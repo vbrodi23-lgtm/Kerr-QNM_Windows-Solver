@@ -19,7 +19,7 @@ Install 64-bit CPython 3.12, clone the repository, and open PowerShell in the re
 .\solver.ps1 run .\examples\problem-contract.json --store .\.solver-store
 ```
 
-The launcher uses a compatible bundled runtime at `.runtime\python\python.exe` when present, then an active `python` if it is 3.12 or newer, then the Windows `py -3.12` launcher. Version probes are silent, so missing or stale launchers cannot contaminate command JSON.
+The launcher uses a compatible bundled runtime at `.runtime\python\python.exe` when present, then an active `python` if it is 3.12 or newer, then the default Python 3 runtime selected by the Windows `py -3` launcher when that runtime is 3.12 or newer. Version probes are silent, so missing or stale launchers cannot contaminate command JSON.
 
 The equivalent Python commands are:
 

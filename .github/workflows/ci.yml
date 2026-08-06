@@ -68,3 +68,4 @@ jobs:
           if (($moduleError -join "`n") -ne ($launcherError -join "`n")) {
             throw "Windows entry points returned different invalid-input JSON."
           }
+          exit 0

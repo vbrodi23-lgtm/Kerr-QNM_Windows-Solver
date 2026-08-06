@@ -34,9 +34,9 @@ else {
     }
     else {
         $PyCommand = Get-Command py -ErrorAction SilentlyContinue
-        if ($PyCommand -and (Test-Python312 -Executable $PyCommand.Source -PrefixArguments @("-3.12"))) {
+        if ($PyCommand -and (Test-Python312 -Executable $PyCommand.Source -PrefixArguments @("-3"))) {
             $PythonExecutable = $PyCommand.Source
-            $PythonPrefixArguments = @("-3.12")
+            $PythonPrefixArguments = @("-3")
         }
     }
 }

@@ -6,6 +6,22 @@ import unittest
 
 
 class PublicSurfaceTests(unittest.TestCase):
+    def test_windows_launcher_accepts_any_supported_py_runtime(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        launcher = (root / "solver.ps1").read_text(encoding="utf-8")
+
+        self.assertIn('PrefixArguments @("-3")', launcher)
+        self.assertIn('$PythonPrefixArguments = @("-3")', launcher)
+        self.assertNotIn('PrefixArguments @("-3.12")', launcher)
+
+    def test_windows_ci_clears_expected_failure_status(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        workflow = (root / ".github" / "workflows" / "ci.yml").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertRegex(workflow, r"(?m)^          exit 0\s*$")
+
     def test_public_surface_contains_no_private_lineage_identifiers(self) -> None:
         root = Path(__file__).resolve().parents[1]
         paths = [
