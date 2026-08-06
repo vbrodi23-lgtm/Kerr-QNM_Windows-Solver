@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=70"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "the-windows-solver"
+version = "0.1.0"
+description = "Evidence-graded nonlinear Kerr ringdown solver"
+readme = "README.md"
+requires-python = ">=3.12"
+license = {text = "All rights reserved"}
+dependencies = []
+
+[project.scripts]
+solver = "windows_solver.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
