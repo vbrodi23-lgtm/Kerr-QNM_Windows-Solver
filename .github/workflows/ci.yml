@@ -1,0 +1,70 @@
+name: verify
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install package
+        run: python -m pip install .
+      - name: Compile Python
+        run: python -m compileall -q src tests
+      - name: Run tests
+        run: python -m unittest discover -s tests -v
+      - name: Plan full evidence request
+        run: solver plan examples/evidence-plan.json
+      - name: Run admitted provider
+        run: solver run examples/problem-contract.json --store "${{ runner.temp }}/solver-store"
+      - name: Verify Windows PowerShell 5.1 launcher parity
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $moduleOutput = python -m windows_solver plan examples/evidence-plan.json
+          $moduleStatus = $LASTEXITCODE
+          $launcherOutput = .\solver.ps1 plan .\examples\evidence-plan.json
+          $launcherStatus = $LASTEXITCODE
+          if ($moduleStatus -ne 0 -or $launcherStatus -ne 0) {
+            throw "Plan command failed through one Windows entry point."
+          }
+          if (($moduleOutput -join "`n") -ne ($launcherOutput -join "`n")) {
+            throw "PowerShell and module entry points returned different JSON."
+          }
+
+          $moduleError = python -m windows_solver run examples/evidence-plan.json --store "${{ runner.temp }}/module-unavailable" 2>&1
+          $moduleStatus = $LASTEXITCODE
+          $launcherError = .\solver.ps1 run .\examples\evidence-plan.json --store "${{ runner.temp }}/launcher-unavailable" 2>&1
+          $launcherStatus = $LASTEXITCODE
+          if ($moduleStatus -ne 3 -or $launcherStatus -ne 3) {
+            throw "Unavailable science did not return exit code 3 through both entry points."
+          }
+          if (($moduleError | ConvertFrom-Json).error.run.unavailable_capability -ne ($launcherError | ConvertFrom-Json).error.run.unavailable_capability) {
+            throw "Windows entry points disagreed on the unavailable capability."
+          }
+
+          $invalidStudy = Join-Path "${{ runner.temp }}" "invalid-study.json"
+          Set-Content -Path $invalidStudy -Value "{}" -Encoding utf8
+          $moduleError = python -m windows_solver plan $invalidStudy 2>&1
+          $moduleStatus = $LASTEXITCODE
+          $launcherError = .\solver.ps1 plan $invalidStudy 2>&1
+          $launcherStatus = $LASTEXITCODE
+          if ($moduleStatus -ne 2 -or $launcherStatus -ne 2) {
+            throw "Invalid input did not return exit code 2 through both entry points."
+          }
+          if (($moduleError -join "`n") -ne ($launcherError -join "`n")) {
+            throw "Windows entry points returned different invalid-input JSON."
+          }

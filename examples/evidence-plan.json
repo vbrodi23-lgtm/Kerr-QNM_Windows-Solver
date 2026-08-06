@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "target": "evidence-package",
+  "theory_id": "general-relativity",
+  "convention_id": "kerr-mass-normalized-outgoing",
+  "modes": [
+    {
+      "s": -2,
+      "ell": 2,
+      "m": 2,
+      "n": 0,
+      "branch": "damped",
+      "polarization": "plus"
+    }
+  ],
+  "spins": [0.0, 0.7],
+  "evidence_profile": "publication",
+  "numerical_policy": {
+    "precision_bits": 128,
+    "root_tolerance": 1e-10
+  }
+}
