@@ -14,13 +14,19 @@ class PublicSurfaceTests(unittest.TestCase):
         self.assertIn('$PythonPrefixArguments = @("-3")', launcher)
         self.assertNotIn('PrefixArguments @("-3.12")', launcher)
 
-    def test_windows_ci_clears_expected_failure_status(self) -> None:
+    def test_windows_ci_captures_native_streams_outside_powershell(self) -> None:
         root = Path(__file__).resolve().parents[1]
         workflow = (root / ".github" / "workflows" / "ci.yml").read_text(
             encoding="utf-8"
         )
 
-        self.assertRegex(workflow, r"(?m)^          exit 0\s*$")
+        self.assertIn("shell: python", workflow)
+        self.assertIn("subprocess.run", workflow)
+        self.assertRegex(
+            workflow,
+            r'"WindowsPowerShell",\s+"v1\.0",\s+"powershell\.exe"',
+        )
+        self.assertNotIn("2>&1", workflow)
 
     def test_public_surface_contains_no_private_lineage_identifiers(self) -> None:
         root = Path(__file__).resolve().parents[1]

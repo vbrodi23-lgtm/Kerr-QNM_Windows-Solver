@@ -32,40 +32,127 @@ jobs:
         run: solver run examples/problem-contract.json --store "${{ runner.temp }}/solver-store"
       - name: Verify Windows PowerShell 5.1 launcher parity
         if: runner.os == 'Windows'
-        shell: powershell
+        shell: python
         run: |
-          $moduleOutput = python -m windows_solver plan examples/evidence-plan.json
-          $moduleStatus = $LASTEXITCODE
-          $launcherOutput = .\solver.ps1 plan .\examples\evidence-plan.json
-          $launcherStatus = $LASTEXITCODE
-          if ($moduleStatus -ne 0 -or $launcherStatus -ne 0) {
-            throw "Plan command failed through one Windows entry point."
-          }
-          if (($moduleOutput -join "`n") -ne ($launcherOutput -join "`n")) {
-            throw "PowerShell and module entry points returned different JSON."
-          }
+          import json
+          import os
+          from pathlib import Path
+          import subprocess
+          import sys
+          import tempfile
 
-          $moduleError = python -m windows_solver run examples/evidence-plan.json --store "${{ runner.temp }}/module-unavailable" 2>&1
-          $moduleStatus = $LASTEXITCODE
-          $launcherError = .\solver.ps1 run .\examples\evidence-plan.json --store "${{ runner.temp }}/launcher-unavailable" 2>&1
-          $launcherStatus = $LASTEXITCODE
-          if ($moduleStatus -ne 3 -or $launcherStatus -ne 3) {
-            throw "Unavailable science did not return exit code 3 through both entry points."
-          }
-          if (($moduleError | ConvertFrom-Json).error.run.unavailable_capability -ne ($launcherError | ConvertFrom-Json).error.run.unavailable_capability) {
-            throw "Windows entry points disagreed on the unavailable capability."
-          }
+          root = Path.cwd()
+          windows_powershell = Path(os.environ["SystemRoot"]).joinpath(
+              "System32", "WindowsPowerShell", "v1.0", "powershell.exe"
+          )
+          module = [sys.executable, "-m", "windows_solver"]
+          launcher = [
+              str(windows_powershell),
+              "-NoLogo",
+              "-NoProfile",
+              "-NonInteractive",
+              "-ExecutionPolicy",
+              "Bypass",
+              "-File",
+              str(root / "solver.ps1"),
+          ]
 
-          $invalidStudy = Join-Path "${{ runner.temp }}" "invalid-study.json"
-          Set-Content -Path $invalidStudy -Value "{}" -Encoding utf8
-          $moduleError = python -m windows_solver plan $invalidStudy 2>&1
-          $moduleStatus = $LASTEXITCODE
-          $launcherError = .\solver.ps1 plan $invalidStudy 2>&1
-          $launcherStatus = $LASTEXITCODE
-          if ($moduleStatus -ne 2 -or $launcherStatus -ne 2) {
-            throw "Invalid input did not return exit code 2 through both entry points."
-          }
-          if (($moduleError -join "`n") -ne ($launcherError -join "`n")) {
-            throw "Windows entry points returned different invalid-input JSON."
-          }
-          exit 0
+          def invoke(prefix, *arguments):
+              return subprocess.run(
+                  [*prefix, *(str(argument) for argument in arguments)],
+                  cwd=root,
+                  stdin=subprocess.DEVNULL,
+                  stdout=subprocess.PIPE,
+                  stderr=subprocess.PIPE,
+                  check=False,
+              )
+
+          def require(condition, message, *results):
+              if condition:
+                  return
+              details = "\n".join(
+                  f"rc={result.returncode} stdout={result.stdout!r} "
+                  f"stderr={result.stderr!r}"
+                  for result in results
+              )
+              raise AssertionError(f"{message}\n{details}")
+
+          request = root / "examples" / "evidence-plan.json"
+          direct = invoke(module, "plan", request)
+          wrapped = invoke(launcher, "plan", request)
+          require(
+              direct.returncode == wrapped.returncode == 0,
+              "Plan command failed through one Windows entry point.",
+              direct,
+              wrapped,
+          )
+          require(
+              direct.stdout == wrapped.stdout and direct.stderr == wrapped.stderr == b"",
+              "Windows entry points returned different plan streams.",
+              direct,
+              wrapped,
+          )
+
+          with tempfile.TemporaryDirectory() as temporary:
+              temporary = Path(temporary)
+              direct = invoke(
+                  module,
+                  "run",
+                  request,
+                  "--store",
+                  temporary / "module-unavailable",
+              )
+              wrapped = invoke(
+                  launcher,
+                  "run",
+                  request,
+                  "--store",
+                  temporary / "launcher-unavailable",
+              )
+              require(
+                  direct.returncode == wrapped.returncode == 3,
+                  "Unavailable science did not return exit code 3.",
+                  direct,
+                  wrapped,
+              )
+              require(
+                  direct.stdout == wrapped.stdout == b"",
+                  "Unavailable science unexpectedly wrote stdout.",
+                  direct,
+                  wrapped,
+              )
+              direct_error = json.loads(direct.stderr)
+              wrapped_error = json.loads(wrapped.stderr)
+              require(
+                  direct_error["error"]["code"]
+                  == wrapped_error["error"]["code"]
+                  == "PROVIDER_UNAVAILABLE",
+                  "Windows entry points returned different error contracts.",
+                  direct,
+                  wrapped,
+              )
+              require(
+                  direct_error["error"]["run"]["unavailable_capability"]
+                  == wrapped_error["error"]["run"]["unavailable_capability"],
+                  "Windows entry points disagreed on unavailable capability.",
+                  direct,
+                  wrapped,
+              )
+
+              invalid = temporary / "invalid-study.json"
+              invalid.write_bytes(b"{}")
+              direct = invoke(module, "plan", invalid)
+              wrapped = invoke(launcher, "plan", invalid)
+              require(
+                  direct.returncode == wrapped.returncode == 2,
+                  "Invalid input did not return exit code 2.",
+                  direct,
+                  wrapped,
+              )
+              require(
+                  direct.stdout == wrapped.stdout == b""
+                  and direct.stderr == wrapped.stderr,
+                  "Windows entry points returned different invalid-input streams.",
+                  direct,
+                  wrapped,
+              )
