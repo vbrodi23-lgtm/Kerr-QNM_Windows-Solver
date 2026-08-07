@@ -1,0 +1,51 @@
+{
+  "schema_version": 1,
+  "target": "linear-response",
+  "theory_id": "general-relativity",
+  "convention_id": "kerr-mass-normalized-outgoing",
+  "modes": [
+    {
+      "s": -2,
+      "ell": 2,
+      "m": 2,
+      "n": 0,
+      "branch": "schwarzschild-overtone-continuation",
+      "polarization": "gravitational"
+    }
+  ],
+  "spins": [0.95],
+  "evidence_profile": "research",
+  "numerical_policy": {
+    "linear-response": {
+      "sampling_coordinates": [
+        {
+          "coordinate_id": "a_over_M",
+          "coordinate_value": 0.95,
+          "coordinate_exact": {
+            "numerator": 19,
+            "denominator": 20
+          },
+          "spin": 0.95,
+          "spin_exact": {
+            "numerator": 19,
+            "denominator": 20
+          },
+          "spin_binary64_hex": "0x1.e666666666666p-1",
+          "transformation_id": "identity-a-over-M"
+        }
+      ],
+      "mechanisms": [
+        {
+          "mechanism_id": "horizon-admittance",
+          "coordinate_id": "unit-complex-deltaB",
+          "theory_id": "general-relativity",
+          "convention_id": "kerr-mass-normalized-outgoing",
+          "response_quantity_id": "h_B",
+          "parameters": {
+            "normalization": "unit-common-delta-B"
+          }
+        }
+      ]
+    }
+  }
+}

@@ -6,6 +6,11 @@ from typing import Mapping
 
 from .artifacts import ArtifactVerificationError
 from .contracts import Capability, StudyRequest
+from .linear_response import (
+    LINEAR_RESPONSE_OUTPUT_ARTIFACT_TYPE,
+    LINEAR_RESPONSE_PROVIDER_ID,
+    validate_linear_response_payload,
+)
 from .spectrum import (
     SPECTRAL_OUTPUT_ARTIFACT_TYPE,
     SPECTRAL_PROVIDER_ID,
@@ -38,5 +43,18 @@ def validate_provider_payload(
             )
         try:
             validate_spectral_payload(request, provider, payload)
+        except (KeyError, RecursionError, TypeError, ValueError) as error:
+            raise ArtifactVerificationError(str(error)) from error
+    elif capability is Capability.LINEAR_RESPONSE:
+        if provider.get("provider_id") != LINEAR_RESPONSE_PROVIDER_ID:
+            raise ArtifactVerificationError(
+                "unsupported linear-response provider contract"
+            )
+        if artifact_type != LINEAR_RESPONSE_OUTPUT_ARTIFACT_TYPE:
+            raise ArtifactVerificationError(
+                "linear-response artifact output type is invalid"
+            )
+        try:
+            validate_linear_response_payload(request, provider, payload)
         except (KeyError, RecursionError, TypeError, ValueError) as error:
             raise ArtifactVerificationError(str(error)) from error
