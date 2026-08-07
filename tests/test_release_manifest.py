@@ -213,6 +213,18 @@ class ReleaseManifestTests(unittest.TestCase):
             RELEASE_MANIFEST_SHA256,
         )
 
+    def test_git_checkout_preserves_manifest_bytes_on_every_platform(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        manifest_path = "src/windows_solver/data/release_domain_manifest.json"
+        completed = subprocess.run(
+            ["git", "check-attr", "eol", "--", manifest_path],
+            cwd=root,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(completed.stdout.strip(), f"{manifest_path}: eol: lf")
+
     def test_missing_receipt_cannot_support_an_admitted_claim(self) -> None:
         mapping = load_release_manifest().to_mapping()
         claim = next(

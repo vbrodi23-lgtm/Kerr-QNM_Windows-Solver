@@ -27,7 +27,7 @@ Create the single release-domain manifest that defines what the solver must comp
 ### Verification
 
 - `python tools/validate_release_manifest.py` — passed; exact scope, claims, receipts, conventions, and blockers validated.
-- `PYTHONPATH=src python -m unittest discover -s tests -v` — 109 tests passed.
+- `PYTHONPATH=src python -m unittest discover -s tests -v` — 110 tests passed.
 - **Evidence ceiling:** This proves the release scope and evidence state were exhaustively declared against available records; it does not promote missing, comparator, framework-only, or retained evidence to production science.
 - **Change reference:** commit `8aeaf5adb2667756b3623daa76f50720118fa5d2`; draft PR [#3](https://github.com/vbrodi23-lgtm/Kerr-QNM_Windows-Solver/pull/3).
 
@@ -200,7 +200,8 @@ The repository contains the canonical manifest, immutable strict parser, CLI val
 
 - `git diff --check` — passed.
 - `python tools/validate_release_manifest.py` — passed.
-- `PYTHONPATH=src python -m unittest discover -s tests -v` — 109 tests passed.
+- `PYTHONPATH=src python -m unittest discover -s tests -v` — 110 tests passed.
+- Cross-platform manifest checkout regression — passed; Git enforces LF bytes before package build on Windows and Ubuntu.
 - Clean wheel build/import — passed; wheel SHA-256 `cbfd6887ed07f186a6966a3093da2bb0e580a8402b53868855be6125240dea18`.
 - Change Review — no blocking findings after remediation.
 - **Evidence ceiling:** M01 validates scope-control machinery and packaging only; it changes no spectral bytes, scientific provider behavior, or evidence state beyond the two previously admitted capabilities.

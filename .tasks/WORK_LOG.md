@@ -6,7 +6,7 @@ Add the newest completed task or milestone-control entry immediately below this 
 
 - **Tasks:** TASK-001–TASK-005
 - **Deliverable:** Frozen release-domain manifest, source-receipt ledger, module-ownership matrix, convention/evidence-ceiling register, strict parser and validator, negative tests, packaged-data binding, and human reconciliation report.
-- **Verification:** `python .tasks/validate_board.py`; `python tools/validate_release_manifest.py`; `PYTHONPATH=src python -m unittest discover -s tests -v` (109 passed); clean wheel build/import (SHA-256 `cbfd6887ed07f186a6966a3093da2bb0e580a8402b53868855be6125240dea18`); Change Review returned no blocking findings.
+- **Verification:** `python .tasks/validate_board.py`; `python tools/validate_release_manifest.py`; `PYTHONPATH=src python -m unittest discover -s tests -v` (110 passed, including the cross-platform manifest checkout regression); clean wheel build/import (SHA-256 `cbfd6887ed07f186a6966a3093da2bb0e580a8402b53868855be6125240dea18`); Change Review returned no blocking findings.
 - **Evidence ceiling:** Scope-control and provenance baseline only. No spectral bytes or provider behavior changed, and only the pre-existing problem-contract and spectral-core capabilities are admitted.
 - **Change reference:** implementation commit `8aeaf5adb2667756b3623daa76f50720118fa5d2`; draft PR [#3](https://github.com/vbrodi23-lgtm/Kerr-QNM_Windows-Solver/pull/3).
 
