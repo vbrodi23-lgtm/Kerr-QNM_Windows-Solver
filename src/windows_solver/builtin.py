@@ -1,4 +1,4 @@
-"""Built-in public providers that do not assert numerical science."""
+"""Admitted built-in public providers."""
 
 from __future__ import annotations
 
@@ -17,6 +17,7 @@ from .contracts import (
     canonical_json_bytes,
 )
 from .providers import ProviderDescriptor, ProviderRegistry, ProviderResult
+from .spectrum import SpectralCatalogProvider
 
 
 class ProblemContractProvider:
@@ -57,4 +58,4 @@ class ProblemContractProvider:
 
 
 def default_registry() -> ProviderRegistry:
-    return ProviderRegistry((ProblemContractProvider(),))
+    return ProviderRegistry((ProblemContractProvider(), SpectralCatalogProvider()))

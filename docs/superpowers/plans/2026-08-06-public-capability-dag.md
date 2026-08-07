@@ -4,7 +4,17 @@
 
 **Goal:** Build the tested public control plane for The Windows Solver without importing private development architecture or claiming unavailable scientific calculations.
 
-**Architecture:** A standard-library Python 3.12 package models immutable scientific contracts, plans a fixed capability DAG, resolves one provider per capability, and writes content-addressed artifacts plus run records. A thin CLI and PowerShell launcher expose the same engine; scientific providers fail closed until migrated.
+**Architecture at this completed checkpoint:** A standard-library Python 3.12
+package models immutable scientific contracts, plans a fixed capability DAG,
+resolves at most one provider per capability, and writes content-addressed
+artifacts plus run records. A thin CLI and PowerShell launcher expose the same
+engine. At that checkpoint only the problem contract was admitted. PR #2 adds
+exact selection from 2,736 computed pure-Kerr roots: 690 for ℓ=2, 966 for ℓ=3,
+and 1,080 for ℓ=4, covering all allowed m, n∈{0,1,2}, and the approved
+ℓ-dependent spin grids. Every row carries determinant, continued-fraction,
+angular-refinement, repeat-polish, and branch evidence. Scientific conclusions
+remain `NOT_EVALUATED`. PR #3 will migrate `linear-response` only, while all
+other unadmitted providers continue to fail closed.
 
 **Tech Stack:** CPython 3.12 standard library, `unittest`, PowerShell 5.1+, GitHub Actions.
 
@@ -103,7 +113,12 @@ Commit message: `Add capability planning and provider ownership`
 
 - [ ] **Step 1: Write failing artifact and engine tests**
 
-Assert hand-derived SHA-256 behavior from canonical bytes, tamper detection, successful problem-contract execution, zero provider executions on a warm repeat, fail-closed unavailable spectral execution, and independent execution/numerical/scientific states.
+At the control-plane checkpoint, assert hand-derived SHA-256 behavior from
+canonical bytes, tamper detection, successful problem-contract execution,
+zero provider executions on a warm repeat, fail-closed unavailable spectral
+execution, and independent execution/numerical/scientific states. The later
+spectral migration replaces only that historical unavailable-provider
+expectation.
 
 - [ ] **Step 2: Run and observe missing-module failures**
 

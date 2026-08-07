@@ -22,14 +22,50 @@ jobs:
           python-version: "3.12"
       - name: Install package
         run: python -m pip install .
+      - name: Build and inspect wheel
+        shell: python
+        run: |
+          from pathlib import Path
+          import subprocess
+          import sys
+          import zipfile
+
+          subprocess.run(
+              [sys.executable, "-m", "pip", "wheel", ".", "--no-deps", "--wheel-dir", "dist"],
+              check=True,
+          )
+          wheels = list(Path("dist").glob("*.whl"))
+          if len(wheels) != 1:
+              raise AssertionError(f"expected one wheel, found {wheels}")
+          with zipfile.ZipFile(wheels[0]) as wheel:
+              names = set(wheel.namelist())
+          required = {
+              "windows_solver/data/kerr_qnm_roots_2736.csv",
+              "windows_solver/data/kerr_qnm_lattice_receipt.json",
+              "windows_solver/data/LICENSE-CANONICAL-BACKEND-MIT.txt",
+              "windows_solver/data/LICENSE-CC-BY-4.0.txt",
+              "windows_solver/data/LICENSE-QNM-MIT.txt",
+          }
+          missing = required - names
+          forbidden = {
+              name for name in names
+              if "roots_91" in name
+              or "benchmark_receipt" in name
+              or "independent_benchmarks" in name
+              or "catalog_receipt" in name
+          }
+          if missing or forbidden:
+              raise AssertionError(f"wheel data mismatch: missing={missing}, forbidden={forbidden}")
       - name: Compile Python
-        run: python -m compileall -q src tests
+        run: python -m compileall -q src tests tools
       - name: Run tests
         run: python -m unittest discover -s tests -v
       - name: Plan full evidence request
         run: solver plan examples/evidence-plan.json
       - name: Run admitted provider
         run: solver run examples/problem-contract.json --store "${{ runner.temp }}/solver-store"
+      - name: Run admitted spectrum provider
+        run: solver run examples/spectrum.json --store "${{ runner.temp }}/spectrum-store"
       - name: Verify Windows PowerShell 5.1 launcher parity
         if: runner.os == 'Windows'
         shell: python
@@ -95,6 +131,45 @@ jobs:
 
           with tempfile.TemporaryDirectory() as temporary:
               temporary = Path(temporary)
+              spectrum_request = root / "examples" / "spectrum.json"
+              direct = invoke(
+                  module,
+                  "run",
+                  spectrum_request,
+                  "--store",
+                  temporary / "module-spectrum",
+              )
+              wrapped = invoke(
+                  launcher,
+                  "run",
+                  spectrum_request,
+                  "--store",
+                  temporary / "launcher-spectrum",
+              )
+              require(
+                  direct.returncode == wrapped.returncode == 0,
+                  "Admitted spectrum failed through one Windows entry point.",
+                  direct,
+                  wrapped,
+              )
+              require(
+                  direct.stderr == wrapped.stderr == b"",
+                  "Admitted spectrum unexpectedly wrote stderr.",
+                  direct,
+                  wrapped,
+              )
+              direct_run = json.loads(direct.stdout)
+              wrapped_run = json.loads(wrapped.stdout)
+              require(
+                  direct_run["artifact_ids"] == wrapped_run["artifact_ids"]
+                  and direct_run["provider_execution_count"]
+                  == wrapped_run["provider_execution_count"]
+                  == 2,
+                  "Windows entry points returned different spectrum artifacts.",
+                  direct,
+                  wrapped,
+              )
+
               direct = invoke(
                   module,
                   "run",

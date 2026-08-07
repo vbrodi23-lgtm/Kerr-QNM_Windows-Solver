@@ -42,7 +42,12 @@ Different boundary laws, gauges, normalizations, source definitions, or mechanis
 
 ## Provider ownership
 
-Exactly one active production provider owns each capability. A provider declares its stable ID, implementation version, equation and convention IDs, runtime and numerical-policy fingerprints, ordered upstream artifact types, output artifact type, availability, and evidence level. Before execution, the engine requires those upstream types to match the direct DAG inputs exactly.
+At most one active production provider may own a capability, and every
+admitted capability has exactly one. A provider declares its stable ID,
+implementation version, equation and convention IDs, runtime and
+numerical-policy fingerprints, ordered upstream artifact types, output
+artifact type, availability, and evidence level. Before execution, the engine
+requires those upstream types to match the direct DAG inputs exactly.
 
 The engine snapshots every provider descriptor before any provider executes and
 uses that immutable snapshot for cache identity, input types, and output type.
@@ -60,6 +65,42 @@ A provider is admitted only with:
 7. native-Windows and Ubuntu test coverage where the backend supports both.
 
 Missing providers fail before partial execution. Test fixtures are never registered as production providers.
+
+### Current provider boundary
+
+The admitted providers are:
+
+| Capability | Provider boundary |
+|---|---|
+| Problem contract | Strict request validation and immutable problem identity |
+| Spectral core | Exact selection from the computed, authenticated pure-Kerr lattice |
+
+PR #2 computes and admits 2,736 pure-Kerr roots with ℓ-dependent spin grids:
+
+| ℓ | Modes `(m,n)` | Spin points | Roots |
+|---|---:|---:|---:|
+| 2 | 15 | 46 | 690 |
+| 3 | 21 | 46 | 966 |
+| 4 | 27 | 40 | 1,080 |
+| Total | 63 | ℓ-dependent | 2,736 |
+
+Every allowed m and n∈{0,1,2} is present. For ℓ=2,3, the spin set is 40
+inclusive uniform points over χ∈[0,0.95] plus χ∈{0.97,0.98,0.99,0.995,
+0.997,0.999}; ℓ=4 uses 40 inclusive uniform points over χ∈[0,0.75]. The
+catalog has no polarization or EFT row axis.
+
+The stored Mω and angular A values come from the canonical coupled
+angular/Leaver determinant polish at every exact rational spin coordinate.
+Full-grid residual, continued-fraction, angular-refinement, repeat-polish, and
+branch-continuation gates must all pass. The Motohashi release supplies 392
+exact-coordinate comparisons only; its values never fill catalog rows.
+Unsupported pairs fail without a partial spectral artifact. Exact selection
+uses the recorded binary64 identity, never rounding or nearby-spin aliases.
+Scientific state remains `NOT_EVALUATED`, and `formal_root_enclosure` remains
+false.
+
+All downstream providers remain unavailable. PR #3 will migrate
+`linear-response` as a distinct provider and contains no spectral-grid cleanup.
 
 ## Artifact identity and caching
 
@@ -97,7 +138,7 @@ Every artifact records four independent dimensions:
 | Numerical | `NOT_EVALUATED`, `CONVERGED`, `ACCEPTED`, `REJECTED`, `UNRESOLVED` |
 | Scientific | `NOT_EVALUATED`, `SUPPORTED`, `CONDITIONALLY_SUPPORTED`, `FRAGILE`, `UNRESOLVED`, `CONTRADICTED` |
 
-No downstream claim may exceed the weakest upstream evidence. Rejection and contradiction propagate as adverse results; unevaluated, unresolved, converged, fragile, and conditional states act as evidence ceilings. Invalid or failed carriers cannot become successful downstream artifacts. Residual validation is not a formal root enclosure. A pole-frequency result is not a waveform, detector, or quadratic-amplitude result.
+No downstream claim may exceed the weakest upstream evidence. Rejection and contradiction propagate as adverse results; unevaluated, unresolved, converged, fragile, and conditional states act as evidence ceilings. Invalid or failed carriers cannot become successful downstream artifacts. The spectral values are computed and numerically accepted but not formally enclosed, and their scientific conclusions remain `NOT_EVALUATED`. A pole-frequency result is not a waveform, detector, or quadratic-amplitude result.
 
 ## Storage layout
 

@@ -1,0 +1,13 @@
+The independent comparison data derived from “Kerr quasinormal mode
+frequencies and excitation factors” by Hayato Motohashi is licensed under the
+Creative Commons Attribution 4.0 International License (CC BY 4.0).
+
+Source: https://doi.org/10.5281/zenodo.14380191
+License: https://creativecommons.org/licenses/by/4.0/
+
+Changes made for this package: all 63 relevant mode files were authenticated;
+at the 392 exact spin overlaps, frequency columns in units of 2Mω were divided
+by exactly two to obtain Mω and compared with the locally polished roots. The
+packaged lattice stores the local determinant-polish values, not substituted
+source-table values. Source member names, one-based row numbers, and absolute
+comparison deltas are retained as attribution and validation evidence.
