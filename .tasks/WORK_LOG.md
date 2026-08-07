@@ -2,6 +2,14 @@
 
 Add the newest completed task or milestone-control entry immediately below this heading.
 
+## 2026-08-07 — TASK-006 public linear-response contract completed
+
+- **Task:** TASK-006 — Define the public linear-response artifact and provider contract.
+- **Deliverable:** Strict unavailable provider descriptor, exact direct-spin/`Mκ` request sampling, eight mechanism contracts, component-local and cross-component covariance, uncertainty-disk and multimode-projective payload validation, example study, design, plan, and fail-closed tests.
+- **Verification:** 19 focused and 129 full unit tests passed; board and unchanged release manifest validated; Wolfram returned zero residual for the simple-root, `Mκ`↔`a/M`, and horizon-coordinate identities; independent Change Review returned no blockers after remediation.
+- **Evidence ceiling:** Contract-only; no response computation or provider admission. M02 remains open, with current spectral-domain, provenance, covariance, and frozen recomputation blockers recorded in PR #4.
+- **Change reference:** implementation commit `a12ef02f57038ac8a8c912381f1fe64c76237860`; draft PR [#4](https://github.com/vbrodi23-lgtm/Kerr-QNM_Windows-Solver/pull/4).
+
 ## 2026-08-07 — M01 release scope and authenticated evidence baseline closed
 
 - **Tasks:** TASK-001–TASK-005

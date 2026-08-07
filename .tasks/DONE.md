@@ -218,3 +218,50 @@ Ensure the manifest freezes required scope without promising science outside ava
 - Run change review and update M01 only on full closure.
 
 ---
+
+## TASK-006: Define the public linear-response artifact and provider contract
+**Priority:** P1 | **Tags:** M02, provider, physics
+**Assignee:** Codex | **Estimate:** 1–2 days | **Milestone:** M02
+
+### Objective
+
+Specify one field-native artifact for physical first-order complex QNM shifts, local covariance/disks, mechanism identity, and bounded multimode comparisons.
+
+### Acceptance Criteria
+
+- [x] Define payload keys, units, modes/spins, mechanism parameters, complex covariance, local uncertainty disks, and unresolved classifications.
+- [x] Separate raw roots, pole shifts, projective reductions, and later response-matrix quantities.
+- [x] Bind equations, conventions, numerical policy, runtime, upstream hashes, and evidence ceiling.
+- [x] Reject unsupported mechanisms or coordinates before partial output.
+
+### Dependencies
+
+- **Blocked by:** TASK-005
+- **Blocks:** TASK-007, TASK-008
+
+### Evidence Output
+
+`src/windows_solver/linear_response.py` defines the unavailable descriptor and strict request/payload/admission contracts. `src/windows_solver/payload_validation.py` dispatches candidate artifact validation. The example, design, implementation plan, and 19 focused tests bind direct-spin and `Mκ` sampling, all eight mechanisms, component-local and correlated covariance, uncertainty disks, projective reductions, completeness, lineage, and fail-closed semantics.
+
+### Verification
+
+- `PYTHONPATH=src python -m unittest tests.test_linear_response_contract -v` — 19 tests passed.
+- `PYTHONPATH=src python -m unittest discover -s tests -v` — 129 tests passed.
+- `python .tasks/validate_board.py` — passed before completion transition.
+- `python tools/validate_release_manifest.py` — passed unchanged; manifest SHA-256 `697c92744e098fe409f481bcfa0ebeecfc61cd222291e36cd4158fbc5857b742`.
+- Wolfram identities — simple-root tangent, `Mκ` to `a/M`, and `δB` to reflectivity inverse residuals all reduced to zero.
+- Independent Change Review — no blocking findings after remediation of the covariance PSD and frozen-coordinate checks.
+- **Evidence ceiling:** Contract-only. No response leaf was computed, the descriptor remains unavailable and unregistered, and M02 remains open. Full closure is blocked by absent high-spin/`Mκ` spectral roots, unauthenticated candidate pilots, and the missing frozen-domain covariance/recomputation bundle.
+- **Change reference:** implementation commit `a12ef02f57038ac8a8c912381f1fe64c76237860`; draft PR [#4](https://github.com/vbrodi23-lgtm/Kerr-QNM_Windows-Solver/pull/4).
+
+### Review Focus
+
+Check field-native terminology, physical mechanism distinctions, exact frozen-coordinate coverage, and no atlas-wide uncertainty substitute.
+
+### Plan
+
+- Translate frozen manifest into an exact contract.
+- Add red contract and identity tests.
+- Review evidence boundary before migration.
+
+---
