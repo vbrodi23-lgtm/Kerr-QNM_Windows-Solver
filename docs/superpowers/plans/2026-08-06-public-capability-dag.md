@@ -13,8 +13,9 @@ exact selection from 2,736 computed pure-Kerr roots: 690 for ℓ=2, 966 for ℓ=
 and 1,080 for ℓ=4, covering all allowed m, n∈{0,1,2}, and the approved
 ℓ-dependent spin grids. Every row carries determinant, continued-fraction,
 angular-refinement, repeat-polish, and branch evidence. Scientific conclusions
-remain `NOT_EVALUATED`. PR #3 will migrate `linear-response` only, while all
-other unadmitted providers continue to fail closed.
+remain `NOT_EVALUATED`. PR #3 freezes the M01 release and evidence boundary;
+PR #4 begins `linear-response`, while all other unadmitted providers continue
+to fail closed.
 
 **Tech Stack:** CPython 3.12 standard library, `unittest`, PowerShell 5.1+, GitHub Actions.
 

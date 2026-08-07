@@ -99,8 +99,11 @@ uses the recorded binary64 identity, never rounding or nearby-spin aliases.
 Scientific state remains `NOT_EVALUATED`, and `formal_root_enclosure` remains
 false.
 
-All downstream providers remain unavailable. PR #3 will migrate
-`linear-response` as a distinct provider and contains no spectral-grid cleanup.
+All downstream providers remain unavailable. PR #3 freezes the M01 release
+domain and authenticated evidence boundary without changing the accepted
+spectrum. PR #4 begins `linear-response` as a distinct provider migration. The
+machine-readable authority and reconciliation report are documented in
+[the M01 release baseline](release-baseline.md).
 
 ## Artifact identity and caching
 

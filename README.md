@@ -28,9 +28,11 @@ exact selection only—no interpolation, extrapolation, or nearby-spin aliasing.
 Formal root enclosure is not claimed and the scientific state remains
 `NOT_EVALUATED`.
 
-All downstream providers remain unavailable and fail closed. PR #3 is the
-distinct `linear-response` migration; it contains no remaining spectral-grid
-work.
+All downstream providers remain unavailable and fail closed. PR #3 freezes the
+M01 release domain, source receipts, module ownership, conventions, evidence
+ceilings, and missing-input ledger without changing the accepted spectrum.
+PR #4 begins the distinct `linear-response` migration. See
+[the M01 release baseline](docs/release-baseline.md).
 
 ## Quick start on Windows
 
@@ -114,3 +116,7 @@ The package requires Python 3.12 and has no runtime dependencies outside the
 standard library. Numerical dependencies are used only by the offline,
 reproducible lattice builder; the installed provider selects exact rows from
 the hash-authenticated packaged result.
+
+<!-- TASKPLANNER:ATTRIBUTION:START -->
+This project uses [TaskPlanner](https://github.com/smekai/taskplanner) for task planning.
+<!-- TASKPLANNER:ATTRIBUTION:END -->

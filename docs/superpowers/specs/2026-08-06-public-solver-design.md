@@ -85,8 +85,9 @@ materializing the problem contract and for exact selection from PR #2's
 computed pure-Kerr lattice. It admits 2,736 roots: 690 for ℓ=2, 966 for ℓ=3,
 and 1,080 for ℓ=4. All allowed m and n∈{0,1,2} are present across the approved
 46/46/40 spin grids. Remaining scientific capabilities are explicitly
-unavailable until their implementations and evidence are migrated. PR #3 will
-migrate `linear-response` as a distinct capability. The engine never
+unavailable until their implementations and evidence are migrated. PR #3
+freezes the M01 release and evidence boundary; PR #4 begins `linear-response`
+as a distinct capability. The engine never
 substitutes synthetic science or reports an unavailable provider as completed.
 
 Provider descriptors are snapshotted before execution. A successful engine run
@@ -165,8 +166,8 @@ Each row is a canonical determinant polish with full-grid numerical evidence;
 392 Motohashi overlaps are independent comparisons rather than data sources.
 The scientific conclusion remains `NOT_EVALUATED`. Response, nonlinear,
 stability, waveform, detector, and inference providers have not migrated; their
-absence is machine-readable and blocks the relevant target. PR #3 is the
-`linear-response` provider migration only.
+absence is machine-readable and blocks the relevant target. PR #3 is the M01
+release-baseline migration; PR #4 begins the `linear-response` provider.
 
 ## Acceptance criteria
 

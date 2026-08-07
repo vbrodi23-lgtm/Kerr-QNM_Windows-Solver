@@ -92,7 +92,7 @@ class PublicSurfaceTests(unittest.TestCase):
 
         self.assertEqual(findings, [])
 
-    def test_current_status_names_pr2_boundary_and_pr3_linear_response_only(self) -> None:
+    def test_current_status_names_pr2_pr3_m01_and_pr4_linear_response(self) -> None:
         root = Path(__file__).resolve().parents[1]
         current_status_files = (
             root / "README.md",
@@ -129,6 +129,8 @@ class PublicSurfaceTests(unittest.TestCase):
             with self.subTest(path=path.relative_to(root)):
                 self.assertIn("PR #2", text)
                 self.assertIn("PR #3", text)
+                self.assertIn("PR #4", text)
+                self.assertIn("M01", text)
                 self.assertIn("linear-response", text)
                 self.assertIsNone(stale.search(text))
 

@@ -1,8 +1,9 @@
 # Pure-Kerr Background QNM Lattice Design
 
 **Status:** Approved by the user on 2026-08-07. PR #2 implements this exact
-2,736-root scope: 690 for ℓ=2, 966 for ℓ=3, and 1,080 for ℓ=4. PR #3 is the
-separate `linear-response` migration.
+2,736-root scope: 690 for ℓ=2, 966 for ℓ=3, and 1,080 for ℓ=4. PR #3 freezes
+the M01 release and evidence boundary; PR #4 begins the separate
+`linear-response` migration.
 
 ## Goal
 
@@ -177,8 +178,9 @@ PR #2 admits two providers:
 - the computed 2,736-row pure-Kerr spectral core.
 
 Every downstream capability remains unavailable and fails closed. PR #3 is the
-separate linear-response migration. It may consume this background lattice but
-cannot add polarization or EFT rows to PR #2 retroactively.
+M01 release-baseline migration. PR #4 begins linear response; it may consume
+this background lattice but cannot add polarization or EFT rows to PR #2
+retroactively.
 
 ## Acceptance criteria
 
