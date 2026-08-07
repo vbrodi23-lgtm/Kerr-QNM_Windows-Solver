@@ -6,12 +6,33 @@ import re
 import shutil
 import subprocess
 import tempfile
+import tomllib
 import unittest
 
 from windows_solver.spectrum import CATALOG_DATA_SHA256, CATALOG_RECEIPT_SHA256
 
 
 class PublicSurfaceTests(unittest.TestCase):
+    def test_ci_installs_pinned_numerical_test_dependencies_only_as_an_extra(
+        self,
+    ) -> None:
+        root = Path(__file__).resolve().parents[1]
+        configuration = tomllib.loads(
+            (root / "pyproject.toml").read_text(encoding="utf-8")
+        )
+        workflow = (root / ".github" / "workflows" / "ci.yml").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertEqual(configuration["project"]["dependencies"], [])
+        self.assertEqual(
+            configuration["project"]["optional-dependencies"][
+                "numerical-tests"
+            ],
+            ["numpy==2.4.6", "scipy==1.18.0"],
+        )
+        self.assertIn('python -m pip install ".[numerical-tests]"', workflow)
+
     def test_windows_launcher_accepts_any_supported_py_runtime(self) -> None:
         root = Path(__file__).resolve().parents[1]
         launcher = (root / "solver.ps1").read_text(encoding="utf-8")

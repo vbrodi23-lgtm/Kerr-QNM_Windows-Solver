@@ -17,6 +17,12 @@ license-files = [
 ]
 dependencies = []
 
+[project.optional-dependencies]
+numerical-tests = [
+    "numpy==2.4.6",
+    "scipy==1.18.0",
+]
+
 [project.scripts]
 solver = "windows_solver.cli:main"
 

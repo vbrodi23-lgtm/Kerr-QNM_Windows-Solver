@@ -21,7 +21,7 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install package
-        run: python -m pip install .
+        run: python -m pip install ".[numerical-tests]"
       - name: Build and inspect wheel
         shell: python
         run: |
