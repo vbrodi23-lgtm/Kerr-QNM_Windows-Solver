@@ -1,28 +1,28 @@
 # Next
 
-## TASK-006: Define the public linear-response artifact and provider contract
-**Priority:** P1 | **Tags:** M02, provider, physics
+## TASK-007: Freeze independent golden results for the legacy linear calculation
+**Priority:** P1 | **Tags:** M02, evidence, validation
 **Assignee:** Unassigned | **Estimate:** 1–2 days | **Milestone:** M02
 
 ### Objective
 
-Specify one field-native artifact for physical first-order complex QNM shifts, local covariance/disks, mechanism identity, and bounded multimode comparisons.
+Characterize the accepted component-local response calculations without making legacy code a production dependency.
 
 ### Acceptance Criteria
 
-- [ ] Define payload keys, units, modes/spins, mechanism parameters, complex covariance, local uncertainty disks, and unresolved classifications.
-- [ ] Separate raw roots, pole shifts, projective reductions, and later response-matrix quantities.
-- [ ] Bind equations, conventions, numerical policy, runtime, upstream hashes, and evidence ceiling.
-- [ ] Reject unsupported mechanisms or coordinates before partial output.
+- [ ] Select manifest-declared modes/spins and both horizon/exterior or theory mechanisms as golden fixtures.
+- [ ] Record central complex shifts, local solver diagnostics, signed-root uncertainty inputs, covariance, and projective classifications.
+- [ ] Authenticate source artifacts, code, runtime, and comparison method.
+- [ ] Include adverse/unresolved fixtures and independent published or alternate-backend comparisons where available.
 
 ### Dependencies
 
-- **Blocked by:** TASK-005
-- **Blocks:** TASK-007, TASK-008
+- **Blocked by:** TASK-005, TASK-006
+- **Blocks:** TASK-008, TASK-009, TASK-010
 
 ### Evidence Output
 
-Linear-response schema, provider descriptor, validation tests, and example study.
+Hash-bound linear-response golden fixture set and comparison receipt.
 
 ### Verification
 
@@ -30,12 +30,12 @@ undefined
 
 ### Review Focus
 
-Check field-native terminology, physical mechanism distinctions, and no atlas-wide uncertainty substitute.
+Confirm fixtures are independent enough to detect migration errors and do not embed obsolete scope.
 
 ### Plan
 
-- Translate frozen manifest into an exact contract.
-- Add red contract and identity tests.
-- Review evidence boundary before migration.
+- Select release-domain fixture slices.
+- Authenticate and independently compare values.
+- Lock tolerances from observed diagnostics, not desired outcomes.
 
 ---
