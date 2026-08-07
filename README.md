@@ -6,9 +6,31 @@ The solver is organized around physical outputs: Kerr quasinormal-mode spectra, 
 
 ## Current release boundary
 
-The public control plane is working. It validates study contracts, plans dependencies, assigns one provider to each capability, stores content-addressed artifacts, resumes from verified cache entries, and reports evidence without conflating numerical success with a scientific conclusion.
+The public control plane is working. It validates study contracts, plans dependencies, admits at most one production provider for each capability, stores content-addressed artifacts, resumes from verified cache entries, and reports evidence without conflating numerical success with a scientific conclusion.
 
-Only the problem-contract provider is admitted in this initial build. Numerical science providers are reported as unavailable until their equations, conventions, validation fixtures, and evidence limits have been migrated. The solver never substitutes fixture data or reports unavailable science as computed.
+PR #1 admitted `problem-contract`; PR #2 computes and admits `spectral-core`
+alongside it. The pure-Kerr lattice contains 2,736 exact mode–spin roots:
+ℓ=2 contributes 690, ℓ=3 contributes 966, and ℓ=4 contributes 1,080.
+For every ℓ it includes every allowed m and n∈{0,1,2}. The ℓ=2 and ℓ=3
+domains use 40 inclusive uniform points from χ=0 to 0.95 plus χ∈{0.97, 0.98,
+0.99, 0.995, 0.997, 0.999}; ℓ=4 uses 40 inclusive uniform points from χ=0
+to 0.75. There is one pure-Kerr result per coordinate, with no polarization or
+EFT result axis.
+
+Every requested node is polished with the coupled angular/Leaver determinant
+backend. The packaged catalog records exact rational χ keys, binary64 solver
+coordinates, Mω, angular A, residual and continued-fraction diagnostics,
+angular refinement, repeat-polish agreement, and branch-continuation evidence.
+All rows pass the declared numerical gates. Exact overlaps are compared with
+392 independently published Motohashi values; those values are comparison
+evidence and are not substituted for computed rows. The provider performs
+exact selection only—no interpolation, extrapolation, or nearby-spin aliasing.
+Formal root enclosure is not claimed and the scientific state remains
+`NOT_EVALUATED`.
+
+All downstream providers remain unavailable and fail closed. PR #3 is the
+distinct `linear-response` migration; it contains no remaining spectral-grid
+work.
 
 ## Quick start on Windows
 
@@ -17,6 +39,7 @@ Install 64-bit CPython 3.12, clone the repository, and open PowerShell in the re
 ```powershell
 .\solver.ps1 plan .\examples\evidence-plan.json
 .\solver.ps1 run .\examples\problem-contract.json --store .\.solver-store
+.\solver.ps1 run .\examples\spectrum.json --store .\.solver-store
 ```
 
 The launcher uses a compatible bundled runtime at `.runtime\python\python.exe` when present, then an active `python` if it is 3.12 or newer, then the default Python 3 runtime selected by the Windows `py -3` launcher when that runtime is 3.12 or newer. Version probes are silent, so missing or stale launchers cannot contaminate command JSON.
@@ -26,6 +49,7 @@ The equivalent Python commands are:
 ```text
 python -m windows_solver plan examples/evidence-plan.json
 python -m windows_solver run examples/problem-contract.json --store .solver-store
+python -m windows_solver run examples/spectrum.json --store .solver-store
 ```
 
 When running directly from a source checkout, set `PYTHONPATH=src` or install the package.
@@ -86,4 +110,7 @@ python -m compileall -q src tests
 python -m unittest discover -s tests -v
 ```
 
-The package requires Python 3.12 and has no runtime dependencies outside the standard library in this control-plane release.
+The package requires Python 3.12 and has no runtime dependencies outside the
+standard library. Numerical dependencies are used only by the offline,
+reproducible lattice builder; the installed provider selects exact rows from
+the hash-authenticated packaged result.

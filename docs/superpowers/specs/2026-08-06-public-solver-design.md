@@ -10,7 +10,8 @@ The public identity is:
 
 > A theory-grounded nonlinear Kerr ringdown solver that computes evidence-graded linear and quadratic multimode responses, tracks deep and near-extremal mode branches, distinguishes physical perturbation mechanisms through inverse inference, and propagates them into waveforms and detector constraints.
 
-The word “certified” applies only to an artifact whose declared certification gates pass. It is never a package-wide adjective.
+Evidence labels apply only to the artifact and checks that support them; they
+are never package-wide endorsements.
 
 ## Product boundary
 
@@ -69,7 +70,8 @@ Unknown fields fail closed. Spins must satisfy `−1 < a_over_m < 1`. A study re
 
 ### Provider contract
 
-Each capability has exactly one active production provider. A provider declares:
+Each admitted capability has exactly one active production provider, and an
+unadmitted capability has none. A provider declares:
 
 - capability;
 - stable provider ID and implementation version;
@@ -78,7 +80,14 @@ Each capability has exactly one active production provider. A provider declares:
 - output artifact type;
 - availability and evidence level.
 
-The initial public control plane contains one built-in provider for validating and materializing the problem contract. Scientific capabilities are explicitly unavailable until their numerical implementations and validation fixtures are migrated. The engine never substitutes synthetic science or reports an unavailable provider as a completed calculation.
+The current release contains built-in providers for validating and
+materializing the problem contract and for exact selection from PR #2's
+computed pure-Kerr lattice. It admits 2,736 roots: 690 for ℓ=2, 966 for ℓ=3,
+and 1,080 for ℓ=4. All allowed m and n∈{0,1,2} are present across the approved
+46/46/40 spin grids. Remaining scientific capabilities are explicitly
+unavailable until their implementations and evidence are migrated. PR #3 will
+migrate `linear-response` as a distinct capability. The engine never
+substitutes synthetic science or reports an unavailable provider as completed.
 
 Provider descriptors are snapshotted before execution. A successful engine run
 must pass complete research-integrity verification before its run record is
@@ -137,9 +146,9 @@ solver export RUN_ID --output PATH [--store PATH]
 
 `solver.ps1` is the native PowerShell entry point and delegates to the package-local Python module. Commands emit deterministic JSON. Validation and provider failures return nonzero and retain structured failure evidence when a run directory exists.
 
-## First implementation boundary
+## Control-plane implementation boundary
 
-This change builds the public control plane:
+The first merged change built the public control plane:
 
 - typed contracts and strict JSON parsing;
 - capability DAG and dependency-closure planner;
@@ -150,7 +159,14 @@ This change builds the public control plane:
 - complete CLI and PowerShell launcher;
 - example study, tests, and CI.
 
-It does not claim that the numerical spectral, response, nonlinear, waveform, or inference providers have already migrated. Their absence is machine-readable and blocks the relevant target.
+The spectral provider has since migrated as an exact selector over the 2,736
+computed pure-Kerr roots: 690 for ℓ=2, 966 for ℓ=3, and 1,080 for ℓ=4.
+Each row is a canonical determinant polish with full-grid numerical evidence;
+392 Motohashi overlaps are independent comparisons rather than data sources.
+The scientific conclusion remains `NOT_EVALUATED`. Response, nonlinear,
+stability, waveform, detector, and inference providers have not migrated; their
+absence is machine-readable and blocks the relevant target. PR #3 is the
+`linear-response` provider migration only.
 
 ## Acceptance criteria
 

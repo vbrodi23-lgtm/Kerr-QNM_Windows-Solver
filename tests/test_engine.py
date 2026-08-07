@@ -4,6 +4,7 @@ from dataclasses import replace
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from windows_solver.artifacts import (
     ArtifactEnvelope,
@@ -172,7 +173,10 @@ class ExecutionEngineTests(unittest.TestCase):
             self.assertEqual(second.provider_execution_count, 0)
             self.assertEqual(second.cache_hit_count, 1)
 
-    def test_upstream_artifact_is_reused_across_requested_targets(self) -> None:
+    @patch("windows_solver.engine.validate_provider_payload")
+    def test_upstream_artifact_is_reused_across_requested_targets(
+        self, _validate_payload
+    ) -> None:
         with tempfile.TemporaryDirectory() as directory:
             store = ArtifactStore(Path(directory))
             engine = ExecutionEngine(store, self.complete_registry())
@@ -191,7 +195,10 @@ class ExecutionEngineTests(unittest.TestCase):
             self.assertEqual(second.provider_execution_count, 9)
             self.assertEqual(second.cache_hit_count, 1)
 
-    def test_detector_policy_change_recomputes_only_detector_descendants(self) -> None:
+    @patch("windows_solver.engine.validate_provider_payload")
+    def test_detector_policy_change_recomputes_only_detector_descendants(
+        self, _validate_payload
+    ) -> None:
         with tempfile.TemporaryDirectory() as directory:
             store = ArtifactStore(Path(directory))
             engine = ExecutionEngine(store, self.complete_registry())
@@ -238,17 +245,17 @@ class ExecutionEngineTests(unittest.TestCase):
             self.assertEqual(second.provider_execution_count, 2)
             self.assertEqual(second.cache_hit_count, 8)
 
-    def test_unavailable_science_fails_before_partial_execution(self) -> None:
+    def test_unavailable_downstream_science_fails_before_partial_execution(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             store = ArtifactStore(Path(directory))
             request = StudyRequest.from_mapping(
-                dict(VALID_STUDY, target="spectral-core")
+                dict(VALID_STUDY, target="linear-response")
             )
 
             record = ExecutionEngine(store, default_registry()).run(request)
 
             self.assertEqual(record.status, "FAILED")
-            self.assertEqual(record.unavailable_capability, "spectral-core")
+            self.assertEqual(record.unavailable_capability, "linear-response")
             self.assertEqual(record.provider_execution_count, 0)
             self.assertEqual(record.cache_hit_count, 0)
             self.assertEqual(record.artifact_ids, {})
@@ -286,7 +293,10 @@ class ExecutionEngineTests(unittest.TestCase):
                 ExecutionEngine(store, registry).load_run(record.run_id), record
             )
 
-    def test_downstream_claim_is_constrained_by_upstream_evidence(self) -> None:
+    @patch("windows_solver.engine.validate_provider_payload")
+    def test_downstream_claim_is_constrained_by_upstream_evidence(
+        self, _validate_payload
+    ) -> None:
         with tempfile.TemporaryDirectory() as directory:
             store = ArtifactStore(Path(directory))
             registry = ProviderRegistry(
@@ -368,7 +378,10 @@ class ExecutionEngineTests(unittest.TestCase):
             self.assertEqual(record.provider_execution_count, 1)
             self.assertIn("TypeError: provider must return ProviderResult", record.error)
 
-    def test_provider_cannot_mutate_upstream_artifact_snapshot(self) -> None:
+    @patch("windows_solver.engine.validate_provider_payload")
+    def test_provider_cannot_mutate_upstream_artifact_snapshot(
+        self, _validate_payload
+    ) -> None:
         with tempfile.TemporaryDirectory() as directory:
             store = ArtifactStore(Path(directory))
             registry = ProviderRegistry(
@@ -404,7 +417,10 @@ class ExecutionEngineTests(unittest.TestCase):
                 (problem.artifact_id,),
             )
 
-    def test_provider_descriptor_is_snapshotted_before_execution(self) -> None:
+    @patch("windows_solver.engine.validate_provider_payload")
+    def test_provider_descriptor_is_snapshotted_before_execution(
+        self, _validate_payload
+    ) -> None:
         with tempfile.TemporaryDirectory() as directory:
             store = ArtifactStore(Path(directory))
             provider = DescriptorChangingProvider(
@@ -429,8 +445,9 @@ class ExecutionEngineTests(unittest.TestCase):
             )
             verify_run_integrity(store, record)
 
+    @patch("windows_solver.engine.validate_provider_payload")
     def test_publication_profile_accepts_complete_evaluated_adverse_or_supported_run(
-        self,
+        self, _validate_payload
     ) -> None:
         for conclusion in (
             ScientificState.SUPPORTED,
@@ -467,8 +484,9 @@ class ExecutionEngineTests(unittest.TestCase):
                 self.assertEqual(record.evidence.scientific, conclusion)
                 self.assertEqual(len(artifacts), len(Capability))
 
+    @patch("windows_solver.engine.validate_provider_payload")
     def test_publication_profile_rejects_unevaluated_branch_hidden_by_contradiction(
-        self,
+        self, _validate_payload
     ) -> None:
         with tempfile.TemporaryDirectory() as directory:
             store = ArtifactStore(Path(directory))

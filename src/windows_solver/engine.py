@@ -27,6 +27,7 @@ from .contracts import (
     canonical_json_bytes,
 )
 from .planner import ExecutionPlan, build_plan
+from .payload_validation import validate_provider_payload
 from .providers import ProviderRegistry, ProviderResult, ProviderUnavailableError
 
 
@@ -413,6 +414,13 @@ class ExecutionEngine:
                         raise TypeError("provider payload must be an object")
                     if not isinstance(result.evidence, EvidenceState):
                         raise TypeError("provider evidence must be EvidenceState")
+                    validate_provider_payload(
+                        capability,
+                        descriptor.output_artifact_type,
+                        provider_mapping,
+                        scoped_request,
+                        result.payload,
+                    )
                     constrained_evidence = result.evidence.constrained_by(
                         tuple(item.evidence for item in upstream_envelopes)
                     )
@@ -465,6 +473,13 @@ class ExecutionEngine:
                         raise ArtifactVerificationError(
                             "cached artifact carrier is invalid"
                         )
+                    validate_provider_payload(
+                        capability,
+                        envelope.artifact_type,
+                        envelope.provider,
+                        scoped_request,
+                        envelope.payload,
+                    )
                     cache_hit_count += 1
             except Exception as error:
                 return self._failure_record(
@@ -564,7 +579,16 @@ def verify_run_integrity(
         if envelope.capability is not capability:
             raise ArtifactVerificationError("run artifact capability mismatch")
         expected_request = request.for_capability(capability).to_mapping()
-        if _thaw_json(envelope.request) != expected_request:
+        try:
+            stored_request_bytes = canonical_json_bytes(
+                _thaw_json(envelope.request)
+            )
+            expected_request_bytes = canonical_json_bytes(expected_request)
+        except (RecursionError, TypeError, ValueError) as error:
+            raise ArtifactVerificationError(
+                "run artifact request scope mismatch"
+            ) from error
+        if stored_request_bytes != expected_request_bytes:
             raise ArtifactVerificationError(
                 "run artifact request scope mismatch"
             )
@@ -599,6 +623,13 @@ def verify_run_integrity(
             raise ArtifactVerificationError("run provider capability mismatch")
         if envelope.provider.get("output_artifact_type") != envelope.artifact_type:
             raise ArtifactVerificationError("run provider output artifact type mismatch")
+        validate_provider_payload(
+            capability,
+            envelope.artifact_type,
+            envelope.provider,
+            request.for_capability(capability),
+            envelope.payload,
+        )
         constrained = envelope.evidence.constrained_by(
             tuple(envelopes[item].evidence for item in direct_dependencies)
         )

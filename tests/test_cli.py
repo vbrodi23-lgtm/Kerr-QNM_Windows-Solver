@@ -16,7 +16,7 @@ from windows_solver.contracts import canonical_json_bytes
 from windows_solver.engine import RunRecord
 from windows_solver.providers import ProviderRegistry
 
-from tests.fixtures import VALID_STUDY
+from tests.fixtures import SUPPORTED_SPECTRUM_STUDY, VALID_STUDY
 
 
 class ExplodingProblemProvider(ProblemContractProvider):
@@ -66,7 +66,6 @@ class CliTests(unittest.TestCase):
         self.assertEqual(
             output["unavailable_capabilities"],
             [
-                "spectral-core",
                 "linear-response",
                 "operator-stability",
                 "quadratic-ringdown",
@@ -76,6 +75,14 @@ class CliTests(unittest.TestCase):
                 "detector-inference",
                 "evidence-package",
             ],
+        )
+        self.assertEqual(
+            [provider["capability"] for provider in output["providers"]],
+            ["problem-contract", "spectral-core"],
+        )
+        self.assertEqual(
+            output["providers"][1]["provider_id"],
+            "kerr-qnm-computed-lattice-2736",
         )
 
     def test_run_then_verify_inspect_and_export(self) -> None:
@@ -122,9 +129,65 @@ class CliTests(unittest.TestCase):
         self.assertEqual(package["run"]["run_id"], second["run_id"])
         self.assertEqual(len(package["artifacts"]), 1)
 
+    def test_spectral_run_is_available_and_verifiable(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            study = Path(directory, "spectrum.json")
+            study.write_bytes(canonical_json_bytes(SUPPORTED_SPECTRUM_STUDY))
+            store = Path(directory, "store")
+            export = Path(directory, "spectrum-export.json")
+
+            status, output, error = self.invoke(
+                ["run", str(study), "--store", str(store)]
+            )
+            verify_status, verified, verify_error = self.invoke(
+                ["verify", output["run_id"], "--store", str(store)]
+            )
+            inspect_status, inspected, inspect_error = self.invoke(
+                ["inspect", output["run_id"], "--store", str(store)]
+            )
+            export_status, exported, export_error = self.invoke(
+                [
+                    "export",
+                    output["run_id"],
+                    "--store",
+                    str(store),
+                    "--output",
+                    str(export),
+                ]
+            )
+            package = json.loads(export.read_text(encoding="utf-8"))
+
+        self.assertEqual(status, 0)
+        self.assertEqual(error, "")
+        self.assertEqual(output["provider_execution_count"], 2)
+        self.assertEqual(set(output["artifact_ids"]), {
+            "problem-contract",
+            "spectral-core",
+        })
+        self.assertEqual(verify_status, 0)
+        self.assertEqual(verify_error, "")
+        self.assertEqual(verified["artifact_count"], 2)
+        self.assertEqual(inspect_status, 0)
+        self.assertEqual(inspect_error, "")
+        self.assertEqual(
+            inspected["artifacts"]["spectral-core"]["payload"][
+                "requested_root_count"
+            ],
+            2,
+        )
+        self.assertEqual(export_status, 0)
+        self.assertEqual(export_error, "")
+        self.assertEqual(exported["artifact_count"], 2)
+        self.assertEqual(
+            package["artifacts"]["spectral-core"]["payload"][
+                "requested_root_count"
+            ],
+            2,
+        )
+
     def test_unavailable_scientific_run_has_distinct_exit_code(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            study = self.write_study(directory, target="spectral-core")
+            study = self.write_study(directory, target="linear-response")
 
             status, output, error = self.invoke(
                 ["run", str(study), "--store", str(Path(directory, "store"))]
@@ -137,7 +200,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual(failure["error"]["run"]["status"], "FAILED")
         self.assertEqual(
             failure["error"]["run"]["unavailable_capability"],
-            "spectral-core",
+            "linear-response",
         )
 
     def test_provider_failure_uses_structured_stderr_and_persists_run(self) -> None:
