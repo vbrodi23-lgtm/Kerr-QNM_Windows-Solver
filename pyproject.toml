@@ -33,6 +33,7 @@ where = ["src"]
 windows_solver = [
     "data/kerr_qnm_roots_2736.csv",
     "data/kerr_qnm_lattice_receipt.json",
+    "data/release_domain_manifest.json",
     "data/LICENSE-CANONICAL-BACKEND-MIT.txt",
     "data/LICENSE-CC-BY-4.0.txt",
     "data/LICENSE-QNM-MIT.txt",

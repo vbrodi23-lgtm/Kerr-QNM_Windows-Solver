@@ -1,0 +1,2682 @@
+# Backlog
+
+## TASK-002: Bind source repositories, artifacts, licenses, and runtime receipts
+**Priority:** P0 | **Tags:** M01, evidence, validation
+**Assignee:** Unassigned | **Estimate:** 1–2 days | **Milestone:** M01
+
+### Objective
+
+Turn every manifest source into a reproducible receipt so later tasks consume immutable inputs rather than remembered locations.
+
+### Acceptance Criteria
+
+- [ ] Record repository URL, commit/blob identity, artifact hash, license, runtime, and retrieval method for every required source.
+- [ ] Verify all available bytes against their recorded hashes and reject mutable or ambiguous aliases.
+- [ ] Identify unavailable inputs with an owner and explicit unblock action.
+- [ ] Store receipts in a machine-readable format covered by repository tests.
+
+### Dependencies
+
+- **Blocked by:** TASK-001
+- **Blocks:** TASK-003, TASK-004
+
+### Evidence Output
+
+Authenticated source-receipt set and missing-input ledger.
+
+### Verification
+
+undefined
+
+### Review Focus
+
+Check license compatibility, mutable URLs, local-only artifacts, and runtime gaps.
+
+### Plan
+
+- Normalize source identities and licenses.
+- Implement or extend receipt validation.
+- Test clean and tampered cases.
+
+---
+
+## TASK-003: Classify every existing module by public scientific responsibility
+**Priority:** P0 | **Tags:** M01, architecture, evidence
+**Assignee:** Unassigned | **Estimate:** 1–2 days | **Milestone:** M01
+
+### Objective
+
+Map each existing implementation to exactly one role: active provider, validator, comparator, extension, retired fixture, or out of release scope.
+
+### Acceptance Criteria
+
+- [ ] Cover every scientific module and executable entry point named by TASK-001.
+- [ ] Assign at most one active production owner to each capability and record public input/output contracts.
+- [ ] Identify duplicate or conflicting implementations and state the replacement test required before any ownership change.
+- [ ] Prohibit retired/comparator code from production dependency closure.
+
+### Dependencies
+
+- **Blocked by:** TASK-001, TASK-002
+- **Blocks:** TASK-004, TASK-005
+
+### Evidence Output
+
+Module-ownership matrix linked to source hashes and capability contracts.
+
+### Verification
+
+undefined
+
+### Review Focus
+
+Look for scrapbook façade dependencies, hidden production comparators, and new physics misclassified as replacement code.
+
+### Plan
+
+- Inventory modules and dependency edges.
+- Classify roles against public capabilities.
+- Cross-check registry and quarantine conflicts.
+
+---
+
+## TASK-004: Freeze equations, conventions, normalizations, and evidence ceilings
+**Priority:** P0 | **Tags:** M01, physics, evidence
+**Assignee:** Unassigned | **Estimate:** 1–2 days | **Milestone:** M01
+
+### Objective
+
+Define the scientific identity required for cache keys and prevent later tasks from silently changing boundary conditions, gauge, tetrad, units, or normalization.
+
+### Acceptance Criteria
+
+- [ ] Record equation IDs, boundary conditions, Fourier/sign conventions, tetrad, gauge, units, field and amplitude normalizations for every release capability.
+- [ ] Define numerical acceptance gates and maximum scientific claim for each artifact class.
+- [ ] Record corrected or disputed conventions as explicit invalidation/replacement decisions.
+- [ ] Bind the manifest fields into canonical identity tests.
+
+### Dependencies
+
+- **Blocked by:** TASK-001, TASK-002, TASK-003
+- **Blocks:** TASK-005, TASK-006, TASK-012
+
+### Evidence Output
+
+Approved convention/equation register and artifact evidence-ceiling matrix.
+
+### Verification
+
+undefined
+
+### Review Focus
+
+Check especially Ψ₄ signs, QNM time convention, ORG/Hertz normalization, forced-frequency labels, and detector units.
+
+### Plan
+
+- Extract conventions from code and receipts.
+- Resolve or record conflicts without guessing.
+- Add identity and evidence-ceiling validation.
+
+---
+
+## TASK-005: Admit the machine-readable release-domain manifest
+**Priority:** P0 | **Tags:** M01, architecture, validation
+**Assignee:** Unassigned | **Estimate:** 1–2 days | **Milestone:** M01
+
+### Objective
+
+Make the frozen completion scope executable so unsupported, missing, or overclaimed work is detected before scientific computation.
+
+### Acceptance Criteria
+
+- [ ] Add a versioned manifest schema and strict parser to the public repository.
+- [ ] Validate capability coverage, coordinate completeness, source receipts, conventions, licenses, evidence ceilings, and milestone mapping.
+- [ ] Provide one canonical manifest fixture and negative fixtures for missing/duplicate/incompatible entries.
+- [ ] Close M01 only after human and automated reconciliation agree.
+
+### Dependencies
+
+- **Blocked by:** TASK-003, TASK-004
+- **Blocks:** TASK-006, TASK-012
+
+### Evidence Output
+
+Merged-ready release manifest, validator, tests, and M01 closure report.
+
+### Verification
+
+undefined
+
+### Review Focus
+
+Ensure the manifest freezes required scope without promising science outside available evidence.
+
+### Plan
+
+- Define schema from TASK-001–004 outputs.
+- Implement strict validation and fixtures.
+- Run change review and update M01 only on full closure.
+
+---
+
+## TASK-006: Define the public linear-response artifact and provider contract
+**Priority:** P1 | **Tags:** M02, provider, physics
+**Assignee:** Unassigned | **Estimate:** 1–2 days | **Milestone:** M02
+
+### Objective
+
+Specify one field-native artifact for physical first-order complex QNM shifts, local covariance/disks, mechanism identity, and bounded multimode comparisons.
+
+### Acceptance Criteria
+
+- [ ] Define payload keys, units, modes/spins, mechanism parameters, complex covariance, local uncertainty disks, and unresolved classifications.
+- [ ] Separate raw roots, pole shifts, projective reductions, and later response-matrix quantities.
+- [ ] Bind equations, conventions, numerical policy, runtime, upstream hashes, and evidence ceiling.
+- [ ] Reject unsupported mechanisms or coordinates before partial output.
+
+### Dependencies
+
+- **Blocked by:** TASK-005
+- **Blocks:** TASK-007, TASK-008
+
+### Evidence Output
+
+Linear-response schema, provider descriptor, validation tests, and example study.
+
+### Verification
+
+undefined
+
+### Review Focus
+
+Check field-native terminology, physical mechanism distinctions, and no atlas-wide uncertainty substitute.
+
+### Plan
+
+- Translate frozen manifest into an exact contract.
+- Add red contract and identity tests.
+- Review evidence boundary before migration.
+
+---
+
+## TASK-007: Freeze independent golden results for the legacy linear calculation
+**Priority:** P1 | **Tags:** M02, evidence, validation
+**Assignee:** Unassigned | **Estimate:** 1–2 days | **Milestone:** M02
+
+### Objective
+
+Characterize the accepted component-local response calculations without making legacy code a production dependency.
+
+### Acceptance Criteria
+
+- [ ] Select manifest-declared modes/spins and both horizon/exterior or theory mechanisms as golden fixtures.
+- [ ] Record central complex shifts, local solver diagnostics, signed-root uncertainty inputs, covariance, and projective classifications.
+- [ ] Authenticate source artifacts, code, runtime, and comparison method.
+- [ ] Include adverse/unresolved fixtures and independent published or alternate-backend comparisons where available.
+
+### Dependencies
+
+- **Blocked by:** TASK-005, TASK-006
+- **Blocks:** TASK-008, TASK-009, TASK-010
+
+### Evidence Output
+
+Hash-bound linear-response golden fixture set and comparison receipt.
+
+### Verification
+
+undefined
+
+### Review Focus
+
+Confirm fixtures are independent enough to detect migration errors and do not embed obsolete scope.
+
+### Plan
+
+- Select release-domain fixture slices.
+- Authenticate and independently compare values.
+- Lock tolerances from observed diagnostics, not desired outcomes.
+
+---
+
+## TASK-008: Migrate one end-to-end 220 linear-response slice
+**Priority:** P1 | **Tags:** M02, provider, validation
+**Assignee:** Unassigned | **Estimate:** 1–2 days | **Milestone:** M02
+
+### Objective
+
+Prove the public provider path with one authenticated mode/spin/mechanism slice before scaling to the full release domain.
+
+### Acceptance Criteria
+
+- [ ] Consume the public spectral artifact and produce one physical complex pole shift through the migrated implementation.
+- [ ] Match the independent golden fixture within declared local uncertainty.
+- [ ] Persist a canonical artifact with complete lineage and fail closed on wrong branch/convention.
+- [ ] Repeat identically with zero provider work from verified cache.
+
+### Dependencies
+
+- **Blocked by:** TASK-006, TASK-007
+- **Blocks:** TASK-009
+
+### Evidence Output
+
+One admitted-candidate linear-response slice with golden and cache receipts.
+
+### Verification
+
+undefined
+
+### Review Focus
+
+Inspect dependency isolation, determinant derivatives, branch identity, and whether fixture code leaks into production.
+
+### Plan
+
+- Create the narrow adapter behind the contract.
+- Run the 220 golden slice and failure cases.
+- Seal lineage and cache behavior.
+
+---
+
+## TASK-009: Expand component-local linear shifts across the frozen multimode domain
+**Priority:** P1 | **Tags:** M02, provider, physics
+**Assignee:** Unassigned | **Estimate:** 1–2 days | **Milestone:** M02
+
+### Objective
+
+Scale the proven provider without changing the response equation or substituting global uncertainty.
+
+### Acceptance Criteria
+
+- [ ] Compute every manifest-required mode × spin × mechanism leaf with exact coordinate identity.
+- [ ] Retain per-leaf residual, conditioning, step/refinement, and branch diagnostics.
+- [ ] Use adaptive precision only where declared conditioning requires it; unresolved leaves remain explicit.
+- [ ] Match all golden and independent overlap fixtures.
+
+### Dependencies
+
+- **Blocked by:** TASK-007, TASK-008
+- **Blocks:** TASK-010
+
+### Evidence Output
+
+Complete release-domain linear-shift artifact set and leaf-completeness receipt.
+
+### Verification
+
+undefined
+
+### Review Focus
+
+Look for interpolation, hidden missing leaves, mode mixing, and policy changes that invalidate unrelated spectrum artifacts.
+
+### Plan
+
+- Enumerate exact leaves from the manifest.
+- Compute/migrate in resumable batches with diagnostics.
+- Audit completeness and comparisons.
+
+---
+
+## TASK-010: Propagate signed-root and solver uncertainty into correlated response disks
+**Priority:** P1 | **Tags:** M02, evidence, physics
+**Assignee:** Unassigned | **Estimate:** 1–2 days | **Milestone:** M02
+
+### Objective
+
+Close the uncertainty model of the reported complex shifts, including the same Richardson combinations used for response centres.
+
+### Acceptance Criteria
+
+- [ ] Propagate signed-root uncertainty through real- and imaginary-axis centred differences and Richardson extrapolation.
+- [ ] Retain complex covariance/correlation across components generated by shared roots and policies.
+- [ ] Demonstrate local disks cover declared holdout or refinement discrepancies.
+- [ ] Reject atlas-wide worst-case substitutions and non-positive covariance.
+
+### Dependencies
+
+- **Blocked by:** TASK-007, TASK-009
+- **Blocks:** TASK-011
+
+### Evidence Output
+
+Per-component response disks, covariance artifacts, coverage audit, and evidence ceiling.
+
+### Verification
+
+undefined
+
+### Review Focus
+
+Check signed coefficients, correlation preservation, extrapolation order, and honest unresolved states.
+
+### Plan
+
+- Specify uncertainty algebra from frozen conventions.
+- Implement propagation over stored local diagnostics.
+- Calibrate and audit coverage without tuning classifications.
+
+---
+
+## TASK-011: Admit the complete linear-response provider and projective result ledger
+**Priority:** P1 | **Tags:** M02, provider, validation
+**Assignee:** Unassigned | **Estimate:** 1–2 days | **Milestone:** M02
+
+### Objective
+
+Publish the frozen-domain linear response with uncertainty-qualified multimode comparisons and explicit unresolved outcomes.
+
+### Acceptance Criteria
+
+- [ ] Compute projective quantities only from component-local responses and correlated uncertainty.
+- [ ] Record supported, fragile, unresolved, or contradicted outcomes without favorable-result gating.
+- [ ] Register exactly one available linear-response provider and keep unrelated capabilities unavailable.
+- [ ] Pass Windows/Ubuntu, cold/warm cache, export, and research verification gates.
+
+### Dependencies
+
+- **Blocked by:** TASK-010
+- **Blocks:** TASK-037, TASK-038
+
+### Evidence Output
+
+Public linear-response provider, projective/unresolved ledger, CI receipt, and M02 closure report.
+
+### Verification
+
+undefined
+
+### Review Focus
+
+Inspect evidence promotion, projective degeneracies, public language, and provider uniqueness.
+
+### Plan
+
+- Integrate reductions and ledger into the provider payload.
+- Run platform/cache/export gates.
+- Close M02 only after blocker-free review.
+
+---
+
+## TASK-012: Define spectral-field, co-mode, residue, and genealogy contracts
+**Priority:** P1 | **Tags:** M03, physics, architecture
+**Assignee:** Unassigned | **Estimate:** 1–2 days | **Milestone:** M03
+
+### Objective
+
+Extend the spectral responsibility beyond root rows with exact normalization and branch objects required downstream.
+
+### Acceptance Criteria
+
+- [ ] Define radial/angular field, derivative, co-mode, residue, normalization, branch-node, branch-edge, κ, and matching-evidence schemas.
+- [ ] Specify domain compactification, boundary behavior, precision/resolution policy, and coordinate identity.
+- [ ] Keep pure roots compatible with the merged spectral artifact and avoid recomputing unchanged leaves.
+- [ ] Reject field artifacts whose normalization or branch identity is unspecified.
+
+### Dependencies
+
+- **Blocked by:** TASK-005
+- **Blocks:** TASK-013, TASK-015
+
+### Evidence Output
+
+Versioned spectral-field/genealogy contracts and negative validation fixtures.
+
+### Verification
+
+undefined
+
+### Review Focus
+
+Check whether the public spectral provider remains one owner while internal leaf artifacts stay composable.
+
+### Plan
+
+- Derive contracts from M01 and downstream needs.
+- Add strict red tests and compatibility rules.
+- Review leaf caching and evidence ceiling.
+
+---
+
+## TASK-013: Compute normalized eigenfunctions and co-modes on reference slices
+**Priority:** P1 | **Tags:** M03, physics, validation
+**Assignee:** Unassigned | **Estimate:** 1–2 days | **Milestone:** M03
+
+### Objective
+
+Produce authenticated radial/angular fields and adjoint/co-mode data at the frozen reference coordinates.
+
+### Acceptance Criteria
+
+- [ ] Compute fields for manifest reference modes/spins with declared boundary and normalization conventions.
+- [ ] Pass radial/angular differential residuals, boundary asymptotics, Wronskian, and refinement checks.
+- [ ] Compute compatible co-modes/adjoints under the declared bilinear or energy pairing.
+- [ ] Record unresolved conditioning rather than renormalizing it away.
+
+### Dependencies
+
+- **Blocked by:** TASK-012
+- **Blocks:** TASK-014, TASK-015, TASK-024
+
+### Evidence Output
+
+Reference spectral-field artifacts with residual/refinement receipts.
+
+### Verification
+
+undefined
+
+### Review Focus
+
+Inspect boundary contamination, coordinate singularities, adjoint definition, and precision escalation.
+
+### Plan
+
+- Implement/select the field evaluator behind the schema.
+- Run reference slices and refinement ladders.
+- Authenticate results and adverse cases.
+
+---
+
+## TASK-014: Compute residues and verify biorthogonal normalization
+**Priority:** P1 | **Tags:** M03, physics, evidence
+**Assignee:** Unassigned | **Estimate:** 1–2 days | **Milestone:** M03
+
+### Objective
+
+Close the pole-residue objects needed by signals, response normalization, and operator comparisons.
+
+### Acceptance Criteria
+
+- [ ] Compute simple-pole residues/excitation factors for reference fields using the frozen convention.
+- [ ] Verify left/right pairing, determinant derivative relation, and scale invariance.
+- [ ] Detect clusters or near-multiple poles and downgrade evidence instead of applying simple-pole formulas.
+- [ ] Bind residue provenance to root and field artifacts.
+
+### Dependencies
+
+- **Blocked by:** TASK-013
+- **Blocks:** TASK-017, TASK-049
+
+### Evidence Output
+
+Residue/co-mode artifacts with biorthogonality and simple-pole evidence.
+
+### Verification
+
+undefined
+
+### Review Focus
+
+Check normalization cancellation, derivative accuracy, and no simple-pole claim near unresolved clusters.
+
+### Plan
+
+- Implement residue extraction from authenticated fields.
+- Cross-check independent derivative/pairing forms.
+- Seal evidence and failure policy.
+
+---
+
+## TASK-015: Build the κ-continuation branch genealogy
+**Priority:** P1 | **Tags:** M03, physics, evidence
+**Assignee:** Unassigned | **Estimate:** 1–2 days | **Milestone:** M03
+
+### Objective
+
+Track each release-domain mode from its seed through the near-extremal grid without branch swaps or overtone relabelling.
+
+### Acceptance Criteria
+
+- [ ] Represent branch nodes/edges with exact spin or κ identity, predictor/corrector diagnostics, and invariant labels.
+- [ ] Continue all manifest-required branches with adaptive intermediate seeds while emitting only requested coordinates.
+- [ ] Reject low-residual branch hops using genealogy, eigenfunction overlap, and continuity diagnostics.
+- [ ] Record clusters, bifurcations, missing branches, and uncertainty explicitly.
+
+### Dependencies
+
+- **Blocked by:** TASK-012, TASK-013
+- **Blocks:** TASK-016
+
+### Evidence Output
+
+Authenticated branch graph and completeness/branch-hop audit.
+
+### Verification
+
+undefined
+
+### Review Focus
+
+Inspect overtone identity, ZDM/DM ambiguity, corotation behavior, and hidden interpolation.
+
+### Plan
+
+- Define seeds and exact κ grid.
+- Run guarded continuation with overlap invariants.
+- Audit genealogy completeness and reversibility.
+
+---
+
+## TASK-016: Validate NHEK matching and ZDM/DM classification
+**Priority:** P1 | **Tags:** M03, physics, validation
+**Assignee:** Unassigned | **Estimate:** 1–2 days | **Milestone:** M03
+
+### Objective
+
+Attach near-horizon matching evidence and stable zero-damped/damped labels to the branch graph.
+
+### Acceptance Criteria
+
+- [ ] Evaluate declared NHEK/throat asymptotic quantities on the frozen κ ladder.
+- [ ] Measure overlap-domain matching errors and convergence with κ/resolution.
+- [ ] Classify ZDM/DM branches and the critical boundary with uncertainty, including ambiguous cases.
+- [ ] Do not require the later quadratic solve for linear branch classification; flag second-order validation separately.
+
+### Dependencies
+
+- **Blocked by:** TASK-015
+- **Blocks:** TASK-017
+
+### Evidence Output
+
+NHEK matching receipt, ZDM/DM classification ledger, and critical-boundary uncertainty.
+
+### Verification
+
+undefined
+
+### Review Focus
+
+Check regime validity, fitted exponents, branch-boundary amplification, and classification overclaim.
+
+### Plan
+
+- Implement matching observables from branch artifacts.
+- Run κ/refinement ladders and comparisons.
+- Classify with explicit ambiguity thresholds.
+
+---
+
+## TASK-017: Admit release-domain spectral fields and branch genealogy
+**Priority:** P1 | **Tags:** M03, provider, validation
+**Assignee:** Unassigned | **Estimate:** 1–2 days | **Milestone:** M03
+
+### Objective
+
+Make roots, fields, residues, and branch information one compatible public spectral responsibility with selective leaf caching.
+
+### Acceptance Criteria
+
+- [ ] Cover every manifest-required spectral leaf with no duplicate or missing branch identity.
+- [ ] Preserve exact compatibility with the merged 2,736-root catalogue.
+- [ ] Register one spectral provider implementation that emits requested field/genealogy subpayloads without unrelated work.
+- [ ] Pass Windows/Ubuntu, resume, cache isolation, export, and research verification.
+
+### Dependencies
+
+- **Blocked by:** TASK-014, TASK-016
+- **Blocks:** TASK-018, TASK-024
+
+### Evidence Output
+
+Admitted spectral-field/genealogy provider upgrade and M03 closure report.
+
+### Verification
+
+undefined
+
+### Review Focus
+
+Inspect provider replacement invariants, cache granularity, catalogue compatibility, and weakest evidence.
+
+### Plan
+
+- Integrate field/genealogy leaves behind the existing owner.
+- Run complete frozen-domain and selective-cache gates.
+- Close M03 only after review.
+
+---
+
+## TASK-018: Define operator-stability artifact and three evidence layers
+**Priority:** P1 | **Tags:** M04, architecture, evidence
+**Assignee:** Unassigned | **Estimate:** 1–2 days | **Milestone:** M04
+
+### Objective
+
+Separate root enclosure, local response error, and full-operator stability so no finite matrix result is reported as a continuum theorem.
+
+### Acceptance Criteria
+
+- [ ] Define 2D operator/pencil, domain, boundary, Gram, symmetrizer, enclosure, resolvent, pseudospectrum, and truncation schemas.
+- [ ] Give each layer independent numerical and scientific evidence fields.
+- [ ] Require compatible spectral artifacts and physical norm identity.
+- [ ] Keep full-operator claim false until continuum/truncation gates pass.
+
+### Dependencies
+
+- **Blocked by:** TASK-017
+- **Blocks:** TASK-019, TASK-020, TASK-021
+
+### Evidence Output
+
+Operator-stability contract and evidence-layer test matrix.
+
+### Verification
+
+undefined
+
+### Review Focus
+
+Check mathematical domain, boundary fluxes, polynomial pencil sign, and continuum language.
+
+### Plan
+
+- Translate frozen operator conventions into schemas.
+- Add evidence propagation and invalid-state tests.
+- Review claim boundaries before computation.
+
+---
+
+## TASK-019: Assemble and validate the 2D hyperboloidal Kerr operator
+**Priority:** P1 | **Tags:** M04, physics, validation
+**Assignee:** Unassigned | **Estimate:** 1–2 days | **Milestone:** M04
+
+### Objective
+
+Produce the general nonseparable operator backend at reference modes/spins and compare its spectral output to the separated backend.
+
+### Acceptance Criteria
+
+- [ ] Assemble the declared Kerr hyperboloidal operator/pencil and regular boundary treatment.
+- [ ] Pass coefficient identity, manufactured-solution, and resolution-refinement tests.
+- [ ] Recover reference spectral roots within declared discretization uncertainty.
+- [ ] Record spurious modes and failure states rather than filtering by desired answers.
+
+### Dependencies
+
+- **Blocked by:** TASK-018
+- **Blocks:** TASK-020, TASK-021
+
+### Evidence Output
+
+Reference 2D operator artifacts, assembly receipts, and separated-backend comparison.
+
+### Verification
+
+undefined
+
+### Review Focus
+
+Inspect compactification, boundary regularity, angular/radial coupling, and spectral pollution controls.
+
+### Plan
+
+- Build the smallest reference operator slice.
+- Validate coefficients and manufactured cases.
+- Compare spectrum and catalogue discrepancies.
+
+---
+
+## TASK-020: Implement coupled Kerr ball evaluation and root enclosures
+**Priority:** P1 | **Tags:** M04, physics, evidence
+**Assignee:** Unassigned | **Estimate:** 1–2 days | **Milestone:** M04
+
+### Objective
+
+Provide formal local root evidence where the coupled angular/radial equations and derivative bounds support it.
+
+### Acceptance Criteria
+
+- [ ] Evaluate determinant/operator quantities over complex balls with outward-rounded bounds or documented equivalent.
+- [ ] Apply Krawczyk/winding gates with derivative and truncation bounds on frozen reference roots.
+- [ ] Distinguish formal enclosure from high-accuracy residual acceptance.
+- [ ] Emit unresolved when the ball or derivative bound cannot certify uniqueness.
+
+### Dependencies
+
+- **Blocked by:** TASK-018, TASK-019
+- **Blocks:** TASK-022
+
+### Evidence Output
+
+Root-enclosure artifacts and certified/unresolved benchmark ledger.
+
+### Verification
+
+undefined
+
+### Review Focus
+
+Check interval validity, derivative completeness, angular coupling, and unsupported uniqueness claims.
+
+### Plan
+
+- Implement validated evaluator on reference cases.
+- Add enclosure and failure benchmarks.
+- Document exact evidence ceiling.
+
+---
+
+## TASK-021: Construct the physical energy Gram matrix and positive-energy symmetrizer
+**Priority:** P1 | **Tags:** M04, physics, evidence
+**Assignee:** Unassigned | **Estimate:** 1–2 days | **Milestone:** M04
+
+### Objective
+
+Define the perturbation norm from Kerr geometry and boundary flux rather than an arbitrary Euclidean discretization.
+
+### Acceptance Criteria
+
+- [ ] Derive/discretize the declared physical energy pairing including horizon and null-infinity boundary terms.
+- [ ] Demonstrate Hermitian consistency and positivity on the admitted subspace or record the exact failure domain.
+- [ ] Construct and condition the symmetrizer with refinement evidence.
+- [ ] Bind all pseudospectral norms to this artifact.
+
+### Dependencies
+
+- **Blocked by:** TASK-018, TASK-019
+- **Blocks:** TASK-022
+
+### Evidence Output
+
+Gram/symmetrizer artifacts, positivity spectrum, flux identity, and domain limitations.
+
+### Verification
+
+undefined
+
+### Review Focus
+
+Inspect physical meaning of the norm, gauge degeneracies, boundary flux signs, and conditioning.
+
+### Plan
+
+- Derive the discrete pairing from frozen conventions.
+- Compute reference Gram/symmetrizer with diagnostics.
+- Audit positivity and admissible subspace.
+
+---
+
+## TASK-022: Compute resolvents, pseudospectra, and truncation evidence
+**Priority:** P1 | **Tags:** M04, physics, validation
+**Assignee:** Unassigned | **Estimate:** 1–2 days | **Milestone:** M04
+
+### Objective
+
+Measure operator sensitivity in the physical norm with explicit finite-dimensional and continuum limits.
+
+### Acceptance Criteria
+
+- [ ] Compute resolvent norms/pseudospectral contours using the authenticated operator and symmetrizer.
+- [ ] Run basis/domain/precision ladders and quantify contour stability.
+- [ ] Provide a continuum truncation bound or explicitly cap evidence at converged finite-dimensional behavior.
+- [ ] Cross-check selected points with direct singular-value or alternate-discretization calculations.
+
+### Dependencies
+
+- **Blocked by:** TASK-020, TASK-021
+- **Blocks:** TASK-023
+
+### Evidence Output
+
+Pseudospectrum artifacts, refinement/truncation ledger, and claim ceiling.
+
+### Verification
+
+undefined
+
+### Review Focus
+
+Look for Euclidean-norm leakage, hidden regularization, contour interpolation, and continuum overstatement.
+
+### Plan
+
+- Compute reference resolvent grid in physical norm.
+- Run refinement and alternate-method comparisons.
+- Set evidence ceiling from observed truncation behavior.
+
+---
+
+## TASK-023: Admit the operator-stability provider
+**Priority:** P1 | **Tags:** M04, provider, validation
+**Assignee:** Unassigned | **Estimate:** 1–2 days | **Milestone:** M04
+
+### Objective
+
+Expose root, resolvent, pseudospectral, and truncation evidence through one fail-closed public capability.
+
+### Acceptance Criteria
+
+- [ ] Register exactly one operator-stability provider with selective evidence-layer output.
+- [ ] Require all direct spectral inputs and reject unsupported continuum profiles before work.
+- [ ] Pass Windows/Ubuntu where supported, resume/cache isolation, export, and research verification.
+- [ ] Publish a closure report that states which claims are formal, numerical, unresolved, or not applicable.
+
+### Dependencies
+
+- **Blocked by:** TASK-022
+- **Blocks:** TASK-059
+
+### Evidence Output
+
+Admitted provider, platform receipts, and M04 closure report.
+
+### Verification
+
+undefined
+
+### Review Focus
+
+Inspect claim language, profile gating, provider uniqueness, and whether unresolved continuum evidence is preserved.
+
+### Plan
+
+- Integrate validated operator artifacts behind the contract.
+- Run platform/cache/evidence gates.
+- Close M04 after independent review.
+
+---
+
+## TASK-024: Authenticate the first-order quadratic handoff and parent fields
+**Priority:** P1 | **Tags:** M05, physics, evidence
+**Assignee:** Unassigned | **Estimate:** 1–2 days | **Milestone:** M05
+
+### Objective
+
+Bind the resolved first-order eigenfunction → Hertz potential → ORG metric chain to exact parent spectral artifacts before derivative work.
+
+### Acceptance Criteria
+
+- [ ] Identify exact parent mode/spin artifacts and verify source hashes, conventions, gauge, tetrad, and normalization.
+- [ ] Define the handoff payload required by the quadratic source, including derivatives and domain maps.
+- [ ] Reproduce the accepted reference residual states from immutable inputs.
+- [ ] Reject equivalent-looking parents with incompatible identities.
+
+### Dependencies
+
+- **Blocked by:** TASK-013, TASK-017
+- **Blocks:** TASK-025, TASK-027
+
+### Evidence Output
+
+First-order handoff contract, parent receipts, and reference reproduction report.
+
+### Verification
+
+undefined
+
+### Review Focus
+
+Confirm prior first-order acceptance is real evidence, not remembered status text.
+
+### Plan
+
+- Locate and authenticate exact parents.
+- Define handoff schema and identity.
+- Reproduce reference artifacts and quarantine gaps.
+
+---
+
+## TASK-025: Reproduce Hertz potentials from authenticated eigenfunctions
+**Priority:** P1 | **Tags:** M05, physics, validation
+**Assignee:** Unassigned | **Estimate:** 1–2 days | **Milestone:** M05
+
+### Objective
+
+Generate first-order Hertz potentials with boundary, normalization, and derivative data usable by the physical metric reconstruction.
+
+### Acceptance Criteria
+
+- [ ] Compute Hertz potentials for frozen reference parents using declared inversion identities.
+- [ ] Pass radial/angular equation, boundary asymptotic, and refinement gates.
+- [ ] Record all derivatives needed downstream without lossy interpolation.
+- [ ] Demonstrate consistent transformation under allowed parent rescaling.
+
+### Dependencies
+
+- **Blocked by:** TASK-024
+- **Blocks:** TASK-026
+
+### Evidence Output
+
+Authenticated Hertz-potential artifacts and inversion/residual receipts.
+
+### Verification
+
+undefined
+
+### Review Focus
+
+Inspect Starobinsky constants, complex conjugation, boundary branch, and derivative accuracy.
+
+### Plan
+
+- Implement/reuse the authenticated inversion path.
+- Compute reference potentials and derivatives.
+- Cross-check identities and scale behavior.
+
+---
+
+## TASK-026: Reconstruct the ORG metric and close G⁽¹⁾ residual gates
+**Priority:** P1 | **Tags:** M05, physics, validation
+**Assignee:** Unassigned | **Estimate:** 1–2 days | **Milestone:** M05
+
+### Objective
+
+Produce the usable first-order metric required by G⁽²⁾ and prove its gauge, boundary, and normalization consistency.
+
+### Acceptance Criteria
+
+- [ ] Reconstruct all required ORG metric/tetrad components and derivatives from the Hertz artifact.
+- [ ] Evaluate G⁽¹⁾ residuals pointwise and in declared norms at each reference spin.
+- [ ] Pass boundary regularity, gauge-condition, conjugation/reality, and refinement gates.
+- [ ] Record unresolved regions or cancellations without suppressing them.
+
+### Dependencies
+
+- **Blocked by:** TASK-025
+- **Blocks:** TASK-027, TASK-028
+
+### Evidence Output
+
+ORG metric artifacts, G⁽¹⁾ residual maps, and first-order closure receipt.
+
+### Verification
+
+undefined
+
+### Review Focus
+
+Inspect tetrad/gauge conventions, cancellation error, axis/horizon regularity, and evidence thresholds.
+
+### Plan
+
+- Build metric components from authenticated Hertz data.
+- Compute residual/gauge diagnostics.
+- Refine and independently review reference closure.
+
+---
+
+## TASK-027: Compile and authenticate quadratic derivative expressions
+**Priority:** P1 | **Tags:** M05, physics, architecture
+**Assignee:** Unassigned | **Estimate:** 1–2 days | **Milestone:** M05
+
+### Objective
+
+Use an offline symbolic compiler to generate the exact angular–radial derivative expressions required by G⁽²⁾ without a proprietary runtime dependency.
+
+### Acceptance Criteria
+
+- [ ] Compile tensor-expanded quadratic expressions from the frozen metric, tetrad, gauge, and Fourier conventions.
+- [ ] Apply algebraic simplification/common-subexpression rules without changing identity.
+- [ ] Hash source notebooks/scripts, generated expressions, compiler version, and independent identity checks.
+- [ ] Ship generated open-runtime code plus licensing/provenance; Wolfram remains optional offline tooling.
+
+### Dependencies
+
+- **Blocked by:** TASK-024, TASK-026
+- **Blocks:** TASK-028, TASK-030
+
+### Evidence Output
+
+Content-addressed symbolic source, generated kernel, and identity-check receipt.
+
+### Verification
+
+undefined
+
+### Review Focus
+
+Inspect omitted terms, conjugation, index placement, convention hashes, and generated-code reproducibility.
+
+### Plan
+
+- Freeze symbolic inputs and compiler environment.
+- Generate and simplify the derivative kernel.
+- Run independent identities and seal receipts.
+
+---
+
+## TASK-028: Compute angular–radial derivative maps and coupling integrals
+**Priority:** P1 | **Tags:** M05, physics, validation
+**Assignee:** Unassigned | **Estimate:** 1–2 days | **Milestone:** M05
+
+### Objective
+
+Evaluate the physical derivative couplings and selection rules needed to form the quadratic source.
+
+### Acceptance Criteria
+
+- [ ] Implement angular/radial derivative maps against authenticated metric/field artifacts.
+- [ ] Enforce m/frequency addition and angular selection rules from the expressions, not hard-coded desired channels.
+- [ ] Compute reference coupling integrals with quadrature, resolution, and precision diagnostics.
+- [ ] Demonstrate vanishing forbidden channels and stable allowed-channel values.
+
+### Dependencies
+
+- **Blocked by:** TASK-026, TASK-027
+- **Blocks:** TASK-029, TASK-030
+
+### Evidence Output
+
+Derivative-map artifacts, selection-rule ledger, coupling integrals, and convergence receipt.
+
+### Verification
+
+undefined
+
+### Review Focus
+
+Check spin weight, angular normalization, derivative order, endpoint behavior, and truncation.
+
+### Plan
+
+- Bind generated kernels to numerical fields.
+- Evaluate allowed/forbidden reference channels.
+- Refine and audit integral stability.
+
+---
+
+## TASK-029: Close the release-domain first-order handoff and coupling set
+**Priority:** P1 | **Tags:** M05, physics, validation
+**Assignee:** Unassigned | **Estimate:** 1–2 days | **Milestone:** M05
+
+### Objective
+
+Expand the verified handoff/coupling path to every parent required by the release manifest and certify completeness for the quadratic source.
+
+### Acceptance Criteria
+
+- [ ] Produce all manifest-required parent metric and derivative-coupling leaves.
+- [ ] Pass per-leaf residual, boundary, selection, quadrature, precision, and normalization gates.
+- [ ] Support interruption/resume and recompute only changed leaves.
+- [ ] Issue M05 closure only when the source builder can consume every required input.
+
+### Dependencies
+
+- **Blocked by:** TASK-028
+- **Blocks:** TASK-030
+
+### Evidence Output
+
+Complete handoff/coupling artifact set, universe receipt, and M05 closure report.
+
+### Verification
+
+undefined
+
+### Review Focus
+
+Look for missing derivatives, implicit interpolation, unbounded condition numbers, and parent-pair scope drift.
+
+### Plan
+
+- Enumerate required leaves from the manifest.
+- Compute/refine with resumable caching.
+- Audit completeness and source compatibility.
+
+---
+
+## TASK-030: Define the physical quadratic-source and forced-solution contract
+**Priority:** P0 | **Tags:** M06, physics, architecture
+**Assignee:** Unassigned | **Estimate:** 1–2 days | **Milestone:** M06
+
+### Objective
+
+Fix the second-order physical quantity, source conventions, forced frequency, azimuth, boundary conditions, amplitude normalization, and R⁺⁺₄₄ identity.
+
+### Acceptance Criteria
+
+- [ ] Define parent-pair identity with Ω=ω₁+ω₂ and M=m₁+m₂; for 220⁺×220⁺ require Ω=2ω₂₂₀ and M=4.
+- [ ] Specify G⁽²⁾ and spin −2 source payloads, forced-solve domain/boundaries, asymptotic amplitudes, and coupling-ratio normalization.
+- [ ] State explicitly that the forced response is not assigned a daughter overtone and is not a linear 440 QNM.
+- [ ] Bind source/solve/extraction evidence and failure states into one quadratic-ringdown provider contract.
+
+### Dependencies
+
+- **Blocked by:** TASK-027, TASK-029
+- **Blocks:** TASK-031, TASK-034
+
+### Evidence Output
+
+Quadratic-ringdown contract, convention register, and red acceptance tests.
+
+### Verification
+
+undefined
+
+### Review Focus
+
+Inspect physical definition, symmetrization factors, gauge/tetrad identity, and amplitude units.
+
+### Plan
+
+- Translate frozen quadratic scope into exact contracts.
+- Add wrong-label and wrong-normalization tests.
+- Review before source computation.
+
+---
+
+## TASK-031: Construct the physical quadratic source at the first reference spin
+**Priority:** P0 | **Tags:** M06, physics, validation
+**Assignee:** Unassigned | **Estimate:** 1–2 days | **Milestone:** M06
+
+### Objective
+
+Evaluate G⁽²⁾ and the corresponding spin −2 Teukolsky source for the first frozen parent case.
+
+### Acceptance Criteria
+
+- [ ] Consume only authenticated M05 metric/coupling artifacts and the generated symbolic kernel.
+- [ ] Produce all source components on the declared hyperboloidal domain with complete lineage.
+- [ ] Pass internal algebraic consistency and independent subset comparisons.
+- [ ] Retain raw diagnostics and fail if any required component is missing or non-finite.
+
+### Dependencies
+
+- **Blocked by:** TASK-030
+- **Blocks:** TASK-032
+
+### Evidence Output
+
+First reference G⁽²⁾/Teukolsky source artifact and construction receipt.
+
+### Verification
+
+undefined
+
+### Review Focus
+
+Inspect source completeness, self-coupling factors, Fourier phases, and cancellation.
+
+### Plan
+
+- Bind first reference parents to generated source code.
+- Compute and independently compare the source.
+- Seal diagnostics and failures.
+
+---
+
+## TASK-032: Validate source residuals, regularity, and gauge consistency
+**Priority:** P0 | **Tags:** M06, physics, evidence
+**Assignee:** Unassigned | **Estimate:** 1–2 days | **Milestone:** M06
+
+### Objective
+
+Prove the first quadratic source is a usable physical forcing term before attempting the expensive solve.
+
+### Acceptance Criteria
+
+- [ ] Evaluate differential/Bianchi/source identities in declared norms.
+- [ ] Check horizon, axis, and null-infinity regularity in the chosen coordinates/tetrad.
+- [ ] Test allowed first-order rescaling and gauge transformations against the predicted source/amplitude behavior.
+- [ ] Set numerical acceptance and scientific evidence ceilings from refinement data.
+
+### Dependencies
+
+- **Blocked by:** TASK-031
+- **Blocks:** TASK-033, TASK-034
+
+### Evidence Output
+
+Source-validation artifact with residual maps, boundary limits, gauge tests, and verdict.
+
+### Verification
+
+undefined
+
+### Review Focus
+
+Check whether small integrated residuals hide local singularities or gauge contamination.
+
+### Plan
+
+- Build residual and boundary evaluators.
+- Run refinement and gauge/scale tests.
+- Accept or return to source construction with exact failure evidence.
+
+---
+
+## TASK-033: Solve the forced hyperboloidal system at the first reference spin
+**Priority:** P0 | **Tags:** M06, physics, validation
+**Assignee:** Unassigned | **Estimate:** 1–2 days | **Milestone:** M06
+
+### Objective
+
+Compute the physical second-order response to the validated source with ingoing/outgoing regularity and no eigenvalue search.
+
+### Acceptance Criteria
+
+- [ ] Solve the spin −2 forced problem at the exact complex Ω with declared boundary conditions.
+- [ ] Pass discrete equation residual, boundary flux/regularity, precision, and resolution gates.
+- [ ] Demonstrate independence from solver initial guess/preconditioner within uncertainty.
+- [ ] Persist solution and asymptotic data with source lineage.
+
+### Dependencies
+
+- **Blocked by:** TASK-032
+- **Blocks:** TASK-035
+
+### Evidence Output
+
+First reference forced-solution artifact and convergence receipt.
+
+### Verification
+
+undefined
+
+### Review Focus
+
+Inspect resonance conditioning, nullspaces, boundary implementation, and distinction from a root solve.
+
+### Plan
+
+- Assemble forced operator/source pair.
+- Solve with refinement and alternate numerical path.
+- Seal solution and boundary diagnostics.
+
+---
+
+## TASK-034: Compute an independent second reference quadratic response
+**Priority:** P0 | **Tags:** M06, physics, validation
+**Assignee:** Unassigned | **Estimate:** 1–2 days | **Milestone:** M06
+
+### Objective
+
+Repeat source construction, validation, and forced solution at a distinct spin to expose spin-dependent or convention-hidden defects.
+
+### Acceptance Criteria
+
+- [ ] Build and validate the complete source at the second frozen reference spin.
+- [ ] Solve the forced problem with the same physical contract and spin-appropriate numerical policy.
+- [ ] Pass local residual/boundary/refinement gates and record any conditioning escalation.
+- [ ] Compare invariant normalization behavior with the first reference case.
+
+### Dependencies
+
+- **Blocked by:** TASK-030, TASK-032
+- **Blocks:** TASK-035
+
+### Evidence Output
+
+Second reference source/solution artifacts and cross-spin comparison.
+
+### Verification
+
+undefined
+
+### Review Focus
+
+Look for hard-coded first-spin assumptions, branch mismatch, and policy undercoverage.
+
+### Plan
+
+- Generate second-spin inputs through the same authenticated path.
+- Compute/validate source and solve.
+- Compare invariant diagnostics across spins.
+
+---
+
+## TASK-035: Extract asymptotic amplitudes and establish convergence
+**Priority:** P0 | **Tags:** M06, physics, evidence
+**Assignee:** Unassigned | **Estimate:** 1–2 days | **Milestone:** M06
+
+### Objective
+
+Obtain the second-order outgoing amplitude from both forced solutions and quantify numerical/truncation uncertainty.
+
+### Acceptance Criteria
+
+- [ ] Extract horizon and null-infinity amplitudes using the frozen normalization and asymptotic series.
+- [ ] Demonstrate extraction-radius/order, resolution, precision, and domain-map convergence.
+- [ ] Cross-check with an independent flux/Wronskian or Green-function extraction where available.
+- [ ] Extend to every manifest-required quadratic case or mark unresolved leaves explicitly.
+
+### Dependencies
+
+- **Blocked by:** TASK-033, TASK-034
+- **Blocks:** TASK-036
+
+### Evidence Output
+
+Asymptotic-amplitude artifacts, convergence disks, and independent extraction receipt.
+
+### Verification
+
+undefined
+
+### Review Focus
+
+Inspect asymptotic contamination, amplitude phase/sign, normalization cancellation, and domain completeness.
+
+### Plan
+
+- Implement two compatible extraction paths.
+- Run convergence ladders on reference and release cases.
+- Set component-local uncertainty and evidence.
+
+---
+
+## TASK-036: Compute R⁺⁺₄₄ and admit the quadratic-ringdown provider
+**Priority:** P0 | **Tags:** M06, provider, validation
+**Assignee:** Unassigned | **Estimate:** 1–2 days | **Milestone:** M06
+
+### Objective
+
+Report the normalized physical coupling ratio with complete provenance and expose it through one public provider.
+
+### Acceptance Criteria
+
+- [ ] Compute R⁺⁺₄₄=A⁽²⁾₄₄/(A⁽¹⁾₂₂₀)² using matching normalization identities and propagated uncertainty.
+- [ ] Verify invariance under allowed parent rescaling and reject incompatible amplitude conventions.
+- [ ] Register one quadratic-ringdown provider with parent-pair leaf caching and fail-closed unsupported requests.
+- [ ] Pass Windows/Ubuntu where supported, cold/warm, export, and research verification gates.
+
+### Dependencies
+
+- **Blocked by:** TASK-035
+- **Blocks:** TASK-037, TASK-039
+
+### Evidence Output
+
+R⁺⁺₄₄ artifacts, admitted provider, CI receipt, and M06 closure report.
+
+### Verification
+
+undefined
+
+### Review Focus
+
+Inspect numerator/denominator conventions, uncertainty correlation, forced-response identity, and evidence ceiling.
+
+### Plan
+
+- Form normalized ratios from authenticated amplitudes.
+- Integrate provider and cache leaves.
+- Run platform/evidence review and close M06.
+
+---
+
+## TASK-037: Define the physical response-matrix contract and parameter basis
+**Priority:** P1 | **Tags:** M07, architecture, physics
+**Assignee:** Unassigned | **Estimate:** 1–2 days | **Milestone:** M07
+
+### Objective
+
+Specify how distinct linear shifts and quadratic amplitudes enter one sparse inference object without losing units, covariance, or provenance.
+
+### Acceptance Criteria
+
+- [ ] Freeze parameter ordering, observable ordering, complex representation, units, priors/scales, sparsity, and missing-block policy.
+- [ ] Define covariance/cross-covariance and uncertainty propagation from M02 and M06.
+- [ ] Keep pole shifts and quadratic amplitudes as typed blocks with explicit joins.
+- [ ] Reject rank/identifiability claims until uncertainty-aware diagnostics exist.
+
+### Dependencies
+
+- **Blocked by:** TASK-011, TASK-036
+- **Blocks:** TASK-038, TASK-039, TASK-040
+
+### Evidence Output
+
+Response-matrix schema, parameter dictionary, and contract tests.
+
+### Verification
+
+undefined
+
+### Review Focus
+
+Inspect physical parameter meaning, unit scaling, complex covariance, and no silent imputation.
+
+### Plan
+
+- Derive basis from the frozen release manifest.
+- Define sparse block contract and uncertainty identity.
+- Add red validation tests.
+
+---
+
+## TASK-038: Assemble and validate the linear-response matrix blocks
+**Priority:** P1 | **Tags:** M07, physics, validation
+**Assignee:** Unassigned | **Estimate:** 1–2 days | **Milestone:** M07
+
+### Objective
+
+Map authenticated M02 responses into ordered Jacobian blocks for each physical linear mechanism.
+
+### Acceptance Criteria
+
+- [ ] Assemble all required mode/mechanism derivatives with exact coordinate and parameter identity.
+- [ ] Carry complex covariance and shared-root correlations into matrix form.
+- [ ] Compare analytic/stored derivatives with held-out finite differences or independent calculations.
+- [ ] Record absent/unresolved blocks without zero-filling.
+
+### Dependencies
+
+- **Blocked by:** TASK-011, TASK-037
+- **Blocks:** TASK-040
+
+### Evidence Output
+
+Linear matrix blocks, covariance blocks, and derivative-comparison receipt.
+
+### Verification
+
+undefined
+
+### Review Focus
+
+Check mechanism columns, parameter scaling, correlations, and evidence preservation.
+
+### Plan
+
+- Map M02 leaves to frozen matrix coordinates.
+- Validate derivatives and covariance.
+- Seal unresolved block policy.
+
+---
+
+## TASK-039: Assemble and validate the quadratic-response matrix blocks
+**Priority:** P1 | **Tags:** M07, physics, validation
+**Assignee:** Unassigned | **Estimate:** 1–2 days | **Milestone:** M07
+
+### Objective
+
+Map authenticated R⁺⁺₄₄ and other frozen quadratic observables into the response matrix.
+
+### Acceptance Criteria
+
+- [ ] Assemble parent-pair/amplitude blocks with exact forced-frequency and normalization identity.
+- [ ] Propagate numerator/denominator uncertainty and shared parent correlations.
+- [ ] Validate derivative or local surrogate behavior within the declared perturbative domain.
+- [ ] Reject use of linear daughter-mode frequencies as quadratic observables.
+
+### Dependencies
+
+- **Blocked by:** TASK-036, TASK-037
+- **Blocks:** TASK-040
+
+### Evidence Output
+
+Quadratic matrix blocks, covariance blocks, and perturbative-domain receipt.
+
+### Verification
+
+undefined
+
+### Review Focus
+
+Inspect parent-pair labels, perturbative truncation, covariance with linear blocks, and units.
+
+### Plan
+
+- Map quadratic artifacts into typed matrix blocks.
+- Propagate correlations and validate local behavior.
+- Audit physical domain and failure cases.
+
+---
+
+## TASK-040: Compute sparse Jacobian rank, conditioning, and identifiability
+**Priority:** P1 | **Tags:** M07, physics, evidence
+**Assignee:** Unassigned | **Estimate:** 1–2 days | **Milestone:** M07
+
+### Objective
+
+Determine which physical parameter combinations the assembled response actually constrains under correlated uncertainty.
+
+### Acceptance Criteria
+
+- [ ] Assemble the complete sparse matrix and covariance without dropping unresolved rows.
+- [ ] Compute numerical rank, singular directions, condition numbers, and prior-whitened identifiability.
+- [ ] Test stability under uncertainty, scaling, row subsets, and manifest-declared holdouts.
+- [ ] Separate algebraic rank from physically adequate identification.
+
+### Dependencies
+
+- **Blocked by:** TASK-037, TASK-038, TASK-039
+- **Blocks:** TASK-041
+
+### Evidence Output
+
+Authenticated response matrix, singular-system diagnostics, and identifiability ledger.
+
+### Verification
+
+undefined
+
+### Review Focus
+
+Check tolerance selection, prior whitening, covariance inversion, and overclaim from nominal full rank.
+
+### Plan
+
+- Join typed blocks and covariance.
+- Run independent rank/conditioning analyses.
+- Classify identifiable/unresolved directions.
+
+---
+
+## TASK-041: Admit the physical response-matrix provider
+**Priority:** P1 | **Tags:** M07, provider, validation
+**Assignee:** Unassigned | **Estimate:** 1–2 days | **Milestone:** M07
+
+### Objective
+
+Expose the validated sparse response matrix as the sole upstream for inference and signals.
+
+### Acceptance Criteria
+
+- [ ] Register exactly one response-matrix provider consuming M02 and M06 artifacts.
+- [ ] Emit matrix, covariance, parameter/observable dictionaries, rank, conditioning, and evidence in one canonical artifact.
+- [ ] Recompute only changed blocks when one upstream leaf changes.
+- [ ] Pass Windows/Ubuntu, cold/warm, export, and research verification.
+
+### Dependencies
+
+- **Blocked by:** TASK-040
+- **Blocks:** TASK-042, TASK-048
+
+### Evidence Output
+
+Admitted provider, selective-cache receipt, and M07 closure report.
+
+### Verification
+
+undefined
+
+### Review Focus
+
+Inspect block lineage, provider uniqueness, sparsity identity, and evidence ceilings.
+
+### Plan
+
+- Integrate matrix assembly behind provider contract.
+- Exercise selective invalidation and platform gates.
+- Close M07 after review.
+
+---
+
+## TASK-042: Freeze physical inverse requests, priors, and injection protocol
+**Priority:** P1 | **Tags:** M08, architecture, physics
+**Assignee:** Unassigned | **Estimate:** 1–2 days | **Milestone:** M08
+
+### Objective
+
+Define a reproducible inference experiment whose parameters, data model, priors, truth labels, noise, and adequacy tests are fixed before recovery.
+
+### Acceptance Criteria
+
+- [ ] Specify physical parameter domains, complex data vector, covariance, priors, injection truth, noise/zero-noise modes, and random seeds.
+- [ ] Define posterior, evidence, identifiability, model-adequacy, and coverage outputs.
+- [ ] Separate physical injection/recovery from synthetic unit fixtures.
+- [ ] Reject inference outside perturbative or response-matrix validity.
+
+### Dependencies
+
+- **Blocked by:** TASK-041
+- **Blocks:** TASK-043, TASK-044
+
+### Evidence Output
+
+Inverse-study contract, prior registry, injection protocol, and red tests.
+
+### Verification
+
+undefined
+
+### Review Focus
+
+Inspect prior dependence, parameter units, data ordering, perturbative bounds, and blind-holdout integrity.
+
+### Plan
+
+- Translate release inference goals into exact protocol.
+- Add deterministic identities and invalid-domain tests.
+- Review before generating injections.
+
+---
+
+## TASK-043: Authenticate the parity-even cubic EFT injection library
+**Priority:** P1 | **Tags:** M08, physics, evidence
+**Assignee:** Unassigned | **Estimate:** 1–2 days | **Milestone:** M08
+
+### Objective
+
+Create physical theory injections from action-derived shifts rather than an instrument potential or arbitrary matrix columns.
+
+### Acceptance Criteria
+
+- [ ] Bind the parity-even cubic action, coupling convention, polarization, modes/spins, and published comparison values to immutable receipts.
+- [ ] Map action-derived shifts into the M07 parameter/observable basis with correlated uncertainty.
+- [ ] Pass all manifest-required published-shift disk comparisons.
+- [ ] Record EFT validity bounds and reject injections outside them.
+
+### Dependencies
+
+- **Blocked by:** TASK-042
+- **Blocks:** TASK-044, TASK-045
+
+### Evidence Output
+
+Physical EFT injection artifacts, published-comparison ledger, and validity-domain receipt.
+
+### Verification
+
+undefined
+
+### Review Focus
+
+Inspect action convention, coupling powers, polarization mapping, interpolation, and theory provenance.
+
+### Plan
+
+- Authenticate theory sources and conventions.
+- Generate injections through the response basis.
+- Compare, bound validity, and seal receipts.
+
+---
+
+## TASK-044: Run normalized complex posterior and evidence recovery
+**Priority:** P1 | **Tags:** M08, physics, validation
+**Assignee:** Unassigned | **Estimate:** 1–2 days | **Milestone:** M08
+
+### Objective
+
+Recover physical injection parameters using the authenticated response matrix and complex Gaussian likelihood.
+
+### Acceptance Criteria
+
+- [ ] Use normalized complex likelihood with full covariance and declared priors.
+- [ ] Compute posterior summaries, evidence, parameter correlations, and prior-whitened directions reproducibly.
+- [ ] Recover zero-noise reference injections within declared uncertainty where identifiable.
+- [ ] Return unresolved or prior-dominated results honestly.
+
+### Dependencies
+
+- **Blocked by:** TASK-042, TASK-043
+- **Blocks:** TASK-045
+
+### Evidence Output
+
+Posterior/evidence artifacts and zero-noise recovery receipt.
+
+### Verification
+
+undefined
+
+### Review Focus
+
+Inspect likelihood normalization, complex covariance, prior volume, numerical integration error, and identifiability language.
+
+### Plan
+
+- Bind existing inference framework to physical M07 artifacts.
+- Run analytic and physical reference recoveries.
+- Audit normalization and uncertainty.
+
+---
+
+## TASK-045: Evaluate model adequacy and posterior predictive residuals
+**Priority:** P1 | **Tags:** M08, physics, evidence
+**Assignee:** Unassigned | **Estimate:** 1–2 days | **Milestone:** M08
+
+### Objective
+
+Determine whether the response model explains physical injections instead of reporting a posterior for an inadequate model.
+
+### Acceptance Criteria
+
+- [ ] Compute posterior predictive residuals, calibrated discrepancy statistics, and held-out component predictions.
+- [ ] Test linear-only, quadratic-enabled, wrong-mechanism, and out-of-domain alternatives.
+- [ ] Separate low evidence from model inadequacy and numerical failure.
+- [ ] Propagate upstream unresolved evidence into adequacy classification.
+
+### Dependencies
+
+- **Blocked by:** TASK-043, TASK-044
+- **Blocks:** TASK-046
+
+### Evidence Output
+
+Model-adequacy artifacts, alternative-model comparison, and holdout ledger.
+
+### Verification
+
+undefined
+
+### Review Focus
+
+Inspect test calibration, multiple comparisons, data reuse, and claim promotion.
+
+### Plan
+
+- Define adequacy diagnostics from the frozen protocol.
+- Run correct and misspecified physical cases.
+- Classify outcomes with upstream ceilings.
+
+---
+
+## TASK-046: Apply admissibility tests and build the rejection ledger
+**Priority:** P1 | **Tags:** M08, physics, evidence
+**Assignee:** Unassigned | **Estimate:** 1–2 days | **Milestone:** M08
+
+### Objective
+
+Make every rejected or unresolved inverse solution traceable to physical, numerical, or statistical criteria.
+
+### Acceptance Criteria
+
+- [ ] Evaluate perturbative validity, parameter bounds, branch consistency, energy/sign conditions, residual adequacy, and evidence thresholds.
+- [ ] Record each rejection with criterion, measured value, threshold, upstream evidence, and remediation if any.
+- [ ] Prevent rejected samples/models from being silently summarized as successful recovery.
+- [ ] Retain valid adverse scientific outcomes.
+
+### Dependencies
+
+- **Blocked by:** TASK-045
+- **Blocks:** TASK-047
+
+### Evidence Output
+
+Machine-readable admissibility/rejection ledger and criterion tests.
+
+### Verification
+
+undefined
+
+### Review Focus
+
+Check post-hoc criteria, double counting, hidden exclusions, and distinction between invalid and contradicted.
+
+### Plan
+
+- Codify frozen admissibility criteria.
+- Apply to all recovery alternatives.
+- Audit complete and reproducible rejection accounting.
+
+---
+
+## TASK-047: Run blind recovery and admit the inverse-inference provider
+**Priority:** P1 | **Tags:** M08, provider, validation
+**Assignee:** Unassigned | **Estimate:** 1–2 days | **Milestone:** M08
+
+### Objective
+
+Demonstrate physical recovery on hidden holdouts and expose posterior, evidence, adequacy, and rejection results through one provider.
+
+### Acceptance Criteria
+
+- [ ] Run manifest-defined blind/held-out injections without tuning after truth inspection.
+- [ ] Report coverage, bias, evidence, model adequacy, identifiability, and rejection outcomes.
+- [ ] Register exactly one inverse-inference provider consuming M07 only.
+- [ ] Pass Windows/Ubuntu, cold/warm, export, and research verification.
+
+### Dependencies
+
+- **Blocked by:** TASK-046
+- **Blocks:** TASK-059
+
+### Evidence Output
+
+Blind recovery report, admitted provider, CI receipt, and M08 closure report.
+
+### Verification
+
+undefined
+
+### Review Focus
+
+Inspect leakage, tuning after unblinding, prior sensitivity, and evidence ceilings.
+
+### Plan
+
+- Freeze holdout hashes before recovery.
+- Execute and score blind cases.
+- Integrate provider and close M08 after review.
+
+---
+
+## TASK-048: Define signal and waveform artifacts with field-native normalizations
+**Priority:** P1 | **Tags:** M09, architecture, physics
+**Assignee:** Unassigned | **Estimate:** 1–2 days | **Milestone:** M09
+
+### Objective
+
+Specify how response-matrix outputs become excitation coefficients, Ψ₄, strain, scattering quantities, and uncertainty-aware waveforms.
+
+### Acceptance Criteria
+
+- [ ] Define source/excitation, mode catalogue, causal evolution, Ψ₄, strain, tail/scattering/greybody, time/phase, distance, and frame conventions.
+- [ ] Separate QNM frequencies, residues, excitation amplitudes, quadratic amplitudes, and observable strain.
+- [ ] Bind spectral/residue and response-matrix lineage plus waveform evidence ceilings.
+- [ ] Reject incomplete mode/normalization combinations before synthesis.
+
+### Dependencies
+
+- **Blocked by:** TASK-041
+- **Blocks:** TASK-049, TASK-050
+
+### Evidence Output
+
+Signal artifact schema, normalization register, and contract tests.
+
+### Verification
+
+undefined
+
+### Review Focus
+
+Inspect Fourier/time signs, spin-weighted harmonics, distance/mass scaling, and causal start conventions.
+
+### Plan
+
+- Translate frozen waveform scope into contracts.
+- Add field-native identity and failure tests.
+- Review before synthesis.
+
+---
+
+## TASK-049: Compute source excitation and causal QNM evolution
+**Priority:** P1 | **Tags:** M09, physics, validation
+**Assignee:** Unassigned | **Estimate:** 1–2 days | **Milestone:** M09
+
+### Objective
+
+Use authenticated residues/co-modes and physical sources to generate causal modal amplitudes.
+
+### Acceptance Criteria
+
+- [ ] Project manifest-defined sources onto co-modes/residues with declared pairing and normalization.
+- [ ] Evolve modes causally with stable complex-frequency conventions and quadratic forcing where included.
+- [ ] Pass analytic impulse/simple-pole limits and rescaling invariance.
+- [ ] Record unresolved clusters or source projections explicitly.
+
+### Dependencies
+
+- **Blocked by:** TASK-014, TASK-048
+- **Blocks:** TASK-050
+
+### Evidence Output
+
+Excitation/evolution artifacts and analytic-limit receipt.
+
+### Verification
+
+undefined
+
+### Review Focus
+
+Inspect contour/residue convention, start time, cluster treatment, and source normalization.
+
+### Plan
+
+- Bind source projections to spectral residue artifacts.
+- Implement causal evolution on reference cases.
+- Validate analytic limits and adverse clusters.
+
+---
+
+## TASK-050: Reconstruct Ψ₄ and convert to strain
+**Priority:** P1 | **Tags:** M09, physics, validation
+**Assignee:** Unassigned | **Estimate:** 1–2 days | **Milestone:** M09
+
+### Objective
+
+Build the multimode angular/time waveform and perform the Ψ₄→strain conversion with controlled integration constants.
+
+### Acceptance Criteria
+
+- [ ] Reconstruct Ψ₄ from authenticated modal amplitudes and angular fields in the declared frame.
+- [ ] Convert to strain using a specified frequency/time-domain method, integration constants, and low-frequency control.
+- [ ] Pass analytic monochromatic limits, reality/conjugation, and frame/normalization checks.
+- [ ] Preserve linear and quadratic contributions as separately inspectable components.
+
+### Dependencies
+
+- **Blocked by:** TASK-048, TASK-049
+- **Blocks:** TASK-051, TASK-052
+
+### Evidence Output
+
+Ψ₄ and strain waveform artifacts with conversion diagnostics.
+
+### Verification
+
+undefined
+
+### Review Focus
+
+Inspect integration drift, mode conjugation, retarded time, tetrad-to-observer normalization, and component separation.
+
+### Plan
+
+- Implement angular/time reconstruction.
+- Apply two compatible Ψ₄→strain paths.
+- Compare, refine, and seal diagnostics.
+
+---
+
+## TASK-051: Add tails, scattering, and greybody quantities
+**Priority:** P1 | **Tags:** M09, physics, evidence
+**Assignee:** Unassigned | **Estimate:** 1–2 days | **Milestone:** M09
+
+### Objective
+
+Extend the validated QNM waveform with the manifest-required non-pole propagation effects without disguising approximations.
+
+### Acceptance Criteria
+
+- [ ] Compute declared tail, scattering, transmission/reflection, and greybody quantities from compatible spectral/operator data.
+- [ ] State approximation and validity domains for each effect.
+- [ ] Demonstrate known Schwarzschild/Kerr limits and conservation/flux relations where applicable.
+- [ ] Keep optional/unresolved effects explicit in waveform evidence.
+
+### Dependencies
+
+- **Blocked by:** TASK-050
+- **Blocks:** TASK-052
+
+### Evidence Output
+
+Propagation-effect artifacts, limit tests, and validity ledger.
+
+### Verification
+
+undefined
+
+### Review Focus
+
+Inspect double counting with QNM residues, asymptotic conventions, approximation validity, and normalization.
+
+### Plan
+
+- Implement only manifest-required effects.
+- Validate independent limits and flux identities.
+- Attach bounded evidence to waveform components.
+
+---
+
+## TASK-052: Propagate uncertainty through the complete waveform
+**Priority:** P1 | **Tags:** M09, physics, evidence
+**Assignee:** Unassigned | **Estimate:** 1–2 days | **Milestone:** M09
+
+### Objective
+
+Carry correlated spectral, response, excitation, extraction, and propagation uncertainty into time/frequency waveform bands.
+
+### Acceptance Criteria
+
+- [ ] Propagate full relevant covariance and non-Gaussian/unresolved flags through reconstruction.
+- [ ] Produce component-local and total waveform uncertainty without assuming independent modes when correlations exist.
+- [ ] Validate coverage on refinement or held-out waveform calculations.
+- [ ] Prevent unevaluated upstream effects from becoming precise waveform claims.
+
+### Dependencies
+
+- **Blocked by:** TASK-050, TASK-051
+- **Blocks:** TASK-053
+
+### Evidence Output
+
+Waveform uncertainty artifacts, coverage audit, and weakest-evidence trace.
+
+### Verification
+
+undefined
+
+### Review Focus
+
+Inspect correlation loss, phase wrapping, linearization limits, and evidence aggregation.
+
+### Plan
+
+- Assemble upstream uncertainty model.
+- Propagate via two methods on reference cases.
+- Calibrate coverage and classify limitations.
+
+---
+
+## TASK-053: Admit the signals provider
+**Priority:** P1 | **Tags:** M09, provider, validation
+**Assignee:** Unassigned | **Estimate:** 1–2 days | **Milestone:** M09
+
+### Objective
+
+Expose excitation, causal reconstruction, strain, propagation effects, and uncertainty as one traceable public capability.
+
+### Acceptance Criteria
+
+- [ ] Register exactly one signals provider consuming the M07 response matrix and compatible spectral leaves through lineage.
+- [ ] Emit separate linear/quadratic components and total waveform with evidence.
+- [ ] Support selective recomputation for changed source/waveform policy.
+- [ ] Pass Windows/Ubuntu, cold/warm, export, and research verification.
+
+### Dependencies
+
+- **Blocked by:** TASK-052
+- **Blocks:** TASK-054
+
+### Evidence Output
+
+Admitted signals provider, waveform fixtures, CI receipt, and M09 closure report.
+
+### Verification
+
+undefined
+
+### Review Focus
+
+Inspect hidden direct dependencies, waveform normalization, provider uniqueness, and claim ceilings.
+
+### Plan
+
+- Integrate validated waveform path behind provider contract.
+- Exercise cache/policy/platform gates.
+- Close M09 after review.
+
+---
+
+## TASK-054: Define detector artifacts and authenticate PSD/configuration inputs
+**Priority:** P1 | **Tags:** M10, architecture, evidence
+**Assignee:** Unassigned | **Estimate:** 1–2 days | **Milestone:** M10
+
+### Objective
+
+Freeze detector geometry, calibration, PSD, sampling, window, units, and likelihood identities before computing observability.
+
+### Acceptance Criteria
+
+- [ ] Define ground/LISA detector configuration, sky/orientation/time, sampling, PSD, calibration, and noise schema.
+- [ ] Authenticate every PSD/configuration file with source, license, date/version, units, and SHA-256.
+- [ ] Specify conditional SNR/likelihood/evidence outputs and validity domains.
+- [ ] Reject unversioned PSDs or incompatible waveform units.
+
+### Dependencies
+
+- **Blocked by:** TASK-053
+- **Blocks:** TASK-055, TASK-056
+
+### Evidence Output
+
+Detector contract, authenticated input receipts, and red validation tests.
+
+### Verification
+
+undefined
+
+### Review Focus
+
+Inspect one-sided/two-sided conventions, frequency units, calibration version, and observatory applicability.
+
+### Plan
+
+- Freeze detector cases from manifest.
+- Authenticate inputs and define contracts.
+- Review provenance and units before projection.
+
+---
+
+## TASK-055: Compute ground-based detector responses
+**Priority:** P1 | **Tags:** M10, physics, validation
+**Assignee:** Unassigned | **Estimate:** 1–2 days | **Milestone:** M10
+
+### Objective
+
+Project authenticated strain onto the frozen ground-detector network with traceable antenna, timing, and calibration behavior.
+
+### Acceptance Criteria
+
+- [ ] Compute detector tensors, antenna factors, delays, calibration response, and network data streams for manifest cases.
+- [ ] Pass analytic sky/polarization limits and independent response-library comparisons.
+- [ ] Propagate waveform and detector uncertainty.
+- [ ] Record blind directions or calibration exclusions explicitly.
+
+### Dependencies
+
+- **Blocked by:** TASK-054
+- **Blocks:** TASK-057
+
+### Evidence Output
+
+Ground-network response artifacts and independent comparison receipt.
+
+### Verification
+
+undefined
+
+### Review Focus
+
+Inspect coordinate frames, polarization angle, Earth rotation/time, calibration, and uncertainty.
+
+### Plan
+
+- Implement/reference response projection.
+- Run analytic and independent cases.
+- Seal network outputs and limitations.
+
+---
+
+## TASK-056: Compute LISA response and transfer functions
+**Priority:** P1 | **Tags:** M10, physics, validation
+**Assignee:** Unassigned | **Estimate:** 1–2 days | **Milestone:** M10
+
+### Objective
+
+Project authenticated strain through the manifest-defined LISA geometry and time-delay/interferometric response.
+
+### Acceptance Criteria
+
+- [ ] Compute orbital geometry, transfer functions, channels, delays, and response for frozen source cases.
+- [ ] Pass long-wavelength and frequency-dependent reference limits.
+- [ ] Propagate waveform, response, and PSD uncertainty.
+- [ ] State mission/configuration validity and reject incompatible approximations.
+
+### Dependencies
+
+- **Blocked by:** TASK-054
+- **Blocks:** TASK-057
+
+### Evidence Output
+
+LISA response artifacts, limit comparisons, and validity receipt.
+
+### Verification
+
+undefined
+
+### Review Focus
+
+Inspect channel conventions, orbital ephemeris, response approximation, and PSD pairing.
+
+### Plan
+
+- Implement the frozen LISA response model.
+- Validate analytic and independent limits.
+- Record mission-specific evidence.
+
+---
+
+## TASK-057: Compute conditional SNR, likelihood, and event-evidence validators
+**Priority:** P1 | **Tags:** M10, physics, evidence
+**Assignee:** Unassigned | **Estimate:** 1–2 days | **Milestone:** M10
+
+### Objective
+
+Quantify detectability and data support without promoting conditional forecasts into event claims.
+
+### Acceptance Criteria
+
+- [ ] Compute single/network SNR, normalized likelihood, and declared event-evidence statistics with authenticated PSDs.
+- [ ] Run deterministic zero-noise and seeded-noise injections for ground and LISA cases.
+- [ ] Validate windowing, frequency integration, sampling, and uncertainty propagation.
+- [ ] Label forecasts conditional on source/detector assumptions and reject insufficient-bandwidth cases.
+
+### Dependencies
+
+- **Blocked by:** TASK-055, TASK-056
+- **Blocks:** TASK-058
+
+### Evidence Output
+
+SNR/likelihood artifacts, injection receipts, and conditional-claim ledger.
+
+### Verification
+
+undefined
+
+### Review Focus
+
+Inspect PSD factors, normalization, trials/selection effects, conditional language, and upstream uncertainty.
+
+### Plan
+
+- Bind responses to authenticated noise models.
+- Run analytic and physical injections.
+- Validate statistics and claim boundaries.
+
+---
+
+## TASK-058: Admit the detector-inference provider
+**Priority:** P1 | **Tags:** M10, provider, validation
+**Assignee:** Unassigned | **Estimate:** 1–2 days | **Milestone:** M10
+
+### Objective
+
+Expose authenticated detector responses and conditional inference through one public capability.
+
+### Acceptance Criteria
+
+- [ ] Register exactly one detector-inference provider consuming signals only through the public DAG.
+- [ ] Emit detector streams, SNR/likelihood, uncertainty, and conditional evidence with complete provenance.
+- [ ] Support detector-only policy changes without rerunning spectral/response computations.
+- [ ] Pass Windows/Ubuntu, cold/warm, export, and research verification.
+
+### Dependencies
+
+- **Blocked by:** TASK-057
+- **Blocks:** TASK-059
+
+### Evidence Output
+
+Admitted detector provider, policy-cache receipt, CI, and M10 closure report.
+
+### Verification
+
+undefined
+
+### Review Focus
+
+Inspect dependency closure, policy scoping, PSD provenance, provider uniqueness, and claim ceilings.
+
+### Plan
+
+- Integrate validated detector path.
+- Exercise policy/cache/platform gates.
+- Close M10 after independent review.
+
+---
+
+## TASK-059: Freeze the canonical publication study and claim matrix
+**Priority:** P0 | **Tags:** M11, evidence, release
+**Assignee:** Unassigned | **Estimate:** 1–2 days | **Milestone:** M11
+
+### Objective
+
+Define the exact end-to-end run whose completion is necessary and sufficient for the solver release.
+
+### Acceptance Criteria
+
+- [ ] Select only manifest-required coordinates, mechanisms, parent pairs, waveforms, detectors, and evidence profile.
+- [ ] List every intended conclusion and its weakest required upstream evidence.
+- [ ] Record canonical input bytes, runtime/container identities, random seeds, and expected dependency closure.
+- [ ] Prohibit post-run scope or threshold changes without a governance decision.
+
+### Dependencies
+
+- **Blocked by:** TASK-023, TASK-047, TASK-058
+- **Blocks:** TASK-060, TASK-061
+
+### Evidence Output
+
+Hash-bound canonical study, claim matrix, and preregistered verification protocol.
+
+### Verification
+
+undefined
+
+### Review Focus
+
+Inspect cherry-picked scope, favorable-result requirements, and claim/evidence mismatch.
+
+### Plan
+
+- Assemble canonical request from closed milestones.
+- Map claims to weakest evidence and pre-register gates.
+- Independently review before execution.
+
+---
+
+## TASK-060: Execute and verify the cold canonical run on Ubuntu
+**Priority:** P0 | **Tags:** M11, evidence, validation
+**Assignee:** Unassigned | **Estimate:** 1–2 days | **Milestone:** M11
+
+### Objective
+
+Produce the complete evidence-package dependency closure from an empty verified store on the reference Linux environment.
+
+### Acceptance Criteria
+
+- [ ] Build/install from the frozen source and runtime receipt.
+- [ ] Run the canonical study from an empty store without manual artifact injection.
+- [ ] Record every execution, artifact, diagnostic, failure/adverse result, and resource use.
+- [ ] Pass research integrity and, if fully evaluated, publication verification.
+
+### Dependencies
+
+- **Blocked by:** TASK-059
+- **Blocks:** TASK-062
+
+### Evidence Output
+
+Ubuntu cold-run store, sealed run record, logs, resource receipt, and verification result.
+
+### Verification
+
+undefined
+
+### Review Focus
+
+Inspect hidden local dependencies, partial reuse, evidence aggregation, and reproducibility.
+
+### Plan
+
+- Provision frozen clean environment.
+- Execute canonical closure and capture all evidence.
+- Verify/export without repairing results post hoc.
+
+---
+
+## TASK-061: Execute and verify the cold canonical run on native Windows
+**Priority:** P0 | **Tags:** M11, evidence, validation
+**Assignee:** Unassigned | **Estimate:** 1–2 days | **Milestone:** M11
+
+### Objective
+
+Prove the same canonical study works through the public PowerShell path on the required native platform.
+
+### Acceptance Criteria
+
+- [ ] Build/install from frozen source/runtime on clean Windows.
+- [ ] Run through PowerShell 5.1-compatible launcher from an empty store.
+- [ ] Capture the same dependency closure, evidence states, and structured outputs as Ubuntu.
+- [ ] Pass platform-specific and publication/research verification gates.
+
+### Dependencies
+
+- **Blocked by:** TASK-059
+- **Blocks:** TASK-062
+
+### Evidence Output
+
+Windows cold-run store, sealed run record, logs, environment receipt, and verification result.
+
+### Verification
+
+undefined
+
+### Review Focus
+
+Inspect line endings, paths, locale, floating-point/runtime variance, and launcher-only failures.
+
+### Plan
+
+- Provision frozen Windows environment.
+- Execute canonical study through public launcher.
+- Verify and compare without suppressing platform differences.
+
+---
+
+## TASK-062: Prove cross-platform equivalence and zero-work warm reuse
+**Priority:** P0 | **Tags:** M11, evidence, validation
+**Assignee:** Unassigned | **Estimate:** 1–2 days | **Milestone:** M11
+
+### Objective
+
+Demonstrate that platform differences are bounded and identical repeated studies perform no numerical work.
+
+### Acceptance Criteria
+
+- [ ] Compare Ubuntu/Windows artifact identities where byte identity is required and bounded values/evidence where runtime identity legitimately differs.
+- [ ] Repeat each canonical study from its verified store and record zero provider executions.
+- [ ] Change one downstream policy and prove only its capability/descendants recompute.
+- [ ] Tamper one artifact/cache binding and prove warm verification fails closed.
+
+### Dependencies
+
+- **Blocked by:** TASK-060, TASK-061
+- **Blocks:** TASK-063
+
+### Evidence Output
+
+Cross-platform comparison, warm-cache accounting, selective-invalidation, and tamper receipts.
+
+### Verification
+
+undefined
+
+### Review Focus
+
+Inspect tolerated platform drift, hidden recomputation, cache-key scope, and tamper recovery.
+
+### Plan
+
+- Normalize allowed platform comparison rules.
+- Run warm/selective/tamper experiments.
+- Resolve discrepancies through recorded tasks, not threshold relaxation.
+
+---
+
+## TASK-063: Audit claims and export the canonical evidence package
+**Priority:** P0 | **Tags:** M11, evidence, release
+**Assignee:** Unassigned | **Estimate:** 1–2 days | **Milestone:** M11
+
+### Objective
+
+Produce the final traceable package and verify that every conclusion is bounded by actual upstream evidence.
+
+### Acceptance Criteria
+
+- [ ] Run an independent claim-to-artifact audit against the preregistered matrix.
+- [ ] Verify complete lineage, licenses, equations, conventions, runtime, policies, hashes, and evidence ceilings.
+- [ ] Export the sealed run plus every reachable artifact and verification receipt.
+- [ ] Close M11 even if the scientific outcome is unresolved/contradicted, but not if computation/evidence is missing.
+
+### Dependencies
+
+- **Blocked by:** TASK-062
+- **Blocks:** TASK-064
+
+### Evidence Output
+
+Canonical evidence package, independent audit, publication verification, and M11 closure report.
+
+### Verification
+
+undefined
+
+### Review Focus
+
+Inspect weakest-evidence propagation, missing artifacts, circular provenance, and favorable-outcome bias.
+
+### Plan
+
+- Audit claims independently from implementers.
+- Export and verify the complete package.
+- Close M11 only on complete evidence, regardless of conclusion.
+
+---
+
+## TASK-064: Produce reproducible source, wheel, Windows bundle, and container builds
+**Priority:** P0 | **Tags:** M12, release, validation
+**Assignee:** Unassigned | **Estimate:** 1–2 days | **Milestone:** M12
+
+### Objective
+
+Build every supported distribution form twice from frozen source and prove deterministic contents or documented platform-bounded equivalence.
+
+### Acceptance Criteria
+
+- [ ] Build sdist, wheel, Windows launcher/bundle, and container from pinned recipes.
+- [ ] Generate SBOM/license/provenance manifests and hashes for every output.
+- [ ] Perform two independent clean builds and compare bytes/content.
+- [ ] Exclude private fixtures, credentials, and unlicensed sources.
+
+### Dependencies
+
+- **Blocked by:** TASK-063
+- **Blocks:** TASK-065
+
+### Evidence Output
+
+Distribution artifacts, build recipes, SBOM/licenses, hashes, and reproducibility report.
+
+### Verification
+
+undefined
+
+### Review Focus
+
+Inspect hidden network access, non-pinned dependencies, package contents, licenses, and runtime bloat.
+
+### Plan
+
+- Freeze build recipes and dependency sources.
+- Build twice in independent environments.
+- Compare, inspect, and seal distributions.
+
+---
+
+## TASK-065: Run clean-machine installation and end-to-end acceptance
+**Priority:** P0 | **Tags:** M12, release, validation
+**Assignee:** Unassigned | **Estimate:** 1–2 days | **Milestone:** M12
+
+### Objective
+
+Prove a user can install and execute the released solver without development-tree state or manual backend knowledge.
+
+### Acceptance Criteria
+
+- [ ] Install each distribution on clean supported Windows/Ubuntu environments.
+- [ ] Run plan, canonical or bounded verification study, inspect, verify, export, and warm-cache paths through public commands.
+- [ ] Confirm structured errors for invalid/unavailable requests and no proprietary mandatory runtime.
+- [ ] Record installation time, runtime, disk, and failure diagnostics.
+
+### Dependencies
+
+- **Blocked by:** TASK-064
+- **Blocks:** TASK-066, TASK-067
+
+### Evidence Output
+
+Clean-machine acceptance matrix, command transcripts, and artifact verification receipts.
+
+### Verification
+
+undefined
+
+### Review Focus
+
+Inspect undeclared files, environment leakage, path assumptions, runtime selection, and usability blockers.
+
+### Plan
+
+- Provision clean matrices and install distributions.
+- Execute public command family end to end.
+- Capture and resolve only evidence-backed defects.
+
+---
+
+## TASK-066: Finalize public documentation, examples, and terminology
+**Priority:** P1 | **Tags:** M12, release, evidence
+**Assignee:** Unassigned | **Estimate:** 1–2 days | **Milestone:** M12
+
+### Objective
+
+Make the solver operable through field-native concepts without exposing implementation history or requiring backend/stage knowledge.
+
+### Acceptance Criteria
+
+- [ ] Document install, study schema, six public scientific capabilities, evidence states, failure modes, caching, and reproducibility.
+- [ ] Provide validated examples for spectrum, linear response, quadratic response, operator stability, waveform/detector, inverse inference, and evidence package.
+- [ ] Use QNM/radial/angular/source/waveform terminology and remove private architecture-heavy manuscript language.
+- [ ] Generate every documented output from admitted providers.
+
+### Dependencies
+
+- **Blocked by:** TASK-065
+- **Blocks:** TASK-067
+
+### Evidence Output
+
+Verified public docs/examples and terminology audit.
+
+### Verification
+
+undefined
+
+### Review Focus
+
+Inspect claim strength, stale provider status, hidden backend instructions, and terminology clarity.
+
+### Plan
+
+- Rewrite docs from frozen public contracts.
+- Execute every example on clean distributions.
+- Audit terminology and claims.
+
+---
+
+## TASK-067: Complete release-candidate scientific, security, license, and change review
+**Priority:** P0 | **Tags:** M12, release, validation
+**Assignee:** Unassigned | **Estimate:** 1–2 days | **Milestone:** M12
+
+### Objective
+
+Obtain a blocker-clean readiness verdict without modifying scientific thresholds to force release.
+
+### Acceptance Criteria
+
+- [ ] Review code/artifact diff from merged baseline, provider ownership, canonical evidence package, distributions, docs, licenses, and security findings.
+- [ ] Resolve or explicitly block every P0/P1 finding; record lower-severity follow-ups.
+- [ ] Confirm release domain and claims match M01/M11 exactly.
+- [ ] Produce a signed readiness recommendation but do not publish without explicit authorization.
+
+### Dependencies
+
+- **Blocked by:** TASK-065, TASK-066
+- **Blocks:** TASK-068
+
+### Evidence Output
+
+Release-candidate audit, resolved-findings ledger, and readiness verdict.
+
+### Verification
+
+undefined
+
+### Review Focus
+
+Focus on scientific validity, supply chain, secrets, licenses, public claim boundaries, and regression risk.
+
+### Plan
+
+- Conduct independent multidisciplinary review.
+- Fix and reverify blockers through tracked tasks.
+- Issue readiness verdict with residual risks.
+
+---
+
+## TASK-068: Publish the authorized reproducible solver release
+**Priority:** P0 | **Tags:** M12, release, evidence
+**Assignee:** Unassigned | **Estimate:** 1–2 days | **Milestone:** M12
+
+### Objective
+
+Publish the reviewed artifacts only after explicit user authorization and preserve a permanent, verifiable release record.
+
+### Acceptance Criteria
+
+- [ ] Obtain explicit authorization for the exact commit/tag and artifact hashes.
+- [ ] Create signed tag/release, attach distributions, SBOM/licenses, canonical evidence package, and verification instructions.
+- [ ] Verify release downloads against recorded hashes and execute one post-release smoke test.
+- [ ] Update Notion M12 and programme status only after publication verification succeeds.
+
+### Dependencies
+
+- **Blocked by:** TASK-067
+- **Blocks:** None; closes M12 and the programme
+
+### Evidence Output
+
+Signed release, immutable archive links/hashes, post-release verification, and M12 closure report.
+
+### Verification
+
+undefined
+
+### Review Focus
+
+Confirm authorization scope, exact artifacts, no accidental prerelease data, and recoverable rollback/withdrawal procedure.
+
+### Plan
+
+- Present exact release candidate for authorization.
+- Publish only the authorized bytes and tag.
+- Verify externally and close the programme.
+
+---
+

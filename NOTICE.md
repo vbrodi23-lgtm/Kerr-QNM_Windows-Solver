@@ -21,4 +21,5 @@ license and transformation notice accompany the package at
 `src/windows_solver/data/LICENSE-CC-BY-4.0.txt`.
 
 The result has no formal root enclosure and carries scientific state
-`NOT_EVALUATED`. PR #3 is the separate `linear-response` migration.
+`NOT_EVALUATED`. PR #3 freezes the M01 release and authenticated-evidence
+boundary. PR #4 begins the separate `linear-response` migration.

@@ -6,7 +6,8 @@
 
 **Goal:** Deliver PR #2 as one computed, validated, immutable 2,736-root
 pure-Kerr QNM spectral provider: 690 for ℓ=2, 966 for ℓ=3, and 1,080 for ℓ=4.
-PR #3 is the separate `linear-response` migration.
+PR #3 freezes the M01 release and evidence boundary; PR #4 begins the separate
+`linear-response` migration.
 
 **Architecture:** An offline adapter uses qnm only to continue the 63
 Schwarzschild-labelled branches, then feeds every exact-node seed to the
@@ -278,7 +279,7 @@ feat: admit computed Kerr spectral lattice
 
 State exactly: PR #2 computes and admits 2,736 pure-Kerr roots at the approved
 ℓ-dependent grids; problem-contract and spectral-core are admitted; downstream
-providers fail closed; PR #3 is linear response.
+providers fail closed; PR #3 is M01 and PR #4 begins linear response.
 
 - [ ] **Step 2: Update the supported example and CLI assertions**
 
@@ -351,7 +352,8 @@ release blockers test-first and re-review.
 
 Create the remote feature branch from current remote `main`, transfer the
 reviewed tree without importing private development history, open draft PR #2,
-and state the exact 2,736-row boundary and PR #3 linear-response boundary.
+and state the exact 2,736-row boundary, PR #3 M01 boundary, and PR #4
+linear-response boundary.
 
 - [ ] **Step 6: Verify GitHub Actions**
 

@@ -1,0 +1,1411 @@
+{
+  "schema_version": 1,
+  "manifest_id": "nonlinear-kerr-ringdown-release-domain-2026-08-07",
+  "baseline": {
+    "repository": "https://api.github.com/repositories/1325068580",
+    "accepted_commit": "da313b60faa3f2c5fff93cf9f4669c8c0091dab5",
+    "accepted_pull_request": 2,
+    "delivery_pull_request": 3,
+    "package_license": "LicenseRef-Proprietary",
+    "accepted_artifact_id": "pure-kerr-qnm-lattice-2736",
+    "immutable": true
+  },
+  "release_domain": {
+    "theories": [
+      "general-relativity",
+      "parity-even-cubic-higher-curvature-eft"
+    ],
+    "evidence_profiles": [
+      "research",
+      "publication"
+    ],
+    "platforms": [
+      "windows-powershell-5.1-cpython-3.12-x64",
+      "ubuntu-cpython-3.12-x64",
+      "oci-linux-amd64-cpython-3.12"
+    ],
+    "spectrum": {
+      "spin_weight": -2,
+      "ell": [2, 3, 4],
+      "m_rule": "every integer from -ell through +ell",
+      "n": [0, 1, 2],
+      "branches": [
+        "schwarzschild-overtone-continuation"
+      ],
+      "polarizations": [
+        "gravitational"
+      ],
+      "spin_points_by_ell": {
+        "2": 46,
+        "3": 46,
+        "4": 40
+      },
+      "mode_count": 63,
+      "root_count": 2736,
+      "roots_by_ell": {
+        "2": 690,
+        "3": 966,
+        "4": 1080
+      },
+      "catalog_sha256": "9ebae4271309cd45a1b26c90d31155602ed8ef33bb79069adb5897e8afe7a564",
+      "receipt_sha256": "61a428a858de1eb7e42fe4cbbda37bf1fddcc808d98be2a62fd33ef4b5b74379"
+    },
+    "linear_response": {
+      "primary_modes": ["220", "221", "222", "330", "331", "440", "441"],
+      "control_modes": ["210", "2-minus-2-0", "320", "3-minus-3-0"],
+      "direct_spins": [0.95, 0.97, 0.98, 0.99, 0.995, 0.997, 0.999, 0.9995, 0.9999],
+      "surface_gravity_values": [0.01, 0.005, 0.002, 0.001],
+      "mechanisms": [
+        "horizon-admittance",
+        "exterior-fixed-r3",
+        "exterior-light-ring",
+        "exterior-throat-kappa",
+        "exterior-alpha-zero",
+        "exterior-alpha-half",
+        "exterior-alpha-one",
+        "cubic-eft"
+      ],
+      "branch_classes": ["damped", "zero-damping", "unresolved"],
+      "required_outputs": [
+        "complex-pole-shift",
+        "local-covariance",
+        "signed-root-uncertainty-disk",
+        "projective-classification"
+      ]
+    },
+    "operator_stability": {
+      "required_outputs": [
+        "two-dimensional-hyperboloidal-operator",
+        "coupled-root-enclosure",
+        "physical-energy-gram-matrix",
+        "pseudospectrum",
+        "continuum-stability-ledger"
+      ],
+      "evidence_layers": ["discrete-numerical", "truncation", "continuum"],
+      "formal_requirement": "proof-bearing enclosure is distinct from numerical convergence"
+    },
+    "quadratic_ringdown": {
+      "parent_pair": ["220-plus", "220-plus"],
+      "forced_azimuthal_number": 4,
+      "forced_frequency_rule": "omega-parent-1-plus-omega-parent-2",
+      "observable": "R-plus-plus-44",
+      "spins": [0.0, 0.3, 0.5, 0.7, 0.9, 0.95],
+      "gauge": "outgoing-radiation-gauge",
+      "tetrad": "kinnersley",
+      "parent_amplitude_normalization": "unit-strain-at-future-null-infinity"
+    },
+    "response_matrix": {
+      "parameter_basis": [
+        "horizon-admittance",
+        "exterior-profile-coefficients",
+        "cubic-eft-coupling"
+      ],
+      "blocks": ["linear-pole-shifts", "quadratic-amplitude"],
+      "required_diagnostics": ["rank", "conditioning", "identifiability"]
+    },
+    "waveforms": {
+      "cases": [
+        "causal-linear-multimode",
+        "quadratic-220-plus-220",
+        "psi4-to-strain",
+        "tails-and-greybody"
+      ],
+      "time_support": "causal",
+      "strain_conversion": "h-double-dot-equals-psi4-with-exp-minus-i-omega-t"
+    },
+    "detector_cases": [
+      "gw250114-h1-l1",
+      "lisa-equal-arm-tdi-x-reference"
+    ],
+    "detector_inputs": {
+      "gw250114-h1-l1": {
+        "event_time_gps": 1420878141.2,
+        "channels": ["H1-GDS-CALIB-STRAIN-CLEAN-AR", "L1-GDS-CALIB-STRAIN-CLEAN-AR"],
+        "sample_rates_hz": [4096, 16384],
+        "duration_seconds": 4096,
+        "data_license": "CC-BY-4.0"
+      },
+      "lisa-equal-arm-tdi-x-reference": {
+        "arm_length_km": 2500000,
+        "observable": "equal-arm-tdi-x",
+        "response": "frequency-dependent-transfer-function",
+        "noise": "authenticated-reference-psd-required"
+      }
+    },
+    "evidence_package": {
+      "profiles": ["research", "publication"],
+      "required_properties": [
+        "cold-run-reproducibility",
+        "cross-platform-equivalence",
+        "zero-work-verified-cache-reuse",
+        "claim-to-artifact-lineage",
+        "license-ledger"
+      ]
+    }
+  },
+  "capabilities": {
+    "problem-contract": {
+      "programme_milestone": "M01",
+      "provider_state": "publicly_admitted",
+      "active_provider_id": "public-problem-contract",
+      "required_outputs": ["problem-contract"],
+      "required_evidence_ids": ["schema-validated"],
+      "convention_ids": ["request-bound"]
+    },
+    "spectral-core": {
+      "programme_milestone": "M03",
+      "provider_state": "publicly_admitted",
+      "active_provider_id": "kerr-qnm-computed-lattice-2736",
+      "required_outputs": [
+        "kerr-qnm-spectrum",
+        "normalized-spectral-fields",
+        "co-modes",
+        "residues",
+        "branch-genealogy"
+      ],
+      "required_evidence_ids": ["full-lattice-numerically-accepted", "missing-input"],
+      "convention_ids": ["kerr-mass-normalized-outgoing"]
+    },
+    "linear-response": {
+      "programme_milestone": "M02",
+      "provider_state": "future_required",
+      "active_provider_id": null,
+      "required_outputs": ["physical-complex-pole-shift", "local-response-disk"],
+      "required_evidence_ids": ["missing-input"],
+      "convention_ids": ["kerr-mass-normalized-outgoing", "cubic-even-220-reference"]
+    },
+    "operator-stability": {
+      "programme_milestone": "M04",
+      "provider_state": "future_required",
+      "active_provider_id": null,
+      "required_outputs": ["operator-stability-artifact"],
+      "required_evidence_ids": ["proof-bearing-required"],
+      "convention_ids": ["operator-proof-bearing"]
+    },
+    "quadratic-ringdown": {
+      "programme_milestone": "M06",
+      "provider_state": "future_required",
+      "active_provider_id": null,
+      "required_outputs": ["physical-quadratic-response"],
+      "required_evidence_ids": ["missing-input"],
+      "convention_ids": ["quadratic-org-hertz-sum-frequency"]
+    },
+    "response-matrix": {
+      "programme_milestone": "M07",
+      "provider_state": "future_required",
+      "active_provider_id": null,
+      "required_outputs": ["physical-response-matrix"],
+      "required_evidence_ids": ["missing-input"],
+      "convention_ids": ["physical-response-and-inference"]
+    },
+    "inverse-inference": {
+      "programme_milestone": "M08",
+      "provider_state": "future_required",
+      "active_provider_id": null,
+      "required_outputs": ["posterior", "evidence", "admissibility-ledger"],
+      "required_evidence_ids": ["missing-input"],
+      "convention_ids": ["physical-response-and-inference"]
+    },
+    "signals": {
+      "programme_milestone": "M09",
+      "provider_state": "future_required",
+      "active_provider_id": null,
+      "required_outputs": ["causal-waveform", "strain", "tails", "greybody"],
+      "required_evidence_ids": ["missing-input"],
+      "convention_ids": ["field-native-waveform-detector"]
+    },
+    "detector-inference": {
+      "programme_milestone": "M10",
+      "provider_state": "future_required",
+      "active_provider_id": null,
+      "required_outputs": ["detector-response", "snr", "likelihood", "event-evidence"],
+      "required_evidence_ids": ["missing-input"],
+      "convention_ids": ["field-native-waveform-detector"]
+    },
+    "evidence-package": {
+      "programme_milestone": "M11",
+      "provider_state": "future_required",
+      "active_provider_id": null,
+      "required_outputs": ["canonical-evidence-package"],
+      "required_evidence_ids": ["missing-input"],
+      "convention_ids": ["release-evidence-package"]
+    }
+  },
+  "claims": [
+    {
+      "claim_id": "public-problem-contract",
+      "capability": "problem-contract",
+      "classification": "publicly_admitted",
+      "statement": "Strict immutable study requests and schema validation are available through the public provider.",
+      "source_receipt_ids": ["public-problem-contract-source"],
+      "evidence_ceiling_id": "schema-validated",
+      "production_dependency": true
+    },
+    {
+      "claim_id": "public-pure-kerr-spectrum",
+      "capability": "spectral-core",
+      "classification": "publicly_admitted",
+      "statement": "The complete frozen 2,736-root pure-Kerr lattice is numerically accepted and publicly selectable.",
+      "source_receipt_ids": ["public-spectrum-catalog", "public-spectrum-receipt"],
+      "evidence_ceiling_id": "full-lattice-numerically-accepted",
+      "production_dependency": true
+    },
+    {
+      "claim_id": "spectral-fields-production",
+      "capability": "spectral-core",
+      "classification": "missing",
+      "statement": "Normalized fields, co-modes, residues, and near-extremal genealogy are not yet admitted.",
+      "source_receipt_ids": ["missing-spectral-fields"],
+      "evidence_ceiling_id": "missing-input",
+      "production_dependency": false
+    },
+    {
+      "claim_id": "first-order-org-reference",
+      "capability": "quadratic-ringdown",
+      "classification": "validated_legacy_evidence",
+      "statement": "Retained first-order outgoing-radiation-gauge reconstructions at a/M equals 0 and 0.7 passed their recorded residual gates.",
+      "source_receipt_ids": [
+        "org-spin-zero-parent",
+        "org-spin-zero-reconstruction",
+        "org-spin-zero-output-receipt",
+        "org-spin-seven-tenths-parent",
+        "org-spin-seven-tenths-reconstruction",
+        "org-spin-seven-tenths-output-receipt"
+      ],
+      "evidence_ceiling_id": "first-order-org-numerically-accepted",
+      "production_dependency": false
+    },
+    {
+      "claim_id": "cubic-eft-220-reference",
+      "capability": "linear-response",
+      "classification": "validated_legacy_evidence",
+      "statement": "Eight retained parity-even cubic 220 benchmark rows reproduce the published plus and minus shift disks at four spins.",
+      "source_receipt_ids": [
+        "cubic-source-potential",
+        "cubic-source-plus-table",
+        "cubic-source-minus-table",
+        "cubic-benchmark-rows",
+        "cubic-resolution-ledger",
+        "cubic-resolved-rows",
+        "cubic-status-receipt",
+        "cubic-two-gauge-ledger"
+      ],
+      "evidence_ceiling_id": "cubic-eft-benchmark-numerically-accepted",
+      "production_dependency": false
+    },
+    {
+      "claim_id": "linear-response-production",
+      "capability": "linear-response",
+      "classification": "framework_only",
+      "statement": "No public release-domain linear-response provider is admitted.",
+      "source_receipt_ids": ["missing-linear-response-provider"],
+      "evidence_ceiling_id": "framework-only",
+      "production_dependency": false
+    },
+    {
+      "claim_id": "operator-stability-production",
+      "capability": "operator-stability",
+      "classification": "framework_only",
+      "statement": "Retained operator code does not constitute proof-bearing continuum evidence or a public provider.",
+      "source_receipt_ids": ["missing-operator-evidence"],
+      "evidence_ceiling_id": "framework-only",
+      "production_dependency": false
+    },
+    {
+      "claim_id": "quadratic-ringdown-production",
+      "capability": "quadratic-ringdown",
+      "classification": "framework_only",
+      "statement": "Retained quadratic code does not provide an authenticated public physical source and forced solution.",
+      "source_receipt_ids": ["missing-quadratic-evidence"],
+      "evidence_ceiling_id": "framework-only",
+      "production_dependency": false
+    },
+    {
+      "claim_id": "response-matrix-production",
+      "capability": "response-matrix",
+      "classification": "framework_only",
+      "statement": "No physical response matrix with authenticated linear and quadratic blocks is admitted.",
+      "source_receipt_ids": ["missing-response-matrix-evidence"],
+      "evidence_ceiling_id": "framework-only",
+      "production_dependency": false
+    },
+    {
+      "claim_id": "inverse-inference-production",
+      "capability": "inverse-inference",
+      "classification": "framework_only",
+      "statement": "Inference scaffolding is not evidence for a physical posterior or model comparison.",
+      "source_receipt_ids": ["missing-inverse-evidence"],
+      "evidence_ceiling_id": "framework-only",
+      "production_dependency": false
+    },
+    {
+      "claim_id": "signals-production",
+      "capability": "signals",
+      "classification": "framework_only",
+      "statement": "Signal scaffolding is not an authenticated causal waveform provider.",
+      "source_receipt_ids": ["missing-signal-evidence"],
+      "evidence_ceiling_id": "framework-only",
+      "production_dependency": false
+    },
+    {
+      "claim_id": "detector-event-evidence",
+      "capability": "detector-inference",
+      "classification": "missing",
+      "statement": "Authenticated event strain, PSD, response, and event-evidence receipts remain required.",
+      "source_receipt_ids": ["missing-ground-detector-evidence"],
+      "evidence_ceiling_id": "missing-input",
+      "production_dependency": false
+    },
+    {
+      "claim_id": "lisa-detector-evidence",
+      "capability": "detector-inference",
+      "classification": "missing",
+      "statement": "Authenticated LISA response and reference-noise evidence remain required.",
+      "source_receipt_ids": ["missing-space-detector-evidence"],
+      "evidence_ceiling_id": "missing-input",
+      "production_dependency": false
+    },
+    {
+      "claim_id": "canonical-evidence-package-production",
+      "capability": "evidence-package",
+      "classification": "missing",
+      "statement": "The canonical cross-platform publication evidence package has not been produced.",
+      "source_receipt_ids": ["missing-canonical-package"],
+      "evidence_ceiling_id": "missing-input",
+      "production_dependency": false
+    }
+  ],
+  "source_receipts": [
+    {
+      "receipt_id": "public-problem-contract-source",
+      "status": "available",
+      "repository": "https://api.github.com/repositories/1325068580",
+      "immutable_url": "https://api.github.com/repositories/1325068580/contents/src/windows_solver/contracts.py?ref=da313b60faa3f2c5fff93cf9f4669c8c0091dab5",
+      "commit": "da313b60faa3f2c5fff93cf9f4669c8c0091dab5",
+      "pull_request": "2",
+      "artifact": "src/windows_solver/contracts.py",
+      "artifact_sha256": "e2789b545b586846ff50a0aac0292f78f93633e3e99c27be2cbaee6b8819bd3c",
+      "artifact_blob": "e2f01e91a1d0031229212ade374ab4d4516459e7",
+      "generator_identity": "source-blob:e2f01e91a1d0031229212ade374ab4d4516459e7",
+      "tests": ["tests.test_contracts"],
+      "license": "LicenseRef-Proprietary",
+      "runtime": "CPython 3.12 on declared platforms; standard library only",
+      "convention_id": "request-bound",
+      "evidence_ceiling_id": "schema-validated",
+      "retrieval": "GitHub contents API at immutable commit",
+      "owner": "public repository",
+      "unblock_action": null
+    },
+    {
+      "receipt_id": "public-spectrum-catalog",
+      "status": "available",
+      "repository": "https://api.github.com/repositories/1325068580",
+      "immutable_url": "https://api.github.com/repositories/1325068580/contents/src/windows_solver/data/kerr_qnm_roots_2736.csv?ref=da313b60faa3f2c5fff93cf9f4669c8c0091dab5",
+      "commit": "da313b60faa3f2c5fff93cf9f4669c8c0091dab5",
+      "pull_request": "2",
+      "artifact": "src/windows_solver/data/kerr_qnm_roots_2736.csv",
+      "artifact_sha256": "9ebae4271309cd45a1b26c90d31155602ed8ef33bb79069adb5897e8afe7a564",
+      "artifact_blob": "493990adc007298ccb4cd91fd0b88310a66db4aa",
+      "generator_identity": "sha256:6f9a4e7b82a01c14768ff431fbc55c8cdbf25641d909b34c204d80a54eceded9",
+      "tests": ["tests.test_spectrum", "tests.test_catalog_builder"],
+      "license": "LicenseRef-Proprietary with scoped MIT and CC-BY-4.0 inputs",
+      "runtime": "CPython 3.12.13; NumPy 2.4.6; SciPy 1.18.0; qnm 0.4.4; Numba 0.66.0",
+      "convention_id": "kerr-mass-normalized-outgoing",
+      "evidence_ceiling_id": "full-lattice-numerically-accepted",
+      "retrieval": "GitHub contents API at immutable commit",
+      "owner": "public spectral provider",
+      "unblock_action": null
+    },
+    {
+      "receipt_id": "public-spectrum-receipt",
+      "status": "available",
+      "repository": "https://api.github.com/repositories/1325068580",
+      "immutable_url": "https://api.github.com/repositories/1325068580/contents/src/windows_solver/data/kerr_qnm_lattice_receipt.json?ref=da313b60faa3f2c5fff93cf9f4669c8c0091dab5",
+      "commit": "da313b60faa3f2c5fff93cf9f4669c8c0091dab5",
+      "pull_request": "2",
+      "artifact": "src/windows_solver/data/kerr_qnm_lattice_receipt.json",
+      "artifact_sha256": "61a428a858de1eb7e42fe4cbbda37bf1fddcc808d98be2a62fd33ef4b5b74379",
+      "artifact_blob": "7cd582ebd8ae1978a4045f56b8ff59d8978b3f51",
+      "generator_identity": "sha256:6f9a4e7b82a01c14768ff431fbc55c8cdbf25641d909b34c204d80a54eceded9",
+      "tests": ["tests.test_spectrum", "tests.test_catalog_builder"],
+      "license": "LicenseRef-Proprietary with scoped MIT and CC-BY-4.0 inputs",
+      "runtime": "CPython 3.12.13; NumPy 2.4.6; SciPy 1.18.0; qnm 0.4.4; Numba 0.66.0",
+      "convention_id": "kerr-mass-normalized-outgoing",
+      "evidence_ceiling_id": "full-lattice-numerically-accepted",
+      "retrieval": "GitHub contents API at immutable commit",
+      "owner": "public spectral provider",
+      "unblock_action": null
+    },
+    {
+      "receipt_id": "org-spin-zero-parent",
+      "status": "available",
+      "repository": "https://api.github.com/repositories/1319960033",
+      "immutable_url": "https://api.github.com/repositories/1319960033/git/blobs/30894c24e4cbeca9b42e00b1fd4b91ad40b58a67",
+      "commit": "e42d9adbe29768c9419186f98e2e7579deeadfbd",
+      "pull_request": "23",
+      "artifact": "retained/first-order/org/spin-zero/parent-mode.npz",
+      "artifact_sha256": "c3e6e209ee2c781a4483e4bc6008789e6bc54e505d289c7489fbfd9d9dc0c047",
+      "artifact_blob": "30894c24e4cbeca9b42e00b1fd4b91ad40b58a67",
+      "generator_identity": "git-blob:7b898161106576a63277c5eb374bfa97b425d671",
+      "tests": ["retained-first-order-producer-test", "retained-first-order-evidence-test"],
+      "license": "MIT",
+      "runtime": "CPython 3.12; NumPy 2.3.5; SciPy 1.17.0; SymPy 1.14.0",
+      "convention_id": "first-order-org-reference",
+      "evidence_ceiling_id": "first-order-org-numerically-accepted",
+      "retrieval": "Git blob API with base64 decoding and SHA-256 verification",
+      "owner": "retained evidence repository",
+      "unblock_action": null
+    },
+    {
+      "receipt_id": "org-spin-zero-reconstruction",
+      "status": "available",
+      "repository": "https://api.github.com/repositories/1319960033",
+      "immutable_url": "https://api.github.com/repositories/1319960033/git/blobs/3e4d673901cd59d498dfda31fc7f4811d769ba06",
+      "commit": "e42d9adbe29768c9419186f98e2e7579deeadfbd",
+      "pull_request": "23",
+      "artifact": "retained/first-order/org/spin-zero/reconstruction.npz",
+      "artifact_sha256": "92a68bf1fdd25e27f77ef037ba0c426d14e0c7ed648028a03187c983e7a78171",
+      "artifact_blob": "3e4d673901cd59d498dfda31fc7f4811d769ba06",
+      "generator_identity": "git-blob:7b898161106576a63277c5eb374bfa97b425d671",
+      "tests": ["retained-first-order-producer-test", "retained-first-order-evidence-test"],
+      "license": "MIT",
+      "runtime": "CPython 3.12; NumPy 2.3.5; SciPy 1.17.0; SymPy 1.14.0",
+      "convention_id": "first-order-org-reference",
+      "evidence_ceiling_id": "first-order-org-numerically-accepted",
+      "retrieval": "Git blob API with base64 decoding and SHA-256 verification",
+      "owner": "retained evidence repository",
+      "unblock_action": null
+    },
+    {
+      "receipt_id": "org-spin-zero-output-receipt",
+      "status": "available",
+      "repository": "https://api.github.com/repositories/1319960033",
+      "immutable_url": "https://api.github.com/repositories/1319960033/git/blobs/aaadcb6ec6132d46cad4a316d8104ec25b8b2712",
+      "commit": "e42d9adbe29768c9419186f98e2e7579deeadfbd",
+      "pull_request": "23",
+      "artifact": "retained/first-order/org/spin-zero/output-receipt.json",
+      "artifact_sha256": "3c9a03768b0f2a59672f1620d04a2d70555a01979ae85f1620c58a0c82e91fe7",
+      "artifact_blob": "aaadcb6ec6132d46cad4a316d8104ec25b8b2712",
+      "generator_identity": "git-blob:7b898161106576a63277c5eb374bfa97b425d671",
+      "tests": ["retained-first-order-producer-test", "retained-first-order-evidence-test"],
+      "license": "MIT",
+      "runtime": "CPython 3.12; NumPy 2.3.5; SciPy 1.17.0; SymPy 1.14.0",
+      "convention_id": "first-order-org-reference",
+      "evidence_ceiling_id": "first-order-org-numerically-accepted",
+      "retrieval": "Git blob API with base64 decoding and SHA-256 verification",
+      "owner": "retained evidence repository",
+      "unblock_action": null
+    },
+    {
+      "receipt_id": "org-spin-seven-tenths-parent",
+      "status": "available",
+      "repository": "https://api.github.com/repositories/1319960033",
+      "immutable_url": "https://api.github.com/repositories/1319960033/git/blobs/4cb60bf1a4b62ac3cc37f89ee94e9345db3acaa8",
+      "commit": "e42d9adbe29768c9419186f98e2e7579deeadfbd",
+      "pull_request": "23",
+      "artifact": "retained/first-order/org/spin-seven-tenths/parent-mode.npz",
+      "artifact_sha256": "6da969c130c2154a2e82aa27808fc7850bbc69893d18068dd05f50b50ccf7c52",
+      "artifact_blob": "4cb60bf1a4b62ac3cc37f89ee94e9345db3acaa8",
+      "generator_identity": "git-blob:7b898161106576a63277c5eb374bfa97b425d671",
+      "tests": ["retained-first-order-producer-test", "retained-first-order-evidence-test"],
+      "license": "MIT",
+      "runtime": "CPython 3.12; NumPy 2.3.5; SciPy 1.17.0; SymPy 1.14.0",
+      "convention_id": "first-order-org-reference",
+      "evidence_ceiling_id": "first-order-org-numerically-accepted",
+      "retrieval": "Git blob API with base64 decoding and SHA-256 verification",
+      "owner": "retained evidence repository",
+      "unblock_action": null
+    },
+    {
+      "receipt_id": "org-spin-seven-tenths-reconstruction",
+      "status": "available",
+      "repository": "https://api.github.com/repositories/1319960033",
+      "immutable_url": "https://api.github.com/repositories/1319960033/git/blobs/ba09bc9f8cc0ef3c23cb74072c293370069a7a45",
+      "commit": "e42d9adbe29768c9419186f98e2e7579deeadfbd",
+      "pull_request": "23",
+      "artifact": "retained/first-order/org/spin-seven-tenths/reconstruction.npz",
+      "artifact_sha256": "f4f63bee82627b21a58e1bd85ee767906e1f3b0cfae669cc28198f8e66a58529",
+      "artifact_blob": "ba09bc9f8cc0ef3c23cb74072c293370069a7a45",
+      "generator_identity": "git-blob:7b898161106576a63277c5eb374bfa97b425d671",
+      "tests": ["retained-first-order-producer-test", "retained-first-order-evidence-test"],
+      "license": "MIT",
+      "runtime": "CPython 3.12; NumPy 2.3.5; SciPy 1.17.0; SymPy 1.14.0",
+      "convention_id": "first-order-org-reference",
+      "evidence_ceiling_id": "first-order-org-numerically-accepted",
+      "retrieval": "Git blob API with base64 decoding and SHA-256 verification",
+      "owner": "retained evidence repository",
+      "unblock_action": null
+    },
+    {
+      "receipt_id": "org-spin-seven-tenths-output-receipt",
+      "status": "available",
+      "repository": "https://api.github.com/repositories/1319960033",
+      "immutable_url": "https://api.github.com/repositories/1319960033/git/blobs/b9e1cb64ca25db32363fbf118d97af787a745235",
+      "commit": "e42d9adbe29768c9419186f98e2e7579deeadfbd",
+      "pull_request": "23",
+      "artifact": "retained/first-order/org/spin-seven-tenths/output-receipt.json",
+      "artifact_sha256": "04164f9956faadcec61bdaaeee9c7f314f251a08fc799f07b53cd200a34e82e6",
+      "artifact_blob": "b9e1cb64ca25db32363fbf118d97af787a745235",
+      "generator_identity": "git-blob:7b898161106576a63277c5eb374bfa97b425d671",
+      "tests": ["retained-first-order-producer-test", "retained-first-order-evidence-test"],
+      "license": "MIT",
+      "runtime": "CPython 3.12; NumPy 2.3.5; SciPy 1.17.0; SymPy 1.14.0",
+      "convention_id": "first-order-org-reference",
+      "evidence_ceiling_id": "first-order-org-numerically-accepted",
+      "retrieval": "Git blob API with base64 decoding and SHA-256 verification",
+      "owner": "retained evidence repository",
+      "unblock_action": null
+    },
+    {
+      "receipt_id": "cubic-source-potential",
+      "status": "available",
+      "repository": "https://api.github.com/repos/pacmn91/BeyondKerrQNM",
+      "immutable_url": "https://api.github.com/repos/pacmn91/BeyondKerrQNM/git/blobs/afa13f54d15c4036ffe527e43f413ae5bd8631c0",
+      "commit": "2a8a10d31c88bf2f6797723d1d4fdb09e2c10c62",
+      "pull_request": null,
+      "artifact": "Potentials/deltaV-even-a18-s-2l2m2.mx",
+      "artifact_sha256": "ebe39cbdc70b1a6fdba0da3c9c5278be264efd34177e8eee15857e1f07646ef5",
+      "artifact_blob": "afa13f54d15c4036ffe527e43f413ae5bd8631c0",
+      "generator_identity": "external-comparator-source-commit:2a8a10d31c88bf2f6797723d1d4fdb09e2c10c62",
+      "tests": ["retained-authenticated-source-test"],
+      "license": "GPL-3.0; comparator use only",
+      "runtime": "Offline source bytes; no runtime import into the public package",
+      "convention_id": "cubic-even-220-reference",
+      "evidence_ceiling_id": "cubic-eft-benchmark-numerically-accepted",
+      "retrieval": "Immutable source tree plus independent SHA-256 verification",
+      "owner": "external published comparator",
+      "unblock_action": null
+    },
+    {
+      "receipt_id": "cubic-source-plus-table",
+      "status": "available",
+      "repository": "https://api.github.com/repos/pacmn91/BeyondKerrQNM",
+      "immutable_url": "https://api.github.com/repos/pacmn91/BeyondKerrQNM/git/blobs/5d277c3f072e70fe05141ced37c9fa4713711797",
+      "commit": "2a8a10d31c88bf2f6797723d1d4fdb09e2c10c62",
+      "pull_request": null,
+      "artifact": "QNM_shifts/cubic_even_domega_plus_l2_m2_n0.txt",
+      "artifact_sha256": "6bf2948b3b7cca3e17bd80e2e4d8dbd065be1d56458341b44175846dd727dacb",
+      "artifact_blob": "5d277c3f072e70fe05141ced37c9fa4713711797",
+      "generator_identity": "external-comparator-source-commit:2a8a10d31c88bf2f6797723d1d4fdb09e2c10c62",
+      "tests": ["retained-authenticated-source-test"],
+      "license": "GPL-3.0; comparator use only",
+      "runtime": "Offline source bytes; no runtime import into the public package",
+      "convention_id": "cubic-even-220-reference",
+      "evidence_ceiling_id": "cubic-eft-benchmark-numerically-accepted",
+      "retrieval": "Immutable source tree plus independent SHA-256 verification",
+      "owner": "external published comparator",
+      "unblock_action": null
+    },
+    {
+      "receipt_id": "cubic-source-minus-table",
+      "status": "available",
+      "repository": "https://api.github.com/repos/pacmn91/BeyondKerrQNM",
+      "immutable_url": "https://api.github.com/repos/pacmn91/BeyondKerrQNM/git/blobs/0ac45bf18414fd83babd33c0f8f6c4ea803e2392",
+      "commit": "2a8a10d31c88bf2f6797723d1d4fdb09e2c10c62",
+      "pull_request": null,
+      "artifact": "QNM_shifts/cubic_even_domega_minus_l2_m2_n0.txt",
+      "artifact_sha256": "2c3f8cd734e538ab18522a7aa462a44148c3f910c3a07a2430cfac4211ce8ef0",
+      "artifact_blob": "0ac45bf18414fd83babd33c0f8f6c4ea803e2392",
+      "generator_identity": "external-comparator-source-commit:2a8a10d31c88bf2f6797723d1d4fdb09e2c10c62",
+      "tests": ["retained-authenticated-source-test"],
+      "license": "GPL-3.0; comparator use only",
+      "runtime": "Offline source bytes; no runtime import into the public package",
+      "convention_id": "cubic-even-220-reference",
+      "evidence_ceiling_id": "cubic-eft-benchmark-numerically-accepted",
+      "retrieval": "Immutable source tree plus independent SHA-256 verification",
+      "owner": "external published comparator",
+      "unblock_action": null
+    },
+    {
+      "receipt_id": "cubic-benchmark-rows",
+      "status": "available",
+      "repository": "https://api.github.com/repositories/1319960033",
+      "immutable_url": "https://api.github.com/repositories/1319960033/git/blobs/f958779d9d769819bb3780a3542995395d45dac2",
+      "commit": "0c1e8a3d3bca6e608c34e111476a4f6dcb73e86e",
+      "pull_request": "24",
+      "artifact": "retained/cubic-even/benchmark-rows.csv",
+      "artifact_sha256": "08351700d6ac23d2892a976176ae0242590ddf90ffbadd14f306fa9c1c56d949",
+      "artifact_blob": "f958779d9d769819bb3780a3542995395d45dac2",
+      "generator_identity": "git-blob:2c9defa92b5d138355d1482113b31f9ff0c4389e",
+      "tests": ["retained-cubic-closure-test"],
+      "license": "MIT for retained calculation; GPL-3.0 source remains comparator-only",
+      "runtime": "CPython 3.12; NumPy 2.3.5; SciPy 1.17.0; SymPy 1.14.0",
+      "convention_id": "cubic-even-220-reference",
+      "evidence_ceiling_id": "cubic-eft-benchmark-numerically-accepted",
+      "retrieval": "Git blob API with base64 decoding and SHA-256 verification",
+      "owner": "retained evidence repository",
+      "unblock_action": null
+    },
+    {
+      "receipt_id": "cubic-resolution-ledger",
+      "status": "available",
+      "repository": "https://api.github.com/repositories/1319960033",
+      "immutable_url": "https://api.github.com/repositories/1319960033/git/blobs/a6d1c53d57b53047321e0b4dd023cd74ce104a52",
+      "commit": "0c1e8a3d3bca6e608c34e111476a4f6dcb73e86e",
+      "pull_request": "24",
+      "artifact": "retained/cubic-even/resolution-ledger.csv",
+      "artifact_sha256": "fbb7193d3fa0994944ea60e3502d80e32318d8ae949719c22e405ab698eaee9a",
+      "artifact_blob": "a6d1c53d57b53047321e0b4dd023cd74ce104a52",
+      "generator_identity": "git-blob:2c9defa92b5d138355d1482113b31f9ff0c4389e",
+      "tests": ["retained-cubic-closure-test"],
+      "license": "MIT for retained calculation; GPL-3.0 source remains comparator-only",
+      "runtime": "CPython 3.12; NumPy 2.3.5; SciPy 1.17.0; SymPy 1.14.0",
+      "convention_id": "cubic-even-220-reference",
+      "evidence_ceiling_id": "cubic-eft-benchmark-numerically-accepted",
+      "retrieval": "Git blob API with base64 decoding and SHA-256 verification",
+      "owner": "retained evidence repository",
+      "unblock_action": null
+    },
+    {
+      "receipt_id": "cubic-resolved-rows",
+      "status": "available",
+      "repository": "https://api.github.com/repositories/1319960033",
+      "immutable_url": "https://api.github.com/repositories/1319960033/git/blobs/b6a6620702ce264e0467d7daf0358bae83d5d5d4",
+      "commit": "0c1e8a3d3bca6e608c34e111476a4f6dcb73e86e",
+      "pull_request": "24",
+      "artifact": "retained/cubic-even/resolved-rows.csv",
+      "artifact_sha256": "89f28eabdf0be247a1db87fb13c6f0c8a60bb9065518426b8a9d5a24630b0bd1",
+      "artifact_blob": "b6a6620702ce264e0467d7daf0358bae83d5d5d4",
+      "generator_identity": "git-blob:2c9defa92b5d138355d1482113b31f9ff0c4389e",
+      "tests": ["retained-cubic-closure-test"],
+      "license": "MIT for retained calculation; GPL-3.0 source remains comparator-only",
+      "runtime": "CPython 3.12; NumPy 2.3.5; SciPy 1.17.0; SymPy 1.14.0",
+      "convention_id": "cubic-even-220-reference",
+      "evidence_ceiling_id": "cubic-eft-benchmark-numerically-accepted",
+      "retrieval": "Git blob API with base64 decoding and SHA-256 verification",
+      "owner": "retained evidence repository",
+      "unblock_action": null
+    },
+    {
+      "receipt_id": "cubic-status-receipt",
+      "status": "available",
+      "repository": "https://api.github.com/repositories/1319960033",
+      "immutable_url": "https://api.github.com/repositories/1319960033/git/blobs/8924859018574c0eda7941a2024b03a6e971a012",
+      "commit": "0c1e8a3d3bca6e608c34e111476a4f6dcb73e86e",
+      "pull_request": "24",
+      "artifact": "retained/cubic-even/status-receipt.json",
+      "artifact_sha256": "07b12e64fa22783a9429371facfc14990b70fbc28dcf60039c477ec3bdec1d9f",
+      "artifact_blob": "8924859018574c0eda7941a2024b03a6e971a012",
+      "generator_identity": "git-blob:2c9defa92b5d138355d1482113b31f9ff0c4389e",
+      "tests": ["retained-cubic-closure-test"],
+      "license": "MIT for retained calculation; GPL-3.0 source remains comparator-only",
+      "runtime": "CPython 3.12; NumPy 2.3.5; SciPy 1.17.0; SymPy 1.14.0",
+      "convention_id": "cubic-even-220-reference",
+      "evidence_ceiling_id": "cubic-eft-benchmark-numerically-accepted",
+      "retrieval": "Git blob API with base64 decoding and SHA-256 verification",
+      "owner": "retained evidence repository",
+      "unblock_action": null
+    },
+    {
+      "receipt_id": "cubic-two-gauge-ledger",
+      "status": "available",
+      "repository": "https://api.github.com/repositories/1319960033",
+      "immutable_url": "https://api.github.com/repositories/1319960033/git/blobs/06ad3cf67a6197d01a61265c85654c07dff44c7f",
+      "commit": "0c1e8a3d3bca6e608c34e111476a4f6dcb73e86e",
+      "pull_request": "24",
+      "artifact": "retained/cubic-even/two-gauge-ledger.csv",
+      "artifact_sha256": "bbaa41d96e9bd42521ed7145efb6ba8a328c4c4856850cd5d27f13a8dceb8ae4",
+      "artifact_blob": "06ad3cf67a6197d01a61265c85654c07dff44c7f",
+      "generator_identity": "git-blob:2c9defa92b5d138355d1482113b31f9ff0c4389e",
+      "tests": ["retained-cubic-closure-test"],
+      "license": "MIT for retained calculation; GPL-3.0 source remains comparator-only",
+      "runtime": "CPython 3.12; NumPy 2.3.5; SciPy 1.17.0; SymPy 1.14.0",
+      "convention_id": "cubic-even-220-reference",
+      "evidence_ceiling_id": "cubic-eft-benchmark-numerically-accepted",
+      "retrieval": "Git blob API with base64 decoding and SHA-256 verification",
+      "owner": "retained evidence repository",
+      "unblock_action": null
+    },
+    {
+      "receipt_id": "missing-spectral-fields",
+      "status": "missing",
+      "repository": "https://api.github.com/repositories/1325068580",
+      "immutable_url": null,
+      "commit": null,
+      "pull_request": null,
+      "artifact": "normalized-fields-co-modes-residues-and-genealogy",
+      "artifact_sha256": null,
+      "artifact_blob": null,
+      "generator_identity": null,
+      "tests": [],
+      "license": "LicenseRef-Proprietary",
+      "runtime": "Declared release platforms",
+      "convention_id": "kerr-mass-normalized-outgoing",
+      "evidence_ceiling_id": "missing-input",
+      "retrieval": null,
+      "owner": "spectral-fields milestone",
+      "unblock_action": "Produce normalized fields, co-modes, residues, and branch genealogy with authenticated receipts."
+    },
+    {
+      "receipt_id": "missing-linear-response-provider",
+      "status": "missing",
+      "repository": "https://api.github.com/repositories/1325068580",
+      "immutable_url": null,
+      "commit": null,
+      "pull_request": null,
+      "artifact": "public-linear-response-provider",
+      "artifact_sha256": null,
+      "artifact_blob": null,
+      "generator_identity": null,
+      "tests": [],
+      "license": "LicenseRef-Proprietary",
+      "runtime": "Declared release platforms",
+      "convention_id": "kerr-mass-normalized-outgoing",
+      "evidence_ceiling_id": "missing-input",
+      "retrieval": null,
+      "owner": "linear-response milestone",
+      "unblock_action": "Migrate field-native calculations against independent golden receipts and admit one public provider."
+    },
+    {
+      "receipt_id": "missing-operator-evidence",
+      "status": "missing",
+      "repository": "https://api.github.com/repositories/1325068580",
+      "immutable_url": null,
+      "commit": null,
+      "pull_request": null,
+      "artifact": "proof-bearing-operator-stability-evidence",
+      "artifact_sha256": null,
+      "artifact_blob": null,
+      "generator_identity": null,
+      "tests": [],
+      "license": "LicenseRef-Proprietary",
+      "runtime": "Declared release platforms",
+      "convention_id": "operator-proof-bearing",
+      "evidence_ceiling_id": "proof-bearing-required",
+      "retrieval": null,
+      "owner": "operator-stability milestone",
+      "unblock_action": "Produce discrete, truncation, and continuum evidence with explicit enclosure status."
+    },
+    {
+      "receipt_id": "missing-quadratic-evidence",
+      "status": "missing",
+      "repository": "https://api.github.com/repositories/1325068580",
+      "immutable_url": null,
+      "commit": null,
+      "pull_request": null,
+      "artifact": "physical-quadratic-source-and-forced-solution",
+      "artifact_sha256": null,
+      "artifact_blob": null,
+      "generator_identity": null,
+      "tests": [],
+      "license": "LicenseRef-Proprietary",
+      "runtime": "Declared release platforms",
+      "convention_id": "quadratic-org-hertz-sum-frequency",
+      "evidence_ceiling_id": "missing-input",
+      "retrieval": null,
+      "owner": "quadratic-ringdown milestone",
+      "unblock_action": "Authenticate parent fields, construct the physical source, solve the forced system, and establish convergence."
+    },
+    {
+      "receipt_id": "missing-response-matrix-evidence",
+      "status": "missing",
+      "repository": "https://api.github.com/repositories/1325068580",
+      "immutable_url": null,
+      "commit": null,
+      "pull_request": null,
+      "artifact": "physical-response-matrix",
+      "artifact_sha256": null,
+      "artifact_blob": null,
+      "generator_identity": null,
+      "tests": [],
+      "license": "LicenseRef-Proprietary",
+      "runtime": "Declared release platforms",
+      "convention_id": "physical-response-and-inference",
+      "evidence_ceiling_id": "missing-input",
+      "retrieval": null,
+      "owner": "response-matrix milestone",
+      "unblock_action": "Assemble authenticated linear and quadratic blocks and close rank and conditioning diagnostics."
+    },
+    {
+      "receipt_id": "missing-inverse-evidence",
+      "status": "missing",
+      "repository": "https://api.github.com/repositories/1325068580",
+      "immutable_url": null,
+      "commit": null,
+      "pull_request": null,
+      "artifact": "physical-inverse-inference-evidence",
+      "artifact_sha256": null,
+      "artifact_blob": null,
+      "generator_identity": null,
+      "tests": [],
+      "license": "LicenseRef-Proprietary",
+      "runtime": "Declared release platforms",
+      "convention_id": "physical-response-and-inference",
+      "evidence_ceiling_id": "missing-input",
+      "retrieval": null,
+      "owner": "inverse-inference milestone",
+      "unblock_action": "Run authenticated injections, posterior recovery, model adequacy, and blind admissibility tests."
+    },
+    {
+      "receipt_id": "missing-signal-evidence",
+      "status": "missing",
+      "repository": "https://api.github.com/repositories/1325068580",
+      "immutable_url": null,
+      "commit": null,
+      "pull_request": null,
+      "artifact": "causal-field-native-waveforms",
+      "artifact_sha256": null,
+      "artifact_blob": null,
+      "generator_identity": null,
+      "tests": [],
+      "license": "LicenseRef-Proprietary",
+      "runtime": "Declared release platforms",
+      "convention_id": "field-native-waveform-detector",
+      "evidence_ceiling_id": "missing-input",
+      "retrieval": null,
+      "owner": "signals milestone",
+      "unblock_action": "Produce causal excitation, Psi4, strain, tails, greybody, and uncertainty artifacts."
+    },
+    {
+      "receipt_id": "missing-ground-detector-evidence",
+      "status": "missing",
+      "repository": "https://api.github.com/repositories/1325068580",
+      "immutable_url": null,
+      "commit": null,
+      "pull_request": null,
+      "artifact": "gw250114-h1-l1-strain-psd-response-and-oracle",
+      "artifact_sha256": null,
+      "artifact_blob": null,
+      "generator_identity": null,
+      "tests": [],
+      "license": "CC-BY-4.0 for event data; package output LicenseRef-Proprietary",
+      "runtime": "Declared release platforms",
+      "convention_id": "field-native-waveform-detector",
+      "evidence_ceiling_id": "missing-input",
+      "retrieval": null,
+      "owner": "detector-inference milestone",
+      "unblock_action": "Fetch and hash the declared strain, construct the PSD and response, and freeze an independent event-evidence oracle."
+    },
+    {
+      "receipt_id": "missing-space-detector-evidence",
+      "status": "missing",
+      "repository": "https://api.github.com/repositories/1325068580",
+      "immutable_url": null,
+      "commit": null,
+      "pull_request": null,
+      "artifact": "lisa-equal-arm-response-psd-and-reference",
+      "artifact_sha256": null,
+      "artifact_blob": null,
+      "generator_identity": null,
+      "tests": [],
+      "license": "Source-specific reference licenses to be reconciled",
+      "runtime": "Declared release platforms",
+      "convention_id": "field-native-waveform-detector",
+      "evidence_ceiling_id": "missing-input",
+      "retrieval": null,
+      "owner": "detector-inference milestone",
+      "unblock_action": "Authenticate the equal-arm transfer function, reference PSD, units, and independent comparison."
+    },
+    {
+      "receipt_id": "missing-canonical-package",
+      "status": "missing",
+      "repository": "https://api.github.com/repositories/1325068580",
+      "immutable_url": null,
+      "commit": null,
+      "pull_request": null,
+      "artifact": "canonical-cross-platform-evidence-package",
+      "artifact_sha256": null,
+      "artifact_blob": null,
+      "generator_identity": null,
+      "tests": [],
+      "license": "LicenseRef-Proprietary with complete input license ledger required",
+      "runtime": "Windows, Ubuntu, and OCI release platforms",
+      "convention_id": "release-evidence-package",
+      "evidence_ceiling_id": "missing-input",
+      "retrieval": null,
+      "owner": "publication evidence milestone",
+      "unblock_action": "Complete all upstream providers and execute the cold and warm canonical runs across release platforms."
+    }
+  ],
+  "module_ownership": [
+    {
+      "module_id": "src/windows_solver/builtin.py::ProblemContractProvider",
+      "role": "active_provider",
+      "capability": "problem-contract",
+      "source_receipt_id": "public-problem-contract-source",
+      "input_contract": "StudyRequest",
+      "output_contract": "problem-contract artifact",
+      "production_dependency": true,
+      "replacement_gate": null
+    },
+    {
+      "module_id": "src/windows_solver/spectrum.py::SpectralCatalogProvider",
+      "role": "active_provider",
+      "capability": "spectral-core",
+      "source_receipt_id": "public-spectrum-receipt",
+      "input_contract": "exact lattice selection",
+      "output_contract": "authenticated Kerr QNM spectrum artifact",
+      "production_dependency": true,
+      "replacement_gate": null
+    },
+    {
+      "module_id": "src/windows_solver/contracts.py",
+      "role": "validator",
+      "capability": "problem-contract",
+      "source_receipt_id": "public-problem-contract-source",
+      "input_contract": "untrusted study mapping",
+      "output_contract": "immutable validated request",
+      "production_dependency": true,
+      "replacement_gate": "All schema, canonical identity, and adverse-input tests must remain green."
+    },
+    {
+      "module_id": "src/windows_solver/payload_validation.py",
+      "role": "validator",
+      "capability": null,
+      "source_receipt_id": null,
+      "input_contract": "untrusted provider payload",
+      "output_contract": "validated payload boundary",
+      "production_dependency": true,
+      "replacement_gate": "All payload validation and tamper tests must remain green."
+    },
+    {
+      "module_id": "src/windows_solver/release_manifest.py",
+      "role": "validator",
+      "capability": null,
+      "source_receipt_id": null,
+      "input_contract": "untrusted release-domain JSON or mapping",
+      "output_contract": "hash-bound immutable release manifest",
+      "production_dependency": false,
+      "replacement_gate": "All scope, receipt, ownership, convention, registry, and adverse-input tests must remain green."
+    },
+    {
+      "module_id": "src/windows_solver/artifacts.py",
+      "role": "infrastructure",
+      "capability": null,
+      "source_receipt_id": null,
+      "input_contract": "provider result and lineage",
+      "output_contract": "content-addressed artifact envelope",
+      "production_dependency": true,
+      "replacement_gate": "Artifact identity and lineage tests must remain green."
+    },
+    {
+      "module_id": "src/windows_solver/providers.py",
+      "role": "infrastructure",
+      "capability": null,
+      "source_receipt_id": null,
+      "input_contract": "provider descriptors",
+      "output_contract": "single-owner provider registry",
+      "production_dependency": true,
+      "replacement_gate": "Duplicate and unavailable provider tests must remain green."
+    },
+    {
+      "module_id": "src/windows_solver/planner.py",
+      "role": "infrastructure",
+      "capability": null,
+      "source_receipt_id": null,
+      "input_contract": "requested capability",
+      "output_contract": "dependency-closed execution plan",
+      "production_dependency": true,
+      "replacement_gate": "Dependency completeness, order, and cycle tests must remain green."
+    },
+    {
+      "module_id": "src/windows_solver/engine.py",
+      "role": "infrastructure",
+      "capability": null,
+      "source_receipt_id": null,
+      "input_contract": "validated request and provider registry",
+      "output_contract": "evidence-constrained execution record",
+      "production_dependency": true,
+      "replacement_gate": "Cold execution, cache, lineage, and fail-closed tests must remain green."
+    },
+    {
+      "module_id": "src/windows_solver/cli.py",
+      "role": "infrastructure",
+      "capability": null,
+      "source_receipt_id": null,
+      "input_contract": "command-line request",
+      "output_contract": "machine-readable solver result",
+      "production_dependency": true,
+      "replacement_gate": "CLI stream and exit-code tests must remain green."
+    },
+    {
+      "module_id": "src/windows_solver/__init__.py",
+      "role": "infrastructure",
+      "capability": null,
+      "source_receipt_id": null,
+      "input_contract": "installed package import",
+      "output_contract": "windows_solver package namespace",
+      "production_dependency": true,
+      "replacement_gate": "Installed-package import and entry-point tests must remain green."
+    },
+    {
+      "module_id": "src/windows_solver/__main__.py",
+      "role": "infrastructure",
+      "capability": null,
+      "source_receipt_id": null,
+      "input_contract": "module invocation",
+      "output_contract": "CLI process",
+      "production_dependency": true,
+      "replacement_gate": "Module-entry tests must remain green."
+    },
+    {
+      "module_id": "solver.ps1",
+      "role": "infrastructure",
+      "capability": null,
+      "source_receipt_id": null,
+      "input_contract": "native Windows invocation",
+      "output_contract": "CPython solver process",
+      "production_dependency": true,
+      "replacement_gate": "Native Windows stream and runtime-discovery tests must remain green."
+    },
+    {
+      "module_id": "tools/compute_kerr_qnm_lattice.py",
+      "role": "validator",
+      "capability": "spectral-core",
+      "source_receipt_id": "public-spectrum-receipt",
+      "input_contract": "declared Kerr lattice and authenticated numerical inputs",
+      "output_contract": "offline catalog and receipt",
+      "production_dependency": false,
+      "replacement_gate": "Recomputed catalog bytes and every numerical gate must match the admitted receipt."
+    },
+    {
+      "module_id": "tools/kerr_angular.py",
+      "role": "validator",
+      "capability": "spectral-core",
+      "source_receipt_id": "public-spectrum-receipt",
+      "input_contract": "spin-weighted angular mode and complex frequency",
+      "output_contract": "offline angular eigenvalue and refinement diagnostics",
+      "production_dependency": false,
+      "replacement_gate": "Angular refinement and independent-comparison gates must remain green."
+    },
+    {
+      "module_id": "tools/kerr_cf_solver.py",
+      "role": "validator",
+      "capability": "spectral-core",
+      "source_receipt_id": "public-spectrum-receipt",
+      "input_contract": "Kerr mode, exact spin, angular eigenvalue, and branch seed",
+      "output_contract": "offline coupled Leaver root and residual diagnostics",
+      "production_dependency": false,
+      "replacement_gate": "Determinant, continued-fraction, branch, and repeat-polish gates must remain green."
+    },
+    {
+      "module_id": "tools/validate_release_manifest.py",
+      "role": "validator",
+      "capability": null,
+      "source_receipt_id": null,
+      "input_contract": "packaged or explicitly supplied release manifest",
+      "output_contract": "machine-readable validity summary or fail-closed diagnostic",
+      "production_dependency": false,
+      "replacement_gate": "Packaged, external-file, and adverse-input command tests must remain green."
+    },
+    {
+      "module_id": "retained-first-order-org-evidence-bundle",
+      "role": "retired_fixture",
+      "capability": "quadratic-ringdown",
+      "source_receipt_id": "org-spin-zero-output-receipt",
+      "input_contract": "retained parent mode artifacts",
+      "output_contract": "golden reconstruction evidence only",
+      "production_dependency": false,
+      "replacement_gate": "A public implementation must match independent retained values within recorded local uncertainty."
+    },
+    {
+      "module_id": "retained-cubic-eft-220-calculation",
+      "role": "comparator",
+      "capability": "linear-response",
+      "source_receipt_id": "cubic-status-receipt",
+      "input_contract": "authenticated published 220 source and tables",
+      "output_contract": "eight benchmark disks only",
+      "production_dependency": false,
+      "replacement_gate": "A public implementation must reproduce all eight disks and independent-route gates."
+    },
+    {
+      "module_id": "external-cubic-eft-source",
+      "role": "comparator",
+      "capability": "linear-response",
+      "source_receipt_id": "cubic-source-potential",
+      "input_contract": "published source bytes",
+      "output_contract": "offline comparison input only",
+      "production_dependency": false,
+      "replacement_gate": "License reconciliation is required before any source copying or runtime linkage."
+    }
+  ],
+  "conventions": [
+    {
+      "convention_id": "request-bound",
+      "equations_id": "request-bound",
+      "time_fourier": "declared by each requested scientific convention",
+      "boundary_conditions": "declared by each requested scientific convention",
+      "gauge": "declared by each requested scientific convention",
+      "tetrad": "declared by each requested scientific convention",
+      "units": "declared by each requested scientific convention",
+      "field_normalization": "declared by each requested scientific convention",
+      "amplitude_normalization": "declared by each requested scientific convention",
+      "branch_rule": "declared by each requested scientific convention",
+      "applies_to": ["problem-contract"],
+      "status": "admitted"
+    },
+    {
+      "convention_id": "kerr-mass-normalized-outgoing",
+      "equations_id": "teukolsky-leaver-coupled-angular-radial-cf",
+      "time_fourier": "exp(-i omega t + i m phi)",
+      "boundary_conditions": "ingoing at the future horizon and outgoing at future null infinity",
+      "gauge": "curvature-field separation; metric gauge not applicable",
+      "tetrad": "Kinnersley-compatible spin-weight minus two curvature convention",
+      "units": "M omega and a/M in geometric units",
+      "field_normalization": "root catalog stores frequency and angular separation constant, not eigenfunction amplitude",
+      "amplitude_normalization": "not applicable to spectral roots",
+      "branch_rule": "Schwarzschild-overtone continuation; damped roots only in the admitted catalog",
+      "applies_to": ["spectral-core", "linear-response"],
+      "status": "admitted for roots; fields and responses remain future work"
+    },
+    {
+      "convention_id": "first-order-org-reference",
+      "equations_id": "regular-hertz-to-outgoing-radiation-gauge-linearized-einstein",
+      "time_fourier": "exp(-i omega t + i m phi)",
+      "boundary_conditions": "parent QNM is ingoing at the horizon and outgoing at infinity",
+      "gauge": "outgoing radiation gauge",
+      "tetrad": "Kinnersley tetrad with two-chart residual checks",
+      "units": "spectral parameter equals -i r-plus omega",
+      "field_normalization": "fourth-order local Taylor jets of the regular Hertz field",
+      "amplitude_normalization": "retained parent artifact normalization; not a public response normalization",
+      "branch_rule": "retained resolved parent mode at a/M equals 0 or 0.7",
+      "applies_to": ["linear-response", "quadratic-ringdown"],
+      "status": "validated legacy evidence only"
+    },
+    {
+      "convention_id": "cubic-even-220-reference",
+      "equations_id": "delta-cubed-radial-derivative-plus-gr-and-alpha-ev-delta-potential",
+      "time_fourier": "exp(-i omega t + i m phi)",
+      "boundary_conditions": "source-derived horizon exponent and outgoing infinity condition",
+      "gauge": "radial-fixing and Cauchy-horizon-fixing comparison gauges",
+      "tetrad": "separated spin-weight minus two curvature convention",
+      "units": "M omega, a/M, and dimensionless cubic coupling in geometric units",
+      "field_normalization": "mode-conditioned 220 separated operator with order-18 spin source and 17-over-1 Pade resummation",
+      "amplitude_normalization": "complex shift per unit cubic coupling",
+      "branch_rule": "220 fundamental branch with plus and minus polarizations",
+      "applies_to": ["linear-response"],
+      "status": "validated legacy benchmark; external source is comparator-only"
+    },
+    {
+      "convention_id": "operator-proof-bearing",
+      "equations_id": "two-dimensional-hyperboloidal-kerr-operator",
+      "time_fourier": "exp(-i omega t + i m phi)",
+      "boundary_conditions": "horizon and future-null-infinity regularity in the hyperboloidal chart",
+      "gauge": "each coordinate fixing is part of operator identity",
+      "tetrad": "declared spin-weight minus two field tetrad",
+      "units": "geometric units with explicit mass and chart scales",
+      "field_normalization": "physical energy Gram matrix and positive-energy symmetrizer required",
+      "amplitude_normalization": "not applicable to root enclosures",
+      "branch_rule": "each enclosed root is bound to a spectral genealogy record",
+      "applies_to": ["operator-stability"],
+      "status": "frozen requirement; no public evidence"
+    },
+    {
+      "convention_id": "quadratic-org-hertz-sum-frequency",
+      "equations_id": "second-order-einstein-source-and-forced-teukolsky",
+      "time_fourier": "exp(-i Omega t + i M phi), with Omega = omega-parent-1 + omega-parent-2",
+      "boundary_conditions": "regular causal forced solution, ingoing at the horizon and outgoing at infinity",
+      "gauge": "outgoing radiation gauge parent reconstruction",
+      "tetrad": "Kinnersley tetrad",
+      "units": "dimensionless M Omega and a/M in geometric units",
+      "field_normalization": "regular Hertz parents reconstructed from authenticated normalized eigenfunctions",
+      "amplitude_normalization": "each parent has unit strain amplitude at future null infinity",
+      "branch_rule": "220-plus times 220-plus forces azimuthal number 4 and the declared 440 response",
+      "applies_to": ["quadratic-ringdown", "response-matrix"],
+      "status": "frozen requirement; no public evidence"
+    },
+    {
+      "convention_id": "physical-response-and-inference",
+      "equations_id": "sparse-physical-response-matrix-and-complex-likelihood",
+      "time_fourier": "inherits each authenticated response block",
+      "boundary_conditions": "inherits each authenticated response block",
+      "gauge": "observable blocks must be gauge-consistent and provenance-bound",
+      "tetrad": "inherits field definitions before observable projection",
+      "units": "dimensionless response coefficients with explicit physical conversion",
+      "field_normalization": "field-native blocks precede projective or statistical reduction",
+      "amplitude_normalization": "one shared physical parameter basis; no independently fitted coupling per mode",
+      "branch_rule": "mode and polarization identities remain explicit in every matrix row",
+      "applies_to": ["response-matrix", "inverse-inference"],
+      "status": "frozen requirement; no public evidence"
+    },
+    {
+      "convention_id": "field-native-waveform-detector",
+      "equations_id": "causal-qnm-evolution-psi4-strain-and-detector-transfer",
+      "time_fourier": "exp(-i omega t + i m phi)",
+      "boundary_conditions": "causal source excitation with future-horizon and future-null-infinity channels",
+      "gauge": "curvature-to-strain conversion and detector projection are separate recorded operations",
+      "tetrad": "wave-zone curvature convention bound before strain conversion",
+      "units": "dimensionless strain, seconds, hertz, and detector-specific one-sided PSD",
+      "field_normalization": "Psi4 equals the second time derivative of complex strain under the declared sign convention",
+      "amplitude_normalization": "source excitation, propagation, and detector response factors remain separate",
+      "branch_rule": "causal multimode sums retain mode, overtone, branch, and polarization identity",
+      "applies_to": ["signals", "detector-inference"],
+      "status": "frozen requirement; no public evidence"
+    },
+    {
+      "convention_id": "release-evidence-package",
+      "equations_id": "all-upstream-identities-content-addressed",
+      "time_fourier": "inherited without transformation from each artifact",
+      "boundary_conditions": "inherited without transformation from each artifact",
+      "gauge": "inherited without transformation from each artifact",
+      "tetrad": "inherited without transformation from each artifact",
+      "units": "inherited with explicit conversion receipts",
+      "field_normalization": "inherited with explicit lineage",
+      "amplitude_normalization": "inherited with explicit lineage",
+      "branch_rule": "inherited with explicit lineage",
+      "applies_to": ["evidence-package"],
+      "status": "frozen requirement; no canonical package"
+    }
+  ],
+  "evidence_ceilings": [
+    {
+      "evidence_ceiling_id": "schema-validated",
+      "carrier": "VALID",
+      "execution": "SUCCEEDED",
+      "numerical": "ACCEPTED",
+      "scientific": "NOT_EVALUATED",
+      "formal_enclosure": false,
+      "maximum_claim": "The request is structurally valid and content-addressed; no scientific result is implied."
+    },
+    {
+      "evidence_ceiling_id": "full-lattice-numerically-accepted",
+      "carrier": "VALID",
+      "execution": "SUCCEEDED",
+      "numerical": "ACCEPTED",
+      "scientific": "NOT_EVALUATED",
+      "formal_enclosure": false,
+      "maximum_claim": "All 2,736 stored pure-Kerr roots pass the recorded numerical gates and independent comparison; no formal root enclosure is claimed."
+    },
+    {
+      "evidence_ceiling_id": "first-order-org-numerically-accepted",
+      "carrier": "VALID",
+      "execution": "SUCCEEDED",
+      "numerical": "ACCEPTED",
+      "scientific": "NOT_EVALUATED",
+      "formal_enclosure": false,
+      "maximum_claim": "The two retained first-order reconstructions pass their local residual and overlap gates; they are golden evidence, not a public provider."
+    },
+    {
+      "evidence_ceiling_id": "cubic-eft-benchmark-numerically-accepted",
+      "carrier": "VALID",
+      "execution": "SUCCEEDED",
+      "numerical": "ACCEPTED",
+      "scientific": "CONDITIONALLY_SUPPORTED",
+      "formal_enclosure": false,
+      "maximum_claim": "Eight mode-conditioned 220 benchmark disks reproduce the published plus and minus shifts at four spins; no universal two-dimensional EFT operator is claimed."
+    },
+    {
+      "evidence_ceiling_id": "framework-only",
+      "carrier": "VALID",
+      "execution": "NOT_RUN",
+      "numerical": "NOT_EVALUATED",
+      "scientific": "NOT_EVALUATED",
+      "formal_enclosure": false,
+      "maximum_claim": "Interfaces or retained code exist, but no production scientific result is admitted."
+    },
+    {
+      "evidence_ceiling_id": "proof-bearing-required",
+      "carrier": "NOT_APPLICABLE",
+      "execution": "NOT_RUN",
+      "numerical": "NOT_EVALUATED",
+      "scientific": "NOT_EVALUATED",
+      "formal_enclosure": false,
+      "maximum_claim": "No operator-stability claim is available until discrete, truncation, and continuum evidence are separately admitted."
+    },
+    {
+      "evidence_ceiling_id": "missing-input",
+      "carrier": "NOT_APPLICABLE",
+      "execution": "NOT_RUN",
+      "numerical": "NOT_EVALUATED",
+      "scientific": "NOT_EVALUATED",
+      "formal_enclosure": false,
+      "maximum_claim": "The required evidence is absent and the associated capability must fail closed."
+    }
+  ],
+  "governance_decisions": [
+    {
+      "decision_id": "accepted-spectrum-baseline",
+      "decision": "Pull request 2 and its 2,736-root catalog remain immutable accepted baseline evidence.",
+      "rationale": "Release-scope work must not rewrite already accepted numerical science."
+    },
+    {
+      "decision_id": "delivery-sequence",
+      "decision": "Pull request 3 delivers M01 release scope and evidence governance; linear-response delivery begins with pull request 4.",
+      "rationale": "Executable scope and fail-closed evidence ownership must precede new scientific providers."
+    },
+    {
+      "decision_id": "legacy-evidence-boundary",
+      "decision": "Retained evidence may be a golden fixture or comparator but never an active public provider or runtime dependency.",
+      "rationale": "Migration must be independently testable and public ownership must remain explicit."
+    },
+    {
+      "decision_id": "external-license-boundary",
+      "decision": "The GPL-3.0 cubic source is restricted to offline comparison and source authentication absent a separate license reconciliation.",
+      "rationale": "The proprietary public runtime must not silently copy or link incompatible source code."
+    },
+    {
+      "decision_id": "scientific-layer-separation",
+      "decision": "Pole shifts, quadratic amplitudes, response matrices, waveforms, and detector evidence remain distinct artifact layers.",
+      "rationale": "Evidence at one layer cannot support a stronger claim at another layer."
+    },
+    {
+      "decision_id": "missing-evidence-policy",
+      "decision": "Missing receipts are explicit blockers and never inferred from code presence, status prose, or adjacent results.",
+      "rationale": "Unsupported capabilities must fail closed."
+    }
+  ],
+  "blockers": [
+    {
+      "blocker_id": "linear-response-disks",
+      "capability": "linear-response",
+      "owner": "M02",
+      "unblock_action": "Authenticate component-local response disks, migrate field-native calculations, and admit the public provider."
+    },
+    {
+      "blocker_id": "spectral-fields-and-genealogy",
+      "capability": "spectral-core",
+      "owner": "M03",
+      "unblock_action": "Compute normalized fields, co-modes, residues, and near-extremal branch genealogy."
+    },
+    {
+      "blocker_id": "operator-continuum-proof",
+      "capability": "operator-stability",
+      "owner": "M04",
+      "unblock_action": "Separate and close discrete, truncation, and continuum stability evidence."
+    },
+    {
+      "blocker_id": "quadratic-production-evidence",
+      "capability": "quadratic-ringdown",
+      "owner": "M05-M06",
+      "unblock_action": "Authenticate parent fields and coupling expressions, then solve and validate the physical forced response."
+    },
+    {
+      "blocker_id": "physical-response-matrix",
+      "capability": "response-matrix",
+      "owner": "M07",
+      "unblock_action": "Assemble authenticated linear and quadratic blocks and establish identifiability."
+    },
+    {
+      "blocker_id": "physical-inverse-and-waveforms",
+      "capability": "inverse-inference",
+      "owner": "M08-M09",
+      "unblock_action": "Complete physical inverse validation and causal field-native waveform production."
+    },
+    {
+      "blocker_id": "ground-event-inputs",
+      "capability": "detector-inference",
+      "owner": "M10",
+      "unblock_action": "Hash event strain bytes, PSD, response configuration, and an independent evidence oracle."
+    },
+    {
+      "blocker_id": "space-detector-inputs",
+      "capability": "detector-inference",
+      "owner": "M10",
+      "unblock_action": "Authenticate the LISA equal-arm transfer function, PSD, units, and reference comparison."
+    },
+    {
+      "blocker_id": "cross-platform-package",
+      "capability": "evidence-package",
+      "owner": "M11-M12",
+      "unblock_action": "Complete all providers, container packaging, clean-machine runs, and cross-platform equivalence."
+    }
+  ],
+  "closure": {
+    "milestone": "M01",
+    "task_ids": ["TASK-001", "TASK-002", "TASK-003", "TASK-004", "TASK-005"],
+    "scope_frozen": true,
+    "human_reconciliation": true,
+    "automated_validation": true,
+    "future_missing_evidence_blocks_capabilities": true
+  }
+}
