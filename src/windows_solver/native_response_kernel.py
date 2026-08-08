@@ -16,6 +16,7 @@ import math
 import os
 from pathlib import Path
 import platform
+import struct
 from typing import Callable, Mapping
 
 from .response_engine import (
@@ -77,7 +78,8 @@ def _native_identity() -> BackendIdentity:
         source_blobs=_SOURCE_BLOBS,
         runtime_fingerprint=(
             f"cpython-{platform.python_version()}-{platform.system().lower()}-"
-            f"{platform.machine().lower()}-gsn-cache-{PINNED_GSN_CACHE_SHA256}-"
+            f"python-{8 * struct.calcsize('P')}bit-"
+            f"gsn-cache-{PINNED_GSN_CACHE_SHA256}-"
             f"adapted-source-{_ADAPTED_SOURCE_CONTRACT_ID}"
         ),
     )
