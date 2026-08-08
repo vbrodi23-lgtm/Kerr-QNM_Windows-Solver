@@ -34,6 +34,10 @@ from .response_reduction import (
     CampaignReductionSummary,
     build_projective_row_plans,
 )
+from .response_engine import (
+    bound_spectral_root_mapping_for_leaf,
+    campaign_spectral_receipt,
+)
 from .spectrum import (
     SPECTRAL_OUTPUT_ARTIFACT_TYPE,
     SpectralCatalogProvider,
@@ -170,6 +174,7 @@ def _validate_evidence_receipt(value: object) -> Mapping[str, object]:
             "produced_count", "missing_count", "unresolved_leaf_ids",
             "release_domain_fingerprint", "numerical_policy_fingerprint",
             "runtime_fingerprint",
+            "campaign_root_set_sha256",
         }),
         "admission evidence receipt",
     )
@@ -192,10 +197,16 @@ def _validate_evidence_receipt(value: object) -> Mapping[str, object]:
         != LINEAR_RESPONSE_DESCRIPTOR.numerical_policy_fingerprint
         or not isinstance(receipt["runtime_fingerprint"], str)
         or not receipt["runtime_fingerprint"]
+        or receipt["campaign_root_set_sha256"]
+        != campaign_spectral_receipt()["root_set_sha256"]
     ):
         raise ValueError("admission evidence receipt is not a complete 553-leaf receipt")
     _digest(receipt["bundle_sha256"], "evidence bundle SHA-256")
     _digest(receipt["manifest_sha256"], "evidence manifest SHA-256")
+    _digest(
+        receipt["campaign_root_set_sha256"],
+        "campaign root-set SHA-256",
+    )
     return receipt
 
 
@@ -235,6 +246,73 @@ def _validate_spectral_upstream_receipt(
     if receipt != expected:
         raise ValueError(
             "admission spectral upstream receipt does not match the admitted catalog"
+        )
+    return receipt
+
+
+def _validate_campaign_spectral_bindings(
+    records: object,
+    receipt_value: object,
+    request: StudyRequest,
+) -> Mapping[str, object]:
+    receipt = _mapping(receipt_value, "campaign spectral receipt")
+    expected_receipt = campaign_spectral_receipt()
+    if receipt != expected_receipt:
+        raise ValueError(
+            "admission campaign roots do not match the installed spectral catalog"
+        )
+    spectral_request = request.for_capability(Capability.SPECTRAL_CORE)
+    spectral_payload = build_spectral_payload(spectral_request)
+    spectral_roots: dict[tuple[object, ...], Mapping[str, object]] = {}
+    for raw_root in _array(
+        spectral_payload["roots"], "admission spectral payload roots"
+    ):
+        root = _mapping(raw_root, "admission spectral payload root")
+        mode = _mapping(root["mode"], "admission spectral payload mode")
+        identity = (
+            mode["ell"], mode["m"], mode["n"], root["spin_binary64_hex"]
+        )
+        spectral_roots[identity] = root
+
+    seen: dict[str, Mapping[str, object]] = {}
+    for raw_record in _array(records, "admission produced records"):
+        record = _mapping(raw_record, "admission produced record")
+        expected_root = bound_spectral_root_mapping_for_leaf(record["leaf_id"])
+        actual_root = _mapping(
+            record["root_identity"], "admission campaign root identity"
+        )
+        actual_digest = _digest(
+            record["root_identity_sha256"],
+            "admission campaign root identity SHA-256",
+        )
+        if (
+            actual_root != expected_root
+            or _digest_bytes(canonical_json_bytes(actual_root)) != actual_digest
+        ):
+            raise ValueError(
+                "admission campaign root identity does not match the installed catalog"
+            )
+        mode = record["mode"]
+        coordinate = _mapping(
+            record["sampling_coordinate"], "admission record coordinate"
+        )
+        spectral_root = spectral_roots.get(
+            (*mode, coordinate["spin_binary64_hex"])
+        )
+        if spectral_root is None or expected_root["owner_record"] != spectral_root:
+            raise ValueError(
+                "admission campaign root values do not match the spectral payload"
+            )
+        seen.setdefault(actual_digest, actual_root)
+    if (
+        len(seen) != receipt["root_count"]
+        or _digest_bytes(canonical_json_bytes(list(seen.values())))
+        != receipt["root_set_sha256"]
+        or receipt["provider"]
+        != SpectralCatalogProvider.descriptor.to_mapping()
+    ):
+        raise ValueError(
+            "admission campaign root set does not match the spectral receipt"
         )
     return receipt
 
@@ -639,6 +717,11 @@ def admit_linear_response_bundle(
     validate_linear_response_admission(
         request, ADMITTED_LINEAR_RESPONSE_DESCRIPTOR.to_mapping(), payload
     )
+    campaign_root_receipt = _validate_campaign_spectral_bindings(
+        records,
+        evidence_manifest["contract"]["campaign_spectral_receipt"],
+        request,
+    )
     _validate_component_evidence_bindings(
         evidence_path.parent, records, payload["response_components"]
     )
@@ -657,6 +740,7 @@ def admit_linear_response_bundle(
             "numerical_policy_fingerprint"
         ],
         "runtime_fingerprint": evidence_manifest["producer"]["runtime_fingerprint"],
+        "campaign_root_set_sha256": campaign_root_receipt["root_set_sha256"],
     }
     source_files = {
         name: _digest_bytes(data) for name, (_, data) in loaded.items()

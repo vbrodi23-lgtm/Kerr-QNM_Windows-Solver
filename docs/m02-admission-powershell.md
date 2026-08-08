@@ -20,9 +20,10 @@ From the directory containing the operator files:
 
 The evidence manifest must have state `complete-operator`, exactly 553 produced
 leaf IDs, zero missing IDs, authenticated payload/source hashes, the frozen M02
-policy fingerprint, and a valid producer runtime lineage. `UNRESOLVED` is a
-governed produced state; missing, rejected, malformed, duplicated, or
-unexecuted leaves fail admission.
+policy fingerprint, a valid producer runtime lineage, the exact spectral
+provider/root-set receipt, and a complete checkpoint root identity on every
+produced record. `UNRESOLVED` is a governed produced state; missing, rejected,
+malformed, duplicated, or unexecuted leaves fail admission.
 
 ## 2. Reduce all frozen projective rows
 
@@ -65,7 +66,11 @@ object is the exact corresponding entry in `payload.json`'s
 mode, binary64 spin identity, and mechanism; requires identical numerical state
 and root reference; and rereads the record payload under its declared byte size
 and SHA-256 before comparing the complete object. A copied lineage hash cannot
-make a stale or unrelated component admissible.
+make a stale or unrelated component admissible. Admission also compares every
+record's complete campaign root identity to the installed catalog and to the
+exact root object in the scoped 87-root spectral payload. A campaign produced
+under catalog A cannot be admitted or replayed under catalog B, even if all
+mode/spin reference IDs and internal evidence hashes are consistently resealed.
 
 Create `admission-input.json` with safe paths relative to its own directory:
 

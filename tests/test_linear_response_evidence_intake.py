@@ -26,6 +26,12 @@ from windows_solver.linear_response import (
     LINEAR_RESPONSE_DESCRIPTOR,
     baseline_root_reference_id,
 )
+from windows_solver.response_engine import (
+    NumericalPolicy,
+    ResponseComponentJob,
+    VettedNativeDeterminantKernel,
+)
+from windows_solver.spectrum import SpectralCatalogProvider
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -51,6 +57,41 @@ def _comparator_identity_sha256(item: dict[str, object]) -> str:
     }))
 
 
+_ROOT_IDENTITIES: dict[str, dict[str, object]] | None = None
+_CAMPAIGN_SPECTRAL_RECEIPT: dict[str, object] | None = None
+
+
+def _root_identity(leaf: object) -> dict[str, object]:
+    global _ROOT_IDENTITIES
+    if _ROOT_IDENTITIES is None:
+        _ROOT_IDENTITIES = {
+            item.leaf_id: ResponseComponentJob.from_leaf_id(
+                item.leaf_id,
+                policy=NumericalPolicy(),
+                backend_identity=VettedNativeDeterminantKernel.identity,
+            ).root.to_mapping()
+            for item in B_PRIME_RELEASE_DOMAIN.production_leaves
+        }
+    return deepcopy(_ROOT_IDENTITIES[leaf.leaf_id])
+
+
+def _campaign_spectral_receipt() -> dict[str, object]:
+    global _CAMPAIGN_SPECTRAL_RECEIPT
+    if _CAMPAIGN_SPECTRAL_RECEIPT is not None:
+        return deepcopy(_CAMPAIGN_SPECTRAL_RECEIPT)
+    roots: dict[str, dict[str, object]] = {}
+    for leaf in B_PRIME_RELEASE_DOMAIN.production_leaves:
+        identity = _root_identity(leaf)
+        digest = _sha256(canonical_json_bytes(identity))
+        roots.setdefault(digest, identity)
+    _CAMPAIGN_SPECTRAL_RECEIPT = {
+        "provider": SpectralCatalogProvider.descriptor.to_mapping(),
+        "root_count": len(roots),
+        "root_set_sha256": _sha256(canonical_json_bytes(list(roots.values()))),
+    }
+    return deepcopy(_CAMPAIGN_SPECTRAL_RECEIPT)
+
+
 def _record(leaf: object, payload_path: str, payload_bytes: bytes) -> dict[str, object]:
     mode = ModeKey(
         s=-2,
@@ -60,6 +101,7 @@ def _record(leaf: object, payload_path: str, payload_bytes: bytes) -> dict[str, 
         branch="schwarzschild-overtone-continuation",
         polarization="gravitational",
     )
+    root_identity = _root_identity(leaf)
     return {
         "leaf_id": leaf.leaf_id,
         "role": leaf.role,
@@ -76,6 +118,8 @@ def _record(leaf: object, payload_path: str, payload_bytes: bytes) -> dict[str, 
         "payload_sha256": _sha256(payload_bytes),
         "source_reference": "sources/operator.json",
         "root_reference_id": baseline_root_reference_id(mode, leaf.spin),
+        "root_identity": root_identity,
+        "root_identity_sha256": _sha256(canonical_json_bytes(root_identity)),
         "uncertainty_scope": "component-local",
     }
 
@@ -109,6 +153,7 @@ def _write_manifest(
             "release_domain_fingerprint": B_PRIME_CONTRACT_SHA256,
             "numerical_policy_fingerprint": LINEAR_RESPONSE_DESCRIPTOR.numerical_policy_fingerprint,
             "required_leaf_ids": required,
+            "campaign_spectral_receipt": _campaign_spectral_receipt(),
         },
         "producer": {
             "producer_id": "powershell-fixture-producer",

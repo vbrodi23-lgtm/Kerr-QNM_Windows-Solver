@@ -355,6 +355,52 @@ class LinearResponseAdmissionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "spectral upstream"):
             provider.execute(request, {Capability.SPECTRAL_CORE: root_drift})
 
+    def test_admission_rejects_campaign_roots_from_another_catalog(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            admission_path = _admission_fixture(directory, complete=True)
+            evidence_path = directory / "evidence" / "evidence-bundle.json"
+            evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+            first = evidence["produced_records"][0]
+            original_digest = first["root_identity_sha256"]
+            for record in evidence["produced_records"]:
+                if record["root_identity_sha256"] == original_digest:
+                    record["root_identity"]["omega"]["real"] += 1.0e-12
+                    record["root_identity_sha256"] = _sha256(
+                        canonical_json_bytes(record["root_identity"])
+                    )
+            roots: dict[str, dict[str, object]] = {}
+            for record in evidence["produced_records"]:
+                roots.setdefault(
+                    record["root_identity_sha256"], record["root_identity"]
+                )
+            receipt = evidence["contract"]["campaign_spectral_receipt"]
+            receipt["root_count"] = len(roots)
+            receipt["root_set_sha256"] = _sha256(
+                canonical_json_bytes(list(roots.values()))
+            )
+            evidence["bundle_sha256"] = evidence_bundle_digest(evidence)
+            _write_json(evidence_path, evidence)
+
+            payload_path = directory / "payload.json"
+            payload = json.loads(payload_path.read_text(encoding="utf-8"))
+            for digest in (
+                evidence["bundle_sha256"],
+                _sha256(evidence_path.read_bytes()),
+            ):
+                if digest not in payload["lineage"]["source_sha256s"]:
+                    payload["lineage"]["source_sha256s"].append(digest)
+            _write_json(payload_path, payload)
+
+            admission = json.loads(admission_path.read_text(encoding="utf-8"))
+            admission["evidence_bundle"]["sha256"] = _sha256(
+                evidence_path.read_bytes()
+            )
+            admission["payload"]["sha256"] = _sha256(payload_path.read_bytes())
+            _write_json(admission_path, admission)
+            with self.assertRaisesRegex(ValueError, "campaign roots"):
+                admit_linear_response_bundle(admission_path)
+
     def test_admission_package_revalidates_content_and_rejects_tamper(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             package = admit_linear_response_bundle(

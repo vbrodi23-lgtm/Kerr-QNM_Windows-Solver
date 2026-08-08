@@ -10,6 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from enum import Enum
 from fractions import Fraction
+from functools import lru_cache
 import csv
 import hashlib
 from importlib import resources
@@ -41,6 +42,7 @@ from .spectrum import (
     PUBLIC_CONVENTION_ID,
     PUBLIC_POLARIZATION_ID,
     PUBLIC_THEORY_ID,
+    SpectralCatalogProvider,
     load_spectrum_catalog,
 )
 
@@ -381,6 +383,47 @@ def _resolve_root(leaf: BPrimeLeaf, mode: ModeKey) -> BoundSpectralRoot:
         owner_data_sha256=owner_sha,
         owner_record=record,
     )
+
+
+@lru_cache(maxsize=None)
+def _bound_spectral_root_bytes(leaf_id: str) -> bytes:
+    leaf = next(
+        (
+            item for item in B_PRIME_RELEASE_DOMAIN.production_leaves
+            if item.leaf_id == leaf_id
+        ),
+        None,
+    )
+    if leaf is None:
+        raise ValueError("spectral root leaf_id is outside frozen B-prime")
+    return canonical_json_bytes(_resolve_root(leaf, _mode_for_leaf(leaf)).to_mapping())
+
+
+def bound_spectral_root_mapping_for_leaf(leaf_id: str) -> dict[str, object]:
+    value = json.loads(_bound_spectral_root_bytes(leaf_id))
+    if not isinstance(value, dict):
+        raise ValueError("bound spectral root must be an object")
+    return value
+
+
+@lru_cache(maxsize=1)
+def _campaign_spectral_receipt_bytes() -> bytes:
+    roots: dict[str, Mapping[str, object]] = {}
+    for leaf in B_PRIME_RELEASE_DOMAIN.production_leaves:
+        root = bound_spectral_root_mapping_for_leaf(leaf.leaf_id)
+        roots.setdefault(_sha256(root), root)
+    return canonical_json_bytes({
+        "provider": SpectralCatalogProvider.descriptor.to_mapping(),
+        "root_count": len(roots),
+        "root_set_sha256": _sha256(list(roots.values())),
+    })
+
+
+def campaign_spectral_receipt() -> dict[str, object]:
+    value = json.loads(_campaign_spectral_receipt_bytes())
+    if not isinstance(value, dict):
+        raise ValueError("campaign spectral receipt must be an object")
+    return value
 
 
 @dataclass(frozen=True, slots=True)

@@ -272,11 +272,14 @@ def _validate_source_files(value: object, directory: Path) -> dict[str, dict[str
     return result
 
 
-def _validate_contract(value: object) -> None:
+def _validate_contract(value: object) -> Mapping[str, object]:
     contract = _mapping(value, "contract")
     _exact_fields(
         contract,
-        frozenset({"release_domain_fingerprint", "numerical_policy_fingerprint", "required_leaf_ids"}),
+        frozenset({
+            "release_domain_fingerprint", "numerical_policy_fingerprint",
+            "required_leaf_ids", "campaign_spectral_receipt",
+        }),
         "contract",
     )
     if _digest(contract["release_domain_fingerprint"], "release_domain_fingerprint") != B_PRIME_CONTRACT_SHA256:
@@ -286,6 +289,21 @@ def _validate_contract(value: object) -> None:
     required = [_string(item, "required leaf ID") for item in _array(contract["required_leaf_ids"], "required_leaf_ids")]
     if required != list(B_PRIME_RELEASE_DOMAIN.production_leaf_ids):
         raise ValueError("required_leaf_ids must equal the ordered frozen 553-leaf B′ contract")
+    receipt = _mapping(
+        contract["campaign_spectral_receipt"], "campaign spectral receipt"
+    )
+    _exact_fields(
+        receipt,
+        frozenset({"provider", "root_count", "root_set_sha256"}),
+        "campaign spectral receipt",
+    )
+    provider = _mapping(receipt["provider"], "campaign spectral provider")
+    if not provider:
+        raise ValueError("campaign spectral provider must not be empty")
+    if _integer(receipt["root_count"], "campaign spectral root_count") != 87:
+        raise ValueError("campaign spectral receipt must bind exactly 87 roots")
+    _digest(receipt["root_set_sha256"], "campaign spectral root-set SHA-256")
+    return receipt
 
 
 def _validate_producer(
@@ -409,12 +427,13 @@ def _validate_records(
     value: object,
     directory: Path,
     sources: Mapping[str, Mapping[str, object]],
-) -> tuple[str, ...]:
+) -> tuple[tuple[str, ...], tuple[Mapping[str, object], ...]]:
     expected_by_id = {
         leaf.leaf_id: leaf for leaf in B_PRIME_RELEASE_DOMAIN.production_leaves
     }
     produced: list[str] = []
     payload_paths: set[str] = set()
+    roots: dict[str, Mapping[str, object]] = {}
     for index, raw in enumerate(_array(value, "produced_records")):
         record = _mapping(raw, f"produced_records[{index}]")
         _exact_fields(
@@ -422,7 +441,8 @@ def _validate_records(
             frozenset({
                 "leaf_id", "role", "mode", "sampling_coordinate", "mechanism_id",
                 "numerical_state", "payload_path", "payload_size", "payload_sha256",
-                "source_reference", "root_reference_id", "uncertainty_scope",
+                "source_reference", "root_reference_id", "root_identity",
+                "root_identity_sha256", "uncertainty_scope",
             }),
             f"produced_records[{index}]",
         )
@@ -480,6 +500,38 @@ def _validate_records(
         )
         if root_reference_id != baseline_root_reference_id(mode, leaf.spin):
             raise ValueError("root_reference_id does not match the exact B′ leaf")
+        root_identity = _mapping(record["root_identity"], "campaign root identity")
+        _exact_fields(
+            root_identity,
+            frozenset({
+                "selector_id", "availability", "root_reference_id", "branch_id",
+                "spin_binary64_hex", "omega", "angular_separation_constant",
+                "owner_id", "owner_data_sha256", "owner_record",
+            }),
+            "campaign root identity",
+        )
+        for name in ("selector_id", "availability", "branch_id", "owner_id"):
+            _string(root_identity[name], f"campaign root {name}")
+        _digest(root_identity["owner_data_sha256"], "campaign root owner SHA-256")
+        _mapping(root_identity["omega"], "campaign root omega")
+        _mapping(
+            root_identity["angular_separation_constant"],
+            "campaign root angular separation constant",
+        )
+        _mapping(root_identity["owner_record"], "campaign root owner record")
+        if (
+            root_identity["root_reference_id"] != root_reference_id
+            or root_identity["spin_binary64_hex"] != leaf.spin.hex()
+            or root_identity["branch_id"]
+            != "schwarzschild-overtone-continuation"
+        ):
+            raise ValueError("campaign root identity does not match its leaf")
+        root_identity_sha256 = _digest(
+            record["root_identity_sha256"], "campaign root identity SHA-256"
+        )
+        if hashlib.sha256(canonical_json_bytes(root_identity)).hexdigest() != root_identity_sha256:
+            raise ValueError("campaign root identity SHA-256 is invalid")
+        roots.setdefault(root_identity_sha256, root_identity)
         produced.append(leaf_id)
         payload_paths.add(payload_path)
     if not produced:
@@ -487,7 +539,7 @@ def _validate_records(
     expected_order = [item for item in B_PRIME_RELEASE_DOMAIN.production_leaf_ids if item in set(produced)]
     if produced != expected_order:
         raise ValueError("produced_records must follow frozen B′ leaf order")
-    return tuple(produced)
+    return tuple(produced), tuple(roots.values())
 
 
 def validate_evidence_bundle(
@@ -515,11 +567,13 @@ def validate_evidence_bundle(
     bundle_sha256 = _digest(mapping["bundle_sha256"], "bundle_sha256")
     if evidence_bundle_digest(mapping) != bundle_sha256:
         raise ValueError("bundle_sha256 does not authenticate canonical bundle content")
-    _validate_contract(mapping["contract"])
+    campaign_spectral_receipt = _validate_contract(mapping["contract"])
     directory = Path(bundle_directory)
     sources = _validate_source_files(mapping["source_files"], directory)
     _validate_producer(mapping["producer"], sources)
-    produced = _validate_records(mapping["produced_records"], directory, sources)
+    produced, campaign_roots = _validate_records(
+        mapping["produced_records"], directory, sources
+    )
     comparator_ids = _validate_comparators(mapping["comparator_fixtures"], sources)
     missing = [_string(item, "missing leaf ID") for item in _array(mapping["missing_leaf_ids"], "missing_leaf_ids")]
     if len(missing) != len(set(missing)):
@@ -533,6 +587,14 @@ def validate_evidence_bundle(
         raise ValueError("produced and missing IDs must exactly partition frozen B′")
     if bundle_state == "complete-operator" and (len(produced) != 553 or missing):
         raise ValueError("complete-operator requires exactly 553 produced and zero missing IDs")
+    if bundle_state == "complete-operator" and (
+        len(campaign_roots) != campaign_spectral_receipt["root_count"]
+        or hashlib.sha256(canonical_json_bytes(list(campaign_roots))).hexdigest()
+        != campaign_spectral_receipt["root_set_sha256"]
+    ):
+        raise ValueError(
+            "complete-operator campaign roots do not match the spectral receipt"
+        )
     sampled = tuple(item for item in _OPERATOR_SMOKE_LEAF_IDS if item in produced_set)
     sampled += tuple(item for item in comparator_ids if item not in sampled)
     return EvidenceBundleSummary(
