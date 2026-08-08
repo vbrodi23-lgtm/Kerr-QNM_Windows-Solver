@@ -20,6 +20,7 @@ from windows_solver.linear_response_admission import (
     AdmittedLinearResponseProvider,
     LinearResponseAdmissionPackage,
     admit_linear_response_bundle,
+    load_linear_response_admission,
 )
 from windows_solver.providers import ProviderUnavailableError
 from windows_solver.response_reduction import (
@@ -176,7 +177,9 @@ class LinearResponseAdmissionTests(unittest.TestCase):
             self.assertEqual(package.evidence_receipt["produced_count"], 553)
             self.assertEqual(package.reduction_receipt["row_count"], 174)
 
-            provider = AdmittedLinearResponseProvider(package)
+            provider = AdmittedLinearResponseProvider(
+                package, expected_admission_id=package.admission_id
+            )
             self.assertEqual(provider.descriptor, ADMITTED_LINEAR_RESPONSE_DESCRIPTOR)
             registry = default_registry(provider)
             self.assertIs(registry.resolve(Capability.LINEAR_RESPONSE), provider)
@@ -188,6 +191,10 @@ class LinearResponseAdmissionTests(unittest.TestCase):
 
             with self.assertRaises(TypeError):
                 package.payload["quantity"] = "mutated-after-admission"
+            with self.assertRaisesRegex(ValueError, "expected admission identity"):
+                AdmittedLinearResponseProvider(
+                    package, expected_admission_id="m02-admission-" + "0" * 64
+                )
 
     def test_admission_package_revalidates_content_and_rejects_tamper(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -205,6 +212,25 @@ class LinearResponseAdmissionTests(unittest.TestCase):
         malformed["evidence_receipt"]["unresolved_leaf_ids"] = [{}]
         with self.assertRaisesRegex(ValueError, "unresolved leaf IDs"):
             LinearResponseAdmissionPackage.from_mapping(malformed)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            tampered = deepcopy(mapping)
+            tampered["payload"]["response_components"][0]["result"]["reason"] = (
+                "modified after admission"
+            )
+            material = {
+                key: value for key, value in tampered.items()
+                if key != "admission_id"
+            }
+            tampered["admission_id"] = (
+                "m02-admission-" + _sha256(canonical_json_bytes(material))
+            )
+            path = Path(temporary) / "tampered-admission.json"
+            _write_json(path, tampered)
+            with self.assertRaisesRegex(ValueError, "expected admission identity"):
+                load_linear_response_admission(
+                    path, expected_admission_id=package.admission_id
+                )
 
     def test_admission_binds_component_state_and_authenticated_payload_bytes(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -277,13 +303,17 @@ class LinearResponseAdmissionTests(unittest.TestCase):
                 "m02-admit", "admission-input.json", "--output", "admitted.json"
             )
             self.assertEqual(admitted.returncode, 0, admitted.stderr)
-            self.assertTrue(json.loads(admitted.stdout)["release_admissible"])
+            admitted_summary = json.loads(admitted.stdout)
+            self.assertTrue(admitted_summary["release_admissible"])
+            admission_id = admitted_summary["admission_id"]
             package = LinearResponseAdmissionPackage.from_mapping(
                 json.loads((directory / "admitted.json").read_text(encoding="utf-8"))
             )
 
             exported = invoke(
-                "m02-export", "admitted.json", "--output", "exported.json"
+                "m02-export", "admitted.json",
+                "--admission-id", admission_id,
+                "--output", "exported.json",
             )
             self.assertEqual(exported.returncode, 0, exported.stderr)
             self.assertEqual(
@@ -294,6 +324,7 @@ class LinearResponseAdmissionTests(unittest.TestCase):
             planned = invoke(
                 "plan", "request.json",
                 "--linear-response-admission", "admitted.json",
+                "--linear-response-admission-id", admission_id,
             )
             self.assertEqual(planned.returncode, 0, planned.stderr)
             self.assertEqual(json.loads(planned.stdout)["unavailable_capabilities"], [])
@@ -301,15 +332,24 @@ class LinearResponseAdmissionTests(unittest.TestCase):
             first = invoke(
                 "run", "request.json", "--store", "store",
                 "--linear-response-admission", "admitted.json",
+                "--linear-response-admission-id", admission_id,
             )
             second = invoke(
                 "run", "request.json", "--store", "store",
                 "--linear-response-admission", "admitted.json",
+                "--linear-response-admission-id", admission_id,
             )
             self.assertEqual(first.returncode, 0, first.stderr)
             self.assertEqual(second.returncode, 0, second.stderr)
             self.assertEqual(json.loads(first.stdout)["provider_execution_count"], 3)
             self.assertEqual(json.loads(second.stdout)["cache_hit_count"], 3)
+
+            unpinned = invoke(
+                "plan", "request.json",
+                "--linear-response-admission", "admitted.json",
+            )
+            self.assertEqual(unpinned.returncode, 2)
+            self.assertIn("detached admission ID", unpinned.stderr)
 
 
 if __name__ == "__main__":

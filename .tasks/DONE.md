@@ -13,7 +13,7 @@ Finish the installable M02 machinery and operator handoff while keeping the line
 - [x] Validate exactly 553 produced leaves, zero missing leaves, governed unresolved IDs, 174 aligned projective rows, role ceilings, hashes, runtime lineage, and policy identity.
 - [x] Provide PowerShell-friendly `validate`, `reduce`, `admit`, and `export` commands with deterministic machine-readable output and useful failure messages.
 - [x] Prove smoke/partial bundles cannot register the provider; prove a structurally complete signed test bundle exercises the availability transition without claiming scientific evidence.
-- [x] Keep exactly one provider owner, unrelated capabilities unchanged, and admission contingent on the external evidence receipt rather than build completion.
+- [x] Keep exactly one provider owner, unrelated capabilities unchanged, and admission contingent on the external evidence receipt plus detached expected admission ID rather than build completion.
 - [x] Pass Windows-oriented command/path tests, Ubuntu tests, cold/warm cache, wheel content, manifest, compile, and head/tail/risk end-to-end smoke gates.
 
 ### Dependencies
@@ -35,7 +35,7 @@ Installable fail-closed admission package and CLI; an explicit dynamic provider 
 
 ### Review Focus
 
-Complete/partial separation is fail closed; every final component is value/state-bound to its authenticated produced-record payload; the admitted package is deeply immutable; provider registration is explicit and unique; native runtime identity is stable across Windows and Ubuntu; operator paths and CLI output are deterministic; scientific readiness is not inferred from build readiness.
+Complete/partial separation is fail closed; every final component is value/state-bound to its authenticated produced-record payload; serialized package loads require an independently preserved admission ID; the admitted package is deeply immutable; provider registration is explicit and unique; native runtime identity is stable across Windows and Ubuntu; operator paths and CLI output are deterministic; scientific readiness is not inferred from build readiness.
 
 ### Plan
 

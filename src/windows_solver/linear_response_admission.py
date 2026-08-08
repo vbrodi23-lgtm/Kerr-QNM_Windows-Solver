@@ -467,19 +467,38 @@ def admit_linear_response_bundle(
 
 def load_linear_response_admission(
     path: str | Path,
+    *,
+    expected_admission_id: str,
 ) -> LinearResponseAdmissionPackage:
-    return LinearResponseAdmissionPackage.from_mapping(
+    package = LinearResponseAdmissionPackage.from_mapping(
         _load_json_bytes(Path(path).read_bytes(), "linear-response admission package")
     )
+    if (
+        not isinstance(expected_admission_id, str)
+        or expected_admission_id != package.admission_id
+    ):
+        raise ValueError(
+            "linear-response package does not match expected admission identity"
+        )
+    return package
 
 
 class AdmittedLinearResponseProvider:
     descriptor = ADMITTED_LINEAR_RESPONSE_DESCRIPTOR
 
-    def __init__(self, package: LinearResponseAdmissionPackage) -> None:
+    def __init__(
+        self,
+        package: LinearResponseAdmissionPackage,
+        *,
+        expected_admission_id: str,
+    ) -> None:
         if not isinstance(package, LinearResponseAdmissionPackage):
             raise ValueError("admitted provider requires a validated package")
         LinearResponseAdmissionPackage.from_mapping(package.to_mapping())
+        if package.admission_id != expected_admission_id:
+            raise ValueError(
+                "admitted provider package does not match expected admission identity"
+            )
         self._package = package
 
     def execute(

@@ -69,11 +69,13 @@ def build_parser() -> argparse.ArgumentParser:
     plan = commands.add_parser("plan", help="show the requested dependency closure")
     plan.add_argument("study", type=Path)
     plan.add_argument("--linear-response-admission", type=Path)
+    plan.add_argument("--linear-response-admission-id")
 
     run = commands.add_parser("run", help="execute one requested dependency closure")
     run.add_argument("study", type=Path)
     run.add_argument("--store", type=Path, default=Path(".solver-store"))
     run.add_argument("--linear-response-admission", type=Path)
+    run.add_argument("--linear-response-admission-id")
 
     verify = commands.add_parser("verify", help="verify one run and its artifacts")
     verify.add_argument("run_id")
@@ -151,6 +153,7 @@ def build_parser() -> argparse.ArgumentParser:
         "m02-export", help="revalidate and export an admitted M02 package"
     )
     m02_export.add_argument("admission", type=Path)
+    m02_export.add_argument("--admission-id", required=True)
     m02_export.add_argument("--output", type=Path, required=True)
     return parser
 
@@ -196,19 +199,36 @@ def _atomic_export(path: Path, value: object) -> None:
         raise
 
 
-def _runtime_registry(admission_path: Path | None):
+def _runtime_registry(
+    admission_path: Path | None,
+    expected_admission_id: str | None,
+):
     if admission_path is None:
+        if expected_admission_id is not None:
+            raise ValueError(
+                "linear-response admission identity requires a package path"
+            )
         return default_registry()
-    package = load_linear_response_admission(admission_path)
-    return default_registry(AdmittedLinearResponseProvider(package))
+    if expected_admission_id is None:
+        raise ValueError(
+            "linear-response admission package requires its detached admission ID"
+        )
+    package = load_linear_response_admission(
+        admission_path, expected_admission_id=expected_admission_id
+    )
+    return default_registry(AdmittedLinearResponseProvider(
+        package, expected_admission_id=expected_admission_id
+    ))
 
 
 def _plan(
-    study_path: Path, admission_path: Path | None = None
+    study_path: Path,
+    admission_path: Path | None = None,
+    expected_admission_id: str | None = None,
 ) -> tuple[int, object]:
     request = load_study(study_path)
     plan = build_plan(request.target)
-    registry = _runtime_registry(admission_path)
+    registry = _runtime_registry(admission_path, expected_admission_id)
     unavailable: list[str] = []
     providers: list[dict[str, object]] = []
     for capability in plan.capabilities:
@@ -230,10 +250,12 @@ def _run(
     study_path: Path,
     store_path: Path,
     admission_path: Path | None = None,
+    expected_admission_id: str | None = None,
 ) -> tuple[int, object]:
     request = load_study(study_path)
     record = ExecutionEngine(
-        ArtifactStore(store_path), _runtime_registry(admission_path)
+        ArtifactStore(store_path),
+        _runtime_registry(admission_path, expected_admission_id),
     ).run(request)
     if record.unavailable_capability is not None:
         return 3, record.to_mapping()
@@ -782,8 +804,12 @@ def _m02_admit(manifest: Path, output: Path) -> tuple[int, object]:
     )
 
 
-def _m02_export(admission: Path, output: Path) -> tuple[int, object]:
-    package = load_linear_response_admission(admission)
+def _m02_export(
+    admission: Path, expected_admission_id: str, output: Path
+) -> tuple[int, object]:
+    package = load_linear_response_admission(
+        admission, expected_admission_id=expected_admission_id
+    )
     resolved_output = resolve_campaign_relative_path(Path.cwd(), str(output))
     if resolved_output.exists():
         raise ValueError("M02 export refuses an existing output")
@@ -798,13 +824,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         arguments = build_parser().parse_args(argv)
         if arguments.command == "plan":
             status, output = _plan(
-                arguments.study, arguments.linear_response_admission
+                arguments.study,
+                arguments.linear_response_admission,
+                arguments.linear_response_admission_id,
             )
         elif arguments.command == "run":
             status, output = _run(
                 arguments.study,
                 arguments.store,
                 arguments.linear_response_admission,
+                arguments.linear_response_admission_id,
             )
         elif arguments.command == "verify":
             status, output = _verify(
@@ -849,7 +878,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         elif arguments.command == "m02-admit":
             status, output = _m02_admit(arguments.manifest, arguments.output)
         elif arguments.command == "m02-export":
-            status, output = _m02_export(arguments.admission, arguments.output)
+            status, output = _m02_export(
+                arguments.admission, arguments.admission_id, arguments.output
+            )
         else:
             raise ValueError(f"unknown command: {arguments.command}")
     except ArtifactVerificationError as error:

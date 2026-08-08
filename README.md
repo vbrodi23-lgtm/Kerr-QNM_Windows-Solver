@@ -78,9 +78,9 @@ solver campaign-validate SELECTION.json --checkpoint CHECKPOINT.json [--full]
 solver campaign-reduce REDUCTION-BUNDLE.json --output REDUCTION.json
 solver m02-validate ADMISSION-INPUT.json
 solver m02-admit ADMISSION-INPUT.json --output ADMITTED.json
-solver m02-export ADMITTED.json --output EXPORTED.json
-solver plan STUDY.json --linear-response-admission ADMITTED.json
-solver run STUDY.json --linear-response-admission ADMITTED.json [--store PATH]
+solver m02-export ADMITTED.json --admission-id ID --output EXPORTED.json
+solver plan STUDY.json --linear-response-admission ADMITTED.json --linear-response-admission-id ID
+solver run STUDY.json --linear-response-admission ADMITTED.json --linear-response-admission-id ID [--store PATH]
 ```
 
 Every command emits one deterministic JSON value: successful results on stdout and failures on stderr. A provider execution failure returns exit code `1`, invalid input returns `2`, an unavailable provider returns `3`, failed verification returns `4`, and storage/output failure returns `5`. Failed runs include their sealed run record in the structured error and remain available to `inspect`.

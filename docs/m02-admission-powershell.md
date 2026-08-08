@@ -95,8 +95,11 @@ output files fail closed.
 
 ```powershell
 .\solver.ps1 m02-validate .\admission-input.json
-.\solver.ps1 m02-admit .\admission-input.json --output .\m02-admitted.json
-.\solver.ps1 m02-export .\m02-admitted.json --output .\m02-export.json
+$admission = .\solver.ps1 m02-admit .\admission-input.json `
+  --output .\m02-admitted.json | ConvertFrom-Json
+$admissionId = $admission.admission_id
+.\solver.ps1 m02-export .\m02-admitted.json `
+  --admission-id $admissionId --output .\m02-export.json
 ```
 
 `m02-validate` reports `release_admissible: false` because it does not write or
@@ -106,20 +109,27 @@ and produce a content-sealed package. The package always records
 passed the frozen structural/numerical contract, not that any scientific
 outcome was favorable.
 
+Preserve `$admissionId` independently from `m02-admitted.json`. It is the
+detached expected identity for every later package load. Editing the package
+and recomputing its internal content hash cannot change this external pin.
+
 ## 5. Run the evidence-bound provider
 
 The default registry remains closed. Supply the package for each plan or run:
 
 ```powershell
 .\solver.ps1 plan .\request.json `
-  --linear-response-admission .\m02-admitted.json
+  --linear-response-admission .\m02-admitted.json `
+  --linear-response-admission-id $admissionId
 
 .\solver.ps1 run .\request.json --store .\.solver-store `
-  --linear-response-admission .\m02-admitted.json
+  --linear-response-admission .\m02-admitted.json `
+  --linear-response-admission-id $admissionId
 ```
 
 The first run materializes problem-contract, the exact 87-root sparse spectral
 upstream, and linear-response artifacts. Repeating the identical command
 against the same store reuses all three verified artifacts with zero provider
 work. A different request, modified package, incomplete bundle, partial smoke,
-or missing package cannot register the provider.
+missing package, missing detached ID, or ID mismatch cannot register the
+provider.

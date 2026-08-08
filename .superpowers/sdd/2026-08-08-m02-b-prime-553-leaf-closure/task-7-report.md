@@ -21,8 +21,9 @@ scientific claim, and the default linear-response provider remains unavailable.
   complete signed test bundle proves the availability transition while keeping
   `scientific_claims_admitted` false.
 - The default registry stays closed. A caller may request the single dynamic
-  provider only by explicitly supplying a complete admitted package; unrelated
-  capabilities are unchanged and provider ownership remains unique.
+  provider only by explicitly supplying a complete admitted package and its
+  independently preserved expected admission ID; unrelated capabilities are
+  unchanged and provider ownership remains unique.
 - `m02-validate`, `m02-admit`, and `m02-export` provide deterministic,
   machine-readable operator commands. `plan` and `run` accept an explicit
   admission package and select the exact 87 role-scoped spectral roots rather
@@ -66,6 +67,9 @@ scientific claim, and the default linear-response provider remains unavailable.
 - Final review closed the value-lineage gap: admission now reconciles all 553
   component identities, states, root references, byte sizes, SHA-256 digests,
   and complete JSON payloads against the authenticated evidence records.
+- Serialized package loads are pinned to the detached ID emitted by
+  `m02-admit`; `plan`, `run`, and `m02-export` reject a missing or mismatched ID,
+  including a modified package with a recomputed internal content hash.
 - The release-data regression now hashes all eight pinned catalogue, receipt,
   manifest, overlay, and license files from disk, complementing the simulated
   `core.autocrlf=true` checkout test.
