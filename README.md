@@ -38,8 +38,10 @@ linear-response provider remains unavailable by default and can be registered
 only from a complete operator package that passes the 553-leaf and 174-row
 admission gates. Reduction inputs are value-bound to their authenticated
 checkpoint records, and all 174 payload comparisons are value-bound to the
-sealed reduction. See [the M01 release baseline](docs/release-baseline.md) and
-[the M02 PowerShell handoff](docs/m02-admission-powershell.md).
+sealed reduction. Each package also seals the accepted 87-root spectral
+provider/request/payload identity, and replay rejects upstream catalog or root
+drift. See [the M01 release baseline](docs/release-baseline.md) and [the M02
+PowerShell handoff](docs/m02-admission-powershell.md).
 
 ## Quick start on Windows
 

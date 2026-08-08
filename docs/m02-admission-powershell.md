@@ -118,7 +118,9 @@ register a provider. `m02-admit` and `m02-export` revalidate every bound object
 and produce a content-sealed package. The package always records
 `scientific_claims_admitted: false`: availability means the supplied evidence
 passed the frozen structural/numerical contract, not that any scientific
-outcome was favorable.
+outcome was favorable. The package also seals a spectral-upstream receipt: the
+exact spectral provider descriptor, capability-scoped request, output artifact
+type, accepted evidence state, and SHA-256 of the canonical 87-root payload.
 
 Preserve `$admissionId` independently from `m02-admitted.json`. It is the
 detached expected identity for every later package load. Editing the package
@@ -145,4 +147,7 @@ work. A different request, modified package, incomplete bundle, partial smoke,
 missing package, missing detached ID, or ID mismatch cannot register the
 provider. The admission ID is also part of the response provider's cache
 identity, so a second valid package cannot reuse a response artifact produced
-by a different admitted package in the same store.
+by a different admitted package in the same store. Before returning the
+admitted response, the provider compares the actual spectral artifact to the
+sealed receipt and rejects provider, request, catalog, root-value, artifact
+type, or evidence-state drift.

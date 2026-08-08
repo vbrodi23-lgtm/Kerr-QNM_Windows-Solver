@@ -10,6 +10,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Mapping
 
+from .artifacts import ArtifactEnvelope
 from .contracts import (
     Capability,
     CarrierState,
@@ -32,6 +33,12 @@ from .response_batches import resolve_campaign_relative_path
 from .response_reduction import (
     CampaignReductionSummary,
     build_projective_row_plans,
+)
+from .spectrum import (
+    SPECTRAL_OUTPUT_ARTIFACT_TYPE,
+    SpectralCatalogProvider,
+    build_spectral_payload,
+    validate_spectral_payload,
 )
 
 
@@ -200,6 +207,36 @@ def _reduction_receipt(summary: CampaignReductionSummary) -> dict[str, object]:
         "row_plan_sha256": summary.row_plan_sha256,
         "source_hashes": list(summary.source_hashes),
     }
+
+
+def _spectral_upstream_receipt(request: StudyRequest) -> dict[str, object]:
+    scoped_request = request.for_capability(Capability.SPECTRAL_CORE)
+    payload = build_spectral_payload(scoped_request)
+    return {
+        "artifact_type": SPECTRAL_OUTPUT_ARTIFACT_TYPE,
+        "capability": Capability.SPECTRAL_CORE.value,
+        "provider": SpectralCatalogProvider.descriptor.to_mapping(),
+        "request": scoped_request.to_mapping(),
+        "payload_sha256": _digest_bytes(canonical_json_bytes(payload)),
+        "evidence": {
+            "carrier": CarrierState.VALID.value,
+            "execution": ExecutionState.SUCCEEDED.value,
+            "numerical": NumericalState.ACCEPTED.value,
+            "scientific": ScientificState.NOT_EVALUATED.value,
+        },
+    }
+
+
+def _validate_spectral_upstream_receipt(
+    request: StudyRequest, value: object
+) -> Mapping[str, object]:
+    receipt = _mapping(value, "admission spectral upstream receipt")
+    expected = _spectral_upstream_receipt(request)
+    if receipt != expected:
+        raise ValueError(
+            "admission spectral upstream receipt does not match the admitted catalog"
+        )
+    return receipt
 
 
 def _validate_component_evidence_bindings(
@@ -439,6 +476,7 @@ class LinearResponseAdmissionPackage:
     request: Mapping[str, object]
     payload: Mapping[str, object]
     evidence_receipt: Mapping[str, object]
+    spectral_upstream_receipt: Mapping[str, object]
     reduction: Mapping[str, object]
     reduction_receipt: Mapping[str, object]
     source_files: Mapping[str, object]
@@ -449,7 +487,7 @@ class LinearResponseAdmissionPackage:
     def __post_init__(self) -> None:
         for name in (
             "request", "payload", "evidence_receipt", "reduction",
-            "reduction_receipt", "source_files",
+            "spectral_upstream_receipt", "reduction_receipt", "source_files",
         ):
             object.__setattr__(self, name, _freeze_json(getattr(self, name)))
 
@@ -461,6 +499,9 @@ class LinearResponseAdmissionPackage:
             "request": _thaw_json(self.request),
             "payload": _thaw_json(self.payload),
             "evidence_receipt": _thaw_json(self.evidence_receipt),
+            "spectral_upstream_receipt": _thaw_json(
+                self.spectral_upstream_receipt
+            ),
             "reduction": _thaw_json(self.reduction),
             "reduction_receipt": _thaw_json(self.reduction_receipt),
             "source_files": _thaw_json(self.source_files),
@@ -476,9 +517,10 @@ class LinearResponseAdmissionPackage:
             mapping,
             frozenset({
                 "schema_version", "kind", "descriptor", "request", "payload",
-                "evidence_receipt", "reduction", "reduction_receipt",
-                "source_files", "scientific_claims_admitted",
-                "release_admissible", "admission_id",
+                "evidence_receipt", "spectral_upstream_receipt", "reduction",
+                "reduction_receipt", "source_files",
+                "scientific_claims_admitted", "release_admissible",
+                "admission_id",
             }),
             "linear-response admission package",
         )
@@ -500,6 +542,9 @@ class LinearResponseAdmissionPackage:
             request, ADMITTED_LINEAR_RESPONSE_DESCRIPTOR.to_mapping(), payload
         )
         evidence_receipt = _validate_evidence_receipt(mapping["evidence_receipt"])
+        spectral_upstream_receipt = _validate_spectral_upstream_receipt(
+            request, mapping["spectral_upstream_receipt"]
+        )
         reduction = CampaignReductionSummary.from_mapping(mapping["reduction"])
         _validate_complete_reduction(reduction)
         _validate_projective_reduction_bindings(reduction, payload)
@@ -533,6 +578,9 @@ class LinearResponseAdmissionPackage:
             request=deepcopy(dict(request_mapping)),
             payload=deepcopy(dict(payload)),
             evidence_receipt=deepcopy(dict(evidence_receipt)),
+            spectral_upstream_receipt=deepcopy(
+                dict(spectral_upstream_receipt)
+            ),
             reduction=deepcopy(dict(mapping["reduction"])),
             reduction_receipt=deepcopy(dict(expected_reduction_receipt)),
             source_files=deepcopy(dict(source_files)),
@@ -620,6 +668,7 @@ def admit_linear_response_bundle(
         "request": request.to_mapping(),
         "payload": deepcopy(dict(payload)),
         "evidence_receipt": evidence_receipt,
+        "spectral_upstream_receipt": _spectral_upstream_receipt(request),
         "reduction": reduction.to_mapping(),
         "reduction_receipt": _reduction_receipt(reduction),
         "source_files": source_files,
@@ -683,6 +732,29 @@ class AdmittedLinearResponseProvider:
             raise ValueError("admission package does not bind this request")
         if set(upstream) != {Capability.SPECTRAL_CORE}:
             raise ValueError("linear-response provider requires the spectral artifact")
+        spectral = upstream[Capability.SPECTRAL_CORE]
+        if not isinstance(spectral, ArtifactEnvelope):
+            raise ValueError("linear-response spectral upstream is not an artifact")
+        receipt = _thaw_json(self._package.spectral_upstream_receipt)
+        actual = {
+            "artifact_type": spectral.artifact_type,
+            "capability": spectral.capability.value,
+            "provider": _thaw_json(spectral.provider),
+            "request": _thaw_json(spectral.request),
+            "payload_sha256": _digest_bytes(
+                canonical_json_bytes(_thaw_json(spectral.payload))
+            ),
+            "evidence": spectral.evidence.to_mapping(),
+        }
+        if actual != receipt:
+            raise ValueError(
+                "linear-response spectral upstream does not match admission receipt"
+            )
+        validate_spectral_payload(
+            request.for_capability(Capability.SPECTRAL_CORE),
+            spectral.provider,
+            spectral.payload,
+        )
         numerical = (
             NumericalState.UNRESOLVED
             if self._package.evidence_receipt["unresolved_leaf_ids"]

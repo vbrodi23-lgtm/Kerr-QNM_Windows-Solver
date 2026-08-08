@@ -9,8 +9,18 @@ import sys
 import tempfile
 import unittest
 
+from windows_solver.artifacts import ArtifactEnvelope
 from windows_solver.builtin import default_registry
-from windows_solver.contracts import Capability, canonical_json_bytes
+from windows_solver.contracts import (
+    Capability,
+    CarrierState,
+    EvidenceState,
+    ExecutionState,
+    NumericalState,
+    ScientificState,
+    StudyRequest,
+    canonical_json_bytes,
+)
 from windows_solver.evidence_intake import (
     B_PRIME_RELEASE_DOMAIN,
     evidence_bundle_digest,
@@ -31,7 +41,11 @@ from windows_solver.response_reduction import (
     build_projective_row_plans,
     reduce_projective_rows,
 )
-from windows_solver.spectrum import build_spectral_payload
+from windows_solver.spectrum import (
+    SPECTRAL_OUTPUT_ARTIFACT_TYPE,
+    SpectralCatalogProvider,
+    build_spectral_payload,
+)
 
 from tests.test_linear_response_contract import b_prime_payload, b_prime_request
 from tests.test_linear_response_evidence_intake import _write_manifest
@@ -44,6 +58,25 @@ def _sha256(data: bytes) -> str:
 def _write_json(path: Path, value: object) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(canonical_json_bytes(value))
+
+
+def _spectral_upstream(request: StudyRequest) -> ArtifactEnvelope:
+    scoped = request.for_capability(Capability.SPECTRAL_CORE)
+    return ArtifactEnvelope(
+        schema_version=1,
+        artifact_type=SPECTRAL_OUTPUT_ARTIFACT_TYPE,
+        capability=Capability.SPECTRAL_CORE,
+        provider=SpectralCatalogProvider.descriptor.to_mapping(),
+        request=scoped.to_mapping(),
+        upstream_artifact_ids=("0" * 64,),
+        payload=build_spectral_payload(scoped),
+        evidence=EvidenceState(
+            carrier=CarrierState.VALID,
+            execution=ExecutionState.SUCCEEDED,
+            numerical=NumericalState.ACCEPTED,
+            scientific=ScientificState.NOT_EVALUATED,
+        ),
+    )
 
 
 def _projective_comparisons(
@@ -268,7 +301,8 @@ class LinearResponseAdmissionTests(unittest.TestCase):
             registry = default_registry(provider)
             self.assertIs(registry.resolve(Capability.LINEAR_RESPONSE), provider)
             result = provider.execute(
-                b_prime_request(), {Capability.SPECTRAL_CORE: object()}
+                b_prime_request(),
+                {Capability.SPECTRAL_CORE: _spectral_upstream(b_prime_request())},
             )
             self.assertEqual(result.payload, package.to_mapping()["payload"])
             self.assertEqual(result.evidence.scientific.value, "NOT_EVALUATED")
@@ -279,6 +313,47 @@ class LinearResponseAdmissionTests(unittest.TestCase):
                 AdmittedLinearResponseProvider(
                     package, expected_admission_id="m02-admission-" + "0" * 64
                 )
+
+    def test_admitted_provider_rejects_spectral_provider_and_root_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            package = admit_linear_response_bundle(
+                _admission_fixture(Path(temporary), complete=True)
+            )
+        request = b_prime_request()
+        provider = AdmittedLinearResponseProvider(
+            package, expected_admission_id=package.admission_id
+        )
+        upstream = _spectral_upstream(request)
+
+        forged_provider = dict(upstream.provider)
+        forged_provider["numerical_policy_fingerprint"] = "different-catalog"
+        provider_drift = ArtifactEnvelope(
+            schema_version=upstream.schema_version,
+            artifact_type=upstream.artifact_type,
+            capability=upstream.capability,
+            provider=forged_provider,
+            request=dict(upstream.request),
+            upstream_artifact_ids=upstream.upstream_artifact_ids,
+            payload=dict(upstream.payload),
+            evidence=upstream.evidence,
+        )
+        with self.assertRaisesRegex(ValueError, "spectral upstream"):
+            provider.execute(request, {Capability.SPECTRAL_CORE: provider_drift})
+
+        forged_payload = upstream.identity_mapping()["payload"]
+        forged_payload["roots"][0]["frequency"]["real"] += 1.0e-12
+        root_drift = ArtifactEnvelope(
+            schema_version=upstream.schema_version,
+            artifact_type=upstream.artifact_type,
+            capability=upstream.capability,
+            provider=dict(upstream.provider),
+            request=dict(upstream.request),
+            upstream_artifact_ids=upstream.upstream_artifact_ids,
+            payload=forged_payload,
+            evidence=upstream.evidence,
+        )
+        with self.assertRaisesRegex(ValueError, "spectral upstream"):
+            provider.execute(request, {Capability.SPECTRAL_CORE: root_drift})
 
     def test_admission_package_revalidates_content_and_rejects_tamper(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -296,6 +371,20 @@ class LinearResponseAdmissionTests(unittest.TestCase):
         malformed["evidence_receipt"]["unresolved_leaf_ids"] = [{}]
         with self.assertRaisesRegex(ValueError, "unresolved leaf IDs"):
             LinearResponseAdmissionPackage.from_mapping(malformed)
+
+        mismatched_spectral = deepcopy(mapping)
+        mismatched_spectral["spectral_upstream_receipt"]["payload_sha256"] = (
+            "0" * 64
+        )
+        material = {
+            key: value for key, value in mismatched_spectral.items()
+            if key != "admission_id"
+        }
+        mismatched_spectral["admission_id"] = (
+            "m02-admission-" + _sha256(canonical_json_bytes(material))
+        )
+        with self.assertRaisesRegex(ValueError, "spectral upstream receipt"):
+            LinearResponseAdmissionPackage.from_mapping(mismatched_spectral)
 
         mismatched_reduction = deepcopy(mapping)
         mismatched_reduction["payload"]["projective_comparisons"][0][

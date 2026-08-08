@@ -13,7 +13,7 @@ Finish the installable M02 machinery and operator handoff while keeping the line
 - [x] Validate exactly 553 produced leaves, zero missing leaves, governed unresolved IDs, checkpoint-bound reducer centres/channels, 174 payload comparisons exactly bound to aligned projective rows, role ceilings, hashes, runtime lineage, and policy identity.
 - [x] Provide PowerShell-friendly `validate`, `reduce`, `admit`, and `export` commands with deterministic machine-readable output and useful failure messages.
 - [x] Prove smoke/partial bundles cannot register the provider; prove a structurally complete signed test bundle exercises the availability transition without claiming scientific evidence.
-- [x] Keep exactly one provider owner, unrelated capabilities unchanged, and admission contingent on the external evidence receipt plus detached expected admission ID rather than build completion.
+- [x] Keep exactly one provider owner, unrelated capabilities unchanged, and admission contingent on the external evidence receipt, an exact spectral-upstream receipt, plus detached expected admission ID rather than build completion.
 - [x] Pass Windows-oriented command/path tests, Ubuntu tests, cold/warm cache, wheel content, manifest, compile, and head/tail/risk end-to-end smoke gates.
 
 ### Dependencies
@@ -27,19 +27,19 @@ Installable fail-closed admission package and CLI; an explicit dynamic provider 
 
 ### Verification
 
-- `PYTHONPATH=src python -m unittest discover -s tests -v` — 223 passed.
-- Predecessor hosted GitHub Actions run `31247921080` passed on `ubuntu-latest` and `windows-latest`, including full tests, wheel inspection, M02 admission/cache, campaign smoke, planning, admitted providers, and PowerShell 5.1 launcher parity; the PR head containing the final two integrity bindings must repeat the same matrix.
+- `PYTHONPATH=src python -m unittest discover -s tests -v` — 224 passed.
+- Predecessor hosted GitHub Actions run `31249395686` passed on `ubuntu-latest` and `windows-latest`, including full tests, wheel inspection, M02 admission/cache, campaign smoke, planning, admitted providers, and PowerShell 5.1 launcher parity; the PR head containing the spectral-upstream binding must repeat the same matrix.
 - `python .tasks/validate_board.py`, `python tools/validate_release_manifest.py`, `python -m compileall -q src tools tests`, and `git diff --check` — passed.
 - **Evidence ceiling:** Structurally complete signed test evidence only; no 553-leaf physical campaign, populated scientific atlas, or scientific claim. The default provider remains unavailable until the user's complete operator package passes admission.
 - **Change references:** admission core `be706164cab2574f2f102f35f625ea72ddfe8430`; CLI/integration `dbb20779f8cca44ceff2a47be23f3853ec0c342b`; handoff/CI `5ecb2f050426650db504959c18b728e29320aadb`; cross-platform identity fixes `3580b73f432d808c4e032a1bb6d68b7d1ea730ac` and `2b09a9b48097c15fcae49c5bdeada3f914e8f7c8`; immutable admitted package `759b37f2faaad6056d94de6a86e4f8bc1c8e800f`; TaskPlanner/report closure `57e4d4ee1e779e299ad97413c19441755e57a774`.
 
 ### Review Focus
 
-Complete/partial separation is fail closed; every reducer centre/channel is bound to its authenticated checkpoint record; every final component is value/state-bound to its authenticated produced-record payload; every projective comparison is bound to its sealed reduction row; serialized package loads require an independently preserved admission ID; that ID participates in the provider/cache identity; the admitted package is deeply immutable; provider registration is explicit and unique; native runtime identity is stable across Windows and Ubuntu; operator paths and CLI output are deterministic; scientific readiness is not inferred from build readiness.
+Complete/partial separation is fail closed; every reducer centre/channel is bound to its authenticated checkpoint record; every final component is value/state-bound to its authenticated produced-record payload; every projective comparison is bound to its sealed reduction row; the package seals the exact spectral provider/request/root-payload identity and replay rejects upstream drift; serialized package loads require an independently preserved admission ID; that ID participates in the provider/cache identity; the admitted package is deeply immutable; provider registration is explicit and unique; native runtime identity is stable across Windows and Ubuntu; operator paths and CLI output are deterministic; scientific readiness is not inferred from build readiness.
 
 ### Plan
 
-- Bound the exact 553-leaf campaign and 174-row reduction to one immutable, hash- and lineage-validated admission package.
+- Bound the exact 553-leaf campaign, 174-row reduction, and accepted 87-root spectral upstream to one immutable, hash- and lineage-validated admission package.
 - Added deterministic `m02-validate`, `m02-admit`, and `m02-export` commands plus explicit `plan`/`run` admission input and exact sparse spectral selection.
 - Proved partial rejection, structural full-bundle transition, cold/warm replay, packaging, PowerShell parity, and both hosted operating systems before closing software readiness.
 
