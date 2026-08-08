@@ -19,7 +19,7 @@ Finish the installable M02 machinery and operator handoff while keeping the line
 ### Dependencies
 
 - **Blocked by:** TASK-010
-- **Blocks:** TASK-037, TASK-038
+- **Blocks:** TASK-075
 
 ### Evidence Output
 
