@@ -15,7 +15,7 @@ DEP_RE = re.compile(r"^- \*\*Blocked by:\*\* (.+)$", re.MULTILINE)
 TAG_RE = re.compile(r"^\*\*Priority:\*\* (P[0-4]) \| \*\*Tags:\*\* ([^\n]+)$", re.MULTILINE)
 REQUIRED_SECTIONS = ("### Objective", "### Acceptance Criteria", "### Dependencies", "### Evidence Output", "### Verification", "### Review Focus", "### Plan")
 EXPECTED_RANGES = {
-    "M01": range(1, 6), "M02": range(6, 12), "M03": range(12, 18),
+    "M01": range(1, 6), "M02": (*range(6, 12), *range(69, 79)), "M03": range(12, 18),
     "M04": range(18, 24), "M05": range(24, 30), "M06": range(30, 37),
     "M07": range(37, 42), "M08": range(42, 48), "M09": range(48, 54),
     "M10": range(54, 59), "M11": range(59, 64), "M12": range(64, 69),
