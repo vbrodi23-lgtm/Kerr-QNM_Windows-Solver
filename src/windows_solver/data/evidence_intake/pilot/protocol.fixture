@@ -1,0 +1,26 @@
+{
+  "component_count": 9,
+  "ladder_plan": {
+    "initial_epsilon": 0.004,
+    "ladder_ratio": 2.0,
+    "maximum_levels": 5,
+    "minimum_epsilon": 0.00025,
+    "order_tolerance": 0.35,
+    "repeat_level_count": 2
+  },
+  "primary_settings": {
+    "endpoint_series_order": 28,
+    "label": "primary",
+    "ode_absolute_tolerance": 2e-12,
+    "ode_relative_tolerance": 2e-10,
+    "readout_radius": 6.0,
+    "seed_displacement_im": 0.0,
+    "seed_displacement_re": 0.0,
+    "support_subinterval_count": 256
+  },
+  "producer_protocol": "component-local-signed-amplitude-ladder-v1",
+  "reduction_count": 2,
+  "stage_id": "V2-02",
+  "stage_name": "multimode_local_response_refinement",
+  "supersedes": "V1 Stage-25 atlas-wide worst-case relative cover"
+}

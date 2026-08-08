@@ -1,0 +1,156 @@
+{
+  "authenticated_published_source": true,
+  "benchmark": {
+    "mode": {
+      "ell": 2,
+      "m": 2,
+      "overtone_branch": 0,
+      "spin_weight": -2
+    },
+    "polarizations": [
+      "plus",
+      "minus"
+    ],
+    "resolution_estimator": {
+      "calculated_disk": "gauge-mean half-separation plus observed per-gauge resolution spread plus independent route spread",
+      "method": "mean-over-declared-ladder",
+      "published_values_used_in_estimator": false
+    },
+    "resolution_ladder": [
+      12,
+      13,
+      14
+    ],
+    "spins": [
+      0.0,
+      0.3,
+      0.5,
+      0.7
+    ],
+    "theory": "parity-even-cubic-higher-curvature-eft"
+  },
+  "benchmark_row_count": 48,
+  "claim_level": "B",
+  "elapsed_seconds": 41.822054624557495,
+  "evidence_aggregation": {
+    "input_count": 4,
+    "input_status_sha256": [
+      "582a2011a36b2d06fe05bcf9263fa1d13596a68e84cbb4d68f5de63e2b5a9abf",
+      "d13535f046855f7beaae4df16212704bdc027da8d4fd8389d8220c2dfc7df0f5",
+      "90805b43e4075c3212dcba94e624cd2adf107a004eeaa464ca0386ca35f2b1cc",
+      "b0fd197e6e6754c4acc4776334b3c1cf4f6194addb93baa11267cb5012db28f4"
+    ],
+    "method": "raw-row-deterministic-merge",
+    "raw_rows_recomputed": true
+  },
+  "gates": {
+    "determinant_versus_left_right": true,
+    "direct_versus_left_right_with_overlap_tracking": true,
+    "published_shift_disk_intersection": true,
+    "source_identity_and_endpoint_transform": true,
+    "two_gauge": true
+  },
+  "producer_protocol": "authenticated-cubic-even-220-three-route-endpoint-r2",
+  "resolved_benchmark_row_count": 8,
+  "source_manifest": {
+    "action": "S_even = (16\u03c0)\u207b\u00b9 \u222b d\u2074x \u221a|g| [R + \u2113_EFT\u2074 \u03bb_ev \u211b\u00b3]",
+    "frequency_convention": "dimensionless M\u03c9 in geometric units; source variable w is \u03c9",
+    "paper_identifier": "arXiv:2409.04517",
+    "potential": {
+      "branch_metadata_excluded_from_potential_identity": [
+        "n"
+      ],
+      "ell": 2,
+      "filename": "deltaV-even-a18-s-2l2m2.mx",
+      "m": 2,
+      "packaged_filename": "deltaV-even-a18-s-2l2m2.mx.b64",
+      "pade_denominator_order": 1,
+      "pade_numerator_order": 17,
+      "polarization_symbols": {
+        "minus": "deltaVminus",
+        "plus": "deltaVplus"
+      },
+      "potential_identity_fields": [
+        "theory_identifier",
+        "spin_weight",
+        "ell",
+        "m",
+        "polarization",
+        "spin_expansion_order",
+        "spin_resummation"
+      ],
+      "radial_powers": [
+        -2,
+        0,
+        1,
+        2
+      ],
+      "sha256": "ebe39cbdc70b1a6fdba0da3c9c5278be264efd34177e8eee15857e1f07646ef5",
+      "spin_expansion_order": 18,
+      "spin_resummation": "pade-17-over-1",
+      "spin_resummation_reference": "Cano et al., arXiv:2409.04517, Eq. (43): N=1 for ell=2, m!=0",
+      "spin_weight": -2
+    },
+    "published_shifts": {
+      "minus": {
+        "ell": 2,
+        "filename": "cubic_even_domega_minus_l2_m2_n0.txt",
+        "m": 2,
+        "n": 0,
+        "sha256": "2c3f8cd734e538ab18522a7aa462a44148c3f910c3a07a2430cfac4211ce8ef0"
+      },
+      "plus": {
+        "ell": 2,
+        "filename": "cubic_even_domega_plus_l2_m2_n0.txt",
+        "m": 2,
+        "n": 0,
+        "sha256": "6bf2948b3b7cca3e17bd80e2e4d8dbd065be1d56458341b44175846dd727dacb"
+      }
+    },
+    "radial_equation_convention": "\u0394\u00b3 d/dr [\u0394\u207b\u00b9 dR/dr] + [V_-2 + \u03b1_ev \u03b4V_-2^\u00b1] R = 0",
+    "repository": "https://github.com/pacmn91/BeyondKerrQNM",
+    "repository_commit": "2a8a10d31c88bf2f6797723d1d4fdb09e2c10c62",
+    "separation_constant_convention": "the authenticated 220 source expression has no explicit separation-constant variable",
+    "source_uses_separation_constant": false,
+    "theory_identifier": "parity-even-cubic-higher-curvature-eft",
+    "time_dependence_convention": "exp(\u2212i\u03c9t + im\u03c6)"
+  },
+  "stage": "V2-07P",
+  "states": {
+    "FINITE_COUPLING_SHIFT_RESOLVED": {
+      "reason": "direct Richardson routes include overlap-tracked branch continuation",
+      "resolved": true
+    },
+    "LEFT_RIGHT_SHIFT_RESOLVED": {
+      "reason": "determinant and left-right route gate at every declared resolution",
+      "resolved": true
+    },
+    "MODE_CONDITIONED_OPERATOR_REPRODUCED": {
+      "reason": "source-derived endpoint transformation and total angular derivative are present",
+      "resolved": true
+    },
+    "OFF_SHELL_THEORY_OPERATOR_EXPORTED": {
+      "reason": "the vendored 220 \u00b1 potential retains off-shell frequency dependence",
+      "resolved": true
+    },
+    "PUBLISHED_SHIFT_REPRODUCED": {
+      "reason": "published disk and relative-error gate",
+      "resolved": true
+    },
+    "UNIVERSAL_2D_THEORY_OPERATOR_UNRESOLVED": {
+      "reason": "the published 220 potential remains a mode-conditioned separated operator",
+      "resolved": false
+    },
+    "published_shift_reproduced": {
+      "reason": "all resolution-ensemble rows intersect the published disks and meet the 1e-4 relative gate",
+      "resolved": true
+    }
+  },
+  "worst": {
+    "determinant_versus_left_right": 1.2729619698637156e-06,
+    "direct_versus_left_right": 9.402862348751629e-09,
+    "published_relative_difference": 1.1223670102035134e-05,
+    "resolution_drift": 3.58844987937395e-05,
+    "two_gauge_difference": 9.176159323533548e-06
+  }
+}

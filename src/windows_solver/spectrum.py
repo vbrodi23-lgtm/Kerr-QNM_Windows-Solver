@@ -21,6 +21,7 @@ from .contracts import (
     CarrierState,
     EvidenceState,
     ExecutionState,
+    ModeKey,
     NumericalState,
     ScientificState,
     StudyRequest,
@@ -42,6 +43,19 @@ CATALOG_RECEIPT_RESOURCE = resources.files("windows_solver").joinpath(
 CATALOG_RECEIPT_SHA256 = (
     "61a428a858de1eb7e42fe4cbbda37bf1fddcc808d98be2a62fd33ef4b5b74379"
 )
+OVERLAY_ID = "m02-b-prime-sparse-overlay-44"
+OVERLAY_RESOURCE = resources.files("windows_solver").joinpath(
+    "data", "kerr_qnm_m02_overlay_44.csv"
+)
+OVERLAY_DATA_SHA256 = (
+    "c4c61a1b73e850d537dba5f5eb947af100449aa2a1958a1ec8ea086f60ffe8e8"
+)
+OVERLAY_RECEIPT_RESOURCE = resources.files("windows_solver").joinpath(
+    "data", "kerr_qnm_m02_overlay_receipt.json"
+)
+OVERLAY_RECEIPT_SHA256 = (
+    "93a2e7586878d9c84e32d19ed9e7ad44d03572a91640625c44501bfbc46a5525"
+)
 
 PUBLIC_THEORY_ID = "general-relativity"
 PUBLIC_CONVENTION_ID = "kerr-mass-normalized-outgoing"
@@ -49,7 +63,7 @@ PUBLIC_BRANCH_ID = "schwarzschild-overtone-continuation"
 PUBLIC_POLARIZATION_ID = "gravitational"
 
 SPECTRAL_PROVIDER_ID = "kerr-qnm-computed-lattice-2736"
-SPECTRAL_PROVIDER_IMPLEMENTATION_VERSION = "2"
+SPECTRAL_PROVIDER_IMPLEMENTATION_VERSION = "3"
 SPECTRAL_EQUATIONS_ID = "teukolsky-leaver-coupled-angular-radial-cf"
 SPECTRAL_OUTPUT_ARTIFACT_TYPE = "kerr-qnm-spectrum"
 SPECTRAL_EVIDENCE_LEVEL = "full-lattice-numerically-accepted"
@@ -66,6 +80,7 @@ MINIMUM_OVERTONE_SEPARATION_ABS = 1.0e-6
 
 SPECTRAL_POLICY_FINGERPRINT = (
     f"catalog-{CATALOG_DATA_SHA256}-receipt-{CATALOG_RECEIPT_SHA256}-"
+    f"overlay-{OVERLAY_DATA_SHA256}-overlay-receipt-{OVERLAY_RECEIPT_SHA256}-"
     "residual-1e-8-cf-1e-9-angular-1e-9-repeat-1e-9-seed-5e-9"
 )
 
@@ -102,6 +117,44 @@ _CATALOG_COLUMNS = (
     "reference_abs_delta_omega_M",
     "reference_abs_delta_A",
 )
+_OVERLAY_COLUMNS = (
+    "s",
+    "ell",
+    "m",
+    "n",
+    "branch_id",
+    "source_coordinate_id",
+    "source_coordinate_numerator",
+    "source_coordinate_denominator",
+    "source_transformation_id",
+    "spin_numerator",
+    "spin_denominator",
+    "spin_float",
+    "spin_binary64_hex",
+    "omega_re_M",
+    "omega_im_M",
+    "angular_A_re",
+    "angular_A_im",
+    "root_solver_success",
+    "optimizer_residual_abs",
+    "continued_fraction_error",
+    "continued_fraction_terms",
+    "angular_padding",
+    "angular_refinement_padding",
+    "angular_refinement_abs",
+    "repeat_polish_delta_abs",
+    "predictor_correction_abs",
+    "predictor_correction_over_separation",
+    "assigned_separation_abs",
+    "assignment_relative_gap",
+    "canonical_polish_delta_abs",
+    "independent_path_delta_abs",
+    "reverse_delta_abs",
+    "angular_overlap_min",
+    "schedule_a_steps",
+    "schedule_b_steps",
+    "minimum_adaptive_step",
+)
 _HEX_64 = re.compile(r"[0-9a-f]{64}")
 _CANONICAL_SOURCE_COMMIT = "0c1e8a3d3bca6e608c34e111476a4f6dcb73e86e"
 _CANONICAL_CF_SOURCE_BLOB = "ffb17a6be8e15da3bbce21f6c5f66420b251b077"
@@ -111,6 +164,15 @@ _QNM_WHEEL_SHA256 = (
 )
 _MOTOHASHI_ARCHIVE_SHA256 = (
     "9a096cdcf873039baaac66fe0194f64c430df17125713a16d8f546129ef238fa"
+)
+_OVERLAY_GENERATOR_SHA256 = (
+    "303f82877e4c557022a906f73b02d42ad44e2a3e1b821212183cbe8d8db1eacb"
+)
+_OVERLAY_TARGET_SET_SHA256 = (
+    "e195928deccd6300b04fab28d60998511f0e788419c1832ee2cfbf28c83b7d90"
+)
+_OVERLAY_POLICY_SHA256 = (
+    "5c62a1db00110ae3d3935f60d6e612acf1dae82fca52e2b6d81228e734824678"
 )
 
 
@@ -143,6 +205,57 @@ def _expected_lattice_keys() -> tuple[tuple[int, int, int, int, int], ...]:
 
 _EXPECTED_LATTICE_KEYS = _expected_lattice_keys()
 _EXPECTED_LATTICE_KEY_SET = frozenset(_EXPECTED_LATTICE_KEYS)
+
+
+def _spin_from_surface_gravity(coordinate: Fraction) -> float:
+    value = float(coordinate)
+    horizon_gap = 2.0 * value / (1.0 - 2.0 * value)
+    return math.sqrt(1.0 - horizon_gap * horizon_gap)
+
+
+def _expected_overlay_targets() -> tuple[
+    tuple[int, int, int, str, Fraction, str, float], ...
+]:
+    direct = (
+        Fraction(19, 20), Fraction(97, 100), Fraction(49, 50),
+        Fraction(99, 100), Fraction(199, 200), Fraction(997, 1000),
+        Fraction(999, 1000), Fraction(1999, 2000), Fraction(9999, 10000),
+    )
+    targets: list[tuple[int, int, int, str, Fraction, str, float]] = []
+    for ell, m, overtones, spins in (
+        (2, 2, (0, 1, 2), direct[-2:]),
+        (3, 3, (0, 1), direct[-2:]),
+        (4, 4, (0, 1), direct),
+    ):
+        for n in overtones:
+            for coordinate in spins:
+                targets.append(
+                    (
+                        ell, m, n, "a-over-M", coordinate,
+                        "identity-a-over-M", float(coordinate),
+                    )
+                )
+    for ell, m, n in ((2, 2, 0), (2, 2, 1), (2, 2, 2), (2, 1, 0)):
+        for coordinate in (
+            Fraction(1, 100), Fraction(1, 200),
+            Fraction(1, 500), Fraction(1, 1000),
+        ):
+            targets.append(
+                (
+                    ell, m, n, "M-kappa", coordinate,
+                    "kerr-prograde-spin-from-dimensionless-surface-gravity",
+                    _spin_from_surface_gravity(coordinate),
+                )
+            )
+    return tuple(
+        sorted(
+            targets,
+            key=lambda item: (*item[:3], item[6]),
+        )
+    )
+
+
+_EXPECTED_OVERLAY_TARGETS = _expected_overlay_targets()
 
 
 def _grid_identity(ell: int, spin: Fraction) -> tuple[str, int]:
@@ -465,6 +578,154 @@ def load_catalog_receipt() -> Mapping[str, object]:
     return _freeze_json(value)  # type: ignore[return-value]
 
 
+@lru_cache(maxsize=1)
+def load_overlay_receipt() -> Mapping[str, object]:
+    value = _read_canonical_json_resource(
+        OVERLAY_RECEIPT_RESOURCE,
+        expected_sha256=OVERLAY_RECEIPT_SHA256,
+        subject="M02 overlay receipt",
+    )
+    if set(value) != {
+        "backend", "evidence_ceiling", "generator", "overlay", "parents",
+        "policy", "policy_sha256", "runtime", "schema_version", "validation",
+    } or value.get("schema_version") != 1:
+        raise ValueError("M02 overlay receipt schema is invalid")
+    overlay = _mapping(value.get("overlay"), "overlay receipt catalog")
+    parents = _mapping(value.get("parents"), "overlay receipt parents")
+    generator = _mapping(value.get("generator"), "overlay receipt generator")
+    backend = _mapping(value.get("backend"), "overlay receipt backend")
+    angular = _mapping(backend.get("canonical_angular"), "overlay angular backend")
+    fraction = _mapping(
+        backend.get("canonical_continued_fraction"), "overlay CF backend"
+    )
+    policy = _mapping(value.get("policy"), "overlay numerical policy")
+    validation = _mapping(value.get("validation"), "overlay validation")
+    maxima = _mapping(validation.get("observed_maxima"), "overlay maxima")
+    minima = _mapping(validation.get("observed_minima"), "overlay minima")
+    runtime = _mapping(value.get("runtime"), "overlay runtime")
+    dependencies = _mapping(runtime.get("dependencies"), "overlay dependencies")
+    if overlay != {
+        "columns": list(_OVERLAY_COLUMNS),
+        "line_endings": "LF",
+        "ordering": ["ell", "m", "n", "spin_binary64"],
+        "row_count_excluding_header": 44,
+        "sha256": OVERLAY_DATA_SHA256,
+        "target_set_sha256": _OVERLAY_TARGET_SET_SHA256,
+    }:
+        raise ValueError("M02 overlay receipt catalog binding is invalid")
+    if parents != {
+        "base_catalog_sha256": CATALOG_DATA_SHA256,
+        "base_independent_comparison_count": 392,
+        "base_receipt_sha256": CATALOG_RECEIPT_SHA256,
+        "base_root_count": 2736,
+    }:
+        raise ValueError("M02 overlay receipt parent binding is invalid")
+    if generator != {
+        "path": "tools/compute_kerr_qnm_overlay.py",
+        "sha256": _OVERLAY_GENERATOR_SHA256,
+    }:
+        raise ValueError("M02 overlay generator identity is invalid")
+    if (
+        backend.get("backend_id")
+        != "canonical-coupled-leaver-cohort-continuation"
+        or backend.get("candidate_bank")
+        != "all-cohort-predictors-cross-all-cohort-inversions"
+        or backend.get("version") != 1
+        or angular
+        != {
+            "migrated_source_blob": _CANONICAL_ANGULAR_SOURCE_BLOB,
+            "module_sha256": (
+                "109642519372736375c24b15a879fe15c2a06714b78d743f065497fdad50738a"
+            ),
+        }
+        or fraction
+        != {
+            "maximum_terms": 60000,
+            "migrated_source_blob": _CANONICAL_CF_SOURCE_BLOB,
+            "minimum_terms": 1000,
+            "module_sha256": (
+                "8ad69fba84d1100ca4b4647760b595ee15ea4a13ffd0a1bfdd9fe635c119d2e4"
+            ),
+            "tolerance": 1e-14,
+        }
+    ):
+        raise ValueError("M02 overlay backend identity is invalid")
+    if value.get("policy_sha256") != _OVERLAY_POLICY_SHA256 or policy != {
+        "angular_overlap_minimum": 0.9,
+        "angular_padding": 20,
+        "angular_refinement_padding": 24,
+        "assignment_minimum_relative_gap": 0.05,
+        "branch_id": PUBLIC_BRANCH_ID,
+        "canonical_repeat_root_tolerance": 1e-12,
+        "canonical_root_tolerance": 1e-10,
+        "continued_fraction_error_maximum": 1e-9,
+        "formal_root_enclosure": False,
+        "independent_path_delta_maximum": 1e-8,
+        "minimum_adaptive_step": 0.003,
+        "minimum_assigned_separation_abs": 1e-6,
+        "optimizer_residual_abs_maximum": 1e-8,
+        "predictor_correction_over_separation_maximum": 0.24,
+        "repeat_polish_delta_abs_maximum": 1e-9,
+        "reverse_delta_abs_maximum": 1e-8,
+        "schedule_a_coordinate": "x=-log(sqrt((1-chi)(1+chi)))",
+        "schedule_a_step_maximum_by_ell": {"2": 0.16, "3": 0.12, "4": 0.12},
+        "schedule_b_coordinate": "y=-log(M-kappa)",
+        "schedule_b_step_maximum_by_ell": {"2": 0.12, "3": 0.09, "4": 0.09},
+        "spin_weight": -2,
+    }:
+        raise ValueError("M02 overlay numerical policy is invalid")
+    ceilings = {
+        "optimizer_residual_abs": 1e-8,
+        "continued_fraction_error": 1e-9,
+        "angular_refinement_abs": 1e-9,
+        "repeat_polish_delta_abs": 1e-9,
+        "predictor_correction_over_separation": 0.24,
+        "independent_path_delta_abs": 1e-8,
+        "reverse_delta_abs": 1e-8,
+    }
+    for field, ceiling in ceilings.items():
+        observed = maxima.get(field)
+        if (
+            isinstance(observed, bool)
+            or not isinstance(observed, (int, float))
+            or not math.isfinite(float(observed))
+            or not 0 <= float(observed) <= ceiling
+        ):
+            raise ValueError(f"M02 overlay {field} maximum is invalid")
+    floor_values = {
+        "assigned_separation_abs": 1e-6,
+        "assignment_relative_gap": 0.05,
+        "angular_overlap_min": 0.9,
+        "minimum_adaptive_step": 0.003,
+    }
+    for field, floor in floor_values.items():
+        observed = minima.get(field)
+        if (
+            isinstance(observed, bool)
+            or not isinstance(observed, (int, float))
+            or not math.isfinite(float(observed))
+            or float(observed) < floor
+        ):
+            raise ValueError(f"M02 overlay {field} minimum is invalid")
+    if (
+        validation.get("damped_count") != 44
+        or validation.get("finite_count") != 44
+        or validation.get("failure_count") != 0
+        or validation.get("scientific_state") != "NOT_EVALUATED"
+        or dependencies.get("numpy") != "2.3.5"
+        or dependencies.get("scipy") != "1.17.0"
+        or runtime.get("python") != "3.12.13"
+        or not isinstance(runtime.get("platform"), str)
+        or value.get("evidence_ceiling")
+        != (
+            "numerical continuation and genealogy evidence only; no formal "
+            "root enclosure, external comparator, or DM/ZDM classification"
+        )
+    ):
+        raise ValueError("M02 overlay validation or evidence ceiling is invalid")
+    return _freeze_json(value)  # type: ignore[return-value]
+
+
 @dataclass(frozen=True, slots=True)
 class SpectralRoot:
     s: int
@@ -560,6 +821,347 @@ class SpectralRoot:
             },
             "independent_comparison": comparison,
         }
+
+
+@dataclass(frozen=True, slots=True)
+class SpectralOverlayRoot:
+    ell: int
+    m: int
+    n: int
+    source_coordinate_id: str
+    source_coordinate: Fraction
+    source_transformation_id: str
+    spin_numerator: int
+    spin_denominator: int
+    spin: float
+    spin_hex: str
+    omega_re: float
+    omega_im: float
+    angular_A_re: float
+    angular_A_im: float
+    optimizer_residual_abs: float
+    continued_fraction_error: float
+    continued_fraction_terms: int
+    angular_refinement_abs: float
+    repeat_polish_delta_abs: float
+    predictor_correction_abs: float
+    predictor_correction_over_separation: float
+    assigned_separation_abs: float
+    assignment_relative_gap: float
+    canonical_polish_delta_abs: float
+    independent_path_delta_abs: float
+    reverse_delta_abs: float
+    angular_overlap_min: float
+    schedule_a_steps: int
+    schedule_b_steps: int
+    minimum_adaptive_step: float
+
+    @property
+    def s(self) -> int:
+        return -2
+
+    @property
+    def branch_id(self) -> str:
+        return PUBLIC_BRANCH_ID
+
+    @property
+    def selection_key(self) -> tuple[int, int, int, str]:
+        return self.ell, self.m, self.n, self.spin_hex
+
+    @property
+    def target_identity(self) -> tuple[int, int, int, str, Fraction, str, float]:
+        return (
+            self.ell,
+            self.m,
+            self.n,
+            self.source_coordinate_id,
+            self.source_coordinate,
+            self.source_transformation_id,
+            self.spin,
+        )
+
+    def to_mapping(self) -> dict[str, object]:
+        return {
+            "mode": {
+                "s": -2,
+                "ell": self.ell,
+                "m": self.m,
+                "n": self.n,
+                "branch": PUBLIC_BRANCH_ID,
+                "polarization": PUBLIC_POLARIZATION_ID,
+            },
+            "source_coordinate": {
+                "coordinate_id": self.source_coordinate_id,
+                "numerator": self.source_coordinate.numerator,
+                "denominator": self.source_coordinate.denominator,
+                "transformation_id": self.source_transformation_id,
+            },
+            "spin": self.spin,
+            "spin_binary64_ratio": {
+                "numerator": self.spin_numerator,
+                "denominator": self.spin_denominator,
+            },
+            "spin_binary64_hex": self.spin_hex,
+            "frequency": {
+                "real": self.omega_re,
+                "imaginary": self.omega_im,
+                "units": "Momega",
+            },
+            "angular_separation_constant_A": {
+                "real": self.angular_A_re,
+                "imaginary": self.angular_A_im,
+            },
+            "numerical_evidence": {
+                "optimizer_residual_abs": self.optimizer_residual_abs,
+                "continued_fraction_error": self.continued_fraction_error,
+                "continued_fraction_terms": self.continued_fraction_terms,
+                "angular_refinement_abs": self.angular_refinement_abs,
+                "repeat_polish_delta_abs": self.repeat_polish_delta_abs,
+                "predictor_correction_abs": self.predictor_correction_abs,
+                "predictor_correction_over_separation": (
+                    self.predictor_correction_over_separation
+                ),
+                "assigned_separation_abs": self.assigned_separation_abs,
+                "assignment_relative_gap": self.assignment_relative_gap,
+                "canonical_polish_delta_abs": self.canonical_polish_delta_abs,
+                "independent_path_delta_abs": self.independent_path_delta_abs,
+                "reverse_delta_abs": self.reverse_delta_abs,
+                "angular_overlap_min": self.angular_overlap_min,
+                "schedule_a_steps": self.schedule_a_steps,
+                "schedule_b_steps": self.schedule_b_steps,
+                "minimum_adaptive_step": self.minimum_adaptive_step,
+                "formal_root_enclosure": False,
+            },
+            "independent_comparison": None,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class SpectrumOverlayCatalog:
+    roots: tuple[SpectralOverlayRoot, ...]
+    data_sha256: str
+    receipt: Mapping[str, object]
+
+    @classmethod
+    def from_csv_bytes(
+        cls, data: bytes, *, expected_sha256: str
+    ) -> "SpectrumOverlayCatalog":
+        actual_sha256 = hashlib.sha256(data).hexdigest()
+        if actual_sha256 != expected_sha256:
+            raise ValueError("overlay SHA-256 does not match the admitted resource")
+        try:
+            text = data.decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise ValueError("overlay must be UTF-8") from error
+        if not text.endswith("\n") or "\r" in text:
+            raise ValueError("overlay bytes are not canonical UTF-8 CSV")
+        reader = csv.DictReader(io.StringIO(text), strict=True)
+        if tuple(reader.fieldnames or ()) != _OVERLAY_COLUMNS:
+            raise ValueError("overlay column schema does not match")
+        roots: list[SpectralOverlayRoot] = []
+        try:
+            for row_number, row in enumerate(reader, start=2):
+                if set(row) != set(_OVERLAY_COLUMNS) or None in row:
+                    raise ValueError(
+                        f"overlay row {row_number} does not match the column schema"
+                    )
+                roots.append(cls._parse_root(row, row_number))
+        except csv.Error as error:
+            raise ValueError("overlay CSV is malformed") from error
+        return cls._validated(tuple(roots), actual_sha256)
+
+    @staticmethod
+    def _parse_root(
+        row: Mapping[str, str], row_number: int
+    ) -> SpectralOverlayRoot:
+        if (
+            _parse_int(row["s"], "s", row_number) != -2
+            or row["branch_id"] != PUBLIC_BRANCH_ID
+            or row["root_solver_success"] != "true"
+        ):
+            raise ValueError(f"overlay row {row_number} mode or solver state is invalid")
+        coordinate_numerator = _parse_int(
+            row["source_coordinate_numerator"],
+            "source_coordinate_numerator",
+            row_number,
+        )
+        coordinate_denominator = _parse_int(
+            row["source_coordinate_denominator"],
+            "source_coordinate_denominator",
+            row_number,
+        )
+        if coordinate_denominator <= 0:
+            raise ValueError(f"overlay row {row_number} source denominator is invalid")
+        coordinate = Fraction(coordinate_numerator, coordinate_denominator)
+        if (coordinate.numerator, coordinate.denominator) != (
+            coordinate_numerator,
+            coordinate_denominator,
+        ):
+            raise ValueError(f"overlay row {row_number} source rational is not reduced")
+        spin_numerator = _parse_int(
+            row["spin_numerator"], "spin_numerator", row_number
+        )
+        spin_denominator = _parse_int(
+            row["spin_denominator"], "spin_denominator", row_number
+        )
+        spin = _parse_float(row["spin_float"], "spin_float", row_number)
+        if spin_denominator <= 0 or spin.as_integer_ratio() != (
+            spin_numerator,
+            spin_denominator,
+        ):
+            raise ValueError(f"overlay row {row_number} spin ratio is invalid")
+        spin_hex = row["spin_binary64_hex"]
+        if spin_hex != spin.hex() or float.fromhex(spin_hex) != spin:
+            raise ValueError(f"overlay row {row_number} spin hex is invalid")
+        integer_fields = {
+            "continued_fraction_terms": _parse_int(
+                row["continued_fraction_terms"],
+                "continued_fraction_terms",
+                row_number,
+            ),
+            "schedule_a_steps": _parse_int(
+                row["schedule_a_steps"], "schedule_a_steps", row_number
+            ),
+            "schedule_b_steps": _parse_int(
+                row["schedule_b_steps"], "schedule_b_steps", row_number
+            ),
+        }
+        if (
+            _parse_int(row["angular_padding"], "angular_padding", row_number) != 20
+            or _parse_int(
+                row["angular_refinement_padding"],
+                "angular_refinement_padding",
+                row_number,
+            )
+            != 24
+        ):
+            raise ValueError(f"overlay row {row_number} angular policy is invalid")
+        float_fields = {
+            field: _parse_float(row[field], field, row_number)
+            for field in (
+                "omega_re_M", "omega_im_M", "angular_A_re", "angular_A_im",
+                "optimizer_residual_abs", "continued_fraction_error",
+                "angular_refinement_abs", "repeat_polish_delta_abs",
+                "predictor_correction_abs",
+                "predictor_correction_over_separation",
+                "assigned_separation_abs", "assignment_relative_gap",
+                "canonical_polish_delta_abs", "independent_path_delta_abs",
+                "reverse_delta_abs", "angular_overlap_min",
+                "minimum_adaptive_step",
+            )
+        }
+        root = SpectralOverlayRoot(
+            ell=_parse_int(row["ell"], "ell", row_number),
+            m=_parse_int(row["m"], "m", row_number),
+            n=_parse_int(row["n"], "n", row_number),
+            source_coordinate_id=row["source_coordinate_id"],
+            source_coordinate=coordinate,
+            source_transformation_id=row["source_transformation_id"],
+            spin_numerator=spin_numerator,
+            spin_denominator=spin_denominator,
+            spin=spin,
+            spin_hex=spin_hex,
+            omega_re=float_fields.pop("omega_re_M"),
+            omega_im=float_fields.pop("omega_im_M"),
+            angular_A_re=float_fields.pop("angular_A_re"),
+            angular_A_im=float_fields.pop("angular_A_im"),
+            **integer_fields,
+            **float_fields,
+        )
+        SpectrumOverlayCatalog._validate_root(root, row_number)
+        return root
+
+    @staticmethod
+    def _validate_root(root: SpectralOverlayRoot, row_number: int) -> None:
+        if root.omega_im >= 0.0:
+            raise ValueError(f"overlay row {row_number} is not damped")
+        ceilings = {
+            "optimizer residual": (root.optimizer_residual_abs, 1e-8),
+            "continued fraction": (root.continued_fraction_error, 1e-9),
+            "angular refinement": (root.angular_refinement_abs, 1e-9),
+            "repeat polish": (root.repeat_polish_delta_abs, 1e-9),
+            "predictor ratio": (
+                root.predictor_correction_over_separation, 0.24
+            ),
+            "independent path": (root.independent_path_delta_abs, 1e-8),
+            "reverse": (root.reverse_delta_abs, 1e-8),
+        }
+        diagnostics = (
+            root.predictor_correction_abs,
+            root.assigned_separation_abs,
+            root.assignment_relative_gap,
+            root.canonical_polish_delta_abs,
+            root.angular_overlap_min,
+            root.minimum_adaptive_step,
+        )
+        if any(value < 0.0 for value in diagnostics):
+            raise ValueError(f"overlay row {row_number} has negative diagnostics")
+        for name, (value, ceiling) in ceilings.items():
+            if value < 0.0 or value > ceiling:
+                raise ValueError(
+                    f"overlay row {row_number} diagnostic {name} exceeds threshold"
+                )
+        if (
+            root.assigned_separation_abs < 1e-6
+            or root.assignment_relative_gap < 0.05
+            or root.angular_overlap_min < 0.9
+            or root.angular_overlap_min > 1.0
+            or root.minimum_adaptive_step < 0.003
+            or root.continued_fraction_terms < 1000
+            or root.continued_fraction_terms >= 60000
+            or root.schedule_a_steps <= 0
+            or root.schedule_b_steps <= 0
+        ):
+            raise ValueError(f"overlay row {row_number} numerical policy is invalid")
+
+    @classmethod
+    def _validated(
+        cls, roots: tuple[SpectralOverlayRoot, ...], data_sha256: str
+    ) -> "SpectrumOverlayCatalog":
+        if len(roots) != 44:
+            raise ValueError("overlay count must be exactly 44 roots")
+        if tuple(root.target_identity for root in roots) != _EXPECTED_OVERLAY_TARGETS:
+            identities = tuple(root.target_identity for root in roots)
+            if set(identities) == set(_EXPECTED_OVERLAY_TARGETS):
+                raise ValueError("overlay roots are not in canonical order")
+            raise ValueError("overlay roots do not equal the exact 44-target set")
+        keys = tuple(root.selection_key for root in roots)
+        if len(set(keys)) != 44:
+            raise ValueError("overlay contains duplicate selection keys")
+        receipt = load_overlay_receipt()
+        overlay = _mapping(receipt.get("overlay"), "overlay receipt catalog")
+        if overlay.get("sha256") != data_sha256:
+            raise ValueError("overlay receipt does not bind the catalog bytes")
+        validation = _mapping(receipt.get("validation"), "overlay validation")
+        receipt_maxima = _mapping(
+            validation.get("observed_maxima"), "overlay maxima"
+        )
+        receipt_minima = _mapping(
+            validation.get("observed_minima"), "overlay minima"
+        )
+        maxima_fields = (
+            "optimizer_residual_abs", "continued_fraction_error",
+            "angular_refinement_abs", "repeat_polish_delta_abs",
+            "predictor_correction_abs",
+            "predictor_correction_over_separation",
+            "canonical_polish_delta_abs", "independent_path_delta_abs",
+            "reverse_delta_abs",
+        )
+        minima_fields = (
+            "assigned_separation_abs", "assignment_relative_gap",
+            "angular_overlap_min", "minimum_adaptive_step",
+        )
+        if any(
+            float(receipt_maxima[field])
+            != max(getattr(root, field) for root in roots)
+            for field in maxima_fields
+        ) or any(
+            float(receipt_minima[field])
+            != min(getattr(root, field) for root in roots)
+            for field in minima_fields
+        ):
+            raise ValueError("overlay row diagnostics do not match the receipt")
+        return cls(roots=roots, data_sha256=data_sha256, receipt=receipt)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1024,9 +1626,139 @@ class SpectrumCatalog:
 
 
 @lru_cache(maxsize=1)
-def load_spectrum_catalog() -> SpectrumCatalog:
+def load_base_spectrum_catalog() -> SpectrumCatalog:
     return SpectrumCatalog.from_csv_bytes(
         CATALOG_RESOURCE.read_bytes(), expected_sha256=CATALOG_DATA_SHA256
+    )
+
+
+@lru_cache(maxsize=1)
+def load_overlay_catalog() -> SpectrumOverlayCatalog:
+    return SpectrumOverlayCatalog.from_csv_bytes(
+        OVERLAY_RESOURCE.read_bytes(), expected_sha256=OVERLAY_DATA_SHA256
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class SpectralCatalogUnion:
+    base: SpectrumCatalog
+    overlay: SpectrumOverlayCatalog
+
+    def __post_init__(self) -> None:
+        base_keys = {root.selection_key for root in self.base.roots}
+        overlay_keys = {root.selection_key for root in self.overlay.roots}
+        if len(base_keys) != len(self.base.roots):
+            raise ValueError("base catalog has ambiguous selection keys")
+        if len(overlay_keys) != len(self.overlay.roots):
+            raise ValueError("overlay catalog has ambiguous selection keys")
+        if base_keys & overlay_keys:
+            raise ValueError("base and overlay contain duplicate ambiguous selectors")
+
+    @property
+    def roots(self) -> tuple[SpectralRoot, ...]:
+        """Retain the immutable base carrier surface for existing consumers."""
+
+        return self.base.roots
+
+    @property
+    def keys(self) -> frozenset[tuple[int, int, int, int, int]]:
+        return self.base.keys
+
+    @property
+    def scope(self) -> SpectrumScope:
+        return self.base.scope
+
+    @property
+    def validation(self) -> SpectrumValidation:
+        return self.base.validation
+
+    @property
+    def data_sha256(self) -> str:
+        return self.base.data_sha256
+
+    def select(
+        self, request: StudyRequest
+    ) -> tuple[SpectralRoot | SpectralOverlayRoot, ...]:
+        if request.target is not Capability.SPECTRAL_CORE:
+            raise ValueError("spectral catalog requires target spectral-core")
+        if request.theory_id != PUBLIC_THEORY_ID:
+            raise ValueError(
+                f"spectral catalog does not support theory_id {request.theory_id!r}"
+            )
+        if request.convention_id != PUBLIC_CONVENTION_ID:
+            raise ValueError(
+                "spectral catalog does not support convention_id "
+                f"{request.convention_id!r}"
+            )
+        all_roots: tuple[SpectralRoot | SpectralOverlayRoot, ...] = (
+            *self.base.roots,
+            *self.overlay.roots,
+        )
+        by_key = {root.selection_key: root for root in all_roots}
+        if len(by_key) != len(all_roots):
+            raise ValueError("spectral union contains ambiguous selection keys")
+        selected: list[SpectralRoot | SpectralOverlayRoot] = []
+        requested: set[tuple[int, int, int, str]] = set()
+        policy = request.numerical_policy
+        if policy:
+            if set(policy) != {"exact-spectral-selection"}:
+                raise ValueError(
+                    "spectral catalog does not accept numerical policy overrides"
+                )
+            selection = policy["exact-spectral-selection"]
+            if not isinstance(selection, Mapping) or set(selection) != {"pairs"}:
+                raise ValueError("exact spectral selection fields are invalid")
+            pairs = selection["pairs"]
+            if not isinstance(pairs, list) or not pairs:
+                raise ValueError("exact spectral selection pairs are invalid")
+            requested_pairs: tuple[tuple[ModeKey, str], ...] = tuple(
+                (
+                    ModeKey.from_mapping(pair["mode"]),
+                    pair["spin_binary64_hex"],
+                )
+                for pair in pairs
+                if isinstance(pair, Mapping)
+                and set(pair) == {"mode", "spin_binary64_hex"}
+                and isinstance(pair["spin_binary64_hex"], str)
+            )
+            if len(requested_pairs) != len(pairs):
+                raise ValueError("exact spectral selection pair is invalid")
+            allowed_modes = {canonical_json_bytes(mode.to_mapping()) for mode in request.modes}
+            allowed_spins = {float(spin).hex() for spin in request.spins}
+            if any(
+                canonical_json_bytes(mode.to_mapping()) not in allowed_modes
+                or spin_hex not in allowed_spins
+                for mode, spin_hex in requested_pairs
+            ):
+                raise ValueError("exact spectral selection is outside the request")
+        else:
+            requested_pairs = tuple(
+                (mode, float(spin).hex())
+                for mode in request.modes
+                for spin in request.spins
+            )
+        for mode, spin_hex in requested_pairs:
+            if (
+                mode.s != -2
+                or mode.branch != PUBLIC_BRANCH_ID
+                or mode.polarization != PUBLIC_POLARIZATION_ID
+            ):
+                raise ValueError("catalog has no exact root for the requested mode")
+            key = (mode.ell, mode.m, mode.n, spin_hex)
+            if key in requested:
+                raise ValueError("duplicate mode-spin pair in spectral request")
+            requested.add(key)
+            root = by_key.get(key)
+            if root is None:
+                raise ValueError("catalog has no exact root for requested mode-spin pair")
+            selected.append(root)
+        return tuple(selected)
+
+
+@lru_cache(maxsize=1)
+def load_spectrum_catalog() -> SpectralCatalogUnion:
+    return SpectralCatalogUnion(
+        base=load_base_spectrum_catalog(), overlay=load_overlay_catalog()
     )
 
 
@@ -1036,11 +1768,29 @@ def build_spectral_payload(request: StudyRequest) -> dict[str, object]:
     provenance = _plain_json(load_catalog_receipt())
     if not isinstance(provenance, dict):
         raise ValueError("lattice provenance receipt must be an object")
+    overlay_provenance = _plain_json(load_overlay_receipt())
+    if not isinstance(overlay_provenance, dict):
+        raise ValueError("overlay provenance receipt must be an object")
+    provenance["m02_sparse_overlay"] = overlay_provenance
+    scope = catalog.scope.to_mapping()
+    scope["m02_sparse_overlay"] = {
+        "root_count": 44,
+        "selection_union_count_for_b_prime": 87,
+        "external_comparison_count": 0,
+        "base_root_count": 2736,
+    }
+    validation = catalog.validation.to_mapping()
+    validation["m02_sparse_overlay"] = _plain_json(
+        _mapping(
+            load_overlay_receipt().get("validation"), "overlay validation"
+        )
+    )
     return {
         "schema_version": 1,
-        "catalog_id": CATALOG_ID,
-        "delivery_mode": "computed-lattice-exact-selection",
+        "catalog_id": f"{CATALOG_ID}-plus-{OVERLAY_ID}",
+        "delivery_mode": "computed-base-plus-sparse-overlay-exact-selection",
         "catalog_data_sha256": catalog.data_sha256,
+        "overlay_data_sha256": catalog.overlay.data_sha256,
         "physics_contract": {
             "spin_weight": -2,
             "boundary_conditions": {
@@ -1053,8 +1803,8 @@ def build_spectral_payload(request: StudyRequest) -> dict[str, object]:
             "pure_kerr": True,
         },
         "provenance": provenance,
-        "scope": catalog.scope.to_mapping(),
-        "validation": catalog.validation.to_mapping(),
+        "scope": scope,
+        "validation": validation,
         "requested_root_count": len(selected),
         "roots": [root.to_mapping() for root in selected],
     }

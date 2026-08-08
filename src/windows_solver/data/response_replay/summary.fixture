@@ -1,0 +1,100 @@
+{
+  "component_count": 18,
+  "evidence_validation_errors": [],
+  "ladder_plan": {
+    "axis_tolerance_factor": 2.0,
+    "even_order_tolerance": 0.75,
+    "initial_epsilon": 0.004,
+    "ladder_ratio": 2.0,
+    "maximum_fit_condition_number": 100000000.0,
+    "maximum_levels": 6,
+    "minimum_epsilon": 0.000125,
+    "order_tolerance": 0.45,
+    "repeat_level_count": 2,
+    "signal_to_root_factor": 8.0
+  },
+  "mechanisms": [
+    "horizon_admittance",
+    "fixed_r3",
+    "light_ring"
+  ],
+  "modes": [
+    [
+      2,
+      2,
+      0
+    ],
+    [
+      3,
+      3,
+      0
+    ],
+    [
+      4,
+      4,
+      0
+    ]
+  ],
+  "producer_protocol": "same-equation-complex-axis-richardson-disk-holdout-r3",
+  "reduction_error": "refined atlas contains unusable components: ['a0.999-s-2-l4-m4-n0-unclassified-gravitational-fixed_r3', 'a0.999-s-2-l4-m4-n0-unclassified-gravitational-horizon_admittance', 'a0.999-s-2-l4-m4-n0-unclassified-gravitational-light_ring']",
+  "reduction_status": "SKIPPED_UNUSABLE_COMPONENTS",
+  "risk_row": {
+    "mechanism": "light_ring",
+    "mode": [
+      4,
+      4,
+      0
+    ],
+    "spin": 0.999
+  },
+  "risk_row_result": {
+    "amplitude_epsilon_reference": null,
+    "amplitude_radius_abs": null,
+    "axis_radius_abs": null,
+    "combined_response_disk": {
+      "center_im": null,
+      "center_re": null,
+      "excludes_zero": null,
+      "radius_abs": null
+    },
+    "component_id": "a0.999-s-2-l4-m4-n0-unclassified-gravitational-light_ring",
+    "convergence_basis": "UNRESOLVED",
+    "disk_excludes_zero": null,
+    "extrapolated_signed_root_radius_abs": null,
+    "holdout_radius_abs": null,
+    "imaginary_axis_richardson_disk": {
+      "center_im": null,
+      "center_re": null,
+      "radius_abs": null
+    },
+    "linear_fit_condition_number": null,
+    "numerical_control_extrapolates": [],
+    "quartic_diagnostic_enabled": null,
+    "quartic_fit_condition_number": null,
+    "real_axis_richardson_disk": {
+      "center_im": null,
+      "center_re": null,
+      "radius_abs": null
+    },
+    "resolution_radius_abs": null,
+    "response_im": null,
+    "response_re": null,
+    "richardson_radius_abs": null,
+    "root_radius_abs": null,
+    "status": "NOT_CONVERGED",
+    "truncation_radius_abs": null,
+    "uncertainty_radius_abs": null,
+    "usable": false
+  },
+  "spins": [
+    0.95,
+    0.999
+  ],
+  "unusable_component_count": 3,
+  "usable_component_count": 15,
+  "written": [
+    "docs/evidence/solver-upgrade-response-risk-pilot/solver_upgrade_local_response_components.csv",
+    "docs/evidence/solver-upgrade-response-risk-pilot/solver_upgrade_local_response_reduction.json",
+    "docs/evidence/solver-upgrade-response-risk-pilot/solver_upgrade_local_response_protocol.json"
+  ]
+}

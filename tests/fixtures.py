@@ -1,6 +1,14 @@
 from fractions import Fraction
 
 
+EXPECTED_KAPPA_SPINS = {
+    Fraction(1, 100): (0.999791731748236, "0x1.ffe4b3ad56fa5p-1"),
+    Fraction(1, 200): (0.9999489834961278, "0x1.fff9502b91917p-1"),
+    Fraction(1, 500): (0.9999919355814243, "0x1.fffef1672c027p-1"),
+    Fraction(1, 1000): (0.9999979919739198, "0x1.ffffbc9f2ff3bp-1"),
+}
+
+
 def expected_lattice_keys() -> set[tuple[int, int, int, int, int]]:
     """Return the approved pure-Kerr lattice with canonical rational χ keys."""
 

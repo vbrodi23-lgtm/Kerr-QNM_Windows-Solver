@@ -1,0 +1,5 @@
+{
+  "reduction_error": "refined atlas contains unusable components: ['a0.999-s-2-l4-m4-n0-unclassified-gravitational-fixed_r3', 'a0.999-s-2-l4-m4-n0-unclassified-gravitational-horizon_admittance', 'a0.999-s-2-l4-m4-n0-unclassified-gravitational-light_ring']",
+  "reduction_status": "SKIPPED_UNUSABLE_COMPONENTS",
+  "reductions": []
+}

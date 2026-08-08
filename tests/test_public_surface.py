@@ -9,9 +9,6 @@ import tempfile
 import tomllib
 import unittest
 
-from windows_solver.spectrum import CATALOG_DATA_SHA256, CATALOG_RECEIPT_SHA256
-
-
 class PublicSurfaceTests(unittest.TestCase):
     def test_ci_installs_pinned_numerical_test_dependencies_only_as_an_extra(
         self,
@@ -176,28 +173,29 @@ class PublicSurfaceTests(unittest.TestCase):
                     self.assertIn(count, text)
                 self.assertIsNone(legacy_scope.search(text))
 
-    def test_authenticated_catalog_survives_autocrlf_checkout(self) -> None:
+    def test_authenticated_package_data_survives_autocrlf_checkout(self) -> None:
         root = Path(__file__).resolve().parents[1]
-        relative_catalog = Path("src/windows_solver/data/kerr_qnm_roots_2736.csv")
-        relative_receipt = Path(
-            "src/windows_solver/data/kerr_qnm_lattice_receipt.json"
+        data_root = root / "src" / "windows_solver" / "data"
+        relative_resources = tuple(
+            path.relative_to(root)
+            for path in sorted(data_root.rglob("*"))
+            if path.is_file()
         )
+        expected = {
+            path: hashlib.sha256((root / path).read_bytes()).hexdigest()
+            for path in relative_resources
+        }
         with (
             tempfile.TemporaryDirectory() as source_directory,
             tempfile.TemporaryDirectory() as checkout_directory,
         ):
             source = Path(source_directory)
             checkout = Path(checkout_directory)
-            (source / relative_catalog.parent).mkdir(parents=True)
             shutil.copyfile(root / ".gitattributes", source / ".gitattributes")
-            shutil.copyfile(
-                root / relative_catalog,
-                source / relative_catalog,
-            )
-            shutil.copyfile(
-                root / relative_receipt,
-                source / relative_receipt,
-            )
+            for relative in relative_resources:
+                target = source / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(root / relative, target)
             subprocess.run(
                 ["git", "init", "--quiet"],
                 cwd=source,
@@ -210,8 +208,7 @@ class PublicSurfaceTests(unittest.TestCase):
                     "git",
                     "add",
                     ".gitattributes",
-                    str(relative_catalog),
-                    str(relative_receipt),
+                    *(str(path) for path in relative_resources),
                 ],
                 cwd=source,
                 check=True,
@@ -233,16 +230,9 @@ class PublicSurfaceTests(unittest.TestCase):
                 capture_output=True,
                 text=True,
             )
-            catalog_bytes = (checkout / relative_catalog).read_bytes()
-            receipt_bytes = (checkout / relative_receipt).read_bytes()
+            actual = {
+                path: hashlib.sha256((checkout / path).read_bytes()).hexdigest()
+                for path in relative_resources
+            }
 
-        self.assertNotIn(b"\r", catalog_bytes)
-        self.assertNotIn(b"\r", receipt_bytes)
-        self.assertEqual(
-            hashlib.sha256(catalog_bytes).hexdigest(),
-            CATALOG_DATA_SHA256,
-        )
-        self.assertEqual(
-            hashlib.sha256(receipt_bytes).hexdigest(),
-            CATALOG_RECEIPT_SHA256,
-        )
+        self.assertEqual(actual, expected)

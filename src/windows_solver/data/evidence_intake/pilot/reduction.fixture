@@ -1,0 +1,164 @@
+[
+  {
+    "angle_lower_rad": 1.1802708934098913,
+    "angle_nominal_rad": 1.1802709983540183,
+    "angle_upper_rad": 1.1802711032981452,
+    "calibrated_amplitude": {
+      "center_im": -8.071560601906333,
+      "center_re": 1.8726001663171243,
+      "excludes_zero": true,
+      "radius_abs": 6.820463043618237e-07
+    },
+    "calibrated_residuals": {
+      "s-2-l3-m3-n0-v2_refined-gravitational": {
+        "center_im": -0.1279582937219319,
+        "center_re": -0.10686552491193561,
+        "excludes_zero": true,
+        "radius_abs": 1.6586580408007542e-08
+      },
+      "s-2-l4-m4-n0-v2_refined-gravitational": {
+        "center_im": 0.07509228295751523,
+        "center_re": -0.005997817499456361,
+        "excludes_zero": true,
+        "radius_abs": 1.7142556215162665e-08
+      }
+    },
+    "calibration_denominator": {
+      "center_im": -0.0045421562702939395,
+      "center_re": 0.013293132887809115,
+      "excludes_zero": true,
+      "radius_abs": 9.624543165343417e-10
+    },
+    "calibration_denominator_excludes_zero": true,
+    "component_local_ladder_complete": true,
+    "family": "fixed_r3",
+    "named_minors": {
+      "220-330": {
+        "center_im": 0.00121556668848595,
+        "center_re": 0.002001784189945022,
+        "excludes_zero": true,
+        "radius_abs": 2.301196352961825e-10
+      },
+      "220-440": {
+        "center_im": -0.0010254547205664482,
+        "center_re": -0.0002613510988290641,
+        "excludes_zero": true,
+        "radius_abs": 2.4038379750975743e-10
+      }
+    },
+    "outcome": "SEPARATED",
+    "producer_protocol": "component-local-signed-amplitude-ladder-v1",
+    "singular_value_lower_bounds": [
+      0.16333924346659726,
+      0.01839448979201087
+    ],
+    "singular_value_upper_bounds": [
+      0.16333925027674503,
+      0.018394496602158663
+    ],
+    "spin": 0.95,
+    "stage_id": "V2-02",
+    "stop_decisions": {
+      "s-2-l2-m2-n0-v2_refined-gravitational": {
+        "current_outcome": "SEPARATED",
+        "perfect_knowledge_outcome": "SEPARATED",
+        "reason": "VERDICT_ALREADY_DECIDED",
+        "refine_further": false
+      },
+      "s-2-l3-m3-n0-v2_refined-gravitational": {
+        "current_outcome": "SEPARATED",
+        "perfect_knowledge_outcome": "SEPARATED",
+        "reason": "VERDICT_ALREADY_DECIDED",
+        "refine_further": false
+      },
+      "s-2-l4-m4-n0-v2_refined-gravitational": {
+        "current_outcome": "SEPARATED",
+        "perfect_knowledge_outcome": "SEPARATED",
+        "reason": "VERDICT_ALREADY_DECIDED",
+        "refine_further": false
+      }
+    },
+    "uncertainty_origin": "V2_COMPONENT_LOCAL_SIGNED_AMPLITUDE_LADDER"
+  },
+  {
+    "angle_lower_rad": 0.7854947298357856,
+    "angle_nominal_rad": 0.7855083786663635,
+    "angle_upper_rad": 0.7855220274969413,
+    "calibrated_amplitude": {
+      "center_im": 725.213110901245,
+      "center_re": -671.077319356809,
+      "excludes_zero": true,
+      "radius_abs": 0.0079702494389461
+    },
+    "calibrated_residuals": {
+      "s-2-l3-m3-n0-v2_refined-gravitational": {
+        "center_im": 0.056944753086175054,
+        "center_re": -0.07548656026612217,
+        "excludes_zero": true,
+        "radius_abs": 2.4096537793095792e-06
+      },
+      "s-2-l4-m4-n0-v2_refined-gravitational": {
+        "center_im": 0.11449560242985282,
+        "center_re": -0.06354939042560234,
+        "excludes_zero": true,
+        "radius_abs": 2.0947169299564547e-06
+      }
+    },
+    "calibration_denominator": {
+      "center_im": 8.83431225938868e-05,
+      "center_re": -7.793144323629971e-05,
+      "excludes_zero": true,
+      "radius_abs": 9.486333919057874e-10
+    },
+    "calibration_denominator_excludes_zero": true,
+    "component_local_ladder_complete": true,
+    "family": "light_ring",
+    "named_minors": {
+      "220-330": {
+        "center_im": 1.110650524052121e-05,
+        "center_re": -8.520992835122397e-07,
+        "excludes_zero": true,
+        "radius_abs": 2.754039091849363e-10
+      },
+      "220-440": {
+        "center_im": 1.4536959130703778e-05,
+        "center_re": 5.162403329267136e-06,
+        "excludes_zero": true,
+        "radius_abs": 2.3711610982626136e-10
+      }
+    },
+    "outcome": "SEPARATED",
+    "producer_protocol": "component-local-signed-amplitude-ladder-v1",
+    "singular_value_lower_bounds": [
+      0.16316101406756225,
+      0.00012366178067845743
+    ],
+    "singular_value_upper_bounds": [
+      0.16316102162431254,
+      0.00012366933742875038
+    ],
+    "spin": 0.95,
+    "stage_id": "V2-02",
+    "stop_decisions": {
+      "s-2-l2-m2-n0-v2_refined-gravitational": {
+        "current_outcome": "SEPARATED",
+        "perfect_knowledge_outcome": "SEPARATED",
+        "reason": "VERDICT_ALREADY_DECIDED",
+        "refine_further": false
+      },
+      "s-2-l3-m3-n0-v2_refined-gravitational": {
+        "current_outcome": "SEPARATED",
+        "perfect_knowledge_outcome": "SEPARATED",
+        "reason": "VERDICT_ALREADY_DECIDED",
+        "refine_further": false
+      },
+      "s-2-l4-m4-n0-v2_refined-gravitational": {
+        "current_outcome": "SEPARATED",
+        "perfect_knowledge_outcome": "SEPARATED",
+        "reason": "VERDICT_ALREADY_DECIDED",
+        "refine_further": false
+      }
+    },
+    "uncertainty_origin": "V2_COMPONENT_LOCAL_SIGNED_AMPLITUDE_LADDER"
+  }
+]

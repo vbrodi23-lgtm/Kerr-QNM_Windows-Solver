@@ -1,28 +1,28 @@
 # Next
 
-## TASK-007: Freeze independent golden results for the legacy linear calculation
-**Priority:** P1 | **Tags:** M02, evidence, validation
-**Assignee:** Unassigned | **Estimate:** 1–2 days | **Milestone:** M02
+## TASK-012: Define spectral-field, co-mode, residue, and genealogy contracts
+**Priority:** P1 | **Tags:** M03, physics, architecture
+**Assignee:** Unassigned | **Estimate:** 1–2 days | **Milestone:** M03
 
 ### Objective
 
-Characterize the accepted component-local response calculations without making legacy code a production dependency.
+Extend the spectral responsibility beyond root rows with exact normalization and branch objects required downstream.
 
 ### Acceptance Criteria
 
-- [ ] Select manifest-declared modes/spins and both horizon/exterior or theory mechanisms as golden fixtures.
-- [ ] Record central complex shifts, local solver diagnostics, signed-root uncertainty inputs, covariance, and projective classifications.
-- [ ] Authenticate source artifacts, code, runtime, and comparison method.
-- [ ] Include adverse/unresolved fixtures and independent published or alternate-backend comparisons where available.
+- [ ] Define radial/angular field, derivative, co-mode, residue, normalization, branch-node, branch-edge, κ, and matching-evidence schemas.
+- [ ] Specify domain compactification, boundary behavior, precision/resolution policy, and coordinate identity.
+- [ ] Keep pure roots compatible with the merged spectral artifact and avoid recomputing unchanged leaves.
+- [ ] Reject field artifacts whose normalization or branch identity is unspecified.
 
 ### Dependencies
 
-- **Blocked by:** TASK-005, TASK-006
-- **Blocks:** TASK-008, TASK-009, TASK-010
+- **Blocked by:** TASK-005
+- **Blocks:** TASK-013, TASK-015
 
 ### Evidence Output
 
-Hash-bound linear-response golden fixture set and comparison receipt.
+Versioned spectral-field/genealogy contracts and negative validation fixtures.
 
 ### Verification
 
@@ -30,12 +30,12 @@ undefined
 
 ### Review Focus
 
-Confirm fixtures are independent enough to detect migration errors and do not embed obsolete scope.
+Check whether the public spectral provider remains one owner while internal leaf artifacts stay composable.
 
 ### Plan
 
-- Select release-domain fixture slices.
-- Authenticate and independently compare values.
-- Lock tolerances from observed diagnostics, not desired outcomes.
+- Derive contracts from M01 and downstream needs.
+- Add strict red tests and compatibility rules.
+- Review leaf caching and evidence ceiling.
 
 ---

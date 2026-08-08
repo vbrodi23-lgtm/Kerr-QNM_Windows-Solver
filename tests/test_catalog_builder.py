@@ -15,6 +15,7 @@ import zipfile
 
 from tools import compute_kerr_qnm_lattice as builder
 from tests.fixtures import expected_lattice_keys
+from windows_solver.linear_response import B_PRIME_RELEASE_DOMAIN
 
 
 def _synthetic_archive() -> bytes:
@@ -106,6 +107,17 @@ def _synthetic_rows() -> list[dict[str, object]]:
 
 
 class CatalogBuilderTests(unittest.TestCase):
+    def test_b_prime_declares_a_sparse_overlay_not_a_cartesian_builder(self) -> None:
+        """TASK-070 receives only the literal 44 missing selectors."""
+
+        domain = B_PRIME_RELEASE_DOMAIN
+        self.assertEqual(len(domain.root_selectors), 87)
+        self.assertEqual(len(domain.missing_root_selector_ids), 44)
+        self.assertEqual(domain.missing_selector_counts_by_role, {
+            "primary": 28, "control": 0, "deep": 16,
+        })
+        self.assertEqual(len(builder.lattice_points()), 2_736)
+
     def test_exact_enumerator_is_the_complete_reduced_rational_lattice(self) -> None:
         points = builder.lattice_points()
         self.assertEqual(len(points), 2_736)

@@ -28,11 +28,22 @@ exact selection only—no interpolation, extrapolation, or nearby-spin aliasing.
 Formal root enclosure is not claimed and the scientific state remains
 `NOT_EVALUATED`.
 
-All downstream providers remain unavailable and fail closed. PR #3 freezes the
-M01 release domain, source receipts, module ownership, conventions, evidence
-ceilings, and missing-input ledger without changing the accepted spectrum.
-PR #4 begins the distinct `linear-response` migration. See
-[the M01 release baseline](docs/release-baseline.md).
+Providers beyond `linear-response` remain unavailable and fail closed. PR #3
+freezes the M01 release domain, source receipts, module ownership, conventions,
+evidence ceilings, and missing-input ledger without changing the accepted
+spectrum. PR #4 begins the distinct `linear-response` migration; PR #5 installs
+the M02 planner, resumable campaign, uncertainty/projective reduction, and
+fail-closed admission machinery. No M02 scientific evidence is shipped: the
+linear-response provider remains unavailable by default and can be registered
+only from a complete operator package that passes the 553-leaf and 174-row
+admission gates. Reduction inputs are value-bound to their authenticated
+checkpoint records, and all 174 payload comparisons are value-bound to the
+sealed reduction. Each produced record carries its complete checkpoint root
+identity; admission reconciles the resulting 87-root campaign set against the
+installed catalog before the package seals the spectral provider/request/payload
+identity. Admission and replay therefore reject catalog or root drift. See [the
+M01 release baseline](docs/release-baseline.md) and [the M02 PowerShell
+handoff](docs/m02-admission-powershell.md).
 
 ## Quick start on Windows
 
@@ -68,6 +79,14 @@ solver run STUDY.json [--store PATH]
 solver verify RUN_ID [--store PATH] [--profile research|publication]
 solver inspect RUN_ID [--store PATH]
 solver export RUN_ID --output PACKAGE.json [--store PATH]
+solver validate-evidence EVIDENCE-BUNDLE.json
+solver campaign-validate SELECTION.json --checkpoint CHECKPOINT.json [--full]
+solver campaign-reduce REDUCTION-BUNDLE.json --output REDUCTION.json
+solver m02-validate ADMISSION-INPUT.json
+solver m02-admit ADMISSION-INPUT.json --output ADMITTED.json
+solver m02-export ADMITTED.json --admission-id ID --output EXPORTED.json
+solver plan STUDY.json --linear-response-admission ADMITTED.json --linear-response-admission-id ID
+solver run STUDY.json --linear-response-admission ADMITTED.json --linear-response-admission-id ID [--store PATH]
 ```
 
 Every command emits one deterministic JSON value: successful results on stdout and failures on stderr. A provider execution failure returns exit code `1`, invalid input returns `2`, an unavailable provider returns `3`, failed verification returns `4`, and storage/output failure returns `5`. Failed runs include their sealed run record in the structured error and remain available to `inspect`.
