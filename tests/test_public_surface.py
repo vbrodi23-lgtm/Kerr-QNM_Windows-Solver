@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import hashlib
+import json
 import re
 import shutil
 import subprocess
@@ -37,6 +38,86 @@ class PublicSurfaceTests(unittest.TestCase):
         self.assertIn('PrefixArguments @("-3")', launcher)
         self.assertIn('$PythonPrefixArguments = @("-3")', launcher)
         self.assertNotIn('PrefixArguments @("-3.12")', launcher)
+
+    def test_launcher_probe_cannot_abort_on_a_stderr_writing_candidate(
+        self,
+    ) -> None:
+        """A rejected candidate must fall through, not terminate the launcher.
+
+        The Windows App Execution Alias stub for ``python.exe`` writes to
+        stderr, which Windows PowerShell 5.1 raises as a terminating
+        ``NativeCommandError`` while ``ErrorActionPreference`` is ``Stop``.
+        The probe must therefore hold its own preference and report failure
+        through the exit code alone, or the remaining candidates and the
+        actionable "not found" message become unreachable.
+        """
+
+        root = Path(__file__).resolve().parents[1]
+        launcher = (root / "solver.ps1").read_text(encoding="utf-8")
+        probe = launcher[launcher.index("function Test-Python312") :]
+        probe = probe[: probe.index("\n$PythonExecutable")]
+
+        self.assertIn('$ErrorActionPreference = "Continue"', probe)
+        self.assertIn("$previous = $ErrorActionPreference", probe)
+        self.assertIn("finally", probe)
+        self.assertIn("$ErrorActionPreference = $previous", probe)
+        self.assertIn("return $false", probe)
+
+    def test_bootstrap_provisions_the_launcher_preferred_interpreter(
+        self,
+    ) -> None:
+        root = Path(__file__).resolve().parents[1]
+        launcher = (root / "solver.ps1").read_text(encoding="utf-8")
+        bootstrap = (root / "runtime" / "bootstrap.ps1").read_text(
+            encoding="utf-8"
+        )
+        policy = json.loads(
+            (root / "runtime" / "runtime_policy.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        configuration = tomllib.loads(
+            (root / "pyproject.toml").read_text(encoding="utf-8")
+        )
+
+        # The launcher must prefer exactly the path the bootstrap creates.
+        self.assertIn(r".runtime\venv\Scripts\python.exe", launcher)
+        self.assertIn(r'Join-Path $VenvRoot "Scripts\python.exe"', bootstrap)
+        self.assertIn(r'Join-Path $RuntimeRoot "venv"', bootstrap)
+        self.assertIn(r".\runtime\bootstrap.ps1", launcher)
+
+        # The provisioned runtime must match the recorded spectral provenance.
+        recorded = json.loads(
+            (
+                root
+                / "src"
+                / "windows_solver"
+                / "data"
+                / "kerr_qnm_lattice_receipt.json"
+            ).read_text(encoding="utf-8")
+        )["runtime"]
+        self.assertEqual(
+            policy["python"]["python_version"], recorded["python"]
+        )
+        self.assertEqual(policy["python"]["implementation"], "CPython")
+        self.assertEqual(policy["python"]["bits"], 64)
+
+        # The optional numerical tier must not drift from the declared extra.
+        self.assertEqual(
+            [
+                f"{package['name']}=={package['version']}"
+                for package in policy["numerical_kernel"]["packages"]
+            ],
+            configuration["project"]["optional-dependencies"][
+                "numerical-tests"
+            ],
+        )
+
+        # .runtime must stay untracked so the provisioned bytes never ship.
+        self.assertIn(
+            ".runtime/",
+            (root / ".gitignore").read_text(encoding="utf-8").splitlines(),
+        )
 
     def test_windows_ci_captures_native_streams_outside_powershell(self) -> None:
         root = Path(__file__).resolve().parents[1]
