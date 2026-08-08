@@ -21,6 +21,7 @@ from .contracts import (
     CarrierState,
     EvidenceState,
     ExecutionState,
+    ModeKey,
     NumericalState,
     ScientificState,
     StudyRequest,
@@ -1689,8 +1690,6 @@ class SpectralCatalogUnion:
                 "spectral catalog does not support convention_id "
                 f"{request.convention_id!r}"
             )
-        if request.numerical_policy:
-            raise ValueError("spectral catalog does not accept numerical policy overrides")
         all_roots: tuple[SpectralRoot | SpectralOverlayRoot, ...] = (
             *self.base.roots,
             *self.overlay.roots,
@@ -1700,22 +1699,59 @@ class SpectralCatalogUnion:
             raise ValueError("spectral union contains ambiguous selection keys")
         selected: list[SpectralRoot | SpectralOverlayRoot] = []
         requested: set[tuple[int, int, int, str]] = set()
-        for mode in request.modes:
+        policy = request.numerical_policy
+        if policy:
+            if set(policy) != {"exact-spectral-selection"}:
+                raise ValueError(
+                    "spectral catalog does not accept numerical policy overrides"
+                )
+            selection = policy["exact-spectral-selection"]
+            if not isinstance(selection, Mapping) or set(selection) != {"pairs"}:
+                raise ValueError("exact spectral selection fields are invalid")
+            pairs = selection["pairs"]
+            if not isinstance(pairs, list) or not pairs:
+                raise ValueError("exact spectral selection pairs are invalid")
+            requested_pairs: tuple[tuple[ModeKey, str], ...] = tuple(
+                (
+                    ModeKey.from_mapping(pair["mode"]),
+                    pair["spin_binary64_hex"],
+                )
+                for pair in pairs
+                if isinstance(pair, Mapping)
+                and set(pair) == {"mode", "spin_binary64_hex"}
+                and isinstance(pair["spin_binary64_hex"], str)
+            )
+            if len(requested_pairs) != len(pairs):
+                raise ValueError("exact spectral selection pair is invalid")
+            allowed_modes = {canonical_json_bytes(mode.to_mapping()) for mode in request.modes}
+            allowed_spins = {float(spin).hex() for spin in request.spins}
+            if any(
+                canonical_json_bytes(mode.to_mapping()) not in allowed_modes
+                or spin_hex not in allowed_spins
+                for mode, spin_hex in requested_pairs
+            ):
+                raise ValueError("exact spectral selection is outside the request")
+        else:
+            requested_pairs = tuple(
+                (mode, float(spin).hex())
+                for mode in request.modes
+                for spin in request.spins
+            )
+        for mode, spin_hex in requested_pairs:
             if (
                 mode.s != -2
                 or mode.branch != PUBLIC_BRANCH_ID
                 or mode.polarization != PUBLIC_POLARIZATION_ID
             ):
                 raise ValueError("catalog has no exact root for the requested mode")
-            for spin in request.spins:
-                key = (mode.ell, mode.m, mode.n, float(spin).hex())
-                if key in requested:
-                    raise ValueError("duplicate mode-spin pair in spectral request")
-                requested.add(key)
-                root = by_key.get(key)
-                if root is None:
-                    raise ValueError("catalog has no exact root for requested mode-spin pair")
-                selected.append(root)
+            key = (mode.ell, mode.m, mode.n, spin_hex)
+            if key in requested:
+                raise ValueError("duplicate mode-spin pair in spectral request")
+            requested.add(key)
+            root = by_key.get(key)
+            if root is None:
+                raise ValueError("catalog has no exact root for requested mode-spin pair")
+            selected.append(root)
         return tuple(selected)
 
 

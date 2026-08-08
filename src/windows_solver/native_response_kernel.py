@@ -18,6 +18,7 @@ from pathlib import Path
 import platform
 from typing import Callable, Mapping
 
+from .contracts import canonical_text_bytes
 from .response_engine import (
     BackendIdentity,
     DeterminantPartials,
@@ -62,9 +63,12 @@ def _adapted_source_sha256() -> str:
     )
     digest = hashlib.sha256()
     for path in paths:
+        data = path.read_bytes()
+        if path.suffix == ".py":
+            data = canonical_text_bytes(data)
         digest.update(path.name.encode("utf-8"))
         digest.update(b"\0")
-        digest.update(path.read_bytes())
+        digest.update(data)
         digest.update(b"\0")
     return digest.hexdigest()
 

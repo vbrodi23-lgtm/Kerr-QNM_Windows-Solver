@@ -4,6 +4,8 @@ from copy import deepcopy
 import hashlib
 import json
 from pathlib import Path
+import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -26,6 +28,7 @@ from windows_solver.response_reduction import (
     build_projective_row_plans,
     reduce_projective_rows,
 )
+from windows_solver.spectrum import build_spectral_payload
 
 from tests.test_linear_response_contract import b_prime_payload, b_prime_request
 from tests.test_linear_response_evidence_intake import _write_manifest
@@ -122,6 +125,15 @@ def _admission_fixture(directory: Path, *, complete: bool) -> Path:
 
 
 class LinearResponseAdmissionTests(unittest.TestCase):
+    def test_role_scoped_request_derives_exact_sparse_spectral_upstream(self) -> None:
+        request = b_prime_request().for_capability(Capability.SPECTRAL_CORE)
+        self.assertEqual(
+            set(request.numerical_policy), {"exact-spectral-selection"}
+        )
+        payload = build_spectral_payload(request)
+        self.assertEqual(payload["requested_root_count"], 87)
+        self.assertEqual(len(payload["roots"]), 87)
+
     def test_partial_bundle_cannot_register_provider(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             manifest = _admission_fixture(Path(temporary), complete=False)
@@ -161,6 +173,63 @@ class LinearResponseAdmissionTests(unittest.TestCase):
         forged["evidence_receipt"]["produced_count"] = 552
         with self.assertRaisesRegex(ValueError, "evidence|identity|553"):
             LinearResponseAdmissionPackage.from_mapping(forged)
+
+    def test_cli_validates_admits_exports_and_runs_cold_then_warm(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            _admission_fixture(directory, complete=True)
+
+            def invoke(*arguments: str) -> subprocess.CompletedProcess[str]:
+                return subprocess.run(
+                    [sys.executable, "-m", "windows_solver", *arguments],
+                    cwd=directory,
+                    env={"PYTHONPATH": str(root / "src")},
+                    text=True,
+                    capture_output=True,
+                )
+
+            validated = invoke("m02-validate", "admission-input.json")
+            self.assertEqual(validated.returncode, 0, validated.stderr)
+            self.assertFalse(json.loads(validated.stdout)["release_admissible"])
+
+            admitted = invoke(
+                "m02-admit", "admission-input.json", "--output", "admitted.json"
+            )
+            self.assertEqual(admitted.returncode, 0, admitted.stderr)
+            self.assertTrue(json.loads(admitted.stdout)["release_admissible"])
+            package = LinearResponseAdmissionPackage.from_mapping(
+                json.loads((directory / "admitted.json").read_text(encoding="utf-8"))
+            )
+
+            exported = invoke(
+                "m02-export", "admitted.json", "--output", "exported.json"
+            )
+            self.assertEqual(exported.returncode, 0, exported.stderr)
+            self.assertEqual(
+                (directory / "exported.json").read_bytes(),
+                canonical_json_bytes(package.to_mapping()),
+            )
+
+            planned = invoke(
+                "plan", "request.json",
+                "--linear-response-admission", "admitted.json",
+            )
+            self.assertEqual(planned.returncode, 0, planned.stderr)
+            self.assertEqual(json.loads(planned.stdout)["unavailable_capabilities"], [])
+
+            first = invoke(
+                "run", "request.json", "--store", "store",
+                "--linear-response-admission", "admitted.json",
+            )
+            second = invoke(
+                "run", "request.json", "--store", "store",
+                "--linear-response-admission", "admitted.json",
+            )
+            self.assertEqual(first.returncode, 0, first.stderr)
+            self.assertEqual(second.returncode, 0, second.stderr)
+            self.assertEqual(json.loads(first.stdout)["provider_execution_count"], 3)
+            self.assertEqual(json.loads(second.stdout)["cache_hit_count"], 3)
 
 
 if __name__ == "__main__":

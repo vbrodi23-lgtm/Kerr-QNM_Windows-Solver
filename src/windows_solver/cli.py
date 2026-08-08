@@ -18,6 +18,12 @@ from .builtin import default_registry
 from .contracts import canonical_json_bytes, load_study
 from .engine import ExecutionEngine, RunRecord, verify_run_integrity
 from .evidence_intake import load_evidence_bundle
+from .linear_response_admission import (
+    AdmittedLinearResponseProvider,
+    LinearResponseAdmissionPackage,
+    admit_linear_response_bundle,
+    load_linear_response_admission,
+)
 from .planner import build_plan
 from .providers import ProviderUnavailableError
 from .response_engine import (
@@ -62,10 +68,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     plan = commands.add_parser("plan", help="show the requested dependency closure")
     plan.add_argument("study", type=Path)
+    plan.add_argument("--linear-response-admission", type=Path)
 
     run = commands.add_parser("run", help="execute one requested dependency closure")
     run.add_argument("study", type=Path)
     run.add_argument("--store", type=Path, default=Path(".solver-store"))
+    run.add_argument("--linear-response-admission", type=Path)
 
     verify = commands.add_parser("verify", help="verify one run and its artifacts")
     verify.add_argument("run_id")
@@ -130,6 +138,20 @@ def build_parser() -> argparse.ArgumentParser:
     commands.add_parser(
         "campaign-smoke", help="run exactly ten predeclared orchestration cases"
     )
+    m02_validate = commands.add_parser(
+        "m02-validate", help="validate one complete M02 admission input"
+    )
+    m02_validate.add_argument("manifest", type=Path)
+    m02_admit = commands.add_parser(
+        "m02-admit", help="seal one complete M02 admission package"
+    )
+    m02_admit.add_argument("manifest", type=Path)
+    m02_admit.add_argument("--output", type=Path, required=True)
+    m02_export = commands.add_parser(
+        "m02-export", help="revalidate and export an admitted M02 package"
+    )
+    m02_export.add_argument("admission", type=Path)
+    m02_export.add_argument("--output", type=Path, required=True)
     return parser
 
 
@@ -174,10 +196,19 @@ def _atomic_export(path: Path, value: object) -> None:
         raise
 
 
-def _plan(study_path: Path) -> tuple[int, object]:
+def _runtime_registry(admission_path: Path | None):
+    if admission_path is None:
+        return default_registry()
+    package = load_linear_response_admission(admission_path)
+    return default_registry(AdmittedLinearResponseProvider(package))
+
+
+def _plan(
+    study_path: Path, admission_path: Path | None = None
+) -> tuple[int, object]:
     request = load_study(study_path)
     plan = build_plan(request.target)
-    registry = default_registry()
+    registry = _runtime_registry(admission_path)
     unavailable: list[str] = []
     providers: list[dict[str, object]] = []
     for capability in plan.capabilities:
@@ -195,9 +226,15 @@ def _plan(study_path: Path) -> tuple[int, object]:
     }
 
 
-def _run(study_path: Path, store_path: Path) -> tuple[int, object]:
+def _run(
+    study_path: Path,
+    store_path: Path,
+    admission_path: Path | None = None,
+) -> tuple[int, object]:
     request = load_study(study_path)
-    record = ExecutionEngine(ArtifactStore(store_path), default_registry()).run(request)
+    record = ExecutionEngine(
+        ArtifactStore(store_path), _runtime_registry(admission_path)
+    ).run(request)
     if record.unavailable_capability is not None:
         return 3, record.to_mapping()
     return (0 if record.status == "SUCCEEDED" else 1), record.to_mapping()
@@ -703,13 +740,72 @@ def _campaign_reduce(bundle_path: Path, output: Path) -> tuple[int, object]:
     return 0, {"command": "campaign-reduce", **output_mapping}
 
 
+def _m02_summary(
+    command: str,
+    package: LinearResponseAdmissionPackage,
+    *,
+    release_admissible: bool,
+    output: Path | None = None,
+) -> dict[str, object]:
+    summary: dict[str, object] = {
+        "command": command,
+        "admission_id": package.admission_id,
+        "produced_leaf_count": package.evidence_receipt["produced_count"],
+        "missing_leaf_count": package.evidence_receipt["missing_count"],
+        "unresolved_leaf_count": len(
+            package.evidence_receipt["unresolved_leaf_ids"]
+        ),
+        "projective_row_count": package.reduction_receipt["row_count"],
+        "scientific_claims_admitted": False,
+        "release_admissible": release_admissible,
+    }
+    if output is not None:
+        summary["output"] = str(output)
+    return summary
+
+
+def _m02_validate(manifest: Path) -> tuple[int, object]:
+    package = admit_linear_response_bundle(manifest)
+    return 0, _m02_summary(
+        "m02-validate", package, release_admissible=False
+    )
+
+
+def _m02_admit(manifest: Path, output: Path) -> tuple[int, object]:
+    package = admit_linear_response_bundle(manifest)
+    resolved_output = resolve_campaign_relative_path(Path.cwd(), str(output))
+    if resolved_output.exists():
+        raise ValueError("M02 admission refuses an existing output")
+    _atomic_export(resolved_output, package.to_mapping())
+    return 0, _m02_summary(
+        "m02-admit", package, release_admissible=True, output=resolved_output
+    )
+
+
+def _m02_export(admission: Path, output: Path) -> tuple[int, object]:
+    package = load_linear_response_admission(admission)
+    resolved_output = resolve_campaign_relative_path(Path.cwd(), str(output))
+    if resolved_output.exists():
+        raise ValueError("M02 export refuses an existing output")
+    _atomic_export(resolved_output, package.to_mapping())
+    return 0, _m02_summary(
+        "m02-export", package, release_admissible=True, output=resolved_output
+    )
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     try:
         arguments = build_parser().parse_args(argv)
         if arguments.command == "plan":
-            status, output = _plan(arguments.study)
+            status, output = _plan(
+                arguments.study, arguments.linear_response_admission
+            )
         elif arguments.command == "run":
-            status, output = _run(arguments.study, arguments.store)
+            status, output = _run(
+                arguments.study,
+                arguments.store,
+                arguments.linear_response_admission,
+            )
         elif arguments.command == "verify":
             status, output = _verify(
                 arguments.run_id, arguments.store, arguments.profile
@@ -748,6 +844,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "command": "campaign-smoke",
                 **run_predeclared_campaign_smoke().to_mapping(),
             }
+        elif arguments.command == "m02-validate":
+            status, output = _m02_validate(arguments.manifest)
+        elif arguments.command == "m02-admit":
+            status, output = _m02_admit(arguments.manifest, arguments.output)
+        elif arguments.command == "m02-export":
+            status, output = _m02_export(arguments.admission, arguments.output)
         else:
             raise ValueError(f"unknown command: {arguments.command}")
     except ArtifactVerificationError as error:

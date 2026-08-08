@@ -15,8 +15,8 @@ _MAX_STUDY_BYTES = 4 * 1024 * 1024
 _MAX_JSON_DEPTH = 64
 
 
-def canonical_text_sha256(value: bytes) -> str:
-    """Hash UTF-8 source text independently of checkout line endings."""
+def canonical_text_bytes(value: bytes) -> bytes:
+    """Normalize UTF-8 source text independently of checkout line endings."""
 
     if not isinstance(value, bytes):
         raise ValueError("canonical text must be bytes")
@@ -25,7 +25,13 @@ def canonical_text_sha256(value: bytes) -> str:
         normalized.decode("utf-8")
     except UnicodeDecodeError as error:
         raise ValueError("canonical text must be UTF-8") from error
-    return hashlib.sha256(normalized).hexdigest()
+    return normalized
+
+
+def canonical_text_sha256(value: bytes) -> str:
+    """Hash UTF-8 source text independently of checkout line endings."""
+
+    return hashlib.sha256(canonical_text_bytes(value)).hexdigest()
 
 
 class Capability(str, Enum):
@@ -372,6 +378,45 @@ class StudyRequest:
             for key, value in self.numerical_policy.items()
             if key not in capability_names or key == capability.value
         }
+        if capability is Capability.SPECTRAL_CORE:
+            linear_policy = self.numerical_policy.get(
+                Capability.LINEAR_RESPONSE.value
+            )
+            if isinstance(linear_policy, Mapping) and (
+                "role_scoped_leaves" in linear_policy
+            ):
+                raw_leaves = linear_policy["role_scoped_leaves"]
+                if not isinstance(raw_leaves, list) or not raw_leaves:
+                    raise ValueError(
+                        "role-scoped linear response requires spectral selections"
+                    )
+                pairs: list[dict[str, object]] = []
+                seen: set[bytes] = set()
+                for leaf in raw_leaves:
+                    if not isinstance(leaf, Mapping):
+                        raise ValueError("role-scoped leaf must be an object")
+                    mode = leaf.get("mode")
+                    coordinate = leaf.get("sampling_coordinate")
+                    if not isinstance(mode, Mapping) or not isinstance(
+                        coordinate, Mapping
+                    ):
+                        raise ValueError(
+                            "role-scoped leaf lacks a spectral selection"
+                        )
+                    spin_hex = coordinate.get("spin_binary64_hex")
+                    if not isinstance(spin_hex, str):
+                        raise ValueError(
+                            "role-scoped leaf spin identity is invalid"
+                        )
+                    pair = {
+                        "mode": dict(mode),
+                        "spin_binary64_hex": spin_hex,
+                    }
+                    identity = canonical_json_bytes(pair)
+                    if identity not in seen:
+                        seen.add(identity)
+                        pairs.append(pair)
+                scoped_policy["exact-spectral-selection"] = {"pairs": pairs}
         mapping = self.to_mapping()
         mapping["target"] = capability.value
         mapping["numerical_policy"] = scoped_policy
