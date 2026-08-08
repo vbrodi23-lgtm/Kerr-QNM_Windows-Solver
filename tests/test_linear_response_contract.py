@@ -4,11 +4,25 @@ from copy import deepcopy
 from fractions import Fraction
 import json
 from pathlib import Path
+import tempfile
 import unittest
 
-from windows_solver.artifacts import ArtifactVerificationError
+from windows_solver.artifacts import (
+    ArtifactEnvelope,
+    ArtifactStore,
+    ArtifactVerificationError,
+)
 from windows_solver.builtin import default_registry
-from windows_solver.contracts import Capability, ModeKey, StudyRequest
+from windows_solver.contracts import (
+    Capability,
+    CarrierState,
+    EvidenceState,
+    ExecutionState,
+    ModeKey,
+    NumericalState,
+    ScientificState,
+    StudyRequest,
+)
 from windows_solver.linear_response import (
     B_PRIME_RELEASE_DOMAIN,
     LINEAR_RESPONSE_DESCRIPTOR,
@@ -557,6 +571,10 @@ class LinearResponseContractTests(unittest.TestCase):
                 self.assertEqual(spin, expected_spin)
                 self.assertEqual(spin.hex(), expected_hex)
 
+        self.assertEqual(spin_from_dimensionless_surface_gravity(0.25), 0.0)
+        with self.assertRaisesRegex(ValueError, "0.25"):
+            spin_from_dimensionless_surface_gravity(0.2500000001)
+
         kappa = 0.01
         spin = spin_from_dimensionless_surface_gravity(kappa)
         exact_spin = Fraction(str(spin))
@@ -661,6 +679,35 @@ class LinearResponseContractTests(unittest.TestCase):
             payload,
         )
 
+    def test_stored_linear_response_payload_revalidates_after_freeze_and_load(self) -> None:
+        request = example_request()
+        provider = LINEAR_RESPONSE_DESCRIPTOR.to_mapping()
+        envelope = ArtifactEnvelope(
+            schema_version=1,
+            artifact_type=LINEAR_RESPONSE_OUTPUT_ARTIFACT_TYPE,
+            capability=Capability.LINEAR_RESPONSE,
+            provider=provider,
+            request=request.to_mapping(),
+            upstream_artifact_ids=(),
+            payload=valid_payload(request),
+            evidence=EvidenceState(
+                carrier=CarrierState.VALID,
+                execution=ExecutionState.SUCCEEDED,
+                numerical=NumericalState.ACCEPTED,
+                scientific=ScientificState.NOT_EVALUATED,
+            ),
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            store = ArtifactStore(temporary)
+            loaded = store.load_artifact(store.put_artifact(envelope))
+            validate_provider_payload(
+                loaded.capability,
+                loaded.artifact_type,
+                loaded.provider,
+                request,
+                loaded.payload,
+            )
+
     def test_dispatch_rejects_wrong_provider_and_output_type(self) -> None:
         request = example_request()
         payload = valid_payload(request)
@@ -716,6 +763,15 @@ class LinearResponseContractTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "finite"):
             validate_linear_response_payload(request, provider, payload)
+
+    def test_branch_class_type_error_uses_declared_value_error_boundary(self) -> None:
+        request = example_request()
+        payload = valid_payload(request)
+        payload["response_components"][0]["branch_class"] = ["damped"]
+        with self.assertRaisesRegex(ValueError, "branch_class"):
+            validate_linear_response_payload(
+                request, LINEAR_RESPONSE_DESCRIPTOR.to_mapping(), payload
+            )
 
     def test_spin_identity_must_match_spectral_coordinate_representation(self) -> None:
         request = example_request()
@@ -797,6 +853,22 @@ class LinearResponseContractTests(unittest.TestCase):
                 payload,
             )
 
+    def test_rank_deficient_outer_product_covariance_is_valid_psd(self) -> None:
+        request = example_request()
+        payload = valid_payload(request)
+        vector = (-3.1812657685587836e-10, 5.7100781472823224e-11)
+        matrix = [
+            [vector[row] * vector[column] for column in range(2)]
+            for row in range(2)
+        ]
+        payload["response_components"][0]["result"]["local_covariance"][
+            "matrix"
+        ] = deepcopy(matrix)
+        payload["covariance_blocks"][0]["matrix"] = deepcopy(matrix)
+        validate_linear_response_payload(
+            request, LINEAR_RESPONSE_DESCRIPTOR.to_mapping(), payload
+        )
+
     def test_payload_rejects_disk_not_centred_on_response(self) -> None:
         request = example_request()
         payload = valid_payload(request)
@@ -843,6 +915,36 @@ class LinearResponseContractTests(unittest.TestCase):
                 request,
                 LINEAR_RESPONSE_DESCRIPTOR.to_mapping(),
                 payload,
+            )
+
+    def test_rejected_component_is_listed_as_unresolved_and_not_admissible(self) -> None:
+        request = example_request()
+        payload = valid_payload(request)
+        component = payload["response_components"][0]
+        component["numerical_state"] = "REJECTED"
+        component["result"] = {
+            "centre": None,
+            "local_covariance": None,
+            "uncertainty_disk": None,
+            "reason": "numerical acceptance gate rejected the attempted result",
+        }
+        leaf_id = component["component_id"]
+        payload["covariance_blocks"] = []
+        payload["completeness"]["unresolved_leaf_count"] = 1
+        payload["completeness"]["unresolved_leaf_ids"] = [leaf_id]
+        validate_linear_response_payload(
+            request, LINEAR_RESPONSE_DESCRIPTOR.to_mapping(), payload
+        )
+        with self.assertRaisesRegex(ValueError, "ACCEPTED or UNRESOLVED"):
+            validate_linear_response_admission(
+                request, LINEAR_RESPONSE_DESCRIPTOR.to_mapping(), payload
+            )
+
+        payload["completeness"]["unresolved_leaf_count"] = 0
+        payload["completeness"]["unresolved_leaf_ids"] = []
+        with self.assertRaisesRegex(ValueError, "unresolved leaf IDs"):
+            validate_linear_response_payload(
+                request, LINEAR_RESPONSE_DESCRIPTOR.to_mapping(), payload
             )
 
     def test_missing_computation_is_distinct_and_blocks_admission(self) -> None:

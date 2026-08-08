@@ -38,7 +38,7 @@ scientific claim, and the default linear-response provider remains unavailable.
 ## Verification
 
 - Fresh local full suite:
-  `PYTHONPATH=src python -m unittest discover -s tests -v` — 216/216 passed.
+  `PYTHONPATH=src python -m unittest discover -s tests -v` — 220/220 passed.
 - Focused forged-checkpoint and stale-projective-row regressions passed.
 - Cross-platform identity and provider regression suite passed.
 - Predecessor GitHub Actions run `31247921080`, head
@@ -85,6 +85,11 @@ scientific claim, and the default linear-response provider remains unavailable.
   centres and ordered signed channels are derived from the corresponding
   authenticated checkpoint record, and all 174 payload comparisons are bound
   exactly to the sealed reduction rows and empirical-Gram identities.
+- Final validation review added a real store/load/frozen-payload round trip,
+  classifies `REJECTED` empty results in the unresolved ledger while retaining
+  the admission ban, accepts rank-deficient PSD outer-product covariance within
+  scale-aware roundoff, admits the exact Kerr `M-kappa=0.25` boundary, and
+  preserves the public `ValueError` boundary for malformed branch classes.
 
 ## Commit SHA(s)
 

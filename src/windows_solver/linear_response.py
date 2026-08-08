@@ -211,13 +211,13 @@ def spin_from_dimensionless_surface_gravity(value: float) -> float:
         "dimensionless surface gravity",
         strictly_positive=True,
     )
-    if kappa >= 0.5:
-        raise ValueError("dimensionless surface gravity must be below 0.5")
+    if kappa > 0.25:
+        raise ValueError("dimensionless surface gravity must not exceed 0.25")
     horizon_gap = 2.0 * kappa / (1.0 - 2.0 * kappa)
     radicand = 1.0 - horizon_gap * horizon_gap
-    if radicand <= 0.0:
+    if radicand < 0.0:
         raise ValueError("dimensionless surface gravity has no prograde Kerr spin")
-    return math.sqrt(radicand)
+    return math.sqrt(max(0.0, radicand))
 
 
 @dataclass(frozen=True, slots=True)
@@ -1041,30 +1041,46 @@ def _validate_real_symmetric_psd_matrix(
                 for column_index, item in enumerate(row)
             ]
         )
+    def roundoff_tolerance(*values: float) -> float:
+        scale = max((abs(item) for item in values), default=0.0)
+        if scale == 0.0:
+            return 0.0
+        return max(
+            1.0e-14 * scale,
+            128.0 * dimension * math.ulp(scale),
+        )
+
     for row in range(dimension):
-        if matrix[row][row] < 0.0:
+        if matrix[row][row] < -roundoff_tolerance(matrix[row][row]):
             raise ValueError(f"{subject} matrix must be positive semidefinite")
         for column in range(row):
             if matrix[row][column] != matrix[column][row]:
                 raise ValueError(f"{subject} matrix must be symmetric")
     lower = [[0.0 for _ in range(dimension)] for _ in range(dimension)]
     for column in range(dimension):
-        diagonal = matrix[column][column] - sum(
+        square_sum = sum(
             lower[column][item] * lower[column][item]
             for item in range(column)
         )
-        if diagonal < 0.0:
+        diagonal = matrix[column][column] - square_sum
+        diagonal_tolerance = roundoff_tolerance(
+            matrix[column][column], square_sum
+        )
+        if diagonal < -diagonal_tolerance:
             raise ValueError(f"{subject} matrix must be positive semidefinite")
-        pivot = math.sqrt(diagonal)
+        pivot = math.sqrt(diagonal) if diagonal > diagonal_tolerance else 0.0
         lower[column][column] = pivot
         for row in range(column + 1, dimension):
-            residual = matrix[row][column] - sum(
+            product_sum = sum(
                 lower[row][item] * lower[column][item]
                 for item in range(column)
             )
+            residual = matrix[row][column] - product_sum
             if pivot > 0.0:
                 lower[row][column] = residual / pivot
-            elif residual != 0.0:
+            elif abs(residual) > roundoff_tolerance(
+                matrix[row][column], product_sum
+            ):
                 raise ValueError(
                     f"{subject} matrix must be positive semidefinite"
                 )
@@ -1081,7 +1097,7 @@ def _validate_covariance(
         frozenset({"basis", "matrix", "representation", "kind"}),
         subject,
     )
-    if mapping["basis"] != ["real", "imaginary"]:
+    if _array(mapping["basis"], f"{subject} basis") != ["real", "imaginary"]:
         raise ValueError(f"{subject} basis must be ['real', 'imaginary']")
     if mapping["representation"] != "real-block-covariance":
         raise ValueError(f"{subject} representation is invalid")
@@ -1163,7 +1179,8 @@ def _validate_component(
         or root_reference_id != baseline_root_reference_id(mode, spin)
     ):
         raise ValueError("component baseline root reference is invalid")
-    if component["branch_class"] not in _BRANCH_CLASSES:
+    branch_class = _string(component["branch_class"], "component branch_class")
+    if branch_class not in _BRANCH_CLASSES:
         raise ValueError("component branch_class is invalid")
     try:
         numerical_state = NumericalState(component["numerical_state"])
@@ -1479,7 +1496,7 @@ def _validate_completeness(
     expected_unresolved = {
         item.component_id
         for item in components.values()
-        if item.numerical_state is NumericalState.UNRESOLVED
+        if item.numerical_state in _EMPTY_RESULT_NUMERICAL_STATES
     }
     if set(unresolved) != expected_unresolved:
         raise ValueError("unresolved leaf IDs do not match component states")
