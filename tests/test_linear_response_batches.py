@@ -13,11 +13,14 @@ from unittest.mock import patch
 from windows_solver.contracts import canonical_json_bytes
 from windows_solver.linear_response import B_PRIME_RELEASE_DOMAIN
 from windows_solver.response_batches import (
+    CAMPAIGN_SCHEMA_VERSION,
+    CampaignStageRecord,
     PrecisionCapabilities,
     PrecisionFactoryIdentity,
     StageOutcome,
     build_campaign_plan,
     build_campaign_selection,
+    synthetic_stage_signed_error_channels,
     merge_campaign_checkpoints,
     resolve_campaign_relative_path,
     run_campaign_selection,
@@ -46,7 +49,72 @@ def reseal_campaign_checkpoint(value):
     ).hexdigest()
 
 
+def _synthetic_stage_outcome(**values):
+    component_result = values["component_result"]
+    radius = values["local_disk_radius_abs"]
+    return StageOutcome(
+        **values,
+        signed_error_channels=synthetic_stage_signed_error_channels(
+            component_result, radius
+        ),
+    )
+
+
 class CampaignPlanTests(unittest.TestCase):
+    def test_stage_digest_owns_complete_signed_channels_and_v1_is_stale(self) -> None:
+        """Catches caller-injected or undigested signed numerical evidence."""
+
+        families = (
+            "signed-root", "centred-step-amplitude", "refinement-holdout",
+            "truncation", "resolution-angular-refinement",
+            "continuation-seed-path", "repeat-polish",
+            "precision-ladder-discrepancy",
+        )
+        component_result = {"leaf_id": "leaf-1"}
+        component_sha256 = hashlib.sha256(
+            canonical_json_bytes(component_result)
+        ).hexdigest()
+        channels = tuple({
+            "channel_id": f"local:leaf-1:{family}",
+            "family": family,
+            "shared_group": "leaf-1",
+            "provenance": {
+                "source_kind": "synthetic-test-stage",
+                "source_id": family,
+                "source_sha256": component_sha256,
+                "derivation": "literal-signed-contract",
+            },
+            "units": "synthetic-dimensionless-response",
+            "signed_delta": {"real": 1.0e-8, "imaginary": 0.0},
+            "scope": "local",
+        } for family in families)
+        outcome = StageOutcome(
+            digits=64,
+            numerical_state="CONVERGED",
+            component_result=component_result,
+            local_disk_radius_abs=8.0e-8,
+            signed_error_channels=channels,
+        )
+        record = CampaignStageRecord(outcome, {
+            "precision_factory_identity": {
+                "factory": "fixture:create_backend", "module_sha256": "b" * 64,
+            },
+            "available_precision_digits": [64],
+        })
+
+        self.assertEqual(CAMPAIGN_SCHEMA_VERSION, 2)
+        self.assertEqual(record.to_mapping()["signed_error_channels"], list(channels))
+        forged = record.to_mapping()
+        injected = dict(forged["signed_error_channels"][0])
+        injected["channel_id"] = "local:leaf-1:injected-signed-root"
+        injected["signed_delta"] = {"real": 0.0, "imaginary": 0.0}
+        forged["signed_error_channels"].append(injected)
+        forged["stage_sha256"] = hashlib.sha256(canonical_json_bytes({
+            key: value for key, value in forged.items() if key != "stage_sha256"
+        })).hexdigest()
+        with self.assertRaisesRegex(ValueError, "signed|disk"):
+            CampaignStageRecord.from_mapping(forged)
+
     def test_plan_is_the_exact_ordered_553_leaf_contract(self) -> None:
         """Catches Cartesian completion, dropped roles, or reordered B-prime leaves."""
 
@@ -119,7 +187,7 @@ class CampaignPlanTests(unittest.TestCase):
                 if self.fail_after is not None and len(self.calls) >= self.fail_after:
                     raise RuntimeError("synthetic interruption")
                 self.calls.append((leaf.leaf_id, digits))
-                return StageOutcome(
+                return _synthetic_stage_outcome(
                     digits=digits,
                     numerical_state="CONVERGED",
                     component_result={
@@ -180,7 +248,7 @@ class CampaignPlanTests(unittest.TestCase):
             precision_capabilities = plan.precision_capabilities
 
             def execute_stage(self, leaf, digits):
-                return StageOutcome(
+                return _synthetic_stage_outcome(
                     digits=digits,
                     numerical_state="CONVERGED",
                     component_result={
@@ -230,7 +298,7 @@ class CampaignPlanTests(unittest.TestCase):
 
             def execute_stage(self, leaf, digits):
                 self.calls.append((leaf.leaf_id, digits))
-                return StageOutcome(
+                return _synthetic_stage_outcome(
                     digits=digits,
                     numerical_state="CONVERGED",
                     component_result={"leaf_id": leaf.leaf_id, "value": 1},
@@ -257,18 +325,12 @@ class CampaignPlanTests(unittest.TestCase):
             forged = json.loads(paths[0].read_text(encoding="utf-8"))
             stage = forged["records"][0]["stages"][0]
             stage["component_result"]["value"] = 2
-            content = {key: value for key, value in stage.items() if key != "stage_sha256"}
-            stage["stage_sha256"] = hashlib.sha256(canonical_json_bytes(content)).hexdigest()
-            record = forged["records"][0]
-            record_content = {
-                key: value for key, value in record.items() if key != "record_sha256"
-            }
-            record["record_sha256"] = hashlib.sha256(
-                canonical_json_bytes(record_content)
+            component_sha256 = hashlib.sha256(
+                canonical_json_bytes(stage["component_result"])
             ).hexdigest()
-            forged["records_sha256"] = hashlib.sha256(
-                canonical_json_bytes(forged["records"])
-            ).hexdigest()
+            for channel in stage["signed_error_channels"]:
+                channel["provenance"]["source_sha256"] = component_sha256
+            reseal_campaign_checkpoint(forged)
             disagree = directory / "disagree.json"
             disagree.write_bytes(canonical_json_bytes(forged))
             with self.assertRaisesRegex(ValueError, "overlap disagrees"):
@@ -299,7 +361,7 @@ class CampaignPlanTests(unittest.TestCase):
             precision_capabilities = plan.precision_capabilities
 
             def execute_stage(self, leaf, digits):
-                return StageOutcome(
+                return _synthetic_stage_outcome(
                     digits=digits,
                     numerical_state="CONVERGED",
                     component_result={"leaf_id": leaf.leaf_id},
@@ -378,7 +440,7 @@ class CampaignPlanTests(unittest.TestCase):
                 precision_capabilities = plan.precision_capabilities
 
                 def execute_stage(self, leaf, digits):
-                    return StageOutcome(
+                    return _synthetic_stage_outcome(
                         digits=digits,
                         numerical_state="CONVERGED",
                         component_result={"leaf_id": leaf.leaf_id},
@@ -520,7 +582,7 @@ class CampaignPlanTests(unittest.TestCase):
                 precision_capabilities = PrecisionCapabilities((64,))
 
                 def execute_stage(self, leaf, digits):
-                    return StageOutcome(
+                    return _synthetic_stage_outcome(
                         digits=64,
                         numerical_state="CONVERGED",
                         component_result={
@@ -608,7 +670,7 @@ class CampaignPlanTests(unittest.TestCase):
             precision_capabilities = plan.precision_capabilities
 
             def execute_stage(self, selected, digits):
-                return StageOutcome(
+                return _synthetic_stage_outcome(
                     digits=64,
                     numerical_state="CONVERGED",
                     component_result={"leaf_id": selected.leaf_id},

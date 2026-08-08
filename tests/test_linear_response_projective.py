@@ -20,12 +20,14 @@ from windows_solver.response_batches import (
 )
 from windows_solver.response_engine import NumericalPolicy, VettedNativeDeterminantKernel
 from windows_solver.response_reduction import (
+    CampaignReductionSummary,
     EMPIRICAL_GRAM_KIND,
     ComputedUnresolvedComponentEvidence,
     ResolvedComponentEvidence,
     SignedErrorContribution,
     build_projective_row_plans,
     reduce_projective_row,
+    reduce_projective_rows,
 )
 
 
@@ -131,6 +133,71 @@ class ProjectiveRowPlanTests(unittest.TestCase):
         self.assertEqual(result.scientific_state, "CONTRADICTED")
         self.assertGreater(result.bounded_angle_interval_radians[0], 1.0e-2)
         self.assertIsNotNone(result.empirical_gram_id)
+
+    def test_summary_owns_complete_recomputable_empirical_gram(self) -> None:
+        """Catches omitted Gram evidence and resealed numeric/metadata tamper."""
+
+        plan = build_projective_row_plans()[0]
+        components = self.resolved_components(
+            plan,
+            (1.0 + 0.0j, 2.0 + 0.0j, 3.0 + 0.0j),
+            (1.0 + 0.0j, 2.5 + 0.0j, 4.0 + 0.0j),
+            family="continuation-seed-path",
+            shared_group="summary-gram-root",
+        )
+        summary = reduce_projective_rows(
+            "campaign-summary-gram",
+            (plan.row_id,),
+            components,
+            source_hashes=("sha256:" + "6" * 64,),
+        )
+        mapping = summary.to_mapping()
+        gram = mapping["empirical_grams"][0]
+        self.assertEqual(gram["construction_id"], summary.results[0].empirical_gram_id)
+        self.assertEqual(
+            set(gram),
+            {
+                "kind", "basis", "channel_ids", "channel_families", "columns",
+                "matrix", "units", "local_marginals", "local_disks",
+                "construction_id", "source_hashes",
+            },
+        )
+        self.assertEqual(len(gram["local_marginals"]), 6)
+        self.assertEqual(CampaignReductionSummary.from_mapping(mapping), summary)
+
+        for name, mutate in (
+            ("column", lambda item: item["columns"][0].__setitem__(0, 9.0)),
+            ("matrix", lambda item: item["matrix"][0].__setitem__(0, 9.0)),
+            (
+                "marginal",
+                lambda item: item["local_marginals"][
+                    plan.left_component_ids[0]
+                ][0].__setitem__(0, 9.0),
+            ),
+        ):
+            forged = json.loads(json.dumps(mapping))
+            forged_gram = forged["empirical_grams"][0]
+            mutate(forged_gram)
+            gram_material = {
+                key: value
+                for key, value in forged_gram.items()
+                if key != "construction_id"
+            }
+            forged_gram["construction_id"] = "empirical-error-gram-" + hashlib.sha256(
+                canonical_json_bytes(gram_material)
+            ).hexdigest()
+            summary_material = {
+                key: value
+                for key, value in forged.items()
+                if key not in {"reduction_id", "release_admissible"}
+            }
+            forged["reduction_id"] = "b-prime-reduction-" + hashlib.sha256(
+                canonical_json_bytes(summary_material)
+            ).hexdigest()
+            with self.subTest(name=name), self.assertRaisesRegex(
+                ValueError, "Gram|gram|marginal|recomput"
+            ):
+                CampaignReductionSummary.from_mapping(forged)
 
     def test_primary_middle_correlated_refinement_reduces_to_equivalent(self) -> None:
         plan = next(

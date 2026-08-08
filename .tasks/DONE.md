@@ -1,53 +1,5 @@
 # Done
 
-## TASK-010: Build the empirical uncertainty and projective-reduction pipeline
-**Priority:** P1 | **Tags:** M02, evidence, physics, tooling
-**Assignee:** Codex | **Estimate:** 1–2 days | **Milestone:** M02
-
-### Objective
-
-Build deterministic uncertainty propagation and projective reduction that operates on user-supplied complete evidence, while validating the algorithms with synthetic and representative smoke inputs.
-
-### Acceptance Criteria
-
-- [x] Propagate signed-root, centred-step, refinement, continuation-path, and precision-ladder channels through the response/Richardson algebra.
-- [x] Construct PSD component and cross-component empirical error Gram matrices from shared signed channels without statistical-covariance claims.
-- [x] Compute the frozen 162 primary and 12 deep projective row schemas only when aligned inputs exist; partial smoke inputs return an explicit incomplete state, never a scientific classification.
-- [x] Smoke-test head/tail/risk reductions, zero-containing calibrations, non-PSD rejection, unresolved propagation, and available independent holdouts.
-- [x] Accept the complete external 553-leaf bundle later without code or threshold changes.
-
-### Dependencies
-
-- **Blocked by:** TASK-009
-- **Blocks:** TASK-011
-
-### Evidence Output
-
-Reusable signed-channel and empirical-Gram schema, exact 174-row planner,
-partial-honest projective reducer, exactly six synthetic/representative smoke
-cases, zero-backend `campaign-reduce` command, and PowerShell handoff.
-
-### Verification
-
-- `PYTHONPATH=src python -m unittest tests.test_linear_response_uncertainty tests.test_linear_response_projective tests.test_linear_response_contract -v` — 32 passed.
-- `PYTHONPATH=src python -m unittest discover -s tests -v` — 203 passed.
-- `python .tasks/validate_board.py`, `python -m compileall -q src tools tests`, and `git diff --check` — passed.
-- **Evidence ceiling:** Exact 174 plans only; exactly six synthetic/representative reductions; no determinant/cache/campaign, populated atlas, complete 553-leaf evidence, scientific admission, or provider availability.
-- **Change reference:** implementation `b9b952c3409146ab695df082662a13a922f6e03e`.
-
-### Review Focus
-
-Check signed coefficients, shared-root correlation, PSD marginals, deterministic terminology, partial-state honesty, and outcome-neutral thresholds.
-
-### Plan
-
-- Froze the signed-channel schema, exact outer-product Gram, conservative disks, and strict tamper validation under focused red/green tests.
-- Enumerated the exact 162 primary and 12 deep plans without constructing the atlas.
-- Reduced exactly six frozen cases, added the zero-backend authenticated CLI/runbook, and kept incomplete evidence classification-free.
-- Passed the required software gates and selected TASK-011 as sole Next.
-
----
-
 ## TASK-009: Build the complete B′ batch planner and PowerShell production handoff
 **Priority:** P1 | **Tags:** M02, provider, physics, tooling
 **Assignee:** Codex | **Estimate:** 1–2 days | **Milestone:** M02

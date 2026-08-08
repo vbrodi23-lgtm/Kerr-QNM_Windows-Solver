@@ -15,6 +15,7 @@ from windows_solver.response_batches import (
     build_campaign_plan,
     build_campaign_selection,
     run_campaign_selection,
+    synthetic_stage_signed_error_channels,
     validate_campaign_checkpoint,
 )
 from windows_solver.response_engine import NumericalPolicy, VettedNativeDeterminantKernel
@@ -68,6 +69,17 @@ def reseal(value):
     ).hexdigest()
 
 
+def _synthetic_stage_outcome(**values):
+    component_result = values["component_result"]
+    radius = values["local_disk_radius_abs"]
+    return StageOutcome(
+        **values,
+        signed_error_channels=synthetic_stage_signed_error_channels(
+            component_result, radius
+        ),
+    )
+
+
 class DeepPrecisionTests(unittest.TestCase):
     def test_missing_precision_is_partial_and_resumes_with_superset_backend(self) -> None:
         plan = build_campaign_plan(
@@ -89,7 +101,7 @@ class DeepPrecisionTests(unittest.TestCase):
             def execute_stage(self, leaf, digits):
                 self.calls.append((leaf.leaf_id, digits))
                 if digits == 64:
-                    return StageOutcome(
+                    return _synthetic_stage_outcome(
                         digits=64,
                         numerical_state="CONVERGED",
                         component_result={
@@ -102,7 +114,7 @@ class DeepPrecisionTests(unittest.TestCase):
                         local_disk_radius_abs=1.0e-6,
                         deep_diagnostics=diagnostics(),
                     )
-                return StageOutcome(
+                return _synthetic_stage_outcome(
                     digits=80,
                     numerical_state="CONVERGED",
                     component_result={
@@ -152,7 +164,7 @@ class DeepPrecisionTests(unittest.TestCase):
             precision_capabilities = capabilities
 
             def execute_stage(self, leaf, digits):
-                return StageOutcome(
+                return _synthetic_stage_outcome(
                     digits=64,
                     numerical_state="CONVERGED",
                     component_result={
@@ -222,20 +234,20 @@ class DeepPrecisionTests(unittest.TestCase):
                     "local_disk_radius_abs": 1.0e-6,
                 }
                 if digits == 64:
-                    return StageOutcome(
+                    return _synthetic_stage_outcome(
                         **common,
                         deep_diagnostics=diagnostics(
                             digits=8.0 if leaf.leaf_id == PROMOTED_120 else 12.0
                         ),
                     )
                 if digits == 80:
-                    return StageOutcome(
+                    return _synthetic_stage_outcome(
                         **common,
                         self_refinement_enclosed=leaf.leaf_id == SENTINEL,
                         discrepancy_from_previous_abs=1.0e-8,
                         discrepancy_enclosed=leaf.leaf_id == SENTINEL,
                     )
-                return StageOutcome(
+                return _synthetic_stage_outcome(
                     **common,
                     discrepancy_from_previous_abs=1.0e-9,
                     discrepancy_enclosed=True,
@@ -285,7 +297,7 @@ class DeepPrecisionTests(unittest.TestCase):
                 self.with_diagnostics = with_diagnostics
 
             def execute_stage(self, leaf, digits):
-                return StageOutcome(
+                return _synthetic_stage_outcome(
                     digits=digits,
                     numerical_state="NOT_CONVERGED",
                     component_result={"leaf_id": leaf.leaf_id},

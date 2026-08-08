@@ -35,8 +35,18 @@ from .response_engine import (
 from .native_response_kernel import PINNED_GSN_CACHE_SHA256
 
 
-CAMPAIGN_SCHEMA_VERSION = 1
+CAMPAIGN_SCHEMA_VERSION = 2
 _PRECISION_DIGITS = frozenset({64, 80, 120})
+STAGE_SIGNED_ERROR_FAMILIES = (
+    "signed-root",
+    "centred-step-amplitude",
+    "refinement-holdout",
+    "truncation",
+    "resolution-angular-refinement",
+    "continuation-seed-path",
+    "repeat-polish",
+    "precision-ladder-discrepancy",
+)
 PREDECLARED_CAMPAIGN_SMOKE_LEAF_IDS = (
     "b-prime-leaf-9e5777728144433e089f9559b92b6e139e16115a5a53099f40403a45297aa3c3",
     "b-prime-leaf-7ef38d6f95c161d0b4c6650d470898c0742ad6ae8440e89956312344c0db6aac",
@@ -211,11 +221,209 @@ class CampaignLeafPlan:
 
 
 @dataclass(frozen=True, slots=True)
+class StageSignedErrorChannel:
+    """One digest-bound signed numerical-error contribution from a stage."""
+
+    channel_id: str
+    family: str
+    shared_group: str
+    provenance: Mapping[str, object]
+    units: str
+    signed_delta: complex
+    scope: str
+
+    def __post_init__(self) -> None:
+        for name in ("channel_id", "family", "shared_group", "units"):
+            value = getattr(self, name)
+            if not isinstance(value, str) or not value:
+                raise ValueError(f"stage signed channel {name} is invalid")
+        if self.family not in STAGE_SIGNED_ERROR_FAMILIES:
+            raise ValueError("stage signed channel family is invalid")
+        if self.scope not in {"local", "shared"}:
+            raise ValueError("stage signed channel scope is invalid")
+        if not self.channel_id.startswith(f"{self.scope}:"):
+            raise ValueError("stage signed channel ID does not match its scope")
+        value = complex(self.signed_delta)
+        if not math.isfinite(value.real) or not math.isfinite(value.imag):
+            raise ValueError("stage signed channel delta is non-finite")
+        object.__setattr__(self, "signed_delta", value)
+        provenance = self.provenance
+        if not isinstance(provenance, Mapping) or set(provenance) != {
+            "source_kind", "source_id", "source_sha256", "derivation"
+        }:
+            raise ValueError("stage signed channel provenance fields are invalid")
+        if any(
+            not isinstance(provenance[name], str) or not provenance[name]
+            for name in ("source_kind", "source_id", "derivation")
+        ) or (
+            not isinstance(provenance["source_sha256"], str)
+            or re.fullmatch(r"[0-9a-f]{64}", provenance["source_sha256"]) is None
+        ):
+            raise ValueError("stage signed channel provenance is invalid")
+        object.__setattr__(self, "provenance", dict(provenance))
+
+    def to_mapping(self) -> dict[str, object]:
+        return {
+            "channel_id": self.channel_id,
+            "family": self.family,
+            "shared_group": self.shared_group,
+            "provenance": dict(self.provenance),
+            "units": self.units,
+            "signed_delta": {
+                "real": self.signed_delta.real,
+                "imaginary": self.signed_delta.imag,
+            },
+            "scope": self.scope,
+        }
+
+    @classmethod
+    def from_mapping(cls, value: object) -> "StageSignedErrorChannel":
+        if not isinstance(value, Mapping) or set(value) != {
+            "channel_id", "family", "shared_group", "provenance", "units",
+            "signed_delta", "scope",
+        }:
+            raise ValueError("stage signed channel fields are invalid")
+        delta = value["signed_delta"]
+        if not isinstance(delta, Mapping) or set(delta) != {"real", "imaginary"}:
+            raise ValueError("stage signed channel delta fields are invalid")
+        real, imaginary = delta["real"], delta["imaginary"]
+        if (
+            isinstance(real, bool) or isinstance(imaginary, bool)
+            or not isinstance(real, (int, float))
+            or not isinstance(imaginary, (int, float))
+        ):
+            raise ValueError("stage signed channel delta types are invalid")
+        channel = cls(
+            channel_id=value["channel_id"],
+            family=value["family"],
+            shared_group=value["shared_group"],
+            provenance=value["provenance"],
+            units=value["units"],
+            signed_delta=complex(float(real), float(imaginary)),
+            scope=value["scope"],
+        )
+        if channel.to_mapping() != value:
+            raise ValueError("stage signed channel is not canonical")
+        return channel
+
+
+def _validate_stage_signed_error_channels(
+    raw_channels: object,
+    component_result: Mapping[str, object],
+    local_disk_radius_abs: float,
+) -> tuple[Mapping[str, object], ...]:
+    if not isinstance(raw_channels, tuple):
+        raise ValueError("stage signed error channels must be an ordered tuple")
+    channels = tuple(
+        item if isinstance(item, StageSignedErrorChannel)
+        else StageSignedErrorChannel.from_mapping(item)
+        for item in raw_channels
+    )
+    if tuple(item.family for item in channels) != STAGE_SIGNED_ERROR_FAMILIES:
+        raise ValueError("stage signed error channels require the exact family order")
+    if len({item.channel_id for item in channels}) != len(channels):
+        raise ValueError("stage signed error channel IDs contain duplicates")
+    units = {item.units for item in channels}
+    if len(units) != 1:
+        raise ValueError("stage signed error channel units disagree")
+    source_sha256 = _sha256(component_result)
+    if any(
+        item.provenance["source_sha256"] != source_sha256 for item in channels
+    ):
+        raise ValueError("stage signed channel provenance is not component-bound")
+    radius = sum(abs(item.signed_delta) for item in channels)
+    tolerance = max(1.0e-15, local_disk_radius_abs * 1.0e-12)
+    if abs(radius - local_disk_radius_abs) > tolerance:
+        raise ValueError("stage signed channel ledger does not reproduce the local disk")
+    return tuple(item.to_mapping() for item in channels)
+
+
+def explicit_stage_signed_error_channels(
+    component_result: Mapping[str, object],
+    *,
+    family_deltas: Mapping[str, complex],
+    source_kind: str,
+    source_id: str,
+    units: str,
+) -> tuple[Mapping[str, object], ...]:
+    """Build a complete, explicitly signed ledger bound to one stage result."""
+
+    if set(family_deltas) != set(STAGE_SIGNED_ERROR_FAMILIES):
+        raise ValueError("explicit stage ledger requires every signed-error family")
+    source_sha256 = _sha256(component_result)
+    return tuple(
+        StageSignedErrorChannel(
+            channel_id=f"local:{source_id}:{family}",
+            family=family,
+            shared_group=source_id,
+            provenance={
+                "source_kind": source_kind,
+                "source_id": source_id,
+                "source_sha256": source_sha256,
+                "derivation": f"explicit-signed-{family}",
+            },
+            units=units,
+            signed_delta=family_deltas[family],
+            scope="local",
+        ).to_mapping()
+        for family in STAGE_SIGNED_ERROR_FAMILIES
+    )
+
+
+def synthetic_stage_signed_error_channels(
+    component_result: Mapping[str, object],
+    local_disk_radius_abs: float,
+) -> tuple[Mapping[str, object], ...]:
+    """Supply an explicit non-physical ledger for orchestration-only stages."""
+
+    source_id = str(component_result.get("leaf_id", "synthetic-stage"))
+    deltas = {family: 0j for family in STAGE_SIGNED_ERROR_FAMILIES}
+    deltas["refinement-holdout"] = complex(float(local_disk_radius_abs), 0.0)
+    return explicit_stage_signed_error_channels(
+        component_result,
+        family_deltas=deltas,
+        source_kind="synthetic-orchestration-contract",
+        source_id=source_id,
+        units="synthetic-dimensionless-response",
+    )
+
+
+def _component_stage_signed_error_channels(
+    component_result: Mapping[str, object], result: ComponentResult
+) -> tuple[Mapping[str, object], ...]:
+    """Preserve the authenticated component engine's six error channels."""
+
+    source = result.error_channels
+    family_sources = {
+        "signed-root": "signed-root",
+        "centred-step-amplitude": "axis",
+        "refinement-holdout": "amplitude",
+        "truncation": "truncation",
+        "resolution-angular-refinement": "resolution",
+        "continuation-seed-path": "seed-path",
+        "repeat-polish": None,
+        "precision-ladder-discrepancy": None,
+    }
+    deltas = {
+        family: complex(0.0 if channel is None else source[channel], 0.0)
+        for family, channel in family_sources.items()
+    }
+    return explicit_stage_signed_error_channels(
+        component_result,
+        family_deltas=deltas,
+        source_kind="authenticated-component-error-channel",
+        source_id=result.job_id,
+        units="M-delta-omega-per-native-coordinate",
+    )
+
+
+@dataclass(frozen=True, slots=True)
 class StageOutcome:
     digits: int
     numerical_state: str
     component_result: Mapping[str, object]
     local_disk_radius_abs: float
+    signed_error_channels: tuple[Mapping[str, object], ...]
     deep_diagnostics: Mapping[str, object] | None = None
     self_refinement_enclosed: bool | None = None
     discrepancy_from_previous_abs: float | None = None
@@ -230,6 +438,13 @@ class StageOutcome:
         if not math.isfinite(radius) or radius < 0.0:
             raise ValueError("stage local disk radius must be finite and nonnegative")
         object.__setattr__(self, "local_disk_radius_abs", radius)
+        object.__setattr__(
+            self,
+            "signed_error_channels",
+            _validate_stage_signed_error_channels(
+                self.signed_error_channels, self.component_result, radius
+            ),
+        )
         for name in ("discrepancy_from_previous_abs",):
             raw = getattr(self, name)
             if raw is not None:
@@ -248,6 +463,9 @@ class StageOutcome:
             "numerical_state": self.numerical_state,
             "component_result": dict(self.component_result),
             "local_disk_radius_abs": self.local_disk_radius_abs,
+            "signed_error_channels": [
+                dict(item) for item in self.signed_error_channels
+            ],
             "deep_diagnostics": (
                 None if self.deep_diagnostics is None else dict(self.deep_diagnostics)
             ),
@@ -321,6 +539,7 @@ class CampaignStageRecord:
             "numerical_state",
             "component_result",
             "local_disk_radius_abs",
+            "signed_error_channels",
             "deep_diagnostics",
             "self_refinement_enclosed",
             "discrepancy_from_previous_abs",
@@ -335,6 +554,7 @@ class CampaignStageRecord:
             numerical_state=value["numerical_state"],
             component_result=value["component_result"],
             local_disk_radius_abs=value["local_disk_radius_abs"],
+            signed_error_channels=tuple(value["signed_error_channels"]),
             deep_diagnostics=value["deep_diagnostics"],
             self_refinement_enclosed=value["self_refinement_enclosed"],
             discrepancy_from_previous_abs=value["discrepancy_from_previous_abs"],
@@ -1084,12 +1304,12 @@ def _validate_record_semantics(
             raise ValueError("campaign promoted deep leaf is missing its 80-digit stage")
         return production
 
-    stage80 = stages[1]
+    precision80 = stages[1]
     if (
-        stage80.deep_diagnostics is not None
-        or stage80.self_refinement_enclosed is None
-        or stage80.discrepancy_from_previous_abs is None
-        or stage80.discrepancy_enclosed is None
+        precision80.deep_diagnostics is not None
+        or precision80.self_refinement_enclosed is None
+        or precision80.discrepancy_from_previous_abs is None
+        or precision80.discrepancy_enclosed is None
     ):
         raise ValueError("campaign 80-digit evidence is incomplete")
     expected_comparison = None
@@ -1098,11 +1318,11 @@ def _validate_record_semantics(
         threshold = 0.25 * first.local_disk_radius_abs
         false_negative = (
             not trigger_ids
-            and stage80.discrepancy_from_previous_abs > threshold
+            and precision80.discrepancy_from_previous_abs > threshold
         )
         expected_comparison = {
             "binary64_to_80_discrepancy_abs": (
-                stage80.discrepancy_from_previous_abs
+                precision80.discrepancy_from_previous_abs
             ),
             "trigger_threshold_abs": threshold,
             "trigger_policy_false_negative": false_negative,
@@ -1116,13 +1336,15 @@ def _validate_record_semantics(
         ):
             raise ValueError("campaign sentinel false-negative state is invalid")
         if len(stages) == 3:
-            _validate_stage120(stages[2])
+            _validate_precision120(stages[2])
         return production
-    if stage80.self_refinement_enclosed:
+    if precision80.self_refinement_enclosed:
         if (
             len(stages) != 2
             or record.state
-            != _terminal_state(stage80, enclosed=bool(stage80.discrepancy_enclosed))
+            != _terminal_state(
+                precision80, enclosed=bool(precision80.discrepancy_enclosed)
+            )
             or record.missing_precision_digits is not None
         ):
             raise ValueError("campaign enclosed 80-digit state is inconsistent")
@@ -1138,18 +1360,20 @@ def _validate_record_semantics(
         if not pending:
             raise ValueError("campaign promoted deep leaf is missing its 120-digit stage")
         return production
-    stage120 = stages[2]
-    _validate_stage120(stage120)
+    precision120 = stages[2]
+    _validate_precision120(precision120)
     if (
         record.state
-        != _terminal_state(stage120, enclosed=bool(stage120.discrepancy_enclosed))
+        != _terminal_state(
+            precision120, enclosed=bool(precision120.discrepancy_enclosed)
+        )
         or record.missing_precision_digits is not None
     ):
         raise ValueError("campaign 120-digit terminal state is inconsistent")
     return production
 
 
-def _validate_stage120(outcome: StageOutcome) -> None:
+def _validate_precision120(outcome: StageOutcome) -> None:
     if (
         outcome.deep_diagnostics is not None
         or outcome.self_refinement_enclosed is not None
@@ -1520,15 +1744,19 @@ class _OrchestrationSmokeBackend:
                 backend_identity=self._replay.identity,
             )
             result = run_component(replay_job, self._replay)
+            component_result = {
+                "evidence_kind": "authenticated-recorded-replay",
+                "recorded_backend_id": RECORDED_REPLAY_BACKEND_ID,
+                "result": result.to_mapping(),
+            }
             return StageOutcome(
                 digits=64,
                 numerical_state=result.status.value,
-                component_result={
-                    "evidence_kind": "authenticated-recorded-replay",
-                    "recorded_backend_id": RECORDED_REPLAY_BACKEND_ID,
-                    "result": result.to_mapping(),
-                },
+                component_result=component_result,
                 local_disk_radius_abs=sum(result.error_channels.values()),
+                signed_error_channels=_component_stage_signed_error_channels(
+                    component_result, result
+                ),
             )
 
         payload = {
@@ -1545,6 +1773,9 @@ class _OrchestrationSmokeBackend:
                     numerical_state="CONVERGED",
                     component_result=payload,
                     local_disk_radius_abs=1.0e-6,
+                    signed_error_channels=synthetic_stage_signed_error_channels(
+                        payload, 1.0e-6
+                    ),
                     deep_diagnostics=_smoke_deep_diagnostics(
                         predicted_digits=12.0
                     ),
@@ -1554,6 +1785,9 @@ class _OrchestrationSmokeBackend:
                 numerical_state="CONVERGED",
                 component_result=payload,
                 local_disk_radius_abs=1.0e-6,
+                signed_error_channels=synthetic_stage_signed_error_channels(
+                    payload, 1.0e-6
+                ),
                 self_refinement_enclosed=True,
                 discrepancy_from_previous_abs=1.0e-8,
                 discrepancy_enclosed=True,
@@ -1565,6 +1799,9 @@ class _OrchestrationSmokeBackend:
                     numerical_state="CONVERGED",
                     component_result=payload,
                     local_disk_radius_abs=1.0e-6,
+                    signed_error_channels=synthetic_stage_signed_error_channels(
+                        payload, 1.0e-6
+                    ),
                     deep_diagnostics=_smoke_deep_diagnostics(predicted_digits=8.0),
                 )
             if digits == 80:
@@ -1573,6 +1810,9 @@ class _OrchestrationSmokeBackend:
                     numerical_state="CONVERGED",
                     component_result=payload,
                     local_disk_radius_abs=1.0e-6,
+                    signed_error_channels=synthetic_stage_signed_error_channels(
+                        payload, 1.0e-6
+                    ),
                     self_refinement_enclosed=False,
                     discrepancy_from_previous_abs=1.0e-7,
                     discrepancy_enclosed=False,
@@ -1582,6 +1822,9 @@ class _OrchestrationSmokeBackend:
                 numerical_state="CONVERGED",
                 component_result=payload,
                 local_disk_radius_abs=1.0e-6,
+                signed_error_channels=synthetic_stage_signed_error_channels(
+                    payload, 1.0e-6
+                ),
                 discrepancy_from_previous_abs=1.0e-8,
                 discrepancy_enclosed=True,
             )
@@ -1591,6 +1834,9 @@ class _OrchestrationSmokeBackend:
                 numerical_state="NOT_CONVERGED",
                 component_result=payload,
                 local_disk_radius_abs=1.0e-6,
+                signed_error_channels=synthetic_stage_signed_error_channels(
+                    payload, 1.0e-6
+                ),
                 deep_diagnostics=_smoke_deep_diagnostics(predicted_digits=8.0),
             )
         return StageOutcome(
@@ -1598,6 +1844,9 @@ class _OrchestrationSmokeBackend:
             numerical_state="CONVERGED",
             component_result=payload,
             local_disk_radius_abs=1.0e-6,
+            signed_error_channels=synthetic_stage_signed_error_channels(
+                payload, 1.0e-6
+            ),
         )
 
 
@@ -1687,12 +1936,16 @@ class NativeCampaignStageBackend:
                 "native campaign adapter lacks authenticated deep trigger diagnostics"
             )
         result = run_component(leaf.job, self.adapter)
+        component_result = {
+            "evidence_kind": "native-task-008-component-engine",
+            "result": result.to_mapping(),
+        }
         return StageOutcome(
             digits=64,
             numerical_state=result.status.value,
-            component_result={
-                "evidence_kind": "native-task-008-component-engine",
-                "result": result.to_mapping(),
-            },
+            component_result=component_result,
             local_disk_radius_abs=sum(result.error_channels.values()),
+            signed_error_channels=_component_stage_signed_error_channels(
+                component_result, result
+            ),
         )

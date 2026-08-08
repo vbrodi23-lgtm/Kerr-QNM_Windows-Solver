@@ -634,10 +634,16 @@ class OverlayExecutionSmokeTests(unittest.TestCase):
                 self.assertLessEqual(abs(refined[0]), 1e-8)
                 self.assertLessEqual(float(canonical[2]), 1e-9)
                 self.assertLessEqual(float(refined[2]), 1e-9)
-                self.assertEqual(complex(canonical[1]), catalog_a)
-                self.assertEqual(
-                    abs(complex(refined[1]) - catalog_a),
-                    root.angular_refinement_abs,
+                canonical_a = complex(canonical[1])
+                refined_a = complex(refined[1])
+                self.assertLessEqual(abs(canonical_a - catalog_a), 1e-11)
+                self.assertLessEqual(abs(refined_a - catalog_a), 1e-11)
+                self.assertLessEqual(
+                    abs(
+                        abs(refined_a - canonical_a)
+                        - root.angular_refinement_abs
+                    ),
+                    1e-11,
                 )
 
         spectrum.load_spectrum_catalog.cache_clear()

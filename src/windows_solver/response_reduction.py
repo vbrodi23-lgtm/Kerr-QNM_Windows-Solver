@@ -202,12 +202,23 @@ class EmpiricalErrorGram:
     columns: tuple[tuple[float, ...], ...]
     matrix: tuple[tuple[float, ...], ...]
     units: str
+    local_marginals: Mapping[
+        str, tuple[tuple[float, float], tuple[float, float]]
+    ]
     local_disks: Mapping[str, float]
     construction_id: str
     source_hashes: tuple[str, ...]
     kind: str = EMPIRICAL_GRAM_KIND
 
     def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "local_marginals",
+            MappingProxyType({
+                key: tuple(tuple(row) for row in marginal)
+                for key, marginal in self.local_marginals.items()
+            }),
+        )
         object.__setattr__(self, "local_disks", MappingProxyType(dict(self.local_disks)))
 
     def to_mapping(self) -> dict[str, object]:
@@ -219,10 +230,56 @@ class EmpiricalErrorGram:
             "columns": [list(column) for column in self.columns],
             "matrix": [list(row) for row in self.matrix],
             "units": self.units,
+            "local_marginals": {
+                key: [list(row) for row in marginal]
+                for key, marginal in self.local_marginals.items()
+            },
             "local_disks": dict(self.local_disks),
             "construction_id": self.construction_id,
             "source_hashes": list(self.source_hashes),
         }
+
+    @classmethod
+    def from_mapping(cls, value: object) -> "EmpiricalErrorGram":
+        mapping = _exact_mapping_fields(
+            value,
+            frozenset({
+                "kind", "basis", "channel_ids", "channel_families", "columns",
+                "matrix", "units", "local_marginals", "local_disks",
+                "construction_id", "source_hashes",
+            }),
+            "empirical error Gram",
+        )
+        for name in ("basis", "channel_ids", "channel_families", "columns", "matrix", "source_hashes"):
+            if not isinstance(mapping[name], list):
+                raise ValueError(f"empirical error Gram {name} is invalid")
+        if not isinstance(mapping["local_marginals"], Mapping) or not isinstance(
+            mapping["local_disks"], Mapping
+        ):
+            raise ValueError("empirical error Gram local evidence is invalid")
+        try:
+            gram = cls(
+                basis=tuple(mapping["basis"]),
+                channel_ids=tuple(mapping["channel_ids"]),
+                channel_families=tuple(mapping["channel_families"]),
+                columns=tuple(tuple(float(item) for item in column) for column in mapping["columns"]),
+                matrix=tuple(tuple(float(item) for item in row) for row in mapping["matrix"]),
+                units=mapping["units"],
+                local_marginals={
+                    key: tuple(tuple(float(item) for item in row) for row in marginal)
+                    for key, marginal in mapping["local_marginals"].items()
+                },
+                local_disks={key: float(item) for key, item in mapping["local_disks"].items()},
+                construction_id=mapping["construction_id"],
+                source_hashes=tuple(mapping["source_hashes"]),
+                kind=mapping["kind"],
+            )
+        except (TypeError, ValueError) as error:
+            raise ValueError("empirical error Gram numeric structure is invalid") from error
+        _validate_serialized_empirical_error_gram(gram)
+        if gram.to_mapping() != value:
+            raise ValueError("empirical error Gram is not canonical")
+        return gram
 
 
 def _outer_product_sum(
@@ -258,6 +315,99 @@ def _is_positive_semidefinite(matrix: Sequence[Sequence[float]]) -> bool:
             elif abs(residual) > tolerance:
                 return False
     return True
+
+
+def _gram_component_ids(basis: Sequence[str]) -> tuple[str, ...]:
+    if not basis or len(basis) % 2:
+        raise ValueError("empirical error Gram basis has the wrong dimension")
+    component_ids: list[str] = []
+    for index in range(0, len(basis), 2):
+        real, imaginary = basis[index:index + 2]
+        if (
+            not isinstance(real, str) or not isinstance(imaginary, str)
+            or not real.startswith("Re ") or imaginary != "Im " + real[3:]
+            or not real[3:]
+        ):
+            raise ValueError("empirical error Gram basis is invalid")
+        component_ids.append(real[3:])
+    if len(component_ids) != len(set(component_ids)):
+        raise ValueError("empirical error Gram basis has duplicate components")
+    return tuple(component_ids)
+
+
+def _gram_local_marginals(
+    basis: Sequence[str], matrix: Sequence[Sequence[float]]
+) -> dict[str, tuple[tuple[float, float], tuple[float, float]]]:
+    return {
+        component_id: tuple(
+            tuple(matrix[row][column] for column in range(start, start + 2))
+            for row in range(start, start + 2)
+        )
+        for start, component_id in zip(
+            range(0, len(basis), 2), _gram_component_ids(basis)
+        )
+    }
+
+
+def _gram_local_disks_from_columns(
+    basis: Sequence[str], columns: Sequence[Sequence[float]]
+) -> dict[str, float]:
+    return {
+        component_id: sum(math.hypot(column[start], column[start + 1]) for column in columns)
+        for start, component_id in zip(
+            range(0, len(basis), 2), _gram_component_ids(basis)
+        )
+    }
+
+
+def _validate_serialized_empirical_error_gram(gram: EmpiricalErrorGram) -> None:
+    dimension = len(gram.basis)
+    component_ids = _gram_component_ids(gram.basis)
+    if gram.kind != EMPIRICAL_GRAM_KIND:
+        raise ValueError("empirical error Gram kind is invalid")
+    if (
+        len(gram.channel_ids) != len(gram.channel_families)
+        or len(gram.channel_ids) != len(gram.columns)
+        or len(gram.channel_ids) != len(set(gram.channel_ids))
+        or any(not isinstance(item, str) or not item for item in gram.channel_ids)
+        or any(item not in SIGNED_ERROR_FAMILIES for item in gram.channel_families)
+    ):
+        raise ValueError("empirical error Gram channel metadata is invalid")
+    if any(
+        len(column) != dimension or any(not math.isfinite(value) for value in column)
+        for column in gram.columns
+    ):
+        raise ValueError("empirical error Gram signed columns are invalid")
+    if (
+        len(gram.matrix) != dimension
+        or any(len(row) != dimension for row in gram.matrix)
+        or any(not math.isfinite(value) for row in gram.matrix for value in row)
+    ):
+        raise ValueError("empirical error Gram matrix is invalid")
+    expected_matrix = _outer_product_sum(gram.columns, dimension)
+    if gram.matrix != expected_matrix:
+        raise ValueError("empirical error Gram matrix failed exact recomputation")
+    expected_marginals = _gram_local_marginals(gram.basis, expected_matrix)
+    if dict(gram.local_marginals) != expected_marginals:
+        raise ValueError("empirical error Gram local marginal failed exact recomputation")
+    expected_disks = _gram_local_disks_from_columns(gram.basis, gram.columns)
+    if dict(gram.local_disks) != expected_disks:
+        raise ValueError("empirical error Gram local disk failed exact recomputation")
+    if set(gram.local_disks) != set(component_ids):
+        raise ValueError("empirical error Gram local component set is invalid")
+    if (
+        not isinstance(gram.units, str) or not gram.units
+        or not gram.source_hashes
+        or any(not isinstance(item, str) or not item for item in gram.source_hashes)
+    ):
+        raise ValueError("empirical error Gram provenance is invalid")
+    material = gram.to_mapping()
+    material.pop("construction_id")
+    expected_id = "empirical-error-gram-" + hashlib.sha256(
+        canonical_json_bytes(material)
+    ).hexdigest()
+    if gram.construction_id != expected_id:
+        raise ValueError("empirical error Gram construction hash is invalid")
 
 
 def build_empirical_error_gram(
@@ -318,6 +468,7 @@ def build_empirical_error_gram(
         for coordinate in (f"Re {component.component_id}", f"Im {component.component_id}")
     )
     matrix = _outer_product_sum(columns, len(basis))
+    local_marginals = _gram_local_marginals(basis, matrix)
     material = {
         "kind": EMPIRICAL_GRAM_KIND,
         "basis": basis,
@@ -326,6 +477,7 @@ def build_empirical_error_gram(
         "columns": columns,
         "matrix": matrix,
         "units": units,
+        "local_marginals": local_marginals,
         "local_disks": local_disks,
         "source_hashes": hashes,
     }
@@ -339,6 +491,7 @@ def build_empirical_error_gram(
         columns=tuple(columns),
         matrix=matrix,
         units=units,
+        local_marginals=local_marginals,
         local_disks=local_disks,
         construction_id=construction_id,
         source_hashes=hashes,
@@ -557,6 +710,9 @@ class ProjectiveRowResult:
     bounded_angle_interval_radians: tuple[float, float] | None
     calibration_disk_contains_zero: bool | None
     empirical_gram_id: str | None
+    linearized_input_basis: tuple[str, ...]
+    linearized_step_policy: Mapping[str, object] | None
+    linearized_angle_jacobian: tuple[float, ...]
     linearized_angle_gram: float | None
     linearized_angle_columns: tuple[tuple[str, float], ...]
     reason: str
@@ -579,6 +735,12 @@ class ProjectiveRowResult:
             ),
             "calibration_disk_contains_zero": self.calibration_disk_contains_zero,
             "empirical_gram_id": self.empirical_gram_id,
+            "linearized_input_basis": list(self.linearized_input_basis),
+            "linearized_step_policy": (
+                None if self.linearized_step_policy is None
+                else dict(self.linearized_step_policy)
+            ),
+            "linearized_angle_jacobian": list(self.linearized_angle_jacobian),
             "linearized_angle_gram": self.linearized_angle_gram,
             "linearized_angle_columns": [
                 {"channel_id": channel_id, "signed_angle_delta": value}
@@ -586,6 +748,64 @@ class ProjectiveRowResult:
             ],
             "reason": self.reason,
         }
+
+    @classmethod
+    def from_mapping(cls, value: object) -> "ProjectiveRowResult":
+        mapping = _exact_mapping_fields(
+            value,
+            frozenset({
+                "row_id", "reducer_state", "present_component_ids",
+                "missing_component_ids", "produced_unresolved_component_ids",
+                "projective_outcome", "scientific_state", "nominal_angle_radians",
+                "bounded_angle_interval_radians", "calibration_disk_contains_zero",
+                "empirical_gram_id", "linearized_input_basis",
+                "linearized_step_policy", "linearized_angle_jacobian",
+                "linearized_angle_gram",
+                "linearized_angle_columns", "reason",
+            }),
+            "projective row result",
+        )
+        for name in (
+            "present_component_ids", "missing_component_ids",
+            "produced_unresolved_component_ids", "linearized_input_basis",
+            "linearized_angle_jacobian", "linearized_angle_columns",
+        ):
+            if not isinstance(mapping[name], list):
+                raise ValueError(f"projective row result {name} is invalid")
+        interval = mapping["bounded_angle_interval_radians"]
+        if interval is not None and (not isinstance(interval, list) or len(interval) != 2):
+            raise ValueError("projective row result angle interval is invalid")
+        columns = mapping["linearized_angle_columns"]
+        if any(
+            not isinstance(item, Mapping)
+            or set(item) != {"channel_id", "signed_angle_delta"}
+            for item in columns
+        ):
+            raise ValueError("projective row result linearized columns are invalid")
+        result = cls(
+            row_id=mapping["row_id"],
+            reducer_state=mapping["reducer_state"],
+            present_component_ids=tuple(mapping["present_component_ids"]),
+            missing_component_ids=tuple(mapping["missing_component_ids"]),
+            produced_unresolved_component_ids=tuple(mapping["produced_unresolved_component_ids"]),
+            projective_outcome=mapping["projective_outcome"],
+            scientific_state=mapping["scientific_state"],
+            nominal_angle_radians=mapping["nominal_angle_radians"],
+            bounded_angle_interval_radians=(None if interval is None else tuple(interval)),
+            calibration_disk_contains_zero=mapping["calibration_disk_contains_zero"],
+            empirical_gram_id=mapping["empirical_gram_id"],
+            linearized_input_basis=tuple(mapping["linearized_input_basis"]),
+            linearized_step_policy=mapping["linearized_step_policy"],
+            linearized_angle_jacobian=tuple(mapping["linearized_angle_jacobian"]),
+            linearized_angle_gram=mapping["linearized_angle_gram"],
+            linearized_angle_columns=tuple(
+                (item["channel_id"], item["signed_angle_delta"]) for item in columns
+            ),
+            reason=mapping["reason"],
+        )
+        if result.to_mapping() != value:
+            raise ValueError("projective row result is not canonical")
+        return result
 
 
 def _fubini_study_angle(
@@ -598,6 +818,107 @@ def _fubini_study_angle(
     inner = sum(complex(left_value).conjugate() * right_value for left_value, right_value in zip(left, right))
     cosine = min(1.0, max(0.0, abs(inner) / (left_norm * right_norm)))
     return math.acos(cosine)
+
+
+@dataclass(frozen=True, slots=True)
+class CalibratedProjectiveJacobian:
+    input_basis: tuple[str, ...]
+    step_policy: Mapping[str, object]
+    jacobian: tuple[float, ...]
+    scalar_gram: float
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "step_policy", MappingProxyType(dict(self.step_policy)))
+
+    def to_mapping(self) -> dict[str, object]:
+        return {
+            "input_basis": list(self.input_basis),
+            "step_policy": dict(self.step_policy),
+            "jacobian": list(self.jacobian),
+            "scalar_gram": self.scalar_gram,
+        }
+
+
+def _calibrated_normalized_angle(
+    left: Sequence[complex], right: Sequence[complex]
+) -> float:
+    if not left or len(left) != len(right) or left[0] == 0.0 or right[0] == 0.0:
+        raise ValueError("projective calibration denominator is zero")
+    calibrated_left = tuple(value / left[0] for value in left)
+    calibrated_right = tuple(value / right[0] for value in right)
+    left_norm = math.sqrt(sum(abs(value) ** 2 for value in calibrated_left))
+    right_norm = math.sqrt(sum(abs(value) ** 2 for value in calibrated_right))
+    if (
+        not math.isfinite(left_norm) or not math.isfinite(right_norm)
+        or left_norm == 0.0 or right_norm == 0.0
+    ):
+        raise ValueError("projective calibrated vector cannot be normalized")
+    normalized_left = tuple(value / left_norm for value in calibrated_left)
+    normalized_right = tuple(value / right_norm for value in calibrated_right)
+    inner = sum(
+        left_value.conjugate() * right_value
+        for left_value, right_value in zip(normalized_left, normalized_right)
+    )
+    return math.acos(min(1.0, max(0.0, abs(inner))))
+
+
+def build_calibrated_projective_jacobian(
+    left: Sequence[complex],
+    right: Sequence[complex],
+    input_basis: Sequence[str],
+    empirical_gram: Sequence[Sequence[float]],
+) -> CalibratedProjectiveJacobian:
+    """Propagate one empirical Gram through calibrated projective geometry."""
+
+    left_values, right_values = tuple(left), tuple(right)
+    centres = (*left_values, *right_values)
+    basis = tuple(input_basis)
+    dimension = 2 * len(centres)
+    if len(basis) != dimension or len(empirical_gram) != dimension or any(
+        len(row) != dimension for row in empirical_gram
+    ):
+        raise ValueError("projective Jacobian basis/Gram dimension is invalid")
+    if any(
+        not math.isfinite(float(value)) for row in empirical_gram for value in row
+    ):
+        raise ValueError("projective Jacobian Gram is non-finite")
+    relative_step = 2.0 ** -24
+    scale = max(1.0, *(abs(value) for value in centres))
+    step = relative_step * scale
+    jacobian: list[float] = []
+    split = len(left_values)
+    for coordinate in range(dimension):
+        component_index, imaginary = divmod(coordinate, 2)
+        delta = (1j if imaginary else 1.0) * step
+        plus, minus = list(centres), list(centres)
+        plus[component_index] += delta
+        minus[component_index] -= delta
+        plus_angle = _calibrated_normalized_angle(
+            plus[:split], plus[split:]
+        )
+        minus_angle = _calibrated_normalized_angle(
+            minus[:split], minus[split:]
+        )
+        jacobian.append((plus_angle - minus_angle) / (2.0 * step))
+    vector = tuple(jacobian)
+    scalar = sum(
+        vector[row] * empirical_gram[row][column] * vector[column]
+        for row in range(dimension)
+        for column in range(dimension)
+    )
+    return CalibratedProjectiveJacobian(
+        input_basis=basis,
+        step_policy={
+            "kind": "central-real-imaginary-quadrature/binary64",
+            "relative_step_binary64_hex": relative_step.hex(),
+            "scale_policy": "max-one-and-complex-centre-modulus",
+            "step_size_binary64_hex": step.hex(),
+            "calibration_policy": "divide-by-first-mode-per-vector",
+            "normalization_policy": "unit-l2-before-fubini-study",
+        },
+        jacobian=vector,
+        scalar_gram=scalar,
+    )
 
 
 def _vector_projective_radius(norm: float, disk_norm: float) -> float | None:
@@ -643,6 +964,9 @@ def reduce_projective_row(
             bounded_angle_interval_radians=None,
             calibration_disk_contains_zero=None,
             empirical_gram_id=None,
+            linearized_input_basis=(),
+            linearized_step_policy=None,
+            linearized_angle_jacobian=(),
             linearized_angle_gram=None,
             linearized_angle_columns=(),
             reason="required aligned component evidence is absent",
@@ -675,6 +999,9 @@ def reduce_projective_row(
             bounded_angle_interval_radians=None,
             calibration_disk_contains_zero=None,
             empirical_gram_id=None,
+            linearized_input_basis=(),
+            linearized_step_policy=None,
+            linearized_angle_jacobian=(),
             linearized_angle_gram=None,
             linearized_angle_columns=(),
             reason="one or more produced components are numerically unresolved",
@@ -690,9 +1017,12 @@ def reduce_projective_row(
     split = len(plan.left_component_ids)
     left = tuple(component.centre for component in ordered_components[:split])
     right = tuple(component.centre for component in ordered_components[split:])
-    denominator = ordered_components[split]
-    denominator_disk = gram.local_disks[denominator.component_id]
-    calibration_zero = abs(denominator.centre) <= denominator_disk
+    left_denominator = ordered_components[0]
+    right_denominator = ordered_components[split]
+    calibration_zero = (
+        abs(left_denominator.centre) <= gram.local_disks[left_denominator.component_id]
+        or abs(right_denominator.centre) <= gram.local_disks[right_denominator.component_id]
+    )
     left_disk_norm = math.sqrt(sum(
         gram.local_disks[component.component_id] ** 2
         for component in ordered_components[:split]
@@ -718,6 +1048,9 @@ def reduce_projective_row(
             bounded_angle_interval_radians=None,
             calibration_disk_contains_zero=calibration_zero,
             empirical_gram_id=gram.construction_id,
+            linearized_input_basis=(),
+            linearized_step_policy=None,
+            linearized_angle_jacobian=(),
             linearized_angle_gram=None,
             linearized_angle_columns=(),
             reason=(
@@ -726,24 +1059,22 @@ def reduce_projective_row(
             ),
         )
 
-    nominal = _fubini_study_angle(left, right)
+    diagnostic = build_calibrated_projective_jacobian(
+        left, right, gram.basis, gram.matrix
+    )
+    nominal = _calibrated_normalized_angle(left, right)
     width = left_radius + right_radius
     interval = (max(0.0, nominal - width), min(math.pi / 2.0, nominal + width))
-    angle_columns: list[tuple[str, float]] = []
-    all_centres = (*left, *right)
-    for channel_id, column in zip(gram.channel_ids, gram.columns):
-        disturbance = tuple(
-            complex(column[index], column[index + 1])
-            for index in range(0, len(column), 2)
+    angle_columns = tuple(
+        (
+            channel_id,
+            sum(
+                derivative * coordinate
+                for derivative, coordinate in zip(diagnostic.jacobian, column)
+            ),
         )
-        plus = tuple(value + delta for value, delta in zip(all_centres, disturbance))
-        minus = tuple(value - delta for value, delta in zip(all_centres, disturbance))
-        signed_delta = 0.5 * (
-            _fubini_study_angle(plus[:split], plus[split:])
-            - _fubini_study_angle(minus[:split], minus[split:])
-        )
-        angle_columns.append((channel_id, signed_delta))
-    linearized_gram = sum(value * value for _, value in angle_columns)
+        for channel_id, column in zip(gram.channel_ids, gram.columns)
+    )
     if interval[0] > plan.separation_lower_radians:
         outcome, scientific_state = "SEPARATED", "CONTRADICTED"
         reason = "conservative angle lower bound exceeds the frozen separation threshold"
@@ -765,8 +1096,11 @@ def reduce_projective_row(
         bounded_angle_interval_radians=interval,
         calibration_disk_contains_zero=False,
         empirical_gram_id=gram.construction_id,
-        linearized_angle_gram=linearized_gram,
-        linearized_angle_columns=tuple(angle_columns),
+        linearized_input_basis=diagnostic.input_basis,
+        linearized_step_policy=diagnostic.step_policy,
+        linearized_angle_jacobian=diagnostic.jacobian,
+        linearized_angle_gram=diagnostic.scalar_gram,
+        linearized_angle_columns=angle_columns,
         reason=reason,
     )
 
@@ -896,6 +1230,7 @@ class CampaignReductionSummary:
     source_hashes: tuple[str, ...]
     plans: tuple[ProjectiveRowPlan, ...]
     results: tuple[ProjectiveRowResult, ...]
+    empirical_grams: tuple[EmpiricalErrorGram, ...]
     reduction_id: str
 
     def to_mapping(self) -> dict[str, object]:
@@ -911,9 +1246,82 @@ class CampaignReductionSummary:
             "source_hashes": list(self.source_hashes),
             "plans": [plan.to_mapping() for plan in self.plans],
             "results": [result.to_mapping() for result in self.results],
+            "empirical_grams": [gram.to_mapping() for gram in self.empirical_grams],
             "reduction_id": self.reduction_id,
             "release_admissible": False,
         }
+
+    @classmethod
+    def from_mapping(cls, value: object) -> "CampaignReductionSummary":
+        mapping = _exact_mapping_fields(
+            value,
+            frozenset({
+                "schema_version", "kind", "campaign_id", "reducer_state",
+                "selected_row_ids", "present_component_ids", "missing_component_ids",
+                "row_plan_sha256", "source_hashes", "plans", "results",
+                "empirical_grams", "reduction_id", "release_admissible",
+            }),
+            "campaign reduction summary",
+        )
+        if (
+            mapping["schema_version"] != 1
+            or mapping["kind"] != "b-prime-projective-reduction"
+            or mapping["release_admissible"] is not False
+        ):
+            raise ValueError("campaign reduction summary envelope is invalid")
+        for name in (
+            "selected_row_ids", "present_component_ids", "missing_component_ids",
+            "source_hashes", "plans", "results", "empirical_grams",
+        ):
+            if not isinstance(mapping[name], list):
+                raise ValueError(f"campaign reduction summary {name} is invalid")
+        selected = tuple(mapping["selected_row_ids"])
+        frozen = {plan.row_id: plan for plan in build_projective_row_plans()}
+        if any(row_id not in frozen for row_id in selected):
+            raise ValueError("campaign reduction summary row selection is invalid")
+        plans = tuple(frozen[row_id] for row_id in selected)
+        if [plan.to_mapping() for plan in plans] != mapping["plans"]:
+            raise ValueError("campaign reduction summary plans are not frozen")
+        results = tuple(ProjectiveRowResult.from_mapping(item) for item in mapping["results"])
+        if tuple(result.row_id for result in results) != selected:
+            raise ValueError("campaign reduction summary result order is invalid")
+        grams = tuple(EmpiricalErrorGram.from_mapping(item) for item in mapping["empirical_grams"])
+        gram_ids = tuple(gram.construction_id for gram in grams)
+        referenced = tuple(
+            result.empirical_gram_id
+            for result in results
+            if result.empirical_gram_id is not None
+        )
+        if gram_ids != referenced or len(gram_ids) != len(set(gram_ids)):
+            raise ValueError("campaign reduction summary Gram references are invalid")
+        expected_plan_sha = hashlib.sha256(canonical_json_bytes(mapping["plans"])).hexdigest()
+        if mapping["row_plan_sha256"] != expected_plan_sha:
+            raise ValueError("campaign reduction summary row plan hash is invalid")
+        material = {
+            key: item for key, item in mapping.items()
+            if key not in {"reduction_id", "release_admissible"}
+        }
+        expected_id = "b-prime-reduction-" + hashlib.sha256(
+            canonical_json_bytes(material)
+        ).hexdigest()
+        if mapping["reduction_id"] != expected_id:
+            raise ValueError("campaign reduction summary hash is invalid")
+        summary = cls(
+            campaign_id=mapping["campaign_id"],
+            reducer_state=mapping["reducer_state"],
+            selected_row_ids=selected,
+            present_component_ids=tuple(mapping["present_component_ids"]),
+            missing_component_ids=tuple(mapping["missing_component_ids"]),
+            row_plan_sha256=mapping["row_plan_sha256"],
+            source_hashes=tuple(mapping["source_hashes"]),
+            plans=plans,
+            results=results,
+            empirical_grams=grams,
+            reduction_id=mapping["reduction_id"],
+        )
+        if summary.to_mapping() != value:
+            raise ValueError("campaign reduction summary is not canonical")
+        return summary
 
 
 def reduce_projective_rows(
@@ -958,6 +1366,19 @@ def reduce_projective_rows(
         )
         for plan in plans
     )
+    empirical_grams: list[EmpiricalErrorGram] = []
+    for plan, result in zip(plans, results):
+        if result.empirical_gram_id is None:
+            continue
+        required = (*plan.left_component_ids, *plan.right_component_ids)
+        ordered = tuple(components[component_id] for component_id in required)
+        if not all(isinstance(item, ResolvedComponentEvidence) for item in ordered):
+            raise ValueError("resolved row Gram lacks resolved component evidence")
+        gram = build_empirical_error_gram(ordered, source_hashes=hashes)
+        validate_empirical_error_gram(gram, ordered)
+        if gram.construction_id != result.empirical_gram_id:
+            raise ValueError("reduction result Gram identity drifted")
+        empirical_grams.append(gram)
     present = tuple(item for item in required_order if item in components)
     missing = tuple(item for item in required_order if item not in components)
     reducer_state = "INCOMPLETE" if missing else "COMPLETE"
@@ -965,6 +1386,8 @@ def reduce_projective_rows(
         [plan.to_mapping() for plan in plans]
     )).hexdigest()
     material = {
+        "schema_version": 1,
+        "kind": "b-prime-projective-reduction",
         "campaign_id": campaign_id,
         "reducer_state": reducer_state,
         "selected_row_ids": requested,
@@ -972,8 +1395,9 @@ def reduce_projective_rows(
         "missing_component_ids": missing,
         "row_plan_sha256": row_plan_sha256,
         "source_hashes": hashes,
-        "component_evidence": [components[item].to_mapping() for item in present],
+        "plans": [plan.to_mapping() for plan in plans],
         "results": [result.to_mapping() for result in results],
+        "empirical_grams": [gram.to_mapping() for gram in empirical_grams],
     }
     reduction_id = "b-prime-reduction-" + hashlib.sha256(
         canonical_json_bytes(material)
@@ -988,5 +1412,6 @@ def reduce_projective_rows(
         source_hashes=hashes,
         plans=plans,
         results=results,
+        empirical_grams=tuple(empirical_grams),
         reduction_id=reduction_id,
     )

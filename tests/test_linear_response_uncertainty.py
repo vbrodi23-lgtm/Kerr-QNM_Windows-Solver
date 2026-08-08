@@ -8,6 +8,7 @@ from windows_solver.response_reduction import (
     ResolvedComponentEvidence,
     SignedErrorContribution,
     build_empirical_error_gram,
+    build_calibrated_projective_jacobian,
     signed_error_contribution_from_mapping,
     validate_empirical_error_gram,
 )
@@ -141,6 +142,57 @@ class SignedChannelGramTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "discrepancy|disk"):
             validate_empirical_error_gram(marginal, components)
 
+    def test_calibrated_normalized_quadrature_jacobian_propagates_j_g_jt(self) -> None:
+        """Catches the old full-channel-amplitude angle perturbation."""
+
+        basis = (
+            "Re left-0", "Im left-0", "Re left-1", "Im left-1",
+            "Re right-0", "Im right-0", "Re right-1", "Im right-1",
+        )
+        columns = (
+            (1.0, 0.5, 0.0, 0.0, -0.25, 0.75, 0.0, 0.0),
+            (0.0, 0.0, 0.2, -0.1, 0.0, 0.0, 0.3, 0.4),
+        )
+        matrix = tuple(tuple(
+            sum(column[row] * column[col] for column in columns)
+            for col in range(8)
+        ) for row in range(8))
+        diagnostic = build_calibrated_projective_jacobian(
+            (1.0 + 0.0j, 2.0 + 1.0j),
+            (1.1 + 0.2j, 1.5 - 0.3j),
+            basis,
+            matrix,
+        )
+
+        self.assertEqual(diagnostic.input_basis, basis)
+        self.assertEqual(
+            diagnostic.step_policy["relative_step_binary64_hex"],
+            float(2.0 ** -24).hex(),
+        )
+        expected_jacobian = (
+            -0.09974497703038063, -0.3590819237234721,
+            -0.03191839464059236, 0.1635817665198154,
+            0.21804974635449595, 0.36608352185056503,
+            -0.24672295555044751, -0.1900433580111252,
+        )
+        for actual, expected in zip(diagnostic.jacobian, expected_jacobian):
+            self.assertAlmostEqual(actual, expected, places=12)
+        direct = sum(
+            diagnostic.jacobian[row] * matrix[row][col] * diagnostic.jacobian[col]
+            for row in range(8) for col in range(8)
+        )
+        self.assertEqual(diagnostic.scalar_gram, direct)
+        self.assertAlmostEqual(diagnostic.scalar_gram, 0.03336044789683155)
+
+        scaled = build_calibrated_projective_jacobian(
+            (1.0 + 0.0j, 2.0 + 1.0j),
+            (1.1 + 0.2j, 1.5 - 0.3j),
+            basis,
+            tuple(tuple(100.0 * value for value in row) for row in matrix),
+        )
+        self.assertEqual(scaled.step_policy, diagnostic.step_policy)
+        self.assertEqual(scaled.jacobian, diagnostic.jacobian)
+
     def test_signed_schema_rejects_unsigned_unknown_duplicate_and_missing_evidence(self) -> None:
         contribution = self.components()[0].contributions[0]
         unsigned = contribution.to_mapping()
@@ -179,6 +231,7 @@ class SignedChannelGramTests(unittest.TestCase):
                 contributions=(contribution,),
                 required_families=("precision-ladder-discrepancy",),
             )
+
 
 
 if __name__ == "__main__":
