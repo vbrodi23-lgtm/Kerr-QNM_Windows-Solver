@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "policy_id": "kerr-qnm-windows-runtime-1",
+  "operating_system": "Windows",
+  "architecture": "x86_64",
+  "uv": {
+    "version": "0.11.29",
+    "archive": "uv-x86_64-pc-windows-msvc.zip",
+    "url": "https://github.com/astral-sh/uv/releases/download/0.11.29/uv-x86_64-pc-windows-msvc.zip",
+    "checksum_url": "https://github.com/astral-sh/uv/releases/download/0.11.29/uv-x86_64-pc-windows-msvc.zip.sha256"
+  },
+  "python": {
+    "python_version": "3.12.13",
+    "implementation": "CPython",
+    "bits": 64,
+    "rationale": "Matches the python field recorded in kerr_qnm_lattice_receipt.json and kerr_qnm_m02_overlay_receipt.json."
+  },
+  "numerical_kernel": {
+    "required_by": "native response kernel (numpy) and the packaged test suite (numpy, scipy)",
+    "not_required_by": "plan, run, verify, inspect, export, campaign-plan, campaign-merge, campaign-smoke",
+    "packages": [
+      { "name": "numpy", "version": "2.4.6" },
+      { "name": "scipy", "version": "1.18.0" }
+    ],
+    "wheels": []
+  }
+}

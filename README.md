@@ -47,7 +47,19 @@ handoff](docs/m02-admission-powershell.md).
 
 ## Quick start on Windows
 
-Install 64-bit CPython 3.12, clone the repository, and open PowerShell in the repository directory:
+Clone or unpack the repository, open a 64-bit PowerShell in it, and provision a
+package-local runtime once:
+
+```powershell
+Set-ExecutionPolicy -Scope Process Bypass -Force
+.\runtime\bootstrap.ps1
+```
+
+The bootstrap installs a pinned CPython 3.12.13 into `.runtime\` inside the
+repository. It requires no administrator rights, writes nothing outside the
+repository, adds no registry entry, and does not modify `PATH`. `.runtime\` is
+git-ignored, and deleting it fully uninstalls the runtime. If you already have a
+64-bit CPython 3.12 or newer on `PATH`, the bootstrap is optional.
 
 ```powershell
 .\solver.ps1 plan .\examples\evidence-plan.json
@@ -55,7 +67,23 @@ Install 64-bit CPython 3.12, clone the repository, and open PowerShell in the re
 .\solver.ps1 run .\examples\spectrum.json --store .\.solver-store
 ```
 
-The launcher uses a compatible bundled runtime at `.runtime\python\python.exe` when present, then an active `python` if it is 3.12 or newer, then the default Python 3 runtime selected by the Windows `py -3` launcher when that runtime is 3.12 or newer. Version probes are silent, so missing or stale launchers cannot contaminate command JSON.
+The public CLI — `plan`, `run`, `verify`, `inspect`, `export`, `campaign-plan`,
+`campaign-merge`, and `campaign-smoke` — has no dependencies beyond the
+standard library. The native response kernel and the packaged test suite
+additionally need the pinned NumPy and SciPy:
+
+```powershell
+.\runtime\bootstrap.ps1 -WithNumericalKernel
+```
+
+The launcher resolves an interpreter in this order: the bootstrap virtual
+environment at `.runtime\venv\Scripts\python.exe`, a bundled runtime at
+`.runtime\python\python.exe`, an active `python` that is 3.12 or newer, then
+the runtime selected by the Windows `py -3` launcher when that runtime is 3.12
+or newer. Version probes report failure through the exit code alone, so a
+candidate that writes to stderr — notably the Windows App Execution Alias stub
+for `python.exe` — is skipped rather than aborting the launcher, and probe
+output never reaches command JSON.
 
 The equivalent Python commands are:
 
