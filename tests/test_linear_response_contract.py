@@ -869,6 +869,31 @@ class LinearResponseContractTests(unittest.TestCase):
             request, LINEAR_RESPONSE_DESCRIPTOR.to_mapping(), payload
         )
 
+    def test_covariance_blocks_allow_overlapping_reduction_gram_bases(self) -> None:
+        request = example_request()
+        payload = valid_payload(request)
+        overlapping = deepcopy(payload["covariance_blocks"][0])
+        overlapping["covariance_id"] = "overlapping-projective-row-gram"
+        payload["covariance_blocks"].append(overlapping)
+        validate_linear_response_payload(
+            request, LINEAR_RESPONSE_DESCRIPTOR.to_mapping(), payload
+        )
+
+    def test_nonfinite_cholesky_intermediate_rejects_extreme_indefinite_matrix(
+        self,
+    ) -> None:
+        request = example_request()
+        payload = valid_payload(request)
+        matrix = [[1.0e-308, 1.0e308], [1.0e308, 1.0]]
+        payload["response_components"][0]["result"]["local_covariance"][
+            "matrix"
+        ] = deepcopy(matrix)
+        payload["covariance_blocks"][0]["matrix"] = deepcopy(matrix)
+        with self.assertRaisesRegex(ValueError, "positive semidefinite"):
+            validate_linear_response_payload(
+                request, LINEAR_RESPONSE_DESCRIPTOR.to_mapping(), payload
+            )
+
     def test_payload_rejects_disk_not_centred_on_response(self) -> None:
         request = example_request()
         payload = valid_payload(request)

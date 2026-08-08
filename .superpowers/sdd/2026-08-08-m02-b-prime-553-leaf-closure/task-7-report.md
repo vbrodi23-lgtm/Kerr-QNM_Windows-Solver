@@ -38,7 +38,7 @@ scientific claim, and the default linear-response provider remains unavailable.
 ## Verification
 
 - Fresh local full suite:
-  `PYTHONPATH=src python -m unittest discover -s tests -v` — 220/220 passed.
+  `PYTHONPATH=src python -m unittest discover -s tests -v` — 223/223 passed.
 - Focused forged-checkpoint and stale-projective-row regressions passed.
 - Cross-platform identity and provider regression suite passed.
 - Predecessor GitHub Actions run `31247921080`, head
@@ -90,6 +90,10 @@ scientific claim, and the default linear-response provider remains unavailable.
   the admission ban, accepts rank-deficient PSD outer-product covariance within
   scale-aware roundoff, admits the exact Kerr `M-kappa=0.25` boundary, and
   preserves the public `ValueError` boundary for malformed branch classes.
+- Resolved payload covariance IDs, mapped bases, and complete matrices now
+  equal their sealed reduction Grams exactly; unsealed cross-component blocks
+  fail admission. PSD factorization also rejects non-finite sums, residuals,
+  pivots, and coefficients before applying roundoff tolerance.
 
 ## Commit SHA(s)
 

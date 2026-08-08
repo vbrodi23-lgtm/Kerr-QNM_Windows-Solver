@@ -1063,12 +1063,16 @@ def _validate_real_symmetric_psd_matrix(
             for item in range(column)
         )
         diagonal = matrix[column][column] - square_sum
+        if not math.isfinite(square_sum) or not math.isfinite(diagonal):
+            raise ValueError(f"{subject} matrix must be positive semidefinite")
         diagonal_tolerance = roundoff_tolerance(
             matrix[column][column], square_sum
         )
         if diagonal < -diagonal_tolerance:
             raise ValueError(f"{subject} matrix must be positive semidefinite")
         pivot = math.sqrt(diagonal) if diagonal > diagonal_tolerance else 0.0
+        if not math.isfinite(pivot):
+            raise ValueError(f"{subject} matrix must be positive semidefinite")
         lower[column][column] = pivot
         for row in range(column + 1, dimension):
             product_sum = sum(
@@ -1076,8 +1080,17 @@ def _validate_real_symmetric_psd_matrix(
                 for item in range(column)
             )
             residual = matrix[row][column] - product_sum
+            if not math.isfinite(product_sum) or not math.isfinite(residual):
+                raise ValueError(
+                    f"{subject} matrix must be positive semidefinite"
+                )
             if pivot > 0.0:
-                lower[row][column] = residual / pivot
+                coefficient = residual / pivot
+                if not math.isfinite(coefficient):
+                    raise ValueError(
+                        f"{subject} matrix must be positive semidefinite"
+                    )
+                lower[row][column] = coefficient
             elif abs(residual) > roundoff_tolerance(
                 matrix[row][column], product_sum
             ):
@@ -1409,7 +1422,7 @@ def _validate_covariance_blocks(
             if entry["units"] != component.units:
                 raise ValueError("covariance basis units do not match component")
             key = (component_id, quadrature)
-            if key in covered_basis or key in basis:
+            if key in basis:
                 raise ValueError("covariance basis entries contain duplicates")
             basis.append(key)
         matrix = _validate_real_symmetric_psd_matrix(

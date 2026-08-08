@@ -43,7 +43,12 @@ produced results. Each payload projective comparison must then reproduce the
 same ordered reduction row: mapped response-component IDs, calibration pair,
 empirical-Gram identity, nominal/bounded angles, calibration state, outcome,
 scientific state, and reason. Admission rejects an empty, reordered, stale, or
-unrelated comparison array. A row containing an unresolved component uses null
+unrelated comparison array. For every resolved row, `covariance_id` must equal
+the sealed empirical-Gram ID and the referenced payload block must reproduce
+that Gram's mapped component/quadrature basis and complete matrix exactly.
+Overlapping component bases across different row Grams are allowed; an extra
+cross-component covariance block that is not sealed by a reduction Gram is not.
+A row containing an unresolved component uses null
 covariance, empirical-Gram, angle, and calibration-state fields rather than an
 invented identity or numerical value.
 

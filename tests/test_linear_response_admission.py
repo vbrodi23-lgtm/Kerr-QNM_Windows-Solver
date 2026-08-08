@@ -19,12 +19,14 @@ from windows_solver.linear_response_admission import (
     ADMITTED_LINEAR_RESPONSE_DESCRIPTOR,
     AdmittedLinearResponseProvider,
     LinearResponseAdmissionPackage,
+    _validate_projective_reduction_bindings,
     admit_linear_response_bundle,
     load_linear_response_admission,
 )
 from windows_solver.providers import ProviderUnavailableError
 from windows_solver.response_reduction import (
     ComputedUnresolvedComponentEvidence,
+    ResolvedComponentEvidence,
     SignedErrorContribution,
     build_projective_row_plans,
     reduce_projective_rows,
@@ -399,6 +401,97 @@ class LinearResponseAdmissionTests(unittest.TestCase):
                     ValueError, "projective.*reduction|174"
                 ):
                     admit_linear_response_bundle(admission_path)
+
+    def test_admission_binds_covariance_block_to_sealed_empirical_gram(self) -> None:
+        request = b_prime_request()
+        payload = b_prime_payload(request)
+        plans = build_projective_row_plans()
+        component_ids = tuple(dict.fromkeys(
+            component_id
+            for plan in plans
+            for component_id in (*plan.left_component_ids, *plan.right_component_ids)
+        ))
+        receipt = "sha256:" + "7" * 64
+        components = {
+            component_id: ComputedUnresolvedComponentEvidence(
+                component_id=component_id,
+                units="M-delta-omega-per-native-coordinate",
+                contributions=(SignedErrorContribution(
+                    channel_id=f"local:{component_id}:signed-root",
+                    family="signed-root",
+                    shared_group=component_id,
+                    delta=0.0j,
+                    units="M-delta-omega-per-native-coordinate",
+                    source_receipt=receipt,
+                    scope="local",
+                ),),
+                reason="structural unresolved component",
+                source_receipt=receipt,
+            )
+            for component_id in component_ids
+        }
+        first_plan = plans[0]
+        first_ids = (*first_plan.left_component_ids, *first_plan.right_component_ids)
+        for index, component_id in enumerate(first_ids):
+            components[component_id] = ResolvedComponentEvidence(
+                component_id=component_id,
+                centre=complex(index + 1, 0.25 * index),
+                units="M-delta-omega-per-native-coordinate",
+                contributions=(SignedErrorContribution(
+                    channel_id="shared:sealed-rank-one",
+                    family="signed-root",
+                    shared_group="sealed-rank-one",
+                    delta=complex((index + 1) * 1.0e-8, index * 2.0e-9),
+                    units="M-delta-omega-per-native-coordinate",
+                    source_receipt=receipt,
+                    scope="shared",
+                ),),
+            )
+        reduction = reduce_projective_rows(
+            "sealed-gram-binding-test",
+            tuple(plan.row_id for plan in plans),
+            components,
+            source_hashes=(receipt,),
+        )
+        payload["projective_comparisons"] = _projective_comparisons(
+            reduction, payload
+        )
+        gram = next(
+            item for item in reduction.empirical_grams
+            if item.construction_id == reduction.results[0].empirical_gram_id
+        )
+        self.assertEqual(len(reduction.empirical_grams), 1)
+        comparison = payload["projective_comparisons"][0]
+        comparison["covariance_id"] = gram.construction_id
+        payload_ids = (
+            *comparison["left_component_ids"],
+            *comparison["right_component_ids"],
+        )
+        payload["covariance_blocks"] = [{
+            "covariance_id": gram.construction_id,
+            "basis": [
+                {
+                    "component_id": component_id,
+                    "quadrature": quadrature,
+                    "units": "payload-contract-units",
+                }
+                for component_id in payload_ids
+                for quadrature in ("real", "imaginary")
+            ],
+            "matrix": [list(row) for row in gram.matrix],
+            "representation": "real-block-covariance-in-declared-basis-units",
+            "kind": "component-local-correlated-empirical",
+        }]
+        _validate_projective_reduction_bindings(reduction, payload)
+
+        forged = deepcopy(payload)
+        matrix = forged["covariance_blocks"][0]["matrix"]
+        for row in range(len(matrix)):
+            for column in range(len(matrix)):
+                if row // 2 != column // 2:
+                    matrix[row][column] = 0.0
+        with self.assertRaisesRegex(ValueError, "covariance|Gram"):
+            _validate_projective_reduction_bindings(reduction, forged)
 
     def test_cli_validates_admits_exports_and_runs_cold_then_warm(self) -> None:
         root = Path(__file__).resolve().parents[1]

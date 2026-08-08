@@ -64,6 +64,12 @@ def _mapping(value: object, subject: str) -> Mapping[str, object]:
     return value
 
 
+def _array(value: object, subject: str) -> list[object]:
+    if not isinstance(value, (list, tuple)):
+        raise ValueError(f"{subject} must be an array")
+    return list(value)
+
+
 def _freeze_json(value: object) -> object:
     if isinstance(value, Mapping):
         return MappingProxyType({key: _freeze_json(item) for key, item in value.items()})
@@ -273,13 +279,17 @@ def _validate_projective_reduction_bindings(
     summary: CampaignReductionSummary,
     payload: Mapping[str, object],
 ) -> None:
-    comparisons = payload["projective_comparisons"]
-    if not isinstance(comparisons, list) or len(comparisons) != 174:
+    comparisons = _array(
+        payload["projective_comparisons"], "admission projective comparisons"
+    )
+    if len(comparisons) != 174:
         raise ValueError(
             "admission requires exactly 174 projective comparisons from the reduction"
         )
     components_by_identity: dict[tuple[object, ...], Mapping[str, object]] = {}
-    for raw_component in payload["response_components"]:
+    for raw_component in _array(
+        payload["response_components"], "admission response components"
+    ):
         component = _mapping(raw_component, "admission response component")
         mode = _mapping(component["mode"], "admission component mode")
         mechanism = _mapping(
@@ -299,6 +309,21 @@ def _validate_projective_reduction_bindings(
         return components_by_identity[
             (*leaf.mode, leaf.spin.hex(), leaf.mechanism_id)
         ]
+
+    covariance_blocks: dict[str, Mapping[str, object]] = {}
+    for raw_block in _array(
+        payload["covariance_blocks"], "admission covariance blocks"
+    ):
+        block = _mapping(raw_block, "admission covariance block")
+        covariance_id = block.get("covariance_id")
+        if (
+            not isinstance(covariance_id, str)
+            or covariance_id in covariance_blocks
+        ):
+            raise ValueError("admission covariance block identities are invalid")
+        covariance_blocks[covariance_id] = block
+    grams = {item.construction_id: item for item in summary.empirical_grams}
+    referenced_grams: set[str] = set()
 
     for raw_comparison, plan, result in zip(
         comparisons, summary.plans, summary.results
@@ -347,6 +372,65 @@ def _validate_projective_reduction_bindings(
         if any(comparison.get(key) != value for key, value in expected.items()):
             raise ValueError(
                 "admission projective comparison does not match reduction row"
+            )
+        gram_id = result.empirical_gram_id
+        if gram_id is None:
+            if comparison.get("covariance_id") is not None:
+                raise ValueError(
+                    "admission unresolved row has unsealed covariance"
+                )
+            continue
+        referenced_grams.add(gram_id)
+        if comparison.get("covariance_id") != gram_id:
+            raise ValueError(
+                "admission covariance identity does not match reduction Gram"
+            )
+        block = covariance_blocks.get(gram_id)
+        gram = grams.get(gram_id)
+        if block is None or gram is None:
+            raise ValueError("admission reduction Gram covariance is missing")
+        expected_basis = [
+            (component["component_id"], quadrature)
+            for component in (*left, *right)
+            for quadrature in ("real", "imaginary")
+        ]
+        actual_basis: list[tuple[object, object]] = []
+        for raw_entry in _array(
+            block.get("basis"), "admission covariance basis"
+        ):
+            entry = _mapping(raw_entry, "admission covariance basis entry")
+            actual_basis.append(
+                (entry.get("component_id"), entry.get("quadrature"))
+            )
+        actual_matrix = [
+            _array(row, "admission covariance matrix row")
+            for row in _array(
+                block.get("matrix"), "admission covariance matrix"
+            )
+        ]
+        if (
+            actual_basis != expected_basis
+            or actual_matrix != [list(row) for row in gram.matrix]
+        ):
+            raise ValueError(
+                "admission covariance basis or matrix does not match reduction Gram"
+            )
+    if referenced_grams != set(grams):
+        raise ValueError("admission reduction Gram references are incomplete")
+    for covariance_id, block in covariance_blocks.items():
+        if covariance_id in referenced_grams:
+            continue
+        component_ids = {
+            _mapping(entry, "admission covariance basis entry").get(
+                "component_id"
+            )
+            for entry in _array(
+                block.get("basis"), "admission covariance basis"
+            )
+        }
+        if len(component_ids) != 1:
+            raise ValueError(
+                "admission contains unsealed cross-component covariance"
             )
 
 
