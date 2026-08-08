@@ -40,6 +40,7 @@ jobs:
           with zipfile.ZipFile(wheels[0]) as wheel:
               names = set(wheel.namelist())
           required = {
+              "windows_solver/linear_response_admission.py",
               "windows_solver/data/kerr_qnm_roots_2736.csv",
               "windows_solver/data/kerr_qnm_lattice_receipt.json",
               "windows_solver/data/LICENSE-CANONICAL-BACKEND-MIT.txt",
@@ -60,6 +61,10 @@ jobs:
         run: python -m compileall -q src tests tools
       - name: Run tests
         run: python -m unittest discover -s tests -v
+      - name: Run M02 admission and cache gate
+        run: python -m unittest tests.test_linear_response_admission -v
+      - name: Run M02 head-tail-risk campaign smoke
+        run: solver campaign-smoke
       - name: Plan full evidence request
         run: solver plan examples/evidence-plan.json
       - name: Run admitted provider
@@ -125,6 +130,21 @@ jobs:
           require(
               direct.stdout == wrapped.stdout and direct.stderr == wrapped.stderr == b"",
               "Windows entry points returned different plan streams.",
+              direct,
+              wrapped,
+          )
+
+          direct = invoke(module, "campaign-smoke")
+          wrapped = invoke(launcher, "campaign-smoke")
+          require(
+              direct.returncode == wrapped.returncode == 0,
+              "M02 campaign smoke failed through one Windows entry point.",
+              direct,
+              wrapped,
+          )
+          require(
+              direct.stdout == wrapped.stdout and direct.stderr == wrapped.stderr == b"",
+              "Windows entry points returned different M02 smoke streams.",
               direct,
               wrapped,
           )
