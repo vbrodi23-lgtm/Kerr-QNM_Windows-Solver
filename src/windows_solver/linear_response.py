@@ -1729,13 +1729,34 @@ def validate_linear_response_payload(
     selections = validate_linear_response_request(request)
     try:
         actual_provider = canonical_json_bytes(dict(provider))
+        admitted_provider = LINEAR_RESPONSE_ADMITTED_DESCRIPTOR.to_mapping()
         expected_providers = {
             canonical_json_bytes(LINEAR_RESPONSE_DESCRIPTOR.to_mapping()),
-            canonical_json_bytes(LINEAR_RESPONSE_ADMITTED_DESCRIPTOR.to_mapping()),
+            canonical_json_bytes(admitted_provider),
         }
+        dynamic_provider = dict(provider)
+        dynamic_version = dynamic_provider.get("implementation_version")
+        dynamic_prefix = (
+            LINEAR_RESPONSE_ADMITTED_DESCRIPTOR.implementation_version
+            + "+m02-admission-"
+        )
+        dynamic_suffix = (
+            dynamic_version.removeprefix(dynamic_prefix)
+            if isinstance(dynamic_version, str)
+            and dynamic_version.startswith(dynamic_prefix)
+            else ""
+        )
+        dynamic_provider["implementation_version"] = (
+            LINEAR_RESPONSE_ADMITTED_DESCRIPTOR.implementation_version
+        )
+        valid_dynamic_provider = (
+            _HEX_64.fullmatch(dynamic_suffix) is not None
+            and canonical_json_bytes(dynamic_provider)
+            == canonical_json_bytes(admitted_provider)
+        )
     except (RecursionError, TypeError, ValueError) as error:
         raise ValueError("linear-response provider contract is invalid") from error
-    if actual_provider not in expected_providers:
+    if actual_provider not in expected_providers and not valid_dynamic_provider:
         raise ValueError("linear-response provider contract is invalid")
     policy = _object(
         request.numerical_policy.get("linear-response"),

@@ -6,7 +6,7 @@ Add the newest completed task or milestone-control entry immediately below this 
 
 - **Task:** TASK-011 — Build fail-closed M02 validation, admission, and operator closure commands.
 - **Deliverable:** Immutable complete-evidence admission package with exact produced-record component binding and a detached expected-ID load boundary, explicit dynamic provider transition, deterministic validation/admission/export CLI, exact sparse 87-root upstream selection, cold/warm cache proof, PowerShell operator runbook, package checks, and hosted platform gates.
-- **Verification:** 213 local tests passed, including stale value/state and malformed input regressions; GitHub Actions run `31246790408` passed on Ubuntu and Windows before the final review binding was added; the final PR head must repeat every hosted gate before review readiness; board, release manifest, compile, and diff gates passed.
+- **Verification:** 214 local tests passed, including stale value/state, resealed package, cross-package cache, and malformed input regressions; GitHub Actions run `31246790408` passed on Ubuntu and Windows before the final review bindings were added; the final PR head must repeat every hosted gate before review readiness; board, release manifest, compile, and diff gates passed.
 - **Evidence ceiling:** Software and operator handoff are ready. No physical 553-leaf campaign or populated scientific atlas ran; the default provider remains unavailable until the user's complete evidence passes admission.
 - **Change reference:** admission `be706164`; CLI/integration `dbb20779`; handoff/CI `5ecb2f05`; stable cross-platform identities `3580b73f` and `2b09a9b4`; immutable package `759b37f2`; closure `57e4d4ee`; PR #5.
 

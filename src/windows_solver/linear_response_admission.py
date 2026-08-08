@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import hashlib
 import json
 from pathlib import Path
@@ -499,6 +499,14 @@ class AdmittedLinearResponseProvider:
             raise ValueError(
                 "admitted provider package does not match expected admission identity"
             )
+        self.descriptor = replace(
+            ADMITTED_LINEAR_RESPONSE_DESCRIPTOR,
+            implementation_version=(
+                ADMITTED_LINEAR_RESPONSE_DESCRIPTOR.implementation_version
+                + "+"
+                + package.admission_id
+            ),
+        )
         self._package = package
 
     def execute(

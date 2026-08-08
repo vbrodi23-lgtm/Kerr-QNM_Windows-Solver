@@ -44,7 +44,12 @@ def _write_json(path: Path, value: object) -> None:
     path.write_bytes(canonical_json_bytes(value))
 
 
-def _admission_fixture(directory: Path, *, complete: bool) -> Path:
+def _admission_fixture(
+    directory: Path,
+    *,
+    complete: bool,
+    first_component_reason: str | None = None,
+) -> Path:
     evidence_directory = directory / "evidence"
     leaves = list(B_PRIME_RELEASE_DOMAIN.production_leaves)
     manifest = _write_manifest(
@@ -60,6 +65,10 @@ def _admission_fixture(directory: Path, *, complete: bool) -> Path:
     _write_json(request_path, request.to_mapping())
 
     payload = b_prime_payload(request)
+    if first_component_reason is not None:
+        payload["response_components"][0]["result"]["reason"] = (
+            first_component_reason
+        )
     components_by_identity = {
         (
             component["mode"]["ell"],
@@ -180,7 +189,11 @@ class LinearResponseAdmissionTests(unittest.TestCase):
             provider = AdmittedLinearResponseProvider(
                 package, expected_admission_id=package.admission_id
             )
-            self.assertEqual(provider.descriptor, ADMITTED_LINEAR_RESPONSE_DESCRIPTOR)
+            expected_descriptor = ADMITTED_LINEAR_RESPONSE_DESCRIPTOR.to_mapping()
+            expected_descriptor["implementation_version"] += (
+                "+" + package.admission_id
+            )
+            self.assertEqual(provider.descriptor.to_mapping(), expected_descriptor)
             registry = default_registry(provider)
             self.assertIs(registry.resolve(Capability.LINEAR_RESPONSE), provider)
             result = provider.execute(
@@ -350,6 +363,61 @@ class LinearResponseAdmissionTests(unittest.TestCase):
             )
             self.assertEqual(unpinned.returncode, 2)
             self.assertIn("detached admission ID", unpinned.stderr)
+
+    def test_admission_identity_separates_persistent_cache(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            packages: list[tuple[Path, LinearResponseAdmissionPackage]] = []
+            for label in ("package-a", "package-b"):
+                package_directory = directory / label
+                package_directory.mkdir()
+                manifest = _admission_fixture(
+                    package_directory,
+                    complete=True,
+                    first_component_reason=label,
+                )
+                package = admit_linear_response_bundle(manifest)
+                package_path = package_directory / "admitted.json"
+                _write_json(package_path, package.to_mapping())
+                packages.append((package_path, package))
+
+            def run(
+                package_path: Path, package: LinearResponseAdmissionPackage
+            ) -> subprocess.CompletedProcess[str]:
+                return subprocess.run(
+                    [
+                        sys.executable,
+                        "-m",
+                        "windows_solver",
+                        "run",
+                        str(package_path.parent / "request.json"),
+                        "--store",
+                        str(directory / "shared-store"),
+                        "--linear-response-admission",
+                        str(package_path),
+                        "--linear-response-admission-id",
+                        package.admission_id,
+                    ],
+                    cwd=directory,
+                    env={"PYTHONPATH": str(root / "src")},
+                    text=True,
+                    capture_output=True,
+                )
+
+            first = run(*packages[0])
+            second = run(*packages[1])
+            self.assertEqual(first.returncode, 0, first.stderr)
+            self.assertEqual(second.returncode, 0, second.stderr)
+            first_run = json.loads(first.stdout)
+            second_run = json.loads(second.stdout)
+            self.assertEqual(first_run["provider_execution_count"], 3)
+            self.assertEqual(second_run["provider_execution_count"], 1)
+            self.assertEqual(second_run["cache_hit_count"], 2)
+            self.assertNotEqual(
+                first_run["artifact_ids"]["linear-response"],
+                second_run["artifact_ids"]["linear-response"],
+            )
 
 
 if __name__ == "__main__":

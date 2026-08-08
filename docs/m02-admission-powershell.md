@@ -132,4 +132,6 @@ upstream, and linear-response artifacts. Repeating the identical command
 against the same store reuses all three verified artifacts with zero provider
 work. A different request, modified package, incomplete bundle, partial smoke,
 missing package, missing detached ID, or ID mismatch cannot register the
-provider.
+provider. The admission ID is also part of the response provider's cache
+identity, so a second valid package cannot reuse a response artifact produced
+by a different admitted package in the same store.

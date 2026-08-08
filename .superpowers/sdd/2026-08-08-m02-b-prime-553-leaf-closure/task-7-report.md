@@ -36,8 +36,8 @@ scientific claim, and the default linear-response provider remains unavailable.
 ## Verification
 
 - Fresh local full suite:
-  `PYTHONPATH=src python -m unittest discover -s tests -v` — 213/213 passed.
-- Focused admission, contract, engine, and CLI suite — 59/59 passed.
+  `PYTHONPATH=src python -m unittest discover -s tests -v` — 214/214 passed.
+- Focused admission, contract, engine, and CLI suite — 61/61 passed.
 - Cross-platform identity and provider regression suite — 14/14 passed.
 - GitHub Actions run `31246301132`, head `759b37f2faaad6056d94de6a86e4f8bc1c8e800f`:
   - `ubuntu-latest` passed install, build/wheel inspection, compile, 212 tests,
@@ -70,6 +70,10 @@ scientific claim, and the default linear-response provider remains unavailable.
 - Serialized package loads are pinned to the detached ID emitted by
   `m02-admit`; `plan`, `run`, and `m02-export` reject a missing or mismatched ID,
   including a modified package with a recomputed internal content hash.
+- The same admission ID is embedded in the admitted provider's instance
+  version, so two valid packages for the same request have distinct cache keys;
+  the second package reuses only the common problem/spectrum ancestors and
+  executes its own response provider.
 - The release-data regression now hashes all eight pinned catalogue, receipt,
   manifest, overlay, and license files from disk, complementing the simulated
   `core.autocrlf=true` checkout test.
