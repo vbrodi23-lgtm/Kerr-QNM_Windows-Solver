@@ -24,7 +24,13 @@ import sys
 import tempfile
 from typing import Any, Callable, Mapping, Protocol, Sequence
 
-from .contracts import Capability, ModeKey, StudyRequest, canonical_json_bytes
+from .contracts import (
+    Capability,
+    ModeKey,
+    StudyRequest,
+    canonical_json_bytes,
+    canonical_text_sha256,
+)
 from .linear_response import (
     B_PRIME_RELEASE_DOMAIN,
     BPrimeLeaf,
@@ -1254,7 +1260,7 @@ def _runtime_fingerprint() -> str:
 
 
 def _engine_source_sha256() -> str:
-    return hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+    return canonical_text_sha256(Path(__file__).read_bytes())
 
 
 @dataclass(frozen=True, slots=True)

@@ -10,7 +10,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from windows_solver.contracts import canonical_json_bytes
+from windows_solver.contracts import canonical_json_bytes, canonical_text_sha256
 from windows_solver.linear_response import B_PRIME_RELEASE_DOMAIN
 from windows_solver.response_batches import (
     CAMPAIGN_SCHEMA_VERSION,
@@ -61,6 +61,16 @@ def _synthetic_stage_outcome(**values):
 
 
 class CampaignPlanTests(unittest.TestCase):
+    def test_source_identity_is_stable_across_checkout_line_endings(self) -> None:
+        """Catches Windows checkout conversion changing campaign lineage."""
+
+        source_lf = b"first = 1\nsecond = 2\n"
+        source_crlf = source_lf.replace(b"\n", b"\r\n")
+        self.assertEqual(
+            canonical_text_sha256(source_lf),
+            canonical_text_sha256(source_crlf),
+        )
+
     def test_stage_digest_owns_complete_signed_channels_and_v1_is_stale(self) -> None:
         """Catches caller-injected or undigested signed numerical evidence."""
 

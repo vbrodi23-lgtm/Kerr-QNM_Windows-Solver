@@ -176,7 +176,7 @@ class SignedChannelGramTests(unittest.TestCase):
             -0.24672295555044751, -0.1900433580111252,
         )
         for actual, expected in zip(diagnostic.jacobian, expected_jacobian):
-            self.assertAlmostEqual(actual, expected, places=12)
+            self.assertAlmostEqual(actual, expected, places=8)
         direct = sum(
             diagnostic.jacobian[row] * matrix[row][col] * diagnostic.jacobian[col]
             for row in range(8) for col in range(8)

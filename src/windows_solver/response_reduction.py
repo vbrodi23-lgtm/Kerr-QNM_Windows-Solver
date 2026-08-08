@@ -432,10 +432,8 @@ def build_empirical_error_gram(
     channel_order: list[str] = []
     metadata: dict[str, tuple[str, str, str, str]] = {}
     component_deltas: list[dict[str, complex]] = []
-    local_disks: dict[str, float] = {}
     for component in ordered_components:
         deltas: dict[str, complex] = {}
-        local_disks[component.component_id] = 0.0
         for contribution in component.contributions:
             channel_id = contribution.channel_id
             candidate = (
@@ -452,7 +450,6 @@ def build_empirical_error_gram(
                 metadata[channel_id] = candidate
                 channel_order.append(channel_id)
             deltas[channel_id] = complex(contribution.delta)
-            local_disks[component.component_id] += abs(complex(contribution.delta))
         component_deltas.append(deltas)
 
     columns: list[tuple[float, ...]] = []
@@ -469,6 +466,7 @@ def build_empirical_error_gram(
     )
     matrix = _outer_product_sum(columns, len(basis))
     local_marginals = _gram_local_marginals(basis, matrix)
+    local_disks = _gram_local_disks_from_columns(basis, columns)
     material = {
         "kind": EMPIRICAL_GRAM_KIND,
         "basis": basis,

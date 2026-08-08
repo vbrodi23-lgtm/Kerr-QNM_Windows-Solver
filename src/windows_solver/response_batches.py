@@ -17,7 +17,7 @@ import re
 import tempfile
 from typing import Mapping, Sequence
 
-from .contracts import canonical_json_bytes
+from .contracts import canonical_json_bytes, canonical_text_sha256
 from .linear_response import B_PRIME_RELEASE_DOMAIN, BPrimeLeaf
 from .response_engine import (
     BackendIdentity,
@@ -69,7 +69,7 @@ def _sha256(value: object) -> str:
 
 
 def _campaign_source_sha256() -> str:
-    return hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+    return canonical_text_sha256(Path(__file__).read_bytes())
 
 
 def resolve_campaign_relative_path(
@@ -83,6 +83,7 @@ def resolve_campaign_relative_path(
         Path(relative_path).is_absolute()
         or windows.is_absolute()
         or windows.drive
+        or normalized.startswith("/")
         or normalized.startswith("//")
         or re.match(r"^[A-Za-z]:", relative_path)
         or ":" in relative_path

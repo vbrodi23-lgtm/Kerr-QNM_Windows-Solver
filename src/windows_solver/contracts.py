@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
+import hashlib
 import json
 import math
 from pathlib import Path
@@ -12,6 +13,19 @@ from typing import Any, Mapping
 
 _MAX_STUDY_BYTES = 4 * 1024 * 1024
 _MAX_JSON_DEPTH = 64
+
+
+def canonical_text_sha256(value: bytes) -> str:
+    """Hash UTF-8 source text independently of checkout line endings."""
+
+    if not isinstance(value, bytes):
+        raise ValueError("canonical text must be bytes")
+    normalized = value.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+    try:
+        normalized.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise ValueError("canonical text must be UTF-8") from error
+    return hashlib.sha256(normalized).hexdigest()
 
 
 class Capability(str, Enum):
