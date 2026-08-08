@@ -1,5 +1,50 @@
 # Done
 
+## TASK-011: Build fail-closed M02 validation, admission, and operator closure commands
+**Priority:** P1 | **Tags:** M02, provider, validation, tooling
+**Assignee:** Codex | **Estimate:** 1 day | **Milestone:** M02
+
+### Objective
+
+Finish the installable M02 machinery and operator handoff while keeping the linear-response provider unavailable until the user's complete PowerShell evidence bundle passes admission.
+
+### Acceptance Criteria
+
+- [x] Validate exactly 553 produced leaves, zero missing leaves, governed unresolved IDs, 174 aligned projective rows, role ceilings, hashes, runtime lineage, and policy identity.
+- [x] Provide PowerShell-friendly `validate`, `reduce`, `admit`, and `export` commands with deterministic machine-readable output and useful failure messages.
+- [x] Prove smoke/partial bundles cannot register the provider; prove a structurally complete signed test bundle exercises the availability transition without claiming scientific evidence.
+- [x] Keep exactly one provider owner, unrelated capabilities unchanged, and admission contingent on the external evidence receipt rather than build completion.
+- [x] Pass Windows-oriented command/path tests, Ubuntu tests, cold/warm cache, wheel content, manifest, compile, and head/tail/risk end-to-end smoke gates.
+
+### Dependencies
+
+- **Blocked by:** TASK-010
+- **Blocks:** TASK-037, TASK-038
+
+### Evidence Output
+
+Installable fail-closed admission package and CLI; an explicit dynamic provider transition only for a complete admitted package; exact sparse 87-root upstream selection; PowerShell operator runbook; cold/warm cache, wheel, manifest, and head/tail/risk smoke gates; and a build-completion report that keeps scientific evidence pending.
+
+### Verification
+
+- `PYTHONPATH=src python -m unittest discover -s tests -v` — 212 passed.
+- Hosted GitHub Actions run `31246301132` passed on `ubuntu-latest` and `windows-latest`, including full tests, wheel inspection, M02 admission/cache, campaign smoke, planning, admitted providers, and PowerShell 5.1 launcher parity.
+- `python .tasks/validate_board.py`, `python tools/validate_release_manifest.py`, `python -m compileall -q src tools tests`, and `git diff --check` — passed.
+- **Evidence ceiling:** Structurally complete signed test evidence only; no 553-leaf physical campaign, populated scientific atlas, or scientific claim. The default provider remains unavailable until the user's complete operator package passes admission.
+- **Change references:** admission core `be706164cab2574f2f102f35f625ea72ddfe8430`; CLI/integration `dbb20779f8cca44ceff2a47be23f3853ec0c342b`; handoff/CI `5ecb2f050426650db504959c18b728e29320aadb`; cross-platform identity fixes `3580b73f432d808c4e032a1bb6d68b7d1ea730ac` and `2b09a9b48097c15fcae49c5bdeada3f914e8f7c8`; immutable admitted package `759b37f2faaad6056d94de6a86e4f8bc1c8e800f`.
+
+### Review Focus
+
+Complete/partial separation is fail closed; the admitted package is deeply immutable; provider registration is explicit and unique; native runtime identity is stable across Windows and Ubuntu; operator paths and CLI output are deterministic; scientific readiness is not inferred from build readiness.
+
+### Plan
+
+- Bound the exact 553-leaf campaign and 174-row reduction to one immutable, hash- and lineage-validated admission package.
+- Added deterministic `m02-validate`, `m02-admit`, and `m02-export` commands plus explicit `plan`/`run` admission input and exact sparse spectral selection.
+- Proved partial rejection, structural full-bundle transition, cold/warm replay, packaging, PowerShell parity, and both hosted operating systems before closing software readiness.
+
+---
+
 ## TASK-010: Build the empirical uncertainty and projective-reduction pipeline
 **Priority:** P1 | **Tags:** M02, evidence, physics, tooling
 **Assignee:** Codex | **Estimate:** 1–2 days | **Milestone:** M02

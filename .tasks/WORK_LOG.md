@@ -2,6 +2,14 @@
 
 Add the newest completed task or milestone-control entry immediately below this heading.
 
+## 2026-08-08 — TASK-011 M02 admission and operator closure completed
+
+- **Task:** TASK-011 — Build fail-closed M02 validation, admission, and operator closure commands.
+- **Deliverable:** Immutable complete-evidence admission package, explicit dynamic provider transition, deterministic validation/admission/export CLI, exact sparse 87-root upstream selection, cold/warm cache proof, PowerShell operator runbook, package checks, and hosted platform gates.
+- **Verification:** 212 local tests passed; GitHub Actions run `31246301132` passed on Ubuntu and Windows, including wheel, admission/cache, head/tail/risk campaign smoke, planning, provider, spectrum-provider, and PowerShell launcher checks; board, release manifest, compile, and diff gates passed.
+- **Evidence ceiling:** Software and operator handoff are ready. No physical 553-leaf campaign or populated scientific atlas ran; the default provider remains unavailable until the user's complete evidence passes admission.
+- **Change reference:** admission `be706164`; CLI/integration `dbb20779`; handoff/CI `5ecb2f05`; stable cross-platform identities `3580b73f` and `2b09a9b4`; immutable package `759b37f2`; PR #5.
+
 ## 2026-08-08 — TASK-010 empirical uncertainty/projective reducer completed
 
 - **Task:** TASK-010 — Build the empirical uncertainty and projective-reduction pipeline.
