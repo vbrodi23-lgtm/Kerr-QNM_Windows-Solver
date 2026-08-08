@@ -28,6 +28,9 @@ LINEAR_RESPONSE_EQUATIONS_ID = "simple-root-first-order-qnm-shift"
 LINEAR_RESPONSE_CONVENTIONS_ID = "request-bound-linear-response"
 LINEAR_RESPONSE_OUTPUT_ARTIFACT_TYPE = "kerr-qnm-linear-response"
 LINEAR_RESPONSE_EVIDENCE_LEVEL = "contract-only-not-admitted"
+LINEAR_RESPONSE_ADMITTED_EVIDENCE_LEVEL = (
+    "complete-operator-bundle-structurally-admitted"
+)
 LINEAR_RESPONSE_QUANTITY = "first-order-complex-qnm-frequency-shift"
 LINEAR_RESPONSE_EVIDENCE_CEILING = (
     "component-local-empirical-not-formal-enclosure"
@@ -45,6 +48,22 @@ LINEAR_RESPONSE_DESCRIPTOR = ProviderDescriptor(
     output_artifact_type=LINEAR_RESPONSE_OUTPUT_ARTIFACT_TYPE,
     available=False,
     evidence_level=LINEAR_RESPONSE_EVIDENCE_LEVEL,
+)
+
+LINEAR_RESPONSE_ADMITTED_DESCRIPTOR = ProviderDescriptor(
+    capability=Capability.LINEAR_RESPONSE,
+    provider_id=LINEAR_RESPONSE_PROVIDER_ID,
+    implementation_version=LINEAR_RESPONSE_IMPLEMENTATION_VERSION,
+    equations_id=LINEAR_RESPONSE_EQUATIONS_ID,
+    conventions_id=LINEAR_RESPONSE_CONVENTIONS_ID,
+    runtime_fingerprint=LINEAR_RESPONSE_DESCRIPTOR.runtime_fingerprint,
+    numerical_policy_fingerprint=(
+        LINEAR_RESPONSE_DESCRIPTOR.numerical_policy_fingerprint
+    ),
+    upstream_artifact_types=LINEAR_RESPONSE_DESCRIPTOR.upstream_artifact_types,
+    output_artifact_type=LINEAR_RESPONSE_OUTPUT_ARTIFACT_TYPE,
+    available=True,
+    evidence_level=LINEAR_RESPONSE_ADMITTED_EVIDENCE_LEVEL,
 )
 
 _GENERAL_RELATIVITY = "general-relativity"
@@ -1710,12 +1729,13 @@ def validate_linear_response_payload(
     selections = validate_linear_response_request(request)
     try:
         actual_provider = canonical_json_bytes(dict(provider))
-        expected_provider = canonical_json_bytes(
-            LINEAR_RESPONSE_DESCRIPTOR.to_mapping()
-        )
+        expected_providers = {
+            canonical_json_bytes(LINEAR_RESPONSE_DESCRIPTOR.to_mapping()),
+            canonical_json_bytes(LINEAR_RESPONSE_ADMITTED_DESCRIPTOR.to_mapping()),
+        }
     except (RecursionError, TypeError, ValueError) as error:
         raise ValueError("linear-response provider contract is invalid") from error
-    if actual_provider != expected_provider:
+    if actual_provider not in expected_providers:
         raise ValueError("linear-response provider contract is invalid")
     policy = _object(
         request.numerical_policy.get("linear-response"),

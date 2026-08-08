@@ -16,7 +16,7 @@ from .contracts import (
     StudyRequest,
     canonical_json_bytes,
 )
-from .providers import ProviderDescriptor, ProviderRegistry, ProviderResult
+from .providers import Provider, ProviderDescriptor, ProviderRegistry, ProviderResult
 from .spectrum import SpectralCatalogProvider
 
 
@@ -57,5 +57,15 @@ class ProblemContractProvider:
         )
 
 
-def default_registry() -> ProviderRegistry:
-    return ProviderRegistry((ProblemContractProvider(), SpectralCatalogProvider()))
+def default_registry(
+    linear_response_provider: Provider | None = None,
+) -> ProviderRegistry:
+    providers: tuple[Provider, ...] = (
+        ProblemContractProvider(),
+        SpectralCatalogProvider(),
+    )
+    if linear_response_provider is not None:
+        if linear_response_provider.descriptor.capability is not Capability.LINEAR_RESPONSE:
+            raise ValueError("optional provider must own linear-response")
+        providers = (*providers, linear_response_provider)
+    return ProviderRegistry(providers)
