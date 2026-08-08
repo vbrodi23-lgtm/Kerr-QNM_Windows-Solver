@@ -31,7 +31,7 @@ Installable fail-closed admission package and CLI; an explicit dynamic provider 
 - Hosted GitHub Actions run `31246301132` passed on `ubuntu-latest` and `windows-latest`, including full tests, wheel inspection, M02 admission/cache, campaign smoke, planning, admitted providers, and PowerShell 5.1 launcher parity.
 - `python .tasks/validate_board.py`, `python tools/validate_release_manifest.py`, `python -m compileall -q src tools tests`, and `git diff --check` — passed.
 - **Evidence ceiling:** Structurally complete signed test evidence only; no 553-leaf physical campaign, populated scientific atlas, or scientific claim. The default provider remains unavailable until the user's complete operator package passes admission.
-- **Change references:** admission core `be706164cab2574f2f102f35f625ea72ddfe8430`; CLI/integration `dbb20779f8cca44ceff2a47be23f3853ec0c342b`; handoff/CI `5ecb2f050426650db504959c18b728e29320aadb`; cross-platform identity fixes `3580b73f432d808c4e032a1bb6d68b7d1ea730ac` and `2b09a9b48097c15fcae49c5bdeada3f914e8f7c8`; immutable admitted package `759b37f2faaad6056d94de6a86e4f8bc1c8e800f`.
+- **Change references:** admission core `be706164cab2574f2f102f35f625ea72ddfe8430`; CLI/integration `dbb20779f8cca44ceff2a47be23f3853ec0c342b`; handoff/CI `5ecb2f050426650db504959c18b728e29320aadb`; cross-platform identity fixes `3580b73f432d808c4e032a1bb6d68b7d1ea730ac` and `2b09a9b48097c15fcae49c5bdeada3f914e8f7c8`; immutable admitted package `759b37f2faaad6056d94de6a86e4f8bc1c8e800f`; TaskPlanner/report closure `57e4d4ee1e779e299ad97413c19441755e57a774`.
 
 ### Review Focus
 

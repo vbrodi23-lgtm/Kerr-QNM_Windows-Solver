@@ -57,6 +57,9 @@ scientific claim, and the default linear-response provider remains unavailable.
   minimal child-process identities equal on Windows.
 - The admitted package now deep-freezes nested mappings and sequences; provider
   payloads are thawed copies, so callers cannot mutate admission state.
+- Malformed non-string unresolved-leaf IDs now fail with the declared
+  `ValueError` boundary instead of leaking an unhashable-container `TypeError`;
+  the focused regression covers the hostile nested-object form.
 
 ## Commit SHA(s)
 
@@ -66,7 +69,8 @@ scientific claim, and the default linear-response provider remains unavailable.
 - `3580b73f432d808c4e032a1bb6d68b7d1ea730ac` — stable native adapter source contract.
 - `2b09a9b48097c15fcae49c5bdeada3f914e8f7c8` — cross-process interpreter architecture identity.
 - `759b37f2faaad6056d94de6a86e4f8bc1c8e800f` — immutable admitted package and mutation regression.
-- TaskPlanner/report closure is recorded by the commit containing this report.
+- `57e4d4ee1e779e299ad97413c19441755e57a774` — TaskPlanner and build-readiness report closure.
+- Final input-boundary review remediation is recorded by the commit containing this updated report.
 
 ## Scientific ceiling and operator next step
 

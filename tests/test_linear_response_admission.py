@@ -177,6 +177,11 @@ class LinearResponseAdmissionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "evidence|identity|553"):
             LinearResponseAdmissionPackage.from_mapping(forged)
 
+        malformed = deepcopy(mapping)
+        malformed["evidence_receipt"]["unresolved_leaf_ids"] = [{}]
+        with self.assertRaisesRegex(ValueError, "unresolved leaf IDs"):
+            LinearResponseAdmissionPackage.from_mapping(malformed)
+
     def test_cli_validates_admits_exports_and_runs_cold_then_warm(self) -> None:
         root = Path(__file__).resolve().parents[1]
         with tempfile.TemporaryDirectory() as temporary:

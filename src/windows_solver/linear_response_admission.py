@@ -161,7 +161,11 @@ def _validate_evidence_receipt(value: object) -> Mapping[str, object]:
         "admission evidence receipt",
     )
     unresolved = receipt["unresolved_leaf_ids"]
-    if not isinstance(unresolved, list) or len(unresolved) != len(set(unresolved)):
+    if (
+        not isinstance(unresolved, list)
+        or any(not isinstance(item, str) for item in unresolved)
+        or len(unresolved) != len(set(unresolved))
+    ):
         raise ValueError("admission unresolved leaf IDs are invalid")
     domain = set(B_PRIME_RELEASE_DOMAIN.production_leaf_ids)
     if any(item not in domain for item in unresolved):
