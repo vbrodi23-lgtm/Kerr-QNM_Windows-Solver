@@ -1,5 +1,176 @@
 # Backlog
 
+## TASK-076: Prove the clean-machine M02 campaign path on Windows and Ubuntu
+**Priority:** P0 | **Tags:** M02, validation, release, provider
+**Assignee:** Unassigned | **Estimate:** 1–2 days | **Milestone:** M02
+
+### Objective
+
+Demonstrate that a fresh public checkout can provision its own runtimes, obtain its pinned upstream sources, and execute/resume representative M02 leaves before the full campaign begins.
+
+### Acceptance Criteria
+
+- [ ] From a clean checkout with no system Python or Julia dependency, provision the package-local Python numerical tier and pinned Julia/GSN backend through the documented PowerShell entrypoint.
+- [ ] Execute canonical primary, control, and deep leaves covering horizon plus all six exterior mechanisms, negative m, direct χ, exact Mκ, binary64, 80-digit, and 120-digit paths.
+- [ ] Validate checkpoint resume, zero-work reuse, backend/source identity, failure recovery, path-with-spaces behavior, and PowerShell 5.1 compatibility.
+- [ ] Repeat the supported campaign smoke on Ubuntu and reconcile deterministic identities or explicitly bounded platform-dependent numerical fields.
+- [ ] Publish one operator command sequence that proceeds from fresh checkout to validated campaign checkpoint without manual dependency hunting.
+
+### Dependencies
+
+- **Blocked by:** TASK-075
+- **Blocks:** TASK-077
+
+### Evidence Output
+
+Clean-machine bootstrap/campaign receipts, representative multi-precision checkpoints, platform reconciliation, and the final PowerShell production runbook.
+
+### Verification
+
+- `python .tasks/validate_board.py`
+- Native Windows PowerShell 5.1 clean-checkout campaign smoke.
+- Hosted Windows and Ubuntu full tests, package checks, resume, and zero-work reuse gates.
+
+### Review Focus
+
+Inspect fresh-machine assumptions, executable discovery, upstream pinning, precision dispatch, checkpoint durability, and whether the documented command actually reaches physical response computation.
+
+### Plan
+
+- Exercise the complete bootstrap and source-provisioning path from a clean checkout.
+- Run a risk-complete representative campaign and resume it.
+- Reconcile platforms and freeze the production command only after the path passes.
+
+---
+
+## TASK-077: Execute and validate the complete 553-leaf physical response campaign
+**Priority:** P0 | **Tags:** M02, physics, evidence, validation
+**Assignee:** Unassigned | **Estimate:** 1–2 days plus compute time | **Milestone:** M02
+
+### Objective
+
+Produce the complete frozen M02 physical evidence bundle instead of stopping at software readiness or representative smoke.
+
+### Acceptance Criteria
+
+- [ ] Execute exactly 441 primary, 48 control, and 64 deep leaves from the frozen campaign plan with zero missing IDs.
+- [ ] Preserve component values, signed numerical-error channels, root identities, backend/source receipts, precision decisions, refinement ladders, and atomic resumable checkpoints for every leaf.
+- [ ] Enforce the declared deep-precision triggers and all fixed 80-digit sentinels; escalate to 120 digits where required and record governed `UNRESOLVED` outcomes rather than dropping work.
+- [ ] Validate branch, angular, readout, continuation, finite-difference, and precision diagnostics without tuning thresholds after results are visible.
+- [ ] Produce one complete campaign checkpoint that passes full validation and can be independently reloaded from a fresh process.
+
+### Dependencies
+
+- **Blocked by:** TASK-076
+- **Blocks:** TASK-078
+
+### Evidence Output
+
+Complete authenticated 553-leaf physical response checkpoint with primary, control, and deep evidence ledgers.
+
+### Verification
+
+- `solver campaign-validate SELECTION.json --checkpoint CHECKPOINT.json --full`
+- Exact 553-ID completeness, zero-missing, precision-sentinel, provenance, and fresh-process reload checks.
+- Independent review of failures and unresolved leaves before reduction.
+
+### Review Focus
+
+Check for silently skipped leaves, post-result threshold changes, stale backend/cache reuse, branch swaps, false precision success, and controls promoted beyond their evidence role.
+
+### Plan
+
+- Run the campaign in resumable cohorts through the validated public backend.
+- Validate each cohort immediately and repair execution defects without changing scientific thresholds.
+- Merge and independently reload the complete checkpoint.
+
+---
+
+## TASK-078: Reduce the physical atlas, admit the provider, and close M02
+**Priority:** P0 | **Tags:** M02, provider, evidence, release
+**Assignee:** Unassigned | **Estimate:** 1–2 days | **Milestone:** M02
+
+### Objective
+
+Turn the complete campaign into the admitted component-local uncertainty and projective-response result required by M02.
+
+### Acceptance Criteria
+
+- [ ] Reduce the authenticated 553 leaves into exactly 162 primary and 12 deep projective rows with checkpoint-derived centres, signed channels, empirical Gram matrices, component disks, and outcome-neutral classifications.
+- [ ] Admit one immutable linear-response package only after exact campaign, spectral-upstream, reduction, payload, policy, runtime, and detached admission-ID reconciliation passes.
+- [ ] Run the admitted provider through cold and zero-work warm studies on Windows and Ubuntu; export and reload the package without identity drift.
+- [ ] Publish the scientific result at its weakest supported evidence ceiling, including bounded, unresolved, contradicted, or indeterminate rows without favorable-outcome requirements.
+- [ ] Reconcile TaskPlanner, the release manifest, operator documentation, and the Notion M02 milestone to the exact merged commit and evidence package.
+
+### Dependencies
+
+- **Blocked by:** TASK-077
+- **Blocks:** TASK-012, TASK-037, TASK-038
+
+### Evidence Output
+
+Admitted linear-response package, populated 174-row atlas, provider/platform receipts, claim-bounded M02 result, and milestone closure record.
+
+### Verification
+
+- `solver m02-validate ADMISSION-INPUT.json`
+- `solver m02-admit ADMISSION-INPUT.json --output ADMITTED.json`
+- Research verification, Windows/Ubuntu cold/warm equivalence, export/reload, full tests, release-manifest validation, and independent review.
+
+### Review Focus
+
+Inspect exact evidence-to-payload binding, covariance/Gram identity, zero-containing disks, outcome neutrality, cross-platform replay, and every claim made from the atlas.
+
+### Plan
+
+- Reduce and independently validate the complete checkpoint.
+- Admit, replay, export, and cross-platform verify the physical package.
+- Publish the bounded result and close M02 only after merge and evidence reconciliation.
+
+---
+
+## TASK-012: Define spectral-field, co-mode, residue, and genealogy contracts
+**Priority:** P1 | **Tags:** M03, physics, architecture
+**Assignee:** Unassigned | **Estimate:** 1–2 days | **Milestone:** M03
+
+### Objective
+
+Extend the spectral responsibility beyond root rows with exact normalization and branch objects required downstream.
+
+### Acceptance Criteria
+
+- [ ] Define radial/angular field, derivative, co-mode, residue, normalization, branch-node, branch-edge, κ, and matching-evidence schemas.
+- [ ] Specify domain compactification, boundary behavior, precision/resolution policy, and coordinate identity.
+- [ ] Preserve both the admitted 2,736-root base catalogue and the authenticated 44-root exact-selector overlay without recomputing unchanged leaves.
+- [ ] Reuse the pinned public radial/angular backend from TASK-075 and reject field artifacts whose normalization, source identity, or branch identity is unspecified.
+
+### Dependencies
+
+- **Blocked by:** TASK-070, TASK-078
+- **Blocks:** TASK-013, TASK-015
+
+### Evidence Output
+
+Versioned spectral-field/genealogy contracts and negative validation fixtures.
+
+### Verification
+
+- `python .tasks/validate_board.py`
+- Focused contract, compatibility, source-identity, and negative validation tests.
+- Full test suite and release-manifest validation.
+
+### Review Focus
+
+Check whether the public spectral provider remains one owner while base, overlay, field, and genealogy artifacts stay composable and source-pinned.
+
+### Plan
+
+- Derive contracts from the admitted base-plus-overlay spectrum and downstream field needs.
+- Reuse the public GSN/angular backend and add strict compatibility tests.
+- Review leaf caching, normalization identity, and evidence ceiling.
+
+---
+
 ## TASK-013: Compute normalized eigenfunctions and co-modes on reference slices
 **Priority:** P1 | **Tags:** M03, physics, validation
 **Assignee:** Unassigned | **Estimate:** 1–2 days | **Milestone:** M03
@@ -418,7 +589,7 @@ Expose root, resolvent, pseudospectral, and truncation evidence through one fail
 ### Dependencies
 
 - **Blocked by:** TASK-022
-- **Blocks:** TASK-059
+- **Blocks:** TASK-033, TASK-034, TASK-059
 
 ### Evidence Output
 
@@ -817,7 +988,7 @@ Compute the physical second-order response to the validated source with ingoing/
 
 ### Dependencies
 
-- **Blocked by:** TASK-032
+- **Blocked by:** TASK-023, TASK-032
 - **Blocks:** TASK-035
 
 ### Evidence Output
@@ -857,7 +1028,7 @@ Repeat source construction, validation, and forced solution at a distinct spin t
 
 ### Dependencies
 
-- **Blocked by:** TASK-030, TASK-032
+- **Blocked by:** TASK-023, TASK-030, TASK-032
 - **Blocks:** TASK-035
 
 ### Evidence Output
@@ -977,7 +1148,7 @@ Specify how distinct linear shifts and quadratic amplitudes enter one sparse inf
 
 ### Dependencies
 
-- **Blocked by:** TASK-011, TASK-036
+- **Blocked by:** TASK-036, TASK-078
 - **Blocks:** TASK-038, TASK-039, TASK-040
 
 ### Evidence Output
@@ -1017,7 +1188,7 @@ Map authenticated M02 responses into ordered Jacobian blocks for each physical l
 
 ### Dependencies
 
-- **Blocked by:** TASK-011, TASK-037
+- **Blocked by:** TASK-037, TASK-078
 - **Blocks:** TASK-040
 
 ### Evidence Output
