@@ -1,41 +1,46 @@
 # Next
 
-## TASK-007: Freeze independent golden results for the legacy linear calculation
-**Priority:** P1 | **Tags:** M02, evidence, validation
-**Assignee:** Unassigned | **Estimate:** 1–2 days | **Milestone:** M02
+## TASK-011: Build fail-closed M02 validation, admission, and operator closure commands
+**Priority:** P1 | **Tags:** M02, provider, validation, tooling
+**Assignee:** Unassigned | **Estimate:** 1 day | **Milestone:** M02
 
 ### Objective
 
-Characterize the accepted component-local response calculations without making legacy code a production dependency.
+Finish the installable M02 machinery and operator handoff while keeping the linear-response provider unavailable until the user's complete PowerShell evidence bundle passes admission.
 
 ### Acceptance Criteria
 
-- [ ] Select manifest-declared modes/spins and both horizon/exterior or theory mechanisms as golden fixtures.
-- [ ] Record central complex shifts, local solver diagnostics, signed-root uncertainty inputs, covariance, and projective classifications.
-- [ ] Authenticate source artifacts, code, runtime, and comparison method.
-- [ ] Include adverse/unresolved fixtures and independent published or alternate-backend comparisons where available.
+- [ ] Validate exactly 553 produced leaves, zero missing leaves, governed unresolved IDs, 174 aligned projective rows, role ceilings, hashes, runtime lineage, and policy identity.
+- [ ] Provide PowerShell-friendly `validate`, `reduce`, `admit`, and `export` commands with deterministic machine-readable output and useful failure messages.
+- [ ] Prove smoke/partial bundles cannot register the provider; prove a structurally complete signed test bundle exercises the availability transition without claiming scientific evidence.
+- [ ] Keep exactly one provider owner, unrelated capabilities unchanged, and admission contingent on the external evidence receipt rather than build completion.
+- [ ] Pass Windows-oriented command/path tests, Ubuntu tests, cold/warm cache, wheel content, manifest, compile, and head/tail/risk end-to-end smoke gates.
 
 ### Dependencies
 
-- **Blocked by:** TASK-005, TASK-006
-- **Blocks:** TASK-008, TASK-009, TASK-010
+- **Blocked by:** TASK-010
+- **Blocks:** TASK-037, TASK-038
 
 ### Evidence Output
 
-Hash-bound linear-response golden fixture set and comparison receipt.
+Installable build, fail-closed admission CLI, PowerShell runbook, structural full-bundle test fixture, representative smoke receipts, CI/cache/export checks, and build-completion report that distinguishes software readiness from scientific evidence completion.
 
 ### Verification
 
-undefined
+- `PYTHONPATH=src python -m unittest tests.test_linear_response_provider tests.test_linear_response_cli tests.test_release_manifest -v`
+- `PYTHONPATH=src python -m unittest discover -s tests -v`
+- `python .tasks/validate_board.py`
+- `python tools/validate_release_manifest.py`
+- `python -m compileall -q src tools tests`
 
 ### Review Focus
 
-Confirm fixtures are independent enough to detect migration errors and do not embed obsolete scope.
+Inspect partial/full separation, provider uniqueness, Windows command behavior, exact count reconciliation, evidence gating, and honest readiness language.
 
 ### Plan
 
-- Select release-domain fixture slices.
-- Authenticate and independently compare values.
-- Lock tolerances from observed diagnostics, not desired outcomes.
+- Integrate the importer, runner, and reducer behind operator commands.
+- Exercise structural full-bundle and representative smoke paths.
+- Ship build readiness without fabricating or collecting the user's research evidence.
 
 ---

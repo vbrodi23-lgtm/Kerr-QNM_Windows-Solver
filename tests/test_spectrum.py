@@ -39,7 +39,11 @@ from windows_solver.spectrum import (
     validate_spectral_payload,
 )
 
-from tests.fixtures import SUPPORTED_SPECTRUM_STUDY, expected_lattice_keys
+from tests.fixtures import (
+    SUPPORTED_SPECTRUM_STUDY,
+    expected_lattice_keys,
+)
+from windows_solver.linear_response import B_PRIME_RELEASE_DOMAIN
 
 
 def _csv_rows(data: bytes) -> tuple[tuple[str, ...], list[dict[str, str]]]:
@@ -114,6 +118,26 @@ class ExactLatticeContractTests(unittest.TestCase):
 
 
 class FullLatticeCatalogContractTests(unittest.TestCase):
+    def test_catalog_preserves_the_immutable_base_while_b_prime_records_overlay_gap(self) -> None:
+        catalog = load_spectrum_catalog()
+
+        self.assertEqual(len(catalog.roots), 2_736)
+        self.assertEqual({root.s for root in catalog.roots}, {-2})
+        self.assertEqual(
+            {
+                (root.s, root.ell, root.m, root.n, root.branch_id)
+                for root in catalog.roots
+            },
+            {
+                (-2, ell, m, n, "schwarzschild-overtone-continuation")
+                for ell in (2, 3, 4)
+                for m in range(-ell, ell + 1)
+                for n in range(3)
+            },
+        )
+        self.assertEqual(len(B_PRIME_RELEASE_DOMAIN.root_selectors), 87)
+        self.assertEqual(len(B_PRIME_RELEASE_DOMAIN.missing_root_selector_ids), 44)
+
     def test_catalog_exactly_matches_the_2736_root_rational_lattice(self) -> None:
         catalog = load_spectrum_catalog()
         expected_keys = frozenset(expected_lattice_keys())

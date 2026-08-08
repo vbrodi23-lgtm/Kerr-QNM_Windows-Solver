@@ -48,7 +48,11 @@
         "4": 1080
       },
       "catalog_sha256": "9ebae4271309cd45a1b26c90d31155602ed8ef33bb79069adb5897e8afe7a564",
-      "receipt_sha256": "61a428a858de1eb7e42fe4cbbda37bf1fddcc808d98be2a62fd33ef4b5b74379"
+      "receipt_sha256": "61a428a858de1eb7e42fe4cbbda37bf1fddcc808d98be2a62fd33ef4b5b74379",
+      "m02_overlay_root_count": 44,
+      "m02_selector_union_count": 87,
+      "m02_overlay_catalog_sha256": "c4c61a1b73e850d537dba5f5eb947af100449aa2a1958a1ec8ea086f60ffe8e8",
+      "m02_overlay_receipt_sha256": "93a2e7586878d9c84e32d19ed9e7ad44d03572a91640625c44501bfbc46a5525"
     },
     "linear_response": {
       "primary_modes": ["220", "221", "222", "330", "331", "440", "441"],
@@ -71,7 +75,20 @@
         "local-covariance",
         "signed-root-uncertainty-disk",
         "projective-classification"
-      ]
+      ],
+      "b_prime": {
+        "leaf_counts": {"primary": 441, "control": 48, "deep": 64, "total": 553},
+        "selector_counts": {"primary": 63, "control": 8, "deep": 16, "total": 87},
+        "missing_selector_counts": {"primary": 28, "control": 0, "deep": 16, "total": 44},
+        "projective_counts": {"primary": 162, "deep": 12, "total": 174},
+        "primary_supports": {"K0": ["220", "330", "440"], "K1": ["221", "331", "441"], "K22": ["220", "221", "222"]},
+        "deep_support": ["220", "221", "222"],
+        "control_role": "claim-negative exterior-only; negative-m positive-spin rows are counterrotating",
+        "cubic_role": "eight retained parity-even 220 rows are comparator-only and outside production",
+        "completeness_rule": "admission requires 553 produced leaves and zero missing; evidence-bearing UNRESOLVED is produced",
+        "precision_policy": {"promote_digits": 80, "repeat_digits": 120, "sentinel_count": 8, "promotion_gate_count": 4},
+        "wolfram_receipt": "docs/evidence/m02-b-prime-wolfram-arithmetic-receipt.json"
+      }
     },
     "operator_stability": {
       "required_outputs": [
@@ -1057,6 +1074,16 @@
       "output_contract": "offline catalog and receipt",
       "production_dependency": false,
       "replacement_gate": "Recomputed catalog bytes and every numerical gate must match the admitted receipt."
+    },
+    {
+      "module_id": "tools/compute_kerr_qnm_overlay.py",
+      "role": "validator",
+      "capability": "spectral-core",
+      "source_receipt_id": "public-spectrum-receipt",
+      "input_contract": "authenticated 2,736-root base catalog and receipt plus the literal 44-selector M02 target set",
+      "output_contract": "deterministic sparse overlay, continuation checkpoint, and strict receipt",
+      "production_dependency": false,
+      "replacement_gate": "All 44 exact targets, genealogy diagnostics, independent paths, reverse continuation, parent hashes, and deterministic bytes must pass."
     },
     {
       "module_id": "tools/kerr_angular.py",

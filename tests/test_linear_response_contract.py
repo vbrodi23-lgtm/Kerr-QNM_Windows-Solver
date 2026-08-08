@@ -10,6 +10,7 @@ from windows_solver.artifacts import ArtifactVerificationError
 from windows_solver.builtin import default_registry
 from windows_solver.contracts import Capability, ModeKey, StudyRequest
 from windows_solver.linear_response import (
+    B_PRIME_RELEASE_DOMAIN,
     LINEAR_RESPONSE_DESCRIPTOR,
     LINEAR_RESPONSE_EQUATIONS_ID,
     LINEAR_RESPONSE_OUTPUT_ARTIFACT_TYPE,
@@ -24,6 +25,7 @@ from windows_solver.linear_response import (
 from windows_solver.payload_validation import validate_provider_payload
 from windows_solver.providers import ProviderUnavailableError
 from windows_solver.release_manifest import load_release_manifest
+from tests.fixtures import EXPECTED_KAPPA_SPINS
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -152,17 +154,144 @@ def valid_payload(request: StudyRequest | None = None) -> dict[str, object]:
         for spin in request.spins
     ]
     components = [
-        resolved_component(
-            mode,
-            spin,
-            selection,
-            deepcopy(sampling_by_spin[spin.hex()]),
-        )
+        resolved_component(mode, spin, selection, deepcopy(sampling_by_spin[spin.hex()]))
         for mode in request.modes
         for spin in request.spins
         for selection in selections
     ]
     component_ids = sorted(component["component_id"] for component in components)
+    return {
+        "schema_version": 1, "quantity": "first-order-complex-qnm-frequency-shift",
+        "equations_id": LINEAR_RESPONSE_EQUATIONS_ID,
+        "baseline_theory_id": request.theory_id, "baseline_convention_id": request.convention_id,
+        "time_dependence": "exp(-i omega t + i m phi)", "frequency_units": "Momega",
+        "spin_coordinate": "a_over_M", "horizon_contact_coordinate": "delta-B",
+        "lineage": {
+            "source_commit": "a" * 40, "source_sha256s": ["b" * 64],
+            "runtime_fingerprint": LINEAR_RESPONSE_DESCRIPTOR.runtime_fingerprint,
+            "numerical_policy_fingerprint": LINEAR_RESPONSE_DESCRIPTOR.numerical_policy_fingerprint,
+            "evidence_ceiling": "component-local-empirical-not-formal-enclosure",
+        },
+        "baseline_root_references": roots, "response_components": components,
+        "covariance_blocks": [covariance_block(components)], "projective_comparisons": [],
+        "completeness": {
+            "required_leaf_count": len(component_ids), "produced_leaf_count": len(component_ids),
+            "unresolved_leaf_count": 0, "missing_leaf_count": 0,
+            "required_leaf_ids": component_ids, "produced_leaf_ids": component_ids,
+            "unresolved_leaf_ids": [], "missing_leaf_ids": [],
+        },
+    }
+
+
+def mechanism_mapping(mechanism_id: str) -> dict[str, object]:
+    contract = MECHANISM_CONTRACTS[mechanism_id]
+    return {
+        "mechanism_id": contract.mechanism_id,
+        "coordinate_id": contract.coordinate_id,
+        "theory_id": contract.theory_id,
+        "convention_id": contract.convention_id,
+        "response_quantity_id": contract.response_quantity_id,
+        "parameters": {name: values[0] for name, values in contract.parameter_values},
+    }
+
+
+def b_prime_request() -> StudyRequest:
+    domain = B_PRIME_RELEASE_DOMAIN
+    coordinate_by_spin: dict[str, dict[str, object]] = {}
+    mode_by_identity: dict[tuple[int, int, int], dict[str, object]] = {}
+    role_scoped_leaves: list[dict[str, object]] = []
+    mechanism_ids: set[str] = set()
+    for leaf in domain.production_leaves:
+        mode = ModeKey(
+            s=-2, ell=leaf.mode[0], m=leaf.mode[1], n=leaf.mode[2],
+            branch="schwarzschild-overtone-continuation", polarization="gravitational",
+        )
+        mode_by_identity[leaf.mode] = mode.to_mapping()
+        coordinate = {
+            "coordinate_id": "a_over_M" if leaf.spin_role == "direct" else "M-kappa",
+            "coordinate_value": float(leaf.coordinate),
+            "coordinate_exact": {"numerator": leaf.coordinate.numerator, "denominator": leaf.coordinate.denominator},
+            **spin_identity(leaf.spin),
+            "transformation_id": (
+                "identity-a-over-M" if leaf.spin_role == "direct"
+                else "kerr-prograde-spin-from-dimensionless-surface-gravity"
+            ),
+        }
+        coordinate_by_spin[leaf.spin.hex()] = coordinate
+        mechanism_ids.add(leaf.mechanism_id)
+        role_scoped_leaves.append({
+            "role": leaf.role,
+            "mode": mode.to_mapping(),
+            "sampling_coordinate": deepcopy(coordinate),
+            "mechanism": mechanism_mapping(leaf.mechanism_id),
+        })
+    return StudyRequest.from_mapping({
+        "schema_version": 1,
+        "target": "linear-response",
+        "theory_id": "general-relativity",
+        "convention_id": "kerr-mass-normalized-outgoing",
+        "modes": list(mode_by_identity.values()),
+        "spins": [coordinate["spin"] for coordinate in coordinate_by_spin.values()],
+        "evidence_profile": "research",
+        "numerical_policy": {"linear-response": {
+            "sampling_coordinates": list(coordinate_by_spin.values()),
+            "mechanisms": [mechanism_mapping(item) for item in sorted(mechanism_ids)],
+            "role_scoped_leaves": role_scoped_leaves,
+        }},
+    })
+
+
+def b_prime_payload(request: StudyRequest) -> dict[str, object]:
+    policy = request.numerical_policy["linear-response"]
+    leaves = policy["role_scoped_leaves"]
+    selections_by_mapping = {
+        json.dumps(item.to_mapping(), sort_keys=True): item
+        for item in validate_linear_response_request(request)
+    }
+    roots: dict[str, dict[str, object]] = {}
+    components: list[dict[str, object]] = []
+    sentinel_inputs = {
+        ((2, 2, 0), "horizon-admittance"),
+        ((2, 2, 2), "exterior-throat-kappa"),
+    }
+    for leaf in leaves:
+        mode = ModeKey.from_mapping(leaf["mode"])
+        coordinate = leaf["sampling_coordinate"]
+        spin = coordinate["spin"]
+        selection = selections_by_mapping[json.dumps(leaf["mechanism"], sort_keys=True)]
+        component = resolved_component(mode, spin, selection, deepcopy(coordinate))
+        component["numerical_state"] = "UNRESOLVED"
+        component["result"] = {
+            "centre": None, "local_covariance": None, "uncertainty_disk": None,
+            "reason": "contract-only precision evidence",
+        }
+        if leaf["role"] == "deep":
+            sentinel = ((mode.ell, mode.m, mode.n), selection.mechanism_id) in sentinel_inputs
+            component["diagnostics"]["precision_evidence"] = {
+                "trigger_ids": [] if sentinel else ["fewer-than-ten-predicted-reliable-decimal-digits"],
+                "promoted": True,
+                "precision_digits": 80,
+                "repeat_precision_digits": None,
+                "self_refinement_enclosed": True,
+                "discrepancy_enclosed": True,
+                "sentinel": sentinel,
+                "sentinel_comparison": (
+                    {
+                        "binary64_to_80_discrepancy_abs": 0.0,
+                        "trigger_threshold_abs": 1.0e-9,
+                        "trigger_policy_false_negative": False,
+                    }
+                    if sentinel
+                    else None
+                ),
+            }
+        root_id = baseline_root_reference_id(mode, spin)
+        roots[root_id] = {
+            "root_reference_id": root_id, "mode": mode.to_mapping(),
+            **spin_identity(spin), "sampling_coordinate": deepcopy(coordinate),
+        }
+        components.append(component)
+    component_ids = sorted(item["component_id"] for item in components)
     return {
         "schema_version": 1,
         "quantity": "first-order-complex-qnm-frequency-shift",
@@ -170,35 +299,24 @@ def valid_payload(request: StudyRequest | None = None) -> dict[str, object]:
         "baseline_theory_id": request.theory_id,
         "baseline_convention_id": request.convention_id,
         "time_dependence": "exp(-i omega t + i m phi)",
-        "frequency_units": "Momega",
-        "spin_coordinate": "a_over_M",
+        "frequency_units": "Momega", "spin_coordinate": "a_over_M",
         "horizon_contact_coordinate": "delta-B",
         "lineage": {
-            "source_commit": "a" * 40,
-            "source_sha256s": ["b" * 64],
+            "source_commit": "a" * 40, "source_sha256s": ["b" * 64],
             "runtime_fingerprint": LINEAR_RESPONSE_DESCRIPTOR.runtime_fingerprint,
-            "numerical_policy_fingerprint": (
-                LINEAR_RESPONSE_DESCRIPTOR.numerical_policy_fingerprint
-            ),
+            "numerical_policy_fingerprint": LINEAR_RESPONSE_DESCRIPTOR.numerical_policy_fingerprint,
             "evidence_ceiling": "component-local-empirical-not-formal-enclosure",
         },
-        "baseline_root_references": roots,
-        "response_components": components,
-        "covariance_blocks": [covariance_block(components)],
+        "baseline_root_references": list(roots.values()),
+        "response_components": components, "covariance_blocks": [],
         "projective_comparisons": [],
         "completeness": {
-            "required_leaf_count": len(component_ids),
-            "produced_leaf_count": len(component_ids),
-            "unresolved_leaf_count": 0,
-            "missing_leaf_count": 0,
-            "required_leaf_ids": component_ids,
-            "produced_leaf_ids": component_ids,
-            "unresolved_leaf_ids": [],
-            "missing_leaf_ids": [],
+            "required_leaf_count": 553, "produced_leaf_count": 553,
+            "unresolved_leaf_count": 553, "missing_leaf_count": 0,
+            "required_leaf_ids": component_ids, "produced_leaf_ids": component_ids,
+            "unresolved_leaf_ids": component_ids, "missing_leaf_ids": [],
         },
     }
-
-
 def component_for(
     payload: dict[str, object],
     *,
@@ -214,6 +332,173 @@ def component_for(
 
 
 class LinearResponseContractTests(unittest.TestCase):
+    def test_b_prime_role_scoped_request_admits_exact_complete_domain(self) -> None:
+        request = b_prime_request()
+        payload = b_prime_payload(request)
+
+        validate_linear_response_admission(
+            request, LINEAR_RESPONSE_DESCRIPTOR.to_mapping(), payload
+        )
+
+        leaked = request.to_mapping()
+        leaked["numerical_policy"]["linear-response"]["role_scoped_leaves"][0]["role"] = "control"
+        with self.assertRaisesRegex(ValueError, "role-scoped leaves"):
+            validate_linear_response_request(StudyRequest.from_mapping(leaked))
+
+        omitted = request.to_mapping()
+        omitted["numerical_policy"]["linear-response"]["role_scoped_leaves"].pop()
+        with self.assertRaisesRegex(ValueError, "role-scoped leaves"):
+            validate_linear_response_request(StudyRequest.from_mapping(omitted))
+
+        added = request.to_mapping()
+        off_domain = deepcopy(
+            added["numerical_policy"]["linear-response"]["role_scoped_leaves"][0]
+        )
+        self.assertEqual(off_domain["role"], "primary")
+        off_domain["role"] = "control"
+        added["numerical_policy"]["linear-response"]["role_scoped_leaves"].append(
+            off_domain
+        )
+        with self.assertRaisesRegex(ValueError, "must exactly match"):
+            validate_linear_response_request(StudyRequest.from_mapping(added))
+
+        deep_component = next(
+            component
+            for component in payload["response_components"]
+            if component["sampling_coordinate"]["coordinate_id"] == "M-kappa"
+        )
+        deep_component["diagnostics"]["precision_evidence"] = {"forged": True}
+        with self.assertRaisesRegex(ValueError, "precision evidence"):
+            validate_linear_response_payload(
+                request, LINEAR_RESPONSE_DESCRIPTOR.to_mapping(), payload
+            )
+
+        payload = b_prime_payload(request)
+        sentinel = next(
+            component
+            for component in payload["response_components"]
+            if component["mode"]["ell"] == 2
+            and component["mode"]["m"] == 2
+            and component["mode"]["n"] == 0
+            and component["mechanism"]["mechanism_id"] == "horizon-admittance"
+            and component["sampling_coordinate"]["coordinate_id"] == "M-kappa"
+        )
+        sentinel["diagnostics"]["precision_evidence"]["sentinel"] = False
+        with self.assertRaisesRegex(ValueError, "sentinel identity"):
+            validate_linear_response_payload(
+                request, LINEAR_RESPONSE_DESCRIPTOR.to_mapping(), payload
+            )
+
+    def test_b_prime_deep_precision_ladder_rejects_frozen_failures(self) -> None:
+        request = b_prime_request()
+
+        def component_with_evidence(
+            payload: dict[str, object], *, sentinel: bool
+        ) -> dict[str, object]:
+            return next(
+                component
+                for component in payload["response_components"]
+                if "precision_evidence" in component["diagnostics"]
+                and component["diagnostics"]["precision_evidence"]["sentinel"]
+                is sentinel
+            )
+
+        payload = b_prime_payload(request)
+        evidence = component_with_evidence(payload, sentinel=True)["diagnostics"][
+            "precision_evidence"
+        ]
+        evidence["sentinel_comparison"] = {
+            "binary64_to_80_discrepancy_abs": 2.0e-9,
+            "trigger_threshold_abs": 1.0e-9,
+            "trigger_policy_false_negative": True,
+        }
+        with self.assertRaisesRegex(ValueError, "sentinel false negative"):
+            validate_linear_response_admission(
+                request, LINEAR_RESPONSE_DESCRIPTOR.to_mapping(), payload
+            )
+
+        payload = b_prime_payload(request)
+        evidence = component_with_evidence(payload, sentinel=True)["diagnostics"][
+            "precision_evidence"
+        ]
+        evidence["sentinel_comparison"]["binary64_to_80_discrepancy_abs"] = 2.0e-9
+        with self.assertRaisesRegex(ValueError, "false-negative outcome is invalid"):
+            validate_linear_response_payload(
+                request, LINEAR_RESPONSE_DESCRIPTOR.to_mapping(), payload
+            )
+
+        payload = b_prime_payload(request)
+        evidence = component_with_evidence(payload, sentinel=False)["diagnostics"][
+            "precision_evidence"
+        ]
+        evidence["promoted"] = False
+        with self.assertRaisesRegex(ValueError, "promotion rule"):
+            validate_linear_response_payload(
+                request, LINEAR_RESPONSE_DESCRIPTOR.to_mapping(), payload
+            )
+
+        payload = b_prime_payload(request)
+        evidence = component_with_evidence(payload, sentinel=False)["diagnostics"][
+            "precision_evidence"
+        ]
+        evidence["precision_digits"] = 64
+        with self.assertRaisesRegex(ValueError, "precision digits"):
+            validate_linear_response_payload(
+                request, LINEAR_RESPONSE_DESCRIPTOR.to_mapping(), payload
+            )
+
+        payload = b_prime_payload(request)
+        evidence = component_with_evidence(payload, sentinel=False)["diagnostics"][
+            "precision_evidence"
+        ]
+        evidence["self_refinement_enclosed"] = False
+        with self.assertRaisesRegex(ValueError, "repeat must run at 120"):
+            validate_linear_response_payload(
+                request, LINEAR_RESPONSE_DESCRIPTOR.to_mapping(), payload
+            )
+
+        payload = b_prime_payload(request)
+        component = component_with_evidence(payload, sentinel=False)
+        component["numerical_state"] = "ACCEPTED"
+        component["diagnostics"]["precision_evidence"][
+            "discrepancy_enclosed"
+        ] = False
+        with self.assertRaisesRegex(ValueError, "enclosed 80/120 discrepancy"):
+            validate_linear_response_payload(
+                request, LINEAR_RESPONSE_DESCRIPTOR.to_mapping(), payload
+            )
+
+    def test_b_prime_precision_and_completeness_contract_is_frozen_before_production(
+        self,
+    ) -> None:
+        domain = B_PRIME_RELEASE_DOMAIN
+        self.assertEqual(
+            tuple(spin.hex() for spin in (
+                spin_from_dimensionless_surface_gravity(value)
+                for value in (0.01, 0.005, 0.002, 0.001)
+            )),
+            (
+                "0x1.ffe4b3ad56fa5p-1", "0x1.fff9502b91917p-1",
+                "0x1.fffef1672c027p-1", "0x1.ffffbc9f2ff3bp-1",
+            ),
+        )
+        self.assertEqual(len(domain.fixed_precision_sentinel_leaf_ids), 8)
+        self.assertEqual(len(domain.precision_promotion_gates), 4)
+        manifest_contract = load_release_manifest().to_mapping()["release_domain"][
+            "linear_response"
+        ]["b_prime"]
+        self.assertEqual(manifest_contract["leaf_counts"], {"primary": 441, "control": 48, "deep": 64, "total": 553})
+        self.assertEqual(manifest_contract["selector_counts"], {"primary": 63, "control": 8, "deep": 16, "total": 87})
+        self.assertEqual(manifest_contract["missing_selector_counts"], {"primary": 28, "control": 0, "deep": 16, "total": 44})
+        self.assertEqual(manifest_contract["projective_counts"], {"primary": 162, "deep": 12, "total": 174})
+
+        with self.assertRaisesRegex(ValueError, "explicit role-scoped leaves"):
+            validate_linear_response_admission(
+                example_request(),
+                LINEAR_RESPONSE_DESCRIPTOR.to_mapping(),
+                valid_payload(),
+            )
+
     def test_descriptor_is_defined_but_not_admitted(self) -> None:
         self.assertEqual(
             LINEAR_RESPONSE_DESCRIPTOR.capability,
@@ -261,6 +546,16 @@ class LinearResponseContractTests(unittest.TestCase):
             {0.95, 0.97, 0.98, 0.99, 0.995, 0.997, 0.999, 0.9995, 0.9999},
         )
         self.assertEqual(surface_gravities, {0.01, 0.005, 0.002, 0.001})
+
+        for kappa_exact, (expected_spin, expected_hex) in (
+            EXPECTED_KAPPA_SPINS.items()
+        ):
+            with self.subTest(kappa=kappa_exact):
+                spin = spin_from_dimensionless_surface_gravity(
+                    float(kappa_exact)
+                )
+                self.assertEqual(spin, expected_spin)
+                self.assertEqual(spin.hex(), expected_hex)
 
         kappa = 0.01
         spin = spin_from_dimensionless_surface_gravity(kappa)

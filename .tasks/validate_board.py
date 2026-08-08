@@ -22,6 +22,13 @@ EXPECTED_RANGES = {
 }
 
 
+def _priority_rank(body: str) -> int | None:
+    """Return the board ordering rank encoded in a task's canonical tag line."""
+
+    match = TAG_RE.search(body)
+    return int(match.group(1)[1:]) if match else None
+
+
 def sections(text: str) -> list[tuple[str, int, str, str]]:
     matches = list(TASK_RE.finditer(text))
     return [
@@ -42,6 +49,7 @@ def main() -> int:
     all_tasks: dict[int, tuple[str, str, str]] = {}
     by_state: dict[str, list[int]] = {}
     edges: dict[int, set[int]] = defaultdict(set)
+    dependencies: dict[int, set[int]] = defaultdict(set)
 
     for state, filename in config["states"].items():
         path = ROOT / filename
@@ -64,33 +72,72 @@ def main() -> int:
                 errors.append(f"{task_id} lacks Blocked by line")
                 continue
             for dep in re.findall(r"TASK-(\d{3})", dep_match.group(1)):
-                edges[int(dep)].add(number)
+                dependency = int(dep)
+                edges[dependency].add(number)
+                dependencies[number].add(dependency)
 
-    expected_ids = set(range(1, 69))
+    next_id = config.get("nextId")
+    if not isinstance(next_id, int) or next_id < 2:
+        errors.append("nextId must be an integer greater than TASK-001")
+        expected_ids: set[int] = set()
+    else:
+        expected_ids = set(range(1, next_id))
     actual_ids = set(all_tasks)
     if actual_ids != expected_ids:
-        errors.append(f"task IDs differ from TASK-001–TASK-068: missing={sorted(expected_ids-actual_ids)}, extra={sorted(actual_ids-expected_ids)}")
-    if config.get("nextId") != 69:
-        errors.append("nextId must be 69")
+        errors.append(
+            "task IDs must be contiguous through the configured nextId: "
+            f"missing={sorted(expected_ids-actual_ids)}, "
+            f"extra={sorted(actual_ids-expected_ids)}"
+        )
     next_tasks = by_state.get("Next", [])
     in_progress = by_state.get("In Progress", [])
-    done = sorted(by_state.get("Done", []))
+    done = set(by_state.get("Done", []))
     if len(in_progress) > 1:
         errors.append("at most one task may be In Progress")
-    expected_done = list(range(1, len(done) + 1))
-    if done != expected_done:
-        errors.append("Done tasks must form one contiguous prefix from TASK-001")
-    current = len(done) + 1
+
+    def dependency_ready(number: int) -> bool:
+        return dependencies[number].issubset(done)
+
+    pending = actual_ids - done - set(by_state.get("Rejected", []))
+    ready = {number for number in pending if dependency_ready(number)}
+    priority_by_task = {
+        number: _priority_rank(body) for number, (_, _, body) in all_tasks.items()
+    }
+
+    def scheduling_key(number: int) -> tuple[int, int]:
+        priority = priority_by_task[number]
+        fallback_priority = len(config["priorities"])
+        return (priority if priority is not None else fallback_priority, number)
+
+    selected_ready = min(ready, key=scheduling_key) if ready else None
+    highest_ready_priority = (
+        scheduling_key(selected_ready)[0] if selected_ready is not None else None
+    )
     if in_progress:
-        if in_progress != [current]:
-            errors.append(f"TASK-{current:03d} must be the sole In Progress task")
+        active = in_progress[0]
+        if not dependency_ready(active):
+            errors.append(f"TASK-{active:03d} is not dependency-ready")
+        if (
+            highest_ready_priority is not None
+            and priority_by_task[active] != highest_ready_priority
+        ):
+            errors.append("In Progress task must have the highest ready priority")
         if next_tasks:
             errors.append("Next must be empty while a task is In Progress")
-    elif current <= max(expected_ids):
-        if next_tasks != [current]:
-            errors.append(f"TASK-{current:03d} must be the sole Next task")
+    elif ready:
+        if len(next_tasks) != 1:
+            errors.append("exactly one dependency-ready task must be Next when idle")
+        else:
+            candidate = next_tasks[0]
+            if candidate not in ready:
+                errors.append(f"TASK-{candidate:03d} is not dependency-ready")
+            elif candidate != selected_ready:
+                errors.append(
+                    f"TASK-{selected_ready:03d} must be the sole Next task "
+                    "(lowest task ID at the highest ready priority)"
+                )
     elif next_tasks:
-        errors.append("Next must be empty when every task is Done")
+        errors.append("Next must be empty when no pending task is dependency-ready")
 
     for milestone, numbers in EXPECTED_RANGES.items():
         for number in numbers:
@@ -104,9 +151,6 @@ def main() -> int:
     for source, destinations in edges.items():
         if source not in all_tasks:
             errors.append(f"dependency references missing TASK-{source:03d}")
-        for destination in destinations:
-            if source >= destination:
-                errors.append(f"TASK-{destination:03d} depends on non-earlier TASK-{source:03d}")
 
     indegree = {number: 0 for number in all_tasks}
     for destinations in edges.values():
@@ -130,7 +174,7 @@ def main() -> int:
         return 1
     print(
         "TaskPlanner board valid: "
-        f"68 unique tasks, 12 milestones, {len(done)} Done, "
+        f"{len(actual_ids)} unique tasks, 12 milestones, {len(done)} Done, "
         f"{len(next_tasks)} Next, {len(in_progress)} In Progress, "
         "acyclic dependencies."
     )

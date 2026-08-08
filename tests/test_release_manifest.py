@@ -61,6 +61,25 @@ class ReleaseManifestTests(unittest.TestCase):
         self.assertEqual(spectrum["roots_by_ell"], {"2": 690, "3": 966, "4": 1080})
         self.assertEqual(spectrum["catalog_sha256"], "9ebae4271309cd45a1b26c90d31155602ed8ef33bb79069adb5897e8afe7a564")
         self.assertEqual(spectrum["receipt_sha256"], "61a428a858de1eb7e42fe4cbbda37bf1fddcc808d98be2a62fd33ef4b5b74379")
+        self.assertTrue(
+            {
+                "m02_overlay_root_count",
+                "m02_selector_union_count",
+                "m02_overlay_catalog_sha256",
+                "m02_overlay_receipt_sha256",
+            }.issubset(spectrum),
+            "release spectrum does not bind the M02 sparse overlay",
+        )
+        self.assertEqual(spectrum["m02_overlay_root_count"], 44)
+        self.assertEqual(spectrum["m02_selector_union_count"], 87)
+        self.assertEqual(
+            spectrum["m02_overlay_catalog_sha256"],
+            "c4c61a1b73e850d537dba5f5eb947af100449aa2a1958a1ec8ea086f60ffe8e8",
+        )
+        self.assertEqual(
+            spectrum["m02_overlay_receipt_sha256"],
+            "93a2e7586878d9c84e32d19ed9e7ad44d03572a91640625c44501bfbc46a5525",
+        )
 
         quadratic = mapping["release_domain"]["quadratic_ringdown"]
         self.assertEqual(quadratic["parent_pair"], ["220-plus", "220-plus"])

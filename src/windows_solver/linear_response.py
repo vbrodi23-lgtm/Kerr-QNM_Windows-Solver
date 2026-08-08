@@ -202,6 +202,226 @@ def spin_from_dimensionless_surface_gravity(value: float) -> float:
 
 
 @dataclass(frozen=True, slots=True)
+class BPrimeLeaf:
+    """One explicitly role-scoped B′ response leaf, before computation."""
+
+    leaf_id: str
+    role: str
+    mode_label: str
+    mode: tuple[int, int, int]
+    spin_role: str
+    coordinate: Fraction
+    spin: float
+    mechanism_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class BPrimeRootSelector:
+    """A root input required by B′, with its base/overlay disposition frozen."""
+
+    selector_id: str
+    role: str
+    mode_label: str
+    mode: tuple[int, int, int]
+    spin_role: str
+    coordinate: Fraction
+    spin: float
+    availability: str
+
+
+@dataclass(frozen=True, slots=True)
+class BPrimeReleaseDomain:
+    """The typed, non-Cartesian M02 B′ release contract."""
+
+    production_leaves: tuple[BPrimeLeaf, ...]
+    root_selectors: tuple[BPrimeRootSelector, ...]
+    projective_row_ids: tuple[str, ...]
+    primary_supports: Mapping[str, tuple[str, ...]]
+    deep_support: tuple[str, ...]
+    exterior_mechanism_ids: tuple[str, ...]
+    cubic_comparator_rows: tuple[tuple[Fraction, str], ...]
+    precision_promotion_gates: tuple[str, ...]
+    fixed_precision_sentinel_leaf_ids: tuple[str, ...]
+
+    @property
+    def production_leaf_ids(self) -> tuple[str, ...]:
+        return tuple(leaf.leaf_id for leaf in self.production_leaves)
+
+    @property
+    def leaf_counts_by_role(self) -> dict[str, int]:
+        return {
+            role: sum(leaf.role == role for leaf in self.production_leaves)
+            for role in ("primary", "control", "deep")
+        }
+
+    @property
+    def selector_counts_by_role(self) -> dict[str, int]:
+        return {
+            role: sum(selector.role == role for selector in self.root_selectors)
+            for role in ("primary", "control", "deep")
+        }
+
+    @property
+    def missing_root_selector_ids(self) -> tuple[str, ...]:
+        return tuple(
+            selector.selector_id
+            for selector in self.root_selectors
+            if selector.availability == "missing-overlay"
+        )
+
+    @property
+    def missing_selector_counts_by_role(self) -> dict[str, int]:
+        return {
+            role: sum(
+                selector.role == role and selector.availability == "missing-overlay"
+                for selector in self.root_selectors
+            )
+            for role in ("primary", "control", "deep")
+        }
+
+    @property
+    def projective_counts(self) -> dict[str, int]:
+        return {
+            "primary": sum(row.startswith("primary-") for row in self.projective_row_ids),
+            "deep": sum(row.startswith("deep-") for row in self.projective_row_ids),
+            "total": len(self.projective_row_ids),
+        }
+
+    @property
+    def cubic_comparator_row_count(self) -> int:
+        return len(self.cubic_comparator_rows)
+
+
+def _b_prime_identifier(kind: str, material: Mapping[str, object]) -> str:
+    digest = hashlib.sha256(canonical_json_bytes(dict(material))).hexdigest()
+    return f"b-prime-{kind}-{digest}"
+
+
+def _build_b_prime_release_domain() -> BPrimeReleaseDomain:
+    """Build only the declared role products; never complete an ambient grid."""
+
+    modes = {
+        "220": (2, 2, 0), "221": (2, 2, 1), "222": (2, 2, 2),
+        "330": (3, 3, 0), "331": (3, 3, 1), "440": (4, 4, 0),
+        "441": (4, 4, 1), "210": (2, 1, 0),
+        "2-minus-2-0": (2, -2, 0), "320": (3, 2, 0),
+        "3-minus-3-0": (3, -3, 0),
+    }
+    primary_modes = ("220", "221", "222", "330", "331", "440", "441")
+    control_modes = ("210", "2-minus-2-0", "320", "3-minus-3-0")
+    deep_modes = ("220", "221", "222", "210")
+    primary_mechanisms = (
+        "horizon-admittance", "exterior-fixed-r3", "exterior-light-ring",
+        "exterior-throat-kappa", "exterior-alpha-zero", "exterior-alpha-half",
+        "exterior-alpha-one",
+    )
+    exterior_mechanisms = primary_mechanisms[1:]
+    deep_mechanisms = (
+        "horizon-admittance", "exterior-alpha-one", "exterior-light-ring",
+        "exterior-throat-kappa",
+    )
+    direct_spins = tuple(sorted(_FROZEN_SPINS))
+    deep_coordinates = tuple(sorted(_FROZEN_SURFACE_GRAVITIES))
+    control_spins = (Fraction(19, 20), Fraction(999, 1000))
+
+    leaves: list[BPrimeLeaf] = []
+    selector_by_identity: dict[tuple[tuple[int, int, int], str], BPrimeRootSelector] = {}
+
+    def add_role(
+        role: str, labels: tuple[str, ...], spin_role: str,
+        coordinates: tuple[Fraction, ...], mechanisms: tuple[str, ...],
+    ) -> None:
+        for label in labels:
+            mode = modes[label]
+            for coordinate in coordinates:
+                spin = (
+                    float(coordinate) if spin_role == "direct"
+                    else spin_from_dimensionless_surface_gravity(float(coordinate))
+                )
+                identity = (mode, spin.hex())
+                if identity not in selector_by_identity:
+                    missing = (
+                        role == "deep"
+                        or (role == "primary" and label in {"440", "441"})
+                        or (
+                            role == "primary"
+                            and coordinate in {Fraction(1999, 2000), Fraction(9999, 10000)}
+                        )
+                    )
+                    selector_material = {
+                        "mode": mode, "spin_binary64_hex": spin.hex(),
+                    }
+                    selector_by_identity[identity] = BPrimeRootSelector(
+                        selector_id=_b_prime_identifier("root", selector_material),
+                        role=role, mode_label=label, mode=mode, spin_role=spin_role,
+                        coordinate=coordinate, spin=spin,
+                        availability="missing-overlay" if missing else "base-2736",
+                    )
+                for mechanism_id in mechanisms:
+                    material = {
+                        "role": role, "mode": mode, "spin_role": spin_role,
+                        "coordinate": [coordinate.numerator, coordinate.denominator],
+                        "mechanism_id": mechanism_id,
+                    }
+                    leaves.append(BPrimeLeaf(
+                        leaf_id=_b_prime_identifier("leaf", material), role=role,
+                        mode_label=label, mode=mode, spin_role=spin_role,
+                        coordinate=coordinate, spin=spin, mechanism_id=mechanism_id,
+                    ))
+
+    add_role("primary", primary_modes, "direct", direct_spins, primary_mechanisms)
+    add_role("control", control_modes, "direct", control_spins, exterior_mechanisms)
+    add_role("deep", deep_modes, "M-kappa", deep_coordinates, deep_mechanisms)
+
+    primary_supports = MappingProxyType({
+        "K0": ("220", "330", "440"),
+        "K1": ("221", "331", "441"),
+        "K22": ("220", "221", "222"),
+    })
+    projective_rows = tuple(
+        f"primary-{support}-{coordinate.numerator}-{coordinate.denominator}-{mechanism}"
+        for support in primary_supports
+        for coordinate in direct_spins
+        for mechanism in exterior_mechanisms
+    ) + tuple(
+        f"deep-K22-{coordinate.numerator}-{coordinate.denominator}-{mechanism}"
+        for coordinate in deep_coordinates
+        for mechanism in deep_mechanisms[1:]
+    )
+    sentinels = tuple(
+        leaf.leaf_id for leaf in leaves
+        if leaf.role == "deep" and (
+            (leaf.mode_label == "220" and leaf.mechanism_id == "horizon-admittance")
+            or (leaf.mode_label == "222" and leaf.mechanism_id == "exterior-throat-kappa")
+        )
+    )
+    return BPrimeReleaseDomain(
+        production_leaves=tuple(leaves),
+        root_selectors=tuple(selector_by_identity.values()),
+        projective_row_ids=projective_rows,
+        primary_supports=primary_supports,
+        deep_support=("220", "221", "222"),
+        exterior_mechanism_ids=exterior_mechanisms,
+        cubic_comparator_rows=tuple(
+            (spin, polarization)
+            for spin in (Fraction(0), Fraction(3, 10), Fraction(1, 2), Fraction(7, 10))
+            for polarization in ("plus", "minus")
+        ),
+        precision_promotion_gates=(
+            "fewer-than-ten-predicted-reliable-decimal-digits",
+            "step-halving-or-richardson-centres-disagree-by-more-than-quarter-local-disk",
+            "repeat-polish-angular-refinement-or-independent-continuation-exceeds-ceiling",
+            "denominator-or-calibration-disk-contains-zero-from-numerical-width",
+        ),
+        fixed_precision_sentinel_leaf_ids=sentinels,
+    )
+
+
+B_PRIME_RELEASE_DOMAIN = _build_b_prime_release_domain()
+B_PRIME_UNRESOLVED_IS_PRODUCED = True
+
+
+@dataclass(frozen=True, slots=True)
 class MechanismContract:
     mechanism_id: str
     coordinate_id: str
@@ -491,6 +711,16 @@ class SpinSamplingCoordinate:
         }
 
 
+@dataclass(frozen=True, slots=True)
+class RoleScopedLeaf:
+    """One request leaf, explicitly bound to its B′ role and axes."""
+
+    role: str
+    mode: ModeKey
+    sampling_coordinate: SpinSamplingCoordinate
+    selection: MechanismSelection
+
+
 def _sampling_coordinates_for_request(
     request: StudyRequest,
     section: Mapping[str, Any],
@@ -514,6 +744,59 @@ def _sampling_coordinates_for_request(
             "sampling coordinates must exactly cover the requested spins"
         )
     return coordinates
+
+
+def _role_scoped_leaves_for_request(
+    request: StudyRequest,
+    section: Mapping[str, Any],
+    selections: tuple[MechanismSelection, ...],
+    sampling_coordinates: tuple[SpinSamplingCoordinate, ...],
+) -> tuple[RoleScopedLeaf, ...] | None:
+    if "role_scoped_leaves" not in section:
+        return None
+    sampling_by_spin = {
+        item.spin_binary64_hex: item for item in sampling_coordinates
+    }
+    leaves: list[RoleScopedLeaf] = []
+    identities: set[tuple[str, ModeKey, str, str]] = set()
+    for raw in _array(section["role_scoped_leaves"], "role-scoped leaves"):
+        mapping = _object(raw, "role-scoped leaf")
+        _exact_fields(
+            mapping,
+            frozenset({"role", "mode", "sampling_coordinate", "mechanism"}),
+            "role-scoped leaf",
+        )
+        role = _string(mapping["role"], "role-scoped leaf role")
+        mode = ModeKey.from_mapping(_object(mapping["mode"], "role-scoped leaf mode"))
+        coordinate = SpinSamplingCoordinate.from_mapping(
+            mapping["sampling_coordinate"]
+        )
+        selection = MechanismSelection.from_mapping(mapping["mechanism"])
+        if mode not in request.modes or coordinate.spin not in request.spins:
+            raise ValueError("role-scoped leaf is outside the request axes")
+        if coordinate != sampling_by_spin.get(coordinate.spin_binary64_hex):
+            raise ValueError("role-scoped leaf sampling coordinate is invalid")
+        if selection not in selections:
+            raise ValueError("role-scoped leaf mechanism is outside the request")
+        identity = (role, mode, coordinate.spin_binary64_hex, selection.mechanism_id)
+        if identity in identities:
+            raise ValueError("role-scoped leaves contain duplicates")
+        identities.add(identity)
+        leaves.append(RoleScopedLeaf(role, mode, coordinate, selection))
+    expected = {
+        (
+            leaf.role,
+            ModeKey(
+                -2, leaf.mode[0], leaf.mode[1], leaf.mode[2],
+                "schwarzschild-overtone-continuation", "gravitational",
+            ),
+            leaf.spin.hex(), leaf.mechanism_id,
+        )
+        for leaf in B_PRIME_RELEASE_DOMAIN.production_leaves
+    }
+    if identities != expected:
+        raise ValueError("role-scoped leaves must exactly match the B′ release domain")
+    return tuple(leaves)
 
 
 def validate_linear_response_request(
@@ -550,10 +833,14 @@ def validate_linear_response_request(
     )
     _exact_fields(
         section,
-        frozenset({"mechanisms", "sampling_coordinates"}),
+        (
+            frozenset({"mechanisms", "sampling_coordinates", "role_scoped_leaves"})
+            if "role_scoped_leaves" in section
+            else frozenset({"mechanisms", "sampling_coordinates"})
+        ),
         "linear-response numerical policy",
     )
-    _sampling_coordinates_for_request(request, section)
+    sampling_coordinates = _sampling_coordinates_for_request(request, section)
     raw = _array(section["mechanisms"], "linear-response mechanisms")
     if not raw:
         raise ValueError("linear-response mechanisms must not be empty")
@@ -561,6 +848,7 @@ def validate_linear_response_request(
     keys = [canonical_json_bytes(item.to_mapping()) for item in selections]
     if len(keys) != len(set(keys)):
         raise ValueError("linear-response request contains duplicate mechanisms")
+    _role_scoped_leaves_for_request(request, section, selections, sampling_coordinates)
     return selections
 
 
@@ -613,6 +901,95 @@ def _validate_spin_fields(
     if binary64_hex != expected_hex:
         raise ValueError(f"{subject} binary64 spin identity is invalid")
     return spin, (numerator, denominator), binary64_hex
+
+
+def _validate_deep_precision_evidence(
+    value: object,
+    numerical_state: NumericalState,
+    *,
+    sentinel_required: bool,
+) -> None:
+    evidence = _object(value, "deep precision evidence")
+    _exact_fields(
+        evidence,
+        frozenset(
+            {
+                "trigger_ids", "promoted", "precision_digits",
+                "repeat_precision_digits", "self_refinement_enclosed",
+                "discrepancy_enclosed", "sentinel", "sentinel_comparison",
+            }
+        ),
+        "deep precision evidence",
+    )
+    trigger_ids = _unique_sorted_strings(
+        evidence["trigger_ids"], "deep precision trigger_ids"
+    )
+    if set(trigger_ids) - set(B_PRIME_RELEASE_DOMAIN.precision_promotion_gates):
+        raise ValueError("deep precision evidence has an unknown promotion trigger")
+    sentinel = _boolean(evidence["sentinel"], "deep precision sentinel")
+    if sentinel != sentinel_required:
+        raise ValueError("deep precision sentinel identity is invalid")
+    comparison = evidence["sentinel_comparison"]
+    if sentinel:
+        sentinel_comparison = _object(
+            comparison, "deep precision sentinel comparison"
+        )
+        _exact_fields(
+            sentinel_comparison,
+            frozenset(
+                {
+                    "binary64_to_80_discrepancy_abs",
+                    "trigger_threshold_abs",
+                    "trigger_policy_false_negative",
+                }
+            ),
+            "deep precision sentinel comparison",
+        )
+        discrepancy = _number(
+            sentinel_comparison["binary64_to_80_discrepancy_abs"],
+            "deep precision sentinel binary64-to-80 discrepancy",
+        )
+        threshold = _number(
+            sentinel_comparison["trigger_threshold_abs"],
+            "deep precision sentinel trigger threshold",
+        )
+        if discrepancy < 0.0 or threshold <= 0.0:
+            raise ValueError("deep precision sentinel comparison magnitudes are invalid")
+        false_negative = _boolean(
+            sentinel_comparison["trigger_policy_false_negative"],
+            "deep precision sentinel false-negative outcome",
+        )
+        expected_false_negative = discrepancy > threshold and not bool(trigger_ids)
+        if false_negative != expected_false_negative:
+            raise ValueError("deep precision sentinel false-negative outcome is invalid")
+        if false_negative:
+            raise ValueError("deep precision sentinel false negative invalidates admission")
+    elif comparison is not None:
+        raise ValueError("deep precision sentinel comparison is not permitted")
+    promoted = _boolean(evidence["promoted"], "deep precision promoted")
+    if promoted != (bool(trigger_ids) or sentinel):
+        raise ValueError("deep precision promotion rule is invalid")
+    digits = _integer(evidence["precision_digits"], "deep precision digits")
+    if digits != (80 if promoted else 64):
+        raise ValueError("deep precision digits do not match the frozen policy")
+    enclosed = _boolean(
+        evidence["self_refinement_enclosed"], "deep self-refinement enclosure"
+    )
+    repeat = evidence["repeat_precision_digits"]
+    if promoted and not enclosed:
+        if (
+            not isinstance(repeat, int)
+            or isinstance(repeat, bool)
+            or repeat != 120
+        ):
+            raise ValueError("deep precision repeat must run at 120 digits")
+    elif repeat is not None:
+        raise ValueError("deep precision repeat is not permitted")
+    discrepancy_enclosed = _boolean(
+        evidence["discrepancy_enclosed"], "deep precision discrepancy enclosure"
+    )
+    if numerical_state is NumericalState.ACCEPTED and not discrepancy_enclosed:
+        raise ValueError("accepted deep component requires enclosed 80/120 discrepancy")
 
 
 def _validate_complex(value: object, subject: str, units: str) -> tuple[float, float]:
@@ -716,6 +1093,7 @@ def _validate_component(
     sampling_by_spin: Mapping[str, SpinSamplingCoordinate],
     expected_ids: frozenset[str],
     root_reference_ids: frozenset[str],
+    precision_requirements: Mapping[str, tuple[bool, bool]],
 ) -> _ComponentSummary:
     component = _object(value, "linear-response component")
     _exact_fields(
@@ -778,18 +1156,14 @@ def _validate_component(
         raise ValueError("component numerical_state is not a produced state")
 
     diagnostics = _object(component["diagnostics"], "component diagnostics")
-    _exact_fields(
-        diagnostics,
-        frozenset(
-            {
-                "baseline_residual_abs",
-                "determinant_derivative_abs",
-                "signed_root_uncertainty_radius_abs",
-                "method",
-            }
-        ),
-        "component diagnostics",
-    )
+    diagnostic_fields = {
+        "baseline_residual_abs", "determinant_derivative_abs",
+        "signed_root_uncertainty_radius_abs", "method",
+    }
+    precision_requirement = precision_requirements.get(component_id)
+    if precision_requirement is not None:
+        diagnostic_fields.add("precision_evidence")
+    _exact_fields(diagnostics, frozenset(diagnostic_fields), "component diagnostics")
     _number(
         diagnostics["baseline_residual_abs"],
         "baseline_residual_abs",
@@ -806,6 +1180,11 @@ def _validate_component(
         minimum=0.0,
     )
     _string(diagnostics["method"], "component diagnostic method")
+    if precision_requirement is not None:
+        _validate_deep_precision_evidence(
+            diagnostics["precision_evidence"], numerical_state,
+            sentinel_required=precision_requirement[0],
+        )
 
     result = _object(component["result"], "component result")
     _exact_fields(
@@ -880,6 +1259,7 @@ def _validate_root_references(
     value: object,
     request: StudyRequest,
     sampling_by_spin: Mapping[str, SpinSamplingCoordinate],
+    expected_coordinates: set[tuple[ModeKey, str]],
 ) -> frozenset[str]:
     references = _array(value, "baseline root references")
     seen: set[str] = set()
@@ -924,12 +1304,7 @@ def _validate_root_references(
             raise ValueError("baseline root reference IDs contain duplicates")
         seen.add(reference_id)
         coordinates.add((mode, spin_hex))
-    expected = {
-        (mode, float(spin).hex())
-        for mode in request.modes
-        for spin in request.spins
-    }
-    if coordinates != expected:
+    if coordinates != expected_coordinates:
         raise ValueError("baseline root references do not cover the request")
     return frozenset(seen)
 
@@ -1350,6 +1725,9 @@ def validate_linear_response_payload(
     sampling_by_spin = {
         item.spin_binary64_hex: item for item in sampling_coordinates
     }
+    role_scoped_leaves = _role_scoped_leaves_for_request(
+        request, policy, selections, sampling_coordinates
+    )
 
     mapping = _object(payload, "linear-response payload")
     _exact_fields(
@@ -1391,16 +1769,39 @@ def validate_linear_response_payload(
         if mapping[field] != expected:
             raise ValueError(f"linear-response {field} is invalid")
     _validate_lineage(mapping["lineage"], provider)
-    root_reference_ids = _validate_root_references(
-        mapping["baseline_root_references"], request, sampling_by_spin
+    active_leaves = (
+        role_scoped_leaves
+        if role_scoped_leaves is not None
+        else tuple(
+            RoleScopedLeaf("unscoped", mode, sampling_by_spin[spin.hex()], selection)
+            for mode in request.modes
+            for spin in request.spins
+            for selection in selections
+        )
     )
-
     expected_ids = frozenset(
-        linear_response_leaf_id(mode, spin, selection)
-        for mode in request.modes
-        for spin in request.spins
-        for selection in selections
+        linear_response_leaf_id(
+            leaf.mode, leaf.sampling_coordinate.spin, leaf.selection
+        )
+        for leaf in active_leaves
     )
+    root_reference_ids = _validate_root_references(
+        mapping["baseline_root_references"], request, sampling_by_spin,
+        {(leaf.mode, leaf.sampling_coordinate.spin_binary64_hex) for leaf in active_leaves},
+    )
+    sentinel_inputs = {
+        ((2, 2, 0), "horizon-admittance"),
+        ((2, 2, 2), "exterior-throat-kappa"),
+    }
+    precision_requirements = {
+        linear_response_leaf_id(leaf.mode, leaf.sampling_coordinate.spin, leaf.selection): (
+            ((leaf.mode.ell, leaf.mode.m, leaf.mode.n), leaf.selection.mechanism_id)
+            in sentinel_inputs,
+            True,
+        )
+        for leaf in active_leaves
+        if leaf.role == "deep"
+    }
     summaries: dict[str, _ComponentSummary] = {}
     for component in _array(
         mapping["response_components"], "linear-response components"
@@ -1412,6 +1813,7 @@ def validate_linear_response_payload(
             sampling_by_spin,
             expected_ids,
             root_reference_ids,
+            precision_requirements,
         )
         if summary.component_id in summaries:
             raise ValueError("linear-response component IDs contain duplicates")
@@ -1439,7 +1841,38 @@ def validate_linear_response_admission(
     components = _array(payload["response_components"], "response_components")
     for component in components:
         mapping = _object(component, "linear-response component")
-        if mapping["numerical_state"] != NumericalState.ACCEPTED.value:
+        if mapping["numerical_state"] not in {
+            NumericalState.ACCEPTED.value,
+            NumericalState.UNRESOLVED.value,
+        }:
             raise ValueError(
-                "every admitted linear-response component must be ACCEPTED"
+                "every admitted linear-response component must be ACCEPTED or UNRESOLVED"
             )
+    selections = validate_linear_response_request(request)
+    policy = _object(
+        request.numerical_policy.get("linear-response"),
+        "linear-response numerical policy",
+    )
+    sampling_coordinates = _sampling_coordinates_for_request(request, policy)
+    role_scoped_leaves = _role_scoped_leaves_for_request(
+        request, policy, selections, sampling_coordinates
+    )
+    if role_scoped_leaves is None:
+        raise ValueError("B′ admission requires explicit role-scoped leaves")
+    expected_b_prime_inputs = {
+        (leaf.role, leaf.mode, leaf.spin.hex(), leaf.mechanism_id)
+        for leaf in B_PRIME_RELEASE_DOMAIN.production_leaves
+    }
+    requested_b_prime_inputs = {
+        (
+            leaf.role, (leaf.mode.ell, leaf.mode.m, leaf.mode.n),
+            leaf.sampling_coordinate.spin.hex(), leaf.selection.mechanism_id,
+        )
+        for leaf in role_scoped_leaves
+    }
+    if (
+        completeness["required_leaf_count"] != len(expected_b_prime_inputs)
+        or completeness["produced_leaf_count"] != len(expected_b_prime_inputs)
+        or requested_b_prime_inputs != expected_b_prime_inputs
+    ):
+        raise ValueError("B′ required leaf count and role-scoped leaf set are exact")

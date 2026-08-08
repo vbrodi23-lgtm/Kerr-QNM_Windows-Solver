@@ -28,7 +28,7 @@ RELEASE_MANIFEST_RESOURCE = resources.files("windows_solver").joinpath(
     "data", "release_domain_manifest.json"
 )
 RELEASE_MANIFEST_SHA256 = (
-    "697c92744e098fe409f481bcfa0ebeecfc61cd222291e36cd4158fbc5857b742"
+    "f946e02b50b87864547a6577636061d97244aff5c616f35398c01c524c0192cb"
 )
 
 _MAX_MANIFEST_BYTES = 2 * 1024 * 1024
@@ -301,6 +301,10 @@ def _validate_release_domain(value: object) -> None:
                 "roots_by_ell",
                 "catalog_sha256",
                 "receipt_sha256",
+                "m02_overlay_root_count",
+                "m02_selector_union_count",
+                "m02_overlay_catalog_sha256",
+                "m02_overlay_receipt_sha256",
             }
         ),
         "release_domain spectrum",
@@ -325,6 +329,23 @@ def _validate_release_domain(value: object) -> None:
         "61a428a858de1eb7e42fe4cbbda37bf1fddcc808d98be2a62fd33ef4b5b74379"
     ):
         raise ValueError("spectrum receipt SHA-256 does not match the baseline")
+    if _integer(
+        spectrum["m02_overlay_root_count"], "spectrum M02 overlay root_count"
+    ) != 44:
+        raise ValueError("spectrum M02 overlay root_count must be 44")
+    if _integer(
+        spectrum["m02_selector_union_count"],
+        "spectrum M02 selector union count",
+    ) != 87:
+        raise ValueError("spectrum M02 selector union count must be 87")
+    if spectrum["m02_overlay_catalog_sha256"] != (
+        "c4c61a1b73e850d537dba5f5eb947af100449aa2a1958a1ec8ea086f60ffe8e8"
+    ):
+        raise ValueError("spectrum M02 overlay catalog SHA-256 does not match")
+    if spectrum["m02_overlay_receipt_sha256"] != (
+        "93a2e7586878d9c84e32d19ed9e7ad44d03572a91640625c44501bfbc46a5525"
+    ):
+        raise ValueError("spectrum M02 overlay receipt SHA-256 does not match")
     if spectrum["m_rule"] != "every integer from -ell through +ell":
         raise ValueError("spectrum m_rule does not match the baseline")
     if spectrum["branches"] != ["schwarzschild-overtone-continuation"]:
@@ -344,6 +365,7 @@ def _validate_release_domain(value: object) -> None:
                 "mechanisms",
                 "branch_classes",
                 "required_outputs",
+                "b_prime",
             }
         ),
         "release_domain linear_response",
@@ -383,6 +405,43 @@ def _validate_release_domain(value: object) -> None:
     if linear["branch_classes"] != ["damped", "zero-damping", "unresolved"]:
         raise ValueError("branch classes do not match the frozen domain")
     _unique_strings(linear["required_outputs"], "linear-response required_outputs")
+    b_prime = _object(linear["b_prime"], "linear-response B-prime")
+    _exact_fields(
+        b_prime,
+        frozenset(
+            {
+                "leaf_counts", "selector_counts", "missing_selector_counts",
+                "projective_counts", "primary_supports", "deep_support",
+                "control_role", "cubic_role", "completeness_rule",
+                "precision_policy", "wolfram_receipt",
+            }
+        ),
+        "linear-response B-prime",
+    )
+    if b_prime["leaf_counts"] != {"primary": 441, "control": 48, "deep": 64, "total": 553}:
+        raise ValueError("B-prime leaf counts do not match the frozen domain")
+    if b_prime["selector_counts"] != {"primary": 63, "control": 8, "deep": 16, "total": 87}:
+        raise ValueError("B-prime selector counts do not match the frozen domain")
+    if b_prime["missing_selector_counts"] != {"primary": 28, "control": 0, "deep": 16, "total": 44}:
+        raise ValueError("B-prime missing-selector counts do not match the frozen domain")
+    if b_prime["projective_counts"] != {"primary": 162, "deep": 12, "total": 174}:
+        raise ValueError("B-prime projective counts do not match the frozen domain")
+    if b_prime["primary_supports"] != {"K0": ["220", "330", "440"], "K1": ["221", "331", "441"], "K22": ["220", "221", "222"]}:
+        raise ValueError("B-prime primary supports do not match the frozen domain")
+    if b_prime["deep_support"] != ["220", "221", "222"]:
+        raise ValueError("B-prime deep support does not match the frozen domain")
+    if b_prime["control_role"] != "claim-negative exterior-only; negative-m positive-spin rows are counterrotating":
+        raise ValueError("B-prime control role does not match the frozen domain")
+    if b_prime["cubic_role"] != "eight retained parity-even 220 rows are comparator-only and outside production":
+        raise ValueError("B-prime cubic role does not match the frozen domain")
+    if b_prime["completeness_rule"] != "admission requires 553 produced leaves and zero missing; evidence-bearing UNRESOLVED is produced":
+        raise ValueError("B-prime completeness rule does not match the frozen domain")
+    precision = _object(b_prime["precision_policy"], "B-prime precision policy")
+    _exact_fields(precision, frozenset({"promote_digits", "repeat_digits", "sentinel_count", "promotion_gate_count"}), "B-prime precision policy")
+    if precision != {"promote_digits": 80, "repeat_digits": 120, "sentinel_count": 8, "promotion_gate_count": 4}:
+        raise ValueError("B-prime precision policy does not match the frozen domain")
+    if b_prime["wolfram_receipt"] != "docs/evidence/m02-b-prime-wolfram-arithmetic-receipt.json":
+        raise ValueError("B-prime Wolfram receipt path does not match the frozen domain")
 
     operator = _object(
         domain["operator_stability"], "release_domain operator_stability"

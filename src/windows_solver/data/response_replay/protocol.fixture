@@ -1,0 +1,33 @@
+{
+  "component_count": 18,
+  "ladder_plan": {
+    "axis_tolerance_factor": 2.0,
+    "even_order_tolerance": 0.75,
+    "initial_epsilon": 0.004,
+    "ladder_ratio": 2.0,
+    "maximum_fit_condition_number": 100000000.0,
+    "maximum_levels": 6,
+    "minimum_epsilon": 0.000125,
+    "order_tolerance": 0.45,
+    "repeat_level_count": 2,
+    "signal_to_root_factor": 8.0
+  },
+  "predeclared_equivalence_threshold_rad": 0.001,
+  "predeclared_separation_threshold_rad": 0.01,
+  "primary_settings": {
+    "endpoint_series_order": 28,
+    "label": "primary",
+    "ode_absolute_tolerance": 2e-12,
+    "ode_relative_tolerance": 2e-10,
+    "readout_radius": 6.0,
+    "seed_displacement_im": 0.0,
+    "seed_displacement_re": 0.0,
+    "support_subinterval_count": 256
+  },
+  "producer_protocol": "same-equation-complex-axis-richardson-disk-holdout-r3",
+  "reduction_count": 0,
+  "reduction_status": "SKIPPED_UNUSABLE_COMPONENTS",
+  "stage_id": "component-local-response-refinement",
+  "stage_name": "component_local_complex_axis_response_refinement",
+  "supersedes": "first-success Stage-25 atlas-wide worst-case relative cover"
+}

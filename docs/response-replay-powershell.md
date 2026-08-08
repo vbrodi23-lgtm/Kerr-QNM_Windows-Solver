@@ -1,0 +1,184 @@
+# Selected response replay from PowerShell
+
+These commands exercise the authenticated representative replay only. They do
+not enable the linear-response provider and do not create release evidence.
+
+Create a selection file containing the pinned replay backend and one or more of
+the five predeclared leaf IDs:
+
+```powershell
+$selection = @{
+  schema_version = 1
+  backend_id = "recorded-response-risk-replay"
+  leaf_ids = @(
+    "b-prime-leaf-9e5777728144433e089f9559b92b6e139e16115a5a53099f40403a45297aa3c3"
+  )
+} | ConvertTo-Json -Depth 4 -Compress
+Set-Content -Path selection.json -Value $selection -Encoding utf8NoBOM
+```
+
+Plan, execute cold, resume with zero work, and validate the checkpoint:
+
+```powershell
+python -m windows_solver response-plan selection.json --checkpoint checkpoint.json
+python -m windows_solver response-run selection.json --checkpoint checkpoint.json
+python -m windows_solver response-resume selection.json --checkpoint checkpoint.json
+python -m windows_solver response-validate selection.json --checkpoint checkpoint.json
+```
+
+Each command writes exactly one JSON object. Invalid selections, stale bindings,
+tampered results, and incorrect cold/resume state return a nonzero exit code and
+one machine-readable error object on standard error.
+
+## B-prime 553-leaf campaign handoff
+
+The campaign commands plan all 553 literal B-prime leaves but execute only the
+explicit role-bounded selection. They never complete a Cartesian product. The
+provider remains unavailable and every partial or merged checkpoint reports
+`release_admissible=false`.
+
+Create a binary64 selection manifest. `leaf_ids` and `cohort_ids` are mutually
+exclusive; IDs must already be in canonical plan order.
+
+```powershell
+$selection = @{
+  schema_version = 1
+  backend_id = "vetted-native-gsn-determinant"
+  precision_digits = @(64)
+  precision_backend = $null
+  role = "primary"
+  leaf_ids = @(
+    "b-prime-leaf-9e5777728144433e089f9559b92b6e139e16115a5a53099f40403a45297aa3c3"
+  )
+  cohort_ids = $null
+} | ConvertTo-Json -Depth 5 -Compress
+Set-Content -Path campaign-selection.json -Value $selection -Encoding utf8NoBOM
+python -m windows_solver campaign-plan campaign-selection.json > campaign-plan.json
+```
+
+For a cohort run, copy the desired canonical `cohort_id` from
+`campaign-plan.json`, set `leaf_ids=$null`, and set `cohort_ids=@($cohortId)`.
+
+The permitted build-time preflight replays exactly three authenticated records
+and exercises seven explicitly synthetic orchestration records. It performs no
+native determinant solve:
+
+```powershell
+python -m windows_solver campaign-smoke
+```
+
+Physical selected execution requires the exact authenticated cache inputs. The
+commands do not generate or download this resource.
+
+```powershell
+$env:GSN_INFINITY_SERIES_CACHE = "C:\solver-inputs\gsn-infinity-series.json"
+$env:GSN_INFINITY_SERIES_CACHE_SHA256 = "0c49fe4c2839444422b2d0ebcf08c912ee06d7e60ed398c9b360ed4c151f28d3"
+python -m windows_solver campaign-run campaign-selection.json --checkpoint primary-part.json
+python -m windows_solver campaign-resume campaign-selection.json --checkpoint primary-part.json
+python -m windows_solver campaign-validate campaign-selection.json --checkpoint primary-part.json
+```
+
+Absent or changed cache bytes fail before determinant work. The installed native
+adapter authenticates binary64 only. A deep selection therefore also requires a
+separately authenticated backend implementing the declared 80/120-digit
+capabilities and deep trigger diagnostics; missing stages remain missing rather
+than being silently downgraded.
+
+An operator precision plugin is declared, but not imported, during `plan` and
+`validate`. Its module is a safe path relative to the selection manifest, and
+its bytes must match before `module:function` import during `run` or nonzero-work
+`resume`. The factory result must expose the exact declared `BackendIdentity`
+and advertised capabilities.
+
+```powershell
+$precisionBackend = @{
+  factory = "operator_precision_backend:create_backend"
+  module_path = "operator_precision_backend.py"
+  module_sha256 = (Get-FileHash .\operator_precision_backend.py -Algorithm SHA256).Hash.ToLowerInvariant()
+  backend_identity = $authenticatedBackendIdentity
+  available_precision_digits = @(64, 80, 120)
+}
+```
+
+Set the selection's `precision_backend` to this object and keep its
+`backend_id`, `precision_digits`, and every other plan field unchanged. This
+allows a same-identity backend with a superset of currently available precision
+stages to resume a `MISSING_PRECISION` prefix. The module does not make
+multi-precision physics available by itself; the operator supplies that
+authenticated implementation.
+
+Merge manifests name relative, non-symlink checkpoint paths. Absolute, UNC,
+drive-relative, traversal, ADS, duplicate-key, nonfinite, stale, mixed-policy,
+and disagreeing-overlap inputs are rejected before work.
+
+```powershell
+$merge = @{
+  schema_version = 1
+  backend_id = "vetted-native-gsn-determinant"
+  precision_digits = @(64)
+  precision_backend = $null
+  checkpoint_paths = @("parts\primary-a.json", "parts\primary-b.json")
+} | ConvertTo-Json -Depth 4 -Compress
+Set-Content -Path campaign-merge.json -Value $merge -Encoding utf8NoBOM
+python -m windows_solver campaign-merge campaign-merge.json --output merged.json
+python -m windows_solver campaign-validate campaign-selection.json --checkpoint merged.json --full
+```
+
+`--full` requires the exact ordered 553 leaf IDs, zero extras or missing records,
+terminal precision evidence, and no missing-precision stage. A governed computed
+`UNRESOLVED` record is complete; an unexecuted leaf or missing 80/120 stage is
+not. Even an exact structurally complete bundle is not admitted by this task:
+software readiness, operator computation, and scientific-provider admission are
+separate states.
+
+## Deterministic projective reduction
+
+`campaign-reduce` performs no response or determinant work. It authenticates
+the named TASK-009 checkpoint bytes, reuses the existing semantic checkpoint
+validator, consumes signed-channel evidence, and writes one canonical reduction
+object atomically. A partial set stays `INCOMPLETE`; every absent component ID
+is listed and no missing row receives a scientific classification.
+
+This example intentionally names the predeclared deep-tail row with no component
+evidence, so it demonstrates the honest partial result rather than constructing
+a scientific atlas:
+
+```powershell
+$checkpointPaths = @("deep-tail-partial.json")
+$sourceHashes = @(
+  $checkpointPaths | ForEach-Object {
+    "sha256:" + (Get-FileHash $_ -Algorithm SHA256).Hash.ToLowerInvariant()
+  }
+)
+$bundle = [ordered]@{
+  schema_version = 1
+  campaign_id = "b-prime-campaign-80e2150845fe9e32fa37d7ecc660fa24083f2a179668b2915bc2a01b748b4f49"
+  backend_id = "vetted-native-gsn-determinant"
+  precision_digits = @(64)
+  precision_backend = $null
+  checkpoint_paths = $checkpointPaths
+  selected_row_ids = @("deep-K22-1-1000-exterior-throat-kappa")
+  component_evidence = @()
+  source_hashes = $sourceHashes
+}
+$bundle | ConvertTo-Json -Depth 20 -Compress | Set-Content reduction-material.json -Encoding utf8NoBOM
+python -c 'from pathlib import Path; import hashlib,json; from windows_solver.contracts import canonical_json_bytes; p=Path("reduction-material.json"); v=json.loads(p.read_text()); v["bundle_sha256"]=hashlib.sha256(canonical_json_bytes(v)).hexdigest(); Path("reduction-bundle.json").write_bytes(canonical_json_bytes(v))'
+python -m windows_solver campaign-reduce reduction-bundle.json --output partial-reduction.json
+$partial = Get-Content partial-reduction.json -Raw | ConvertFrom-Json
+$partial.reducer_state
+$partial.missing_component_ids
+```
+
+Resolved evidence uses an ordered `contributions` array. Every item supplies a
+stable channel ID and family, shared group, signed real/imaginary delta, units,
+checkpoint source receipt, and `local` or `shared` scope. Computed unresolved
+evidence retains its raw contribution ledger but has no centre, Gram, or disk.
+The CLI accepts only `authenticated-campaign` evidence whose receipts equal one
+of the byte-verified checkpoint hashes. Duplicate/nonfinite JSON, stale or mixed
+campaign lineage, unsafe paths, and existing output files fail before
+publication.
+
+Once the operator has the complete admitted 553-leaf evidence, use the same
+frozen command and all 174 canonical row IDs. Only that complete evidence may
+produce the full 174-row scientific artifact. The reducer software and the
+examples above do not admit the provider or populate that atlas.
