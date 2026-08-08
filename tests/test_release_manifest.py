@@ -219,18 +219,42 @@ class ReleaseManifestTests(unittest.TestCase):
             self.assertIn(receipt["convention_id"], convention_ids)
             self.assertIn(receipt["evidence_ceiling_id"], evidence_ids)
 
-    def test_manifest_bytes_are_content_bound(self) -> None:
-        path = (
+    def test_hash_pinned_release_data_bytes_are_content_bound(self) -> None:
+        data_directory = (
             Path(__file__).resolve().parents[1]
             / "src"
             / "windows_solver"
             / "data"
-            / "release_domain_manifest.json"
         )
-        self.assertEqual(
-            hashlib.sha256(path.read_bytes()).hexdigest(),
-            RELEASE_MANIFEST_SHA256,
-        )
+        expected = {
+            "LICENSE-CANONICAL-BACKEND-MIT.txt": (
+                "9d077724a197b552d3fc7547b8f7ef8a781387fab6e687fc312f14e28a9928f4"
+            ),
+            "LICENSE-CC-BY-4.0.txt": (
+                "ca21e12402b18b0ed880cdbf2a5b57980983b61ada45760268672b226ac46457"
+            ),
+            "LICENSE-QNM-MIT.txt": (
+                "da080a799bd23a0d461e6a33896e4a40f2e5c033e15882a64a3f76f397d20731"
+            ),
+            "kerr_qnm_lattice_receipt.json": (
+                "61a428a858de1eb7e42fe4cbbda37bf1fddcc808d98be2a62fd33ef4b5b74379"
+            ),
+            "kerr_qnm_m02_overlay_44.csv": (
+                "c4c61a1b73e850d537dba5f5eb947af100449aa2a1958a1ec8ea086f60ffe8e8"
+            ),
+            "kerr_qnm_m02_overlay_receipt.json": (
+                "93a2e7586878d9c84e32d19ed9e7ad44d03572a91640625c44501bfbc46a5525"
+            ),
+            "kerr_qnm_roots_2736.csv": (
+                "9ebae4271309cd45a1b26c90d31155602ed8ef33bb79069adb5897e8afe7a564"
+            ),
+            "release_domain_manifest.json": RELEASE_MANIFEST_SHA256,
+        }
+        actual = {
+            name: hashlib.sha256((data_directory / name).read_bytes()).hexdigest()
+            for name in expected
+        }
+        self.assertEqual(actual, expected)
 
     def test_git_checkout_preserves_manifest_bytes_on_every_platform(self) -> None:
         root = Path(__file__).resolve().parents[1]

@@ -53,14 +53,39 @@ def _admission_fixture(directory: Path, *, complete: bool) -> Path:
     )
     for record in manifest["produced_records"]:
         record["numerical_state"] = "UNRESOLVED"
-    manifest["bundle_sha256"] = evidence_bundle_digest(manifest)
-    evidence_path = evidence_directory / "evidence-bundle.json"
-    _write_json(evidence_path, manifest)
-    evidence_receipt = "sha256:" + _sha256(evidence_path.read_bytes())
 
     request = b_prime_request()
     request_path = directory / "request.json"
     _write_json(request_path, request.to_mapping())
+
+    payload = b_prime_payload(request)
+    components_by_identity = {
+        (
+            component["mode"]["ell"],
+            component["mode"]["m"],
+            component["mode"]["n"],
+            component["spin_binary64_hex"],
+            component["mechanism"]["mechanism_id"],
+        ): component
+        for component in payload["response_components"]
+    }
+    for record in manifest["produced_records"]:
+        record_identity = (
+            *record["mode"],
+            record["sampling_coordinate"]["spin_binary64_hex"],
+            record["mechanism_id"],
+        )
+        component_bytes = canonical_json_bytes(
+            components_by_identity[record_identity]
+        )
+        component_path = evidence_directory / record["payload_path"]
+        component_path.write_bytes(component_bytes)
+        record["payload_size"] = len(component_bytes)
+        record["payload_sha256"] = _sha256(component_bytes)
+    manifest["bundle_sha256"] = evidence_bundle_digest(manifest)
+    evidence_path = evidence_directory / "evidence-bundle.json"
+    _write_json(evidence_path, manifest)
+    evidence_receipt = "sha256:" + _sha256(evidence_path.read_bytes())
 
     plans = build_projective_row_plans()
     component_ids = tuple(dict.fromkeys(
@@ -96,7 +121,6 @@ def _admission_fixture(directory: Path, *, complete: bool) -> Path:
     reduction_path = directory / "reduction.json"
     _write_json(reduction_path, reduction.to_mapping())
 
-    payload = b_prime_payload(request)
     payload["lineage"]["source_sha256s"] = [
         manifest["bundle_sha256"],
         evidence_receipt.removeprefix("sha256:"),
@@ -181,6 +205,54 @@ class LinearResponseAdmissionTests(unittest.TestCase):
         malformed["evidence_receipt"]["unresolved_leaf_ids"] = [{}]
         with self.assertRaisesRegex(ValueError, "unresolved leaf IDs"):
             LinearResponseAdmissionPackage.from_mapping(malformed)
+
+    def test_admission_binds_component_state_and_authenticated_payload_bytes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            admission_path = _admission_fixture(directory, complete=True)
+            evidence_path = directory / "evidence" / "evidence-bundle.json"
+            evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+            evidence["produced_records"][0]["numerical_state"] = "ACCEPTED"
+            evidence["bundle_sha256"] = evidence_bundle_digest(evidence)
+            _write_json(evidence_path, evidence)
+
+            payload_path = directory / "payload.json"
+            payload = json.loads(payload_path.read_text(encoding="utf-8"))
+            for digest in (
+                evidence["bundle_sha256"],
+                _sha256(evidence_path.read_bytes()),
+            ):
+                if digest not in payload["lineage"]["source_sha256s"]:
+                    payload["lineage"]["source_sha256s"].append(digest)
+            _write_json(payload_path, payload)
+
+            admission = json.loads(admission_path.read_text(encoding="utf-8"))
+            admission["evidence_bundle"]["sha256"] = _sha256(
+                evidence_path.read_bytes()
+            )
+            admission["payload"]["sha256"] = _sha256(payload_path.read_bytes())
+            _write_json(admission_path, admission)
+            with self.assertRaisesRegex(
+                ValueError, "component numerical state does not match"
+            ):
+                admit_linear_response_bundle(admission_path)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            admission_path = _admission_fixture(directory, complete=True)
+            payload_path = directory / "payload.json"
+            payload = json.loads(payload_path.read_text(encoding="utf-8"))
+            payload["response_components"][0]["result"]["reason"] = (
+                "stale unrelated payload"
+            )
+            _write_json(payload_path, payload)
+            admission = json.loads(admission_path.read_text(encoding="utf-8"))
+            admission["payload"]["sha256"] = _sha256(payload_path.read_bytes())
+            _write_json(admission_path, admission)
+            with self.assertRaisesRegex(
+                ValueError, "authenticated payload does not match component"
+            ):
+                admit_linear_response_bundle(admission_path)
 
     def test_cli_validates_admits_exports_and_runs_cold_then_warm(self) -> None:
         root = Path(__file__).resolve().parents[1]

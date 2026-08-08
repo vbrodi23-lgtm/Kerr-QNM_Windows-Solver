@@ -13,7 +13,10 @@ scientific claim, and the default linear-response provider remains unavailable.
 - A strict admission package validates exactly 553 produced leaves, zero
   missing leaves, governed unresolved IDs, the exact complete 174-row
   reduction, role ceilings, request and payload identities, artifact hashes,
-  runtime lineage, and policy identity. Nested contents are deeply immutable.
+  runtime lineage, and policy identity. Every final response component and
+  numerical state must equal its corresponding byte-authenticated produced
+  payload; copied lineage hashes cannot admit unrelated values. Nested contents
+  are deeply immutable.
 - Partial and representative smoke bundles fail admission. A structurally
   complete signed test bundle proves the availability transition while keeping
   `scientific_claims_admitted` false.
@@ -32,7 +35,7 @@ scientific claim, and the default linear-response provider remains unavailable.
 ## Verification
 
 - Fresh local full suite:
-  `PYTHONPATH=src python -m unittest discover -s tests -v` — 212/212 passed.
+  `PYTHONPATH=src python -m unittest discover -s tests -v` — 213/213 passed.
 - Focused admission, contract, engine, and CLI suite — 59/59 passed.
 - Cross-platform identity and provider regression suite — 14/14 passed.
 - GitHub Actions run `31246301132`, head `759b37f2faaad6056d94de6a86e4f8bc1c8e800f`:
@@ -60,6 +63,12 @@ scientific claim, and the default linear-response provider remains unavailable.
 - Malformed non-string unresolved-leaf IDs now fail with the declared
   `ValueError` boundary instead of leaking an unhashable-container `TypeError`;
   the focused regression covers the hostile nested-object form.
+- Final review closed the value-lineage gap: admission now reconciles all 553
+  component identities, states, root references, byte sizes, SHA-256 digests,
+  and complete JSON payloads against the authenticated evidence records.
+- The release-data regression now hashes all eight pinned catalogue, receipt,
+  manifest, overlay, and license files from disk, complementing the simulated
+  `core.autocrlf=true` checkout test.
 
 ## Commit SHA(s)
 

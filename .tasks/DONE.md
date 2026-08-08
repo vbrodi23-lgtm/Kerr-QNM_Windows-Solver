@@ -27,7 +27,7 @@ Installable fail-closed admission package and CLI; an explicit dynamic provider 
 
 ### Verification
 
-- `PYTHONPATH=src python -m unittest discover -s tests -v` — 212 passed.
+- `PYTHONPATH=src python -m unittest discover -s tests -v` — 213 passed.
 - Hosted GitHub Actions run `31246301132` passed on `ubuntu-latest` and `windows-latest`, including full tests, wheel inspection, M02 admission/cache, campaign smoke, planning, admitted providers, and PowerShell 5.1 launcher parity.
 - `python .tasks/validate_board.py`, `python tools/validate_release_manifest.py`, `python -m compileall -q src tools tests`, and `git diff --check` — passed.
 - **Evidence ceiling:** Structurally complete signed test evidence only; no 553-leaf physical campaign, populated scientific atlas, or scientific claim. The default provider remains unavailable until the user's complete operator package passes admission.
@@ -35,7 +35,7 @@ Installable fail-closed admission package and CLI; an explicit dynamic provider 
 
 ### Review Focus
 
-Complete/partial separation is fail closed; the admitted package is deeply immutable; provider registration is explicit and unique; native runtime identity is stable across Windows and Ubuntu; operator paths and CLI output are deterministic; scientific readiness is not inferred from build readiness.
+Complete/partial separation is fail closed; every final component is value/state-bound to its authenticated produced-record payload; the admitted package is deeply immutable; provider registration is explicit and unique; native runtime identity is stable across Windows and Ubuntu; operator paths and CLI output are deterministic; scientific readiness is not inferred from build readiness.
 
 ### Plan
 

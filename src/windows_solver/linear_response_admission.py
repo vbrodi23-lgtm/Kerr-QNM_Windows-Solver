@@ -196,6 +196,79 @@ def _reduction_receipt(summary: CampaignReductionSummary) -> dict[str, object]:
     }
 
 
+def _validate_component_evidence_bindings(
+    evidence_directory: Path,
+    records: object,
+    components: object,
+) -> None:
+    records_by_identity: dict[tuple[object, ...], Mapping[str, object]] = {}
+    for raw_record in records:
+        record = _mapping(raw_record, "admission produced record")
+        coordinate = _mapping(
+            record["sampling_coordinate"], "admission record coordinate"
+        )
+        identity = (
+            *record["mode"],
+            coordinate["spin_binary64_hex"],
+            record["mechanism_id"],
+        )
+        records_by_identity[identity] = record
+
+    components_by_identity: dict[tuple[object, ...], Mapping[str, object]] = {}
+    for raw_component in components:
+        component = _mapping(raw_component, "admission response component")
+        mode = _mapping(component["mode"], "admission component mode")
+        mechanism = _mapping(
+            component["mechanism"], "admission component mechanism"
+        )
+        identity = (
+            mode["ell"],
+            mode["m"],
+            mode["n"],
+            component["spin_binary64_hex"],
+            mechanism["mechanism_id"],
+        )
+        components_by_identity[identity] = component
+
+    if (
+        len(records_by_identity) != 553
+        or len(components_by_identity) != 553
+        or set(records_by_identity) != set(components_by_identity)
+    ):
+        raise ValueError(
+            "admission evidence records do not match response component identities"
+        )
+
+    for identity, component in components_by_identity.items():
+        record = records_by_identity[identity]
+        if record["numerical_state"] != component["numerical_state"]:
+            raise ValueError(
+                "admission component numerical state does not match evidence record"
+            )
+        if record["root_reference_id"] != component["baseline_root_reference_id"]:
+            raise ValueError(
+                "admission component root reference does not match evidence record"
+            )
+        component_path = resolve_campaign_relative_path(
+            evidence_directory, record["payload_path"]
+        )
+        component_bytes = component_path.read_bytes()
+        if (
+            len(component_bytes) != record["payload_size"]
+            or _digest_bytes(component_bytes) != record["payload_sha256"]
+        ):
+            raise ValueError(
+                "admission produced component payload changed after authentication"
+            )
+        authenticated_component = _load_json_bytes(
+            component_bytes, "admission produced component payload"
+        )
+        if authenticated_component != component:
+            raise ValueError(
+                "admission authenticated payload does not match component"
+            )
+
+
 @dataclass(frozen=True, slots=True)
 class LinearResponseAdmissionPackage:
     request: Mapping[str, object]
@@ -351,6 +424,9 @@ def admit_linear_response_bundle(
     payload = _load_json_bytes(loaded["payload"][1], "linear-response payload")
     validate_linear_response_admission(
         request, ADMITTED_LINEAR_RESPONSE_DESCRIPTOR.to_mapping(), payload
+    )
+    _validate_component_evidence_bindings(
+        evidence_path.parent, records, payload["response_components"]
     )
     evidence_receipt = {
         "bundle_state": evidence_summary.bundle_state,

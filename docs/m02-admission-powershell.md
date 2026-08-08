@@ -48,6 +48,14 @@ as `request.json` and `payload.json`. The payload lineage must include the
 evidence bundle digest, the evidence manifest file digest, the reduction file
 digest, and every reduction source receipt.
 
+Each of the 553 `produced_records` must also point to a JSON payload whose
+object is the exact corresponding entry in `payload.json`'s
+`response_components` array. Admission matches the record and component by
+mode, binary64 spin identity, and mechanism; requires identical numerical state
+and root reference; and rereads the record payload under its declared byte size
+and SHA-256 before comparing the complete object. A copied lineage hash cannot
+make a stale or unrelated component admissible.
+
 Create `admission-input.json` with safe paths relative to its own directory:
 
 ```json
