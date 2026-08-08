@@ -1516,6 +1516,7 @@ def _validate_projective_comparisons(
                     "calibration_numerator_component_id",
                     "calibration_denominator_component_id",
                     "covariance_id",
+                    "empirical_gram_id",
                     "nominal_angle_radians",
                     "bounded_angle_interval_radians",
                     "calibration_disk_contains_zero",
@@ -1602,30 +1603,61 @@ def _validate_projective_comparisons(
         ):
             raise ValueError("projective calibration pair is inconsistent")
         denominator = components[denominator_id]
-        covariance_id = _string(comparison["covariance_id"], "covariance_id")
-        covered = covariance_blocks.get(covariance_id)
-        if covered is None:
-            raise ValueError("projective covariance reference is unknown")
         resolved_vector_ids = {
             item.component_id
             for item in (*left, *right)
             if item.centre is not None
         }
-        if not resolved_vector_ids.issubset(covered):
-            raise ValueError(
-                "projective covariance block does not cover the vector"
+        has_unresolved_component = len(resolved_vector_ids) != len(
+            (*left, *right)
+        )
+        covariance_id = comparison["covariance_id"]
+        if has_unresolved_component:
+            if covariance_id is not None:
+                raise ValueError(
+                    "unresolved projective comparison covariance must be null"
+                )
+        else:
+            covariance_id = _string(covariance_id, "covariance_id")
+            covered = covariance_blocks.get(covariance_id)
+            if covered is None:
+                raise ValueError("projective covariance reference is unknown")
+            if not resolved_vector_ids.issubset(covered):
+                raise ValueError(
+                    "projective covariance block does not cover the vector"
+                )
+        empirical_gram_id = comparison["empirical_gram_id"]
+        if has_unresolved_component:
+            if empirical_gram_id is not None:
+                raise ValueError(
+                    "unresolved projective comparison Gram must be null"
+                )
+        elif (
+            not isinstance(empirical_gram_id, str)
+            or re.fullmatch(
+                r"empirical-error-gram-[0-9a-f]{64}", empirical_gram_id
+            ) is None
+        ):
+            raise ValueError("projective empirical Gram identity is invalid")
+        contains_zero_raw = comparison["calibration_disk_contains_zero"]
+        if has_unresolved_component:
+            if contains_zero_raw is not None:
+                raise ValueError(
+                    "unresolved projective calibration state must be null"
+                )
+            contains_zero = None
+        else:
+            contains_zero = _boolean(
+                contains_zero_raw, "calibration_disk_contains_zero"
             )
-        contains_zero = _boolean(
-            comparison["calibration_disk_contains_zero"],
-            "calibration_disk_contains_zero",
-        )
-        computed_contains_zero = (
-            denominator.centre is None
-            or denominator.disk_radius is None
-            or math.hypot(*denominator.centre) <= denominator.disk_radius
-        )
-        if contains_zero != computed_contains_zero:
-            raise ValueError("calibration_disk_contains_zero is inconsistent")
+            computed_contains_zero = (
+                denominator.disk_radius is None
+                or math.hypot(*denominator.centre) <= denominator.disk_radius
+            )
+            if contains_zero != computed_contains_zero:
+                raise ValueError(
+                    "calibration_disk_contains_zero is inconsistent"
+                )
         outcome = _string(
             comparison["projective_outcome"], "projective_outcome"
         )
@@ -1642,10 +1674,7 @@ def _validate_projective_comparisons(
         if scientific_state not in _PROJECTIVE_STATES:
             raise ValueError("projective scientific state is invalid")
         _string(comparison["reason"], "projective comparison reason")
-        is_unbounded = (
-            contains_zero
-            or any(item.centre is None for item in (*left, *right))
-        )
+        is_unbounded = has_unresolved_component or contains_zero is True
         if is_unbounded:
             if (
                 outcome != "UNRESOLVED"

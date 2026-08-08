@@ -44,6 +44,72 @@ def _write_json(path: Path, value: object) -> None:
     path.write_bytes(canonical_json_bytes(value))
 
 
+def _projective_comparisons(
+    reduction: object, payload: dict[str, object]
+) -> list[dict[str, object]]:
+    components_by_identity = {
+        (
+            component["mode"]["ell"],
+            component["mode"]["m"],
+            component["mode"]["n"],
+            component["spin_binary64_hex"],
+            component["mechanism"]["mechanism_id"],
+        ): component
+        for component in payload["response_components"]
+    }
+    leaves = {
+        leaf.leaf_id: leaf for leaf in B_PRIME_RELEASE_DOMAIN.production_leaves
+    }
+
+    def component(leaf_id: str) -> dict[str, object]:
+        leaf = leaves[leaf_id]
+        return components_by_identity[
+            (*leaf.mode, leaf.spin.hex(), leaf.mechanism_id)
+        ]
+
+    return [
+        {
+            "comparison_id": result.row_id,
+            "mode_order": [
+                component(component_id)["mode"]
+                for component_id in plan.left_component_ids
+            ],
+            "left_component_ids": [
+                component(component_id)["component_id"]
+                for component_id in plan.left_component_ids
+            ],
+            "right_component_ids": [
+                component(component_id)["component_id"]
+                for component_id in plan.right_component_ids
+            ],
+            "calibration_mode": component(
+                plan.calibration_component_ids[0]
+            )["mode"],
+            "calibration_numerator_component_id": (
+                component(plan.calibration_component_ids[0])["component_id"]
+            ),
+            "calibration_denominator_component_id": (
+                component(plan.calibration_component_ids[1])["component_id"]
+            ),
+            "covariance_id": None,
+            "empirical_gram_id": result.empirical_gram_id,
+            "nominal_angle_radians": result.nominal_angle_radians,
+            "bounded_angle_interval_radians": (
+                None
+                if result.bounded_angle_interval_radians is None
+                else list(result.bounded_angle_interval_radians)
+            ),
+            "calibration_disk_contains_zero": (
+                result.calibration_disk_contains_zero
+            ),
+            "projective_outcome": result.projective_outcome,
+            "scientific_state": result.scientific_state,
+            "reason": result.reason,
+        }
+        for plan, result in zip(reduction.plans, reduction.results)
+    ]
+
+
 def _admission_fixture(
     directory: Path,
     *,
@@ -127,6 +193,9 @@ def _admission_fixture(
         tuple(plan.row_id for plan in plans),
         components,
         source_hashes=(evidence_receipt,),
+    )
+    payload["projective_comparisons"] = _projective_comparisons(
+        reduction, payload
     )
     reduction_path = directory / "reduction.json"
     _write_json(reduction_path, reduction.to_mapping())
@@ -226,6 +295,20 @@ class LinearResponseAdmissionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "unresolved leaf IDs"):
             LinearResponseAdmissionPackage.from_mapping(malformed)
 
+        mismatched_reduction = deepcopy(mapping)
+        mismatched_reduction["payload"]["projective_comparisons"][0][
+            "reason"
+        ] = "resealed unrelated projective conclusion"
+        material = {
+            key: value for key, value in mismatched_reduction.items()
+            if key != "admission_id"
+        }
+        mismatched_reduction["admission_id"] = (
+            "m02-admission-" + _sha256(canonical_json_bytes(material))
+        )
+        with self.assertRaisesRegex(ValueError, "projective.*reduction"):
+            LinearResponseAdmissionPackage.from_mapping(mismatched_reduction)
+
         with tempfile.TemporaryDirectory() as temporary:
             tampered = deepcopy(mapping)
             tampered["payload"]["response_components"][0]["result"]["reason"] = (
@@ -292,6 +375,30 @@ class LinearResponseAdmissionTests(unittest.TestCase):
                 ValueError, "authenticated payload does not match component"
             ):
                 admit_linear_response_bundle(admission_path)
+
+    def test_admission_binds_all_projective_rows_to_reduction(self) -> None:
+        for mutation in ("empty", "unrelated"):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as temporary:
+                directory = Path(temporary)
+                admission_path = _admission_fixture(directory, complete=True)
+                payload_path = directory / "payload.json"
+                payload = json.loads(payload_path.read_text(encoding="utf-8"))
+                if mutation == "empty":
+                    payload["projective_comparisons"] = []
+                else:
+                    payload["projective_comparisons"][0]["reason"] = (
+                        "unrelated projective conclusion"
+                    )
+                _write_json(payload_path, payload)
+                admission = json.loads(admission_path.read_text(encoding="utf-8"))
+                admission["payload"]["sha256"] = _sha256(
+                    payload_path.read_bytes()
+                )
+                _write_json(admission_path, admission)
+                with self.assertRaisesRegex(
+                    ValueError, "projective.*reduction|174"
+                ):
+                    admit_linear_response_bundle(admission_path)
 
     def test_cli_validates_admits_exports_and_runs_cold_then_warm(self) -> None:
         root = Path(__file__).resolve().parents[1]

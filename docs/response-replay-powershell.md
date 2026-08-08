@@ -173,10 +173,16 @@ Resolved evidence uses an ordered `contributions` array. Every item supplies a
 stable channel ID and family, shared group, signed real/imaginary delta, units,
 checkpoint source receipt, and `local` or `shared` scope. Computed unresolved
 evidence retains its raw contribution ledger but has no centre, Gram, or disk.
-The CLI accepts only `authenticated-campaign` evidence whose receipts equal one
-of the byte-verified checkpoint hashes. Duplicate/nonfinite JSON, stale or mixed
-campaign lineage, unsafe paths, and existing output files fail before
-publication.
+The CLI accepts only `authenticated-campaign` evidence and binds each component
+to the same leaf record in the byte-verified checkpoint named by its receipt.
+For resolved leaves the centre must equal the final checkpoint response; the
+ordered family, signed delta, units, and scope of every channel must equal the
+final stage ledger. Local stage job IDs are translated only to the canonical
+`local:<leaf-id>:<family>` component ID and leaf shared group. Required families
+and recorded precision discrepancies are also exact. Receipt membership by
+itself is not sufficient. Duplicate/nonfinite JSON, stale or mixed campaign
+lineage, disagreeing checkpoint overlaps, unsafe paths, and existing output
+files fail before publication.
 
 Once the operator has the complete admitted 553-leaf evidence, use the same
 frozen command and all 174 canonical row IDs. Only that complete evidence may

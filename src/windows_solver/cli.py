@@ -28,6 +28,7 @@ from .planner import build_plan
 from .providers import ProviderUnavailableError
 from .response_engine import (
     BackendIdentity,
+    ComponentResult,
     NumericalPolicy,
     RECORDED_REPLAY_BACKEND_ID,
     RECORDED_SMOKE_CASES,
@@ -38,9 +39,11 @@ from .response_engine import (
     validate_response_checkpoint,
 )
 from .response_batches import (
+    CampaignLeafRecord,
     NativeCampaignStageBackend,
     PrecisionCapabilities,
     PrecisionFactoryIdentity,
+    STAGE_SIGNED_ERROR_FAMILIES,
     build_campaign_plan,
     build_campaign_selection,
     merge_campaign_checkpoints,
@@ -52,9 +55,83 @@ from .response_batches import (
 from .response_engine import VettedNativeDeterminantKernel, NativeResourceUnavailableError
 from .response_reduction import (
     ComputedUnresolvedComponentEvidence,
+    ResolvedComponentEvidence,
     component_evidence_from_mapping,
     reduce_projective_rows,
 )
+
+
+def _validate_reduction_component_checkpoint_binding(
+    component: ResolvedComponentEvidence | ComputedUnresolvedComponentEvidence,
+    record: CampaignLeafRecord,
+    authenticated_receipts: frozenset[str],
+) -> None:
+    if component.evidence_kind != "authenticated-campaign":
+        raise ValueError("campaign reduction CLI accepts authenticated evidence only")
+    if record.state not in {"PRODUCED", "UNRESOLVED"} or not record.stages:
+        raise ValueError("campaign reduction component checkpoint is not terminal")
+    outcome = record.stages[-1].outcome
+    raw_result = outcome.component_result.get("result")
+    if not isinstance(raw_result, Mapping):
+        raise ValueError(
+            "campaign reduction component lacks a checkpoint production result"
+        )
+    result = ComponentResult.from_mapping(raw_result)
+    expected_channels: list[dict[str, object]] = []
+    for raw_channel in outcome.signed_error_channels:
+        channel = dict(raw_channel)
+        if channel["scope"] == "local":
+            channel_id = f"local:{record.leaf_id}:{channel['family']}"
+            shared_group = record.leaf_id
+        else:
+            channel_id = channel["channel_id"]
+            shared_group = channel["shared_group"]
+        expected_channels.append({
+            "channel_id": channel_id,
+            "family": channel["family"],
+            "shared_group": shared_group,
+            "signed_delta": channel["signed_delta"],
+            "units": channel["units"],
+            "scope": channel["scope"],
+        })
+    actual_channels = [item.to_mapping() for item in component.contributions]
+    if len(actual_channels) != len(expected_channels):
+        raise ValueError(
+            "campaign reduction signed channels do not match checkpoint"
+        )
+    for actual, expected in zip(actual_channels, expected_channels):
+        receipt = actual.pop("source_receipt")
+        if receipt not in authenticated_receipts or actual != expected:
+            raise ValueError(
+                "campaign reduction signed channels do not match checkpoint"
+            )
+    units = {item["units"] for item in expected_channels}
+    if len(units) != 1 or component.units != next(iter(units)):
+        raise ValueError("campaign reduction component units do not match checkpoint")
+    discrepancies = tuple(
+        stage.outcome.discrepancy_from_previous_abs
+        for stage in record.stages
+        if stage.outcome.discrepancy_from_previous_abs is not None
+    )
+    if isinstance(component, ResolvedComponentEvidence):
+        if (
+            record.state != "PRODUCED"
+            or result.response is None
+            or component.centre != result.response
+            or component.required_families != STAGE_SIGNED_ERROR_FAMILIES
+            or component.recorded_discrepancies != discrepancies
+        ):
+            raise ValueError(
+                "campaign reduction resolved component does not match checkpoint"
+            )
+    elif (
+        record.state != "UNRESOLVED"
+        or result.response is not None
+        or component.source_receipt not in authenticated_receipts
+    ):
+        raise ValueError(
+            "campaign reduction unresolved component does not match checkpoint"
+        )
 
 
 class CommandParser(argparse.ArgumentParser):
@@ -730,27 +807,43 @@ def _campaign_reduce(bundle_path: Path, output: Path) -> tuple[int, object]:
     )
     if tuple(declared_hashes) != computed_hashes:
         raise ValueError("campaign reduction checkpoint source hashes are invalid")
-    for checkpoint in resolved_checkpoints:
+    records_by_id: dict[str, CampaignLeafRecord] = {}
+    receipts_by_id: dict[str, set[str]] = {}
+    for checkpoint, checkpoint_receipt in zip(
+        resolved_checkpoints, computed_hashes
+    ):
         summary = validate_campaign_checkpoint(plan, checkpoint)
         _validate_campaign_capability_superset(summary, descriptor)
+        for record in summary.records:
+            existing = records_by_id.get(record.leaf_id)
+            if (
+                existing is not None
+                and existing.to_mapping() != record.to_mapping()
+            ):
+                raise ValueError(
+                    "campaign reduction checkpoint overlap disagrees"
+                )
+            records_by_id[record.leaf_id] = record
+            receipts_by_id.setdefault(record.leaf_id, set()).add(
+                checkpoint_receipt
+            )
     components = tuple(
         component_evidence_from_mapping(item) for item in raw_components
     )
     component_ids = tuple(item.component_id for item in components)
     if len(component_ids) != len(set(component_ids)):
         raise ValueError("campaign reduction component evidence contains duplicates")
-    authenticated_receipts = set(computed_hashes)
     for component in components:
-        if component.evidence_kind != "authenticated-campaign":
-            raise ValueError("campaign reduction CLI accepts authenticated evidence only")
-        if isinstance(component, ComputedUnresolvedComponentEvidence):
-            if component.source_receipt not in authenticated_receipts:
-                raise ValueError("unresolved component source receipt is not authenticated")
-        if any(
-            contribution.source_receipt not in authenticated_receipts
-            for contribution in component.contributions
-        ):
-            raise ValueError("signed channel source receipt is not authenticated")
+        record = records_by_id.get(component.component_id)
+        if record is None:
+            raise ValueError(
+                "campaign reduction component is absent from authenticated checkpoint"
+            )
+        _validate_reduction_component_checkpoint_binding(
+            component,
+            record,
+            frozenset(receipts_by_id[component.component_id]),
+        )
     reduction = reduce_projective_rows(
         plan.campaign_id,
         selected_row_ids,

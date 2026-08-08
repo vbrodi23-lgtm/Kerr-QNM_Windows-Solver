@@ -269,6 +269,87 @@ def _validate_component_evidence_bindings(
             )
 
 
+def _validate_projective_reduction_bindings(
+    summary: CampaignReductionSummary,
+    payload: Mapping[str, object],
+) -> None:
+    comparisons = payload["projective_comparisons"]
+    if not isinstance(comparisons, list) or len(comparisons) != 174:
+        raise ValueError(
+            "admission requires exactly 174 projective comparisons from the reduction"
+        )
+    components_by_identity: dict[tuple[object, ...], Mapping[str, object]] = {}
+    for raw_component in payload["response_components"]:
+        component = _mapping(raw_component, "admission response component")
+        mode = _mapping(component["mode"], "admission component mode")
+        mechanism = _mapping(
+            component["mechanism"], "admission component mechanism"
+        )
+        identity = (
+            mode["ell"], mode["m"], mode["n"],
+            component["spin_binary64_hex"], mechanism["mechanism_id"],
+        )
+        components_by_identity[identity] = component
+    leaves = {
+        leaf.leaf_id: leaf for leaf in B_PRIME_RELEASE_DOMAIN.production_leaves
+    }
+
+    def component_for_leaf(leaf_id: str) -> Mapping[str, object]:
+        leaf = leaves[leaf_id]
+        return components_by_identity[
+            (*leaf.mode, leaf.spin.hex(), leaf.mechanism_id)
+        ]
+
+    for raw_comparison, plan, result in zip(
+        comparisons, summary.plans, summary.results
+    ):
+        comparison = _mapping(raw_comparison, "admission projective comparison")
+        left = tuple(
+            component_for_leaf(component_id)
+            for component_id in plan.left_component_ids
+        )
+        right = tuple(
+            component_for_leaf(component_id)
+            for component_id in plan.right_component_ids
+        )
+        expected = {
+            "comparison_id": result.row_id,
+            "mode_order": [component["mode"] for component in left],
+            "left_component_ids": [
+                component["component_id"] for component in left
+            ],
+            "right_component_ids": [
+                component["component_id"] for component in right
+            ],
+            "calibration_mode": component_for_leaf(
+                plan.calibration_component_ids[0]
+            )["mode"],
+            "calibration_numerator_component_id": component_for_leaf(
+                plan.calibration_component_ids[0]
+            )["component_id"],
+            "calibration_denominator_component_id": component_for_leaf(
+                plan.calibration_component_ids[1]
+            )["component_id"],
+            "empirical_gram_id": result.empirical_gram_id,
+            "nominal_angle_radians": result.nominal_angle_radians,
+            "bounded_angle_interval_radians": (
+                None
+                if result.bounded_angle_interval_radians is None
+                else list(result.bounded_angle_interval_radians)
+            ),
+            "calibration_disk_contains_zero": (
+                result.calibration_disk_contains_zero
+            ),
+            "projective_outcome": result.projective_outcome,
+            "scientific_state": result.scientific_state,
+            "reason": result.reason,
+        }
+        if any(comparison.get(key) != value for key, value in expected.items()):
+            raise ValueError(
+                "admission projective comparison does not match reduction row"
+            )
+
+
 @dataclass(frozen=True, slots=True)
 class LinearResponseAdmissionPackage:
     request: Mapping[str, object]
@@ -337,6 +418,7 @@ class LinearResponseAdmissionPackage:
         evidence_receipt = _validate_evidence_receipt(mapping["evidence_receipt"])
         reduction = CampaignReductionSummary.from_mapping(mapping["reduction"])
         _validate_complete_reduction(reduction)
+        _validate_projective_reduction_bindings(reduction, payload)
         expected_reduction_receipt = _reduction_receipt(reduction)
         if mapping["reduction_receipt"] != expected_reduction_receipt:
             raise ValueError("admission reduction receipt is invalid")
@@ -428,6 +510,7 @@ def admit_linear_response_bundle(
     _validate_component_evidence_bindings(
         evidence_path.parent, records, payload["response_components"]
     )
+    _validate_projective_reduction_bindings(reduction, payload)
     evidence_receipt = {
         "bundle_state": evidence_summary.bundle_state,
         "bundle_sha256": evidence_summary.bundle_sha256,

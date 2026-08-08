@@ -13,12 +13,23 @@ import unittest
 from windows_solver.contracts import canonical_json_bytes
 from windows_solver.linear_response import B_PRIME_RELEASE_DOMAIN
 from windows_solver.response_batches import (
+    CampaignLeafRecord,
+    CampaignStageRecord,
     PrecisionCapabilities,
+    StageOutcome,
     _checkpoint_mapping,
     build_campaign_plan,
     build_campaign_selection,
+    explicit_stage_signed_error_channels,
 )
-from windows_solver.response_engine import NumericalPolicy, VettedNativeDeterminantKernel
+from windows_solver.response_engine import (
+    ComponentResult,
+    ComponentStatus,
+    ERROR_CHANNELS,
+    NumericalPolicy,
+    RootReadout,
+    VettedNativeDeterminantKernel,
+)
 from windows_solver.response_reduction import (
     CampaignReductionSummary,
     EMPIRICAL_GRAM_KIND,
@@ -375,6 +386,173 @@ class ProjectiveRowPlanTests(unittest.TestCase):
                 "campaign-reduce", bundle_path.name, "--output", "duplicate.json"
             )
             self.assertEqual(duplicate.returncode, 2)
+
+    def test_campaign_reduce_binds_centres_and_signed_channels_to_checkpoint(self) -> None:
+        plan = build_campaign_plan(
+            policy=NumericalPolicy(),
+            backend_identity=VettedNativeDeterminantKernel.identity,
+            precision_capabilities=PrecisionCapabilities((64,)),
+        )
+        row = build_projective_row_plans()[0]
+        leaf = next(
+            item for item in plan.leaves
+            if item.leaf_id == row.left_component_ids[0]
+        )
+        job = leaf.job
+        response = complex(1.25, -0.5)
+        result = ComponentResult(
+            job_id=job.job_id,
+            leaf_id=job.leaf_id,
+            mechanism_id=job.mechanism_id,
+            status=ComponentStatus.CONVERGED,
+            convergence_basis="ORDER_RESOLVED",
+            response=response,
+            signed_root_crosscheck=response,
+            closed_form_response=None,
+            error_channels={name: 0.0 for name in ERROR_CHANNELS},
+            baseline=RootReadout(
+                omega=job.root.omega,
+                determinant_residual_abs=0.0,
+                determinant_derivative_abs=1.0,
+                converged=True,
+                root_reference_id=job.root.root_reference_id,
+                branch_id=job.root.branch_id,
+                equation_id=job.equation_id,
+            ),
+            levels=(),
+            lineage={
+                "leaf_id": job.leaf_id,
+                "root_reference_id": job.root.root_reference_id,
+                "root_identity_sha256": job.root.identity_sha256,
+                "policy_sha256": job.policy.identity_sha256,
+                "backend_identity_sha256": job.backend_identity.identity_sha256,
+                "equation_id": job.equation_id,
+                "sampling_coordinate": job.sampling_coordinate.to_mapping(),
+                "source_root_mapping": None,
+            },
+        )
+        component_result = {
+            "evidence_kind": "authenticated-test-component",
+            "result": result.to_mapping(),
+        }
+        family_deltas = {family: 0.0j for family in (
+            "signed-root", "centred-step-amplitude", "refinement-holdout",
+            "truncation", "resolution-angular-refinement",
+            "continuation-seed-path", "repeat-polish",
+            "precision-ladder-discrepancy",
+        )}
+        family_deltas["signed-root"] = complex(1.0e-8, -2.0e-8)
+        stage = StageOutcome(
+            digits=64,
+            numerical_state="CONVERGED",
+            component_result=component_result,
+            local_disk_radius_abs=abs(family_deltas["signed-root"]),
+            signed_error_channels=explicit_stage_signed_error_channels(
+                component_result,
+                family_deltas=family_deltas,
+                source_kind="authenticated-test-component",
+                source_id=job.job_id,
+                units="M-delta-omega-per-native-coordinate",
+            ),
+        )
+        record = CampaignLeafRecord(
+            leaf_id=leaf.leaf_id,
+            role=leaf.role,
+            state="PRODUCED",
+            stages=(CampaignStageRecord(stage, {
+                "precision_factory_identity": (
+                    plan.precision_factory_identity.to_mapping()
+                ),
+                "available_precision_digits": [64],
+            }),),
+        )
+        selection = build_campaign_selection(
+            plan, role="primary", leaf_ids=(leaf.leaf_id,)
+        )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            checkpoint = directory / "one-component.json"
+            checkpoint.write_bytes(canonical_json_bytes(
+                _checkpoint_mapping(plan, selection, (record,))
+            ))
+            source_receipt = (
+                "sha256:" + hashlib.sha256(checkpoint.read_bytes()).hexdigest()
+            )
+            contributions = []
+            for channel in stage.signed_error_channels:
+                contributions.append({
+                    "channel_id": f"local:{leaf.leaf_id}:{channel['family']}",
+                    "family": channel["family"],
+                    "shared_group": leaf.leaf_id,
+                    "signed_delta": channel["signed_delta"],
+                    "units": channel["units"],
+                    "source_receipt": source_receipt,
+                    "scope": channel["scope"],
+                })
+            component = {
+                "evidence_state": "RESOLVED",
+                "evidence_kind": "authenticated-campaign",
+                "component_id": leaf.leaf_id,
+                "centre": {"real": response.real, "imaginary": response.imag},
+                "units": "M-delta-omega-per-native-coordinate",
+                "contributions": contributions,
+                "required_families": [item["family"] for item in contributions],
+                "recorded_discrepancies": [],
+            }
+
+            def write_bundle(component_mapping: dict[str, object]) -> Path:
+                material = {
+                    "schema_version": 1,
+                    "campaign_id": plan.campaign_id,
+                    "backend_id": plan.backend_identity.backend_id,
+                    "precision_digits": [64],
+                    "precision_backend": None,
+                    "checkpoint_paths": [checkpoint.name],
+                    "selected_row_ids": [row.row_id],
+                    "component_evidence": [component_mapping],
+                    "source_hashes": [source_receipt],
+                }
+                bundle = {
+                    **material,
+                    "bundle_sha256": hashlib.sha256(
+                        canonical_json_bytes(material)
+                    ).hexdigest(),
+                }
+                path = directory / "reduction-bundle.json"
+                path.write_bytes(canonical_json_bytes(bundle))
+                return path
+
+            def invoke(output: str) -> subprocess.CompletedProcess[str]:
+                return subprocess.run(
+                    [
+                        sys.executable, "-m", "windows_solver",
+                        "campaign-reduce", write_bundle(component).name,
+                        "--output", output,
+                    ],
+                    cwd=directory,
+                    env={
+                        "PYTHONPATH": str(
+                            Path(__file__).resolve().parents[1] / "src"
+                        )
+                    },
+                    text=True,
+                    capture_output=True,
+                )
+
+            accepted = invoke("accepted.json")
+            self.assertEqual(accepted.returncode, 0, accepted.stderr)
+
+            component["centre"]["real"] = 99.0
+            corrupted_centre = invoke("corrupted-centre.json")
+            self.assertEqual(corrupted_centre.returncode, 2)
+            self.assertIn("checkpoint", corrupted_centre.stderr)
+            component["centre"]["real"] = response.real
+
+            component["contributions"][0]["signed_delta"]["real"] = 99.0
+            corrupted_delta = invoke("corrupted-delta.json")
+            self.assertEqual(corrupted_delta.returncode, 2)
+            self.assertIn("checkpoint", corrupted_delta.stderr)
 
 
 if __name__ == "__main__":

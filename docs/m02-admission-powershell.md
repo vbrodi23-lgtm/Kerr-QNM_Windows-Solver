@@ -39,7 +39,13 @@ The reducer authenticates its checkpoint receipts and performs no determinant
 or response solve. Admission requires reducer state `COMPLETE`, 162 primary
 rows plus 12 deep rows, the exact row order, every required component present,
 and zero missing components. Projective `UNRESOLVED` outcomes remain honest
-produced results.
+produced results. Each payload projective comparison must then reproduce the
+same ordered reduction row: mapped response-component IDs, calibration pair,
+empirical-Gram identity, nominal/bounded angles, calibration state, outcome,
+scientific state, and reason. Admission rejects an empty, reordered, stale, or
+unrelated comparison array. A row containing an unresolved component uses null
+covariance, empirical-Gram, angle, and calibration-state fields rather than an
+invented identity or numerical value.
 
 ## 3. Build the admission input
 

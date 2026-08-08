@@ -15,8 +15,10 @@ scientific claim, and the default linear-response provider remains unavailable.
   reduction, role ceilings, request and payload identities, artifact hashes,
   runtime lineage, and policy identity. Every final response component and
   numerical state must equal its corresponding byte-authenticated produced
-  payload; copied lineage hashes cannot admit unrelated values. Nested contents
-  are deeply immutable.
+  payload; every reducer centre and signed channel must equal its authenticated
+  final checkpoint stage; and every payload projective comparison must equal
+  its corresponding sealed reduction row. Copied lineage hashes cannot admit
+  unrelated values. Nested contents are deeply immutable.
 - Partial and representative smoke bundles fail admission. A structurally
   complete signed test bundle proves the availability transition while keeping
   `scientific_claims_admitted` false.
@@ -36,15 +38,17 @@ scientific claim, and the default linear-response provider remains unavailable.
 ## Verification
 
 - Fresh local full suite:
-  `PYTHONPATH=src python -m unittest discover -s tests -v` — 214/214 passed.
-- Focused admission, contract, engine, and CLI suite — 61/61 passed.
-- Cross-platform identity and provider regression suite — 14/14 passed.
-- GitHub Actions run `31246301132`, head `759b37f2faaad6056d94de6a86e4f8bc1c8e800f`:
-  - `ubuntu-latest` passed install, build/wheel inspection, compile, 212 tests,
+  `PYTHONPATH=src python -m unittest discover -s tests -v` — 216/216 passed.
+- Focused forged-checkpoint and stale-projective-row regressions passed.
+- Cross-platform identity and provider regression suite passed.
+- Predecessor GitHub Actions run `31247921080`, head
+  `1a0df4ebfe32069e209adf11f8913b53a5a3dd37`:
+  - `ubuntu-latest` passed install, build/wheel inspection, compile, 214 tests,
     M02 admission/cache, head/tail/risk campaign smoke, full-evidence planning,
     admitted problem provider, and admitted spectrum provider.
   - `windows-latest` passed the same gates plus Windows PowerShell 5.1 launcher
-    parity.
+    parity. The PR head containing the final two bindings must repeat this
+    matrix before review readiness.
 - TaskPlanner, release manifest, Python compilation, workflow YAML, package
   contents, and whitespace diff checks passed.
 - Campaign smoke contains exactly ten structural cases and remains
@@ -77,6 +81,10 @@ scientific claim, and the default linear-response provider remains unavailable.
 - The release-data regression now hashes all eight pinned catalogue, receipt,
   manifest, overlay, and license files from disk, complementing the simulated
   `core.autocrlf=true` checkout test.
+- Final reduction review closed both remaining value gaps: reducer component
+  centres and ordered signed channels are derived from the corresponding
+  authenticated checkpoint record, and all 174 payload comparisons are bound
+  exactly to the sealed reduction rows and empirical-Gram identities.
 
 ## Commit SHA(s)
 

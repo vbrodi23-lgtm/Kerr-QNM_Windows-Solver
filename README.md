@@ -36,7 +36,9 @@ the M02 planner, resumable campaign, uncertainty/projective reduction, and
 fail-closed admission machinery. No M02 scientific evidence is shipped: the
 linear-response provider remains unavailable by default and can be registered
 only from a complete operator package that passes the 553-leaf and 174-row
-admission gates. See [the M01 release baseline](docs/release-baseline.md) and
+admission gates. Reduction inputs are value-bound to their authenticated
+checkpoint records, and all 174 payload comparisons are value-bound to the
+sealed reduction. See [the M01 release baseline](docs/release-baseline.md) and
 [the M02 PowerShell handoff](docs/m02-admission-powershell.md).
 
 ## Quick start on Windows
