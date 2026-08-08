@@ -7,6 +7,7 @@ from dataclasses import dataclass
 import hashlib
 import json
 from pathlib import Path
+from types import MappingProxyType
 from typing import Mapping
 
 from .contracts import (
@@ -60,6 +61,22 @@ def _mapping(value: object, subject: str) -> Mapping[str, object]:
         isinstance(key, str) for key in value
     ):
         raise ValueError(f"{subject} must be an object")
+    return value
+
+
+def _freeze_json(value: object) -> object:
+    if isinstance(value, Mapping):
+        return MappingProxyType({key: _freeze_json(item) for key, item in value.items()})
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze_json(item) for item in value)
+    return value
+
+
+def _thaw_json(value: object) -> object:
+    if isinstance(value, Mapping):
+        return {key: _thaw_json(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_thaw_json(item) for item in value]
     return value
 
 
@@ -187,17 +204,24 @@ class LinearResponseAdmissionPackage:
     release_admissible: bool = True
     scientific_claims_admitted: bool = False
 
+    def __post_init__(self) -> None:
+        for name in (
+            "request", "payload", "evidence_receipt", "reduction",
+            "reduction_receipt", "source_files",
+        ):
+            object.__setattr__(self, name, _freeze_json(getattr(self, name)))
+
     def to_mapping(self) -> dict[str, object]:
         return {
             "schema_version": ADMISSION_SCHEMA_VERSION,
             "kind": _PACKAGE_KIND,
             "descriptor": ADMITTED_LINEAR_RESPONSE_DESCRIPTOR.to_mapping(),
-            "request": deepcopy(dict(self.request)),
-            "payload": deepcopy(dict(self.payload)),
-            "evidence_receipt": deepcopy(dict(self.evidence_receipt)),
-            "reduction": deepcopy(dict(self.reduction)),
-            "reduction_receipt": deepcopy(dict(self.reduction_receipt)),
-            "source_files": deepcopy(dict(self.source_files)),
+            "request": _thaw_json(self.request),
+            "payload": _thaw_json(self.payload),
+            "evidence_receipt": _thaw_json(self.evidence_receipt),
+            "reduction": _thaw_json(self.reduction),
+            "reduction_receipt": _thaw_json(self.reduction_receipt),
+            "source_files": _thaw_json(self.source_files),
             "scientific_claims_admitted": False,
             "release_admissible": True,
             "admission_id": self.admission_id,
@@ -381,7 +405,7 @@ class AdmittedLinearResponseProvider:
     def execute(
         self, request: StudyRequest, upstream: Mapping[Capability, object]
     ) -> ProviderResult:
-        if request.to_mapping() != self._package.request:
+        if request.to_mapping() != _thaw_json(self._package.request):
             raise ValueError("admission package does not bind this request")
         if set(upstream) != {Capability.SPECTRAL_CORE}:
             raise ValueError("linear-response provider requires the spectral artifact")
@@ -391,7 +415,7 @@ class AdmittedLinearResponseProvider:
             else NumericalState.ACCEPTED
         )
         return ProviderResult(
-            payload=deepcopy(dict(self._package.payload)),
+            payload=_thaw_json(self._package.payload),
             evidence=EvidenceState(
                 carrier=CarrierState.VALID,
                 execution=ExecutionState.SUCCEEDED,

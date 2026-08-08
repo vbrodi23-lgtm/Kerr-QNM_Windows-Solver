@@ -159,8 +159,11 @@ class LinearResponseAdmissionTests(unittest.TestCase):
             result = provider.execute(
                 b_prime_request(), {Capability.SPECTRAL_CORE: object()}
             )
-            self.assertEqual(result.payload, package.payload)
+            self.assertEqual(result.payload, package.to_mapping()["payload"])
             self.assertEqual(result.evidence.scientific.value, "NOT_EVALUATED")
+
+            with self.assertRaises(TypeError):
+                package.payload["quantity"] = "mutated-after-admission"
 
     def test_admission_package_revalidates_content_and_rejects_tamper(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
