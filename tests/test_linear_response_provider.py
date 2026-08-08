@@ -179,7 +179,10 @@ class LinearResponseEngineTests(unittest.TestCase):
             kernel_type.identity.source_commit,
             "0c1e8a3d3bca6e608c34e111476a4f6dcb73e86e",
         )
-        self.assertIn("adapted-source-", kernel_type.identity.runtime_fingerprint)
+        self.assertIn(
+            "adapted-source-native-gsn-adapter-contract-1",
+            kernel_type.identity.runtime_fingerprint,
+        )
         self.assertIn("gsn-cache-0c49fe4c", kernel_type.identity.runtime_fingerprint)
         for mechanism_id in (
             "exterior-fixed-r3",

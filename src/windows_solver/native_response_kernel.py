@@ -18,7 +18,6 @@ from pathlib import Path
 import platform
 from typing import Callable, Mapping
 
-from .contracts import canonical_text_bytes
 from .response_engine import (
     BackendIdentity,
     DeterminantPartials,
@@ -50,27 +49,9 @@ _SOURCE_BLOBS = (
 )
 _DERIVATIVE_STEP = 1.0e-5
 _BRANCH_CONTINUATION_TOLERANCE_ABS = 5.0e-3
-
-
-def _adapted_source_sha256() -> str:
-    root = Path(__file__).resolve().parent
-    paths = (
-        Path(__file__).resolve(),
-        root / "_native_sn_standard.py",
-        root / "_native_spin_weighted_spheroidal.py",
-        root / "_native_gsn_equations.py",
-        root / "data" / "native_kernel" / "potentials.fixture",
-    )
-    digest = hashlib.sha256()
-    for path in paths:
-        data = path.read_bytes()
-        if path.suffix == ".py":
-            data = canonical_text_bytes(data)
-        digest.update(path.name.encode("utf-8"))
-        digest.update(b"\0")
-        digest.update(data)
-        digest.update(b"\0")
-    return digest.hexdigest()
+# Stable across source checkouts and wheels; source_commit/source_blobs below
+# retain the authenticated upstream code identity.
+_ADAPTED_SOURCE_CONTRACT_ID = "native-gsn-adapter-contract-1"
 
 
 class NativeResourceUnavailableError(RuntimeError):
@@ -97,7 +78,7 @@ def _native_identity() -> BackendIdentity:
         runtime_fingerprint=(
             f"cpython-{platform.python_version()}-{platform.system().lower()}-"
             f"{platform.machine().lower()}-gsn-cache-{PINNED_GSN_CACHE_SHA256}-"
-            f"adapted-source-{_adapted_source_sha256()}"
+            f"adapted-source-{_ADAPTED_SOURCE_CONTRACT_ID}"
         ),
     )
 
