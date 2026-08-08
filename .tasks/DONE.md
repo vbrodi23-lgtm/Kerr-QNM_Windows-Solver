@@ -1,5 +1,49 @@
 # Done
 
+## TASK-010: Build the empirical uncertainty and projective-reduction pipeline
+**Priority:** P1 | **Tags:** M02, evidence, physics, tooling
+**Assignee:** Codex | **Estimate:** 1–2 days | **Milestone:** M02
+
+### Objective
+
+Build deterministic uncertainty propagation and projective reduction that operates on user-supplied complete evidence, while validating the algorithms with synthetic and representative smoke inputs.
+
+### Acceptance Criteria
+
+- [x] Propagate signed-root, centred-step, refinement, continuation-path, and precision-ladder channels through the response/Richardson algebra.
+- [x] Construct PSD component and cross-component empirical error Gram matrices from shared signed channels without statistical-covariance claims.
+- [x] Compute the frozen 162 primary and 12 deep projective row schemas only when aligned inputs exist; partial smoke inputs return an explicit incomplete state, never a scientific classification.
+- [x] Smoke-test head/tail/risk reductions, zero-containing calibrations, non-PSD rejection, unresolved propagation, and available independent holdouts.
+- [x] Accept the complete external 553-leaf bundle later without code or threshold changes.
+
+### Dependencies
+
+- **Blocked by:** TASK-009
+- **Blocks:** TASK-011
+
+### Evidence Output
+
+Digest-owned signed-channel ledgers, exact empirical-Gram recomputation, calibrated-normalized projective Jacobian propagation, exact 174-row planner, partial-honest reducer, exactly six synthetic/representative reductions, and zero-backend PowerShell handoff.
+
+### Verification
+
+- `PYTHONPATH=src python -m unittest discover -s tests` — 206 passed.
+- `python .tasks/validate_board.py`, `python tools/validate_release_manifest.py`, `python -m compileall -q src tools tests`, `git diff --check`, and wheel-content inspection — passed.
+- **Evidence ceiling:** Exact plans plus six synthetic/representative reductions only; no physical campaign, populated 174-row atlas, scientific admission, or provider availability.
+- **Change references:** implementation `b9b952c3409146ab695df082662a13a922f6e03e`; review/CI remediation published on PR #5 as `6e60a94481c5d8f83026f56f54adeba285105a4b`.
+
+### Review Focus
+
+Each campaign stage owns a complete digest-bound signed-channel ledger; serialized Grams are exactly recomputed; projective uncertainty uses an explicit local `J G Jᵀ` diagnostic; partial evidence remains unclassified; authenticated package bytes survive Windows checkout unchanged.
+
+### Plan
+
+- Bound every signed channel to the stage component digest and rejected stale or injected evidence.
+- Made every serialized empirical Gram recomputable and propagated it through a calibrated-normalized local Jacobian.
+- Preserved six reductions, repaired cross-platform authenticated bytes/smoke tolerance, and passed the full build gate before activating TASK-011.
+
+---
+
 ## TASK-009: Build the complete B′ batch planner and PowerShell production handoff
 **Priority:** P1 | **Tags:** M02, provider, physics, tooling
 **Assignee:** Codex | **Estimate:** 1–2 days | **Milestone:** M02

@@ -1,47 +1,46 @@
 # In Progress
 
-## TASK-010: Build the empirical uncertainty and projective-reduction pipeline
-**Priority:** P1 | **Tags:** M02, evidence, physics, tooling
-**Assignee:** Codex | **Estimate:** 1–2 days | **Milestone:** M02
+## TASK-011: Build fail-closed M02 validation, admission, and operator closure commands
+**Priority:** P1 | **Tags:** M02, provider, validation, tooling
+**Assignee:** Codex | **Estimate:** 1 day | **Milestone:** M02
 
 ### Objective
 
-Build deterministic uncertainty propagation and projective reduction that operates on user-supplied complete evidence, while validating the algorithms with synthetic and representative smoke inputs.
+Finish the installable M02 machinery and operator handoff while keeping the linear-response provider unavailable until the user's complete PowerShell evidence bundle passes admission.
 
 ### Acceptance Criteria
 
-- [ ] Propagate signed-root, centred-step, refinement, continuation-path, and precision-ladder channels through the response/Richardson algebra.
-- [ ] Construct PSD component and cross-component empirical error Gram matrices from shared signed channels without statistical-covariance claims.
-- [ ] Compute the frozen 162 primary and 12 deep projective row schemas only when aligned inputs exist; partial smoke inputs return an explicit incomplete state, never a scientific classification.
-- [ ] Smoke-test head/tail/risk reductions, zero-containing calibrations, non-PSD rejection, unresolved propagation, and available independent holdouts.
-- [ ] Accept the complete external 553-leaf bundle later without code or threshold changes.
+- [ ] Validate exactly 553 produced leaves, zero missing leaves, governed unresolved IDs, 174 aligned projective rows, role ceilings, hashes, runtime lineage, and policy identity.
+- [ ] Provide PowerShell-friendly `validate`, `reduce`, `admit`, and `export` commands with deterministic machine-readable output and useful failure messages.
+- [ ] Prove smoke/partial bundles cannot register the provider; prove a structurally complete signed test bundle exercises the availability transition without claiming scientific evidence.
+- [ ] Keep exactly one provider owner, unrelated capabilities unchanged, and admission contingent on the external evidence receipt rather than build completion.
+- [ ] Pass Windows-oriented command/path tests, Ubuntu tests, cold/warm cache, wheel content, manifest, compile, and head/tail/risk end-to-end smoke gates.
 
 ### Dependencies
 
-- **Blocked by:** TASK-009
-- **Blocks:** TASK-011
+- **Blocked by:** TASK-010
+- **Blocks:** TASK-037, TASK-038
 
 ### Evidence Output
 
-Reusable signed-channel and empirical-Gram schema, exact 174-row planner,
-partial-honest projective reducer, exactly six synthetic/representative smoke
-cases, zero-backend `campaign-reduce` command, and PowerShell handoff.
+Installable build, fail-closed admission CLI, PowerShell runbook, structural full-bundle test fixture, representative smoke receipts, CI/cache/export checks, and build-completion report that distinguishes software readiness from scientific evidence completion.
 
 ### Verification
 
-- `PYTHONPATH=src python -m unittest tests.test_linear_response_uncertainty tests.test_linear_response_projective tests.test_linear_response_contract -v`
+- `PYTHONPATH=src python -m unittest tests.test_linear_response_provider tests.test_linear_response_cli tests.test_release_manifest -v`
 - `PYTHONPATH=src python -m unittest discover -s tests -v`
 - `python .tasks/validate_board.py`
+- `python tools/validate_release_manifest.py`
+- `python -m compileall -q src tools tests`
 
 ### Review Focus
 
-Check signed coefficients, shared-root correlation, PSD marginals, deterministic terminology, partial-state honesty, and outcome-neutral thresholds.
+Inspect partial/full separation, provider uniqueness, Windows command behavior, exact count reconciliation, evidence gating, and honest readiness language.
 
 ### Plan
 
-- Version TASK-009 stage/checkpoint evidence so each digested stage owns a strict complete signed-channel ledger; reject stale v1 and external evidence injection.
-- Serialize and semantically recompute every empirical Gram carried by a campaign reduction artifact.
-- Replace finite full-amplitude perturbation with a frozen calibrated-normalized local Jacobian and explicit `J G J^T` diagnostic.
-- Preserve exactly six smoke cases, run the required gates, update the report, and restore TASK-011 as sole Next.
+- Add one strict admission/export artifact that binds the complete campaign and 174-row reduction to the frozen release request and receipts.
+- Wire deterministic `validate`, `reduce`, `admit`, and `export` operator commands without invoking the numerical backend.
+- Prove partial/smoke rejection and a structurally complete synthetic availability transition, then run platform/package gates and close M02 build readiness.
 
 ---

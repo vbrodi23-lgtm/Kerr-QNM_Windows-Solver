@@ -124,3 +124,30 @@ The smoke count is exactly six; no other projective row was reduced.
 - TASK-011 still owns exact full-bundle admission, provider availability,
   release-manifest/export closure, and platform/package gates. No provider
   admission or response evidence was created here.
+
+## Review and CI remediation — 2026-08-08
+
+- Campaign schema version 2 now makes every stage digest own the exact ordered
+  eight-family signed-error ledger; stale schema, missing families, injected
+  channels, wrong component bindings, and disk mismatch fail closed.
+- Serialized campaign reductions carry every empirical Gram and reconstruct its
+  columns, matrix, marginals, disks, construction ID, and source hashes before
+  acceptance. Projective propagation now records an explicit calibrated-
+  normalized local Jacobian and scalar `J G Jᵀ` diagnostic instead of applying
+  full finite channel amplitudes.
+- Windows checkout failures were traced to Git line-ending conversion of
+  content-addressed package resources. `src/windows_solver/data/** -text`
+  preserves exact committed bytes, and the regression now checks every packaged
+  data resource through a simulated `core.autocrlf=true` checkout.
+- Cross-platform overlay recomputation continues to enforce 10⁻⁸ equation and
+  10⁻⁹ refinement gates while allowing 10⁻¹¹ angular-eigenvalue variation;
+  observed CI differences were only at approximately 10⁻¹⁴.
+- Fresh verification: 206/206 tests, wheel-content inspection, TaskPlanner,
+  release manifest, compile, and diff checks passed. The provider remained
+  unavailable and no physical response campaign ran.
+- Remediation source hashes: `response_reduction.py`
+  `f4b3b5fd1ad1f3c93cff023a16aeaf2fa786273ecbfe2f264d6ae14ee3f9af33`;
+  `response_batches.py`
+  `a773dea00f21573310e9b3e7b6a2bb4375451c04fb50f4bc55a023c73d2e61f9`.
+- Published review commit: PR #5 head
+  `6e60a94481c5d8f83026f56f54adeba285105a4b`.

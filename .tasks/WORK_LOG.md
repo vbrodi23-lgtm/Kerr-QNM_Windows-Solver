@@ -5,10 +5,10 @@ Add the newest completed task or milestone-control entry immediately below this 
 ## 2026-08-08 — TASK-010 empirical uncertainty/projective reducer completed
 
 - **Task:** TASK-010 — Build the empirical uncertainty and projective-reduction pipeline.
-- **Deliverable:** Authenticated signed-channel schema, exact empirical error Gram and conservative disks, exact 174-row planner, partial-honest projective reducer, zero-backend CLI, and PowerShell handoff.
-- **Verification:** 32 focused and 203 full tests passed; exact six-case smoke, Gram tamper, partial honesty, safe CLI, board, compile, and diff gates passed.
+- **Deliverable:** Digest-owned signed-channel schema, exactly recomputable empirical Grams, calibrated-normalized `J G Jᵀ` propagation, exact 174-row planner, partial-honest reducer, zero-backend CLI, and PowerShell handoff.
+- **Verification:** 206 full tests passed after review remediation; exact six-case smoke, stage/Gram tamper rejection, partial honesty, Windows byte preservation, cross-platform angular smoke, wheel, manifest, board, compile, and diff gates passed.
 - **Evidence ceiling:** Plans plus six synthetic/representative reductions only; no determinant/cache/campaign, complete 553-leaf evidence, populated scientific atlas, or provider admission.
-- **Change reference:** implementation `b9b952c3409146ab695df082662a13a922f6e03e`.
+- **Change reference:** implementation `b9b952c3409146ab695df082662a13a922f6e03e`; review/CI remediation on PR #5 `6e60a94481c5d8f83026f56f54adeba285105a4b`.
 
 ## 2026-08-08 — TASK-008 two-path response engine completed after review
 
