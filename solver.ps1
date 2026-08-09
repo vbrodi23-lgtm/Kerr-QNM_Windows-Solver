@@ -1,3 +1,4 @@
+[CmdletBinding(PositionalBinding = $false)]
 param(
     [switch]$PortableRuntime,
     [string]$RuntimeRoot,
