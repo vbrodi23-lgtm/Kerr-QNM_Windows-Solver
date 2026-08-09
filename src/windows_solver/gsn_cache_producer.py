@@ -278,6 +278,62 @@ def _validate_status(path: Path, expected_count: int) -> None:
         raise GsnCacheProductionError("GSN producer rejected its generated cache")
 
 
+def _cache_receipt(
+    *,
+    request_sha256: str,
+    cache_sha256: str,
+    pairs: Sequence[GsnParameterPair],
+    julia: Path,
+    script: Path,
+    kerr: Path,
+    potentials: Path,
+) -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "request_sha256": request_sha256,
+        "cache_sha256": cache_sha256,
+        "parameter_pairs": [pair.to_mapping() for pair in pairs],
+        "julia_executable_sha256": hashlib.sha256(julia.read_bytes()).hexdigest(),
+        "producer_sha256": hashlib.sha256(script.read_bytes()).hexdigest(),
+        "kerr_sha256": hashlib.sha256(kerr.read_bytes()).hexdigest(),
+        "potentials_sha256": hashlib.sha256(potentials.read_bytes()).hexdigest(),
+    }
+
+
+def _load_receipt(path: Path) -> object:
+    _validate_regular_file(path, "generated GSN cache receipt")
+    try:
+        return json.loads(
+            path.read_bytes(),
+            object_pairs_hook=_reject_duplicate_keys,
+            parse_constant=lambda item: (_ for _ in ()).throw(
+                GsnCacheProductionError(
+                    f"generated GSN receipt contains non-finite constant {item}"
+                )
+            ),
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise GsnCacheProductionError(
+            "generated GSN cache receipt is invalid JSON"
+        ) from error
+
+
+def _write_receipt(path: Path, value: Mapping[str, object]) -> None:
+    temporary = path.with_name(f"{path.name}.tmp")
+    temporary.write_text(
+        json.dumps(
+            value,
+            ensure_ascii=True,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n",
+        encoding="ascii",
+    )
+    temporary.replace(path)
+
+
 def ensure_generated_gsn_cache(
     parameter_pairs: Iterable[GsnParameterPair],
     *,
@@ -325,6 +381,19 @@ def ensure_generated_gsn_cache(
     cache_path = output_directory / "gsn-infinity-series.json"
     status_path = output_directory / "status.csv"
     journal_path = output_directory / "journal.jsonl"
+    receipt_path = output_directory / "receipt.json"
+    for output_path in (
+        pairs_path,
+        cache_path,
+        status_path,
+        journal_path,
+        receipt_path,
+        receipt_path.with_name(f"{receipt_path.name}.tmp"),
+    ):
+        if output_path.is_symlink():
+            raise GsnCacheProductionError(
+                f"generated GSN output path must not be a symlink: {output_path}"
+            )
     pairs_path.write_text(
         "".join(
             f"{pair.spin_numerator},{pair.spin_denominator},{pair.azimuthal_index}\n"
@@ -332,6 +401,23 @@ def ensure_generated_gsn_cache(
         ),
         encoding="ascii",
     )
+    if cache_path.is_file() and status_path.is_file() and receipt_path.is_file():
+        try:
+            _validate_status(status_path, len(pairs))
+            cached_digest = _validate_generated_cache(cache_path, pairs, potentials)
+            expected_receipt = _cache_receipt(
+                request_sha256=request_sha256,
+                cache_sha256=cached_digest,
+                pairs=pairs,
+                julia=julia,
+                script=script,
+                kerr=kerr,
+                potentials=potentials,
+            )
+            if _load_receipt(receipt_path) == expected_receipt:
+                return GeneratedGsnCache(cache_path.resolve(), cached_digest, pairs)
+        except (GsnCacheProductionError, OSError):
+            pass
     command = (
         str(julia),
         "--startup-file=no",
@@ -363,4 +449,16 @@ def ensure_generated_gsn_cache(
         )
     _validate_status(status_path, len(pairs))
     digest = _validate_generated_cache(cache_path, pairs, potentials)
+    _write_receipt(
+        receipt_path,
+        _cache_receipt(
+            request_sha256=request_sha256,
+            cache_sha256=digest,
+            pairs=pairs,
+            julia=julia,
+            script=script,
+            kerr=kerr,
+            potentials=potentials,
+        ),
+    )
     return GeneratedGsnCache(cache_path.resolve(), digest, pairs)
