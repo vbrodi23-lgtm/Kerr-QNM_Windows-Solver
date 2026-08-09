@@ -32,7 +32,11 @@ from .response_engine import (
     _engine_source_sha256,
     run_component,
 )
-from .native_response_kernel import PINNED_GSN_CACHE_SHA256
+from .gsn_cache_producer import (
+    GsnCacheProductionError,
+    ensure_generated_gsn_cache,
+    parameter_pairs_for_selection,
+)
 
 
 CAMPAIGN_SCHEMA_VERSION = 2
@@ -162,7 +166,7 @@ class PrecisionFactoryIdentity:
 
 def _native_precision_factory_identity() -> PrecisionFactoryIdentity:
     return PrecisionFactoryIdentity(
-        "windows_solver.response_batches:NativeCampaignStageBackend.from_environment",
+        "windows_solver.response_batches:NativeCampaignStageBackend.from_selection",
         _campaign_source_sha256(),
     )
 
@@ -1914,14 +1918,17 @@ class NativeCampaignStageBackend:
         self.precision_capabilities = precision_capabilities
 
     @classmethod
-    def from_environment(cls) -> "NativeCampaignStageBackend":
-        path = os.environ.get("GSN_INFINITY_SERIES_CACHE")
-        digest = os.environ.get("GSN_INFINITY_SERIES_CACHE_SHA256")
-        if not path or digest != PINNED_GSN_CACHE_SHA256:
-            raise NativeResourceUnavailableError(
-                "campaign execution requires authenticated GSN cache path and SHA-256 environment inputs"
-            )
-        kernel = VettedNativeDeterminantKernel.from_authenticated_resource(path)
+    def from_selection(
+        cls, plan: CampaignPlan, selection: CampaignSelection
+    ) -> "NativeCampaignStageBackend":
+        try:
+            pairs = parameter_pairs_for_selection(plan, selection)
+            generated = ensure_generated_gsn_cache(pairs)
+        except GsnCacheProductionError as error:
+            raise NativeResourceUnavailableError(str(error)) from error
+        kernel = VettedNativeDeterminantKernel.from_generated_resource(
+            generated.path, generated.sha256
+        )
         return cls(
             NativeDeterminantAdapter(identity=kernel.identity, kernel=kernel),
             PrecisionCapabilities((64,)),
