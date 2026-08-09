@@ -80,8 +80,8 @@ class NativeCampaignBackendTests(unittest.TestCase):
         )
         self.leaf = next(leaf for leaf in self.plan.leaves if leaf.role == "deep")
         generated = GeneratedGsnCache(
-            "gsn-set-000001",
-            Path(".runtime/generated/gsn/gsn-set-000001.json"),
+            ("gsn-000001",),
+            Path(".runtime/generated/gsn/gsn-selection-test.json"),
             "a" * 64,
             (GsnParameterPair(19, 20, self.leaf.job.mode.m),),
         )
@@ -123,7 +123,7 @@ class NativeCampaignBackendTests(unittest.TestCase):
             },
         )
         runtime = outcome.component_result["scientific_runtime"]
-        self.assertEqual(runtime["artifact_id"], "gsn-set-000001")
+        self.assertEqual(runtime["record_artifact_ids"], ["gsn-000001"])
         self.assertEqual(runtime["cache_sha256_observed"], "a" * 64)
 
     def test_promoted_stage_records_repeat_and_prior_discrepancies(self):
