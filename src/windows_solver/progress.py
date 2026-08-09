@@ -12,7 +12,7 @@ from types import MappingProxyType
 from typing import Protocol
 
 
-PROGRESS_SCHEMA = "windows-solver.progress/v1"
+PROGRESS_SCHEMA = "windows-solver.progress/1"
 
 
 class ProgressMode(StrEnum):
