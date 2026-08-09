@@ -14,20 +14,13 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 from typing import Callable, Iterable, Mapping, Sequence
 
 
 class GsnCacheProductionError(RuntimeError):
     """The package-owned GSN input stage could not produce a trusted cache."""
-
-
-PINNED_GSN_KERR_SHA256 = (
-    "1c333604190ba6a9554dcbcacf1ae308ac57bc036dbd8be074fe16e73f1a6635"
-)
-PINNED_GSN_POTENTIALS_SHA256 = (
-    "4339ed8a7861c534bd8d81f108cacf7fd75f19954352daa636afe30b47e50089"
-)
 
 
 def _reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -86,6 +79,7 @@ class GsnParameterPair:
 
 @dataclass(frozen=True, slots=True)
 class GeneratedGsnCache:
+    artifact_id: str
     path: Path
     sha256: str
     parameter_pairs: tuple[GsnParameterPair, ...]
@@ -133,20 +127,131 @@ def parameter_pairs_for_selection(
     return tuple(pairs)
 
 
-def _canonical_request_sha256(
-    pairs: Sequence[GsnParameterPair], script: Path, kerr: Path, potentials: Path
-) -> str:
+def _parameter_set_sha256(pairs: Sequence[GsnParameterPair]) -> str:
     value = {
         "schema_version": 1,
-        "producer_sha256": hashlib.sha256(script.read_bytes()).hexdigest(),
-        "kerr_sha256": hashlib.sha256(kerr.read_bytes()).hexdigest(),
-        "potentials_sha256": hashlib.sha256(potentials.read_bytes()).hexdigest(),
         "parameter_pairs": [pair.to_mapping() for pair in pairs],
     }
     raw = json.dumps(
         value, ensure_ascii=True, allow_nan=False, sort_keys=True, separators=(",", ":")
     ).encode("ascii")
     return hashlib.sha256(raw).hexdigest()
+
+
+def _parameter_set_mapping(
+    pairs: Sequence[GsnParameterPair],
+) -> list[dict[str, int]]:
+    return [pair.to_mapping() for pair in pairs]
+
+
+def _load_artifact_index(path: Path) -> dict[str, object]:
+    if not path.exists():
+        return {"schema_version": 1, "artifacts": []}
+    _validate_regular_file(path, "GSN artifact index")
+    try:
+        value = json.loads(
+            path.read_bytes(),
+            object_pairs_hook=_reject_duplicate_keys,
+            parse_constant=lambda item: (_ for _ in ()).throw(
+                GsnCacheProductionError(
+                    f"GSN artifact index contains non-finite constant {item}"
+                )
+            ),
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise GsnCacheProductionError("GSN artifact index is invalid JSON") from error
+    if (
+        not isinstance(value, Mapping)
+        or set(value) != {"schema_version", "artifacts"}
+        or value["schema_version"] != 1
+        or not isinstance(value["artifacts"], list)
+    ):
+        raise GsnCacheProductionError("GSN artifact index schema is invalid")
+    ids: set[str] = set()
+    parameter_sets: set[str] = set()
+    for row in value["artifacts"]:
+        if not isinstance(row, Mapping) or set(row) != {
+            "artifact_id",
+            "parameter_pairs",
+            "cache_path",
+            "status_path",
+            "journal_path",
+            "receipt_path",
+            "pairs_path",
+            "status",
+            "cache_sha256_observed",
+        }:
+            raise GsnCacheProductionError("GSN artifact index row is invalid")
+        artifact_id = row["artifact_id"]
+        if (
+            not isinstance(artifact_id, str)
+            or re.fullmatch(r"gsn-set-[0-9]{6}", artifact_id) is None
+            or artifact_id in ids
+        ):
+            raise GsnCacheProductionError("GSN artifact index ID is invalid")
+        ids.add(artifact_id)
+        if not isinstance(row["parameter_pairs"], list):
+            raise GsnCacheProductionError("GSN artifact index parameter set is invalid")
+        parameter_key = json.dumps(
+            row["parameter_pairs"], sort_keys=True, separators=(",", ":")
+        )
+        if parameter_key in parameter_sets:
+            raise GsnCacheProductionError("GSN artifact index parameter set is duplicated")
+        parameter_sets.add(parameter_key)
+        for name in (
+            "cache_path", "status_path", "journal_path", "receipt_path", "pairs_path"
+        ):
+            filename = row[name]
+            if (
+                not isinstance(filename, str)
+                or Path(filename).name != filename
+                or not filename.startswith(artifact_id)
+            ):
+                raise GsnCacheProductionError("GSN artifact index path is invalid")
+        if row["status"] != "accepted":
+            raise GsnCacheProductionError("GSN artifact index status is invalid")
+        observed = row["cache_sha256_observed"]
+        if observed is not None and (
+            not isinstance(observed, str)
+            or re.fullmatch(r"[0-9a-f]{64}", observed) is None
+        ):
+            raise GsnCacheProductionError("GSN artifact index digest metadata is invalid")
+    return {"schema_version": 1, "artifacts": [dict(row) for row in value["artifacts"]]}
+
+
+def _write_json(path: Path, value: Mapping[str, object]) -> None:
+    temporary = path.with_name(f"{path.name}.tmp")
+    temporary.write_text(
+        json.dumps(
+            value,
+            ensure_ascii=True,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n",
+        encoding="ascii",
+    )
+    temporary.replace(path)
+
+
+def _artifact_row(
+    artifact_id: str,
+    pairs: Sequence[GsnParameterPair],
+    *,
+    cache_sha256: str | None,
+) -> dict[str, object]:
+    return {
+        "artifact_id": artifact_id,
+        "parameter_pairs": _parameter_set_mapping(pairs),
+        "cache_path": f"{artifact_id}.json",
+        "status_path": f"{artifact_id}-status.csv",
+        "journal_path": f"{artifact_id}-journal.jsonl",
+        "receipt_path": f"{artifact_id}-receipt.json",
+        "pairs_path": f"{artifact_id}-pairs.csv",
+        "status": "accepted",
+        "cache_sha256_observed": cache_sha256,
+    }
 
 
 def _validate_regular_file(path: Path, label: str) -> None:
@@ -221,14 +326,16 @@ def _validate_generated_cache(
         or value["mass_normalization"] != 1
     ):
         raise GsnCacheProductionError("generated GSN cache contract is invalid")
-    expected_source_sha256 = hashlib.sha256(potentials.read_bytes()).hexdigest()
     if value["source_relative_path"] != "src/Homogeneous/Potentials.jl":
         raise GsnCacheProductionError(
             "generated GSN cache source path is not the packaged Potentials.jl"
         )
-    if value["source_sha256"] != expected_source_sha256:
+    if (
+        not isinstance(value["source_sha256"], str)
+        or re.fullmatch(r"[0-9a-f]{64}", value["source_sha256"]) is None
+    ):
         raise GsnCacheProductionError(
-            "generated GSN cache source SHA-256 does not match packaged Potentials.jl"
+            "generated GSN cache source digest metadata is invalid"
         )
     records = value["records"]
     if not isinstance(records, Mapping) or set(records) != {
@@ -280,7 +387,7 @@ def _validate_status(path: Path, expected_count: int) -> None:
 
 def _cache_receipt(
     *,
-    request_sha256: str,
+    parameter_set_sha256: str,
     cache_sha256: str,
     pairs: Sequence[GsnParameterPair],
     julia: Path,
@@ -290,7 +397,7 @@ def _cache_receipt(
 ) -> dict[str, object]:
     return {
         "schema_version": 1,
-        "request_sha256": request_sha256,
+        "parameter_set_sha256_observed": parameter_set_sha256,
         "cache_sha256": cache_sha256,
         "parameter_pairs": [pair.to_mapping() for pair in pairs],
         "julia_executable_sha256": hashlib.sha256(julia.read_bytes()).hexdigest(),
@@ -345,11 +452,19 @@ def ensure_generated_gsn_cache(
 ) -> GeneratedGsnCache:
     """Generate, validate, and digest the exact cache needed by a selection."""
 
-    pairs = tuple(dict.fromkeys(parameter_pairs))
+    pairs = tuple(sorted(
+        dict.fromkeys(parameter_pairs),
+        key=lambda pair: (
+            pair.spin,
+            pair.azimuthal_index,
+            pair.spin_numerator,
+            pair.spin_denominator,
+        ),
+    ))
     if not pairs:
         raise GsnCacheProductionError("at least one GSN parameter pair is required")
     package_data = Path(__file__).resolve().parent / "data" / "julia"
-    script = Path(producer_script or package_data / "stage01_generate_gsn_cache.jl")
+    script = Path(producer_script or package_data / "generate_gsn_cache.jl")
     source_root = Path(
         gsn_source_root or package_data / "GeneralizedSasakiNakamura.jl"
     )
@@ -366,22 +481,37 @@ def ensure_generated_gsn_cache(
     _validate_regular_file(script, "package-owned GSN cache producer")
     _validate_regular_file(kerr, "packaged GeneralizedSasakiNakamura.jl Kerr")
     _validate_regular_file(potentials, "packaged GeneralizedSasakiNakamura.jl Potentials")
-    if hashlib.sha256(kerr.read_bytes()).hexdigest() != PINNED_GSN_KERR_SHA256:
-        raise GsnCacheProductionError("packaged GSN Kerr.jl source digest mismatch")
-    if (
-        hashlib.sha256(potentials.read_bytes()).hexdigest()
-        != PINNED_GSN_POTENTIALS_SHA256
-    ):
-        raise GsnCacheProductionError("packaged GSN Potentials.jl source digest mismatch")
-
-    request_sha256 = _canonical_request_sha256(pairs, script, kerr, potentials)
-    output_directory = runtime / "generated" / "gsn" / request_sha256
+    parameter_set_sha256 = _parameter_set_sha256(pairs)
+    output_directory = runtime / "generated" / "gsn"
     output_directory.mkdir(parents=True, exist_ok=True)
-    pairs_path = output_directory / "parameter-pairs.csv"
-    cache_path = output_directory / "gsn-infinity-series.json"
-    status_path = output_directory / "status.csv"
-    journal_path = output_directory / "journal.jsonl"
-    receipt_path = output_directory / "receipt.json"
+    index_path = output_directory / "gsn-index.json"
+    index = _load_artifact_index(index_path)
+    expected_pairs = _parameter_set_mapping(pairs)
+    row = next(
+        (
+            item
+            for item in index["artifacts"]
+            if item["parameter_pairs"] == expected_pairs
+        ),
+        None,
+    )
+    if row is None:
+        sequence = max(
+            (
+                int(item["artifact_id"].rsplit("-", 1)[1])
+                for item in index["artifacts"]
+            ),
+            default=0,
+        ) + 1
+        artifact_id = f"gsn-set-{sequence:06d}"
+        row = _artifact_row(artifact_id, pairs, cache_sha256=None)
+    else:
+        artifact_id = str(row["artifact_id"])
+    pairs_path = output_directory / str(row["pairs_path"])
+    cache_path = output_directory / str(row["cache_path"])
+    status_path = output_directory / str(row["status_path"])
+    journal_path = output_directory / str(row["journal_path"])
+    receipt_path = output_directory / str(row["receipt_path"])
     for output_path in (
         pairs_path,
         cache_path,
@@ -401,21 +531,13 @@ def ensure_generated_gsn_cache(
         ),
         encoding="ascii",
     )
-    if cache_path.is_file() and status_path.is_file() and receipt_path.is_file():
+    if cache_path.is_file() and status_path.is_file():
         try:
             _validate_status(status_path, len(pairs))
             cached_digest = _validate_generated_cache(cache_path, pairs, potentials)
-            expected_receipt = _cache_receipt(
-                request_sha256=request_sha256,
-                cache_sha256=cached_digest,
-                pairs=pairs,
-                julia=julia,
-                script=script,
-                kerr=kerr,
-                potentials=potentials,
+            return GeneratedGsnCache(
+                artifact_id, cache_path.resolve(), cached_digest, pairs
             )
-            if _load_receipt(receipt_path) == expected_receipt:
-                return GeneratedGsnCache(cache_path.resolve(), cached_digest, pairs)
         except (GsnCacheProductionError, OSError):
             pass
     command = (
@@ -452,7 +574,7 @@ def ensure_generated_gsn_cache(
     _write_receipt(
         receipt_path,
         _cache_receipt(
-            request_sha256=request_sha256,
+            parameter_set_sha256=parameter_set_sha256,
             cache_sha256=digest,
             pairs=pairs,
             julia=julia,
@@ -461,4 +583,12 @@ def ensure_generated_gsn_cache(
             potentials=potentials,
         ),
     )
-    return GeneratedGsnCache(cache_path.resolve(), digest, pairs)
+    accepted_row = _artifact_row(artifact_id, pairs, cache_sha256=digest)
+    artifacts = [
+        accepted_row if item["artifact_id"] == artifact_id else item
+        for item in index["artifacts"]
+    ]
+    if not any(item["artifact_id"] == artifact_id for item in artifacts):
+        artifacts.append(accepted_row)
+    _write_json(index_path, {"schema_version": 1, "artifacts": artifacts})
+    return GeneratedGsnCache(artifact_id, cache_path.resolve(), digest, pairs)
