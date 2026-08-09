@@ -646,9 +646,9 @@ def _load_campaign_backend(descriptor, *, plan=None, selection=None):
     return backend
 
 
-def _validate_campaign_capability_superset(summary, descriptor) -> None:
+def _validate_campaign_capability_superset(summary, descriptor, plan) -> None:
     available = (
-        PrecisionCapabilities((64,))
+        plan.precision_capabilities
         if descriptor is None
         else descriptor["precision_capabilities"]
     )
@@ -683,7 +683,7 @@ def _campaign_selected(command: str, selection_path: Path, checkpoint: Path, *, 
         summary = validate_campaign_checkpoint(
             plan, checkpoint, require_complete_campaign=full
         )
-        _validate_campaign_capability_superset(summary, descriptor)
+        _validate_campaign_capability_superset(summary, descriptor, plan)
         if not full and summary.selection_id != selection.selection_id:
             raise ValueError("campaign checkpoint selection does not match request")
     else:
@@ -693,7 +693,7 @@ def _campaign_selected(command: str, selection_path: Path, checkpoint: Path, *, 
             raise ValueError("campaign resume requires an existing checkpoint")
         if command == "campaign-resume":
             cached = validate_campaign_checkpoint(plan, checkpoint)
-            _validate_campaign_capability_superset(cached, descriptor)
+            _validate_campaign_capability_superset(cached, descriptor, plan)
             if cached.selection_id != selection.selection_id:
                 raise ValueError("campaign checkpoint selection does not match request")
             if cached.state == "COMPLETE":
@@ -743,7 +743,7 @@ def _campaign_merge(manifest: Path, output: Path) -> tuple[int, object]:
     )
     for path in resolved:
         _validate_campaign_capability_superset(
-            validate_campaign_checkpoint(plan, path), descriptor
+            validate_campaign_checkpoint(plan, path), descriptor, plan
         )
     summary = merge_campaign_checkpoints(plan, resolved, resolved_output)
     return 0, {"command": "campaign-merge", **summary.to_mapping()}
@@ -815,7 +815,7 @@ def _campaign_reduce(bundle_path: Path, output: Path) -> tuple[int, object]:
         resolved_checkpoints, computed_hashes
     ):
         summary = validate_campaign_checkpoint(plan, checkpoint)
-        _validate_campaign_capability_superset(summary, descriptor)
+        _validate_campaign_capability_superset(summary, descriptor, plan)
         for record in summary.records:
             existing = records_by_id.get(record.leaf_id)
             if (
