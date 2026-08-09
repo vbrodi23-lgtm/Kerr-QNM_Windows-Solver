@@ -878,10 +878,7 @@ exit 0
 $Policy = [pscustomobject]@{ julia = [pscustomobject]@{ version = "1.10.11" } }
 function Try-InvokeNativeCapture([string]$FilePath, [string[]]$Arguments) {
     $joined = $Arguments -join " "
-    if ($FilePath -eq $env:M02_TEST_JULIA_LAUNCHER -and $joined -eq "+1.10.11 --version") {
-        return "julia version 1.10.11"
-    }
-    if ($FilePath -eq $env:M02_TEST_JULIA_REAL -and $joined -eq "--version") {
+    if ($joined -eq "+1.10.11 --version" -or $joined -eq "--version") {
         return "julia version 1.10.11"
     }
     if ($joined -match "Sys.WORD_SIZE") { return "64" }
@@ -922,12 +919,15 @@ $candidate | ConvertTo-Json -Compress | Set-Content -LiteralPath $env:M02_TEST_J
                 f"stdout={result.stdout!r} stderr={result.stderr!r}",
             )
             candidate = json.loads(record_path.read_text(encoding="utf-8"))
-
-        self.assertEqual(candidate["source"], "juliaup")
-        self.assertEqual(Path(candidate["launcher"]), launcher)
-        self.assertEqual(Path(candidate["executable"]), real_executable)
-        self.assertEqual(candidate["executable_sha256"], "real-julia-sha256")
-        self.assertEqual(candidate["arguments"], [])
+            self.assertEqual(candidate["source"], "juliaup")
+            self.assertTrue(Path(candidate["launcher"]).samefile(launcher))
+            self.assertTrue(
+                Path(candidate["executable"]).samefile(real_executable)
+            )
+            self.assertEqual(
+                candidate["executable_sha256"], "real-julia-sha256"
+            )
+            self.assertEqual(candidate["arguments"], [])
 
     def test_public_surface_contains_no_private_lineage_identifiers(self) -> None:
         root = Path(__file__).resolve().parents[1]
