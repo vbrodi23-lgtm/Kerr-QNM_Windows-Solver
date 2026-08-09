@@ -148,6 +148,70 @@ class DeepPrecisionTests(unittest.TestCase):
             self.assertEqual(complete.records[0].state, "PRODUCED")
             self.assertEqual(promoted.calls, [(SENTINEL, 80)])
 
+    def test_resume_passes_authenticated_prior_outcomes_to_promoted_backend(self) -> None:
+        binary64_capabilities = PrecisionCapabilities((64,))
+        promoted_capabilities = PrecisionCapabilities((64, 80))
+        plan = build_campaign_plan(
+            policy=NumericalPolicy(),
+            backend_identity=VettedNativeDeterminantKernel.identity,
+            precision_capabilities=binary64_capabilities,
+        )
+        selection = build_campaign_selection(
+            plan, role="deep", leaf_ids=(SENTINEL,)
+        )
+
+        class Binary64Backend:
+            identity = plan.backend_identity
+            precision_capabilities = binary64_capabilities
+
+            def execute_stage(self, leaf, digits):
+                return _synthetic_stage_outcome(
+                    digits=digits,
+                    numerical_state="CONVERGED",
+                    component_result={"leaf_id": leaf.leaf_id, "digits": digits},
+                    local_disk_radius_abs=1.0e-6,
+                    deep_diagnostics=diagnostics(digits=12.0),
+                )
+
+        class PromotedBackend:
+            identity = plan.backend_identity
+            precision_capabilities = promoted_capabilities
+
+            def __init__(self):
+                self.previous = None
+
+            def execute_stage(self, leaf, digits):
+                raise AssertionError("promoted resume lost its prior-stage boundary")
+
+            def execute_promoted_stage(self, leaf, digits, previous_outcomes):
+                self.previous = previous_outcomes
+                return _synthetic_stage_outcome(
+                    digits=digits,
+                    numerical_state="CONVERGED",
+                    component_result={"leaf_id": leaf.leaf_id, "digits": digits},
+                    local_disk_radius_abs=1.0e-8,
+                    self_refinement_enclosed=True,
+                    discrepancy_from_previous_abs=2.0e-8,
+                    discrepancy_enclosed=True,
+                )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            checkpoint = Path(temporary) / "promoted-resume.json"
+            run_campaign_selection(
+                plan, selection, Binary64Backend(), checkpoint, resume=False
+            )
+            promoted = PromotedBackend()
+            completed = run_campaign_selection(
+                plan, selection, promoted, checkpoint, resume=True
+            )
+
+        self.assertEqual(completed.state, "COMPLETE")
+        self.assertIsNotNone(promoted.previous)
+        self.assertEqual(tuple(stage.digits for stage in promoted.previous), (64,))
+        self.assertEqual(
+            promoted.previous[0].component_result["leaf_id"], SENTINEL
+        )
+
     def test_resealed_sentinel64_and_inconsistent_state_are_rejected(self) -> None:
         capabilities = PrecisionCapabilities((64,))
         plan = build_campaign_plan(
