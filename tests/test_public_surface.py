@@ -236,7 +236,12 @@ class PublicSurfaceTests(unittest.TestCase):
             "Get-Command chcp.com -ErrorAction SilentlyContinue",
             m02_bootstrap,
         )
+        self.assertIn("if ($null -eq $Chcp)", m02_bootstrap)
         self.assertIn(chcp, m02_bootstrap)
+        self.assertIn(
+            "Could not switch the active console code page to UTF-8 (65001).",
+            m02_bootstrap,
+        )
         self.assertIn(input_encoding, m02_bootstrap)
         self.assertIn(output_encoding, m02_bootstrap)
         self.assertIn(native_input_encoding, m02_bootstrap)
