@@ -126,7 +126,10 @@ if ($WithM02) {
 
 if ($Force -and (Test-Path -LiteralPath $RuntimeRoot)) {
     Write-Step "Removing existing .runtime for a clean reprovision"
-    Remove-Item -LiteralPath $RuntimeRoot -Recurse -Force
+    cmd.exe /c rd /s /q "\\?\$RuntimeRoot"
+    if ($LASTEXITCODE -ne 0 -and (Test-Path -LiteralPath $RuntimeRoot)) {
+        throw "Could not remove existing runtime directory: $RuntimeRoot"
+    }
 }
 foreach ($path in @($RuntimeRoot, $DownloadRoot, $TempRoot)) {
     New-Item -ItemType Directory -Force -Path $path | Out-Null
