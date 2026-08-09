@@ -204,7 +204,7 @@ Build the strict import and validation boundary for evidence produced by the use
 ### Dependencies
 
 - **Blocked by:** TASK-005, TASK-006
-- **Blocks:** TASK-008
+- **Blocks:** TASK-008, TASK-009
 
 ### Evidence Output
 
@@ -250,7 +250,7 @@ Supply the 44 genuinely missing B′ background roots without replacing or widen
 ### Dependencies
 
 - **Blocked by:** TASK-069
-- **Blocks:** TASK-009, TASK-074
+- **Blocks:** TASK-009, TASK-012, TASK-074
 
 ### Evidence Output
 
@@ -472,7 +472,7 @@ Define the scientific identity required for cache keys and prevent later tasks f
 ### Dependencies
 
 - **Blocked by:** TASK-001, TASK-002, TASK-003
-- **Blocks:** TASK-005, TASK-006, TASK-012
+- **Blocks:** TASK-005
 
 ### Evidence Output
 
@@ -515,7 +515,7 @@ Make the frozen completion scope executable so unsupported, missing, or overclai
 ### Dependencies
 
 - **Blocked by:** TASK-003, TASK-004
-- **Blocks:** TASK-006, TASK-012
+- **Blocks:** TASK-006, TASK-007, TASK-069
 
 ### Evidence Output
 
@@ -562,7 +562,7 @@ Specify one field-native artifact for physical first-order complex QNM shifts, l
 ### Dependencies
 
 - **Blocked by:** TASK-005
-- **Blocks:** TASK-007, TASK-008
+- **Blocks:** TASK-007, TASK-008, TASK-069
 
 ### Evidence Output
 
