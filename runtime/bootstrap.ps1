@@ -327,6 +327,19 @@ if ($WithM02) {
         }
     }
 
+    $Utf8NoBom = [System.Text.UTF8Encoding]::new($false)
+    $Chcp = Get-Command chcp.com -ErrorAction SilentlyContinue
+    if ($null -eq $Chcp) {
+        throw "Windows chcp.com is required to configure UTF-8 console output."
+    }
+    & $Chcp.Source 65001 | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        throw "Could not switch the active console code page to UTF-8 (65001)."
+    }
+    [Console]::InputEncoding = $Utf8NoBom
+    [Console]::OutputEncoding = $Utf8NoBom
+    $OutputEncoding = $Utf8NoBom
+
     $JuliaIdentity = Invoke-NativeCapture $JuliaExe @("--version")
     if ($JuliaIdentity -ne "julia version $($Policy.julia.version)") {
         throw "Julia identity mismatch: expected $($Policy.julia.version); received '$JuliaIdentity'."
