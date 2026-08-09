@@ -243,16 +243,18 @@ class PublicSurfaceTests(unittest.TestCase):
             "Installed Julia runtime contains no julia.exe.",
             julia_install,
         )
+        move_index = julia_install.index(move)
+        installed_runtime_check_index = julia_install.index(
+            installed_runtime_check,
+            move_index,
+        )
         self.assertLess(
             julia_install.index('if ($null -eq $FoundJulia)'),
-            julia_install.index(move),
+            move_index,
         )
+        self.assertLess(move_index, installed_runtime_check_index)
         self.assertLess(
-            julia_install.index(move),
-            julia_install.index(installed_runtime_check),
-        )
-        self.assertLess(
-            julia_install.index(installed_runtime_check),
+            installed_runtime_check_index,
             julia_install.index(
                 "Could not remove Julia extraction directory after installation"
             ),
