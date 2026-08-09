@@ -156,6 +156,37 @@ class GsnCacheProducerTests(unittest.TestCase):
         self.assertEqual(origin["coordinate_denominator"], 20)
         self.assertEqual(origin["transformation_id"], "identity-a-over-M")
 
+    def test_kappa_leaf_uses_campaign_spin_and_retains_exact_origin(self) -> None:
+        plan = _campaign_plan()
+        leaf = next(
+            item
+            for item in plan.leaves
+            if item.role == "deep"
+            and item.job.mode.m == 2
+            and item.job.sampling_coordinate.coordinate_id == "M-kappa"
+            and item.job.sampling_coordinate.exact == (1, 1000)
+        )
+        selection = build_campaign_selection(
+            plan, role="deep", leaf_ids=(leaf.leaf_id,)
+        )
+
+        pairs = parameter_pairs_for_selection(plan, selection)
+
+        self.assertEqual(
+            pairs,
+            (GsnParameterPair(9007181168049979, 9007199254740992, 2),),
+        )
+        self.assertEqual(pairs[0].spin_binary64_hex, "0x1.ffffbc9f2ff3bp-1")
+        self.assertEqual(len(pairs[0].origins), 1)
+        origin = pairs[0].origins[0].to_mapping()
+        self.assertEqual(origin["coordinate_id"], "M-kappa")
+        self.assertEqual(origin["coordinate_numerator"], 1)
+        self.assertEqual(origin["coordinate_denominator"], 1000)
+        self.assertEqual(
+            origin["transformation_id"],
+            "kerr-prograde-spin-from-dimensionless-surface-gravity",
+        )
+
     def test_pair_records_are_reused_for_subsets_independent_of_request_order(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             fixture = _ProducerFixture(Path(temporary))
@@ -243,6 +274,24 @@ class GsnCacheProducerTests(unittest.TestCase):
             index_path.write_text(json.dumps(value) + "\n", encoding="ascii")
             with self.assertRaisesRegex(GsnCacheProductionError, "binding"):
                 fixture.ensure((pair,))
+
+    def test_changed_scientific_convention_allocates_a_new_logical_record(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = _ProducerFixture(Path(temporary))
+            pair = GsnParameterPair(19, 20, 2)
+            first = fixture.ensure((pair,))
+            index_path = first.path.parent / "gsn-index.json"
+            value = json.loads(index_path.read_text(encoding="ascii"))
+            value["records"][0]["logical_identity"]["equation_convention"] = (
+                "legacy-generalized-sasaki-nakamura-convention"
+            )
+            index_path.write_text(json.dumps(value) + "\n", encoding="ascii")
+
+            second = fixture.ensure((pair,))
+
+            self.assertEqual(first.record_artifact_ids, ("gsn-000001",))
+            self.assertEqual(second.record_artifact_ids, ("gsn-000002",))
+            self.assertEqual(fixture.invocations, [pair, pair])
 
     def test_deleted_index_regenerates_without_overwriting_surviving_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -334,6 +383,40 @@ class GsnCacheProducerTests(unittest.TestCase):
             self.assertEqual(kernel.cache_path, cache.resolve())
             with self.assertRaisesRegex(RuntimeError, "digest mismatch"):
                 VettedNativeDeterminantKernel.from_generated_resource(cache, "0" * 64)
+
+    def test_native_consumer_accepts_readable_potential_source_without_pinned_sha(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            cache = root / "generated.json"
+            cache.write_text(
+                json.dumps(
+                    {"records": {"m=2;a=0.95": _coefficient_record()}},
+                    sort_keys=True,
+                ),
+                encoding="utf-8",
+            )
+            digest = hashlib.sha256(cache.read_bytes()).hexdigest()
+            potential_source = root / "Potentials.jl"
+            potential_source.write_text(
+                "# readable development source with evolving bytes\n",
+                encoding="utf-8",
+            )
+
+            with (
+                patch(
+                    "windows_solver.native_response_kernel._POTENTIAL_SOURCE_PATH",
+                    potential_source,
+                ),
+                patch(
+                    "windows_solver.native_response_kernel.importlib.import_module",
+                    return_value=SimpleNamespace(StandardSN=object),
+                ),
+            ):
+                kernel = VettedNativeDeterminantKernel.from_generated_resource(
+                    cache, digest
+                )
+
+            self.assertEqual(kernel.cache_path, cache.resolve())
 
 
 if __name__ == "__main__":
