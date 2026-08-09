@@ -40,6 +40,68 @@ class PublicSurfaceTests(unittest.TestCase):
         self.assertIn('$PythonPrefixArguments = @("-3")', launcher)
         self.assertNotIn('PrefixArguments @("-3.12")', launcher)
 
+    @unittest.skipUnless(os.name == "nt", "requires Windows PowerShell 5.1")
+    def test_solver_launcher_preserves_positional_command_arguments(self) -> None:
+        """Runtime options must not consume the public solver command position."""
+
+        root = Path(__file__).resolve().parents[1]
+        windows_powershell = Path(os.environ["SystemRoot"]).joinpath(
+            "System32", "WindowsPowerShell", "v1.0", "powershell.exe"
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            package_root = Path(temporary) / "solver-launcher-binding"
+            (package_root / "runtime").mkdir(parents=True)
+            (package_root / "src").mkdir()
+            shutil.copy2(root / "solver.ps1", package_root / "solver.ps1")
+            shutil.copy2(
+                root / "runtime" / "resolve-runtime-root.ps1",
+                package_root / "runtime" / "resolve-runtime-root.ps1",
+            )
+            argument_log = package_root / "solver-arguments.json"
+            (package_root / "src" / "windows_solver.py").write_text(
+                "import json\n"
+                "import os\n"
+                "import sys\n"
+                "from pathlib import Path\n"
+                "Path(os.environ['SOLVER_ARGUMENT_LOG']).write_text(\n"
+                "    json.dumps(sys.argv[1:]), encoding='utf-8'\n"
+                ")\n",
+                encoding="utf-8",
+            )
+            environment = dict(os.environ)
+            environment["KERR_QNM_RUNTIME_ROOT"] = str(package_root / "managed")
+            environment["SOLVER_ARGUMENT_LOG"] = str(argument_log)
+            result = subprocess.run(
+                [
+                    str(windows_powershell),
+                    "-NoLogo",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-File",
+                    str(package_root / "solver.ps1"),
+                    "plan",
+                    "study.json",
+                ],
+                cwd=package_root,
+                env=environment,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+
+            self.assertEqual(
+                result.returncode,
+                0,
+                f"stdout={result.stdout!r} stderr={result.stderr!r}",
+            )
+            self.assertEqual(
+                json.loads(argument_log.read_text(encoding="utf-8")),
+                ["plan", "study.json"],
+            )
+
     def test_launcher_probe_cannot_abort_on_a_stderr_writing_candidate(
         self,
     ) -> None:
