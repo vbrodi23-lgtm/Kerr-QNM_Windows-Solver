@@ -1,7 +1,8 @@
 param(
     [string]$Selection = ".\examples\m02-campaign.json",
     [string]$Checkpoint = ".\m02-output\m02-campaign-checkpoint.json",
-    [switch]$SkipBootstrap
+    [switch]$SkipBootstrap,
+    [switch]$RebuildRuntime
 )
 
 $ErrorActionPreference = "Stop"
@@ -15,8 +16,16 @@ function Invoke-M02Command([string[]]$Arguments) {
     }
 }
 
+if ($SkipBootstrap -and $RebuildRuntime) {
+    throw "-SkipBootstrap and -RebuildRuntime cannot be used together."
+}
+
 if (-not $SkipBootstrap) {
-    & (Join-Path $PackageRoot "runtime\bootstrap.ps1") -WithM02
+    $BootstrapArguments = @("-WithM02")
+    if ($RebuildRuntime) {
+        $BootstrapArguments += "-Force"
+    }
+    & (Join-Path $PackageRoot "runtime\bootstrap.ps1") @BootstrapArguments
     if ($LASTEXITCODE -ne 0) {
         throw "M02 runtime bootstrap failed with exit code $LASTEXITCODE."
     }
