@@ -118,48 +118,66 @@ class GsnCacheProducerTests(unittest.TestCase):
                 )
                 return SimpleNamespace(returncode=0, stdout="", stderr="")
 
-            with (
-                patch(
-                    "windows_solver.gsn_cache_producer.PINNED_GSN_KERR_SHA256",
-                    hashlib.sha256(kerr.read_bytes()).hexdigest(),
-                ),
-                patch(
-                    "windows_solver.gsn_cache_producer.PINNED_GSN_POTENTIALS_SHA256",
-                    hashlib.sha256(potentials.read_bytes()).hexdigest(),
-                ),
-            ):
-                generated = ensure_generated_gsn_cache(
-                    (pair,),
-                    runtime_root=runtime_root,
-                    julia_executable=julia,
-                    producer_script=script,
-                    gsn_source_root=source_root,
-                    runner=run,
-                )
+            generated = ensure_generated_gsn_cache(
+                (pair,),
+                runtime_root=runtime_root,
+                julia_executable=julia,
+                producer_script=script,
+                gsn_source_root=source_root,
+                runner=run,
+            )
 
-                reused = ensure_generated_gsn_cache(
-                    (pair,),
-                    runtime_root=runtime_root,
-                    julia_executable=julia,
-                    producer_script=script,
-                    gsn_source_root=source_root,
-                    runner=run,
-                )
+            reused = ensure_generated_gsn_cache(
+                (pair,),
+                runtime_root=runtime_root,
+                julia_executable=julia,
+                producer_script=script,
+                gsn_source_root=source_root,
+                runner=run,
+            )
 
-                generated.path.write_text("{}\n", encoding="utf-8")
-                regenerated = ensure_generated_gsn_cache(
-                    (pair,),
-                    runtime_root=runtime_root,
-                    julia_executable=julia,
-                    producer_script=script,
-                    gsn_source_root=source_root,
-                    runner=run,
-                )
+            script.write_text("# evolved development producer\n", encoding="utf-8")
+            reused_after_source_change = ensure_generated_gsn_cache(
+                (pair,),
+                runtime_root=runtime_root,
+                julia_executable=julia,
+                producer_script=script,
+                gsn_source_root=source_root,
+                runner=run,
+            )
+
+            generated.path.write_text("{}\n", encoding="utf-8")
+            regenerated = ensure_generated_gsn_cache(
+                (pair,),
+                runtime_root=runtime_root,
+                julia_executable=julia,
+                producer_script=script,
+                gsn_source_root=source_root,
+                runner=run,
+            )
 
             self.assertTrue(generated.path.is_file())
+            self.assertEqual(generated.artifact_id, "gsn-set-000001")
+            self.assertEqual(generated.path.name, "gsn-set-000001.json")
+            self.assertLess(len(generated.path.name), 64)
+            self.assertEqual(
+                generated.path.parent, runtime_root / "generated" / "gsn"
+            )
+            index = json.loads(
+                (runtime_root / "generated" / "gsn" / "gsn-index.json").read_text(
+                    encoding="ascii"
+                )
+            )
+            self.assertEqual(index["artifacts"][0]["artifact_id"], generated.artifact_id)
+            self.assertEqual(
+                index["artifacts"][0]["parameter_pairs"], [pair.to_mapping()]
+            )
             self.assertEqual(invocation_count, 2)
             self.assertEqual(reused.sha256, generated.sha256)
+            self.assertEqual(reused_after_source_change.path, generated.path)
+            self.assertEqual(reused_after_source_change.sha256, generated.sha256)
             self.assertEqual(regenerated.sha256, generated.sha256)
+            self.assertEqual(regenerated.artifact_id, generated.artifact_id)
             self.assertEqual(
                 generated.sha256,
                 hashlib.sha256(generated.path.read_bytes()).hexdigest(),
