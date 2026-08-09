@@ -496,6 +496,23 @@ function pair_key(spin::Q, m::Int)
     return "m=$(m);a=$(@sprintf("%.15g", Float64(spin)))"
 end
 
+function python_binary64_hex(value::Float64)
+    bits = reinterpret(UInt64, value)
+    sign = ((bits >> 63) == 1) ? "-" : ""
+    exponent_bits = Int((bits >> 52) & 0x7ff)
+    fraction_bits = bits & 0x000fffffffffffff
+    fraction_hex = lpad(string(fraction_bits, base=16), 13, '0')
+    if exponent_bits == 0
+        fraction_bits == 0 && return sign * "0x0.0p+0"
+        return sign * "0x0." * fraction_hex * "p-1022"
+    elseif exponent_bits == 0x7ff
+        error("GSN spin must have a finite binary64 representation")
+    end
+    exponent = exponent_bits - 1023
+    exponent_text = exponent >= 0 ? "+$(exponent)" : string(exponent)
+    return sign * "0x1." * fraction_hex * "p" * exponent_text
+end
+
 function build_record(spin::Q, m::Int)
     u = inverse_radius_symbol()
     r = u^-1
@@ -625,7 +642,7 @@ function main()
             push!(declared, Dict{String,Any}(
                 "spin_numerator" => numerator(spin),
                 "spin_denominator" => denominator(spin),
-                "spin_binary64_hex" => @sprintf("%a", Float64(spin)),
+                "spin_binary64_hex" => python_binary64_hex(Float64(spin)),
                 "azimuthal_index" => m,
             ))
             maximum_error = max(maximum_error, error_value)
