@@ -189,6 +189,25 @@ class PublicSurfaceTests(unittest.TestCase):
         )
         self.assertNotIn("Expand-Archive", julia_install)
 
+    def test_m02_bootstrap_runs_package_setup_from_a_julia_script(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        bootstrap = (root / "runtime" / "bootstrap.ps1").read_text(
+            encoding="utf-8"
+        )
+        project_setup = bootstrap[
+            bootstrap.index("    $SetupExpression = @'") : bootstrap.index(
+                "\n    $WorkerPath"
+            )
+        ]
+
+        self.assertIn(
+            '$SetupScript = Join-Path $TempRoot "m02-setup.jl"',
+            project_setup,
+        )
+        self.assertIn("[IO.File]::WriteAllText", project_setup)
+        self.assertIn("$SetupScript", project_setup)
+        self.assertNotIn('"-e"', project_setup)
+
     def test_campaign_runbook_has_no_historic_cache_environment_prerequisite(
         self,
     ) -> None:
