@@ -8,7 +8,7 @@ Add the newest completed task or milestone-control entry immediately below this 
 - **Delivery sequence:** TASK-075 pins and integrates the public Julia GSN/angular backend; TASK-076 proves the clean-machine multi-precision campaign path; TASK-077 produces all 553 physical leaves; TASK-078 reduces 174 rows, admits the provider, and closes M02.
 - **Dependency correction:** M03 now starts after TASK-078. M06 forced solves consume the validated M04 operator through TASK-023. M07 consumes TASK-078 rather than the software-only TASK-011 gate.
 - **Evidence ceiling:** Roadmap and executable task control only. M02 remains incomplete until TASK-078 produces and admits the physical package.
-- **Change reference:** roadmap-control PR pending.
+- **Change reference:** PR [#7](https://github.com/vbrodi23-lgtm/Kerr-QNM_Windows-Solver/pull/7).
 
 ## 2026-08-08 — TASK-011 M02 admission and operator closure completed
 
