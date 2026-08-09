@@ -47,5 +47,6 @@ Confirm that a fresh checkout can originate every M02 numerical prerequisite fro
 - Index and validate one exact pair record at a time, then assemble the records selected by the campaign for the existing `StandardSN` consumer.
 - Route package-owned Julia 80/120-digit root readouts through the existing campaign stage and evidence contracts.
 - Launch all 553 leaves from `m02.ps1`; the user supplies the physical Windows execution evidence and failure logs.
+- Add out-of-band quiet/normal/trace inner-leaf progress while preserving scientific execution and checkpoint/evidence bytes.
 
 ---
