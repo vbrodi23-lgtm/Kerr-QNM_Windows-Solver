@@ -159,6 +159,22 @@ class PublicSurfaceTests(unittest.TestCase):
         self.assertIn(r".\runtime\bootstrap.ps1 -WithM02", runbook)
         self.assertIn("campaign-run", runbook)
 
+    def test_m02_launcher_runs_the_full_selection_and_can_rebuild_runtime(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        launcher = (root / "m02.ps1").read_text(encoding="utf-8")
+        selection = json.loads(
+            (root / "examples" / "m02-campaign.json").read_text(encoding="utf-8")
+        )
+
+        self.assertEqual(selection["role"], "all")
+        self.assertIsNone(selection["leaf_ids"])
+        self.assertEqual(selection["precision_digits"], [64, 80, 120])
+        self.assertIn("[switch]$RebuildRuntime", launcher)
+        self.assertIn('campaign-resume', launcher)
+        self.assertIn('"--full"', launcher)
+        self.assertIn('if ($RebuildRuntime)', launcher)
+        self.assertIn('$BootstrapArguments += "-Force"', launcher)
+
     def test_windows_ci_captures_native_streams_outside_powershell(self) -> None:
         root = Path(__file__).resolve().parents[1]
         workflow = (root / ".github" / "workflows" / "ci.yml").read_text(
