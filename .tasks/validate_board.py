@@ -12,6 +12,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 TASK_RE = re.compile(r"^## (TASK-(\d{3})): (.+)$", re.MULTILINE)
 DEP_RE = re.compile(r"^- \*\*Blocked by:\*\* (.+)$", re.MULTILINE)
+BLOCKS_RE = re.compile(r"^- \*\*Blocks:\*\* (.+)$", re.MULTILINE)
 TAG_RE = re.compile(r"^\*\*Priority:\*\* (P[0-4]) \| \*\*Tags:\*\* ([^\n]+)$", re.MULTILINE)
 REQUIRED_SECTIONS = ("### Objective", "### Acceptance Criteria", "### Dependencies", "### Evidence Output", "### Verification", "### Review Focus", "### Plan")
 EXPECTED_RANGES = {
@@ -50,6 +51,7 @@ def main() -> int:
     by_state: dict[str, list[int]] = {}
     edges: dict[int, set[int]] = defaultdict(set)
     dependencies: dict[int, set[int]] = defaultdict(set)
+    declared_blocks: dict[int, set[int]] = defaultdict(set)
 
     for state, filename in config["states"].items():
         path = ROOT / filename
@@ -70,11 +72,21 @@ def main() -> int:
             dep_match = DEP_RE.search(body)
             if not dep_match:
                 errors.append(f"{task_id} lacks Blocked by line")
-                continue
-            for dep in re.findall(r"TASK-(\d{3})", dep_match.group(1)):
-                dependency = int(dep)
-                edges[dependency].add(number)
-                dependencies[number].add(dependency)
+            else:
+                for dep in re.findall(r"TASK-(\d{3})", dep_match.group(1)):
+                    dependency = int(dep)
+                    edges[dependency].add(number)
+                    dependencies[number].add(dependency)
+            blocks_match = BLOCKS_RE.search(body)
+            if not blocks_match and state != "Rejected":
+                errors.append(f"{task_id} lacks Blocks line")
+            elif blocks_match:
+                declared_blocks[number].update(
+                    int(destination)
+                    for destination in re.findall(
+                        r"TASK-(\d{3})", blocks_match.group(1)
+                    )
+                )
 
     next_id = config.get("nextId")
     if not isinstance(next_id, int) or next_id < 2:
@@ -98,7 +110,8 @@ def main() -> int:
     def dependency_ready(number: int) -> bool:
         return dependencies[number].issubset(done)
 
-    pending = actual_ids - done - set(by_state.get("Rejected", []))
+    rejected = set(by_state.get("Rejected", []))
+    pending = actual_ids - done - rejected
     ready = {number for number in pending if dependency_ready(number)}
     priority_by_task = {
         number: _priority_rank(body) for number, (_, _, body) in all_tasks.items()
@@ -151,6 +164,23 @@ def main() -> int:
     for source, destinations in edges.items():
         if source not in all_tasks:
             errors.append(f"dependency references missing TASK-{source:03d}")
+
+    # Blocked by is the scheduling authority, but operators also read Blocks.
+    # Require reciprocal live-task links so the board cannot describe two
+    # different delivery graphs. Rejected tasks retain historical links.
+    live_tasks = actual_ids - rejected
+    for source in sorted(live_tasks):
+        actual_destinations = edges.get(source, set()) & live_tasks
+        stated_destinations = declared_blocks.get(source, set()) & live_tasks
+        for destination in sorted(actual_destinations - stated_destinations):
+            errors.append(
+                f"TASK-{source:03d} must list TASK-{destination:03d} in Blocks"
+            )
+        for destination in sorted(stated_destinations - actual_destinations):
+            errors.append(
+                f"TASK-{source:03d} lists stale Blocks link "
+                f"TASK-{destination:03d}"
+            )
 
     indegree = {number: 0 for number in all_tasks}
     for destinations in edges.values():
