@@ -259,6 +259,18 @@ class CampaignProgressReporterTests(unittest.TestCase):
     def tearDown(self):
         self._reporter_directory.cleanup()
 
+    def _console_reporter(self, stream):
+        # StringIO can model terminal output but can never supply a real Windows
+        # console handle to SetConsoleMode.
+        with patch.object(
+            CampaignProgressReporter,
+            "_enable_virtual_terminal",
+            return_value=True,
+        ):
+            return CampaignProgressReporter(
+                "normal", self.reporter_checkpoint, stream
+            )
+
     def test_normal_defaults_to_the_main_stdout_console(self):
         class ConsoleStream(io.StringIO):
             def isatty(self):
@@ -308,7 +320,7 @@ class CampaignProgressReporterTests(unittest.TestCase):
                 return True
 
         stream = ConsoleStream()
-        reporter = CampaignProgressReporter("normal", self.reporter_checkpoint, stream)
+        reporter = self._console_reporter(stream)
         shared_context = {
             "leaf_id": (
                 "b-prime-leaf-"
@@ -455,7 +467,7 @@ class CampaignProgressReporterTests(unittest.TestCase):
         stream = ConsoleStream()
         history = "[bootstrap] solver plan succeeded\nPS> .\\m02.ps1\n"
         stream.write(history)
-        reporter = CampaignProgressReporter("normal", self.reporter_checkpoint, stream)
+        reporter = self._console_reporter(stream)
         reporter.publish(
             _event(
                 ProgressEventKind.LEAF_STARTED,
@@ -493,7 +505,7 @@ class CampaignProgressReporterTests(unittest.TestCase):
         stream = ConsoleStream()
         history = "[bootstrap] solver plan succeeded\nPS> .\\m02.ps1\n"
         stream.write(history)
-        reporter = CampaignProgressReporter("normal", self.reporter_checkpoint, stream)
+        reporter = self._console_reporter(stream)
         with patch.object(reporter, "_terminal_dimensions", return_value=(80, 24)):
             first = _payload_event(
                 ProgressEventKind.DETERMINANT_COMPLETED,
@@ -555,7 +567,7 @@ class CampaignProgressReporterTests(unittest.TestCase):
                 return True
 
         stream = ConsoleStream()
-        reporter = CampaignProgressReporter("normal", self.reporter_checkpoint, stream)
+        reporter = self._console_reporter(stream)
         reporter.publish(
             replace(
                 _event(
@@ -606,7 +618,7 @@ class CampaignProgressReporterTests(unittest.TestCase):
                 return True
 
         stream = ConsoleStream()
-        reporter = CampaignProgressReporter("normal", self.reporter_checkpoint, stream)
+        reporter = self._console_reporter(stream)
         current = 0.0
         for leaf_index in range(1, 12):
             reporter.publish(
@@ -658,7 +670,7 @@ class CampaignProgressReporterTests(unittest.TestCase):
                 return True
 
         stream = ConsoleStream()
-        reporter = CampaignProgressReporter("normal", self.reporter_checkpoint, stream)
+        reporter = self._console_reporter(stream)
         leaf_context = {
             "leaf_id": "leaf-1",
             "leaf_index": 1,
