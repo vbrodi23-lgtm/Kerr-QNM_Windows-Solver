@@ -67,19 +67,25 @@ native determinant solve:
 python -m windows_solver campaign-smoke
 ```
 
-Physical selected execution requires the exact authenticated cache inputs. The
-commands do not generate or download this resource.
+Physical selected execution uses package-local Julia to generate the exact F/U
+coefficient records required by the selected campaign leaves. Provision the
+pinned CPython, NumPy/SciPy, and portable Julia runtimes once:
 
 ```powershell
-$env:GSN_INFINITY_SERIES_CACHE = "C:\solver-inputs\gsn-infinity-series.json"
-$env:GSN_INFINITY_SERIES_CACHE_SHA256 = "0c49fe4c2839444422b2d0ebcf08c912ee06d7e60ed398c9b360ed4c151f28d3"
-python -m windows_solver campaign-run campaign-selection.json --checkpoint primary-part.json
-python -m windows_solver campaign-resume campaign-selection.json --checkpoint primary-part.json
-python -m windows_solver campaign-validate campaign-selection.json --checkpoint primary-part.json
+.\runtime\bootstrap.ps1 -WithM02
+.\solver.ps1 campaign-run .\campaign-selection.json --checkpoint .\primary-part.json
+.\solver.ps1 campaign-resume .\campaign-selection.json --checkpoint .\primary-part.json
+.\solver.ps1 campaign-validate .\campaign-selection.json --checkpoint .\primary-part.json
 ```
 
-Absent or changed cache bytes fail before determinant work. The installed native
-adapter authenticates binary64 only. A deep selection therefore also requires a
+The producer executes the packaged `Potentials.sF` / `Potentials.sU` equations
+with exact symbolic rational algebra, validates them against direct evaluation,
+and writes a content-addressed cache under `.runtime`. The Python boundary
+rehashes the artifact before importing the existing `StandardSN` consumer.
+Verified warm state is reused; source, producer, executable, receipt, status, or
+cache drift forces regeneration or rejection before determinant work.
+
+The installed native adapter authenticates binary64 only. A deep selection therefore also requires a
 separately authenticated backend implementing the declared 80/120-digit
 capabilities and deep trigger diagnostics; missing stages remain missing rather
 than being silently downgraded.
