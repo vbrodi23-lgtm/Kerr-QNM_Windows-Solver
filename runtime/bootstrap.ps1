@@ -317,7 +317,10 @@ if ($WithM02) {
                 throw "Could not remove previous Julia runtime directory: $JuliaRoot"
             }
         }
-        Copy-Item -LiteralPath $ExtractedJuliaRoot -Destination $JuliaRoot -Recurse -Force
+        Move-Item -LiteralPath $ExtractedJuliaRoot -Destination $JuliaRoot
+        if (-not (Test-Path -LiteralPath $JuliaExe -PathType Leaf)) {
+            throw "Installed Julia runtime contains no julia.exe. Expected: $JuliaExe"
+        }
         cmd.exe /c rd /s /q "\\?\$JuliaExtract"
         if ($LASTEXITCODE -ne 0 -and (Test-Path -LiteralPath $JuliaExtract)) {
             throw "Could not remove Julia extraction directory after installation: $JuliaExtract"
