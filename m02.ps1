@@ -21,11 +21,12 @@ if ($SkipBootstrap -and $RebuildRuntime) {
 }
 
 if (-not $SkipBootstrap) {
-    $BootstrapArguments = @("-WithM02")
     if ($RebuildRuntime) {
-        $BootstrapArguments += "-Force"
+        & (Join-Path $PackageRoot "runtime\bootstrap.ps1") -WithM02 -Force
     }
-    & (Join-Path $PackageRoot "runtime\bootstrap.ps1") @BootstrapArguments
+    else {
+        & (Join-Path $PackageRoot "runtime\bootstrap.ps1") -WithM02
+    }
     if ($LASTEXITCODE -ne 0) {
         throw "M02 runtime bootstrap failed with exit code $LASTEXITCODE."
     }
