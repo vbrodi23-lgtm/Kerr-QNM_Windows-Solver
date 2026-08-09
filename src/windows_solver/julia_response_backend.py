@@ -86,7 +86,12 @@ def _finite_text(value: object, label: str) -> float:
 
 def _runtime_root() -> Path:
     override = os.environ.get("KERR_QNM_RUNTIME_ROOT")
-    return Path(override) if override else Path.cwd() / ".runtime"
+    if override:
+        return Path(override)
+    local_app_data = os.environ.get("LOCALAPPDATA")
+    if os.name == "nt" and local_app_data:
+        return Path(local_app_data) / "Kerr-QNM_Windows-Solver" / "runtime-1"
+    return Path.cwd() / ".runtime"
 
 
 @dataclass(frozen=True, slots=True)
@@ -97,6 +102,7 @@ class JuliaResponseAdapter:
     worker_script: Path
     runtime_provenance: Mapping[str, object]
     runner: Callable[..., object] = subprocess.run
+    julia_prefix_arguments: tuple[str, ...] = ()
 
     @classmethod
     def from_runtime_receipt(
@@ -121,23 +127,52 @@ class JuliaResponseAdapter:
                 ".\\runtime\\bootstrap.ps1 -WithM02"
             )
         executable = _regular_file(
-            Path(str(julia["executable"])), "package-local Julia executable"
+            Path(str(julia["executable"])), "M02 Julia executable"
         )
         project = Path(str(julia["project"]))
         project_file = _regular_file(project / "Project.toml", "M02 Julia project")
         manifest = _regular_file(project / "Manifest.toml", "M02 Julia manifest")
+        declared_worker = julia.get("worker")
         worker = _regular_file(
-            Path(__file__).resolve().parent / "data" / "julia" / "m02_worker.jl",
-            "package-owned M02 Julia worker",
+            (
+                Path(str(declared_worker))
+                if isinstance(declared_worker, str) and declared_worker
+                else Path(__file__).resolve().parent / "data" / "julia" / "m02_worker.jl"
+            ),
+            "M02 Julia worker",
         )
         depot = Path(str(julia["depot"]))
         if not depot.is_dir() or depot.is_symlink():
             raise JuliaResponseBackendError(f"M02 Julia depot is invalid: {depot}")
+        observed_executable_sha256 = _sha256(executable)
+        observed_manifest_sha256 = _sha256(manifest)
+        observed_worker_sha256 = _sha256(worker)
+        for key, observed, label in (
+            ("executable_sha256", observed_executable_sha256, "executable"),
+            ("manifest_sha256", observed_manifest_sha256, "manifest"),
+            ("worker_sha256", observed_worker_sha256, "worker"),
+        ):
+            declared = julia.get(key)
+            if declared is not None and (
+                not isinstance(declared, str) or declared != observed
+            ):
+                raise JuliaResponseBackendError(
+                    f"M02 Julia {label} receipt digest does not match the installed runtime"
+                )
+        declared_arguments = julia.get("arguments", [])
+        if (
+            not isinstance(declared_arguments, list)
+            or any(not isinstance(item, str) or not item for item in declared_arguments)
+        ):
+            raise JuliaResponseBackendError(
+                "M02 Julia runtime invocation arguments are invalid"
+            )
         provenance = {
             "julia_version": julia.get("version", "unrecorded"),
-            "julia_executable_sha256": _sha256(executable),
-            "julia_manifest_sha256": _sha256(manifest),
-            "worker_sha256": _sha256(worker),
+            "julia_executable_sha256": observed_executable_sha256,
+            "julia_arguments": list(declared_arguments),
+            "julia_manifest_sha256": observed_manifest_sha256,
+            "worker_sha256": observed_worker_sha256,
             "runtime_policy_sha256": receipt.get("policy_sha256"),
             "scientific_sources": list(julia.get("sources", ())),
         }
@@ -148,6 +183,7 @@ class JuliaResponseAdapter:
             worker,
             provenance,
             runner,
+            tuple(declared_arguments),
         )
 
     def evaluate(self, request: Mapping[str, object]) -> dict[str, object]:
@@ -176,6 +212,7 @@ class JuliaResponseAdapter:
             completed = self.runner(
                 (
                     str(self.julia_executable),
+                    *self.julia_prefix_arguments,
                     "--startup-file=no",
                     "--history-file=no",
                     f"--project={self.julia_project}",
