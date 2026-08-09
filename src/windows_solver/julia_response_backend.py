@@ -8,6 +8,7 @@ component reduction, error ledger, checkpoints, resume, and admission schema.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from contextvars import copy_context
 import hashlib
 import json
 import math
@@ -15,6 +16,8 @@ import os
 from pathlib import Path
 import subprocess
 import tempfile
+from threading import Thread
+from types import SimpleNamespace
 from typing import Callable, Mapping
 
 from .contracts import canonical_json_bytes
@@ -24,9 +27,76 @@ from .response_engine import (
     RootReadout,
     _exterior_support,
 )
+from .progress import ProgressEventKind, emit_progress, ingest_external_progress
 
 
 _PROMOTED_DIGITS = frozenset({80, 120})
+JULIA_PROGRESS_PREFIX = "@@KERR_QNM_PROGRESS@@"
+
+
+def _forward_julia_progress_line(line: str) -> bool:
+    """Forward one reserved worker event; return whether the line was reserved."""
+
+    if not line.startswith(JULIA_PROGRESS_PREFIX):
+        return False
+    try:
+        value = json.loads(line[len(JULIA_PROGRESS_PREFIX):])
+        ingest_external_progress(value)
+    except Exception as error:
+        emit_progress(
+            ProgressEventKind.ERROR,
+            source="julia-progress",
+            error_type=type(error).__name__,
+            message=str(error),
+        )
+    return True
+
+
+def _run_streamed_julia(
+    command: tuple[str, ...], *, cwd: Path, env: Mapping[str, str], timeout: int
+) -> object:
+    """Drain worker pipes concurrently and forward progress before completion."""
+
+    process = subprocess.Popen(
+        command,
+        cwd=cwd,
+        env=dict(env),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+    )
+    stdout_lines: list[str] = []
+    stderr_lines: list[str] = []
+
+    def read_stdout() -> None:
+        assert process.stdout is not None
+        for line in process.stdout:
+            if not _forward_julia_progress_line(line.rstrip("\r\n")):
+                stdout_lines.append(line)
+
+    def read_stderr() -> None:
+        assert process.stderr is not None
+        stderr_lines.extend(process.stderr)
+
+    stdout_context = copy_context()
+    stdout_thread = Thread(target=stdout_context.run, args=(read_stdout,), daemon=True)
+    stderr_thread = Thread(target=read_stderr, daemon=True)
+    stdout_thread.start()
+    stderr_thread.start()
+    try:
+        returncode = process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        returncode = process.wait()
+        stderr_lines.append(f"Julia worker timed out after {timeout} seconds\n")
+    stdout_thread.join()
+    stderr_thread.join()
+    return SimpleNamespace(
+        returncode=returncode,
+        stdout="".join(stdout_lines)[-4000:],
+        stderr="".join(stderr_lines)[-4000:],
+    )
 
 
 class JuliaResponseBackendError(RuntimeError):
@@ -209,8 +279,8 @@ class JuliaResponseAdapter:
             environment = os.environ.copy()
             environment["JULIA_DEPOT_PATH"] = str(self.julia_depot)
             environment["JULIA_PKG_OFFLINE"] = "true"
-            completed = self.runner(
-                (
+            environment["KERR_QNM_PROGRESS"] = "1"
+            command = (
                     str(self.julia_executable),
                     *self.julia_prefix_arguments,
                     "--startup-file=no",
@@ -219,14 +289,21 @@ class JuliaResponseAdapter:
                     str(self.worker_script),
                     str(request_path),
                     str(response_path),
-                ),
-                cwd=directory,
-                env=environment,
-                capture_output=True,
-                text=True,
-                check=False,
-                timeout=timeout,
-            )
+                )
+            if self.runner is subprocess.run:
+                completed = _run_streamed_julia(
+                    command, cwd=directory, env=environment, timeout=timeout
+                )
+            else:
+                completed = self.runner(
+                    command,
+                    cwd=directory,
+                    env=environment,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=timeout,
+                )
             returncode = getattr(completed, "returncode", None)
             if returncode != 0:
                 stderr = str(getattr(completed, "stderr", ""))[-4000:]

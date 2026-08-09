@@ -105,5 +105,14 @@ under Settings > Apps > Advanced app settings > App execution aliases.
 "@
 }
 
-& $PythonExecutable @PythonPrefixArguments -m windows_solver @SolverArguments
-exit $LASTEXITCODE
+$PreviousErrorActionPreference = $ErrorActionPreference
+$ErrorActionPreference = "Continue"
+$SolverExitCode = 1
+try {
+    & $PythonExecutable @PythonPrefixArguments -m windows_solver @SolverArguments
+    $SolverExitCode = $LASTEXITCODE
+}
+finally {
+    $ErrorActionPreference = $PreviousErrorActionPreference
+}
+exit $SolverExitCode

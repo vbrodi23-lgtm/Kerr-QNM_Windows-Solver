@@ -26,6 +26,13 @@ from .linear_response_admission import (
 )
 from .planner import build_plan
 from .providers import ProviderUnavailableError
+from .progress import (
+    ProgressEventKind,
+    ProgressMode,
+    activate_progress,
+    emit_progress,
+)
+from .progress_output import CampaignProgressReporter
 from .response_engine import (
     BackendIdentity,
     ComponentResult,
@@ -40,6 +47,7 @@ from .response_engine import (
 )
 from .response_batches import (
     CampaignLeafRecord,
+    CampaignRunSummary,
     NativeCampaignStageBackend,
     PrecisionCapabilities,
     PrecisionFactoryIdentity,
@@ -201,6 +209,12 @@ def build_parser() -> argparse.ArgumentParser:
         campaign = commands.add_parser(name, help=help_text)
         campaign.add_argument("selection", type=Path)
         campaign.add_argument("--checkpoint", type=Path, required=True)
+        if name in {"campaign-run", "campaign-resume"}:
+            campaign.add_argument(
+                "--progress",
+                choices=tuple(mode.value for mode in ProgressMode),
+                default=ProgressMode.NORMAL.value,
+            )
         if name == "campaign-validate":
             campaign.add_argument("--full", action="store_true")
     campaign_merge = commands.add_parser(
@@ -663,7 +677,21 @@ def _validate_campaign_capability_superset(summary, descriptor, plan) -> None:
 
 
 def _campaign_selected(command: str, selection_path: Path, checkpoint: Path, *, full=False):
+    if command in {"campaign-run", "campaign-resume"}:
+        emit_progress(
+            ProgressEventKind.REQUEST_STARTED,
+            operation=command,
+            selection_path=str(selection_path),
+            checkpoint_path=str(checkpoint),
+        )
     plan, selection, descriptor = _campaign_plan_and_selection(selection_path)
+    if command in {"campaign-run", "campaign-resume"}:
+        emit_progress(
+            ProgressEventKind.REQUEST_VALIDATED,
+            campaign_id=plan.campaign_id,
+            selection_id=selection.selection_id,
+            leaf_count=len(selection.leaf_ids),
+        )
     if command == "campaign-plan":
         return 0, {
             "command": command,
@@ -697,7 +725,7 @@ def _campaign_selected(command: str, selection_path: Path, checkpoint: Path, *, 
             if cached.selection_id != selection.selection_id:
                 raise ValueError("campaign checkpoint selection does not match request")
             if cached.state == "COMPLETE":
-                return 0, {"command": command, **cached.to_mapping()}
+                return 0, _campaign_console_mapping(command, cached)
         backend = _load_campaign_backend(descriptor, plan=plan, selection=selection)
         summary = run_campaign_selection(
             plan,
@@ -706,7 +734,23 @@ def _campaign_selected(command: str, selection_path: Path, checkpoint: Path, *, 
             checkpoint,
             resume=command == "campaign-resume",
         )
-    return 0, {"command": command, **summary.to_mapping()}
+    return 0, _campaign_console_mapping(command, summary)
+
+
+def _campaign_console_mapping(
+    command: str, summary: CampaignRunSummary
+) -> dict[str, object]:
+    return {
+        "command": command,
+        "campaign_id": summary.campaign_id,
+        "selection_id": summary.selection_id,
+        "state": summary.state,
+        "executed_stage_count": summary.executed_stage_count,
+        "reused_stage_count": summary.reused_stage_count,
+        "result_count": summary.result_count,
+        "checkpoint_path": summary.checkpoint_path,
+        "release_admissible": False,
+    }
 
 
 def _campaign_merge(manifest: Path, output: Path) -> tuple[int, object]:
@@ -953,12 +997,48 @@ def main(argv: Sequence[str] | None = None) -> int:
         elif arguments.command in {
             "campaign-run", "campaign-resume", "campaign-validate"
         }:
-            status, output = _campaign_selected(
-                arguments.command,
-                arguments.selection,
-                arguments.checkpoint,
-                full=getattr(arguments, "full", False),
-            )
+            reporter = None
+            if arguments.command in {"campaign-run", "campaign-resume"}:
+                progress_checkpoint = resolve_campaign_relative_path(
+                    Path.cwd(), str(arguments.checkpoint)
+                )
+                reporter = CampaignProgressReporter(
+                    arguments.progress, progress_checkpoint
+                )
+            if reporter is None:
+                status, output = _campaign_selected(
+                    arguments.command,
+                    arguments.selection,
+                    arguments.checkpoint,
+                    full=getattr(arguments, "full", False),
+                )
+            else:
+                try:
+                    with activate_progress(reporter):
+                        try:
+                            status, output = _campaign_selected(
+                                arguments.command,
+                                arguments.selection,
+                                arguments.checkpoint,
+                            )
+                        except BaseException as error:
+                            emit_progress(
+                                ProgressEventKind.REQUEST_FAILED,
+                                operation=arguments.command,
+                                error_type=type(error).__name__,
+                                message=str(error),
+                            )
+                            raise
+                        else:
+                            emit_progress(
+                                ProgressEventKind.REQUEST_COMPLETED,
+                                operation=arguments.command,
+                                status=status,
+                                state=output.get("state"),
+                                checkpoint_path=output.get("checkpoint_path"),
+                            )
+                finally:
+                    reporter.close()
         elif arguments.command == "campaign-merge":
             status, output = _campaign_merge(arguments.manifest, arguments.output)
         elif arguments.command == "campaign-reduce":

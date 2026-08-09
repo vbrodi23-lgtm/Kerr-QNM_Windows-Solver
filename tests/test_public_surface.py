@@ -455,9 +455,11 @@ class PublicSurfaceTests(unittest.TestCase):
         self.assertIn('campaign-resume', launcher)
         self.assertIn('"--full"', launcher)
         self.assertIn('if ($RebuildRuntime)', launcher)
+        self.assertIn('[ValidateSet("quiet", "normal", "trace")]', launcher)
+        self.assertIn('[string]$Progress = "normal"', launcher)
+        self.assertIn('"--progress"', launcher)
         self.assertEqual(launcher.count("$Selection,"), 2)
-        self.assertEqual(launcher.count("\n        $Checkpoint\n"), 1)
-        self.assertEqual(launcher.count("\n        $Checkpoint,\n"), 1)
+        self.assertEqual(launcher.count("\n        $Checkpoint,\n"), 2)
         self.assertNotIn("$SelectionPath,", launcher)
         self.assertNotIn("$CheckpointPath,", launcher)
 
@@ -764,7 +766,14 @@ exit 0
         self.assertEqual(
             calls,
             [
-                ["campaign-run", selection, "--checkpoint", checkpoint],
+                [
+                    "campaign-run",
+                    selection,
+                    "--checkpoint",
+                    checkpoint,
+                    "--progress",
+                    "normal",
+                ],
                 [
                     "campaign-validate",
                     selection,

@@ -8,6 +8,7 @@ no numerical work during import or validation.
 from __future__ import annotations
 
 import cmath
+from contextlib import contextmanager
 from dataclasses import replace
 import hashlib
 import importlib
@@ -18,6 +19,7 @@ from pathlib import Path
 import platform
 import re
 import struct
+import time
 from typing import Callable, Mapping
 
 from .response_engine import (
@@ -29,6 +31,7 @@ from .response_engine import (
     ResponseComponentJob,
     RootReadout,
 )
+from .progress import ProgressEventKind, emit_progress, progress_scope
 
 
 _SOURCE_COMMIT = "0c1e8a3d3bca6e608c34e111476a4f6dcb73e86e"
@@ -52,6 +55,41 @@ _GENERATED_INPUT_CONTRACT_ID = "julia-exact-f-u-cache-contract-1"
 _POTENTIAL_SOURCE_PATH = (
     Path(__file__).resolve().parent / "data" / "native_kernel" / "potentials.fixture"
 )
+
+
+def _progress_complex(value: complex) -> dict[str, float]:
+    converted = complex(value)
+    return {"real": converted.real, "imaginary": converted.imag}
+
+
+@contextmanager
+def _progress_suboperation(name: str, **payload: object):
+    started = time.monotonic()
+    with progress_scope(suboperation=name):
+        emit_progress(
+            ProgressEventKind.SUBOPERATION_STARTED,
+            suboperation=name,
+            **payload,
+        )
+        try:
+            yield
+        except BaseException as error:
+            emit_progress(
+                ProgressEventKind.ERROR,
+                suboperation=name,
+                error_type=type(error).__name__,
+                message=str(error),
+                elapsed_seconds=time.monotonic() - started,
+                **payload,
+            )
+            raise
+        else:
+            emit_progress(
+                ProgressEventKind.SUBOPERATION_COMPLETED,
+                suboperation=name,
+                elapsed_seconds=time.monotonic() - started,
+                **payload,
+            )
 
 
 class NativeResourceUnavailableError(RuntimeError):
@@ -255,14 +293,17 @@ class VettedNativeDeterminantKernel:
     def _integrate_horizon_branch(
         cls, sn: object, omega: complex, sign: int, readout: float
     ) -> object:
-        separation, _ = sn.lambda_phys(omega)
+        with _progress_suboperation("angular"):
+            separation, _ = sn.lambda_phys(omega)
         radius = sn.rp + min(2.0e-4, 0.02 * (sn.rp - sn.rm))
         seed = cls._horizon_seed_branch(
             sn, omega, separation, sign, radius
         )
-        return sn.integrate_real(
-            omega, separation, radius, readout, seed
-        ).y[:, -1]
+        branch = "Xin" if sign < 0 else "Xup"
+        with _progress_suboperation(branch):
+            return sn.integrate_real(
+                omega, separation, radius, readout, seed
+            ).y[:, -1]
 
     @staticmethod
     def _integrate_exterior(
@@ -296,7 +337,10 @@ class VettedNativeDeterminantKernel:
         )
         boundaries = sorted(set(boundaries), reverse=stop < start)
         state = np.asarray(seed, dtype=complex)
-        for left, right in zip(boundaries[:-1], boundaries[1:]):
+        segment_count = len(boundaries) - 1
+        for segment_index, (left, right) in enumerate(
+            zip(boundaries[:-1], boundaries[1:]), start=1
+        ):
             midpoint = 0.5 * (left + right)
             inside = perturbation.support.lower <= midpoint <= perturbation.support.upper
             step = 0.2
@@ -306,15 +350,22 @@ class VettedNativeDeterminantKernel:
                     (perturbation.support.upper - perturbation.support.lower)
                     / policy.support_subinterval_count,
                 )
-            solution = solve_ivp(
-                equation,
-                (left, right),
-                state,
-                method="DOP853",
-                rtol=policy.ode_relative_tolerance,
-                atol=policy.ode_absolute_tolerance,
-                max_step=step,
-            )
+            with _progress_suboperation(
+                "perturbed integration",
+                segment_index=segment_index,
+                segment_count=segment_count,
+                start_radius=left,
+                stop_radius=right,
+            ):
+                solution = solve_ivp(
+                    equation,
+                    (left, right),
+                    state,
+                    method="DOP853",
+                    rtol=policy.ode_relative_tolerance,
+                    atol=policy.ode_absolute_tolerance,
+                    max_step=step,
+                )
             if not solution.success:
                 raise RuntimeError(solution.message)
             state = solution.y[:, -1]
@@ -330,18 +381,21 @@ class VettedNativeDeterminantKernel:
     ) -> complex:
         readout = policy.readout_radius
         if isinstance(perturbation, HorizonPerturbation):
-            outgoing, _ = sn.outgoing_at(omega, readout)
+            with _progress_suboperation("Xup"):
+                outgoing, _ = sn.outgoing_at(omega, readout)
             ingoing = cls._integrate_horizon_branch(sn, omega, -1, readout)
             outgoing_horizon = cls._integrate_horizon_branch(
                 sn, omega, +1, readout
             )
             reflectivity = perturbation.reflectivity(omega)
             horizon = ingoing + reflectivity * outgoing_horizon
-            return sn.wfac(readout) * (
-                horizon[0] * outgoing[1] - horizon[1] * outgoing[0]
-            )
+            with _progress_suboperation("Wronskian"):
+                return sn.wfac(readout) * (
+                    horizon[0] * outgoing[1] - horizon[1] * outgoing[0]
+                )
 
-        separation, _ = sn.lambda_phys(omega)
+        with _progress_suboperation("angular"):
+            separation, _ = sn.lambda_phys(omega)
         horizon_radius = sn.rp + min(2.0e-4, 0.02 * (sn.rp - sn.rm))
         horizon_seed = sn.horizon_seed(omega, separation, horizon_radius)
         infinity_radius, infinity_seed = sn.outgoing_real_seed(omega, separation)
@@ -365,37 +419,142 @@ class VettedNativeDeterminantKernel:
             perturbation,
             policy,
         )
-        return sn.wfac(readout) * (
-            horizon[0] * infinity[1] - horizon[1] * infinity[0]
-        )
+        with _progress_suboperation("Wronskian"):
+            return sn.wfac(readout) * (
+                horizon[0] * infinity[1] - horizon[1] * infinity[0]
+            )
 
     @staticmethod
     def _bounded_newton(
         determinant: Callable[[complex], complex], guess: complex
     ) -> tuple[complex, float, bool]:
         value = complex(guess)
-        best = (value, abs(determinant(value)))
-        for _ in range(12):
-            residual = determinant(value)
+
+        def evaluated(
+            omega: complex, purpose: str, current: complex
+        ) -> complex:
+            candidate = complex(omega)
+            started = time.monotonic()
+            with progress_scope(
+                determinant_purpose=purpose,
+                current_omega=_progress_complex(current),
+                candidate_omega=_progress_complex(candidate),
+            ):
+                emit_progress(
+                    ProgressEventKind.DETERMINANT_STARTED,
+                    purpose=purpose,
+                    omega=_progress_complex(candidate),
+                )
+                result = determinant(candidate)
+                emit_progress(
+                    ProgressEventKind.DETERMINANT_COMPLETED,
+                    purpose=purpose,
+                    omega=_progress_complex(candidate),
+                    determinant_real=complex(result).real,
+                    determinant_imag=complex(result).imag,
+                    determinant_abs=abs(result),
+                    elapsed_seconds=time.monotonic() - started,
+                )
+                return result
+
+        best = (value, abs(evaluated(value, "initial best", value)))
+        for iteration in range(1, 13):
+            iteration_started = time.monotonic()
+            residual = evaluated(value, "residual", value)
             magnitude = abs(residual)
             if magnitude < best[1]:
                 best = value, magnitude
-            if magnitude < 2.0e-11:
-                return value, magnitude, True
-            h = _DERIVATIVE_STEP * (1.0 + abs(value))
-            derivative = (determinant(value + h) - determinant(value - h)) / (2.0 * h)
-            if not math.isfinite(abs(derivative)) or derivative == 0.0j:
-                break
-            step = residual / derivative
-            if abs(step) > 6.0e-3:
-                step *= 6.0e-3 / abs(step)
-            for damping in (1.0, 0.5, 0.25, 0.125):
-                candidate = value - damping * step
-                if abs(determinant(candidate)) < magnitude:
-                    value = candidate
+            with progress_scope(
+                newton_index=iteration,
+                newton_limit=12,
+                current_omega=_progress_complex(value),
+            ):
+                emit_progress(
+                    ProgressEventKind.NEWTON_ITERATION_STARTED,
+                    current_omega=_progress_complex(value),
+                    determinant_abs=magnitude,
+                    best_determinant_abs=best[1],
+                )
+                if magnitude < 2.0e-11:
+                    emit_progress(
+                        ProgressEventKind.NEWTON_ITERATION_COMPLETED,
+                        derivative_abs=None,
+                        raw_step=None,
+                        applied_step=None,
+                        step_abs=0.0,
+                        clipped=False,
+                        damping=0.0,
+                        accepted=True,
+                        resulting_omega=_progress_complex(value),
+                        resulting_determinant_abs=magnitude,
+                        elapsed_seconds=time.monotonic() - iteration_started,
+                    )
+                    return value, magnitude, True
+                h = _DERIVATIVE_STEP * (1.0 + abs(value))
+                derivative = (
+                    evaluated(value + h, "derivative +h", value)
+                    - evaluated(value - h, "derivative -h", value)
+                ) / (2.0 * h)
+                derivative_abs = abs(derivative)
+                if not math.isfinite(derivative_abs) or derivative == 0.0j:
+                    emit_progress(
+                        ProgressEventKind.NEWTON_ITERATION_COMPLETED,
+                        derivative_abs=derivative_abs,
+                        raw_step=None,
+                        applied_step=None,
+                        step_abs=0.0,
+                        clipped=False,
+                        damping=0.0,
+                        accepted=False,
+                        resulting_omega=_progress_complex(value),
+                        resulting_determinant_abs=magnitude,
+                        elapsed_seconds=time.monotonic() - iteration_started,
+                    )
                     break
-            else:
-                value -= 0.125 * step
+                raw_step = residual / derivative
+                step = raw_step
+                clipped = abs(step) > 6.0e-3
+                if clipped:
+                    step *= 6.0e-3 / abs(step)
+                accepted = False
+                selected_damping = 0.125
+                resulting_abs = magnitude
+                for damping in (1.0, 0.5, 0.25, 0.125):
+                    candidate = value - damping * step
+                    candidate_residual = evaluated(
+                        candidate, f"damping {damping:g}", value
+                    )
+                    candidate_abs = abs(candidate_residual)
+                    emit_progress(
+                        ProgressEventKind.DAMPING_DECIDED,
+                        damping=damping,
+                        candidate_omega=_progress_complex(candidate),
+                        candidate_determinant_abs=candidate_abs,
+                        accepted=candidate_abs < magnitude,
+                    )
+                    if candidate_abs < magnitude:
+                        value = candidate
+                        selected_damping = damping
+                        resulting_abs = candidate_abs
+                        accepted = True
+                        break
+                if not accepted:
+                    value -= 0.125 * step
+                    resulting_abs = candidate_abs
+                applied_step = selected_damping * step
+                emit_progress(
+                    ProgressEventKind.NEWTON_ITERATION_COMPLETED,
+                    derivative_abs=derivative_abs,
+                    raw_step=_progress_complex(raw_step),
+                    applied_step=_progress_complex(applied_step),
+                    step_abs=abs(applied_step),
+                    clipped=clipped,
+                    damping=selected_damping,
+                    accepted=accepted,
+                    resulting_omega=_progress_complex(value),
+                    resulting_determinant_abs=resulting_abs,
+                    elapsed_seconds=time.monotonic() - iteration_started,
+                )
         return best[0], best[1], best[1] < 2.0e-11
 
     def _solve_once(
@@ -412,8 +571,37 @@ class VettedNativeDeterminantKernel:
         )
         root, residual, converged = self._bounded_newton(determinant, guess)
         h = _DERIVATIVE_STEP * (1.0 + abs(root))
+
+        def final_determinant(omega: complex, purpose: str) -> complex:
+            started = time.monotonic()
+            with progress_scope(
+                determinant_purpose=purpose,
+                current_omega=_progress_complex(root),
+                candidate_omega=_progress_complex(omega),
+            ):
+                emit_progress(
+                    ProgressEventKind.DETERMINANT_STARTED,
+                    purpose=purpose,
+                    omega=_progress_complex(omega),
+                )
+                result = determinant(omega)
+                emit_progress(
+                    ProgressEventKind.DETERMINANT_COMPLETED,
+                    purpose=purpose,
+                    omega=_progress_complex(omega),
+                    determinant_real=result.real,
+                    determinant_imag=result.imag,
+                    determinant_abs=abs(result),
+                    elapsed_seconds=time.monotonic() - started,
+                )
+                return result
+
         derivative = abs(
-            (determinant(root + h) - determinant(root - h)) / (2.0 * h)
+            (
+                final_determinant(root + h, "final derivative +h")
+                - final_determinant(root - h, "final derivative -h")
+            )
+            / (2.0 * h)
         )
         if not math.isfinite(derivative) or derivative <= 0.0:
             raise NativeResourceUnavailableError(
@@ -429,24 +617,48 @@ class VettedNativeDeterminantKernel:
         perturbation: HorizonPerturbation | ExteriorPerturbation,
         policy: NumericalPolicy,
     ) -> RootReadout:
+        def solve_phase(name, sn, phase_policy, guess):
+            started = time.monotonic()
+            with progress_scope(
+                phase=name,
+                seed_omega=_progress_complex(guess),
+                current_omega=_progress_complex(guess),
+            ):
+                emit_progress(
+                    ProgressEventKind.ROOT_PHASE_STARTED,
+                    seed_omega=_progress_complex(guess),
+                    current_omega=_progress_complex(guess),
+                )
+                result = self._solve_once(
+                    sn=sn,
+                    job=job,
+                    perturbation=perturbation,
+                    policy=phase_policy,
+                    guess=guess,
+                )
+                emit_progress(
+                    ProgressEventKind.ROOT_PHASE_COMPLETED,
+                    resulting_omega=_progress_complex(result[0]),
+                    resulting_determinant_abs=result[1],
+                    derivative_abs=result[2],
+                    converged=result[3],
+                    elapsed_seconds=time.monotonic() - started,
+                )
+                return result
+
         primary_sn = self._standard_sn(job, policy)
-        root, residual, derivative, primary_converged = self._solve_once(
-            sn=primary_sn,
-            job=job,
-            perturbation=perturbation,
-            policy=policy,
-            guess=background_root.omega,
+        root, residual, derivative, primary_converged = solve_phase(
+            "PRIMARY", primary_sn, policy, background_root.omega
         )
 
         truncation_policy = replace(
             policy, endpoint_series_order=policy.endpoint_series_order + 8
         )
-        truncation_root, _, _, truncation_converged = self._solve_once(
-            sn=self._standard_sn(job, truncation_policy),
-            job=job,
-            perturbation=perturbation,
-            policy=truncation_policy,
-            guess=root,
+        truncation_root, _, _, truncation_converged = solve_phase(
+            "TRUNCATION",
+            self._standard_sn(job, truncation_policy),
+            truncation_policy,
+            root,
         )
 
         resolution_policy = replace(
@@ -455,23 +667,18 @@ class VettedNativeDeterminantKernel:
             ode_absolute_tolerance=policy.ode_absolute_tolerance / 2.0,
             support_subinterval_count=policy.support_subinterval_count * 2,
         )
-        resolution_root, _, _, resolution_converged = self._solve_once(
-            sn=self._standard_sn(job, resolution_policy),
-            job=job,
-            perturbation=perturbation,
-            policy=resolution_policy,
-            guess=root,
+        resolution_root, _, _, resolution_converged = solve_phase(
+            "RESOLUTION",
+            self._standard_sn(job, resolution_policy),
+            resolution_policy,
+            root,
         )
 
         alternate_guess = background_root.omega + complex(2.5e-4, 1.25e-4) * (
             1.0 + abs(background_root.omega)
         )
-        seed_path_root, _, _, seed_path_converged = self._solve_once(
-            sn=primary_sn,
-            job=job,
-            perturbation=perturbation,
-            policy=policy,
-            guess=alternate_guess,
+        seed_path_root, _, _, seed_path_converged = solve_phase(
+            "SEED-PATH", primary_sn, policy, alternate_guess
         )
         diagnostic_roots = (truncation_root, resolution_root, seed_path_root)
         branch_continuation_valid = (
@@ -519,18 +726,47 @@ class VettedNativeDeterminantKernel:
         omega = background_root.omega
         h = _DERIVATIVE_STEP * (1.0 + abs(omega))
         zero = HorizonPerturbation(0.0j, job.spin, job.mode.m)
+
+        def partial_determinant(candidate: complex, purpose: str) -> complex:
+            started = time.monotonic()
+            with progress_scope(
+                phase="CLOSED-FORM-PARTIALS",
+                determinant_purpose=purpose,
+                seed_omega=_progress_complex(omega),
+                current_omega=_progress_complex(omega),
+                candidate_omega=_progress_complex(candidate),
+            ):
+                emit_progress(
+                    ProgressEventKind.DETERMINANT_STARTED,
+                    purpose=purpose,
+                    omega=_progress_complex(candidate),
+                )
+                result = self._determinant(sn, candidate, zero, policy)
+                emit_progress(
+                    ProgressEventKind.DETERMINANT_COMPLETED,
+                    purpose=purpose,
+                    omega=_progress_complex(candidate),
+                    determinant_real=result.real,
+                    determinant_imag=result.imag,
+                    determinant_abs=abs(result),
+                    elapsed_seconds=time.monotonic() - started,
+                )
+                return result
+
         frequency = (
-            self._determinant(sn, omega + h, zero, policy)
-            - self._determinant(sn, omega - h, zero, policy)
+            partial_determinant(omega + h, "closed-form derivative +h")
+            - partial_determinant(omega - h, "closed-form derivative -h")
         ) / (2.0 * h)
-        outgoing, _ = sn.outgoing_at(omega, policy.readout_radius)
+        with _progress_suboperation("Xup"):
+            outgoing, _ = sn.outgoing_at(omega, policy.readout_radius)
         outgoing_horizon = self._integrate_horizon_branch(
             sn, omega, +1, policy.readout_radius
         )
-        reflectivity_partial = sn.wfac(policy.readout_radius) * (
-            outgoing_horizon[0] * outgoing[1]
-            - outgoing_horizon[1] * outgoing[0]
-        )
+        with _progress_suboperation("Wronskian"):
+            reflectivity_partial = sn.wfac(policy.readout_radius) * (
+                outgoing_horizon[0] * outgoing[1]
+                - outgoing_horizon[1] * outgoing[0]
+            )
         horizon_frequency = omega - job.mode.m * sn.OmH
         if horizon_frequency == 0.0j:
             coordinate = complex(math.nan, math.nan)

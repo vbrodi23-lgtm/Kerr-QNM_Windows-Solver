@@ -94,6 +94,9 @@ _INTEGER_CONTEXT_KEYS = frozenset(
         "newton_index",
         "newton_limit",
         "determinant_index",
+        "determinant_index_leaf",
+        "determinant_index_phase",
+        "determinant_index_newton",
     }
 )
 _FLOAT_CONTEXT_KEYS = frozenset({"spin", "epsilon"})
@@ -110,7 +113,15 @@ _STRING_CONTEXT_KEYS = frozenset(
     }
 )
 _MAPPING_CONTEXT_KEYS = frozenset(
-    {"mode", "sampling_coordinate", "bound_omega", "amplitude"}
+    {
+        "mode",
+        "sampling_coordinate",
+        "bound_omega",
+        "seed_omega",
+        "current_omega",
+        "candidate_omega",
+        "amplitude",
+    }
 )
 
 
@@ -150,6 +161,9 @@ class ProgressContext:
     sampling_coordinate: Mapping[str, object] | None = None
     mechanism_id: str | None = None
     bound_omega: Mapping[str, object] | None = None
+    seed_omega: Mapping[str, object] | None = None
+    current_omega: Mapping[str, object] | None = None
+    candidate_omega: Mapping[str, object] | None = None
     precision_digits: int | None = None
     component_pass: str | None = None
     readout_index: int | None = None
@@ -160,6 +174,9 @@ class ProgressContext:
     newton_index: int | None = None
     newton_limit: int | None = None
     determinant_index: int | None = None
+    determinant_index_leaf: int | None = None
+    determinant_index_phase: int | None = None
+    determinant_index_newton: int | None = None
     determinant_purpose: str | None = None
     suboperation: str | None = None
 

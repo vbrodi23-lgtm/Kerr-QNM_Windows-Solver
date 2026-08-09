@@ -23,6 +23,7 @@ import platform
 import re
 import sys
 import tempfile
+import time
 from typing import Any, Callable, Mapping, Protocol, Sequence
 
 from .contracts import (
@@ -45,6 +46,7 @@ from .spectrum import (
     SpectralCatalogProvider,
     load_spectrum_catalog,
 )
+from .progress import ProgressEventKind, emit_progress, progress_scope
 
 
 ENGINE_SCHEMA_VERSION = 1
@@ -1139,7 +1141,39 @@ def run_component(
     binder = getattr(backend, "bind_job", None)
     if binder is not None:
         job = binder(job)
-    baseline = backend.read_root(job, 0.0j)
+    readout_index = 0
+
+    def read_root(role: str, amplitude: complex, epsilon: float | None) -> RootReadout:
+        nonlocal readout_index
+        readout_index += 1
+        converted = complex(amplitude)
+        amplitude_mapping = {
+            "real": converted.real,
+            "imaginary": converted.imag,
+        }
+        with progress_scope(
+            readout_index=readout_index,
+            readout_role=role,
+            epsilon=epsilon,
+            amplitude=amplitude_mapping,
+        ):
+            started = time.monotonic()
+            emit_progress(ProgressEventKind.AMPLITUDE_READOUT_STARTED)
+            result = backend.read_root(job, converted)
+            emit_progress(
+                ProgressEventKind.AMPLITUDE_READOUT_COMPLETED,
+                current_omega={
+                    "real": result.omega.real,
+                    "imaginary": result.omega.imag,
+                },
+                determinant_abs=result.determinant_residual_abs,
+                derivative_abs=result.determinant_derivative_abs,
+                converged=result.converged,
+                elapsed_seconds=time.monotonic() - started,
+            )
+            return result
+
+    baseline = read_root("baseline", 0.0j, None)
     initial_status = _identity_status(job, baseline)
     if initial_status is not None:
         return _validated_result(
@@ -1154,10 +1188,14 @@ def run_component(
     for epsilon in job.policy.epsilons:
         level = LadderLevel(
             epsilon=epsilon,
-            real_plus=backend.read_root(job, complex(epsilon, 0.0)),
-            real_minus=backend.read_root(job, complex(-epsilon, 0.0)),
-            imaginary_plus=backend.read_root(job, complex(0.0, epsilon)),
-            imaginary_minus=backend.read_root(job, complex(0.0, -epsilon)),
+            real_plus=read_root("real-plus", complex(epsilon, 0.0), epsilon),
+            real_minus=read_root("real-minus", complex(-epsilon, 0.0), epsilon),
+            imaginary_plus=read_root(
+                "imaginary-plus", complex(0.0, epsilon), epsilon
+            ),
+            imaginary_minus=read_root(
+                "imaginary-minus", complex(0.0, -epsilon), epsilon
+            ),
         )
         levels.append(level)
         for readout in (

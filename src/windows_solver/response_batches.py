@@ -15,6 +15,7 @@ import os
 from pathlib import Path, PureWindowsPath
 import re
 import tempfile
+import time
 from typing import Mapping, Sequence
 
 from .contracts import canonical_json_bytes
@@ -42,6 +43,7 @@ from .julia_response_backend import (
     JuliaResponseAdapter,
     JuliaResponseBackendError,
 )
+from .progress import ProgressEventKind, emit_progress, progress_scope
 
 
 CAMPAIGN_SCHEMA_VERSION = 2
@@ -1477,7 +1479,127 @@ def _execute_campaign_stage(
     return execute(leaf, digits)
 
 
+def _complex_progress(value: complex) -> dict[str, float]:
+    return {"real": complex(value).real, "imaginary": complex(value).imag}
+
+
+def _leaf_progress_context(
+    leaf: CampaignLeafPlan, index: int, count: int
+) -> dict[str, object]:
+    return {
+        "leaf_index": index,
+        "leaf_count": count,
+        "leaf_id": leaf.leaf_id,
+        "role": leaf.role,
+        "mode": {
+            "s": leaf.job.mode.s,
+            "ell": leaf.job.mode.ell,
+            "m": leaf.job.mode.m,
+            "n": leaf.job.mode.n,
+        },
+        "spin": leaf.job.spin,
+        "sampling_coordinate": leaf.job.sampling_coordinate.to_mapping(),
+        "mechanism_id": leaf.mechanism_id,
+        "bound_omega": _complex_progress(leaf.job.root.omega),
+        "seed_omega": _complex_progress(leaf.job.root.omega),
+    }
+
+
+def _execute_campaign_stage_with_progress(
+    backend: object,
+    leaf: CampaignLeafPlan,
+    digits: int,
+    context: Mapping[str, object],
+    previous_stages: Sequence[CampaignStageRecord] = (),
+) -> tuple[StageOutcome, float]:
+    component_pass = "primary" if digits == 64 else "promoted"
+    started = time.monotonic()
+    with progress_scope(
+        **context,
+        precision_digits=digits,
+        component_pass=component_pass,
+    ):
+        emit_progress(ProgressEventKind.PRECISION_STAGE_STARTED)
+        try:
+            outcome = _execute_campaign_stage(
+                backend, leaf, digits, previous_stages
+            )
+        except BaseException as error:
+            emit_progress(
+                ProgressEventKind.LEAF_FAILED,
+                precision_digits=digits,
+                error_type=type(error).__name__,
+                message=str(error),
+                elapsed_seconds=time.monotonic() - started,
+            )
+            raise
+    return outcome, time.monotonic() - started
+
+
+def _checkpoint_stage_with_progress(
+    path: Path,
+    mapping: Mapping[str, object],
+    *,
+    context: Mapping[str, object],
+    digits: int,
+    duration_seconds: float,
+    record: CampaignLeafRecord,
+) -> None:
+    component_pass = "primary" if digits == 64 else "promoted"
+    with progress_scope(
+        **context,
+        precision_digits=digits,
+        component_pass=component_pass,
+    ):
+        emit_progress(ProgressEventKind.CHECKPOINT_WRITING)
+        _atomic_json(path, mapping)
+        emit_progress(ProgressEventKind.CHECKPOINT_WRITTEN)
+        emit_progress(
+            ProgressEventKind.PRECISION_STAGE_COMPLETED,
+            duration_seconds=duration_seconds,
+            numerical_state=record.stages[-1].outcome.numerical_state,
+            leaf_state=record.state,
+        )
+
+
 def run_campaign_selection(
+    plan: CampaignPlan,
+    selection: CampaignSelection,
+    backend: object,
+    checkpoint_path: str | os.PathLike[str] | Path,
+    *,
+    resume: bool,
+) -> CampaignRunSummary:
+    emit_progress(
+        ProgressEventKind.CAMPAIGN_STARTED,
+        campaign_id=plan.campaign_id,
+        selection_id=selection.selection_id,
+        leaf_count=len(selection.leaf_ids),
+        resume=resume,
+    )
+    try:
+        summary = _run_campaign_selection_active(
+            plan, selection, backend, checkpoint_path, resume=resume
+        )
+    except BaseException as error:
+        emit_progress(
+            ProgressEventKind.CAMPAIGN_FAILED,
+            error_type=type(error).__name__,
+            message=str(error),
+        )
+        raise
+    emit_progress(
+        ProgressEventKind.CAMPAIGN_COMPLETED,
+        state=summary.state,
+        executed_stage_count=summary.executed_stage_count,
+        reused_stage_count=summary.reused_stage_count,
+        result_count=summary.result_count,
+        checkpoint_path=summary.checkpoint_path,
+    )
+    return summary
+
+
+def _run_campaign_selection_active(
     plan: CampaignPlan,
     selection: CampaignSelection,
     backend: object,
@@ -1513,14 +1635,25 @@ def run_campaign_selection(
     executed = 0
     leaf_by_id = {leaf.leaf_id: leaf for leaf in plan.leaves}
     for index, leaf_id in enumerate(selection.leaf_ids):
+        leaf = leaf_by_id[leaf_id]
+        context = _leaf_progress_context(leaf, index + 1, len(selection.leaf_ids))
         if index < len(records) and records[index].state in {
             "PRODUCED", "UNRESOLVED"
         }:
+            with progress_scope(**context):
+                emit_progress(
+                    ProgressEventKind.LEAF_REUSED,
+                    state=records[index].state,
+                    stage_count=len(records[index].stages),
+                )
             continue
-        leaf = leaf_by_id[leaf_id]
+        with progress_scope(**context):
+            emit_progress(ProgressEventKind.LEAF_STARTED)
         record = records[index] if index < len(records) else None
         if record is None:
-            outcome = _execute_campaign_stage(backend, leaf, 64)
+            outcome, stage_duration = _execute_campaign_stage_with_progress(
+                backend, leaf, 64, context
+            )
             if not isinstance(outcome, StageOutcome) or outcome.digits != 64:
                 raise ValueError("campaign backend returned an invalid binary64 stage")
             executed += 1
@@ -1555,15 +1688,28 @@ def run_campaign_selection(
                     ),
                 )
             _replace_record(records, index, record)
-            _atomic_json(path, _checkpoint_mapping(plan, selection, records))
+            _checkpoint_stage_with_progress(
+                path,
+                _checkpoint_mapping(plan, selection, records),
+                context=context,
+                digits=64,
+                duration_seconds=stage_duration,
+                record=record,
+            )
 
         if record.state in {"PRODUCED", "UNRESOLVED"}:
+            with progress_scope(**context):
+                emit_progress(
+                    ProgressEventKind.LEAF_COMPLETED,
+                    state=record.state,
+                    stage_count=len(record.stages),
+                )
             continue
         if len(record.stages) == 1:
             if 80 not in available.digits:
                 continue
-            outcome80 = _execute_campaign_stage(
-                backend, leaf, 80, record.stages
+            outcome80, stage_duration = _execute_campaign_stage_with_progress(
+                backend, leaf, 80, context, record.stages
             )
             if (
                 not isinstance(outcome80, StageOutcome)
@@ -1604,7 +1750,14 @@ def run_campaign_selection(
                         sentinel_comparison=comparison,
                     )
                     _replace_record(records, index, record)
-                    _atomic_json(path, _checkpoint_mapping(plan, selection, records))
+                    _checkpoint_stage_with_progress(
+                        path,
+                        _checkpoint_mapping(plan, selection, records),
+                        context=context,
+                        digits=80,
+                        duration_seconds=stage_duration,
+                        record=record,
+                    )
             if false_negative:
                 pass
             elif outcome80.self_refinement_enclosed:
@@ -1633,15 +1786,28 @@ def run_campaign_selection(
                     sentinel_comparison=comparison,
                 )
                 _replace_record(records, index, record)
-                _atomic_json(path, _checkpoint_mapping(plan, selection, records))
+                _checkpoint_stage_with_progress(
+                    path,
+                    _checkpoint_mapping(plan, selection, records),
+                    context=context,
+                    digits=80,
+                    duration_seconds=stage_duration,
+                    record=record,
+                )
 
         if record.state in {"PRODUCED", "UNRESOLVED"}:
+            with progress_scope(**context):
+                emit_progress(
+                    ProgressEventKind.LEAF_COMPLETED,
+                    state=record.state,
+                    stage_count=len(record.stages),
+                )
             continue
         if len(record.stages) == 2:
             if 120 not in available.digits:
                 continue
-            outcome120 = _execute_campaign_stage(
-                backend, leaf, 120, record.stages
+            outcome120, stage_duration = _execute_campaign_stage_with_progress(
+                backend, leaf, 120, context, record.stages
             )
             if (
                 not isinstance(outcome120, StageOutcome)
@@ -1672,7 +1838,21 @@ def run_campaign_selection(
                 sentinel_comparison=record.sentinel_comparison,
             )
             _replace_record(records, index, record)
-            _atomic_json(path, _checkpoint_mapping(plan, selection, records))
+            _checkpoint_stage_with_progress(
+                path,
+                _checkpoint_mapping(plan, selection, records),
+                context=context,
+                digits=120,
+                duration_seconds=stage_duration,
+                record=record,
+            )
+        if record.state in {"PRODUCED", "UNRESOLVED"}:
+            with progress_scope(**context):
+                emit_progress(
+                    ProgressEventKind.LEAF_COMPLETED,
+                    state=record.state,
+                    stage_count=len(record.stages),
+                )
     mapping = _checkpoint_mapping(plan, selection, records)
     return CampaignRunSummary(
         campaign_id=plan.campaign_id,
@@ -2035,6 +2215,33 @@ def _native_deep_diagnostics(
     }
 
 
+def _run_component_with_progress(
+    job: ResponseComponentJob, backend: object, component_pass: str
+) -> ComponentResult:
+    started = time.monotonic()
+    with progress_scope(component_pass=component_pass):
+        emit_progress(ProgressEventKind.COMPONENT_PASS_STARTED)
+        try:
+            result = run_component(job, backend)  # type: ignore[arg-type]
+        except BaseException as error:
+            emit_progress(
+                ProgressEventKind.ERROR,
+                component_pass=component_pass,
+                error_type=type(error).__name__,
+                message=str(error),
+                elapsed_seconds=time.monotonic() - started,
+            )
+            raise
+        emit_progress(
+            ProgressEventKind.COMPONENT_PASS_COMPLETED,
+            component_pass=component_pass,
+            status=result.status.value,
+            readout_count=len(result.raw_readouts),
+            elapsed_seconds=time.monotonic() - started,
+        )
+        return result
+
+
 class NativeCampaignStageBackend:
     """Package-owned binary64 and Julia BigFloat M02 campaign backend."""
 
@@ -2101,7 +2308,9 @@ class NativeCampaignStageBackend:
             raise NativeResourceUnavailableError(
                 "promoted precision must use execute_promoted_stage"
             )
-        result = run_component(leaf.job, self.adapter)
+        result = _run_component_with_progress(
+            leaf.job, self.adapter, "primary"
+        )
         component_result = {
             "evidence_kind": "native-task-008-component-engine",
             "result": result.to_mapping(),
@@ -2141,7 +2350,9 @@ class NativeCampaignStageBackend:
         primary_backend = JuliaPrecisionRootBackend(
             self.identity, self.julia_adapter, digits
         )
-        result = run_component(leaf.job, primary_backend)
+        result = _run_component_with_progress(
+            leaf.job, primary_backend, "primary"
+        )
         previous_result = ComponentResult.from_mapping(
             previous_outcomes[-1].component_result["result"]
         )
@@ -2158,7 +2369,9 @@ class NativeCampaignStageBackend:
             repeat_backend = JuliaPrecisionRootBackend(
                 self.identity, self.julia_adapter, digits, refinement=1
             )
-            repeat_result = run_component(leaf.job, repeat_backend)
+            repeat_result = _run_component_with_progress(
+                leaf.job, repeat_backend, "self-refinement"
+            )
             repeat_delta = _component_result_delta(repeat_result, result)
             repeat_radius = sum(repeat_result.error_channels.values())
             self_refinement_enclosed = (
