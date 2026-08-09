@@ -211,13 +211,52 @@ class PublicSurfaceTests(unittest.TestCase):
             "Verified Julia archive contains no julia.exe.",
             julia_install,
         )
+        self.assertNotIn("Expand-Archive", julia_install)
+
+    def test_m02_bootstrap_installs_julia_by_renaming_the_extracted_tree(
+        self,
+    ) -> None:
+        root = Path(__file__).resolve().parents[1]
+        bootstrap = (root / "runtime" / "bootstrap.ps1").read_text(
+            encoding="utf-8"
+        )
+        julia_install = bootstrap[
+            bootstrap.index(
+                'if (-not (Test-Path -LiteralPath $JuliaExe -PathType Leaf))'
+            ) : bootstrap.index("\n    $JuliaIdentity")
+        ]
+        move = (
+            "Move-Item -LiteralPath $ExtractedJuliaRoot "
+            "-Destination $JuliaRoot"
+        )
+        installed_runtime_check = (
+            "if (-not (Test-Path -LiteralPath $JuliaExe -PathType Leaf))"
+        )
+
+        self.assertIn(move, julia_install)
+        self.assertNotIn(
+            "Copy-Item -LiteralPath $ExtractedJuliaRoot",
+            julia_install,
+        )
+        self.assertIn(installed_runtime_check, julia_install)
+        self.assertIn(
+            "Installed Julia runtime contains no julia.exe.",
+            julia_install,
+        )
         self.assertLess(
             julia_install.index('if ($null -eq $FoundJulia)'),
+            julia_install.index(move),
+        )
+        self.assertLess(
+            julia_install.index(move),
+            julia_install.index(installed_runtime_check),
+        )
+        self.assertLess(
+            julia_install.index(installed_runtime_check),
             julia_install.index(
-                "Copy-Item -LiteralPath $ExtractedJuliaRoot"
+                "Could not remove Julia extraction directory after installation"
             ),
         )
-        self.assertNotIn("Expand-Archive", julia_install)
 
     def test_force_reprovision_uses_long_path_safe_runtime_cleanup(self) -> None:
         root = Path(__file__).resolve().parents[1]
