@@ -48,18 +48,29 @@ handoff](docs/m02-admission-powershell.md).
 ## Quick start on Windows
 
 Clone or unpack the repository, open a 64-bit PowerShell in it, and provision a
-package-local runtime once:
+per-user managed runtime once:
 
 ```powershell
 Set-ExecutionPolicy -Scope Process Bypass -Force
 .\runtime\bootstrap.ps1
 ```
 
-The bootstrap installs a pinned CPython 3.12.13 into `.runtime\` inside the
-repository. It requires no administrator rights, writes nothing outside the
-repository, adds no registry entry, and does not modify `PATH`. `.runtime\` is
-git-ignored, and deleting it fully uninstalls the runtime. If you already have a
-64-bit CPython 3.12 or newer on `PATH`, the bootstrap is optional.
+The normal runtime lives under
+`%LOCALAPPDATA%\Kerr-QNM_Windows-Solver\runtime-1\`, requires no administrator
+rights, adds no registry entry, and does not modify `PATH`. It persists when a
+solver ZIP is deleted or re-extracted. The bootstrap validates a healthy,
+64-bit CPython 3.12.13 first; if one is available it is used only as the source
+for the solver-owned virtual environment. Pinned NumPy/SciPy are installed only
+inside that environment, never into the system interpreter. A solver-managed
+CPython is downloaded only when no compatible interpreter exists.
+
+Use checkout-local runtime bytes only when portability is explicitly needed:
+
+```powershell
+.\runtime\bootstrap.ps1 -PortableRuntime
+```
+
+That mode uses the git-ignored `.runtime\` folder beside the checkout.
 
 ```powershell
 .\solver.ps1 plan .\examples\evidence-plan.json
@@ -76,9 +87,12 @@ additionally need the pinned NumPy and SciPy:
 .\runtime\bootstrap.ps1 -WithNumericalKernel
 ```
 
-The physical M02 campaign has a single stronger bootstrap tier. It provisions
-the numerical kernel plus portable Julia 1.10.11, the packaged GSN equations,
-and the package-owned 80/120-digit worker. The complete 553-leaf campaign is a
+The physical M02 campaign has a single stronger bootstrap tier. It validates an
+exact Julia 1.10.11 from the managed runtime, an existing system installation,
+or Juliaup before downloading solver-managed Julia. It then reuses or provisions
+the pinned numerical environment, contract-addressed persistent GSN/spheroidal
+source copies, M02 project, Julia depot/packages/artifacts/compiled cache, and
+the package-owned 80/120-digit worker. The complete 553-leaf campaign is a
 single resumable command:
 
 ```powershell
@@ -87,11 +101,15 @@ single resumable command:
 
 On its first invocation the launcher bootstraps the runtime, generates the
 required exact F/U records, starts `campaign-run`, and validates the completed
-checkpoint. Later invocations use `campaign-resume` against the same checkpoint.
-No historic cache, external precision plugin, cache digest, or source digest is
-an execution prerequisite.
+checkpoint. Later invocations cheaply validate receipts and executable health,
+reuse a compatible runtime and M02 environment, validate/reuse individual GSN
+pairs, and use `campaign-resume` against the same checkpoint. No historic cache,
+external precision plugin, cache digest, or source digest is an execution
+prerequisite.
 
-Generated coefficients live under `.runtime\generated\gsn\`. The
+Generated coefficients live under the managed runtime's source-contract-scoped
+`generated\gsn\<contract-id>` directory (normally
+`%LOCALAPPDATA%\Kerr-QNM_Windows-Solver\runtime-1\generated\gsn\`). The
 `gsn-index.json` registry maps each scientific identity—spin weight, resolved
 `a/M`, binary64 campaign value, `m`, normalization, equation convention, and
 producer/consumer contract versions—to a short pair artifact such as
@@ -102,21 +120,19 @@ and coefficient artifact itself. Missing or invalid records regenerate
 independently; measured SHA-256 values are recorded as observations only during
 development.
 
-To discard all development runtime state and reprovision from the repository,
-use:
+To discard the persistent managed runtime and explicitly reprovision it, use:
 
 ```powershell
 .\m02.ps1 -RebuildRuntime
 ```
 
-The launcher resolves an interpreter in this order: the bootstrap virtual
-environment at `.runtime\venv\Scripts\python.exe`, a bundled runtime at
-`.runtime\python\python.exe`, an active `python` that is 3.12 or newer, then
-the runtime selected by the Windows `py -3` launcher when that runtime is 3.12
-or newer. Version probes report failure through the exit code alone, so a
-candidate that writes to stderr — notably the Windows App Execution Alias stub
-for `python.exe` — is skipped rather than aborting the launcher, and probe
-output never reaches command JSON.
+The launcher resolves the virtual environment declared by the validated runtime
+receipt first, then its recorded interpreter source, an active `python` that is
+3.12 or newer, and finally the runtime selected by the Windows `py -3`
+launcher when that runtime is 3.12 or newer. Version probes report failure
+through the exit code alone, so a candidate that writes to stderr — notably the
+Windows App Execution Alias stub for `python.exe` — is skipped rather than
+aborting the launcher, and probe output never reaches command JSON.
 
 The equivalent Python commands are:
 

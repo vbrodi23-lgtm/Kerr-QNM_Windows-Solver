@@ -1,9 +1,17 @@
+[CmdletBinding(PositionalBinding = $false)]
 param(
+    [switch]$PortableRuntime,
+    [string]$RuntimeRoot,
     [Parameter(ValueFromRemainingArguments = $true)]
     [string[]]$SolverArguments
 )
 
 $ErrorActionPreference = "Stop"
+$PackageRoot = $PSScriptRoot
+. (Join-Path $PackageRoot "runtime\resolve-runtime-root.ps1")
+$ResolvedRuntimeRoot = Resolve-KerrQnmRuntimeRoot -PackageRoot $PackageRoot `
+    -PortableRuntime:$PortableRuntime -OverrideRoot $RuntimeRoot
+Set-KerrQnmRuntimeRoot $ResolvedRuntimeRoot
 $SourceDirectory = Join-Path $PSScriptRoot "src"
 if ($env:PYTHONPATH) {
     $env:PYTHONPATH = "$SourceDirectory;$env:PYTHONPATH"
@@ -12,8 +20,26 @@ else {
     $env:PYTHONPATH = $SourceDirectory
 }
 
-$BootstrapPython = Join-Path $PSScriptRoot ".runtime\venv\Scripts\python.exe"
-$BundledPython = Join-Path $PSScriptRoot ".runtime\python\python.exe"
+$BootstrapPython = $null
+$BundledPython = $null
+$RuntimeReceiptPath = Join-Path $ResolvedRuntimeRoot "python-runtime.json"
+if (Test-Path -LiteralPath $RuntimeReceiptPath -PathType Leaf) {
+    try {
+        $RuntimeReceipt = Get-Content -LiteralPath $RuntimeReceiptPath -Raw | ConvertFrom-Json
+        if ($null -ne $RuntimeReceipt.python -and -not [string]::IsNullOrWhiteSpace($RuntimeReceipt.python.venv)) {
+            $BootstrapPython = Join-Path ([string]$RuntimeReceipt.python.venv) "Scripts\python.exe"
+        }
+        if ($null -ne $RuntimeReceipt.python -and -not [string]::IsNullOrWhiteSpace($RuntimeReceipt.python.source_executable)) {
+            $BundledPython = [string]$RuntimeReceipt.python.source_executable
+        }
+    }
+    catch {
+        # A malformed receipt is not trusted.  Fall through to explicit user
+        # interpreters and let the bootstrap rebuild the managed environment.
+        $BootstrapPython = $null
+        $BundledPython = $null
+    }
+}
 function Test-Python312 {
     param(
         [string]$Executable,
@@ -41,7 +67,7 @@ function Test-Python312 {
 $PythonExecutable = $null
 $PythonPrefixArguments = @()
 foreach ($Candidate in @($BootstrapPython, $BundledPython)) {
-    if ((Test-Path $Candidate) -and (Test-Python312 -Executable $Candidate -PrefixArguments @())) {
+    if ($null -ne $Candidate -and (Test-Path $Candidate) -and (Test-Python312 -Executable $Candidate -PrefixArguments @())) {
         $PythonExecutable = $Candidate
         break
     }
@@ -64,9 +90,12 @@ if (-not $PythonExecutable) {
     throw @"
 Python 3.12 or newer is required and was not found.
 
-Provision a package-local runtime without installing anything system-wide:
+Provision a persistent per-user runtime without installing anything system-wide:
 
     .\runtime\bootstrap.ps1
+
+Use `-PortableRuntime` only when a checkout-local `.runtime` is specifically
+required.
 
 If 'python' on PATH prints "Python was not found; run without arguments to
 install from the Microsoft Store", that is the Windows App Execution Alias

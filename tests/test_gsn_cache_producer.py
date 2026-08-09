@@ -138,6 +138,45 @@ class _ProducerFixture:
 
 
 class GsnCacheProducerTests(unittest.TestCase):
+    def test_runtime_receipt_uses_persistent_gsn_sources_and_juliaup_channel(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = _ProducerFixture(Path(temporary))
+            fixture.runtime_root.mkdir()
+            receipt = {
+                "julia_runtime": {
+                    "requested": True,
+                    "executable": str(fixture.julia),
+                    "arguments": ["+1.10.11"],
+                    "gsn_producer": str(fixture.script),
+                    "gsn_source_root": str(fixture.source_root),
+                    "contract_id": "m02-" + "a" * 24,
+                }
+            }
+            (fixture.runtime_root / "python-runtime.json").write_text(
+                json.dumps(receipt), encoding="utf-8"
+            )
+            commands: list[tuple[str, ...]] = []
+
+            def runner(command, **kwargs):
+                commands.append(tuple(command))
+                return fixture.run(command, **kwargs)
+
+            generated = ensure_generated_gsn_cache(
+                (GsnParameterPair(1, 2, 2),),
+                runtime_root=fixture.runtime_root,
+                runner=runner,
+            )
+
+        self.assertEqual(
+            commands[0][:3],
+            (str(fixture.julia), "+1.10.11", "--startup-file=no"),
+        )
+        self.assertIn(str(fixture.script), commands[0])
+        self.assertIn(str(fixture.source_root), commands[0])
+        self.assertEqual(generated.path.parent.name, "m02-" + "a" * 24)
+
     def test_selected_leaf_retains_exact_resolved_spin_and_origin_coordinate(self) -> None:
         plan = _campaign_plan()
         selection = build_campaign_selection(

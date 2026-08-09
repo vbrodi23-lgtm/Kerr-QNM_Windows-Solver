@@ -40,6 +40,68 @@ class PublicSurfaceTests(unittest.TestCase):
         self.assertIn('$PythonPrefixArguments = @("-3")', launcher)
         self.assertNotIn('PrefixArguments @("-3.12")', launcher)
 
+    @unittest.skipUnless(os.name == "nt", "requires Windows PowerShell 5.1")
+    def test_solver_launcher_preserves_positional_command_arguments(self) -> None:
+        """Runtime options must not consume the public solver command position."""
+
+        root = Path(__file__).resolve().parents[1]
+        windows_powershell = Path(os.environ["SystemRoot"]).joinpath(
+            "System32", "WindowsPowerShell", "v1.0", "powershell.exe"
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            package_root = Path(temporary) / "solver-launcher-binding"
+            (package_root / "runtime").mkdir(parents=True)
+            (package_root / "src").mkdir()
+            shutil.copy2(root / "solver.ps1", package_root / "solver.ps1")
+            shutil.copy2(
+                root / "runtime" / "resolve-runtime-root.ps1",
+                package_root / "runtime" / "resolve-runtime-root.ps1",
+            )
+            argument_log = package_root / "solver-arguments.json"
+            (package_root / "src" / "windows_solver.py").write_text(
+                "import json\n"
+                "import os\n"
+                "import sys\n"
+                "from pathlib import Path\n"
+                "Path(os.environ['SOLVER_ARGUMENT_LOG']).write_text(\n"
+                "    json.dumps(sys.argv[1:]), encoding='utf-8'\n"
+                ")\n",
+                encoding="utf-8",
+            )
+            environment = dict(os.environ)
+            environment["KERR_QNM_RUNTIME_ROOT"] = str(package_root / "managed")
+            environment["SOLVER_ARGUMENT_LOG"] = str(argument_log)
+            result = subprocess.run(
+                [
+                    str(windows_powershell),
+                    "-NoLogo",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-File",
+                    str(package_root / "solver.ps1"),
+                    "plan",
+                    "study.json",
+                ],
+                cwd=package_root,
+                env=environment,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+
+            self.assertEqual(
+                result.returncode,
+                0,
+                f"stdout={result.stdout!r} stderr={result.stderr!r}",
+            )
+            self.assertEqual(
+                json.loads(argument_log.read_text(encoding="utf-8")),
+                ["plan", "study.json"],
+            )
+
     def test_launcher_probe_cannot_abort_on_a_stderr_writing_candidate(
         self,
     ) -> None:
@@ -64,12 +126,15 @@ class PublicSurfaceTests(unittest.TestCase):
         self.assertIn("$ErrorActionPreference = $previous", probe)
         self.assertIn("return $false", probe)
 
-    def test_bootstrap_provisions_the_launcher_preferred_interpreter(
+    def test_bootstrap_provisions_a_persistent_receipted_interpreter(
         self,
     ) -> None:
         root = Path(__file__).resolve().parents[1]
         launcher = (root / "solver.ps1").read_text(encoding="utf-8")
         bootstrap = (root / "runtime" / "bootstrap.ps1").read_text(
+            encoding="utf-8"
+        )
+        resolver = (root / "runtime" / "resolve-runtime-root.ps1").read_text(
             encoding="utf-8"
         )
         policy = json.loads(
@@ -81,11 +146,22 @@ class PublicSurfaceTests(unittest.TestCase):
             (root / "pyproject.toml").read_text(encoding="utf-8")
         )
 
-        # The launcher must prefer exactly the path the bootstrap creates.
-        self.assertIn(r".runtime\venv\Scripts\python.exe", launcher)
+        # The launcher follows the receipt written by the bootstrap rather
+        # than baking a source-checkout path into its executable preference.
+        self.assertIn("Resolve-KerrQnmRuntimeRoot", launcher)
+        self.assertIn('Join-Path $ResolvedRuntimeRoot "python-runtime.json"', launcher)
+        self.assertIn('$RuntimeReceipt.python.venv', launcher)
         self.assertIn(r'Join-Path $VenvRoot "Scripts\python.exe"', bootstrap)
-        self.assertIn(r'Join-Path $RuntimeRoot "venv"', bootstrap)
+        self.assertIn(r'Join-Path $RuntimeRoot "python-env', bootstrap)
+        self.assertIn("$NumericalEnvironmentId", bootstrap)
+        self.assertIn("Get-PythonIdentity", bootstrap)
+        self.assertIn("Test-NumericalKernel", bootstrap)
+        self.assertIn("source_kind", bootstrap)
         self.assertIn(r".\runtime\bootstrap.ps1", launcher)
+
+        self.assertIn("LOCALAPPDATA", resolver)
+        self.assertIn("Kerr-QNM_Windows-Solver\\runtime-1", resolver)
+        self.assertIn("[switch]$PortableRuntime", resolver)
 
         # The provisioned runtime must match the recorded spectral provenance.
         recorded = json.loads(
@@ -114,13 +190,14 @@ class PublicSurfaceTests(unittest.TestCase):
             ],
         )
 
-        # .runtime must stay untracked so the provisioned bytes never ship.
+        # Portable bytes remain untracked; the normal runtime is outside the
+        # repository and therefore cannot be accidentally packaged.
         self.assertIn(
             ".runtime/",
             (root / ".gitignore").read_text(encoding="utf-8").splitlines(),
         )
 
-    def test_m02_bootstrap_pins_package_local_julia_for_the_cache_producer(
+    def test_m02_bootstrap_pins_and_receipts_persistent_julia_contracts(
         self,
     ) -> None:
         root = Path(__file__).resolve().parents[1]
@@ -142,9 +219,16 @@ class PublicSurfaceTests(unittest.TestCase):
         )
         self.assertTrue(julia["url"].startswith("https://julialang-s3.julialang.org/"))
         self.assertIn("[switch]$WithM02", bootstrap)
-        self.assertIn(r'Join-Path $RuntimeRoot "julia"', bootstrap)
-        self.assertIn(r'Join-Path $JuliaRoot "bin\julia.exe"', bootstrap)
+        self.assertIn(r'Join-Path $RuntimeRoot "julia\$JuliaVersion"', bootstrap)
+        self.assertIn(r'Join-Path $ManagedJuliaRoot "bin\julia.exe"', bootstrap)
         self.assertIn("$Policy.julia.sha256", bootstrap)
+        self.assertIn("Get-JuliaCandidate", bootstrap)
+        self.assertIn("print(Sys.WORD_SIZE)", bootstrap)
+        self.assertIn('"juliaup"', bootstrap)
+        self.assertIn(r'Join-Path $RuntimeRoot "scientific-sources\$M02ContractId"', bootstrap)
+        self.assertIn(r'Join-Path $RuntimeRoot "m02-environments\$M02ContractId"', bootstrap)
+        self.assertIn(r'Join-Path $RuntimeRoot "julia-depot\$M02ContractId"', bootstrap)
+        self.assertIn("Test-PersistentScientificSources", bootstrap)
         self.assertIn("julia_runtime", bootstrap)
 
     def test_m02_bootstrap_extracts_julia_with_windows_tar(self) -> None:
@@ -152,40 +236,27 @@ class PublicSurfaceTests(unittest.TestCase):
         bootstrap = (root / "runtime" / "bootstrap.ps1").read_text(
             encoding="utf-8"
         )
-        julia_install = bootstrap[
-            bootstrap.index(
-                'if (-not (Test-Path -LiteralPath $JuliaExe -PathType Leaf))'
-            ) : bootstrap.index("\n    $JuliaIdentity")
-        ]
+        install_start = bootstrap.index('    if ($null -eq $JuliaCandidate) {\n        $JuliaArchive')
+        julia_install = bootstrap[install_start : bootstrap.index("\n    $SourceReceipts", install_start)]
 
         self.assertIn(
-            'cmd.exe /c rd /s /q "\\\\?\\$JuliaExtract"',
+            'Remove-ManagedDirectory $JuliaExtract "previous Julia extraction directory"',
             julia_install,
         )
         self.assertIn(
-            'cmd.exe /c rd /s /q "\\\\?\\$JuliaRoot"',
+            'Remove-ManagedDirectory $ManagedJuliaRoot "previous managed Julia runtime directory"',
             julia_install,
         )
         self.assertIn(
-            "Could not remove previous Julia extraction directory",
+            "Windows tar.exe is required to extract the managed Julia runtime.",
             julia_install,
         )
-        self.assertIn(
-            "Could not remove previous Julia runtime directory",
-            julia_install,
-        )
-        self.assertIn(
-            "Could not remove Julia extraction directory after installation",
-            julia_install,
-        )
-        self.assertEqual(julia_install.count("cmd.exe /c rd /s /q"), 3)
-        self.assertNotIn("Remove-Item -LiteralPath $Julia", julia_install)
         self.assertIn(
             'Get-Command tar.exe -ErrorAction SilentlyContinue',
             julia_install,
         )
         self.assertIn(
-            "Windows tar.exe is required to extract the portable Julia runtime.",
+            "Windows tar.exe is required to extract the managed Julia runtime.",
             julia_install,
         )
         self.assertIn(
@@ -196,10 +267,7 @@ class PublicSurfaceTests(unittest.TestCase):
             "Julia archive extraction failed with tar.exe exit code",
             julia_install,
         )
-        self.assertIn(
-            'New-Item -ItemType Directory -Force -Path $JuliaExtract',
-            julia_install,
-        )
+        self.assertIn('New-Item -ItemType Directory -Force -Path $JuliaExtract', julia_install)
         self.assertIn(
             'Get-ChildItem -LiteralPath $JuliaExtract -Filter "julia.exe"',
             julia_install,
@@ -219,10 +287,9 @@ class PublicSurfaceTests(unittest.TestCase):
         bootstrap = (root / "runtime" / "bootstrap.ps1").read_text(
             encoding="utf-8"
         )
+        m02_start = bootstrap.index("function Set-JuliaUtf8Console")
         m02_bootstrap = bootstrap[
-            bootstrap.index(
-                "$JuliaReceipt = [ordered]@{ requested = [bool]$WithM02 }"
-            ) : bootstrap.index("\n    $JuliaIdentity")
+            m02_start : bootstrap.index("\nfunction Get-JuliaCandidate", m02_start)
         ]
         chcp = "& $Chcp.Source 65001 | Out-Null"
         input_encoding = "[Console]::InputEncoding = $Utf8NoBom"
@@ -266,17 +333,14 @@ class PublicSurfaceTests(unittest.TestCase):
         bootstrap = (root / "runtime" / "bootstrap.ps1").read_text(
             encoding="utf-8"
         )
-        julia_install = bootstrap[
-            bootstrap.index(
-                'if (-not (Test-Path -LiteralPath $JuliaExe -PathType Leaf))'
-            ) : bootstrap.index("\n    $JuliaIdentity")
-        ]
+        install_start = bootstrap.index('    if ($null -eq $JuliaCandidate) {\n        $JuliaArchive')
+        julia_install = bootstrap[install_start : bootstrap.index("\n    $SourceReceipts", install_start)]
         move = (
             "Move-Item -LiteralPath $ExtractedJuliaRoot "
-            "-Destination $JuliaRoot"
+            "-Destination $ManagedJuliaRoot"
         )
         installed_runtime_check = (
-            "if (-not (Test-Path -LiteralPath $JuliaExe -PathType Leaf))"
+            "if ($null -eq $JuliaCandidate)"
         )
 
         self.assertIn(move, julia_install)
@@ -286,25 +350,17 @@ class PublicSurfaceTests(unittest.TestCase):
         )
         self.assertIn(installed_runtime_check, julia_install)
         self.assertIn(
-            "Installed Julia runtime contains no julia.exe.",
+            "Installed managed Julia runtime is absent or incompatible",
             julia_install,
         )
         move_index = julia_install.index(move)
-        installed_runtime_check_index = julia_install.index(
-            installed_runtime_check,
-            move_index,
-        )
+        installed_runtime_check_index = julia_install.index(installed_runtime_check, move_index)
         self.assertLess(
             julia_install.index('if ($null -eq $FoundJulia)'),
             move_index,
         )
         self.assertLess(move_index, installed_runtime_check_index)
-        self.assertLess(
-            installed_runtime_check_index,
-            julia_install.index(
-                "Could not remove Julia extraction directory after installation"
-            ),
-        )
+        self.assertLess(installed_runtime_check_index, len(julia_install))
 
     def test_force_reprovision_uses_long_path_safe_runtime_cleanup(self) -> None:
         root = Path(__file__).resolve().parents[1]
@@ -312,30 +368,30 @@ class PublicSurfaceTests(unittest.TestCase):
             encoding="utf-8"
         )
         force_cleanup = bootstrap[
-            bootstrap.index("if ($Force -and") : bootstrap.index(
-                "\nforeach ($path"
-            )
+            bootstrap.index("if ($Force -and") : bootstrap.index("\nforeach ($path")
         ]
 
         self.assertIn(
-            'cmd.exe /c rd /s /q "\\\\?\\$RuntimeRoot"',
+            'Remove-ManagedDirectory $RuntimeRoot "existing managed runtime directory"',
             force_cleanup,
         )
-        self.assertIn(
-            "Could not remove existing runtime directory",
-            force_cleanup,
-        )
-        self.assertNotIn("Remove-Item", force_cleanup)
+        helper = bootstrap[
+            bootstrap.index("function Remove-ManagedDirectory") : bootstrap.index(
+                "\nfunction Read-JsonOrNull"
+            )
+        ]
+        self.assertIn('cmd.exe /c rd /s /q "\\\\?\\$fullPath"', helper)
+        self.assertIn("Refusing to remove a filesystem root", helper)
 
     def test_m02_bootstrap_runs_package_setup_from_a_julia_script(self) -> None:
         root = Path(__file__).resolve().parents[1]
         bootstrap = (root / "runtime" / "bootstrap.ps1").read_text(
             encoding="utf-8"
         )
-        setup_start = bootstrap.index("    $SetupExpression = @'")
+        setup_start = bootstrap.index("        $SetupExpression = @'")
         project_setup = bootstrap[
             setup_start : bootstrap.index(
-                '\n    Write-Step "Julia runtime, pinned GSN sources, and precision worker ready"',
+                '\n        Write-Step "M02 Julia project, depot, and precision worker are ready"',
                 setup_start,
             )
         ]
@@ -350,15 +406,14 @@ class PublicSurfaceTests(unittest.TestCase):
             project_setup,
         )
         self.assertNotIn('"-e"', project_setup)
-        setup_invoke = project_setup.index("    Invoke-Native $JuliaExe @(")
+        setup_invoke = project_setup.index("            Invoke-Julia @(")
         setup_cleanup = project_setup.index(
-            "    Remove-Item -LiteralPath $SetupScript -Force"
+            "                Remove-Item -LiteralPath $SetupScript -Force"
         )
         worker_path = project_setup.index(
-            '    $WorkerPath = Join-Path $JuliaDataRoot "m02_worker.jl"'
+            "        $WorkerPath = $PersistentWorkerPath"
         )
         worker_probe = project_setup.index('        "--probe"')
-        receipt = project_setup.index("    $JuliaReceipt = [ordered]@{")
 
         self.assertIn(
             "$SetupScript",
@@ -367,7 +422,6 @@ class PublicSurfaceTests(unittest.TestCase):
         self.assertLess(setup_invoke, setup_cleanup)
         self.assertLess(setup_cleanup, worker_path)
         self.assertLess(worker_path, worker_probe)
-        self.assertLess(worker_probe, receipt)
 
     def test_campaign_runbook_has_no_historic_cache_environment_prerequisite(
         self,
@@ -423,20 +477,27 @@ class PublicSurfaceTests(unittest.TestCase):
             (package_root / "runtime").mkdir()
             shutil.copy2(root / "m02.ps1", package_root / "m02.ps1")
             shutil.copy2(
+                root / "runtime" / "resolve-runtime-root.ps1",
+                package_root / "runtime" / "resolve-runtime-root.ps1",
+            )
+            shutil.copy2(
                 root / "examples" / "m02-campaign.json",
                 package_root / "examples" / "m02-campaign.json",
             )
             bootstrap_log = package_root / "bootstrap-bindings.jsonl"
             argument_log = package_root / "arguments.jsonl"
             (package_root / "runtime" / "bootstrap.ps1").write_text(
-                r'''param(
+r'''param(
     [switch]$WithM02,
-    [switch]$Force
+    [switch]$Force,
+    [switch]$PortableRuntime,
+    [string]$RuntimeRoot
 )
 
 $record = [ordered]@{
     with_m02 = [bool]$WithM02
     force = [bool]$Force
+    portable_runtime = [bool]$PortableRuntime
 }
 [IO.File]::AppendAllText(
     $env:M02_TEST_BOOTSTRAP_LOG,
@@ -482,8 +543,9 @@ exit 0
             environment = dict(os.environ)
             environment["M02_TEST_BOOTSTRAP_LOG"] = str(bootstrap_log)
             environment["M02_TEST_ARGUMENT_LOG"] = str(argument_log)
+            environment["KERR_QNM_RUNTIME_ROOT"] = str(package_root / "managed")
 
-            for extra_arguments in ([], ["-RebuildRuntime"]):
+            for extra_arguments in ([], ["-RebuildRuntime"], ["-PortableRuntime"]):
                 result = subprocess.run(
                     [
                         str(windows_powershell),
@@ -517,10 +579,90 @@ exit 0
         self.assertEqual(
             bindings,
             [
-                {"with_m02": True, "force": False},
-                {"with_m02": True, "force": True},
+                {
+                    "with_m02": True,
+                    "force": False,
+                    "portable_runtime": False,
+                },
+                {
+                    "with_m02": True,
+                    "force": True,
+                    "portable_runtime": False,
+                },
+                {
+                    "with_m02": True,
+                    "force": False,
+                    "portable_runtime": True,
+                },
             ],
         )
+
+    @unittest.skipUnless(os.name == "nt", "requires Windows PowerShell 5.1")
+    def test_runtime_root_resolver_uses_localappdata_unless_portable(self) -> None:
+        """Exercise the actual resolver without provisioning any runtime."""
+
+        root = Path(__file__).resolve().parents[1]
+        windows_powershell = Path(os.environ["SystemRoot"]).joinpath(
+            "System32", "WindowsPowerShell", "v1.0", "powershell.exe"
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            temporary_root = Path(temporary)
+            package_root = temporary_root / "downloaded-solver"
+            local_app_data = temporary_root / "local-app-data"
+            package_root.mkdir()
+            environment = dict(os.environ)
+            environment["M02_TEST_RUNTIME_RESOLVER"] = str(
+                root / "runtime" / "resolve-runtime-root.ps1"
+            )
+            environment["M02_TEST_PACKAGE_ROOT"] = str(package_root)
+            environment["M02_TEST_LOCALAPPDATA"] = str(local_app_data)
+            resolver_log = temporary_root / "resolver.json"
+            environment["M02_TEST_RESOLVER_LOG"] = str(resolver_log)
+            script = r'''
+$env:LOCALAPPDATA = $env:M02_TEST_LOCALAPPDATA
+Remove-Item Env:KERR_QNM_RUNTIME_ROOT -ErrorAction SilentlyContinue
+. $env:M02_TEST_RUNTIME_RESOLVER
+$default = Resolve-KerrQnmRuntimeRoot -PackageRoot $env:M02_TEST_PACKAGE_ROOT
+$portable = Resolve-KerrQnmRuntimeRoot -PackageRoot $env:M02_TEST_PACKAGE_ROOT -PortableRuntime
+$record = [ordered]@{ default = $default; portable = $portable } | ConvertTo-Json -Compress
+[IO.File]::WriteAllText(
+    $env:M02_TEST_RESOLVER_LOG,
+    $record,
+    [System.Text.UTF8Encoding]::new($false)
+)
+'''
+            result = subprocess.run(
+                [
+                    str(windows_powershell),
+                    "-NoLogo",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-Command",
+                    script,
+                ],
+                cwd=root,
+                env=environment,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            self.assertEqual(
+                result.returncode,
+                0,
+                f"stdout={result.stdout!r} stderr={result.stderr!r}",
+            )
+            resolved = json.loads(resolver_log.read_text(encoding="utf-8"))
+            expected_default = (
+                local_app_data / "Kerr-QNM_Windows-Solver" / "runtime-1"
+            )
+            expected_portable = package_root / ".runtime"
+            expected_default.mkdir(parents=True)
+            expected_portable.mkdir()
+            self.assertTrue(Path(resolved["default"]).samefile(expected_default))
+            self.assertTrue(Path(resolved["portable"]).samefile(expected_portable))
 
     @unittest.skipUnless(os.name == "nt", "requires Windows PowerShell 5.1")
     def test_m02_public_default_invocation_forwards_safe_relative_paths(self) -> None:
@@ -532,7 +674,12 @@ exit 0
         with tempfile.TemporaryDirectory() as temporary:
             package_root = Path(temporary) / "m02-public"
             (package_root / "examples").mkdir(parents=True)
+            (package_root / "runtime").mkdir()
             shutil.copy2(root / "m02.ps1", package_root / "m02.ps1")
+            shutil.copy2(
+                root / "runtime" / "resolve-runtime-root.ps1",
+                package_root / "runtime" / "resolve-runtime-root.ps1",
+            )
             shutil.copy2(
                 root / "examples" / "m02-campaign.json",
                 package_root / "examples" / "m02-campaign.json",
@@ -572,6 +719,7 @@ exit 0
             )
             environment = dict(os.environ)
             environment["M02_TEST_ARGUMENT_LOG"] = str(argument_log)
+            environment["KERR_QNM_RUNTIME_ROOT"] = str(package_root / "managed")
             result = subprocess.run(
                 [
                     str(windows_powershell),

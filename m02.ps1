@@ -2,12 +2,18 @@ param(
     [string]$Selection = ".\examples\m02-campaign.json",
     [string]$Checkpoint = ".\m02-output\m02-campaign-checkpoint.json",
     [switch]$SkipBootstrap,
-    [switch]$RebuildRuntime
+    [switch]$RebuildRuntime,
+    [switch]$PortableRuntime,
+    [string]$RuntimeRoot
 )
 
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
 $PackageRoot = $PSScriptRoot
+. (Join-Path $PackageRoot "runtime\resolve-runtime-root.ps1")
+$ResolvedRuntimeRoot = Resolve-KerrQnmRuntimeRoot -PackageRoot $PackageRoot `
+    -PortableRuntime:$PortableRuntime -OverrideRoot $RuntimeRoot
+Set-KerrQnmRuntimeRoot $ResolvedRuntimeRoot
 
 function Invoke-M02Command([string[]]$Arguments) {
     & (Join-Path $PackageRoot "solver.ps1") @Arguments
@@ -21,12 +27,17 @@ if ($SkipBootstrap -and $RebuildRuntime) {
 }
 
 if (-not $SkipBootstrap) {
+    $BootstrapParameters = @{
+        WithM02 = $true
+        PortableRuntime = [bool]$PortableRuntime
+    }
     if ($RebuildRuntime) {
-        & (Join-Path $PackageRoot "runtime\bootstrap.ps1") -WithM02 -Force
+        $BootstrapParameters.Force = $true
     }
-    else {
-        & (Join-Path $PackageRoot "runtime\bootstrap.ps1") -WithM02
+    if (-not [string]::IsNullOrWhiteSpace($RuntimeRoot)) {
+        $BootstrapParameters.RuntimeRoot = $RuntimeRoot
     }
+    & (Join-Path $PackageRoot "runtime\bootstrap.ps1") @BootstrapParameters
     if ($LASTEXITCODE -ne 0) {
         throw "M02 runtime bootstrap failed with exit code $LASTEXITCODE."
     }

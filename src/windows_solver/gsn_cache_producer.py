@@ -243,6 +243,65 @@ def _load_json(path: Path, label: str) -> object:
         raise GsnCacheProductionError(f"{label} is invalid JSON") from error
 
 
+def _runtime_root(runtime_root: Path | None) -> Path:
+    if runtime_root is not None:
+        return Path(runtime_root)
+    override = os.environ.get("KERR_QNM_RUNTIME_ROOT")
+    if override:
+        return Path(override)
+    local_app_data = os.environ.get("LOCALAPPDATA")
+    if os.name == "nt" and local_app_data:
+        return Path(local_app_data) / "Kerr-QNM_Windows-Solver" / "runtime-1"
+    return Path.cwd() / ".runtime"
+
+
+def _receipt_julia_invocation(
+    runtime: Path,
+    package_data: Path,
+) -> tuple[Path, tuple[str, ...], Path, Path, str | None]:
+    """Read the persistent Julia invocation and scientific source contract.
+
+    The receipt is the boundary between disposable solver checkouts and the
+    installed runtime.  Older receipts retain the package-data fallback so a
+    user can run the bootstrap once to migrate them without a hand edit.
+    """
+
+    receipt = _load_json(runtime / "python-runtime.json", "M02 runtime receipt")
+    if not isinstance(receipt, Mapping):
+        raise GsnCacheProductionError("M02 runtime receipt is invalid")
+    julia = receipt.get("julia_runtime")
+    if not isinstance(julia, Mapping) or julia.get("requested") is not True:
+        raise GsnCacheProductionError(
+            "M02 Julia runtime is not provisioned; run .\\runtime\\bootstrap.ps1 -WithM02"
+        )
+    executable = julia.get("executable")
+    arguments = julia.get("arguments", [])
+    if (
+        not isinstance(executable, str)
+        or not executable
+        or not isinstance(arguments, list)
+        or any(not isinstance(item, str) or not item for item in arguments)
+    ):
+        raise GsnCacheProductionError("M02 Julia runtime receipt is invalid")
+    producer = julia.get("gsn_producer")
+    source_root = julia.get("gsn_source_root")
+    contract_id = julia.get("contract_id")
+    if contract_id is not None and (
+        not isinstance(contract_id, str)
+        or re.fullmatch(r"m02-[0-9a-f]{24}", contract_id) is None
+    ):
+        raise GsnCacheProductionError("M02 scientific source contract ID is invalid")
+    return (
+        Path(executable),
+        tuple(arguments),
+        Path(producer) if isinstance(producer, str) and producer else package_data / "generate_gsn_cache.jl",
+        Path(source_root)
+        if isinstance(source_root, str) and source_root
+        else package_data / "GeneralizedSasakiNakamura.jl",
+        contract_id,
+    )
+
+
 def _canonical_json(value: object) -> str:
     return json.dumps(
         value,
@@ -653,6 +712,7 @@ def _generate_pair(
     row: Mapping[str, object],
     directory: Path,
     julia: Path,
+    julia_arguments: Sequence[str],
     script: Path,
     source_root: Path,
     kerr: Path,
@@ -678,6 +738,7 @@ def _generate_pair(
     )
     command = (
         str(julia),
+        *julia_arguments,
         "--startup-file=no",
         str(script),
         "--gsn-source-root",
@@ -823,27 +884,39 @@ def ensure_generated_gsn_cache(
     source_root = Path(
         gsn_source_root or package_data / "GeneralizedSasakiNakamura.jl"
     )
+    runtime = _runtime_root(runtime_root)
+    declared_julia = os.environ.get("KERR_QNM_JULIA_EXE")
+    julia_arguments: tuple[str, ...] = ()
+    source_contract_id: str | None = None
+    if julia_executable is not None:
+        julia = Path(julia_executable)
+    elif declared_julia:
+        julia = Path(declared_julia)
+    else:
+        (
+            julia,
+            julia_arguments,
+            receipt_script,
+            receipt_source_root,
+            source_contract_id,
+        ) = _receipt_julia_invocation(runtime, package_data)
+        if producer_script is None:
+            script = receipt_script
+        if gsn_source_root is None:
+            source_root = receipt_source_root
     homogeneous = source_root / "src" / "Homogeneous"
     kerr = homogeneous / "Kerr.jl"
     potentials = homogeneous / "Potentials.jl"
-    runtime = Path(runtime_root or Path.cwd() / ".runtime")
-    declared_julia = os.environ.get("KERR_QNM_JULIA_EXE")
-    julia = Path(
-        julia_executable
-        or (
-            Path(declared_julia)
-            if declared_julia
-            else runtime / "julia" / "bin" / "julia.exe"
-        )
-    )
-    _validate_regular_file(julia, "package-local Julia executable")
-    _validate_regular_file(script, "package-owned GSN cache producer")
-    _validate_regular_file(kerr, "packaged GeneralizedSasakiNakamura.jl Kerr")
+    _validate_regular_file(julia, "M02 Julia executable")
+    _validate_regular_file(script, "M02 GSN cache producer")
+    _validate_regular_file(kerr, "M02 GeneralizedSasakiNakamura.jl Kerr")
     _validate_regular_file(
-        potentials, "packaged GeneralizedSasakiNakamura.jl Potentials"
+        potentials, "M02 GeneralizedSasakiNakamura.jl Potentials"
     )
 
     directory = runtime / "generated" / "gsn"
+    if source_contract_id is not None:
+        directory /= source_contract_id
     directory.mkdir(parents=True, exist_ok=True)
     index_path = directory / "gsn-index.json"
     resolved: list[tuple[str, GsnParameterPair, Mapping[str, object]]] = []
@@ -879,6 +952,7 @@ def ensure_generated_gsn_cache(
                     row=row,
                     directory=directory,
                     julia=julia,
+                    julia_arguments=julia_arguments,
                     script=script,
                     source_root=source_root,
                     kerr=kerr,
