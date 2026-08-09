@@ -1,0 +1,9 @@
+[deps]
+DifferentialEquations = "0c46a032-eb83-5123-abaf-570d42b7fbaa"
+GeneralizedSasakiNakamura = "7d2aac85-6cc1-40c7-a4aa-e1a43f13f131"
+JSON = "682c06a0-de6a-54ab-a142-c8b1cf79cde6"
+SciMLBase = "0bca4576-84f4-4d90-8ffe-ffa030f20462"
+SpinWeightedSpheroidalHarmonics = "680e17a6-2a17-48fd-ae01-e2b5a643bef0"
+
+[compat]
+julia = "1.10"

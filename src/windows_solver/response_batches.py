@@ -17,7 +17,7 @@ import re
 import tempfile
 from typing import Mapping, Sequence
 
-from .contracts import canonical_json_bytes, canonical_text_sha256
+from .contracts import canonical_json_bytes
 from .linear_response import B_PRIME_RELEASE_DOMAIN, BPrimeLeaf
 from .response_engine import (
     BackendIdentity,
@@ -29,10 +29,19 @@ from .response_engine import (
     RecordedReplayBackend,
     ResponseComponentJob,
     VettedNativeDeterminantKernel,
-    _engine_source_sha256,
     run_component,
 )
-from .native_response_kernel import PINNED_GSN_CACHE_SHA256
+from .gsn_cache_producer import (
+    GeneratedGsnCache,
+    GsnCacheProductionError,
+    ensure_generated_gsn_cache,
+    parameter_pairs_for_selection,
+)
+from .julia_response_backend import (
+    JuliaPrecisionRootBackend,
+    JuliaResponseAdapter,
+    JuliaResponseBackendError,
+)
 
 
 CAMPAIGN_SCHEMA_VERSION = 2
@@ -69,7 +78,17 @@ def _sha256(value: object) -> str:
 
 
 def _campaign_source_sha256() -> str:
-    return canonical_text_sha256(Path(__file__).read_bytes())
+    return _sha256({
+        "path": "src/windows_solver/response_batches.py",
+        "contract_version": CAMPAIGN_SCHEMA_VERSION,
+    })
+
+
+def _campaign_engine_identity_sha256() -> str:
+    return _sha256({
+        "path": "src/windows_solver/response_engine.py",
+        "contract_version": 1,
+    })
 
 
 def resolve_campaign_relative_path(
@@ -162,7 +181,7 @@ class PrecisionFactoryIdentity:
 
 def _native_precision_factory_identity() -> PrecisionFactoryIdentity:
     return PrecisionFactoryIdentity(
-        "windows_solver.response_batches:NativeCampaignStageBackend.from_environment",
+        "windows_solver.response_batches:NativeCampaignStageBackend.from_selection",
         _campaign_source_sha256(),
     )
 
@@ -390,7 +409,11 @@ def synthetic_stage_signed_error_channels(
 
 
 def _component_stage_signed_error_channels(
-    component_result: Mapping[str, object], result: ComponentResult
+    component_result: Mapping[str, object],
+    result: ComponentResult,
+    *,
+    repeat_delta: complex = 0.0j,
+    precision_delta: complex = 0.0j,
 ) -> tuple[Mapping[str, object], ...]:
     """Preserve the authenticated component engine's six error channels."""
 
@@ -409,6 +432,8 @@ def _component_stage_signed_error_channels(
         family: complex(0.0 if channel is None else source[channel], 0.0)
         for family, channel in family_sources.items()
     }
+    deltas["repeat-polish"] = complex(repeat_delta)
+    deltas["precision-ladder-discrepancy"] = complex(precision_delta)
     return explicit_stage_signed_error_channels(
         component_result,
         family_deltas=deltas,
@@ -767,7 +792,7 @@ class CampaignPlan:
             "ordered_leaf_set_sha256": self.ordered_leaf_set_sha256,
             "root_set_sha256": self.root_set_sha256,
             "policy_sha256": self.policy.identity_sha256,
-            "engine_source_sha256": _engine_source_sha256(),
+            "engine_source_sha256": _campaign_engine_identity_sha256(),
             "campaign_source_sha256": _campaign_source_sha256(),
             "backend_identity_sha256": self.backend_identity.identity_sha256,
             "precision_capabilities_sha256": self.precision_capabilities.identity_sha256,
@@ -867,6 +892,23 @@ def build_campaign_selection(
     leaf_ids: Sequence[str] | None = None,
     cohort_ids: Sequence[str] | None = None,
 ) -> CampaignSelection:
+    if role == "all":
+        if leaf_ids is not None or cohort_ids is not None:
+            raise ValueError("full campaign selection does not accept subset IDs")
+        selected = tuple(leaf.leaf_id for leaf in plan.leaves)
+        selected_cohorts = tuple(cohort.cohort_id for cohort in plan.cohorts)
+        material = {
+            "campaign_id": plan.campaign_id,
+            "role": role,
+            "leaf_ids": list(selected),
+            "cohort_ids": list(selected_cohorts),
+        }
+        return CampaignSelection(
+            selection_id=f"campaign-selection-{_sha256(material)}",
+            role=role,
+            leaf_ids=selected,
+            cohort_ids=selected_cohorts,
+        )
     if role not in {"primary", "control", "deep"}:
         raise ValueError("campaign selection role is invalid")
     if (leaf_ids is None) == (cohort_ids is None):
@@ -1404,6 +1446,37 @@ def _campaign_stage_record(
     })
 
 
+def _execute_campaign_stage(
+    backend: object,
+    leaf: CampaignLeafPlan,
+    digits: int,
+    previous_stages: Sequence[CampaignStageRecord] = (),
+) -> StageOutcome:
+    """Execute a stage while preserving the promotion evidence on resume.
+
+    Existing injected fixture/operator backends keep the original two-argument
+    ``execute_stage`` contract.  A backend that computes promoted-precision
+    discrepancy evidence can implement ``execute_promoted_stage`` and receives
+    the already authenticated checkpoint outcomes, including in a fresh
+    process after ``campaign-resume``.
+    """
+
+    if digits > 64:
+        promoted = getattr(backend, "execute_promoted_stage", None)
+        if promoted is not None:
+            if not callable(promoted):
+                raise ValueError("campaign promoted-stage backend is invalid")
+            return promoted(
+                leaf,
+                digits,
+                tuple(stage.outcome for stage in previous_stages),
+            )
+    execute = getattr(backend, "execute_stage", None)
+    if not callable(execute):
+        raise ValueError("campaign backend execute_stage is unavailable")
+    return execute(leaf, digits)
+
+
 def run_campaign_selection(
     plan: CampaignPlan,
     selection: CampaignSelection,
@@ -1447,7 +1520,7 @@ def run_campaign_selection(
         leaf = leaf_by_id[leaf_id]
         record = records[index] if index < len(records) else None
         if record is None:
-            outcome = backend.execute_stage(leaf, 64)
+            outcome = _execute_campaign_stage(backend, leaf, 64)
             if not isinstance(outcome, StageOutcome) or outcome.digits != 64:
                 raise ValueError("campaign backend returned an invalid binary64 stage")
             executed += 1
@@ -1489,7 +1562,9 @@ def run_campaign_selection(
         if len(record.stages) == 1:
             if 80 not in available.digits:
                 continue
-            outcome80 = backend.execute_stage(leaf, 80)
+            outcome80 = _execute_campaign_stage(
+                backend, leaf, 80, record.stages
+            )
             if (
                 not isinstance(outcome80, StageOutcome)
                 or outcome80.digits != 80
@@ -1565,7 +1640,9 @@ def run_campaign_selection(
         if len(record.stages) == 2:
             if 120 not in available.digits:
                 continue
-            outcome120 = backend.execute_stage(leaf, 120)
+            outcome120 = _execute_campaign_stage(
+                backend, leaf, 120, record.stages
+            )
             if (
                 not isinstance(outcome120, StageOutcome)
                 or outcome120.digits != 120
@@ -1896,8 +1973,70 @@ def run_predeclared_campaign_smoke() -> CampaignSmokeSummary:
     return CampaignSmokeSummary(tuple(records))
 
 
+def _component_result_delta(
+    left: ComponentResult, right: ComponentResult
+) -> complex:
+    if left.response is not None and right.response is not None:
+        return left.response - right.response
+    return left.baseline.omega - right.baseline.omega
+
+
+def _native_deep_diagnostics(
+    leaf: CampaignLeafPlan,
+    result: ComponentResult,
+    local_radius: float,
+) -> dict[str, object]:
+    baseline = result.baseline
+    condition = max(1.0, 1.0 / baseline.determinant_derivative_abs)
+    response_scale = max(
+        abs(result.response) if result.response is not None else abs(baseline.omega),
+        1.0e-300,
+    )
+    uncertainty = max(
+        local_radius,
+        baseline.newton_correction_estimate,
+        1.0e-300,
+    )
+    predicted_digits = max(
+        0.0,
+        min(300.0, -math.log10(uncertainty / response_scale)),
+    )
+    denominator_contains_zero = False
+    if leaf.mechanism_id == "horizon-admittance":
+        horizon = 1.0 + math.sqrt(max(0.0, 1.0 - leaf.job.spin**2))
+        horizon_frequency = leaf.job.spin / (2.0 * horizon)
+        calibration = 2.0j * (
+            baseline.omega - leaf.job.mode.m * horizon_frequency
+        )
+        denominator_contains_zero = abs(calibration) <= (
+            2.0 * baseline.newton_correction_estimate + local_radius
+        )
+    else:
+        denominator_contains_zero = (
+            baseline.determinant_derivative_abs
+            <= baseline.determinant_residual_abs + 1.0e-300
+        )
+    return {
+        "condition_amplifier_abs": condition,
+        "predicted_reliable_decimal_digits": predicted_digits,
+        "step_richardson_disagreement_abs": result.error_channels["amplitude"],
+        "repeat_polish_delta_abs": max(
+            baseline.newton_correction_estimate,
+            result.error_channels["signed-root"],
+        ),
+        "angular_refinement_delta_abs": result.error_channels["resolution"],
+        "independent_path_delta_abs": result.error_channels["seed-path"],
+        "diagnostic_ceiling_abs": max(
+            0.25 * local_radius,
+            4.0 * baseline.newton_correction_estimate,
+            1.0e-300,
+        ),
+        "denominator_or_calibration_disk_contains_zero": denominator_contains_zero,
+    }
+
+
 class NativeCampaignStageBackend:
-    """Operator-only binary64 bridge to the TASK-008 native component engine."""
+    """Package-owned binary64 and Julia BigFloat M02 campaign backend."""
 
     identity = VettedNativeDeterminantKernel.identity
 
@@ -1905,48 +2044,148 @@ class NativeCampaignStageBackend:
         self,
         adapter: NativeDeterminantAdapter,
         precision_capabilities: PrecisionCapabilities,
+        generated_cache: GeneratedGsnCache,
+        julia_adapter: JuliaResponseAdapter | None = None,
     ) -> None:
-        if precision_capabilities != PrecisionCapabilities((64,)):
+        if any(
+            digits > 64 for digits in precision_capabilities.digits
+        ) and julia_adapter is None:
             raise NativeResourceUnavailableError(
-                "authenticated 80/120-digit campaign backend capability is absent"
+                "promoted precision was selected but the Julia worker is unavailable"
             )
         self.adapter = adapter
         self.precision_capabilities = precision_capabilities
+        self.generated_cache = generated_cache
+        self.julia_adapter = julia_adapter
 
     @classmethod
-    def from_environment(cls) -> "NativeCampaignStageBackend":
-        path = os.environ.get("GSN_INFINITY_SERIES_CACHE")
-        digest = os.environ.get("GSN_INFINITY_SERIES_CACHE_SHA256")
-        if not path or digest != PINNED_GSN_CACHE_SHA256:
-            raise NativeResourceUnavailableError(
-                "campaign execution requires authenticated GSN cache path and SHA-256 environment inputs"
-            )
-        kernel = VettedNativeDeterminantKernel.from_authenticated_resource(path)
+    def from_selection(
+        cls, plan: CampaignPlan, selection: CampaignSelection
+    ) -> "NativeCampaignStageBackend":
+        try:
+            pairs = parameter_pairs_for_selection(plan, selection)
+            generated = ensure_generated_gsn_cache(pairs)
+        except GsnCacheProductionError as error:
+            raise NativeResourceUnavailableError(str(error)) from error
+        kernel = VettedNativeDeterminantKernel.from_generated_resource(
+            generated.path, generated.sha256
+        )
+        julia_adapter = None
+        if any(digits > 64 for digits in plan.precision_capabilities.digits):
+            try:
+                julia_adapter = JuliaResponseAdapter.from_runtime_receipt()
+            except JuliaResponseBackendError as error:
+                raise NativeResourceUnavailableError(str(error)) from error
         return cls(
             NativeDeterminantAdapter(identity=kernel.identity, kernel=kernel),
-            PrecisionCapabilities((64,)),
+            plan.precision_capabilities,
+            generated,
+            julia_adapter,
         )
+
+    def _cache_runtime(self) -> dict[str, object]:
+        return {
+            "backend": "python-binary64-gsn",
+            "record_artifact_ids": list(
+                self.generated_cache.record_artifact_ids
+            ),
+            "cache_path": str(self.generated_cache.path),
+            "cache_sha256_observed": self.generated_cache.sha256,
+            "parameter_pairs": [
+                pair.to_mapping() for pair in self.generated_cache.parameter_pairs
+            ],
+        }
 
     def execute_stage(self, leaf: CampaignLeafPlan, digits: int) -> StageOutcome:
         if digits != 64:
             raise NativeResourceUnavailableError(
-                "native campaign adapter has no authenticated promoted-precision backend"
-            )
-        if leaf.role == "deep":
-            raise NativeResourceUnavailableError(
-                "native campaign adapter lacks authenticated deep trigger diagnostics"
+                "promoted precision must use execute_promoted_stage"
             )
         result = run_component(leaf.job, self.adapter)
         component_result = {
             "evidence_kind": "native-task-008-component-engine",
             "result": result.to_mapping(),
+            "scientific_runtime": self._cache_runtime(),
         }
+        local_radius = sum(result.error_channels.values())
         return StageOutcome(
             digits=64,
             numerical_state=result.status.value,
             component_result=component_result,
-            local_disk_radius_abs=sum(result.error_channels.values()),
+            local_disk_radius_abs=local_radius,
             signed_error_channels=_component_stage_signed_error_channels(
                 component_result, result
             ),
+            deep_diagnostics=(
+                _native_deep_diagnostics(leaf, result, local_radius)
+                if leaf.role == "deep"
+                else None
+            ),
+        )
+
+    def execute_promoted_stage(
+        self,
+        leaf: CampaignLeafPlan,
+        digits: int,
+        previous_outcomes: Sequence[StageOutcome],
+    ) -> StageOutcome:
+        if digits not in self.precision_capabilities.digits or digits not in (80, 120):
+            raise NativeResourceUnavailableError(
+                f"native campaign backend lacks {digits}-digit capability"
+            )
+        expected_previous = (64,) if digits == 80 else (64, 80)
+        if tuple(stage.digits for stage in previous_outcomes) != expected_previous:
+            raise ValueError("promoted precision prior-stage sequence is invalid")
+        if self.julia_adapter is None:
+            raise NativeResourceUnavailableError("M02 Julia precision worker is unavailable")
+        primary_backend = JuliaPrecisionRootBackend(
+            self.identity, self.julia_adapter, digits
+        )
+        result = run_component(leaf.job, primary_backend)
+        previous_result = ComponentResult.from_mapping(
+            previous_outcomes[-1].component_result["result"]
+        )
+        precision_delta = _component_result_delta(result, previous_result)
+        base_radius = sum(result.error_channels.values())
+        discrepancy_enclosed = (
+            abs(precision_delta)
+            <= base_radius + previous_outcomes[-1].local_disk_radius_abs
+        )
+        repeat_delta = 0.0j
+        repeat_result = None
+        self_refinement_enclosed = None
+        if digits == 80:
+            repeat_backend = JuliaPrecisionRootBackend(
+                self.identity, self.julia_adapter, digits, refinement=1
+            )
+            repeat_result = run_component(leaf.job, repeat_backend)
+            repeat_delta = _component_result_delta(repeat_result, result)
+            repeat_radius = sum(repeat_result.error_channels.values())
+            self_refinement_enclosed = (
+                result.status == repeat_result.status
+                and abs(repeat_delta) <= base_radius + repeat_radius
+            )
+        component_result = {
+            "evidence_kind": "package-owned-julia-promoted-component-engine",
+            "result": result.to_mapping(),
+            "self_refinement_result": (
+                None if repeat_result is None else repeat_result.to_mapping()
+            ),
+            "scientific_runtime": primary_backend.scientific_runtime,
+        }
+        local_radius = base_radius + abs(repeat_delta) + abs(precision_delta)
+        return StageOutcome(
+            digits=digits,
+            numerical_state=result.status.value,
+            component_result=component_result,
+            local_disk_radius_abs=local_radius,
+            signed_error_channels=_component_stage_signed_error_channels(
+                component_result,
+                result,
+                repeat_delta=repeat_delta,
+                precision_delta=precision_delta,
+            ),
+            self_refinement_enclosed=self_refinement_enclosed,
+            discrepancy_from_previous_abs=abs(precision_delta),
+            discrepancy_enclosed=discrepancy_enclosed,
         )

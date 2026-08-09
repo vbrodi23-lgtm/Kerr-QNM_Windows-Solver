@@ -76,6 +76,39 @@ additionally need the pinned NumPy and SciPy:
 .\runtime\bootstrap.ps1 -WithNumericalKernel
 ```
 
+The physical M02 campaign has a single stronger bootstrap tier. It provisions
+the numerical kernel plus portable Julia 1.10.11, the packaged GSN equations,
+and the package-owned 80/120-digit worker. The complete 553-leaf campaign is a
+single resumable command:
+
+```powershell
+.\m02.ps1
+```
+
+On its first invocation the launcher bootstraps the runtime, generates the
+required exact F/U records, starts `campaign-run`, and validates the completed
+checkpoint. Later invocations use `campaign-resume` against the same checkpoint.
+No historic cache, external precision plugin, cache digest, or source digest is
+an execution prerequisite.
+
+Generated coefficients live under `.runtime\generated\gsn\`. The
+`gsn-index.json` registry maps each scientific identity—spin weight, resolved
+`a/M`, binary64 campaign value, `m`, normalization, equation convention, and
+producer/consumer contract versions—to a short pair artifact such as
+`gsn-000001.json`. Direct-spin leaves retain their exact rational `a/M`;
+κ-derived leaves retain exact `Mκ` as origin metadata and use the exact integer
+ratio of the resolved campaign binary64 `a/M`. Every reuse validates the status
+and coefficient artifact itself. Missing or invalid records regenerate
+independently; measured SHA-256 values are recorded as observations only during
+development.
+
+To discard all development runtime state and reprovision from the repository,
+use:
+
+```powershell
+.\m02.ps1 -RebuildRuntime
+```
+
 The launcher resolves an interpreter in this order: the bootstrap virtual
 environment at `.runtime\venv\Scripts\python.exe`, a bundled runtime at
 `.runtime\python\python.exe`, an active `python` that is 3.12 or newer, then

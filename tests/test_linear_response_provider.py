@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from windows_solver.linear_response import (
     B_PRIME_RELEASE_DOMAIN,
@@ -184,7 +185,10 @@ class LinearResponseEngineTests(unittest.TestCase):
             kernel_type.identity.runtime_fingerprint,
         )
         self.assertIn("python-64bit", kernel_type.identity.runtime_fingerprint)
-        self.assertIn("gsn-cache-0c49fe4c", kernel_type.identity.runtime_fingerprint)
+        self.assertIn(
+            "gsn-input-julia-exact-f-u-cache-contract-1",
+            kernel_type.identity.runtime_fingerprint,
+        )
         for mechanism_id in (
             "exterior-fixed-r3",
             "exterior-light-ring",
@@ -205,7 +209,20 @@ class LinearResponseEngineTests(unittest.TestCase):
             with self.assertRaisesRegex(
                 unavailable_type, "authenticated GSN infinity-series resource is absent"
             ):
-                kernel_type.from_authenticated_resource(missing)
+                kernel_type.from_generated_resource(missing, "0" * 64)
+
+    def test_native_equation_source_identity_is_structural_not_sha_gated(self) -> None:
+        """A readable contract-compatible source edit must remain executable."""
+
+        from windows_solver import _native_gsn_equations as equations
+
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / "Potentials.jl"
+            source.write_bytes(equations.POTENTIALS_SOURCE.read_bytes() + b"\n")
+            with patch.object(equations, "POTENTIALS_SOURCE", source):
+                expression = equations._julia_branch_expression("sF", "sU")
+
+        self.assertIn("omega", expression)
 
     def test_job_resolves_direct_and_source_coordinate_roots_through_owner(self) -> None:
         """Catches jobs substituting a caller-provided root or losing M-kappa lineage."""

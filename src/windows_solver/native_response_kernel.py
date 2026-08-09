@@ -1,8 +1,8 @@
 """Concrete vetted GSN determinant kernel for selected response jobs.
 
-Construction authenticates the immutable coefficient cache before importing
-the optional numerical stack.  The module never generates that cache and
-performs no numerical work during import or validation.
+Construction rehashes the generated coefficient cache before importing the
+optional numerical stack.  The module never generates that cache and performs
+no numerical work during import or validation.
 """
 
 from __future__ import annotations
@@ -16,6 +16,7 @@ import math
 import os
 from pathlib import Path
 import platform
+import re
 import struct
 from typing import Callable, Mapping
 
@@ -30,12 +31,6 @@ from .response_engine import (
 )
 
 
-PINNED_GSN_CACHE_SHA256 = (
-    "0c49fe4c2839444422b2d0ebcf08c912ee06d7e60ed398c9b360ed4c151f28d3"
-)
-PINNED_POTENTIALS_SHA256 = (
-    "8f60c740be8049878cf8cb3f58cd2c6676f10cc9c23cab13c5ce8af9ef3ae860"
-)
 _SOURCE_COMMIT = "0c1e8a3d3bca6e608c34e111476a4f6dcb73e86e"
 _SOURCE_BLOBS = (
     ("determinant-backend", "b65f2236f828204aa21dfa8d9bc79c8a1c66ca3b"),
@@ -53,6 +48,10 @@ _BRANCH_CONTINUATION_TOLERANCE_ABS = 5.0e-3
 # Stable across source checkouts and wheels; source_commit/source_blobs below
 # retain the authenticated upstream code identity.
 _ADAPTED_SOURCE_CONTRACT_ID = "native-gsn-adapter-contract-1"
+_GENERATED_INPUT_CONTRACT_ID = "julia-exact-f-u-cache-contract-1"
+_POTENTIAL_SOURCE_PATH = (
+    Path(__file__).resolve().parent / "data" / "native_kernel" / "potentials.fixture"
+)
 
 
 class NativeResourceUnavailableError(RuntimeError):
@@ -73,13 +72,13 @@ def _reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]
 def _native_identity() -> BackendIdentity:
     return BackendIdentity(
         backend_id="vetted-native-gsn-determinant",
-        implementation_version="1",
+        implementation_version="2",
         source_commit=_SOURCE_COMMIT,
         source_blobs=_SOURCE_BLOBS,
         runtime_fingerprint=(
             f"cpython-{platform.python_version()}-{platform.system().lower()}-"
             f"python-{8 * struct.calcsize('P')}bit-"
-            f"gsn-cache-{PINNED_GSN_CACHE_SHA256}-"
+            f"gsn-input-{_GENERATED_INPUT_CONTRACT_ID}-"
             f"adapted-source-{_ADAPTED_SOURCE_CONTRACT_ID}"
         ),
     )
@@ -95,8 +94,24 @@ class VettedNativeDeterminantKernel:
         self._standard_sn_type = standard_sn_type
 
     @classmethod
-    def from_authenticated_resource(
-        cls, cache_path: str | os.PathLike[str] | Path
+    def from_generated_resource(
+        cls,
+        cache_path: str | os.PathLike[str] | Path,
+        expected_sha256: str,
+    ) -> "VettedNativeDeterminantKernel":
+        """Bind a just-produced cache using its measured content identity."""
+
+        if re.fullmatch(r"[0-9a-f]{64}", expected_sha256) is None:
+            raise NativeResourceUnavailableError(
+                "generated GSN infinity-series resource digest is invalid"
+            )
+        return cls._from_resource(cache_path, expected_sha256)
+
+    @classmethod
+    def _from_resource(
+        cls,
+        cache_path: str | os.PathLike[str] | Path,
+        expected_sha256: str,
     ) -> "VettedNativeDeterminantKernel":
         path = Path(cache_path)
         if not path.is_file():
@@ -109,7 +124,7 @@ class VettedNativeDeterminantKernel:
             )
         raw = path.read_bytes()
         actual = hashlib.sha256(raw).hexdigest()
-        if actual != PINNED_GSN_CACHE_SHA256:
+        if actual != expected_sha256:
             raise NativeResourceUnavailableError(
                 "authenticated GSN infinity-series resource digest mismatch"
             )
@@ -136,23 +151,24 @@ class VettedNativeDeterminantKernel:
                 "authenticated GSN infinity-series resource has no records"
             )
 
-        potentials = (
-            Path(__file__).resolve().parent
-            / "data"
-            / "native_kernel"
-            / "potentials.fixture"
-        )
-        if (
-            not potentials.is_file()
-            or hashlib.sha256(potentials.read_bytes()).hexdigest()
-            != PINNED_POTENTIALS_SHA256
-        ):
+        potentials = _POTENTIAL_SOURCE_PATH
+        if not potentials.is_file() or potentials.is_symlink():
             raise NativeResourceUnavailableError(
-                "authenticated GSN potential expression resource is absent or changed"
+                "GSN potential expression source is absent or not a regular file"
+            )
+        try:
+            potential_source = potentials.read_bytes()
+        except OSError as error:
+            raise NativeResourceUnavailableError(
+                "GSN potential expression source is unreadable"
+            ) from error
+        if not potential_source:
+            raise NativeResourceUnavailableError(
+                "GSN potential expression source is empty"
             )
 
         os.environ["GSN_INFINITY_SERIES_CACHE"] = str(path.resolve())
-        os.environ["GSN_INFINITY_SERIES_CACHE_SHA256"] = PINNED_GSN_CACHE_SHA256
+        os.environ["GSN_INFINITY_SERIES_CACHE_SHA256"] = expected_sha256
         try:
             module = importlib.import_module("windows_solver._native_sn_standard")
         except (ImportError, OSError, RuntimeError) as error:

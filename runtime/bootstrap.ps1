@@ -31,6 +31,7 @@ Set-ExecutionPolicy -Scope Process Bypass -Force; .\runtime\bootstrap.ps1
 #>
 param(
     [switch]$WithNumericalKernel,
+    [switch]$WithM02,
     [switch]$Force,
     [switch]$SkipSmokeTest
 )
@@ -48,6 +49,12 @@ $UvExe = Join-Path $UvRoot "uv.exe"
 $PythonInstallRoot = Join-Path $RuntimeRoot "python"
 $VenvRoot = Join-Path $RuntimeRoot "venv"
 $VenvPython = Join-Path $VenvRoot "Scripts\python.exe"
+$JuliaRoot = Join-Path $RuntimeRoot "julia"
+$JuliaExe = Join-Path $JuliaRoot "bin\julia.exe"
+$JuliaDepot = Join-Path $RuntimeRoot "julia-depot"
+$JuliaProject = Join-Path $RuntimeRoot "m02-julia-project"
+$JuliaVendorRoot = Join-Path $RuntimeRoot "vendor"
+$JuliaDataRoot = Join-Path $PackageRoot "src\windows_solver\data\julia"
 $ReceiptPath = Join-Path $RuntimeRoot "python-runtime.json"
 $PolicyPath = Join-Path $PSScriptRoot "runtime_policy.json"
 
@@ -113,6 +120,9 @@ if (-not (Test-Path -LiteralPath $PolicyPath -PathType Leaf)) {
 $Policy = Get-Content -LiteralPath $PolicyPath -Raw | ConvertFrom-Json
 $PolicySha256 = Get-Sha256 $PolicyPath
 $PythonVersion = $Policy.python.python_version
+if ($WithM02) {
+    $WithNumericalKernel = $true
+}
 
 if ($Force -and (Test-Path -LiteralPath $RuntimeRoot)) {
     Write-Step "Removing existing .runtime for a clean reprovision"
@@ -255,6 +265,121 @@ if ($WithNumericalKernel) {
     Write-Step "Numerical kernel ready"
 }
 
+# ------------------------------------------------------- package-local Julia
+
+$JuliaReceipt = [ordered]@{ requested = [bool]$WithM02 }
+if ($WithM02) {
+    $JuliaArchive = Join-Path $DownloadRoot $Policy.julia.archive
+    $ExpectedJuliaSha256 = $Policy.julia.sha256.ToLowerInvariant()
+    if (-not (Test-Path -LiteralPath $JuliaArchive -PathType Leaf) `
+        -or (Get-Sha256 $JuliaArchive) -ne $ExpectedJuliaSha256) {
+        Write-Step "Downloading portable Julia $($Policy.julia.version)"
+        Get-File $Policy.julia.url $JuliaArchive
+    }
+    $ActualJuliaSha256 = Get-Sha256 $JuliaArchive
+    if ($ActualJuliaSha256 -ne $ExpectedJuliaSha256) {
+        throw "Julia archive SHA-256 mismatch. Expected $ExpectedJuliaSha256; received $ActualJuliaSha256."
+    }
+    Write-Step "Julia archive verified ($ActualJuliaSha256)"
+
+    if (-not (Test-Path -LiteralPath $JuliaExe -PathType Leaf)) {
+        $JuliaExtract = Join-Path $TempRoot "julia-extract"
+        if (Test-Path -LiteralPath $JuliaExtract) {
+            Remove-Item -LiteralPath $JuliaExtract -Recurse -Force
+        }
+        Expand-Archive -LiteralPath $JuliaArchive -DestinationPath $JuliaExtract -Force
+        $FoundJulia = Get-ChildItem -LiteralPath $JuliaExtract -Filter "julia.exe" -File -Recurse |
+            Select-Object -First 1
+        if ($null -eq $FoundJulia) {
+            throw "Verified Julia archive contains no julia.exe."
+        }
+        $ExtractedJuliaRoot = Split-Path -Parent (Split-Path -Parent $FoundJulia.FullName)
+        if (Test-Path -LiteralPath $JuliaRoot) {
+            Remove-Item -LiteralPath $JuliaRoot -Recurse -Force
+        }
+        Copy-Item -LiteralPath $ExtractedJuliaRoot -Destination $JuliaRoot -Recurse -Force
+        Remove-Item -LiteralPath $JuliaExtract -Recurse -Force
+    }
+
+    $JuliaIdentity = Invoke-NativeCapture $JuliaExe @("--version")
+    if ($JuliaIdentity -ne "julia version $($Policy.julia.version)") {
+        throw "Julia identity mismatch: expected $($Policy.julia.version); received '$JuliaIdentity'."
+    }
+    $SourceReceipts = @()
+    foreach ($Source in $Policy.scientific_sources) {
+        $SourcePath = Join-Path $PackageRoot $Source.path
+        if (-not (Test-Path -LiteralPath $SourcePath -PathType Leaf)) {
+            throw "Required scientific source is absent: $SourcePath"
+        }
+        $ActualSourceSha256 = Get-Sha256 $SourcePath
+        $SourceReceipts += [ordered]@{
+            id = [string]$Source.id
+            path = [IO.Path]::GetFullPath($SourcePath)
+            sha256 = $ActualSourceSha256
+        }
+    }
+
+    Write-Step "Preparing the pinned M02 Julia project"
+    if (Test-Path -LiteralPath $JuliaVendorRoot) {
+        Remove-Item -LiteralPath $JuliaVendorRoot -Recurse -Force
+    }
+    New-Item -ItemType Directory -Force -Path $JuliaVendorRoot | Out-Null
+    Copy-Item -LiteralPath (Join-Path $JuliaDataRoot "GeneralizedSasakiNakamura.jl") `
+        -Destination $JuliaVendorRoot -Recurse -Force
+    Copy-Item -LiteralPath (Join-Path $JuliaDataRoot "SpinWeightedSpheroidalHarmonics.jl") `
+        -Destination $JuliaVendorRoot -Recurse -Force
+    New-Item -ItemType Directory -Force -Path $JuliaProject | Out-Null
+    Copy-Item -LiteralPath (Join-Path $JuliaDataRoot "m02_project\Project.toml") `
+        -Destination (Join-Path $JuliaProject "Project.toml") -Force
+    $RuntimeManifest = Join-Path $JuliaProject "Manifest.toml"
+    if (-not (Test-Path -LiteralPath $RuntimeManifest -PathType Leaf)) {
+        Copy-Item -LiteralPath (Join-Path $JuliaDataRoot "m02_project\Manifest.seed.toml") `
+            -Destination $RuntimeManifest -Force
+    }
+    New-Item -ItemType Directory -Force -Path $JuliaDepot | Out-Null
+    $env:JULIA_DEPOT_PATH = $JuliaDepot
+    $env:JULIA_PKG_PRECOMPILE_AUTO = "0"
+    $env:M02_GSN_SOURCE = Join-Path $JuliaVendorRoot "GeneralizedSasakiNakamura.jl"
+    $env:M02_ANGULAR_SOURCE = Join-Path $JuliaVendorRoot "SpinWeightedSpheroidalHarmonics.jl"
+    $SetupExpression = @'
+using Pkg
+Pkg.develop(PackageSpec(path=ENV["M02_ANGULAR_SOURCE"]))
+Pkg.develop(PackageSpec(path=ENV["M02_GSN_SOURCE"]))
+Pkg.resolve()
+Pkg.instantiate()
+Pkg.precompile()
+'@
+    Invoke-Native $JuliaExe @(
+        "--startup-file=no",
+        "--history-file=no",
+        "--project=$JuliaProject",
+        "-e",
+        $SetupExpression
+    )
+    $WorkerPath = Join-Path $JuliaDataRoot "m02_worker.jl"
+    Invoke-Native $JuliaExe @(
+        "--startup-file=no",
+        "--history-file=no",
+        "--project=$JuliaProject",
+        $WorkerPath,
+        "--probe"
+    )
+    $JuliaReceipt = [ordered]@{
+        requested = $true
+        version = [string]$Policy.julia.version
+        executable = [IO.Path]::GetFullPath($JuliaExe)
+        executable_sha256 = Get-Sha256 $JuliaExe
+        archive = [IO.Path]::GetFullPath($JuliaArchive)
+        archive_sha256 = $ActualJuliaSha256
+        sources = @($SourceReceipts)
+        depot = [IO.Path]::GetFullPath($JuliaDepot)
+        project = [IO.Path]::GetFullPath($JuliaProject)
+        manifest_sha256 = Get-Sha256 (Join-Path $JuliaProject "Manifest.toml")
+        worker_sha256 = Get-Sha256 $WorkerPath
+    }
+    Write-Step "Julia runtime, pinned GSN sources, and precision worker ready"
+}
+
 # -------------------------------------------------------------------- receipt
 
 $receipt = [ordered]@{
@@ -274,6 +399,7 @@ $receipt = [ordered]@{
         requested = [bool]$WithNumericalKernel
         packages = @($installed)
     }
+    julia_runtime = $JuliaReceipt
 }
 $receipt | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $ReceiptPath -Encoding UTF8
 Write-Step "Wrote $ReceiptPath"
@@ -296,4 +422,9 @@ if (-not $WithNumericalKernel) {
     Write-Host ""
     Write-Host "The native response kernel and the test suite additionally need numpy/scipy:"
     Write-Host "    .\runtime\bootstrap.ps1 -WithNumericalKernel"
+}
+if (-not $WithM02) {
+    Write-Host ""
+    Write-Host "The physical M02 campaign additionally needs package-local Julia:"
+    Write-Host "    .\runtime\bootstrap.ps1 -WithM02"
 }

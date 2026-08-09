@@ -119,6 +119,62 @@ class PublicSurfaceTests(unittest.TestCase):
             (root / ".gitignore").read_text(encoding="utf-8").splitlines(),
         )
 
+    def test_m02_bootstrap_pins_package_local_julia_for_the_cache_producer(
+        self,
+    ) -> None:
+        root = Path(__file__).resolve().parents[1]
+        bootstrap = (root / "runtime" / "bootstrap.ps1").read_text(
+            encoding="utf-8"
+        )
+        policy = json.loads(
+            (root / "runtime" / "runtime_policy.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        julia = policy["julia"]
+
+        self.assertEqual(julia["version"], "1.10.11")
+        self.assertEqual(julia["archive"], "julia-1.10.11-win64.zip")
+        self.assertEqual(
+            julia["sha256"],
+            "11ba52fd1384f82d09ea232eb1552b6694bb2083e6adfe3ae2f9e1e663ed8cf8",
+        )
+        self.assertTrue(julia["url"].startswith("https://julialang-s3.julialang.org/"))
+        self.assertIn("[switch]$WithM02", bootstrap)
+        self.assertIn(r'Join-Path $RuntimeRoot "julia"', bootstrap)
+        self.assertIn(r'Join-Path $JuliaRoot "bin\julia.exe"', bootstrap)
+        self.assertIn("$Policy.julia.sha256", bootstrap)
+        self.assertIn("Expand-Archive", bootstrap)
+        self.assertIn("julia_runtime", bootstrap)
+
+    def test_campaign_runbook_has_no_historic_cache_environment_prerequisite(
+        self,
+    ) -> None:
+        root = Path(__file__).resolve().parents[1]
+        runbook = (root / "docs" / "response-replay-powershell.md").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertNotIn("GSN_INFINITY_SERIES_CACHE", runbook)
+        self.assertIn(r".\runtime\bootstrap.ps1 -WithM02", runbook)
+        self.assertIn("campaign-run", runbook)
+
+    def test_m02_launcher_runs_the_full_selection_and_can_rebuild_runtime(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        launcher = (root / "m02.ps1").read_text(encoding="utf-8")
+        selection = json.loads(
+            (root / "examples" / "m02-campaign.json").read_text(encoding="utf-8")
+        )
+
+        self.assertEqual(selection["role"], "all")
+        self.assertIsNone(selection["leaf_ids"])
+        self.assertEqual(selection["precision_digits"], [64, 80, 120])
+        self.assertIn("[switch]$RebuildRuntime", launcher)
+        self.assertIn('campaign-resume', launcher)
+        self.assertIn('"--full"', launcher)
+        self.assertIn('if ($RebuildRuntime)', launcher)
+        self.assertIn('$BootstrapArguments += "-Force"', launcher)
+
     def test_windows_ci_captures_native_streams_outside_powershell(self) -> None:
         root = Path(__file__).resolve().parents[1]
         workflow = (root / ".github" / "workflows" / "ci.yml").read_text(

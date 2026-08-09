@@ -177,6 +177,30 @@ class CampaignPlanTests(unittest.TestCase):
             with self.subTest(invalid=invalid), self.assertRaises(ValueError):
                 build_campaign_selection(plan, role="primary", leaf_ids=invalid)
 
+    def test_full_selection_expands_to_the_exact_ordered_campaign(self) -> None:
+        plan = build_campaign_plan(
+            policy=NumericalPolicy(),
+            backend_identity=VettedNativeDeterminantKernel.identity,
+            precision_capabilities=PrecisionCapabilities((64, 80, 120)),
+        )
+
+        selection = build_campaign_selection(
+            plan, role="all", leaf_ids=None, cohort_ids=None
+        )
+
+        self.assertEqual(selection.role, "all")
+        self.assertEqual(
+            selection.leaf_ids, B_PRIME_RELEASE_DOMAIN.production_leaf_ids
+        )
+        self.assertEqual(len(selection.leaf_ids), 553)
+        with self.assertRaisesRegex(ValueError, "does not accept subset"):
+            build_campaign_selection(
+                plan,
+                role="all",
+                leaf_ids=(selection.leaf_ids[0],),
+                cohort_ids=None,
+            )
+
     def test_checkpoint_resume_zero_work_and_tamper_are_strict(self) -> None:
         plan = build_campaign_plan(
             policy=NumericalPolicy(),

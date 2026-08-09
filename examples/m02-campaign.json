@@ -1,0 +1,9 @@
+{
+  "schema_version": 1,
+  "backend_id": "vetted-native-gsn-determinant",
+  "precision_digits": [64, 80, 120],
+  "precision_backend": null,
+  "role": "all",
+  "leaf_ids": null,
+  "cohort_ids": null
+}
