@@ -126,7 +126,10 @@ if ($WithM02) {
 
 if ($Force -and (Test-Path -LiteralPath $RuntimeRoot)) {
     Write-Step "Removing existing .runtime for a clean reprovision"
-    Remove-Item -LiteralPath $RuntimeRoot -Recurse -Force
+    cmd.exe /c rd /s /q "\\?\$RuntimeRoot"
+    if ($LASTEXITCODE -ne 0 -and (Test-Path -LiteralPath $RuntimeRoot)) {
+        throw "Could not remove existing runtime directory: $RuntimeRoot"
+    }
 }
 foreach ($path in @($RuntimeRoot, $DownloadRoot, $TempRoot)) {
     New-Item -ItemType Directory -Force -Path $path | Out-Null
@@ -285,9 +288,23 @@ if ($WithM02) {
     if (-not (Test-Path -LiteralPath $JuliaExe -PathType Leaf)) {
         $JuliaExtract = Join-Path $TempRoot "julia-extract"
         if (Test-Path -LiteralPath $JuliaExtract) {
-            Remove-Item -LiteralPath $JuliaExtract -Recurse -Force
+            cmd.exe /c rd /s /q "\\?\$JuliaExtract"
+            if ($LASTEXITCODE -ne 0 -and (Test-Path -LiteralPath $JuliaExtract)) {
+                throw "Could not remove previous Julia extraction directory: $JuliaExtract"
+            }
         }
-        Expand-Archive -LiteralPath $JuliaArchive -DestinationPath $JuliaExtract -Force
+        New-Item -ItemType Directory -Force -Path $JuliaExtract | Out-Null
+
+        $Tar = Get-Command tar.exe -ErrorAction SilentlyContinue
+        if ($null -eq $Tar) {
+            throw "Windows tar.exe is required to extract the portable Julia runtime."
+        }
+
+        & $Tar.Source -xf $JuliaArchive -C $JuliaExtract
+        if ($LASTEXITCODE -ne 0) {
+            throw "Julia archive extraction failed with tar.exe exit code $LASTEXITCODE."
+        }
+
         $FoundJulia = Get-ChildItem -LiteralPath $JuliaExtract -Filter "julia.exe" -File -Recurse |
             Select-Object -First 1
         if ($null -eq $FoundJulia) {
@@ -295,10 +312,16 @@ if ($WithM02) {
         }
         $ExtractedJuliaRoot = Split-Path -Parent (Split-Path -Parent $FoundJulia.FullName)
         if (Test-Path -LiteralPath $JuliaRoot) {
-            Remove-Item -LiteralPath $JuliaRoot -Recurse -Force
+            cmd.exe /c rd /s /q "\\?\$JuliaRoot"
+            if ($LASTEXITCODE -ne 0 -and (Test-Path -LiteralPath $JuliaRoot)) {
+                throw "Could not remove previous Julia runtime directory: $JuliaRoot"
+            }
         }
         Copy-Item -LiteralPath $ExtractedJuliaRoot -Destination $JuliaRoot -Recurse -Force
-        Remove-Item -LiteralPath $JuliaExtract -Recurse -Force
+        cmd.exe /c rd /s /q "\\?\$JuliaExtract"
+        if ($LASTEXITCODE -ne 0 -and (Test-Path -LiteralPath $JuliaExtract)) {
+            throw "Could not remove Julia extraction directory after installation: $JuliaExtract"
+        }
     }
 
     $JuliaIdentity = Invoke-NativeCapture $JuliaExe @("--version")
@@ -349,13 +372,19 @@ Pkg.resolve()
 Pkg.instantiate()
 Pkg.precompile()
 '@
+    $SetupScript = Join-Path $TempRoot "m02-setup.jl"
+    [IO.File]::WriteAllText(
+        $SetupScript,
+        $SetupExpression,
+        [System.Text.UTF8Encoding]::new($false)
+    )
     Invoke-Native $JuliaExe @(
         "--startup-file=no",
         "--history-file=no",
         "--project=$JuliaProject",
-        "-e",
-        $SetupExpression
+        $SetupScript
     )
+    Remove-Item -LiteralPath $SetupScript -Force
     $WorkerPath = Join-Path $JuliaDataRoot "m02_worker.jl"
     Invoke-Native $JuliaExe @(
         "--startup-file=no",

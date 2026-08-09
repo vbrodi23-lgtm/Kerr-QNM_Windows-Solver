@@ -144,8 +144,143 @@ class PublicSurfaceTests(unittest.TestCase):
         self.assertIn(r'Join-Path $RuntimeRoot "julia"', bootstrap)
         self.assertIn(r'Join-Path $JuliaRoot "bin\julia.exe"', bootstrap)
         self.assertIn("$Policy.julia.sha256", bootstrap)
-        self.assertIn("Expand-Archive", bootstrap)
         self.assertIn("julia_runtime", bootstrap)
+
+    def test_m02_bootstrap_extracts_julia_with_windows_tar(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        bootstrap = (root / "runtime" / "bootstrap.ps1").read_text(
+            encoding="utf-8"
+        )
+        julia_install = bootstrap[
+            bootstrap.index(
+                'if (-not (Test-Path -LiteralPath $JuliaExe -PathType Leaf))'
+            ) : bootstrap.index("\n    $JuliaIdentity")
+        ]
+
+        self.assertIn(
+            'cmd.exe /c rd /s /q "\\\\?\\$JuliaExtract"',
+            julia_install,
+        )
+        self.assertIn(
+            'cmd.exe /c rd /s /q "\\\\?\\$JuliaRoot"',
+            julia_install,
+        )
+        self.assertIn(
+            "Could not remove previous Julia extraction directory",
+            julia_install,
+        )
+        self.assertIn(
+            "Could not remove previous Julia runtime directory",
+            julia_install,
+        )
+        self.assertIn(
+            "Could not remove Julia extraction directory after installation",
+            julia_install,
+        )
+        self.assertEqual(julia_install.count("cmd.exe /c rd /s /q"), 3)
+        self.assertNotIn("Remove-Item -LiteralPath $Julia", julia_install)
+        self.assertIn(
+            'Get-Command tar.exe -ErrorAction SilentlyContinue',
+            julia_install,
+        )
+        self.assertIn(
+            "Windows tar.exe is required to extract the portable Julia runtime.",
+            julia_install,
+        )
+        self.assertIn(
+            '& $Tar.Source -xf $JuliaArchive -C $JuliaExtract',
+            julia_install,
+        )
+        self.assertIn(
+            "Julia archive extraction failed with tar.exe exit code",
+            julia_install,
+        )
+        self.assertIn(
+            'New-Item -ItemType Directory -Force -Path $JuliaExtract',
+            julia_install,
+        )
+        self.assertIn(
+            'Get-ChildItem -LiteralPath $JuliaExtract -Filter "julia.exe"',
+            julia_install,
+        )
+        self.assertIn(
+            'if ($null -eq $FoundJulia)',
+            julia_install,
+        )
+        self.assertIn(
+            "Verified Julia archive contains no julia.exe.",
+            julia_install,
+        )
+        self.assertLess(
+            julia_install.index('if ($null -eq $FoundJulia)'),
+            julia_install.index(
+                "Copy-Item -LiteralPath $ExtractedJuliaRoot"
+            ),
+        )
+        self.assertNotIn("Expand-Archive", julia_install)
+
+    def test_force_reprovision_uses_long_path_safe_runtime_cleanup(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        bootstrap = (root / "runtime" / "bootstrap.ps1").read_text(
+            encoding="utf-8"
+        )
+        force_cleanup = bootstrap[
+            bootstrap.index("if ($Force -and") : bootstrap.index(
+                "\nforeach ($path"
+            )
+        ]
+
+        self.assertIn(
+            'cmd.exe /c rd /s /q "\\\\?\\$RuntimeRoot"',
+            force_cleanup,
+        )
+        self.assertIn(
+            "Could not remove existing runtime directory",
+            force_cleanup,
+        )
+        self.assertNotIn("Remove-Item", force_cleanup)
+
+    def test_m02_bootstrap_runs_package_setup_from_a_julia_script(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        bootstrap = (root / "runtime" / "bootstrap.ps1").read_text(
+            encoding="utf-8"
+        )
+        setup_start = bootstrap.index("    $SetupExpression = @'")
+        project_setup = bootstrap[
+            setup_start : bootstrap.index(
+                '\n    Write-Step "Julia runtime, pinned GSN sources, and precision worker ready"',
+                setup_start,
+            )
+        ]
+
+        self.assertIn(
+            '$SetupScript = Join-Path $TempRoot "m02-setup.jl"',
+            project_setup,
+        )
+        self.assertIn("[IO.File]::WriteAllText", project_setup)
+        self.assertIn(
+            "[System.Text.UTF8Encoding]::new($false)",
+            project_setup,
+        )
+        self.assertNotIn('"-e"', project_setup)
+        setup_invoke = project_setup.index("    Invoke-Native $JuliaExe @(")
+        setup_cleanup = project_setup.index(
+            "    Remove-Item -LiteralPath $SetupScript -Force"
+        )
+        worker_path = project_setup.index(
+            '    $WorkerPath = Join-Path $JuliaDataRoot "m02_worker.jl"'
+        )
+        worker_probe = project_setup.index('        "--probe"')
+        receipt = project_setup.index("    $JuliaReceipt = [ordered]@{")
+
+        self.assertIn(
+            "$SetupScript",
+            project_setup[setup_invoke:setup_cleanup],
+        )
+        self.assertLess(setup_invoke, setup_cleanup)
+        self.assertLess(setup_cleanup, worker_path)
+        self.assertLess(worker_path, worker_probe)
+        self.assertLess(worker_probe, receipt)
 
     def test_campaign_runbook_has_no_historic_cache_environment_prerequisite(
         self,
