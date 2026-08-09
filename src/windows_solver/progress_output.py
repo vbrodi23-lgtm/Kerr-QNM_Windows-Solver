@@ -51,6 +51,13 @@ _NORMAL_KINDS = _QUIET_KINDS | frozenset(
         ProgressEventKind.REQUEST_FAILED,
     }
 )
+_NORMAL_FALLBACK_KINDS = _NORMAL_KINDS | frozenset(
+    {
+        ProgressEventKind.DETERMINANT_COMPLETED,
+        ProgressEventKind.DETERMINANT_EVALUATED,
+        ProgressEventKind.SUBOPERATION_COMPLETED,
+    }
+)
 _TERMINAL_KINDS = frozenset(
     {
         ProgressEventKind.CAMPAIGN_COMPLETED,
@@ -138,6 +145,7 @@ class CampaignProgressReporter:
         self._failed_leaf_ids: set[object] = set()
         self._last_accepted_leaf: object | None = None
         self._checkpoint_status = "not yet written"
+        self._campaign_status = "PENDING"
         self._root_started: dict[tuple[object, object, object], float] = {}
         self._newton_started: dict[
             tuple[object, object, object, object], float
@@ -356,7 +364,7 @@ class CampaignProgressReporter:
             if self._terminal_dashboard:
                 if self._should_render_dashboard(event):
                     self._dashboard(record)
-            elif event.kind in _FORCED_STATUS_KINDS:
+            elif event.kind in _NORMAL_FALLBACK_KINDS:
                 self._ordinary_line(record)
             return
         self._ordinary_line(record)
@@ -522,10 +530,24 @@ class CampaignProgressReporter:
             numerical_state = payload.get("numerical_state")
             if numerical_state is not None:
                 self._dashboard_state["precision_status"] = numerical_state
+            if payload.get("leaf_state") == "MISSING_PRECISION":
+                self._dashboard_state["leaf_status"] = "MISSING_PRECISION"
         elif kind == ProgressEventKind.CHECKPOINT_WRITING.value:
             self._checkpoint_status = "writing"
         elif kind == ProgressEventKind.CHECKPOINT_WRITTEN.value:
             self._checkpoint_status = "written"
+        elif kind == ProgressEventKind.CAMPAIGN_STARTED.value:
+            self._campaign_status = "RUNNING"
+        elif kind == ProgressEventKind.CAMPAIGN_COMPLETED.value:
+            state = payload.get("state")
+            self._campaign_status = str(state) if state is not None else "COMPLETED"
+            if (
+                self._campaign_status == "PARTIAL"
+                and self._dashboard_state.get("leaf_status") == "RUNNING"
+            ):
+                self._dashboard_state["leaf_status"] = "PARTIAL"
+        elif kind == ProgressEventKind.CAMPAIGN_FAILED.value:
+            self._campaign_status = "FAILED"
 
     def _record_leaf_outcome(self, leaf_id: object, state: object) -> None:
         if leaf_id is not None:
@@ -567,6 +589,7 @@ class CampaignProgressReporter:
             ("Sequence", record["sequence"]),
             ("Event", record["kind"]),
             ("Elapsed_s", round(float(record["elapsed_seconds"]), 1)),
+            ("CampaignStatus", self._campaign_status),
             ("Leaf", leaf),
             ("LeafStatus", context.get("leaf_status")),
             ("RootStatus", context.get("root_status")),
@@ -621,7 +644,8 @@ class CampaignProgressReporter:
 
         return [
             "M02 CAMPAIGN | " + line("Sequence", "Event", "Elapsed_s"),
-            line("Leaf", "LeafStatus", "LeafId"),
+            line("CampaignStatus", "Leaf", "LeafStatus"),
+            line("LeafId"),
             line("Role", "Mode", "Spin"),
             line("Mechanism", "Precision", "Phase", "Newton"),
             line("RootStatus", "PrecisionStatus", "Checkpoint"),
