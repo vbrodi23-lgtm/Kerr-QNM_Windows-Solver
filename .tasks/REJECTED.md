@@ -11,7 +11,7 @@ Retire the separate 126-leaf alpha-half/light-ring production campaign from the 
 ### Acceptance Criteria
 
 - [x] Generic execution is owned by TASK-009.
-- [x] Full evidence collection is assigned to the user's PowerShell workflow.
+- [x] Full evidence collection is consolidated into TASK-077 after TASK-075–TASK-076 make the public backend reproducible.
 - [x] Representative mechanism coverage remains required by TASK-009 smoke gates.
 
 ### Dependencies
@@ -47,7 +47,7 @@ Retire the separate 126-leaf alpha1/throat-κ production campaign from the softw
 ### Acceptance Criteria
 
 - [x] Generic execution is owned by TASK-009.
-- [x] Full evidence collection is assigned to the user's PowerShell workflow.
+- [x] Full evidence collection is consolidated into TASK-077 after TASK-075–TASK-076 make the public backend reproducible.
 - [x] Primary 441-ID planning and representative mechanism coverage remain mandatory.
 
 ### Dependencies
@@ -83,7 +83,7 @@ Retire the separate 48-leaf control production campaign from the software-build 
 ### Acceptance Criteria
 
 - [x] Generic execution and exact 48-ID control planning are owned by TASK-009.
-- [x] Full evidence collection is assigned to the user's PowerShell workflow.
+- [x] Full evidence collection is consolidated into TASK-077 after TASK-075–TASK-076 make the public backend reproducible.
 - [x] Negative-m, no-symmetry, and control-only behavior remain required smoke gates.
 
 ### Dependencies
@@ -119,7 +119,7 @@ Retire the separate 64-leaf multiprecision production campaign from the software
 ### Acceptance Criteria
 
 - [x] Generic execution and exact 64-ID deep planning are owned by TASK-009.
-- [x] Full multiprecision evidence collection is assigned to the user's PowerShell workflow.
+- [x] Full multiprecision evidence collection is consolidated into TASK-077 after TASK-075–TASK-076 validate the public BigFloat path.
 - [x] Trigger, sentinel, 80/120-digit, exact-Mκ, and unresolved behavior remain required smoke/validation gates.
 
 ### Dependencies
@@ -143,4 +143,3 @@ Confirm the deep precision policy remains executable and fail-closed in TASK-009
 - Do not execute this campaign separately.
 
 ---
-

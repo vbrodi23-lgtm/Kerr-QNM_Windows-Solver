@@ -2,6 +2,14 @@
 
 Add the newest completed task or milestone-control entry immediately below this heading.
 
+## 2026-08-09 — M02 self-originating scientific execution set as the active delivery path
+
+- **Current position:** PR #5 merged the complete 553-leaf planning, execution, reduction, and fail-closed admission machinery. PR #6 merged the package-local Python bootstrap. No 553-leaf physical campaign or admitted linear-response result exists yet.
+- **Delivery sequence:** TASK-075 makes the solver originate its package-local runtime, pinned public GSN/angular sources, generated numerical prerequisites, and provenance ledger; TASK-076 proves the one-command cold/warm multi-precision path with preflight, resume, and failure diagnostics; TASK-077 produces all 553 physical leaves; TASK-078 reduces 174 rows, admits the provider, and closes M02.
+- **Dependency correction:** M03 now starts after TASK-078. M06 forced solves consume the validated M04 operator through TASK-023. M07 consumes TASK-078 rather than the software-only TASK-011 gate.
+- **Evidence ceiling:** Roadmap and executable task control only. M02 remains incomplete until TASK-078 produces and admits the physical package.
+- **Change reference:** PR [#7](https://github.com/vbrodi23-lgtm/Kerr-QNM_Windows-Solver/pull/7).
+
 ## 2026-08-08 — TASK-011 M02 admission and operator closure completed
 
 - **Task:** TASK-011 — Build fail-closed M02 validation, admission, and operator closure commands.
