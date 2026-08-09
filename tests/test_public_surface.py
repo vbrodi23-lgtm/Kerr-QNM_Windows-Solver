@@ -920,7 +920,7 @@ $candidate | ConvertTo-Json -Compress | Set-Content -LiteralPath $env:M02_TEST_J
                 0,
                 f"stdout={result.stdout!r} stderr={result.stderr!r}",
             )
-            candidate = json.loads(record_path.read_text(encoding="utf-8"))
+            candidate = json.loads(record_path.read_text(encoding="utf-8-sig"))
             self.assertEqual(candidate["source"], "juliaup")
             self.assertTrue(Path(candidate["launcher"]).samefile(launcher))
             self.assertTrue(
