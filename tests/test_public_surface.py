@@ -213,6 +213,46 @@ class PublicSurfaceTests(unittest.TestCase):
         )
         self.assertNotIn("Expand-Archive", julia_install)
 
+    def test_m02_bootstrap_configures_utf8_console_before_julia(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        bootstrap = (root / "runtime" / "bootstrap.ps1").read_text(
+            encoding="utf-8"
+        )
+        m02_bootstrap = bootstrap[
+            bootstrap.index(
+                "$JuliaReceipt = [ordered]@{ requested = [bool]$WithM02 }"
+            ) : bootstrap.index("\n    $JuliaIdentity")
+        ]
+        chcp = "& $Chcp.Source 65001 | Out-Null"
+        input_encoding = "[Console]::InputEncoding = $Utf8NoBom"
+        output_encoding = "[Console]::OutputEncoding = $Utf8NoBom"
+        native_input_encoding = "$OutputEncoding = $Utf8NoBom"
+
+        self.assertIn(
+            "$Utf8NoBom = [System.Text.UTF8Encoding]::new($false)",
+            m02_bootstrap,
+        )
+        self.assertIn(
+            "Get-Command chcp.com -ErrorAction SilentlyContinue",
+            m02_bootstrap,
+        )
+        self.assertIn(chcp, m02_bootstrap)
+        self.assertIn(input_encoding, m02_bootstrap)
+        self.assertIn(output_encoding, m02_bootstrap)
+        self.assertIn(native_input_encoding, m02_bootstrap)
+        self.assertLess(
+            m02_bootstrap.index(chcp),
+            m02_bootstrap.index(input_encoding),
+        )
+        self.assertLess(
+            m02_bootstrap.index(input_encoding),
+            m02_bootstrap.index(output_encoding),
+        )
+        self.assertLess(
+            m02_bootstrap.index(output_encoding),
+            m02_bootstrap.index(native_input_encoding),
+        )
+
     def test_m02_bootstrap_installs_julia_by_renaming_the_extracted_tree(
         self,
     ) -> None:
