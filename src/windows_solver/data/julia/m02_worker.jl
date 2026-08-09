@@ -11,6 +11,64 @@ const GSN = GeneralizedSasakiNakamura
 const CF = GeneralizedSasakiNakamura.ComplexFrequencies
 const Kerr = GeneralizedSasakiNakamura.Kerr
 const Potentials = GeneralizedSasakiNakamura.Potentials
+const PROGRESS_PREFIX = "@@KERR_QNM_PROGRESS@@"
+const PROGRESS_SCHEMA = "windows-solver.progress/1"
+const ACTIVE_PROGRESS_CONTEXT = Ref(Dict{String,Any}())
+
+progress_active() = get(ENV, "KERR_QNM_PROGRESS", "0") == "1"
+progress_complex(value) = Dict(
+    "real" => string(real(value)),
+    "imaginary" => string(imag(value)),
+)
+
+function progress_emit(kind; context=Dict{String,Any}(), payload=Dict{String,Any}())
+    progress_active() || return
+    document = Dict(
+        "schema" => PROGRESS_SCHEMA,
+        "kind" => kind,
+        "context" => merge(ACTIVE_PROGRESS_CONTEXT[], context),
+        "payload" => payload,
+    )
+    println(PROGRESS_PREFIX * JSON.json(document))
+    flush(stdout)
+end
+
+function progress_scope(operation::Function, context::Dict{String,Any})
+    previous = ACTIVE_PROGRESS_CONTEXT[]
+    ACTIVE_PROGRESS_CONTEXT[] = merge(previous, context)
+    try
+        return operation()
+    finally
+        ACTIVE_PROGRESS_CONTEXT[] = previous
+    end
+end
+
+function progress_operation(operation::Function, name::String; payload=Dict{String,Any}())
+    started = time_ns()
+    context = Dict{String,Any}("suboperation" => name)
+    progress_emit("suboperation_started"; context=context, payload=merge(
+        Dict{String,Any}("suboperation" => name), payload
+    ))
+    try
+        result = operation()
+        progress_emit("suboperation_completed"; context=context, payload=merge(
+            Dict{String,Any}(
+                "suboperation" => name,
+                "elapsed_seconds" => (time_ns() - started) / 1.0e9,
+            ),
+            payload,
+        ))
+        return result
+    catch failure
+        progress_emit("error"; context=context, payload=Dict{String,Any}(
+            "suboperation" => name,
+            "error_type" => string(typeof(failure)),
+            "message" => sprint(showerror, failure),
+            "elapsed_seconds" => (time_ns() - started) / 1.0e9,
+        ))
+        rethrow()
+    end
+end
 
 required(request, key) = haskey(request, key) ? request[key] : error("missing request key $key")
 
@@ -171,7 +229,9 @@ function branch_values(::Type{T}, request, omega::Complex{T}, match_radius::T) w
     pad = parse_integer(request, "angular_pad")
     a = parse_real(T, request, "spin")
     seed_A = parse_complex(T, request, "angular_A_re", "angular_A_im")
-    _, lambda = angular_constants(T, s, ell, m, a, omega, seed_A, pad, digits)
+    _, lambda = progress_operation("angular") do
+        angular_constants(T, s, ell, m, a, omega, seed_A, pad, digits)
+    end
     tolerance = min(
         parse_real(T, request, "ode_relative_tolerance"),
         parse_real(T, request, "ode_absolute_tolerance"),
@@ -194,22 +254,26 @@ function branch_values(::Type{T}, request, omega::Complex{T}, match_radius::T) w
         reltol=tolerance,
         abstol=tolerance,
     )
-    xin, _, _ = CF.solve_Xin(
-        s, m, a, beta_positive, beta_negative, omega, lambda,
-        radius_from_rho, rs_match, rho_in, rho_out;
-        initialconditions_order=order,
-        dtype=dtype,
-        reltol=tolerance,
-        abstol=tolerance,
-    )
-    xup, _, _ = CF.solve_Xup(
-        s, m, a, beta_positive, beta_negative, omega, lambda,
-        radius_from_rho, rs_match, rho_in, rho_out;
-        initialconditions_order=order,
-        dtype=dtype,
-        reltol=tolerance,
-        abstol=tolerance,
-    )
+    xin, _, _ = progress_operation("Xin") do
+        CF.solve_Xin(
+            s, m, a, beta_positive, beta_negative, omega, lambda,
+            radius_from_rho, rs_match, rho_in, rho_out;
+            initialconditions_order=order,
+            dtype=dtype,
+            reltol=tolerance,
+            abstol=tolerance,
+        )
+    end
+    xup, _, _ = progress_operation("Xup") do
+        CF.solve_Xup(
+            s, m, a, beta_positive, beta_negative, omega, lambda,
+            radius_from_rho, rs_match, rho_in, rho_out;
+            initialconditions_order=order,
+            dtype=dtype,
+            reltol=tolerance,
+            abstol=tolerance,
+        )
+    end
     xin_match = xin(zero(T))
     xup_match = xup(zero(T))
     Cref, Cinc = CF.CrefCinc_SN_from_Xup(
@@ -289,7 +353,9 @@ function determinant(::Type{T}, request, omega::Complex{T}, amplitude::Complex{T
         iszero(denominator) && error("zero horizon chart denominator")
         reflectivity = amplitude / denominator
         horizon = branches.xin .+ reflectivity .* branches.xout
-        return wronskian(horizon, branches.xup)
+        return progress_operation("Wronskian") do
+            wronskian(horizon, branches.xup)
+        end
     end
 
     lower = parse_real(T, request, "support_lower")
@@ -297,13 +363,49 @@ function determinant(::Type{T}, request, omega::Complex{T}, amplitude::Complex{T
     lower > Kerr.r_plus(a) || error("exterior support is not outside the horizon")
     upper < readout || error("exterior support must lie below the readout radius")
     branches = branch_values(T, request, omega, lower)
-    perturbed_in = integrate_real_branch(
-        T, request, omega, branches.lambda, lower, readout, branches.xin, amplitude
+    perturbed_in = progress_operation("perturbed integration"; payload=Dict(
+        "branch" => "Xin",
+    )) do
+        integrate_real_branch(
+            T, request, omega, branches.lambda, lower, readout, branches.xin, amplitude
+        )
+    end
+    perturbed_up = progress_operation("perturbed integration"; payload=Dict(
+        "branch" => "Xup",
+    )) do
+        integrate_real_branch(
+            T, request, omega, branches.lambda, lower, readout, branches.xup, amplitude
+        )
+    end
+    return progress_operation("Wronskian") do
+        wronskian(perturbed_in, perturbed_up)
+    end
+end
+
+function determinant_progress(
+    ::Type{T}, request, omega::Complex{T}, amplitude::Complex{T},
+    purpose::String, current::Complex{T},
+) where {T<:AbstractFloat}
+    started = time_ns()
+    context = Dict{String,Any}(
+        "determinant_purpose" => purpose,
+        "current_omega" => progress_complex(current),
+        "candidate_omega" => progress_complex(omega),
     )
-    perturbed_up = integrate_real_branch(
-        T, request, omega, branches.lambda, lower, readout, branches.xup, amplitude
-    )
-    return wronskian(perturbed_in, perturbed_up)
+    progress_emit("determinant_started"; context=context, payload=Dict(
+        "purpose" => purpose,
+        "omega" => progress_complex(omega),
+    ))
+    value = determinant(T, request, omega, amplitude)
+    progress_emit("determinant_completed"; context=context, payload=Dict(
+        "purpose" => purpose,
+        "omega" => progress_complex(omega),
+        "determinant_real" => string(real(value)),
+        "determinant_imag" => string(imag(value)),
+        "determinant_abs" => string(abs(value)),
+        "elapsed_seconds" => (time_ns() - started) / 1.0e9,
+    ))
+    return value
 end
 
 function bounded_newton(::Type{T}, request, initial::Complex{T}, amplitude::Complex{T}) where {T<:AbstractFloat}
@@ -312,35 +414,113 @@ function bounded_newton(::Type{T}, request, initial::Complex{T}, amplitude::Comp
     maximum_iterations = parse_integer(request, "max_newton_iterations")
     value = initial
     best_value = value
-    best_residual = abs(determinant(T, request, value, amplitude))
-    for _ in 1:maximum_iterations
-        residual = determinant(T, request, value, amplitude)
+    best_residual = abs(determinant_progress(
+        T, request, value, amplitude, "initial best", value
+    ))
+    for iteration in 1:maximum_iterations
+        iteration_started = time_ns()
+        residual = determinant_progress(T, request, value, amplitude, "residual", value)
         magnitude = abs(residual)
         if magnitude < best_residual
             best_value, best_residual = value, magnitude
         end
-        magnitude <= tolerance && return value, magnitude, true
+        newton_context = Dict{String,Any}(
+            "newton_index" => iteration,
+            "newton_limit" => maximum_iterations,
+            "current_omega" => progress_complex(value),
+        )
+        progress_emit("newton_iteration_started"; context=newton_context, payload=Dict(
+            "current_omega" => progress_complex(value),
+            "determinant_abs" => string(magnitude),
+            "best_determinant_abs" => string(best_residual),
+        ))
+        if magnitude <= tolerance
+            progress_emit("newton_iteration_completed"; context=newton_context, payload=Dict(
+                "derivative_abs" => nothing,
+                "raw_step" => nothing,
+                "applied_step" => nothing,
+                "step_abs" => "0",
+                "clipped" => false,
+                "damping" => "0",
+                "accepted" => true,
+                "resulting_omega" => progress_complex(value),
+                "resulting_determinant_abs" => string(magnitude),
+                "elapsed_seconds" => (time_ns() - iteration_started) / 1.0e9,
+            ))
+            return value, magnitude, true
+        end
         h = frequency_step * (one(T) + abs(value))
         derivative = (
-            determinant(T, request, value + h, amplitude) -
-            determinant(T, request, value - h, amplitude)
+            determinant_progress(T, request, value + h, amplitude, "derivative +h", value) -
+            determinant_progress(T, request, value - h, amplitude, "derivative -h", value)
         ) / (T(2) * h)
-        iszero(derivative) && break
-        step = residual / derivative
+        derivative_abs = abs(derivative)
+        if iszero(derivative)
+            progress_emit("newton_iteration_completed"; context=newton_context, payload=Dict(
+                "derivative_abs" => string(derivative_abs),
+                "raw_step" => nothing,
+                "applied_step" => nothing,
+                "step_abs" => "0",
+                "clipped" => false,
+                "damping" => "0",
+                "accepted" => false,
+                "resulting_omega" => progress_complex(value),
+                "resulting_determinant_abs" => string(magnitude),
+                "elapsed_seconds" => (time_ns() - iteration_started) / 1.0e9,
+            ))
+            break
+        end
+        raw_step = residual / derivative
+        step = raw_step
         maximum_step = parse(T, "0.006")
-        abs(step) > maximum_step && (step *= maximum_step / abs(step))
+        clipped = abs(step) > maximum_step
+        clipped && (step *= maximum_step / abs(step))
         accepted = false
+        selected_damping = parse(T, "0.125")
+        resulting_abs = magnitude
         for damping in (
             one(T), parse(T, "0.5"), parse(T, "0.25"), parse(T, "0.125")
         )
             candidate = value - damping * step
-            if abs(determinant(T, request, candidate, amplitude)) < magnitude
+            candidate_residual = determinant_progress(
+                T, request, candidate, amplitude, "damping $(damping)", value
+            )
+            candidate_abs = abs(candidate_residual)
+            decision_context = merge(
+                newton_context,
+                Dict{String,Any}("candidate_omega" => progress_complex(candidate)),
+            )
+            progress_emit("damping_decided"; context=decision_context, payload=Dict(
+                "damping" => string(damping),
+                "candidate_omega" => progress_complex(candidate),
+                "candidate_determinant_abs" => string(candidate_abs),
+                "accepted" => candidate_abs < magnitude,
+            ))
+            if candidate_abs < magnitude
                 value = candidate
                 accepted = true
+                selected_damping = damping
+                resulting_abs = candidate_abs
                 break
             end
         end
-        accepted || (value -= parse(T, "0.125") * step)
+        if !accepted
+            value -= parse(T, "0.125") * step
+            resulting_abs = candidate_abs
+        end
+        applied_step = selected_damping * step
+        progress_emit("newton_iteration_completed"; context=newton_context, payload=Dict(
+            "derivative_abs" => string(derivative_abs),
+            "raw_step" => progress_complex(raw_step),
+            "applied_step" => progress_complex(applied_step),
+            "step_abs" => string(abs(applied_step)),
+            "clipped" => clipped,
+            "damping" => string(selected_damping),
+            "accepted" => accepted,
+            "resulting_omega" => progress_complex(value),
+            "resulting_determinant_abs" => string(resulting_abs),
+            "elapsed_seconds" => (time_ns() - iteration_started) / 1.0e9,
+        ))
     end
     return best_value, best_residual, best_residual <= tolerance
 end
@@ -351,13 +531,39 @@ function solve_once(::Type{T}, request, initial::Complex{T}, amplitude::Complex{
     root, residual, converged = bounded_newton(T, request, initial, amplitude)
     root_step = parse_real(T, request, "frequency_step") * (one(T) + abs(root))
     root_derivative = (
-        determinant(T, request, root + root_step, amplitude) -
-        determinant(T, request, root - root_step, amplitude)
+        determinant_progress(T, request, root + root_step, amplitude, "final derivative +h", root) -
+        determinant_progress(T, request, root - root_step, amplitude, "final derivative -h", root)
     ) / (T(2) * root_step)
     derivative_abs = abs(root_derivative)
     isfinite(derivative_abs) && derivative_abs > zero(T) ||
         error("determinant frequency derivative is unusable")
     return root, residual, derivative_abs, converged
+end
+
+function solve_phase(
+    ::Type{T}, request, phase::String, initial::Complex{T}, amplitude::Complex{T}
+) where {T<:AbstractFloat}
+    started = time_ns()
+    context = Dict{String,Any}(
+        "phase" => phase,
+        "seed_omega" => progress_complex(initial),
+        "current_omega" => progress_complex(initial),
+    )
+    return progress_scope(context) do
+        progress_emit("root_phase_started"; payload=Dict(
+            "seed_omega" => progress_complex(initial),
+            "current_omega" => progress_complex(initial),
+        ))
+        result = solve_once(T, request, initial, amplitude)
+        progress_emit("root_phase_completed"; payload=Dict(
+            "resulting_omega" => progress_complex(result[1]),
+            "resulting_determinant_abs" => string(result[2]),
+            "derivative_abs" => string(result[3]),
+            "converged" => result[4],
+            "elapsed_seconds" => (time_ns() - started) / 1.0e9,
+        ))
+        result
+    end
 end
 
 function refined_request(::Type{T}, request, kind::Symbol) where {T<:AbstractFloat}
@@ -385,17 +591,17 @@ function result_fields(::Type{T}, request, digits::Int, bits::Int) where {T<:Abs
     amplitude = parse_complex(T, request, "amplitude_re", "amplitude_im")
 
     root, residual, derivative_abs, primary_converged =
-        solve_once(T, request, omega, amplitude)
-    truncation_root, _, _, truncation_converged = solve_once(
-        T, refined_request(T, request, :truncation), root, amplitude
+        solve_phase(T, request, "PRIMARY", omega, amplitude)
+    truncation_root, _, _, truncation_converged = solve_phase(
+        T, refined_request(T, request, :truncation), "TRUNCATION", root, amplitude
     )
-    resolution_root, _, _, resolution_converged = solve_once(
-        T, refined_request(T, request, :resolution), root, amplitude
+    resolution_root, _, _, resolution_converged = solve_phase(
+        T, refined_request(T, request, :resolution), "RESOLUTION", root, amplitude
     )
     alternate = omega + Complex{T}(T("0.00025"), T("0.000125")) *
         (one(T) + abs(omega))
     seed_path_root, _, _, seed_path_converged =
-        solve_once(T, request, alternate, amplitude)
+        solve_phase(T, request, "SEED-PATH", alternate, amplitude)
     branch_tolerance = T("0.005")
     branch_valid = abs(root - omega) <= branch_tolerance && all(
         abs(candidate - root) <= branch_tolerance
@@ -452,9 +658,18 @@ function main()
     document = JSON.parsefile(request_path)
     request = flatten_request(document)
     try
+        progress_emit("request_started"; payload=Dict(
+            "request_sha256" => string(required(request, "request_sha256")),
+        ))
+        progress_emit("request_validated"; payload=Dict(
+            "request_sha256" => string(required(request, "request_sha256")),
+        ))
         result = Dict(evaluate_request(request))
         mkpath(dirname(response_path))
         write(response_path, JSON.json(result))
+        progress_emit("request_completed"; payload=Dict(
+            "request_sha256" => string(required(request, "request_sha256")),
+        ))
         return 0
     catch failure
         result = Dict(
@@ -465,6 +680,10 @@ function main()
         )
         mkpath(dirname(response_path))
         write(response_path, JSON.json(result))
+        progress_emit("request_failed"; payload=Dict(
+            "error_type" => string(typeof(failure)),
+            "message" => sprint(showerror, failure),
+        ))
         @error "M02 Julia precision worker failed" exception=(failure, catch_backtrace())
         return 21
     end
