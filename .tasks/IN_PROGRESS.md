@@ -47,7 +47,7 @@ Confirm that a fresh checkout can originate every M02 numerical prerequisite fro
 - Index and validate one exact pair record at a time, then assemble the records selected by the campaign for the existing `StandardSN` consumer.
 - Route package-owned Julia 80/120-digit root readouts through the existing campaign stage and evidence contracts.
 - Launch all 553 leaves from `m02.ps1`; the user supplies the physical Windows execution evidence and failure logs.
-- Add out-of-band quiet/normal/trace inner-leaf progress while preserving scientific execution and checkpoint/evidence bytes.
+- Render normal progress as a stateful in-place dashboard with acceptance state and rolling ETA while preserving console history, scientific execution, and checkpoint/evidence bytes.
 - Bind `m02.ps1` bootstrap switches as actual PowerShell parameters, and prove the boundary with a mocked Windows bootstrap invocation.
 - Move the normal Windows runtime to a versioned per-user LocalAppData root; retain an explicit package-local portable mode, validate runtime receipts before reuse, and leave checkout-local campaign state untouched.
 - Add Windows PowerShell 5.1 parse-and-safe-execution coverage for the actual bootstrap, including PowerShell interpolation, path-character, and Juliaup WindowsApps-shim discovery regressions.
