@@ -19,6 +19,7 @@ from windows_solver.progress import (
     progress_scope,
 )
 from windows_solver.progress_output import CampaignProgressReporter
+from windows_solver.cli import build_parser
 
 
 class RecordingObserver:
@@ -30,6 +31,46 @@ class RecordingObserver:
 
 
 class ProgressBusTests(unittest.TestCase):
+    def test_campaign_run_and_resume_default_to_normal_progress(self):
+        parser = build_parser()
+        for command in ("campaign-run", "campaign-resume"):
+            arguments = parser.parse_args(
+                [command, "selection.json", "--checkpoint", "checkpoint.json"]
+            )
+            self.assertEqual(arguments.progress, "normal")
+            traced = parser.parse_args(
+                [
+                    command,
+                    "selection.json",
+                    "--checkpoint",
+                    "checkpoint.json",
+                    "--progress",
+                    "trace",
+                ]
+            )
+            self.assertEqual(traced.progress, "trace")
+
+    def test_progress_context_carries_unambiguous_omega_and_counter_fields(self):
+        observer = RecordingObserver()
+        omega = {"real": 0.5, "imaginary": -0.1}
+        with activate_progress(observer), progress_scope(
+            seed_omega=omega,
+            current_omega=omega,
+            candidate_omega=omega,
+            determinant_index_leaf=137,
+            determinant_index_phase=42,
+            determinant_index_newton=3,
+        ):
+            emit_progress(ProgressEventKind.DETERMINANT_COMPLETED)
+
+        context = observer.events[0].context
+        self.assertEqual(context.seed_omega, omega)
+        self.assertEqual(context.current_omega, omega)
+        self.assertEqual(context.candidate_omega, omega)
+        self.assertEqual(context.determinant_index_leaf, 137)
+        self.assertEqual(context.determinant_index_phase, 42)
+        self.assertEqual(context.determinant_index_newton, 3)
+
     def test_progress_scope_carries_the_complete_hierarchy_without_global_leakage(self):
         observer = RecordingObserver()
         with activate_progress(observer), progress_scope(
@@ -199,10 +240,124 @@ def _event(kind: ProgressEventKind, **context_values):
     return observer.events[0]
 
 
+def _payload_event(kind: ProgressEventKind, payload, **context_values):
+    observer = RecordingObserver()
+    with activate_progress(observer), progress_scope(**context_values):
+        emit_progress(kind, **payload)
+    return observer.events[0]
+
+
 class CampaignProgressReporterTests(unittest.TestCase):
+    def setUp(self):
+        self._reporter_directory = TemporaryDirectory()
+        self.reporter_checkpoint = (
+            Path(self._reporter_directory.name) / "checkpoint.json"
+        )
+
+    def tearDown(self):
+        self._reporter_directory.cleanup()
+
+    def test_normal_writes_atomic_live_status_for_second_process_inspection(self):
+        with TemporaryDirectory() as directory:
+            checkpoint = Path(directory) / "checkpoint.json"
+            reporter = CampaignProgressReporter("normal", checkpoint, io.StringIO())
+            reporter.publish(
+                _event(
+                    ProgressEventKind.LEAF_STARTED,
+                    leaf_id="leaf-1",
+                    leaf_index=1,
+                    leaf_count=553,
+                    role="primary",
+                    mode={"s": -2, "ell": 2, "m": 2, "n": 0},
+                    spin=0.95,
+                    sampling_coordinate={"coordinate_id": "a_over_M", "value": 0.95},
+                    mechanism_id="horizon-admittance",
+                )
+            )
+            status_path = Path(f"{checkpoint}.status.json")
+            status = json.loads(status_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(status["kind"], "leaf_started")
+        self.assertEqual(status["context"]["leaf_index"], 1)
+        self.assertEqual(status["context"]["leaf_count"], 553)
+        self.assertEqual(status["context"]["mode"]["ell"], 2)
+
+    def test_normal_determinant_status_names_all_three_counters_and_numerics(self):
+        stream = io.StringIO()
+        reporter = CampaignProgressReporter("normal", self.reporter_checkpoint, stream)
+        reporter.publish(
+            _payload_event(
+                ProgressEventKind.DETERMINANT_COMPLETED,
+                {
+                    "determinant_abs": 1.0e-12,
+                    "best_determinant_abs": 5.0e-13,
+                },
+                leaf_id="leaf-1",
+                leaf_index=1,
+                leaf_count=553,
+                role="primary",
+                mode={"s": -2, "ell": 2, "m": 2, "n": 0},
+                spin=0.95,
+                sampling_coordinate={"coordinate_id": "kappa", "value": 0.05},
+                mechanism_id="horizon-admittance",
+                phase="PRIMARY",
+                newton_index=4,
+                newton_limit=12,
+                determinant_index_leaf=137,
+                determinant_index_phase=42,
+                determinant_index_newton=3,
+                determinant_purpose="damping 0.5",
+                current_omega={"real": 0.5, "imaginary": -0.1},
+            )
+        )
+
+        output = stream.getvalue()
+        self.assertIn("leaf=1/553", output)
+        self.assertIn("leaf_id=leaf-1", output)
+        self.assertIn("s=-2 ell=2 m=2 n=0", output)
+        self.assertIn("a/M=0.95", output)
+        self.assertIn("source={'coordinate_id': 'kappa', 'value': 0.05}", output)
+        self.assertIn("Newton=4/12", output)
+        self.assertIn("leaf-total=137", output)
+        self.assertIn("phase-total=42", output)
+        self.assertIn("newton-total=3", output)
+        self.assertIn("purpose=damping 0.5", output)
+        self.assertIn("current_|D|=1e-12", output)
+        self.assertIn("best_|D|=5e-13", output)
+
+    def test_live_status_throttles_detail_events_but_forces_leaf_visibility(self):
+        reporter = CampaignProgressReporter(
+            "normal", self.reporter_checkpoint, io.StringIO()
+        )
+        with patch.object(reporter, "_write_status") as write_status:
+            reporter.publish(
+                _event(
+                    ProgressEventKind.LEAF_STARTED,
+                    leaf_id="leaf-1",
+                    leaf_index=1,
+                    leaf_count=553,
+                )
+            )
+            reporter.publish(
+                _event(
+                    ProgressEventKind.DETERMINANT_STARTED,
+                    leaf_id="leaf-1",
+                    phase="PRIMARY",
+                )
+            )
+            reporter.publish(
+                _payload_event(
+                    ProgressEventKind.DETERMINANT_COMPLETED,
+                    {"determinant_abs": 1.0e-12},
+                    leaf_id="leaf-1",
+                    phase="PRIMARY",
+                )
+            )
+
+        self.assertEqual(write_status.call_count, 1)
     def test_quiet_renders_only_leaf_and_terminal_events(self):
         stream = io.StringIO()
-        reporter = CampaignProgressReporter("quiet", Path("checkpoint.json"), stream)
+        reporter = CampaignProgressReporter("quiet", self.reporter_checkpoint, stream)
         reporter.publish(_event(ProgressEventKind.CAMPAIGN_STARTED))
         reporter.publish(_event(ProgressEventKind.LEAF_STARTED, leaf_id="leaf-1"))
         reporter.publish(
@@ -222,7 +377,7 @@ class CampaignProgressReporterTests(unittest.TestCase):
 
     def test_normal_renders_identity_phase_newton_and_in_place_determinant_status(self):
         stream = io.StringIO()
-        reporter = CampaignProgressReporter("normal", Path("checkpoint.json"), stream)
+        reporter = CampaignProgressReporter("normal", self.reporter_checkpoint, stream)
         reporter.publish(
             _event(
                 ProgressEventKind.LEAF_STARTED,
@@ -270,7 +425,8 @@ class CampaignProgressReporterTests(unittest.TestCase):
         reporter.publish(_event(ProgressEventKind.LEAF_COMPLETED, leaf_id="leaf-1"))
 
         output = stream.getvalue()
-        self.assertIn("leaf=leaf-1", output)
+        self.assertIn("leaf=1/1", output)
+        self.assertIn("leaf_id=leaf-1", output)
         self.assertIn("root_phase_started", output)
         self.assertIn("newton_iteration_started", output)
         self.assertEqual(output.count("\rdeterminant"), 3)
@@ -423,7 +579,9 @@ class CampaignProgressReporterTests(unittest.TestCase):
                 raise OSError("broken progress stream")
 
         event = _event(ProgressEventKind.LEAF_STARTED, leaf_id="leaf-1", leaf_index=1)
-        reporter = CampaignProgressReporter("trace", Path("checkpoint.json"), BrokenStream())
+        reporter = CampaignProgressReporter(
+            "trace", self.reporter_checkpoint, BrokenStream()
+        )
         reporter.publish(event)
 
         self.assertEqual(len(reporter.diagnostics), 1)
