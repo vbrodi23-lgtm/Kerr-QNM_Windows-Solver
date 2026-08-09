@@ -2086,7 +2086,9 @@ class NativeCampaignStageBackend:
     def _cache_runtime(self) -> dict[str, object]:
         return {
             "backend": "python-binary64-gsn",
-            "artifact_id": self.generated_cache.artifact_id,
+            "record_artifact_ids": list(
+                self.generated_cache.record_artifact_ids
+            ),
             "cache_path": str(self.generated_cache.path),
             "cache_sha256_observed": self.generated_cache.sha256,
             "parameter_pairs": [
