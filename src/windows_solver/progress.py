@@ -41,11 +41,17 @@ class ProgressEventKind(StrEnum):
     ROOT_PHASE_COMPLETED = "root_phase_completed"
     NEWTON_ITERATION_STARTED = "newton_iteration_started"
     NEWTON_ITERATION_COMPLETED = "newton_iteration_completed"
+    DETERMINANT_STARTED = "determinant_started"
+    DETERMINANT_COMPLETED = "determinant_completed"
     DETERMINANT_EVALUATED = "determinant_evaluated"
     CANDIDATE_EVALUATED = "candidate_evaluated"
     DAMPING_DECIDED = "damping_decided"
     SUBOPERATION_STARTED = "suboperation_started"
     SUBOPERATION_COMPLETED = "suboperation_completed"
+    REQUEST_STARTED = "request_started"
+    REQUEST_VALIDATED = "request_validated"
+    REQUEST_COMPLETED = "request_completed"
+    REQUEST_FAILED = "request_failed"
     ERROR = "error"
 
 
@@ -55,15 +61,24 @@ def _freeze(value: object) -> object:
     if isinstance(value, Mapping):
         frozen: dict[str, object] = {}
         for key, item in value.items():
-            if not isinstance(key, str):
-                raise ValueError("progress mapping keys must be strings")
-            frozen[key] = _freeze(item)
+            frozen[key if isinstance(key, str) else _safe_text(key)] = _freeze(item)
         return MappingProxyType(frozen)
     if isinstance(value, (list, tuple)):
         return tuple(_freeze(item) for item in value)
     if isinstance(value, (set, frozenset)):
         return frozenset(_freeze(item) for item in value)
-    return value
+    if isinstance(value, bytearray):
+        return bytes(value)
+    if value is None or isinstance(value, (bool, int, float, str, bytes, complex)):
+        return value
+    return _safe_text(value)
+
+
+def _safe_text(value: object) -> str:
+    try:
+        return repr(value)
+    except Exception:
+        return f"<unrepresentable {type(value).__name__}>"
 
 
 def _mapping_snapshot(values: Mapping[str, object]) -> Mapping[str, object]:
@@ -100,9 +115,12 @@ _MAPPING_CONTEXT_KEYS = frozenset(
 
 
 def _validate_context_values(values: Mapping[str, object]) -> Mapping[str, object]:
-    unknown = sorted(set(values) - _PROGRESS_CONTEXT_KEYS)
+    unknown = set(values) - _PROGRESS_CONTEXT_KEYS
     if unknown:
-        raise ValueError("unknown progress context fields: " + ", ".join(unknown))
+        raise ValueError(
+            "unknown progress context fields: "
+            + ", ".join(sorted(_safe_text(key) for key in unknown))
+        )
     for name, value in values.items():
         if value is None:
             continue
@@ -254,6 +272,6 @@ def ingest_external_progress(value: object) -> ProgressEvent | None:
     payload = value["payload"]
     if not isinstance(context, Mapping) or not isinstance(payload, Mapping):
         raise ValueError("external progress context and payload must be mappings")
-    validated_context = ProgressContext.from_mapping(context)
-    with progress_scope(**validated_context.to_mapping()):
+    validated_context = _validate_context_values(context)
+    with progress_scope(**validated_context):
         return emit_progress(kind, **_mapping_snapshot(payload))

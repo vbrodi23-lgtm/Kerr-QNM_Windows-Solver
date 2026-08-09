@@ -17,7 +17,6 @@ from .progress import PROGRESS_SCHEMA, ProgressEvent, ProgressEventKind, Progres
 
 _QUIET_KINDS = frozenset(
     {
-        ProgressEventKind.CAMPAIGN_STARTED,
         ProgressEventKind.CAMPAIGN_COMPLETED,
         ProgressEventKind.CAMPAIGN_FAILED,
         ProgressEventKind.LEAF_STARTED,
@@ -29,6 +28,7 @@ _QUIET_KINDS = frozenset(
 )
 _NORMAL_KINDS = _QUIET_KINDS | frozenset(
     {
+        ProgressEventKind.CAMPAIGN_STARTED,
         ProgressEventKind.CHECKPOINT_WRITING,
         ProgressEventKind.CHECKPOINT_WRITTEN,
         ProgressEventKind.PRECISION_STAGE_STARTED,
@@ -113,7 +113,10 @@ class CampaignProgressReporter:
         )
         if event.kind is ProgressEventKind.NEWTON_ITERATION_STARTED:
             counters["newton"] += 1
-        elif event.kind is ProgressEventKind.DETERMINANT_EVALUATED:
+        elif event.kind in {
+            ProgressEventKind.DETERMINANT_STARTED,
+            ProgressEventKind.DETERMINANT_EVALUATED,
+        }:
             counters["determinant"] += 1
         self._sequence += 1
         return {
@@ -137,7 +140,11 @@ class CampaignProgressReporter:
                 self._ordinary_line(record)
             return
         if self.mode is ProgressMode.NORMAL:
-            if event.kind is ProgressEventKind.DETERMINANT_EVALUATED:
+            if event.kind in {
+                ProgressEventKind.DETERMINANT_STARTED,
+                ProgressEventKind.DETERMINANT_COMPLETED,
+                ProgressEventKind.DETERMINANT_EVALUATED,
+            }:
                 self._determinant_status(record)
             elif event.kind in _NORMAL_KINDS:
                 self._ordinary_line(record)
@@ -162,6 +169,8 @@ class CampaignProgressReporter:
             "readout_index",
             "readout_role",
             "phase",
+            "determinant_purpose",
+            "suboperation",
         ):
             value = context[name]
             if value is not None:
@@ -210,7 +219,7 @@ class CampaignProgressReporter:
         assert isinstance(context, Mapping)
         leaf_index = context["leaf_index"]
         if isinstance(leaf_index, bool) or not isinstance(leaf_index, int):
-            raise ValueError("trace event requires an integer leaf_index")
+            return
         path = Path(f"{self.checkpoint}.progress") / f"leaf-{leaf_index:06d}.jsonl"
         path.parent.mkdir(parents=True, exist_ok=True)
         if path not in self._traced_leaf_paths:
