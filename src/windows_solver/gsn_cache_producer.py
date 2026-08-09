@@ -21,6 +21,8 @@ import subprocess
 import time
 from typing import Callable, Iterable, Iterator, Mapping, Sequence
 
+from .linear_response import spin_from_dimensionless_surface_gravity
+
 
 GSN_INDEX_SCHEMA_VERSION = 2
 GSN_RECORD_SCHEMA_VERSION = 2
@@ -166,7 +168,10 @@ def _parameter_pair_for_leaf(leaf: object) -> GsnParameterPair:
     elif coordinate.transformation_id == (
         "kerr-prograde-spin-from-dimensionless-surface-gravity"
     ):
-        spin = 2 * exact_coordinate / (1 + exact_coordinate * exact_coordinate)
+        resolved_spin = spin_from_dimensionless_surface_gravity(
+            float(exact_coordinate)
+        )
+        spin = Fraction(*resolved_spin.as_integer_ratio())
     else:
         raise GsnCacheProductionError(
             f"unsupported campaign spin transformation {coordinate.transformation_id!r}"
@@ -353,13 +358,21 @@ def _pair_from_identity(value: object) -> GsnParameterPair:
     if not isinstance(value, Mapping) or set(value) != fields:
         raise GsnCacheProductionError("GSN index logical identity is invalid")
     if (
-        value["spin_weight"] != GSN_SPIN_WEIGHT
-        or value["mass_normalization"] != GSN_MASS_NORMALIZATION
-        or value["equation_convention"] != GSN_EQUATION_CONVENTION
-        or value["producer_contract_version"] != GSN_PRODUCER_CONTRACT_VERSION
-        or value["consumer_contract_version"] != GSN_CONSUMER_CONTRACT_VERSION
+        isinstance(value["spin_weight"], bool)
+        or not isinstance(value["spin_weight"], int)
+        or isinstance(value["mass_normalization"], bool)
+        or not isinstance(value["mass_normalization"], int)
+        or value["mass_normalization"] <= 0
+        or not isinstance(value["equation_convention"], str)
+        or not value["equation_convention"]
+        or isinstance(value["producer_contract_version"], bool)
+        or not isinstance(value["producer_contract_version"], int)
+        or value["producer_contract_version"] <= 0
+        or isinstance(value["consumer_contract_version"], bool)
+        or not isinstance(value["consumer_contract_version"], int)
+        or value["consumer_contract_version"] <= 0
     ):
-        raise GsnCacheProductionError("GSN index logical contract is incompatible")
+        raise GsnCacheProductionError("GSN index logical contract is invalid")
     try:
         pair = GsnParameterPair(
             value["resolved_spin_numerator"],
@@ -419,8 +432,8 @@ def _load_artifact_index(path: Path) -> dict[str, object]:
                 "GSN artifact index ID is invalid or duplicated"
             )
         ids.add(artifact_id)
-        pair = _pair_from_identity(row["logical_identity"])
-        identity_key = _canonical_json(pair.logical_identity())
+        _pair_from_identity(row["logical_identity"])
+        identity_key = _canonical_json(row["logical_identity"])
         if identity_key in identities:
             raise GsnCacheProductionError(
                 "GSN artifact index logical identity is duplicated"
