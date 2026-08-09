@@ -476,13 +476,78 @@ class CampaignProgressReporterTests(unittest.TestCase):
         )
 
         output = stream.getvalue()
-        self.assertTrue(output.startswith(history + "\x1b7"))
-        self.assertEqual(output.count("\x1b7"), 1)
-        self.assertEqual(output.count("\x1b8"), 1)
+        self.assertTrue(output.startswith(history + "\x1b[0J"))
+        self.assertIn("\x1b[35F", output)
+        self.assertNotIn("\x1b7", output)
+        self.assertNotIn("\x1b8", output)
         self.assertEqual(output.count("\x1b[0J"), 2)
         self.assertNotIn("\x1b[2J", output)
         self.assertIn("Event          : leaf_started", output)
         self.assertIn("Event          : leaf_completed", output)
+
+    def test_normal_console_compacts_without_wrapping_or_scrollback_panels(self):
+        class ConsoleStream(io.StringIO):
+            def isatty(self):
+                return True
+
+        stream = ConsoleStream()
+        history = "[bootstrap] solver plan succeeded\nPS> .\\m02.ps1\n"
+        stream.write(history)
+        reporter = CampaignProgressReporter("normal", self.reporter_checkpoint, stream)
+        with patch.object(reporter, "_terminal_dimensions", return_value=(80, 24)):
+            first = _payload_event(
+                ProgressEventKind.DETERMINANT_COMPLETED,
+                {
+                    "determinant_abs": 3.2e-8,
+                    "best_determinant_abs": 2.1e-9,
+                    "acceptance_threshold": 1.0e-10,
+                },
+                leaf_id="b-prime-leaf-" + "9" * 64,
+                leaf_index=1,
+                leaf_count=553,
+                role="primary",
+                mode={"s": -2, "ell": 2, "m": 2, "n": 0},
+                spin=0.95,
+                mechanism_id="horizon-admittance",
+                precision_digits=64,
+                phase="PRIMARY",
+                newton_index=2,
+                determinant_index_leaf=137,
+                determinant_index_phase=42,
+                determinant_index_newton=3,
+                suboperation="Xup integration",
+            )
+            reporter.publish(first)
+            reporter.publish(
+                replace(
+                    _event(
+                        ProgressEventKind.SUBOPERATION_COMPLETED,
+                        leaf_id="b-prime-leaf-" + "9" * 64,
+                        leaf_index=1,
+                        leaf_count=553,
+                        phase="PRIMARY",
+                        suboperation="Xup integration",
+                    ),
+                    monotonic_seconds=first.monotonic_seconds + 1.0,
+                )
+            )
+
+        output = stream.getvalue()
+        self.assertTrue(output.startswith(history + "\x1b[0J"))
+        self.assertIn("\x1b[13F", output)
+        self.assertNotIn("\x1b7", output)
+        self.assertNotIn("\x1b8", output)
+        self.assertNotIn("\x1b[2J", output)
+        latest_panel = output.rsplit("\x1b[13F\x1b[0J", 1)[-1]
+        lines = latest_panel.splitlines()
+        self.assertEqual(len(lines), 13)
+        self.assertTrue(all(len(line) <= 80 for line in lines))
+        self.assertIn("M02 CAMPAIGN", latest_panel)
+        self.assertIn("LeafStatus: RUNNING", latest_panel)
+        self.assertIn("Completed: 0/553 | Accepted: 0 | Rejected: 0", latest_panel)
+        self.assertIn("DeterminantAbs: 3.2e-08", latest_panel)
+        self.assertIn("DetLeaf: 137 | DetPhase: 42 | DetNewton: 3", latest_panel)
+        self.assertIn("Suboperation: Xup integration", latest_panel)
 
     def test_normal_console_estimates_eta_from_rolling_completed_leaf_timings(self):
         class ConsoleStream(io.StringIO):
