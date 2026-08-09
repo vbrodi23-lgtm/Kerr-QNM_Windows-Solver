@@ -144,8 +144,33 @@ class PublicSurfaceTests(unittest.TestCase):
         self.assertIn(r'Join-Path $RuntimeRoot "julia"', bootstrap)
         self.assertIn(r'Join-Path $JuliaRoot "bin\julia.exe"', bootstrap)
         self.assertIn("$Policy.julia.sha256", bootstrap)
-        self.assertIn("Expand-Archive", bootstrap)
         self.assertIn("julia_runtime", bootstrap)
+
+    def test_m02_bootstrap_extracts_julia_with_windows_tar(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        bootstrap = (root / "runtime" / "bootstrap.ps1").read_text(
+            encoding="utf-8"
+        )
+        julia_install = bootstrap[
+            bootstrap.index(
+                'if (-not (Test-Path -LiteralPath $JuliaExe -PathType Leaf))'
+            ) : bootstrap.index("\n    $JuliaIdentity")
+        ]
+
+        self.assertIn('Get-Command -Name "tar.exe"', julia_install)
+        self.assertIn(
+            'Invoke-Native $TarExe @("-xf", $JuliaArchive, "-C", $JuliaExtract)',
+            julia_install,
+        )
+        self.assertIn(
+            'New-Item -ItemType Directory -Force -Path $JuliaExtract',
+            julia_install,
+        )
+        self.assertIn(
+            'Get-ChildItem -LiteralPath $JuliaExtract -Filter "julia.exe"',
+            julia_install,
+        )
+        self.assertNotIn("Expand-Archive", julia_install)
 
     def test_campaign_runbook_has_no_historic_cache_environment_prerequisite(
         self,
