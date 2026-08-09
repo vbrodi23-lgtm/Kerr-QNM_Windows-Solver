@@ -283,11 +283,18 @@ if ($WithM02) {
     Write-Step "Julia archive verified ($ActualJuliaSha256)"
 
     if (-not (Test-Path -LiteralPath $JuliaExe -PathType Leaf)) {
+        $TarCommand = Get-Command -Name "tar.exe" -CommandType Application `
+            -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($null -eq $TarCommand) {
+            throw "Windows tar.exe is required to extract portable Julia, but it is unavailable on PATH."
+        }
+        $TarExe = $TarCommand.Path
         $JuliaExtract = Join-Path $TempRoot "julia-extract"
         if (Test-Path -LiteralPath $JuliaExtract) {
             Remove-Item -LiteralPath $JuliaExtract -Recurse -Force
         }
-        Expand-Archive -LiteralPath $JuliaArchive -DestinationPath $JuliaExtract -Force
+        New-Item -ItemType Directory -Force -Path $JuliaExtract | Out-Null
+        Invoke-Native $TarExe @("-xf", $JuliaArchive, "-C", $JuliaExtract)
         $FoundJulia = Get-ChildItem -LiteralPath $JuliaExtract -Filter "julia.exe" -File -Recurse |
             Select-Object -First 1
         if ($null -eq $FoundJulia) {
