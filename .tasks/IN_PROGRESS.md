@@ -49,5 +49,6 @@ Confirm that a fresh checkout can originate every M02 numerical prerequisite fro
 - Launch all 553 leaves from `m02.ps1`; the user supplies the physical Windows execution evidence and failure logs.
 - Add out-of-band quiet/normal/trace inner-leaf progress while preserving scientific execution and checkpoint/evidence bytes.
 - Bind `m02.ps1` bootstrap switches as actual PowerShell parameters, and prove the boundary with a mocked Windows bootstrap invocation.
+- Move the normal Windows runtime to a versioned per-user LocalAppData root; retain an explicit package-local portable mode, validate runtime receipts before reuse, and leave checkout-local campaign state untouched.
 
 ---
