@@ -59,15 +59,15 @@ try {
     }
     Invoke-M02Command -Arguments @(
         $Command,
-        $SelectionPath,
+        $Selection,
         "--checkpoint",
-        $CheckpointPath
+        $Checkpoint
     )
     Invoke-M02Command -Arguments @(
         "campaign-validate",
-        $SelectionPath,
+        $Selection,
         "--checkpoint",
-        $CheckpointPath,
+        $Checkpoint,
         "--full"
     )
 }

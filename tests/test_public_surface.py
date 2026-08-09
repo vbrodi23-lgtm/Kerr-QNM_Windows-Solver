@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 import hashlib
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -395,6 +396,113 @@ class PublicSurfaceTests(unittest.TestCase):
         self.assertIn('"--full"', launcher)
         self.assertIn('if ($RebuildRuntime)', launcher)
         self.assertIn('$BootstrapArguments += "-Force"', launcher)
+        self.assertEqual(launcher.count("$Selection,"), 2)
+        self.assertEqual(launcher.count("\n        $Checkpoint\n"), 1)
+        self.assertEqual(launcher.count("\n        $Checkpoint,\n"), 1)
+        self.assertNotIn("$SelectionPath,", launcher)
+        self.assertNotIn("$CheckpointPath,", launcher)
+
+    @unittest.skipUnless(os.name == "nt", "requires Windows PowerShell 5.1")
+    def test_m02_public_default_invocation_forwards_safe_relative_paths(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        windows_powershell = Path(os.environ["SystemRoot"]).joinpath(
+            "System32", "WindowsPowerShell", "v1.0", "powershell.exe"
+        )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            package_root = Path(temporary) / "m02-public"
+            (package_root / "examples").mkdir(parents=True)
+            shutil.copy2(root / "m02.ps1", package_root / "m02.ps1")
+            shutil.copy2(
+                root / "examples" / "m02-campaign.json",
+                package_root / "examples" / "m02-campaign.json",
+            )
+            argument_log = package_root / "arguments.jsonl"
+            (package_root / "solver.ps1").write_text(
+                r'''param(
+    [Parameter(ValueFromRemainingArguments = $true)]
+    [string[]]$SolverArguments
+)
+
+$record = $SolverArguments | ConvertTo-Json -Compress
+[IO.File]::AppendAllText(
+    $env:M02_TEST_ARGUMENT_LOG,
+    $record + [Environment]::NewLine,
+    [System.Text.UTF8Encoding]::new($false)
+)
+$checkpointIndex = [Array]::IndexOf($SolverArguments, "--checkpoint")
+if ($checkpointIndex -lt 0) {
+    exit 91
+}
+if ($SolverArguments[0] -eq "campaign-run") {
+    $checkpointArgument = $SolverArguments[$checkpointIndex + 1]
+    $checkpoint = if ([IO.Path]::IsPathRooted($checkpointArgument)) {
+        [IO.Path]::GetFullPath($checkpointArgument)
+    }
+    else {
+        [IO.Path]::GetFullPath((Join-Path $PSScriptRoot $checkpointArgument))
+    }
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $checkpoint) |
+        Out-Null
+    [IO.File]::WriteAllText($checkpoint, "{}")
+}
+exit 0
+''',
+                encoding="utf-8",
+            )
+            environment = dict(os.environ)
+            environment["M02_TEST_ARGUMENT_LOG"] = str(argument_log)
+            result = subprocess.run(
+                [
+                    str(windows_powershell),
+                    "-NoLogo",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-File",
+                    str(package_root / "m02.ps1"),
+                    "-SkipBootstrap",
+                ],
+                cwd=root,
+                env=environment,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            self.assertEqual(
+                result.returncode,
+                0,
+                f"stdout={result.stdout!r} stderr={result.stderr!r}",
+            )
+            calls = [
+                json.loads(line)
+                for line in argument_log.read_text(encoding="utf-8").splitlines()
+            ]
+
+        selection = r".\examples\m02-campaign.json"
+        checkpoint = r".\m02-output\m02-campaign-checkpoint.json"
+        self.assertEqual(
+            calls,
+            [
+                ["campaign-run", selection, "--checkpoint", checkpoint],
+                [
+                    "campaign-validate",
+                    selection,
+                    "--checkpoint",
+                    checkpoint,
+                    "--full",
+                ],
+            ],
+        )
+        self.assertTrue(
+            all(
+                not Path(call[index]).is_absolute() and ":" not in call[index]
+                for call in calls
+                for index in (1, 3)
+            )
+        )
 
     def test_windows_ci_captures_native_streams_outside_powershell(self) -> None:
         root = Path(__file__).resolve().parents[1]
