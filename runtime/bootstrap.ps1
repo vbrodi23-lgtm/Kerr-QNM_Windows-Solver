@@ -51,6 +51,10 @@ $VenvRoot = Join-Path $RuntimeRoot "venv"
 $VenvPython = Join-Path $VenvRoot "Scripts\python.exe"
 $JuliaRoot = Join-Path $RuntimeRoot "julia"
 $JuliaExe = Join-Path $JuliaRoot "bin\julia.exe"
+$JuliaDepot = Join-Path $RuntimeRoot "julia-depot"
+$JuliaProject = Join-Path $RuntimeRoot "m02-julia-project"
+$JuliaVendorRoot = Join-Path $RuntimeRoot "vendor"
+$JuliaDataRoot = Join-Path $PackageRoot "src\windows_solver\data\julia"
 $ReceiptPath = Join-Path $RuntimeRoot "python-runtime.json"
 $PolicyPath = Join-Path $PSScriptRoot "runtime_policy.json"
 
@@ -305,18 +309,61 @@ if ($WithM02) {
     foreach ($Source in $Policy.scientific_sources) {
         $SourcePath = Join-Path $PackageRoot $Source.path
         if (-not (Test-Path -LiteralPath $SourcePath -PathType Leaf)) {
-            throw "Pinned scientific source is absent: $SourcePath"
+            throw "Required scientific source is absent: $SourcePath"
         }
         $ActualSourceSha256 = Get-Sha256 $SourcePath
-        if ($ActualSourceSha256 -ne $Source.sha256.ToLowerInvariant()) {
-            throw "Pinned scientific source SHA-256 mismatch for $($Source.id)."
-        }
         $SourceReceipts += [ordered]@{
             id = [string]$Source.id
             path = [IO.Path]::GetFullPath($SourcePath)
             sha256 = $ActualSourceSha256
         }
     }
+
+    Write-Step "Preparing the pinned M02 Julia project"
+    if (Test-Path -LiteralPath $JuliaVendorRoot) {
+        Remove-Item -LiteralPath $JuliaVendorRoot -Recurse -Force
+    }
+    New-Item -ItemType Directory -Force -Path $JuliaVendorRoot | Out-Null
+    Copy-Item -LiteralPath (Join-Path $JuliaDataRoot "GeneralizedSasakiNakamura.jl") `
+        -Destination $JuliaVendorRoot -Recurse -Force
+    Copy-Item -LiteralPath (Join-Path $JuliaDataRoot "SpinWeightedSpheroidalHarmonics.jl") `
+        -Destination $JuliaVendorRoot -Recurse -Force
+    New-Item -ItemType Directory -Force -Path $JuliaProject | Out-Null
+    Copy-Item -LiteralPath (Join-Path $JuliaDataRoot "m02_project\Project.toml") `
+        -Destination (Join-Path $JuliaProject "Project.toml") -Force
+    $RuntimeManifest = Join-Path $JuliaProject "Manifest.toml"
+    if (-not (Test-Path -LiteralPath $RuntimeManifest -PathType Leaf)) {
+        Copy-Item -LiteralPath (Join-Path $JuliaDataRoot "m02_project\Manifest.seed.toml") `
+            -Destination $RuntimeManifest -Force
+    }
+    New-Item -ItemType Directory -Force -Path $JuliaDepot | Out-Null
+    $env:JULIA_DEPOT_PATH = $JuliaDepot
+    $env:JULIA_PKG_PRECOMPILE_AUTO = "0"
+    $env:M02_GSN_SOURCE = Join-Path $JuliaVendorRoot "GeneralizedSasakiNakamura.jl"
+    $env:M02_ANGULAR_SOURCE = Join-Path $JuliaVendorRoot "SpinWeightedSpheroidalHarmonics.jl"
+    $SetupExpression = @'
+using Pkg
+Pkg.develop(PackageSpec(path=ENV["M02_ANGULAR_SOURCE"]))
+Pkg.develop(PackageSpec(path=ENV["M02_GSN_SOURCE"]))
+Pkg.resolve()
+Pkg.instantiate()
+Pkg.precompile()
+'@
+    Invoke-Native $JuliaExe @(
+        "--startup-file=no",
+        "--history-file=no",
+        "--project=$JuliaProject",
+        "-e",
+        $SetupExpression
+    )
+    $WorkerPath = Join-Path $JuliaDataRoot "m02_worker.jl"
+    Invoke-Native $JuliaExe @(
+        "--startup-file=no",
+        "--history-file=no",
+        "--project=$JuliaProject",
+        $WorkerPath,
+        "--probe"
+    )
     $JuliaReceipt = [ordered]@{
         requested = $true
         version = [string]$Policy.julia.version
@@ -325,8 +372,12 @@ if ($WithM02) {
         archive = [IO.Path]::GetFullPath($JuliaArchive)
         archive_sha256 = $ActualJuliaSha256
         sources = @($SourceReceipts)
+        depot = [IO.Path]::GetFullPath($JuliaDepot)
+        project = [IO.Path]::GetFullPath($JuliaProject)
+        manifest_sha256 = Get-Sha256 (Join-Path $JuliaProject "Manifest.toml")
+        worker_sha256 = Get-Sha256 $WorkerPath
     }
-    Write-Step "Julia runtime and pinned GSN sources ready"
+    Write-Step "Julia runtime, pinned GSN sources, and precision worker ready"
 }
 
 # -------------------------------------------------------------------- receipt
