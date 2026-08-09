@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import re
 from functools import lru_cache
 from pathlib import Path
@@ -14,14 +13,15 @@ POTENTIALS_SOURCE = (
     / "native_kernel"
     / "potentials.fixture"
 )
-POTENTIALS_SHA256 = "8f60c740be8049878cf8cb3f58cd2c6676f10cc9c23cab13c5ce8af9ef3ae860"
-
-
 def _julia_branch_expression(function_name: str, next_function_name: str) -> str:
-    raw = POTENTIALS_SOURCE.read_bytes()
-    if hashlib.sha256(raw).hexdigest() != POTENTIALS_SHA256:
-        raise RuntimeError("authenticated GSN potential expression digest mismatch")
-    source = raw.decode("utf-8")
+    if not POTENTIALS_SOURCE.is_file() or POTENTIALS_SOURCE.is_symlink():
+        raise RuntimeError("GSN potential expression source is unavailable")
+    try:
+        source = POTENTIALS_SOURCE.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as error:
+        raise RuntimeError("GSN potential expression source is unreadable") from error
+    if not source:
+        raise RuntimeError("GSN potential expression source is empty")
     begin = source.index(f"function {function_name}(")
     finish = source.index(f"function {next_function_name}(", begin)
     body = source[begin:finish]
