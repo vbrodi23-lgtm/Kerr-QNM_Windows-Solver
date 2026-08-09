@@ -76,6 +76,18 @@ additionally need the pinned NumPy and SciPy:
 .\runtime\bootstrap.ps1 -WithNumericalKernel
 ```
 
+The physical M02 campaign has a single stronger bootstrap tier. It provisions
+the numerical kernel plus a pinned portable Julia 1.10.11 and verifies the
+packaged GSN source equations used to generate F/U infinity-series inputs:
+
+```powershell
+.\runtime\bootstrap.ps1 -WithM02
+```
+
+`campaign-run` then generates or verifies its content-addressed coefficient
+cache automatically. No historic cache path or digest environment variable is
+required.
+
 The launcher resolves an interpreter in this order: the bootstrap virtual
 environment at `.runtime\venv\Scripts\python.exe`, a bundled runtime at
 `.runtime\python\python.exe`, an active `python` that is 3.12 or newer, then
