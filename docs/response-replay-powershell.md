@@ -67,9 +67,9 @@ native determinant solve:
 python -m windows_solver campaign-smoke
 ```
 
-Physical selected execution uses package-local Julia to generate the exact F/U
-coefficient records required by the selected campaign leaves. Provision the
-CPython, NumPy/SciPy, and portable Julia runtimes once:
+Physical selected execution uses the persistent per-user Julia environment to
+generate the exact F/U coefficient records required by the selected campaign
+leaves. Provision CPython, NumPy/SciPy, and Julia once:
 
 ```powershell
 .\runtime\bootstrap.ps1 -WithM02
@@ -78,10 +78,19 @@ CPython, NumPy/SciPy, and portable Julia runtimes once:
 .\solver.ps1 campaign-validate .\campaign-selection.json --checkpoint .\primary-part.json
 ```
 
+The bootstrap validates an exact existing CPython 3.12.13 and Julia 1.10.11
+before downloading managed copies. It keeps the numerical virtual environment,
+Julia depot/packages/artifacts/compiled cache, and contract-addressed copies of
+the vendored Julia scientific sources under
+`%LOCALAPPDATA%\Kerr-QNM_Windows-Solver\runtime-1\` by default. The persistent
+M02 Project/Manifest uses those installed source paths rather than a disposable
+Downloads checkout. Use `-PortableRuntime` only for an explicitly portable
+checkout-local `.runtime` tree.
+
 The producer executes the packaged `Potentials.sF` / `Potentials.sU` equations
 with exact symbolic rational algebra, validates them against direct evaluation,
-and writes one short artifact per exact `(a,m)` pair under
-`.runtime\generated\gsn`. `gsn-index.json` uses a canonical scientific
+and writes one short artifact per exact `(a,m)` pair under the matching managed
+source contract's `generated\gsn\<contract-id>` directory. `gsn-index.json` uses a canonical scientific
 identity containing spin weight, the resolved campaign spin, azimuthal index,
 mass normalization, equation convention, and the producer/consumer contract
 versions. Direct-spin leaves use their exact rational `a/M`. For an `M-kappa`
@@ -98,8 +107,8 @@ the prior valid index is retained as `gsn-index.previous.json`. Measured hashes
 and producer metadata are observations, not development execution gates.
 
 The installed backend owns all declared precision stages. Binary64 uses the
-existing Python `StandardSN` path; 80/120-digit stages use the package-local
-Julia worker and return the same root-readout contract to the existing campaign
+existing Python `StandardSN` path; 80/120-digit stages use the persistent
+managed Julia worker and return the same root-readout contract to the existing campaign
 runner. No separately supplied precision module is needed for M02.
 
 For the complete campaign, the root launcher selects all 553 leaves, starts or
@@ -109,9 +118,9 @@ resumes the checkpoint, and performs full structural validation:
 .\m02.ps1
 ```
 
-Use `.\m02.ps1 -RebuildRuntime` only when intentionally discarding `.runtime`
-and provisioning it again. The campaign checkpoint under `m02-output` is not
-removed by that option.
+Use `.\m02.ps1 -RebuildRuntime` only when intentionally discarding the
+persistent managed runtime and provisioning it again. The campaign checkpoint
+under `m02-output` is checkout-local and is not removed by that option.
 
 Merge manifests name relative, non-symlink checkpoint paths. Absolute, UNC,
 drive-relative, traversal, ADS, duplicate-key, nonfinite, stale, mixed-policy,
