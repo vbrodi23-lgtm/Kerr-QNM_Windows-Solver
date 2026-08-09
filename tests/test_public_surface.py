@@ -887,7 +887,9 @@ function Try-InvokeNativeCapture([string]$FilePath, [string[]]$Arguments) {
 }
 function Get-Sha256([string]$Path) {
     if ($Path -like "*WindowsApps*") { throw "WindowsApps shim must not be hashed" }
-    if ($Path -ne $env:M02_TEST_JULIA_REAL) { throw "unexpected hash target: $Path" }
+    if ((Get-Content -LiteralPath $Path -Raw) -ne "real-julia") {
+        throw "unexpected hash target: $Path"
+    }
     return "real-julia-sha256"
 }
 . $env:M02_TEST_JULIA_DISCOVERY
