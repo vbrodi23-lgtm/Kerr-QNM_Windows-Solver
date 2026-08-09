@@ -145,10 +145,16 @@ class NativeProgressTests(unittest.TestCase):
             event for event in observer.events
             if event.kind is ProgressEventKind.NEWTON_ITERATION_COMPLETED
         ]
+        started = [
+            event for event in observer.events
+            if event.kind is ProgressEventKind.NEWTON_ITERATION_STARTED
+        ]
         self.assertEqual(len(determinant_events), len(calls))
         self.assertTrue(converged)
         self.assertLess(residual, 2.0e-11)
         self.assertAlmostEqual(root.real, 0.5)
+        self.assertTrue(started)
+        self.assertEqual(started[0].payload["acceptance_threshold"], 2.0e-11)
         self.assertTrue(completed)
         payload = completed[0].payload
         for field in (
