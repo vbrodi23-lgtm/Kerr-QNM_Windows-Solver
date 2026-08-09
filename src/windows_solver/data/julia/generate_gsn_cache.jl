@@ -7,6 +7,11 @@
 using SHA
 using Printf
 
+const RECORD_SCHEMA_VERSION = 2
+const PRODUCER_CONTRACT_VERSION = 1
+const CONSUMER_CONTRACT_VERSION = 1
+const EQUATION_CONVENTION = "generalized-sasaki-nakamura-spin-minus-two-sF-sU"
+
 function bootstrap_argument_value(flag::String)
     index = findfirst(==(flag), ARGS)
     index === nothing && error("missing argument $flag")
@@ -618,7 +623,9 @@ function main()
             record, error_value = build_record(spin, m)
             records[key] = record
             push!(declared, Dict{String,Any}(
-                "spin" => Float64(spin),
+                "spin_numerator" => numerator(spin),
+                "spin_denominator" => denominator(spin),
+                "spin_binary64_hex" => @sprintf("%a", Float64(spin)),
                 "azimuthal_index" => m,
             ))
             maximum_error = max(maximum_error, error_value)
@@ -648,7 +655,10 @@ function main()
                    isfinite(maximum_error) &&
                    maximum_error <= VALIDATION_TOLERANCE
         document = Dict{String,Any}(
-            "schema_version" => 1,
+            "schema_version" => RECORD_SCHEMA_VERSION,
+            "producer_contract_version" => PRODUCER_CONTRACT_VERSION,
+            "consumer_contract_version" => CONSUMER_CONTRACT_VERSION,
+            "equation_convention" => EQUATION_CONVENTION,
             "spin_weight" => -2,
             "mass_normalization" => 1,
             "source_relative_path" => "src/Homogeneous/Potentials.jl",
