@@ -1,20 +1,22 @@
 # Backlog
 
-## TASK-076: Prove the clean-machine M02 campaign path on Windows and Ubuntu
-**Priority:** P0 | **Tags:** M02, validation, release, provider
-**Assignee:** Unassigned | **Estimate:** 1–2 days | **Milestone:** M02
+## TASK-076: Prove the one-command self-originating M02 solve on Windows and Ubuntu
+**Priority:** P0 | **Tags:** M02, bootstrap, validation, release, provider
+**Assignee:** Unassigned | **Estimate:** 2–3 days plus native validation | **Milestone:** M02
 
 ### Objective
 
-Demonstrate that a fresh public checkout can provision its own runtimes, obtain its pinned upstream sources, and execute/resume representative M02 leaves before the full campaign begins.
+Demonstrate that one documented command can take a fresh public checkout through provisioning, source verification, scientific-input generation, representative physical execution, checkpoint validation, and actionable failure reporting before the full campaign begins.
 
 ### Acceptance Criteria
 
-- [ ] From a clean checkout with no system Python or Julia dependency, provision the package-local Python numerical tier and pinned Julia/GSN backend through the documented PowerShell entrypoint.
+- [ ] From a clean checkout with no system Python or Julia dependency, one PowerShell entrypoint must initialize its run ledger before any mutation, provision the package-local runtimes and pinned source environment, generate required numerical inputs, and reach representative physical M02 computation without manual intervention.
+- [ ] Provide a fast non-scientific preflight of the complete M02 path that verifies runtime identities and imports, source and manifest digests, command/token resolution, producer command-line contracts, Julia parsing/loading, output routing, and directory writability before compute starts.
 - [ ] Execute canonical primary, control, and deep leaves covering horizon plus all six exterior mechanisms, negative m, direct χ, exact Mκ, binary64, 80-digit, and 120-digit paths.
-- [ ] Validate checkpoint resume, zero-work reuse, backend/source identity, failure recovery, path-with-spaces behavior, and PowerShell 5.1 compatibility.
+- [ ] Validate authenticated checkpoint resume, zero-work warm reuse, no redundant downloads, backend/source identity, reset-with-ledger-preservation, path-with-spaces behavior, and PowerShell 5.1 compatibility.
+- [ ] On every failure, stop at the first rejected phase and emit a structured failure record, retained transcript/artifact inventory, exact recovery command, and a PowerShell-only diagnostic bundle that still works when Python or Julia provisioning failed.
 - [ ] Repeat the supported campaign smoke on Ubuntu and reconcile deterministic identities or explicitly bounded platform-dependent numerical fields.
-- [ ] Publish one operator command sequence that proceeds from fresh checkout to validated campaign checkpoint without manual dependency hunting.
+- [ ] Publish one operator command that proceeds from fresh checkout to validated campaign checkpoint, plus an explicit preflight command and diagnostic command; none may require dependency hunting, old Downloads folders, or an unpublished cache.
 
 ### Dependencies
 
@@ -23,23 +25,24 @@ Demonstrate that a fresh public checkout can provision its own runtimes, obtain 
 
 ### Evidence Output
 
-Clean-machine bootstrap/campaign receipts, representative multi-precision checkpoints, platform reconciliation, and the final PowerShell production runbook.
+Cold-start and warm-reuse ledgers, preflight report, representative multi-precision checkpoints, structured failure/diagnostic fixtures, platform reconciliation, and the final one-command production runbook.
 
 ### Verification
 
 - `python .tasks/validate_board.py`
-- Native Windows PowerShell 5.1 clean-checkout campaign smoke.
-- Hosted Windows and Ubuntu full tests, package checks, resume, and zero-work reuse gates.
+- Native Windows PowerShell 5.1 clean-checkout cold-start and warm-reuse campaign smoke.
+- Hosted Windows and Ubuntu full tests, package checks, preflight, failure diagnostics, resume, and zero-work reuse gates.
 
 ### Review Focus
 
-Inspect fresh-machine assumptions, executable discovery, upstream pinning, precision dispatch, checkpoint durability, and whether the documented command actually reaches physical response computation.
+Inspect fresh-machine assumptions, ledger-before-bootstrap ordering, executable discovery, download/source verification, generated-input provenance, precision dispatch, checkpoint durability, failure recoverability, and whether the documented command actually reaches physical response computation.
 
 ### Plan
 
-- Exercise the complete bootstrap and source-provisioning path from a clean checkout.
+- Exercise the complete bootstrap, source-provisioning, and scientific-input generation path from a clean checkout.
 - Run a risk-complete representative campaign and resume it.
-- Reconcile platforms and freeze the production command only after the path passes.
+- Force and collect a provisioning and scientific failure, then prove warm reuse.
+- Reconcile platforms and freeze the one-command production path only after every gate passes.
 
 ---
 
