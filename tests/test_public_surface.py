@@ -204,6 +204,9 @@ class PublicSurfaceTests(unittest.TestCase):
         bootstrap = (root / "runtime" / "bootstrap.ps1").read_text(
             encoding="utf-8"
         )
+        discovery = (root / "runtime" / "julia-runtime-discovery.ps1").read_text(
+            encoding="utf-8"
+        )
         policy = json.loads(
             (root / "runtime" / "runtime_policy.json").read_text(
                 encoding="utf-8"
@@ -223,7 +226,10 @@ class PublicSurfaceTests(unittest.TestCase):
         self.assertIn(r'Join-Path $ManagedJuliaRoot "bin\julia.exe"', bootstrap)
         self.assertIn("$Policy.julia.sha256", bootstrap)
         self.assertIn("Get-JuliaCandidate", bootstrap)
-        self.assertIn("print(Sys.WORD_SIZE)", bootstrap)
+        self.assertIn("print(Sys.WORD_SIZE)", discovery)
+        self.assertIn("print(Sys.BINDIR)", discovery)
+        self.assertIn("windowsapps-juliaup-shim", discovery)
+        self.assertIn("julia-runtime-discovery.ps1", bootstrap)
         self.assertIn('"juliaup"', bootstrap)
         self.assertIn(r'Join-Path $RuntimeRoot "scientific-sources\$M02ContractId"', bootstrap)
         self.assertIn(r'Join-Path $RuntimeRoot "m02-environments\$M02ContractId"', bootstrap)
@@ -289,7 +295,7 @@ class PublicSurfaceTests(unittest.TestCase):
         )
         m02_start = bootstrap.index("function Set-JuliaUtf8Console")
         m02_bootstrap = bootstrap[
-            m02_start : bootstrap.index("\nfunction Get-JuliaCandidate", m02_start)
+            m02_start : bootstrap.index("\n. (Join-Path $PSScriptRoot", m02_start)
         ]
         chcp = "& $Chcp.Source 65001 | Out-Null"
         input_encoding = "[Console]::InputEncoding = $Utf8NoBom"
@@ -498,6 +504,7 @@ $record = [ordered]@{
     with_m02 = [bool]$WithM02
     force = [bool]$Force
     portable_runtime = [bool]$PortableRuntime
+    runtime_root = $RuntimeRoot
 }
 [IO.File]::AppendAllText(
     $env:M02_TEST_BOOTSTRAP_LOG,
@@ -583,16 +590,19 @@ exit 0
                     "with_m02": True,
                     "force": False,
                     "portable_runtime": False,
+                    "runtime_root": None,
                 },
                 {
                     "with_m02": True,
                     "force": True,
                     "portable_runtime": False,
+                    "runtime_root": None,
                 },
                 {
                     "with_m02": True,
                     "force": False,
                     "portable_runtime": True,
+                    "runtime_root": None,
                 },
             ],
         )
@@ -655,14 +665,12 @@ $record = [ordered]@{ default = $default; portable = $portable } | ConvertTo-Jso
                 f"stdout={result.stdout!r} stderr={result.stderr!r}",
             )
             resolved = json.loads(resolver_log.read_text(encoding="utf-8"))
-            expected_default = (
-                local_app_data / "Kerr-QNM_Windows-Solver" / "runtime-1"
-            )
-            expected_portable = package_root / ".runtime"
-            expected_default.mkdir(parents=True)
-            expected_portable.mkdir()
-            self.assertTrue(Path(resolved["default"]).samefile(expected_default))
-            self.assertTrue(Path(resolved["portable"]).samefile(expected_portable))
+
+        self.assertEqual(
+            Path(resolved["default"]),
+            local_app_data / "Kerr-QNM_Windows-Solver" / "runtime-1",
+        )
+        self.assertEqual(Path(resolved["portable"]), package_root / ".runtime")
 
     @unittest.skipUnless(os.name == "nt", "requires Windows PowerShell 5.1")
     def test_m02_public_default_invocation_forwards_safe_relative_paths(self) -> None:
@@ -785,6 +793,134 @@ exit 0
             r'"WindowsPowerShell",\s+"v1\.0",\s+"powershell\.exe"',
         )
         self.assertNotIn("2>&1", workflow)
+
+    @unittest.skipUnless(os.name == "nt", "requires Windows PowerShell 5.1")
+    def test_actual_bootstrap_parses_and_executes_safe_powershell51_smoke(self) -> None:
+        """Catch parser and path-character regressions before provisioning.
+
+        The production change that must fail this test is either an invalid
+        PowerShell interpolation such as ``$Label:`` or a two-character value
+        passed to a ``[char[]]`` path-trimming call.  It runs the actual
+        bootstrap's safe smoke path, which creates and removes only its own
+        temporary directory; no runtime, package, Julia, or solver work runs.
+        """
+
+        root = Path(__file__).resolve().parents[1]
+        windows_powershell = Path(os.environ["SystemRoot"]).joinpath(
+            "System32", "WindowsPowerShell", "v1.0", "powershell.exe"
+        )
+        result = subprocess.run(
+            [
+                str(windows_powershell),
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(root / "runtime" / "bootstrap.ps1"),
+                "-PowerShell51Smoke",
+            ],
+            cwd=root,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        self.assertEqual(
+            result.returncode,
+            0,
+            f"stdout={result.stdout!r} stderr={result.stderr!r}",
+        )
+        self.assertIn(
+            b"PowerShell 5.1 compatibility smoke passed", result.stdout
+        )
+
+    @unittest.skipUnless(os.name == "nt", "requires Windows PowerShell 5.1")
+    def test_juliaup_windowsapps_shim_resolves_and_hashes_real_julia_executable(
+        self,
+    ) -> None:
+        """A WindowsApps shim is a launcher, never the hash/receipt target.
+
+        The test executes the shared production Julia discovery function in
+        Windows PowerShell 5.1.  Native probing is controlled only because the
+        test fixture is not a Julia installation; filesystem resolution and
+        the discovery logic remain real.  Hashing the WindowsApps alias throws
+        immediately, while hashing the resolved ``Sys.BINDIR\\julia.exe`` is
+        required to succeed.
+        """
+
+        root = Path(__file__).resolve().parents[1]
+        windows_powershell = Path(os.environ["SystemRoot"]).joinpath(
+            "System32", "WindowsPowerShell", "v1.0", "powershell.exe"
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture_root = Path(temporary)
+            windows_apps = fixture_root / "WindowsApps"
+            real_bin = fixture_root / "Julia-1.10.11" / "bin"
+            windows_apps.mkdir()
+            real_bin.mkdir(parents=True)
+            launcher = windows_apps / "julia.exe"
+            real_executable = real_bin / "julia.exe"
+            launcher.write_text("shim", encoding="utf-8")
+            real_executable.write_text("real-julia", encoding="utf-8")
+            record_path = fixture_root / "candidate.json"
+            environment = dict(os.environ)
+            environment["M02_TEST_JULIA_DISCOVERY"] = str(
+                root / "runtime" / "julia-runtime-discovery.ps1"
+            )
+            environment["M02_TEST_JULIA_LAUNCHER"] = str(launcher)
+            environment["M02_TEST_JULIA_BINDIR"] = str(real_bin)
+            environment["M02_TEST_JULIA_RECORD"] = str(record_path)
+            script = r'''
+$Policy = [pscustomobject]@{ julia = [pscustomobject]@{ version = "1.10.11" } }
+function Try-InvokeNativeCapture([string]$FilePath, [string[]]$Arguments) {
+    $joined = $Arguments -join " "
+    if ($joined -eq "--version") { return "julia version 1.10.11" }
+    if ($joined -match "Sys.WORD_SIZE") { return "64" }
+    if ($joined -match "Sys.BINDIR") { return $env:M02_TEST_JULIA_BINDIR }
+    throw "unexpected Julia probe: $FilePath $joined"
+}
+function Get-Sha256([string]$Path) {
+    if ($Path -like "*WindowsApps*") { throw "WindowsApps shim must not be hashed" }
+    if ($Path -ne $env:M02_TEST_JULIA_REAL) { throw "unexpected hash target: $Path" }
+    return "real-julia-sha256"
+}
+. $env:M02_TEST_JULIA_DISCOVERY
+$candidate = Get-JuliaCandidate $env:M02_TEST_JULIA_LAUNCHER @("+1.10.11") "juliaup"
+$candidate | ConvertTo-Json -Compress | Set-Content -LiteralPath $env:M02_TEST_JULIA_RECORD -Encoding UTF8
+'''
+            environment["M02_TEST_JULIA_REAL"] = str(real_executable)
+            result = subprocess.run(
+                [
+                    str(windows_powershell),
+                    "-NoLogo",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-Command",
+                    script,
+                ],
+                cwd=root,
+                env=environment,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            self.assertEqual(
+                result.returncode,
+                0,
+                f"stdout={result.stdout!r} stderr={result.stderr!r}",
+            )
+            candidate = json.loads(record_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(candidate["source"], "juliaup")
+        self.assertEqual(Path(candidate["launcher"]), launcher)
+        self.assertEqual(Path(candidate["executable"]), real_executable)
+        self.assertEqual(candidate["executable_sha256"], "real-julia-sha256")
+        self.assertEqual(candidate["arguments"], [])
 
     def test_public_surface_contains_no_private_lineage_identifiers(self) -> None:
         root = Path(__file__).resolve().parents[1]

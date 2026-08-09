@@ -19,6 +19,7 @@ param(
     [switch]$WithM02,
     [switch]$Force,
     [switch]$SkipSmokeTest,
+    [switch]$PowerShell51Smoke,
     [switch]$PortableRuntime,
     [string]$RuntimeRoot
 )
@@ -127,12 +128,12 @@ function Remove-ManagedDirectory([string]$Path, [string]$Label) {
     }
     $fullPath = [IO.Path]::GetFullPath($Path)
     $pathRoot = [IO.Path]::GetPathRoot($fullPath)
-    if ($fullPath.TrimEnd([char[]]@('\\', '/')) -eq $pathRoot.TrimEnd([char[]]@('\\', '/'))) {
-        throw "Refusing to remove a filesystem root for $Label: $fullPath"
+    if ($fullPath.TrimEnd([char[]]@(92, 47)) -eq $pathRoot.TrimEnd([char[]]@(92, 47))) {
+        throw "Refusing to remove a filesystem root for ${Label}: $fullPath"
     }
     cmd.exe /c rd /s /q "\\?\$fullPath"
     if ($LASTEXITCODE -ne 0 -and (Test-Path -LiteralPath $fullPath)) {
-        throw "Could not remove $Label: $fullPath"
+        throw "Could not remove ${Label}: $fullPath"
     }
 }
 
@@ -275,36 +276,7 @@ function Set-JuliaUtf8Console {
     $OutputEncoding = $Utf8NoBom
 }
 
-function Get-JuliaCandidate(
-    [string]$Executable,
-    [string[]]$PrefixArguments = @(),
-    [string]$Source
-) {
-    if ([string]::IsNullOrWhiteSpace($Executable) -or -not (Test-Path -LiteralPath $Executable -PathType Leaf)) {
-        return $null
-    }
-    $identity = Try-InvokeNativeCapture $Executable (@($PrefixArguments) + @("--version"))
-    if ($identity -ne "julia version $($Policy.julia.version)") {
-        return $null
-    }
-    $bits = Try-InvokeNativeCapture $Executable (@($PrefixArguments) + @(
-        "--startup-file=no",
-        "--history-file=no",
-        "-e",
-        "print(Sys.WORD_SIZE)"
-    ))
-    if ($bits -ne "64") {
-        return $null
-    }
-    return [ordered]@{
-        executable = [IO.Path]::GetFullPath($Executable)
-        arguments = @($PrefixArguments)
-        source = $Source
-        version = [string]$Policy.julia.version
-        bits = [int]$bits
-        executable_sha256 = Get-Sha256 $Executable
-    }
-}
+. (Join-Path $PSScriptRoot "julia-runtime-discovery.ps1")
 
 function Invoke-Julia([string[]]$Arguments) {
     Invoke-Native $JuliaCandidate.executable (@($JuliaCandidate.arguments) + $Arguments)
@@ -316,7 +288,7 @@ function Invoke-JuliaCapture([string[]]$Arguments) {
 
 function Get-SourceReceipts {
     $receipts = @()
-    $sourceRoot = [IO.Path]::GetFullPath($JuliaDataRoot).TrimEnd([char[]]@('\\', '/'))
+    $sourceRoot = [IO.Path]::GetFullPath($JuliaDataRoot).TrimEnd([char[]]@(92, 47))
     foreach ($Source in $Policy.scientific_sources) {
         $SourcePath = Join-Path $PackageRoot $Source.path
         if (-not (Test-Path -LiteralPath $SourcePath -PathType Leaf)) {
@@ -329,7 +301,7 @@ function Get-SourceReceipts {
         $receipts += [ordered]@{
             id = [string]$Source.id
             checkout_path = $resolvedSourcePath
-            relative_path = $resolvedSourcePath.Substring($sourceRoot.Length).TrimStart([char[]]@('\\', '/'))
+            relative_path = $resolvedSourcePath.Substring($sourceRoot.Length).TrimStart([char[]]@(92, 47))
             sha256 = Get-Sha256 $resolvedSourcePath
         }
     }
@@ -340,13 +312,13 @@ function Get-TreeSha256([string]$Root) {
     if (-not (Test-Path -LiteralPath $Root -PathType Container)) {
         throw "Required source directory is absent: $Root"
     }
-    $resolvedRoot = [IO.Path]::GetFullPath($Root).TrimEnd([char[]]@('\\', '/'))
+    $resolvedRoot = [IO.Path]::GetFullPath($Root).TrimEnd([char[]]@(92, 47))
     $entries = @()
     foreach ($file in (Get-ChildItem -LiteralPath $resolvedRoot -File -Recurse | Sort-Object FullName)) {
         if (($file.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
             throw "Runtime source tree must not contain a reparse point: $($file.FullName)"
         }
-        $relative = $file.FullName.Substring($resolvedRoot.Length).TrimStart([char[]]@('\\', '/'))
+        $relative = $file.FullName.Substring($resolvedRoot.Length).TrimStart([char[]]@(92, 47))
         $entries += "$relative`t$(Get-Sha256 $file.FullName)"
     }
     return Get-TextSha256 ($entries -join "`n")
@@ -365,7 +337,19 @@ function Test-M02Environment([string]$ContractSha256) {
     }
     $projectShaProperty = $receipt.PSObject.Properties["project_sha256"]
     $manifestShaProperty = $receipt.PSObject.Properties["manifest_sha256"]
-    if ($null -eq $projectShaProperty -or $null -eq $manifestShaProperty) {
+    $sourceContractProperty = $receipt.PSObject.Properties["scientific_source_contract_id"]
+    if ($null -eq $projectShaProperty `
+        -or $null -eq $manifestShaProperty `
+        -or $null -eq $sourceContractProperty `
+        -or $sourceContractProperty.Value -ne $M02ContractId) {
+        return $false
+    }
+    $manifest = Get-Content -LiteralPath (Join-Path $JuliaProject "Manifest.toml") -Raw
+    $checkoutRoot = [IO.Path]::GetFullPath($PackageRoot)
+    $persistentSourceRoot = ([IO.Path]::GetFullPath($M02SourceRoot)).Replace('\', '/')
+    if ($manifest.IndexOf($checkoutRoot, [System.StringComparison]::OrdinalIgnoreCase) -ge 0 `
+        -or $manifest.IndexOf("../vendor/", [System.StringComparison]::OrdinalIgnoreCase) -ge 0 `
+        -or $manifest.Replace('\', '/').IndexOf($persistentSourceRoot, [System.StringComparison]::OrdinalIgnoreCase) -lt 0) {
         return $false
     }
     return (
@@ -422,6 +406,60 @@ function Install-PersistentScientificSources {
     if (-not (Test-PersistentScientificSources)) {
         throw "Persistent scientific source copy failed contract validation: $M02SourceRoot"
     }
+}
+
+function Write-PersistentM02Manifest([string]$SeedPath, [string]$Destination) {
+    $manifest = Get-Content -LiteralPath $SeedPath -Raw
+    foreach ($name in @("GeneralizedSasakiNakamura.jl", "SpinWeightedSpheroidalHarmonics.jl")) {
+        $persistentPath = ([IO.Path]::GetFullPath((Join-Path $M02SourceRoot $name))).Replace('\', '/')
+        $seedPath = "path = `"../vendor/$name`""
+        if (-not $manifest.Contains($seedPath)) {
+            throw "M02 seed manifest lacks the expected path dependency: $seedPath"
+        }
+        $manifest = $manifest.Replace($seedPath, "path = `"$persistentPath`"")
+    }
+    if ($manifest.IndexOf("../vendor/", [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
+        throw "Persistent M02 manifest still contains an environment-local vendor path."
+    }
+    [IO.File]::WriteAllText($Destination, $manifest, [System.Text.UTF8Encoding]::new($false))
+}
+
+if ($PowerShell51Smoke) {
+    $smokeRoot = Join-Path ([IO.Path]::GetTempPath()) ("Kerr-QNM-bootstrap-smoke-" + [Guid]::NewGuid().ToString("N"))
+    try {
+        New-Item -ItemType Directory -Force -Path (Join-Path $smokeRoot "child") | Out-Null
+        Remove-ManagedDirectory $smokeRoot "PowerShell compatibility smoke"
+        if (Test-Path -LiteralPath $smokeRoot) {
+            throw "PowerShell compatibility smoke could not remove its temporary directory."
+        }
+        $M02SourceRoot = Join-Path $smokeRoot "scientific-sources\smoke-contract"
+        $smokeProject = Join-Path $smokeRoot "m02-environments\smoke-contract\project"
+        foreach ($name in @("GeneralizedSasakiNakamura.jl", "SpinWeightedSpheroidalHarmonics.jl")) {
+            $package = Join-Path $M02SourceRoot $name
+            New-Item -ItemType Directory -Force -Path $package | Out-Null
+            Set-Content -LiteralPath (Join-Path $package "Project.toml") -Value "name = '$name'" -Encoding UTF8
+        }
+        New-Item -ItemType Directory -Force -Path $smokeProject | Out-Null
+        $smokeSeed = Join-Path $smokeRoot "Manifest.seed.toml"
+        @'
+[[deps.GeneralizedSasakiNakamura]]
+path = "../vendor/GeneralizedSasakiNakamura.jl"
+[[deps.SpinWeightedSpheroidalHarmonics]]
+path = "../vendor/SpinWeightedSpheroidalHarmonics.jl"
+'@ | Set-Content -LiteralPath $smokeSeed -Encoding UTF8
+        $smokeManifest = Join-Path $smokeProject "Manifest.toml"
+        Write-PersistentM02Manifest $smokeSeed $smokeManifest
+        if ((Get-Content -LiteralPath $smokeManifest -Raw).IndexOf("../vendor/", [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
+            throw "PowerShell compatibility smoke left an environment-local vendor path in the manifest."
+        }
+        Write-Host "PowerShell 5.1 compatibility smoke passed"
+    }
+    finally {
+        if (Test-Path -LiteralPath $smokeRoot) {
+            Remove-Item -LiteralPath $smokeRoot -Force -Recurse
+        }
+    }
+    exit 0
 }
 
 # ---------------------------------------------------------------- preconditions
@@ -622,16 +660,16 @@ if ($WithM02) {
     Set-JuliaUtf8Console
     $JuliaCandidate = Get-JuliaCandidate $ManagedJuliaExe @() "managed"
     if ($null -eq $JuliaCandidate) {
-        $systemJulia = Get-ApplicationCommand @("julia.exe", "julia")
-        if ($null -ne $systemJulia) {
-            $JuliaCandidate = Get-JuliaCandidate $systemJulia @() "system"
-        }
-    }
-    if ($null -eq $JuliaCandidate) {
         $juliaup = Get-ApplicationCommand @("juliaup.exe", "juliaup")
         $juliaShim = Get-ApplicationCommand @("julia.exe", "julia")
         if ($null -ne $juliaup -and $null -ne $juliaShim) {
             $JuliaCandidate = Get-JuliaCandidate $juliaShim @("+$JuliaVersion") "juliaup"
+        }
+    }
+    if ($null -eq $JuliaCandidate) {
+        $systemJulia = Get-ApplicationCommand @("julia.exe", "julia")
+        if ($null -ne $systemJulia) {
+            $JuliaCandidate = Get-JuliaCandidate $systemJulia @() "system"
         }
     }
     $JuliaArchive = $null
@@ -738,8 +776,9 @@ if ($WithM02) {
         New-Item -ItemType Directory -Force -Path $JuliaProject | Out-Null
         Copy-Item -LiteralPath (Join-Path $M02SourceRoot "m02_project\Project.toml") `
             -Destination (Join-Path $JuliaProject "Project.toml") -Force
-        Copy-Item -LiteralPath (Join-Path $M02SourceRoot "m02_project\Manifest.seed.toml") `
-            -Destination (Join-Path $JuliaProject "Manifest.toml") -Force
+        Write-PersistentM02Manifest `
+            (Join-Path $M02SourceRoot "m02_project\Manifest.seed.toml") `
+            (Join-Path $JuliaProject "Manifest.toml")
         New-Item -ItemType Directory -Force -Path $JuliaDepot | Out-Null
         Set-M02JuliaEnvironment
         $SetupExpression = @'
@@ -782,6 +821,7 @@ Pkg.precompile()
             schema_version = 1
             contract_sha256 = $M02ContractSha256
             contract_id = $M02ContractId
+            scientific_source_contract_id = $M02ContractId
             scientific_source_root = [IO.Path]::GetFullPath($M02SourceRoot)
             contract = $M02Contract
             project = [IO.Path]::GetFullPath($JuliaProject)
@@ -806,6 +846,9 @@ Pkg.precompile()
         executable_sha256 = [string]$JuliaCandidate.executable_sha256
         arguments = @($JuliaCandidate.arguments)
         source = [string]$JuliaCandidate.source
+        launcher = [string]$JuliaCandidate.launcher
+        launcher_arguments = @($JuliaCandidate.launcher_arguments)
+        launcher_kind = [string]$JuliaCandidate.launcher_kind
         archive = $JuliaArchive
         archive_sha256 = $ActualJuliaSha256
         sources = @($SourceReceipts)
@@ -820,6 +863,7 @@ Pkg.precompile()
         worker_sha256 = Get-Sha256 $WorkerPath
         contract_sha256 = $M02ContractSha256
         contract_id = $M02ContractId
+        scientific_source_contract_id = $M02ContractId
     }
 }
 
