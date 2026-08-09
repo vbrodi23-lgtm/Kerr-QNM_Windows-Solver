@@ -43,7 +43,12 @@ from .julia_response_backend import (
     JuliaResponseAdapter,
     JuliaResponseBackendError,
 )
-from .progress import ProgressEventKind, emit_progress, progress_scope
+from .progress import PROGRESS_SCHEMA, ProgressEventKind, emit_progress, progress_scope
+from .solved_leaf_cache import (
+    SolvedLeafLookup,
+    SolvedLeafLookupStatus,
+    SolvedLeafStore,
+)
 
 
 CAMPAIGN_SCHEMA_VERSION = 2
@@ -717,6 +722,22 @@ class CampaignRunSummary:
 
 
 @dataclass(frozen=True, slots=True)
+class SolvedLeafImportSummary:
+    imported_count: int
+    skipped_count: int
+    leaf_ids: tuple[str, ...]
+    store_root: str
+
+    def to_mapping(self) -> dict[str, object]:
+        return {
+            "imported_terminal_solved_leaves": self.imported_count,
+            "skipped_records": self.skipped_count,
+            "leaf_ids": list(self.leaf_ids),
+            "store_root": self.store_root,
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class CampaignSmokeRecord:
     leaf_id: str
     evidence_kind: str
@@ -824,6 +845,45 @@ class CampaignPlan:
             "bindings": self.bindings,
             "release_admissible": False,
         }
+
+
+def _leaf_precision_contract(leaf: CampaignLeafPlan) -> dict[str, object]:
+    return {
+        "binary64_stage_required": True,
+        "deep_leaf": leaf.role == "deep",
+        "promotion_digits": [80, 120] if leaf.role == "deep" else [],
+        "promotion_gates": list(B_PRIME_RELEASE_DOMAIN.precision_promotion_gates),
+        "fixed_precision_sentinel": leaf.leaf_id in set(
+            B_PRIME_RELEASE_DOMAIN.fixed_precision_sentinel_leaf_ids
+        ),
+    }
+
+
+def scientific_computation_identity_sha256(
+    plan: CampaignPlan, leaf: CampaignLeafPlan
+) -> str:
+    """Bind one requested calculation without binding campaign presentation code."""
+
+    if leaf.leaf_id not in {item.leaf_id for item in plan.leaves}:
+        raise ValueError("solved-leaf scientific identity is outside the campaign plan")
+    material = {
+        "schema_version": 1,
+        "leaf_id": leaf.leaf_id,
+        "role": leaf.role,
+        "mode_label": leaf.leaf.mode_label,
+        "mode": list(leaf.leaf.mode),
+        "spin_role": leaf.leaf.spin_role,
+        "coordinate_exact": {
+            "numerator": leaf.leaf.coordinate.numerator,
+            "denominator": leaf.leaf.coordinate.denominator,
+        },
+        "spin_binary64_hex": leaf.leaf.spin.hex(),
+        "mechanism_id": leaf.mechanism_id,
+        "response_job": leaf.job.to_mapping(),
+        "precision_factory_identity": plan.precision_factory_identity.to_mapping(),
+        "precision_contract": _leaf_precision_contract(leaf),
+    }
+    return _sha256(material)
 
 
 def _campaign_cohorts() -> tuple[CampaignCohort, ...]:
@@ -1064,9 +1124,9 @@ def _reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]
     return result
 
 
-def _load_checkpoint(
-    plan: CampaignPlan, path: Path
-) -> tuple[CampaignSelection, tuple[CampaignLeafRecord, ...], str]:
+def _read_checkpoint_envelope(
+    path: Path,
+) -> tuple[Mapping[str, object], Mapping[str, object], tuple[CampaignLeafRecord, ...]]:
     try:
         value = json.loads(
             path.read_text(encoding="utf-8"),
@@ -1091,12 +1151,30 @@ def _load_checkpoint(
     bindings = value["bindings"]
     if not isinstance(bindings, Mapping):
         raise ValueError("campaign checkpoint bindings are invalid")
+    raw_records = value["records"]
+    if (
+        not isinstance(raw_records, list)
+        or value["records_sha256"] != _sha256(raw_records)
+    ):
+        raise ValueError("campaign checkpoint records digest is invalid")
+    records = tuple(CampaignLeafRecord.from_mapping(item) for item in raw_records)
+    return value, bindings, records
+
+
+def _load_checkpoint(
+    plan: CampaignPlan, path: Path
+) -> tuple[CampaignSelection, tuple[CampaignLeafRecord, ...], str]:
+    value, bindings, records = _read_checkpoint_envelope(path)
     selection_value = bindings.get("selection")
     if not isinstance(selection_value, Mapping) or set(selection_value) != {
         "selection_id", "role", "leaf_ids", "cohort_ids"
     }:
         raise ValueError("campaign checkpoint selection is invalid")
-    if selection_value["role"] == "merged":
+    if selection_value["role"] == "all":
+        selection = build_campaign_selection(
+            plan, role="all", leaf_ids=None, cohort_ids=None
+        )
+    elif selection_value["role"] == "merged":
         if selection_value["cohort_ids"]:
             raise ValueError("merged campaign checkpoint cannot name cohorts")
         selection = _merged_selection(plan, selection_value["leaf_ids"])
@@ -1116,13 +1194,6 @@ def _load_checkpoint(
         raise ValueError("campaign checkpoint selection identity is invalid")
     if bindings != _checkpoint_bindings(plan, selection):
         raise ValueError("campaign checkpoint bindings are stale or forged")
-    raw_records = value["records"]
-    if (
-        not isinstance(raw_records, list)
-        or value["records_sha256"] != _sha256(raw_records)
-    ):
-        raise ValueError("campaign checkpoint records digest is invalid")
-    records = tuple(CampaignLeafRecord.from_mapping(item) for item in raw_records)
     if len(records) > len(selection.leaf_ids):
         raise ValueError("campaign checkpoint has excess records")
     leaf_by_id = {leaf.leaf_id: leaf for leaf in plan.leaves}
@@ -1418,6 +1489,65 @@ def _validate_record_semantics(
     return production
 
 
+def _validate_cacheable_leaf_record(
+    plan: CampaignPlan,
+    leaf: CampaignLeafPlan,
+    record: CampaignLeafRecord,
+) -> None:
+    if record.leaf_id != leaf.leaf_id or record.role != leaf.role:
+        raise ValueError("solved-leaf record identity or role is invalid")
+    if record.state not in {"PRODUCED", "UNRESOLVED"}:
+        raise ValueError("solved-leaf record is not terminal and cacheable")
+    if not record.stages or record.stages[0].outcome.digits != 64:
+        raise ValueError("solved-leaf precision stages are incomplete")
+    digits = tuple(stage.outcome.digits for stage in record.stages)
+    if digits not in {(64,), (64, 80), (64, 80, 120)}:
+        raise ValueError("solved-leaf precision stage order is invalid")
+    if not set(digits).issubset(set(plan.precision_capabilities.digits)):
+        raise ValueError("solved-leaf precision stages exceed the current contract")
+    for stage in record.stages:
+        prior_available = set(
+            stage.runner_provenance["available_precision_digits"]
+        )
+        if not prior_available.issubset(set(plan.precision_capabilities.digits)):
+            raise ValueError(
+                "solved-leaf precision availability exceeds the current contract"
+            )
+    if not _validate_record_semantics(
+        leaf, record, plan.precision_factory_identity
+    ):
+        raise ValueError("solved-leaf record lacks canonical production evidence")
+
+
+def _authenticated_solved_leaf_lookup(
+    plan: CampaignPlan,
+    leaf: CampaignLeafPlan,
+    store: SolvedLeafStore,
+) -> SolvedLeafLookup:
+    identity = scientific_computation_identity_sha256(plan, leaf)
+    lookup = store.lookup(identity, leaf.leaf_id)
+    if lookup.status is not SolvedLeafLookupStatus.HIT:
+        return lookup
+    try:
+        if lookup.receipt is None:
+            raise ValueError("solved-leaf cache hit has no receipt")
+        record = CampaignLeafRecord.from_mapping(lookup.receipt["record"])
+        _validate_cacheable_leaf_record(plan, leaf, record)
+    except (KeyError, TypeError, ValueError) as error:
+        if lookup.path is not None:
+            store.quarantine(lookup.path, str(error))
+        return SolvedLeafLookup(
+            SolvedLeafLookupStatus.CORRUPT,
+            path=lookup.path,
+            reason=str(error),
+        )
+    return SolvedLeafLookup(
+        SolvedLeafLookupStatus.HIT,
+        path=lookup.path,
+        receipt={**dict(lookup.receipt), "record": record.to_mapping()},
+    )
+
+
 def _validate_precision120(outcome: StageOutcome) -> None:
     if (
         outcome.deep_diagnostics is not None
@@ -1562,6 +1692,37 @@ def _checkpoint_stage_with_progress(
         )
 
 
+def _publish_terminal_solved_leaf(
+    plan: CampaignPlan,
+    leaf: CampaignLeafPlan,
+    record: CampaignLeafRecord,
+    store: SolvedLeafStore | None,
+) -> None:
+    if store is None or record.state not in {"PRODUCED", "UNRESOLVED"}:
+        return
+    try:
+        _validate_cacheable_leaf_record(plan, leaf, record)
+        store.publish(
+            scientific_identity_sha256=scientific_computation_identity_sha256(
+                plan, leaf
+            ),
+            leaf_id=leaf.leaf_id,
+            record=record.to_mapping(),
+            source_type="originating-campaign",
+        )
+        emit_progress(
+            ProgressEventKind.LEAF_CACHE_PUBLISHED,
+            state=record.state,
+            stage_count=len(record.stages),
+        )
+    except (OSError, RuntimeError, ValueError) as error:
+        emit_progress(
+            ProgressEventKind.LEAF_CACHE_PUBLICATION_FAILED,
+            error_type=type(error).__name__,
+            message=str(error),
+        )
+
+
 def run_campaign_selection(
     plan: CampaignPlan,
     selection: CampaignSelection,
@@ -1569,7 +1730,37 @@ def run_campaign_selection(
     checkpoint_path: str | os.PathLike[str] | Path,
     *,
     resume: bool,
+    solved_leaf_store: SolvedLeafStore | None = None,
 ) -> CampaignRunSummary:
+    cache_lookups: dict[str, SolvedLeafLookup] = {}
+    if solved_leaf_store is not None:
+        leaf_by_id = {leaf.leaf_id: leaf for leaf in plan.leaves}
+        for leaf_id in selection.leaf_ids:
+            cache_lookups[leaf_id] = _authenticated_solved_leaf_lookup(
+                plan, leaf_by_id[leaf_id], solved_leaf_store
+            )
+        compatible = sum(
+            lookup.status is SolvedLeafLookupStatus.HIT
+            for lookup in cache_lookups.values()
+        )
+        next_unsolved = next(
+            (
+                index
+                for index, leaf_id in enumerate(selection.leaf_ids, start=1)
+                if cache_lookups[leaf_id].status
+                is not SolvedLeafLookupStatus.HIT
+            ),
+            None,
+        )
+        emit_progress(
+            ProgressEventKind.SOLVED_LEAF_CACHE_SCANNED,
+            compatible_count=compatible,
+            stored_count=solved_leaf_store.stored_count,
+            reusing_count=compatible,
+            next_unsolved_index=next_unsolved,
+            leaf_count=len(selection.leaf_ids),
+            store_root=str(solved_leaf_store.root),
+        )
     emit_progress(
         ProgressEventKind.CAMPAIGN_STARTED,
         campaign_id=plan.campaign_id,
@@ -1579,7 +1770,13 @@ def run_campaign_selection(
     )
     try:
         summary = _run_campaign_selection_active(
-            plan, selection, backend, checkpoint_path, resume=resume
+            plan,
+            selection,
+            backend,
+            checkpoint_path,
+            resume=resume,
+            solved_leaf_store=solved_leaf_store,
+            cache_lookups=cache_lookups,
         )
     except BaseException as error:
         emit_progress(
@@ -1606,6 +1803,8 @@ def _run_campaign_selection_active(
     checkpoint_path: str | os.PathLike[str] | Path,
     *,
     resume: bool,
+    solved_leaf_store: SolvedLeafStore | None,
+    cache_lookups: Mapping[str, SolvedLeafLookup],
 ) -> CampaignRunSummary:
     if getattr(backend, "identity", None) != plan.backend_identity:
         raise ValueError("campaign backend identity does not match plan")
@@ -1647,6 +1846,44 @@ def _run_campaign_selection_active(
                     stage_count=len(records[index].stages),
                 )
             continue
+        if index >= len(records) and solved_leaf_store is not None:
+            lookup = cache_lookups.get(leaf.leaf_id)
+            if lookup is None:
+                lookup = _authenticated_solved_leaf_lookup(
+                    plan, leaf, solved_leaf_store
+                )
+            if lookup.status is SolvedLeafLookupStatus.HIT:
+                assert lookup.receipt is not None
+                cached_record = CampaignLeafRecord.from_mapping(
+                    lookup.receipt["record"]
+                )
+                _replace_record(records, index, cached_record)
+                with progress_scope(**context):
+                    emit_progress(ProgressEventKind.CHECKPOINT_WRITING)
+                    _atomic_json(
+                        path, _checkpoint_mapping(plan, selection, records)
+                    )
+                    emit_progress(ProgressEventKind.CHECKPOINT_WRITTEN)
+                    emit_progress(
+                        ProgressEventKind.LEAF_REUSED,
+                        state=cached_record.state,
+                        stage_count=len(cached_record.stages),
+                        source="authenticated prior originating result",
+                    )
+                reused += len(cached_record.stages)
+                continue
+            if lookup.status is SolvedLeafLookupStatus.STALE:
+                with progress_scope(**context):
+                    emit_progress(
+                        ProgressEventKind.LEAF_CACHE_STALE,
+                        message=lookup.reason or "scientific identity changed",
+                    )
+            elif lookup.status is SolvedLeafLookupStatus.CORRUPT:
+                with progress_scope(**context):
+                    emit_progress(
+                        ProgressEventKind.LEAF_CACHE_CORRUPT,
+                        message=lookup.reason or "authentication failed",
+                    )
         with progress_scope(**context):
             emit_progress(ProgressEventKind.LEAF_STARTED)
         record = records[index] if index < len(records) else None
@@ -1698,6 +1935,9 @@ def _run_campaign_selection_active(
             )
 
         if record.state in {"PRODUCED", "UNRESOLVED"}:
+            _publish_terminal_solved_leaf(
+                plan, leaf, record, solved_leaf_store
+            )
             with progress_scope(**context):
                 emit_progress(
                     ProgressEventKind.LEAF_COMPLETED,
@@ -1796,6 +2036,9 @@ def _run_campaign_selection_active(
                 )
 
         if record.state in {"PRODUCED", "UNRESOLVED"}:
+            _publish_terminal_solved_leaf(
+                plan, leaf, record, solved_leaf_store
+            )
             with progress_scope(**context):
                 emit_progress(
                     ProgressEventKind.LEAF_COMPLETED,
@@ -1847,6 +2090,9 @@ def _run_campaign_selection_active(
                 record=record,
             )
         if record.state in {"PRODUCED", "UNRESOLVED"}:
+            _publish_terminal_solved_leaf(
+                plan, leaf, record, solved_leaf_store
+            )
             with progress_scope(**context):
                 emit_progress(
                     ProgressEventKind.LEAF_COMPLETED,
@@ -1904,6 +2150,171 @@ def validate_campaign_checkpoint(
         records=records,
         checkpoint_path=str(path),
     )
+
+
+def import_campaign_checkpoint_to_solved_leaf_store(
+    plan: CampaignPlan,
+    checkpoint_path: str | os.PathLike[str] | Path,
+    store: SolvedLeafStore,
+) -> SolvedLeafImportSummary:
+    """Import independently valid terminal records; never infer progress."""
+
+    path = Path(checkpoint_path)
+    try:
+        diagnostic = json.loads(
+            path.read_text(encoding="utf-8"),
+            object_pairs_hook=_reject_duplicate_keys,
+        )
+    except (json.JSONDecodeError, OSError, ValueError):
+        diagnostic = None
+    if (
+        isinstance(diagnostic, Mapping)
+        and diagnostic.get("schema") == PROGRESS_SCHEMA
+        and "records" not in diagnostic
+    ):
+        return SolvedLeafImportSummary(0, 0, (), str(store.root))
+    _, records, _ = _load_checkpoint_for_solved_leaf_import(
+        plan, path
+    )
+    leaf_by_id = {leaf.leaf_id: leaf for leaf in plan.leaves}
+    imported: list[str] = []
+    skipped = 0
+    for record in records:
+        if record.state not in {"PRODUCED", "UNRESOLVED"}:
+            skipped += 1
+            continue
+        leaf = leaf_by_id[record.leaf_id]
+        _validate_cacheable_leaf_record(plan, leaf, record)
+        store.publish(
+            scientific_identity_sha256=scientific_computation_identity_sha256(
+                plan, leaf
+            ),
+            leaf_id=leaf.leaf_id,
+            record=record.to_mapping(),
+            source_type="imported-authenticated-checkpoint",
+        )
+        imported.append(leaf.leaf_id)
+    return SolvedLeafImportSummary(
+        imported_count=len(imported),
+        skipped_count=skipped,
+        leaf_ids=tuple(imported),
+        store_root=str(store.root),
+    )
+
+
+def _load_checkpoint_for_solved_leaf_import(
+    plan: CampaignPlan, path: Path
+) -> tuple[CampaignSelection, tuple[CampaignLeafRecord, ...], str]:
+    """Authenticate an old checkpoint while permitting operational campaign drift."""
+
+    value, bindings, records = _read_checkpoint_envelope(path)
+    if set(bindings) != {
+        "campaign_id",
+        "campaign_bindings",
+        "selection",
+        "selection_jobs_sha256",
+        "precision_factory_identity",
+        "precision_contract_sha256",
+    }:
+        raise ValueError("campaign checkpoint binding fields are invalid")
+    campaign_bindings = bindings["campaign_bindings"]
+    if not isinstance(campaign_bindings, Mapping) or set(campaign_bindings) != set(
+        plan.bindings
+    ):
+        raise ValueError("campaign checkpoint campaign bindings are invalid")
+    stored_campaign_id = bindings["campaign_id"]
+    if stored_campaign_id != f"b-prime-campaign-{_sha256(campaign_bindings)}":
+        raise ValueError("campaign checkpoint campaign binding digest is invalid")
+    for name in (
+        "schema_version",
+        "ordered_leaf_set_sha256",
+        "root_set_sha256",
+        "policy_sha256",
+        "backend_identity_sha256",
+        "precision_capabilities_sha256",
+        "precision_factory_identity",
+        "cohort_set_sha256",
+    ):
+        if campaign_bindings[name] != plan.bindings[name]:
+            raise ValueError(
+                f"campaign checkpoint scientific binding {name} is incompatible"
+            )
+    selection_value = bindings["selection"]
+    if not isinstance(selection_value, Mapping) or set(selection_value) != {
+        "selection_id", "role", "leaf_ids", "cohort_ids"
+    }:
+        raise ValueError("campaign checkpoint selection is invalid")
+    role = selection_value["role"]
+    leaf_ids = selection_value["leaf_ids"]
+    cohort_ids = selection_value["cohort_ids"]
+    if not isinstance(leaf_ids, list) or not isinstance(cohort_ids, list):
+        raise ValueError("campaign checkpoint selection arrays are invalid")
+    material = {
+        "campaign_id": stored_campaign_id,
+        "role": role,
+        "leaf_ids": leaf_ids,
+        "cohort_ids": cohort_ids,
+    }
+    if selection_value["selection_id"] != f"campaign-selection-{_sha256(material)}":
+        raise ValueError("campaign checkpoint selection binding digest is invalid")
+    if role == "all":
+        selection = build_campaign_selection(
+            plan, role="all", leaf_ids=None, cohort_ids=None
+        )
+    elif role == "merged":
+        if cohort_ids:
+            raise ValueError("merged campaign checkpoint cannot name cohorts")
+        selection = _merged_selection(plan, leaf_ids)
+    elif cohort_ids:
+        selection = build_campaign_selection(
+            plan, role=str(role), cohort_ids=cohort_ids
+        )
+    else:
+        selection = build_campaign_selection(
+            plan, role=str(role), leaf_ids=leaf_ids
+        )
+    if list(selection.leaf_ids) != leaf_ids or list(selection.cohort_ids) != cohort_ids:
+        raise ValueError("campaign checkpoint selection is outside the current domain")
+    current_bindings = _checkpoint_bindings(plan, selection)
+    for name in (
+        "selection_jobs_sha256",
+        "precision_factory_identity",
+        "precision_contract_sha256",
+    ):
+        if bindings[name] != current_bindings[name]:
+            raise ValueError(
+                f"campaign checkpoint scientific binding {name} is incompatible"
+            )
+    if len(records) > len(selection.leaf_ids):
+        raise ValueError("campaign checkpoint has excess records")
+    record_ids = tuple(record.leaf_id for record in records)
+    if len(record_ids) != len(set(record_ids)):
+        raise ValueError("campaign checkpoint contains duplicate leaf records")
+    record_set = set(record_ids)
+    expected_order = tuple(
+        leaf_id for leaf_id in selection.leaf_ids if leaf_id in record_set
+    )
+    if record_ids != expected_order:
+        raise ValueError("campaign checkpoint record order is invalid")
+    if selection.role != "merged" and record_ids != selection.leaf_ids[:len(records)]:
+        raise ValueError("selected campaign checkpoint records are not a prefix")
+    leaf_by_id = {leaf.leaf_id: leaf for leaf in plan.leaves}
+    for record in records:
+        leaf = leaf_by_id[record.leaf_id]
+        if record.role != leaf.role:
+            raise ValueError("campaign checkpoint record role is invalid")
+        _validate_record_semantics(
+            leaf, record, plan.precision_factory_identity
+        )
+    expected_state = (
+        "COMPLETE"
+        if len(records) == len(selection.leaf_ids)
+        and all(record.state in {"PRODUCED", "UNRESOLVED"} for record in records)
+        else "PARTIAL"
+    )
+    if value["state"] != expected_state or value["release_admissible"] is not False:
+        raise ValueError("campaign checkpoint state is invalid")
+    return selection, records, expected_state
 
 
 def merge_campaign_checkpoints(

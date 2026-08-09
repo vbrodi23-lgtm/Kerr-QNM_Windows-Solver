@@ -530,7 +530,7 @@ class CampaignProgressReporterTests(unittest.TestCase):
 
         output = stream.getvalue()
         self.assertTrue(output.startswith(history + "\x1b[0J"))
-        self.assertIn("\x1b[36F", output)
+        self.assertIn("\x1b[39F", output)
         self.assertNotIn("\x1b7", output)
         self.assertNotIn("\x1b8", output)
         self.assertEqual(output.count("\x1b[0J"), 2)
@@ -587,13 +587,13 @@ class CampaignProgressReporterTests(unittest.TestCase):
 
         output = stream.getvalue()
         self.assertTrue(output.startswith(history + "\x1b[0J"))
-        self.assertIn("\x1b[14F", output)
+        self.assertIn("\x1b[15F", output)
         self.assertNotIn("\x1b7", output)
         self.assertNotIn("\x1b8", output)
         self.assertNotIn("\x1b[2J", output)
-        latest_panel = output.rsplit("\x1b[14F\x1b[0J", 1)[-1]
+        latest_panel = output.rsplit("\x1b[15F\x1b[0J", 1)[-1]
         lines = latest_panel.splitlines()
-        self.assertEqual(len(lines), 14)
+        self.assertEqual(len(lines), 15)
         self.assertTrue(all(len(line) <= 80 for line in lines))
         self.assertIn("M02 CAMPAIGN", latest_panel)
         self.assertIn("LeafStatus: RUNNING", latest_panel)

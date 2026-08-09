@@ -25,6 +25,9 @@ _QUIET_KINDS = frozenset(
         ProgressEventKind.CAMPAIGN_FAILED,
         ProgressEventKind.LEAF_STARTED,
         ProgressEventKind.LEAF_REUSED,
+        ProgressEventKind.LEAF_CACHE_STALE,
+        ProgressEventKind.LEAF_CACHE_CORRUPT,
+        ProgressEventKind.LEAF_CACHE_PUBLICATION_FAILED,
         ProgressEventKind.LEAF_COMPLETED,
         ProgressEventKind.LEAF_FAILED,
         ProgressEventKind.ERROR,
@@ -32,6 +35,7 @@ _QUIET_KINDS = frozenset(
 )
 _NORMAL_KINDS = _QUIET_KINDS | frozenset(
     {
+        ProgressEventKind.SOLVED_LEAF_CACHE_SCANNED,
         ProgressEventKind.CAMPAIGN_STARTED,
         ProgressEventKind.CHECKPOINT_WRITING,
         ProgressEventKind.CHECKPOINT_WRITTEN,
@@ -49,6 +53,7 @@ _NORMAL_KINDS = _QUIET_KINDS | frozenset(
         ProgressEventKind.REQUEST_VALIDATED,
         ProgressEventKind.REQUEST_COMPLETED,
         ProgressEventKind.REQUEST_FAILED,
+        ProgressEventKind.LEAF_CACHE_PUBLISHED,
     }
 )
 _NORMAL_FALLBACK_KINDS = _NORMAL_KINDS | frozenset(
@@ -76,6 +81,11 @@ _FORCED_STATUS_KINDS = frozenset(
         ProgressEventKind.CAMPAIGN_COMPLETED,
         ProgressEventKind.CAMPAIGN_FAILED,
         ProgressEventKind.LEAF_STARTED,
+        ProgressEventKind.LEAF_REUSED,
+        ProgressEventKind.LEAF_CACHE_STALE,
+        ProgressEventKind.LEAF_CACHE_CORRUPT,
+        ProgressEventKind.LEAF_CACHE_PUBLICATION_FAILED,
+        ProgressEventKind.SOLVED_LEAF_CACHE_SCANNED,
         ProgressEventKind.LEAF_COMPLETED,
         ProgressEventKind.LEAF_FAILED,
         ProgressEventKind.PRECISION_STAGE_STARTED,
@@ -146,6 +156,10 @@ class CampaignProgressReporter:
         self._last_accepted_leaf: object | None = None
         self._checkpoint_status = "not yet written"
         self._campaign_status = "PENDING"
+        self._cache_compatible = 0
+        self._cache_stored = 0
+        self._cache_reusing = 0
+        self._cache_next_unsolved: object = None
         self._root_started: dict[tuple[object, object, object], float] = {}
         self._newton_started: dict[
             tuple[object, object, object, object], float
@@ -456,6 +470,11 @@ class CampaignProgressReporter:
         payload = record["payload"]
         assert isinstance(payload, Mapping)
         kind = record["kind"]
+        if kind == ProgressEventKind.SOLVED_LEAF_CACHE_SCANNED.value:
+            self._cache_compatible = int(payload.get("compatible_count", 0))
+            self._cache_stored = int(payload.get("stored_count", 0))
+            self._cache_reusing = int(payload.get("reusing_count", 0))
+            self._cache_next_unsolved = payload.get("next_unsolved_index")
         prior_leaf = self._dashboard_state.get("leaf_id")
         next_leaf = context["leaf_id"]
         if next_leaf is not None and next_leaf != prior_leaf:
@@ -590,6 +609,12 @@ class CampaignProgressReporter:
             ("Event", record["kind"]),
             ("Elapsed_s", round(float(record["elapsed_seconds"]), 1)),
             ("CampaignStatus", self._campaign_status),
+            (
+                "SolvedCache",
+                f"{self._cache_compatible} compatible / {self._cache_stored} stored",
+            ),
+            ("CacheReusing", self._cache_reusing),
+            ("NextUnsolved", self._cache_next_unsolved),
             ("Leaf", leaf),
             ("LeafStatus", context.get("leaf_status")),
             ("RootStatus", context.get("root_status")),
@@ -645,6 +670,7 @@ class CampaignProgressReporter:
         return [
             "M02 CAMPAIGN | " + line("Sequence", "Event", "Elapsed_s"),
             line("CampaignStatus", "Leaf", "LeafStatus"),
+            line("SolvedCache", "CacheReusing", "NextUnsolved"),
             line("LeafId"),
             line("Role", "Mode", "Spin"),
             line("Mechanism", "Precision", "Phase", "Newton"),
@@ -717,6 +743,37 @@ class CampaignProgressReporter:
         self._close_status()
         context = record["context"]
         assert isinstance(context, Mapping)
+        payload = record["payload"]
+        assert isinstance(payload, Mapping)
+        kind = record["kind"]
+        leaf = self._live_leaf_label(context)
+        if kind == ProgressEventKind.SOLVED_LEAF_CACHE_SCANNED.value:
+            compatible = payload.get("compatible_count", 0)
+            stored = payload.get("stored_count", 0)
+            reusing = payload.get("reusing_count", 0)
+            next_unsolved = payload.get("next_unsolved_index")
+            leaf_count = payload.get("leaf_count")
+            next_text = "none" if next_unsolved is None else f"{next_unsolved}/{leaf_count}"
+            self.stream.write(
+                f"Solved-leaf cache: {compatible} compatible / {stored} stored | "
+                f"Reusing {reusing} leaves | Next unsolved leaf: {next_text}\n"
+            )
+            self.stream.flush()
+            return
+        if kind == ProgressEventKind.LEAF_REUSED.value:
+            source = payload.get("source", "authenticated prior result")
+            self.stream.write(f"leaf_reused | Leaf {leaf} REUSED | {source}\n")
+            self.stream.flush()
+            return
+        if kind in {
+            ProgressEventKind.LEAF_CACHE_STALE.value,
+            ProgressEventKind.LEAF_CACHE_CORRUPT.value,
+        }:
+            label = "CACHE STALE" if kind.endswith("stale") else "CACHE CORRUPT"
+            message = payload.get("message", "not reused")
+            self.stream.write(f"Leaf {leaf} {label} | {message} | solving normally\n")
+            self.stream.flush()
+            return
         parts = [str(record["kind"]) + "".join(self._live_identity_parts(context))]
         for name in (
             "seed_omega",
@@ -733,8 +790,6 @@ class CampaignProgressReporter:
             if value is not None:
                 label = "leaf" if name == "leaf_id" else name
                 parts.append(f"{label}={value}")
-        payload = record["payload"]
-        assert isinstance(payload, Mapping)
         for name in (
             "current_omega",
             "determinant_abs",
@@ -755,6 +810,14 @@ class CampaignProgressReporter:
                 parts.append(f"{name}={record[name]:.3f}s")
         self.stream.write(" ".join(parts) + "\n")
         self.stream.flush()
+
+    @staticmethod
+    def _live_leaf_label(context: Mapping[str, object]) -> str:
+        index = context.get("leaf_index")
+        count = context.get("leaf_count")
+        if index is None or count is None:
+            return str(context.get("leaf_id") or "-")
+        return f"{index}/{count}"
 
     def _determinant_status(self, record: Mapping[str, object]) -> None:
         context = record["context"]

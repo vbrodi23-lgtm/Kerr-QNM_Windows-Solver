@@ -68,30 +68,81 @@ class M02PersistentRuntimeIntegrationTests(unittest.TestCase):
                 f"cold stdout={first.stdout!r} stderr={first.stderr!r}",
             )
             receipt = json.loads(
-                (runtime_root / "python-runtime.json").read_text(encoding="utf-8")
+                (runtime_root / "python-runtime.json").read_text(encoding="utf-8-sig")
             )
             julia = receipt["julia_runtime"]
-            contract_id = julia["scientific_source_contract_id"]
+            dependency_id = julia["dependency_contract_id"]
             environment_receipt = (
-                runtime_root / "metadata" / "m02-environments" / f"{contract_id}.json"
+                runtime_root
+                / "metadata"
+                / "m02-environments"
+                / f"{dependency_id}.json"
             )
             before = environment_receipt.read_bytes()
             environment = json.loads(before)
             self.assertEqual(
-                environment["scientific_source_contract_id"], contract_id
+                environment["dependency_contract_id"], dependency_id
             )
             self.assertEqual(
-                Path(environment["scientific_source_root"]),
-                runtime_root / "scientific-sources" / contract_id,
+                Path(environment["dependency_source_root"]),
+                runtime_root / "scientific-sources" / dependency_id,
             )
 
-            second = bootstrap(checkout_two)
+            unchanged = bootstrap(checkout_one)
             self.assertEqual(
-                second.returncode,
+                unchanged.returncode,
                 0,
-                f"warm stdout={second.stdout!r} stderr={second.stderr!r}",
+                f"same-checkout stdout={unchanged.stdout!r} "
+                f"stderr={unchanged.stderr!r}",
             )
             self.assertEqual(environment_receipt.read_bytes(), before)
+            self.assertIn(
+                b"M02 Julia project/depot receipt and probe are valid",
+                unchanged.stdout,
+            )
+            self.assertNotIn(b"Pkg.precompile", unchanged.stdout)
+            self.assertNotIn(b"Instantiating and precompiling", unchanged.stdout)
+
+            worker = (
+                checkout_two
+                / "src"
+                / "windows_solver"
+                / "data"
+                / "julia"
+                / "m02_worker.jl"
+            )
+            worker.write_text(
+                worker.read_text(encoding="utf-8")
+                + "\n# telemetry-only cross-checkout identity regression\n",
+                encoding="utf-8",
+            )
+            telemetry = bootstrap(checkout_two)
+            self.assertEqual(
+                telemetry.returncode,
+                0,
+                f"telemetry stdout={telemetry.stdout!r} "
+                f"stderr={telemetry.stderr!r}",
+            )
+            self.assertEqual(environment_receipt.read_bytes(), before)
+            self.assertIn(
+                b"M02 worker source changed; refreshing worker only",
+                telemetry.stdout,
+            )
+            self.assertIn(b"M02 dependency environment reused", telemetry.stdout)
+            self.assertNotIn(b"Pkg.precompile", telemetry.stdout)
+            self.assertNotIn(b"Instantiating and precompiling", telemetry.stdout)
+            telemetry_receipt = json.loads(
+                (runtime_root / "python-runtime.json").read_text(encoding="utf-8-sig")
+            )["julia_runtime"]
+            self.assertEqual(
+                telemetry_receipt["dependency_contract_id"], dependency_id
+            )
+            self.assertNotEqual(
+                telemetry_receipt["worker_contract_id"],
+                julia["worker_contract_id"],
+            )
+            self.assertEqual(telemetry_receipt["project"], julia["project"])
+            self.assertEqual(telemetry_receipt["depot"], julia["depot"])
 
             project = Path(julia["project"])
             manifest = (project / "Manifest.toml").read_text(encoding="utf-8")
@@ -102,7 +153,7 @@ class M02PersistentRuntimeIntegrationTests(unittest.TestCase):
                 "GeneralizedSasakiNakamura.jl",
                 "SpinWeightedSpheroidalHarmonics.jl",
             ):
-                source = runtime_root / "scientific-sources" / contract_id / package
+                source = runtime_root / "scientific-sources" / dependency_id / package
                 self.assertIn(source.as_posix(), manifest.replace("\\", "/"))
                 self.assertTrue(
                     (source / "Project.toml").is_file(), source / "Project.toml"

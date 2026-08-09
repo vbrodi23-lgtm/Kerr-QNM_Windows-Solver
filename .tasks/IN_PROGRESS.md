@@ -52,5 +52,7 @@ Confirm that a fresh checkout can originate every M02 numerical prerequisite fro
 - Move the normal Windows runtime to a versioned per-user LocalAppData root; retain an explicit package-local portable mode, validate runtime receipts before reuse, and leave checkout-local campaign state untouched.
 - Add Windows PowerShell 5.1 parse-and-safe-execution coverage for the actual bootstrap, including PowerShell interpolation, path-character, and Juliaup WindowsApps-shim discovery regressions.
 - Rebind every persistent M02 Manifest's legacy `vendor` entries to immutable contract-scoped scientific-source paths before `Pkg` reads it; reject checkout and environment-local paths, then prove clean-runtime/new-checkout reuse with an opt-in Windows integration test.
+- Separate Julia dependency, worker, and generated-GSN cache identities so exact-checkout and telemetry-only updates reuse authenticated project/depot state; retain fail-closed dependency invalidation and explicit rebuild diagnostics.
+- Add an optional private per-user authenticated solved-leaf store that reuses only complete terminal `CampaignLeafRecord`s under a separate per-leaf scientific-computation identity, imports authenticated checkpoints, and writes through only after the active checkpoint succeeds.
 
 ---

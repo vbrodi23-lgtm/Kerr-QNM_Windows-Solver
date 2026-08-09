@@ -22,11 +22,16 @@ class ProgressMode(StrEnum):
 
 
 class ProgressEventKind(StrEnum):
+    SOLVED_LEAF_CACHE_SCANNED = "solved_leaf_cache_scanned"
     CAMPAIGN_STARTED = "campaign_started"
     CAMPAIGN_COMPLETED = "campaign_completed"
     CAMPAIGN_FAILED = "campaign_failed"
     LEAF_STARTED = "leaf_started"
     LEAF_REUSED = "leaf_reused"
+    LEAF_CACHE_STALE = "leaf_cache_stale"
+    LEAF_CACHE_CORRUPT = "leaf_cache_corrupt"
+    LEAF_CACHE_PUBLISHED = "leaf_cache_published"
+    LEAF_CACHE_PUBLICATION_FAILED = "leaf_cache_publication_failed"
     LEAF_COMPLETED = "leaf_completed"
     LEAF_FAILED = "leaf_failed"
     CHECKPOINT_WRITING = "checkpoint_writing"

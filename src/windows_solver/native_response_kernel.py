@@ -231,7 +231,6 @@ class VettedNativeDeterminantKernel:
             integration_absolute_tolerance=policy.ode_absolute_tolerance,
             real_maximum_step=0.2,
         )
-
     @staticmethod
     def _horizon_seed_branch(
         sn: object,
