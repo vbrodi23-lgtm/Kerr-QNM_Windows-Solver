@@ -492,7 +492,9 @@ class CampaignPlanTests(unittest.TestCase):
                 "campaign-resume", str(config), "--checkpoint", checkpoint.name
             )
             self.assertEqual(resumed.returncode, 0, resumed.stderr)
-            self.assertEqual(json.loads(resumed.stdout)["executed_stage_count"], 0)
+            resumed_payload = json.loads(resumed.stdout)
+            self.assertEqual(resumed_payload["executed_stage_count"], 0)
+            self.assertNotIn("records", resumed_payload)
             validated = invoke(
                 "campaign-validate", str(config), "--checkpoint", checkpoint.name
             )
@@ -524,8 +526,13 @@ class CampaignPlanTests(unittest.TestCase):
             self.assertEqual(cold.returncode, 3)
             self.assertFalse((directory / "cold.json").exists())
             self.assertEqual(
-                json.loads(cold.stderr)["error"]["code"], "PROVIDER_UNAVAILABLE"
+                json.loads(cold.stderr.splitlines()[-1])["error"]["code"],
+                "PROVIDER_UNAVAILABLE",
             )
+            failed_status = json.loads(
+                (directory / "cold.json.status.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(failed_status["kind"], "request_failed")
 
             smoke = invoke("campaign-smoke")
             self.assertEqual(smoke.returncode, 0, smoke.stderr)
