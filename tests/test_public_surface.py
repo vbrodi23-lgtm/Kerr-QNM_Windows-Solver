@@ -157,9 +157,26 @@ class PublicSurfaceTests(unittest.TestCase):
             ) : bootstrap.index("\n    $JuliaIdentity")
         ]
 
-        self.assertIn('Get-Command -Name "tar.exe"', julia_install)
         self.assertIn(
-            'Invoke-Native $TarExe @("-xf", $JuliaArchive, "-C", $JuliaExtract)',
+            'cmd.exe /c rd /s /q "\\\\?\\$JuliaExtract"',
+            julia_install,
+        )
+        self.assertIn(
+            "Could not remove previous Julia extraction directory",
+            julia_install,
+        )
+        self.assertEqual(julia_install.count("cmd.exe /c rd /s /q"), 3)
+        self.assertNotIn("Remove-Item -LiteralPath $Julia", julia_install)
+        self.assertIn(
+            'Get-Command tar.exe -ErrorAction SilentlyContinue',
+            julia_install,
+        )
+        self.assertIn(
+            '& $Tar.Source -xf $JuliaArchive -C $JuliaExtract',
+            julia_install,
+        )
+        self.assertIn(
+            "Julia archive extraction failed with tar.exe exit code",
             julia_install,
         )
         self.assertIn(
