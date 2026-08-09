@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+from collections import deque
 from collections.abc import Mapping
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import json
 import math
 import os
 from pathlib import Path
+from statistics import fmean, median
 import sys
 import tempfile
 import time
@@ -49,6 +51,13 @@ _NORMAL_KINDS = _QUIET_KINDS | frozenset(
         ProgressEventKind.REQUEST_FAILED,
     }
 )
+_NORMAL_FALLBACK_KINDS = _NORMAL_KINDS | frozenset(
+    {
+        ProgressEventKind.DETERMINANT_COMPLETED,
+        ProgressEventKind.DETERMINANT_EVALUATED,
+        ProgressEventKind.SUBOPERATION_COMPLETED,
+    }
+)
 _TERMINAL_KINDS = frozenset(
     {
         ProgressEventKind.CAMPAIGN_COMPLETED,
@@ -74,6 +83,7 @@ _FORCED_STATUS_KINDS = frozenset(
     }
 )
 _STATUS_INTERVAL_SECONDS = 0.25
+_LEAF_TIMING_WINDOW = 10
 
 
 def _json_value(value: object) -> object:
@@ -107,7 +117,12 @@ class CampaignProgressReporter:
     ) -> None:
         self.mode = ProgressMode(mode)
         self.checkpoint = Path(checkpoint)
-        self.stream = sys.stderr if stream is None else stream
+        if stream is None:
+            if self.mode is ProgressMode.NORMAL and self._is_terminal(sys.stdout):
+                stream = sys.stdout
+            else:
+                stream = sys.stderr
+        self.stream = stream
         self.session = uuid4().hex
         self._started = time.monotonic()
         self._sequence = 0
@@ -120,6 +135,17 @@ class CampaignProgressReporter:
         ] = {}
         self._active_newton: dict[tuple[object, object, object], object] = {}
         self._leaf_started: dict[object, float] = {}
+        self._completed_leaf_seconds: deque[float] = deque(
+            maxlen=_LEAF_TIMING_WINDOW
+        )
+        self._settled_leaf_ids: set[object] = set()
+        self._accepted_leaf_ids: set[object] = set()
+        self._rejected_leaf_ids: set[object] = set()
+        self._indeterminate_leaf_ids: set[object] = set()
+        self._failed_leaf_ids: set[object] = set()
+        self._last_accepted_leaf: object | None = None
+        self._checkpoint_status = "not yet written"
+        self._campaign_status = "PENDING"
         self._root_started: dict[tuple[object, object, object], float] = {}
         self._newton_started: dict[
             tuple[object, object, object, object], float
@@ -129,6 +155,12 @@ class CampaignProgressReporter:
             tuple[object, object, object], tuple[float, object]
         ] = {}
         self._last_status_seconds: float | None = None
+        self._last_dashboard_seconds: float | None = None
+        self._dashboard_rendered_rows = 0
+        self._terminal_dashboard = self._stream_is_terminal()
+        if self._terminal_dashboard:
+            self._terminal_dashboard = self._enable_virtual_terminal()
+        self._dashboard_state: dict[str, object] = {}
         self.diagnostics: list[str] = []
 
     def publish(self, event: ProgressEvent) -> None:
@@ -136,6 +168,7 @@ class CampaignProgressReporter:
 
         try:
             record = self._record(event)
+            self._update_dashboard_state(record)
             if self._should_write_status(event):
                 self._write_status(record)
             self._render(event, record)
@@ -180,7 +213,7 @@ class CampaignProgressReporter:
             self._newton_determinants[newton_key] = (
                 self._newton_determinants.get(newton_key, 0) + 1
             )
-        if event.kind in determinant_kinds:
+        if context["leaf_id"] is not None:
             leaf_key = context["leaf_id"]
             newton_key = (
                 leaf_key,
@@ -190,14 +223,15 @@ class CampaignProgressReporter:
             )
             context["determinant_index_leaf"] = (
                 context["determinant_index_leaf"]
-                or self._leaf_determinants.get(leaf_key, 0)
+                or self._leaf_determinants.get(leaf_key)
             )
             context["determinant_index_phase"] = (
-                context["determinant_index_phase"] or counters["determinant"]
+                context["determinant_index_phase"]
+                or (counters["determinant"] or None)
             )
             context["determinant_index_newton"] = (
                 context["determinant_index_newton"]
-                or self._newton_determinants.get(newton_key, 0)
+                or self._newton_determinants.get(newton_key)
             )
         self._sequence += 1
         now = event.monotonic_seconds
@@ -211,6 +245,22 @@ class CampaignProgressReporter:
         )
         if event.kind is ProgressEventKind.LEAF_STARTED:
             self._leaf_started[leaf_key] = now
+        if (
+            event.kind in {
+                ProgressEventKind.LEAF_COMPLETED,
+                ProgressEventKind.LEAF_REUSED,
+            }
+            and leaf_key is not None
+            and leaf_key not in self._settled_leaf_ids
+        ):
+            if (
+                event.kind is ProgressEventKind.LEAF_COMPLETED
+                and leaf_key in self._leaf_started
+            ):
+                duration = now - self._leaf_started[leaf_key]
+                if math.isfinite(duration) and duration >= 0:
+                    self._completed_leaf_seconds.append(duration)
+            self._settled_leaf_ids.add(leaf_key)
         if event.kind is ProgressEventKind.ROOT_PHASE_STARTED:
             self._root_started[root_key] = now
         if event.kind is ProgressEventKind.NEWTON_ITERATION_STARTED:
@@ -254,7 +304,32 @@ class CampaignProgressReporter:
             record["best_determinant_abs"] = self._best_determinants[
                 determinant_key
             ][1]
+        self._add_leaf_timing_estimate(record, context)
         return record
+
+    def _add_leaf_timing_estimate(
+        self, record: dict[str, object], context: Mapping[str, object]
+    ) -> None:
+        if not self._completed_leaf_seconds:
+            return
+        leaf_count = context["leaf_count"]
+        if isinstance(leaf_count, bool) or not isinstance(leaf_count, int):
+            return
+        average = fmean(self._completed_leaf_seconds)
+        midpoint = median(self._completed_leaf_seconds)
+        remaining = max(0, leaf_count - len(self._settled_leaf_ids))
+        eta_seconds = average * remaining
+        finish = datetime.now().astimezone() + timedelta(seconds=eta_seconds)
+        record.update(
+            {
+                "leaf_timing_sample_size": len(self._completed_leaf_seconds),
+                "leaf_timing_window_size": _LEAF_TIMING_WINDOW,
+                "average_leaf_seconds": average,
+                "median_leaf_seconds": midpoint,
+                "eta_seconds": eta_seconds,
+                "estimated_finish": finish.isoformat(timespec="minutes"),
+            }
+        )
 
     def _observe_best_determinant(
         self, key: tuple[object, object, object], value: object
@@ -286,21 +361,357 @@ class CampaignProgressReporter:
                 self._ordinary_line(record)
             return
         if self.mode is ProgressMode.NORMAL:
-            if event.kind in {
-                ProgressEventKind.DETERMINANT_STARTED,
-                ProgressEventKind.DETERMINANT_COMPLETED,
-                ProgressEventKind.DETERMINANT_EVALUATED,
-            }:
-                self._determinant_status(record)
-            elif event.kind in {
-                ProgressEventKind.SUBOPERATION_STARTED,
-                ProgressEventKind.SUBOPERATION_COMPLETED,
-            }:
-                self._suboperation_status(record)
-            elif event.kind in _NORMAL_KINDS:
+            if self._terminal_dashboard:
+                if self._should_render_dashboard(event):
+                    self._dashboard(record)
+            elif event.kind in _NORMAL_FALLBACK_KINDS:
                 self._ordinary_line(record)
             return
         self._ordinary_line(record)
+
+    def _stream_is_terminal(self) -> bool:
+        return self._is_terminal(self.stream)
+
+    @staticmethod
+    def _is_terminal(stream: TextIO) -> bool:
+        try:
+            return bool(stream.isatty())
+        except (AttributeError, OSError):
+            return False
+
+    def _enable_virtual_terminal(self) -> bool:
+        if os.name != "nt":
+            return True
+        try:
+            import ctypes
+            import msvcrt
+
+            handle = msvcrt.get_osfhandle(self.stream.fileno())
+            mode = ctypes.c_ulong()
+            kernel32 = ctypes.windll.kernel32
+            if not kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+                return False
+            enable_virtual_terminal_processing = 0x0004
+            return bool(
+                kernel32.SetConsoleMode(
+                    handle, mode.value | enable_virtual_terminal_processing
+                )
+            )
+        except (AttributeError, ImportError, OSError, ValueError):
+            return False
+
+    def _should_render_dashboard(self, event: ProgressEvent) -> bool:
+        now = event.monotonic_seconds
+        if (
+            self._last_dashboard_seconds is None
+            or event.kind in _FORCED_STATUS_KINDS
+            or now - self._last_dashboard_seconds >= _STATUS_INTERVAL_SECONDS
+        ):
+            self._last_dashboard_seconds = now
+            return True
+        return False
+
+    def _dashboard(self, record: Mapping[str, object]) -> None:
+        lines = self._bounded_dashboard_lines(record)
+        if self._dashboard_rendered_rows:
+            # Redraw relative to the current cursor.  A saved screen position is
+            # not stable once a first render scrolls a short console.
+            self.stream.write(f"\x1b[{self._dashboard_rendered_rows}F")
+        # Erase only the dashboard region below the current cursor.  Do not use
+        # Clear-Host or ESC[2J: bootstrap and command history must remain in
+        # scrollback.
+        self.stream.write("\x1b[0J")
+        self.stream.write("\n".join(lines) + "\n")
+        self.stream.flush()
+        self._dashboard_rendered_rows = len(lines)
+
+    def _bounded_dashboard_lines(self, record: Mapping[str, object]) -> list[str]:
+        columns, terminal_rows = self._terminal_dimensions()
+        maximum_rows = max(1, terminal_rows - 1)
+        lines = self._dashboard_lines(record)
+        if len(lines) > maximum_rows:
+            lines = self._compact_dashboard_lines(record)
+        return [self._fit_dashboard_line(line, columns) for line in lines[:maximum_rows]]
+
+    def _terminal_dimensions(self) -> tuple[int, int]:
+        try:
+            size = os.get_terminal_size(self.stream.fileno())
+        except (AttributeError, OSError, ValueError):
+            # Preserve the full Format-List view for terminal-like streams that
+            # do not expose a file descriptor (including test and embedded hosts).
+            return 120, 50
+        return max(1, size.columns), max(2, size.lines)
+
+    @staticmethod
+    def _fit_dashboard_line(line: str, columns: int) -> str:
+        if len(line) <= columns:
+            return line
+        if columns == 1:
+            return "…"
+        return line[: columns - 1] + "…"
+
+    def _update_dashboard_state(self, record: Mapping[str, object]) -> None:
+        context = record["context"]
+        assert isinstance(context, Mapping)
+        payload = record["payload"]
+        assert isinstance(payload, Mapping)
+        kind = record["kind"]
+        prior_leaf = self._dashboard_state.get("leaf_id")
+        next_leaf = context["leaf_id"]
+        if next_leaf is not None and next_leaf != prior_leaf:
+            self._dashboard_state.clear()
+            self._dashboard_state.update(
+                {
+                    "leaf_status": "RUNNING",
+                    "root_status": "PENDING",
+                    "precision_status": "PENDING",
+                }
+            )
+        else:
+            prior_readout = self._dashboard_state.get("readout_index")
+            next_readout = context["readout_index"]
+            prior_phase = self._dashboard_state.get("phase")
+            next_phase = context["phase"]
+            if (
+                next_readout is not None
+                and prior_readout is not None
+                and next_readout != prior_readout
+            ) or (
+                next_phase is not None
+                and prior_phase is not None
+                and next_phase != prior_phase
+            ):
+                for name in (
+                    "current_omega",
+                    "candidate_omega",
+                    "newton_index",
+                    "newton_limit",
+                    "determinant_index_phase",
+                    "determinant_index_newton",
+                    "determinant_abs",
+                    "suboperation",
+                ):
+                    self._dashboard_state.pop(name, None)
+        for name, value in context.items():
+            if value is not None:
+                self._dashboard_state[name] = value
+        determinant_abs = record.get("current_determinant_abs")
+        if determinant_abs is not None:
+            self._dashboard_state["determinant_abs"] = determinant_abs
+        best_determinant_abs = record.get("best_determinant_abs")
+        if best_determinant_abs is not None:
+            self._dashboard_state["best_determinant_abs"] = best_determinant_abs
+        acceptance_threshold = payload.get("acceptance_threshold")
+        if acceptance_threshold is not None:
+            self._dashboard_state["acceptance_threshold"] = acceptance_threshold
+        if kind == ProgressEventKind.LEAF_STARTED.value:
+            self._dashboard_state["leaf_status"] = "RUNNING"
+        elif kind in {
+            ProgressEventKind.LEAF_COMPLETED.value,
+            ProgressEventKind.LEAF_REUSED.value,
+        }:
+            self._record_leaf_outcome(next_leaf, payload.get("state"))
+        elif kind == ProgressEventKind.LEAF_FAILED.value:
+            self._dashboard_state["leaf_status"] = "FAILED"
+            if next_leaf is not None:
+                self._discard_leaf_outcomes(next_leaf)
+                self._failed_leaf_ids.add(next_leaf)
+        elif kind == ProgressEventKind.ROOT_PHASE_STARTED.value:
+            self._dashboard_state["root_status"] = "SEARCHING"
+        elif kind == ProgressEventKind.ROOT_PHASE_COMPLETED.value:
+            converged = payload.get("converged")
+            if converged is True:
+                self._dashboard_state["root_status"] = "CONVERGED"
+            elif converged is False:
+                self._dashboard_state["root_status"] = "NOT_CONVERGED"
+        elif kind == ProgressEventKind.PRECISION_STAGE_STARTED.value:
+            self._dashboard_state["precision_status"] = "ACTIVE"
+        elif kind == ProgressEventKind.PRECISION_STAGE_COMPLETED.value:
+            numerical_state = payload.get("numerical_state")
+            if numerical_state is not None:
+                self._dashboard_state["precision_status"] = numerical_state
+            if payload.get("leaf_state") == "MISSING_PRECISION":
+                self._dashboard_state["leaf_status"] = "MISSING_PRECISION"
+        elif kind == ProgressEventKind.CHECKPOINT_WRITING.value:
+            self._checkpoint_status = "writing"
+        elif kind == ProgressEventKind.CHECKPOINT_WRITTEN.value:
+            self._checkpoint_status = "written"
+        elif kind == ProgressEventKind.CAMPAIGN_STARTED.value:
+            self._campaign_status = "RUNNING"
+        elif kind == ProgressEventKind.CAMPAIGN_COMPLETED.value:
+            state = payload.get("state")
+            self._campaign_status = str(state) if state is not None else "COMPLETED"
+            if (
+                self._campaign_status == "PARTIAL"
+                and self._dashboard_state.get("leaf_status") == "RUNNING"
+            ):
+                self._dashboard_state["leaf_status"] = "PARTIAL"
+        elif kind == ProgressEventKind.CAMPAIGN_FAILED.value:
+            self._campaign_status = "FAILED"
+
+    def _record_leaf_outcome(self, leaf_id: object, state: object) -> None:
+        if leaf_id is not None:
+            self._discard_leaf_outcomes(leaf_id)
+        if state == "PRODUCED":
+            status = "ACCEPTED"
+            target = self._accepted_leaf_ids
+            self._last_accepted_leaf = leaf_id
+        elif state == "UNRESOLVED":
+            status = "INDETERMINATE"
+            target = self._indeterminate_leaf_ids
+        elif state == "REJECTED":
+            status = "REJECTED"
+            target = self._rejected_leaf_ids
+        else:
+            status = "COMPLETED"
+            target = None
+        self._dashboard_state["leaf_status"] = status
+        if leaf_id is not None and target is not None:
+            target.add(leaf_id)
+
+    def _discard_leaf_outcomes(self, leaf_id: object) -> None:
+        for outcomes in (
+            self._accepted_leaf_ids,
+            self._rejected_leaf_ids,
+            self._indeterminate_leaf_ids,
+            self._failed_leaf_ids,
+        ):
+            outcomes.discard(leaf_id)
+
+    def _dashboard_fields(
+        self, record: Mapping[str, object]
+    ) -> tuple[tuple[str, object], ...]:
+        context = self._dashboard_state
+        leaf = "-"
+        if context.get("leaf_index") is not None and context.get("leaf_count") is not None:
+            leaf = f"{context['leaf_index']}/{context['leaf_count']}"
+        return (
+            ("Sequence", record["sequence"]),
+            ("Event", record["kind"]),
+            ("Elapsed_s", round(float(record["elapsed_seconds"]), 1)),
+            ("CampaignStatus", self._campaign_status),
+            ("Leaf", leaf),
+            ("LeafStatus", context.get("leaf_status")),
+            ("RootStatus", context.get("root_status")),
+            ("PrecisionStatus", context.get("precision_status")),
+            ("Completed", self._completed_value(context.get("leaf_count"))),
+            ("Accepted", len(self._accepted_leaf_ids)),
+            ("Rejected", len(self._rejected_leaf_ids)),
+            ("Indeterminate", len(self._indeterminate_leaf_ids)),
+            ("Failed", len(self._failed_leaf_ids)),
+            ("LastAccepted", self._last_accepted_leaf),
+            ("LeafId", context.get("leaf_id")),
+            ("Role", context.get("role")),
+            ("Mode", context.get("mode")),
+            ("Spin", context.get("spin")),
+            ("Mechanism", context.get("mechanism_id")),
+            ("Precision", context.get("precision_digits")),
+            ("Phase", context.get("phase")),
+            ("Newton", context.get("newton_index")),
+            ("CurrentOmega", context.get("current_omega")),
+            ("DeterminantAbs", context.get("determinant_abs")),
+            ("BestDetAbs", context.get("best_determinant_abs")),
+            ("Threshold", context.get("acceptance_threshold")),
+            ("DetLeaf", context.get("determinant_index_leaf")),
+            ("DetPhase", context.get("determinant_index_phase")),
+            ("DetNewton", context.get("determinant_index_newton")),
+            ("Suboperation", context.get("suboperation")),
+            ("Checkpoint", self._checkpoint_status),
+            (
+                "TimingSample",
+                self._timing_sample(record),
+            ),
+            ("AvgLeaf", self._duration_value(record.get("average_leaf_seconds"))),
+            ("MedianLeaf", self._duration_value(record.get("median_leaf_seconds"))),
+            ("ETA", self._duration_value(record.get("eta_seconds"))),
+            ("Finish", self._finish_value(record.get("estimated_finish"))),
+        )
+
+    def _dashboard_lines(self, record: Mapping[str, object]) -> list[str]:
+        return [
+            f"{label:<15}: {self._dashboard_value(value)}"
+            for label, value in self._dashboard_fields(record)
+        ]
+
+    def _compact_dashboard_lines(self, record: Mapping[str, object]) -> list[str]:
+        fields = dict(self._dashboard_fields(record))
+
+        def line(*labels: str) -> str:
+            return " | ".join(
+                f"{label}: {self._dashboard_value(fields.get(label))}"
+                for label in labels
+            )
+
+        return [
+            "M02 CAMPAIGN | " + line("Sequence", "Event", "Elapsed_s"),
+            line("CampaignStatus", "Leaf", "LeafStatus"),
+            line("LeafId"),
+            line("Role", "Mode", "Spin"),
+            line("Mechanism", "Precision", "Phase", "Newton"),
+            line("RootStatus", "PrecisionStatus", "Checkpoint"),
+            line("Completed", "Accepted", "Rejected"),
+            line("Indeterminate", "Failed", "LastAccepted"),
+            line("CurrentOmega"),
+            line("DeterminantAbs", "BestDetAbs", "Threshold"),
+            line("DetLeaf", "DetPhase", "DetNewton"),
+            line("Suboperation"),
+            line("TimingSample", "AvgLeaf", "MedianLeaf"),
+            line("ETA", "Finish"),
+        ]
+
+    def _completed_value(self, leaf_count: object) -> str:
+        completed = len(self._settled_leaf_ids)
+        if isinstance(leaf_count, bool) or not isinstance(leaf_count, int):
+            return str(completed)
+        return f"{completed}/{leaf_count}"
+
+    @classmethod
+    def _dashboard_value(cls, value: object) -> str:
+        if value is None:
+            return ""
+        if isinstance(value, Mapping):
+            entries = "; ".join(
+                f"{key}={cls._dashboard_value(value[key])}" for key in sorted(value)
+            )
+            return "@{" + entries + "}"
+        if isinstance(value, bool):
+            return str(value).lower()
+        return str(value)
+
+    @staticmethod
+    def _timing_sample(record: Mapping[str, object]) -> str | None:
+        sample = record.get("leaf_timing_sample_size")
+        window = record.get("leaf_timing_window_size")
+        if sample is None or window is None:
+            return None
+        return f"{sample}/{window}"
+
+    @staticmethod
+    def _duration_value(value: object) -> str | None:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        seconds = max(0, round(value))
+        days, seconds = divmod(seconds, 86400)
+        hours, seconds = divmod(seconds, 3600)
+        minutes, seconds = divmod(seconds, 60)
+        if days:
+            return f"{days}d {hours}h {minutes}m"
+        if hours:
+            return f"{hours}h {minutes}m {seconds}s"
+        if minutes:
+            return f"{minutes}m {seconds}s"
+        return f"{seconds}s"
+
+    @staticmethod
+    def _finish_value(value: object) -> str | None:
+        if not isinstance(value, str):
+            return None
+        try:
+            finish = datetime.fromisoformat(value)
+        except ValueError:
+            return value
+        compact = finish.strftime("%Y-%m-%d %H:%M %z")
+        return compact[:-2] + ":" + compact[-2:]
 
     def _ordinary_line(self, record: Mapping[str, object]) -> None:
         self._close_status()

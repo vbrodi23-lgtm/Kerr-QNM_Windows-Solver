@@ -433,6 +433,7 @@ function bounded_newton(::Type{T}, request, initial::Complex{T}, amplitude::Comp
             "current_omega" => progress_complex(value),
             "determinant_abs" => string(magnitude),
             "best_determinant_abs" => string(best_residual),
+            "acceptance_threshold" => string(tolerance),
         ))
         if magnitude <= tolerance
             progress_emit("newton_iteration_completed"; context=newton_context, payload=Dict(

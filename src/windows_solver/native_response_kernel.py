@@ -47,6 +47,7 @@ _SOURCE_BLOBS = (
     ("gsn-potential-expressions", "34af90dd81e6e0f60823b338488d8d9587e2cc6a"),
 )
 _DERIVATIVE_STEP = 1.0e-5
+_ROOT_TOLERANCE = 2.0e-11
 _BRANCH_CONTINUATION_TOLERANCE_ABS = 5.0e-3
 # Stable across source checkouts and wheels; source_commit/source_blobs below
 # retain the authenticated upstream code identity.
@@ -474,8 +475,9 @@ class VettedNativeDeterminantKernel:
                     current_omega=_progress_complex(value),
                     determinant_abs=magnitude,
                     best_determinant_abs=best[1],
+                    acceptance_threshold=_ROOT_TOLERANCE,
                 )
-                if magnitude < 2.0e-11:
+                if magnitude < _ROOT_TOLERANCE:
                     emit_progress(
                         ProgressEventKind.NEWTON_ITERATION_COMPLETED,
                         derivative_abs=None,
@@ -555,7 +557,7 @@ class VettedNativeDeterminantKernel:
                     resulting_determinant_abs=resulting_abs,
                     elapsed_seconds=time.monotonic() - iteration_started,
                 )
-        return best[0], best[1], best[1] < 2.0e-11
+        return best[0], best[1], best[1] < _ROOT_TOLERANCE
 
     def _solve_once(
         self,
