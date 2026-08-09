@@ -21,18 +21,32 @@
     "url": "https://julialang-s3.julialang.org/bin/winnt/x64/1.10/julia-1.10.11-win64.zip",
     "sha256": "11ba52fd1384f82d09ea232eb1552b6694bb2083e6adfe3ae2f9e1e663ed8cf8",
     "executable_relative_path": "julia/bin/julia.exe",
-    "required_by": "M02 package-owned GSN F/U infinity-series cache production"
+    "required_by": "M02 package-owned GSN F/U cache production and 80/120-digit promoted root readouts"
   },
   "scientific_sources": [
     {
       "id": "gsn-kerr",
-      "path": "src/windows_solver/data/julia/GeneralizedSasakiNakamura.jl/src/Homogeneous/Kerr.jl",
-      "sha256": "1c333604190ba6a9554dcbcacf1ae308ac57bc036dbd8be074fe16e73f1a6635"
+      "path": "src/windows_solver/data/julia/GeneralizedSasakiNakamura.jl/src/Homogeneous/Kerr.jl"
     },
     {
       "id": "gsn-potentials",
-      "path": "src/windows_solver/data/julia/GeneralizedSasakiNakamura.jl/src/Homogeneous/Potentials.jl",
-      "sha256": "4339ed8a7861c534bd8d81f108cacf7fd75f19954352daa636afe30b47e50089"
+      "path": "src/windows_solver/data/julia/GeneralizedSasakiNakamura.jl/src/Homogeneous/Potentials.jl"
+    },
+    {
+      "id": "m02-julia-worker",
+      "path": "src/windows_solver/data/julia/m02_worker.jl"
+    },
+    {
+      "id": "gsn-cache-producer",
+      "path": "src/windows_solver/data/julia/generate_gsn_cache.jl"
+    },
+    {
+      "id": "m02-julia-project",
+      "path": "src/windows_solver/data/julia/m02_project/Project.toml"
+    },
+    {
+      "id": "m02-julia-manifest-seed",
+      "path": "src/windows_solver/data/julia/m02_project/Manifest.seed.toml"
     }
   ],
   "numerical_kernel": {
