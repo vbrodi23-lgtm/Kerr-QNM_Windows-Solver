@@ -620,9 +620,11 @@ def _campaign_backend_descriptor(value: object, base: Path):
     }
 
 
-def _load_campaign_backend(descriptor):
+def _load_campaign_backend(descriptor, *, plan=None, selection=None):
     if descriptor is None:
-        return NativeCampaignStageBackend.from_environment()
+        if plan is None or selection is None:
+            raise ValueError("native campaign backend requires the selected campaign leaves")
+        return NativeCampaignStageBackend.from_selection(plan, selection)
     module_name, factory_name = descriptor["factory"].split(":", 1)
     module_path = descriptor["module_path"]
     module = types.ModuleType(module_name)
@@ -696,7 +698,7 @@ def _campaign_selected(command: str, selection_path: Path, checkpoint: Path, *, 
                 raise ValueError("campaign checkpoint selection does not match request")
             if cached.state == "COMPLETE":
                 return 0, {"command": command, **cached.to_mapping()}
-        backend = _load_campaign_backend(descriptor)
+        backend = _load_campaign_backend(descriptor, plan=plan, selection=selection)
         summary = run_campaign_selection(
             plan,
             selection,
