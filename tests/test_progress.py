@@ -289,6 +289,47 @@ class CampaignProgressReporterTests(unittest.TestCase):
 
         self.assertIs(reporter.stream, sys.stderr)
 
+    def test_normal_non_terminal_preserves_lifecycle_and_detail_lines(self):
+        stream = io.StringIO()
+        reporter = CampaignProgressReporter("normal", self.reporter_checkpoint, stream)
+        events = (
+            _payload_event(
+                ProgressEventKind.LEAF_REUSED,
+                {"state": "PRODUCED"},
+                leaf_id="leaf-1",
+            ),
+            _event(ProgressEventKind.CHECKPOINT_WRITING, leaf_id="leaf-2"),
+            _event(ProgressEventKind.CHECKPOINT_WRITTEN, leaf_id="leaf-2"),
+            _payload_event(
+                ProgressEventKind.PRECISION_STAGE_COMPLETED,
+                {"numerical_state": "CONVERGED", "leaf_state": "PRODUCED"},
+                leaf_id="leaf-2",
+            ),
+            _event(ProgressEventKind.ROOT_PHASE_STARTED, leaf_id="leaf-2"),
+            _event(ProgressEventKind.NEWTON_ITERATION_STARTED, leaf_id="leaf-2"),
+            _payload_event(
+                ProgressEventKind.DETERMINANT_COMPLETED,
+                {"determinant_abs": 1.0e-12},
+                leaf_id="leaf-2",
+            ),
+            _event(ProgressEventKind.SUBOPERATION_COMPLETED, leaf_id="leaf-2"),
+        )
+        for event in events:
+            reporter.publish(event)
+
+        output = stream.getvalue()
+        for kind in (
+            "leaf_reused",
+            "checkpoint_writing",
+            "checkpoint_written",
+            "precision_stage_completed",
+            "root_phase_started",
+            "newton_iteration_started",
+            "determinant_completed",
+            "suboperation_completed",
+        ):
+            self.assertIn(kind, output)
+
     def test_normal_writes_atomic_live_status_for_second_process_inspection(self):
         with TemporaryDirectory() as directory:
             checkpoint = Path(directory) / "checkpoint.json"
@@ -489,7 +530,7 @@ class CampaignProgressReporterTests(unittest.TestCase):
 
         output = stream.getvalue()
         self.assertTrue(output.startswith(history + "\x1b[0J"))
-        self.assertIn("\x1b[35F", output)
+        self.assertIn("\x1b[36F", output)
         self.assertNotIn("\x1b7", output)
         self.assertNotIn("\x1b8", output)
         self.assertEqual(output.count("\x1b[0J"), 2)
@@ -546,13 +587,13 @@ class CampaignProgressReporterTests(unittest.TestCase):
 
         output = stream.getvalue()
         self.assertTrue(output.startswith(history + "\x1b[0J"))
-        self.assertIn("\x1b[13F", output)
+        self.assertIn("\x1b[14F", output)
         self.assertNotIn("\x1b7", output)
         self.assertNotIn("\x1b8", output)
         self.assertNotIn("\x1b[2J", output)
-        latest_panel = output.rsplit("\x1b[13F\x1b[0J", 1)[-1]
+        latest_panel = output.rsplit("\x1b[14F\x1b[0J", 1)[-1]
         lines = latest_panel.splitlines()
-        self.assertEqual(len(lines), 13)
+        self.assertEqual(len(lines), 14)
         self.assertTrue(all(len(line) <= 80 for line in lines))
         self.assertIn("M02 CAMPAIGN", latest_panel)
         self.assertIn("LeafStatus: RUNNING", latest_panel)
@@ -560,6 +601,39 @@ class CampaignProgressReporterTests(unittest.TestCase):
         self.assertIn("DeterminantAbs: 3.2e-08", latest_panel)
         self.assertIn("DetLeaf: 137 | DetPhase: 42 | DetNewton: 3", latest_panel)
         self.assertIn("Suboperation: Xup integration", latest_panel)
+
+    def test_partial_campaign_settles_missing_precision_leaf_without_rejection(self):
+        class ConsoleStream(io.StringIO):
+            def isatty(self):
+                return True
+
+        stream = ConsoleStream()
+        reporter = self._console_reporter(stream)
+        leaf_context = {"leaf_id": "leaf-1", "leaf_index": 1, "leaf_count": 553}
+        reporter.publish(_event(ProgressEventKind.LEAF_STARTED, **leaf_context))
+        reporter.publish(
+            _payload_event(
+                ProgressEventKind.PRECISION_STAGE_COMPLETED,
+                {
+                    "numerical_state": "NOT_CONVERGED",
+                    "leaf_state": "MISSING_PRECISION",
+                },
+                **leaf_context,
+            )
+        )
+        reporter.publish(
+            _payload_event(
+                ProgressEventKind.CAMPAIGN_COMPLETED,
+                {"state": "PARTIAL"},
+            )
+        )
+
+        latest_panel = stream.getvalue().rsplit("\x1b[36F", 1)[-1]
+        self.assertIn("CampaignStatus : PARTIAL", latest_panel)
+        self.assertIn("LeafStatus     : MISSING_PRECISION", latest_panel)
+        self.assertIn("Completed      : 0/553", latest_panel)
+        self.assertIn("Rejected       : 0", latest_panel)
+        self.assertIn("Indeterminate  : 0", latest_panel)
 
     def test_normal_console_estimates_eta_from_rolling_completed_leaf_timings(self):
         class ConsoleStream(io.StringIO):
