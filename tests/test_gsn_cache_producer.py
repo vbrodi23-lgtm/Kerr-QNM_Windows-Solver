@@ -71,8 +71,11 @@ class GsnCacheProducerTests(unittest.TestCase):
             julia = root / "julia.exe"
             julia.write_bytes(b"test executable")
             pair = GsnParameterPair(19, 20, 2)
+            invocation_count = 0
 
             def run(command, **kwargs):
+                nonlocal invocation_count
+                invocation_count += 1
                 self.assertEqual(Path(command[0]), julia)
                 self.assertIn("--startup-file=no", command)
                 pairs_path = Path(command[command.index("--pairs-file") + 1])
@@ -134,7 +137,29 @@ class GsnCacheProducerTests(unittest.TestCase):
                     runner=run,
                 )
 
+                reused = ensure_generated_gsn_cache(
+                    (pair,),
+                    runtime_root=runtime_root,
+                    julia_executable=julia,
+                    producer_script=script,
+                    gsn_source_root=source_root,
+                    runner=run,
+                )
+
+                generated.path.write_text("{}\n", encoding="utf-8")
+                regenerated = ensure_generated_gsn_cache(
+                    (pair,),
+                    runtime_root=runtime_root,
+                    julia_executable=julia,
+                    producer_script=script,
+                    gsn_source_root=source_root,
+                    runner=run,
+                )
+
             self.assertTrue(generated.path.is_file())
+            self.assertEqual(invocation_count, 2)
+            self.assertEqual(reused.sha256, generated.sha256)
+            self.assertEqual(regenerated.sha256, generated.sha256)
             self.assertEqual(
                 generated.sha256,
                 hashlib.sha256(generated.path.read_bytes()).hexdigest(),
