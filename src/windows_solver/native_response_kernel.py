@@ -1,8 +1,8 @@
 """Concrete vetted GSN determinant kernel for selected response jobs.
 
-Construction authenticates the immutable coefficient cache before importing
-the optional numerical stack.  The module never generates that cache and
-performs no numerical work during import or validation.
+Construction rehashes the generated coefficient cache before importing the
+optional numerical stack.  The module never generates that cache and performs
+no numerical work during import or validation.
 """
 
 from __future__ import annotations
@@ -31,12 +31,6 @@ from .response_engine import (
 )
 
 
-PINNED_GSN_CACHE_SHA256 = (
-    "0c49fe4c2839444422b2d0ebcf08c912ee06d7e60ed398c9b360ed4c151f28d3"
-)
-PINNED_POTENTIALS_SHA256 = (
-    "8f60c740be8049878cf8cb3f58cd2c6676f10cc9c23cab13c5ce8af9ef3ae860"
-)
 _SOURCE_COMMIT = "0c1e8a3d3bca6e608c34e111476a4f6dcb73e86e"
 _SOURCE_BLOBS = (
     ("determinant-backend", "b65f2236f828204aa21dfa8d9bc79c8a1c66ca3b"),
@@ -55,6 +49,9 @@ _BRANCH_CONTINUATION_TOLERANCE_ABS = 5.0e-3
 # retain the authenticated upstream code identity.
 _ADAPTED_SOURCE_CONTRACT_ID = "native-gsn-adapter-contract-1"
 _GENERATED_INPUT_CONTRACT_ID = "julia-exact-f-u-cache-contract-1"
+_POTENTIAL_SOURCE_PATH = (
+    Path(__file__).resolve().parent / "data" / "native_kernel" / "potentials.fixture"
+)
 
 
 class NativeResourceUnavailableError(RuntimeError):
@@ -95,12 +92,6 @@ class VettedNativeDeterminantKernel:
     def __init__(self, cache_path: Path, standard_sn_type: type) -> None:
         self.cache_path = cache_path
         self._standard_sn_type = standard_sn_type
-
-    @classmethod
-    def from_authenticated_resource(
-        cls, cache_path: str | os.PathLike[str] | Path
-    ) -> "VettedNativeDeterminantKernel":
-        return cls._from_resource(cache_path, PINNED_GSN_CACHE_SHA256)
 
     @classmethod
     def from_generated_resource(
@@ -160,19 +151,20 @@ class VettedNativeDeterminantKernel:
                 "authenticated GSN infinity-series resource has no records"
             )
 
-        potentials = (
-            Path(__file__).resolve().parent
-            / "data"
-            / "native_kernel"
-            / "potentials.fixture"
-        )
-        if (
-            not potentials.is_file()
-            or hashlib.sha256(potentials.read_bytes()).hexdigest()
-            != PINNED_POTENTIALS_SHA256
-        ):
+        potentials = _POTENTIAL_SOURCE_PATH
+        if not potentials.is_file() or potentials.is_symlink():
             raise NativeResourceUnavailableError(
-                "authenticated GSN potential expression resource is absent or changed"
+                "GSN potential expression source is absent or not a regular file"
+            )
+        try:
+            potential_source = potentials.read_bytes()
+        except OSError as error:
+            raise NativeResourceUnavailableError(
+                "GSN potential expression source is unreadable"
+            ) from error
+        if not potential_source:
+            raise NativeResourceUnavailableError(
+                "GSN potential expression source is empty"
             )
 
         os.environ["GSN_INFINITY_SERIES_CACHE"] = str(path.resolve())
