@@ -1,39 +1,26 @@
 <#
 .SYNOPSIS
-Provision a package-local CPython for the Kerr QNM Windows solver.
+Provision the managed runtime for the Kerr QNM Windows solver.
 
 .DESCRIPTION
-Installs a pinned CPython into .runtime\ inside this repository and creates a
-virtual environment that solver.ps1 uses in preference to any system Python.
-Nothing is installed system-wide, no registry entry is written, PATH is not
-modified, and no administrator rights are required.
+The normal runtime is a versioned, per-user tree below LocalAppData so it
+survives deleting or re-extracting a solver ZIP.  It never modifies a system
+Python installation or system package set.  -PortableRuntime is an explicit
+opt-in for the legacy checkout-local .runtime tree.
 
-Two tiers are provisioned:
-
-  * default            CPython only.  This is everything the public CLI needs:
-                       plan, run, verify, inspect, export, campaign-plan,
-                       campaign-merge, campaign-smoke.
-  * -WithNumericalKernel
-                       adds the pinned numpy and scipy used by the native
-                       response kernel and by the packaged test suite.
-
-Re-running is safe.  Work already done is detected and skipped unless -Force
-is given.
-
-.EXAMPLE
-Set-ExecutionPolicy -Scope Process Bypass -Force; .\runtime\bootstrap.ps1
-
-.EXAMPLE
-.\runtime\bootstrap.ps1 -WithNumericalKernel
-
-.EXAMPLE
-.\runtime\bootstrap.ps1 -Force
+The bootstrap first validates an exact 64-bit CPython 3.12.13 and Julia 1.10.11
+already available to the user.  It downloads a solver-managed runtime only
+when no compatible executable is available.  The numerical packages always
+live in the solver-managed virtual environment, regardless of where the base
+Python came from.
 #>
 param(
     [switch]$WithNumericalKernel,
     [switch]$WithM02,
     [switch]$Force,
-    [switch]$SkipSmokeTest
+    [switch]$SkipSmokeTest,
+    [switch]$PortableRuntime,
+    [string]$RuntimeRoot
 )
 
 $ErrorActionPreference = "Stop"
@@ -41,21 +28,10 @@ Set-StrictMode -Version Latest
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
 $PackageRoot = Split-Path -Parent $PSScriptRoot
-$RuntimeRoot = Join-Path $PackageRoot ".runtime"
-$DownloadRoot = Join-Path $RuntimeRoot "downloads"
-$TempRoot = Join-Path $RuntimeRoot "tmp"
-$UvRoot = Join-Path $RuntimeRoot "uv"
-$UvExe = Join-Path $UvRoot "uv.exe"
-$PythonInstallRoot = Join-Path $RuntimeRoot "python"
-$VenvRoot = Join-Path $RuntimeRoot "venv"
-$VenvPython = Join-Path $VenvRoot "Scripts\python.exe"
-$JuliaRoot = Join-Path $RuntimeRoot "julia"
-$JuliaExe = Join-Path $JuliaRoot "bin\julia.exe"
-$JuliaDepot = Join-Path $RuntimeRoot "julia-depot"
-$JuliaProject = Join-Path $RuntimeRoot "m02-julia-project"
-$JuliaVendorRoot = Join-Path $RuntimeRoot "vendor"
-$JuliaDataRoot = Join-Path $PackageRoot "src\windows_solver\data\julia"
-$ReceiptPath = Join-Path $RuntimeRoot "python-runtime.json"
+. (Join-Path $PSScriptRoot "resolve-runtime-root.ps1")
+$RuntimeRoot = Resolve-KerrQnmRuntimeRoot -PackageRoot $PackageRoot `
+    -PortableRuntime:$PortableRuntime -OverrideRoot $RuntimeRoot
+Set-KerrQnmRuntimeRoot $RuntimeRoot
 $PolicyPath = Join-Path $PSScriptRoot "runtime_policy.json"
 
 function Write-Step([string]$Message) {
@@ -66,10 +42,29 @@ function Get-Sha256([string]$Path) {
     return (Get-FileHash -Algorithm SHA256 -LiteralPath $Path).Hash.ToLowerInvariant()
 }
 
+function Get-TextSha256([string]$Text) {
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes($Text)
+    try {
+        $sha = [System.Security.Cryptography.SHA256]::Create()
+        try {
+            return ([BitConverter]::ToString($sha.ComputeHash($bytes))).Replace("-", "").ToLowerInvariant()
+        }
+        finally {
+            $sha.Dispose()
+        }
+    }
+    finally {
+        [Array]::Clear($bytes, 0, $bytes.Length)
+    }
+}
+
+function Get-ObjectSha256($Value) {
+    return Get-TextSha256 ($Value | ConvertTo-Json -Depth 20 -Compress)
+}
+
 function Invoke-Native([string]$FilePath, [string[]]$Arguments) {
-    # A native command that writes to stderr becomes a terminating
-    # NativeCommandError while ErrorActionPreference is Stop, which would abort
-    # the bootstrap on harmless progress output.  Exit codes are the contract.
+    # Native commands often emit harmless progress text to stderr.  Exit code,
+    # rather than the stream, is the executable contract.
     $previous = $ErrorActionPreference
     $ErrorActionPreference = "Continue"
     try {
@@ -100,9 +95,333 @@ function Invoke-NativeCapture([string]$FilePath, [string[]]$Arguments) {
     return $output
 }
 
+function Try-InvokeNativeCapture([string]$FilePath, [string[]]$Arguments) {
+    $previous = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        try {
+            $output = (& $FilePath @Arguments 2>$null | Out-String).Trim()
+            $code = $LASTEXITCODE
+        }
+        catch {
+            return $null
+        }
+    }
+    finally {
+        $ErrorActionPreference = $previous
+    }
+    if ($code -ne 0) {
+        return $null
+    }
+    return $output
+}
+
 function Get-File([string]$Url, [string]$Destination) {
     New-Item -ItemType Directory -Force -Path (Split-Path -Parent $Destination) | Out-Null
     Invoke-WebRequest -UseBasicParsing -Uri $Url -OutFile $Destination
+}
+
+function Remove-ManagedDirectory([string]$Path, [string]$Label) {
+    if (-not (Test-Path -LiteralPath $Path)) {
+        return
+    }
+    $fullPath = [IO.Path]::GetFullPath($Path)
+    $pathRoot = [IO.Path]::GetPathRoot($fullPath)
+    if ($fullPath.TrimEnd([char[]]@('\\', '/')) -eq $pathRoot.TrimEnd([char[]]@('\\', '/'))) {
+        throw "Refusing to remove a filesystem root for $Label: $fullPath"
+    }
+    cmd.exe /c rd /s /q "\\?\$fullPath"
+    if ($LASTEXITCODE -ne 0 -and (Test-Path -LiteralPath $fullPath)) {
+        throw "Could not remove $Label: $fullPath"
+    }
+}
+
+function Read-JsonOrNull([string]$Path) {
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        return $null
+    }
+    try {
+        return Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json
+    }
+    catch {
+        return $null
+    }
+}
+
+function Get-ApplicationCommand([string[]]$Names) {
+    foreach ($Name in $Names) {
+        $command = Get-Command $Name -CommandType Application -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+        if ($null -ne $command -and -not [string]::IsNullOrWhiteSpace($command.Source)) {
+            return $command.Source
+        }
+    }
+    return $null
+}
+
+function Get-PythonIdentity([string]$Executable, [string[]]$PrefixArguments = @()) {
+    if ([string]::IsNullOrWhiteSpace($Executable) -or -not (Test-Path -LiteralPath $Executable -PathType Leaf)) {
+        return $null
+    }
+    $identityText = Try-InvokeNativeCapture $Executable (@($PrefixArguments) + @(
+        "-c",
+        "import json,platform,struct,sys; print(json.dumps({'version':platform.python_version(),'implementation':platform.python_implementation(),'bits':struct.calcsize('P')*8,'executable':sys.executable}))"
+    ))
+    if ($null -eq $identityText) {
+        return $null
+    }
+    try {
+        $identity = $identityText | ConvertFrom-Json
+    }
+    catch {
+        return $null
+    }
+    if ($identity.version -ne $PythonVersion `
+        -or $identity.implementation -ne $Policy.python.implementation `
+        -or $identity.bits -ne $Policy.python.bits `
+        -or [string]::IsNullOrWhiteSpace($identity.executable)) {
+        return $null
+    }
+    return [ordered]@{
+        command = [IO.Path]::GetFullPath($Executable)
+        arguments = @($PrefixArguments)
+        executable = [IO.Path]::GetFullPath([string]$identity.executable)
+        version = [string]$identity.version
+        implementation = [string]$identity.implementation
+        bits = [int]$identity.bits
+    }
+}
+
+function Test-NumericalKernel([string]$Python) {
+    foreach ($package in $Policy.numerical_kernel.packages) {
+        $observed = Try-InvokeNativeCapture $Python @(
+            "-c", "import importlib.metadata as m; print(m.version('$($package.name)'))"
+        )
+        if ($observed -ne $package.version) {
+            return $false
+        }
+    }
+    return $true
+}
+
+function Get-NumericalPackageReceipt([string]$Python) {
+    $packages = @()
+    foreach ($package in $Policy.numerical_kernel.packages) {
+        $observed = Try-InvokeNativeCapture $Python @(
+            "-c", "import importlib.metadata as m; print(m.version('$($package.name)'))"
+        )
+        if ($null -ne $observed) {
+            $packages += [ordered]@{ name = [string]$package.name; version = [string]$observed }
+        }
+    }
+    return @($packages)
+}
+
+function Ensure-Uv {
+    if (Test-Path -LiteralPath $UvExe -PathType Leaf) {
+        $uvIdentity = Try-InvokeNativeCapture $UvExe @("--version")
+        if ($null -ne $uvIdentity -and $uvIdentity -match '^uv\s+([0-9][^\s\)]*)' `
+            -and $Matches[1] -eq $Policy.uv.version) {
+            return
+        }
+        Remove-ManagedDirectory $UvRoot "incompatible uv runtime"
+    }
+
+    Write-Step "Downloading uv $($Policy.uv.version) to provision CPython"
+    $archive = Join-Path $DownloadRoot $Policy.uv.archive
+    $checksum = "$archive.sha256"
+    Get-File $Policy.uv.url $archive
+    Get-File $Policy.uv.checksum_url $checksum
+    $checksumText = Get-Content -LiteralPath $checksum -Raw
+    if ($checksumText -notmatch "([0-9a-fA-F]{64})") {
+        throw "uv checksum response is malformed: $checksumText"
+    }
+    $expected = $Matches[1].ToLowerInvariant()
+    $actual = Get-Sha256 $archive
+    if ($actual -ne $expected) {
+        throw "uv SHA-256 mismatch. Expected $expected; received $actual."
+    }
+    Write-Step "uv archive verified ($actual)"
+
+    $extract = Join-Path $TempRoot "uv-extract"
+    Remove-ManagedDirectory $extract "previous uv extraction"
+    Expand-Archive -LiteralPath $archive -DestinationPath $extract
+    $found = Get-ChildItem -LiteralPath $extract -Filter "uv.exe" -File -Recurse | Select-Object -First 1
+    if ($null -eq $found) {
+        throw "Verified uv archive contains no uv.exe."
+    }
+    New-Item -ItemType Directory -Force -Path $UvRoot | Out-Null
+    Copy-Item -LiteralPath $found.FullName -Destination $UvExe -Force
+    Remove-ManagedDirectory $extract "uv extraction"
+
+    $uvIdentity = Invoke-NativeCapture $UvExe @("--version")
+    if ($uvIdentity -notmatch '^uv\s+([0-9][^\s\)]*)' -or $Matches[1] -ne $Policy.uv.version) {
+        throw "uv version mismatch: expected $($Policy.uv.version); received $uvIdentity."
+    }
+}
+
+function Set-JuliaUtf8Console {
+    $Utf8NoBom = [System.Text.UTF8Encoding]::new($false)
+    $Chcp = Get-Command chcp.com -ErrorAction SilentlyContinue
+    if ($null -eq $Chcp) {
+        throw "Windows chcp.com is required to configure UTF-8 console output."
+    }
+    & $Chcp.Source 65001 | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        throw "Could not switch the active console code page to UTF-8 (65001)."
+    }
+    [Console]::InputEncoding = $Utf8NoBom
+    [Console]::OutputEncoding = $Utf8NoBom
+    $OutputEncoding = $Utf8NoBom
+}
+
+function Get-JuliaCandidate(
+    [string]$Executable,
+    [string[]]$PrefixArguments = @(),
+    [string]$Source
+) {
+    if ([string]::IsNullOrWhiteSpace($Executable) -or -not (Test-Path -LiteralPath $Executable -PathType Leaf)) {
+        return $null
+    }
+    $identity = Try-InvokeNativeCapture $Executable (@($PrefixArguments) + @("--version"))
+    if ($identity -ne "julia version $($Policy.julia.version)") {
+        return $null
+    }
+    $bits = Try-InvokeNativeCapture $Executable (@($PrefixArguments) + @(
+        "--startup-file=no",
+        "--history-file=no",
+        "-e",
+        "print(Sys.WORD_SIZE)"
+    ))
+    if ($bits -ne "64") {
+        return $null
+    }
+    return [ordered]@{
+        executable = [IO.Path]::GetFullPath($Executable)
+        arguments = @($PrefixArguments)
+        source = $Source
+        version = [string]$Policy.julia.version
+        bits = [int]$bits
+        executable_sha256 = Get-Sha256 $Executable
+    }
+}
+
+function Invoke-Julia([string[]]$Arguments) {
+    Invoke-Native $JuliaCandidate.executable (@($JuliaCandidate.arguments) + $Arguments)
+}
+
+function Invoke-JuliaCapture([string[]]$Arguments) {
+    return Invoke-NativeCapture $JuliaCandidate.executable (@($JuliaCandidate.arguments) + $Arguments)
+}
+
+function Get-SourceReceipts {
+    $receipts = @()
+    $sourceRoot = [IO.Path]::GetFullPath($JuliaDataRoot).TrimEnd([char[]]@('\\', '/'))
+    foreach ($Source in $Policy.scientific_sources) {
+        $SourcePath = Join-Path $PackageRoot $Source.path
+        if (-not (Test-Path -LiteralPath $SourcePath -PathType Leaf)) {
+            throw "Required scientific source is absent: $SourcePath"
+        }
+        $resolvedSourcePath = [IO.Path]::GetFullPath($SourcePath)
+        if (-not $resolvedSourcePath.StartsWith($sourceRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
+            throw "Scientific source is outside the packaged Julia source root: $resolvedSourcePath"
+        }
+        $receipts += [ordered]@{
+            id = [string]$Source.id
+            checkout_path = $resolvedSourcePath
+            relative_path = $resolvedSourcePath.Substring($sourceRoot.Length).TrimStart([char[]]@('\\', '/'))
+            sha256 = Get-Sha256 $resolvedSourcePath
+        }
+    }
+    return @($receipts)
+}
+
+function Get-TreeSha256([string]$Root) {
+    if (-not (Test-Path -LiteralPath $Root -PathType Container)) {
+        throw "Required source directory is absent: $Root"
+    }
+    $resolvedRoot = [IO.Path]::GetFullPath($Root).TrimEnd([char[]]@('\\', '/'))
+    $entries = @()
+    foreach ($file in (Get-ChildItem -LiteralPath $resolvedRoot -File -Recurse | Sort-Object FullName)) {
+        if (($file.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw "Runtime source tree must not contain a reparse point: $($file.FullName)"
+        }
+        $relative = $file.FullName.Substring($resolvedRoot.Length).TrimStart([char[]]@('\\', '/'))
+        $entries += "$relative`t$(Get-Sha256 $file.FullName)"
+    }
+    return Get-TextSha256 ($entries -join "`n")
+}
+
+function Test-M02Environment([string]$ContractSha256) {
+    $receipt = Read-JsonOrNull $M02ReceiptPath
+    if ($null -eq $receipt `
+        -or $receipt.schema_version -ne 1 `
+        -or $receipt.contract_sha256 -ne $ContractSha256 `
+        -or -not (Test-PersistentScientificSources) `
+        -or -not (Test-Path -LiteralPath (Join-Path $JuliaProject "Project.toml") -PathType Leaf) `
+        -or -not (Test-Path -LiteralPath (Join-Path $JuliaProject "Manifest.toml") -PathType Leaf) `
+        -or -not (Test-Path -LiteralPath $JuliaDepot -PathType Container)) {
+        return $false
+    }
+    $projectShaProperty = $receipt.PSObject.Properties["project_sha256"]
+    $manifestShaProperty = $receipt.PSObject.Properties["manifest_sha256"]
+    if ($null -eq $projectShaProperty -or $null -eq $manifestShaProperty) {
+        return $false
+    }
+    return (
+        $projectShaProperty.Value -eq (Get-Sha256 (Join-Path $JuliaProject "Project.toml")) `
+        -and $manifestShaProperty.Value -eq (Get-Sha256 (Join-Path $JuliaProject "Manifest.toml"))
+    )
+}
+
+function Set-M02JuliaEnvironment {
+    $env:JULIA_DEPOT_PATH = $JuliaDepot
+    $env:JULIA_PKG_PRECOMPILE_AUTO = "0"
+    $env:M02_GSN_SOURCE = Join-Path $M02SourceRoot "GeneralizedSasakiNakamura.jl"
+    $env:M02_ANGULAR_SOURCE = Join-Path $M02SourceRoot "SpinWeightedSpheroidalHarmonics.jl"
+}
+
+function Test-PersistentScientificSources {
+    if (-not (Test-Path -LiteralPath $M02SourceRoot -PathType Container) `
+        -or -not (Test-Path -LiteralPath (Join-Path $M02SourceRoot "GeneralizedSasakiNakamura.jl") -PathType Container) `
+        -or -not (Test-Path -LiteralPath (Join-Path $M02SourceRoot "SpinWeightedSpheroidalHarmonics.jl") -PathType Container) `
+        -or -not (Test-Path -LiteralPath $PersistentWorkerPath -PathType Leaf) `
+        -or -not (Test-Path -LiteralPath $PersistentProducerPath -PathType Leaf)) {
+        return $false
+    }
+    if ((Get-TreeSha256 (Join-Path $M02SourceRoot "GeneralizedSasakiNakamura.jl")) `
+        -ne $M02Contract.vendor_trees.generalized_sasaki_nakamura `
+        -or (Get-TreeSha256 (Join-Path $M02SourceRoot "SpinWeightedSpheroidalHarmonics.jl")) `
+        -ne $M02Contract.vendor_trees.spin_weighted_spheroidal_harmonics) {
+        return $false
+    }
+    foreach ($source in $SourceReceipts) {
+        $persistentPath = Join-Path $M02SourceRoot $source.relative_path
+        if (-not (Test-Path -LiteralPath $persistentPath -PathType Leaf) `
+            -or (Get-Sha256 $persistentPath) -ne $source.sha256) {
+            return $false
+        }
+    }
+    return $true
+}
+
+function Install-PersistentScientificSources {
+    if (Test-Path -LiteralPath $M02SourceRoot) {
+        Remove-ManagedDirectory $M02SourceRoot "invalid persistent scientific source contract"
+    }
+    New-Item -ItemType Directory -Force -Path $M02SourceRoot | Out-Null
+    Copy-Item -LiteralPath (Join-Path $JuliaDataRoot "GeneralizedSasakiNakamura.jl") `
+        -Destination $M02SourceRoot -Recurse -Force
+    Copy-Item -LiteralPath (Join-Path $JuliaDataRoot "SpinWeightedSpheroidalHarmonics.jl") `
+        -Destination $M02SourceRoot -Recurse -Force
+    foreach ($source in $SourceReceipts) {
+        $destination = Join-Path $M02SourceRoot $source.relative_path
+        New-Item -ItemType Directory -Force -Path (Split-Path -Parent $destination) | Out-Null
+        Copy-Item -LiteralPath $source.checkout_path -Destination $destination -Force
+    }
+    if (-not (Test-PersistentScientificSources)) {
+        throw "Persistent scientific source copy failed contract validation: $M02SourceRoot"
+    }
 }
 
 # ---------------------------------------------------------------- preconditions
@@ -119,268 +438,311 @@ if (-not (Test-Path -LiteralPath $PolicyPath -PathType Leaf)) {
 
 $Policy = Get-Content -LiteralPath $PolicyPath -Raw | ConvertFrom-Json
 $PolicySha256 = Get-Sha256 $PolicyPath
-$PythonVersion = $Policy.python.python_version
+$PythonVersion = [string]$Policy.python.python_version
+$JuliaVersion = [string]$Policy.julia.version
+$NumericalEnvironmentParts = @()
+foreach ($package in $Policy.numerical_kernel.packages) {
+    $safeName = ([string]$package.name).ToLowerInvariant() -replace '[^a-z0-9]+', '-'
+    $safeVersion = ([string]$package.version).ToLowerInvariant() -replace '[^a-z0-9]+', '-'
+    $NumericalEnvironmentParts += "$safeName-$safeVersion"
+}
+$NumericalEnvironmentId = $NumericalEnvironmentParts -join "-"
 if ($WithM02) {
     $WithNumericalKernel = $true
 }
 
+$DownloadRoot = Join-Path $RuntimeRoot "downloads"
+$TempRoot = Join-Path $RuntimeRoot "tmp"
+$MetadataRoot = Join-Path $RuntimeRoot "metadata"
+$UvRoot = Join-Path $RuntimeRoot "tools\uv-$($Policy.uv.version)"
+$UvExe = Join-Path $UvRoot "uv.exe"
+$PythonInstallRoot = Join-Path $RuntimeRoot "cpython\$PythonVersion"
+$ManagedPythonHint = Join-Path $PythonInstallRoot "python.exe"
+$VenvRoot = Join-Path $RuntimeRoot "python-env\$($Policy.policy_id)-cpython-$PythonVersion-$NumericalEnvironmentId"
+$VenvPython = Join-Path $VenvRoot "Scripts\python.exe"
+$ManagedJuliaRoot = Join-Path $RuntimeRoot "julia\$JuliaVersion"
+$ManagedJuliaExe = Join-Path $ManagedJuliaRoot "bin\julia.exe"
+$JuliaDataRoot = Join-Path $PackageRoot "src\windows_solver\data\julia"
+$ReceiptPath = Join-Path $RuntimeRoot "python-runtime.json"
+$IdentityPath = Join-Path $MetadataRoot "runtime-identity.json"
+$ExistingReceipt = Read-JsonOrNull $ReceiptPath
+
 if ($Force -and (Test-Path -LiteralPath $RuntimeRoot)) {
-    Write-Step "Removing existing .runtime for a clean reprovision"
-    cmd.exe /c rd /s /q "\\?\$RuntimeRoot"
-    if ($LASTEXITCODE -ne 0 -and (Test-Path -LiteralPath $RuntimeRoot)) {
-        throw "Could not remove existing runtime directory: $RuntimeRoot"
-    }
+    Write-Step "Removing managed runtime for an explicit clean reprovision: $RuntimeRoot"
+    Remove-ManagedDirectory $RuntimeRoot "existing managed runtime directory"
+    $ExistingReceipt = $null
 }
-foreach ($path in @($RuntimeRoot, $DownloadRoot, $TempRoot)) {
+foreach ($path in @($RuntimeRoot, $DownloadRoot, $TempRoot, $MetadataRoot)) {
     New-Item -ItemType Directory -Force -Path $path | Out-Null
 }
-# Keep interpreter and wheel unpacking inside the package so a locked-down or
-# full %TEMP% cannot fail the run halfway through.
 $env:TEMP = $TempRoot
 $env:TMP = $TempRoot
 
-# ------------------------------------------------------------------------- uv
-
-if (-not (Test-Path -LiteralPath $UvExe -PathType Leaf)) {
-    Write-Step "Downloading uv $($Policy.uv.version)"
-    $archive = Join-Path $DownloadRoot $Policy.uv.archive
-    $checksum = "$archive.sha256"
-    Get-File $Policy.uv.url $archive
-    Get-File $Policy.uv.checksum_url $checksum
-
-    # Verify against the checksum published beside the release asset rather than
-    # a digest copied into this repository, so the policy file never has to be
-    # edited in lockstep with a uv upgrade.
-    $checksumText = Get-Content -LiteralPath $checksum -Raw
-    if ($checksumText -notmatch "([0-9a-fA-F]{64})") {
-        throw "uv checksum response is malformed: $checksumText"
-    }
-    $expected = $Matches[1].ToLowerInvariant()
-    $actual = Get-Sha256 $archive
-    if ($actual -ne $expected) {
-        throw "uv SHA-256 mismatch. Expected $expected; received $actual."
-    }
-    Write-Step "uv archive verified ($actual)"
-
-    $extract = Join-Path $TempRoot "uv-extract"
-    if (Test-Path -LiteralPath $extract) { Remove-Item -LiteralPath $extract -Recurse -Force }
-    Expand-Archive -LiteralPath $archive -DestinationPath $extract
-    $found = Get-ChildItem -LiteralPath $extract -Filter "uv.exe" -File -Recurse | Select-Object -First 1
-    if ($null -eq $found) { throw "Verified uv archive contains no uv.exe." }
-    New-Item -ItemType Directory -Force -Path $UvRoot | Out-Null
-    Copy-Item -LiteralPath $found.FullName -Destination $UvExe -Force
-    Remove-Item -LiteralPath $extract -Recurse -Force
-}
-
-# uv prints "uv <version> (<triple> <date>)"; compare the version token only.
-$uvIdentity = Invoke-NativeCapture $UvExe @("--version")
-if ($uvIdentity -notmatch '^uv\s+([0-9][^\s\)]*)') {
-    throw "uv identity could not be read: '$uvIdentity'."
-}
-$uvVersion = $Matches[1]
-if ($uvVersion -ne $Policy.uv.version) {
-    throw "uv version mismatch: expected $($Policy.uv.version); received $uvVersion."
-}
-$UvSha256 = Get-Sha256 $UvExe
-
 # --------------------------------------------------------------------- CPython
 
-$env:UV_PYTHON_INSTALL_DIR = $PythonInstallRoot
-$env:UV_CACHE_DIR = Join-Path $RuntimeRoot "uv-cache"
-
-Write-Step "Installing package-local CPython $PythonVersion"
-Invoke-Native $UvExe @(
-    "python", "install", $PythonVersion,
-    "--install-dir", $PythonInstallRoot,
-    "--no-bin", "--no-registry", "--no-config", "--system-certs"
-)
-
-$ManagedPython = Invoke-NativeCapture $UvExe @(
-    "python", "find", $PythonVersion,
-    "--managed-python", "--no-python-downloads", "--no-project", "--no-config"
-)
-if (-not (Test-Path -LiteralPath $ManagedPython -PathType Leaf)) {
-    throw "uv could not resolve package-local CPython ${PythonVersion}: '$ManagedPython'"
-}
-
-if (-not (Test-Path -LiteralPath $VenvPython -PathType Leaf)) {
-    Write-Step "Creating .runtime\venv"
-    Invoke-Native $UvExe @(
-        "venv", $VenvRoot, "--python", $ManagedPython,
-        "--managed-python", "--no-python-downloads", "--no-project", "--no-config"
-    )
-}
-
-$identityText = Invoke-NativeCapture $VenvPython @(
-    "-c",
-    "import json,platform,struct,sys; print(json.dumps({'version':platform.python_version(),'implementation':platform.python_implementation(),'bits':struct.calcsize('P')*8,'executable':sys.executable}))"
-)
-$identity = $identityText | ConvertFrom-Json
-if ($identity.version -ne $PythonVersion `
-    -or $identity.implementation -ne $Policy.python.implementation `
-    -or $identity.bits -ne $Policy.python.bits) {
-    throw "Python identity mismatch: $($identity | ConvertTo-Json -Compress)"
-}
-Write-Step "CPython $($identity.version) $($identity.bits)-bit ready"
-
-# ------------------------------------------------------- optional numerical tier
-
-$installed = @()
-if ($WithNumericalKernel) {
-    Write-Step "Installing the pinned numerical kernel"
-    $specifiers = @()
-    foreach ($package in $Policy.numerical_kernel.packages) {
-        $specifiers += "$($package.name)==$($package.version)"
-    }
-    if ($Policy.numerical_kernel.wheels.Count -gt 0) {
-        # A populated wheels array means the digests have been frozen; install
-        # offline from verified local bytes instead of resolving from an index.
-        $wheelhouse = Join-Path $RuntimeRoot "wheelhouse"
-        New-Item -ItemType Directory -Force -Path $wheelhouse | Out-Null
-        foreach ($wheel in $Policy.numerical_kernel.wheels) {
-            $destination = Join-Path $wheelhouse $wheel.filename
-            if (-not (Test-Path -LiteralPath $destination -PathType Leaf) `
-                -or (Get-Sha256 $destination) -ne $wheel.sha256) {
-                Get-File $wheel.url $destination
-            }
-            $actual = Get-Sha256 $destination
-            if ($actual -ne $wheel.sha256.ToLowerInvariant()) {
-                throw "Wheel SHA-256 mismatch for $($wheel.filename). Expected $($wheel.sha256); received $actual."
-            }
-        }
-        Invoke-Native $UvExe (@(
-            "pip", "install", "--python", $VenvPython,
-            "--no-index", "--find-links", $wheelhouse
-        ) + $specifiers)
+$PriorManagedPython = $null
+if ($null -ne $ExistingReceipt) {
+    $pythonProperty = $ExistingReceipt.PSObject.Properties["python"]
+    $existingPython = if ($null -ne $pythonProperty) { $pythonProperty.Value } else { $null }
+    $managedProperty = if ($null -ne $existingPython) {
+        $existingPython.PSObject.Properties["managed_interpreter"]
     }
     else {
-        Invoke-Native $UvExe (@("pip", "install", "--python", $VenvPython) + $specifiers)
+        $null
     }
-    foreach ($package in $Policy.numerical_kernel.packages) {
-        $observed = Invoke-NativeCapture $VenvPython @(
-            "-c", "import importlib.metadata as m; print(m.version('$($package.name)'))"
-        )
-        if ($observed -ne $package.version) {
-            throw "$($package.name) version mismatch: expected $($package.version); received $observed."
-        }
-        $installed += [ordered]@{ name = $package.name; version = $observed }
+    if ($null -ne $managedProperty -and -not [string]::IsNullOrWhiteSpace([string]$managedProperty.Value)) {
+        $PriorManagedPython = [string]$managedProperty.Value
     }
-    Write-Step "Numerical kernel ready"
 }
-
-# ------------------------------------------------------- package-local Julia
-
-$JuliaReceipt = [ordered]@{ requested = [bool]$WithM02 }
-if ($WithM02) {
-    $JuliaArchive = Join-Path $DownloadRoot $Policy.julia.archive
-    $ExpectedJuliaSha256 = $Policy.julia.sha256.ToLowerInvariant()
-    if (-not (Test-Path -LiteralPath $JuliaArchive -PathType Leaf) `
-        -or (Get-Sha256 $JuliaArchive) -ne $ExpectedJuliaSha256) {
-        Write-Step "Downloading portable Julia $($Policy.julia.version)"
-        Get-File $Policy.julia.url $JuliaArchive
+$VenvIdentity = Get-PythonIdentity $VenvPython
+$PythonSource = $null
+$PythonSourceKind = $null
+$ManagedPython = $PriorManagedPython
+if ($null -ne $VenvIdentity) {
+    $PythonSource = $VenvIdentity
+    $PythonSourceKind = "managed-venv"
+    Write-Step "Reusing validated CPython $PythonVersion virtual environment"
+}
+else {
+    $ManagedIdentity = Get-PythonIdentity $ManagedPythonHint
+    if ($null -eq $ManagedIdentity -and $null -ne $PriorManagedPython) {
+        $ManagedIdentity = Get-PythonIdentity $PriorManagedPython
     }
-    $ActualJuliaSha256 = Get-Sha256 $JuliaArchive
-    if ($ActualJuliaSha256 -ne $ExpectedJuliaSha256) {
-        throw "Julia archive SHA-256 mismatch. Expected $ExpectedJuliaSha256; received $ActualJuliaSha256."
+    if ($null -ne $ManagedIdentity) {
+        $PythonSource = $ManagedIdentity
+        $PythonSourceKind = "managed-cpython"
+        $ManagedPython = $ManagedIdentity.command
     }
-    Write-Step "Julia archive verified ($ActualJuliaSha256)"
-
-    if (-not (Test-Path -LiteralPath $JuliaExe -PathType Leaf)) {
-        $JuliaExtract = Join-Path $TempRoot "julia-extract"
-        if (Test-Path -LiteralPath $JuliaExtract) {
-            cmd.exe /c rd /s /q "\\?\$JuliaExtract"
-            if ($LASTEXITCODE -ne 0 -and (Test-Path -LiteralPath $JuliaExtract)) {
-                throw "Could not remove previous Julia extraction directory: $JuliaExtract"
+    if ($null -eq $PythonSource) {
+        foreach ($candidatePath in @((Get-ApplicationCommand @("python.exe", "python")))) {
+            if ($null -eq $candidatePath) { continue }
+            $candidate = Get-PythonIdentity $candidatePath
+            if ($null -ne $candidate) {
+                $PythonSource = $candidate
+                $PythonSourceKind = "system"
+                break
             }
         }
-        New-Item -ItemType Directory -Force -Path $JuliaExtract | Out-Null
+    }
+    if ($null -eq $PythonSource) {
+        $pyCommand = Get-ApplicationCommand @("py.exe", "py")
+        if ($null -ne $pyCommand) {
+            $candidate = Get-PythonIdentity $pyCommand @("-3.12")
+            if ($null -ne $candidate) {
+                $PythonSource = $candidate
+                $PythonSourceKind = "py-launcher"
+            }
+        }
+    }
+    if ($null -eq $PythonSource) {
+        Ensure-Uv
+        $env:UV_PYTHON_INSTALL_DIR = $PythonInstallRoot
+        $env:UV_CACHE_DIR = Join-Path $RuntimeRoot "uv-cache"
+        Write-Step "No compatible CPython found; provisioning managed CPython $PythonVersion"
+        Invoke-Native $UvExe @(
+            "python", "install", $PythonVersion,
+            "--install-dir", $PythonInstallRoot,
+            "--no-bin", "--no-registry", "--no-config", "--system-certs"
+        )
+        $ManagedPython = Invoke-NativeCapture $UvExe @(
+            "python", "find", $PythonVersion,
+            "--managed-python", "--no-python-downloads", "--no-project", "--no-config"
+        )
+        $candidate = Get-PythonIdentity $ManagedPython
+        if ($null -eq $candidate) {
+            throw "uv could not resolve a compatible managed CPython ${PythonVersion}: '$ManagedPython'"
+        }
+        $PythonSource = $candidate
+        $PythonSourceKind = "managed-cpython"
+    }
 
+    Remove-ManagedDirectory $VenvRoot "incompatible Python virtual environment"
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $VenvRoot) | Out-Null
+    Write-Step "Creating isolated numerical environment from $PythonSourceKind Python"
+    Invoke-Native $PythonSource.command (@($PythonSource.arguments) + @("-m", "venv", $VenvRoot))
+    $VenvIdentity = Get-PythonIdentity $VenvPython
+    if ($null -eq $VenvIdentity) {
+        throw "Created virtual environment does not satisfy the pinned CPython contract: $VenvPython"
+    }
+}
+
+if ($WithNumericalKernel) {
+    if (Test-NumericalKernel $VenvPython) {
+        Write-Step "Pinned NumPy/SciPy environment is already valid"
+    }
+    else {
+        $pipProbe = Try-InvokeNativeCapture $VenvPython @("-m", "pip", "--version")
+        if ($null -eq $pipProbe) {
+            Invoke-Native $VenvPython @("-m", "ensurepip", "--upgrade")
+        }
+        $specifiers = @()
+        foreach ($package in $Policy.numerical_kernel.packages) {
+            $specifiers += "$($package.name)==$($package.version)"
+        }
+        $pipArguments = @("-m", "pip", "install", "--disable-pip-version-check", "--upgrade", "--only-binary=:all:")
+        if ($Policy.numerical_kernel.wheels.Count -gt 0) {
+            $wheelhouse = Join-Path $RuntimeRoot "wheelhouse"
+            New-Item -ItemType Directory -Force -Path $wheelhouse | Out-Null
+            foreach ($wheel in $Policy.numerical_kernel.wheels) {
+                $destination = Join-Path $wheelhouse $wheel.filename
+                if (-not (Test-Path -LiteralPath $destination -PathType Leaf) `
+                    -or (Get-Sha256 $destination) -ne $wheel.sha256) {
+                    Get-File $wheel.url $destination
+                }
+                if ((Get-Sha256 $destination) -ne $wheel.sha256.ToLowerInvariant()) {
+                    throw "Wheel SHA-256 mismatch for $($wheel.filename)."
+                }
+            }
+            $pipArguments += @("--no-index", "--find-links", $wheelhouse)
+        }
+        Write-Step "Installing pinned NumPy/SciPy only inside the managed virtual environment"
+        Invoke-Native $VenvPython ($pipArguments + $specifiers)
+        if (-not (Test-NumericalKernel $VenvPython)) {
+            throw "Pinned NumPy/SciPy environment failed post-install validation."
+        }
+    }
+}
+$InstalledPackages = Get-NumericalPackageReceipt $VenvPython
+
+# ------------------------------------------------------------------------- M02
+
+$existingJuliaProperty = if ($null -ne $ExistingReceipt) {
+    $ExistingReceipt.PSObject.Properties["julia_runtime"]
+}
+else {
+    $null
+}
+$JuliaReceipt = if ($null -ne $existingJuliaProperty) {
+    $existingJuliaProperty.Value
+}
+else {
+    [ordered]@{ requested = $false }
+}
+if ($WithM02) {
+    Set-JuliaUtf8Console
+    $JuliaCandidate = Get-JuliaCandidate $ManagedJuliaExe @() "managed"
+    if ($null -eq $JuliaCandidate) {
+        $systemJulia = Get-ApplicationCommand @("julia.exe", "julia")
+        if ($null -ne $systemJulia) {
+            $JuliaCandidate = Get-JuliaCandidate $systemJulia @() "system"
+        }
+    }
+    if ($null -eq $JuliaCandidate) {
+        $juliaup = Get-ApplicationCommand @("juliaup.exe", "juliaup")
+        $juliaShim = Get-ApplicationCommand @("julia.exe", "julia")
+        if ($null -ne $juliaup -and $null -ne $juliaShim) {
+            $JuliaCandidate = Get-JuliaCandidate $juliaShim @("+$JuliaVersion") "juliaup"
+        }
+    }
+    $JuliaArchive = $null
+    $ActualJuliaSha256 = $null
+    if ($null -eq $JuliaCandidate) {
+        $JuliaArchive = Join-Path $DownloadRoot $Policy.julia.archive
+        $ExpectedJuliaSha256 = $Policy.julia.sha256.ToLowerInvariant()
+        if (-not (Test-Path -LiteralPath $JuliaArchive -PathType Leaf) `
+            -or (Get-Sha256 $JuliaArchive) -ne $ExpectedJuliaSha256) {
+            Write-Step "No compatible Julia found; downloading managed Julia $JuliaVersion"
+            Get-File $Policy.julia.url $JuliaArchive
+        }
+        $ActualJuliaSha256 = Get-Sha256 $JuliaArchive
+        if ($ActualJuliaSha256 -ne $ExpectedJuliaSha256) {
+            throw "Julia archive SHA-256 mismatch. Expected $ExpectedJuliaSha256; received $ActualJuliaSha256."
+        }
+        Write-Step "Julia archive verified ($ActualJuliaSha256)"
+        $JuliaExtract = Join-Path $TempRoot "julia-extract"
+        Remove-ManagedDirectory $JuliaExtract "previous Julia extraction directory"
+        New-Item -ItemType Directory -Force -Path $JuliaExtract | Out-Null
         $Tar = Get-Command tar.exe -ErrorAction SilentlyContinue
         if ($null -eq $Tar) {
-            throw "Windows tar.exe is required to extract the portable Julia runtime."
+            throw "Windows tar.exe is required to extract the managed Julia runtime."
         }
-
         & $Tar.Source -xf $JuliaArchive -C $JuliaExtract
         if ($LASTEXITCODE -ne 0) {
             throw "Julia archive extraction failed with tar.exe exit code $LASTEXITCODE."
         }
-
-        $FoundJulia = Get-ChildItem -LiteralPath $JuliaExtract -Filter "julia.exe" -File -Recurse |
-            Select-Object -First 1
+        $FoundJulia = Get-ChildItem -LiteralPath $JuliaExtract -Filter "julia.exe" -File -Recurse | Select-Object -First 1
         if ($null -eq $FoundJulia) {
             throw "Verified Julia archive contains no julia.exe."
         }
         $ExtractedJuliaRoot = Split-Path -Parent (Split-Path -Parent $FoundJulia.FullName)
-        if (Test-Path -LiteralPath $JuliaRoot) {
-            cmd.exe /c rd /s /q "\\?\$JuliaRoot"
-            if ($LASTEXITCODE -ne 0 -and (Test-Path -LiteralPath $JuliaRoot)) {
-                throw "Could not remove previous Julia runtime directory: $JuliaRoot"
-            }
-        }
-        Move-Item -LiteralPath $ExtractedJuliaRoot -Destination $JuliaRoot
-        if (-not (Test-Path -LiteralPath $JuliaExe -PathType Leaf)) {
-            throw "Installed Julia runtime contains no julia.exe. Expected: $JuliaExe"
-        }
-        cmd.exe /c rd /s /q "\\?\$JuliaExtract"
-        if ($LASTEXITCODE -ne 0 -and (Test-Path -LiteralPath $JuliaExtract)) {
-            throw "Could not remove Julia extraction directory after installation: $JuliaExtract"
+        Remove-ManagedDirectory $ManagedJuliaRoot "previous managed Julia runtime directory"
+        New-Item -ItemType Directory -Force -Path (Split-Path -Parent $ManagedJuliaRoot) | Out-Null
+        Move-Item -LiteralPath $ExtractedJuliaRoot -Destination $ManagedJuliaRoot
+        Remove-ManagedDirectory $JuliaExtract "Julia extraction directory"
+        $JuliaCandidate = Get-JuliaCandidate $ManagedJuliaExe @() "managed"
+        if ($null -eq $JuliaCandidate) {
+            throw "Installed managed Julia runtime is absent or incompatible: $ManagedJuliaExe"
         }
     }
 
-    $Utf8NoBom = [System.Text.UTF8Encoding]::new($false)
-    $Chcp = Get-Command chcp.com -ErrorAction SilentlyContinue
-    if ($null -eq $Chcp) {
-        throw "Windows chcp.com is required to configure UTF-8 console output."
-    }
-    & $Chcp.Source 65001 | Out-Null
-    if ($LASTEXITCODE -ne 0) {
-        throw "Could not switch the active console code page to UTF-8 (65001)."
-    }
-    [Console]::InputEncoding = $Utf8NoBom
-    [Console]::OutputEncoding = $Utf8NoBom
-    $OutputEncoding = $Utf8NoBom
-
-    $JuliaIdentity = Invoke-NativeCapture $JuliaExe @("--version")
-    if ($JuliaIdentity -ne "julia version $($Policy.julia.version)") {
-        throw "Julia identity mismatch: expected $($Policy.julia.version); received '$JuliaIdentity'."
-    }
-    $SourceReceipts = @()
-    foreach ($Source in $Policy.scientific_sources) {
-        $SourcePath = Join-Path $PackageRoot $Source.path
-        if (-not (Test-Path -LiteralPath $SourcePath -PathType Leaf)) {
-            throw "Required scientific source is absent: $SourcePath"
+    $SourceReceipts = Get-SourceReceipts
+    $M02Contract = [ordered]@{
+        schema_version = 1
+        policy_sha256 = $PolicySha256
+        julia = [ordered]@{
+            version = $JuliaCandidate.version
+            executable_sha256 = $JuliaCandidate.executable_sha256
+            arguments = @($JuliaCandidate.arguments)
         }
-        $ActualSourceSha256 = Get-Sha256 $SourcePath
-        $SourceReceipts += [ordered]@{
-            id = [string]$Source.id
-            path = [IO.Path]::GetFullPath($SourcePath)
-            sha256 = $ActualSourceSha256
+        sources = @($SourceReceipts | ForEach-Object {
+            [ordered]@{ id = $_.id; sha256 = $_.sha256 }
+        })
+        vendor_trees = [ordered]@{
+            generalized_sasaki_nakamura = Get-TreeSha256 (Join-Path $JuliaDataRoot "GeneralizedSasakiNakamura.jl")
+            spin_weighted_spheroidal_harmonics = Get-TreeSha256 (Join-Path $JuliaDataRoot "SpinWeightedSpheroidalHarmonics.jl")
         }
     }
-
-    Write-Step "Preparing the pinned M02 Julia project"
-    if (Test-Path -LiteralPath $JuliaVendorRoot) {
-        Remove-Item -LiteralPath $JuliaVendorRoot -Recurse -Force
+    $M02ContractSha256 = Get-ObjectSha256 $M02Contract
+    $M02ContractId = "m02-" + $M02ContractSha256.Substring(0, 24)
+    $M02SourceRoot = Join-Path $RuntimeRoot "scientific-sources\$M02ContractId"
+    $M02Root = Join-Path $RuntimeRoot "m02-environments\$M02ContractId"
+    $JuliaProject = Join-Path $M02Root "project"
+    $JuliaDepot = Join-Path $RuntimeRoot "julia-depot\$M02ContractId"
+    $M02ReceiptDirectory = Join-Path $MetadataRoot "m02-environments"
+    $M02ReceiptPath = Join-Path $M02ReceiptDirectory "$M02ContractId.json"
+    $PersistentWorkerPath = Join-Path $M02SourceRoot "m02_worker.jl"
+    $PersistentProducerPath = Join-Path $M02SourceRoot "generate_gsn_cache.jl"
+    New-Item -ItemType Directory -Force -Path $M02ReceiptDirectory | Out-Null
+    $PersistentSourcesReinstalled = $false
+    if (-not (Test-PersistentScientificSources)) {
+        Write-Step "Installing scientific source contract $M02ContractId"
+        Install-PersistentScientificSources
+        $PersistentSourcesReinstalled = $true
     }
-    New-Item -ItemType Directory -Force -Path $JuliaVendorRoot | Out-Null
-    Copy-Item -LiteralPath (Join-Path $JuliaDataRoot "GeneralizedSasakiNakamura.jl") `
-        -Destination $JuliaVendorRoot -Recurse -Force
-    Copy-Item -LiteralPath (Join-Path $JuliaDataRoot "SpinWeightedSpheroidalHarmonics.jl") `
-        -Destination $JuliaVendorRoot -Recurse -Force
-    New-Item -ItemType Directory -Force -Path $JuliaProject | Out-Null
-    Copy-Item -LiteralPath (Join-Path $JuliaDataRoot "m02_project\Project.toml") `
-        -Destination (Join-Path $JuliaProject "Project.toml") -Force
-    $RuntimeManifest = Join-Path $JuliaProject "Manifest.toml"
-    if (-not (Test-Path -LiteralPath $RuntimeManifest -PathType Leaf)) {
-        Copy-Item -LiteralPath (Join-Path $JuliaDataRoot "m02_project\Manifest.seed.toml") `
-            -Destination $RuntimeManifest -Force
+    $M02Ready = if ($PersistentSourcesReinstalled) {
+        $false
     }
-    New-Item -ItemType Directory -Force -Path $JuliaDepot | Out-Null
-    $env:JULIA_DEPOT_PATH = $JuliaDepot
-    $env:JULIA_PKG_PRECOMPILE_AUTO = "0"
-    $env:M02_GSN_SOURCE = Join-Path $JuliaVendorRoot "GeneralizedSasakiNakamura.jl"
-    $env:M02_ANGULAR_SOURCE = Join-Path $JuliaVendorRoot "SpinWeightedSpheroidalHarmonics.jl"
-    $SetupExpression = @'
+    else {
+        Test-M02Environment $M02ContractSha256
+    }
+    if ($M02Ready) {
+        Set-M02JuliaEnvironment
+        try {
+            Invoke-Julia @(
+                "--startup-file=no",
+                "--history-file=no",
+                "--project=$JuliaProject",
+                $PersistentWorkerPath,
+                "--probe"
+            )
+            Write-Step "M02 Julia project/depot receipt and probe are valid"
+        }
+        catch {
+            Write-Step "M02 Julia project probe failed; rebuilding only the M02 project and depot"
+            $M02Ready = $false
+        }
+    }
+    if (-not $M02Ready) {
+        Remove-ManagedDirectory $M02Root "incompatible M02 Julia project"
+        Remove-ManagedDirectory $JuliaDepot "incompatible M02 Julia depot"
+        New-Item -ItemType Directory -Force -Path $JuliaProject | Out-Null
+        Copy-Item -LiteralPath (Join-Path $M02SourceRoot "m02_project\Project.toml") `
+            -Destination (Join-Path $JuliaProject "Project.toml") -Force
+        Copy-Item -LiteralPath (Join-Path $M02SourceRoot "m02_project\Manifest.seed.toml") `
+            -Destination (Join-Path $JuliaProject "Manifest.toml") -Force
+        New-Item -ItemType Directory -Force -Path $JuliaDepot | Out-Null
+        Set-M02JuliaEnvironment
+        $SetupExpression = @'
 using Pkg
 Pkg.develop(PackageSpec(path=ENV["M02_ANGULAR_SOURCE"]))
 Pkg.develop(PackageSpec(path=ENV["M02_GSN_SOURCE"]))
@@ -388,66 +750,111 @@ Pkg.resolve()
 Pkg.instantiate()
 Pkg.precompile()
 '@
-    $SetupScript = Join-Path $TempRoot "m02-setup.jl"
-    [IO.File]::WriteAllText(
-        $SetupScript,
-        $SetupExpression,
-        [System.Text.UTF8Encoding]::new($false)
-    )
-    Invoke-Native $JuliaExe @(
-        "--startup-file=no",
-        "--history-file=no",
-        "--project=$JuliaProject",
-        $SetupScript
-    )
-    Remove-Item -LiteralPath $SetupScript -Force
-    $WorkerPath = Join-Path $JuliaDataRoot "m02_worker.jl"
-    Invoke-Native $JuliaExe @(
-        "--startup-file=no",
-        "--history-file=no",
-        "--project=$JuliaProject",
-        $WorkerPath,
-        "--probe"
-    )
+        $SetupScript = Join-Path $TempRoot "m02-setup.jl"
+        [IO.File]::WriteAllText(
+            $SetupScript,
+            $SetupExpression,
+            [System.Text.UTF8Encoding]::new($false)
+        )
+        Write-Step "Instantiating and precompiling the pinned M02 Julia project"
+        try {
+            Invoke-Julia @(
+                "--startup-file=no",
+                "--history-file=no",
+                "--project=$JuliaProject",
+                $SetupScript
+            )
+        }
+        finally {
+            if (Test-Path -LiteralPath $SetupScript -PathType Leaf) {
+                Remove-Item -LiteralPath $SetupScript -Force
+            }
+        }
+        $WorkerPath = $PersistentWorkerPath
+        Invoke-Julia @(
+            "--startup-file=no",
+            "--history-file=no",
+            "--project=$JuliaProject",
+            $WorkerPath,
+            "--probe"
+        )
+        $M02Receipt = [ordered]@{
+            schema_version = 1
+            contract_sha256 = $M02ContractSha256
+            contract_id = $M02ContractId
+            scientific_source_root = [IO.Path]::GetFullPath($M02SourceRoot)
+            contract = $M02Contract
+            project = [IO.Path]::GetFullPath($JuliaProject)
+            depot = [IO.Path]::GetFullPath($JuliaDepot)
+            project_sha256 = Get-Sha256 (Join-Path $JuliaProject "Project.toml")
+            manifest_sha256 = Get-Sha256 (Join-Path $JuliaProject "Manifest.toml")
+            worker_sha256 = Get-Sha256 $WorkerPath
+            created_utc = [DateTime]::UtcNow.ToString("o")
+        }
+        $M02Receipt | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $M02ReceiptPath -Encoding UTF8
+        Write-Step "M02 Julia project, depot, and precision worker are ready"
+    }
+    else {
+        $WorkerPath = $PersistentWorkerPath
+    }
+
     $JuliaReceipt = [ordered]@{
         requested = $true
-        version = [string]$Policy.julia.version
-        executable = [IO.Path]::GetFullPath($JuliaExe)
-        executable_sha256 = Get-Sha256 $JuliaExe
-        archive = [IO.Path]::GetFullPath($JuliaArchive)
+        version = [string]$JuliaCandidate.version
+        bits = [int]$JuliaCandidate.bits
+        executable = [string]$JuliaCandidate.executable
+        executable_sha256 = [string]$JuliaCandidate.executable_sha256
+        arguments = @($JuliaCandidate.arguments)
+        source = [string]$JuliaCandidate.source
+        archive = $JuliaArchive
         archive_sha256 = $ActualJuliaSha256
         sources = @($SourceReceipts)
+        source_root = [IO.Path]::GetFullPath($M02SourceRoot)
+        worker = [IO.Path]::GetFullPath($PersistentWorkerPath)
+        gsn_producer = [IO.Path]::GetFullPath($PersistentProducerPath)
+        gsn_source_root = [IO.Path]::GetFullPath((Join-Path $M02SourceRoot "GeneralizedSasakiNakamura.jl"))
+        angular_source_root = [IO.Path]::GetFullPath((Join-Path $M02SourceRoot "SpinWeightedSpheroidalHarmonics.jl"))
         depot = [IO.Path]::GetFullPath($JuliaDepot)
         project = [IO.Path]::GetFullPath($JuliaProject)
         manifest_sha256 = Get-Sha256 (Join-Path $JuliaProject "Manifest.toml")
         worker_sha256 = Get-Sha256 $WorkerPath
+        contract_sha256 = $M02ContractSha256
+        contract_id = $M02ContractId
     }
-    Write-Step "Julia runtime, pinned GSN sources, and precision worker ready"
 }
 
 # -------------------------------------------------------------------- receipt
 
+$runtimeMode = if ($PortableRuntime) { "portable" } else { "per-user" }
 $receipt = [ordered]@{
-    schema_version = 1
+    schema_version = 2
     policy_id = $Policy.policy_id
     policy_sha256 = $PolicySha256
-    uv = [ordered]@{ version = $uvVersion; executable = $UvExe; sha256 = $UvSha256 }
+    runtime_root = [IO.Path]::GetFullPath($RuntimeRoot)
+    runtime_mode = $runtimeMode
     python = [ordered]@{
-        version = [string]$identity.version
-        implementation = [string]$identity.implementation
-        bits = [int]$identity.bits
-        executable = [string]$identity.executable
-        venv = $VenvRoot
+        version = [string]$VenvIdentity.version
+        implementation = [string]$VenvIdentity.implementation
+        bits = [int]$VenvIdentity.bits
+        executable = [string]$VenvIdentity.executable
+        venv = [IO.Path]::GetFullPath($VenvRoot)
+        source_kind = $PythonSourceKind
+        source_command = [string]$PythonSource.command
+        source_arguments = @($PythonSource.arguments)
+        source_executable = [string]$PythonSource.executable
+        source_executable_sha256 = Get-Sha256 $PythonSource.executable
         managed_interpreter = $ManagedPython
     }
     numerical_kernel = [ordered]@{
         requested = [bool]$WithNumericalKernel
-        packages = @($installed)
+        packages = @($InstalledPackages)
     }
     julia_runtime = $JuliaReceipt
 }
-$receipt | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $ReceiptPath -Encoding UTF8
-Write-Step "Wrote $ReceiptPath"
+$receiptText = $receipt | ConvertTo-Json -Depth 20
+$receiptText | Set-Content -LiteralPath $ReceiptPath -Encoding UTF8
+$receiptText | Set-Content -LiteralPath $IdentityPath -Encoding UTF8
+Write-Step "Wrote runtime receipt: $ReceiptPath"
 
 # ------------------------------------------------------------------ smoke test
 
@@ -470,6 +877,6 @@ if (-not $WithNumericalKernel) {
 }
 if (-not $WithM02) {
     Write-Host ""
-    Write-Host "The physical M02 campaign additionally needs package-local Julia:"
+    Write-Host "The physical M02 campaign additionally needs Julia 1.10.11:"
     Write-Host "    .\runtime\bootstrap.ps1 -WithM02"
 }
