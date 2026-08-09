@@ -9,10 +9,13 @@ import unittest
 
 from windows_solver.contracts import canonical_json_bytes
 from windows_solver.julia_response_backend import (
+    JULIA_PROGRESS_PREFIX,
     JuliaPrecisionRootBackend,
     JuliaResponseAdapter,
     JuliaResponseBackendError,
+    _forward_julia_progress_line,
 )
+from windows_solver.progress import PROGRESS_SCHEMA, ProgressEventKind, activate_progress
 from windows_solver.response_batches import (
     PrecisionCapabilities,
     build_campaign_plan,
@@ -63,6 +66,56 @@ class FakeAdapter:
 
 
 class JuliaResponseBackendTests(unittest.TestCase):
+    def test_package_worker_declares_line_flushed_inner_progress_without_request_changes(self):
+        worker = (
+            Path(__file__).resolve().parents[1]
+            / "src/windows_solver/data/julia/m02_worker.jl"
+        ).read_text(encoding="utf-8")
+        self.assertIn('const PROGRESS_PREFIX = "@@KERR_QNM_PROGRESS@@"', worker)
+        self.assertIn("flush(stdout)", worker)
+        for event in (
+            "root_phase_started",
+            "newton_iteration_started",
+            "newton_iteration_completed",
+            "determinant_started",
+            "determinant_completed",
+            "suboperation_started",
+            "suboperation_completed",
+        ):
+            self.assertIn(f'progress_emit("{event}"', worker)
+        self.assertNotIn('document["progress', worker)
+
+    def test_reserved_julia_stdout_event_is_forwarded_to_active_reporter(self):
+        class Observer:
+            def __init__(self):
+                self.events = []
+
+            def publish(self, event):
+                self.events.append(event)
+
+        observer = Observer()
+        line = JULIA_PROGRESS_PREFIX + json.dumps({
+            "schema": PROGRESS_SCHEMA,
+            "kind": "newton_iteration_started",
+            "context": {
+                "phase": "PRIMARY",
+                "newton_index": 1,
+                "newton_limit": 16,
+                "current_omega": {"real": "0.5", "imaginary": "-0.1"},
+            },
+            "payload": {
+                "current_omega": {"real": "0.5", "imaginary": "-0.1"},
+                "determinant_abs": "1e-20",
+                "best_determinant_abs": "1e-20",
+            },
+        })
+        with activate_progress(observer):
+            self.assertTrue(_forward_julia_progress_line(line))
+
+        self.assertEqual(len(observer.events), 1)
+        self.assertIs(observer.events[0].kind, ProgressEventKind.NEWTON_ITERATION_STARTED)
+        self.assertEqual(observer.events[0].context.phase, "PRIMARY")
+
     def test_promoted_backend_uses_bigfloat_policy_without_binary64_tolerances(self):
         job = _deep_job()
         adapter = FakeAdapter()
