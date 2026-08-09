@@ -155,11 +155,11 @@ class JuliaResponseBackendTests(unittest.TestCase):
             self.assertEqual(adapter.julia_project, project.resolve())
 
             manifest.write_bytes(b"changed")
-            evolved = JuliaResponseAdapter.from_runtime_receipt(runtime_root=runtime)
-            self.assertEqual(
-                evolved.runtime_provenance["julia_manifest_sha256"],
-                hashlib.sha256(b"changed").hexdigest(),
-            )
+            with self.assertRaisesRegex(
+                JuliaResponseBackendError,
+                "manifest receipt digest",
+            ):
+                JuliaResponseAdapter.from_runtime_receipt(runtime_root=runtime)
 
     def test_subprocess_response_is_bound_to_exact_request_digest(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -188,6 +188,72 @@ class JuliaResponseBackendTests(unittest.TestCase):
             )
             with self.assertRaisesRegex(JuliaResponseBackendError, "request digest"):
                 adapter.evaluate({"schema_version": 1})
+
+    def test_runtime_receipt_uses_persistent_worker_and_juliaup_channel(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runtime = root / "runtime"
+            project = runtime / "m02-environments" / "m02-contract" / "project"
+            depot = runtime / "julia-depot" / "m02-contract"
+            source_root = runtime / "scientific-sources" / "m02-contract"
+            project.mkdir(parents=True)
+            depot.mkdir(parents=True)
+            source_root.mkdir(parents=True)
+            julia = root / "julia.exe"
+            worker = source_root / "m02_worker.jl"
+            for path, data in (
+                (julia, b"juliaup-shim"),
+                (project / "Project.toml", b"project"),
+                (project / "Manifest.toml", b"manifest"),
+                (worker, b"persistent worker"),
+            ):
+                path.write_bytes(data)
+            receipt = {
+                "policy_sha256": "f" * 64,
+                "julia_runtime": {
+                    "requested": True,
+                    "version": "1.10.11",
+                    "executable": str(julia),
+                    "executable_sha256": hashlib.sha256(julia.read_bytes()).hexdigest(),
+                    "arguments": ["+1.10.11"],
+                    "worker": str(worker),
+                    "worker_sha256": hashlib.sha256(worker.read_bytes()).hexdigest(),
+                    "depot": str(depot),
+                    "project": str(project),
+                    "manifest_sha256": hashlib.sha256(
+                        (project / "Manifest.toml").read_bytes()
+                    ).hexdigest(),
+                    "sources": [],
+                },
+            }
+            (runtime / "python-runtime.json").write_bytes(
+                canonical_json_bytes(receipt)
+            )
+            commands: list[tuple[str, ...]] = []
+
+            def runner(command, **kwargs):
+                commands.append(tuple(command))
+                request = json.loads(
+                    Path(command[-2]).read_text(encoding="utf-8")
+                )
+                Path(command[-1]).write_bytes(
+                    canonical_json_bytes(
+                        {
+                            "status": "ok",
+                            "request_sha256": request["request_sha256"],
+                        }
+                    )
+                )
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+            adapter = JuliaResponseAdapter.from_runtime_receipt(
+                runtime_root=runtime,
+                runner=runner,
+            )
+            adapter.evaluate({"schema_version": 1})
+            self.assertTrue(Path(commands[0][0]).samefile(julia))
+            self.assertEqual(commands[0][1:3], ("+1.10.11", "--startup-file=no"))
+            self.assertTrue(Path(commands[0][-3]).samefile(worker))
 
 
 if __name__ == "__main__":
