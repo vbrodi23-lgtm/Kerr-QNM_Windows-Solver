@@ -184,7 +184,10 @@ class LinearResponseEngineTests(unittest.TestCase):
             kernel_type.identity.runtime_fingerprint,
         )
         self.assertIn("python-64bit", kernel_type.identity.runtime_fingerprint)
-        self.assertIn("gsn-cache-0c49fe4c", kernel_type.identity.runtime_fingerprint)
+        self.assertIn(
+            "gsn-input-julia-exact-f-u-cache-contract-1",
+            kernel_type.identity.runtime_fingerprint,
+        )
         for mechanism_id in (
             "exterior-fixed-r3",
             "exterior-light-ring",
