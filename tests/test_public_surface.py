@@ -395,12 +395,132 @@ class PublicSurfaceTests(unittest.TestCase):
         self.assertIn('campaign-resume', launcher)
         self.assertIn('"--full"', launcher)
         self.assertIn('if ($RebuildRuntime)', launcher)
-        self.assertIn('$BootstrapArguments += "-Force"', launcher)
         self.assertEqual(launcher.count("$Selection,"), 2)
         self.assertEqual(launcher.count("\n        $Checkpoint\n"), 1)
         self.assertEqual(launcher.count("\n        $Checkpoint,\n"), 1)
         self.assertNotIn("$SelectionPath,", launcher)
         self.assertNotIn("$CheckpointPath,", launcher)
+
+    @unittest.skipUnless(os.name == "nt", "requires Windows PowerShell 5.1")
+    def test_m02_launcher_binds_bootstrap_switches_at_the_script_boundary(
+        self,
+    ) -> None:
+        """The launcher must bind, rather than merely construct, bootstrap switches.
+
+        A real PowerShell invocation runs a copied ``m02.ps1`` against a
+        parameter-bearing bootstrap stub.  The stub records its bound switch
+        values; no runtime, Julia, or scientific command is executed.
+        """
+
+        root = Path(__file__).resolve().parents[1]
+        windows_powershell = Path(os.environ["SystemRoot"]).joinpath(
+            "System32", "WindowsPowerShell", "v1.0", "powershell.exe"
+        )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            package_root = Path(temporary) / "m02-bootstrap-binding"
+            (package_root / "examples").mkdir(parents=True)
+            (package_root / "runtime").mkdir()
+            shutil.copy2(root / "m02.ps1", package_root / "m02.ps1")
+            shutil.copy2(
+                root / "examples" / "m02-campaign.json",
+                package_root / "examples" / "m02-campaign.json",
+            )
+            bootstrap_log = package_root / "bootstrap-bindings.jsonl"
+            argument_log = package_root / "arguments.jsonl"
+            (package_root / "runtime" / "bootstrap.ps1").write_text(
+                r'''param(
+    [switch]$WithM02,
+    [switch]$Force
+)
+
+$record = [ordered]@{
+    with_m02 = [bool]$WithM02
+    force = [bool]$Force
+}
+[IO.File]::AppendAllText(
+    $env:M02_TEST_BOOTSTRAP_LOG,
+    ($record | ConvertTo-Json -Compress) + [Environment]::NewLine,
+    [System.Text.UTF8Encoding]::new($false)
+)
+exit 0
+''',
+                encoding="utf-8",
+            )
+            (package_root / "solver.ps1").write_text(
+                r'''param(
+    [Parameter(ValueFromRemainingArguments = $true)]
+    [string[]]$SolverArguments
+)
+
+$record = $SolverArguments | ConvertTo-Json -Compress
+[IO.File]::AppendAllText(
+    $env:M02_TEST_ARGUMENT_LOG,
+    $record + [Environment]::NewLine,
+    [System.Text.UTF8Encoding]::new($false)
+)
+$checkpointIndex = [Array]::IndexOf($SolverArguments, "--checkpoint")
+if ($checkpointIndex -lt 0) {
+    exit 91
+}
+if ($SolverArguments[0] -eq "campaign-run") {
+    $checkpointArgument = $SolverArguments[$checkpointIndex + 1]
+    $checkpoint = if ([IO.Path]::IsPathRooted($checkpointArgument)) {
+        [IO.Path]::GetFullPath($checkpointArgument)
+    }
+    else {
+        [IO.Path]::GetFullPath((Join-Path $PSScriptRoot $checkpointArgument))
+    }
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $checkpoint) |
+        Out-Null
+    [IO.File]::WriteAllText($checkpoint, "{}")
+}
+exit 0
+''',
+                encoding="utf-8",
+            )
+            environment = dict(os.environ)
+            environment["M02_TEST_BOOTSTRAP_LOG"] = str(bootstrap_log)
+            environment["M02_TEST_ARGUMENT_LOG"] = str(argument_log)
+
+            for extra_arguments in ([], ["-RebuildRuntime"]):
+                result = subprocess.run(
+                    [
+                        str(windows_powershell),
+                        "-NoLogo",
+                        "-NoProfile",
+                        "-NonInteractive",
+                        "-ExecutionPolicy",
+                        "Bypass",
+                        "-File",
+                        str(package_root / "m02.ps1"),
+                        *extra_arguments,
+                    ],
+                    cwd=root,
+                    env=environment,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    check=False,
+                )
+                self.assertEqual(
+                    result.returncode,
+                    0,
+                    f"stdout={result.stdout!r} stderr={result.stderr!r}",
+                )
+
+            bindings = [
+                json.loads(line)
+                for line in bootstrap_log.read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertEqual(
+            bindings,
+            [
+                {"with_m02": True, "force": False},
+                {"with_m02": True, "force": True},
+            ],
+        )
 
     @unittest.skipUnless(os.name == "nt", "requires Windows PowerShell 5.1")
     def test_m02_public_default_invocation_forwards_safe_relative_paths(self) -> None:
