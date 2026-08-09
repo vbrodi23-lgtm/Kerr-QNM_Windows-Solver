@@ -1408,6 +1408,37 @@ def _campaign_stage_record(
     })
 
 
+def _execute_campaign_stage(
+    backend: object,
+    leaf: CampaignLeafPlan,
+    digits: int,
+    previous_stages: Sequence[CampaignStageRecord] = (),
+) -> StageOutcome:
+    """Execute a stage while preserving the promotion evidence on resume.
+
+    Existing injected fixture/operator backends keep the original two-argument
+    ``execute_stage`` contract.  A backend that computes promoted-precision
+    discrepancy evidence can implement ``execute_promoted_stage`` and receives
+    the already authenticated checkpoint outcomes, including in a fresh
+    process after ``campaign-resume``.
+    """
+
+    if digits > 64:
+        promoted = getattr(backend, "execute_promoted_stage", None)
+        if promoted is not None:
+            if not callable(promoted):
+                raise ValueError("campaign promoted-stage backend is invalid")
+            return promoted(
+                leaf,
+                digits,
+                tuple(stage.outcome for stage in previous_stages),
+            )
+    execute = getattr(backend, "execute_stage", None)
+    if not callable(execute):
+        raise ValueError("campaign backend execute_stage is unavailable")
+    return execute(leaf, digits)
+
+
 def run_campaign_selection(
     plan: CampaignPlan,
     selection: CampaignSelection,
@@ -1451,7 +1482,7 @@ def run_campaign_selection(
         leaf = leaf_by_id[leaf_id]
         record = records[index] if index < len(records) else None
         if record is None:
-            outcome = backend.execute_stage(leaf, 64)
+            outcome = _execute_campaign_stage(backend, leaf, 64)
             if not isinstance(outcome, StageOutcome) or outcome.digits != 64:
                 raise ValueError("campaign backend returned an invalid binary64 stage")
             executed += 1
@@ -1493,7 +1524,9 @@ def run_campaign_selection(
         if len(record.stages) == 1:
             if 80 not in available.digits:
                 continue
-            outcome80 = backend.execute_stage(leaf, 80)
+            outcome80 = _execute_campaign_stage(
+                backend, leaf, 80, record.stages
+            )
             if (
                 not isinstance(outcome80, StageOutcome)
                 or outcome80.digits != 80
@@ -1569,7 +1602,9 @@ def run_campaign_selection(
         if len(record.stages) == 2:
             if 120 not in available.digits:
                 continue
-            outcome120 = backend.execute_stage(leaf, 120)
+            outcome120 = _execute_campaign_stage(
+                backend, leaf, 120, record.stages
+            )
             if (
                 not isinstance(outcome120, StageOutcome)
                 or outcome120.digits != 120
