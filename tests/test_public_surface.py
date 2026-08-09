@@ -590,19 +590,19 @@ exit 0
                     "with_m02": True,
                     "force": False,
                     "portable_runtime": False,
-                    "runtime_root": None,
+                    "runtime_root": "",
                 },
                 {
                     "with_m02": True,
                     "force": True,
                     "portable_runtime": False,
-                    "runtime_root": None,
+                    "runtime_root": "",
                 },
                 {
                     "with_m02": True,
                     "force": False,
                     "portable_runtime": True,
-                    "runtime_root": None,
+                    "runtime_root": "",
                 },
             ],
         )
@@ -665,12 +665,14 @@ $record = [ordered]@{ default = $default; portable = $portable } | ConvertTo-Jso
                 f"stdout={result.stdout!r} stderr={result.stderr!r}",
             )
             resolved = json.loads(resolver_log.read_text(encoding="utf-8"))
-
-        self.assertEqual(
-            Path(resolved["default"]),
-            local_app_data / "Kerr-QNM_Windows-Solver" / "runtime-1",
-        )
-        self.assertEqual(Path(resolved["portable"]), package_root / ".runtime")
+            expected_default = (
+                local_app_data / "Kerr-QNM_Windows-Solver" / "runtime-1"
+            )
+            expected_portable = package_root / ".runtime"
+            expected_default.mkdir(parents=True)
+            expected_portable.mkdir()
+            self.assertTrue(Path(resolved["default"]).samefile(expected_default))
+            self.assertTrue(Path(resolved["portable"]).samefile(expected_portable))
 
     @unittest.skipUnless(os.name == "nt", "requires Windows PowerShell 5.1")
     def test_m02_public_default_invocation_forwards_safe_relative_paths(self) -> None:
@@ -876,14 +878,18 @@ exit 0
 $Policy = [pscustomobject]@{ julia = [pscustomobject]@{ version = "1.10.11" } }
 function Try-InvokeNativeCapture([string]$FilePath, [string[]]$Arguments) {
     $joined = $Arguments -join " "
-    if ($joined -eq "--version") { return "julia version 1.10.11" }
+    if ($joined -eq "+1.10.11 --version" -or $joined -eq "--version") {
+        return "julia version 1.10.11"
+    }
     if ($joined -match "Sys.WORD_SIZE") { return "64" }
     if ($joined -match "Sys.BINDIR") { return $env:M02_TEST_JULIA_BINDIR }
     throw "unexpected Julia probe: $FilePath $joined"
 }
 function Get-Sha256([string]$Path) {
     if ($Path -like "*WindowsApps*") { throw "WindowsApps shim must not be hashed" }
-    if ($Path -ne $env:M02_TEST_JULIA_REAL) { throw "unexpected hash target: $Path" }
+    if ((Get-Content -LiteralPath $Path -Raw) -ne "real-julia") {
+        throw "unexpected hash target: $Path"
+    }
     return "real-julia-sha256"
 }
 . $env:M02_TEST_JULIA_DISCOVERY
@@ -914,13 +920,16 @@ $candidate | ConvertTo-Json -Compress | Set-Content -LiteralPath $env:M02_TEST_J
                 0,
                 f"stdout={result.stdout!r} stderr={result.stderr!r}",
             )
-            candidate = json.loads(record_path.read_text(encoding="utf-8"))
-
-        self.assertEqual(candidate["source"], "juliaup")
-        self.assertEqual(Path(candidate["launcher"]), launcher)
-        self.assertEqual(Path(candidate["executable"]), real_executable)
-        self.assertEqual(candidate["executable_sha256"], "real-julia-sha256")
-        self.assertEqual(candidate["arguments"], [])
+            candidate = json.loads(record_path.read_text(encoding="utf-8-sig"))
+            self.assertEqual(candidate["source"], "juliaup")
+            self.assertTrue(Path(candidate["launcher"]).samefile(launcher))
+            self.assertTrue(
+                Path(candidate["executable"]).samefile(real_executable)
+            )
+            self.assertEqual(
+                candidate["executable_sha256"], "real-julia-sha256"
+            )
+            self.assertEqual(candidate["arguments"], [])
 
     def test_public_surface_contains_no_private_lineage_identifiers(self) -> None:
         root = Path(__file__).resolve().parents[1]
