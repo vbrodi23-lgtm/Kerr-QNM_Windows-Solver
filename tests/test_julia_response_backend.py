@@ -83,6 +83,7 @@ class JuliaResponseBackendTests(unittest.TestCase):
             "suboperation_completed",
         ):
             self.assertIn(f'progress_emit("{event}"', worker)
+        self.assertIn('"acceptance_threshold" => string(tolerance)', worker)
         self.assertNotIn('document["progress', worker)
 
     def test_reserved_julia_stdout_event_is_forwarded_to_active_reporter(self):
