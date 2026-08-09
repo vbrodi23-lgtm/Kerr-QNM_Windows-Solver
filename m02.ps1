@@ -4,7 +4,9 @@ param(
     [switch]$SkipBootstrap,
     [switch]$RebuildRuntime,
     [switch]$PortableRuntime,
-    [string]$RuntimeRoot
+    [string]$RuntimeRoot,
+    [ValidateSet("quiet", "normal", "trace")]
+    [string]$Progress = "normal"
 )
 
 $ErrorActionPreference = "Stop"
@@ -69,11 +71,15 @@ try {
     else {
         "campaign-run"
     }
+    Write-Host "M02 live progress status:" -ForegroundColor Cyan
+    Write-Host "    $CheckpointPath.status.json"
     Invoke-M02Command -Arguments @(
         $Command,
         $Selection,
         "--checkpoint",
-        $Checkpoint
+        $Checkpoint,
+        "--progress",
+        $Progress
     )
     Invoke-M02Command -Arguments @(
         "campaign-validate",
