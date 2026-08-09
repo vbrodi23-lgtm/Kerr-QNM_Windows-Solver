@@ -792,7 +792,7 @@ Evaluate the physical derivative couplings and selection rules needed to form th
 ### Dependencies
 
 - **Blocked by:** TASK-026, TASK-027
-- **Blocks:** TASK-029, TASK-030
+- **Blocks:** TASK-029
 
 ### Evidence Output
 
