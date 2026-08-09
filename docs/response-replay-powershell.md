@@ -69,7 +69,7 @@ python -m windows_solver campaign-smoke
 
 Physical selected execution uses package-local Julia to generate the exact F/U
 coefficient records required by the selected campaign leaves. Provision the
-pinned CPython, NumPy/SciPy, and portable Julia runtimes once:
+CPython, NumPy/SciPy, and portable Julia runtimes once:
 
 ```powershell
 .\runtime\bootstrap.ps1 -WithM02
@@ -80,38 +80,38 @@ pinned CPython, NumPy/SciPy, and portable Julia runtimes once:
 
 The producer executes the packaged `Potentials.sF` / `Potentials.sU` equations
 with exact symbolic rational algebra, validates them against direct evaluation,
-and writes a content-addressed cache under `.runtime`. The Python boundary
-rehashes the artifact before importing the existing `StandardSN` consumer.
-Verified warm state is reused; source, producer, executable, receipt, status, or
-cache drift forces regeneration or rejection before determinant work.
+and writes one short artifact per exact `(a,m)` pair under
+`.runtime\generated\gsn`. `gsn-index.json` uses a canonical scientific
+identity containing spin weight, the resolved campaign spin, azimuthal index,
+mass normalization, equation convention, and the producer/consumer contract
+versions. Direct-spin leaves use their exact rational `a/M`. For an `M-kappa`
+leaf, the bridge resolves
+`a/M = sqrt(1 - 4 M-kappa) / (1 - 2 M-kappa)`, stores the exact integer ratio of
+that binary64 value for Julia rational algebra, and retains the exact source
+`M-kappa` coordinate as origin metadata.
 
-The installed native adapter authenticates binary64 only. A deep selection therefore also requires a
-separately authenticated backend implementing the declared 80/120-digit
-capabilities and deep trigger diagnostics; missing stages remain missing rather
-than being silently downgraded.
+Warm reuse is pair-level and independent of campaign ordering or subset size.
+The status and artifact are reread and structurally validated on every reuse;
+an invalid pair regenerates under the same short ID without discarding other
+accepted pairs. Index allocation is locked, index replacement is atomic, and
+the prior valid index is retained as `gsn-index.previous.json`. Measured hashes
+and producer metadata are observations, not development execution gates.
 
-An operator precision plugin is declared, but not imported, during `plan` and
-`validate`. Its module is a safe path relative to the selection manifest, and
-its bytes must match before `module:function` import during `run` or nonzero-work
-`resume`. The factory result must expose the exact declared `BackendIdentity`
-and advertised capabilities.
+The installed backend owns all declared precision stages. Binary64 uses the
+existing Python `StandardSN` path; 80/120-digit stages use the package-local
+Julia worker and return the same root-readout contract to the existing campaign
+runner. No separately supplied precision module is needed for M02.
+
+For the complete campaign, the root launcher selects all 553 leaves, starts or
+resumes the checkpoint, and performs full structural validation:
 
 ```powershell
-$precisionBackend = @{
-  factory = "operator_precision_backend:create_backend"
-  module_path = "operator_precision_backend.py"
-  module_sha256 = (Get-FileHash .\operator_precision_backend.py -Algorithm SHA256).Hash.ToLowerInvariant()
-  backend_identity = $authenticatedBackendIdentity
-  available_precision_digits = @(64, 80, 120)
-}
+.\m02.ps1
 ```
 
-Set the selection's `precision_backend` to this object and keep its
-`backend_id`, `precision_digits`, and every other plan field unchanged. This
-allows a same-identity backend with a superset of currently available precision
-stages to resume a `MISSING_PRECISION` prefix. The module does not make
-multi-precision physics available by itself; the operator supplies that
-authenticated implementation.
+Use `.\m02.ps1 -RebuildRuntime` only when intentionally discarding `.runtime`
+and provisioning it again. The campaign checkpoint under `m02-output` is not
+removed by that option.
 
 Merge manifests name relative, non-symlink checkpoint paths. Absolute, UNC,
 drive-relative, traversal, ADS, duplicate-key, nonfinite, stale, mixed-policy,
@@ -121,7 +121,7 @@ and disagreeing-overlap inputs are rejected before work.
 $merge = @{
   schema_version = 1
   backend_id = "vetted-native-gsn-determinant"
-  precision_digits = @(64)
+  precision_digits = @(64, 80, 120)
   precision_backend = $null
   checkpoint_paths = @("parts\primary-a.json", "parts\primary-b.json")
 } | ConvertTo-Json -Depth 4 -Compress
