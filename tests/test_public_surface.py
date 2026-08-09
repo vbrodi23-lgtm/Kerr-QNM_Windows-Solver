@@ -211,13 +211,99 @@ class PublicSurfaceTests(unittest.TestCase):
             "Verified Julia archive contains no julia.exe.",
             julia_install,
         )
+        self.assertNotIn("Expand-Archive", julia_install)
+
+    def test_m02_bootstrap_configures_utf8_console_before_julia(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        bootstrap = (root / "runtime" / "bootstrap.ps1").read_text(
+            encoding="utf-8"
+        )
+        m02_bootstrap = bootstrap[
+            bootstrap.index(
+                "$JuliaReceipt = [ordered]@{ requested = [bool]$WithM02 }"
+            ) : bootstrap.index("\n    $JuliaIdentity")
+        ]
+        chcp = "& $Chcp.Source 65001 | Out-Null"
+        input_encoding = "[Console]::InputEncoding = $Utf8NoBom"
+        output_encoding = "[Console]::OutputEncoding = $Utf8NoBom"
+        native_input_encoding = "$OutputEncoding = $Utf8NoBom"
+
+        self.assertIn(
+            "$Utf8NoBom = [System.Text.UTF8Encoding]::new($false)",
+            m02_bootstrap,
+        )
+        self.assertIn(
+            "Get-Command chcp.com -ErrorAction SilentlyContinue",
+            m02_bootstrap,
+        )
+        self.assertIn("if ($null -eq $Chcp)", m02_bootstrap)
+        self.assertIn(chcp, m02_bootstrap)
+        self.assertIn(
+            "Could not switch the active console code page to UTF-8 (65001).",
+            m02_bootstrap,
+        )
+        self.assertIn(input_encoding, m02_bootstrap)
+        self.assertIn(output_encoding, m02_bootstrap)
+        self.assertIn(native_input_encoding, m02_bootstrap)
+        self.assertLess(
+            m02_bootstrap.index(chcp),
+            m02_bootstrap.index(input_encoding),
+        )
+        self.assertLess(
+            m02_bootstrap.index(input_encoding),
+            m02_bootstrap.index(output_encoding),
+        )
+        self.assertLess(
+            m02_bootstrap.index(output_encoding),
+            m02_bootstrap.index(native_input_encoding),
+        )
+
+    def test_m02_bootstrap_installs_julia_by_renaming_the_extracted_tree(
+        self,
+    ) -> None:
+        root = Path(__file__).resolve().parents[1]
+        bootstrap = (root / "runtime" / "bootstrap.ps1").read_text(
+            encoding="utf-8"
+        )
+        julia_install = bootstrap[
+            bootstrap.index(
+                'if (-not (Test-Path -LiteralPath $JuliaExe -PathType Leaf))'
+            ) : bootstrap.index("\n    $JuliaIdentity")
+        ]
+        move = (
+            "Move-Item -LiteralPath $ExtractedJuliaRoot "
+            "-Destination $JuliaRoot"
+        )
+        installed_runtime_check = (
+            "if (-not (Test-Path -LiteralPath $JuliaExe -PathType Leaf))"
+        )
+
+        self.assertIn(move, julia_install)
+        self.assertNotIn(
+            "Copy-Item -LiteralPath $ExtractedJuliaRoot",
+            julia_install,
+        )
+        self.assertIn(installed_runtime_check, julia_install)
+        self.assertIn(
+            "Installed Julia runtime contains no julia.exe.",
+            julia_install,
+        )
+        move_index = julia_install.index(move)
+        installed_runtime_check_index = julia_install.index(
+            installed_runtime_check,
+            move_index,
+        )
         self.assertLess(
             julia_install.index('if ($null -eq $FoundJulia)'),
+            move_index,
+        )
+        self.assertLess(move_index, installed_runtime_check_index)
+        self.assertLess(
+            installed_runtime_check_index,
             julia_install.index(
-                "Copy-Item -LiteralPath $ExtractedJuliaRoot"
+                "Could not remove Julia extraction directory after installation"
             ),
         )
-        self.assertNotIn("Expand-Archive", julia_install)
 
     def test_force_reprovision_uses_long_path_safe_runtime_cleanup(self) -> None:
         root = Path(__file__).resolve().parents[1]

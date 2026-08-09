@@ -317,12 +317,28 @@ if ($WithM02) {
                 throw "Could not remove previous Julia runtime directory: $JuliaRoot"
             }
         }
-        Copy-Item -LiteralPath $ExtractedJuliaRoot -Destination $JuliaRoot -Recurse -Force
+        Move-Item -LiteralPath $ExtractedJuliaRoot -Destination $JuliaRoot
+        if (-not (Test-Path -LiteralPath $JuliaExe -PathType Leaf)) {
+            throw "Installed Julia runtime contains no julia.exe. Expected: $JuliaExe"
+        }
         cmd.exe /c rd /s /q "\\?\$JuliaExtract"
         if ($LASTEXITCODE -ne 0 -and (Test-Path -LiteralPath $JuliaExtract)) {
             throw "Could not remove Julia extraction directory after installation: $JuliaExtract"
         }
     }
+
+    $Utf8NoBom = [System.Text.UTF8Encoding]::new($false)
+    $Chcp = Get-Command chcp.com -ErrorAction SilentlyContinue
+    if ($null -eq $Chcp) {
+        throw "Windows chcp.com is required to configure UTF-8 console output."
+    }
+    & $Chcp.Source 65001 | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        throw "Could not switch the active console code page to UTF-8 (65001)."
+    }
+    [Console]::InputEncoding = $Utf8NoBom
+    [Console]::OutputEncoding = $Utf8NoBom
+    $OutputEncoding = $Utf8NoBom
 
     $JuliaIdentity = Invoke-NativeCapture $JuliaExe @("--version")
     if ($JuliaIdentity -ne "julia version $($Policy.julia.version)") {
