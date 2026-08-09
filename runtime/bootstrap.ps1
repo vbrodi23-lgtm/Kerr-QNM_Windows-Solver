@@ -369,13 +369,19 @@ Pkg.resolve()
 Pkg.instantiate()
 Pkg.precompile()
 '@
+    $SetupScript = Join-Path $TempRoot "m02-setup.jl"
+    [IO.File]::WriteAllText(
+        $SetupScript,
+        $SetupExpression,
+        [System.Text.UTF8Encoding]::new($false)
+    )
     Invoke-Native $JuliaExe @(
         "--startup-file=no",
         "--history-file=no",
         "--project=$JuliaProject",
-        "-e",
-        $SetupExpression
+        $SetupScript
     )
+    Remove-Item -LiteralPath $SetupScript -Force
     $WorkerPath = Join-Path $JuliaDataRoot "m02_worker.jl"
     Invoke-Native $JuliaExe @(
         "--startup-file=no",
