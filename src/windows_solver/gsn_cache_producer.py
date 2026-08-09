@@ -285,12 +285,12 @@ def _receipt_julia_invocation(
         raise GsnCacheProductionError("M02 Julia runtime receipt is invalid")
     producer = julia.get("gsn_producer")
     source_root = julia.get("gsn_source_root")
-    contract_id = julia.get("contract_id")
-    if contract_id is not None and (
-        not isinstance(contract_id, str)
-        or re.fullmatch(r"m02-[0-9a-f]{24}", contract_id) is None
+    cache_id = julia.get("gsn_cache_id", julia.get("contract_id"))
+    if cache_id is not None and (
+        not isinstance(cache_id, str)
+        or re.fullmatch(r"m02(?:-gsn)?-[0-9a-f]{24}", cache_id) is None
     ):
-        raise GsnCacheProductionError("M02 scientific source contract ID is invalid")
+        raise GsnCacheProductionError("M02 GSN cache contract ID is invalid")
     return (
         Path(executable),
         tuple(arguments),
@@ -298,7 +298,7 @@ def _receipt_julia_invocation(
         Path(source_root)
         if isinstance(source_root, str) and source_root
         else package_data / "GeneralizedSasakiNakamura.jl",
-        contract_id,
+        cache_id,
     )
 
 
@@ -887,7 +887,7 @@ def ensure_generated_gsn_cache(
     runtime = _runtime_root(runtime_root)
     declared_julia = os.environ.get("KERR_QNM_JULIA_EXE")
     julia_arguments: tuple[str, ...] = ()
-    source_contract_id: str | None = None
+    gsn_cache_id: str | None = None
     if julia_executable is not None:
         julia = Path(julia_executable)
     elif declared_julia:
@@ -898,7 +898,7 @@ def ensure_generated_gsn_cache(
             julia_arguments,
             receipt_script,
             receipt_source_root,
-            source_contract_id,
+            gsn_cache_id,
         ) = _receipt_julia_invocation(runtime, package_data)
         if producer_script is None:
             script = receipt_script
@@ -915,8 +915,8 @@ def ensure_generated_gsn_cache(
     )
 
     directory = runtime / "generated" / "gsn"
-    if source_contract_id is not None:
-        directory /= source_contract_id
+    if gsn_cache_id is not None:
+        directory /= gsn_cache_id
     directory.mkdir(parents=True, exist_ok=True)
     index_path = directory / "gsn-index.json"
     resolved: list[tuple[str, GsnParameterPair, Mapping[str, object]]] = []

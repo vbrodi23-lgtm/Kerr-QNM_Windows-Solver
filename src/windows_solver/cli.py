@@ -54,12 +54,14 @@ from .response_batches import (
     STAGE_SIGNED_ERROR_FAMILIES,
     build_campaign_plan,
     build_campaign_selection,
+    import_campaign_checkpoint_to_solved_leaf_store,
     merge_campaign_checkpoints,
     resolve_campaign_relative_path,
     run_campaign_selection,
     run_predeclared_campaign_smoke,
     validate_campaign_checkpoint,
 )
+from .solved_leaf_cache import SolvedLeafStore
 from .response_engine import VettedNativeDeterminantKernel, NativeResourceUnavailableError
 from .response_reduction import (
     ComputedUnresolvedComponentEvidence,
@@ -222,6 +224,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     campaign_merge.add_argument("manifest", type=Path)
     campaign_merge.add_argument("--output", type=Path, required=True)
+    campaign_import = commands.add_parser(
+        "campaign-cache-import",
+        help="import terminal authenticated leaves from a campaign checkpoint",
+    )
+    campaign_import.add_argument("selection", type=Path)
+    campaign_import.add_argument("--checkpoint", type=Path, required=True)
+    campaign_import.add_argument("--store", type=Path)
     campaign_reduce = commands.add_parser(
         "campaign-reduce",
         help="reduce authenticated campaign checkpoints without backend work",
@@ -733,8 +742,25 @@ def _campaign_selected(command: str, selection_path: Path, checkpoint: Path, *, 
             backend,
             checkpoint,
             resume=command == "campaign-resume",
+            solved_leaf_store=SolvedLeafStore.default(),
         )
     return 0, _campaign_console_mapping(command, summary)
+
+
+def _campaign_cache_import(
+    selection_path: Path,
+    checkpoint: Path,
+    store_path: Path | None,
+) -> tuple[int, object]:
+    plan, _, _ = _campaign_plan_and_selection(selection_path)
+    resolved_checkpoint = resolve_campaign_relative_path(
+        Path.cwd(), str(checkpoint)
+    )
+    store = SolvedLeafStore.default() if store_path is None else SolvedLeafStore(store_path)
+    summary = import_campaign_checkpoint_to_solved_leaf_store(
+        plan, resolved_checkpoint, store
+    )
+    return 0, {"command": "campaign-cache-import", **summary.to_mapping()}
 
 
 def _campaign_console_mapping(
@@ -1041,6 +1067,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                     reporter.close()
         elif arguments.command == "campaign-merge":
             status, output = _campaign_merge(arguments.manifest, arguments.output)
+        elif arguments.command == "campaign-cache-import":
+            status, output = _campaign_cache_import(
+                arguments.selection, arguments.checkpoint, arguments.store
+            )
         elif arguments.command == "campaign-reduce":
             status, output = _campaign_reduce(arguments.bundle, arguments.output)
         elif arguments.command == "campaign-smoke":

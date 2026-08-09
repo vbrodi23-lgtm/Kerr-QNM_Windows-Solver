@@ -231,11 +231,93 @@ class PublicSurfaceTests(unittest.TestCase):
         self.assertIn("windowsapps-juliaup-shim", discovery)
         self.assertIn("julia-runtime-discovery.ps1", bootstrap)
         self.assertIn('"juliaup"', bootstrap)
-        self.assertIn(r'Join-Path $RuntimeRoot "scientific-sources\$M02ContractId"', bootstrap)
-        self.assertIn(r'Join-Path $RuntimeRoot "m02-environments\$M02ContractId"', bootstrap)
-        self.assertIn(r'Join-Path $RuntimeRoot "julia-depot\$M02ContractId"', bootstrap)
-        self.assertIn("Test-PersistentScientificSources", bootstrap)
+        self.assertIn(r'Join-Path $RuntimeRoot "scientific-sources\$M02DependencyId"', bootstrap)
+        self.assertIn(r'Join-Path $RuntimeRoot "m02-environments\$M02DependencyId"', bootstrap)
+        self.assertIn(r'Join-Path $RuntimeRoot "julia-depot\$M02DependencyId"', bootstrap)
+        self.assertIn("Test-PersistentDependencySources", bootstrap)
         self.assertIn("julia_runtime", bootstrap)
+
+    def test_m02_dependency_environment_identity_excludes_worker_telemetry(
+        self,
+    ) -> None:
+        """Worker-only edits must not select a new Julia project or depot.
+
+        Removing the dependency-only IDs, or using the worker/aggregate ID in
+        either environment path, must make this regression fail.
+        """
+
+        root = Path(__file__).resolve().parents[1]
+        bootstrap = (root / "runtime" / "bootstrap.ps1").read_text(
+            encoding="utf-8"
+        )
+        policy = json.loads(
+            (root / "runtime" / "runtime_policy.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        lifecycles = {
+            source["id"]: source.get("lifecycle")
+            for source in policy["scientific_sources"]
+        }
+
+        self.assertEqual(lifecycles["m02-julia-worker"], "worker")
+        self.assertEqual(lifecycles["m02-julia-project"], "dependency")
+        self.assertEqual(
+            lifecycles["m02-julia-manifest-seed"], "dependency"
+        )
+        self.assertEqual(lifecycles["gsn-cache-producer"], "gsn-cache")
+        self.assertIn('$M02DependencyId = "m02-deps-"', bootstrap)
+        self.assertIn('$M02WorkerId = "m02-worker-"', bootstrap)
+        self.assertIn('$M02GsnCacheId = "m02-gsn-"', bootstrap)
+        self.assertIn(
+            r'Join-Path $RuntimeRoot "m02-environments\$M02DependencyId"',
+            bootstrap,
+        )
+        self.assertIn(
+            r'Join-Path $RuntimeRoot "julia-depot\$M02DependencyId"',
+            bootstrap,
+        )
+        self.assertIn(
+            r'Join-Path $RuntimeRoot "m02-workers\$M02WorkerId"',
+            bootstrap,
+        )
+        self.assertIn(
+            r'Join-Path $RuntimeRoot "gsn-producers\$M02GsnCacheId"',
+            bootstrap,
+        )
+        self.assertNotIn(
+            r'Join-Path $RuntimeRoot "m02-environments\$M02ContractId"',
+            bootstrap,
+        )
+        self.assertNotIn(
+            r'Join-Path $RuntimeRoot "julia-depot\$M02ContractId"',
+            bootstrap,
+        )
+        self.assertIn(
+            "M02 worker source changed; refreshing worker only", bootstrap
+        )
+        self.assertIn("M02 dependency environment reused", bootstrap)
+        self.assertIn(
+            "M02 dependency Manifest changed; rebuilding Julia environment",
+            bootstrap,
+        )
+        warm_path = bootstrap[
+            bootstrap.index("    if ($M02Ready) {") : bootstrap.index(
+                "\n    else {", bootstrap.index("    if ($M02Ready) {")
+            )
+        ]
+        self.assertIn(
+            "M02 worker probe failed; retaining the authenticated dependency environment",
+            warm_path,
+        )
+        self.assertIn("            throw", warm_path)
+        self.assertNotIn("Remove-ManagedDirectory", warm_path)
+        self.assertNotIn("Pkg.precompile", warm_path)
+        self.assertIn("Get-CompatibleLegacyM02Environment", bootstrap)
+        self.assertIn(
+            "M02 dependency environment reused from authenticated legacy aggregate contract",
+            bootstrap,
+        )
 
     def test_m02_bootstrap_extracts_julia_with_windows_tar(self) -> None:
         root = Path(__file__).resolve().parents[1]

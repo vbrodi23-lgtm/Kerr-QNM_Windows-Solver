@@ -26,26 +26,32 @@
   "scientific_sources": [
     {
       "id": "gsn-kerr",
+      "lifecycle": "gsn-cache",
       "path": "src/windows_solver/data/julia/GeneralizedSasakiNakamura.jl/src/Homogeneous/Kerr.jl"
     },
     {
       "id": "gsn-potentials",
+      "lifecycle": "gsn-cache",
       "path": "src/windows_solver/data/julia/GeneralizedSasakiNakamura.jl/src/Homogeneous/Potentials.jl"
     },
     {
       "id": "m02-julia-worker",
+      "lifecycle": "worker",
       "path": "src/windows_solver/data/julia/m02_worker.jl"
     },
     {
       "id": "gsn-cache-producer",
+      "lifecycle": "gsn-cache",
       "path": "src/windows_solver/data/julia/generate_gsn_cache.jl"
     },
     {
       "id": "m02-julia-project",
+      "lifecycle": "dependency",
       "path": "src/windows_solver/data/julia/m02_project/Project.toml"
     },
     {
       "id": "m02-julia-manifest-seed",
+      "lifecycle": "dependency",
       "path": "src/windows_solver/data/julia/m02_project/Manifest.seed.toml"
     }
   ],

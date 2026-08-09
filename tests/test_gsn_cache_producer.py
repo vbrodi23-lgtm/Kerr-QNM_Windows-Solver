@@ -152,6 +152,7 @@ class GsnCacheProducerTests(unittest.TestCase):
                     "gsn_producer": str(fixture.script),
                     "gsn_source_root": str(fixture.source_root),
                     "contract_id": "m02-" + "a" * 24,
+                    "gsn_cache_id": "m02-gsn-" + "b" * 24,
                 }
             }
             (fixture.runtime_root / "python-runtime.json").write_text(
@@ -175,7 +176,7 @@ class GsnCacheProducerTests(unittest.TestCase):
         )
         self.assertIn(str(fixture.script), commands[0])
         self.assertIn(str(fixture.source_root), commands[0])
-        self.assertEqual(generated.path.parent.name, "m02-" + "a" * 24)
+        self.assertEqual(generated.path.parent.name, "m02-gsn-" + "b" * 24)
 
     def test_selected_leaf_retains_exact_resolved_spin_and_origin_coordinate(self) -> None:
         plan = _campaign_plan()
