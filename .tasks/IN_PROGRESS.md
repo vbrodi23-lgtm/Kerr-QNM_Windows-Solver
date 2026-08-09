@@ -6,19 +6,21 @@
 
 ### Objective
 
-Make every M02 numerical prerequisite reproducible from a fresh checkout and pinned public inputs, with no preinstalled scientific runtime, hidden cache, or manual dependency discovery.
+Make every M02 numerical prerequisite executable from a fresh checkout and declared repository inputs, with no preinstalled scientific runtime, hidden cache, external precision plugin, or manual dependency discovery.
 
 ### Acceptance Criteria
 
-- [ ] Put the existing package-local CPython tier and a package-local Julia tier behind one solver-owned runtime policy that pins OS/architecture, exact tool and interpreter versions, download URLs, cryptographic digests, environment paths, and supported cold/warm behavior; require neither administrator rights nor system Python/Julia.
-- [ ] Pin exact source commits for `GeneralizedSasakiNakamura.jl` and its Julia `SpinWeightedSpheroidalHarmonics.jl` dependency, including licences, `Project.toml`, `Manifest.toml`, source digests, and a deterministic acquisition or vendoring procedure.
-- [ ] Implement a solver-owned generation stage and adapter that derive the required infinity-series, radial, and angular quantities from those pinned sources in binary64 and `BigFloat` 80/120-digit modes; generated artifacts must be reproducible outputs, never undeclared inputs.
-- [ ] Make runtime downloads, source trees, Julia depots, package environments, and generated scientific artifacts content-addressed and self-validating: a cold start obtains or generates them, a warm start reuses only verified identities, and corruption or policy drift forces rejection or regeneration.
-- [ ] Start a structured provenance ledger before provisioning and record every download URL, checksum/signature decision, command, executable/version, source commit, project identity, numerical policy, generated artifact, and SHA-256 result needed to reconstruct a run.
-- [ ] Seal the same runtime, source, environment, numerical-policy, and generated-artifact identities into every campaign checkpoint; reject branch-head drift, unpinned packages, incompatible cached artifacts, and cross-run identity substitution.
+- [ ] Put the existing package-local CPython tier and a package-local Julia 1.10.11 tier behind one solver-owned runtime policy; require neither administrator rights nor system Python/Julia.
+- [ ] Vendor the GSN and spheroidal source packages, licences, Julia project, and seed manifest at stable repository-relative paths; validate required paths and package loading before execution.
+- [ ] Implement solver-owned F/U generation plus binary64 and `BigFloat` 80/120-digit adapters; generated scientific artifacts must be declared outputs, never historic external inputs.
+- [ ] Index one resolved `(a,m)` record per short artifact ID using spin weight, exact rational spin where available, the exact integer-ratio representation of a κ-derived campaign binary64 spin, normalization, equation convention, and producer/consumer contract versions; retain originating exact `M−κ` coordinates as metadata.
+- [ ] Validate every reused coefficient artifact and producer status structurally; regenerate missing or invalid pairs independently under the same indexed ID, serialize concurrent allocation, write the index atomically, and preserve one previous index.
+- [ ] Record runtime, source, manifest, worker, and generated-artifact SHA-256 values as observations without making evolving scientific bytes a development execution gate.
+- [ ] Preserve existing campaign checkpoint/resume, signed reduction, full validation, and admission behavior across binary64, 80-digit, and 120-digit stages.
 - [ ] Keep the Black Hole Perturbation Toolkit Mathematica spheroidal repository as an independently pinned validation source, not a runtime dependency or competing production owner.
 - [ ] Remove every operational requirement to search old Downloads folders or possess a historic private cache; preserve an old cache only as a non-authoritative comparator fixture when its exact receipt is available.
-- [ ] Pass focused adapter, precision, provenance, tamper, licence, package-local bootstrap, cold/warm cache, and non-scientific preflight tests on supported CI platforms.
+- [ ] Expose one PowerShell command that bootstraps, runs or resumes all 553 leaves, and performs full checkpoint validation; include a clean runtime rebuild option.
+- [ ] Pass focused adapter, precision, tamper, licence, package-local bootstrap, pair reuse, PowerShell parser, package-build, and non-scientific preflight tests on supported CI platforms.
 
 ### Dependencies
 
@@ -27,7 +29,7 @@ Make every M02 numerical prerequisite reproducible from a fresh checkout and pin
 
 ### Evidence Output
 
-Pinned runtime/source policy, reproducible Julia environment, solver-owned generation/adapter boundary, cold/warm content-addressed caches, complete provisioning ledger, and binary64/BigFloat validation fixtures.
+Declared runtime/source policy, package-local Julia environment, solver-owned generation/adapter boundary, pair-level GSN index, complete runtime observations, binary64/BigFloat validation fixtures, and a full PowerShell campaign launcher.
 
 ### Verification
 
@@ -37,12 +39,13 @@ Pinned runtime/source policy, reproducible Julia environment, solver-owned gener
 
 ### Review Focus
 
-Confirm that a fresh checkout can originate every M02 numerical prerequisite from declared public inputs, all reusable state is identity-checked, the Julia angular authority is singular, Mathematica remains validation-only, and no historic cache is silently trusted.
+Confirm that a fresh checkout can originate every M02 numerical prerequisite from declared repository inputs, all reusable pair records are structurally and mathematically identity-checked, Julia remains the promoted-precision authority, Mathematica remains validation-only, and no historic cache is silently trusted.
 
 ### Plan
 
 - Replace the fixed-cache `campaign-run` boundary with the package-local Julia F/U cache producer.
-- Generate and authenticate the exact `(χ = 19/20, m = 2)` GSN coefficient record needed by the first physical leaf, then bind it to the existing `StandardSN` consumer.
-- Expand from binary64 to 80/120-digit stages only after the first Windows leaf returns execution evidence.
+- Index and validate one exact pair record at a time, then assemble the records selected by the campaign for the existing `StandardSN` consumer.
+- Route package-owned Julia 80/120-digit root readouts through the existing campaign stage and evidence contracts.
+- Launch all 553 leaves from `m02.ps1`; the user supplies the physical Windows execution evidence and failure logs.
 
 ---
