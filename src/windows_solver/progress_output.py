@@ -148,7 +148,7 @@ class CampaignProgressReporter:
         ] = {}
         self._last_status_seconds: float | None = None
         self._last_dashboard_seconds: float | None = None
-        self._dashboard_open = False
+        self._dashboard_rendered_rows = 0
         self._terminal_dashboard = self._stream_is_terminal()
         if self._terminal_dashboard:
             self._terminal_dashboard = self._enable_virtual_terminal()
@@ -404,16 +404,43 @@ class CampaignProgressReporter:
         return False
 
     def _dashboard(self, record: Mapping[str, object]) -> None:
-        if self._dashboard_open:
-            self.stream.write("\x1b8")
-        else:
-            self.stream.write("\x1b7")
-            self._dashboard_open = True
-        # Erase only the dashboard region below the saved cursor.  Do not use
-        # Clear-Host or ESC[2J: bootstrap and command history must remain visible.
+        lines = self._bounded_dashboard_lines(record)
+        if self._dashboard_rendered_rows:
+            # Redraw relative to the current cursor.  A saved screen position is
+            # not stable once a first render scrolls a short console.
+            self.stream.write(f"\x1b[{self._dashboard_rendered_rows}F")
+        # Erase only the dashboard region below the current cursor.  Do not use
+        # Clear-Host or ESC[2J: bootstrap and command history must remain in
+        # scrollback.
         self.stream.write("\x1b[0J")
-        self.stream.write("\n".join(self._dashboard_lines(record)) + "\n")
+        self.stream.write("\n".join(lines) + "\n")
         self.stream.flush()
+        self._dashboard_rendered_rows = len(lines)
+
+    def _bounded_dashboard_lines(self, record: Mapping[str, object]) -> list[str]:
+        columns, terminal_rows = self._terminal_dimensions()
+        maximum_rows = max(1, terminal_rows - 1)
+        lines = self._dashboard_lines(record)
+        if len(lines) > maximum_rows:
+            lines = self._compact_dashboard_lines(record)
+        return [self._fit_dashboard_line(line, columns) for line in lines[:maximum_rows]]
+
+    def _terminal_dimensions(self) -> tuple[int, int]:
+        try:
+            size = os.get_terminal_size(self.stream.fileno())
+        except (AttributeError, OSError, ValueError):
+            # Preserve the full Format-List view for terminal-like streams that
+            # do not expose a file descriptor (including test and embedded hosts).
+            return 120, 50
+        return max(1, size.columns), max(2, size.lines)
+
+    @staticmethod
+    def _fit_dashboard_line(line: str, columns: int) -> str:
+        if len(line) <= columns:
+            return line
+        if columns == 1:
+            return "…"
+        return line[: columns - 1] + "…"
 
     def _update_dashboard_state(self, record: Mapping[str, object]) -> None:
         context = record["context"]
@@ -529,12 +556,14 @@ class CampaignProgressReporter:
         ):
             outcomes.discard(leaf_id)
 
-    def _dashboard_lines(self, record: Mapping[str, object]) -> list[str]:
+    def _dashboard_fields(
+        self, record: Mapping[str, object]
+    ) -> tuple[tuple[str, object], ...]:
         context = self._dashboard_state
         leaf = "-"
         if context.get("leaf_index") is not None and context.get("leaf_count") is not None:
             leaf = f"{context['leaf_index']}/{context['leaf_count']}"
-        fields = (
+        return (
             ("Sequence", record["sequence"]),
             ("Event", record["kind"]),
             ("Elapsed_s", round(float(record["elapsed_seconds"]), 1)),
@@ -574,8 +603,36 @@ class CampaignProgressReporter:
             ("ETA", self._duration_value(record.get("eta_seconds"))),
             ("Finish", self._finish_value(record.get("estimated_finish"))),
         )
+
+    def _dashboard_lines(self, record: Mapping[str, object]) -> list[str]:
         return [
-            f"{label:<15}: {self._dashboard_value(value)}" for label, value in fields
+            f"{label:<15}: {self._dashboard_value(value)}"
+            for label, value in self._dashboard_fields(record)
+        ]
+
+    def _compact_dashboard_lines(self, record: Mapping[str, object]) -> list[str]:
+        fields = dict(self._dashboard_fields(record))
+
+        def line(*labels: str) -> str:
+            return " | ".join(
+                f"{label}: {self._dashboard_value(fields.get(label))}"
+                for label in labels
+            )
+
+        return [
+            "M02 CAMPAIGN | " + line("Sequence", "Event", "Elapsed_s"),
+            line("Leaf", "LeafStatus", "LeafId"),
+            line("Role", "Mode", "Spin"),
+            line("Mechanism", "Precision", "Phase", "Newton"),
+            line("RootStatus", "PrecisionStatus", "Checkpoint"),
+            line("Completed", "Accepted", "Rejected"),
+            line("Indeterminate", "Failed", "LastAccepted"),
+            line("CurrentOmega"),
+            line("DeterminantAbs", "BestDetAbs", "Threshold"),
+            line("DetLeaf", "DetPhase", "DetNewton"),
+            line("Suboperation"),
+            line("TimingSample", "AvgLeaf", "MedianLeaf"),
+            line("ETA", "Finish"),
         ]
 
     def _completed_value(self, leaf_count: object) -> str:
