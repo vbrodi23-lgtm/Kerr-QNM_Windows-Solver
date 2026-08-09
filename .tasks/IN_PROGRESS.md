@@ -50,5 +50,7 @@ Confirm that a fresh checkout can originate every M02 numerical prerequisite fro
 - Add out-of-band quiet/normal/trace inner-leaf progress while preserving scientific execution and checkpoint/evidence bytes.
 - Bind `m02.ps1` bootstrap switches as actual PowerShell parameters, and prove the boundary with a mocked Windows bootstrap invocation.
 - Move the normal Windows runtime to a versioned per-user LocalAppData root; retain an explicit package-local portable mode, validate runtime receipts before reuse, and leave checkout-local campaign state untouched.
+- Add Windows PowerShell 5.1 parse-and-safe-execution coverage for the actual bootstrap, including PowerShell interpolation, path-character, and Juliaup WindowsApps-shim discovery regressions.
+- Rebind every persistent M02 Manifest's legacy `vendor` entries to immutable contract-scoped scientific-source paths before `Pkg` reads it; reject checkout and environment-local paths, then prove clean-runtime/new-checkout reuse with an opt-in Windows integration test.
 
 ---
