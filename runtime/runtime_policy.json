@@ -15,6 +15,26 @@
     "bits": 64,
     "rationale": "Matches the python field recorded in kerr_qnm_lattice_receipt.json and kerr_qnm_m02_overlay_receipt.json."
   },
+  "julia": {
+    "version": "1.10.11",
+    "archive": "julia-1.10.11-win64.zip",
+    "url": "https://julialang-s3.julialang.org/bin/winnt/x64/1.10/julia-1.10.11-win64.zip",
+    "sha256": "11ba52fd1384f82d09ea232eb1552b6694bb2083e6adfe3ae2f9e1e663ed8cf8",
+    "executable_relative_path": "julia/bin/julia.exe",
+    "required_by": "M02 package-owned GSN F/U infinity-series cache production"
+  },
+  "scientific_sources": [
+    {
+      "id": "gsn-kerr",
+      "path": "src/windows_solver/data/julia/GeneralizedSasakiNakamura.jl/src/Homogeneous/Kerr.jl",
+      "sha256": "1c333604190ba6a9554dcbcacf1ae308ac57bc036dbd8be074fe16e73f1a6635"
+    },
+    {
+      "id": "gsn-potentials",
+      "path": "src/windows_solver/data/julia/GeneralizedSasakiNakamura.jl/src/Homogeneous/Potentials.jl",
+      "sha256": "4339ed8a7861c534bd8d81f108cacf7fd75f19954352daa636afe30b47e50089"
+    }
+  ],
   "numerical_kernel": {
     "required_by": "native response kernel (numpy) and the packaged test suite (numpy, scipy)",
     "not_required_by": "plan, run, verify, inspect, export, campaign-plan, campaign-merge, campaign-smoke",
