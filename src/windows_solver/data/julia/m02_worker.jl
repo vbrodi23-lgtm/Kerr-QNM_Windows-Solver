@@ -118,6 +118,13 @@ function flatten_request(document)
         predictor = required(document, "primary_predictor")
         flattened["primary_predictor_re"] = required(predictor, "real")
         flattened["primary_predictor_im"] = required(predictor, "imaginary")
+        flattened["primary_predictor_kind"] = if haskey(
+            document, "primary_predictor_kind"
+        )
+            required(document, "primary_predictor_kind")
+        else
+            "EPSILON_CONTINUATION"
+        end
     end
     return flattened
 end
@@ -676,7 +683,14 @@ function result_fields(::Type{T}, request, digits::Int, bits::Int) where {T<:Abs
     primary_fallback_used = false
     primary_fallback_reason = nothing
     if haskey(request, "primary_predictor_re") && haskey(request, "primary_predictor_im")
-        primary_requested_seed_kind = "EPSILON_CONTINUATION"
+        primary_requested_seed_kind = string(
+            required(request, "primary_predictor_kind")
+        )
+        if !(primary_requested_seed_kind in (
+            "EPSILON_CONTINUATION", "SPIN_CONTINUATION"
+        ))
+            error("primary predictor kind is invalid")
+        end
         predictor = parse_complex(
             T, request, "primary_predictor_re", "primary_predictor_im"
         )
@@ -684,7 +698,7 @@ function result_fields(::Type{T}, request, digits::Int, bits::Int) where {T<:Abs
            abs(predictor - omega) <= T("0.005")
             primary_initial = predictor
             fallback_initial = omega
-            primary_seed_kind = "EPSILON_CONTINUATION"
+            primary_seed_kind = primary_requested_seed_kind
         else
             primary_seed_kind = "FALLBACK_BACKGROUND"
             primary_fallback_used = true
