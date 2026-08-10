@@ -29,8 +29,10 @@ Role order prioritizes hypothesis-bearing rows before controls:
 2. deep
 3. control
 
-Within each role the schedule is mechanism, then mode, then ascending exact
-coordinate.
+Within each role the schedule is mechanism, then mode, then ascending physical
+spin. Direct coordinates therefore run `.95 → .99 → .999 → .9999`. The deep
+Mκ coordinates run `.01 → .002 → .001`, because decreasing Mκ is increasing
+Kerr spin toward extremality.
 
 Primary mechanism order:
 
@@ -78,7 +80,7 @@ chain. A reused authenticated record may advance it. `UNRESOLVED`, rejected,
 missing, or non-finite evidence clears that chain so momentum never jumps an
 unresolved coordinate.
 
-For the next coordinate in the same chain, response coefficient `r_prev`
+For the next higher-spin coordinate in the same chain, response coefficient `r_prev`
 predicts only the PRIMARY displacement:
 
 `ω_seed = ω₀,new + amplitude × r_prev`
@@ -103,4 +105,3 @@ SEED-PATH, no dual determinant preflight, and unchanged historical
 scientific-computation identity.
 
 No Kerr, Julia, determinant, or campaign workload is executed in development.
-
