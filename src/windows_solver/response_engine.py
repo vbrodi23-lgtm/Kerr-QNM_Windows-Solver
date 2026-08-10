@@ -708,7 +708,9 @@ def root_readout_preserves_authenticated_branch(
     native production kernel preserves that identity when the polished root
     and each diagnostic root remain inside the existing branch-continuation
     radius.  Numerical convergence is a separate status and is deliberately
-    not required by this authentication predicate.
+    not required by this authentication predicate.  The Newton-correction
+    bound below is an additional persistence-quality gate; it does not rewrite
+    the kernel's geometric branch identity.
     """
 
     expected_source = _validated_source_root_mapping(source_root_mapping)
