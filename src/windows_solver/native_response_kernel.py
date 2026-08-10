@@ -29,6 +29,7 @@ from .response_engine import (
     HorizonPerturbation,
     NumericalPolicy,
     ResponseComponentJob,
+    ROOT_BRANCH_CONTINUATION_TOLERANCE_ABS,
     RootReadout,
 )
 from .progress import ProgressEventKind, emit_progress, progress_scope
@@ -48,7 +49,6 @@ _SOURCE_BLOBS = (
 )
 _DERIVATIVE_STEP = 1.0e-5
 _ROOT_TOLERANCE = 2.0e-11
-_BRANCH_CONTINUATION_TOLERANCE_ABS = 5.0e-3
 # Stable across source checkouts and wheels; source_commit/source_blobs below
 # retain the authenticated upstream code identity.
 _ADAPTED_SOURCE_CONTRACT_ID = "native-gsn-adapter-contract-1"
@@ -618,7 +618,17 @@ class VettedNativeDeterminantKernel:
         perturbation: HorizonPerturbation | ExteriorPerturbation,
         policy: NumericalPolicy,
         primary_predictor: complex | None = None,
+        primary_predictor_kind: str | None = None,
     ) -> RootReadout:
+        if primary_predictor_kind not in {
+            None,
+            "EPSILON_CONTINUATION",
+            "SPIN_CONTINUATION",
+        }:
+            raise ValueError("primary predictor kind is invalid")
+        requested_predictor_kind = (
+            primary_predictor_kind or "EPSILON_CONTINUATION"
+        )
         def solve_phase(
             name,
             sn,
@@ -697,7 +707,7 @@ class VettedNativeDeterminantKernel:
                     if fallback_guess is not None and (
                         not result[3]
                         or abs(result[0] - fallback_guess)
-                        > _BRANCH_CONTINUATION_TOLERANCE_ABS
+                        > ROOT_BRANCH_CONTINUATION_TOLERANCE_ABS
                     ):
                         fallback_reason = (
                             "PREDICTOR_NEWTON_FAILED"
@@ -744,10 +754,10 @@ class VettedNativeDeterminantKernel:
                 math.isfinite(candidate.real)
                 and math.isfinite(candidate.imag)
                 and abs(candidate - background_omega)
-                <= _BRANCH_CONTINUATION_TOLERANCE_ABS
+                <= ROOT_BRANCH_CONTINUATION_TOLERANCE_ABS
             ):
                 predictor = candidate
-                primary_seed_kind = "EPSILON_CONTINUATION"
+                primary_seed_kind = requested_predictor_kind
             else:
                 primary_seed_kind = "FALLBACK_BACKGROUND"
                 primary_fallback_used = True
@@ -766,7 +776,7 @@ class VettedNativeDeterminantKernel:
             background_omega if predictor is None else predictor,
             seed_kind=primary_seed_kind,
             requested_seed_kind=(
-                "EPSILON_CONTINUATION"
+                requested_predictor_kind
                 if primary_predictor is not None
                 else "AUTHENTICATED_BACKGROUND"
             ),
@@ -813,9 +823,10 @@ class VettedNativeDeterminantKernel:
         diagnostic_roots = (truncation_root, resolution_root, seed_path_root)
         branch_continuation_valid = (
             abs(root - background_omega)
-            <= _BRANCH_CONTINUATION_TOLERANCE_ABS
+            <= ROOT_BRANCH_CONTINUATION_TOLERANCE_ABS
             and all(
-                abs(candidate - root) <= _BRANCH_CONTINUATION_TOLERANCE_ABS
+                abs(candidate - root)
+                <= ROOT_BRANCH_CONTINUATION_TOLERANCE_ABS
                 for candidate in diagnostic_roots
             )
         )
@@ -843,6 +854,25 @@ class VettedNativeDeterminantKernel:
             truncation_radius=abs(truncation_root - root),
             resolution_radius=abs(resolution_root - root),
             seed_path_radius=abs(seed_path_root - root),
+        )
+
+    def evaluate_root_with_predictor_kind(
+        self,
+        *,
+        job: ResponseComponentJob,
+        background_root: object,
+        perturbation: HorizonPerturbation | ExteriorPerturbation,
+        policy: NumericalPolicy,
+        primary_predictor: complex,
+        primary_predictor_kind: str,
+    ) -> RootReadout:
+        return self.evaluate_root(
+            job=job,
+            background_root=background_root,
+            perturbation=perturbation,
+            policy=policy,
+            primary_predictor=primary_predictor,
+            primary_predictor_kind=primary_predictor_kind,
         )
 
     def horizon_partials(
