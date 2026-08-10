@@ -13,10 +13,14 @@ from statistics import fmean, median
 import sys
 import tempfile
 import time
-from typing import TextIO
+from typing import TYPE_CHECKING, TextIO
 from uuid import uuid4
 
+from .campaign_reports import CampaignReportModel, refresh_campaign_reports
 from .progress import PROGRESS_SCHEMA, ProgressEvent, ProgressEventKind, ProgressMode
+
+if TYPE_CHECKING:
+    from .response_batches import CampaignPlan
 
 
 _QUIET_KINDS = frozenset(
@@ -181,12 +185,27 @@ class CampaignProgressReporter:
         if self._terminal_dashboard:
             self._terminal_dashboard = self._enable_virtual_terminal()
         self._dashboard_state: dict[str, object] = {}
+        self._campaign_report_plan: CampaignPlan | None = None
+        self._campaign_report_model: CampaignReportModel | None = None
+        self._report_run_provenance: dict[str, str] = {}
         self.diagnostics: list[str] = []
+
+    def bind_campaign_reports(self, plan: CampaignPlan) -> None:
+        """Enable derived reports without placing them in campaign execution."""
+
+        self._campaign_report_plan = plan
+        if self.checkpoint.is_file():
+            self._refresh_campaign_reports()
 
     def publish(self, event: ProgressEvent) -> None:
         """Add renderer metadata and safely render one event."""
 
         try:
+            if (
+                event.kind is ProgressEventKind.LEAF_STARTED
+                and event.context.leaf_id is not None
+            ):
+                self._report_run_provenance[event.context.leaf_id] = "EXECUTED"
             record = self._record(event)
             self._update_dashboard_state(record)
             if self._should_write_status(event):
@@ -196,7 +215,25 @@ class CampaignProgressReporter:
                 self._append_root_solve(record)
             if self.mode is ProgressMode.TRACE:
                 self._append_trace(record)
+            if event.kind in {
+                ProgressEventKind.CHECKPOINT_WRITTEN,
+                ProgressEventKind.CAMPAIGN_COMPLETED,
+            }:
+                self._refresh_campaign_reports()
         except Exception as error:  # Progress must never change solver outcome.
+            self._report_failure(error)
+
+    def _refresh_campaign_reports(self) -> None:
+        plan = self._campaign_report_plan
+        if plan is None or not self.checkpoint.is_file():
+            return
+        try:
+            self._campaign_report_model = refresh_campaign_reports(
+                plan,
+                self.checkpoint,
+                run_provenance=self._report_run_provenance,
+            )
+        except Exception as error:
             self._report_failure(error)
 
     def _record(self, event: ProgressEvent) -> dict[str, object]:
