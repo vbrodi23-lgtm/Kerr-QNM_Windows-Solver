@@ -14,6 +14,7 @@ from unittest.mock import patch
 from windows_solver.contracts import canonical_json_bytes, canonical_text_sha256
 from windows_solver.linear_response import B_PRIME_RELEASE_DOMAIN
 from windows_solver.response_batches import (
+    CAMPAIGN_CHECKPOINT_SCHEMA_VERSION,
     CAMPAIGN_SCHEMA_VERSION,
     CampaignStageRecord,
     PrecisionCapabilities,
@@ -394,7 +395,8 @@ class CampaignPlanTests(unittest.TestCase):
             "available_precision_digits": [64],
         })
 
-        self.assertEqual(CAMPAIGN_SCHEMA_VERSION, 3)
+        self.assertEqual(CAMPAIGN_SCHEMA_VERSION, 2)
+        self.assertEqual(CAMPAIGN_CHECKPOINT_SCHEMA_VERSION, 3)
         self.assertEqual(record.to_mapping()["signed_error_channels"], list(channels))
         forged = record.to_mapping()
         injected = dict(forged["signed_error_channels"][0])
