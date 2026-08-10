@@ -694,6 +694,43 @@ class RootReadout:
         )
 
 
+def root_readout_preserves_authenticated_branch(
+    readout: RootReadout,
+    authenticated_root: BoundSpectralRoot,
+    *,
+    equation_id: str,
+    source_root_mapping: Mapping[str, object] | None,
+) -> bool:
+    """Replay the production root-readout branch contract for persisted evidence.
+
+    The authenticated catalog root establishes identity and branch provenance;
+    ``readout.omega`` is the numerical root returned after polishing.  The
+    native production kernel accepts that readout only when the polished root
+    and each diagnostic root remain inside the existing branch-continuation
+    radius.  Persisted records must carry the same identity bindings and the
+    same numerical evidence.
+    """
+
+    expected_source = _validated_source_root_mapping(source_root_mapping)
+    return (
+        readout.converged
+        and readout.root_reference_id == authenticated_root.root_reference_id
+        and readout.branch_id == authenticated_root.branch_id
+        and readout.equation_id == equation_id
+        and readout.source_root_mapping == expected_source
+        and abs(readout.omega - authenticated_root.omega)
+        <= ROOT_BRANCH_CONTINUATION_TOLERANCE_ABS
+        and readout.newton_correction_estimate
+        <= ROOT_BRANCH_CONTINUATION_TOLERANCE_ABS
+        and readout.truncation_radius
+        <= ROOT_BRANCH_CONTINUATION_TOLERANCE_ABS
+        and readout.resolution_radius
+        <= ROOT_BRANCH_CONTINUATION_TOLERANCE_ABS
+        and readout.seed_path_radius
+        <= ROOT_BRANCH_CONTINUATION_TOLERANCE_ABS
+    )
+
+
 class NativeDeterminantKernel(Protocol):
     def evaluate_root(
         self,
