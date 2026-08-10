@@ -1010,7 +1010,14 @@ class CampaignPlanTests(unittest.TestCase):
                 return subprocess.run(
                     [sys.executable, "-m", "windows_solver", *arguments],
                     cwd=directory,
-                    env={"PYTHONPATH": str(Path(__file__).resolve().parents[1] / "src")},
+                    env={
+                        "PYTHONPATH": str(
+                            Path(__file__).resolve().parents[1] / "src"
+                        ),
+                        "KERR_QNM_SOLVED_LEAF_STORE": str(
+                            directory / "solved-leaves"
+                        ),
+                    },
                     text=True,
                     capture_output=True,
                 )
