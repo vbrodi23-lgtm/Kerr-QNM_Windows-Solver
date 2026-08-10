@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import replace
 import json
 from fractions import Fraction
+import os
 from pathlib import Path
 import shutil
 import tempfile
@@ -163,6 +164,110 @@ class SolvedLeafCacheTests(unittest.TestCase):
             self.assertEqual(second.executed_stage_count, 0)
             self.assertEqual(second.reused_stage_count, 1)
 
+    def test_resume_backfills_terminal_checkpoint_records_to_default_windows_store(self):
+        """Catches checkpoint reuse that skips persistent solved-leaf publication."""
+
+        plan = _plan()
+        selection = _primary(plan, 3)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkpoint = (
+                root
+                / "Downloads"
+                / "extracted-copy"
+                / "m02-output"
+                / "m02-campaign-checkpoint.json"
+            )
+            local_app_data = root / "LocalAppData"
+            with patch.dict(
+                os.environ,
+                {"LOCALAPPDATA": str(local_app_data)},
+                clear=True,
+            ), patch(
+                "windows_solver.response_batches._validate_record_semantics",
+                return_value=True,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "interruption"):
+                    run_campaign_selection(
+                        plan,
+                        selection,
+                        _Backend(plan, fail_after=2),
+                        checkpoint,
+                        resume=False,
+                    )
+
+                store = SolvedLeafStore.default()
+                resumed = run_campaign_selection(
+                    plan,
+                    selection,
+                    _Backend(plan),
+                    checkpoint,
+                    resume=True,
+                    solved_leaf_store=store,
+                )
+
+            self.assertEqual(
+                store.root,
+                local_app_data
+                / "Kerr-QNM_Windows-Solver"
+                / "solved-leaves-v1",
+            )
+            self.assertEqual(resumed.result_count, 3)
+            self.assertEqual(store.stored_count, 3)
+            stored_leaf_ids = {
+                json.loads(path.read_text(encoding="utf-8"))["leaf_id"]
+                for path in store.root.glob("*.json")
+            }
+            self.assertEqual(stored_leaf_ids, set(selection.leaf_ids))
+
+    def test_complete_cli_resume_backfills_default_windows_store(self):
+        """Catches the complete-checkpoint fast path bypassing persistence."""
+
+        from windows_solver.cli import _campaign_selected
+
+        plan = _plan()
+        selection = _primary(plan, 1)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkpoint = root / "m02-output" / "m02-campaign-checkpoint.json"
+            local_app_data = root / "LocalAppData"
+            with patch(
+                "windows_solver.response_batches._validate_record_semantics",
+                return_value=True,
+            ):
+                run_campaign_selection(
+                    plan,
+                    selection,
+                    _Backend(plan),
+                    checkpoint,
+                    resume=False,
+                )
+                with patch.dict(
+                    os.environ,
+                    {"LOCALAPPDATA": str(local_app_data)},
+                    clear=True,
+                ), patch(
+                    "windows_solver.cli._campaign_plan_and_selection",
+                    return_value=(plan, selection, None),
+                ), patch(
+                    "windows_solver.cli.Path.cwd",
+                    return_value=root,
+                ):
+                    status, output = _campaign_selected(
+                        "campaign-resume",
+                        root / "selection.json",
+                        Path("m02-output/m02-campaign-checkpoint.json"),
+                    )
+
+            store = SolvedLeafStore(
+                local_app_data
+                / "Kerr-QNM_Windows-Solver"
+                / "solved-leaves-v1"
+            )
+            self.assertEqual(status, 0)
+            self.assertEqual(output["state"], "COMPLETE")
+            self.assertEqual(store.stored_count, 1)
+
     def test_scientific_change_misses_but_telemetry_change_does_not_change_identity(self):
         plan = _plan()
         changed = _plan(tolerance=1.0e-10)
@@ -295,7 +400,10 @@ class SolvedLeafCacheTests(unittest.TestCase):
                     plan, source, SolvedLeafStore(root / "solved")
                 )
             self.assertEqual(imported.imported_count, 2)
-            self.assertEqual(imported.leaf_ids, selection.leaf_ids[:2])
+            self.assertEqual(imported.leaf_ids, (
+                "b-prime-leaf-9e5777728144433e089f9559b92b6e139e16115a5a53099f40403a45297aa3c3",
+                "b-prime-leaf-4eb508d767bea5cddc3f7c0eb120c1a9cc184122900f4d7ec86b56c98ddab596",
+            ))
 
             status = root / "status.json"
             status.write_text(
