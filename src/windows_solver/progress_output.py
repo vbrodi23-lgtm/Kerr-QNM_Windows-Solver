@@ -159,6 +159,8 @@ class CampaignProgressReporter:
         self._indeterminate_leaf_ids: set[object] = set()
         self._failed_leaf_ids: set[object] = set()
         self._last_accepted_leaf: object | None = None
+        self._last_terminal_leaf: object | None = None
+        self._last_terminal_state: object | None = None
         self._checkpoint_status = "not yet written"
         self._campaign_status = "PENDING"
         self._cache_compatible = 0
@@ -308,6 +310,7 @@ class CampaignProgressReporter:
             event.kind in {
                 ProgressEventKind.LEAF_COMPLETED,
                 ProgressEventKind.LEAF_REUSED,
+                ProgressEventKind.LEAF_FAILED,
             }
             and leaf_key is not None
             and leaf_key not in self._settled_leaf_ids
@@ -576,15 +579,15 @@ class CampaignProgressReporter:
             return False
 
     def _should_render_dashboard(self, event: ProgressEvent) -> bool:
-        now = event.monotonic_seconds
-        if (
-            self._last_dashboard_seconds is None
-            or event.kind in _FORCED_STATUS_KINDS
-            or now - self._last_dashboard_seconds >= _STATUS_INTERVAL_SECONDS
-        ):
-            self._last_dashboard_seconds = now
-            return True
-        return False
+        return event.kind in {
+            ProgressEventKind.SOLVED_LEAF_CACHE_SCANNED,
+            ProgressEventKind.CAMPAIGN_STARTED,
+            ProgressEventKind.LEAF_COMPLETED,
+            ProgressEventKind.LEAF_REUSED,
+            ProgressEventKind.LEAF_FAILED,
+            ProgressEventKind.CAMPAIGN_COMPLETED,
+            ProgressEventKind.CAMPAIGN_FAILED,
+        }
 
     def _dashboard(self, record: Mapping[str, object]) -> None:
         lines = self._bounded_dashboard_lines(record)
@@ -596,7 +599,8 @@ class CampaignProgressReporter:
         # Clear-Host or ESC[2J: bootstrap and command history must remain in
         # scrollback.
         self.stream.write("\x1b[0J")
-        self.stream.write("\n".join(lines) + "\n")
+        rendered = [self._color_dashboard_line(line) for line in lines]
+        self.stream.write("\n".join(rendered) + "\n")
         self.stream.flush()
         self._dashboard_rendered_rows = len(lines)
 
@@ -711,6 +715,8 @@ class CampaignProgressReporter:
             self._record_leaf_outcome(next_leaf, payload.get("state"))
         elif kind == ProgressEventKind.LEAF_FAILED.value:
             self._dashboard_state["leaf_status"] = "FAILED"
+            self._last_terminal_leaf = next_leaf
+            self._last_terminal_state = "FAILED"
             if next_leaf is not None:
                 self._discard_leaf_outcomes(next_leaf)
                 self._failed_leaf_ids.add(next_leaf)
@@ -748,6 +754,8 @@ class CampaignProgressReporter:
             self._campaign_status = "FAILED"
 
     def _record_leaf_outcome(self, leaf_id: object, state: object) -> None:
+        self._last_terminal_leaf = leaf_id
+        self._last_terminal_state = state
         if leaf_id is not None:
             self._discard_leaf_outcomes(leaf_id)
         if state == "PRODUCED":
@@ -814,13 +822,15 @@ class CampaignProgressReporter:
         model = self._campaign_report_model
         if model is None:
             return None
+        if self._last_terminal_leaf is not None:
+            for row in model.leaf_rows:
+                if row.get("leaf_id") == self._last_terminal_leaf:
+                    return row
+            return None
         if self._last_accepted_leaf is not None:
             for row in model.leaf_rows:
                 if row.get("leaf_id") == self._last_accepted_leaf:
                     return row
-        for row in reversed(model.leaf_rows):
-            if row.get("terminal_state") == "PRODUCED":
-                return row
         return None
 
     @staticmethod
@@ -908,6 +918,8 @@ class CampaignProgressReporter:
             }
         return (
             ("LatestResult", latest_leaf_id),
+            ("ResultState", None if row is None else row.get("terminal_state")),
+            ("ResultPrecision", None if row is None else row.get("precision_digits")),
             ("ResultMode", None if row is None else row.get("mode")),
             ("ResultSpin", None if row is None else row.get("spin_or_Mkappa")),
             (
@@ -931,6 +943,10 @@ class CampaignProgressReporter:
             (
                 "BaselineResidual",
                 None if row is None else row.get("baseline_determinant_residual"),
+            ),
+            (
+                "BaselineNewtonCorrection",
+                None if row is None else row.get("baseline_newton_correction"),
             ),
             ("SignedRoot", signed_root),
             (
@@ -1029,58 +1045,222 @@ class CampaignProgressReporter:
         )
 
     def _dashboard_lines(self, record: Mapping[str, object]) -> list[str]:
-        return [
-            f"{label:<15}: {self._dashboard_value(value)}"
-            for label, value in self._dashboard_fields(record)
+        fields = dict(self._dashboard_fields(record))
+        lines = [
+            "==============================================================",
+            " M02 KERR-QNM SCIENTIFIC DASHBOARD",
+            "==============================================================",
+            "",
+            " CAMPAIGN",
+            self._dashboard_field_line("Completed", fields.get("Completed")),
+            self._dashboard_field_line("Accepted", fields.get("Accepted")),
+            self._dashboard_field_line("Unresolved", fields.get("Indeterminate")),
+            self._dashboard_field_line("Rejected", fields.get("Rejected")),
+            self._dashboard_field_line("Failed", fields.get("Failed")),
+            "",
+            " LATEST COMPLETED LEAF",
+            *self._latest_completed_leaf_lines(fields),
+            "",
+            " CACHE",
+            self._dashboard_field_line("Stored", self._cache_stored),
+            self._dashboard_field_line(
+                "Publish fails", len(self._cache_publication_failures)
+            ),
+            "",
+            f" Last refresh:  {datetime.now().astimezone().strftime('%H:%M:%S')}",
+            " Dashboard refreshes only when another leaf finishes.",
         ]
+        return lines
 
     def _compact_dashboard_lines(self, record: Mapping[str, object]) -> list[str]:
         fields = dict(self._dashboard_fields(record))
-
-        def line(*labels: str) -> str:
-            return " | ".join(
-                f"{label}: {self._dashboard_value(fields.get(label))}"
-                for label in labels
-            )
-
-        lines = [
-            "M02 CAMPAIGN | " + line("Sequence", "Event", "Elapsed_s"),
-            line("CampaignStatus", "Leaf", "LeafStatus"),
-            line("SolvedCache", "CacheReusing", "NextUnsolved"),
-            line("LeafId"),
-            line("Role", "Mode", "Spin"),
-            line("Mechanism", "Precision", "Phase", "Newton"),
-            line("RootStatus", "PrecisionStatus", "Checkpoint"),
-            line("Completed", "Accepted", "Rejected"),
-            line("Indeterminate", "Failed", "LastAccepted"),
-            line("Computed", "Checkpoint", "PersistentReceipt"),
-            line("CachePublishFailures"),
-            line("CurrentOmega"),
-            line("DeterminantAbs", "BestDetAbs", "Threshold"),
-            line("DetLeaf", "DetPhase", "DetNewton"),
-            line("Suboperation"),
-            line("TimingSample", "AvgLeaf", "MedianLeaf"),
-            line("ETA", "Finish"),
+        latest = self._latest_completed_leaf_lines(fields)
+        response = next(
+            (line for line in latest if line.startswith(" Response")),
+            " No scientific result payload.",
+        )
+        disk = next(
+            (line for line in latest if line.startswith(" Local disk")),
+            "",
+        )
+        return [
+            "==============================================================",
+            " M02 KERR-QNM SCIENTIFIC DASHBOARD",
+            "==============================================================",
+            "",
+            " CAMPAIGN",
+            self._dashboard_field_line("Completed", fields.get("Completed")),
+            (
+                f" Accepted       {self._dashboard_value(fields.get('Accepted'))}"
+                f" | Unresolved {self._dashboard_value(fields.get('Indeterminate'))}"
+            ),
+            (
+                f" Rejected       {self._dashboard_value(fields.get('Rejected'))}"
+                f" | Failed {self._dashboard_value(fields.get('Failed'))}"
+            ),
+            "",
+            " LATEST COMPLETED LEAF",
+            self._dashboard_field_line(
+                "State", fields.get("ResultState") or self._last_terminal_state
+            ),
+            self._dashboard_field_line(
+                "Mechanism",
+                fields.get("ResultMechanism")
+                or self._dashboard_state.get("mechanism_id"),
+            ),
+            (
+                f" Spin           {self._dashboard_value(fields.get('ResultSpin') or self._dashboard_state.get('spin'))}"
+                f" | Precision {self._precision_value(fields)}"
+            ),
+            self._dashboard_field_line(
+                "Convergence", fields.get("Convergence")
+            ),
+            response,
+            disk,
+            "",
+            " CACHE",
+            (
+                f" Stored         {self._cache_stored}"
+                f" | Publish fails {len(self._cache_publication_failures)}"
+            ),
+            "",
+            f" Last refresh:  {datetime.now().astimezone().strftime('%H:%M:%S')}",
+            " Dashboard refreshes only when another leaf finishes.",
         ]
-        if self._campaign_report_model is not None:
-            lines.extend(
-                [
-                    "LATEST SCIENTIFIC RESULT | "
-                    + line("LatestResult", "ResultMode"),
-                    line("ResultSpin", "ResultMechanism", "Convergence"),
-                    line("ResponseRe", "ResponseIm", "ResponseAbs"),
-                    line("LocalDisk", "DiskResponse", "DiskState"),
-                    line("BaselineOmega"),
-                    line("BaselineResidual", "SignedRootAbs"),
-                    line("ErrorChannels"),
-                    "PROJECTIVE EVIDENCE | "
-                    + line("Projective", "ProjectiveRow"),
-                    line("ProjectiveState", "ProjectiveOutcome"),
-                    line("FSAngle", "FSBounds"),
-                    line("SepThreshold", "EquivThreshold"),
-                ]
-            )
+
+    def _latest_completed_leaf_lines(
+        self, fields: Mapping[str, object]
+    ) -> list[str]:
+        state = fields.get("ResultState") or self._last_terminal_state
+        mechanism = (
+            fields.get("ResultMechanism")
+            or self._dashboard_state.get("mechanism_id")
+        )
+        spin = fields.get("ResultSpin") or self._dashboard_state.get("spin")
+        lines = [
+            self._dashboard_field_line("State", state),
+            self._dashboard_field_line("Mechanism", mechanism),
+            self._dashboard_field_line("Spin", spin),
+            self._dashboard_field_line("Precision", self._precision_value(fields)),
+            self._dashboard_field_line("Convergence", fields.get("Convergence")),
+        ]
+        response_real = fields.get("ResponseRe")
+        response_imaginary = fields.get("ResponseIm")
+        if response_real is None or response_imaginary is None:
+            lines.extend(["", " No scientific result payload."])
+            return lines
+        response = (
+            f"{self._general_number(response_real)} "
+            f"{self._signed_imaginary(response_imaginary)}i"
+        )
+        lines.extend(
+            [
+                "",
+                self._dashboard_field_line("Response", response),
+                self._dashboard_field_line(
+                    "|Response|", self._scientific_number(fields.get("ResponseAbs"))
+                ),
+                self._dashboard_field_line(
+                    "Local disk", self._scientific_number(fields.get("LocalDisk"))
+                ),
+                self._dashboard_field_line(
+                    "Disk / |R|",
+                    self._scientific_number(fields.get("DiskResponse")),
+                ),
+                "",
+                self._dashboard_field_line(
+                    "Baseline Re",
+                    self._general_number(
+                        self._mapping_value(fields.get("BaselineOmega"), "real")
+                    ),
+                ),
+                self._dashboard_field_line(
+                    "Baseline Im",
+                    self._general_number(
+                        self._mapping_value(
+                            fields.get("BaselineOmega"), "imaginary"
+                        )
+                    ),
+                ),
+                self._dashboard_field_line(
+                    "Baseline |D|",
+                    self._scientific_number(fields.get("BaselineResidual")),
+                ),
+                self._dashboard_field_line(
+                    "Newton corr",
+                    self._scientific_number(
+                        fields.get("BaselineNewtonCorrection")
+                    ),
+                ),
+            ]
+        )
         return lines
+
+    @classmethod
+    def _dashboard_field_line(cls, label: str, value: object) -> str:
+        return f" {label:<14} {cls._dashboard_value(value)}"
+
+    def _precision_value(self, fields: Mapping[str, object]) -> str:
+        value = (
+            fields.get("ResultPrecision")
+            or self._dashboard_state.get("precision_digits")
+        )
+        if value is None:
+            return ""
+        return f"{self._dashboard_value(value)} digits"
+
+    @staticmethod
+    def _mapping_value(value: object, key: str) -> object:
+        if not isinstance(value, Mapping):
+            return None
+        return value.get(key)
+
+    @staticmethod
+    def _general_number(value: object) -> str:
+        if value is None:
+            return ""
+        try:
+            return format(float(value), ".13g")
+        except (TypeError, ValueError, OverflowError):
+            return str(value)
+
+    @staticmethod
+    def _signed_imaginary(value: object) -> str:
+        try:
+            return format(float(value), "+.12f")
+        except (TypeError, ValueError, OverflowError):
+            return str(value)
+
+    @staticmethod
+    def _scientific_number(value: object) -> str:
+        if value is None:
+            return ""
+        try:
+            return format(float(value), ".3E")
+        except (TypeError, ValueError, OverflowError):
+            return str(value)
+
+    @staticmethod
+    def _color_dashboard_line(line: str) -> str:
+        stripped = line.strip()
+        color = None
+        if line.startswith("=") or stripped == "M02 KERR-QNM SCIENTIFIC DASHBOARD":
+            color = "96"
+        elif stripped == "CAMPAIGN":
+            color = "93"
+        elif stripped == "LATEST COMPLETED LEAF":
+            color = "95"
+        elif stripped == "CACHE":
+            color = "36"
+        elif line.startswith(" Accepted"):
+            color = "92"
+        elif line.startswith(" Last refresh:") or line.startswith(
+            " Dashboard refreshes"
+        ):
+            color = "90"
+        if color is None:
+            return line
+        return f"\x1b[{color}m{line}\x1b[0m"
 
     def _completed_value(self, leaf_count: object) -> str:
         completed = len(self._settled_leaf_ids)
