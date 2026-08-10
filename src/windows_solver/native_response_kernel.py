@@ -847,7 +847,7 @@ class VettedNativeDeterminantKernel:
             root_reference_id=background_root.root_reference_id,
             branch_id=(
                 background_root.branch_id
-                if converged
+                if branch_continuation_valid
                 else "nonmatching-native-continuation"
             ),
             equation_id=job.equation_id,
