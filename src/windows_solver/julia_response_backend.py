@@ -365,7 +365,12 @@ class JuliaPrecisionRootBackend:
             "refinement_level": self.refinement,
         }
 
-    def _request(self, job: ResponseComponentJob, amplitude: complex) -> dict[str, object]:
+    def _request(
+        self,
+        job: ResponseComponentJob,
+        amplitude: complex,
+        primary_predictor: complex | None = None,
+    ) -> dict[str, object]:
         request: dict[str, object] = {
             "schema_version": 1,
             "operation": "root-readout",
@@ -393,6 +398,13 @@ class JuliaPrecisionRootBackend:
             "working_precision_bits": math.ceil(self.digits * math.log2(10)) + 32,
             "policy": _precision_policy(job, self.digits, self.refinement),
         }
+        if primary_predictor is not None:
+            predictor = complex(primary_predictor)
+            if math.isfinite(predictor.real) and math.isfinite(predictor.imag):
+                request["primary_predictor"] = {
+                    "real": format(predictor.real, ".17g"),
+                    "imaginary": format(predictor.imag, ".17g"),
+                }
         if job.mechanism_id != "horizon-admittance":
             support = _exterior_support(job.spin, job.mechanism_id)
             request["support"] = {
@@ -401,10 +413,17 @@ class JuliaPrecisionRootBackend:
             }
         return request
 
-    def read_root(self, job: ResponseComponentJob, amplitude: complex) -> RootReadout:
+    def read_root(
+        self,
+        job: ResponseComponentJob,
+        amplitude: complex,
+        primary_predictor: complex | None = None,
+    ) -> RootReadout:
         if job.backend_identity != self.identity:
             raise ValueError("response job backend identity does not match Julia adapter")
-        response = self.adapter.evaluate(self._request(job, complex(amplitude)))
+        response = self.adapter.evaluate(
+            self._request(job, complex(amplitude), primary_predictor)
+        )
         expected_fields = {
             "schema_version",
             "status",

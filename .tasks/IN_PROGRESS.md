@@ -55,5 +55,6 @@ Confirm that a fresh checkout can originate every M02 numerical prerequisite fro
 - Separate Julia dependency, worker, and generated-GSN cache identities so exact-checkout and telemetry-only updates reuse authenticated project/depot state; retain fail-closed dependency invalidation and explicit rebuild diagnostics.
 - Add an optional private per-user authenticated solved-leaf store that reuses only complete terminal `CampaignLeafRecord`s under a separate per-leaf scientific-computation identity, imports authenticated checkpoints, and writes through only after the active checkpoint succeeds.
 - Preserve warm dependency reuse when Julia serializes Windows Manifest paths as TOML-escaped backslashes, including the intentional checkout-local portable runtime; verify dependency receipts immediately, emit predicate-level rejection diagnostics, and cover identical, worker-only, changed-dependency, missing-receipt, and malformed-receipt lifecycles with a no-Julia PowerShell smoke.
+- Add measured within-leaf signed-ray PRIMARY continuation through an optional predictor boundary; retain independent SEED-PATH, preserve historical solved-leaf identities, and defer cross-leaf momentum until Windows campaign telemetry demonstrates benefit.
 
 ---

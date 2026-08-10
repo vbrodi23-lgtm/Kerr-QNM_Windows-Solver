@@ -46,6 +46,7 @@ _NORMAL_KINDS = _QUIET_KINDS | frozenset(
         ProgressEventKind.AMPLITUDE_READOUT_STARTED,
         ProgressEventKind.AMPLITUDE_READOUT_COMPLETED,
         ProgressEventKind.ROOT_PHASE_STARTED,
+        ProgressEventKind.ROOT_SEED_SELECTED,
         ProgressEventKind.ROOT_PHASE_COMPLETED,
         ProgressEventKind.NEWTON_ITERATION_STARTED,
         ProgressEventKind.NEWTON_ITERATION_COMPLETED,
@@ -138,12 +139,12 @@ class CampaignProgressReporter:
         self._sequence = 0
         self._status_open = False
         self._traced_leaf_paths: set[Path] = set()
-        self._phase_counters: dict[tuple[object, object, object], dict[str, int]] = {}
+        self._phase_counters: dict[tuple[object, ...], dict[str, int]] = {}
         self._leaf_determinants: dict[object, int] = {}
         self._newton_determinants: dict[
-            tuple[object, object, object, object], int
+            tuple[object, ...], int
         ] = {}
-        self._active_newton: dict[tuple[object, object, object], object] = {}
+        self._active_newton: dict[tuple[object, ...], object] = {}
         self._leaf_started: dict[object, float] = {}
         self._completed_leaf_seconds: deque[float] = deque(
             maxlen=_LEAF_TIMING_WINDOW
@@ -160,14 +161,19 @@ class CampaignProgressReporter:
         self._cache_stored = 0
         self._cache_reusing = 0
         self._cache_next_unsolved: object = None
-        self._root_started: dict[tuple[object, object, object], float] = {}
+        self._root_started: dict[tuple[object, ...], float] = {}
         self._newton_started: dict[
-            tuple[object, object, object, object], float
+            tuple[object, ...], float
         ] = {}
-        self._current_determinants: dict[tuple[object, object, object], object] = {}
+        self._current_determinants: dict[tuple[object, ...], object] = {}
         self._best_determinants: dict[
-            tuple[object, object, object], tuple[float, object]
+            tuple[object, ...], tuple[float, object]
         ] = {}
+        self._root_seed_state: dict[
+            tuple[object, ...], dict[str, object]
+        ] = {}
+        self._primary_seed_stats: dict[str, dict[str, float | int]] = {}
+        self._completed_primary_roots: set[tuple[object, ...]] = set()
         self._last_status_seconds: float | None = None
         self._last_dashboard_seconds: float | None = None
         self._dashboard_rendered_rows = 0
@@ -186,6 +192,8 @@ class CampaignProgressReporter:
             if self._should_write_status(event):
                 self._write_status(record)
             self._render(event, record)
+            if "root_solve" in record:
+                self._append_root_solve(record)
             if self.mode is ProgressMode.TRACE:
                 self._append_trace(record)
         except Exception as error:  # Progress must never change solver outcome.
@@ -194,7 +202,11 @@ class CampaignProgressReporter:
     def _record(self, event: ProgressEvent) -> dict[str, object]:
         context = event.context.to_mapping()
         counter_key = (
-            context["leaf_id"], context["readout_index"], context["phase"]
+            context["leaf_id"],
+            context["precision_digits"],
+            context["component_pass"],
+            context["readout_index"],
+            context["phase"],
         )
         counters = self._phase_counters.setdefault(
             counter_key, {"newton": 0, "determinant": 0}
@@ -216,9 +228,7 @@ class CampaignProgressReporter:
             counters["determinant"] += 1
             leaf_key = context["leaf_id"]
             newton_key = (
-                leaf_key,
-                context["readout_index"],
-                context["phase"],
+                *counter_key,
                 context["newton_index"],
             )
             self._leaf_determinants[leaf_key] = (
@@ -230,9 +240,7 @@ class CampaignProgressReporter:
         if context["leaf_id"] is not None:
             leaf_key = context["leaf_id"]
             newton_key = (
-                leaf_key,
-                context["readout_index"],
-                context["phase"],
+                *counter_key,
                 context["newton_index"],
             )
             context["determinant_index_leaf"] = (
@@ -250,11 +258,9 @@ class CampaignProgressReporter:
         self._sequence += 1
         now = event.monotonic_seconds
         leaf_key = context["leaf_id"]
-        root_key = (leaf_key, context["readout_index"], context["phase"])
+        root_key = counter_key
         newton_key = (
-            leaf_key,
-            context["readout_index"],
-            context["phase"],
+            *root_key,
             context["newton_index"],
         )
         if event.kind is ProgressEventKind.LEAF_STARTED:
@@ -279,8 +285,32 @@ class CampaignProgressReporter:
             self._root_started[root_key] = now
         if event.kind is ProgressEventKind.NEWTON_ITERATION_STARTED:
             self._newton_started[newton_key] = now
-        determinant_key = (leaf_key, context["readout_index"], context["phase"])
+        determinant_key = root_key
         payload = event.payload
+        if event.kind is ProgressEventKind.ROOT_SEED_SELECTED:
+            prior_seed = self._root_seed_state.get(root_key, {})
+            predictor_initial = prior_seed.get("initial_determinant_abs")
+            fallback_used = bool(payload.get("fallback_used", False))
+            self._root_seed_state[root_key] = {
+                "requested_seed_kind": payload.get("requested_seed_kind"),
+                "seed_kind": payload.get("seed_kind"),
+                "seed_omega": payload.get("seed_omega"),
+                "fallback_used": fallback_used,
+                "fallback_reason": payload.get("fallback_reason"),
+                "fallback_error_type": payload.get("fallback_error_type"),
+                "initial_determinant_abs": None,
+                "predictor_initial_determinant_abs": (
+                    predictor_initial if fallback_used else None
+                ),
+            }
+        if event.kind is ProgressEventKind.DETERMINANT_COMPLETED:
+            seed_state = self._root_seed_state.get(root_key)
+            if (
+                seed_state is not None
+                and seed_state.get("initial_determinant_abs") is None
+                and payload.get("determinant_abs") is not None
+            ):
+                seed_state["initial_determinant_abs"] = payload["determinant_abs"]
         current_determinant = payload.get("determinant_abs")
         if current_determinant is None:
             current_determinant = payload.get("resulting_determinant_abs")
@@ -318,8 +348,100 @@ class CampaignProgressReporter:
             record["best_determinant_abs"] = self._best_determinants[
                 determinant_key
             ][1]
+        if event.kind is ProgressEventKind.ROOT_PHASE_COMPLETED:
+            seed_state = dict(self._root_seed_state.get(root_key, {}))
+            root_solve = {
+                **seed_state,
+                "newton_iterations": counters["newton"],
+                "determinant_calls": counters["determinant"],
+                "resulting_omega": payload.get("resulting_omega"),
+                "resulting_determinant_abs": payload.get(
+                    "resulting_determinant_abs"
+                ),
+                "converged": payload.get("converged"),
+                "elapsed_seconds": payload.get("elapsed_seconds"),
+            }
+            record["root_solve"] = root_solve
+            if context["phase"] == "PRIMARY" and root_key not in self._completed_primary_roots:
+                self._completed_primary_roots.add(root_key)
+                self._observe_primary_seed_result(root_solve)
+        record["momentum_summary"] = self._momentum_summary()
         self._add_leaf_timing_estimate(record, context)
         return record
+
+    def _observe_primary_seed_result(self, root_solve: Mapping[str, object]) -> None:
+        seed_kind = root_solve.get("seed_kind")
+        if not isinstance(seed_kind, str) or not seed_kind:
+            return
+        stats = self._primary_seed_stats.setdefault(
+            seed_kind,
+            {
+                "solve_count": 0,
+                "fallback_count": 0,
+                "total_newton_iterations": 0,
+                "total_determinant_calls": 0,
+                "total_elapsed_seconds": 0.0,
+            },
+        )
+        stats["solve_count"] += 1
+        stats["fallback_count"] += int(bool(root_solve.get("fallback_used")))
+        stats["total_newton_iterations"] += int(
+            root_solve.get("newton_iterations", 0)
+        )
+        stats["total_determinant_calls"] += int(
+            root_solve.get("determinant_calls", 0)
+        )
+        try:
+            elapsed = float(root_solve.get("elapsed_seconds", 0.0))
+        except (TypeError, ValueError, OverflowError):
+            elapsed = 0.0
+        if math.isfinite(elapsed) and elapsed >= 0.0:
+            stats["total_elapsed_seconds"] += elapsed
+
+    def _momentum_summary(self) -> dict[str, object]:
+        by_seed_kind: dict[str, dict[str, object]] = {}
+        for seed_kind in sorted(self._primary_seed_stats):
+            raw = self._primary_seed_stats[seed_kind]
+            count = int(raw["solve_count"])
+            by_seed_kind[seed_kind] = {
+                "solve_count": count,
+                "fallback_count": int(raw["fallback_count"]),
+                "total_newton_iterations": int(raw["total_newton_iterations"]),
+                "average_newton_iterations": (
+                    float(raw["total_newton_iterations"]) / count
+                ),
+                "total_determinant_calls": int(raw["total_determinant_calls"]),
+                "average_determinant_calls": (
+                    float(raw["total_determinant_calls"]) / count
+                ),
+                "total_elapsed_seconds": float(raw["total_elapsed_seconds"]),
+                "mean_solve_seconds": float(raw["total_elapsed_seconds"]) / count,
+            }
+        epsilon_count = sum(
+            int(by_seed_kind.get(kind, {}).get("solve_count", 0))
+            for kind in ("EPSILON_CONTINUATION", "FALLBACK_BACKGROUND")
+        )
+        fallback_count = int(
+            by_seed_kind.get("FALLBACK_BACKGROUND", {}).get("solve_count", 0)
+        )
+        background = by_seed_kind.get("AUTHENTICATED_BACKGROUND")
+        epsilon = by_seed_kind.get("EPSILON_CONTINUATION")
+        observed_delta = None
+        if background is not None and epsilon is not None:
+            observed_delta = (
+                float(background["average_determinant_calls"])
+                - float(epsilon["average_determinant_calls"])
+            )
+        return {
+            "primary_solve_count": sum(
+                int(item["solve_count"]) for item in by_seed_kind.values()
+            ),
+            "epsilon_continuation_fallback_rate": (
+                None if epsilon_count == 0 else fallback_count / epsilon_count
+            ),
+            "observed_epsilon_determinant_call_delta_vs_background_mean": observed_delta,
+            "by_seed_kind": by_seed_kind,
+        }
 
     def _add_leaf_timing_estimate(
         self, record: dict[str, object], context: Mapping[str, object]
@@ -346,7 +468,7 @@ class CampaignProgressReporter:
         )
 
     def _observe_best_determinant(
-        self, key: tuple[object, object, object], value: object
+        self, key: tuple[object, ...], value: object
     ) -> None:
         try:
             comparable = float(value)
@@ -955,6 +1077,13 @@ class CampaignProgressReporter:
             self._sequence += 1
             assert isinstance(record, dict)
             record["sequence"] = self._sequence
+        self._write_jsonl(path, record)
+
+    def _append_root_solve(self, record: Mapping[str, object]) -> None:
+        """Persist one compact solve measurement in every progress mode."""
+
+        path = Path(f"{self.checkpoint}.progress") / "root-solves.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
         self._write_jsonl(path, record)
 
     def _write_status(self, record: Mapping[str, object]) -> None:

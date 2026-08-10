@@ -75,6 +75,7 @@ class JuliaResponseBackendTests(unittest.TestCase):
         self.assertIn("flush(stdout)", worker)
         for event in (
             "root_phase_started",
+            "root_seed_selected",
             "newton_iteration_started",
             "newton_iteration_completed",
             "determinant_started",
@@ -84,6 +85,11 @@ class JuliaResponseBackendTests(unittest.TestCase):
         ):
             self.assertIn(f'progress_emit("{event}"', worker)
         self.assertIn('"acceptance_threshold" => string(tolerance)', worker)
+        self.assertIn('haskey(document, "primary_predictor")', worker)
+        self.assertIn('fallback_initial=fallback_initial', worker)
+        self.assertIn('fallback_reason = "PREDICTOR_SOLVE_ERROR"', worker)
+        self.assertIn("failure isa InterruptException && rethrow()", worker)
+        self.assertIn('"INDEPENDENT_SEED_PATH"', worker)
         self.assertNotIn('document["progress', worker)
 
     def test_reserved_julia_stdout_event_is_forwarded_to_active_reporter(self):
@@ -139,6 +145,23 @@ class JuliaResponseBackendTests(unittest.TestCase):
         self.assertEqual(readout.truncation_radius, 2.0e-55)
         self.assertTrue(readout.converged)
         self.assertEqual(backend.scientific_runtime["precision_digits"], 80)
+
+    def test_promoted_backend_forwards_optional_primary_predictor(self):
+        """Catches promoted precision reverting to background-only PRIMARY seeds."""
+
+        job = _deep_job()
+        adapter = FakeAdapter()
+        backend = JuliaPrecisionRootBackend(
+            VettedNativeDeterminantKernel.identity, adapter, 80
+        )
+        predictor = job.root.omega + complex(1.0e-5, -2.0e-5)
+
+        backend.read_root(job, 0.001 + 0.0j, primary_predictor=predictor)
+
+        self.assertEqual(adapter.requests[0]["primary_predictor"], {
+            "real": format(predictor.real, ".17g"),
+            "imaginary": format(predictor.imag, ".17g"),
+        })
 
     def test_refinement_tightens_every_resolution_control(self):
         job = _deep_job()

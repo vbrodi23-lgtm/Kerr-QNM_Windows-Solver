@@ -617,9 +617,53 @@ class VettedNativeDeterminantKernel:
         background_root: object,
         perturbation: HorizonPerturbation | ExteriorPerturbation,
         policy: NumericalPolicy,
+        primary_predictor: complex | None = None,
     ) -> RootReadout:
-        def solve_phase(name, sn, phase_policy, guess):
+        def solve_phase(
+            name,
+            sn,
+            phase_policy,
+            guess,
+            *,
+            seed_kind,
+            requested_seed_kind=None,
+            fallback_guess=None,
+            fallback_used=False,
+            fallback_reason=None,
+        ):
             started = time.monotonic()
+            requested_kind = requested_seed_kind or seed_kind
+
+            def solve_with_seed(
+                selected_guess,
+                selected_kind,
+                used,
+                reason,
+                error_type=None,
+            ):
+                with progress_scope(
+                    seed_omega=_progress_complex(selected_guess),
+                    current_omega=_progress_complex(selected_guess),
+                    seed_kind=selected_kind,
+                    fallback_used=used,
+                ):
+                    emit_progress(
+                        ProgressEventKind.ROOT_SEED_SELECTED,
+                        requested_seed_kind=requested_kind,
+                        seed_kind=selected_kind,
+                        seed_omega=_progress_complex(selected_guess),
+                        fallback_used=used,
+                        fallback_reason=reason,
+                        fallback_error_type=error_type,
+                    )
+                    return self._solve_once(
+                        sn=sn,
+                        job=job,
+                        perturbation=perturbation,
+                        policy=phase_policy,
+                        guess=selected_guess,
+                    )
+
             with progress_scope(
                 phase=name,
                 seed_omega=_progress_complex(guess),
@@ -630,26 +674,105 @@ class VettedNativeDeterminantKernel:
                     seed_omega=_progress_complex(guess),
                     current_omega=_progress_complex(guess),
                 )
-                result = self._solve_once(
-                    sn=sn,
-                    job=job,
-                    perturbation=perturbation,
-                    policy=phase_policy,
-                    guess=guess,
-                )
-                emit_progress(
-                    ProgressEventKind.ROOT_PHASE_COMPLETED,
-                    resulting_omega=_progress_complex(result[0]),
-                    resulting_determinant_abs=result[1],
-                    derivative_abs=result[2],
-                    converged=result[3],
-                    elapsed_seconds=time.monotonic() - started,
-                )
+                fallback_error_type = None
+                try:
+                    result = solve_with_seed(
+                        guess, seed_kind, fallback_used, fallback_reason
+                    )
+                except Exception as error:
+                    if fallback_guess is None:
+                        raise
+                    fallback_reason = "PREDICTOR_SOLVE_ERROR"
+                    fallback_error_type = type(error).__name__
+                    seed_kind = "FALLBACK_BACKGROUND"
+                    fallback_used = True
+                    result = solve_with_seed(
+                        fallback_guess,
+                        seed_kind,
+                        fallback_used,
+                        fallback_reason,
+                        fallback_error_type,
+                    )
+                else:
+                    if fallback_guess is not None and (
+                        not result[3]
+                        or abs(result[0] - fallback_guess)
+                        > _BRANCH_CONTINUATION_TOLERANCE_ABS
+                    ):
+                        fallback_reason = (
+                            "PREDICTOR_NEWTON_FAILED"
+                            if not result[3]
+                            else "PREDICTOR_BRANCH_ESCAPE"
+                        )
+                        seed_kind = "FALLBACK_BACKGROUND"
+                        fallback_used = True
+                        result = solve_with_seed(
+                            fallback_guess,
+                            seed_kind,
+                            fallback_used,
+                            fallback_reason,
+                        )
+                with progress_scope(
+                    seed_omega=_progress_complex(
+                        fallback_guess
+                        if fallback_used and fallback_guess is not None
+                        else guess
+                    ),
+                    current_omega=_progress_complex(result[0]),
+                    seed_kind=seed_kind,
+                    fallback_used=fallback_used,
+                ):
+                    emit_progress(
+                        ProgressEventKind.ROOT_PHASE_COMPLETED,
+                        resulting_omega=_progress_complex(result[0]),
+                        resulting_determinant_abs=result[1],
+                        derivative_abs=result[2],
+                        converged=result[3],
+                        elapsed_seconds=time.monotonic() - started,
+                    )
                 return result
 
         primary_sn = self._standard_sn(job, policy)
+        background_omega = complex(background_root.omega)
+        predictor = None
+        primary_seed_kind = "AUTHENTICATED_BACKGROUND"
+        primary_fallback_used = False
+        primary_fallback_reason = None
+        if primary_predictor is not None:
+            candidate = complex(primary_predictor)
+            if (
+                math.isfinite(candidate.real)
+                and math.isfinite(candidate.imag)
+                and abs(candidate - background_omega)
+                <= _BRANCH_CONTINUATION_TOLERANCE_ABS
+            ):
+                predictor = candidate
+                primary_seed_kind = "EPSILON_CONTINUATION"
+            else:
+                primary_seed_kind = "FALLBACK_BACKGROUND"
+                primary_fallback_used = True
+                primary_fallback_reason = (
+                    "PREDICTOR_INVALID"
+                    if not (
+                        math.isfinite(candidate.real)
+                        and math.isfinite(candidate.imag)
+                    )
+                    else "PREDICTOR_OUTSIDE_BRANCH"
+                )
         root, residual, derivative, primary_converged = solve_phase(
-            "PRIMARY", primary_sn, policy, background_root.omega
+            "PRIMARY",
+            primary_sn,
+            policy,
+            background_omega if predictor is None else predictor,
+            seed_kind=primary_seed_kind,
+            requested_seed_kind=(
+                "EPSILON_CONTINUATION"
+                if primary_predictor is not None
+                else "AUTHENTICATED_BACKGROUND"
+            ),
+            fallback_guess=(background_omega if predictor is not None else None),
+            fallback_used=primary_fallback_used,
+            fallback_reason=primary_fallback_reason,
         )
 
         truncation_policy = replace(
@@ -660,6 +783,7 @@ class VettedNativeDeterminantKernel:
             self._standard_sn(job, truncation_policy),
             truncation_policy,
             root,
+            seed_kind="ACCEPTED_PRIMARY",
         )
 
         resolution_policy = replace(
@@ -673,17 +797,22 @@ class VettedNativeDeterminantKernel:
             self._standard_sn(job, resolution_policy),
             resolution_policy,
             root,
+            seed_kind="ACCEPTED_PRIMARY",
         )
 
-        alternate_guess = background_root.omega + complex(2.5e-4, 1.25e-4) * (
-            1.0 + abs(background_root.omega)
+        alternate_guess = background_omega + complex(2.5e-4, 1.25e-4) * (
+            1.0 + abs(background_omega)
         )
         seed_path_root, _, _, seed_path_converged = solve_phase(
-            "SEED-PATH", primary_sn, policy, alternate_guess
+            "SEED-PATH",
+            primary_sn,
+            policy,
+            alternate_guess,
+            seed_kind="INDEPENDENT_SEED_PATH",
         )
         diagnostic_roots = (truncation_root, resolution_root, seed_path_root)
         branch_continuation_valid = (
-            abs(root - background_root.omega)
+            abs(root - background_omega)
             <= _BRANCH_CONTINUATION_TOLERANCE_ABS
             and all(
                 abs(candidate - root) <= _BRANCH_CONTINUATION_TOLERANCE_ABS

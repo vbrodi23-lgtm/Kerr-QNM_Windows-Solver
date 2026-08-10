@@ -73,6 +73,18 @@ class ProgressBusTests(unittest.TestCase):
         self.assertEqual(context.determinant_index_phase, 42)
         self.assertEqual(context.determinant_index_newton, 3)
 
+    def test_progress_context_carries_seed_strategy_without_entering_scientific_payloads(self):
+        observer = RecordingObserver()
+        with activate_progress(observer), progress_scope(
+            seed_kind="EPSILON_CONTINUATION",
+            fallback_used=False,
+        ):
+            emit_progress(ProgressEventKind.ROOT_SEED_SELECTED)
+
+        context = observer.events[0].context
+        self.assertEqual(context.seed_kind, "EPSILON_CONTINUATION")
+        self.assertIs(context.fallback_used, False)
+
     def test_progress_scope_carries_the_complete_hierarchy_without_global_leakage(self):
         observer = RecordingObserver()
         with activate_progress(observer), progress_scope(
@@ -355,6 +367,242 @@ class CampaignProgressReporterTests(unittest.TestCase):
         self.assertEqual(status["context"]["leaf_count"], 553)
         self.assertEqual(status["context"]["mode"]["ell"], 2)
 
+    def test_primary_seed_telemetry_aggregates_calls_iterations_fallbacks_and_time(self):
+        reporter = CampaignProgressReporter(
+            "normal", self.reporter_checkpoint, io.StringIO()
+        )
+
+        def publish_primary(
+            *, readout_index, seed_kind, fallback_used, determinants, newtons, elapsed
+        ):
+            context = {
+                "leaf_id": "leaf-1",
+                "leaf_index": 1,
+                "leaf_count": 212,
+                "readout_index": readout_index,
+                "phase": "PRIMARY",
+                "seed_kind": seed_kind,
+                "fallback_used": fallback_used,
+                "seed_omega": {"real": 0.5, "imaginary": -0.1},
+            }
+            reporter.publish(_event(ProgressEventKind.ROOT_PHASE_STARTED, **context))
+            reporter.publish(
+                _payload_event(
+                    ProgressEventKind.ROOT_SEED_SELECTED,
+                    {
+                        "requested_seed_kind": (
+                            "EPSILON_CONTINUATION"
+                            if fallback_used
+                            else seed_kind
+                        ),
+                        "seed_kind": seed_kind,
+                        "fallback_used": fallback_used,
+                        "fallback_reason": (
+                            "PREDICTOR_NEWTON_FAILED" if fallback_used else None
+                        ),
+                        "seed_omega": {"real": 0.5, "imaginary": -0.1},
+                    },
+                    **context,
+                )
+            )
+            for index in range(determinants):
+                reporter.publish(
+                    _payload_event(
+                        ProgressEventKind.DETERMINANT_STARTED,
+                        {"purpose": f"det-{index}"},
+                        **context,
+                    )
+                )
+                reporter.publish(
+                    _payload_event(
+                        ProgressEventKind.DETERMINANT_COMPLETED,
+                        {"determinant_abs": 1.0e-3 / (index + 1)},
+                        **context,
+                    )
+                )
+            for index in range(newtons):
+                reporter.publish(
+                    _event(
+                        ProgressEventKind.NEWTON_ITERATION_STARTED,
+                        **context,
+                        newton_index=index + 1,
+                    )
+                )
+            reporter.publish(
+                _payload_event(
+                    ProgressEventKind.ROOT_PHASE_COMPLETED,
+                    {
+                        "resulting_omega": {"real": 0.49, "imaginary": -0.09},
+                        "resulting_determinant_abs": 1.0e-12,
+                        "converged": True,
+                        "elapsed_seconds": elapsed,
+                    },
+                    **context,
+                )
+            )
+
+        publish_primary(
+            readout_index=1,
+            seed_kind="AUTHENTICATED_BACKGROUND",
+            fallback_used=False,
+            determinants=10,
+            newtons=3,
+            elapsed=12.0,
+        )
+        publish_primary(
+            readout_index=2,
+            seed_kind="EPSILON_CONTINUATION",
+            fallback_used=False,
+            determinants=6,
+            newtons=2,
+            elapsed=7.0,
+        )
+        publish_primary(
+            readout_index=3,
+            seed_kind="FALLBACK_BACKGROUND",
+            fallback_used=True,
+            determinants=14,
+            newtons=5,
+            elapsed=18.0,
+        )
+        reporter.publish(
+            _event(
+                ProgressEventKind.LEAF_COMPLETED,
+                leaf_id="leaf-1",
+                leaf_index=1,
+                leaf_count=212,
+            )
+        )
+        status = json.loads(
+            Path(f"{self.reporter_checkpoint}.status.json").read_text(
+                encoding="utf-8"
+            )
+        )
+
+        summary = status["momentum_summary"]
+        self.assertEqual(summary["primary_solve_count"], 3)
+        self.assertEqual(summary["epsilon_continuation_fallback_rate"], 0.5)
+        self.assertEqual(
+            summary["by_seed_kind"]["EPSILON_CONTINUATION"],
+            {
+                "solve_count": 1,
+                "fallback_count": 0,
+                "total_newton_iterations": 2,
+                "average_newton_iterations": 2.0,
+                "total_determinant_calls": 6,
+                "average_determinant_calls": 6.0,
+                "total_elapsed_seconds": 7.0,
+                "mean_solve_seconds": 7.0,
+            },
+        )
+        self.assertEqual(
+            summary["observed_epsilon_determinant_call_delta_vs_background_mean"],
+            4.0,
+        )
+        root_solve_path = (
+            Path(f"{self.reporter_checkpoint}.progress") / "root-solves.jsonl"
+        )
+        root_solves = [
+            json.loads(line)
+            for line in root_solve_path.read_text(encoding="utf-8").splitlines()
+        ]
+        self.assertEqual(len(root_solves), 3)
+        self.assertEqual(
+            root_solves[1]["root_solve"],
+            {
+                "requested_seed_kind": "EPSILON_CONTINUATION",
+                "seed_kind": "EPSILON_CONTINUATION",
+                "seed_omega": {"real": 0.5, "imaginary": -0.1},
+                "fallback_used": False,
+                "fallback_reason": None,
+                "fallback_error_type": None,
+                "initial_determinant_abs": 0.001,
+                "predictor_initial_determinant_abs": None,
+                "newton_iterations": 2,
+                "determinant_calls": 6,
+                "resulting_omega": {"real": 0.49, "imaginary": -0.09},
+                "resulting_determinant_abs": 1.0e-12,
+                "converged": True,
+                "elapsed_seconds": 7.0,
+            },
+        )
+
+    def test_root_telemetry_separates_precision_and_component_pass(self):
+        reporter = CampaignProgressReporter(
+            "normal", self.reporter_checkpoint, io.StringIO()
+        )
+
+        def publish_root(*, digits, component_pass):
+            context = {
+                "leaf_id": "leaf-1",
+                "leaf_index": 1,
+                "leaf_count": 212,
+                "precision_digits": digits,
+                "component_pass": component_pass,
+                "readout_index": 1,
+                "phase": "PRIMARY",
+            }
+            reporter.publish(_event(ProgressEventKind.ROOT_PHASE_STARTED, **context))
+            reporter.publish(
+                _payload_event(
+                    ProgressEventKind.ROOT_SEED_SELECTED,
+                    {
+                        "requested_seed_kind": "AUTHENTICATED_BACKGROUND",
+                        "seed_kind": "AUTHENTICATED_BACKGROUND",
+                        "seed_omega": {"real": 0.5, "imaginary": -0.1},
+                        "fallback_used": False,
+                        "fallback_reason": None,
+                    },
+                    **context,
+                )
+            )
+            reporter.publish(
+                _payload_event(
+                    ProgressEventKind.DETERMINANT_STARTED,
+                    {"purpose": "initial"},
+                    **context,
+                )
+            )
+            reporter.publish(
+                _payload_event(
+                    ProgressEventKind.DETERMINANT_COMPLETED,
+                    {"determinant_abs": 1.0e-3},
+                    **context,
+                )
+            )
+            reporter.publish(
+                _payload_event(
+                    ProgressEventKind.ROOT_PHASE_COMPLETED,
+                    {
+                        "resulting_omega": {"real": 0.49, "imaginary": -0.09},
+                        "resulting_determinant_abs": 1.0e-12,
+                        "converged": True,
+                        "elapsed_seconds": 1.0,
+                    },
+                    **context,
+                )
+            )
+
+        publish_root(digits=64, component_pass="primary")
+        publish_root(digits=80, component_pass="primary")
+        publish_root(digits=80, component_pass="self-refinement")
+
+        root_solve_path = (
+            Path(f"{self.reporter_checkpoint}.progress") / "root-solves.jsonl"
+        )
+        root_solves = [
+            json.loads(line)
+            for line in root_solve_path.read_text(encoding="utf-8").splitlines()
+        ]
+        self.assertEqual(len(root_solves), 3)
+        self.assertEqual(
+            [record["root_solve"]["determinant_calls"] for record in root_solves],
+            [1, 1, 1],
+        )
+        self.assertEqual(
+            root_solves[-1]["momentum_summary"]["primary_solve_count"], 3
+        )
+
     def test_normal_console_dashboard_matches_the_working_status_view(self):
         class ConsoleStream(io.StringIO):
             def isatty(self):
@@ -406,6 +654,7 @@ class CampaignProgressReporterTests(unittest.TestCase):
                     leaf_id=shared_context["leaf_id"],
                     leaf_index=1,
                     leaf_count=553,
+                    precision_digits=64,
                     phase="SEED-PATH",
                     newton_index=1,
                     suboperation="Xup",
