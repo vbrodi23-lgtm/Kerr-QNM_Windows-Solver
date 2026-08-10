@@ -23,6 +23,7 @@ from windows_solver.response_engine import (
     ResponseComponentJob,
     RootReadout,
     build_response_plan,
+    root_readout_preserves_authenticated_branch,
     run_component,
     run_response_plan,
     validate_response_checkpoint,
@@ -300,6 +301,73 @@ class LinearResponseEngineTests(unittest.TestCase):
         self.assertFalse(rejected.converged)
         self.assertEqual(rejected.branch_id, "nonmatching-native-continuation")
 
+    def test_native_nonconvergence_preserves_authenticated_branch(self) -> None:
+        """Catches relabelling an in-radius numerical failure as branch loss."""
+
+        kernel_type = response_engine.VettedNativeDeterminantKernel
+
+        class ScriptedKernel(kernel_type):
+            def __init__(self, roots):
+                self.roots = iter(roots)
+
+            def _standard_sn(self, job, policy):
+                return object()
+
+            def _solve_once(self, *, sn, job, perturbation, policy, guess):
+                return next(self.roots)
+
+        job = ResponseComponentJob.from_leaf_id(
+            EXTERIOR_LEAF_ID,
+            policy=NumericalPolicy(),
+            backend_identity=kernel_type.identity,
+        )
+        perturbation = ExteriorPerturbation(
+            0.0j,
+            "fixed-r3",
+            response_engine._exterior_support(job.spin, job.mechanism_id),
+        )
+        base = job.root.omega
+        root = base + 1.0e-4
+        kernel = ScriptedKernel((
+            (root, 5.0e-11, 2.0, False),
+            (root + 1.0e-9, 1.0e-12, 2.0, True),
+            (root + 2.0e-9, 1.0e-12, 2.0, True),
+            (root + 3.0e-9, 1.0e-12, 2.0, True),
+        ))
+
+        readout = kernel.evaluate_root(
+            job=job,
+            background_root=job.root,
+            perturbation=perturbation,
+            policy=job.policy,
+        )
+
+        self.assertFalse(readout.converged)
+        self.assertEqual(readout.branch_id, job.root.branch_id)
+        self.assertTrue(
+            root_readout_preserves_authenticated_branch(
+                readout,
+                job.root,
+                equation_id=job.equation_id,
+                source_root_mapping=job.source_root_mapping,
+            )
+        )
+
+        large_correction = replace(
+            readout,
+            determinant_residual_abs=6.0e-3,
+            determinant_derivative_abs=1.0,
+        )
+        self.assertEqual(large_correction.branch_id, job.root.branch_id)
+        self.assertFalse(
+            root_readout_preserves_authenticated_branch(
+                large_correction,
+                job.root,
+                equation_id=job.equation_id,
+                source_root_mapping=job.source_root_mapping,
+            )
+        )
+
     def test_native_primary_uses_in_branch_predictor_without_preflight_and_keeps_seed_path_independent(
         self,
     ) -> None:
@@ -448,8 +516,9 @@ class LinearResponseEngineTests(unittest.TestCase):
             kernel_type.identity.source_commit,
             "0c1e8a3d3bca6e608c34e111476a4f6dcb73e86e",
         )
+        self.assertEqual(kernel_type.identity.implementation_version, "3")
         self.assertIn(
-            "adapted-source-native-gsn-adapter-contract-1",
+            "adapted-source-native-gsn-adapter-contract-2",
             kernel_type.identity.runtime_fingerprint,
         )
         self.assertIn("python-64bit", kernel_type.identity.runtime_fingerprint)

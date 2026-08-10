@@ -14,6 +14,7 @@ from unittest.mock import patch
 from windows_solver.contracts import canonical_json_bytes, canonical_text_sha256
 from windows_solver.linear_response import B_PRIME_RELEASE_DOMAIN
 from windows_solver.response_batches import (
+    CAMPAIGN_CHECKPOINT_SCHEMA_VERSION,
     CAMPAIGN_SCHEMA_VERSION,
     CampaignStageRecord,
     PrecisionCapabilities,
@@ -36,6 +37,7 @@ from windows_solver.response_engine import (
     NumericalPolicy,
     RootReadout,
     VettedNativeDeterminantKernel,
+    run_component,
 )
 from windows_solver.solved_leaf_cache import SolvedLeafStore
 
@@ -193,6 +195,155 @@ class CampaignPlanTests(unittest.TestCase):
                     SolvedLeafStore(root / "escaped-import"),
                 )
 
+    def test_legacy_branch_authentication_checkpoint_requires_fresh_path(self) -> None:
+        plan = build_campaign_plan(
+            policy=NumericalPolicy(),
+            backend_identity=VettedNativeDeterminantKernel.identity,
+            precision_capabilities=PrecisionCapabilities((64,)),
+        )
+        leaf = next(item for item in plan.leaves if item.role == "primary")
+        selection = build_campaign_selection(
+            plan, role="primary", leaf_ids=(leaf.leaf_id,)
+        )
+
+        class Backend:
+            identity = plan.backend_identity
+            precision_capabilities = plan.precision_capabilities
+
+            def __init__(self, *, reject_work=False):
+                self.calls = 0
+                self.reject_work = reject_work
+
+            def execute_stage(self, selected, digits):
+                self.calls += 1
+                if self.reject_work:
+                    raise AssertionError("legacy resume reached stage execution")
+                return _synthetic_stage_outcome(
+                    digits=digits,
+                    numerical_state="CONVERGED",
+                    component_result={"leaf_id": selected.leaf_id},
+                    local_disk_radius_abs=1.0e-8,
+                )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            current = root / "current.json"
+            run_campaign_selection(
+                plan, selection, Backend(), current, resume=False
+            )
+            legacy_value = json.loads(current.read_text(encoding="utf-8"))
+            legacy_value["schema_version"] = 2
+            legacy = root / "legacy.json"
+            legacy.write_bytes(canonical_json_bytes(legacy_value))
+            original = legacy.read_bytes()
+            guard = Backend(reject_work=True)
+
+            with self.assertRaisesRegex(
+                ValueError,
+                "legacy branch-authentication contract.*fresh checkpoint path",
+            ):
+                run_campaign_selection(
+                    plan, selection, guard, legacy, resume=True
+                )
+
+            self.assertEqual(guard.calls, 0)
+            self.assertEqual(legacy.read_bytes(), original)
+
+    def test_authenticated_nonconvergence_is_published_and_reloaded(self) -> None:
+        plan = build_campaign_plan(
+            policy=NumericalPolicy(),
+            backend_identity=VettedNativeDeterminantKernel.identity,
+            precision_capabilities=PrecisionCapabilities((64,)),
+        )
+        leaf = next(item for item in plan.leaves if item.role == "primary")
+        selection = build_campaign_selection(
+            plan, role="primary", leaf_ids=(leaf.leaf_id,)
+        )
+
+        class RootBackend:
+            identity = plan.backend_identity
+
+            def read_root(self, job, amplitude, primary_predictor=None):
+                return RootReadout(
+                    omega=job.root.omega + 1.0e-10,
+                    determinant_residual_abs=5.0e-11,
+                    determinant_derivative_abs=2.0,
+                    converged=False,
+                    root_reference_id=job.root.root_reference_id,
+                    branch_id=job.root.branch_id,
+                    equation_id=job.equation_id,
+                    truncation_radius=1.0e-10,
+                    resolution_radius=1.0e-10,
+                    seed_path_radius=1.0e-10,
+                    source_root_mapping=job.source_root_mapping,
+                )
+
+            def closed_form_horizon_response(self, job):
+                return None
+
+        class CampaignBackend:
+            identity = plan.backend_identity
+            precision_capabilities = plan.precision_capabilities
+
+            def __init__(self):
+                self.calls = 0
+
+            def execute_stage(self, selected, digits):
+                self.calls += 1
+                result = run_component(selected.job, RootBackend())
+                return _synthetic_stage_outcome(
+                    digits=digits,
+                    numerical_state=result.status.value,
+                    component_result={
+                        "evidence_kind": "synthetic-authenticated-nonconvergence",
+                        "result": result.to_mapping(),
+                    },
+                    local_disk_radius_abs=0.0,
+                )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            store = SolvedLeafStore(root / "solved-leaves")
+            first_backend = CampaignBackend()
+            first_checkpoint = root / "first.json"
+            first = run_campaign_selection(
+                plan,
+                selection,
+                first_backend,
+                first_checkpoint,
+                resume=False,
+                solved_leaf_store=store,
+            )
+
+            self.assertEqual(first_backend.calls, 1)
+            self.assertEqual(first.records[0].state, "UNRESOLVED")
+            self.assertEqual(
+                first.records[0].stages[0].outcome.numerical_state,
+                ComponentStatus.NOT_CONVERGED.value,
+            )
+            self.assertEqual(store.stored_count, 1)
+            validate_campaign_checkpoint(plan, first_checkpoint)
+
+            second_backend = CampaignBackend()
+            second_checkpoint = root / "second.json"
+            second = run_campaign_selection(
+                plan,
+                selection,
+                second_backend,
+                second_checkpoint,
+                resume=False,
+                solved_leaf_store=store,
+            )
+
+            self.assertEqual(second_backend.calls, 0)
+            self.assertEqual(second.executed_stage_count, 0)
+            self.assertEqual(second.reused_stage_count, 1)
+            self.assertEqual(
+                second.records[0].to_mapping(),
+                first.records[0].to_mapping(),
+            )
+            validate_campaign_checkpoint(plan, second_checkpoint)
+
     def test_source_identity_is_stable_across_checkout_line_endings(self) -> None:
         """Catches Windows checkout conversion changing campaign lineage."""
 
@@ -245,6 +396,7 @@ class CampaignPlanTests(unittest.TestCase):
         })
 
         self.assertEqual(CAMPAIGN_SCHEMA_VERSION, 2)
+        self.assertEqual(CAMPAIGN_CHECKPOINT_SCHEMA_VERSION, 3)
         self.assertEqual(record.to_mapping()["signed_error_channels"], list(channels))
         forged = record.to_mapping()
         injected = dict(forged["signed_error_channels"][0])

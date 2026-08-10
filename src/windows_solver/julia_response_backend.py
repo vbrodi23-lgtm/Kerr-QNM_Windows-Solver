@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from contextvars import copy_context
+from decimal import Decimal, InvalidOperation, localcontext
 import hashlib
 import json
 import math
@@ -23,6 +24,7 @@ from typing import Callable, Mapping
 from .contracts import canonical_json_bytes
 from .response_engine import (
     BackendIdentity,
+    ROOT_BRANCH_CONTINUATION_TOLERANCE_ABS,
     ResponseComponentJob,
     RootReadout,
     _exterior_support,
@@ -32,6 +34,9 @@ from .progress import ProgressEventKind, emit_progress, ingest_external_progress
 
 _PROMOTED_DIGITS = frozenset({80, 120})
 JULIA_PROGRESS_PREFIX = "@@KERR_QNM_PROGRESS@@"
+_BRANCH_TOLERANCE_DECIMAL = Decimal(
+    str(ROOT_BRANCH_CONTINUATION_TOLERANCE_ABS)
+)
 
 
 def _forward_julia_progress_line(line: str) -> bool:
@@ -151,6 +156,28 @@ def _finite_text(value: object, label: str) -> float:
     converted = float(value)
     if not math.isfinite(converted):
         raise JuliaResponseBackendError(f"Julia response {label} is not finite")
+    return converted
+
+
+def _finite_decimal_text(
+    value: object, label: str, *, nonnegative: bool = False
+) -> Decimal:
+    """Preserve promoted-precision branch evidence without binary64 rounding."""
+
+    if not isinstance(value, str) or not value:
+        raise JuliaResponseBackendError(
+            f"Julia response {label} is not precision-preserving numeric text"
+        )
+    try:
+        converted = Decimal(value)
+    except InvalidOperation as error:
+        raise JuliaResponseBackendError(
+            f"Julia response {label} is not numeric"
+        ) from error
+    if not converted.is_finite() or (nonnegative and converted < 0):
+        raise JuliaResponseBackendError(
+            f"Julia response {label} is not finite and nonnegative"
+        )
     return converted
 
 
@@ -475,6 +502,10 @@ class JuliaPrecisionRootBackend:
             "root_residual_abs",
             "root_derivative_abs",
             "root_converged",
+            "branch_authentication_contract_version",
+            "root_branch_continuation_valid",
+            "branch_tolerance_abs",
+            "root_displacement_abs",
             "truncation_radius_abs",
             "resolution_radius_abs",
             "seed_path_radius_abs",
@@ -488,14 +519,98 @@ class JuliaPrecisionRootBackend:
             or response["working_precision_bits"]
             != math.ceil(self.digits * math.log2(10)) + 32
             or not isinstance(response["root_converged"], bool)
+            or response["branch_authentication_contract_version"] != 2
+            or not isinstance(response["root_branch_continuation_valid"], bool)
+            or (
+                response["root_converged"]
+                and not response["root_branch_continuation_valid"]
+            )
         ):
             raise JuliaResponseBackendError("M02 Julia response contract is invalid")
         converged = response["root_converged"]
-        return RootReadout(
-            omega=complex(
-                _finite_text(response["root_omega_re"], "root_omega_re"),
-                _finite_text(response["root_omega_im"], "root_omega_im"),
+        branch_continuation_valid = response[
+            "root_branch_continuation_valid"
+        ]
+        branch_tolerance_decimal = _finite_decimal_text(
+            response["branch_tolerance_abs"],
+            "branch_tolerance_abs",
+            nonnegative=True,
+        )
+        root_real_decimal = _finite_decimal_text(
+            response["root_omega_re"], "root_omega_re"
+        )
+        root_imaginary_decimal = _finite_decimal_text(
+            response["root_omega_im"], "root_omega_im"
+        )
+        root_displacement_decimal = _finite_decimal_text(
+            response["root_displacement_abs"],
+            "root_displacement_abs",
+            nonnegative=True,
+        )
+        diagnostic_radii_decimal = (
+            _finite_decimal_text(
+                response["truncation_radius_abs"],
+                "truncation_radius_abs",
+                nonnegative=True,
             ),
+            _finite_decimal_text(
+                response["resolution_radius_abs"],
+                "resolution_radius_abs",
+                nonnegative=True,
+            ),
+            _finite_decimal_text(
+                response["seed_path_radius_abs"],
+                "seed_path_radius_abs",
+                nonnegative=True,
+            ),
+        )
+        with localcontext() as context:
+            context.prec = self.digits + 64
+            delta_real = root_real_decimal - Decimal(
+                format(job.root.omega.real, ".17g")
+            )
+            delta_imaginary = root_imaginary_decimal - Decimal(
+                format(job.root.omega.imag, ".17g")
+            )
+            derived_displacement = (
+                delta_real * delta_real + delta_imaginary * delta_imaginary
+            ).sqrt()
+            # The worker has at least ``digits`` significant decimal digits;
+            # this bound allows only its final serialized decimal place.
+            serialization_allowance = Decimal(1).scaleb(-self.digits)
+            inconsistent_branch_evidence = (
+                abs(branch_tolerance_decimal - _BRANCH_TOLERANCE_DECIMAL)
+                > serialization_allowance
+                or abs(derived_displacement - root_displacement_decimal)
+                > serialization_allowance
+                or branch_continuation_valid
+                != (
+                    derived_displacement <= branch_tolerance_decimal
+                    and all(
+                        radius <= branch_tolerance_decimal
+                        for radius in diagnostic_radii_decimal
+                    )
+                )
+            )
+            if inconsistent_branch_evidence:
+                raise JuliaResponseBackendError(
+                    "M02 Julia branch-continuation evidence is inconsistent"
+                )
+        root = complex(
+            _finite_text(response["root_omega_re"], "root_omega_re"),
+            _finite_text(response["root_omega_im"], "root_omega_im"),
+        )
+        truncation_radius = _finite_text(
+            response["truncation_radius_abs"], "truncation_radius_abs"
+        )
+        resolution_radius = _finite_text(
+            response["resolution_radius_abs"], "resolution_radius_abs"
+        )
+        seed_path_radius = _finite_text(
+            response["seed_path_radius_abs"], "seed_path_radius_abs"
+        )
+        return RootReadout(
+            omega=root,
             determinant_residual_abs=_finite_text(
                 response["root_residual_abs"], "root_residual_abs"
             ),
@@ -505,18 +620,14 @@ class JuliaPrecisionRootBackend:
             converged=converged,
             root_reference_id=job.root.root_reference_id,
             branch_id=(
-                job.root.branch_id if converged else "nonmatching-julia-continuation"
+                job.root.branch_id
+                if branch_continuation_valid
+                else "nonmatching-julia-continuation"
             ),
             equation_id=job.equation_id,
-            truncation_radius=_finite_text(
-                response["truncation_radius_abs"], "truncation_radius_abs"
-            ),
-            resolution_radius=_finite_text(
-                response["resolution_radius_abs"], "resolution_radius_abs"
-            ),
-            seed_path_radius=_finite_text(
-                response["seed_path_radius_abs"], "seed_path_radius_abs"
-            ),
+            truncation_radius=truncation_radius,
+            resolution_radius=resolution_radius,
+            seed_path_radius=seed_path_radius,
         )
 
     def closed_form_horizon_response(

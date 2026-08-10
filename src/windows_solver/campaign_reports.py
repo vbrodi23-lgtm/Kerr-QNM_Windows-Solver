@@ -243,7 +243,7 @@ def _leaf_row(
         "precision_digits": outcome.digits,
         "precision_tier": precision.precision_tier,
         "precision_decimal_digits_nominal": (
-            precision.nominal_decimal_digits
+            str(precision.nominal_decimal_digits)
         ),
         "convergence_basis": (
             "" if result is None else result.convergence_basis
@@ -344,7 +344,7 @@ def _error_channel_rows(
             "precision_digits": stage.outcome.digits,
             "precision_tier": precision.precision_tier,
             "precision_decimal_digits_nominal": (
-                precision.nominal_decimal_digits
+                str(precision.nominal_decimal_digits)
             ),
             "channel_index": index,
             "channel_id": normalized.channel_id,
