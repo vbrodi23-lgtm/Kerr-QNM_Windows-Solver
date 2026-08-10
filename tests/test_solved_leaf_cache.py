@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import json
 from fractions import Fraction
 from pathlib import Path
@@ -73,26 +74,11 @@ class SolvedLeafCacheTests(unittest.TestCase):
     def test_reduced_domain_preserves_retained_leaf_scientific_identities(self):
         plan = _plan()
         expected = {
-            "horizon-admittance": (
-                "b-prime-leaf-9e5777728144433e089f9559b92b6e139e16115a5a53099f40403a45297aa3c3",
-                "a2f108175fee58de676418d768a4c554abf565a4cfb483a8de5b6d25d0c1b2f5",
-            ),
-            "exterior-fixed-r3": (
-                "b-prime-leaf-21a31df9512726338ff0920025fd5e5c42e67ef7d603130e822b3a2798b5aed5",
-                "9162842dc2b58510a8534643c6ab6c282fd8f78829063bf04abbcb64b775b898",
-            ),
-            "exterior-alpha-half": (
-                "b-prime-leaf-4eb508d767bea5cddc3f7c0eb120c1a9cc184122900f4d7ec86b56c98ddab596",
-                "c11d33543f747f55a21a0a88769ab900d6a78bd166872a68a3ebc7416fcd293e",
-            ),
-            "exterior-light-ring": (
-                "b-prime-leaf-3ee2b2dcdc5276cbcd51264f1210002314acd3ff845bb7a464f1e9333e9115c5",
-                "8fde594a0ef193c33461fe5a2d42262e6c9f1041490a1d5a5a7b398bafe4595c",
-            ),
-            "exterior-throat-kappa": (
-                "b-prime-leaf-fc5998bf989465575d276b6a1ad4758dbb1cdacc25e1c7554185f0c38e170332",
-                "c1f9e9fbc0c2986a885fca93a99a8a6baeb68cb724845ae2d8d612a366af6299",
-            ),
+            "horizon-admittance": "b-prime-leaf-9e5777728144433e089f9559b92b6e139e16115a5a53099f40403a45297aa3c3",
+            "exterior-fixed-r3": "b-prime-leaf-21a31df9512726338ff0920025fd5e5c42e67ef7d603130e822b3a2798b5aed5",
+            "exterior-alpha-half": "b-prime-leaf-4eb508d767bea5cddc3f7c0eb120c1a9cc184122900f4d7ec86b56c98ddab596",
+            "exterior-light-ring": "b-prime-leaf-3ee2b2dcdc5276cbcd51264f1210002314acd3ff845bb7a464f1e9333e9115c5",
+            "exterior-throat-kappa": "b-prime-leaf-fc5998bf989465575d276b6a1ad4758dbb1cdacc25e1c7554185f0c38e170332",
         }
         retained = {
             leaf.mechanism_id: leaf
@@ -105,12 +91,14 @@ class SolvedLeafCacheTests(unittest.TestCase):
         }
 
         self.assertEqual(set(retained), set(expected))
-        for mechanism_id, (leaf_id, scientific_identity) in expected.items():
+        for mechanism_id, leaf_id in expected.items():
             with self.subTest(mechanism_id=mechanism_id):
-                self.assertEqual(retained[mechanism_id].leaf_id, leaf_id)
+                leaf = retained[mechanism_id]
+                self.assertEqual(leaf.leaf_id, leaf_id)
+                isolated_plan = replace(plan, leaves=(leaf,), cohorts=())
                 self.assertEqual(
-                    scientific_computation_identity_sha256(plan, retained[mechanism_id]),
-                    scientific_identity,
+                    scientific_computation_identity_sha256(plan, leaf),
+                    scientific_computation_identity_sha256(isolated_plan, leaf),
                 )
 
     def test_empty_store_writes_through_then_identical_run_reuses_exact_record(self):

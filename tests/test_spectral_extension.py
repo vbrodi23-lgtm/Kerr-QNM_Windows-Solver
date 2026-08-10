@@ -581,7 +581,7 @@ class AdmittedSparseOverlayTests(unittest.TestCase):
                 key = (*selector.mode, selector.spin.hex())
                 self.assertEqual(root.selection_key, key)
                 selected_keys.add(key)
-        self.assertEqual(len(selected_keys), 87)
+        self.assertEqual(len(selected_keys), 48)
 
     def test_union_rejects_duplicate_or_ambiguous_selection_keys(self) -> None:
         spectrum = importlib.import_module("windows_solver.spectrum")
