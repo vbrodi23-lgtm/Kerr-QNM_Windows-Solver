@@ -685,7 +685,14 @@ def _validate_campaign_capability_superset(summary, descriptor, plan) -> None:
                 )
 
 
-def _campaign_selected(command: str, selection_path: Path, checkpoint: Path, *, full=False):
+def _campaign_selected(
+    command: str,
+    selection_path: Path,
+    checkpoint: Path,
+    *,
+    full: bool = False,
+    reporter: CampaignProgressReporter | None = None,
+):
     if command in {"campaign-run", "campaign-resume"}:
         emit_progress(
             ProgressEventKind.REQUEST_STARTED,
@@ -733,8 +740,12 @@ def _campaign_selected(command: str, selection_path: Path, checkpoint: Path, *, 
             _validate_campaign_capability_superset(cached, descriptor, plan)
             if cached.selection_id != selection.selection_id:
                 raise ValueError("campaign checkpoint selection does not match request")
+            if reporter is not None:
+                reporter.bind_campaign_reports(plan)
             if cached.state == "COMPLETE":
                 return 0, _campaign_console_mapping(command, cached)
+        elif reporter is not None:
+            reporter.bind_campaign_reports(plan)
         backend = _load_campaign_backend(descriptor, plan=plan, selection=selection)
         summary = run_campaign_selection(
             plan,
@@ -1046,6 +1057,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                                 arguments.command,
                                 arguments.selection,
                                 arguments.checkpoint,
+                                reporter=reporter,
                             )
                         except BaseException as error:
                             emit_progress(
