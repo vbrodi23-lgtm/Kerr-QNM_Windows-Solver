@@ -34,6 +34,7 @@ class RecordingObserver:
 
 
 class ProgressBusTests(unittest.TestCase):
+
     def test_campaign_run_and_resume_default_to_normal_progress(self):
         parser = build_parser()
         for command in ("campaign-run", "campaign-resume"):
@@ -604,7 +605,6 @@ class CampaignProgressReporterTests(unittest.TestCase):
             root_solves[-1]["momentum_summary"]["primary_solve_count"], 3
         )
 
-
     def test_normal_console_dashboard_is_completion_driven(self):
         class ConsoleStream(io.StringIO):
             def isatty(self):
@@ -663,6 +663,46 @@ class CampaignProgressReporterTests(unittest.TestCase):
         self.assertIn(" No scientific result payload.", output)
         self.assertNotIn("DeterminantAbs", output)
         self.assertNotIn("Suboperation", output)
+
+    def test_published_receipts_increase_the_visible_cache_total(self):
+        class ConsoleStream(io.StringIO):
+            def isatty(self):
+                return True
+
+        stream = ConsoleStream()
+        reporter = self._console_reporter(stream)
+        reporter.publish(
+            _payload_event(
+                ProgressEventKind.SOLVED_LEAF_CACHE_SCANNED,
+                {
+                    "compatible_count": 10,
+                    "stored_count": 11,
+                    "reusing_count": 10,
+                },
+                leaf_count=212,
+            )
+        )
+        reporter.publish(
+            _payload_event(
+                ProgressEventKind.LEAF_CACHE_PUBLISHED,
+                {"store_path": "solved-leaves-v1"},
+                leaf_id="leaf-1",
+                leaf_index=1,
+                leaf_count=212,
+            )
+        )
+        reporter.publish(
+            _payload_event(
+                ProgressEventKind.LEAF_COMPLETED,
+                {"state": "PRODUCED"},
+                leaf_id="leaf-2",
+                leaf_index=2,
+                leaf_count=212,
+            )
+        )
+
+        latest_panel = stream.getvalue().rsplit("\x1b[0J", 1)[-1]
+        self.assertIn(" Stored         12", latest_panel)
 
     def test_live_dashboard_renders_latest_completed_scientific_result(self):
         class ConsoleStream(io.StringIO):
@@ -757,6 +797,7 @@ class CampaignProgressReporterTests(unittest.TestCase):
         self.assertEqual(
             status["scientific"]["ProjectiveOutcome"], "SEPARATED"
         )
+
     def test_live_status_throttles_detail_events_but_forces_leaf_visibility(self):
         reporter = CampaignProgressReporter(
             "normal", self.reporter_checkpoint, io.StringIO()
@@ -787,6 +828,7 @@ class CampaignProgressReporterTests(unittest.TestCase):
             )
 
         self.assertEqual(write_status.call_count, 1)
+
     def test_quiet_renders_only_leaf_and_terminal_events(self):
         stream = io.StringIO()
         reporter = CampaignProgressReporter("quiet", self.reporter_checkpoint, stream)
@@ -806,7 +848,6 @@ class CampaignProgressReporterTests(unittest.TestCase):
         self.assertIn("leaf_completed", output)
         self.assertNotIn("campaign_started", output)
         self.assertNotIn("root_phase_started", output)
-
 
     def test_normal_console_redraws_only_on_campaign_or_terminal_events(self):
         class ConsoleStream(io.StringIO):
@@ -1100,6 +1141,7 @@ class CampaignProgressReporterTests(unittest.TestCase):
         self.assertIn(" Completed      3/553", failed_panel)
         self.assertIn(" Rejected       0", failed_panel)
         self.assertIn(" Failed         1", failed_panel)
+
     def test_trace_appends_session_marker_and_flushes_each_leaf_jsonl_event(self):
         with TemporaryDirectory() as directory:
             checkpoint = Path(directory) / "checkpoint.json"
