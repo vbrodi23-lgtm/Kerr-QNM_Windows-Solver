@@ -809,6 +809,35 @@ class CampaignProgressReporterTests(unittest.TestCase):
             status["scientific"]["ProjectiveOutcome"], "SEPARATED"
         )
 
+    def test_live_status_exposes_active_precision_tier_without_rewriting_context(self):
+        reporter = CampaignProgressReporter(
+            "quiet", self.reporter_checkpoint, io.StringIO()
+        )
+        reporter.publish(
+            _event(
+                ProgressEventKind.LEAF_STARTED,
+                leaf_id="leaf-1",
+                precision_digits=64,
+            )
+        )
+
+        status = json.loads(
+            Path(f"{self.reporter_checkpoint}.status.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(status["context"]["precision_digits"], 64)
+        self.assertEqual(
+            status["precision"],
+            {
+                "arithmetic": "IEEE-754 binary64",
+                "legacy_tier_value": 64,
+                "nominal_decimal_digits": 15.95,
+                "precision_tier": "binary64",
+                "presentation_label": "binary64 (~15.95 dec)",
+            },
+        )
+
     def test_live_status_throttles_detail_events_but_forces_leaf_visibility(self):
         reporter = CampaignProgressReporter(
             "normal", self.reporter_checkpoint, io.StringIO()
