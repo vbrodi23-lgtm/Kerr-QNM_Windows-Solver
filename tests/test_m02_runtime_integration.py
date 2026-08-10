@@ -154,7 +154,12 @@ class M02PersistentRuntimeIntegrationTests(unittest.TestCase):
                 "SpinWeightedSpheroidalHarmonics.jl",
             ):
                 source = runtime_root / "scientific-sources" / dependency_id / package
-                self.assertIn(source.as_posix(), manifest.replace("\\", "/"))
+                native_source = str(source)
+                self.assertTrue(
+                    source.as_posix() in manifest
+                    or native_source.replace("\\", "\\\\") in manifest,
+                    f"Manifest does not bind {source}",
+                )
                 self.assertTrue(
                     (source / "Project.toml").is_file(), source / "Project.toml"
                 )

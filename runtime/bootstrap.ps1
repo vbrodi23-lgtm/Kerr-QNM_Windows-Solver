@@ -137,15 +137,59 @@ function Remove-ManagedDirectory([string]$Path, [string]$Label) {
     }
 }
 
-function Read-JsonOrNull([string]$Path) {
+function Read-JsonState([string]$Path) {
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
-        return $null
+        return [ordered]@{
+            exists = $false
+            value = $null
+            error = $null
+        }
     }
     try {
-        return Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json
+        $value = Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json
+        return [ordered]@{
+            exists = $true
+            value = $value
+            error = $null
+        }
     }
     catch {
-        return $null
+        return [ordered]@{
+            exists = $true
+            value = $null
+            error = $_.Exception.Message
+        }
+    }
+}
+
+function Read-JsonOrNull([string]$Path) {
+    return (Read-JsonState $Path).value
+}
+
+function Write-JsonAtomically($Value, [string]$Path) {
+    $directory = Split-Path -Parent $Path
+    New-Item -ItemType Directory -Force -Path $directory | Out-Null
+    $temporary = Join-Path $directory (
+        "." + [IO.Path]::GetFileName($Path) + "." + [Guid]::NewGuid().ToString("N") + ".tmp"
+    )
+    try {
+        $json = $Value | ConvertTo-Json -Depth 20
+        [IO.File]::WriteAllText(
+            $temporary,
+            $json,
+            [System.Text.UTF8Encoding]::new($false)
+        )
+        if (Test-Path -LiteralPath $Path -PathType Leaf) {
+            [IO.File]::Replace($temporary, $Path, $null)
+        }
+        else {
+            Move-Item -LiteralPath $temporary -Destination $Path
+        }
+    }
+    finally {
+        if (Test-Path -LiteralPath $temporary -PathType Leaf) {
+            Remove-Item -LiteralPath $temporary -Force
+        }
     }
 }
 
@@ -333,15 +377,48 @@ function Get-TreeSha256([string]$Root) {
     return Get-TextSha256 ($entries -join "`n")
 }
 
+function Test-ManifestReferencesPath([string]$Manifest, [string]$Path) {
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        return $false
+    }
+    $fullPath = [IO.Path]::GetFullPath($Path).TrimEnd([char[]]@(92, 47))
+    $nativePathPrefix = $fullPath + '\'
+    $forwardSlashPathPrefix = $fullPath.Replace('\', '/') + '/'
+    $tomlEscapedWindowsPathPrefix = $fullPath.Replace('\', '\\') + '\\'
+    return (
+        $Manifest.IndexOf($nativePathPrefix, [System.StringComparison]::OrdinalIgnoreCase) -ge 0 `
+        -or $Manifest.IndexOf($forwardSlashPathPrefix, [System.StringComparison]::OrdinalIgnoreCase) -ge 0 `
+        -or $Manifest.IndexOf($tomlEscapedWindowsPathPrefix, [System.StringComparison]::OrdinalIgnoreCase) -ge 0
+    )
+}
+
 function Get-M02EnvironmentRejectionReason([string]$ContractSha256) {
-    $receipt = Read-JsonOrNull $M02ReceiptPath
-    if ($null -eq $receipt) {
+    $receiptState = Read-JsonState $M02ReceiptPath
+    if (-not $receiptState.exists) {
         return "dependency receipt is absent"
     }
-    if ($receipt.schema_version -ne 2 `
-        -or $receipt.dependency_contract_sha256 -ne $ContractSha256 `
-        -or $receipt.dependency_contract_id -ne $M02DependencyId) {
-        return "dependency receipt identity changed"
+    if ($null -eq $receiptState.value) {
+        return "dependency receipt is malformed: $($receiptState.error)"
+    }
+    $receipt = $receiptState.value
+    $schemaProperty = $receipt.PSObject.Properties["schema_version"]
+    $contractShaProperty = $receipt.PSObject.Properties["dependency_contract_sha256"]
+    $contractIdProperty = $receipt.PSObject.Properties["dependency_contract_id"]
+    if ($null -eq $schemaProperty -or $schemaProperty.Value -ne 2) {
+        return "dependency receipt schema changed"
+    }
+    if ($null -eq $contractShaProperty -or $contractShaProperty.Value -ne $ContractSha256) {
+        return "dependency receipt contract SHA-256 changed"
+    }
+    if ($null -eq $contractIdProperty -or $contractIdProperty.Value -ne $M02DependencyId) {
+        return "dependency receipt contract ID changed"
+    }
+    foreach ($name in @("dependency_source_root", "project", "depot")) {
+        $pathProperty = $receipt.PSObject.Properties[$name]
+        if ($null -eq $pathProperty `
+            -or -not (Test-ManagedRuntimePath ([string]$pathProperty.Value))) {
+            return "dependency receipt contains an absent or unmanaged $name path"
+        }
     }
     if (-not (Test-PersistentDependencySources)) {
         return "dependency source contract is absent or invalid"
@@ -361,14 +438,16 @@ function Get-M02EnvironmentRejectionReason([string]$ContractSha256) {
         -or $null -eq $manifestShaProperty) {
         return "dependency receipt lacks Project/Manifest digests"
     }
+    if ($projectShaProperty.Value -ne $M02DependencyContract.project_sha256) {
+        return "dependency receipt Project digest changed"
+    }
     $manifest = Get-Content -LiteralPath (Join-Path $JuliaProject "Manifest.toml") -Raw
-    $checkoutRoot = [IO.Path]::GetFullPath($PackageRoot)
-    $persistentSourceRoot = ([IO.Path]::GetFullPath($M02DependencySourceRoot)).Replace('\', '/')
-    if ($manifest.IndexOf($checkoutRoot, [System.StringComparison]::OrdinalIgnoreCase) -ge 0 `
+    $checkoutSourceRoot = [IO.Path]::GetFullPath($JuliaDataRoot)
+    if ((Test-ManifestReferencesPath $manifest $checkoutSourceRoot) `
         -or $manifest.IndexOf("../vendor/", [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
         return "dependency Manifest contains a checkout-relative or environment-local source path"
     }
-    if ($manifest.Replace('\', '/').IndexOf($persistentSourceRoot, [System.StringComparison]::OrdinalIgnoreCase) -lt 0) {
+    if (-not (Test-ManifestReferencesPath $manifest $M02DependencySourceRoot)) {
         return "dependency Manifest is not bound to the authenticated dependency source root"
     }
     if ($projectShaProperty.Value -ne (Get-Sha256 (Join-Path $JuliaProject "Project.toml"))) {
@@ -382,6 +461,79 @@ function Get-M02EnvironmentRejectionReason([string]$ContractSha256) {
 
 function Test-M02Environment([string]$ContractSha256) {
     return $null -eq (Get-M02EnvironmentRejectionReason $ContractSha256)
+}
+
+function Write-M02DependencyDiagnostics([string]$Reason) {
+    $receiptState = Read-JsonState $M02ReceiptPath
+    $receipt = $receiptState.value
+    $projectPath = Join-Path $JuliaProject "Project.toml"
+    $manifestPath = Join-Path $JuliaProject "Manifest.toml"
+    $projectExists = Test-Path -LiteralPath $projectPath -PathType Leaf
+    $manifestExists = Test-Path -LiteralPath $manifestPath -PathType Leaf
+    $depotExists = Test-Path -LiteralPath $JuliaDepot -PathType Container
+    $expectedProjectSha256 = [string]$ProjectSource.sha256
+    $expectedManifestSha256 = "<unavailable>"
+    $receiptProjectSha256 = "<unavailable>"
+    $receiptDependencyId = "<unavailable>"
+    $receiptDependencySha256 = "<unavailable>"
+    if ($null -ne $receipt) {
+        $receiptIdProperty = $receipt.PSObject.Properties["dependency_contract_id"]
+        $receiptShaProperty = $receipt.PSObject.Properties["dependency_contract_sha256"]
+        $projectShaProperty = $receipt.PSObject.Properties["project_sha256"]
+        $manifestShaProperty = $receipt.PSObject.Properties["manifest_sha256"]
+        if ($null -ne $receiptIdProperty) {
+            $receiptDependencyId = [string]$receiptIdProperty.Value
+        }
+        if ($null -ne $receiptShaProperty) {
+            $receiptDependencySha256 = [string]$receiptShaProperty.Value
+        }
+        if ($null -ne $projectShaProperty) {
+            $receiptProjectSha256 = [string]$projectShaProperty.Value
+        }
+        if ($null -ne $manifestShaProperty) {
+            $expectedManifestSha256 = [string]$manifestShaProperty.Value
+        }
+    }
+    $observedProjectSha256 = if ($projectExists) { Get-Sha256 $projectPath } else { "<absent>" }
+    $observedManifestSha256 = if ($manifestExists) { Get-Sha256 $manifestPath } else { "<absent>" }
+
+    Write-Step "Runtime root: $RuntimeRoot"
+    Write-Step "M02 dependency SHA-256: $M02DependencySha256"
+    Write-Step "M02 dependency ID: $M02DependencyId"
+    Write-Step "Dependency receipt path: $M02ReceiptPath"
+    Write-Step "Dependency receipt exists: $($receiptState.exists)"
+    Write-Step "Dependency receipt readable: $($null -ne $receipt)"
+    Write-Step "Receipt dependency ID: $receiptDependencyId"
+    Write-Step "Receipt dependency SHA-256: $receiptDependencySha256"
+    if ($receiptState.exists -and $null -eq $receipt) {
+        Write-Step "Dependency receipt parse error: $($receiptState.error)"
+    }
+    Write-Step "Dependency source root: $M02DependencySourceRoot"
+    Write-Step "Julia project: $JuliaProject"
+    Write-Step "Julia depot: $JuliaDepot"
+    Write-Step "Project exists: $projectExists"
+    Write-Step "Manifest exists: $manifestExists"
+    Write-Step "Depot exists: $depotExists"
+    Write-Step "Expected Project SHA-256: $expectedProjectSha256"
+    Write-Step "Receipt Project SHA-256: $receiptProjectSha256"
+    Write-Step "Observed Project SHA-256: $observedProjectSha256"
+    Write-Step "Expected Manifest SHA-256: $expectedManifestSha256"
+    Write-Step "Observed Manifest SHA-256: $observedManifestSha256"
+    Write-Step "Manifest seed SHA-256: $($ManifestSeedSource.sha256)"
+    Write-Step "Julia executable SHA-256: $($JuliaCandidate.executable_sha256)"
+    Write-Step "GSN vendor-tree SHA-256: $GsnTreeSha256"
+    Write-Step "Angular vendor-tree SHA-256: $AngularTreeSha256"
+    Write-Step "Reuse rejected: $Reason"
+}
+
+function Write-ValidatedM02DependencyReceipt($Receipt) {
+    Write-JsonAtomically $Receipt $M02ReceiptPath
+    $persistedRejectionReason = Get-M02EnvironmentRejectionReason $M02DependencySha256
+    if ($null -ne $persistedRejectionReason) {
+        Write-M02DependencyDiagnostics $persistedRejectionReason
+        throw "M02 dependency receipt failed immediate validation: $persistedRejectionReason"
+    }
+    Write-Step "M02 dependency receipt written: $M02ReceiptPath"
 }
 
 function Set-M02JuliaEnvironment {
@@ -476,9 +628,14 @@ function Test-ManagedRuntimePath([string]$Path) {
     if ([string]::IsNullOrWhiteSpace($Path)) {
         return $false
     }
-    $managedRoot = [IO.Path]::GetFullPath($RuntimeRoot).TrimEnd([char[]]@(92, 47)) + [IO.Path]::DirectorySeparatorChar
-    $candidate = [IO.Path]::GetFullPath($Path)
-    return $candidate.StartsWith($managedRoot, [System.StringComparison]::OrdinalIgnoreCase)
+    try {
+        $managedRoot = [IO.Path]::GetFullPath($RuntimeRoot).TrimEnd([char[]]@(92, 47)) + [IO.Path]::DirectorySeparatorChar
+        $candidate = [IO.Path]::GetFullPath($Path)
+        return $candidate.StartsWith($managedRoot, [System.StringComparison]::OrdinalIgnoreCase)
+    }
+    catch {
+        return $false
+    }
 }
 
 function Get-CompatibleLegacyM02Environment {
@@ -540,11 +697,10 @@ function Get-CompatibleLegacyM02Environment {
         return $null
     }
     $actualManifest = Get-Content -LiteralPath $manifestPath -Raw
-    $checkoutRoot = [IO.Path]::GetFullPath($PackageRoot)
-    $persistentSourceRoot = $sourceRoot.Replace('\', '/')
-    if ($actualManifest.IndexOf($checkoutRoot, [System.StringComparison]::OrdinalIgnoreCase) -ge 0 `
+    $checkoutSourceRoot = [IO.Path]::GetFullPath($JuliaDataRoot)
+    if ((Test-ManifestReferencesPath $actualManifest $checkoutSourceRoot) `
         -or $actualManifest.IndexOf("../vendor/", [System.StringComparison]::OrdinalIgnoreCase) -ge 0 `
-        -or $actualManifest.Replace('\', '/').IndexOf($persistentSourceRoot, [System.StringComparison]::OrdinalIgnoreCase) -lt 0) {
+        -or -not (Test-ManifestReferencesPath $actualManifest $sourceRoot)) {
         return $null
     }
     return [ordered]@{
@@ -557,6 +713,25 @@ function Get-CompatibleLegacyM02Environment {
 if ($PowerShell51Smoke) {
     $smokeRoot = Join-Path ([IO.Path]::GetTempPath()) ("Kerr-QNM-bootstrap-smoke-" + [Guid]::NewGuid().ToString("N"))
     try {
+        # GitHub's stripped Windows PowerShell test host may not auto-load the
+        # module that provides Get-FileHash. The normal bootstrap keeps its
+        # production hash function; this no-Julia smoke uses the same SHA-256
+        # bytes through the framework directly.
+        function Get-Sha256([string]$Path) {
+            $stream = [IO.File]::OpenRead($Path)
+            try {
+                $sha = [System.Security.Cryptography.SHA256]::Create()
+                try {
+                    return ([BitConverter]::ToString($sha.ComputeHash($stream))).Replace("-", "").ToLowerInvariant()
+                }
+                finally {
+                    $sha.Dispose()
+                }
+            }
+            finally {
+                $stream.Dispose()
+            }
+        }
         New-Item -ItemType Directory -Force -Path (Join-Path $smokeRoot "child") | Out-Null
         Remove-ManagedDirectory $smokeRoot "PowerShell compatibility smoke"
         if (Test-Path -LiteralPath $smokeRoot) {
@@ -582,6 +757,179 @@ path = "../vendor/SpinWeightedSpheroidalHarmonics.jl"
         if ((Get-Content -LiteralPath $smokeManifest -Raw).IndexOf("../vendor/", [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
             throw "PowerShell compatibility smoke left an environment-local vendor path in the manifest."
         }
+
+        # Exercise the actual dependency receipt/reuse predicates with a
+        # Windows-TOML fixture. Julia serializes native paths with doubled
+        # backslashes, so this catches the warm-reuse regression without
+        # launching Julia or installing any package.
+        $PackageRoot = Join-Path $smokeRoot "checkout"
+        $JuliaDataRoot = Join-Path $PackageRoot "src\windows_solver\data\julia"
+        $RuntimeRoot = Join-Path $PackageRoot ".runtime"
+        $M02DependencyId = "m02-deps-smoke"
+        $M02DependencySha256 = "a" * 64
+        $M02DependencySourceRoot = Join-Path $RuntimeRoot "scientific-sources\$M02DependencyId"
+        $JuliaProject = Join-Path $RuntimeRoot "m02-environments\$M02DependencyId\project"
+        $JuliaDepot = Join-Path $RuntimeRoot "julia-depot\$M02DependencyId"
+        $M02ReceiptPath = Join-Path $RuntimeRoot "metadata\m02-environments\$M02DependencyId.json"
+        $smokeProjectSource = Join-Path $M02DependencySourceRoot "m02_project\Project.toml"
+        $smokeManifestSeedSource = Join-Path $M02DependencySourceRoot "m02_project\Manifest.seed.toml"
+        New-Item -ItemType Directory -Force -Path (Split-Path -Parent $smokeProjectSource) | Out-Null
+        Set-Content -LiteralPath $smokeProjectSource -Value "name = 'M02Smoke'" -Encoding UTF8
+        Set-Content -LiteralPath $smokeManifestSeedSource -Value "manifest_format = '2.0'" -Encoding UTF8
+        foreach ($name in @("GeneralizedSasakiNakamura.jl", "SpinWeightedSpheroidalHarmonics.jl")) {
+            $package = Join-Path $M02DependencySourceRoot $name
+            New-Item -ItemType Directory -Force -Path $package | Out-Null
+            Set-Content -LiteralPath (Join-Path $package "Project.toml") -Value "name = '$name'" -Encoding UTF8
+        }
+        $GsnTreeSha256 = Get-TreeSha256 (Join-Path $M02DependencySourceRoot "GeneralizedSasakiNakamura.jl")
+        $AngularTreeSha256 = Get-TreeSha256 (Join-Path $M02DependencySourceRoot "SpinWeightedSpheroidalHarmonics.jl")
+        $ProjectSource = [ordered]@{
+            id = "m02-julia-project"
+            lifecycle = "dependency"
+            relative_path = "m02_project\Project.toml"
+            sha256 = Get-Sha256 $smokeProjectSource
+        }
+        $ManifestSeedSource = [ordered]@{
+            id = "m02-julia-manifest-seed"
+            lifecycle = "dependency"
+            relative_path = "m02_project\Manifest.seed.toml"
+            sha256 = Get-Sha256 $smokeManifestSeedSource
+        }
+        $SourceReceipts = @($ProjectSource, $ManifestSeedSource)
+        $JuliaCandidate = [ordered]@{
+            version = "1.10.11"
+            bits = 64
+            executable_sha256 = "b" * 64
+        }
+        $M02DependencyContract = [ordered]@{
+            schema_version = 1
+            julia = $JuliaCandidate
+            project_sha256 = $ProjectSource.sha256
+            manifest_seed_sha256 = $ManifestSeedSource.sha256
+            vendor_trees = [ordered]@{
+                generalized_sasaki_nakamura = $GsnTreeSha256
+                spin_weighted_spheroidal_harmonics = $AngularTreeSha256
+            }
+        }
+        $escapedGsnPath = ([IO.Path]::GetFullPath((Join-Path $M02DependencySourceRoot "GeneralizedSasakiNakamura.jl"))).Replace('\', '\\')
+        $escapedAngularPath = ([IO.Path]::GetFullPath((Join-Path $M02DependencySourceRoot "SpinWeightedSpheroidalHarmonics.jl"))).Replace('\', '\\')
+        $escapedManifest = @"
+[[deps.GeneralizedSasakiNakamura]]
+path = "$escapedGsnPath"
+[[deps.SpinWeightedSpheroidalHarmonics]]
+path = "$escapedAngularPath"
+"@
+
+        $firstReason = Get-M02EnvironmentRejectionReason $M02DependencySha256
+        if ($firstReason -ne "dependency receipt is absent") {
+            throw "M02 dependency smoke expected an absent first-run receipt; received: $firstReason"
+        }
+        $script:SmokeDependencyRebuildCalls = 0
+        $rebuildSmokeDependencyEnvironment = {
+            $script:SmokeDependencyRebuildCalls += 1
+            if (Test-Path -LiteralPath $JuliaProject) {
+                Remove-ManagedDirectory $JuliaProject "M02 dependency smoke project"
+            }
+            if (Test-Path -LiteralPath $JuliaDepot) {
+                Remove-ManagedDirectory $JuliaDepot "M02 dependency smoke depot"
+            }
+            New-Item -ItemType Directory -Force -Path $JuliaProject | Out-Null
+            New-Item -ItemType Directory -Force -Path $JuliaDepot | Out-Null
+            Copy-Item -LiteralPath $smokeProjectSource -Destination (Join-Path $JuliaProject "Project.toml")
+            [IO.File]::WriteAllText(
+                (Join-Path $JuliaProject "Manifest.toml"),
+                $escapedManifest,
+                [System.Text.UTF8Encoding]::new($false)
+            )
+            $M02Receipt = [ordered]@{
+                schema_version = 2
+                dependency_contract_sha256 = $M02DependencySha256
+                dependency_contract_id = $M02DependencyId
+                dependency_contract = $M02DependencyContract
+                dependency_source_root = [IO.Path]::GetFullPath($M02DependencySourceRoot)
+                project = [IO.Path]::GetFullPath($JuliaProject)
+                depot = [IO.Path]::GetFullPath($JuliaDepot)
+                project_sha256 = Get-Sha256 (Join-Path $JuliaProject "Project.toml")
+                manifest_sha256 = Get-Sha256 (Join-Path $JuliaProject "Manifest.toml")
+                storage_layout = "dependency-v2-smoke"
+                created_utc = [DateTime]::UtcNow.ToString("o")
+            }
+            Write-ValidatedM02DependencyReceipt $M02Receipt
+        }
+        & $rebuildSmokeDependencyEnvironment
+
+        $secondReason = Get-M02EnvironmentRejectionReason $M02DependencySha256
+        $secondRunRebuildCalls = 0
+        if ($null -ne $secondReason) {
+            $secondRunRebuildCalls += 1
+            & $rebuildSmokeDependencyEnvironment
+        }
+        if ($secondRunRebuildCalls -ne 0 -or $script:SmokeDependencyRebuildCalls -ne 1) {
+            throw "M02 dependency smoke rebuilt an identical second invocation."
+        }
+
+        $dependencyShaBeforeWorkerChange = Get-ObjectSha256 $M02DependencyContract
+        $workerContractBefore = Get-ObjectSha256 ([ordered]@{ worker_sha256 = "c" * 64 })
+        $workerContractAfter = Get-ObjectSha256 ([ordered]@{ worker_sha256 = "d" * 64 })
+        $dependencyShaAfterWorkerChange = Get-ObjectSha256 $M02DependencyContract
+        if ($workerContractBefore -eq $workerContractAfter `
+            -or $dependencyShaBeforeWorkerChange -ne $dependencyShaAfterWorkerChange `
+            -or $null -ne (Get-M02EnvironmentRejectionReason $M02DependencySha256)) {
+            throw "M02 dependency smoke invalidated the environment for a worker-only change."
+        }
+
+        $checkoutSourcePath = ([IO.Path]::GetFullPath((Join-Path $JuliaDataRoot "GeneralizedSasakiNakamura.jl"))).Replace('\', '\\')
+        $checkoutManifest = $escapedManifest.Replace($escapedGsnPath, $checkoutSourcePath)
+        [IO.File]::WriteAllText(
+            (Join-Path $JuliaProject "Manifest.toml"),
+            $checkoutManifest,
+            [System.Text.UTF8Encoding]::new($false)
+        )
+        $checkoutReason = Get-M02EnvironmentRejectionReason $M02DependencySha256
+        if ($checkoutReason -ne "dependency Manifest contains a checkout-relative or environment-local source path") {
+            throw "M02 dependency smoke did not reject a packaged-source Manifest path: $checkoutReason"
+        }
+        [IO.File]::WriteAllText(
+            (Join-Path $JuliaProject "Manifest.toml"),
+            $escapedManifest,
+            [System.Text.UTF8Encoding]::new($false)
+        )
+
+        $changedDependencyContract = [ordered]@{
+            schema_version = 1
+            julia = $JuliaCandidate
+            project_sha256 = "e" * 64
+            manifest_seed_sha256 = $ManifestSeedSource.sha256
+            vendor_trees = $M02DependencyContract.vendor_trees
+        }
+        $changedDependencySha256 = Get-ObjectSha256 $changedDependencyContract
+        $changedDependencyId = "m02-deps-" + $changedDependencySha256.Substring(0, 24)
+        $changedJuliaProject = Join-Path $RuntimeRoot "m02-environments\$changedDependencyId\project"
+        $changedJuliaDepot = Join-Path $RuntimeRoot "julia-depot\$changedDependencyId"
+        if ($changedDependencySha256 -eq $dependencyShaBeforeWorkerChange `
+            -or $changedDependencyId -eq $M02DependencyId `
+            -or $changedJuliaProject -eq $JuliaProject `
+            -or $changedJuliaDepot -eq $JuliaDepot) {
+            throw "M02 dependency smoke did not invalidate an actual dependency-contract change."
+        }
+
+        Remove-Item -LiteralPath $M02ReceiptPath -Force
+        $deletedReason = Get-M02EnvironmentRejectionReason $M02DependencySha256
+        if ($deletedReason -ne "dependency receipt is absent") {
+            throw "M02 dependency smoke did not reject a deleted receipt explicitly: $deletedReason"
+        }
+        Write-M02DependencyDiagnostics $deletedReason
+        [IO.File]::WriteAllText(
+            $M02ReceiptPath,
+            "{malformed",
+            [System.Text.UTF8Encoding]::new($false)
+        )
+        $malformedReason = Get-M02EnvironmentRejectionReason $M02DependencySha256
+        if (-not $malformedReason.StartsWith("dependency receipt is malformed:")) {
+            throw "M02 dependency smoke did not reject a malformed receipt explicitly: $malformedReason"
+        }
+        Write-M02DependencyDiagnostics $malformedReason
+        Write-Host "M02 dependency lifecycle smoke passed"
         Write-Host "PowerShell 5.1 compatibility smoke passed"
     }
     finally {
@@ -994,7 +1342,7 @@ if ($WithM02) {
             storage_layout = "legacy-aggregate-v1"
             created_utc = [DateTime]::UtcNow.ToString("o")
         }
-        $M02Receipt | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $M02ReceiptPath -Encoding UTF8
+        Write-ValidatedM02DependencyReceipt $M02Receipt
         $DependencyRejectionReason = Get-M02EnvironmentRejectionReason $M02DependencySha256
         $M02Ready = $null -eq $DependencyRejectionReason
     }
@@ -1018,6 +1366,10 @@ if ($WithM02) {
         Write-Step "M02 Julia project/depot receipt and probe are valid"
     }
     else {
+        if ($DependencyRejectionReason -eq "dependency receipt is absent") {
+            Write-Step "M02 dependency environment absent"
+        }
+        Write-M02DependencyDiagnostics $DependencyRejectionReason
         $PriorManifestSeedSha256 = $null
         if ($null -ne $ExistingReceipt) {
             $priorJuliaProperty = $ExistingReceipt.PSObject.Properties["julia_runtime"]
@@ -1097,7 +1449,7 @@ Pkg.precompile()
             storage_layout = "dependency-v2"
             created_utc = [DateTime]::UtcNow.ToString("o")
         }
-        $M02Receipt | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $M02ReceiptPath -Encoding UTF8
+        Write-ValidatedM02DependencyReceipt $M02Receipt
         Write-Step "M02 Julia project, depot, and precision worker are ready"
     }
     $WorkerPath = $PersistentWorkerPath

@@ -318,6 +318,34 @@ class PublicSurfaceTests(unittest.TestCase):
             "M02 dependency environment reused from authenticated legacy aggregate contract",
             bootstrap,
         )
+        self.assertIn("Test-ManifestReferencesPath", bootstrap)
+        self.assertIn("$tomlEscapedWindowsPath", bootstrap)
+        self.assertIn(
+            "$checkoutSourceRoot = [IO.Path]::GetFullPath($JuliaDataRoot)",
+            bootstrap,
+        )
+        self.assertNotIn(
+            "$checkoutRoot = [IO.Path]::GetFullPath($PackageRoot)",
+            bootstrap,
+        )
+        self.assertIn("Write-ValidatedM02DependencyReceipt", bootstrap)
+        self.assertIn("M02 dependency receipt written:", bootstrap)
+        for diagnostic in (
+            "M02 dependency SHA-256:",
+            "M02 dependency ID:",
+            "Dependency receipt path:",
+            "Dependency receipt exists:",
+            "Expected Project SHA-256:",
+            "Receipt Project SHA-256:",
+            "Observed Project SHA-256:",
+            "Expected Manifest SHA-256:",
+            "Observed Manifest SHA-256:",
+            "Julia executable SHA-256:",
+            "GSN vendor-tree SHA-256:",
+            "Angular vendor-tree SHA-256:",
+            "Reuse rejected:",
+        ):
+            self.assertIn(diagnostic, bootstrap)
 
     def test_m02_bootstrap_extracts_julia_with_windows_tar(self) -> None:
         root = Path(__file__).resolve().parents[1]
@@ -927,6 +955,16 @@ exit 0
         )
         self.assertIn(
             b"PowerShell 5.1 compatibility smoke passed", result.stdout
+        )
+        self.assertIn(
+            b"M02 dependency lifecycle smoke passed", result.stdout
+        )
+        self.assertIn(b"Dependency receipt exists: False", result.stdout)
+        self.assertIn(
+            b"Reuse rejected: dependency receipt is absent", result.stdout
+        )
+        self.assertIn(
+            b"Reuse rejected: dependency receipt is malformed:", result.stdout
         )
 
     @unittest.skipUnless(os.name == "nt", "requires Windows PowerShell 5.1")
