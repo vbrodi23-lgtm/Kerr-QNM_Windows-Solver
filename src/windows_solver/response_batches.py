@@ -63,6 +63,31 @@ STAGE_SIGNED_ERROR_FAMILIES = (
     "repeat-polish",
     "precision-ladder-discrepancy",
 )
+_EXECUTION_ROLE_ORDER = {
+    "primary": 0,
+    "deep": 1,
+    "control": 2,
+}
+_EXECUTION_MECHANISM_ORDER = {
+    "horizon-admittance": 0,
+    "exterior-light-ring": 1,
+    "exterior-throat-kappa": 2,
+    "exterior-alpha-half": 3,
+    "exterior-alpha-one": 3,
+    "exterior-fixed-r3": 4,
+}
+_EXECUTION_MODE_ORDER = {
+    "primary": {
+        "220": 0, "440": 1, "330": 2, "221": 3,
+        "441": 4, "331": 5, "222": 6,
+    },
+    "deep": {
+        "220": 0, "221": 1, "222": 2, "210": 3,
+    },
+    "control": {
+        "210": 0, "2-minus-2-0": 1, "320": 2, "3-minus-3-0": 3,
+    },
+}
 PREDECLARED_CAMPAIGN_SMOKE_LEAF_IDS = (
     "b-prime-leaf-9e5777728144433e089f9559b92b6e139e16115a5a53099f40403a45297aa3c3",
     "b-prime-leaf-7ef38d6f95c161d0b4c6650d470898c0742ad6ae8440e89956312344c0db6aac",
@@ -1021,6 +1046,45 @@ def build_campaign_selection(
     )
 
 
+def _campaign_execution_leaf_ids(
+    plan: CampaignPlan, selection: CampaignSelection
+) -> tuple[str, ...]:
+    """Order selected work without changing its authenticated selection order."""
+
+    selected = set(selection.leaf_ids)
+    canonical_index = {
+        leaf.leaf_id: index for index, leaf in enumerate(plan.leaves)
+    }
+
+    def execution_key(leaf: CampaignLeafPlan) -> tuple[object, ...]:
+        try:
+            role_rank = _EXECUTION_ROLE_ORDER[leaf.role]
+            mechanism_rank = _EXECUTION_MECHANISM_ORDER[leaf.mechanism_id]
+            mode_rank = _EXECUTION_MODE_ORDER[leaf.role][leaf.leaf.mode_label]
+        except KeyError as error:
+            raise ValueError(
+                "campaign execution order lacks a declared role, mechanism, or mode"
+            ) from error
+        return (
+            role_rank,
+            mechanism_rank,
+            mode_rank,
+            leaf.leaf.spin,
+            canonical_index[leaf.leaf_id],
+        )
+
+    ordered = tuple(
+        leaf.leaf_id
+        for leaf in sorted(
+            (leaf for leaf in plan.leaves if leaf.leaf_id in selected),
+            key=execution_key,
+        )
+    )
+    if len(ordered) != len(selection.leaf_ids) or set(ordered) != selected:
+        raise ValueError("campaign execution traversal is off-selection")
+    return ordered
+
+
 def _merged_selection(
     plan: CampaignPlan, leaf_ids: Sequence[str]
 ) -> CampaignSelection:
@@ -1200,8 +1264,6 @@ def _load_checkpoint(
     )
     if record_ids != expected_record_order:
         raise ValueError("campaign checkpoint record order is invalid")
-    if selection.role != "merged" and record_ids != selection.leaf_ids[:len(records)]:
-        raise ValueError("selected campaign checkpoint records are not a prefix")
     for record in records:
         leaf = leaf_by_id[record.leaf_id]
         if record.role != leaf.role:
@@ -1552,13 +1614,15 @@ def _validate_precision120(outcome: StageOutcome) -> None:
         raise ValueError("campaign 120-digit evidence is incomplete")
 
 
-def _replace_record(
-    records: list[CampaignLeafRecord], index: int, record: CampaignLeafRecord
-) -> None:
-    if index < len(records):
-        records[index] = record
-    else:
-        records.append(record)
+def _ordered_selection_records(
+    selection: CampaignSelection,
+    records_by_id: Mapping[str, CampaignLeafRecord],
+) -> tuple[CampaignLeafRecord, ...]:
+    return tuple(
+        records_by_id[leaf_id]
+        for leaf_id in selection.leaf_ids
+        if leaf_id in records_by_id
+    )
 
 
 def _campaign_stage_record(
@@ -1726,10 +1790,11 @@ def run_campaign_selection(
     resume: bool,
     solved_leaf_store: SolvedLeafStore | None = None,
 ) -> CampaignRunSummary:
+    execution_leaf_ids = _campaign_execution_leaf_ids(plan, selection)
     cache_lookups: dict[str, SolvedLeafLookup] = {}
     if solved_leaf_store is not None:
         leaf_by_id = {leaf.leaf_id: leaf for leaf in plan.leaves}
-        for leaf_id in selection.leaf_ids:
+        for leaf_id in execution_leaf_ids:
             cache_lookups[leaf_id] = _authenticated_solved_leaf_lookup(
                 plan, leaf_by_id[leaf_id], solved_leaf_store
             )
@@ -1740,7 +1805,7 @@ def run_campaign_selection(
         next_unsolved = next(
             (
                 index
-                for index, leaf_id in enumerate(selection.leaf_ids, start=1)
+                for index, leaf_id in enumerate(execution_leaf_ids, start=1)
                 if cache_lookups[leaf_id].status
                 is not SolvedLeafLookupStatus.HIT
             ),
@@ -1812,8 +1877,8 @@ def _run_campaign_selection_active(
         loaded_selection, existing, _ = _load_checkpoint(plan, path)
         if loaded_selection != selection:
             raise ValueError("campaign checkpoint selection does not match request")
-        records = list(existing)
-        for record in records:
+        records_by_id = {record.leaf_id: record for record in existing}
+        for record in existing:
             for stage in record.stages:
                 prior = set(stage.runner_provenance["available_precision_digits"])
                 if not prior.issubset(set(available.digits)):
@@ -1823,24 +1888,28 @@ def _run_campaign_selection_active(
     else:
         if resume:
             raise ValueError("campaign resume requires an existing checkpoint")
-        records = []
-    reused = sum(len(record.stages) for record in records)
+        records_by_id = {}
+    reused = sum(
+        len(record.stages) for record in records_by_id.values()
+    )
     executed = 0
     leaf_by_id = {leaf.leaf_id: leaf for leaf in plan.leaves}
-    for index, leaf_id in enumerate(selection.leaf_ids):
+    execution_leaf_ids = _campaign_execution_leaf_ids(plan, selection)
+    for index, leaf_id in enumerate(execution_leaf_ids):
         leaf = leaf_by_id[leaf_id]
         context = _leaf_progress_context(leaf, index + 1, len(selection.leaf_ids))
-        if index < len(records) and records[index].state in {
+        record = records_by_id.get(leaf_id)
+        if record is not None and record.state in {
             "PRODUCED", "UNRESOLVED"
         }:
             with progress_scope(**context):
                 emit_progress(
                     ProgressEventKind.LEAF_REUSED,
-                    state=records[index].state,
-                    stage_count=len(records[index].stages),
+                    state=record.state,
+                    stage_count=len(record.stages),
                 )
             continue
-        if index >= len(records) and solved_leaf_store is not None:
+        if record is None and solved_leaf_store is not None:
             lookup = cache_lookups.get(leaf.leaf_id)
             if lookup is None:
                 lookup = _authenticated_solved_leaf_lookup(
@@ -1851,11 +1920,18 @@ def _run_campaign_selection_active(
                 cached_record = CampaignLeafRecord.from_mapping(
                     lookup.receipt["record"]
                 )
-                _replace_record(records, index, cached_record)
+                records_by_id[leaf_id] = cached_record
                 with progress_scope(**context):
                     emit_progress(ProgressEventKind.CHECKPOINT_WRITING)
                     _atomic_json(
-                        path, _checkpoint_mapping(plan, selection, records)
+                        path,
+                        _checkpoint_mapping(
+                            plan,
+                            selection,
+                            _ordered_selection_records(
+                                selection, records_by_id
+                            ),
+                        ),
                     )
                     emit_progress(ProgressEventKind.CHECKPOINT_WRITTEN)
                     emit_progress(
@@ -1880,7 +1956,6 @@ def _run_campaign_selection_active(
                     )
         with progress_scope(**context):
             emit_progress(ProgressEventKind.LEAF_STARTED)
-        record = records[index] if index < len(records) else None
         if record is None:
             outcome, stage_duration = _execute_campaign_stage_with_progress(
                 backend, leaf, 64, context
@@ -1918,10 +1993,14 @@ def _run_campaign_selection_active(
                         else None
                     ),
                 )
-            _replace_record(records, index, record)
+            records_by_id[leaf_id] = record
             _checkpoint_stage_with_progress(
                 path,
-                _checkpoint_mapping(plan, selection, records),
+                _checkpoint_mapping(
+                    plan,
+                    selection,
+                    _ordered_selection_records(selection, records_by_id),
+                ),
                 context=context,
                 digits=64,
                 duration_seconds=stage_duration,
@@ -1983,10 +2062,16 @@ def _run_campaign_selection_active(
                         missing_precision_digits=120,
                         sentinel_comparison=comparison,
                     )
-                    _replace_record(records, index, record)
+                    records_by_id[leaf_id] = record
                     _checkpoint_stage_with_progress(
                         path,
-                        _checkpoint_mapping(plan, selection, records),
+                        _checkpoint_mapping(
+                            plan,
+                            selection,
+                            _ordered_selection_records(
+                                selection, records_by_id
+                            ),
+                        ),
                         context=context,
                         digits=80,
                         duration_seconds=stage_duration,
@@ -2019,10 +2104,14 @@ def _run_campaign_selection_active(
                     missing_precision_digits=missing,
                     sentinel_comparison=comparison,
                 )
-                _replace_record(records, index, record)
+                records_by_id[leaf_id] = record
                 _checkpoint_stage_with_progress(
                     path,
-                    _checkpoint_mapping(plan, selection, records),
+                    _checkpoint_mapping(
+                        plan,
+                        selection,
+                        _ordered_selection_records(selection, records_by_id),
+                    ),
                     context=context,
                     digits=80,
                     duration_seconds=stage_duration,
@@ -2074,10 +2163,14 @@ def _run_campaign_selection_active(
                 missing_precision_digits=120 if false_negative else None,
                 sentinel_comparison=record.sentinel_comparison,
             )
-            _replace_record(records, index, record)
+            records_by_id[leaf_id] = record
             _checkpoint_stage_with_progress(
                 path,
-                _checkpoint_mapping(plan, selection, records),
+                _checkpoint_mapping(
+                    plan,
+                    selection,
+                    _ordered_selection_records(selection, records_by_id),
+                ),
                 context=context,
                 digits=120,
                 duration_seconds=stage_duration,
@@ -2093,6 +2186,7 @@ def _run_campaign_selection_active(
                     state=record.state,
                     stage_count=len(record.stages),
                 )
+    records = _ordered_selection_records(selection, records_by_id)
     mapping = _checkpoint_mapping(plan, selection, records)
     return CampaignRunSummary(
         campaign_id=plan.campaign_id,
