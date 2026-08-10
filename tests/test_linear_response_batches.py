@@ -125,7 +125,7 @@ class CampaignPlanTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "signed|disk"):
             CampaignStageRecord.from_mapping(forged)
 
-    def test_plan_is_the_exact_ordered_553_leaf_contract(self) -> None:
+    def test_plan_is_the_exact_ordered_212_leaf_contract(self) -> None:
         """Catches Cartesian completion, dropped roles, or reordered B-prime leaves."""
 
         plan = build_campaign_plan(
@@ -138,18 +138,17 @@ class CampaignPlanTests(unittest.TestCase):
             B_PRIME_RELEASE_DOMAIN.production_leaf_ids,
         )
         self.assertEqual(plan.role_counts, {
-            "primary": 441,
-            "control": 48,
-            "deep": 64,
+            "primary": 140,
+            "control": 24,
+            "deep": 48,
         })
         self.assertEqual(plan.mechanism_counts, {
-            "horizon-admittance": 79,
-            "exterior-fixed-r3": 71,
-            "exterior-light-ring": 87,
-            "exterior-throat-kappa": 87,
-            "exterior-alpha-zero": 71,
-            "exterior-alpha-half": 71,
-            "exterior-alpha-one": 87,
+            "horizon-admittance": 40,
+            "exterior-fixed-r3": 36,
+            "exterior-alpha-half": 28,
+            "exterior-light-ring": 48,
+            "exterior-throat-kappa": 48,
+            "exterior-alpha-one": 12,
         })
         self.assertEqual(len(plan.cohorts), 15)
         self.assertEqual(len(plan.bindings["campaign_source_sha256"]), 64)
@@ -192,7 +191,7 @@ class CampaignPlanTests(unittest.TestCase):
         self.assertEqual(
             selection.leaf_ids, B_PRIME_RELEASE_DOMAIN.production_leaf_ids
         )
-        self.assertEqual(len(selection.leaf_ids), 553)
+        self.assertEqual(len(selection.leaf_ids), 212)
         with self.assertRaisesRegex(ValueError, "does not accept subset"):
             build_campaign_selection(
                 plan,
@@ -428,7 +427,7 @@ class CampaignPlanTests(unittest.TestCase):
             )
             checkpoint = directory / "partial.json"
             run_campaign_selection(plan, selection, Backend(), checkpoint, resume=False)
-            with self.assertRaisesRegex(ValueError, "exact ordered 553"):
+            with self.assertRaisesRegex(ValueError, "exact ordered"):
                 validate_campaign_checkpoint(
                     plan, checkpoint, require_complete_campaign=True
                 )
@@ -466,7 +465,7 @@ class CampaignPlanTests(unittest.TestCase):
             self.assertEqual(planned.returncode, 0, planned.stderr)
             self.assertEqual(len(planned.stdout.splitlines()), 1)
             payload = json.loads(planned.stdout)
-            self.assertEqual(payload["leaf_count"], 553)
+            self.assertEqual(payload["leaf_count"], 212)
             self.assertEqual(payload["selected_leaf_count"], 1)
 
             class Backend:

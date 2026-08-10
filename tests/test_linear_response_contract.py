@@ -325,8 +325,8 @@ def b_prime_payload(request: StudyRequest) -> dict[str, object]:
         "response_components": components, "covariance_blocks": [],
         "projective_comparisons": [],
         "completeness": {
-            "required_leaf_count": 553, "produced_leaf_count": 553,
-            "unresolved_leaf_count": 553, "missing_leaf_count": 0,
+            "required_leaf_count": 212, "produced_leaf_count": 212,
+            "unresolved_leaf_count": 212, "missing_leaf_count": 0,
             "required_leaf_ids": component_ids, "produced_leaf_ids": component_ids,
             "unresolved_leaf_ids": component_ids, "missing_leaf_ids": [],
         },
@@ -496,15 +496,49 @@ class LinearResponseContractTests(unittest.TestCase):
                 "0x1.fffef1672c027p-1", "0x1.ffffbc9f2ff3bp-1",
             ),
         )
-        self.assertEqual(len(domain.fixed_precision_sentinel_leaf_ids), 8)
+        self.assertEqual(len(domain.fixed_precision_sentinel_leaf_ids), 6)
         self.assertEqual(len(domain.precision_promotion_gates), 4)
         manifest_contract = load_release_manifest().to_mapping()["release_domain"][
             "linear_response"
         ]["b_prime"]
-        self.assertEqual(manifest_contract["leaf_counts"], {"primary": 441, "control": 48, "deep": 64, "total": 553})
-        self.assertEqual(manifest_contract["selector_counts"], {"primary": 63, "control": 8, "deep": 16, "total": 87})
-        self.assertEqual(manifest_contract["missing_selector_counts"], {"primary": 28, "control": 0, "deep": 16, "total": 44})
-        self.assertEqual(manifest_contract["projective_counts"], {"primary": 162, "deep": 12, "total": 174})
+        self.assertEqual(manifest_contract["leaf_counts"], {"primary": 140, "control": 24, "deep": 48, "total": 212})
+        self.assertEqual(manifest_contract["selector_counts"], {"primary": 28, "control": 8, "deep": 12, "total": 48})
+        self.assertEqual(manifest_contract["missing_selector_counts"], {"primary": 13, "control": 0, "deep": 12, "total": 25})
+        self.assertEqual(manifest_contract["projective_counts"], {"primary": 48, "deep": 9, "total": 57})
+        self.assertEqual(
+            manifest_contract["primary_direct_spin_coordinates"],
+            [[19, 20], [99, 100], [999, 1000], [9999, 10000]],
+        )
+        self.assertEqual(
+            manifest_contract["control_direct_spin_coordinates"],
+            [[19, 20], [999, 1000]],
+        )
+        self.assertEqual(
+            manifest_contract["deep_surface_gravity_coordinates"],
+            [[1, 100], [1, 500], [1, 1000]],
+        )
+        self.assertEqual(
+            manifest_contract["primary_mechanisms"],
+            [
+                "horizon-admittance", "exterior-fixed-r3",
+                "exterior-alpha-half", "exterior-light-ring",
+                "exterior-throat-kappa",
+            ],
+        )
+        self.assertEqual(
+            manifest_contract["control_mechanisms"],
+            [
+                "exterior-fixed-r3", "exterior-light-ring",
+                "exterior-throat-kappa",
+            ],
+        )
+        self.assertEqual(
+            manifest_contract["deep_mechanisms"],
+            [
+                "horizon-admittance", "exterior-alpha-one",
+                "exterior-light-ring", "exterior-throat-kappa",
+            ],
+        )
 
         with self.assertRaisesRegex(ValueError, "explicit role-scoped leaves"):
             validate_linear_response_admission(
@@ -557,9 +591,9 @@ class LinearResponseContractTests(unittest.TestCase):
         surface_gravities = set(manifest["surface_gravity_values"])
         self.assertEqual(
             direct_values,
-            {0.95, 0.97, 0.98, 0.99, 0.995, 0.997, 0.999, 0.9995, 0.9999},
+            {0.95, 0.99, 0.999, 0.9999},
         )
-        self.assertEqual(surface_gravities, {0.01, 0.005, 0.002, 0.001})
+        self.assertEqual(surface_gravities, {0.01, 0.002, 0.001})
 
         for kappa_exact, (expected_spin, expected_hex) in (
             EXPECTED_KAPPA_SPINS.items()

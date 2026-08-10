@@ -221,17 +221,17 @@ def _request_for_overlay_root(root) -> StudyRequest:
     )
 
 class FrozenM02BPrimeDomainTests(unittest.TestCase):
-    def test_b_prime_release_domain_is_a_literal_role_scoped_contract(self) -> None:
+    def test_b_prime_release_domain_is_the_literal_212_leaf_contract(self) -> None:
         domain = B_PRIME_RELEASE_DOMAIN
 
-        self.assertEqual(domain.leaf_counts_by_role, {"primary": 441, "control": 48, "deep": 64})
-        self.assertEqual(len(domain.production_leaf_ids), 553)
-        self.assertEqual(len(set(domain.production_leaf_ids)), 553)
-        self.assertEqual(domain.selector_counts_by_role, {"primary": 63, "control": 8, "deep": 16})
-        self.assertEqual(len(domain.root_selectors), 87)
-        self.assertEqual(domain.missing_selector_counts_by_role, {"primary": 28, "control": 0, "deep": 16})
-        self.assertEqual(len(domain.missing_root_selector_ids), 44)
-        self.assertEqual(domain.projective_counts, {"primary": 162, "deep": 12, "total": 174})
+        self.assertEqual(domain.leaf_counts_by_role, {"primary": 140, "control": 24, "deep": 48})
+        self.assertEqual(len(domain.production_leaf_ids), 212)
+        self.assertEqual(len(set(domain.production_leaf_ids)), 212)
+        self.assertEqual(domain.selector_counts_by_role, {"primary": 28, "control": 8, "deep": 12})
+        self.assertEqual(len(domain.root_selectors), 48)
+        self.assertEqual(domain.missing_selector_counts_by_role, {"primary": 13, "control": 0, "deep": 12})
+        self.assertEqual(len(domain.missing_root_selector_ids), 25)
+        self.assertEqual(domain.projective_counts, {"primary": 48, "deep": 9, "total": 57})
         self.assertEqual(domain.primary_supports, {"K0": ("220", "330", "440"), "K1": ("221", "331", "441"), "K22": ("220", "221", "222")})
         self.assertEqual(domain.deep_support, ("220", "221", "222"))
         self.assertEqual(domain.cubic_comparator_row_count, 8)
@@ -239,10 +239,53 @@ class FrozenM02BPrimeDomainTests(unittest.TestCase):
 
         leaves = tuple(domain.production_leaves)
         self.assertFalse(any(leaf.mechanism_id == "cubic-eft" for leaf in leaves))
+        primary = [leaf for leaf in leaves if leaf.role == "primary"]
+        self.assertEqual(
+            {leaf.mode_label for leaf in primary},
+            {"220", "221", "222", "330", "331", "440", "441"},
+        )
+        self.assertEqual(
+            {leaf.coordinate for leaf in primary},
+            {Fraction(19, 20), Fraction(99, 100), Fraction(999, 1000), Fraction(9999, 10000)},
+        )
+        self.assertEqual(
+            {leaf.mechanism_id for leaf in primary},
+            {
+                "horizon-admittance", "exterior-fixed-r3", "exterior-alpha-half",
+                "exterior-light-ring", "exterior-throat-kappa",
+            },
+        )
         controls = [leaf for leaf in leaves if leaf.role == "control"]
-        self.assertEqual({leaf.mechanism_id for leaf in controls}, set(domain.exterior_mechanism_ids))
+        self.assertEqual(
+            {leaf.coordinate for leaf in controls},
+            {Fraction(19, 20), Fraction(999, 1000)},
+        )
+        self.assertEqual(
+            {leaf.mechanism_id for leaf in controls},
+            {"exterior-fixed-r3", "exterior-light-ring", "exterior-throat-kappa"},
+        )
         self.assertTrue(any(leaf.mode_label in {"2-minus-2-0", "3-minus-3-0"} for leaf in controls))
         self.assertTrue(all(leaf.spin_role == "direct" for leaf in controls))
+        deep = [leaf for leaf in leaves if leaf.role == "deep"]
+        self.assertEqual(
+            {leaf.coordinate for leaf in deep},
+            {Fraction(1, 100), Fraction(1, 500), Fraction(1, 1000)},
+        )
+        self.assertEqual(
+            {leaf.mechanism_id for leaf in deep},
+            {
+                "horizon-admittance", "exterior-alpha-one", "exterior-light-ring",
+                "exterior-throat-kappa",
+            },
+        )
+        self.assertFalse(any(
+            leaf.mechanism_id == "exterior-alpha-zero"
+            or (
+                leaf.role == "primary"
+                and leaf.mechanism_id == "exterior-alpha-one"
+            )
+            for leaf in leaves
+        ))
 
 
 class SparseOverlayBuilderContractTests(unittest.TestCase):

@@ -71,6 +71,22 @@ try {
     else {
         "campaign-run"
     }
+    $CampaignPlan = Invoke-M02Command -Arguments @(
+        "campaign-plan",
+        $Selection
+    ) | ConvertFrom-Json
+    if (
+        $null -eq $CampaignPlan -or
+        $null -eq $CampaignPlan.role_counts -or
+        $null -eq $CampaignPlan.leaf_count
+    ) {
+        throw "M02 campaign plan did not report role and leaf counts."
+    }
+    Write-Host "M02 B′ campaign" -ForegroundColor Cyan
+    Write-Host ("    Primary : {0}" -f $CampaignPlan.role_counts.primary)
+    Write-Host ("    Control : {0}" -f $CampaignPlan.role_counts.control)
+    Write-Host ("    Deep    : {0}" -f $CampaignPlan.role_counts.deep)
+    Write-Host ("    Total   : {0}" -f $CampaignPlan.leaf_count)
     Write-Host "M02 live progress status:" -ForegroundColor Cyan
     Write-Host "    $CheckpointPath.status.json"
     Invoke-M02Command -Arguments @(

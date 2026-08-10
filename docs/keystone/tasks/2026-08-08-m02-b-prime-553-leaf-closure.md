@@ -1,5 +1,11 @@
 # Task Creation: M02 B′ 553-leaf linear-response closure
 
+> **Superseded on 2026-08-10.** This is the historical 553-leaf planning
+> record. The current canonical M02 B′ domain is the 212-leaf contract in
+> `src/windows_solver/linear_response.py` and
+> `src/windows_solver/data/release_domain_manifest.json`: 140 primary, 24
+> control, 48 deep, 57 projective rows, and 48 selected campaign roots.
+
 ## Goal
 
 Build one admission-ready first-order Kerr QNM linear-response provider over a stratified 553-leaf general-relativity domain. It becomes publicly available only after the operator supplies a complete admitted evidence bundle. The software must preserve typed mechanism identity, component-local correlated empirical uncertainty, exact background-root provenance, and outcome-neutral projective results.

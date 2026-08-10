@@ -57,8 +57,8 @@
     "linear_response": {
       "primary_modes": ["220", "221", "222", "330", "331", "440", "441"],
       "control_modes": ["210", "2-minus-2-0", "320", "3-minus-3-0"],
-      "direct_spins": [0.95, 0.97, 0.98, 0.99, 0.995, 0.997, 0.999, 0.9995, 0.9999],
-      "surface_gravity_values": [0.01, 0.005, 0.002, 0.001],
+      "direct_spins": [0.95, 0.99, 0.999, 0.9999],
+      "surface_gravity_values": [0.01, 0.002, 0.001],
       "mechanisms": [
         "horizon-admittance",
         "exterior-fixed-r3",
@@ -77,16 +77,22 @@
         "projective-classification"
       ],
       "b_prime": {
-        "leaf_counts": {"primary": 441, "control": 48, "deep": 64, "total": 553},
-        "selector_counts": {"primary": 63, "control": 8, "deep": 16, "total": 87},
-        "missing_selector_counts": {"primary": 28, "control": 0, "deep": 16, "total": 44},
-        "projective_counts": {"primary": 162, "deep": 12, "total": 174},
+        "leaf_counts": {"primary": 140, "control": 24, "deep": 48, "total": 212},
+        "selector_counts": {"primary": 28, "control": 8, "deep": 12, "total": 48},
+        "missing_selector_counts": {"primary": 13, "control": 0, "deep": 12, "total": 25},
+        "projective_counts": {"primary": 48, "deep": 9, "total": 57},
         "primary_supports": {"K0": ["220", "330", "440"], "K1": ["221", "331", "441"], "K22": ["220", "221", "222"]},
         "deep_support": ["220", "221", "222"],
         "control_role": "claim-negative exterior-only; negative-m positive-spin rows are counterrotating",
         "cubic_role": "eight retained parity-even 220 rows are comparator-only and outside production",
-        "completeness_rule": "admission requires 553 produced leaves and zero missing; evidence-bearing UNRESOLVED is produced",
-        "precision_policy": {"promote_digits": 80, "repeat_digits": 120, "sentinel_count": 8, "promotion_gate_count": 4},
+        "primary_direct_spin_coordinates": [[19, 20], [99, 100], [999, 1000], [9999, 10000]],
+        "control_direct_spin_coordinates": [[19, 20], [999, 1000]],
+        "deep_surface_gravity_coordinates": [[1, 100], [1, 500], [1, 1000]],
+        "primary_mechanisms": ["horizon-admittance", "exterior-fixed-r3", "exterior-alpha-half", "exterior-light-ring", "exterior-throat-kappa"],
+        "control_mechanisms": ["exterior-fixed-r3", "exterior-light-ring", "exterior-throat-kappa"],
+        "deep_mechanisms": ["horizon-admittance", "exterior-alpha-one", "exterior-light-ring", "exterior-throat-kappa"],
+        "completeness_rule": "admission requires 212 produced leaves and zero missing; evidence-bearing UNRESOLVED is produced",
+        "precision_policy": {"promote_digits": 80, "repeat_digits": 120, "sentinel_count": 6, "promotion_gate_count": 4},
         "wolfram_receipt": "docs/evidence/m02-b-prime-wolfram-arithmetic-receipt.json"
       }
     },

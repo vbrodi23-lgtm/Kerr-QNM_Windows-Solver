@@ -46,7 +46,7 @@ Inspect fresh-machine assumptions, ledger-before-bootstrap ordering, executable 
 
 ---
 
-## TASK-077: Execute and validate the complete 553-leaf physical response campaign
+## TASK-077: Execute and validate the complete 212-leaf physical response campaign
 **Priority:** P0 | **Tags:** M02, physics, evidence, validation
 **Assignee:** Unassigned | **Estimate:** 1–2 days plus compute time | **Milestone:** M02
 
@@ -56,7 +56,7 @@ Produce the complete frozen M02 physical evidence bundle instead of stopping at 
 
 ### Acceptance Criteria
 
-- [ ] Execute exactly 441 primary, 48 control, and 64 deep leaves from the frozen campaign plan with zero missing IDs.
+- [ ] Execute exactly 140 primary, 24 control, and 48 deep leaves from the frozen campaign plan with zero missing IDs.
 - [ ] Preserve component values, signed numerical-error channels, root identities, backend/source receipts, precision decisions, refinement ladders, and atomic resumable checkpoints for every leaf.
 - [ ] Enforce the declared deep-precision triggers and all fixed 80-digit sentinels; escalate to 120 digits where required and record governed `UNRESOLVED` outcomes rather than dropping work.
 - [ ] Validate branch, angular, readout, continuation, finite-difference, and precision diagnostics without tuning thresholds after results are visible.
@@ -69,12 +69,12 @@ Produce the complete frozen M02 physical evidence bundle instead of stopping at 
 
 ### Evidence Output
 
-Complete authenticated 553-leaf physical response checkpoint with primary, control, and deep evidence ledgers.
+Complete authenticated 212-leaf physical response checkpoint with primary, control, and deep evidence ledgers.
 
 ### Verification
 
 - `solver campaign-validate SELECTION.json --checkpoint CHECKPOINT.json --full`
-- Exact 553-ID completeness, zero-missing, precision-sentinel, provenance, and fresh-process reload checks.
+- Exact 212-ID completeness, zero-missing, precision-sentinel, provenance, and fresh-process reload checks.
 - Independent review of failures and unresolved leaves before reduction.
 
 ### Review Focus
@@ -99,7 +99,7 @@ Turn the complete campaign into the admitted component-local uncertainty and pro
 
 ### Acceptance Criteria
 
-- [ ] Reduce the authenticated 553 leaves into exactly 162 primary and 12 deep projective rows with checkpoint-derived centres, signed channels, empirical Gram matrices, component disks, and outcome-neutral classifications.
+- [ ] Reduce the authenticated 212 leaves into exactly 48 primary and 9 deep projective rows with checkpoint-derived centres, signed channels, empirical Gram matrices, component disks, and outcome-neutral classifications.
 - [ ] Admit one immutable linear-response package only after exact campaign, spectral-upstream, reduction, payload, policy, runtime, and detached admission-ID reconciliation passes.
 - [ ] Run the admitted provider through cold and zero-work warm studies on Windows and Ubuntu; export and reload the package without identity drift.
 - [ ] Publish the scientific result at its weakest supported evidence ceiling, including bounded, unresolved, contradicted, or indeterminate rows without favorable-outcome requirements.
@@ -112,7 +112,7 @@ Turn the complete campaign into the admitted component-local uncertainty and pro
 
 ### Evidence Output
 
-Admitted linear-response package, populated 174-row atlas, provider/platform receipts, claim-bounded M02 result, and milestone closure record.
+Admitted linear-response package, populated 57-row atlas, provider/platform receipts, claim-bounded M02 result, and milestone closure record.
 
 ### Verification
 

@@ -601,7 +601,7 @@ class ProjectiveRowPlan:
 
 
 def build_projective_row_plans() -> tuple[ProjectiveRowPlan, ...]:
-    """Enumerate the frozen 174 plans without computing any response result."""
+    """Enumerate the frozen domain plans without computing any response result."""
 
     domain = B_PRIME_RELEASE_DOMAIN
     leaves = {

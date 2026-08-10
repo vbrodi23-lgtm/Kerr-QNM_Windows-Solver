@@ -28,7 +28,7 @@ RELEASE_MANIFEST_RESOURCE = resources.files("windows_solver").joinpath(
     "data", "release_domain_manifest.json"
 )
 RELEASE_MANIFEST_SHA256 = (
-    "f946e02b50b87864547a6577636061d97244aff5c616f35398c01c524c0192cb"
+    "d924949307d225342a6f12961c19bb40da1b7078b4ebf25ac07e806814c374dd"
 )
 
 _MAX_MANIFEST_BYTES = 2 * 1024 * 1024
@@ -376,20 +376,15 @@ def _validate_release_domain(value: object) -> None:
         raise ValueError("linear-response control modes do not match the frozen domain")
     if _number_list(linear["direct_spins"], "linear-response direct_spins") != [
         0.95,
-        0.97,
-        0.98,
         0.99,
-        0.995,
-        0.997,
         0.999,
-        0.9995,
         0.9999,
     ]:
         raise ValueError("linear-response direct spins do not match the frozen domain")
     if _number_list(
         linear["surface_gravity_values"],
         "linear-response surface_gravity_values",
-    ) != [0.01, 0.005, 0.002, 0.001]:
+    ) != [0.01, 0.002, 0.001]:
         raise ValueError("surface-gravity values do not match the frozen domain")
     if linear["mechanisms"] != [
         "horizon-admittance",
@@ -413,18 +408,22 @@ def _validate_release_domain(value: object) -> None:
                 "leaf_counts", "selector_counts", "missing_selector_counts",
                 "projective_counts", "primary_supports", "deep_support",
                 "control_role", "cubic_role", "completeness_rule",
-                "precision_policy", "wolfram_receipt",
+                "primary_direct_spin_coordinates",
+                "control_direct_spin_coordinates",
+                "deep_surface_gravity_coordinates", "primary_mechanisms",
+                "control_mechanisms", "deep_mechanisms", "precision_policy",
+                "wolfram_receipt",
             }
         ),
         "linear-response B-prime",
     )
-    if b_prime["leaf_counts"] != {"primary": 441, "control": 48, "deep": 64, "total": 553}:
+    if b_prime["leaf_counts"] != {"primary": 140, "control": 24, "deep": 48, "total": 212}:
         raise ValueError("B-prime leaf counts do not match the frozen domain")
-    if b_prime["selector_counts"] != {"primary": 63, "control": 8, "deep": 16, "total": 87}:
+    if b_prime["selector_counts"] != {"primary": 28, "control": 8, "deep": 12, "total": 48}:
         raise ValueError("B-prime selector counts do not match the frozen domain")
-    if b_prime["missing_selector_counts"] != {"primary": 28, "control": 0, "deep": 16, "total": 44}:
+    if b_prime["missing_selector_counts"] != {"primary": 13, "control": 0, "deep": 12, "total": 25}:
         raise ValueError("B-prime missing-selector counts do not match the frozen domain")
-    if b_prime["projective_counts"] != {"primary": 162, "deep": 12, "total": 174}:
+    if b_prime["projective_counts"] != {"primary": 48, "deep": 9, "total": 57}:
         raise ValueError("B-prime projective counts do not match the frozen domain")
     if b_prime["primary_supports"] != {"K0": ["220", "330", "440"], "K1": ["221", "331", "441"], "K22": ["220", "221", "222"]}:
         raise ValueError("B-prime primary supports do not match the frozen domain")
@@ -434,11 +433,31 @@ def _validate_release_domain(value: object) -> None:
         raise ValueError("B-prime control role does not match the frozen domain")
     if b_prime["cubic_role"] != "eight retained parity-even 220 rows are comparator-only and outside production":
         raise ValueError("B-prime cubic role does not match the frozen domain")
-    if b_prime["completeness_rule"] != "admission requires 553 produced leaves and zero missing; evidence-bearing UNRESOLVED is produced":
+    if b_prime["primary_direct_spin_coordinates"] != [[19, 20], [99, 100], [999, 1000], [9999, 10000]]:
+        raise ValueError("B-prime primary direct-spin coordinates do not match the frozen domain")
+    if b_prime["control_direct_spin_coordinates"] != [[19, 20], [999, 1000]]:
+        raise ValueError("B-prime control direct-spin coordinates do not match the frozen domain")
+    if b_prime["deep_surface_gravity_coordinates"] != [[1, 100], [1, 500], [1, 1000]]:
+        raise ValueError("B-prime deep surface-gravity coordinates do not match the frozen domain")
+    if b_prime["primary_mechanisms"] != [
+        "horizon-admittance", "exterior-fixed-r3", "exterior-alpha-half",
+        "exterior-light-ring", "exterior-throat-kappa",
+    ]:
+        raise ValueError("B-prime primary mechanisms do not match the frozen domain")
+    if b_prime["control_mechanisms"] != [
+        "exterior-fixed-r3", "exterior-light-ring", "exterior-throat-kappa",
+    ]:
+        raise ValueError("B-prime control mechanisms do not match the frozen domain")
+    if b_prime["deep_mechanisms"] != [
+        "horizon-admittance", "exterior-alpha-one", "exterior-light-ring",
+        "exterior-throat-kappa",
+    ]:
+        raise ValueError("B-prime deep mechanisms do not match the frozen domain")
+    if b_prime["completeness_rule"] != "admission requires 212 produced leaves and zero missing; evidence-bearing UNRESOLVED is produced":
         raise ValueError("B-prime completeness rule does not match the frozen domain")
     precision = _object(b_prime["precision_policy"], "B-prime precision policy")
     _exact_fields(precision, frozenset({"promote_digits", "repeat_digits", "sentinel_count", "promotion_gate_count"}), "B-prime precision policy")
-    if precision != {"promote_digits": 80, "repeat_digits": 120, "sentinel_count": 8, "promotion_gate_count": 4}:
+    if precision != {"promote_digits": 80, "repeat_digits": 120, "sentinel_count": 6, "promotion_gate_count": 4}:
         raise ValueError("B-prime precision policy does not match the frozen domain")
     if b_prime["wolfram_receipt"] != "docs/evidence/m02-b-prime-wolfram-arithmetic-receipt.json":
         raise ValueError("B-prime Wolfram receipt path does not match the frozen domain")

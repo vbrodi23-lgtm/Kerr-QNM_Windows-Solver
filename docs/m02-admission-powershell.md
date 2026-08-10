@@ -1,7 +1,7 @@
 # M02 validation, admission, and export from PowerShell
 
 The installed M02 machinery performs no hidden full campaign. The operator
-produces the 553 scientific leaf records, then supplies those files to the
+produces the 212 scientific leaf records, then supplies those files to the
 validator and reducer. The provider is unavailable unless a sealed admission
 package is passed explicitly to `plan` or `run`.
 
@@ -18,7 +18,7 @@ From the directory containing the operator files:
   --checkpoint .\campaign-complete.json --full
 ```
 
-The evidence manifest must have state `complete-operator`, exactly 553 produced
+The evidence manifest must have state `complete-operator`, exactly 212 produced
 leaf IDs, zero missing IDs, authenticated payload/source hashes, the frozen M02
 policy fingerprint, a valid producer runtime lineage, the exact spectral
 provider/root-set receipt, and a complete checkpoint root identity on every
@@ -29,7 +29,7 @@ malformed, duplicated, or unexecuted leaves fail admission.
 
 Use the reduction bundle described in
 [response-replay-powershell.md](response-replay-powershell.md), selecting all
-174 frozen row IDs:
+57 frozen row IDs:
 
 ```powershell
 .\solver.ps1 campaign-reduce .\reduction-bundle.json `
@@ -37,8 +37,8 @@ Use the reduction bundle described in
 ```
 
 The reducer authenticates its checkpoint receipts and performs no determinant
-or response solve. Admission requires reducer state `COMPLETE`, 162 primary
-rows plus 12 deep rows, the exact row order, every required component present,
+or response solve. Admission requires reducer state `COMPLETE`, 48 primary
+rows plus 9 deep rows, the exact row order, every required component present,
 and zero missing components. Projective `UNRESOLVED` outcomes remain honest
 produced results. Each payload projective comparison must then reproduce the
 same ordered reduction row: mapped response-component IDs, calibration pair,
@@ -60,7 +60,7 @@ as `request.json` and `payload.json`. The payload lineage must include the
 evidence bundle digest, the evidence manifest file digest, the reduction file
 digest, and every reduction source receipt.
 
-Each of the 553 `produced_records` must also point to a JSON payload whose
+Each of the 212 `produced_records` must also point to a JSON payload whose
 object is the exact corresponding entry in `payload.json`'s
 `response_components` array. Admission matches the record and component by
 mode, binary64 spin identity, and mechanism; requires identical numerical state
@@ -68,7 +68,7 @@ and root reference; and rereads the record payload under its declared byte size
 and SHA-256 before comparing the complete object. A copied lineage hash cannot
 make a stale or unrelated component admissible. Admission also compares every
 record's complete campaign root identity to the installed catalog and to the
-exact root object in the scoped 87-root spectral payload. A campaign produced
+exact root object in the scoped 48-root spectral payload. A campaign produced
 under catalog A cannot be admitted or replayed under catalog B, even if all
 mode/spin reference IDs and internal evidence hashes are consistently resealed.
 
@@ -125,7 +125,7 @@ and produce a content-sealed package. The package always records
 passed the frozen structural/numerical contract, not that any scientific
 outcome was favorable. The package also seals a spectral-upstream receipt: the
 exact spectral provider descriptor, capability-scoped request, output artifact
-type, accepted evidence state, and SHA-256 of the canonical 87-root payload.
+type, accepted evidence state, and SHA-256 of the canonical 48-root payload.
 
 Preserve `$admissionId` independently from `m02-admitted.json`. It is the
 detached expected identity for every later package load. Editing the package
@@ -145,7 +145,7 @@ The default registry remains closed. Supply the package for each plan or run:
   --linear-response-admission-id $admissionId
 ```
 
-The first run materializes problem-contract, the exact 87-root sparse spectral
+The first run materializes problem-contract, the exact 48-root sparse spectral
 upstream, and linear-response artifacts. Repeating the identical command
 against the same store reuses all three verified artifacts with zero provider
 work. A different request, modified package, incomplete bundle, partial smoke,
