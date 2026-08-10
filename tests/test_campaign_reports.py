@@ -157,6 +157,11 @@ class CampaignReportTests(unittest.TestCase):
             current = next(item for item in leaves if item["leaf_id"] == leaf.leaf_id)
             self.assertEqual(current["terminal_state"], "PRODUCED")
             self.assertEqual(current["component_status"], "CONVERGED")
+            self.assertEqual(current["precision_digits"], "64")
+            self.assertEqual(current["precision_tier"], "binary64")
+            self.assertEqual(
+                current["precision_decimal_digits_nominal"], "15.95"
+            )
             self.assertEqual(current["convergence_basis"], "ORDER_RESOLVED")
             self.assertEqual(current["run_provenance"], "EXECUTED")
             self.assertEqual(float(current["response_real"]), 1.25)
@@ -182,6 +187,18 @@ class CampaignReportTests(unittest.TestCase):
             with channels_path.open(newline="", encoding="utf-8") as handle:
                 channels = list(csv.DictReader(handle))
             self.assertEqual(len(channels), 8)
+            self.assertTrue(
+                all(item["precision_digits"] == "64" for item in channels)
+            )
+            self.assertTrue(
+                all(item["precision_tier"] == "binary64" for item in channels)
+            )
+            self.assertTrue(
+                all(
+                    item["precision_decimal_digits_nominal"] == "15.95"
+                    for item in channels
+                )
+            )
             self.assertEqual(
                 tuple(item["family"] for item in channels),
                 (
