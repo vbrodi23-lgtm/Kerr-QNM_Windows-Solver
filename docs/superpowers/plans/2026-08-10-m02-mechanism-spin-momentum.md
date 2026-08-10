@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Execute the unchanged 212-leaf campaign mechanism-first and use only same-chain accepted responses to seed the next coordinate's PRIMARY solves.
+**Goal:** Execute the unchanged 212-leaf campaign mechanism-first and use only same-chain accepted responses to seed the next higher-spin coordinate's PRIMARY solves.
 
 **Architecture:** Keep authenticated plan/selection ordering as the scientific and persistence order. Derive a separate execution schedule, store sparse partial records canonically by leaf ID, and pass one invocation-local response predictor through the existing component/root-readout boundary.
 
@@ -29,7 +29,7 @@
 - Produces: `_campaign_execution_leaf_ids(plan, selection) -> tuple[str, ...]`
 - Preserves: `CampaignPlan.leaves`, `CampaignSelection.leaf_ids`, checkpoint bindings, and canonical record serialization.
 
-- [ ] Write a test with literal expected primary tuples proving mechanism order, mode order, and ascending coordinates.
+- [ ] Write a test with literal expected tuples proving mechanism order, mode order, and ascending physical spin (`.95 → .99 → .999 → .9999`; deep Mκ `.01 → .002 → .001`).
 - [ ] Run the focused test and confirm it fails on the old mode/spin/mechanism traversal.
 - [ ] Add the deterministic execution-key function without changing plan or selection construction.
 - [ ] Add a test loading an old canonical-prefix checkpoint, executing the next scheduled non-prefix leaf, and validating the resulting canonical sparse subset.
@@ -92,4 +92,3 @@
 - [ ] Run `python -m compileall -q src tests`, `python .tasks/validate_board.py`, and the full Python `unittest` suite.
 - [ ] Inspect the diff for protected-file, identity, SEED-PATH, determinant-preflight, and domain changes.
 - [ ] Commit the final proof and hand off for change review and draft PR publication.
-
