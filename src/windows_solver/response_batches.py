@@ -29,6 +29,7 @@ from .response_engine import (
     RECORDED_REPLAY_BACKEND_ID,
     RecordedReplayBackend,
     ResponseComponentJob,
+    ROOT_BRANCH_CONTINUATION_TOLERANCE_ABS,
     VettedNativeDeterminantKernel,
     run_component,
 )
@@ -1406,7 +1407,10 @@ def _validate_component_result(
             or readout.equation_id != job.equation_id
         ):
             raise ValueError("campaign production readout lineage is invalid")
-    if result.baseline.omega != job.root.omega:
+    if (
+        abs(result.baseline.omega - job.root.omega)
+        > ROOT_BRANCH_CONTINUATION_TOLERANCE_ABS
+    ):
         raise ValueError("campaign production baseline root is invalid")
     return True
 
@@ -1631,6 +1635,35 @@ def _ordered_selection_records(
     )
 
 
+def _continuation_chain_key(
+    leaf: CampaignLeafPlan,
+) -> tuple[str, str, str, str]:
+    return (
+        leaf.role,
+        leaf.leaf.mode_label,
+        leaf.mechanism_id,
+        leaf.leaf.spin_role,
+    )
+
+
+def _produced_response(record: CampaignLeafRecord) -> complex | None:
+    if record.state != "PRODUCED" or not record.stages:
+        return None
+    raw_result = record.stages[-1].outcome.component_result.get("result")
+    if not isinstance(raw_result, Mapping):
+        return None
+    try:
+        result = ComponentResult.from_mapping(raw_result)
+    except (TypeError, ValueError):
+        return None
+    if result.response is None:
+        return None
+    response = complex(result.response)
+    if not (math.isfinite(response.real) and math.isfinite(response.imag)):
+        return None
+    return response
+
+
 def _campaign_stage_record(
     plan: CampaignPlan,
     available: PrecisionCapabilities,
@@ -1647,6 +1680,7 @@ def _execute_campaign_stage(
     leaf: CampaignLeafPlan,
     digits: int,
     previous_stages: Sequence[CampaignStageRecord] = (),
+    response_predictor: complex | None = None,
 ) -> StageOutcome:
     """Execute a stage while preserving the promotion evidence on resume.
 
@@ -1658,6 +1692,20 @@ def _execute_campaign_stage(
     """
 
     if digits > 64:
+        promoted_with_predictor = getattr(
+            backend, "execute_promoted_stage_with_predictor", None
+        )
+        if promoted_with_predictor is not None:
+            if not callable(promoted_with_predictor):
+                raise ValueError(
+                    "campaign promoted-stage predictor backend is invalid"
+                )
+            return promoted_with_predictor(
+                leaf,
+                digits,
+                tuple(stage.outcome for stage in previous_stages),
+                response_predictor,
+            )
         promoted = getattr(backend, "execute_promoted_stage", None)
         if promoted is not None:
             if not callable(promoted):
@@ -1667,6 +1715,13 @@ def _execute_campaign_stage(
                 digits,
                 tuple(stage.outcome for stage in previous_stages),
             )
+    execute_with_predictor = getattr(
+        backend, "execute_stage_with_predictor", None
+    )
+    if execute_with_predictor is not None:
+        if not callable(execute_with_predictor):
+            raise ValueError("campaign stage predictor backend is invalid")
+        return execute_with_predictor(leaf, digits, response_predictor)
     execute = getattr(backend, "execute_stage", None)
     if not callable(execute):
         raise ValueError("campaign backend execute_stage is unavailable")
@@ -1705,6 +1760,7 @@ def _execute_campaign_stage_with_progress(
     digits: int,
     context: Mapping[str, object],
     previous_stages: Sequence[CampaignStageRecord] = (),
+    response_predictor: complex | None = None,
 ) -> tuple[StageOutcome, float]:
     component_pass = "primary" if digits == 64 else "promoted"
     started = time.monotonic()
@@ -1716,7 +1772,11 @@ def _execute_campaign_stage_with_progress(
         emit_progress(ProgressEventKind.PRECISION_STAGE_STARTED)
         try:
             outcome = _execute_campaign_stage(
-                backend, leaf, digits, previous_stages
+                backend,
+                leaf,
+                digits,
+                previous_stages,
+                response_predictor,
             )
         except BaseException as error:
             emit_progress(
@@ -1901,8 +1961,13 @@ def _run_campaign_selection_active(
     executed = 0
     leaf_by_id = {leaf.leaf_id: leaf for leaf in plan.leaves}
     execution_leaf_ids = _campaign_execution_leaf_ids(plan, selection)
+    continuation_responses: dict[tuple[str, str, str, str], complex] = {}
     for index, leaf_id in enumerate(execution_leaf_ids):
         leaf = leaf_by_id[leaf_id]
+        continuation_key = _continuation_chain_key(leaf)
+        response_predictor = continuation_responses.pop(
+            continuation_key, None
+        )
         context = _leaf_progress_context(leaf, index + 1, len(selection.leaf_ids))
         record = records_by_id.get(leaf_id)
         if record is not None and record.state in {
@@ -1912,6 +1977,9 @@ def _run_campaign_selection_active(
                 _publish_terminal_solved_leaf(
                     plan, leaf, record, solved_leaf_store
                 )
+                response = _produced_response(record)
+                if response is not None:
+                    continuation_responses[continuation_key] = response
                 emit_progress(
                     ProgressEventKind.LEAF_REUSED,
                     state=record.state,
@@ -1949,6 +2017,9 @@ def _run_campaign_selection_active(
                         stage_count=len(cached_record.stages),
                         source="authenticated prior originating result",
                     )
+                response = _produced_response(cached_record)
+                if response is not None:
+                    continuation_responses[continuation_key] = response
                 reused += len(cached_record.stages)
                 continue
             if lookup.status is SolvedLeafLookupStatus.STALE:
@@ -1967,7 +2038,11 @@ def _run_campaign_selection_active(
             emit_progress(ProgressEventKind.LEAF_STARTED)
         if record is None:
             outcome, stage_duration = _execute_campaign_stage_with_progress(
-                backend, leaf, 64, context
+                backend,
+                leaf,
+                64,
+                context,
+                response_predictor=response_predictor,
             )
             if not isinstance(outcome, StageOutcome) or outcome.digits != 64:
                 raise ValueError("campaign backend returned an invalid binary64 stage")
@@ -2020,6 +2095,9 @@ def _run_campaign_selection_active(
             _publish_terminal_solved_leaf(
                 plan, leaf, record, solved_leaf_store
             )
+            response = _produced_response(record)
+            if response is not None:
+                continuation_responses[continuation_key] = response
             with progress_scope(**context):
                 emit_progress(
                     ProgressEventKind.LEAF_COMPLETED,
@@ -2031,7 +2109,12 @@ def _run_campaign_selection_active(
             if 80 not in available.digits:
                 continue
             outcome80, stage_duration = _execute_campaign_stage_with_progress(
-                backend, leaf, 80, context, record.stages
+                backend,
+                leaf,
+                80,
+                context,
+                record.stages,
+                response_predictor,
             )
             if (
                 not isinstance(outcome80, StageOutcome)
@@ -2131,6 +2214,9 @@ def _run_campaign_selection_active(
             _publish_terminal_solved_leaf(
                 plan, leaf, record, solved_leaf_store
             )
+            response = _produced_response(record)
+            if response is not None:
+                continuation_responses[continuation_key] = response
             with progress_scope(**context):
                 emit_progress(
                     ProgressEventKind.LEAF_COMPLETED,
@@ -2142,7 +2228,12 @@ def _run_campaign_selection_active(
             if 120 not in available.digits:
                 continue
             outcome120, stage_duration = _execute_campaign_stage_with_progress(
-                backend, leaf, 120, context, record.stages
+                backend,
+                leaf,
+                120,
+                context,
+                record.stages,
+                response_predictor,
             )
             if (
                 not isinstance(outcome120, StageOutcome)
@@ -2189,6 +2280,9 @@ def _run_campaign_selection_active(
             _publish_terminal_solved_leaf(
                 plan, leaf, record, solved_leaf_store
             )
+            response = _produced_response(record)
+            if response is not None:
+                continuation_responses[continuation_key] = response
             with progress_scope(**context):
                 emit_progress(
                     ProgressEventKind.LEAF_COMPLETED,
@@ -2729,13 +2823,20 @@ def _native_deep_diagnostics(
 
 
 def _run_component_with_progress(
-    job: ResponseComponentJob, backend: object, component_pass: str
+    job: ResponseComponentJob,
+    backend: object,
+    component_pass: str,
+    response_predictor: complex | None = None,
 ) -> ComponentResult:
     started = time.monotonic()
     with progress_scope(component_pass=component_pass):
         emit_progress(ProgressEventKind.COMPONENT_PASS_STARTED)
         try:
-            result = run_component(job, backend)  # type: ignore[arg-type]
+            result = run_component(  # type: ignore[arg-type]
+                job,
+                backend,
+                response_predictor=response_predictor,
+            )
         except BaseException as error:
             emit_progress(
                 ProgressEventKind.ERROR,
@@ -2817,12 +2918,23 @@ class NativeCampaignStageBackend:
         }
 
     def execute_stage(self, leaf: CampaignLeafPlan, digits: int) -> StageOutcome:
+        return self.execute_stage_with_predictor(leaf, digits, None)
+
+    def execute_stage_with_predictor(
+        self,
+        leaf: CampaignLeafPlan,
+        digits: int,
+        response_predictor: complex | None,
+    ) -> StageOutcome:
         if digits != 64:
             raise NativeResourceUnavailableError(
                 "promoted precision must use execute_promoted_stage"
             )
         result = _run_component_with_progress(
-            leaf.job, self.adapter, "primary"
+            leaf.job,
+            self.adapter,
+            "primary",
+            response_predictor,
         )
         component_result = {
             "evidence_kind": "native-task-008-component-engine",
@@ -2851,6 +2963,17 @@ class NativeCampaignStageBackend:
         digits: int,
         previous_outcomes: Sequence[StageOutcome],
     ) -> StageOutcome:
+        return self.execute_promoted_stage_with_predictor(
+            leaf, digits, previous_outcomes, None
+        )
+
+    def execute_promoted_stage_with_predictor(
+        self,
+        leaf: CampaignLeafPlan,
+        digits: int,
+        previous_outcomes: Sequence[StageOutcome],
+        response_predictor: complex | None,
+    ) -> StageOutcome:
         if digits not in self.precision_capabilities.digits or digits not in (80, 120):
             raise NativeResourceUnavailableError(
                 f"native campaign backend lacks {digits}-digit capability"
@@ -2864,7 +2987,10 @@ class NativeCampaignStageBackend:
             self.identity, self.julia_adapter, digits
         )
         result = _run_component_with_progress(
-            leaf.job, primary_backend, "primary"
+            leaf.job,
+            primary_backend,
+            "primary",
+            response_predictor,
         )
         previous_result = ComponentResult.from_mapping(
             previous_outcomes[-1].component_result["result"]
@@ -2883,7 +3009,10 @@ class NativeCampaignStageBackend:
                 self.identity, self.julia_adapter, digits, refinement=1
             )
             repeat_result = _run_component_with_progress(
-                leaf.job, repeat_backend, "self-refinement"
+                leaf.job,
+                repeat_backend,
+                "self-refinement",
+                response_predictor,
             )
             repeat_delta = _component_result_delta(repeat_result, result)
             repeat_radius = sum(repeat_result.error_channels.values())
