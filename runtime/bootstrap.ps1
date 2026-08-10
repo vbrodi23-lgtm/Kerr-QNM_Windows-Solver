@@ -442,8 +442,8 @@ function Get-M02EnvironmentRejectionReason([string]$ContractSha256) {
         return "dependency receipt Project digest changed"
     }
     $manifest = Get-Content -LiteralPath (Join-Path $JuliaProject "Manifest.toml") -Raw
-    $checkoutRoot = [IO.Path]::GetFullPath($PackageRoot)
-    if ((Test-ManifestReferencesPath $manifest $checkoutRoot) `
+    $checkoutSourceRoot = [IO.Path]::GetFullPath($JuliaDataRoot)
+    if ((Test-ManifestReferencesPath $manifest $checkoutSourceRoot) `
         -or $manifest.IndexOf("../vendor/", [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
         return "dependency Manifest contains a checkout-relative or environment-local source path"
     }
@@ -697,8 +697,8 @@ function Get-CompatibleLegacyM02Environment {
         return $null
     }
     $actualManifest = Get-Content -LiteralPath $manifestPath -Raw
-    $checkoutRoot = [IO.Path]::GetFullPath($PackageRoot)
-    if ((Test-ManifestReferencesPath $actualManifest $checkoutRoot) `
+    $checkoutSourceRoot = [IO.Path]::GetFullPath($JuliaDataRoot)
+    if ((Test-ManifestReferencesPath $actualManifest $checkoutSourceRoot) `
         -or $actualManifest.IndexOf("../vendor/", [System.StringComparison]::OrdinalIgnoreCase) -ge 0 `
         -or -not (Test-ManifestReferencesPath $actualManifest $sourceRoot)) {
         return $null
@@ -762,7 +762,9 @@ path = "../vendor/SpinWeightedSpheroidalHarmonics.jl"
         # Windows-TOML fixture. Julia serializes native paths with doubled
         # backslashes, so this catches the warm-reuse regression without
         # launching Julia or installing any package.
-        $RuntimeRoot = Join-Path $smokeRoot "runtime-1"
+        $PackageRoot = Join-Path $smokeRoot "checkout"
+        $JuliaDataRoot = Join-Path $PackageRoot "src\windows_solver\data\julia"
+        $RuntimeRoot = Join-Path $PackageRoot ".runtime"
         $M02DependencyId = "m02-deps-smoke"
         $M02DependencySha256 = "a" * 64
         $M02DependencySourceRoot = Join-Path $RuntimeRoot "scientific-sources\$M02DependencyId"
@@ -875,6 +877,23 @@ path = "$escapedAngularPath"
             -or $null -ne (Get-M02EnvironmentRejectionReason $M02DependencySha256)) {
             throw "M02 dependency smoke invalidated the environment for a worker-only change."
         }
+
+        $checkoutSourcePath = ([IO.Path]::GetFullPath((Join-Path $JuliaDataRoot "GeneralizedSasakiNakamura.jl"))).Replace('\', '\\')
+        $checkoutManifest = $escapedManifest.Replace($escapedGsnPath, $checkoutSourcePath)
+        [IO.File]::WriteAllText(
+            (Join-Path $JuliaProject "Manifest.toml"),
+            $checkoutManifest,
+            [System.Text.UTF8Encoding]::new($false)
+        )
+        $checkoutReason = Get-M02EnvironmentRejectionReason $M02DependencySha256
+        if ($checkoutReason -ne "dependency Manifest contains a checkout-relative or environment-local source path") {
+            throw "M02 dependency smoke did not reject a packaged-source Manifest path: $checkoutReason"
+        }
+        [IO.File]::WriteAllText(
+            (Join-Path $JuliaProject "Manifest.toml"),
+            $escapedManifest,
+            [System.Text.UTF8Encoding]::new($false)
+        )
 
         $changedDependencyContract = [ordered]@{
             schema_version = 1
