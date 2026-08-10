@@ -59,6 +59,7 @@ LEAF_COLUMNS = (
     "baseline_omega_real",
     "baseline_omega_imaginary",
     "baseline_determinant_residual",
+    "baseline_newton_correction",
     "signed_root_crosscheck_real",
     "signed_root_crosscheck_imaginary",
     "signed_root_crosscheck_magnitude",
@@ -249,6 +250,9 @@ def _leaf_row(
         "baseline_omega_imaginary": result.baseline.omega.imag,
         "baseline_determinant_residual": (
             result.baseline.determinant_residual_abs
+        ),
+        "baseline_newton_correction": (
+            result.baseline.newton_correction_estimate
         ),
         **{
             f"{name.replace('-', '_')}_error": result.error_channels[name]
