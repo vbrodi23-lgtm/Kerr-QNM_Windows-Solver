@@ -1582,6 +1582,17 @@ class CampaignProgressReporter:
         path = Path(f"{self.checkpoint}.status.json")
         path.parent.mkdir(parents=True, exist_ok=True)
         status = dict(record)
+        context = record.get("context")
+        precision_value = (
+            context.get("precision_digits")
+            if isinstance(context, Mapping)
+            else None
+        )
+        status["precision"] = (
+            None
+            if precision_value is None
+            else precision_tier_presentation(precision_value).to_mapping()
+        )
         status["persistence"] = self._persistence_status()
         status["scientific"] = dict(self._scientific_dashboard_fields())
         encoded = json.dumps(
