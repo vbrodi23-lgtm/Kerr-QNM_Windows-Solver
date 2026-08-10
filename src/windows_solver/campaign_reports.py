@@ -56,7 +56,12 @@ LEAF_COLUMNS = (
     "local_disk_radius",
     "relative_disk_radius",
     "relative_disk_state",
+    "baseline_omega_real",
+    "baseline_omega_imaginary",
     "baseline_determinant_residual",
+    "signed_root_crosscheck_real",
+    "signed_root_crosscheck_imaginary",
+    "signed_root_crosscheck_magnitude",
     "signed_root_error",
     "truncation_error",
     "resolution_error",
@@ -240,6 +245,8 @@ def _leaf_row(
         return row
 
     row.update({
+        "baseline_omega_real": result.baseline.omega.real,
+        "baseline_omega_imaginary": result.baseline.omega.imag,
         "baseline_determinant_residual": (
             result.baseline.determinant_residual_abs
         ),
@@ -258,6 +265,16 @@ def _leaf_row(
         "response_imaginary": result.response.imag,
         "response_magnitude": magnitude,
     })
+    if result.signed_root_crosscheck is not None:
+        row.update({
+            "signed_root_crosscheck_real": result.signed_root_crosscheck.real,
+            "signed_root_crosscheck_imaginary": (
+                result.signed_root_crosscheck.imag
+            ),
+            "signed_root_crosscheck_magnitude": abs(
+                result.signed_root_crosscheck
+            ),
+        })
     if magnitude == 0.0:
         row["relative_disk_state"] = "ZERO_RESPONSE"
     else:

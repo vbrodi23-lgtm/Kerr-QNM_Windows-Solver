@@ -86,6 +86,7 @@ class JuliaResponseBackendTests(unittest.TestCase):
             self.assertIn(f'progress_emit("{event}"', worker)
         self.assertIn('"acceptance_threshold" => string(tolerance)', worker)
         self.assertIn('haskey(document, "primary_predictor")', worker)
+        self.assertIn('required(document, "primary_predictor_kind")', worker)
         self.assertIn('fallback_initial=fallback_initial', worker)
         self.assertIn('fallback_reason = "PREDICTOR_SOLVE_ERROR"', worker)
         self.assertIn("failure isa InterruptException && rethrow()", worker)
@@ -162,6 +163,26 @@ class JuliaResponseBackendTests(unittest.TestCase):
             "real": format(predictor.real, ".17g"),
             "imaginary": format(predictor.imag, ".17g"),
         })
+
+    def test_promoted_backend_labels_cross_spin_predictor(self):
+        job = _deep_job()
+        adapter = FakeAdapter()
+        backend = JuliaPrecisionRootBackend(
+            VettedNativeDeterminantKernel.identity, adapter, 80
+        )
+        predictor = job.root.omega + complex(1.0e-5, -2.0e-5)
+
+        backend.read_root_with_predictor_kind(
+            job,
+            0.001 + 0.0j,
+            predictor,
+            "SPIN_CONTINUATION",
+        )
+
+        self.assertEqual(
+            adapter.requests[0]["primary_predictor_kind"],
+            "SPIN_CONTINUATION",
+        )
 
     def test_refinement_tightens_every_resolution_control(self):
         job = _deep_job()

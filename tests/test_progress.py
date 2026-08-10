@@ -11,6 +11,7 @@ from threading import Thread
 import unittest
 from unittest.mock import patch
 
+from windows_solver.campaign_reports import CampaignReportModel
 from windows_solver.progress import (
     PROGRESS_SCHEMA,
     ProgressEventKind,
@@ -699,6 +700,95 @@ class CampaignProgressReporterTests(unittest.TestCase):
         self.assertEqual(status["context"]["determinant_index_phase"], 1)
         self.assertEqual(status["context"]["determinant_index_newton"], 1)
 
+    def test_live_dashboard_renders_accumulated_scientific_report_evidence(self):
+        class ConsoleStream(io.StringIO):
+            def isatty(self):
+                return True
+
+        accepted_leaf = "leaf-accepted"
+        stream = ConsoleStream()
+        reporter = self._console_reporter(stream)
+        reporter._last_accepted_leaf = accepted_leaf
+        reporter._campaign_report_model = CampaignReportModel(
+            leaf_rows=(
+                {
+                    "leaf_id": accepted_leaf,
+                    "terminal_state": "PRODUCED",
+                    "mode": "220",
+                    "spin_or_Mkappa": "0.999",
+                    "mechanism": "horizon-admittance",
+                    "convergence_basis": "ORDER_RESOLVED",
+                    "response_real": 1.25,
+                    "response_imaginary": -0.5,
+                    "response_magnitude": 1.346291201783626,
+                    "local_disk_radius": 2.0e-8,
+                    "relative_disk_radius": 1.4855627054164149e-8,
+                    "relative_disk_state": "FINITE",
+                    "baseline_omega_real": 0.9558544196294082,
+                    "baseline_omega_imaginary": -0.010530589036141928,
+                    "baseline_determinant_residual": 2.0e-13,
+                    "signed_root_crosscheck_real": 1.25,
+                    "signed_root_crosscheck_imaginary": -0.5,
+                    "signed_root_crosscheck_magnitude": 1.346291201783626,
+                    "signed_root_error": 2.0e-9,
+                    "truncation_error": 3.0e-9,
+                    "resolution_error": 4.0e-9,
+                    "seed_path_error": 5.0e-9,
+                    "axis_error": 6.0e-9,
+                    "amplitude_error": 7.0e-9,
+                },
+            ),
+            error_channel_rows=(),
+            projective_rows=(
+                {
+                    "row_id": "projective-row-1",
+                    "present_component_ids": json.dumps([accepted_leaf]),
+                    "reducer_state": "COMPLETE",
+                    "scientific_state": "BOUNDED",
+                    "projective_outcome": "SEPARATED",
+                    "nominal_angle": 0.21,
+                    "angle_lower_bound": 0.20,
+                    "angle_upper_bound": 0.22,
+                    "separation_threshold": 0.15,
+                    "equivalence_threshold": 0.05,
+                    "reason": "bounded interval exceeds separation threshold",
+                },
+            ),
+            checkpoint_source_receipt="sha256:" + "a" * 64,
+        )
+
+        reporter.publish(
+            _event(
+                ProgressEventKind.LEAF_STARTED,
+                leaf_id="next-leaf",
+                leaf_index=12,
+                leaf_count=212,
+            )
+        )
+
+        latest_panel = stream.getvalue().rsplit("\x1b8", 1)[-1]
+        self.assertIn("LATEST SCIENTIFIC RESULT", latest_panel)
+        self.assertIn("LatestResult: leaf-accepted", latest_panel)
+        self.assertIn("ResponseRe: 1.25", latest_panel)
+        self.assertIn("LocalDisk: 2e-08", latest_panel)
+        self.assertIn("Convergence: ORDER_RESOLVED", latest_panel)
+        self.assertIn("BaselineResidual: 2e-13", latest_panel)
+        self.assertIn("ErrorChannels:", latest_panel)
+        self.assertIn("PROJECTIVE EVIDENCE", latest_panel)
+        self.assertIn("ProjectiveOutcome: SEPARATED", latest_panel)
+        self.assertIn("FSAngle: 0.21", latest_panel)
+
+        status = json.loads(
+            Path(f"{self.reporter_checkpoint}.status.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(status["scientific"]["LatestResult"], accepted_leaf)
+        self.assertEqual(status["scientific"]["ResponseRe"], 1.25)
+        self.assertEqual(
+            status["scientific"]["ProjectiveOutcome"], "SEPARATED"
+        )
+
     def test_live_status_throttles_detail_events_but_forces_leaf_visibility(self):
         reporter = CampaignProgressReporter(
             "normal", self.reporter_checkpoint, io.StringIO()
@@ -779,7 +869,7 @@ class CampaignProgressReporterTests(unittest.TestCase):
 
         output = stream.getvalue()
         self.assertTrue(output.startswith(history + "\x1b[0J"))
-        self.assertIn("\x1b[39F", output)
+        self.assertIn("\x1b[42F", output)
         self.assertNotIn("\x1b7", output)
         self.assertNotIn("\x1b8", output)
         self.assertEqual(output.count("\x1b[0J"), 2)
@@ -836,13 +926,13 @@ class CampaignProgressReporterTests(unittest.TestCase):
 
         output = stream.getvalue()
         self.assertTrue(output.startswith(history + "\x1b[0J"))
-        self.assertIn("\x1b[15F", output)
+        self.assertIn("\x1b[17F", output)
         self.assertNotIn("\x1b7", output)
         self.assertNotIn("\x1b8", output)
         self.assertNotIn("\x1b[2J", output)
-        latest_panel = output.rsplit("\x1b[15F\x1b[0J", 1)[-1]
+        latest_panel = output.rsplit("\x1b[17F\x1b[0J", 1)[-1]
         lines = latest_panel.splitlines()
-        self.assertEqual(len(lines), 15)
+        self.assertEqual(len(lines), 17)
         self.assertTrue(all(len(line) <= 80 for line in lines))
         self.assertIn("M02 CAMPAIGN", latest_panel)
         self.assertIn("LeafStatus: RUNNING", latest_panel)
@@ -850,6 +940,7 @@ class CampaignProgressReporterTests(unittest.TestCase):
         self.assertIn("DeterminantAbs: 3.2e-08", latest_panel)
         self.assertIn("DetLeaf: 137 | DetPhase: 42 | DetNewton: 3", latest_panel)
         self.assertIn("Suboperation: Xup integration", latest_panel)
+        self.assertIn("PersistentReceipt: PENDING", latest_panel)
 
     def test_partial_campaign_settles_missing_precision_leaf_without_rejection(self):
         class ConsoleStream(io.StringIO):

@@ -370,6 +370,7 @@ class JuliaPrecisionRootBackend:
         job: ResponseComponentJob,
         amplitude: complex,
         primary_predictor: complex | None = None,
+        primary_predictor_kind: str | None = None,
     ) -> dict[str, object]:
         request: dict[str, object] = {
             "schema_version": 1,
@@ -405,6 +406,13 @@ class JuliaPrecisionRootBackend:
                     "real": format(predictor.real, ".17g"),
                     "imaginary": format(predictor.imag, ".17g"),
                 }
+                if primary_predictor_kind is not None:
+                    if primary_predictor_kind not in {
+                        "EPSILON_CONTINUATION",
+                        "SPIN_CONTINUATION",
+                    }:
+                        raise ValueError("primary predictor kind is invalid")
+                    request["primary_predictor_kind"] = primary_predictor_kind
         if job.mechanism_id != "horizon-admittance":
             support = _exterior_support(job.spin, job.mechanism_id)
             request["support"] = {
@@ -419,10 +427,41 @@ class JuliaPrecisionRootBackend:
         amplitude: complex,
         primary_predictor: complex | None = None,
     ) -> RootReadout:
+        return self._read_root(
+            job, amplitude, primary_predictor, primary_predictor_kind=None
+        )
+
+    def read_root_with_predictor_kind(
+        self,
+        job: ResponseComponentJob,
+        amplitude: complex,
+        primary_predictor: complex,
+        primary_predictor_kind: str,
+    ) -> RootReadout:
+        return self._read_root(
+            job,
+            amplitude,
+            primary_predictor,
+            primary_predictor_kind=primary_predictor_kind,
+        )
+
+    def _read_root(
+        self,
+        job: ResponseComponentJob,
+        amplitude: complex,
+        primary_predictor: complex | None,
+        *,
+        primary_predictor_kind: str | None,
+    ) -> RootReadout:
         if job.backend_identity != self.identity:
             raise ValueError("response job backend identity does not match Julia adapter")
         response = self.adapter.evaluate(
-            self._request(job, complex(amplitude), primary_predictor)
+            self._request(
+                job,
+                complex(amplitude),
+                primary_predictor,
+                primary_predictor_kind,
+            )
         )
         expected_fields = {
             "schema_version",

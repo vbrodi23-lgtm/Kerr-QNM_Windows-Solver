@@ -51,6 +51,7 @@ from .progress import ProgressEventKind, emit_progress, progress_scope
 
 ENGINE_SCHEMA_VERSION = 1
 ENGINE_EQUATION_ID = "same-equation-complex-amplitude-root-readout-" + "v" + str(1)
+ROOT_BRANCH_CONTINUATION_TOLERANCE_ABS = 5.0e-3
 _HEX_40 = re.compile(r"[0-9a-f]{40}")
 _EXTERIOR_PROFILE_IDS: Mapping[str, str] = {
     "exterior-fixed-r3": "fixed-r3",
@@ -693,6 +694,43 @@ class RootReadout:
         )
 
 
+def root_readout_preserves_authenticated_branch(
+    readout: RootReadout,
+    authenticated_root: BoundSpectralRoot,
+    *,
+    equation_id: str,
+    source_root_mapping: Mapping[str, object] | None,
+) -> bool:
+    """Replay the production root-readout branch contract for persisted evidence.
+
+    The authenticated catalog root establishes identity and branch provenance;
+    ``readout.omega`` is the numerical root returned after polishing.  The
+    native production kernel accepts that readout only when the polished root
+    and each diagnostic root remain inside the existing branch-continuation
+    radius.  Persisted records must carry the same identity bindings and the
+    same numerical evidence.
+    """
+
+    expected_source = _validated_source_root_mapping(source_root_mapping)
+    return (
+        readout.converged
+        and readout.root_reference_id == authenticated_root.root_reference_id
+        and readout.branch_id == authenticated_root.branch_id
+        and readout.equation_id == equation_id
+        and readout.source_root_mapping == expected_source
+        and abs(readout.omega - authenticated_root.omega)
+        <= ROOT_BRANCH_CONTINUATION_TOLERANCE_ABS
+        and readout.newton_correction_estimate
+        <= ROOT_BRANCH_CONTINUATION_TOLERANCE_ABS
+        and readout.truncation_radius
+        <= ROOT_BRANCH_CONTINUATION_TOLERANCE_ABS
+        and readout.resolution_radius
+        <= ROOT_BRANCH_CONTINUATION_TOLERANCE_ABS
+        and readout.seed_path_radius
+        <= ROOT_BRANCH_CONTINUATION_TOLERANCE_ABS
+    )
+
+
 class NativeDeterminantKernel(Protocol):
     def evaluate_root(
         self,
@@ -743,6 +781,32 @@ class NativeDeterminantAdapter:
         amplitude: complex,
         primary_predictor: complex | None = None,
     ) -> RootReadout:
+        return self._read_root(
+            job, amplitude, primary_predictor, primary_predictor_kind=None
+        )
+
+    def read_root_with_predictor_kind(
+        self,
+        job: ResponseComponentJob,
+        amplitude: complex,
+        primary_predictor: complex,
+        primary_predictor_kind: str,
+    ) -> RootReadout:
+        return self._read_root(
+            job,
+            amplitude,
+            primary_predictor,
+            primary_predictor_kind=primary_predictor_kind,
+        )
+
+    def _read_root(
+        self,
+        job: ResponseComponentJob,
+        amplitude: complex,
+        primary_predictor: complex | None,
+        *,
+        primary_predictor_kind: str | None,
+    ) -> RootReadout:
         self._check_job(job)
         value = _finite_complex(amplitude, "perturbation amplitude")
         if job.mechanism_id == "horizon-admittance":
@@ -754,6 +818,18 @@ class NativeDeterminantAdapter:
                 value,
                 _EXTERIOR_PROFILE_IDS[job.mechanism_id],
                 _exterior_support(job.spin, job.mechanism_id),
+            )
+        evaluate_with_kind = getattr(
+            self.kernel, "evaluate_root_with_predictor_kind", None
+        )
+        if primary_predictor_kind is not None and callable(evaluate_with_kind):
+            return evaluate_with_kind(
+                job=job,
+                background_root=job.root,
+                perturbation=perturbation,
+                policy=job.policy,
+                primary_predictor=primary_predictor,
+                primary_predictor_kind=primary_predictor_kind,
             )
         return self.kernel.evaluate_root(
             job=job,
@@ -1145,11 +1221,19 @@ def _validated_result(
 def run_component(
     job: ResponseComponentJob,
     backend: RootReadoutBackend,
+    response_predictor: complex | None = None,
 ) -> ComponentResult:
     """Run one job through same-equation zero and complex signed amplitudes."""
 
     if backend.identity != job.backend_identity:
         raise ValueError("response backend identity does not match job")
+    if response_predictor is not None:
+        response_predictor = complex(response_predictor)
+        if not (
+            math.isfinite(response_predictor.real)
+            and math.isfinite(response_predictor.imag)
+        ):
+            raise ValueError("response predictor must be finite")
     binder = getattr(backend, "bind_job", None)
     if binder is not None:
         job = binder(job)
@@ -1160,6 +1244,7 @@ def run_component(
         amplitude: complex,
         epsilon: float | None,
         primary_predictor: complex | None = None,
+        primary_predictor_kind: str | None = None,
     ) -> RootReadout:
         nonlocal readout_index
         readout_index += 1
@@ -1176,11 +1261,26 @@ def run_component(
         ):
             started = time.monotonic()
             emit_progress(ProgressEventKind.AMPLITUDE_READOUT_STARTED)
-            result = backend.read_root(
-                job,
-                converted,
-                primary_predictor=primary_predictor,
+            read_with_kind = getattr(
+                backend, "read_root_with_predictor_kind", None
             )
+            if (
+                primary_predictor is not None
+                and primary_predictor_kind is not None
+                and callable(read_with_kind)
+            ):
+                result = read_with_kind(
+                    job,
+                    converted,
+                    primary_predictor,
+                    primary_predictor_kind,
+                )
+            else:
+                result = backend.read_root(
+                    job,
+                    converted,
+                    primary_predictor=primary_predictor,
+                )
             emit_progress(
                 ProgressEventKind.AMPLITUDE_READOUT_COMPLETED,
                 current_omega={
@@ -1208,13 +1308,23 @@ def run_component(
     combined_estimate: _AxisEstimate | None = None
     ray_states: dict[str, tuple[float, RootReadout]] = {}
 
-    def ray_predictor(ray: str, epsilon: float) -> complex | None:
+    def ray_predictor(
+        ray: str, amplitude: complex, epsilon: float
+    ) -> tuple[complex | None, str | None]:
         previous = ray_states.get(ray)
         if previous is None:
-            return None
+            if response_predictor is None:
+                return None, None
+            return (
+                job.root.omega + amplitude * response_predictor,
+                "SPIN_CONTINUATION",
+            )
         previous_epsilon, previous_root = previous
-        return job.root.omega + (epsilon / previous_epsilon) * (
-            previous_root.omega - job.root.omega
+        return (
+            job.root.omega + (epsilon / previous_epsilon) * (
+                previous_root.omega - job.root.omega
+            ),
+            "EPSILON_CONTINUATION",
         )
 
     for epsilon in job.policy.epsilons:
@@ -1224,25 +1334,29 @@ def run_component(
                 "real-plus",
                 complex(epsilon, 0.0),
                 epsilon,
-                ray_predictor("real-plus", epsilon),
+                *ray_predictor("real-plus", complex(epsilon, 0.0), epsilon),
             ),
             real_minus=read_root(
                 "real-minus",
                 complex(-epsilon, 0.0),
                 epsilon,
-                ray_predictor("real-minus", epsilon),
+                *ray_predictor("real-minus", complex(-epsilon, 0.0), epsilon),
             ),
             imaginary_plus=read_root(
                 "imaginary-plus",
                 complex(0.0, epsilon),
                 epsilon,
-                ray_predictor("imaginary-plus", epsilon),
+                *ray_predictor(
+                    "imaginary-plus", complex(0.0, epsilon), epsilon
+                ),
             ),
             imaginary_minus=read_root(
                 "imaginary-minus",
                 complex(0.0, -epsilon),
                 epsilon,
-                ray_predictor("imaginary-minus", epsilon),
+                *ray_predictor(
+                    "imaginary-minus", complex(0.0, -epsilon), epsilon
+                ),
             ),
         )
         levels.append(level)
