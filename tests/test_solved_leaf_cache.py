@@ -504,6 +504,65 @@ class SolvedLeafCacheTests(unittest.TestCase):
             self.assertEqual(second.executed_stage_count, 0)
             self.assertEqual(second.reused_stage_count, 1)
 
+    def test_windows_campaign_store_cannot_be_redirected_from_local_app_data(self):
+        """Catches split read/write stores caused by an inherited override."""
+
+        plan = _plan()
+        selection = _primary(plan, 2)
+        first_only = build_campaign_selection(
+            plan, role="primary", leaf_ids=(selection.leaf_ids[0],)
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            local_app_data = root / "LocalAppData"
+            required_root = (
+                local_app_data
+                / "Kerr-QNM_Windows-Solver"
+                / "solved-leaves-v1"
+            )
+            redirected_root = root / "wrong-store"
+            required_store = SolvedLeafStore(required_root)
+            with patch(
+                "windows_solver.response_batches._validate_record_semantics",
+                return_value=True,
+            ):
+                run_campaign_selection(
+                    plan,
+                    first_only,
+                    _Backend(plan),
+                    root / "seed.json",
+                    resume=False,
+                    solved_leaf_store=required_store,
+                )
+                with patch.dict(
+                    os.environ,
+                    {
+                        "LOCALAPPDATA": str(local_app_data),
+                        "KERR_QNM_SOLVED_LEAF_STORE": str(redirected_root),
+                    },
+                    clear=True,
+                ):
+                    production_store = SolvedLeafStore.default()
+                    backend = _Backend(plan)
+                    summary = run_campaign_selection(
+                        plan,
+                        selection,
+                        backend,
+                        root / "campaign.json",
+                        resume=False,
+                        solved_leaf_store=production_store,
+                    )
+
+            self.assertEqual(production_store.root, required_root)
+            self.assertEqual(
+                backend.calls,
+                [(selection.leaf_ids[1], 64)],
+            )
+            self.assertEqual(summary.executed_stage_count, 1)
+            self.assertEqual(summary.reused_stage_count, 1)
+            self.assertEqual(required_store.stored_count, 2)
+            self.assertFalse(redirected_root.exists())
+
     def test_resume_backfills_terminal_checkpoint_records_to_default_windows_store(self):
         """Catches checkpoint reuse that skips persistent solved-leaf publication."""
 
