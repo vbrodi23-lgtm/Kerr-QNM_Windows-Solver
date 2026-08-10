@@ -1345,6 +1345,10 @@ def _terminal_state(outcome: StageOutcome, *, enclosed: bool = True) -> str:
     return "PRODUCED"
 
 
+class _NonProductionSolvedLeafRecord(ValueError):
+    """A valid orchestration record that is ineligible for scientific reuse."""
+
+
 def _validate_component_result(
     leaf: CampaignLeafPlan, outcome: StageOutcome
 ) -> bool:
@@ -1572,7 +1576,9 @@ def _validate_cacheable_leaf_record(
     if not _validate_record_semantics(
         leaf, record, plan.precision_factory_identity
     ):
-        raise ValueError("solved-leaf record lacks canonical production evidence")
+        raise _NonProductionSolvedLeafRecord(
+            "solved-leaf record lacks canonical production evidence"
+        )
 
 
 def _authenticated_solved_leaf_lookup(
@@ -1903,6 +1909,9 @@ def _run_campaign_selection_active(
             "PRODUCED", "UNRESOLVED"
         }:
             with progress_scope(**context):
+                _publish_terminal_solved_leaf(
+                    plan, leaf, record, solved_leaf_store
+                )
                 emit_progress(
                     ProgressEventKind.LEAF_REUSED,
                     state=record.state,
@@ -2275,7 +2284,11 @@ def import_campaign_checkpoint_to_solved_leaf_store(
             skipped += 1
             continue
         leaf = leaf_by_id[record.leaf_id]
-        _validate_cacheable_leaf_record(plan, leaf, record)
+        try:
+            _validate_cacheable_leaf_record(plan, leaf, record)
+        except _NonProductionSolvedLeafRecord:
+            skipped += 1
+            continue
         store.publish(
             scientific_identity_sha256=scientific_computation_identity_sha256(
                 plan, leaf
@@ -2387,8 +2400,6 @@ def _load_checkpoint_for_solved_leaf_import(
     )
     if record_ids != expected_order:
         raise ValueError("campaign checkpoint record order is invalid")
-    if selection.role != "merged" and record_ids != selection.leaf_ids[:len(records)]:
-        raise ValueError("selected campaign checkpoint records are not a prefix")
     leaf_by_id = {leaf.leaf_id: leaf for leaf in plan.leaves}
     for record in records:
         leaf = leaf_by_id[record.leaf_id]
