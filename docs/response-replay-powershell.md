@@ -37,7 +37,11 @@ explicit role-bounded selection. They never complete a Cartesian product. The
 provider remains unavailable and every partial or merged checkpoint reports
 `release_admissible=false`.
 
-Create a binary64 selection manifest. `leaf_ids` and `cohort_ids` are mutually
+Create a binary64 selection manifest. The compatibility field
+`precision_digits` is a mixed-unit tier selector: `64` means IEEE-754 binary64
+(~15–16 significant decimal digits), while `80` and `120` mean decimal-digit
+Julia BigFloat tiers. Reports retain that legacy field and add unambiguous
+precision-tier metadata. `leaf_ids` and `cohort_ids` are mutually
 exclusive; IDs must already be in canonical plan order.
 
 ```powershell

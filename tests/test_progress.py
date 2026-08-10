@@ -659,7 +659,7 @@ class CampaignProgressReporterTests(unittest.TestCase):
         self.assertIn(" Accepted       1", output)
         self.assertIn(" State          PRODUCED", output)
         self.assertIn(" Mechanism      horizon-admittance", output)
-        self.assertIn(" Precision      64 digits", output)
+        self.assertIn(" Precision      binary64 (~15.95 dec)", output)
         self.assertIn(" No scientific result payload.", output)
         self.assertNotIn("DeterminantAbs", output)
         self.assertNotIn("Suboperation", output)
@@ -777,7 +777,7 @@ class CampaignProgressReporterTests(unittest.TestCase):
         self.assertIn("LATEST COMPLETED LEAF", latest_panel)
         self.assertIn(" State          PRODUCED", latest_panel)
         self.assertIn(" Mechanism      horizon-admittance", latest_panel)
-        self.assertIn(" Precision      64 digits", latest_panel)
+        self.assertIn(" Precision      binary64 (~15.95 dec)", latest_panel)
         self.assertIn(" Convergence    ORDER_RESOLVED", latest_panel)
         self.assertIn(" Response       1.25 -0.500000000000i", latest_panel)
         self.assertIn(" |Response|     1.346E+00", latest_panel)
@@ -793,9 +793,49 @@ class CampaignProgressReporterTests(unittest.TestCase):
             )
         )
         self.assertEqual(status["scientific"]["LatestResult"], accepted_leaf)
+        self.assertEqual(status["scientific"]["ResultPrecision"], 64)
+        self.assertEqual(
+            status["scientific"]["ResultPrecisionTier"], "binary64"
+        )
+        self.assertEqual(
+            status["scientific"]["ResultPrecisionDecimalDigitsNominal"], 15.95
+        )
+        self.assertEqual(
+            status["scientific"]["ResultPrecisionLabel"],
+            "binary64 (~15.95 dec)",
+        )
         self.assertEqual(status["scientific"]["ResponseRe"], 1.25)
         self.assertEqual(
             status["scientific"]["ProjectiveOutcome"], "SEPARATED"
+        )
+
+    def test_live_status_exposes_active_precision_tier_without_rewriting_context(self):
+        reporter = CampaignProgressReporter(
+            "quiet", self.reporter_checkpoint, io.StringIO()
+        )
+        reporter.publish(
+            _event(
+                ProgressEventKind.LEAF_STARTED,
+                leaf_id="leaf-1",
+                precision_digits=64,
+            )
+        )
+
+        status = json.loads(
+            Path(f"{self.reporter_checkpoint}.status.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(status["context"]["precision_digits"], 64)
+        self.assertEqual(
+            status["precision"],
+            {
+                "arithmetic": "IEEE-754 binary64",
+                "legacy_tier_value": 64,
+                "nominal_decimal_digits": 15.95,
+                "precision_tier": "binary64",
+                "presentation_label": "binary64 (~15.95 dec)",
+            },
         )
 
     def test_live_status_throttles_detail_events_but_forces_leaf_visibility(self):
@@ -833,7 +873,13 @@ class CampaignProgressReporterTests(unittest.TestCase):
         stream = io.StringIO()
         reporter = CampaignProgressReporter("quiet", self.reporter_checkpoint, stream)
         reporter.publish(_event(ProgressEventKind.CAMPAIGN_STARTED))
-        reporter.publish(_event(ProgressEventKind.LEAF_STARTED, leaf_id="leaf-1"))
+        reporter.publish(
+            _event(
+                ProgressEventKind.LEAF_STARTED,
+                leaf_id="leaf-1",
+                precision_digits=64,
+            )
+        )
         reporter.publish(
             _event(
                 ProgressEventKind.ROOT_PHASE_STARTED,
@@ -841,11 +887,19 @@ class CampaignProgressReporterTests(unittest.TestCase):
                 phase="PRIMARY",
             )
         )
-        reporter.publish(_event(ProgressEventKind.LEAF_COMPLETED, leaf_id="leaf-1"))
+        reporter.publish(
+            _event(
+                ProgressEventKind.LEAF_COMPLETED,
+                leaf_id="leaf-1",
+                precision_digits=64,
+            )
+        )
 
         output = stream.getvalue()
         self.assertIn("leaf_started", output)
         self.assertIn("leaf_completed", output)
+        self.assertIn("precision=binary64 (~15.95 dec)", output)
+        self.assertNotIn("precision=64", output)
         self.assertNotIn("campaign_started", output)
         self.assertNotIn("root_phase_started", output)
 

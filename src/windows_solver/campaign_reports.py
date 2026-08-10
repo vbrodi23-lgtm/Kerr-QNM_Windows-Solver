@@ -23,6 +23,7 @@ from .response_batches import (
     STAGE_SIGNED_ERROR_FAMILIES,
     validate_campaign_checkpoint,
 )
+from .precision_tiers import precision_tier_presentation
 from .response_engine import ComponentResult, ERROR_CHANNELS
 from .response_reduction import (
     ComputedUnresolvedComponentEvidence,
@@ -49,6 +50,8 @@ LEAF_COLUMNS = (
     "terminal_state",
     "component_status",
     "precision_digits",
+    "precision_tier",
+    "precision_decimal_digits_nominal",
     "convergence_basis",
     "response_real",
     "response_imaginary",
@@ -83,6 +86,8 @@ ERROR_CHANNEL_COLUMNS = (
     "component_id",
     "leaf_ordinal",
     "precision_digits",
+    "precision_tier",
+    "precision_decimal_digits_nominal",
     "channel_index",
     "channel_id",
     "family",
@@ -229,12 +234,17 @@ def _leaf_row(
 
     stage = record.stages[-1]
     outcome = stage.outcome
+    precision = precision_tier_presentation(outcome.digits)
     result = _component_result(record)
     row.update({
         "component_status": (
             outcome.numerical_state if result is None else result.status.value
         ),
         "precision_digits": outcome.digits,
+        "precision_tier": precision.precision_tier,
+        "precision_decimal_digits_nominal": (
+            precision.nominal_decimal_digits
+        ),
         "convergence_basis": (
             "" if result is None else result.convergence_basis
         ),
@@ -321,6 +331,7 @@ def _error_channel_rows(
     if not record.stages:
         return ()
     stage = record.stages[-1]
+    precision = precision_tier_presentation(stage.outcome.digits)
     output: list[dict[str, object]] = []
     for index, raw_channel in enumerate(stage.outcome.signed_error_channels, start=1):
         normalized = _normalized_channel(record.leaf_id, raw_channel, source_receipt)
@@ -331,6 +342,10 @@ def _error_channel_rows(
             "component_id": record.leaf_id,
             "leaf_ordinal": ordinal,
             "precision_digits": stage.outcome.digits,
+            "precision_tier": precision.precision_tier,
+            "precision_decimal_digits_nominal": (
+                precision.nominal_decimal_digits
+            ),
             "channel_index": index,
             "channel_id": normalized.channel_id,
             "family": normalized.family,
