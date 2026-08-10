@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from decimal import Decimal
 import hashlib
 import json
 from pathlib import Path
@@ -54,11 +55,15 @@ class FakeAdapter:
             "request_sha256": "e" * 64,
             "precision_digits": request["precision_digits"],
             "working_precision_bits": request["working_precision_bits"],
-            "root_omega_re": "0.5",
-            "root_omega_im": "-0.08",
+            "root_omega_re": request["omega"]["real"],
+            "root_omega_im": request["omega"]["imaginary"],
             "root_residual_abs": "1e-60",
             "root_derivative_abs": "2.5",
             "root_converged": True,
+            "branch_authentication_contract_version": 2,
+            "root_branch_continuation_valid": True,
+            "branch_tolerance_abs": "0.005",
+            "root_displacement_abs": "0",
             "truncation_radius_abs": "2e-55",
             "resolution_radius_abs": "3e-55",
             "seed_path_radius_abs": "4e-55",
@@ -91,6 +96,10 @@ class JuliaResponseBackendTests(unittest.TestCase):
         self.assertIn('fallback_reason = "PREDICTOR_SOLVE_ERROR"', worker)
         self.assertIn("failure isa InterruptException && rethrow()", worker)
         self.assertIn('"INDEPENDENT_SEED_PATH"', worker)
+        self.assertIn('"branch_authentication_contract_version" => 2', worker)
+        self.assertIn('"root_branch_continuation_valid" => branch_valid', worker)
+        self.assertIn('"branch_tolerance_abs" => numeric_text(branch_tolerance)', worker)
+        self.assertIn('"root_displacement_abs" => numeric_text(abs(root - omega))', worker)
         self.assertNotIn('document["progress', worker)
 
     def test_reserved_julia_stdout_event_is_forwarded_to_active_reporter(self):
@@ -142,7 +151,7 @@ class JuliaResponseBackendTests(unittest.TestCase):
             "real": "0.001",
             "imaginary": "-0.002",
         })
-        self.assertEqual(readout.omega, complex(0.5, -0.08))
+        self.assertEqual(readout.omega, job.root.omega)
         self.assertEqual(readout.truncation_radius, 2.0e-55)
         self.assertTrue(readout.converged)
         self.assertEqual(backend.scientific_runtime["precision_digits"], 80)
@@ -156,6 +165,7 @@ class JuliaResponseBackendTests(unittest.TestCase):
                 response.update({
                     "root_omega_re": request["omega"]["real"],
                     "root_omega_im": request["omega"]["imaginary"],
+                    "root_displacement_abs": "0",
                     "root_residual_abs": "5e-11",
                     "root_converged": False,
                 })
@@ -180,9 +190,12 @@ class JuliaResponseBackendTests(unittest.TestCase):
             def evaluate(self, request):
                 response = super().evaluate(request)
                 response.update({
-                    "root_omega_re": str(float(request["omega"]["real"]) + 0.006),
+                    "root_omega_re": request["omega"]["real"],
                     "root_omega_im": request["omega"]["imaginary"],
+                    "root_displacement_abs": "0",
+                    "truncation_radius_abs": "0.006",
                     "root_converged": False,
+                    "root_branch_continuation_valid": False,
                 })
                 return response
 
@@ -197,6 +210,153 @@ class JuliaResponseBackendTests(unittest.TestCase):
 
         self.assertFalse(readout.converged)
         self.assertEqual(readout.branch_id, "nonmatching-julia-continuation")
+
+    def test_promoted_branch_decision_preserves_high_precision_boundary(self):
+        """Catches binary64 rounding authenticating a just-outside Julia root."""
+
+        class BoundaryAdapter(FakeAdapter):
+            def __init__(self, displacement, branch_valid):
+                super().__init__()
+                self.displacement = displacement
+                self.branch_valid = branch_valid
+
+            def evaluate(self, request):
+                response = super().evaluate(request)
+                response.update({
+                    "root_omega_re": request["omega"]["real"],
+                    "root_omega_im": request["omega"]["imaginary"],
+                    "root_displacement_abs": "0",
+                    "truncation_radius_abs": self.displacement,
+                    "root_converged": False,
+                    "root_branch_continuation_valid": self.branch_valid,
+                })
+                return response
+
+        job = _deep_job()
+        exact = JuliaPrecisionRootBackend(
+            VettedNativeDeterminantKernel.identity,
+            BoundaryAdapter("0.005", True),
+            80,
+        ).read_root(job, 0.0j)
+        outside = JuliaPrecisionRootBackend(
+            VettedNativeDeterminantKernel.identity,
+            BoundaryAdapter("0.0050000000000000000000000001", False),
+            80,
+        ).read_root(job, 0.0j)
+
+        class ComplexBoundaryAdapter(FakeAdapter):
+            def evaluate(self, request):
+                response = super().evaluate(request)
+                response.update({
+                    "root_omega_re": str(
+                        Decimal(request["omega"]["real"]) + Decimal("0.003")
+                    ),
+                    "root_omega_im": str(
+                        Decimal(request["omega"]["imaginary"]) + Decimal("0.004")
+                    ),
+                    "root_displacement_abs": "0.005",
+                })
+                return response
+
+        complex_boundary = JuliaPrecisionRootBackend(
+            VettedNativeDeterminantKernel.identity,
+            ComplexBoundaryAdapter(),
+            80,
+        ).read_root(job, 0.0j)
+
+        self.assertEqual(exact.branch_id, job.root.branch_id)
+        self.assertEqual(complex_boundary.branch_id, job.root.branch_id)
+        self.assertEqual(outside.branch_id, "nonmatching-julia-continuation")
+        self.assertEqual(
+            float("0.0050000000000000000000000001"),
+            0.005,
+        )
+
+    def test_promoted_branch_decision_rejects_worker_metric_disagreement(self):
+        """Catches trusting a forged Julia branch Boolean over clear radius evidence."""
+
+        class DisagreeingAdapter(FakeAdapter):
+            def evaluate(self, request):
+                response = super().evaluate(request)
+                response.update({
+                    "root_omega_re": request["omega"]["real"],
+                    "root_omega_im": request["omega"]["imaginary"],
+                    "root_displacement_abs": "0",
+                    "truncation_radius_abs": "0.006",
+                    "root_converged": False,
+                    "root_branch_continuation_valid": True,
+                })
+                return response
+
+        job = _deep_job()
+        backend = JuliaPrecisionRootBackend(
+            VettedNativeDeterminantKernel.identity,
+            DisagreeingAdapter(),
+            80,
+        )
+
+        with self.assertRaisesRegex(
+            JuliaResponseBackendError,
+            "branch-continuation evidence is inconsistent",
+        ):
+            backend.read_root(job, 0.0j)
+
+        class ForgedToleranceAdapter(DisagreeingAdapter):
+            def evaluate(self, request):
+                response = super().evaluate(request)
+                response["branch_tolerance_abs"] = "0.006"
+                return response
+
+        forged_tolerance_backend = JuliaPrecisionRootBackend(
+            VettedNativeDeterminantKernel.identity,
+            ForgedToleranceAdapter(),
+            80,
+        )
+        with self.assertRaisesRegex(
+            JuliaResponseBackendError,
+            "branch-continuation evidence is inconsistent",
+        ):
+            forged_tolerance_backend.read_root(job, 0.0j)
+
+        class ImpossibleConvergenceAdapter(DisagreeingAdapter):
+            def evaluate(self, request):
+                response = super().evaluate(request)
+                response.update({
+                    "root_converged": True,
+                    "root_branch_continuation_valid": False,
+                })
+                return response
+
+        impossible_backend = JuliaPrecisionRootBackend(
+            VettedNativeDeterminantKernel.identity,
+            ImpossibleConvergenceAdapter(),
+            80,
+        )
+        with self.assertRaisesRegex(
+            JuliaResponseBackendError,
+            "response contract is invalid",
+        ):
+            impossible_backend.read_root(job, 0.0j)
+
+        class FalseInsideAdapter(FakeAdapter):
+            def evaluate(self, request):
+                response = super().evaluate(request)
+                response.update({
+                    "root_converged": False,
+                    "root_branch_continuation_valid": False,
+                })
+                return response
+
+        false_inside_backend = JuliaPrecisionRootBackend(
+            VettedNativeDeterminantKernel.identity,
+            FalseInsideAdapter(),
+            80,
+        )
+        with self.assertRaisesRegex(
+            JuliaResponseBackendError,
+            "branch-continuation evidence is inconsistent",
+        ):
+            false_inside_backend.read_root(job, 0.0j)
 
     def test_promoted_backend_forwards_optional_primary_predictor(self):
         """Catches promoted precision reverting to background-only PRIMARY seeds."""
