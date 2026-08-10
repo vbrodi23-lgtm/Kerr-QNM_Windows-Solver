@@ -36,7 +36,7 @@ class Observer:
 class LinearBackend:
     identity = IDENTITY
 
-    def read_root(self, job, amplitude):
+    def read_root(self, job, amplitude, primary_predictor=None):
         omega = job.root.omega + (0.125 - 0.375j) * amplitude
         return RootReadout(
             omega=omega,
@@ -113,16 +113,101 @@ class NativeProgressTests(unittest.TestCase):
                 background_root=job.root,
                 perturbation=HorizonPerturbation(0.0j, job.spin, job.mode.m),
                 policy=job.policy,
+                primary_predictor=base + complex(5.0e-5, -2.0e-5),
             )
 
         starts = [event for event in observer.events if event.kind is ProgressEventKind.ROOT_PHASE_STARTED]
+        seeds = [event for event in observer.events if event.kind is ProgressEventKind.ROOT_SEED_SELECTED]
         completions = [event for event in observer.events if event.kind is ProgressEventKind.ROOT_PHASE_COMPLETED]
         self.assertEqual([event.context.phase for event in starts], [
             "PRIMARY", "TRUNCATION", "RESOLUTION", "SEED-PATH"
         ])
+        self.assertEqual(len(seeds), 4)
+        self.assertEqual(
+            [event.payload["seed_kind"] for event in seeds],
+            [
+                "EPSILON_CONTINUATION",
+                "ACCEPTED_PRIMARY",
+                "ACCEPTED_PRIMARY",
+                "INDEPENDENT_SEED_PATH",
+            ],
+        )
+        self.assertEqual(seeds[0].payload["requested_seed_kind"], "EPSILON_CONTINUATION")
+        self.assertIs(seeds[0].payload["fallback_used"], False)
+        self.assertEqual(
+            seeds[-1].payload["seed_omega"],
+            starts[-1].context.seed_omega,
+        )
         self.assertEqual(len(completions), 4)
         self.assertIsNotNone(starts[0].context.seed_omega)
         self.assertIn("resulting_omega", completions[0].payload)
+
+    def test_failed_predictor_reports_one_primary_fallback_without_new_phase(self):
+        class ScriptedKernel(VettedNativeDeterminantKernel):
+            def __init__(self, roots):
+                self.roots = iter(roots)
+
+            def _standard_sn(self, job, policy):
+                return object()
+
+            def _solve_once(self, *, sn, job, perturbation, policy, guess):
+                return next(self.roots)
+
+        job = ResponseComponentJob.from_leaf_id(
+            LEAF_ID,
+            policy=NumericalPolicy(),
+            backend_identity=VettedNativeDeterminantKernel.identity,
+        )
+        base = job.root.omega
+        predictor = base + complex(5.0e-5, -2.0e-5)
+        accepted = base + complex(1.0e-4, -4.0e-5)
+        kernel = ScriptedKernel((
+            (predictor, 1.0, 2.0, False),
+            (accepted, 1.0e-12, 2.0, True),
+            (accepted + 1.0e-10, 1.0e-12, 2.0, True),
+            (accepted + 2.0e-10, 1.0e-12, 2.0, True),
+            (accepted + 3.0e-10, 1.0e-12, 2.0, True),
+        ))
+        observer = Observer()
+        from windows_solver.response_engine import HorizonPerturbation
+
+        with activate_progress(observer):
+            kernel.evaluate_root(
+                job=job,
+                background_root=job.root,
+                perturbation=HorizonPerturbation(0.0j, job.spin, job.mode.m),
+                policy=job.policy,
+                primary_predictor=predictor,
+            )
+
+        starts = [
+            event
+            for event in observer.events
+            if event.kind is ProgressEventKind.ROOT_PHASE_STARTED
+        ]
+        primary_seeds = [
+            event
+            for event in observer.events
+            if event.kind is ProgressEventKind.ROOT_SEED_SELECTED
+            and event.context.phase == "PRIMARY"
+        ]
+        primary_completion = next(
+            event
+            for event in observer.events
+            if event.kind is ProgressEventKind.ROOT_PHASE_COMPLETED
+            and event.context.phase == "PRIMARY"
+        )
+        self.assertEqual(len(starts), 4)
+        self.assertEqual(
+            [event.payload["seed_kind"] for event in primary_seeds],
+            ["EPSILON_CONTINUATION", "FALLBACK_BACKGROUND"],
+        )
+        self.assertEqual(
+            primary_seeds[-1].payload["fallback_reason"],
+            "PREDICTOR_NEWTON_FAILED",
+        )
+        self.assertEqual(primary_completion.context.seed_kind, "FALLBACK_BACKGROUND")
+        self.assertIs(primary_completion.context.fallback_used, True)
 
     def test_newton_payloads_reuse_exact_determinant_calls_and_report_steps(self):
         calls = []

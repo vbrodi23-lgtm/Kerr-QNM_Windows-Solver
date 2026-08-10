@@ -65,7 +65,15 @@ class AnalyticKernel:
         self.fail_leaf_id = fail_leaf_id
         self.calls: list[object] = []
 
-    def evaluate_root(self, *, job, background_root, perturbation, policy):
+    def evaluate_root(
+        self,
+        *,
+        job,
+        background_root,
+        perturbation,
+        policy,
+        primary_predictor=None,
+    ):
         self.calls.append(perturbation)
         if self.fail_leaf_id == job.leaf_id:
             raise RuntimeError("intentional interruption")
@@ -99,7 +107,87 @@ class AnalyticKernel:
         )
 
 
+class PredictorRecordingBackend:
+    identity = IDENTITY
+
+    def __init__(self) -> None:
+        self.response = 0.125 - 0.375j
+        self.calls: list[tuple[complex, complex | None]] = []
+
+    def read_root(
+        self,
+        job: ResponseComponentJob,
+        amplitude: complex,
+        primary_predictor: complex | None = None,
+    ) -> RootReadout:
+        value = complex(amplitude)
+        self.calls.append((value, primary_predictor))
+        omega = (
+            job.root.omega
+            + self.response * value
+            + (0.2 + 0.1j) * value**3
+        )
+        return RootReadout(
+            omega=omega,
+            determinant_residual_abs=1.0e-12,
+            determinant_derivative_abs=2.0,
+            converged=True,
+            root_reference_id=job.root.root_reference_id,
+            branch_id=job.root.branch_id,
+            equation_id=job.equation_id,
+        )
+
+    def closed_form_horizon_response(
+        self, job: ResponseComponentJob
+    ) -> complex | None:
+        return None
+
+
 class LinearResponseEngineTests(unittest.TestCase):
+    def test_finer_epsilon_readouts_continue_independently_along_each_signed_ray(
+        self,
+    ) -> None:
+        """Catches restarting every signed PRIMARY solve from the background."""
+
+        job = ResponseComponentJob.from_leaf_id(
+            EXTERIOR_LEAF_ID,
+            policy=NumericalPolicy(),
+            backend_identity=IDENTITY,
+        )
+        original_job_id = job.job_id
+        backend = PredictorRecordingBackend()
+
+        result = run_component(job, backend)
+
+        self.assertEqual(result.status, ComponentStatus.CONVERGED)
+        self.assertEqual(job.job_id, original_job_id)
+        self.assertEqual(len(backend.calls), 17)
+        self.assertEqual(backend.calls[0], (0.0j, None))
+        rays = (1.0 + 0.0j, -1.0 + 0.0j, 0.0 + 1.0j, 0.0 - 1.0j)
+        previous_roots: dict[complex, tuple[float, complex]] = {}
+        call_index = 1
+        for level_index, epsilon in enumerate(job.policy.epsilons[:4]):
+            for ray in rays:
+                amplitude, predictor = backend.calls[call_index]
+                self.assertEqual(amplitude, ray * epsilon)
+                if level_index == 0:
+                    self.assertIsNone(predictor)
+                else:
+                    prior_epsilon, prior_root = previous_roots[ray]
+                    expected = job.root.omega + (epsilon / prior_epsilon) * (
+                        prior_root - job.root.omega
+                    )
+                    self.assertEqual(predictor, expected)
+                previous_roots[ray] = (epsilon, result.levels[level_index].__getattribute__(
+                    {
+                        1.0 + 0.0j: "real_plus",
+                        -1.0 + 0.0j: "real_minus",
+                        0.0 + 1.0j: "imaginary_plus",
+                        0.0 - 1.0j: "imaginary_minus",
+                    }[ray]
+                ).omega)
+                call_index += 1
+
     def test_native_kernel_requires_variant_radii_and_branch_continuation(self) -> None:
         """Catches accepting one native solve with zero diagnostics as converged."""
 
@@ -169,6 +257,143 @@ class LinearResponseEngineTests(unittest.TestCase):
         )
         self.assertFalse(rejected.converged)
         self.assertEqual(rejected.branch_id, "nonmatching-native-continuation")
+
+    def test_native_primary_uses_in_branch_predictor_without_preflight_and_keeps_seed_path_independent(
+        self,
+    ) -> None:
+        """Catches predictor preflight determinants or predictor-fed SEED-PATH."""
+
+        kernel_type = response_engine.VettedNativeDeterminantKernel
+
+        class ScriptedKernel(kernel_type):
+            def __init__(self, roots):
+                self.roots = iter(roots)
+                self.calls = []
+
+            def _standard_sn(self, job, policy):
+                return object()
+
+            def _determinant(self, *args, **kwargs):
+                raise AssertionError("predictor admission must not preflight determinants")
+
+            def _solve_once(self, *, sn, job, perturbation, policy, guess):
+                self.calls.append((policy, guess))
+                return next(self.roots)
+
+        job = ResponseComponentJob.from_leaf_id(
+            EXTERIOR_LEAF_ID,
+            policy=NumericalPolicy(),
+            backend_identity=kernel_type.identity,
+        )
+        base = job.root.omega
+        predictor = base + complex(5.0e-5, -2.0e-5)
+        primary = base + complex(1.0e-4, -4.0e-5)
+        kernel = ScriptedKernel((
+            (primary, 1.0e-12, 2.0, True),
+            (primary + 1.0e-9, 1.0e-12, 2.0, True),
+            (primary + 2.0e-9, 1.0e-12, 2.0, True),
+            (primary + 3.0e-9, 1.0e-12, 2.0, True),
+        ))
+        perturbation = ExteriorPerturbation(
+            0.001 + 0.0j,
+            "fixed-r3",
+            response_engine._exterior_support(job.spin, job.mechanism_id),
+        )
+
+        readout = kernel.evaluate_root(
+            job=job,
+            background_root=job.root,
+            perturbation=perturbation,
+            policy=job.policy,
+            primary_predictor=predictor,
+        )
+
+        self.assertTrue(readout.converged)
+        self.assertEqual(kernel.calls[0][1], predictor)
+        self.assertEqual(kernel.calls[1][1], primary)
+        self.assertEqual(kernel.calls[2][1], primary)
+        expected_seed_path = base + complex(2.5e-4, 1.25e-4) * (1.0 + abs(base))
+        self.assertEqual(kernel.calls[3][1], expected_seed_path)
+
+    def test_native_primary_falls_back_before_work_or_after_failed_predictor(self) -> None:
+        """Catches losing the authenticated-background recovery path."""
+
+        kernel_type = response_engine.VettedNativeDeterminantKernel
+
+        class ScriptedKernel(kernel_type):
+            def __init__(self, roots):
+                self.roots = iter(roots)
+                self.guesses = []
+
+            def _standard_sn(self, job, policy):
+                return object()
+
+            def _solve_once(self, *, sn, job, perturbation, policy, guess):
+                self.guesses.append(guess)
+                result = next(self.roots)
+                if isinstance(result, Exception):
+                    raise result
+                return result
+
+        job = ResponseComponentJob.from_leaf_id(
+            EXTERIOR_LEAF_ID,
+            policy=NumericalPolicy(),
+            backend_identity=kernel_type.identity,
+        )
+        base = job.root.omega
+        primary = base + 1.0e-4
+        perturbation = ExteriorPerturbation(
+            0.001 + 0.0j,
+            "fixed-r3",
+            response_engine._exterior_support(job.spin, job.mechanism_id),
+        )
+        outside = ScriptedKernel(tuple(
+            (primary + index * 1.0e-9, 1.0e-12, 2.0, True)
+            for index in range(4)
+        ))
+        outside.evaluate_root(
+            job=job,
+            background_root=job.root,
+            perturbation=perturbation,
+            policy=job.policy,
+            primary_predictor=base + 0.1,
+        )
+        self.assertEqual(outside.guesses[0], base)
+
+        predictor = base + 5.0e-5
+        failed = ScriptedKernel((
+            (predictor, 1.0, 2.0, False),
+            (primary, 1.0e-12, 2.0, True),
+            (primary + 1.0e-9, 1.0e-12, 2.0, True),
+            (primary + 2.0e-9, 1.0e-12, 2.0, True),
+            (primary + 3.0e-9, 1.0e-12, 2.0, True),
+        ))
+        recovered = failed.evaluate_root(
+            job=job,
+            background_root=job.root,
+            perturbation=perturbation,
+            policy=job.policy,
+            primary_predictor=predictor,
+        )
+        self.assertTrue(recovered.converged)
+        self.assertEqual(failed.guesses[:2], [predictor, base])
+
+        errored = ScriptedKernel((
+            RuntimeError("predictor-local determinant failure"),
+            (primary, 1.0e-12, 2.0, True),
+            (primary + 1.0e-9, 1.0e-12, 2.0, True),
+            (primary + 2.0e-9, 1.0e-12, 2.0, True),
+            (primary + 3.0e-9, 1.0e-12, 2.0, True),
+        ))
+        recovered_after_error = errored.evaluate_root(
+            job=job,
+            background_root=job.root,
+            perturbation=perturbation,
+            policy=job.policy,
+            primary_predictor=predictor,
+        )
+        self.assertTrue(recovered_after_error.converged)
+        self.assertEqual(errored.guesses[:2], [predictor, base])
 
     def test_vetted_native_kernel_profiles_and_missing_cache_fail_before_work(self) -> None:
         """Catches shipping only a Protocol or six support labels without kernels."""

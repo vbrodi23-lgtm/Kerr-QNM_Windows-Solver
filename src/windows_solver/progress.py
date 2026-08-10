@@ -43,6 +43,7 @@ class ProgressEventKind(StrEnum):
     AMPLITUDE_READOUT_STARTED = "amplitude_readout_started"
     AMPLITUDE_READOUT_COMPLETED = "amplitude_readout_completed"
     ROOT_PHASE_STARTED = "root_phase_started"
+    ROOT_SEED_SELECTED = "root_seed_selected"
     ROOT_PHASE_COMPLETED = "root_phase_completed"
     NEWTON_ITERATION_STARTED = "newton_iteration_started"
     NEWTON_ITERATION_COMPLETED = "newton_iteration_completed"
@@ -105,6 +106,7 @@ _INTEGER_CONTEXT_KEYS = frozenset(
     }
 )
 _FLOAT_CONTEXT_KEYS = frozenset({"spin", "epsilon"})
+_BOOLEAN_CONTEXT_KEYS = frozenset({"fallback_used"})
 _STRING_CONTEXT_KEYS = frozenset(
     {
         "leaf_id",
@@ -113,6 +115,7 @@ _STRING_CONTEXT_KEYS = frozenset(
         "component_pass",
         "readout_role",
         "phase",
+        "seed_kind",
         "determinant_purpose",
         "suboperation",
     }
@@ -148,6 +151,8 @@ def _validate_context_values(values: Mapping[str, object]) -> Mapping[str, objec
             isinstance(value, bool) or not isinstance(value, (int, float))
         ):
             raise ValueError(f"progress context {name} must be a number")
+        if name in _BOOLEAN_CONTEXT_KEYS and not isinstance(value, bool):
+            raise ValueError(f"progress context {name} must be a boolean")
         if name in _STRING_CONTEXT_KEYS and not isinstance(value, str):
             raise ValueError(f"progress context {name} must be a string")
         if name in _MAPPING_CONTEXT_KEYS and not isinstance(value, Mapping):
@@ -176,6 +181,8 @@ class ProgressContext:
     epsilon: float | None = None
     amplitude: Mapping[str, object] | None = None
     phase: str | None = None
+    seed_kind: str | None = None
+    fallback_used: bool | None = None
     newton_index: int | None = None
     newton_limit: int | None = None
     determinant_index: int | None = None

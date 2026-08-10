@@ -20,7 +20,11 @@ from windows_solver.response_batches import (
     run_campaign_selection,
     synthetic_stage_signed_error_channels,
 )
-from windows_solver.response_engine import NumericalPolicy, VettedNativeDeterminantKernel
+from windows_solver.response_engine import (
+    BackendIdentity,
+    NumericalPolicy,
+    VettedNativeDeterminantKernel,
+)
 from windows_solver.solved_leaf_cache import SolvedLeafLookupStatus, SolvedLeafStore
 
 
@@ -102,8 +106,29 @@ class SolvedLeafCacheTests(unittest.TestCase):
                 )
 
     def test_empty_store_writes_through_then_identical_run_reuses_exact_record(self):
-        plan = _plan()
+        historical_backend = BackendIdentity(
+            backend_id="cache-compatibility-fixture",
+            implementation_version="1",
+            source_commit="0c1e8a3d3bca6e608c34e111476a4f6dcb73e86e",
+            source_blobs=((
+                "fixture",
+                "b65f2236f828204aa21dfa8d9bc79c8a1c66ca3b",
+            ),),
+            runtime_fingerprint="platform-independent-cache-fixture",
+        )
+        plan = build_campaign_plan(
+            policy=NumericalPolicy(ode_relative_tolerance=2.0e-10),
+            backend_identity=historical_backend,
+            precision_capabilities=PrecisionCapabilities((64,)),
+        )
         selection = _primary(plan, 1)
+        leaf = next(
+            item for item in plan.leaves if item.leaf_id == selection.leaf_ids[0]
+        )
+        self.assertEqual(
+            scientific_computation_identity_sha256(plan, leaf),
+            "82dd7b5fc50fa17b3ebbded02a3ea83b827f8e9c2c4f47679ffe462b142b640c",
+        )
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             store = SolvedLeafStore(root / "solved")

@@ -701,6 +701,7 @@ class NativeDeterminantKernel(Protocol):
         background_root: BoundSpectralRoot,
         perturbation: HorizonPerturbation | ExteriorPerturbation,
         policy: NumericalPolicy,
+        primary_predictor: complex | None = None,
     ) -> RootReadout: ...
 
     def horizon_partials(
@@ -715,7 +716,12 @@ class NativeDeterminantKernel(Protocol):
 class RootReadoutBackend(Protocol):
     identity: BackendIdentity
 
-    def read_root(self, job: ResponseComponentJob, amplitude: complex) -> RootReadout: ...
+    def read_root(
+        self,
+        job: ResponseComponentJob,
+        amplitude: complex,
+        primary_predictor: complex | None = None,
+    ) -> RootReadout: ...
 
     def closed_form_horizon_response(
         self, job: ResponseComponentJob
@@ -731,7 +737,12 @@ class NativeDeterminantAdapter:
         if job.backend_identity != self.identity:
             raise ValueError("response job backend identity does not match adapter")
 
-    def read_root(self, job: ResponseComponentJob, amplitude: complex) -> RootReadout:
+    def read_root(
+        self,
+        job: ResponseComponentJob,
+        amplitude: complex,
+        primary_predictor: complex | None = None,
+    ) -> RootReadout:
         self._check_job(job)
         value = _finite_complex(amplitude, "perturbation amplitude")
         if job.mechanism_id == "horizon-admittance":
@@ -749,6 +760,7 @@ class NativeDeterminantAdapter:
             background_root=job.root,
             perturbation=perturbation,
             policy=job.policy,
+            primary_predictor=primary_predictor,
         )
 
     def closed_form_horizon_response(
@@ -1143,7 +1155,12 @@ def run_component(
         job = binder(job)
     readout_index = 0
 
-    def read_root(role: str, amplitude: complex, epsilon: float | None) -> RootReadout:
+    def read_root(
+        role: str,
+        amplitude: complex,
+        epsilon: float | None,
+        primary_predictor: complex | None = None,
+    ) -> RootReadout:
         nonlocal readout_index
         readout_index += 1
         converted = complex(amplitude)
@@ -1159,7 +1176,11 @@ def run_component(
         ):
             started = time.monotonic()
             emit_progress(ProgressEventKind.AMPLITUDE_READOUT_STARTED)
-            result = backend.read_root(job, converted)
+            result = backend.read_root(
+                job,
+                converted,
+                primary_predictor=primary_predictor,
+            )
             emit_progress(
                 ProgressEventKind.AMPLITUDE_READOUT_COMPLETED,
                 current_omega={
@@ -1185,16 +1206,43 @@ def run_component(
     real_estimate: _AxisEstimate | None = None
     imaginary_estimate: _AxisEstimate | None = None
     combined_estimate: _AxisEstimate | None = None
+    ray_states: dict[str, tuple[float, RootReadout]] = {}
+
+    def ray_predictor(ray: str, epsilon: float) -> complex | None:
+        previous = ray_states.get(ray)
+        if previous is None:
+            return None
+        previous_epsilon, previous_root = previous
+        return job.root.omega + (epsilon / previous_epsilon) * (
+            previous_root.omega - job.root.omega
+        )
+
     for epsilon in job.policy.epsilons:
         level = LadderLevel(
             epsilon=epsilon,
-            real_plus=read_root("real-plus", complex(epsilon, 0.0), epsilon),
-            real_minus=read_root("real-minus", complex(-epsilon, 0.0), epsilon),
+            real_plus=read_root(
+                "real-plus",
+                complex(epsilon, 0.0),
+                epsilon,
+                ray_predictor("real-plus", epsilon),
+            ),
+            real_minus=read_root(
+                "real-minus",
+                complex(-epsilon, 0.0),
+                epsilon,
+                ray_predictor("real-minus", epsilon),
+            ),
             imaginary_plus=read_root(
-                "imaginary-plus", complex(0.0, epsilon), epsilon
+                "imaginary-plus",
+                complex(0.0, epsilon),
+                epsilon,
+                ray_predictor("imaginary-plus", epsilon),
             ),
             imaginary_minus=read_root(
-                "imaginary-minus", complex(0.0, -epsilon), epsilon
+                "imaginary-minus",
+                complex(0.0, -epsilon),
+                epsilon,
+                ray_predictor("imaginary-minus", epsilon),
             ),
         )
         levels.append(level)
@@ -1211,6 +1259,12 @@ def run_component(
                     job,
                     _unresolved_result(job, status, baseline, levels),
                 )
+        ray_states.update({
+            "real-plus": (epsilon, level.real_plus),
+            "real-minus": (epsilon, level.real_minus),
+            "imaginary-plus": (epsilon, level.imaginary_plus),
+            "imaginary-minus": (epsilon, level.imaginary_minus),
+        })
         if len(levels) < 4:
             continue
 
@@ -1875,7 +1929,12 @@ class RecordedReplayBackend:
             return job
         return replace(job, source_root_mapping=receipt)
 
-    def read_root(self, job: ResponseComponentJob, amplitude: complex) -> RootReadout:
+    def read_root(
+        self,
+        job: ResponseComponentJob,
+        amplitude: complex,
+        primary_predictor: complex | None = None,
+    ) -> RootReadout:
         case = self._case(job)
         expected_mapping = self.source_root_mapping(job)
         if job.source_root_mapping != expected_mapping:

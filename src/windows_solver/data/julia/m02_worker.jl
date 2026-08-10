@@ -114,6 +114,11 @@ function flatten_request(document)
             flattened["support_$key"] = required(support, key)
         end
     end
+    if haskey(document, "primary_predictor")
+        predictor = required(document, "primary_predictor")
+        flattened["primary_predictor_re"] = required(predictor, "real")
+        flattened["primary_predictor_im"] = required(predictor, "imaginary")
+    end
     return flattened
 end
 
@@ -542,7 +547,12 @@ function solve_once(::Type{T}, request, initial::Complex{T}, amplitude::Complex{
 end
 
 function solve_phase(
-    ::Type{T}, request, phase::String, initial::Complex{T}, amplitude::Complex{T}
+    ::Type{T}, request, phase::String, initial::Complex{T}, amplitude::Complex{T};
+    seed_kind="AUTHENTICATED_BACKGROUND",
+    requested_seed_kind=seed_kind,
+    fallback_initial=nothing,
+    fallback_used=false,
+    fallback_reason=nothing,
 ) where {T<:AbstractFloat}
     started = time_ns()
     context = Dict{String,Any}(
@@ -550,19 +560,87 @@ function solve_phase(
         "seed_omega" => progress_complex(initial),
         "current_omega" => progress_complex(initial),
     )
+
+    function solve_with_seed(
+        selected_initial, selected_kind, used, reason, error_type=nothing
+    )
+        seed_context = Dict{String,Any}(
+            "seed_omega" => progress_complex(selected_initial),
+            "current_omega" => progress_complex(selected_initial),
+            "seed_kind" => selected_kind,
+            "fallback_used" => used,
+        )
+        return progress_scope(seed_context) do
+            progress_emit("root_seed_selected"; payload=Dict(
+                "requested_seed_kind" => requested_seed_kind,
+                "seed_kind" => selected_kind,
+                "seed_omega" => progress_complex(selected_initial),
+                "fallback_used" => used,
+                "fallback_reason" => reason,
+                "fallback_error_type" => error_type,
+            ))
+            solve_once(T, request, selected_initial, amplitude)
+        end
+    end
+
     return progress_scope(context) do
         progress_emit("root_phase_started"; payload=Dict(
             "seed_omega" => progress_complex(initial),
             "current_omega" => progress_complex(initial),
         ))
-        result = solve_once(T, request, initial, amplitude)
-        progress_emit("root_phase_completed"; payload=Dict(
-            "resulting_omega" => progress_complex(result[1]),
-            "resulting_determinant_abs" => string(result[2]),
-            "derivative_abs" => string(result[3]),
-            "converged" => result[4],
-            "elapsed_seconds" => (time_ns() - started) / 1.0e9,
-        ))
+        actual_initial = initial
+        actual_kind = seed_kind
+        fallback_error_type = nothing
+        result = try
+            solve_with_seed(
+                actual_initial, actual_kind, fallback_used, fallback_reason
+            )
+        catch failure
+            failure isa InterruptException && rethrow()
+            fallback_initial === nothing && rethrow()
+            fallback_reason = "PREDICTOR_SOLVE_ERROR"
+            fallback_error_type = string(typeof(failure))
+            fallback_used = true
+            actual_initial = fallback_initial
+            actual_kind = "FALLBACK_BACKGROUND"
+            solve_with_seed(
+                actual_initial,
+                actual_kind,
+                fallback_used,
+                fallback_reason,
+                fallback_error_type,
+            )
+        end
+        if actual_kind != "FALLBACK_BACKGROUND" && fallback_initial !== nothing
+            if !result[4] || abs(result[1] - fallback_initial) > T("0.005")
+                if !result[4]
+                    fallback_reason = "PREDICTOR_NEWTON_FAILED"
+                else
+                    fallback_reason = "PREDICTOR_BRANCH_ESCAPE"
+                end
+                fallback_used = true
+                actual_initial = fallback_initial
+                actual_kind = "FALLBACK_BACKGROUND"
+                result = solve_with_seed(
+                    actual_initial, actual_kind, fallback_used, fallback_reason
+                )
+            end
+        end
+        completion_context = Dict{String,Any}(
+            "seed_omega" => progress_complex(actual_initial),
+            "current_omega" => progress_complex(result[1]),
+            "seed_kind" => actual_kind,
+            "fallback_used" => fallback_used,
+        )
+        progress_scope(completion_context) do
+            progress_emit("root_phase_completed"; payload=Dict(
+                "resulting_omega" => progress_complex(result[1]),
+                "resulting_determinant_abs" => string(result[2]),
+                "derivative_abs" => string(result[3]),
+                "converged" => result[4],
+                "elapsed_seconds" => (time_ns() - started) / 1.0e9,
+            ))
+        end
         result
     end
 end
@@ -591,18 +669,56 @@ function result_fields(::Type{T}, request, digits::Int, bits::Int) where {T<:Abs
     omega = parse_complex(T, request, "omega_re", "omega_im")
     amplitude = parse_complex(T, request, "amplitude_re", "amplitude_im")
 
+    primary_initial = omega
+    fallback_initial = nothing
+    primary_seed_kind = "AUTHENTICATED_BACKGROUND"
+    primary_requested_seed_kind = "AUTHENTICATED_BACKGROUND"
+    primary_fallback_used = false
+    primary_fallback_reason = nothing
+    if haskey(request, "primary_predictor_re") && haskey(request, "primary_predictor_im")
+        primary_requested_seed_kind = "EPSILON_CONTINUATION"
+        predictor = parse_complex(
+            T, request, "primary_predictor_re", "primary_predictor_im"
+        )
+        if isfinite(real(predictor)) && isfinite(imag(predictor)) &&
+           abs(predictor - omega) <= T("0.005")
+            primary_initial = predictor
+            fallback_initial = omega
+            primary_seed_kind = "EPSILON_CONTINUATION"
+        else
+            primary_seed_kind = "FALLBACK_BACKGROUND"
+            primary_fallback_used = true
+            if !isfinite(real(predictor)) || !isfinite(imag(predictor))
+                primary_fallback_reason = "PREDICTOR_INVALID"
+            else
+                primary_fallback_reason = "PREDICTOR_OUTSIDE_BRANCH"
+            end
+        end
+    end
     root, residual, derivative_abs, primary_converged =
-        solve_phase(T, request, "PRIMARY", omega, amplitude)
+        solve_phase(
+            T, request, "PRIMARY", primary_initial, amplitude;
+            seed_kind=primary_seed_kind,
+            requested_seed_kind=primary_requested_seed_kind,
+            fallback_initial=fallback_initial,
+            fallback_used=primary_fallback_used,
+            fallback_reason=primary_fallback_reason,
+        )
     truncation_root, _, _, truncation_converged = solve_phase(
-        T, refined_request(T, request, :truncation), "TRUNCATION", root, amplitude
+        T, refined_request(T, request, :truncation), "TRUNCATION", root, amplitude;
+        seed_kind="ACCEPTED_PRIMARY",
     )
     resolution_root, _, _, resolution_converged = solve_phase(
-        T, refined_request(T, request, :resolution), "RESOLUTION", root, amplitude
+        T, refined_request(T, request, :resolution), "RESOLUTION", root, amplitude;
+        seed_kind="ACCEPTED_PRIMARY",
     )
     alternate = omega + Complex{T}(T("0.00025"), T("0.000125")) *
         (one(T) + abs(omega))
     seed_path_root, _, _, seed_path_converged =
-        solve_phase(T, request, "SEED-PATH", alternate, amplitude)
+        solve_phase(
+            T, request, "SEED-PATH", alternate, amplitude;
+            seed_kind="INDEPENDENT_SEED_PATH",
+        )
     branch_tolerance = T("0.005")
     branch_valid = abs(root - omega) <= branch_tolerance && all(
         abs(candidate - root) <= branch_tolerance
