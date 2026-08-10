@@ -184,7 +184,8 @@ class CampaignPlanTests(unittest.TestCase):
             )
             self.assertEqual(escaped_store.stored_count, 0)
             with self.assertRaisesRegex(
-                ValueError, "campaign production baseline root is invalid"
+                ValueError,
+                "campaign production baseline root readout evidence is invalid",
             ):
                 import_campaign_checkpoint_to_solved_leaf_store(
                     plan,
