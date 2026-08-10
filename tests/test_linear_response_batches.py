@@ -23,13 +23,21 @@ from windows_solver.response_batches import (
     _checkpoint_mapping,
     build_campaign_plan,
     build_campaign_selection,
+    import_campaign_checkpoint_to_solved_leaf_store,
     synthetic_stage_signed_error_channels,
     merge_campaign_checkpoints,
     resolve_campaign_relative_path,
     run_campaign_selection,
     validate_campaign_checkpoint,
 )
-from windows_solver.response_engine import NumericalPolicy, VettedNativeDeterminantKernel
+from windows_solver.response_engine import (
+    ComponentResult,
+    ComponentStatus,
+    NumericalPolicy,
+    RootReadout,
+    VettedNativeDeterminantKernel,
+)
+from windows_solver.solved_leaf_cache import SolvedLeafStore
 
 
 def reseal_campaign_checkpoint(value):
@@ -63,7 +71,127 @@ def _synthetic_stage_outcome(**values):
     )
 
 
+def _produced_stage_outcome(leaf, response, *, baseline_delta=0.0j):
+    job = leaf.job
+    result = ComponentResult(
+        job_id=job.job_id,
+        leaf_id=job.leaf_id,
+        mechanism_id=job.mechanism_id,
+        status=ComponentStatus.CONVERGED,
+        convergence_basis="ORDER_RESOLVED",
+        response=response,
+        signed_root_crosscheck=response,
+        closed_form_response=None,
+        error_channels={
+            "signed-root": 1.0e-9,
+            "truncation": 1.0e-9,
+            "resolution": 1.0e-9,
+            "seed-path": 1.0e-9,
+            "axis": 1.0e-9,
+            "amplitude": 1.0e-9,
+        },
+        baseline=RootReadout(
+            omega=job.root.omega + baseline_delta,
+            determinant_residual_abs=1.0e-12,
+            determinant_derivative_abs=2.0,
+            converged=True,
+            root_reference_id=job.root.root_reference_id,
+            branch_id=job.root.branch_id,
+            equation_id=job.equation_id,
+        ),
+        levels=(),
+        lineage={
+            "leaf_id": job.leaf_id,
+            "root_reference_id": job.root.root_reference_id,
+            "root_identity_sha256": job.root.identity_sha256,
+            "policy_sha256": job.policy.identity_sha256,
+            "backend_identity_sha256": job.backend_identity.identity_sha256,
+            "equation_id": job.equation_id,
+            "sampling_coordinate": job.sampling_coordinate.to_mapping(),
+            "source_root_mapping": None,
+        },
+    )
+    component_result = {
+        "evidence_kind": "authenticated-test-component",
+        "result": result.to_mapping(),
+    }
+    return _synthetic_stage_outcome(
+        digits=64,
+        numerical_state="CONVERGED",
+        component_result=component_result,
+        local_disk_radius_abs=6.0e-9,
+    )
+
+
 class CampaignPlanTests(unittest.TestCase):
+    def test_enclosed_baseline_polish_is_published_to_solved_leaf_store(self) -> None:
+        """Catches requiring a polished zero-amplitude root to equal its seed."""
+
+        plan = build_campaign_plan(
+            policy=NumericalPolicy(),
+            backend_identity=VettedNativeDeterminantKernel.identity,
+            precision_capabilities=PrecisionCapabilities((64,)),
+        )
+        leaf = next(item for item in plan.leaves if item.role == "primary")
+        selection = build_campaign_selection(
+            plan, role="primary", leaf_ids=(leaf.leaf_id,)
+        )
+
+        class Backend:
+            identity = plan.backend_identity
+            precision_capabilities = plan.precision_capabilities
+
+            def __init__(self, baseline_delta):
+                self.baseline_delta = baseline_delta
+
+            def execute_stage(self, selected, digits):
+                return _produced_stage_outcome(
+                    selected,
+                    complex(1.0, -0.5),
+                    baseline_delta=self.baseline_delta,
+                )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            store = SolvedLeafStore(root / "solved-leaves")
+            checkpoint = root / "checkpoint.json"
+            run_campaign_selection(
+                plan,
+                selection,
+                Backend(complex(1.0e-12, -2.0e-12)),
+                checkpoint,
+                resume=False,
+                solved_leaf_store=store,
+            )
+
+            self.assertEqual(store.stored_count, 1)
+            imported_store = SolvedLeafStore(root / "imported-solved-leaves")
+            imported = import_campaign_checkpoint_to_solved_leaf_store(
+                plan, checkpoint, imported_store
+            )
+            self.assertEqual(imported.imported_count, 1)
+            self.assertEqual(imported_store.stored_count, 1)
+
+            escaped_store = SolvedLeafStore(root / "escaped-solved-leaves")
+            escaped_checkpoint = root / "escaped-checkpoint.json"
+            run_campaign_selection(
+                plan,
+                selection,
+                Backend(complex(1.0e-2, 0.0)),
+                escaped_checkpoint,
+                resume=False,
+                solved_leaf_store=escaped_store,
+            )
+            self.assertEqual(escaped_store.stored_count, 0)
+            with self.assertRaisesRegex(
+                ValueError, "campaign production baseline root is invalid"
+            ):
+                import_campaign_checkpoint_to_solved_leaf_store(
+                    plan,
+                    escaped_checkpoint,
+                    SolvedLeafStore(root / "escaped-import"),
+                )
+
     def test_source_identity_is_stable_across_checkout_line_endings(self) -> None:
         """Catches Windows checkout conversion changing campaign lineage."""
 
@@ -274,6 +402,233 @@ class CampaignPlanTests(unittest.TestCase):
         self.assertEqual(
             tuple(record.leaf_id for record in authenticated.records), primary_ids
         )
+
+    def test_response_continuation_stays_in_one_mode_mechanism_chain(self) -> None:
+        """Catches absolute-root seeding or continuation across scientific chains."""
+
+        plan = build_campaign_plan(
+            policy=NumericalPolicy(),
+            backend_identity=VettedNativeDeterminantKernel.identity,
+            precision_capabilities=PrecisionCapabilities((64,)),
+        )
+        selected_ids = tuple(
+            leaf.leaf_id
+            for leaf in plan.leaves
+            if leaf.role == "primary"
+            and (
+                (
+                    leaf.mechanism_id == "horizon-admittance"
+                    and leaf.leaf.mode_label == "220"
+                    and leaf.leaf.coordinate
+                    in {Fraction(19, 20), Fraction(99, 100)}
+                )
+                or (
+                    leaf.mechanism_id == "horizon-admittance"
+                    and leaf.leaf.mode_label == "440"
+                    and leaf.leaf.coordinate == Fraction(19, 20)
+                )
+                or (
+                    leaf.mechanism_id == "exterior-light-ring"
+                    and leaf.leaf.mode_label == "220"
+                    and leaf.leaf.coordinate == Fraction(19, 20)
+                )
+            )
+        )
+        selection = build_campaign_selection(
+            plan, role="primary", leaf_ids=selected_ids
+        )
+
+        class Backend:
+            identity = plan.backend_identity
+            precision_capabilities = plan.precision_capabilities
+
+            def __init__(self):
+                self.calls = []
+
+            def execute_stage(self, leaf, digits):
+                return self.execute_stage_with_predictor(leaf, digits, None)
+
+            def execute_stage_with_predictor(
+                self, leaf, digits, response_predictor
+            ):
+                response = complex(len(self.calls) + 1, -(len(self.calls) + 1))
+                self.calls.append((
+                    leaf.mechanism_id,
+                    leaf.leaf.mode_label,
+                    leaf.leaf.coordinate,
+                    response_predictor,
+                ))
+                return _produced_stage_outcome(leaf, response)
+
+        backend = Backend()
+        with tempfile.TemporaryDirectory() as temporary:
+            run_campaign_selection(
+                plan,
+                selection,
+                backend,
+                Path(temporary) / "checkpoint.json",
+                resume=False,
+            )
+
+        self.assertEqual(tuple(backend.calls), (
+            (
+                "horizon-admittance",
+                "220",
+                Fraction(19, 20),
+                None,
+            ),
+            (
+                "horizon-admittance",
+                "220",
+                Fraction(99, 100),
+                complex(1.0, -1.0),
+            ),
+            (
+                "horizon-admittance",
+                "440",
+                Fraction(19, 20),
+                None,
+            ),
+            (
+                "exterior-light-ring",
+                "220",
+                Fraction(19, 20),
+                None,
+            ),
+        ))
+
+    def test_resumed_produced_record_advances_its_response_chain(self) -> None:
+        """Catches discarding authenticated continuation state on resume."""
+
+        plan = build_campaign_plan(
+            policy=NumericalPolicy(),
+            backend_identity=VettedNativeDeterminantKernel.identity,
+            precision_capabilities=PrecisionCapabilities((64,)),
+        )
+        selected_ids = tuple(
+            leaf.leaf_id
+            for leaf in plan.leaves
+            if leaf.role == "primary"
+            and leaf.mechanism_id == "horizon-admittance"
+            and leaf.leaf.mode_label == "220"
+            and leaf.leaf.coordinate
+            in {Fraction(19, 20), Fraction(99, 100)}
+        )
+        selection = build_campaign_selection(
+            plan, role="primary", leaf_ids=selected_ids
+        )
+
+        class Backend:
+            identity = plan.backend_identity
+            precision_capabilities = plan.precision_capabilities
+
+            def __init__(self, fail_after=None):
+                self.calls = []
+                self.fail_after = fail_after
+
+            def execute_stage(self, leaf, digits):
+                return self.execute_stage_with_predictor(leaf, digits, None)
+
+            def execute_stage_with_predictor(
+                self, leaf, digits, response_predictor
+            ):
+                if (
+                    self.fail_after is not None
+                    and len(self.calls) >= self.fail_after
+                ):
+                    raise RuntimeError("synthetic interruption")
+                response = complex(len(self.calls) + 1, -(len(self.calls) + 1))
+                self.calls.append((leaf.leaf.coordinate, response_predictor))
+                return _produced_stage_outcome(leaf, response)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            checkpoint = Path(temporary) / "checkpoint.json"
+            with self.assertRaisesRegex(RuntimeError, "interruption"):
+                run_campaign_selection(
+                    plan,
+                    selection,
+                    Backend(fail_after=1),
+                    checkpoint,
+                    resume=False,
+                )
+            resumed = Backend()
+            run_campaign_selection(
+                plan,
+                selection,
+                resumed,
+                checkpoint,
+                resume=True,
+            )
+
+        self.assertEqual(resumed.calls, [
+            (Fraction(99, 100), complex(1.0, -1.0)),
+        ])
+
+    def test_cached_produced_record_advances_its_response_chain(self) -> None:
+        """Catches persistent cache reuse dropping valid continuation state."""
+
+        plan = build_campaign_plan(
+            policy=NumericalPolicy(),
+            backend_identity=VettedNativeDeterminantKernel.identity,
+            precision_capabilities=PrecisionCapabilities((64,)),
+        )
+        chain_ids = tuple(
+            leaf.leaf_id
+            for leaf in plan.leaves
+            if leaf.role == "primary"
+            and leaf.mechanism_id == "horizon-admittance"
+            and leaf.leaf.mode_label == "220"
+            and leaf.leaf.coordinate
+            in {Fraction(19, 20), Fraction(99, 100)}
+        )
+        first = build_campaign_selection(
+            plan, role="primary", leaf_ids=(chain_ids[0],)
+        )
+        both = build_campaign_selection(
+            plan, role="primary", leaf_ids=chain_ids
+        )
+
+        class Backend:
+            identity = plan.backend_identity
+            precision_capabilities = plan.precision_capabilities
+
+            def __init__(self):
+                self.calls = []
+
+            def execute_stage(self, leaf, digits):
+                return self.execute_stage_with_predictor(leaf, digits, None)
+
+            def execute_stage_with_predictor(
+                self, leaf, digits, response_predictor
+            ):
+                response = complex(len(self.calls) + 1, -(len(self.calls) + 1))
+                self.calls.append((leaf.leaf.coordinate, response_predictor))
+                return _produced_stage_outcome(leaf, response)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            store = SolvedLeafStore(root / "solved-leaves")
+            run_campaign_selection(
+                plan,
+                first,
+                Backend(),
+                root / "first.json",
+                resume=False,
+                solved_leaf_store=store,
+            )
+            warm = Backend()
+            run_campaign_selection(
+                plan,
+                both,
+                warm,
+                root / "warm.json",
+                resume=False,
+                solved_leaf_store=store,
+            )
+
+        self.assertEqual(warm.calls, [
+            (Fraction(99, 100), complex(1.0, -1.0)),
+        ])
 
     def test_old_order_prefix_resumes_into_canonical_sparse_checkpoint(self) -> None:
         """Catches traversal changes invalidating or overwriting solved prefixes."""
