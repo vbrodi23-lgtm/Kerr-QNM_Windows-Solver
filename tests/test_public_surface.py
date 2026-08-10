@@ -320,6 +320,14 @@ class PublicSurfaceTests(unittest.TestCase):
         )
         self.assertIn("Test-ManifestReferencesPath", bootstrap)
         self.assertIn("$tomlEscapedWindowsPath", bootstrap)
+        self.assertIn(
+            "$checkoutSourceRoot = [IO.Path]::GetFullPath($JuliaDataRoot)",
+            bootstrap,
+        )
+        self.assertNotIn(
+            "$checkoutRoot = [IO.Path]::GetFullPath($PackageRoot)",
+            bootstrap,
+        )
         self.assertIn("Write-ValidatedM02DependencyReceipt", bootstrap)
         self.assertIn("M02 dependency receipt written:", bootstrap)
         for diagnostic in (
