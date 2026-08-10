@@ -162,7 +162,18 @@ class CampaignReportTests(unittest.TestCase):
             self.assertEqual(float(current["response_real"]), 1.25)
             self.assertEqual(float(current["response_imaginary"]), -0.5)
             self.assertEqual(
+                float(current["baseline_omega_real"]), leaf.job.root.omega.real
+            )
+            self.assertEqual(
+                float(current["baseline_omega_imaginary"]),
+                leaf.job.root.omega.imag,
+            )
+            self.assertEqual(
                 float(current["baseline_determinant_residual"]), 1.42e-11
+            )
+            self.assertEqual(float(current["signed_root_crosscheck_real"]), 1.25)
+            self.assertEqual(
+                float(current["signed_root_crosscheck_imaginary"]), -0.5
             )
             pending = next(item for item in leaves if item["leaf_id"] != leaf.leaf_id)
             self.assertEqual(pending["terminal_state"], "PENDING")
