@@ -165,6 +165,8 @@ class CampaignProgressReporter:
         self._cache_stored = 0
         self._cache_reusing = 0
         self._cache_next_unsolved: object = None
+        self._cache_published_leaf_ids: set[object] = set()
+        self._cache_publication_failures: dict[object, dict[str, object]] = {}
         self._root_started: dict[tuple[object, ...], float] = {}
         self._newton_started: dict[
             tuple[object, ...], float
@@ -206,6 +208,11 @@ class CampaignProgressReporter:
                 and event.context.leaf_id is not None
             ):
                 self._report_run_provenance[event.context.leaf_id] = "EXECUTED"
+            if event.kind in {
+                ProgressEventKind.CHECKPOINT_WRITTEN,
+                ProgressEventKind.CAMPAIGN_COMPLETED,
+            }:
+                self._refresh_campaign_reports()
             record = self._record(event)
             self._update_dashboard_state(record)
             if self._should_write_status(event):
@@ -215,11 +222,6 @@ class CampaignProgressReporter:
                 self._append_root_solve(record)
             if self.mode is ProgressMode.TRACE:
                 self._append_trace(record)
-            if event.kind in {
-                ProgressEventKind.CHECKPOINT_WRITTEN,
-                ProgressEventKind.CAMPAIGN_COMPLETED,
-            }:
-                self._refresh_campaign_reports()
         except Exception as error:  # Progress must never change solver outcome.
             self._report_failure(error)
 
@@ -634,6 +636,24 @@ class CampaignProgressReporter:
             self._cache_stored = int(payload.get("stored_count", 0))
             self._cache_reusing = int(payload.get("reusing_count", 0))
             self._cache_next_unsolved = payload.get("next_unsolved_index")
+        elif kind == ProgressEventKind.LEAF_CACHE_PUBLISHED.value:
+            leaf_id = context.get("leaf_id")
+            if leaf_id is not None:
+                self._cache_published_leaf_ids.add(leaf_id)
+                self._cache_publication_failures.pop(leaf_id, None)
+        elif kind == ProgressEventKind.LEAF_CACHE_PUBLICATION_FAILED.value:
+            leaf_id = context.get("leaf_id")
+            if leaf_id is not None:
+                self._cache_published_leaf_ids.discard(leaf_id)
+                self._cache_publication_failures[leaf_id] = {
+                    "leaf_id": leaf_id,
+                    "leaf_index": context.get("leaf_index"),
+                    "store_path": payload.get("store_path"),
+                    "error_type": payload.get("error_type"),
+                    "message": payload.get("message"),
+                    "sequence": record.get("sequence"),
+                    "timestamp_utc": record.get("timestamp_utc"),
+                }
         prior_leaf = self._dashboard_state.get("leaf_id")
         next_leaf = context["leaf_id"]
         if next_leaf is not None and next_leaf != prior_leaf:
@@ -756,6 +776,199 @@ class CampaignProgressReporter:
         ):
             outcomes.discard(leaf_id)
 
+    def _current_leaf_persistence(self) -> dict[str, object]:
+        leaf_id = self._dashboard_state.get("leaf_id")
+        return {
+            "leaf_id": leaf_id,
+            "terminal_computed": leaf_id in self._settled_leaf_ids,
+            "checkpoint_saved": self._checkpoint_status == "written",
+            "receipt_published": leaf_id in self._cache_published_leaf_ids,
+            "publication_failed": leaf_id in self._cache_publication_failures,
+        }
+
+    def _persistence_status(self) -> dict[str, object]:
+        failures = sorted(
+            self._cache_publication_failures.values(),
+            key=lambda item: (
+                item.get("sequence") is None,
+                item.get("sequence"),
+            ),
+        )
+        return {
+            "publication_failure_count": len(failures),
+            "publication_failures": failures,
+            "current_leaf": self._current_leaf_persistence(),
+        }
+
+    def _persistent_receipt_status(self) -> str:
+        state = self._current_leaf_persistence()
+        if state["receipt_published"]:
+            return "PUBLISHED"
+        if state["publication_failed"]:
+            return "FAILED"
+        if state["terminal_computed"] and state["checkpoint_saved"]:
+            return "NOT_PUBLISHED"
+        return "PENDING"
+
+    def _latest_scientific_leaf_row(self) -> Mapping[str, object] | None:
+        model = self._campaign_report_model
+        if model is None:
+            return None
+        if self._last_accepted_leaf is not None:
+            for row in model.leaf_rows:
+                if row.get("leaf_id") == self._last_accepted_leaf:
+                    return row
+        for row in reversed(model.leaf_rows):
+            if row.get("terminal_state") == "PRODUCED":
+                return row
+        return None
+
+    @staticmethod
+    def _projective_component_ids(value: object) -> tuple[str, ...]:
+        if isinstance(value, str):
+            try:
+                value = json.loads(value)
+            except (TypeError, ValueError):
+                return ()
+        if not isinstance(value, list):
+            return ()
+        return tuple(str(item) for item in value)
+
+    def _selected_projective_row(
+        self, latest_leaf_id: object
+    ) -> tuple[Mapping[str, object] | None, int, int]:
+        model = self._campaign_report_model
+        if model is None:
+            return None, 0, 0
+        rows = model.projective_rows
+        resolved = tuple(
+            row for row in rows if row.get("reducer_state") != "INCOMPLETE"
+        )
+        relevant = tuple(
+            row
+            for row in rows
+            if latest_leaf_id is not None
+            and str(latest_leaf_id)
+            in self._projective_component_ids(row.get("present_component_ids"))
+        )
+        relevant_resolved = tuple(
+            row for row in relevant if row.get("reducer_state") != "INCOMPLETE"
+        )
+        selected = (
+            relevant_resolved[-1]
+            if relevant_resolved
+            else resolved[-1]
+            if resolved
+            else relevant[0]
+            if relevant
+            else rows[0]
+            if rows
+            else None
+        )
+        return selected, len(resolved), len(rows)
+
+    def _scientific_dashboard_fields(self) -> tuple[tuple[str, object], ...]:
+        if self._campaign_report_model is None:
+            return ()
+        row = self._latest_scientific_leaf_row()
+        latest_leaf_id = None if row is None else row.get("leaf_id")
+        projective, resolved_count, projective_count = (
+            self._selected_projective_row(latest_leaf_id)
+        )
+        channels = None
+        baseline = None
+        signed_root = None
+        if row is not None:
+            channels = {
+                "signed-root": row.get("signed_root_error"),
+                "truncation": row.get("truncation_error"),
+                "resolution": row.get("resolution_error"),
+                "seed-path": row.get("seed_path_error"),
+                "axis": row.get("axis_error"),
+                "amplitude": row.get("amplitude_error"),
+            }
+            baseline = {
+                "real": row.get("baseline_omega_real"),
+                "imaginary": row.get("baseline_omega_imaginary"),
+            }
+            signed_root = {
+                "real": row.get("signed_root_crosscheck_real"),
+                "imaginary": row.get("signed_root_crosscheck_imaginary"),
+            }
+        projective_state = None
+        bounds = None
+        if projective is not None:
+            projective_state = {
+                "reducer": projective.get("reducer_state"),
+                "scientific": projective.get("scientific_state"),
+            }
+            bounds = {
+                "lower": projective.get("angle_lower_bound"),
+                "upper": projective.get("angle_upper_bound"),
+            }
+        return (
+            ("LatestResult", latest_leaf_id),
+            ("ResultMode", None if row is None else row.get("mode")),
+            ("ResultSpin", None if row is None else row.get("spin_or_Mkappa")),
+            (
+                "ResultMechanism",
+                None if row is None else row.get("mechanism"),
+            ),
+            ("ResponseRe", None if row is None else row.get("response_real")),
+            ("ResponseIm", None if row is None else row.get("response_imaginary")),
+            ("ResponseAbs", None if row is None else row.get("response_magnitude")),
+            ("LocalDisk", None if row is None else row.get("local_disk_radius")),
+            (
+                "DiskResponse",
+                None if row is None else row.get("relative_disk_radius"),
+            ),
+            ("DiskState", None if row is None else row.get("relative_disk_state")),
+            (
+                "Convergence",
+                None if row is None else row.get("convergence_basis"),
+            ),
+            ("BaselineOmega", baseline),
+            (
+                "BaselineResidual",
+                None if row is None else row.get("baseline_determinant_residual"),
+            ),
+            ("SignedRoot", signed_root),
+            (
+                "SignedRootAbs",
+                None
+                if row is None
+                else row.get("signed_root_crosscheck_magnitude"),
+            ),
+            ("ErrorChannels", channels),
+            ("Projective", f"{resolved_count}/{projective_count} resolved"),
+            (
+                "ProjectiveRow",
+                None if projective is None else projective.get("row_id"),
+            ),
+            ("ProjectiveState", projective_state),
+            (
+                "ProjectiveOutcome",
+                None if projective is None else projective.get("projective_outcome"),
+            ),
+            (
+                "FSAngle",
+                None if projective is None else projective.get("nominal_angle"),
+            ),
+            ("FSBounds", bounds),
+            (
+                "SepThreshold",
+                None if projective is None else projective.get("separation_threshold"),
+            ),
+            (
+                "EquivThreshold",
+                None if projective is None else projective.get("equivalence_threshold"),
+            ),
+            (
+                "ProjectiveReason",
+                None if projective is None else projective.get("reason"),
+            ),
+        )
+
     def _dashboard_fields(
         self, record: Mapping[str, object]
     ) -> tuple[tuple[str, object], ...]:
@@ -784,6 +997,9 @@ class CampaignProgressReporter:
             ("Indeterminate", len(self._indeterminate_leaf_ids)),
             ("Failed", len(self._failed_leaf_ids)),
             ("LastAccepted", self._last_accepted_leaf),
+            ("Computed", self._current_leaf_persistence()["terminal_computed"]),
+            ("PersistentReceipt", self._persistent_receipt_status()),
+            ("CachePublishFailures", len(self._cache_publication_failures)),
             ("LeafId", context.get("leaf_id")),
             ("Role", context.get("role")),
             ("Mode", context.get("mode")),
@@ -809,6 +1025,7 @@ class CampaignProgressReporter:
             ("MedianLeaf", self._duration_value(record.get("median_leaf_seconds"))),
             ("ETA", self._duration_value(record.get("eta_seconds"))),
             ("Finish", self._finish_value(record.get("estimated_finish"))),
+            *self._scientific_dashboard_fields(),
         )
 
     def _dashboard_lines(self, record: Mapping[str, object]) -> list[str]:
@@ -826,7 +1043,7 @@ class CampaignProgressReporter:
                 for label in labels
             )
 
-        return [
+        lines = [
             "M02 CAMPAIGN | " + line("Sequence", "Event", "Elapsed_s"),
             line("CampaignStatus", "Leaf", "LeafStatus"),
             line("SolvedCache", "CacheReusing", "NextUnsolved"),
@@ -836,6 +1053,8 @@ class CampaignProgressReporter:
             line("RootStatus", "PrecisionStatus", "Checkpoint"),
             line("Completed", "Accepted", "Rejected"),
             line("Indeterminate", "Failed", "LastAccepted"),
+            line("Computed", "Checkpoint", "PersistentReceipt"),
+            line("CachePublishFailures"),
             line("CurrentOmega"),
             line("DeterminantAbs", "BestDetAbs", "Threshold"),
             line("DetLeaf", "DetPhase", "DetNewton"),
@@ -843,6 +1062,25 @@ class CampaignProgressReporter:
             line("TimingSample", "AvgLeaf", "MedianLeaf"),
             line("ETA", "Finish"),
         ]
+        if self._campaign_report_model is not None:
+            lines.extend(
+                [
+                    "LATEST SCIENTIFIC RESULT | "
+                    + line("LatestResult", "ResultMode"),
+                    line("ResultSpin", "ResultMechanism", "Convergence"),
+                    line("ResponseRe", "ResponseIm", "ResponseAbs"),
+                    line("LocalDisk", "DiskResponse", "DiskState"),
+                    line("BaselineOmega"),
+                    line("BaselineResidual", "SignedRootAbs"),
+                    line("ErrorChannels"),
+                    "PROJECTIVE EVIDENCE | "
+                    + line("Projective", "ProjectiveRow"),
+                    line("ProjectiveState", "ProjectiveOutcome"),
+                    line("FSAngle", "FSBounds"),
+                    line("SepThreshold", "EquivThreshold"),
+                ]
+            )
+        return lines
 
     def _completed_value(self, leaf_count: object) -> str:
         completed = len(self._settled_leaf_ids)
@@ -931,6 +1169,15 @@ class CampaignProgressReporter:
             label = "CACHE STALE" if kind.endswith("stale") else "CACHE CORRUPT"
             message = payload.get("message", "not reused")
             self.stream.write(f"Leaf {leaf} {label} | {message} | solving normally\n")
+            self.stream.flush()
+            return
+        if kind == ProgressEventKind.LEAF_CACHE_PUBLICATION_FAILED.value:
+            self.stream.write(
+                "leaf_cache_publication_failed"
+                f" | Leaf {leaf} PERSISTENT RECEIPT FAILED"
+                f" | store={payload.get('store_path')}"
+                f" | {payload.get('error_type')}: {payload.get('message')}\n"
+            )
             self.stream.flush()
             return
         parts = [str(record["kind"]) + "".join(self._live_identity_parts(context))]
@@ -1128,8 +1375,11 @@ class CampaignProgressReporter:
 
         path = Path(f"{self.checkpoint}.status.json")
         path.parent.mkdir(parents=True, exist_ok=True)
+        status = dict(record)
+        status["persistence"] = self._persistence_status()
+        status["scientific"] = dict(self._scientific_dashboard_fields())
         encoded = json.dumps(
-            _json_value(record), ensure_ascii=False, allow_nan=False,
+            _json_value(status), ensure_ascii=False, allow_nan=False,
             separators=(",", ":"), sort_keys=True,
         ).encode("utf-8")
         descriptor, temporary_name = tempfile.mkstemp(
