@@ -54,5 +54,6 @@ Confirm that a fresh checkout can originate every M02 numerical prerequisite fro
 - Rebind every persistent M02 Manifest's legacy `vendor` entries to immutable contract-scoped scientific-source paths before `Pkg` reads it; reject checkout and environment-local paths, then prove clean-runtime/new-checkout reuse with an opt-in Windows integration test.
 - Separate Julia dependency, worker, and generated-GSN cache identities so exact-checkout and telemetry-only updates reuse authenticated project/depot state; retain fail-closed dependency invalidation and explicit rebuild diagnostics.
 - Add an optional private per-user authenticated solved-leaf store that reuses only complete terminal `CampaignLeafRecord`s under a separate per-leaf scientific-computation identity, imports authenticated checkpoints, and writes through only after the active checkpoint succeeds.
+- Preserve warm dependency reuse when Julia serializes Windows Manifest paths as TOML-escaped backslashes; verify dependency receipts immediately, emit predicate-level rejection diagnostics, and cover identical, worker-only, changed-dependency, missing-receipt, and malformed-receipt lifecycles with a no-Julia PowerShell smoke.
 
 ---
