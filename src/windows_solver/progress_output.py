@@ -183,7 +183,6 @@ class CampaignProgressReporter:
         self._primary_seed_stats: dict[str, dict[str, float | int]] = {}
         self._completed_primary_roots: set[tuple[object, ...]] = set()
         self._last_status_seconds: float | None = None
-        self._last_dashboard_seconds: float | None = None
         self._dashboard_rendered_rows = 0
         self._terminal_dashboard = self._stream_is_terminal()
         if self._terminal_dashboard:
@@ -643,6 +642,8 @@ class CampaignProgressReporter:
         elif kind == ProgressEventKind.LEAF_CACHE_PUBLISHED.value:
             leaf_id = context.get("leaf_id")
             if leaf_id is not None:
+                if leaf_id not in self._cache_published_leaf_ids:
+                    self._cache_stored += 1
                 self._cache_published_leaf_ids.add(leaf_id)
                 self._cache_publication_failures.pop(leaf_id, None)
         elif kind == ProgressEventKind.LEAF_CACHE_PUBLICATION_FAILED.value:
@@ -919,7 +920,10 @@ class CampaignProgressReporter:
         return (
             ("LatestResult", latest_leaf_id),
             ("ResultState", None if row is None else row.get("terminal_state")),
-            ("ResultPrecision", None if row is None else row.get("precision_digits")),
+            (
+                "ResultPrecision",
+                None if row is None else row.get("precision_digits"),
+            ),
             ("ResultMode", None if row is None else row.get("mode")),
             ("ResultSpin", None if row is None else row.get("spin_or_Mkappa")),
             (
@@ -1254,8 +1258,9 @@ class CampaignProgressReporter:
             color = "36"
         elif line.startswith(" Accepted"):
             color = "92"
-        elif line.startswith(" Last refresh:") or line.startswith(
-            " Dashboard refreshes"
+        elif (
+            line.startswith(" Last refresh:")
+            or line.startswith(" Dashboard refreshes")
         ):
             color = "90"
         if color is None:
