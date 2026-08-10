@@ -743,6 +743,9 @@ def _campaign_selected(
             if reporter is not None:
                 reporter.bind_campaign_reports(plan)
             if cached.state == "COMPLETE":
+                import_campaign_checkpoint_to_solved_leaf_store(
+                    plan, checkpoint, SolvedLeafStore.default()
+                )
                 return 0, _campaign_console_mapping(command, cached)
         elif reporter is not None:
             reporter.bind_campaign_reports(plan)
