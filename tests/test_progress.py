@@ -34,6 +34,7 @@ class RecordingObserver:
 
 
 class ProgressBusTests(unittest.TestCase):
+
     def test_campaign_run_and_resume_default_to_normal_progress(self):
         parser = build_parser()
         for command in ("campaign-run", "campaign-resume"):
@@ -604,103 +605,106 @@ class CampaignProgressReporterTests(unittest.TestCase):
             root_solves[-1]["momentum_summary"]["primary_solve_count"], 3
         )
 
-    def test_normal_console_dashboard_matches_the_working_status_view(self):
+    def test_normal_console_dashboard_is_completion_driven(self):
         class ConsoleStream(io.StringIO):
             def isatty(self):
                 return True
 
         stream = ConsoleStream()
         reporter = self._console_reporter(stream)
+        reporter.publish(
+            _event(
+                ProgressEventKind.CAMPAIGN_STARTED,
+                leaf_count=553,
+            )
+        )
+        initial_output = stream.getvalue()
         shared_context = {
-            "leaf_id": (
-                "b-prime-leaf-"
-                "9e5777728144433e089f9559b92b6e139e16115a5a53099f40403a45297aa3c3"
-            ),
+            "leaf_id": "leaf-1",
             "leaf_index": 1,
             "leaf_count": 553,
             "role": "primary",
-            "mode": {"s": -2, "ell": 2, "m": 2, "n": 0},
-            "spin": 0.95,
             "mechanism_id": "horizon-admittance",
+            "spin": 0.95,
             "precision_digits": 64,
-            "phase": "SEED-PATH",
-            "newton_index": 1,
-            "newton_limit": 12,
-            "current_omega": {
-                "real": 0.7467570512425654,
-                "imaginary": -0.052930481783164646,
-            },
+            "phase": "PRIMARY",
         }
         reporter.publish(
-            replace(
-                _event(ProgressEventKind.DETERMINANT_STARTED, **shared_context),
-                monotonic_seconds=1.0,
+            _payload_event(
+                ProgressEventKind.DETERMINANT_COMPLETED,
+                {"determinant_abs": 3.2e-8},
+                **shared_context,
             )
         )
         reporter.publish(
-            replace(
-                _payload_event(
-                    ProgressEventKind.DETERMINANT_COMPLETED,
-                    {"determinant_abs": 3.2e-8},
-                    **shared_context,
-                ),
-                monotonic_seconds=2.0,
+            _event(
+                ProgressEventKind.SUBOPERATION_COMPLETED,
+                **shared_context,
+                suboperation="Xup",
             )
         )
+        self.assertEqual(stream.getvalue(), initial_output)
+
         reporter.publish(
-            replace(
-                _payload_event(
-                    ProgressEventKind.SUBOPERATION_COMPLETED,
-                    {"elapsed_seconds": 0.42},
-                    leaf_id=shared_context["leaf_id"],
-                    leaf_index=1,
-                    leaf_count=553,
-                    precision_digits=64,
-                    phase="SEED-PATH",
-                    newton_index=1,
-                    suboperation="Xup",
-                ),
-                monotonic_seconds=3.0,
+            _payload_event(
+                ProgressEventKind.LEAF_COMPLETED,
+                {"state": "PRODUCED"},
+                **shared_context,
             )
         )
 
         output = stream.getvalue()
-        latest_panel = output.rsplit("\x1b8", 1)[-1]
-        self.assertIn("Sequence       : 3", latest_panel)
-        self.assertIn("Event          : suboperation_completed", latest_panel)
-        self.assertIn("Leaf           : 1/553", latest_panel)
-        self.assertIn("Role           : primary", latest_panel)
-        self.assertIn("Mode           : @{ell=2; m=2; n=0; s=-2}", latest_panel)
-        self.assertIn("Spin           : 0.95", latest_panel)
-        self.assertIn("Mechanism      : horizon-admittance", latest_panel)
-        self.assertIn("Precision      : 64", latest_panel)
-        self.assertIn("Phase          : SEED-PATH", latest_panel)
-        self.assertIn("Newton         : 1", latest_panel)
-        self.assertIn(
-            "CurrentOmega   : @{imaginary=-0.052930481783164646; "
-            "real=0.7467570512425654}",
-            latest_panel,
-        )
-        self.assertIn("DeterminantAbs : 3.2e-08", latest_panel)
-        self.assertIn("DetLeaf        : 1", latest_panel)
-        self.assertIn("DetPhase       : 1", latest_panel)
-        self.assertIn("DetNewton      : 1", latest_panel)
-        self.assertIn("Suboperation   : Xup", latest_panel)
-        self.assertNotIn("\rdeterminant", latest_panel)
-        self.assertNotIn(" leaf_id=", latest_panel)
-        self.assertNotIn(" current_|D|=", latest_panel)
-        self.assertNotIn("\x1b[2J", latest_panel)
-        status = json.loads(
-            Path(f"{self.reporter_checkpoint}.status.json").read_text(
-                encoding="utf-8"
+        self.assertIn("M02 KERR-QNM SCIENTIFIC DASHBOARD", output)
+        self.assertIn(" Completed      1/553", output)
+        self.assertIn(" Accepted       1", output)
+        self.assertIn(" State          PRODUCED", output)
+        self.assertIn(" Mechanism      horizon-admittance", output)
+        self.assertIn(" Precision      64 digits", output)
+        self.assertIn(" No scientific result payload.", output)
+        self.assertNotIn("DeterminantAbs", output)
+        self.assertNotIn("Suboperation", output)
+
+    def test_published_receipts_increase_the_visible_cache_total(self):
+        class ConsoleStream(io.StringIO):
+            def isatty(self):
+                return True
+
+        stream = ConsoleStream()
+        reporter = self._console_reporter(stream)
+        reporter.publish(
+            _payload_event(
+                ProgressEventKind.SOLVED_LEAF_CACHE_SCANNED,
+                {
+                    "compatible_count": 10,
+                    "stored_count": 11,
+                    "reusing_count": 10,
+                },
+                leaf_count=212,
             )
         )
-        self.assertEqual(status["current_determinant_abs"], 3.2e-8)
-        self.assertEqual(status["context"]["determinant_index_leaf"], 1)
-        self.assertEqual(status["context"]["determinant_index_phase"], 1)
-        self.assertEqual(status["context"]["determinant_index_newton"], 1)
+        reporter.publish(
+            _payload_event(
+                ProgressEventKind.LEAF_CACHE_PUBLISHED,
+                {"store_path": "solved-leaves-v1"},
+                leaf_id="leaf-1",
+                leaf_index=1,
+                leaf_count=212,
+            )
+        )
+        reporter.publish(
+            _payload_event(
+                ProgressEventKind.LEAF_COMPLETED,
+                {"state": "PRODUCED"},
+                leaf_id="leaf-2",
+                leaf_index=2,
+                leaf_count=212,
+            )
+        )
 
-    def test_live_dashboard_renders_accumulated_scientific_report_evidence(self):
+        latest_panel = stream.getvalue().rsplit("\x1b[0J", 1)[-1]
+        self.assertIn(" Stored         12", latest_panel)
+
+    def test_live_dashboard_renders_latest_completed_scientific_result(self):
         class ConsoleStream(io.StringIO):
             def isatty(self):
                 return True
@@ -708,12 +712,12 @@ class CampaignProgressReporterTests(unittest.TestCase):
         accepted_leaf = "leaf-accepted"
         stream = ConsoleStream()
         reporter = self._console_reporter(stream)
-        reporter._last_accepted_leaf = accepted_leaf
         reporter._campaign_report_model = CampaignReportModel(
             leaf_rows=(
                 {
                     "leaf_id": accepted_leaf,
                     "terminal_state": "PRODUCED",
+                    "precision_digits": 64,
                     "mode": "220",
                     "spin_or_Mkappa": "0.999",
                     "mechanism": "horizon-admittance",
@@ -727,6 +731,7 @@ class CampaignProgressReporterTests(unittest.TestCase):
                     "baseline_omega_real": 0.9558544196294082,
                     "baseline_omega_imaginary": -0.010530589036141928,
                     "baseline_determinant_residual": 2.0e-13,
+                    "baseline_newton_correction": 3.0e-14,
                     "signed_root_crosscheck_real": 1.25,
                     "signed_root_crosscheck_imaginary": -0.5,
                     "signed_root_crosscheck_magnitude": 1.346291201783626,
@@ -758,25 +763,29 @@ class CampaignProgressReporterTests(unittest.TestCase):
         )
 
         reporter.publish(
-            _event(
-                ProgressEventKind.LEAF_STARTED,
-                leaf_id="next-leaf",
+            _payload_event(
+                ProgressEventKind.LEAF_COMPLETED,
+                {"state": "PRODUCED"},
+                leaf_id=accepted_leaf,
                 leaf_index=12,
                 leaf_count=212,
+                precision_digits=64,
             )
         )
 
-        latest_panel = stream.getvalue().rsplit("\x1b8", 1)[-1]
-        self.assertIn("LATEST SCIENTIFIC RESULT", latest_panel)
-        self.assertIn("LatestResult: leaf-accepted", latest_panel)
-        self.assertIn("ResponseRe: 1.25", latest_panel)
-        self.assertIn("LocalDisk: 2e-08", latest_panel)
-        self.assertIn("Convergence: ORDER_RESOLVED", latest_panel)
-        self.assertIn("BaselineResidual: 2e-13", latest_panel)
-        self.assertIn("ErrorChannels:", latest_panel)
-        self.assertIn("PROJECTIVE EVIDENCE", latest_panel)
-        self.assertIn("ProjectiveOutcome: SEPARATED", latest_panel)
-        self.assertIn("FSAngle: 0.21", latest_panel)
+        latest_panel = stream.getvalue()
+        self.assertIn("LATEST COMPLETED LEAF", latest_panel)
+        self.assertIn(" State          PRODUCED", latest_panel)
+        self.assertIn(" Mechanism      horizon-admittance", latest_panel)
+        self.assertIn(" Precision      64 digits", latest_panel)
+        self.assertIn(" Convergence    ORDER_RESOLVED", latest_panel)
+        self.assertIn(" Response       1.25 -0.500000000000i", latest_panel)
+        self.assertIn(" |Response|     1.346E+00", latest_panel)
+        self.assertIn(" Local disk     2.000E-08", latest_panel)
+        self.assertIn(" Disk / |R|     1.486E-08", latest_panel)
+        self.assertIn(" Baseline |D|   2.000E-13", latest_panel)
+        self.assertIn(" Newton corr    3.000E-14", latest_panel)
+        self.assertNotIn("PROJECTIVE EVIDENCE", latest_panel)
 
         status = json.loads(
             Path(f"{self.reporter_checkpoint}.status.json").read_text(
@@ -819,6 +828,7 @@ class CampaignProgressReporterTests(unittest.TestCase):
             )
 
         self.assertEqual(write_status.call_count, 1)
+
     def test_quiet_renders_only_leaf_and_terminal_events(self):
         stream = io.StringIO()
         reporter = CampaignProgressReporter("quiet", self.reporter_checkpoint, stream)
@@ -839,7 +849,7 @@ class CampaignProgressReporterTests(unittest.TestCase):
         self.assertNotIn("campaign_started", output)
         self.assertNotIn("root_phase_started", output)
 
-    def test_normal_console_redraws_only_its_panel_without_clearing_history(self):
+    def test_normal_console_redraws_only_on_campaign_or_terminal_events(self):
         class ConsoleStream(io.StringIO):
             def isatty(self):
                 return True
@@ -848,6 +858,8 @@ class CampaignProgressReporterTests(unittest.TestCase):
         history = "[bootstrap] solver plan succeeded\nPS> .\\m02.ps1\n"
         stream.write(history)
         reporter = self._console_reporter(stream)
+        reporter.publish(_event(ProgressEventKind.CAMPAIGN_STARTED, leaf_count=1))
+        after_start = stream.getvalue()
         reporter.publish(
             _event(
                 ProgressEventKind.LEAF_STARTED,
@@ -857,9 +869,11 @@ class CampaignProgressReporterTests(unittest.TestCase):
                 role="primary",
             )
         )
+        self.assertEqual(stream.getvalue(), after_start)
         reporter.publish(
-            _event(
+            _payload_event(
                 ProgressEventKind.LEAF_COMPLETED,
+                {"state": "PRODUCED"},
                 leaf_id="leaf-1",
                 leaf_index=1,
                 leaf_count=1,
@@ -869,15 +883,12 @@ class CampaignProgressReporterTests(unittest.TestCase):
 
         output = stream.getvalue()
         self.assertTrue(output.startswith(history + "\x1b[0J"))
-        self.assertIn("\x1b[42F", output)
-        self.assertNotIn("\x1b7", output)
-        self.assertNotIn("\x1b8", output)
         self.assertEqual(output.count("\x1b[0J"), 2)
         self.assertNotIn("\x1b[2J", output)
-        self.assertIn("Event          : leaf_started", output)
-        self.assertIn("Event          : leaf_completed", output)
+        self.assertIn(" Completed      1/1", output)
+        self.assertNotIn("Event", output)
 
-    def test_normal_console_compacts_without_wrapping_or_scrollback_panels(self):
+    def test_normal_console_compacts_without_active_solver_noise(self):
         class ConsoleStream(io.StringIO):
             def isatty(self):
                 return True
@@ -887,62 +898,51 @@ class CampaignProgressReporterTests(unittest.TestCase):
         stream.write(history)
         reporter = self._console_reporter(stream)
         with patch.object(reporter, "_terminal_dimensions", return_value=(80, 24)):
-            first = _payload_event(
-                ProgressEventKind.DETERMINANT_COMPLETED,
-                {
-                    "determinant_abs": 3.2e-8,
-                    "best_determinant_abs": 2.1e-9,
-                    "acceptance_threshold": 1.0e-10,
-                },
-                leaf_id="b-prime-leaf-" + "9" * 64,
-                leaf_index=1,
-                leaf_count=553,
-                role="primary",
-                mode={"s": -2, "ell": 2, "m": 2, "n": 0},
-                spin=0.95,
-                mechanism_id="horizon-admittance",
-                precision_digits=64,
-                phase="PRIMARY",
-                newton_index=2,
-                determinant_index_leaf=137,
-                determinant_index_phase=42,
-                determinant_index_newton=3,
-                suboperation="Xup integration",
-            )
-            reporter.publish(first)
             reporter.publish(
-                replace(
-                    _event(
-                        ProgressEventKind.SUBOPERATION_COMPLETED,
-                        leaf_id="b-prime-leaf-" + "9" * 64,
-                        leaf_index=1,
-                        leaf_count=553,
-                        phase="PRIMARY",
-                        suboperation="Xup integration",
-                    ),
-                    monotonic_seconds=first.monotonic_seconds + 1.0,
+                _event(ProgressEventKind.CAMPAIGN_STARTED, leaf_count=553)
+            )
+            after_start = stream.getvalue()
+            reporter.publish(
+                _payload_event(
+                    ProgressEventKind.DETERMINANT_COMPLETED,
+                    {
+                        "determinant_abs": 3.2e-8,
+                        "best_determinant_abs": 2.1e-9,
+                    },
+                    leaf_id="leaf-1",
+                    leaf_index=1,
+                    leaf_count=553,
+                    suboperation="Xup integration",
+                )
+            )
+            self.assertEqual(stream.getvalue(), after_start)
+            reporter.publish(
+                _payload_event(
+                    ProgressEventKind.LEAF_COMPLETED,
+                    {"state": "UNRESOLVED"},
+                    leaf_id="leaf-1",
+                    leaf_index=1,
+                    leaf_count=553,
+                    mechanism_id="horizon-admittance",
+                    spin=0.95,
+                    precision_digits=64,
                 )
             )
 
         output = stream.getvalue()
         self.assertTrue(output.startswith(history + "\x1b[0J"))
-        self.assertIn("\x1b[17F", output)
-        self.assertNotIn("\x1b7", output)
-        self.assertNotIn("\x1b8", output)
         self.assertNotIn("\x1b[2J", output)
-        latest_panel = output.rsplit("\x1b[17F\x1b[0J", 1)[-1]
+        latest_panel = output.rsplit("\x1b[0J", 1)[-1]
         lines = latest_panel.splitlines()
-        self.assertEqual(len(lines), 17)
-        self.assertTrue(all(len(line) <= 80 for line in lines))
-        self.assertIn("M02 CAMPAIGN", latest_panel)
-        self.assertIn("LeafStatus: RUNNING", latest_panel)
-        self.assertIn("Completed: 0/553 | Accepted: 0 | Rejected: 0", latest_panel)
-        self.assertIn("DeterminantAbs: 3.2e-08", latest_panel)
-        self.assertIn("DetLeaf: 137 | DetPhase: 42 | DetNewton: 3", latest_panel)
-        self.assertIn("Suboperation: Xup integration", latest_panel)
-        self.assertIn("PersistentReceipt: PENDING", latest_panel)
+        self.assertLessEqual(len(lines), 23)
+        self.assertTrue(all(len(line) <= 90 for line in lines))
+        self.assertIn("M02 KERR-QNM SCIENTIFIC DASHBOARD", latest_panel)
+        self.assertIn(" Completed      1/553", latest_panel)
+        self.assertIn(" State          UNRESOLVED", latest_panel)
+        self.assertNotIn("DeterminantAbs", latest_panel)
+        self.assertNotIn("Suboperation", latest_panel)
 
-    def test_partial_campaign_settles_missing_precision_leaf_without_rejection(self):
+    def test_partial_campaign_dashboard_keeps_outcome_counts_neutral(self):
         class ConsoleStream(io.StringIO):
             def isatty(self):
                 return True
@@ -968,14 +968,13 @@ class CampaignProgressReporterTests(unittest.TestCase):
             )
         )
 
-        latest_panel = stream.getvalue().rsplit("\x1b[36F", 1)[-1]
-        self.assertIn("CampaignStatus : PARTIAL", latest_panel)
-        self.assertIn("LeafStatus     : MISSING_PRECISION", latest_panel)
-        self.assertIn("Completed      : 0/553", latest_panel)
-        self.assertIn("Rejected       : 0", latest_panel)
-        self.assertIn("Indeterminate  : 0", latest_panel)
+        latest_panel = stream.getvalue()
+        self.assertIn(" Completed      0/553", latest_panel)
+        self.assertIn(" Rejected       0", latest_panel)
+        self.assertIn(" Unresolved     0", latest_panel)
+        self.assertIn(" Failed         0", latest_panel)
 
-    def test_normal_console_estimates_eta_from_rolling_completed_leaf_timings(self):
+    def test_completed_leaf_status_retains_rolling_eta_telemetry(self):
         class ConsoleStream(io.StringIO):
             def isatty(self):
                 return True
@@ -995,8 +994,9 @@ class CampaignProgressReporterTests(unittest.TestCase):
         )
         reporter.publish(
             replace(
-                _event(
+                _payload_event(
                     ProgressEventKind.LEAF_COMPLETED,
+                    {"state": "PRODUCED"},
                     leaf_id="leaf-1",
                     leaf_index=1,
                     leaf_count=553,
@@ -1016,23 +1016,22 @@ class CampaignProgressReporterTests(unittest.TestCase):
             )
         )
 
-        latest_panel = stream.getvalue().rsplit("\x1b8", 1)[-1]
-        self.assertIn("TimingSample   : 1/10", latest_panel)
-        self.assertIn("AvgLeaf        : 13m 12s", latest_panel)
-        self.assertIn("MedianLeaf     : 13m 12s", latest_panel)
-        self.assertIn("ETA            : 5d 1h 26m", latest_panel)
-        self.assertRegex(
-            latest_panel,
-            r"Finish         : \d{4}-\d{2}-\d{2} \d{2}:\d{2} [+-]\d{2}:\d{2}",
+        status = json.loads(
+            Path(f"{self.reporter_checkpoint}.status.json").read_text(
+                encoding="utf-8"
+            )
         )
+        self.assertEqual(status["leaf_timing_sample_size"], 1)
+        self.assertEqual(status["average_leaf_seconds"], 792.0)
+        self.assertEqual(status["median_leaf_seconds"], 792.0)
+        self.assertGreater(status["eta_seconds"], 0.0)
+        self.assertIn("estimated_finish", status)
+        self.assertNotIn("ETA", stream.getvalue())
 
-    def test_normal_console_timing_window_excludes_old_and_reused_leaves(self):
-        class ConsoleStream(io.StringIO):
-            def isatty(self):
-                return True
-
-        stream = ConsoleStream()
-        reporter = self._console_reporter(stream)
+    def test_timing_window_excludes_old_and_reused_leaves(self):
+        reporter = CampaignProgressReporter(
+            "normal", self.reporter_checkpoint, io.StringIO()
+        )
         current = 0.0
         for leaf_index in range(1, 12):
             reporter.publish(
@@ -1072,13 +1071,16 @@ class CampaignProgressReporterTests(unittest.TestCase):
             )
         )
 
-        latest_panel = stream.getvalue().rsplit("\x1b8", 1)[-1]
-        self.assertIn("TimingSample   : 10/10", latest_panel)
-        self.assertIn("AvgLeaf        : 10s", latest_panel)
-        self.assertIn("MedianLeaf     : 10s", latest_panel)
-        self.assertIn("Completed      : 12/20", latest_panel)
+        status = json.loads(
+            Path(f"{self.reporter_checkpoint}.status.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(status["leaf_timing_sample_size"], 10)
+        self.assertEqual(status["average_leaf_seconds"], 10.0)
+        self.assertEqual(status["median_leaf_seconds"], 10.0)
 
-    def test_normal_console_reports_authenticated_acceptance_and_checkpoint_state(self):
+    def test_normal_console_reports_terminal_outcome_counts(self):
         class ConsoleStream(io.StringIO):
             def isatty(self):
                 return True
@@ -1092,92 +1094,53 @@ class CampaignProgressReporterTests(unittest.TestCase):
             "precision_digits": 64,
             "phase": "PRIMARY",
         }
-        events = (
-            _event(ProgressEventKind.LEAF_STARTED, **leaf_context),
-            _event(ProgressEventKind.ROOT_PHASE_STARTED, **leaf_context),
-            _payload_event(
-                ProgressEventKind.NEWTON_ITERATION_STARTED,
-                {
-                    "determinant_abs": 3.2e-8,
-                    "best_determinant_abs": 2.1e-9,
-                    "acceptance_threshold": 1.0e-10,
-                },
-                **leaf_context,
-                newton_index=2,
-            ),
-            _payload_event(
-                ProgressEventKind.ROOT_PHASE_COMPLETED,
-                {"converged": True, "resulting_determinant_abs": 2.1e-9},
-                **leaf_context,
-            ),
-            _event(ProgressEventKind.PRECISION_STAGE_STARTED, **leaf_context),
-            _event(ProgressEventKind.CHECKPOINT_WRITING, **leaf_context),
-            _event(ProgressEventKind.CHECKPOINT_WRITTEN, **leaf_context),
-            _payload_event(
-                ProgressEventKind.PRECISION_STAGE_COMPLETED,
-                {"numerical_state": "CONVERGED", "leaf_state": "PRODUCED"},
-                **leaf_context,
-            ),
+        reporter.publish(_event(ProgressEventKind.LEAF_STARTED, **leaf_context))
+        reporter.publish(_event(ProgressEventKind.CHECKPOINT_WRITTEN, **leaf_context))
+        reporter.publish(
             _payload_event(
                 ProgressEventKind.LEAF_COMPLETED,
                 {"state": "PRODUCED", "stage_count": 1},
                 **leaf_context,
-            ),
-        )
-        for index, event in enumerate(events, start=1):
-            reporter.publish(replace(event, monotonic_seconds=float(index)))
-
-        latest_panel = stream.getvalue().rsplit("\x1b8", 1)[-1]
-        self.assertIn("LeafStatus     : ACCEPTED", latest_panel)
-        self.assertIn("RootStatus     : CONVERGED", latest_panel)
-        self.assertIn("PrecisionStatus: CONVERGED", latest_panel)
-        self.assertIn("Completed      : 1/553", latest_panel)
-        self.assertIn("Accepted       : 1", latest_panel)
-        self.assertIn("Rejected       : 0", latest_panel)
-        self.assertIn("Indeterminate  : 0", latest_panel)
-        self.assertIn("Failed         : 0", latest_panel)
-        self.assertIn("LastAccepted   : leaf-1", latest_panel)
-        self.assertIn("BestDetAbs     : 2.1e-09", latest_panel)
-        self.assertIn("Threshold      : 1e-10", latest_panel)
-        self.assertIn("Checkpoint     : written", latest_panel)
-
-        reporter.publish(
-            replace(
-                _payload_event(
-                    ProgressEventKind.LEAF_REUSED,
-                    {"state": "UNRESOLVED", "stage_count": 1},
-                    leaf_id="leaf-2",
-                    leaf_index=2,
-                    leaf_count=553,
-                ),
-                monotonic_seconds=20.0,
             )
         )
-        reused_panel = stream.getvalue().rsplit("\x1b8", 1)[-1]
-        self.assertIn("LeafStatus     : INDETERMINATE", reused_panel)
-        self.assertIn("Completed      : 2/553", reused_panel)
-        self.assertIn("Accepted       : 1", reused_panel)
-        self.assertIn("Indeterminate  : 1", reused_panel)
-        self.assertIn("LastAccepted   : leaf-1", reused_panel)
-        self.assertIn("Checkpoint     : written", reused_panel)
+
+        latest_panel = stream.getvalue()
+        self.assertIn(" State          PRODUCED", latest_panel)
+        self.assertIn(" Completed      1/553", latest_panel)
+        self.assertIn(" Accepted       1", latest_panel)
+        self.assertIn(" Rejected       0", latest_panel)
+        self.assertIn(" Unresolved     0", latest_panel)
+        self.assertIn(" Failed         0", latest_panel)
 
         reporter.publish(
-            replace(
-                _payload_event(
-                    ProgressEventKind.LEAF_FAILED,
-                    {"error_type": "RuntimeError", "message": "backend stopped"},
-                    leaf_id="leaf-3",
-                    leaf_index=3,
-                    leaf_count=553,
-                ),
-                monotonic_seconds=21.0,
+            _payload_event(
+                ProgressEventKind.LEAF_REUSED,
+                {"state": "UNRESOLVED", "stage_count": 1},
+                leaf_id="leaf-2",
+                leaf_index=2,
+                leaf_count=553,
             )
         )
-        failed_panel = stream.getvalue().rsplit("\x1b8", 1)[-1]
-        self.assertIn("LeafStatus     : FAILED", failed_panel)
-        self.assertIn("Completed      : 2/553", failed_panel)
-        self.assertIn("Rejected       : 0", failed_panel)
-        self.assertIn("Failed         : 1", failed_panel)
+        reused_panel = stream.getvalue()
+        self.assertIn(" State          UNRESOLVED", reused_panel)
+        self.assertIn(" Completed      2/553", reused_panel)
+        self.assertIn(" Accepted       1", reused_panel)
+        self.assertIn(" Unresolved     1", reused_panel)
+
+        reporter.publish(
+            _payload_event(
+                ProgressEventKind.LEAF_FAILED,
+                {"error_type": "RuntimeError", "message": "backend stopped"},
+                leaf_id="leaf-3",
+                leaf_index=3,
+                leaf_count=553,
+            )
+        )
+        failed_panel = stream.getvalue()
+        self.assertIn(" State          FAILED", failed_panel)
+        self.assertIn(" Completed      3/553", failed_panel)
+        self.assertIn(" Rejected       0", failed_panel)
+        self.assertIn(" Failed         1", failed_panel)
 
     def test_trace_appends_session_marker_and_flushes_each_leaf_jsonl_event(self):
         with TemporaryDirectory() as directory:
