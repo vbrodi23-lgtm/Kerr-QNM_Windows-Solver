@@ -113,6 +113,7 @@ class PredictorRecordingBackend:
     def __init__(self) -> None:
         self.response = 0.125 - 0.375j
         self.calls: list[tuple[complex, complex | None]] = []
+        self.predictor_kinds: list[str] = []
 
     def read_root(
         self,
@@ -137,6 +138,16 @@ class PredictorRecordingBackend:
             equation_id=job.equation_id,
         )
 
+    def read_root_with_predictor_kind(
+        self,
+        job: ResponseComponentJob,
+        amplitude: complex,
+        primary_predictor: complex,
+        primary_predictor_kind: str,
+    ) -> RootReadout:
+        self.predictor_kinds.append(primary_predictor_kind)
+        return self.read_root(job, amplitude, primary_predictor)
+
     def closed_form_horizon_response(
         self, job: ResponseComponentJob
     ) -> complex | None:
@@ -144,6 +155,37 @@ class PredictorRecordingBackend:
 
 
 class LinearResponseEngineTests(unittest.TestCase):
+    def test_coarse_signed_readouts_predict_from_previous_spin_response(
+        self,
+    ) -> None:
+        """Catches seeding a new spin from its predecessor's absolute root."""
+
+        job = ResponseComponentJob.from_leaf_id(
+            EXTERIOR_LEAF_ID,
+            policy=NumericalPolicy(),
+            backend_identity=IDENTITY,
+        )
+        backend = PredictorRecordingBackend()
+        previous_response = complex(-0.75, 0.25)
+
+        result = run_component(
+            job,
+            backend,
+            response_predictor=previous_response,
+        )
+
+        self.assertEqual(result.status, ComponentStatus.CONVERGED)
+        self.assertEqual(backend.calls[0], (0.0j, None))
+        for amplitude, predictor in backend.calls[1:5]:
+            self.assertEqual(
+                predictor,
+                job.root.omega + amplitude * previous_response,
+            )
+        self.assertEqual(
+            backend.predictor_kinds,
+            ["SPIN_CONTINUATION"] * 4 + ["EPSILON_CONTINUATION"] * 12,
+        )
+
     def test_finer_epsilon_readouts_continue_independently_along_each_signed_ray(
         self,
     ) -> None:
