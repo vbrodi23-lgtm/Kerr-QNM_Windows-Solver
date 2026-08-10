@@ -19,7 +19,7 @@ Make every M02 numerical prerequisite executable from a fresh checkout and decla
 - [ ] Preserve existing campaign checkpoint/resume, signed reduction, full validation, and admission behavior across binary64, 80-digit, and 120-digit stages.
 - [ ] Keep the Black Hole Perturbation Toolkit Mathematica spheroidal repository as an independently pinned validation source, not a runtime dependency or competing production owner.
 - [ ] Remove every operational requirement to search old Downloads folders or possess a historic private cache; preserve an old cache only as a non-authoritative comparator fixture when its exact receipt is available.
-- [ ] Expose one PowerShell command that bootstraps, runs or resumes all 553 leaves, and performs full checkpoint validation; include a clean runtime rebuild option.
+- [ ] Expose one PowerShell command that bootstraps, runs or resumes all 212 leaves, and performs full checkpoint validation; include a clean runtime rebuild option.
 - [ ] Pass focused adapter, precision, tamper, licence, package-local bootstrap, pair reuse, PowerShell parser, package-build, and non-scientific preflight tests on supported CI platforms.
 
 ### Dependencies
@@ -46,7 +46,7 @@ Confirm that a fresh checkout can originate every M02 numerical prerequisite fro
 - Replace the fixed-cache `campaign-run` boundary with the package-local Julia F/U cache producer.
 - Index and validate one exact pair record at a time, then assemble the records selected by the campaign for the existing `StandardSN` consumer.
 - Route package-owned Julia 80/120-digit root readouts through the existing campaign stage and evidence contracts.
-- Launch all 553 leaves from `m02.ps1`; the user supplies the physical Windows execution evidence and failure logs.
+- Launch all 212 leaves from `m02.ps1`; the user supplies the physical Windows execution evidence and failure logs.
 - Render normal progress as a stateful in-place dashboard with acceptance state and rolling ETA while preserving console history, scientific execution, and checkpoint/evidence bytes.
 - Bind `m02.ps1` bootstrap switches as actual PowerShell parameters, and prove the boundary with a mocked Windows bootstrap invocation.
 - Move the normal Windows runtime to a versioned per-user LocalAppData root; retain an explicit package-local portable mode, validate runtime receipts before reuse, and leave checkout-local campaign state untouched.

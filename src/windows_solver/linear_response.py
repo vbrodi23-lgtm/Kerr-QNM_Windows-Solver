@@ -105,20 +105,14 @@ _FROZEN_MODE_COORDINATES = frozenset(
 _FROZEN_SPINS = frozenset(
     {
         Fraction(19, 20),
-        Fraction(97, 100),
-        Fraction(49, 50),
         Fraction(99, 100),
-        Fraction(199, 200),
-        Fraction(997, 1000),
         Fraction(999, 1000),
-        Fraction(1999, 2000),
         Fraction(9999, 10000),
     }
 )
 _FROZEN_SURFACE_GRAVITIES = frozenset(
     {
         Fraction(1, 100),
-        Fraction(1, 200),
         Fraction(1, 500),
         Fraction(1, 1000),
     }
@@ -330,11 +324,13 @@ def _build_b_prime_release_domain() -> BPrimeReleaseDomain:
     control_modes = ("210", "2-minus-2-0", "320", "3-minus-3-0")
     deep_modes = ("220", "221", "222", "210")
     primary_mechanisms = (
-        "horizon-admittance", "exterior-fixed-r3", "exterior-light-ring",
-        "exterior-throat-kappa", "exterior-alpha-zero", "exterior-alpha-half",
-        "exterior-alpha-one",
+        "horizon-admittance", "exterior-fixed-r3", "exterior-alpha-half",
+        "exterior-light-ring", "exterior-throat-kappa",
     )
     exterior_mechanisms = primary_mechanisms[1:]
+    control_exterior_mechanisms = (
+        "exterior-fixed-r3", "exterior-light-ring", "exterior-throat-kappa",
+    )
     deep_mechanisms = (
         "horizon-admittance", "exterior-alpha-one", "exterior-light-ring",
         "exterior-throat-kappa",
@@ -364,7 +360,7 @@ def _build_b_prime_release_domain() -> BPrimeReleaseDomain:
                         or (role == "primary" and label in {"440", "441"})
                         or (
                             role == "primary"
-                            and coordinate in {Fraction(1999, 2000), Fraction(9999, 10000)}
+                            and coordinate == Fraction(9999, 10000)
                         )
                     )
                     selector_material = {
@@ -389,7 +385,10 @@ def _build_b_prime_release_domain() -> BPrimeReleaseDomain:
                     ))
 
     add_role("primary", primary_modes, "direct", direct_spins, primary_mechanisms)
-    add_role("control", control_modes, "direct", control_spins, exterior_mechanisms)
+    add_role(
+        "control", control_modes, "direct", control_spins,
+        control_exterior_mechanisms,
+    )
     add_role("deep", deep_modes, "M-kappa", deep_coordinates, deep_mechanisms)
 
     primary_supports = MappingProxyType({

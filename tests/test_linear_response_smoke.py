@@ -76,10 +76,10 @@ class RecordedResponseSmokeTests(unittest.TestCase):
         expected = (
             "b-prime-leaf-9e5777728144433e089f9559b92b6e139e16115a5a53099f40403a45297aa3c3",
             "b-prime-leaf-7ef38d6f95c161d0b4c6650d470898c0742ad6ae8440e89956312344c0db6aac",
-            "b-prime-leaf-87cd3420fc56eca66218e7414d17fd2803d59e719f3ab7c05b52a997f5cf0895",
-            "b-prime-leaf-65d0a36c9075d255c2e78a5d8c8098ba745da0b4228c309d210cf05bdb9696ea",
+            "b-prime-leaf-4eb508d767bea5cddc3f7c0eb120c1a9cc184122900f4d7ec86b56c98ddab596",
+            "b-prime-leaf-3ee2b2dcdc5276cbcd51264f1210002314acd3ff845bb7a464f1e9333e9115c5",
             "b-prime-leaf-e0a48b72b4071c5c88c66955420dc2748cfeeac577b8fd1c399f171f5fa08475",
-            "b-prime-leaf-0b1d66162e12c8b4e5ae0d2d360bc3f22f5f18f09e75fb84cd90d435292fed34",
+            "b-prime-leaf-fc5998bf989465575d276b6a1ad4758dbb1cdacc25e1c7554185f0c38e170332",
             "b-prime-leaf-29476bee7eab938f57ee149c682a367cd3e65f2b3337e90aeae91009998d08a2",
             "b-prime-leaf-bef33f29593b50014490d255e06e90e6e0fb4b94868a7906d7d10db62522cbbd",
             "b-prime-leaf-0784febf73878ce64ed23c8284325d2dc5ca30ce97cdccb543c0250371d39d7a",

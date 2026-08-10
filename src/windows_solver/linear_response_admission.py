@@ -152,17 +152,24 @@ def _expected_reduction_component_ids() -> tuple[str, ...]:
 def _validate_complete_reduction(summary: CampaignReductionSummary) -> None:
     plans = build_projective_row_plans()
     expected_rows = tuple(plan.row_id for plan in plans)
-    if len(expected_rows) != 174:
-        raise ValueError("frozen projective row contract is not exactly 174 rows")
+    expected_row_count = len(B_PRIME_RELEASE_DOMAIN.projective_row_ids)
+    if len(expected_rows) != expected_row_count:
+        raise ValueError(
+            "frozen projective row contract does not match the "
+            f"{expected_row_count}-row release domain"
+        )
     if (
         summary.reducer_state != "COMPLETE"
         or summary.selected_row_ids != expected_rows
-        or len(summary.results) != 174
+        or len(summary.results) != expected_row_count
         or any(result.reducer_state != "COMPLETE" for result in summary.results)
         or summary.missing_component_ids
         or summary.present_component_ids != _expected_reduction_component_ids()
     ):
-        raise ValueError("admission requires the complete aligned 174-row reduction")
+        raise ValueError(
+            "admission requires the complete aligned "
+            f"{expected_row_count}-row reduction"
+        )
 
 
 def _validate_evidence_receipt(value: object) -> Mapping[str, object]:
@@ -186,11 +193,12 @@ def _validate_evidence_receipt(value: object) -> Mapping[str, object]:
     ):
         raise ValueError("admission unresolved leaf IDs are invalid")
     domain = set(B_PRIME_RELEASE_DOMAIN.production_leaf_ids)
+    expected_leaf_count = len(domain)
     if any(item not in domain for item in unresolved):
         raise ValueError("admission unresolved leaf IDs are off-domain")
     if (
         receipt["bundle_state"] != "complete-operator"
-        or receipt["produced_count"] != 553
+        or receipt["produced_count"] != expected_leaf_count
         or receipt["missing_count"] != 0
         or receipt["release_domain_fingerprint"] != B_PRIME_CONTRACT_SHA256
         or receipt["numerical_policy_fingerprint"]
@@ -200,7 +208,10 @@ def _validate_evidence_receipt(value: object) -> Mapping[str, object]:
         or receipt["campaign_root_set_sha256"]
         != campaign_spectral_receipt()["root_set_sha256"]
     ):
-        raise ValueError("admission evidence receipt is not a complete 553-leaf receipt")
+        raise ValueError(
+            "admission evidence receipt is not a complete "
+            f"{expected_leaf_count}-leaf receipt"
+        )
     _digest(receipt["bundle_sha256"], "evidence bundle SHA-256")
     _digest(receipt["manifest_sha256"], "evidence manifest SHA-256")
     _digest(
@@ -351,9 +362,10 @@ def _validate_component_evidence_bindings(
         )
         components_by_identity[identity] = component
 
+    expected_leaf_count = len(B_PRIME_RELEASE_DOMAIN.production_leaf_ids)
     if (
-        len(records_by_identity) != 553
-        or len(components_by_identity) != 553
+        len(records_by_identity) != expected_leaf_count
+        or len(components_by_identity) != expected_leaf_count
         or set(records_by_identity) != set(components_by_identity)
     ):
         raise ValueError(
@@ -397,9 +409,11 @@ def _validate_projective_reduction_bindings(
     comparisons = _array(
         payload["projective_comparisons"], "admission projective comparisons"
     )
-    if len(comparisons) != 174:
+    expected_row_count = len(B_PRIME_RELEASE_DOMAIN.projective_row_ids)
+    if len(comparisons) != expected_row_count:
         raise ValueError(
-            "admission requires exactly 174 projective comparisons from the reduction"
+            "admission requires exactly "
+            f"{expected_row_count} projective comparisons from the reduction"
         )
     components_by_identity: dict[tuple[object, ...], Mapping[str, object]] = {}
     for raw_component in _array(
@@ -696,10 +710,15 @@ def admit_linear_response_bundle(
     evidence_manifest = _load_json_bytes(evidence_bytes, "evidence bundle")
     if (
         evidence_summary.bundle_state != "complete-operator"
-        or evidence_summary.produced_count != 553
+        or evidence_summary.produced_count != len(
+            B_PRIME_RELEASE_DOMAIN.production_leaf_ids
+        )
         or evidence_summary.missing_count != 0
     ):
-        raise ValueError("admission requires one complete 553-leaf evidence bundle")
+        raise ValueError(
+            "admission requires one complete "
+            f"{len(B_PRIME_RELEASE_DOMAIN.production_leaf_ids)}-leaf evidence bundle"
+        )
     records = evidence_manifest["produced_records"]
     unresolved_ids = [
         record["leaf_id"]

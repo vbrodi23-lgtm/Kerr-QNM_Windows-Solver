@@ -193,7 +193,7 @@ class EvidenceBundleValidationTests(unittest.TestCase):
             partial = _write_manifest(directory, [leaves[0], leaves[-1]])
             summary = validate_evidence_bundle(partial, bundle_directory=directory)
             self.assertEqual(summary.bundle_state, "partial-smoke")
-            self.assertEqual((summary.produced_count, summary.missing_count), (2, 551))
+            self.assertEqual((summary.produced_count, summary.missing_count), (2, 210))
             self.assertFalse(summary.release_admissible)
             self.assertFalse(LINEAR_RESPONSE_DESCRIPTOR.available)
 
@@ -201,7 +201,7 @@ class EvidenceBundleValidationTests(unittest.TestCase):
             directory = Path(temporary)
             complete = _write_manifest(directory, leaves, state="complete-operator")
             summary = validate_evidence_bundle(complete, bundle_directory=directory)
-            self.assertEqual((summary.produced_count, summary.missing_count), (553, 0))
+            self.assertEqual((summary.produced_count, summary.missing_count), (212, 0))
             self.assertEqual(summary.validation_status, "STRUCTURALLY_VALID")
             self.assertFalse(summary.release_admissible)
 
@@ -427,7 +427,7 @@ class RepresentativeFixtureTests(unittest.TestCase):
             "b-prime-leaf-9e5777728144433e089f9559b92b6e139e16115a5a53099f40403a45297aa3c3",
             "b-prime-leaf-59894e4af3913286bb06cb36d1f01f508f728588937fbc5a45eab6da2906b77d",
             "b-prime-leaf-3ee2b2dcdc5276cbcd51264f1210002314acd3ff845bb7a464f1e9333e9115c5",
-            "b-prime-leaf-ea3be34f9f06cab547552a6b774adba5305ed328a3a8ae4e8e49b2d78562d79f",
+            "b-prime-leaf-4eb508d767bea5cddc3f7c0eb120c1a9cc184122900f4d7ec86b56c98ddab596",
         ])
         self.assertEqual(receipt["fixture_smoke_ids"], [
             "pilot:220:19/20:exterior-light-ring",
@@ -452,7 +452,7 @@ class EvidenceIntakeCommandTests(unittest.TestCase):
             output = json.loads(first.stdout)
             self.assertEqual(output["command"], "validate-evidence")
             self.assertEqual(output["validation_status"], "STRUCTURALLY_VALID")
-            self.assertEqual((output["produced_count"], output["missing_count"]), (1, 552))
+            self.assertEqual((output["produced_count"], output["missing_count"]), (1, 211))
             self.assertFalse(output["release_admissible"])
 
     def test_invalid_command_input_is_machine_readable_and_nonzero(self) -> None:

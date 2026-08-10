@@ -108,13 +108,13 @@ def _synthetic_rows() -> list[dict[str, object]]:
 
 class CatalogBuilderTests(unittest.TestCase):
     def test_b_prime_declares_a_sparse_overlay_not_a_cartesian_builder(self) -> None:
-        """TASK-070 receives only the literal 44 missing selectors."""
+        """The reduced campaign consumes only its literal overlay subset."""
 
         domain = B_PRIME_RELEASE_DOMAIN
-        self.assertEqual(len(domain.root_selectors), 87)
-        self.assertEqual(len(domain.missing_root_selector_ids), 44)
+        self.assertEqual(len(domain.root_selectors), 48)
+        self.assertEqual(len(domain.missing_root_selector_ids), 25)
         self.assertEqual(domain.missing_selector_counts_by_role, {
-            "primary": 28, "control": 0, "deep": 16,
+            "primary": 13, "control": 0, "deep": 12,
         })
         self.assertEqual(len(builder.lattice_points()), 2_736)
 

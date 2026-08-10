@@ -74,13 +74,13 @@ class ProjectiveRowPlanTests(unittest.TestCase):
             for index, (component_id, centre) in enumerate(zip(component_ids, centres))
         }
 
-    def test_exact_frozen_162_primary_and_12_deep_rows_are_enumerated_only(self) -> None:
+    def test_exact_frozen_48_primary_and_9_deep_rows_are_enumerated_only(self) -> None:
         plans = build_projective_row_plans()
 
-        self.assertEqual(len(plans), 174)
+        self.assertEqual(len(plans), 57)
         self.assertEqual(tuple(plan.row_id for plan in plans), B_PRIME_RELEASE_DOMAIN.projective_row_ids)
-        self.assertEqual(sum(plan.role == "primary" for plan in plans), 162)
-        self.assertEqual(sum(plan.role == "deep" for plan in plans), 12)
+        self.assertEqual(sum(plan.role == "primary" for plan in plans), 48)
+        self.assertEqual(sum(plan.role == "deep" for plan in plans), 9)
         self.assertFalse(any(plan.role == "control" for plan in plans))
 
         head = plans[0]
@@ -214,7 +214,7 @@ class ProjectiveRowPlanTests(unittest.TestCase):
         plan = next(
             plan
             for plan in build_projective_row_plans()
-            if plan.row_id == "primary-K1-1999-2000-exterior-alpha-half"
+            if plan.row_id == "primary-K1-999-1000-exterior-alpha-half"
         )
         components = self.resolved_components(
             plan,

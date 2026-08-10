@@ -30,9 +30,9 @@ Each command writes exactly one JSON object. Invalid selections, stale bindings,
 tampered results, and incorrect cold/resume state return a nonzero exit code and
 one machine-readable error object on standard error.
 
-## B-prime 553-leaf campaign handoff
+## B-prime 212-leaf campaign handoff
 
-The campaign commands plan all 553 literal B-prime leaves but execute only the
+The campaign commands plan all 212 literal B-prime leaves but execute only the
 explicit role-bounded selection. They never complete a Cartesian product. The
 provider remains unavailable and every partial or merged checkpoint reports
 `release_admissible=false`.
@@ -111,7 +111,7 @@ existing Python `StandardSN` path; 80/120-digit stages use the persistent
 managed Julia worker and return the same root-readout contract to the existing campaign
 runner. No separately supplied precision module is needed for M02.
 
-For the complete campaign, the root launcher selects all 553 leaves, starts or
+For the complete campaign, the root launcher selects all 212 leaves, starts or
 resumes the checkpoint, and performs full structural validation:
 
 ```powershell
@@ -139,7 +139,7 @@ python -m windows_solver campaign-merge campaign-merge.json --output merged.json
 python -m windows_solver campaign-validate campaign-selection.json --checkpoint merged.json --full
 ```
 
-`--full` requires the exact ordered 553 leaf IDs, zero extras or missing records,
+`--full` requires the exact ordered 212 leaf IDs, zero extras or missing records,
 terminal precision evidence, and no missing-precision stage. A governed computed
 `UNRESOLVED` record is complete; an unexecuted leaf or missing 80/120 stage is
 not. Even an exact structurally complete bundle is not admitted by this task:
@@ -199,7 +199,7 @@ itself is not sufficient. Duplicate/nonfinite JSON, stale or mixed campaign
 lineage, disagreeing checkpoint overlaps, unsafe paths, and existing output
 files fail before publication.
 
-Once the operator has the complete admitted 553-leaf evidence, use the same
-frozen command and all 174 canonical row IDs. Only that complete evidence may
-produce the full 174-row scientific artifact. The reducer software and the
+Once the operator has the complete admitted 212-leaf evidence, use the same
+frozen command and all 57 canonical row IDs. Only that complete evidence may
+produce the full 57-row scientific artifact. The reducer software and the
 examples above do not admit the provider or populate that atlas.

@@ -269,13 +269,13 @@ class LinearResponseAdmissionTests(unittest.TestCase):
             set(request.numerical_policy), {"exact-spectral-selection"}
         )
         payload = build_spectral_payload(request)
-        self.assertEqual(payload["requested_root_count"], 87)
-        self.assertEqual(len(payload["roots"]), 87)
+        self.assertEqual(payload["requested_root_count"], 48)
+        self.assertEqual(len(payload["roots"]), 48)
 
     def test_partial_bundle_cannot_register_provider(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             manifest = _admission_fixture(Path(temporary), complete=False)
-            with self.assertRaisesRegex(ValueError, "553|complete"):
+            with self.assertRaisesRegex(ValueError, "212|complete"):
                 admit_linear_response_bundle(manifest)
         with self.assertRaises(ProviderUnavailableError):
             default_registry().resolve(Capability.LINEAR_RESPONSE)
@@ -287,8 +287,8 @@ class LinearResponseAdmissionTests(unittest.TestCase):
             )
             self.assertTrue(package.release_admissible)
             self.assertFalse(package.scientific_claims_admitted)
-            self.assertEqual(package.evidence_receipt["produced_count"], 553)
-            self.assertEqual(package.reduction_receipt["row_count"], 174)
+            self.assertEqual(package.evidence_receipt["produced_count"], 212)
+            self.assertEqual(package.reduction_receipt["row_count"], 57)
 
             provider = AdmittedLinearResponseProvider(
                 package, expected_admission_id=package.admission_id
@@ -409,8 +409,8 @@ class LinearResponseAdmissionTests(unittest.TestCase):
         mapping = package.to_mapping()
         self.assertEqual(LinearResponseAdmissionPackage.from_mapping(mapping), package)
         forged = deepcopy(mapping)
-        forged["evidence_receipt"]["produced_count"] = 552
-        with self.assertRaisesRegex(ValueError, "evidence|identity|553"):
+        forged["evidence_receipt"]["produced_count"] = 211
+        with self.assertRaisesRegex(ValueError, "evidence|identity|212"):
             LinearResponseAdmissionPackage.from_mapping(forged)
 
         malformed = deepcopy(mapping)
@@ -533,7 +533,7 @@ class LinearResponseAdmissionTests(unittest.TestCase):
                 )
                 _write_json(admission_path, admission)
                 with self.assertRaisesRegex(
-                    ValueError, "projective.*reduction|174"
+                    ValueError, "projective.*reduction|57"
                 ):
                     admit_linear_response_bundle(admission_path)
 

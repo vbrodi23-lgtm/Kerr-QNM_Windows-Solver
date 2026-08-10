@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from dataclasses import replace
 import json
 from pathlib import Path
 import tempfile
@@ -280,19 +281,25 @@ class LinearResponseEngineTests(unittest.TestCase):
             "exterior-alpha-half": "alpha-half",
             "exterior-alpha-one": "alpha-one",
         }
-        leaves = {
-            leaf.mechanism_id: leaf
+        template_leaf = next(
+            leaf
             for leaf in B_PRIME_RELEASE_DOMAIN.production_leaves
-            if leaf.role == "primary" and leaf.mode_label == "220" and leaf.spin == 0.95
-        }
+            if (
+                leaf.role == "primary"
+                and leaf.mode_label == "220"
+                and leaf.spin == 0.95
+                and leaf.mechanism_id == "exterior-fixed-r3"
+            )
+        )
+        template = ResponseComponentJob.from_leaf_id(
+            template_leaf.leaf_id,
+            policy=NumericalPolicy(),
+            backend_identity=IDENTITY,
+        )
         for mechanism_id, profile_id in expected.items():
             with self.subTest(mechanism_id=mechanism_id):
                 kernel = AnalyticKernel()
-                job = ResponseComponentJob.from_leaf_id(
-                    leaves[mechanism_id].leaf_id,
-                    policy=NumericalPolicy(),
-                    backend_identity=IDENTITY,
-                )
+                job = replace(template, mechanism_id=mechanism_id)
                 adapter = NativeDeterminantAdapter(IDENTITY, kernel)
                 adapter.read_root(job, 1.0j)
                 perturbation = kernel.calls[-1]

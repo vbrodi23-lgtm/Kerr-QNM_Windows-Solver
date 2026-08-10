@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import json
+from fractions import Fraction
 from pathlib import Path
 import shutil
 import tempfile
@@ -69,6 +71,36 @@ def _primary(plan, count):
 
 
 class SolvedLeafCacheTests(unittest.TestCase):
+    def test_reduced_domain_preserves_retained_leaf_scientific_identities(self):
+        plan = _plan()
+        expected = {
+            "horizon-admittance": "b-prime-leaf-9e5777728144433e089f9559b92b6e139e16115a5a53099f40403a45297aa3c3",
+            "exterior-fixed-r3": "b-prime-leaf-21a31df9512726338ff0920025fd5e5c42e67ef7d603130e822b3a2798b5aed5",
+            "exterior-alpha-half": "b-prime-leaf-4eb508d767bea5cddc3f7c0eb120c1a9cc184122900f4d7ec86b56c98ddab596",
+            "exterior-light-ring": "b-prime-leaf-3ee2b2dcdc5276cbcd51264f1210002314acd3ff845bb7a464f1e9333e9115c5",
+            "exterior-throat-kappa": "b-prime-leaf-fc5998bf989465575d276b6a1ad4758dbb1cdacc25e1c7554185f0c38e170332",
+        }
+        retained = {
+            leaf.mechanism_id: leaf
+            for leaf in plan.leaves
+            if (
+                leaf.role == "primary"
+                and leaf.leaf.mode_label == "220"
+                and leaf.leaf.coordinate == Fraction(19, 20)
+            )
+        }
+
+        self.assertEqual(set(retained), set(expected))
+        for mechanism_id, leaf_id in expected.items():
+            with self.subTest(mechanism_id=mechanism_id):
+                leaf = retained[mechanism_id]
+                self.assertEqual(leaf.leaf_id, leaf_id)
+                isolated_plan = replace(plan, leaves=(leaf,), cohorts=())
+                self.assertEqual(
+                    scientific_computation_identity_sha256(plan, leaf),
+                    scientific_computation_identity_sha256(isolated_plan, leaf),
+                )
+
     def test_empty_store_writes_through_then_identical_run_reuses_exact_record(self):
         plan = _plan()
         selection = _primary(plan, 1)

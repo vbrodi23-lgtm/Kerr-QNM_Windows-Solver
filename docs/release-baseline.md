@@ -3,7 +3,7 @@
 **Status:** Closed for review on 2026-08-07. The machine-readable authority is
 [`release_domain_manifest.json`](../src/windows_solver/data/release_domain_manifest.json),
 whose packaged SHA-256 is
-`697c92744e098fe409f481bcfa0ebeecfc61cd222291e36cd4158fbc5857b742`.
+`d924949307d225342a6f12961c19bb40da1b7078b4ebf25ac07e806814c374dd`.
 
 M01 freezes the completion domain before any downstream scientific provider is
 migrated. It does not add or modify spectral rows. PR #2 remains the immutable
@@ -19,8 +19,9 @@ PR #4 begins the separate `linear-response` migration.
 | Platforms | Native Windows PowerShell 5.1 with CPython 3.12 x64; Ubuntu CPython 3.12 x64; OCI Linux amd64 with CPython 3.12 |
 | Pure-Kerr spectrum | s=−2; ℓ∈{2,3,4}; every allowed m; n∈{0,1,2}; 63 modes; 2,736 exact roots on the accepted 46/46/40 spin grids |
 | Linear modes | Primary: 220, 221, 222, 330, 331, 440, 441; controls: 210, 2−20, 320, 3−30 |
-| Near-extremal coordinates | Direct a/M values 0.95, 0.97, 0.98, 0.99, 0.995, 0.997, 0.999, 0.9995, 0.9999; surface-gravity values 0.01, 0.005, 0.002, 0.001 |
+| Near-extremal coordinates | Direct a/M values 0.95, 0.99, 0.999, 0.9999; surface-gravity values 0.01, 0.002, 0.001 |
 | Response mechanisms | Horizon admittance; fixed-r3, light-ring, throat-κ, α=0, α=1/2, and α=1 exterior profiles; cubic EFT |
+| M02 B′ campaign | 140 primary: 7 modes × 4 direct spins × horizon/fixed-r3/α=1/2/light-ring/throat-κ; 24 exterior-only controls: 4 modes × a/M∈{0.95,0.999} × fixed-r3/light-ring/throat-κ; 48 deep: 4 modes × Mκ∈{1/100,1/500,1/1000} × 4 retained deep mechanisms |
 | Branch classes | Damped; zero-damping; unresolved; all tied to explicit Schwarzschild-overtone continuation records |
 | Quadratic case | 220-plus × 220-plus; forced m=4; Ω=ω₁+ω₂; observable R-plus-plus-44; a/M∈{0,0.3,0.5,0.7,0.9,0.95} |
 | Waveforms | Causal linear multimode; quadratic 220×220; Ψ₄-to-strain; tails and greybody quantities |

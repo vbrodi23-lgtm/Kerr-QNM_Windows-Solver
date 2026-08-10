@@ -562,12 +562,15 @@ class PublicSurfaceTests(unittest.TestCase):
         self.assertIsNone(selection["leaf_ids"])
         self.assertEqual(selection["precision_digits"], [64, 80, 120])
         self.assertIn("[switch]$RebuildRuntime", launcher)
+        self.assertIn('"campaign-plan"', launcher)
+        self.assertIn('Write-Host "M02 B′ campaign"', launcher)
         self.assertIn('campaign-resume', launcher)
         self.assertIn('"--full"', launcher)
         self.assertIn('if ($RebuildRuntime)', launcher)
         self.assertIn('[ValidateSet("quiet", "normal", "trace")]', launcher)
         self.assertIn('[string]$Progress = "normal"', launcher)
         self.assertIn('"--progress"', launcher)
+        self.assertIn('"campaign-plan",\n        $Selection\n', launcher)
         self.assertEqual(launcher.count("$Selection,"), 2)
         self.assertEqual(launcher.count("\n        $Checkpoint,\n"), 2)
         self.assertNotIn("$SelectionPath,", launcher)
@@ -639,6 +642,10 @@ $record = $SolverArguments | ConvertTo-Json -Compress
     $record + [Environment]::NewLine,
     [System.Text.UTF8Encoding]::new($false)
 )
+if ($SolverArguments[0] -eq "campaign-plan") {
+    '{"role_counts":{"primary":140,"control":24,"deep":48},"leaf_count":212}'
+    exit 0
+}
 $checkpointIndex = [Array]::IndexOf($SolverArguments, "--checkpoint")
 if ($checkpointIndex -lt 0) {
     exit 91
@@ -819,6 +826,10 @@ $record = $SolverArguments | ConvertTo-Json -Compress
     $record + [Environment]::NewLine,
     [System.Text.UTF8Encoding]::new($false)
 )
+if ($SolverArguments[0] -eq "campaign-plan") {
+    '{"role_counts":{"primary":140,"control":24,"deep":48},"leaf_count":212}'
+    exit 0
+}
 $checkpointIndex = [Array]::IndexOf($SolverArguments, "--checkpoint")
 if ($checkpointIndex -lt 0) {
     exit 91
@@ -877,6 +888,10 @@ exit 0
             calls,
             [
                 [
+                    "campaign-plan",
+                    selection,
+                ],
+                [
                     "campaign-run",
                     selection,
                     "--checkpoint",
@@ -896,7 +911,7 @@ exit 0
         self.assertTrue(
             all(
                 not Path(call[index]).is_absolute() and ":" not in call[index]
-                for call in calls
+                for call in calls[1:]
                 for index in (1, 3)
             )
         )

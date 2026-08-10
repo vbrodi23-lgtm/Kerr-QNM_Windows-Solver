@@ -35,11 +35,13 @@ spectrum. PR #4 begins the distinct `linear-response` migration; PR #5 installs
 the M02 planner, resumable campaign, uncertainty/projective reduction, and
 fail-closed admission machinery. No M02 scientific evidence is shipped: the
 linear-response provider remains unavailable by default and can be registered
-only from a complete operator package that passes the 553-leaf and 174-row
-admission gates. Reduction inputs are value-bound to their authenticated
-checkpoint records, and all 174 payload comparisons are value-bound to the
-sealed reduction. Each produced record carries its complete checkpoint root
-identity; admission reconciles the resulting 87-root campaign set against the
+only from a complete operator package that passes the 212-leaf and 57-row
+admission gates. The canonical M02 B′ campaign comprises 140 primary, 24
+control, and 48 deep leaves. Reduction inputs are value-bound to their
+authenticated checkpoint records, and all 57 payload comparisons are
+value-bound to the sealed reduction. Each produced record carries its complete
+checkpoint root identity; admission reconciles the resulting 48-root campaign
+set against the
 installed catalog before the package seals the spectral provider/request/payload
 identity. Admission and replay therefore reject catalog or root drift. See [the
 M01 release baseline](docs/release-baseline.md) and [the M02 PowerShell
@@ -92,7 +94,7 @@ exact Julia 1.10.11 from the managed runtime, an existing system installation,
 or Juliaup before downloading solver-managed Julia. It then reuses or provisions
 the pinned numerical environment, contract-addressed persistent GSN/spheroidal
 source copies, M02 project, Julia depot/packages/artifacts/compiled cache, and
-the package-owned 80/120-digit worker. The complete 553-leaf campaign is a
+the package-owned 80/120-digit worker. The complete 212-leaf campaign is a
 single resumable command:
 
 ```powershell

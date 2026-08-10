@@ -135,8 +135,9 @@ class FullLatticeCatalogContractTests(unittest.TestCase):
                 for n in range(3)
             },
         )
-        self.assertEqual(len(B_PRIME_RELEASE_DOMAIN.root_selectors), 87)
-        self.assertEqual(len(B_PRIME_RELEASE_DOMAIN.missing_root_selector_ids), 44)
+        self.assertEqual(len(catalog.overlay.roots), 44)
+        self.assertEqual(len(B_PRIME_RELEASE_DOMAIN.root_selectors), 48)
+        self.assertEqual(len(B_PRIME_RELEASE_DOMAIN.missing_root_selector_ids), 25)
 
     def test_catalog_exactly_matches_the_2736_root_rational_lattice(self) -> None:
         catalog = load_spectrum_catalog()

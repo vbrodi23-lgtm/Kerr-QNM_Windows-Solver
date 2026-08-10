@@ -57,11 +57,11 @@ _OPERATOR_SMOKE_LEAF_IDS = (
     "b-prime-leaf-9e5777728144433e089f9559b92b6e139e16115a5a53099f40403a45297aa3c3",
     "b-prime-leaf-59894e4af3913286bb06cb36d1f01f508f728588937fbc5a45eab6da2906b77d",
     "b-prime-leaf-3ee2b2dcdc5276cbcd51264f1210002314acd3ff845bb7a464f1e9333e9115c5",
-    "b-prime-leaf-ea3be34f9f06cab547552a6b774adba5305ed328a3a8ae4e8e49b2d78562d79f",
+    "b-prime-leaf-4eb508d767bea5cddc3f7c0eb120c1a9cc184122900f4d7ec86b56c98ddab596",
 )
 
 _CONTRACT_MATERIAL = {
-    "contract_id": "m02-b-prime-553-leaf-linear-response",
+    "contract_id": "m02-b-prime-212-leaf-linear-response",
     "required_leaf_ids": list(B_PRIME_RELEASE_DOMAIN.production_leaf_ids),
 }
 B_PRIME_CONTRACT_SHA256 = hashlib.sha256(
@@ -288,7 +288,10 @@ def _validate_contract(value: object) -> Mapping[str, object]:
         raise ValueError("numerical-policy fingerprint does not match frozen B′")
     required = [_string(item, "required leaf ID") for item in _array(contract["required_leaf_ids"], "required_leaf_ids")]
     if required != list(B_PRIME_RELEASE_DOMAIN.production_leaf_ids):
-        raise ValueError("required_leaf_ids must equal the ordered frozen 553-leaf B′ contract")
+        raise ValueError(
+            "required_leaf_ids must equal the ordered frozen "
+            f"{len(B_PRIME_RELEASE_DOMAIN.production_leaf_ids)}-leaf B′ contract"
+        )
     receipt = _mapping(
         contract["campaign_spectral_receipt"], "campaign spectral receipt"
     )
@@ -300,8 +303,12 @@ def _validate_contract(value: object) -> Mapping[str, object]:
     provider = _mapping(receipt["provider"], "campaign spectral provider")
     if not provider:
         raise ValueError("campaign spectral provider must not be empty")
-    if _integer(receipt["root_count"], "campaign spectral root_count") != 87:
-        raise ValueError("campaign spectral receipt must bind exactly 87 roots")
+    expected_root_count = len(B_PRIME_RELEASE_DOMAIN.root_selectors)
+    if _integer(receipt["root_count"], "campaign spectral root_count") != expected_root_count:
+        raise ValueError(
+            "campaign spectral receipt must bind exactly "
+            f"{expected_root_count} roots"
+        )
     _digest(receipt["root_set_sha256"], "campaign spectral root-set SHA-256")
     return receipt
 
@@ -585,8 +592,14 @@ def validate_evidence_bundle(
     expected_missing = [item for item in required if item not in produced_set]
     if missing != expected_missing:
         raise ValueError("produced and missing IDs must exactly partition frozen B′")
-    if bundle_state == "complete-operator" and (len(produced) != 553 or missing):
-        raise ValueError("complete-operator requires exactly 553 produced and zero missing IDs")
+    expected_leaf_count = len(B_PRIME_RELEASE_DOMAIN.production_leaf_ids)
+    if bundle_state == "complete-operator" and (
+        len(produced) != expected_leaf_count or missing
+    ):
+        raise ValueError(
+            "complete-operator requires exactly "
+            f"{expected_leaf_count} produced and zero missing IDs"
+        )
     if bundle_state == "complete-operator" and (
         len(campaign_roots) != campaign_spectral_receipt["root_count"]
         or hashlib.sha256(canonical_json_bytes(list(campaign_roots))).hexdigest()
