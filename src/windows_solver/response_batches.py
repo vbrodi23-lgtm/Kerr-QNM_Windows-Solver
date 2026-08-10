@@ -52,7 +52,7 @@ from .solved_leaf_cache import (
 )
 
 
-CAMPAIGN_SCHEMA_VERSION = 2
+CAMPAIGN_SCHEMA_VERSION = 3
 _PRECISION_DIGITS = frozenset({64, 80, 120})
 STAGE_SIGNED_ERROR_FAMILIES = (
     "signed-root",
@@ -1205,6 +1205,11 @@ def _read_checkpoint_envelope(
         "release_admissible",
     }:
         raise ValueError("campaign checkpoint envelope fields are invalid")
+    if value["schema_version"] == 2:
+        raise ValueError(
+            "campaign checkpoint uses the legacy branch-authentication contract; "
+            "preserve it as evidence and start with a fresh checkpoint path"
+        )
     if value["schema_version"] != CAMPAIGN_SCHEMA_VERSION:
         raise ValueError("campaign checkpoint schema is invalid")
     bindings = value["bindings"]
