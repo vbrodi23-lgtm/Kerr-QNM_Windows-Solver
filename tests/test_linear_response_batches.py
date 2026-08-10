@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from fractions import Fraction
 import json
 import hashlib
 import os
@@ -18,6 +19,8 @@ from windows_solver.response_batches import (
     PrecisionCapabilities,
     PrecisionFactoryIdentity,
     StageOutcome,
+    _campaign_execution_leaf_ids,
+    _checkpoint_mapping,
     build_campaign_plan,
     build_campaign_selection,
     synthetic_stage_signed_error_channels,
@@ -199,6 +202,202 @@ class CampaignPlanTests(unittest.TestCase):
                 leaf_ids=(selection.leaf_ids[0],),
                 cohort_ids=None,
             )
+
+    def test_primary_execution_is_mechanism_mode_then_ascending_spin(self) -> None:
+        """Catches regression to mode/spin/all-mechanisms campaign traversal."""
+
+        plan = build_campaign_plan(
+            policy=NumericalPolicy(),
+            backend_identity=VettedNativeDeterminantKernel.identity,
+            precision_capabilities=PrecisionCapabilities((64,)),
+        )
+        primary_ids = tuple(
+            leaf.leaf_id for leaf in plan.leaves if leaf.role == "primary"
+        )
+        selection = build_campaign_selection(
+            plan, role="primary", leaf_ids=primary_ids
+        )
+
+        class Backend:
+            identity = plan.backend_identity
+            precision_capabilities = plan.precision_capabilities
+
+            def __init__(self):
+                self.calls = []
+
+            def execute_stage(self, leaf, digits):
+                self.calls.append((
+                    leaf.mechanism_id,
+                    leaf.leaf.mode_label,
+                    leaf.leaf.coordinate,
+                ))
+                return _synthetic_stage_outcome(
+                    digits=digits,
+                    numerical_state="CONVERGED",
+                    component_result={"leaf_id": leaf.leaf_id},
+                    local_disk_radius_abs=1.0e-8,
+                )
+
+        backend = Backend()
+        with tempfile.TemporaryDirectory() as temporary:
+            checkpoint = Path(temporary) / "checkpoint.json"
+            summary = run_campaign_selection(
+                plan,
+                selection,
+                backend,
+                checkpoint,
+                resume=False,
+            )
+            authenticated = validate_campaign_checkpoint(plan, checkpoint)
+
+        expected = tuple(
+            (mechanism, mode, spin)
+            for mechanism in (
+                "horizon-admittance",
+                "exterior-light-ring",
+                "exterior-throat-kappa",
+                "exterior-alpha-half",
+                "exterior-fixed-r3",
+            )
+            for mode in ("220", "440", "330", "221", "441", "331", "222")
+            for spin in (
+                Fraction(19, 20),
+                Fraction(99, 100),
+                Fraction(999, 1000),
+                Fraction(9999, 10000),
+            )
+        )
+        self.assertEqual(tuple(backend.calls), expected)
+        self.assertEqual(
+            tuple(record.leaf_id for record in summary.records), primary_ids
+        )
+        self.assertEqual(
+            tuple(record.leaf_id for record in authenticated.records), primary_ids
+        )
+
+    def test_old_order_prefix_resumes_into_canonical_sparse_checkpoint(self) -> None:
+        """Catches traversal changes invalidating or overwriting solved prefixes."""
+
+        plan = build_campaign_plan(
+            policy=NumericalPolicy(),
+            backend_identity=VettedNativeDeterminantKernel.identity,
+            precision_capabilities=PrecisionCapabilities((64,)),
+        )
+        primary_ids = tuple(
+            leaf.leaf_id for leaf in plan.leaves if leaf.role == "primary"
+        )
+        full_selection = build_campaign_selection(
+            plan, role="primary", leaf_ids=primary_ids
+        )
+
+        class Backend:
+            identity = plan.backend_identity
+            precision_capabilities = plan.precision_capabilities
+
+            def __init__(self, fail_after=None):
+                self.calls = []
+                self.fail_after = fail_after
+
+            def execute_stage(self, leaf, digits):
+                if self.fail_after is not None and len(self.calls) >= self.fail_after:
+                    raise RuntimeError("stop after one newly scheduled leaf")
+                self.calls.append(leaf.leaf_id)
+                return _synthetic_stage_outcome(
+                    digits=digits,
+                    numerical_state="CONVERGED",
+                    component_result={"leaf_id": leaf.leaf_id},
+                    local_disk_radius_abs=1.0e-8,
+                )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            prefix_selection = build_campaign_selection(
+                plan, role="primary", leaf_ids=primary_ids[:2]
+            )
+            prefix_summary = run_campaign_selection(
+                plan,
+                prefix_selection,
+                Backend(),
+                directory / "prefix-source.json",
+                resume=False,
+            )
+            checkpoint = directory / "checkpoint.json"
+            checkpoint.write_bytes(canonical_json_bytes(
+                _checkpoint_mapping(
+                    plan, full_selection, prefix_summary.records
+                )
+            ))
+
+            resumed = Backend(fail_after=1)
+            with self.assertRaisesRegex(RuntimeError, "one newly scheduled"):
+                run_campaign_selection(
+                    plan,
+                    full_selection,
+                    resumed,
+                    checkpoint,
+                    resume=True,
+                )
+            try:
+                authenticated = validate_campaign_checkpoint(plan, checkpoint)
+            except ValueError as error:
+                self.fail(f"sparse resumed checkpoint was rejected: {error}")
+
+        leaf_by_id = {leaf.leaf_id: leaf for leaf in plan.leaves}
+        self.assertEqual(len(resumed.calls), 1)
+        newly_scheduled = leaf_by_id[resumed.calls[0]]
+        self.assertEqual(newly_scheduled.mechanism_id, "horizon-admittance")
+        self.assertEqual(newly_scheduled.leaf.mode_label, "220")
+        self.assertEqual(newly_scheduled.leaf.coordinate, Fraction(99, 100))
+        expected_ids = tuple(
+            leaf_id
+            for leaf_id in primary_ids
+            if leaf_id in {*primary_ids[:2], resumed.calls[0]}
+        )
+        self.assertEqual(
+            tuple(record.leaf_id for record in authenticated.records),
+            expected_ids,
+        )
+
+    def test_full_execution_prioritizes_projective_roles_and_physical_spin(self) -> None:
+        """Catches controls delaying projective rows or Mκ running away from extremality."""
+
+        plan = build_campaign_plan(
+            policy=NumericalPolicy(),
+            backend_identity=VettedNativeDeterminantKernel.identity,
+            precision_capabilities=PrecisionCapabilities((64, 80, 120)),
+        )
+        selection = build_campaign_selection(
+            plan, role="all", leaf_ids=None, cohort_ids=None
+        )
+        leaf_by_id = {leaf.leaf_id: leaf for leaf in plan.leaves}
+        ordered = tuple(
+            leaf_by_id[leaf_id]
+            for leaf_id in _campaign_execution_leaf_ids(plan, selection)
+        )
+
+        self.assertEqual(
+            tuple(leaf.role for leaf in ordered),
+            ("primary",) * 140 + ("deep",) * 48 + ("control",) * 24,
+        )
+        first_deep_chain = tuple(
+            leaf.leaf.coordinate
+            for leaf in ordered
+            if leaf.role == "deep"
+            and leaf.mechanism_id == "horizon-admittance"
+            and leaf.leaf.mode_label == "220"
+        )
+        self.assertEqual(
+            first_deep_chain,
+            (Fraction(1, 100), Fraction(1, 500), Fraction(1, 1000)),
+        )
+        control_mechanisms = tuple(dict.fromkeys(
+            leaf.mechanism_id for leaf in ordered if leaf.role == "control"
+        ))
+        self.assertEqual(control_mechanisms, (
+            "exterior-light-ring",
+            "exterior-throat-kappa",
+            "exterior-fixed-r3",
+        ))
 
     def test_checkpoint_resume_zero_work_and_tamper_are_strict(self) -> None:
         plan = build_campaign_plan(
