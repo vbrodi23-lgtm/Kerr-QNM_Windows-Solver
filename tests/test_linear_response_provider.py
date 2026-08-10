@@ -353,6 +353,21 @@ class LinearResponseEngineTests(unittest.TestCase):
             )
         )
 
+        large_correction = replace(
+            readout,
+            determinant_residual_abs=6.0e-3,
+            determinant_derivative_abs=1.0,
+        )
+        self.assertEqual(large_correction.branch_id, job.root.branch_id)
+        self.assertFalse(
+            root_readout_preserves_authenticated_branch(
+                large_correction,
+                job.root,
+                equation_id=job.equation_id,
+                source_root_mapping=job.source_root_mapping,
+            )
+        )
+
     def test_native_primary_uses_in_branch_predictor_without_preflight_and_keeps_seed_path_independent(
         self,
     ) -> None:
@@ -501,8 +516,9 @@ class LinearResponseEngineTests(unittest.TestCase):
             kernel_type.identity.source_commit,
             "0c1e8a3d3bca6e608c34e111476a4f6dcb73e86e",
         )
+        self.assertEqual(kernel_type.identity.implementation_version, "3")
         self.assertIn(
-            "adapted-source-native-gsn-adapter-contract-1",
+            "adapted-source-native-gsn-adapter-contract-2",
             kernel_type.identity.runtime_fingerprint,
         )
         self.assertIn("python-64bit", kernel_type.identity.runtime_fingerprint)
