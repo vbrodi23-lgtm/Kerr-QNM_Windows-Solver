@@ -23,6 +23,7 @@ from typing import Callable, Mapping
 from .contracts import canonical_json_bytes
 from .response_engine import (
     BackendIdentity,
+    ROOT_BRANCH_CONTINUATION_TOLERANCE_ABS,
     ResponseComponentJob,
     RootReadout,
     _exterior_support,
@@ -491,11 +492,33 @@ class JuliaPrecisionRootBackend:
         ):
             raise JuliaResponseBackendError("M02 Julia response contract is invalid")
         converged = response["root_converged"]
+        root = complex(
+            _finite_text(response["root_omega_re"], "root_omega_re"),
+            _finite_text(response["root_omega_im"], "root_omega_im"),
+        )
+        truncation_radius = _finite_text(
+            response["truncation_radius_abs"], "truncation_radius_abs"
+        )
+        resolution_radius = _finite_text(
+            response["resolution_radius_abs"], "resolution_radius_abs"
+        )
+        seed_path_radius = _finite_text(
+            response["seed_path_radius_abs"], "seed_path_radius_abs"
+        )
+        branch_continuation_valid = (
+            abs(root - job.root.omega)
+            <= ROOT_BRANCH_CONTINUATION_TOLERANCE_ABS
+            and all(
+                radius <= ROOT_BRANCH_CONTINUATION_TOLERANCE_ABS
+                for radius in (
+                    truncation_radius,
+                    resolution_radius,
+                    seed_path_radius,
+                )
+            )
+        )
         return RootReadout(
-            omega=complex(
-                _finite_text(response["root_omega_re"], "root_omega_re"),
-                _finite_text(response["root_omega_im"], "root_omega_im"),
-            ),
+            omega=root,
             determinant_residual_abs=_finite_text(
                 response["root_residual_abs"], "root_residual_abs"
             ),
@@ -505,18 +528,14 @@ class JuliaPrecisionRootBackend:
             converged=converged,
             root_reference_id=job.root.root_reference_id,
             branch_id=(
-                job.root.branch_id if converged else "nonmatching-julia-continuation"
+                job.root.branch_id
+                if branch_continuation_valid
+                else "nonmatching-julia-continuation"
             ),
             equation_id=job.equation_id,
-            truncation_radius=_finite_text(
-                response["truncation_radius_abs"], "truncation_radius_abs"
-            ),
-            resolution_radius=_finite_text(
-                response["resolution_radius_abs"], "resolution_radius_abs"
-            ),
-            seed_path_radius=_finite_text(
-                response["seed_path_radius_abs"], "seed_path_radius_abs"
-            ),
+            truncation_radius=truncation_radius,
+            resolution_radius=resolution_radius,
+            seed_path_radius=seed_path_radius,
         )
 
     def closed_form_horizon_response(
