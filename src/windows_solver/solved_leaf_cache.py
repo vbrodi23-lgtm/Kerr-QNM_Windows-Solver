@@ -108,9 +108,8 @@ class SolvedLeafStore:
 
     @classmethod
     def default(cls) -> "SolvedLeafStore":
-        override = os.environ.get("KERR_QNM_SOLVED_LEAF_STORE")
-        if override:
-            return cls(override)
+        """Return the fixed per-user production store for this platform."""
+
         local = os.environ.get("LOCALAPPDATA")
         if local:
             return cls(
