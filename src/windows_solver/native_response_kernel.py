@@ -51,7 +51,7 @@ _DERIVATIVE_STEP = 1.0e-5
 _ROOT_TOLERANCE = 2.0e-11
 # Stable across source checkouts and wheels; source_commit/source_blobs below
 # retain the authenticated upstream code identity.
-_ADAPTED_SOURCE_CONTRACT_ID = "native-gsn-adapter-contract-1"
+_ADAPTED_SOURCE_CONTRACT_ID = "native-gsn-adapter-contract-2"
 _GENERATED_INPUT_CONTRACT_ID = "julia-exact-f-u-cache-contract-1"
 _POTENTIAL_SOURCE_PATH = (
     Path(__file__).resolve().parent / "data" / "native_kernel" / "potentials.fixture"
@@ -111,7 +111,7 @@ def _reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]
 def _native_identity() -> BackendIdentity:
     return BackendIdentity(
         backend_id="vetted-native-gsn-determinant",
-        implementation_version="2",
+        implementation_version="3",
         source_commit=_SOURCE_COMMIT,
         source_blobs=_SOURCE_BLOBS,
         runtime_fingerprint=(
