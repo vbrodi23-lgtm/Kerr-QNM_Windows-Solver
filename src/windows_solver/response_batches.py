@@ -29,8 +29,8 @@ from .response_engine import (
     RECORDED_REPLAY_BACKEND_ID,
     RecordedReplayBackend,
     ResponseComponentJob,
-    ROOT_BRANCH_CONTINUATION_TOLERANCE_ABS,
     VettedNativeDeterminantKernel,
+    root_readout_preserves_authenticated_branch,
     run_component,
 )
 from .gsn_cache_producer import (
@@ -1400,18 +1400,23 @@ def _validate_component_result(
     }
     if dict(result.lineage) != expected_lineage:
         raise ValueError("campaign production component lineage is invalid")
-    for readout in result.raw_readouts:
+    for readout_index, readout in enumerate(result.raw_readouts):
         if (
             readout.root_reference_id != job.root.root_reference_id
             or readout.branch_id != job.root.branch_id
             or readout.equation_id != job.equation_id
         ):
             raise ValueError("campaign production readout lineage is invalid")
-    if (
-        abs(result.baseline.omega - job.root.omega)
-        > ROOT_BRANCH_CONTINUATION_TOLERANCE_ABS
-    ):
-        raise ValueError("campaign production baseline root is invalid")
+        if not root_readout_preserves_authenticated_branch(
+            readout,
+            job.root,
+            equation_id=job.equation_id,
+            source_root_mapping=job.source_root_mapping,
+        ):
+            kind = "baseline" if readout_index == 0 else "perturbed"
+            raise ValueError(
+                f"campaign production {kind} root readout evidence is invalid"
+            )
     return True
 
 
@@ -1838,10 +1843,12 @@ def _publish_terminal_solved_leaf(
             ProgressEventKind.LEAF_CACHE_PUBLISHED,
             state=record.state,
             stage_count=len(record.stages),
+            store_path=str(store.root),
         )
     except (OSError, RuntimeError, ValueError) as error:
         emit_progress(
             ProgressEventKind.LEAF_CACHE_PUBLICATION_FAILED,
+            store_path=str(store.root),
             error_type=type(error).__name__,
             message=str(error),
         )
@@ -2092,9 +2099,10 @@ def _run_campaign_selection_active(
             )
 
         if record.state in {"PRODUCED", "UNRESOLVED"}:
-            _publish_terminal_solved_leaf(
-                plan, leaf, record, solved_leaf_store
-            )
+            with progress_scope(**context):
+                _publish_terminal_solved_leaf(
+                    plan, leaf, record, solved_leaf_store
+                )
             response = _produced_response(record)
             if response is not None:
                 continuation_responses[continuation_key] = response
@@ -2211,9 +2219,10 @@ def _run_campaign_selection_active(
                 )
 
         if record.state in {"PRODUCED", "UNRESOLVED"}:
-            _publish_terminal_solved_leaf(
-                plan, leaf, record, solved_leaf_store
-            )
+            with progress_scope(**context):
+                _publish_terminal_solved_leaf(
+                    plan, leaf, record, solved_leaf_store
+                )
             response = _produced_response(record)
             if response is not None:
                 continuation_responses[continuation_key] = response
@@ -2277,9 +2286,10 @@ def _run_campaign_selection_active(
                 record=record,
             )
         if record.state in {"PRODUCED", "UNRESOLVED"}:
-            _publish_terminal_solved_leaf(
-                plan, leaf, record, solved_leaf_store
-            )
+            with progress_scope(**context):
+                _publish_terminal_solved_leaf(
+                    plan, leaf, record, solved_leaf_store
+                )
             response = _produced_response(record)
             if response is not None:
                 continuation_responses[continuation_key] = response
