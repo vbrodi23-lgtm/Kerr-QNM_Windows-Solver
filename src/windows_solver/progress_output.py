@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, TextIO
 from uuid import uuid4
 
 from .campaign_reports import CampaignReportModel, refresh_campaign_reports
+from .precision_tiers import precision_tier_presentation
 from .progress import PROGRESS_SCHEMA, ProgressEvent, ProgressEventKind, ProgressMode
 
 if TYPE_CHECKING:
@@ -906,6 +907,12 @@ class CampaignProgressReporter:
                 "real": row.get("signed_root_crosscheck_real"),
                 "imaginary": row.get("signed_root_crosscheck_imaginary"),
             }
+        result_precision = None if row is None else row.get("precision_digits")
+        precision = (
+            None
+            if result_precision is None
+            else precision_tier_presentation(result_precision)
+        )
         projective_state = None
         bounds = None
         if projective is not None:
@@ -920,9 +927,20 @@ class CampaignProgressReporter:
         return (
             ("LatestResult", latest_leaf_id),
             ("ResultState", None if row is None else row.get("terminal_state")),
+            ("ResultPrecision", result_precision),
             (
-                "ResultPrecision",
-                None if row is None else row.get("precision_digits"),
+                "ResultPrecisionTier",
+                None if precision is None else precision.precision_tier,
+            ),
+            (
+                "ResultPrecisionDecimalDigitsNominal",
+                None
+                if precision is None
+                else precision.nominal_decimal_digits,
+            ),
+            (
+                "ResultPrecisionLabel",
+                None if precision is None else precision.presentation_label,
             ),
             ("ResultMode", None if row is None else row.get("mode")),
             ("ResultSpin", None if row is None else row.get("spin_or_Mkappa")),
@@ -1211,7 +1229,7 @@ class CampaignProgressReporter:
         )
         if value is None:
             return ""
-        return f"{self._dashboard_value(value)} digits"
+        return precision_tier_presentation(value).presentation_label
 
     @staticmethod
     def _mapping_value(value: object, key: str) -> object:
@@ -1497,7 +1515,10 @@ class CampaignProgressReporter:
         if context["mechanism_id"] is not None:
             parts.append(f" mechanism={context['mechanism_id']}")
         if context["precision_digits"] is not None:
-            parts.append(f" precision={context['precision_digits']}")
+            precision = precision_tier_presentation(
+                context["precision_digits"]
+            )
+            parts.append(f" precision={precision.presentation_label}")
         if context["component_pass"] is not None:
             parts.append(f" component={context['component_pass']}")
         if context["readout_role"] is not None:
