@@ -108,12 +108,13 @@ class NativeProgressTests(unittest.TestCase):
         from windows_solver.response_engine import HorizonPerturbation
 
         with activate_progress(observer):
-            kernel.evaluate_root(
+            kernel.evaluate_root_with_predictor_kind(
                 job=job,
                 background_root=job.root,
                 perturbation=HorizonPerturbation(0.0j, job.spin, job.mode.m),
                 policy=job.policy,
                 primary_predictor=base + complex(5.0e-5, -2.0e-5),
+                primary_predictor_kind="SPIN_CONTINUATION",
             )
 
         starts = [event for event in observer.events if event.kind is ProgressEventKind.ROOT_PHASE_STARTED]
@@ -126,13 +127,13 @@ class NativeProgressTests(unittest.TestCase):
         self.assertEqual(
             [event.payload["seed_kind"] for event in seeds],
             [
-                "EPSILON_CONTINUATION",
+                "SPIN_CONTINUATION",
                 "ACCEPTED_PRIMARY",
                 "ACCEPTED_PRIMARY",
                 "INDEPENDENT_SEED_PATH",
             ],
         )
-        self.assertEqual(seeds[0].payload["requested_seed_kind"], "EPSILON_CONTINUATION")
+        self.assertEqual(seeds[0].payload["requested_seed_kind"], "SPIN_CONTINUATION")
         self.assertIs(seeds[0].payload["fallback_used"], False)
         self.assertEqual(
             seeds[-1].payload["seed_omega"],
