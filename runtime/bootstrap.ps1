@@ -713,6 +713,25 @@ function Get-CompatibleLegacyM02Environment {
 if ($PowerShell51Smoke) {
     $smokeRoot = Join-Path ([IO.Path]::GetTempPath()) ("Kerr-QNM-bootstrap-smoke-" + [Guid]::NewGuid().ToString("N"))
     try {
+        # GitHub's stripped Windows PowerShell test host may not auto-load the
+        # module that provides Get-FileHash. The normal bootstrap keeps its
+        # production hash function; this no-Julia smoke uses the same SHA-256
+        # bytes through the framework directly.
+        function Get-Sha256([string]$Path) {
+            $stream = [IO.File]::OpenRead($Path)
+            try {
+                $sha = [System.Security.Cryptography.SHA256]::Create()
+                try {
+                    return ([BitConverter]::ToString($sha.ComputeHash($stream))).Replace("-", "").ToLowerInvariant()
+                }
+                finally {
+                    $sha.Dispose()
+                }
+            }
+            finally {
+                $stream.Dispose()
+            }
+        }
         New-Item -ItemType Directory -Force -Path (Join-Path $smokeRoot "child") | Out-Null
         Remove-ManagedDirectory $smokeRoot "PowerShell compatibility smoke"
         if (Test-Path -LiteralPath $smokeRoot) {
