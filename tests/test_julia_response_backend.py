@@ -147,6 +147,57 @@ class JuliaResponseBackendTests(unittest.TestCase):
         self.assertTrue(readout.converged)
         self.assertEqual(backend.scientific_runtime["precision_digits"], 80)
 
+    def test_promoted_nonconvergence_preserves_authenticated_branch(self):
+        """Catches relabelling an in-radius Julia failure as branch loss."""
+
+        class NonconvergedAdapter(FakeAdapter):
+            def evaluate(self, request):
+                response = super().evaluate(request)
+                response.update({
+                    "root_omega_re": request["omega"]["real"],
+                    "root_omega_im": request["omega"]["imaginary"],
+                    "root_residual_abs": "5e-11",
+                    "root_converged": False,
+                })
+                return response
+
+        job = _deep_job()
+        backend = JuliaPrecisionRootBackend(
+            VettedNativeDeterminantKernel.identity,
+            NonconvergedAdapter(),
+            80,
+        )
+
+        readout = backend.read_root(job, 0.0j)
+
+        self.assertFalse(readout.converged)
+        self.assertEqual(readout.branch_id, job.root.branch_id)
+
+    def test_promoted_branch_radius_violation_marks_nonmatching_identity(self):
+        """Catches authenticating a Julia root outside the continuation radius."""
+
+        class OutsideBranchAdapter(FakeAdapter):
+            def evaluate(self, request):
+                response = super().evaluate(request)
+                response.update({
+                    "root_omega_re": str(float(request["omega"]["real"]) + 0.006),
+                    "root_omega_im": request["omega"]["imaginary"],
+                    "root_converged": False,
+                })
+                return response
+
+        job = _deep_job()
+        backend = JuliaPrecisionRootBackend(
+            VettedNativeDeterminantKernel.identity,
+            OutsideBranchAdapter(),
+            80,
+        )
+
+        readout = backend.read_root(job, 0.0j)
+
+        self.assertFalse(readout.converged)
+        self.assertEqual(readout.branch_id, "nonmatching-julia-continuation")
+
     def test_promoted_backend_forwards_optional_primary_predictor(self):
         """Catches promoted precision reverting to background-only PRIMARY seeds."""
 
