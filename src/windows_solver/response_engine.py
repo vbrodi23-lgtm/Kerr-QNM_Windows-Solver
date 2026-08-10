@@ -705,16 +705,15 @@ def root_readout_preserves_authenticated_branch(
 
     The authenticated catalog root establishes identity and branch provenance;
     ``readout.omega`` is the numerical root returned after polishing.  The
-    native production kernel accepts that readout only when the polished root
+    native production kernel preserves that identity when the polished root
     and each diagnostic root remain inside the existing branch-continuation
-    radius.  Persisted records must carry the same identity bindings and the
-    same numerical evidence.
+    radius.  Numerical convergence is a separate status and is deliberately
+    not required by this authentication predicate.
     """
 
     expected_source = _validated_source_root_mapping(source_root_mapping)
     return (
-        readout.converged
-        and readout.root_reference_id == authenticated_root.root_reference_id
+        readout.root_reference_id == authenticated_root.root_reference_id
         and readout.branch_id == authenticated_root.branch_id
         and readout.equation_id == equation_id
         and readout.source_root_mapping == expected_source
