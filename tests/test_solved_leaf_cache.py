@@ -84,9 +84,9 @@ _POLISHED_BASELINES = {
     ),
 }
 _POLISHED_IDENTITIES = {
-    "b-prime-leaf-4c8594e4a59486a1c56206e41cd7f7f3ff1ab5193a5ff6b699cbe9492bc45355": "8855b718c70469bd287554caa82e17caaa6e42278b9477d931586736b8f10d5f",
-    "b-prime-leaf-0f36daefa853de1280f17c8b8ef89bbaf9b34f5e5044a5eb85bc563d3896b60d": "ca92ccd62de8aefb282b91d020e3adf28f40484d9d8f935fb1b1e1b157873d62",
-    "b-prime-leaf-08b8dc3df83fc1304a61d8b6105c412a316a44816ca229d375573fdf72ac0a57": "7188b9d5ce7f8cbfcb2f56783b780e1edb962c50ed58f8c38f4f50d20ffbe1a2",
+    "b-prime-leaf-4c8594e4a59486a1c56206e41cd7f7f3ff1ab5193a5ff6b699cbe9492bc45355": "40452ba3d26daca8cc45de2f279ee09883f232842217bd5090be078f7f472213",
+    "b-prime-leaf-0f36daefa853de1280f17c8b8ef89bbaf9b34f5e5044a5eb85bc563d3896b60d": "94edef60dc4b4b82214f5b2a194a59ceee92977dfd299c2562eb779b290bbf2f",
+    "b-prime-leaf-08b8dc3df83fc1304a61d8b6105c412a316a44816ca229d375573fdf72ac0a57": "4a83d582a118b46cc7d077663bcb64e1feb7b3520f6460eccd2ce0897cd32230",
 }
 
 
@@ -231,8 +231,29 @@ def _frozen_predecessor_precision_contract(leaf):
     }
 
 
-def _frozen_predecessor_scientific_identity(plan, leaf):
-    """Rebuild the exact pre-recovery identity without production helpers."""
+def _frozen_previous_recovery_contract():
+    """The pre-PR-33 PRIMARY recovery contract, independent of production."""
+
+    return {
+        "binary64_trigger": {
+            "component_status": ComponentStatus.NOT_CONVERGED.value,
+            "requires_canonical_production_evidence": True,
+        },
+        "recovery_digits": [80, 120],
+        "precision120_gates": {
+            "component_status": ComponentStatus.NOT_CONVERGED.value,
+            "self_refinement_enclosed": False,
+            "discrepancy_enclosed": False,
+        },
+        "precision120_terminal_success": {
+            "component_status": ComponentStatus.CONVERGED.value,
+            "discrepancy_enclosed": True,
+        },
+    }
+
+
+def _frozen_scientific_identity(plan, leaf, precision_contract):
+    """Build an independently frozen one-leaf scientific identity."""
 
     material = {
         "schema_version": 1,
@@ -249,9 +270,25 @@ def _frozen_predecessor_scientific_identity(plan, leaf):
         "mechanism_id": leaf.mechanism_id,
         "response_job": leaf.job.to_mapping(),
         "precision_factory_identity": plan.precision_factory_identity.to_mapping(),
-        "precision_contract": _frozen_predecessor_precision_contract(leaf),
+        "precision_contract": precision_contract,
     }
     return hashlib.sha256(canonical_json_bytes(material)).hexdigest()
+
+
+def _frozen_predecessor_scientific_identity(plan, leaf):
+    """Rebuild the exact pre-recovery identity without production helpers."""
+
+    return _frozen_scientific_identity(
+        plan, leaf, _frozen_predecessor_precision_contract(leaf)
+    )
+
+
+def _frozen_previous_recovery_scientific_identity(plan, leaf):
+    """Rebuild the exact pre-PR-33 PRIMARY identity independently."""
+
+    contract = _frozen_predecessor_precision_contract(leaf)
+    contract["primary_recovery"] = _frozen_previous_recovery_contract()
+    return _frozen_scientific_identity(plan, leaf, contract)
 
 
 def _windows_production_plan():
@@ -607,7 +644,7 @@ class SolvedLeafCacheTests(unittest.TestCase):
         )
         self.assertEqual(
             scientific_computation_identity_sha256(plan, leaf),
-            "c968d7616d54a296278148638f96576e7c4dfb9d666b72790f882a0e55f46416",
+            "05a1cdc4acd9bbfcfd12bfdbf7882d726dc65a1c761457b3d961d4be2203e6df",
         )
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -743,6 +780,141 @@ class SolvedLeafCacheTests(unittest.TestCase):
                 current_lookup.receipt["source_type"],
                 "imported-authenticated-checkpoint",
             )
+
+    def test_exact_previous_recovery_binary64_success_migrates_without_execution(self):
+        """Catches invalidating the three clean preloaded binary64 successes."""
+
+        plan = build_campaign_plan(
+            policy=NumericalPolicy(),
+            backend_identity=VettedNativeDeterminantKernel.identity,
+            precision_capabilities=PrecisionCapabilities((64, 80)),
+        )
+        leaf = next(item for item in plan.leaves if item.role == "primary")
+        selection = build_campaign_selection(
+            plan, role="primary", leaf_ids=(leaf.leaf_id,)
+        )
+        previous_identity = _frozen_previous_recovery_scientific_identity(
+            plan, leaf
+        )
+        current_identity = scientific_computation_identity_sha256(plan, leaf)
+        self.assertNotEqual(current_identity, previous_identity)
+
+        class Backend:
+            identity = plan.backend_identity
+            precision_capabilities = plan.precision_capabilities
+
+            def execute_stage(self, selected, digits):
+                raise AssertionError(
+                    "previous-policy binary64 success reached stage execution"
+                )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            store = SolvedLeafStore(root / "solved")
+            previous = _legacy_primary_record(
+                plan, leaf, ComponentStatus.CONVERGED
+            )
+            store.publish(
+                scientific_identity_sha256=previous_identity,
+                leaf_id=leaf.leaf_id,
+                record=previous.to_mapping(),
+                source_type="originating-campaign",
+            )
+
+            summary = run_campaign_selection(
+                plan,
+                selection,
+                Backend(),
+                root / "migrated.json",
+                resume=False,
+                solved_leaf_store=store,
+            )
+
+            self.assertEqual(summary.executed_stage_count, 0)
+            self.assertEqual(summary.records[0].to_mapping(), previous.to_mapping())
+            self.assertIs(
+                store.lookup(previous_identity, leaf.leaf_id).status,
+                SolvedLeafLookupStatus.HIT,
+            )
+            self.assertIs(
+                store.lookup(current_identity, leaf.leaf_id).status,
+                SolvedLeafLookupStatus.HIT,
+            )
+
+    def test_previous_recovery_promoted_receipt_stays_stale_and_recomputes(self):
+        """Catches reusing a 10⁻⁶²-stage result under the practical policy."""
+
+        plan = build_campaign_plan(
+            policy=NumericalPolicy(),
+            backend_identity=VettedNativeDeterminantKernel.identity,
+            precision_capabilities=PrecisionCapabilities((64, 80)),
+        )
+        leaf = next(item for item in plan.leaves if item.role == "primary")
+        selection = build_campaign_selection(
+            plan, role="primary", leaf_ids=(leaf.leaf_id,)
+        )
+        previous_identity = _frozen_previous_recovery_scientific_identity(
+            plan, leaf
+        )
+        current_identity = scientific_computation_identity_sha256(plan, leaf)
+        self.assertNotEqual(current_identity, previous_identity)
+        stage64 = _production_outcome(
+            leaf, status=ComponentStatus.NOT_CONVERGED
+        )
+        stage80 = replace(
+            _production_outcome(leaf, digits=80),
+            self_refinement_enclosed=True,
+            discrepancy_from_previous_abs=1.0e-19,
+            discrepancy_enclosed=True,
+        )
+        provenance = {
+            "precision_factory_identity": (
+                plan.precision_factory_identity.to_mapping()
+            ),
+            "available_precision_digits": [64, 80],
+        }
+        previous = CampaignLeafRecord(
+            leaf_id=leaf.leaf_id,
+            role="primary",
+            state="PRODUCED",
+            stages=(
+                CampaignStageRecord(stage64, provenance),
+                CampaignStageRecord(stage80, provenance),
+            ),
+        )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            store = SolvedLeafStore(root / "solved")
+            store.publish(
+                scientific_identity_sha256=previous_identity,
+                leaf_id=leaf.leaf_id,
+                record=previous.to_mapping(),
+                source_type="originating-campaign",
+            )
+            backend = _ConvergedProductionBackend(plan)
+
+            summary = run_campaign_selection(
+                plan,
+                selection,
+                backend,
+                root / "recomputed.json",
+                resume=False,
+                solved_leaf_store=store,
+            )
+
+            self.assertEqual(backend.calls, [(leaf.leaf_id, 64)])
+            self.assertEqual(summary.executed_stage_count, 1)
+            self.assertEqual(len(summary.records[0].stages), 1)
+            self.assertIs(
+                store.lookup(previous_identity, leaf.leaf_id).status,
+                SolvedLeafLookupStatus.HIT,
+            )
+            self.assertIs(
+                store.lookup(current_identity, leaf.leaf_id).status,
+                SolvedLeafLookupStatus.HIT,
+            )
+            self.assertFalse((store.root / "quarantine").exists())
 
     def test_legacy_primary_unresolved_record_recomputes_through_recovery_ladder(self):
         """Catches reusing a legacy UNRESOLVED record that must enter recovery."""
