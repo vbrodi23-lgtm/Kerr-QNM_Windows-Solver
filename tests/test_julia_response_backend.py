@@ -4,10 +4,15 @@ from decimal import Decimal
 import hashlib
 import io
 import json
+import os
 from pathlib import Path
+import subprocess
+import sys
+import threading
 from types import SimpleNamespace
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from windows_solver.contracts import canonical_json_bytes
 from windows_solver.julia_response_backend import (
@@ -16,6 +21,7 @@ from windows_solver.julia_response_backend import (
     JuliaResponseAdapter,
     JuliaResponseBackendError,
     _forward_julia_progress_line,
+    _run_streamed_julia,
 )
 from windows_solver.progress import PROGRESS_SCHEMA, ProgressEventKind, activate_progress
 from windows_solver.response_batches import (
@@ -75,6 +81,52 @@ class FakeAdapter:
 
 
 class JuliaResponseBackendTests(unittest.TestCase):
+    def test_streamed_worker_progress_and_heartbeat_are_serialized(self):
+        """Catches a live Julia child becoming invisible between stdout events."""
+
+        class Observer:
+            def __init__(self):
+                self.events = []
+                self.thread_ids = []
+
+            def publish(self, event):
+                self.events.append(event)
+                self.thread_ids.append(threading.get_ident())
+
+        worker_event = JULIA_PROGRESS_PREFIX + json.dumps({
+            "schema": PROGRESS_SCHEMA,
+            "kind": "suboperation_started",
+            "context": {"suboperation": "r-from-rho"},
+            "payload": {"suboperation": "r-from-rho"},
+        })
+        script = (
+            "import time; "
+            f"print({worker_event!r}, flush=True); "
+            "time.sleep(0.08)"
+        )
+        observer = Observer()
+        caller_thread = threading.get_ident()
+
+        with patch(
+            "windows_solver.julia_response_backend._WORKER_HEARTBEAT_SECONDS",
+            0.01,
+            create=True,
+        ):
+            with activate_progress(observer):
+                completed = _run_streamed_julia(
+                    (sys.executable, "-c", script),
+                    cwd=Path.cwd(),
+                    env=os.environ,
+                    timeout=5,
+                )
+
+        kinds = [event.kind.value for event in observer.events]
+        self.assertEqual(completed.returncode, 0)
+        self.assertIn("suboperation_started", kinds)
+        self.assertIn("worker_heartbeat", kinds)
+        self.assertTrue(observer.thread_ids)
+        self.assertEqual(set(observer.thread_ids), {caller_thread})
+
     def test_package_worker_declares_line_flushed_inner_progress_without_request_changes(self):
         worker = (
             Path(__file__).resolve().parents[1]
