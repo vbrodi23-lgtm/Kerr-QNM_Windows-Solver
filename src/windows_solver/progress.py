@@ -58,6 +58,7 @@ class ProgressEventKind(StrEnum):
     REQUEST_VALIDATED = "request_validated"
     REQUEST_COMPLETED = "request_completed"
     REQUEST_FAILED = "request_failed"
+    WORKER_HEARTBEAT = "worker_heartbeat"
     ERROR = "error"
 
 
