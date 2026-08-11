@@ -244,10 +244,8 @@ function branch_values(::Type{T}, request, omega::Complex{T}, match_radius::T) w
     _, lambda = progress_operation("angular") do
         angular_constants(T, s, ell, m, a, omega, seed_A, pad, digits)
     end
-    tolerance = min(
-        parse_real(T, request, "ode_relative_tolerance"),
-        parse_real(T, request, "ode_absolute_tolerance"),
-    )
+    relative_tolerance = parse_real(T, request, "ode_relative_tolerance")
+    absolute_tolerance = parse_real(T, request, "ode_absolute_tolerance")
     order = parse_integer(request, "endpoint_series_order")
     rho_in = parse_real(T, request, "rho_in")
     rho_out = parse_real(T, request, "rho_out")
@@ -258,22 +256,24 @@ function branch_values(::Type{T}, request, omega::Complex{T}, match_radius::T) w
     sign_negative = CF.determine_sign(p_h)
     sign_positive = CF.determine_sign(omega)
     dtype = Complex{T}
-    radius_from_rho = CF.solve_r_from_rho(
-        a, beta_negative, beta_positive, rs_match, rho_in, rho_out;
-        sign_neg=sign_negative,
-        sign_pos=sign_positive,
-        dtype=dtype,
-        reltol=tolerance,
-        abstol=tolerance,
-    )
+    radius_from_rho = progress_operation("r-from-rho") do
+        CF.solve_r_from_rho(
+            a, beta_negative, beta_positive, rs_match, rho_in, rho_out;
+            sign_neg=sign_negative,
+            sign_pos=sign_positive,
+            dtype=dtype,
+            reltol=relative_tolerance,
+            abstol=absolute_tolerance,
+        )
+    end
     xin, _, _ = progress_operation("Xin") do
         CF.solve_Xin(
             s, m, a, beta_positive, beta_negative, omega, lambda,
             radius_from_rho, rs_match, rho_in, rho_out;
             initialconditions_order=order,
             dtype=dtype,
-            reltol=tolerance,
-            abstol=tolerance,
+            reltol=relative_tolerance,
+            abstol=absolute_tolerance,
         )
     end
     xup, _, _ = progress_operation("Xup") do
@@ -282,8 +282,8 @@ function branch_values(::Type{T}, request, omega::Complex{T}, match_radius::T) w
             radius_from_rho, rs_match, rho_in, rho_out;
             initialconditions_order=order,
             dtype=dtype,
-            reltol=tolerance,
-            abstol=tolerance,
+            reltol=relative_tolerance,
+            abstol=absolute_tolerance,
         )
     end
     xin_match = xin(zero(T))
