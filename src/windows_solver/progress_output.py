@@ -1232,15 +1232,6 @@ class CampaignProgressReporter:
         self, record: Mapping[str, object], maximum_rows: int
     ) -> list[str]:
         fields = dict(self._dashboard_fields(record))
-        latest = self._latest_completed_leaf_lines(fields)
-        response = next(
-            (line for line in latest if line.startswith(" Response")),
-            " No scientific result payload.",
-        )
-        disk = next(
-            (line for line in latest if line.startswith(" Local disk")),
-            "",
-        )
         leading = [
             "==============================================================",
             " M02 KERR-QNM SCIENTIFIC DASHBOARD",
@@ -1270,11 +1261,6 @@ class CampaignProgressReporter:
                 f" Spin           {self._dashboard_value(fields.get('ResultSpin') or self._dashboard_state.get('spin'))}"
                 f" | Precision {self._precision_value(fields)}"
             ),
-            self._dashboard_field_line(
-                "Convergence", fields.get("Convergence")
-            ),
-            response,
-            disk,
             "",
             *self._current_execution_lines(compact=True),
         ]
@@ -1303,9 +1289,9 @@ class CampaignProgressReporter:
 
         model = self._campaign_report_model
         header = (
-            f"{'ROOT':<20} {'PREC':>4} {'RESULT':<18} {'CONVERGED':<9} "
+            f"{'ROOT':<16} {'PRECISION':<21} {'RESULT':<13} {'CONVERGED':<9} "
             f"{'BRANCH_OK':<9} {'D_ABS':>10} {'D_OVER_TOL':>11} "
-            f"{'NEWTON_DW':>11} {'DELTA_ROOT':>11}"
+            f"{'NEWTON_DW':>10} {'DELTA_ROOT':>10}"
         )
         if model is None or not model.precision_stage_rows:
             return [
@@ -1359,16 +1345,13 @@ class CampaignProgressReporter:
                 " CURRENTLY EXECUTING",
                 f" Root           {self._dashboard_value(root)} | {self._dashboard_value(precision)}",
                 f" Mechanism      {self._dashboard_value(mechanism)} | Phase {self._dashboard_value(phase)} | RUNNING",
-                self._dashboard_field_line("Promoted by", promotion),
-                f" Seed           {self._dashboard_value(seed)} | authenticated {seed_authenticated} | Branch {branch_valid}",
+                f" Promoted by    {self._dashboard_value(promotion)} | Branch {branch_valid}",
                 f" Worker         {self._dashboard_value(worker)} | Tier elapsed {self._dashboard_value(tier_elapsed)}",
-                self._dashboard_field_line("Last activity", activity),
-                "",
+                f" Activity       {self._dashboard_value(activity)} | Seed authenticated {seed_authenticated}",
                 " LIVE ROOT SOLVE",
                 f" Newton         {newton} | Determinant {self._dashboard_value(determinant)} | Suboperation {self._dashboard_value(suboperation)}",
                 self._dashboard_field_line("Current ω", current_omega),
                 f" |D|            {determinant_abs} | Best |D| {best_determinant_abs}",
-                "",
             ]
         return [
             "",
@@ -1508,11 +1491,18 @@ class CampaignProgressReporter:
         displacement = cls._precision_stage_number(
             row.get("root_displacement_abs")
         )
-        precision = cls._precision_stage_text(row.get("precision_digits"))
+        precision_digits = row.get("precision_digits")
+        precision = (
+            "-"
+            if precision_digits is None
+            else precision_tier_presentation(
+                precision_digits
+            ).presentation_label
+        )
         return (
-            f"{root:<20.20} {precision:>4.4} {result:<18.18} "
+            f"{root:<16.16} {precision:<21.21} {result:<13.13} "
             f"{converged:<9.9} {branch_ok:<9.9} {determinant:>10.10} "
-            f"{over_tolerance:>11.11} {newton:>11.11} {displacement:>11.11}"
+            f"{over_tolerance:>11.11} {newton:>10.10} {displacement:>10.10}"
         )
 
     @staticmethod

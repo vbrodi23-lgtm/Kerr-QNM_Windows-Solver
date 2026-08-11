@@ -13,6 +13,7 @@ from windows_solver.linear_response import B_PRIME_RELEASE_DOMAIN
 from windows_solver.response_batches import (
     PrecisionCapabilities,
     StageOutcome,
+    _primary_recovery_precision_contract,
     _produced_response,
     build_campaign_plan,
     build_campaign_selection,
@@ -194,6 +195,46 @@ def _replace_component_result_fields(
 
 
 class PrimaryPrecisionTests(unittest.TestCase):
+    def test_primary_recovery_contract_binds_promoted_numerical_controls(self):
+        """Catches changing promoted tolerances without changing policy identity."""
+
+        contract = _primary_recovery_precision_contract()
+
+        self.assertEqual(contract["recovery_digits"], [80, 120])
+        self.assertEqual(
+            contract["promoted_numerical_controls"],
+            {
+                "80": {
+                    "base": {
+                        "root_tolerance": "1e-18",
+                        "ode_relative_tolerance": "1e-18",
+                        "ode_absolute_tolerance": "1e-20",
+                        "frequency_step": "1e-6",
+                    },
+                    "refinement": {
+                        "root_tolerance": "1e-20",
+                        "ode_relative_tolerance": "1e-20",
+                        "ode_absolute_tolerance": "1e-20",
+                        "frequency_step": "1e-7",
+                    },
+                },
+                "120": {
+                    "base": {
+                        "root_tolerance": "1e-102",
+                        "ode_relative_tolerance": "1e-102",
+                        "ode_absolute_tolerance": "1e-104",
+                        "frequency_step": "1e-60",
+                    },
+                    "refinement": {
+                        "root_tolerance": "1e-106",
+                        "ode_relative_tolerance": "1e-106",
+                        "ode_absolute_tolerance": "1e-108",
+                        "frequency_step": "1e-60",
+                    },
+                },
+            },
+        )
+
     def test_authenticated_primary_not_converged_recovers_at_80_or_each_120_gate(self) -> None:
         """Catches PRIMARY records terminalized at binary64 instead of recovered."""
 

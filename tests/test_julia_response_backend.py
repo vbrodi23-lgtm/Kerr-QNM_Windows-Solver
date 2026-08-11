@@ -212,7 +212,7 @@ class JuliaResponseBackendTests(unittest.TestCase):
         self.assertIs(observer.events[0].kind, ProgressEventKind.NEWTON_ITERATION_STARTED)
         self.assertEqual(observer.events[0].context.phase, "PRIMARY")
 
-    def test_promoted_backend_uses_bigfloat_policy_without_binary64_tolerances(self):
+    def test_promoted_backend_uses_practical_80_digit_policy(self):
         job = _deep_job()
         adapter = FakeAdapter()
         backend = JuliaPrecisionRootBackend(
@@ -224,8 +224,10 @@ class JuliaResponseBackendTests(unittest.TestCase):
         request = adapter.requests[0]
         self.assertEqual(request["precision_digits"], 80)
         self.assertEqual(request["working_precision_bits"], 298)
-        self.assertEqual(request["policy"]["ode_relative_tolerance"], "1e-62")
-        self.assertEqual(request["policy"]["root_tolerance"], "1e-62")
+        self.assertEqual(request["policy"]["root_tolerance"], "1e-18")
+        self.assertEqual(request["policy"]["ode_relative_tolerance"], "1e-18")
+        self.assertEqual(request["policy"]["ode_absolute_tolerance"], "1e-20")
+        self.assertEqual(request["policy"]["frequency_step"], "1e-6")
         self.assertEqual(request["amplitude"], {
             "real": "0.001",
             "imaginary": "-0.002",
@@ -234,6 +236,34 @@ class JuliaResponseBackendTests(unittest.TestCase):
         self.assertEqual(readout.truncation_radius, 2.0e-55)
         self.assertTrue(readout.converged)
         self.assertEqual(backend.scientific_runtime["precision_digits"], 80)
+
+    def test_promoted_policy_refines_80_without_changing_120_contract(self):
+        """Catches coupling scientific solve targets to BigFloat storage digits."""
+
+        job = _deep_job()
+        adapter = FakeAdapter()
+        policy80_refined = JuliaPrecisionRootBackend(
+            VettedNativeDeterminantKernel.identity, adapter, 80, refinement=1
+        )._request(job, 0.0j)["policy"]
+        policy120 = JuliaPrecisionRootBackend(
+            VettedNativeDeterminantKernel.identity, adapter, 120
+        )._request(job, 0.0j)["policy"]
+        policy120_refined = JuliaPrecisionRootBackend(
+            VettedNativeDeterminantKernel.identity, adapter, 120, refinement=1
+        )._request(job, 0.0j)["policy"]
+
+        self.assertEqual(policy80_refined["root_tolerance"], "1e-20")
+        self.assertEqual(policy80_refined["ode_relative_tolerance"], "1e-20")
+        self.assertEqual(policy80_refined["ode_absolute_tolerance"], "1e-20")
+        self.assertEqual(policy80_refined["frequency_step"], "1e-7")
+        self.assertEqual(policy120["root_tolerance"], "1e-102")
+        self.assertEqual(policy120["ode_relative_tolerance"], "1e-102")
+        self.assertEqual(policy120["ode_absolute_tolerance"], "1e-104")
+        self.assertEqual(policy120["frequency_step"], "1e-60")
+        self.assertEqual(policy120_refined["root_tolerance"], "1e-106")
+        self.assertEqual(policy120_refined["ode_relative_tolerance"], "1e-106")
+        self.assertEqual(policy120_refined["ode_absolute_tolerance"], "1e-108")
+        self.assertEqual(policy120_refined["frequency_step"], "1e-60")
 
     def test_promoted_nonconvergence_preserves_authenticated_branch(self):
         """Catches relabelling an in-radius Julia failure as branch loss."""
@@ -484,7 +514,7 @@ class JuliaResponseBackendTests(unittest.TestCase):
         backend.read_root(job, 0.0j)
 
         policy = adapter.requests[0]["policy"]
-        self.assertEqual(policy["ode_relative_tolerance"], "1e-66")
+        self.assertEqual(policy["ode_relative_tolerance"], "1e-20")
         self.assertEqual(policy["endpoint_series_order"], 36)
         self.assertEqual(policy["support_subinterval_count"], 512)
         self.assertEqual(policy["angular_pad"], 26)
