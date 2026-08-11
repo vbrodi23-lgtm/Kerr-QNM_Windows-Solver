@@ -167,6 +167,30 @@ def _ratio(value: object, subject: str) -> dict[str, int]:
     return {"numerator": numerator, "denominator": denominator}
 
 
+def _sampling_coordinate(value: object) -> dict[str, object]:
+    coordinate = _mapping(value, "M02 sampling coordinate")
+    _exact_fields(
+        coordinate,
+        frozenset({"coordinate_id", "exact", "value", "transformation_id"}),
+        "M02 sampling coordinate",
+    )
+    return {
+        "coordinate_id": _nonempty(
+            coordinate["coordinate_id"], "M02 sampling coordinate ID"
+        ),
+        "exact": _ratio(
+            coordinate["exact"], "M02 sampling coordinate exact value"
+        ),
+        "transformation_id": _nonempty(
+            coordinate["transformation_id"],
+            "M02 sampling coordinate transformation ID",
+        ),
+        "value": _finite(
+            coordinate["value"], "M02 sampling coordinate value"
+        ),
+    }
+
+
 class M03ArtifactKind(str, Enum):
     RADIAL_ANGULAR_FIELD = "radial-angular-field"
     COMODE_NORMALIZATION = "co-mode-normalization"
@@ -210,6 +234,13 @@ class M03RootSeed(_FactoryOnlyContract):
         overlay_data_sha256: str,
     ) -> "M03RootSeed":
         root = _mapping(root, "spectral root")
+        catalog_id = _nonempty(catalog_id, "catalog ID")
+        catalog_data_sha256 = _hash(
+            catalog_data_sha256, "catalog data identity"
+        )
+        overlay_data_sha256 = _hash(
+            overlay_data_sha256, "overlay data identity"
+        )
         mode = _mapping(root.get("mode"), "spectral root mode")
         _exact_fields(
             mode,
@@ -556,10 +587,7 @@ class M02LineageAnchor(_FactoryOnlyContract):
                 lineage.get("policy_sha256"), "M02 policy identity"
             )
             sampling_coordinate = _freeze(
-                _mapping(
-                    lineage.get("sampling_coordinate"),
-                    "M02 sampling coordinate",
-                )
+                _sampling_coordinate(lineage.get("sampling_coordinate"))
             )  # type: ignore[assignment]
 
         material = {
