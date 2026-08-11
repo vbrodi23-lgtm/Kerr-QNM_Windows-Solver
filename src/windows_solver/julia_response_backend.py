@@ -8,16 +8,17 @@ component reduction, error ledger, checkpoints, resume, and admission schema.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from contextvars import copy_context
 from decimal import Decimal, InvalidOperation, localcontext
 import hashlib
 import json
 import math
 import os
 from pathlib import Path
+from queue import Empty, Queue
 import subprocess
 import tempfile
 from threading import Thread
+import time
 from types import SimpleNamespace
 from typing import Callable, Mapping
 
@@ -34,6 +35,7 @@ from .progress import ProgressEventKind, emit_progress, ingest_external_progress
 
 _PROMOTED_DIGITS = frozenset({80, 120})
 JULIA_PROGRESS_PREFIX = "@@KERR_QNM_PROGRESS@@"
+_WORKER_HEARTBEAT_SECONDS = 2.0
 _BRANCH_TOLERANCE_DECIMAL = Decimal(
     str(ROOT_BRANCH_CONTINUATION_TOLERANCE_ABS)
 )
@@ -73,32 +75,74 @@ def _run_streamed_julia(
     )
     stdout_lines: list[str] = []
     stderr_lines: list[str] = []
+    progress_lines: Queue[str | None] = Queue()
 
     def read_stdout() -> None:
         assert process.stdout is not None
-        for line in process.stdout:
-            if not _forward_julia_progress_line(line.rstrip("\r\n")):
-                stdout_lines.append(line)
+        try:
+            for line in process.stdout:
+                stripped = line.rstrip("\r\n")
+                if stripped.startswith(JULIA_PROGRESS_PREFIX):
+                    progress_lines.put(stripped)
+                else:
+                    stdout_lines.append(line)
+        finally:
+            progress_lines.put(None)
 
     def read_stderr() -> None:
         assert process.stderr is not None
         stderr_lines.extend(process.stderr)
 
-    stdout_context = copy_context()
-    stdout_thread = Thread(target=stdout_context.run, args=(read_stdout,), daemon=True)
+    stdout_thread = Thread(target=read_stdout, daemon=True)
     stderr_thread = Thread(target=read_stderr, daemon=True)
     stdout_thread.start()
     stderr_thread.start()
     timed_out = False
-    try:
-        returncode = process.wait(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        timed_out = True
-        process.kill()
-        returncode = process.wait()
-        stderr_lines.append(f"Julia worker timed out after {timeout} seconds\n")
+    deadline = time.monotonic() + timeout
+    next_heartbeat = time.monotonic() + _WORKER_HEARTBEAT_SECONDS
+    returncode: int | None = None
+    stdout_done = False
+    while returncode is None or not stdout_done:
+        if returncode is None:
+            returncode = process.poll()
+            if returncode is None and time.monotonic() >= deadline:
+                timed_out = True
+                process.kill()
+                returncode = process.wait()
+                stderr_lines.append(
+                    f"Julia worker timed out after {timeout} seconds\n"
+                )
+        now = time.monotonic()
+        wait_seconds = 0.05
+        if returncode is None:
+            wait_seconds = min(
+                wait_seconds,
+                max(0.0, next_heartbeat - now),
+                max(0.0, deadline - now),
+            )
+        try:
+            line = progress_lines.get(timeout=wait_seconds)
+        except Empty:
+            line = ""
+        if line is None:
+            stdout_done = True
+        elif line:
+            _forward_julia_progress_line(line)
+        now = time.monotonic()
+        if returncode is None and now >= next_heartbeat:
+            emit_progress(
+                ProgressEventKind.WORKER_HEARTBEAT,
+                worker="Julia",
+                worker_alive=True,
+                heartbeat_interval_seconds=_WORKER_HEARTBEAT_SECONDS,
+            )
+            next_heartbeat = now + _WORKER_HEARTBEAT_SECONDS
     stdout_thread.join()
     stderr_thread.join()
+    if process.stdout is not None:
+        process.stdout.close()
+    if process.stderr is not None:
+        process.stderr.close()
     return SimpleNamespace(
         returncode=returncode,
         stdout="".join(stdout_lines)[-4000:],
