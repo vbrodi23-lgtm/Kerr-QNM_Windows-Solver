@@ -2135,6 +2135,37 @@ def _execute_campaign_stage(
     return execute(leaf, digits)
 
 
+def _worker_failure_payload(error: BaseException) -> dict[str, object] | None:
+    """Preserve a Julia worker diagnostic only when its operational shape is exact."""
+
+    raw = getattr(error, "worker_failure", None)
+    expected = {
+        "worker_exit_code",
+        "worker_timed_out",
+        "worker_stderr_tail",
+        "worker_error_type",
+        "worker_error_message",
+    }
+    if not isinstance(raw, Mapping) or set(raw) != expected:
+        return None
+    exit_code = raw["worker_exit_code"]
+    if exit_code is not None and (
+        isinstance(exit_code, bool) or not isinstance(exit_code, int)
+    ):
+        return None
+    if not isinstance(raw["worker_timed_out"], bool):
+        return None
+    for name in (
+        "worker_stderr_tail",
+        "worker_error_type",
+        "worker_error_message",
+    ):
+        value = raw[name]
+        if value is not None and not isinstance(value, str):
+            return None
+    return dict(raw)
+
+
 def _complex_progress(value: complex) -> dict[str, float]:
     return {"real": complex(value).real, "imaginary": complex(value).imag}
 
@@ -2186,12 +2217,17 @@ def _execute_campaign_stage_with_progress(
                 response_predictor,
             )
         except BaseException as error:
+            worker_failure = _worker_failure_payload(error)
             emit_progress(
                 ProgressEventKind.LEAF_FAILED,
                 precision_digits=digits,
                 error_type=type(error).__name__,
                 message=str(error),
                 elapsed_seconds=time.monotonic() - started,
+                **(
+                    {} if worker_failure is None
+                    else {"worker_failure": worker_failure}
+                ),
             )
             raise
     return outcome, time.monotonic() - started
@@ -2318,10 +2354,15 @@ def run_campaign_selection(
             cache_lookups=cache_lookups,
         )
     except BaseException as error:
+        worker_failure = _worker_failure_payload(error)
         emit_progress(
             ProgressEventKind.CAMPAIGN_FAILED,
             error_type=type(error).__name__,
             message=str(error),
+            **(
+                {} if worker_failure is None
+                else {"worker_failure": worker_failure}
+            ),
         )
         raise
     emit_progress(
