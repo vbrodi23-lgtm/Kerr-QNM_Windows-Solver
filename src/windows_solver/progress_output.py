@@ -1314,6 +1314,9 @@ class CampaignProgressReporter:
         state = self._live_execution_mapping()
         if state.get("state") != "RUNNING":
             return []
+        current_leaf = self._index_limit(
+            state.get("leaf_index"), state.get("leaf_count")
+        )
         root = state.get("root")
         mechanism = state.get("mechanism_id")
         precision = state.get("precision_label")
@@ -1343,7 +1346,7 @@ class CampaignProgressReporter:
         if compact:
             return [
                 " CURRENTLY EXECUTING",
-                f" Root           {self._dashboard_value(root)} | {self._dashboard_value(precision)}",
+                f" Current leaf   {current_leaf} | Root {self._dashboard_value(root)} | {self._dashboard_value(precision)}",
                 f" Mechanism      {self._dashboard_value(mechanism)} | Phase {self._dashboard_value(phase)} | RUNNING",
                 f" Promoted by    {self._dashboard_value(promotion)} | Branch {branch_valid}",
                 f" Worker         {self._dashboard_value(worker)} | Tier elapsed {self._dashboard_value(tier_elapsed)}",
@@ -1356,6 +1359,7 @@ class CampaignProgressReporter:
         return [
             "",
             " CURRENTLY EXECUTING",
+            self._dashboard_field_line("Current leaf", current_leaf),
             self._dashboard_field_line("Root", root),
             self._dashboard_field_line("Mechanism", mechanism),
             self._dashboard_field_line("Precision", precision),
@@ -1401,6 +1405,8 @@ class CampaignProgressReporter:
             ).presentation_label
         return {
             "state": state.get("execution_state", "IDLE"),
+            "leaf_index": state.get("leaf_index"),
+            "leaf_count": state.get("leaf_count"),
             "root": root,
             "leaf_id": state.get("leaf_id"),
             "mechanism_id": state.get("mechanism_id"),

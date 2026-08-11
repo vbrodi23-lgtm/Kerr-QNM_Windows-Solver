@@ -61,5 +61,6 @@ Confirm that a fresh checkout can originate every M02 numerical prerequisite fro
 - Recover every authenticated PRIMARY binary64 `NOT_CONVERGED` leaf through the existing 80/120-digit boundary; preserve CONTROL and DEEP policy, migrate only exact legacy binary64 successes, recompute legacy unresolved receipts, and reject old checkpoints through the precision-policy binding without a schema/backend bump.
 - Split the checkpoint-derived latest-completed summary from a heartbeat-refreshed currently-executing Julia panel, including live root counters and pending-vs-authenticated branch state, without changing scientific execution.
 - Keep BigFloat 80 at 80 decimal digits/298 bits while retargeting its root, ODE, and centred-derivative controls to coherent 10⁻¹⁸–10⁻²⁰ accuracy; bind the new controls into PRIMARY identity, migrate only exact binary64 successes, retain the 120-tier policy, and render unit-aware precision labels throughout the live dashboard.
+- Show the active leaf ordinal and campaign total explicitly in both full and compact `CURRENTLY EXECUTING` views without reducing the compact precision-stage table below one completed row.
 
 ---
