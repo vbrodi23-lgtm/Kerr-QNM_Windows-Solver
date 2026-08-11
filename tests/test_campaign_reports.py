@@ -8,7 +8,7 @@ import tempfile
 from types import SimpleNamespace
 import unittest
 
-from windows_solver.campaign_reports import refresh_campaign_reports
+from windows_solver.campaign_reports import CampaignReportModel, refresh_campaign_reports
 from windows_solver.contracts import canonical_json_bytes
 from windows_solver.progress import ProgressEventKind
 from windows_solver.progress_output import CampaignProgressReporter
@@ -207,6 +207,8 @@ class CampaignReportTests(unittest.TestCase):
             self.assertIn("DELTA_ROOT", table)
             self.assertIn("220 a/M=0.95", table)
             self.assertIn("CONVERGED", table)
+            reporter._last_terminal_state = "CONVERGED"
+            reporter._dashboard_state["mechanism_id"] = "horizon-admittance"
             compact = "\n".join(reporter._compact_dashboard_lines({
                 "sequence": 1,
                 "kind": ProgressEventKind.PRECISION_STAGE_COMPLETED.value,
@@ -215,9 +217,18 @@ class CampaignReportTests(unittest.TestCase):
             self.assertIn("LATEST COMPLETED LEAF", compact)
             self.assertIn("PRECISION STAGE RESULTS", compact)
             self.assertIn("220 a/M=0.95", compact)
+            self.assertIn(" State          CONVERGED", compact)
+            self.assertIn(" Mechanism      horizon-admittance", compact)
             self.assertTrue(reporter._should_render_dashboard(
                 SimpleNamespace(kind=ProgressEventKind.PRECISION_STAGE_COMPLETED)
             ))
+            legacy_fixture = CampaignReportModel(
+                leaf_rows=(),
+                error_channel_rows=(),
+                projective_rows=(),
+                checkpoint_source_receipt="fixture-receipt",
+            )
+            self.assertEqual(legacy_fixture.precision_stage_rows, ())
             pending = next(item for item in leaves if item["leaf_id"] != leaf.leaf_id)
             self.assertEqual(pending["terminal_state"], "PENDING")
             self.assertEqual(pending["response_real"], "")
