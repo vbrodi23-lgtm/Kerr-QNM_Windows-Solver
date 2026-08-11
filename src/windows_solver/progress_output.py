@@ -95,10 +95,39 @@ _FORCED_STATUS_KINDS = frozenset(
         ProgressEventKind.LEAF_COMPLETED,
         ProgressEventKind.LEAF_FAILED,
         ProgressEventKind.PRECISION_STAGE_STARTED,
+        ProgressEventKind.WORKER_HEARTBEAT,
         ProgressEventKind.ERROR,
     }
 )
 _STATUS_INTERVAL_SECONDS = 0.25
+_DASHBOARD_INTERVAL_SECONDS = 0.25
+_DASHBOARD_FORCED_KINDS = frozenset(
+    {
+        ProgressEventKind.SOLVED_LEAF_CACHE_SCANNED,
+        ProgressEventKind.CAMPAIGN_STARTED,
+        ProgressEventKind.CAMPAIGN_COMPLETED,
+        ProgressEventKind.CAMPAIGN_FAILED,
+        ProgressEventKind.PRECISION_STAGE_STARTED,
+        ProgressEventKind.PRECISION_STAGE_COMPLETED,
+        ProgressEventKind.ROOT_PHASE_STARTED,
+        ProgressEventKind.ROOT_SEED_SELECTED,
+        ProgressEventKind.ROOT_PHASE_COMPLETED,
+        ProgressEventKind.WORKER_HEARTBEAT,
+        ProgressEventKind.LEAF_COMPLETED,
+        ProgressEventKind.LEAF_REUSED,
+        ProgressEventKind.LEAF_FAILED,
+    }
+)
+_DASHBOARD_LIVE_KINDS = frozenset(
+    {
+        ProgressEventKind.NEWTON_ITERATION_STARTED,
+        ProgressEventKind.NEWTON_ITERATION_COMPLETED,
+        ProgressEventKind.DETERMINANT_STARTED,
+        ProgressEventKind.DETERMINANT_COMPLETED,
+        ProgressEventKind.SUBOPERATION_STARTED,
+        ProgressEventKind.SUBOPERATION_COMPLETED,
+    }
+)
 _LEAF_TIMING_WINDOW = 10
 
 
@@ -171,6 +200,10 @@ class CampaignProgressReporter:
         self._cache_published_leaf_ids: set[object] = set()
         self._cache_publication_failures: dict[object, dict[str, object]] = {}
         self._root_started: dict[tuple[object, ...], float] = {}
+        self._precision_started: dict[tuple[object, object], float] = {}
+        self._precision_activity: dict[
+            tuple[object, object], tuple[float, str, str]
+        ] = {}
         self._newton_started: dict[
             tuple[object, ...], float
         ] = {}
@@ -184,6 +217,7 @@ class CampaignProgressReporter:
         self._primary_seed_stats: dict[str, dict[str, float | int]] = {}
         self._completed_primary_roots: set[tuple[object, ...]] = set()
         self._last_status_seconds: float | None = None
+        self._last_dashboard_seconds: float | None = None
         self._dashboard_rendered_rows = 0
         self._terminal_dashboard = self._stream_is_terminal()
         if self._terminal_dashboard:
@@ -298,7 +332,13 @@ class CampaignProgressReporter:
             )
         self._sequence += 1
         now = event.monotonic_seconds
+        timestamp_utc = (
+            datetime.now(timezone.utc)
+            .isoformat(timespec="milliseconds")
+            .replace("+00:00", "Z")
+        )
         leaf_key = context["leaf_id"]
+        precision_key = (leaf_key, context["precision_digits"])
         root_key = counter_key
         newton_key = (
             *root_key,
@@ -325,6 +365,21 @@ class CampaignProgressReporter:
             self._settled_leaf_ids.add(leaf_key)
         if event.kind is ProgressEventKind.ROOT_PHASE_STARTED:
             self._root_started[root_key] = now
+        if (
+            event.kind is ProgressEventKind.PRECISION_STAGE_STARTED
+            and leaf_key is not None
+            and context["precision_digits"] is not None
+        ):
+            self._precision_started[precision_key] = now
+        if (
+            precision_key in self._precision_started
+            and event.kind is not ProgressEventKind.WORKER_HEARTBEAT
+        ):
+            self._precision_activity[precision_key] = (
+                now,
+                event.kind.value,
+                timestamp_utc,
+            )
         if event.kind is ProgressEventKind.NEWTON_ITERATION_STARTED:
             self._newton_started[newton_key] = now
         determinant_key = root_key
@@ -367,9 +422,7 @@ class CampaignProgressReporter:
             "kind": event.kind.value,
             "session": self.session,
             "sequence": self._sequence,
-            "timestamp_utc": datetime.now(timezone.utc)
-            .isoformat(timespec="milliseconds")
-            .replace("+00:00", "Z"),
+            "timestamp_utc": timestamp_utc,
             "elapsed_seconds": time.monotonic() - self._started,
             "monotonic_seconds": event.monotonic_seconds,
             "context": context,
@@ -378,6 +431,19 @@ class CampaignProgressReporter:
         }
         if leaf_key in self._leaf_started:
             record["elapsed_leaf_seconds"] = now - self._leaf_started[leaf_key]
+        if precision_key in self._precision_started:
+            record["elapsed_precision_seconds"] = (
+                now - self._precision_started[precision_key]
+            )
+        if precision_key in self._precision_activity:
+            activity_seconds, activity_kind, activity_timestamp = (
+                self._precision_activity[precision_key]
+            )
+            record["last_activity_age_seconds"] = max(
+                0.0, now - activity_seconds
+            )
+            record["last_activity_kind"] = activity_kind
+            record["last_activity_timestamp_utc"] = activity_timestamp
         if root_key in self._root_started:
             record["elapsed_root_seconds"] = now - self._root_started[root_key]
         if newton_key in self._newton_started:
@@ -579,16 +645,19 @@ class CampaignProgressReporter:
             return False
 
     def _should_render_dashboard(self, event: ProgressEvent) -> bool:
-        return event.kind in {
-            ProgressEventKind.SOLVED_LEAF_CACHE_SCANNED,
-            ProgressEventKind.CAMPAIGN_STARTED,
-            ProgressEventKind.PRECISION_STAGE_COMPLETED,
-            ProgressEventKind.LEAF_COMPLETED,
-            ProgressEventKind.LEAF_REUSED,
-            ProgressEventKind.LEAF_FAILED,
-            ProgressEventKind.CAMPAIGN_COMPLETED,
-            ProgressEventKind.CAMPAIGN_FAILED,
-        }
+        if event.kind in _DASHBOARD_FORCED_KINDS:
+            self._last_dashboard_seconds = event.monotonic_seconds
+            return True
+        if event.kind not in _DASHBOARD_LIVE_KINDS:
+            return False
+        now = event.monotonic_seconds
+        if (
+            self._last_dashboard_seconds is None
+            or now - self._last_dashboard_seconds >= _DASHBOARD_INTERVAL_SECONDS
+        ):
+            self._last_dashboard_seconds = now
+            return True
+        return False
 
     def _dashboard(self, record: Mapping[str, object]) -> None:
         lines = self._bounded_dashboard_lines(record)
@@ -700,6 +769,14 @@ class CampaignProgressReporter:
         for name, value in context.items():
             if value is not None:
                 self._dashboard_state[name] = value
+        for name in (
+            "elapsed_precision_seconds",
+            "last_activity_age_seconds",
+            "last_activity_kind",
+            "last_activity_timestamp_utc",
+        ):
+            if name in record:
+                self._dashboard_state[name] = record[name]
         determinant_abs = record.get("current_determinant_abs")
         if determinant_abs is not None:
             self._dashboard_state["determinant_abs"] = determinant_abs
@@ -731,14 +808,38 @@ class CampaignProgressReporter:
                 self._dashboard_state["root_status"] = "CONVERGED"
             elif converged is False:
                 self._dashboard_state["root_status"] = "NOT_CONVERGED"
+        elif kind == ProgressEventKind.ROOT_SEED_SELECTED.value:
+            seed_kind = context.get("seed_kind") or payload.get("seed_kind")
+            self._dashboard_state["seed_kind"] = seed_kind
+            self._dashboard_state["seed_authenticated"] = seed_kind in {
+                "AUTHENTICATED_BACKGROUND",
+                "FALLBACK_BACKGROUND",
+                "EPSILON_CONTINUATION",
+                "SPIN_CONTINUATION",
+            }
         elif kind == ProgressEventKind.PRECISION_STAGE_STARTED.value:
             self._dashboard_state["precision_status"] = "ACTIVE"
+            self._dashboard_state["execution_state"] = "RUNNING"
+            self._dashboard_state["branch_valid"] = "PENDING"
+            self._dashboard_state["worker"] = (
+                "Julia"
+                if context.get("precision_digits") in {80, 120}
+                else "Python"
+            )
+            self._dashboard_state["promotion_reason"] = self._promotion_reason(
+                next_leaf, context.get("precision_digits")
+            )
         elif kind == ProgressEventKind.PRECISION_STAGE_COMPLETED.value:
             numerical_state = payload.get("numerical_state")
             if numerical_state is not None:
                 self._dashboard_state["precision_status"] = numerical_state
             if payload.get("leaf_state") == "MISSING_PRECISION":
                 self._dashboard_state["leaf_status"] = "MISSING_PRECISION"
+            self._dashboard_state["execution_state"] = "COMPLETED"
+        elif kind == ProgressEventKind.WORKER_HEARTBEAT.value:
+            worker = payload.get("worker")
+            if isinstance(worker, str) and worker:
+                self._dashboard_state["worker"] = worker
         elif kind == ProgressEventKind.CHECKPOINT_WRITING.value:
             self._checkpoint_status = "writing"
         elif kind == ProgressEventKind.CHECKPOINT_WRITTEN.value:
@@ -755,6 +856,36 @@ class CampaignProgressReporter:
                 self._dashboard_state["leaf_status"] = "PARTIAL"
         elif kind == ProgressEventKind.CAMPAIGN_FAILED.value:
             self._campaign_status = "FAILED"
+
+    def _promotion_reason(
+        self, leaf_id: object, precision_digits: object
+    ) -> str | None:
+        if (
+            leaf_id is None
+            or isinstance(precision_digits, bool)
+            or not isinstance(precision_digits, int)
+            or precision_digits <= 64
+            or self._campaign_report_model is None
+        ):
+            return None
+        prior = [
+            row
+            for row in self._campaign_report_model.precision_stage_rows
+            if row.get("leaf_id") == leaf_id
+            and isinstance(row.get("precision_digits"), int)
+            and row["precision_digits"] < precision_digits
+        ]
+        if not prior:
+            return None
+        row = prior[-1]
+        prior_digits = row["precision_digits"]
+        label = (
+            "binary64"
+            if prior_digits == 64
+            else precision_tier_presentation(prior_digits).presentation_label
+        )
+        state = row.get("numerical_state")
+        return label if state is None else f"{label} {state}"
 
     def _record_leaf_outcome(self, leaf_id: object, state: object) -> None:
         self._last_terminal_leaf = leaf_id
@@ -1083,6 +1214,7 @@ class CampaignProgressReporter:
             "",
             " LATEST COMPLETED LEAF",
             *self._latest_completed_leaf_lines(fields),
+            *self._current_execution_lines(),
             *self._precision_stage_table_lines(),
             "",
             " CACHE",
@@ -1092,7 +1224,7 @@ class CampaignProgressReporter:
             ),
             "",
             f" Last refresh:  {datetime.now().astimezone().strftime('%H:%M:%S')}",
-            " Dashboard refreshes after completed precision stages and leaf transitions.",
+            " Dashboard refreshes throughout active work and after committed stages.",
         ]
         return lines
 
@@ -1144,6 +1276,7 @@ class CampaignProgressReporter:
             response,
             disk,
             "",
+            *self._current_execution_lines(compact=True),
         ]
         trailing = [
             " CACHE",
@@ -1153,7 +1286,7 @@ class CampaignProgressReporter:
             ),
             "",
             f" Last refresh:  {datetime.now().astimezone().strftime('%H:%M:%S')}",
-            " Dashboard refreshes after completed precision stages and leaf transitions.",
+            " Dashboard refreshes throughout active work and after committed stages.",
         ]
         table_overhead = 4
         table_rows = max(1, maximum_rows - len(leading) - len(trailing) - table_overhead)
@@ -1190,6 +1323,176 @@ class CampaignProgressReporter:
             "-" * len(header),
             *(self._precision_stage_table_row(row) for row in rows),
         ]
+
+    def _current_execution_lines(self, *, compact: bool = False) -> list[str]:
+        state = self._live_execution_mapping()
+        if state.get("state") != "RUNNING":
+            return []
+        root = state.get("root")
+        mechanism = state.get("mechanism_id")
+        precision = state.get("precision_label")
+        phase = state.get("phase")
+        promotion = state.get("promotion_reason")
+        seed = state.get("seed_kind")
+        seed_authenticated = self._yes_no_pending(
+            state.get("seed_authenticated")
+        )
+        branch_valid = self._yes_no_pending(state.get("branch_valid"))
+        worker = state.get("worker")
+        tier_elapsed = self._duration_value(state.get("elapsed_precision_seconds"))
+        activity = self._activity_text(state)
+        newton = self._index_limit(
+            state.get("newton_index"), state.get("newton_limit")
+        )
+        determinant = (
+            state.get("determinant_index_phase")
+            or state.get("determinant_index_leaf")
+        )
+        current_omega = self._complex_text(state.get("current_omega"))
+        determinant_abs = self._scientific_number(state.get("determinant_abs"))
+        best_determinant_abs = self._scientific_number(
+            state.get("best_determinant_abs")
+        )
+        suboperation = state.get("suboperation")
+        if compact:
+            return [
+                " CURRENTLY EXECUTING",
+                f" Root           {self._dashboard_value(root)} | {self._dashboard_value(precision)}",
+                f" Mechanism      {self._dashboard_value(mechanism)} | Phase {self._dashboard_value(phase)} | RUNNING",
+                self._dashboard_field_line("Promoted by", promotion),
+                f" Seed           {self._dashboard_value(seed)} | authenticated {seed_authenticated} | Branch {branch_valid}",
+                f" Worker         {self._dashboard_value(worker)} | Tier elapsed {self._dashboard_value(tier_elapsed)}",
+                self._dashboard_field_line("Last activity", activity),
+                "",
+                " LIVE ROOT SOLVE",
+                f" Newton         {newton} | Determinant {self._dashboard_value(determinant)} | Suboperation {self._dashboard_value(suboperation)}",
+                self._dashboard_field_line("Current ω", current_omega),
+                f" |D|            {determinant_abs} | Best |D| {best_determinant_abs}",
+                "",
+            ]
+        return [
+            "",
+            " CURRENTLY EXECUTING",
+            self._dashboard_field_line("Root", root),
+            self._dashboard_field_line("Mechanism", mechanism),
+            self._dashboard_field_line("Precision", precision),
+            self._dashboard_field_line("Phase", phase),
+            self._dashboard_field_line("State", state.get("state")),
+            self._dashboard_field_line("Promotion", promotion),
+            self._dashboard_field_line("Seed", seed),
+            self._dashboard_field_line("Seed authenticated", seed_authenticated),
+            self._dashboard_field_line("Branch valid", branch_valid),
+            self._dashboard_field_line("Worker", worker),
+            self._dashboard_field_line("Tier elapsed", tier_elapsed),
+            self._dashboard_field_line("Last activity", activity),
+            "",
+            " LIVE ROOT SOLVE",
+            self._dashboard_field_line("Newton", newton),
+            self._dashboard_field_line("Determinant", determinant),
+            self._dashboard_field_line("Current ω", current_omega),
+            self._dashboard_field_line("|D|", determinant_abs),
+            self._dashboard_field_line("Best |D|", best_determinant_abs),
+            self._dashboard_field_line("Suboperation", suboperation),
+        ]
+
+    def _live_execution_mapping(self) -> dict[str, object]:
+        state = self._dashboard_state
+        mode = state.get("mode")
+        spin = state.get("spin")
+        mode_label = self._mode_label(mode)
+        root = None
+        if mode_label is not None and spin is not None:
+            try:
+                spin_text = format(float(spin), ".6g")
+            except (TypeError, ValueError, OverflowError):
+                spin_text = str(spin)
+            root = f"{mode_label} a/M={spin_text}"
+        precision_digits = state.get("precision_digits")
+        precision_label = None
+        if (
+            isinstance(precision_digits, int)
+            and not isinstance(precision_digits, bool)
+        ):
+            precision_label = precision_tier_presentation(
+                precision_digits
+            ).presentation_label
+        return {
+            "state": state.get("execution_state", "IDLE"),
+            "root": root,
+            "leaf_id": state.get("leaf_id"),
+            "mechanism_id": state.get("mechanism_id"),
+            "precision_digits": precision_digits,
+            "precision_label": precision_label,
+            "phase": state.get("phase"),
+            "promotion_reason": state.get("promotion_reason"),
+            "seed_kind": state.get("seed_kind"),
+            "seed_authenticated": state.get("seed_authenticated"),
+            "branch_valid": state.get("branch_valid"),
+            "worker": state.get("worker"),
+            "elapsed_precision_seconds": state.get("elapsed_precision_seconds"),
+            "last_activity_age_seconds": state.get("last_activity_age_seconds"),
+            "last_activity_kind": state.get("last_activity_kind"),
+            "last_activity_timestamp_utc": state.get(
+                "last_activity_timestamp_utc"
+            ),
+            "newton_index": state.get("newton_index"),
+            "newton_limit": state.get("newton_limit"),
+            "determinant_index_leaf": state.get("determinant_index_leaf"),
+            "determinant_index_phase": state.get("determinant_index_phase"),
+            "current_omega": state.get("current_omega"),
+            "determinant_abs": state.get("determinant_abs"),
+            "best_determinant_abs": state.get("best_determinant_abs"),
+            "suboperation": state.get("suboperation"),
+        }
+
+    @staticmethod
+    def _mode_label(value: object) -> str | None:
+        if not isinstance(value, Mapping):
+            return None
+        ell, m, n = value.get("ell"), value.get("m"), value.get("n")
+        if any(isinstance(item, bool) or not isinstance(item, int) for item in (ell, m, n)):
+            return None
+        return f"{ell}{m}{n}"
+
+    @staticmethod
+    def _yes_no_pending(value: object) -> str:
+        if value is True:
+            return "YES"
+        if value is False:
+            return "NO"
+        if isinstance(value, str) and value:
+            return value
+        return "PENDING"
+
+    @staticmethod
+    def _index_limit(index: object, limit: object) -> str:
+        left = "-" if index is None else str(index)
+        right = "-" if limit is None else str(limit)
+        return f"{left}/{right}"
+
+    @classmethod
+    def _complex_text(cls, value: object) -> str:
+        if not isinstance(value, Mapping):
+            return ""
+        real = value.get("real")
+        imaginary = value.get("imaginary")
+        if real is None or imaginary is None:
+            return ""
+        return f"{real} {imaginary}i"
+
+    @classmethod
+    def _activity_text(cls, state: Mapping[str, object]) -> str:
+        kind = state.get("last_activity_kind")
+        if not isinstance(kind, str) or not kind:
+            return "PENDING"
+        if kind == ProgressEventKind.SUBOPERATION_STARTED.value:
+            label = f"{state.get('suboperation') or 'suboperation'} started"
+        elif kind == ProgressEventKind.SUBOPERATION_COMPLETED.value:
+            label = f"{state.get('suboperation') or 'suboperation'} completed"
+        else:
+            label = kind.replace("_", " ")
+        age = cls._duration_value(state.get("last_activity_age_seconds"))
+        return label if age is None else f"{label} ({age} ago)"
 
     @classmethod
     def _precision_stage_table_row(cls, row: Mapping[str, object]) -> str:
@@ -1355,7 +1658,12 @@ class CampaignProgressReporter:
             color = "96"
         elif stripped == "CAMPAIGN":
             color = "93"
-        elif stripped in {"LATEST COMPLETED LEAF", "PRECISION STAGE RESULTS"}:
+        elif stripped in {
+            "LATEST COMPLETED LEAF",
+            "CURRENTLY EXECUTING",
+            "LIVE ROOT SOLVE",
+            "PRECISION STAGE RESULTS",
+        }:
             color = "95"
         elif stripped == "CACHE":
             color = "36"
@@ -1680,6 +1988,7 @@ class CampaignProgressReporter:
         )
         status["persistence"] = self._persistence_status()
         status["scientific"] = dict(self._scientific_dashboard_fields())
+        status["live_execution"] = self._live_execution_mapping()
         encoded = json.dumps(
             _json_value(status), ensure_ascii=False, allow_nan=False,
             separators=(",", ":"), sort_keys=True,
