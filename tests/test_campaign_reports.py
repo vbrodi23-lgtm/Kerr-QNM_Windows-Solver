@@ -10,7 +10,11 @@ import time
 from types import SimpleNamespace
 import unittest
 
-from windows_solver.campaign_reports import CampaignReportModel, refresh_campaign_reports
+from windows_solver.campaign_reports import (
+    CampaignReportModel,
+    _root_tolerance_for_precision,
+    refresh_campaign_reports,
+)
 from windows_solver.contracts import canonical_json_bytes
 from windows_solver.progress import ProgressContext, ProgressEvent, ProgressEventKind
 from windows_solver.progress_output import CampaignProgressReporter
@@ -143,6 +147,7 @@ class CampaignReportTests(unittest.TestCase):
                 checkpoint_source_receipt="fixture-receipt",
                 precision_stage_rows=({
                     "leaf_id": "active-9999",
+                    "root": "220 a/M=0.9999",
                     "precision_digits": 64,
                     "numerical_state": "NOT_CONVERGED",
                 },),
@@ -235,6 +240,10 @@ class CampaignReportTests(unittest.TestCase):
             )
 
             dashboard = "\n".join(reporter._dashboard_lines(heartbeat))
+            reporter._terminal_dimensions = lambda: (120, 30)
+            bounded_dashboard = "\n".join(
+                reporter._bounded_dashboard_lines(heartbeat)
+            )
             reporter._write_status(heartbeat)
             status = json.loads(
                 Path(f"{checkpoint}.status.json").read_text(encoding="utf-8")
@@ -265,6 +274,15 @@ class CampaignReportTests(unittest.TestCase):
         self.assertIn("146", dashboard)
         self.assertIn("0.98567354838270116", dashboard)
         self.assertIn("2.400E-11", dashboard)
+        self.assertIn("LATEST COMPLETED LEAF", bounded_dashboard)
+        self.assertIn("CURRENTLY EXECUTING", bounded_dashboard)
+        self.assertIn("LIVE ROOT SOLVE", bounded_dashboard)
+        self.assertIn("PRECISION STAGE RESULTS", bounded_dashboard)
+        self.assertIn("220 a/M=0.9999", bounded_dashboard)
+        self.assertRegex(
+            bounded_dashboard,
+            r"220 a/M=0\.9999\s+binary64 \(~15\.95 dec\)",
+        )
         self.assertTrue(reporter._should_render_dashboard(SimpleNamespace(
             kind=ProgressEventKind.WORKER_HEARTBEAT,
             monotonic_seconds=base_time + 14.0,
@@ -272,6 +290,43 @@ class CampaignReportTests(unittest.TestCase):
         self.assertEqual(status["live_execution"]["state"], "RUNNING")
         self.assertEqual(status["live_execution"]["precision_digits"], 80)
         self.assertEqual(status["live_execution"]["suboperation"], "r-from-rho")
+
+    def test_precision_stage_table_uses_unit_aware_labels_and_real_thresholds(self):
+        """Catches restoring the table with ambiguous 64/80/120 units."""
+
+        reporter = CampaignProgressReporter(
+            "normal", "checkpoint.json", io.StringIO()
+        )
+        reporter._campaign_report_model = CampaignReportModel(
+            leaf_rows=(),
+            error_channel_rows=(),
+            projective_rows=(),
+            checkpoint_source_receipt="fixture-receipt",
+            precision_stage_rows=tuple(
+                {
+                    "root": f"220 a/M=0.{digits}",
+                    "precision_digits": digits,
+                    "numerical_state": "CONVERGED",
+                    "converged": True,
+                    "branch_ok": True,
+                    "determinant_abs": 1.0e-18,
+                    "determinant_over_tolerance": 1.0,
+                    "newton_correction": 1.0e-19,
+                    "root_displacement_abs": 1.0e-18,
+                }
+                for digits in (64, 80, 120)
+            ),
+        )
+
+        table = "\n".join(reporter._precision_stage_table_lines())
+
+        self.assertIn("binary64 (~15.95 dec)", table)
+        self.assertIn("BigFloat 80 dec", table)
+        self.assertIn("BigFloat 120 dec", table)
+        self.assertNotIn("  64 CONVERGED", table)
+        self.assertEqual(_root_tolerance_for_precision(64), 2.0e-11)
+        self.assertEqual(_root_tolerance_for_precision(80), 1.0e-18)
+        self.assertEqual(_root_tolerance_for_precision(120), 1.0e-102)
 
     def test_dashboard_throttles_fast_inner_events_but_forces_heartbeat(self):
         """Catches terminal redraw volume scaling with determinant operations."""
