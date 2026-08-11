@@ -251,6 +251,7 @@ class CampaignReportTests(unittest.TestCase):
 
         self.assertIn("LATEST COMPLETED LEAF", dashboard)
         self.assertIn("CURRENTLY EXECUTING", dashboard)
+        self.assertIn("Current leaf   16/212", dashboard)
         self.assertIn("LIVE ROOT SOLVE", dashboard)
         self.assertIn("220 a/M=0.9999", dashboard)
         self.assertIn("BigFloat 80 dec", dashboard)
@@ -276,6 +277,7 @@ class CampaignReportTests(unittest.TestCase):
         self.assertIn("2.400E-11", dashboard)
         self.assertIn("LATEST COMPLETED LEAF", bounded_dashboard)
         self.assertIn("CURRENTLY EXECUTING", bounded_dashboard)
+        self.assertIn("Current leaf   16/212", bounded_dashboard)
         self.assertIn("LIVE ROOT SOLVE", bounded_dashboard)
         self.assertIn("PRECISION STAGE RESULTS", bounded_dashboard)
         self.assertIn("220 a/M=0.9999", bounded_dashboard)
@@ -288,6 +290,8 @@ class CampaignReportTests(unittest.TestCase):
             monotonic_seconds=base_time + 14.0,
         )))
         self.assertEqual(status["live_execution"]["state"], "RUNNING")
+        self.assertEqual(status["live_execution"]["leaf_index"], 16)
+        self.assertEqual(status["live_execution"]["leaf_count"], 212)
         self.assertEqual(status["live_execution"]["precision_digits"], 80)
         self.assertEqual(status["live_execution"]["suboperation"], "r-from-rho")
 
