@@ -43,6 +43,16 @@ from windows_solver.progress_output import CampaignProgressReporter
 from windows_solver.solved_leaf_cache import SolvedLeafLookupStatus, SolvedLeafStore
 
 
+_FROZEN_MIGRATION_BACKEND_IDENTITY = replace(
+    VettedNativeDeterminantKernel.identity,
+    runtime_fingerprint=(
+        "cpython-3.12.13-linux-python-64bit-"
+        "gsn-input-julia-exact-f-u-cache-contract-1-"
+        "adapted-source-native-gsn-adapter-contract-2"
+    ),
+)
+
+
 def _outcome(leaf, digits=64):
     component = {
         "evidence_kind": "synthetic-cache-orchestration-contract",
@@ -290,7 +300,7 @@ def _primary(plan, count):
 def _primary_migration_context():
     plan = build_campaign_plan(
         policy=NumericalPolicy(),
-        backend_identity=VettedNativeDeterminantKernel.identity,
+        backend_identity=_FROZEN_MIGRATION_BACKEND_IDENTITY,
         precision_capabilities=PrecisionCapabilities((64, 80)),
     )
     leaf = next(item for item in plan.leaves if item.role == "primary")
@@ -638,7 +648,7 @@ class SolvedLeafCacheTests(unittest.TestCase):
 
         plan = build_campaign_plan(
             policy=NumericalPolicy(),
-            backend_identity=VettedNativeDeterminantKernel.identity,
+            backend_identity=_FROZEN_MIGRATION_BACKEND_IDENTITY,
             precision_capabilities=PrecisionCapabilities((64, 80)),
         )
         leaf = next(item for item in plan.leaves if item.role == "primary")
@@ -739,7 +749,7 @@ class SolvedLeafCacheTests(unittest.TestCase):
 
         plan = build_campaign_plan(
             policy=NumericalPolicy(),
-            backend_identity=VettedNativeDeterminantKernel.identity,
+            backend_identity=_FROZEN_MIGRATION_BACKEND_IDENTITY,
             precision_capabilities=PrecisionCapabilities((64, 80)),
         )
         leaf = next(item for item in plan.leaves if item.role == "primary")
