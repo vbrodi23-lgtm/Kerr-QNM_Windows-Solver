@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from fractions import Fraction
 import hashlib
 import json
@@ -12,13 +13,21 @@ from windows_solver.linear_response import B_PRIME_RELEASE_DOMAIN
 from windows_solver.response_batches import (
     PrecisionCapabilities,
     StageOutcome,
+    _produced_response,
     build_campaign_plan,
     build_campaign_selection,
     run_campaign_selection,
     synthetic_stage_signed_error_channels,
     validate_campaign_checkpoint,
 )
-from windows_solver.response_engine import NumericalPolicy, VettedNativeDeterminantKernel
+from windows_solver.response_engine import (
+    ComponentResult,
+    ComponentStatus,
+    NumericalPolicy,
+    RootReadout,
+    VettedNativeDeterminantKernel,
+)
+from windows_solver.solved_leaf_cache import SolvedLeafStore
 
 
 def leaf_id(role, mode_label, coordinate, mechanism_id):
@@ -78,6 +87,531 @@ def _synthetic_stage_outcome(**values):
             component_result, radius
         ),
     )
+
+
+def _authenticated_primary_stage(
+    leaf,
+    digits,
+    status,
+    *,
+    self_refinement_enclosed=None,
+    discrepancy_from_previous_abs=None,
+    discrepancy_enclosed=None,
+    branch_loss_mismatch=True,
+):
+    """Build a canonical production-shaped stage without invoking a solver."""
+
+    job = leaf.job
+    status = ComponentStatus(status)
+    result = ComponentResult(
+        job_id=job.job_id,
+        leaf_id=job.leaf_id,
+        mechanism_id=job.mechanism_id,
+        status=status,
+        convergence_basis=(
+            "ORDER_RESOLVED" if status is ComponentStatus.CONVERGED else "UNRESOLVED"
+        ),
+        response=complex(1.0, -0.5) if status is ComponentStatus.CONVERGED else None,
+        signed_root_crosscheck=(
+            complex(1.0, -0.5) if status is ComponentStatus.CONVERGED else None
+        ),
+        closed_form_response=None,
+        error_channels={
+            "signed-root": 1.0e-9,
+            "truncation": 1.0e-9,
+            "resolution": 1.0e-9,
+            "seed-path": 1.0e-9,
+            "axis": 1.0e-9,
+            "amplitude": 1.0e-9,
+        },
+        baseline=RootReadout(
+            omega=job.root.omega,
+            determinant_residual_abs=1.0e-12,
+            determinant_derivative_abs=2.0,
+            converged=status is not ComponentStatus.NOT_CONVERGED,
+            root_reference_id=job.root.root_reference_id,
+            branch_id=(
+                f"{job.root.branch_id}-mismatch"
+                if (
+                    status is ComponentStatus.BRANCH_LOSS
+                    and branch_loss_mismatch
+                )
+                else job.root.branch_id
+            ),
+            equation_id=job.equation_id,
+            source_root_mapping=job.source_root_mapping,
+        ),
+        levels=(),
+        lineage={
+            "leaf_id": job.leaf_id,
+            "root_reference_id": job.root.root_reference_id,
+            "root_identity_sha256": job.root.identity_sha256,
+            "policy_sha256": job.policy.identity_sha256,
+            "backend_identity_sha256": job.backend_identity.identity_sha256,
+            "equation_id": job.equation_id,
+            "sampling_coordinate": job.sampling_coordinate.to_mapping(),
+            "source_root_mapping": job.source_root_mapping,
+        },
+    )
+    component_result = {
+        "evidence_kind": "authenticated-primary-precision-contract",
+        "result": result.to_mapping(),
+    }
+    return _synthetic_stage_outcome(
+        digits=digits,
+        numerical_state=status.value,
+        component_result=component_result,
+        local_disk_radius_abs=1.0e-8,
+        self_refinement_enclosed=self_refinement_enclosed,
+        discrepancy_from_previous_abs=discrepancy_from_previous_abs,
+        discrepancy_enclosed=discrepancy_enclosed,
+    )
+
+
+def _replace_component_result_fields(
+    outcome,
+    *,
+    result_changes=None,
+    raw_changes=None,
+):
+    """Reseal a synthetic stage around an independently chosen result body."""
+
+    component = dict(outcome.component_result)
+    result = replace(
+        ComponentResult.from_mapping(component["result"]),
+        **(result_changes or {}),
+    )
+    raw_result = result.to_mapping()
+    raw_result.update(raw_changes or {})
+    component["result"] = raw_result
+    return replace(
+        outcome,
+        component_result=component,
+        signed_error_channels=synthetic_stage_signed_error_channels(
+            component, outcome.local_disk_radius_abs
+        ),
+    )
+
+
+class PrimaryPrecisionTests(unittest.TestCase):
+    def test_authenticated_primary_not_converged_recovers_at_80_or_each_120_gate(self) -> None:
+        """Catches PRIMARY records terminalized at binary64 instead of recovered."""
+
+        capabilities = PrecisionCapabilities((64, 80, 120))
+        plan = build_campaign_plan(
+            policy=NumericalPolicy(),
+            backend_identity=VettedNativeDeterminantKernel.identity,
+            precision_capabilities=capabilities,
+        )
+        leaf = next(item for item in plan.leaves if item.role == "primary")
+        selection = build_campaign_selection(
+            plan, role="primary", leaf_ids=(leaf.leaf_id,)
+        )
+        cases = {
+            "80-terminal": (
+                ComponentStatus.CONVERGED,
+                True,
+                True,
+                ComponentStatus.CONVERGED,
+                True,
+                (64, 80),
+                "PRODUCED",
+            ),
+            "80-not-converged": (
+                ComponentStatus.NOT_CONVERGED,
+                True,
+                True,
+                ComponentStatus.CONVERGED,
+                True,
+                (64, 80, 120),
+                "PRODUCED",
+            ),
+            "80-branch-loss-is-terminal": (
+                ComponentStatus.BRANCH_LOSS,
+                True,
+                True,
+                ComponentStatus.CONVERGED,
+                True,
+                (64, 80),
+                "UNRESOLVED",
+            ),
+            "80-self-refinement-unenclosed": (
+                ComponentStatus.CONVERGED,
+                False,
+                True,
+                ComponentStatus.CONVERGED,
+                True,
+                (64, 80, 120),
+                "PRODUCED",
+            ),
+            "64-80-discrepancy-unenclosed": (
+                ComponentStatus.CONVERGED,
+                True,
+                False,
+                ComponentStatus.CONVERGED,
+                True,
+                (64, 80, 120),
+                "PRODUCED",
+            ),
+            "120-nonconvergence-is-terminal-unresolved": (
+                ComponentStatus.CONVERGED,
+                False,
+                True,
+                ComponentStatus.NOT_CONVERGED,
+                True,
+                (64, 80, 120),
+                "UNRESOLVED",
+            ),
+            "120-unenclosed-discrepancy-is-terminal-unresolved": (
+                ComponentStatus.CONVERGED,
+                False,
+                True,
+                ComponentStatus.CONVERGED,
+                False,
+                (64, 80, 120),
+                "UNRESOLVED",
+            ),
+        }
+
+        for name, (
+            status80,
+            self_enclosed,
+            discrepancy_enclosed,
+            status120,
+            discrepancy120_enclosed,
+            expected,
+            terminal_state,
+        ) in cases.items():
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as temporary:
+                class Backend:
+                    identity = plan.backend_identity
+                    precision_capabilities = capabilities
+
+                    def __init__(self):
+                        self.calls = []
+
+                    def execute_stage(self, selected, digits):
+                        self.calls.append(digits)
+                        if digits == 64:
+                            return _authenticated_primary_stage(
+                                selected, digits, ComponentStatus.NOT_CONVERGED
+                            )
+                        if digits == 80:
+                            return _authenticated_primary_stage(
+                                selected,
+                                digits,
+                                status80,
+                                self_refinement_enclosed=self_enclosed,
+                                discrepancy_from_previous_abs=1.0e-9,
+                                discrepancy_enclosed=discrepancy_enclosed,
+                            )
+                        return _authenticated_primary_stage(
+                            selected,
+                            digits,
+                            status120,
+                            discrepancy_from_previous_abs=1.0e-10,
+                            discrepancy_enclosed=discrepancy120_enclosed,
+                        )
+
+                backend = Backend()
+                root = Path(temporary)
+                checkpoint = root / "primary.json"
+                store = SolvedLeafStore(root / "solved")
+                summary = run_campaign_selection(
+                    plan,
+                    selection,
+                    backend,
+                    checkpoint,
+                    resume=False,
+                    solved_leaf_store=store,
+                )
+
+                self.assertEqual(tuple(backend.calls), expected)
+                self.assertEqual(summary.state, "COMPLETE")
+                self.assertEqual(summary.records[0].state, terminal_state)
+                self.assertEqual(
+                    tuple(stage.outcome.digits for stage in summary.records[0].stages),
+                    expected,
+                )
+                self.assertEqual(
+                    validate_campaign_checkpoint(plan, checkpoint).records,
+                    summary.records,
+                )
+                self.assertEqual(store.stored_count, 1)
+                if terminal_state == "PRODUCED":
+                    self.assertEqual(
+                        _produced_response(summary.records[0]),
+                        complex(1.0, -0.5),
+                    )
+
+        with self.subTest(name="missing-80-is-not-terminal-or-cacheable"):
+            binary64 = PrecisionCapabilities((64,))
+            plan64 = build_campaign_plan(
+                policy=NumericalPolicy(),
+                backend_identity=VettedNativeDeterminantKernel.identity,
+                precision_capabilities=binary64,
+            )
+            leaf64 = next(item for item in plan64.leaves if item.role == "primary")
+            selection64 = build_campaign_selection(
+                plan64, role="primary", leaf_ids=(leaf64.leaf_id,)
+            )
+
+            class Binary64Backend:
+                identity = plan64.backend_identity
+                precision_capabilities = binary64
+
+                def __init__(self):
+                    self.calls = []
+
+                def execute_stage(self, selected, digits):
+                    self.calls.append(digits)
+                    return _authenticated_primary_stage(
+                        selected, digits, ComponentStatus.NOT_CONVERGED
+                    )
+
+            with tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                store = SolvedLeafStore(root / "solved")
+                backend = Binary64Backend()
+                summary = run_campaign_selection(
+                    plan64,
+                    selection64,
+                    backend,
+                    root / "primary.json",
+                    resume=False,
+                    solved_leaf_store=store,
+                )
+
+            self.assertEqual(backend.calls, [64])
+            self.assertEqual(summary.state, "PARTIAL")
+            self.assertEqual(summary.records[0].state, "MISSING_PRECISION")
+            self.assertEqual(summary.records[0].missing_precision_digits, 80)
+            self.assertEqual(store.stored_count, 0)
+
+    def test_component_status_body_contract_is_enforced_at_every_primary_tier(self) -> None:
+        """Catches sealed status/body contradictions accepted as production."""
+
+        capabilities = PrecisionCapabilities((64, 80, 120))
+        plan = build_campaign_plan(
+            policy=NumericalPolicy(),
+            backend_identity=VettedNativeDeterminantKernel.identity,
+            precision_capabilities=capabilities,
+        )
+        leaf = next(item for item in plan.leaves if item.role == "primary")
+        selection = build_campaign_selection(
+            plan, role="primary", leaf_ids=(leaf.leaf_id,)
+        )
+        contradictions = (
+            (
+                "converged-response-null",
+                ComponentStatus.CONVERGED,
+                {"response": None},
+                {},
+            ),
+            (
+                "converged-signed-root-null",
+                ComponentStatus.CONVERGED,
+                {"signed_root_crosscheck": None},
+                {},
+            ),
+            (
+                "converged-basis-unresolved",
+                ComponentStatus.CONVERGED,
+                {"convergence_basis": "UNRESOLVED"},
+                {},
+            ),
+            (
+                "converged-claims-unusable",
+                ComponentStatus.CONVERGED,
+                {},
+                {"usable": False},
+            ),
+            (
+                "unresolved-response-present",
+                ComponentStatus.NOT_CONVERGED,
+                {"response": complex(1.0, -0.5)},
+                {},
+            ),
+            (
+                "unresolved-signed-root-present",
+                ComponentStatus.NOT_CONVERGED,
+                {"signed_root_crosscheck": complex(1.0, -0.5)},
+                {},
+            ),
+            (
+                "unresolved-closed-form-present",
+                ComponentStatus.NOT_CONVERGED,
+                {"closed_form_response": complex(1.0, -0.5)},
+                {},
+            ),
+            (
+                "unresolved-basis-resolved",
+                ComponentStatus.NOT_CONVERGED,
+                {"convergence_basis": "ORDER_RESOLVED"},
+                {},
+            ),
+            (
+                "unresolved-claims-usable",
+                ComponentStatus.NOT_CONVERGED,
+                {},
+                {"usable": True},
+            ),
+        )
+
+        for digits in (64, 80, 120):
+            for name, status, result_changes, raw_changes in contradictions:
+                with self.subTest(digits=digits, contradiction=name), tempfile.TemporaryDirectory() as temporary:
+                    class Backend:
+                        identity = plan.backend_identity
+                        precision_capabilities = capabilities
+
+                        def execute_stage(self, selected, current_digits):
+                            if current_digits == digits:
+                                target = _authenticated_primary_stage(
+                                    selected,
+                                    current_digits,
+                                    status,
+                                    self_refinement_enclosed=(
+                                        False if current_digits == 80 else None
+                                    ),
+                                    discrepancy_from_previous_abs=(
+                                        1.0e-9 if current_digits > 64 else None
+                                    ),
+                                    discrepancy_enclosed=(
+                                        True if current_digits > 64 else None
+                                    ),
+                                )
+                                return _replace_component_result_fields(
+                                    target,
+                                    result_changes=result_changes,
+                                    raw_changes=raw_changes,
+                                )
+                            if current_digits == 64:
+                                return _authenticated_primary_stage(
+                                    selected,
+                                    current_digits,
+                                    ComponentStatus.NOT_CONVERGED,
+                                )
+                            if current_digits == 80:
+                                return _authenticated_primary_stage(
+                                    selected,
+                                    current_digits,
+                                    ComponentStatus.CONVERGED,
+                                    self_refinement_enclosed=False,
+                                    discrepancy_from_previous_abs=1.0e-9,
+                                    discrepancy_enclosed=True,
+                                )
+                            return _authenticated_primary_stage(
+                                selected,
+                                current_digits,
+                                ComponentStatus.CONVERGED,
+                                discrepancy_from_previous_abs=1.0e-10,
+                                discrepancy_enclosed=True,
+                            )
+
+                    with self.assertRaisesRegex(
+                        ValueError,
+                        "component result.*status|component result.*canonical",
+                    ):
+                        run_campaign_selection(
+                            plan,
+                            selection,
+                            Backend(),
+                            Path(temporary) / "contradiction.json",
+                            resume=False,
+                        )
+
+    def test_primary_terminal_component_statuses_and_control_never_promote(self) -> None:
+        """Catches the PRIMARY ladder promoting scientific terminal statuses."""
+
+        capabilities = PrecisionCapabilities((64, 80, 120))
+        plan = build_campaign_plan(
+            policy=NumericalPolicy(),
+            backend_identity=VettedNativeDeterminantKernel.identity,
+            precision_capabilities=capabilities,
+        )
+        for role, status, terminal_state in (
+            ("primary", ComponentStatus.CONVERGED, "PRODUCED"),
+            ("primary", ComponentStatus.BRANCH_LOSS, "UNRESOLVED"),
+            ("primary", ComponentStatus.NOISE_FLOOR, "UNRESOLVED"),
+            ("primary", ComponentStatus.AXIS_MISMATCH, "UNRESOLVED"),
+            ("control", ComponentStatus.NOT_CONVERGED, "UNRESOLVED"),
+        ):
+            leaf = next(item for item in plan.leaves if item.role == role)
+            selection = build_campaign_selection(
+                plan, role=role, leaf_ids=(leaf.leaf_id,)
+            )
+
+            class Backend:
+                identity = plan.backend_identity
+                precision_capabilities = capabilities
+
+                def __init__(self):
+                    self.calls = []
+
+                def execute_stage(self, selected, digits):
+                    self.calls.append(digits)
+                    return _authenticated_primary_stage(selected, digits, status)
+
+            with self.subTest(role=role, status=status.value), tempfile.TemporaryDirectory() as temporary:
+                backend = Backend()
+                root = Path(temporary)
+                checkpoint = root / "terminal.json"
+                store = (
+                    SolvedLeafStore(root / "solved")
+                    if status is ComponentStatus.BRANCH_LOSS
+                    else None
+                )
+                summary = run_campaign_selection(
+                    plan,
+                    selection,
+                    backend,
+                    checkpoint,
+                    resume=False,
+                    solved_leaf_store=store,
+                )
+                self.assertEqual(backend.calls, [64])
+                self.assertEqual(summary.records[0].state, terminal_state)
+                self.assertEqual(
+                    validate_campaign_checkpoint(plan, checkpoint).records,
+                    summary.records,
+                )
+                if terminal_state == "PRODUCED":
+                    self.assertEqual(
+                        _produced_response(summary.records[0]),
+                        complex(1.0, -0.5),
+                    )
+                if store is not None:
+                    self.assertEqual(store.stored_count, 1)
+
+        mislabeled_leaf = next(
+            item for item in plan.leaves if item.role == "primary"
+        )
+        mislabeled_selection = build_campaign_selection(
+            plan, role="primary", leaf_ids=(mislabeled_leaf.leaf_id,)
+        )
+
+        class MislabeledBranchLossBackend:
+            identity = plan.backend_identity
+            precision_capabilities = capabilities
+
+            def execute_stage(self, selected, digits):
+                return _authenticated_primary_stage(
+                    selected,
+                    digits,
+                    ComponentStatus.BRANCH_LOSS,
+                    branch_loss_mismatch=False,
+                )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            with self.assertRaisesRegex(ValueError, "lacks an identity mismatch"):
+                run_campaign_selection(
+                    plan,
+                    mislabeled_selection,
+                    MislabeledBranchLossBackend(),
+                    Path(temporary) / "mislabeled-branch-loss.json",
+                    resume=False,
+                )
 
 
 class DeepPrecisionTests(unittest.TestCase):
@@ -147,70 +681,6 @@ class DeepPrecisionTests(unittest.TestCase):
             self.assertEqual(complete.state, "COMPLETE")
             self.assertEqual(complete.records[0].state, "PRODUCED")
             self.assertEqual(promoted.calls, [(SENTINEL, 80)])
-
-    def test_resume_passes_authenticated_prior_outcomes_to_promoted_backend(self) -> None:
-        binary64_capabilities = PrecisionCapabilities((64,))
-        promoted_capabilities = PrecisionCapabilities((64, 80))
-        plan = build_campaign_plan(
-            policy=NumericalPolicy(),
-            backend_identity=VettedNativeDeterminantKernel.identity,
-            precision_capabilities=binary64_capabilities,
-        )
-        selection = build_campaign_selection(
-            plan, role="deep", leaf_ids=(SENTINEL,)
-        )
-
-        class Binary64Backend:
-            identity = plan.backend_identity
-            precision_capabilities = binary64_capabilities
-
-            def execute_stage(self, leaf, digits):
-                return _synthetic_stage_outcome(
-                    digits=digits,
-                    numerical_state="CONVERGED",
-                    component_result={"leaf_id": leaf.leaf_id, "digits": digits},
-                    local_disk_radius_abs=1.0e-6,
-                    deep_diagnostics=diagnostics(digits=12.0),
-                )
-
-        class PromotedBackend:
-            identity = plan.backend_identity
-            precision_capabilities = promoted_capabilities
-
-            def __init__(self):
-                self.previous = None
-
-            def execute_stage(self, leaf, digits):
-                raise AssertionError("promoted resume lost its prior-stage boundary")
-
-            def execute_promoted_stage(self, leaf, digits, previous_outcomes):
-                self.previous = previous_outcomes
-                return _synthetic_stage_outcome(
-                    digits=digits,
-                    numerical_state="CONVERGED",
-                    component_result={"leaf_id": leaf.leaf_id, "digits": digits},
-                    local_disk_radius_abs=1.0e-8,
-                    self_refinement_enclosed=True,
-                    discrepancy_from_previous_abs=2.0e-8,
-                    discrepancy_enclosed=True,
-                )
-
-        with tempfile.TemporaryDirectory() as temporary:
-            checkpoint = Path(temporary) / "promoted-resume.json"
-            run_campaign_selection(
-                plan, selection, Binary64Backend(), checkpoint, resume=False
-            )
-            promoted = PromotedBackend()
-            completed = run_campaign_selection(
-                plan, selection, promoted, checkpoint, resume=True
-            )
-
-        self.assertEqual(completed.state, "COMPLETE")
-        self.assertIsNotNone(promoted.previous)
-        self.assertEqual(tuple(stage.digits for stage in promoted.previous), (64,))
-        self.assertEqual(
-            promoted.previous[0].component_result["leaf_id"], SENTINEL
-        )
 
     def test_resealed_sentinel64_and_inconsistent_state_are_rejected(self) -> None:
         capabilities = PrecisionCapabilities((64,))
