@@ -41,6 +41,41 @@ _BRANCH_TOLERANCE_DECIMAL = Decimal(
 )
 
 
+def promoted_precision_numerical_controls() -> dict[str, object]:
+    """Return the canonical root/ODE/derivative controls for promoted tiers."""
+
+    return {
+        "80": {
+            "base": {
+                "root_tolerance": "1e-18",
+                "ode_relative_tolerance": "1e-18",
+                "ode_absolute_tolerance": "1e-20",
+                "frequency_step": "1e-6",
+            },
+            "refinement": {
+                "root_tolerance": "1e-20",
+                "ode_relative_tolerance": "1e-20",
+                "ode_absolute_tolerance": "1e-20",
+                "frequency_step": "1e-7",
+            },
+        },
+        "120": {
+            "base": {
+                "root_tolerance": "1e-102",
+                "ode_relative_tolerance": "1e-102",
+                "ode_absolute_tolerance": "1e-104",
+                "frequency_step": "1e-60",
+            },
+            "refinement": {
+                "root_tolerance": "1e-106",
+                "ode_relative_tolerance": "1e-106",
+                "ode_absolute_tolerance": "1e-108",
+                "frequency_step": "1e-60",
+            },
+        },
+    }
+
+
 def _forward_julia_progress_line(line: str) -> bool:
     """Forward one reserved worker event; return whether the line was reserved."""
 
@@ -462,18 +497,16 @@ def _precision_policy(job: ResponseComponentJob, digits: int, refinement: int) -
         raise ValueError("Julia response precision must be 80 or 120 digits")
     if refinement not in (0, 1):
         raise ValueError("Julia response refinement level must be zero or one")
-    effective = digits - (18 if refinement == 0 else 14)
+    level = "base" if refinement == 0 else "refinement"
+    controls = promoted_precision_numerical_controls()[str(digits)][level]
     return {
         "readout_radius": format(job.policy.readout_radius, ".17g"),
-        "ode_relative_tolerance": f"1e-{effective}",
-        "ode_absolute_tolerance": f"1e-{effective + 2}",
+        **controls,
         "endpoint_series_order": job.policy.endpoint_series_order + 8 * refinement,
         "support_subinterval_count": job.policy.support_subinterval_count * (2 ** refinement),
         "angular_pad": 18 + 8 * refinement,
         "rho_in": "-5000",
         "rho_out": "5000",
-        "frequency_step": f"1e-{max(24, digits // 2)}",
-        "root_tolerance": f"1e-{effective}",
         "max_newton_iterations": 16,
     }
 
