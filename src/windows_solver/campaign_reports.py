@@ -153,10 +153,10 @@ class CampaignReportModel:
     """One normalized projection shared by CSV and terminal renderers."""
 
     leaf_rows: tuple[Mapping[str, object], ...]
-    precision_stage_rows: tuple[Mapping[str, object], ...]
     error_channel_rows: tuple[Mapping[str, object], ...]
     projective_rows: tuple[Mapping[str, object], ...]
     checkpoint_source_receipt: str
+    precision_stage_rows: tuple[Mapping[str, object], ...] = ()
 
 
 def report_directory_for_checkpoint(checkpoint_path: str | os.PathLike[str]) -> Path:
