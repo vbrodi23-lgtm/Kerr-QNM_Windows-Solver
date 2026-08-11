@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from decimal import Decimal
 import hashlib
+import io
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -19,9 +20,12 @@ from windows_solver.julia_response_backend import (
 from windows_solver.progress import PROGRESS_SCHEMA, ProgressEventKind, activate_progress
 from windows_solver.response_batches import (
     PrecisionCapabilities,
+    build_campaign_selection,
     build_campaign_plan,
+    run_campaign_selection,
 )
 from windows_solver.response_engine import NumericalPolicy, VettedNativeDeterminantKernel
+from windows_solver.progress_output import CampaignProgressReporter
 
 
 def _deep_job():
@@ -101,6 +105,29 @@ class JuliaResponseBackendTests(unittest.TestCase):
         self.assertIn('"branch_tolerance_abs" => numeric_text(branch_tolerance)', worker)
         self.assertIn('"root_displacement_abs" => numeric_text(abs(root - omega))', worker)
         self.assertNotIn('document["progress', worker)
+
+    def test_package_worker_preserves_radial_tolerances_and_reports_r_from_rho(self):
+        """Catches collapsing the promoted ODE tolerance pair or hiding its map."""
+
+        worker = (
+            Path(__file__).resolve().parents[1]
+            / "src/windows_solver/data/julia/m02_worker.jl"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn(
+            'relative_tolerance = parse_real(T, request, "ode_relative_tolerance")',
+            worker,
+        )
+        self.assertIn(
+            'absolute_tolerance = parse_real(T, request, "ode_absolute_tolerance")',
+            worker,
+        )
+        self.assertIn('radius_from_rho = progress_operation("r-from-rho") do', worker)
+        self.assertIn("reltol=relative_tolerance", worker)
+        self.assertIn("abstol=absolute_tolerance", worker)
+        self.assertNotIn("tolerance = min(", worker)
+        self.assertNotIn("reltol=tolerance", worker)
+        self.assertNotIn("abstol=tolerance", worker)
 
     def test_reserved_julia_stdout_event_is_forwarded_to_active_reporter(self):
         class Observer:
@@ -497,6 +524,134 @@ class JuliaResponseBackendTests(unittest.TestCase):
             )
             with self.assertRaisesRegex(JuliaResponseBackendError, "request digest"):
                 adapter.evaluate({"schema_version": 1})
+
+    def test_nonzero_worker_exit_exposes_structured_error_receipt(self):
+        """Catches discarding the worker's own exit/error receipt on failure."""
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for name in ("julia.exe", "Project.toml", "Manifest.toml", "worker.jl"):
+                (root / name).write_text(name, encoding="ascii")
+            depot = root / "depot"
+            depot.mkdir()
+
+            def runner(command, **kwargs):
+                Path(command[-1]).write_bytes(canonical_json_bytes({
+                    "schema_version": 1,
+                    "status": "error",
+                    "error_type": "ErrorException",
+                    "message": "r-from-rho failed",
+                }))
+                return SimpleNamespace(
+                    returncode=21,
+                    stdout="",
+                    stderr="synthetic Julia traceback",
+                )
+
+            adapter = JuliaResponseAdapter(
+                root / "julia.exe",
+                root,
+                depot,
+                root / "worker.jl",
+                {},
+                runner,
+            )
+            with self.assertRaisesRegex(JuliaResponseBackendError, "code 21") as raised:
+                adapter.evaluate({"schema_version": 1})
+
+        self.assertEqual(raised.exception.worker_failure, {
+            "worker_exit_code": 21,
+            "worker_timed_out": False,
+            "worker_stderr_tail": "synthetic Julia traceback",
+            "worker_error_type": "ErrorException",
+            "worker_error_message": "r-from-rho failed",
+        })
+
+    def test_worker_timeout_is_explicit_in_failure_diagnostic(self):
+        """Catches a killed worker being reported as an opaque nonzero exit."""
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for name in ("julia.exe", "Project.toml", "Manifest.toml", "worker.jl"):
+                (root / name).write_text(name, encoding="ascii")
+            depot = root / "depot"
+            depot.mkdir()
+
+            def runner(command, **kwargs):
+                return SimpleNamespace(
+                    returncode=-9,
+                    stdout="",
+                    stderr="Julia worker timed out after 60 seconds\n",
+                    timed_out=True,
+                )
+
+            adapter = JuliaResponseAdapter(
+                root / "julia.exe",
+                root,
+                depot,
+                root / "worker.jl",
+                {},
+                runner,
+            )
+            with self.assertRaisesRegex(JuliaResponseBackendError, "timed out") as raised:
+                adapter.evaluate({"schema_version": 1})
+
+        self.assertEqual(raised.exception.worker_failure, {
+            "worker_exit_code": -9,
+            "worker_timed_out": True,
+            "worker_stderr_tail": "Julia worker timed out after 60 seconds\n",
+            "worker_error_type": None,
+            "worker_error_message": None,
+        })
+
+    def test_campaign_failure_status_persists_worker_diagnostic(self):
+        """Catches final status overwriting the failed worker's exact diagnostic."""
+
+        plan = build_campaign_plan(
+            policy=NumericalPolicy(),
+            backend_identity=VettedNativeDeterminantKernel.identity,
+            precision_capabilities=PrecisionCapabilities((64, 80, 120)),
+        )
+        leaf = next(item for item in plan.leaves if item.role == "primary")
+        selection = build_campaign_selection(
+            plan,
+            role="primary",
+            leaf_ids=(leaf.leaf_id,),
+        )
+        failure = JuliaResponseBackendError("M02 Julia worker failed with code 21")
+        failure.worker_failure = {
+            "worker_exit_code": 21,
+            "worker_timed_out": False,
+            "worker_stderr_tail": "synthetic Julia traceback",
+            "worker_error_type": "ErrorException",
+            "worker_error_message": "r-from-rho failed",
+        }
+
+        class FailingBackend:
+            identity = plan.backend_identity
+            precision_capabilities = plan.precision_capabilities
+
+            def execute_stage(self, selected_leaf, digits):
+                raise failure
+
+        with tempfile.TemporaryDirectory() as temporary:
+            checkpoint = Path(temporary) / "checkpoint.json"
+            reporter = CampaignProgressReporter("normal", checkpoint, io.StringIO())
+            with activate_progress(reporter):
+                with self.assertRaisesRegex(JuliaResponseBackendError, "code 21"):
+                    run_campaign_selection(
+                        plan,
+                        selection,
+                        FailingBackend(),
+                        checkpoint,
+                        resume=False,
+                    )
+            status = json.loads(
+                Path(f"{checkpoint}.status.json").read_text(encoding="utf-8")
+            )
+
+        self.assertEqual(status["kind"], "campaign_failed")
+        self.assertEqual(status["payload"]["worker_failure"], failure.worker_failure)
 
     def test_runtime_receipt_uses_persistent_worker_and_juliaup_channel(self):
         with tempfile.TemporaryDirectory() as temporary:

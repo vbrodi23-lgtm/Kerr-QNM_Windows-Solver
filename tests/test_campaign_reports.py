@@ -2,12 +2,16 @@ from __future__ import annotations
 
 import csv
 import hashlib
+import io
 from pathlib import Path
 import tempfile
+from types import SimpleNamespace
 import unittest
 
-from windows_solver.campaign_reports import refresh_campaign_reports
+from windows_solver.campaign_reports import CampaignReportModel, refresh_campaign_reports
 from windows_solver.contracts import canonical_json_bytes
+from windows_solver.progress import ProgressEventKind
+from windows_solver.progress_output import CampaignProgressReporter
 from windows_solver.response_batches import (
     CampaignLeafRecord,
     CampaignStageRecord,
@@ -134,7 +138,7 @@ class CampaignReportTests(unittest.TestCase):
             ))
             original_checkpoint = checkpoint.read_bytes()
 
-            refresh_campaign_reports(
+            model = refresh_campaign_reports(
                 plan,
                 checkpoint,
                 run_provenance={leaf.leaf_id: "EXECUTED"},
@@ -180,6 +184,51 @@ class CampaignReportTests(unittest.TestCase):
             self.assertEqual(
                 float(current["signed_root_crosscheck_imaginary"]), -0.5
             )
+            self.assertEqual(len(model.precision_stage_rows), 1)
+            stage_row = model.precision_stage_rows[0]
+            self.assertEqual(stage_row["root"], "220 a/M=0.95")
+            self.assertEqual(stage_row["precision_digits"], 64)
+            self.assertEqual(stage_row["numerical_state"], "CONVERGED")
+            self.assertIs(stage_row["converged"], True)
+            self.assertIs(stage_row["branch_ok"], True)
+            self.assertAlmostEqual(stage_row["determinant_abs"], 1.42e-11)
+            self.assertAlmostEqual(
+                stage_row["determinant_over_tolerance"], 0.71
+            )
+            self.assertAlmostEqual(stage_row["newton_correction"], 1.42e-11)
+            self.assertEqual(stage_row["root_displacement_abs"], 0.0)
+
+            reporter = CampaignProgressReporter("normal", checkpoint, io.StringIO())
+            reporter._campaign_report_model = model
+            table = "\n".join(reporter._precision_stage_table_lines())
+            self.assertIn("ROOT", table)
+            self.assertIn("D_OVER_TOL", table)
+            self.assertIn("NEWTON_DW", table)
+            self.assertIn("DELTA_ROOT", table)
+            self.assertIn("220 a/M=0.95", table)
+            self.assertIn("CONVERGED", table)
+            reporter._last_terminal_state = "CONVERGED"
+            reporter._dashboard_state["mechanism_id"] = "horizon-admittance"
+            compact = "\n".join(reporter._compact_dashboard_lines({
+                "sequence": 1,
+                "kind": ProgressEventKind.PRECISION_STAGE_COMPLETED.value,
+                "elapsed_seconds": 0.0,
+            }, 32))
+            self.assertIn("LATEST COMPLETED LEAF", compact)
+            self.assertIn("PRECISION STAGE RESULTS", compact)
+            self.assertIn("220 a/M=0.95", compact)
+            self.assertIn(" State          CONVERGED", compact)
+            self.assertIn(" Mechanism      horizon-admittance", compact)
+            self.assertTrue(reporter._should_render_dashboard(
+                SimpleNamespace(kind=ProgressEventKind.PRECISION_STAGE_COMPLETED)
+            ))
+            legacy_fixture = CampaignReportModel(
+                leaf_rows=(),
+                error_channel_rows=(),
+                projective_rows=(),
+                checkpoint_source_receipt="fixture-receipt",
+            )
+            self.assertEqual(legacy_fixture.precision_stage_rows, ())
             pending = next(item for item in leaves if item["leaf_id"] != leaf.leaf_id)
             self.assertEqual(pending["terminal_state"], "PENDING")
             self.assertEqual(pending["response_real"], "")

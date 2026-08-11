@@ -89,9 +89,11 @@ def _run_streamed_julia(
     stderr_thread = Thread(target=read_stderr, daemon=True)
     stdout_thread.start()
     stderr_thread.start()
+    timed_out = False
     try:
         returncode = process.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
+        timed_out = True
         process.kill()
         returncode = process.wait()
         stderr_lines.append(f"Julia worker timed out after {timeout} seconds\n")
@@ -101,6 +103,7 @@ def _run_streamed_julia(
         returncode=returncode,
         stdout="".join(stdout_lines)[-4000:],
         stderr="".join(stderr_lines)[-4000:],
+        timed_out=timed_out,
     )
 
 
@@ -148,6 +151,70 @@ def _strict_json_file(path: Path, label: str) -> dict[str, object]:
     if not isinstance(value, dict):
         raise JuliaResponseBackendError(f"{label} must be a JSON object")
     return value
+
+
+def _worker_failure_details(
+    completed: object,
+    response_path: Path,
+    *,
+    response: Mapping[str, object] | None = None,
+) -> dict[str, object]:
+    """Extract an operational failure receipt without treating it as science."""
+
+    error_response = response
+    if error_response is None:
+        try:
+            error_response = _strict_json_file(
+                response_path, "M02 Julia worker failure response"
+            )
+        except JuliaResponseBackendError:
+            error_response = None
+    error_type: str | None = None
+    error_message: str | None = None
+    if (
+        isinstance(error_response, Mapping)
+        and set(error_response) == {
+            "schema_version", "status", "error_type", "message"
+        }
+        and error_response["schema_version"] == 1
+        and error_response["status"] == "error"
+        and isinstance(error_response["error_type"], str)
+        and isinstance(error_response["message"], str)
+    ):
+        error_type = error_response["error_type"]
+        error_message = error_response["message"]
+    raw_exit_code = getattr(completed, "returncode", None)
+    exit_code = (
+        raw_exit_code
+        if isinstance(raw_exit_code, int) and not isinstance(raw_exit_code, bool)
+        else None
+    )
+    return {
+        "worker_exit_code": exit_code,
+        "worker_timed_out": bool(getattr(completed, "timed_out", False)),
+        "worker_stderr_tail": str(getattr(completed, "stderr", ""))[-4000:],
+        "worker_error_type": error_type,
+        "worker_error_message": error_message,
+    }
+
+
+def _raise_worker_failure(details: Mapping[str, object]) -> None:
+    """Raise an operational error while retaining bounded worker diagnostics."""
+
+    timed_out = details["worker_timed_out"] is True
+    exit_code = details["worker_exit_code"]
+    prefix = "M02 Julia worker timed out" if timed_out else "M02 Julia worker failed"
+    message = f"{prefix} with code {exit_code}"
+    error_type = details["worker_error_type"]
+    error_message = details["worker_error_message"]
+    stderr = details["worker_stderr_tail"]
+    if isinstance(error_type, str) and isinstance(error_message, str):
+        message += f": {error_type}: {error_message}"
+    elif isinstance(stderr, str) and stderr:
+        message += f": {stderr}"
+    failure = JuliaResponseBackendError(message)
+    failure.worker_failure = dict(details)
+    raise failure
 
 
 def _finite_text(value: object, label: str) -> float:
@@ -333,15 +400,14 @@ class JuliaResponseAdapter:
                 )
             returncode = getattr(completed, "returncode", None)
             if returncode != 0:
-                stderr = str(getattr(completed, "stderr", ""))[-4000:]
-                raise JuliaResponseBackendError(
-                    f"M02 Julia worker failed with code {returncode}: {stderr}"
-                )
+                _raise_worker_failure(_worker_failure_details(
+                    completed, response_path
+                ))
             response = _strict_json_file(response_path, "M02 Julia response")
         if response.get("status") != "ok":
-            raise JuliaResponseBackendError(
-                f"M02 Julia worker rejected the request: {response.get('message')}"
-            )
+            _raise_worker_failure(_worker_failure_details(
+                completed, response_path, response=response
+            ))
         if response.get("request_sha256") != request_sha256:
             raise JuliaResponseBackendError("M02 Julia response request digest mismatch")
         return response
