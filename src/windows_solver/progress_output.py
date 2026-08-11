@@ -1126,14 +1126,20 @@ class CampaignProgressReporter:
             ),
             "",
             " LATEST COMPLETED LEAF",
-            (
-                f" State {self._dashboard_value(fields.get('ResultState') or self._last_terminal_state)}"
-                f" | Mechanism {self._dashboard_value(fields.get('ResultMechanism') or self._dashboard_state.get('mechanism_id'))}"
+            self._dashboard_field_line(
+                "State", fields.get("ResultState") or self._last_terminal_state
+            ),
+            self._dashboard_field_line(
+                "Mechanism",
+                fields.get("ResultMechanism")
+                or self._dashboard_state.get("mechanism_id"),
             ),
             (
-                f" Spin {self._dashboard_value(fields.get('ResultSpin') or self._dashboard_state.get('spin'))}"
+                f" Spin           {self._dashboard_value(fields.get('ResultSpin') or self._dashboard_state.get('spin'))}"
                 f" | Precision {self._precision_value(fields)}"
-                f" | Convergence {self._dashboard_value(fields.get('Convergence'))}"
+            ),
+            self._dashboard_field_line(
+                "Convergence", fields.get("Convergence")
             ),
             response,
             disk,
