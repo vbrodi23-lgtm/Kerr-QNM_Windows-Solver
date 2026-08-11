@@ -153,6 +153,7 @@ class CampaignReportModel:
     """One normalized projection shared by CSV and terminal renderers."""
 
     leaf_rows: tuple[Mapping[str, object], ...]
+    precision_stage_rows: tuple[Mapping[str, object], ...]
     error_channel_rows: tuple[Mapping[str, object], ...]
     projective_rows: tuple[Mapping[str, object], ...]
     checkpoint_source_receipt: str
@@ -185,13 +186,92 @@ def _csv_cell(value: object) -> str:
     return str(value)
 
 
-def _component_result(record: CampaignLeafRecord) -> ComponentResult | None:
-    if not record.stages:
+def _stage_component_result(stage: object) -> ComponentResult | None:
+    outcome = getattr(stage, "outcome", None)
+    component_result = getattr(outcome, "component_result", None)
+    if not isinstance(component_result, Mapping):
         return None
-    raw = record.stages[-1].outcome.component_result.get("result")
+    raw = component_result.get("result")
     if not isinstance(raw, Mapping):
         return None
     return ComponentResult.from_mapping(raw)
+
+
+def _component_result(record: CampaignLeafRecord) -> ComponentResult | None:
+    if not record.stages:
+        return None
+    return _stage_component_result(record.stages[-1])
+
+
+def _root_tolerance_for_precision(digits: int) -> float:
+    """Return the display-only Newton residual threshold for one M02 stage."""
+
+    if digits == 64:
+        return 2.0e-11
+    if digits in {80, 120}:
+        return 10.0 ** -(digits - 18)
+    raise ValueError("campaign report stage precision is invalid")
+
+
+def _precision_stage_rows(
+    plan: CampaignPlan,
+    records_by_id: Mapping[str, CampaignLeafRecord],
+) -> tuple[Mapping[str, object], ...]:
+    """Project every committed precision stage for the terminal dashboard."""
+
+    rows: list[Mapping[str, object]] = []
+    for ordinal, leaf in enumerate(plan.leaves, start=1):
+        record = records_by_id.get(leaf.leaf_id)
+        if record is None:
+            continue
+        domain_leaf = leaf.leaf
+        root_label = (
+            f"{domain_leaf.mode_label} a/M="
+            f"{format(float(domain_leaf.coordinate), '.6g')}"
+        )
+        for stage_index, stage in enumerate(record.stages, start=1):
+            outcome = stage.outcome
+            result = _stage_component_result(stage)
+            row: dict[str, object] = {
+                "leaf_ordinal": ordinal,
+                "leaf_id": leaf.leaf_id,
+                "stage_index": stage_index,
+                "root": root_label,
+                "precision_digits": outcome.digits,
+                "numerical_state": outcome.numerical_state,
+                "component_status": None,
+                "converged": None,
+                "branch_ok": None,
+                "determinant_abs": None,
+                "determinant_over_tolerance": None,
+                "newton_correction": None,
+                "root_displacement_abs": None,
+            }
+            if result is not None:
+                baseline = result.baseline
+                determinant_abs = baseline.determinant_residual_abs
+                row.update({
+                    "component_status": result.status.value,
+                    "converged": baseline.converged,
+                    "branch_ok": (
+                        result.status.value != "BRANCH_LOSS"
+                        and baseline.root_reference_id
+                        == leaf.job.root.root_reference_id
+                        and baseline.branch_id == leaf.job.root.branch_id
+                        and baseline.equation_id == leaf.job.equation_id
+                    ),
+                    "determinant_abs": determinant_abs,
+                    "determinant_over_tolerance": (
+                        determinant_abs
+                        / _root_tolerance_for_precision(outcome.digits)
+                    ),
+                    "newton_correction": baseline.newton_correction_estimate,
+                    "root_displacement_abs": abs(
+                        baseline.omega - leaf.job.root.omega
+                    ),
+                })
+            rows.append(row)
+    return tuple(rows)
 
 
 def _leaf_row(
@@ -457,6 +537,7 @@ def project_campaign_reports(
         )
         for ordinal, leaf in enumerate(plan.leaves, start=1)
     )
+    precision_stage_rows = _precision_stage_rows(plan, records_by_id)
     ordinal_by_id = {
         leaf.leaf_id: ordinal
         for ordinal, leaf in enumerate(plan.leaves, start=1)
@@ -583,6 +664,7 @@ def project_campaign_reports(
     )
     return CampaignReportModel(
         leaf_rows=leaf_rows,
+        precision_stage_rows=precision_stage_rows,
         error_channel_rows=error_rows,
         projective_rows=projective_rows,
         checkpoint_source_receipt=source_receipt,
