@@ -23,6 +23,7 @@ from .linear_response import B_PRIME_RELEASE_DOMAIN, BPrimeLeaf
 from .response_engine import (
     BackendIdentity,
     ComponentResult,
+    ComponentStatus,
     NativeDeterminantAdapter,
     NativeResourceUnavailableError,
     NumericalPolicy,
@@ -70,6 +71,8 @@ _EXECUTION_ROLE_ORDER = {
     "deep": 1,
     "control": 2,
 }
+_LEGACY_MIGRATION_LOCK_TIMEOUT_SECONDS = 1.0
+_LEGACY_MIGRATION_LOCK_RETRY_SECONDS = 0.01
 _EXECUTION_MECHANISM_ORDER = {
     "horizon-admittance": 0,
     "exterior-light-ring": 1,
@@ -868,7 +871,30 @@ class CampaignPlan:
         }
 
 
-def _leaf_precision_contract(leaf: CampaignLeafPlan) -> dict[str, object]:
+def _primary_recovery_precision_contract() -> dict[str, object]:
+    """Return the canonical PRIMARY promoted-precision policy fragment."""
+
+    return {
+        "binary64_trigger": {
+            "component_status": ComponentStatus.NOT_CONVERGED.value,
+            "requires_canonical_production_evidence": True,
+        },
+        "recovery_digits": [80, 120],
+        "precision120_gates": {
+            "component_status": ComponentStatus.NOT_CONVERGED.value,
+            "self_refinement_enclosed": False,
+            "discrepancy_enclosed": False,
+        },
+        "precision120_terminal_success": {
+            "component_status": ComponentStatus.CONVERGED.value,
+            "discrepancy_enclosed": True,
+        },
+    }
+
+
+def _legacy_leaf_precision_contract(leaf: CampaignLeafPlan) -> dict[str, object]:
+    """Return the exact precision contract used by the immediate predecessor."""
+
     return {
         "binary64_stage_required": True,
         "deep_leaf": leaf.role == "deep",
@@ -880,14 +906,19 @@ def _leaf_precision_contract(leaf: CampaignLeafPlan) -> dict[str, object]:
     }
 
 
-def scientific_computation_identity_sha256(
-    plan: CampaignPlan, leaf: CampaignLeafPlan
-) -> str:
-    """Bind one requested calculation without binding campaign presentation code."""
+def _leaf_precision_contract(leaf: CampaignLeafPlan) -> dict[str, object]:
+    contract = _legacy_leaf_precision_contract(leaf)
+    if leaf.role == "primary":
+        contract["primary_recovery"] = _primary_recovery_precision_contract()
+    return contract
 
-    if leaf.leaf_id not in {item.leaf_id for item in plan.leaves}:
-        raise ValueError("solved-leaf scientific identity is outside the campaign plan")
-    material = {
+
+def _scientific_computation_identity_material(
+    plan: CampaignPlan,
+    leaf: CampaignLeafPlan,
+    precision_contract: Mapping[str, object],
+) -> dict[str, object]:
+    return {
         "schema_version": 1,
         "leaf_id": leaf.leaf_id,
         "role": leaf.role,
@@ -902,9 +933,35 @@ def scientific_computation_identity_sha256(
         "mechanism_id": leaf.mechanism_id,
         "response_job": leaf.job.to_mapping(),
         "precision_factory_identity": plan.precision_factory_identity.to_mapping(),
-        "precision_contract": _leaf_precision_contract(leaf),
+        "precision_contract": precision_contract,
     }
+
+
+def scientific_computation_identity_sha256(
+    plan: CampaignPlan, leaf: CampaignLeafPlan
+) -> str:
+    """Bind one requested calculation without binding campaign presentation code."""
+
+    if leaf.leaf_id not in {item.leaf_id for item in plan.leaves}:
+        raise ValueError("solved-leaf scientific identity is outside the campaign plan")
+    material = _scientific_computation_identity_material(
+        plan, leaf, _leaf_precision_contract(leaf)
+    )
     return _sha256(material)
+
+
+def _legacy_primary_scientific_computation_identity_sha256(
+    plan: CampaignPlan, leaf: CampaignLeafPlan
+) -> str:
+    """Derive the exact binary64-only PRIMARY predecessor identity."""
+
+    if leaf.role != "primary":
+        raise ValueError("legacy PRIMARY identity requires a PRIMARY leaf")
+    if leaf.leaf_id not in {item.leaf_id for item in plan.leaves}:
+        raise ValueError("legacy PRIMARY identity is outside the campaign plan")
+    return _sha256(_scientific_computation_identity_material(
+        plan, leaf, _legacy_leaf_precision_contract(leaf)
+    ))
 
 
 def _campaign_cohorts() -> tuple[CampaignCohort, ...]:
@@ -1132,6 +1189,7 @@ def _checkpoint_bindings(
             "fixed_sentinel_leaf_ids": list(
                 B_PRIME_RELEASE_DOMAIN.fixed_precision_sentinel_leaf_ids
             ),
+            "primary_recovery": _primary_recovery_precision_contract(),
         }),
     }
 
@@ -1352,8 +1410,60 @@ def _terminal_state(outcome: StageOutcome, *, enclosed: bool = True) -> str:
     return "PRODUCED"
 
 
+def _primary_recovery_digits() -> tuple[int, int]:
+    digits = _primary_recovery_precision_contract()["recovery_digits"]
+    if not isinstance(digits, list) or len(digits) != 2:
+        raise ValueError("PRIMARY recovery precision contract is invalid")
+    return int(digits[0]), int(digits[1])
+
+
+def _primary_binary64_promotes(
+    outcome: StageOutcome, *, production: bool
+) -> bool:
+    trigger = _primary_recovery_precision_contract()["binary64_trigger"]
+    if not isinstance(trigger, Mapping):
+        raise ValueError("PRIMARY recovery trigger contract is invalid")
+    return (
+        production
+        and outcome.numerical_state == trigger["component_status"]
+        and trigger["requires_canonical_production_evidence"] is True
+    )
+
+
+def _primary_requires_precision120(outcome: StageOutcome) -> bool:
+    gates = _primary_recovery_precision_contract()["precision120_gates"]
+    if not isinstance(gates, Mapping):
+        raise ValueError("PRIMARY 120-digit gate contract is invalid")
+    if outcome.numerical_state == gates["component_status"]:
+        return True
+    if outcome.numerical_state != ComponentStatus.CONVERGED.value:
+        return False
+    return (
+        outcome.self_refinement_enclosed
+        is gates["self_refinement_enclosed"]
+        or outcome.discrepancy_enclosed is gates["discrepancy_enclosed"]
+    )
+
+
+def _primary_precision120_terminal_state(outcome: StageOutcome) -> str:
+    success = _primary_recovery_precision_contract()[
+        "precision120_terminal_success"
+    ]
+    if not isinstance(success, Mapping):
+        raise ValueError("PRIMARY 120-digit terminal contract is invalid")
+    produced = (
+        outcome.numerical_state == success["component_status"]
+        and outcome.discrepancy_enclosed is success["discrepancy_enclosed"]
+    )
+    return "PRODUCED" if produced else "UNRESOLVED"
+
+
 class _NonProductionSolvedLeafRecord(ValueError):
     """A valid orchestration record that is ineligible for scientific reuse."""
+
+
+class _UnauthenticatedComponentEvidence(ValueError):
+    """Well-formed component evidence that fails scientific authentication."""
 
 
 def _validate_component_result(
@@ -1382,6 +1492,28 @@ def _validate_component_result(
     result = ComponentResult.from_mapping(raw_result)
     if result.to_mapping() != raw_result:
         raise ValueError("campaign component result is not canonical")
+    if result.status is ComponentStatus.CONVERGED:
+        body_is_valid = (
+            result.usable
+            and result.response is not None
+            and result.signed_root_crosscheck is not None
+            and result.convergence_basis in {
+                "ORDER_RESOLVED",
+                "TRUNCATION_BELOW_ROOT_RESOLUTION",
+            }
+        )
+    else:
+        body_is_valid = (
+            not result.usable
+            and result.response is None
+            and result.signed_root_crosscheck is None
+            and result.closed_form_response is None
+            and result.convergence_basis == "UNRESOLVED"
+        )
+    if not body_is_valid:
+        raise ValueError(
+            "campaign production component result status/body contract is invalid"
+        )
     job = leaf.job
     if (
         result.job_id != job.job_id
@@ -1389,7 +1521,9 @@ def _validate_component_result(
         or result.mechanism_id != leaf.mechanism_id
         or result.status.value != outcome.numerical_state
     ):
-        raise ValueError("campaign production component identity is invalid")
+        raise _UnauthenticatedComponentEvidence(
+            "campaign production component identity is invalid"
+        )
     expected_lineage = {
         "leaf_id": job.leaf_id,
         "root_reference_id": job.root.root_reference_id,
@@ -1405,14 +1539,23 @@ def _validate_component_result(
         ),
     }
     if dict(result.lineage) != expected_lineage:
-        raise ValueError("campaign production component lineage is invalid")
+        raise _UnauthenticatedComponentEvidence(
+            "campaign production component lineage is invalid"
+        )
+    branch_loss_mismatch = False
     for readout_index, readout in enumerate(result.raw_readouts):
-        if (
+        identity_mismatch = (
             readout.root_reference_id != job.root.root_reference_id
             or readout.branch_id != job.root.branch_id
             or readout.equation_id != job.equation_id
-        ):
-            raise ValueError("campaign production readout lineage is invalid")
+        )
+        if identity_mismatch:
+            if result.status is not ComponentStatus.BRANCH_LOSS:
+                raise _UnauthenticatedComponentEvidence(
+                    "campaign production readout lineage is invalid"
+                )
+            branch_loss_mismatch = True
+            continue
         if not root_readout_preserves_authenticated_branch(
             readout,
             job.root,
@@ -1420,10 +1563,116 @@ def _validate_component_result(
             source_root_mapping=job.source_root_mapping,
         ):
             kind = "baseline" if readout_index == 0 else "perturbed"
-            raise ValueError(
+            raise _UnauthenticatedComponentEvidence(
                 f"campaign production {kind} root readout evidence is invalid"
             )
+    if (
+        result.status is ComponentStatus.BRANCH_LOSS
+        and not branch_loss_mismatch
+    ):
+        raise ValueError(
+            "campaign production BRANCH_LOSS lacks an identity mismatch"
+        )
     return True
+
+
+def _validate_primary_record_semantics(
+    record: CampaignLeafRecord,
+    stages: tuple[StageOutcome, ...],
+    production_flags: tuple[bool, ...],
+) -> bool:
+    first = stages[0]
+    precision80_digits, precision120_digits = _primary_recovery_digits()
+    if (
+        first.deep_diagnostics is not None
+        or record.trigger_ids
+        or record.sentinel
+        or record.sentinel_comparison is not None
+    ):
+        raise ValueError("campaign PRIMARY role fields are inconsistent")
+
+    promoted = _primary_binary64_promotes(
+        first, production=production_flags[0]
+    )
+    if not promoted:
+        if (
+            len(stages) != 1
+            or record.state != _terminal_state(first)
+            or record.missing_precision_digits is not None
+        ):
+            raise ValueError("campaign unpromoted PRIMARY state is inconsistent")
+        return all(production_flags)
+
+    if len(stages) == 1:
+        pending = (
+            record.state == "IN_PROGRESS"
+            and record.missing_precision_digits is None
+        ) or (
+            record.state == "MISSING_PRECISION"
+            and record.missing_precision_digits == precision80_digits
+        )
+        if not pending:
+            raise ValueError(
+                "campaign promoted PRIMARY leaf is missing its 80-digit stage"
+            )
+        return all(production_flags)
+
+    precision80 = stages[1]
+    if (
+        precision80.deep_diagnostics is not None
+        or precision80.self_refinement_enclosed is None
+        or precision80.discrepancy_from_previous_abs is None
+        or precision80.discrepancy_enclosed is None
+    ):
+        raise ValueError("campaign PRIMARY 80-digit evidence is incomplete")
+    if not production_flags[1]:
+        raise ValueError(
+            "campaign promoted PRIMARY stage lacks canonical production evidence"
+        )
+
+    requires120 = _primary_requires_precision120(precision80)
+    if not requires120:
+        expected_state = _terminal_state(
+            precision80,
+            enclosed=(
+                bool(precision80.self_refinement_enclosed)
+                and bool(precision80.discrepancy_enclosed)
+            ),
+        )
+        if (
+            len(stages) != 2
+            or record.state != expected_state
+            or record.missing_precision_digits is not None
+        ):
+            raise ValueError("campaign terminal PRIMARY 80-digit state is inconsistent")
+        return all(production_flags)
+
+    if len(stages) == 2:
+        pending = (
+            record.state == "IN_PROGRESS"
+            and record.missing_precision_digits is None
+        ) or (
+            record.state == "MISSING_PRECISION"
+            and record.missing_precision_digits == precision120_digits
+        )
+        if not pending:
+            raise ValueError(
+                "campaign promoted PRIMARY leaf is missing its 120-digit stage"
+            )
+        return all(production_flags)
+
+    precision120 = stages[2]
+    _validate_precision120(precision120)
+    if not production_flags[2]:
+        raise ValueError(
+            "campaign promoted PRIMARY stage lacks canonical production evidence"
+        )
+    if (
+        record.state != _primary_precision120_terminal_state(precision120)
+        or record.missing_precision_digits is not None
+    ):
+        raise ValueError("campaign PRIMARY 120-digit terminal state is inconsistent")
+    return all(production_flags)
 
 
 def _validate_record_semantics(
@@ -1453,7 +1702,7 @@ def _validate_record_semantics(
     ):
         raise ValueError("campaign binary64 stage refinement fields are invalid")
 
-    if leaf.role != "deep":
+    if leaf.role == "control":
         expected_state = _terminal_state(first)
         if (
             len(stages) != 1
@@ -1466,6 +1715,11 @@ def _validate_record_semantics(
         ):
             raise ValueError("campaign role or component state is inconsistent")
         return production
+
+    if leaf.role == "primary":
+        return _validate_primary_record_semantics(
+            record, stages, production_flags
+        )
 
     trigger_ids = _deep_trigger_ids(first)
     sentinel = leaf.leaf_id in set(
@@ -1596,19 +1850,20 @@ def _validate_cacheable_leaf_record(
         )
 
 
-def _authenticated_solved_leaf_lookup(
+def _authenticate_solved_leaf_hit(
     plan: CampaignPlan,
     leaf: CampaignLeafPlan,
     store: SolvedLeafStore,
+    lookup: SolvedLeafLookup,
 ) -> SolvedLeafLookup:
-    identity = scientific_computation_identity_sha256(plan, leaf)
-    lookup = store.lookup(identity, leaf.leaf_id)
     if lookup.status is not SolvedLeafLookupStatus.HIT:
         return lookup
     try:
         if lookup.receipt is None:
             raise ValueError("solved-leaf cache hit has no receipt")
         record = CampaignLeafRecord.from_mapping(lookup.receipt["record"])
+        if record.to_mapping() != lookup.receipt["record"]:
+            raise ValueError("solved-leaf cache record is not canonical")
         _validate_cacheable_leaf_record(plan, leaf, record)
     except (KeyError, TypeError, ValueError) as error:
         if lookup.path is not None:
@@ -1622,6 +1877,147 @@ def _authenticated_solved_leaf_lookup(
         SolvedLeafLookupStatus.HIT,
         path=lookup.path,
         receipt={**dict(lookup.receipt), "record": record.to_mapping()},
+    )
+
+
+def _validate_legacy_primary_record_evidence(
+    plan: CampaignPlan,
+    leaf: CampaignLeafPlan,
+    record: CampaignLeafRecord,
+) -> bool:
+    if (
+        record.leaf_id != leaf.leaf_id
+        or record.role != "primary"
+        or leaf.role != "primary"
+        or len(record.stages) != 1
+        or record.trigger_ids
+        or record.sentinel
+        or record.missing_precision_digits is not None
+        or record.sentinel_comparison is not None
+    ):
+        raise ValueError("legacy PRIMARY solved-leaf role fields are inconsistent")
+    stage = record.stages[0]
+    outcome = stage.outcome
+    if (
+        outcome.digits != 64
+        or outcome.deep_diagnostics is not None
+        or outcome.self_refinement_enclosed is not None
+        or outcome.discrepancy_from_previous_abs is not None
+        or outcome.discrepancy_enclosed is not None
+    ):
+        raise ValueError("legacy PRIMARY solved-leaf stage fields are inconsistent")
+    provenance = stage.runner_provenance
+    if (
+        provenance["precision_factory_identity"]
+        != plan.precision_factory_identity.to_mapping()
+        or not set(provenance["available_precision_digits"]).issubset(
+            set(plan.precision_capabilities.digits)
+        )
+    ):
+        raise ValueError("legacy PRIMARY solved-leaf factory evidence is invalid")
+    if not _validate_component_result(leaf, outcome):
+        raise _NonProductionSolvedLeafRecord(
+            "legacy PRIMARY solved-leaf lacks canonical production evidence"
+        )
+    if record.state != _terminal_state(outcome):
+        raise ValueError("legacy PRIMARY solved-leaf terminal state is inconsistent")
+    return (
+        record.state == "PRODUCED"
+        and outcome.numerical_state == ComponentStatus.CONVERGED.value
+    )
+
+
+def _authenticated_solved_leaf_lookup(
+    plan: CampaignPlan,
+    leaf: CampaignLeafPlan,
+    store: SolvedLeafStore,
+) -> SolvedLeafLookup:
+    identity = scientific_computation_identity_sha256(plan, leaf)
+    current = _authenticate_solved_leaf_hit(
+        plan, leaf, store, store.lookup(identity, leaf.leaf_id)
+    )
+    if current.status in {
+        SolvedLeafLookupStatus.HIT,
+        SolvedLeafLookupStatus.CORRUPT,
+    }:
+        return current
+    if leaf.role != "primary":
+        return current
+
+    legacy_identity = _legacy_primary_scientific_computation_identity_sha256(
+        plan, leaf
+    )
+    legacy = store.lookup(legacy_identity, leaf.leaf_id)
+    if legacy.status is SolvedLeafLookupStatus.CORRUPT:
+        return legacy
+    if legacy.status is not SolvedLeafLookupStatus.HIT:
+        return current
+
+    try:
+        if legacy.receipt is None:
+            raise ValueError("legacy solved-leaf cache hit has no receipt")
+        record_mapping = legacy.receipt["record"]
+        record = CampaignLeafRecord.from_mapping(record_mapping)
+        if record.to_mapping() != record_mapping:
+            raise ValueError("legacy solved-leaf cache record is not canonical")
+        success = _validate_legacy_primary_record_evidence(
+            plan, leaf, record
+        )
+    except (KeyError, TypeError, ValueError) as error:
+        if legacy.path is not None:
+            store.quarantine(legacy.path, str(error))
+        return SolvedLeafLookup(
+            SolvedLeafLookupStatus.CORRUPT,
+            path=legacy.path,
+            reason=str(error),
+        )
+
+    if not success:
+        return current
+
+    try:
+        _validate_cacheable_leaf_record(plan, leaf, record)
+    except (KeyError, TypeError, ValueError) as error:
+        if legacy.path is not None:
+            store.quarantine(legacy.path, str(error))
+        return SolvedLeafLookup(
+            SolvedLeafLookupStatus.CORRUPT,
+            path=legacy.path,
+            reason=str(error),
+        )
+
+    source_type = legacy.receipt["source_type"]
+    if source_type not in {
+        "originating-campaign",
+        "imported-authenticated-checkpoint",
+    }:
+        raise ValueError("legacy solved-leaf cache source type is invalid")
+    deadline = time.monotonic() + _LEGACY_MIGRATION_LOCK_TIMEOUT_SECONDS
+    while True:
+        try:
+            published = store.publish_if_missing(
+                scientific_identity_sha256=identity,
+                leaf_id=leaf.leaf_id,
+                record=record.to_mapping(),
+                source_type=source_type,
+            )
+            break
+        except RuntimeError as error:
+            if str(error) != "solved-leaf cache publication is locked":
+                raise
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.0:
+                raise RuntimeError(
+                    "timed out waiting for solved-leaf cache migration "
+                    "publication lock"
+                ) from error
+            time.sleep(min(_LEGACY_MIGRATION_LOCK_RETRY_SECONDS, remaining))
+    if published.status is SolvedLeafLookupStatus.CORRUPT:
+        return published
+    if published.status is not SolvedLeafLookupStatus.HIT:
+        return published
+    return _authenticate_solved_leaf_hit(
+        plan, leaf, store, store.lookup(identity, leaf.leaf_id)
     )
 
 
@@ -1869,6 +2265,11 @@ def run_campaign_selection(
     resume: bool,
     solved_leaf_store: SolvedLeafStore | None = None,
 ) -> CampaignRunSummary:
+    if resume:
+        resume_path = Path(checkpoint_path)
+        if not resume_path.exists():
+            raise ValueError("campaign resume requires an existing checkpoint")
+        _load_checkpoint(plan, resume_path)
     execution_leaf_ids = _campaign_execution_leaf_ids(plan, selection)
     cache_lookups: dict[str, SolvedLeafLookup] = {}
     if solved_leaf_store is not None:
@@ -2060,12 +2461,43 @@ def _run_campaign_selection_active(
             if not isinstance(outcome, StageOutcome) or outcome.digits != 64:
                 raise ValueError("campaign backend returned an invalid binary64 stage")
             executed += 1
-            if leaf.role != "deep":
+            if leaf.role == "control":
                 record = CampaignLeafRecord(
                     leaf_id=leaf.leaf_id,
                     role=leaf.role,
                     state=_terminal_state(outcome),
                     stages=(_campaign_stage_record(plan, available, outcome),),
+                )
+            elif leaf.role == "primary":
+                precision80_digits, _ = _primary_recovery_digits()
+                try:
+                    production = _validate_component_result(leaf, outcome)
+                except _UnauthenticatedComponentEvidence:
+                    # Promotion is recovery for authenticated numerical
+                    # nonconvergence, not a new fail-fast boundary for
+                    # malformed or deliberately adverse evidence.  Keep the
+                    # strict validator authoritative at checkpoint/cache
+                    # authentication while refusing to promote this stage.
+                    production = False
+                promoted = _primary_binary64_promotes(
+                    outcome, production=production
+                )
+                record = CampaignLeafRecord(
+                    leaf_id=leaf.leaf_id,
+                    role=leaf.role,
+                    state=(
+                        "MISSING_PRECISION"
+                        if promoted and precision80_digits not in available.digits
+                        else "IN_PROGRESS"
+                        if promoted
+                        else _terminal_state(outcome)
+                    ),
+                    stages=(_campaign_stage_record(plan, available, outcome),),
+                    missing_precision_digits=(
+                        precision80_digits
+                        if promoted and precision80_digits not in available.digits
+                        else None
+                    ),
                 )
             else:
                 trigger_ids = _deep_trigger_ids(outcome)
@@ -2120,12 +2552,17 @@ def _run_campaign_selection_active(
                 )
             continue
         if len(record.stages) == 1:
-            if 80 not in available.digits:
+            precision80_digits = (
+                _primary_recovery_digits()[0]
+                if leaf.role == "primary"
+                else 80
+            )
+            if precision80_digits not in available.digits:
                 continue
             outcome80, stage_duration = _execute_campaign_stage_with_progress(
                 backend,
                 leaf,
-                80,
+                precision80_digits,
                 context,
                 record.stages,
                 response_predictor,
@@ -2139,33 +2576,126 @@ def _run_campaign_selection_active(
             ):
                 raise ValueError("campaign backend returned incomplete 80-digit evidence")
             executed += 1
-            comparison = None
-            false_negative = False
-            if record.sentinel:
-                threshold = 0.25 * record.stages[0].outcome.local_disk_radius_abs
-                false_negative = (
-                    not record.trigger_ids
-                    and outcome80.discrepancy_from_previous_abs > threshold
-                )
-                comparison = {
-                    "binary64_to_80_discrepancy_abs": (
-                        outcome80.discrepancy_from_previous_abs
+            if leaf.role == "primary":
+                if not _validate_component_result(leaf, outcome80):
+                    raise ValueError(
+                        "campaign promoted PRIMARY stage lacks canonical "
+                        "production evidence"
+                    )
+                _, precision120_digits = _primary_recovery_digits()
+                if _primary_requires_precision120(outcome80):
+                    state = (
+                        "MISSING_PRECISION"
+                        if precision120_digits not in available.digits
+                        else "IN_PROGRESS"
+                    )
+                    missing = (
+                        precision120_digits
+                        if precision120_digits not in available.digits
+                        else None
+                    )
+                else:
+                    state = _terminal_state(
+                        outcome80,
+                        enclosed=(
+                            bool(outcome80.self_refinement_enclosed)
+                            and bool(outcome80.discrepancy_enclosed)
+                        ),
+                    )
+                    missing = None
+                record = CampaignLeafRecord(
+                    leaf_id=record.leaf_id,
+                    role=record.role,
+                    state=state,
+                    stages=(
+                        *record.stages,
+                        _campaign_stage_record(plan, available, outcome80),
                     ),
-                    "trigger_threshold_abs": threshold,
-                    "trigger_policy_false_negative": false_negative,
-                }
+                    missing_precision_digits=missing,
+                )
+                records_by_id[leaf_id] = record
+                _checkpoint_stage_with_progress(
+                    path,
+                    _checkpoint_mapping(
+                        plan,
+                        selection,
+                        _ordered_selection_records(selection, records_by_id),
+                    ),
+                    context=context,
+                    digits=precision80_digits,
+                    duration_seconds=stage_duration,
+                    record=record,
+                )
+            else:
+                comparison = None
+                false_negative = False
+                if record.sentinel:
+                    threshold = 0.25 * record.stages[0].outcome.local_disk_radius_abs
+                    false_negative = (
+                        not record.trigger_ids
+                        and outcome80.discrepancy_from_previous_abs > threshold
+                    )
+                    comparison = {
+                        "binary64_to_80_discrepancy_abs": (
+                            outcome80.discrepancy_from_previous_abs
+                        ),
+                        "trigger_threshold_abs": threshold,
+                        "trigger_policy_false_negative": false_negative,
+                    }
+                    if false_negative:
+                        record = CampaignLeafRecord(
+                            leaf_id=record.leaf_id,
+                            role=record.role,
+                            state="INVALID_SENTINEL_FALSE_NEGATIVE",
+                            stages=(
+                                *record.stages,
+                                _campaign_stage_record(plan, available, outcome80),
+                            ),
+                            trigger_ids=record.trigger_ids,
+                            sentinel=True,
+                            missing_precision_digits=120,
+                            sentinel_comparison=comparison,
+                        )
+                        records_by_id[leaf_id] = record
+                        _checkpoint_stage_with_progress(
+                            path,
+                            _checkpoint_mapping(
+                                plan,
+                                selection,
+                                _ordered_selection_records(
+                                    selection, records_by_id
+                                ),
+                            ),
+                            context=context,
+                            digits=80,
+                            duration_seconds=stage_duration,
+                            record=record,
+                        )
                 if false_negative:
+                    pass
+                elif outcome80.self_refinement_enclosed:
+                    state = _terminal_state(
+                        outcome80, enclosed=bool(outcome80.discrepancy_enclosed)
+                    )
+                    missing = None
+                elif 120 not in available.digits:
+                    state = "MISSING_PRECISION"
+                    missing = 120
+                else:
+                    state = "IN_PROGRESS"
+                    missing = None
+                if not false_negative:
                     record = CampaignLeafRecord(
                         leaf_id=record.leaf_id,
                         role=record.role,
-                        state="INVALID_SENTINEL_FALSE_NEGATIVE",
+                        state=state,
                         stages=(
                             *record.stages,
                             _campaign_stage_record(plan, available, outcome80),
                         ),
                         trigger_ids=record.trigger_ids,
-                        sentinel=True,
-                        missing_precision_digits=120,
+                        sentinel=record.sentinel,
+                        missing_precision_digits=missing,
                         sentinel_comparison=comparison,
                     )
                     records_by_id[leaf_id] = record
@@ -2183,46 +2713,6 @@ def _run_campaign_selection_active(
                         duration_seconds=stage_duration,
                         record=record,
                     )
-            if false_negative:
-                pass
-            elif outcome80.self_refinement_enclosed:
-                state = _terminal_state(
-                    outcome80, enclosed=bool(outcome80.discrepancy_enclosed)
-                )
-                missing = None
-            elif 120 not in available.digits:
-                state = "MISSING_PRECISION"
-                missing = 120
-            else:
-                state = "IN_PROGRESS"
-                missing = None
-            if not false_negative:
-                record = CampaignLeafRecord(
-                    leaf_id=record.leaf_id,
-                    role=record.role,
-                    state=state,
-                    stages=(
-                        *record.stages,
-                        _campaign_stage_record(plan, available, outcome80),
-                    ),
-                    trigger_ids=record.trigger_ids,
-                    sentinel=record.sentinel,
-                    missing_precision_digits=missing,
-                    sentinel_comparison=comparison,
-                )
-                records_by_id[leaf_id] = record
-                _checkpoint_stage_with_progress(
-                    path,
-                    _checkpoint_mapping(
-                        plan,
-                        selection,
-                        _ordered_selection_records(selection, records_by_id),
-                    ),
-                    context=context,
-                    digits=80,
-                    duration_seconds=stage_duration,
-                    record=record,
-                )
 
         if record.state in {"PRODUCED", "UNRESOLVED"}:
             with progress_scope(**context):
@@ -2240,12 +2730,17 @@ def _run_campaign_selection_active(
                 )
             continue
         if len(record.stages) == 2:
-            if 120 not in available.digits:
+            precision120_digits = (
+                _primary_recovery_digits()[1]
+                if leaf.role == "primary"
+                else 120
+            )
+            if precision120_digits not in available.digits:
                 continue
             outcome120, stage_duration = _execute_campaign_stage_with_progress(
                 backend,
                 leaf,
-                120,
+                precision120_digits,
                 context,
                 record.stages,
                 response_predictor,
@@ -2258,26 +2753,46 @@ def _run_campaign_selection_active(
             ):
                 raise ValueError("campaign backend returned incomplete 120-digit evidence")
             executed += 1
-            false_negative = record.state == "INVALID_SENTINEL_FALSE_NEGATIVE"
-            record = CampaignLeafRecord(
-                leaf_id=record.leaf_id,
-                role=record.role,
-                state=(
-                    "INVALID_SENTINEL_FALSE_NEGATIVE"
-                    if false_negative
-                    else _terminal_state(
-                        outcome120, enclosed=bool(outcome120.discrepancy_enclosed)
+            if leaf.role == "primary":
+                _validate_precision120(outcome120)
+                if not _validate_component_result(leaf, outcome120):
+                    raise ValueError(
+                        "campaign promoted PRIMARY stage lacks canonical "
+                        "production evidence"
                     )
-                ),
-                stages=(
-                    *record.stages,
-                    _campaign_stage_record(plan, available, outcome120),
-                ),
-                trigger_ids=record.trigger_ids,
-                sentinel=record.sentinel,
-                missing_precision_digits=120 if false_negative else None,
-                sentinel_comparison=record.sentinel_comparison,
-            )
+                record = CampaignLeafRecord(
+                    leaf_id=record.leaf_id,
+                    role=record.role,
+                    state=_primary_precision120_terminal_state(outcome120),
+                    stages=(
+                        *record.stages,
+                        _campaign_stage_record(plan, available, outcome120),
+                    ),
+                )
+            else:
+                false_negative = (
+                    record.state == "INVALID_SENTINEL_FALSE_NEGATIVE"
+                )
+                record = CampaignLeafRecord(
+                    leaf_id=record.leaf_id,
+                    role=record.role,
+                    state=(
+                        "INVALID_SENTINEL_FALSE_NEGATIVE"
+                        if false_negative
+                        else _terminal_state(
+                            outcome120,
+                            enclosed=bool(outcome120.discrepancy_enclosed),
+                        )
+                    ),
+                    stages=(
+                        *record.stages,
+                        _campaign_stage_record(plan, available, outcome120),
+                    ),
+                    trigger_ids=record.trigger_ids,
+                    sentinel=record.sentinel,
+                    missing_precision_digits=120 if false_negative else None,
+                    sentinel_comparison=record.sentinel_comparison,
+                )
             records_by_id[leaf_id] = record
             _checkpoint_stage_with_progress(
                 path,
@@ -2287,7 +2802,7 @@ def _run_campaign_selection_active(
                     _ordered_selection_records(selection, records_by_id),
                 ),
                 context=context,
-                digits=120,
+                digits=precision120_digits,
                 duration_seconds=stage_duration,
                 record=record,
             )

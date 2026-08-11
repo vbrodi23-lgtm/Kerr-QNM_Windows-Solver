@@ -236,15 +236,14 @@ class SolvedLeafStore:
         os.replace(path, target)
         return target
 
-    def publish(
+    def _publication_receipt(
         self,
         *,
         scientific_identity_sha256: str,
         leaf_id: str,
         record: Mapping[str, object],
         source_type: str,
-    ) -> Path:
-        path = self._entry_path(scientific_identity_sha256)
+    ) -> dict[str, object]:
         state = record.get("state")
         if state not in _TERMINAL_STATES or record.get("computed") is not True:
             raise ValueError("solved-leaf cache accepts terminal records only")
@@ -267,6 +266,23 @@ class SolvedLeafStore:
         }
         receipt = {**sealed, "receipt_sha256": _sha256(sealed)}
         self._validate_receipt(receipt)
+        return receipt
+
+    def publish(
+        self,
+        *,
+        scientific_identity_sha256: str,
+        leaf_id: str,
+        record: Mapping[str, object],
+        source_type: str,
+    ) -> Path:
+        path = self._entry_path(scientific_identity_sha256)
+        receipt = self._publication_receipt(
+            scientific_identity_sha256=scientific_identity_sha256,
+            leaf_id=leaf_id,
+            record=record,
+            source_type=source_type,
+        )
 
         lock = self.root / "locks" / f"{scientific_identity_sha256}.lock"
         lock.parent.mkdir(parents=True, exist_ok=True)
@@ -287,6 +303,45 @@ class SolvedLeafStore:
                     )
             _atomic_json(path, receipt)
             return path
+        finally:
+            try:
+                lock.unlink()
+            except FileNotFoundError:
+                pass
+
+    def publish_if_missing(
+        self,
+        *,
+        scientific_identity_sha256: str,
+        leaf_id: str,
+        record: Mapping[str, object],
+        source_type: str,
+    ) -> SolvedLeafLookup:
+        """Publish only when no exact current object exists under the lock."""
+
+        path = self._entry_path(scientific_identity_sha256)
+        receipt = self._publication_receipt(
+            scientific_identity_sha256=scientific_identity_sha256,
+            leaf_id=leaf_id,
+            record=record,
+            source_type=source_type,
+        )
+        lock = self.root / "locks" / f"{scientific_identity_sha256}.lock"
+        lock.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            descriptor = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except FileExistsError as error:
+            raise RuntimeError("solved-leaf cache publication is locked") from error
+        try:
+            os.close(descriptor)
+            if path.exists():
+                return self.lookup(scientific_identity_sha256, leaf_id)
+            _atomic_json(path, receipt)
+            return SolvedLeafLookup(
+                SolvedLeafLookupStatus.HIT,
+                path=path,
+                receipt=receipt,
+            )
         finally:
             try:
                 lock.unlink()

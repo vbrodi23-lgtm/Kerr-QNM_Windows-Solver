@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import hashlib
 import io
 import json
 from fractions import Fraction
@@ -8,11 +9,16 @@ import os
 from pathlib import Path
 import shutil
 import tempfile
+import threading
 import unittest
 from unittest.mock import patch
 
+import windows_solver.solved_leaf_cache as solved_leaf_cache_module
 from windows_solver.contracts import canonical_json_bytes
+from windows_solver.linear_response import B_PRIME_RELEASE_DOMAIN
 from windows_solver.response_batches import (
+    CampaignLeafRecord,
+    CampaignStageRecord,
     PrecisionCapabilities,
     StageOutcome,
     _authenticated_solved_leaf_lookup,
@@ -35,6 +41,16 @@ from windows_solver.response_engine import (
 from windows_solver.progress import activate_progress
 from windows_solver.progress_output import CampaignProgressReporter
 from windows_solver.solved_leaf_cache import SolvedLeafLookupStatus, SolvedLeafStore
+
+
+_FROZEN_MIGRATION_BACKEND_IDENTITY = replace(
+    VettedNativeDeterminantKernel.identity,
+    runtime_fingerprint=(
+        "cpython-3.12.13-linux-python-64bit-"
+        "gsn-input-julia-exact-f-u-cache-contract-1-"
+        "adapted-source-native-gsn-adapter-contract-2"
+    ),
+)
 
 
 def _outcome(leaf, digits=64):
@@ -68,15 +84,17 @@ _POLISHED_BASELINES = {
     ),
 }
 _POLISHED_IDENTITIES = {
-    "b-prime-leaf-4c8594e4a59486a1c56206e41cd7f7f3ff1ab5193a5ff6b699cbe9492bc45355": "f8a27f26f8f4ddef54f8854d7aba0056ce654bfaac91a27ed19386f0f872ff3d",
-    "b-prime-leaf-0f36daefa853de1280f17c8b8ef89bbaf9b34f5e5044a5eb85bc563d3896b60d": "3d3eb67100cfaf0a1e898eaf64b31ab8a3732ec45eb882e9e8a641972ff015de",
-    "b-prime-leaf-08b8dc3df83fc1304a61d8b6105c412a316a44816ca229d375573fdf72ac0a57": "f44a0eebeebe14035fcb21aecf894a9d3fef9ad0701f9c756c5e17bb5f1193ad",
+    "b-prime-leaf-4c8594e4a59486a1c56206e41cd7f7f3ff1ab5193a5ff6b699cbe9492bc45355": "8855b718c70469bd287554caa82e17caaa6e42278b9477d931586736b8f10d5f",
+    "b-prime-leaf-0f36daefa853de1280f17c8b8ef89bbaf9b34f5e5044a5eb85bc563d3896b60d": "ca92ccd62de8aefb282b91d020e3adf28f40484d9d8f935fb1b1e1b157873d62",
+    "b-prime-leaf-08b8dc3df83fc1304a61d8b6105c412a316a44816ca229d375573fdf72ac0a57": "7188b9d5ce7f8cbfcb2f56783b780e1edb962c50ed58f8c38f4f50d20ffbe1a2",
 }
 
 
 def _production_outcome(
     leaf,
     *,
+    digits=64,
+    status=ComponentStatus.CONVERGED,
     baseline_omega=None,
     root_reference_id=None,
     branch_id=None,
@@ -88,7 +106,7 @@ def _production_outcome(
         omega=job.root.omega if baseline_omega is None else baseline_omega,
         determinant_residual_abs=2.0e-13,
         determinant_derivative_abs=1.0,
-        converged=True,
+        converged=status is not ComponentStatus.NOT_CONVERGED,
         root_reference_id=(
             job.root.root_reference_id
             if root_reference_id is None
@@ -105,10 +123,16 @@ def _production_outcome(
         job_id=job.job_id,
         leaf_id=job.leaf_id,
         mechanism_id=job.mechanism_id,
-        status=ComponentStatus.CONVERGED,
-        convergence_basis="ORDER_RESOLVED",
-        response=complex(1.0, -0.5),
-        signed_root_crosscheck=complex(1.0, -0.5),
+        status=status,
+        convergence_basis=(
+            "ORDER_RESOLVED" if status is ComponentStatus.CONVERGED else "UNRESOLVED"
+        ),
+        response=(
+            complex(1.0, -0.5) if status is ComponentStatus.CONVERGED else None
+        ),
+        signed_root_crosscheck=(
+            complex(1.0, -0.5) if status is ComponentStatus.CONVERGED else None
+        ),
         closed_form_response=None,
         error_channels={
             "signed-root": 1.0e-9,
@@ -140,14 +164,94 @@ def _production_outcome(
         "result": result.to_mapping(),
     }
     return StageOutcome(
-        digits=64,
-        numerical_state="CONVERGED",
+        digits=digits,
+        numerical_state=status.value,
         component_result=component,
         local_disk_radius_abs=1.0e-8,
         signed_error_channels=synthetic_stage_signed_error_channels(
             component, 1.0e-8
         ),
     )
+
+
+def _legacy_primary_record(plan, leaf, status):
+    """Seal the predecessor's binary64-only PRIMARY record.
+
+    The approved migration contract changes PRIMARY orchestration policy only:
+    leaf/job/root/policy/backend/readout and precision-factory identities stay
+    exact.  The legacy identity supplied by each test is therefore the only
+    predecessor-only value; this stage provenance deliberately remains current.
+    """
+
+    outcome = _production_outcome(leaf, status=status)
+    return CampaignLeafRecord(
+        leaf_id=leaf.leaf_id,
+        role="primary",
+        state=("PRODUCED" if status is ComponentStatus.CONVERGED else "UNRESOLVED"),
+        stages=(CampaignStageRecord(
+            outcome,
+            {
+                "precision_factory_identity": (
+                    plan.precision_factory_identity.to_mapping()
+                ),
+                "available_precision_digits": [64],
+            },
+        ),),
+    )
+
+
+def _replace_component_result_fields(outcome, **changes):
+    """Reseal a synthetic outcome containing a deliberately impossible body."""
+
+    component = dict(outcome.component_result)
+    component["result"] = replace(
+        ComponentResult.from_mapping(component["result"]),
+        **changes,
+    ).to_mapping()
+    return replace(
+        outcome,
+        component_result=component,
+        signed_error_channels=synthetic_stage_signed_error_channels(
+            component, outcome.local_disk_radius_abs
+        ),
+    )
+
+
+def _frozen_predecessor_precision_contract(leaf):
+    """The M01 contract, frozen independently of production policy helpers."""
+
+    return {
+        "binary64_stage_required": True,
+        "deep_leaf": leaf.role == "deep",
+        "promotion_digits": [80, 120] if leaf.role == "deep" else [],
+        "promotion_gates": list(B_PRIME_RELEASE_DOMAIN.precision_promotion_gates),
+        "fixed_precision_sentinel": leaf.leaf_id in set(
+            B_PRIME_RELEASE_DOMAIN.fixed_precision_sentinel_leaf_ids
+        ),
+    }
+
+
+def _frozen_predecessor_scientific_identity(plan, leaf):
+    """Rebuild the exact pre-recovery identity without production helpers."""
+
+    material = {
+        "schema_version": 1,
+        "leaf_id": leaf.leaf_id,
+        "role": leaf.role,
+        "mode_label": leaf.leaf.mode_label,
+        "mode": list(leaf.leaf.mode),
+        "spin_role": leaf.leaf.spin_role,
+        "coordinate_exact": {
+            "numerator": leaf.leaf.coordinate.numerator,
+            "denominator": leaf.leaf.coordinate.denominator,
+        },
+        "spin_binary64_hex": leaf.leaf.spin.hex(),
+        "mechanism_id": leaf.mechanism_id,
+        "response_job": leaf.job.to_mapping(),
+        "precision_factory_identity": plan.precision_factory_identity.to_mapping(),
+        "precision_contract": _frozen_predecessor_precision_contract(leaf),
+    }
+    return hashlib.sha256(canonical_json_bytes(material)).hexdigest()
 
 
 def _windows_production_plan():
@@ -191,6 +295,41 @@ def _plan(*, tolerance=2.0e-10):
 def _primary(plan, count):
     ids = tuple(leaf.leaf_id for leaf in plan.leaves if leaf.role == "primary")[:count]
     return build_campaign_selection(plan, role="primary", leaf_ids=ids)
+
+
+def _primary_migration_context():
+    plan = build_campaign_plan(
+        policy=NumericalPolicy(),
+        backend_identity=_FROZEN_MIGRATION_BACKEND_IDENTITY,
+        precision_capabilities=PrecisionCapabilities((64, 80)),
+    )
+    leaf = next(item for item in plan.leaves if item.role == "primary")
+    legacy_plan = build_campaign_plan(
+        policy=plan.policy,
+        backend_identity=plan.backend_identity,
+        precision_capabilities=PrecisionCapabilities((64,)),
+    )
+    legacy_leaf = next(
+        item for item in legacy_plan.leaves if item.leaf_id == leaf.leaf_id
+    )
+    legacy_identity = _frozen_predecessor_scientific_identity(
+        legacy_plan, legacy_leaf
+    )
+    selection = build_campaign_selection(
+        plan, role="primary", leaf_ids=(leaf.leaf_id,)
+    )
+    return plan, leaf, legacy_plan, legacy_leaf, legacy_identity, selection
+
+
+class _ConvergedProductionBackend:
+    def __init__(self, plan):
+        self.identity = plan.backend_identity
+        self.precision_capabilities = plan.precision_capabilities
+        self.calls = []
+
+    def execute_stage(self, leaf, digits):
+        self.calls.append((leaf.leaf_id, digits))
+        return _production_outcome(leaf, digits=digits)
 
 
 class SolvedLeafCacheTests(unittest.TestCase):
@@ -468,7 +607,7 @@ class SolvedLeafCacheTests(unittest.TestCase):
         )
         self.assertEqual(
             scientific_computation_identity_sha256(plan, leaf),
-            "82dd7b5fc50fa17b3ebbded02a3ea83b827f8e9c2c4f47679ffe462b142b640c",
+            "c968d7616d54a296278148638f96576e7c4dfb9d666b72790f882a0e55f46416",
         )
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -503,6 +642,745 @@ class SolvedLeafCacheTests(unittest.TestCase):
             )
             self.assertEqual(second.executed_stage_count, 0)
             self.assertEqual(second.reused_stage_count, 1)
+
+    def test_exact_legacy_primary_binary64_success_is_republished_under_recovery_identity(self):
+        """Catches discarding the exact predecessor success instead of migrating it."""
+
+        plan = build_campaign_plan(
+            policy=NumericalPolicy(),
+            backend_identity=_FROZEN_MIGRATION_BACKEND_IDENTITY,
+            precision_capabilities=PrecisionCapabilities((64, 80)),
+        )
+        leaf = next(item for item in plan.leaves if item.role == "primary")
+        legacy_plan = build_campaign_plan(
+            policy=plan.policy,
+            backend_identity=plan.backend_identity,
+            precision_capabilities=PrecisionCapabilities((64,)),
+        )
+        legacy_leaf = next(
+            item for item in legacy_plan.leaves if item.leaf_id == leaf.leaf_id
+        )
+        legacy_identity = _frozen_predecessor_scientific_identity(
+            legacy_plan, legacy_leaf
+        )
+        self.assertEqual(
+            legacy_identity,
+            "4f0833f9f3426decc9e2bde4b55e1b52af86e8ebce13cad99939bea1fa7fe974",
+        )
+        selection = build_campaign_selection(
+            plan, role="primary", leaf_ids=(leaf.leaf_id,)
+        )
+
+        class Backend:
+            identity = plan.backend_identity
+            precision_capabilities = plan.precision_capabilities
+
+            def __init__(self):
+                self.calls = []
+
+            def execute_stage(self, selected, digits):
+                self.calls.append((selected.leaf_id, digits))
+                raise AssertionError("legacy success migration reached stage execution")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            store = SolvedLeafStore(root / "solved")
+            legacy = _legacy_primary_record(
+                legacy_plan, legacy_leaf, ComponentStatus.CONVERGED
+            )
+            self.assertEqual(legacy_leaf.job.to_mapping(), leaf.job.to_mapping())
+            self.assertEqual(
+                legacy_plan.precision_factory_identity.to_mapping(),
+                plan.precision_factory_identity.to_mapping(),
+            )
+            self.assertEqual(
+                legacy.stages[0].runner_provenance["available_precision_digits"],
+                [64],
+            )
+            self.assertEqual(tuple(stage.outcome.digits for stage in legacy.stages), (64,))
+            self.assertEqual(legacy.trigger_ids, ())
+            self.assertFalse(legacy.sentinel)
+            self.assertIsNone(legacy.missing_precision_digits)
+            self.assertIsNone(legacy.sentinel_comparison)
+            self.assertIsNone(legacy.stages[0].outcome.deep_diagnostics)
+            self.assertIsNone(legacy.stages[0].outcome.self_refinement_enclosed)
+            self.assertIsNone(
+                legacy.stages[0].outcome.discrepancy_from_previous_abs
+            )
+            self.assertIsNone(legacy.stages[0].outcome.discrepancy_enclosed)
+            store.publish(
+                scientific_identity_sha256=legacy_identity,
+                leaf_id=leaf.leaf_id,
+                record=legacy.to_mapping(),
+                source_type="imported-authenticated-checkpoint",
+            )
+            backend = Backend()
+            summary = run_campaign_selection(
+                plan,
+                selection,
+                backend,
+                root / "migrated.json",
+                resume=False,
+                solved_leaf_store=store,
+            )
+
+            current_identity = scientific_computation_identity_sha256(plan, leaf)
+            self.assertNotEqual(current_identity, legacy_identity)
+            self.assertEqual(backend.calls, [])
+            self.assertEqual(summary.records[0].to_mapping(), legacy.to_mapping())
+            self.assertEqual(store.stored_count, 2)
+            legacy_lookup = store.lookup(legacy_identity, leaf.leaf_id)
+            current_lookup = _authenticated_solved_leaf_lookup(plan, leaf, store)
+            self.assertIs(legacy_lookup.status, SolvedLeafLookupStatus.HIT)
+            self.assertIs(current_lookup.status, SolvedLeafLookupStatus.HIT)
+            self.assertEqual(legacy_lookup.receipt["record"], legacy.to_mapping())
+            self.assertEqual(current_lookup.receipt["record"], legacy.to_mapping())
+            self.assertEqual(
+                legacy_lookup.receipt["source_type"],
+                "imported-authenticated-checkpoint",
+            )
+            self.assertEqual(
+                current_lookup.receipt["source_type"],
+                "imported-authenticated-checkpoint",
+            )
+
+    def test_legacy_primary_unresolved_record_recomputes_through_recovery_ladder(self):
+        """Catches reusing a legacy UNRESOLVED record that must enter recovery."""
+
+        plan = build_campaign_plan(
+            policy=NumericalPolicy(),
+            backend_identity=_FROZEN_MIGRATION_BACKEND_IDENTITY,
+            precision_capabilities=PrecisionCapabilities((64, 80)),
+        )
+        leaf = next(item for item in plan.leaves if item.role == "primary")
+        legacy_plan = build_campaign_plan(
+            policy=plan.policy,
+            backend_identity=plan.backend_identity,
+            precision_capabilities=PrecisionCapabilities((64,)),
+        )
+        legacy_leaf = next(
+            item for item in legacy_plan.leaves if item.leaf_id == leaf.leaf_id
+        )
+        legacy_identity = _frozen_predecessor_scientific_identity(
+            legacy_plan, legacy_leaf
+        )
+        self.assertEqual(
+            legacy_identity,
+            "4f0833f9f3426decc9e2bde4b55e1b52af86e8ebce13cad99939bea1fa7fe974",
+        )
+        selection = build_campaign_selection(
+            plan, role="primary", leaf_ids=(leaf.leaf_id,)
+        )
+
+        class Backend:
+            identity = plan.backend_identity
+            precision_capabilities = plan.precision_capabilities
+
+            def __init__(self):
+                self.calls = []
+
+            def execute_stage(self, selected, digits):
+                self.calls.append((selected.leaf_id, digits))
+                if digits == 64:
+                    return _production_outcome(
+                        selected, status=ComponentStatus.NOT_CONVERGED
+                    )
+                return replace(
+                    _production_outcome(selected, digits=80),
+                    self_refinement_enclosed=True,
+                    discrepancy_from_previous_abs=1.0e-9,
+                    discrepancy_enclosed=True,
+                )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            store = SolvedLeafStore(root / "solved")
+            legacy = _legacy_primary_record(
+                legacy_plan, legacy_leaf, ComponentStatus.NOT_CONVERGED
+            )
+            self.assertEqual(legacy_leaf.job.to_mapping(), leaf.job.to_mapping())
+            self.assertEqual(
+                legacy_plan.precision_factory_identity.to_mapping(),
+                plan.precision_factory_identity.to_mapping(),
+            )
+            self.assertEqual(
+                legacy.stages[0].runner_provenance["available_precision_digits"],
+                [64],
+            )
+            self.assertEqual(tuple(stage.outcome.digits for stage in legacy.stages), (64,))
+            self.assertEqual(legacy.trigger_ids, ())
+            self.assertFalse(legacy.sentinel)
+            self.assertIsNone(legacy.missing_precision_digits)
+            self.assertIsNone(legacy.sentinel_comparison)
+            store.publish(
+                scientific_identity_sha256=legacy_identity,
+                leaf_id=leaf.leaf_id,
+                record=legacy.to_mapping(),
+                source_type="originating-campaign",
+            )
+            backend = Backend()
+            summary = run_campaign_selection(
+                plan,
+                selection,
+                backend,
+                root / "recomputed.json",
+                resume=False,
+                solved_leaf_store=store,
+            )
+
+        self.assertEqual(backend.calls, [(leaf.leaf_id, 64), (leaf.leaf_id, 80)])
+        self.assertEqual(summary.state, "COMPLETE")
+        self.assertEqual(summary.records[0].state, "PRODUCED")
+        self.assertEqual(
+            tuple(stage.outcome.digits for stage in summary.records[0].stages),
+            (64, 80),
+        )
+
+    def test_arbitrary_same_leaf_stale_success_does_not_authorize_migration(self):
+        """Catches treating the cache's generic same-leaf STALE as predecessor proof."""
+
+        plan, leaf, legacy_plan, legacy_leaf, legacy_identity, selection = (
+            _primary_migration_context()
+        )
+        arbitrary_identity = "a" * 64
+        self.assertNotEqual(arbitrary_identity, legacy_identity)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            store = SolvedLeafStore(root / "solved")
+            stale = _legacy_primary_record(
+                legacy_plan, legacy_leaf, ComponentStatus.CONVERGED
+            )
+            store.publish(
+                scientific_identity_sha256=arbitrary_identity,
+                leaf_id=leaf.leaf_id,
+                record=stale.to_mapping(),
+                source_type="originating-campaign",
+            )
+            backend = _ConvergedProductionBackend(plan)
+            summary = run_campaign_selection(
+                plan,
+                selection,
+                backend,
+                root / "recomputed.json",
+                resume=False,
+                solved_leaf_store=store,
+            )
+
+            current_identity = scientific_computation_identity_sha256(plan, leaf)
+            self.assertEqual(backend.calls, [(leaf.leaf_id, 64)])
+            self.assertEqual(summary.executed_stage_count, 1)
+            self.assertTrue((store.root / f"{arbitrary_identity}.json").is_file())
+            self.assertFalse((store.root / f"{legacy_identity}.json").exists())
+            self.assertIs(
+                store.lookup(current_identity, leaf.leaf_id).status,
+                SolvedLeafLookupStatus.HIT,
+            )
+
+    def test_semantically_corrupt_exact_legacy_receipt_is_quarantined(self):
+        """Catches migrating exact-path evidence sealed for the wrong current job."""
+
+        plan, leaf, _, _, legacy_identity, selection = (
+            _primary_migration_context()
+        )
+        wrong_plan = build_campaign_plan(
+            policy=NumericalPolicy(ode_relative_tolerance=1.0e-10),
+            backend_identity=plan.backend_identity,
+            precision_capabilities=PrecisionCapabilities((64,)),
+        )
+        wrong_leaf = next(
+            item for item in wrong_plan.leaves if item.leaf_id == leaf.leaf_id
+        )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            store = SolvedLeafStore(root / "solved")
+            corrupt = _legacy_primary_record(
+                wrong_plan, wrong_leaf, ComponentStatus.NOT_CONVERGED
+            )
+            store.publish(
+                scientific_identity_sha256=legacy_identity,
+                leaf_id=leaf.leaf_id,
+                record=corrupt.to_mapping(),
+                source_type="originating-campaign",
+            )
+            backend = _ConvergedProductionBackend(plan)
+            summary = run_campaign_selection(
+                plan,
+                selection,
+                backend,
+                root / "recomputed.json",
+                resume=False,
+                solved_leaf_store=store,
+            )
+
+            current_identity = scientific_computation_identity_sha256(plan, leaf)
+            quarantined = tuple((store.root / "quarantine").glob("*.json"))
+            self.assertEqual(backend.calls, [(leaf.leaf_id, 64)])
+            self.assertEqual(summary.executed_stage_count, 1)
+            self.assertFalse((store.root / f"{legacy_identity}.json").exists())
+            self.assertEqual(len(quarantined), 1)
+            self.assertIs(
+                store.lookup(current_identity, leaf.leaf_id).status,
+                SolvedLeafLookupStatus.HIT,
+            )
+
+    def test_impossible_exact_legacy_produced_receipt_is_quarantined_and_recomputed(self):
+        """Catches migrating a CONVERGED record with no consumable response."""
+
+        plan, leaf, legacy_plan, legacy_leaf, legacy_identity, selection = (
+            _primary_migration_context()
+        )
+        legacy = _legacy_primary_record(
+            legacy_plan, legacy_leaf, ComponentStatus.CONVERGED
+        )
+        corrupt_stage = CampaignStageRecord(
+            _replace_component_result_fields(
+                legacy.stages[0].outcome,
+                response=None,
+            ),
+            legacy.stages[0].runner_provenance,
+        )
+        corrupt = replace(legacy, stages=(corrupt_stage,))
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            store = SolvedLeafStore(root / "solved")
+            store.publish(
+                scientific_identity_sha256=legacy_identity,
+                leaf_id=leaf.leaf_id,
+                record=corrupt.to_mapping(),
+                source_type="originating-campaign",
+            )
+            backend = _ConvergedProductionBackend(plan)
+            summary = run_campaign_selection(
+                plan,
+                selection,
+                backend,
+                root / "recomputed.json",
+                resume=False,
+                solved_leaf_store=store,
+            )
+
+            current_identity = scientific_computation_identity_sha256(plan, leaf)
+            self.assertEqual(backend.calls, [(leaf.leaf_id, 64)])
+            self.assertEqual(summary.records[0].state, "PRODUCED")
+            self.assertFalse((store.root / f"{legacy_identity}.json").exists())
+            self.assertEqual(
+                len(tuple((store.root / "quarantine").glob("*.json"))), 1
+            )
+            self.assertIs(
+                store.lookup(current_identity, leaf.leaf_id).status,
+                SolvedLeafLookupStatus.HIT,
+            )
+
+    def test_corrupt_current_receipt_is_not_bypassed_by_exact_legacy_success(self):
+        """Catches consulting the predecessor after current evidence fails semantics."""
+
+        plan, leaf, legacy_plan, legacy_leaf, legacy_identity, selection = (
+            _primary_migration_context()
+        )
+        current_identity = scientific_computation_identity_sha256(plan, leaf)
+        wrong_plan = build_campaign_plan(
+            policy=NumericalPolicy(ode_relative_tolerance=1.0e-10),
+            backend_identity=plan.backend_identity,
+            precision_capabilities=PrecisionCapabilities((64, 80)),
+        )
+        wrong_leaf = next(
+            item for item in wrong_plan.leaves if item.leaf_id == leaf.leaf_id
+        )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            store = SolvedLeafStore(root / "solved")
+            store.publish(
+                scientific_identity_sha256=current_identity,
+                leaf_id=leaf.leaf_id,
+                record=_legacy_primary_record(
+                    wrong_plan, wrong_leaf, ComponentStatus.CONVERGED
+                ).to_mapping(),
+                source_type="originating-campaign",
+            )
+            store.publish(
+                scientific_identity_sha256=legacy_identity,
+                leaf_id=leaf.leaf_id,
+                record=_legacy_primary_record(
+                    legacy_plan, legacy_leaf, ComponentStatus.CONVERGED
+                ).to_mapping(),
+                source_type="originating-campaign",
+            )
+            backend = _ConvergedProductionBackend(plan)
+            run_campaign_selection(
+                plan,
+                selection,
+                backend,
+                root / "recomputed.json",
+                resume=False,
+                solved_leaf_store=store,
+            )
+
+            self.assertEqual(backend.calls, [(leaf.leaf_id, 64)])
+            self.assertTrue((store.root / f"{legacy_identity}.json").is_file())
+            self.assertEqual(
+                len(tuple((store.root / "quarantine").glob("*.json"))), 1
+            )
+
+    def test_impossible_current_produced_receipt_is_quarantined_without_legacy_fallback(self):
+        """Catches accepting or replacing corrupt current evidence from legacy."""
+
+        plan, leaf, legacy_plan, legacy_leaf, legacy_identity, selection = (
+            _primary_migration_context()
+        )
+        current_identity = scientific_computation_identity_sha256(plan, leaf)
+        current = _legacy_primary_record(plan, leaf, ComponentStatus.CONVERGED)
+        corrupt_stage = CampaignStageRecord(
+            _replace_component_result_fields(
+                current.stages[0].outcome,
+                signed_root_crosscheck=None,
+            ),
+            current.stages[0].runner_provenance,
+        )
+        corrupt = replace(current, stages=(corrupt_stage,))
+        legacy = _legacy_primary_record(
+            legacy_plan, legacy_leaf, ComponentStatus.CONVERGED
+        )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            store = SolvedLeafStore(root / "solved")
+            store.publish(
+                scientific_identity_sha256=current_identity,
+                leaf_id=leaf.leaf_id,
+                record=corrupt.to_mapping(),
+                source_type="originating-campaign",
+            )
+            store.publish(
+                scientific_identity_sha256=legacy_identity,
+                leaf_id=leaf.leaf_id,
+                record=legacy.to_mapping(),
+                source_type="originating-campaign",
+            )
+            backend = _ConvergedProductionBackend(plan)
+            summary = run_campaign_selection(
+                plan,
+                selection,
+                backend,
+                root / "recomputed.json",
+                resume=False,
+                solved_leaf_store=store,
+            )
+
+            current_lookup = store.lookup(current_identity, leaf.leaf_id)
+            self.assertEqual(backend.calls, [(leaf.leaf_id, 64)])
+            self.assertEqual(
+                current_lookup.receipt["record"], summary.records[0].to_mapping()
+            )
+            self.assertNotEqual(current_lookup.receipt["record"], legacy.to_mapping())
+            self.assertTrue((store.root / f"{legacy_identity}.json").is_file())
+            self.assertEqual(
+                len(tuple((store.root / "quarantine").glob("*.json"))), 1
+            )
+
+    def test_legacy_migration_race_preserves_authenticated_current_evidence(self):
+        """Catches overwriting a current receipt published during migration."""
+
+        plan, leaf, legacy_plan, legacy_leaf, legacy_identity, _ = (
+            _primary_migration_context()
+        )
+        current_identity = scientific_computation_identity_sha256(plan, leaf)
+        competing = CampaignLeafRecord(
+            leaf_id=leaf.leaf_id,
+            role="primary",
+            state="PRODUCED",
+            stages=(CampaignStageRecord(
+                _production_outcome(
+                    leaf,
+                    baseline_omega=leaf.job.root.omega + complex(1.0e-13, 0.0),
+                ),
+                {
+                    "precision_factory_identity": (
+                        plan.precision_factory_identity.to_mapping()
+                    ),
+                    "available_precision_digits": [64, 80],
+                },
+            ),),
+        )
+        _validate_cacheable_leaf_record(plan, leaf, competing)
+
+        class RacingStore(SolvedLeafStore):
+            raced = False
+
+            def publish_if_missing(self, **kwargs):
+                if (
+                    kwargs["scientific_identity_sha256"] == current_identity
+                    and not self.raced
+                ):
+                    self.raced = True
+                    SolvedLeafStore.publish(
+                        self,
+                        scientific_identity_sha256=current_identity,
+                        leaf_id=leaf.leaf_id,
+                        record=competing.to_mapping(),
+                        source_type="originating-campaign",
+                    )
+                return SolvedLeafStore.publish_if_missing(self, **kwargs)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            store = RacingStore(Path(temporary) / "solved")
+            store.publish(
+                scientific_identity_sha256=legacy_identity,
+                leaf_id=leaf.leaf_id,
+                record=_legacy_primary_record(
+                    legacy_plan, legacy_leaf, ComponentStatus.CONVERGED
+                ).to_mapping(),
+                source_type="originating-campaign",
+            )
+
+            lookup = _authenticated_solved_leaf_lookup(plan, leaf, store)
+
+            self.assertTrue(store.raced)
+            self.assertIs(lookup.status, SolvedLeafLookupStatus.HIT)
+            self.assertEqual(lookup.receipt["record"], competing.to_mapping())
+            self.assertEqual(
+                store.lookup(current_identity, leaf.leaf_id).receipt["record"],
+                competing.to_mapping(),
+            )
+            self.assertTrue((store.root / f"{legacy_identity}.json").is_file())
+
+    def test_legacy_migration_waits_for_inflight_current_writer_and_authenticates_winner(self):
+        """Catches aborting while the current receipt writer owns the lock."""
+
+        plan, leaf, legacy_plan, legacy_leaf, legacy_identity, _ = (
+            _primary_migration_context()
+        )
+        current_identity = scientific_computation_identity_sha256(plan, leaf)
+        competing = CampaignLeafRecord(
+            leaf_id=leaf.leaf_id,
+            role="primary",
+            state="PRODUCED",
+            stages=(CampaignStageRecord(
+                _production_outcome(
+                    leaf,
+                    baseline_omega=leaf.job.root.omega + complex(1.0e-13, 0.0),
+                ),
+                {
+                    "precision_factory_identity": (
+                        plan.precision_factory_identity.to_mapping()
+                    ),
+                    "available_precision_digits": [64, 80],
+                },
+            ),),
+        )
+        _validate_cacheable_leaf_record(plan, leaf, competing)
+        writer_holds_lock = threading.Event()
+        release_writer = threading.Event()
+        writer_finished = threading.Event()
+        migration_observed_lock = threading.Event()
+        conditional_attempts = []
+        writer_errors = []
+        migration_errors = []
+        migration_results = []
+
+        class CoordinatedStore(SolvedLeafStore):
+            def publish_if_missing(self, **kwargs):
+                conditional_attempts.append(kwargs["scientific_identity_sha256"])
+                try:
+                    return super().publish_if_missing(**kwargs)
+                except RuntimeError as error:
+                    if str(error) == "solved-leaf cache publication is locked":
+                        migration_observed_lock.set()
+                        if not writer_finished.wait(5.0):
+                            raise AssertionError(
+                                "test current writer did not finish"
+                            ) from error
+                    raise
+
+        with tempfile.TemporaryDirectory() as temporary:
+            store = CoordinatedStore(Path(temporary) / "solved")
+            store.publish(
+                scientific_identity_sha256=legacy_identity,
+                leaf_id=leaf.leaf_id,
+                record=_legacy_primary_record(
+                    legacy_plan, legacy_leaf, ComponentStatus.CONVERGED
+                ).to_mapping(),
+                source_type="originating-campaign",
+            )
+            current_path = store.root / f"{current_identity}.json"
+            real_atomic_json = solved_leaf_cache_module._atomic_json
+
+            def blocking_atomic_json(path, value):
+                if path == current_path:
+                    writer_holds_lock.set()
+                    if not release_writer.wait(5.0):
+                        raise AssertionError("test did not release the current writer")
+                return real_atomic_json(path, value)
+
+            def write_current():
+                try:
+                    store.publish(
+                        scientific_identity_sha256=current_identity,
+                        leaf_id=leaf.leaf_id,
+                        record=competing.to_mapping(),
+                        source_type="originating-campaign",
+                    )
+                except BaseException as error:
+                    writer_errors.append(error)
+                finally:
+                    writer_finished.set()
+
+            def migrate_legacy():
+                try:
+                    migration_results.append(
+                        _authenticated_solved_leaf_lookup(plan, leaf, store)
+                    )
+                except BaseException as error:
+                    migration_errors.append(error)
+
+            with patch.object(
+                solved_leaf_cache_module,
+                "_atomic_json",
+                side_effect=blocking_atomic_json,
+            ):
+                writer = threading.Thread(target=write_current)
+                writer.start()
+                self.assertTrue(writer_holds_lock.wait(5.0))
+                migration = threading.Thread(target=migrate_legacy)
+                migration.start()
+                self.assertTrue(migration_observed_lock.wait(5.0))
+                release_writer.set()
+                writer.join(5.0)
+                migration.join(5.0)
+
+            self.assertFalse(writer.is_alive())
+            self.assertFalse(migration.is_alive())
+            self.assertEqual(writer_errors, [])
+            self.assertEqual(migration_errors, [])
+            self.assertEqual(
+                conditional_attempts,
+                [current_identity, current_identity],
+            )
+            self.assertEqual(len(migration_results), 1)
+            lookup = migration_results[0]
+            self.assertIs(lookup.status, SolvedLeafLookupStatus.HIT)
+            self.assertEqual(lookup.receipt["record"], competing.to_mapping())
+            self.assertEqual(
+                store.lookup(current_identity, leaf.leaf_id).receipt["record"],
+                competing.to_mapping(),
+            )
+            self.assertTrue((store.root / f"{legacy_identity}.json").is_file())
+
+    def test_legacy_migration_lock_timeout_fails_closed_and_publish_stays_immediate(self):
+        """Catches unbounded waiting and changes to originating publication."""
+
+        plan, leaf, legacy_plan, legacy_leaf, legacy_identity, _ = (
+            _primary_migration_context()
+        )
+        current_identity = scientific_computation_identity_sha256(plan, leaf)
+        current = _legacy_primary_record(plan, leaf, ComponentStatus.CONVERGED)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            store = SolvedLeafStore(Path(temporary) / "solved")
+            store.publish(
+                scientific_identity_sha256=legacy_identity,
+                leaf_id=leaf.leaf_id,
+                record=_legacy_primary_record(
+                    legacy_plan, legacy_leaf, ComponentStatus.CONVERGED
+                ).to_mapping(),
+                source_type="originating-campaign",
+            )
+            lock = store.root / "locks" / f"{current_identity}.lock"
+            lock.parent.mkdir(parents=True, exist_ok=True)
+            lock.write_bytes(b"")
+
+            with self.assertRaisesRegex(RuntimeError, "publication is locked"):
+                store.publish(
+                    scientific_identity_sha256=current_identity,
+                    leaf_id=leaf.leaf_id,
+                    record=current.to_mapping(),
+                    source_type="originating-campaign",
+                )
+            with patch(
+                "windows_solver.response_batches._LEGACY_MIGRATION_LOCK_TIMEOUT_SECONDS",
+                0.0,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "timed out"):
+                    _authenticated_solved_leaf_lookup(plan, leaf, store)
+
+            self.assertTrue(lock.is_file())
+            self.assertFalse((store.root / f"{current_identity}.json").exists())
+            self.assertTrue((store.root / f"{legacy_identity}.json").is_file())
+
+    def test_late_corrupt_current_receipt_blocks_legacy_migration(self):
+        """Catches replacing late current corruption with predecessor evidence."""
+
+        plan, leaf, legacy_plan, legacy_leaf, legacy_identity, selection = (
+            _primary_migration_context()
+        )
+        current_identity = scientific_computation_identity_sha256(plan, leaf)
+
+        class LateCorruptStore(SolvedLeafStore):
+            injected = False
+            conditional_status = None
+
+            def _inject_current_corruption(self, identity):
+                if identity == current_identity and not self.injected:
+                    self.injected = True
+                    path = self.root / f"{current_identity}.json"
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_bytes(b"{")
+
+            def publish(self, **kwargs):
+                self._inject_current_corruption(
+                    kwargs["scientific_identity_sha256"]
+                )
+                return SolvedLeafStore.publish(self, **kwargs)
+
+            def publish_if_missing(self, **kwargs):
+                self._inject_current_corruption(
+                    kwargs["scientific_identity_sha256"]
+                )
+                result = SolvedLeafStore.publish_if_missing(self, **kwargs)
+                self.conditional_status = result.status
+                return result
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            store = LateCorruptStore(root / "solved")
+            legacy = _legacy_primary_record(
+                legacy_plan, legacy_leaf, ComponentStatus.CONVERGED
+            )
+            store.publish(
+                scientific_identity_sha256=legacy_identity,
+                leaf_id=leaf.leaf_id,
+                record=legacy.to_mapping(),
+                source_type="originating-campaign",
+            )
+            backend = _ConvergedProductionBackend(plan)
+
+            summary = run_campaign_selection(
+                plan,
+                selection,
+                backend,
+                root / "recomputed.json",
+                resume=False,
+                solved_leaf_store=store,
+            )
+
+            current = store.lookup(current_identity, leaf.leaf_id)
+            quarantined = tuple((store.root / "quarantine").glob("*.json"))
+            self.assertTrue(store.injected)
+            self.assertEqual(backend.calls, [(leaf.leaf_id, 64)])
+            self.assertIs(
+                store.conditional_status, SolvedLeafLookupStatus.CORRUPT
+            )
+            self.assertEqual(summary.executed_stage_count, 1)
+            self.assertIs(current.status, SolvedLeafLookupStatus.HIT)
+            self.assertEqual(
+                current.receipt["record"], summary.records[0].to_mapping()
+            )
+            self.assertNotEqual(current.receipt["record"], legacy.to_mapping())
+            self.assertEqual(len(quarantined), 1)
+            self.assertTrue((store.root / f"{legacy_identity}.json").is_file())
 
     def test_windows_campaign_store_cannot_be_redirected_from_local_app_data(self):
         """Catches split read/write stores caused by an inherited override."""

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from fractions import Fraction
 import json
 import hashlib
@@ -16,6 +17,7 @@ from windows_solver.linear_response import B_PRIME_RELEASE_DOMAIN
 from windows_solver.response_batches import (
     CAMPAIGN_CHECKPOINT_SCHEMA_VERSION,
     CAMPAIGN_SCHEMA_VERSION,
+    CampaignLeafRecord,
     CampaignStageRecord,
     PrecisionCapabilities,
     PrecisionFactoryIdentity,
@@ -25,6 +27,7 @@ from windows_solver.response_batches import (
     build_campaign_plan,
     build_campaign_selection,
     import_campaign_checkpoint_to_solved_leaf_store,
+    scientific_computation_identity_sha256,
     synthetic_stage_signed_error_channels,
     merge_campaign_checkpoints,
     resolve_campaign_relative_path,
@@ -40,6 +43,16 @@ from windows_solver.response_engine import (
     run_component,
 )
 from windows_solver.solved_leaf_cache import SolvedLeafStore
+
+
+_FROZEN_IDENTITY_TEST_BACKEND = replace(
+    VettedNativeDeterminantKernel.identity,
+    runtime_fingerprint=(
+        "cpython-3.12.13-linux-python-64bit-"
+        "gsn-input-julia-exact-f-u-cache-contract-1-"
+        "adapted-source-native-gsn-adapter-contract-2"
+    ),
+)
 
 
 def reseal_campaign_checkpoint(value):
@@ -126,6 +139,112 @@ def _produced_stage_outcome(leaf, response, *, baseline_delta=0.0j):
 
 
 class CampaignPlanTests(unittest.TestCase):
+    def test_primary_recovery_identity_and_checkpoint_binding(self) -> None:
+        """Catches old PRIMARY identity/binding while preserving CONTROL and DEEP."""
+
+        plan = build_campaign_plan(
+            policy=NumericalPolicy(),
+            backend_identity=_FROZEN_IDENTITY_TEST_BACKEND,
+            precision_capabilities=PrecisionCapabilities((64, 80, 120)),
+        )
+        primary = next(item for item in plan.leaves if item.role == "primary")
+        control = next(item for item in plan.leaves if item.role == "control")
+        deep = next(item for item in plan.leaves if item.role == "deep")
+
+        self.assertEqual(CAMPAIGN_SCHEMA_VERSION, 2)
+        self.assertEqual(CAMPAIGN_CHECKPOINT_SCHEMA_VERSION, 3)
+        with self.subTest(contract="identity"):
+            self.assertNotEqual(
+                scientific_computation_identity_sha256(plan, primary),
+                "4f0833f9f3426decc9e2bde4b55e1b52af86e8ebce13cad99939bea1fa7fe974",
+            )
+            self.assertEqual(
+                scientific_computation_identity_sha256(plan, control),
+                "a6d06e19d6c3b046bcff772a9765393a636e20aaa4a03d9412dbb4c43d837788",
+            )
+            self.assertEqual(
+                scientific_computation_identity_sha256(plan, deep),
+                "9905df951c1331a300dfb0a06722846edb2cec45d46d94f2baab29297b23b78c",
+            )
+
+        leaf = primary
+        selection = build_campaign_selection(
+            plan, role="primary", leaf_ids=(leaf.leaf_id,)
+        )
+        legacy_precision_binding = (
+            "75b7210a8e8cefbdcefef210f6ef5792b68227f6957862b3a42cb9cdc92dd74b"
+        )
+
+        with self.subTest(contract="binding-entry-points"), tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkpoint = root / "legacy-primary-policy.json"
+            record = CampaignLeafRecord(
+                leaf_id=leaf.leaf_id,
+                role=leaf.role,
+                state="PRODUCED",
+                stages=(CampaignStageRecord(
+                    _produced_stage_outcome(leaf, complex(1.0, -0.5)),
+                    {
+                        "precision_factory_identity": (
+                            plan.precision_factory_identity.to_mapping()
+                        ),
+                        "available_precision_digits": [64, 80, 120],
+                    },
+                ),),
+            )
+            checkpoint_value = _checkpoint_mapping(plan, selection, (record,))
+            checkpoint_value["bindings"]["precision_contract_sha256"] = (
+                legacy_precision_binding
+            )
+            checkpoint.write_bytes(canonical_json_bytes(checkpoint_value))
+            original_checkpoint = checkpoint.read_bytes()
+            with self.assertRaisesRegex(ValueError, "bindings.*stale|forged"):
+                validate_campaign_checkpoint(plan, checkpoint)
+
+            class Backend:
+                identity = plan.backend_identity
+                precision_capabilities = plan.precision_capabilities
+
+                def __init__(self):
+                    self.calls = []
+
+                def execute_stage(self, selected, digits):
+                    self.calls.append((selected.leaf_id, digits))
+                    raise AssertionError("old-bound resume reached backend execution")
+
+            backend = Backend()
+            resume_store = SolvedLeafStore(root / "resume-store")
+            current_identity = scientific_computation_identity_sha256(plan, leaf)
+            corrupt_current = resume_store.root / f"{current_identity}.json"
+            corrupt_current.parent.mkdir(parents=True, exist_ok=True)
+            corrupt_current.write_bytes(b"{")
+            with self.assertRaisesRegex(ValueError, "bindings.*stale|forged"):
+                run_campaign_selection(
+                    plan,
+                    selection,
+                    backend,
+                    checkpoint,
+                    resume=True,
+                    solved_leaf_store=resume_store,
+                )
+            self.assertEqual(backend.calls, [])
+            self.assertEqual(checkpoint.read_bytes(), original_checkpoint)
+            self.assertTrue(corrupt_current.is_file())
+            self.assertEqual(corrupt_current.read_bytes(), b"{")
+            self.assertFalse((resume_store.root / "quarantine").exists())
+
+            merged = root / "merged.json"
+            with self.assertRaisesRegex(ValueError, "bindings.*stale|forged"):
+                merge_campaign_checkpoints(plan, (checkpoint,), merged)
+            self.assertFalse(merged.exists())
+
+            import_store = SolvedLeafStore(root / "import-store")
+            with self.assertRaisesRegex(ValueError, "binding.*incompatible"):
+                import_campaign_checkpoint_to_solved_leaf_store(
+                    plan, checkpoint, import_store
+                )
+            self.assertFalse(import_store.root.exists())
+
     def test_enclosed_baseline_polish_is_published_to_solved_leaf_store(self) -> None:
         """Catches requiring a polished zero-amplitude root to equal its seed."""
 
@@ -253,7 +372,7 @@ class CampaignPlanTests(unittest.TestCase):
         plan = build_campaign_plan(
             policy=NumericalPolicy(),
             backend_identity=VettedNativeDeterminantKernel.identity,
-            precision_capabilities=PrecisionCapabilities((64,)),
+            precision_capabilities=PrecisionCapabilities((64, 80, 120)),
         )
         leaf = next(item for item in plan.leaves if item.role == "primary")
         selection = build_campaign_selection(
@@ -291,6 +410,18 @@ class CampaignPlanTests(unittest.TestCase):
             def execute_stage(self, selected, digits):
                 self.calls += 1
                 result = run_component(selected.job, RootBackend())
+                refinement = {}
+                if digits == 80:
+                    refinement = {
+                        "self_refinement_enclosed": True,
+                        "discrepancy_from_previous_abs": 0.0,
+                        "discrepancy_enclosed": True,
+                    }
+                elif digits == 120:
+                    refinement = {
+                        "discrepancy_from_previous_abs": 0.0,
+                        "discrepancy_enclosed": True,
+                    }
                 return _synthetic_stage_outcome(
                     digits=digits,
                     numerical_state=result.status.value,
@@ -299,6 +430,7 @@ class CampaignPlanTests(unittest.TestCase):
                         "result": result.to_mapping(),
                     },
                     local_disk_radius_abs=0.0,
+                    **refinement,
                 )
 
         with tempfile.TemporaryDirectory() as temporary:
@@ -315,7 +447,7 @@ class CampaignPlanTests(unittest.TestCase):
                 solved_leaf_store=store,
             )
 
-            self.assertEqual(first_backend.calls, 1)
+            self.assertEqual(first_backend.calls, 3)
             self.assertEqual(first.records[0].state, "UNRESOLVED")
             self.assertEqual(
                 first.records[0].stages[0].outcome.numerical_state,
@@ -337,7 +469,7 @@ class CampaignPlanTests(unittest.TestCase):
 
             self.assertEqual(second_backend.calls, 0)
             self.assertEqual(second.executed_stage_count, 0)
-            self.assertEqual(second.reused_stage_count, 1)
+            self.assertEqual(second.reused_stage_count, 3)
             self.assertEqual(
                 second.records[0].to_mapping(),
                 first.records[0].to_mapping(),
