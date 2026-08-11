@@ -59,5 +59,6 @@ Confirm that a fresh checkout can originate every M02 numerical prerequisite fro
 - Project the committed authenticated campaign state into deterministic, disposable CSV audit views and operator-facing numerical certificates; keep run provenance invocation-local, refresh only after checkpoint commits, and surface unresolved science as prominently as accepted science.
 - Traverse the unchanged campaign through mechanism-local, fail-fast mode, and ascending-physical-spin chains; use only same-chain accepted response centres as execution-only PRIMARY predictors while preserving checkpoint/cache compatibility and independent SEED-PATH evidence.
 - Recover every authenticated PRIMARY binary64 `NOT_CONVERGED` leaf through the existing 80/120-digit boundary; preserve CONTROL and DEEP policy, migrate only exact legacy binary64 successes, recompute legacy unresolved receipts, and reject old checkpoints through the precision-policy binding without a schema/backend bump.
+- Split the checkpoint-derived latest-completed summary from a heartbeat-refreshed currently-executing Julia panel, including live root counters and pending-vs-authenticated branch state, without changing scientific execution.
 
 ---
