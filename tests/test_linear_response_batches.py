@@ -361,7 +361,7 @@ class CampaignPlanTests(unittest.TestCase):
         plan = build_campaign_plan(
             policy=NumericalPolicy(),
             backend_identity=VettedNativeDeterminantKernel.identity,
-            precision_capabilities=PrecisionCapabilities((64,)),
+            precision_capabilities=PrecisionCapabilities((64, 80, 120)),
         )
         leaf = next(item for item in plan.leaves if item.role == "primary")
         selection = build_campaign_selection(
@@ -399,6 +399,18 @@ class CampaignPlanTests(unittest.TestCase):
             def execute_stage(self, selected, digits):
                 self.calls += 1
                 result = run_component(selected.job, RootBackend())
+                refinement = {}
+                if digits == 80:
+                    refinement = {
+                        "self_refinement_enclosed": True,
+                        "discrepancy_from_previous_abs": 0.0,
+                        "discrepancy_enclosed": True,
+                    }
+                elif digits == 120:
+                    refinement = {
+                        "discrepancy_from_previous_abs": 0.0,
+                        "discrepancy_enclosed": True,
+                    }
                 return _synthetic_stage_outcome(
                     digits=digits,
                     numerical_state=result.status.value,
@@ -407,6 +419,7 @@ class CampaignPlanTests(unittest.TestCase):
                         "result": result.to_mapping(),
                     },
                     local_disk_radius_abs=0.0,
+                    **refinement,
                 )
 
         with tempfile.TemporaryDirectory() as temporary:
@@ -423,7 +436,7 @@ class CampaignPlanTests(unittest.TestCase):
                 solved_leaf_store=store,
             )
 
-            self.assertEqual(first_backend.calls, 1)
+            self.assertEqual(first_backend.calls, 3)
             self.assertEqual(first.records[0].state, "UNRESOLVED")
             self.assertEqual(
                 first.records[0].stages[0].outcome.numerical_state,
@@ -445,7 +458,7 @@ class CampaignPlanTests(unittest.TestCase):
 
             self.assertEqual(second_backend.calls, 0)
             self.assertEqual(second.executed_stage_count, 0)
-            self.assertEqual(second.reused_stage_count, 1)
+            self.assertEqual(second.reused_stage_count, 3)
             self.assertEqual(
                 second.records[0].to_mapping(),
                 first.records[0].to_mapping(),
