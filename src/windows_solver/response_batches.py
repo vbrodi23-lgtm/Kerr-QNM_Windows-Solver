@@ -2460,7 +2460,15 @@ def _run_campaign_selection_active(
                 )
             elif leaf.role == "primary":
                 precision80_digits, _ = _primary_recovery_digits()
-                production = _validate_component_result(leaf, outcome)
+                try:
+                    production = _validate_component_result(leaf, outcome)
+                except (KeyError, TypeError, ValueError):
+                    # Promotion is recovery for authenticated numerical
+                    # nonconvergence, not a new fail-fast boundary for
+                    # malformed or deliberately adverse evidence.  Keep the
+                    # strict validator authoritative at checkpoint/cache
+                    # authentication while refusing to promote this stage.
+                    production = False
                 promoted = _primary_binary64_promotes(
                     outcome, production=production
                 )
