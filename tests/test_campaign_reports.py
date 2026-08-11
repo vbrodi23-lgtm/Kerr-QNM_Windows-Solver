@@ -3,14 +3,16 @@ from __future__ import annotations
 import csv
 import hashlib
 import io
+import json
 from pathlib import Path
 import tempfile
+import time
 from types import SimpleNamespace
 import unittest
 
 from windows_solver.campaign_reports import CampaignReportModel, refresh_campaign_reports
 from windows_solver.contracts import canonical_json_bytes
-from windows_solver.progress import ProgressEventKind
+from windows_solver.progress import ProgressContext, ProgressEvent, ProgressEventKind
 from windows_solver.progress_output import CampaignProgressReporter
 from windows_solver.response_batches import (
     CampaignLeafRecord,
@@ -121,6 +123,182 @@ class CampaignReportTests(unittest.TestCase):
             }),),
         )
 
+    def test_dashboard_separates_completed_leaf_from_live_promoted_worker(self):
+        """Catches a running BigFloat stage being hidden by completed science."""
+
+        with tempfile.TemporaryDirectory() as temporary:
+            checkpoint = Path(temporary) / "checkpoint.json"
+            reporter = CampaignProgressReporter("normal", checkpoint, io.StringIO())
+            reporter._campaign_report_model = CampaignReportModel(
+                leaf_rows=({
+                    "leaf_id": "completed-999",
+                    "terminal_state": "PRODUCED",
+                    "mechanism": "horizon-admittance",
+                    "spin_or_Mkappa": 0.999,
+                    "precision_digits": 64,
+                    "mode": "220",
+                },),
+                error_channel_rows=(),
+                projective_rows=(),
+                checkpoint_source_receipt="fixture-receipt",
+                precision_stage_rows=({
+                    "leaf_id": "active-9999",
+                    "precision_digits": 64,
+                    "numerical_state": "NOT_CONVERGED",
+                },),
+            )
+            reporter._last_terminal_leaf = "completed-999"
+            reporter._last_terminal_state = "PRODUCED"
+            base_time = time.monotonic()
+            base_context = {
+                "leaf_index": 16,
+                "leaf_count": 212,
+                "leaf_id": "active-9999",
+                "role": "primary",
+                "mode": {"s": -2, "ell": 2, "m": 2, "n": 0},
+                "spin": 0.9999,
+                "mechanism_id": "horizon-admittance",
+                "precision_digits": 80,
+                "component_pass": "promoted",
+            }
+
+            def observe(kind, seconds, *, context=None, payload=None):
+                event = ProgressEvent(
+                    kind=kind,
+                    context=ProgressContext.from_mapping({
+                        **base_context,
+                        **(context or {}),
+                    }),
+                    payload=payload or {},
+                    monotonic_seconds=base_time + seconds,
+                )
+                record = reporter._record(event)
+                reporter._update_dashboard_state(record)
+                return record
+
+            observe(ProgressEventKind.PRECISION_STAGE_STARTED, 0.0)
+            observe(
+                ProgressEventKind.ROOT_PHASE_STARTED,
+                0.1,
+                context={"phase": "PRIMARY"},
+            )
+            observe(
+                ProgressEventKind.ROOT_SEED_SELECTED,
+                0.2,
+                context={
+                    "phase": "PRIMARY",
+                    "seed_kind": "AUTHENTICATED_BACKGROUND",
+                    "fallback_used": False,
+                },
+                payload={
+                    "seed_kind": "AUTHENTICATED_BACKGROUND",
+                    "fallback_used": False,
+                },
+            )
+            observe(
+                ProgressEventKind.NEWTON_ITERATION_STARTED,
+                1.0,
+                context={
+                    "phase": "PRIMARY",
+                    "newton_index": 7,
+                    "newton_limit": 16,
+                    "current_omega": {
+                        "real": "0.98567354838270116",
+                        "imaginary": "-0.0034686730676767082",
+                    },
+                },
+                payload={
+                    "determinant_abs": "2.40e-11",
+                    "best_determinant_abs": "2.40e-11",
+                },
+            )
+            observe(
+                ProgressEventKind.SUBOPERATION_STARTED,
+                2.0,
+                context={
+                    "phase": "PRIMARY",
+                    "newton_index": 7,
+                    "newton_limit": 16,
+                    "determinant_index_phase": 146,
+                    "suboperation": "r-from-rho",
+                },
+                payload={"suboperation": "r-from-rho"},
+            )
+            heartbeat = observe(
+                ProgressEventKind.WORKER_HEARTBEAT,
+                12.0,
+                payload={
+                    "worker": "Julia",
+                    "worker_alive": True,
+                    "heartbeat_interval_seconds": 2.0,
+                },
+            )
+
+            dashboard = "\n".join(reporter._dashboard_lines(heartbeat))
+            reporter._write_status(heartbeat)
+            status = json.loads(
+                Path(f"{checkpoint}.status.json").read_text(encoding="utf-8")
+            )
+
+        self.assertIn("LATEST COMPLETED LEAF", dashboard)
+        self.assertIn("CURRENTLY EXECUTING", dashboard)
+        self.assertIn("LIVE ROOT SOLVE", dashboard)
+        self.assertIn("220 a/M=0.9999", dashboard)
+        self.assertIn("BigFloat 80 dec", dashboard)
+        self.assertIn("PRIMARY", dashboard)
+        self.assertIn("RUNNING", dashboard)
+        self.assertIn("binary64 NOT_CONVERGED", dashboard)
+        self.assertIn("AUTHENTICATED_BACKGROUND", dashboard)
+        self.assertIn("Seed authenticated", dashboard)
+        self.assertIn("YES", dashboard)
+        self.assertIn("Branch valid", dashboard)
+        self.assertIn("PENDING", dashboard)
+        self.assertIn("Worker", dashboard)
+        self.assertIn("Julia", dashboard)
+        self.assertIn("Tier elapsed", dashboard)
+        self.assertIn("12s", dashboard)
+        self.assertIn("Last activity", dashboard)
+        self.assertIn("r-from-rho started (10s ago)", dashboard)
+        self.assertIn("Newton", dashboard)
+        self.assertIn("7/16", dashboard)
+        self.assertIn("Determinant", dashboard)
+        self.assertIn("146", dashboard)
+        self.assertIn("0.98567354838270116", dashboard)
+        self.assertIn("2.400E-11", dashboard)
+        self.assertTrue(reporter._should_render_dashboard(SimpleNamespace(
+            kind=ProgressEventKind.WORKER_HEARTBEAT,
+            monotonic_seconds=base_time + 14.0,
+        )))
+        self.assertEqual(status["live_execution"]["state"], "RUNNING")
+        self.assertEqual(status["live_execution"]["precision_digits"], 80)
+        self.assertEqual(status["live_execution"]["suboperation"], "r-from-rho")
+
+    def test_dashboard_throttles_fast_inner_events_but_forces_heartbeat(self):
+        """Catches terminal redraw volume scaling with determinant operations."""
+
+        reporter = CampaignProgressReporter(
+            "normal", "checkpoint.json", io.StringIO()
+        )
+
+        def event(kind, seconds):
+            return SimpleNamespace(kind=kind, monotonic_seconds=seconds)
+
+        self.assertTrue(reporter._should_render_dashboard(event(
+            ProgressEventKind.PRECISION_STAGE_STARTED, 1.0
+        )))
+        self.assertFalse(reporter._should_render_dashboard(event(
+            ProgressEventKind.DETERMINANT_STARTED, 1.01
+        )))
+        self.assertFalse(reporter._should_render_dashboard(event(
+            ProgressEventKind.SUBOPERATION_STARTED, 1.20
+        )))
+        self.assertTrue(reporter._should_render_dashboard(event(
+            ProgressEventKind.DETERMINANT_COMPLETED, 1.30
+        )))
+        self.assertTrue(reporter._should_render_dashboard(event(
+            ProgressEventKind.WORKER_HEARTBEAT, 1.31
+        )))
+
     def test_refresh_projects_committed_checkpoint_without_mutating_it(self):
         """Catches absent or nondeterministic audit projections of committed science."""
 
@@ -220,7 +398,10 @@ class CampaignReportTests(unittest.TestCase):
             self.assertIn(" State          CONVERGED", compact)
             self.assertIn(" Mechanism      horizon-admittance", compact)
             self.assertTrue(reporter._should_render_dashboard(
-                SimpleNamespace(kind=ProgressEventKind.PRECISION_STAGE_COMPLETED)
+                SimpleNamespace(
+                    kind=ProgressEventKind.PRECISION_STAGE_COMPLETED,
+                    monotonic_seconds=time.monotonic(),
+                )
             ))
             legacy_fixture = CampaignReportModel(
                 leaf_rows=(),
