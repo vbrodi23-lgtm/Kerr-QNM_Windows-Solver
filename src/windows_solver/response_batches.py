@@ -871,8 +871,8 @@ class CampaignPlan:
         }
 
 
-def _primary_recovery_precision_contract() -> dict[str, object]:
-    """Return the canonical PRIMARY promoted-precision policy fragment."""
+def _previous_primary_recovery_precision_contract() -> dict[str, object]:
+    """Return the exact PRIMARY recovery contract immediately before PR 33."""
 
     return {
         "binary64_trigger": {
@@ -889,6 +889,17 @@ def _primary_recovery_precision_contract() -> dict[str, object]:
             "component_status": ComponentStatus.CONVERGED.value,
             "discrepancy_enclosed": True,
         },
+    }
+
+
+def _primary_recovery_precision_contract() -> dict[str, object]:
+    """Return the canonical PRIMARY promoted-precision policy fragment."""
+
+    from .julia_response_backend import promoted_precision_numerical_controls
+
+    return {
+        **_previous_primary_recovery_precision_contract(),
+        "promoted_numerical_controls": promoted_precision_numerical_controls(),
     }
 
 
@@ -962,6 +973,24 @@ def _legacy_primary_scientific_computation_identity_sha256(
     return _sha256(_scientific_computation_identity_material(
         plan, leaf, _legacy_leaf_precision_contract(leaf)
     ))
+
+
+def _previous_primary_scientific_computation_identity_sha256(
+    plan: CampaignPlan, leaf: CampaignLeafPlan
+) -> str:
+    """Derive the exact PRIMARY identity immediately before PR 33."""
+
+    if leaf.role != "primary":
+        raise ValueError("previous PRIMARY identity requires a PRIMARY leaf")
+    if leaf.leaf_id not in {item.leaf_id for item in plan.leaves}:
+        raise ValueError("previous PRIMARY identity is outside the campaign plan")
+    contract = _legacy_leaf_precision_contract(leaf)
+    contract["primary_recovery"] = (
+        _previous_primary_recovery_precision_contract()
+    )
+    return _sha256(
+        _scientific_computation_identity_material(plan, leaf, contract)
+    )
 
 
 def _campaign_cohorts() -> tuple[CampaignCohort, ...]:
@@ -1944,81 +1973,100 @@ def _authenticated_solved_leaf_lookup(
     if leaf.role != "primary":
         return current
 
-    legacy_identity = _legacy_primary_scientific_computation_identity_sha256(
-        plan, leaf
+    predecessor_identities = (
+        _previous_primary_scientific_computation_identity_sha256(plan, leaf),
+        _legacy_primary_scientific_computation_identity_sha256(plan, leaf),
     )
-    legacy = store.lookup(legacy_identity, leaf.leaf_id)
-    if legacy.status is SolvedLeafLookupStatus.CORRUPT:
-        return legacy
-    if legacy.status is not SolvedLeafLookupStatus.HIT:
-        return current
+    for predecessor_identity in predecessor_identities:
+        predecessor = store.lookup(predecessor_identity, leaf.leaf_id)
+        if predecessor.status is SolvedLeafLookupStatus.CORRUPT:
+            return predecessor
+        if predecessor.status is not SolvedLeafLookupStatus.HIT:
+            continue
 
-    try:
-        if legacy.receipt is None:
-            raise ValueError("legacy solved-leaf cache hit has no receipt")
-        record_mapping = legacy.receipt["record"]
-        record = CampaignLeafRecord.from_mapping(record_mapping)
-        if record.to_mapping() != record_mapping:
-            raise ValueError("legacy solved-leaf cache record is not canonical")
-        success = _validate_legacy_primary_record_evidence(
-            plan, leaf, record
-        )
-    except (KeyError, TypeError, ValueError) as error:
-        if legacy.path is not None:
-            store.quarantine(legacy.path, str(error))
-        return SolvedLeafLookup(
-            SolvedLeafLookupStatus.CORRUPT,
-            path=legacy.path,
-            reason=str(error),
-        )
-
-    if not success:
-        return current
-
-    try:
-        _validate_cacheable_leaf_record(plan, leaf, record)
-    except (KeyError, TypeError, ValueError) as error:
-        if legacy.path is not None:
-            store.quarantine(legacy.path, str(error))
-        return SolvedLeafLookup(
-            SolvedLeafLookupStatus.CORRUPT,
-            path=legacy.path,
-            reason=str(error),
-        )
-
-    source_type = legacy.receipt["source_type"]
-    if source_type not in {
-        "originating-campaign",
-        "imported-authenticated-checkpoint",
-    }:
-        raise ValueError("legacy solved-leaf cache source type is invalid")
-    deadline = time.monotonic() + _LEGACY_MIGRATION_LOCK_TIMEOUT_SECONDS
-    while True:
         try:
-            published = store.publish_if_missing(
-                scientific_identity_sha256=identity,
-                leaf_id=leaf.leaf_id,
-                record=record.to_mapping(),
-                source_type=source_type,
+            if predecessor.receipt is None:
+                raise ValueError("legacy solved-leaf cache hit has no receipt")
+            record_mapping = predecessor.receipt["record"]
+            record = CampaignLeafRecord.from_mapping(record_mapping)
+            if record.to_mapping() != record_mapping:
+                raise ValueError("legacy solved-leaf cache record is not canonical")
+        except (KeyError, TypeError, ValueError) as error:
+            if predecessor.path is not None:
+                store.quarantine(predecessor.path, str(error))
+            return SolvedLeafLookup(
+                SolvedLeafLookupStatus.CORRUPT,
+                path=predecessor.path,
+                reason=str(error),
             )
-            break
-        except RuntimeError as error:
-            if str(error) != "solved-leaf cache publication is locked":
-                raise
-            remaining = deadline - time.monotonic()
-            if remaining <= 0.0:
-                raise RuntimeError(
-                    "timed out waiting for solved-leaf cache migration "
-                    "publication lock"
-                ) from error
-            time.sleep(min(_LEGACY_MIGRATION_LOCK_RETRY_SECONDS, remaining))
-    if published.status is SolvedLeafLookupStatus.CORRUPT:
-        return published
-    if published.status is not SolvedLeafLookupStatus.HIT:
-        return published
-    return _authenticate_solved_leaf_hit(
-        plan, leaf, store, store.lookup(identity, leaf.leaf_id)
-    )
+
+        # A prior-policy promoted or otherwise multi-stage receipt is valid
+        # stale evidence, but it cannot cross the changed numerical controls.
+        if len(record.stages) != 1:
+            continue
+
+        try:
+            success = _validate_legacy_primary_record_evidence(
+                plan, leaf, record
+            )
+        except (KeyError, TypeError, ValueError) as error:
+            if predecessor.path is not None:
+                store.quarantine(predecessor.path, str(error))
+            return SolvedLeafLookup(
+                SolvedLeafLookupStatus.CORRUPT,
+                path=predecessor.path,
+                reason=str(error),
+            )
+        if not success:
+            continue
+
+        try:
+            _validate_cacheable_leaf_record(plan, leaf, record)
+        except (KeyError, TypeError, ValueError) as error:
+            if predecessor.path is not None:
+                store.quarantine(predecessor.path, str(error))
+            return SolvedLeafLookup(
+                SolvedLeafLookupStatus.CORRUPT,
+                path=predecessor.path,
+                reason=str(error),
+            )
+
+        source_type = predecessor.receipt["source_type"]
+        if source_type not in {
+            "originating-campaign",
+            "imported-authenticated-checkpoint",
+        }:
+            raise ValueError("legacy solved-leaf cache source type is invalid")
+        deadline = time.monotonic() + _LEGACY_MIGRATION_LOCK_TIMEOUT_SECONDS
+        while True:
+            try:
+                published = store.publish_if_missing(
+                    scientific_identity_sha256=identity,
+                    leaf_id=leaf.leaf_id,
+                    record=record.to_mapping(),
+                    source_type=source_type,
+                )
+                break
+            except RuntimeError as error:
+                if str(error) != "solved-leaf cache publication is locked":
+                    raise
+                remaining = deadline - time.monotonic()
+                if remaining <= 0.0:
+                    raise RuntimeError(
+                        "timed out waiting for solved-leaf cache migration "
+                        "publication lock"
+                    ) from error
+                time.sleep(min(
+                    _LEGACY_MIGRATION_LOCK_RETRY_SECONDS, remaining
+                ))
+        if published.status is SolvedLeafLookupStatus.CORRUPT:
+            return published
+        if published.status is not SolvedLeafLookupStatus.HIT:
+            return published
+        return _authenticate_solved_leaf_hit(
+            plan, leaf, store, store.lookup(identity, leaf.leaf_id)
+        )
+    return current
 
 
 def _validate_precision120(outcome: StageOutcome) -> None:
