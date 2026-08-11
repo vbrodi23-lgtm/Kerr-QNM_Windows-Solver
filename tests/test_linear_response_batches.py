@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from fractions import Fraction
 import json
 import hashlib
@@ -42,6 +43,16 @@ from windows_solver.response_engine import (
     run_component,
 )
 from windows_solver.solved_leaf_cache import SolvedLeafStore
+
+
+_FROZEN_IDENTITY_TEST_BACKEND = replace(
+    VettedNativeDeterminantKernel.identity,
+    runtime_fingerprint=(
+        "cpython-3.12.13-linux-python-64bit-"
+        "gsn-input-julia-exact-f-u-cache-contract-1-"
+        "adapted-source-native-gsn-adapter-contract-2"
+    ),
+)
 
 
 def reseal_campaign_checkpoint(value):
@@ -133,7 +144,7 @@ class CampaignPlanTests(unittest.TestCase):
 
         plan = build_campaign_plan(
             policy=NumericalPolicy(),
-            backend_identity=VettedNativeDeterminantKernel.identity,
+            backend_identity=_FROZEN_IDENTITY_TEST_BACKEND,
             precision_capabilities=PrecisionCapabilities((64, 80, 120)),
         )
         primary = next(item for item in plan.leaves if item.role == "primary")
