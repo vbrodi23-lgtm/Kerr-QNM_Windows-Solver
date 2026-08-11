@@ -208,8 +208,10 @@ def _root_tolerance_for_precision(digits: int) -> float:
 
     if digits == 64:
         return 2.0e-11
-    if digits in {80, 120}:
-        return 10.0 ** -(digits - 18)
+    if digits == 80:
+        return 1.0e-18
+    if digits == 120:
+        return 1.0e-102
     raise ValueError("campaign report stage precision is invalid")
 
 
