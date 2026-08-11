@@ -582,6 +582,7 @@ class CampaignProgressReporter:
         return event.kind in {
             ProgressEventKind.SOLVED_LEAF_CACHE_SCANNED,
             ProgressEventKind.CAMPAIGN_STARTED,
+            ProgressEventKind.PRECISION_STAGE_COMPLETED,
             ProgressEventKind.LEAF_COMPLETED,
             ProgressEventKind.LEAF_REUSED,
             ProgressEventKind.LEAF_FAILED,
@@ -609,7 +610,7 @@ class CampaignProgressReporter:
         maximum_rows = max(1, terminal_rows - 1)
         lines = self._dashboard_lines(record)
         if len(lines) > maximum_rows:
-            lines = self._compact_dashboard_lines(record)
+            lines = self._compact_dashboard_lines(record, maximum_rows)
         return [self._fit_dashboard_line(line, columns) for line in lines[:maximum_rows]]
 
     def _terminal_dimensions(self) -> tuple[int, int]:
@@ -1082,6 +1083,7 @@ class CampaignProgressReporter:
             "",
             " LATEST COMPLETED LEAF",
             *self._latest_completed_leaf_lines(fields),
+            *self._precision_stage_table_lines(),
             "",
             " CACHE",
             self._dashboard_field_line("Stored", self._cache_stored),
@@ -1090,11 +1092,13 @@ class CampaignProgressReporter:
             ),
             "",
             f" Last refresh:  {datetime.now().astimezone().strftime('%H:%M:%S')}",
-            " Dashboard refreshes only when another leaf finishes.",
+            " Dashboard refreshes after completed precision stages and leaf transitions.",
         ]
         return lines
 
-    def _compact_dashboard_lines(self, record: Mapping[str, object]) -> list[str]:
+    def _compact_dashboard_lines(
+        self, record: Mapping[str, object], maximum_rows: int
+    ) -> list[str]:
         fields = dict(self._dashboard_fields(record))
         latest = self._latest_completed_leaf_lines(fields)
         response = next(
@@ -1105,7 +1109,7 @@ class CampaignProgressReporter:
             (line for line in latest if line.startswith(" Local disk")),
             "",
         )
-        return [
+        leading = [
             "==============================================================",
             " M02 KERR-QNM SCIENTIFIC DASHBOARD",
             "==============================================================",
@@ -1122,24 +1126,20 @@ class CampaignProgressReporter:
             ),
             "",
             " LATEST COMPLETED LEAF",
-            self._dashboard_field_line(
-                "State", fields.get("ResultState") or self._last_terminal_state
-            ),
-            self._dashboard_field_line(
-                "Mechanism",
-                fields.get("ResultMechanism")
-                or self._dashboard_state.get("mechanism_id"),
+            (
+                f" State {self._dashboard_value(fields.get('ResultState') or self._last_terminal_state)}"
+                f" | Mechanism {self._dashboard_value(fields.get('ResultMechanism') or self._dashboard_state.get('mechanism_id'))}"
             ),
             (
-                f" Spin           {self._dashboard_value(fields.get('ResultSpin') or self._dashboard_state.get('spin'))}"
+                f" Spin {self._dashboard_value(fields.get('ResultSpin') or self._dashboard_state.get('spin'))}"
                 f" | Precision {self._precision_value(fields)}"
-            ),
-            self._dashboard_field_line(
-                "Convergence", fields.get("Convergence")
+                f" | Convergence {self._dashboard_value(fields.get('Convergence'))}"
             ),
             response,
             disk,
             "",
+        ]
+        trailing = [
             " CACHE",
             (
                 f" Stored         {self._cache_stored}"
@@ -1147,8 +1147,87 @@ class CampaignProgressReporter:
             ),
             "",
             f" Last refresh:  {datetime.now().astimezone().strftime('%H:%M:%S')}",
-            " Dashboard refreshes only when another leaf finishes.",
+            " Dashboard refreshes after completed precision stages and leaf transitions.",
         ]
+        table_overhead = 4
+        table_rows = max(1, maximum_rows - len(leading) - len(trailing) - table_overhead)
+        return [
+            *leading,
+            *self._precision_stage_table_lines(maximum_rows=table_rows),
+            *trailing,
+        ]
+
+    def _precision_stage_table_lines(
+        self, *, maximum_rows: int = 8
+    ) -> list[str]:
+        """Render recent committed precision stages as one fixed-width table."""
+
+        model = self._campaign_report_model
+        header = (
+            f"{'ROOT':<20} {'PREC':>4} {'RESULT':<18} {'CONVERGED':<9} "
+            f"{'BRANCH_OK':<9} {'D_ABS':>10} {'D_OVER_TOL':>11} "
+            f"{'NEWTON_DW':>11} {'DELTA_ROOT':>11}"
+        )
+        if model is None or not model.precision_stage_rows:
+            return [
+                "",
+                " PRECISION STAGE RESULTS",
+                header,
+                "-" * len(header),
+                "(no completed precision stages in the authenticated checkpoint)",
+            ]
+        rows = model.precision_stage_rows[-max(1, maximum_rows):]
+        return [
+            "",
+            " PRECISION STAGE RESULTS",
+            header,
+            "-" * len(header),
+            *(self._precision_stage_table_row(row) for row in rows),
+        ]
+
+    @classmethod
+    def _precision_stage_table_row(cls, row: Mapping[str, object]) -> str:
+        root = cls._precision_stage_text(row.get("root"))
+        result = cls._precision_stage_text(row.get("numerical_state"))
+        converged = cls._precision_stage_boolean(row.get("converged"))
+        branch_ok = cls._precision_stage_boolean(row.get("branch_ok"))
+        determinant = cls._precision_stage_number(row.get("determinant_abs"))
+        over_tolerance = cls._precision_stage_number(
+            row.get("determinant_over_tolerance")
+        )
+        newton = cls._precision_stage_number(row.get("newton_correction"))
+        displacement = cls._precision_stage_number(
+            row.get("root_displacement_abs")
+        )
+        precision = cls._precision_stage_text(row.get("precision_digits"))
+        return (
+            f"{root:<20.20} {precision:>4.4} {result:<18.18} "
+            f"{converged:<9.9} {branch_ok:<9.9} {determinant:>10.10} "
+            f"{over_tolerance:>11.11} {newton:>11.11} {displacement:>11.11}"
+        )
+
+    @staticmethod
+    def _precision_stage_text(value: object) -> str:
+        return "-" if value is None else str(value)
+
+    @staticmethod
+    def _precision_stage_boolean(value: object) -> str:
+        if value is True:
+            return "True"
+        if value is False:
+            return "False"
+        return "-"
+
+    @staticmethod
+    def _precision_stage_number(value: object) -> str:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return "-"
+        number = float(value)
+        if not math.isfinite(number):
+            return "-"
+        if 1.0e-3 <= abs(number) < 1.0e5:
+            return format(number, ".6g")
+        return format(number, ".3E")
 
     def _latest_completed_leaf_lines(
         self, fields: Mapping[str, object]
@@ -1270,7 +1349,7 @@ class CampaignProgressReporter:
             color = "96"
         elif stripped == "CAMPAIGN":
             color = "93"
-        elif stripped == "LATEST COMPLETED LEAF":
+        elif stripped in {"LATEST COMPLETED LEAF", "PRECISION STAGE RESULTS"}:
             color = "95"
         elif stripped == "CACHE":
             color = "36"
