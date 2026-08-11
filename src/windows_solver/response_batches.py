@@ -1462,6 +1462,10 @@ class _NonProductionSolvedLeafRecord(ValueError):
     """A valid orchestration record that is ineligible for scientific reuse."""
 
 
+class _UnauthenticatedComponentEvidence(ValueError):
+    """Well-formed component evidence that fails scientific authentication."""
+
+
 def _validate_component_result(
     leaf: CampaignLeafPlan, outcome: StageOutcome
 ) -> bool:
@@ -1517,7 +1521,9 @@ def _validate_component_result(
         or result.mechanism_id != leaf.mechanism_id
         or result.status.value != outcome.numerical_state
     ):
-        raise ValueError("campaign production component identity is invalid")
+        raise _UnauthenticatedComponentEvidence(
+            "campaign production component identity is invalid"
+        )
     expected_lineage = {
         "leaf_id": job.leaf_id,
         "root_reference_id": job.root.root_reference_id,
@@ -1533,7 +1539,9 @@ def _validate_component_result(
         ),
     }
     if dict(result.lineage) != expected_lineage:
-        raise ValueError("campaign production component lineage is invalid")
+        raise _UnauthenticatedComponentEvidence(
+            "campaign production component lineage is invalid"
+        )
     branch_loss_mismatch = False
     for readout_index, readout in enumerate(result.raw_readouts):
         identity_mismatch = (
@@ -1543,7 +1551,9 @@ def _validate_component_result(
         )
         if identity_mismatch:
             if result.status is not ComponentStatus.BRANCH_LOSS:
-                raise ValueError("campaign production readout lineage is invalid")
+                raise _UnauthenticatedComponentEvidence(
+                    "campaign production readout lineage is invalid"
+                )
             branch_loss_mismatch = True
             continue
         if not root_readout_preserves_authenticated_branch(
@@ -1553,7 +1563,7 @@ def _validate_component_result(
             source_root_mapping=job.source_root_mapping,
         ):
             kind = "baseline" if readout_index == 0 else "perturbed"
-            raise ValueError(
+            raise _UnauthenticatedComponentEvidence(
                 f"campaign production {kind} root readout evidence is invalid"
             )
     if (
@@ -2462,7 +2472,7 @@ def _run_campaign_selection_active(
                 precision80_digits, _ = _primary_recovery_digits()
                 try:
                     production = _validate_component_result(leaf, outcome)
-                except (KeyError, TypeError, ValueError):
+                except _UnauthenticatedComponentEvidence:
                     # Promotion is recovery for authenticated numerical
                     # nonconvergence, not a new fail-fast boundary for
                     # malformed or deliberately adverse evidence.  Keep the
