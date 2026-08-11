@@ -6,123 +6,94 @@
 
 ## Goal
 
-Create the non-numerical M03 contract layer that converts admitted spectral-root
-payloads into stable M03 seed identities and defines the evidence carriers needed
-by later field, co-mode, residue, genealogy, classification, NHEK, cache, and
-admission work.
+Create the non-numerical M03 contract layer that converts already-admitted
+spectral-root payloads into stable M03 seed identities and defines evidence and
+cache carriers for later M03 work.
 
 ## Boundary
 
 This change does not compute a field, co-mode, residue, classification, or NHEK
-match. It does not register an M03 provider or alter the admitted spectral
-provider. M02 remains the active programme milestone until its 212-leaf campaign
-and closure gates complete.
+match. It does not register an M03 provider, alter the capability DAG, or admit
+artifacts. Its input precondition is a payload already validated by the spectral
+provider. Future integration must call it only after
+`spectrum.validate_spectral_payload` succeeds.
 
-The authoritative root source is the admitted spectral payload built from the
-immutable 2,736-root catalogue plus the authenticated 44-root exact-selector
-overlay. M02 solved-leaf receipts may add cross-milestone lineage only when their
-root identity, root reference, exact coordinate, equation, backend, and policy
-identities are explicit. M02 response values never become spectral-field or
-residue evidence.
+The authoritative root source is the admitted 2,736-root catalogue plus the
+authenticated 44-root exact-selector overlay. M02 solved-leaf receipts may add
+lineage only when their identities and coordinate are explicit. M02 response
+values and baseline frequencies never become M03 evidence.
 
 ## Architecture
 
 Add one standard-library module, `windows_solver.m03_contracts`, with three
 responsibilities:
 
-1. validate and adapt an admitted spectral payload into canonical M03 root seeds;
-2. optionally validate and attach an M02 solved-leaf lineage anchor;
-3. define immutable, canonical contract records for later M03 evidence and cache
-   identity.
+1. adapt an already-admitted spectral payload into canonical M03 root seeds;
+2. authenticate an optional M02 solved-leaf lineage anchor while leaving it
+   `UNRECONCILED`;
+3. define factory-only immutable cache and artifact-envelope records.
 
-No new capability is added to the DAG. No built-in provider is registered.
+No built-in provider or second provider-envelope API is introduced.
 
 ## Canonical root seed
 
-Each seed binds:
-
-- mode: s, ℓ, m, n, branch, polarization;
-- exact spin identity when supplied by the base catalogue;
-- binary64 spin identity for both base and overlay roots;
-- Mω and angular separation constant A;
-- admitted catalogue and overlay hashes;
-- source realization: `base-catalogue` or `exact-selector-overlay`;
-- a SHA-256 over canonical JSON identity material.
-
-Exact-selector roots are identified from `source_coordinate` and
-`spin_binary64_ratio`. Base roots are identified from `spin_exact`.
-Ambiguous or malformed roots fail closed.
+Each seed binds the exact admitted mode domain, spin realization, damped Mω,
+angular separation constant A, catalogue/overlay hashes, and canonical SHA-256.
+Base roots use `spin_exact`; overlay roots use `source_coordinate` and
+`spin_binary64_ratio`. The adapter validates canonical binary64 identity,
+base/overlay exclusivity, finite values, requested count, and duplicate seeds.
 
 ## M02 lineage anchor
 
-An optional lineage anchor accepts only schema-version-1 solved-leaf receipts
-whose terminal state is one of `PRODUCED`, `UNRESOLVED`, `REJECTED`, or
-`FAILED`. It records the receipt hash, canonical leaf-record hash, scientific
-computation identity, root identity, root reference, exact sampling coordinate,
-equation identity, backend identity, and policy identity.
+Only schema-version-1 solved-leaf receipts with terminal state `PRODUCED` or
+`UNRESOLVED` are accepted. `REJECTED` and `FAILED` are checkpoint-only states,
+not solved-leaf cache receipts.
 
-For `PRODUCED` receipts, the nested result lineage must be complete. Other
-terminal states may have no result payload and remain outcome-neutral. The
-anchor never promotes M02 numerical or scientific state into M03.
+The anchor authenticates the receipt and canonical record hashes. It preserves
+receipt, computation, root/reference, equation, backend, policy, and exact
+sampling-coordinate identities. It excludes response values and baseline ω.
+For `PRODUCED`, nested lineage must be complete and agree with its baseline root
+reference and equation.
 
-## M03 artifact contracts
+Every imported anchor remains `UNRECONCILED`; no current factory can bind it to
+an M03 cache key. A future public reconciliation artifact must define that
+transition explicitly.
 
-The module defines exact artifact kinds and evidence states for:
+## Precision compatibility
 
-- radial/angular field;
-- co-mode and normalization;
-- pole residue;
-- κ-genealogy;
-- ZDM/DM classification;
-- NHEK match;
-- provider admission.
+Cache identities consume the merged `precision_tier_presentation()` contract.
+Legacy 64 means IEEE-754 binary64 (about 15.95 decimal digits), while 80 and 120
+mean BigFloat tiers. A forged or inconsistent presentation is rejected.
 
-Every contract envelope binds a root-seed identity, equation and convention
-versions, backend revisions, precision, numerical policy, payload, evidence
-state, and blockers.
+## Artifact contracts
 
-The following start fail-closed because the governing mathematics is not frozen:
+Exact artifact IDs include `co-mode-normalization` and `kappa-genealogy`.
+No TASK-012 artifact can claim `ADMITTED`. Co-mode, residue, ZDM/DM
+classification, and NHEK matching cannot claim `PRODUCED` until the exact
+human-math blockers in the registry are resolved. Provider admission remains
+blocked upstream.
 
-- co-mode/normalization:
-  `HUMAN_MATH_REVIEW_REQUIRED: freeze the separated adjoint equation, pairing, phase convention, and normalization identity`;
-- pole residue:
-  `HUMAN_MATH_REVIEW_REQUIRED: derive the Green-function numerator, determinant derivative, source, and readout conventions`;
-- ZDM/DM classification:
-  `HUMAN_MATH_REVIEW_REQUIRED: freeze classification observables, κ-domain, uncertainty model, and transition policy`;
-- NHEK matching:
-  `HUMAN_MATH_REVIEW_REQUIRED: supply the matched-asymptotic formula, overlap region, convention map, and error model`.
-
-A blocked envelope cannot claim `PRODUCED` or `ADMITTED`.
+`PRODUCED` field evidence is accepted only when its exact residual, boundary,
+Wronskian-drift, and resolution-comparison schema satisfies its exact validation
+policy. `PRODUCED` genealogy evidence requires nonzero nodes and edges, overlap
+guards, branch-resolved continuation invariants, and exact-node polish satisfying
+policy. Cyclic genealogy graphs are permitted.
 
 ## Cache identity
 
-The cache key binds:
-
-- root-seed identity;
-- artifact kind;
-- equation and convention versions;
-- radial and angular grids;
-- normalization and pairing IDs;
-- backend revisions;
-- precision;
-- validation-policy identity;
-- optional M02 lineage identity.
-
-Changing any bound item changes the canonical cache SHA-256.
+The canonical cache SHA-256 binds seed, artifact kind, equation/convention
+versions, grids, normalization/pairing IDs, backend revisions, canonical
+precision tier, validation policy, and an optional explicitly reconciled M02
+lineage identity. JSON inputs must have string keys and finite values.
 
 ## Verification
 
-Tests use synthetic admitted spectral payloads shaped exactly like the current
-provider output and a sanitized M02 receipt shaped like the attached production
-receipts. They prove:
+Structural tests cover deterministic base/overlay adaptation, receipt/hash
+authentication, lineage exclusions, canonical precision, convention-sensitive
+cache identity, factory-only construction, exact blockers, non-admission, and
+policy-bound field/genealogy evidence. The supplied archive of 24 solved-leaf
+receipts is authenticated structurally.
 
-- base and overlay roots adapt deterministically;
-- malformed and ambiguous roots fail closed;
-- M02 anchors preserve lineage without importing response values;
-- cache identities change when bound conventions change;
-- blocked mathematical contracts cannot be promoted;
-- produced field/genealogy envelopes require complete validation payloads.
-
-Only standard-library unit tests and Python compilation are permitted in this
-change. No solver, Julia worker, determinant, continuation, or mathematical
-campaign is executed.
+Only focused standard-library tests and in-memory Python compilation are local
+verification claims. No solver, Julia worker, determinant, continuation, or
+mathematical campaign is executed.
