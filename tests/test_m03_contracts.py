@@ -13,6 +13,7 @@ from windows_solver.m03_contracts import (
     M03ArtifactKind,
     M03CacheIdentity,
     M03EvidenceState,
+    M03RootSeed,
     adapt_spectral_payload,
     build_m03_envelope,
 )
@@ -339,6 +340,24 @@ class M03CatalogAdapterTests(unittest.TestCase):
                 ):
                     adapt_spectral_payload(payload)
 
+    def test_root_seed_factory_rejects_malformed_catalogue_binding(self) -> None:
+        """Catches direct factory bypass of admitted catalogue identities."""
+
+        cases = (
+            ("", "1" * 64, "2" * 64, "catalog ID"),
+            ("admitted-catalogue", "not-a-sha", "2" * 64, "catalog data identity"),
+            ("admitted-catalogue", "1" * 64, "not-a-sha", "overlay data identity"),
+        )
+        for catalog_id, catalog_hash, overlay_hash, message in cases:
+            with self.subTest(message=message):
+                with self.assertRaisesRegex(ValueError, message):
+                    M03RootSeed.from_spectral_root(
+                        _base_root(),
+                        catalog_id=catalog_id,
+                        catalog_data_sha256=catalog_hash,
+                        overlay_data_sha256=overlay_hash,
+                    )
+
 
 class M03LineageAndCacheTests(unittest.TestCase):
     def test_m02_receipt_preserves_lineage_without_response_values(self) -> None:
@@ -456,6 +475,28 @@ class M03LineageAndCacheTests(unittest.TestCase):
             ValueError,
             "solved-leaf receipt terminal state is invalid",
         ):
+            M02LineageAnchor.from_receipt(receipt)
+
+    def test_m02_lineage_rejects_response_in_sampling_coordinate(self) -> None:
+        """Catches nested M02 response data crossing the lineage boundary."""
+
+        receipt = _m02_receipt()
+        record = receipt["record"]
+        assert isinstance(record, dict)
+        stages = record["stages"]
+        assert isinstance(stages, list)
+        component = stages[-1]["component_result"]
+        assert isinstance(component, dict)
+        result = component["result"]
+        assert isinstance(result, dict)
+        lineage = result["lineage"]
+        assert isinstance(lineage, dict)
+        coordinate = lineage["sampling_coordinate"]
+        assert isinstance(coordinate, dict)
+        coordinate["response"] = {"real": 12.34, "imaginary": -56.78}
+        _reseal_m02_receipt(receipt)
+
+        with self.assertRaisesRegex(ValueError, "sampling coordinate fields"):
             M02LineageAnchor.from_receipt(receipt)
 
 
