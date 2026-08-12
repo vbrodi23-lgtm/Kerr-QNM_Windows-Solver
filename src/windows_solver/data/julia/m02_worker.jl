@@ -797,6 +797,9 @@ function branch_values(
             )
         end
     else
+        # The direct coefficient determinant consumes only Xup.  Its outer-to-match
+        # and match-to-inner propagation is two homogeneous legs; Xin is absent
+        # entirely, improving on the earlier three-leg optimization target.
         xup_radius_from_rho = observed_radial_map(radius_from_rho, "Xup", rho_in, rho_out)
         Cref, Cinc = progress_operation("Xup") do
             solve_xup_scattering_coefficients(
