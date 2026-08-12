@@ -10,6 +10,7 @@ from windows_solver.contracts import canonical_json_bytes
 from windows_solver.progress import ProgressEventKind, activate_progress
 from windows_solver.response_engine import (
     BackendIdentity,
+    DiagnosticRootReadout,
     NumericalPolicy,
     ResponseComponentJob,
     RootReadout,
@@ -284,6 +285,17 @@ class NativeProgressTests(unittest.TestCase):
             canonical_json_bytes({"converged": converged}),
             b'{"converged":true}',
         )
+
+    def test_convergence_carriers_reject_foreign_boolean_scalars(self):
+        with self.assertRaises(TypeError):
+            canonical_json_bytes({"converged": np.bool_(True)})
+        with self.assertRaisesRegex(ValueError, "converged must be a built-in bool"):
+            DiagnosticRootReadout(
+                omega_delta_from_primary=0.0j,
+                determinant_residual_abs=1.0e-15,
+                determinant_derivative_abs=2.0,
+                converged=np.bool_(True),
+            )
 
 
 if __name__ == "__main__":
