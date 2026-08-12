@@ -484,8 +484,9 @@ class JuliaResponseBackendTests(unittest.TestCase):
         self.assertIn("save_end=true", worker)
         self.assertIn("dense=false", worker)
         self.assertIn("solution.u[end]", worker)
-        self.assertIn('"perturbed_Xin_compact_support"', worker)
-        self.assertIn('"perturbed_Xin_vacuum_tail"', worker)
+        self.assertIn('ode_leg="$(ode_leg)_compact_support"', worker)
+        self.assertIn('ode_leg="$(ode_leg)_vacuum_tail"', worker)
+        self.assertIn('ode_leg="perturbed_Xin"', worker)
 
     def test_package_worker_avoids_unused_exterior_homogeneous_half_solutions(self):
         worker = (
