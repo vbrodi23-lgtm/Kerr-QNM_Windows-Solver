@@ -64,5 +64,6 @@ Confirm that a fresh checkout can originate every M02 numerical prerequisite fro
 - Show the active leaf ordinal and campaign total explicitly in both full and compact `CURRENTLY EXECUTING` views without reducing the compact precision-stage table below one completed row.
 - Carry the seed determinant into the first Newton residual, retain each completed promoted root readout under its request-and-runtime identity so an interrupted stage resumes rather than recomputes, and report radial integration interior progress; keep every numerical control, phase, and authentication boundary unchanged.
 - Observe each promoted ODE segment's SciML return code and final step statistics, fail closed on ODE resource/control failures, clear stale cross-tier dashboard values, and terminate the full Julia process tree without changing numerical controls.
+- Gate each four-phase root solve and precision promotion on the finite local Newton-correction estimate `|D|/|Dω|` while retaining raw `|D|` diagnostics, branch-continuation checks, and explicit non-certificate wording; bind the policy into scientific identity and migrate only stored binary64 PRIMARY successes whose derivative evidence passes it.
 
 ---

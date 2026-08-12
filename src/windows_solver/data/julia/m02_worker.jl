@@ -326,7 +326,9 @@ function flatten_request(document)
         "rho_in" => required(policy, "rho_in"),
         "rho_out" => required(policy, "rho_out"),
         "frequency_step" => required(policy, "frequency_step"),
-        "root_tolerance" => required(policy, "root_tolerance"),
+        "root_correction_tolerance" => required(
+            policy, "root_correction_tolerance"
+        ),
         "max_newton_iterations" => required(policy, "max_newton_iterations"),
     )
     if string(flattened["mechanism_id"]) != "horizon-admittance"
@@ -662,7 +664,7 @@ end
 
 function bounded_newton(::Type{T}, request, initial::Complex{T}, amplitude::Complex{T}) where {T<:AbstractFloat}
     frequency_step = parse_real(T, request, "frequency_step")
-    tolerance = parse_real(T, request, "root_tolerance")
+    tolerance = parse_real(T, request, "root_correction_tolerance")
     maximum_iterations = parse_integer(request, "max_newton_iterations")
     value = initial
     best_value = value
@@ -698,30 +700,16 @@ function bounded_newton(::Type{T}, request, initial::Complex{T}, amplitude::Comp
             "current_omega" => progress_complex(value),
             "determinant_abs" => string(magnitude),
             "best_determinant_abs" => string(best_residual),
+            "acceptance_metric" => "newton_correction_estimate_abs",
             "acceptance_threshold" => string(tolerance),
         ))
-        if magnitude <= tolerance
-            progress_emit("newton_iteration_completed"; context=newton_context, payload=Dict(
-                "derivative_abs" => nothing,
-                "raw_step" => nothing,
-                "applied_step" => nothing,
-                "step_abs" => "0",
-                "clipped" => false,
-                "damping" => "0",
-                "accepted" => true,
-                "resulting_omega" => progress_complex(value),
-                "resulting_determinant_abs" => string(magnitude),
-                "elapsed_seconds" => (time_ns() - iteration_started) / 1.0e9,
-            ))
-            return value, magnitude, true
-        end
         h = frequency_step * (one(T) + abs(value))
         derivative = (
             determinant_progress(T, request, value + h, amplitude, "derivative +h", value) -
             determinant_progress(T, request, value - h, amplitude, "derivative -h", value)
         ) / (T(2) * h)
         derivative_abs = abs(derivative)
-        if iszero(derivative)
+        if !isfinite(derivative_abs) || iszero(derivative)
             progress_emit("newton_iteration_completed"; context=newton_context, payload=Dict(
                 "derivative_abs" => string(derivative_abs),
                 "raw_step" => nothing,
@@ -737,6 +725,23 @@ function bounded_newton(::Type{T}, request, initial::Complex{T}, amplitude::Comp
             break
         end
         raw_step = residual / derivative
+        correction_abs = magnitude / derivative_abs
+        if correction_abs <= tolerance
+            progress_emit("newton_iteration_completed"; context=newton_context, payload=Dict(
+                "derivative_abs" => string(derivative_abs),
+                "raw_step" => progress_complex(raw_step),
+                "correction_abs" => string(correction_abs),
+                "applied_step" => progress_complex(zero(Complex{T})),
+                "step_abs" => "0",
+                "clipped" => false,
+                "damping" => "0",
+                "accepted" => true,
+                "resulting_omega" => progress_complex(value),
+                "resulting_determinant_abs" => string(magnitude),
+                "elapsed_seconds" => (time_ns() - iteration_started) / 1.0e9,
+            ))
+            return value, magnitude, true
+        end
         step = raw_step
         maximum_step = parse(T, "0.006")
         clipped = abs(step) > maximum_step
@@ -788,13 +793,13 @@ function bounded_newton(::Type{T}, request, initial::Complex{T}, amplitude::Comp
             "elapsed_seconds" => (time_ns() - iteration_started) / 1.0e9,
         ))
     end
-    return best_value, best_residual, best_residual <= tolerance
+    return best_value, best_residual, false
 end
 
 numeric_text(value) = string(value)
 
 function solve_once(::Type{T}, request, initial::Complex{T}, amplitude::Complex{T}) where {T<:AbstractFloat}
-    root, residual, converged = bounded_newton(T, request, initial, amplitude)
+    root, residual, _ = bounded_newton(T, request, initial, amplitude)
     root_step = parse_real(T, request, "frequency_step") * (one(T) + abs(root))
     root_derivative = (
         determinant_progress(T, request, root + root_step, amplitude, "final derivative +h", root) -
@@ -803,6 +808,8 @@ function solve_once(::Type{T}, request, initial::Complex{T}, amplitude::Complex{
     derivative_abs = abs(root_derivative)
     isfinite(derivative_abs) && derivative_abs > zero(T) ||
         error("determinant frequency derivative is unusable")
+    tolerance = parse_real(T, request, "root_correction_tolerance")
+    converged = residual / derivative_abs <= tolerance
     return root, residual, derivative_abs, converged
 end
 

@@ -203,8 +203,8 @@ def _component_result(record: CampaignLeafRecord) -> ComponentResult | None:
     return _stage_component_result(record.stages[-1])
 
 
-def _root_tolerance_for_precision(digits: int) -> float:
-    """Return the display-only Newton residual threshold for one M02 stage."""
+def _root_correction_tolerance_for_precision(digits: int) -> float:
+    """Return the Newton-correction threshold governing one M02 stage."""
 
     if digits == 64:
         return 2.0e-11
@@ -245,8 +245,8 @@ def _precision_stage_rows(
                 "converged": None,
                 "branch_ok": None,
                 "determinant_abs": None,
-                "determinant_over_tolerance": None,
                 "newton_correction": None,
+                "newton_correction_over_tolerance": None,
                 "root_displacement_abs": None,
             }
             if result is not None:
@@ -263,11 +263,11 @@ def _precision_stage_rows(
                         and baseline.equation_id == leaf.job.equation_id
                     ),
                     "determinant_abs": determinant_abs,
-                    "determinant_over_tolerance": (
-                        determinant_abs
-                        / _root_tolerance_for_precision(outcome.digits)
-                    ),
                     "newton_correction": baseline.newton_correction_estimate,
+                    "newton_correction_over_tolerance": (
+                        baseline.newton_correction_estimate
+                        / _root_correction_tolerance_for_precision(outcome.digits)
+                    ),
                     "root_displacement_abs": abs(
                         baseline.omega - leaf.job.root.omega
                     ),
