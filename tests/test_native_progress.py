@@ -1,6 +1,11 @@
 from __future__ import annotations
 
 import unittest
+from unittest.mock import patch
+
+import numpy as np
+
+from windows_solver.contracts import canonical_json_bytes
 
 from windows_solver.progress import ProgressEventKind, activate_progress
 from windows_solver.response_engine import (
@@ -252,6 +257,33 @@ class NativeProgressTests(unittest.TestCase):
             "resulting_determinant_abs", "elapsed_seconds",
         ):
             self.assertIn(field, payload)
+
+
+    def test_solve_once_emits_a_json_serializable_builtin_convergence_boolean(self):
+        kernel = object.__new__(VettedNativeDeterminantKernel)
+        with patch.object(
+            VettedNativeDeterminantKernel,
+            "_bounded_newton",
+            return_value=(
+                0.5 - 0.1j,
+                np.float64(1.0e-15),
+                np.float64(2.0),
+                True,
+            ),
+        ):
+            _, _, _, converged = kernel._solve_once(
+                sn=object(),
+                job=object(),
+                perturbation=object(),
+                policy=object(),
+                guess=0.5 - 0.1j,
+            )
+
+        self.assertIs(type(converged), bool)
+        self.assertEqual(
+            canonical_json_bytes({"converged": converged}),
+            b'{"converged":true}',
+        )
 
 
 if __name__ == "__main__":
