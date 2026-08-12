@@ -439,7 +439,7 @@ class JuliaResponseBackendTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
 
         self.assertNotIn('value -= parse(T, "0.125") * step', worker)
-        self.assertIn("if !accepted", worker)
+        self.assertIn("!accepted && break", worker)
         self.assertIn("best_value, best_residual = candidate, candidate_abs", worker)
 
     def test_package_worker_cross_checks_frequency_derivatives(self):
