@@ -767,13 +767,16 @@ function branch_values(
     Cref = nothing
     Cinc = nothing
     if branch == :xin
+        xin_radius_from_rho = observed_radial_map(
+            radius_from_rho, "Xin", rho_in, rho_out
+        )
         xin_match = progress_operation("Xin") do
             solve_xin_at_match(
                 T,
                 request,
                 omega,
                 lambda,
-                radius_from_rho,
+                xin_radius_from_rho,
                 beta_negative,
                 sign_negative,
                 rs_match,
@@ -781,13 +784,16 @@ function branch_values(
             )
         end
     elseif branch == :xup
+        xup_radius_from_rho = observed_radial_map(
+            radius_from_rho, "Xup", rho_in, rho_out
+        )
         xup_match = progress_operation("Xup") do
             solve_xup_at_match(
                 T,
                 request,
                 omega,
                 lambda,
-                radius_from_rho,
+                xup_radius_from_rho,
                 beta_positive,
                 sign_positive,
                 rs_match,
@@ -795,13 +801,16 @@ function branch_values(
             )
         end
     else
+        xup_radius_from_rho = observed_radial_map(
+            radius_from_rho, "Xup", rho_in, rho_out
+        )
         Cref, Cinc = progress_operation("Xup") do
             solve_xup_scattering_coefficients(
                 T,
                 request,
                 omega,
                 lambda,
-                radius_from_rho,
+                xup_radius_from_rho,
                 beta_negative,
                 beta_positive,
                 sign_negative,
