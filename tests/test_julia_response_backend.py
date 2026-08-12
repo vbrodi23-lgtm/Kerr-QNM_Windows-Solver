@@ -409,6 +409,9 @@ class JuliaResponseBackendTests(unittest.TestCase):
         )
         self.assertNotIn('"branch" => "Xup"', worker)
         self.assertNotIn("perturbed_Xup_real_radius", worker)
+        self.assertIn("chart_ratio < one(T)", worker)
+        self.assertIn('"Cinc" => progress_complex(branches.Cinc)', worker)
+        self.assertIn('"Cref" => progress_complex(branches.Cref)', worker)
 
     def test_package_worker_rejects_invalid_mechanism_and_support_contracts(self):
         worker = (
@@ -458,6 +461,12 @@ class JuliaResponseBackendTests(unittest.TestCase):
         ):
             self.assertIn(evidence, worker)
         self.assertIn("correction_upper_bound", worker)
+        self.assertIn("real_step_convergent", worker)
+        self.assertIn("complex_axis_consistent", worker)
+        self.assertIn(
+            "return root, residual, derivative_lower_bound_abs, converged",
+            worker,
+        )
         self.assertIn("derivative_control_completed", worker)
 
     def test_package_worker_confines_fine_steps_and_stores_only_endpoints(self):
@@ -488,7 +497,8 @@ class JuliaResponseBackendTests(unittest.TestCase):
         self.assertIn("function solve_xup_at_match(", worker)
         self.assertIn("CF.Xin_initialconditions(", worker)
         self.assertIn("CF.Xup_initialconditions(", worker)
-        self.assertIn("CF.solve_X_in_rho(", worker)
+        self.assertIn("function homogeneous_rho_rhs!(", worker)
+        self.assertIn("function solve_homogeneous_endpoint(", worker)
         self.assertIn(
             "xin_match = solve_xin_at_match(",
             worker,
