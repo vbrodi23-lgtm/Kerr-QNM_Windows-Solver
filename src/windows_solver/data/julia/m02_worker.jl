@@ -1008,11 +1008,16 @@ function determinant(::Type{T}, request, omega::Complex{T}, amplitude::Complex{T
         branches = branch_values(T, request, omega, readout, :xup_scattering)
         p_h = omega - T(m) * Kerr.omega_horizon(a)
         denominator = T(2) * im * p_h - amplitude
-        iszero(denominator) && error("zero horizon chart denominator")
+        denominator_abs = abs(denominator)
+        iszero(denominator_abs) && error("zero horizon chart denominator")
+        chart_scale_abs = max(T(2) * abs(p_h), abs(amplitude))
+        chart_condition_abs = denominator_abs / chart_scale_abs
+        chart_condition_threshold = sqrt(eps(T))
+        isfinite(chart_condition_abs) &&
+            chart_condition_abs > chart_condition_threshold ||
+            error("horizon chart denominator is numerically singular")
         reflectivity = amplitude / denominator
         chart_ratio = iszero(p_h) ? T(Inf) : abs(amplitude) / (T(2) * abs(p_h))
-        isfinite(chart_ratio) && chart_ratio < one(T) ||
-            error("horizon chart ratio must be finite and below one")
         progress_emit("horizon_chart_evaluated"; payload=Dict(
             "Cinc" => progress_complex(branches.Cinc),
             "Cref" => progress_complex(branches.Cref),
@@ -1023,7 +1028,10 @@ function determinant(::Type{T}, request, omega::Complex{T}, amplitude::Complex{T
             "Cref_abs" => string(abs(branches.Cref)),
             "horizon_frequency_abs" => string(abs(p_h)),
             "reflectivity_abs" => string(abs(reflectivity)),
-            "chart_denominator_abs" => string(abs(denominator)),
+            "chart_denominator_abs" => string(denominator_abs),
+            "chart_scale_abs" => string(chart_scale_abs),
+            "chart_condition_abs" => string(chart_condition_abs),
+            "chart_condition_threshold" => string(chart_condition_threshold),
             "chart_ratio" => string(chart_ratio),
         ))
         return branches.Cinc - reflectivity * branches.Cref
