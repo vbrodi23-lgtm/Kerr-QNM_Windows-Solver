@@ -23,3 +23,20 @@ license and transformation notice accompany the package at
 The result has no formal root enclosure and carries scientific state
 `NOT_EVALUATED`. PR #3 freezes the M01 release and authenticated-evidence
 boundary. PR #4 begins the separate `linear-response` migration.
+
+## M02 Julia numerical sources
+
+The M02 managed runtime packages the solver-consumed source snapshots of
+`GeneralizedSasakiNakamura.jl` 0.9.0 and
+`SpinWeightedSpheroidalHarmonics.jl` 1.3.0. Both are MIT-licensed works by Rico
+Ka Lok Lo (with Yucheng Yin also named as an author of
+`GeneralizedSasakiNakamura.jl`). Their complete licence texts accompany the
+package at:
+
+- `src/windows_solver/data/julia/GeneralizedSasakiNakamura.jl/LICENSE`
+- `src/windows_solver/data/julia/SpinWeightedSpheroidalHarmonics.jl/LICENSE`
+
+Those licences apply to the identified third-party source components only.
+They do not alter the repository's declared project licence. Julia packages
+resolved into the managed M02 environment remain subject to their own upstream
+licences and must be retained in the release licence ledger.

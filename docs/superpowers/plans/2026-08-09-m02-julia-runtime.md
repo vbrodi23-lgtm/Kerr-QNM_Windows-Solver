@@ -1,5 +1,12 @@
 # M02 Package-Local Julia Runtime Implementation Plan
 
+> **Historical implementation record.** The implementation evolved after this
+> plan: PR #13 made the versioned per-user managed runtime the default and PR
+> #21 narrowed the production contract from 553 leaves to a 212-leaf,
+> 48-selector campaign and 57 projective rows. The checklist below records the
+> original execution sequence and is not the live backlog; use `.tasks/` for
+> current state.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Make the full 553-leaf M02 campaign runnable and resumable from one PowerShell entry point without undeclared scientific inputs.

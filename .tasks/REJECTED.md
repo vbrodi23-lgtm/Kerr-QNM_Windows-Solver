@@ -1,5 +1,9 @@
 # Rejected
 
+> TASK-071–TASK-074 retain the historical 553-leaf partition they superseded.
+> PR #21 later narrowed the canonical production domain to 212 leaves; these
+> rejected records are provenance, not current campaign instructions.
+
 ## TASK-071: Superseded bulk primary batch-B evidence campaign
 **Priority:** P1 | **Tags:** M02, superseded, evidence
 **Assignee:** Unassigned | **Estimate:** Superseded | **Milestone:** M02

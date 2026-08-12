@@ -1,5 +1,12 @@
 # M02 Package-Local Julia Runtime Design
 
+> **Historical implementation record.** PR #13 moved the default runtime from
+> checkout-local `.runtime` storage to the versioned per-user managed root, and
+> PR #21 replaced the 553-leaf campaign with the canonical 212-leaf,
+> 48-selector campaign and 57-row reduction contract. Use `README.md`,
+> `docs/response-replay-powershell.md`, and the release manifest for current
+> behavior; the original design below is retained as provenance.
+
 **Status:** Approved for implementation on 2026-08-09.
 
 ## Goal

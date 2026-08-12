@@ -10,9 +10,11 @@ Demonstrate that one documented command can take a fresh public checkout through
 
 ### Acceptance Criteria
 
-- [ ] From a clean checkout with no system Python or Julia dependency, one PowerShell entrypoint must initialize its run ledger before any mutation, provision the package-local runtimes and pinned source environment, generate required numerical inputs, and reach representative physical M02 computation without manual intervention.
+- [ ] From a clean checkout with no system Python or Julia dependency, one PowerShell entrypoint must initialize its run ledger before any mutation, provision the solver-managed runtimes and pinned source environment, generate required numerical inputs, and reach representative physical M02 computation without manual intervention.
 - [ ] Provide a fast non-scientific preflight of the complete M02 path that verifies runtime identities and imports, source and manifest digests, command/token resolution, producer command-line contracts, Julia parsing/loading, output routing, and directory writability before compute starts.
 - [ ] Execute canonical primary, control, and deep leaves covering horizon plus all six exterior mechanisms, negative m, direct χ, exact Mκ, binary64, 80-digit, and 120-digit paths.
+- [ ] Exercise the packaged Julia worker semantically, not only through Python source assertions: verify the stable horizon/exterior determinants, compact-support segmentation, reduced homogeneous-leg counts, in-place endpoint-only evolution, and a measured promoted-precision performance baseline without changing the frozen numerical policy.
+- [ ] Preserve the scale-aware horizon-chart coefficients/conditioning and conservative finite-difference derivative bound through checkpoint serialization and fresh-process replay so acceptance evidence is durable rather than progress-only.
 - [ ] Validate authenticated checkpoint resume, zero-work warm reuse, no redundant downloads, backend/source identity, reset-with-ledger-preservation, path-with-spaces behavior, and PowerShell 5.1 compatibility.
 - [ ] On every failure, stop at the first rejected phase and emit a structured failure record, retained transcript/artifact inventory, exact recovery command, and a PowerShell-only diagnostic bundle that still works when Python or Julia provisioning failed.
 - [ ] Repeat the supported campaign smoke on Ubuntu and reconcile deterministic identities or explicitly bounded platform-dependent numerical fields.
@@ -32,6 +34,8 @@ Cold-start and warm-reuse ledgers, preflight report, representative multi-precis
 - `python .tasks/validate_board.py`
 - Native Windows PowerShell 5.1 clean-checkout cold-start and warm-reuse campaign smoke.
 - Hosted Windows and Ubuntu full tests, package checks, preflight, failure diagnostics, resume, and zero-work reuse gates.
+- Native Julia semantic/performance receipt plus checkpoint/replay assertions for
+  horizon-chart and derivative-control evidence.
 
 ### Review Focus
 
@@ -140,6 +144,15 @@ Inspect exact evidence-to-payload binding, covariance/Gram identity, zero-contai
 
 Extend the spectral responsibility beyond root rows with exact normalization and branch objects required downstream.
 
+### Current Status
+
+PR #30 merged a contract-only precursor: admitted-root seed adapters,
+authenticated but `UNRECONCILED` M02 lineage carriers, canonical cache identity,
+fail-closed artifact envelopes, and 23 focused tests. TASK-012 remains in
+Backlog because that slice does not specify the complete field/derivative and
+compactification contract, reconcile an admitted M02 package, reuse the
+numerical field backend, or clear the declared human-mathematics blockers.
+
 ### Acceptance Criteria
 
 - [ ] Define radial/angular field, derivative, co-mode, residue, normalization, branch-node, branch-edge, κ, and matching-evidence schemas.
@@ -169,6 +182,8 @@ Check whether the public spectral provider remains one owner while base, overlay
 ### Plan
 
 - Derive contracts from the admitted base-plus-overlay spectrum and downstream field needs.
+- Retain PR #30's root-seed, lineage, cache, and fail-closed envelope slice as
+  the non-numerical starting point; do not mistake it for TASK-012 closure.
 - Reuse the public GSN/angular backend and add strict compatibility tests.
 - Review leaf caching, normalization identity, and evidence ceiling.
 

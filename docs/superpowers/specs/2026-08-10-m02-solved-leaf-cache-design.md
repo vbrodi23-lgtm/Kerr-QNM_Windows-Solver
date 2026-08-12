@@ -1,5 +1,11 @@
 # M02 Authenticated Solved-Leaf Cache Design
 
+> **Historical implementation record.** PR #21 later replaced the 553-leaf
+> production contract referenced below with the canonical 212-leaf,
+> 48-selector campaign and 57-row reduction contract. The cache trust and
+> identity design remains a record of the implemented boundary; current status
+> and counts come from `.tasks/`, `README.md`, and the release manifest.
+
 ## Purpose
 
 M02 may reuse a complete terminal leaf record that the same scientific contract has already originated and certified. The cache is optional acceleration: deleting it must leave cold campaign execution fully functional.

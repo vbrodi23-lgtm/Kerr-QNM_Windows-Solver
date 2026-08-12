@@ -1,5 +1,12 @@
 # M03 Contracts and Catalogue Adapters Implementation Plan
 
+> **Implementation result:** the contract-only slice described here merged in
+> PR #30. Its unchecked boxes preserve the plan-at-authoring state and are not
+> live task status. TASK-012 remains in Backlog because PR #30 deliberately did
+> not reconcile admitted M02 lineage, specify the complete numerical field and
+> compactification contract, reuse the field backend, or clear human-math
+> blockers.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use
 > superpowers:executing-plans to implement this plan task-by-task. Steps use
 > checkbox (`- [ ]`) syntax for tracking.
