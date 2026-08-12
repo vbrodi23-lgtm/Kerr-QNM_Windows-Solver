@@ -23,6 +23,7 @@ from windows_solver.julia_response_backend import (
     JuliaResponseAdapter,
     JuliaResponseBackendError,
     _forward_julia_progress_line,
+    _mode_specific_branch_enclosure_radius,
     _run_streamed_julia,
 )
 from windows_solver.progress import PROGRESS_SCHEMA, ProgressEventKind, activate_progress
@@ -694,28 +695,35 @@ class JuliaResponseBackendTests(unittest.TestCase):
                 return response
 
         job = _deep_job()
+        exact_radius = Decimal(
+            format(_mode_specific_branch_enclosure_radius(job), ".17g")
+        )
+        outside_radius = exact_radius + Decimal("1e-28")
         exact = JuliaPrecisionRootBackend(
             VettedNativeDeterminantKernel.identity,
-            BoundaryAdapter("0.005", True),
+            BoundaryAdapter(str(exact_radius), True),
             80,
         ).read_root(job, 0.0j)
         outside = JuliaPrecisionRootBackend(
             VettedNativeDeterminantKernel.identity,
-            BoundaryAdapter("0.0050000000000000000000000001", False),
+            BoundaryAdapter(str(outside_radius), False),
             80,
         ).read_root(job, 0.0j)
 
         class ComplexBoundaryAdapter(FakeAdapter):
             def evaluate(self, request):
                 response = super().evaluate(request)
+                radius = Decimal(request["policy"]["branch_enclosure_radius_abs"])
+                real_delta = Decimal("0.6") * radius
+                imaginary_delta = Decimal("0.8") * radius
                 response.update({
                     "root_omega_re": str(
-                        Decimal(request["omega"]["real"]) + Decimal("0.003")
+                        Decimal(request["omega"]["real"]) + real_delta
                     ),
                     "root_omega_im": str(
-                        Decimal(request["omega"]["imaginary"]) + Decimal("0.004")
+                        Decimal(request["omega"]["imaginary"]) + imaginary_delta
                     ),
-                    "root_displacement_abs": "0.005",
+                    "root_displacement_abs": str(radius),
                 })
                 for raw in response["diagnostic_roots"].values():
                     raw["root_omega_re"] = response["root_omega_re"]
@@ -734,10 +742,7 @@ class JuliaResponseBackendTests(unittest.TestCase):
         self.assertEqual(exact.branch_id, job.root.branch_id)
         self.assertEqual(complex_boundary.branch_id, job.root.branch_id)
         self.assertEqual(outside.branch_id, "nonmatching-julia-continuation")
-        self.assertEqual(
-            float("0.0050000000000000000000000001"),
-            0.005,
-        )
+        self.assertEqual(float(outside_radius), float(exact_radius))
 
     def test_promoted_branch_decision_rejects_worker_metric_disagreement(self):
         """Catches trusting a forged Julia branch Boolean over clear radius evidence."""
