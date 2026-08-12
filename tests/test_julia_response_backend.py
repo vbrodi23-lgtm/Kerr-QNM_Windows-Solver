@@ -23,6 +23,7 @@ from windows_solver.julia_response_backend import (
     JuliaResponseAdapter,
     JuliaResponseBackendError,
     _forward_julia_progress_line,
+    _mode_specific_branch_enclosure_radius,
     _run_streamed_julia,
 )
 from windows_solver.progress import PROGRESS_SCHEMA, ProgressEventKind, activate_progress
@@ -83,9 +84,9 @@ class FakeAdapter:
             "root_residual_abs": "1e-60",
             "root_derivative_abs": "2.5",
             "root_converged": True,
-            "branch_authentication_contract_version": 2,
+            "branch_authentication_contract_version": 3,
             "root_branch_continuation_valid": True,
-            "branch_tolerance_abs": "0.005",
+            "branch_tolerance_abs": request["policy"]["branch_enclosure_radius_abs"],
             "root_displacement_abs": "0",
             "truncation_radius_abs": "2e-55",
             "resolution_radius_abs": "3e-55",
@@ -235,7 +236,7 @@ class JuliaResponseBackendTests(unittest.TestCase):
         self.assertIn('fallback_reason = "PREDICTOR_SOLVE_ERROR"', worker)
         self.assertIn("failure isa InterruptException && rethrow()", worker)
         self.assertIn('"INDEPENDENT_SEED_PATH"', worker)
-        self.assertIn('"branch_authentication_contract_version" => 2', worker)
+        self.assertIn('"branch_authentication_contract_version" => 3', worker)
         self.assertIn('"root_branch_continuation_valid" => branch_valid', worker)
         self.assertIn('"branch_tolerance_abs" => numeric_text(branch_tolerance)', worker)
         self.assertIn('"root_displacement_abs" => numeric_text(abs(root - omega))', worker)
@@ -256,9 +257,9 @@ class JuliaResponseBackendTests(unittest.TestCase):
         self.assertIn("carried_available = false", worker)
         self.assertIn("carried_residual = candidate_residual", worker)
         self.assertIn("carried_available = true", worker)
-        self.assertIn("return value, magnitude, derivative_abs, true", worker)
-        self.assertIn("root, residual, accepted_derivative, _ = bounded_newton", worker)
-        self.assertIn("if isnothing(accepted_derivative)", worker)
+        self.assertIn("return value, magnitude, derivative, true", worker)
+        self.assertIn("root, residual, accepted_derivative, newton_converged =", worker)
+        self.assertIn("isnothing(accepted_derivative) ?", worker)
         # The seed determinant is carried, not recomputed, but every later
         # iteration still evaluates its own residual at its own frequency.
         self.assertIn(
@@ -386,6 +387,151 @@ class JuliaResponseBackendTests(unittest.TestCase):
         self.assertIn("correction_abs = magnitude / derivative_abs", worker)
         self.assertIn("correction_abs <= tolerance", worker)
         self.assertNotIn("best_residual <= tolerance", worker)
+
+    def test_package_worker_uses_stable_two_ended_determinants(self):
+        """Catches singular horizon reconstruction and common-flow exterior roots."""
+
+        worker = (
+            Path(__file__).resolve().parents[1]
+            / "src/windows_solver/data/julia/m02_worker.jl"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("branches.Cinc - reflectivity * branches.Cref", worker)
+        self.assertNotIn("xout_match =", worker)
+        self.assertNotIn("horizon = branches.xin", worker)
+        self.assertIn(
+            "readout_branches = branch_values(T, request, omega, readout, :xup)",
+            worker,
+        )
+        self.assertIn(
+            "wronskian(perturbed_in, readout_branches.xup)",
+            worker,
+        )
+        self.assertNotIn('"branch" => "Xup"', worker)
+        self.assertNotIn("perturbed_Xup_real_radius", worker)
+        self.assertNotIn("chart_ratio < one(T)", worker)
+        self.assertIn("chart_condition_threshold = sqrt(eps(T))", worker)
+        self.assertIn(
+            "chart_condition_abs > chart_condition_threshold",
+            worker,
+        )
+        self.assertIn('"Cinc" => progress_complex(branches.Cinc)', worker)
+        self.assertIn('"Cref" => progress_complex(branches.Cref)', worker)
+        self.assertIn('"chart_condition_abs" => string(chart_condition_abs)', worker)
+        self.assertIn(
+            '"chart_condition_threshold" => string(chart_condition_threshold)',
+            worker,
+        )
+
+    def test_package_worker_rejects_invalid_mechanism_and_support_contracts(self):
+        worker = (
+            Path(__file__).resolve().parents[1]
+            / "src/windows_solver/data/julia/m02_worker.jl"
+        ).read_text(encoding="utf-8")
+
+        for mechanism in (
+            "horizon-admittance",
+            "exterior-fixed-r3",
+            "exterior-light-ring",
+            "exterior-throat-kappa",
+            "exterior-alpha-zero",
+            "exterior-alpha-half",
+            "exterior-alpha-one",
+        ):
+            self.assertIn(f'"{mechanism}"', worker)
+        self.assertIn("ALLOWED_MECHANISMS", worker)
+        self.assertIn("unsupported mechanism_id", worker)
+        self.assertIn("half_width > zero(T)", worker)
+        self.assertIn("support lower bound is inconsistent", worker)
+        self.assertIn("support upper bound is inconsistent", worker)
+
+    def test_package_worker_rejects_an_unaccepted_newton_step(self):
+        worker = (
+            Path(__file__).resolve().parents[1]
+            / "src/windows_solver/data/julia/m02_worker.jl"
+        ).read_text(encoding="utf-8")
+
+        self.assertNotIn('value -= parse(T, "0.125") * step', worker)
+        self.assertIn("!accepted && break", worker)
+        self.assertIn("best_value, best_residual = candidate, candidate_abs", worker)
+
+    def test_package_worker_cross_checks_frequency_derivatives(self):
+        worker = (
+            Path(__file__).resolve().parents[1]
+            / "src/windows_solver/data/julia/m02_worker.jl"
+        ).read_text(encoding="utf-8")
+
+        for evidence in (
+            "derivative_real_half",
+            "derivative_real_base",
+            "derivative_real_double",
+            "derivative_imaginary",
+            "derivative_uncertainty_abs",
+            "derivative_lower_bound_abs",
+        ):
+            self.assertIn(evidence, worker)
+        self.assertIn("correction_upper_bound", worker)
+        self.assertIn("real_step_convergent", worker)
+        self.assertIn("complex_axis_consistent", worker)
+        self.assertIn(
+            "return root, residual, derivative_lower_bound_abs, converged",
+            worker,
+        )
+        self.assertIn("derivative_control_completed", worker)
+
+    def test_package_worker_confines_fine_steps_and_stores_only_endpoints(self):
+        worker = (
+            Path(__file__).resolve().parents[1]
+            / "src/windows_solver/data/julia/m02_worker.jl"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("function radial_rhs!(du, state, parameters, radius)", worker)
+        self.assertIn("vacuum_tail_dtmax = T(0.2)", worker)
+        self.assertIn("fine_dtmax = min(", worker)
+        self.assertIn("tstops=[stop_radius]", worker)
+        self.assertIn("save_everystep=false", worker)
+        self.assertIn("save_start=false", worker)
+        self.assertIn("save_end=true", worker)
+        self.assertIn("dense=false", worker)
+        self.assertIn("solution.u[end]", worker)
+        self.assertIn('ode_leg="$(ode_leg)_compact_support"', worker)
+        self.assertIn('ode_leg="$(ode_leg)_vacuum_tail"', worker)
+        self.assertIn('ode_leg="perturbed_Xin"', worker)
+
+    def test_package_worker_avoids_unused_exterior_homogeneous_half_solutions(self):
+        worker = (
+            Path(__file__).resolve().parents[1]
+            / "src/windows_solver/data/julia/m02_worker.jl"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("function solve_xin_at_match(", worker)
+        self.assertIn("function solve_xup_at_match(", worker)
+        self.assertIn("CF.Xin_initialconditions(", worker)
+        self.assertIn("CF.Xup_initialconditions(", worker)
+        self.assertIn("function homogeneous_rho_rhs!(", worker)
+        self.assertIn("function solve_homogeneous_endpoint(", worker)
+        self.assertIn(
+            "            solve_xin_at_match(",
+            worker,
+        )
+        self.assertIn(
+            "            solve_xup_at_match(",
+            worker,
+        )
+
+    def test_promoted_branch_authentication_uses_a_mode_specific_enclosure(self):
+        root = Path(__file__).resolve().parents[1]
+        worker = (root / "src/windows_solver/data/julia/m02_worker.jl").read_text(
+            encoding="utf-8"
+        )
+        backend = (
+            root / "src/windows_solver/julia_response_backend.py"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn('"branch_enclosure_radius_abs"', worker)
+        self.assertIn('"branch_enclosure_radius_abs"', backend)
+        self.assertIn("_mode_specific_branch_enclosure_radius", backend)
+        self.assertIn('"branch_authentication_contract_version" => 3', worker)
 
     def test_reserved_julia_stdout_event_is_forwarded_to_active_reporter(self):
         class Observer:
@@ -608,28 +754,35 @@ class JuliaResponseBackendTests(unittest.TestCase):
                 return response
 
         job = _deep_job()
+        exact_radius = Decimal(
+            format(_mode_specific_branch_enclosure_radius(job), ".17g")
+        )
+        outside_radius = exact_radius + Decimal("1e-28")
         exact = JuliaPrecisionRootBackend(
             VettedNativeDeterminantKernel.identity,
-            BoundaryAdapter("0.005", True),
+            BoundaryAdapter(str(exact_radius), True),
             80,
         ).read_root(job, 0.0j)
         outside = JuliaPrecisionRootBackend(
             VettedNativeDeterminantKernel.identity,
-            BoundaryAdapter("0.0050000000000000000000000001", False),
+            BoundaryAdapter(str(outside_radius), False),
             80,
         ).read_root(job, 0.0j)
 
         class ComplexBoundaryAdapter(FakeAdapter):
             def evaluate(self, request):
                 response = super().evaluate(request)
+                radius = Decimal(request["policy"]["branch_enclosure_radius_abs"])
+                real_delta = Decimal("0.6") * radius
+                imaginary_delta = Decimal("0.8") * radius
                 response.update({
                     "root_omega_re": str(
-                        Decimal(request["omega"]["real"]) + Decimal("0.003")
+                        Decimal(request["omega"]["real"]) + real_delta
                     ),
                     "root_omega_im": str(
-                        Decimal(request["omega"]["imaginary"]) + Decimal("0.004")
+                        Decimal(request["omega"]["imaginary"]) + imaginary_delta
                     ),
-                    "root_displacement_abs": "0.005",
+                    "root_displacement_abs": str(radius),
                 })
                 for raw in response["diagnostic_roots"].values():
                     raw["root_omega_re"] = response["root_omega_re"]
@@ -648,10 +801,7 @@ class JuliaResponseBackendTests(unittest.TestCase):
         self.assertEqual(exact.branch_id, job.root.branch_id)
         self.assertEqual(complex_boundary.branch_id, job.root.branch_id)
         self.assertEqual(outside.branch_id, "nonmatching-julia-continuation")
-        self.assertEqual(
-            float("0.0050000000000000000000000001"),
-            0.005,
-        )
+        self.assertEqual(float(outside_radius), float(exact_radius))
 
     def test_promoted_branch_decision_rejects_worker_metric_disagreement(self):
         """Catches trusting a forged Julia branch Boolean over clear radius evidence."""

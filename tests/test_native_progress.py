@@ -1,10 +1,16 @@
 from __future__ import annotations
 
 import unittest
+from unittest.mock import patch
+
+import numpy as np
+
+from windows_solver.contracts import canonical_json_bytes
 
 from windows_solver.progress import ProgressEventKind, activate_progress
 from windows_solver.response_engine import (
     BackendIdentity,
+    DiagnosticRootReadout,
     NumericalPolicy,
     ResponseComponentJob,
     RootReadout,
@@ -252,6 +258,72 @@ class NativeProgressTests(unittest.TestCase):
             "resulting_determinant_abs", "elapsed_seconds",
         ):
             self.assertIn(field, payload)
+
+
+    def test_solve_once_emits_a_json_serializable_builtin_convergence_boolean(self):
+        kernel = object.__new__(VettedNativeDeterminantKernel)
+        with patch.object(
+            VettedNativeDeterminantKernel,
+            "_bounded_newton",
+            return_value=(
+                0.5 - 0.1j,
+                np.float64(1.0e-15),
+                np.float64(2.0),
+                True,
+            ),
+        ):
+            _, _, _, converged = kernel._solve_once(
+                sn=object(),
+                job=object(),
+                perturbation=object(),
+                policy=object(),
+                guess=0.5 - 0.1j,
+            )
+
+        self.assertIs(type(converged), bool)
+        self.assertEqual(
+            canonical_json_bytes({"converged": converged}),
+            b'{"converged":true}',
+        )
+
+    def test_convergence_carriers_reject_foreign_boolean_scalars(self):
+        with self.assertRaises(TypeError):
+            canonical_json_bytes({"converged": np.bool_(True)})
+        with self.assertRaisesRegex(ValueError, "converged must be a built-in bool"):
+            DiagnosticRootReadout(
+                omega_delta_from_primary=0.0j,
+                determinant_residual_abs=1.0e-15,
+                determinant_derivative_abs=2.0,
+                converged=np.bool_(True),
+            )
+
+    def test_persisted_convergence_flags_are_not_coerced(self):
+        diagnostic = {
+            "omega_delta_from_primary": {"real": 0.0, "imaginary": 0.0},
+            "determinant_residual_abs": 1.0e-15,
+            "determinant_derivative_abs": 2.0,
+        }
+        root = {
+            "omega": {"real": 0.5, "imaginary": -0.1},
+            "determinant_residual_abs": 1.0e-15,
+            "determinant_derivative_abs": 2.0,
+            "root_reference_id": "root-reference",
+            "branch_id": "branch",
+            "equation_id": "equation",
+        }
+        for foreign in (1, "false"):
+            with self.subTest(carrier="diagnostic", foreign=foreign):
+                with self.assertRaisesRegex(
+                    ValueError, "converged must be a built-in bool"
+                ):
+                    DiagnosticRootReadout.from_mapping(
+                        {**diagnostic, "converged": foreign}
+                    )
+            with self.subTest(carrier="root", foreign=foreign):
+                with self.assertRaisesRegex(
+                    ValueError, "converged must be a built-in bool"
+                ):
+                    RootReadout.from_mapping({**root, "converged": foreign})
 
 
 if __name__ == "__main__":

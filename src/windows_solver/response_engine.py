@@ -333,6 +333,63 @@ class BoundSpectralRoot:
         return _sha256(self.to_mapping())
 
 
+def mode_specific_branch_enclosure_radius(
+    authenticated_root: BoundSpectralRoot,
+) -> float:
+    """Return a radius strictly below half the nearest authenticated overtone."""
+
+    mode = authenticated_root.owner_record.get("mode")
+    evidence = authenticated_root.owner_record.get("numerical_evidence")
+    if not isinstance(mode, Mapping) or not isinstance(evidence, Mapping):
+        raise ValueError("authenticated root branch evidence is incomplete")
+    ell = mode.get("ell")
+    m = mode.get("m")
+    n = mode.get("n")
+    if any(isinstance(value, bool) or not isinstance(value, int) for value in (ell, m, n)):
+        raise ValueError("authenticated root mode identity is invalid")
+
+    separations: list[float] = []
+    for field in (
+        "assigned_separation_abs",
+        "nearest_overtone_separation_abs",
+    ):
+        value = evidence.get(field)
+        if (
+            not isinstance(value, bool)
+            and isinstance(value, (int, float))
+            and math.isfinite(float(value))
+            and float(value) > 0.0
+        ):
+            separations.append(float(value))
+
+    catalog = load_spectrum_catalog()
+    for candidate in (*catalog.base.roots, *catalog.overlay.roots):
+        if (
+            candidate.ell == ell
+            and candidate.m == m
+            and candidate.n != n
+            and candidate.spin_hex == authenticated_root.spin_binary64_hex
+        ):
+            separation = abs(
+                complex(candidate.omega_re, candidate.omega_im)
+                - authenticated_root.omega
+            )
+            if math.isfinite(separation) and separation > 0.0:
+                separations.append(separation)
+
+    if not separations:
+        raise ValueError(
+            "authenticated root has no mode-specific overtone separation"
+        )
+    radius = min(
+        ROOT_BRANCH_CONTINUATION_TOLERANCE_ABS,
+        0.45 * min(separations),
+    )
+    if not math.isfinite(radius) or radius <= 0.0:
+        raise ValueError("mode-specific branch enclosure radius is invalid")
+    return radius
+
+
 def _mode_for_leaf(leaf: BPrimeLeaf) -> ModeKey:
     return ModeKey(
         s=-2,
@@ -639,6 +696,8 @@ class DiagnosticRootReadout:
             object.__setattr__(self, name, value)
         if self.determinant_derivative_abs <= 0.0:
             raise ValueError("diagnostic determinant derivative must be positive")
+        if type(self.converged) is not bool:
+            raise ValueError("converged must be a built-in bool")
 
     @property
     def newton_correction_estimate(self) -> float:
@@ -666,7 +725,7 @@ class DiagnosticRootReadout:
             ),
             determinant_residual_abs=float(value["determinant_residual_abs"]),
             determinant_derivative_abs=float(value["determinant_derivative_abs"]),
-            converged=bool(value["converged"]),
+            converged=value["converged"],
         )
 
 
@@ -700,6 +759,8 @@ class RootReadout:
             object.__setattr__(self, name, value)
         if self.determinant_derivative_abs <= 0.0:
             raise ValueError("determinant derivative must be positive")
+        if type(self.converged) is not bool:
+            raise ValueError("converged must be a built-in bool")
         if not self.root_reference_id or not self.branch_id or not self.equation_id:
             raise ValueError("root readout identity fields must be nonempty")
         object.__setattr__(
@@ -787,7 +848,7 @@ class RootReadout:
             omega=_complex_from_mapping(value.get("omega"), "root omega"),
             determinant_residual_abs=float(value["determinant_residual_abs"]),
             determinant_derivative_abs=float(value["determinant_derivative_abs"]),
-            converged=bool(value["converged"]),
+            converged=value["converged"],
             root_reference_id=str(value["root_reference_id"]),
             branch_id=str(value["branch_id"]),
             equation_id=str(value["equation_id"]),
@@ -830,21 +891,19 @@ def root_readout_preserves_authenticated_branch(
     """
 
     expected_source = _validated_source_root_mapping(source_root_mapping)
+    branch_radius = mode_specific_branch_enclosure_radius(authenticated_root)
     return (
         readout.root_reference_id == authenticated_root.root_reference_id
         and readout.branch_id == authenticated_root.branch_id
         and readout.equation_id == equation_id
         and readout.source_root_mapping == expected_source
         and abs(readout.omega - authenticated_root.omega)
-        <= ROOT_BRANCH_CONTINUATION_TOLERANCE_ABS
+        <= branch_radius
         and readout.newton_correction_estimate
         <= ROOT_BRANCH_CONTINUATION_TOLERANCE_ABS
-        and readout.truncation_radius
-        <= ROOT_BRANCH_CONTINUATION_TOLERANCE_ABS
-        and readout.resolution_radius
-        <= ROOT_BRANCH_CONTINUATION_TOLERANCE_ABS
-        and readout.seed_path_radius
-        <= ROOT_BRANCH_CONTINUATION_TOLERANCE_ABS
+        and readout.truncation_radius <= branch_radius
+        and readout.resolution_radius <= branch_radius
+        and readout.seed_path_radius <= branch_radius
     )
 
 

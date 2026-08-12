@@ -17,6 +17,15 @@ const ACTIVE_PROGRESS_CONTEXT = Ref(Dict{String,Any}())
 const ODE_PROGRESS_INTERVAL_SECONDS = 15.0
 const ODE_ALGORITHM_CONFIGURED = "AutoVern9(Rosenbrock23(autodiff=false))"
 const NEXT_ODE_SOLVE_ID = Ref(0)
+const ALLOWED_MECHANISMS = Set([
+    "horizon-admittance",
+    "exterior-fixed-r3",
+    "exterior-light-ring",
+    "exterior-throat-kappa",
+    "exterior-alpha-zero",
+    "exterior-alpha-half",
+    "exterior-alpha-one",
+])
 
 abstract type ODEControlFailure <: Exception end
 
@@ -299,6 +308,9 @@ function flatten_request(document)
     angular = required(document, "angular_A")
     amplitude = required(document, "amplitude")
     policy = required(document, "policy")
+    mechanism = string(required(document, "mechanism_id"))
+    mechanism in ALLOWED_MECHANISMS ||
+        error("unsupported mechanism_id $(repr(mechanism))")
     flattened = Dict{String,Any}(
         "schema_version" => required(document, "schema_version"),
         "operation" => required(document, "operation"),
@@ -311,7 +323,7 @@ function flatten_request(document)
         "omega_im" => required(omega, "imaginary"),
         "angular_A_re" => required(angular, "real"),
         "angular_A_im" => required(angular, "imaginary"),
-        "mechanism_id" => required(document, "mechanism_id"),
+        "mechanism_id" => mechanism,
         "amplitude_re" => required(amplitude, "real"),
         "amplitude_im" => required(amplitude, "imaginary"),
         "precision_digits" => required(document, "precision_digits"),
@@ -329,9 +341,12 @@ function flatten_request(document)
         "root_correction_tolerance" => required(
             policy, "root_correction_tolerance"
         ),
+        "branch_enclosure_radius_abs" => required(
+            policy, "branch_enclosure_radius_abs"
+        ),
         "max_newton_iterations" => required(policy, "max_newton_iterations"),
     )
-    if string(flattened["mechanism_id"]) != "horizon-admittance"
+    if mechanism != "horizon-admittance"
         support = required(document, "support")
         for key in ("lower", "upper", "centre", "half_width")
             flattened["support_$key"] = required(support, key)
@@ -456,7 +471,263 @@ function angular_constants(::Type{BigFloat}, s, ell, m, a, omega, seed_A, pad, d
     return A, A + c^2 - T(2m) * c
 end
 
-function branch_values(::Type{T}, request, omega::Complex{T}, match_radius::T) where {T<:AbstractFloat}
+function homogeneous_rho_rhs!(du, state, parameters, rho)
+    radius = parameters.radius_from_rho(rho)
+    F = parameters.sign * exp(im * parameters.beta) * Potentials.sF(
+        parameters.s,
+        parameters.m,
+        parameters.a,
+        parameters.omega,
+        parameters.lambda,
+        radius,
+    )
+    U = exp(2im * parameters.beta) * Potentials.sU(
+        parameters.s,
+        parameters.m,
+        parameters.a,
+        parameters.omega,
+        parameters.lambda,
+        radius,
+    )
+    du[1] = state[2]
+    du[2] = F * state[2] + U * state[1]
+    return nothing
+end
+
+function solve_homogeneous_endpoint(
+    ::Type{T},
+    request,
+    omega::Complex{T},
+    lambda::Complex{T},
+    radius_from_rho,
+    beta,
+    sign,
+    start_rho::T,
+    stop_rho::T,
+    seed;
+    ode_leg::String,
+) where {T<:AbstractFloat}
+    parameters = (
+        s=parse_integer(request, "s"),
+        m=parse_integer(request, "m"),
+        a=parse_real(T, request, "spin"),
+        omega=omega,
+        lambda=lambda,
+        radius_from_rho=radius_from_rho,
+        beta=beta,
+        sign=sign,
+    )
+    initial = Complex{T}[seed[1], seed[2]]
+    problem = ODEProblem(
+        homogeneous_rho_rhs!,
+        initial,
+        (start_rho, stop_rho),
+        parameters,
+    )
+    algorithm = AutoVern9(Rosenbrock23(autodiff=false))
+    observation_callback, observation = ode_observation_factory(
+        ode_leg, (start_rho, stop_rho), algorithm
+    )
+    solve_arguments = observation_callback === nothing ?
+        NamedTuple() : (; callback=observation_callback)
+    solution = solve(
+        problem,
+        algorithm;
+        reltol=parse_real(T, request, "ode_relative_tolerance"),
+        abstol=parse_real(T, request, "ode_absolute_tolerance"),
+        maxiters=Inf,
+        tstops=[stop_rho],
+        save_everystep=false,
+        save_start=false,
+        save_end=true,
+        dense=false,
+        solve_arguments...
+    )
+    observe_ode_solution(ode_leg, solution, observation)
+    endpoint = solution.u[end]
+    return Complex{T}[endpoint[1], endpoint[2]]
+end
+
+function solve_xin_at_match(
+    ::Type{T},
+    request,
+    omega::Complex{T},
+    lambda::Complex{T},
+    radius_from_rho,
+    beta_negative,
+    sign_negative,
+    rs_match,
+    rho_in::T,
+) where {T<:AbstractFloat}
+    seed = CF.Xin_initialconditions(
+        parse_integer(request, "s"),
+        parse_integer(request, "m"),
+        parse_real(T, request, "spin"),
+        beta_negative,
+        omega,
+        lambda,
+        radius_from_rho,
+        rs_match,
+        rho_in;
+        order=parse_integer(request, "endpoint_series_order"),
+        dtype=Complex{T},
+    )
+    raw = solve_homogeneous_endpoint(
+        T,
+        request,
+        omega,
+        lambda,
+        radius_from_rho,
+        beta_negative,
+        sign_negative,
+        rho_in,
+        zero(T),
+        seed;
+        ode_leg="Xin_inner_to_match",
+    )
+    return Complex{T}[
+        raw[1],
+        sign_negative * exp(-im * beta_negative) * raw[2],
+    ]
+end
+
+function xup_outer_to_match_raw(
+    ::Type{T},
+    request,
+    omega::Complex{T},
+    lambda::Complex{T},
+    radius_from_rho,
+    beta_positive,
+    sign_positive,
+    rs_match,
+    rho_out::T,
+) where {T<:AbstractFloat}
+    seed = CF.Xup_initialconditions(
+        parse_integer(request, "s"),
+        parse_integer(request, "m"),
+        parse_real(T, request, "spin"),
+        beta_positive,
+        omega,
+        lambda,
+        radius_from_rho,
+        rs_match,
+        rho_out;
+        order=parse_integer(request, "endpoint_series_order"),
+        dtype=Complex{T},
+    )
+    return solve_homogeneous_endpoint(
+        T,
+        request,
+        omega,
+        lambda,
+        radius_from_rho,
+        beta_positive,
+        sign_positive,
+        rho_out,
+        zero(T),
+        seed;
+        ode_leg="Xup_outer_to_match",
+    )
+end
+
+function solve_xup_at_match(
+    ::Type{T},
+    request,
+    omega::Complex{T},
+    lambda::Complex{T},
+    radius_from_rho,
+    beta_positive,
+    sign_positive,
+    rs_match,
+    rho_out::T,
+) where {T<:AbstractFloat}
+    raw = xup_outer_to_match_raw(
+        T,
+        request,
+        omega,
+        lambda,
+        radius_from_rho,
+        beta_positive,
+        sign_positive,
+        rs_match,
+        rho_out,
+    )
+    return Complex{T}[
+        raw[1],
+        sign_positive * exp(-im * beta_positive) * raw[2],
+    ]
+end
+
+function solve_xup_scattering_coefficients(
+    ::Type{T},
+    request,
+    omega::Complex{T},
+    lambda::Complex{T},
+    radius_from_rho,
+    beta_negative,
+    beta_positive,
+    sign_negative,
+    sign_positive,
+    rs_match,
+    rho_in::T,
+    rho_out::T,
+) where {T<:AbstractFloat}
+    outer_at_match = xup_outer_to_match_raw(
+        T,
+        request,
+        omega,
+        lambda,
+        radius_from_rho,
+        beta_positive,
+        sign_positive,
+        rs_match,
+        rho_out,
+    )
+    inner_seed = Complex{T}[
+        outer_at_match[1],
+        sign_negative * exp(im * beta_negative) *
+            sign_positive * exp(-im * beta_positive) *
+            outer_at_match[2],
+    ]
+    raw_inner = solve_homogeneous_endpoint(
+        T,
+        request,
+        omega,
+        lambda,
+        radius_from_rho,
+        beta_negative,
+        sign_negative,
+        zero(T),
+        rho_in,
+        inner_seed;
+        ode_leg="Xup_match_to_inner",
+    )
+    xup_inner = Complex{T}[
+        raw_inner[1],
+        sign_negative * exp(-im * beta_negative) * raw_inner[2],
+    ]
+    xup_endpoint(_rho) = xup_inner
+    return CF.CrefCinc_SN_from_Xup(
+        parse_integer(request, "s"),
+        parse_integer(request, "m"),
+        parse_real(T, request, "spin"),
+        beta_negative,
+        omega,
+        lambda,
+        xup_endpoint,
+        radius_from_rho,
+        rs_match,
+        rho_in;
+        order=parse_integer(request, "endpoint_series_order"),
+        dtype=Complex{T},
+    )
+end
+
+function branch_values(
+    ::Type{T}, request, omega::Complex{T}, match_radius::T, branch::Symbol
+) where {T<:AbstractFloat}
+    branch in (:xin, :xup, :xup_scattering) ||
+        error("unsupported homogeneous branch request")
     s = parse_integer(request, "s")
     ell = parse_integer(request, "ell")
     m = parse_integer(request, "m")
@@ -469,7 +740,6 @@ function branch_values(::Type{T}, request, omega::Complex{T}, match_radius::T) w
     end
     relative_tolerance = parse_real(T, request, "ode_relative_tolerance")
     absolute_tolerance = parse_real(T, request, "ode_absolute_tolerance")
-    order = parse_integer(request, "endpoint_series_order")
     rho_in = parse_real(T, request, "rho_in")
     rho_out = parse_real(T, request, "rho_out")
     rs_match = GSN.rstar_from_r(a, match_radius)
@@ -491,46 +761,69 @@ function branch_values(::Type{T}, request, omega::Complex{T}, match_radius::T) w
             ode_solution_observer=observe_ode_solution,
         )
     end
-    xin, _, _ = progress_operation("Xin") do
-        CF.solve_Xin(
-            s, m, a, beta_positive, beta_negative, omega, lambda,
-            observed_radial_map(radius_from_rho, "Xin", rho_in, rho_out),
-            rs_match, rho_in, rho_out;
-            initialconditions_order=order,
-            dtype=dtype,
-            reltol=relative_tolerance,
-            abstol=absolute_tolerance,
-            ode_observation_factory=ode_observation_factory,
-            ode_solution_observer=observe_ode_solution,
-        )
+
+    xin_match = nothing
+    xup_match = nothing
+    Cref = nothing
+    Cinc = nothing
+    if branch == :xin
+        xin_radius_from_rho = observed_radial_map(radius_from_rho, "Xin", rho_in, rho_out)
+        xin_match = progress_operation("Xin") do
+            solve_xin_at_match(
+                T,
+                request,
+                omega,
+                lambda,
+                xin_radius_from_rho,
+                beta_negative,
+                sign_negative,
+                rs_match,
+                rho_in,
+            )
+        end
+    elseif branch == :xup
+        xup_radius_from_rho = observed_radial_map(radius_from_rho, "Xup", rho_in, rho_out)
+        xup_match = progress_operation("Xup") do
+            solve_xup_at_match(
+                T,
+                request,
+                omega,
+                lambda,
+                xup_radius_from_rho,
+                beta_positive,
+                sign_positive,
+                rs_match,
+                rho_out,
+            )
+        end
+    else
+        # The direct coefficient determinant consumes only Xup.  Its outer-to-match
+        # and match-to-inner propagation is two homogeneous legs; Xin is absent
+        # entirely, improving on the earlier three-leg optimization target.
+        xup_radius_from_rho = observed_radial_map(radius_from_rho, "Xup", rho_in, rho_out)
+        Cref, Cinc = progress_operation("Xup") do
+            solve_xup_scattering_coefficients(
+                T,
+                request,
+                omega,
+                lambda,
+                xup_radius_from_rho,
+                beta_negative,
+                beta_positive,
+                sign_negative,
+                sign_positive,
+                rs_match,
+                rho_in,
+                rho_out,
+            )
+        end
     end
-    xup, _, _ = progress_operation("Xup") do
-        CF.solve_Xup(
-            s, m, a, beta_positive, beta_negative, omega, lambda,
-            observed_radial_map(radius_from_rho, "Xup", rho_in, rho_out),
-            rs_match, rho_in, rho_out;
-            initialconditions_order=order,
-            dtype=dtype,
-            reltol=relative_tolerance,
-            abstol=absolute_tolerance,
-            ode_observation_factory=ode_observation_factory,
-            ode_solution_observer=observe_ode_solution,
-        )
-    end
-    xin_match = xin(zero(T))
-    xup_match = xup(zero(T))
-    Cref, Cinc = CF.CrefCinc_SN_from_Xup(
-        s, m, a, beta_negative, omega, lambda, xup,
-        radius_from_rho, rs_match, rho_in;
-        order=order,
-        dtype=dtype,
-    )
-    iszero(Cinc) && error("outgoing-horizon normalization has zero Cinc")
-    xout_match = (xup_match .- Cref .* xin_match) ./ Cinc
+
     return (
-        xin=Complex{T}[xin_match[1], xin_match[2]],
-        xup=Complex{T}[xup_match[1], xup_match[2]],
-        xout=Complex{T}[xout_match[1], xout_match[2]],
+        xin=xin_match,
+        xup=xup_match,
+        Cref=Cref,
+        Cinc=Cinc,
         lambda=lambda,
     )
 end
@@ -543,94 +836,227 @@ function compact_profile(radius, centre, half_width, amplitude)
     return amplitude * exp(one(scaled) - inv(one(scaled) - scaled^2))
 end
 
-function integrate_real_branch(::Type{T}, request, omega::Complex{T}, lambda::Complex{T},
-                               start_radius::T, stop_radius::T, seed,
-                               amplitude::Complex{T};
-                               ode_leg="perturbed_real_radius") where {T<:AbstractFloat}
-    s = parse_integer(request, "s")
-    m = parse_integer(request, "m")
-    a = parse_real(T, request, "spin")
+function exterior_support_contract(::Type{T}, request, a::T, readout::T) where {T<:AbstractFloat}
+    lower = parse_real(T, request, "support_lower")
+    upper = parse_real(T, request, "support_upper")
     centre = parse_real(T, request, "support_centre")
     half_width = parse_real(T, request, "support_half_width")
-    relative_tolerance = parse_real(T, request, "ode_relative_tolerance")
-    absolute_tolerance = parse_real(T, request, "ode_absolute_tolerance")
-    support_count = parse_integer(request, "support_subinterval_count")
-    dtmax = min(T(0.2), T(2) * half_width / T(support_count))
+    half_width > zero(T) || error("support half_width must be positive")
+    lower < upper || error("support lower bound must be below upper bound")
+    geometry_tolerance = parse(T, "1e-14") * max(
+        one(T), abs(lower), abs(upper), abs(centre), abs(half_width)
+    )
+    isapprox(
+        lower, centre - half_width;
+        atol=geometry_tolerance,
+        rtol=zero(T),
+    ) || error("support lower bound is inconsistent with centre and half_width")
+    isapprox(
+        upper, centre + half_width;
+        atol=geometry_tolerance,
+        rtol=zero(T),
+    ) || error("support upper bound is inconsistent with centre and half_width")
+    lower > Kerr.r_plus(a) || error("exterior support is not outside the horizon")
+    upper < readout || error("exterior support must lie below the readout radius")
+    parse_integer(request, "support_subinterval_count") > 0 ||
+        error("support_subinterval_count must be positive")
+    return lower, upper
+end
 
-    function equation(state, _, radius)
-        w = Kerr.Delta(a, radius) / (radius^2 + a^2)
-        F = Potentials.sF(s, m, a, omega, lambda, radius)
-        U = Potentials.sU(s, m, a, omega, lambda, radius)
-        profile = compact_profile(radius, centre, half_width, amplitude)
-        X, Xstar = state
-        return Complex{T}[
-            Xstar / w,
-            (F * Xstar + U * X) / w - w * profile * X,
-        ]
-    end
+function radial_rhs!(du, state, parameters, radius)
+    w = Kerr.Delta(parameters.a, radius) / (radius^2 + parameters.a^2)
+    F = Potentials.sF(
+        parameters.s,
+        parameters.m,
+        parameters.a,
+        parameters.omega,
+        parameters.lambda,
+        radius,
+    )
+    U = Potentials.sU(
+        parameters.s,
+        parameters.m,
+        parameters.a,
+        parameters.omega,
+        parameters.lambda,
+        radius,
+    )
+    profile = compact_profile(
+        radius,
+        parameters.centre,
+        parameters.half_width,
+        parameters.amplitude,
+    )
+    du[1] = state[2] / w
+    du[2] = (F * state[2] + U * state[1]) / w - w * profile * state[1]
+    return nothing
+end
 
+function solve_radial_endpoint(
+    ::Type{T},
+    request,
+    omega::Complex{T},
+    lambda::Complex{T},
+    start_radius::T,
+    stop_radius::T,
+    seed,
+    amplitude::Complex{T},
+    dtmax::T;
+    ode_leg::String,
+) where {T<:AbstractFloat}
+    parameters = (
+        s=parse_integer(request, "s"),
+        m=parse_integer(request, "m"),
+        a=parse_real(T, request, "spin"),
+        omega=omega,
+        lambda=lambda,
+        centre=parse_real(T, request, "support_centre"),
+        half_width=parse_real(T, request, "support_half_width"),
+        amplitude=amplitude,
+    )
     initial = Complex{T}[seed[1], seed[2]]
-    problem = ODEProblem(equation, initial, (start_radius, stop_radius))
+    problem = ODEProblem(
+        radial_rhs!,
+        initial,
+        (start_radius, stop_radius),
+        parameters,
+    )
+    algorithm = AutoVern9(Rosenbrock23(autodiff=false))
     observation_callback, observation = ode_observation_factory(
-        ode_leg, (start_radius, stop_radius), nothing
+        ode_leg, (start_radius, stop_radius), algorithm
     )
     solve_arguments = observation_callback === nothing ?
         NamedTuple() : (; callback=observation_callback)
     solution = solve(
         problem,
-        AutoVern9(Rosenbrock23(autodiff=false));
-        reltol=relative_tolerance,
-        abstol=absolute_tolerance,
+        algorithm;
+        reltol=parse_real(T, request, "ode_relative_tolerance"),
+        abstol=parse_real(T, request, "ode_absolute_tolerance"),
         dtmax=dtmax,
         maxiters=10^7,
+        tstops=[stop_radius],
+        save_everystep=false,
+        save_start=false,
+        save_end=true,
+        dense=false,
         solve_arguments...
     )
     observe_ode_solution(ode_leg, solution, observation)
-    final = solution(stop_radius)
-    return Complex{T}[final[1], final[2]]
+    endpoint = solution.u[end]
+    return Complex{T}[endpoint[1], endpoint[2]]
+end
+
+function integrate_real_branch(
+    ::Type{T},
+    request,
+    omega::Complex{T},
+    lambda::Complex{T},
+    start_radius::T,
+    stop_radius::T,
+    seed,
+    amplitude::Complex{T};
+    ode_leg="perturbed_Xin",
+) where {T<:AbstractFloat}
+    lower = parse_real(T, request, "support_lower")
+    upper = parse_real(T, request, "support_upper")
+    half_width = parse_real(T, request, "support_half_width")
+    support_count = parse_integer(request, "support_subinterval_count")
+    start_radius == lower ||
+        error("perturbed integration must start at the compact support boundary")
+    stop_radius >= upper ||
+        error("perturbed integration must reach the compact support boundary")
+
+    fine_dtmax = min(T(0.2), T(2) * half_width / T(support_count))
+    support_endpoint = solve_radial_endpoint(
+        T,
+        request,
+        omega,
+        lambda,
+        lower,
+        upper,
+        seed,
+        amplitude,
+        fine_dtmax;
+        ode_leg="$(ode_leg)_compact_support",
+    )
+    stop_radius == upper && return support_endpoint
+
+    vacuum_tail_dtmax = T(0.2)
+    return solve_radial_endpoint(
+        T,
+        request,
+        omega,
+        lambda,
+        upper,
+        stop_radius,
+        support_endpoint,
+        zero(amplitude),
+        vacuum_tail_dtmax;
+        ode_leg="$(ode_leg)_vacuum_tail",
+    )
 end
 
 function determinant(::Type{T}, request, omega::Complex{T}, amplitude::Complex{T}) where {T<:AbstractFloat}
     mechanism = string(required(request, "mechanism_id"))
+    mechanism in ALLOWED_MECHANISMS ||
+        error("unsupported mechanism_id $(repr(mechanism))")
     readout = parse_real(T, request, "readout_radius")
     a = parse_real(T, request, "spin")
     m = parse_integer(request, "m")
 
     if mechanism == "horizon-admittance"
-        branches = branch_values(T, request, omega, readout)
+        branches = branch_values(T, request, omega, readout, :xup_scattering)
         p_h = omega - T(m) * Kerr.omega_horizon(a)
         denominator = T(2) * im * p_h - amplitude
-        iszero(denominator) && error("zero horizon chart denominator")
+        denominator_abs = abs(denominator)
+        iszero(denominator_abs) && error("zero horizon chart denominator")
+        chart_scale_abs = max(T(2) * abs(p_h), abs(amplitude))
+        chart_condition_abs = denominator_abs / chart_scale_abs
+        chart_condition_threshold = sqrt(eps(T))
+        isfinite(chart_condition_abs) &&
+            chart_condition_abs > chart_condition_threshold ||
+            error("horizon chart denominator is numerically singular")
         reflectivity = amplitude / denominator
-        horizon = branches.xin .+ reflectivity .* branches.xout
-        return progress_operation("Wronskian") do
-            wronskian(horizon, branches.xup)
-        end
+        chart_ratio = iszero(p_h) ? T(Inf) : abs(amplitude) / (T(2) * abs(p_h))
+        progress_emit("horizon_chart_evaluated"; payload=Dict(
+            "Cinc" => progress_complex(branches.Cinc),
+            "Cref" => progress_complex(branches.Cref),
+            "horizon_frequency" => progress_complex(p_h),
+            "reflectivity" => progress_complex(reflectivity),
+            "chart_denominator" => progress_complex(denominator),
+            "Cinc_abs" => string(abs(branches.Cinc)),
+            "Cref_abs" => string(abs(branches.Cref)),
+            "horizon_frequency_abs" => string(abs(p_h)),
+            "reflectivity_abs" => string(abs(reflectivity)),
+            "chart_denominator_abs" => string(denominator_abs),
+            "chart_scale_abs" => string(chart_scale_abs),
+            "chart_condition_abs" => string(chart_condition_abs),
+            "chart_condition_threshold" => string(chart_condition_threshold),
+            "chart_ratio" => string(chart_ratio),
+        ))
+        return branches.Cinc - reflectivity * branches.Cref
     end
 
-    lower = parse_real(T, request, "support_lower")
-    upper = parse_real(T, request, "support_upper")
-    lower > Kerr.r_plus(a) || error("exterior support is not outside the horizon")
-    upper < readout || error("exterior support must lie below the readout radius")
-    branches = branch_values(T, request, omega, lower)
+    lower, _ = exterior_support_contract(T, request, a, readout)
+    lower_branches = branch_values(T, request, omega, lower, :xin)
+    readout_branches = branch_values(T, request, omega, readout, :xup)
     perturbed_in = progress_operation("perturbed integration"; payload=Dict(
         "branch" => "Xin",
     )) do
         integrate_real_branch(
-            T, request, omega, branches.lambda, lower, readout, branches.xin, amplitude;
-            ode_leg="perturbed_Xin_real_radius",
-        )
-    end
-    perturbed_up = progress_operation("perturbed integration"; payload=Dict(
-        "branch" => "Xup",
-    )) do
-        integrate_real_branch(
-            T, request, omega, branches.lambda, lower, readout, branches.xup, amplitude;
-            ode_leg="perturbed_Xup_real_radius",
+            T,
+            request,
+            omega,
+            lower_branches.lambda,
+            lower,
+            readout,
+            lower_branches.xin,
+            amplitude;
+            ode_leg="perturbed_Xin",
         )
     end
     return progress_operation("Wronskian") do
-        wronskian(perturbed_in, perturbed_up)
+        wronskian(perturbed_in, readout_branches.xup)
     end
 end
 
@@ -741,7 +1167,7 @@ function bounded_newton(::Type{T}, request, initial::Complex{T}, amplitude::Comp
                 "resulting_determinant_abs" => string(magnitude),
                 "elapsed_seconds" => (time_ns() - iteration_started) / 1.0e9,
             ))
-            return value, magnitude, derivative_abs, true
+            return value, magnitude, derivative, true
         end
         step = raw_step
         maximum_step = parse(T, "0.006")
@@ -776,17 +1202,18 @@ function bounded_newton(::Type{T}, request, initial::Complex{T}, amplitude::Comp
                 accepted = true
                 selected_damping = damping
                 resulting_abs = candidate_abs
+                if candidate_abs < best_residual
+                    best_value, best_residual = candidate, candidate_abs
+                end
                 break
             end
         end
-        if !accepted
-            value -= parse(T, "0.125") * step
-            resulting_abs = candidate_abs
-            carried_value = value
-            carried_residual = candidate_residual
-            carried_available = true
+        applied_step = if accepted
+            selected_damping * step
+        else
+            selected_damping = zero(T)
+            zero(Complex{T})
         end
-        applied_step = selected_damping * step
         progress_emit("newton_iteration_completed"; context=newton_context, payload=Dict(
             "derivative_abs" => string(derivative_abs),
             "raw_step" => progress_complex(raw_step),
@@ -799,28 +1226,94 @@ function bounded_newton(::Type{T}, request, initial::Complex{T}, amplitude::Comp
             "resulting_determinant_abs" => string(resulting_abs),
             "elapsed_seconds" => (time_ns() - iteration_started) / 1.0e9,
         ))
+        !accepted && break
     end
     return best_value, best_residual, nothing, false
 end
 
 numeric_text(value) = string(value)
 
+function final_derivative(
+    ::Type{T}, request, root::Complex{T}, amplitude::Complex{T},
+    offset::Complex{T}, label::String,
+) where {T<:AbstractFloat}
+    return (
+        determinant_progress(
+            T, request, root + offset, amplitude, "$(label) +", root
+        ) -
+        determinant_progress(
+            T, request, root - offset, amplitude, "$(label) -", root
+        )
+    ) / (T(2) * offset)
+end
+
 function solve_once(::Type{T}, request, initial::Complex{T}, amplitude::Complex{T}) where {T<:AbstractFloat}
-    root, residual, accepted_derivative, _ = bounded_newton(T, request, initial, amplitude)
-    derivative_abs = accepted_derivative
-    if isnothing(accepted_derivative)
-        root_step = parse_real(T, request, "frequency_step") * (one(T) + abs(root))
-        root_derivative = (
-            determinant_progress(T, request, root + root_step, amplitude, "final derivative +h", root) -
-            determinant_progress(T, request, root - root_step, amplitude, "final derivative -h", root)
-        ) / (T(2) * root_step)
-        derivative_abs = abs(root_derivative)
-    end
-    isfinite(derivative_abs) && derivative_abs > zero(T) ||
-        error("determinant frequency derivative is unusable")
+    root, residual, accepted_derivative, newton_converged =
+        bounded_newton(T, request, initial, amplitude)
+    h = parse_real(T, request, "frequency_step") * (one(T) + abs(root))
+    real_offset = Complex{T}(h, zero(T))
+    derivative_real_base = isnothing(accepted_derivative) ?
+        final_derivative(
+            T, request, root, amplitude, real_offset, "final derivative h"
+        ) : accepted_derivative
+    derivative_real_half = final_derivative(
+        T, request, root, amplitude, real_offset / T(2), "final derivative h/2"
+    )
+    derivative_real_double = final_derivative(
+        T, request, root, amplitude, T(2) * real_offset, "final derivative 2h"
+    )
+    derivative_imaginary = final_derivative(
+        T,
+        request,
+        root,
+        amplitude,
+        Complex{T}(zero(T), h),
+        "final derivative ih",
+    )
+    fine_step_difference_abs = abs(
+        derivative_real_half - derivative_real_base
+    )
+    coarse_step_difference_abs = abs(
+        derivative_real_base - derivative_real_double
+    )
+    complex_axis_difference_abs = abs(
+        derivative_imaginary - derivative_real_half
+    )
+    real_step_convergent =
+        fine_step_difference_abs <= coarse_step_difference_abs
+    complex_axis_consistent =
+        complex_axis_difference_abs <= coarse_step_difference_abs
+    real_step_convergent && complex_axis_consistent ||
+        error("determinant frequency derivative estimates do not agree")
+    derivative_uncertainty_abs = maximum((
+        fine_step_difference_abs,
+        abs(derivative_real_double - derivative_real_half),
+        complex_axis_difference_abs,
+    ))
+    derivative_abs = abs(derivative_real_half)
+    derivative_lower_bound_abs = derivative_abs - derivative_uncertainty_abs
+    isfinite(derivative_abs) && isfinite(derivative_uncertainty_abs) &&
+        derivative_lower_bound_abs > zero(T) ||
+        error("determinant frequency derivative controls are unusable")
+    correction_upper_bound = residual / derivative_lower_bound_abs
     tolerance = parse_real(T, request, "root_correction_tolerance")
-    converged = residual / derivative_abs <= tolerance
-    return root, residual, derivative_abs, converged
+    converged = newton_converged && correction_upper_bound <= tolerance
+    progress_emit("derivative_control_completed"; payload=Dict(
+        "derivative_real_half" => progress_complex(derivative_real_half),
+        "derivative_real_base" => progress_complex(derivative_real_base),
+        "derivative_real_double" => progress_complex(derivative_real_double),
+        "derivative_imaginary" => progress_complex(derivative_imaginary),
+        "fine_step_difference_abs" => string(fine_step_difference_abs),
+        "coarse_step_difference_abs" => string(coarse_step_difference_abs),
+        "complex_axis_difference_abs" => string(complex_axis_difference_abs),
+        "real_step_convergent" => real_step_convergent,
+        "complex_axis_consistent" => complex_axis_consistent,
+        "derivative_uncertainty_abs" => string(derivative_uncertainty_abs),
+        "derivative_lower_bound_abs" => string(derivative_lower_bound_abs),
+        "correction_upper_bound" => string(correction_upper_bound),
+        "accepted" => converged,
+    ))
+    return root, residual, derivative_lower_bound_abs, converged
 end
 
 function solve_phase(
@@ -890,7 +1383,7 @@ function solve_phase(
             )
         end
         if actual_kind != "FALLBACK_BACKGROUND" && fallback_initial !== nothing
-            if !result[4] || abs(result[1] - fallback_initial) > T("0.005")
+            if !result[4] || abs(result[1] - fallback_initial) > parse_real(T, request, "branch_enclosure_radius_abs")
                 if !result[4]
                     fallback_reason = "PREDICTOR_NEWTON_FAILED"
                 else
@@ -966,7 +1459,7 @@ function result_fields(::Type{T}, request, digits::Int, bits::Int) where {T<:Abs
             T, request, "primary_predictor_re", "primary_predictor_im"
         )
         if isfinite(real(predictor)) && isfinite(imag(predictor)) &&
-           abs(predictor - omega) <= T("0.005")
+           abs(predictor - omega) <= parse_real(T, request, "branch_enclosure_radius_abs")
             primary_initial = predictor
             fallback_initial = omega
             primary_seed_kind = primary_requested_seed_kind
@@ -1004,7 +1497,7 @@ function result_fields(::Type{T}, request, digits::Int, bits::Int) where {T<:Abs
             T, request, "SEED-PATH", alternate, amplitude;
             seed_kind="INDEPENDENT_SEED_PATH",
         )
-    branch_tolerance = T("0.005")
+    branch_tolerance = parse_real(T, request, "branch_enclosure_radius_abs")
     branch_valid = abs(root - omega) <= branch_tolerance && all(
         abs(candidate - root) <= branch_tolerance
         for candidate in (truncation_root, resolution_root, seed_path_root)
@@ -1029,7 +1522,7 @@ function result_fields(::Type{T}, request, digits::Int, bits::Int) where {T<:Abs
         "root_residual_abs" => numeric_text(residual),
         "root_derivative_abs" => numeric_text(derivative_abs),
         "root_converged" => converged,
-        "branch_authentication_contract_version" => 2,
+        "branch_authentication_contract_version" => 3,
         "root_branch_continuation_valid" => branch_valid,
         "branch_tolerance_abs" => numeric_text(branch_tolerance),
         "root_displacement_abs" => numeric_text(abs(root - omega)),
