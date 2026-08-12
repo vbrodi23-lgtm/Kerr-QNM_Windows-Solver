@@ -40,6 +40,7 @@ from .root_readout_cache import (
     RootReadoutStore,
     runtime_identity_sha256,
 )
+from .spectrum import load_spectrum_catalog
 
 
 _PROMOTED_DIGITS = frozenset({80, 120})
@@ -58,9 +59,53 @@ _WINDOWS_JOB_BOOTSTRAP = (
     "token=sys.stdin.read(1); "
     "sys.exit(125 if token != 'G' else subprocess.run(sys.argv[1:]).returncode)"
 )
-_BRANCH_TOLERANCE_DECIMAL = Decimal(
-    str(ROOT_BRANCH_CONTINUATION_TOLERANCE_ABS)
-)
+def _mode_specific_branch_enclosure_radius(
+    job: ResponseComponentJob,
+) -> float:
+    """Return a radius below half the nearest authenticated overtone spacing."""
+
+    separations: list[float] = []
+    evidence = job.root.owner_record.get("numerical_evidence")
+    if isinstance(evidence, Mapping):
+        for field in (
+            "assigned_separation_abs",
+            "nearest_overtone_separation_abs",
+        ):
+            value = evidence.get(field)
+            if (
+                not isinstance(value, bool)
+                and isinstance(value, (int, float))
+                and math.isfinite(float(value))
+                and float(value) > 0.0
+            ):
+                separations.append(float(value))
+
+    catalog = load_spectrum_catalog()
+    for candidate in (*catalog.base.roots, *catalog.overlay.roots):
+        if (
+            candidate.ell == job.mode.ell
+            and candidate.m == job.mode.m
+            and candidate.n != job.mode.n
+            and candidate.spin_hex == job.root.spin_binary64_hex
+        ):
+            separation = abs(
+                complex(candidate.omega_re, candidate.omega_im)
+                - job.root.omega
+            )
+            if math.isfinite(separation) and separation > 0.0:
+                separations.append(separation)
+
+    if not separations:
+        raise ValueError(
+            "authenticated root has no mode-specific overtone separation"
+        )
+    radius = min(
+        ROOT_BRANCH_CONTINUATION_TOLERANCE_ABS,
+        0.45 * min(separations),
+    )
+    if not math.isfinite(radius) or radius <= 0.0:
+        raise ValueError("mode-specific branch enclosure radius is invalid")
+    return radius
 
 
 class JuliaResponseBackendError(RuntimeError):
@@ -1008,6 +1053,9 @@ def _precision_policy(job: ResponseComponentJob, digits: int, refinement: int) -
         "angular_pad": 18 + 8 * refinement,
         "rho_in": "-5000",
         "rho_out": "5000",
+        "branch_enclosure_radius_abs": format(
+            _mode_specific_branch_enclosure_radius(job), ".17g"
+        ),
         "max_newton_iterations": 16,
     }
 
@@ -1126,14 +1174,13 @@ class JuliaPrecisionRootBackend:
     ) -> RootReadout:
         if job.backend_identity != self.identity:
             raise ValueError("response job backend identity does not match Julia adapter")
-        response = self.adapter.evaluate(
-            self._request(
-                job,
-                complex(amplitude),
-                primary_predictor,
-                primary_predictor_kind,
-            )
+        request = self._request(
+            job,
+            complex(amplitude),
+            primary_predictor,
+            primary_predictor_kind,
         )
+        response = self.adapter.evaluate(request)
         expected_fields = {
             "schema_version",
             "status",
@@ -1164,7 +1211,7 @@ class JuliaPrecisionRootBackend:
             or response["working_precision_bits"]
             != math.ceil(self.digits * math.log2(10)) + 32
             or not isinstance(response["root_converged"], bool)
-            or response["branch_authentication_contract_version"] != 2
+            or response["branch_authentication_contract_version"] != 3
             or not isinstance(response["root_branch_continuation_valid"], bool)
             or (
                 response["root_converged"]
@@ -1179,6 +1226,14 @@ class JuliaPrecisionRootBackend:
         branch_tolerance_decimal = _finite_decimal_text(
             response["branch_tolerance_abs"],
             "branch_tolerance_abs",
+            nonnegative=True,
+        )
+        policy = request["policy"]
+        if not isinstance(policy, Mapping):
+            raise JuliaResponseBackendError("M02 Julia request policy is invalid")
+        expected_branch_tolerance_decimal = _finite_decimal_text(
+            policy["branch_enclosure_radius_abs"],
+            "branch_enclosure_radius_abs",
             nonnegative=True,
         )
         root_real_decimal = _finite_decimal_text(
@@ -1224,7 +1279,7 @@ class JuliaPrecisionRootBackend:
             # this bound allows only its final serialized decimal place.
             serialization_allowance = Decimal(1).scaleb(-self.digits)
             inconsistent_branch_evidence = (
-                abs(branch_tolerance_decimal - _BRANCH_TOLERANCE_DECIMAL)
+                abs(branch_tolerance_decimal - expected_branch_tolerance_decimal)
                 > serialization_allowance
                 or abs(derived_displacement - root_displacement_decimal)
                 > serialization_allowance
