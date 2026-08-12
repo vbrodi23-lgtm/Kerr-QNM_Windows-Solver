@@ -83,9 +83,9 @@ class FakeAdapter:
             "root_residual_abs": "1e-60",
             "root_derivative_abs": "2.5",
             "root_converged": True,
-            "branch_authentication_contract_version": 2,
+            "branch_authentication_contract_version": 3,
             "root_branch_continuation_valid": True,
-            "branch_tolerance_abs": "0.005",
+            "branch_tolerance_abs": request["policy"]["branch_enclosure_radius_abs"],
             "root_displacement_abs": "0",
             "truncation_radius_abs": "2e-55",
             "resolution_radius_abs": "3e-55",
@@ -235,7 +235,7 @@ class JuliaResponseBackendTests(unittest.TestCase):
         self.assertIn('fallback_reason = "PREDICTOR_SOLVE_ERROR"', worker)
         self.assertIn("failure isa InterruptException && rethrow()", worker)
         self.assertIn('"INDEPENDENT_SEED_PATH"', worker)
-        self.assertIn('"branch_authentication_contract_version" => 2', worker)
+        self.assertIn('"branch_authentication_contract_version" => 3', worker)
         self.assertIn('"root_branch_continuation_valid" => branch_valid', worker)
         self.assertIn('"branch_tolerance_abs" => numeric_text(branch_tolerance)', worker)
         self.assertIn('"root_displacement_abs" => numeric_text(abs(root - omega))', worker)
