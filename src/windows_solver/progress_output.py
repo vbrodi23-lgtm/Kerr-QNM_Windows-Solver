@@ -28,6 +28,7 @@ _QUIET_KINDS = frozenset(
     {
         ProgressEventKind.CAMPAIGN_COMPLETED,
         ProgressEventKind.CAMPAIGN_FAILED,
+        ProgressEventKind.CAMPAIGN_INTERRUPTED,
         ProgressEventKind.LEAF_STARTED,
         ProgressEventKind.LEAF_REUSED,
         ProgressEventKind.LEAF_CACHE_STALE,
@@ -35,6 +36,7 @@ _QUIET_KINDS = frozenset(
         ProgressEventKind.LEAF_CACHE_PUBLICATION_FAILED,
         ProgressEventKind.LEAF_COMPLETED,
         ProgressEventKind.LEAF_FAILED,
+        ProgressEventKind.LEAF_INTERRUPTED,
         ProgressEventKind.ERROR,
     }
 )
@@ -59,6 +61,7 @@ _NORMAL_KINDS = _QUIET_KINDS | frozenset(
         ProgressEventKind.REQUEST_VALIDATED,
         ProgressEventKind.REQUEST_COMPLETED,
         ProgressEventKind.REQUEST_FAILED,
+        ProgressEventKind.REQUEST_INTERRUPTED,
         ProgressEventKind.LEAF_CACHE_PUBLISHED,
         ProgressEventKind.ROOT_READOUT_REUSED,
     }
@@ -78,8 +81,10 @@ _TERMINAL_KINDS = frozenset(
     {
         ProgressEventKind.CAMPAIGN_COMPLETED,
         ProgressEventKind.CAMPAIGN_FAILED,
+        ProgressEventKind.CAMPAIGN_INTERRUPTED,
         ProgressEventKind.LEAF_COMPLETED,
         ProgressEventKind.LEAF_FAILED,
+        ProgressEventKind.LEAF_INTERRUPTED,
         ProgressEventKind.ERROR,
     }
 )
@@ -88,9 +93,11 @@ _FORCED_STATUS_KINDS = frozenset(
         ProgressEventKind.REQUEST_STARTED,
         ProgressEventKind.REQUEST_COMPLETED,
         ProgressEventKind.REQUEST_FAILED,
+        ProgressEventKind.REQUEST_INTERRUPTED,
         ProgressEventKind.CAMPAIGN_STARTED,
         ProgressEventKind.CAMPAIGN_COMPLETED,
         ProgressEventKind.CAMPAIGN_FAILED,
+        ProgressEventKind.CAMPAIGN_INTERRUPTED,
         ProgressEventKind.LEAF_STARTED,
         ProgressEventKind.LEAF_REUSED,
         ProgressEventKind.LEAF_CACHE_STALE,
@@ -99,6 +106,7 @@ _FORCED_STATUS_KINDS = frozenset(
         ProgressEventKind.SOLVED_LEAF_CACHE_SCANNED,
         ProgressEventKind.LEAF_COMPLETED,
         ProgressEventKind.LEAF_FAILED,
+        ProgressEventKind.LEAF_INTERRUPTED,
         ProgressEventKind.PRECISION_STAGE_STARTED,
         ProgressEventKind.ODE_SOLVE_COMPLETED,
         ProgressEventKind.ODE_SOLVE_FAILED,
@@ -115,6 +123,7 @@ _DASHBOARD_FORCED_KINDS = frozenset(
         ProgressEventKind.CAMPAIGN_STARTED,
         ProgressEventKind.CAMPAIGN_COMPLETED,
         ProgressEventKind.CAMPAIGN_FAILED,
+        ProgressEventKind.CAMPAIGN_INTERRUPTED,
         ProgressEventKind.PRECISION_STAGE_STARTED,
         ProgressEventKind.PRECISION_STAGE_COMPLETED,
         ProgressEventKind.ROOT_PHASE_STARTED,
@@ -126,6 +135,7 @@ _DASHBOARD_FORCED_KINDS = frozenset(
         ProgressEventKind.LEAF_COMPLETED,
         ProgressEventKind.LEAF_REUSED,
         ProgressEventKind.LEAF_FAILED,
+        ProgressEventKind.LEAF_INTERRUPTED,
     }
 )
 _DASHBOARD_LIVE_KINDS = frozenset(
@@ -253,6 +263,7 @@ class CampaignProgressReporter:
             maxlen=_LEAF_TIMING_WINDOW
         )
         self._settled_leaf_ids: set[object] = set()
+        self._terminal_computed_leaf_ids: set[object] = set()
         self._accepted_leaf_ids: set[object] = set()
         self._rejected_leaf_ids: set[object] = set()
         self._indeterminate_leaf_ids: set[object] = set()
@@ -261,6 +272,7 @@ class CampaignProgressReporter:
         self._last_terminal_leaf: object | None = None
         self._last_terminal_state: object | None = None
         self._checkpoint_status = "not yet written"
+        self._checkpoint_leaf_ids: set[object] = set()
         self._campaign_status = "PENDING"
         self._cache_compatible = 0
         self._cache_stored = 0
@@ -340,6 +352,17 @@ class CampaignProgressReporter:
                 self.checkpoint,
                 run_provenance=self._report_run_provenance,
             )
+            for row in self._campaign_report_model.leaf_rows:
+                leaf_id = row.get("leaf_id")
+                state = row.get("terminal_state")
+                if leaf_id is None or state == "PENDING":
+                    continue
+                self._checkpoint_leaf_ids.add(leaf_id)
+                if state in {"PRODUCED", "UNRESOLVED"}:
+                    self._settled_leaf_ids.add(leaf_id)
+                    self._terminal_computed_leaf_ids.add(leaf_id)
+            if self._checkpoint_leaf_ids:
+                self._checkpoint_status = "written"
         except Exception as error:
             self._report_failure(error)
 
@@ -432,6 +455,11 @@ class CampaignProgressReporter:
                 if math.isfinite(duration) and duration >= 0:
                     self._completed_leaf_seconds.append(duration)
             self._settled_leaf_ids.add(leaf_key)
+            if event.kind in {
+                ProgressEventKind.LEAF_COMPLETED,
+                ProgressEventKind.LEAF_REUSED,
+            }:
+                self._terminal_computed_leaf_ids.add(leaf_key)
         if event.kind is ProgressEventKind.ROOT_PHASE_STARTED:
             self._root_started[root_key] = now
         if (
@@ -915,6 +943,13 @@ class CampaignProgressReporter:
             if next_leaf is not None:
                 self._discard_leaf_outcomes(next_leaf)
                 self._failed_leaf_ids.add(next_leaf)
+        elif kind == ProgressEventKind.LEAF_INTERRUPTED.value:
+            self._dashboard_state["leaf_status"] = "INTERRUPTED"
+            self._dashboard_state["precision_status"] = "INTERRUPTED"
+            self._dashboard_state["root_status"] = "INTERRUPTED"
+            self._dashboard_state["execution_state"] = "INTERRUPTED"
+            if next_leaf is not None:
+                self._discard_leaf_outcomes(next_leaf)
         elif kind == ProgressEventKind.ROOT_PHASE_STARTED.value:
             self._dashboard_state["root_status"] = "SEARCHING"
         elif kind == ProgressEventKind.ROOT_PHASE_COMPLETED.value:
@@ -960,6 +995,8 @@ class CampaignProgressReporter:
             self._checkpoint_status = "writing"
         elif kind == ProgressEventKind.CHECKPOINT_WRITTEN.value:
             self._checkpoint_status = "written"
+            if next_leaf is not None:
+                self._checkpoint_leaf_ids.add(next_leaf)
         elif kind == ProgressEventKind.CAMPAIGN_STARTED.value:
             self._campaign_status = "RUNNING"
         elif kind == ProgressEventKind.CAMPAIGN_COMPLETED.value:
@@ -974,9 +1011,21 @@ class CampaignProgressReporter:
             self._campaign_status = "FAILED"
             self._dashboard_state["root_status"] = "FAILED"
             self._dashboard_state["execution_state"] = "FAILED"
+        elif kind == ProgressEventKind.CAMPAIGN_INTERRUPTED.value:
+            self._campaign_status = "INTERRUPTED"
+            if self.checkpoint.is_file():
+                self._refresh_campaign_reports()
+            if self._dashboard_state.get("leaf_status") == "RUNNING":
+                self._dashboard_state["leaf_status"] = "INTERRUPTED"
+                self._dashboard_state["precision_status"] = "INTERRUPTED"
+            self._dashboard_state["root_status"] = "INTERRUPTED"
+            self._dashboard_state["execution_state"] = "INTERRUPTED"
         elif kind == ProgressEventKind.REQUEST_FAILED.value:
             self._dashboard_state["root_status"] = "FAILED"
             self._dashboard_state["execution_state"] = "FAILED"
+        elif kind == ProgressEventKind.REQUEST_INTERRUPTED.value:
+            self._dashboard_state["root_status"] = "INTERRUPTED"
+            self._dashboard_state["execution_state"] = "INTERRUPTED"
 
     def _promotion_reason(
         self, leaf_id: object, precision_digits: object
@@ -1043,8 +1092,8 @@ class CampaignProgressReporter:
         leaf_id = self._dashboard_state.get("leaf_id")
         return {
             "leaf_id": leaf_id,
-            "terminal_computed": leaf_id in self._settled_leaf_ids,
-            "checkpoint_saved": self._checkpoint_status == "written",
+            "terminal_computed": leaf_id in self._terminal_computed_leaf_ids,
+            "checkpoint_saved": leaf_id in self._checkpoint_leaf_ids,
             "receipt_published": leaf_id in self._cache_published_leaf_ids,
             "publication_failed": leaf_id in self._cache_publication_failures,
         }

@@ -554,6 +554,7 @@ class PublicSurfaceTests(unittest.TestCase):
     def test_m02_launcher_runs_the_full_selection_and_can_rebuild_runtime(self) -> None:
         root = Path(__file__).resolve().parents[1]
         launcher = (root / "m02.ps1").read_text(encoding="utf-8")
+        solver_launcher = (root / "solver.ps1").read_text(encoding="utf-8")
         selection = json.loads(
             (root / "examples" / "m02-campaign.json").read_text(encoding="utf-8")
         )
@@ -570,6 +571,11 @@ class PublicSurfaceTests(unittest.TestCase):
         self.assertIn('[ValidateSet("quiet", "normal", "trace")]', launcher)
         self.assertIn('[string]$Progress = "normal"', launcher)
         self.assertIn('"--progress"', launcher)
+        self.assertIn("if ($CommandExitCode -eq 130)", launcher)
+        self.assertIn("exit 130", launcher)
+        self.assertIn("PipelineStoppedException", launcher)
+        self.assertIn("PipelineStoppedException", solver_launcher)
+        self.assertIn("-1073741510", solver_launcher)
         self.assertIn('"campaign-plan",\n        $Selection\n', launcher)
         self.assertEqual(launcher.count("$Selection,"), 2)
         self.assertEqual(launcher.count("\n        $Checkpoint,\n"), 2)

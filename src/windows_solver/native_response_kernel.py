@@ -24,6 +24,7 @@ from typing import Callable, Mapping
 
 from .response_engine import (
     BackendIdentity,
+    DiagnosticRootReadout,
     DeterminantPartials,
     ExteriorPerturbation,
     HorizonPerturbation,
@@ -74,6 +75,8 @@ def _progress_suboperation(name: str, **payload: object):
         )
         try:
             yield
+        except KeyboardInterrupt:
+            raise
         except BaseException as error:
             emit_progress(
                 ProgressEventKind.ERROR,
@@ -457,10 +460,16 @@ class VettedNativeDeterminantKernel:
                 )
                 return result
 
-        best = (value, abs(evaluated(value, "initial best", value)))
+        initial_residual = evaluated(value, "initial best", value)
+        carried: tuple[complex, complex] | None = (value, initial_residual)
+        best = (value, abs(initial_residual))
         for iteration in range(1, 13):
             iteration_started = time.monotonic()
-            residual = evaluated(value, "residual", value)
+            if carried is not None and carried[0] == value:
+                residual = carried[1]
+            else:
+                residual = evaluated(value, "residual", value)
+            carried = None
             magnitude = abs(residual)
             if magnitude < best[1]:
                 best = value, magnitude
@@ -538,12 +547,14 @@ class VettedNativeDeterminantKernel:
                     )
                     if candidate_abs < magnitude:
                         value = candidate
+                        carried = (candidate, candidate_residual)
                         selected_damping = damping
                         resulting_abs = candidate_abs
                         accepted = True
                         break
                 if not accepted:
                     value -= 0.125 * step
+                    carried = (value, candidate_residual)
                     resulting_abs = candidate_abs
                 applied_step = selected_damping * step
                 emit_progress(
@@ -796,7 +807,7 @@ class VettedNativeDeterminantKernel:
         truncation_policy = replace(
             policy, endpoint_series_order=policy.endpoint_series_order + 8
         )
-        truncation_root, _, _, truncation_converged = solve_phase(
+        truncation_root, truncation_residual, truncation_derivative, truncation_converged = solve_phase(
             "TRUNCATION",
             self._standard_sn(job, truncation_policy),
             truncation_policy,
@@ -810,7 +821,7 @@ class VettedNativeDeterminantKernel:
             ode_absolute_tolerance=policy.ode_absolute_tolerance / 2.0,
             support_subinterval_count=policy.support_subinterval_count * 2,
         )
-        resolution_root, _, _, resolution_converged = solve_phase(
+        resolution_root, resolution_residual, resolution_derivative, resolution_converged = solve_phase(
             "RESOLUTION",
             self._standard_sn(job, resolution_policy),
             resolution_policy,
@@ -821,7 +832,7 @@ class VettedNativeDeterminantKernel:
         alternate_guess = background_omega + complex(2.5e-4, 1.25e-4) * (
             1.0 + abs(background_omega)
         )
-        seed_path_root, _, _, seed_path_converged = solve_phase(
+        seed_path_root, seed_path_residual, seed_path_derivative, seed_path_converged = solve_phase(
             "SEED-PATH",
             primary_sn,
             policy,
@@ -862,6 +873,26 @@ class VettedNativeDeterminantKernel:
             truncation_radius=abs(truncation_root - root),
             resolution_radius=abs(resolution_root - root),
             seed_path_radius=abs(seed_path_root - root),
+            diagnostic_readouts={
+                "truncation": DiagnosticRootReadout(
+                    truncation_root - root,
+                    truncation_residual,
+                    truncation_derivative,
+                    truncation_converged,
+                ),
+                "resolution": DiagnosticRootReadout(
+                    resolution_root - root,
+                    resolution_residual,
+                    resolution_derivative,
+                    resolution_converged,
+                ),
+                "seed-path": DiagnosticRootReadout(
+                    seed_path_root - root,
+                    seed_path_residual,
+                    seed_path_derivative,
+                    seed_path_converged,
+                ),
+            },
         )
 
     def evaluate_root_with_predictor_kind(

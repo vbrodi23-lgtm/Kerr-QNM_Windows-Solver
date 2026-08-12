@@ -22,6 +22,7 @@ from windows_solver.response_batches import (
     PrecisionCapabilities,
     StageOutcome,
     _authenticated_solved_leaf_lookup,
+    _validate_component_result,
     _validate_cacheable_leaf_record,
     build_campaign_plan,
     build_campaign_selection,
@@ -34,6 +35,8 @@ from windows_solver.response_engine import (
     BackendIdentity,
     ComponentResult,
     ComponentStatus,
+    DiagnosticRootReadout,
+    LadderLevel,
     NumericalPolicy,
     RootReadout,
     VettedNativeDeterminantKernel,
@@ -84,9 +87,9 @@ _POLISHED_BASELINES = {
     ),
 }
 _POLISHED_IDENTITIES = {
-    "b-prime-leaf-4c8594e4a59486a1c56206e41cd7f7f3ff1ab5193a5ff6b699cbe9492bc45355": "115a3b6fdb73e53600f280c173b98553133ca6bbd97d855dcc5dbab2e39d3cb3",
-    "b-prime-leaf-0f36daefa853de1280f17c8b8ef89bbaf9b34f5e5044a5eb85bc563d3896b60d": "7b43f4fa1d7c93d91ab636a88f63fdecc2c9736bd2e4fa4d991dc4fcc68e95cb",
-    "b-prime-leaf-08b8dc3df83fc1304a61d8b6105c412a316a44816ca229d375573fdf72ac0a57": "4f1b710f32a606fd6dde50900c37bcd3924744dc5f9c11f7038841a36e3641d9",
+    "b-prime-leaf-4c8594e4a59486a1c56206e41cd7f7f3ff1ab5193a5ff6b699cbe9492bc45355": "78152c129310112d73a50f2b7de04c636911fa2d98de2b60566a21fd9b83747c",
+    "b-prime-leaf-0f36daefa853de1280f17c8b8ef89bbaf9b34f5e5044a5eb85bc563d3896b60d": "ec73e209dc2f8dbdddfb211c0b89ff9c514af271b69796f8d8d198dae3b52977",
+    "b-prime-leaf-08b8dc3df83fc1304a61d8b6105c412a316a44816ca229d375573fdf72ac0a57": "fd5013c425b769025e579e2138b1b844bbce9ff94c49acbb6840fb455584119e",
 }
 
 
@@ -121,6 +124,49 @@ def _production_outcome(
         seed_path_radius=seed_path_radius,
         source_root_mapping=job.source_root_mapping,
     )
+    levels = ()
+    if status is ComponentStatus.CONVERGED:
+        diagnostic_deltas = {
+            "truncation": complex(3.0e-12, -1.0e-12),
+            "resolution": complex(-2.0e-12, 2.0e-12),
+            "seed-path": complex(1.0e-12, 3.0e-12),
+        }
+
+        def signed_readout(amplitude):
+            omega = job.root.omega + complex(2.0e-4, -1.0e-4) * amplitude
+            return RootReadout(
+                omega=omega,
+                determinant_residual_abs=2.0e-13,
+                determinant_derivative_abs=1.0,
+                converged=True,
+                root_reference_id=job.root.root_reference_id,
+                branch_id=job.root.branch_id,
+                equation_id=job.equation_id,
+                truncation_radius=abs(diagnostic_deltas["truncation"]),
+                resolution_radius=abs(diagnostic_deltas["resolution"]),
+                seed_path_radius=abs(diagnostic_deltas["seed-path"]),
+                diagnostic_readouts={
+                    family: DiagnosticRootReadout(
+                        omega_delta_from_primary=delta,
+                        determinant_residual_abs=1.0e-13,
+                        determinant_derivative_abs=1.0,
+                        converged=True,
+                    )
+                    for family, delta in diagnostic_deltas.items()
+                },
+                source_root_mapping=job.source_root_mapping,
+            )
+
+        levels = tuple(
+            LadderLevel(
+                epsilon=epsilon,
+                real_plus=signed_readout(complex(epsilon, 0.0)),
+                real_minus=signed_readout(complex(-epsilon, 0.0)),
+                imaginary_plus=signed_readout(complex(0.0, epsilon)),
+                imaginary_minus=signed_readout(complex(0.0, -epsilon)),
+            )
+            for epsilon in job.policy.epsilons[:4]
+        )
     result = ComponentResult(
         job_id=job.job_id,
         leaf_id=job.leaf_id,
@@ -145,7 +191,7 @@ def _production_outcome(
             "amplitude": 1.0e-9,
         },
         baseline=baseline,
-        levels=(),
+        levels=levels,
         lineage={
             "leaf_id": job.leaf_id,
             "root_reference_id": job.root.root_reference_id,
@@ -289,7 +335,25 @@ def _frozen_raw_residual_promoted_controls():
     }
 
 
-def _frozen_scientific_identity(plan, leaf, precision_contract):
+def _frozen_response_uncertainty_contract():
+    return {
+        "version": 2,
+        "primary_disk": "combined_signed_secant_two_finest_level_richardson",
+        "diagnostic_phases": ["TRUNCATION", "RESOLUTION", "SEED-PATH"],
+        "diagnostic_disk": "signed_phase_secants_two_finest_level_richardson",
+        "containment_increment": (
+            "max_axis_of_max_zero_control_distance_plus_control_radius_"
+            "minus_primary_combined_radius"
+        ),
+        "baseline_diagnostic_displacement_excluded": True,
+        "root_space_displacements": "branch_continuation_only",
+        "units": "dimensionless_response",
+    }
+
+
+def _frozen_scientific_identity(
+    plan, leaf, precision_contract, *, corrected_uncertainty=True
+):
     """Build an independently frozen one-leaf scientific identity."""
 
     material = {
@@ -309,6 +373,10 @@ def _frozen_scientific_identity(plan, leaf, precision_contract):
         "precision_factory_identity": plan.precision_factory_identity.to_mapping(),
         "precision_contract": precision_contract,
     }
+    if corrected_uncertainty:
+        material["response_uncertainty_contract"] = (
+            _frozen_response_uncertainty_contract()
+        )
     return hashlib.sha256(canonical_json_bytes(material)).hexdigest()
 
 
@@ -316,7 +384,10 @@ def _frozen_predecessor_scientific_identity(plan, leaf):
     """Rebuild the exact pre-recovery identity without production helpers."""
 
     return _frozen_scientific_identity(
-        plan, leaf, _frozen_predecessor_precision_contract(leaf)
+        plan,
+        leaf,
+        _frozen_predecessor_precision_contract(leaf),
+        corrected_uncertainty=False,
     )
 
 
@@ -397,8 +468,10 @@ def _primary_migration_context():
     legacy_leaf = next(
         item for item in legacy_plan.leaves if item.leaf_id == leaf.leaf_id
     )
-    legacy_identity = _frozen_predecessor_scientific_identity(
-        legacy_plan, legacy_leaf
+    legacy_identity = _frozen_scientific_identity(
+        legacy_plan,
+        legacy_leaf,
+        _frozen_predecessor_precision_contract(legacy_leaf),
     )
     selection = build_campaign_selection(
         plan, role="primary", leaf_ids=(leaf.leaf_id,)
@@ -418,6 +491,22 @@ class _ConvergedProductionBackend:
 
 
 class SolvedLeafCacheTests(unittest.TestCase):
+    def test_corrected_live_converged_result_requires_diagnostic_ladder(self):
+        plan = build_campaign_plan(
+            policy=NumericalPolicy(),
+            backend_identity=VettedNativeDeterminantKernel.identity,
+            precision_capabilities=PrecisionCapabilities((64,)),
+        )
+        leaf = next(item for item in plan.leaves if item.role == "primary")
+        outcome = _production_outcome(leaf)
+        forged = _replace_component_result_fields(outcome, levels=())
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "diagnostic root evidence is incomplete",
+        ):
+            _validate_component_result(leaf, forged)
+
     def test_polished_production_baseline_is_cacheable_under_correction_identity(self):
         plan = _windows_production_plan()
         leaf = next(
@@ -692,7 +781,7 @@ class SolvedLeafCacheTests(unittest.TestCase):
         )
         self.assertEqual(
             scientific_computation_identity_sha256(plan, leaf),
-            "c07c1fd228df8ab73341321c5810db0cfbc8b65b1096fe312495251b491ebae9",
+            "0ae6f98321459f77d89c1c15593a2297a36235995e7a66cf66dedb312eee56ff",
         )
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -728,8 +817,8 @@ class SolvedLeafCacheTests(unittest.TestCase):
             self.assertEqual(second.executed_stage_count, 0)
             self.assertEqual(second.reused_stage_count, 1)
 
-    def test_exact_legacy_primary_binary64_success_is_republished_under_recovery_identity(self):
-        """Catches discarding the exact predecessor success instead of migrating it."""
+    def test_pre_uncertainty_primary_success_stays_stale_and_recomputes(self):
+        """Catches migrating a scalar-only receipt into corrected uncertainty."""
 
         plan = build_campaign_plan(
             policy=NumericalPolicy(),
@@ -755,17 +844,6 @@ class SolvedLeafCacheTests(unittest.TestCase):
         selection = build_campaign_selection(
             plan, role="primary", leaf_ids=(leaf.leaf_id,)
         )
-
-        class Backend:
-            identity = plan.backend_identity
-            precision_capabilities = plan.precision_capabilities
-
-            def __init__(self):
-                self.calls = []
-
-            def execute_stage(self, selected, digits):
-                self.calls.append((selected.leaf_id, digits))
-                raise AssertionError("legacy success migration reached stage execution")
 
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -799,7 +877,7 @@ class SolvedLeafCacheTests(unittest.TestCase):
                 record=legacy.to_mapping(),
                 source_type="imported-authenticated-checkpoint",
             )
-            backend = Backend()
+            backend = _ConvergedProductionBackend(plan)
             summary = run_campaign_selection(
                 plan,
                 selection,
@@ -811,23 +889,75 @@ class SolvedLeafCacheTests(unittest.TestCase):
 
             current_identity = scientific_computation_identity_sha256(plan, leaf)
             self.assertNotEqual(current_identity, legacy_identity)
-            self.assertEqual(backend.calls, [])
-            self.assertEqual(summary.records[0].to_mapping(), legacy.to_mapping())
+            self.assertEqual(backend.calls, [(leaf.leaf_id, 64)])
+            self.assertEqual(summary.executed_stage_count, 1)
+            self.assertNotEqual(summary.records[0].to_mapping(), legacy.to_mapping())
             self.assertEqual(store.stored_count, 2)
             legacy_lookup = store.lookup(legacy_identity, leaf.leaf_id)
             current_lookup = _authenticated_solved_leaf_lookup(plan, leaf, store)
             self.assertIs(legacy_lookup.status, SolvedLeafLookupStatus.HIT)
             self.assertIs(current_lookup.status, SolvedLeafLookupStatus.HIT)
             self.assertEqual(legacy_lookup.receipt["record"], legacy.to_mapping())
-            self.assertEqual(current_lookup.receipt["record"], legacy.to_mapping())
+            self.assertEqual(
+                current_lookup.receipt["record"],
+                summary.records[0].to_mapping(),
+            )
             self.assertEqual(
                 legacy_lookup.receipt["source_type"],
                 "imported-authenticated-checkpoint",
             )
-            self.assertEqual(
-                current_lookup.receipt["source_type"],
-                "imported-authenticated-checkpoint",
+            self.assertEqual(current_lookup.receipt["source_type"], "originating-campaign")
+
+    def test_all_pre_uncertainty_predecessor_identities_remain_stale(self):
+        plan = build_campaign_plan(
+            policy=NumericalPolicy(),
+            backend_identity=VettedNativeDeterminantKernel.identity,
+            precision_capabilities=PrecisionCapabilities((64, 80)),
+        )
+        leaf = next(item for item in plan.leaves if item.role == "primary")
+        base = _frozen_predecessor_precision_contract(leaf)
+        previous = dict(base)
+        previous["primary_recovery"] = _frozen_previous_recovery_contract()
+        raw_residual = dict(base)
+        raw_residual["primary_recovery"] = {
+            **_frozen_previous_recovery_contract(),
+            "promoted_numerical_controls": _frozen_raw_residual_promoted_controls(),
+        }
+        old_identities = tuple(
+            _frozen_scientific_identity(
+                plan,
+                leaf,
+                contract,
+                corrected_uncertainty=False,
             )
+            for contract in (base, previous, raw_residual)
+        )
+        self.assertEqual(len(set(old_identities)), 3)
+
+        for old_identity in old_identities:
+            with self.subTest(old_identity=old_identity), tempfile.TemporaryDirectory() as temporary:
+                store = SolvedLeafStore(Path(temporary) / "solved")
+                record = _legacy_primary_record(
+                    plan, leaf, ComponentStatus.CONVERGED
+                )
+                store.publish(
+                    scientific_identity_sha256=old_identity,
+                    leaf_id=leaf.leaf_id,
+                    record=record.to_mapping(),
+                    source_type="originating-campaign",
+                )
+
+                lookup = _authenticated_solved_leaf_lookup(plan, leaf, store)
+
+                self.assertIs(lookup.status, SolvedLeafLookupStatus.STALE)
+                self.assertTrue((store.root / f"{old_identity}.json").is_file())
+                self.assertFalse(
+                    (
+                        store.root
+                        / f"{scientific_computation_identity_sha256(plan, leaf)}.json"
+                    ).exists()
+                )
+                self.assertFalse((store.root / "quarantine").exists())
 
     def test_exact_previous_recovery_binary64_success_migrates_without_execution(self):
         """Catches invalidating the three clean preloaded binary64 successes."""

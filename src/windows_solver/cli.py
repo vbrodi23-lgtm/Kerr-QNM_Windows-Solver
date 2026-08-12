@@ -1063,6 +1063,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                                 arguments.checkpoint,
                                 reporter=reporter,
                             )
+                        except KeyboardInterrupt:
+                            emit_progress(
+                                ProgressEventKind.REQUEST_INTERRUPTED,
+                                operation=arguments.command,
+                                message="operator interrupt",
+                            )
+                            raise
                         except BaseException as error:
                             worker_failure = worker_failure_payload(error)
                             emit_progress(
@@ -1109,6 +1116,20 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         else:
             raise ValueError(f"unknown command: {arguments.command}")
+    except KeyboardInterrupt:
+        _emit(
+            {
+                "error": {
+                    "code": "INTERRUPTED",
+                    "message": (
+                        "operation interrupted by user; committed checkpoints "
+                        "remain resumable"
+                    ),
+                }
+            },
+            stream=sys.stderr,
+        )
+        return 130
     except ArtifactVerificationError as error:
         _emit(
             {"error": {"code": "VERIFICATION_FAILED", "message": str(error)}},

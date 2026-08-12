@@ -15,9 +15,11 @@ from windows_solver.linear_response import (
 from windows_solver.response_engine import (
     BackendIdentity,
     ComponentStatus,
+    DiagnosticRootReadout,
     DeterminantPartials,
     ExteriorPerturbation,
     HorizonPerturbation,
+    LadderLevel,
     NativeDeterminantAdapter,
     NumericalPolicy,
     ResponseComponentJob,
@@ -131,7 +133,7 @@ class NewtonCorrectionGateTests(unittest.TestCase):
         self.assertAlmostEqual(observed_residual, residual, places=22)
         self.assertAlmostEqual(observed_derivative, derivative, places=9)
         self.assertLess(residual / derivative, 2.0e-11)
-        self.assertEqual(len(calls), 4)
+        self.assertEqual(len(calls), 3)
 
     def test_solve_once_reuses_derivative_that_accepted_the_same_root(self):
         """Catches recomputing the accepted phase derivative for its receipt."""
@@ -162,7 +164,26 @@ class NewtonCorrectionGateTests(unittest.TestCase):
         self.assertEqual(root, 0.0j)
         self.assertAlmostEqual(observed_residual, residual, places=22)
         self.assertAlmostEqual(observed_derivative, derivative, places=9)
-        self.assertEqual(len(kernel.calls), 4)
+        self.assertEqual(len(kernel.calls), 3)
+
+    def test_bounded_newton_carries_an_accepted_candidate_into_next_iteration(self):
+        calls: list[complex] = []
+
+        def determinant(omega: complex) -> complex:
+            calls.append(complex(omega))
+            return complex(omega) - 1.0
+
+        root, residual, derivative, converged = (
+            response_engine.VettedNativeDeterminantKernel._bounded_newton(
+                determinant, 0.999 + 0.0j
+            )
+        )
+
+        self.assertTrue(converged)
+        self.assertAlmostEqual(root.real, 1.0, places=14)
+        self.assertLess(residual, 2.0e-15)
+        self.assertAlmostEqual(derivative, 1.0)
+        self.assertEqual(len(calls), 6)
 
 class PredictorRecordingBackend:
     identity = IDENTITY
@@ -212,6 +233,142 @@ class PredictorRecordingBackend:
 
 
 class LinearResponseEngineTests(unittest.TestCase):
+    def test_diagnostic_containment_increment_propagates_richardson_radii(self):
+        def readout(omega: complex, epsilon: float) -> RootReadout:
+            diagnostic = DiagnosticRootReadout(
+                omega_delta_from_primary=omega,
+                determinant_residual_abs=2.0 * epsilon,
+                determinant_derivative_abs=1.0,
+                converged=True,
+            )
+            radius = abs(omega)
+            return RootReadout(
+                omega=0.0j,
+                determinant_residual_abs=0.0,
+                determinant_derivative_abs=1.0,
+                converged=True,
+                root_reference_id="root",
+                branch_id="branch",
+                equation_id="equation",
+                truncation_radius=radius,
+                resolution_radius=radius,
+                seed_path_radius=radius,
+                diagnostic_readouts={
+                    family: diagnostic
+                    for family in ("truncation", "resolution", "seed-path")
+                },
+            )
+
+        def level(epsilon: float) -> LadderLevel:
+            return LadderLevel(
+                epsilon=epsilon,
+                real_plus=readout(epsilon, epsilon),
+                real_minus=readout(-epsilon, epsilon),
+                imaginary_plus=readout(1.0j * epsilon, epsilon),
+                imaginary_minus=readout(-1.0j * epsilon, epsilon),
+            )
+
+        increment = response_engine._diagnostic_response_channel(
+            (level(2.0), level(1.0)),
+            "truncation",
+            primary_center=0.0j,
+            primary_radius=5.0 / 3.0,
+        )
+
+        self.assertAlmostEqual(increment, 8.0 / 3.0)
+
+    def test_live_diagnostic_roots_reduce_to_response_units_and_exclude_baseline(self):
+        """Catches inserting raw frequency shifts into response error channels."""
+
+        class DiagnosticBackend:
+            identity = IDENTITY
+            primary_response = complex(0.125, -0.375)
+            resolution_delta = complex(0.75, -0.25)
+            seed_path_delta = complex(-0.4, 0.2)
+
+            def __init__(self):
+                self.calls = 0
+
+            @staticmethod
+            def _diagnostic(omega: complex) -> DiagnosticRootReadout:
+                return DiagnosticRootReadout(
+                    omega_delta_from_primary=omega,
+                    determinant_residual_abs=0.0,
+                    determinant_derivative_abs=2.0,
+                    converged=True,
+                )
+
+            def read_root(self, job, amplitude, primary_predictor=None):
+                self.calls += 1
+                amplitude = complex(amplitude)
+                primary = (
+                    job.root.omega
+                    + self.primary_response * amplitude
+                    + complex(0.2, 0.1) * amplitude**3
+                )
+                if amplitude == 0.0j:
+                    diagnostic_omegas = {
+                        "truncation": primary + 0.004j,
+                        "resolution": primary,
+                        "seed-path": primary,
+                    }
+                else:
+                    diagnostic_omegas = {
+                        "truncation": primary,
+                        "resolution": primary + self.resolution_delta * amplitude,
+                        "seed-path": primary + self.seed_path_delta * amplitude,
+                    }
+                return RootReadout(
+                    omega=primary,
+                    determinant_residual_abs=0.0,
+                    determinant_derivative_abs=2.0,
+                    converged=True,
+                    root_reference_id=job.root.root_reference_id,
+                    branch_id=job.root.branch_id,
+                    equation_id=job.equation_id,
+                    truncation_radius=abs(diagnostic_omegas["truncation"] - primary),
+                    resolution_radius=abs(diagnostic_omegas["resolution"] - primary),
+                    seed_path_radius=abs(diagnostic_omegas["seed-path"] - primary),
+                    diagnostic_readouts={
+                        name: self._diagnostic(omega - primary)
+                        for name, omega in diagnostic_omegas.items()
+                    },
+                )
+
+            def closed_form_horizon_response(self, job):
+                return None
+
+        job = ResponseComponentJob.from_leaf_id(
+            EXTERIOR_LEAF_ID,
+            policy=NumericalPolicy(),
+            backend_identity=IDENTITY,
+        )
+        backend = DiagnosticBackend()
+
+        result = run_component(job, backend)
+
+        self.assertEqual(result.status, ComponentStatus.CONVERGED)
+        self.assertEqual(backend.calls, 17)
+        self.assertAlmostEqual(result.response.real, backend.primary_response.real)
+        self.assertAlmostEqual(result.response.imag, backend.primary_response.imag)
+        self.assertLess(result.error_channels["truncation"], 1.0e-12)
+        self.assertAlmostEqual(
+            result.error_channels["resolution"],
+            abs(backend.resolution_delta),
+            places=12,
+        )
+        self.assertAlmostEqual(
+            result.error_channels["seed-path"],
+            abs(backend.seed_path_delta),
+            places=12,
+        )
+        self.assertGreater(result.error_channels["resolution"], 0.5)
+        restored = RootReadout.from_mapping(result.levels[-1].real_plus.to_mapping())
+        self.assertEqual(
+            restored.diagnostic_readouts,
+            result.levels[-1].real_plus.diagnostic_readouts,
+        )
+
     def test_coarse_signed_readouts_predict_from_previous_spin_response(
         self,
     ) -> None:

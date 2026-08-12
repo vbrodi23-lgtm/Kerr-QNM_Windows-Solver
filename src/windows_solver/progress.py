@@ -27,6 +27,7 @@ class ProgressEventKind(StrEnum):
     CAMPAIGN_STARTED = "campaign_started"
     CAMPAIGN_COMPLETED = "campaign_completed"
     CAMPAIGN_FAILED = "campaign_failed"
+    CAMPAIGN_INTERRUPTED = "campaign_interrupted"
     LEAF_STARTED = "leaf_started"
     LEAF_REUSED = "leaf_reused"
     LEAF_CACHE_STALE = "leaf_cache_stale"
@@ -35,6 +36,7 @@ class ProgressEventKind(StrEnum):
     LEAF_CACHE_PUBLICATION_FAILED = "leaf_cache_publication_failed"
     LEAF_COMPLETED = "leaf_completed"
     LEAF_FAILED = "leaf_failed"
+    LEAF_INTERRUPTED = "leaf_interrupted"
     CHECKPOINT_WRITING = "checkpoint_writing"
     CHECKPOINT_WRITTEN = "checkpoint_written"
     PRECISION_STAGE_STARTED = "precision_stage_started"
@@ -68,6 +70,7 @@ class ProgressEventKind(StrEnum):
     REQUEST_VALIDATED = "request_validated"
     REQUEST_COMPLETED = "request_completed"
     REQUEST_FAILED = "request_failed"
+    REQUEST_INTERRUPTED = "request_interrupted"
     WORKER_HEARTBEAT = "worker_heartbeat"
     ERROR = "error"
 
