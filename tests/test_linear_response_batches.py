@@ -37,6 +37,8 @@ from windows_solver.response_batches import (
 from windows_solver.response_engine import (
     ComponentResult,
     ComponentStatus,
+    DiagnosticRootReadout,
+    LadderLevel,
     NumericalPolicy,
     RootReadout,
     VettedNativeDeterminantKernel,
@@ -88,6 +90,46 @@ def _synthetic_stage_outcome(**values):
 
 def _produced_stage_outcome(leaf, response, *, baseline_delta=0.0j):
     job = leaf.job
+    diagnostic_deltas = {
+        "truncation": complex(3.0e-12, -1.0e-12),
+        "resolution": complex(-2.0e-12, 2.0e-12),
+        "seed-path": complex(1.0e-12, 3.0e-12),
+    }
+
+    def signed_readout(amplitude):
+        omega = job.root.omega + response * amplitude
+        return RootReadout(
+            omega=omega,
+            determinant_residual_abs=1.0e-12,
+            determinant_derivative_abs=2.0,
+            converged=True,
+            root_reference_id=job.root.root_reference_id,
+            branch_id=job.root.branch_id,
+            equation_id=job.equation_id,
+            truncation_radius=abs(diagnostic_deltas["truncation"]),
+            resolution_radius=abs(diagnostic_deltas["resolution"]),
+            seed_path_radius=abs(diagnostic_deltas["seed-path"]),
+            diagnostic_readouts={
+                family: DiagnosticRootReadout(
+                    omega_delta_from_primary=delta,
+                    determinant_residual_abs=1.0e-13,
+                    determinant_derivative_abs=1.0,
+                    converged=True,
+                )
+                for family, delta in diagnostic_deltas.items()
+            },
+        )
+
+    levels = tuple(
+        LadderLevel(
+            epsilon=epsilon,
+            real_plus=signed_readout(complex(epsilon, 0.0)),
+            real_minus=signed_readout(complex(-epsilon, 0.0)),
+            imaginary_plus=signed_readout(complex(0.0, epsilon)),
+            imaginary_minus=signed_readout(complex(0.0, -epsilon)),
+        )
+        for epsilon in job.policy.epsilons[-4:]
+    )
     result = ComponentResult(
         job_id=job.job_id,
         leaf_id=job.leaf_id,
@@ -114,7 +156,7 @@ def _produced_stage_outcome(leaf, response, *, baseline_delta=0.0j):
             branch_id=job.root.branch_id,
             equation_id=job.equation_id,
         ),
-        levels=(),
+        levels=levels,
         lineage={
             "leaf_id": job.leaf_id,
             "root_reference_id": job.root.root_reference_id,
@@ -156,15 +198,15 @@ class CampaignPlanTests(unittest.TestCase):
         with self.subTest(contract="identity"):
             self.assertEqual(
                 scientific_computation_identity_sha256(plan, primary),
-                "02207005956469fd058302820c9861193c90bb3bf2b09df7d0570058787c386d",
+                "349d9d7f0898109623ab612538ab4eed8b9e0c1f7d0fcc4d5b9926850b26eeee",
             )
             self.assertEqual(
                 scientific_computation_identity_sha256(plan, control),
-                "6c460f57aa73bb6b08272c11e925da3becc01f7acde9b765d374bf716ad59ba9",
+                "a9752efd09a9300f05e72c71a209e2bb2c5331e907f47b1b65894760007672c9",
             )
             self.assertEqual(
                 scientific_computation_identity_sha256(plan, deep),
-                "6e3b5ac41472ae9801dc5855535f4145460efdb53cfed28b588783168cd0b2ae",
+                "da5c572b8b8190786a9391aa622b0443064160993f87e6975802447aff2e906a",
             )
 
         leaf = primary

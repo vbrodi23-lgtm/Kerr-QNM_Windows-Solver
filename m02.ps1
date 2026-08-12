@@ -18,9 +18,27 @@ $ResolvedRuntimeRoot = Resolve-KerrQnmRuntimeRoot -PackageRoot $PackageRoot `
 Set-KerrQnmRuntimeRoot $ResolvedRuntimeRoot
 
 function Invoke-M02Command([string[]]$Arguments) {
-    & (Join-Path $PackageRoot "solver.ps1") @Arguments
-    if ($LASTEXITCODE -ne 0) {
-        throw "M02 command failed with exit code $LASTEXITCODE."
+    try {
+        & (Join-Path $PackageRoot "solver.ps1") @Arguments
+        $CommandExitCode = $LASTEXITCODE
+    }
+    catch [System.Management.Automation.PipelineStoppedException] {
+        exit 130
+    }
+    catch {
+        if ($LASTEXITCODE -eq 130 -or $LASTEXITCODE -eq -1073741510 -or $LASTEXITCODE -eq 3221225786) {
+            exit 130
+        }
+        throw
+    }
+    if ($CommandExitCode -eq -1073741510 -or $CommandExitCode -eq 3221225786) {
+        $CommandExitCode = 130
+    }
+    if ($CommandExitCode -eq 130) {
+        exit 130
+    }
+    if ($CommandExitCode -ne 0) {
+        throw "M02 command failed with exit code $CommandExitCode."
     }
 }
 

@@ -25,6 +25,8 @@ from windows_solver.response_batches import (
 from windows_solver.response_engine import (
     ComponentResult,
     ComponentStatus,
+    DiagnosticRootReadout,
+    LadderLevel,
     NumericalPolicy,
     RootReadout,
     VettedNativeDeterminantKernel,
@@ -105,6 +107,49 @@ def _authenticated_primary_stage(
 
     job = leaf.job
     status = ComponentStatus(status)
+    levels = ()
+    if status is ComponentStatus.CONVERGED:
+        response = complex(1.0, -0.5)
+        diagnostic_deltas = {
+            "truncation": complex(3.0e-12, -1.0e-12),
+            "resolution": complex(-2.0e-12, 2.0e-12),
+            "seed-path": complex(1.0e-12, 3.0e-12),
+        }
+
+        def signed_readout(amplitude):
+            return RootReadout(
+                omega=job.root.omega + response * amplitude,
+                determinant_residual_abs=1.0e-12,
+                determinant_derivative_abs=2.0,
+                converged=True,
+                root_reference_id=job.root.root_reference_id,
+                branch_id=job.root.branch_id,
+                equation_id=job.equation_id,
+                truncation_radius=abs(diagnostic_deltas["truncation"]),
+                resolution_radius=abs(diagnostic_deltas["resolution"]),
+                seed_path_radius=abs(diagnostic_deltas["seed-path"]),
+                diagnostic_readouts={
+                    family: DiagnosticRootReadout(
+                        omega_delta_from_primary=delta,
+                        determinant_residual_abs=1.0e-13,
+                        determinant_derivative_abs=1.0,
+                        converged=True,
+                    )
+                    for family, delta in diagnostic_deltas.items()
+                },
+                source_root_mapping=job.source_root_mapping,
+            )
+
+        levels = tuple(
+            LadderLevel(
+                epsilon=epsilon,
+                real_plus=signed_readout(complex(epsilon, 0.0)),
+                real_minus=signed_readout(complex(-epsilon, 0.0)),
+                imaginary_plus=signed_readout(complex(0.0, epsilon)),
+                imaginary_minus=signed_readout(complex(0.0, -epsilon)),
+            )
+            for epsilon in job.policy.epsilons[-4:]
+        )
     result = ComponentResult(
         job_id=job.job_id,
         leaf_id=job.leaf_id,
@@ -143,7 +188,7 @@ def _authenticated_primary_stage(
             equation_id=job.equation_id,
             source_root_mapping=job.source_root_mapping,
         ),
-        levels=(),
+        levels=levels,
         lineage={
             "leaf_id": job.leaf_id,
             "root_reference_id": job.root.root_reference_id,

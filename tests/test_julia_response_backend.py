@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from decimal import Decimal
+from decimal import Decimal, localcontext
 import hashlib
 import io
 import json
@@ -32,7 +32,12 @@ from windows_solver.response_batches import (
     build_campaign_plan,
     run_campaign_selection,
 )
-from windows_solver.response_engine import NumericalPolicy, VettedNativeDeterminantKernel
+from windows_solver.response_engine import (
+    LadderLevel,
+    NumericalPolicy,
+    VettedNativeDeterminantKernel,
+    _diagnostic_response_channel,
+)
 from windows_solver.progress_output import CampaignProgressReporter
 
 
@@ -58,6 +63,12 @@ class FakeAdapter:
     def __init__(self):
         self.requests = []
 
+    @staticmethod
+    def shifted(value, delta):
+        with localcontext() as context:
+            context.prec = 180
+            return str(Decimal(value) + Decimal(delta))
+
     def evaluate(self, request):
         self.requests.append(request)
         return {
@@ -79,6 +90,22 @@ class FakeAdapter:
             "truncation_radius_abs": "2e-55",
             "resolution_radius_abs": "3e-55",
             "seed_path_radius_abs": "4e-55",
+            "diagnostic_roots": {
+                phase: {
+                    "root_omega_re": self.shifted(
+                        request["omega"]["real"], radius
+                    ),
+                    "root_omega_im": request["omega"]["imaginary"],
+                    "root_residual_abs": "1e-60",
+                    "root_derivative_abs": "2.5",
+                    "root_converged": True,
+                }
+                for phase, radius in {
+                    "truncation": "2e-55",
+                    "resolution": "3e-55",
+                    "seed-path": "4e-55",
+                }.items()
+            },
         }
 
 
@@ -227,6 +254,11 @@ class JuliaResponseBackendTests(unittest.TestCase):
         self.assertIn("carried_residual = initial_determinant", worker)
         self.assertIn("carried_available = true", worker)
         self.assertIn("carried_available = false", worker)
+        self.assertIn("carried_residual = candidate_residual", worker)
+        self.assertIn("carried_available = true", worker)
+        self.assertIn("return value, magnitude, derivative_abs, true", worker)
+        self.assertIn("root, residual, accepted_derivative, _ = bounded_newton", worker)
+        self.assertIn("if isnothing(accepted_derivative)", worker)
         # The seed determinant is carried, not recomputed, but every later
         # iteration still evaluates its own residual at its own frequency.
         self.assertIn(
@@ -454,6 +486,10 @@ class JuliaResponseBackendTests(unittest.TestCase):
         })
         self.assertEqual(readout.omega, job.root.omega)
         self.assertEqual(readout.truncation_radius, 2.0e-55)
+        self.assertEqual(
+            set(readout.diagnostic_readouts),
+            {"truncation", "resolution", "seed-path"},
+        )
         self.assertTrue(readout.converged)
         self.assertEqual(backend.scientific_runtime["precision_digits"], 80)
 
@@ -530,6 +566,9 @@ class JuliaResponseBackendTests(unittest.TestCase):
                     "root_converged": False,
                     "root_branch_continuation_valid": False,
                 })
+                response["diagnostic_roots"]["truncation"]["root_omega_re"] = self.shifted(
+                    request["omega"]["real"], "0.006"
+                )
                 return response
 
         job = _deep_job()
@@ -563,6 +602,9 @@ class JuliaResponseBackendTests(unittest.TestCase):
                     "root_converged": False,
                     "root_branch_continuation_valid": self.branch_valid,
                 })
+                response["diagnostic_roots"]["truncation"]["root_omega_re"] = self.shifted(
+                    request["omega"]["real"], self.displacement
+                )
                 return response
 
         job = _deep_job()
@@ -589,6 +631,12 @@ class JuliaResponseBackendTests(unittest.TestCase):
                     ),
                     "root_displacement_abs": "0.005",
                 })
+                for raw in response["diagnostic_roots"].values():
+                    raw["root_omega_re"] = response["root_omega_re"]
+                    raw["root_omega_im"] = response["root_omega_im"]
+                response["truncation_radius_abs"] = "0"
+                response["resolution_radius_abs"] = "0"
+                response["seed_path_radius_abs"] = "0"
                 return response
 
         complex_boundary = JuliaPrecisionRootBackend(
@@ -690,6 +738,88 @@ class JuliaResponseBackendTests(unittest.TestCase):
             "branch-continuation evidence is inconsistent",
         ):
             false_inside_backend.read_root(job, 0.0j)
+
+    def test_promoted_backend_rejects_diagnostic_root_displacement_forgery(self):
+        class ForgedDiagnosticAdapter(FakeAdapter):
+            def evaluate(self, request):
+                response = super().evaluate(request)
+                response["diagnostic_roots"]["resolution"]["root_omega_re"] = (
+                    self.shifted(request["omega"]["real"], "0.001")
+                )
+                return response
+
+        job = _deep_job()
+        backend = JuliaPrecisionRootBackend(
+            VettedNativeDeterminantKernel.identity,
+            ForgedDiagnosticAdapter(),
+            80,
+        )
+
+        with self.assertRaisesRegex(
+            JuliaResponseBackendError,
+            "diagnostic root evidence is inconsistent",
+        ):
+            backend.read_root(job, 0.0j)
+
+    def test_promoted_sub_ulp_diagnostic_shifts_survive_response_reduction(self):
+        """Catches rounding signed BigFloat control deltas into absolute roots."""
+
+        class SubUlpDiagnosticAdapter(FakeAdapter):
+            coefficient = Decimal("1e-18")
+
+            def evaluate(self, request):
+                response = super().evaluate(request)
+                amplitude_real = Decimal(request["amplitude"]["real"])
+                amplitude_imaginary = Decimal(request["amplitude"]["imaginary"])
+                delta_real = self.coefficient * amplitude_real
+                delta_imaginary = self.coefficient * amplitude_imaginary
+                with localcontext() as context:
+                    context.prec = 180
+                    radius = (
+                        delta_real * delta_real
+                        + delta_imaginary * delta_imaginary
+                    ).sqrt()
+                response["truncation_radius_abs"] = str(radius)
+                response["resolution_radius_abs"] = "0"
+                response["seed_path_radius_abs"] = "0"
+                for family, real_delta, imaginary_delta in (
+                    ("truncation", delta_real, delta_imaginary),
+                    ("resolution", Decimal(0), Decimal(0)),
+                    ("seed-path", Decimal(0), Decimal(0)),
+                ):
+                    raw = response["diagnostic_roots"][family]
+                    raw["root_omega_re"] = self.shifted(
+                        request["omega"]["real"], real_delta
+                    )
+                    raw["root_omega_im"] = self.shifted(
+                        request["omega"]["imaginary"], imaginary_delta
+                    )
+                return response
+
+        job = _deep_job()
+        backend = JuliaPrecisionRootBackend(
+            VettedNativeDeterminantKernel.identity,
+            SubUlpDiagnosticAdapter(),
+            80,
+        )
+
+        def level(epsilon):
+            return LadderLevel(
+                epsilon=epsilon,
+                real_plus=backend.read_root(job, complex(epsilon, 0.0)),
+                real_minus=backend.read_root(job, complex(-epsilon, 0.0)),
+                imaginary_plus=backend.read_root(job, complex(0.0, epsilon)),
+                imaginary_minus=backend.read_root(job, complex(0.0, -epsilon)),
+            )
+
+        channel = _diagnostic_response_channel(
+            (level(2.0e-3), level(1.0e-3)),
+            "truncation",
+            primary_center=0.0j,
+            primary_radius=0.0,
+        )
+
+        self.assertAlmostEqual(channel, 1.0e-18, places=32)
 
     def test_promoted_backend_forwards_optional_primary_predictor(self):
         """Catches promoted precision reverting to background-only PRIMARY seeds."""

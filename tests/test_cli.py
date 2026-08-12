@@ -404,6 +404,28 @@ class CliTests(unittest.TestCase):
             "VERIFICATION_FAILED",
         )
 
+    def test_campaign_keyboard_interrupt_returns_structured_exit_130(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            selection = root / "selection.json"
+            selection.write_bytes(canonical_json_bytes({}))
+            with patch("windows_solver.cli.Path.cwd", return_value=root), patch(
+                "windows_solver.cli._campaign_selected",
+                side_effect=KeyboardInterrupt,
+            ):
+                status, output, error = self.invoke([
+                    "campaign-run",
+                    "selection.json",
+                    "--checkpoint",
+                    "checkpoint.json",
+                    "--progress",
+                    "quiet",
+                ])
+
+        self.assertEqual(status, 130)
+        self.assertEqual(output, {})
+        self.assertEqual(json.loads(error)["error"]["code"], "INTERRUPTED")
+
 
 if __name__ == "__main__":
     unittest.main()

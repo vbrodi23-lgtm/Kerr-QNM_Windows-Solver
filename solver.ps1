@@ -112,7 +112,13 @@ try {
     & $PythonExecutable @PythonPrefixArguments -m windows_solver @SolverArguments
     $SolverExitCode = $LASTEXITCODE
 }
+catch [System.Management.Automation.PipelineStoppedException] {
+    $SolverExitCode = 130
+}
 finally {
     $ErrorActionPreference = $PreviousErrorActionPreference
+}
+if ($SolverExitCode -eq -1073741510 -or $SolverExitCode -eq 3221225786) {
+    $SolverExitCode = 130
 }
 exit $SolverExitCode

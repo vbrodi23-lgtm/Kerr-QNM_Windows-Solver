@@ -24,6 +24,7 @@ import re
 import sys
 import tempfile
 import time
+from types import MappingProxyType
 from typing import Any, Callable, Mapping, Protocol, Sequence
 
 from .contracts import (
@@ -70,6 +71,7 @@ ERROR_CHANNELS = (
     "amplitude",
 )
 _RECORDED_ROOT_MAPPING_TOLERANCE_ABS = 5.0e-9
+_DIAGNOSTIC_ROOT_FAMILIES = ("truncation", "resolution", "seed-path")
 
 
 def _sha256(value: object) -> str:
@@ -613,6 +615,62 @@ class DeterminantPartials:
 
 
 @dataclass(frozen=True, slots=True)
+class DiagnosticRootReadout:
+    """One non-primary solve retained for response-space error reduction."""
+
+    omega_delta_from_primary: complex
+    determinant_residual_abs: float
+    determinant_derivative_abs: float
+    converged: bool
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "omega_delta_from_primary",
+            _finite_complex(
+                self.omega_delta_from_primary,
+                "diagnostic root delta from primary",
+            ),
+        )
+        for name in ("determinant_residual_abs", "determinant_derivative_abs"):
+            value = float(getattr(self, name))
+            if not math.isfinite(value) or value < 0.0:
+                raise ValueError(f"{name} must be finite and nonnegative")
+            object.__setattr__(self, name, value)
+        if self.determinant_derivative_abs <= 0.0:
+            raise ValueError("diagnostic determinant derivative must be positive")
+
+    @property
+    def newton_correction_estimate(self) -> float:
+        return self.determinant_residual_abs / self.determinant_derivative_abs
+
+    def to_mapping(self) -> dict[str, object]:
+        return {
+            "omega_delta_from_primary": _complex_mapping(
+                self.omega_delta_from_primary
+            ),
+            "determinant_residual_abs": self.determinant_residual_abs,
+            "determinant_derivative_abs": self.determinant_derivative_abs,
+            "newton_correction_estimate": self.newton_correction_estimate,
+            "converged": self.converged,
+        }
+
+    @classmethod
+    def from_mapping(cls, value: object) -> "DiagnosticRootReadout":
+        if not isinstance(value, Mapping):
+            raise ValueError("diagnostic root readout must be an object")
+        return cls(
+            omega_delta_from_primary=_complex_from_mapping(
+                value.get("omega_delta_from_primary"),
+                "diagnostic root delta from primary",
+            ),
+            determinant_residual_abs=float(value["determinant_residual_abs"]),
+            determinant_derivative_abs=float(value["determinant_derivative_abs"]),
+            converged=bool(value["converged"]),
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class RootReadout:
     omega: complex
     determinant_residual_abs: float
@@ -624,6 +682,7 @@ class RootReadout:
     truncation_radius: float = 0.0
     resolution_radius: float = 0.0
     seed_path_radius: float = 0.0
+    diagnostic_readouts: Mapping[str, DiagnosticRootReadout] | None = None
     source_root_mapping: Mapping[str, object] | None = None
 
     def __post_init__(self) -> None:
@@ -648,13 +707,54 @@ class RootReadout:
             "source_root_mapping",
             _validated_source_root_mapping(self.source_root_mapping),
         )
+        diagnostics = self.diagnostic_readouts
+        if diagnostics is None:
+            object.__setattr__(self, "diagnostic_readouts", MappingProxyType({}))
+        else:
+            if not isinstance(diagnostics, Mapping) or set(diagnostics) != set(
+                _DIAGNOSTIC_ROOT_FAMILIES
+            ):
+                raise ValueError("diagnostic root readouts are incomplete")
+            copied: dict[str, DiagnosticRootReadout] = {}
+            for family in _DIAGNOSTIC_ROOT_FAMILIES:
+                readout = diagnostics[family]
+                if not isinstance(readout, DiagnosticRootReadout):
+                    raise ValueError("diagnostic root readout has invalid type")
+                copied[family] = readout
+            if self.converged and not all(item.converged for item in copied.values()):
+                raise ValueError("converged primary readout has failed diagnostics")
+            object.__setattr__(
+                self, "diagnostic_readouts", MappingProxyType(copied)
+            )
+            scalar_radii = {
+                "truncation": self.truncation_radius,
+                "resolution": self.resolution_radius,
+                "seed-path": self.seed_path_radius,
+            }
+            for family, readout in copied.items():
+                derived = abs(readout.omega_delta_from_primary)
+                binary64_resolution = 2.0 * max(
+                    math.ulp(readout.omega_delta_from_primary.real),
+                    math.ulp(readout.omega_delta_from_primary.imag),
+                    math.ulp(scalar_radii[family]),
+                    1.0e-300,
+                )
+                if not math.isclose(
+                    scalar_radii[family],
+                    derived,
+                    rel_tol=1.0e-12,
+                    abs_tol=binary64_resolution,
+                ):
+                    raise ValueError(
+                        f"{family} diagnostic root displacement is inconsistent"
+                    )
 
     @property
     def newton_correction_estimate(self) -> float:
         return self.determinant_residual_abs / self.determinant_derivative_abs
 
     def to_mapping(self) -> dict[str, object]:
-        return {
+        output = {
             "omega": _complex_mapping(self.omega),
             "determinant_residual_abs": self.determinant_residual_abs,
             "determinant_derivative_abs": self.determinant_derivative_abs,
@@ -672,6 +772,12 @@ class RootReadout:
                 else dict(self.source_root_mapping)
             ),
         }
+        if self.diagnostic_readouts:
+            output["diagnostic_readouts"] = {
+                family: self.diagnostic_readouts[family].to_mapping()
+                for family in _DIAGNOSTIC_ROOT_FAMILIES
+            }
+        return output
 
     @classmethod
     def from_mapping(cls, value: object) -> "RootReadout":
@@ -688,6 +794,16 @@ class RootReadout:
             truncation_radius=float(value.get("truncation_radius", 0.0)),
             resolution_radius=float(value.get("resolution_radius", 0.0)),
             seed_path_radius=float(value.get("seed_path_radius", 0.0)),
+            diagnostic_readouts=(
+                None
+                if "diagnostic_readouts" not in value
+                else {
+                    family: DiagnosticRootReadout.from_mapping(
+                        value["diagnostic_readouts"][family]
+                    )
+                    for family in _DIAGNOSTIC_ROOT_FAMILIES
+                }
+            ),
             source_root_mapping=_validated_source_root_mapping(
                 value.get("source_root_mapping")
             ),
@@ -1046,6 +1162,74 @@ def _axis_estimate(levels: Sequence[LadderLevel], axis: str) -> _AxisEstimate:
         holdout_radius=holdout,
         regression_radius=max(fit_residual, abs(center - fit_center)),
     )
+
+
+def _diagnostic_response_channel(
+    levels: Sequence[LadderLevel],
+    family: str,
+    *,
+    primary_center: complex,
+    primary_radius: float,
+) -> float:
+    """Reduce signed diagnostic roots into the same units as the response."""
+
+    def value_and_radius(level: LadderLevel, axis: str) -> tuple[complex, float]:
+        if axis == "real":
+            plus_readout, minus_readout, denominator = (
+                level.real_plus,
+                level.real_minus,
+                complex(2.0 * level.epsilon, 0.0),
+            )
+        elif axis == "imaginary":
+            plus_readout, minus_readout, denominator = (
+                level.imaginary_plus,
+                level.imaginary_minus,
+                complex(0.0, 2.0 * level.epsilon),
+            )
+        else:
+            real_value, real_radius = value_and_radius(level, "real")
+            imaginary_value, imaginary_radius = value_and_radius(level, "imaginary")
+            return (
+                0.5 * (real_value + imaginary_value),
+                0.5 * (real_radius + imaginary_radius),
+            )
+        plus = plus_readout.diagnostic_readouts[family]
+        minus = minus_readout.diagnostic_readouts[family]
+        return (
+            (
+                (plus_readout.omega - minus_readout.omega)
+                + (
+                    plus.omega_delta_from_primary
+                    - minus.omega_delta_from_primary
+                )
+            )
+            / denominator,
+            (
+                plus.newton_correction_estimate
+                + minus.newton_correction_estimate
+            )
+            / (2.0 * level.epsilon),
+        )
+
+    if len(levels) < 2:
+        raise ValueError("diagnostic response reduction requires two levels")
+    coarse, fine = levels[-2:]
+    increments: list[float] = []
+    for axis in ("real", "imaginary", "combined"):
+        coarse_value, coarse_radius = value_and_radius(coarse, axis)
+        fine_value, fine_radius = value_and_radius(fine, axis)
+        center, _, radius = _richardson(
+            coarse.epsilon,
+            coarse_value,
+            coarse_radius,
+            fine.epsilon,
+            fine_value,
+            fine_radius,
+        )
+        increments.append(
+            max(0.0, abs(center - primary_center) + radius - primary_radius)
+        )
+    return max(increments)
 
 
 def _observed_orders(epsilons: Sequence[float], values: Sequence[complex]) -> tuple[float, ...]:
@@ -1474,11 +1658,39 @@ def run_component(
         level.imaginary_plus,
         level.imaginary_minus,
     )))
+    signed_readouts = tuple(
+        item
+        for level in levels
+        for item in (
+            level.real_plus,
+            level.real_minus,
+            level.imaginary_plus,
+            level.imaginary_minus,
+        )
+    )
+    live_diagnostics = all(item.diagnostic_readouts for item in signed_readouts)
+    if not live_diagnostics and any(item.diagnostic_readouts for item in signed_readouts):
+        raise ValueError("signed diagnostic root evidence is incomplete")
+    diagnostic_channels = (
+        {
+            family: _diagnostic_response_channel(
+                levels,
+                family,
+                primary_center=combined_estimate.center,
+                primary_radius=combined_estimate.root_radius,
+            )
+            for family in _DIAGNOSTIC_ROOT_FAMILIES
+        }
+        if live_diagnostics
+        else {
+            "truncation": max(item.truncation_radius for item in raw),
+            "resolution": max(item.resolution_radius for item in raw),
+            "seed-path": max(item.seed_path_radius for item in raw),
+        }
+    )
     channels = {
         "signed-root": combined_estimate.root_radius,
-        "truncation": max(item.truncation_radius for item in raw),
-        "resolution": max(item.resolution_radius for item in raw),
-        "seed-path": max(item.seed_path_radius for item in raw),
+        **diagnostic_channels,
         "axis": axis_radius,
         "amplitude": amplitude_radius,
     }

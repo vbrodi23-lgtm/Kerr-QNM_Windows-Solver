@@ -677,11 +677,12 @@ function bounded_newton(::Type{T}, request, initial::Complex{T}, amplitude::Comp
     # deterministic function of the frequency and the request controls, so carry
     # that result into the first iteration instead of repeating the solve; at
     # promoted precision one determinant is several radial integrations.
+    carried_value = value
     carried_residual = initial_determinant
     carried_available = true
     for iteration in 1:maximum_iterations
         iteration_started = time_ns()
-        residual = if carried_available
+        residual = if carried_available && carried_value == value
             carried_available = false
             carried_residual
         else
@@ -740,7 +741,7 @@ function bounded_newton(::Type{T}, request, initial::Complex{T}, amplitude::Comp
                 "resulting_determinant_abs" => string(magnitude),
                 "elapsed_seconds" => (time_ns() - iteration_started) / 1.0e9,
             ))
-            return value, magnitude, true
+            return value, magnitude, derivative_abs, true
         end
         step = raw_step
         maximum_step = parse(T, "0.006")
@@ -769,6 +770,9 @@ function bounded_newton(::Type{T}, request, initial::Complex{T}, amplitude::Comp
             ))
             if candidate_abs < magnitude
                 value = candidate
+                carried_value = candidate
+                carried_residual = candidate_residual
+                carried_available = true
                 accepted = true
                 selected_damping = damping
                 resulting_abs = candidate_abs
@@ -778,6 +782,9 @@ function bounded_newton(::Type{T}, request, initial::Complex{T}, amplitude::Comp
         if !accepted
             value -= parse(T, "0.125") * step
             resulting_abs = candidate_abs
+            carried_value = value
+            carried_residual = candidate_residual
+            carried_available = true
         end
         applied_step = selected_damping * step
         progress_emit("newton_iteration_completed"; context=newton_context, payload=Dict(
@@ -793,19 +800,22 @@ function bounded_newton(::Type{T}, request, initial::Complex{T}, amplitude::Comp
             "elapsed_seconds" => (time_ns() - iteration_started) / 1.0e9,
         ))
     end
-    return best_value, best_residual, false
+    return best_value, best_residual, nothing, false
 end
 
 numeric_text(value) = string(value)
 
 function solve_once(::Type{T}, request, initial::Complex{T}, amplitude::Complex{T}) where {T<:AbstractFloat}
-    root, residual, _ = bounded_newton(T, request, initial, amplitude)
-    root_step = parse_real(T, request, "frequency_step") * (one(T) + abs(root))
-    root_derivative = (
-        determinant_progress(T, request, root + root_step, amplitude, "final derivative +h", root) -
-        determinant_progress(T, request, root - root_step, amplitude, "final derivative -h", root)
-    ) / (T(2) * root_step)
-    derivative_abs = abs(root_derivative)
+    root, residual, accepted_derivative, _ = bounded_newton(T, request, initial, amplitude)
+    derivative_abs = accepted_derivative
+    if isnothing(accepted_derivative)
+        root_step = parse_real(T, request, "frequency_step") * (one(T) + abs(root))
+        root_derivative = (
+            determinant_progress(T, request, root + root_step, amplitude, "final derivative +h", root) -
+            determinant_progress(T, request, root - root_step, amplitude, "final derivative -h", root)
+        ) / (T(2) * root_step)
+        derivative_abs = abs(root_derivative)
+    end
     isfinite(derivative_abs) && derivative_abs > zero(T) ||
         error("determinant frequency derivative is unusable")
     tolerance = parse_real(T, request, "root_correction_tolerance")
@@ -979,17 +989,17 @@ function result_fields(::Type{T}, request, digits::Int, bits::Int) where {T<:Abs
             fallback_used=primary_fallback_used,
             fallback_reason=primary_fallback_reason,
         )
-    truncation_root, _, _, truncation_converged = solve_phase(
+    truncation_root, truncation_residual, truncation_derivative, truncation_converged = solve_phase(
         T, refined_request(T, request, :truncation), "TRUNCATION", root, amplitude;
         seed_kind="ACCEPTED_PRIMARY",
     )
-    resolution_root, _, _, resolution_converged = solve_phase(
+    resolution_root, resolution_residual, resolution_derivative, resolution_converged = solve_phase(
         T, refined_request(T, request, :resolution), "RESOLUTION", root, amplitude;
         seed_kind="ACCEPTED_PRIMARY",
     )
     alternate = omega + Complex{T}(T("0.00025"), T("0.000125")) *
         (one(T) + abs(omega))
-    seed_path_root, _, _, seed_path_converged =
+    seed_path_root, seed_path_residual, seed_path_derivative, seed_path_converged =
         solve_phase(
             T, request, "SEED-PATH", alternate, amplitude;
             seed_kind="INDEPENDENT_SEED_PATH",
@@ -1026,6 +1036,29 @@ function result_fields(::Type{T}, request, digits::Int, bits::Int) where {T<:Abs
         "truncation_radius_abs" => numeric_text(abs(truncation_root - root)),
         "resolution_radius_abs" => numeric_text(abs(resolution_root - root)),
         "seed_path_radius_abs" => numeric_text(abs(seed_path_root - root)),
+        "diagnostic_roots" => Dict(
+            "truncation" => Dict(
+                "root_omega_re" => numeric_text(real(truncation_root)),
+                "root_omega_im" => numeric_text(imag(truncation_root)),
+                "root_residual_abs" => numeric_text(truncation_residual),
+                "root_derivative_abs" => numeric_text(truncation_derivative),
+                "root_converged" => truncation_converged,
+            ),
+            "resolution" => Dict(
+                "root_omega_re" => numeric_text(real(resolution_root)),
+                "root_omega_im" => numeric_text(imag(resolution_root)),
+                "root_residual_abs" => numeric_text(resolution_residual),
+                "root_derivative_abs" => numeric_text(resolution_derivative),
+                "root_converged" => resolution_converged,
+            ),
+            "seed-path" => Dict(
+                "root_omega_re" => numeric_text(real(seed_path_root)),
+                "root_omega_im" => numeric_text(imag(seed_path_root)),
+                "root_residual_abs" => numeric_text(seed_path_residual),
+                "root_derivative_abs" => numeric_text(seed_path_derivative),
+                "root_converged" => seed_path_converged,
+            ),
+        ),
     ]
 end
 

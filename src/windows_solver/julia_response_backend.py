@@ -27,6 +27,7 @@ from typing import Callable, Mapping
 from .contracts import canonical_json_bytes
 from .response_engine import (
     BackendIdentity,
+    DiagnosticRootReadout,
     ROOT_BRANCH_CONTINUATION_TOLERANCE_ABS,
     ResponseComponentJob,
     RootReadout,
@@ -1152,6 +1153,7 @@ class JuliaPrecisionRootBackend:
             "truncation_radius_abs",
             "resolution_radius_abs",
             "seed_path_radius_abs",
+            "diagnostic_roots",
         }
         if set(response) != expected_fields:
             raise JuliaResponseBackendError("M02 Julia response fields are invalid")
@@ -1190,23 +1192,23 @@ class JuliaPrecisionRootBackend:
             "root_displacement_abs",
             nonnegative=True,
         )
-        diagnostic_radii_decimal = (
-            _finite_decimal_text(
+        diagnostic_radii_decimal = {
+            "truncation": _finite_decimal_text(
                 response["truncation_radius_abs"],
                 "truncation_radius_abs",
                 nonnegative=True,
             ),
-            _finite_decimal_text(
+            "resolution": _finite_decimal_text(
                 response["resolution_radius_abs"],
                 "resolution_radius_abs",
                 nonnegative=True,
             ),
-            _finite_decimal_text(
+            "seed-path": _finite_decimal_text(
                 response["seed_path_radius_abs"],
                 "seed_path_radius_abs",
                 nonnegative=True,
             ),
-        )
+        }
         with localcontext() as context:
             context.prec = self.digits + 64
             delta_real = root_real_decimal - Decimal(
@@ -1231,7 +1233,7 @@ class JuliaPrecisionRootBackend:
                     derived_displacement <= branch_tolerance_decimal
                     and all(
                         radius <= branch_tolerance_decimal
-                        for radius in diagnostic_radii_decimal
+                        for radius in diagnostic_radii_decimal.values()
                     )
                 )
             )
@@ -1252,26 +1254,87 @@ class JuliaPrecisionRootBackend:
         seed_path_radius = _finite_text(
             response["seed_path_radius_abs"], "seed_path_radius_abs"
         )
-        return RootReadout(
-            omega=root,
-            determinant_residual_abs=_finite_text(
-                response["root_residual_abs"], "root_residual_abs"
-            ),
-            determinant_derivative_abs=_finite_text(
-                response["root_derivative_abs"], "root_derivative_abs"
-            ),
-            converged=converged,
-            root_reference_id=job.root.root_reference_id,
-            branch_id=(
-                job.root.branch_id
-                if branch_continuation_valid
-                else "nonmatching-julia-continuation"
-            ),
-            equation_id=job.equation_id,
-            truncation_radius=truncation_radius,
-            resolution_radius=resolution_radius,
-            seed_path_radius=seed_path_radius,
-        )
+        raw_diagnostics = response["diagnostic_roots"]
+        if not isinstance(raw_diagnostics, Mapping) or set(raw_diagnostics) != {
+            "truncation", "resolution", "seed-path"
+        }:
+            raise JuliaResponseBackendError("M02 Julia diagnostic roots are invalid")
+        diagnostics: dict[str, DiagnosticRootReadout] = {}
+        for family in ("truncation", "resolution", "seed-path"):
+            raw = raw_diagnostics[family]
+            if not isinstance(raw, Mapping) or set(raw) != {
+                "root_omega_re",
+                "root_omega_im",
+                "root_residual_abs",
+                "root_derivative_abs",
+                "root_converged",
+            } or not isinstance(raw["root_converged"], bool):
+                raise JuliaResponseBackendError("M02 Julia diagnostic root is invalid")
+            diagnostic_real_decimal = _finite_decimal_text(
+                raw["root_omega_re"], "diagnostic root_omega_re"
+            )
+            diagnostic_imaginary_decimal = _finite_decimal_text(
+                raw["root_omega_im"], "diagnostic root_omega_im"
+            )
+            with localcontext() as context:
+                context.prec = self.digits + 64
+                delta_real = diagnostic_real_decimal - root_real_decimal
+                delta_imaginary = (
+                    diagnostic_imaginary_decimal - root_imaginary_decimal
+                )
+                derived_radius = (
+                    delta_real * delta_real
+                    + delta_imaginary * delta_imaginary
+                ).sqrt()
+                if (
+                    abs(derived_radius - diagnostic_radii_decimal[family])
+                    > serialization_allowance
+                ):
+                    raise JuliaResponseBackendError(
+                        "M02 Julia diagnostic root evidence is inconsistent"
+                    )
+            diagnostics[family] = DiagnosticRootReadout(
+                omega_delta_from_primary=complex(
+                    _finite_text(str(delta_real), "diagnostic root delta real"),
+                    _finite_text(
+                        str(delta_imaginary),
+                        "diagnostic root delta imaginary",
+                    ),
+                ),
+                determinant_residual_abs=_finite_text(
+                    raw["root_residual_abs"], "diagnostic root_residual_abs"
+                ),
+                determinant_derivative_abs=_finite_text(
+                    raw["root_derivative_abs"], "diagnostic root_derivative_abs"
+                ),
+                converged=raw["root_converged"],
+            )
+        try:
+            return RootReadout(
+                omega=root,
+                determinant_residual_abs=_finite_text(
+                    response["root_residual_abs"], "root_residual_abs"
+                ),
+                determinant_derivative_abs=_finite_text(
+                    response["root_derivative_abs"], "root_derivative_abs"
+                ),
+                converged=converged,
+                root_reference_id=job.root.root_reference_id,
+                branch_id=(
+                    job.root.branch_id
+                    if branch_continuation_valid
+                    else "nonmatching-julia-continuation"
+                ),
+                equation_id=job.equation_id,
+                truncation_radius=truncation_radius,
+                resolution_radius=resolution_radius,
+                seed_path_radius=seed_path_radius,
+                diagnostic_readouts=diagnostics,
+            )
+        except ValueError as error:
+            raise JuliaResponseBackendError(
+                "M02 Julia diagnostic root evidence is inconsistent"
+            ) from error
 
     def closed_form_horizon_response(
         self, job: ResponseComponentJob

@@ -8,6 +8,7 @@ explicit injected component backend.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from contextvars import ContextVar
 import hashlib
 import json
 import math
@@ -75,6 +76,9 @@ _EXECUTION_ROLE_ORDER = {
 _LEGACY_MIGRATION_LOCK_TIMEOUT_SECONDS = 1.0
 _LEGACY_MIGRATION_LOCK_RETRY_SECONDS = 0.01
 _BINARY64_ROOT_CORRECTION_TOLERANCE_ABS = 2.0e-11
+_ACTIVE_CAMPAIGN_LEAF_CONTEXT: ContextVar[Mapping[str, object] | None] = ContextVar(
+    "windows_solver_active_campaign_leaf_context", default=None
+)
 _EXECUTION_MECHANISM_ORDER = {
     "horizon-admittance": 0,
     "exterior-light-ring": 1,
@@ -971,6 +975,24 @@ def _root_convergence_precision_contract() -> dict[str, object]:
     }
 
 
+def _response_uncertainty_contract() -> dict[str, object]:
+    """Bind the live diagnostic-root reduction used by every precision tier."""
+
+    return {
+        "version": 2,
+        "primary_disk": "combined_signed_secant_two_finest_level_richardson",
+        "diagnostic_phases": ["TRUNCATION", "RESOLUTION", "SEED-PATH"],
+        "diagnostic_disk": "signed_phase_secants_two_finest_level_richardson",
+        "containment_increment": (
+            "max_axis_of_max_zero_control_distance_plus_control_radius_"
+            "minus_primary_combined_radius"
+        ),
+        "baseline_diagnostic_displacement_excluded": True,
+        "root_space_displacements": "branch_continuation_only",
+        "units": "dimensionless_response",
+    }
+
+
 def _legacy_leaf_precision_contract(leaf: CampaignLeafPlan) -> dict[str, object]:
     """Return the base precision contract predating PRIMARY recovery."""
 
@@ -1027,6 +1049,7 @@ def _scientific_computation_identity_material(
         "response_job": leaf.job.to_mapping(),
         "precision_factory_identity": plan.precision_factory_identity.to_mapping(),
         "precision_contract": precision_contract,
+        "response_uncertainty_contract": _response_uncertainty_contract(),
     }
 
 
@@ -1315,6 +1338,7 @@ def _checkpoint_bindings(
                 B_PRIME_RELEASE_DOMAIN.fixed_precision_sentinel_leaf_ids
             ),
             "primary_recovery": _primary_recovery_precision_contract(),
+            "response_uncertainty": _response_uncertainty_contract(),
         }),
     }
 
@@ -1667,6 +1691,18 @@ def _validate_component_result(
         raise _UnauthenticatedComponentEvidence(
             "campaign production component lineage is invalid"
         )
+    if job.backend_identity.backend_id != RECORDED_REPLAY_BACKEND_ID:
+        if result.status is ComponentStatus.CONVERGED and len(result.levels) < 4:
+            raise _UnauthenticatedComponentEvidence(
+                "campaign production diagnostic root evidence is incomplete"
+            )
+        if any(
+            not readout.diagnostic_readouts
+            for readout in result.raw_readouts[1:]
+        ):
+            raise _UnauthenticatedComponentEvidence(
+                "campaign production diagnostic root evidence is incomplete"
+            )
     branch_loss_mismatch = False
     for readout_index, readout in enumerate(result.raw_readouts):
         identity_mismatch = (
@@ -2355,6 +2391,8 @@ def _execute_campaign_stage_with_progress(
                 previous_stages,
                 response_predictor,
             )
+        except KeyboardInterrupt:
+            raise
         except BaseException as error:
             worker_failure = _worker_failure_payload(error)
             emit_progress(
@@ -2492,7 +2530,22 @@ def run_campaign_selection(
             solved_leaf_store=solved_leaf_store,
             cache_lookups=cache_lookups,
         )
+    except KeyboardInterrupt:
+        interrupted_context = _ACTIVE_CAMPAIGN_LEAF_CONTEXT.get()
+        if interrupted_context is not None:
+            with progress_scope(**interrupted_context):
+                emit_progress(
+                    ProgressEventKind.LEAF_INTERRUPTED,
+                    message="operator interrupt",
+                )
+        _ACTIVE_CAMPAIGN_LEAF_CONTEXT.set(None)
+        emit_progress(
+            ProgressEventKind.CAMPAIGN_INTERRUPTED,
+            message="operator interrupt",
+        )
+        raise
     except BaseException as error:
+        _ACTIVE_CAMPAIGN_LEAF_CONTEXT.set(None)
         worker_failure = _worker_failure_payload(error)
         emit_progress(
             ProgressEventKind.CAMPAIGN_FAILED,
@@ -2563,6 +2616,7 @@ def _run_campaign_selection_active(
             continuation_key, None
         )
         context = _leaf_progress_context(leaf, index + 1, len(selection.leaf_ids))
+        _ACTIVE_CAMPAIGN_LEAF_CONTEXT.set(context)
         record = records_by_id.get(leaf_id)
         if record is not None and record.state in {
             "PRODUCED", "UNRESOLVED"
@@ -3002,6 +3056,7 @@ def _run_campaign_selection_active(
                 )
     records = _ordered_selection_records(selection, records_by_id)
     mapping = _checkpoint_mapping(plan, selection, records)
+    _ACTIVE_CAMPAIGN_LEAF_CONTEXT.set(None)
     return CampaignRunSummary(
         campaign_id=plan.campaign_id,
         selection_id=selection.selection_id,
@@ -3548,6 +3603,8 @@ def _run_component_with_progress(
                 backend,
                 response_predictor=response_predictor,
             )
+        except KeyboardInterrupt:
+            raise
         except BaseException as error:
             emit_progress(
                 ProgressEventKind.ERROR,

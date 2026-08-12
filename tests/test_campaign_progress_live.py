@@ -8,7 +8,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from windows_solver.progress import activate_progress
+from windows_solver.progress import ProgressEventKind, activate_progress
 from windows_solver.progress_output import CampaignProgressReporter
 from windows_solver.response_batches import (
     PrecisionCapabilities,
@@ -20,9 +20,46 @@ from windows_solver.response_batches import (
     validate_campaign_checkpoint,
 )
 from windows_solver.response_engine import NumericalPolicy, VettedNativeDeterminantKernel
+from windows_solver.native_response_kernel import _progress_suboperation
 
 
 class CampaignProgressLifecycleTests(unittest.TestCase):
+    def test_keyboard_interrupt_emits_interrupted_not_failed_events(self):
+        plan, selection, _, _ = self._plan_selection_backend()
+
+        class InterruptingBackend:
+            identity = plan.backend_identity
+            precision_capabilities = plan.precision_capabilities
+
+            def execute_stage(self, leaf, digits):
+                with _progress_suboperation("synthetic native integration"):
+                    raise KeyboardInterrupt
+
+        class Observer:
+            def __init__(self):
+                self.events = []
+
+            def publish(self, event):
+                self.events.append(event)
+
+        observer = Observer()
+        with tempfile.TemporaryDirectory() as temporary, activate_progress(observer):
+            with self.assertRaises(KeyboardInterrupt):
+                run_campaign_selection(
+                    plan,
+                    selection,
+                    InterruptingBackend(),
+                    Path(temporary) / "checkpoint.json",
+                    resume=False,
+                )
+
+        kinds = [event.kind for event in observer.events]
+        self.assertIn(ProgressEventKind.LEAF_INTERRUPTED, kinds)
+        self.assertIn(ProgressEventKind.CAMPAIGN_INTERRUPTED, kinds)
+        self.assertNotIn(ProgressEventKind.LEAF_FAILED, kinds)
+        self.assertNotIn(ProgressEventKind.CAMPAIGN_FAILED, kinds)
+        self.assertNotIn(ProgressEventKind.ERROR, kinds)
+
     @staticmethod
     def _plan_selection_backend():
         plan = build_campaign_plan(

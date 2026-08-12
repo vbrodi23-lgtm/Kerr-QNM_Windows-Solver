@@ -657,6 +657,64 @@ class CampaignProgressReporterTests(unittest.TestCase):
                 )
                 self.assertEqual(status["live_execution"]["state"], "FAILED")
 
+    def test_interruption_is_not_failure_and_checkpoint_is_bound_to_its_leaf(self):
+        reporter = CampaignProgressReporter(
+            "normal", self.reporter_checkpoint, io.StringIO()
+        )
+        first = {"leaf_id": "leaf-1", "leaf_index": 1, "leaf_count": 3}
+        second = {"leaf_id": "leaf-2", "leaf_index": 2, "leaf_count": 3}
+        reporter.publish(_event(ProgressEventKind.LEAF_STARTED, **first))
+        reporter.publish(_event(ProgressEventKind.CHECKPOINT_WRITTEN, **first))
+        reporter.publish(_payload_event(
+            ProgressEventKind.LEAF_COMPLETED,
+            {"state": "PRODUCED"},
+            **first,
+        ))
+        reporter.publish(_event(ProgressEventKind.LEAF_STARTED, **second))
+        reporter.publish(_payload_event(
+            ProgressEventKind.LEAF_INTERRUPTED,
+            {"message": "operator interrupt"},
+            **second,
+        ))
+
+        persistence = reporter._current_leaf_persistence()
+        self.assertEqual(reporter._dashboard_state["leaf_status"], "INTERRUPTED")
+        self.assertEqual(reporter._dashboard_state["execution_state"], "INTERRUPTED")
+        self.assertEqual(len(reporter._failed_leaf_ids), 0)
+        self.assertFalse(persistence["terminal_computed"])
+        self.assertFalse(persistence["checkpoint_saved"])
+        status = json.loads(
+            Path(f"{self.reporter_checkpoint}.status.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(status["kind"], "leaf_interrupted")
+        self.assertEqual(status["live_execution"]["state"], "INTERRUPTED")
+
+    def test_interrupted_promoted_leaf_reports_resumable_partial_checkpoint(self):
+        reporter = CampaignProgressReporter(
+            "normal", self.reporter_checkpoint, io.StringIO()
+        )
+        context = {"leaf_id": "leaf-2", "leaf_index": 2, "leaf_count": 3}
+        reporter.publish(_event(ProgressEventKind.LEAF_STARTED, **context))
+        reporter.publish(_event(ProgressEventKind.CHECKPOINT_WRITTEN, **context))
+        reporter.publish(_payload_event(
+            ProgressEventKind.LEAF_INTERRUPTED,
+            {"message": "operator interrupt"},
+            **context,
+        ))
+
+        self.assertEqual(
+            reporter._current_leaf_persistence(),
+            {
+                "leaf_id": "leaf-2",
+                "terminal_computed": False,
+                "checkpoint_saved": True,
+                "receipt_published": False,
+                "publication_failed": False,
+            },
+        )
+
     def test_normal_writes_atomic_live_status_for_second_process_inspection(self):
         with TemporaryDirectory() as directory:
             checkpoint = Path(directory) / "checkpoint.json"
@@ -1646,6 +1704,13 @@ class CampaignProgressReporterTests(unittest.TestCase):
         self.assertEqual(ProgressEventKind.REQUEST_VALIDATED.value, "request_validated")
         self.assertEqual(ProgressEventKind.REQUEST_COMPLETED.value, "request_completed")
         self.assertEqual(ProgressEventKind.REQUEST_FAILED.value, "request_failed")
+        self.assertEqual(ProgressEventKind.LEAF_INTERRUPTED.value, "leaf_interrupted")
+        self.assertEqual(
+            ProgressEventKind.CAMPAIGN_INTERRUPTED.value, "campaign_interrupted"
+        )
+        self.assertEqual(
+            ProgressEventKind.REQUEST_INTERRUPTED.value, "request_interrupted"
+        )
 
     def test_reporter_contains_stream_and_trace_failures(self):
         class BrokenStream:
