@@ -15,9 +15,11 @@ import math
 import os
 from pathlib import Path
 from queue import Empty, Queue
+import signal
 import subprocess
+import sys
 import tempfile
-from threading import Thread
+from threading import Event, Thread
 import time
 from types import SimpleNamespace
 from typing import Callable, Mapping
@@ -42,9 +44,154 @@ from .root_readout_cache import (
 _PROMOTED_DIGITS = frozenset({80, 120})
 JULIA_PROGRESS_PREFIX = "@@KERR_QNM_PROGRESS@@"
 _WORKER_HEARTBEAT_SECONDS = 2.0
+_PROCESS_REAP_SECONDS = 10.0
+_IS_WINDOWS = os.name == "nt"
+_CREATE_NEW_PROCESS_GROUP = getattr(
+    subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200
+)
+_JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
+_JOB_OBJECT_EXTENDED_LIMIT_INFORMATION_CLASS = 9
+_WINDOWS_JOB_START_TOKEN = "G"
+_WINDOWS_JOB_BOOTSTRAP = (
+    "import subprocess,sys; "
+    "token=sys.stdin.read(1); "
+    "sys.exit(125 if token != 'G' else subprocess.run(sys.argv[1:]).returncode)"
+)
 _BRANCH_TOLERANCE_DECIMAL = Decimal(
     str(ROOT_BRANCH_CONTINUATION_TOLERANCE_ABS)
 )
+
+
+class JuliaResponseBackendError(RuntimeError):
+    """The package-owned Julia precision worker is unavailable or rejected work."""
+
+
+class JuliaProgressProtocolError(JuliaResponseBackendError):
+    """A reserved Julia progress record violated its authenticated protocol."""
+
+
+class JuliaWorkerTimeoutError(JuliaResponseBackendError):
+    """The Julia worker exceeded the request wall-clock timeout."""
+
+
+class JuliaODEResourceLimitError(JuliaResponseBackendError):
+    """The Julia worker reported an existing ODE solver resource limit."""
+
+
+class _WindowsKillOnCloseJob:
+    """Own one Windows worker tree until every request pipe has drained."""
+
+    def __init__(self, handle: object, kernel32: object) -> None:
+        self._handle = handle
+        self._kernel32 = kernel32
+
+    @classmethod
+    def create(cls) -> "_WindowsKillOnCloseJob":
+        import ctypes
+        from ctypes import wintypes
+
+        class BasicLimitInformation(ctypes.Structure):
+            _fields_ = (
+                ("PerProcessUserTimeLimit", ctypes.c_longlong),
+                ("PerJobUserTimeLimit", ctypes.c_longlong),
+                ("LimitFlags", wintypes.DWORD),
+                ("MinimumWorkingSetSize", ctypes.c_size_t),
+                ("MaximumWorkingSetSize", ctypes.c_size_t),
+                ("ActiveProcessLimit", wintypes.DWORD),
+                ("Affinity", ctypes.c_size_t),
+                ("PriorityClass", wintypes.DWORD),
+                ("SchedulingClass", wintypes.DWORD),
+            )
+
+        class IoCounters(ctypes.Structure):
+            _fields_ = tuple(
+                (name, ctypes.c_ulonglong)
+                for name in (
+                    "ReadOperationCount",
+                    "WriteOperationCount",
+                    "OtherOperationCount",
+                    "ReadTransferCount",
+                    "WriteTransferCount",
+                    "OtherTransferCount",
+                )
+            )
+
+        class ExtendedLimitInformation(ctypes.Structure):
+            _fields_ = (
+                ("BasicLimitInformation", BasicLimitInformation),
+                ("IoInfo", IoCounters),
+                ("ProcessMemoryLimit", ctypes.c_size_t),
+                ("JobMemoryLimit", ctypes.c_size_t),
+                ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                ("PeakJobMemoryUsed", ctypes.c_size_t),
+            )
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateJobObjectW.argtypes = (wintypes.LPVOID, wintypes.LPCWSTR)
+        kernel32.CreateJobObjectW.restype = wintypes.HANDLE
+        kernel32.SetInformationJobObject.argtypes = (
+            wintypes.HANDLE,
+            ctypes.c_int,
+            wintypes.LPVOID,
+            wintypes.DWORD,
+        )
+        kernel32.SetInformationJobObject.restype = wintypes.BOOL
+        kernel32.AssignProcessToJobObject.argtypes = (
+            wintypes.HANDLE,
+            wintypes.HANDLE,
+        )
+        kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
+        kernel32.TerminateJobObject.argtypes = (wintypes.HANDLE, wintypes.UINT)
+        kernel32.TerminateJobObject.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+        kernel32.CloseHandle.restype = wintypes.BOOL
+
+        handle = kernel32.CreateJobObjectW(None, None)
+        if not handle:
+            raise ctypes.WinError(ctypes.get_last_error())
+        job = cls(handle, kernel32)
+        information = ExtendedLimitInformation()
+        information.BasicLimitInformation.LimitFlags = (
+            _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        )
+        if not kernel32.SetInformationJobObject(
+            handle,
+            _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION_CLASS,
+            ctypes.byref(information),
+            ctypes.sizeof(information),
+        ):
+            error = ctypes.WinError(ctypes.get_last_error())
+            job.close()
+            raise error
+        return job
+
+    def assign(self, process: subprocess.Popen[str]) -> None:
+        import ctypes
+        from ctypes import wintypes
+
+        process_handle = getattr(process, "_handle", None)
+        if process_handle is None or not self._kernel32.AssignProcessToJobObject(
+            self._handle, wintypes.HANDLE(int(process_handle))
+        ):
+            raise ctypes.WinError(ctypes.get_last_error())
+
+    def terminate(self) -> None:
+        """Kill every process still associated with the job, then close it."""
+
+        handle = self._handle
+        if handle is None:
+            return
+        try:
+            self._kernel32.TerminateJobObject(handle, 1)
+        finally:
+            self.close()
+
+    def close(self) -> None:
+        handle = self._handle
+        if handle is None:
+            return
+        self._handle = None
+        self._kernel32.CloseHandle(handle)
 
 
 def promoted_precision_numerical_controls() -> dict[str, object]:
@@ -97,7 +244,51 @@ def _forward_julia_progress_line(line: str) -> bool:
             error_type=type(error).__name__,
             message=str(error),
         )
+        raise JuliaProgressProtocolError(
+            "Julia worker emitted malformed reserved progress"
+        ) from error
     return True
+
+
+def _terminate_process_tree(
+    process: subprocess.Popen[str],
+    windows_job: _WindowsKillOnCloseJob | None = None,
+) -> None:
+    """Force-stop the isolated worker tree and reap its direct process."""
+
+    if _IS_WINDOWS:
+        if windows_job is not None:
+            windows_job.terminate()
+        else:
+            try:
+                completed = subprocess.run(
+                    ("taskkill", "/PID", str(process.pid), "/T", "/F"),
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=_PROCESS_REAP_SECONDS,
+                )
+                if completed.returncode != 0 and process.poll() is None:
+                    process.kill()
+            except (OSError, subprocess.SubprocessError):
+                if process.poll() is None:
+                    process.kill()
+    else:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        except OSError:
+            if process.poll() is None:
+                process.kill()
+    try:
+        process.wait(timeout=_PROCESS_REAP_SECONDS)
+    except subprocess.TimeoutExpired:
+        if process.poll() is None:
+            process.kill()
+        process.wait()
+    except (ChildProcessError, OSError):
+        pass
 
 
 def _run_streamed_julia(
@@ -105,18 +296,37 @@ def _run_streamed_julia(
 ) -> object:
     """Drain worker pipes concurrently and forward progress before completion."""
 
-    process = subprocess.Popen(
-        command,
-        cwd=cwd,
-        env=dict(env),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        bufsize=1,
-    )
+    popen_options: dict[str, object] = {
+        "cwd": cwd,
+        "env": dict(env),
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
+        "text": True,
+        "bufsize": 1,
+    }
+    launch_command = command
+    if _IS_WINDOWS:
+        popen_options["creationflags"] = _CREATE_NEW_PROCESS_GROUP
+        popen_options["stdin"] = subprocess.PIPE
+        # The bootstrap cannot create Julia until the controller assigns it to
+        # the kill-on-close job and releases the one-byte gate.  Every Julia
+        # descendant is consequently born inside the owned job tree.
+        launch_command = (
+            sys.executable,
+            "-I",
+            "-S",
+            "-c",
+            _WINDOWS_JOB_BOOTSTRAP,
+            *command,
+        )
+    else:
+        popen_options["start_new_session"] = True
+    process = subprocess.Popen(launch_command, **popen_options)
+    windows_job: _WindowsKillOnCloseJob | None = None
     stdout_lines: list[str] = []
     stderr_lines: list[str] = []
     progress_lines: Queue[str | None] = Queue()
+    stderr_done = Event()
 
     def read_stdout() -> None:
         assert process.stdout is not None
@@ -132,68 +342,110 @@ def _run_streamed_julia(
 
     def read_stderr() -> None:
         assert process.stderr is not None
-        stderr_lines.extend(process.stderr)
+        try:
+            stderr_lines.extend(process.stderr)
+        finally:
+            stderr_done.set()
 
     stdout_thread = Thread(target=read_stdout, daemon=True)
     stderr_thread = Thread(target=read_stderr, daemon=True)
-    stdout_thread.start()
-    stderr_thread.start()
     timed_out = False
     deadline = time.monotonic() + timeout
     next_heartbeat = time.monotonic() + _WORKER_HEARTBEAT_SECONDS
     returncode: int | None = None
     stdout_done = False
-    while returncode is None or not stdout_done:
-        if returncode is None:
-            returncode = process.poll()
-            if returncode is None and time.monotonic() >= deadline:
+    stdout_started = False
+    stderr_started = False
+    stdin_closed = False
+    try:
+        if _IS_WINDOWS:
+            try:
+                windows_job = _WindowsKillOnCloseJob.create()
+                windows_job.assign(process)
+            except OSError as error:
+                if windows_job is not None:
+                    windows_job.close()
+                    windows_job = None
+                raise JuliaResponseBackendError(
+                    "M02 Julia worker could not enter a kill-on-close Windows job"
+                ) from error
+        stdout_thread.start()
+        stdout_started = True
+        stderr_thread.start()
+        stderr_started = True
+        if _IS_WINDOWS:
+            assert process.stdin is not None
+            process.stdin.write(_WINDOWS_JOB_START_TOKEN)
+            process.stdin.flush()
+            process.stdin.close()
+            stdin_closed = True
+        while returncode is None or not stdout_done or not stderr_done.is_set():
+            if returncode is None:
+                returncode = process.poll()
+            now = time.monotonic()
+            wait_seconds = min(0.05, max(0.0, deadline - now))
+            if returncode is None:
+                wait_seconds = min(
+                    wait_seconds,
+                    max(0.0, next_heartbeat - now),
+                )
+            try:
+                line = progress_lines.get(timeout=wait_seconds)
+            except Empty:
+                line = ""
+            if line is None:
+                stdout_done = True
+            elif line:
+                _forward_julia_progress_line(line)
+            if returncode is None:
+                returncode = process.poll()
+            now = time.monotonic()
+            if (
+                not timed_out
+                and now >= deadline
+                and (
+                    returncode is None
+                    or not stdout_done
+                    or not stderr_done.is_set()
+                )
+            ):
                 timed_out = True
-                process.kill()
-                returncode = process.wait()
+                _terminate_process_tree(process, windows_job)
+                if returncode is None:
+                    returncode = process.returncode
                 stderr_lines.append(
                     f"Julia worker timed out after {timeout} seconds\n"
                 )
-        now = time.monotonic()
-        wait_seconds = 0.05
-        if returncode is None:
-            wait_seconds = min(
-                wait_seconds,
-                max(0.0, next_heartbeat - now),
-                max(0.0, deadline - now),
-            )
-        try:
-            line = progress_lines.get(timeout=wait_seconds)
-        except Empty:
-            line = ""
-        if line is None:
-            stdout_done = True
-        elif line:
-            _forward_julia_progress_line(line)
-        now = time.monotonic()
-        if returncode is None and now >= next_heartbeat:
-            emit_progress(
-                ProgressEventKind.WORKER_HEARTBEAT,
-                worker="Julia",
-                worker_alive=True,
-                heartbeat_interval_seconds=_WORKER_HEARTBEAT_SECONDS,
-            )
-            next_heartbeat = now + _WORKER_HEARTBEAT_SECONDS
-    stdout_thread.join()
-    stderr_thread.join()
-    if process.stdout is not None:
-        process.stdout.close()
-    if process.stderr is not None:
-        process.stderr.close()
+            if returncode is None and now >= next_heartbeat:
+                emit_progress(
+                    ProgressEventKind.WORKER_HEARTBEAT,
+                    worker="Julia",
+                    worker_alive=True,
+                    heartbeat_interval_seconds=_WORKER_HEARTBEAT_SECONDS,
+                )
+                next_heartbeat = now + _WORKER_HEARTBEAT_SECONDS
+    except BaseException:
+        _terminate_process_tree(process, windows_job)
+        raise
+    finally:
+        if process.stdin is not None and not stdin_closed:
+            process.stdin.close()
+        if stdout_started:
+            stdout_thread.join()
+        if stderr_started:
+            stderr_thread.join()
+        if process.stdout is not None:
+            process.stdout.close()
+        if process.stderr is not None:
+            process.stderr.close()
+        if windows_job is not None:
+            windows_job.close()
     return SimpleNamespace(
         returncode=returncode,
         stdout="".join(stdout_lines)[-4000:],
         stderr="".join(stderr_lines)[-4000:],
         timed_out=timed_out,
     )
-
-
-class JuliaResponseBackendError(RuntimeError):
-    """The package-owned Julia precision worker is unavailable or rejected work."""
 
 
 def _reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -238,6 +490,126 @@ def _strict_json_file(path: Path, label: str) -> dict[str, object]:
     return value
 
 
+_WORKER_FAILURE_BASE_FIELDS = frozenset({
+    "worker_exit_code",
+    "worker_timed_out",
+    "worker_stderr_tail",
+    "worker_error_type",
+    "worker_error_message",
+})
+
+
+def _bounded_text(value: object, limit: int) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, bytes):
+        value = value.decode("utf-8", errors="replace")
+    if not isinstance(value, str):
+        return None
+    return value[-limit:]
+
+
+def _copy_failure_value(value: object, *, depth: int = 0) -> object:
+    """Copy a bounded JSON failure value or reject an untrusted attribute."""
+
+    if depth > 8:
+        raise ValueError("worker failure nesting is too deep")
+    if value is None or isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        if len(value) > 4000:
+            raise ValueError("worker failure text is too long")
+        return value
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError("worker failure number is not finite")
+        return value
+    if isinstance(value, Mapping):
+        if len(value) > 128:
+            raise ValueError("worker failure object is too large")
+        copied: dict[str, object] = {}
+        for key, item in value.items():
+            if not isinstance(key, str) or not key or len(key) > 128:
+                raise ValueError("worker failure key is invalid")
+            copied[key] = _copy_failure_value(item, depth=depth + 1)
+        return copied
+    if isinstance(value, list):
+        if len(value) > 256:
+            raise ValueError("worker failure list is too large")
+        return [_copy_failure_value(item, depth=depth + 1) for item in value]
+    raise ValueError("worker failure value is not JSON-compatible")
+
+
+def _structured_worker_failure(value: object) -> dict[str, object] | None:
+    if not isinstance(value, Mapping):
+        return None
+    try:
+        copied = _copy_failure_value(value)
+    except ValueError:
+        return None
+    if not isinstance(copied, dict):
+        return None
+    try:
+        serialized = json.dumps(
+            copied,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    except (TypeError, ValueError):
+        return None
+    if len(serialized) > 32_000:
+        return None
+    for name in ("failure_code", "failure_class"):
+        item = copied.get(name)
+        if not isinstance(item, str) or not item:
+            return None
+    return copied
+
+
+def worker_failure_payload(error: BaseException) -> dict[str, object] | None:
+    """Return one bounded legacy-or-extended Julia worker failure receipt."""
+
+    raw = getattr(error, "worker_failure", None)
+    if not isinstance(raw, Mapping):
+        return None
+    allowed = _WORKER_FAILURE_BASE_FIELDS | {"failure"}
+    if not _WORKER_FAILURE_BASE_FIELDS.issubset(raw) or not set(raw).issubset(
+        allowed
+    ):
+        return None
+    exit_code = raw["worker_exit_code"]
+    if exit_code is not None and (
+        isinstance(exit_code, bool) or not isinstance(exit_code, int)
+    ):
+        return None
+    timed_out = raw["worker_timed_out"]
+    if not isinstance(timed_out, bool):
+        return None
+    stderr = _bounded_text(raw["worker_stderr_tail"], 4000)
+    error_type = _bounded_text(raw["worker_error_type"], 256)
+    error_message = _bounded_text(raw["worker_error_message"], 4000)
+    if raw["worker_stderr_tail"] is not None and stderr is None:
+        return None
+    if raw["worker_error_type"] is not None and error_type is None:
+        return None
+    if raw["worker_error_message"] is not None and error_message is None:
+        return None
+    receipt: dict[str, object] = {
+        "worker_exit_code": exit_code,
+        "worker_timed_out": timed_out,
+        "worker_stderr_tail": stderr,
+        "worker_error_type": error_type,
+        "worker_error_message": error_message,
+    }
+    if "failure" in raw:
+        structured = _structured_worker_failure(raw["failure"])
+        if structured is not None:
+            receipt["failure"] = structured
+    return receipt
+
+
 def _worker_failure_details(
     completed: object,
     response_path: Path,
@@ -256,31 +628,41 @@ def _worker_failure_details(
             error_response = None
     error_type: str | None = None
     error_message: str | None = None
+    structured_failure: dict[str, object] | None = None
+    required_response_fields = {
+        "schema_version", "status", "error_type", "message"
+    }
     if (
         isinstance(error_response, Mapping)
-        and set(error_response) == {
-            "schema_version", "status", "error_type", "message"
-        }
+        and required_response_fields.issubset(error_response)
+        and set(error_response).issubset(required_response_fields | {"failure"})
         and error_response["schema_version"] == 1
         and error_response["status"] == "error"
         and isinstance(error_response["error_type"], str)
         and isinstance(error_response["message"], str)
     ):
-        error_type = error_response["error_type"]
-        error_message = error_response["message"]
+        error_type = _bounded_text(error_response["error_type"], 256)
+        error_message = _bounded_text(error_response["message"], 4000)
+        if "failure" in error_response:
+            structured_failure = _structured_worker_failure(
+                error_response["failure"]
+            )
     raw_exit_code = getattr(completed, "returncode", None)
     exit_code = (
         raw_exit_code
         if isinstance(raw_exit_code, int) and not isinstance(raw_exit_code, bool)
         else None
     )
-    return {
+    details: dict[str, object] = {
         "worker_exit_code": exit_code,
         "worker_timed_out": bool(getattr(completed, "timed_out", False)),
         "worker_stderr_tail": str(getattr(completed, "stderr", ""))[-4000:],
         "worker_error_type": error_type,
         "worker_error_message": error_message,
     }
+    if structured_failure is not None:
+        details["failure"] = structured_failure
+    return details
 
 
 def _raise_worker_failure(details: Mapping[str, object]) -> None:
@@ -297,7 +679,19 @@ def _raise_worker_failure(details: Mapping[str, object]) -> None:
         message += f": {error_type}: {error_message}"
     elif isinstance(stderr, str) and stderr:
         message += f": {stderr}"
-    failure = JuliaResponseBackendError(message)
+    structured = details.get("failure")
+    error_class: type[JuliaResponseBackendError]
+    if timed_out:
+        error_class = JuliaWorkerTimeoutError
+    elif (
+        isinstance(structured, Mapping)
+        and structured.get("failure_code") == "ODE_RESOURCE_LIMIT"
+        and structured.get("failure_class") == "CONTROL"
+    ):
+        error_class = JuliaODEResourceLimitError
+    else:
+        error_class = JuliaResponseBackendError
+    failure = error_class(message)
     failure.worker_failure = dict(details)
     raise failure
 
@@ -561,17 +955,29 @@ class JuliaResponseAdapter:
                     command, cwd=directory, env=environment, timeout=timeout
                 )
             else:
-                completed = self.runner(
-                    command,
-                    cwd=directory,
-                    env=environment,
-                    capture_output=True,
-                    text=True,
-                    check=False,
-                    timeout=timeout,
-                )
+                try:
+                    completed = self.runner(
+                        command,
+                        cwd=directory,
+                        env=environment,
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                        timeout=timeout,
+                    )
+                except subprocess.TimeoutExpired as error:
+                    stderr = _bounded_text(error.stderr, 4000)
+                    if stderr is None:
+                        stderr = _bounded_text(error.output, 4000) or ""
+                    _raise_worker_failure({
+                        "worker_exit_code": None,
+                        "worker_timed_out": True,
+                        "worker_stderr_tail": stderr,
+                        "worker_error_type": None,
+                        "worker_error_message": None,
+                    })
             returncode = getattr(completed, "returncode", None)
-            if returncode != 0:
+            if bool(getattr(completed, "timed_out", False)) or returncode != 0:
                 _raise_worker_failure(_worker_failure_details(
                     completed, response_path
                 ))

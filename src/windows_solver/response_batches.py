@@ -44,6 +44,7 @@ from .julia_response_backend import (
     JuliaPrecisionRootBackend,
     JuliaResponseAdapter,
     JuliaResponseBackendError,
+    worker_failure_payload as _julia_worker_failure_payload,
 )
 from .progress import PROGRESS_SCHEMA, ProgressEventKind, emit_progress, progress_scope
 from .solved_leaf_cache import (
@@ -2183,35 +2184,16 @@ def _execute_campaign_stage(
     return execute(leaf, digits)
 
 
-def _worker_failure_payload(error: BaseException) -> dict[str, object] | None:
-    """Preserve a Julia worker diagnostic only when its operational shape is exact."""
+def worker_failure_payload(error: BaseException) -> dict[str, object] | None:
+    """Preserve one bounded legacy-or-extended Julia worker diagnostic."""
 
-    raw = getattr(error, "worker_failure", None)
-    expected = {
-        "worker_exit_code",
-        "worker_timed_out",
-        "worker_stderr_tail",
-        "worker_error_type",
-        "worker_error_message",
-    }
-    if not isinstance(raw, Mapping) or set(raw) != expected:
-        return None
-    exit_code = raw["worker_exit_code"]
-    if exit_code is not None and (
-        isinstance(exit_code, bool) or not isinstance(exit_code, int)
-    ):
-        return None
-    if not isinstance(raw["worker_timed_out"], bool):
-        return None
-    for name in (
-        "worker_stderr_tail",
-        "worker_error_type",
-        "worker_error_message",
-    ):
-        value = raw[name]
-        if value is not None and not isinstance(value, str):
-            return None
-    return dict(raw)
+    return _julia_worker_failure_payload(error)
+
+
+def _worker_failure_payload(error: BaseException) -> dict[str, object] | None:
+    """Backward-compatible internal spelling for the campaign failure path."""
+
+    return worker_failure_payload(error)
 
 
 def _complex_progress(value: complex) -> dict[str, float]:

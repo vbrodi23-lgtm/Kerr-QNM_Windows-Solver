@@ -210,6 +210,49 @@ class ProgressBusTests(unittest.TestCase):
         self.assertEqual(observer.events[0].context.leaf_id, "leaf-reader")
         self.assertEqual(observer.events[0].context.phase, "PRIMARY")
 
+    def test_external_ode_progress_rejects_malformed_solver_counters(self):
+        valid = {
+            "schema": PROGRESS_SCHEMA,
+            "kind": "ode_solve_completed",
+            "context": {"suboperation": "Xin"},
+            "payload": {
+                "ode_solve_id": 4,
+                "ode_leg": "Xin_inner_to_match",
+                "ode_stats_scope": "leg",
+                "ode_t_start": "-5000.0",
+                "ode_t_end": "0.0",
+                "ode_t_current": "0.0",
+                "ode_retcode": "Success",
+                "ode_endpoint_reached": True,
+                "ode_rhs_evaluations": 4096,
+                "ode_accepted_steps": 1024,
+                "ode_rejected_steps": 3,
+                "ode_jacobian_evaluations": 0,
+                "ode_linear_solves": 0,
+                "ode_nonlinear_iterations": 0,
+                "ode_nonlinear_convergence_failures": 0,
+                "ode_last_accepted_step_abs": "0.25",
+                "ode_min_accepted_step_abs": "1e-12",
+                "ode_proposed_step_abs": None,
+                "ode_algorithm_configured": "AutoVern9(Rosenbrock23(autodiff=false))",
+                "elapsed_seconds": 3.0,
+            },
+        }
+        observer = RecordingObserver()
+        with activate_progress(observer):
+            ingest_external_progress(valid)
+            with self.assertRaises(ValueError):
+                ingest_external_progress({
+                    **valid,
+                    "payload": {
+                        **valid["payload"],
+                        "ode_accepted_steps": "1024",
+                    },
+                })
+
+        self.assertEqual(len(observer.events), 1)
+        self.assertEqual(observer.events[0].payload["ode_accepted_steps"], 1024)
+
     def test_mutable_leaf_values_are_snapshotted_without_live_references(self):
         class MutableLeaf:
             def __init__(self, value):
@@ -343,6 +386,208 @@ class CampaignProgressReporterTests(unittest.TestCase):
             "suboperation_completed",
         ):
             self.assertIn(kind, output)
+
+    def test_promoted_stage_start_clears_prior_precision_live_solver_state(self):
+        reporter = CampaignProgressReporter(
+            "normal", self.reporter_checkpoint, io.StringIO()
+        )
+        base = {
+            "leaf_id": "leaf-1",
+            "leaf_index": 1,
+            "leaf_count": 212,
+            "role": "primary",
+            "mode": {"s": -2, "ell": 2, "m": 2, "n": 0},
+            "spin": 0.9999,
+            "mechanism_id": "horizon-admittance",
+        }
+        reporter.publish(_event(
+            ProgressEventKind.PRECISION_STAGE_STARTED,
+            **base,
+            precision_digits=64,
+        ))
+        reporter.publish(_payload_event(
+            ProgressEventKind.ROOT_SEED_SELECTED,
+            {"seed_kind": "AUTHENTICATED_BACKGROUND", "fallback_used": False},
+            **base,
+            precision_digits=64,
+            phase="PRIMARY",
+            seed_kind="AUTHENTICATED_BACKGROUND",
+            fallback_used=False,
+        ))
+        reporter.publish(_payload_event(
+            ProgressEventKind.NEWTON_ITERATION_STARTED,
+            {"determinant_abs": "9.87654321e-7"},
+            **base,
+            precision_digits=64,
+            phase="PRIMARY",
+            newton_index=7,
+            newton_limit=16,
+            current_omega={"real": "0.7", "imaginary": "-0.1"},
+        ))
+        reporter.publish(_payload_event(
+            ProgressEventKind.DETERMINANT_COMPLETED,
+            {"determinant_abs": "9.87654321e-7"},
+            **base,
+            precision_digits=64,
+            phase="PRIMARY",
+            suboperation="Xin",
+        ))
+        reporter.publish(_payload_event(
+            ProgressEventKind.SUBOPERATION_PROGRESS,
+            {
+                "suboperation": "Xin",
+                "rhs_evaluations": 123456,
+                "rho_span_fraction": 0.4,
+                "elapsed_seconds": 99.0,
+            },
+            **base,
+            precision_digits=64,
+            phase="PRIMARY",
+            suboperation="Xin",
+        ))
+
+        reporter.publish(_event(
+            ProgressEventKind.PRECISION_STAGE_STARTED,
+            **base,
+            precision_digits=80,
+        ))
+        live = reporter._live_execution_mapping()
+
+        self.assertEqual(live["precision_digits"], 80)
+        self.assertEqual(live["worker"], "Julia")
+        for name in (
+            "phase",
+            "seed_kind",
+            "seed_authenticated",
+            "current_omega",
+            "newton_index",
+            "newton_limit",
+            "determinant_abs",
+            "best_determinant_abs",
+            "suboperation",
+            "radial_suboperation",
+            "radial_rhs_evaluations",
+            "radial_rho_span_fraction",
+            "radial_elapsed_seconds",
+        ):
+            self.assertIsNone(live[name], name)
+
+    def test_worker_ode_segment_stats_reach_status_and_dashboard_state(self):
+        reporter = CampaignProgressReporter(
+            "normal", self.reporter_checkpoint, io.StringIO()
+        )
+        reporter.publish(_event(
+            ProgressEventKind.PRECISION_STAGE_STARTED,
+            leaf_id="leaf-1",
+            leaf_index=1,
+            leaf_count=212,
+            precision_digits=80,
+        ))
+        payload = {
+            "ode_solve_id": 4,
+            "ode_leg": "Xin_inner_to_match",
+            "ode_stats_scope": "leg",
+            "ode_t_start": "-5000.0",
+            "ode_t_end": "0.0",
+            "ode_t_current": "0.0",
+            "ode_retcode": "Success",
+            "ode_endpoint_reached": True,
+            "ode_rhs_evaluations": 4096,
+            "ode_accepted_steps": 1024,
+            "ode_rejected_steps": 3,
+            "ode_jacobian_evaluations": 0,
+            "ode_linear_solves": 0,
+            "ode_nonlinear_iterations": 0,
+            "ode_nonlinear_convergence_failures": 0,
+            "ode_last_accepted_step_abs": "0.25",
+            "ode_min_accepted_step_abs": "1e-12",
+            "ode_proposed_step_abs": None,
+            "ode_algorithm_configured": "AutoVern9(Rosenbrock23(autodiff=false))",
+            "elapsed_seconds": 3.0,
+        }
+        reporter.publish(_payload_event(
+            ProgressEventKind.ODE_SOLVE_COMPLETED,
+            payload,
+            leaf_id="leaf-1",
+            leaf_index=1,
+            leaf_count=212,
+            precision_digits=80,
+            phase="PRIMARY",
+            suboperation="Xin",
+        ))
+
+        live = reporter._live_execution_mapping()
+        self.assertEqual(live["ode_leg"], "Xin_inner_to_match")
+        self.assertEqual(live["ode_retcode"], "Success")
+        self.assertEqual(live["ode_rhs_evaluations"], 4096)
+        self.assertEqual(live["ode_accepted_steps"], 1024)
+        self.assertEqual(live["ode_rejected_steps"], 3)
+        status = json.loads(
+            Path(f"{self.reporter_checkpoint}.status.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(status["live_execution"]["ode_leg"], "Xin_inner_to_match")
+        self.assertEqual(status["live_execution"]["ode_rhs_evaluations"], 4096)
+        dashboard = "\n".join(reporter._current_execution_lines())
+        compact = "\n".join(reporter._current_execution_lines(compact=True))
+        for expected in (
+            "#4 Xin_inner_to_match",
+            "ret=Success",
+            "nf=4096",
+            "accept/reject=1024/3",
+            "jac/linear=0/0",
+            "nonlinear/fail=0/0",
+            "dt last/min/proposed=0.25/1e-12/-",
+            "AutoVern9(Rosenbrock23(autodiff=false))",
+        ):
+            self.assertIn(expected, dashboard)
+        self.assertIn("dt last/min/proposed=0.25/1e-12/-", compact)
+
+    def test_operational_terminal_events_cannot_leave_live_solver_running(self):
+        for terminal_kind in (
+            ProgressEventKind.LEAF_FAILED,
+            ProgressEventKind.CAMPAIGN_FAILED,
+            ProgressEventKind.REQUEST_FAILED,
+        ):
+            with self.subTest(kind=terminal_kind.value):
+                reporter = CampaignProgressReporter(
+                    "normal", self.reporter_checkpoint, io.StringIO()
+                )
+                reporter.publish(_event(
+                    ProgressEventKind.PRECISION_STAGE_STARTED,
+                    leaf_id="leaf-failed",
+                    leaf_index=1,
+                    leaf_count=212,
+                    precision_digits=80,
+                ))
+                reporter.publish(_event(
+                    ProgressEventKind.ROOT_PHASE_STARTED,
+                    leaf_id="leaf-failed",
+                    leaf_index=1,
+                    leaf_count=212,
+                    precision_digits=80,
+                    phase="PRIMARY",
+                ))
+                reporter.publish(_payload_event(
+                    terminal_kind,
+                    {"error_type": "JuliaWorkerTimeoutError", "message": "timeout"},
+                    leaf_id="leaf-failed",
+                    leaf_index=1,
+                    leaf_count=212,
+                    precision_digits=80,
+                    phase="PRIMARY",
+                ))
+
+                live = reporter._live_execution_mapping()
+                self.assertEqual(live["state"], "FAILED")
+                self.assertEqual(reporter._dashboard_state["root_status"], "FAILED")
+                status = json.loads(
+                    Path(f"{self.reporter_checkpoint}.status.json").read_text(
+                        encoding="utf-8"
+                    )
+                )
+                self.assertEqual(status["live_execution"]["state"], "FAILED")
 
     def test_normal_writes_atomic_live_status_for_second_process_inspection(self):
         with TemporaryDirectory() as directory:
