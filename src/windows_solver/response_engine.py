@@ -725,7 +725,7 @@ class DiagnosticRootReadout:
             ),
             determinant_residual_abs=float(value["determinant_residual_abs"]),
             determinant_derivative_abs=float(value["determinant_derivative_abs"]),
-            converged=bool(value["converged"]),
+            converged=value["converged"],
         )
 
 
@@ -848,7 +848,7 @@ class RootReadout:
             omega=_complex_from_mapping(value.get("omega"), "root omega"),
             determinant_residual_abs=float(value["determinant_residual_abs"]),
             determinant_derivative_abs=float(value["determinant_derivative_abs"]),
-            converged=bool(value["converged"]),
+            converged=value["converged"],
             root_reference_id=str(value["root_reference_id"]),
             branch_id=str(value["branch_id"]),
             equation_id=str(value["equation_id"]),
