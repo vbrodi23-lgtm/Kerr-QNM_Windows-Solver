@@ -257,8 +257,8 @@ class JuliaResponseBackendTests(unittest.TestCase):
         self.assertIn("carried_available = false", worker)
         self.assertIn("carried_residual = candidate_residual", worker)
         self.assertIn("carried_available = true", worker)
-        self.assertIn("return value, magnitude, derivative_abs, true", worker)
-        self.assertIn("root, residual, accepted_derivative, _ = bounded_newton", worker)
+        self.assertIn("return value, magnitude, derivative, true", worker)
+        self.assertIn("root, residual, accepted_derivative, newton_converged =", worker)
         self.assertIn("if isnothing(accepted_derivative)", worker)
         # The seed determinant is carried, not recomputed, but every later
         # iteration still evaluates its own residual at its own frequency.
