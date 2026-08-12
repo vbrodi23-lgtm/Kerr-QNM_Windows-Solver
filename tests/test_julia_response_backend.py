@@ -387,6 +387,92 @@ class JuliaResponseBackendTests(unittest.TestCase):
         self.assertIn("correction_abs <= tolerance", worker)
         self.assertNotIn("best_residual <= tolerance", worker)
 
+    def test_package_worker_uses_stable_two_ended_determinants(self):
+        """Catches singular horizon reconstruction and common-flow exterior roots."""
+
+        worker = (
+            Path(__file__).resolve().parents[1]
+            / "src/windows_solver/data/julia/m02_worker.jl"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("branches.Cinc - reflectivity * branches.Cref", worker)
+        self.assertNotIn("xout_match =", worker)
+        self.assertNotIn("horizon = branches.xin", worker)
+        self.assertIn(
+            "readout_branches = branch_values(T, request, omega, readout, :xup)",
+            worker,
+        )
+        self.assertIn(
+            "wronskian(perturbed_in, readout_branches.xup)",
+            worker,
+        )
+        self.assertNotIn('"branch" => "Xup"', worker)
+        self.assertNotIn("perturbed_Xup_real_radius", worker)
+
+    def test_package_worker_rejects_invalid_mechanism_and_support_contracts(self):
+        worker = (
+            Path(__file__).resolve().parents[1]
+            / "src/windows_solver/data/julia/m02_worker.jl"
+        ).read_text(encoding="utf-8")
+
+        for mechanism in (
+            "horizon-admittance",
+            "exterior-fixed-r3",
+            "exterior-light-ring",
+            "exterior-throat-kappa",
+            "exterior-alpha-zero",
+            "exterior-alpha-half",
+            "exterior-alpha-one",
+        ):
+            self.assertIn(f'"{mechanism}"', worker)
+        self.assertIn("ALLOWED_MECHANISMS", worker)
+        self.assertIn("unsupported mechanism_id", worker)
+        self.assertIn("half_width > zero(T)", worker)
+        self.assertIn("support lower bound is inconsistent", worker)
+        self.assertIn("support upper bound is inconsistent", worker)
+
+    def test_package_worker_rejects_an_unaccepted_newton_step(self):
+        worker = (
+            Path(__file__).resolve().parents[1]
+            / "src/windows_solver/data/julia/m02_worker.jl"
+        ).read_text(encoding="utf-8")
+
+        self.assertNotIn('value -= parse(T, "0.125") * step', worker)
+        self.assertIn("if !accepted", worker)
+        self.assertIn("best_value, best_residual = candidate, candidate_abs", worker)
+
+    def test_package_worker_cross_checks_frequency_derivatives(self):
+        worker = (
+            Path(__file__).resolve().parents[1]
+            / "src/windows_solver/data/julia/m02_worker.jl"
+        ).read_text(encoding="utf-8")
+
+        for evidence in (
+            "derivative_real_half",
+            "derivative_real_base",
+            "derivative_real_double",
+            "derivative_imaginary",
+            "derivative_uncertainty_abs",
+            "derivative_lower_bound_abs",
+        ):
+            self.assertIn(evidence, worker)
+        self.assertIn("correction_upper_bound", worker)
+        self.assertIn("derivative_control_completed", worker)
+
+    def test_promoted_branch_authentication_uses_a_mode_specific_enclosure(self):
+        root = Path(__file__).resolve().parents[1]
+        worker = (root / "src/windows_solver/data/julia/m02_worker.jl").read_text(
+            encoding="utf-8"
+        )
+        backend = (
+            root / "src/windows_solver/julia_response_backend.py"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn('"branch_enclosure_radius_abs"', worker)
+        self.assertIn('"branch_enclosure_radius_abs"', backend)
+        self.assertIn("_mode_specific_branch_enclosure_radius", backend)
+        self.assertIn('"branch_authentication_contract_version" => 3', worker)
+
     def test_reserved_julia_stdout_event_is_forwarded_to_active_reporter(self):
         class Observer:
             def __init__(self):
