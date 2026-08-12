@@ -847,8 +847,12 @@ function bounded_newton(::Type{T}, request, initial::Complex{T}, amplitude::Comp
                 break
             end
         end
-        applied_step = accepted ?
-            selected_damping * step : zero(Complex{T})
+        applied_step = if accepted
+            selected_damping * step
+        else
+            selected_damping = zero(T)
+            zero(Complex{T})
+        end
         progress_emit("newton_iteration_completed"; context=newton_context, payload=Dict(
             "derivative_abs" => string(derivative_abs),
             "raw_step" => progress_complex(raw_step),
