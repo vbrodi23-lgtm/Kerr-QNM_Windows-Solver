@@ -66,5 +66,6 @@ Confirm that a fresh checkout can originate every M02 numerical prerequisite fro
 - Observe each promoted ODE segment's SciML return code and final step statistics, fail closed on ODE resource/control failures, clear stale cross-tier dashboard values, and terminate the full Julia process tree without changing numerical controls.
 - Gate each four-phase root solve and precision promotion on the finite local Newton-correction estimate `|D|/|Dω|` while retaining raw `|D|` diagnostics, branch-continuation checks, and explicit non-certificate wording; bind the policy into scientific identity and migrate only stored binary64 PRIMARY successes whose derivative evidence passes it.
 - Repair live uncertainty channels in response units from full diagnostic signed-root evidence, eliminate duplicate Python/Julia determinant work, invalidate only incompatible scientific receipts/checkpoints, and preserve resumable checkpoints with honest `INTERRUPTED`/exit-130 handling.
+- Replace the promoted worker's singular horizon reconstruction and common-flow exterior determinant with coefficient and two-ended forms; enforce derivative, branch, support, mechanism, and Newton controls, and normalize numerical booleans before checkpoint persistence.
 
 ---
