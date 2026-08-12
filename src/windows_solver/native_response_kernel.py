@@ -626,7 +626,9 @@ class VettedNativeDeterminantKernel:
             raise NativeResourceUnavailableError(
                 "native determinant frequency derivative is not usable"
             )
-        converged = residual / derivative <= _ROOT_CORRECTION_TOLERANCE
+        converged = bool(
+            residual / derivative <= _ROOT_CORRECTION_TOLERANCE
+        )
         return root, residual, derivative, converged
 
     def evaluate_root(
