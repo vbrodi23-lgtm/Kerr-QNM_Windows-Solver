@@ -17,6 +17,15 @@ const ACTIVE_PROGRESS_CONTEXT = Ref(Dict{String,Any}())
 const ODE_PROGRESS_INTERVAL_SECONDS = 15.0
 const ODE_ALGORITHM_CONFIGURED = "AutoVern9(Rosenbrock23(autodiff=false))"
 const NEXT_ODE_SOLVE_ID = Ref(0)
+const ALLOWED_MECHANISMS = Set([
+    "horizon-admittance",
+    "exterior-fixed-r3",
+    "exterior-light-ring",
+    "exterior-throat-kappa",
+    "exterior-alpha-zero",
+    "exterior-alpha-half",
+    "exterior-alpha-one",
+])
 
 abstract type ODEControlFailure <: Exception end
 
@@ -299,6 +308,9 @@ function flatten_request(document)
     angular = required(document, "angular_A")
     amplitude = required(document, "amplitude")
     policy = required(document, "policy")
+    mechanism = string(required(document, "mechanism_id"))
+    mechanism in ALLOWED_MECHANISMS ||
+        error("unsupported mechanism_id $(repr(mechanism))")
     flattened = Dict{String,Any}(
         "schema_version" => required(document, "schema_version"),
         "operation" => required(document, "operation"),
@@ -311,7 +323,7 @@ function flatten_request(document)
         "omega_im" => required(omega, "imaginary"),
         "angular_A_re" => required(angular, "real"),
         "angular_A_im" => required(angular, "imaginary"),
-        "mechanism_id" => required(document, "mechanism_id"),
+        "mechanism_id" => mechanism,
         "amplitude_re" => required(amplitude, "real"),
         "amplitude_im" => required(amplitude, "imaginary"),
         "precision_digits" => required(document, "precision_digits"),
@@ -329,9 +341,12 @@ function flatten_request(document)
         "root_correction_tolerance" => required(
             policy, "root_correction_tolerance"
         ),
+        "branch_enclosure_radius_abs" => required(
+            policy, "branch_enclosure_radius_abs"
+        ),
         "max_newton_iterations" => required(policy, "max_newton_iterations"),
     )
-    if string(flattened["mechanism_id"]) != "horizon-admittance"
+    if mechanism != "horizon-admittance"
         support = required(document, "support")
         for key in ("lower", "upper", "centre", "half_width")
             flattened["support_$key"] = required(support, key)
@@ -456,7 +471,11 @@ function angular_constants(::Type{BigFloat}, s, ell, m, a, omega, seed_A, pad, d
     return A, A + c^2 - T(2m) * c
 end
 
-function branch_values(::Type{T}, request, omega::Complex{T}, match_radius::T) where {T<:AbstractFloat}
+function branch_values(
+    ::Type{T}, request, omega::Complex{T}, match_radius::T, branch::Symbol
+) where {T<:AbstractFloat}
+    branch in (:xin, :xup, :xup_scattering) ||
+        error("unsupported homogeneous branch request")
     s = parse_integer(request, "s")
     ell = parse_integer(request, "ell")
     m = parse_integer(request, "m")
@@ -491,46 +510,60 @@ function branch_values(::Type{T}, request, omega::Complex{T}, match_radius::T) w
             ode_solution_observer=observe_ode_solution,
         )
     end
-    xin, _, _ = progress_operation("Xin") do
-        CF.solve_Xin(
-            s, m, a, beta_positive, beta_negative, omega, lambda,
-            observed_radial_map(radius_from_rho, "Xin", rho_in, rho_out),
-            rs_match, rho_in, rho_out;
-            initialconditions_order=order,
-            dtype=dtype,
-            reltol=relative_tolerance,
-            abstol=absolute_tolerance,
-            ode_observation_factory=ode_observation_factory,
-            ode_solution_observer=observe_ode_solution,
-        )
+
+    xin_match = nothing
+    if branch == :xin
+        xin, _, _ = progress_operation("Xin") do
+            CF.solve_Xin(
+                s, m, a, beta_positive, beta_negative, omega, lambda,
+                observed_radial_map(radius_from_rho, "Xin", rho_in, rho_out),
+                rs_match, rho_in, rho_out;
+                initialconditions_order=order,
+                dtype=dtype,
+                reltol=relative_tolerance,
+                abstol=absolute_tolerance,
+                ode_observation_factory=ode_observation_factory,
+                ode_solution_observer=observe_ode_solution,
+            )
+        end
+        value = xin(zero(T))
+        xin_match = Complex{T}[value[1], value[2]]
     end
-    xup, _, _ = progress_operation("Xup") do
-        CF.solve_Xup(
-            s, m, a, beta_positive, beta_negative, omega, lambda,
-            observed_radial_map(radius_from_rho, "Xup", rho_in, rho_out),
-            rs_match, rho_in, rho_out;
-            initialconditions_order=order,
-            dtype=dtype,
-            reltol=relative_tolerance,
-            abstol=absolute_tolerance,
-            ode_observation_factory=ode_observation_factory,
-            ode_solution_observer=observe_ode_solution,
-        )
+
+    xup_match = nothing
+    Cref = nothing
+    Cinc = nothing
+    if branch in (:xup, :xup_scattering)
+        xup, _, _ = progress_operation("Xup") do
+            CF.solve_Xup(
+                s, m, a, beta_positive, beta_negative, omega, lambda,
+                observed_radial_map(radius_from_rho, "Xup", rho_in, rho_out),
+                rs_match, rho_in, rho_out;
+                initialconditions_order=order,
+                dtype=dtype,
+                reltol=relative_tolerance,
+                abstol=absolute_tolerance,
+                ode_observation_factory=ode_observation_factory,
+                ode_solution_observer=observe_ode_solution,
+            )
+        end
+        value = xup(zero(T))
+        xup_match = Complex{T}[value[1], value[2]]
+        if branch == :xup_scattering
+            Cref, Cinc = CF.CrefCinc_SN_from_Xup(
+                s, m, a, beta_negative, omega, lambda, xup,
+                radius_from_rho, rs_match, rho_in;
+                order=order,
+                dtype=dtype,
+            )
+        end
     end
-    xin_match = xin(zero(T))
-    xup_match = xup(zero(T))
-    Cref, Cinc = CF.CrefCinc_SN_from_Xup(
-        s, m, a, beta_negative, omega, lambda, xup,
-        radius_from_rho, rs_match, rho_in;
-        order=order,
-        dtype=dtype,
-    )
-    iszero(Cinc) && error("outgoing-horizon normalization has zero Cinc")
-    xout_match = (xup_match .- Cref .* xin_match) ./ Cinc
+
     return (
-        xin=Complex{T}[xin_match[1], xin_match[2]],
-        xup=Complex{T}[xup_match[1], xup_match[2]],
-        xout=Complex{T}[xout_match[1], xout_match[2]],
+        xin=xin_match,
+        xup=xup_match,
+        Cref=Cref,
+        Cinc=Cinc,
         lambda=lambda,
     )
 end
@@ -541,6 +574,33 @@ function compact_profile(radius, centre, half_width, amplitude)
     scaled = (radius - centre) / half_width
     abs(scaled) >= one(scaled) && return zero(amplitude)
     return amplitude * exp(one(scaled) - inv(one(scaled) - scaled^2))
+end
+
+function exterior_support_contract(::Type{T}, request, a::T, readout::T) where {T<:AbstractFloat}
+    lower = parse_real(T, request, "support_lower")
+    upper = parse_real(T, request, "support_upper")
+    centre = parse_real(T, request, "support_centre")
+    half_width = parse_real(T, request, "support_half_width")
+    half_width > zero(T) || error("support half_width must be positive")
+    lower < upper || error("support lower bound must be below upper bound")
+    geometry_tolerance = parse(T, "1e-14") * max(
+        one(T), abs(lower), abs(upper), abs(centre), abs(half_width)
+    )
+    isapprox(
+        lower, centre - half_width;
+        atol=geometry_tolerance,
+        rtol=zero(T),
+    ) || error("support lower bound is inconsistent with centre and half_width")
+    isapprox(
+        upper, centre + half_width;
+        atol=geometry_tolerance,
+        rtol=zero(T),
+    ) || error("support upper bound is inconsistent with centre and half_width")
+    lower > Kerr.r_plus(a) || error("exterior support is not outside the horizon")
+    upper < readout || error("exterior support must lie below the readout radius")
+    parse_integer(request, "support_subinterval_count") > 0 ||
+        error("support_subinterval_count must be positive")
+    return lower, upper
 end
 
 function integrate_real_branch(::Type{T}, request, omega::Complex{T}, lambda::Complex{T},
@@ -592,45 +652,50 @@ end
 
 function determinant(::Type{T}, request, omega::Complex{T}, amplitude::Complex{T}) where {T<:AbstractFloat}
     mechanism = string(required(request, "mechanism_id"))
+    mechanism in ALLOWED_MECHANISMS ||
+        error("unsupported mechanism_id $(repr(mechanism))")
     readout = parse_real(T, request, "readout_radius")
     a = parse_real(T, request, "spin")
     m = parse_integer(request, "m")
 
     if mechanism == "horizon-admittance"
-        branches = branch_values(T, request, omega, readout)
+        branches = branch_values(T, request, omega, readout, :xup_scattering)
         p_h = omega - T(m) * Kerr.omega_horizon(a)
         denominator = T(2) * im * p_h - amplitude
         iszero(denominator) && error("zero horizon chart denominator")
         reflectivity = amplitude / denominator
-        horizon = branches.xin .+ reflectivity .* branches.xout
-        return progress_operation("Wronskian") do
-            wronskian(horizon, branches.xup)
-        end
+        chart_ratio = iszero(p_h) ? T(Inf) : abs(amplitude) / (T(2) * abs(p_h))
+        progress_emit("horizon_chart_evaluated"; payload=Dict(
+            "Cinc_abs" => string(abs(branches.Cinc)),
+            "Cref_abs" => string(abs(branches.Cref)),
+            "horizon_frequency_abs" => string(abs(p_h)),
+            "reflectivity_abs" => string(abs(reflectivity)),
+            "chart_denominator_abs" => string(abs(denominator)),
+            "chart_ratio" => string(chart_ratio),
+        ))
+        return branches.Cinc - reflectivity * branches.Cref
     end
 
-    lower = parse_real(T, request, "support_lower")
-    upper = parse_real(T, request, "support_upper")
-    lower > Kerr.r_plus(a) || error("exterior support is not outside the horizon")
-    upper < readout || error("exterior support must lie below the readout radius")
-    branches = branch_values(T, request, omega, lower)
+    lower, _ = exterior_support_contract(T, request, a, readout)
+    lower_branches = branch_values(T, request, omega, lower, :xin)
+    readout_branches = branch_values(T, request, omega, readout, :xup)
     perturbed_in = progress_operation("perturbed integration"; payload=Dict(
         "branch" => "Xin",
     )) do
         integrate_real_branch(
-            T, request, omega, branches.lambda, lower, readout, branches.xin, amplitude;
+            T,
+            request,
+            omega,
+            lower_branches.lambda,
+            lower,
+            readout,
+            lower_branches.xin,
+            amplitude;
             ode_leg="perturbed_Xin_real_radius",
         )
     end
-    perturbed_up = progress_operation("perturbed integration"; payload=Dict(
-        "branch" => "Xup",
-    )) do
-        integrate_real_branch(
-            T, request, omega, branches.lambda, lower, readout, branches.xup, amplitude;
-            ode_leg="perturbed_Xup_real_radius",
-        )
-    end
     return progress_operation("Wronskian") do
-        wronskian(perturbed_in, perturbed_up)
+        wronskian(perturbed_in, readout_branches.xup)
     end
 end
 
@@ -741,7 +806,7 @@ function bounded_newton(::Type{T}, request, initial::Complex{T}, amplitude::Comp
                 "resulting_determinant_abs" => string(magnitude),
                 "elapsed_seconds" => (time_ns() - iteration_started) / 1.0e9,
             ))
-            return value, magnitude, derivative_abs, true
+            return value, magnitude, derivative, true
         end
         step = raw_step
         maximum_step = parse(T, "0.006")
@@ -776,17 +841,14 @@ function bounded_newton(::Type{T}, request, initial::Complex{T}, amplitude::Comp
                 accepted = true
                 selected_damping = damping
                 resulting_abs = candidate_abs
+                if candidate_abs < best_residual
+                    best_value, best_residual = candidate, candidate_abs
+                end
                 break
             end
         end
-        if !accepted
-            value -= parse(T, "0.125") * step
-            resulting_abs = candidate_abs
-            carried_value = value
-            carried_residual = candidate_residual
-            carried_available = true
-        end
-        applied_step = selected_damping * step
+        applied_step = accepted ?
+            selected_damping * step : zero(Complex{T})
         progress_emit("newton_iteration_completed"; context=newton_context, payload=Dict(
             "derivative_abs" => string(derivative_abs),
             "raw_step" => progress_complex(raw_step),
@@ -799,27 +861,73 @@ function bounded_newton(::Type{T}, request, initial::Complex{T}, amplitude::Comp
             "resulting_determinant_abs" => string(resulting_abs),
             "elapsed_seconds" => (time_ns() - iteration_started) / 1.0e9,
         ))
+        !accepted && break
     end
     return best_value, best_residual, nothing, false
 end
 
 numeric_text(value) = string(value)
 
+function final_derivative(
+    ::Type{T}, request, root::Complex{T}, amplitude::Complex{T},
+    offset::Complex{T}, label::String,
+) where {T<:AbstractFloat}
+    return (
+        determinant_progress(
+            T, request, root + offset, amplitude, "$(label) +", root
+        ) -
+        determinant_progress(
+            T, request, root - offset, amplitude, "$(label) -", root
+        )
+    ) / (T(2) * offset)
+end
+
 function solve_once(::Type{T}, request, initial::Complex{T}, amplitude::Complex{T}) where {T<:AbstractFloat}
-    root, residual, accepted_derivative, _ = bounded_newton(T, request, initial, amplitude)
-    derivative_abs = accepted_derivative
-    if isnothing(accepted_derivative)
-        root_step = parse_real(T, request, "frequency_step") * (one(T) + abs(root))
-        root_derivative = (
-            determinant_progress(T, request, root + root_step, amplitude, "final derivative +h", root) -
-            determinant_progress(T, request, root - root_step, amplitude, "final derivative -h", root)
-        ) / (T(2) * root_step)
-        derivative_abs = abs(root_derivative)
-    end
-    isfinite(derivative_abs) && derivative_abs > zero(T) ||
-        error("determinant frequency derivative is unusable")
+    root, residual, accepted_derivative, newton_converged =
+        bounded_newton(T, request, initial, amplitude)
+    h = parse_real(T, request, "frequency_step") * (one(T) + abs(root))
+    real_offset = Complex{T}(h, zero(T))
+    derivative_real_base = isnothing(accepted_derivative) ?
+        final_derivative(
+            T, request, root, amplitude, real_offset, "final derivative h"
+        ) : accepted_derivative
+    derivative_real_half = final_derivative(
+        T, request, root, amplitude, real_offset / T(2), "final derivative h/2"
+    )
+    derivative_real_double = final_derivative(
+        T, request, root, amplitude, T(2) * real_offset, "final derivative 2h"
+    )
+    derivative_imaginary = final_derivative(
+        T,
+        request,
+        root,
+        amplitude,
+        Complex{T}(zero(T), h),
+        "final derivative ih",
+    )
+    derivative_uncertainty_abs = maximum((
+        abs(derivative_real_base - derivative_real_half),
+        abs(derivative_real_double - derivative_real_half),
+        abs(derivative_imaginary - derivative_real_half),
+    ))
+    derivative_abs = abs(derivative_real_half)
+    derivative_lower_bound_abs = derivative_abs - derivative_uncertainty_abs
+    isfinite(derivative_abs) && isfinite(derivative_uncertainty_abs) &&
+        derivative_lower_bound_abs > zero(T) ||
+        error("determinant frequency derivative controls are unusable")
+    correction_upper_bound = residual / derivative_lower_bound_abs
     tolerance = parse_real(T, request, "root_correction_tolerance")
-    converged = residual / derivative_abs <= tolerance
+    converged = newton_converged && correction_upper_bound <= tolerance
+    progress_emit("derivative_control_completed"; payload=Dict(
+        "derivative_real_half" => progress_complex(derivative_real_half),
+        "derivative_real_base" => progress_complex(derivative_real_base),
+        "derivative_real_double" => progress_complex(derivative_real_double),
+        "derivative_imaginary" => progress_complex(derivative_imaginary),
+        "derivative_uncertainty_abs" => string(derivative_uncertainty_abs),
+        "derivative_lower_bound_abs" => string(derivative_lower_bound_abs),
+        "correction_upper_bound" => string(correction_upper_bound),
+        "accepted" => converged,
+    ))
     return root, residual, derivative_abs, converged
 end
 
@@ -890,7 +998,7 @@ function solve_phase(
             )
         end
         if actual_kind != "FALLBACK_BACKGROUND" && fallback_initial !== nothing
-            if !result[4] || abs(result[1] - fallback_initial) > T("0.005")
+            if !result[4] || abs(result[1] - fallback_initial) > parse_real(T, request, "branch_enclosure_radius_abs")
                 if !result[4]
                     fallback_reason = "PREDICTOR_NEWTON_FAILED"
                 else
@@ -966,7 +1074,7 @@ function result_fields(::Type{T}, request, digits::Int, bits::Int) where {T<:Abs
             T, request, "primary_predictor_re", "primary_predictor_im"
         )
         if isfinite(real(predictor)) && isfinite(imag(predictor)) &&
-           abs(predictor - omega) <= T("0.005")
+           abs(predictor - omega) <= parse_real(T, request, "branch_enclosure_radius_abs")
             primary_initial = predictor
             fallback_initial = omega
             primary_seed_kind = primary_requested_seed_kind
@@ -1004,7 +1112,7 @@ function result_fields(::Type{T}, request, digits::Int, bits::Int) where {T<:Abs
             T, request, "SEED-PATH", alternate, amplitude;
             seed_kind="INDEPENDENT_SEED_PATH",
         )
-    branch_tolerance = T("0.005")
+    branch_tolerance = parse_real(T, request, "branch_enclosure_radius_abs")
     branch_valid = abs(root - omega) <= branch_tolerance && all(
         abs(candidate - root) <= branch_tolerance
         for candidate in (truncation_root, resolution_root, seed_path_root)
@@ -1029,7 +1137,7 @@ function result_fields(::Type{T}, request, digits::Int, bits::Int) where {T<:Abs
         "root_residual_abs" => numeric_text(residual),
         "root_derivative_abs" => numeric_text(derivative_abs),
         "root_converged" => converged,
-        "branch_authentication_contract_version" => 2,
+        "branch_authentication_contract_version" => 3,
         "root_branch_continuation_valid" => branch_valid,
         "branch_tolerance_abs" => numeric_text(branch_tolerance),
         "root_displacement_abs" => numeric_text(abs(root - omega)),
