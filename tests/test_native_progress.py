@@ -219,8 +219,10 @@ class NativeProgressTests(unittest.TestCase):
 
         observer = Observer()
         with activate_progress(observer):
-            root, residual, converged = VettedNativeDeterminantKernel._bounded_newton(
-                determinant, 0.5002 - 0.1j
+            root, residual, derivative, converged = (
+                VettedNativeDeterminantKernel._bounded_newton(
+                    determinant, 0.5002 - 0.1j
+                )
             )
 
         determinant_events = [
@@ -238,6 +240,7 @@ class NativeProgressTests(unittest.TestCase):
         self.assertEqual(len(determinant_events), len(calls))
         self.assertTrue(converged)
         self.assertLess(residual, 2.0e-11)
+        self.assertAlmostEqual(derivative, 1.0)
         self.assertAlmostEqual(root.real, 0.5)
         self.assertTrue(started)
         self.assertEqual(started[0].payload["acceptance_threshold"], 2.0e-11)

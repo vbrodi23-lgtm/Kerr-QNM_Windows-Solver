@@ -120,7 +120,7 @@ class NewtonCorrectionGateTests(unittest.TestCase):
             calls.append(complex(omega))
             return residual + derivative * complex(omega)
 
-        root, observed_residual, converged = (
+        root, observed_residual, observed_derivative, converged = (
             response_engine.VettedNativeDeterminantKernel._bounded_newton(
                 determinant, 0.0j
             )
@@ -129,8 +129,40 @@ class NewtonCorrectionGateTests(unittest.TestCase):
         self.assertTrue(converged)
         self.assertEqual(root, 0.0j)
         self.assertAlmostEqual(observed_residual, residual, places=22)
+        self.assertAlmostEqual(observed_derivative, derivative, places=9)
         self.assertLess(residual / derivative, 2.0e-11)
         self.assertEqual(len(calls), 4)
+
+    def test_solve_once_reuses_derivative_that_accepted_the_same_root(self):
+        """Catches recomputing the accepted phase derivative for its receipt."""
+
+        derivative = 36.1
+        residual = 3.50e-11
+
+        class CountingKernel(response_engine.VettedNativeDeterminantKernel):
+            def __init__(self):
+                self.calls: list[complex] = []
+
+            def _determinant(self, sn, omega, perturbation, policy):
+                self.calls.append(complex(omega))
+                return residual + derivative * complex(omega)
+
+        kernel = CountingKernel()
+        root, observed_residual, observed_derivative, converged = (
+            kernel._solve_once(
+                sn=object(),
+                job=object(),
+                perturbation=object(),
+                policy=NumericalPolicy(),
+                guess=0.0j,
+            )
+        )
+
+        self.assertTrue(converged)
+        self.assertEqual(root, 0.0j)
+        self.assertAlmostEqual(observed_residual, residual, places=22)
+        self.assertAlmostEqual(observed_derivative, derivative, places=9)
+        self.assertEqual(len(kernel.calls), 4)
 
 class PredictorRecordingBackend:
     identity = IDENTITY

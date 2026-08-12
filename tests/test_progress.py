@@ -509,7 +509,7 @@ class CampaignProgressReporterTests(unittest.TestCase):
 
         active = "\n".join(reporter._current_execution_lines(compact=True))
         self.assertIn(
-            "Determinants   leaf 306 | phase 10 | Newton 10",
+            "Dets leaf 306 phase 10 Newton 10",
             active,
         )
 
@@ -517,7 +517,7 @@ class CampaignProgressReporterTests(unittest.TestCase):
         reporter.publish(_event(ProgressEventKind.ROOT_PHASE_STARTED, **next_phase))
         boundary = "\n".join(reporter._current_execution_lines(compact=True))
         self.assertIn(
-            "Determinants   leaf 306 | phase - | Newton -",
+            "Dets leaf 306 phase - Newton -",
             boundary,
         )
         self.assertNotIn("Determinant 306", boundary)
@@ -536,7 +536,7 @@ class CampaignProgressReporterTests(unittest.TestCase):
         ))
         restarted = "\n".join(reporter._current_execution_lines(compact=True))
         self.assertIn(
-            "Determinants   leaf 307 | phase 1 | Newton 1",
+            "Dets leaf 307 phase 1 Newton 1",
             restarted,
         )
 
