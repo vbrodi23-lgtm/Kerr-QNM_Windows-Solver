@@ -70,6 +70,57 @@ function progress_operation(operation::Function, name::String; payload=Dict{Stri
     end
 end
 
+const RADIAL_PROGRESS_SAMPLE_STRIDE = 512
+const RADIAL_PROGRESS_INTERVAL_SECONDS = 15.0
+
+"""
+    observed_radial_map(radial_map, name, rho_in, rho_out)
+
+Wrap the ρ → r map so a long radial integration reports its interior progress.
+
+The GSN right-hand side evaluates the supplied map once per call, so counting
+those calls and tracking the furthest ρ reached separates an integration that is
+advancing slowly from one whose step size has collapsed.  The wrapper forwards
+the original argument and returns the original value, so the radial solution is
+unchanged.
+"""
+function observed_radial_map(radial_map, name::String, rho_in, rho_out)
+    progress_active() || return radial_map
+    started = time_ns()
+    interval = round(UInt64, RADIAL_PROGRESS_INTERVAL_SECONDS * 1.0e9)
+    evaluations = Ref(0)
+    lowest = Ref(Inf)
+    highest = Ref(-Inf)
+    next_report = Ref(started + interval)
+    span = abs(Float64(rho_out) - Float64(rho_in))
+    context = Dict{String,Any}("suboperation" => name)
+    return function (rho)
+        evaluations[] += 1
+        position = Float64(real(rho))
+        position < lowest[] && (lowest[] = position)
+        position > highest[] && (highest[] = position)
+        if evaluations[] % RADIAL_PROGRESS_SAMPLE_STRIDE == 0
+            sampled_at = time_ns()
+            if sampled_at >= next_report[] && isfinite(lowest[]) && isfinite(highest[])
+                next_report[] = sampled_at + interval
+                covered = highest[] - lowest[]
+                progress_emit("suboperation_progress"; context=context, payload=Dict{String,Any}(
+                    "suboperation" => name,
+                    "rhs_evaluations" => evaluations[],
+                    "rho_current" => position,
+                    "rho_reached_min" => lowest[],
+                    "rho_reached_max" => highest[],
+                    "rho_span" => span,
+                    "rho_span_covered" => covered,
+                    "rho_span_fraction" => span > zero(span) ? covered / span : nothing,
+                    "elapsed_seconds" => (sampled_at - started) / 1.0e9,
+                ))
+            end
+        end
+        return radial_map(rho)
+    end
+end
+
 required(request, key) = haskey(request, key) ? request[key] : error("missing request key $key")
 
 function flatten_request(document)
@@ -269,7 +320,8 @@ function branch_values(::Type{T}, request, omega::Complex{T}, match_radius::T) w
     xin, _, _ = progress_operation("Xin") do
         CF.solve_Xin(
             s, m, a, beta_positive, beta_negative, omega, lambda,
-            radius_from_rho, rs_match, rho_in, rho_out;
+            observed_radial_map(radius_from_rho, "Xin", rho_in, rho_out),
+            rs_match, rho_in, rho_out;
             initialconditions_order=order,
             dtype=dtype,
             reltol=relative_tolerance,
@@ -279,7 +331,8 @@ function branch_values(::Type{T}, request, omega::Complex{T}, match_radius::T) w
     xup, _, _ = progress_operation("Xup") do
         CF.solve_Xup(
             s, m, a, beta_positive, beta_negative, omega, lambda,
-            radius_from_rho, rs_match, rho_in, rho_out;
+            observed_radial_map(radius_from_rho, "Xup", rho_in, rho_out),
+            rs_match, rho_in, rho_out;
             initialconditions_order=order,
             dtype=dtype,
             reltol=relative_tolerance,
@@ -426,12 +479,25 @@ function bounded_newton(::Type{T}, request, initial::Complex{T}, amplitude::Comp
     maximum_iterations = parse_integer(request, "max_newton_iterations")
     value = initial
     best_value = value
-    best_residual = abs(determinant_progress(
+    initial_determinant = determinant_progress(
         T, request, value, amplitude, "initial best", value
-    ))
+    )
+    best_residual = abs(initial_determinant)
+    # The first iteration evaluates the determinant at the initial frequency,
+    # which is exactly the value just computed above.  The determinant is a
+    # deterministic function of the frequency and the request controls, so carry
+    # that result into the first iteration instead of repeating the solve; at
+    # promoted precision one determinant is several radial integrations.
+    carried_residual = initial_determinant
+    carried_available = true
     for iteration in 1:maximum_iterations
         iteration_started = time_ns()
-        residual = determinant_progress(T, request, value, amplitude, "residual", value)
+        residual = if carried_available
+            carried_available = false
+            carried_residual
+        else
+            determinant_progress(T, request, value, amplitude, "residual", value)
+        end
         magnitude = abs(residual)
         if magnitude < best_residual
             best_value, best_residual = value, magnitude

@@ -60,6 +60,7 @@ _NORMAL_KINDS = _QUIET_KINDS | frozenset(
         ProgressEventKind.REQUEST_COMPLETED,
         ProgressEventKind.REQUEST_FAILED,
         ProgressEventKind.LEAF_CACHE_PUBLISHED,
+        ProgressEventKind.ROOT_READOUT_REUSED,
     }
 )
 _NORMAL_FALLBACK_KINDS = _NORMAL_KINDS | frozenset(
@@ -67,6 +68,7 @@ _NORMAL_FALLBACK_KINDS = _NORMAL_KINDS | frozenset(
         ProgressEventKind.DETERMINANT_COMPLETED,
         ProgressEventKind.DETERMINANT_EVALUATED,
         ProgressEventKind.SUBOPERATION_COMPLETED,
+        ProgressEventKind.SUBOPERATION_PROGRESS,
     }
 )
 _TERMINAL_KINDS = frozenset(
@@ -125,10 +127,17 @@ _DASHBOARD_LIVE_KINDS = frozenset(
         ProgressEventKind.DETERMINANT_STARTED,
         ProgressEventKind.DETERMINANT_COMPLETED,
         ProgressEventKind.SUBOPERATION_STARTED,
+        ProgressEventKind.SUBOPERATION_PROGRESS,
         ProgressEventKind.SUBOPERATION_COMPLETED,
     }
 )
 _LEAF_TIMING_WINDOW = 10
+_RADIAL_PROGRESS_STATE_KEYS = (
+    "radial_suboperation",
+    "radial_rhs_evaluations",
+    "radial_rho_span_fraction",
+    "radial_elapsed_seconds",
+)
 
 
 def _json_value(value: object) -> object:
@@ -764,6 +773,7 @@ class CampaignProgressReporter:
                     "determinant_index_newton",
                     "determinant_abs",
                     "suboperation",
+                    *_RADIAL_PROGRESS_STATE_KEYS,
                 ):
                     self._dashboard_state.pop(name, None)
         for name, value in context.items():
@@ -786,6 +796,23 @@ class CampaignProgressReporter:
         acceptance_threshold = payload.get("acceptance_threshold")
         if acceptance_threshold is not None:
             self._dashboard_state["acceptance_threshold"] = acceptance_threshold
+        if kind == ProgressEventKind.SUBOPERATION_PROGRESS.value:
+            self._dashboard_state.update({
+                "radial_suboperation": (
+                    context.get("suboperation") or payload.get("suboperation")
+                ),
+                "radial_rhs_evaluations": payload.get("rhs_evaluations"),
+                "radial_rho_span_fraction": payload.get("rho_span_fraction"),
+                "radial_elapsed_seconds": payload.get("elapsed_seconds"),
+            })
+        elif kind in {
+            ProgressEventKind.SUBOPERATION_STARTED.value,
+            ProgressEventKind.SUBOPERATION_COMPLETED.value,
+        }:
+            # A finished or newly started integration has no interior progress of
+            # its own yet; keep the panel from reporting the previous one.
+            for name in _RADIAL_PROGRESS_STATE_KEYS:
+                self._dashboard_state.pop(name, None)
         if kind == ProgressEventKind.LEAF_STARTED.value:
             self._dashboard_state["leaf_status"] = "RUNNING"
         elif kind in {
@@ -1343,7 +1370,11 @@ class CampaignProgressReporter:
             state.get("best_determinant_abs")
         )
         suboperation = state.get("suboperation")
+        radial = self._radial_progress_text()
         if compact:
+            suboperation_text = self._dashboard_value(suboperation)
+            if radial is not None:
+                suboperation_text = f"{suboperation_text} ({radial})"
             return [
                 " CURRENTLY EXECUTING",
                 f" Current leaf   {current_leaf} | Root {self._dashboard_value(root)} | {self._dashboard_value(precision)}",
@@ -1352,7 +1383,7 @@ class CampaignProgressReporter:
                 f" Worker         {self._dashboard_value(worker)} | Tier elapsed {self._dashboard_value(tier_elapsed)}",
                 f" Activity       {self._dashboard_value(activity)} | Seed authenticated {seed_authenticated}",
                 " LIVE ROOT SOLVE",
-                f" Newton         {newton} | Determinant {self._dashboard_value(determinant)} | Suboperation {self._dashboard_value(suboperation)}",
+                f" Newton         {newton} | Determinant {self._dashboard_value(determinant)} | Suboperation {suboperation_text}",
                 self._dashboard_field_line("Current ω", current_omega),
                 f" |D|            {determinant_abs} | Best |D| {best_determinant_abs}",
             ]
@@ -1380,7 +1411,26 @@ class CampaignProgressReporter:
             self._dashboard_field_line("|D|", determinant_abs),
             self._dashboard_field_line("Best |D|", best_determinant_abs),
             self._dashboard_field_line("Suboperation", suboperation),
+            self._dashboard_field_line("Radial progress", radial),
         ]
+
+    def _radial_progress_text(self) -> str | None:
+        """Summarise how far the active radial integration has advanced."""
+
+        state = self._dashboard_state
+        evaluations = state.get("radial_rhs_evaluations")
+        if isinstance(evaluations, bool) or not isinstance(evaluations, int):
+            return None
+        parts = [f"{evaluations} evals"]
+        fraction = state.get("radial_rho_span_fraction")
+        if not isinstance(fraction, bool) and isinstance(fraction, (int, float)):
+            if math.isfinite(float(fraction)):
+                parts.append(f"{float(fraction) * 100.0:.1f}% of ρ span")
+        elapsed = state.get("radial_elapsed_seconds")
+        if not isinstance(elapsed, bool) and isinstance(elapsed, (int, float)):
+            if math.isfinite(float(elapsed)):
+                parts.append(f"{float(elapsed):.0f}s")
+        return ", ".join(parts)
 
     def _live_execution_mapping(self) -> dict[str, object]:
         state = self._dashboard_state
@@ -1432,6 +1482,10 @@ class CampaignProgressReporter:
             "determinant_abs": state.get("determinant_abs"),
             "best_determinant_abs": state.get("best_determinant_abs"),
             "suboperation": state.get("suboperation"),
+            "radial_suboperation": state.get("radial_suboperation"),
+            "radial_rhs_evaluations": state.get("radial_rhs_evaluations"),
+            "radial_rho_span_fraction": state.get("radial_rho_span_fraction"),
+            "radial_elapsed_seconds": state.get("radial_elapsed_seconds"),
         }
 
     @staticmethod

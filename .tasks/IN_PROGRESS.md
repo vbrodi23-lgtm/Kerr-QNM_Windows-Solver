@@ -62,5 +62,6 @@ Confirm that a fresh checkout can originate every M02 numerical prerequisite fro
 - Split the checkpoint-derived latest-completed summary from a heartbeat-refreshed currently-executing Julia panel, including live root counters and pending-vs-authenticated branch state, without changing scientific execution.
 - Keep BigFloat 80 at 80 decimal digits/298 bits while retargeting its root, ODE, and centred-derivative controls to coherent 10⁻¹⁸–10⁻²⁰ accuracy; bind the new controls into PRIMARY identity, migrate only exact binary64 successes, retain the 120-tier policy, and render unit-aware precision labels throughout the live dashboard.
 - Show the active leaf ordinal and campaign total explicitly in both full and compact `CURRENTLY EXECUTING` views without reducing the compact precision-stage table below one completed row.
+- Carry the seed determinant into the first Newton residual, retain each completed promoted root readout under its request-and-runtime identity so an interrupted stage resumes rather than recomputes, and report radial integration interior progress; keep every numerical control, phase, and authentication boundary unchanged.
 
 ---
