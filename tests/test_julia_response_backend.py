@@ -158,6 +158,61 @@ class JuliaResponseBackendTests(unittest.TestCase):
         self.assertIn('"root_displacement_abs" => numeric_text(abs(root - omega))', worker)
         self.assertNotIn('document["progress', worker)
 
+    def test_package_worker_carries_the_initial_determinant_into_the_first_iteration(self):
+        """Catches re-solving the determinant already computed at the seed."""
+
+        worker = (
+            Path(__file__).resolve().parents[1]
+            / "src/windows_solver/data/julia/m02_worker.jl"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("initial_determinant = determinant_progress(", worker)
+        self.assertIn("best_residual = abs(initial_determinant)", worker)
+        self.assertIn("carried_residual = initial_determinant", worker)
+        self.assertIn("carried_available = true", worker)
+        self.assertIn("carried_available = false", worker)
+        # The seed determinant is carried, not recomputed, but every later
+        # iteration still evaluates its own residual at its own frequency.
+        self.assertIn(
+            'determinant_progress(T, request, value, amplitude, "residual", value)',
+            worker,
+        )
+        self.assertEqual(
+            worker.count(
+                'determinant_progress(T, request, value, amplitude, "residual", value)'
+            ),
+            1,
+        )
+
+    def test_package_worker_reports_radial_integration_interior_progress(self):
+        """Catches a radial integration that cannot be told from a stalled one."""
+
+        worker = (
+            Path(__file__).resolve().parents[1]
+            / "src/windows_solver/data/julia/m02_worker.jl"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("function observed_radial_map(", worker)
+        self.assertIn('progress_emit("suboperation_progress"', worker)
+        for field in (
+            "rhs_evaluations",
+            "rho_current",
+            "rho_reached_min",
+            "rho_reached_max",
+            "rho_span_fraction",
+        ):
+            self.assertIn(f'"{field}"', worker)
+        # Both homogeneous radial solves report through the observed map, and the
+        # map itself still returns the unmodified radius.
+        self.assertIn(
+            'observed_radial_map(radius_from_rho, "Xin", rho_in, rho_out)', worker
+        )
+        self.assertIn(
+            'observed_radial_map(radius_from_rho, "Xup", rho_in, rho_out)', worker
+        )
+        self.assertIn("return radial_map(rho)", worker)
+        self.assertIn("progress_active() || return radial_map", worker)
+
     def test_package_worker_preserves_radial_tolerances_and_reports_r_from_rho(self):
         """Catches collapsing the promoted ODE tolerance pair or hiding its map."""
 

@@ -127,6 +127,89 @@ class CampaignReportTests(unittest.TestCase):
             }),),
         )
 
+    def test_dashboard_reports_radial_integration_progress_inside_one_suboperation(self):
+        """Catches a long radial solve that shows no evidence of advancing."""
+
+        with tempfile.TemporaryDirectory() as temporary:
+            checkpoint = Path(temporary) / "checkpoint.json"
+            reporter = CampaignProgressReporter("normal", checkpoint, io.StringIO())
+            base_time = time.monotonic()
+            base_context = {
+                "leaf_index": 4,
+                "leaf_count": 212,
+                "leaf_id": "active-9999",
+                "mechanism_id": "horizon-admittance",
+                "precision_digits": 80,
+                "phase": "PRIMARY",
+            }
+
+            def observe(kind, seconds, *, context=None, payload=None):
+                event = ProgressEvent(
+                    kind=kind,
+                    context=ProgressContext.from_mapping({
+                        **base_context,
+                        **(context or {}),
+                    }),
+                    payload=payload or {},
+                    monotonic_seconds=base_time + seconds,
+                )
+                record = reporter._record(event)
+                reporter._update_dashboard_state(record)
+                return record
+
+            observe(ProgressEventKind.PRECISION_STAGE_STARTED, 0.0)
+            observe(
+                ProgressEventKind.SUBOPERATION_STARTED,
+                0.1,
+                context={"suboperation": "Xin"},
+                payload={"suboperation": "Xin"},
+            )
+            advancing = observe(
+                ProgressEventKind.SUBOPERATION_PROGRESS,
+                900.0,
+                context={"suboperation": "Xin"},
+                payload={
+                    "suboperation": "Xin",
+                    "rhs_evaluations": 1048576,
+                    "rho_current": -1200.0,
+                    "rho_reached_min": -5000.0,
+                    "rho_reached_max": -1200.0,
+                    "rho_span": 10000.0,
+                    "rho_span_fraction": 0.38,
+                    "elapsed_seconds": 900.0,
+                },
+            )
+            dashboard = "\n".join(reporter._dashboard_lines(advancing))
+            reporter._terminal_dimensions = lambda: (120, 30)
+            bounded = "\n".join(reporter._bounded_dashboard_lines(advancing))
+            reporter._write_status(advancing)
+            status = json.loads(
+                Path(f"{checkpoint}.status.json").read_text(encoding="utf-8")
+            )
+
+            self.assertIn("Radial progress", dashboard)
+            self.assertIn("1048576 evals", dashboard)
+            self.assertIn("38.0% of ρ span", dashboard)
+            self.assertIn("900s", dashboard)
+            # The bounded panel must not spend an extra row on it.
+            self.assertIn("1048576 evals", bounded)
+            execution = status["live_execution"]
+            self.assertEqual(execution["radial_suboperation"], "Xin")
+            self.assertEqual(execution["radial_rhs_evaluations"], 1048576)
+            self.assertEqual(execution["radial_rho_span_fraction"], 0.38)
+
+            # A completed integration must stop reporting the interior progress
+            # of the integration that has just finished.
+            completed = observe(
+                ProgressEventKind.SUBOPERATION_COMPLETED,
+                901.0,
+                context={"suboperation": "Xin"},
+                payload={"suboperation": "Xin", "elapsed_seconds": 901.0},
+            )
+            self.assertNotIn(
+                "1048576 evals", "\n".join(reporter._dashboard_lines(completed))
+            )
+
     def test_dashboard_separates_completed_leaf_from_live_promoted_worker(self):
         """Catches a running BigFloat stage being hidden by completed science."""
 

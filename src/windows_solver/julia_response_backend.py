@@ -31,6 +31,12 @@ from .response_engine import (
     _exterior_support,
 )
 from .progress import ProgressEventKind, emit_progress, ingest_external_progress
+from .root_readout_cache import (
+    ROOT_READOUT_STORE_DIRECTORY_NAME,
+    RootReadoutLookupStatus,
+    RootReadoutStore,
+    runtime_identity_sha256,
+)
 
 
 _PROMOTED_DIGITS = frozenset({80, 120})
@@ -337,6 +343,22 @@ def _runtime_root() -> Path:
     return Path.cwd() / ".runtime"
 
 
+def _resolve_readout_cache(runtime_root: Path) -> RootReadoutStore | None:
+    """Resolve the readout work cache belonging to one provisioned runtime.
+
+    The cache is scoped to the runtime that answers the readouts rather than to
+    a fixed per-user path, so a separate runtime keeps a separate cache and a
+    throwaway runtime never writes into the production one.
+    """
+
+    if os.environ.get("KERR_QNM_ROOT_READOUT_CACHE", "1").strip() == "0":
+        return None
+    override = os.environ.get("KERR_QNM_ROOT_READOUT_CACHE_ROOT")
+    if override:
+        return RootReadoutStore(Path(override))
+    return RootReadoutStore(Path(runtime_root) / ROOT_READOUT_STORE_DIRECTORY_NAME)
+
+
 @dataclass(frozen=True, slots=True)
 class JuliaResponseAdapter:
     julia_executable: Path
@@ -346,6 +368,7 @@ class JuliaResponseAdapter:
     runtime_provenance: Mapping[str, object]
     runner: Callable[..., object] = subprocess.run
     julia_prefix_arguments: tuple[str, ...] = ()
+    readout_cache: RootReadoutStore | None = None
 
     @classmethod
     def from_runtime_receipt(
@@ -427,10 +450,80 @@ class JuliaResponseAdapter:
             provenance,
             runner,
             tuple(declared_arguments),
+            _resolve_readout_cache(runtime),
+        )
+
+    def _reuse_readout(self, request_sha256: str) -> dict[str, object] | None:
+        """Return an already-computed readout for this exact request, if any."""
+
+        store = self.readout_cache
+        if store is None:
+            return None
+        try:
+            identity = runtime_identity_sha256(self.runtime_provenance)
+            lookup = store.lookup(
+                request_sha256=request_sha256, runtime_identity=identity
+            )
+        except (OSError, ValueError) as error:
+            # A work cache must never be able to fail a readout; fall through and
+            # let the worker recompute.
+            emit_progress(
+                ProgressEventKind.ROOT_READOUT_CACHE_CORRUPT,
+                request_sha256=request_sha256,
+                error_type=type(error).__name__,
+                message=str(error),
+            )
+            return None
+        if lookup.status is RootReadoutLookupStatus.CORRUPT:
+            emit_progress(
+                ProgressEventKind.ROOT_READOUT_CACHE_CORRUPT,
+                request_sha256=request_sha256,
+                store_path=str(lookup.path),
+                message=lookup.reason,
+            )
+            return None
+        if lookup.status is not RootReadoutLookupStatus.HIT:
+            return None
+        emit_progress(
+            ProgressEventKind.ROOT_READOUT_REUSED,
+            request_sha256=request_sha256,
+            store_path=str(lookup.path),
+        )
+        return dict(lookup.response or {})
+
+    def _retain_readout(
+        self, request_sha256: str, response: Mapping[str, object]
+    ) -> None:
+        """Retain a validated readout so an interrupted stage can resume."""
+
+        store = self.readout_cache
+        if store is None:
+            return
+        try:
+            path = store.publish(
+                request_sha256=request_sha256,
+                runtime_identity=runtime_identity_sha256(self.runtime_provenance),
+                response=response,
+            )
+        except (OSError, ValueError) as error:
+            emit_progress(
+                ProgressEventKind.ROOT_READOUT_CACHE_CORRUPT,
+                request_sha256=request_sha256,
+                error_type=type(error).__name__,
+                message=str(error),
+            )
+            return
+        emit_progress(
+            ProgressEventKind.ROOT_READOUT_RETAINED,
+            request_sha256=request_sha256,
+            store_path=str(path),
         )
 
     def evaluate(self, request: Mapping[str, object]) -> dict[str, object]:
         request_sha256 = hashlib.sha256(canonical_json_bytes(request)).hexdigest()
+        reused = self._reuse_readout(request_sha256)
+        if reused is not None:
+            return reused
         document = dict(request)
         document["request_sha256"] = request_sha256
         timeout_text = os.environ.get("KERR_QNM_JULIA_REQUEST_TIMEOUT_SECONDS", "7200")
@@ -489,6 +582,7 @@ class JuliaResponseAdapter:
             ))
         if response.get("request_sha256") != request_sha256:
             raise JuliaResponseBackendError("M02 Julia response request digest mismatch")
+        self._retain_readout(request_sha256, response)
         return response
 
 
