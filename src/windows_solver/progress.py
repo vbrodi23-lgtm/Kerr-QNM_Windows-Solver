@@ -7,6 +7,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, fields, replace
 from enum import StrEnum
+import math
 import time
 from types import MappingProxyType
 from typing import Protocol
@@ -55,6 +56,11 @@ class ProgressEventKind(StrEnum):
     SUBOPERATION_STARTED = "suboperation_started"
     SUBOPERATION_PROGRESS = "suboperation_progress"
     SUBOPERATION_COMPLETED = "suboperation_completed"
+    ODE_SOLVE_STARTED = "ode_solve_started"
+    ODE_SOLVE_PROGRESS = "ode_solve_progress"
+    ODE_SOLVE_COMPLETED = "ode_solve_completed"
+    ODE_SOLVE_FAILED = "ode_solve_failed"
+    ODE_RESOURCE_LIMIT = "ode_resource_limit"
     ROOT_READOUT_REUSED = "root_readout_reused"
     ROOT_READOUT_RETAINED = "root_readout_retained"
     ROOT_READOUT_CACHE_CORRUPT = "root_readout_cache_corrupt"
@@ -217,6 +223,141 @@ class ProgressContext:
 _PROGRESS_CONTEXT_KEYS = frozenset(field.name for field in fields(ProgressContext))
 
 
+_ODE_PROGRESS_KINDS = frozenset(
+    {
+        ProgressEventKind.ODE_SOLVE_STARTED,
+        ProgressEventKind.ODE_SOLVE_PROGRESS,
+        ProgressEventKind.ODE_SOLVE_COMPLETED,
+        ProgressEventKind.ODE_SOLVE_FAILED,
+        ProgressEventKind.ODE_RESOURCE_LIMIT,
+    }
+)
+_ODE_BASE_PAYLOAD_FIELDS = frozenset(
+    {
+        "ode_solve_id",
+        "ode_leg",
+        "ode_stats_scope",
+        "ode_t_start",
+        "ode_t_end",
+        "ode_algorithm_configured",
+    }
+)
+_ODE_COUNTER_PAYLOAD_FIELDS = frozenset(
+    {
+        "ode_rhs_evaluations",
+        "ode_accepted_steps",
+        "ode_rejected_steps",
+        "ode_jacobian_evaluations",
+        "ode_linear_solves",
+        "ode_nonlinear_iterations",
+        "ode_nonlinear_convergence_failures",
+    }
+)
+_ODE_SNAPSHOT_PAYLOAD_FIELDS = frozenset(
+    {
+        "ode_t_current",
+        *_ODE_COUNTER_PAYLOAD_FIELDS,
+        "ode_last_accepted_step_abs",
+        "ode_min_accepted_step_abs",
+        "ode_proposed_step_abs",
+        "elapsed_seconds",
+    }
+)
+_ODE_TERMINAL_PAYLOAD_FIELDS = frozenset(
+    {"ode_retcode", "ode_endpoint_reached"}
+)
+_ODE_FAILURE_PAYLOAD_FIELDS = frozenset(
+    {"failure_code", "failure_class", "limit_kind"}
+)
+_ODE_ALLOWED_PAYLOAD_FIELDS = frozenset(
+    {
+        *_ODE_BASE_PAYLOAD_FIELDS,
+        *_ODE_SNAPSHOT_PAYLOAD_FIELDS,
+        *_ODE_TERMINAL_PAYLOAD_FIELDS,
+        *_ODE_FAILURE_PAYLOAD_FIELDS,
+    }
+)
+
+
+def _validate_external_payload(
+    kind: ProgressEventKind, payload: Mapping[str, object]
+) -> Mapping[str, object]:
+    """Validate strict worker-owned payloads before publishing them locally."""
+
+    if kind not in _ODE_PROGRESS_KINDS:
+        return _mapping_snapshot(payload)
+    unknown = set(payload) - _ODE_ALLOWED_PAYLOAD_FIELDS
+    if unknown:
+        raise ValueError(
+            "unknown ODE progress payload fields: "
+            + ", ".join(sorted(_safe_text(key) for key in unknown))
+        )
+    required = set(_ODE_BASE_PAYLOAD_FIELDS)
+    if kind is not ProgressEventKind.ODE_SOLVE_STARTED:
+        required.update(_ODE_SNAPSHOT_PAYLOAD_FIELDS)
+    if kind in {
+        ProgressEventKind.ODE_SOLVE_COMPLETED,
+        ProgressEventKind.ODE_SOLVE_FAILED,
+        ProgressEventKind.ODE_RESOURCE_LIMIT,
+    }:
+        required.update(_ODE_TERMINAL_PAYLOAD_FIELDS)
+    if kind in {
+        ProgressEventKind.ODE_SOLVE_FAILED,
+        ProgressEventKind.ODE_RESOURCE_LIMIT,
+    }:
+        required.update({"failure_code", "failure_class"})
+    missing = required - set(payload)
+    if missing:
+        raise ValueError(
+            "missing ODE progress payload fields: " + ", ".join(sorted(missing))
+        )
+
+    solve_id = payload.get("ode_solve_id")
+    if isinstance(solve_id, bool) or not isinstance(solve_id, int) or solve_id < 1:
+        raise ValueError("ODE progress ode_solve_id must be a positive integer")
+    for name in (
+        "ode_leg",
+        "ode_stats_scope",
+        "ode_t_start",
+        "ode_t_end",
+        "ode_algorithm_configured",
+        "ode_t_current",
+        "ode_retcode",
+        "failure_code",
+        "failure_class",
+        "limit_kind",
+    ):
+        if name in payload and not isinstance(payload[name], str):
+            raise ValueError(f"ODE progress {name} must be a string")
+    if payload.get("ode_stats_scope") != "leg":
+        raise ValueError("ODE progress ode_stats_scope must be leg")
+    for name in _ODE_COUNTER_PAYLOAD_FIELDS:
+        if name in payload:
+            value = payload[name]
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"ODE progress {name} must be a nonnegative integer")
+    if "ode_endpoint_reached" in payload and not isinstance(
+        payload["ode_endpoint_reached"], bool
+    ):
+        raise ValueError("ODE progress ode_endpoint_reached must be a boolean")
+    for name in (
+        "ode_last_accepted_step_abs",
+        "ode_min_accepted_step_abs",
+        "ode_proposed_step_abs",
+    ):
+        if name in payload and payload[name] is not None and not isinstance(
+            payload[name], str
+        ):
+            raise ValueError(f"ODE progress {name} must be a string or null")
+    if "elapsed_seconds" in payload:
+        elapsed = payload["elapsed_seconds"]
+        if isinstance(elapsed, bool) or not isinstance(elapsed, (int, float)):
+            raise ValueError("ODE progress elapsed_seconds must be a number")
+        if not math.isfinite(float(elapsed)) or elapsed < 0:
+            raise ValueError("ODE progress elapsed_seconds must be finite and nonnegative")
+    return _mapping_snapshot(payload)
+
+
 @dataclass(frozen=True, slots=True)
 class ProgressEvent:
     kind: ProgressEventKind
@@ -307,5 +448,6 @@ def ingest_external_progress(value: object) -> ProgressEvent | None:
     if not isinstance(context, Mapping) or not isinstance(payload, Mapping):
         raise ValueError("external progress context and payload must be mappings")
     validated_context = _validate_context_values(context)
+    validated_payload = _validate_external_payload(kind, payload)
     with progress_scope(**validated_context):
-        return emit_progress(kind, **_mapping_snapshot(payload))
+        return emit_progress(kind, **validated_payload)

@@ -14,6 +14,17 @@ _DEFAULTDATATYPE = Solutions._DEFAULTDATATYPE
 _DEFAULTSOLVER = Solutions._DEFAULTSOLVER
 _DEFAULTTOLERANCE = Solutions._DEFAULTTOLERANCE
 
+function _begin_ode_observation(factory, leg, tspan, odealgo)
+    factory === nothing && return nothing, nothing
+    return factory(leg, tspan, odealgo)
+end
+
+function _finish_ode_observation(ode_solution_observer, leg, solution, observation)
+    ode_solution_observer === nothing ||
+        ode_solution_observer(leg, solution, observation)
+    return solution
+end
+
 function determine_sign(x)
     if real(x) >= 0
         return sign(1.0)
@@ -37,7 +48,9 @@ end
 function solve_r_from_rho(
     a, beta, rs_mp, rho_end; verbose=true, sign=1,
     dtype=_DEFAULTDATATYPE, odealgo=_DEFAULTSOLVER,
-    reltol=_DEFAULTTOLERANCE, abstol=_DEFAULTTOLERANCE
+    reltol=_DEFAULTTOLERANCE, abstol=_DEFAULTTOLERANCE,
+    ode_observation_factory=nothing, ode_solution_observer=nothing,
+    ode_leg="r_from_rho"
 )
     p = (a=a, beta=beta, sign=sign)
     # Initial condition at rho = 0
@@ -46,7 +59,16 @@ function solve_r_from_rho(
 
     rhospan = (0, rho_end)
     odeprob = ODEProblem(drdrho, u0, rhospan, p)
-    odesoln = solve(odeprob, odealgo; reltol=reltol, abstol=abstol, verbose=verbose)
+    observation_callback, observation = _begin_ode_observation(
+        ode_observation_factory, ode_leg, rhospan, odealgo
+    )
+    solve_arguments = observation_callback === nothing ?
+        NamedTuple() : (; callback=observation_callback)
+    odesoln = solve(
+        odeprob, odealgo;
+        reltol=reltol, abstol=abstol, verbose=verbose, solve_arguments...
+    )
+    _finish_ode_observation(ode_solution_observer, ode_leg, odesoln, observation)
 
     r_from_rho(rho) = odesoln(rho)[1] # Flatten the output
     return r_from_rho
@@ -58,20 +80,27 @@ function solve_r_from_rho(
     rs_mp, rho_neg_end, rho_pos_end;
     sign_neg=1, sign_pos=1, verbose=true,
     dtype=_DEFAULTDATATYPE, odealgo=_DEFAULTSOLVER,
-    reltol=_DEFAULTTOLERANCE, abstol=_DEFAULTTOLERANCE
+    reltol=_DEFAULTTOLERANCE, abstol=_DEFAULTTOLERANCE,
+    ode_observation_factory=nothing, ode_solution_observer=nothing
 )
     # Obtain r_from_rho for positive rho
     r_from_rhopos = solve_r_from_rho(
         a, beta_pos, rs_mp, rho_pos_end; sign=sign_pos,
         dtype=dtype, odealgo=odealgo, verbose=verbose,
-        reltol=reltol, abstol=abstol
+        reltol=reltol, abstol=abstol,
+        ode_observation_factory=ode_observation_factory,
+        ode_solution_observer=ode_solution_observer,
+        ode_leg="r_from_rho_positive"
     )
 
     # Obtain r_from_rho for negative rho
     r_from_rhoneg = solve_r_from_rho(
         a, beta_neg, rs_mp, rho_neg_end; sign=sign_neg,
         dtype=dtype, odealgo=odealgo, verbose=verbose,
-        reltol=reltol, abstol=abstol
+        reltol=reltol, abstol=abstol,
+        ode_observation_factory=ode_observation_factory,
+        ode_solution_observer=ode_solution_observer,
+        ode_leg="r_from_rho_negative"
     )
 
     # Stitch together the two solutions
@@ -182,11 +211,26 @@ function GSN_Riccati_eqn(u, p, rho)
     return SA[u[2], -1im*_sU + _sF*u[2] - 1im*u[2]*u[2]]
 end
 
-function solve_X_in_rho(s::Int, m::Int, a, beta, omega, lambda, r_from_rho, sign, rhospan, initial_conditions; dtype=_DEFAULTDATATYPE, odealgo=_DEFAULTSOLVER, reltol=_DEFAULTTOLERANCE, abstol=_DEFAULTTOLERANCE)
+function solve_X_in_rho(
+    s::Int, m::Int, a, beta, omega, lambda, r_from_rho, sign, rhospan,
+    initial_conditions; dtype=_DEFAULTDATATYPE, odealgo=_DEFAULTSOLVER,
+    reltol=_DEFAULTTOLERANCE, abstol=_DEFAULTTOLERANCE,
+    ode_observation_factory=nothing, ode_solution_observer=nothing,
+    ode_leg="X_in_rho"
+)
     p = (s=s, m=m, a=a, beta=beta, omega=omega, lambda=lambda, sign=sign, r_from_rho=r_from_rho)
 
     odeprob = ODEProblem(GSN_linear_eqn, initial_conditions, rhospan, p)
-    odesoln = solve(odeprob, odealgo; maxiters=Inf, reltol=reltol, abstol=abstol)
+    observation_callback, observation = _begin_ode_observation(
+        ode_observation_factory, ode_leg, rhospan, odealgo
+    )
+    solve_arguments = observation_callback === nothing ?
+        NamedTuple() : (; callback=observation_callback)
+    odesoln = solve(
+        odeprob, odealgo;
+        maxiters=Inf, reltol=reltol, abstol=abstol, solve_arguments...
+    )
+    _finish_ode_observation(ode_solution_observer, ode_leg, odesoln, observation)
 
     return odesoln
 end
@@ -217,7 +261,13 @@ function Xup_initialconditions(s::Int, m::Int, a, beta, omega, lambda, r_from_rh
     return Xrho_out, dXdrho_out
 end
 
-function solve_Xup(s::Int, m::Int, a, beta_pos, beta_neg, omega, lambda, r_from_rho, rs_mp, rhoin, rhoout; initialconditions_order=-1, dtype=_DEFAULTDATATYPE, odealgo=_DEFAULTSOLVER, reltol=_DEFAULTTOLERANCE, abstol=_DEFAULTTOLERANCE)
+function solve_Xup(
+    s::Int, m::Int, a, beta_pos, beta_neg, omega, lambda, r_from_rho,
+    rs_mp, rhoin, rhoout; initialconditions_order=-1,
+    dtype=_DEFAULTDATATYPE, odealgo=_DEFAULTSOLVER,
+    reltol=_DEFAULTTOLERANCE, abstol=_DEFAULTTOLERANCE,
+    ode_observation_factory=nothing, ode_solution_observer=nothing
+)
     # Sanity check
     if rhoin > rhoout
         throw(DomainError(rhoout, "rhoout ($rhoout) must be larger than rhoin ($rhoin)"))
@@ -231,12 +281,26 @@ function solve_Xup(s::Int, m::Int, a, beta_pos, beta_neg, omega, lambda, r_from_
     u0 = SA[dtype(Xup_rhoout); dtype(Xupprime_rhoout)]
 
     # Solve the ODE to the matching point no matter what
-    odesoln_pos = solve_X_in_rho(s, m, a, beta_pos, omega, lambda, r_from_rho, determine_sign(omega), (rhoout, 0), u0; dtype=dtype, odealgo=odealgo, reltol=reltol, abstol=abstol)
+    odesoln_pos = solve_X_in_rho(
+        s, m, a, beta_pos, omega, lambda, r_from_rho, determine_sign(omega),
+        (rhoout, 0), u0; dtype=dtype, odealgo=odealgo,
+        reltol=reltol, abstol=abstol,
+        ode_observation_factory=ode_observation_factory,
+        ode_solution_observer=ode_solution_observer,
+        ode_leg="Xup_outer_to_match",
+    )
 
     if rhoin < 0
         v0 = SA[dtype(1); dtype(determine_sign(omega - m*omega_horizon(a))*exp(1im*beta_neg))] .* SA[dtype(1); dtype(determine_sign(omega)*exp(-1im*beta_pos))] .* odesoln_pos(0)
         # Continue the integration
-        odesoln_neg = solve_X_in_rho(s, m, a, beta_neg, omega, lambda, r_from_rho, determine_sign(omega - m*omega_horizon(a)), (0, rhoin), v0; dtype=dtype, odealgo=odealgo, reltol=reltol, abstol=abstol)
+        odesoln_neg = solve_X_in_rho(
+            s, m, a, beta_neg, omega, lambda, r_from_rho,
+            determine_sign(omega - m*omega_horizon(a)), (0, rhoin), v0;
+            dtype=dtype, odealgo=odealgo, reltol=reltol, abstol=abstol,
+            ode_observation_factory=ode_observation_factory,
+            ode_solution_observer=ode_solution_observer,
+            ode_leg="Xup_match_to_inner",
+        )
     else
         # Should not be used
         odesoln_neg = rho -> SA[NaN; NaN]
@@ -306,7 +370,13 @@ function Xin_initialconditions(s::Int, m::Int, a, beta, omega, lambda, r_from_rh
     return Xrho_in, dXdrho_in
 end
 
-function solve_Xin(s::Int, m::Int, a, beta_pos, beta_neg, omega, lambda, r_from_rho, rs_mp, rhoin, rhoout; initialconditions_order=-1, dtype=_DEFAULTDATATYPE, odealgo=_DEFAULTSOLVER, reltol=_DEFAULTTOLERANCE, abstol=_DEFAULTTOLERANCE)
+function solve_Xin(
+    s::Int, m::Int, a, beta_pos, beta_neg, omega, lambda, r_from_rho,
+    rs_mp, rhoin, rhoout; initialconditions_order=-1,
+    dtype=_DEFAULTDATATYPE, odealgo=_DEFAULTSOLVER,
+    reltol=_DEFAULTTOLERANCE, abstol=_DEFAULTTOLERANCE,
+    ode_observation_factory=nothing, ode_solution_observer=nothing
+)
     # Sanity check
     if rhoin > rhoout
         throw(DomainError(rhoin, "rhoin ($rhoin) must be smaller than rhoout ($rhoout)"))
@@ -320,12 +390,26 @@ function solve_Xin(s::Int, m::Int, a, beta_pos, beta_neg, omega, lambda, r_from_
     u0 = SA[dtype(Xin_rhoin); dtype(Xinprime_rhoin)]
 
     # Solve the ODE to the matching point no matter what
-    odesoln_neg = solve_X_in_rho(s, m, a, beta_neg, omega, lambda, r_from_rho, determine_sign(omega - m*omega_horizon(a)), (rhoin, 0), u0; dtype=dtype, odealgo=odealgo, reltol=reltol, abstol=abstol)
+    odesoln_neg = solve_X_in_rho(
+        s, m, a, beta_neg, omega, lambda, r_from_rho,
+        determine_sign(omega - m*omega_horizon(a)), (rhoin, 0), u0;
+        dtype=dtype, odealgo=odealgo, reltol=reltol, abstol=abstol,
+        ode_observation_factory=ode_observation_factory,
+        ode_solution_observer=ode_solution_observer,
+        ode_leg="Xin_inner_to_match",
+    )
 
     if rhoout > 0
         v0 = SA[dtype(1); dtype(determine_sign(omega)*exp(1im*beta_pos))] .* SA[dtype(1); dtype(determine_sign(omega - m*omega_horizon(a))*exp(-1im*beta_neg))] .* odesoln_neg(0)
         # Continue the integration
-        odesoln_pos = solve_X_in_rho(s, m, a, beta_pos, omega, lambda, r_from_rho, determine_sign(omega), (0, rhoout), v0; dtype=dtype, odealgo=odealgo, reltol=reltol, abstol=abstol)
+        odesoln_pos = solve_X_in_rho(
+            s, m, a, beta_pos, omega, lambda, r_from_rho,
+            determine_sign(omega), (0, rhoout), v0;
+            dtype=dtype, odealgo=odealgo, reltol=reltol, abstol=abstol,
+            ode_observation_factory=ode_observation_factory,
+            ode_solution_observer=ode_solution_observer,
+            ode_leg="Xin_match_to_outer",
+        )
     else
         # Should not be used
         odesoln_pos = rho -> SA[NaN; NaN]

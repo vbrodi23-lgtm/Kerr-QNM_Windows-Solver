@@ -69,6 +69,9 @@ _NORMAL_FALLBACK_KINDS = _NORMAL_KINDS | frozenset(
         ProgressEventKind.DETERMINANT_EVALUATED,
         ProgressEventKind.SUBOPERATION_COMPLETED,
         ProgressEventKind.SUBOPERATION_PROGRESS,
+        ProgressEventKind.ODE_SOLVE_COMPLETED,
+        ProgressEventKind.ODE_SOLVE_FAILED,
+        ProgressEventKind.ODE_RESOURCE_LIMIT,
     }
 )
 _TERMINAL_KINDS = frozenset(
@@ -97,6 +100,9 @@ _FORCED_STATUS_KINDS = frozenset(
         ProgressEventKind.LEAF_COMPLETED,
         ProgressEventKind.LEAF_FAILED,
         ProgressEventKind.PRECISION_STAGE_STARTED,
+        ProgressEventKind.ODE_SOLVE_COMPLETED,
+        ProgressEventKind.ODE_SOLVE_FAILED,
+        ProgressEventKind.ODE_RESOURCE_LIMIT,
         ProgressEventKind.WORKER_HEARTBEAT,
         ProgressEventKind.ERROR,
     }
@@ -114,6 +120,8 @@ _DASHBOARD_FORCED_KINDS = frozenset(
         ProgressEventKind.ROOT_PHASE_STARTED,
         ProgressEventKind.ROOT_SEED_SELECTED,
         ProgressEventKind.ROOT_PHASE_COMPLETED,
+        ProgressEventKind.ODE_SOLVE_FAILED,
+        ProgressEventKind.ODE_RESOURCE_LIMIT,
         ProgressEventKind.WORKER_HEARTBEAT,
         ProgressEventKind.LEAF_COMPLETED,
         ProgressEventKind.LEAF_REUSED,
@@ -129,6 +137,9 @@ _DASHBOARD_LIVE_KINDS = frozenset(
         ProgressEventKind.SUBOPERATION_STARTED,
         ProgressEventKind.SUBOPERATION_PROGRESS,
         ProgressEventKind.SUBOPERATION_COMPLETED,
+        ProgressEventKind.ODE_SOLVE_STARTED,
+        ProgressEventKind.ODE_SOLVE_PROGRESS,
+        ProgressEventKind.ODE_SOLVE_COMPLETED,
     }
 )
 _LEAF_TIMING_WINDOW = 10
@@ -137,6 +148,55 @@ _RADIAL_PROGRESS_STATE_KEYS = (
     "radial_rhs_evaluations",
     "radial_rho_span_fraction",
     "radial_elapsed_seconds",
+)
+_ODE_PROGRESS_STATE_KEYS = (
+    "ode_solve_id",
+    "ode_leg",
+    "ode_stats_scope",
+    "ode_t_start",
+    "ode_t_end",
+    "ode_t_current",
+    "ode_retcode",
+    "ode_endpoint_reached",
+    "ode_rhs_evaluations",
+    "ode_accepted_steps",
+    "ode_rejected_steps",
+    "ode_jacobian_evaluations",
+    "ode_linear_solves",
+    "ode_nonlinear_iterations",
+    "ode_nonlinear_convergence_failures",
+    "ode_last_accepted_step_abs",
+    "ode_min_accepted_step_abs",
+    "ode_proposed_step_abs",
+    "ode_algorithm_configured",
+    "ode_elapsed_seconds",
+    "failure_code",
+    "failure_class",
+    "limit_kind",
+)
+_PRECISION_LIVE_STATE_KEYS = (
+    "phase",
+    "seed_kind",
+    "seed_authenticated",
+    "fallback_used",
+    "seed_omega",
+    "current_omega",
+    "candidate_omega",
+    "newton_index",
+    "newton_limit",
+    "determinant_index_leaf",
+    "determinant_index_phase",
+    "determinant_index_newton",
+    "determinant_abs",
+    "best_determinant_abs",
+    "acceptance_threshold",
+    "suboperation",
+    "readout_index",
+    "readout_role",
+    "epsilon",
+    "amplitude",
+    *_RADIAL_PROGRESS_STATE_KEYS,
+    *_ODE_PROGRESS_STATE_KEYS,
 )
 
 
@@ -714,6 +774,9 @@ class CampaignProgressReporter:
         payload = record["payload"]
         assert isinstance(payload, Mapping)
         kind = record["kind"]
+        if kind == ProgressEventKind.PRECISION_STAGE_STARTED.value:
+            for name in _PRECISION_LIVE_STATE_KEYS:
+                self._dashboard_state.pop(name, None)
         if kind == ProgressEventKind.SOLVED_LEAF_CACHE_SCANNED.value:
             self._cache_compatible = int(payload.get("compatible_count", 0))
             self._cache_stored = int(payload.get("stored_count", 0))
@@ -813,6 +876,28 @@ class CampaignProgressReporter:
             # its own yet; keep the panel from reporting the previous one.
             for name in _RADIAL_PROGRESS_STATE_KEYS:
                 self._dashboard_state.pop(name, None)
+        if kind in {
+            ProgressEventKind.ODE_SOLVE_STARTED.value,
+            ProgressEventKind.ODE_SOLVE_PROGRESS.value,
+            ProgressEventKind.ODE_SOLVE_COMPLETED.value,
+            ProgressEventKind.ODE_SOLVE_FAILED.value,
+            ProgressEventKind.ODE_RESOURCE_LIMIT.value,
+        }:
+            if kind == ProgressEventKind.ODE_SOLVE_STARTED.value:
+                for name in _ODE_PROGRESS_STATE_KEYS:
+                    self._dashboard_state.pop(name, None)
+            for name in _ODE_PROGRESS_STATE_KEYS:
+                payload_name = (
+                    "elapsed_seconds" if name == "ode_elapsed_seconds" else name
+                )
+                if payload_name in payload:
+                    self._dashboard_state[name] = payload[payload_name]
+            if kind in {
+                ProgressEventKind.ODE_SOLVE_FAILED.value,
+                ProgressEventKind.ODE_RESOURCE_LIMIT.value,
+            }:
+                self._dashboard_state["execution_state"] = "FAILED"
+                self._dashboard_state["root_status"] = "FAILED"
         if kind == ProgressEventKind.LEAF_STARTED.value:
             self._dashboard_state["leaf_status"] = "RUNNING"
         elif kind in {
@@ -822,6 +907,9 @@ class CampaignProgressReporter:
             self._record_leaf_outcome(next_leaf, payload.get("state"))
         elif kind == ProgressEventKind.LEAF_FAILED.value:
             self._dashboard_state["leaf_status"] = "FAILED"
+            self._dashboard_state["precision_status"] = "FAILED"
+            self._dashboard_state["root_status"] = "FAILED"
+            self._dashboard_state["execution_state"] = "FAILED"
             self._last_terminal_leaf = next_leaf
             self._last_terminal_state = "FAILED"
             if next_leaf is not None:
@@ -847,6 +935,7 @@ class CampaignProgressReporter:
         elif kind == ProgressEventKind.PRECISION_STAGE_STARTED.value:
             self._dashboard_state["precision_status"] = "ACTIVE"
             self._dashboard_state["execution_state"] = "RUNNING"
+            self._dashboard_state["root_status"] = "PENDING"
             self._dashboard_state["branch_valid"] = "PENDING"
             self._dashboard_state["worker"] = (
                 "Julia"
@@ -883,6 +972,11 @@ class CampaignProgressReporter:
                 self._dashboard_state["leaf_status"] = "PARTIAL"
         elif kind == ProgressEventKind.CAMPAIGN_FAILED.value:
             self._campaign_status = "FAILED"
+            self._dashboard_state["root_status"] = "FAILED"
+            self._dashboard_state["execution_state"] = "FAILED"
+        elif kind == ProgressEventKind.REQUEST_FAILED.value:
+            self._dashboard_state["root_status"] = "FAILED"
+            self._dashboard_state["execution_state"] = "FAILED"
 
     def _promotion_reason(
         self, leaf_id: object, precision_digits: object
@@ -1371,6 +1465,7 @@ class CampaignProgressReporter:
         )
         suboperation = state.get("suboperation")
         radial = self._radial_progress_text()
+        ode_lines = self._ode_progress_lines(compact=compact)
         if compact:
             suboperation_text = self._dashboard_value(suboperation)
             if radial is not None:
@@ -1386,6 +1481,7 @@ class CampaignProgressReporter:
                 f" Newton         {newton} | Determinant {self._dashboard_value(determinant)} | Suboperation {suboperation_text}",
                 self._dashboard_field_line("Current ω", current_omega),
                 f" |D|            {determinant_abs} | Best |D| {best_determinant_abs}",
+                *ode_lines,
             ]
         return [
             "",
@@ -1412,6 +1508,7 @@ class CampaignProgressReporter:
             self._dashboard_field_line("Best |D|", best_determinant_abs),
             self._dashboard_field_line("Suboperation", suboperation),
             self._dashboard_field_line("Radial progress", radial),
+            *ode_lines,
         ]
 
     def _radial_progress_text(self) -> str | None:
@@ -1431,6 +1528,50 @@ class CampaignProgressReporter:
             if math.isfinite(float(elapsed)):
                 parts.append(f"{float(elapsed):.0f}s")
         return ", ".join(parts)
+
+    def _ode_progress_lines(self, *, compact: bool) -> list[str]:
+        """Render the latest exact SciML segment snapshot without hiding collapse."""
+
+        state = self._dashboard_state
+        leg = state.get("ode_leg")
+        if not isinstance(leg, str) or not leg:
+            return []
+
+        def shown(name: str) -> str:
+            value = state.get(name)
+            return "-" if value is None else str(value)
+
+        identity = (
+            f"#{shown('ode_solve_id')} {leg} | ret={shown('ode_retcode')} "
+            f"| endpoint={shown('ode_endpoint_reached')}"
+        )
+        work = (
+            f"nf={shown('ode_rhs_evaluations')} "
+            f"accept/reject={shown('ode_accepted_steps')}/{shown('ode_rejected_steps')} "
+            f"jac/linear={shown('ode_jacobian_evaluations')}/{shown('ode_linear_solves')} "
+            f"nonlinear/fail={shown('ode_nonlinear_iterations')}/"
+            f"{shown('ode_nonlinear_convergence_failures')}"
+        )
+        steps = (
+            f"dt last/min/proposed={shown('ode_last_accepted_step_abs')}/"
+            f"{shown('ode_min_accepted_step_abs')}/"
+            f"{shown('ode_proposed_step_abs')}"
+        )
+        algorithm = f"algorithm={shown('ode_algorithm_configured')}"
+        if compact:
+            return [
+                f" ODE segment    {identity}",
+                f" ODE work       {work}",
+                f" ODE steps      {steps}",
+            ]
+        return [
+            "",
+            " LIVE ODE SEGMENT",
+            self._dashboard_field_line("Identity", identity),
+            self._dashboard_field_line("Work", work),
+            self._dashboard_field_line("Steps", steps),
+            self._dashboard_field_line("Algorithm", algorithm),
+        ]
 
     def _live_execution_mapping(self) -> dict[str, object]:
         state = self._dashboard_state
@@ -1486,6 +1627,7 @@ class CampaignProgressReporter:
             "radial_rhs_evaluations": state.get("radial_rhs_evaluations"),
             "radial_rho_span_fraction": state.get("radial_rho_span_fraction"),
             "radial_elapsed_seconds": state.get("radial_elapsed_seconds"),
+            **{name: state.get(name) for name in _ODE_PROGRESS_STATE_KEYS},
         }
 
     @staticmethod
@@ -1850,6 +1992,13 @@ class CampaignProgressReporter:
             "residual_abs",
             "best_residual_abs",
             "duration_seconds",
+            "ode_solve_id",
+            "ode_leg",
+            "ode_retcode",
+            "ode_rhs_evaluations",
+            "ode_accepted_steps",
+            "ode_rejected_steps",
+            "failure_code",
         ):
             if name in payload:
                 parts.append(f"{name}={payload[name]}")

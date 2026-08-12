@@ -14,6 +14,40 @@ const Potentials = GeneralizedSasakiNakamura.Potentials
 const PROGRESS_PREFIX = "@@KERR_QNM_PROGRESS@@"
 const PROGRESS_SCHEMA = "windows-solver.progress/1"
 const ACTIVE_PROGRESS_CONTEXT = Ref(Dict{String,Any}())
+const ODE_PROGRESS_INTERVAL_SECONDS = 15.0
+const ODE_ALGORITHM_CONFIGURED = "AutoVern9(Rosenbrock23(autodiff=false))"
+const NEXT_ODE_SOLVE_ID = Ref(0)
+
+abstract type ODEControlFailure <: Exception end
+
+struct ODEResourceLimit <: ODEControlFailure
+    message::String
+    details::Dict{String,Any}
+end
+
+struct ODESolverFailure <: ODEControlFailure
+    message::String
+    details::Dict{String,Any}
+end
+
+Base.showerror(io::IO, failure::ODEResourceLimit) = print(io, failure.message)
+Base.showerror(io::IO, failure::ODESolverFailure) = print(io, failure.message)
+failure_details(failure::ODEControlFailure) = failure.details
+
+mutable struct ODEObservationState
+    solve_id::Int
+    leg::String
+    t_start
+    t_end
+    started_ns::UInt64
+    next_report_ns::UInt64
+    last_accepted_step
+    minimum_accepted_step
+end
+
+struct ODEObservationCallback
+    state::ODEObservationState
+end
 
 progress_active() = get(ENV, "KERR_QNM_PROGRESS", "0") == "1"
 progress_complex(value) = Dict(
@@ -43,30 +77,166 @@ function progress_scope(operation::Function, context::Dict{String,Any})
     end
 end
 
+function ode_base_payload(state::ODEObservationState)
+    return Dict{String,Any}(
+        "ode_solve_id" => state.solve_id,
+        "ode_leg" => state.leg,
+        "ode_stats_scope" => "leg",
+        "ode_t_start" => string(state.t_start),
+        "ode_t_end" => string(state.t_end),
+        "ode_algorithm_configured" => ODE_ALGORITHM_CONFIGURED,
+    )
+end
+
+function ode_snapshot_payload(
+    state::ODEObservationState, stats, t_current; proposed_step=nothing
+)
+    return merge(ode_base_payload(state), Dict{String,Any}(
+        "ode_t_current" => string(t_current),
+        "ode_rhs_evaluations" => Int(stats.nf),
+        "ode_accepted_steps" => Int(stats.naccept),
+        "ode_rejected_steps" => Int(stats.nreject),
+        "ode_jacobian_evaluations" => Int(stats.njacs),
+        "ode_linear_solves" => Int(stats.nsolve),
+        "ode_nonlinear_iterations" => Int(stats.nnonliniter),
+        "ode_nonlinear_convergence_failures" => Int(stats.nnonlinconvfail),
+        "ode_last_accepted_step_abs" => state.last_accepted_step === nothing ?
+            nothing : string(state.last_accepted_step),
+        "ode_min_accepted_step_abs" => state.minimum_accepted_step === nothing ?
+            nothing : string(state.minimum_accepted_step),
+        "ode_proposed_step_abs" => proposed_step === nothing ?
+            nothing : string(proposed_step),
+        "elapsed_seconds" => (time_ns() - state.started_ns) / 1.0e9,
+    ))
+end
+
+function ode_observation_factory(leg, tspan, _algorithm)
+    NEXT_ODE_SOLVE_ID[] += 1
+    started = time_ns()
+    interval = round(UInt64, ODE_PROGRESS_INTERVAL_SECONDS * 1.0e9)
+    state = ODEObservationState(
+        NEXT_ODE_SOLVE_ID[],
+        string(leg),
+        tspan[1],
+        tspan[2],
+        started,
+        started + interval,
+        nothing,
+        nothing,
+    )
+    progress_emit("ode_solve_started"; payload=ode_base_payload(state))
+    progress_active() || return nothing, ODEObservationCallback(state)
+
+    condition = (_u, _t, _integrator) -> true
+    function observe_step!(integrator)
+        try
+            stats = integrator.stats
+            if stats.naccept > 0
+                accepted_step = abs(integrator.t - integrator.tprev)
+                state.last_accepted_step = accepted_step
+                if state.minimum_accepted_step === nothing ||
+                   accepted_step < state.minimum_accepted_step
+                    state.minimum_accepted_step = accepted_step
+                end
+            end
+            sampled_at = time_ns()
+            if sampled_at >= state.next_report_ns
+                state.next_report_ns = sampled_at + interval
+                proposed_step = try
+                    abs(SciMLBase.get_proposed_dt(integrator))
+                catch
+                    nothing
+                end
+                progress_emit("ode_solve_progress"; payload=ode_snapshot_payload(
+                    state, stats, integrator.t; proposed_step=proposed_step
+                ))
+            end
+        finally
+            SciMLBase.u_modified!(integrator, false)
+        end
+    end
+    callback = DiscreteCallback(
+        condition, observe_step!; save_positions=(false, false)
+    )
+    return callback, ODEObservationCallback(state)
+end
+
+function observe_ode_solution(leg, solution, observation::ODEObservationCallback)
+    state = observation.state
+    string(leg) == state.leg || error("ODE observation leg mismatch")
+    stats = solution.stats
+    t_current = isempty(solution.t) ? state.t_start : solution.t[end]
+    endpoint_reached = t_current == state.t_end
+    retcode = string(solution.retcode)
+    snapshot = merge(ode_snapshot_payload(state, stats, t_current), Dict{String,Any}(
+        "ode_retcode" => retcode,
+        "ode_endpoint_reached" => endpoint_reached,
+    ))
+
+    if solution.retcode === SciMLBase.ReturnCode.MaxIters
+        details = Dict{String,Any}(
+            "failure_code" => "ODE_RESOURCE_LIMIT",
+            "failure_class" => "CONTROL",
+            "limit_kind" => "ode_solver_iterations",
+            "ode_snapshot" => snapshot,
+        )
+        progress_emit("ode_resource_limit"; payload=merge(snapshot, Dict{String,Any}(
+            "failure_code" => "ODE_RESOURCE_LIMIT",
+            "failure_class" => "CONTROL",
+            "limit_kind" => "ode_solver_iterations",
+        )))
+        throw(ODEResourceLimit(
+            "$(state.leg) reached the existing ODE solver iteration limit",
+            details,
+        ))
+    end
+
+    if !SciMLBase.successful_retcode(solution) || !endpoint_reached
+        details = Dict{String,Any}(
+            "failure_code" => "ODE_SOLVER_FAILURE",
+            "failure_class" => "CONTROL",
+            "ode_snapshot" => snapshot,
+        )
+        progress_emit("ode_solve_failed"; payload=merge(snapshot, Dict{String,Any}(
+            "failure_code" => "ODE_SOLVER_FAILURE",
+            "failure_class" => "CONTROL",
+        )))
+        throw(ODESolverFailure(
+            "$(state.leg) failed with ODE solver return code $(retcode)",
+            details,
+        ))
+    end
+
+    progress_emit("ode_solve_completed"; payload=snapshot)
+    return solution
+end
+
 function progress_operation(operation::Function, name::String; payload=Dict{String,Any}())
     started = time_ns()
     context = Dict{String,Any}("suboperation" => name)
-    progress_emit("suboperation_started"; context=context, payload=merge(
-        Dict{String,Any}("suboperation" => name), payload
-    ))
-    try
-        result = operation()
-        progress_emit("suboperation_completed"; context=context, payload=merge(
-            Dict{String,Any}(
+    return progress_scope(context) do
+        progress_emit("suboperation_started"; context=context, payload=merge(
+            Dict{String,Any}("suboperation" => name), payload
+        ))
+        try
+            result = operation()
+            progress_emit("suboperation_completed"; context=context, payload=merge(
+                Dict{String,Any}(
+                    "suboperation" => name,
+                    "elapsed_seconds" => (time_ns() - started) / 1.0e9,
+                ),
+                payload,
+            ))
+            return result
+        catch failure
+            progress_emit("error"; context=context, payload=Dict{String,Any}(
                 "suboperation" => name,
+                "error_type" => string(typeof(failure)),
+                "message" => sprint(showerror, failure),
                 "elapsed_seconds" => (time_ns() - started) / 1.0e9,
-            ),
-            payload,
-        ))
-        return result
-    catch failure
-        progress_emit("error"; context=context, payload=Dict{String,Any}(
-            "suboperation" => name,
-            "error_type" => string(typeof(failure)),
-            "message" => sprint(showerror, failure),
-            "elapsed_seconds" => (time_ns() - started) / 1.0e9,
-        ))
-        rethrow()
+            ))
+            rethrow()
+        end
     end
 end
 
@@ -315,6 +485,8 @@ function branch_values(::Type{T}, request, omega::Complex{T}, match_radius::T) w
             dtype=dtype,
             reltol=relative_tolerance,
             abstol=absolute_tolerance,
+            ode_observation_factory=ode_observation_factory,
+            ode_solution_observer=observe_ode_solution,
         )
     end
     xin, _, _ = progress_operation("Xin") do
@@ -326,6 +498,8 @@ function branch_values(::Type{T}, request, omega::Complex{T}, match_radius::T) w
             dtype=dtype,
             reltol=relative_tolerance,
             abstol=absolute_tolerance,
+            ode_observation_factory=ode_observation_factory,
+            ode_solution_observer=observe_ode_solution,
         )
     end
     xup, _, _ = progress_operation("Xup") do
@@ -337,6 +511,8 @@ function branch_values(::Type{T}, request, omega::Complex{T}, match_radius::T) w
             dtype=dtype,
             reltol=relative_tolerance,
             abstol=absolute_tolerance,
+            ode_observation_factory=ode_observation_factory,
+            ode_solution_observer=observe_ode_solution,
         )
     end
     xin_match = xin(zero(T))
@@ -367,7 +543,8 @@ end
 
 function integrate_real_branch(::Type{T}, request, omega::Complex{T}, lambda::Complex{T},
                                start_radius::T, stop_radius::T, seed,
-                               amplitude::Complex{T}) where {T<:AbstractFloat}
+                               amplitude::Complex{T};
+                               ode_leg="perturbed_real_radius") where {T<:AbstractFloat}
     s = parse_integer(request, "s")
     m = parse_integer(request, "m")
     a = parse_real(T, request, "spin")
@@ -392,6 +569,11 @@ function integrate_real_branch(::Type{T}, request, omega::Complex{T}, lambda::Co
 
     initial = Complex{T}[seed[1], seed[2]]
     problem = ODEProblem(equation, initial, (start_radius, stop_radius))
+    observation_callback, observation = ode_observation_factory(
+        ode_leg, (start_radius, stop_radius), nothing
+    )
+    solve_arguments = observation_callback === nothing ?
+        NamedTuple() : (; callback=observation_callback)
     solution = solve(
         problem,
         AutoVern9(Rosenbrock23(autodiff=false));
@@ -399,8 +581,9 @@ function integrate_real_branch(::Type{T}, request, omega::Complex{T}, lambda::Co
         abstol=absolute_tolerance,
         dtmax=dtmax,
         maxiters=10^7,
+        solve_arguments...
     )
-    SciMLBase.successful_retcode(solution) || error("real-radius GSN integration failed: $(solution.retcode)")
+    observe_ode_solution(ode_leg, solution, observation)
     final = solution(stop_radius)
     return Complex{T}[final[1], final[2]]
 end
@@ -432,14 +615,16 @@ function determinant(::Type{T}, request, omega::Complex{T}, amplitude::Complex{T
         "branch" => "Xin",
     )) do
         integrate_real_branch(
-            T, request, omega, branches.lambda, lower, readout, branches.xin, amplitude
+            T, request, omega, branches.lambda, lower, readout, branches.xin, amplitude;
+            ode_leg="perturbed_Xin_real_radius",
         )
     end
     perturbed_up = progress_operation("perturbed integration"; payload=Dict(
         "branch" => "Xup",
     )) do
         integrate_real_branch(
-            T, request, omega, branches.lambda, lower, readout, branches.xup, amplitude
+            T, request, omega, branches.lambda, lower, readout, branches.xup, amplitude;
+            ode_leg="perturbed_Xup_real_radius",
         )
     end
     return progress_operation("Wronskian") do
@@ -457,20 +642,22 @@ function determinant_progress(
         "current_omega" => progress_complex(current),
         "candidate_omega" => progress_complex(omega),
     )
-    progress_emit("determinant_started"; context=context, payload=Dict(
-        "purpose" => purpose,
-        "omega" => progress_complex(omega),
-    ))
-    value = determinant(T, request, omega, amplitude)
-    progress_emit("determinant_completed"; context=context, payload=Dict(
-        "purpose" => purpose,
-        "omega" => progress_complex(omega),
-        "determinant_real" => string(real(value)),
-        "determinant_imag" => string(imag(value)),
-        "determinant_abs" => string(abs(value)),
-        "elapsed_seconds" => (time_ns() - started) / 1.0e9,
-    ))
-    return value
+    return progress_scope(context) do
+        progress_emit("determinant_started"; context=context, payload=Dict(
+            "purpose" => purpose,
+            "omega" => progress_complex(omega),
+        ))
+        value = determinant(T, request, omega, amplitude)
+        progress_emit("determinant_completed"; context=context, payload=Dict(
+            "purpose" => purpose,
+            "omega" => progress_complex(omega),
+            "determinant_real" => string(real(value)),
+            "determinant_imag" => string(imag(value)),
+            "determinant_abs" => string(abs(value)),
+            "elapsed_seconds" => (time_ns() - started) / 1.0e9,
+        ))
+        return value
+    end
 end
 
 function bounded_newton(::Type{T}, request, initial::Complex{T}, amplitude::Complex{T}) where {T<:AbstractFloat}
@@ -670,6 +857,7 @@ function solve_phase(
             )
         catch failure
             failure isa InterruptException && rethrow()
+            failure isa ODEControlFailure && rethrow()
             fallback_initial === nothing && rethrow()
             fallback_reason = "PREDICTOR_SOLVE_ERROR"
             fallback_error_type = string(typeof(failure))
@@ -873,18 +1061,32 @@ function main()
         ))
         return 0
     catch failure
-        result = Dict(
-            "schema_version" => 1,
-            "status" => "error",
+        result = if failure isa ODEControlFailure
+            Dict(
+                "schema_version" => 1,
+                "status" => "error",
+                "error_type" => string(typeof(failure)),
+                "message" => sprint(showerror, failure),
+                "failure" => failure_details(failure),
+            )
+        else
+            Dict(
+                "schema_version" => 1,
+                "status" => "error",
+                "error_type" => string(typeof(failure)),
+                "message" => sprint(showerror, failure),
+            )
+        end
+        mkpath(dirname(response_path))
+        write(response_path, JSON.json(result))
+        request_failure = Dict{String,Any}(
             "error_type" => string(typeof(failure)),
             "message" => sprint(showerror, failure),
         )
-        mkpath(dirname(response_path))
-        write(response_path, JSON.json(result))
-        progress_emit("request_failed"; payload=Dict(
-            "error_type" => string(typeof(failure)),
-            "message" => sprint(showerror, failure),
-        ))
+        if failure isa ODEControlFailure
+            request_failure["failure"] = failure_details(failure)
+        end
+        progress_emit("request_failed"; payload=request_failure)
         @error "M02 Julia precision worker failed" exception=(failure, catch_backtrace())
         return 21
     end

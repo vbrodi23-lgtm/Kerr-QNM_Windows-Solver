@@ -60,6 +60,7 @@ from .response_batches import (
     run_campaign_selection,
     run_predeclared_campaign_smoke,
     validate_campaign_checkpoint,
+    worker_failure_payload,
 )
 from .solved_leaf_cache import SolvedLeafStore
 from .response_engine import VettedNativeDeterminantKernel, NativeResourceUnavailableError
@@ -1063,11 +1064,16 @@ def main(argv: Sequence[str] | None = None) -> int:
                                 reporter=reporter,
                             )
                         except BaseException as error:
+                            worker_failure = worker_failure_payload(error)
                             emit_progress(
                                 ProgressEventKind.REQUEST_FAILED,
                                 operation=arguments.command,
                                 error_type=type(error).__name__,
                                 message=str(error),
+                                **(
+                                    {} if worker_failure is None
+                                    else {"worker_failure": worker_failure}
+                                ),
                             )
                             raise
                         else:

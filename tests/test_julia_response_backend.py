@@ -6,9 +6,11 @@ import io
 import json
 import os
 from pathlib import Path
+import signal
 import subprocess
 import sys
 import threading
+import time
 from types import SimpleNamespace
 import tempfile
 import unittest
@@ -81,6 +83,60 @@ class FakeAdapter:
 
 
 class JuliaResponseBackendTests(unittest.TestCase):
+    @staticmethod
+    def _force_stop_process(pid_path: Path) -> None:
+        if not pid_path.is_file():
+            return
+        pid = int(pid_path.read_text(encoding="ascii"))
+        if os.name == "nt":
+            subprocess.run(
+                ("taskkill", "/PID", str(pid), "/T", "/F"),
+                check=False,
+                capture_output=True,
+            )
+        else:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+    @staticmethod
+    def _process_tree_command(
+        directory: Path, *, emit_reserved_progress: bool = False
+    ) -> tuple[str, ...]:
+        parent_pid = directory / "parent.pid"
+        child_pid = directory / "child.pid"
+        marker = directory / "child.marker"
+        child = (
+            "import os,sys,time; "
+            "open(sys.argv[1],'w',encoding='ascii').write(str(os.getpid())); "
+            "f=open(sys.argv[2],'a',encoding='ascii'); "
+            "[(f.write('x'),f.flush(),time.sleep(.02)) for _ in range(3000)]"
+        )
+        progress = ""
+        if emit_reserved_progress:
+            progress = (
+                f"print({(JULIA_PROGRESS_PREFIX + json.dumps({'schema': PROGRESS_SCHEMA, 'kind': 'request_started', 'context': {}, 'payload': {}}))!r}, flush=True); "
+            )
+        parent = (
+            "import os,subprocess,sys,time; "
+            "open(sys.argv[1],'w',encoding='ascii').write(str(os.getpid())); "
+            f"subprocess.Popen([sys.executable,'-c',{child!r},sys.argv[2],sys.argv[3]],"
+            "stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL); "
+            "deadline=time.time()+5; "
+            "exec(\"while not os.path.exists(sys.argv[2]) and time.time() < deadline:\\n time.sleep(.01)\"); "
+            + progress
+            + "time.sleep(60)"
+        )
+        return (
+            sys.executable,
+            "-c",
+            parent,
+            str(parent_pid),
+            str(child_pid),
+            str(marker),
+        )
+
     def test_streamed_worker_progress_and_heartbeat_are_serialized(self):
         """Catches a live Julia child becoming invisible between stdout events."""
 
@@ -236,6 +292,55 @@ class JuliaResponseBackendTests(unittest.TestCase):
         self.assertNotIn("reltol=tolerance", worker)
         self.assertNotIn("abstol=tolerance", worker)
 
+    def test_package_worker_observes_every_promoted_ode_leg_before_use(self):
+        root = Path(__file__).resolve().parents[1]
+        worker = (root / "src/windows_solver/data/julia/m02_worker.jl").read_text(
+            encoding="utf-8"
+        )
+        complex_frequencies = (
+            root
+            / "src/windows_solver/data/julia/GeneralizedSasakiNakamura.jl/src/Homogeneous/ComplexFrequencies.jl"
+        ).read_text(encoding="utf-8")
+
+        for leg in (
+            "r_from_rho_positive",
+            "r_from_rho_negative",
+            "Xin_inner_to_match",
+            "Xin_match_to_outer",
+            "Xup_outer_to_match",
+            "Xup_match_to_inner",
+        ):
+            self.assertIn(f'"{leg}"', complex_frequencies)
+        self.assertIn("ode_observation_factory=nothing", complex_frequencies)
+        self.assertIn("ode_solution_observer=nothing", complex_frequencies)
+        self.assertIn("ode_solution_observer(", complex_frequencies)
+        self.assertIn("function ode_observation_factory(", worker)
+        self.assertIn("function observe_ode_solution(", worker)
+        self.assertIn("DiscreteCallback(", worker)
+        self.assertIn("save_positions=(false, false)", worker)
+        self.assertIn("SciMLBase.u_modified!(integrator, false)", worker)
+        self.assertIn("stats = solution.stats", worker)
+
+    def test_package_worker_serializes_ode_control_failures_without_policy_drift(self):
+        root = Path(__file__).resolve().parents[1]
+        worker = (root / "src/windows_solver/data/julia/m02_worker.jl").read_text(
+            encoding="utf-8"
+        )
+        complex_frequencies = (
+            root
+            / "src/windows_solver/data/julia/GeneralizedSasakiNakamura.jl/src/Homogeneous/ComplexFrequencies.jl"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("abstract type ODEControlFailure", worker)
+        self.assertIn("SciMLBase.ReturnCode.MaxIters", worker)
+        self.assertIn('"ODE_RESOURCE_LIMIT"', worker)
+        self.assertIn('"ODE_SOLVER_FAILURE"', worker)
+        self.assertIn("failure isa ODEControlFailure && rethrow()", worker)
+        self.assertIn('"failure" => failure_details(failure)', worker)
+        self.assertNotIn("ode_max_iterations", worker)
+        self.assertIn("maxiters=Inf", complex_frequencies)
+        self.assertIn("maxiters=10^7", worker)
+
     def test_reserved_julia_stdout_event_is_forwarded_to_active_reporter(self):
         class Observer:
             def __init__(self):
@@ -266,6 +371,50 @@ class JuliaResponseBackendTests(unittest.TestCase):
         self.assertEqual(len(observer.events), 1)
         self.assertIs(observer.events[0].kind, ProgressEventKind.NEWTON_ITERATION_STARTED)
         self.assertEqual(observer.events[0].context.phase, "PRIMARY")
+
+    def test_malformed_reserved_julia_progress_is_fail_closed(self):
+        with self.assertRaises(JuliaResponseBackendError):
+            _forward_julia_progress_line(JULIA_PROGRESS_PREFIX + "{")
+
+    def test_streamed_worker_timeout_terminates_descendant_process_tree(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            command = self._process_tree_command(directory)
+            try:
+                completed = _run_streamed_julia(
+                    command, cwd=directory, env=os.environ, timeout=1
+                )
+                self.assertTrue(completed.timed_out)
+                marker = directory / "child.marker"
+                before = marker.stat().st_size
+                time.sleep(0.2)
+                self.assertEqual(marker.stat().st_size, before)
+            finally:
+                self._force_stop_process(directory / "child.pid")
+                self._force_stop_process(directory / "parent.pid")
+
+    def test_streamed_worker_keyboard_interrupt_terminates_descendant_tree(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            command = self._process_tree_command(
+                directory, emit_reserved_progress=True
+            )
+            try:
+                with patch(
+                    "windows_solver.julia_response_backend._forward_julia_progress_line",
+                    side_effect=KeyboardInterrupt,
+                ):
+                    with self.assertRaises(KeyboardInterrupt):
+                        _run_streamed_julia(
+                            command, cwd=directory, env=os.environ, timeout=5
+                        )
+                marker = directory / "child.marker"
+                before = marker.stat().st_size
+                time.sleep(0.2)
+                self.assertEqual(marker.stat().st_size, before)
+            finally:
+                self._force_stop_process(directory / "child.pid")
+                self._force_stop_process(directory / "parent.pid")
 
     def test_promoted_backend_uses_practical_80_digit_policy(self):
         job = _deep_job()
@@ -703,6 +852,54 @@ class JuliaResponseBackendTests(unittest.TestCase):
             "worker_error_type": "ErrorException",
             "worker_error_message": "r-from-rho failed",
         })
+
+    def test_ode_resource_limit_receipt_is_a_typed_worker_failure(self):
+        ode_snapshot = {
+            "ode_solve_id": 17,
+            "ode_leg": "Xup_outer_to_match",
+            "ode_stats_scope": "leg",
+            "ode_retcode": "MaxIters",
+            "ode_rhs_evaluations": 9000001,
+            "ode_accepted_steps": 120,
+            "ode_rejected_steps": 9999880,
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for name in ("julia.exe", "Project.toml", "Manifest.toml", "worker.jl"):
+                (root / name).write_text(name, encoding="ascii")
+            depot = root / "depot"
+            depot.mkdir()
+
+            def runner(command, **kwargs):
+                Path(command[-1]).write_bytes(canonical_json_bytes({
+                    "schema_version": 1,
+                    "status": "error",
+                    "error_type": "ODEResourceLimit",
+                    "message": "Xup exceeded the existing solver iteration limit",
+                    "failure": {
+                        "failure_code": "ODE_RESOURCE_LIMIT",
+                        "failure_class": "CONTROL",
+                        "limit_kind": "ode_solver_iterations",
+                        "ode_snapshot": ode_snapshot,
+                    },
+                }))
+                return SimpleNamespace(returncode=21, stdout="", stderr="")
+
+            adapter = JuliaResponseAdapter(
+                root / "julia.exe", root, depot, root / "worker.jl", {}, runner
+            )
+            with self.assertRaises(JuliaResponseBackendError) as raised:
+                adapter.evaluate({"schema_version": 1})
+
+        self.assertEqual(type(raised.exception).__name__, "JuliaODEResourceLimitError")
+        self.assertEqual(
+            raised.exception.worker_failure["failure"]["failure_code"],
+            "ODE_RESOURCE_LIMIT",
+        )
+        self.assertEqual(
+            raised.exception.worker_failure["failure"]["ode_snapshot"],
+            ode_snapshot,
+        )
 
     def test_worker_timeout_is_explicit_in_failure_diagnostic(self):
         """Catches a killed worker being reported as an opaque nonzero exit."""
