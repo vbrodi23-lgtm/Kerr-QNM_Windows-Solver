@@ -30,8 +30,8 @@ from .response_engine import (
     HorizonPerturbation,
     NumericalPolicy,
     ResponseComponentJob,
-    ROOT_BRANCH_CONTINUATION_TOLERANCE_ABS,
     RootReadout,
+    mode_specific_branch_enclosure_radius,
 )
 from .progress import ProgressEventKind, emit_progress, progress_scope
 
@@ -728,7 +728,7 @@ class VettedNativeDeterminantKernel:
                     if fallback_guess is not None and (
                         not result[3]
                         or abs(result[0] - fallback_guess)
-                        > ROOT_BRANCH_CONTINUATION_TOLERANCE_ABS
+                        > branch_radius
                     ):
                         fallback_reason = (
                             "PREDICTOR_NEWTON_FAILED"
@@ -763,6 +763,7 @@ class VettedNativeDeterminantKernel:
                     )
                 return result
 
+        branch_radius = mode_specific_branch_enclosure_radius(background_root)
         primary_sn = self._standard_sn(job, policy)
         background_omega = complex(background_root.omega)
         predictor = None
@@ -775,7 +776,7 @@ class VettedNativeDeterminantKernel:
                 math.isfinite(candidate.real)
                 and math.isfinite(candidate.imag)
                 and abs(candidate - background_omega)
-                <= ROOT_BRANCH_CONTINUATION_TOLERANCE_ABS
+                <= branch_radius
             ):
                 predictor = candidate
                 primary_seed_kind = requested_predictor_kind
@@ -844,10 +845,10 @@ class VettedNativeDeterminantKernel:
         diagnostic_roots = (truncation_root, resolution_root, seed_path_root)
         branch_continuation_valid = (
             abs(root - background_omega)
-            <= ROOT_BRANCH_CONTINUATION_TOLERANCE_ABS
+            <= branch_radius
             and all(
                 abs(candidate - root)
-                <= ROOT_BRANCH_CONTINUATION_TOLERANCE_ABS
+                <= branch_radius
                 for candidate in diagnostic_roots
             )
         )
