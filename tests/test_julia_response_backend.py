@@ -409,9 +409,19 @@ class JuliaResponseBackendTests(unittest.TestCase):
         )
         self.assertNotIn('"branch" => "Xup"', worker)
         self.assertNotIn("perturbed_Xup_real_radius", worker)
-        self.assertIn("chart_ratio < one(T)", worker)
+        self.assertNotIn("chart_ratio < one(T)", worker)
+        self.assertIn("chart_condition_threshold = sqrt(eps(T))", worker)
+        self.assertIn(
+            "chart_condition_abs > chart_condition_threshold",
+            worker,
+        )
         self.assertIn('"Cinc" => progress_complex(branches.Cinc)', worker)
         self.assertIn('"Cref" => progress_complex(branches.Cref)', worker)
+        self.assertIn('"chart_condition_abs" => string(chart_condition_abs)', worker)
+        self.assertIn(
+            '"chart_condition_threshold" => string(chart_condition_threshold)',
+            worker,
+        )
 
     def test_package_worker_rejects_invalid_mechanism_and_support_contracts(self):
         worker = (
@@ -501,11 +511,11 @@ class JuliaResponseBackendTests(unittest.TestCase):
         self.assertIn("function homogeneous_rho_rhs!(", worker)
         self.assertIn("function solve_homogeneous_endpoint(", worker)
         self.assertIn(
-            "xin_match = solve_xin_at_match(",
+            "            solve_xin_at_match(",
             worker,
         )
         self.assertIn(
-            "xup_match = solve_xup_at_match(",
+            "            solve_xup_at_match(",
             worker,
         )
 
