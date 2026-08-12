@@ -639,6 +639,8 @@ class DiagnosticRootReadout:
             object.__setattr__(self, name, value)
         if self.determinant_derivative_abs <= 0.0:
             raise ValueError("diagnostic determinant derivative must be positive")
+        if type(self.converged) is not bool:
+            raise ValueError("converged must be a built-in bool")
 
     @property
     def newton_correction_estimate(self) -> float:
@@ -700,6 +702,8 @@ class RootReadout:
             object.__setattr__(self, name, value)
         if self.determinant_derivative_abs <= 0.0:
             raise ValueError("determinant derivative must be positive")
+        if type(self.converged) is not bool:
+            raise ValueError("converged must be a built-in bool")
         if not self.root_reference_id or not self.branch_id or not self.equation_id:
             raise ValueError("root readout identity fields must be nonempty")
         object.__setattr__(
