@@ -74,6 +74,7 @@ _EXECUTION_ROLE_ORDER = {
 }
 _LEGACY_MIGRATION_LOCK_TIMEOUT_SECONDS = 1.0
 _LEGACY_MIGRATION_LOCK_RETRY_SECONDS = 0.01
+_BINARY64_ROOT_CORRECTION_TOLERANCE_ABS = 2.0e-11
 _EXECUTION_MECHANISM_ORDER = {
     "horizon-admittance": 0,
     "exterior-light-ring": 1,
@@ -904,8 +905,74 @@ def _primary_recovery_precision_contract() -> dict[str, object]:
     }
 
 
+def _raw_residual_promoted_precision_numerical_controls() -> dict[str, object]:
+    """Return the exact promoted controls immediately before this change."""
+
+    return {
+        "80": {
+            "base": {
+                "root_tolerance": "1e-18",
+                "ode_relative_tolerance": "1e-18",
+                "ode_absolute_tolerance": "1e-20",
+                "frequency_step": "1e-6",
+            },
+            "refinement": {
+                "root_tolerance": "1e-20",
+                "ode_relative_tolerance": "1e-20",
+                "ode_absolute_tolerance": "1e-20",
+                "frequency_step": "1e-7",
+            },
+        },
+        "120": {
+            "base": {
+                "root_tolerance": "1e-102",
+                "ode_relative_tolerance": "1e-102",
+                "ode_absolute_tolerance": "1e-104",
+                "frequency_step": "1e-60",
+            },
+            "refinement": {
+                "root_tolerance": "1e-106",
+                "ode_relative_tolerance": "1e-106",
+                "ode_absolute_tolerance": "1e-108",
+                "frequency_step": "1e-60",
+            },
+        },
+    }
+
+
+def _raw_residual_primary_recovery_precision_contract() -> dict[str, object]:
+    """Return the exact PRIMARY recovery contract on immediate main."""
+
+    return {
+        **_previous_primary_recovery_precision_contract(),
+        "promoted_numerical_controls": (
+            _raw_residual_promoted_precision_numerical_controls()
+        ),
+    }
+
+
+def _root_convergence_precision_contract() -> dict[str, object]:
+    """Bind the local estimator and its independent acceptance safeguards."""
+
+    return {
+        "version": 1,
+        "metric": "newton_correction_estimate_abs",
+        "definition": "determinant_residual_abs_over_derivative_abs",
+        "binary64_tolerance_abs": _BINARY64_ROOT_CORRECTION_TOLERANCE_ABS,
+        "derivative_requirement": "finite_strictly_positive",
+        "required_phases": [
+            "PRIMARY",
+            "TRUNCATION",
+            "RESOLUTION",
+            "SEED-PATH",
+        ],
+        "branch_continuation_required": True,
+        "evidence_ceiling": "local_estimate_not_root_enclosure",
+    }
+
+
 def _legacy_leaf_precision_contract(leaf: CampaignLeafPlan) -> dict[str, object]:
-    """Return the exact precision contract used by the immediate predecessor."""
+    """Return the base precision contract predating PRIMARY recovery."""
 
     return {
         "binary64_stage_required": True,
@@ -922,6 +989,20 @@ def _leaf_precision_contract(leaf: CampaignLeafPlan) -> dict[str, object]:
     contract = _legacy_leaf_precision_contract(leaf)
     if leaf.role == "primary":
         contract["primary_recovery"] = _primary_recovery_precision_contract()
+    contract["root_convergence"] = _root_convergence_precision_contract()
+    return contract
+
+
+def _raw_residual_leaf_precision_contract(
+    leaf: CampaignLeafPlan,
+) -> dict[str, object]:
+    """Return the exact leaf contract on immediate main."""
+
+    contract = _legacy_leaf_precision_contract(leaf)
+    if leaf.role == "primary":
+        contract["primary_recovery"] = (
+            _raw_residual_primary_recovery_precision_contract()
+        )
     return contract
 
 
@@ -973,6 +1054,20 @@ def _legacy_primary_scientific_computation_identity_sha256(
         raise ValueError("legacy PRIMARY identity is outside the campaign plan")
     return _sha256(_scientific_computation_identity_material(
         plan, leaf, _legacy_leaf_precision_contract(leaf)
+    ))
+
+
+def _raw_residual_primary_scientific_computation_identity_sha256(
+    plan: CampaignPlan, leaf: CampaignLeafPlan
+) -> str:
+    """Derive the exact PRIMARY identity from immediate main."""
+
+    if leaf.role != "primary":
+        raise ValueError("raw-residual identity requires a PRIMARY leaf")
+    if leaf.leaf_id not in {item.leaf_id for item in plan.leaves}:
+        raise ValueError("raw-residual identity is outside the campaign plan")
+    return _sha256(_scientific_computation_identity_material(
+        plan, leaf, _raw_residual_leaf_precision_contract(leaf)
     ))
 
 
@@ -1951,9 +2046,20 @@ def _validate_legacy_primary_record_evidence(
         )
     if record.state != _terminal_state(outcome):
         raise ValueError("legacy PRIMARY solved-leaf terminal state is inconsistent")
+    raw_result = outcome.component_result.get("result")
+    if not isinstance(raw_result, Mapping):
+        raise ValueError("legacy PRIMARY solved-leaf result is missing")
+    result = ComponentResult.from_mapping(raw_result)
+    correction_evidence_passes = all(
+        readout.converged
+        and readout.newton_correction_estimate
+        <= _BINARY64_ROOT_CORRECTION_TOLERANCE_ABS
+        for readout in result.raw_readouts
+    )
     return (
         record.state == "PRODUCED"
         and outcome.numerical_state == ComponentStatus.CONVERGED.value
+        and correction_evidence_passes
     )
 
 
@@ -1975,6 +2081,9 @@ def _authenticated_solved_leaf_lookup(
         return current
 
     predecessor_identities = (
+        _raw_residual_primary_scientific_computation_identity_sha256(
+            plan, leaf
+        ),
         _previous_primary_scientific_computation_identity_sha256(plan, leaf),
         _legacy_primary_scientific_computation_identity_sha256(plan, leaf),
     )

@@ -140,7 +140,7 @@ def _produced_stage_outcome(leaf, response, *, baseline_delta=0.0j):
 
 class CampaignPlanTests(unittest.TestCase):
     def test_primary_recovery_identity_and_checkpoint_binding(self) -> None:
-        """Catches old PRIMARY identity/binding while preserving CONTROL and DEEP."""
+        """Catches omitting the root-convergence policy from leaf identities."""
 
         plan = build_campaign_plan(
             policy=NumericalPolicy(),
@@ -154,17 +154,17 @@ class CampaignPlanTests(unittest.TestCase):
         self.assertEqual(CAMPAIGN_SCHEMA_VERSION, 2)
         self.assertEqual(CAMPAIGN_CHECKPOINT_SCHEMA_VERSION, 3)
         with self.subTest(contract="identity"):
-            self.assertNotEqual(
+            self.assertEqual(
                 scientific_computation_identity_sha256(plan, primary),
-                "4f0833f9f3426decc9e2bde4b55e1b52af86e8ebce13cad99939bea1fa7fe974",
+                "02207005956469fd058302820c9861193c90bb3bf2b09df7d0570058787c386d",
             )
             self.assertEqual(
                 scientific_computation_identity_sha256(plan, control),
-                "a6d06e19d6c3b046bcff772a9765393a636e20aaa4a03d9412dbb4c43d837788",
+                "6c460f57aa73bb6b08272c11e925da3becc01f7acde9b765d374bf716ad59ba9",
             )
             self.assertEqual(
                 scientific_computation_identity_sha256(plan, deep),
-                "9905df951c1331a300dfb0a06722846edb2cec45d46d94f2baab29297b23b78c",
+                "6e3b5ac41472ae9801dc5855535f4145460efdb53cfed28b588783168cd0b2ae",
             )
 
         leaf = primary

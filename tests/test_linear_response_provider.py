@@ -108,6 +108,30 @@ class AnalyticKernel:
         )
 
 
+class NewtonCorrectionGateTests(unittest.TestCase):
+    def test_scaled_residual_converges_on_small_newton_correction_before_damping(self):
+        """Catches treating determinant normalization as root-location error."""
+
+        derivative = 36.1
+        residual = 3.50e-11
+        calls: list[complex] = []
+
+        def determinant(omega: complex) -> complex:
+            calls.append(complex(omega))
+            return residual + derivative * complex(omega)
+
+        root, observed_residual, converged = (
+            response_engine.VettedNativeDeterminantKernel._bounded_newton(
+                determinant, 0.0j
+            )
+        )
+
+        self.assertTrue(converged)
+        self.assertEqual(root, 0.0j)
+        self.assertAlmostEqual(observed_residual, residual, places=22)
+        self.assertLess(residual / derivative, 2.0e-11)
+        self.assertEqual(len(calls), 4)
+
 class PredictorRecordingBackend:
     identity = IDENTITY
 
@@ -232,7 +256,7 @@ class LinearResponseEngineTests(unittest.TestCase):
                 call_index += 1
 
     def test_native_kernel_requires_variant_radii_and_branch_continuation(self) -> None:
-        """Catches accepting one native solve with zero diagnostics as converged."""
+        """Catches a tiny local correction overriding independent-path disagreement."""
 
         kernel_type = response_engine.VettedNativeDeterminantKernel
 
@@ -299,6 +323,7 @@ class LinearResponseEngineTests(unittest.TestCase):
             policy=job.policy,
         )
         self.assertFalse(rejected.converged)
+        self.assertLess(1.0e-12 / 2.0, 2.0e-11)
         self.assertEqual(rejected.branch_id, "nonmatching-native-continuation")
 
     def test_native_nonconvergence_preserves_authenticated_branch(self) -> None:

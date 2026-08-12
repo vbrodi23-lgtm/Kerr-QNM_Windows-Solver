@@ -84,9 +84,9 @@ _POLISHED_BASELINES = {
     ),
 }
 _POLISHED_IDENTITIES = {
-    "b-prime-leaf-4c8594e4a59486a1c56206e41cd7f7f3ff1ab5193a5ff6b699cbe9492bc45355": "40452ba3d26daca8cc45de2f279ee09883f232842217bd5090be078f7f472213",
-    "b-prime-leaf-0f36daefa853de1280f17c8b8ef89bbaf9b34f5e5044a5eb85bc563d3896b60d": "94edef60dc4b4b82214f5b2a194a59ceee92977dfd299c2562eb779b290bbf2f",
-    "b-prime-leaf-08b8dc3df83fc1304a61d8b6105c412a316a44816ca229d375573fdf72ac0a57": "4a83d582a118b46cc7d077663bcb64e1feb7b3520f6460eccd2ce0897cd32230",
+    "b-prime-leaf-4c8594e4a59486a1c56206e41cd7f7f3ff1ab5193a5ff6b699cbe9492bc45355": "115a3b6fdb73e53600f280c173b98553133ca6bbd97d855dcc5dbab2e39d3cb3",
+    "b-prime-leaf-0f36daefa853de1280f17c8b8ef89bbaf9b34f5e5044a5eb85bc563d3896b60d": "7b43f4fa1d7c93d91ab636a88f63fdecc2c9736bd2e4fa4d991dc4fcc68e95cb",
+    "b-prime-leaf-08b8dc3df83fc1304a61d8b6105c412a316a44816ca229d375573fdf72ac0a57": "4f1b710f32a606fd6dde50900c37bcd3924744dc5f9c11f7038841a36e3641d9",
 }
 
 
@@ -100,12 +100,14 @@ def _production_outcome(
     branch_id=None,
     root_identity_sha256=None,
     seed_path_radius=8.0e-12,
+    determinant_residual_abs=2.0e-13,
+    determinant_derivative_abs=1.0,
 ):
     job = leaf.job
     baseline = RootReadout(
         omega=job.root.omega if baseline_omega is None else baseline_omega,
-        determinant_residual_abs=2.0e-13,
-        determinant_derivative_abs=1.0,
+        determinant_residual_abs=determinant_residual_abs,
+        determinant_derivative_abs=determinant_derivative_abs,
         converged=status is not ComponentStatus.NOT_CONVERGED,
         root_reference_id=(
             job.root.root_reference_id
@@ -174,7 +176,7 @@ def _production_outcome(
     )
 
 
-def _legacy_primary_record(plan, leaf, status):
+def _legacy_primary_record(plan, leaf, status, **outcome_changes):
     """Seal the predecessor's binary64-only PRIMARY record.
 
     The approved migration contract changes PRIMARY orchestration policy only:
@@ -183,7 +185,7 @@ def _legacy_primary_record(plan, leaf, status):
     predecessor-only value; this stage provenance deliberately remains current.
     """
 
-    outcome = _production_outcome(leaf, status=status)
+    outcome = _production_outcome(leaf, status=status, **outcome_changes)
     return CampaignLeafRecord(
         leaf_id=leaf.leaf_id,
         role="primary",
@@ -252,6 +254,41 @@ def _frozen_previous_recovery_contract():
     }
 
 
+def _frozen_raw_residual_promoted_controls():
+    """The immediate-main promoted controls, independent of production."""
+
+    return {
+        "80": {
+            "base": {
+                "root_tolerance": "1e-18",
+                "ode_relative_tolerance": "1e-18",
+                "ode_absolute_tolerance": "1e-20",
+                "frequency_step": "1e-6",
+            },
+            "refinement": {
+                "root_tolerance": "1e-20",
+                "ode_relative_tolerance": "1e-20",
+                "ode_absolute_tolerance": "1e-20",
+                "frequency_step": "1e-7",
+            },
+        },
+        "120": {
+            "base": {
+                "root_tolerance": "1e-102",
+                "ode_relative_tolerance": "1e-102",
+                "ode_absolute_tolerance": "1e-104",
+                "frequency_step": "1e-60",
+            },
+            "refinement": {
+                "root_tolerance": "1e-106",
+                "ode_relative_tolerance": "1e-106",
+                "ode_absolute_tolerance": "1e-108",
+                "frequency_step": "1e-60",
+            },
+        },
+    }
+
+
 def _frozen_scientific_identity(plan, leaf, precision_contract):
     """Build an independently frozen one-leaf scientific identity."""
 
@@ -288,6 +325,17 @@ def _frozen_previous_recovery_scientific_identity(plan, leaf):
 
     contract = _frozen_predecessor_precision_contract(leaf)
     contract["primary_recovery"] = _frozen_previous_recovery_contract()
+    return _frozen_scientific_identity(plan, leaf, contract)
+
+
+def _frozen_raw_residual_scientific_identity(plan, leaf):
+    """Rebuild the exact immediate-main PRIMARY identity independently."""
+
+    contract = _frozen_predecessor_precision_contract(leaf)
+    contract["primary_recovery"] = {
+        **_frozen_previous_recovery_contract(),
+        "promoted_numerical_controls": _frozen_raw_residual_promoted_controls(),
+    }
     return _frozen_scientific_identity(plan, leaf, contract)
 
 
@@ -370,7 +418,7 @@ class _ConvergedProductionBackend:
 
 
 class SolvedLeafCacheTests(unittest.TestCase):
-    def test_polished_production_baseline_is_cacheable_without_changing_identity(self):
+    def test_polished_production_baseline_is_cacheable_under_correction_identity(self):
         plan = _windows_production_plan()
         leaf = next(
             item for item in plan.leaves if item.leaf_id in _POLISHED_BASELINES
@@ -644,7 +692,7 @@ class SolvedLeafCacheTests(unittest.TestCase):
         )
         self.assertEqual(
             scientific_computation_identity_sha256(plan, leaf),
-            "05a1cdc4acd9bbfcfd12bfdbf7882d726dc65a1c761457b3d961d4be2203e6df",
+            "c07c1fd228df8ab73341321c5810db0cfbc8b65b1096fe312495251b491ebae9",
         )
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -840,6 +888,122 @@ class SolvedLeafCacheTests(unittest.TestCase):
                 store.lookup(current_identity, leaf.leaf_id).status,
                 SolvedLeafLookupStatus.HIT,
             )
+
+    def test_immediate_raw_residual_success_migrates_on_stored_correction(self):
+        """Catches recomputing an old success with valid correction evidence."""
+
+        plan = build_campaign_plan(
+            policy=NumericalPolicy(),
+            backend_identity=VettedNativeDeterminantKernel.identity,
+            precision_capabilities=PrecisionCapabilities((64, 80)),
+        )
+        leaf = next(item for item in plan.leaves if item.role == "primary")
+        selection = build_campaign_selection(
+            plan, role="primary", leaf_ids=(leaf.leaf_id,)
+        )
+        predecessor_identity = _frozen_raw_residual_scientific_identity(
+            plan, leaf
+        )
+        current_identity = scientific_computation_identity_sha256(plan, leaf)
+        self.assertNotEqual(current_identity, predecessor_identity)
+
+        class Backend:
+            identity = plan.backend_identity
+            precision_capabilities = plan.precision_capabilities
+
+            def execute_stage(self, selected, digits):
+                raise AssertionError(
+                    "correction-qualified predecessor reached stage execution"
+                )
+
+        record = _legacy_primary_record(
+            plan,
+            leaf,
+            ComponentStatus.CONVERGED,
+            determinant_residual_abs=1.42e-11,
+            determinant_derivative_abs=7.8,
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            store = SolvedLeafStore(root / "solved")
+            store.publish(
+                scientific_identity_sha256=predecessor_identity,
+                leaf_id=leaf.leaf_id,
+                record=record.to_mapping(),
+                source_type="originating-campaign",
+            )
+
+            summary = run_campaign_selection(
+                plan,
+                selection,
+                Backend(),
+                root / "migrated.json",
+                resume=False,
+                solved_leaf_store=store,
+            )
+
+            self.assertEqual(summary.executed_stage_count, 0)
+            self.assertEqual(summary.records[0].to_mapping(), record.to_mapping())
+            self.assertIs(
+                store.lookup(current_identity, leaf.leaf_id).status,
+                SolvedLeafLookupStatus.HIT,
+            )
+
+    def test_immediate_raw_residual_success_recomputes_if_correction_fails(self):
+        """Catches migrating old success solely because its receipt is canonical."""
+
+        plan = build_campaign_plan(
+            policy=NumericalPolicy(),
+            backend_identity=VettedNativeDeterminantKernel.identity,
+            precision_capabilities=PrecisionCapabilities((64, 80)),
+        )
+        leaf = next(item for item in plan.leaves if item.role == "primary")
+        selection = build_campaign_selection(
+            plan, role="primary", leaf_ids=(leaf.leaf_id,)
+        )
+        predecessor_identity = _frozen_raw_residual_scientific_identity(
+            plan, leaf
+        )
+        current_identity = scientific_computation_identity_sha256(plan, leaf)
+        record = _legacy_primary_record(
+            plan,
+            leaf,
+            ComponentStatus.CONVERGED,
+            determinant_residual_abs=1.0e-11,
+            determinant_derivative_abs=0.25,
+        )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            store = SolvedLeafStore(root / "solved")
+            store.publish(
+                scientific_identity_sha256=predecessor_identity,
+                leaf_id=leaf.leaf_id,
+                record=record.to_mapping(),
+                source_type="originating-campaign",
+            )
+            backend = _ConvergedProductionBackend(plan)
+
+            summary = run_campaign_selection(
+                plan,
+                selection,
+                backend,
+                root / "recomputed.json",
+                resume=False,
+                solved_leaf_store=store,
+            )
+
+            self.assertEqual(backend.calls, [(leaf.leaf_id, 64)])
+            self.assertEqual(summary.executed_stage_count, 1)
+            self.assertIs(
+                store.lookup(predecessor_identity, leaf.leaf_id).status,
+                SolvedLeafLookupStatus.HIT,
+            )
+            self.assertIs(
+                store.lookup(current_identity, leaf.leaf_id).status,
+                SolvedLeafLookupStatus.HIT,
+            )
+            self.assertFalse((store.root / "quarantine").exists())
 
     def test_previous_recovery_promoted_receipt_stays_stale_and_recomputes(self):
         """Catches reusing a 10⁻⁶²-stage result under the practical policy."""

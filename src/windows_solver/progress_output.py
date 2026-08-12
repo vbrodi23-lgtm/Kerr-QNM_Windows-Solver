@@ -1411,7 +1411,7 @@ class CampaignProgressReporter:
         model = self._campaign_report_model
         header = (
             f"{'ROOT':<16} {'PRECISION':<21} {'RESULT':<13} {'CONVERGED':<9} "
-            f"{'BRANCH_OK':<9} {'D_ABS':>10} {'D_OVER_TOL':>11} "
+            f"{'BRANCH_OK':<9} {'D_ABS':>10} {'CORR_OVER_TOL':>13} "
             f"{'NEWTON_DW':>10} {'DELTA_ROOT':>10}"
         )
         if model is None or not model.precision_stage_rows:
@@ -1686,8 +1686,8 @@ class CampaignProgressReporter:
         converged = cls._precision_stage_boolean(row.get("converged"))
         branch_ok = cls._precision_stage_boolean(row.get("branch_ok"))
         determinant = cls._precision_stage_number(row.get("determinant_abs"))
-        over_tolerance = cls._precision_stage_number(
-            row.get("determinant_over_tolerance")
+        correction_over_tolerance = cls._precision_stage_number(
+            row.get("newton_correction_over_tolerance")
         )
         newton = cls._precision_stage_number(row.get("newton_correction"))
         displacement = cls._precision_stage_number(
@@ -1704,7 +1704,7 @@ class CampaignProgressReporter:
         return (
             f"{root:<16.16} {precision:<21.21} {result:<13.13} "
             f"{converged:<9.9} {branch_ok:<9.9} {determinant:>10.10} "
-            f"{over_tolerance:>11.11} {newton:>10.10} {displacement:>10.10}"
+            f"{correction_over_tolerance:>13.13} {newton:>10.10} {displacement:>10.10}"
         )
 
     @staticmethod

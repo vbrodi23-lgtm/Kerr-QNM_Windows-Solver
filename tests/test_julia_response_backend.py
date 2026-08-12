@@ -341,6 +341,20 @@ class JuliaResponseBackendTests(unittest.TestCase):
         self.assertIn("maxiters=Inf", complex_frequencies)
         self.assertIn("maxiters=10^7", worker)
 
+    def test_package_worker_gates_roots_on_newton_correction(self):
+        """Catches restoring the normalization-dependent bare residual gate."""
+
+        root = Path(__file__).resolve().parents[1]
+        worker = (root / "src/windows_solver/data/julia/m02_worker.jl").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn('"root_correction_tolerance"', worker)
+        self.assertIn('"newton_correction_estimate_abs"', worker)
+        self.assertIn("correction_abs = magnitude / derivative_abs", worker)
+        self.assertIn("correction_abs <= tolerance", worker)
+        self.assertNotIn("best_residual <= tolerance", worker)
+
     def test_reserved_julia_stdout_event_is_forwarded_to_active_reporter(self):
         class Observer:
             def __init__(self):
@@ -428,7 +442,9 @@ class JuliaResponseBackendTests(unittest.TestCase):
         request = adapter.requests[0]
         self.assertEqual(request["precision_digits"], 80)
         self.assertEqual(request["working_precision_bits"], 298)
-        self.assertEqual(request["policy"]["root_tolerance"], "1e-18")
+        self.assertEqual(
+            request["policy"]["root_correction_tolerance"], "1e-18"
+        )
         self.assertEqual(request["policy"]["ode_relative_tolerance"], "1e-18")
         self.assertEqual(request["policy"]["ode_absolute_tolerance"], "1e-20")
         self.assertEqual(request["policy"]["frequency_step"], "1e-6")
@@ -456,15 +472,19 @@ class JuliaResponseBackendTests(unittest.TestCase):
             VettedNativeDeterminantKernel.identity, adapter, 120, refinement=1
         )._request(job, 0.0j)["policy"]
 
-        self.assertEqual(policy80_refined["root_tolerance"], "1e-20")
+        self.assertEqual(
+            policy80_refined["root_correction_tolerance"], "1e-20"
+        )
         self.assertEqual(policy80_refined["ode_relative_tolerance"], "1e-20")
         self.assertEqual(policy80_refined["ode_absolute_tolerance"], "1e-20")
         self.assertEqual(policy80_refined["frequency_step"], "1e-7")
-        self.assertEqual(policy120["root_tolerance"], "1e-102")
+        self.assertEqual(policy120["root_correction_tolerance"], "1e-102")
         self.assertEqual(policy120["ode_relative_tolerance"], "1e-102")
         self.assertEqual(policy120["ode_absolute_tolerance"], "1e-104")
         self.assertEqual(policy120["frequency_step"], "1e-60")
-        self.assertEqual(policy120_refined["root_tolerance"], "1e-106")
+        self.assertEqual(
+            policy120_refined["root_correction_tolerance"], "1e-106"
+        )
         self.assertEqual(policy120_refined["ode_relative_tolerance"], "1e-106")
         self.assertEqual(policy120_refined["ode_absolute_tolerance"], "1e-108")
         self.assertEqual(policy120_refined["frequency_step"], "1e-60")

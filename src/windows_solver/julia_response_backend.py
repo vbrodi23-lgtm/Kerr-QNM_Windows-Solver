@@ -200,13 +200,13 @@ def promoted_precision_numerical_controls() -> dict[str, object]:
     return {
         "80": {
             "base": {
-                "root_tolerance": "1e-18",
+                "root_correction_tolerance": "1e-18",
                 "ode_relative_tolerance": "1e-18",
                 "ode_absolute_tolerance": "1e-20",
                 "frequency_step": "1e-6",
             },
             "refinement": {
-                "root_tolerance": "1e-20",
+                "root_correction_tolerance": "1e-20",
                 "ode_relative_tolerance": "1e-20",
                 "ode_absolute_tolerance": "1e-20",
                 "frequency_step": "1e-7",
@@ -214,13 +214,13 @@ def promoted_precision_numerical_controls() -> dict[str, object]:
         },
         "120": {
             "base": {
-                "root_tolerance": "1e-102",
+                "root_correction_tolerance": "1e-102",
                 "ode_relative_tolerance": "1e-102",
                 "ode_absolute_tolerance": "1e-104",
                 "frequency_step": "1e-60",
             },
             "refinement": {
-                "root_tolerance": "1e-106",
+                "root_correction_tolerance": "1e-106",
                 "ode_relative_tolerance": "1e-106",
                 "ode_absolute_tolerance": "1e-108",
                 "frequency_step": "1e-60",

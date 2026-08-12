@@ -48,7 +48,7 @@ _SOURCE_BLOBS = (
     ("gsn-potential-expressions", "34af90dd81e6e0f60823b338488d8d9587e2cc6a"),
 )
 _DERIVATIVE_STEP = 1.0e-5
-_ROOT_TOLERANCE = 2.0e-11
+_ROOT_CORRECTION_TOLERANCE = 2.0e-11
 # Stable across source checkouts and wheels; source_commit/source_blobs below
 # retain the authenticated upstream code identity.
 _ADAPTED_SOURCE_CONTRACT_ID = "native-gsn-adapter-contract-2"
@@ -474,23 +474,9 @@ class VettedNativeDeterminantKernel:
                     current_omega=_progress_complex(value),
                     determinant_abs=magnitude,
                     best_determinant_abs=best[1],
-                    acceptance_threshold=_ROOT_TOLERANCE,
+                    acceptance_metric="newton_correction_estimate_abs",
+                    acceptance_threshold=_ROOT_CORRECTION_TOLERANCE,
                 )
-                if magnitude < _ROOT_TOLERANCE:
-                    emit_progress(
-                        ProgressEventKind.NEWTON_ITERATION_COMPLETED,
-                        derivative_abs=None,
-                        raw_step=None,
-                        applied_step=None,
-                        step_abs=0.0,
-                        clipped=False,
-                        damping=0.0,
-                        accepted=True,
-                        resulting_omega=_progress_complex(value),
-                        resulting_determinant_abs=magnitude,
-                        elapsed_seconds=time.monotonic() - iteration_started,
-                    )
-                    return value, magnitude, True
                 h = _DERIVATIVE_STEP * (1.0 + abs(value))
                 derivative = (
                     evaluated(value + h, "derivative +h", value)
@@ -513,6 +499,23 @@ class VettedNativeDeterminantKernel:
                     )
                     break
                 raw_step = residual / derivative
+                correction_abs = abs(raw_step)
+                if correction_abs <= _ROOT_CORRECTION_TOLERANCE:
+                    emit_progress(
+                        ProgressEventKind.NEWTON_ITERATION_COMPLETED,
+                        derivative_abs=derivative_abs,
+                        raw_step=_progress_complex(raw_step),
+                        correction_abs=correction_abs,
+                        applied_step=_progress_complex(0.0j),
+                        step_abs=0.0,
+                        clipped=False,
+                        damping=0.0,
+                        accepted=True,
+                        resulting_omega=_progress_complex(value),
+                        resulting_determinant_abs=magnitude,
+                        elapsed_seconds=time.monotonic() - iteration_started,
+                    )
+                    return value, magnitude, True
                 step = raw_step
                 clipped = abs(step) > 6.0e-3
                 if clipped:
@@ -556,7 +559,7 @@ class VettedNativeDeterminantKernel:
                     resulting_determinant_abs=resulting_abs,
                     elapsed_seconds=time.monotonic() - iteration_started,
                 )
-        return best[0], best[1], best[1] < _ROOT_TOLERANCE
+        return best[0], best[1], False
 
     def _solve_once(
         self,
@@ -570,7 +573,7 @@ class VettedNativeDeterminantKernel:
         determinant = lambda omega: self._determinant(
             sn, complex(omega), perturbation, policy
         )
-        root, residual, converged = self._bounded_newton(determinant, guess)
+        root, residual, _ = self._bounded_newton(determinant, guess)
         h = _DERIVATIVE_STEP * (1.0 + abs(root))
 
         def final_determinant(omega: complex, purpose: str) -> complex:
@@ -608,6 +611,7 @@ class VettedNativeDeterminantKernel:
             raise NativeResourceUnavailableError(
                 "native determinant frequency derivative is not usable"
             )
+        converged = residual / derivative <= _ROOT_CORRECTION_TOLERANCE
         return root, residual, derivative, converged
 
     def evaluate_root(

@@ -14,6 +14,7 @@ from windows_solver.response_batches import (
     PrecisionCapabilities,
     StageOutcome,
     _primary_recovery_precision_contract,
+    _root_convergence_precision_contract,
     _produced_response,
     build_campaign_plan,
     build_campaign_selection,
@@ -195,6 +196,28 @@ def _replace_component_result_fields(
 
 
 class PrimaryPrecisionTests(unittest.TestCase):
+    def test_root_convergence_contract_names_estimate_and_safeguards(self):
+        """Catches presenting a local Newton estimate as certified root error."""
+
+        self.assertEqual(
+            _root_convergence_precision_contract(),
+            {
+                "version": 1,
+                "metric": "newton_correction_estimate_abs",
+                "definition": "determinant_residual_abs_over_derivative_abs",
+                "binary64_tolerance_abs": 2.0e-11,
+                "derivative_requirement": "finite_strictly_positive",
+                "required_phases": [
+                    "PRIMARY",
+                    "TRUNCATION",
+                    "RESOLUTION",
+                    "SEED-PATH",
+                ],
+                "branch_continuation_required": True,
+                "evidence_ceiling": "local_estimate_not_root_enclosure",
+            },
+        )
+
     def test_primary_recovery_contract_binds_promoted_numerical_controls(self):
         """Catches changing promoted tolerances without changing policy identity."""
 
@@ -206,13 +229,13 @@ class PrimaryPrecisionTests(unittest.TestCase):
             {
                 "80": {
                     "base": {
-                        "root_tolerance": "1e-18",
+                        "root_correction_tolerance": "1e-18",
                         "ode_relative_tolerance": "1e-18",
                         "ode_absolute_tolerance": "1e-20",
                         "frequency_step": "1e-6",
                     },
                     "refinement": {
-                        "root_tolerance": "1e-20",
+                        "root_correction_tolerance": "1e-20",
                         "ode_relative_tolerance": "1e-20",
                         "ode_absolute_tolerance": "1e-20",
                         "frequency_step": "1e-7",
@@ -220,13 +243,13 @@ class PrimaryPrecisionTests(unittest.TestCase):
                 },
                 "120": {
                     "base": {
-                        "root_tolerance": "1e-102",
+                        "root_correction_tolerance": "1e-102",
                         "ode_relative_tolerance": "1e-102",
                         "ode_absolute_tolerance": "1e-104",
                         "frequency_step": "1e-60",
                     },
                     "refinement": {
-                        "root_tolerance": "1e-106",
+                        "root_correction_tolerance": "1e-106",
                         "ode_relative_tolerance": "1e-106",
                         "ode_absolute_tolerance": "1e-108",
                         "frequency_step": "1e-60",

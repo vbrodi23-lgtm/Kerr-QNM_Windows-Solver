@@ -12,7 +12,7 @@ import unittest
 
 from windows_solver.campaign_reports import (
     CampaignReportModel,
-    _root_tolerance_for_precision,
+    _root_correction_tolerance_for_precision,
     refresh_campaign_reports,
 )
 from windows_solver.contracts import canonical_json_bytes
@@ -69,8 +69,8 @@ class CampaignReportTests(unittest.TestCase):
             },
             baseline=RootReadout(
                 omega=job.root.omega,
-                determinant_residual_abs=1.42e-11,
-                determinant_derivative_abs=1.0,
+                determinant_residual_abs=3.50e-11,
+                determinant_derivative_abs=36.1,
                 converged=True,
                 root_reference_id=job.root.root_reference_id,
                 branch_id=job.root.branch_id,
@@ -397,7 +397,7 @@ class CampaignReportTests(unittest.TestCase):
                     "converged": True,
                     "branch_ok": True,
                     "determinant_abs": 1.0e-18,
-                    "determinant_over_tolerance": 1.0,
+                    "newton_correction_over_tolerance": 1.0,
                     "newton_correction": 1.0e-19,
                     "root_displacement_abs": 1.0e-18,
                 }
@@ -411,9 +411,9 @@ class CampaignReportTests(unittest.TestCase):
         self.assertIn("BigFloat 80 dec", table)
         self.assertIn("BigFloat 120 dec", table)
         self.assertNotIn("  64 CONVERGED", table)
-        self.assertEqual(_root_tolerance_for_precision(64), 2.0e-11)
-        self.assertEqual(_root_tolerance_for_precision(80), 1.0e-18)
-        self.assertEqual(_root_tolerance_for_precision(120), 1.0e-102)
+        self.assertEqual(_root_correction_tolerance_for_precision(64), 2.0e-11)
+        self.assertEqual(_root_correction_tolerance_for_precision(80), 1.0e-18)
+        self.assertEqual(_root_correction_tolerance_for_precision(120), 1.0e-102)
 
     def test_dashboard_throttles_fast_inner_events_but_forces_heartbeat(self):
         """Catches terminal redraw volume scaling with determinant operations."""
@@ -498,7 +498,7 @@ class CampaignReportTests(unittest.TestCase):
                 leaf.job.root.omega.imag,
             )
             self.assertEqual(
-                float(current["baseline_determinant_residual"]), 1.42e-11
+                float(current["baseline_determinant_residual"]), 3.50e-11
             )
             self.assertEqual(float(current["signed_root_crosscheck_real"]), 1.25)
             self.assertEqual(
@@ -511,18 +511,22 @@ class CampaignReportTests(unittest.TestCase):
             self.assertEqual(stage_row["numerical_state"], "CONVERGED")
             self.assertIs(stage_row["converged"], True)
             self.assertIs(stage_row["branch_ok"], True)
-            self.assertAlmostEqual(stage_row["determinant_abs"], 1.42e-11)
+            self.assertAlmostEqual(stage_row["determinant_abs"], 3.50e-11)
             self.assertAlmostEqual(
-                stage_row["determinant_over_tolerance"], 0.71
+                stage_row["newton_correction_over_tolerance"],
+                (3.50e-11 / 36.1) / 2.0e-11,
             )
-            self.assertAlmostEqual(stage_row["newton_correction"], 1.42e-11)
+            self.assertAlmostEqual(
+                stage_row["newton_correction"], 3.50e-11 / 36.1
+            )
             self.assertEqual(stage_row["root_displacement_abs"], 0.0)
 
             reporter = CampaignProgressReporter("normal", checkpoint, io.StringIO())
             reporter._campaign_report_model = model
             table = "\n".join(reporter._precision_stage_table_lines())
             self.assertIn("ROOT", table)
-            self.assertIn("D_OVER_TOL", table)
+            self.assertIn("CORR_OVER_TOL", table)
+            self.assertNotIn("D_OVER_TOL", table.splitlines()[2].split())
             self.assertIn("NEWTON_DW", table)
             self.assertIn("DELTA_ROOT", table)
             self.assertIn("220 a/M=0.95", table)
