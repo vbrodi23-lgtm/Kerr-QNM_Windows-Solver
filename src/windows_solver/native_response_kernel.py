@@ -427,7 +427,7 @@ class VettedNativeDeterminantKernel:
     @staticmethod
     def _bounded_newton(
         determinant: Callable[[complex], complex], guess: complex
-    ) -> tuple[complex, float, bool]:
+    ) -> tuple[complex, float, float | None, bool]:
         value = complex(guess)
 
         def evaluated(
@@ -515,7 +515,7 @@ class VettedNativeDeterminantKernel:
                         resulting_determinant_abs=magnitude,
                         elapsed_seconds=time.monotonic() - iteration_started,
                     )
-                    return value, magnitude, True
+                    return value, magnitude, derivative_abs, True
                 step = raw_step
                 clipped = abs(step) > 6.0e-3
                 if clipped:
@@ -559,7 +559,7 @@ class VettedNativeDeterminantKernel:
                     resulting_determinant_abs=resulting_abs,
                     elapsed_seconds=time.monotonic() - iteration_started,
                 )
-        return best[0], best[1], False
+        return best[0], best[1], None, False
 
     def _solve_once(
         self,
@@ -573,7 +573,9 @@ class VettedNativeDeterminantKernel:
         determinant = lambda omega: self._determinant(
             sn, complex(omega), perturbation, policy
         )
-        root, residual, _ = self._bounded_newton(determinant, guess)
+        root, residual, accepted_derivative, _ = self._bounded_newton(
+            determinant, guess
+        )
         h = _DERIVATIVE_STEP * (1.0 + abs(root))
 
         def final_determinant(omega: complex, purpose: str) -> complex:
@@ -600,13 +602,15 @@ class VettedNativeDeterminantKernel:
                 )
                 return result
 
-        derivative = abs(
-            (
-                final_determinant(root + h, "final derivative +h")
-                - final_determinant(root - h, "final derivative -h")
+        derivative = accepted_derivative
+        if derivative is None:
+            derivative = abs(
+                (
+                    final_determinant(root + h, "final derivative +h")
+                    - final_determinant(root - h, "final derivative -h")
+                )
+                / (2.0 * h)
             )
-            / (2.0 * h)
-        )
         if not math.isfinite(derivative) or derivative <= 0.0:
             raise NativeResourceUnavailableError(
                 "native determinant frequency derivative is not usable"

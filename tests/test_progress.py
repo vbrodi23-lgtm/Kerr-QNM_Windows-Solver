@@ -472,6 +472,74 @@ class CampaignProgressReporterTests(unittest.TestCase):
         ):
             self.assertIsNone(live[name], name)
 
+    def test_live_dashboard_keeps_determinant_counter_scopes_separate_at_phase_boundary(self):
+        reporter = CampaignProgressReporter(
+            "normal", self.reporter_checkpoint, io.StringIO()
+        )
+        base = {
+            "leaf_id": "leaf-1",
+            "leaf_index": 1,
+            "leaf_count": 212,
+            "precision_digits": 64,
+            "component_pass": "primary",
+            "readout_index": 2,
+        }
+        reporter.publish(_event(
+            ProgressEventKind.PRECISION_STAGE_STARTED,
+            **{name: value for name, value in base.items() if name != "readout_index"},
+        ))
+        prior = {**base, "readout_index": 1, "phase": "PRIMARY"}
+        for _ in range(296):
+            reporter.publish(_event(ProgressEventKind.DETERMINANT_STARTED, **prior))
+
+        current = {**base, "phase": "PRIMARY"}
+        reporter.publish(_event(
+            ProgressEventKind.NEWTON_ITERATION_STARTED,
+            **current,
+            newton_index=2,
+            newton_limit=12,
+        ))
+        for _ in range(10):
+            reporter.publish(_event(
+                ProgressEventKind.DETERMINANT_STARTED,
+                **current,
+                newton_index=2,
+                newton_limit=12,
+            ))
+
+        active = "\n".join(reporter._current_execution_lines(compact=True))
+        self.assertIn(
+            "Dets leaf 306 phase 10 Newton 10",
+            active,
+        )
+
+        next_phase = {**base, "phase": "TRUNCATION"}
+        reporter.publish(_event(ProgressEventKind.ROOT_PHASE_STARTED, **next_phase))
+        boundary = "\n".join(reporter._current_execution_lines(compact=True))
+        self.assertIn(
+            "Dets leaf 306 phase - Newton -",
+            boundary,
+        )
+        self.assertNotIn("Determinant 306", boundary)
+
+        reporter.publish(_event(
+            ProgressEventKind.NEWTON_ITERATION_STARTED,
+            **next_phase,
+            newton_index=1,
+            newton_limit=12,
+        ))
+        reporter.publish(_event(
+            ProgressEventKind.DETERMINANT_STARTED,
+            **next_phase,
+            newton_index=1,
+            newton_limit=12,
+        ))
+        restarted = "\n".join(reporter._current_execution_lines(compact=True))
+        self.assertIn(
+            "Dets leaf 307 phase 1 Newton 1",
+            restarted,
+        )
+
     def test_worker_ode_segment_stats_reach_status_and_dashboard_state(self):
         reporter = CampaignProgressReporter(
             "normal", self.reporter_checkpoint, io.StringIO()

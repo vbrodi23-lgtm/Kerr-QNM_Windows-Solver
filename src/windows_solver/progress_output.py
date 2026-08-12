@@ -1454,9 +1454,12 @@ class CampaignProgressReporter:
         newton = self._index_limit(
             state.get("newton_index"), state.get("newton_limit")
         )
-        determinant = (
-            state.get("determinant_index_phase")
-            or state.get("determinant_index_leaf")
+        determinant_counts = " | ".join(
+            (
+                f"leaf {self._dashboard_value(state.get('determinant_index_leaf')) or '-'}",
+                f"phase {self._dashboard_value(state.get('determinant_index_phase')) or '-'}",
+                f"Newton {self._dashboard_value(state.get('determinant_index_newton')) or '-'}",
+            )
         )
         current_omega = self._complex_text(state.get("current_omega"))
         determinant_abs = self._scientific_number(state.get("determinant_abs"))
@@ -1470,6 +1473,7 @@ class CampaignProgressReporter:
             suboperation_text = self._dashboard_value(suboperation)
             if radial is not None:
                 suboperation_text = f"{suboperation_text} ({radial})"
+            compact_determinants = determinant_counts.replace(" | ", " ")
             return [
                 " CURRENTLY EXECUTING",
                 f" Current leaf   {current_leaf} | Root {self._dashboard_value(root)} | {self._dashboard_value(precision)}",
@@ -1478,7 +1482,7 @@ class CampaignProgressReporter:
                 f" Worker         {self._dashboard_value(worker)} | Tier elapsed {self._dashboard_value(tier_elapsed)}",
                 f" Activity       {self._dashboard_value(activity)} | Seed authenticated {seed_authenticated}",
                 " LIVE ROOT SOLVE",
-                f" Newton         {newton} | Determinant {self._dashboard_value(determinant)} | Suboperation {suboperation_text}",
+                f" Newton         {newton} | Dets {compact_determinants} | Suboperation {suboperation_text}",
                 self._dashboard_field_line("Current ω", current_omega),
                 f" |D|            {determinant_abs} | Best |D| {best_determinant_abs}",
                 *ode_lines,
@@ -1502,7 +1506,7 @@ class CampaignProgressReporter:
             "",
             " LIVE ROOT SOLVE",
             self._dashboard_field_line("Newton", newton),
-            self._dashboard_field_line("Determinant", determinant),
+            self._dashboard_field_line("Determinants", determinant_counts),
             self._dashboard_field_line("Current ω", current_omega),
             self._dashboard_field_line("|D|", determinant_abs),
             self._dashboard_field_line("Best |D|", best_determinant_abs),
@@ -1619,6 +1623,7 @@ class CampaignProgressReporter:
             "newton_limit": state.get("newton_limit"),
             "determinant_index_leaf": state.get("determinant_index_leaf"),
             "determinant_index_phase": state.get("determinant_index_phase"),
+            "determinant_index_newton": state.get("determinant_index_newton"),
             "current_omega": state.get("current_omega"),
             "determinant_abs": state.get("determinant_abs"),
             "best_determinant_abs": state.get("best_determinant_abs"),
