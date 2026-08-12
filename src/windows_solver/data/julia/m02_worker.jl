@@ -481,7 +481,7 @@ function homogeneous_rho_rhs!(du, state, parameters, rho)
         parameters.lambda,
         radius,
     )
-    U = exp(T(2) * im * parameters.beta) * Potentials.sU(
+    U = exp(2im * parameters.beta) * Potentials.sU(
         parameters.s,
         parameters.m,
         parameters.a,
@@ -1005,7 +1005,14 @@ function determinant(::Type{T}, request, omega::Complex{T}, amplitude::Complex{T
         iszero(denominator) && error("zero horizon chart denominator")
         reflectivity = amplitude / denominator
         chart_ratio = iszero(p_h) ? T(Inf) : abs(amplitude) / (T(2) * abs(p_h))
+        isfinite(chart_ratio) && chart_ratio < one(T) ||
+            error("horizon chart ratio must be finite and below one")
         progress_emit("horizon_chart_evaluated"; payload=Dict(
+            "Cinc" => progress_complex(branches.Cinc),
+            "Cref" => progress_complex(branches.Cref),
+            "horizon_frequency" => progress_complex(p_h),
+            "reflectivity" => progress_complex(reflectivity),
+            "chart_denominator" => progress_complex(denominator),
             "Cinc_abs" => string(abs(branches.Cinc)),
             "Cref_abs" => string(abs(branches.Cref)),
             "horizon_frequency_abs" => string(abs(p_h)),
@@ -1249,10 +1256,25 @@ function solve_once(::Type{T}, request, initial::Complex{T}, amplitude::Complex{
         Complex{T}(zero(T), h),
         "final derivative ih",
     )
+    fine_step_difference_abs = abs(
+        derivative_real_half - derivative_real_base
+    )
+    coarse_step_difference_abs = abs(
+        derivative_real_base - derivative_real_double
+    )
+    complex_axis_difference_abs = abs(
+        derivative_imaginary - derivative_real_half
+    )
+    real_step_convergent =
+        fine_step_difference_abs <= coarse_step_difference_abs
+    complex_axis_consistent =
+        complex_axis_difference_abs <= coarse_step_difference_abs
+    real_step_convergent && complex_axis_consistent ||
+        error("determinant frequency derivative estimates do not agree")
     derivative_uncertainty_abs = maximum((
-        abs(derivative_real_base - derivative_real_half),
+        fine_step_difference_abs,
         abs(derivative_real_double - derivative_real_half),
-        abs(derivative_imaginary - derivative_real_half),
+        complex_axis_difference_abs,
     ))
     derivative_abs = abs(derivative_real_half)
     derivative_lower_bound_abs = derivative_abs - derivative_uncertainty_abs
@@ -1267,12 +1289,17 @@ function solve_once(::Type{T}, request, initial::Complex{T}, amplitude::Complex{
         "derivative_real_base" => progress_complex(derivative_real_base),
         "derivative_real_double" => progress_complex(derivative_real_double),
         "derivative_imaginary" => progress_complex(derivative_imaginary),
+        "fine_step_difference_abs" => string(fine_step_difference_abs),
+        "coarse_step_difference_abs" => string(coarse_step_difference_abs),
+        "complex_axis_difference_abs" => string(complex_axis_difference_abs),
+        "real_step_convergent" => real_step_convergent,
+        "complex_axis_consistent" => complex_axis_consistent,
         "derivative_uncertainty_abs" => string(derivative_uncertainty_abs),
         "derivative_lower_bound_abs" => string(derivative_lower_bound_abs),
         "correction_upper_bound" => string(correction_upper_bound),
         "accepted" => converged,
     ))
-    return root, residual, derivative_abs, converged
+    return root, residual, derivative_lower_bound_abs, converged
 end
 
 function solve_phase(
