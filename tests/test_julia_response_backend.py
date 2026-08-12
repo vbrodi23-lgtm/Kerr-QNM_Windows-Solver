@@ -460,6 +460,44 @@ class JuliaResponseBackendTests(unittest.TestCase):
         self.assertIn("correction_upper_bound", worker)
         self.assertIn("derivative_control_completed", worker)
 
+    def test_package_worker_confines_fine_steps_and_stores_only_endpoints(self):
+        worker = (
+            Path(__file__).resolve().parents[1]
+            / "src/windows_solver/data/julia/m02_worker.jl"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("function radial_rhs!(du, state, parameters, radius)", worker)
+        self.assertIn("vacuum_tail_dtmax = T(0.2)", worker)
+        self.assertIn("fine_dtmax = min(", worker)
+        self.assertIn("tstops=[stop_radius]", worker)
+        self.assertIn("save_everystep=false", worker)
+        self.assertIn("save_start=false", worker)
+        self.assertIn("save_end=true", worker)
+        self.assertIn("dense=false", worker)
+        self.assertIn("solution.u[end]", worker)
+        self.assertIn('"perturbed_Xin_compact_support"', worker)
+        self.assertIn('"perturbed_Xin_vacuum_tail"', worker)
+
+    def test_package_worker_avoids_unused_exterior_homogeneous_half_solutions(self):
+        worker = (
+            Path(__file__).resolve().parents[1]
+            / "src/windows_solver/data/julia/m02_worker.jl"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("function solve_xin_at_match(", worker)
+        self.assertIn("function solve_xup_at_match(", worker)
+        self.assertIn("CF.Xin_initialconditions(", worker)
+        self.assertIn("CF.Xup_initialconditions(", worker)
+        self.assertIn("CF.solve_X_in_rho(", worker)
+        self.assertIn(
+            "xin_match = solve_xin_at_match(",
+            worker,
+        )
+        self.assertIn(
+            "xup_match = solve_xup_at_match(",
+            worker,
+        )
+
     def test_promoted_branch_authentication_uses_a_mode_specific_enclosure(self):
         root = Path(__file__).resolve().parents[1]
         worker = (root / "src/windows_solver/data/julia/m02_worker.jl").read_text(
