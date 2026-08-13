@@ -53,6 +53,8 @@ class ProgressEventKind(StrEnum):
     DETERMINANT_STARTED = "determinant_started"
     DETERMINANT_COMPLETED = "determinant_completed"
     DETERMINANT_EVALUATED = "determinant_evaluated"
+    HORIZON_CHART_EVALUATED = "horizon_chart_evaluated"
+    DERIVATIVE_CONTROL_COMPLETED = "derivative_control_completed"
     CANDIDATE_EVALUATED = "candidate_evaluated"
     DAMPING_DECIDED = "damping_decided"
     SUBOPERATION_STARTED = "suboperation_started"
