@@ -6,6 +6,7 @@ import io
 import json
 import os
 from pathlib import Path
+import re
 import signal
 import subprocess
 import sys
@@ -563,6 +564,106 @@ class JuliaResponseBackendTests(unittest.TestCase):
         self.assertEqual(len(observer.events), 1)
         self.assertIs(observer.events[0].kind, ProgressEventKind.NEWTON_ITERATION_STARTED)
         self.assertEqual(observer.events[0].context.phase, "PRIMARY")
+
+    def test_reserved_horizon_chart_event_is_forwarded_to_active_reporter(self):
+        class Observer:
+            def __init__(self):
+                self.events = []
+
+            def publish(self, event):
+                self.events.append(event)
+
+        observer = Observer()
+        line = JULIA_PROGRESS_PREFIX + json.dumps({
+            "schema": PROGRESS_SCHEMA,
+            "kind": "horizon_chart_evaluated",
+            "context": {},
+            "payload": {
+                "Cinc": {"real": "1.0", "imaginary": "-0.5"},
+                "Cref": {"real": "0.25", "imaginary": "0.125"},
+                "horizon_frequency": {"real": "0.01", "imaginary": "-0.02"},
+                "reflectivity": {"real": "0.03", "imaginary": "0.04"},
+                "chart_denominator": {"real": "0.05", "imaginary": "0.06"},
+                "Cinc_abs": "1.118033988749895",
+                "Cref_abs": "0.2795084971874737",
+                "horizon_frequency_abs": "0.0223606797749979",
+                "reflectivity_abs": "0.05",
+                "chart_denominator_abs": "0.07810249675906655",
+                "chart_scale_abs": "0.04",
+                "chart_condition_abs": "1.9525624189766637",
+                "chart_condition_threshold": "1e-40",
+                "chart_ratio": "0.1",
+            },
+        })
+        with activate_progress(observer):
+            self.assertTrue(_forward_julia_progress_line(line))
+
+        self.assertEqual(len(observer.events), 1)
+        self.assertIs(
+            observer.events[0].kind,
+            ProgressEventKind.HORIZON_CHART_EVALUATED,
+        )
+        self.assertEqual(observer.events[0].payload["chart_ratio"], "0.1")
+
+    def test_reserved_derivative_control_event_is_forwarded_to_active_reporter(self):
+        class Observer:
+            def __init__(self):
+                self.events = []
+
+            def publish(self, event):
+                self.events.append(event)
+
+        observer = Observer()
+        line = JULIA_PROGRESS_PREFIX + json.dumps({
+            "schema": PROGRESS_SCHEMA,
+            "kind": "derivative_control_completed",
+            "context": {},
+            "payload": {
+                "derivative_real_half": {"real": "2.0", "imaginary": "0.1"},
+                "derivative_real_base": {"real": "2.1", "imaginary": "0.1"},
+                "derivative_real_double": {"real": "2.2", "imaginary": "0.1"},
+                "derivative_imaginary": {"real": "2.0", "imaginary": "0.2"},
+                "fine_step_difference_abs": "0.1",
+                "coarse_step_difference_abs": "0.2",
+                "complex_axis_difference_abs": "0.1",
+                "real_step_convergent": True,
+                "complex_axis_consistent": True,
+                "derivative_uncertainty_abs": "0.2",
+                "derivative_lower_bound_abs": "1.8024984394500787",
+                "correction_upper_bound": "1e-18",
+                "accepted": True,
+            },
+        })
+        with activate_progress(observer):
+            self.assertTrue(_forward_julia_progress_line(line))
+
+        self.assertEqual(len(observer.events), 1)
+        self.assertIs(
+            observer.events[0].kind,
+            ProgressEventKind.DERIVATIVE_CONTROL_COMPLETED,
+        )
+        self.assertIs(observer.events[0].payload["accepted"], True)
+
+    def test_every_literal_worker_progress_event_is_registered_in_python(self):
+        worker = (
+            Path(__file__).resolve().parents[1]
+            / "src/windows_solver/data/julia/m02_worker.jl"
+        ).read_text(encoding="utf-8")
+        worker_kinds = set(re.findall(r'progress_emit\("([^"]+)"', worker))
+        python_kinds = {kind.value for kind in ProgressEventKind}
+
+        self.assertEqual(worker_kinds - python_kinds, set())
+
+    def test_unknown_reserved_julia_progress_kind_is_fail_closed(self):
+        line = JULIA_PROGRESS_PREFIX + json.dumps({
+            "schema": PROGRESS_SCHEMA,
+            "kind": "unregistered_worker_event",
+            "context": {},
+            "payload": {},
+        })
+
+        with self.assertRaises(JuliaResponseBackendError):
+            _forward_julia_progress_line(line)
 
     def test_malformed_reserved_julia_progress_is_fail_closed(self):
         with self.assertRaises(JuliaResponseBackendError):
