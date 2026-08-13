@@ -738,22 +738,25 @@ class RootReadout:
     root_reference_id: str
     branch_id: str
     equation_id: str
-    truncation_radius: float = 0.0
-    resolution_radius: float = 0.0
-    seed_path_radius: float = 0.0
+    truncation_radius: float | None = 0.0
+    resolution_radius: float | None = 0.0
+    seed_path_radius: float | None = 0.0
     diagnostic_readouts: Mapping[str, DiagnosticRootReadout] | None = None
     source_root_mapping: Mapping[str, object] | None = None
+    diagnostics_skipped_reason: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "omega", _finite_complex(self.omega, "root omega"))
-        for name in (
-            "determinant_residual_abs",
-            "determinant_derivative_abs",
-            "truncation_radius",
-            "resolution_radius",
-            "seed_path_radius",
-        ):
+        for name in ("determinant_residual_abs", "determinant_derivative_abs"):
             value = float(getattr(self, name))
+            if not math.isfinite(value) or value < 0.0:
+                raise ValueError(f"{name} must be finite and nonnegative")
+            object.__setattr__(self, name, value)
+        for name in ("truncation_radius", "resolution_radius", "seed_path_radius"):
+            raw = getattr(self, name)
+            if raw is None:
+                continue
+            value = float(raw)
             if not math.isfinite(value) or value < 0.0:
                 raise ValueError(f"{name} must be finite and nonnegative")
             object.__setattr__(self, name, value)
@@ -793,6 +796,8 @@ class RootReadout:
                 "seed-path": self.seed_path_radius,
             }
             for family, readout in copied.items():
+                if scalar_radii[family] is None:
+                    raise ValueError("diagnostic root radius is missing")
                 derived = abs(readout.omega_delta_from_primary)
                 binary64_resolution = 2.0 * max(
                     math.ulp(readout.omega_delta_from_primary.real),
@@ -809,6 +814,31 @@ class RootReadout:
                     raise ValueError(
                         f"{family} diagnostic root displacement is inconsistent"
                     )
+        skipped = self.diagnostics_skipped_reason
+        if skipped is not None:
+            if (
+                skipped != "PRIMARY_NOT_CONVERGED"
+                or self.converged
+                or self.diagnostic_readouts
+                or any(
+                    value is not None
+                    for value in (
+                        self.truncation_radius,
+                        self.resolution_radius,
+                        self.seed_path_radius,
+                    )
+                )
+            ):
+                raise ValueError("root diagnostic skip evidence is inconsistent")
+        elif any(
+            value is None
+            for value in (
+                self.truncation_radius,
+                self.resolution_radius,
+                self.seed_path_radius,
+            )
+        ):
+            raise ValueError("root diagnostic radii are missing without a reason")
 
     @property
     def newton_correction_estimate(self) -> float:
@@ -838,6 +868,8 @@ class RootReadout:
                 family: self.diagnostic_readouts[family].to_mapping()
                 for family in _DIAGNOSTIC_ROOT_FAMILIES
             }
+        if self.diagnostics_skipped_reason is not None:
+            output["diagnostics_skipped_reason"] = self.diagnostics_skipped_reason
         return output
 
     @classmethod
@@ -852,9 +884,21 @@ class RootReadout:
             root_reference_id=str(value["root_reference_id"]),
             branch_id=str(value["branch_id"]),
             equation_id=str(value["equation_id"]),
-            truncation_radius=float(value.get("truncation_radius", 0.0)),
-            resolution_radius=float(value.get("resolution_radius", 0.0)),
-            seed_path_radius=float(value.get("seed_path_radius", 0.0)),
+            truncation_radius=(
+                None
+                if value.get("truncation_radius", 0.0) is None
+                else float(value.get("truncation_radius", 0.0))
+            ),
+            resolution_radius=(
+                None
+                if value.get("resolution_radius", 0.0) is None
+                else float(value.get("resolution_radius", 0.0))
+            ),
+            seed_path_radius=(
+                None
+                if value.get("seed_path_radius", 0.0) is None
+                else float(value.get("seed_path_radius", 0.0))
+            ),
             diagnostic_readouts=(
                 None
                 if "diagnostic_readouts" not in value
@@ -867,6 +911,11 @@ class RootReadout:
             ),
             source_root_mapping=_validated_source_root_mapping(
                 value.get("source_root_mapping")
+            ),
+            diagnostics_skipped_reason=(
+                None
+                if value.get("diagnostics_skipped_reason") is None
+                else str(value["diagnostics_skipped_reason"])
             ),
         )
 
@@ -901,9 +950,17 @@ def root_readout_preserves_authenticated_branch(
         <= branch_radius
         and readout.newton_correction_estimate
         <= ROOT_BRANCH_CONTINUATION_TOLERANCE_ABS
-        and readout.truncation_radius <= branch_radius
-        and readout.resolution_radius <= branch_radius
-        and readout.seed_path_radius <= branch_radius
+        and (
+            readout.diagnostics_skipped_reason == "PRIMARY_NOT_CONVERGED"
+            or (
+                readout.truncation_radius is not None
+                and readout.resolution_radius is not None
+                and readout.seed_path_radius is not None
+                and readout.truncation_radius <= branch_radius
+                and readout.resolution_radius <= branch_radius
+                and readout.seed_path_radius <= branch_radius
+            )
+        )
     )
 
 

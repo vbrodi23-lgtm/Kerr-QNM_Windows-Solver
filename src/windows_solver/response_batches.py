@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from contextvars import ContextVar
+from datetime import datetime, timezone
 import hashlib
 import json
 import math
@@ -42,9 +43,12 @@ from .gsn_cache_producer import (
     parameter_pairs_for_selection,
 )
 from .julia_response_backend import (
+    JuliaODEResourceLimitError,
     JuliaPrecisionRootBackend,
+    JuliaRootReadoutResourceLimitError,
     JuliaResponseAdapter,
     JuliaResponseBackendError,
+    JuliaWorkerTimeoutError,
     worker_failure_payload as _julia_worker_failure_payload,
 )
 from .progress import PROGRESS_SCHEMA, ProgressEventKind, emit_progress, progress_scope
@@ -56,7 +60,8 @@ from .solved_leaf_cache import (
 
 
 CAMPAIGN_SCHEMA_VERSION = 2
-CAMPAIGN_CHECKPOINT_SCHEMA_VERSION = 3
+CAMPAIGN_CHECKPOINT_SCHEMA_VERSION = 4
+_LEGACY_CAMPAIGN_CHECKPOINT_SCHEMA_VERSION = 3
 _PRECISION_DIGITS = frozenset({64, 80, 120})
 STAGE_SIGNED_ERROR_FAMILIES = (
     "signed-root",
@@ -729,6 +734,222 @@ class CampaignLeafRecord:
         return record
 
 
+_CONTAINABLE_FAILURE_CODES = frozenset({
+    "ODE_RESOURCE_LIMIT",
+    "ROOT_READOUT_RESOURCE_INFEASIBLE",
+    "WORKER_TIMEOUT",
+})
+_CONTAINABLE_FAILURE_STATES = {
+    "ODE_RESOURCE_LIMIT": "EXECUTION_RESOURCE_LIMITED",
+    "ROOT_READOUT_RESOURCE_INFEASIBLE": "EXECUTION_RESOURCE_LIMITED",
+    "WORKER_TIMEOUT": "WORKER_TIMEOUT",
+}
+_CONTAINABLE_EXCEPTION_TYPES = (
+    JuliaODEResourceLimitError,
+    JuliaRootReadoutResourceLimitError,
+    JuliaWorkerTimeoutError,
+)
+
+
+def _validated_attempt_failure_receipt(value: object) -> dict[str, object]:
+    if not isinstance(value, Mapping):
+        raise ValueError("campaign execution attempt receipt is invalid")
+    probe = JuliaResponseBackendError("attempt receipt validation")
+    probe.worker_failure = value  # type: ignore[attr-defined]
+    bounded = _julia_worker_failure_payload(probe)
+    if bounded is None or bounded != dict(value):
+        raise ValueError("campaign execution attempt receipt is malformed")
+    failure = bounded.get("failure")
+    if not isinstance(failure, Mapping):
+        raise ValueError("campaign execution attempt lacks a structured failure")
+    code = failure.get("failure_code")
+    if (
+        code not in _CONTAINABLE_FAILURE_CODES
+        or failure.get("failure_class") != "CONTROL"
+        or not isinstance(failure.get("retryable"), bool)
+    ):
+        raise ValueError("campaign execution attempt is not containable")
+    resource_policy = failure.get("execution_resource_policy")
+    identity_fields = {"schema", "version", "sha256"}
+    full_policy_fields = identity_fields | {
+        "worker_request_wall_clock_seconds",
+        "cooperative_request_deadline_seconds",
+        "homogeneous_ode_maxiters",
+        "max_accepted_steps_per_homogeneous_leg",
+        "max_rhs_evaluations_per_homogeneous_leg",
+        "homogeneous_leg_wall_clock_seconds",
+    }
+    resource_policy_fields = frozenset(resource_policy) if isinstance(
+        resource_policy, Mapping
+    ) else frozenset()
+    if (
+        not isinstance(resource_policy, Mapping)
+        or resource_policy_fields
+        not in {frozenset(identity_fields), frozenset(full_policy_fields)}
+        or resource_policy.get("schema")
+        != "windows-solver.execution-resource-policy/1"
+        or resource_policy.get("version") != 1
+        or not isinstance(resource_policy.get("sha256"), str)
+        or len(resource_policy["sha256"]) != 64
+        or any(
+            character not in "0123456789abcdef"
+            for character in resource_policy["sha256"]
+        )
+    ):
+        raise ValueError(
+            "campaign execution attempt resource-policy identity is invalid"
+        )
+    if resource_policy_fields == full_policy_fields:
+        for name in (
+            "worker_request_wall_clock_seconds",
+            "cooperative_request_deadline_seconds",
+            "homogeneous_ode_maxiters",
+            "max_accepted_steps_per_homogeneous_leg",
+            "max_rhs_evaluations_per_homogeneous_leg",
+        ):
+            item = resource_policy[name]
+            if isinstance(item, bool) or not isinstance(item, int) or item < 1:
+                raise ValueError(
+                    "campaign execution attempt resource-policy limit is invalid"
+                )
+        leg_timeout = resource_policy["homogeneous_leg_wall_clock_seconds"]
+        if leg_timeout is not None and (
+            isinstance(leg_timeout, bool)
+            or not isinstance(leg_timeout, int)
+            or leg_timeout < 1
+        ):
+            raise ValueError(
+                "campaign execution attempt resource-policy leg limit is invalid"
+            )
+        if (
+            resource_policy["worker_request_wall_clock_seconds"] < 60
+            or resource_policy["cooperative_request_deadline_seconds"]
+            >= resource_policy["worker_request_wall_clock_seconds"]
+        ):
+            raise ValueError(
+                "campaign execution attempt resource-policy deadline is invalid"
+            )
+        material = {
+            key: item
+            for key, item in resource_policy.items()
+            if key != "sha256"
+        }
+        if resource_policy["sha256"] != _sha256(material):
+            raise ValueError(
+                "campaign execution attempt resource-policy digest is invalid"
+            )
+    return bounded
+
+
+@dataclass(frozen=True, slots=True)
+class CampaignExecutionAttempt:
+    """One append-only operational attempt; never scientific evidence."""
+
+    attempt_ordinal: int
+    leaf_id: str
+    leaf_index: int
+    role: str
+    state: str
+    precision_digits: int
+    failure_code: str
+    failure_receipt: Mapping[str, object]
+    created_at_utc: str
+
+    def __post_init__(self) -> None:
+        if self.attempt_ordinal < 1 or self.leaf_index < 1:
+            raise ValueError("campaign execution attempt ordinal is invalid")
+        if self.precision_digits not in {80, 120}:
+            raise ValueError("campaign execution attempt precision is invalid")
+        if self.failure_code not in _CONTAINABLE_FAILURE_CODES:
+            raise ValueError("campaign execution attempt failure code is invalid")
+        if self.state != _CONTAINABLE_FAILURE_STATES[self.failure_code]:
+            raise ValueError("campaign execution attempt state is invalid")
+        receipt = _validated_attempt_failure_receipt(self.failure_receipt)
+        failure = receipt["failure"]
+        assert isinstance(failure, Mapping)
+        if failure["failure_code"] != self.failure_code:
+            raise ValueError("campaign execution attempt code does not match receipt")
+        if failure.get("precision_digits") != self.precision_digits:
+            raise ValueError(
+                "campaign execution attempt precision does not match receipt"
+            )
+        try:
+            parsed = datetime.fromisoformat(self.created_at_utc.replace("Z", "+00:00"))
+        except ValueError as error:
+            raise ValueError("campaign execution attempt timestamp is invalid") from error
+        if parsed.tzinfo is None:
+            raise ValueError("campaign execution attempt timestamp lacks timezone")
+        object.__setattr__(self, "failure_receipt", receipt)
+
+    @property
+    def content(self) -> dict[str, object]:
+        return {
+            "attempt_ordinal": self.attempt_ordinal,
+            "leaf_id": self.leaf_id,
+            "leaf_index": self.leaf_index,
+            "role": self.role,
+            "state": self.state,
+            "precision_digits": self.precision_digits,
+            "failure_code": self.failure_code,
+            "failure_receipt": dict(self.failure_receipt),
+            "created_at_utc": self.created_at_utc,
+        }
+
+    @property
+    def attempt_sha256(self) -> str:
+        return _sha256(self.content)
+
+    def to_mapping(self) -> dict[str, object]:
+        return {**self.content, "attempt_sha256": self.attempt_sha256}
+
+    @classmethod
+    def from_mapping(cls, value: object) -> "CampaignExecutionAttempt":
+        if not isinstance(value, Mapping) or set(value) != {
+            "attempt_ordinal",
+            "leaf_id",
+            "leaf_index",
+            "role",
+            "state",
+            "precision_digits",
+            "failure_code",
+            "failure_receipt",
+            "created_at_utc",
+            "attempt_sha256",
+        }:
+            raise ValueError("campaign execution attempt fields are invalid")
+        for name in ("attempt_ordinal", "leaf_index", "precision_digits"):
+            if isinstance(value[name], bool) or not isinstance(value[name], int):
+                raise ValueError(
+                    f"campaign execution attempt {name} is invalid"
+                )
+        for name in (
+            "leaf_id",
+            "role",
+            "state",
+            "failure_code",
+            "created_at_utc",
+            "attempt_sha256",
+        ):
+            if not isinstance(value[name], str) or not value[name]:
+                raise ValueError(
+                    f"campaign execution attempt {name} is invalid"
+                )
+        attempt = cls(
+            attempt_ordinal=value["attempt_ordinal"],
+            leaf_id=value["leaf_id"],
+            leaf_index=value["leaf_index"],
+            role=value["role"],
+            state=value["state"],
+            precision_digits=value["precision_digits"],
+            failure_code=value["failure_code"],
+            failure_receipt=value["failure_receipt"],
+            created_at_utc=value["created_at_utc"],
+        )
+        if value["attempt_sha256"] != attempt.attempt_sha256:
+            raise ValueError("campaign execution attempt digest is invalid")
+        return attempt
+
+
 @dataclass(frozen=True, slots=True)
 class CampaignRunSummary:
     campaign_id: str
@@ -738,6 +959,7 @@ class CampaignRunSummary:
     reused_stage_count: int
     records: tuple[CampaignLeafRecord, ...]
     checkpoint_path: str
+    attempts: tuple[CampaignExecutionAttempt, ...] = ()
 
     @property
     def result_count(self) -> int:
@@ -752,6 +974,7 @@ class CampaignRunSummary:
             "reused_stage_count": self.reused_stage_count,
             "result_count": self.result_count,
             "records": [record.to_mapping() for record in self.records],
+            "attempts": [attempt.to_mapping() for attempt in self.attempts],
             "checkpoint_path": self.checkpoint_path,
             "release_admissible": False,
         }
@@ -1347,8 +1570,10 @@ def _checkpoint_mapping(
     plan: CampaignPlan,
     selection: CampaignSelection,
     records: Sequence[CampaignLeafRecord],
+    attempts: Sequence[CampaignExecutionAttempt] = (),
 ) -> dict[str, object]:
     values = [record.to_mapping() for record in records]
+    attempt_values = [attempt.to_mapping() for attempt in attempts]
     complete = (
         len(records) == len(selection.leaf_ids)
         and all(record.state in {"PRODUCED", "UNRESOLVED"} for record in records)
@@ -1359,6 +1584,8 @@ def _checkpoint_mapping(
         "bindings": _checkpoint_bindings(plan, selection),
         "records": values,
         "records_sha256": _sha256(values),
+        "attempts": attempt_values,
+        "attempts_sha256": _sha256(attempt_values),
         "release_admissible": False,
     }
 
@@ -1393,7 +1620,12 @@ def _reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]
 
 def _read_checkpoint_envelope(
     path: Path,
-) -> tuple[Mapping[str, object], Mapping[str, object], tuple[CampaignLeafRecord, ...]]:
+) -> tuple[
+    Mapping[str, object],
+    Mapping[str, object],
+    tuple[CampaignLeafRecord, ...],
+    tuple[CampaignExecutionAttempt, ...],
+]:
     try:
         value = json.loads(
             path.read_text(encoding="utf-8"),
@@ -1404,21 +1636,33 @@ def _read_checkpoint_envelope(
         )
     except json.JSONDecodeError as error:
         raise ValueError("campaign checkpoint is not valid JSON") from error
-    if not isinstance(value, Mapping) or set(value) != {
+    if not isinstance(value, Mapping):
+        raise ValueError("campaign checkpoint envelope fields are invalid")
+    common_fields = {
         "schema_version",
         "state",
         "bindings",
         "records",
         "records_sha256",
         "release_admissible",
-    }:
+    }
+    version = value.get("schema_version")
+    expected_fields = (
+        common_fields
+        if version == _LEGACY_CAMPAIGN_CHECKPOINT_SCHEMA_VERSION
+        else common_fields | {"attempts", "attempts_sha256"}
+    )
+    if set(value) != expected_fields:
         raise ValueError("campaign checkpoint envelope fields are invalid")
     if value["schema_version"] == 2:
         raise ValueError(
             "campaign checkpoint uses the legacy branch-authentication contract; "
             "preserve it as evidence and start with a fresh checkpoint path"
         )
-    if value["schema_version"] != CAMPAIGN_CHECKPOINT_SCHEMA_VERSION:
+    if version not in {
+        _LEGACY_CAMPAIGN_CHECKPOINT_SCHEMA_VERSION,
+        CAMPAIGN_CHECKPOINT_SCHEMA_VERSION,
+    }:
         raise ValueError("campaign checkpoint schema is invalid")
     bindings = value["bindings"]
     if not isinstance(bindings, Mapping):
@@ -1430,13 +1674,30 @@ def _read_checkpoint_envelope(
     ):
         raise ValueError("campaign checkpoint records digest is invalid")
     records = tuple(CampaignLeafRecord.from_mapping(item) for item in raw_records)
-    return value, bindings, records
+    if version == _LEGACY_CAMPAIGN_CHECKPOINT_SCHEMA_VERSION:
+        attempts: tuple[CampaignExecutionAttempt, ...] = ()
+    else:
+        raw_attempts = value["attempts"]
+        if (
+            not isinstance(raw_attempts, list)
+            or value["attempts_sha256"] != _sha256(raw_attempts)
+        ):
+            raise ValueError("campaign checkpoint attempts digest is invalid")
+        attempts = tuple(
+            CampaignExecutionAttempt.from_mapping(item) for item in raw_attempts
+        )
+    return value, bindings, records, attempts
 
 
-def _load_checkpoint(
+def _load_checkpoint_with_attempts(
     plan: CampaignPlan, path: Path
-) -> tuple[CampaignSelection, tuple[CampaignLeafRecord, ...], str]:
-    value, bindings, records = _read_checkpoint_envelope(path)
+) -> tuple[
+    CampaignSelection,
+    tuple[CampaignLeafRecord, ...],
+    tuple[CampaignExecutionAttempt, ...],
+    str,
+]:
+    value, bindings, records, attempts = _read_checkpoint_envelope(path)
     selection_value = bindings.get("selection")
     if not isinstance(selection_value, Mapping) or set(selection_value) != {
         "selection_id", "role", "leaf_ids", "cohort_ids"
@@ -1490,6 +1751,30 @@ def _load_checkpoint(
         _validate_record_semantics(
             leaf, record, plan.precision_factory_identity
         )
+    if tuple(attempt.attempt_ordinal for attempt in attempts) != tuple(
+        range(1, len(attempts) + 1)
+    ):
+        raise ValueError("campaign execution attempt order is invalid")
+    selection_index = {
+        leaf_id: index
+        for index, leaf_id in enumerate(
+            _campaign_execution_leaf_ids(plan, selection), start=1
+        )
+    }
+    for attempt in attempts:
+        if attempt.leaf_id not in selection_index:
+            raise ValueError("campaign execution attempt is off-selection")
+        leaf = leaf_by_id[attempt.leaf_id]
+        if (
+            attempt.leaf_index != selection_index[attempt.leaf_id]
+            or attempt.role != leaf.role
+        ):
+            raise ValueError("campaign execution attempt leaf identity is invalid")
+        record = next(
+            (item for item in records if item.leaf_id == attempt.leaf_id), None
+        )
+        if record is None or not record.stages:
+            raise ValueError("campaign execution attempt lacks prior stage evidence")
     expected_state = (
         "COMPLETE"
         if len(records) == len(selection.leaf_ids)
@@ -1498,7 +1783,16 @@ def _load_checkpoint(
     )
     if value["state"] != expected_state or value["release_admissible"] is not False:
         raise ValueError("campaign checkpoint state is invalid")
-    return selection, records, expected_state
+    return selection, records, attempts, expected_state
+
+
+def _load_checkpoint(
+    plan: CampaignPlan, path: Path
+) -> tuple[CampaignSelection, tuple[CampaignLeafRecord, ...], str]:
+    """Backward-compatible checkpoint loader omitting the operational ledger."""
+
+    selection, records, _attempts, state = _load_checkpoint_with_attempts(plan, path)
+    return selection, records, state
 
 
 _DEEP_DIAGNOSTIC_FIELDS = {
@@ -2410,6 +2704,78 @@ def _execute_campaign_stage_with_progress(
     return outcome, time.monotonic() - started
 
 
+def _execution_attempt_from_failure(
+    error: BaseException,
+    *,
+    leaf: CampaignLeafPlan,
+    context: Mapping[str, object],
+    digits: int,
+    attempt_ordinal: int,
+) -> CampaignExecutionAttempt | None:
+    """Return a durable control attempt only for exact, well-formed typed failures."""
+
+    if not isinstance(error, _CONTAINABLE_EXCEPTION_TYPES):
+        return None
+    receipt = _worker_failure_payload(error)
+    if receipt is None:
+        return None
+    try:
+        receipt = _validated_attempt_failure_receipt(receipt)
+    except ValueError:
+        return None
+    failure = receipt["failure"]
+    assert isinstance(failure, Mapping)
+    code = str(failure["failure_code"])
+    expected_type: type[BaseException]
+    if code == "ODE_RESOURCE_LIMIT":
+        expected_type = JuliaODEResourceLimitError
+    elif code == "ROOT_READOUT_RESOURCE_INFEASIBLE":
+        expected_type = JuliaRootReadoutResourceLimitError
+    else:
+        expected_type = JuliaWorkerTimeoutError
+    if type(error) is not expected_type:
+        return None
+    if code == "WORKER_TIMEOUT" and receipt["worker_timed_out"] is not True:
+        return None
+    if code != "WORKER_TIMEOUT" and receipt["worker_timed_out"] is not False:
+        return None
+    leaf_index = context.get("leaf_index")
+    if isinstance(leaf_index, bool) or not isinstance(leaf_index, int):
+        return None
+    return CampaignExecutionAttempt(
+        attempt_ordinal=attempt_ordinal,
+        leaf_id=leaf.leaf_id,
+        leaf_index=leaf_index,
+        role=leaf.role,
+        state=_CONTAINABLE_FAILURE_STATES[code],
+        precision_digits=digits,
+        failure_code=code,
+        failure_receipt=receipt,
+        created_at_utc=(
+            datetime.now(timezone.utc)
+            .isoformat(timespec="milliseconds")
+            .replace("+00:00", "Z")
+        ),
+    )
+
+
+def _checkpoint_attempt_with_progress(
+    path: Path,
+    mapping: Mapping[str, object],
+    *,
+    context: Mapping[str, object],
+    digits: int,
+) -> None:
+    with progress_scope(
+        **context,
+        precision_digits=digits,
+        component_pass="promoted",
+    ):
+        emit_progress(ProgressEventKind.CHECKPOINT_WRITING)
+        _atomic_json(path, mapping)
+        emit_progress(ProgressEventKind.CHECKPOINT_WRITTEN)
+
+
 def _checkpoint_stage_with_progress(
     path: Path,
     mapping: Mapping[str, object],
@@ -2587,7 +2953,9 @@ def _run_campaign_selection_active(
     if path.exists():
         if not resume:
             raise ValueError("campaign cold execution refuses an existing checkpoint")
-        loaded_selection, existing, _ = _load_checkpoint(plan, path)
+        loaded_selection, existing, loaded_attempts, _ = (
+            _load_checkpoint_with_attempts(plan, path)
+        )
         if loaded_selection != selection:
             raise ValueError("campaign checkpoint selection does not match request")
         records_by_id = {record.leaf_id: record for record in existing}
@@ -2598,10 +2966,12 @@ def _run_campaign_selection_active(
                     raise ValueError(
                         "campaign backend precision availability is not a permitted superset"
                     )
+        attempts = list(loaded_attempts)
     else:
         if resume:
             raise ValueError("campaign resume requires an existing checkpoint")
         records_by_id = {}
+        attempts = []
     reused = sum(
         len(record.stages) for record in records_by_id.values()
     )
@@ -2656,6 +3026,7 @@ def _run_campaign_selection_active(
                             _ordered_selection_records(
                                 selection, records_by_id
                             ),
+                            attempts,
                         ),
                     )
                     emit_progress(ProgressEventKind.CHECKPOINT_WRITTEN)
@@ -2763,6 +3134,7 @@ def _run_campaign_selection_active(
                     plan,
                     selection,
                     _ordered_selection_records(selection, records_by_id),
+                    attempts,
                 ),
                 context=context,
                 digits=64,
@@ -2793,14 +3165,38 @@ def _run_campaign_selection_active(
             )
             if precision80_digits not in available.digits:
                 continue
-            outcome80, stage_duration = _execute_campaign_stage_with_progress(
-                backend,
-                leaf,
-                precision80_digits,
-                context,
-                record.stages,
-                response_predictor,
-            )
+            try:
+                outcome80, stage_duration = _execute_campaign_stage_with_progress(
+                    backend,
+                    leaf,
+                    precision80_digits,
+                    context,
+                    record.stages,
+                    response_predictor,
+                )
+            except _CONTAINABLE_EXCEPTION_TYPES as error:
+                attempt = _execution_attempt_from_failure(
+                    error,
+                    leaf=leaf,
+                    context=context,
+                    digits=precision80_digits,
+                    attempt_ordinal=len(attempts) + 1,
+                )
+                if attempt is None:
+                    raise
+                attempts.append(attempt)
+                _checkpoint_attempt_with_progress(
+                    path,
+                    _checkpoint_mapping(
+                        plan,
+                        selection,
+                        _ordered_selection_records(selection, records_by_id),
+                        attempts,
+                    ),
+                    context=context,
+                    digits=precision80_digits,
+                )
+                continue
             if (
                 not isinstance(outcome80, StageOutcome)
                 or outcome80.digits != 80
@@ -2854,6 +3250,7 @@ def _run_campaign_selection_active(
                         plan,
                         selection,
                         _ordered_selection_records(selection, records_by_id),
+                        attempts,
                     ),
                     context=context,
                     digits=precision80_digits,
@@ -2899,6 +3296,7 @@ def _run_campaign_selection_active(
                                 _ordered_selection_records(
                                     selection, records_by_id
                                 ),
+                                attempts,
                             ),
                             context=context,
                             digits=80,
@@ -2941,6 +3339,7 @@ def _run_campaign_selection_active(
                             _ordered_selection_records(
                                 selection, records_by_id
                             ),
+                            attempts,
                         ),
                         context=context,
                         digits=80,
@@ -2971,14 +3370,38 @@ def _run_campaign_selection_active(
             )
             if precision120_digits not in available.digits:
                 continue
-            outcome120, stage_duration = _execute_campaign_stage_with_progress(
-                backend,
-                leaf,
-                precision120_digits,
-                context,
-                record.stages,
-                response_predictor,
-            )
+            try:
+                outcome120, stage_duration = _execute_campaign_stage_with_progress(
+                    backend,
+                    leaf,
+                    precision120_digits,
+                    context,
+                    record.stages,
+                    response_predictor,
+                )
+            except _CONTAINABLE_EXCEPTION_TYPES as error:
+                attempt = _execution_attempt_from_failure(
+                    error,
+                    leaf=leaf,
+                    context=context,
+                    digits=precision120_digits,
+                    attempt_ordinal=len(attempts) + 1,
+                )
+                if attempt is None:
+                    raise
+                attempts.append(attempt)
+                _checkpoint_attempt_with_progress(
+                    path,
+                    _checkpoint_mapping(
+                        plan,
+                        selection,
+                        _ordered_selection_records(selection, records_by_id),
+                        attempts,
+                    ),
+                    context=context,
+                    digits=precision120_digits,
+                )
+                continue
             if (
                 not isinstance(outcome120, StageOutcome)
                 or outcome120.digits != 120
@@ -3034,6 +3457,7 @@ def _run_campaign_selection_active(
                     plan,
                     selection,
                     _ordered_selection_records(selection, records_by_id),
+                    attempts,
                 ),
                 context=context,
                 digits=precision120_digits,
@@ -3055,7 +3479,7 @@ def _run_campaign_selection_active(
                     stage_count=len(record.stages),
                 )
     records = _ordered_selection_records(selection, records_by_id)
-    mapping = _checkpoint_mapping(plan, selection, records)
+    mapping = _checkpoint_mapping(plan, selection, records, attempts)
     _ACTIVE_CAMPAIGN_LEAF_CONTEXT.set(None)
     return CampaignRunSummary(
         campaign_id=plan.campaign_id,
@@ -3065,6 +3489,7 @@ def _run_campaign_selection_active(
         reused_stage_count=reused,
         records=tuple(records),
         checkpoint_path=str(path),
+        attempts=tuple(attempts),
     )
 
 
@@ -3075,7 +3500,7 @@ def validate_campaign_checkpoint(
     require_complete_campaign: bool = False,
 ) -> CampaignRunSummary:
     path = Path(checkpoint_path)
-    selection, records, state = _load_checkpoint(plan, path)
+    selection, records, attempts, state = _load_checkpoint_with_attempts(plan, path)
     if require_complete_campaign:
         expected_ids = B_PRIME_RELEASE_DOMAIN.production_leaf_ids
         if selection.leaf_ids != expected_ids:
@@ -3085,6 +3510,25 @@ def validate_campaign_checkpoint(
             )
         if tuple(record.leaf_id for record in records) != expected_ids:
             raise ValueError("full campaign has missing or extra leaf records")
+        terminal_ids = {
+            record.leaf_id
+            for record in records
+            if record.state in {"PRODUCED", "UNRESOLVED"}
+        }
+        deferred = tuple(
+            attempt
+            for attempt in attempts
+            if attempt.leaf_id not in terminal_ids
+        )
+        if deferred:
+            codes = ", ".join(
+                f"{attempt.leaf_id}:{attempt.failure_code}"
+                for attempt in deferred
+            )
+            raise ValueError(
+                "full campaign has execution-resource-limited deferred leaves: "
+                + codes
+            )
         if any(record.state not in {"PRODUCED", "UNRESOLVED"} for record in records):
             raise ValueError("full campaign has an unexecuted or missing-precision leaf")
         if state != "COMPLETE":
@@ -3109,6 +3553,7 @@ def validate_campaign_checkpoint(
         reused_stage_count=sum(len(record.stages) for record in records),
         records=records,
         checkpoint_path=str(path),
+        attempts=attempts,
     )
 
 
@@ -3171,7 +3616,7 @@ def _load_checkpoint_for_solved_leaf_import(
 ) -> tuple[CampaignSelection, tuple[CampaignLeafRecord, ...], str]:
     """Authenticate an old checkpoint while permitting operational campaign drift."""
 
-    value, bindings, records = _read_checkpoint_envelope(path)
+    value, bindings, records, _attempts = _read_checkpoint_envelope(path)
     if set(bindings) != {
         "campaign_id",
         "campaign_bindings",
@@ -3292,8 +3737,10 @@ def merge_campaign_checkpoints(
         raise ValueError("campaign merge refuses an existing output")
     selected_ids: set[str] = set()
     record_by_leaf: dict[str, CampaignLeafRecord] = {}
+    attempt_values: list[CampaignExecutionAttempt] = []
+    seen_attempts: set[str] = set()
     for path in paths:
-        selection, records, _ = _load_checkpoint(plan, path)
+        selection, records, attempts, _ = _load_checkpoint_with_attempts(plan, path)
         selected_ids.update(selection.leaf_ids)
         for record in records:
             existing = record_by_leaf.get(record.leaf_id)
@@ -3302,6 +3749,10 @@ def merge_campaign_checkpoints(
                     f"campaign checkpoint overlap disagrees for {record.leaf_id}"
                 )
             record_by_leaf[record.leaf_id] = record
+        for attempt in attempts:
+            if attempt.attempt_sha256 not in seen_attempts:
+                seen_attempts.add(attempt.attempt_sha256)
+                attempt_values.append(attempt)
     canonical_ids = tuple(
         leaf.leaf_id for leaf in plan.leaves if leaf.leaf_id in selected_ids
     )
@@ -3311,8 +3762,28 @@ def merge_campaign_checkpoints(
         for leaf_id in canonical_ids
         if leaf_id in record_by_leaf
     )
-    _atomic_json(output, _checkpoint_mapping(plan, selection, records))
-    mapping = _checkpoint_mapping(plan, selection, records)
+    merged_index = {
+        leaf_id: index
+        for index, leaf_id in enumerate(
+            _campaign_execution_leaf_ids(plan, selection), start=1
+        )
+    }
+    attempts = tuple(
+        CampaignExecutionAttempt(
+            attempt_ordinal=ordinal,
+            leaf_id=attempt.leaf_id,
+            leaf_index=merged_index[attempt.leaf_id],
+            role=attempt.role,
+            state=attempt.state,
+            precision_digits=attempt.precision_digits,
+            failure_code=attempt.failure_code,
+            failure_receipt=attempt.failure_receipt,
+            created_at_utc=attempt.created_at_utc,
+        )
+        for ordinal, attempt in enumerate(attempt_values, start=1)
+    )
+    _atomic_json(output, _checkpoint_mapping(plan, selection, records, attempts))
+    mapping = _checkpoint_mapping(plan, selection, records, attempts)
     return CampaignRunSummary(
         campaign_id=plan.campaign_id,
         selection_id=selection.selection_id,
@@ -3321,6 +3792,7 @@ def merge_campaign_checkpoints(
         reused_stage_count=sum(len(record.stages) for record in records),
         records=records,
         checkpoint_path=str(output),
+        attempts=attempts,
     )
 
 
@@ -3772,22 +4244,27 @@ class NativeCampaignStageBackend:
         repeat_delta = 0.0j
         repeat_result = None
         self_refinement_enclosed = None
+        self_refinement_skipped_reason = None
         if digits == 80:
-            repeat_backend = JuliaPrecisionRootBackend(
-                self.identity, self.julia_adapter, digits, refinement=1
-            )
-            repeat_result = _run_component_with_progress(
-                leaf.job,
-                repeat_backend,
-                "self-refinement",
-                response_predictor,
-            )
-            repeat_delta = _component_result_delta(repeat_result, result)
-            repeat_radius = sum(repeat_result.error_channels.values())
-            self_refinement_enclosed = (
-                result.status == repeat_result.status
-                and abs(repeat_delta) <= base_radius + repeat_radius
-            )
+            if result.status is not ComponentStatus.CONVERGED:
+                self_refinement_enclosed = False
+                self_refinement_skipped_reason = "PRIMARY_NOT_CONVERGED"
+            else:
+                repeat_backend = JuliaPrecisionRootBackend(
+                    self.identity, self.julia_adapter, digits, refinement=1
+                )
+                repeat_result = _run_component_with_progress(
+                    leaf.job,
+                    repeat_backend,
+                    "self-refinement",
+                    response_predictor,
+                )
+                repeat_delta = _component_result_delta(repeat_result, result)
+                repeat_radius = sum(repeat_result.error_channels.values())
+                self_refinement_enclosed = (
+                    result.status == repeat_result.status
+                    and abs(repeat_delta) <= base_radius + repeat_radius
+                )
         component_result = {
             "evidence_kind": "package-owned-julia-promoted-component-engine",
             "result": result.to_mapping(),
@@ -3796,6 +4273,10 @@ class NativeCampaignStageBackend:
             ),
             "scientific_runtime": primary_backend.scientific_runtime,
         }
+        if self_refinement_skipped_reason is not None:
+            component_result["self_refinement_skipped_reason"] = (
+                self_refinement_skipped_reason
+            )
         local_radius = base_radius + abs(repeat_delta) + abs(precision_delta)
         return StageOutcome(
             digits=digits,

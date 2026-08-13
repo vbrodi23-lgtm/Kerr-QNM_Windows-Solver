@@ -39,12 +39,32 @@ Cold-start and warm-reuse ledgers, preflight report, representative multi-precis
 
 ### Review Focus
 
-Inspect fresh-machine assumptions, ledger-before-bootstrap ordering, executable discovery, download/source verification, generated-input provenance, precision dispatch, checkpoint durability, failure recoverability, and whether the documented command actually reaches physical response computation.
+Inspect fresh-machine assumptions, ledger-before-bootstrap ordering, executable
+discovery, download/source verification, generated-input provenance, precision
+dispatch, checkpoint durability, failure recoverability, and whether the
+documented command actually reaches physical response computation. Treat the
+Leaf 13/212 (`221`, `a/M = 0.95`, `horizon-admittance`) promoted-readout
+benchmark as a native performance blocker: confirm finite Julia ODE/request
+boundaries, authenticated append-only attempt evidence, per-leaf quarantine,
+next-leaf continuation, explicit-resume retry, and the separation of execution
+resource identity from scientific leaf/backend/policy identity. Do not treat
+resource exhaustion or worker timeout as QNM nonconvergence evidence.
 
 ### Plan
 
+- Land the first promoted-readout containment slice without changing frozen
+  mathematics or numerical controls: version the operational resource policy,
+  enforce cooperative Julia limits and feasibility triage, short-circuit
+  diagnostics after an unsuccessful PRIMARY, and preserve typed bounded
+  failure receipts.
+- Prove with static and mocked tests that a resource-limited leaf stays
+  non-computed, publishes no solved-leaf receipt, appends rather than overwrites
+  attempts, permits the following leaf to execute, and can be retried only by
+  explicit resume while completed neighbours remain reusable.
 - Exercise the complete bootstrap, source-provisioning, and scientific-input generation path from a clean checkout.
-- Run a risk-complete representative campaign and resume it.
+- Re-run Leaf 13 and the risk-complete representative campaign on native
+  Windows only after the containment PR is reviewed; capture the measured
+  resource receipt and resume it without weakening the frozen policy.
 - Force and collect a provisioning and scientific failure, then prove warm reuse.
 - Reconcile platforms and freeze the one-command production path only after every gate passes.
 

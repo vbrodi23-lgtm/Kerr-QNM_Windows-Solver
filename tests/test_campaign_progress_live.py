@@ -5,10 +5,16 @@ import io
 import json
 from pathlib import Path
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 
-from windows_solver.progress import ProgressEventKind, activate_progress
+from windows_solver.progress import (
+    ProgressContext,
+    ProgressEvent,
+    ProgressEventKind,
+    activate_progress,
+)
 from windows_solver.progress_output import CampaignProgressReporter
 from windows_solver.response_batches import (
     PrecisionCapabilities,
@@ -24,6 +30,96 @@ from windows_solver.native_response_kernel import _progress_suboperation
 
 
 class CampaignProgressLifecycleTests(unittest.TestCase):
+    def test_resource_failure_is_deferred_not_counted_as_completed_science(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            checkpoint = Path(temporary) / "checkpoint.json"
+            reporter = CampaignProgressReporter(
+                "normal", checkpoint, io.StringIO()
+            )
+            event = ProgressEvent(
+                kind=ProgressEventKind.LEAF_FAILED,
+                context=ProgressContext.from_mapping({
+                    "leaf_index": 13,
+                    "leaf_count": 212,
+                    "leaf_id": "leaf-13",
+                    "role": "primary",
+                    "mode": {"s": -2, "ell": 2, "m": 2, "n": 1},
+                    "spin": 0.95,
+                    "mechanism_id": "horizon-admittance",
+                    "precision_digits": 80,
+                    "readout_index": 1,
+                    "readout_role": "baseline",
+                    "phase": "PRIMARY",
+                    "newton_index": 1,
+                    "determinant_index_phase": 3,
+                }),
+                payload={
+                    "error_type": "JuliaODEResourceLimitError",
+                    "message": "synthetic limit",
+                    "worker_failure": {
+                        "worker_exit_code": 1,
+                        "worker_timed_out": False,
+                        "worker_stderr_tail": "bounded",
+                        "worker_error_type": "ODEResourceLimit",
+                        "worker_error_message": "rhs limit",
+                        "failure": {
+                            "failure_code": "ODE_RESOURCE_LIMIT",
+                            "failure_class": "CONTROL",
+                            "retryable": True,
+                            "limiting_resource": "rhs_evaluations",
+                        },
+                    },
+                },
+                monotonic_seconds=time.monotonic(),
+            )
+
+            reporter.publish(event)
+            status = json.loads(
+                Path(f"{checkpoint}.status.json").read_text(encoding="utf-8")
+            )
+
+        self.assertEqual(reporter._completed_value(212), "0/212")
+        self.assertEqual(status["live_execution"]["failure_category"], "RESOURCE LIMIT")
+        self.assertEqual(
+            status["live_execution"]["failure_code"], "ODE_RESOURCE_LIMIT"
+        )
+        self.assertFalse(status["persistence"]["current_leaf"]["terminal_computed"])
+
+    def test_dashboard_failure_categories_are_distinct(self):
+        classify = CampaignProgressReporter._failure_category
+        self.assertEqual(
+            classify({"numerical_state": "NOT_CONVERGED"}),
+            "NUMERICAL NONCONVERGENCE",
+        )
+        self.assertEqual(
+            classify({
+                "worker_failure": {
+                    "worker_timed_out": False,
+                    "failure": {
+                        "failure_code": "ROOT_READOUT_RESOURCE_INFEASIBLE",
+                        "failure_class": "CONTROL",
+                    },
+                }
+            }),
+            "RESOURCE LIMIT",
+        )
+        self.assertEqual(
+            classify({
+                "worker_failure": {
+                    "worker_timed_out": True,
+                    "failure": {
+                        "failure_code": "WORKER_TIMEOUT",
+                        "failure_class": "CONTROL",
+                    },
+                }
+            }),
+            "WORKER TIMEOUT",
+        )
+        self.assertEqual(
+            classify({"error_type": "JuliaProgressProtocolError"}),
+            "PROTOCOL/CONTROL FAILURE",
+        )
+
     def test_keyboard_interrupt_emits_interrupted_not_failed_events(self):
         plan, selection, _, _ = self._plan_selection_backend()
 

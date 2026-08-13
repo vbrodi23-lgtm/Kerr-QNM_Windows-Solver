@@ -3,12 +3,17 @@ from __future__ import annotations
 from dataclasses import replace
 from fractions import Fraction
 import hashlib
+import io
 import json
 from pathlib import Path
 import tempfile
 import unittest
 
+import windows_solver.julia_response_backend as julia_backend
 from windows_solver.contracts import canonical_json_bytes
+from windows_solver.campaign_reports import refresh_campaign_reports
+from windows_solver.progress import activate_progress
+from windows_solver.progress_output import CampaignProgressReporter
 from windows_solver.linear_response import B_PRIME_RELEASE_DOMAIN
 from windows_solver.response_batches import (
     PrecisionCapabilities,
@@ -496,6 +501,456 @@ class PrimaryPrecisionTests(unittest.TestCase):
             self.assertEqual(summary.records[0].state, "MISSING_PRECISION")
             self.assertEqual(summary.records[0].missing_precision_digits, 80)
             self.assertEqual(store.stored_count, 0)
+
+
+class PromotedResourceContainmentTests(unittest.TestCase):
+    @staticmethod
+    def _plan_and_leaves():
+        capabilities = PrecisionCapabilities((64, 80, 120))
+        plan = build_campaign_plan(
+            policy=NumericalPolicy(),
+            backend_identity=VettedNativeDeterminantKernel.identity,
+            precision_capabilities=capabilities,
+        )
+        incident = next(
+            leaf
+            for leaf in plan.leaves
+            if (
+                leaf.role == "primary"
+                and leaf.leaf.mode_label == "221"
+                and leaf.job.spin == 0.95
+                and leaf.mechanism_id == "horizon-admittance"
+            )
+        )
+        following = next(
+            leaf
+            for leaf in plan.leaves
+            if (
+                leaf.role == "primary"
+                and leaf.leaf.mode_label == "221"
+                and leaf.job.spin == 0.99
+                and leaf.mechanism_id == "horizon-admittance"
+            )
+        )
+        selection = build_campaign_selection(
+            plan,
+            role="primary",
+            leaf_ids=(incident.leaf_id, following.leaf_id),
+        )
+        return plan, capabilities, selection, incident, following
+
+    @staticmethod
+    def _failure(error_class, failure_code, *, timed_out=False):
+        error = error_class(f"synthetic {failure_code}")
+        error.worker_failure = {
+            "worker_exit_code": None if timed_out else 1,
+            "worker_timed_out": timed_out,
+            "worker_stderr_tail": "bounded synthetic stderr",
+            "worker_error_type": "SyntheticControlFailure",
+            "worker_error_message": failure_code,
+            "failure": {
+                "failure_code": failure_code,
+                "failure_class": "CONTROL",
+                "retryable": True,
+                "precision_digits": 80,
+                "readout_index": 1,
+                "readout_role": "baseline",
+                "root_phase": "PRIMARY",
+                "newton_index": 1,
+                "determinant_index": 3,
+                "phase_determinant_index": 3,
+                "determinant_purpose": "residual",
+                "elapsed_request_seconds": 5271.5,
+                "elapsed_phase_seconds": 5271.5,
+                "elapsed_leg_seconds": 1900.0,
+                "ode_leg": "Xup_match_to_inner",
+                "limiting_resource": (
+                    "worker_request_wall_clock"
+                    if timed_out
+                    else "rhs_evaluations"
+                ),
+                "ode_snapshot": {
+                    "accepted_steps": 982000,
+                    "rejected_steps": 0,
+                    "rhs_evaluations": 1960000,
+                },
+                "execution_resource_policy": {
+                    "schema": "windows-solver.execution-resource-policy/1",
+                    "version": 1,
+                    "sha256": "a" * 64,
+                },
+            },
+        }
+        return error
+
+    def _run_with_failure(self, error_class, failure_code, *, timed_out=False):
+        plan, capabilities, selection, incident, following = self._plan_and_leaves()
+        failure = self._failure(
+            error_class, failure_code, timed_out=timed_out
+        )
+
+        class Backend:
+            identity = plan.backend_identity
+            precision_capabilities = capabilities
+
+            def __init__(self):
+                self.calls = []
+
+            def execute_stage(self, leaf, digits):
+                self.calls.append((leaf.leaf_id, digits))
+                if leaf.leaf_id == incident.leaf_id:
+                    if digits == 64:
+                        return _authenticated_primary_stage(
+                            leaf, digits, ComponentStatus.NOT_CONVERGED
+                        )
+                    raise failure
+                return _authenticated_primary_stage(
+                    leaf, digits, ComponentStatus.CONVERGED
+                )
+
+        temporary = tempfile.TemporaryDirectory()
+        root = Path(temporary.name)
+        backend = Backend()
+        store = SolvedLeafStore(root / "solved")
+        checkpoint = root / "checkpoint.json"
+        reporter = CampaignProgressReporter("normal", checkpoint, io.StringIO())
+        reporter.bind_campaign_reports(plan)
+        with activate_progress(reporter):
+            summary = run_campaign_selection(
+                plan,
+                selection,
+                backend,
+                checkpoint,
+                resume=False,
+                solved_leaf_store=store,
+            )
+        return (
+            temporary,
+            root,
+            plan,
+            selection,
+            incident,
+            following,
+            backend,
+            store,
+            summary,
+        )
+
+    def test_promoted_ode_resource_limit_is_durable_and_next_leaf_executes(self):
+        run = self._run_with_failure(
+            julia_backend.JuliaODEResourceLimitError,
+            "ODE_RESOURCE_LIMIT",
+        )
+        temporary, root, plan, _, incident, following, backend, store, summary = run
+        self.addCleanup(temporary.cleanup)
+
+        records = {record.leaf_id: record for record in summary.records}
+        self.assertEqual(summary.state, "PARTIAL")
+        self.assertFalse(records[incident.leaf_id].to_mapping()["computed"])
+        self.assertEqual(records[following.leaf_id].state, "PRODUCED")
+        self.assertIn((following.leaf_id, 64), backend.calls)
+        self.assertEqual(store.stored_count, 1)
+        self.assertEqual(len(summary.attempts), 1)
+        self.assertEqual(summary.attempts[0].failure_code, "ODE_RESOURCE_LIMIT")
+        self.assertEqual(summary.attempts[0].state, "EXECUTION_RESOURCE_LIMITED")
+
+        checkpoint = json.loads(
+            (root / "checkpoint.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(checkpoint["schema_version"], 4)
+        self.assertEqual(len(checkpoint["attempts"]), 1)
+        self.assertEqual(
+            checkpoint["attempts_sha256"],
+            hashlib.sha256(canonical_json_bytes(checkpoint["attempts"])).hexdigest(),
+        )
+        reports = refresh_campaign_reports(plan, root / "checkpoint.json")
+        self.assertEqual(len(reports.resource_failure_rows), 1)
+        failure_row = reports.resource_failure_rows[0]
+        self.assertEqual(failure_row["leaf_id"], incident.leaf_id)
+        self.assertEqual(failure_row["mode"], "221")
+        self.assertEqual(failure_row["precision_digits"], 80)
+        self.assertEqual(failure_row["phase"], "PRIMARY")
+        self.assertEqual(failure_row["determinant_count"], 3)
+        self.assertEqual(failure_row["failure_code"], "ODE_RESOURCE_LIMIT")
+        self.assertEqual(failure_row["limiting_resource"], "rhs_evaluations")
+        self.assertEqual(failure_row["ode_rejected_steps"], 0)
+        self.assertEqual(failure_row["rhs_evaluations"], 1960000)
+        self.assertEqual(failure_row["retry_status"], "DEFERRED")
+        self.assertTrue(
+            (root / "checkpoint.reports" / "m02-resource-failures.csv").is_file()
+        )
+        status = json.loads(
+            (root / "checkpoint.json.status.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(len(status["resource_failures"]), 1)
+        self.assertEqual(
+            status["resource_failures"][0]["failure_code"],
+            "ODE_RESOURCE_LIMIT",
+        )
+        self.assertNotEqual(
+            status["resource_failures"][0].get("terminal_state"),
+            "PRODUCED",
+        )
+
+    def test_worker_timeout_is_durable_and_next_leaf_executes(self):
+        run = self._run_with_failure(
+            julia_backend.JuliaWorkerTimeoutError,
+            "WORKER_TIMEOUT",
+            timed_out=True,
+        )
+        temporary, _, _, _, incident, following, backend, store, summary = run
+        self.addCleanup(temporary.cleanup)
+
+        records = {record.leaf_id: record for record in summary.records}
+        self.assertFalse(records[incident.leaf_id].to_mapping()["computed"])
+        self.assertEqual(records[following.leaf_id].state, "PRODUCED")
+        self.assertIn((following.leaf_id, 64), backend.calls)
+        self.assertEqual(store.stored_count, 1)
+        self.assertEqual(summary.attempts[0].failure_code, "WORKER_TIMEOUT")
+        self.assertEqual(summary.attempts[0].state, "WORKER_TIMEOUT")
+
+    def test_malformed_typed_or_unknown_worker_failure_remains_fail_closed(self):
+        plan, capabilities, selection, incident, _ = self._plan_and_leaves()
+        malformed = julia_backend.JuliaODEResourceLimitError("malformed")
+        malformed.worker_failure = {
+            "worker_exit_code": 1,
+            "worker_timed_out": False,
+            "worker_stderr_tail": "bad receipt",
+            "worker_error_type": "Synthetic",
+            "worker_error_message": "missing structured failure",
+        }
+
+        class Backend:
+            identity = plan.backend_identity
+            precision_capabilities = capabilities
+
+            def execute_stage(self, leaf, digits):
+                if leaf.leaf_id == incident.leaf_id and digits == 64:
+                    return _authenticated_primary_stage(
+                        leaf, digits, ComponentStatus.NOT_CONVERGED
+                    )
+                raise malformed
+
+        with tempfile.TemporaryDirectory() as temporary:
+            with self.assertRaises(julia_backend.JuliaODEResourceLimitError):
+                run_campaign_selection(
+                    plan,
+                    selection,
+                    Backend(),
+                    Path(temporary) / "checkpoint.json",
+                    resume=False,
+                )
+
+        unknown = julia_backend.JuliaResponseBackendError("unknown worker failure")
+
+        class UnknownBackend(Backend):
+            def execute_stage(self, leaf, digits):
+                if leaf.leaf_id == incident.leaf_id and digits == 64:
+                    return _authenticated_primary_stage(
+                        leaf, digits, ComponentStatus.NOT_CONVERGED
+                    )
+                raise unknown
+
+        with tempfile.TemporaryDirectory() as temporary:
+            with self.assertRaises(julia_backend.JuliaResponseBackendError):
+                run_campaign_selection(
+                    plan,
+                    selection,
+                    UnknownBackend(),
+                    Path(temporary) / "checkpoint.json",
+                    resume=False,
+                )
+
+    def test_resume_retries_deferred_leaf_without_recomputing_completed_leaf(self):
+        run = self._run_with_failure(
+            julia_backend.JuliaRootReadoutResourceLimitError,
+            "ROOT_READOUT_RESOURCE_INFEASIBLE",
+        )
+        temporary, root, plan, selection, incident, following, _, store, first = run
+        self.addCleanup(temporary.cleanup)
+
+        class RetryBackend:
+            identity = plan.backend_identity
+            precision_capabilities = plan.precision_capabilities
+
+            def __init__(self):
+                self.calls = []
+
+            def execute_stage(self, leaf, digits):
+                self.calls.append((leaf.leaf_id, digits))
+                return _authenticated_primary_stage(
+                    leaf,
+                    digits,
+                    ComponentStatus.CONVERGED,
+                    self_refinement_enclosed=True,
+                    discrepancy_from_previous_abs=1.0e-9,
+                    discrepancy_enclosed=True,
+                )
+
+        retry = RetryBackend()
+        resumed = run_campaign_selection(
+            plan,
+            selection,
+            retry,
+            root / "checkpoint.json",
+            resume=True,
+            solved_leaf_store=store,
+        )
+
+        self.assertEqual(first.state, "PARTIAL")
+        self.assertEqual(resumed.state, "COMPLETE")
+        self.assertEqual(retry.calls, [(incident.leaf_id, 80)])
+        self.assertNotIn((following.leaf_id, 64), retry.calls)
+        self.assertEqual(store.stored_count, 2)
+        self.assertEqual(len(resumed.attempts), 1)
+
+    def test_failed_retry_appends_without_overwriting_first_attempt(self):
+        run = self._run_with_failure(
+            julia_backend.JuliaRootReadoutResourceLimitError,
+            "ROOT_READOUT_RESOURCE_INFEASIBLE",
+        )
+        temporary, root, plan, selection, incident, following, _, store, first = run
+        self.addCleanup(temporary.cleanup)
+        second_failure = self._failure(
+            julia_backend.JuliaODEResourceLimitError,
+            "ODE_RESOURCE_LIMIT",
+        )
+
+        class RetryBackend:
+            identity = plan.backend_identity
+            precision_capabilities = plan.precision_capabilities
+
+            def __init__(self):
+                self.calls = []
+
+            def execute_stage(self, leaf, digits):
+                self.calls.append((leaf.leaf_id, digits))
+                raise second_failure
+
+        backend = RetryBackend()
+        retried = run_campaign_selection(
+            plan,
+            selection,
+            backend,
+            root / "checkpoint.json",
+            resume=True,
+            solved_leaf_store=store,
+        )
+
+        self.assertEqual(backend.calls, [(incident.leaf_id, 80)])
+        self.assertNotIn((following.leaf_id, 64), backend.calls)
+        self.assertEqual(len(retried.attempts), 2)
+        self.assertEqual(
+            retried.attempts[0].to_mapping(), first.attempts[0].to_mapping()
+        )
+        self.assertNotEqual(
+            retried.attempts[0].attempt_sha256,
+            retried.attempts[1].attempt_sha256,
+        )
+
+    def test_recovered_80_failure_can_be_followed_by_deferred_120_attempt(self):
+        run = self._run_with_failure(
+            julia_backend.JuliaRootReadoutResourceLimitError,
+            "ROOT_READOUT_RESOURCE_INFEASIBLE",
+        )
+        temporary, root, plan, selection, incident, _, _, store, _ = run
+        self.addCleanup(temporary.cleanup)
+        failure120 = self._failure(
+            julia_backend.JuliaODEResourceLimitError,
+            "ODE_RESOURCE_LIMIT",
+        )
+        failure120.worker_failure["failure"]["precision_digits"] = 120
+
+        class RetryBackend:
+            identity = plan.backend_identity
+            precision_capabilities = plan.precision_capabilities
+
+            def execute_stage(self, leaf, digits):
+                if digits == 80:
+                    return _authenticated_primary_stage(
+                        leaf,
+                        digits,
+                        ComponentStatus.CONVERGED,
+                        self_refinement_enclosed=False,
+                        discrepancy_from_previous_abs=1.0e-9,
+                        discrepancy_enclosed=True,
+                    )
+                raise failure120
+
+        retried = run_campaign_selection(
+            plan,
+            selection,
+            RetryBackend(),
+            root / "checkpoint.json",
+            resume=True,
+            solved_leaf_store=store,
+        )
+        reloaded = validate_campaign_checkpoint(
+            plan,
+            root / "checkpoint.json",
+        )
+
+        self.assertEqual(retried.state, "PARTIAL")
+        self.assertEqual(retried.records[0].stages[-1].outcome.digits, 80)
+        self.assertEqual(
+            [attempt.precision_digits for attempt in retried.attempts],
+            [80, 120],
+        )
+        self.assertEqual(
+            [attempt.attempt_sha256 for attempt in reloaded.attempts],
+            [attempt.attempt_sha256 for attempt in retried.attempts],
+        )
+
+    def test_attempt_content_digest_detects_tampering(self):
+        run = self._run_with_failure(
+            julia_backend.JuliaODEResourceLimitError,
+            "ODE_RESOURCE_LIMIT",
+        )
+        temporary, root, plan, _, _, _, _, _, _ = run
+        self.addCleanup(temporary.cleanup)
+        checkpoint = root / "checkpoint.json"
+        forged = json.loads(checkpoint.read_text(encoding="utf-8"))
+        forged["attempts"][0]["failure_receipt"]["failure"][
+            "limiting_resource"
+        ] = "forged-limit"
+        forged["attempts_sha256"] = hashlib.sha256(
+            canonical_json_bytes(forged["attempts"])
+        ).hexdigest()
+        checkpoint.write_bytes(canonical_json_bytes(forged))
+
+        with self.assertRaisesRegex(ValueError, "attempt digest"):
+            validate_campaign_checkpoint(plan, checkpoint)
+
+    def test_schema_version_3_checkpoint_remains_compatible(self):
+        plan, capabilities, _, incident, _ = self._plan_and_leaves()
+        selection = build_campaign_selection(
+            plan, role="primary", leaf_ids=(incident.leaf_id,)
+        )
+
+        class Backend:
+            identity = plan.backend_identity
+            precision_capabilities = capabilities
+
+            def execute_stage(self, leaf, digits):
+                return _authenticated_primary_stage(
+                    leaf, digits, ComponentStatus.CONVERGED
+                )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            checkpoint = Path(temporary) / "checkpoint.json"
+            run_campaign_selection(
+                plan, selection, Backend(), checkpoint, resume=False
+            )
+            legacy = json.loads(checkpoint.read_text(encoding="utf-8"))
+            legacy["schema_version"] = 3
+            legacy.pop("attempts")
+            legacy.pop("attempts_sha256")
+            checkpoint.write_bytes(canonical_json_bytes(legacy))
+
+            loaded = validate_campaign_checkpoint(plan, checkpoint)
+
+        self.assertEqual(loaded.state, "COMPLETE")
+        self.assertEqual(loaded.attempts, ())
 
     def test_component_status_body_contract_is_enforced_at_every_primary_tier(self) -> None:
         """Catches sealed status/body contradictions accepted as production."""

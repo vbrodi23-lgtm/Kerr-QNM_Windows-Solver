@@ -2,6 +2,15 @@
 
 Add the newest completed task or milestone-control entry immediately below this heading.
 
+## 2026-08-14 — TASK-076 promoted Julia readout containment triage
+
+- **Leaf 13 benchmark:** M02 Leaf 13/212 (`221`, `a/M = 0.95`, `horizon-admittance`) exhausted all four binary64 phases after 216 determinant evaluations and about 361 seconds. At 80 decimal digits it had spent 5,271.5 seconds in PRIMARY, Newton iteration 1, determinant 3, with zero completed promoted readouts; `Xup_match_to_inner` was active at about 1.96 million radial RHS evaluations, zero rejected steps, zero nonlinear failures, and a healthy heartbeat. The observed raw determinant magnitude near `3.83e1450` is recorded but is not itself classified as failure.
+- **Architectural diagnosis:** The promoted worker had unbounded homogeneous `maxiters`, no cooperative deadline or per-leg work ceilings, no determinant-cost feasibility guard, and no campaign-level typed quarantine. One pathological leaf therefore depended on the outer 7,200-second Python kill boundary, could abort all 212 leaves, and could lose the exact phase/ODE cost location or be confused with scientific nonconvergence.
+- **Containment PR scope:** Add a request-digested but science-identity-excluded execution-resource policy; finite Julia ODE/request/leg limits; first-determinant root-readout feasibility triage; PRIMARY diagnostic short-circuit; distinct typed ODE/readout/timeout failures; schema-version-4 append-only attempt records with schema-version-3 loading; atomic deferred-leaf quarantine and next-leaf continuation; explicit-resume retry; and resource CSV/status/dashboard fields. Mathematical performance redesign remains outside this slice.
+- **Task state:** TASK-076 remains Backlog and blocked by TASK-075. TASK-075 remains In Progress, and the M02 milestone status is unchanged.
+- **Evidence ceiling:** Static Julia source contracts, Python compilation, and mocked/synthetic Python unit tests only. No Julia worker, Kerr determinant, 80/120-digit mathematical payload, native Leaf 13 rerun, PowerShell campaign, or physical campaign evidence is claimed.
+- **Change reference:** branch `agent/m02-promoted-readout-resource-containment`; draft PR to be opened against `main` without merge.
+
 ## 2026-08-13 — TASK-075 implementation reconciled after PR #40
 
 - **Current position:** The canonical M02 domain is 212 leaves, 48 campaign roots, and 57 projective rows. PR #21 superseded the earlier 553/87/174 execution scope, and PR #40 merged the determinant, branch, finite-difference, Newton, support-contract, checkpoint-boolean, and promoted-ODE repairs. Earlier work-log entries retain their historical scope rather than being silently rewritten.
