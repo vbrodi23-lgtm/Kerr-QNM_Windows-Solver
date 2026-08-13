@@ -75,6 +75,7 @@ _NORMAL_FALLBACK_KINDS = _NORMAL_KINDS | frozenset(
         ProgressEventKind.ODE_SOLVE_COMPLETED,
         ProgressEventKind.ODE_SOLVE_FAILED,
         ProgressEventKind.ODE_RESOURCE_LIMIT,
+        ProgressEventKind.ROOT_READOUT_RESOURCE_INFEASIBLE,
     }
 )
 _TERMINAL_KINDS = frozenset(
@@ -111,6 +112,7 @@ _FORCED_STATUS_KINDS = frozenset(
         ProgressEventKind.ODE_SOLVE_COMPLETED,
         ProgressEventKind.ODE_SOLVE_FAILED,
         ProgressEventKind.ODE_RESOURCE_LIMIT,
+        ProgressEventKind.ROOT_READOUT_RESOURCE_INFEASIBLE,
         ProgressEventKind.WORKER_HEARTBEAT,
         ProgressEventKind.ERROR,
     }
@@ -131,6 +133,7 @@ _DASHBOARD_FORCED_KINDS = frozenset(
         ProgressEventKind.ROOT_PHASE_COMPLETED,
         ProgressEventKind.ODE_SOLVE_FAILED,
         ProgressEventKind.ODE_RESOURCE_LIMIT,
+        ProgressEventKind.ROOT_READOUT_RESOURCE_INFEASIBLE,
         ProgressEventKind.WORKER_HEARTBEAT,
         ProgressEventKind.LEAF_COMPLETED,
         ProgressEventKind.LEAF_REUSED,
@@ -183,6 +186,8 @@ _ODE_PROGRESS_STATE_KEYS = (
     "failure_code",
     "failure_class",
     "limit_kind",
+    "limiting_resource",
+    "request_elapsed_seconds",
 )
 _PRECISION_LIVE_STATE_KEYS = (
     "phase",
@@ -268,6 +273,9 @@ class CampaignProgressReporter:
         self._rejected_leaf_ids: set[object] = set()
         self._indeterminate_leaf_ids: set[object] = set()
         self._failed_leaf_ids: set[object] = set()
+        self._resource_limited_leaf_ids: set[object] = set()
+        self._worker_timeout_leaf_ids: set[object] = set()
+        self._protocol_failure_leaf_ids: set[object] = set()
         self._last_accepted_leaf: object | None = None
         self._last_terminal_leaf: object | None = None
         self._last_terminal_state: object | None = None
@@ -361,6 +369,24 @@ class CampaignProgressReporter:
                 if state in {"PRODUCED", "UNRESOLVED"}:
                     self._settled_leaf_ids.add(leaf_id)
                     self._terminal_computed_leaf_ids.add(leaf_id)
+            for row in self._campaign_report_model.resource_failure_rows:
+                leaf_id = row.get("leaf_id")
+                code = row.get("failure_code")
+                retry_status = row.get("retry_status")
+                if leaf_id is None:
+                    continue
+                if retry_status == "RETRIED_COMPLETED":
+                    self._resource_limited_leaf_ids.discard(leaf_id)
+                    self._worker_timeout_leaf_ids.discard(leaf_id)
+                    continue
+                if retry_status == "RETRIED_FAILED":
+                    continue
+                self._resource_limited_leaf_ids.discard(leaf_id)
+                self._worker_timeout_leaf_ids.discard(leaf_id)
+                if code == "WORKER_TIMEOUT":
+                    self._worker_timeout_leaf_ids.add(leaf_id)
+                else:
+                    self._resource_limited_leaf_ids.add(leaf_id)
             if self._checkpoint_leaf_ids:
                 self._checkpoint_status = "written"
         except Exception as error:
@@ -442,7 +468,6 @@ class CampaignProgressReporter:
             event.kind in {
                 ProgressEventKind.LEAF_COMPLETED,
                 ProgressEventKind.LEAF_REUSED,
-                ProgressEventKind.LEAF_FAILED,
             }
             and leaf_key is not None
             and leaf_key not in self._settled_leaf_ids
@@ -455,11 +480,15 @@ class CampaignProgressReporter:
                 if math.isfinite(duration) and duration >= 0:
                     self._completed_leaf_seconds.append(duration)
             self._settled_leaf_ids.add(leaf_key)
-            if event.kind in {
-                ProgressEventKind.LEAF_COMPLETED,
-                ProgressEventKind.LEAF_REUSED,
-            }:
-                self._terminal_computed_leaf_ids.add(leaf_key)
+            self._terminal_computed_leaf_ids.add(leaf_key)
+        if (
+            event.kind is ProgressEventKind.LEAF_FAILED
+            and leaf_key is not None
+            and leaf_key not in self._settled_leaf_ids
+            and self._failure_category(event.payload)
+            not in {"RESOURCE LIMIT", "WORKER TIMEOUT"}
+        ):
+            self._settled_leaf_ids.add(leaf_key)
         if event.kind is ProgressEventKind.ROOT_PHASE_STARTED:
             self._root_started[root_key] = now
         if (
@@ -926,6 +955,18 @@ class CampaignProgressReporter:
             }:
                 self._dashboard_state["execution_state"] = "FAILED"
                 self._dashboard_state["root_status"] = "FAILED"
+                self._dashboard_state["failure_category"] = (
+                    "RESOURCE LIMIT"
+                    if kind == ProgressEventKind.ODE_RESOURCE_LIMIT.value
+                    else "PROTOCOL/CONTROL FAILURE"
+                )
+        if kind == ProgressEventKind.ROOT_READOUT_RESOURCE_INFEASIBLE.value:
+            self._dashboard_state["execution_state"] = "FAILED"
+            self._dashboard_state["root_status"] = "RESOURCE LIMIT"
+            self._dashboard_state["failure_category"] = "RESOURCE LIMIT"
+            for name in ("failure_code", "limiting_resource"):
+                if name in payload:
+                    self._dashboard_state[name] = payload[name]
         if kind == ProgressEventKind.LEAF_STARTED.value:
             self._dashboard_state["leaf_status"] = "RUNNING"
         elif kind in {
@@ -934,15 +975,45 @@ class CampaignProgressReporter:
         }:
             self._record_leaf_outcome(next_leaf, payload.get("state"))
         elif kind == ProgressEventKind.LEAF_FAILED.value:
-            self._dashboard_state["leaf_status"] = "FAILED"
-            self._dashboard_state["precision_status"] = "FAILED"
-            self._dashboard_state["root_status"] = "FAILED"
-            self._dashboard_state["execution_state"] = "FAILED"
+            category = self._failure_category(payload)
+            self._dashboard_state["failure_category"] = category
+            structured = None
+            worker_failure = payload.get("worker_failure")
+            if isinstance(worker_failure, Mapping):
+                candidate = worker_failure.get("failure")
+                if isinstance(candidate, Mapping):
+                    structured = candidate
+            if structured is not None:
+                for name in ("failure_code", "limiting_resource"):
+                    if name in structured:
+                        self._dashboard_state[name] = structured[name]
+            if category == "RESOURCE LIMIT":
+                leaf_status = "RESOURCE LIMITED / DEFERRED"
+                root_status = "RESOURCE LIMIT"
+                execution_state = "DEFERRED"
+            elif category == "WORKER TIMEOUT":
+                leaf_status = "WORKER TIMEOUT / DEFERRED"
+                root_status = "WORKER TIMEOUT"
+                execution_state = "DEFERRED"
+            else:
+                leaf_status = "FAILED"
+                root_status = "FAILED"
+                execution_state = "FAILED"
+            self._dashboard_state["leaf_status"] = leaf_status
+            self._dashboard_state["precision_status"] = root_status
+            self._dashboard_state["root_status"] = root_status
+            self._dashboard_state["execution_state"] = execution_state
             self._last_terminal_leaf = next_leaf
-            self._last_terminal_state = "FAILED"
+            self._last_terminal_state = leaf_status
             if next_leaf is not None:
                 self._discard_leaf_outcomes(next_leaf)
-                self._failed_leaf_ids.add(next_leaf)
+                if category == "RESOURCE LIMIT":
+                    self._resource_limited_leaf_ids.add(next_leaf)
+                elif category == "WORKER TIMEOUT":
+                    self._worker_timeout_leaf_ids.add(next_leaf)
+                else:
+                    self._failed_leaf_ids.add(next_leaf)
+                    self._protocol_failure_leaf_ids.add(next_leaf)
         elif kind == ProgressEventKind.LEAF_INTERRUPTED.value:
             self._dashboard_state["leaf_status"] = "INTERRUPTED"
             self._dashboard_state["precision_status"] = "INTERRUPTED"
@@ -958,6 +1029,9 @@ class CampaignProgressReporter:
                 self._dashboard_state["root_status"] = "CONVERGED"
             elif converged is False:
                 self._dashboard_state["root_status"] = "NOT_CONVERGED"
+                self._dashboard_state["failure_category"] = (
+                    "NUMERICAL NONCONVERGENCE"
+                )
         elif kind == ProgressEventKind.ROOT_SEED_SELECTED.value:
             seed_kind = context.get("seed_kind") or payload.get("seed_kind")
             self._dashboard_state["seed_kind"] = seed_kind
@@ -968,6 +1042,12 @@ class CampaignProgressReporter:
                 "SPIN_CONTINUATION",
             }
         elif kind == ProgressEventKind.PRECISION_STAGE_STARTED.value:
+            for name in (
+                "failure_category",
+                "failure_code",
+                "limiting_resource",
+            ):
+                self._dashboard_state.pop(name, None)
             self._dashboard_state["precision_status"] = "ACTIVE"
             self._dashboard_state["execution_state"] = "RUNNING"
             self._dashboard_state["root_status"] = "PENDING"
@@ -1057,6 +1137,26 @@ class CampaignProgressReporter:
         state = row.get("numerical_state")
         return label if state is None else f"{label} {state}"
 
+    @staticmethod
+    def _failure_category(payload: Mapping[str, object]) -> str:
+        worker_failure = payload.get("worker_failure")
+        if isinstance(worker_failure, Mapping):
+            structured = worker_failure.get("failure")
+            if worker_failure.get("worker_timed_out") is True:
+                return "WORKER TIMEOUT"
+            if isinstance(structured, Mapping):
+                code = structured.get("failure_code")
+                if code == "WORKER_TIMEOUT":
+                    return "WORKER TIMEOUT"
+                if code in {
+                    "ODE_RESOURCE_LIMIT",
+                    "ROOT_READOUT_RESOURCE_INFEASIBLE",
+                } and structured.get("failure_class") == "CONTROL":
+                    return "RESOURCE LIMIT"
+        if payload.get("numerical_state") == "NOT_CONVERGED":
+            return "NUMERICAL NONCONVERGENCE"
+        return "PROTOCOL/CONTROL FAILURE"
+
     def _record_leaf_outcome(self, leaf_id: object, state: object) -> None:
         self._last_terminal_leaf = leaf_id
         self._last_terminal_state = state
@@ -1069,6 +1169,9 @@ class CampaignProgressReporter:
         elif state == "UNRESOLVED":
             status = "INDETERMINATE"
             target = self._indeterminate_leaf_ids
+            self._dashboard_state["failure_category"] = (
+                "NUMERICAL NONCONVERGENCE"
+            )
         elif state == "REJECTED":
             status = "REJECTED"
             target = self._rejected_leaf_ids
@@ -1085,6 +1188,9 @@ class CampaignProgressReporter:
             self._rejected_leaf_ids,
             self._indeterminate_leaf_ids,
             self._failed_leaf_ids,
+            self._resource_limited_leaf_ids,
+            self._worker_timeout_leaf_ids,
+            self._protocol_failure_leaf_ids,
         ):
             outcomes.discard(leaf_id)
 
@@ -1336,6 +1442,10 @@ class CampaignProgressReporter:
             ("Rejected", len(self._rejected_leaf_ids)),
             ("Indeterminate", len(self._indeterminate_leaf_ids)),
             ("Failed", len(self._failed_leaf_ids)),
+            ("ResourceLimited", len(self._resource_limited_leaf_ids)),
+            ("WorkerTimeout", len(self._worker_timeout_leaf_ids)),
+            ("ProtocolControlFailed", len(self._protocol_failure_leaf_ids)),
+            ("FailureCategory", context.get("failure_category")),
             ("LastAccepted", self._last_accepted_leaf),
             ("Computed", self._current_leaf_persistence()["terminal_computed"]),
             ("PersistentReceipt", self._persistent_receipt_status()),
@@ -1381,6 +1491,15 @@ class CampaignProgressReporter:
             self._dashboard_field_line("Unresolved", fields.get("Indeterminate")),
             self._dashboard_field_line("Rejected", fields.get("Rejected")),
             self._dashboard_field_line("Failed", fields.get("Failed")),
+            self._dashboard_field_line(
+                "Resource limits", fields.get("ResourceLimited")
+            ),
+            self._dashboard_field_line(
+                "Worker timeouts", fields.get("WorkerTimeout")
+            ),
+            self._dashboard_field_line(
+                "Protocol/control", fields.get("ProtocolControlFailed")
+            ),
             "",
             " LATEST COMPLETED LEAF",
             *self._latest_completed_leaf_lines(fields),
@@ -1483,7 +1602,17 @@ class CampaignProgressReporter:
     def _current_execution_lines(self, *, compact: bool = False) -> list[str]:
         state = self._live_execution_mapping()
         if state.get("state") != "RUNNING":
-            return []
+            category = state.get("failure_category")
+            if category is None:
+                return []
+            return [
+                " CURRENT EXECUTION CONTROL RESULT",
+                self._dashboard_field_line("Category", category),
+                self._dashboard_field_line("Failure code", state.get("failure_code")),
+                self._dashboard_field_line(
+                    "Limiting resource", state.get("limiting_resource")
+                ),
+            ]
         current_leaf = self._index_limit(
             state.get("leaf_index"), state.get("leaf_count")
         )
@@ -1526,7 +1655,7 @@ class CampaignProgressReporter:
             return [
                 " CURRENTLY EXECUTING",
                 f" Current leaf   {current_leaf} | Root {self._dashboard_value(root)} | {self._dashboard_value(precision)}",
-                f" Mechanism      {self._dashboard_value(mechanism)} | Phase {self._dashboard_value(phase)} | RUNNING",
+                f" Mechanism      {self._dashboard_value(mechanism)} | Phase {self._dashboard_value(phase)} | {self._dashboard_value(state.get('failure_category') or 'RUNNING')}",
                 f" Promoted by    {self._dashboard_value(promotion)} | Branch {branch_valid}",
                 f" Worker         {self._dashboard_value(worker)} | Tier elapsed {self._dashboard_value(tier_elapsed)}",
                 f" Activity       {self._dashboard_value(activity)} | Seed authenticated {seed_authenticated}",
@@ -1545,6 +1674,9 @@ class CampaignProgressReporter:
             self._dashboard_field_line("Precision", precision),
             self._dashboard_field_line("Phase", phase),
             self._dashboard_field_line("State", state.get("state")),
+            self._dashboard_field_line(
+                "Classification", state.get("failure_category")
+            ),
             self._dashboard_field_line("Promotion", promotion),
             self._dashboard_field_line("Seed", seed),
             self._dashboard_field_line("Seed authenticated", seed_authenticated),
@@ -1662,6 +1794,9 @@ class CampaignProgressReporter:
             "seed_authenticated": state.get("seed_authenticated"),
             "branch_valid": state.get("branch_valid"),
             "worker": state.get("worker"),
+            "failure_category": state.get("failure_category"),
+            "failure_code": state.get("failure_code"),
+            "limiting_resource": state.get("limiting_resource"),
             "elapsed_precision_seconds": state.get("elapsed_precision_seconds"),
             "last_activity_age_seconds": state.get("last_activity_age_seconds"),
             "last_activity_kind": state.get("last_activity_kind"),
@@ -2242,6 +2377,14 @@ class CampaignProgressReporter:
         status["persistence"] = self._persistence_status()
         status["scientific"] = dict(self._scientific_dashboard_fields())
         status["live_execution"] = self._live_execution_mapping()
+        status["resource_failures"] = (
+            []
+            if self._campaign_report_model is None
+            else [
+                dict(row)
+                for row in self._campaign_report_model.resource_failure_rows
+            ]
+        )
         encoded = json.dumps(
             _json_value(status), ensure_ascii=False, allow_nan=False,
             separators=(",", ":"), sort_keys=True,

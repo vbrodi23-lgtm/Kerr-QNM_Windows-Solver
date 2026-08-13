@@ -147,6 +147,37 @@ PROJECTIVE_COLUMNS = (
     "checkpoint_source_receipt",
 )
 
+RESOURCE_FAILURE_COLUMNS = (
+    "attempt_ordinal",
+    "leaf_index",
+    "leaf_id",
+    "mode",
+    "spin_or_Mkappa",
+    "mechanism",
+    "precision_digits",
+    "readout_role",
+    "phase",
+    "newton_index",
+    "determinant_count",
+    "determinant_purpose",
+    "elapsed_seconds",
+    "elapsed_phase_seconds",
+    "elapsed_leg_seconds",
+    "failure_code",
+    "limiting_resource",
+    "ode_leg",
+    "ode_accepted_steps",
+    "ode_rejected_steps",
+    "rhs_evaluations",
+    "retry_status",
+    "resource_policy_schema",
+    "resource_policy_version",
+    "resource_policy_sha256",
+    "attempt_sha256",
+    "created_at_utc",
+    "checkpoint_source_receipt",
+)
+
 
 @dataclass(frozen=True, slots=True)
 class CampaignReportModel:
@@ -157,6 +188,7 @@ class CampaignReportModel:
     projective_rows: tuple[Mapping[str, object], ...]
     checkpoint_source_receipt: str
     precision_stage_rows: tuple[Mapping[str, object], ...] = ()
+    resource_failure_rows: tuple[Mapping[str, object], ...] = ()
 
 
 def report_directory_for_checkpoint(checkpoint_path: str | os.PathLike[str]) -> Path:
@@ -509,6 +541,85 @@ def _vector_cell(
     return _json_cell(values)
 
 
+def _resource_failure_rows(
+    plan: CampaignPlan,
+    summary: object,
+    *,
+    source_receipt: str,
+) -> tuple[Mapping[str, object], ...]:
+    attempts = tuple(getattr(summary, "attempts", ()))
+    records = tuple(getattr(summary, "records", ()))
+    terminal_ids = {
+        record.leaf_id
+        for record in records
+        if record.state in {"PRODUCED", "UNRESOLVED"}
+    }
+    last_attempt_by_leaf = {
+        attempt.leaf_id: attempt.attempt_ordinal for attempt in attempts
+    }
+    leaf_by_id = {leaf.leaf_id: leaf for leaf in plan.leaves}
+    rows: list[Mapping[str, object]] = []
+    for attempt in attempts:
+        leaf = leaf_by_id[attempt.leaf_id]
+        receipt = attempt.failure_receipt
+        failure = receipt["failure"]
+        if not isinstance(failure, Mapping):
+            raise ValueError("campaign resource failure receipt is invalid")
+        snapshot = failure.get("ode_snapshot")
+        if not isinstance(snapshot, Mapping):
+            snapshot = {}
+        resource_policy = failure.get("execution_resource_policy")
+        if not isinstance(resource_policy, Mapping):
+            raise ValueError("campaign resource policy receipt is invalid")
+        if attempt.leaf_id in terminal_ids:
+            retry_status = "RETRIED_COMPLETED"
+        elif last_attempt_by_leaf[attempt.leaf_id] != attempt.attempt_ordinal:
+            retry_status = "RETRIED_FAILED"
+        else:
+            retry_status = "DEFERRED"
+        rows.append({
+            "attempt_ordinal": attempt.attempt_ordinal,
+            "leaf_index": attempt.leaf_index,
+            "leaf_id": attempt.leaf_id,
+            "mode": leaf.leaf.mode_label,
+            "spin_or_Mkappa": float(leaf.leaf.coordinate),
+            "mechanism": leaf.mechanism_id,
+            "precision_digits": attempt.precision_digits,
+            "readout_role": failure.get("readout_role"),
+            "phase": failure.get("root_phase"),
+            "newton_index": failure.get("newton_index"),
+            "determinant_count": (
+                failure.get("phase_determinant_index")
+                if failure.get("phase_determinant_index") is not None
+                else failure.get("determinant_index")
+            ),
+            "determinant_purpose": failure.get("determinant_purpose"),
+            "elapsed_seconds": failure.get("elapsed_request_seconds"),
+            "elapsed_phase_seconds": failure.get("elapsed_phase_seconds"),
+            "elapsed_leg_seconds": failure.get("elapsed_leg_seconds"),
+            "failure_code": attempt.failure_code,
+            "limiting_resource": failure.get("limiting_resource"),
+            "ode_leg": failure.get("ode_leg") or snapshot.get("ode_leg"),
+            "ode_accepted_steps": snapshot.get(
+                "ode_accepted_steps", snapshot.get("accepted_steps")
+            ),
+            "ode_rejected_steps": snapshot.get(
+                "ode_rejected_steps", snapshot.get("rejected_steps")
+            ),
+            "rhs_evaluations": snapshot.get(
+                "ode_rhs_evaluations", snapshot.get("rhs_evaluations")
+            ),
+            "retry_status": retry_status,
+            "resource_policy_schema": resource_policy.get("schema"),
+            "resource_policy_version": resource_policy.get("version"),
+            "resource_policy_sha256": resource_policy.get("sha256"),
+            "attempt_sha256": attempt.attempt_sha256,
+            "created_at_utc": attempt.created_at_utc,
+            "checkpoint_source_receipt": source_receipt,
+        })
+    return tuple(rows)
+
+
 def project_campaign_reports(
     plan: CampaignPlan,
     checkpoint_path: str | os.PathLike[str],
@@ -664,11 +775,15 @@ def project_campaign_reports(
         }
         for row_plan, result in zip(reduction.plans, reduction.results)
     )
+    resource_failure_rows = _resource_failure_rows(
+        plan, summary, source_receipt=source_receipt
+    )
     return CampaignReportModel(
         leaf_rows=leaf_rows,
         precision_stage_rows=precision_stage_rows,
         error_channel_rows=error_rows,
         projective_rows=projective_rows,
+        resource_failure_rows=resource_failure_rows,
         checkpoint_source_receipt=source_receipt,
     )
 
@@ -738,5 +853,10 @@ def refresh_campaign_reports(
         directory / "m02-projective.csv",
         PROJECTIVE_COLUMNS,
         model.projective_rows,
+    )
+    _atomic_csv(
+        directory / "m02-resource-failures.csv",
+        RESOURCE_FAILURE_COLUMNS,
+        model.resource_failure_rows,
     )
     return model

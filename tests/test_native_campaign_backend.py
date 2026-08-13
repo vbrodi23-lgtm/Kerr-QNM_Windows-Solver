@@ -18,6 +18,7 @@ from windows_solver.response_engine import (
     NumericalPolicy,
     RootReadout,
     VettedNativeDeterminantKernel,
+    ERROR_CHANNELS,
 )
 
 
@@ -158,6 +159,57 @@ class NativeCampaignBackendTests(unittest.TestCase):
             for item in outcome.signed_error_channels
         )
         self.assertAlmostEqual(ledger_radius, outcome.local_disk_radius_abs)
+
+    def test_unsuccessful_promoted_primary_skips_self_refinement(self):
+        previous_result = _result(self.leaf.job, 1.0 + 0.0j)
+        baseline = RootReadout(
+            omega=self.leaf.job.root.omega,
+            determinant_residual_abs=1.0e-12,
+            determinant_derivative_abs=2.0,
+            converged=False,
+            root_reference_id=self.leaf.job.root.root_reference_id,
+            branch_id=self.leaf.job.root.branch_id,
+            equation_id=self.leaf.job.equation_id,
+            truncation_radius=None,
+            resolution_radius=None,
+            seed_path_radius=None,
+            diagnostics_skipped_reason="PRIMARY_NOT_CONVERGED",
+        )
+        primary = ComponentResult(
+            job_id=self.leaf.job.job_id,
+            leaf_id=self.leaf.job.leaf_id,
+            mechanism_id=self.leaf.job.mechanism_id,
+            status=ComponentStatus.NOT_CONVERGED,
+            convergence_basis="UNRESOLVED",
+            response=None,
+            signed_root_crosscheck=None,
+            closed_form_response=None,
+            error_channels={name: 0.0 for name in ERROR_CHANNELS},
+            baseline=baseline,
+            levels=(),
+            lineage=_lineage(self.leaf.job),
+        )
+        previous = SimpleNamespace(
+            digits=64,
+            component_result={"result": previous_result.to_mapping()},
+            local_disk_radius_abs=1.0e-6,
+        )
+        with patch(
+            "windows_solver.response_batches.run_component",
+            return_value=primary,
+        ) as run:
+            outcome = self.backend.execute_promoted_stage(
+                self.leaf, 80, (previous,)
+            )
+
+        self.assertEqual(run.call_count, 1)
+        self.assertEqual(outcome.numerical_state, "NOT_CONVERGED")
+        self.assertIs(outcome.self_refinement_enclosed, False)
+        self.assertIsNone(outcome.component_result["self_refinement_result"])
+        self.assertEqual(
+            outcome.component_result["self_refinement_skipped_reason"],
+            "PRIMARY_NOT_CONVERGED",
+        )
 
 
 if __name__ == "__main__":

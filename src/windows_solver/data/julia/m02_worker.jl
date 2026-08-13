@@ -17,6 +17,15 @@ const ACTIVE_PROGRESS_CONTEXT = Ref(Dict{String,Any}())
 const ODE_PROGRESS_INTERVAL_SECONDS = 15.0
 const ODE_ALGORITHM_CONFIGURED = "AutoVern9(Rosenbrock23(autodiff=false))"
 const NEXT_ODE_SOLVE_ID = Ref(0)
+const REQUEST_STARTED_NS = Ref(UInt64(0))
+const ACTIVE_PHASE_STARTED_NS = Ref(UInt64(0))
+const ACTIVE_PHASE = Ref{Union{Nothing,String}}(nothing)
+const ACTIVE_NEWTON_INDEX = Ref(0)
+const DETERMINANT_INDEX_REQUEST = Ref(0)
+const DETERMINANT_INDEX_PHASE = Ref(0)
+const LAST_DETERMINANT_PURPOSE = Ref{Union{Nothing,String}}(nothing)
+const LAST_DETERMINANT_SECONDS = Ref(0.0)
+const LAST_ODE_SNAPSHOT = Ref{Union{Nothing,Dict{String,Any}}}(nothing)
 const ALLOWED_MECHANISMS = Set([
     "horizon-admittance",
     "exterior-fixed-r3",
@@ -27,7 +36,8 @@ const ALLOWED_MECHANISMS = Set([
     "exterior-alpha-one",
 ])
 
-abstract type ODEControlFailure <: Exception end
+abstract type WorkerControlFailure <: Exception end
+abstract type ODEControlFailure <: WorkerControlFailure end
 
 struct ODEResourceLimit <: ODEControlFailure
     message::String
@@ -39,9 +49,15 @@ struct ODESolverFailure <: ODEControlFailure
     details::Dict{String,Any}
 end
 
+struct RootReadoutResourceLimit <: WorkerControlFailure
+    message::String
+    details::Dict{String,Any}
+end
+
 Base.showerror(io::IO, failure::ODEResourceLimit) = print(io, failure.message)
 Base.showerror(io::IO, failure::ODESolverFailure) = print(io, failure.message)
-failure_details(failure::ODEControlFailure) = failure.details
+Base.showerror(io::IO, failure::RootReadoutResourceLimit) = print(io, failure.message)
+failure_details(failure::WorkerControlFailure) = failure.details
 
 mutable struct ODEObservationState
     solve_id::Int
@@ -52,6 +68,7 @@ mutable struct ODEObservationState
     next_report_ns::UInt64
     last_accepted_step
     minimum_accepted_step
+    request
 end
 
 struct ODEObservationCallback
@@ -116,10 +133,76 @@ function ode_snapshot_payload(
         "ode_proposed_step_abs" => proposed_step === nothing ?
             nothing : string(proposed_step),
         "elapsed_seconds" => (time_ns() - state.started_ns) / 1.0e9,
+        "request_elapsed_seconds" =>
+            (time_ns() - REQUEST_STARTED_NS[]) / 1.0e9,
     ))
 end
 
-function ode_observation_factory(leg, tspan, _algorithm)
+function resource_policy_identity(request)
+    return Dict{String,Any}(
+        "schema" => string(required(request, "resource_policy_schema")),
+        "version" => parse_integer(request, "resource_policy_version"),
+        "sha256" => string(required(request, "resource_policy_sha256")),
+    )
+end
+
+function control_failure_context(request)
+    now = time_ns()
+    return Dict{String,Any}(
+        "retryable" => true,
+        "precision_digits" => parse_integer(request, "precision_digits"),
+        "root_phase" => ACTIVE_PHASE[],
+        "newton_index" => ACTIVE_NEWTON_INDEX[],
+        "determinant_index" => DETERMINANT_INDEX_REQUEST[],
+        "phase_determinant_index" => DETERMINANT_INDEX_PHASE[],
+        "determinant_purpose" => LAST_DETERMINANT_PURPOSE[],
+        "diagnostics_skipped_reason" => ACTIVE_PHASE[] == "PRIMARY" ?
+            "PRIMARY_RESOURCE_LIMIT" : nothing,
+        "elapsed_request_seconds" =>
+            (now - REQUEST_STARTED_NS[]) / 1.0e9,
+        "elapsed_phase_seconds" => ACTIVE_PHASE_STARTED_NS[] == 0 ?
+            nothing : (now - ACTIVE_PHASE_STARTED_NS[]) / 1.0e9,
+        "execution_resource_policy" => resource_policy_identity(request),
+    )
+end
+
+function throw_ode_resource_limit(
+    state::ODEObservationState, stats, t_current, limit_kind::String,
+    limiting_resource::String; proposed_step=nothing,
+)
+    snapshot = merge(
+        ode_snapshot_payload(
+            state, stats, t_current; proposed_step=proposed_step
+        ),
+        Dict{String,Any}(
+            "ode_retcode" => "ResourceLimit",
+            "ode_endpoint_reached" => false,
+        ),
+    )
+    LAST_ODE_SNAPSHOT[] = snapshot
+    details = merge(control_failure_context(state.request), Dict{String,Any}(
+        "failure_code" => "ODE_RESOURCE_LIMIT",
+        "failure_class" => "CONTROL",
+        "limit_kind" => limit_kind,
+        "limiting_resource" => limiting_resource,
+        "elapsed_leg_seconds" => snapshot["elapsed_seconds"],
+        "ode_leg" => state.leg,
+        "ode_snapshot" => snapshot,
+    ))
+    progress_emit("ode_resource_limit"; payload=merge(snapshot, Dict{String,Any}(
+        "failure_code" => "ODE_RESOURCE_LIMIT",
+        "failure_class" => "CONTROL",
+        "limit_kind" => limit_kind,
+        "limiting_resource" => limiting_resource,
+        "execution_resource_policy" => resource_policy_identity(state.request),
+    )))
+    throw(ODEResourceLimit(
+        "$(state.leg) reached execution resource $(limiting_resource)",
+        details,
+    ))
+end
+
+function ode_observation_factory(request, leg, tspan, _algorithm)
     NEXT_ODE_SOLVE_ID[] += 1
     started = time_ns()
     interval = round(UInt64, ODE_PROGRESS_INTERVAL_SECONDS * 1.0e9)
@@ -132,11 +215,11 @@ function ode_observation_factory(leg, tspan, _algorithm)
         started + interval,
         nothing,
         nothing,
+        request,
     )
     progress_emit("ode_solve_started"; payload=ode_base_payload(state))
-    progress_active() || return nothing, ODEObservationCallback(state)
 
-    condition = (_u, _t, _integrator) -> true
+    condition = (_u, _t, integrator) -> integrator.stats.naccept > 0
     function observe_step!(integrator)
         try
             stats = integrator.stats
@@ -149,13 +232,50 @@ function ode_observation_factory(leg, tspan, _algorithm)
                 end
             end
             sampled_at = time_ns()
+            proposed_step = try
+                abs(SciMLBase.get_proposed_dt(integrator))
+            catch
+                nothing
+            end
+            request_elapsed = (sampled_at - REQUEST_STARTED_NS[]) / 1.0e9
+            leg_elapsed = (sampled_at - state.started_ns) / 1.0e9
+            if request_elapsed >= parse_integer(
+                request, "cooperative_request_deadline_seconds"
+            )
+                throw_ode_resource_limit(
+                    state, stats, integrator.t,
+                    "request_wall_clock", "cooperative_request_deadline";
+                    proposed_step=proposed_step,
+                )
+            end
+            leg_limit = required(request, "homogeneous_leg_wall_clock_seconds")
+            if leg_limit !== nothing && leg_elapsed >= parse(Int, string(leg_limit))
+                throw_ode_resource_limit(
+                    state, stats, integrator.t,
+                    "homogeneous_leg_wall_clock", "homogeneous_leg_wall_clock";
+                    proposed_step=proposed_step,
+                )
+            end
+            if Int(stats.naccept) >= parse_integer(
+                request, "max_accepted_steps_per_homogeneous_leg"
+            )
+                throw_ode_resource_limit(
+                    state, stats, integrator.t,
+                    "accepted_steps", "accepted_steps";
+                    proposed_step=proposed_step,
+                )
+            end
+            if Int(stats.nf) >= parse_integer(
+                request, "max_rhs_evaluations_per_homogeneous_leg"
+            )
+                throw_ode_resource_limit(
+                    state, stats, integrator.t,
+                    "rhs_evaluations", "rhs_evaluations";
+                    proposed_step=proposed_step,
+                )
+            end
             if sampled_at >= state.next_report_ns
                 state.next_report_ns = sampled_at + interval
-                proposed_step = try
-                    abs(SciMLBase.get_proposed_dt(integrator))
-                catch
-                    nothing
-                end
                 progress_emit("ode_solve_progress"; payload=ode_snapshot_payload(
                     state, stats, integrator.t; proposed_step=proposed_step
                 ))
@@ -181,18 +301,24 @@ function observe_ode_solution(leg, solution, observation::ODEObservationCallback
         "ode_retcode" => retcode,
         "ode_endpoint_reached" => endpoint_reached,
     ))
+    LAST_ODE_SNAPSHOT[] = snapshot
 
     if solution.retcode === SciMLBase.ReturnCode.MaxIters
-        details = Dict{String,Any}(
+        details = merge(control_failure_context(state.request), Dict{String,Any}(
             "failure_code" => "ODE_RESOURCE_LIMIT",
             "failure_class" => "CONTROL",
             "limit_kind" => "ode_solver_iterations",
+            "limiting_resource" => "homogeneous_ode_maxiters",
+            "elapsed_leg_seconds" => snapshot["elapsed_seconds"],
+            "ode_leg" => state.leg,
             "ode_snapshot" => snapshot,
-        )
+        ))
         progress_emit("ode_resource_limit"; payload=merge(snapshot, Dict{String,Any}(
             "failure_code" => "ODE_RESOURCE_LIMIT",
             "failure_class" => "CONTROL",
             "limit_kind" => "ode_solver_iterations",
+            "limiting_resource" => "homogeneous_ode_maxiters",
+            "execution_resource_policy" => resource_policy_identity(state.request),
         )))
         throw(ODEResourceLimit(
             "$(state.leg) reached the existing ODE solver iteration limit",
@@ -201,11 +327,14 @@ function observe_ode_solution(leg, solution, observation::ODEObservationCallback
     end
 
     if !SciMLBase.successful_retcode(solution) || !endpoint_reached
-        details = Dict{String,Any}(
+        details = merge(control_failure_context(state.request), Dict{String,Any}(
             "failure_code" => "ODE_SOLVER_FAILURE",
             "failure_class" => "CONTROL",
+            "retryable" => false,
+            "elapsed_leg_seconds" => snapshot["elapsed_seconds"],
+            "ode_leg" => state.leg,
             "ode_snapshot" => snapshot,
-        )
+        ))
         progress_emit("ode_solve_failed"; payload=merge(snapshot, Dict{String,Any}(
             "failure_code" => "ODE_SOLVER_FAILURE",
             "failure_class" => "CONTROL",
@@ -308,6 +437,7 @@ function flatten_request(document)
     angular = required(document, "angular_A")
     amplitude = required(document, "amplitude")
     policy = required(document, "policy")
+    execution_resource = required(document, "execution_resource")
     mechanism = string(required(document, "mechanism_id"))
     mechanism in ALLOWED_MECHANISMS ||
         error("unsupported mechanism_id $(repr(mechanism))")
@@ -345,6 +475,27 @@ function flatten_request(document)
             policy, "branch_enclosure_radius_abs"
         ),
         "max_newton_iterations" => required(policy, "max_newton_iterations"),
+        "resource_policy_schema" => required(execution_resource, "schema"),
+        "resource_policy_version" => required(execution_resource, "version"),
+        "resource_policy_sha256" => required(execution_resource, "sha256"),
+        "worker_request_wall_clock_seconds" => required(
+            execution_resource, "worker_request_wall_clock_seconds"
+        ),
+        "cooperative_request_deadline_seconds" => required(
+            execution_resource, "cooperative_request_deadline_seconds"
+        ),
+        "homogeneous_ode_maxiters" => required(
+            execution_resource, "homogeneous_ode_maxiters"
+        ),
+        "max_accepted_steps_per_homogeneous_leg" => required(
+            execution_resource, "max_accepted_steps_per_homogeneous_leg"
+        ),
+        "max_rhs_evaluations_per_homogeneous_leg" => required(
+            execution_resource, "max_rhs_evaluations_per_homogeneous_leg"
+        ),
+        "homogeneous_leg_wall_clock_seconds" => required(
+            execution_resource, "homogeneous_leg_wall_clock_seconds"
+        ),
     )
     if mechanism != "horizon-admittance"
         support = required(document, "support")
@@ -526,16 +677,17 @@ function solve_homogeneous_endpoint(
     )
     algorithm = AutoVern9(Rosenbrock23(autodiff=false))
     observation_callback, observation = ode_observation_factory(
-        ode_leg, (start_rho, stop_rho), algorithm
+        request, ode_leg, (start_rho, stop_rho), algorithm
     )
     solve_arguments = observation_callback === nothing ?
         NamedTuple() : (; callback=observation_callback)
+    ode_maxiters = parse_integer(request, "homogeneous_ode_maxiters")
     solution = solve(
         problem,
         algorithm;
         reltol=parse_real(T, request, "ode_relative_tolerance"),
         abstol=parse_real(T, request, "ode_absolute_tolerance"),
-        maxiters=Inf,
+        maxiters=ode_maxiters,
         tstops=[stop_rho],
         save_everystep=false,
         save_start=false,
@@ -750,6 +902,8 @@ function branch_values(
     sign_positive = CF.determine_sign(omega)
     dtype = Complex{T}
     radius_from_rho = progress_operation("r-from-rho") do
+        observation_factory = (leg, tspan, algorithm) ->
+            ode_observation_factory(request, leg, tspan, algorithm)
         CF.solve_r_from_rho(
             a, beta_negative, beta_positive, rs_match, rho_in, rho_out;
             sign_neg=sign_negative,
@@ -757,7 +911,8 @@ function branch_values(
             dtype=dtype,
             reltol=relative_tolerance,
             abstol=absolute_tolerance,
-            ode_observation_factory=ode_observation_factory,
+            ode_maxiters=parse_integer(request, "homogeneous_ode_maxiters"),
+            ode_observation_factory=observation_factory,
             ode_solution_observer=observe_ode_solution,
         )
     end
@@ -923,17 +1078,18 @@ function solve_radial_endpoint(
     )
     algorithm = AutoVern9(Rosenbrock23(autodiff=false))
     observation_callback, observation = ode_observation_factory(
-        ode_leg, (start_radius, stop_radius), algorithm
+        request, ode_leg, (start_radius, stop_radius), algorithm
     )
     solve_arguments = observation_callback === nothing ?
         NamedTuple() : (; callback=observation_callback)
+    ode_maxiters = parse_integer(request, "homogeneous_ode_maxiters")
     solution = solve(
         problem,
         algorithm;
         reltol=parse_real(T, request, "ode_relative_tolerance"),
         abstol=parse_real(T, request, "ode_absolute_tolerance"),
         dtmax=dtmax,
-        maxiters=10^7,
+        maxiters=ode_maxiters,
         tstops=[stop_radius],
         save_everystep=false,
         save_start=false,
@@ -1065,8 +1221,13 @@ function determinant_progress(
     purpose::String, current::Complex{T},
 ) where {T<:AbstractFloat}
     started = time_ns()
+    DETERMINANT_INDEX_REQUEST[] += 1
+    DETERMINANT_INDEX_PHASE[] += 1
+    LAST_DETERMINANT_PURPOSE[] = purpose
     context = Dict{String,Any}(
         "determinant_purpose" => purpose,
+        "determinant_index" => DETERMINANT_INDEX_REQUEST[],
+        "determinant_index_phase" => DETERMINANT_INDEX_PHASE[],
         "current_omega" => progress_complex(current),
         "candidate_omega" => progress_complex(omega),
     )
@@ -1076,16 +1237,58 @@ function determinant_progress(
             "omega" => progress_complex(omega),
         ))
         value = determinant(T, request, omega, amplitude)
+        elapsed_seconds = (time_ns() - started) / 1.0e9
+        LAST_DETERMINANT_SECONDS[] = elapsed_seconds
         progress_emit("determinant_completed"; context=context, payload=Dict(
             "purpose" => purpose,
             "omega" => progress_complex(omega),
             "determinant_real" => string(real(value)),
             "determinant_imag" => string(imag(value)),
             "determinant_abs" => string(abs(value)),
-            "elapsed_seconds" => (time_ns() - started) / 1.0e9,
+            "elapsed_seconds" => elapsed_seconds,
         ))
         return value
     end
+end
+
+function enforce_root_readout_feasibility(request)
+    measured_seconds = LAST_DETERMINANT_SECONDS[]
+    minimum_remaining_determinant_count = 8
+    request_elapsed_seconds = (time_ns() - REQUEST_STARTED_NS[]) / 1.0e9
+    remaining_wall_time_seconds = max(
+        0.0,
+        parse_integer(request, "cooperative_request_deadline_seconds") -
+            request_elapsed_seconds,
+    )
+    estimated_mandatory_seconds =
+        measured_seconds * minimum_remaining_determinant_count
+    estimated_mandatory_seconds < remaining_wall_time_seconds && return
+    estimator = "first-determinant-linear-lower-bound/v1"
+    details = merge(control_failure_context(request), Dict{String,Any}(
+        "failure_code" => "ROOT_READOUT_RESOURCE_INFEASIBLE",
+        "failure_class" => "CONTROL",
+        "limiting_resource" => "cooperative_request_deadline",
+        "measured_determinant_seconds" => measured_seconds,
+        "minimum_remaining_determinant_count" => 8,
+        "remaining_wall_time_seconds" => remaining_wall_time_seconds,
+        "estimated_mandatory_seconds" => estimated_mandatory_seconds,
+        "estimator" => "first-determinant-linear-lower-bound/v1",
+    ))
+    progress_emit("root_readout_resource_infeasible"; payload=Dict{String,Any}(
+        "failure_code" => "ROOT_READOUT_RESOURCE_INFEASIBLE",
+        "failure_class" => "CONTROL",
+        "limiting_resource" => "cooperative_request_deadline",
+        "measured_determinant_seconds" => measured_seconds,
+        "minimum_remaining_determinant_count" => minimum_remaining_determinant_count,
+        "remaining_wall_time_seconds" => remaining_wall_time_seconds,
+        "estimated_mandatory_seconds" => estimated_mandatory_seconds,
+        "estimator" => estimator,
+        "execution_resource_policy" => resource_policy_identity(request),
+    ))
+    throw(RootReadoutResourceLimit(
+        "mandatory determinant work cannot fit before the cooperative deadline",
+        details,
+    ))
 end
 
 function bounded_newton(::Type{T}, request, initial::Complex{T}, amplitude::Complex{T}) where {T<:AbstractFloat}
@@ -1094,9 +1297,11 @@ function bounded_newton(::Type{T}, request, initial::Complex{T}, amplitude::Comp
     maximum_iterations = parse_integer(request, "max_newton_iterations")
     value = initial
     best_value = value
+    ACTIVE_NEWTON_INDEX[] = 1
     initial_determinant = determinant_progress(
         T, request, value, amplitude, "initial best", value
     )
+    enforce_root_readout_feasibility(request)
     best_residual = abs(initial_determinant)
     # The first iteration evaluates the determinant at the initial frequency,
     # which is exactly the value just computed above.  The determinant is a
@@ -1107,6 +1312,7 @@ function bounded_newton(::Type{T}, request, initial::Complex{T}, amplitude::Comp
     carried_residual = initial_determinant
     carried_available = true
     for iteration in 1:maximum_iterations
+        ACTIVE_NEWTON_INDEX[] = iteration
         iteration_started = time_ns()
         residual = if carried_available && carried_value == value
             carried_available = false
@@ -1325,6 +1531,11 @@ function solve_phase(
     fallback_reason=nothing,
 ) where {T<:AbstractFloat}
     started = time_ns()
+    ACTIVE_PHASE[] = phase
+    ACTIVE_PHASE_STARTED_NS[] = started
+    ACTIVE_NEWTON_INDEX[] = 0
+    DETERMINANT_INDEX_PHASE[] = 0
+    LAST_DETERMINANT_PURPOSE[] = nothing
     context = Dict{String,Any}(
         "phase" => phase,
         "seed_omega" => progress_complex(initial),
@@ -1368,6 +1579,7 @@ function solve_phase(
         catch failure
             failure isa InterruptException && rethrow()
             failure isa ODEControlFailure && rethrow()
+            failure isa WorkerControlFailure && rethrow()
             fallback_initial === nothing && rethrow()
             fallback_reason = "PREDICTOR_SOLVE_ERROR"
             fallback_error_type = string(typeof(failure))
@@ -1482,6 +1694,32 @@ function result_fields(::Type{T}, request, digits::Int, bits::Int) where {T<:Abs
             fallback_used=primary_fallback_used,
             fallback_reason=primary_fallback_reason,
         )
+    branch_tolerance = parse_real(T, request, "branch_enclosure_radius_abs")
+    if !primary_converged
+        branch_valid = abs(root - omega) <= branch_tolerance
+        return [
+            "schema_version" => 1,
+            "status" => "ok",
+            "adapter" => "package-owned-julia-gsn-root-readout",
+            "request_sha256" => string(required(request, "request_sha256")),
+            "precision_digits" => digits,
+            "working_precision_bits" => bits,
+            "root_omega_re" => numeric_text(real(root)),
+            "root_omega_im" => numeric_text(imag(root)),
+            "root_residual_abs" => numeric_text(residual),
+            "root_derivative_abs" => numeric_text(derivative_abs),
+            "root_converged" => false,
+            "branch_authentication_contract_version" => 3,
+            "root_branch_continuation_valid" => branch_valid,
+            "branch_tolerance_abs" => numeric_text(branch_tolerance),
+            "root_displacement_abs" => numeric_text(abs(root - omega)),
+            "truncation_radius_abs" => nothing,
+            "resolution_radius_abs" => nothing,
+            "seed_path_radius_abs" => nothing,
+            "diagnostic_roots" => Dict{String,Any}(),
+            "diagnostics_skipped_reason" => "PRIMARY_NOT_CONVERGED",
+        ]
+    end
     truncation_root, truncation_residual, truncation_derivative, truncation_converged = solve_phase(
         T, refined_request(T, request, :truncation), "TRUNCATION", root, amplitude;
         seed_kind="ACCEPTED_PRIMARY",
@@ -1497,7 +1735,6 @@ function result_fields(::Type{T}, request, digits::Int, bits::Int) where {T<:Abs
             T, request, "SEED-PATH", alternate, amplitude;
             seed_kind="INDEPENDENT_SEED_PATH",
         )
-    branch_tolerance = parse_real(T, request, "branch_enclosure_radius_abs")
     branch_valid = abs(root - omega) <= branch_tolerance && all(
         abs(candidate - root) <= branch_tolerance
         for candidate in (truncation_root, resolution_root, seed_path_root)
@@ -1552,6 +1789,7 @@ function result_fields(::Type{T}, request, digits::Int, bits::Int) where {T<:Abs
                 "root_converged" => seed_path_converged,
             ),
         ),
+        "diagnostics_skipped_reason" => nothing,
     ]
 end
 
@@ -1564,6 +1802,26 @@ function evaluate_request(request)
     bits = ceil(Int, digits * log2(10)) + 32
     parse_integer(request, "working_precision_bits") == bits ||
         error("working precision bits do not match decimal precision policy")
+    string(required(request, "resource_policy_schema")) ==
+        "windows-solver.execution-resource-policy/1" ||
+        error("execution resource policy schema is invalid")
+    parse_integer(request, "resource_policy_version") == 1 ||
+        error("execution resource policy version is invalid")
+    length(string(required(request, "resource_policy_sha256"))) == 64 ||
+        error("execution resource policy SHA-256 is invalid")
+    for key in (
+        "worker_request_wall_clock_seconds",
+        "cooperative_request_deadline_seconds",
+        "homogeneous_ode_maxiters",
+        "max_accepted_steps_per_homogeneous_leg",
+        "max_rhs_evaluations_per_homogeneous_leg",
+    )
+        parse_integer(request, key) > 0 ||
+            error("execution resource policy $(key) is invalid")
+    end
+    parse_integer(request, "cooperative_request_deadline_seconds") <
+        parse_integer(request, "worker_request_wall_clock_seconds") ||
+        error("cooperative deadline must precede the outer worker deadline")
     return setprecision(BigFloat, bits) do
         result_fields(BigFloat, request, digits, bits)
     end
@@ -1577,14 +1835,25 @@ function main()
     length(ARGS) == 2 || error("usage: m02_worker.jl REQUEST_JSON RESPONSE_JSON")
     request_path = abspath(ARGS[1])
     response_path = abspath(ARGS[2])
+    REQUEST_STARTED_NS[] = time_ns()
+    ACTIVE_PHASE_STARTED_NS[] = UInt64(0)
+    ACTIVE_PHASE[] = nothing
+    ACTIVE_NEWTON_INDEX[] = 0
+    DETERMINANT_INDEX_REQUEST[] = 0
+    DETERMINANT_INDEX_PHASE[] = 0
+    LAST_DETERMINANT_PURPOSE[] = nothing
+    LAST_DETERMINANT_SECONDS[] = 0.0
+    LAST_ODE_SNAPSHOT[] = nothing
     document = JSON.parsefile(request_path)
     request = flatten_request(document)
     try
         progress_emit("request_started"; payload=Dict(
             "request_sha256" => string(required(request, "request_sha256")),
+            "execution_resource_policy" => resource_policy_identity(request),
         ))
         progress_emit("request_validated"; payload=Dict(
             "request_sha256" => string(required(request, "request_sha256")),
+            "execution_resource_policy" => resource_policy_identity(request),
         ))
         result = Dict(evaluate_request(request))
         mkpath(dirname(response_path))
@@ -1594,7 +1863,7 @@ function main()
         ))
         return 0
     catch failure
-        result = if failure isa ODEControlFailure
+        result = if failure isa WorkerControlFailure
             Dict(
                 "schema_version" => 1,
                 "status" => "error",
@@ -1616,7 +1885,7 @@ function main()
             "error_type" => string(typeof(failure)),
             "message" => sprint(showerror, failure),
         )
-        if failure isa ODEControlFailure
+        if failure isa WorkerControlFailure
             request_failure["failure"] = failure_details(failure)
         end
         progress_emit("request_failed"; payload=request_failure)

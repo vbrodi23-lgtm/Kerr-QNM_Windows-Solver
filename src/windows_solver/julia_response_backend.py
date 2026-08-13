@@ -33,7 +33,13 @@ from .response_engine import (
     _exterior_support,
     mode_specific_branch_enclosure_radius,
 )
-from .progress import ProgressEventKind, emit_progress, ingest_external_progress
+from .progress import (
+    PROGRESS_SCHEMA,
+    ProgressEventKind,
+    current_progress_context,
+    emit_progress,
+    ingest_external_progress,
+)
 from .root_readout_cache import (
     ROOT_READOUT_STORE_DIRECTORY_NAME,
     RootReadoutLookupStatus,
@@ -58,6 +64,15 @@ _WINDOWS_JOB_BOOTSTRAP = (
     "token=sys.stdin.read(1); "
     "sys.exit(125 if token != 'G' else subprocess.run(sys.argv[1:]).returncode)"
 )
+_EXECUTION_RESOURCE_SCHEMA = "windows-solver.execution-resource-policy/1"
+_EXECUTION_RESOURCE_VERSION = 1
+_DEFAULT_REQUEST_TIMEOUT_SECONDS = 7200
+_DEFAULT_COOPERATIVE_MARGIN_SECONDS = 120
+_DEFAULT_HOMOGENEOUS_ODE_MAXITERS = 10_000_000
+_DEFAULT_HOMOGENEOUS_MAX_ACCEPTED_STEPS = 1_000_000
+_DEFAULT_HOMOGENEOUS_MAX_RHS_EVALUATIONS = 2_000_000
+
+
 def _mode_specific_branch_enclosure_radius(
     job: ResponseComponentJob,
 ) -> float:
@@ -78,6 +93,143 @@ class JuliaWorkerTimeoutError(JuliaResponseBackendError):
 
 class JuliaODEResourceLimitError(JuliaResponseBackendError):
     """The Julia worker reported an existing ODE solver resource limit."""
+
+
+class JuliaRootReadoutResourceLimitError(JuliaResponseBackendError):
+    """The Julia worker proved mandatory root-readout work cannot fit."""
+
+
+def _positive_environment_integer(name: str, default: int) -> int:
+    raw = os.environ.get(name, str(default))
+    try:
+        value = int(raw)
+    except ValueError as error:
+        raise JuliaResponseBackendError(f"{name} must be an integer") from error
+    if value < 1:
+        raise JuliaResponseBackendError(f"{name} must be positive")
+    return value
+
+
+def _optional_positive_environment_integer(name: str) -> int | None:
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip() or raw.strip() == "0":
+        return None
+    try:
+        value = int(raw)
+    except ValueError as error:
+        raise JuliaResponseBackendError(
+            f"{name} must be an integer or zero"
+        ) from error
+    if value < 1:
+        raise JuliaResponseBackendError(f"{name} must be positive or zero")
+    return value
+
+
+def _execution_resource_policy() -> dict[str, object]:
+    """Build one versioned operational policy, separate from scientific identity."""
+
+    timeout = _positive_environment_integer(
+        "KERR_QNM_JULIA_REQUEST_TIMEOUT_SECONDS",
+        _DEFAULT_REQUEST_TIMEOUT_SECONDS,
+    )
+    if timeout < 60:
+        raise JuliaResponseBackendError(
+            "KERR_QNM_JULIA_REQUEST_TIMEOUT_SECONDS must be at least 60"
+        )
+    default_margin = min(
+        _DEFAULT_COOPERATIVE_MARGIN_SECONDS,
+        max(1, timeout // 20),
+    )
+    margin = _positive_environment_integer(
+        "KERR_QNM_JULIA_COOPERATIVE_DEADLINE_MARGIN_SECONDS",
+        default_margin,
+    )
+    if margin >= timeout:
+        raise JuliaResponseBackendError(
+            "KERR_QNM_JULIA_COOPERATIVE_DEADLINE_MARGIN_SECONDS must be "
+            "smaller than the request timeout"
+        )
+    material: dict[str, object] = {
+        "schema": _EXECUTION_RESOURCE_SCHEMA,
+        "version": _EXECUTION_RESOURCE_VERSION,
+        "worker_request_wall_clock_seconds": timeout,
+        "cooperative_request_deadline_seconds": timeout - margin,
+        "homogeneous_ode_maxiters": _positive_environment_integer(
+            "KERR_QNM_JULIA_HOMOGENEOUS_ODE_MAXITERS",
+            _DEFAULT_HOMOGENEOUS_ODE_MAXITERS,
+        ),
+        "max_accepted_steps_per_homogeneous_leg": _positive_environment_integer(
+            "KERR_QNM_JULIA_ODE_MAX_ACCEPTED_STEPS",
+            _DEFAULT_HOMOGENEOUS_MAX_ACCEPTED_STEPS,
+        ),
+        "max_rhs_evaluations_per_homogeneous_leg": _positive_environment_integer(
+            "KERR_QNM_JULIA_ODE_MAX_RHS_EVALUATIONS",
+            _DEFAULT_HOMOGENEOUS_MAX_RHS_EVALUATIONS,
+        ),
+        "homogeneous_leg_wall_clock_seconds": (
+            _optional_positive_environment_integer(
+                "KERR_QNM_JULIA_HOMOGENEOUS_LEG_TIMEOUT_SECONDS"
+            )
+        ),
+    }
+    return {
+        **material,
+        "sha256": hashlib.sha256(canonical_json_bytes(material)).hexdigest(),
+    }
+
+
+def _validated_execution_resource_policy(value: object) -> dict[str, object]:
+    expected = {
+        "schema",
+        "version",
+        "worker_request_wall_clock_seconds",
+        "cooperative_request_deadline_seconds",
+        "homogeneous_ode_maxiters",
+        "max_accepted_steps_per_homogeneous_leg",
+        "max_rhs_evaluations_per_homogeneous_leg",
+        "homogeneous_leg_wall_clock_seconds",
+        "sha256",
+    }
+    if not isinstance(value, Mapping) or set(value) != expected:
+        raise JuliaResponseBackendError("execution-resource policy fields are invalid")
+    copied = dict(value)
+    if (
+        copied["schema"] != _EXECUTION_RESOURCE_SCHEMA
+        or copied["version"] != _EXECUTION_RESOURCE_VERSION
+    ):
+        raise JuliaResponseBackendError("execution-resource policy version is invalid")
+    for name in (
+        "worker_request_wall_clock_seconds",
+        "cooperative_request_deadline_seconds",
+        "homogeneous_ode_maxiters",
+        "max_accepted_steps_per_homogeneous_leg",
+        "max_rhs_evaluations_per_homogeneous_leg",
+    ):
+        item = copied[name]
+        if isinstance(item, bool) or not isinstance(item, int) or item < 1:
+            raise JuliaResponseBackendError(
+                f"execution-resource policy {name} is invalid"
+            )
+    leg_timeout = copied["homogeneous_leg_wall_clock_seconds"]
+    if leg_timeout is not None and (
+        isinstance(leg_timeout, bool)
+        or not isinstance(leg_timeout, int)
+        or leg_timeout < 1
+    ):
+        raise JuliaResponseBackendError(
+            "execution-resource policy homogeneous leg timeout is invalid"
+        )
+    if (
+        copied["worker_request_wall_clock_seconds"] < 60
+        or copied["cooperative_request_deadline_seconds"]
+        >= copied["worker_request_wall_clock_seconds"]
+    ):
+        raise JuliaResponseBackendError("execution-resource deadlines are invalid")
+    material = {key: item for key, item in copied.items() if key != "sha256"}
+    expected_sha = hashlib.sha256(canonical_json_bytes(material)).hexdigest()
+    if copied["sha256"] != expected_sha:
+        raise JuliaResponseBackendError("execution-resource policy digest is invalid")
+    return copied
 
 
 class _WindowsKillOnCloseJob:
@@ -231,7 +383,11 @@ def promoted_precision_numerical_controls() -> dict[str, object]:
     }
 
 
-def _forward_julia_progress_line(line: str) -> bool:
+def _forward_julia_progress_line(
+    line: str,
+    *,
+    capture: list[dict[str, object]] | None = None,
+) -> bool:
     """Forward one reserved worker event; return whether the line was reserved."""
 
     if not line.startswith(JULIA_PROGRESS_PREFIX):
@@ -239,6 +395,9 @@ def _forward_julia_progress_line(line: str) -> bool:
     try:
         value = json.loads(line[len(JULIA_PROGRESS_PREFIX):])
         ingest_external_progress(value)
+        if capture is not None:
+            assert isinstance(value, dict)
+            capture[:] = [value]
     except Exception as error:
         emit_progress(
             ProgressEventKind.ERROR,
@@ -329,6 +488,7 @@ def _run_streamed_julia(
     stderr_lines: list[str] = []
     progress_lines: Queue[str | None] = Queue()
     stderr_done = Event()
+    last_progress_event: list[dict[str, object]] = []
 
     def read_stdout() -> None:
         assert process.stdout is not None
@@ -398,7 +558,10 @@ def _run_streamed_julia(
             if line is None:
                 stdout_done = True
             elif line:
-                _forward_julia_progress_line(line)
+                _forward_julia_progress_line(
+                    line,
+                    capture=last_progress_event,
+                )
             if returncode is None:
                 returncode = process.poll()
             now = time.monotonic()
@@ -447,6 +610,10 @@ def _run_streamed_julia(
         stdout="".join(stdout_lines)[-4000:],
         stderr="".join(stderr_lines)[-4000:],
         timed_out=timed_out,
+        last_progress_event=(
+            None if not last_progress_event else last_progress_event[0]
+        ),
+        last_progress_event_validated=bool(last_progress_event),
     )
 
 
@@ -667,9 +834,95 @@ def _worker_failure_details(
     return details
 
 
+def _execution_resource_identity(
+    policy: Mapping[str, object],
+) -> dict[str, object]:
+    return {
+        "schema": policy["schema"],
+        "version": policy["version"],
+        "sha256": policy["sha256"],
+    }
+
+
+def _worker_resource_identity_matches(
+    value: object,
+    execution_resource: Mapping[str, object],
+) -> bool:
+    if not isinstance(value, Mapping):
+        return False
+    identity = _execution_resource_identity(execution_resource)
+    if set(value) == set(identity):
+        return dict(value) == identity
+    if set(value) == set(execution_resource):
+        try:
+            validated = _validated_execution_resource_policy(value)
+        except JuliaResponseBackendError:
+            return False
+        return validated == dict(execution_resource)
+    return False
+
+
+def _require_worker_resource_identity(
+    details: Mapping[str, object],
+    execution_resource: Mapping[str, object],
+) -> None:
+    """Fail closed if a CONTROL receipt is not bound to this request policy."""
+
+    structured = details.get("failure")
+    if not isinstance(structured, Mapping) or structured.get(
+        "failure_class"
+    ) != "CONTROL":
+        return
+    if _worker_resource_identity_matches(
+        structured.get("execution_resource_policy"),
+        execution_resource,
+    ):
+        return
+    message = "M02 Julia worker execution-resource policy identity mismatch"
+    fatal_details = {
+        name: details.get(name) for name in _WORKER_FAILURE_BASE_FIELDS
+    }
+    fatal_details["worker_error_type"] = "ExecutionResourcePolicyIdentityError"
+    fatal_details["worker_error_message"] = message
+    failure = JuliaResponseBackendError(message)
+    failure.worker_failure = fatal_details
+    raise failure
+
+
 def _raise_worker_failure(details: Mapping[str, object]) -> None:
     """Raise an operational error while retaining bounded worker diagnostics."""
 
+    details = dict(details)
+    structured = details.get("failure")
+    if isinstance(structured, Mapping):
+        enriched = dict(structured)
+        context = current_progress_context()
+        for receipt_name, context_name in (
+            ("readout_index", "readout_index"),
+            ("readout_role", "readout_role"),
+            ("root_phase", "phase"),
+            ("newton_index", "newton_index"),
+            ("determinant_index", "determinant_index_leaf"),
+            ("phase_determinant_index", "determinant_index_phase"),
+            ("determinant_purpose", "determinant_purpose"),
+        ):
+            value = context.get(context_name)
+            if receipt_name not in enriched and value is not None:
+                enriched[receipt_name] = value
+        if enriched.get("root_phase") == "PRIMARY":
+            code = enriched.get("failure_code")
+            if code == "WORKER_TIMEOUT":
+                enriched.setdefault(
+                    "diagnostics_skipped_reason", "PRIMARY_TIMEOUT"
+                )
+            elif code in {
+                "ODE_RESOURCE_LIMIT",
+                "ROOT_READOUT_RESOURCE_INFEASIBLE",
+            }:
+                enriched.setdefault(
+                    "diagnostics_skipped_reason", "PRIMARY_RESOURCE_LIMIT"
+                )
+        details["failure"] = enriched
     timed_out = details["worker_timed_out"] is True
     exit_code = details["worker_exit_code"]
     prefix = "M02 Julia worker timed out" if timed_out else "M02 Julia worker failed"
@@ -691,11 +944,100 @@ def _raise_worker_failure(details: Mapping[str, object]) -> None:
         and structured.get("failure_class") == "CONTROL"
     ):
         error_class = JuliaODEResourceLimitError
+    elif (
+        isinstance(structured, Mapping)
+        and structured.get("failure_code")
+        == "ROOT_READOUT_RESOURCE_INFEASIBLE"
+        and structured.get("failure_class") == "CONTROL"
+    ):
+        error_class = JuliaRootReadoutResourceLimitError
     else:
         error_class = JuliaResponseBackendError
     failure = error_class(message)
     failure.worker_failure = dict(details)
     raise failure
+
+
+def _timeout_worker_failure_details(
+    details: Mapping[str, object],
+    request: Mapping[str, object],
+    execution_resource: Mapping[str, object],
+    last_progress_event: object = None,
+) -> dict[str, object]:
+    """Attach a bounded control receipt to a forced outer worker timeout."""
+
+    output = dict(details)
+    failure: dict[str, object] = {
+        "failure_code": "WORKER_TIMEOUT",
+        "failure_class": "CONTROL",
+        "retryable": True,
+        "precision_digits": request.get("precision_digits"),
+        "elapsed_request_seconds": execution_resource[
+            "worker_request_wall_clock_seconds"
+        ],
+        "limiting_resource": "worker_request_wall_clock",
+        "execution_resource_policy": dict(execution_resource),
+    }
+    failure.update(_timeout_progress_failure_fields(last_progress_event))
+    output["failure"] = failure
+    return output
+
+
+def _timeout_progress_failure_fields(value: object) -> dict[str, object]:
+    """Project the last already-validated worker event into timeout evidence."""
+
+    if not isinstance(value, Mapping) or set(value) != {
+        "schema",
+        "kind",
+        "context",
+        "payload",
+    }:
+        return {}
+    if value.get("schema") != PROGRESS_SCHEMA:
+        return {}
+    try:
+        ProgressEventKind(value.get("kind"))
+        copied = _copy_failure_value(value)
+    except (TypeError, ValueError):
+        return {}
+    if not isinstance(copied, Mapping):
+        return {}
+    context = copied.get("context")
+    payload = copied.get("payload")
+    if not isinstance(context, Mapping) or not isinstance(payload, Mapping):
+        return {}
+    fields: dict[str, object] = {"last_progress_kind": copied["kind"]}
+    for receipt_name, context_names in (
+        ("readout_index", ("readout_index",)),
+        ("readout_role", ("readout_role",)),
+        ("root_phase", ("phase",)),
+        ("newton_index", ("newton_index",)),
+        ("determinant_index", ("determinant_index_leaf", "determinant_index")),
+        ("phase_determinant_index", ("determinant_index_phase",)),
+        ("determinant_purpose", ("determinant_purpose",)),
+    ):
+        for context_name in context_names:
+            item = context.get(context_name)
+            if item is not None:
+                fields[receipt_name] = item
+                break
+    request_elapsed = payload.get("request_elapsed_seconds")
+    if request_elapsed is not None:
+        fields["elapsed_request_seconds"] = request_elapsed
+    ode_kinds = {
+        ProgressEventKind.ODE_SOLVE_STARTED.value,
+        ProgressEventKind.ODE_SOLVE_PROGRESS.value,
+        ProgressEventKind.ODE_SOLVE_COMPLETED.value,
+        ProgressEventKind.ODE_SOLVE_FAILED.value,
+        ProgressEventKind.ODE_RESOURCE_LIMIT.value,
+    }
+    if copied["kind"] in ode_kinds:
+        fields["ode_snapshot"] = dict(payload)
+        if payload.get("ode_leg") is not None:
+            fields["ode_leg"] = payload["ode_leg"]
+        if payload.get("elapsed_seconds") is not None:
+            fields["elapsed_leg_seconds"] = payload["elapsed_seconds"]
+    return fields
 
 
 def _finite_text(value: object, label: str) -> float:
@@ -916,23 +1258,22 @@ class JuliaResponseAdapter:
         )
 
     def evaluate(self, request: Mapping[str, object]) -> dict[str, object]:
-        request_sha256 = hashlib.sha256(canonical_json_bytes(request)).hexdigest()
+        request_document = dict(request)
+        execution_resource = _validated_execution_resource_policy(
+            request_document["execution_resource"]
+            if "execution_resource" in request_document
+            else _execution_resource_policy()
+        )
+        request_document["execution_resource"] = execution_resource
+        request_sha256 = hashlib.sha256(
+            canonical_json_bytes(request_document)
+        ).hexdigest()
         reused = self._reuse_readout(request_sha256)
         if reused is not None:
             return reused
-        document = dict(request)
+        document = dict(request_document)
         document["request_sha256"] = request_sha256
-        timeout_text = os.environ.get("KERR_QNM_JULIA_REQUEST_TIMEOUT_SECONDS", "7200")
-        try:
-            timeout = int(timeout_text)
-        except ValueError as error:
-            raise JuliaResponseBackendError(
-                "KERR_QNM_JULIA_REQUEST_TIMEOUT_SECONDS must be an integer"
-            ) from error
-        if timeout < 60:
-            raise JuliaResponseBackendError(
-                "KERR_QNM_JULIA_REQUEST_TIMEOUT_SECONDS must be at least 60"
-            )
+        timeout = int(execution_resource["worker_request_wall_clock_seconds"])
         with tempfile.TemporaryDirectory(prefix="m02-julia-readout-") as temporary:
             directory = Path(temporary)
             request_path = directory / "request.json"
@@ -971,23 +1312,47 @@ class JuliaResponseAdapter:
                     stderr = _bounded_text(error.stderr, 4000)
                     if stderr is None:
                         stderr = _bounded_text(error.output, 4000) or ""
-                    _raise_worker_failure({
-                        "worker_exit_code": None,
-                        "worker_timed_out": True,
-                        "worker_stderr_tail": stderr,
-                        "worker_error_type": None,
-                        "worker_error_message": None,
-                    })
+                    _raise_worker_failure(_timeout_worker_failure_details(
+                        {
+                            "worker_exit_code": None,
+                            "worker_timed_out": True,
+                            "worker_stderr_tail": stderr,
+                            "worker_error_type": None,
+                            "worker_error_message": None,
+                        },
+                        document,
+                        execution_resource,
+                    ))
             returncode = getattr(completed, "returncode", None)
             if bool(getattr(completed, "timed_out", False)) or returncode != 0:
-                _raise_worker_failure(_worker_failure_details(
-                    completed, response_path
-                ))
+                details = _worker_failure_details(completed, response_path)
+                if bool(getattr(completed, "timed_out", False)):
+                    last_progress_event = (
+                        getattr(completed, "last_progress_event", None)
+                        if bool(
+                            getattr(
+                                completed,
+                                "last_progress_event_validated",
+                                False,
+                            )
+                        )
+                        else None
+                    )
+                    details = _timeout_worker_failure_details(
+                        details,
+                        document,
+                        execution_resource,
+                        last_progress_event,
+                    )
+                _require_worker_resource_identity(details, execution_resource)
+                _raise_worker_failure(details)
             response = _strict_json_file(response_path, "M02 Julia response")
         if response.get("status") != "ok":
-            _raise_worker_failure(_worker_failure_details(
+            details = _worker_failure_details(
                 completed, response_path, response=response
-            ))
+            )
+            _require_worker_resource_identity(details, execution_resource)
+            _raise_worker_failure(details)
         if response.get("request_sha256") != request_sha256:
             raise JuliaResponseBackendError("M02 Julia response request digest mismatch")
         self._retain_readout(request_sha256, response)
@@ -1073,6 +1438,7 @@ class JuliaPrecisionRootBackend:
             "precision_digits": self.digits,
             "working_precision_bits": math.ceil(self.digits * math.log2(10)) + 32,
             "policy": _precision_policy(job, self.digits, self.refinement),
+            "execution_resource": _execution_resource_policy(),
         }
         if primary_predictor is not None:
             predictor = complex(primary_predictor)
@@ -1158,7 +1524,10 @@ class JuliaPrecisionRootBackend:
             "seed_path_radius_abs",
             "diagnostic_roots",
         }
-        if set(response) != expected_fields:
+        if set(response) not in {
+            frozenset(expected_fields),
+            frozenset(expected_fields | {"diagnostics_skipped_reason"}),
+        }:
             raise JuliaResponseBackendError("M02 Julia response fields are invalid")
         if (
             response["schema_version"] != 1
@@ -1176,6 +1545,29 @@ class JuliaPrecisionRootBackend:
         ):
             raise JuliaResponseBackendError("M02 Julia response contract is invalid")
         converged = response["root_converged"]
+        diagnostics_skipped_reason = response.get("diagnostics_skipped_reason")
+        diagnostics_skipped = diagnostics_skipped_reason == "PRIMARY_NOT_CONVERGED"
+        if diagnostics_skipped_reason not in {None, "PRIMARY_NOT_CONVERGED"}:
+            raise JuliaResponseBackendError(
+                "M02 Julia diagnostic skip reason is invalid"
+            )
+        raw_diagnostics = response["diagnostic_roots"]
+        if diagnostics_skipped and (
+            converged
+            or any(
+                response[name] is not None
+                for name in (
+                    "truncation_radius_abs",
+                    "resolution_radius_abs",
+                    "seed_path_radius_abs",
+                )
+            )
+            or not isinstance(raw_diagnostics, Mapping)
+            or bool(raw_diagnostics)
+        ):
+            raise JuliaResponseBackendError(
+                "M02 Julia diagnostic skip evidence is inconsistent"
+            )
         branch_continuation_valid = response[
             "root_branch_continuation_valid"
         ]
@@ -1203,23 +1595,27 @@ class JuliaPrecisionRootBackend:
             "root_displacement_abs",
             nonnegative=True,
         )
-        diagnostic_radii_decimal = {
-            "truncation": _finite_decimal_text(
-                response["truncation_radius_abs"],
-                "truncation_radius_abs",
-                nonnegative=True,
-            ),
-            "resolution": _finite_decimal_text(
-                response["resolution_radius_abs"],
-                "resolution_radius_abs",
-                nonnegative=True,
-            ),
-            "seed-path": _finite_decimal_text(
-                response["seed_path_radius_abs"],
-                "seed_path_radius_abs",
-                nonnegative=True,
-            ),
-        }
+        diagnostic_radii_decimal = (
+            {}
+            if diagnostics_skipped
+            else {
+                "truncation": _finite_decimal_text(
+                    response["truncation_radius_abs"],
+                    "truncation_radius_abs",
+                    nonnegative=True,
+                ),
+                "resolution": _finite_decimal_text(
+                    response["resolution_radius_abs"],
+                    "resolution_radius_abs",
+                    nonnegative=True,
+                ),
+                "seed-path": _finite_decimal_text(
+                    response["seed_path_radius_abs"],
+                    "seed_path_radius_abs",
+                    nonnegative=True,
+                ),
+            }
+        )
         with localcontext() as context:
             context.prec = self.digits + 64
             delta_real = root_real_decimal - Decimal(
@@ -1242,10 +1638,10 @@ class JuliaPrecisionRootBackend:
                 or branch_continuation_valid
                 != (
                     derived_displacement <= branch_tolerance_decimal
-                    and all(
+                    and (diagnostics_skipped or all(
                         radius <= branch_tolerance_decimal
                         for radius in diagnostic_radii_decimal.values()
-                    )
+                    ))
                 )
             )
             if inconsistent_branch_evidence:
@@ -1256,22 +1652,36 @@ class JuliaPrecisionRootBackend:
             _finite_text(response["root_omega_re"], "root_omega_re"),
             _finite_text(response["root_omega_im"], "root_omega_im"),
         )
-        truncation_radius = _finite_text(
-            response["truncation_radius_abs"], "truncation_radius_abs"
+        truncation_radius = (
+            None
+            if diagnostics_skipped
+            else _finite_text(
+                response["truncation_radius_abs"], "truncation_radius_abs"
+            )
         )
-        resolution_radius = _finite_text(
-            response["resolution_radius_abs"], "resolution_radius_abs"
+        resolution_radius = (
+            None
+            if diagnostics_skipped
+            else _finite_text(
+                response["resolution_radius_abs"], "resolution_radius_abs"
+            )
         )
-        seed_path_radius = _finite_text(
-            response["seed_path_radius_abs"], "seed_path_radius_abs"
+        seed_path_radius = (
+            None
+            if diagnostics_skipped
+            else _finite_text(
+                response["seed_path_radius_abs"], "seed_path_radius_abs"
+            )
         )
-        raw_diagnostics = response["diagnostic_roots"]
-        if not isinstance(raw_diagnostics, Mapping) or set(raw_diagnostics) != {
-            "truncation", "resolution", "seed-path"
-        }:
+        if not diagnostics_skipped and (
+            not isinstance(raw_diagnostics, Mapping)
+            or set(raw_diagnostics) != {"truncation", "resolution", "seed-path"}
+        ):
             raise JuliaResponseBackendError("M02 Julia diagnostic roots are invalid")
         diagnostics: dict[str, DiagnosticRootReadout] = {}
-        for family in ("truncation", "resolution", "seed-path"):
+        for family in (() if diagnostics_skipped else (
+            "truncation", "resolution", "seed-path"
+        )):
             raw = raw_diagnostics[family]
             if not isinstance(raw, Mapping) or set(raw) != {
                 "root_omega_re",
@@ -1340,7 +1750,8 @@ class JuliaPrecisionRootBackend:
                 truncation_radius=truncation_radius,
                 resolution_radius=resolution_radius,
                 seed_path_radius=seed_path_radius,
-                diagnostic_readouts=diagnostics,
+                diagnostic_readouts=(None if diagnostics_skipped else diagnostics),
+                diagnostics_skipped_reason=diagnostics_skipped_reason,
             )
         except ValueError as error:
             raise JuliaResponseBackendError(

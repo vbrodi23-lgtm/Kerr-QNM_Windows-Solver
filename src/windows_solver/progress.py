@@ -65,6 +65,7 @@ class ProgressEventKind(StrEnum):
     ODE_SOLVE_COMPLETED = "ode_solve_completed"
     ODE_SOLVE_FAILED = "ode_solve_failed"
     ODE_RESOURCE_LIMIT = "ode_resource_limit"
+    ROOT_READOUT_RESOURCE_INFEASIBLE = "root_readout_resource_infeasible"
     ROOT_READOUT_REUSED = "root_readout_reused"
     ROOT_READOUT_RETAINED = "root_readout_retained"
     ROOT_READOUT_CACHE_CORRUPT = "root_readout_cache_corrupt"
@@ -272,7 +273,7 @@ _ODE_TERMINAL_PAYLOAD_FIELDS = frozenset(
     {"ode_retcode", "ode_endpoint_reached"}
 )
 _ODE_FAILURE_PAYLOAD_FIELDS = frozenset(
-    {"failure_code", "failure_class", "limit_kind"}
+    {"failure_code", "failure_class", "limit_kind", "limiting_resource"}
 )
 _ODE_ALLOWED_PAYLOAD_FIELDS = frozenset(
     {
@@ -280,6 +281,8 @@ _ODE_ALLOWED_PAYLOAD_FIELDS = frozenset(
         *_ODE_SNAPSHOT_PAYLOAD_FIELDS,
         *_ODE_TERMINAL_PAYLOAD_FIELDS,
         *_ODE_FAILURE_PAYLOAD_FIELDS,
+        "request_elapsed_seconds",
+        "execution_resource_policy",
     }
 )
 
@@ -331,6 +334,7 @@ def _validate_external_payload(
         "failure_code",
         "failure_class",
         "limit_kind",
+        "limiting_resource",
     ):
         if name in payload and not isinstance(payload[name], str):
             raise ValueError(f"ODE progress {name} must be a string")
@@ -354,12 +358,27 @@ def _validate_external_payload(
             payload[name], str
         ):
             raise ValueError(f"ODE progress {name} must be a string or null")
-    if "elapsed_seconds" in payload:
-        elapsed = payload["elapsed_seconds"]
-        if isinstance(elapsed, bool) or not isinstance(elapsed, (int, float)):
-            raise ValueError("ODE progress elapsed_seconds must be a number")
-        if not math.isfinite(float(elapsed)) or elapsed < 0:
-            raise ValueError("ODE progress elapsed_seconds must be finite and nonnegative")
+    for name in ("elapsed_seconds", "request_elapsed_seconds"):
+        if name in payload:
+            elapsed = payload[name]
+            if isinstance(elapsed, bool) or not isinstance(elapsed, (int, float)):
+                raise ValueError(f"ODE progress {name} must be a number")
+            if not math.isfinite(float(elapsed)) or elapsed < 0:
+                raise ValueError(
+                    f"ODE progress {name} must be finite and nonnegative"
+                )
+    if "execution_resource_policy" in payload:
+        identity = payload["execution_resource_policy"]
+        if (
+            not isinstance(identity, Mapping)
+            or set(identity) != {"schema", "version", "sha256"}
+            or not isinstance(identity["schema"], str)
+            or isinstance(identity["version"], bool)
+            or not isinstance(identity["version"], int)
+            or not isinstance(identity["sha256"], str)
+            or len(identity["sha256"]) != 64
+        ):
+            raise ValueError("ODE progress resource-policy identity is invalid")
     return _mapping_snapshot(payload)
 
 
@@ -432,6 +451,12 @@ def emit_progress(kind: ProgressEventKind, **payload: object) -> ProgressEvent |
     )
     observer.publish(event)
     return event
+
+
+def current_progress_context() -> dict[str, object]:
+    """Return a detached snapshot for an operational failure receipt."""
+
+    return _ACTIVE_CONTEXT.get().to_mapping()
 
 
 def ingest_external_progress(value: object) -> ProgressEvent | None:

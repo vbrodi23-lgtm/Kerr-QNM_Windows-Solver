@@ -49,6 +49,7 @@ function solve_r_from_rho(
     a, beta, rs_mp, rho_end; verbose=true, sign=1,
     dtype=_DEFAULTDATATYPE, odealgo=_DEFAULTSOLVER,
     reltol=_DEFAULTTOLERANCE, abstol=_DEFAULTTOLERANCE,
+    ode_maxiters=10^7,
     ode_observation_factory=nothing, ode_solution_observer=nothing,
     ode_leg="r_from_rho"
 )
@@ -66,7 +67,8 @@ function solve_r_from_rho(
         NamedTuple() : (; callback=observation_callback)
     odesoln = solve(
         odeprob, odealgo;
-        reltol=reltol, abstol=abstol, verbose=verbose, solve_arguments...
+        maxiters=ode_maxiters, reltol=reltol, abstol=abstol,
+        verbose=verbose, solve_arguments...
     )
     _finish_ode_observation(ode_solution_observer, ode_leg, odesoln, observation)
 
@@ -81,6 +83,7 @@ function solve_r_from_rho(
     sign_neg=1, sign_pos=1, verbose=true,
     dtype=_DEFAULTDATATYPE, odealgo=_DEFAULTSOLVER,
     reltol=_DEFAULTTOLERANCE, abstol=_DEFAULTTOLERANCE,
+    ode_maxiters=10^7,
     ode_observation_factory=nothing, ode_solution_observer=nothing
 )
     # Obtain r_from_rho for positive rho
@@ -88,6 +91,7 @@ function solve_r_from_rho(
         a, beta_pos, rs_mp, rho_pos_end; sign=sign_pos,
         dtype=dtype, odealgo=odealgo, verbose=verbose,
         reltol=reltol, abstol=abstol,
+        ode_maxiters=ode_maxiters,
         ode_observation_factory=ode_observation_factory,
         ode_solution_observer=ode_solution_observer,
         ode_leg="r_from_rho_positive"
@@ -98,6 +102,7 @@ function solve_r_from_rho(
         a, beta_neg, rs_mp, rho_neg_end; sign=sign_neg,
         dtype=dtype, odealgo=odealgo, verbose=verbose,
         reltol=reltol, abstol=abstol,
+        ode_maxiters=ode_maxiters,
         ode_observation_factory=ode_observation_factory,
         ode_solution_observer=ode_solution_observer,
         ode_leg="r_from_rho_negative"
@@ -114,7 +119,8 @@ function solve_r_from_rho(
     rho_neg_end, rho_pos_end;
     sign_neg=1, sign_pos=1,
     dtype=_DEFAULTDATATYPE, odealgo=_DEFAULTSOLVER,
-    reltol=_DEFAULTTOLERANCE, abstol=_DEFAULTTOLERANCE
+    reltol=_DEFAULTTOLERANCE, abstol=_DEFAULTTOLERANCE,
+    ode_maxiters=10^7
 )
     # Some helper functions
     p = omega - m*omega_horizon(a)
@@ -123,7 +129,8 @@ function solve_r_from_rho(
         a, beta_neg, beta_pos, rsmp, rho_neg_end, rho_pos_end;
         sign_neg=sign_neg, sign_pos=sign_pos,
         dtype=dtype, odealgo=odealgo,
-        reltol=reltol, abstol=abstol, verbose=false
+        reltol=reltol, abstol=abstol,
+        ode_maxiters=ode_maxiters, verbose=false
     )
 
     function check_potential_behaviors(u)
@@ -215,6 +222,7 @@ function solve_X_in_rho(
     s::Int, m::Int, a, beta, omega, lambda, r_from_rho, sign, rhospan,
     initial_conditions; dtype=_DEFAULTDATATYPE, odealgo=_DEFAULTSOLVER,
     reltol=_DEFAULTTOLERANCE, abstol=_DEFAULTTOLERANCE,
+    ode_maxiters=10^7,
     ode_observation_factory=nothing, ode_solution_observer=nothing,
     ode_leg="X_in_rho"
 )
@@ -228,18 +236,18 @@ function solve_X_in_rho(
         NamedTuple() : (; callback=observation_callback)
     odesoln = solve(
         odeprob, odealgo;
-        maxiters=Inf, reltol=reltol, abstol=abstol, solve_arguments...
+        maxiters=ode_maxiters, reltol=reltol, abstol=abstol, solve_arguments...
     )
     _finish_ode_observation(ode_solution_observer, ode_leg, odesoln, observation)
 
     return odesoln
 end
 
-function solve_Phi_in_rho(s::Int, m::Int, a, beta, omega, lambda, r_from_rho, sign, rhospan, initial_conditions; dtype=_DEFAULTDATATYPE, odealgo=_DEFAULTSOLVER, reltol=_DEFAULTTOLERANCE, abstol=_DEFAULTTOLERANCE)
+function solve_Phi_in_rho(s::Int, m::Int, a, beta, omega, lambda, r_from_rho, sign, rhospan, initial_conditions; dtype=_DEFAULTDATATYPE, odealgo=_DEFAULTSOLVER, reltol=_DEFAULTTOLERANCE, abstol=_DEFAULTTOLERANCE, ode_maxiters=10^7)
     p = (s=s, m=m, a=a, beta=beta, omega=omega, lambda=lambda, sign=sign, r_from_rho=r_from_rho)
 
     odeprob = ODEProblem(GSN_Riccati_eqn, initial_conditions, rhospan, p)
-    odesoln = solve(odeprob, odealgo; maxiters=Inf, reltol=reltol, abstol=abstol)
+    odesoln = solve(odeprob, odealgo; maxiters=ode_maxiters, reltol=reltol, abstol=abstol)
 
     return odesoln
 end
