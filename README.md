@@ -41,11 +41,30 @@ control, and 48 deep leaves. Reduction inputs are value-bound to their
 authenticated checkpoint records, and all 57 payload comparisons are
 value-bound to the sealed reduction. Each produced record carries its complete
 checkpoint root identity; admission reconciles the resulting 48-root campaign
-set against the
-installed catalog before the package seals the spectral provider/request/payload
+set against the installed catalog before the package seals the spectral
+provider/request/payload
 identity. Admission and replay therefore reject catalog or root drift. See [the
 M01 release baseline](docs/release-baseline.md) and [the M02 PowerShell
 handoff](docs/m02-admission-powershell.md).
+
+M02 software work through PR #40 is merged, including the managed Julia/GSN
+runtime, checkpoint and cache contracts, promoted-precision worker, determinant
+repairs, strict convergence serialization, and high-precision ODE
+optimizations. This is not a scientific completion claim. TASK-075 remains open
+only for the missing immutable receipt for the independent Black Hole
+Perturbation Toolkit Mathematica spheroidal validation source. TASK-076 then
+owns native Windows/Ubuntu cold/warm execution proof; TASK-077 owns the complete
+212-leaf campaign; and TASK-078 owns reduction, provider admission, and M02
+closure. PR #30 separately added a fail-closed M03 contract precursor, but no
+M03 field artifact or provider is admitted.
+
+The live delivery authority is [the TaskPlanner board](.tasks/README.md), with
+the active item in [.tasks/IN_PROGRESS.md](.tasks/IN_PROGRESS.md), the next
+dependency-ready item in [.tasks/NEXT.md](.tasks/NEXT.md), and chronological
+evidence in [.tasks/WORK_LOG.md](.tasks/WORK_LOG.md). Dated files under
+`docs/superpowers/` and `docs/keystone/` are historical design/implementation
+records; unchecked boxes there are not a second backlog. See the
+[documentation authority map](docs/README.md).
 
 ## Quick start on Windows
 
@@ -80,10 +99,9 @@ That mode uses the git-ignored `.runtime\` folder beside the checkout.
 .\solver.ps1 run .\examples\spectrum.json --store .\.solver-store
 ```
 
-The public CLI — `plan`, `run`, `verify`, `inspect`, `export`, `campaign-plan`,
-`campaign-merge`, and `campaign-smoke` — has no dependencies beyond the
-standard library. The native response kernel and the packaged test suite
-additionally need the pinned NumPy and SciPy:
+The core Python package has no required third-party Python dependency. Commands
+that execute the native response kernel, plus the complete packaged test suite,
+need the pinned NumPy and SciPy numerical tier:
 
 ```powershell
 .\runtime\bootstrap.ps1 -WithNumericalKernel
@@ -158,9 +176,19 @@ solver run STUDY.json [--store PATH]
 solver verify RUN_ID [--store PATH] [--profile research|publication]
 solver inspect RUN_ID [--store PATH]
 solver export RUN_ID --output PACKAGE.json [--store PATH]
-solver validate-evidence EVIDENCE-BUNDLE.json
+solver validate-evidence BUNDLE
+solver response-plan SELECTION.json --checkpoint CHECKPOINT.json
+solver response-run SELECTION.json --checkpoint CHECKPOINT.json
+solver response-resume SELECTION.json --checkpoint CHECKPOINT.json
+solver response-validate SELECTION.json --checkpoint CHECKPOINT.json
+solver campaign-plan SELECTION.json
+solver campaign-run SELECTION.json --checkpoint CHECKPOINT.json [--progress quiet|normal|trace]
+solver campaign-resume SELECTION.json --checkpoint CHECKPOINT.json [--progress quiet|normal|trace]
 solver campaign-validate SELECTION.json --checkpoint CHECKPOINT.json [--full]
+solver campaign-merge MANIFEST.json --output CHECKPOINT.json
+solver campaign-cache-import SELECTION.json --checkpoint CHECKPOINT.json [--store PATH]
 solver campaign-reduce REDUCTION-BUNDLE.json --output REDUCTION.json
+solver campaign-smoke
 solver m02-validate ADMISSION-INPUT.json
 solver m02-admit ADMISSION-INPUT.json --output ADMITTED.json
 solver m02-export ADMITTED.json --admission-id ID --output EXPORTED.json
@@ -210,10 +238,11 @@ python -m compileall -q src tests
 python -m unittest discover -s tests -v
 ```
 
-The package requires Python 3.12 and has no runtime dependencies outside the
-standard library. Numerical dependencies are used only by the offline,
-reproducible lattice builder; the installed provider selects exact rows from
-the hash-authenticated packaged result.
+The core package requires Python 3.12 and has no required dependencies outside
+the standard library. The offline lattice builder and native response kernel
+use the pinned numerical extra; promoted M02 execution additionally uses the
+solver-managed Julia environment. The installed spectral provider itself
+selects exact rows from the hash-authenticated packaged result.
 
 <!-- TASKPLANNER:ATTRIBUTION:START -->
 This project uses [TaskPlanner](https://github.com/smekai/taskplanner) for task planning.

@@ -10,6 +10,12 @@ This board is the executable work system for the Kerr Solver Completion Programm
 
 Do not create another stage list. Do not mark a milestone complete because code exists. A completed task must carry verification, provenance, an evidence ceiling, and a commit/PR reference when repository content changed.
 
+Dated files under `docs/superpowers/` and `docs/keystone/` are historical
+design or implementation records, not a second live backlog. Their checkbox
+state must not override this board. When a later decision changes scope, retain
+the historical record and add an explicit supersession note plus a newer work-log
+entry.
+
 ## Queue rules
 
 - One dependency-ready task belongs in `NEXT.md` while open work remains and no task is in progress.
@@ -23,7 +29,7 @@ Do not create another stage list. Do not mark a milestone complete because code 
 | Milestone | Tasks |
 |---|---|
 | M01 — Scope and evidence baseline | TASK-001–TASK-005 |
-| M02 — Public linear response | TASK-006–TASK-011 |
+| M02 — Public linear response | TASK-006–TASK-011; TASK-069–TASK-078 |
 | M03 — Spectral fields and branch genealogy | TASK-012–TASK-017 |
 | M04 — Operator stability and pseudospectra | TASK-018–TASK-023 |
 | M05 — First-order handoff and derivative couplings | TASK-024–TASK-029 |

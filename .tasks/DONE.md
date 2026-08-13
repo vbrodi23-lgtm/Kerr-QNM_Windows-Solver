@@ -1,5 +1,11 @@
 # Done
 
+> Historical M02 records below preserve the scope under which they closed.
+> PR #21 later replaced the 553-leaf, 87-selector, 174-row production contract
+> with the canonical 212-leaf, 48-selector campaign and 57-row reduction
+> contract. Current delivery state is recorded in `IN_PROGRESS.md` and the
+> newest `WORK_LOG.md` entry.
+
 ## TASK-011: Build fail-closed M02 validation, admission, and operator closure commands
 **Priority:** P1 | **Tags:** M02, provider, validation, tooling
 **Assignee:** Codex | **Estimate:** 1 day | **Milestone:** M02

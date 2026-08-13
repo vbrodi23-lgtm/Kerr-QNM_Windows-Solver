@@ -2,7 +2,9 @@
 
 **Date:** 2026-08-11  
 **Scope:** TASK-012 only  
-**Status:** Approved implementation boundary
+**Status:** Contract-only slice merged in PR #30; full TASK-012 remains blocked
+pending M02 admission/reconciliation, complete field/compactification contracts,
+backend reuse, and the declared human-mathematics gates.
 
 ## Goal
 

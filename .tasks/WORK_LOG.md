@@ -2,6 +2,14 @@
 
 Add the newest completed task or milestone-control entry immediately below this heading.
 
+## 2026-08-13 — TASK-075 implementation reconciled after PR #40
+
+- **Current position:** The canonical M02 domain is 212 leaves, 48 campaign roots, and 57 projective rows. PR #21 superseded the earlier 553/87/174 execution scope, and PR #40 merged the determinant, branch, finite-difference, Newton, support-contract, checkpoint-boolean, and promoted-ODE repairs. Earlier work-log entries retain their historical scope rather than being silently rewritten.
+- **Task state:** Ten of TASK-075's eleven acceptance criteria now have merged repository and CI evidence. The task remains In Progress because no immutable Black Hole Perturbation Toolkit Mathematica spheroidal validation-source receipt exists in the repository. TASK-076 therefore remains blocked rather than being prematurely promoted.
+- **Verification:** GitHub Actions run `31640576550` passed on PR #40's exact final head on Ubuntu and Windows: 471 tests plus the 11-test follow-on gate, wheel inspection, compilation, admission/cache, campaign smoke, provider checks, and Windows launcher parity. The release-manifest validator passes, and direct contract introspection returns 212 leaves, 48 campaign roots, and 57 projective rows.
+- **Evidence ceiling:** Software, static/promoted-worker contract tests, and hosted cross-platform Python/PowerShell gates only. No native Julia physics benchmark, representative cold/warm scientific execution, complete 212-leaf campaign, populated atlas, or admitted linear-response provider is claimed.
+- **Change reference:** canonical scope PR [#21](https://github.com/vbrodi23-lgtm/Kerr-QNM_Windows-Solver/pull/21); final implementation repair PR [#40](https://github.com/vbrodi23-lgtm/Kerr-QNM_Windows-Solver/pull/40), merged as `c10fbeccb8c4a2253a542166e82637c14232c594`.
+
 ## 2026-08-09 — M02 self-originating scientific execution set as the active delivery path
 
 - **Current position:** PR #5 merged the complete 553-leaf planning, execution, reduction, and fail-closed admission machinery. PR #6 merged the package-local Python bootstrap. No 553-leaf physical campaign or admitted linear-response result exists yet.
