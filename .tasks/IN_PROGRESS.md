@@ -54,6 +54,8 @@ preservation, and cache/provenance separation from historical raw-state leaves.
 - Move promoted horizon and exterior orchestration onto the canonical factored endpoint solver and scaled coefficient extraction.
 - Propagate conditioning evidence through strict Julia/Python schemas, promotion policy, progress, reports, and runtime identity.
 - Run a time-boxed, performance-only Leaf 13 diagnostic through the existing post-readiness factored executor, measuring the outer-to-match and match-to-inner legs separately before any further hardening.
+- Preserve the production gate and existing worker contour while prototyping a horizon basis at the match point: use a real positive inner tortoise ray that demonstrably approaches `r_plus`, authenticate both horizon endpoint series before any homogeneous RHS evaluation, propagate the pure ingoing/outgoing remainders independently to the match point, and solve the scaled physical-state basis there.
+- Emit the contour-approach, endpoint-conditioning, per-leg RHS/step, basis-condition, coefficient, and reconstruction evidence needed to decide whether the prototype merits production integration; do not treat this performance prototype as a mathematical activation receipt.
 - Run only permitted static/mocked checks, independently review the diff, then stop for human math review and native PowerShell execution.
 
 ---
