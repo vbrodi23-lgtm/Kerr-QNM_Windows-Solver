@@ -53,6 +53,7 @@ preservation, and cache/provenance separation from historical raw-state leaves.
 - Implement representation primitives and precision-preserving asymptotics in the vendored GSN package, with tests written before production changes.
 - Move promoted horizon and exterior orchestration onto the canonical factored endpoint solver and scaled coefficient extraction.
 - Propagate conditioning evidence through strict Julia/Python schemas, promotion policy, progress, reports, and runtime identity.
+- Run a time-boxed, performance-only Leaf 13 diagnostic through the existing post-readiness factored executor, measuring the outer-to-match and match-to-inner legs separately before any further hardening.
 - Run only permitted static/mocked checks, independently review the diff, then stop for human math review and native PowerShell execution.
 
 ---
