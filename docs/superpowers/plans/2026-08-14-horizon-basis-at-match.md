@@ -69,4 +69,4 @@ GeneralizedSasakiNakamura package, BigFloat at 298 bits.
 - [x] Run the full vendored Julia suite, focused Python source contracts,
   TaskPlanner validation, and whitespace checks.
 - [x] Review the diff for accidental production-path or policy changes.
-- [ ] Commit and push the prototype and evidence to PR #44.
+- [x] Commit and push the prototype and evidence to PR #44.
