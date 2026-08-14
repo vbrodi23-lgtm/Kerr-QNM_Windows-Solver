@@ -174,6 +174,45 @@ class RegularisedGsnScatteringSourceTests(unittest.TestCase):
         self.assertNotIn("raw_scattering_determinant", production)
         self.assertNotRegex(production, r"(?:fallback|catch|else).*raw")
 
+    def test_safe_chart_precedes_explicit_nonblocking_raw_overflow_evidence(
+        self,
+    ) -> None:
+        """Catches raw overflow aborting a finite normalised horizon chart."""
+
+        assessment = self.source[
+            self.source.index("struct DeterminantChartAssessment") :
+            self.source.index("struct DeterminantChartEvaluation")
+        ]
+        self.assertIn("raw_determinant::Union{Nothing,Complex{T}}", assessment)
+        self.assertIn("raw_determinant_abs::Union{Nothing,T}", assessment)
+        self.assertIn("raw_determinant_evidence_status::String", assessment)
+
+        chart = self._function("assess_horizon_determinant_chart")
+        self.assertIn("normalised_determinant = iszero(Cref) ? nothing", chart)
+        self.assertIn("raw_diagnostic = if collect_raw_diagnostic", chart)
+        self.assertIn("try", chart)
+        self.assertLess(
+            chart.index("normalised_determinant = iszero(Cref) ? nothing"),
+            chart.index("raw_diagnostic = if collect_raw_diagnostic"),
+        )
+        self.assertIn("raw_scattering_determinant(", chart)
+        self.assertIn('"unavailable-overflow/v1"', chart)
+        production = self._function("evaluate_normalised_horizon_determinant")
+        self.assertIn("collect_raw_diagnostic=false", production)
+        self.assertIn("collect_raw_diagnostic=true", production)
+        self.assertLess(
+            production.index("collect_raw_diagnostic=false"),
+            production.index("assessment.safe || throw"),
+        )
+        self.assertLess(
+            production.index("assessment.safe || throw"),
+            production.index("collect_raw_diagnostic=true"),
+        )
+        self.assertIn(
+            "safe normalised horizon chart survives raw diagnostic overflow",
+            self.spec,
+        )
+
     def test_exact_root_cancellation_diagnostic_saturates_explicitly(self) -> None:
         assessment = self.source[
             self.source.index("struct DeterminantChartAssessment") :

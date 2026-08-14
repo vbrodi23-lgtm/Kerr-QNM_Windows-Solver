@@ -266,6 +266,38 @@ end
     end
 end
 
+@testset "safe normalised horizon chart survives raw diagnostic overflow" begin
+    # Both coefficients are finite.  Their raw Cinc - R*Cref subtraction
+    # overflows, while Cinc/Cref - R is finite and has a safe Cref margin.
+    huge = Float64(0.75) * floatmax(Float64)
+    basis = synthetic_basis(Float64, 1.0, 1.0)
+    target = FS.FactoredEndpointState{Float64}(
+        complex(huge, 0.0), complex(huge, 0.0)
+    )
+    coefficients = SOL.solve_scaled_factored_scattering(
+        target, basis.common_carrier, basis
+    )
+    assessment = SOL.assess_horizon_determinant_chart(
+        coefficients,
+        -1.0 + 0.0im,
+        huge / 128.0,
+    )
+    evaluation = SOL.evaluate_normalised_horizon_determinant(
+        coefficients,
+        -1.0 + 0.0im,
+        huge / 128.0,
+    )
+
+    @test assessment.safe
+    @test assessment.normalised_determinant == 2.0 + 0.0im
+    @test assessment.normalised_determinant_abs == 2.0
+    @test assessment.raw_determinant_evidence_status ==
+        "unavailable-overflow/v1"
+    @test assessment.raw_determinant === nothing
+    @test assessment.raw_determinant_abs === nothing
+    @test evaluation.value == assessment.normalised_determinant
+end
+
 @testset "near-dependent basis rejection" begin
     epsilon = eps(Float64) / 4
     column_1 = FS.FactoredEndpointState{Float64}(1.0 + 0im, 0.0 + 0im)

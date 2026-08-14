@@ -1143,13 +1143,14 @@ struct DeterminantChartAssessment{T<:AbstractFloat}
     cref_chart_margin::T
     cref_fraction::T
     safe::Bool
-    raw_determinant::Complex{T}
+    raw_determinant::Union{Nothing,Complex{T}}
     normalised_determinant::Union{Nothing,Complex{T}}
-    raw_determinant_abs::T
+    raw_determinant_abs::Union{Nothing,T}
+    raw_determinant_evidence_status::String
     normalised_determinant_abs::Union{Nothing,T}
     cref_abs::T
     cinc_abs::T
-    raw_cancellation_ratio::T
+    raw_cancellation_ratio::Union{Nothing,T}
     raw_cancellation_ratio_saturated::Bool
     equivalence_relative_error::Union{Nothing,T}
     homogeneous_representation::String
@@ -1252,7 +1253,8 @@ end
 function assess_horizon_determinant_chart(
     coefficients::ScatteringCoefficients{T},
     reflectivity::Union{T,Complex{T}},
-    estimated_cref_error::T,
+    estimated_cref_error::T;
+    collect_raw_diagnostic::Bool=true,
 )::DeterminantChartAssessment{T} where {T<:AbstractFloat}
     precision_bits = coefficients.diagnostics.precision_bits
     return _with_scattering_precision(T, precision_bits) do
@@ -1271,10 +1273,6 @@ function assess_horizon_determinant_chart(
         Cinc = _assert_scattering_complex(
             coefficients.Cinc, precision_bits, "chart Cinc"
         )
-        raw_determinant = Cinc - typed_reflectivity * Cref
-        _assert_scattering_complex(
-            raw_determinant, precision_bits, "raw determinant evidence"
-        )
         cref_abs = abs(Cref)
         cinc_abs = abs(Cinc)
         denominator = T(SCATTERING_CHART_SAFETY_FACTOR) *
@@ -1287,15 +1285,18 @@ function assess_horizon_determinant_chart(
         _assert_scattering_real(
             margin, precision_bits, "Cref chart margin"; nonnegative=true
         )
-        coefficient_pair_norm = hypot(cref_abs, cinc_abs)
+        coefficient_scale = max(cref_abs, cinc_abs, floatmin(T))
+        coefficient_pair_norm = hypot(
+            cref_abs / coefficient_scale,
+            cinc_abs / coefficient_scale,
+        )
         _assert_scattering_real(
             coefficient_pair_norm,
             precision_bits,
-            "scattering coefficient-pair norm";
-            nonnegative=true,
+            "scaled scattering coefficient-pair norm"; positive=true,
         )
-        cref_fraction = cref_abs / max(coefficient_pair_norm, floatmin(T))
-        safe = !iszero(Cref) && margin > one(T)
+        cref_fraction = (cref_abs / coefficient_scale) /
+            coefficient_pair_norm
         normalised_determinant = iszero(Cref) ? nothing :
             Cinc / Cref - typed_reflectivity
         if normalised_determinant !== nothing
@@ -1305,31 +1306,12 @@ function assess_horizon_determinant_chart(
                 "normalised scattering determinant",
             )
         end
-        raw_determinant_abs = abs(raw_determinant)
         normalised_determinant_abs = normalised_determinant === nothing ?
             nothing : abs(normalised_determinant)
-        reflected_cref_abs = abs(typed_reflectivity * Cref)
-        raw_cancellation_ratio, raw_cancellation_ratio_saturated =
-            _finite_scattering_ratio(
-                (cinc_abs, reflected_cref_abs),
-                max(raw_determinant_abs, floatmin(T)),
-                precision_bits,
-                "raw determinant cancellation ratio",
-            )
-        equivalence_relative_error = if normalised_determinant === nothing
-            nothing
-        else
-            reconstructed_raw = Cref * normalised_determinant
-            _relative_scattering_disagreement(
-                raw_determinant, reconstructed_raw
-            )
-        end
         for (name, value) in (
             ("Cref magnitude", cref_abs),
             ("Cinc magnitude", cinc_abs),
             ("Cref fraction", cref_fraction),
-            ("raw determinant magnitude", raw_determinant_abs),
-            ("raw cancellation ratio", raw_cancellation_ratio),
         )
             _assert_scattering_real(value, precision_bits, name;
                 nonnegative=true)
@@ -1341,28 +1323,97 @@ function assess_horizon_determinant_chart(
                 "normalised determinant magnitude";
                 nonnegative=true,
             )
-        equivalence_relative_error === nothing ||
-            _assert_scattering_real(
-                equivalence_relative_error,
-                precision_bits,
-                "raw/normalised determinant equivalence error";
-                nonnegative=true,
+        safe = !iszero(Cref) && margin > one(T)
+        raw_diagnostic = if collect_raw_diagnostic
+            try
+                raw_determinant = raw_scattering_determinant(
+                    coefficients, typed_reflectivity
+                )
+                raw_determinant_abs = abs(raw_determinant)
+                _assert_scattering_real(
+                    raw_determinant_abs,
+                    precision_bits,
+                    "raw determinant magnitude";
+                    nonnegative=true,
+                )
+                reflected_cref_abs = abs(typed_reflectivity * Cref)
+                raw_cancellation_ratio, raw_cancellation_ratio_saturated =
+                    _finite_scattering_ratio(
+                        (cinc_abs, reflected_cref_abs),
+                        max(raw_determinant_abs, floatmin(T)),
+                        precision_bits,
+                        "raw determinant cancellation ratio",
+                    )
+                _assert_scattering_real(
+                    raw_cancellation_ratio,
+                    precision_bits,
+                    "raw cancellation ratio";
+                    nonnegative=true,
+                )
+                equivalence_relative_error =
+                    normalised_determinant === nothing ? nothing :
+                    _relative_scattering_disagreement(
+                        raw_determinant,
+                        Cref * normalised_determinant,
+                    )
+                equivalence_relative_error === nothing ||
+                    _assert_scattering_real(
+                        equivalence_relative_error,
+                        precision_bits,
+                        "raw/normalised determinant equivalence error";
+                        nonnegative=true,
+                    )
+                (
+                    raw_determinant=raw_determinant,
+                    raw_determinant_abs=raw_determinant_abs,
+                    raw_determinant_evidence_status="available/v1",
+                    raw_cancellation_ratio=raw_cancellation_ratio,
+                    raw_cancellation_ratio_saturated=
+                        raw_cancellation_ratio_saturated,
+                    equivalence_relative_error=equivalence_relative_error,
+                )
+            catch error
+                if error isa ScatteringExtractionError &&
+                        error.reason == NONFINITE_SCATTERING_DATA
+                    (
+                        raw_determinant=nothing,
+                        raw_determinant_abs=nothing,
+                        raw_determinant_evidence_status=
+                            "unavailable-overflow/v1",
+                        raw_cancellation_ratio=nothing,
+                        raw_cancellation_ratio_saturated=false,
+                        equivalence_relative_error=nothing,
+                    )
+                else
+                    rethrow()
+                end
+            end
+        else
+            (
+                raw_determinant=nothing,
+                raw_determinant_abs=nothing,
+                raw_determinant_evidence_status="not-collected/v1",
+                raw_cancellation_ratio=nothing,
+                raw_cancellation_ratio_saturated=false,
+                equivalence_relative_error=nothing,
             )
+        end
         return DeterminantChartAssessment{T}(
             estimated_cref_error,
             SCATTERING_CHART_SAFETY_FACTOR,
             margin,
             cref_fraction,
             safe,
-            raw_determinant,
+            raw_diagnostic.raw_determinant,
             normalised_determinant,
-            raw_determinant_abs,
+            raw_diagnostic.raw_determinant_abs,
+            raw_diagnostic.raw_determinant_evidence_status,
             normalised_determinant_abs,
             cref_abs,
             cinc_abs,
-            raw_cancellation_ratio,
-            raw_cancellation_ratio_saturated,
-            equivalence_relative_error,
+            raw_diagnostic.raw_cancellation_ratio,
+            raw_diagnostic.raw_cancellation_ratio_saturated,
+            raw_diagnostic.equivalence_relative_error,
             HOMOGENEOUS_REPRESENTATION_ID,
             GSN_BRANCH_CONVENTION_ID,
             SCATTERING_EXTRACTION_ID,
@@ -1419,7 +1470,8 @@ function evaluate_normalised_horizon_determinant(
     estimated_cref_error::T,
 )::DeterminantChartEvaluation{T} where {T<:AbstractFloat}
     assessment = assess_horizon_determinant_chart(
-        coefficients, reflectivity, estimated_cref_error
+        coefficients, reflectivity, estimated_cref_error;
+        collect_raw_diagnostic=false,
     )
     assessment.safe || throw(_scattering_error(
         SCATTERING_CHART_ILL_CONDITIONED,
@@ -1434,6 +1486,10 @@ function evaluate_normalised_horizon_determinant(
             "safe normalised chart unexpectedly lacks a determinant value",
             diagnostics=assessment,
         )
+    )
+    assessment = assess_horizon_determinant_chart(
+        coefficients, reflectivity, estimated_cref_error;
+        collect_raw_diagnostic=true,
     )
     return DeterminantChartEvaluation{T}(
         assessment.normalised_determinant, assessment

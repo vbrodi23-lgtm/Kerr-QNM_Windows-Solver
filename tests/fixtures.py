@@ -174,6 +174,11 @@ def valid_schema_two_julia_root_response(
             if request["mechanism_id"] == "horizon-admittance"
             else None
         ),
+        "raw_determinant_evidence_status": (
+            "available/v1"
+            if request["mechanism_id"] == "horizon-admittance"
+            else "not-applicable/v1"
+        ),
         "root_derivative_abs": "2.5",
         "root_converged": True,
         "branch_authentication_contract_version": 3,

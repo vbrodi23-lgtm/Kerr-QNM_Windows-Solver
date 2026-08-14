@@ -1069,6 +1069,7 @@ class RootReadout:
     numerical_conditioning: NumericalConditioningEvidence | None = None
     normalised_determinant_abs: Decimal | None = None
     raw_determinant_abs: Decimal | None = None
+    raw_determinant_evidence_status: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "omega", _finite_complex(self.omega, "root omega"))
@@ -1106,16 +1107,53 @@ class RootReadout:
                 raise ValueError(
                     f"{name} must be a finite nonnegative Decimal or None"
                 )
+        if (
+            self.raw_determinant_evidence_status is not None
+            and not isinstance(self.raw_determinant_evidence_status, str)
+        ):
+            raise ValueError("raw determinant evidence status has invalid type")
         if self.numerical_conditioning is not None:
             if self.numerical_conditioning.scattering_diagnostics_applicable:
-                if self.raw_determinant_abs is None:
+                if self.raw_determinant_evidence_status is None:
+                    if self.raw_determinant_abs is None:
+                        raise ValueError(
+                            "raw_determinant_abs is required for horizon scattering"
+                        )
+                elif self.raw_determinant_evidence_status == "available/v1":
+                    if self.raw_determinant_abs is None:
+                        raise ValueError(
+                            "available raw_determinant_abs is required for "
+                            "horizon scattering"
+                        )
+                elif self.raw_determinant_evidence_status == "unavailable-overflow/v1":
+                    if self.raw_determinant_abs is not None:
+                        raise ValueError(
+                            "unavailable raw determinant evidence must not "
+                            "carry raw_determinant_abs"
+                        )
+                else:
                     raise ValueError(
-                        "raw_determinant_abs is required for horizon scattering"
+                        "raw_determinant_evidence_status is required for "
+                        "horizon scattering"
                     )
-            elif self.raw_determinant_abs is not None:
+            elif self.raw_determinant_evidence_status is None:
+                if self.raw_determinant_abs is not None:
+                    raise ValueError(
+                        "raw_determinant_abs must be null for an exterior "
+                        "Wronskian"
+                    )
+            elif (
+                self.raw_determinant_evidence_status != "not-applicable/v1"
+                or self.raw_determinant_abs is not None
+            ):
                 raise ValueError(
-                    "raw_determinant_abs must be null for an exterior Wronskian"
+                    "exterior Wronskians require not-applicable raw determinant "
+                    "evidence"
                 )
+        elif self.raw_determinant_evidence_status is not None:
+            raise ValueError(
+                "raw determinant evidence status requires numerical conditioning"
+            )
         if (
             self.normalised_determinant_abs is not None
             and float(self.normalised_determinant_abs)
@@ -1237,6 +1275,10 @@ class RootReadout:
             value = getattr(self, name)
             if value is not None:
                 output[name] = str(value)
+        if self.raw_determinant_evidence_status is not None:
+            output["raw_determinant_evidence_status"] = (
+                self.raw_determinant_evidence_status
+            )
         return output
 
     @classmethod
@@ -1306,6 +1348,11 @@ class RootReadout:
                     value["raw_determinant_abs"],
                     "root readout raw_determinant_abs",
                 )
+            ),
+            raw_determinant_evidence_status=(
+                None
+                if "raw_determinant_evidence_status" not in value
+                else value["raw_determinant_evidence_status"]
             ),
         )
 

@@ -772,6 +772,7 @@ struct DeterminantDiagnostics{T<:AbstractFloat}
     endpoint_remainders_regular::Bool
     maximum_endpoint_reconstruction_error::T
     raw_determinant_abs::Union{Nothing,T}
+    raw_determinant_evidence_status::String
     normalised_determinant_abs::T
     minimum_cref_chart_margin::Union{Nothing,T}
     maximum_carrier_change_error::Union{Nothing,T}
@@ -1621,6 +1622,7 @@ function evaluate_horizon_determinant(
         endpoint_summary.endpoint_remainders_regular,
         endpoint_summary.maximum_endpoint_reconstruction_error,
         chart_assessment.raw_determinant_abs,
+        chart_assessment.raw_determinant_evidence_status,
         normalised_determinant_abs,
         chart_assessment.cref_chart_margin,
         carrier_change_error,
@@ -1632,7 +1634,10 @@ function evaluate_horizon_determinant(
         "Cref_abs" => string(chart_assessment.cref_abs),
         "reflectivity_abs" => string(abs(reflectivity)),
         "raw_determinant_abs" =>
-            string(chart_assessment.raw_determinant_abs),
+            chart_assessment.raw_determinant_abs === nothing ?
+                nothing : string(chart_assessment.raw_determinant_abs),
+        "raw_determinant_evidence_status" =>
+            chart_assessment.raw_determinant_evidence_status,
         "normalised_determinant_abs" =>
             string(normalised_determinant_abs),
         "cref_chart_margin" =>
@@ -1770,6 +1775,7 @@ function evaluate_exterior_determinant(
         endpoint_summary.endpoint_remainders_regular,
         endpoint_summary.maximum_endpoint_reconstruction_error,
         nothing,
+        "not-applicable/v1",
         abs(value),
         nothing,
         nothing,
@@ -2943,10 +2949,31 @@ function result_fields(::Type{T}, request, digits::Int, bits::Int) where {T<:Abs
         )
     branch_tolerance = parse_real(T, request, "branch_enclosure_radius_abs")
     raw_determinant_abs = root_evaluation.diagnostics.raw_determinant_abs
+    raw_determinant_evidence_status =
+        root_evaluation.diagnostics.raw_determinant_evidence_status
     horizon = string(required(request, "mechanism_id")) ==
         "horizon-admittance"
-    horizon == (raw_determinant_abs !== nothing) ||
-        error("root determinant raw-magnitude applicability is inconsistent")
+    if horizon
+        raw_determinant_evidence_status in (
+            "available/v1", "unavailable-overflow/v1"
+        ) || error("root raw determinant evidence status is invalid")
+        if raw_determinant_evidence_status == "available/v1"
+            raw_determinant_abs === nothing && error(
+                "available raw determinant evidence lacks its magnitude"
+            )
+        else
+            raw_determinant_abs === nothing || error(
+                "unavailable raw determinant evidence must not carry a magnitude"
+            )
+        end
+    else
+        raw_determinant_evidence_status == "not-applicable/v1" || error(
+            "exterior determinant raw-evidence status is inconsistent"
+        )
+        raw_determinant_abs === nothing || error(
+            "exterior determinant must not carry raw horizon evidence"
+        )
+    end
     raw_determinant_abs === nothing ||
         (isfinite(raw_determinant_abs) &&
          raw_determinant_abs >= zero(T)) ||
@@ -2968,6 +2995,8 @@ function result_fields(::Type{T}, request, digits::Int, bits::Int) where {T<:Abs
             "root_residual_abs" => numeric_text(residual),
             "raw_determinant_abs" => raw_determinant_abs === nothing ?
                 nothing : numeric_text(raw_determinant_abs),
+            "raw_determinant_evidence_status" =>
+                raw_determinant_evidence_status,
             "root_derivative_abs" => numeric_text(derivative_abs),
             "root_converged" => false,
             "branch_authentication_contract_version" => 3,
@@ -3042,6 +3071,8 @@ function result_fields(::Type{T}, request, digits::Int, bits::Int) where {T<:Abs
         "root_residual_abs" => numeric_text(residual),
         "raw_determinant_abs" => raw_determinant_abs === nothing ?
             nothing : numeric_text(raw_determinant_abs),
+        "raw_determinant_evidence_status" =>
+            raw_determinant_evidence_status,
         "root_derivative_abs" => numeric_text(derivative_abs),
         "root_converged" => converged,
         "branch_authentication_contract_version" => 3,

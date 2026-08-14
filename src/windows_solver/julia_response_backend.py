@@ -1679,6 +1679,7 @@ class JuliaPrecisionRootBackend:
             "root_omega_im",
             "root_residual_abs",
             "raw_determinant_abs",
+            "raw_determinant_evidence_status",
             "root_derivative_abs",
             "root_converged",
             "branch_authentication_contract_version",
@@ -1830,15 +1831,36 @@ class JuliaPrecisionRootBackend:
                 nonnegative=True,
             )
         )
-        if job.mechanism_id == "horizon-admittance":
-            if raw_determinant_abs is None:
-                raise JuliaResponseBackendError(
-                    "M02 Julia horizon scattering must include its raw horizon "
-                    "determinant"
-                )
-        elif raw_determinant_abs is not None:
+        raw_determinant_evidence_status = response[
+            "raw_determinant_evidence_status"
+        ]
+        if not isinstance(raw_determinant_evidence_status, str):
             raise JuliaResponseBackendError(
-                "M02 Julia exterior Wronskian must not claim a raw horizon determinant"
+                "M02 Julia raw determinant evidence status is invalid"
+            )
+        if job.mechanism_id == "horizon-admittance":
+            if raw_determinant_evidence_status == "available/v1":
+                if raw_determinant_abs is None:
+                    raise JuliaResponseBackendError(
+                        "M02 Julia available raw horizon determinant lacks "
+                        "its magnitude"
+                    )
+            elif raw_determinant_evidence_status == "unavailable-overflow/v1":
+                if raw_determinant_abs is not None:
+                    raise JuliaResponseBackendError(
+                        "M02 Julia unavailable raw horizon determinant must "
+                        "not carry a magnitude"
+                    )
+            else:
+                raise JuliaResponseBackendError(
+                    "M02 Julia horizon raw determinant evidence status is invalid"
+                )
+        elif (
+            raw_determinant_evidence_status != "not-applicable/v1"
+            or raw_determinant_abs is not None
+        ):
+            raise JuliaResponseBackendError(
+                "M02 Julia exterior Wronskian must not claim raw horizon evidence"
             )
         diagnostic_radii_decimal = (
             {}
@@ -2000,6 +2022,8 @@ class JuliaPrecisionRootBackend:
                 numerical_conditioning=numerical_conditioning,
                 normalised_determinant_abs=normalised_determinant_abs,
                 raw_determinant_abs=raw_determinant_abs,
+                raw_determinant_evidence_status=
+                    raw_determinant_evidence_status,
             )
         except ValueError as error:
             raise JuliaResponseBackendError(
