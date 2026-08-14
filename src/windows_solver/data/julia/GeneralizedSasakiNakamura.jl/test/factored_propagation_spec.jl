@@ -33,7 +33,7 @@ function factored_spec_parameters(::Type{T}) where {T<:AbstractFloat}
 end
 
 function factored_spec_context(
-    ::Type{T}; outer_radius::T=T(14)
+    ::Type{T}; outer_radius::T=T(14), inner_rstar::T=-T(50)
 ) where {T<:AbstractFloat}
     parameters = factored_spec_parameters(T)
     geometry = KERR_FACTORED.stable_horizon_geometry(parameters.a)
@@ -60,9 +60,12 @@ function factored_spec_context(
     ))
     rho_in = -one(T)
     rho_out = one(T)
+    inner_radius = complex(
+        T(COORD_FACTORED.r_from_rstar(parameters.a, inner_rstar)), zero(T)
+    )
     radius_from_rho = function (rho::T)
         if rho < zero(T)
-            return complex(geometry.rplus + T(1) / T(10), -T(1) / T(50))
+            return inner_radius
         elseif rho > zero(T)
             return complex(outer_radius, T(1) / T(50))
         end
@@ -244,6 +247,7 @@ end
     horizon = CF_FACTORED.prepare_factored_horizon_ingoing(
         prepared.spectral, prepared.contour, 0.0
     )
+    @test horizon.assessment.adequate
     infinity_carrier = FS_FACTORED.PlaneWaveCarrier(
         FS_FACTORED.INFINITY_OUTGOING,
         prepared.spectral.omega,
