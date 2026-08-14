@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from decimal import Decimal
 from fractions import Fraction
 import hashlib
 import io
 import json
+import math
 from pathlib import Path
 import tempfile
 import unittest
@@ -18,11 +20,14 @@ from windows_solver.linear_response import B_PRIME_RELEASE_DOMAIN
 from windows_solver.response_batches import (
     PrecisionCapabilities,
     StageOutcome,
+    _checkpoint_precision_contract_sha256,
     _primary_recovery_precision_contract,
     _root_convergence_precision_contract,
     _produced_response,
     build_campaign_plan,
     build_campaign_selection,
+    import_campaign_checkpoint_to_solved_leaf_store,
+    merge_campaign_checkpoints,
     run_campaign_selection,
     synthetic_stage_signed_error_channels,
     validate_campaign_checkpoint,
@@ -33,10 +38,13 @@ from windows_solver.response_engine import (
     DiagnosticRootReadout,
     LadderLevel,
     NumericalPolicy,
+    NumericalConditioningEvidence,
     RootReadout,
     VettedNativeDeterminantKernel,
+    regularised_gsn_precision_policy,
 )
 from windows_solver.solved_leaf_cache import SolvedLeafStore
+from tests.fixtures import valid_numerical_conditioning
 
 
 def leaf_id(role, mode_label, coordinate, mechanism_id):
@@ -85,6 +93,35 @@ def reseal(value):
     value["records_sha256"] = hashlib.sha256(
         canonical_json_bytes(value["records"])
     ).hexdigest()
+
+
+def remove_promotion_decision_and_reseal(
+    value, *, stage_index=1, remove_conditioning=False,
+    historical_shape=False,
+):
+    stage = value["records"][0]["stages"][stage_index]
+    component = stage["component_result"]
+    component.pop("promotion_decision")
+    if remove_conditioning or historical_shape:
+        baseline = component["result"]["baseline"]
+        for name in (
+            "numerical_conditioning",
+            "normalised_determinant_abs",
+            "raw_determinant_abs",
+            "raw_determinant_evidence_status",
+            "worker_response_receipt",
+        ):
+            baseline.pop(name, None)
+    if historical_shape:
+        component["scientific_runtime"].pop(
+            "regularised_gsn_precision_policy"
+        )
+    source_sha256 = hashlib.sha256(
+        canonical_json_bytes(component)
+    ).hexdigest()
+    for channel in stage["signed_error_channels"]:
+        channel["provenance"]["source_sha256"] = source_sha256
+    reseal(value)
 
 
 def _synthetic_stage_outcome(**values):
@@ -209,7 +246,7 @@ def _authenticated_primary_stage(
         "evidence_kind": "authenticated-primary-precision-contract",
         "result": result.to_mapping(),
     }
-    return _synthetic_stage_outcome(
+    outcome = _synthetic_stage_outcome(
         digits=digits,
         numerical_state=status.value,
         component_result=component_result,
@@ -217,6 +254,24 @@ def _authenticated_primary_stage(
         self_refinement_enclosed=self_refinement_enclosed,
         discrepancy_from_previous_abs=discrepancy_from_previous_abs,
         discrepancy_enclosed=discrepancy_enclosed,
+    )
+    if digits not in (80, 120):
+        return outcome
+    precision_limited = (
+        digits == 80
+        and (
+            status is ComponentStatus.NOT_CONVERGED
+            or self_refinement_enclosed is False
+            or discrepancy_enclosed is False
+        )
+    )
+    return _with_baseline_conditioning(
+        outcome,
+        predicted_reliable_digits=("11.25" if precision_limited else "55.125"),
+        required_reliable_digits="24",
+        precision_limited=precision_limited,
+        receipt_job=job,
+        receipt_role=leaf.role,
     )
 
 
@@ -243,6 +298,817 @@ def _replace_component_result_fields(
             component, outcome.local_disk_radius_abs
         ),
     )
+
+
+def _with_baseline_conditioning(
+    outcome,
+    *,
+    predicted_reliable_digits,
+    required_reliable_digits,
+    precision_limited,
+    raw_determinant_evidence_status=None,
+    receipt_job=None,
+    receipt_role=None,
+):
+    result = ComponentResult.from_mapping(outcome.component_result["result"])
+    mapping = valid_numerical_conditioning(result.mechanism_id)
+    mapping.update({
+        "predicted_reliable_digits": predicted_reliable_digits,
+        "required_reliable_digits": required_reliable_digits,
+        "precision_limited": precision_limited,
+    })
+    evidence = NumericalConditioningEvidence.from_mapping(mapping)
+    horizon = evidence.scattering_diagnostics_applicable
+    raw_status = (
+        raw_determinant_evidence_status
+        if horizon
+        else "not-applicable/v1"
+    )
+    if horizon and raw_status is None:
+        raw_status = "available/v1"
+
+    scientific_runtime = {
+        "precision_digits": outcome.digits,
+        "working_precision_bits": (
+            math.ceil(outcome.digits * math.log2(10)) + 32
+        ),
+        "refinement_level": 0,
+        "regularised_gsn_precision_policy": dict(
+            regularised_gsn_precision_policy(result.mechanism_id)
+        ),
+    }
+
+    def conditioned(readout, readout_id):
+        existing_receipt = readout.worker_response_receipt
+        updated = replace(
+            readout,
+            diagnostic_readouts=(readout.diagnostic_readouts or None),
+            numerical_conditioning=evidence,
+            normalised_determinant_abs=Decimal(
+                str(readout.determinant_residual_abs)
+            ),
+            raw_determinant_abs=(
+                Decimal(str(readout.determinant_residual_abs))
+                if raw_status == "available/v1"
+                else None
+            ),
+            raw_determinant_evidence_status=raw_status,
+            worker_response_receipt=None,
+        )
+        if existing_receipt is not None:
+            request_binding = dict(existing_receipt["request_binding"])
+            scientific_runtime_sha256 = existing_receipt[
+                "scientific_runtime_sha256"
+            ]
+        elif receipt_job is None or receipt_role is None:
+            raise AssertionError(
+                "synthetic current promoted evidence requires receipt lineage"
+            )
+        else:
+            request_binding = {
+                "schema_version": 1,
+                "operation": "root-readout",
+                "job_id": receipt_job.job_id,
+                "leaf_id": receipt_job.leaf_id,
+                "role": receipt_role,
+                "mechanism_id": receipt_job.mechanism_id,
+                "job_policy_sha256": receipt_job.policy.identity_sha256,
+                "backend_identity_sha256": (
+                    receipt_job.backend_identity.identity_sha256
+                ),
+                "precision_digits": outcome.digits,
+                "refinement_level": 0,
+                "synthetic_readout_id": readout_id,
+            }
+            scientific_runtime_sha256 = hashlib.sha256(
+                canonical_json_bytes(scientific_runtime)
+            ).hexdigest()
+        receipt_material = {
+            "schema": "windows-solver.worker-response-receipt/1",
+            "request_binding": request_binding,
+            "request_sha256": hashlib.sha256(
+                canonical_json_bytes(request_binding)
+            ).hexdigest(),
+            "scientific_runtime_sha256": scientific_runtime_sha256,
+            "worker_response_schema_version": 3,
+            "root_residual_abs_text": str(
+                updated.normalised_determinant_abs
+            ),
+            "raw_determinant_abs_text": (
+                None
+                if updated.raw_determinant_abs is None
+                else str(updated.raw_determinant_abs)
+            ),
+            "raw_determinant_evidence_status": raw_status,
+        }
+        return replace(
+            updated,
+            diagnostic_readouts=(updated.diagnostic_readouts or None),
+            worker_response_receipt={
+                **receipt_material,
+                "receipt_sha256": hashlib.sha256(
+                    canonical_json_bytes(receipt_material)
+                ).hexdigest(),
+            },
+        )
+
+    levels = tuple(
+        replace(
+            level,
+            real_plus=conditioned(level.real_plus, f"level-{index}-real-plus"),
+            real_minus=conditioned(level.real_minus, f"level-{index}-real-minus"),
+            imaginary_plus=conditioned(
+                level.imaginary_plus, f"level-{index}-imaginary-plus"
+            ),
+            imaginary_minus=conditioned(
+                level.imaginary_minus, f"level-{index}-imaginary-minus"
+            ),
+        )
+        for index, level in enumerate(result.levels)
+    )
+    conditioned_outcome = _replace_component_result_fields(
+        outcome,
+        result_changes={
+            "baseline": conditioned(result.baseline, "baseline"),
+            "levels": levels,
+        },
+    )
+    component = dict(conditioned_outcome.component_result)
+    component.update({
+        "evidence_kind": "package-owned-julia-promoted-component-engine",
+        "self_refinement_result": None,
+        "scientific_runtime": scientific_runtime,
+    })
+    if result.status is ComponentStatus.NOT_CONVERGED:
+        component["self_refinement_skipped_reason"] = "PRIMARY_NOT_CONVERGED"
+    return replace(
+        conditioned_outcome,
+        component_result=component,
+        signed_error_channels=synthetic_stage_signed_error_channels(
+            component, conditioned_outcome.local_disk_radius_abs
+        ),
+    )
+
+
+def _authenticated_failed_preflight_recovery_stage(leaf, predecessor):
+    """Build an independently checkable 120-base/120-refinement fixture."""
+
+    outcome = _authenticated_primary_stage(
+        leaf,
+        120,
+        ComponentStatus.CONVERGED,
+        self_refinement_enclosed=True,
+        discrepancy_from_previous_abs=None,
+        discrepancy_enclosed=None,
+    )
+    outcome = _with_baseline_conditioning(
+        outcome,
+        predicted_reliable_digits="55",
+        required_reliable_digits="24",
+        precision_limited=False,
+    )
+    component = dict(outcome.component_result)
+    refinement_runtime = {
+        **dict(component["scientific_runtime"]),
+        "refinement_level": 1,
+    }
+    component.update({
+        "failed_preflight_predecessor": predecessor.to_mapping(),
+        "comparison_kind": "same-precision-120-base-vs-refinement/v1",
+        "precision_ladder_discrepancy_applicable": False,
+        "same_precision_refinement_discrepancy_abs": 0.0,
+        "self_refinement_result": _rebind_result_worker_receipts(
+            component["result"], refinement_runtime, refinement_level=1
+        ),
+        "self_refinement_scientific_runtime": refinement_runtime,
+    })
+    return replace(
+        outcome,
+        component_result=component,
+        signed_error_channels=synthetic_stage_signed_error_channels(
+            component,
+            outcome.local_disk_radius_abs,
+            precision_ladder_applicable=False,
+        ),
+    )
+
+
+def _rebind_result_worker_receipts(
+    raw_result, scientific_runtime, *, refinement_level
+):
+    """Rebind a synthetic component clone to its distinct refinement runtime."""
+
+    result = ComponentResult.from_mapping(raw_result)
+
+    def rebound(readout):
+        receipt = readout.worker_response_receipt
+        if receipt is None:
+            raise AssertionError("synthetic promoted readout receipt is missing")
+        request_binding = dict(receipt["request_binding"])
+        request_binding["refinement_level"] = refinement_level
+        material = {
+            **{
+                key: value
+                for key, value in receipt.items()
+                if key != "receipt_sha256"
+            },
+            "request_binding": request_binding,
+            "request_sha256": hashlib.sha256(
+                canonical_json_bytes(request_binding)
+            ).hexdigest(),
+            "scientific_runtime_sha256": hashlib.sha256(
+                canonical_json_bytes(scientific_runtime)
+            ).hexdigest(),
+        }
+        return replace(
+            readout,
+            diagnostic_readouts=(readout.diagnostic_readouts or None),
+            worker_response_receipt={
+                **material,
+                "receipt_sha256": hashlib.sha256(
+                    canonical_json_bytes(material)
+                ).hexdigest(),
+            },
+        )
+
+    levels = tuple(
+        replace(
+            level,
+            real_plus=rebound(level.real_plus),
+            real_minus=rebound(level.real_minus),
+            imaginary_plus=rebound(level.imaginary_plus),
+            imaginary_minus=rebound(level.imaginary_minus),
+        )
+        for level in result.levels
+    )
+    return replace(
+        result,
+        baseline=rebound(result.baseline),
+        levels=levels,
+    ).to_mapping()
+
+
+def _reseal_failed_preflight_recovery_stage(outcome, component, **changes):
+    return replace(
+        outcome,
+        component_result=component,
+        signed_error_channels=synthetic_stage_signed_error_channels(
+            component,
+            outcome.local_disk_radius_abs,
+            precision_ladder_applicable=False,
+        ),
+        **changes,
+    )
+
+
+def _condition_failed_preflight_result(
+    outcome,
+    result_key,
+    *,
+    predicted_reliable_digits,
+    required_reliable_digits="24",
+    precision_limited,
+):
+    component = dict(outcome.component_result)
+    temporary_component = {"result": component[result_key]}
+    temporary = replace(
+        outcome,
+        component_result=temporary_component,
+        signed_error_channels=synthetic_stage_signed_error_channels(
+            temporary_component, outcome.local_disk_radius_abs
+        ),
+    )
+    conditioned = _with_baseline_conditioning(
+        temporary,
+        predicted_reliable_digits=predicted_reliable_digits,
+        required_reliable_digits=required_reliable_digits,
+        precision_limited=precision_limited,
+    )
+    component[result_key] = conditioned.component_result["result"]
+    return _reseal_failed_preflight_recovery_stage(outcome, component)
+
+
+def _branch_safe_failed_preflight_recovery_stage(outcome, leaf):
+    component = dict(outcome.component_result)
+
+    def safe_result(raw):
+        result = ComponentResult.from_mapping(raw)
+
+        def safe(readout):
+            return replace(readout, omega=leaf.job.root.omega)
+
+        levels = tuple(
+            replace(
+                level,
+                real_plus=safe(level.real_plus),
+                real_minus=safe(level.real_minus),
+                imaginary_plus=safe(level.imaginary_plus),
+                imaginary_minus=safe(level.imaginary_minus),
+            )
+            for level in result.levels
+        )
+        return replace(result, levels=levels).to_mapping()
+
+    component["result"] = safe_result(component["result"])
+    component["self_refinement_result"] = safe_result(
+        component["self_refinement_result"]
+    )
+    return _reseal_failed_preflight_recovery_stage(outcome, component)
+
+
+class PromotedConditioningDecisionTests(unittest.TestCase):
+    @staticmethod
+    def _run(*, evidence, status80=ComponentStatus.NOT_CONVERGED,
+             self_refinement_enclosed=True, discrepancy_enclosed=True):
+        capabilities = PrecisionCapabilities((64, 80, 120))
+        plan = build_campaign_plan(
+            policy=NumericalPolicy(),
+            backend_identity=VettedNativeDeterminantKernel.identity,
+            precision_capabilities=capabilities,
+        )
+        leaf = next(item for item in plan.leaves if item.role == "primary")
+        selection = build_campaign_selection(
+            plan, role="primary", leaf_ids=(leaf.leaf_id,)
+        )
+
+        class Backend:
+            identity = plan.backend_identity
+            precision_capabilities = capabilities
+
+            def __init__(self):
+                self.calls = []
+
+            def execute_stage(self, selected, digits):
+                self.calls.append(digits)
+                if digits == 64:
+                    return _authenticated_primary_stage(
+                        selected, digits, ComponentStatus.NOT_CONVERGED
+                    )
+                if digits == 80:
+                    outcome = _authenticated_primary_stage(
+                        selected,
+                        digits,
+                        status80,
+                        self_refinement_enclosed=self_refinement_enclosed,
+                        discrepancy_from_previous_abs=1.0e-9,
+                        discrepancy_enclosed=discrepancy_enclosed,
+                    )
+                    if evidence is not None:
+                        outcome = _with_baseline_conditioning(
+                            outcome, **evidence
+                        )
+                    return outcome
+                return _authenticated_primary_stage(
+                    selected,
+                    digits,
+                    ComponentStatus.CONVERGED,
+                    discrepancy_from_previous_abs=1.0e-10,
+                    discrepancy_enclosed=True,
+                )
+
+        temporary = tempfile.TemporaryDirectory()
+        checkpoint = Path(temporary.name) / "conditioning.json"
+        backend = Backend()
+        summary = run_campaign_selection(
+            plan, selection, backend, checkpoint, resume=False
+        )
+        reloaded = validate_campaign_checkpoint(plan, checkpoint)
+        return temporary, backend, summary, reloaded
+
+    def test_nonconverged_precision_limited_result_requests_120(self):
+        temporary, backend, summary, reloaded = self._run(evidence={
+            "predicted_reliable_digits": "11.2500",
+            "required_reliable_digits": "24",
+            "precision_limited": True,
+        })
+        self.addCleanup(temporary.cleanup)
+
+        self.assertEqual(backend.calls, [64, 80, 120])
+        decision = summary.records[0].stages[1].outcome.component_result[
+            "promotion_decision"
+        ]
+        self.assertEqual(decision, {
+            "schema": "windows-solver.precision-promotion-decision/1",
+            "from_precision_digits": 80,
+            "to_precision_digits": 120,
+            "state": "REQUESTED",
+            "reason": "INSUFFICIENT_RELIABLE_DIGITS",
+            "predicted_reliable_digits": "11.2500",
+            "required_reliable_digits": "24",
+            "precision_limited": True,
+            "asymptotic_preflight_avoided_ode": False,
+        })
+        self.assertEqual(
+            reloaded.records[0].stages[1].outcome.component_result[
+                "promotion_decision"
+            ],
+            decision,
+        )
+
+    def test_typed_raw_overflow_round_trips_through_campaign_checkpoint(self):
+        """Catches checkpoint persistence dropping typed optional raw evidence."""
+
+        temporary, backend, summary, reloaded = self._run(evidence={
+            "predicted_reliable_digits": "55.125",
+            "required_reliable_digits": "24",
+            "precision_limited": False,
+            "raw_determinant_evidence_status": "unavailable-overflow/v1",
+        })
+        self.addCleanup(temporary.cleanup)
+
+        self.assertEqual(backend.calls, [64, 80])
+        originating = ComponentResult.from_mapping(
+            summary.records[0].stages[1].outcome.component_result["result"]
+        ).baseline
+        restored = ComponentResult.from_mapping(
+            reloaded.records[0].stages[1].outcome.component_result["result"]
+        ).baseline
+        self.assertEqual(
+            originating.raw_determinant_evidence_status,
+            "unavailable-overflow/v1",
+        )
+        self.assertIsNone(originating.raw_determinant_abs)
+        self.assertEqual(restored.to_mapping(), originating.to_mapping())
+
+    def test_nonconverged_adequate_result_suppresses_120(self):
+        temporary, backend, summary, _ = self._run(evidence={
+            "predicted_reliable_digits": "55.12500000000000000001",
+            "required_reliable_digits": "24",
+            "precision_limited": False,
+        })
+        self.addCleanup(temporary.cleanup)
+
+        self.assertEqual(backend.calls, [64, 80])
+        self.assertEqual(summary.records[0].state, "UNRESOLVED")
+        decision = summary.records[0].stages[1].outcome.component_result[
+            "promotion_decision"
+        ]
+        self.assertEqual(decision["state"], "SUPPRESSED")
+        self.assertEqual(
+            decision["reason"], "PREDICTED_RELIABLE_DIGITS_ADEQUATE"
+        )
+        self.assertEqual(
+            decision["predicted_reliable_digits"],
+            "55.12500000000000000001",
+        )
+
+    def test_current_default_conditioning_preserves_prior_promotion(self):
+        temporary, backend, summary, _ = self._run(evidence=None)
+        self.addCleanup(temporary.cleanup)
+
+        self.assertEqual(backend.calls, [64, 80, 120])
+        decision = summary.records[0].stages[1].outcome.component_result[
+            "promotion_decision"
+        ]
+        self.assertEqual(decision["state"], "REQUESTED")
+        self.assertEqual(
+            decision["reason"], "INSUFFICIENT_RELIABLE_DIGITS"
+        )
+        self.assertEqual(decision["predicted_reliable_digits"], "11.25")
+        self.assertEqual(decision["required_reliable_digits"], "24")
+        self.assertIs(decision["precision_limited"], True)
+
+    def test_converged_refinement_gates_remain_authoritative(self):
+        temporary, backend, summary, _ = self._run(
+            evidence={
+                "predicted_reliable_digits": "11.25",
+                "required_reliable_digits": "24",
+                "precision_limited": True,
+            },
+            status80=ComponentStatus.CONVERGED,
+            self_refinement_enclosed=True,
+            discrepancy_enclosed=True,
+        )
+        self.addCleanup(temporary.cleanup)
+
+        self.assertEqual(backend.calls, [64, 80])
+        decision = summary.records[0].stages[1].outcome.component_result[
+            "promotion_decision"
+        ]
+        self.assertEqual(decision["state"], "SUPPRESSED")
+        self.assertEqual(
+            decision["reason"], "CONVERGED_PROMOTION_GATES_SATISFIED"
+        )
+
+    def test_deep_nonconverged_adequate_result_suppresses_120(self):
+        capabilities = PrecisionCapabilities((64, 80, 120))
+        plan = build_campaign_plan(
+            policy=NumericalPolicy(),
+            backend_identity=VettedNativeDeterminantKernel.identity,
+            precision_capabilities=capabilities,
+        )
+        leaf = next(item for item in plan.leaves if item.role == "deep")
+        selection = build_campaign_selection(
+            plan, role="deep", leaf_ids=(leaf.leaf_id,)
+        )
+
+        class Backend:
+            identity = plan.backend_identity
+            precision_capabilities = capabilities
+
+            def __init__(self):
+                self.calls = []
+
+            def execute_stage(self, selected, digits):
+                self.calls.append(digits)
+                if digits == 64:
+                    return replace(
+                        _authenticated_primary_stage(
+                            selected, digits, ComponentStatus.CONVERGED
+                        ),
+                        deep_diagnostics=diagnostics(digits=8.0),
+                    )
+                outcome = _authenticated_primary_stage(
+                    selected,
+                    digits,
+                    ComponentStatus.NOT_CONVERGED,
+                    self_refinement_enclosed=False,
+                    discrepancy_from_previous_abs=1.0e-9,
+                    discrepancy_enclosed=True,
+                )
+                return _with_baseline_conditioning(
+                    outcome,
+                    predicted_reliable_digits="52.12500000000000000001",
+                    required_reliable_digits="24",
+                    precision_limited=False,
+                )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            backend = Backend()
+            summary = run_campaign_selection(
+                plan,
+                selection,
+                backend,
+                Path(temporary) / "deep-conditioning.json",
+                resume=False,
+            )
+
+        self.assertEqual(backend.calls, [64, 80])
+        self.assertEqual(summary.records[0].state, "UNRESOLVED")
+        decision = summary.records[0].stages[1].outcome.component_result[
+            "promotion_decision"
+        ]
+        self.assertEqual(decision["state"], "SUPPRESSED")
+        self.assertEqual(
+            decision["reason"], "PREDICTED_RELIABLE_DIGITS_ADEQUATE"
+        )
+
+    def test_sentinel_false_negative_remains_mandatory_with_adequate_digits(self):
+        capabilities = PrecisionCapabilities((64, 80, 120))
+        plan = build_campaign_plan(
+            policy=NumericalPolicy(),
+            backend_identity=VettedNativeDeterminantKernel.identity,
+            precision_capabilities=capabilities,
+        )
+        leaf = next(item for item in plan.leaves if item.leaf_id == SENTINEL)
+        selection = build_campaign_selection(
+            plan, role="deep", leaf_ids=(leaf.leaf_id,)
+        )
+
+        class Backend:
+            identity = plan.backend_identity
+            precision_capabilities = capabilities
+
+            def __init__(self):
+                self.calls = []
+
+            def execute_stage(self, selected, digits):
+                self.calls.append(digits)
+                if digits == 64:
+                    return replace(
+                        _authenticated_primary_stage(
+                            selected, digits, ComponentStatus.CONVERGED
+                        ),
+                        deep_diagnostics=diagnostics(digits=12.0),
+                    )
+                if digits == 80:
+                    outcome = _authenticated_primary_stage(
+                        selected,
+                        digits,
+                        ComponentStatus.NOT_CONVERGED,
+                        self_refinement_enclosed=False,
+                        discrepancy_from_previous_abs=1.0e-8,
+                        discrepancy_enclosed=True,
+                    )
+                    return _with_baseline_conditioning(
+                        outcome,
+                        predicted_reliable_digits="55.125",
+                        required_reliable_digits="24",
+                        precision_limited=False,
+                    )
+                return _authenticated_primary_stage(
+                    selected,
+                    digits,
+                    ComponentStatus.CONVERGED,
+                    discrepancy_from_previous_abs=1.0e-9,
+                    discrepancy_enclosed=True,
+                )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            backend = Backend()
+            summary = run_campaign_selection(
+                plan,
+                selection,
+                backend,
+                Path(temporary) / "sentinel-conditioning.json",
+                resume=False,
+            )
+
+        self.assertEqual(backend.calls, [64, 80, 120])
+        self.assertEqual(
+            summary.records[0].state, "INVALID_SENTINEL_FALSE_NEGATIVE"
+        )
+        decision = summary.records[0].stages[1].outcome.component_result[
+            "promotion_decision"
+        ]
+        self.assertEqual(decision["state"], "REQUESTED")
+        self.assertEqual(decision["reason"], "SENTINEL_TRIGGER_FALSE_NEGATIVE")
+
+    def test_schema_five_cannot_strip_conditioning_and_promotion_decision(self):
+        temporary, _, _, _ = self._run(evidence={
+            "predicted_reliable_digits": "11.25",
+            "required_reliable_digits": "24",
+            "precision_limited": True,
+        })
+        self.addCleanup(temporary.cleanup)
+        checkpoint = Path(temporary.name) / "conditioning.json"
+        forged = json.loads(checkpoint.read_text(encoding="utf-8"))
+        self.assertEqual(forged["schema_version"], 6)
+        remove_promotion_decision_and_reseal(
+            forged, remove_conditioning=True
+        )
+        checkpoint.write_bytes(canonical_json_bytes(forged))
+
+        plan = build_campaign_plan(
+            policy=NumericalPolicy(),
+            backend_identity=VettedNativeDeterminantKernel.identity,
+            precision_capabilities=PrecisionCapabilities((64, 80, 120)),
+        )
+        with self.assertRaisesRegex(
+            ValueError, "scientific runtime lacks current conditioning"
+        ):
+            validate_campaign_checkpoint(plan, checkpoint)
+
+    def test_schema_six_rejects_resealed_package_evidence_downgraded_to_historical_shape(self):
+        """Catches current checkpoints inferring history from missing evidence."""
+
+        temporary, _, _, _ = self._run(evidence={
+            "predicted_reliable_digits": "11.25",
+            "required_reliable_digits": "24",
+            "precision_limited": True,
+        })
+        self.addCleanup(temporary.cleanup)
+        checkpoint = Path(temporary.name) / "conditioning.json"
+        forged = json.loads(checkpoint.read_text(encoding="utf-8"))
+        self.assertEqual(forged["schema_version"], 6)
+        component = forged["records"][0]["stages"][1]["component_result"]
+        component["scientific_runtime"].pop(
+            "regularised_gsn_precision_policy"
+        )
+        component["promotion_decision"] = {
+            "schema": "windows-solver.precision-promotion-decision/1",
+            "from_precision_digits": 80,
+            "to_precision_digits": 120,
+            "state": "REQUESTED",
+            "reason": "LEGACY_CONDITIONING_EVIDENCE_ABSENT",
+            "predicted_reliable_digits": None,
+            "required_reliable_digits": None,
+            "precision_limited": None,
+            "asymptotic_preflight_avoided_ode": None,
+        }
+        for readout in (
+            [component["result"]["baseline"]]
+            + [
+                item
+                for level in component["result"]["levels"]
+                for item in (
+                    level["real_plus"],
+                    level["real_minus"],
+                    level["imaginary_plus"],
+                    level["imaginary_minus"],
+                )
+            ]
+        ):
+            for field in (
+                "numerical_conditioning",
+                "normalised_determinant_abs",
+                "raw_determinant_abs",
+                "raw_determinant_evidence_status",
+                "worker_response_receipt",
+            ):
+                readout.pop(field, None)
+        source_sha256 = hashlib.sha256(
+            canonical_json_bytes(component)
+        ).hexdigest()
+        for channel in forged["records"][0]["stages"][1]["signed_error_channels"]:
+            channel["provenance"]["source_sha256"] = source_sha256
+        reseal(forged)
+        checkpoint.write_bytes(canonical_json_bytes(forged))
+
+        plan = build_campaign_plan(
+            policy=NumericalPolicy(),
+            backend_identity=VettedNativeDeterminantKernel.identity,
+            precision_capabilities=PrecisionCapabilities((64, 80, 120)),
+        )
+        with self.assertRaisesRegex(
+            ValueError, "current conditioning evidence"
+        ):
+            validate_campaign_checkpoint(plan, checkpoint)
+
+        component["evidence_kind"] = "authenticated-primary-precision-contract"
+        source_sha256 = hashlib.sha256(
+            canonical_json_bytes(component)
+        ).hexdigest()
+        for channel in forged["records"][0]["stages"][1][
+            "signed_error_channels"
+        ]:
+            channel["provenance"]["source_sha256"] = source_sha256
+        reseal(forged)
+        checkpoint.write_bytes(canonical_json_bytes(forged))
+        with self.assertRaisesRegex(
+            ValueError, "current promoted evidence kind"
+        ):
+            validate_campaign_checkpoint(plan, checkpoint)
+
+    def test_schema_four_allows_historical_missing_decision_and_conditioning(self):
+        temporary, _, _, _ = self._run(evidence=None)
+        self.addCleanup(temporary.cleanup)
+        checkpoint = Path(temporary.name) / "conditioning.json"
+        historical = json.loads(checkpoint.read_text(encoding="utf-8"))
+        remove_promotion_decision_and_reseal(
+            historical, historical_shape=True
+        )
+        historical["schema_version"] = 4
+        checkpoint.write_bytes(canonical_json_bytes(historical))
+
+        plan = build_campaign_plan(
+            policy=NumericalPolicy(),
+            backend_identity=VettedNativeDeterminantKernel.identity,
+            precision_capabilities=PrecisionCapabilities((64, 80, 120)),
+        )
+        restored = validate_campaign_checkpoint(plan, checkpoint)
+
+        self.assertNotIn(
+            "promotion_decision",
+            restored.records[0].stages[1].outcome.component_result,
+        )
+
+    def test_schema_four_without_decision_is_not_resealed_on_resume(self):
+        temporary, backend, _, _ = self._run(evidence=None)
+        self.addCleanup(temporary.cleanup)
+        checkpoint = Path(temporary.name) / "conditioning.json"
+        historical = json.loads(checkpoint.read_text(encoding="utf-8"))
+        remove_promotion_decision_and_reseal(
+            historical, historical_shape=True
+        )
+        historical["schema_version"] = 4
+        checkpoint.write_bytes(canonical_json_bytes(historical))
+        original = checkpoint.read_bytes()
+
+        plan = build_campaign_plan(
+            policy=NumericalPolicy(),
+            backend_identity=VettedNativeDeterminantKernel.identity,
+            precision_capabilities=PrecisionCapabilities((64, 80, 120)),
+        )
+        leaf = next(item for item in plan.leaves if item.role == "primary")
+        selection = build_campaign_selection(
+            plan, role="primary", leaf_ids=(leaf.leaf_id,)
+        )
+        backend.calls.clear()
+
+        with self.assertRaisesRegex(ValueError, "current conditioning evidence"):
+            run_campaign_selection(
+                plan,
+                selection,
+                backend,
+                checkpoint,
+                resume=True,
+            )
+
+        self.assertEqual(backend.calls, [])
+        self.assertEqual(checkpoint.read_bytes(), original)
+
+    def test_schema_four_without_decision_is_not_merged_as_schema_five(self):
+        temporary, _, _, _ = self._run(evidence=None)
+        self.addCleanup(temporary.cleanup)
+        checkpoint = Path(temporary.name) / "conditioning.json"
+        historical = json.loads(checkpoint.read_text(encoding="utf-8"))
+        remove_promotion_decision_and_reseal(
+            historical, historical_shape=True
+        )
+        historical["schema_version"] = 4
+        checkpoint.write_bytes(canonical_json_bytes(historical))
+        output = Path(temporary.name) / "merged.json"
+
+        plan = build_campaign_plan(
+            policy=NumericalPolicy(),
+            backend_identity=VettedNativeDeterminantKernel.identity,
+            precision_capabilities=PrecisionCapabilities((64, 80, 120)),
+        )
+        with self.assertRaisesRegex(ValueError, "current conditioning evidence"):
+            merge_campaign_checkpoints(plan, (checkpoint,), output)
+
+        self.assertFalse(output.exists())
 
 
 class PrimaryPrecisionTests(unittest.TestCase):
@@ -306,6 +1172,32 @@ class PrimaryPrecisionTests(unittest.TestCase):
                     },
                 },
             },
+        )
+        alternate = contract["failed_preflight_alternate"]
+        self.assertEqual(
+            alternate["control_predecessor"],
+            {
+                "precision_digits": 80,
+                "failure_code": "INSUFFICIENT_ASYMPTOTIC_PRECISION",
+                "failure_class": "CONTROL",
+                "retryable": True,
+                "request_binding_required": True,
+                "asymptotic_preflight_avoided_ode": True,
+                "factored_homogeneous_rhs_evaluations": 0,
+                "avoided_ode_scope": "factored-homogeneous-gsn/v1",
+            },
+        )
+        self.assertEqual(alternate["terminal_precision_sequence"], [64, 120])
+        self.assertEqual(
+            alternate["comparison_kind"],
+            "same-precision-120-base-vs-refinement/v1",
+        )
+        self.assertIs(
+            alternate["precision_ladder_discrepancy_applicable"], False
+        )
+        self.assertEqual(
+            alternate["terminal_state"]["fixed_precision_sentinel"],
+            "UNRESOLVED",
         )
 
     def test_authenticated_primary_not_converged_recovers_at_80_or_each_120_gate(self) -> None:
@@ -540,8 +1432,19 @@ class PromotedResourceContainmentTests(unittest.TestCase):
         return plan, capabilities, selection, incident, following
 
     @staticmethod
-    def _failure(error_class, failure_code, *, timed_out=False):
-        error = error_class(f"synthetic {failure_code}")
+    def _failure(
+        error_class,
+        failure_code,
+        *,
+        timed_out=False,
+        leaf=None,
+        precision_digits=80,
+    ):
+        error = (
+            error_class(f"synthetic {failure_code}", failure_code)
+            if error_class is julia_backend.JuliaNumericalControlError
+            else error_class(f"synthetic {failure_code}")
+        )
         error.worker_failure = {
             "worker_exit_code": None if timed_out else 1,
             "worker_timed_out": timed_out,
@@ -551,8 +1454,12 @@ class PromotedResourceContainmentTests(unittest.TestCase):
             "failure": {
                 "failure_code": failure_code,
                 "failure_class": "CONTROL",
-                "retryable": True,
-                "precision_digits": 80,
+                "retryable": (
+                    failure_code == "INSUFFICIENT_ASYMPTOTIC_PRECISION"
+                    if error_class is julia_backend.JuliaNumericalControlError
+                    else True
+                ),
+                "precision_digits": precision_digits,
                 "readout_index": 1,
                 "readout_role": "baseline",
                 "root_phase": "PRIMARY",
@@ -581,12 +1488,47 @@ class PromotedResourceContainmentTests(unittest.TestCase):
                 },
             },
         }
+        if leaf is not None:
+            request_binding = julia_backend.JuliaPrecisionRootBackend(
+                leaf.job.backend_identity,
+                object(),
+                precision_digits,
+                refinement=0,
+            )._request(leaf.job, 0.0j)
+            request_sha256 = hashlib.sha256(
+                canonical_json_bytes(request_binding)
+            ).hexdigest()
+            error.worker_failure["failure"].update({
+                "request_sha256": request_sha256,
+                "request_binding": request_binding,
+                "job_id": leaf.job.job_id,
+                "leaf_id": leaf.leaf_id,
+                "role": leaf.role,
+                "job_policy_sha256": leaf.job.policy.identity_sha256,
+                "backend_identity_sha256": (
+                    leaf.job.backend_identity.identity_sha256
+                ),
+                "refinement_level": 0,
+                "execution_resource_policy": {
+                    name: request_binding["execution_resource"][name]
+                    for name in ("schema", "version", "sha256")
+                },
+            })
+        if error_class is julia_backend.JuliaNumericalControlError:
+            error.worker_failure["failure"]["diagnostics"] = {
+                "predicted_reliable_digits": "11.25000000000000000001",
+                "required_reliable_digits": "24",
+                "asymptotic_preflight_avoided_ode": True,
+                "asymptotic_preflight_reason": failure_code,
+                "factored_homogeneous_rhs_evaluations": 0,
+                "avoided_ode_scope": "factored-homogeneous-gsn/v1",
+            }
         return error
 
     def _run_with_failure(self, error_class, failure_code, *, timed_out=False):
         plan, capabilities, selection, incident, following = self._plan_and_leaves()
         failure = self._failure(
-            error_class, failure_code, timed_out=timed_out
+            error_class, failure_code, timed_out=timed_out, leaf=incident
         )
 
         class Backend:
@@ -606,6 +1548,14 @@ class PromotedResourceContainmentTests(unittest.TestCase):
                     raise failure
                 return _authenticated_primary_stage(
                     leaf, digits, ComponentStatus.CONVERGED
+                )
+
+            def execute_promoted_stage_after_failed_preflight(
+                self, leaf, digits, predecessor
+            ):
+                self.calls.append((leaf.leaf_id, digits))
+                return _authenticated_failed_preflight_recovery_stage(
+                    leaf, predecessor
                 )
 
         temporary = tempfile.TemporaryDirectory()
@@ -657,7 +1607,7 @@ class PromotedResourceContainmentTests(unittest.TestCase):
         checkpoint = json.loads(
             (root / "checkpoint.json").read_text(encoding="utf-8")
         )
-        self.assertEqual(checkpoint["schema_version"], 4)
+        self.assertEqual(checkpoint["schema_version"], 6)
         self.assertEqual(len(checkpoint["attempts"]), 1)
         self.assertEqual(
             checkpoint["attempts_sha256"],
@@ -708,6 +1658,1172 @@ class PromotedResourceContainmentTests(unittest.TestCase):
         self.assertEqual(store.stored_count, 1)
         self.assertEqual(summary.attempts[0].failure_code, "WORKER_TIMEOUT")
         self.assertEqual(summary.attempts[0].state, "WORKER_TIMEOUT")
+
+    def test_every_numerical_control_failure_is_durably_contained(self):
+        for code in sorted(julia_backend.NUMERICAL_CONTROL_FAILURE_CODES):
+            with self.subTest(code=code):
+                run = self._run_with_failure(
+                    julia_backend.JuliaNumericalControlError,
+                    code,
+                )
+                (
+                    temporary,
+                    root,
+                    plan,
+                    _,
+                    incident,
+                    following,
+                    backend,
+                    store,
+                    summary,
+                ) = run
+                self.addCleanup(temporary.cleanup)
+
+                records = {item.leaf_id: item for item in summary.records}
+                self.assertEqual(summary.attempts[0].failure_code, code)
+                self.assertEqual(
+                    summary.attempts[0].state, "NUMERICAL_CONTROL_FAILURE"
+                )
+                self.assertEqual(records[following.leaf_id].state, "PRODUCED")
+                self.assertIn((following.leaf_id, 64), backend.calls)
+                self.assertIs(
+                    records[incident.leaf_id].to_mapping()["computed"],
+                    code == "INSUFFICIENT_ASYMPTOTIC_PRECISION",
+                )
+
+                persisted = summary.attempts[0].failure_receipt["failure"]
+                self.assertEqual(persisted["failure_code"], code)
+                self.assertEqual(
+                    persisted["execution_resource_policy"]["sha256"],
+                    persisted["request_binding"]["execution_resource"][
+                        "sha256"
+                    ],
+                )
+                decision = persisted["promotion_decision"]
+                self.assertEqual(
+                    decision["state"],
+                    (
+                        "REQUESTED"
+                        if code == "INSUFFICIENT_ASYMPTOTIC_PRECISION"
+                        else "SUPPRESSED"
+                    ),
+                )
+                self.assertEqual(decision["reason"], code)
+                if code == "INSUFFICIENT_ASYMPTOTIC_PRECISION":
+                    self.assertIn((incident.leaf_id, 120), backend.calls)
+                    self.assertEqual(records[incident.leaf_id].state, "PRODUCED")
+                    self.assertEqual(store.stored_count, 2)
+                    imported_store = SolvedLeafStore(root / "imported-solved")
+                    imported = import_campaign_checkpoint_to_solved_leaf_store(
+                        plan,
+                        root / "checkpoint.json",
+                        imported_store,
+                    )
+                    self.assertEqual(imported.imported_count, 2)
+                    self.assertEqual(imported_store.stored_count, 2)
+                else:
+                    self.assertNotIn((incident.leaf_id, 120), backend.calls)
+                if code == "INSUFFICIENT_ASYMPTOTIC_PRECISION":
+                    self.assertEqual(
+                        decision["predicted_reliable_digits"],
+                        "11.25000000000000000001",
+                    )
+                    self.assertEqual(
+                        decision["required_reliable_digits"], "24"
+                    )
+                    self.assertIs(
+                        decision["asymptotic_preflight_avoided_ode"], True
+                    )
+                reloaded = validate_campaign_checkpoint(
+                    plan, root / "checkpoint.json"
+                )
+                self.assertEqual(
+                    reloaded.attempts[0].to_mapping(),
+                    summary.attempts[0].to_mapping(),
+                )
+
+    def test_insufficient_preflight_uses_authenticated_120_refinement_path(self):
+        plan, capabilities, _, incident, _ = self._plan_and_leaves()
+        selection = build_campaign_selection(
+            plan, role="primary", leaf_ids=(incident.leaf_id,)
+        )
+        failure = self._failure(
+            julia_backend.JuliaNumericalControlError,
+            "INSUFFICIENT_ASYMPTOTIC_PRECISION",
+            leaf=incident,
+        )
+
+        class Backend:
+            identity = plan.backend_identity
+            precision_capabilities = capabilities
+
+            def __init__(self):
+                self.calls = []
+
+            def execute_stage(self, leaf, digits):
+                self.calls.append(("ordinary", digits))
+                if digits == 64:
+                    return _authenticated_primary_stage(
+                        leaf, digits, ComponentStatus.NOT_CONVERGED
+                    )
+                raise failure
+
+            def execute_promoted_stage_after_failed_preflight(
+                self, leaf, digits, predecessor
+            ):
+                self.calls.append(("failed-preflight", digits))
+                return _authenticated_failed_preflight_recovery_stage(
+                    leaf, predecessor
+                )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            checkpoint = Path(temporary) / "checkpoint.json"
+            backend = Backend()
+            summary = run_campaign_selection(
+                plan,
+                selection,
+                backend,
+                checkpoint,
+                resume=False,
+            )
+            reloaded = validate_campaign_checkpoint(plan, checkpoint)
+
+        self.assertEqual(
+            backend.calls,
+            [("ordinary", 64), ("ordinary", 80), ("failed-preflight", 120)],
+        )
+        self.assertEqual(summary.state, "COMPLETE")
+        self.assertEqual(summary.records[0].state, "PRODUCED")
+        self.assertEqual(
+            tuple(stage.outcome.digits for stage in summary.records[0].stages),
+            (64, 120),
+        )
+        recovered = summary.records[0].stages[-1].outcome
+        self.assertIsNone(recovered.discrepancy_from_previous_abs)
+        self.assertIsNone(recovered.discrepancy_enclosed)
+        self.assertEqual(
+            recovered.component_result["comparison_kind"],
+            "same-precision-120-base-vs-refinement/v1",
+        )
+        self.assertIs(
+            recovered.component_result[
+                "precision_ladder_discrepancy_applicable"
+            ],
+            False,
+        )
+        precision_channel = next(
+            channel
+            for channel in recovered.signed_error_channels
+            if channel["family"] == "precision-ladder-discrepancy"
+        )
+        self.assertEqual(
+            precision_channel["provenance"]["derivation"],
+            "not-applicable-precision-ladder-discrepancy",
+        )
+        self.assertEqual(
+            precision_channel["signed_delta"],
+            {"real": 0.0, "imaginary": 0.0},
+        )
+        self.assertEqual(
+            recovered.component_result["failed_preflight_predecessor"],
+            summary.attempts[0].to_mapping(),
+        )
+        self.assertEqual(
+            reloaded.records[0].to_mapping(),
+            summary.records[0].to_mapping(),
+        )
+
+    def test_failed_preflight_resume_requests_only_missing_120_precision(self):
+        plan, _, _, incident, _ = self._plan_and_leaves()
+        selection = build_campaign_selection(
+            plan, role="primary", leaf_ids=(incident.leaf_id,)
+        )
+        failure = self._failure(
+            julia_backend.JuliaNumericalControlError,
+            "INSUFFICIENT_ASYMPTOTIC_PRECISION",
+            leaf=incident,
+        )
+
+        class InitialBackend:
+            identity = plan.backend_identity
+            precision_capabilities = PrecisionCapabilities((64, 80))
+
+            def __init__(self):
+                self.calls = []
+
+            def execute_stage(self, leaf, digits):
+                self.calls.append(digits)
+                if digits == 64:
+                    return _authenticated_primary_stage(
+                        leaf, digits, ComponentStatus.NOT_CONVERGED
+                    )
+                raise failure
+
+        class ResumeBackend:
+            identity = plan.backend_identity
+            precision_capabilities = PrecisionCapabilities((64, 80, 120))
+
+            def __init__(self):
+                self.calls = []
+
+            def execute_stage(self, _leaf, digits):
+                self.calls.append(("unexpected-ordinary", digits))
+                raise AssertionError("resume must not repeat the 80-digit stage")
+
+            def execute_promoted_stage_after_failed_preflight(
+                self, leaf, digits, predecessor
+            ):
+                self.calls.append(("failed-preflight", digits))
+                return _authenticated_failed_preflight_recovery_stage(
+                    leaf, predecessor
+                )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            checkpoint = Path(temporary) / "checkpoint.json"
+            initial_backend = InitialBackend()
+            first = run_campaign_selection(
+                plan,
+                selection,
+                initial_backend,
+                checkpoint,
+                resume=False,
+            )
+            self.assertEqual(first.records[0].state, "MISSING_PRECISION")
+            self.assertEqual(first.records[0].missing_precision_digits, 120)
+            self.assertEqual(initial_backend.calls, [64, 80])
+
+            resume_backend = ResumeBackend()
+            resumed = run_campaign_selection(
+                plan,
+                selection,
+                resume_backend,
+                checkpoint,
+                resume=True,
+            )
+
+        self.assertEqual(
+            resume_backend.calls, [("failed-preflight", 120)]
+        )
+        self.assertEqual(resumed.state, "COMPLETE")
+        self.assertEqual(resumed.records[0].state, "PRODUCED")
+        self.assertEqual(
+            tuple(stage.outcome.digits for stage in resumed.records[0].stages),
+            (64, 120),
+        )
+
+    def test_failed_preflight_recovery_fails_closed_at_each_terminal_gate(self):
+        def base_limited(outcome):
+            return _condition_failed_preflight_result(
+                outcome,
+                "result",
+                predicted_reliable_digits="11",
+                precision_limited=True,
+            )
+
+        def refinement_limited(outcome):
+            return _condition_failed_preflight_result(
+                outcome,
+                "self_refinement_result",
+                predicted_reliable_digits="11",
+                precision_limited=True,
+            )
+
+        def refinement_not_converged(outcome):
+            component = dict(outcome.component_result)
+            refinement = ComponentResult.from_mapping(
+                component["self_refinement_result"]
+            )
+            component["self_refinement_result"] = replace(
+                refinement,
+                status=ComponentStatus.NOT_CONVERGED,
+                convergence_basis="UNRESOLVED",
+                response=None,
+                signed_root_crosscheck=None,
+                closed_form_response=None,
+            ).to_mapping()
+            component["same_precision_refinement_discrepancy_abs"] = 0.0
+            return _reseal_failed_preflight_recovery_stage(
+                outcome, component, self_refinement_enclosed=False
+            )
+
+        def refinement_unenclosed(outcome):
+            component = dict(outcome.component_result)
+            base = ComponentResult.from_mapping(component["result"])
+            refinement = ComponentResult.from_mapping(
+                component["self_refinement_result"]
+            )
+            shifted_response = base.response + complex(1.0, 0.0)
+            component["self_refinement_result"] = replace(
+                refinement,
+                response=shifted_response,
+                signed_root_crosscheck=shifted_response,
+            ).to_mapping()
+            component["same_precision_refinement_discrepancy_abs"] = 1.0
+            return _reseal_failed_preflight_recovery_stage(
+                outcome, component, self_refinement_enclosed=False
+            )
+
+        for label, mutate in (
+            ("base-conditioning", base_limited),
+            ("refinement-conditioning", refinement_limited),
+            ("refinement-nonconverged", refinement_not_converged),
+            ("delta-unenclosed", refinement_unenclosed),
+        ):
+            with self.subTest(label=label):
+                plan, capabilities, _, incident, _ = self._plan_and_leaves()
+                selection = build_campaign_selection(
+                    plan, role="primary", leaf_ids=(incident.leaf_id,)
+                )
+                failure = self._failure(
+                    julia_backend.JuliaNumericalControlError,
+                    "INSUFFICIENT_ASYMPTOTIC_PRECISION",
+                    leaf=incident,
+                )
+
+                class Backend:
+                    identity = plan.backend_identity
+                    precision_capabilities = capabilities
+
+                    def execute_stage(self, leaf, digits):
+                        if digits == 64:
+                            return _authenticated_primary_stage(
+                                leaf, digits, ComponentStatus.NOT_CONVERGED
+                            )
+                        raise failure
+
+                    def execute_promoted_stage_after_failed_preflight(
+                        self, leaf, digits, predecessor
+                    ):
+                        outcome = _authenticated_failed_preflight_recovery_stage(
+                            leaf, predecessor
+                        )
+                        return mutate(outcome)
+
+                with tempfile.TemporaryDirectory() as temporary:
+                    checkpoint = Path(temporary) / f"{label}.json"
+                    summary = run_campaign_selection(
+                        plan,
+                        selection,
+                        Backend(),
+                        checkpoint,
+                        resume=False,
+                    )
+                    reloaded = validate_campaign_checkpoint(plan, checkpoint)
+
+                self.assertEqual(summary.records[0].state, "UNRESOLVED")
+                self.assertEqual(reloaded.records[0].state, "UNRESOLVED")
+                self.assertIsNone(_produced_response(summary.records[0]))
+
+    def test_failed_preflight_recovery_rejects_forged_refinement_runtime(self):
+        plan, capabilities, _, incident, _ = self._plan_and_leaves()
+        selection = build_campaign_selection(
+            plan, role="primary", leaf_ids=(incident.leaf_id,)
+        )
+        failure = self._failure(
+            julia_backend.JuliaNumericalControlError,
+            "INSUFFICIENT_ASYMPTOTIC_PRECISION",
+            leaf=incident,
+        )
+
+        class Backend:
+            identity = plan.backend_identity
+            precision_capabilities = capabilities
+
+            def execute_stage(self, leaf, digits):
+                if digits == 64:
+                    return _authenticated_primary_stage(
+                        leaf, digits, ComponentStatus.NOT_CONVERGED
+                    )
+                raise failure
+
+            def execute_promoted_stage_after_failed_preflight(
+                self, leaf, digits, predecessor
+            ):
+                outcome = _authenticated_failed_preflight_recovery_stage(
+                    leaf, predecessor
+                )
+                component = dict(outcome.component_result)
+                runtime = dict(
+                    component["self_refinement_scientific_runtime"]
+                )
+                runtime["worker_sha256"] = "f" * 64
+                component["self_refinement_scientific_runtime"] = runtime
+                return _reseal_failed_preflight_recovery_stage(
+                    outcome, component
+                )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            with self.assertRaisesRegex(ValueError, "paired runtime identity"):
+                run_campaign_selection(
+                    plan,
+                    selection,
+                    Backend(),
+                    Path(temporary) / "forged-runtime.json",
+                    resume=False,
+                )
+
+    def test_failed_preflight_recovery_authenticates_embedded_and_refinement_evidence(self):
+        def missing_predecessor(component):
+            component.pop("failed_preflight_predecessor")
+
+        def forged_refinement_readout(component):
+            component["self_refinement_result"]["baseline"]["branch_id"] = (
+                "forged-branch"
+            )
+
+        def forged_predecessor_code(component):
+            predecessor = component["failed_preflight_predecessor"]
+            predecessor["failure_code"] = "SCATTERING_BASIS_ILL_CONDITIONED"
+            predecessor["failure_receipt"]["failure"]["failure_code"] = (
+                "SCATTERING_BASIS_ILL_CONDITIONED"
+            )
+            predecessor["attempt_sha256"] = hashlib.sha256(
+                canonical_json_bytes({
+                    key: value
+                    for key, value in predecessor.items()
+                    if key != "attempt_sha256"
+                })
+            ).hexdigest()
+
+        def fake_cross_precision_evidence(component):
+            component["precision80_result"] = component["result"]
+            component["cross_precision_discrepancy_abs"] = 0.0
+
+        for label, mutate, message in (
+            (
+                "missing-predecessor",
+                missing_predecessor,
+                "recovery component fields",
+            ),
+            (
+                "forged-predecessor-code",
+                forged_predecessor_code,
+                "receipt numerical-control diagnostics|predecessor identity",
+            ),
+            (
+                "fake-cross-precision-evidence",
+                fake_cross_precision_evidence,
+                "recovery component fields",
+            ),
+            (
+                "forged-refinement-readout",
+                forged_refinement_readout,
+                "readout lineage",
+            ),
+        ):
+            with self.subTest(label=label):
+                plan, capabilities, _, incident, _ = self._plan_and_leaves()
+                selection = build_campaign_selection(
+                    plan, role="primary", leaf_ids=(incident.leaf_id,)
+                )
+                failure = self._failure(
+                    julia_backend.JuliaNumericalControlError,
+                    "INSUFFICIENT_ASYMPTOTIC_PRECISION",
+                    leaf=incident,
+                )
+
+                class Backend:
+                    identity = plan.backend_identity
+                    precision_capabilities = capabilities
+
+                    def execute_stage(self, leaf, digits):
+                        if digits == 64:
+                            return _authenticated_primary_stage(
+                                leaf, digits, ComponentStatus.NOT_CONVERGED
+                            )
+                        raise failure
+
+                    def execute_promoted_stage_after_failed_preflight(
+                        self, leaf, digits, predecessor
+                    ):
+                        outcome = _authenticated_failed_preflight_recovery_stage(
+                            leaf, predecessor
+                        )
+                        component = json.loads(json.dumps(
+                            outcome.component_result
+                        ))
+                        mutate(component)
+                        return _reseal_failed_preflight_recovery_stage(
+                            outcome, component
+                        )
+
+                with tempfile.TemporaryDirectory() as temporary:
+                    with self.assertRaisesRegex(ValueError, message):
+                        run_campaign_selection(
+                            plan,
+                            selection,
+                            Backend(),
+                            Path(temporary) / f"{label}.json",
+                            resume=False,
+                        )
+
+    def test_failed_preflight_120_control_failure_remains_partial(self):
+        plan, capabilities, _, incident, _ = self._plan_and_leaves()
+        selection = build_campaign_selection(
+            plan, role="primary", leaf_ids=(incident.leaf_id,)
+        )
+        failure80 = self._failure(
+            julia_backend.JuliaNumericalControlError,
+            "INSUFFICIENT_ASYMPTOTIC_PRECISION",
+            leaf=incident,
+        )
+        failure120 = self._failure(
+            julia_backend.JuliaODEResourceLimitError,
+            "ODE_RESOURCE_LIMIT",
+            leaf=incident,
+            precision_digits=120,
+        )
+
+        class Backend:
+            identity = plan.backend_identity
+            precision_capabilities = capabilities
+
+            def execute_stage(self, leaf, digits):
+                if digits == 64:
+                    return _authenticated_primary_stage(
+                        leaf, digits, ComponentStatus.NOT_CONVERGED
+                    )
+                raise failure80
+
+            def execute_promoted_stage_after_failed_preflight(
+                self, leaf, digits, predecessor
+            ):
+                raise failure120
+
+        with tempfile.TemporaryDirectory() as temporary:
+            checkpoint = Path(temporary) / "failed-120.json"
+            summary = run_campaign_selection(
+                plan,
+                selection,
+                Backend(),
+                checkpoint,
+                resume=False,
+            )
+            reloaded = validate_campaign_checkpoint(plan, checkpoint)
+
+        self.assertEqual(summary.state, "PARTIAL")
+        self.assertEqual(summary.records[0].state, "IN_PROGRESS")
+        self.assertEqual(
+            tuple(stage.outcome.digits for stage in summary.records[0].stages),
+            (64,),
+        )
+        self.assertEqual(
+            [attempt.precision_digits for attempt in summary.attempts],
+            [80, 120],
+        )
+        self.assertEqual(
+            [attempt.attempt_sha256 for attempt in reloaded.attempts],
+            [attempt.attempt_sha256 for attempt in summary.attempts],
+        )
+
+    def test_cached_failed_preflight_recovery_materializes_predecessor_before_checkpointing(self):
+        """Catches cache reuse losing the outer 80-digit control attempt."""
+
+        plan, capabilities, _, incident, following = self._plan_and_leaves()
+        cached_selection = build_campaign_selection(
+            plan, role="primary", leaf_ids=(following.leaf_id,)
+        )
+        selection = build_campaign_selection(
+            plan, role="primary", leaf_ids=(incident.leaf_id, following.leaf_id)
+        )
+        failure = self._failure(
+            julia_backend.JuliaNumericalControlError,
+            "INSUFFICIENT_ASYMPTOTIC_PRECISION",
+            leaf=following,
+        )
+        deferred = self._failure(
+            julia_backend.JuliaODEResourceLimitError,
+            "ODE_RESOURCE_LIMIT",
+            leaf=incident,
+        )
+
+        class OriginatingBackend:
+            identity = plan.backend_identity
+            precision_capabilities = capabilities
+
+            def execute_stage(self, leaf, digits):
+                if digits == 64:
+                    return _authenticated_primary_stage(
+                        leaf, digits, ComponentStatus.NOT_CONVERGED
+                    )
+                raise failure
+
+            def execute_promoted_stage_after_failed_preflight(
+                self, leaf, digits, predecessor
+            ):
+                return _authenticated_failed_preflight_recovery_stage(
+                    leaf, predecessor
+                )
+
+        class CacheOnlyBackend:
+            identity = plan.backend_identity
+            precision_capabilities = capabilities
+
+            def execute_stage(self, leaf, digits):
+                if leaf.leaf_id == incident.leaf_id and digits == 64:
+                    return _authenticated_primary_stage(
+                        leaf, digits, ComponentStatus.NOT_CONVERGED
+                    )
+                if leaf.leaf_id == incident.leaf_id and digits == 80:
+                    raise deferred
+                raise AssertionError("cache hit must not execute the leaf")
+
+            def execute_promoted_stage_after_failed_preflight(
+                self, _leaf, _digits, _predecessor
+            ):
+                raise AssertionError("cache hit must not recover the leaf")
+
+        class ResumeBackend:
+            identity = plan.backend_identity
+            precision_capabilities = capabilities
+
+            def __init__(self):
+                self.calls = []
+
+            def execute_stage(self, leaf, digits):
+                self.calls.append((leaf.leaf_id, digits))
+                if leaf.leaf_id != incident.leaf_id or digits != 80:
+                    raise AssertionError("resume must not execute the cached leaf")
+                return _authenticated_primary_stage(
+                    leaf,
+                    digits,
+                    ComponentStatus.CONVERGED,
+                    self_refinement_enclosed=True,
+                    discrepancy_from_previous_abs=1.0e-9,
+                    discrepancy_enclosed=True,
+                )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            store = SolvedLeafStore(root / "solved")
+            run_campaign_selection(
+                plan,
+                cached_selection,
+                OriginatingBackend(),
+                root / "originating.json",
+                resume=False,
+                solved_leaf_store=store,
+            )
+            cached = run_campaign_selection(
+                plan,
+                selection,
+                CacheOnlyBackend(),
+                root / "cached.json",
+                resume=False,
+                solved_leaf_store=store,
+            )
+            validated = validate_campaign_checkpoint(plan, root / "cached.json")
+            resume_backend = ResumeBackend()
+            resumed = run_campaign_selection(
+                plan,
+                selection,
+                resume_backend,
+                root / "cached.json",
+                resume=True,
+                solved_leaf_store=store,
+            )
+
+        self.assertEqual(cached.state, "PARTIAL")
+        self.assertEqual(len(validated.attempts), 2)
+        self.assertEqual(
+            validated.records[1].stages[-1].outcome.component_result[
+                "failed_preflight_predecessor"
+            ],
+            validated.attempts[1].to_mapping(),
+        )
+        self.assertEqual(validated.attempts[1].attempt_ordinal, 2)
+        self.assertEqual(validated.attempts[1].leaf_index, 2)
+        self.assertEqual(resume_backend.calls, [(incident.leaf_id, 80)])
+        self.assertEqual(resumed.state, "COMPLETE")
+
+    def test_120_asymptotic_failure_is_durable_and_not_retried_on_resume(self):
+        """Catches promoting an already-contained 120-digit control failure."""
+
+        plan, capabilities, selection, incident, following = self._plan_and_leaves()
+        failure80 = self._failure(
+            julia_backend.JuliaNumericalControlError,
+            "INSUFFICIENT_ASYMPTOTIC_PRECISION",
+            leaf=incident,
+        )
+        failure120 = self._failure(
+            julia_backend.JuliaNumericalControlError,
+            "INSUFFICIENT_ASYMPTOTIC_PRECISION",
+            leaf=incident,
+            precision_digits=120,
+        )
+
+        class InitialBackend:
+            identity = plan.backend_identity
+            precision_capabilities = capabilities
+
+            def __init__(self):
+                self.calls = []
+
+            def execute_stage(self, leaf, digits):
+                self.calls.append((leaf.leaf_id, digits))
+                if leaf.leaf_id == incident.leaf_id:
+                    if digits == 64:
+                        return _authenticated_primary_stage(
+                            leaf, digits, ComponentStatus.NOT_CONVERGED
+                        )
+                    raise failure80
+                return _authenticated_primary_stage(
+                    leaf, digits, ComponentStatus.CONVERGED
+                )
+
+            def execute_promoted_stage_after_failed_preflight(
+                self, leaf, digits, predecessor
+            ):
+                self.calls.append((leaf.leaf_id, digits))
+                raise failure120
+
+        class ResumeBackend:
+            identity = plan.backend_identity
+            precision_capabilities = capabilities
+
+            def execute_stage(self, _leaf, _digits):
+                raise AssertionError("resume must retain the deferred leaf")
+
+            def execute_promoted_stage_after_failed_preflight(
+                self, _leaf, _digits, _predecessor
+            ):
+                raise AssertionError("resume must not repeat the 120-digit failure")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            checkpoint = Path(temporary) / "failed-120-asymptotic.json"
+            backend = InitialBackend()
+            first = run_campaign_selection(
+                plan, selection, backend, checkpoint, resume=False
+            )
+            reloaded = validate_campaign_checkpoint(plan, checkpoint)
+            resumed = run_campaign_selection(
+                plan, selection, ResumeBackend(), checkpoint, resume=True
+            )
+            forged = json.loads(checkpoint.read_text(encoding="utf-8"))
+            recovery_attempt = forged["attempts"][1]
+            recovery_failure = recovery_attempt["failure_receipt"]["failure"]
+            recovery_failure["request_binding"]["job_id"] = following.job.job_id
+            recovery_failure["request_sha256"] = hashlib.sha256(
+                canonical_json_bytes(recovery_failure["request_binding"])
+            ).hexdigest()
+            recovery_attempt["attempt_sha256"] = hashlib.sha256(
+                canonical_json_bytes({
+                    key: value
+                    for key, value in recovery_attempt.items()
+                    if key != "attempt_sha256"
+                })
+            ).hexdigest()
+            forged["attempts_sha256"] = hashlib.sha256(
+                canonical_json_bytes(forged["attempts"])
+            ).hexdigest()
+            forged_path = Path(temporary) / "forged-120-asymptotic.json"
+            forged_path.write_bytes(canonical_json_bytes(forged))
+            with self.assertRaisesRegex(
+                ValueError, "canonical request identity"
+            ):
+                validate_campaign_checkpoint(plan, forged_path)
+
+        records = {record.leaf_id: record for record in first.records}
+        self.assertEqual(first.state, "PARTIAL")
+        self.assertEqual(records[following.leaf_id].state, "PRODUCED")
+        self.assertEqual(
+            [attempt.precision_digits for attempt in first.attempts], [80, 120]
+        )
+        self.assertEqual(
+            [attempt.failure_code for attempt in reloaded.attempts],
+            ["INSUFFICIENT_ASYMPTOTIC_PRECISION"] * 2,
+        )
+        self.assertEqual(resumed.attempts, first.attempts)
+
+    def test_deep_failed_preflight_recovery_preserves_sentinel_audit_boundary(self):
+        capabilities = PrecisionCapabilities((64, 80, 120))
+        plan = build_campaign_plan(
+            policy=NumericalPolicy(),
+            backend_identity=VettedNativeDeterminantKernel.identity,
+            precision_capabilities=capabilities,
+        )
+        sentinel_ids = set(
+            B_PRIME_RELEASE_DOMAIN.fixed_precision_sentinel_leaf_ids
+        )
+        leaves = (
+            next(
+                leaf for leaf in plan.leaves
+                if leaf.role == "deep" and leaf.leaf_id not in sentinel_ids
+            ),
+            next(leaf for leaf in plan.leaves if leaf.leaf_id in sentinel_ids),
+        )
+        for leaf in leaves:
+            with self.subTest(leaf_id=leaf.leaf_id):
+                selection = build_campaign_selection(
+                    plan, role="deep", leaf_ids=(leaf.leaf_id,)
+                )
+                failure = self._failure(
+                    julia_backend.JuliaNumericalControlError,
+                    "INSUFFICIENT_ASYMPTOTIC_PRECISION",
+                    leaf=leaf,
+                )
+
+                class Backend:
+                    identity = plan.backend_identity
+                    precision_capabilities = capabilities
+
+                    def execute_stage(self, selected, digits):
+                        if digits == 64:
+                            return replace(
+                                _authenticated_primary_stage(
+                                    selected,
+                                    digits,
+                                    ComponentStatus.NOT_CONVERGED,
+                                ),
+                                deep_diagnostics=diagnostics(digits=8.0),
+                            )
+                        raise failure
+
+                    def execute_promoted_stage_after_failed_preflight(
+                        self, selected, digits, predecessor
+                    ):
+                        return _branch_safe_failed_preflight_recovery_stage(
+                            _authenticated_failed_preflight_recovery_stage(
+                                selected, predecessor
+                            ),
+                            selected,
+                        )
+
+                with tempfile.TemporaryDirectory() as temporary:
+                    checkpoint = Path(temporary) / "deep-recovery.json"
+                    summary = run_campaign_selection(
+                        plan,
+                        selection,
+                        Backend(),
+                        checkpoint,
+                        resume=False,
+                    )
+                    reloaded = validate_campaign_checkpoint(plan, checkpoint)
+
+                is_sentinel = leaf.leaf_id in sentinel_ids
+                expected_state = "UNRESOLVED" if is_sentinel else "PRODUCED"
+                self.assertEqual(summary.records[0].state, expected_state)
+                self.assertEqual(reloaded.records[0].state, expected_state)
+                self.assertIs(summary.records[0].sentinel, is_sentinel)
+                self.assertIsNone(summary.records[0].sentinel_comparison)
+
+    def test_invalid_asymptotic_failure_diagnostics_are_not_contained(self):
+        cases = {
+            "false_avoided": lambda failure: failure["diagnostics"].update(
+                {"asymptotic_preflight_avoided_ode": False}
+            ),
+            "wrong_reason": lambda failure: failure["diagnostics"].update(
+                {"asymptotic_preflight_reason": "ADEQUATE"}
+            ),
+            "inconsistent_digits": lambda failure: failure["diagnostics"].update(
+                {
+                    "predicted_reliable_digits": "24",
+                    "required_reliable_digits": "24",
+                }
+            ),
+            "wrong_retryability": lambda failure: failure.update(
+                {"retryable": False}
+            ),
+            "wrong_source_precision": lambda failure: failure.update(
+                {"precision_digits": 64}
+            ),
+            "wrong_job": lambda failure: failure.update(
+                {"job_id": "forged-job"}
+            ),
+            "wrong_policy": lambda failure: failure.update(
+                {"job_policy_sha256": "f" * 64}
+            ),
+            "wrong_refinement": lambda failure: failure.update(
+                {"refinement_level": 1}
+            ),
+            "rhs_already_evaluated": lambda failure: failure[
+                "diagnostics"
+            ].update({"factored_homogeneous_rhs_evaluations": 1}),
+        }
+        for label, mutate in cases.items():
+            with self.subTest(label=label):
+                plan, capabilities, selection, incident, _ = (
+                    self._plan_and_leaves()
+                )
+                failure = self._failure(
+                    julia_backend.JuliaNumericalControlError,
+                    "INSUFFICIENT_ASYMPTOTIC_PRECISION",
+                    leaf=incident,
+                )
+                mutate(failure.worker_failure["failure"])
+
+                class Backend:
+                    identity = plan.backend_identity
+                    precision_capabilities = capabilities
+
+                    def execute_stage(self, leaf, digits):
+                        if leaf.leaf_id == incident.leaf_id and digits == 64:
+                            return _authenticated_primary_stage(
+                                leaf, digits, ComponentStatus.NOT_CONVERGED
+                            )
+                        raise failure
+
+                with tempfile.TemporaryDirectory() as temporary:
+                    with self.assertRaises((
+                        julia_backend.JuliaNumericalControlError,
+                        ValueError,
+                    )):
+                        run_campaign_selection(
+                            plan,
+                            selection,
+                            Backend(),
+                            Path(temporary) / "invalid-control.json",
+                            resume=False,
+                        )
+
+    def test_nonretryable_control_cannot_claim_retryability(self):
+        plan, capabilities, selection, incident, _ = self._plan_and_leaves()
+        failure = self._failure(
+            julia_backend.JuliaNumericalControlError,
+            "SCATTERING_BASIS_ILL_CONDITIONED",
+        )
+        failure.worker_failure["failure"]["retryable"] = True
+
+        class Backend:
+            identity = plan.backend_identity
+            precision_capabilities = capabilities
+
+            def execute_stage(self, leaf, digits):
+                if leaf.leaf_id == incident.leaf_id and digits == 64:
+                    return _authenticated_primary_stage(
+                        leaf, digits, ComponentStatus.NOT_CONVERGED
+                    )
+                raise failure
+
+        with tempfile.TemporaryDirectory() as temporary:
+            with self.assertRaises(julia_backend.JuliaNumericalControlError):
+                run_campaign_selection(
+                    plan,
+                    selection,
+                    Backend(),
+                    Path(temporary) / "invalid-retryability.json",
+                    resume=False,
+                )
+
+    def test_reloaded_asymptotic_attempt_revalidates_diagnostics(self):
+        run = self._run_with_failure(
+            julia_backend.JuliaNumericalControlError,
+            "INSUFFICIENT_ASYMPTOTIC_PRECISION",
+        )
+        temporary, root, plan, _, _, _, _, _, _ = run
+        self.addCleanup(temporary.cleanup)
+        checkpoint = root / "checkpoint.json"
+        forged = json.loads(checkpoint.read_text(encoding="utf-8"))
+        attempt = forged["attempts"][0]
+        attempt["failure_receipt"]["failure"]["diagnostics"][
+            "asymptotic_preflight_reason"
+        ] = "ADEQUATE"
+        attempt["attempt_sha256"] = hashlib.sha256(
+            canonical_json_bytes({
+                key: value
+                for key, value in attempt.items()
+                if key != "attempt_sha256"
+            })
+        ).hexdigest()
+        forged["attempts_sha256"] = hashlib.sha256(
+            canonical_json_bytes(forged["attempts"])
+        ).hexdigest()
+        checkpoint.write_bytes(canonical_json_bytes(forged))
+
+        with self.assertRaisesRegex(ValueError, "attempt receipt"):
+            validate_campaign_checkpoint(plan, checkpoint)
+
+    def test_reloaded_preflight_attempt_rejects_valid_but_wrong_request_sha(self):
+        plan, _, _, incident, _ = self._plan_and_leaves()
+        selection = build_campaign_selection(
+            plan, role="primary", leaf_ids=(incident.leaf_id,)
+        )
+        failure = self._failure(
+            julia_backend.JuliaNumericalControlError,
+            "INSUFFICIENT_ASYMPTOTIC_PRECISION",
+            leaf=incident,
+        )
+
+        class Backend:
+            identity = plan.backend_identity
+            precision_capabilities = PrecisionCapabilities((64, 80))
+
+            def execute_stage(self, leaf, digits):
+                if digits == 64:
+                    return _authenticated_primary_stage(
+                        leaf, digits, ComponentStatus.NOT_CONVERGED
+                    )
+                raise failure
+
+        with tempfile.TemporaryDirectory() as temporary:
+            checkpoint = Path(temporary) / "checkpoint.json"
+            run_campaign_selection(
+                plan, selection, Backend(), checkpoint, resume=False
+            )
+            forged = json.loads(checkpoint.read_text(encoding="utf-8"))
+            attempt = forged["attempts"][0]
+            attempt["failure_receipt"]["failure"]["request_sha256"] = (
+                "0" * 64
+            )
+            attempt["attempt_sha256"] = hashlib.sha256(
+                canonical_json_bytes({
+                    key: value
+                    for key, value in attempt.items()
+                    if key != "attempt_sha256"
+                })
+            ).hexdigest()
+            forged["attempts_sha256"] = hashlib.sha256(
+                canonical_json_bytes(forged["attempts"])
+            ).hexdigest()
+            checkpoint.write_bytes(canonical_json_bytes(forged))
+
+            with self.assertRaisesRegex(
+                ValueError, "digest disagrees with canonical binding"
+            ):
+                validate_campaign_checkpoint(plan, checkpoint)
+
+    def test_reloaded_preflight_attempt_rejects_resealed_nested_request_policy(self):
+        plan, _, _, incident, _ = self._plan_and_leaves()
+        selection = build_campaign_selection(
+            plan, role="primary", leaf_ids=(incident.leaf_id,)
+        )
+        failure = self._failure(
+            julia_backend.JuliaNumericalControlError,
+            "INSUFFICIENT_ASYMPTOTIC_PRECISION",
+            leaf=incident,
+        )
+
+        class Backend:
+            identity = plan.backend_identity
+            precision_capabilities = PrecisionCapabilities((64, 80))
+
+            def execute_stage(self, leaf, digits):
+                if digits == 64:
+                    return _authenticated_primary_stage(
+                        leaf, digits, ComponentStatus.NOT_CONVERGED
+                    )
+                raise failure
+
+        with tempfile.TemporaryDirectory() as temporary:
+            checkpoint = Path(temporary) / "checkpoint.json"
+            run_campaign_selection(
+                plan, selection, Backend(), checkpoint, resume=False
+            )
+            forged = json.loads(checkpoint.read_text(encoding="utf-8"))
+            attempt = forged["attempts"][0]
+            receipt = attempt["failure_receipt"]["failure"]
+            receipt["request_binding"]["policy"][
+                "root_correction_tolerance"
+            ] = "9e-18"
+            receipt["request_sha256"] = hashlib.sha256(
+                canonical_json_bytes(receipt["request_binding"])
+            ).hexdigest()
+            attempt["attempt_sha256"] = hashlib.sha256(
+                canonical_json_bytes({
+                    key: value
+                    for key, value in attempt.items()
+                    if key != "attempt_sha256"
+                })
+            ).hexdigest()
+            forged["attempts_sha256"] = hashlib.sha256(
+                canonical_json_bytes(forged["attempts"])
+            ).hexdigest()
+            checkpoint.write_bytes(canonical_json_bytes(forged))
+
+            with self.assertRaisesRegex(
+                ValueError, "canonical request contract"
+            ):
+                validate_campaign_checkpoint(plan, checkpoint)
+
+    def test_reloaded_preflight_attempt_rejects_resealed_exterior_support(self):
+        plan, _, _, _, _ = self._plan_and_leaves()
+        leaf = next(
+            item for item in plan.leaves
+            if item.role == "primary"
+            and item.mechanism_id != "horizon-admittance"
+        )
+        selection = build_campaign_selection(
+            plan, role="primary", leaf_ids=(leaf.leaf_id,)
+        )
+        failure = self._failure(
+            julia_backend.JuliaNumericalControlError,
+            "INSUFFICIENT_ASYMPTOTIC_PRECISION",
+            leaf=leaf,
+        )
+
+        class Backend:
+            identity = plan.backend_identity
+            precision_capabilities = PrecisionCapabilities((64, 80))
+
+            def execute_stage(self, selected, digits):
+                if digits == 64:
+                    return _authenticated_primary_stage(
+                        selected, digits, ComponentStatus.NOT_CONVERGED
+                    )
+                raise failure
+
+        with tempfile.TemporaryDirectory() as temporary:
+            checkpoint = Path(temporary) / "checkpoint.json"
+            run_campaign_selection(
+                plan, selection, Backend(), checkpoint, resume=False
+            )
+            forged = json.loads(checkpoint.read_text(encoding="utf-8"))
+            attempt = forged["attempts"][0]
+            receipt = attempt["failure_receipt"]["failure"]
+            support = receipt["request_binding"]["support"]
+            first_name = next(iter(support))
+            support[first_name] = "9"
+            receipt["request_sha256"] = hashlib.sha256(
+                canonical_json_bytes(receipt["request_binding"])
+            ).hexdigest()
+            attempt["attempt_sha256"] = hashlib.sha256(
+                canonical_json_bytes({
+                    key: value
+                    for key, value in attempt.items()
+                    if key != "attempt_sha256"
+                })
+            ).hexdigest()
+            forged["attempts_sha256"] = hashlib.sha256(
+                canonical_json_bytes(forged["attempts"])
+            ).hexdigest()
+            checkpoint.write_bytes(canonical_json_bytes(forged))
+
+            with self.assertRaisesRegex(
+                ValueError, "canonical request contract"
+            ):
+                validate_campaign_checkpoint(plan, checkpoint)
+
+    def test_reloaded_recovery_rejects_one_ulp_discrepancy_tamper(self):
+        run = self._run_with_failure(
+            julia_backend.JuliaNumericalControlError,
+            "INSUFFICIENT_ASYMPTOTIC_PRECISION",
+        )
+        temporary, root, plan, _, incident, _, _, _, _ = run
+        self.addCleanup(temporary.cleanup)
+        checkpoint = root / "checkpoint.json"
+        forged = json.loads(checkpoint.read_text(encoding="utf-8"))
+        record = next(
+            item for item in forged["records"]
+            if item["leaf_id"] == incident.leaf_id
+        )
+        stage = record["stages"][-1]
+        component = stage["component_result"]
+        recorded = component["same_precision_refinement_discrepancy_abs"]
+        component["same_precision_refinement_discrepancy_abs"] = math.nextafter(
+            recorded, math.inf
+        )
+        source_sha256 = hashlib.sha256(
+            canonical_json_bytes(component)
+        ).hexdigest()
+        for channel in stage["signed_error_channels"]:
+            channel["provenance"]["source_sha256"] = source_sha256
+        reseal(forged)
+        checkpoint.write_bytes(canonical_json_bytes(forged))
+
+        with self.assertRaisesRegex(
+            ValueError, "same-precision discrepancy disagrees"
+        ):
+            validate_campaign_checkpoint(plan, checkpoint)
 
     def test_malformed_typed_or_unknown_worker_failure_remains_fail_closed(self):
         plan, capabilities, selection, incident, _ = self._plan_and_leaves()
@@ -943,14 +3059,108 @@ class PromotedResourceContainmentTests(unittest.TestCase):
             )
             legacy = json.loads(checkpoint.read_text(encoding="utf-8"))
             legacy["schema_version"] = 3
+            source_history_v3_sha256 = (
+                "7949e077764bfb262d7241be60b57fbf4105e120a52cb8b32cbc8c1a32497d32"
+            )
+            self.assertEqual(
+                _checkpoint_precision_contract_sha256(3),
+                source_history_v3_sha256,
+            )
+            legacy["bindings"]["precision_contract_sha256"] = (
+                source_history_v3_sha256
+            )
             legacy.pop("attempts")
             legacy.pop("attempts_sha256")
             checkpoint.write_bytes(canonical_json_bytes(legacy))
 
             loaded = validate_campaign_checkpoint(plan, checkpoint)
+            legacy["bindings"]["precision_contract_sha256"] = (
+                "75b7210a8e8cefbdcefef210f6ef5792b68227f6957862b3a42cb9cdc92dd74b"
+            )
+            checkpoint.write_bytes(canonical_json_bytes(legacy))
+            earliest_loaded = validate_campaign_checkpoint(plan, checkpoint)
 
         self.assertEqual(loaded.state, "COMPLETE")
         self.assertEqual(loaded.attempts, ())
+        self.assertEqual(earliest_loaded.state, "COMPLETE")
+        self.assertEqual(earliest_loaded.attempts, ())
+
+    def test_incomplete_schema_five_checkpoint_cannot_resume_as_schema_six(self):
+        plan, _, _, incident, _ = self._plan_and_leaves()
+        selection = build_campaign_selection(
+            plan, role="primary", leaf_ids=(incident.leaf_id,)
+        )
+
+        class InitialBackend:
+            identity = plan.backend_identity
+            precision_capabilities = PrecisionCapabilities((64,))
+
+            def execute_stage(self, leaf, digits):
+                self.assert_digits = digits
+                return _authenticated_primary_stage(
+                    leaf, digits, ComponentStatus.NOT_CONVERGED
+                )
+
+        class ResumeBackend:
+            identity = plan.backend_identity
+            precision_capabilities = PrecisionCapabilities((64, 80, 120))
+
+            def execute_stage(self, _leaf, _digits):
+                raise AssertionError("historical partial resume must not execute")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            checkpoint = Path(temporary) / "checkpoint.json"
+            run_campaign_selection(
+                plan,
+                selection,
+                InitialBackend(),
+                checkpoint,
+                resume=False,
+            )
+            historical = json.loads(checkpoint.read_text(encoding="utf-8"))
+            historical["schema_version"] = 5
+            source_history_v5_sha256 = (
+                "7949e077764bfb262d7241be60b57fbf4105e120a52cb8b32cbc8c1a32497d32"
+            )
+            self.assertEqual(
+                _checkpoint_precision_contract_sha256(5),
+                source_history_v5_sha256,
+            )
+            historical["bindings"]["precision_contract_sha256"] = (
+                source_history_v5_sha256
+            )
+            checkpoint.write_bytes(canonical_json_bytes(historical))
+
+            readable = validate_campaign_checkpoint(plan, checkpoint)
+            self.assertEqual(readable.state, "PARTIAL")
+            with self.assertRaisesRegex(
+                ValueError,
+                "incomplete historical campaign checkpoint.*fresh checkpoint",
+            ):
+                run_campaign_selection(
+                    plan,
+                    selection,
+                    ResumeBackend(),
+                    checkpoint,
+                    resume=True,
+                )
+            with self.assertRaisesRegex(
+                ValueError, "incomplete historical campaign checkpoint.*merged"
+            ):
+                merge_campaign_checkpoints(
+                    plan,
+                    (checkpoint,),
+                    Path(temporary) / "merged.json",
+                )
+            with self.assertRaisesRegex(
+                ValueError,
+                "incomplete historical campaign checkpoint.*publish",
+            ):
+                import_campaign_checkpoint_to_solved_leaf_store(
+                    plan,
+                    checkpoint,
+                    SolvedLeafStore(Path(temporary) / "solved"),
+                )
 
     def test_component_status_body_contract_is_enforced_at_every_primary_tier(self) -> None:
         """Catches sealed status/body contradictions accepted as production."""

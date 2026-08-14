@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from decimal import Decimal
 import hashlib
 import io
 import json
@@ -38,12 +39,17 @@ from windows_solver.response_engine import (
     DiagnosticRootReadout,
     LadderLevel,
     NumericalPolicy,
+    NumericalConditioningEvidence,
     RootReadout,
     VettedNativeDeterminantKernel,
 )
 from windows_solver.progress import activate_progress
 from windows_solver.progress_output import CampaignProgressReporter
 from windows_solver.solved_leaf_cache import SolvedLeafLookupStatus, SolvedLeafStore
+from tests.fixtures import (
+    current_promoted_component_payload,
+    valid_numerical_conditioning,
+)
 
 
 _FROZEN_MIGRATION_BACKEND_IDENTITY = replace(
@@ -87,9 +93,9 @@ _POLISHED_BASELINES = {
     ),
 }
 _POLISHED_IDENTITIES = {
-    "b-prime-leaf-4c8594e4a59486a1c56206e41cd7f7f3ff1ab5193a5ff6b699cbe9492bc45355": "78152c129310112d73a50f2b7de04c636911fa2d98de2b60566a21fd9b83747c",
-    "b-prime-leaf-0f36daefa853de1280f17c8b8ef89bbaf9b34f5e5044a5eb85bc563d3896b60d": "ec73e209dc2f8dbdddfb211c0b89ff9c514af271b69796f8d8d198dae3b52977",
-    "b-prime-leaf-08b8dc3df83fc1304a61d8b6105c412a316a44816ca229d375573fdf72ac0a57": "fd5013c425b769025e579e2138b1b844bbce9ff94c49acbb6840fb455584119e",
+    "b-prime-leaf-4c8594e4a59486a1c56206e41cd7f7f3ff1ab5193a5ff6b699cbe9492bc45355": "af2fd8349e2a071f0b8c50004963a0e0fe7c4d8d6e6ae7c0f74f1f1485609508",
+    "b-prime-leaf-0f36daefa853de1280f17c8b8ef89bbaf9b34f5e5044a5eb85bc563d3896b60d": "37c6ed02e830114f774f1b4b0fd8c1f199fa759147fc8855435a3445426fec78",
+    "b-prime-leaf-08b8dc3df83fc1304a61d8b6105c412a316a44816ca229d375573fdf72ac0a57": "a853181c4fa27517c8b72836e1babf64a7ce74968b9128266bb898d998406f69",
 }
 
 
@@ -211,6 +217,15 @@ def _production_outcome(
         "evidence_kind": "authenticated-polished-baseline-regression",
         "result": result.to_mapping(),
     }
+    if digits in (80, 120):
+        component = current_promoted_component_payload(
+            result,
+            digits,
+            precision_limited=(
+                digits == 80 and status is ComponentStatus.NOT_CONVERGED
+            ),
+            leaf=leaf,
+        )
     return StageOutcome(
         digits=digits,
         numerical_state=status.value,
@@ -491,6 +506,108 @@ class _ConvergedProductionBackend:
 
 
 class SolvedLeafCacheTests(unittest.TestCase):
+    def test_typed_raw_overflow_round_trips_through_solved_leaf_store(self):
+        """Catches solved-cache sealing or reload dropping the raw status."""
+
+        capabilities = PrecisionCapabilities((64, 80, 120))
+        plan = build_campaign_plan(
+            policy=NumericalPolicy(),
+            backend_identity=VettedNativeDeterminantKernel.identity,
+            precision_capabilities=capabilities,
+        )
+        leaf = next(
+            item
+            for item in plan.leaves
+            if item.job.mechanism_id == "horizon-admittance"
+        )
+        outcome = _production_outcome(
+            leaf,
+            digits=80,
+            status=ComponentStatus.NOT_CONVERGED,
+        )
+        component = dict(outcome.component_result)
+        result = ComponentResult.from_mapping(component["result"])
+        evidence = NumericalConditioningEvidence.from_mapping(
+            valid_numerical_conditioning("horizon-admittance")
+        )
+        receipt = {
+            **dict(result.baseline.worker_response_receipt),
+            "request_binding": dict(
+                result.baseline.worker_response_receipt["request_binding"]
+            ),
+            "raw_determinant_abs_text": None,
+            "raw_determinant_evidence_status": "unavailable-overflow/v1",
+        }
+        receipt["receipt_sha256"] = hashlib.sha256(
+            canonical_json_bytes({
+                key: value
+                for key, value in receipt.items()
+                if key != "receipt_sha256"
+            })
+        ).hexdigest()
+        baseline = replace(
+            result.baseline,
+            truncation_radius=None,
+            resolution_radius=None,
+            seed_path_radius=None,
+            diagnostic_readouts=None,
+            diagnostics_skipped_reason="PRIMARY_NOT_CONVERGED",
+            numerical_conditioning=evidence,
+            normalised_determinant_abs=Decimal(
+                str(result.baseline.determinant_residual_abs)
+            ),
+            raw_determinant_abs=None,
+            raw_determinant_evidence_status="unavailable-overflow/v1",
+            worker_response_receipt=receipt,
+        )
+        component["result"] = replace(result, baseline=baseline).to_mapping()
+        outcome = replace(
+            outcome,
+            component_result=component,
+            signed_error_channels=synthetic_stage_signed_error_channels(
+                component, outcome.local_disk_radius_abs
+            ),
+        )
+        record = CampaignLeafRecord(
+            leaf_id=leaf.leaf_id,
+            role=leaf.role,
+            state="UNRESOLVED",
+            stages=(CampaignStageRecord(
+                outcome,
+                {
+                    "precision_factory_identity": (
+                        plan.precision_factory_identity.to_mapping()
+                    ),
+                    "available_precision_digits": list(capabilities.digits),
+                },
+            ),),
+        )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            store = SolvedLeafStore(Path(temporary) / "solved")
+            identity = "f" * 64
+            store.publish(
+                scientific_identity_sha256=identity,
+                leaf_id=leaf.leaf_id,
+                record=record.to_mapping(),
+                source_type="originating-campaign",
+            )
+            lookup = store.lookup(identity, leaf.leaf_id)
+
+        self.assertIs(lookup.status, SolvedLeafLookupStatus.HIT)
+        restored_record = CampaignLeafRecord.from_mapping(
+            lookup.receipt["record"]
+        )
+        restored_result = ComponentResult.from_mapping(
+            restored_record.stages[-1].outcome.component_result["result"]
+        )
+        self.assertEqual(
+            restored_result.baseline.raw_determinant_evidence_status,
+            "unavailable-overflow/v1",
+        )
+        self.assertIsNone(restored_result.baseline.raw_determinant_abs)
+        self.assertEqual(lookup.receipt["record"], record.to_mapping())
+
     def test_corrected_live_converged_result_requires_diagnostic_ladder(self):
         plan = build_campaign_plan(
             policy=NumericalPolicy(),
@@ -781,7 +898,7 @@ class SolvedLeafCacheTests(unittest.TestCase):
         )
         self.assertEqual(
             scientific_computation_identity_sha256(plan, leaf),
-            "0ae6f98321459f77d89c1c15593a2297a36235995e7a66cf66dedb312eee56ff",
+            "3e53114753ca751b7fe5567390402b9f104bd442208d492ec18fbcbc03bc5b3a",
         )
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

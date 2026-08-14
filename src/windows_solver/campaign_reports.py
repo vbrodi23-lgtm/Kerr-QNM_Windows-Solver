@@ -34,6 +34,36 @@ from .response_reduction import (
 )
 
 
+CONDITIONING_REPORT_COLUMNS = (
+    "homogeneous_representation",
+    "determinant_family",
+    "determinant_normalisation",
+    "scattering_diagnostics_applicable",
+    "scattering_column_convention",
+    "determinant_convention",
+    "series_digits_lost_max",
+    "series_evaluation_spread_max",
+    "last_term_ratio_max",
+    "recurrence_digits_lost_max",
+    "asymptotic_predicted_reliable_digits_min",
+    "basis_condition_max",
+    "basis_backward_error_max",
+    "matching_reconstruction_residual_max",
+    "endpoint_remainders_regular",
+    "endpoint_reconstruction_error_max",
+    "contour_angle_deformation_max",
+    "fd_digits_lost_max",
+    "predicted_reliable_digits",
+    "required_reliable_digits",
+    "precision_limited",
+    "cref_chart_margin_min",
+    "carrier_change_error_max",
+    "normalised_determinant_abs",
+    "raw_determinant_abs",
+    "raw_determinant_evidence_status",
+)
+
+
 LEAF_COLUMNS = (
     "leaf_ordinal",
     "leaf_id",
@@ -63,6 +93,7 @@ LEAF_COLUMNS = (
     "baseline_omega_imaginary",
     "baseline_determinant_residual",
     "baseline_newton_correction",
+    *CONDITIONING_REPORT_COLUMNS,
     "signed_root_crosscheck_real",
     "signed_root_crosscheck_imaginary",
     "signed_root_crosscheck_magnitude",
@@ -235,6 +266,68 @@ def _component_result(record: CampaignLeafRecord) -> ComponentResult | None:
     return _stage_component_result(record.stages[-1])
 
 
+def _optional_evidence_value(value: object, name: str) -> object:
+    if isinstance(value, Mapping):
+        return value.get(name)
+    return getattr(value, name, None)
+
+
+def _conditioning_report_fields(readout: object) -> dict[str, object]:
+    """Project optional schema-2 evidence without synthesizing legacy values."""
+
+    output = {name: None for name in CONDITIONING_REPORT_COLUMNS}
+    conditioning = _optional_evidence_value(readout, "numerical_conditioning")
+    evidence_fields = {
+        "homogeneous_representation": "homogeneous_representation",
+        "determinant_family": "determinant_family",
+        "determinant_normalisation": "determinant_normalisation",
+        "scattering_diagnostics_applicable": (
+            "scattering_diagnostics_applicable"
+        ),
+        "scattering_column_convention": "scattering_column_convention",
+        "determinant_convention": "determinant_convention",
+        "series_digits_lost_max": "maximum_series_digits_lost",
+        "series_evaluation_spread_max": "maximum_series_evaluation_spread",
+        "last_term_ratio_max": "maximum_last_term_ratio",
+        "recurrence_digits_lost_max": "maximum_recurrence_digits_lost",
+        "asymptotic_predicted_reliable_digits_min": (
+            "minimum_asymptotic_predicted_reliable_digits"
+        ),
+        "basis_condition_max": "maximum_basis_condition",
+        "basis_backward_error_max": "maximum_basis_backward_error",
+        "matching_reconstruction_residual_max": (
+            "maximum_matching_reconstruction_residual"
+        ),
+        "endpoint_remainders_regular": "endpoint_remainders_regular",
+        "endpoint_reconstruction_error_max": (
+            "maximum_endpoint_reconstruction_error"
+        ),
+        "contour_angle_deformation_max": (
+            "maximum_contour_angle_deformation"
+        ),
+        "fd_digits_lost_max": "maximum_fd_digits_lost",
+        "predicted_reliable_digits": "predicted_reliable_digits",
+        "required_reliable_digits": "required_reliable_digits",
+        "precision_limited": "precision_limited",
+        "cref_chart_margin_min": "minimum_cref_chart_margin",
+        "carrier_change_error_max": "maximum_carrier_change_error",
+    }
+    if conditioning is not None:
+        for report_name, evidence_name in evidence_fields.items():
+            output[report_name] = _optional_evidence_value(
+                conditioning, evidence_name
+            )
+    # Determinant magnitudes are precision-exact RootReadout evidence.  Never
+    # synthesize them from binary64 compatibility fields or conditioning loss
+    # estimates, including for historical records where they remain absent.
+    for name in ("normalised_determinant_abs", "raw_determinant_abs"):
+        output[name] = _optional_evidence_value(readout, name)
+    output["raw_determinant_evidence_status"] = _optional_evidence_value(
+        readout, "raw_determinant_evidence_status"
+    )
+    return output
+
+
 def _root_correction_tolerance_for_precision(digits: int) -> float:
     """Return the Newton-correction threshold governing one M02 stage."""
 
@@ -382,6 +475,7 @@ def _leaf_row(
             f"{name.replace('-', '_')}_error": result.error_channels[name]
             for name in ERROR_CHANNELS
         },
+        **_conditioning_report_fields(result.baseline),
     })
     if record.state != "PRODUCED" or result.response is None:
         row["relative_disk_state"] = "UNRESOLVED"

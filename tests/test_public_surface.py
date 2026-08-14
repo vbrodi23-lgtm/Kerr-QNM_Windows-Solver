@@ -1096,6 +1096,70 @@ $candidate | ConvertTo-Json -Compress | Set-Content -LiteralPath $env:M02_TEST_J
         ]
         version_one = "v" + "1"
         version_two = "v" + "2"
+        approved_regularised_gsn_identities = frozenset({
+            "exterior-wronskian/v1",
+            "factored-homogeneous-gsn/v1",
+            "factored-plane-wave-gsn/v1",
+            "horizon-scattering/v1",
+            "same-precision-120-base-vs-refinement/v1",
+            "typed-batch-horner-compensated/v1",
+            "scaled-factored-horizon-basis/v1",
+            "absent-unapproved/v1",
+            "absent-unreviewed/v1",
+            "cinc-over-cref-minus-reflectivity/v1",
+            "series-recurrence-basis-fd/v1",
+            "gsn-complex-rho/v1",
+            (
+                "column1=horizon-ingoing-Cref;"
+                "column2=horizon-outgoing-Cinc/v1"
+            ),
+            "state2=dX/drho/v1",
+            "cinc-over-cref-minus-R/v1",
+            "known-carrier-times-regular-remainder/v1",
+            "state1=Y;state2=dY/drho/v1",
+            "unit-asymptotic-branch-wronskian/v1",
+            "wronskian-perturbed-Xin-with-Xup/v1",
+            (
+                "blocked-pending-human-math-review-and-independent-"
+                "reference/v1"
+            ),
+            "available/v1",
+            "unavailable-overflow/v1",
+            "not-applicable/v1",
+        })
+        lineage_character = r"A-Za-z0-9_/:;=+\-"
+        approved_identity = re.compile(
+            rf"(?<![{lineage_character}])(?:"
+            + "|".join(
+                re.escape(identity)
+                for identity in sorted(
+                    approved_regularised_gsn_identities,
+                    key=len,
+                    reverse=True,
+                )
+            )
+            + rf")(?![{lineage_character}])"
+        )
+
+        def contains_unapproved_lineage_version(text: str) -> bool:
+            text = re.sub(r'''["']\s*["']''', "", text)
+            remaining = approved_identity.sub("", text).casefold()
+            return version_one in remaining or version_two in remaining
+
+        for identity in approved_regularised_gsn_identities:
+            self.assertFalse(contains_unapproved_lineage_version(identity))
+        for arbitrary_label in (
+            "private-lineage/v1",
+            "private-lineage/v2",
+            "private-factored-plane-wave-gsn/v1",
+            "factored-plane-wave-gsn/v1-private",
+            "available/v1-private",
+            "unavailable-overflow/v2",
+            "not-applicable/v1-extra",
+        ):
+            self.assertTrue(
+                contains_unapproved_lineage_version(arbitrary_label)
+            )
         numbered_sequence = re.compile(
             r"(?:stage|target)[\s_-]*\d+", re.IGNORECASE
         )
@@ -1107,7 +1171,7 @@ $candidate | ConvertTo-Json -Compress | Set-Content -LiteralPath $env:M02_TEST_J
         for path in paths:
             text = path.read_text(encoding="utf-8")
             lowered = text.casefold()
-            if version_one in lowered or version_two in lowered:
+            if contains_unapproved_lineage_version(text):
                 findings.append(str(path.relative_to(root)))
             if numbered_sequence.search(text):
                 findings.append(str(path.relative_to(root)))

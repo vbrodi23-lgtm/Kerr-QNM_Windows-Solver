@@ -28,10 +28,15 @@ from .contracts import canonical_json_bytes
 from .response_engine import (
     BackendIdentity,
     DiagnosticRootReadout,
+    NumericalConditioningEvidence,
+    NUMERICAL_CONDITIONING_SCHEMA,
     ResponseComponentJob,
     RootReadout,
+    WORKER_RESPONSE_RECEIPT_SCHEMA,
     _exterior_support,
     mode_specific_branch_enclosure_radius,
+    regularised_gsn_mechanism_contract,
+    regularised_gsn_precision_policy,
 )
 from .progress import (
     PROGRESS_SCHEMA,
@@ -71,6 +76,19 @@ _DEFAULT_COOPERATIVE_MARGIN_SECONDS = 120
 _DEFAULT_HOMOGENEOUS_ODE_MAXITERS = 10_000_000
 _DEFAULT_HOMOGENEOUS_MAX_ACCEPTED_STEPS = 1_000_000
 _DEFAULT_HOMOGENEOUS_MAX_RHS_EVALUATIONS = 2_000_000
+NUMERICAL_CONTROL_FAILURE_CODES = frozenset({
+    "SCATTERING_BASIS_ILL_CONDITIONED",
+    "SCATTERING_CHART_ILL_CONDITIONED",
+    "ASYMPTOTIC_SERIES_INVALID",
+    "INSUFFICIENT_ASYMPTOTIC_PRECISION",
+    "PHYSICAL_SINGULAR_LIMIT",
+    "ALGEBRAIC_REPRESENTATION_SINGULAR",
+    "CARRIER_CHANGE_INCONSISTENT",
+    "INVALID_FACTORED_PROPAGATION_INPUT",
+    "FACTORED_PROPAGATION_PRECISION_MISMATCH",
+    "NONFINITE_FACTORED_PROPAGATION_DATA",
+    "FACTORED_ODE_FAILURE",
+})
 
 
 def _mode_specific_branch_enclosure_radius(
@@ -97,6 +115,16 @@ class JuliaODEResourceLimitError(JuliaResponseBackendError):
 
 class JuliaRootReadoutResourceLimitError(JuliaResponseBackendError):
     """The Julia worker proved mandatory root-readout work cannot fit."""
+
+
+class JuliaNumericalControlError(JuliaResponseBackendError):
+    """The worker stopped at one recognized, bounded numerical-control gate."""
+
+    def __init__(self, message: str, failure_code: str) -> None:
+        if failure_code not in NUMERICAL_CONTROL_FAILURE_CODES:
+            raise ValueError("numerical-control failure code is not recognized")
+        super().__init__(message)
+        self.failure_code = failure_code
 
 
 def _positive_environment_integer(name: str, default: int) -> int:
@@ -889,6 +917,57 @@ def _require_worker_resource_identity(
     raise failure
 
 
+def _bind_failed_preflight_failure_to_request(
+    details: Mapping[str, object],
+    request_document: Mapping[str, object],
+    request_sha256: str,
+) -> dict[str, object]:
+    """Attach the canonical request only after its worker identity is verified."""
+
+    bound = dict(details)
+    structured = bound.get("failure")
+    if (
+        not isinstance(structured, Mapping)
+        or structured.get("failure_class") != "CONTROL"
+        or structured.get("failure_code")
+        != "INSUFFICIENT_ASYMPTOTIC_PRECISION"
+    ):
+        return bound
+    expected_sha256 = hashlib.sha256(
+        canonical_json_bytes(request_document)
+    ).hexdigest()
+    expected_identity = {
+        "request_sha256": expected_sha256,
+        "job_id": request_document.get("job_id"),
+        "leaf_id": request_document.get("leaf_id"),
+        "role": request_document.get("role"),
+        "job_policy_sha256": request_document.get("job_policy_sha256"),
+        "backend_identity_sha256": request_document.get(
+            "backend_identity_sha256"
+        ),
+        "refinement_level": request_document.get("refinement_level"),
+        "precision_digits": request_document.get("precision_digits"),
+    }
+    mismatch = request_sha256 != expected_sha256 or any(
+        structured.get(name) != expected
+        for name, expected in expected_identity.items()
+    )
+    if mismatch:
+        message = "M02 Julia failed-preflight request identity mismatch"
+        fatal_details = {
+            name: details.get(name) for name in _WORKER_FAILURE_BASE_FIELDS
+        }
+        fatal_details["worker_error_type"] = "FailedPreflightRequestIdentityError"
+        fatal_details["worker_error_message"] = message
+        failure = JuliaResponseBackendError(message)
+        failure.worker_failure = fatal_details
+        raise failure
+    enriched = dict(structured)
+    enriched["request_binding"] = dict(request_document)
+    bound["failure"] = enriched
+    return bound
+
+
 def _raise_worker_failure(details: Mapping[str, object]) -> None:
     """Raise an operational error while retaining bounded worker diagnostics."""
 
@@ -951,11 +1030,59 @@ def _raise_worker_failure(details: Mapping[str, object]) -> None:
         and structured.get("failure_class") == "CONTROL"
     ):
         error_class = JuliaRootReadoutResourceLimitError
+    elif (
+        isinstance(structured, Mapping)
+        and structured.get("failure_code") in NUMERICAL_CONTROL_FAILURE_CODES
+        and structured.get("failure_class") == "CONTROL"
+        and _valid_numerical_control_diagnostics(structured)
+    ):
+        error_class = JuliaNumericalControlError
     else:
         error_class = JuliaResponseBackendError
-    failure = error_class(message)
+    if error_class is JuliaNumericalControlError:
+        failure = JuliaNumericalControlError(
+            message, str(structured["failure_code"])
+        )
+    else:
+        failure = error_class(message)
     failure.worker_failure = dict(details)
     raise failure
+
+
+def _valid_numerical_control_diagnostics(
+    failure: Mapping[str, object],
+) -> bool:
+    """Return whether a recognized control receipt carries typed evidence."""
+
+    diagnostics = failure.get("diagnostics")
+    if not isinstance(diagnostics, Mapping) or not diagnostics:
+        return False
+    code = failure.get("failure_code")
+    if code != "INSUFFICIENT_ASYMPTOTIC_PRECISION":
+        return True
+    try:
+        predicted_reliable_digits = _finite_decimal_text(
+            diagnostics.get("predicted_reliable_digits"),
+            "failure predicted_reliable_digits",
+        )
+        required_reliable_digits = _finite_decimal_text(
+            diagnostics.get("required_reliable_digits"),
+            "failure required_reliable_digits",
+            nonnegative=True,
+        )
+    except JuliaResponseBackendError:
+        return False
+    return (
+        predicted_reliable_digits < required_reliable_digits
+        and diagnostics.get("asymptotic_preflight_avoided_ode") is True
+        and diagnostics.get("asymptotic_preflight_reason") == code
+        and type(
+            diagnostics.get("factored_homogeneous_rhs_evaluations")
+        ) is int
+        and diagnostics["factored_homogeneous_rhs_evaluations"] == 0
+        and diagnostics.get("avoided_ode_scope")
+        == "factored-homogeneous-gsn/v1"
+    )
 
 
 def _timeout_worker_failure_details(
@@ -1098,6 +1225,18 @@ def _resolve_readout_cache(runtime_root: Path) -> RootReadoutStore | None:
 
 
 @dataclass(frozen=True, slots=True)
+class JuliaResponseEvaluation:
+    """One worker response plus the exact identities required to validate it."""
+
+    response: Mapping[str, object]
+    request_binding: Mapping[str, object]
+    request_sha256: str
+    runtime_identity_sha256: str
+    reused: bool
+    cached_worker_response_receipt: Mapping[str, object] | None
+
+
+@dataclass(frozen=True, slots=True)
 class JuliaResponseAdapter:
     julia_executable: Path
     julia_project: Path
@@ -1191,7 +1330,9 @@ class JuliaResponseAdapter:
             _resolve_readout_cache(runtime),
         )
 
-    def _reuse_readout(self, request_sha256: str) -> dict[str, object] | None:
+    def _reuse_readout(
+        self, request_sha256: str
+    ) -> tuple[dict[str, object], dict[str, object] | None] | None:
         """Return an already-computed readout for this exact request, if any."""
 
         store = self.readout_cache
@@ -1227,10 +1368,20 @@ class JuliaResponseAdapter:
             request_sha256=request_sha256,
             store_path=str(lookup.path),
         )
-        return dict(lookup.response or {})
+        return (
+            dict(lookup.response or {}),
+            (
+                None
+                if lookup.worker_response_receipt is None
+                else dict(lookup.worker_response_receipt)
+            ),
+        )
 
     def _retain_readout(
-        self, request_sha256: str, response: Mapping[str, object]
+        self,
+        request_sha256: str,
+        response: Mapping[str, object],
+        worker_response_receipt: Mapping[str, object] | None = None,
     ) -> None:
         """Retain a validated readout so an interrupted stage can resume."""
 
@@ -1242,6 +1393,7 @@ class JuliaResponseAdapter:
                 request_sha256=request_sha256,
                 runtime_identity=runtime_identity_sha256(self.runtime_provenance),
                 response=response,
+                worker_response_receipt=worker_response_receipt,
             )
         except (OSError, ValueError) as error:
             emit_progress(
@@ -1258,6 +1410,51 @@ class JuliaResponseAdapter:
         )
 
     def evaluate(self, request: Mapping[str, object]) -> dict[str, object]:
+        """Generic adapter entry point retaining its successful wire response."""
+
+        return dict(self._evaluate(request, retain_fresh=True).response)
+
+    def evaluate_for_validation(
+        self, request: Mapping[str, object]
+    ) -> JuliaResponseEvaluation:
+        """Return a response without publishing it before scientific validation."""
+
+        return self._evaluate(request, retain_fresh=False)
+
+    def retain_validated_readout(
+        self,
+        evaluation: JuliaResponseEvaluation,
+        worker_response_receipt: Mapping[str, object],
+    ) -> None:
+        if evaluation.reused:
+            return
+        self._retain_readout(
+            evaluation.request_sha256,
+            evaluation.response,
+            worker_response_receipt,
+        )
+
+    def invalidate_validated_readout(
+        self, evaluation: JuliaResponseEvaluation
+    ) -> None:
+        if not evaluation.reused or self.readout_cache is None:
+            return
+        try:
+            self.readout_cache.invalidate(
+                request_sha256=evaluation.request_sha256,
+                runtime_identity=evaluation.runtime_identity_sha256,
+            )
+        except (OSError, ValueError) as error:
+            emit_progress(
+                ProgressEventKind.ROOT_READOUT_CACHE_CORRUPT,
+                request_sha256=evaluation.request_sha256,
+                error_type=type(error).__name__,
+                message=str(error),
+            )
+
+    def _evaluate(
+        self, request: Mapping[str, object], *, retain_fresh: bool
+    ) -> JuliaResponseEvaluation:
         request_document = dict(request)
         execution_resource = _validated_execution_resource_policy(
             request_document["execution_resource"]
@@ -1268,9 +1465,18 @@ class JuliaResponseAdapter:
         request_sha256 = hashlib.sha256(
             canonical_json_bytes(request_document)
         ).hexdigest()
+        runtime_identity = runtime_identity_sha256(self.runtime_provenance)
         reused = self._reuse_readout(request_sha256)
         if reused is not None:
-            return reused
+            response, receipt = reused
+            return JuliaResponseEvaluation(
+                response=response,
+                request_binding=request_document,
+                request_sha256=request_sha256,
+                runtime_identity_sha256=runtime_identity,
+                reused=True,
+                cached_worker_response_receipt=receipt,
+            )
         document = dict(request_document)
         document["request_sha256"] = request_sha256
         timeout = int(execution_resource["worker_request_wall_clock_seconds"])
@@ -1345,6 +1551,9 @@ class JuliaResponseAdapter:
                         last_progress_event,
                     )
                 _require_worker_resource_identity(details, execution_resource)
+                details = _bind_failed_preflight_failure_to_request(
+                    details, request_document, request_sha256
+                )
                 _raise_worker_failure(details)
             response = _strict_json_file(response_path, "M02 Julia response")
         if response.get("status") != "ok":
@@ -1352,11 +1561,22 @@ class JuliaResponseAdapter:
                 completed, response_path, response=response
             )
             _require_worker_resource_identity(details, execution_resource)
+            details = _bind_failed_preflight_failure_to_request(
+                details, request_document, request_sha256
+            )
             _raise_worker_failure(details)
         if response.get("request_sha256") != request_sha256:
             raise JuliaResponseBackendError("M02 Julia response request digest mismatch")
-        self._retain_readout(request_sha256, response)
-        return response
+        if retain_fresh:
+            self._retain_readout(request_sha256, response)
+        return JuliaResponseEvaluation(
+            response=dict(response),
+            request_binding=request_document,
+            request_sha256=request_sha256,
+            runtime_identity_sha256=runtime_identity,
+            reused=False,
+            cached_worker_response_receipt=None,
+        )
 
 
 def _precision_policy(job: ResponseComponentJob, digits: int, refinement: int) -> dict[str, object]:
@@ -1369,6 +1589,7 @@ def _precision_policy(job: ResponseComponentJob, digits: int, refinement: int) -
     return {
         "readout_radius": format(job.policy.readout_radius, ".17g"),
         **controls,
+        **regularised_gsn_precision_policy(job.mechanism_id),
         "endpoint_series_order": job.policy.endpoint_series_order + 8 * refinement,
         "support_subinterval_count": job.policy.support_subinterval_count * (2 ** refinement),
         "angular_pad": 18 + 8 * refinement,
@@ -1379,6 +1600,18 @@ def _precision_policy(job: ResponseComponentJob, digits: int, refinement: int) -
         ),
         "max_newton_iterations": 16,
     }
+
+
+def _validate_mechanism_precision_policy(
+    mechanism_id: str, policy: Mapping[str, object]
+) -> None:
+    """Fail closed when a request authenticates the wrong determinant family."""
+
+    expected = regularised_gsn_precision_policy(mechanism_id)
+    if any(policy.get(field) != value for field, value in expected.items()):
+        raise ValueError(
+            "regularised GSN precision policy disagrees with response mechanism"
+        )
 
 
 @dataclass(slots=True)
@@ -1405,6 +1638,22 @@ class JuliaPrecisionRootBackend:
             "refinement_level": self.refinement,
         }
 
+    def scientific_runtime_for(
+        self, job: ResponseComponentJob
+    ) -> dict[str, object]:
+        """Return provenance bound to the determinant family used by ``job``."""
+
+        if job.backend_identity != self.identity:
+            raise ValueError(
+                "response job backend identity does not match Julia adapter"
+            )
+        return {
+            **self.scientific_runtime,
+            "regularised_gsn_precision_policy": dict(
+                regularised_gsn_precision_policy(job.mechanism_id)
+            ),
+        }
+
     def _request(
         self,
         job: ResponseComponentJob,
@@ -1415,6 +1664,12 @@ class JuliaPrecisionRootBackend:
         request: dict[str, object] = {
             "schema_version": 1,
             "operation": "root-readout",
+            "job_id": job.job_id,
+            "leaf_id": job.leaf_id,
+            "role": job.role,
+            "job_policy_sha256": job.policy.identity_sha256,
+            "backend_identity_sha256": job.backend_identity.identity_sha256,
+            "refinement_level": self.refinement,
             "mode": {
                 "s": job.mode.s,
                 "ell": job.mode.ell,
@@ -1440,6 +1695,9 @@ class JuliaPrecisionRootBackend:
             "policy": _precision_policy(job, self.digits, self.refinement),
             "execution_resource": _execution_resource_policy(),
         }
+        _validate_mechanism_precision_policy(
+            job.mechanism_id, request["policy"]
+        )
         if primary_predictor is not None:
             predictor = complex(primary_predictor)
             if math.isfinite(predictor.real) and math.isfinite(predictor.imag):
@@ -1502,7 +1760,42 @@ class JuliaPrecisionRootBackend:
             primary_predictor,
             primary_predictor_kind,
         )
-        response = self.adapter.evaluate(request)
+        evaluate_for_validation = getattr(
+            self.adapter, "evaluate_for_validation", None
+        )
+        if evaluate_for_validation is None:
+            response = self.adapter.evaluate(request)
+            evaluation = JuliaResponseEvaluation(
+                response=response,
+                request_binding=dict(request),
+                request_sha256=hashlib.sha256(
+                    canonical_json_bytes(request)
+                ).hexdigest(),
+                runtime_identity_sha256=runtime_identity_sha256(
+                    self.adapter.runtime_provenance
+                ),
+                reused=False,
+                cached_worker_response_receipt=None,
+            )
+        else:
+            evaluation = evaluate_for_validation(request)
+        try:
+            return self._read_root_response(job, request, evaluation)
+        except JuliaResponseBackendError:
+            invalidate = getattr(
+                self.adapter, "invalidate_validated_readout", None
+            )
+            if invalidate is not None:
+                invalidate(evaluation)
+            raise
+
+    def _read_root_response(
+        self,
+        job: ResponseComponentJob,
+        request: Mapping[str, object],
+        evaluation: JuliaResponseEvaluation,
+    ) -> RootReadout:
+        response = dict(evaluation.response)
         expected_fields = {
             "schema_version",
             "status",
@@ -1513,6 +1806,8 @@ class JuliaPrecisionRootBackend:
             "root_omega_re",
             "root_omega_im",
             "root_residual_abs",
+            "raw_determinant_abs",
+            "raw_determinant_evidence_status",
             "root_derivative_abs",
             "root_converged",
             "branch_authentication_contract_version",
@@ -1523,6 +1818,7 @@ class JuliaPrecisionRootBackend:
             "resolution_radius_abs",
             "seed_path_radius_abs",
             "diagnostic_roots",
+            "numerical_conditioning",
         }
         if set(response) not in {
             frozenset(expected_fields),
@@ -1530,7 +1826,17 @@ class JuliaPrecisionRootBackend:
         }:
             raise JuliaResponseBackendError("M02 Julia response fields are invalid")
         if (
-            response["schema_version"] != 1
+            any(
+                type(response[name]) is not int
+                for name in (
+                    "schema_version",
+                    "precision_digits",
+                    "working_precision_bits",
+                    "branch_authentication_contract_version",
+                )
+            )
+            or response["schema_version"] != 3
+            or response["status"] != "ok"
             or response["adapter"] != "package-owned-julia-gsn-root-readout"
             or response["precision_digits"] != self.digits
             or response["working_precision_bits"]
@@ -1544,6 +1850,18 @@ class JuliaPrecisionRootBackend:
             )
         ):
             raise JuliaResponseBackendError("M02 Julia response contract is invalid")
+        try:
+            numerical_conditioning = NumericalConditioningEvidence.from_mapping(
+                response["numerical_conditioning"]
+            )
+        except ValueError as error:
+            raise JuliaResponseBackendError(
+                "M02 Julia numerical conditioning evidence is invalid"
+            ) from error
+        if numerical_conditioning.schema != NUMERICAL_CONDITIONING_SCHEMA:
+            raise JuliaResponseBackendError(
+                "M02 Julia current conditioning schema is required"
+            )
         converged = response["root_converged"]
         diagnostics_skipped_reason = response.get("diagnostics_skipped_reason")
         diagnostics_skipped = diagnostics_skipped_reason == "PRIMARY_NOT_CONVERGED"
@@ -1579,6 +1897,46 @@ class JuliaPrecisionRootBackend:
         policy = request["policy"]
         if not isinstance(policy, Mapping):
             raise JuliaResponseBackendError("M02 Julia request policy is invalid")
+        try:
+            _validate_mechanism_precision_policy(job.mechanism_id, policy)
+        except ValueError as error:
+            raise JuliaResponseBackendError(
+                "M02 Julia request policy disagrees with response mechanism"
+            ) from error
+        conditioning_identity_fields = (
+            "homogeneous_representation",
+            "branch_convention",
+            "scattering_column_convention",
+            "radial_derivative_convention",
+            "determinant_convention",
+            "determinant_normalisation",
+            "regular_remainder_contract",
+            "factored_remainder_state_convention",
+            "determinant_family",
+            "scattering_diagnostics_applicable",
+            "human_math_review_receipt_status",
+            "human_math_review_receipt_sha256",
+            "independent_reference_fixture_receipt_status",
+            "independent_reference_fixture_receipt_sha256",
+        )
+        if any(
+            policy.get(field) != getattr(numerical_conditioning, field)
+            for field in conditioning_identity_fields
+        ):
+            raise JuliaResponseBackendError(
+                "M02 Julia numerical conditioning identity disagrees with request policy"
+            )
+        mechanism_contract = regularised_gsn_mechanism_contract(
+            job.mechanism_id
+        )
+        if any(
+            getattr(numerical_conditioning, field) != expected
+            for field, expected in mechanism_contract.items()
+        ):
+            raise JuliaResponseBackendError(
+                "M02 Julia numerical conditioning determinant family disagrees "
+                "with response mechanism"
+            )
         expected_branch_tolerance_decimal = _finite_decimal_text(
             policy["branch_enclosure_radius_abs"],
             "branch_enclosure_radius_abs",
@@ -1595,6 +1953,51 @@ class JuliaPrecisionRootBackend:
             "root_displacement_abs",
             nonnegative=True,
         )
+        normalised_determinant_abs = _finite_decimal_text(
+            response["root_residual_abs"],
+            "root_residual_abs",
+            nonnegative=True,
+        )
+        raw_determinant_abs = (
+            None
+            if response["raw_determinant_abs"] is None
+            else _finite_decimal_text(
+                response["raw_determinant_abs"],
+                "raw_determinant_abs",
+                nonnegative=True,
+            )
+        )
+        raw_determinant_evidence_status = response[
+            "raw_determinant_evidence_status"
+        ]
+        if not isinstance(raw_determinant_evidence_status, str):
+            raise JuliaResponseBackendError(
+                "M02 Julia raw determinant evidence status is invalid"
+            )
+        if job.mechanism_id == "horizon-admittance":
+            if raw_determinant_evidence_status == "available/v1":
+                if raw_determinant_abs is None:
+                    raise JuliaResponseBackendError(
+                        "M02 Julia available raw horizon determinant lacks "
+                        "its magnitude"
+                    )
+            elif raw_determinant_evidence_status == "unavailable-overflow/v1":
+                if raw_determinant_abs is not None:
+                    raise JuliaResponseBackendError(
+                        "M02 Julia unavailable raw horizon determinant must "
+                        "not carry a magnitude"
+                    )
+            else:
+                raise JuliaResponseBackendError(
+                    "M02 Julia horizon raw determinant evidence status is invalid"
+                )
+        elif (
+            raw_determinant_evidence_status != "not-applicable/v1"
+            or raw_determinant_abs is not None
+        ):
+            raise JuliaResponseBackendError(
+                "M02 Julia exterior Wronskian must not claim raw horizon evidence"
+            )
         diagnostic_radii_decimal = (
             {}
             if diagnostics_skipped
@@ -1730,8 +2133,36 @@ class JuliaPrecisionRootBackend:
                 ),
                 converged=raw["root_converged"],
             )
+        receipt_material = {
+            "schema": WORKER_RESPONSE_RECEIPT_SCHEMA,
+            "request_binding": dict(evaluation.request_binding),
+            "request_sha256": evaluation.request_sha256,
+            "scientific_runtime_sha256": hashlib.sha256(
+                canonical_json_bytes(self.scientific_runtime_for(job))
+            ).hexdigest(),
+            "worker_response_schema_version": response["schema_version"],
+            "root_residual_abs_text": response["root_residual_abs"],
+            "raw_determinant_abs_text": response["raw_determinant_abs"],
+            "raw_determinant_evidence_status": (
+                response["raw_determinant_evidence_status"]
+            ),
+        }
+        worker_response_receipt = {
+            **receipt_material,
+            "receipt_sha256": hashlib.sha256(
+                canonical_json_bytes(receipt_material)
+            ).hexdigest(),
+        }
+        if (
+            evaluation.reused
+            and dict(evaluation.cached_worker_response_receipt or {})
+            != worker_response_receipt
+        ):
+            raise JuliaResponseBackendError(
+                "M02 cached worker response receipt is invalid"
+            )
         try:
-            return RootReadout(
+            readout = RootReadout(
                 omega=root,
                 determinant_residual_abs=_finite_text(
                     response["root_residual_abs"], "root_residual_abs"
@@ -1752,11 +2183,21 @@ class JuliaPrecisionRootBackend:
                 seed_path_radius=seed_path_radius,
                 diagnostic_readouts=(None if diagnostics_skipped else diagnostics),
                 diagnostics_skipped_reason=diagnostics_skipped_reason,
+                numerical_conditioning=numerical_conditioning,
+                normalised_determinant_abs=normalised_determinant_abs,
+                raw_determinant_abs=raw_determinant_abs,
+                raw_determinant_evidence_status=
+                    raw_determinant_evidence_status,
+                worker_response_receipt=worker_response_receipt,
             )
         except ValueError as error:
             raise JuliaResponseBackendError(
                 "M02 Julia diagnostic root evidence is inconsistent"
             ) from error
+        retain = getattr(self.adapter, "retain_validated_readout", None)
+        if retain is not None:
+            retain(evaluation, worker_response_receipt)
+        return readout
 
     def closed_form_horizon_response(
         self, job: ResponseComponentJob

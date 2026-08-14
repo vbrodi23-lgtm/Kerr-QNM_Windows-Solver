@@ -28,6 +28,11 @@ from windows_solver.julia_response_backend import (
     _run_streamed_julia,
 )
 from windows_solver.progress import PROGRESS_SCHEMA, ProgressEventKind, activate_progress
+from windows_solver.root_readout_cache import (
+    ROOT_READOUT_STORE_DIRECTORY_NAME,
+    RootReadoutStore,
+    runtime_identity_sha256,
+)
 from windows_solver.response_batches import (
     PrecisionCapabilities,
     build_campaign_selection,
@@ -42,6 +47,7 @@ from windows_solver.response_engine import (
     _diagnostic_response_channel,
 )
 from windows_solver.progress_output import CampaignProgressReporter
+from tests.fixtures import valid_schema_three_julia_root_response
 
 
 def _deep_job():
@@ -74,45 +80,240 @@ class FakeAdapter:
 
     def evaluate(self, request):
         self.requests.append(request)
-        return {
-            "schema_version": 1,
-            "status": "ok",
-            "adapter": "package-owned-julia-gsn-root-readout",
-            "request_sha256": "e" * 64,
-            "precision_digits": request["precision_digits"],
-            "working_precision_bits": request["working_precision_bits"],
-            "root_omega_re": request["omega"]["real"],
-            "root_omega_im": request["omega"]["imaginary"],
-            "root_residual_abs": "1e-60",
-            "root_derivative_abs": "2.5",
-            "root_converged": True,
-            "branch_authentication_contract_version": 3,
-            "root_branch_continuation_valid": True,
-            "branch_tolerance_abs": request["policy"]["branch_enclosure_radius_abs"],
-            "root_displacement_abs": "0",
-            "truncation_radius_abs": "2e-55",
-            "resolution_radius_abs": "3e-55",
-            "seed_path_radius_abs": "4e-55",
-            "diagnostic_roots": {
-                phase: {
-                    "root_omega_re": self.shifted(
-                        request["omega"]["real"], radius
-                    ),
-                    "root_omega_im": request["omega"]["imaginary"],
-                    "root_residual_abs": "1e-60",
-                    "root_derivative_abs": "2.5",
-                    "root_converged": True,
-                }
-                for phase, radius in {
-                    "truncation": "2e-55",
-                    "resolution": "3e-55",
-                    "seed-path": "4e-55",
-                }.items()
-            },
-        }
+        return valid_schema_three_julia_root_response(request)
+
+    def evaluate_for_validation(self, request):
+        return SimpleNamespace(
+            response=self.evaluate(request),
+            request_binding=dict(request),
+            request_sha256=hashlib.sha256(
+                canonical_json_bytes(request)
+            ).hexdigest(),
+            runtime_identity_sha256=hashlib.sha256(
+                canonical_json_bytes(
+                    JuliaPrecisionRootBackend(
+                        VettedNativeDeterminantKernel.identity,
+                        self,
+                        request["precision_digits"],
+                        refinement=request["refinement_level"],
+                    ).scientific_runtime_for(_deep_job())
+                )
+            ).hexdigest(),
+            reused=False,
+            cached_worker_response_receipt=None,
+        )
+
+    def retain_validated_readout(self, evaluation, receipt):
+        return None
+
+    def invalidate_validated_readout(self, evaluation):
+        return None
 
 
 class JuliaResponseBackendTests(unittest.TestCase):
+    @staticmethod
+    def _cache_adapter(root, runner):
+        depot = root / "depot"
+        depot.mkdir()
+        for name in ("julia.exe", "Project.toml", "Manifest.toml", "worker.jl"):
+            (root / name).write_text(name, encoding="ascii")
+        store = RootReadoutStore(root / ROOT_READOUT_STORE_DIRECTORY_NAME)
+        adapter = JuliaResponseAdapter(
+            root / "julia.exe",
+            root,
+            depot,
+            root / "worker.jl",
+            dict(FakeAdapter.runtime_provenance),
+            runner,
+            readout_cache=store,
+        )
+        return adapter, store
+
+    def test_invalid_fresh_success_is_rejected_before_cache_publication(self):
+        """Catches adapter-only checks retaining a mechanism-swapped success."""
+
+        def runner(command, **kwargs):
+            request = json.loads(Path(command[-2]).read_text(encoding="utf-8"))
+            response = valid_schema_three_julia_root_response(request)
+            response["numerical_conditioning"]["determinant_family"] = (
+                "cinc-over-cref-minus-R/v1"
+            )
+            response["numerical_conditioning"][
+                "scattering_diagnostics_applicable"
+            ] = True
+            response["request_sha256"] = request["request_sha256"]
+            Path(command[-1]).write_bytes(canonical_json_bytes(response))
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            adapter, store = self._cache_adapter(Path(temporary), runner)
+            backend = JuliaPrecisionRootBackend(
+                VettedNativeDeterminantKernel.identity, adapter, 80
+            )
+            with self.assertRaises(JuliaResponseBackendError):
+                backend.read_root(_deep_job(), 0.0j)
+            self.assertEqual(store.stored_count, 0)
+
+    def test_invalid_cached_success_is_evicted_then_valid_retry_is_reused(self):
+        """Catches one poisoned entry permanently blocking exact recomputation."""
+
+        calls = []
+
+        def runner(command, **kwargs):
+            calls.append(tuple(command))
+            request = json.loads(Path(command[-2]).read_text(encoding="utf-8"))
+            response = valid_schema_three_julia_root_response(request)
+            response["request_sha256"] = request["request_sha256"]
+            Path(command[-1]).write_bytes(canonical_json_bytes(response))
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            adapter, store = self._cache_adapter(Path(temporary), runner)
+            job = _deep_job()
+            backend = JuliaPrecisionRootBackend(
+                VettedNativeDeterminantKernel.identity, adapter, 80
+            )
+            request = backend._request(job, 0.0j)
+            request_sha256 = hashlib.sha256(
+                canonical_json_bytes(request)
+            ).hexdigest()
+            poisoned = valid_schema_three_julia_root_response(request)
+            poisoned["schema_version"] = 2
+            poisoned["request_sha256"] = request_sha256
+            store.publish(
+                request_sha256=request_sha256,
+                runtime_identity=runtime_identity_sha256(
+                    adapter.runtime_provenance
+                ),
+                response=poisoned,
+            )
+
+            with self.assertRaisesRegex(
+                JuliaResponseBackendError, "response contract is invalid"
+            ):
+                backend.read_root(job, 0.0j)
+            self.assertEqual(store.stored_count, 0)
+            self.assertEqual(calls, [])
+
+            first = backend.read_root(job, 0.0j)
+            second = backend.read_root(job, 0.0j)
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(second.to_mapping(), first.to_mapping())
+            self.assertEqual(store.stored_count, 1)
+
+    def test_worker_response_receipt_preserves_exact_determinant_text(self):
+        """Catches reducing exact worker decimal evidence to one binary64 bin."""
+
+        readout = JuliaPrecisionRootBackend(
+            VettedNativeDeterminantKernel.identity, FakeAdapter(), 80
+        ).read_root(_deep_job(), 0.0j)
+
+        receipt = readout.worker_response_receipt
+        self.assertEqual(
+            receipt["root_residual_abs_text"],
+            str(readout.normalised_determinant_abs),
+        )
+        self.assertEqual(len(receipt["receipt_sha256"]), 64)
+
+    def test_cached_receipt_rejects_sub_binary64_text_tampering(self):
+        """Catches exact evidence changes hidden inside one binary64 value."""
+
+        calls = []
+
+        def runner(command, **kwargs):
+            calls.append(tuple(command))
+            request = json.loads(Path(command[-2]).read_text(encoding="utf-8"))
+            response = valid_schema_three_julia_root_response(request)
+            response["request_sha256"] = request["request_sha256"]
+            Path(command[-1]).write_bytes(canonical_json_bytes(response))
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            adapter, store = self._cache_adapter(Path(temporary), runner)
+            backend = JuliaPrecisionRootBackend(
+                VettedNativeDeterminantKernel.identity, adapter, 80
+            )
+            backend.read_root(_deep_job(), 0.0j)
+            cache_path = next(store.root.glob("*.json"))
+            entry = json.loads(cache_path.read_text(encoding="utf-8"))
+            receipt = entry["worker_response_receipt"]
+            receipt["root_residual_abs_text"] = (
+                "1.0000000000000000000000000000000000000001E-60"
+            )
+            material = {
+                key: value
+                for key, value in receipt.items()
+                if key != "receipt_sha256"
+            }
+            receipt["receipt_sha256"] = hashlib.sha256(
+                canonical_json_bytes(material)
+            ).hexdigest()
+            cache_path.write_bytes(canonical_json_bytes(entry))
+
+            with self.assertRaisesRegex(
+                JuliaResponseBackendError,
+                "cached worker response receipt is invalid",
+            ):
+                backend.read_root(_deep_job(), 0.0j)
+            self.assertEqual(store.stored_count, 0)
+            backend.read_root(_deep_job(), 0.0j)
+            self.assertEqual(len(calls), 2)
+
+    def test_success_wire_schema_is_three_and_worker_errors_remain_schema_one(self):
+        """Catches changing the successful wire without preserving error parsing."""
+
+        request = JuliaPrecisionRootBackend(
+            VettedNativeDeterminantKernel.identity,
+            FakeAdapter(),
+            80,
+        )._request(_deep_job(), 0.0j)
+        self.assertEqual(
+            valid_schema_three_julia_root_response(request)["schema_version"],
+            3,
+        )
+        root = Path(__file__).resolve().parents[1]
+        worker = (
+            root / "src/windows_solver/data/julia/m02_worker.jl"
+        ).read_text(encoding="utf-8")
+        result_fields = worker[
+            worker.index("function result_fields(") :
+            worker.index("function evaluate_request(")
+        ]
+        self.assertEqual(result_fields.count('"schema_version" => 3'), 2)
+        error_path = worker[
+            worker.rindex("catch failure") : worker.index(
+                "if abspath(PROGRAM_FILE)"
+            )
+        ]
+        self.assertGreaterEqual(error_path.count('"schema_version" => 1'), 2)
+
+    def test_worker_control_failure_binds_request_job_and_refinement(self):
+        root = Path(__file__).resolve().parents[1]
+        worker = (
+            root / "src/windows_solver/data/julia/m02_worker.jl"
+        ).read_text(encoding="utf-8")
+        flatten = worker[
+            worker.index("function flatten_request(") :
+            worker.index("function parse_real(")
+        ]
+        context = worker[
+            worker.index("function control_failure_context(") :
+            worker.index("function throw_ode_resource_limit(")
+        ]
+        for field in (
+            "job_id",
+            "leaf_id",
+            "role",
+            "job_policy_sha256",
+            "backend_identity_sha256",
+            "refinement_level",
+            "request_sha256",
+        ):
+            self.assertIn(f'"{field}" =>', flatten)
+            self.assertIn(f'required(document, "{field}")', flatten)
+            self.assertIn(f'"{field}" =>', context)
+            self.assertIn(f'required(request, "{field}")', context)
+
     @staticmethod
     def _force_stop_process(pid_path: Path) -> None:
         if not pid_path.is_file():
@@ -253,27 +454,32 @@ class JuliaResponseBackendTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
 
         self.assertIn("initial_determinant = determinant_progress(", worker)
-        self.assertIn("best_residual = abs(initial_determinant)", worker)
+        self.assertIn("best_residual = abs(initial_determinant.value)", worker)
         self.assertIn("carried_residual = initial_determinant", worker)
         self.assertIn("carried_available = true", worker)
         self.assertIn("carried_available = false", worker)
         self.assertIn("carried_residual = candidate_residual", worker)
         self.assertIn("carried_available = true", worker)
-        self.assertIn("return value, magnitude, derivative, true", worker)
-        self.assertIn("root, residual, accepted_derivative, newton_converged =", worker)
+        self.assertIn(
+            "return value, magnitude, derivative, true, residual", worker
+        )
+        self.assertIn(
+            "root, residual, accepted_derivative, newton_converged, "
+            "root_evaluation =",
+            worker,
+        )
         self.assertIn("isnothing(accepted_derivative) ?", worker)
         # The seed determinant is carried, not recomputed, but every later
         # iteration still evaluates its own residual at its own frequency.
-        self.assertIn(
-            'determinant_progress(T, request, value, amplitude, "residual", value)',
-            worker,
-        )
+        bounded_newton = worker[
+            worker.index("function bounded_newton(") :
+            worker.index("numeric_text(value)")
+        ]
         self.assertEqual(
-            worker.count(
-                'determinant_progress(T, request, value, amplitude, "residual", value)'
-            ),
+            bounded_newton.count('"residual",'),
             1,
         )
+        self.assertIn("magnitude = abs(residual.value)", bounded_newton)
 
     def test_package_worker_reports_radial_integration_interior_progress(self):
         """Catches a radial integration that cannot be told from a stalled one."""
@@ -293,14 +499,16 @@ class JuliaResponseBackendTests(unittest.TestCase):
             "rho_span_fraction",
         ):
             self.assertIn(f'"{field}"', worker)
-        # Both homogeneous radial solves report through the observed map, and the
-        # map itself still returns the unmodified radius.
+        # Every package-owned contour map reports through the observed wrapper,
+        # and the map itself still returns the unmodified radius.
         self.assertIn(
-            'observed_radial_map(radius_from_rho, "Xin", rho_in, rho_out)', worker
+            "observed_radial_map(\n"
+            "        raw_radius_from_rho, label, rho_in, rho_out\n"
+            "    )",
+            worker,
         )
-        self.assertIn(
-            'observed_radial_map(radius_from_rho, "Xup", rho_in, rho_out)', worker
-        )
+        self.assertIn('lower, "Xin"', worker)
+        self.assertIn('readout, "Xup"', worker)
         self.assertIn("return radial_map(rho)", worker)
         self.assertIn("progress_active() || return radial_map", worker)
 
@@ -313,16 +521,14 @@ class JuliaResponseBackendTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
 
         self.assertIn(
-            'relative_tolerance = parse_real(T, request, "ode_relative_tolerance")',
-            worker,
+            'progress_operation("r-from-rho"; payload=Dict(', worker
         )
         self.assertIn(
-            'absolute_tolerance = parse_real(T, request, "ode_absolute_tolerance")',
-            worker,
+            'reltol=parse_real(T, request, "ode_relative_tolerance")', worker
         )
-        self.assertIn('radius_from_rho = progress_operation("r-from-rho") do', worker)
-        self.assertIn("reltol=relative_tolerance", worker)
-        self.assertIn("abstol=absolute_tolerance", worker)
+        self.assertIn(
+            'abstol=parse_real(T, request, "ode_absolute_tolerance")', worker
+        )
         self.assertNotIn("tolerance = min(", worker)
         self.assertNotIn("reltol=tolerance", worker)
         self.assertNotIn("abstol=tolerance", worker)
@@ -422,31 +628,33 @@ class JuliaResponseBackendTests(unittest.TestCase):
             / "src/windows_solver/data/julia/m02_worker.jl"
         ).read_text(encoding="utf-8")
 
-        self.assertIn("branches.Cinc - reflectivity * branches.Cref", worker)
+        self.assertIn("Solutions.solve_scaled_factored_scattering(", worker)
+        self.assertIn("Solutions.evaluate_normalised_horizon_determinant(", worker)
+        self.assertIn(
+            "reflectivity = amplitude / "
+            "(T(2) * im * spectral.p_horizon - amplitude)",
+            worker,
+        )
         self.assertNotIn("xout_match =", worker)
-        self.assertNotIn("horizon = branches.xin", worker)
         self.assertIn(
-            "readout_branches = branch_values(T, request, omega, readout, :xup)",
+            "xup_match = CF.reconstruct_factored_match_state(",
             worker,
         )
         self.assertIn(
-            "wronskian(perturbed_in, readout_branches.xup)",
+            "Complex{T}[xup_match.X, xup_match.dX_drstar]",
             worker,
         )
-        self.assertNotIn('"branch" => "Xup"', worker)
         self.assertNotIn("perturbed_Xup_real_radius", worker)
         self.assertNotIn("chart_ratio < one(T)", worker)
-        self.assertIn("chart_condition_threshold = sqrt(eps(T))", worker)
+        self.assertIn("chart_relative_margin > sqrt(eps(T))", worker)
         self.assertIn(
-            "chart_condition_abs > chart_condition_threshold",
-            worker,
+            '"Cinc" => progress_complex(coefficients.Cinc)', worker
         )
-        self.assertIn('"Cinc" => progress_complex(branches.Cinc)', worker)
-        self.assertIn('"Cref" => progress_complex(branches.Cref)', worker)
-        self.assertIn('"chart_condition_abs" => string(chart_condition_abs)', worker)
         self.assertIn(
-            '"chart_condition_threshold" => string(chart_condition_threshold)',
-            worker,
+            '"Cref" => progress_complex(coefficients.Cref)', worker
+        )
+        self.assertIn(
+            '"matching_reconstruction_residual" => string(', worker
         )
 
     def test_package_worker_rejects_invalid_mechanism_and_support_contracts(self):
@@ -530,20 +738,19 @@ class JuliaResponseBackendTests(unittest.TestCase):
             / "src/windows_solver/data/julia/m02_worker.jl"
         ).read_text(encoding="utf-8")
 
-        self.assertIn("function solve_xin_at_match(", worker)
-        self.assertIn("function solve_xup_at_match(", worker)
-        self.assertIn("CF.Xin_initialconditions(", worker)
-        self.assertIn("CF.Xup_initialconditions(", worker)
-        self.assertIn("function homogeneous_rho_rhs!(", worker)
-        self.assertIn("function solve_homogeneous_endpoint(", worker)
-        self.assertIn(
-            "            solve_xin_at_match(",
-            worker,
-        )
-        self.assertIn(
-            "            solve_xup_at_match(",
-            worker,
-        )
+        for retired in (
+            "solve_xin_at_match",
+            "solve_xup_at_match",
+            "homogeneous_rho_rhs!",
+            "solve_homogeneous_endpoint",
+            "xup_outer_to_match_raw",
+            "solve_xup_scattering_coefficients",
+        ):
+            self.assertNotIn(f"function {retired}(", worker)
+        self.assertIn("CF.prepare_factored_horizon_ingoing(", worker)
+        self.assertIn("CF.prepare_factored_infinity_outgoing(", worker)
+        self.assertIn("CF.solve_factored_xin_to_match(", worker)
+        self.assertIn("CF.solve_factored_xup_to_match(", worker)
 
     def test_promoted_branch_authentication_uses_a_mode_specific_enclosure(self):
         root = Path(__file__).resolve().parents[1]
@@ -764,6 +971,27 @@ class JuliaResponseBackendTests(unittest.TestCase):
         )
         self.assertTrue(readout.converged)
         self.assertEqual(backend.scientific_runtime["precision_digits"], 80)
+
+    def test_promoted_request_binds_job_policy_and_refinement_identity(self):
+        job = _deep_job()
+        request = JuliaPrecisionRootBackend(
+            VettedNativeDeterminantKernel.identity,
+            FakeAdapter(),
+            120,
+            refinement=1,
+        )._request(job, 0.0j)
+
+        self.assertEqual(request["job_id"], job.job_id)
+        self.assertEqual(request["leaf_id"], job.leaf_id)
+        self.assertEqual(request["role"], job.role)
+        self.assertEqual(
+            request["job_policy_sha256"], job.policy.identity_sha256
+        )
+        self.assertEqual(
+            request["backend_identity_sha256"],
+            job.backend_identity.identity_sha256,
+        )
+        self.assertEqual(request["refinement_level"], 1)
 
     def test_promoted_policy_refines_80_without_changing_120_contract(self):
         """Catches coupling scientific solve targets to BigFloat storage digits."""
@@ -1427,6 +1655,139 @@ class JuliaResponseBackendTests(unittest.TestCase):
             "worker_error_type": "ErrorException",
             "worker_error_message": "r-from-rho failed",
         })
+
+    def test_failed_preflight_receipt_is_bound_to_canonical_request(self):
+        job = _deep_job()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for name in ("julia.exe", "Project.toml", "Manifest.toml", "worker.jl"):
+                (root / name).write_text(name, encoding="ascii")
+            depot = root / "depot"
+            depot.mkdir()
+
+            def runner(command, **kwargs):
+                request = json.loads(
+                    Path(command[-2]).read_text(encoding="utf-8")
+                )
+                Path(command[-1]).write_bytes(canonical_json_bytes({
+                    "schema_version": 1,
+                    "status": "error",
+                    "error_type": "AsymptoticPrecisionError",
+                    "message": "preflight rejected 80 digits",
+                    "failure": {
+                        "failure_code": "INSUFFICIENT_ASYMPTOTIC_PRECISION",
+                        "failure_class": "CONTROL",
+                        "retryable": True,
+                        "precision_digits": request["precision_digits"],
+                        "request_sha256": request["request_sha256"],
+                        "job_id": request["job_id"],
+                        "leaf_id": request["leaf_id"],
+                        "role": request["role"],
+                        "job_policy_sha256": request["job_policy_sha256"],
+                        "backend_identity_sha256": request[
+                            "backend_identity_sha256"
+                        ],
+                        "refinement_level": request["refinement_level"],
+                        "execution_resource_policy": {
+                            name: request["execution_resource"][name]
+                            for name in ("schema", "version", "sha256")
+                        },
+                        "diagnostics": {
+                            "predicted_reliable_digits": "11",
+                            "required_reliable_digits": "24",
+                            "asymptotic_preflight_avoided_ode": True,
+                            "asymptotic_preflight_reason": (
+                                "INSUFFICIENT_ASYMPTOTIC_PRECISION"
+                            ),
+                            "factored_homogeneous_rhs_evaluations": 0,
+                            "avoided_ode_scope": (
+                                "factored-homogeneous-gsn/v1"
+                            ),
+                        },
+                    },
+                }))
+                return SimpleNamespace(returncode=21, stdout="", stderr="")
+
+            adapter = JuliaResponseAdapter(
+                root / "julia.exe", root, depot, root / "worker.jl", {}, runner
+            )
+            request = JuliaPrecisionRootBackend(
+                job.backend_identity, adapter, 80
+            )._request(job, 0.0j)
+            with self.assertRaises(JuliaResponseBackendError) as raised:
+                adapter.evaluate(request)
+
+        failure = raised.exception.worker_failure["failure"]
+        self.assertEqual(failure["request_binding"], request)
+        self.assertEqual(
+            failure["request_sha256"],
+            hashlib.sha256(canonical_json_bytes(request)).hexdigest(),
+        )
+
+    def test_failed_preflight_worker_cannot_substitute_valid_request_digest(self):
+        job = _deep_job()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for name in ("julia.exe", "Project.toml", "Manifest.toml", "worker.jl"):
+                (root / name).write_text(name, encoding="ascii")
+            depot = root / "depot"
+            depot.mkdir()
+
+            def runner(command, **kwargs):
+                request = json.loads(
+                    Path(command[-2]).read_text(encoding="utf-8")
+                )
+                Path(command[-1]).write_bytes(canonical_json_bytes({
+                    "schema_version": 1,
+                    "status": "error",
+                    "error_type": "AsymptoticPrecisionError",
+                    "message": "forged request digest",
+                    "failure": {
+                        "failure_code": "INSUFFICIENT_ASYMPTOTIC_PRECISION",
+                        "failure_class": "CONTROL",
+                        "retryable": True,
+                        "precision_digits": request["precision_digits"],
+                        "request_sha256": "0" * 64,
+                        "job_id": request["job_id"],
+                        "leaf_id": request["leaf_id"],
+                        "role": request["role"],
+                        "job_policy_sha256": request["job_policy_sha256"],
+                        "backend_identity_sha256": request[
+                            "backend_identity_sha256"
+                        ],
+                        "refinement_level": request["refinement_level"],
+                        "execution_resource_policy": {
+                            name: request["execution_resource"][name]
+                            for name in ("schema", "version", "sha256")
+                        },
+                        "diagnostics": {
+                            "predicted_reliable_digits": "11",
+                            "required_reliable_digits": "24",
+                            "asymptotic_preflight_avoided_ode": True,
+                            "asymptotic_preflight_reason": (
+                                "INSUFFICIENT_ASYMPTOTIC_PRECISION"
+                            ),
+                            "factored_homogeneous_rhs_evaluations": 0,
+                            "avoided_ode_scope": (
+                                "factored-homogeneous-gsn/v1"
+                            ),
+                        },
+                    },
+                }))
+                return SimpleNamespace(returncode=21, stdout="", stderr="")
+
+            adapter = JuliaResponseAdapter(
+                root / "julia.exe", root, depot, root / "worker.jl", {}, runner
+            )
+            request = JuliaPrecisionRootBackend(
+                job.backend_identity, adapter, 80
+            )._request(job, 0.0j)
+            with self.assertRaisesRegex(
+                JuliaResponseBackendError, "request identity mismatch"
+            ) as raised:
+                adapter.evaluate(request)
+
+        self.assertNotIn("failure", raised.exception.worker_failure)
 
     def test_ode_resource_limit_receipt_is_a_typed_worker_failure(self):
         ode_snapshot = {
