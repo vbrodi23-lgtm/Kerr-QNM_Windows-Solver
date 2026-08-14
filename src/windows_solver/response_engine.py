@@ -74,6 +74,9 @@ ERROR_CHANNELS = (
 _RECORDED_ROOT_MAPPING_TOLERANCE_ABS = 5.0e-9
 _DIAGNOSTIC_ROOT_FAMILIES = ("truncation", "resolution", "seed-path")
 NUMERICAL_CONDITIONING_SCHEMA = "windows-solver.m02-conditioning/3"
+HISTORICAL_NUMERICAL_CONDITIONING_SCHEMA = (
+    "windows-solver.m02-conditioning/2"
+)
 WORKER_RESPONSE_RECEIPT_SCHEMA = "windows-solver.worker-response-receipt/1"
 _WORKER_RESPONSE_RECEIPT_FIELDS = frozenset({
     "schema",
@@ -979,10 +982,6 @@ class NumericalConditioningEvidence:
     determinant_normalisation: str
     regular_remainder_contract: str
     factored_remainder_state_convention: str
-    human_math_review_receipt_status: str
-    human_math_review_receipt_sha256: str | None
-    independent_reference_fixture_receipt_status: str
-    independent_reference_fixture_receipt_sha256: str | None
     maximum_series_digits_lost: Decimal
     maximum_recurrence_digits_lost: Decimal
     maximum_series_evaluation_spread: Decimal
@@ -1001,21 +1000,36 @@ class NumericalConditioningEvidence:
     minimum_cref_chart_margin: Decimal | None
     maximum_carrier_change_error: Decimal | None
     maximum_contour_angle_deformation: Decimal
+    human_math_review_receipt_status: str | None = None
+    human_math_review_receipt_sha256: str | None = None
+    independent_reference_fixture_receipt_status: str | None = None
+    independent_reference_fixture_receipt_sha256: str | None = None
 
     def __post_init__(self) -> None:
-        if self.schema != NUMERICAL_CONDITIONING_SCHEMA:
+        if self.schema not in {
+            NUMERICAL_CONDITIONING_SCHEMA,
+            HISTORICAL_NUMERICAL_CONDITIONING_SCHEMA,
+        }:
             raise ValueError("numerical conditioning schema is invalid")
         for field, expected in _REGULARISED_GSN_COMMON_IDENTITIES.items():
             if getattr(self, field) != expected:
                 raise ValueError(
                     f"numerical conditioning {field} identity is invalid"
                 )
-        for field in _NUMERICAL_CONDITIONING_GATE_FIELDS:
-            expected = _REGULARISED_GSN_COMMON_PRECISION_POLICY[field]
-            if getattr(self, field) != expected:
-                raise ValueError(
-                    f"numerical conditioning {field} identity is invalid"
-                )
+        if self.schema == NUMERICAL_CONDITIONING_SCHEMA:
+            for field in _NUMERICAL_CONDITIONING_GATE_FIELDS:
+                expected = _REGULARISED_GSN_COMMON_PRECISION_POLICY[field]
+                if getattr(self, field) != expected:
+                    raise ValueError(
+                        f"numerical conditioning {field} identity is invalid"
+                    )
+        elif any(
+            getattr(self, field) is not None
+            for field in _NUMERICAL_CONDITIONING_GATE_FIELDS
+        ):
+            raise ValueError(
+                "historical numerical conditioning cannot contain gate identities"
+            )
         if type(self.scattering_diagnostics_applicable) is not bool:
             raise ValueError(
                 "numerical conditioning scattering_diagnostics_applicable "
@@ -1085,11 +1099,12 @@ class NumericalConditioningEvidence:
                 field: getattr(self, field)
                 for field in _NUMERICAL_CONDITIONING_IDENTITY_FIELDS
             },
-            **{
+        }
+        if self.schema == NUMERICAL_CONDITIONING_SCHEMA:
+            output.update({
                 field: getattr(self, field)
                 for field in _NUMERICAL_CONDITIONING_GATE_FIELDS
-            },
-        }
+            })
         for field in _NUMERICAL_CONDITIONING_DECIMAL_FIELDS:
             value = getattr(self, field)
             output[field] = None if value is None else str(value)
@@ -1099,15 +1114,28 @@ class NumericalConditioningEvidence:
 
     @classmethod
     def from_mapping(cls, value: object) -> "NumericalConditioningEvidence":
+        if not isinstance(value, Mapping):
+            raise ValueError("numerical conditioning evidence fields are invalid")
+        schema = value.get("schema")
+        if schema not in {
+            NUMERICAL_CONDITIONING_SCHEMA,
+            HISTORICAL_NUMERICAL_CONDITIONING_SCHEMA,
+        }:
+            raise ValueError("numerical conditioning schema is invalid")
+        gate_fields = (
+            _NUMERICAL_CONDITIONING_GATE_FIELDS
+            if schema == NUMERICAL_CONDITIONING_SCHEMA
+            else ()
+        )
         expected_fields = {
             "schema",
             "scattering_diagnostics_applicable",
             *_NUMERICAL_CONDITIONING_IDENTITY_FIELDS,
-            *_NUMERICAL_CONDITIONING_GATE_FIELDS,
+            *gate_fields,
             *_NUMERICAL_CONDITIONING_DECIMAL_FIELDS,
             *_NUMERICAL_CONDITIONING_BOOLEAN_FIELDS,
         }
-        if not isinstance(value, Mapping) or set(value) != expected_fields:
+        if set(value) != expected_fields:
             raise ValueError("numerical conditioning evidence fields are invalid")
         applicability = value["scattering_diagnostics_applicable"]
         if type(applicability) is not bool:
@@ -1139,10 +1167,7 @@ class NumericalConditioningEvidence:
                 field: value[field]
                 for field in _NUMERICAL_CONDITIONING_IDENTITY_FIELDS
             },
-            **{
-                field: value[field]
-                for field in _NUMERICAL_CONDITIONING_GATE_FIELDS
-            },
+            **{field: value[field] for field in gate_fields},
             **decimal_values,
             **boolean_values,
         )

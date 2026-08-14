@@ -26,7 +26,46 @@ import windows_solver.response_engine as response_engine
 from windows_solver.root_readout_cache import root_readout_identity_sha256
 
 
+def historical_schema_two_conditioning(
+    mechanism_id: str = "horizon-admittance",
+) -> dict[str, object]:
+    mapping = valid_numerical_conditioning(mechanism_id)
+    mapping["schema"] = "windows-solver.m02-conditioning/2"
+    for field in (
+        "human_math_review_receipt_status",
+        "human_math_review_receipt_sha256",
+        "independent_reference_fixture_receipt_status",
+        "independent_reference_fixture_receipt_sha256",
+    ):
+        mapping.pop(field)
+    return mapping
+
+
 class NumericalConditioningEvidenceTests(unittest.TestCase):
+    def test_historical_schema_two_round_trips_without_inventing_gate_receipts(self):
+        source = historical_schema_two_conditioning()
+
+        evidence = response_engine.NumericalConditioningEvidence.from_mapping(
+            source
+        )
+
+        self.assertEqual(evidence.to_mapping(), source)
+        self.assertIsNone(evidence.human_math_review_receipt_status)
+        self.assertIsNone(evidence.human_math_review_receipt_sha256)
+        self.assertIsNone(
+            evidence.independent_reference_fixture_receipt_status
+        )
+        self.assertIsNone(
+            evidence.independent_reference_fixture_receipt_sha256
+        )
+
+    def test_schema_two_rejects_backfilled_gate_fields(self):
+        stale = valid_numerical_conditioning()
+        stale["schema"] = "windows-solver.m02-conditioning/2"
+
+        with self.assertRaises(ValueError):
+            response_engine.NumericalConditioningEvidence.from_mapping(stale)
+
     def test_current_evidence_binds_both_independent_activation_gates(self):
         evidence = response_engine.NumericalConditioningEvidence.from_mapping(
             valid_numerical_conditioning()
@@ -649,6 +688,25 @@ class RootReadoutConditioningPersistenceTests(unittest.TestCase):
 
 class PromotedRuntimeProvenancePersistenceTests(unittest.TestCase):
     @staticmethod
+    def _historical_policy(job):
+        policy = dict(
+            response_engine.regularised_gsn_precision_policy(
+                job.mechanism_id
+            )
+        )
+        for field in (
+            "human_math_review_receipt_status",
+            "human_math_review_receipt_sha256",
+            "independent_reference_fixture_receipt_status",
+            "independent_reference_fixture_receipt_sha256",
+        ):
+            policy.pop(field)
+        policy["regularised_gsn_activation_status"] = (
+            "blocked-pending-human-math-review-and-independent-reference/v1"
+        )
+        return policy
+
+    @staticmethod
     def _leaf():
         plan = build_campaign_plan(
             policy=response_engine.NumericalPolicy(),
@@ -815,6 +873,22 @@ class PromotedRuntimeProvenancePersistenceTests(unittest.TestCase):
             "wrong_refinement": lambda runtime: runtime.__setitem__(
                 "refinement_level", 1
             ),
+            "human_status": lambda runtime: runtime[
+                "regularised_gsn_precision_policy"
+            ].__setitem__("human_math_review_receipt_status", "approved/v1"),
+            "human_digest": lambda runtime: runtime[
+                "regularised_gsn_precision_policy"
+            ].__setitem__("human_math_review_receipt_sha256", "0" * 64),
+            "reference_status": lambda runtime: runtime[
+                "regularised_gsn_precision_policy"
+            ].__setitem__(
+                "independent_reference_fixture_receipt_status", "reviewed/v1"
+            ),
+            "reference_digest": lambda runtime: runtime[
+                "regularised_gsn_precision_policy"
+            ].__setitem__(
+                "independent_reference_fixture_receipt_sha256", "1" * 64
+            ),
         }
         for label, mutate in mutations.items():
             with self.subTest(label=label):
@@ -877,6 +951,44 @@ class PromotedRuntimeProvenancePersistenceTests(unittest.TestCase):
         outcome = self._stage_outcome(result, runtime)
 
         self.assertTrue(response_batches._validate_component_result(leaf, outcome))
+
+    def test_historical_schema_two_is_bounded_to_exact_combined_policy(self):
+        leaf = self._leaf()
+        current = self._result(leaf.job, current_schema=True)
+        baseline = current.baseline.to_mapping()
+        baseline["numerical_conditioning"] = (
+            historical_schema_two_conditioning(leaf.job.mechanism_id)
+        )
+        baseline.pop("worker_response_receipt")
+        historical = replace(
+            current,
+            baseline=response_engine.RootReadout.from_mapping(baseline),
+        )
+        runtime = self._current_runtime(leaf.job)
+        runtime["regularised_gsn_precision_policy"] = self._historical_policy(
+            leaf.job
+        )
+        outcome = self._stage_outcome(historical, runtime)
+
+        self.assertTrue(
+            response_batches._validate_component_result(leaf, outcome)
+        )
+        with self.assertRaisesRegex(ValueError, "conditioning schema"):
+            response_batches._validate_component_result(
+                leaf,
+                outcome,
+                allow_historical_conditioning_absence=False,
+            )
+
+        runtime["regularised_gsn_precision_policy"] = {
+            **self._historical_policy(leaf.job),
+            "regularised_gsn_activation_status": "blocked-but-drifted/v1",
+        }
+        with self.assertRaisesRegex(ValueError, "runtime policy"):
+            response_batches._validate_component_result(
+                leaf,
+                self._stage_outcome(historical, runtime),
+            )
 
     def test_historical_promoted_runtime_must_still_identify_its_precision(self):
         """Catches malformed current packages masquerading as historical evidence."""
@@ -960,6 +1072,20 @@ class JuliaSchemaThreeConditioningTests(unittest.TestCase):
             readout.numerical_conditioning.to_mapping(),
             valid_numerical_conditioning(),
         )
+
+    def test_current_worker_rejects_historical_conditioning_schema_two(self):
+        def downgrade(response):
+            response["numerical_conditioning"] = (
+                historical_schema_two_conditioning()
+            )
+
+        with self.assertRaisesRegex(
+            JuliaResponseBackendError,
+            "current conditioning schema is required",
+        ):
+            self._backend(self.Adapter(downgrade)).read_root(
+                self._job(), 0.0j
+            )
 
     def test_exterior_schema_three_persists_named_wronskian_and_no_raw_chart(self):
         """Catches presenting an exterior Wronskian as horizon scattering."""
@@ -1278,6 +1404,41 @@ class JuliaSchemaThreeConditioningTests(unittest.TestCase):
             julia_backend._validate_mechanism_precision_policy(
                 job.mechanism_id, request["policy"]
             )
+
+    def test_request_and_cache_identity_bind_each_activation_gate(self):
+        baseline = self._backend()._request(self._job(), 0.0j)
+        baseline_digest = hashlib.sha256(
+            canonical_json_bytes(baseline)
+        ).hexdigest()
+        mutations = {
+            "human_math_review_receipt_status": "approved/v1",
+            "human_math_review_receipt_sha256": "0" * 64,
+            "independent_reference_fixture_receipt_status": "reviewed/v1",
+            "independent_reference_fixture_receipt_sha256": "1" * 64,
+        }
+        for field, invalid in mutations.items():
+            with self.subTest(field=field):
+                changed = copy.deepcopy(baseline)
+                changed["policy"][field] = invalid
+                changed_digest = hashlib.sha256(
+                    canonical_json_bytes(changed)
+                ).hexdigest()
+                self.assertNotEqual(baseline_digest, changed_digest)
+                self.assertNotEqual(
+                    root_readout_identity_sha256(
+                        request_sha256=baseline_digest,
+                        runtime_identity="f" * 64,
+                    ),
+                    root_readout_identity_sha256(
+                        request_sha256=changed_digest,
+                        runtime_identity="f" * 64,
+                    ),
+                )
+                with self.assertRaises(ValueError):
+                    julia_backend._validate_mechanism_precision_policy(
+                        self._job().mechanism_id,
+                        changed["policy"],
+                    )
 
     def test_precision_bits_change_request_and_cache_identity(self):
         """Catches BigFloat requests at different precisions sharing a cache key."""

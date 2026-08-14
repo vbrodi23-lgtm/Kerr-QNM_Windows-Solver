@@ -29,6 +29,7 @@ from .response_engine import (
     BackendIdentity,
     DiagnosticRootReadout,
     NumericalConditioningEvidence,
+    NUMERICAL_CONDITIONING_SCHEMA,
     ResponseComponentJob,
     RootReadout,
     WORKER_RESPONSE_RECEIPT_SCHEMA,
@@ -1853,6 +1854,10 @@ class JuliaPrecisionRootBackend:
             raise JuliaResponseBackendError(
                 "M02 Julia numerical conditioning evidence is invalid"
             ) from error
+        if numerical_conditioning.schema != NUMERICAL_CONDITIONING_SCHEMA:
+            raise JuliaResponseBackendError(
+                "M02 Julia current conditioning schema is required"
+            )
         converged = response["root_converged"]
         diagnostics_skipped_reason = response.get("diagnostics_skipped_reason")
         diagnostics_skipped = diagnostics_skipped_reason == "PRIMARY_NOT_CONVERGED"

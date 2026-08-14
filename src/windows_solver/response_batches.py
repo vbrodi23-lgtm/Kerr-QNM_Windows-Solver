@@ -30,6 +30,8 @@ from .response_engine import (
     NativeDeterminantAdapter,
     NativeResourceUnavailableError,
     NumericalConditioningEvidence,
+    HISTORICAL_NUMERICAL_CONDITIONING_SCHEMA,
+    NUMERICAL_CONDITIONING_SCHEMA,
     NumericalPolicy,
     RECORDED_REPLAY_BACKEND_ID,
     RecordedReplayBackend,
@@ -2668,6 +2670,23 @@ class _UnauthenticatedComponentEvidence(ValueError):
     """Well-formed component evidence that fails scientific authentication."""
 
 
+def _historical_regularised_gsn_precision_policy(
+    mechanism_id: str,
+) -> dict[str, object]:
+    policy = dict(regularised_gsn_precision_policy(mechanism_id))
+    for field in (
+        "human_math_review_receipt_status",
+        "human_math_review_receipt_sha256",
+        "independent_reference_fixture_receipt_status",
+        "independent_reference_fixture_receipt_sha256",
+    ):
+        policy.pop(field)
+    policy["regularised_gsn_activation_status"] = (
+        "blocked-pending-human-math-review-and-independent-reference/v1"
+    )
+    return policy
+
+
 def _validate_current_promoted_runtime(
     leaf: CampaignLeafPlan,
     outcome: StageOutcome,
@@ -2736,10 +2755,28 @@ def _validate_current_promoted_runtime(
         # Main-branch promoted checkpoints with a complete Julia precision
         # identity predate conditioning schema 2 and its mechanism policy.
         return
+    conditioning_schemas = {
+        readout.numerical_conditioning.schema
+        for readout in result.raw_readouts
+        if readout.numerical_conditioning is not None
+    }
+    if conditioning_schemas == {NUMERICAL_CONDITIONING_SCHEMA}:
+        expected_policy = dict(
+            regularised_gsn_precision_policy(leaf.job.mechanism_id)
+        )
+    elif (
+        allow_historical_conditioning_absence
+        and conditioning_schemas
+        == {HISTORICAL_NUMERICAL_CONDITIONING_SCHEMA}
+    ):
+        expected_policy = _historical_regularised_gsn_precision_policy(
+            leaf.job.mechanism_id
+        )
+    else:
+        raise _UnauthenticatedComponentEvidence(
+            "campaign promoted numerical conditioning schema is invalid"
+        )
     observed_policy = runtime.get("regularised_gsn_precision_policy")
-    expected_policy = dict(
-        regularised_gsn_precision_policy(leaf.job.mechanism_id)
-    )
     if not isinstance(observed_policy, Mapping) or dict(observed_policy) != (
         expected_policy
     ):

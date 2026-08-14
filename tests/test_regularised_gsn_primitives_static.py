@@ -123,6 +123,23 @@ class RegularisedGsnPrimitiveSourceTests(unittest.TestCase):
         self.assertNotIn("@test_broken", julia_tests)
         self.assertNotIn("@test_skip", julia_tests)
 
+    def test_hypothetically_satisfying_only_one_gate_still_leaves_the_other(self):
+        factored = self.read(FACTORED)
+        readiness = factored[
+            factored.index("function assert_regularised_gsn_production_ready()") :
+            factored.index("\nend\n\nend", factored.index(
+                "function assert_regularised_gsn_production_ready()"
+            ))
+        ]
+        gates = (
+            "assert_human_math_review_receipt_available()",
+            "assert_independent_reference_fixture_available()",
+        )
+        for hypothetically_satisfied in gates:
+            with self.subTest(hypothetically_satisfied=hypothetically_satisfied):
+                remaining = next(gate for gate in gates if gate != hypothetically_satisfied)
+                self.assertIn(remaining, readiness)
+
     def test_activation_gates_have_distinct_fail_closed_policy_identities(self):
         policy = regularised_gsn_precision_policy("horizon-admittance")
         self.assertEqual(
