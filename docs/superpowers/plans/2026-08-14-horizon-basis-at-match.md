@@ -31,24 +31,24 @@ GeneralizedSasakiNakamura package, BigFloat at 298 bits.
 **Files:**
 - Create: `src/windows_solver/data/julia/horizon_basis_at_match_prototype_spec.jl`
 
-- [ ] Pin the physical-state carrier/factor round trip for a non-aligned real
+- [x] Pin the physical-state carrier/factor round trip for a non-aligned real
   tangent.
-- [ ] Pin independent column scaling and exact coefficient recovery at the
+- [x] Pin independent column scaling and exact coefficient recovery at the
   match point.
-- [ ] Pin fail-closed radial-approach and preflight predicates.
-- [ ] Run the focused spec and observe the missing prototype API failures.
+- [x] Pin fail-closed radial-approach and preflight predicates.
+- [x] Run the focused spec and observe the missing prototype API failures.
 
 ### Task 2: Prototype implementation
 
 **Files:**
 - Create: `tools/benchmark_leaf13_horizon_basis_at_match.jl`
 
-- [ ] Build and verify the real inner radial map.
-- [ ] Select the nearest endpoint that passes both horizon preflights.
-- [ ] Build explicit-tangent carriers and pure horizon remainder seeds.
-- [ ] Propagate ingoing and outgoing branches independently to `rho=0` with
+- [x] Build and verify the real inner radial map.
+- [x] Select the nearest endpoint that passes both horizon preflights.
+- [x] Build explicit-tangent carriers and pure horizon remainder seeds.
+- [x] Propagate ingoing and outgoing branches independently to `rho=0` with
   production algorithm/tolerances and endpoint-only saves.
-- [ ] Convert the outer result into the real-inner match coordinate, solve the
+- [x] Convert the outer result into the real-inner match coordinate, solve the
   scaled basis, and emit bounded JSON evidence.
 
 ### Task 3: Native Leaf 13 decision run
@@ -56,9 +56,9 @@ GeneralizedSasakiNakamura package, BigFloat at 298 bits.
 **Files:**
 - Create: `docs/engineering/2026-08-14-leaf13-horizon-basis-at-match.md`
 
-- [ ] Run the focused spec.
-- [ ] Run the full prototype at 298 bits.
-- [ ] Record per-leg cost, conditioning, reconstruction, verdict, and the
+- [x] Run the focused spec.
+- [x] Run the full prototype at 298 bits.
+- [x] Record per-leg cost, conditioning, reconstruction, verdict, and the
   performance-only claim ceiling.
 
 ### Task 4: Verification and delivery
@@ -66,7 +66,7 @@ GeneralizedSasakiNakamura package, BigFloat at 298 bits.
 **Files:**
 - Modify: `.tasks/IN_PROGRESS.md`
 
-- [ ] Run the full vendored Julia suite, focused Python source contracts,
+- [x] Run the full vendored Julia suite, focused Python source contracts,
   TaskPlanner validation, and whitespace checks.
-- [ ] Review the diff for accidental production-path or policy changes.
+- [x] Review the diff for accidental production-path or policy changes.
 - [ ] Commit and push the prototype and evidence to PR #44.
