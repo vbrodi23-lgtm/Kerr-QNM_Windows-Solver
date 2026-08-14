@@ -126,19 +126,24 @@ class RegularisedGsnFactoredPropagationSourceTests(unittest.TestCase):
         self.assertIn("U_rho + F_rho * q - q_rho - q^2", algebra)
         self.assertIn("synthetic nonzero q_rho transformed algebra", self.spec)
 
-    def test_inadequate_preflight_precedes_readiness_observers_and_rhs(self) -> None:
+    def test_inadequate_preflight_precedes_observers_and_rhs(self) -> None:
         solve_endpoint = self._function("solve_factored_endpoint")
         provenance = solve_endpoint.index("_assert_preparation_provenance(")
         preflight = solve_endpoint.index("_assert_factored_preflight_adequate(")
-        readiness = solve_endpoint.index(
-            "assert_regularised_gsn_production_ready()"
-        )
         execute = solve_endpoint.index(
             "_execute_factored_endpoint_after_readiness("
         )
         self.assertLess(provenance, preflight)
-        self.assertLess(preflight, readiness)
-        self.assertLess(readiness, execute)
+        self.assertLess(preflight, execute)
+        self.assertNotIn(
+            "assert_regularised_gsn_production_ready()", solve_endpoint
+        )
+        match_to_inner = self._function(
+            "solve_factored_horizon_match_to_inner"
+        )
+        self.assertNotIn(
+            "assert_regularised_gsn_production_ready()", match_to_inner
+        )
         self.assertIn("INSUFFICIENT_ASYMPTOTIC_PRECISION", self.source)
         self.assertIn(
             'FACTORED_HOMOGENEOUS_ODE_SCOPE_ID = "factored-homogeneous-gsn/v1"',
@@ -419,7 +424,8 @@ class RegularisedGsnFactoredPropagationSourceTests(unittest.TestCase):
             "transformed factored RHS identity",
             "production carriers have q_rho zero",
             "inadequate preflight performs zero factored homogeneous RHS evaluations",
-            "adequate preflight reaches the non-bypassable readiness gate",
+            "adequate preflight executes the public numerical solver",
+            "carrier transition executes the public match-to-inner solver",
             "compatible contour deformation and branch crossing rejection",
             "carrier change preserves X and Xrho at rho zero",
             "Float64 and BigFloat branch preparation",

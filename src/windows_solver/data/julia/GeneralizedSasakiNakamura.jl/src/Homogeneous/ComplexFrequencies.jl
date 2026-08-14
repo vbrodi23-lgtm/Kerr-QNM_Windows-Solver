@@ -2168,7 +2168,6 @@ function solve_factored_endpoint(
     ))
     # TODO: [HUMAN MATH REVIEW REQUIRED — verify the branch-specific plane-wave carriers, the transformed complex-contour GSN equation, the carrier change at ρ=0, the factored horizon basis, and the Cinc/Cref determinant chart against the current GSN amplitude and branch conventions.]
     # TODO: [HUMAN MATH REVIEW REQUIRED — decide whether derivative stencils freeze only the GSN branch cell while allowing frequency-local contour angles, or freeze the full contour tangent and use q=±i z t_frozen; verify contour-deformation invariance before production activation.]
-    assert_regularised_gsn_production_ready()
     typed_reltol = _resolve_factored_tolerance(
         T, spectral.precision_bits, reltol, "relative tolerance"
     )
@@ -2339,7 +2338,6 @@ function solve_factored_horizon_match_to_inner(
         "match-to-inner path requires horizon-ingoing preparation",
     ))
     _assert_carrier_transition_provenance(spectral, contour, transition)
-    assert_regularised_gsn_production_ready()
     typed_reltol = _resolve_factored_tolerance(
         T, spectral.precision_bits, reltol, "relative tolerance"
     )

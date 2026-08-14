@@ -9,6 +9,36 @@ permissions:
   contents: read
 
 jobs:
+  julia-factored-gsn:
+    runs-on: ubuntu-latest
+    env:
+      GSN_PROJECT: src/windows_solver/data/julia/GeneralizedSasakiNakamura.jl
+      JULIA_NUM_THREADS: "1"
+      JULIA_PKG_PRECOMPILE_AUTO: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: julia-actions/setup-julia@v3
+        with:
+          version: "1.10.11"
+      - name: Instantiate vendored GSN package
+        shell: bash
+        run: |
+          julia --startup-file=no --history-file=no --project="$GSN_PROJECT" -e '
+            using Pkg
+            Pkg.develop(PackageSpec(path=joinpath(
+              pwd(),
+              "src/windows_solver/data/julia/SpinWeightedSpheroidalHarmonics.jl",
+            )))
+            Pkg.instantiate()
+          '
+      - name: Run vendored GSN tests
+        shell: bash
+        run: |
+          julia --startup-file=no --history-file=no --project="$GSN_PROJECT" -e '
+            using Pkg
+            Pkg.test()
+          '
+
   test:
     strategy:
       fail-fast: false

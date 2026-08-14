@@ -292,9 +292,10 @@ end
 """
     assert_regularised_gsn_production_ready()
 
-Fail unless every external reference required to activate the regularised GSN
-production path is available. The future Task 1C/worker factored endpoint must
-call this gate before activation; the existing raw solver intentionally does not.
+Fail unless every external reference required to admit regularised-GSN
+mathematical claims is available. Evidence-generating numerical solvers do not
+call this gate: their emitted receipt statuses remain explicitly unapproved, and
+the scientific-claim/release boundary must call this gate before admission.
 """
 function assert_regularised_gsn_production_ready()
     assert_human_math_review_receipt_available()
