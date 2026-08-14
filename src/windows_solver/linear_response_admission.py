@@ -37,6 +37,7 @@ from .response_reduction import (
 from .response_engine import (
     bound_spectral_root_mapping_for_leaf,
     campaign_spectral_receipt,
+    regularised_gsn_precision_policy,
 )
 from .spectrum import (
     SPECTRAL_OUTPUT_ARTIFACT_TYPE,
@@ -46,7 +47,8 @@ from .spectrum import (
 )
 
 
-ADMISSION_SCHEMA_VERSION = 1
+ADMISSION_INPUT_SCHEMA_VERSION = 1
+ADMISSION_SCHEMA_VERSION = 2
 ADMITTED_LINEAR_RESPONSE_DESCRIPTOR = LINEAR_RESPONSE_ADMITTED_DESCRIPTOR
 _INPUT_KIND = "m02-linear-response-admission-input"
 _PACKAGE_KIND = "m02-linear-response-admission"
@@ -65,6 +67,59 @@ def _digest(value: object, subject: str) -> str:
     ):
         raise ValueError(f"{subject} must be a lowercase SHA-256 digest")
     return value
+
+
+def _validate_regularised_gsn_review_receipts(
+    value: object,
+) -> Mapping[str, object]:
+    receipts = _mapping(value, "regularised GSN review receipts")
+    _exact_fields(
+        receipts,
+        frozenset({
+            "human_math_review_receipt_status",
+            "human_math_review_receipt_sha256",
+            "independent_reference_fixture_receipt_status",
+            "independent_reference_fixture_receipt_sha256",
+        }),
+        "regularised GSN review receipts",
+    )
+    if receipts["human_math_review_receipt_status"] != "approved/v1":
+        raise ValueError(
+            "regularised GSN release admission blocked: human mathematical "
+            "review receipt has not been approved"
+        )
+    _digest(
+        receipts["human_math_review_receipt_sha256"],
+        "human mathematical review receipt SHA-256",
+    )
+    if (
+        receipts["independent_reference_fixture_receipt_status"]
+        != "reviewed/v1"
+    ):
+        raise ValueError(
+            "regularised GSN release admission blocked: independent reference "
+            "fixture receipt has not been reviewed"
+        )
+    _digest(
+        receipts["independent_reference_fixture_receipt_sha256"],
+        "independent reference fixture receipt SHA-256",
+    )
+    return receipts
+
+
+def _current_regularised_gsn_review_receipts() -> dict[str, object]:
+    policy = regularised_gsn_precision_policy("horizon-admittance")
+    receipts = {
+        name: policy[name]
+        for name in (
+            "human_math_review_receipt_status",
+            "human_math_review_receipt_sha256",
+            "independent_reference_fixture_receipt_status",
+            "independent_reference_fixture_receipt_sha256",
+        )
+    }
+    _validate_regularised_gsn_review_receipts(receipts)
+    return receipts
 
 
 def _mapping(value: object, subject: str) -> Mapping[str, object]:
@@ -568,6 +623,7 @@ class LinearResponseAdmissionPackage:
     request: Mapping[str, object]
     payload: Mapping[str, object]
     evidence_receipt: Mapping[str, object]
+    regularised_gsn_review_receipts: Mapping[str, object]
     spectral_upstream_receipt: Mapping[str, object]
     reduction: Mapping[str, object]
     reduction_receipt: Mapping[str, object]
@@ -578,7 +634,8 @@ class LinearResponseAdmissionPackage:
 
     def __post_init__(self) -> None:
         for name in (
-            "request", "payload", "evidence_receipt", "reduction",
+            "request", "payload", "evidence_receipt",
+            "regularised_gsn_review_receipts", "reduction",
             "spectral_upstream_receipt", "reduction_receipt", "source_files",
         ):
             object.__setattr__(self, name, _freeze_json(getattr(self, name)))
@@ -591,6 +648,9 @@ class LinearResponseAdmissionPackage:
             "request": _thaw_json(self.request),
             "payload": _thaw_json(self.payload),
             "evidence_receipt": _thaw_json(self.evidence_receipt),
+            "regularised_gsn_review_receipts": _thaw_json(
+                self.regularised_gsn_review_receipts
+            ),
             "spectral_upstream_receipt": _thaw_json(
                 self.spectral_upstream_receipt
             ),
@@ -609,8 +669,9 @@ class LinearResponseAdmissionPackage:
             mapping,
             frozenset({
                 "schema_version", "kind", "descriptor", "request", "payload",
-                "evidence_receipt", "spectral_upstream_receipt", "reduction",
-                "reduction_receipt", "source_files",
+                "evidence_receipt", "regularised_gsn_review_receipts",
+                "spectral_upstream_receipt", "reduction", "reduction_receipt",
+                "source_files",
                 "scientific_claims_admitted", "release_admissible",
                 "admission_id",
             }),
@@ -634,6 +695,9 @@ class LinearResponseAdmissionPackage:
             request, ADMITTED_LINEAR_RESPONSE_DESCRIPTOR.to_mapping(), payload
         )
         evidence_receipt = _validate_evidence_receipt(mapping["evidence_receipt"])
+        review_receipts = _validate_regularised_gsn_review_receipts(
+            mapping["regularised_gsn_review_receipts"]
+        )
         spectral_upstream_receipt = _validate_spectral_upstream_receipt(
             request, mapping["spectral_upstream_receipt"]
         )
@@ -670,6 +734,7 @@ class LinearResponseAdmissionPackage:
             request=deepcopy(dict(request_mapping)),
             payload=deepcopy(dict(payload)),
             evidence_receipt=deepcopy(dict(evidence_receipt)),
+            regularised_gsn_review_receipts=deepcopy(dict(review_receipts)),
             spectral_upstream_receipt=deepcopy(
                 dict(spectral_upstream_receipt)
             ),
@@ -683,9 +748,9 @@ class LinearResponseAdmissionPackage:
         return package
 
 
-def admit_linear_response_bundle(
+def _validated_admission_material(
     manifest_path: str | Path,
-) -> LinearResponseAdmissionPackage:
+) -> dict[str, object]:
     path = Path(manifest_path)
     manifest = _load_json_bytes(path.read_bytes(), "admission input manifest")
     _exact_fields(
@@ -697,7 +762,7 @@ def admit_linear_response_bundle(
         "admission input manifest",
     )
     if (
-        manifest["schema_version"] != ADMISSION_SCHEMA_VERSION
+        manifest["schema_version"] != ADMISSION_INPUT_SCHEMA_VERSION
         or manifest["kind"] != _INPUT_KIND
     ):
         raise ValueError("admission input manifest envelope is invalid")
@@ -764,10 +829,7 @@ def admit_linear_response_bundle(
     source_files = {
         name: _digest_bytes(data) for name, (_, data) in loaded.items()
     }
-    package_material = {
-        "schema_version": ADMISSION_SCHEMA_VERSION,
-        "kind": _PACKAGE_KIND,
-        "descriptor": ADMITTED_LINEAR_RESPONSE_DESCRIPTOR.to_mapping(),
+    return {
         "request": request.to_mapping(),
         "payload": deepcopy(dict(payload)),
         "evidence_receipt": evidence_receipt,
@@ -775,6 +837,48 @@ def admit_linear_response_bundle(
         "reduction": reduction.to_mapping(),
         "reduction_receipt": _reduction_receipt(reduction),
         "source_files": source_files,
+    }
+
+
+def validate_linear_response_bundle(
+    manifest_path: str | Path,
+) -> dict[str, object]:
+    """Validate structural/numerical evidence without admitting its release."""
+
+    material = _validated_admission_material(manifest_path)
+    evidence_receipt = _mapping(
+        material["evidence_receipt"], "admission evidence receipt"
+    )
+    reduction_receipt = _mapping(
+        material["reduction_receipt"], "admission reduction receipt"
+    )
+    return {
+        "produced_leaf_count": evidence_receipt["produced_count"],
+        "missing_leaf_count": evidence_receipt["missing_count"],
+        "unresolved_leaf_count": len(
+            _array(
+                evidence_receipt["unresolved_leaf_ids"],
+                "admission unresolved leaf IDs",
+            )
+        ),
+        "projective_row_count": reduction_receipt["row_count"],
+        "scientific_claims_admitted": False,
+        "release_admissible": False,
+    }
+
+
+def admit_linear_response_bundle(
+    manifest_path: str | Path,
+) -> LinearResponseAdmissionPackage:
+    material = _validated_admission_material(manifest_path)
+    package_material = {
+        "schema_version": ADMISSION_SCHEMA_VERSION,
+        "kind": _PACKAGE_KIND,
+        "descriptor": ADMITTED_LINEAR_RESPONSE_DESCRIPTOR.to_mapping(),
+        **material,
+        "regularised_gsn_review_receipts": (
+            _current_regularised_gsn_review_receipts()
+        ),
         "scientific_claims_admitted": False,
         "release_admissible": True,
     }

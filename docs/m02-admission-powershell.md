@@ -119,8 +119,14 @@ $admissionId = $admission.admission_id
 ```
 
 `m02-validate` reports `release_admissible: false` because it does not write or
-register a provider. `m02-admit` and `m02-export` revalidate every bound object
-and produce a content-sealed package. The package always records
+register a provider. It remains available while mathematical-review receipts
+are pending so operator evidence can be checked without claiming release
+readiness. `m02-admit` fails closed unless the installed regularised-GSN policy
+contains both `approved/v1` human-review and `reviewed/v1` independent-reference
+receipts with lowercase SHA-256 identities. A sealed package uses schema version
+2 and binds those receipt identities into its admission ID. `m02-export`
+revalidates the embedded receipts and every other bound object before copying the
+content-sealed package. The package always records
 `scientific_claims_admitted: false`: availability means the supplied evidence
 passed the frozen structural/numerical contract, not that any scientific
 outcome was favorable. The package also seals a spectral-upstream receipt: the

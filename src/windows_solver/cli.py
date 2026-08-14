@@ -23,6 +23,7 @@ from .linear_response_admission import (
     LinearResponseAdmissionPackage,
     admit_linear_response_bundle,
     load_linear_response_admission,
+    validate_linear_response_bundle,
 )
 from .planner import build_plan
 from .providers import ProviderUnavailableError
@@ -967,10 +968,10 @@ def _m02_summary(
 
 
 def _m02_validate(manifest: Path) -> tuple[int, object]:
-    package = admit_linear_response_bundle(manifest)
-    return 0, _m02_summary(
-        "m02-validate", package, release_admissible=False
-    )
+    return 0, {
+        "command": "m02-validate",
+        **validate_linear_response_bundle(manifest),
+    }
 
 
 def _m02_admit(manifest: Path, output: Path) -> tuple[int, object]:

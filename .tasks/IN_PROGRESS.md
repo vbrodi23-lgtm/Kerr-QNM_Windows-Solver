@@ -57,6 +57,7 @@ preservation, and cache/provenance separation from historical raw-state leaves.
 - Preserve the production gate and existing worker contour while prototyping a horizon basis at the match point: use a real positive inner tortoise ray that demonstrably approaches `r_plus`, authenticate both horizon endpoint series before any homogeneous RHS evaluation, propagate the pure ingoing/outgoing remainders independently to the match point, and solve the scaled physical-state basis there.
 - Emit the contour-approach, endpoint-conditioning, per-leg RHS/step, basis-condition, coefficient, and reconstruction evidence needed to decide whether the prototype merits production integration; do not treat this performance prototype as a mathematical activation receipt.
 - Keep the external review receipts fail-closed at the mathematical-claim/release boundary, not inside the factored ODE executor, so native campaigns can generate the evidence required to satisfy those receipts.
+- Keep structural `m02-validate` available for unapproved evidence, but require SHA-bound `approved/v1` human-review and `reviewed/v1` independent-reference receipts before sealing a schema-2 release-admissible package.
 - Run focused regression, Julia, and Python checks, independently review the diff, then publish a hotfix for native PowerShell resumption; do not reinterpret execution as mathematical approval.
 
 ---
