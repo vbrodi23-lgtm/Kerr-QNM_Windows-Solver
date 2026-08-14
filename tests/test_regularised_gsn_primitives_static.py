@@ -3,6 +3,8 @@ from __future__ import annotations
 from pathlib import Path
 import unittest
 
+from windows_solver.response_engine import regularised_gsn_precision_policy
+
 
 ROOT = Path(__file__).resolve().parents[1]
 PACKAGE = (
@@ -14,6 +16,7 @@ FACTORED = PACKAGE / "src/Homogeneous/FactoredSolutions.jl"
 COMPLEX_FREQUENCIES = PACKAGE / "src/Homogeneous/ComplexFrequencies.jl"
 ENTRYPOINT = PACKAGE / "src/GeneralizedSasakiNakamura.jl"
 JULIA_TESTS = PACKAGE / "test/runtests.jl"
+WORKER = ROOT / "src/windows_solver/data/julia/m02_worker.jl"
 
 BRANCH_REVIEW_TODO = (
     "TODO: [HUMAN MATH REVIEW REQUIRED — decide whether derivative stencils "
@@ -106,14 +109,48 @@ class RegularisedGsnPrimitiveSourceTests(unittest.TestCase):
         self.assertIn(CARRIER_REVIEW_TODO, factored)
         self.assertIn(REFERENCE_REVIEW_TODO, julia_tests)
         self.assertIn("assert_independent_reference_fixture_available", factored)
+        self.assertIn("assert_human_math_review_receipt_available", factored)
         self.assertIn("assert_regularised_gsn_production_ready", factored)
-        self.assertIn(
-            "assert_independent_reference_fixture_available()\n    return nothing",
-            factored,
-        )
+        readiness = factored[
+            factored.index("function assert_regularised_gsn_production_ready()") :
+            factored.index("\nend\n\nend", factored.index(
+                "function assert_regularised_gsn_production_ready()"
+            ))
+        ]
+        self.assertIn("assert_human_math_review_receipt_available()", readiness)
+        self.assertIn("assert_independent_reference_fixture_available()", readiness)
         self.assertIn("assert_regularised_gsn_production_ready", self.read(ENTRYPOINT))
         self.assertNotIn("@test_broken", julia_tests)
         self.assertNotIn("@test_skip", julia_tests)
+
+    def test_activation_gates_have_distinct_fail_closed_policy_identities(self):
+        policy = regularised_gsn_precision_policy("horizon-admittance")
+        self.assertEqual(
+            policy["human_math_review_receipt_status"],
+            "absent-unapproved/v1",
+        )
+        self.assertIsNone(policy["human_math_review_receipt_sha256"])
+        self.assertEqual(
+            policy["independent_reference_fixture_receipt_status"],
+            "absent-unreviewed/v1",
+        )
+        self.assertIsNone(
+            policy["independent_reference_fixture_receipt_sha256"]
+        )
+        self.assertNotIn("regularised_gsn_activation_status", policy)
+
+        worker = self.read(WORKER)
+        for field in (
+            "human_math_review_receipt_status",
+            "human_math_review_receipt_sha256",
+            "independent_reference_fixture_receipt_status",
+            "independent_reference_fixture_receipt_sha256",
+        ):
+            self.assertIn(f'"{field}"', worker)
+        self.assertNotIn(
+            "blocked-pending-human-math-review-and-independent-reference/v1",
+            worker,
+        )
 
     def test_factored_representation_has_no_dynamic_max_abs_normalizer(self):
         factored = self.read(FACTORED)

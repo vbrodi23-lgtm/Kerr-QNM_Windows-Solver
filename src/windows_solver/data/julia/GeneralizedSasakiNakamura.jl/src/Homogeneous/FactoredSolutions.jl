@@ -16,6 +16,10 @@ export carrier_log, carrier_value, carrier_log_derivative
 export carrier_log_derivative_derivative
 export reconstruct_state, factor_state, change_carrier
 export carrier_change_diagnostics
+export human_math_review_receipt_status, human_math_review_receipt_sha256
+export independent_reference_fixture_receipt_status
+export independent_reference_fixture_receipt_sha256
+export assert_human_math_review_receipt_available
 export assert_independent_reference_fixture_available
 export assert_regularised_gsn_production_ready
 
@@ -27,6 +31,10 @@ const scattering_column_convention =
 const radial_derivative_convention = "state2=dX/drho/v1"
 const determinant_convention = "cinc-over-cref-minus-R/v1"
 const factored_remainder_state_convention = "state1=Y;state2=dY/drho/v1"
+const human_math_review_receipt_status = "absent-unapproved/v1"
+const human_math_review_receipt_sha256 = nothing
+const independent_reference_fixture_receipt_status = "absent-unreviewed/v1"
+const independent_reference_fixture_receipt_sha256 = nothing
 
 struct RegularRemainderContract
     identity::String
@@ -274,6 +282,13 @@ function assert_independent_reference_fixture_available()
     )
 end
 
+function assert_human_math_review_receipt_available()
+    error(
+        "production activation blocked: human mathematical review receipt " *
+        "has not been approved"
+    )
+end
+
 """
     assert_regularised_gsn_production_ready()
 
@@ -282,6 +297,7 @@ production path is available. The future Task 1C/worker factored endpoint must
 call this gate before activation; the existing raw solver intentionally does not.
 """
 function assert_regularised_gsn_production_ready()
+    assert_human_math_review_receipt_available()
     assert_independent_reference_fixture_available()
     return nothing
 end

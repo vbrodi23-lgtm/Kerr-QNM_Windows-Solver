@@ -43,8 +43,10 @@ const EXTERIOR_DETERMINANT_FAMILY_ID = "exterior-wronskian/v1"
 const RELIABLE_DIGIT_SAFETY_MARGIN = 8
 const REQUIRED_DIGIT_GUARD = 6
 const SCATTERING_CHART_SAFETY_FACTOR = 64
-const REGULARISED_GSN_ACTIVATION_STATUS =
-    "blocked-pending-human-math-review-and-independent-reference/v1"
+const HUMAN_MATH_REVIEW_RECEIPT_STATUS = "absent-unapproved/v1"
+const HUMAN_MATH_REVIEW_RECEIPT_SHA256 = nothing
+const INDEPENDENT_REFERENCE_FIXTURE_RECEIPT_STATUS = "absent-unreviewed/v1"
+const INDEPENDENT_REFERENCE_FIXTURE_RECEIPT_SHA256 = nothing
 const ACTIVE_PROGRESS_CONTEXT = Ref(Dict{String,Any}())
 const ODE_PROGRESS_INTERVAL_SECONDS = 15.0
 const ODE_ALGORITHM_CONFIGURED = "AutoVern9(Rosenbrock23(autodiff=false))"
@@ -560,7 +562,10 @@ function flatten_request(document)
         "factored_remainder_state_convention",
         "reliable_digit_safety_margin",
         "required_digit_guard",
-        "regularised_gsn_activation_status",
+        "human_math_review_receipt_status",
+        "human_math_review_receipt_sha256",
+        "independent_reference_fixture_receipt_status",
+        "independent_reference_fixture_receipt_sha256",
         "determinant_family",
         "scattering_diagnostics_applicable",
         "scattering_coefficient_extraction",
@@ -606,8 +611,14 @@ function validate_regularised_gsn_policy(request)
         "reliable_digit_safety_margin" =>
             string(RELIABLE_DIGIT_SAFETY_MARGIN),
         "required_digit_guard" => string(REQUIRED_DIGIT_GUARD),
-        "regularised_gsn_activation_status" =>
-            REGULARISED_GSN_ACTIVATION_STATUS,
+        "human_math_review_receipt_status" =>
+            HUMAN_MATH_REVIEW_RECEIPT_STATUS,
+        "human_math_review_receipt_sha256" =>
+            HUMAN_MATH_REVIEW_RECEIPT_SHA256,
+        "independent_reference_fixture_receipt_status" =>
+            INDEPENDENT_REFERENCE_FIXTURE_RECEIPT_STATUS,
+        "independent_reference_fixture_receipt_sha256" =>
+            INDEPENDENT_REFERENCE_FIXTURE_RECEIPT_SHA256,
     )
     for (key, expected) in expected_common
         required(request, key) == expected ||

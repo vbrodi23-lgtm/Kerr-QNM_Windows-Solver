@@ -1178,9 +1178,12 @@ class JuliaSchemaThreeConditioningTests(unittest.TestCase):
             ),
             "reliable_digit_safety_margin": "8",
             "required_digit_guard": "6",
-            "regularised_gsn_activation_status": (
-                "blocked-pending-human-math-review-and-independent-reference/v1"
+            "human_math_review_receipt_status": "absent-unapproved/v1",
+            "human_math_review_receipt_sha256": None,
+            "independent_reference_fixture_receipt_status": (
+                "absent-unreviewed/v1"
             ),
+            "independent_reference_fixture_receipt_sha256": None,
         }
 
         for field, value in expected.items():

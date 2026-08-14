@@ -237,7 +237,7 @@ end
         caught
     end
     @test error isa ErrorException
-    @test occursin("independent high-precision GSN reference fixture", error.msg)
+    @test occursin("human mathematical review receipt", error.msg)
     @test rhs_count[] == 0
     @test observer_factory_calls[] == 0
 end

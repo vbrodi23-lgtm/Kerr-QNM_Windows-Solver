@@ -162,6 +162,7 @@ end
     @test_throws ArgumentError gsn_branch_convention(Inf + 1.0im, 1.0 + 1.0im)
 
     # TODO: [HUMAN MATH REVIEW REQUIRED — generate and freeze independent high-precision reference values for the three GSN asymptotic branches after the branch and normalization conventions have been verified.]
+    @test_throws ErrorException assert_human_math_review_receipt_available()
     @test_throws ErrorException assert_independent_reference_fixture_available()
     @test_throws ErrorException assert_regularised_gsn_production_ready()
 end
