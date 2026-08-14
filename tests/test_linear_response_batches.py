@@ -45,6 +45,7 @@ from windows_solver.response_engine import (
     run_component,
 )
 from windows_solver.solved_leaf_cache import SolvedLeafStore
+from tests.fixtures import current_promoted_component_payload
 
 
 _FROZEN_IDENTITY_TEST_BACKEND = replace(
@@ -464,13 +465,20 @@ class CampaignPlanTests(unittest.TestCase):
                         "discrepancy_from_previous_abs": 0.0,
                         "discrepancy_enclosed": True,
                     }
+                component = {
+                    "evidence_kind": "synthetic-authenticated-nonconvergence",
+                    "result": result.to_mapping(),
+                }
+                if digits in (80, 120):
+                    component = current_promoted_component_payload(
+                        result,
+                        digits,
+                        precision_limited=(digits == 80),
+                    )
                 return _synthetic_stage_outcome(
                     digits=digits,
                     numerical_state=result.status.value,
-                    component_result={
-                        "evidence_kind": "synthetic-authenticated-nonconvergence",
-                        "result": result.to_mapping(),
-                    },
+                    component_result=component,
                     local_disk_radius_abs=0.0,
                     **refinement,
                 )

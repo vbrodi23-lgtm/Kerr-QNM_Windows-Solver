@@ -1,5 +1,7 @@
+from dataclasses import replace
 from decimal import Decimal, localcontext
 from fractions import Fraction
+import math
 
 
 EXPECTED_KAPPA_SPINS = {
@@ -140,6 +142,84 @@ def valid_numerical_conditioning(
         "maximum_carrier_change_error": "5.00E-46" if horizon else None,
         "maximum_contour_angle_deformation": "7.50E-8",
     }
+
+
+def current_promoted_component_payload(
+    result,
+    digits: int,
+    *,
+    precision_limited: bool,
+) -> dict[str, object]:
+    """Wrap a mocked promoted result in the current package evidence contract."""
+
+    from windows_solver.response_engine import (
+        ComponentStatus,
+        NumericalConditioningEvidence,
+        regularised_gsn_precision_policy,
+    )
+
+    mapping = valid_numerical_conditioning(result.mechanism_id)
+    mapping.update({
+        "predicted_reliable_digits": (
+            "11.25" if precision_limited else "55.125"
+        ),
+        "required_reliable_digits": "24",
+        "precision_limited": precision_limited,
+    })
+    evidence = NumericalConditioningEvidence.from_mapping(mapping)
+    raw_status = (
+        "available/v1"
+        if evidence.scattering_diagnostics_applicable
+        else "not-applicable/v1"
+    )
+
+    def conditioned(readout):
+        return replace(
+            readout,
+            diagnostic_readouts=(readout.diagnostic_readouts or None),
+            numerical_conditioning=evidence,
+            normalised_determinant_abs=Decimal(
+                str(readout.determinant_residual_abs)
+            ),
+            raw_determinant_abs=(
+                Decimal(str(readout.determinant_residual_abs))
+                if raw_status == "available/v1"
+                else None
+            ),
+            raw_determinant_evidence_status=raw_status,
+        )
+
+    levels = tuple(
+        replace(
+            level,
+            real_plus=conditioned(level.real_plus),
+            real_minus=conditioned(level.real_minus),
+            imaginary_plus=conditioned(level.imaginary_plus),
+            imaginary_minus=conditioned(level.imaginary_minus),
+        )
+        for level in result.levels
+    )
+    conditioned_result = replace(
+        result,
+        baseline=conditioned(result.baseline),
+        levels=levels,
+    )
+    payload: dict[str, object] = {
+        "evidence_kind": "package-owned-julia-promoted-component-engine",
+        "result": conditioned_result.to_mapping(),
+        "self_refinement_result": None,
+        "scientific_runtime": {
+            "precision_digits": digits,
+            "working_precision_bits": math.ceil(digits * math.log2(10)) + 32,
+            "refinement_level": 0,
+            "regularised_gsn_precision_policy": dict(
+                regularised_gsn_precision_policy(result.mechanism_id)
+            ),
+        },
+    }
+    if result.status is ComponentStatus.NOT_CONVERGED:
+        payload["self_refinement_skipped_reason"] = "PRIMARY_NOT_CONVERGED"
+    return payload
 
 
 def valid_schema_three_julia_root_response(

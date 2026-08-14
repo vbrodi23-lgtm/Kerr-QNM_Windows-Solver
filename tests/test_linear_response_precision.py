@@ -96,12 +96,13 @@ def reseal(value):
 
 
 def remove_promotion_decision_and_reseal(
-    value, *, stage_index=1, remove_conditioning=False
+    value, *, stage_index=1, remove_conditioning=False,
+    historical_shape=False,
 ):
     stage = value["records"][0]["stages"][stage_index]
     component = stage["component_result"]
     component.pop("promotion_decision")
-    if remove_conditioning:
+    if remove_conditioning or historical_shape:
         baseline = component["result"]["baseline"]
         for name in (
             "numerical_conditioning",
@@ -110,6 +111,10 @@ def remove_promotion_decision_and_reseal(
             "raw_determinant_evidence_status",
         ):
             baseline.pop(name, None)
+    if historical_shape:
+        component["scientific_runtime"].pop(
+            "regularised_gsn_precision_policy"
+        )
     source_sha256 = hashlib.sha256(
         canonical_json_bytes(component)
     ).hexdigest()
@@ -240,7 +245,7 @@ def _authenticated_primary_stage(
         "evidence_kind": "authenticated-primary-precision-contract",
         "result": result.to_mapping(),
     }
-    return _synthetic_stage_outcome(
+    outcome = _synthetic_stage_outcome(
         digits=digits,
         numerical_state=status.value,
         component_result=component_result,
@@ -248,6 +253,22 @@ def _authenticated_primary_stage(
         self_refinement_enclosed=self_refinement_enclosed,
         discrepancy_from_previous_abs=discrepancy_from_previous_abs,
         discrepancy_enclosed=discrepancy_enclosed,
+    )
+    if digits not in (80, 120):
+        return outcome
+    precision_limited = (
+        digits == 80
+        and (
+            status is ComponentStatus.NOT_CONVERGED
+            or self_refinement_enclosed is False
+            or discrepancy_enclosed is False
+        )
+    )
+    return _with_baseline_conditioning(
+        outcome,
+        predicted_reliable_digits=("11.25" if precision_limited else "55.125"),
+        required_reliable_digits="24",
+        precision_limited=precision_limited,
     )
 
 
@@ -604,7 +625,7 @@ class PromotedConditioningDecisionTests(unittest.TestCase):
             "55.12500000000000000001",
         )
 
-    def test_legacy_missing_conditioning_preserves_prior_promotion(self):
+    def test_current_default_conditioning_preserves_prior_promotion(self):
         temporary, backend, summary, _ = self._run(evidence=None)
         self.addCleanup(temporary.cleanup)
 
@@ -614,11 +635,11 @@ class PromotedConditioningDecisionTests(unittest.TestCase):
         ]
         self.assertEqual(decision["state"], "REQUESTED")
         self.assertEqual(
-            decision["reason"], "LEGACY_CONDITIONING_EVIDENCE_ABSENT"
+            decision["reason"], "INSUFFICIENT_RELIABLE_DIGITS"
         )
-        self.assertIsNone(decision["predicted_reliable_digits"])
-        self.assertIsNone(decision["required_reliable_digits"])
-        self.assertIsNone(decision["precision_limited"])
+        self.assertEqual(decision["predicted_reliable_digits"], "11.25")
+        self.assertEqual(decision["required_reliable_digits"], "24")
+        self.assertIs(decision["precision_limited"], True)
 
     def test_converged_refinement_gates_remain_authoritative(self):
         temporary, backend, summary, _ = self._run(
@@ -866,12 +887,29 @@ class PromotedConditioningDecisionTests(unittest.TestCase):
         ):
             validate_campaign_checkpoint(plan, checkpoint)
 
+        component["evidence_kind"] = "authenticated-primary-precision-contract"
+        source_sha256 = hashlib.sha256(
+            canonical_json_bytes(component)
+        ).hexdigest()
+        for channel in forged["records"][0]["stages"][1][
+            "signed_error_channels"
+        ]:
+            channel["provenance"]["source_sha256"] = source_sha256
+        reseal(forged)
+        checkpoint.write_bytes(canonical_json_bytes(forged))
+        with self.assertRaisesRegex(
+            ValueError, "current promoted evidence kind"
+        ):
+            validate_campaign_checkpoint(plan, checkpoint)
+
     def test_schema_four_allows_historical_missing_decision_and_conditioning(self):
         temporary, _, _, _ = self._run(evidence=None)
         self.addCleanup(temporary.cleanup)
         checkpoint = Path(temporary.name) / "conditioning.json"
         historical = json.loads(checkpoint.read_text(encoding="utf-8"))
-        remove_promotion_decision_and_reseal(historical)
+        remove_promotion_decision_and_reseal(
+            historical, historical_shape=True
+        )
         historical["schema_version"] = 4
         checkpoint.write_bytes(canonical_json_bytes(historical))
 
@@ -892,7 +930,9 @@ class PromotedConditioningDecisionTests(unittest.TestCase):
         self.addCleanup(temporary.cleanup)
         checkpoint = Path(temporary.name) / "conditioning.json"
         historical = json.loads(checkpoint.read_text(encoding="utf-8"))
-        remove_promotion_decision_and_reseal(historical)
+        remove_promotion_decision_and_reseal(
+            historical, historical_shape=True
+        )
         historical["schema_version"] = 4
         checkpoint.write_bytes(canonical_json_bytes(historical))
         original = checkpoint.read_bytes()
@@ -908,7 +948,7 @@ class PromotedConditioningDecisionTests(unittest.TestCase):
         )
         backend.calls.clear()
 
-        with self.assertRaisesRegex(ValueError, "promotion decision is required"):
+        with self.assertRaisesRegex(ValueError, "current conditioning evidence"):
             run_campaign_selection(
                 plan,
                 selection,
@@ -925,7 +965,9 @@ class PromotedConditioningDecisionTests(unittest.TestCase):
         self.addCleanup(temporary.cleanup)
         checkpoint = Path(temporary.name) / "conditioning.json"
         historical = json.loads(checkpoint.read_text(encoding="utf-8"))
-        remove_promotion_decision_and_reseal(historical)
+        remove_promotion_decision_and_reseal(
+            historical, historical_shape=True
+        )
         historical["schema_version"] = 4
         checkpoint.write_bytes(canonical_json_bytes(historical))
         output = Path(temporary.name) / "merged.json"
@@ -935,7 +977,7 @@ class PromotedConditioningDecisionTests(unittest.TestCase):
             backend_identity=VettedNativeDeterminantKernel.identity,
             precision_capabilities=PrecisionCapabilities((64, 80, 120)),
         )
-        with self.assertRaisesRegex(ValueError, "promotion decision is required"):
+        with self.assertRaisesRegex(ValueError, "current conditioning evidence"):
             merge_campaign_checkpoints(plan, (checkpoint,), output)
 
         self.assertFalse(output.exists())
@@ -2229,6 +2271,29 @@ class PromotedResourceContainmentTests(unittest.TestCase):
             resumed = run_campaign_selection(
                 plan, selection, ResumeBackend(), checkpoint, resume=True
             )
+            forged = json.loads(checkpoint.read_text(encoding="utf-8"))
+            recovery_attempt = forged["attempts"][1]
+            recovery_failure = recovery_attempt["failure_receipt"]["failure"]
+            recovery_failure["request_binding"]["job_id"] = following.job.job_id
+            recovery_failure["request_sha256"] = hashlib.sha256(
+                canonical_json_bytes(recovery_failure["request_binding"])
+            ).hexdigest()
+            recovery_attempt["attempt_sha256"] = hashlib.sha256(
+                canonical_json_bytes({
+                    key: value
+                    for key, value in recovery_attempt.items()
+                    if key != "attempt_sha256"
+                })
+            ).hexdigest()
+            forged["attempts_sha256"] = hashlib.sha256(
+                canonical_json_bytes(forged["attempts"])
+            ).hexdigest()
+            forged_path = Path(temporary) / "forged-120-asymptotic.json"
+            forged_path.write_bytes(canonical_json_bytes(forged))
+            with self.assertRaisesRegex(
+                ValueError, "canonical request identity"
+            ):
+                validate_campaign_checkpoint(plan, forged_path)
 
         records = {record.leaf_id: record for record in first.records}
         self.assertEqual(first.state, "PARTIAL")

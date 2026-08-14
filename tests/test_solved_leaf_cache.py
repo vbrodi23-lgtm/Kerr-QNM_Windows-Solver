@@ -46,7 +46,10 @@ from windows_solver.response_engine import (
 from windows_solver.progress import activate_progress
 from windows_solver.progress_output import CampaignProgressReporter
 from windows_solver.solved_leaf_cache import SolvedLeafLookupStatus, SolvedLeafStore
-from tests.fixtures import valid_numerical_conditioning
+from tests.fixtures import (
+    current_promoted_component_payload,
+    valid_numerical_conditioning,
+)
 
 
 _FROZEN_MIGRATION_BACKEND_IDENTITY = replace(
@@ -214,6 +217,14 @@ def _production_outcome(
         "evidence_kind": "authenticated-polished-baseline-regression",
         "result": result.to_mapping(),
     }
+    if digits in (80, 120):
+        component = current_promoted_component_payload(
+            result,
+            digits,
+            precision_limited=(
+                digits == 80 and status is ComponentStatus.NOT_CONVERGED
+            ),
+        )
     return StageOutcome(
         digits=digits,
         numerical_state=status.value,

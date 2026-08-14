@@ -2690,6 +2690,14 @@ def _validate_current_promoted_runtime(
         for readout in result.raw_readouts
     )
     has_conditioning = any(conditioned)
+    if (
+        outcome.digits in (80, 120)
+        and not allow_historical_conditioning_absence
+        and not package_promoted
+    ):
+        raise _UnauthenticatedComponentEvidence(
+            "campaign current promoted evidence kind is invalid"
+        )
     if not package_promoted and not has_conditioning:
         return
     if not package_promoted or (has_conditioning and not all(conditioned)):
