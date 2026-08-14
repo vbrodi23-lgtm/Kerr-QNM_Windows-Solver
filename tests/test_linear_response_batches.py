@@ -474,6 +474,7 @@ class CampaignPlanTests(unittest.TestCase):
                         result,
                         digits,
                         precision_limited=(digits == 80),
+                        leaf=selected,
                     )
                 return _synthetic_stage_outcome(
                     digits=digits,

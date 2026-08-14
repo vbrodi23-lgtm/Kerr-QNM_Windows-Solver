@@ -1,7 +1,10 @@
 from dataclasses import replace
 from decimal import Decimal, localcontext
 from fractions import Fraction
+import hashlib
 import math
+
+from windows_solver.contracts import canonical_json_bytes
 
 
 EXPECTED_KAPPA_SPINS = {
@@ -149,6 +152,7 @@ def current_promoted_component_payload(
     digits: int,
     *,
     precision_limited: bool,
+    leaf,
 ) -> dict[str, object]:
     """Wrap a mocked promoted result in the current package evidence contract."""
 
@@ -173,8 +177,17 @@ def current_promoted_component_payload(
         else "not-applicable/v1"
     )
 
-    def conditioned(readout):
-        return replace(
+    scientific_runtime = {
+        "precision_digits": digits,
+        "working_precision_bits": math.ceil(digits * math.log2(10)) + 32,
+        "refinement_level": 0,
+        "regularised_gsn_precision_policy": dict(
+            regularised_gsn_precision_policy(result.mechanism_id)
+        ),
+    }
+
+    def conditioned(readout, readout_id):
+        updated = replace(
             readout,
             diagnostic_readouts=(readout.diagnostic_readouts or None),
             numerical_conditioning=evidence,
@@ -187,35 +200,78 @@ def current_promoted_component_payload(
                 else None
             ),
             raw_determinant_evidence_status=raw_status,
+            worker_response_receipt=None,
+        )
+        request_binding = {
+            "schema_version": 1,
+            "operation": "root-readout",
+            "job_id": leaf.job.job_id,
+            "leaf_id": leaf.leaf_id,
+            "role": leaf.role,
+            "mechanism_id": leaf.mechanism_id,
+            "job_policy_sha256": leaf.job.policy.identity_sha256,
+            "backend_identity_sha256": (
+                leaf.job.backend_identity.identity_sha256
+            ),
+            "precision_digits": digits,
+            "refinement_level": 0,
+            "synthetic_readout_id": readout_id,
+        }
+        receipt_material = {
+            "schema": "windows-solver.worker-response-receipt/1",
+            "request_binding": request_binding,
+            "request_sha256": hashlib.sha256(
+                canonical_json_bytes(request_binding)
+            ).hexdigest(),
+            "scientific_runtime_sha256": hashlib.sha256(
+                canonical_json_bytes(scientific_runtime)
+            ).hexdigest(),
+            "worker_response_schema_version": 3,
+            "root_residual_abs_text": str(
+                updated.normalised_determinant_abs
+            ),
+            "raw_determinant_abs_text": (
+                None
+                if updated.raw_determinant_abs is None
+                else str(updated.raw_determinant_abs)
+            ),
+            "raw_determinant_evidence_status": raw_status,
+        }
+        return replace(
+            updated,
+            diagnostic_readouts=(updated.diagnostic_readouts or None),
+            worker_response_receipt={
+                **receipt_material,
+                "receipt_sha256": hashlib.sha256(
+                    canonical_json_bytes(receipt_material)
+                ).hexdigest(),
+            },
         )
 
     levels = tuple(
         replace(
             level,
-            real_plus=conditioned(level.real_plus),
-            real_minus=conditioned(level.real_minus),
-            imaginary_plus=conditioned(level.imaginary_plus),
-            imaginary_minus=conditioned(level.imaginary_minus),
+            real_plus=conditioned(level.real_plus, f"level-{index}-real-plus"),
+            real_minus=conditioned(level.real_minus, f"level-{index}-real-minus"),
+            imaginary_plus=conditioned(
+                level.imaginary_plus, f"level-{index}-imaginary-plus"
+            ),
+            imaginary_minus=conditioned(
+                level.imaginary_minus, f"level-{index}-imaginary-minus"
+            ),
         )
-        for level in result.levels
+        for index, level in enumerate(result.levels)
     )
     conditioned_result = replace(
         result,
-        baseline=conditioned(result.baseline),
+        baseline=conditioned(result.baseline, "baseline"),
         levels=levels,
     )
     payload: dict[str, object] = {
         "evidence_kind": "package-owned-julia-promoted-component-engine",
         "result": conditioned_result.to_mapping(),
         "self_refinement_result": None,
-        "scientific_runtime": {
-            "precision_digits": digits,
-            "working_precision_bits": math.ceil(digits * math.log2(10)) + 32,
-            "refinement_level": 0,
-            "regularised_gsn_precision_policy": dict(
-                regularised_gsn_precision_policy(result.mechanism_id)
-            ),
-        },
+        "scientific_runtime": scientific_runtime,
     }
     if result.status is ComponentStatus.NOT_CONVERGED:
         payload["self_refinement_skipped_reason"] = "PRIMARY_NOT_CONVERGED"

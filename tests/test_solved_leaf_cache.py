@@ -224,6 +224,7 @@ def _production_outcome(
             precision_limited=(
                 digits == 80 and status is ComponentStatus.NOT_CONVERGED
             ),
+            leaf=leaf,
         )
     return StageOutcome(
         digits=digits,
@@ -529,6 +530,21 @@ class SolvedLeafCacheTests(unittest.TestCase):
         evidence = NumericalConditioningEvidence.from_mapping(
             valid_numerical_conditioning("horizon-admittance")
         )
+        receipt = {
+            **dict(result.baseline.worker_response_receipt),
+            "request_binding": dict(
+                result.baseline.worker_response_receipt["request_binding"]
+            ),
+            "raw_determinant_abs_text": None,
+            "raw_determinant_evidence_status": "unavailable-overflow/v1",
+        }
+        receipt["receipt_sha256"] = hashlib.sha256(
+            canonical_json_bytes({
+                key: value
+                for key, value in receipt.items()
+                if key != "receipt_sha256"
+            })
+        ).hexdigest()
         baseline = replace(
             result.baseline,
             truncation_radius=None,
@@ -542,6 +558,7 @@ class SolvedLeafCacheTests(unittest.TestCase):
             ),
             raw_determinant_abs=None,
             raw_determinant_evidence_status="unavailable-overflow/v1",
+            worker_response_receipt=receipt,
         )
         component["result"] = replace(result, baseline=baseline).to_mapping()
         outcome = replace(

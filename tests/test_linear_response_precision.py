@@ -109,6 +109,7 @@ def remove_promotion_decision_and_reseal(
             "normalised_determinant_abs",
             "raw_determinant_abs",
             "raw_determinant_evidence_status",
+            "worker_response_receipt",
         ):
             baseline.pop(name, None)
     if historical_shape:
@@ -269,6 +270,8 @@ def _authenticated_primary_stage(
         predicted_reliable_digits=("11.25" if precision_limited else "55.125"),
         required_reliable_digits="24",
         precision_limited=precision_limited,
+        receipt_job=job,
+        receipt_role=leaf.role,
     )
 
 
@@ -304,6 +307,8 @@ def _with_baseline_conditioning(
     required_reliable_digits,
     precision_limited,
     raw_determinant_evidence_status=None,
+    receipt_job=None,
+    receipt_role=None,
 ):
     result = ComponentResult.from_mapping(outcome.component_result["result"])
     mapping = valid_numerical_conditioning(result.mechanism_id)
@@ -322,8 +327,20 @@ def _with_baseline_conditioning(
     if horizon and raw_status is None:
         raw_status = "available/v1"
 
-    def conditioned(readout):
-        return replace(
+    scientific_runtime = {
+        "precision_digits": outcome.digits,
+        "working_precision_bits": (
+            math.ceil(outcome.digits * math.log2(10)) + 32
+        ),
+        "refinement_level": 0,
+        "regularised_gsn_precision_policy": dict(
+            regularised_gsn_precision_policy(result.mechanism_id)
+        ),
+    }
+
+    def conditioned(readout, readout_id):
+        existing_receipt = readout.worker_response_receipt
+        updated = replace(
             readout,
             diagnostic_readouts=(readout.diagnostic_readouts or None),
             numerical_conditioning=evidence,
@@ -336,22 +353,83 @@ def _with_baseline_conditioning(
                 else None
             ),
             raw_determinant_evidence_status=raw_status,
+            worker_response_receipt=None,
+        )
+        if existing_receipt is not None:
+            request_binding = dict(existing_receipt["request_binding"])
+            scientific_runtime_sha256 = existing_receipt[
+                "scientific_runtime_sha256"
+            ]
+        elif receipt_job is None or receipt_role is None:
+            raise AssertionError(
+                "synthetic current promoted evidence requires receipt lineage"
+            )
+        else:
+            request_binding = {
+                "schema_version": 1,
+                "operation": "root-readout",
+                "job_id": receipt_job.job_id,
+                "leaf_id": receipt_job.leaf_id,
+                "role": receipt_role,
+                "mechanism_id": receipt_job.mechanism_id,
+                "job_policy_sha256": receipt_job.policy.identity_sha256,
+                "backend_identity_sha256": (
+                    receipt_job.backend_identity.identity_sha256
+                ),
+                "precision_digits": outcome.digits,
+                "refinement_level": 0,
+                "synthetic_readout_id": readout_id,
+            }
+            scientific_runtime_sha256 = hashlib.sha256(
+                canonical_json_bytes(scientific_runtime)
+            ).hexdigest()
+        receipt_material = {
+            "schema": "windows-solver.worker-response-receipt/1",
+            "request_binding": request_binding,
+            "request_sha256": hashlib.sha256(
+                canonical_json_bytes(request_binding)
+            ).hexdigest(),
+            "scientific_runtime_sha256": scientific_runtime_sha256,
+            "worker_response_schema_version": 3,
+            "root_residual_abs_text": str(
+                updated.normalised_determinant_abs
+            ),
+            "raw_determinant_abs_text": (
+                None
+                if updated.raw_determinant_abs is None
+                else str(updated.raw_determinant_abs)
+            ),
+            "raw_determinant_evidence_status": raw_status,
+        }
+        return replace(
+            updated,
+            diagnostic_readouts=(updated.diagnostic_readouts or None),
+            worker_response_receipt={
+                **receipt_material,
+                "receipt_sha256": hashlib.sha256(
+                    canonical_json_bytes(receipt_material)
+                ).hexdigest(),
+            },
         )
 
     levels = tuple(
         replace(
             level,
-            real_plus=conditioned(level.real_plus),
-            real_minus=conditioned(level.real_minus),
-            imaginary_plus=conditioned(level.imaginary_plus),
-            imaginary_minus=conditioned(level.imaginary_minus),
+            real_plus=conditioned(level.real_plus, f"level-{index}-real-plus"),
+            real_minus=conditioned(level.real_minus, f"level-{index}-real-minus"),
+            imaginary_plus=conditioned(
+                level.imaginary_plus, f"level-{index}-imaginary-plus"
+            ),
+            imaginary_minus=conditioned(
+                level.imaginary_minus, f"level-{index}-imaginary-minus"
+            ),
         )
-        for level in result.levels
+        for index, level in enumerate(result.levels)
     )
     conditioned_outcome = _replace_component_result_fields(
         outcome,
         result_changes={
-            "baseline": conditioned(result.baseline),
+            "baseline": conditioned(result.baseline, "baseline"),
             "levels": levels,
         },
     )
@@ -359,16 +437,7 @@ def _with_baseline_conditioning(
     component.update({
         "evidence_kind": "package-owned-julia-promoted-component-engine",
         "self_refinement_result": None,
-        "scientific_runtime": {
-            "precision_digits": outcome.digits,
-            "working_precision_bits": (
-                math.ceil(outcome.digits * math.log2(10)) + 32
-            ),
-            "refinement_level": 0,
-            "regularised_gsn_precision_policy": dict(
-                regularised_gsn_precision_policy(result.mechanism_id)
-            ),
-        },
+        "scientific_runtime": scientific_runtime,
     })
     if result.status is ComponentStatus.NOT_CONVERGED:
         component["self_refinement_skipped_reason"] = "PRIMARY_NOT_CONVERGED"
@@ -399,16 +468,19 @@ def _authenticated_failed_preflight_recovery_stage(leaf, predecessor):
         precision_limited=False,
     )
     component = dict(outcome.component_result)
+    refinement_runtime = {
+        **dict(component["scientific_runtime"]),
+        "refinement_level": 1,
+    }
     component.update({
         "failed_preflight_predecessor": predecessor.to_mapping(),
         "comparison_kind": "same-precision-120-base-vs-refinement/v1",
         "precision_ladder_discrepancy_applicable": False,
         "same_precision_refinement_discrepancy_abs": 0.0,
-        "self_refinement_result": component["result"],
-        "self_refinement_scientific_runtime": {
-            **dict(component["scientific_runtime"]),
-            "refinement_level": 1,
-        },
+        "self_refinement_result": _rebind_result_worker_receipts(
+            component["result"], refinement_runtime, refinement_level=1
+        ),
+        "self_refinement_scientific_runtime": refinement_runtime,
     })
     return replace(
         outcome,
@@ -419,6 +491,61 @@ def _authenticated_failed_preflight_recovery_stage(leaf, predecessor):
             precision_ladder_applicable=False,
         ),
     )
+
+
+def _rebind_result_worker_receipts(
+    raw_result, scientific_runtime, *, refinement_level
+):
+    """Rebind a synthetic component clone to its distinct refinement runtime."""
+
+    result = ComponentResult.from_mapping(raw_result)
+
+    def rebound(readout):
+        receipt = readout.worker_response_receipt
+        if receipt is None:
+            raise AssertionError("synthetic promoted readout receipt is missing")
+        request_binding = dict(receipt["request_binding"])
+        request_binding["refinement_level"] = refinement_level
+        material = {
+            **{
+                key: value
+                for key, value in receipt.items()
+                if key != "receipt_sha256"
+            },
+            "request_binding": request_binding,
+            "request_sha256": hashlib.sha256(
+                canonical_json_bytes(request_binding)
+            ).hexdigest(),
+            "scientific_runtime_sha256": hashlib.sha256(
+                canonical_json_bytes(scientific_runtime)
+            ).hexdigest(),
+        }
+        return replace(
+            readout,
+            diagnostic_readouts=(readout.diagnostic_readouts or None),
+            worker_response_receipt={
+                **material,
+                "receipt_sha256": hashlib.sha256(
+                    canonical_json_bytes(material)
+                ).hexdigest(),
+            },
+        )
+
+    levels = tuple(
+        replace(
+            level,
+            real_plus=rebound(level.real_plus),
+            real_minus=rebound(level.real_minus),
+            imaginary_plus=rebound(level.imaginary_plus),
+            imaginary_minus=rebound(level.imaginary_minus),
+        )
+        for level in result.levels
+    )
+    return replace(
+        result,
+        baseline=rebound(result.baseline),
+        levels=levels,
+    ).to_mapping()
 
 
 def _reseal_failed_preflight_recovery_stage(outcome, component, **changes):
@@ -867,6 +994,7 @@ class PromotedConditioningDecisionTests(unittest.TestCase):
                 "normalised_determinant_abs",
                 "raw_determinant_abs",
                 "raw_determinant_evidence_status",
+                "worker_response_receipt",
             ):
                 readout.pop(field, None)
         source_sha256 = hashlib.sha256(

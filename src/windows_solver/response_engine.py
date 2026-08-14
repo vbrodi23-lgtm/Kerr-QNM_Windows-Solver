@@ -298,6 +298,7 @@ def _validated_worker_response_receipt(
     if (status == "available/v1") != (raw_text is not None):
         raise ValueError("worker response receipt determinant evidence is inconsistent")
     material = {key: value[key] for key in value if key != "receipt_sha256"}
+    material["request_binding"] = dict(request_binding)
     if value["receipt_sha256"] != _sha256(material):
         raise ValueError("worker response receipt digest is invalid")
     return {

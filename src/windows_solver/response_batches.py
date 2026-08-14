@@ -3030,18 +3030,6 @@ def _validate_failed_preflight_recovery_stage(
         or refinement.lineage != base.lineage
     ):
         raise ValueError("failed-preflight refinement component identity is invalid")
-    if not _validate_component_result(
-        leaf,
-        outcome,
-        result_key="self_refinement_result",
-        runtime_key="self_refinement_scientific_runtime",
-        expected_refinement_level=1,
-        expected_numerical_state=refinement.status.value,
-        allow_historical_conditioning_absence=False,
-    ):
-        raise ValueError(
-            "failed-preflight refinement lacks canonical production evidence"
-        )
     base_runtime = component.get("scientific_runtime")
     refinement_runtime = component.get("self_refinement_scientific_runtime")
     if not isinstance(base_runtime, Mapping) or not isinstance(
@@ -3055,7 +3043,18 @@ def _validate_failed_preflight_recovery_stage(
     _validate_failed_preflight_refinement_runtime(
         leaf, refinement_runtime
     )
-
+    if not _validate_component_result(
+        leaf,
+        outcome,
+        result_key="self_refinement_result",
+        runtime_key="self_refinement_scientific_runtime",
+        expected_refinement_level=1,
+        expected_numerical_state=refinement.status.value,
+        allow_historical_conditioning_absence=False,
+    ):
+        raise ValueError(
+            "failed-preflight refinement lacks canonical production evidence"
+        )
     raw_delta = component.get("same_precision_refinement_discrepancy_abs")
     if isinstance(raw_delta, bool) or not isinstance(raw_delta, (int, float)):
         raise ValueError("failed-preflight same-precision discrepancy is invalid")
