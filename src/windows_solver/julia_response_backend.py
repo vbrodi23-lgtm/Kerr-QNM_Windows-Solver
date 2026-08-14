@@ -1707,7 +1707,7 @@ class JuliaPrecisionRootBackend:
                     "branch_authentication_contract_version",
                 )
             )
-            or response["schema_version"] != 2
+            or response["schema_version"] != 3
             or response["status"] != "ok"
             or response["adapter"] != "package-owned-julia-gsn-root-readout"
             or response["precision_digits"] != self.digits

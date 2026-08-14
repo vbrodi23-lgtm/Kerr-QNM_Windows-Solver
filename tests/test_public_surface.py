@@ -1121,6 +1121,9 @@ $candidate | ConvertTo-Json -Compress | Set-Content -LiteralPath $env:M02_TEST_J
                 "blocked-pending-human-math-review-and-independent-"
                 "reference/v1"
             ),
+            "available/v1",
+            "unavailable-overflow/v1",
+            "not-applicable/v1",
         })
         lineage_character = r"A-Za-z0-9_/:;=+\-"
         approved_identity = re.compile(
@@ -1148,6 +1151,9 @@ $candidate | ConvertTo-Json -Compress | Set-Content -LiteralPath $env:M02_TEST_J
             "private-lineage/v2",
             "private-factored-plane-wave-gsn/v1",
             "factored-plane-wave-gsn/v1-private",
+            "available/v1-private",
+            "unavailable-overflow/v2",
+            "not-applicable/v1-extra",
         ):
             self.assertTrue(
                 contains_unapproved_lineage_version(arbitrary_label)

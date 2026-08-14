@@ -8,7 +8,7 @@ import unittest
 
 from tests.fixtures import (
     valid_numerical_conditioning,
-    valid_schema_two_julia_root_response,
+    valid_schema_three_julia_root_response,
 )
 from windows_solver.contracts import canonical_json_bytes
 from windows_solver.julia_response_backend import (
@@ -219,6 +219,7 @@ class RootReadoutConditioningPersistenceTests(unittest.TestCase):
             equation_id="equation/v1",
             numerical_conditioning=evidence,
             raw_determinant_abs=Decimal("0"),
+            raw_determinant_evidence_status="available/v1",
         )
 
         mapping = readout.to_mapping()
@@ -228,6 +229,40 @@ class RootReadoutConditioningPersistenceTests(unittest.TestCase):
             mapping["numerical_conditioning"], valid_numerical_conditioning()
         )
         self.assertEqual(restored.numerical_conditioning, evidence)
+        self.assertEqual(
+            restored.raw_determinant_evidence_status,
+            "available/v1",
+        )
+        self.assertEqual(restored.to_mapping(), mapping)
+
+    def test_root_readout_round_trips_typed_unavailable_raw_evidence(self):
+        """Catches persistence fabricating a magnitude for raw overflow."""
+
+        evidence = response_engine.NumericalConditioningEvidence.from_mapping(
+            valid_numerical_conditioning("horizon-admittance")
+        )
+        readout = response_engine.RootReadout(
+            omega=0.5 - 0.1j,
+            determinant_residual_abs=1.0e-12,
+            determinant_derivative_abs=2.0,
+            converged=True,
+            root_reference_id="root-reference",
+            branch_id="damped-branch",
+            equation_id="equation/v1",
+            numerical_conditioning=evidence,
+            normalised_determinant_abs=Decimal("1E-12"),
+            raw_determinant_abs=None,
+            raw_determinant_evidence_status="unavailable-overflow/v1",
+        )
+
+        mapping = readout.to_mapping()
+        restored = response_engine.RootReadout.from_mapping(mapping)
+
+        self.assertNotIn("raw_determinant_abs", mapping)
+        self.assertEqual(
+            mapping["raw_determinant_evidence_status"],
+            "unavailable-overflow/v1",
+        )
         self.assertEqual(restored.to_mapping(), mapping)
 
     def test_root_readout_persists_exact_determinant_magnitudes(self):
@@ -377,6 +412,70 @@ class RootReadoutConditioningPersistenceTests(unittest.TestCase):
                 raw_determinant_abs=None,
             )
 
+    def test_root_readout_rejects_invalid_raw_status_value_pairs(self):
+        """Catches persistence accepting contradictory typed raw evidence."""
+
+        horizon = response_engine.NumericalConditioningEvidence.from_mapping(
+            valid_numerical_conditioning("horizon-admittance")
+        )
+        exterior = response_engine.NumericalConditioningEvidence.from_mapping(
+            valid_numerical_conditioning("exterior-light-ring")
+        )
+        base = {
+            "omega": 0.5 - 0.1j,
+            "determinant_residual_abs": 1.0e-12,
+            "determinant_derivative_abs": 2.0,
+            "converged": True,
+            "root_reference_id": "root-reference",
+            "branch_id": "damped-branch",
+            "equation_id": "equation/v1",
+            "normalised_determinant_abs": Decimal("1E-12"),
+        }
+        cases = (
+            (horizon, None, "available/v1"),
+            (horizon, Decimal("1"), "unavailable-overflow/v1"),
+            (horizon, None, "not-applicable/v1"),
+            (horizon, None, "unavailable-overflow/v2"),
+            (exterior, Decimal("1"), "available/v1"),
+            (exterior, None, "unavailable-overflow/v1"),
+        )
+        for evidence, raw, status in cases:
+            with self.subTest(status=status, raw=raw):
+                with self.assertRaises(ValueError):
+                    response_engine.RootReadout(
+                        **base,
+                        numerical_conditioning=evidence,
+                        raw_determinant_abs=raw,
+                        raw_determinant_evidence_status=status,
+                    )
+
+    def test_historical_conditioned_root_without_raw_status_remains_readable(self):
+        """Catches retroactively requiring schema-3 status on old checkpoints."""
+
+        evidence = response_engine.NumericalConditioningEvidence.from_mapping(
+            valid_numerical_conditioning("horizon-admittance")
+        )
+        current = response_engine.RootReadout(
+            omega=0.5 - 0.1j,
+            determinant_residual_abs=1.0e-12,
+            determinant_derivative_abs=2.0,
+            converged=True,
+            root_reference_id="root-reference",
+            branch_id="damped-branch",
+            equation_id="equation/v1",
+            numerical_conditioning=evidence,
+            normalised_determinant_abs=Decimal("1E-12"),
+            raw_determinant_abs=Decimal("2E+100"),
+            raw_determinant_evidence_status="available/v1",
+        ).to_mapping()
+        current.pop("raw_determinant_evidence_status")
+
+        restored = response_engine.RootReadout.from_mapping(current)
+
+        self.assertIsNone(restored.raw_determinant_evidence_status)
+        self.assertEqual(restored.raw_determinant_abs, Decimal("2E+100"))
+        self.assertEqual(restored.to_mapping(), current)
+
     def test_historical_root_without_conditioning_remains_readable(self):
         """Catches breaking completed schema-1 checkpoints during the migration."""
 
@@ -416,6 +515,7 @@ class RootReadoutConditioningPersistenceTests(unittest.TestCase):
             equation_id="equation/v1",
             numerical_conditioning=evidence,
             raw_determinant_abs=Decimal("0"),
+            raw_determinant_evidence_status="available/v1",
         )
         result = response_engine.ComponentResult(
             job_id="job",
@@ -437,6 +537,10 @@ class RootReadoutConditioningPersistenceTests(unittest.TestCase):
         )
 
         self.assertEqual(restored.baseline.numerical_conditioning, evidence)
+        self.assertEqual(
+            restored.baseline.raw_determinant_evidence_status,
+            "available/v1",
+        )
         self.assertEqual(restored.to_mapping(), result.to_mapping())
 
     def test_component_result_binds_every_conditioned_readout_to_mechanism(self):
@@ -696,7 +800,7 @@ class PromotedRuntimeProvenancePersistenceTests(unittest.TestCase):
                     response_batches._validate_component_result(leaf, outcome)
 
 
-class JuliaSchemaTwoConditioningTests(unittest.TestCase):
+class JuliaSchemaThreeConditioningTests(unittest.TestCase):
     @staticmethod
     def _job(mechanism_id="horizon-admittance"):
         plan = build_campaign_plan(
@@ -726,7 +830,7 @@ class JuliaSchemaTwoConditioningTests(unittest.TestCase):
 
         def evaluate(self, request):
             self.requests.append(request)
-            response = valid_schema_two_julia_root_response(request)
+            response = valid_schema_three_julia_root_response(request)
             if self.mutate is not None:
                 self.mutate(response)
             return response
@@ -738,7 +842,7 @@ class JuliaSchemaTwoConditioningTests(unittest.TestCase):
             digits,
         )
 
-    def test_schema_two_success_requires_and_persists_conditioning(self):
+    def test_schema_three_success_requires_and_persists_conditioning(self):
         """Catches accepting current promoted success without evidence."""
 
         readout = self._backend().read_root(self._job(), 0.0j)
@@ -749,7 +853,7 @@ class JuliaSchemaTwoConditioningTests(unittest.TestCase):
             valid_numerical_conditioning(),
         )
 
-    def test_exterior_schema_two_persists_named_wronskian_and_no_raw_chart(self):
+    def test_exterior_schema_three_persists_named_wronskian_and_no_raw_chart(self):
         """Catches presenting an exterior Wronskian as horizon scattering."""
 
         job = self._job("exterior-light-ring")
@@ -761,14 +865,24 @@ class JuliaSchemaTwoConditioningTests(unittest.TestCase):
         )
         self.assertEqual(readout.normalised_determinant_abs, Decimal("1E-60"))
         self.assertIsNone(readout.raw_determinant_abs)
+        self.assertEqual(
+            readout.raw_determinant_evidence_status,
+            "not-applicable/v1",
+        )
 
-    def test_exterior_schema_two_rejects_raw_or_horizon_scattering_evidence(self):
+    def test_exterior_schema_three_rejects_raw_or_horizon_scattering_evidence(self):
         """Catches accepting internally inconsistent mechanism diagnostics."""
 
         job = self._job("exterior-fixed-r3")
         mutations = {
             "raw_chart": lambda response: response.__setitem__(
                 "raw_determinant_abs", "2.5E+40"
+            ),
+            "available_status": lambda response: response.__setitem__(
+                "raw_determinant_evidence_status", "available/v1"
+            ),
+            "unavailable_status": lambda response: response.__setitem__(
+                "raw_determinant_evidence_status", "unavailable-overflow/v1"
             ),
             "horizon_family": lambda response: response[
                 "numerical_conditioning"
@@ -782,7 +896,7 @@ class JuliaSchemaTwoConditioningTests(unittest.TestCase):
                 with self.assertRaises(JuliaResponseBackendError):
                     self._backend(self.Adapter(mutate)).read_root(job, 0.0j)
 
-    def test_schema_two_preserves_exact_determinant_magnitudes(self):
+    def test_schema_three_preserves_exact_determinant_magnitudes(self):
         """Catches converting determinant evidence to binary64 before persistence."""
 
         normalised = (
@@ -805,17 +919,48 @@ class JuliaSchemaTwoConditioningTests(unittest.TestCase):
         )
         self.assertEqual(readout.to_mapping()["raw_determinant_abs"], raw)
 
-    def test_schema_two_rejects_missing_horizon_raw_determinant(self):
+    def test_schema_three_rejects_invalid_raw_evidence_status_pairs(self):
         """Catches accepting a horizon result without its raw comparator."""
 
-        adapter = self.Adapter(
-            lambda response: response.__setitem__("raw_determinant_abs", None)
+        mutations = {
+            "available_without_value": lambda response: response.__setitem__(
+                "raw_determinant_abs", None
+            ),
+            "unavailable_with_value": lambda response: response.__setitem__(
+                "raw_determinant_evidence_status", "unavailable-overflow/v1"
+            ),
+            "horizon_not_applicable": lambda response: response.__setitem__(
+                "raw_determinant_evidence_status", "not-applicable/v1"
+            ),
+            "unknown_status": lambda response: response.__setitem__(
+                "raw_determinant_evidence_status", "available/v2"
+            ),
+        }
+        for label, mutate in mutations.items():
+            with self.subTest(label=label):
+                with self.assertRaises(JuliaResponseBackendError):
+                    self._backend(self.Adapter(mutate)).read_root(
+                        self._job(), 0.0j
+                    )
+
+    def test_schema_three_accepts_typed_unavailable_raw_horizon_evidence(self):
+        """Catches requiring an overflowing optional raw chart comparator."""
+
+        def unavailable(response):
+            response["raw_determinant_abs"] = None
+            response["raw_determinant_evidence_status"] = (
+                "unavailable-overflow/v1"
+            )
+
+        readout = self._backend(self.Adapter(unavailable)).read_root(
+            self._job(), 0.0j
         )
 
-        with self.assertRaisesRegex(
-            JuliaResponseBackendError, "raw horizon determinant"
-        ):
-            self._backend(adapter).read_root(self._job(), 0.0j)
+        self.assertIsNone(readout.raw_determinant_abs)
+        self.assertEqual(
+            readout.raw_determinant_evidence_status,
+            "unavailable-overflow/v1",
+        )
 
     def test_malformed_current_raw_determinant_fails_closed(self):
         """Catches accepting precision-losing or invalid raw determinant evidence."""
@@ -839,23 +984,26 @@ class JuliaSchemaTwoConditioningTests(unittest.TestCase):
                         self._job(), 0.0j
                     )
 
-    def test_schema_one_success_is_historical_only(self):
-        """Catches a stale schema-1 worker response satisfying current work."""
+    def test_stale_success_wire_schemas_are_historical_only(self):
+        """Catches a stale schema-1/2 success satisfying current work."""
 
-        adapter = self.Adapter(
-            lambda response: response.__setitem__("schema_version", 1)
-        )
+        for schema_version in (1, 2):
+            with self.subTest(schema_version=schema_version):
+                adapter = self.Adapter(
+                    lambda response, schema_version=schema_version: (
+                        response.__setitem__("schema_version", schema_version)
+                    )
+                )
+                with self.assertRaisesRegex(
+                    JuliaResponseBackendError, "response contract is invalid"
+                ):
+                    self._backend(adapter).read_root(self._job(), 0.0j)
 
-        with self.assertRaisesRegex(
-            JuliaResponseBackendError, "response contract is invalid"
-        ):
-            self._backend(adapter).read_root(self._job(), 0.0j)
-
-    def test_schema_two_control_integers_require_exact_builtin_ints(self):
+    def test_schema_three_control_integers_require_exact_builtin_ints(self):
         """Catches float/string drift passing equality-based schema checks."""
 
         request = self._backend()._request(self._job(), 0.0j)
-        expected = valid_schema_two_julia_root_response(request)
+        expected = valid_schema_three_julia_root_response(request)
         fields = (
             "schema_version",
             "precision_digits",
@@ -876,7 +1024,7 @@ class JuliaSchemaTwoConditioningTests(unittest.TestCase):
                     ):
                         self._backend(adapter).read_root(self._job(), 0.0j)
 
-    def test_schema_two_success_status_must_be_exactly_ok(self):
+    def test_schema_three_success_status_must_be_exactly_ok(self):
         """Catches accepting an error-shaped response through the success parser."""
 
         adapter = self.Adapter(
@@ -889,7 +1037,7 @@ class JuliaSchemaTwoConditioningTests(unittest.TestCase):
             self._backend(adapter).read_root(self._job(), 0.0j)
 
     def test_missing_or_malformed_current_evidence_fails_closed(self):
-        """Catches weakening schema-2 parsing to accommodate stale fakes."""
+        """Catches weakening schema-3 parsing to accommodate stale fakes."""
 
         def remove(response):
             response.pop("numerical_conditioning")

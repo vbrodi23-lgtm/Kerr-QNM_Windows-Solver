@@ -1272,9 +1272,9 @@ class RootReadout:
                 self.numerical_conditioning.to_mapping()
             )
         for name in ("normalised_determinant_abs", "raw_determinant_abs"):
-            value = getattr(self, name)
-            if value is not None:
-                output[name] = str(value)
+            item = getattr(self, name)
+            if item is not None:
+                output[name] = str(item)
         if self.raw_determinant_evidence_status is not None:
             output["raw_determinant_evidence_status"] = (
                 self.raw_determinant_evidence_status
@@ -1343,7 +1343,10 @@ class RootReadout:
             ),
             raw_determinant_abs=(
                 None
-                if "raw_determinant_abs" not in value
+                if (
+                    "raw_determinant_abs" not in value
+                    or value["raw_determinant_abs"] is None
+                )
                 else _conditioning_decimal_from_text(
                     value["raw_determinant_abs"],
                     "root readout raw_determinant_abs",

@@ -189,14 +189,29 @@ class RegularisedGsnScatteringSourceTests(unittest.TestCase):
 
         chart = self._function("assess_horizon_determinant_chart")
         self.assertIn("normalised_determinant = iszero(Cref) ? nothing", chart)
-        self.assertIn("raw_diagnostic = if collect_raw_diagnostic", chart)
+        self.assertIn("raw_value = try", chart)
         self.assertIn("try", chart)
         self.assertLess(
             chart.index("normalised_determinant = iszero(Cref) ? nothing"),
-            chart.index("raw_diagnostic = if collect_raw_diagnostic"),
+            chart.index("raw_value = try"),
         )
         self.assertIn("raw_scattering_determinant(", chart)
         self.assertIn('"unavailable-overflow/v1"', chart)
+        raw_guard = chart[
+            chart.index("raw_value = try") : chart.index("raw_diagnostic = if")
+        ]
+        self.assertIn("raw_scattering_determinant(", raw_guard)
+        self.assertIn("raw_determinant_abs = abs(raw_determinant)", raw_guard)
+        self.assertNotIn("reflected_cref_abs", raw_guard)
+        self.assertNotIn("equivalence_relative_error", raw_guard)
+        auxiliary = chart[
+            chart.index("raw_diagnostic = if") : chart.index(
+                "return DeterminantChartAssessment"
+            )
+        ]
+        self.assertIn("equivalence_relative_error = try", auxiliary)
+        self.assertIn("NONFINITE_SCATTERING_DATA", auxiliary)
+        self.assertIn("nothing", auxiliary)
         production = self._function("evaluate_normalised_horizon_determinant")
         self.assertIn("collect_raw_diagnostic=false", production)
         self.assertIn("collect_raw_diagnostic=true", production)

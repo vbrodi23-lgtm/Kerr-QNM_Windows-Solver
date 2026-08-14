@@ -107,6 +107,7 @@ class Task3CConditioningSurfaceTests(unittest.TestCase):
                 {
                     "normalised_determinant_abs": "4.5e-20",
                     "raw_determinant_abs": "6.75e+220",
+                    "raw_determinant_evidence_status": "available/v1",
                     "cref_chart_safe": False,
                 },
                 **context,
@@ -135,6 +136,10 @@ class Task3CConditioningSurfaceTests(unittest.TestCase):
             self.assertEqual(live["predicted_reliable_digits"], "58.625")
             self.assertEqual(live["required_reliable_digits"], "64")
             self.assertEqual(live["determinant_chart"], "Cinc/Cref − R")
+            self.assertEqual(
+                live["raw_determinant_evidence_status"], "available/v1"
+            )
+            self.assertEqual(live["raw_determinant_abs"], "6.75e+220")
             self.assertIs(live["cref_chart_safe"], False)
             self.assertIs(live["asymptotic_preflight_adequate"], True)
             self.assertIs(live["asymptotic_preflight_avoided_ode"], False)
@@ -165,6 +170,56 @@ class Task3CConditioningSurfaceTests(unittest.TestCase):
                 status["live_execution"]["normalised_determinant_abs"],
                 "4.5e-20",
             )
+            self.assertEqual(
+                status["live_execution"]["raw_determinant_evidence_status"],
+                "available/v1",
+            )
+
+    def test_live_raw_status_clears_stale_magnitude_when_unavailable(self) -> None:
+        """Catches an old finite raw value surviving a typed overflow event."""
+
+        temporary = self.enterContext(TemporaryDirectory())
+        reporter = CampaignProgressReporter(
+            "normal", Path(temporary) / "campaign.json", io.StringIO()
+        )
+        context = {
+            "leaf_id": "leaf-horizon",
+            "mechanism_id": "horizon-admittance",
+            "precision_digits": 80,
+        }
+        reporter.publish(_event(
+            ProgressEventKind.PRECISION_STAGE_STARTED,
+            **context,
+        ))
+        reporter.publish(_event(
+            ProgressEventKind.DETERMINANT_CHART_EVALUATED,
+            {
+                "raw_determinant_abs": "6.75E+220",
+                "raw_determinant_evidence_status": "available/v1",
+            },
+            **context,
+        ))
+        reporter.publish(_event(
+            ProgressEventKind.DETERMINANT_CHART_EVALUATED,
+            {
+                "raw_determinant_abs": None,
+                "raw_determinant_evidence_status": (
+                    "unavailable-overflow/v1"
+                ),
+            },
+            **context,
+        ))
+
+        live = reporter._live_execution_mapping()
+        self.assertEqual(
+            live["raw_determinant_evidence_status"],
+            "unavailable-overflow/v1",
+        )
+        self.assertIsNone(live["raw_determinant_abs"])
+        self.assertIn(
+            "unavailable-overflow/v1",
+            "\n".join(reporter._current_execution_lines()),
+        )
 
     def test_exterior_conditioning_clears_stale_scattering_live_state(self) -> None:
         """Catches a prior horizon basis/Cref chart surviving an exterior event."""
@@ -224,6 +279,7 @@ class Task3CConditioningSurfaceTests(unittest.TestCase):
                 "minimum_cref_chart_margin": None,
                 "maximum_carrier_change_error": None,
                 "raw_determinant_abs": None,
+                "raw_determinant_evidence_status": "not-applicable/v1",
                 "normalised_determinant_abs": "7E-31",
             },
             leaf_id="leaf-one",
@@ -248,6 +304,10 @@ class Task3CConditioningSurfaceTests(unittest.TestCase):
             "raw_determinant_abs",
         ):
             self.assertIsNone(live[name], name)
+        self.assertEqual(
+            live["raw_determinant_evidence_status"],
+            "not-applicable/v1",
+        )
         self.assertEqual(live["normalised_determinant_abs"], "7E-31")
 
     def test_exterior_live_state_does_not_reingest_scattering_fields(self) -> None:
@@ -270,6 +330,7 @@ class Task3CConditioningSurfaceTests(unittest.TestCase):
                 "maximum_carrier_change_error": "0",
                 "cref_chart_safe": True,
                 "raw_determinant_abs": "0",
+                "raw_determinant_evidence_status": "not-applicable/v1",
             },
             leaf_id="leaf-exterior",
             mechanism_id="exterior-light-ring",
@@ -289,6 +350,10 @@ class Task3CConditioningSurfaceTests(unittest.TestCase):
             "raw_determinant_abs",
         ):
             self.assertIsNone(live[name], name)
+        self.assertEqual(
+            live["raw_determinant_evidence_status"],
+            "not-applicable/v1",
+        )
 
     def test_exterior_chart_uses_mechanism_context_without_identity_payload(self) -> None:
         """Catches a Wronskian event being labelled as the horizon Cref chart."""
@@ -339,6 +404,7 @@ class Task3CConditioningSurfaceTests(unittest.TestCase):
             "carrier_change_error_max",
             "normalised_determinant_abs",
             "raw_determinant_abs",
+            "raw_determinant_evidence_status",
         )
         self.assertEqual(CONDITIONING_REPORT_COLUMNS, expected_columns)
         self.assertTrue(set(CONDITIONING_REPORT_COLUMNS) <= set(LEAF_COLUMNS))
@@ -388,6 +454,7 @@ class Task3CConditioningSurfaceTests(unittest.TestCase):
                 raw_determinant_abs=Decimal(
                     "6.7500000000000000000000000000001E+220"
                 ),
+                raw_determinant_evidence_status="available/v1",
             )
         )
         self.assertEqual(
@@ -409,6 +476,9 @@ class Task3CConditioningSurfaceTests(unittest.TestCase):
         self.assertEqual(
             current["raw_determinant_abs"],
             Decimal("6.7500000000000000000000000000001E+220"),
+        )
+        self.assertEqual(
+            current["raw_determinant_evidence_status"], "available/v1"
         )
         self.assertIs(current["endpoint_remainders_regular"], True)
         self.assertIs(current["precision_limited"], True)
@@ -436,12 +506,29 @@ class Task3CConditioningSurfaceTests(unittest.TestCase):
             numerical_conditioning=exterior_evidence,
             normalised_determinant_abs=Decimal("9.5E-90"),
             raw_determinant_abs=None,
+            raw_determinant_evidence_status="not-applicable/v1",
         ))
         self.assertEqual(exterior["determinant_family"], "exterior-wronskian/v1")
         self.assertIs(exterior["scattering_diagnostics_applicable"], False)
         self.assertIsNone(exterior["basis_condition_max"])
         self.assertIsNone(exterior["cref_chart_margin_min"])
         self.assertIsNone(exterior["raw_determinant_abs"])
+        self.assertEqual(
+            exterior["raw_determinant_evidence_status"],
+            "not-applicable/v1",
+        )
+
+        unavailable = _conditioning_report_fields(SimpleNamespace(
+            numerical_conditioning=evidence,
+            normalised_determinant_abs=Decimal("9.5E-90"),
+            raw_determinant_abs=None,
+            raw_determinant_evidence_status="unavailable-overflow/v1",
+        ))
+        self.assertIsNone(unavailable["raw_determinant_abs"])
+        self.assertEqual(
+            unavailable["raw_determinant_evidence_status"],
+            "unavailable-overflow/v1",
+        )
 
         no_exact_magnitudes = _conditioning_report_fields(
             SimpleNamespace(
@@ -480,6 +567,9 @@ class Task3CConditioningSurfaceTests(unittest.TestCase):
                     "2.1250000000000000000001"
                 ),
                 "normalised_determinant_abs": Decimal("4.5000E-120"),
+                "raw_determinant_evidence_status": (
+                    "unavailable-overflow/v1"
+                ),
             })
             reporter = CampaignProgressReporter(
                 "quiet", checkpoint, io.StringIO()
@@ -509,6 +599,10 @@ class Task3CConditioningSurfaceTests(unittest.TestCase):
             self.assertEqual(
                 status["scientific"]["normalised_determinant_abs"],
                 "4.5000E-120",
+            )
+            self.assertEqual(
+                status["scientific"]["raw_determinant_evidence_status"],
+                "unavailable-overflow/v1",
             )
 
     def test_runtime_policy_inventories_factored_sources_and_identity(self) -> None:

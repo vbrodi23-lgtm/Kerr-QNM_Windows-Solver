@@ -2984,7 +2984,7 @@ function result_fields(::Type{T}, request, digits::Int, bits::Int) where {T<:Abs
         )
         branch_valid = abs(root - omega) <= branch_tolerance
         return [
-            "schema_version" => 2,
+            "schema_version" => 3,
             "status" => "ok",
             "adapter" => "package-owned-julia-gsn-root-readout",
             "request_sha256" => string(required(request, "request_sha256")),
@@ -3060,7 +3060,7 @@ function result_fields(::Type{T}, request, digits::Int, bits::Int) where {T<:Abs
     )
 
     return [
-        "schema_version" => 2,
+        "schema_version" => 3,
         "status" => "ok",
         "adapter" => "package-owned-julia-gsn-root-readout",
         "request_sha256" => string(required(request, "request_sha256")),

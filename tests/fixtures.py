@@ -142,7 +142,7 @@ def valid_numerical_conditioning(
     }
 
 
-def valid_schema_two_julia_root_response(
+def valid_schema_three_julia_root_response(
     request: dict[str, object],
 ) -> dict[str, object]:
     """Return a complete successful promoted-worker response for one request."""
@@ -160,7 +160,7 @@ def valid_schema_two_julia_root_response(
         "seed-path": "4E-55",
     }
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "status": "ok",
         "adapter": "package-owned-julia-gsn-root-readout",
         "request_sha256": "e" * 64,

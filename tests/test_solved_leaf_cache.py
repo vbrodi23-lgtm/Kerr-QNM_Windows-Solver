@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from decimal import Decimal
 import hashlib
 import io
 import json
@@ -38,12 +39,14 @@ from windows_solver.response_engine import (
     DiagnosticRootReadout,
     LadderLevel,
     NumericalPolicy,
+    NumericalConditioningEvidence,
     RootReadout,
     VettedNativeDeterminantKernel,
 )
 from windows_solver.progress import activate_progress
 from windows_solver.progress_output import CampaignProgressReporter
 from windows_solver.solved_leaf_cache import SolvedLeafLookupStatus, SolvedLeafStore
+from tests.fixtures import valid_numerical_conditioning
 
 
 _FROZEN_MIGRATION_BACKEND_IDENTITY = replace(
@@ -491,6 +494,92 @@ class _ConvergedProductionBackend:
 
 
 class SolvedLeafCacheTests(unittest.TestCase):
+    def test_typed_raw_overflow_round_trips_through_solved_leaf_store(self):
+        """Catches solved-cache sealing or reload dropping the raw status."""
+
+        capabilities = PrecisionCapabilities((64, 80, 120))
+        plan = build_campaign_plan(
+            policy=NumericalPolicy(),
+            backend_identity=VettedNativeDeterminantKernel.identity,
+            precision_capabilities=capabilities,
+        )
+        leaf = next(
+            item
+            for item in plan.leaves
+            if item.job.mechanism_id == "horizon-admittance"
+        )
+        outcome = _production_outcome(
+            leaf,
+            digits=80,
+            status=ComponentStatus.NOT_CONVERGED,
+        )
+        component = dict(outcome.component_result)
+        result = ComponentResult.from_mapping(component["result"])
+        evidence = NumericalConditioningEvidence.from_mapping(
+            valid_numerical_conditioning("horizon-admittance")
+        )
+        baseline = replace(
+            result.baseline,
+            truncation_radius=None,
+            resolution_radius=None,
+            seed_path_radius=None,
+            diagnostic_readouts=None,
+            diagnostics_skipped_reason="PRIMARY_NOT_CONVERGED",
+            numerical_conditioning=evidence,
+            normalised_determinant_abs=Decimal(
+                str(result.baseline.determinant_residual_abs)
+            ),
+            raw_determinant_abs=None,
+            raw_determinant_evidence_status="unavailable-overflow/v1",
+        )
+        component["result"] = replace(result, baseline=baseline).to_mapping()
+        outcome = replace(
+            outcome,
+            component_result=component,
+            signed_error_channels=synthetic_stage_signed_error_channels(
+                component, outcome.local_disk_radius_abs
+            ),
+        )
+        record = CampaignLeafRecord(
+            leaf_id=leaf.leaf_id,
+            role=leaf.role,
+            state="UNRESOLVED",
+            stages=(CampaignStageRecord(
+                outcome,
+                {
+                    "precision_factory_identity": (
+                        plan.precision_factory_identity.to_mapping()
+                    ),
+                    "available_precision_digits": list(capabilities.digits),
+                },
+            ),),
+        )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            store = SolvedLeafStore(Path(temporary) / "solved")
+            identity = "f" * 64
+            store.publish(
+                scientific_identity_sha256=identity,
+                leaf_id=leaf.leaf_id,
+                record=record.to_mapping(),
+                source_type="originating-campaign",
+            )
+            lookup = store.lookup(identity, leaf.leaf_id)
+
+        self.assertIs(lookup.status, SolvedLeafLookupStatus.HIT)
+        restored_record = CampaignLeafRecord.from_mapping(
+            lookup.receipt["record"]
+        )
+        restored_result = ComponentResult.from_mapping(
+            restored_record.stages[-1].outcome.component_result["result"]
+        )
+        self.assertEqual(
+            restored_result.baseline.raw_determinant_evidence_status,
+            "unavailable-overflow/v1",
+        )
+        self.assertIsNone(restored_result.baseline.raw_determinant_abs)
+        self.assertEqual(lookup.receipt["record"], record.to_mapping())
+
     def test_corrected_live_converged_result_requires_diagnostic_ladder(self):
         plan = build_campaign_plan(
             policy=NumericalPolicy(),

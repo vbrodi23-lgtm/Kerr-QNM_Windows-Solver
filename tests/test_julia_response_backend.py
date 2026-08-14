@@ -42,7 +42,7 @@ from windows_solver.response_engine import (
     _diagnostic_response_channel,
 )
 from windows_solver.progress_output import CampaignProgressReporter
-from tests.fixtures import valid_schema_two_julia_root_response
+from tests.fixtures import valid_schema_three_julia_root_response
 
 
 def _deep_job():
@@ -75,10 +75,38 @@ class FakeAdapter:
 
     def evaluate(self, request):
         self.requests.append(request)
-        return valid_schema_two_julia_root_response(request)
+        return valid_schema_three_julia_root_response(request)
 
 
 class JuliaResponseBackendTests(unittest.TestCase):
+    def test_success_wire_schema_is_three_and_worker_errors_remain_schema_one(self):
+        """Catches changing the successful wire without preserving error parsing."""
+
+        request = JuliaPrecisionRootBackend(
+            VettedNativeDeterminantKernel.identity,
+            FakeAdapter(),
+            80,
+        )._request(_deep_job(), 0.0j)
+        self.assertEqual(
+            valid_schema_three_julia_root_response(request)["schema_version"],
+            3,
+        )
+        root = Path(__file__).resolve().parents[1]
+        worker = (
+            root / "src/windows_solver/data/julia/m02_worker.jl"
+        ).read_text(encoding="utf-8")
+        result_fields = worker[
+            worker.index("function result_fields(") :
+            worker.index("function evaluate_request(")
+        ]
+        self.assertEqual(result_fields.count('"schema_version" => 3'), 2)
+        error_path = worker[
+            worker.rindex("catch failure") : worker.index(
+                "if abspath(PROGRAM_FILE)"
+            )
+        ]
+        self.assertGreaterEqual(error_path.count('"schema_version" => 1'), 2)
+
     def test_worker_control_failure_binds_request_job_and_refinement(self):
         root = Path(__file__).resolve().parents[1]
         worker = (

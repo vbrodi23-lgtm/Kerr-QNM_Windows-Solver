@@ -229,6 +229,7 @@ _CONDITIONING_LIVE_STATE_KEYS = (
     "maximum_carrier_change_error",
     "normalised_determinant_abs",
     "raw_determinant_abs",
+    "raw_determinant_evidence_status",
     "determinant_chart",
     "cref_chart_safe",
     "asymptotic_preflight_adequate",
@@ -1277,6 +1278,27 @@ class CampaignProgressReporter:
                 if payload_name in payload and payload[payload_name] is not None:
                     self._dashboard_state[state_name] = payload[payload_name]
                     break
+        if "raw_determinant_evidence_status" in payload:
+            raw_status = payload["raw_determinant_evidence_status"]
+            if exterior:
+                self._dashboard_state["raw_determinant_evidence_status"] = (
+                    "not-applicable/v1"
+                )
+                self._dashboard_state.pop("raw_determinant_abs", None)
+            elif raw_status in {"available/v1", "unavailable-overflow/v1"}:
+                self._dashboard_state["raw_determinant_evidence_status"] = (
+                    raw_status
+                )
+                if (
+                    raw_status == "unavailable-overflow/v1"
+                    or payload.get("raw_determinant_abs") is None
+                ):
+                    self._dashboard_state.pop("raw_determinant_abs", None)
+            else:
+                self._dashboard_state.pop(
+                    "raw_determinant_evidence_status", None
+                )
+                self._dashboard_state.pop("raw_determinant_abs", None)
         if exterior:
             self._dashboard_state.update({
                 "determinant_family": "exterior-wronskian/v1",
@@ -1288,6 +1310,7 @@ class CampaignProgressReporter:
                 ),
                 "scattering_diagnostics_applicable": False,
                 "determinant_chart": "unit-asymptotic branch Wronskian",
+                "raw_determinant_evidence_status": "not-applicable/v1",
             })
         elif kind == ProgressEventKind.DETERMINANT_CHART_EVALUATED.value:
             self._dashboard_state["determinant_chart"] = "Cinc/Cref − R"
@@ -2000,12 +2023,14 @@ class CampaignProgressReporter:
         if state.get("scattering_diagnostics_applicable") is False:
             chart = (
                 f"{shown('determinant_chart')}; scattering n/a; "
-                f"|D|={shown('normalised_determinant_abs')}"
+                f"|D|={shown('normalised_determinant_abs')}; "
+                f"raw={shown('raw_determinant_evidence_status')}"
             )
         else:
             chart = (
                 f"{shown('determinant_chart')}; Cref {safe_text}; "
-                f"|D|={shown('normalised_determinant_abs')}"
+                f"|D|={shown('normalised_determinant_abs')}; "
+                f"raw={shown('raw_determinant_evidence_status')}"
             )
         if compact:
             return [

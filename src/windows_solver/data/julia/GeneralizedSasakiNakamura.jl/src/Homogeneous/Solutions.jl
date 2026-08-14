@@ -1324,8 +1324,8 @@ function assess_horizon_determinant_chart(
                 nonnegative=true,
             )
         safe = !iszero(Cref) && margin > one(T)
-        raw_diagnostic = if collect_raw_diagnostic
-            try
+        raw_value = try
+            if collect_raw_diagnostic
                 raw_determinant = raw_scattering_determinant(
                     coefficients, typed_reflectivity
                 )
@@ -1336,66 +1336,97 @@ function assess_horizon_determinant_chart(
                     "raw determinant magnitude";
                     nonnegative=true,
                 )
-                reflected_cref_abs = abs(typed_reflectivity * Cref)
-                raw_cancellation_ratio, raw_cancellation_ratio_saturated =
-                    _finite_scattering_ratio(
-                        (cinc_abs, reflected_cref_abs),
-                        max(raw_determinant_abs, floatmin(T)),
-                        precision_bits,
-                        "raw determinant cancellation ratio",
-                    )
-                _assert_scattering_real(
-                    raw_cancellation_ratio,
-                    precision_bits,
-                    "raw cancellation ratio";
-                    nonnegative=true,
-                )
-                equivalence_relative_error =
-                    normalised_determinant === nothing ? nothing :
-                    _relative_scattering_disagreement(
-                        raw_determinant,
-                        Cref * normalised_determinant,
-                    )
-                equivalence_relative_error === nothing ||
-                    _assert_scattering_real(
-                        equivalence_relative_error,
-                        precision_bits,
-                        "raw/normalised determinant equivalence error";
-                        nonnegative=true,
-                    )
                 (
                     raw_determinant=raw_determinant,
                     raw_determinant_abs=raw_determinant_abs,
                     raw_determinant_evidence_status="available/v1",
-                    raw_cancellation_ratio=raw_cancellation_ratio,
-                    raw_cancellation_ratio_saturated=
-                        raw_cancellation_ratio_saturated,
-                    equivalence_relative_error=equivalence_relative_error,
                 )
+            else
+                (
+                    raw_determinant=nothing,
+                    raw_determinant_abs=nothing,
+                    raw_determinant_evidence_status="not-collected/v1",
+                )
+            end
+        catch error
+            if error isa ScatteringExtractionError &&
+                    error.reason == NONFINITE_SCATTERING_DATA
+                (
+                    raw_determinant=nothing,
+                    raw_determinant_abs=nothing,
+                    raw_determinant_evidence_status=
+                        "unavailable-overflow/v1",
+                )
+            else
+                rethrow()
+            end
+        end
+        raw_diagnostic = if raw_value.raw_determinant === nothing
+            (
+                raw_determinant=raw_value.raw_determinant,
+                raw_determinant_abs=raw_value.raw_determinant_abs,
+                raw_determinant_evidence_status=
+                    raw_value.raw_determinant_evidence_status,
+                raw_cancellation_ratio=nothing,
+                raw_cancellation_ratio_saturated=false,
+                equivalence_relative_error=nothing,
+            )
+        else
+            cancellation = try
+                reflected_cref_abs = abs(typed_reflectivity * Cref)
+                ratio, saturated = _finite_scattering_ratio(
+                    (cinc_abs, reflected_cref_abs),
+                    max(raw_value.raw_determinant_abs, floatmin(T)),
+                    precision_bits,
+                    "raw determinant cancellation ratio",
+                )
+                _assert_scattering_real(
+                    ratio,
+                    precision_bits,
+                    "raw cancellation ratio";
+                    nonnegative=true,
+                )
+                (ratio=ratio, saturated=saturated)
             catch error
                 if error isa ScatteringExtractionError &&
                         error.reason == NONFINITE_SCATTERING_DATA
-                    (
-                        raw_determinant=nothing,
-                        raw_determinant_abs=nothing,
-                        raw_determinant_evidence_status=
-                            "unavailable-overflow/v1",
-                        raw_cancellation_ratio=nothing,
-                        raw_cancellation_ratio_saturated=false,
-                        equivalence_relative_error=nothing,
-                    )
+                    (ratio=nothing, saturated=false)
                 else
                     rethrow()
                 end
             end
-        else
+            equivalence_relative_error = try
+                if normalised_determinant === nothing
+                    nothing
+                else
+                    value = _relative_scattering_disagreement(
+                        raw_value.raw_determinant,
+                        Cref * normalised_determinant,
+                    )
+                    _assert_scattering_real(
+                        value,
+                        precision_bits,
+                        "raw/normalised determinant equivalence error";
+                        nonnegative=true,
+                    )
+                    value
+                end
+            catch error
+                if error isa ScatteringExtractionError &&
+                        error.reason == NONFINITE_SCATTERING_DATA
+                    nothing
+                else
+                    rethrow()
+                end
+            end
             (
-                raw_determinant=nothing,
-                raw_determinant_abs=nothing,
-                raw_determinant_evidence_status="not-collected/v1",
-                raw_cancellation_ratio=nothing,
-                raw_cancellation_ratio_saturated=false,
-                equivalence_relative_error=nothing,
+                raw_determinant=raw_value.raw_determinant,
+                raw_determinant_abs=raw_value.raw_determinant_abs,
+                raw_determinant_evidence_status=
+                    raw_value.raw_determinant_evidence_status,
+                raw_cancellation_ratio=cancellation.ratio,
+                raw_cancellation_ratio_saturated=cancellation.saturated,
+                equivalence_relative_error=equivalence_relative_error,
             )
         end
         return DeterminantChartAssessment{T}(

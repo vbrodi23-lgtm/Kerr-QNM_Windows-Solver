@@ -102,7 +102,14 @@ def remove_promotion_decision_and_reseal(
     component = stage["component_result"]
     component.pop("promotion_decision")
     if remove_conditioning:
-        component["result"]["baseline"].pop("numerical_conditioning")
+        baseline = component["result"]["baseline"]
+        for name in (
+            "numerical_conditioning",
+            "normalised_determinant_abs",
+            "raw_determinant_abs",
+            "raw_determinant_evidence_status",
+        ):
+            baseline.pop(name, None)
     source_sha256 = hashlib.sha256(
         canonical_json_bytes(component)
     ).hexdigest()
@@ -275,6 +282,7 @@ def _with_baseline_conditioning(
     predicted_reliable_digits,
     required_reliable_digits,
     precision_limited,
+    raw_determinant_evidence_status=None,
 ):
     result = ComponentResult.from_mapping(outcome.component_result["result"])
     mapping = valid_numerical_conditioning(result.mechanism_id)
@@ -285,6 +293,13 @@ def _with_baseline_conditioning(
     })
     evidence = NumericalConditioningEvidence.from_mapping(mapping)
     horizon = evidence.scattering_diagnostics_applicable
+    raw_status = (
+        raw_determinant_evidence_status
+        if horizon
+        else "not-applicable/v1"
+    )
+    if horizon and raw_status is None:
+        raw_status = "available/v1"
 
     def conditioned(readout):
         return replace(
@@ -296,9 +311,10 @@ def _with_baseline_conditioning(
             ),
             raw_determinant_abs=(
                 Decimal(str(readout.determinant_residual_abs))
-                if horizon
+                if raw_status == "available/v1"
                 else None
             ),
+            raw_determinant_evidence_status=raw_status,
         )
 
     levels = tuple(
@@ -540,6 +556,31 @@ class PromotedConditioningDecisionTests(unittest.TestCase):
             ],
             decision,
         )
+
+    def test_typed_raw_overflow_round_trips_through_campaign_checkpoint(self):
+        """Catches checkpoint persistence dropping typed optional raw evidence."""
+
+        temporary, backend, summary, reloaded = self._run(evidence={
+            "predicted_reliable_digits": "55.125",
+            "required_reliable_digits": "24",
+            "precision_limited": False,
+            "raw_determinant_evidence_status": "unavailable-overflow/v1",
+        })
+        self.addCleanup(temporary.cleanup)
+
+        self.assertEqual(backend.calls, [64, 80])
+        originating = ComponentResult.from_mapping(
+            summary.records[0].stages[1].outcome.component_result["result"]
+        ).baseline
+        restored = ComponentResult.from_mapping(
+            reloaded.records[0].stages[1].outcome.component_result["result"]
+        ).baseline
+        self.assertEqual(
+            originating.raw_determinant_evidence_status,
+            "unavailable-overflow/v1",
+        )
+        self.assertIsNone(originating.raw_determinant_abs)
+        self.assertEqual(restored.to_mapping(), originating.to_mapping())
 
     def test_nonconverged_adequate_result_suppresses_120(self):
         temporary, backend, summary, _ = self._run(evidence={

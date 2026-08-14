@@ -60,6 +60,7 @@ CONDITIONING_REPORT_COLUMNS = (
     "carrier_change_error_max",
     "normalised_determinant_abs",
     "raw_determinant_abs",
+    "raw_determinant_evidence_status",
 )
 
 
@@ -321,6 +322,9 @@ def _conditioning_report_fields(readout: object) -> dict[str, object]:
     # estimates, including for historical records where they remain absent.
     for name in ("normalised_determinant_abs", "raw_determinant_abs"):
         output[name] = _optional_evidence_value(readout, name)
+    output["raw_determinant_evidence_status"] = _optional_evidence_value(
+        readout, "raw_determinant_evidence_status"
+    )
     return output
 
 
