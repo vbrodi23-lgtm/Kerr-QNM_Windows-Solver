@@ -1859,18 +1859,80 @@ def _checkpoint_bindings(
         "selection": selection.to_mapping(),
         "selection_jobs_sha256": _sha256(jobs),
         "precision_factory_identity": plan.precision_factory_identity.to_mapping(),
-        "precision_contract_sha256": _sha256({
-            "promotion_gates": list(B_PRIME_RELEASE_DOMAIN.precision_promotion_gates),
+        "precision_contract_sha256": _checkpoint_precision_contract_sha256(
+            CAMPAIGN_CHECKPOINT_SCHEMA_VERSION
+        ),
+    }
+
+
+def _checkpoint_precision_contract_sha256(schema_version: int) -> str:
+    material: dict[str, object] = {
+        "promotion_gates": list(B_PRIME_RELEASE_DOMAIN.precision_promotion_gates),
+        "fixed_sentinel_leaf_ids": list(
+            B_PRIME_RELEASE_DOMAIN.fixed_precision_sentinel_leaf_ids
+        ),
+    }
+    if schema_version in {3, 4, 5}:
+        historical_primary = dict(_primary_recovery_precision_contract())
+        historical_primary.pop("failed_preflight_alternate")
+        material.update(
+            {
+                "primary_recovery": historical_primary,
+                "response_uncertainty": _response_uncertainty_contract(),
+            }
+        )
+    elif schema_version == CAMPAIGN_CHECKPOINT_SCHEMA_VERSION:
+        material.update(
+            {
+                "primary_recovery": _primary_recovery_precision_contract(),
+                "failed_preflight_recovery": (
+                    _failed_preflight_recovery_precision_contract()
+                ),
+                "response_uncertainty": _response_uncertainty_contract(),
+            }
+        )
+    elif schema_version != _LEGACY_CAMPAIGN_CHECKPOINT_SCHEMA_VERSION:
+        raise ValueError("campaign checkpoint precision contract schema is invalid")
+    return _sha256(material)
+
+
+def _historical_checkpoint_precision_contract_sha256s(
+    schema_version: int,
+) -> frozenset[str]:
+    hashes = {_checkpoint_precision_contract_sha256(schema_version)}
+    if schema_version == _LEGACY_CAMPAIGN_CHECKPOINT_SCHEMA_VERSION:
+        hashes.add(_sha256({
+            "promotion_gates": list(
+                B_PRIME_RELEASE_DOMAIN.precision_promotion_gates
+            ),
             "fixed_sentinel_leaf_ids": list(
                 B_PRIME_RELEASE_DOMAIN.fixed_precision_sentinel_leaf_ids
             ),
-            "primary_recovery": _primary_recovery_precision_contract(),
-            "failed_preflight_recovery": (
-                _failed_preflight_recovery_precision_contract()
-            ),
-            "response_uncertainty": _response_uncertainty_contract(),
-        }),
-    }
+        }))
+    return frozenset(hashes)
+
+
+def _checkpoint_bindings_match_schema(
+    plan: CampaignPlan,
+    selection: CampaignSelection,
+    bindings: object,
+    schema_version: int,
+) -> bool:
+    if not isinstance(bindings, Mapping):
+        return False
+    current = _checkpoint_bindings(plan, selection)
+    if dict(bindings) == current:
+        return True
+    if schema_version not in _HISTORICAL_CAMPAIGN_CHECKPOINT_SCHEMA_VERSIONS:
+        return False
+    for precision_contract_sha256 in (
+        _historical_checkpoint_precision_contract_sha256s(schema_version)
+    ):
+        historical = dict(current)
+        historical["precision_contract_sha256"] = precision_contract_sha256
+        if dict(bindings) == historical:
+            return True
+    return False
 
 
 def _checkpoint_mapping(
@@ -2033,7 +2095,9 @@ def _load_checkpoint_with_attempts(
         )
     if selection.to_mapping() != selection_value:
         raise ValueError("campaign checkpoint selection identity is invalid")
-    if bindings != _checkpoint_bindings(plan, selection):
+    if not _checkpoint_bindings_match_schema(
+        plan, selection, bindings, value["schema_version"]
+    ):
         raise ValueError("campaign checkpoint bindings are stale or forged")
     if len(records) > len(selection.leaf_ids):
         raise ValueError("campaign checkpoint has excess records")
@@ -2729,6 +2793,19 @@ def _validate_failed_preflight_recovery_stage(
     ):
         raise ValueError("failed-preflight recovery stage fields are invalid")
     component = outcome.component_result
+    expected_component_fields = {
+        "evidence_kind",
+        "result",
+        "self_refinement_result",
+        "scientific_runtime",
+        "self_refinement_scientific_runtime",
+        "failed_preflight_predecessor",
+        "comparison_kind",
+        "precision_ladder_discrepancy_applicable",
+        "same_precision_refinement_discrepancy_abs",
+    }
+    if set(component) != expected_component_fields:
+        raise ValueError("failed-preflight recovery component fields are invalid")
     if (
         component.get("comparison_kind") != _FAILED_PREFLIGHT_COMPARISON_KIND
         or component.get("precision_ladder_discrepancy_applicable") is not False
@@ -4929,15 +5006,22 @@ def _load_checkpoint_for_solved_leaf_import(
     if list(selection.leaf_ids) != leaf_ids or list(selection.cohort_ids) != cohort_ids:
         raise ValueError("campaign checkpoint selection is outside the current domain")
     current_bindings = _checkpoint_bindings(plan, selection)
-    for name in (
-        "selection_jobs_sha256",
-        "precision_factory_identity",
-        "precision_contract_sha256",
-    ):
+    for name in ("selection_jobs_sha256", "precision_factory_identity"):
         if bindings[name] != current_bindings[name]:
             raise ValueError(
                 f"campaign checkpoint scientific binding {name} is incompatible"
             )
+    allowed_precision_contracts = {
+        current_bindings["precision_contract_sha256"],
+        *_historical_checkpoint_precision_contract_sha256s(
+            value["schema_version"]
+        ),
+    }
+    if bindings["precision_contract_sha256"] not in allowed_precision_contracts:
+        raise ValueError(
+            "campaign checkpoint scientific binding "
+            "precision_contract_sha256 is incompatible"
+        )
     if len(records) > len(selection.leaf_ids):
         raise ValueError("campaign checkpoint has excess records")
     record_ids = tuple(record.leaf_id for record in records)

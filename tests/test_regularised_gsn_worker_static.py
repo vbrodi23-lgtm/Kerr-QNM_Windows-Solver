@@ -214,11 +214,11 @@ class RegularisedGsnWorkerSourceTests(unittest.TestCase):
         self,
     ) -> None:
         translation = self._function_slice(
-            "translate_numerical_control_failure", "wronskian"
+            "translate_numerical_control_failure", "compact_profile"
         )
         pair = self._function_slice("finite_difference_pair", "bounded_newton")
-        bounded = self._function_slice("bounded_newton", "numeric_text")
-        phase = self._function_slice("solve_phase", "solve_diagnostic")
+        bounded = self._function_slice("bounded_newton", "final_derivative")
+        phase = self._function_slice("solve_phase", "refined_request")
 
         range_branch = translation[
             translation.index("failure isa FiniteDifferenceRangeError") :

@@ -20,6 +20,7 @@ from windows_solver.linear_response import B_PRIME_RELEASE_DOMAIN
 from windows_solver.response_batches import (
     PrecisionCapabilities,
     StageOutcome,
+    _checkpoint_precision_contract_sha256,
     _primary_recovery_precision_contract,
     _root_convergence_precision_contract,
     _produced_response,
@@ -1808,12 +1809,25 @@ class PromotedResourceContainmentTests(unittest.TestCase):
                 })
             ).hexdigest()
 
+        def fake_cross_precision_evidence(component):
+            component["precision80_result"] = component["result"]
+            component["cross_precision_discrepancy_abs"] = 0.0
+
         for label, mutate, message in (
-            ("missing-predecessor", missing_predecessor, "attempt fields"),
+            (
+                "missing-predecessor",
+                missing_predecessor,
+                "recovery component fields",
+            ),
             (
                 "forged-predecessor-code",
                 forged_predecessor_code,
                 "receipt numerical-control diagnostics|predecessor identity",
+            ),
+            (
+                "fake-cross-precision-evidence",
+                fake_cross_precision_evidence,
+                "recovery component fields",
             ),
             (
                 "forged-refinement-readout",
@@ -2550,6 +2564,9 @@ class PromotedResourceContainmentTests(unittest.TestCase):
             )
             legacy = json.loads(checkpoint.read_text(encoding="utf-8"))
             legacy["schema_version"] = 3
+            legacy["bindings"]["precision_contract_sha256"] = (
+                _checkpoint_precision_contract_sha256(3)
+            )
             legacy.pop("attempts")
             legacy.pop("attempts_sha256")
             checkpoint.write_bytes(canonical_json_bytes(legacy))
@@ -2593,6 +2610,9 @@ class PromotedResourceContainmentTests(unittest.TestCase):
             )
             historical = json.loads(checkpoint.read_text(encoding="utf-8"))
             historical["schema_version"] = 5
+            historical["bindings"]["precision_contract_sha256"] = (
+                _checkpoint_precision_contract_sha256(5)
+            )
             checkpoint.write_bytes(canonical_json_bytes(historical))
 
             readable = validate_campaign_checkpoint(plan, checkpoint)

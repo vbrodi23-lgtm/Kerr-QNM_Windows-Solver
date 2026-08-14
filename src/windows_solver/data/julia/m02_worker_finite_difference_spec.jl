@@ -7,6 +7,55 @@ using Test
 
 include("m02_worker.jl")
 
+function finite_difference_control_request(; frequency_step="1e-6")
+    digest = repeat("0", 64)
+    return Dict{String,Any}(
+        "precision_digits" => 80,
+        "request_sha256" => digest,
+        "job_id" => "finite-difference-spec",
+        "leaf_id" => 13,
+        "role" => "specification",
+        "job_policy_sha256" => digest,
+        "backend_identity_sha256" => digest,
+        "refinement_level" => 0,
+        "resource_policy_schema" =>
+            "windows-solver.execution-resource-policy/1",
+        "resource_policy_version" => 1,
+        "resource_policy_sha256" => digest,
+        "frequency_step" => frequency_step,
+    )
+end
+
+function assert_range_translation(
+    range_failure::FiniteDifferenceRangeError,
+    axis::String,
+    h::T,
+) where {T<:AbstractFloat}
+    translated = translate_numerical_control_failure(
+        finite_difference_control_request(),
+        range_failure;
+        finite_difference_axis=axis,
+        finite_difference_h=h,
+    )
+    @test translated isa NumericalControlFailure
+    if translated isa NumericalControlFailure
+        details = failure_details(translated)
+        @test details["failure_code"] ==
+            "ALGEBRAIC_REPRESENTATION_SINGULAR"
+        @test details["failure_class"] == "CONTROL"
+        @test details["retryable"] == false
+        diagnostics = details["diagnostics"]
+        @test diagnostics["range_status"] == range_failure.status
+        @test diagnostics["axis"] == axis
+        @test diagnostics["h"] == string(h)
+        @test !haskey(
+            diagnostics, "factored_homogeneous_rhs_evaluations"
+        )
+        @test !haskey(diagnostics, "avoided_ode_scope")
+        @test !haskey(diagnostics, "asymptotic_preflight_avoided_ode")
+    end
+end
+
 function cancellation_sensitive_map(::Type{T}, z::Complex{T}) where {
     T<:AbstractFloat
 }
@@ -251,6 +300,33 @@ end
 end
 
 
+@testset "request frequency step is positive and finite before sampling" begin
+    @test validated_frequency_step(
+        Float64, finite_difference_control_request(frequency_step="1e-6")
+    ) == 1.0e-6
+    for invalid in ("0", "-1e-6", "Inf", "NaN")
+        failure = try
+            validated_frequency_step(
+                Float64,
+                finite_difference_control_request(frequency_step=invalid),
+            )
+            nothing
+        catch caught
+            caught
+        end
+        @test failure isa NumericalControlFailure
+        if failure isa NumericalControlFailure
+            details = failure_details(failure)
+            @test details["failure_code"] ==
+                "ALGEBRAIC_REPRESENTATION_SINGULAR"
+            @test details["retryable"] == false
+            @test details["diagnostics"]["reason"] ==
+                "INVALID_FREQUENCY_STEP"
+        end
+    end
+end
+
+
 @testset "BigFloat exponent combinations fail before integer wrap" begin
     setprecision(BigFloat, 192) do
         huge = floatmax(BigFloat) / BigFloat(2)
@@ -269,6 +345,7 @@ end
         @test failure isa FiniteDifferenceRangeError
         if failure isa FiniteDifferenceRangeError
             @test failure.status == "derivative-overflow/v1"
+            assert_range_translation(failure, "real", tiny)
         end
     end
 end
@@ -290,6 +367,7 @@ end
     @test failure isa FiniteDifferenceRangeError
     if failure isa FiniteDifferenceRangeError
         @test failure.status == "derivative-underflow/v1"
+        assert_range_translation(failure, "real", floatmax(Float64))
     end
 
     materialized, upper_clamped, underflowed = _fd_materialize_clamped(

@@ -1097,7 +1097,11 @@ $candidate | ConvertTo-Json -Compress | Set-Content -LiteralPath $env:M02_TEST_J
         version_one = "v" + "1"
         version_two = "v" + "2"
         approved_regularised_gsn_identities = frozenset({
+            "exterior-wronskian/v1",
+            "factored-homogeneous-gsn/v1",
             "factored-plane-wave-gsn/v1",
+            "horizon-scattering/v1",
+            "same-precision-120-base-vs-refinement/v1",
             "typed-batch-horner-compensated/v1",
             "scaled-factored-horizon-basis/v1",
             "cinc-over-cref-minus-reflectivity/v1",
@@ -1111,6 +1115,8 @@ $candidate | ConvertTo-Json -Compress | Set-Content -LiteralPath $env:M02_TEST_J
             "cinc-over-cref-minus-R/v1",
             "known-carrier-times-regular-remainder/v1",
             "state1=Y;state2=dY/drho/v1",
+            "unit-asymptotic-branch-wronskian/v1",
+            "wronskian-perturbed-Xin-with-Xup/v1",
             (
                 "blocked-pending-human-math-review-and-independent-"
                 "reference/v1"
