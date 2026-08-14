@@ -5,7 +5,9 @@
 - Task 3: committed through `d50ef82` — post-validation cache publication,
   exact-entry invalidation/retry, and request/runtime/exact-decimal worker
   response receipts with 219 mocked/static tests passing.
-- Task 4: pending — separate human-math and independent-reference activation gates.
+- Task 4: committed through `07a7745` — separate fail-loud human-math and
+  independent-reference gates, schema-3 evidence propagation, and bounded
+  schema-2 compatibility with 262 mocked/static tests passing.
 - Task 5: pending — final static integration and review.
 
 Global execution boundary: do not run Julia, Kerr determinant, PowerShell, solver, or scientific payload commands. Only mocked/static Python checks are permitted.
