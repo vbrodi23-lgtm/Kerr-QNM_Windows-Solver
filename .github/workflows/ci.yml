@@ -13,7 +13,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 25
     env:
+      M02_PROJECT: .ci/m02-project
+      M02_PROJECT_SEED: src/windows_solver/data/julia/m02_project
       GSN_PROJECT: src/windows_solver/data/julia/GeneralizedSasakiNakamura.jl
+      ANGULAR_PROJECT: src/windows_solver/data/julia/SpinWeightedSpheroidalHarmonics.jl
       JULIA_NUM_THREADS: "1"
       JULIA_NUM_PRECOMPILE_TASKS: "4"
       JULIA_PKG_PRECOMPILE_AUTO: "0"
@@ -22,25 +25,53 @@ jobs:
       - uses: julia-actions/setup-julia@v3
         with:
           version: "1.10.11"
+      - name: Materialize pinned M02 Julia project
+        shell: bash
+        run: |
+          julia --startup-file=no --history-file=no -e '
+            seed_project = abspath(ENV["M02_PROJECT_SEED"])
+            project = abspath(ENV["M02_PROJECT"])
+            mkpath(project)
+            cp(
+              joinpath(seed_project, "Project.toml"),
+              joinpath(project, "Project.toml");
+              force=true,
+            )
+            manifest = read(joinpath(seed_project, "Manifest.seed.toml"), String)
+            for source in (ENV["GSN_PROJECT"], ENV["ANGULAR_PROJECT"])
+              source_path = abspath(source)
+              seed_path = string("path = \"../vendor/", basename(source_path), "\"")
+              pinned_path = string(
+                "path = \"", replace(source_path, "\\" => "/"), "\""
+              )
+              occursin(seed_path, manifest) || error(
+                "seed manifest lacks path dependency: $seed_path"
+              )
+              manifest = replace(manifest, seed_path => pinned_path)
+            end
+            occursin("../vendor/", manifest) && error(
+              "materialized manifest retains a seed vendor path"
+            )
+            write(joinpath(project, "Manifest.toml"), manifest)
+          '
       - uses: julia-actions/cache@v3
         with:
           delete-old-caches: "false"
-      - name: Instantiate and precompile vendored GSN package
+      - name: Instantiate and precompile pinned M02 project
         shell: bash
         run: |
-          julia --startup-file=no --history-file=no --project="$GSN_PROJECT" -e '
+          julia --startup-file=no --history-file=no --project="$M02_PROJECT" -e '
             using Pkg
-            Pkg.develop(PackageSpec(path=joinpath(
-              pwd(),
-              "src/windows_solver/data/julia/SpinWeightedSpheroidalHarmonics.jl",
-            )))
+            Pkg.develop(PackageSpec(path=abspath(ENV["ANGULAR_PROJECT"])))
+            Pkg.develop(PackageSpec(path=abspath(ENV["GSN_PROJECT"])))
+            Pkg.resolve()
             Pkg.instantiate()
             Pkg.precompile()
           '
       - name: Run load-bearing factored GSN regression
         shell: bash
         run: |
-          julia --startup-file=no --history-file=no --project="$GSN_PROJECT" -e '
+          julia --startup-file=no --history-file=no --project="$M02_PROJECT" -e '
             using Test
             using GeneralizedSasakiNakamura
             include(joinpath(ENV["GSN_PROJECT"], "test", "factored_propagation_spec.jl"))

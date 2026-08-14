@@ -30,6 +30,24 @@ class RegularisedGsnFactoredPropagationSourceTests(unittest.TestCase):
         self,
     ) -> None:
         self.assertIn(
+            "M02_PROJECT_SEED: src/windows_solver/data/julia/m02_project",
+            self.workflow,
+        )
+        self.assertIn(
+            'read(joinpath(seed_project, "Manifest.seed.toml"), String)',
+            self.workflow,
+        )
+        self.assertIn(
+            'manifest = replace(manifest, seed_path => pinned_path)',
+            self.workflow,
+        )
+        self.assertIn('--project="$M02_PROJECT"', self.workflow)
+        self.assertIn(
+            'Pkg.develop(PackageSpec(path=abspath(ENV["GSN_PROJECT"])))',
+            self.workflow,
+        )
+        self.assertIn("Pkg.resolve()", self.workflow)
+        self.assertIn(
             'include(joinpath(ENV["GSN_PROJECT"], "test", '
             '"factored_propagation_spec.jl"))',
             self.workflow,
