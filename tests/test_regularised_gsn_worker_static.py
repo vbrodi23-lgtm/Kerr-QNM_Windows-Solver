@@ -261,6 +261,33 @@ class RegularisedGsnWorkerSourceTests(unittest.TestCase):
         )
         self.assertIn('include("m02_worker.jl")', self.fd_spec)
 
+    def test_every_factored_failure_reason_has_typed_worker_translation(self):
+        translation = self.worker[
+            self.worker.index("function translate_numerical_control_failure(") :
+            self.worker.index("function compact_profile", self.worker.index(
+                "function translate_numerical_control_failure("
+            ))
+        ]
+        for reason in (
+            "INVALID_FACTORED_PROPAGATION_INPUT",
+            "FACTORED_PROPAGATION_PRECISION_MISMATCH",
+            "NONFINITE_FACTORED_PROPAGATION_DATA",
+            "FACTORED_ODE_FAILURE",
+        ):
+            self.assertIn(f'"{reason}"', translation)
+
+    def test_nonfinite_stencil_values_use_the_caught_range_error(self):
+        validation = self.worker[
+            self.worker.index("function validate_finite_difference_inputs(") :
+            self.worker.index("struct _FDScaledValue")
+        ]
+        self.assertIn("FiniteDifferenceRangeError(", validation)
+        self.assertIn('"nonfinite-stencil/v1"', validation)
+        self.assertNotIn(
+            'ArgumentError("finite-difference inputs must be finite")',
+            validation,
+        )
+
     def test_worker_emits_exact_mechanism_honest_conditioning_contract(self) -> None:
         conditioning = self.worker[
             self.worker.index("function conditioning_response(") :

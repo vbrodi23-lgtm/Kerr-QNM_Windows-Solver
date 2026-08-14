@@ -26,6 +26,15 @@ function finite_difference_control_request(; frequency_step="1e-6")
     )
 end
 
+@testset "nonfinite stencil values are typed range failures" begin
+    @test_throws FiniteDifferenceRangeError build_finite_difference_diagnostics(
+        complex(Inf, 0.0),
+        complex(1.0, 0.0),
+        complex(1.0e-6, 0.0);
+        axis="real",
+    )
+end
+
 function assert_range_translation(
     range_failure::FiniteDifferenceRangeError,
     axis::String,

@@ -1222,6 +1222,10 @@ function translate_numerical_control_failure(
             "PHYSICAL_SINGULAR_LIMIT",
             "ALGEBRAIC_REPRESENTATION_SINGULAR",
             "CARRIER_CHANGE_INCONSISTENT",
+            "INVALID_FACTORED_PROPAGATION_INPUT",
+            "FACTORED_PROPAGATION_PRECISION_MISMATCH",
+            "NONFINITE_FACTORED_PROPAGATION_DATA",
+            "FACTORED_ODE_FAILURE",
         )
         recognized || return failure
         diagnostics = Dict{String,Any}(
@@ -1959,7 +1963,10 @@ function validate_finite_difference_inputs(
         imag(d_plus_value),
         real(d_minus_value),
         imag(d_minus_value),
-    )) || throw(ArgumentError("finite-difference inputs must be finite"))
+    )) || throw(FiniteDifferenceRangeError(
+        "finite-difference stencil values must be finite",
+        "nonfinite-stencil/v1",
+    ))
     return validate_finite_difference_offset(offset; axis=axis)
 end
 
