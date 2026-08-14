@@ -15,6 +15,7 @@ JULIA_SPEC = REPO_ROOT / (
     "factored_propagation_spec.jl"
 )
 WORKER_SOURCE = REPO_ROOT / "src/windows_solver/data/julia/m02_worker.jl"
+CI_WORKFLOW = REPO_ROOT / ".github/workflows/ci.yml"
 
 
 class RegularisedGsnFactoredPropagationSourceTests(unittest.TestCase):
@@ -23,6 +24,17 @@ class RegularisedGsnFactoredPropagationSourceTests(unittest.TestCase):
         cls.source = COMPLEX_FREQUENCIES_SOURCE.read_text(encoding="utf-8")
         cls.spec = JULIA_SPEC.read_text(encoding="utf-8")
         cls.worker = WORKER_SOURCE.read_text(encoding="utf-8")
+        cls.workflow = CI_WORKFLOW.read_text(encoding="utf-8")
+
+    def test_ci_runs_the_load_bearing_factored_spec_not_the_full_vendor_suite(
+        self,
+    ) -> None:
+        self.assertIn(
+            'include(joinpath(ENV["GSN_PROJECT"], "test", '
+            '"factored_propagation_spec.jl"))',
+            self.workflow,
+        )
+        self.assertNotIn("Pkg.test()", self.workflow)
 
     def test_contexts_are_typed_and_bind_frozen_cell_to_sample_deformation(
         self,
