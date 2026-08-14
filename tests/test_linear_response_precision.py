@@ -2564,17 +2564,31 @@ class PromotedResourceContainmentTests(unittest.TestCase):
             )
             legacy = json.loads(checkpoint.read_text(encoding="utf-8"))
             legacy["schema_version"] = 3
+            source_history_v3_sha256 = (
+                "7949e077764bfb262d7241be60b57fbf4105e120a52cb8b32cbc8c1a32497d32"
+            )
+            self.assertEqual(
+                _checkpoint_precision_contract_sha256(3),
+                source_history_v3_sha256,
+            )
             legacy["bindings"]["precision_contract_sha256"] = (
-                _checkpoint_precision_contract_sha256(3)
+                source_history_v3_sha256
             )
             legacy.pop("attempts")
             legacy.pop("attempts_sha256")
             checkpoint.write_bytes(canonical_json_bytes(legacy))
 
             loaded = validate_campaign_checkpoint(plan, checkpoint)
+            legacy["bindings"]["precision_contract_sha256"] = (
+                "75b7210a8e8cefbdcefef210f6ef5792b68227f6957862b3a42cb9cdc92dd74b"
+            )
+            checkpoint.write_bytes(canonical_json_bytes(legacy))
+            earliest_loaded = validate_campaign_checkpoint(plan, checkpoint)
 
         self.assertEqual(loaded.state, "COMPLETE")
         self.assertEqual(loaded.attempts, ())
+        self.assertEqual(earliest_loaded.state, "COMPLETE")
+        self.assertEqual(earliest_loaded.attempts, ())
 
     def test_incomplete_schema_five_checkpoint_cannot_resume_as_schema_six(self):
         plan, _, _, incident, _ = self._plan_and_leaves()
@@ -2610,8 +2624,15 @@ class PromotedResourceContainmentTests(unittest.TestCase):
             )
             historical = json.loads(checkpoint.read_text(encoding="utf-8"))
             historical["schema_version"] = 5
+            source_history_v5_sha256 = (
+                "7949e077764bfb262d7241be60b57fbf4105e120a52cb8b32cbc8c1a32497d32"
+            )
+            self.assertEqual(
+                _checkpoint_precision_contract_sha256(5),
+                source_history_v5_sha256,
+            )
             historical["bindings"]["precision_contract_sha256"] = (
-                _checkpoint_precision_contract_sha256(5)
+                source_history_v5_sha256
             )
             checkpoint.write_bytes(canonical_json_bytes(historical))
 
