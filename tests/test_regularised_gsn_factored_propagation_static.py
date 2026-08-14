@@ -37,6 +37,7 @@ class RegularisedGsnFactoredPropagationSourceTests(unittest.TestCase):
             'read(joinpath(seed_project, "Manifest.seed.toml"), String)',
             self.workflow,
         )
+        self.assertIn("let manifest = read", self.workflow)
         self.assertIn(
             'manifest = replace(manifest, seed_path => pinned_path)',
             self.workflow,

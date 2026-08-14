@@ -37,22 +37,25 @@ jobs:
               joinpath(project, "Project.toml");
               force=true,
             )
-            manifest = read(joinpath(seed_project, "Manifest.seed.toml"), String)
-            for source in (ENV["GSN_PROJECT"], ENV["ANGULAR_PROJECT"])
-              source_path = abspath(source)
-              seed_path = string("path = \"../vendor/", basename(source_path), "\"")
-              pinned_path = string(
-                "path = \"", replace(source_path, "\\" => "/"), "\""
+            let manifest = read(joinpath(seed_project, "Manifest.seed.toml"), String)
+              for source in (ENV["GSN_PROJECT"], ENV["ANGULAR_PROJECT"])
+                source_path = abspath(source)
+                seed_path = string(
+                  "path = \"../vendor/", basename(source_path), "\""
+                )
+                pinned_path = string(
+                  "path = \"", replace(source_path, "\\" => "/"), "\""
+                )
+                occursin(seed_path, manifest) || error(
+                  "seed manifest lacks path dependency: $seed_path"
+                )
+                manifest = replace(manifest, seed_path => pinned_path)
+              end
+              occursin("../vendor/", manifest) && error(
+                "materialized manifest retains a seed vendor path"
               )
-              occursin(seed_path, manifest) || error(
-                "seed manifest lacks path dependency: $seed_path"
-              )
-              manifest = replace(manifest, seed_path => pinned_path)
+              write(joinpath(project, "Manifest.toml"), manifest)
             end
-            occursin("../vendor/", manifest) && error(
-              "materialized manifest retains a seed vendor path"
-            )
-            write(joinpath(project, "Manifest.toml"), manifest)
           '
       - uses: julia-actions/cache@v3
         with:
