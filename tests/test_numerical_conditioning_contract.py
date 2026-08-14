@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+from dataclasses import replace
 from decimal import Decimal
 import hashlib
 import math
@@ -634,6 +635,35 @@ class PromotedRuntimeProvenancePersistenceTests(unittest.TestCase):
             if current_schema
             else None
         )
+        worker_response_receipt = None
+        if current_schema:
+            request_binding = JuliaPrecisionRootBackend(
+                job.backend_identity, object(), 80
+            )._request(job, 0.0j)
+            receipt_material = {
+                "schema": response_engine.WORKER_RESPONSE_RECEIPT_SCHEMA,
+                "request_binding": request_binding,
+                "request_sha256": hashlib.sha256(
+                    canonical_json_bytes(request_binding)
+                ).hexdigest(),
+                "scientific_runtime_sha256": hashlib.sha256(
+                    canonical_json_bytes(
+                        PromotedRuntimeProvenancePersistenceTests._current_runtime(
+                            job
+                        )
+                    )
+                ).hexdigest(),
+                "worker_response_schema_version": 3,
+                "root_residual_abs_text": "1E-12",
+                "raw_determinant_abs_text": None,
+                "raw_determinant_evidence_status": "not-applicable/v1",
+            }
+            worker_response_receipt = {
+                **receipt_material,
+                "receipt_sha256": hashlib.sha256(
+                    canonical_json_bytes(receipt_material)
+                ).hexdigest(),
+            }
         baseline = response_engine.RootReadout(
             omega=job.root.omega,
             determinant_residual_abs=1.0e-12,
@@ -651,6 +681,10 @@ class PromotedRuntimeProvenancePersistenceTests(unittest.TestCase):
                 Decimal("1E-12") if current_schema else None
             ),
             raw_determinant_abs=None,
+            raw_determinant_evidence_status=(
+                "not-applicable/v1" if current_schema else None
+            ),
+            worker_response_receipt=worker_response_receipt,
         )
         return response_engine.ComponentResult(
             job_id=job.job_id,
@@ -757,6 +791,45 @@ class PromotedRuntimeProvenancePersistenceTests(unittest.TestCase):
 
         valid = self._stage_outcome(result, self._current_runtime(job))
         self.assertTrue(response_batches._validate_component_result(leaf, valid))
+        self.assertTrue(response_batches._validate_component_result(
+            leaf,
+            valid,
+            allow_historical_conditioning_absence=False,
+        ))
+
+    def test_current_promoted_receipt_is_bound_to_scientific_runtime(self):
+        """Catches replaying exact worker text under a different runtime."""
+
+        leaf = self._leaf()
+        result = self._result(leaf.job, current_schema=True)
+        baseline_mapping = result.baseline.to_mapping()
+        receipt = dict(baseline_mapping["worker_response_receipt"])
+        receipt["scientific_runtime_sha256"] = "f" * 64
+        material = {
+            key: value
+            for key, value in receipt.items()
+            if key != "receipt_sha256"
+        }
+        receipt["receipt_sha256"] = hashlib.sha256(
+            canonical_json_bytes(material)
+        ).hexdigest()
+        baseline_mapping["worker_response_receipt"] = receipt
+        tampered = replace(
+            result,
+            baseline=response_engine.RootReadout.from_mapping(
+                baseline_mapping
+            ),
+        )
+        outcome = self._stage_outcome(
+            tampered, self._current_runtime(leaf.job)
+        )
+
+        with self.assertRaisesRegex(ValueError, "worker response receipt"):
+            response_batches._validate_component_result(
+                leaf,
+                outcome,
+                allow_historical_conditioning_absence=False,
+            )
 
     def test_historical_promoted_runtime_without_conditioning_remains_readable(self):
         """Catches retroactively applying schema-2 policy to historical evidence."""

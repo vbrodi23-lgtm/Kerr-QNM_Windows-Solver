@@ -215,6 +215,50 @@ class JuliaResponseBackendTests(unittest.TestCase):
         )
         self.assertEqual(len(receipt["receipt_sha256"]), 64)
 
+    def test_cached_receipt_rejects_sub_binary64_text_tampering(self):
+        """Catches exact evidence changes hidden inside one binary64 value."""
+
+        calls = []
+
+        def runner(command, **kwargs):
+            calls.append(tuple(command))
+            request = json.loads(Path(command[-2]).read_text(encoding="utf-8"))
+            response = valid_schema_three_julia_root_response(request)
+            response["request_sha256"] = request["request_sha256"]
+            Path(command[-1]).write_bytes(canonical_json_bytes(response))
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            adapter, store = self._cache_adapter(Path(temporary), runner)
+            backend = JuliaPrecisionRootBackend(
+                VettedNativeDeterminantKernel.identity, adapter, 80
+            )
+            backend.read_root(_deep_job(), 0.0j)
+            cache_path = next(store.root.glob("*.json"))
+            entry = json.loads(cache_path.read_text(encoding="utf-8"))
+            receipt = entry["worker_response_receipt"]
+            receipt["root_residual_abs_text"] = (
+                "1.0000000000000000000000000000000000000001E-60"
+            )
+            material = {
+                key: value
+                for key, value in receipt.items()
+                if key != "receipt_sha256"
+            }
+            receipt["receipt_sha256"] = hashlib.sha256(
+                canonical_json_bytes(material)
+            ).hexdigest()
+            cache_path.write_bytes(canonical_json_bytes(entry))
+
+            with self.assertRaisesRegex(
+                JuliaResponseBackendError,
+                "cached worker response receipt is invalid",
+            ):
+                backend.read_root(_deep_job(), 0.0j)
+            self.assertEqual(store.stored_count, 0)
+            backend.read_root(_deep_job(), 0.0j)
+            self.assertEqual(len(calls), 2)
+
     def test_success_wire_schema_is_three_and_worker_errors_remain_schema_one(self):
         """Catches changing the successful wire without preserving error parsing."""
 
