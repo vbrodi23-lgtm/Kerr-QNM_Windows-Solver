@@ -1,11 +1,22 @@
 module ComplexFrequencies
 
 using ..Kerr
-using ..Coordinates
+using ..Coordinates: r_from_rstar, contour_half_plane_sign
+using ..Coordinates: rstar_from_r
+using ..Coordinates:
+    GSNBranchConvention,
+    GSNBranchCell,
+    gsn_branch_convention,
+    branch_cell,
+    assert_no_branch_crossing,
+    infinity_contour_tangent,
+    horizon_contour_tangent,
+    contour_angle_deformation
+using ..FactoredSolutions
 using ..Potentials
 using ..AsymptoticExpansionCoefficients
 using ..InitialConditions
-using ..Solutions
+import ..Solutions
 
 using DifferentialEquations
 using StaticArrays
@@ -13,6 +24,32 @@ using StaticArrays
 _DEFAULTDATATYPE = Solutions._DEFAULTDATATYPE
 _DEFAULTSOLVER = Solutions._DEFAULTSOLVER
 _DEFAULTTOLERANCE = Solutions._DEFAULTTOLERANCE
+
+export ContourAngleDeformation, HomogeneousSpectralContext
+export ComplexContourContext, ContourContext
+export FactoredPropagationFailureReason, FactoredPropagationError
+export FactoredEndpointPreparation
+export HorizonDeterminantPreparation, ExteriorDeterminantPreparation
+export FactoredGSNParameters, FactoredODEDiagnostics, FactoredODESolution
+export FactoredCarrierTransition, FactoredScatteringPropagation
+export FactoredExteriorMatches, FactoredMatchState
+export HOMOGENEOUS_REPRESENTATION_ID
+export FACTORED_HOMOGENEOUS_ODE_SCOPE_ID
+export MATCH_RADIAL_DERIVATIVE_CONVENTION_ID
+export build_homogeneous_spectral_context, build_contour_context
+export prepare_factored_infinity_outgoing
+export prepare_factored_horizon_ingoing, prepare_factored_horizon_outgoing
+export prepare_factored_horizon_determinant_branches
+export prepare_factored_exterior_determinant_branches
+export assert_factored_preflights_adequate
+export assert_factored_exterior_preparations_ready
+export factored_GSN_linear_eqn!, solve_factored_endpoint
+export solve_factored_infinity_outer_to_match
+export change_factored_infinity_to_horizon_at_match
+export solve_factored_horizon_match_to_inner
+export solve_factored_xup_scattering_endpoint
+export solve_factored_xin_to_match, solve_factored_xup_to_match
+export solve_factored_exterior_matches, reconstruct_factored_match_state
 
 function _begin_ode_observation(factory, leg, tspan, odealgo)
     factory === nothing && return nothing, nothing
@@ -25,13 +62,7 @@ function _finish_ode_observation(ode_solution_observer, leg, solution, observati
     return solution
 end
 
-function determine_sign(x)
-    if real(x) >= 0
-        return sign(1.0)
-    else
-        return sign(-1.0)
-    end
-end
+determine_sign(x) = contour_half_plane_sign(x)
 
 function drdrho(u, p, rho)
     #=
@@ -187,6 +218,2416 @@ function solve_r_from_rho(
     return solve_r_from_rho_rsmp(0), NaN
 end
 
+const HOMOGENEOUS_REPRESENTATION_ID = "factored-plane-wave-gsn/v1"
+const FACTORED_HOMOGENEOUS_ODE_SCOPE_ID = "factored-homogeneous-gsn/v1"
+const MATCH_RADIAL_DERIVATIVE_CONVENTION_ID =
+    "match-state2=dX/drstar-from-Xrho-over-contour-tangent/v1"
+const _FACTORED_DEFAULTSOLVER = AutoVern9(Rosenbrock23(autodiff=false))
+
+@enum FactoredPropagationFailureReason begin
+    INVALID_FACTORED_PROPAGATION_INPUT = 1
+    FACTORED_PROPAGATION_PRECISION_MISMATCH = 2
+    NONFINITE_FACTORED_PROPAGATION_DATA = 3
+    INSUFFICIENT_ASYMPTOTIC_PRECISION = 4
+    CARRIER_CHANGE_INCONSISTENT = 5
+    FACTORED_ODE_FAILURE = 6
+end
+
+@enum FactoredODESolveExceptionDisposition begin
+    PASSTHROUGH_ODE_EXCEPTION = 1
+    WRAP_ODE_EXCEPTION = 2
+end
+
+struct FactoredPropagationError{T<:AbstractFloat} <: Exception
+    reason::Union{FactoredPropagationFailureReason,AsymptoticFailureReason}
+    assessment::Union{Nothing,AsymptoticConditioningAssessment{T}}
+    precision_bits::Int
+    factored_homogeneous_rhs_evaluations::Int
+    avoided_ode_scope::String
+    message::String
+end
+
+function Base.showerror(io::IO, error::FactoredPropagationError)
+    print(
+        io,
+        string(error.reason),
+        ": ",
+        error.message,
+        " (precision_bits=",
+        error.precision_bits,
+        ", factored_homogeneous_rhs_evaluations=",
+        error.factored_homogeneous_rhs_evaluations,
+        ", avoided_ode_scope=",
+        error.avoided_ode_scope,
+        ")",
+    )
+end
+
+struct ContourAngleDeformation{T<:AbstractFloat}
+    infinity_delta::T
+    horizon_delta::T
+    maximum_absolute::T
+end
+
+struct HomogeneousSpectralContext{T<:AbstractFloat}
+    s::Int
+    m::Int
+    a::T
+    omega::Complex{T}
+    lambda::Complex{T}
+    p_horizon::Complex{T}
+    precision_digits::Int
+    precision_bits::Int
+    endpoint_order::Int
+    series::AsymptoticSeriesBundle{T}
+    contract::RegularRemainderContract
+    convention::GSNBranchConvention{T}
+    frozen_convention::GSNBranchConvention{T}
+    frozen_branch_cell::GSNBranchCell
+    contour_deformation::ContourAngleDeformation{T}
+end
+
+struct ComplexContourContext{T<:AbstractFloat,F}
+    match_radius::T
+    rstar_match::T
+    rho_in::T
+    rho_out::T
+    precision_bits::Int
+    infinity_contour_angle::T
+    horizon_contour_angle::T
+    infinity_sign::Int8
+    horizon_sign::Int8
+    infinity_tangent::Complex{T}
+    horizon_tangent::Complex{T}
+    radius_from_rho::F
+    convention::GSNBranchConvention{T}
+    frozen_branch_cell::GSNBranchCell
+    contour_deformation::ContourAngleDeformation{T}
+end
+
+# Compatibility alias for callers written while Task 1C was under review. New
+# production code uses the mathematically explicit ComplexContourContext name.
+const ContourContext = ComplexContourContext
+
+struct FactoredEndpointPreparation{T<:AbstractFloat}
+    branch::CarrierKind
+    initial_condition::FactoredInitialCondition{T}
+    assessment::AsymptoticConditioningAssessment{T}
+    required_digits::T
+    precision_bits::Int
+    endpoint_order::Int
+    frozen_branch_cell::GSNBranchCell
+    contour_deformation::ContourAngleDeformation{T}
+end
+
+struct HorizonDeterminantPreparation{T<:AbstractFloat}
+    infinity_outgoing::FactoredEndpointPreparation{T}
+    horizon_ingoing::FactoredEndpointPreparation{T}
+    horizon_outgoing::FactoredEndpointPreparation{T}
+end
+
+struct ExteriorDeterminantPreparation{T<:AbstractFloat}
+    horizon_ingoing::FactoredEndpointPreparation{T}
+    infinity_outgoing::FactoredEndpointPreparation{T}
+end
+
+struct FactoredGSNParameters{T<:AbstractFloat,F}
+    s::Int
+    m::Int
+    a::T
+    omega::Complex{T}
+    lambda::Complex{T}
+    radius_from_rho::F
+    tangent::Complex{T}
+    carrier::PlaneWaveCarrier{T}
+    precision_bits::Int
+    rhs_evaluations_at_start::Int
+    factored_homogeneous_rhs_evaluations::Base.RefValue{Int}
+end
+
+mutable struct _FactoredDiagnosticAccumulator{T<:AbstractFloat}
+    accepted_steps::Int
+    maximum_remainder_state_norm::T
+    minimum_remainder_state_norm::T
+    maximum_absolute_real_carrier_log::T
+end
+
+struct FactoredODEDiagnostics{T<:AbstractFloat}
+    branch::CarrierKind
+    ode_leg::String
+    representation_id::String
+    ode_scope_id::String
+    precision_bits::Int
+    accepted_steps::Int
+    rejected_steps::Int
+    maximum_remainder_state_norm::T
+    minimum_remainder_state_norm::T
+    maximum_absolute_real_carrier_log::T
+    initial_regularity::RemainderRegularityEvidence{T}
+    assessment::AsymptoticConditioningAssessment{T}
+    convention::GSNBranchConvention{T}
+    frozen_branch_cell::GSNBranchCell
+    contour_deformation::ContourAngleDeformation{T}
+    factored_homogeneous_rhs_evaluations::Int
+    endpoint_only_saved_points::Int
+end
+
+struct FactoredODESolution{T<:AbstractFloat}
+    endpoint::FactoredEndpointState{T}
+    carrier::PlaneWaveCarrier{T}
+    endpoint_rho::T
+    diagnostics::FactoredODEDiagnostics{T}
+end
+
+struct FactoredCarrierTransition{T<:AbstractFloat}
+    state::FactoredEndpointState{T}
+    source_carrier::PlaneWaveCarrier{T}
+    target_carrier::PlaneWaveCarrier{T}
+    diagnostics::CarrierChangeDiagnostics{T}
+    reconstruction_tolerance::T
+    frozen_branch_cell::GSNBranchCell
+    contour_deformation::ContourAngleDeformation{T}
+end
+
+struct FactoredScatteringPropagation{T<:AbstractFloat}
+    infinity_outer_to_match::FactoredODESolution{T}
+    carrier_transition::FactoredCarrierTransition{T}
+    horizon_match_to_inner::FactoredODESolution{T}
+end
+
+struct FactoredExteriorMatches{T<:AbstractFloat}
+    xin_at_match::FactoredODESolution{T}
+    xup_at_match::FactoredODESolution{T}
+end
+
+struct FactoredMatchState{T<:AbstractFloat}
+    X::Complex{T}
+    Xrho::Complex{T}
+    dX_drstar::Complex{T}
+    rho::T
+    branch::CarrierKind
+    tangent::Complex{T}
+    radial_derivative_convention::String
+end
+
+function _factored_error(
+    ::Type{T},
+    reason::Union{FactoredPropagationFailureReason,AsymptoticFailureReason},
+    precision_bits::Int,
+    message::AbstractString;
+    assessment::Union{Nothing,AsymptoticConditioningAssessment{T}}=nothing,
+    factored_homogeneous_rhs_evaluations::Int=0,
+) where {T<:AbstractFloat}
+    return FactoredPropagationError{T}(
+        reason,
+        assessment,
+        precision_bits,
+        factored_homogeneous_rhs_evaluations,
+        FACTORED_HOMOGENEOUS_ODE_SCOPE_ID,
+        String(message),
+    )
+end
+
+function _translate_factored_failure(
+    operation::F,
+    ::Type{T},
+    precision_bits::Int,
+    context::AbstractString;
+    argument_reason::FactoredPropagationFailureReason=
+        INVALID_FACTORED_PROPAGATION_INPUT,
+    factored_homogeneous_rhs_evaluations::Int=0,
+) where {F,T<:AbstractFloat}
+    try
+        return operation()
+    catch error
+        error isa FactoredPropagationError && rethrow()
+        if error isa AsymptoticConstructionError
+            throw(_factored_error(
+                T,
+                error.reason,
+                precision_bits,
+                "$context: $(error.message)";
+                factored_homogeneous_rhs_evaluations=
+                    factored_homogeneous_rhs_evaluations,
+            ))
+        elseif error isa ArgumentError || error isa DomainError
+            throw(_factored_error(
+                T,
+                argument_reason,
+                precision_bits,
+                "$context: $(sprint(showerror, error))";
+                factored_homogeneous_rhs_evaluations=
+                    factored_homogeneous_rhs_evaluations,
+            ))
+        end
+        rethrow()
+    end
+end
+
+function _factored_rhs_evaluation_count(parameters::FactoredGSNParameters)
+    return max(
+        0,
+        parameters.factored_homogeneous_rhs_evaluations[] -
+            parameters.rhs_evaluations_at_start,
+    )
+end
+
+_never_passthrough_ode_exception(_error) = false
+
+function _factored_ode_exception_disposition(
+    error, ode_exception_passthrough
+)
+    if error isa FactoredPropagationError || error isa InterruptException
+        return PASSTHROUGH_ODE_EXCEPTION
+    end
+    passthrough = ode_exception_passthrough(error)
+    passthrough isa Bool || throw(ArgumentError(
+        "ode_exception_passthrough must return Bool"
+    ))
+    return passthrough ?
+        PASSTHROUGH_ODE_EXCEPTION : WRAP_ODE_EXCEPTION
+end
+
+function _throw_or_wrap_factored_ode_failure(
+    error,
+    ode_exception_passthrough,
+    ::Type{T},
+    precision_bits::Int,
+    assessment::AsymptoticConditioningAssessment{T},
+    factored_homogeneous_rhs_evaluations::Int,
+) where {T<:AbstractFloat}
+    disposition = _factored_ode_exception_disposition(
+        error, ode_exception_passthrough
+    )
+    disposition === PASSTHROUGH_ODE_EXCEPTION && throw(error)
+    throw(_factored_error(
+        T,
+        FACTORED_ODE_FAILURE,
+        precision_bits,
+        "factored ODE solve failed: $(sprint(showerror, error))";
+        assessment=assessment,
+        factored_homogeneous_rhs_evaluations=
+            factored_homogeneous_rhs_evaluations,
+    ))
+end
+
+function _with_factored_precision(
+    operation::F, ::Type{BigFloat}, precision_bits::Int
+) where {F}
+    return setprecision(BigFloat, precision_bits) do
+        operation()
+    end
+end
+
+function _with_factored_precision(
+    operation::F, ::Type{T}, precision_bits::Int
+) where {F,T<:AbstractFloat}
+    precision(T) == precision_bits || throw(ArgumentError(
+        "requested precision does not match the floating component type"
+    ))
+    return operation()
+end
+
+function _finite_factored_complex(value::Complex)
+    return isfinite(real(value)) && isfinite(imag(value))
+end
+
+function _factored_precision_matches(value::T, precision_bits::Int) where {T<:AbstractFloat}
+    return precision(value) == precision_bits
+end
+
+function _factored_precision_matches(
+    value::Complex{T}, precision_bits::Int
+) where {T<:AbstractFloat}
+    return precision(real(value)) == precision_bits &&
+        precision(imag(value)) == precision_bits
+end
+
+_exact_factored_value(left, right) =
+    typeof(left) === typeof(right) && isequal(left, right)
+
+function _exact_factored_value(left::T, right::T) where {T<:AbstractFloat}
+    return isequal(left, right) && precision(left) == precision(right)
+end
+
+function _exact_factored_value(
+    left::Complex{T}, right::Complex{T}
+) where {T<:AbstractFloat}
+    return _exact_factored_value(real(left), real(right)) &&
+        _exact_factored_value(imag(left), imag(right))
+end
+
+function _primitive_fields_match_exactly(left::S, right::S) where {S}
+    return all(
+        name -> _exact_factored_value(
+            getfield(left, name), getfield(right, name)
+        ),
+        fieldnames(S),
+    )
+end
+
+_conventions_match_exactly(
+    left::GSNBranchConvention, right::GSNBranchConvention
+) = _primitive_fields_match_exactly(left, right)
+
+_branch_cells_match_exactly(left::GSNBranchCell, right::GSNBranchCell) =
+    _primitive_fields_match_exactly(left, right)
+
+_deformations_match_exactly(
+    left::ContourAngleDeformation, right::ContourAngleDeformation
+) = _primitive_fields_match_exactly(left, right)
+
+_contracts_match_exactly(
+    left::RegularRemainderContract, right::RegularRemainderContract
+) = _primitive_fields_match_exactly(left, right)
+
+_series_keys_match_exactly(left::SeriesKey, right::SeriesKey) =
+    _primitive_fields_match_exactly(left, right)
+
+function _series_evaluations_match_exactly(
+    left::SeriesEvaluation, right::SeriesEvaluation
+)
+    _series_keys_match_exactly(left.key, right.key) || return false
+    return all(
+        name -> name === :key || _exact_factored_value(
+            getfield(left, name), getfield(right, name)
+        ),
+        fieldnames(typeof(left)),
+    )
+end
+
+_endpoint_states_match_exactly(
+    left::FactoredEndpointState, right::FactoredEndpointState
+) = _primitive_fields_match_exactly(left, right)
+
+_regularity_evidence_matches_exactly(
+    left::RemainderRegularityEvidence, right::RemainderRegularityEvidence
+) = _primitive_fields_match_exactly(left, right)
+
+function _carriers_match_exactly(
+    left::PlaneWaveCarrier, right::PlaneWaveCarrier
+)
+    return left.kind === right.kind &&
+        _exact_factored_value(left.wave_number, right.wave_number) &&
+        _exact_factored_value(left.rstar_match, right.rstar_match) &&
+        _exact_factored_value(left.log_at_match, right.log_at_match) &&
+        _exact_factored_value(left.q, right.q) &&
+        _conventions_match_exactly(left.convention, right.convention)
+end
+
+function _factored_initial_conditions_match_exactly(
+    left::FactoredInitialCondition, right::FactoredInitialCondition
+)
+    return _endpoint_states_match_exactly(left.state, right.state) &&
+        _carriers_match_exactly(left.carrier, right.carrier) &&
+        _series_evaluations_match_exactly(left.evaluation, right.evaluation) &&
+        _regularity_evidence_matches_exactly(
+            left.regularity, right.regularity
+        ) &&
+        _contracts_match_exactly(left.contract, right.contract)
+end
+
+_assessments_match_exactly(
+    left::AsymptoticConditioningAssessment,
+    right::AsymptoticConditioningAssessment,
+) = _primitive_fields_match_exactly(left, right)
+
+function _canonical_carrier(
+    spectral::HomogeneousSpectralContext{T},
+    contour::ComplexContourContext{T},
+    kind::CarrierKind,
+) where {T<:AbstractFloat}
+    wave_number = kind === INFINITY_OUTGOING ?
+        spectral.omega : spectral.p_horizon
+    return PlaneWaveCarrier(
+        kind, wave_number, contour.rstar_match, spectral.convention
+    )
+end
+
+function _assert_carrier_provenance(
+    spectral::HomogeneousSpectralContext{T},
+    contour::ComplexContourContext{T},
+    carrier::PlaneWaveCarrier{T},
+    kind::CarrierKind,
+    context::AbstractString,
+) where {T<:AbstractFloat}
+    canonical = _translate_factored_failure(
+        T,
+        spectral.precision_bits,
+        "$context canonical carrier construction";
+        argument_reason=CARRIER_CHANGE_INCONSISTENT,
+    ) do
+        _canonical_carrier(spectral, contour, kind)
+    end
+    _carriers_match_exactly(carrier, canonical) || throw(_factored_error(
+        T,
+        CARRIER_CHANGE_INCONSISTENT,
+        spectral.precision_bits,
+        "$context carrier wave_number, rstar_match, log_at_match, q, kind, " *
+        "or convention differs from the canonical spectral carrier",
+    ))
+    return canonical
+end
+
+function _series_key_matches_spectral(
+    key::SeriesKey,
+    spectral::HomogeneousSpectralContext,
+    family::AsymptoticFamily,
+)
+    return key.s == spectral.s &&
+        key.m == spectral.m &&
+        _exact_factored_value(key.a, spectral.a) &&
+        _exact_factored_value(key.omega, spectral.omega) &&
+        _exact_factored_value(key.lambda, spectral.lambda) &&
+        key.family === family &&
+        key.max_order == spectral.endpoint_order &&
+        key.precision_bits == spectral.precision_bits
+end
+
+function _assert_spectral_context_provenance(
+    spectral::HomogeneousSpectralContext{T},
+) where {T<:AbstractFloat}
+    return _translate_factored_failure(
+        T,
+        spectral.precision_bits,
+        "spectral context provenance",
+    ) do
+        _with_factored_precision(T, spectral.precision_bits) do
+            spectral.precision_digits > 0 || throw(ArgumentError(
+                "spectral precision_digits must be positive"
+            ))
+            spectral.endpoint_order >= 0 || throw(ArgumentError(
+                "spectral endpoint_order must be nonnegative"
+            ))
+            all(
+                value -> _factored_precision_matches(
+                    value, spectral.precision_bits
+                ),
+                (
+                    spectral.a,
+                    spectral.omega,
+                    spectral.lambda,
+                    spectral.p_horizon,
+                ),
+            ) || throw(_factored_error(
+                T,
+                FACTORED_PROPAGATION_PRECISION_MISMATCH,
+                spectral.precision_bits,
+                "spectral context values do not preserve request precision",
+            ))
+            isfinite(spectral.a) &&
+                _finite_factored_complex(spectral.omega) &&
+                _finite_factored_complex(spectral.lambda) &&
+                _finite_factored_complex(spectral.p_horizon) ||
+                throw(ArgumentError("spectral context values must be finite"))
+            iszero(spectral.omega) && throw(_factored_error(
+                T,
+                PHYSICAL_SINGULAR_LIMIT,
+                spectral.precision_bits,
+                "omega=0 is a physical singular limit of the selected " *
+                "infinity plane-wave representation",
+            ))
+            geometry = stable_horizon_geometry(spectral.a)
+            canonical_p_horizon = spectral.omega -
+                T(spectral.m) * geometry.omega_horizon
+            iszero(canonical_p_horizon) && throw(_factored_error(
+                T,
+                PHYSICAL_SINGULAR_LIMIT,
+                spectral.precision_bits,
+                "p_horizon=0 is a physical coalescence of the horizon carriers",
+            ))
+            _exact_factored_value(
+                spectral.p_horizon, canonical_p_horizon
+            ) || throw(ArgumentError(
+                "spectral p_horizon does not reproduce from a, m, and omega"
+            ))
+            canonical_convention = gsn_branch_convention(
+                spectral.omega, canonical_p_horizon
+            )
+            _conventions_match_exactly(
+                spectral.convention, canonical_convention
+            ) || throw(ArgumentError(
+                "spectral convention does not reproduce from its wave numbers"
+            ))
+            assert_no_branch_crossing(
+                spectral.frozen_convention, canonical_convention
+            )
+            canonical_branch_cell = branch_cell(spectral.frozen_convention)
+            _branch_cells_match_exactly(
+                spectral.frozen_branch_cell, canonical_branch_cell
+            ) || throw(ArgumentError(
+                "spectral frozen branch cell does not reproduce"
+            ))
+            raw_deformation = contour_angle_deformation(
+                spectral.frozen_convention, canonical_convention
+            )
+            canonical_deformation = ContourAngleDeformation{T}(
+                T(raw_deformation.infinity_delta),
+                T(raw_deformation.horizon_delta),
+                max(
+                    abs(T(raw_deformation.infinity_delta)),
+                    abs(T(raw_deformation.horizon_delta)),
+                ),
+            )
+            _deformations_match_exactly(
+                spectral.contour_deformation, canonical_deformation
+            ) || throw(ArgumentError(
+                "spectral contour deformation does not reproduce"
+            ))
+            _contracts_match_exactly(
+                spectral.contract, RegularRemainderContract()
+            ) || throw(ArgumentError(
+                "spectral regular-remainder contract is not canonical"
+            ))
+            expected_families = (
+                INFINITY_INGOING_SERIES,
+                INFINITY_OUTGOING_SERIES,
+                HORIZON_INGOING_SERIES,
+                HORIZON_OUTGOING_SERIES,
+            )
+            actual_series = (
+                spectral.series.infinity_ingoing,
+                spectral.series.infinity_outgoing,
+                spectral.series.horizon_ingoing,
+                spectral.series.horizon_outgoing,
+            )
+            all(
+                index -> _series_key_matches_spectral(
+                    actual_series[index].key,
+                    spectral,
+                    expected_families[index],
+                ),
+                eachindex(actual_series),
+            ) || throw(ArgumentError(
+                "spectral asymptotic-series keys do not match their context"
+            ))
+            return nothing
+        end
+    end
+end
+
+function _assert_contour_context_provenance(
+    spectral::HomogeneousSpectralContext{T},
+    contour::ComplexContourContext{T},
+) where {T<:AbstractFloat}
+    _assert_spectral_context_provenance(spectral)
+    return _translate_factored_failure(
+        T,
+        spectral.precision_bits,
+        "contour context provenance";
+        argument_reason=CARRIER_CHANGE_INCONSISTENT,
+    ) do
+        _with_factored_precision(T, spectral.precision_bits) do
+            contour.precision_bits == spectral.precision_bits || throw(
+                _factored_error(
+                    T,
+                    FACTORED_PROPAGATION_PRECISION_MISMATCH,
+                    spectral.precision_bits,
+                    "contour and spectral precision bits differ",
+                )
+            )
+            all(
+                value -> _factored_precision_matches(
+                    value, spectral.precision_bits
+                ),
+                (
+                    contour.match_radius,
+                    contour.rstar_match,
+                    contour.rho_in,
+                    contour.rho_out,
+                    contour.infinity_contour_angle,
+                    contour.horizon_contour_angle,
+                    contour.infinity_tangent,
+                    contour.horizon_tangent,
+                ),
+            ) || throw(_factored_error(
+                T,
+                FACTORED_PROPAGATION_PRECISION_MISMATCH,
+                spectral.precision_bits,
+                "contour context values do not preserve request precision",
+            ))
+            _conventions_match_exactly(
+                contour.convention, spectral.convention
+            ) || throw(ArgumentError(
+                "contour and spectral conventions differ"
+            ))
+            _branch_cells_match_exactly(
+                contour.frozen_branch_cell, spectral.frozen_branch_cell
+            ) || throw(ArgumentError(
+                "contour and spectral frozen branch cells differ"
+            ))
+            _deformations_match_exactly(
+                contour.contour_deformation, spectral.contour_deformation
+            ) || throw(ArgumentError(
+                "contour and spectral deformations differ"
+            ))
+            _exact_factored_value(
+                contour.infinity_contour_angle,
+                spectral.convention.infinity_contour_angle,
+            ) && _exact_factored_value(
+                contour.horizon_contour_angle,
+                spectral.convention.horizon_contour_angle,
+            ) && contour.infinity_sign == spectral.convention.infinity_sign &&
+                contour.horizon_sign == spectral.convention.horizon_sign ||
+                throw(ArgumentError(
+                    "contour angles or signs differ from the sample convention"
+                ))
+            canonical_infinity_tangent = Complex{T}(
+                infinity_contour_tangent(spectral.convention)
+            )
+            canonical_horizon_tangent = Complex{T}(
+                horizon_contour_tangent(spectral.convention)
+            )
+            _exact_factored_value(
+                contour.infinity_tangent, canonical_infinity_tangent
+            ) && _exact_factored_value(
+                contour.horizon_tangent, canonical_horizon_tangent
+            ) || throw(ArgumentError(
+                "contour tangents do not reproduce from the sample convention"
+            ))
+            canonical_rstar_match = T(rstar_from_r(
+                spectral.a, contour.match_radius
+            ))
+            _exact_factored_value(
+                contour.rstar_match, canonical_rstar_match
+            ) || throw(ArgumentError(
+                "rstar_match does not reproduce from a and match_radius"
+            ))
+            raw_match_radius = contour.radius_from_rho(zero(T))
+            (raw_match_radius isa T || raw_match_radius isa Complex{T}) ||
+                throw(_factored_error(
+                    T,
+                    FACTORED_PROPAGATION_PRECISION_MISMATCH,
+                    spectral.precision_bits,
+                    "radius_from_rho changed the contour component type",
+                ))
+            typed_match_radius = Complex{T}(raw_match_radius)
+            _factored_precision_matches(
+                typed_match_radius, spectral.precision_bits
+            ) || throw(_factored_error(
+                T,
+                FACTORED_PROPAGATION_PRECISION_MISMATCH,
+                spectral.precision_bits,
+                "radius_from_rho narrowed the match-radius precision",
+            ))
+            match_radius_tolerance = T(256) * eps(T) *
+                max(one(T), abs(contour.match_radius))
+            abs(
+                typed_match_radius -
+                complex(contour.match_radius, zero(T))
+            ) <= match_radius_tolerance || throw(ArgumentError(
+                "radius_from_rho(0) does not reproduce match_radius"
+            ))
+            return nothing
+        end
+    end
+end
+
+function _branch_series(
+    series::AsymptoticSeriesBundle, branch::CarrierKind
+)
+    if branch === INFINITY_OUTGOING
+        return series.infinity_outgoing
+    elseif branch === HORIZON_INGOING
+        return series.horizon_ingoing
+    elseif branch === HORIZON_OUTGOING
+        return series.horizon_outgoing
+    end
+    throw(ArgumentError("unsupported factored branch"))
+end
+
+function _branch_tangent(
+    contour::ComplexContourContext, branch::CarrierKind
+)
+    return branch === INFINITY_OUTGOING ?
+        contour.infinity_tangent : contour.horizon_tangent
+end
+
+function _factored_default_tolerance(::Type{T}) where {T<:AbstractFloat}
+    return one(T) / T(10)^12
+end
+
+function _resolve_factored_tolerance(
+    ::Type{T},
+    precision_bits::Int,
+    value::Union{Nothing,T},
+    name::AbstractString,
+) where {T<:AbstractFloat}
+    return _with_factored_precision(T, precision_bits) do
+        resolved = value === nothing ? _factored_default_tolerance(T) : value
+        _factored_precision_matches(resolved, precision_bits) || throw(
+            _factored_error(
+                T,
+                FACTORED_PROPAGATION_PRECISION_MISMATCH,
+                precision_bits,
+                "$name does not preserve the context precision",
+            )
+        )
+        resolved
+    end
+end
+
+function build_homogeneous_spectral_context(
+    s::Int,
+    m::Int,
+    a::T,
+    omega::Complex{T},
+    lambda::Complex{T},
+    precision_digits::Int,
+    precision_bits::Int,
+    endpoint_order::Int,
+    frozen_convention::GSNBranchConvention{T},
+) where {T<:AbstractFloat}
+    return _translate_factored_failure(
+        T, precision_bits, "homogeneous spectral context construction"
+    ) do
+        precision_digits > 0 || throw(ArgumentError(
+            "precision_digits must be positive"
+        ))
+        precision_bits > 0 || throw(ArgumentError(
+            "precision_bits must be positive"
+        ))
+        endpoint_order >= 0 || throw(ArgumentError(
+            "endpoint_order must be nonnegative"
+        ))
+        _factored_precision_matches(a, precision_bits) &&
+            _factored_precision_matches(omega, precision_bits) &&
+            _factored_precision_matches(lambda, precision_bits) ||
+            throw(ArgumentError(
+                "spectral values do not share the requested precision"
+            ))
+        isfinite(a) && _finite_factored_complex(omega) &&
+            _finite_factored_complex(lambda) || throw(ArgumentError(
+                "spectral values must be finite"
+            ))
+        frozen_numeric_fields = (
+            frozen_convention.infinity_contour_angle,
+            frozen_convention.horizon_contour_angle,
+            frozen_convention.omega_argument,
+            frozen_convention.p_horizon_argument,
+        )
+        all(isfinite, frozen_numeric_fields) || throw(ArgumentError(
+            "frozen convention numeric fields must be finite"
+        ))
+        all(
+            value -> _factored_precision_matches(value, precision_bits),
+            frozen_numeric_fields,
+        ) || throw(ArgumentError(
+            "frozen convention does not preserve the requested precision"
+        ))
+        _with_factored_precision(T, precision_bits) do
+            iszero(omega) && throw(_factored_error(
+                T,
+                PHYSICAL_SINGULAR_LIMIT,
+                precision_bits,
+                "omega=0 is a physical singular limit of the selected " *
+                "infinity plane-wave representation",
+            ))
+            geometry = stable_horizon_geometry(a)
+            p_horizon = omega - T(m) * geometry.omega_horizon
+            _finite_factored_complex(p_horizon) || throw(ArgumentError(
+                "horizon wave number must be finite"
+            ))
+            iszero(p_horizon) && throw(_factored_error(
+                T,
+                PHYSICAL_SINGULAR_LIMIT,
+                precision_bits,
+                "p_horizon=0 is a physical coalescence of the horizon carriers",
+            ))
+            convention = gsn_branch_convention(omega, p_horizon)
+            deltas = try
+                assert_no_branch_crossing(frozen_convention, convention)
+                contour_angle_deformation(frozen_convention, convention)
+            catch error
+                error isa ArgumentError || rethrow()
+                throw(_factored_error(
+                    T,
+                    CARRIER_CHANGE_INCONSISTENT,
+                    precision_bits,
+                    "sample convention crosses the frozen branch cell: " *
+                    sprint(showerror, error),
+                ))
+            end
+            deformation = ContourAngleDeformation{T}(
+                T(deltas.infinity_delta),
+                T(deltas.horizon_delta),
+                max(
+                    abs(T(deltas.infinity_delta)),
+                    abs(T(deltas.horizon_delta)),
+                ),
+            )
+            series = build_asymptotic_series_bundle(
+                s,
+                m,
+                a,
+                omega,
+                lambda,
+                endpoint_order;
+                precision_bits=precision_bits,
+            )
+            return HomogeneousSpectralContext{T}(
+                s,
+                m,
+                a,
+                omega,
+                lambda,
+                p_horizon,
+                precision_digits,
+                precision_bits,
+                endpoint_order,
+                series,
+                RegularRemainderContract(),
+                convention,
+                frozen_convention,
+                branch_cell(frozen_convention),
+                deformation,
+            )
+        end
+    end
+end
+
+function build_contour_context(
+    spectral::HomogeneousSpectralContext{T},
+    match_radius::T,
+    rstar_match::T,
+    rho_in::T,
+    rho_out::T,
+    radius_from_rho::F,
+) where {T<:AbstractFloat,F}
+    return _translate_factored_failure(
+        T,
+        spectral.precision_bits,
+        "contour context construction",
+    ) do
+        _with_factored_precision(T, spectral.precision_bits) do
+            _assert_spectral_context_provenance(spectral)
+            all(isfinite, (match_radius, rstar_match, rho_in, rho_out)) ||
+                throw(ArgumentError("contour scalars must be finite"))
+            all(
+                value -> _factored_precision_matches(
+                    value, spectral.precision_bits
+                ),
+                (match_radius, rstar_match, rho_in, rho_out),
+            ) || throw(ArgumentError(
+                "contour scalars do not preserve the spectral precision"
+            ))
+            rho_in < zero(T) < rho_out || throw(ArgumentError(
+                "contour endpoints must satisfy rho_in < 0 < rho_out"
+            ))
+            geometry = stable_horizon_geometry(spectral.a)
+            match_radius > geometry.rplus || throw(ArgumentError(
+                "match radius must lie outside the outer horizon"
+            ))
+            canonical_rstar_match = T(rstar_from_r(
+                spectral.a, match_radius
+            ))
+            _factored_precision_matches(
+                canonical_rstar_match, spectral.precision_bits
+            ) || throw(ArgumentError(
+                "canonical rstar_match does not preserve spectral precision"
+            ))
+            _exact_factored_value(
+                rstar_match, canonical_rstar_match
+            ) || throw(ArgumentError(
+                "rstar_match must equal Coordinates.rstar_from_r(a, match_radius)"
+            ))
+            raw_match_radius = radius_from_rho(zero(match_radius))
+            (raw_match_radius isa T || raw_match_radius isa Complex{T}) ||
+                throw(ArgumentError(
+                    "radius_from_rho must preserve the context component type"
+                ))
+            typed_match_radius = Complex{T}(raw_match_radius)
+            _factored_precision_matches(
+                typed_match_radius, spectral.precision_bits
+            ) || throw(ArgumentError(
+                "radius_from_rho narrowed the match-radius precision"
+            ))
+            _finite_factored_complex(typed_match_radius) ||
+                throw(ArgumentError(
+                    "radius_from_rho returned a nonfinite match radius"
+                ))
+            match_radius_tolerance = T(256) * eps(T) *
+                max(one(T), abs(match_radius))
+            abs(
+                typed_match_radius - complex(match_radius, zero(T))
+            ) <= match_radius_tolerance || throw(ArgumentError(
+                "radius_from_rho(0) does not reproduce match_radius"
+            ))
+            assert_no_branch_crossing(
+                spectral.frozen_convention, spectral.convention
+            )
+            infinity_tangent = Complex{T}(
+                infinity_contour_tangent(spectral.convention)
+            )
+            horizon_tangent = Complex{T}(
+                horizon_contour_tangent(spectral.convention)
+            )
+            _factored_precision_matches(
+                infinity_tangent, spectral.precision_bits
+            ) && _factored_precision_matches(
+                horizon_tangent, spectral.precision_bits
+            ) || throw(ArgumentError(
+                "contour tangents do not preserve spectral precision"
+            ))
+            _finite_factored_complex(infinity_tangent) &&
+                _finite_factored_complex(horizon_tangent) &&
+                !iszero(infinity_tangent) && !iszero(horizon_tangent) ||
+                throw(ArgumentError(
+                    "contour tangents must be finite and nonzero"
+                ))
+            return ComplexContourContext{T,F}(
+                match_radius,
+                canonical_rstar_match,
+                rho_in,
+                rho_out,
+                spectral.precision_bits,
+                spectral.convention.infinity_contour_angle,
+                spectral.convention.horizon_contour_angle,
+                spectral.convention.infinity_sign,
+                spectral.convention.horizon_sign,
+                infinity_tangent,
+                horizon_tangent,
+                radius_from_rho,
+                spectral.convention,
+                spectral.frozen_branch_cell,
+                spectral.contour_deformation,
+            )
+        end
+    end
+end
+
+function _build_factored_initial_condition(
+    spectral::HomogeneousSpectralContext{T},
+    contour::ComplexContourContext{T},
+    branch::CarrierKind,
+) where {T<:AbstractFloat}
+    series = _branch_series(spectral.series, branch)
+    if branch === INFINITY_OUTGOING
+        return factored_infinity_outgoing_initialconditions(
+            series,
+            contour.rho_out,
+            contour.rstar_match,
+            contour.radius_from_rho,
+            spectral.convention,
+            spectral.contract;
+            order=spectral.endpoint_order,
+        )
+    elseif branch === HORIZON_INGOING
+        return factored_horizon_ingoing_initialconditions(
+            series,
+            contour.rho_in,
+            contour.rstar_match,
+            contour.radius_from_rho,
+            spectral.convention,
+            spectral.contract;
+            order=spectral.endpoint_order,
+        )
+    elseif branch === HORIZON_OUTGOING
+        return factored_horizon_outgoing_initialconditions(
+            series,
+            contour.rho_in,
+            contour.rstar_match,
+            contour.radius_from_rho,
+            spectral.convention,
+            spectral.contract;
+            order=spectral.endpoint_order,
+        )
+    end
+    throw(ArgumentError("unsupported factored endpoint branch"))
+end
+
+function _prepare_factored_endpoint(
+    spectral::HomogeneousSpectralContext{T},
+    contour::ComplexContourContext{T},
+    branch::CarrierKind,
+    required_digits::T,
+) where {T<:AbstractFloat}
+    return _translate_factored_failure(
+        T,
+        spectral.precision_bits,
+        "factored endpoint preparation",
+    ) do
+        _with_factored_precision(T, spectral.precision_bits) do
+            _factored_precision_matches(
+                required_digits, spectral.precision_bits
+            ) || throw(_factored_error(
+                T,
+                FACTORED_PROPAGATION_PRECISION_MISMATCH,
+                spectral.precision_bits,
+                "required reliable digits do not preserve request precision",
+            ))
+            isfinite(required_digits) && required_digits >= zero(T) ||
+                throw(ArgumentError(
+                    "required reliable digits must be finite and nonnegative"
+                ))
+            _assert_contour_context_provenance(spectral, contour)
+            series = _branch_series(spectral.series, branch)
+            initial_condition = _build_factored_initial_condition(
+                spectral, contour, branch
+            )
+            initial_condition.regularity.finite || throw(ArgumentError(
+                "regular-remainder endpoint evidence is not finite"
+            ))
+            assessment = assess_asymptotic_preflight(
+                series, initial_condition.evaluation, required_digits
+            )
+            return FactoredEndpointPreparation{T}(
+                branch,
+                initial_condition,
+                assessment,
+                required_digits,
+                spectral.precision_bits,
+                spectral.endpoint_order,
+                spectral.frozen_branch_cell,
+                spectral.contour_deformation,
+            )
+        end
+    end
+end
+
+function prepare_factored_infinity_outgoing(
+    spectral::HomogeneousSpectralContext{T},
+    contour::ComplexContourContext{T},
+    required_digits::T,
+) where {T<:AbstractFloat}
+    return _prepare_factored_endpoint(
+        spectral, contour, INFINITY_OUTGOING, required_digits
+    )
+end
+
+function prepare_factored_horizon_ingoing(
+    spectral::HomogeneousSpectralContext{T},
+    contour::ComplexContourContext{T},
+    required_digits::T,
+) where {T<:AbstractFloat}
+    return _prepare_factored_endpoint(
+        spectral, contour, HORIZON_INGOING, required_digits
+    )
+end
+
+function prepare_factored_horizon_outgoing(
+    spectral::HomogeneousSpectralContext{T},
+    contour::ComplexContourContext{T},
+    required_digits::T,
+) where {T<:AbstractFloat}
+    return _prepare_factored_endpoint(
+        spectral, contour, HORIZON_OUTGOING, required_digits
+    )
+end
+
+function prepare_factored_horizon_determinant_branches(
+    spectral::HomogeneousSpectralContext{T},
+    contour::ComplexContourContext{T},
+    required_digits::T,
+) where {T<:AbstractFloat}
+    infinity_outgoing = prepare_factored_infinity_outgoing(
+        spectral, contour, required_digits
+    )
+    horizon_ingoing = prepare_factored_horizon_ingoing(
+        spectral, contour, required_digits
+    )
+    horizon_outgoing = prepare_factored_horizon_outgoing(
+        spectral, contour, required_digits
+    )
+    return HorizonDeterminantPreparation{T}(
+        infinity_outgoing, horizon_ingoing, horizon_outgoing
+    )
+end
+
+function prepare_factored_exterior_determinant_branches(
+    spectral::HomogeneousSpectralContext{T},
+    contour::ComplexContourContext{T},
+    required_digits::T,
+) where {T<:AbstractFloat}
+    horizon_ingoing = prepare_factored_horizon_ingoing(
+        spectral, contour, required_digits
+    )
+    infinity_outgoing = prepare_factored_infinity_outgoing(
+        spectral, contour, required_digits
+    )
+    return ExteriorDeterminantPreparation{T}(
+        horizon_ingoing, infinity_outgoing
+    )
+end
+
+function _assert_factored_preflight_adequate(
+    preparation::FactoredEndpointPreparation{T}
+) where {T<:AbstractFloat}
+    preparation.assessment.adequate || throw(_factored_error(
+        T,
+        INSUFFICIENT_ASYMPTOTIC_PRECISION,
+        preparation.precision_bits,
+        "asymptotic construction cannot supply the required reliable digits";
+        assessment=preparation.assessment,
+        factored_homogeneous_rhs_evaluations=0,
+    ))
+    return preparation
+end
+
+function assert_factored_preflights_adequate(
+    preparations::FactoredEndpointPreparation...
+)
+    for preparation in preparations
+        _assert_factored_preflight_adequate(preparation)
+    end
+    return preparations
+end
+
+function assert_factored_preflights_adequate(
+    preparation::HorizonDeterminantPreparation
+)
+    return assert_factored_preflights_adequate(
+        preparation.infinity_outgoing,
+        preparation.horizon_ingoing,
+        preparation.horizon_outgoing,
+    )
+end
+
+function assert_factored_preflights_adequate(
+    preparation::ExteriorDeterminantPreparation
+)
+    return assert_factored_preflights_adequate(
+        preparation.horizon_ingoing, preparation.infinity_outgoing
+    )
+end
+
+function _assert_preparation_provenance(
+    spectral::HomogeneousSpectralContext{T},
+    contour::ComplexContourContext{T},
+    preparation::FactoredEndpointPreparation{T},
+) where {T<:AbstractFloat}
+    return _translate_factored_failure(
+        T,
+        spectral.precision_bits,
+        "prepared endpoint provenance",
+    ) do
+        _with_factored_precision(T, spectral.precision_bits) do
+            _assert_contour_context_provenance(spectral, contour)
+            preparation.precision_bits == spectral.precision_bits || throw(
+                _factored_error(
+                    T,
+                    FACTORED_PROPAGATION_PRECISION_MISMATCH,
+                    spectral.precision_bits,
+                    "prepared endpoint precision differs from spectral context",
+                )
+            )
+            _factored_precision_matches(
+                preparation.required_digits, spectral.precision_bits
+            ) || throw(_factored_error(
+                T,
+                FACTORED_PROPAGATION_PRECISION_MISMATCH,
+                spectral.precision_bits,
+                "prepared required_digits do not preserve request precision",
+            ))
+            preparation.endpoint_order == spectral.endpoint_order || throw(
+                _factored_error(
+                    T,
+                    INVALID_FACTORED_PROPAGATION_INPUT,
+                    spectral.precision_bits,
+                    "prepared endpoint order differs from spectral context",
+                )
+            )
+            _branch_cells_match_exactly(
+                preparation.frozen_branch_cell,
+                spectral.frozen_branch_cell,
+            ) && _branch_cells_match_exactly(
+                preparation.frozen_branch_cell,
+                contour.frozen_branch_cell,
+            ) || throw(_factored_error(
+                T,
+                CARRIER_CHANGE_INCONSISTENT,
+                spectral.precision_bits,
+                "prepared, spectral, and contour branch cells differ",
+            ))
+            _deformations_match_exactly(
+                preparation.contour_deformation,
+                spectral.contour_deformation,
+            ) && _deformations_match_exactly(
+                preparation.contour_deformation,
+                contour.contour_deformation,
+            ) || throw(_factored_error(
+                T,
+                CARRIER_CHANGE_INCONSISTENT,
+                spectral.precision_bits,
+                "prepared, spectral, and contour deformations differ",
+            ))
+            expected_initial_condition = _build_factored_initial_condition(
+                spectral, contour, preparation.branch
+            )
+            _factored_initial_conditions_match_exactly(
+                preparation.initial_condition, expected_initial_condition
+            ) || throw(_factored_error(
+                T,
+                INVALID_FACTORED_PROPAGATION_INPUT,
+                spectral.precision_bits,
+                "prepared factored initial condition does not reproduce exactly",
+            ))
+            _assert_carrier_provenance(
+                spectral,
+                contour,
+                preparation.initial_condition.carrier,
+                preparation.branch,
+                "prepared endpoint",
+            )
+            series = _branch_series(spectral.series, preparation.branch)
+            refreshed = assess_asymptotic_preflight(
+                series,
+                expected_initial_condition.evaluation,
+                preparation.required_digits,
+            )
+            _assessments_match_exactly(
+                refreshed, preparation.assessment
+            ) || throw(_factored_error(
+                T,
+                INVALID_FACTORED_PROPAGATION_INPUT,
+                spectral.precision_bits,
+                "prepared asymptotic assessment does not reproduce exactly",
+            ))
+            return nothing
+        end
+    end
+end
+
+function _assert_horizon_preparation_provenance(
+    spectral::HomogeneousSpectralContext{T},
+    contour::ComplexContourContext{T},
+    preparations::HorizonDeterminantPreparation{T},
+) where {T<:AbstractFloat}
+    _assert_preparation_provenance(
+        spectral, contour, preparations.infinity_outgoing
+    )
+    _assert_preparation_provenance(
+        spectral, contour, preparations.horizon_ingoing
+    )
+    _assert_preparation_provenance(
+        spectral, contour, preparations.horizon_outgoing
+    )
+    preparations.infinity_outgoing.branch === INFINITY_OUTGOING &&
+        preparations.horizon_ingoing.branch === HORIZON_INGOING &&
+        preparations.horizon_outgoing.branch === HORIZON_OUTGOING ||
+        throw(_factored_error(
+            T,
+            INVALID_FACTORED_PROPAGATION_INPUT,
+            spectral.precision_bits,
+            "horizon determinant preparation branch slots are not canonical",
+        ))
+    return nothing
+end
+
+function _assert_exterior_preparation_provenance(
+    spectral::HomogeneousSpectralContext{T},
+    contour::ComplexContourContext{T},
+    preparations::ExteriorDeterminantPreparation{T},
+) where {T<:AbstractFloat}
+    _assert_preparation_provenance(
+        spectral, contour, preparations.horizon_ingoing
+    )
+    _assert_preparation_provenance(
+        spectral, contour, preparations.infinity_outgoing
+    )
+    preparations.horizon_ingoing.branch === HORIZON_INGOING &&
+        preparations.infinity_outgoing.branch === INFINITY_OUTGOING ||
+        throw(_factored_error(
+            T,
+            INVALID_FACTORED_PROPAGATION_INPUT,
+            spectral.precision_bits,
+            "exterior determinant preparation branch slots are not canonical",
+        ))
+    return nothing
+end
+
+function assert_factored_exterior_preparations_ready(
+    spectral::HomogeneousSpectralContext{T},
+    horizon_contour::ComplexContourContext{T},
+    horizon_ingoing::FactoredEndpointPreparation{T},
+    infinity_contour::ComplexContourContext{T},
+    infinity_outgoing::FactoredEndpointPreparation{T},
+) where {T<:AbstractFloat}
+    _assert_preparation_provenance(
+        spectral, horizon_contour, horizon_ingoing
+    )
+    _assert_preparation_provenance(
+        spectral, infinity_contour, infinity_outgoing
+    )
+    horizon_ingoing.branch === HORIZON_INGOING &&
+        infinity_outgoing.branch === INFINITY_OUTGOING || throw(
+            _factored_error(
+                T,
+                INVALID_FACTORED_PROPAGATION_INPUT,
+                spectral.precision_bits,
+                "exterior endpoint branch slots are not canonical",
+            )
+        )
+    assert_factored_preflights_adequate(
+        horizon_ingoing, infinity_outgoing
+    )
+    return nothing
+end
+
+function _factored_transformed_rhs_second(
+    Y::Complex{T},
+    Yrho::Complex{T},
+    F_rho::Complex{T},
+    U_rho::Complex{T},
+    q::Complex{T},
+    q_rho::Complex{T},
+)::Complex{T} where {T<:AbstractFloat}
+    return (F_rho - 2 * q) * Yrho +
+        (U_rho + F_rho * q - q_rho - q^2) * Y
+end
+
+function factored_GSN_linear_eqn!(du, state, parameters, rho)
+    factored_homogeneous_rhs_evaluations =
+        parameters.factored_homogeneous_rhs_evaluations
+    factored_homogeneous_rhs_evaluations[] += 1
+    T = typeof(parameters.a)
+    rhs_count = _factored_rhs_evaluation_count(parameters)
+    return _translate_factored_failure(
+        T,
+        parameters.precision_bits,
+        "factored homogeneous RHS";
+        factored_homogeneous_rhs_evaluations=rhs_count,
+    ) do
+        _with_factored_precision(T, parameters.precision_bits) do
+            length(state) == 2 && length(du) == 2 || throw(ArgumentError(
+                "factored homogeneous state and derivative must have length two"
+            ))
+            rho isa T && _factored_precision_matches(
+                rho, parameters.precision_bits
+            ) || throw(_factored_error(
+                T,
+                FACTORED_PROPAGATION_PRECISION_MISMATCH,
+                parameters.precision_bits,
+                "RHS rho does not preserve request precision";
+                factored_homogeneous_rhs_evaluations=rhs_count,
+            ))
+            isfinite(rho) || throw(_factored_error(
+                T,
+                NONFINITE_FACTORED_PROPAGATION_DATA,
+                parameters.precision_bits,
+                "RHS rho is nonfinite";
+                factored_homogeneous_rhs_evaluations=rhs_count,
+            ))
+            all(
+                value -> value isa Complex{T} &&
+                    _factored_precision_matches(
+                        value, parameters.precision_bits
+                    ),
+                state,
+            ) || throw(_factored_error(
+                T,
+                FACTORED_PROPAGATION_PRECISION_MISMATCH,
+                parameters.precision_bits,
+                "factored RHS state narrowed or changed component type";
+                factored_homogeneous_rhs_evaluations=rhs_count,
+            ))
+            all(_finite_factored_complex, state) || throw(_factored_error(
+                T,
+                NONFINITE_FACTORED_PROPAGATION_DATA,
+                parameters.precision_bits,
+                "factored RHS state is nonfinite";
+                factored_homogeneous_rhs_evaluations=rhs_count,
+            ))
+            raw_r = parameters.radius_from_rho(rho)
+            (raw_r isa T || raw_r isa Complex{T}) || throw(
+                _factored_error(
+                    T,
+                    FACTORED_PROPAGATION_PRECISION_MISMATCH,
+                    parameters.precision_bits,
+                    "radius_from_rho narrowed or changed the RHS component type";
+                    factored_homogeneous_rhs_evaluations=rhs_count,
+                )
+            )
+            r = Complex{T}(raw_r)
+            _factored_precision_matches(r, parameters.precision_bits) || throw(
+                _factored_error(
+                    T,
+                    FACTORED_PROPAGATION_PRECISION_MISMATCH,
+                    parameters.precision_bits,
+                    "radius_from_rho narrowed RHS precision";
+                    factored_homogeneous_rhs_evaluations=rhs_count,
+                )
+            )
+            _finite_factored_complex(r) || throw(_factored_error(
+                T,
+                NONFINITE_FACTORED_PROPAGATION_DATA,
+                parameters.precision_bits,
+                "radius_from_rho returned nonfinite RHS geometry";
+                factored_homogeneous_rhs_evaluations=rhs_count,
+            ))
+            F_rho = parameters.tangent * sF(
+                parameters.s,
+                parameters.m,
+                parameters.a,
+                parameters.omega,
+                parameters.lambda,
+                r,
+            )
+            U_rho = parameters.tangent^2 * sU(
+                parameters.s,
+                parameters.m,
+                parameters.a,
+                parameters.omega,
+                parameters.lambda,
+                r,
+            )
+            q = carrier_log_derivative(parameters.carrier)
+            q_rho = carrier_log_derivative_derivative(parameters.carrier)
+            _finite_factored_complex(F_rho) &&
+                _finite_factored_complex(U_rho) &&
+                _finite_factored_complex(q) &&
+                _finite_factored_complex(q_rho) || throw(_factored_error(
+                    T,
+                    NONFINITE_FACTORED_PROPAGATION_DATA,
+                    parameters.precision_bits,
+                    "factored RHS coefficient is nonfinite";
+                    factored_homogeneous_rhs_evaluations=rhs_count,
+                ))
+            iszero(q_rho) || throw(_factored_error(
+                T,
+                INVALID_FACTORED_PROPAGATION_INPUT,
+                parameters.precision_bits,
+                "production plane-wave carrier must have q_rho=0";
+                factored_homogeneous_rhs_evaluations=rhs_count,
+            ))
+            du[1] = state[2]
+            du[2] = _factored_transformed_rhs_second(
+                state[1], state[2], F_rho, U_rho, q, q_rho
+            )
+            du[1] isa Complex{T} && du[2] isa Complex{T} &&
+                _finite_factored_complex(du[1]) &&
+                _finite_factored_complex(du[2]) || throw(_factored_error(
+                    T,
+                    NONFINITE_FACTORED_PROPAGATION_DATA,
+                    parameters.precision_bits,
+                    "factored RHS derivative is nonfinite or narrowed";
+                    factored_homogeneous_rhs_evaluations=rhs_count,
+                ))
+            return nothing
+        end
+    end
+end
+
+function _factored_internal_callback(
+    accumulator::_FactoredDiagnosticAccumulator{T},
+    carrier::PlaneWaveCarrier{T},
+) where {T<:AbstractFloat}
+    condition = (_state, _rho, _integrator) -> true
+    affect! = integrator -> begin
+        try
+            state_norm = hypot(abs(integrator.u[1]), abs(integrator.u[2]))
+            absolute_real_carrier_log = abs(real(carrier_log(
+                carrier, integrator.t
+            )))
+            isfinite(state_norm) && isfinite(absolute_real_carrier_log) ||
+                throw(ArgumentError(
+                    "factored ODE diagnostics became nonfinite"
+                ))
+            accumulator.accepted_steps += 1
+            accumulator.maximum_remainder_state_norm = max(
+                accumulator.maximum_remainder_state_norm, state_norm
+            )
+            accumulator.minimum_remainder_state_norm = min(
+                accumulator.minimum_remainder_state_norm, state_norm
+            )
+            accumulator.maximum_absolute_real_carrier_log = max(
+                accumulator.maximum_absolute_real_carrier_log,
+                absolute_real_carrier_log,
+            )
+        finally
+            DifferentialEquations.SciMLBase.u_modified!(integrator, false)
+        end
+        nothing
+    end
+    return DiscreteCallback(
+        condition, affect!; save_positions=(false, false)
+    )
+end
+
+function _combine_factored_callbacks(external_callback, internal_callback)
+    external_callback === nothing && return internal_callback
+    internal_callback === nothing && return external_callback
+    return CallbackSet(external_callback, internal_callback)
+end
+
+function _assert_factored_ode_solution_provenance(
+    spectral::HomogeneousSpectralContext{T},
+    contour::ComplexContourContext{T},
+    propagated::FactoredODESolution{T},
+    expected_branch::CarrierKind,
+    expected_rho::T,
+) where {T<:AbstractFloat}
+    _assert_contour_context_provenance(spectral, contour)
+    _assert_carrier_provenance(
+        spectral,
+        contour,
+        propagated.carrier,
+        expected_branch,
+        "propagated factored endpoint",
+    )
+    _exact_factored_value(
+        propagated.endpoint_rho, expected_rho
+    ) || throw(_factored_error(
+        T,
+        CARRIER_CHANGE_INCONSISTENT,
+        spectral.precision_bits,
+        "propagated endpoint rho differs from the requested match point",
+    ))
+    _finite_factored_complex(propagated.endpoint.Y) &&
+        _finite_factored_complex(propagated.endpoint.Yrho) || throw(
+            _factored_error(
+                T,
+                NONFINITE_FACTORED_PROPAGATION_DATA,
+                spectral.precision_bits,
+                "propagated factored endpoint is nonfinite",
+            )
+        )
+    diagnostics = propagated.diagnostics
+    diagnostics.branch === expected_branch &&
+        diagnostics.representation_id == HOMOGENEOUS_REPRESENTATION_ID &&
+        diagnostics.ode_scope_id == FACTORED_HOMOGENEOUS_ODE_SCOPE_ID &&
+        diagnostics.precision_bits == spectral.precision_bits &&
+        diagnostics.factored_homogeneous_rhs_evaluations >= 0 &&
+        diagnostics.endpoint_only_saved_points == 1 &&
+        _conventions_match_exactly(
+            diagnostics.convention, spectral.convention
+        ) && _branch_cells_match_exactly(
+            diagnostics.frozen_branch_cell, spectral.frozen_branch_cell
+        ) && _deformations_match_exactly(
+            diagnostics.contour_deformation, spectral.contour_deformation
+        ) || throw(_factored_error(
+            T,
+            CARRIER_CHANGE_INCONSISTENT,
+            spectral.precision_bits,
+            "propagated endpoint diagnostics do not authenticate to the sample",
+        ))
+    return nothing
+end
+
+function _assert_carrier_transition_provenance(
+    spectral::HomogeneousSpectralContext{T},
+    contour::ComplexContourContext{T},
+    transition::FactoredCarrierTransition{T},
+) where {T<:AbstractFloat}
+    _assert_contour_context_provenance(spectral, contour)
+    _assert_carrier_provenance(
+        spectral,
+        contour,
+        transition.source_carrier,
+        INFINITY_OUTGOING,
+        "carrier transition source",
+    )
+    _assert_carrier_provenance(
+        spectral,
+        contour,
+        transition.target_carrier,
+        HORIZON_INGOING,
+        "carrier transition target",
+    )
+    _branch_cells_match_exactly(
+        transition.frozen_branch_cell, spectral.frozen_branch_cell
+    ) && _deformations_match_exactly(
+        transition.contour_deformation, spectral.contour_deformation
+    ) || throw(_factored_error(
+        T,
+        CARRIER_CHANGE_INCONSISTENT,
+        spectral.precision_bits,
+        "carrier transition branch-cell or deformation provenance differs",
+    ))
+    all(
+        value -> _factored_precision_matches(
+            value, spectral.precision_bits
+        ),
+        (
+            transition.state.Y,
+            transition.state.Yrho,
+            transition.reconstruction_tolerance,
+        ),
+    ) || throw(_factored_error(
+        T,
+        FACTORED_PROPAGATION_PRECISION_MISMATCH,
+        spectral.precision_bits,
+        "carrier transition state or tolerance narrowed request precision",
+    ))
+    _finite_factored_complex(transition.state.Y) &&
+        _finite_factored_complex(transition.state.Yrho) &&
+        isfinite(transition.reconstruction_tolerance) &&
+        transition.reconstruction_tolerance >= zero(T) &&
+        transition.diagnostics.X_reconstruction_error <=
+            transition.reconstruction_tolerance &&
+        transition.diagnostics.Xrho_reconstruction_error <=
+            transition.reconstruction_tolerance || throw(_factored_error(
+                T,
+                CARRIER_CHANGE_INCONSISTENT,
+                spectral.precision_bits,
+                "carrier transition fails its reconstruction evidence",
+            ))
+    return nothing
+end
+
+function _assert_successful_factored_ode_result(
+    odesoln,
+    ::Type{T},
+    precision_bits::Int,
+    assessment::AsymptoticConditioningAssessment{T},
+    factored_homogeneous_rhs_evaluations::Int,
+) where {T<:AbstractFloat}
+    DifferentialEquations.SciMLBase.successful_retcode(odesoln) || throw(
+        _factored_error(
+            T,
+            FACTORED_ODE_FAILURE,
+            precision_bits,
+            "factored ODE returned unsuccessful retcode $(odesoln.retcode)";
+            assessment=assessment,
+            factored_homogeneous_rhs_evaluations=
+                factored_homogeneous_rhs_evaluations,
+        )
+    )
+    return nothing
+end
+
+function _execute_factored_endpoint_after_readiness(
+    spectral::HomogeneousSpectralContext{T},
+    contour::ComplexContourContext{T},
+    preparation::FactoredEndpointPreparation{T},
+    start_rho::T,
+    stop_rho::T;
+    initial_state::FactoredEndpointState{T}=
+        preparation.initial_condition.state,
+    initial_carrier::PlaneWaveCarrier{T}=
+        preparation.initial_condition.carrier,
+    odealgo=_FACTORED_DEFAULTSOLVER,
+    reltol::T=_factored_default_tolerance(T),
+    abstol::T=_factored_default_tolerance(T),
+    ode_maxiters::Int=10^7,
+    verbose::Bool=false,
+    ode_observation_factory=nothing,
+    ode_solution_observer=nothing,
+    ode_exception_passthrough=_never_passthrough_ode_exception,
+    ode_leg::AbstractString="factored_endpoint",
+    factored_homogeneous_rhs_counter::Base.RefValue{Int}=Ref(0),
+) where {T<:AbstractFloat}
+    return _with_factored_precision(T, spectral.precision_bits) do
+    _assert_contour_context_provenance(spectral, contour)
+    _assert_carrier_provenance(
+        spectral,
+        contour,
+        initial_carrier,
+        preparation.branch,
+        "factored ODE seed",
+    )
+    all(
+        value -> _factored_precision_matches(
+            value, spectral.precision_bits
+        ),
+        (
+            start_rho,
+            stop_rho,
+            reltol,
+            abstol,
+            initial_state.Y,
+            initial_state.Yrho,
+            initial_carrier.wave_number,
+            initial_carrier.rstar_match,
+            initial_carrier.log_at_match,
+            initial_carrier.q,
+        ),
+    ) || throw(_factored_error(
+        T,
+        FACTORED_PROPAGATION_PRECISION_MISMATCH,
+        spectral.precision_bits,
+        "factored ODE seed or controls do not preserve context precision",
+    ))
+    all(isfinite, (start_rho, stop_rho, reltol, abstol)) || throw(
+        _factored_error(
+            T,
+            NONFINITE_FACTORED_PROPAGATION_DATA,
+            spectral.precision_bits,
+            "factored ODE controls must be finite",
+        )
+    )
+    start_rho != stop_rho || throw(_factored_error(
+        T,
+        INVALID_FACTORED_PROPAGATION_INPUT,
+        spectral.precision_bits,
+        "factored ODE interval must have nonzero length",
+    ))
+    reltol > zero(T) && abstol > zero(T) || throw(_factored_error(
+        T,
+        INVALID_FACTORED_PROPAGATION_INPUT,
+        spectral.precision_bits,
+        "factored ODE tolerances must be positive",
+    ))
+    ode_maxiters > 0 || throw(_factored_error(
+        T,
+        INVALID_FACTORED_PROPAGATION_INPUT,
+        spectral.precision_bits,
+        "factored ODE maxiters must be positive",
+    ))
+    _finite_factored_complex(initial_state.Y) &&
+        _finite_factored_complex(initial_state.Yrho) || throw(
+            _factored_error(
+                T,
+                NONFINITE_FACTORED_PROPAGATION_DATA,
+                spectral.precision_bits,
+                "factored ODE seed state is nonfinite",
+            )
+        )
+    tangent = _branch_tangent(contour, initial_carrier.kind)
+    _finite_factored_complex(tangent) && !iszero(tangent) || throw(
+        _factored_error(
+            T,
+            NONFINITE_FACTORED_PROPAGATION_DATA,
+            spectral.precision_bits,
+            "factored ODE contour tangent is nonfinite or zero",
+        )
+    )
+    initial_norm = hypot(abs(initial_state.Y), abs(initial_state.Yrho))
+    initial_carrier_log = T(abs(real(carrier_log(
+        initial_carrier, start_rho
+    ))))
+    isfinite(initial_norm) && isfinite(initial_carrier_log) || throw(
+        _factored_error(
+            T,
+            NONFINITE_FACTORED_PROPAGATION_DATA,
+            spectral.precision_bits,
+            "factored ODE initial diagnostics are nonfinite",
+        )
+    )
+    accumulator = _FactoredDiagnosticAccumulator{T}(
+        0, initial_norm, initial_norm, initial_carrier_log
+    )
+    internal_callback = _factored_internal_callback(
+        accumulator, initial_carrier
+    )
+    rhospan = (start_rho, stop_rho)
+    external_callback, observation = _begin_ode_observation(
+        ode_observation_factory, String(ode_leg), rhospan, odealgo
+    )
+    callback = _combine_factored_callbacks(
+        external_callback, internal_callback
+    )
+    rhs_count_before = factored_homogeneous_rhs_counter[]
+    parameters = FactoredGSNParameters(
+        spectral.s,
+        spectral.m,
+        spectral.a,
+        spectral.omega,
+        spectral.lambda,
+        contour.radius_from_rho,
+        tangent,
+        initial_carrier,
+        spectral.precision_bits,
+        rhs_count_before,
+        factored_homogeneous_rhs_counter,
+    )
+    initial_values = Complex{T}[initial_state.Y, initial_state.Yrho]
+    odeprob = ODEProblem(factored_GSN_linear_eqn!, initial_values, rhospan, parameters)
+    odesoln = try
+        solve(
+            odeprob,
+            odealgo;
+            maxiters=ode_maxiters,
+            reltol=reltol,
+            abstol=abstol,
+            tstops=[stop_rho],
+            save_everystep=false,
+            save_start=false,
+            save_end=true,
+            dense=false,
+            callback=callback,
+            verbose=verbose,
+        )
+    catch error
+        _throw_or_wrap_factored_ode_failure(
+            error,
+            ode_exception_passthrough,
+            T,
+            spectral.precision_bits,
+            preparation.assessment,
+            _factored_rhs_evaluation_count(parameters),
+        )
+    end
+    _finish_ode_observation(
+        ode_solution_observer, String(ode_leg), odesoln, observation
+    )
+    _assert_successful_factored_ode_result(
+        odesoln,
+        T,
+        spectral.precision_bits,
+        preparation.assessment,
+        _factored_rhs_evaluation_count(parameters),
+    )
+    isempty(odesoln.u) && throw(_factored_error(
+        T,
+        FACTORED_ODE_FAILURE,
+        spectral.precision_bits,
+        "factored ODE returned no saved endpoint";
+        assessment=preparation.assessment,
+        factored_homogeneous_rhs_evaluations=
+            _factored_rhs_evaluation_count(parameters),
+    ))
+    length(odesoln.u) == 1 && length(odesoln.t) == 1 || throw(
+        _factored_error(
+            T,
+            FACTORED_ODE_FAILURE,
+            spectral.precision_bits,
+            "factored ODE violated the endpoint-only save contract";
+            assessment=preparation.assessment,
+            factored_homogeneous_rhs_evaluations=
+                _factored_rhs_evaluation_count(parameters),
+        )
+    )
+    reached_rho = T(last(odesoln.t))
+    endpoint_tolerance = T(64) * eps(T) * max(one(T), abs(stop_rho))
+    abs(reached_rho - stop_rho) <= endpoint_tolerance || throw(
+        _factored_error(
+            T,
+            FACTORED_ODE_FAILURE,
+            spectral.precision_bits,
+            "factored ODE did not reach the requested endpoint";
+            assessment=preparation.assessment,
+            factored_homogeneous_rhs_evaluations=
+                _factored_rhs_evaluation_count(parameters),
+        )
+    )
+    endpoint_values = last(odesoln.u)
+    endpoint = FactoredEndpointState{T}(
+        Complex{T}(endpoint_values[1]), Complex{T}(endpoint_values[2])
+    )
+    _finite_factored_complex(endpoint.Y) &&
+        _finite_factored_complex(endpoint.Yrho) || throw(_factored_error(
+            T,
+            NONFINITE_FACTORED_PROPAGATION_DATA,
+            spectral.precision_bits,
+            "factored ODE endpoint state is nonfinite";
+            assessment=preparation.assessment,
+            factored_homogeneous_rhs_evaluations=
+                _factored_rhs_evaluation_count(parameters),
+        ))
+    solver_stats = hasproperty(odesoln, :destats) ?
+        getproperty(odesoln, :destats) : nothing
+    accepted_steps = solver_stats !== nothing &&
+        hasproperty(solver_stats, :naccept) ?
+            Int(getproperty(solver_stats, :naccept)) :
+            accumulator.accepted_steps
+    rejected_steps = solver_stats !== nothing &&
+        hasproperty(solver_stats, :nreject) ?
+            Int(getproperty(solver_stats, :nreject)) : 0
+    diagnostics = FactoredODEDiagnostics{T}(
+        initial_carrier.kind,
+        String(ode_leg),
+        HOMOGENEOUS_REPRESENTATION_ID,
+        FACTORED_HOMOGENEOUS_ODE_SCOPE_ID,
+        spectral.precision_bits,
+        accepted_steps,
+        rejected_steps,
+        accumulator.maximum_remainder_state_norm,
+        accumulator.minimum_remainder_state_norm,
+        accumulator.maximum_absolute_real_carrier_log,
+        preparation.initial_condition.regularity,
+        preparation.assessment,
+        spectral.convention,
+        preparation.frozen_branch_cell,
+        preparation.contour_deformation,
+        _factored_rhs_evaluation_count(parameters),
+        length(odesoln.u),
+    )
+    return FactoredODESolution{T}(
+        endpoint, initial_carrier, stop_rho, diagnostics
+    )
+    end
+end
+
+function solve_factored_endpoint(
+    spectral::HomogeneousSpectralContext{T},
+    contour::ComplexContourContext{T},
+    preparation::FactoredEndpointPreparation{T},
+    start_rho::T,
+    stop_rho::T;
+    odealgo=_FACTORED_DEFAULTSOLVER,
+    reltol::Union{Nothing,T}=nothing,
+    abstol::Union{Nothing,T}=nothing,
+    ode_maxiters::Int=10^7,
+    verbose::Bool=false,
+    ode_observation_factory=nothing,
+    ode_solution_observer=nothing,
+    ode_exception_passthrough=_never_passthrough_ode_exception,
+    ode_leg::AbstractString="factored_endpoint",
+    factored_homogeneous_rhs_counter::Base.RefValue{Int}=Ref(0),
+) where {T<:AbstractFloat}
+    _assert_preparation_provenance(spectral, contour, preparation)
+    _assert_factored_preflight_adequate(preparation)
+    expected_start = preparation.branch === INFINITY_OUTGOING ?
+        contour.rho_out : contour.rho_in
+    start_rho == expected_start || throw(_factored_error(
+        T,
+        INVALID_FACTORED_PROPAGATION_INPUT,
+        spectral.precision_bits,
+        "factored endpoint solve must begin at its prepared endpoint",
+    ))
+    # TODO: [HUMAN MATH REVIEW REQUIRED — verify the branch-specific plane-wave carriers, the transformed complex-contour GSN equation, the carrier change at ρ=0, the factored horizon basis, and the Cinc/Cref determinant chart against the current GSN amplitude and branch conventions.]
+    # TODO: [HUMAN MATH REVIEW REQUIRED — decide whether derivative stencils freeze only the GSN branch cell while allowing frequency-local contour angles, or freeze the full contour tangent and use q=±i z t_frozen; verify contour-deformation invariance before production activation.]
+    assert_regularised_gsn_production_ready()
+    typed_reltol = _resolve_factored_tolerance(
+        T, spectral.precision_bits, reltol, "relative tolerance"
+    )
+    typed_abstol = _resolve_factored_tolerance(
+        T, spectral.precision_bits, abstol, "absolute tolerance"
+    )
+    return _execute_factored_endpoint_after_readiness(
+        spectral,
+        contour,
+        preparation,
+        start_rho,
+        stop_rho;
+        odealgo=odealgo,
+        reltol=typed_reltol,
+        abstol=typed_abstol,
+        ode_maxiters=ode_maxiters,
+        verbose=verbose,
+        ode_observation_factory=ode_observation_factory,
+        ode_solution_observer=ode_solution_observer,
+        ode_exception_passthrough=ode_exception_passthrough,
+        ode_leg=ode_leg,
+        factored_homogeneous_rhs_counter=
+            factored_homogeneous_rhs_counter,
+    )
+end
+
+function solve_factored_infinity_outer_to_match(
+    spectral::HomogeneousSpectralContext{T},
+    contour::ComplexContourContext{T},
+    preparation::FactoredEndpointPreparation{T};
+    ode_leg::AbstractString="Xup_outer_to_match",
+    kwargs...,
+) where {T<:AbstractFloat}
+    preparation.branch === INFINITY_OUTGOING || throw(_factored_error(
+        T,
+        INVALID_FACTORED_PROPAGATION_INPUT,
+        spectral.precision_bits,
+        "outer-to-match path requires infinity-outgoing preparation",
+    ))
+    return solve_factored_endpoint(
+        spectral,
+        contour,
+        preparation,
+        contour.rho_out,
+        zero(contour.rho_out);
+        ode_leg=ode_leg,
+        kwargs...,
+    )
+end
+
+function change_factored_infinity_to_horizon_at_match(
+    spectral::HomogeneousSpectralContext{T},
+    contour::ComplexContourContext{T},
+    state::FactoredEndpointState{T},
+    source_carrier::PlaneWaveCarrier{T},
+) where {T<:AbstractFloat}
+    return _translate_factored_failure(
+        T,
+        spectral.precision_bits,
+        "infinity-to-horizon carrier transition";
+        argument_reason=CARRIER_CHANGE_INCONSISTENT,
+    ) do
+        _with_factored_precision(T, spectral.precision_bits) do
+            _assert_contour_context_provenance(spectral, contour)
+            _assert_carrier_provenance(
+                spectral,
+                contour,
+                source_carrier,
+                INFINITY_OUTGOING,
+                "carrier change source",
+            )
+            _factored_precision_matches(
+                state.Y, spectral.precision_bits
+            ) && _factored_precision_matches(
+                state.Yrho, spectral.precision_bits
+            ) || throw(_factored_error(
+                T,
+                FACTORED_PROPAGATION_PRECISION_MISMATCH,
+                spectral.precision_bits,
+                "carrier-change state does not preserve request precision",
+            ))
+            _finite_factored_complex(state.Y) &&
+                _finite_factored_complex(state.Yrho) || throw(
+                    _factored_error(
+                        T,
+                        NONFINITE_FACTORED_PROPAGATION_DATA,
+                        spectral.precision_bits,
+                        "carrier-change state is nonfinite",
+                    )
+                )
+            target_carrier = _canonical_carrier(
+                spectral, contour, HORIZON_INGOING
+            )
+            target_state = change_carrier(
+                state, source_carrier, target_carrier, zero(T)
+            )
+            diagnostics = carrier_change_diagnostics(
+                state,
+                target_state,
+                source_carrier,
+                target_carrier,
+                zero(T),
+            )
+            raw = reconstruct_state(state, source_carrier, zero(T))
+            scale = max(one(T), abs(raw.X), abs(raw.Xrho))
+            tolerance = T(256) * eps(T) * scale
+            diagnostics.X_reconstruction_error <= tolerance &&
+                diagnostics.Xrho_reconstruction_error <= tolerance || throw(
+                    _factored_error(
+                        T,
+                        CARRIER_CHANGE_INCONSISTENT,
+                        spectral.precision_bits,
+                        "carrier change failed the X/Xrho reconstruction invariant",
+                    )
+                )
+            return FactoredCarrierTransition{T}(
+                target_state,
+                source_carrier,
+                target_carrier,
+                diagnostics,
+                tolerance,
+                spectral.frozen_branch_cell,
+                spectral.contour_deformation,
+            )
+        end
+    end
+end
+
+function change_factored_infinity_to_horizon_at_match(
+    spectral::HomogeneousSpectralContext{T},
+    contour::ComplexContourContext{T},
+    propagated::FactoredODESolution{T},
+) where {T<:AbstractFloat}
+    _assert_factored_ode_solution_provenance(
+        spectral,
+        contour,
+        propagated,
+        INFINITY_OUTGOING,
+        zero(T),
+    )
+    return change_factored_infinity_to_horizon_at_match(
+        spectral, contour, propagated.endpoint, propagated.carrier
+    )
+end
+
+function solve_factored_horizon_match_to_inner(
+    spectral::HomogeneousSpectralContext{T},
+    contour::ComplexContourContext{T},
+    preparation::FactoredEndpointPreparation{T},
+    transition::FactoredCarrierTransition{T};
+    odealgo=_FACTORED_DEFAULTSOLVER,
+    reltol::Union{Nothing,T}=nothing,
+    abstol::Union{Nothing,T}=nothing,
+    ode_maxiters::Int=10^7,
+    verbose::Bool=false,
+    ode_observation_factory=nothing,
+    ode_solution_observer=nothing,
+    ode_exception_passthrough=_never_passthrough_ode_exception,
+    ode_leg::AbstractString="Xup_match_to_inner",
+    factored_homogeneous_rhs_counter::Base.RefValue{Int}=Ref(0),
+) where {T<:AbstractFloat}
+    _assert_preparation_provenance(spectral, contour, preparation)
+    _assert_factored_preflight_adequate(preparation)
+    preparation.branch === HORIZON_INGOING || throw(_factored_error(
+        T,
+        INVALID_FACTORED_PROPAGATION_INPUT,
+        spectral.precision_bits,
+        "match-to-inner path requires horizon-ingoing preparation",
+    ))
+    _assert_carrier_transition_provenance(spectral, contour, transition)
+    assert_regularised_gsn_production_ready()
+    typed_reltol = _resolve_factored_tolerance(
+        T, spectral.precision_bits, reltol, "relative tolerance"
+    )
+    typed_abstol = _resolve_factored_tolerance(
+        T, spectral.precision_bits, abstol, "absolute tolerance"
+    )
+    return _execute_factored_endpoint_after_readiness(
+        spectral,
+        contour,
+        preparation,
+        zero(contour.rho_in),
+        contour.rho_in;
+        initial_state=transition.state,
+        initial_carrier=transition.target_carrier,
+        odealgo=odealgo,
+        reltol=typed_reltol,
+        abstol=typed_abstol,
+        ode_maxiters=ode_maxiters,
+        verbose=verbose,
+        ode_observation_factory=ode_observation_factory,
+        ode_solution_observer=ode_solution_observer,
+        ode_exception_passthrough=ode_exception_passthrough,
+        ode_leg=ode_leg,
+        factored_homogeneous_rhs_counter=
+            factored_homogeneous_rhs_counter,
+    )
+end
+
+function solve_factored_xup_scattering_endpoint(
+    spectral::HomogeneousSpectralContext{T},
+    contour::ComplexContourContext{T},
+    preparations::HorizonDeterminantPreparation{T};
+    odealgo=_FACTORED_DEFAULTSOLVER,
+    reltol::Union{Nothing,T}=nothing,
+    abstol::Union{Nothing,T}=nothing,
+    ode_maxiters::Int=10^7,
+    verbose::Bool=false,
+    ode_observation_factory=nothing,
+    ode_solution_observer=nothing,
+    ode_exception_passthrough=_never_passthrough_ode_exception,
+    factored_homogeneous_rhs_counter::Base.RefValue{Int}=Ref(0),
+) where {T<:AbstractFloat}
+    _assert_horizon_preparation_provenance(
+        spectral, contour, preparations
+    )
+    assert_factored_preflights_adequate(preparations)
+    outer = solve_factored_infinity_outer_to_match(
+        spectral,
+        contour,
+        preparations.infinity_outgoing;
+        odealgo=odealgo,
+        reltol=reltol,
+        abstol=abstol,
+        ode_maxiters=ode_maxiters,
+        verbose=verbose,
+        ode_observation_factory=ode_observation_factory,
+        ode_solution_observer=ode_solution_observer,
+        ode_exception_passthrough=ode_exception_passthrough,
+        ode_leg="Xup_outer_to_match",
+        factored_homogeneous_rhs_counter=
+            factored_homogeneous_rhs_counter,
+    )
+    transition = change_factored_infinity_to_horizon_at_match(
+        spectral, contour, outer
+    )
+    inner = solve_factored_horizon_match_to_inner(
+        spectral,
+        contour,
+        preparations.horizon_ingoing,
+        transition;
+        odealgo=odealgo,
+        reltol=reltol,
+        abstol=abstol,
+        ode_maxiters=ode_maxiters,
+        verbose=verbose,
+        ode_observation_factory=ode_observation_factory,
+        ode_solution_observer=ode_solution_observer,
+        ode_exception_passthrough=ode_exception_passthrough,
+        ode_leg="Xup_match_to_inner",
+        factored_homogeneous_rhs_counter=
+            factored_homogeneous_rhs_counter,
+    )
+    return FactoredScatteringPropagation{T}(outer, transition, inner)
+end
+
+function solve_factored_xin_to_match(
+    spectral::HomogeneousSpectralContext{T},
+    contour::ComplexContourContext{T},
+    preparation::FactoredEndpointPreparation{T};
+    ode_leg::AbstractString="Xin_inner_to_match",
+    kwargs...,
+) where {T<:AbstractFloat}
+    preparation.branch === HORIZON_INGOING || throw(_factored_error(
+        T,
+        INVALID_FACTORED_PROPAGATION_INPUT,
+        spectral.precision_bits,
+        "Xin-to-match path requires horizon-ingoing preparation",
+    ))
+    return solve_factored_endpoint(
+        spectral,
+        contour,
+        preparation,
+        contour.rho_in,
+        zero(contour.rho_in);
+        ode_leg=ode_leg,
+        kwargs...,
+    )
+end
+
+function solve_factored_xup_to_match(
+    spectral::HomogeneousSpectralContext{T},
+    contour::ComplexContourContext{T},
+    preparation::FactoredEndpointPreparation{T};
+    ode_leg::AbstractString="Xup_outer_to_match",
+    kwargs...,
+) where {T<:AbstractFloat}
+    return solve_factored_infinity_outer_to_match(
+        spectral, contour, preparation; ode_leg=ode_leg, kwargs...
+    )
+end
+
+function solve_factored_exterior_matches(
+    spectral::HomogeneousSpectralContext{T},
+    contour::ComplexContourContext{T},
+    preparations::ExteriorDeterminantPreparation{T};
+    odealgo=_FACTORED_DEFAULTSOLVER,
+    reltol::Union{Nothing,T}=nothing,
+    abstol::Union{Nothing,T}=nothing,
+    ode_maxiters::Int=10^7,
+    verbose::Bool=false,
+    ode_observation_factory=nothing,
+    ode_solution_observer=nothing,
+    ode_exception_passthrough=_never_passthrough_ode_exception,
+    factored_homogeneous_rhs_counter::Base.RefValue{Int}=Ref(0),
+) where {T<:AbstractFloat}
+    _assert_exterior_preparation_provenance(
+        spectral, contour, preparations
+    )
+    assert_factored_preflights_adequate(preparations)
+    xin = solve_factored_xin_to_match(
+        spectral,
+        contour,
+        preparations.horizon_ingoing;
+        odealgo=odealgo,
+        reltol=reltol,
+        abstol=abstol,
+        ode_maxiters=ode_maxiters,
+        verbose=verbose,
+        ode_observation_factory=ode_observation_factory,
+        ode_solution_observer=ode_solution_observer,
+        ode_exception_passthrough=ode_exception_passthrough,
+        ode_leg="Xin_inner_to_match",
+        factored_homogeneous_rhs_counter=
+            factored_homogeneous_rhs_counter,
+    )
+    xup = solve_factored_xup_to_match(
+        spectral,
+        contour,
+        preparations.infinity_outgoing;
+        odealgo=odealgo,
+        reltol=reltol,
+        abstol=abstol,
+        ode_maxiters=ode_maxiters,
+        verbose=verbose,
+        ode_observation_factory=ode_observation_factory,
+        ode_solution_observer=ode_solution_observer,
+        ode_exception_passthrough=ode_exception_passthrough,
+        ode_leg="Xup_outer_to_match",
+        factored_homogeneous_rhs_counter=
+            factored_homogeneous_rhs_counter,
+    )
+    return FactoredExteriorMatches{T}(xin, xup)
+end
+
+function reconstruct_factored_match_state(
+    state::FactoredEndpointState{T},
+    carrier::PlaneWaveCarrier{T},
+    rho::T,
+    spectral::HomogeneousSpectralContext{T},
+    contour::ComplexContourContext{T},
+) where {T<:AbstractFloat}
+    return _translate_factored_failure(
+        T,
+        spectral.precision_bits,
+        "factored match-state reconstruction";
+        argument_reason=CARRIER_CHANGE_INCONSISTENT,
+    ) do
+        _with_factored_precision(T, spectral.precision_bits) do
+            _assert_contour_context_provenance(spectral, contour)
+            _assert_carrier_provenance(
+                spectral,
+                contour,
+                carrier,
+                carrier.kind,
+                "factored match state",
+            )
+            all(
+                value -> _factored_precision_matches(
+                    value, spectral.precision_bits
+                ),
+                (
+                    state.Y,
+                    state.Yrho,
+                    carrier.wave_number,
+                    carrier.rstar_match,
+                    carrier.log_at_match,
+                    carrier.q,
+                    rho,
+                ),
+            ) || throw(_factored_error(
+                T,
+                FACTORED_PROPAGATION_PRECISION_MISMATCH,
+                spectral.precision_bits,
+                "factored match state does not preserve request precision",
+            ))
+            rho == zero(T) || throw(_factored_error(
+                T,
+                INVALID_FACTORED_PROPAGATION_INPUT,
+                spectral.precision_bits,
+                "factored match-state conversion is defined at rho=0",
+            ))
+            _finite_factored_complex(state.Y) &&
+                _finite_factored_complex(state.Yrho) || throw(
+                    _factored_error(
+                        T,
+                        NONFINITE_FACTORED_PROPAGATION_DATA,
+                        spectral.precision_bits,
+                        "factored match state is nonfinite",
+                    )
+                )
+            raw = reconstruct_state(state, carrier, rho)
+            tangent = _branch_tangent(contour, carrier.kind)
+            _finite_factored_complex(tangent) && !iszero(tangent) || throw(
+                _factored_error(
+                    T,
+                    INVALID_FACTORED_PROPAGATION_INPUT,
+                    spectral.precision_bits,
+                    "match-state contour tangent must be finite and nonzero",
+                )
+            )
+            dX_drstar = raw.Xrho / tangent
+            radial_derivative_convention =
+                MATCH_RADIAL_DERIVATIVE_CONVENTION_ID
+            _finite_factored_complex(raw.X) &&
+                _finite_factored_complex(raw.Xrho) &&
+                _finite_factored_complex(dX_drstar) || throw(
+                    _factored_error(
+                        T,
+                        NONFINITE_FACTORED_PROPAGATION_DATA,
+                        spectral.precision_bits,
+                        "reconstructed match state or derivative is nonfinite",
+                    )
+                )
+            return FactoredMatchState{T}(
+                raw.X,
+                raw.Xrho,
+                dX_drstar,
+                rho,
+                carrier.kind,
+                tangent,
+                radial_derivative_convention,
+            )
+        end
+    end
+end
+
+function reconstruct_factored_match_state(
+    propagated::FactoredODESolution{T},
+    spectral::HomogeneousSpectralContext{T},
+    contour::ComplexContourContext{T},
+) where {T<:AbstractFloat}
+    _assert_factored_ode_solution_provenance(
+        spectral,
+        contour,
+        propagated,
+        propagated.carrier.kind,
+        zero(T),
+    )
+    return reconstruct_factored_match_state(
+        propagated.endpoint,
+        propagated.carrier,
+        propagated.endpoint_rho,
+        spectral,
+        contour,
+    )
+end
+
+# Legacy raw-comparator equation
 function GSN_linear_eqn(u, p, rho)
     r = p.r_from_rho(rho)
     _sF = p.sign * exp(1im*p.beta)*sF(p.s, p.m, p.a, p.omega, p.lambda, r)

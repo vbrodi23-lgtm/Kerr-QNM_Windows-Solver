@@ -8,6 +8,7 @@ one typed boundary; importing this module cannot start a numerical solve.
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from decimal import Decimal, InvalidOperation
 from enum import Enum
 from fractions import Fraction
 from functools import lru_cache
@@ -72,6 +73,164 @@ ERROR_CHANNELS = (
 )
 _RECORDED_ROOT_MAPPING_TOLERANCE_ABS = 5.0e-9
 _DIAGNOSTIC_ROOT_FAMILIES = ("truncation", "resolution", "seed-path")
+NUMERICAL_CONDITIONING_SCHEMA = "windows-solver.m02-conditioning/2"
+HORIZON_DETERMINANT_FAMILY = "horizon-scattering/v1"
+EXTERIOR_DETERMINANT_FAMILY = "exterior-wronskian/v1"
+HORIZON_SCATTERING_COLUMN_CONVENTION = (
+    "column1=horizon-ingoing-Cref;column2=horizon-outgoing-Cinc/v1"
+)
+HORIZON_DETERMINANT_CONVENTION = "cinc-over-cref-minus-R/v1"
+EXTERIOR_DETERMINANT_CONVENTION = (
+    "wronskian-perturbed-Xin-with-Xup/v1"
+)
+HORIZON_DETERMINANT_NORMALISATION = (
+    "cinc-over-cref-minus-reflectivity/v1"
+)
+EXTERIOR_DETERMINANT_NORMALISATION = (
+    "unit-asymptotic-branch-wronskian/v1"
+)
+
+_REGULARISED_GSN_COMMON_IDENTITIES: Mapping[str, str] = MappingProxyType({
+    "homogeneous_representation": "factored-plane-wave-gsn/v1",
+    "branch_convention": "gsn-complex-rho/v1",
+    "radial_derivative_convention": "state2=dX/drho/v1",
+    "regular_remainder_contract": "known-carrier-times-regular-remainder/v1",
+    "factored_remainder_state_convention": "state1=Y;state2=dY/drho/v1",
+})
+REGULARISED_GSN_CONDITIONING_IDENTITIES: Mapping[str, object] = MappingProxyType({
+    **_REGULARISED_GSN_COMMON_IDENTITIES,
+    "determinant_family": HORIZON_DETERMINANT_FAMILY,
+    "scattering_diagnostics_applicable": True,
+    "scattering_column_convention": HORIZON_SCATTERING_COLUMN_CONVENTION,
+    "determinant_convention": HORIZON_DETERMINANT_CONVENTION,
+    "determinant_normalisation": HORIZON_DETERMINANT_NORMALISATION,
+})
+_REGULARISED_GSN_COMMON_PRECISION_POLICY: Mapping[str, object] = MappingProxyType({
+    "homogeneous_representation": "factored-plane-wave-gsn/v1",
+    "asymptotic_series_evaluation": "typed-batch-horner-compensated/v1",
+    "conditioning_diagnostics": "series-recurrence-basis-fd/v1",
+    "branch_convention": "gsn-complex-rho/v1",
+    "radial_derivative_convention": "state2=dX/drho/v1",
+    "regular_remainder_contract": "known-carrier-times-regular-remainder/v1",
+    "factored_remainder_state_convention": "state1=Y;state2=dY/drho/v1",
+    "reliable_digit_safety_margin": "8",
+    "required_digit_guard": "6",
+    "regularised_gsn_activation_status": (
+        "blocked-pending-human-math-review-and-independent-reference/v1"
+    ),
+})
+REGULARISED_GSN_PRECISION_POLICY: Mapping[str, object] = MappingProxyType({
+    **_REGULARISED_GSN_COMMON_PRECISION_POLICY,
+    "determinant_family": HORIZON_DETERMINANT_FAMILY,
+    "scattering_diagnostics_applicable": True,
+    "scattering_coefficient_extraction": "scaled-factored-horizon-basis/v1",
+    "horizon_determinant_chart": "cinc-over-cref-minus-reflectivity/v1",
+    "scattering_chart_safety_factor": "64",
+    "scattering_column_convention": HORIZON_SCATTERING_COLUMN_CONVENTION,
+    "determinant_convention": HORIZON_DETERMINANT_CONVENTION,
+    "determinant_normalisation": HORIZON_DETERMINANT_NORMALISATION,
+})
+
+
+def regularised_gsn_mechanism_contract(
+    mechanism_id: str,
+) -> Mapping[str, object]:
+    """Return the determinant identities applicable to one physical mechanism."""
+
+    if mechanism_id == "horizon-admittance":
+        return MappingProxyType({
+            "determinant_family": HORIZON_DETERMINANT_FAMILY,
+            "scattering_diagnostics_applicable": True,
+            "scattering_column_convention": HORIZON_SCATTERING_COLUMN_CONVENTION,
+            "determinant_convention": HORIZON_DETERMINANT_CONVENTION,
+            "determinant_normalisation": HORIZON_DETERMINANT_NORMALISATION,
+        })
+    if mechanism_id in _EXTERIOR_PROFILE_IDS:
+        return MappingProxyType({
+            "determinant_family": EXTERIOR_DETERMINANT_FAMILY,
+            "scattering_diagnostics_applicable": False,
+            "scattering_column_convention": None,
+            "determinant_convention": EXTERIOR_DETERMINANT_CONVENTION,
+            "determinant_normalisation": EXTERIOR_DETERMINANT_NORMALISATION,
+        })
+    raise ValueError(f"unsupported response mechanism: {mechanism_id}")
+
+
+def regularised_gsn_precision_policy(
+    mechanism_id: str,
+) -> Mapping[str, object]:
+    """Bind precision controls to the determinant family actually evaluated."""
+
+    contract = regularised_gsn_mechanism_contract(mechanism_id)
+    horizon = contract["scattering_diagnostics_applicable"] is True
+    return MappingProxyType({
+        **_REGULARISED_GSN_COMMON_PRECISION_POLICY,
+        **contract,
+        "scattering_coefficient_extraction": (
+            "scaled-factored-horizon-basis/v1" if horizon else None
+        ),
+        "horizon_determinant_chart": (
+            "cinc-over-cref-minus-reflectivity/v1" if horizon else None
+        ),
+        "scattering_chart_safety_factor": "64" if horizon else None,
+    })
+
+_NUMERICAL_CONDITIONING_DECIMAL_FIELDS = (
+    "maximum_series_digits_lost",
+    "maximum_recurrence_digits_lost",
+    "maximum_series_evaluation_spread",
+    "maximum_last_term_ratio",
+    "minimum_asymptotic_predicted_reliable_digits",
+    "maximum_basis_condition",
+    "maximum_basis_backward_error",
+    "maximum_matching_reconstruction_residual",
+    "maximum_endpoint_reconstruction_error",
+    "maximum_fd_digits_lost",
+    "predicted_reliable_digits",
+    "required_reliable_digits",
+    "minimum_cref_chart_margin",
+    "maximum_carrier_change_error",
+    "maximum_contour_angle_deformation",
+)
+_HORIZON_SCATTERING_DECIMAL_FIELDS = frozenset({
+    "maximum_basis_condition",
+    "maximum_basis_backward_error",
+    "maximum_matching_reconstruction_residual",
+    "minimum_cref_chart_margin",
+    "maximum_carrier_change_error",
+})
+_NUMERICAL_CONDITIONING_IDENTITY_FIELDS = (
+    "determinant_family",
+    "homogeneous_representation",
+    "branch_convention",
+    "scattering_column_convention",
+    "radial_derivative_convention",
+    "determinant_convention",
+    "determinant_normalisation",
+    "regular_remainder_contract",
+    "factored_remainder_state_convention",
+)
+_NUMERICAL_CONDITIONING_SIGNED_DECIMAL_FIELDS = frozenset({
+    "minimum_asymptotic_predicted_reliable_digits",
+    "predicted_reliable_digits",
+})
+_NUMERICAL_CONDITIONING_BOOLEAN_FIELDS = (
+    "endpoint_remainders_regular",
+    "precision_limited",
+    "asymptotic_preflight_avoided_ode",
+)
+
+
+def _conditioning_decimal_from_text(value: object, subject: str) -> Decimal:
+    if not isinstance(value, str) or not value or value.strip() != value:
+        raise ValueError(f"{subject} must be precision-preserving decimal text")
+    try:
+        converted = Decimal(value)
+    except InvalidOperation as error:
+        raise ValueError(f"{subject} must be decimal text") from error
+    if not converted.is_finite():
+        raise ValueError(f"{subject} must be finite")
+    return converted
 
 
 def _sha256(value: object) -> str:
@@ -730,6 +889,169 @@ class DiagnosticRootReadout:
 
 
 @dataclass(frozen=True, slots=True)
+class NumericalConditioningEvidence:
+    schema: str
+    determinant_family: str
+    scattering_diagnostics_applicable: bool
+    homogeneous_representation: str
+    branch_convention: str
+    scattering_column_convention: str | None
+    radial_derivative_convention: str
+    determinant_convention: str
+    determinant_normalisation: str
+    regular_remainder_contract: str
+    factored_remainder_state_convention: str
+    maximum_series_digits_lost: Decimal
+    maximum_recurrence_digits_lost: Decimal
+    maximum_series_evaluation_spread: Decimal
+    maximum_last_term_ratio: Decimal
+    minimum_asymptotic_predicted_reliable_digits: Decimal
+    maximum_basis_condition: Decimal | None
+    maximum_basis_backward_error: Decimal | None
+    maximum_matching_reconstruction_residual: Decimal | None
+    endpoint_remainders_regular: bool
+    maximum_endpoint_reconstruction_error: Decimal
+    maximum_fd_digits_lost: Decimal
+    predicted_reliable_digits: Decimal
+    required_reliable_digits: Decimal
+    precision_limited: bool
+    asymptotic_preflight_avoided_ode: bool
+    minimum_cref_chart_margin: Decimal | None
+    maximum_carrier_change_error: Decimal | None
+    maximum_contour_angle_deformation: Decimal
+
+    def __post_init__(self) -> None:
+        if self.schema != NUMERICAL_CONDITIONING_SCHEMA:
+            raise ValueError("numerical conditioning schema is invalid")
+        for field, expected in _REGULARISED_GSN_COMMON_IDENTITIES.items():
+            if getattr(self, field) != expected:
+                raise ValueError(
+                    f"numerical conditioning {field} identity is invalid"
+                )
+        if type(self.scattering_diagnostics_applicable) is not bool:
+            raise ValueError(
+                "numerical conditioning scattering_diagnostics_applicable "
+                "must be a built-in bool"
+            )
+        if self.scattering_diagnostics_applicable:
+            expected_contract = regularised_gsn_mechanism_contract(
+                "horizon-admittance"
+            )
+        else:
+            expected_contract = regularised_gsn_mechanism_contract(
+                "exterior-fixed-r3"
+            )
+        for field, expected in expected_contract.items():
+            if getattr(self, field) != expected:
+                raise ValueError(
+                    f"numerical conditioning {field} is inconsistent with "
+                    "scattering_diagnostics_applicable"
+                )
+        for field in _NUMERICAL_CONDITIONING_DECIMAL_FIELDS:
+            value = getattr(self, field)
+            if field in _HORIZON_SCATTERING_DECIMAL_FIELDS:
+                if not self.scattering_diagnostics_applicable:
+                    if value is not None:
+                        raise ValueError(
+                            f"numerical conditioning {field} must be null "
+                            "when scattering diagnostics are not applicable"
+                        )
+                    continue
+                if value is None:
+                    raise ValueError(
+                        f"numerical conditioning {field} is required when "
+                        "scattering diagnostics are applicable"
+                    )
+            if type(value) is not Decimal or not value.is_finite():
+                raise ValueError(
+                    f"numerical conditioning {field} must be a finite Decimal"
+                )
+            if (
+                field not in _NUMERICAL_CONDITIONING_SIGNED_DECIMAL_FIELDS
+                and value < 0
+            ):
+                raise ValueError(
+                    f"numerical conditioning {field} must be nonnegative"
+                )
+        for field in _NUMERICAL_CONDITIONING_BOOLEAN_FIELDS:
+            if type(getattr(self, field)) is not bool:
+                raise ValueError(
+                    f"numerical conditioning {field} must be a built-in bool"
+                )
+        expected_precision_limited = (
+            self.predicted_reliable_digits < self.required_reliable_digits
+        )
+        if self.precision_limited != expected_precision_limited:
+            raise ValueError(
+                "numerical conditioning precision_limited must equal "
+                "predicted_reliable_digits < required_reliable_digits"
+            )
+
+    def to_mapping(self) -> dict[str, object]:
+        output: dict[str, object] = {
+            "schema": self.schema,
+            "scattering_diagnostics_applicable": (
+                self.scattering_diagnostics_applicable
+            ),
+            **{
+                field: getattr(self, field)
+                for field in _NUMERICAL_CONDITIONING_IDENTITY_FIELDS
+            },
+        }
+        for field in _NUMERICAL_CONDITIONING_DECIMAL_FIELDS:
+            value = getattr(self, field)
+            output[field] = None if value is None else str(value)
+        for field in _NUMERICAL_CONDITIONING_BOOLEAN_FIELDS:
+            output[field] = getattr(self, field)
+        return output
+
+    @classmethod
+    def from_mapping(cls, value: object) -> "NumericalConditioningEvidence":
+        expected_fields = {
+            "schema",
+            "scattering_diagnostics_applicable",
+            *_NUMERICAL_CONDITIONING_IDENTITY_FIELDS,
+            *_NUMERICAL_CONDITIONING_DECIMAL_FIELDS,
+            *_NUMERICAL_CONDITIONING_BOOLEAN_FIELDS,
+        }
+        if not isinstance(value, Mapping) or set(value) != expected_fields:
+            raise ValueError("numerical conditioning evidence fields are invalid")
+        applicability = value["scattering_diagnostics_applicable"]
+        if type(applicability) is not bool:
+            raise ValueError(
+                "numerical conditioning scattering_diagnostics_applicable "
+                "must be a built-in bool"
+            )
+        decimal_values: dict[str, Decimal | None] = {}
+        for field in _NUMERICAL_CONDITIONING_DECIMAL_FIELDS:
+            raw = value[field]
+            if field in _HORIZON_SCATTERING_DECIMAL_FIELDS and raw is None:
+                decimal_values[field] = None
+            else:
+                decimal_values[field] = _conditioning_decimal_from_text(
+                    raw, f"numerical conditioning {field}"
+                )
+        boolean_values: dict[str, bool] = {}
+        for field in _NUMERICAL_CONDITIONING_BOOLEAN_FIELDS:
+            raw = value[field]
+            if type(raw) is not bool:
+                raise ValueError(
+                    f"numerical conditioning {field} must be a built-in bool"
+                )
+            boolean_values[field] = raw
+        return cls(
+            schema=value["schema"],
+            scattering_diagnostics_applicable=applicability,
+            **{
+                field: value[field]
+                for field in _NUMERICAL_CONDITIONING_IDENTITY_FIELDS
+            },
+            **decimal_values,
+            **boolean_values,
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class RootReadout:
     omega: complex
     determinant_residual_abs: float
@@ -744,6 +1066,9 @@ class RootReadout:
     diagnostic_readouts: Mapping[str, DiagnosticRootReadout] | None = None
     source_root_mapping: Mapping[str, object] | None = None
     diagnostics_skipped_reason: str | None = None
+    numerical_conditioning: NumericalConditioningEvidence | None = None
+    normalised_determinant_abs: Decimal | None = None
+    raw_determinant_abs: Decimal | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "omega", _finite_complex(self.omega, "root omega"))
@@ -766,6 +1091,40 @@ class RootReadout:
             raise ValueError("converged must be a built-in bool")
         if not self.root_reference_id or not self.branch_id or not self.equation_id:
             raise ValueError("root readout identity fields must be nonempty")
+        if (
+            self.numerical_conditioning is not None
+            and not isinstance(
+                self.numerical_conditioning, NumericalConditioningEvidence
+            )
+        ):
+            raise ValueError("root readout numerical conditioning has invalid type")
+        for name in ("normalised_determinant_abs", "raw_determinant_abs"):
+            value = getattr(self, name)
+            if value is None:
+                continue
+            if type(value) is not Decimal or not value.is_finite() or value < 0:
+                raise ValueError(
+                    f"{name} must be a finite nonnegative Decimal or None"
+                )
+        if self.numerical_conditioning is not None:
+            if self.numerical_conditioning.scattering_diagnostics_applicable:
+                if self.raw_determinant_abs is None:
+                    raise ValueError(
+                        "raw_determinant_abs is required for horizon scattering"
+                    )
+            elif self.raw_determinant_abs is not None:
+                raise ValueError(
+                    "raw_determinant_abs must be null for an exterior Wronskian"
+                )
+        if (
+            self.normalised_determinant_abs is not None
+            and float(self.normalised_determinant_abs)
+            != self.determinant_residual_abs
+        ):
+            raise ValueError(
+                "normalised_determinant_abs disagrees with "
+                "determinant_residual_abs"
+            )
         object.__setattr__(
             self,
             "source_root_mapping",
@@ -870,6 +1229,14 @@ class RootReadout:
             }
         if self.diagnostics_skipped_reason is not None:
             output["diagnostics_skipped_reason"] = self.diagnostics_skipped_reason
+        if self.numerical_conditioning is not None:
+            output["numerical_conditioning"] = (
+                self.numerical_conditioning.to_mapping()
+            )
+        for name in ("normalised_determinant_abs", "raw_determinant_abs"):
+            value = getattr(self, name)
+            if value is not None:
+                output[name] = str(value)
         return output
 
     @classmethod
@@ -916,6 +1283,29 @@ class RootReadout:
                 None
                 if value.get("diagnostics_skipped_reason") is None
                 else str(value["diagnostics_skipped_reason"])
+            ),
+            numerical_conditioning=(
+                None
+                if "numerical_conditioning" not in value
+                else NumericalConditioningEvidence.from_mapping(
+                    value["numerical_conditioning"]
+                )
+            ),
+            normalised_determinant_abs=(
+                None
+                if "normalised_determinant_abs" not in value
+                else _conditioning_decimal_from_text(
+                    value["normalised_determinant_abs"],
+                    "root readout normalised_determinant_abs",
+                )
+            ),
+            raw_determinant_abs=(
+                None
+                if "raw_determinant_abs" not in value
+                else _conditioning_decimal_from_text(
+                    value["raw_determinant_abs"],
+                    "root readout raw_determinant_abs",
+                )
             ),
         )
 
@@ -1383,6 +1773,26 @@ class ComponentResult:
     baseline: RootReadout
     levels: tuple[LadderLevel, ...]
     lineage: Mapping[str, object]
+
+    def __post_init__(self) -> None:
+        conditioned_readouts = tuple(
+            readout
+            for readout in self.raw_readouts
+            if readout.numerical_conditioning is not None
+        )
+        if not conditioned_readouts:
+            return
+        expected = regularised_gsn_mechanism_contract(self.mechanism_id)
+        for readout in conditioned_readouts:
+            evidence = readout.numerical_conditioning
+            assert evidence is not None
+            if any(
+                getattr(evidence, field) != value
+                for field, value in expected.items()
+            ):
+                raise ValueError(
+                    "component readout determinant family disagrees with mechanism"
+                )
 
     @property
     def usable(self) -> bool:

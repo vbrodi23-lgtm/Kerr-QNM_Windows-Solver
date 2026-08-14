@@ -194,11 +194,11 @@ class CampaignPlanTests(unittest.TestCase):
         deep = next(item for item in plan.leaves if item.role == "deep")
 
         self.assertEqual(CAMPAIGN_SCHEMA_VERSION, 2)
-        self.assertEqual(CAMPAIGN_CHECKPOINT_SCHEMA_VERSION, 4)
+        self.assertEqual(CAMPAIGN_CHECKPOINT_SCHEMA_VERSION, 6)
         with self.subTest(contract="identity"):
             self.assertEqual(
                 scientific_computation_identity_sha256(plan, primary),
-                "349d9d7f0898109623ab612538ab4eed8b9e0c1f7d0fcc4d5b9926850b26eeee",
+                "5710cf7b3f53aab8602c07d170dad3e8e1e2527b0c179a27c191607e2babf575",
             )
             self.assertEqual(
                 scientific_computation_identity_sha256(plan, control),
@@ -206,7 +206,7 @@ class CampaignPlanTests(unittest.TestCase):
             )
             self.assertEqual(
                 scientific_computation_identity_sha256(plan, deep),
-                "da5c572b8b8190786a9391aa622b0443064160993f87e6975802447aff2e906a",
+                "56a0a02efba9d6d746f7aa935009d753313f1f8e790fc1e5114e71004b801639",
             )
 
         leaf = primary
@@ -570,7 +570,7 @@ class CampaignPlanTests(unittest.TestCase):
         })
 
         self.assertEqual(CAMPAIGN_SCHEMA_VERSION, 2)
-        self.assertEqual(CAMPAIGN_CHECKPOINT_SCHEMA_VERSION, 4)
+        self.assertEqual(CAMPAIGN_CHECKPOINT_SCHEMA_VERSION, 6)
         self.assertEqual(record.to_mapping()["signed_error_channels"], list(channels))
         forged = record.to_mapping()
         injected = dict(forged["signed_error_channels"][0])

@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections import deque
 from collections.abc import Mapping
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 import json
 import math
 import os
@@ -16,7 +17,11 @@ import time
 from typing import TYPE_CHECKING, TextIO
 from uuid import uuid4
 
-from .campaign_reports import CampaignReportModel, refresh_campaign_reports
+from .campaign_reports import (
+    CONDITIONING_REPORT_COLUMNS,
+    CampaignReportModel,
+    refresh_campaign_reports,
+)
 from .precision_tiers import precision_tier_presentation
 from .progress import PROGRESS_SCHEMA, ProgressEvent, ProgressEventKind, ProgressMode
 
@@ -109,6 +114,8 @@ _FORCED_STATUS_KINDS = frozenset(
         ProgressEventKind.LEAF_FAILED,
         ProgressEventKind.LEAF_INTERRUPTED,
         ProgressEventKind.PRECISION_STAGE_STARTED,
+        ProgressEventKind.ASYMPTOTIC_SERIES_EVALUATED,
+        ProgressEventKind.CONDITIONING_EVALUATED,
         ProgressEventKind.ODE_SOLVE_COMPLETED,
         ProgressEventKind.ODE_SOLVE_FAILED,
         ProgressEventKind.ODE_RESOURCE_LIMIT,
@@ -131,6 +138,8 @@ _DASHBOARD_FORCED_KINDS = frozenset(
         ProgressEventKind.ROOT_PHASE_STARTED,
         ProgressEventKind.ROOT_SEED_SELECTED,
         ProgressEventKind.ROOT_PHASE_COMPLETED,
+        ProgressEventKind.ASYMPTOTIC_SERIES_EVALUATED,
+        ProgressEventKind.CONDITIONING_EVALUATED,
         ProgressEventKind.ODE_SOLVE_FAILED,
         ProgressEventKind.ODE_RESOURCE_LIMIT,
         ProgressEventKind.ROOT_READOUT_RESOURCE_INFEASIBLE,
@@ -153,6 +162,12 @@ _DASHBOARD_LIVE_KINDS = frozenset(
         ProgressEventKind.ODE_SOLVE_STARTED,
         ProgressEventKind.ODE_SOLVE_PROGRESS,
         ProgressEventKind.ODE_SOLVE_COMPLETED,
+        ProgressEventKind.ASYMPTOTIC_SERIES_EVALUATED,
+        ProgressEventKind.CARRIER_CHANGED,
+        ProgressEventKind.FACTORED_ODE_COMPLETED,
+        ProgressEventKind.SCATTERING_COEFFICIENTS_EXTRACTED,
+        ProgressEventKind.DETERMINANT_CHART_EVALUATED,
+        ProgressEventKind.CONDITIONING_EVALUATED,
     }
 )
 _LEAF_TIMING_WINDOW = 10
@@ -189,6 +204,36 @@ _ODE_PROGRESS_STATE_KEYS = (
     "limiting_resource",
     "request_elapsed_seconds",
 )
+_CONDITIONING_LIVE_STATE_KEYS = (
+    "homogeneous_representation",
+    "determinant_family",
+    "determinant_normalisation",
+    "scattering_diagnostics_applicable",
+    "scattering_column_convention",
+    "determinant_convention",
+    "current_carrier",
+    "maximum_series_digits_lost",
+    "maximum_recurrence_digits_lost",
+    "maximum_series_evaluation_spread",
+    "maximum_basis_condition",
+    "maximum_basis_backward_error",
+    "maximum_matching_reconstruction_residual",
+    "endpoint_remainders_regular",
+    "maximum_endpoint_reconstruction_error",
+    "maximum_contour_angle_deformation",
+    "maximum_fd_digits_lost",
+    "predicted_reliable_digits",
+    "required_reliable_digits",
+    "precision_limited",
+    "minimum_cref_chart_margin",
+    "maximum_carrier_change_error",
+    "normalised_determinant_abs",
+    "raw_determinant_abs",
+    "determinant_chart",
+    "cref_chart_safe",
+    "asymptotic_preflight_adequate",
+    "asymptotic_preflight_avoided_ode",
+)
 _PRECISION_LIVE_STATE_KEYS = (
     "phase",
     "seed_kind",
@@ -210,12 +255,15 @@ _PRECISION_LIVE_STATE_KEYS = (
     "readout_role",
     "epsilon",
     "amplitude",
+    *_CONDITIONING_LIVE_STATE_KEYS,
     *_RADIAL_PROGRESS_STATE_KEYS,
     *_ODE_PROGRESS_STATE_KEYS,
 )
 
 
 def _json_value(value: object) -> object:
+    if isinstance(value, Decimal):
+        return str(value)
     if isinstance(value, Mapping):
         return {str(key): _json_value(item) for key, item in value.items()}
     if isinstance(value, (list, tuple)):
@@ -916,6 +964,7 @@ class CampaignProgressReporter:
         acceptance_threshold = payload.get("acceptance_threshold")
         if acceptance_threshold is not None:
             self._dashboard_state["acceptance_threshold"] = acceptance_threshold
+        self._update_conditioning_dashboard_state(kind, payload)
         if kind == ProgressEventKind.SUBOPERATION_PROGRESS.value:
             self._dashboard_state.update({
                 "radial_suboperation": (
@@ -1106,6 +1155,142 @@ class CampaignProgressReporter:
         elif kind == ProgressEventKind.REQUEST_INTERRUPTED.value:
             self._dashboard_state["root_status"] = "INTERRUPTED"
             self._dashboard_state["execution_state"] = "INTERRUPTED"
+
+    def _update_conditioning_dashboard_state(
+        self, kind: str, payload: Mapping[str, object]
+    ) -> None:
+        """Retain bounded factored diagnostics, never full series values."""
+
+        payload_names = {
+            "homogeneous_representation": (
+                "homogeneous_representation",
+                "representation_id",
+            ),
+            "determinant_family": ("determinant_family",),
+            "determinant_normalisation": ("determinant_normalisation",),
+            "scattering_diagnostics_applicable": (
+                "scattering_diagnostics_applicable",
+            ),
+            "scattering_column_convention": (
+                "scattering_column_convention",
+            ),
+            "determinant_convention": ("determinant_convention",),
+            "current_carrier": (
+                "current_carrier",
+                "carrier_id",
+                "carrier",
+                "to_carrier",
+            ),
+            "maximum_series_digits_lost": (
+                "maximum_series_digits_lost",
+                "series_digits_lost",
+            ),
+            "maximum_recurrence_digits_lost": (
+                "maximum_recurrence_digits_lost",
+                "recurrence_digits_lost",
+            ),
+            "maximum_series_evaluation_spread": (
+                "maximum_series_evaluation_spread",
+                "series_evaluation_spread",
+            ),
+            "maximum_basis_condition": (
+                "maximum_basis_condition",
+                "basis_condition",
+            ),
+            "maximum_basis_backward_error": (
+                "maximum_basis_backward_error",
+                "basis_backward_error",
+            ),
+            "maximum_matching_reconstruction_residual": (
+                "maximum_matching_reconstruction_residual",
+                "matching_reconstruction_residual",
+            ),
+            "endpoint_remainders_regular": ("endpoint_remainders_regular",),
+            "maximum_endpoint_reconstruction_error": (
+                "maximum_endpoint_reconstruction_error",
+                "endpoint_reconstruction_error",
+            ),
+            "maximum_contour_angle_deformation": (
+                "maximum_contour_angle_deformation",
+                "contour_angle_deformation",
+            ),
+            "maximum_fd_digits_lost": (
+                "maximum_fd_digits_lost",
+                "fd_digits_lost",
+                "digits_lost_fd",
+            ),
+            "predicted_reliable_digits": ("predicted_reliable_digits",),
+            "required_reliable_digits": ("required_reliable_digits",),
+            "precision_limited": ("precision_limited",),
+            "minimum_cref_chart_margin": (
+                "minimum_cref_chart_margin",
+                "cref_chart_margin",
+            ),
+            "maximum_carrier_change_error": (
+                "maximum_carrier_change_error",
+                "carrier_change_error",
+            ),
+            "normalised_determinant_abs": ("normalised_determinant_abs",),
+            "raw_determinant_abs": ("raw_determinant_abs",),
+            "cref_chart_safe": ("cref_chart_safe",),
+            "asymptotic_preflight_adequate": (
+                "asymptotic_preflight_adequate",
+                "adequate",
+            ),
+            "asymptotic_preflight_avoided_ode": (
+                "asymptotic_preflight_avoided_ode",
+                "ode_avoided",
+            ),
+        }
+        applicability = payload.get("scattering_diagnostics_applicable")
+        mechanism_id = self._dashboard_state.get("mechanism_id")
+        if mechanism_id == "horizon-admittance":
+            exterior = False
+        elif isinstance(mechanism_id, str) and mechanism_id.startswith(
+            "exterior-"
+        ):
+            exterior = True
+        else:
+            exterior = applicability is False or (
+                payload.get("determinant_family") == "exterior-wronskian/v1"
+            )
+        exterior_forbidden_fields = frozenset({
+            "maximum_basis_condition",
+            "maximum_basis_backward_error",
+            "maximum_matching_reconstruction_residual",
+            "minimum_cref_chart_margin",
+            "maximum_carrier_change_error",
+            "scattering_column_convention",
+            "cref_chart_safe",
+            "raw_determinant_abs",
+        })
+        if exterior:
+            # These values belong only to the horizon scattering solve.  Clear
+            # them explicitly because ignoring JSON null would display stale
+            # Cref/basis evidence from an earlier event.
+            for name in exterior_forbidden_fields:
+                self._dashboard_state.pop(name, None)
+        for state_name, candidates in payload_names.items():
+            if exterior and state_name in exterior_forbidden_fields:
+                continue
+            for payload_name in candidates:
+                if payload_name in payload and payload[payload_name] is not None:
+                    self._dashboard_state[state_name] = payload[payload_name]
+                    break
+        if exterior:
+            self._dashboard_state.update({
+                "determinant_family": "exterior-wronskian/v1",
+                "determinant_convention": (
+                    "wronskian-perturbed-Xin-with-Xup/v1"
+                ),
+                "determinant_normalisation": (
+                    "unit-asymptotic-branch-wronskian/v1"
+                ),
+                "scattering_diagnostics_applicable": False,
+                "determinant_chart": "unit-asymptotic branch Wronskian",
+            })
+        elif kind == ProgressEventKind.DETERMINANT_CHART_EVALUATED.value:
+            self._dashboard_state["determinant_chart"] = "Cinc/Cref − R"
 
     def _promotion_reason(
         self, leaf_id: object, precision_digits: object
@@ -1413,6 +1598,13 @@ class CampaignProgressReporter:
                 "ProjectiveReason",
                 None if projective is None else projective.get("reason"),
             ),
+            *tuple(
+                (
+                    name,
+                    None if row is None else row.get(name),
+                )
+                for name in CONDITIONING_REPORT_COLUMNS
+            ),
         )
 
     def _dashboard_fields(
@@ -1647,6 +1839,7 @@ class CampaignProgressReporter:
         suboperation = state.get("suboperation")
         radial = self._radial_progress_text()
         ode_lines = self._ode_progress_lines(compact=compact)
+        conditioning_lines = self._conditioning_progress_lines(compact=compact)
         if compact:
             suboperation_text = self._dashboard_value(suboperation)
             if radial is not None:
@@ -1664,6 +1857,7 @@ class CampaignProgressReporter:
                 self._dashboard_field_line("Current ω", current_omega),
                 f" |D|            {determinant_abs} | Best |D| {best_determinant_abs}",
                 *ode_lines,
+                *conditioning_lines,
             ]
         return [
             "",
@@ -1694,6 +1888,7 @@ class CampaignProgressReporter:
             self._dashboard_field_line("Suboperation", suboperation),
             self._dashboard_field_line("Radial progress", radial),
             *ode_lines,
+            *conditioning_lines,
         ]
 
     def _radial_progress_text(self) -> str | None:
@@ -1758,6 +1953,82 @@ class CampaignProgressReporter:
             self._dashboard_field_line("Algorithm", algorithm),
         ]
 
+    def _conditioning_progress_lines(self, *, compact: bool) -> list[str]:
+        """Render the bounded state, excluding detailed complex series values."""
+
+        state = self._dashboard_state
+        if not any(
+            state.get(name) is not None
+            for name in _CONDITIONING_LIVE_STATE_KEYS
+        ):
+            return []
+
+        def shown(name: str) -> str:
+            value = state.get(name)
+            return "-" if value is None else str(value)
+
+        adequate = state.get("asymptotic_preflight_adequate")
+        if adequate is True:
+            adequacy = "adequate"
+        elif adequate is False:
+            adequacy = "inadequate"
+        else:
+            adequacy = "-"
+        avoided = state.get("asymptotic_preflight_avoided_ode")
+        avoided_text = (
+            "yes" if avoided is True else "no" if avoided is False else "-"
+        )
+        safe = state.get("cref_chart_safe")
+        safe_text = "safe" if safe is True else "unsafe" if safe is False else "-"
+        representation = shown("homogeneous_representation")
+        determinant_family = shown("determinant_family")
+        carrier = shown("current_carrier")
+        asymptotic = (
+            f"{adequacy}; loss={shown('maximum_series_digits_lost')}; "
+            f"spread={shown('maximum_series_evaluation_spread')}; "
+            f"ODE avoided={avoided_text}"
+        )
+        losses = (
+            f"recurrence={shown('maximum_recurrence_digits_lost')}; "
+            f"basis={shown('maximum_basis_condition')}; "
+            f"FD={shown('maximum_fd_digits_lost')}"
+        )
+        reliable = (
+            f"{shown('predicted_reliable_digits')} / "
+            f"{shown('required_reliable_digits')}"
+        )
+        if state.get("scattering_diagnostics_applicable") is False:
+            chart = (
+                f"{shown('determinant_chart')}; scattering n/a; "
+                f"|D|={shown('normalised_determinant_abs')}"
+            )
+        else:
+            chart = (
+                f"{shown('determinant_chart')}; Cref {safe_text}; "
+                f"|D|={shown('normalised_determinant_abs')}"
+            )
+        if compact:
+            return [
+                " FACTORED CONDITIONING",
+                f" Representation {representation} | Determinant {determinant_family}",
+                f" Carrier        {carrier}",
+                f" Asymptotic     {asymptotic}",
+                f" Loss/condition {losses}",
+                f" Reliable digits {reliable}",
+                f" Chart          {chart}",
+            ]
+        return [
+            "",
+            " FACTORED CONDITIONING",
+            self._dashboard_field_line("Representation", representation),
+            self._dashboard_field_line("Determinant", determinant_family),
+            self._dashboard_field_line("Carrier", carrier),
+            self._dashboard_field_line("Asymptotic", asymptotic),
+            self._dashboard_field_line("Loss/condition", losses),
+            self._dashboard_field_line("Reliable digits", reliable),
+            self._dashboard_field_line("Chart", chart),
+        ]
+
     def _live_execution_mapping(self) -> dict[str, object]:
         state = self._dashboard_state
         mode = state.get("mode")
@@ -1816,6 +2087,31 @@ class CampaignProgressReporter:
             "radial_rhs_evaluations": state.get("radial_rhs_evaluations"),
             "radial_rho_span_fraction": state.get("radial_rho_span_fraction"),
             "radial_elapsed_seconds": state.get("radial_elapsed_seconds"),
+            **{
+                name: state.get(name)
+                for name in _CONDITIONING_LIVE_STATE_KEYS
+            },
+            "series_digits_lost_max": state.get(
+                "maximum_series_digits_lost"
+            ),
+            "recurrence_digits_lost_max": state.get(
+                "maximum_recurrence_digits_lost"
+            ),
+            "basis_condition_max": state.get("maximum_basis_condition"),
+            "basis_backward_error_max": state.get(
+                "maximum_basis_backward_error"
+            ),
+            "matching_reconstruction_residual_max": state.get(
+                "maximum_matching_reconstruction_residual"
+            ),
+            "endpoint_reconstruction_error_max": state.get(
+                "maximum_endpoint_reconstruction_error"
+            ),
+            "contour_angle_deformation_max": state.get(
+                "maximum_contour_angle_deformation"
+            ),
+            "fd_digits_lost_max": state.get("maximum_fd_digits_lost"),
+            "cref_chart_margin_min": state.get("minimum_cref_chart_margin"),
             **{name: state.get(name) for name in _ODE_PROGRESS_STATE_KEYS},
         }
 

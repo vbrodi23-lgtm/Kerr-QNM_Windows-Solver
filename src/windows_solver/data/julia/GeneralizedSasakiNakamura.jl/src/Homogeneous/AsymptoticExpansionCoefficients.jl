@@ -6,9 +6,1512 @@ using ..Coordinates
 
 export outgoing_coefficient_at_inf, ingoing_coefficient_at_inf
 export outgoing_coefficient_at_hor, ingoing_coefficient_at_hor
+export AsymptoticFamily
+export INFINITY_INGOING_SERIES, INFINITY_OUTGOING_SERIES
+export HORIZON_INGOING_SERIES, HORIZON_OUTGOING_SERIES
+export AsymptoticFailureReason, AsymptoticConstructionError
+export PHYSICAL_SINGULAR_LIMIT, ALGEBRAIC_REPRESENTATION_SINGULAR
+export SeriesKey, TypedTaylorWorkspace, RecurrenceEvidence
+export AsymptoticSeries, AsymptoticSeriesBundle
+export build_asymptotic_series, build_asymptotic_series_bundle
+export build_infinity_recurrence_from_zero
+export SeriesEvaluation, AsymptoticConditioningAssessment
+export ASYMPTOTIC_CONDITIONING_ESTIMATE_KIND
+export evaluate_asymptotic_series
+export evaluate_infinity_asymptotic_series, evaluate_horizon_asymptotic_series
+export assess_asymptotic_preflight
 
 const I = 1im # Mathematica being Mathematica
 _DEFAULTDATATYPE = ComplexF64 # Double precision by default
+const ASYMPTOTIC_CONDITIONING_ESTIMATE_KIND =
+    "empirical-three-way-series-conditioning/not-a-bound/v1"
+
+@enum AsymptoticFamily begin
+    INFINITY_INGOING_SERIES = 1
+    INFINITY_OUTGOING_SERIES = 2
+    HORIZON_INGOING_SERIES = 3
+    HORIZON_OUTGOING_SERIES = 4
+end
+
+@enum AsymptoticFailureReason begin
+    INVALID_ASYMPTOTIC_INPUT = 1
+    INVALID_ASYMPTOTIC_ORDER = 2
+    PRECISION_MISMATCH = 3
+    NONFINITE_ASYMPTOTIC_DATA = 4
+    PHYSICAL_SINGULAR_LIMIT = 5
+    ALGEBRAIC_REPRESENTATION_SINGULAR = 6
+end
+
+struct AsymptoticConstructionError <: Exception
+    reason::AsymptoticFailureReason
+    family::Union{Nothing,AsymptoticFamily}
+    order::Int
+    precision_bits::Int
+    message::String
+end
+
+function Base.showerror(io::IO, error::AsymptoticConstructionError)
+    print(
+        io,
+        string(error.reason),
+        ": ",
+        error.message,
+        " (family=", error.family,
+        ", order=", error.order,
+        ", precision_bits=", error.precision_bits,
+        ")",
+    )
+end
+
+struct SeriesKey{T<:AbstractFloat}
+    s::Int
+    m::Int
+    a::T
+    omega::Complex{T}
+    lambda::Complex{T}
+    family::AsymptoticFamily
+    max_order::Int
+    precision_bits::Int
+end
+
+struct TypedTaylorWorkspace{T<:AbstractFloat}
+    center::Complex{T}
+    coefficients::Vector{Complex{T}}
+end
+
+struct RecurrenceEvidence{T<:AbstractFloat}
+    denominator_value::Complex{T}
+    denominator_scale::T
+    value_scale::T
+    recurrence_term_abs_sum::T
+    cancellation_factor::T
+    cancellation_digits::T
+    family::AsymptoticFamily
+    order::Int
+    precision_bits::Int
+end
+
+struct AsymptoticSeries{T<:AbstractFloat}
+    key::SeriesKey{T}
+    coefficients::Vector{Complex{T}}
+    P::TypedTaylorWorkspace{T}
+    Q::TypedTaylorWorkspace{T}
+    evidence::Vector{RecurrenceEvidence{T}}
+end
+
+struct AsymptoticSeriesBundle{T<:AbstractFloat}
+    infinity_ingoing::AsymptoticSeries{T}
+    infinity_outgoing::AsymptoticSeries{T}
+    horizon_ingoing::AsymptoticSeries{T}
+    horizon_outgoing::AsymptoticSeries{T}
+end
+
+struct SeriesEvaluation{T<:AbstractFloat}
+    key::SeriesKey{T}
+    family::AsymptoticFamily
+    order::Int
+    precision_bits::Int
+    series_eval_horner::Complex{T}
+    series_eval_compensated::Complex{T}
+    series_eval_alternate::Complex{T}
+    series_evaluation_spread::T
+    series_evaluation_digits_lost::T
+    last_term_magnitude::T
+    last_term_total_ratio::T
+    series_derivative_horner::Complex{T}
+    series_derivative_compensated::Complex{T}
+    series_derivative_alternate::Complex{T}
+    derivative_evaluation_spread::T
+    derivative_evaluation_digits_lost::T
+    derivative_last_term_magnitude::T
+    derivative_last_term_total_ratio::T
+    maximum_recurrence_cancellation_factor::T
+    recurrence_digits_lost::T
+    estimate_kind::String
+end
+
+function _series_keys_match_exactly(
+    left::SeriesKey{T}, right::SeriesKey{T}
+) where {T<:AbstractFloat}
+    return left.s == right.s &&
+        left.m == right.m &&
+        isequal(left.a, right.a) &&
+        isequal(left.omega, right.omega) &&
+        isequal(left.lambda, right.lambda) &&
+        left.family == right.family &&
+        left.max_order == right.max_order &&
+        left.precision_bits == right.precision_bits
+end
+
+struct AsymptoticConditioningAssessment{T<:AbstractFloat}
+    adequate::Bool
+    reason::Union{Nothing,String}
+    precision_bits::Int
+    arithmetic_decimal_digits::T
+    required_digits::T
+    safety_margin_digits::T
+    maximum_recurrence_digits_lost::T
+    maximum_recurrence_cancellation_factor::T
+    maximum_series_evaluation_spread::T
+    maximum_series_evaluation_digits_lost::T
+    maximum_last_term_ratio::T
+    maximum_truncation_digits_lost::T
+    effective_digits_lost::T
+    predicted_reliable_digits::T
+    estimate_kind::String
+end
+
+typed_integer(::Type{T}, value::Integer) where {T<:AbstractFloat} = T(value)
+
+function _construction_error(
+    reason::AsymptoticFailureReason,
+    key::SeriesKey,
+    message::AbstractString;
+    order::Int=key.max_order,
+)
+    return AsymptoticConstructionError(
+        reason, key.family, order, key.precision_bits, String(message)
+    )
+end
+
+function _finite_complex(value::Complex)
+    return isfinite(real(value)) && isfinite(imag(value))
+end
+
+function _complex_precision_matches(value::Complex, precision_bits::Int)
+    return precision(real(value)) == precision_bits &&
+        precision(imag(value)) == precision_bits
+end
+
+function SeriesKey(
+    s::Int,
+    m::Int,
+    a::T,
+    omega::Union{T,Complex{T}},
+    lambda::Union{T,Complex{T}},
+    family::AsymptoticFamily,
+    max_order::Int,
+    precision_bits::Int,
+) where {T<:AbstractFloat}
+    typed_omega = Complex{T}(omega)
+    typed_lambda = Complex{T}(lambda)
+    provisional = SeriesKey{T}(
+        s, m, a, typed_omega, typed_lambda, family, max_order, precision_bits
+    )
+    max_order >= 0 || throw(_construction_error(
+        INVALID_ASYMPTOTIC_ORDER,
+        provisional,
+        "maximum expansion order must be nonnegative",
+    ))
+    precision_bits > 0 || throw(_construction_error(
+        PRECISION_MISMATCH,
+        provisional,
+        "precision_bits must be positive and mandatory",
+    ))
+    input_precision_matches = precision(a) == precision_bits &&
+        _complex_precision_matches(typed_omega, precision_bits) &&
+        _complex_precision_matches(typed_lambda, precision_bits)
+    input_precision_matches || throw(_construction_error(
+        PRECISION_MISMATCH,
+        provisional,
+        "requested precision does not match every input component; Float64 " *
+        "inputs cannot be promoted into purported high-precision evidence",
+    ))
+    isfinite(a) && _finite_complex(typed_omega) && _finite_complex(typed_lambda) ||
+        throw(_construction_error(
+            NONFINITE_ASYMPTOTIC_DATA,
+            provisional,
+            "asymptotic inputs must be finite",
+        ))
+    return provisional
+end
+
+function SeriesKey(
+    s::Int,
+    m::Int,
+    a::Number,
+    omega::Number,
+    lambda::Number,
+    family::AsymptoticFamily,
+    max_order::Int,
+    precision_bits::Int,
+)
+    throw(AsymptoticConstructionError(
+        PRECISION_MISMATCH,
+        family,
+        max_order,
+        precision_bits,
+        "all floating input components must have one exact real type and " *
+        "cannot be promoted into purported high-precision evidence",
+    ))
+end
+
+function _with_request_precision(
+    operation::F, ::Type{BigFloat}, precision_bits::Int
+) where {F}
+    return setprecision(BigFloat, precision_bits) do
+        operation()
+    end
+end
+
+function _with_request_precision(
+    operation::F, ::Type{T}, precision_bits::Int
+) where {F,T<:AbstractFloat}
+    precision(T) == precision_bits || throw(ArgumentError(
+        "fixed-width real type disagrees with requested precision"
+    ))
+    return operation()
+end
+
+_component_type(::Type{Complex{T}}) where {T<:AbstractFloat} = T
+_component_type(::Type{T}) where {T<:AbstractFloat} = T
+
+function _legacy_real_component(::Type{T}, value, name::AbstractString) where {T}
+    if value isa Integer || value isa Rational
+        return T(value)
+    elseif value isa T
+        return value
+    end
+    throw(AsymptoticConstructionError(
+        PRECISION_MISMATCH,
+        nothing,
+        -1,
+        precision(T),
+        "$name cannot be promoted into purported high-precision evidence",
+    ))
+end
+
+function _legacy_complex_component(
+    ::Type{T}, value::Number, name::AbstractString
+) where {T<:AbstractFloat}
+    real_part = _legacy_real_component(T, real(value), "$name real component")
+    imag_part = _legacy_real_component(T, imag(value), "$name imaginary component")
+    return complex(real_part, imag_part)
+end
+
+function _legacy_series_key(
+    s::Int,
+    m::Int,
+    a,
+    omega,
+    lambda,
+    family::AsymptoticFamily,
+    max_order::Int,
+    data_type,
+)
+    T = _component_type(data_type)
+    typed_a = _legacy_real_component(T, a, "a")
+    typed_omega = _legacy_complex_component(T, omega, "omega")
+    typed_lambda = _legacy_complex_component(T, lambda, "lambda")
+    return SeriesKey(
+        s,
+        m,
+        typed_a,
+        typed_omega,
+        typed_lambda,
+        family,
+        max_order,
+        precision(typed_a),
+    )
+end
+
+function _assert_value(key::SeriesKey{T}, value::Complex{T}, name::AbstractString) where {T}
+    _finite_complex(value) || throw(_construction_error(
+        NONFINITE_ASYMPTOTIC_DATA,
+        key,
+        "$name is nonfinite",
+    ))
+    _complex_precision_matches(value, key.precision_bits) || throw(_construction_error(
+        PRECISION_MISMATCH,
+        key,
+        "$name precision differs from the request precision",
+    ))
+    return value
+end
+
+function _typed_taylor_workspace(
+    key::SeriesKey{T}, function_to_expand::F, maximum_order::Int, name::AbstractString
+) where {T<:AbstractFloat,F}
+    center = zero(Complex{T})
+    _complex_precision_matches(center, key.precision_bits) || throw(_construction_error(
+        PRECISION_MISMATCH,
+        key,
+        "$name Taylor centre precision differs from the request precision",
+    ))
+    raw_workspace = taylor_expand(
+        function_to_expand, center, order=maximum_order
+    )
+    coefficients = Vector{Complex{T}}(undef, maximum_order + 1)
+    for order in 0:maximum_order
+        coefficient = Complex{T}(getcoeff(raw_workspace, order))
+        coefficients[order + 1] = _assert_value(
+            key, coefficient, "$name Taylor coefficient $order"
+        )
+    end
+    return TypedTaylorWorkspace{T}(center, coefficients)
+end
+
+function _chart_denominator(key::SeriesKey{T}) where {T}
+    lambda = key.lambda
+    omega = key.omega
+    a = key.a
+    mT = typed_integer(T, key.m)
+    imaginary_unit = complex(zero(T), one(T))
+    if key.s == 1
+        denominator = lambda + typed_integer(T, 2)
+        scale = abs(lambda) + typed_integer(T, 2)
+    elseif key.s == -1
+        denominator = lambda
+        scale = abs(lambda)
+    elseif key.s == 2
+        Eplus = lambda^2 + typed_integer(T, 10) * lambda + typed_integer(T, 24) +
+            typed_integer(T, 12) * (imaginary_unit + a * mT) * omega -
+            typed_integer(T, 12) * a^2 * omega^2
+        denominator = Eplus
+        scale = abs(lambda^2) + abs(typed_integer(T, 10) * lambda) +
+            typed_integer(T, 24) +
+            abs(typed_integer(T, 12) * (imaginary_unit + a * mT) * omega) +
+            abs(typed_integer(T, 12) * a^2 * omega^2)
+    elseif key.s == -2
+        Eminus = lambda * (lambda + typed_integer(T, 2)) -
+            typed_integer(T, 12) * omega *
+            (imaginary_unit - a * mT + a^2 * omega)
+        denominator = Eminus
+        scale = abs(lambda * (lambda + typed_integer(T, 2))) +
+            abs(typed_integer(T, 12) * omega *
+                (imaginary_unit - a * mT + a^2 * omega))
+    elseif key.s == 0
+        denominator = one(Complex{T})
+        scale = one(T)
+    else
+        throw(_construction_error(
+            INVALID_ASYMPTOTIC_INPUT,
+            key,
+            "only spin weights 0, +/-1, and +/-2 are supported",
+        ))
+    end
+    _assert_value(key, Complex{T}(denominator), "GSN chart denominator")
+    isfinite(scale) || throw(_construction_error(
+        NONFINITE_ASYMPTOTIC_DATA,
+        key,
+        "GSN chart denominator scale is nonfinite",
+    ))
+    iszero(denominator) && throw(_construction_error(
+        ALGEBRAIC_REPRESENTATION_SINGULAR,
+        key,
+        "unresolved exact low-order GSN chart denominator",
+    ))
+    return Complex{T}(denominator), T(scale)
+end
+
+function _cancellation_metrics(
+    ::Type{T}, recurrence_term_abs_sum::T, value_scale::T, precision_bits::Int
+) where {T<:AbstractFloat}
+    arithmetic_digits = typed_integer(T, precision_bits) * log10(typed_integer(T, 2))
+    if iszero(recurrence_term_abs_sum)
+        cancellation_digits = zero(T)
+    elseif iszero(value_scale)
+        cancellation_digits = arithmetic_digits
+    else
+        cancellation_digits = min(
+            arithmetic_digits,
+            max(
+                zero(T),
+                log10(max(one(T), recurrence_term_abs_sum / value_scale)),
+            ),
+        )
+    end
+    cancellation_factor = typed_integer(T, 10)^cancellation_digits
+    return cancellation_factor, cancellation_digits
+end
+
+function _chart_digits_lost(
+    ::Type{T}, denominator::Complex{T}, scale::T, precision_bits::Int
+) where {T}
+    _, digits = _cancellation_metrics(T, scale, abs(denominator), precision_bits)
+    return digits
+end
+
+function _recurrence_evidence(
+    key::SeriesKey{T},
+    order::Int,
+    denominator::Complex{T},
+    denominator_scale::T,
+    value::Complex{T},
+    recurrence_term_abs_sum::T,
+    extra_digits_lost::T,
+) where {T<:AbstractFloat}
+    factor, digits = _cancellation_metrics(
+        T, recurrence_term_abs_sum, abs(value * denominator), key.precision_bits
+    )
+    digits = max(digits, extra_digits_lost)
+    factor = max(factor, typed_integer(T, 10)^digits)
+    evidence = RecurrenceEvidence{T}(
+        denominator,
+        denominator_scale,
+        abs(value),
+        recurrence_term_abs_sum,
+        factor,
+        digits,
+        key.family,
+        order,
+        key.precision_bits,
+    )
+    all(isfinite, (
+        evidence.denominator_scale,
+        evidence.value_scale,
+        evidence.recurrence_term_abs_sum,
+        evidence.cancellation_factor,
+        evidence.cancellation_digits,
+    )) || throw(_construction_error(
+        NONFINITE_ASYMPTOTIC_DATA,
+        key,
+        "recurrence evidence is nonfinite",
+        order=order,
+    ))
+    return evidence
+end
+
+function _potential_workspaces(key::SeriesKey{T}) where {T}
+    if key.family == INFINITY_INGOING_SERIES
+        P_function(z) = PminusInf_z(
+            key.s, key.m, key.a, key.omega, key.lambda, z
+        )
+        Q_function(z) = QminusInf_z(
+            key.s, key.m, key.a, key.omega, key.lambda, z
+        )
+        P = _typed_taylor_workspace(key, P_function, key.max_order, "PminusInf")
+        Q = _typed_taylor_workspace(key, Q_function, key.max_order + 1, "QminusInf")
+    elseif key.family == INFINITY_OUTGOING_SERIES
+        P_function(z) = PplusInf_z(
+            key.s, key.m, key.a, key.omega, key.lambda, z
+        )
+        Q_function(z) = QplusInf_z(
+            key.s, key.m, key.a, key.omega, key.lambda, z
+        )
+        P = _typed_taylor_workspace(key, P_function, key.max_order, "PplusInf")
+        Q = _typed_taylor_workspace(key, Q_function, key.max_order + 1, "QplusInf")
+    elseif key.family == HORIZON_INGOING_SERIES
+        P_function(x) = PminusH(
+            key.s, key.m, key.a, key.omega, key.lambda, x
+        )
+        Q_function(x) = QminusH(
+            key.s, key.m, key.a, key.omega, key.lambda, x
+        )
+        P = _typed_taylor_workspace(key, P_function, key.max_order, "PminusH")
+        Q = _typed_taylor_workspace(key, Q_function, key.max_order, "QminusH")
+    else
+        P_function(x) = PplusH(
+            key.s, key.m, key.a, key.omega, key.lambda, x
+        )
+        Q_function(x) = QplusH(
+            key.s, key.m, key.a, key.omega, key.lambda, x
+        )
+        P = _typed_taylor_workspace(key, P_function, key.max_order, "PplusH")
+        Q = _typed_taylor_workspace(key, Q_function, key.max_order, "QplusH")
+    end
+    return P, Q
+end
+
+function _infinity_recurrence_coefficient(
+    key::SeriesKey{T},
+    order::Int,
+    coefficients::Vector{Complex{T}},
+    Pcoeffs::Vector{Complex{T}},
+    Qcoeffs::Vector{Complex{T}},
+    chart_digits_lost::T,
+) where {T<:AbstractFloat}
+    sigma = key.family == INFINITY_INGOING_SERIES ? -one(T) : one(T)
+    denominator = 2 * sigma * complex(zero(T), one(T)) * typed_integer(T, order)
+    numerator = typed_integer(T, order) * typed_integer(T, order - 1) *
+        coefficients[order]
+    recurrence_term_abs_sum = abs(numerator)
+    omega_power = one(Complex{T})
+    for k in 1:order
+        term = omega_power *
+            (Qcoeffs[k + 2] - typed_integer(T, order - k) * Pcoeffs[k + 1]) *
+            coefficients[order - k + 1]
+        _assert_value(key, term, "infinity recurrence term")
+        numerator += term
+        recurrence_term_abs_sum += abs(term)
+        omega_power *= key.omega
+    end
+    _assert_value(key, denominator, "infinity recurrence denominator")
+    iszero(denominator) && throw(_construction_error(
+        ALGEBRAIC_REPRESENTATION_SINGULAR,
+        key,
+        "infinity stored-coefficient recurrence denominator is zero",
+        order=order,
+    ))
+    value = _assert_value(
+        key, numerator / denominator, "infinity recurrence coefficient"
+    )
+    evidence = _recurrence_evidence(
+        key,
+        order,
+        denominator,
+        abs(denominator),
+        value,
+        recurrence_term_abs_sum,
+        chart_digits_lost,
+    )
+    return value, evidence
+end
+
+function _explicit_infinity_coefficient(key::SeriesKey{T}, order::Int) where {T}
+    value = if key.family == INFINITY_INGOING_SERIES
+        _ingoing_coefficient_at_inf_legacy_impl(
+            key.s,
+            key.m,
+            key.a,
+            key.omega,
+            key.lambda,
+            order;
+            data_type=Complex{T},
+        )
+    else
+        _outgoing_coefficient_at_inf_legacy_impl(
+            key.s,
+            key.m,
+            key.a,
+            key.omega,
+            key.lambda,
+            order;
+            data_type=Complex{T},
+        )
+    end
+    return _assert_value(key, Complex{T}(value), "explicit infinity coefficient")
+end
+
+function _build_infinity_recurrence(
+    key::SeriesKey{T}; use_explicit_low_orders::Bool
+) where {T<:AbstractFloat}
+    chart_denominator, chart_scale = _chart_denominator(key)
+    chart_digits_lost = _chart_digits_lost(
+        T, chart_denominator, chart_scale, key.precision_bits
+    )
+    P, Q = _potential_workspaces(key)
+    coefficients = Vector{Complex{T}}(undef, key.max_order + 1)
+    evidence = Vector{RecurrenceEvidence{T}}(undef, key.max_order + 1)
+    coefficients[1] = one(Complex{T})
+    evidence[1] = _recurrence_evidence(
+        key,
+        0,
+        chart_denominator,
+        chart_scale,
+        coefficients[1],
+        one(T),
+        chart_digits_lost,
+    )
+
+    explicit_maximum = use_explicit_low_orders ? min(3, key.max_order) : 0
+    for order in 1:explicit_maximum
+        coefficients[order + 1] = _explicit_infinity_coefficient(key, order)
+        evidence[order + 1] = _recurrence_evidence(
+            key,
+            order,
+            chart_denominator,
+            chart_scale,
+            coefficients[order + 1],
+            abs(coefficients[order + 1]),
+            chart_digits_lost,
+        )
+    end
+    for order in (explicit_maximum + 1):key.max_order
+        value, order_evidence = _infinity_recurrence_coefficient(
+            key, order, coefficients, P.coefficients, Q.coefficients,
+            chart_digits_lost,
+        )
+        coefficients[order + 1] = value
+        evidence[order + 1] = order_evidence
+    end
+    return AsymptoticSeries{T}(key, coefficients, P, Q, evidence)
+end
+
+function _horizon_geometry(key::SeriesKey{T}) where {T<:AbstractFloat}
+    delta_squared = (one(T) - key.a) * (one(T) + key.a)
+    delta_squared < zero(T) && throw(_construction_error(
+        INVALID_ASYMPTOTIC_INPUT,
+        key,
+        "real Kerr spin must satisfy abs(a) <= 1",
+    ))
+    geometry = stable_horizon_geometry(key.a)
+    delta = geometry.delta
+    iszero(delta) && throw(_construction_error(
+        PHYSICAL_SINGULAR_LIMIT,
+        key,
+        "extremal delta=0 requires an independently proved logarithm-free limit",
+    ))
+    rplus = geometry.rplus
+    p_horizon = key.omega - typed_integer(T, key.m) *
+        geometry.omega_horizon
+    _assert_value(key, Complex{T}(p_horizon), "horizon wave number")
+    iszero(p_horizon) && throw(_construction_error(
+        PHYSICAL_SINGULAR_LIMIT,
+        key,
+        "pH=0 coalesces the horizon carrier and basis modes",
+    ))
+    return delta, rplus, Complex{T}(p_horizon)
+end
+
+function _horizon_denominator(
+    key::SeriesKey{T}, order::Int, delta::T, rplus::T, p_horizon::Complex{T}
+) where {T<:AbstractFloat}
+    nT = typed_integer(T, order)
+    imaginary_unit = complex(zero(T), one(T))
+    carrier_coupling_term = _assert_value(
+        key,
+        Complex{T}(
+            2 * imaginary_unit * nT * rplus * p_horizon / delta
+        ),
+        "horizon recurrence carrier coupling",
+    )
+    if key.family == HORIZON_OUTGOING_SERIES
+        denominator = nT * (
+            nT + 2 * imaginary_unit * rplus * p_horizon / delta
+        )
+    else
+        denominator = nT * (
+            nT - 2 * imaginary_unit * rplus * p_horizon / delta
+        )
+    end
+    denominator = _assert_value(
+        key, Complex{T}(denominator), "horizon recurrence denominator"
+    )
+    denominator_scale = abs(nT^2) + abs(carrier_coupling_term)
+    isfinite(denominator_scale) || throw(_construction_error(
+        NONFINITE_ASYMPTOTIC_DATA,
+        key,
+        "horizon recurrence denominator scale is nonfinite",
+        order=order,
+    ))
+    iszero(denominator) && throw(_construction_error(
+        PHYSICAL_SINGULAR_LIMIT,
+        key,
+        "exact horizon Frobenius resonance requires a separately proved limit",
+        order=order,
+    ))
+    return denominator, denominator_scale
+end
+
+function _build_horizon_recurrence(key::SeriesKey{T}) where {T<:AbstractFloat}
+    chart_denominator, chart_scale = _chart_denominator(key)
+    chart_digits_lost = _chart_digits_lost(
+        T, chart_denominator, chart_scale, key.precision_bits
+    )
+    delta, rplus, p_horizon = _horizon_geometry(key)
+    P, Q = _potential_workspaces(key)
+    coefficients = Vector{Complex{T}}(undef, key.max_order + 1)
+    evidence = Vector{RecurrenceEvidence{T}}(undef, key.max_order + 1)
+    coefficients[1] = one(Complex{T})
+    evidence[1] = _recurrence_evidence(
+        key,
+        0,
+        chart_denominator,
+        chart_scale,
+        coefficients[1],
+        one(T),
+        chart_digits_lost,
+    )
+    for order in 1:key.max_order
+        recurrence_sum = zero(Complex{T})
+        recurrence_term_abs_sum = zero(T)
+        for previous_order in 0:(order - 1)
+            term = coefficients[previous_order + 1] *
+                (typed_integer(T, previous_order) *
+                    P.coefficients[order - previous_order + 1] +
+                 Q.coefficients[order - previous_order + 1])
+            _assert_value(key, term, "horizon recurrence term")
+            recurrence_sum += term
+            recurrence_term_abs_sum += abs(term)
+        end
+        denominator, denominator_scale = _horizon_denominator(
+            key, order, delta, rplus, p_horizon
+        )
+        _, denominator_cancellation_digits = _cancellation_metrics(
+            T, denominator_scale, abs(denominator), key.precision_bits
+        )
+        value = _assert_value(
+            key, -recurrence_sum / denominator, "horizon recurrence coefficient"
+        )
+        coefficients[order + 1] = value
+        evidence[order + 1] = _recurrence_evidence(
+            key,
+            order,
+            denominator,
+            denominator_scale,
+            value,
+            recurrence_term_abs_sum,
+            max(chart_digits_lost, denominator_cancellation_digits),
+        )
+    end
+    return AsymptoticSeries{T}(key, coefficients, P, Q, evidence)
+end
+
+function build_asymptotic_series(key::SeriesKey{T}) where {T<:AbstractFloat}
+    return _with_request_precision(T, key.precision_bits) do
+        if key.family == INFINITY_INGOING_SERIES ||
+           key.family == INFINITY_OUTGOING_SERIES
+            _build_infinity_recurrence(key; use_explicit_low_orders=true)
+        else
+            _build_horizon_recurrence(key)
+        end
+    end
+end
+
+function build_infinity_recurrence_from_zero(
+    key::SeriesKey{T}
+) where {T<:AbstractFloat}
+    (key.family == INFINITY_INGOING_SERIES ||
+     key.family == INFINITY_OUTGOING_SERIES) || throw(_construction_error(
+        INVALID_ASYMPTOTIC_INPUT,
+        key,
+        "recurrence-from-zero diagnostics are defined only at infinity",
+    ))
+    return _with_request_precision(T, key.precision_bits) do
+        _build_infinity_recurrence(key; use_explicit_low_orders=false)
+    end
+end
+
+function build_asymptotic_series_bundle(
+    s::Int,
+    m::Int,
+    a::T,
+    omega::Union{T,Complex{T}},
+    lambda::Union{T,Complex{T}},
+    max_order::Int;
+    precision_bits::Int,
+) where {T<:AbstractFloat}
+    keys = (
+        SeriesKey(s, m, a, omega, lambda, INFINITY_INGOING_SERIES,
+            max_order, precision_bits),
+        SeriesKey(s, m, a, omega, lambda, INFINITY_OUTGOING_SERIES,
+            max_order, precision_bits),
+        SeriesKey(s, m, a, omega, lambda, HORIZON_INGOING_SERIES,
+            max_order, precision_bits),
+        SeriesKey(s, m, a, omega, lambda, HORIZON_OUTGOING_SERIES,
+            max_order, precision_bits),
+    )
+    return AsymptoticSeriesBundle{T}(
+        build_asymptotic_series(keys[1]),
+        build_asymptotic_series(keys[2]),
+        build_asymptotic_series(keys[3]),
+        build_asymptotic_series(keys[4]),
+    )
+end
+
+function _assert_evaluation_real(
+    key::SeriesKey{T}, value::T, name::AbstractString; order::Int=key.max_order
+) where {T<:AbstractFloat}
+    isfinite(value) || throw(_construction_error(
+        NONFINITE_ASYMPTOTIC_DATA,
+        key,
+        "$name is nonfinite",
+        order=order,
+    ))
+    precision(value) == key.precision_bits || throw(_construction_error(
+        PRECISION_MISMATCH,
+        key,
+        "$name precision differs from the series key",
+        order=order,
+    ))
+    return value
+end
+
+function _validate_series_for_evaluation(
+    series::AsymptoticSeries{T}, order::Int
+) where {T<:AbstractFloat}
+    key = series.key
+    0 <= order <= key.max_order || throw(_construction_error(
+        INVALID_ASYMPTOTIC_ORDER,
+        key,
+        "evaluation order must lie within the constructed series",
+        order=order,
+    ))
+    length(series.coefficients) == key.max_order + 1 || throw(_construction_error(
+        INVALID_ASYMPTOTIC_INPUT,
+        key,
+        "coefficient count differs from the series key",
+        order=order,
+    ))
+    length(series.evidence) == key.max_order + 1 || throw(_construction_error(
+        INVALID_ASYMPTOTIC_INPUT,
+        key,
+        "recurrence evidence count differs from the series key",
+        order=order,
+    ))
+    for (workspace_name, workspace) in (("P", series.P), ("Q", series.Q))
+        _assert_value(key, workspace.center, "$workspace_name Taylor centre")
+        isempty(workspace.coefficients) && throw(_construction_error(
+            INVALID_ASYMPTOTIC_INPUT,
+            key,
+            "$workspace_name Taylor workspace is empty",
+            order=order,
+        ))
+        for (index, coefficient) in enumerate(workspace.coefficients)
+            _assert_value(
+                key,
+                coefficient,
+                "$workspace_name Taylor workspace coefficient $(index - 1)",
+            )
+        end
+    end
+    for coefficient_order in 0:order
+        _assert_value(
+            key,
+            series.coefficients[coefficient_order + 1],
+            "series coefficient $coefficient_order",
+        )
+        evidence = series.evidence[coefficient_order + 1]
+        evidence.family == key.family || throw(_construction_error(
+            INVALID_ASYMPTOTIC_INPUT,
+            key,
+            "recurrence evidence family differs from the series key",
+            order=coefficient_order,
+        ))
+        evidence.order == coefficient_order || throw(_construction_error(
+            INVALID_ASYMPTOTIC_INPUT,
+            key,
+            "recurrence evidence order differs from the series key",
+            order=coefficient_order,
+        ))
+        evidence.precision_bits == key.precision_bits || throw(_construction_error(
+            PRECISION_MISMATCH,
+            key,
+            "recurrence evidence precision differs from the series key",
+            order=coefficient_order,
+        ))
+        _assert_value(
+            key,
+            evidence.denominator_value,
+            "recurrence evidence denominator",
+        )
+        for (name, value) in (
+            ("denominator scale", evidence.denominator_scale),
+            ("value scale", evidence.value_scale),
+            ("recurrence term absolute sum", evidence.recurrence_term_abs_sum),
+            ("cancellation factor", evidence.cancellation_factor),
+            ("cancellation digits", evidence.cancellation_digits),
+        )
+            _assert_evaluation_real(
+                key, value, "recurrence evidence $name"; order=coefficient_order
+            )
+            value >= zero(T) || throw(_construction_error(
+                INVALID_ASYMPTOTIC_INPUT,
+                key,
+                "recurrence evidence $name must be nonnegative",
+                order=coefficient_order,
+            ))
+        end
+    end
+    return key
+end
+
+function _horner_value_and_derivative(
+    key::SeriesKey{T},
+    coefficients::Vector{Complex{T}},
+    z::Complex{T},
+    dz_dr::Complex{T},
+    order::Int,
+) where {T<:AbstractFloat}
+    value = coefficients[order + 1]
+    derivative_z = zero(Complex{T})
+    for coefficient_index in order:-1:1
+        derivative_z = _assert_value(
+            key,
+            derivative_z * z + value,
+            "Horner series derivative accumulator",
+        )
+        value = _assert_value(
+            key,
+            value * z + coefficients[coefficient_index],
+            "Horner series value accumulator",
+        )
+    end
+    derivative_r = _assert_value(
+        key, derivative_z * dz_dr, "Horner radial derivative"
+    )
+    return value, derivative_r
+end
+
+function _neumaier_component(
+    total::T, compensation::T, value::T
+) where {T<:AbstractFloat}
+    updated = total + value
+    if abs(total) >= abs(value)
+        compensation += (total - updated) + value
+    else
+        compensation += (value - updated) + total
+    end
+    return updated, compensation
+end
+
+function _componentwise_neumaier(
+    terms::Vector{Complex{T}}
+) where {T<:AbstractFloat}
+    real_total = zero(T)
+    real_compensation = zero(T)
+    imaginary_total = zero(T)
+    imaginary_compensation = zero(T)
+    for term in terms
+        real_total, real_compensation = _neumaier_component(
+            real_total, real_compensation, real(term)
+        )
+        imaginary_total, imaginary_compensation = _neumaier_component(
+            imaginary_total, imaginary_compensation, imag(term)
+        )
+    end
+    return complex(
+        real_total + real_compensation,
+        imaginary_total + imaginary_compensation,
+    )
+end
+
+function _direct_series_terms(
+    key::SeriesKey{T},
+    coefficients::Vector{Complex{T}},
+    z::Complex{T},
+    dz_dr::Complex{T},
+    order::Int,
+) where {T<:AbstractFloat}
+    value_terms = Vector{Complex{T}}(undef, order + 1)
+    derivative_terms = Vector{Complex{T}}(undef, order + 1)
+    value_power = one(Complex{T})
+    derivative_power = one(Complex{T})
+    for coefficient_order in 0:order
+        coefficient = coefficients[coefficient_order + 1]
+        value_terms[coefficient_order + 1] = _assert_value(
+            key,
+            coefficient * value_power,
+            "direct series value term $coefficient_order",
+        )
+        derivative_terms[coefficient_order + 1] = if coefficient_order == 0
+            zero(Complex{T})
+        else
+            _assert_value(
+                key,
+                typed_integer(T, coefficient_order) * coefficient *
+                    derivative_power * dz_dr,
+                "direct series derivative term $coefficient_order",
+            )
+        end
+        if coefficient_order < order
+            value_power = _assert_value(
+                key, value_power * z, "direct series value power"
+            )
+            if coefficient_order > 0
+                derivative_power = _assert_value(
+                    key,
+                    derivative_power * z,
+                    "direct series derivative power",
+                )
+            end
+        end
+    end
+    return value_terms, derivative_terms
+end
+
+function _maximum_relative_spread(
+    key::SeriesKey{T}, values::NTuple{3,Complex{T}}, name::AbstractString
+) where {T<:AbstractFloat}
+    maximum_magnitude = max(abs(values[1]), abs(values[2]), abs(values[3]))
+    scale = max(maximum_magnitude, floatmin(T))
+    pairwise_difference = max(
+        abs(values[1] - values[2]),
+        abs(values[1] - values[3]),
+        abs(values[2] - values[3]),
+    )
+    return _assert_evaluation_real(
+        key, pairwise_difference / scale, "$name maximum relative spread"
+    )
+end
+
+function _empirical_digits_lost(
+    key::SeriesKey{T}, relative_measure::T, arithmetic_digits::T,
+    name::AbstractString
+) where {T<:AbstractFloat}
+    _assert_evaluation_real(key, relative_measure, "$name relative measure")
+    relative_measure >= zero(T) || throw(_construction_error(
+        INVALID_ASYMPTOTIC_INPUT,
+        key,
+        "$name relative measure must be nonnegative",
+    ))
+    digits_lost = if iszero(relative_measure)
+        zero(T)
+    else
+        max(zero(T), arithmetic_digits + log10(relative_measure))
+    end
+    return _assert_evaluation_real(key, digits_lost, "$name digits lost")
+end
+
+function _finite_ratio(
+    key::SeriesKey{T}, numerator::T, denominator::T, name::AbstractString
+) where {T<:AbstractFloat}
+    numerator >= zero(T) && denominator > zero(T) || throw(_construction_error(
+        INVALID_ASYMPTOTIC_INPUT,
+        key,
+        "$name requires a nonnegative numerator and positive denominator",
+    ))
+    ratio = numerator / denominator
+    if !isfinite(ratio) && !iszero(numerator)
+        ratio = floatmax(T)
+    end
+    return _assert_evaluation_real(key, ratio, name)
+end
+
+function _maximum_recurrence_digits_lost(
+    series::AsymptoticSeries{T}, order::Int
+) where {T<:AbstractFloat}
+    maximum_loss = zero(T)
+    for coefficient_order in 0:order
+        maximum_loss = max(
+            maximum_loss,
+            series.evidence[coefficient_order + 1].cancellation_digits,
+        )
+    end
+    return _assert_evaluation_real(
+        series.key, maximum_loss, "maximum recurrence digits lost"; order=order
+    )
+end
+
+function _maximum_recurrence_cancellation_factor(
+    series::AsymptoticSeries{T}, order::Int
+) where {T<:AbstractFloat}
+    maximum_factor = zero(T)
+    for coefficient_order in 0:order
+        maximum_factor = max(
+            maximum_factor,
+            series.evidence[coefficient_order + 1].cancellation_factor,
+        )
+    end
+    return _assert_evaluation_real(
+        series.key,
+        maximum_factor,
+        "maximum recurrence cancellation factor";
+        order=order,
+    )
+end
+
+function evaluate_asymptotic_series(
+    series::AsymptoticSeries{T},
+    z::Union{T,Complex{T}},
+    dz_dr::Union{T,Complex{T}};
+    order::Int=series.key.max_order,
+)::SeriesEvaluation{T} where {T<:AbstractFloat}
+    return _with_request_precision(T, series.key.precision_bits) do
+        key = _validate_series_for_evaluation(series, order)
+        if (key.family == INFINITY_INGOING_SERIES ||
+            key.family == INFINITY_OUTGOING_SERIES) && iszero(key.omega)
+            throw(_construction_error(
+                PHYSICAL_SINGULAR_LIMIT,
+                key,
+                "omega=0 is a physical static limit for the infinity " *
+                "plane-wave/(omega*r)^-n endpoint state",
+                order=order,
+            ))
+        end
+        typed_z = _assert_value(key, Complex{T}(z), "series variable z")
+        typed_dz_dr = _assert_value(
+            key, Complex{T}(dz_dr), "series variable derivative dz_dr"
+        )
+        horner_value, horner_derivative = _horner_value_and_derivative(
+            key, series.coefficients, typed_z, typed_dz_dr, order
+        )
+        value_terms, derivative_terms = _direct_series_terms(
+            key, series.coefficients, typed_z, typed_dz_dr, order
+        )
+        compensated_value = _assert_value(
+            key,
+            _componentwise_neumaier(value_terms),
+            "forward compensated series value",
+        )
+        compensated_derivative = _assert_value(
+            key,
+            _componentwise_neumaier(derivative_terms),
+            "forward compensated series derivative",
+        )
+        alternate_value_terms = copy(value_terms)
+        alternate_derivative_terms = copy(derivative_terms)
+        sort!(alternate_value_terms; by=abs)
+        sort!(alternate_derivative_terms; by=abs)
+        alternate_value = _assert_value(
+            key,
+            _componentwise_neumaier(alternate_value_terms),
+            "magnitude-sorted compensated series value",
+        )
+        alternate_derivative = _assert_value(
+            key,
+            _componentwise_neumaier(alternate_derivative_terms),
+            "magnitude-sorted compensated series derivative",
+        )
+        value_spread = _maximum_relative_spread(
+            key,
+            (horner_value, compensated_value, alternate_value),
+            "series value",
+        )
+        derivative_spread = _maximum_relative_spread(
+            key,
+            (horner_derivative, compensated_derivative, alternate_derivative),
+            "series derivative",
+        )
+        arithmetic_digits = typed_integer(T, key.precision_bits) *
+            log10(typed_integer(T, 2))
+        _assert_evaluation_real(
+            key, arithmetic_digits, "arithmetic decimal digits"
+        )
+        value_digits_lost = _empirical_digits_lost(
+            key, value_spread, arithmetic_digits, "series value evaluation"
+        )
+        derivative_digits_lost = _empirical_digits_lost(
+            key,
+            derivative_spread,
+            arithmetic_digits,
+            "series derivative evaluation",
+        )
+        last_term_magnitude = _assert_evaluation_real(
+            key, abs(value_terms[end]), "last series term magnitude"
+        )
+        derivative_last_term_magnitude = _assert_evaluation_real(
+            key,
+            abs(derivative_terms[end]),
+            "last derivative term magnitude",
+        )
+        last_term_total_ratio = _finite_ratio(
+            key,
+            last_term_magnitude,
+            max(abs(horner_value), floatmin(T)),
+            "last term to total series magnitude ratio",
+        )
+        derivative_last_term_total_ratio = _finite_ratio(
+            key,
+            derivative_last_term_magnitude,
+            max(abs(horner_derivative), floatmin(T)),
+            "last derivative term to total derivative magnitude ratio",
+        )
+        maximum_recurrence_cancellation_factor =
+            _maximum_recurrence_cancellation_factor(series, order)
+        recurrence_digits_lost = _maximum_recurrence_digits_lost(series, order)
+        return SeriesEvaluation{T}(
+            key,
+            key.family,
+            order,
+            key.precision_bits,
+            horner_value,
+            compensated_value,
+            alternate_value,
+            value_spread,
+            value_digits_lost,
+            last_term_magnitude,
+            last_term_total_ratio,
+            horner_derivative,
+            compensated_derivative,
+            alternate_derivative,
+            derivative_spread,
+            derivative_digits_lost,
+            derivative_last_term_magnitude,
+            derivative_last_term_total_ratio,
+            maximum_recurrence_cancellation_factor,
+            recurrence_digits_lost,
+            ASYMPTOTIC_CONDITIONING_ESTIMATE_KIND,
+        )
+    end
+end
+
+function evaluate_asymptotic_series(
+    series::AsymptoticSeries,
+    z::Number,
+    dz_dr::Number;
+    order::Int=series.key.max_order,
+)
+    throw(_construction_error(
+        PRECISION_MISMATCH,
+        series.key,
+        "mixed-precision series evaluation inputs do not match the series key",
+        order=order,
+    ))
+end
+
+function evaluate_infinity_asymptotic_series(
+    series::AsymptoticSeries{T},
+    r::Union{T,Complex{T}};
+    order::Int=series.key.max_order,
+)::SeriesEvaluation{T} where {T<:AbstractFloat}
+    key = series.key
+    (key.family == INFINITY_INGOING_SERIES ||
+     key.family == INFINITY_OUTGOING_SERIES) || throw(_construction_error(
+        INVALID_ASYMPTOTIC_INPUT,
+        key,
+        "infinity evaluator family differs from the series key",
+        order=order,
+    ))
+    iszero(series.key.omega) && throw(_construction_error(
+        PHYSICAL_SINGULAR_LIMIT,
+        key,
+        "omega=0 is a physical static limit for the infinity " *
+        "plane-wave/(omega*r)^-n endpoint state",
+        order=order,
+    ))
+    return _with_request_precision(T, key.precision_bits) do
+        typed_r = _assert_value(key, Complex{T}(r), "infinity evaluation radius")
+        iszero(typed_r) && throw(_construction_error(
+            INVALID_ASYMPTOTIC_INPUT,
+            key,
+            "infinity evaluation radius must be nonzero",
+            order=order,
+        ))
+        omega_r = _assert_value(
+            key, key.omega * typed_r, "infinity omega*r product"
+        )
+        iszero(omega_r) && throw(_construction_error(
+            ALGEBRAIC_REPRESENTATION_SINGULAR,
+            key,
+            "infinity omega*r product underflowed to zero before inversion",
+            order=order,
+        ))
+        z = _assert_value(key, inv(omega_r), "infinity series variable")
+        dz_dr = _assert_value(
+            key, -z / typed_r, "infinity series variable derivative"
+        )
+        evaluate_asymptotic_series(series, z, dz_dr; order=order)
+    end
+end
+
+function evaluate_infinity_asymptotic_series(
+    series::AsymptoticSeries, r::Number; order::Int=series.key.max_order
+)
+    throw(_construction_error(
+        PRECISION_MISMATCH,
+        series.key,
+        "mixed-precision infinity evaluation radius does not match the series key",
+        order=order,
+    ))
+end
+
+function evaluate_horizon_asymptotic_series(
+    series::AsymptoticSeries{T},
+    r::Union{T,Complex{T}};
+    order::Int=series.key.max_order,
+)::SeriesEvaluation{T} where {T<:AbstractFloat}
+    key = series.key
+    (key.family == HORIZON_INGOING_SERIES ||
+     key.family == HORIZON_OUTGOING_SERIES) || throw(_construction_error(
+        INVALID_ASYMPTOTIC_INPUT,
+        key,
+        "horizon evaluator family differs from the series key",
+        order=order,
+    ))
+    return _with_request_precision(T, key.precision_bits) do
+        typed_r = _assert_value(key, Complex{T}(r), "horizon evaluation radius")
+        _, rplus, _ = _horizon_geometry(key)
+        z = _assert_value(
+            key,
+            typed_r - complex(rplus, zero(T)),
+            "horizon series variable",
+        )
+        dz_dr = one(Complex{T})
+        evaluate_asymptotic_series(series, z, dz_dr; order=order)
+    end
+end
+
+function evaluate_horizon_asymptotic_series(
+    series::AsymptoticSeries, r::Number; order::Int=series.key.max_order
+)
+    throw(_construction_error(
+        PRECISION_MISMATCH,
+        series.key,
+        "mixed-precision horizon evaluation radius does not match the series key",
+        order=order,
+    ))
+end
+
+function _assert_evaluation_matches_series(
+    series::AsymptoticSeries{T}, evaluation::SeriesEvaluation{T}
+) where {T<:AbstractFloat}
+    key = _validate_series_for_evaluation(series, evaluation.order)
+    _series_keys_match_exactly(evaluation.key, key) || throw(_construction_error(
+        INVALID_ASYMPTOTIC_INPUT,
+        key,
+        "evaluation spectral key differs from the requested series key",
+        order=evaluation.order,
+    ))
+    evaluation.family == key.family || throw(_construction_error(
+        INVALID_ASYMPTOTIC_INPUT,
+        key,
+        "evaluation family differs from the series key",
+        order=evaluation.order,
+    ))
+    evaluation.precision_bits == key.precision_bits || throw(_construction_error(
+        PRECISION_MISMATCH,
+        key,
+        "evaluation precision differs from the series key",
+        order=evaluation.order,
+    ))
+    evaluation.estimate_kind == ASYMPTOTIC_CONDITIONING_ESTIMATE_KIND ||
+        throw(_construction_error(
+            INVALID_ASYMPTOTIC_INPUT,
+            key,
+            "evaluation estimate identity differs from the series key contract",
+            order=evaluation.order,
+        ))
+    expected_recurrence_loss = _maximum_recurrence_digits_lost(
+        series, evaluation.order
+    )
+    expected_recurrence_factor = _maximum_recurrence_cancellation_factor(
+        series, evaluation.order
+    )
+    evaluation.maximum_recurrence_cancellation_factor ==
+        expected_recurrence_factor || throw(_construction_error(
+            INVALID_ASYMPTOTIC_INPUT,
+            key,
+            "evaluation recurrence cancellation factor differs from the series key",
+            order=evaluation.order,
+        ))
+    evaluation.recurrence_digits_lost == expected_recurrence_loss ||
+        throw(_construction_error(
+            INVALID_ASYMPTOTIC_INPUT,
+            key,
+            "evaluation recurrence evidence differs from the series key",
+            order=evaluation.order,
+        ))
+    for (name, value) in (
+        ("Horner series value", evaluation.series_eval_horner),
+        ("forward compensated series value", evaluation.series_eval_compensated),
+        ("alternate compensated series value", evaluation.series_eval_alternate),
+        ("Horner series derivative", evaluation.series_derivative_horner),
+        ("forward compensated series derivative", evaluation.series_derivative_compensated),
+        ("alternate compensated series derivative", evaluation.series_derivative_alternate),
+    )
+        _assert_value(key, value, name)
+    end
+    for (name, value) in (
+        ("series evaluation spread", evaluation.series_evaluation_spread),
+        ("series evaluation digits lost", evaluation.series_evaluation_digits_lost),
+        ("last term magnitude", evaluation.last_term_magnitude),
+        ("last term ratio", evaluation.last_term_total_ratio),
+        ("derivative evaluation spread", evaluation.derivative_evaluation_spread),
+        ("derivative evaluation digits lost", evaluation.derivative_evaluation_digits_lost),
+        ("derivative last term magnitude", evaluation.derivative_last_term_magnitude),
+        ("derivative last term ratio", evaluation.derivative_last_term_total_ratio),
+        ("maximum recurrence cancellation factor", evaluation.maximum_recurrence_cancellation_factor),
+        ("recurrence digits lost", evaluation.recurrence_digits_lost),
+    )
+        _assert_evaluation_real(key, value, name; order=evaluation.order)
+        value >= zero(T) || throw(_construction_error(
+            INVALID_ASYMPTOTIC_INPUT,
+            key,
+            "$name must be nonnegative",
+            order=evaluation.order,
+        ))
+    end
+    return key
+end
+
+# This empirical assessment is the mandatory preflight before any future RHS
+# evaluation. It is diagnostic evidence, not interval arithmetic or a bound.
+function assess_asymptotic_preflight(
+    series::AsymptoticSeries{T},
+    evaluation::SeriesEvaluation{T},
+    required_digits::T,
+)::AsymptoticConditioningAssessment{T} where {T<:AbstractFloat}
+    return _with_request_precision(T, series.key.precision_bits) do
+        key = _assert_evaluation_matches_series(series, evaluation)
+        _assert_evaluation_real(
+            key, required_digits, "required reliable digits";
+            order=evaluation.order,
+        )
+        required_digits >= zero(T) || throw(_construction_error(
+            INVALID_ASYMPTOTIC_INPUT,
+            key,
+            "required reliable digits must be nonnegative",
+            order=evaluation.order,
+        ))
+        arithmetic_decimal_digits =
+            typed_integer(T, series.key.precision_bits) *
+            log10(typed_integer(T, 2))
+        _assert_evaluation_real(
+            key, arithmetic_decimal_digits, "arithmetic decimal digits";
+            order=evaluation.order,
+        )
+        safety_margin_digits = typed_integer(T, 8)
+        maximum_recurrence_digits_lost = evaluation.recurrence_digits_lost
+        maximum_recurrence_cancellation_factor =
+            evaluation.maximum_recurrence_cancellation_factor
+        maximum_series_evaluation_spread = max(
+            evaluation.series_evaluation_spread,
+            evaluation.derivative_evaluation_spread,
+        )
+        maximum_series_evaluation_digits_lost = max(
+            evaluation.series_evaluation_digits_lost,
+            evaluation.derivative_evaluation_digits_lost,
+        )
+        maximum_last_term_ratio = max(
+            evaluation.last_term_total_ratio,
+            evaluation.derivative_last_term_total_ratio,
+        )
+        value_truncation_digits_lost = _empirical_digits_lost(
+            key,
+            evaluation.last_term_total_ratio,
+            arithmetic_decimal_digits,
+            "series truncation",
+        )
+        derivative_truncation_digits_lost = _empirical_digits_lost(
+            key,
+            evaluation.derivative_last_term_total_ratio,
+            arithmetic_decimal_digits,
+            "series derivative truncation",
+        )
+        maximum_truncation_digits_lost = max(
+            value_truncation_digits_lost,
+            derivative_truncation_digits_lost,
+        )
+        effective_digits_lost = max(
+            maximum_recurrence_digits_lost,
+            maximum_series_evaluation_digits_lost,
+            maximum_truncation_digits_lost,
+        )
+        predicted_reliable_digits = arithmetic_decimal_digits -
+            effective_digits_lost - safety_margin_digits
+        _assert_evaluation_real(
+            key,
+            predicted_reliable_digits,
+            "predicted reliable digits";
+            order=evaluation.order,
+        )
+        adequate = predicted_reliable_digits >= required_digits
+        reason = adequate ? nothing : "INSUFFICIENT_ASYMPTOTIC_PRECISION"
+        return AsymptoticConditioningAssessment{T}(
+            adequate,
+            reason,
+            key.precision_bits,
+            arithmetic_decimal_digits,
+            required_digits,
+            safety_margin_digits,
+            maximum_recurrence_digits_lost,
+            maximum_recurrence_cancellation_factor,
+            maximum_series_evaluation_spread,
+            maximum_series_evaluation_digits_lost,
+            maximum_last_term_ratio,
+            maximum_truncation_digits_lost,
+            effective_digits_lost,
+            predicted_reliable_digits,
+            ASYMPTOTIC_CONDITIONING_ESTIMATE_KIND,
+        )
+    end
+end
+
+function assess_asymptotic_preflight(
+    series::AsymptoticSeries,
+    evaluation::SeriesEvaluation,
+    required_digits::Number,
+)
+    throw(_construction_error(
+        PRECISION_MISMATCH,
+        series.key,
+        "mixed evaluation and series preflight inputs do not share one " *
+        "exact key precision",
+        order=evaluation.order,
+    ))
+end
 
 function PminusInf_z(s::Int, m::Int, a, omega, lambda, z)
     if s == 0
@@ -201,16 +1704,7 @@ function QminusInf_z(s::Int, m::Int, a, omega, lambda, z)
     end
 end
 
-# Cache mechanism for the ingoing coefficients at infinity
-# Initialize the cache with a set of fiducial parameters
-_cached_ingoing_coefficients_at_inf_params::NamedTuple{(:s, :m, :a, :omega, :lambda), Tuple{Int, Int, _DEFAULTDATATYPE, _DEFAULTDATATYPE, _DEFAULTDATATYPE}} = (s=-2, m=2, a=0, omega=0.5, lambda=1)
-_cached_ingoing_coefficients_at_inf::NamedTuple{(:expansion_coeffs, :Pcoeffs, :Qcoeffs), Tuple{Vector{_DEFAULTDATATYPE}, Vector{_DEFAULTDATATYPE}, Vector{_DEFAULTDATATYPE}}} = (
-    expansion_coeffs = [_DEFAULTDATATYPE(1.0)], 
-    Pcoeffs = [_DEFAULTDATATYPE(0.0)],
-    Qcoeffs = [_DEFAULTDATATYPE(0.0)]
-)
-
-function ingoing_coefficient_at_inf(s::Int, m::Int, a, omega, lambda, order::Int; data_type=_DEFAULTDATATYPE)
+function _ingoing_coefficient_at_inf_legacy_impl(s::Int, m::Int, a, omega, lambda, order::Int; data_type=_DEFAULTDATATYPE)
     #=
     We have derived/shown the explicit expression for
     different physically-relevant spin weight (s=0, \pm 1, \pm2)
@@ -223,25 +1717,22 @@ function ingoing_coefficient_at_inf(s::Int, m::Int, a, omega, lambda, order::Int
     is designed to be evaluated recursively to build
     the full list of coefficients
     =#
-    global _cached_ingoing_coefficients_at_inf_params
-    global _cached_ingoing_coefficients_at_inf
-
     if order < 0
         throw(DomainError(order, "Only positive expansion order is supported"))
     end
 
     if order == 0
-        return 1.0 # This is always 1.0
+        return one(data_type) # This is always 1.0
     elseif order == 1
         if s == 0
-            return (-(1/2))*I*(lambda + 2*a*m*omega)
+            return -(one(omega)/2)*I*(lambda + 2*a*m*omega)
         elseif s == +1
             return begin
                 -((I*(4 + lambda^2 + 8*a*m*omega + 2*lambda*(2 + a*m*omega)))/
                 (2*(2 + lambda)))
             end
         elseif s == -1
-            return (-(1/2))*I*(lambda + 2*a*m*omega)
+            return -(one(omega)/2)*I*(lambda + 2*a*m*omega)
         elseif s == +2
             return begin
                 (I*(-lambda^3 - 2*lambda^2*(8 + a*m*omega) + 
@@ -252,14 +1743,14 @@ function ingoing_coefficient_at_inf(s::Int, m::Int, a, omega, lambda, order::Int
                 12*(2 + (I + a*m)*omega - a^2*omega^2)))
             end
         elseif s == -2
-            return (-(1/2))*I*(2 + lambda + 2*a*m*omega)
+            return -(one(omega)/2)*I*(2 + lambda + 2*a*m*omega)
         else
             throw(DomainError(s, "Currently only spin weight s of 0, +/-1, +/-2 are supported"))
         end
     elseif order == 2
         if s == 0
             return begin
-                (1/8)*(-((-2 + lambda)*lambda) - 4*(I + a*m*(-1 + lambda))*omega - 
+                (one(omega)/8)*(-((-2 + lambda)*lambda) - 4*(I + a*m*(-1 + lambda))*omega -
                 4*a*m*(2*I + a*m)*omega^2)
             end
         elseif s == +1
@@ -271,7 +1762,7 @@ function ingoing_coefficient_at_inf(s::Int, m::Int, a, omega, lambda, order::Int
             end
         elseif s == -1
             return begin
-                (1/8)*(-lambda^2 + lambda*(2 - 4*a*m*omega) + 
+                (one(omega)/8)*(-lambda^2 + lambda*(2 - 4*a*m*omega) +
                 4*a*omega*(m + 2*a*omega - m*(2*I + a*m)*omega))
             end
         elseif s == +2
@@ -290,7 +1781,7 @@ function ingoing_coefficient_at_inf(s::Int, m::Int, a, omega, lambda, order::Int
             end
         elseif s == -2
             return begin
-                (1/8)*((-lambda)*(2 + lambda) - 4*(-3*I + a*m*(1 + lambda))*omega - 
+                (one(omega)/8)*((-lambda)*(2 + lambda) - 4*(-3*I + a*m*(1 + lambda))*omega -
                 4*a*m*(2*I + a*m)*omega^2)
             end
         else
@@ -299,7 +1790,7 @@ function ingoing_coefficient_at_inf(s::Int, m::Int, a, omega, lambda, order::Int
     elseif order == 3
         if s == 0
             return begin
-                (1/48)*(I*(-6 + lambda)*(-2 + lambda)*lambda + 
+                (one(omega)/48)*(I*(-6 + lambda)*(-2 + lambda)*lambda +
                 2*(12 - 18*lambda + I*a*m*(12 + lambda*(-16 + 3*lambda)))*omega + 
                 4*I*a*(3*a*m^2*(-2 + lambda) + 2*a*(-1 + lambda) + 
                 6*I*m*(1 + lambda))*omega^2 + 
@@ -319,7 +1810,7 @@ function ingoing_coefficient_at_inf(s::Int, m::Int, a, omega, lambda, order::Int
             end
         elseif s == -1
             return begin
-                (1/48)*I*(lambda^3 + lambda^2*(-8 + 6*a*m*omega) + 
+                (one(omega)/48)*I*(lambda^3 + lambda^2*(-8 + 6*a*m*omega) +
                 8*a*omega*(a*omega + m*(2 - 3*a*m*omega + 
                 (-8 + 6*I*a*m + a^2*(-4 + m^2))*omega^2)) + 
                 4*lambda*(3 + omega*(6*I + a*(-4*a*omega + 
@@ -349,7 +1840,7 @@ function ingoing_coefficient_at_inf(s::Int, m::Int, a, omega, lambda, order::Int
             end
         elseif s == -2
             return begin
-                (1/48)*(I*(-4 + lambda)*lambda*(2 + lambda) + 
+                (one(omega)/48)*(I*(-4 + lambda)*lambda*(2 + lambda) +
                 2*(6*(-4 + lambda) + I*a*m*(-24 + lambda*(-4 + 3*lambda)))*
                 omega + 4*a*(-6*m*(-1 + lambda) + 
                 I*a*(-6 + (2 + 3*m^2)*lambda))*omega^2 + 
@@ -359,55 +1850,29 @@ function ingoing_coefficient_at_inf(s::Int, m::Int, a, omega, lambda, order::Int
             throw(DomainError(s, "Currently only spin weight s of 0, +/-1, +/-2 are supported"))
         end
     else
-        # Evaluate higher order corrections using AD
-        # Specifically we use TaylorSeries.jl for a much more performant AD
+        throw(ArgumentError("explicit infinity bridge supports orders 0 through 3"))
+    end
+end
 
-        _this_params = (s=s, m=m, a=a, omega=omega, lambda=lambda)
-        # Check if we can use the cached results
-        if _cached_ingoing_coefficients_at_inf_params == _this_params
-            expansion_coeffs = _cached_ingoing_coefficients_at_inf.expansion_coeffs
-            Pcoeffs = _cached_ingoing_coefficients_at_inf.Pcoeffs
-            Qcoeffs = _cached_ingoing_coefficients_at_inf.Qcoeffs
+function ingoing_coefficient_at_inf(
+    s::Int, m::Int, a, omega, lambda, order::Int;
+    data_type=_DEFAULTDATATYPE,
+)
+    key = _legacy_series_key(
+        s, m, a, omega, lambda, INFINITY_INGOING_SERIES, order, data_type
+    )
+    T = _component_type(data_type)
+    return _with_request_precision(T, key.precision_bits) do
+        _chart_denominator(key)
+        if order <= 3
+            value = _ingoing_coefficient_at_inf_legacy_impl(
+                key.s, key.m, key.a, key.omega, key.lambda, order;
+                data_type=Complex{T},
+            )
+            _assert_value(key, Complex{T}(value), "legacy ingoing infinity coefficient")
         else
-            # Cannot re-use the cached results, re-compute from zero
-            expansion_coeffs = [data_type(1.0)] # order 0
-            Pcoeffs = [data_type(PminusInf_z(s, m, a, omega, lambda, 0))] # order 0
-            Qcoeffs = [data_type(0.0), data_type(0.0)] # the recurrence relation takes Q_{r+1}
+            build_asymptotic_series(key).coefficients[order + 1]
         end
-
-        # Compute Pcoeffs to the necessary order
-        _P(z) = PminusInf_z(s, m, a, omega, lambda, z)
-        _P_taylor = taylor_expand(_P, 0, order=order) # FIXME This is not the most efficient way to do this
-        for i in length(Pcoeffs):order
-            append!(Pcoeffs, getcoeff(_P_taylor, i))
-        end
-
-        # Compute Qcoeffs to the necessary order (to current order + 1)
-        _Q(z) = QminusInf_z(s, m, a, omega, lambda, z)
-        _Q_taylor = taylor_expand(_Q, 0, order=order+1)
-        for i in length(Qcoeffs):order+1
-            append!(Qcoeffs, getcoeff(_Q_taylor, i))
-        end
-
-        # Note that the expansion coefficients we store is scaled by \omega^{i}
-        for i in length(expansion_coeffs):order
-            _P0 = Pcoeffs[1] # P0
-            sum = 0.0
-            for k in 1:i
-                sum += (Qcoeffs[k+2] - (i-k)*Pcoeffs[k+1])*(expansion_coeffs[i-k+1]/omega^(i-k))
-            end
-            append!(expansion_coeffs, omega^(i)*((i*(i-1)*(expansion_coeffs[i]/omega^(i-1)) + sum)/(_P0*i)))
-        end
-
-        # Update cache
-        _cached_ingoing_coefficients_at_inf_params = _this_params
-        _cached_ingoing_coefficients_at_inf = (
-            expansion_coeffs = expansion_coeffs,
-            Pcoeffs = Pcoeffs,
-            Qcoeffs = Qcoeffs
-        )
-
-        return expansion_coeffs[order+1]
     end
 end
 
@@ -616,16 +2081,7 @@ function QplusInf_z(s::Int, m::Int, a, omega, lambda, z)
     end
 end
 
-# Cache mechanism for the outgoing coefficients at infinity
-# Initialize the cache with a set of fiducial parameters
-_cached_outgoing_coefficients_at_inf_params::NamedTuple{(:s, :m, :a, :omega, :lambda), Tuple{Int, Int, _DEFAULTDATATYPE, _DEFAULTDATATYPE, _DEFAULTDATATYPE}} = (s=-2, m=2, a=0, omega=0.5, lambda=1)
-_cached_outgoing_coefficients_at_inf::NamedTuple{(:expansion_coeffs, :Pcoeffs, :Qcoeffs), Tuple{Vector{_DEFAULTDATATYPE}, Vector{_DEFAULTDATATYPE}, Vector{_DEFAULTDATATYPE}}} = (
-    expansion_coeffs = [_DEFAULTDATATYPE(1.0)], 
-    Pcoeffs = [_DEFAULTDATATYPE(0.0)],
-    Qcoeffs = [_DEFAULTDATATYPE(0.0)]
-)
-
-function outgoing_coefficient_at_inf(s::Int, m::Int, a, omega, lambda, order::Int; data_type=_DEFAULTDATATYPE)
+function _outgoing_coefficient_at_inf_legacy_impl(s::Int, m::Int, a, omega, lambda, order::Int; data_type=_DEFAULTDATATYPE)
     #=
     We have derived/shown the explicit expression for
     different physically-relevant spin weight (s=0, \pm 1, \pm2)
@@ -638,27 +2094,24 @@ function outgoing_coefficient_at_inf(s::Int, m::Int, a, omega, lambda, order::In
     is designed to be evaluated recursively to build
     the full list of coefficients
     =#
-    global _cached_outgoing_coefficients_at_inf_params
-    global _cached_outgoing_coefficients_at_inf
-
     if order < 0
         throw(DomainError(order, "Only positive expansion order is supported"))
     end
 
     if order == 0
-        return 1.0 # This is always 1.0
+        return one(data_type) # This is always 1.0
     elseif order == 1
         if s == 0
-            return (1/2)*I*(lambda + 2*a*m*omega)
+            return (one(omega)/2)*I*(lambda + 2*a*m*omega)
         elseif s == +1
-            return (1/2)*I*(2 + lambda + 2*a*m*omega)
+            return (one(omega)/2)*I*(2 + lambda + 2*a*m*omega)
         elseif s == -1
             return (I*(lambda^2 + 2*a*m*(2 + lambda)*omega))/(2*lambda)
         elseif s == +2
-            return (1/2)*I*(6 + lambda + 2*a*m*omega)
+            return (one(omega)/2)*I*(6 + lambda + 2*a*m*omega)
         elseif s == -2
             return begin
-                (1/6)*I*(-6 + 7*lambda) + I*a*m*omega + 
+                (one(omega)/6)*I*(-6 + 7*lambda) + I*a*m*omega +
                 (2*I*(-3 + lambda)*lambda*(2 + lambda) + 
                 24*(-3 - 3*I*a*m + lambda)*omega)/(-3*lambda*(2 + lambda) + 
                 36*omega*(I - a*m + a^2*omega))
@@ -669,12 +2122,12 @@ function outgoing_coefficient_at_inf(s::Int, m::Int, a, omega, lambda, order::In
     elseif order == 2
         if s == 0
             return begin
-                (1/8)*(-lambda^2 + lambda*(2 - 4*a*m*omega) + 
+                (one(omega)/8)*(-lambda^2 + lambda*(2 - 4*a*m*omega) +
                 4*omega*(I + a*m + a*m*(2*I - a*m)*omega))
             end
         elseif s == +1
             return begin
-                (1/8)*(-lambda^2 - 2*lambda*(1 + 2*a*m*omega) - 
+                (one(omega)/8)*(-lambda^2 - 2*lambda*(1 + 2*a*m*omega) -
                 4*a*omega*(m - 2*a*omega - 2*I*m*omega + a*m^2*omega))
             end
         elseif s == -1
@@ -684,7 +2137,7 @@ function outgoing_coefficient_at_inf(s::Int, m::Int, a, omega, lambda, order::In
             end
         elseif s == +2
             return begin
-                (1/8)*(-lambda^2 - 2*lambda*(5 + 2*a*m*omega) - 
+                (one(omega)/8)*(-lambda^2 - 2*lambda*(5 + 2*a*m*omega) -
                 4*(6 + (3*I + 5*a*m)*omega + a*m*(-2*I + a*m)*omega^2))
             end
         elseif s == -2
@@ -704,7 +2157,7 @@ function outgoing_coefficient_at_inf(s::Int, m::Int, a, omega, lambda, order::In
     elseif order == 3
         if s == 0
             return begin
-                (1/2)*(1 - I*a*m)*omega - (1/48)*I*((-6 + lambda)*(-2 + lambda)*lambda + 
+                (one(omega)/2)*(1 - I*a*m)*omega - (one(omega)/48)*I*((-6 + lambda)*(-2 + lambda)*lambda +
                 2*lambda*(-18*I + a*m*(-16 + 3*lambda))*omega + 
                 4*a*(3*a*m^2*(-2 + lambda) + 2*a*(-1 + lambda) - 
                 6*I*m*(1 + lambda))*omega^2 + 8*a*m*(-8 - 6*I*a*m + 
@@ -712,7 +2165,7 @@ function outgoing_coefficient_at_inf(s::Int, m::Int, a, omega, lambda, order::In
             end
         elseif s == +1
             return begin
-                (-(1/48))*I*(lambda^3 + lambda^2*(-2 + 6*a*m*omega) + 
+                -(one(omega)/48)*I*(lambda^3 + lambda^2*(-2 + 6*a*m*omega) +
                 4*lambda*(-2 - 2*(3*I + a*m)*omega + 
                 a*(-4*a - 6*I*m + 3*a*m^2)*omega^2) + 
                 8*omega*(-6*I + a^3*m*(-4 + m^2)*omega^2 + 
@@ -730,7 +2183,7 @@ function outgoing_coefficient_at_inf(s::Int, m::Int, a, omega, lambda, order::In
             end
         elseif s == +2
             return begin
-                (-(1/48))*I*(lambda^3 + 2*lambda^2*(5 + 3*a*m*omega) + 
+                -(one(omega)/48)*I*(lambda^3 + 2*lambda^2*(5 + 3*a*m*omega) +
                 4*lambda*(6 + (3*I + 10*a*m)*omega + 
                 a*(2*a - 6*I*m + 3*a*m^2)*omega^2) + 
                 8*a*omega*(a*omega + 6*a*m^2*(1 - I*omega)*omega + 
@@ -762,54 +2215,29 @@ function outgoing_coefficient_at_inf(s::Int, m::Int, a, omega, lambda, order::In
             throw(DomainError(s, "Currently only spin weight s of 0, +/-1, +/-2 are supported"))
         end
     else
-        # Evaluate higher order corrections using AD
+        throw(ArgumentError("explicit infinity bridge supports orders 0 through 3"))
+    end
+end
 
-        _this_params = (s=s, m=m, a=a, omega=omega, lambda=lambda)
-        # Check if we can use the cached results
-        if _cached_outgoing_coefficients_at_inf_params == _this_params
-            expansion_coeffs = _cached_outgoing_coefficients_at_inf.expansion_coeffs
-            Pcoeffs = _cached_outgoing_coefficients_at_inf.Pcoeffs
-            Qcoeffs = _cached_outgoing_coefficients_at_inf.Qcoeffs
+function outgoing_coefficient_at_inf(
+    s::Int, m::Int, a, omega, lambda, order::Int;
+    data_type=_DEFAULTDATATYPE,
+)
+    key = _legacy_series_key(
+        s, m, a, omega, lambda, INFINITY_OUTGOING_SERIES, order, data_type
+    )
+    T = _component_type(data_type)
+    return _with_request_precision(T, key.precision_bits) do
+        _chart_denominator(key)
+        if order <= 3
+            value = _outgoing_coefficient_at_inf_legacy_impl(
+                key.s, key.m, key.a, key.omega, key.lambda, order;
+                data_type=Complex{T},
+            )
+            _assert_value(key, Complex{T}(value), "legacy outgoing infinity coefficient")
         else
-            # Cannot re-use the cached results, re-compute from zero
-            expansion_coeffs = [data_type(1.0)] # order 0
-            Pcoeffs = [data_type(PplusInf_z(s, m, a, omega, lambda, 0))] # order 0
-            Qcoeffs = [data_type(0.0), data_type(0.0)] # the recurrence relation takes Q_{r+1}
+            build_asymptotic_series(key).coefficients[order + 1]
         end
-
-        # Compute Pcoeffs to the necessary order
-        _P(z) = PplusInf_z(s, m, a, omega, lambda, z)
-        _P_taylor = taylor_expand(_P, 0, order=order)
-        for i in length(Pcoeffs):order
-            append!(Pcoeffs, getcoeff(_P_taylor, i))
-        end
-
-        # Compute Qcoeffs to the necessary order (to current order + 1)
-        _Q(z) = QplusInf_z(s, m, a, omega, lambda, z)
-        _Q_taylor = taylor_expand(_Q, 0, order=order+1)
-        for i in length(Qcoeffs):order+1
-            append!(Qcoeffs, getcoeff(_Q_taylor, i))
-        end
-
-        # Note that the expansion coefficients we store is scaled by \omega^{i}
-        for i in length(expansion_coeffs):order
-            _P0 = Pcoeffs[1] # P0
-            sum = 0.0
-            for k in 1:i
-                sum += (Qcoeffs[k+2] - (i-k)*Pcoeffs[k+1])*(expansion_coeffs[i-k+1]/omega^(i-k))
-            end
-            append!(expansion_coeffs, omega^(i)*((i*(i-1)*(expansion_coeffs[i]/omega^(i-1)) + sum)/(_P0*i)))
-        end
-
-        # Update cache
-        _cached_outgoing_coefficients_at_inf_params = _this_params
-        _cached_outgoing_coefficients_at_inf = (
-            expansion_coeffs = expansion_coeffs,
-            Pcoeffs = Pcoeffs,
-            Qcoeffs = Qcoeffs
-        )
-
-        return expansion_coeffs[order+1]
     end
 end
 
@@ -1193,70 +2621,14 @@ function QplusH(s::Int, m::Int, a, omega, lambda, x)
     end
 end
 
-# Cache mechanism for the outgoing coefficients at horizon
-# Initialize the cache with a set of fiducial parameters
-_cached_outgoing_coefficients_at_hor_params::NamedTuple{(:s, :m, :a, :omega, :lambda), Tuple{Int, Int, _DEFAULTDATATYPE, _DEFAULTDATATYPE, _DEFAULTDATATYPE}} = (s=-2, m=2, a=0, omega=0.5, lambda=1)
-_cached_outgoing_coefficients_at_hor::NamedTuple{(:expansion_coeffs, :Pcoeffs, :Qcoeffs), Tuple{Vector{_DEFAULTDATATYPE}, Vector{_DEFAULTDATATYPE}, Vector{_DEFAULTDATATYPE}}} = (
-    expansion_coeffs = [_DEFAULTDATATYPE(1.0)], 
-    Pcoeffs = [_DEFAULTDATATYPE(0.0)],
-    Qcoeffs = [_DEFAULTDATATYPE(0.0)]
+function outgoing_coefficient_at_hor(
+    s::Int, m::Int, a, omega, lambda, order::Int;
+    data_type=_DEFAULTDATATYPE,
 )
-
-function outgoing_coefficient_at_hor(s::Int, m::Int, a, omega, lambda, order::Int; data_type=_DEFAULTDATATYPE)
-    global _cached_outgoing_coefficients_at_hor_params
-    global _cached_outgoing_coefficients_at_hor
-
-    if order < 0
-        throw(DomainError(order, "Only positive expansion order is supported"))
-    end
-
-    _this_params = (s=s, m=m, a=a, omega=omega, lambda=lambda)
-    # Check if we can use the cached results
-    if _cached_outgoing_coefficients_at_hor_params == _this_params
-        expansion_coeffs = _cached_outgoing_coefficients_at_hor.expansion_coeffs
-        Pcoeffs = _cached_outgoing_coefficients_at_hor.Pcoeffs
-        Qcoeffs = _cached_outgoing_coefficients_at_hor.Qcoeffs
-    else
-        # Cannot re-use the cached results, re-compute from zero
-        expansion_coeffs = [data_type(1.0)] # order 0
-        Pcoeffs = [data_type(PplusH(s, m, a, omega, lambda, 0))] # order 0
-        Qcoeffs = [data_type(0.0)] # order 0
-    end
-
-    if order > 0
-        # Compute series expansion coefficients for P and Q
-        _P(x) = PplusH(s, m, a, omega, lambda, x)
-        _Q(x) = QplusH(s, m, a, omega, lambda, x)
-        _P_taylor = taylor_expand(_P, 0, order=order)
-        _Q_taylor = taylor_expand(_Q, 0, order=order)
-
-        for i in length(Pcoeffs):order
-            append!(Pcoeffs, getcoeff(_P_taylor, i))
-            append!(Qcoeffs, getcoeff(_Q_taylor, i))       
-        end
-    end
-    # Define the indicial polynomial
-    indicial(nu) = nu*(nu - 1) + Pcoeffs[1]*nu + Qcoeffs[1]
-
-    if order > 0
-        # Evaluate the C coefficients
-        for i in length(expansion_coeffs):order
-            sum = 0.0
-            for r in 0:i-1
-                sum += expansion_coeffs[r+1]*(r*Pcoeffs[i-r+1] + Qcoeffs[i-r+1])
-            end
-            append!(expansion_coeffs, -sum/indicial(i))
-        end
-    end
-
-    # Update cache
-    _cached_outgoing_coefficients_at_hor_params = _this_params
-    _cached_outgoing_coefficients_at_hor = (
-        expansion_coeffs = expansion_coeffs,
-        Pcoeffs = Pcoeffs,
-        Qcoeffs = Qcoeffs
+    key = _legacy_series_key(
+        s, m, a, omega, lambda, HORIZON_OUTGOING_SERIES, order, data_type
     )
-    return expansion_coeffs[order+1]
+    return build_asymptotic_series(key).coefficients[order + 1]
 end
 
 function PminusH(s::Int, m::Int, a, omega, lambda, x)
@@ -1639,70 +3011,14 @@ function QminusH(s::Int, m::Int, a, omega, lambda, x)
     end
 end
 
-# Cache mechanism for the ingoing coefficients at horizon
-# Initialize the cache with a set of fiducial parameters
-_cached_ingoing_coefficients_at_hor_params::NamedTuple{(:s, :m, :a, :omega, :lambda), Tuple{Int, Int, _DEFAULTDATATYPE, _DEFAULTDATATYPE, _DEFAULTDATATYPE}} = (s=-2, m=2, a=0, omega=0.5, lambda=1)
-_cached_ingoing_coefficients_at_hor::NamedTuple{(:expansion_coeffs, :Pcoeffs, :Qcoeffs), Tuple{Vector{_DEFAULTDATATYPE}, Vector{_DEFAULTDATATYPE}, Vector{_DEFAULTDATATYPE}}} = (
-    expansion_coeffs = [_DEFAULTDATATYPE(1.0)], 
-    Pcoeffs = [_DEFAULTDATATYPE(0.0)],
-    Qcoeffs = [_DEFAULTDATATYPE(0.0)]
+function ingoing_coefficient_at_hor(
+    s::Int, m::Int, a, omega, lambda, order::Int;
+    data_type=_DEFAULTDATATYPE,
 )
-
-function ingoing_coefficient_at_hor(s::Int, m::Int, a, omega, lambda, order::Int; data_type=_DEFAULTDATATYPE)
-    global _cached_ingoing_coefficients_at_hor_params
-    global _cached_ingoing_coefficients_at_hor
-
-    if order < 0
-        throw(DomainError(order, "Only positive expansion order is supported"))
-    end
-
-    _this_params = (s=s, m=m, a=a, omega=omega, lambda=lambda)
-    # Check if we can use the cached results
-    if _cached_ingoing_coefficients_at_hor_params == _this_params
-        expansion_coeffs = _cached_ingoing_coefficients_at_hor.expansion_coeffs
-        Pcoeffs = _cached_ingoing_coefficients_at_hor.Pcoeffs
-        Qcoeffs = _cached_ingoing_coefficients_at_hor.Qcoeffs
-    else
-        # Cannot re-use the cached results, re-compute from zero
-        expansion_coeffs = [data_type(1.0)] # order 0
-        Pcoeffs = [data_type(PminusH(s, m, a, omega, lambda, 0))] # order 0
-        Qcoeffs = [data_type(0.0)] # order 0
-    end
-
-    if order > 0
-        # Compute series expansion coefficients for P and Q
-        _P(x) = PminusH(s, m, a, omega, lambda, x)
-        _Q(x) = QminusH(s, m, a, omega, lambda, x)
-        _P_taylor = taylor_expand(_P, 0, order=order)
-        _Q_taylor = taylor_expand(_Q, 0, order=order)
-
-        for i in length(Pcoeffs):order
-            append!(Pcoeffs, getcoeff(_P_taylor, i))
-            append!(Qcoeffs, getcoeff(_Q_taylor, i))       
-        end
-    end
-    # Define the indicial polynomial
-    indicial(nu) = nu*(nu - 1) + Pcoeffs[1]*nu + Qcoeffs[1]
-
-    if order > 0
-        # Evaluate the C coefficients
-        for i in length(expansion_coeffs):order
-            sum = 0.0
-            for r in 0:i-1
-                sum += expansion_coeffs[r+1]*(r*Pcoeffs[i-r+1] + Qcoeffs[i-r+1])
-            end
-            append!(expansion_coeffs, -sum/indicial(i))
-        end
-    end
-
-    # Update cache
-    _cached_ingoing_coefficients_at_hor_params = _this_params
-    _cached_ingoing_coefficients_at_hor = (
-        expansion_coeffs = expansion_coeffs,
-        Pcoeffs = Pcoeffs,
-        Qcoeffs = Qcoeffs
+    key = _legacy_series_key(
+        s, m, a, omega, lambda, HORIZON_INGOING_SERIES, order, data_type
     )
-    return expansion_coeffs[order+1]
+    return build_asymptotic_series(key).coefficients[order + 1]
 end
 
 end

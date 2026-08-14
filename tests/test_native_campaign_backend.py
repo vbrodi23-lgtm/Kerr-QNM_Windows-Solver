@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
+from windows_solver.contracts import canonical_json_bytes
 from windows_solver.gsn_cache_producer import GeneratedGsnCache, GsnParameterPair
+from windows_solver.julia_response_backend import JuliaPrecisionRootBackend
 from windows_solver.response_batches import (
+    CampaignExecutionAttempt,
     NativeCampaignStageBackend,
     PrecisionCapabilities,
     build_campaign_plan,
@@ -68,6 +72,71 @@ def _result(job, response: complex, *, radius: float = 1.0e-7):
         baseline=baseline,
         levels=(),
         lineage=_lineage(job),
+    )
+
+
+def _failed_preflight_attempt(leaf):
+    request_binding = JuliaPrecisionRootBackend(
+        leaf.job.backend_identity, object(), 80
+    )._request(leaf.job, 0.0j)
+    failure = {
+        "failure_code": "INSUFFICIENT_ASYMPTOTIC_PRECISION",
+        "failure_class": "CONTROL",
+        "retryable": True,
+        "precision_digits": 80,
+        "request_sha256": hashlib.sha256(
+            canonical_json_bytes(request_binding)
+        ).hexdigest(),
+        "request_binding": request_binding,
+        "job_id": leaf.job.job_id,
+        "leaf_id": leaf.leaf_id,
+        "role": leaf.role,
+        "job_policy_sha256": leaf.job.policy.identity_sha256,
+        "backend_identity_sha256": leaf.job.backend_identity.identity_sha256,
+        "refinement_level": 0,
+        "execution_resource_policy": {
+            name: request_binding["execution_resource"][name]
+            for name in ("schema", "version", "sha256")
+        },
+        "diagnostics": {
+            "predicted_reliable_digits": "11",
+            "required_reliable_digits": "24",
+            "asymptotic_preflight_avoided_ode": True,
+            "asymptotic_preflight_reason": (
+                "INSUFFICIENT_ASYMPTOTIC_PRECISION"
+            ),
+            "factored_homogeneous_rhs_evaluations": 0,
+            "avoided_ode_scope": "factored-homogeneous-gsn/v1",
+        },
+        "promotion_decision": {
+            "schema": "windows-solver.precision-promotion-decision/1",
+            "from_precision_digits": 80,
+            "to_precision_digits": 120,
+            "state": "REQUESTED",
+            "reason": "INSUFFICIENT_ASYMPTOTIC_PRECISION",
+            "predicted_reliable_digits": "11",
+            "required_reliable_digits": "24",
+            "precision_limited": True,
+            "asymptotic_preflight_avoided_ode": True,
+        },
+    }
+    return CampaignExecutionAttempt(
+        attempt_ordinal=1,
+        leaf_id=leaf.leaf_id,
+        leaf_index=1,
+        role=leaf.role,
+        state="NUMERICAL_CONTROL_FAILURE",
+        precision_digits=80,
+        failure_code="INSUFFICIENT_ASYMPTOTIC_PRECISION",
+        failure_receipt={
+            "worker_exit_code": 1,
+            "worker_timed_out": False,
+            "worker_stderr_tail": "synthetic",
+            "worker_error_type": "Synthetic",
+            "worker_error_message": "insufficient",
+            "failure": failure,
+        },
+        created_at_utc="2026-08-14T00:00:00.000Z",
     )
 
 
@@ -209,6 +278,43 @@ class NativeCampaignBackendTests(unittest.TestCase):
         self.assertEqual(
             outcome.component_result["self_refinement_skipped_reason"],
             "PRIMARY_NOT_CONVERGED",
+        )
+
+    def test_failed_preflight_recovery_runs_120_base_and_refinement(self):
+        predecessor = _failed_preflight_attempt(self.leaf)
+        base = _result(self.leaf.job, 1.0 + 2.0e-8j)
+        refinement = _result(self.leaf.job, 1.0 + 2.5e-8j)
+
+        with patch(
+            "windows_solver.response_batches.run_component",
+            side_effect=(base, refinement),
+        ) as run:
+            outcome = self.backend.execute_promoted_stage_after_failed_preflight(
+                self.leaf, 120, predecessor
+            )
+
+        self.assertEqual(run.call_count, 2)
+        self.assertEqual(outcome.digits, 120)
+        self.assertIsNone(outcome.discrepancy_from_previous_abs)
+        self.assertIsNone(outcome.discrepancy_enclosed)
+        self.assertTrue(outcome.self_refinement_enclosed)
+        component = outcome.component_result
+        self.assertEqual(
+            component["failed_preflight_predecessor"],
+            predecessor.to_mapping(),
+        )
+        self.assertEqual(
+            component["comparison_kind"],
+            "same-precision-120-base-vs-refinement/v1",
+        )
+        self.assertIs(
+            component["precision_ladder_discrepancy_applicable"], False
+        )
+        self.assertEqual(
+            component["self_refinement_scientific_runtime"][
+                "refinement_level"
+            ],
+            1,
         )
 
 

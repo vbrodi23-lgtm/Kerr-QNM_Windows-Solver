@@ -7,9 +7,10 @@ explicit injected component backend.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from contextvars import ContextVar
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 import hashlib
 import json
 import math
@@ -28,11 +29,13 @@ from .response_engine import (
     ComponentStatus,
     NativeDeterminantAdapter,
     NativeResourceUnavailableError,
+    NumericalConditioningEvidence,
     NumericalPolicy,
     RECORDED_REPLAY_BACKEND_ID,
     RecordedReplayBackend,
     ResponseComponentJob,
     VettedNativeDeterminantKernel,
+    regularised_gsn_precision_policy,
     root_readout_preserves_authenticated_branch,
     run_component,
 )
@@ -43,12 +46,16 @@ from .gsn_cache_producer import (
     parameter_pairs_for_selection,
 )
 from .julia_response_backend import (
+    NUMERICAL_CONTROL_FAILURE_CODES,
+    JuliaNumericalControlError,
     JuliaODEResourceLimitError,
     JuliaPrecisionRootBackend,
     JuliaRootReadoutResourceLimitError,
     JuliaResponseAdapter,
     JuliaResponseBackendError,
     JuliaWorkerTimeoutError,
+    _validated_execution_resource_policy,
+    _valid_numerical_control_diagnostics,
     worker_failure_payload as _julia_worker_failure_payload,
 )
 from .progress import PROGRESS_SCHEMA, ProgressEventKind, emit_progress, progress_scope
@@ -60,9 +67,14 @@ from .solved_leaf_cache import (
 
 
 CAMPAIGN_SCHEMA_VERSION = 2
-CAMPAIGN_CHECKPOINT_SCHEMA_VERSION = 4
+CAMPAIGN_CHECKPOINT_SCHEMA_VERSION = 6
 _LEGACY_CAMPAIGN_CHECKPOINT_SCHEMA_VERSION = 3
+_HISTORICAL_CAMPAIGN_CHECKPOINT_SCHEMA_VERSIONS = frozenset({3, 4, 5})
 _PRECISION_DIGITS = frozenset({64, 80, 120})
+_FAILED_PREFLIGHT_COMPARISON_KIND = (
+    "same-precision-120-base-vs-refinement/v1"
+)
+_FACTORED_HOMOGENEOUS_ODE_SCOPE_ID = "factored-homogeneous-gsn/v1"
 STAGE_SIGNED_ERROR_FAMILIES = (
     "signed-root",
     "centred-step-amplitude",
@@ -413,11 +425,14 @@ def explicit_stage_signed_error_channels(
     source_kind: str,
     source_id: str,
     units: str,
+    not_applicable_families: frozenset[str] = frozenset(),
 ) -> tuple[Mapping[str, object], ...]:
     """Build a complete, explicitly signed ledger bound to one stage result."""
 
     if set(family_deltas) != set(STAGE_SIGNED_ERROR_FAMILIES):
         raise ValueError("explicit stage ledger requires every signed-error family")
+    if not set(not_applicable_families).issubset(STAGE_SIGNED_ERROR_FAMILIES):
+        raise ValueError("stage ledger not-applicable family is invalid")
     source_sha256 = _sha256(component_result)
     return tuple(
         StageSignedErrorChannel(
@@ -428,7 +443,11 @@ def explicit_stage_signed_error_channels(
                 "source_kind": source_kind,
                 "source_id": source_id,
                 "source_sha256": source_sha256,
-                "derivation": f"explicit-signed-{family}",
+                "derivation": (
+                    f"not-applicable-{family}"
+                    if family in not_applicable_families
+                    else f"explicit-signed-{family}"
+                ),
             },
             units=units,
             signed_delta=family_deltas[family],
@@ -441,6 +460,8 @@ def explicit_stage_signed_error_channels(
 def synthetic_stage_signed_error_channels(
     component_result: Mapping[str, object],
     local_disk_radius_abs: float,
+    *,
+    precision_ladder_applicable: bool = True,
 ) -> tuple[Mapping[str, object], ...]:
     """Supply an explicit non-physical ledger for orchestration-only stages."""
 
@@ -453,6 +474,11 @@ def synthetic_stage_signed_error_channels(
         source_kind="synthetic-orchestration-contract",
         source_id=source_id,
         units="synthetic-dimensionless-response",
+        not_applicable_families=(
+            frozenset()
+            if precision_ladder_applicable
+            else frozenset({"precision-ladder-discrepancy"})
+        ),
     )
 
 
@@ -462,6 +488,7 @@ def _component_stage_signed_error_channels(
     *,
     repeat_delta: complex = 0.0j,
     precision_delta: complex = 0.0j,
+    precision_ladder_applicable: bool = True,
 ) -> tuple[Mapping[str, object], ...]:
     """Preserve the authenticated component engine's six error channels."""
 
@@ -488,6 +515,11 @@ def _component_stage_signed_error_channels(
         source_kind="authenticated-component-error-channel",
         source_id=result.job_id,
         units="M-delta-omega-per-native-coordinate",
+        not_applicable_families=(
+            frozenset()
+            if precision_ladder_applicable
+            else frozenset({"precision-ladder-discrepancy"})
+        ),
     )
 
 
@@ -738,16 +770,21 @@ _CONTAINABLE_FAILURE_CODES = frozenset({
     "ODE_RESOURCE_LIMIT",
     "ROOT_READOUT_RESOURCE_INFEASIBLE",
     "WORKER_TIMEOUT",
-})
+}) | NUMERICAL_CONTROL_FAILURE_CODES
 _CONTAINABLE_FAILURE_STATES = {
     "ODE_RESOURCE_LIMIT": "EXECUTION_RESOURCE_LIMITED",
     "ROOT_READOUT_RESOURCE_INFEASIBLE": "EXECUTION_RESOURCE_LIMITED",
     "WORKER_TIMEOUT": "WORKER_TIMEOUT",
+    **{
+        code: "NUMERICAL_CONTROL_FAILURE"
+        for code in NUMERICAL_CONTROL_FAILURE_CODES
+    },
 }
 _CONTAINABLE_EXCEPTION_TYPES = (
     JuliaODEResourceLimitError,
     JuliaRootReadoutResourceLimitError,
     JuliaWorkerTimeoutError,
+    JuliaNumericalControlError,
 )
 
 
@@ -769,6 +806,15 @@ def _validated_attempt_failure_receipt(value: object) -> dict[str, object]:
         or not isinstance(failure.get("retryable"), bool)
     ):
         raise ValueError("campaign execution attempt is not containable")
+    if code in NUMERICAL_CONTROL_FAILURE_CODES and (
+        failure.get("retryable")
+        is not (code == "INSUFFICIENT_ASYMPTOTIC_PRECISION")
+        or not _valid_numerical_control_diagnostics(failure)
+    ):
+        raise ValueError(
+            "campaign execution attempt receipt numerical-control diagnostics "
+            "are invalid"
+        )
     resource_policy = failure.get("execution_resource_policy")
     identity_fields = {"schema", "version", "sha256"}
     full_policy_fields = identity_fields | {
@@ -873,6 +919,21 @@ class CampaignExecutionAttempt:
             raise ValueError(
                 "campaign execution attempt precision does not match receipt"
             )
+        expected_decision = _numerical_failure_promotion_decision(
+            failure, self.precision_digits
+        )
+        raw_decision = failure.get("promotion_decision")
+        if expected_decision is None:
+            if raw_decision is not None:
+                raise ValueError(
+                    "campaign execution attempt promotion decision is unexpected"
+                )
+        elif raw_decision is None or (
+            _validated_promotion_decision(raw_decision) != expected_decision
+        ):
+            raise ValueError(
+                "campaign execution attempt promotion decision is invalid"
+            )
         try:
             parsed = datetime.fromisoformat(self.created_at_utc.replace("Z", "+00:00"))
         except ValueError as error:
@@ -948,6 +1009,209 @@ class CampaignExecutionAttempt:
         if value["attempt_sha256"] != attempt.attempt_sha256:
             raise ValueError("campaign execution attempt digest is invalid")
         return attempt
+
+
+def _validate_failed_preflight_predecessor(
+    attempt: CampaignExecutionAttempt,
+    leaf: CampaignLeafPlan,
+) -> None:
+    """Authenticate the sole control predecessor for a 120-only recovery."""
+
+    if (
+        attempt.leaf_id != leaf.leaf_id
+        or attempt.role != leaf.role
+        or attempt.precision_digits != 80
+        or attempt.failure_code != "INSUFFICIENT_ASYMPTOTIC_PRECISION"
+        or attempt.state != "NUMERICAL_CONTROL_FAILURE"
+    ):
+        raise ValueError("failed-preflight predecessor identity is invalid")
+    failure = attempt.failure_receipt.get("failure")
+    if not isinstance(failure, Mapping):
+        raise ValueError("failed-preflight predecessor receipt is missing")
+    identity = {
+        "job_id": leaf.job.job_id,
+        "leaf_id": leaf.leaf_id,
+        "role": leaf.role,
+        "job_policy_sha256": leaf.job.policy.identity_sha256,
+        "backend_identity_sha256": leaf.job.backend_identity.identity_sha256,
+        "refinement_level": 0,
+    }
+    if any(failure.get(name) != expected for name, expected in identity.items()):
+        raise ValueError("failed-preflight request/job identity is invalid")
+    request_sha256 = failure.get("request_sha256")
+    if (
+        not isinstance(request_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", request_sha256) is None
+    ):
+        raise ValueError("failed-preflight request digest is invalid")
+    request_binding = failure.get("request_binding")
+    if (
+        not isinstance(request_binding, Mapping)
+        or _sha256(request_binding) != request_sha256
+    ):
+        raise ValueError(
+            "failed-preflight request digest disagrees with canonical binding"
+        )
+    expected_request_identity = {
+        "schema_version": 1,
+        "operation": "root-readout",
+        "job_id": leaf.job.job_id,
+        "leaf_id": leaf.leaf_id,
+        "role": leaf.role,
+        "job_policy_sha256": leaf.job.policy.identity_sha256,
+        "backend_identity_sha256": leaf.job.backend_identity.identity_sha256,
+        "refinement_level": 0,
+        "mode": {
+            "s": leaf.job.mode.s,
+            "ell": leaf.job.mode.ell,
+            "m": leaf.job.mode.m,
+            "n": leaf.job.mode.n,
+        },
+        "spin": format(leaf.job.spin, ".17g"),
+        "omega": {
+            "real": format(leaf.job.root.omega.real, ".17g"),
+            "imaginary": format(leaf.job.root.omega.imag, ".17g"),
+        },
+        "angular_A": {
+            "real": format(
+                leaf.job.root.angular_separation_constant.real, ".17g"
+            ),
+            "imaginary": format(
+                leaf.job.root.angular_separation_constant.imag, ".17g"
+            ),
+        },
+        "mechanism_id": leaf.job.mechanism_id,
+        "precision_digits": 80,
+        "working_precision_bits": math.ceil(80 * math.log2(10)) + 32,
+    }
+    if any(
+        request_binding.get(name) != expected
+        for name, expected in expected_request_identity.items()
+    ):
+        raise ValueError("failed-preflight canonical request identity is invalid")
+    amplitude = request_binding.get("amplitude")
+    if not isinstance(amplitude, Mapping) or set(amplitude) != {
+        "real", "imaginary"
+    }:
+        raise ValueError("failed-preflight request amplitude is invalid")
+    try:
+        amplitude_parts = tuple(Decimal(amplitude[name]) for name in (
+            "real", "imaginary"
+        ))
+    except (InvalidOperation, TypeError, ValueError) as error:
+        raise ValueError("failed-preflight request amplitude is invalid") from error
+    if not all(part.is_finite() for part in amplitude_parts):
+        raise ValueError("failed-preflight request amplitude is invalid")
+    amplitude_value = complex(*(float(part) for part in amplitude_parts))
+    allowed_amplitudes = {0.0j}
+    for epsilon in leaf.job.policy.epsilons:
+        allowed_amplitudes.update({
+            complex(epsilon, 0.0),
+            complex(-epsilon, 0.0),
+            complex(0.0, epsilon),
+            complex(0.0, -epsilon),
+        })
+    if amplitude_value not in allowed_amplitudes:
+        raise ValueError("failed-preflight request amplitude is off schedule")
+    raw_predictor = request_binding.get("primary_predictor")
+    predictor_kind = request_binding.get("primary_predictor_kind")
+    predictor_value: complex | None = None
+    if raw_predictor is not None:
+        if (
+            not isinstance(raw_predictor, Mapping)
+            or set(raw_predictor) != {"real", "imaginary"}
+            or predictor_kind not in {
+                "EPSILON_CONTINUATION", "SPIN_CONTINUATION"
+            }
+        ):
+            raise ValueError("failed-preflight request predictor is invalid")
+        try:
+            predictor_value = complex(
+                float(Decimal(raw_predictor["real"])),
+                float(Decimal(raw_predictor["imaginary"])),
+            )
+        except (InvalidOperation, TypeError, ValueError) as error:
+            raise ValueError(
+                "failed-preflight request predictor is invalid"
+            ) from error
+        if not (
+            math.isfinite(predictor_value.real)
+            and math.isfinite(predictor_value.imag)
+        ):
+            raise ValueError("failed-preflight request predictor is invalid")
+    elif predictor_kind is not None:
+        raise ValueError("failed-preflight request predictor is invalid")
+    resource = request_binding.get("execution_resource")
+    failure_resource = failure.get("execution_resource_policy")
+    try:
+        validated_resource = _validated_execution_resource_policy(resource)
+    except JuliaResponseBackendError as error:
+        raise ValueError(
+            "failed-preflight request resource binding is invalid"
+        ) from error
+    resource_identity = {
+        "schema": validated_resource["schema"],
+        "version": validated_resource["version"],
+        "sha256": validated_resource["sha256"],
+    }
+    if not isinstance(failure_resource, Mapping) or dict(failure_resource) not in (
+        resource_identity,
+        validated_resource,
+    ):
+        raise ValueError("failed-preflight request resource binding is invalid")
+    expected_request = JuliaPrecisionRootBackend(
+        leaf.job.backend_identity, object(), 80, refinement=0
+    )._request(
+        leaf.job,
+        amplitude_value,
+        predictor_value,
+        predictor_kind,
+    )
+    expected_request["execution_resource"] = validated_resource
+    if dict(request_binding) != expected_request:
+        raise ValueError("failed-preflight canonical request contract is invalid")
+    if failure.get("precision_digits") != 80:
+        raise ValueError("failed-preflight request precision is invalid")
+    diagnostics = failure.get("diagnostics")
+    if (
+        failure.get("retryable") is not True
+        or not isinstance(diagnostics, Mapping)
+        or diagnostics.get("asymptotic_preflight_avoided_ode") is not True
+        or diagnostics.get("asymptotic_preflight_reason")
+        != "INSUFFICIENT_ASYMPTOTIC_PRECISION"
+        or diagnostics.get("factored_homogeneous_rhs_evaluations") != 0
+        or diagnostics.get("avoided_ode_scope")
+        != _FACTORED_HOMOGENEOUS_ODE_SCOPE_ID
+    ):
+        raise ValueError("failed-preflight zero-work evidence is invalid")
+    decision = failure.get("promotion_decision")
+    expected_decision = _numerical_failure_promotion_decision(failure, 80)
+    if expected_decision is None or (
+        _validated_promotion_decision(decision) != expected_decision
+    ):
+        raise ValueError("failed-preflight promotion decision is invalid")
+
+
+def _failed_preflight_predecessor_for_leaf(
+    attempts: Sequence[CampaignExecutionAttempt],
+    leaf: CampaignLeafPlan,
+) -> CampaignExecutionAttempt | None:
+    candidates = tuple(
+        attempt
+        for attempt in attempts
+        if (
+            attempt.leaf_id == leaf.leaf_id
+            and attempt.precision_digits == 80
+            and attempt.failure_code
+            == "INSUFFICIENT_ASYMPTOTIC_PRECISION"
+        )
+    )
+    if len(candidates) > 1:
+        raise ValueError("campaign has duplicate failed-preflight predecessors")
+    if not candidates:
+        return None
+    _validate_failed_preflight_predecessor(candidates[0], leaf)
+    return candidates[0]
 
 
 @dataclass(frozen=True, slots=True)
@@ -1121,6 +1385,39 @@ def _previous_primary_recovery_precision_contract() -> dict[str, object]:
     }
 
 
+def _failed_preflight_recovery_precision_contract() -> dict[str, object]:
+    """Bind the only admissible 80-preflight-to-120 alternate terminal gate."""
+
+    return {
+        "schema": "windows-solver.failed-preflight-recovery/1",
+        "control_predecessor": {
+            "precision_digits": 80,
+            "failure_code": "INSUFFICIENT_ASYMPTOTIC_PRECISION",
+            "failure_class": "CONTROL",
+            "retryable": True,
+            "request_binding_required": True,
+            "asymptotic_preflight_avoided_ode": True,
+            "factored_homogeneous_rhs_evaluations": 0,
+            "avoided_ode_scope": _FACTORED_HOMOGENEOUS_ODE_SCOPE_ID,
+        },
+        "terminal_precision_sequence": [64, 120],
+        "comparison_kind": _FAILED_PREFLIGHT_COMPARISON_KIND,
+        "precision_ladder_discrepancy_applicable": False,
+        "precision120_evidence": {
+            "base_refinement_levels": [0, 1],
+            "component_status": ComponentStatus.CONVERGED.value,
+            "conditioning_precision_limited": False,
+            "conditioning_required_digits_met": True,
+            "same_precision_delta_enclosed": True,
+        },
+        "terminal_state": {
+            "non_sentinel_when_all_gates_pass": "PRODUCED",
+            "otherwise": "UNRESOLVED",
+            "fixed_precision_sentinel": "UNRESOLVED",
+        },
+    }
+
+
 def _primary_recovery_precision_contract() -> dict[str, object]:
     """Return the canonical PRIMARY promoted-precision policy fragment."""
 
@@ -1129,6 +1426,9 @@ def _primary_recovery_precision_contract() -> dict[str, object]:
     return {
         **_previous_primary_recovery_precision_contract(),
         "promoted_numerical_controls": promoted_precision_numerical_controls(),
+        "failed_preflight_alternate": (
+            _failed_preflight_recovery_precision_contract()
+        ),
     }
 
 
@@ -1234,6 +1534,10 @@ def _leaf_precision_contract(leaf: CampaignLeafPlan) -> dict[str, object]:
     contract = _legacy_leaf_precision_contract(leaf)
     if leaf.role == "primary":
         contract["primary_recovery"] = _primary_recovery_precision_contract()
+    elif leaf.role == "deep":
+        contract["failed_preflight_recovery"] = (
+            _failed_preflight_recovery_precision_contract()
+        )
     contract["root_convergence"] = _root_convergence_precision_contract()
     return contract
 
@@ -1561,6 +1865,9 @@ def _checkpoint_bindings(
                 B_PRIME_RELEASE_DOMAIN.fixed_precision_sentinel_leaf_ids
             ),
             "primary_recovery": _primary_recovery_precision_contract(),
+            "failed_preflight_recovery": (
+                _failed_preflight_recovery_precision_contract()
+            ),
             "response_uncertainty": _response_uncertainty_contract(),
         }),
     }
@@ -1659,10 +1966,10 @@ def _read_checkpoint_envelope(
             "campaign checkpoint uses the legacy branch-authentication contract; "
             "preserve it as evidence and start with a fresh checkpoint path"
         )
-    if version not in {
-        _LEGACY_CAMPAIGN_CHECKPOINT_SCHEMA_VERSION,
-        CAMPAIGN_CHECKPOINT_SCHEMA_VERSION,
-    }:
+    if version not in (
+        _HISTORICAL_CAMPAIGN_CHECKPOINT_SCHEMA_VERSIONS
+        | {CAMPAIGN_CHECKPOINT_SCHEMA_VERSION}
+    ):
         raise ValueError("campaign checkpoint schema is invalid")
     bindings = value["bindings"]
     if not isinstance(bindings, Mapping):
@@ -1696,6 +2003,7 @@ def _load_checkpoint_with_attempts(
     tuple[CampaignLeafRecord, ...],
     tuple[CampaignExecutionAttempt, ...],
     str,
+    int,
 ]:
     value, bindings, records, attempts = _read_checkpoint_envelope(path)
     selection_value = bindings.get("selection")
@@ -1746,10 +2054,13 @@ def _load_checkpoint_with_attempts(
         if not record.stages or record.stages[0].outcome.digits != 64:
             raise ValueError("campaign checkpoint precision stages are invalid")
         digits = tuple(stage.outcome.digits for stage in record.stages)
-        if digits not in {(64,), (64, 80), (64, 80, 120)}:
+        if digits not in {(64,), (64, 80), (64, 120), (64, 80, 120)}:
             raise ValueError("campaign checkpoint precision stage order is invalid")
         _validate_record_semantics(
-            leaf, record, plan.precision_factory_identity
+            leaf,
+            record,
+            plan.precision_factory_identity,
+            checkpoint_schema_version=value["schema_version"],
         )
     if tuple(attempt.attempt_ordinal for attempt in attempts) != tuple(
         range(1, len(attempts) + 1)
@@ -1775,6 +2086,43 @@ def _load_checkpoint_with_attempts(
         )
         if record is None or not record.stages:
             raise ValueError("campaign execution attempt lacks prior stage evidence")
+    for record in records:
+        digits = tuple(stage.outcome.digits for stage in record.stages)
+        leaf = leaf_by_id[record.leaf_id]
+        predecessor = _failed_preflight_predecessor_for_leaf(
+            attempts, leaf
+        )
+        pending_recovery = (
+            digits == (64,)
+            and record.state in {"IN_PROGRESS", "MISSING_PRECISION"}
+            and (
+                record.missing_precision_digits is None
+                or record.missing_precision_digits == 120
+            )
+        )
+        if predecessor is not None and not (
+            pending_recovery or digits == (64, 120)
+        ):
+            raise ValueError(
+                "failed-preflight predecessor has incompatible stage evidence"
+            )
+        if (
+            record.missing_precision_digits == 120
+            and digits == (64,)
+            and predecessor is None
+        ):
+            raise ValueError(
+                "missing 120-digit recovery lacks a failed-preflight predecessor"
+            )
+        if digits != (64, 120):
+            continue
+        embedded = record.stages[-1].outcome.component_result.get(
+            "failed_preflight_predecessor"
+        )
+        if predecessor is None or predecessor.to_mapping() != embedded:
+            raise ValueError(
+                "failed-preflight recovery predecessor does not match checkpoint"
+            )
     expected_state = (
         "COMPLETE"
         if len(records) == len(selection.leaf_ids)
@@ -1783,7 +2131,13 @@ def _load_checkpoint_with_attempts(
     )
     if value["state"] != expected_state or value["release_admissible"] is not False:
         raise ValueError("campaign checkpoint state is invalid")
-    return selection, records, attempts, expected_state
+    return (
+        selection,
+        records,
+        attempts,
+        expected_state,
+        value["schema_version"],
+    )
 
 
 def _load_checkpoint(
@@ -1791,7 +2145,9 @@ def _load_checkpoint(
 ) -> tuple[CampaignSelection, tuple[CampaignLeafRecord, ...], str]:
     """Backward-compatible checkpoint loader omitting the operational ledger."""
 
-    selection, records, _attempts, state = _load_checkpoint_with_attempts(plan, path)
+    selection, records, _attempts, state, _version = (
+        _load_checkpoint_with_attempts(plan, path)
+    )
     return selection, records, state
 
 
@@ -1873,7 +2229,178 @@ def _primary_binary64_promotes(
     )
 
 
-def _primary_requires_precision120(outcome: StageOutcome) -> bool:
+_PROMOTION_DECISION_SCHEMA = "windows-solver.precision-promotion-decision/1"
+_PROMOTION_DECISION_FIELDS = frozenset({
+    "schema",
+    "from_precision_digits",
+    "to_precision_digits",
+    "state",
+    "reason",
+    "predicted_reliable_digits",
+    "required_reliable_digits",
+    "precision_limited",
+    "asymptotic_preflight_avoided_ode",
+})
+
+
+def _promotion_conditioning(
+    outcome: StageOutcome,
+) -> NumericalConditioningEvidence | None:
+    raw_result = outcome.component_result.get("result")
+    if not isinstance(raw_result, Mapping):
+        return None
+    result = ComponentResult.from_mapping(raw_result)
+    return result.baseline.numerical_conditioning
+
+
+def _promotion_decision(
+    outcome: StageOutcome,
+    *,
+    existing_requested: bool,
+    requested_reason: str,
+    suppressed_reason: str,
+) -> dict[str, object]:
+    evidence = _promotion_conditioning(outcome)
+    requested = existing_requested
+    reason = requested_reason if requested else suppressed_reason
+    if outcome.numerical_state == ComponentStatus.NOT_CONVERGED.value:
+        if evidence is None:
+            reason = "LEGACY_CONDITIONING_EVIDENCE_ABSENT"
+        else:
+            requested = evidence.precision_limited
+            reason = (
+                "INSUFFICIENT_RELIABLE_DIGITS"
+                if requested
+                else "PREDICTED_RELIABLE_DIGITS_ADEQUATE"
+            )
+    return {
+        "schema": _PROMOTION_DECISION_SCHEMA,
+        "from_precision_digits": 80,
+        "to_precision_digits": 120,
+        "state": "REQUESTED" if requested else "SUPPRESSED",
+        "reason": reason,
+        "predicted_reliable_digits": (
+            None if evidence is None else str(evidence.predicted_reliable_digits)
+        ),
+        "required_reliable_digits": (
+            None if evidence is None else str(evidence.required_reliable_digits)
+        ),
+        "precision_limited": (
+            None if evidence is None else evidence.precision_limited
+        ),
+        "asymptotic_preflight_avoided_ode": (
+            None
+            if evidence is None
+            else evidence.asymptotic_preflight_avoided_ode
+        ),
+    }
+
+
+def _validated_promotion_decision(value: object) -> dict[str, object]:
+    if not isinstance(value, Mapping) or set(value) != _PROMOTION_DECISION_FIELDS:
+        raise ValueError("precision promotion decision fields are invalid")
+    if (
+        value["schema"] != _PROMOTION_DECISION_SCHEMA
+        or type(value["from_precision_digits"]) is not int
+        or value["from_precision_digits"] != 80
+        or type(value["to_precision_digits"]) is not int
+        or value["to_precision_digits"] != 120
+        or value["state"] not in {"REQUESTED", "SUPPRESSED"}
+        or not isinstance(value["reason"], str)
+        or not value["reason"]
+    ):
+        raise ValueError("precision promotion decision contract is invalid")
+    predicted = value["predicted_reliable_digits"]
+    required = value["required_reliable_digits"]
+    limited = value["precision_limited"]
+    preflight = value["asymptotic_preflight_avoided_ode"]
+    if predicted is None or required is None:
+        if not (
+            predicted is None
+            and required is None
+            and limited is None
+            and preflight is None
+        ):
+            raise ValueError("precision promotion evidence is incomplete")
+    else:
+        if (
+            not isinstance(predicted, str)
+            or not predicted
+            or predicted.strip() != predicted
+            or not isinstance(required, str)
+            or not required
+            or required.strip() != required
+            or type(limited) is not bool
+            or type(preflight) is not bool
+        ):
+            raise ValueError("precision promotion evidence types are invalid")
+        try:
+            predicted_decimal = Decimal(predicted)
+            required_decimal = Decimal(required)
+        except InvalidOperation as error:
+            raise ValueError("precision promotion evidence is not decimal") from error
+        if (
+            not predicted_decimal.is_finite()
+            or not required_decimal.is_finite()
+            or required_decimal < 0
+            or limited != (predicted_decimal < required_decimal)
+        ):
+            raise ValueError("precision promotion evidence is inconsistent")
+    output = dict(value)
+    if output["reason"] == "INSUFFICIENT_RELIABLE_DIGITS" and (
+        output["state"] != "REQUESTED" or limited is not True
+    ):
+        raise ValueError("insufficient-digit promotion decision is inconsistent")
+    if output["reason"] == "PREDICTED_RELIABLE_DIGITS_ADEQUATE" and (
+        output["state"] != "SUPPRESSED" or limited is not False
+    ):
+        raise ValueError("adequate-digit promotion decision is inconsistent")
+    return output
+
+
+def _stage_with_promotion_decision(
+    outcome: StageOutcome, decision: Mapping[str, object]
+) -> StageOutcome:
+    if "promotion_decision" in outcome.component_result:
+        raise ValueError("stage component result already has a promotion decision")
+    validated = _validated_promotion_decision(decision)
+    component_result = dict(outcome.component_result)
+    component_result["promotion_decision"] = validated
+    source_sha256 = _sha256(component_result)
+    channels: list[Mapping[str, object]] = []
+    for raw in outcome.signed_error_channels:
+        copied = dict(raw)
+        provenance = dict(copied["provenance"])
+        provenance["source_sha256"] = source_sha256
+        copied["provenance"] = provenance
+        channels.append(copied)
+    return replace(
+        outcome,
+        component_result=component_result,
+        signed_error_channels=tuple(channels),
+    )
+
+
+def _validate_attached_promotion_decision(
+    outcome: StageOutcome,
+    expected: Mapping[str, object],
+    *,
+    required: bool,
+) -> None:
+    raw = outcome.component_result.get("promotion_decision")
+    if raw is None:
+        if required:
+            raise ValueError(
+                "precision promotion decision is required for checkpoint "
+                f"schema {CAMPAIGN_CHECKPOINT_SCHEMA_VERSION}"
+            )
+        # Schema 3/4 checkpoints predate the mandatory attached decision.
+        return
+    if _validated_promotion_decision(raw) != dict(expected):
+        raise ValueError("precision promotion decision disagrees with stage evidence")
+
+
+def _primary_existing_requires_precision120(outcome: StageOutcome) -> bool:
     gates = _primary_recovery_precision_contract()["precision120_gates"]
     if not isinstance(gates, Mapping):
         raise ValueError("PRIMARY 120-digit gate contract is invalid")
@@ -1886,6 +2413,44 @@ def _primary_requires_precision120(outcome: StageOutcome) -> bool:
         is gates["self_refinement_enclosed"]
         or outcome.discrepancy_enclosed is gates["discrepancy_enclosed"]
     )
+
+
+def _primary_precision120_decision(outcome: StageOutcome) -> dict[str, object]:
+    existing_requested = _primary_existing_requires_precision120(outcome)
+    return _promotion_decision(
+        outcome,
+        existing_requested=existing_requested,
+        requested_reason="CONVERGED_REFINEMENT_OR_DISCREPANCY_GATE",
+        suppressed_reason="CONVERGED_PROMOTION_GATES_SATISFIED",
+    )
+
+
+def _deep_precision120_decision(
+    outcome: StageOutcome, *, sentinel_false_negative: bool
+) -> dict[str, object]:
+    existing_requested = (
+        sentinel_false_negative or not bool(outcome.self_refinement_enclosed)
+    )
+    decision = _promotion_decision(
+        outcome,
+        existing_requested=existing_requested,
+        requested_reason=(
+            "SENTINEL_TRIGGER_FALSE_NEGATIVE"
+            if sentinel_false_negative
+            else "CONVERGED_REFINEMENT_OR_DISCREPANCY_GATE"
+        ),
+        suppressed_reason="CONVERGED_PROMOTION_GATES_SATISFIED",
+    )
+    if sentinel_false_negative:
+        # This is an independent release-policy audit of the binary64 trigger,
+        # not a claim that extra digits will repair 80-digit nonconvergence.
+        decision["state"] = "REQUESTED"
+        decision["reason"] = "SENTINEL_TRIGGER_FALSE_NEGATIVE"
+    return decision
+
+
+def _primary_requires_precision120(outcome: StageOutcome) -> bool:
+    return _primary_precision120_decision(outcome)["state"] == "REQUESTED"
 
 
 def _primary_precision120_terminal_state(outcome: StageOutcome) -> str:
@@ -1909,12 +2474,86 @@ class _UnauthenticatedComponentEvidence(ValueError):
     """Well-formed component evidence that fails scientific authentication."""
 
 
+def _validate_current_promoted_runtime(
+    leaf: CampaignLeafPlan,
+    outcome: StageOutcome,
+    result: ComponentResult,
+    *,
+    runtime_key: str = "scientific_runtime",
+    expected_refinement_level: int = 0,
+) -> None:
+    """Bind schema-2 promoted evidence to its exact job and precision policy."""
+
+    payload = outcome.component_result
+    runtime = payload.get(runtime_key)
+    package_promoted = (
+        payload.get("evidence_kind")
+        == "package-owned-julia-promoted-component-engine"
+    )
+    conditioned = tuple(
+        readout.numerical_conditioning is not None
+        for readout in result.raw_readouts
+    )
+    has_conditioning = any(conditioned)
+    if not package_promoted and not has_conditioning:
+        return
+    if not package_promoted or (has_conditioning and not all(conditioned)):
+        raise _UnauthenticatedComponentEvidence(
+            "campaign promoted scientific runtime identity is invalid"
+        )
+    if (
+        outcome.digits not in (80, 120)
+        or not isinstance(runtime, Mapping)
+    ):
+        raise _UnauthenticatedComponentEvidence(
+            "campaign promoted scientific runtime identity is invalid"
+        )
+    expected_bits = math.ceil(outcome.digits * math.log2(10)) + 32
+    if (
+        type(runtime.get("precision_digits")) is not int
+        or runtime["precision_digits"] != outcome.digits
+        or type(runtime.get("working_precision_bits")) is not int
+        or runtime["working_precision_bits"] != expected_bits
+        or type(runtime.get("refinement_level")) is not int
+        or runtime["refinement_level"] != expected_refinement_level
+    ):
+        raise _UnauthenticatedComponentEvidence(
+            "campaign promoted scientific runtime precision is invalid"
+        )
+    if not has_conditioning:
+        if "regularised_gsn_precision_policy" in runtime:
+            raise _UnauthenticatedComponentEvidence(
+                "campaign promoted scientific runtime lacks current conditioning"
+            )
+        # Main-branch promoted checkpoints with a complete Julia precision
+        # identity predate conditioning schema 2 and its mechanism policy.
+        return
+    observed_policy = runtime.get("regularised_gsn_precision_policy")
+    expected_policy = dict(
+        regularised_gsn_precision_policy(leaf.job.mechanism_id)
+    )
+    if not isinstance(observed_policy, Mapping) or dict(observed_policy) != (
+        expected_policy
+    ):
+        raise _UnauthenticatedComponentEvidence(
+            "campaign promoted scientific runtime policy disagrees with mechanism"
+        )
+
+
 def _validate_component_result(
-    leaf: CampaignLeafPlan, outcome: StageOutcome
+    leaf: CampaignLeafPlan,
+    outcome: StageOutcome,
+    *,
+    result_key: str = "result",
+    runtime_key: str = "scientific_runtime",
+    expected_refinement_level: int = 0,
+    expected_numerical_state: str | None = None,
 ) -> bool:
     payload = outcome.component_result
-    raw_result = payload.get("result")
+    raw_result = payload.get(result_key)
     if raw_result is None:
+        if result_key != "result":
+            raise ValueError("campaign refinement component result is missing")
         if payload.get("leaf_id") != leaf.leaf_id:
             raise ValueError("campaign component lineage leaf is invalid")
         optional_bindings = {
@@ -1962,11 +2601,23 @@ def _validate_component_result(
         result.job_id != job.job_id
         or result.leaf_id != leaf.leaf_id
         or result.mechanism_id != leaf.mechanism_id
-        or result.status.value != outcome.numerical_state
+        or result.status.value
+        != (
+            outcome.numerical_state
+            if expected_numerical_state is None
+            else expected_numerical_state
+        )
     ):
         raise _UnauthenticatedComponentEvidence(
             "campaign production component identity is invalid"
         )
+    _validate_current_promoted_runtime(
+        leaf,
+        outcome,
+        result,
+        runtime_key=runtime_key,
+        expected_refinement_level=expected_refinement_level,
+    )
     expected_lineage = {
         "leaf_id": job.leaf_id,
         "root_reference_id": job.root.root_reference_id,
@@ -2031,10 +2682,152 @@ def _validate_component_result(
     return True
 
 
+def _component_conditioning_is_adequate(result: ComponentResult) -> bool:
+    evidence = tuple(
+        readout.numerical_conditioning for readout in result.raw_readouts
+    )
+    return bool(evidence) and all(
+        item is not None
+        and item.precision_limited is False
+        and item.predicted_reliable_digits >= item.required_reliable_digits
+        for item in evidence
+    )
+
+
+def _validate_failed_preflight_refinement_runtime(
+    leaf: CampaignLeafPlan,
+    value: object,
+) -> None:
+    if not isinstance(value, Mapping):
+        raise ValueError("failed-preflight refinement runtime is missing")
+    if (
+        type(value.get("precision_digits")) is not int
+        or value["precision_digits"] != 120
+        or type(value.get("working_precision_bits")) is not int
+        or value["working_precision_bits"]
+        != math.ceil(120 * math.log2(10)) + 32
+        or type(value.get("refinement_level")) is not int
+        or value["refinement_level"] != 1
+        or value.get("regularised_gsn_precision_policy")
+        != dict(regularised_gsn_precision_policy(leaf.job.mechanism_id))
+    ):
+        raise ValueError("failed-preflight refinement runtime identity is invalid")
+
+
+def _validate_failed_preflight_recovery_stage(
+    leaf: CampaignLeafPlan,
+    outcome: StageOutcome,
+) -> tuple[CampaignExecutionAttempt, bool]:
+    """Validate a self-contained 120-base/120-refinement recovery stage."""
+
+    if (
+        outcome.digits != 120
+        or outcome.deep_diagnostics is not None
+        or type(outcome.self_refinement_enclosed) is not bool
+        or outcome.discrepancy_from_previous_abs is not None
+        or outcome.discrepancy_enclosed is not None
+    ):
+        raise ValueError("failed-preflight recovery stage fields are invalid")
+    component = outcome.component_result
+    if (
+        component.get("comparison_kind") != _FAILED_PREFLIGHT_COMPARISON_KIND
+        or component.get("precision_ladder_discrepancy_applicable") is not False
+    ):
+        raise ValueError("failed-preflight comparison identity is invalid")
+    precision_channel = next(
+        channel
+        for channel in outcome.signed_error_channels
+        if channel["family"] == "precision-ladder-discrepancy"
+    )
+    if (
+        precision_channel["provenance"]["derivation"]
+        != "not-applicable-precision-ladder-discrepancy"
+        or precision_channel["signed_delta"] != {"real": 0.0, "imaginary": 0.0}
+    ):
+        raise ValueError(
+            "failed-preflight precision-ladder channel must be not-applicable"
+        )
+    raw_predecessor = component.get("failed_preflight_predecessor")
+    predecessor = CampaignExecutionAttempt.from_mapping(raw_predecessor)
+    _validate_failed_preflight_predecessor(predecessor, leaf)
+
+    raw_base = component.get("result")
+    raw_refinement = component.get("self_refinement_result")
+    if not isinstance(raw_base, Mapping) or not isinstance(
+        raw_refinement, Mapping
+    ):
+        raise ValueError("failed-preflight recovery component results are missing")
+    base = ComponentResult.from_mapping(raw_base)
+    refinement = ComponentResult.from_mapping(raw_refinement)
+    if base.to_mapping() != raw_base or refinement.to_mapping() != raw_refinement:
+        raise ValueError("failed-preflight recovery component is not canonical")
+    if (
+        refinement.job_id != leaf.job.job_id
+        or refinement.leaf_id != leaf.leaf_id
+        or refinement.mechanism_id != leaf.mechanism_id
+        or refinement.lineage != base.lineage
+    ):
+        raise ValueError("failed-preflight refinement component identity is invalid")
+    if not _validate_component_result(
+        leaf,
+        outcome,
+        result_key="self_refinement_result",
+        runtime_key="self_refinement_scientific_runtime",
+        expected_refinement_level=1,
+        expected_numerical_state=refinement.status.value,
+    ):
+        raise ValueError(
+            "failed-preflight refinement lacks canonical production evidence"
+        )
+    base_runtime = component.get("scientific_runtime")
+    refinement_runtime = component.get("self_refinement_scientific_runtime")
+    if not isinstance(base_runtime, Mapping) or not isinstance(
+        refinement_runtime, Mapping
+    ):
+        raise ValueError("failed-preflight paired runtime identity is missing")
+    expected_refinement_runtime = dict(base_runtime)
+    expected_refinement_runtime["refinement_level"] = 1
+    if dict(refinement_runtime) != expected_refinement_runtime:
+        raise ValueError("failed-preflight paired runtime identity is invalid")
+    _validate_failed_preflight_refinement_runtime(
+        leaf, refinement_runtime
+    )
+
+    raw_delta = component.get("same_precision_refinement_discrepancy_abs")
+    if isinstance(raw_delta, bool) or not isinstance(raw_delta, (int, float)):
+        raise ValueError("failed-preflight same-precision discrepancy is invalid")
+    recorded_delta = float(raw_delta)
+    expected_delta = abs(_component_result_delta(refinement, base))
+    if (
+        not math.isfinite(recorded_delta)
+        or recorded_delta < 0.0
+        or recorded_delta != expected_delta
+    ):
+        raise ValueError("failed-preflight same-precision discrepancy disagrees")
+    base_radius = sum(base.error_channels.values())
+    refinement_radius = sum(refinement.error_channels.values())
+    enclosed = (
+        base.status is ComponentStatus.CONVERGED
+        and refinement.status is ComponentStatus.CONVERGED
+        and expected_delta <= base_radius + refinement_radius
+    )
+    if outcome.self_refinement_enclosed is not enclosed:
+        raise ValueError("failed-preflight refinement enclosure is inconsistent")
+    produced = (
+        enclosed
+        and _component_conditioning_is_adequate(base)
+        and _component_conditioning_is_adequate(refinement)
+    )
+    return predecessor, produced
+
+
 def _validate_primary_record_semantics(
     record: CampaignLeafRecord,
     stages: tuple[StageOutcome, ...],
     production_flags: tuple[bool, ...],
+    *,
+    promotion_decision_required: bool,
+    failed_preflight_pending_allowed: bool,
 ) -> bool:
     first = stages[0]
     precision80_digits, precision120_digits = _primary_recovery_digits()
@@ -2065,6 +2858,10 @@ def _validate_primary_record_semantics(
         ) or (
             record.state == "MISSING_PRECISION"
             and record.missing_precision_digits == precision80_digits
+        ) or (
+            failed_preflight_pending_allowed
+            and record.state == "MISSING_PRECISION"
+            and record.missing_precision_digits == precision120_digits
         )
         if not pending:
             raise ValueError(
@@ -2085,6 +2882,11 @@ def _validate_primary_record_semantics(
             "campaign promoted PRIMARY stage lacks canonical production evidence"
         )
 
+    _validate_attached_promotion_decision(
+        precision80,
+        _primary_precision120_decision(precision80),
+        required=promotion_decision_required,
+    )
     requires120 = _primary_requires_precision120(precision80)
     if not requires120:
         expected_state = _terminal_state(
@@ -2134,6 +2936,8 @@ def _validate_record_semantics(
     leaf: CampaignLeafPlan,
     record: CampaignLeafRecord,
     factory_identity: PrecisionFactoryIdentity,
+    *,
+    checkpoint_schema_version: int = CAMPAIGN_CHECKPOINT_SCHEMA_VERSION,
 ) -> bool:
     previous_available: set[int] = set()
     for stage in record.stages:
@@ -2157,6 +2961,52 @@ def _validate_record_semantics(
     ):
         raise ValueError("campaign binary64 stage refinement fields are invalid")
 
+    digits = tuple(stage.digits for stage in stages)
+    if digits == (64, 120):
+        if checkpoint_schema_version != CAMPAIGN_CHECKPOINT_SCHEMA_VERSION:
+            raise ValueError(
+                "historical checkpoints cannot claim failed-preflight recovery"
+            )
+        if leaf.role == "control":
+            raise ValueError("control leaves cannot use failed-preflight recovery")
+        _, recovery_produced = _validate_failed_preflight_recovery_stage(
+            leaf, stages[1]
+        )
+        if not all(production_flags):
+            raise ValueError(
+                "failed-preflight recovery lacks canonical production evidence"
+            )
+        if leaf.role == "primary":
+            role_fields_valid = (
+                _primary_binary64_promotes(
+                    first, production=production_flags[0]
+                )
+                and not record.trigger_ids
+                and not record.sentinel
+                and record.sentinel_comparison is None
+            )
+        else:
+            trigger_ids = _deep_trigger_ids(first)
+            sentinel = leaf.leaf_id in set(
+                B_PRIME_RELEASE_DOMAIN.fixed_precision_sentinel_leaf_ids
+            )
+            role_fields_valid = (
+                (bool(trigger_ids) or sentinel)
+                and record.trigger_ids == trigger_ids
+                and record.sentinel is sentinel
+                and record.sentinel_comparison is None
+            )
+            if sentinel:
+                recovery_produced = False
+        expected_state = "PRODUCED" if recovery_produced else "UNRESOLVED"
+        if (
+            not role_fields_valid
+            or record.state != expected_state
+            or record.missing_precision_digits is not None
+        ):
+            raise ValueError("failed-preflight recovery terminal state is invalid")
+        return True
+
     if leaf.role == "control":
         expected_state = _terminal_state(first)
         if (
@@ -2173,7 +3023,15 @@ def _validate_record_semantics(
 
     if leaf.role == "primary":
         return _validate_primary_record_semantics(
-            record, stages, production_flags
+            record,
+            stages,
+            production_flags,
+            promotion_decision_required=(
+                checkpoint_schema_version >= CAMPAIGN_CHECKPOINT_SCHEMA_VERSION
+            ),
+            failed_preflight_pending_allowed=(
+                checkpoint_schema_version == CAMPAIGN_CHECKPOINT_SCHEMA_VERSION
+            ),
         )
 
     trigger_ids = _deep_trigger_ids(first)
@@ -2199,6 +3057,10 @@ def _validate_record_semantics(
         ) or (
             record.state == "MISSING_PRECISION"
             and record.missing_precision_digits == 80
+        ) or (
+            checkpoint_schema_version == CAMPAIGN_CHECKPOINT_SCHEMA_VERSION
+            and record.state == "MISSING_PRECISION"
+            and record.missing_precision_digits == 120
         )
         if not pending or record.sentinel_comparison is not None:
             raise ValueError("campaign promoted deep leaf is missing its 80-digit stage")
@@ -2229,7 +3091,18 @@ def _validate_record_semantics(
         }
     if record.sentinel_comparison != expected_comparison:
         raise ValueError("campaign sentinel comparison is invalid")
-    if false_negative:
+    decision = _deep_precision120_decision(
+        precision80, sentinel_false_negative=false_negative
+    )
+    _validate_attached_promotion_decision(
+        precision80,
+        decision,
+        required=(
+            checkpoint_schema_version >= CAMPAIGN_CHECKPOINT_SCHEMA_VERSION
+        ),
+    )
+    requires120 = decision["state"] == "REQUESTED"
+    if false_negative and requires120:
         if (
             record.state != "INVALID_SENTINEL_FALSE_NEGATIVE"
             or record.missing_precision_digits != 120
@@ -2238,12 +3111,16 @@ def _validate_record_semantics(
         if len(stages) == 3:
             _validate_precision120(stages[2])
         return production
-    if precision80.self_refinement_enclosed:
+    if not requires120:
         if (
             len(stages) != 2
             or record.state
             != _terminal_state(
-                precision80, enclosed=bool(precision80.discrepancy_enclosed)
+                precision80,
+                enclosed=(
+                    bool(precision80.self_refinement_enclosed)
+                    and bool(precision80.discrepancy_enclosed)
+                ),
             )
             or record.missing_precision_digits is not None
         ):
@@ -2285,7 +3162,7 @@ def _validate_cacheable_leaf_record(
     if not record.stages or record.stages[0].outcome.digits != 64:
         raise ValueError("solved-leaf precision stages are incomplete")
     digits = tuple(stage.outcome.digits for stage in record.stages)
-    if digits not in {(64,), (64, 80), (64, 80, 120)}:
+    if digits not in {(64,), (64, 80), (64, 120), (64, 80, 120)}:
         raise ValueError("solved-leaf precision stage order is invalid")
     if not set(digits).issubset(set(plan.precision_capabilities.digits)):
         raise ValueError("solved-leaf precision stages exceed the current contract")
@@ -2570,6 +3447,45 @@ def _campaign_stage_record(
     })
 
 
+def _failed_preflight_recovery_record(
+    plan: CampaignPlan,
+    available: PrecisionCapabilities,
+    leaf: CampaignLeafPlan,
+    record: CampaignLeafRecord,
+    outcome: StageOutcome,
+    predecessor: CampaignExecutionAttempt,
+) -> CampaignLeafRecord:
+    if not isinstance(outcome, StageOutcome) or outcome.digits != 120:
+        raise ValueError(
+            "campaign backend returned invalid failed-preflight 120-digit evidence"
+        )
+    if not _validate_component_result(leaf, outcome):
+        raise ValueError(
+            "failed-preflight recovery lacks canonical base evidence"
+        )
+    embedded, recovery_produced = _validate_failed_preflight_recovery_stage(
+        leaf, outcome
+    )
+    if embedded.to_mapping() != predecessor.to_mapping():
+        raise ValueError(
+            "failed-preflight recovery embedded the wrong predecessor"
+        )
+    if leaf.role == "deep" and record.sentinel:
+        recovery_produced = False
+    return CampaignLeafRecord(
+        leaf_id=record.leaf_id,
+        role=record.role,
+        state="PRODUCED" if recovery_produced else "UNRESOLVED",
+        stages=(
+            *record.stages,
+            _campaign_stage_record(plan, available, outcome),
+        ),
+        trigger_ids=record.trigger_ids,
+        sentinel=record.sentinel,
+        sentinel_comparison=None,
+    )
+
+
 def _execute_campaign_stage(
     backend: object,
     leaf: CampaignLeafPlan,
@@ -2621,6 +3537,36 @@ def _execute_campaign_stage(
     if not callable(execute):
         raise ValueError("campaign backend execute_stage is unavailable")
     return execute(leaf, digits)
+
+
+def _execute_campaign_stage_after_failed_preflight(
+    backend: object,
+    leaf: CampaignLeafPlan,
+    predecessor: CampaignExecutionAttempt,
+    response_predictor: complex | None = None,
+) -> StageOutcome:
+    """Run the dedicated 120-base/120-refinement recovery boundary."""
+
+    _validate_failed_preflight_predecessor(predecessor, leaf)
+    with_predictor = getattr(
+        backend,
+        "execute_promoted_stage_after_failed_preflight_with_predictor",
+        None,
+    )
+    if with_predictor is not None:
+        if not callable(with_predictor):
+            raise ValueError("failed-preflight predictor backend is invalid")
+        return with_predictor(
+            leaf, 120, predecessor, response_predictor
+        )
+    execute = getattr(
+        backend, "execute_promoted_stage_after_failed_preflight", None
+    )
+    if not callable(execute):
+        raise ValueError(
+            "campaign backend lacks failed-preflight 120 refinement support"
+        )
+    return execute(leaf, 120, predecessor)
 
 
 def worker_failure_payload(error: BaseException) -> dict[str, object] | None:
@@ -2704,6 +3650,78 @@ def _execute_campaign_stage_with_progress(
     return outcome, time.monotonic() - started
 
 
+def _execute_failed_preflight_recovery_with_progress(
+    backend: object,
+    leaf: CampaignLeafPlan,
+    predecessor: CampaignExecutionAttempt,
+    context: Mapping[str, object],
+    response_predictor: complex | None = None,
+) -> tuple[StageOutcome, float]:
+    started = time.monotonic()
+    with progress_scope(
+        **context,
+        precision_digits=120,
+        component_pass="promoted",
+    ):
+        emit_progress(ProgressEventKind.PRECISION_STAGE_STARTED)
+        try:
+            outcome = _execute_campaign_stage_after_failed_preflight(
+                backend,
+                leaf,
+                predecessor,
+                response_predictor,
+            )
+        except KeyboardInterrupt:
+            raise
+        except BaseException as error:
+            worker_failure = _worker_failure_payload(error)
+            emit_progress(
+                ProgressEventKind.LEAF_FAILED,
+                precision_digits=120,
+                error_type=type(error).__name__,
+                message=str(error),
+                elapsed_seconds=time.monotonic() - started,
+                **(
+                    {} if worker_failure is None
+                    else {"worker_failure": worker_failure}
+                ),
+            )
+            raise
+    return outcome, time.monotonic() - started
+
+
+def _numerical_failure_promotion_decision(
+    failure: Mapping[str, object], digits: int
+) -> dict[str, object] | None:
+    code = failure.get("failure_code")
+    if digits != 80 or code not in NUMERICAL_CONTROL_FAILURE_CODES:
+        return None
+    predicted: str | None = None
+    required: str | None = None
+    limited: bool | None = None
+    preflight: bool | None = None
+    requested = code == "INSUFFICIENT_ASYMPTOTIC_PRECISION"
+    if requested:
+        diagnostics = failure.get("diagnostics")
+        if not isinstance(diagnostics, Mapping):
+            raise ValueError("asymptotic precision failure diagnostics are missing")
+        predicted = diagnostics.get("predicted_reliable_digits")
+        required = diagnostics.get("required_reliable_digits")
+        preflight = diagnostics.get("asymptotic_preflight_avoided_ode")
+        limited = True
+    return _validated_promotion_decision({
+        "schema": _PROMOTION_DECISION_SCHEMA,
+        "from_precision_digits": 80,
+        "to_precision_digits": 120,
+        "state": "REQUESTED" if requested else "SUPPRESSED",
+        "reason": code,
+        "predicted_reliable_digits": predicted,
+        "required_reliable_digits": required,
+        "precision_limited": limited,
+        "asymptotic_preflight_avoided_ode": preflight,
+    })
+
+
 def _execution_attempt_from_failure(
     error: BaseException,
     *,
@@ -2731,9 +3749,16 @@ def _execution_attempt_from_failure(
         expected_type = JuliaODEResourceLimitError
     elif code == "ROOT_READOUT_RESOURCE_INFEASIBLE":
         expected_type = JuliaRootReadoutResourceLimitError
+    elif code in NUMERICAL_CONTROL_FAILURE_CODES:
+        expected_type = JuliaNumericalControlError
     else:
         expected_type = JuliaWorkerTimeoutError
     if type(error) is not expected_type:
+        return None
+    if (
+        expected_type is JuliaNumericalControlError
+        and error.failure_code != code
+    ):
         return None
     if code == "WORKER_TIMEOUT" and receipt["worker_timed_out"] is not True:
         return None
@@ -2742,7 +3767,14 @@ def _execution_attempt_from_failure(
     leaf_index = context.get("leaf_index")
     if isinstance(leaf_index, bool) or not isinstance(leaf_index, int):
         return None
-    return CampaignExecutionAttempt(
+    promotion_decision = _numerical_failure_promotion_decision(failure, digits)
+    if promotion_decision is not None:
+        receipt = dict(receipt)
+        enriched_failure = dict(failure)
+        enriched_failure["promotion_decision"] = promotion_decision
+        receipt["failure"] = enriched_failure
+        receipt = _validated_attempt_failure_receipt(receipt)
+    attempt = CampaignExecutionAttempt(
         attempt_ordinal=attempt_ordinal,
         leaf_id=leaf.leaf_id,
         leaf_index=leaf_index,
@@ -2757,6 +3789,12 @@ def _execution_attempt_from_failure(
             .replace("+00:00", "Z")
         ),
     )
+    if code == "INSUFFICIENT_ASYMPTOTIC_PRECISION":
+        try:
+            _validate_failed_preflight_predecessor(attempt, leaf)
+        except ValueError:
+            return None
+    return attempt
 
 
 def _checkpoint_attempt_with_progress(
@@ -2953,11 +3991,30 @@ def _run_campaign_selection_active(
     if path.exists():
         if not resume:
             raise ValueError("campaign cold execution refuses an existing checkpoint")
-        loaded_selection, existing, loaded_attempts, _ = (
+        loaded_selection, existing, loaded_attempts, loaded_state, loaded_schema_version = (
             _load_checkpoint_with_attempts(plan, path)
         )
         if loaded_selection != selection:
             raise ValueError("campaign checkpoint selection does not match request")
+        if (
+            loaded_schema_version != CAMPAIGN_CHECKPOINT_SCHEMA_VERSION
+            and loaded_state == "PARTIAL"
+        ):
+            raise ValueError(
+                "incomplete historical campaign checkpoint is read-only; "
+                "preserve it as evidence and start with a fresh checkpoint path"
+            )
+        if loaded_schema_version != CAMPAIGN_CHECKPOINT_SCHEMA_VERSION:
+            leaf_by_id = {leaf.leaf_id: leaf for leaf in plan.leaves}
+            for record in existing:
+                _validate_record_semantics(
+                    leaf_by_id[record.leaf_id],
+                    record,
+                    plan.precision_factory_identity,
+                    checkpoint_schema_version=(
+                        CAMPAIGN_CHECKPOINT_SCHEMA_VERSION
+                    ),
+                )
         records_by_id = {record.leaf_id: record for record in existing}
         for record in existing:
             for stage in record.stages:
@@ -3158,6 +4215,84 @@ def _run_campaign_selection_active(
                 )
             continue
         if len(record.stages) == 1:
+            failed_preflight_predecessor = (
+                _failed_preflight_predecessor_for_leaf(attempts, leaf)
+            )
+            if failed_preflight_predecessor is not None:
+                if 120 not in available.digits:
+                    continue
+                try:
+                    outcome120, recovery_duration = (
+                        _execute_failed_preflight_recovery_with_progress(
+                            backend,
+                            leaf,
+                            failed_preflight_predecessor,
+                            context,
+                            response_predictor,
+                        )
+                    )
+                except _CONTAINABLE_EXCEPTION_TYPES as recovery_error:
+                    recovery_attempt = _execution_attempt_from_failure(
+                        recovery_error,
+                        leaf=leaf,
+                        context=context,
+                        digits=120,
+                        attempt_ordinal=len(attempts) + 1,
+                    )
+                    if recovery_attempt is None:
+                        raise
+                    attempts.append(recovery_attempt)
+                    _checkpoint_attempt_with_progress(
+                        path,
+                        _checkpoint_mapping(
+                            plan,
+                            selection,
+                            _ordered_selection_records(
+                                selection, records_by_id
+                            ),
+                            attempts,
+                        ),
+                        context=context,
+                        digits=120,
+                    )
+                    continue
+                record = _failed_preflight_recovery_record(
+                    plan,
+                    available,
+                    leaf,
+                    record,
+                    outcome120,
+                    failed_preflight_predecessor,
+                )
+                records_by_id[leaf_id] = record
+                executed += 1
+                _checkpoint_stage_with_progress(
+                    path,
+                    _checkpoint_mapping(
+                        plan,
+                        selection,
+                        _ordered_selection_records(selection, records_by_id),
+                        attempts,
+                    ),
+                    context=context,
+                    digits=120,
+                    duration_seconds=recovery_duration,
+                    record=record,
+                )
+                with progress_scope(**context):
+                    _publish_terminal_solved_leaf(
+                        plan, leaf, record, solved_leaf_store
+                    )
+                response = _produced_response(record)
+                if response is not None:
+                    continuation_responses[continuation_key] = response
+                with progress_scope(**context):
+                    emit_progress(
+                        ProgressEventKind.LEAF_COMPLETED,
+                        state=record.state,
+                        stage_count=len(record.stages),
+                    )
+                continue
             precision80_digits = (
                 _primary_recovery_digits()[0]
                 if leaf.role == "primary"
@@ -3185,6 +4320,22 @@ def _run_campaign_selection_active(
                 if attempt is None:
                     raise
                 attempts.append(attempt)
+                failed_preflight = (
+                    attempt.failure_code
+                    == "INSUFFICIENT_ASYMPTOTIC_PRECISION"
+                )
+                if failed_preflight and 120 not in available.digits:
+                    record = CampaignLeafRecord(
+                        leaf_id=record.leaf_id,
+                        role=record.role,
+                        state="MISSING_PRECISION",
+                        stages=record.stages,
+                        trigger_ids=record.trigger_ids,
+                        sentinel=record.sentinel,
+                        missing_precision_digits=120,
+                        sentinel_comparison=record.sentinel_comparison,
+                    )
+                    records_by_id[leaf_id] = record
                 _checkpoint_attempt_with_progress(
                     path,
                     _checkpoint_mapping(
@@ -3196,6 +4347,106 @@ def _run_campaign_selection_active(
                     context=context,
                     digits=precision80_digits,
                 )
+                if not failed_preflight or 120 not in available.digits:
+                    continue
+                try:
+                    outcome120, recovery_duration = (
+                        _execute_failed_preflight_recovery_with_progress(
+                            backend,
+                            leaf,
+                            attempt,
+                            context,
+                            response_predictor,
+                        )
+                    )
+                except _CONTAINABLE_EXCEPTION_TYPES as recovery_error:
+                    recovery_attempt = _execution_attempt_from_failure(
+                        recovery_error,
+                        leaf=leaf,
+                        context=context,
+                        digits=120,
+                        attempt_ordinal=len(attempts) + 1,
+                    )
+                    if recovery_attempt is None:
+                        raise
+                    attempts.append(recovery_attempt)
+                    _checkpoint_attempt_with_progress(
+                        path,
+                        _checkpoint_mapping(
+                            plan,
+                            selection,
+                            _ordered_selection_records(
+                                selection, records_by_id
+                            ),
+                            attempts,
+                        ),
+                        context=context,
+                        digits=120,
+                    )
+                    continue
+                if (
+                    not isinstance(outcome120, StageOutcome)
+                    or outcome120.digits != 120
+                ):
+                    raise ValueError(
+                        "campaign backend returned invalid failed-preflight "
+                        "120-digit evidence"
+                    )
+                if not _validate_component_result(leaf, outcome120):
+                    raise ValueError(
+                        "failed-preflight recovery lacks canonical base evidence"
+                    )
+                embedded, recovery_produced = (
+                    _validate_failed_preflight_recovery_stage(
+                        leaf, outcome120
+                    )
+                )
+                if embedded.to_mapping() != attempt.to_mapping():
+                    raise ValueError(
+                        "failed-preflight recovery embedded the wrong predecessor"
+                    )
+                if leaf.role == "deep" and record.sentinel:
+                    recovery_produced = False
+                record = CampaignLeafRecord(
+                    leaf_id=record.leaf_id,
+                    role=record.role,
+                    state="PRODUCED" if recovery_produced else "UNRESOLVED",
+                    stages=(
+                        *record.stages,
+                        _campaign_stage_record(plan, available, outcome120),
+                    ),
+                    trigger_ids=record.trigger_ids,
+                    sentinel=record.sentinel,
+                    sentinel_comparison=None,
+                )
+                records_by_id[leaf_id] = record
+                executed += 1
+                _checkpoint_stage_with_progress(
+                    path,
+                    _checkpoint_mapping(
+                        plan,
+                        selection,
+                        _ordered_selection_records(selection, records_by_id),
+                        attempts,
+                    ),
+                    context=context,
+                    digits=120,
+                    duration_seconds=recovery_duration,
+                    record=record,
+                )
+                with progress_scope(**context):
+                    _publish_terminal_solved_leaf(
+                        plan, leaf, record, solved_leaf_store
+                    )
+                response = _produced_response(record)
+                if response is not None:
+                    continuation_responses[continuation_key] = response
+                with progress_scope(**context):
+                    emit_progress(
+                        ProgressEventKind.LEAF_COMPLETED,
+                        state=record.state,
+                        stage_count=len(record.stages),
+                    )
                 continue
             if (
                 not isinstance(outcome80, StageOutcome)
@@ -3212,6 +4463,9 @@ def _run_campaign_selection_active(
                         "campaign promoted PRIMARY stage lacks canonical "
                         "production evidence"
                     )
+                outcome80 = _stage_with_promotion_decision(
+                    outcome80, _primary_precision120_decision(outcome80)
+                )
                 _, precision120_digits = _primary_recovery_digits()
                 if _primary_requires_precision120(outcome80):
                     state = (
@@ -3273,41 +4527,21 @@ def _run_campaign_selection_active(
                         "trigger_threshold_abs": threshold,
                         "trigger_policy_false_negative": false_negative,
                     }
-                    if false_negative:
-                        record = CampaignLeafRecord(
-                            leaf_id=record.leaf_id,
-                            role=record.role,
-                            state="INVALID_SENTINEL_FALSE_NEGATIVE",
-                            stages=(
-                                *record.stages,
-                                _campaign_stage_record(plan, available, outcome80),
-                            ),
-                            trigger_ids=record.trigger_ids,
-                            sentinel=True,
-                            missing_precision_digits=120,
-                            sentinel_comparison=comparison,
-                        )
-                        records_by_id[leaf_id] = record
-                        _checkpoint_stage_with_progress(
-                            path,
-                            _checkpoint_mapping(
-                                plan,
-                                selection,
-                                _ordered_selection_records(
-                                    selection, records_by_id
-                                ),
-                                attempts,
-                            ),
-                            context=context,
-                            digits=80,
-                            duration_seconds=stage_duration,
-                            record=record,
-                        )
-                if false_negative:
-                    pass
-                elif outcome80.self_refinement_enclosed:
+                decision = _deep_precision120_decision(
+                    outcome80, sentinel_false_negative=false_negative
+                )
+                outcome80 = _stage_with_promotion_decision(outcome80, decision)
+                requires120 = decision["state"] == "REQUESTED"
+                if false_negative and requires120:
+                    state = "INVALID_SENTINEL_FALSE_NEGATIVE"
+                    missing = 120
+                elif not requires120:
                     state = _terminal_state(
-                        outcome80, enclosed=bool(outcome80.discrepancy_enclosed)
+                        outcome80,
+                        enclosed=(
+                            bool(outcome80.self_refinement_enclosed)
+                            and bool(outcome80.discrepancy_enclosed)
+                        ),
                     )
                     missing = None
                 elif 120 not in available.digits:
@@ -3316,36 +4550,35 @@ def _run_campaign_selection_active(
                 else:
                     state = "IN_PROGRESS"
                     missing = None
-                if not false_negative:
-                    record = CampaignLeafRecord(
-                        leaf_id=record.leaf_id,
-                        role=record.role,
-                        state=state,
-                        stages=(
-                            *record.stages,
-                            _campaign_stage_record(plan, available, outcome80),
+                record = CampaignLeafRecord(
+                    leaf_id=record.leaf_id,
+                    role=record.role,
+                    state=state,
+                    stages=(
+                        *record.stages,
+                        _campaign_stage_record(plan, available, outcome80),
+                    ),
+                    trigger_ids=record.trigger_ids,
+                    sentinel=record.sentinel,
+                    missing_precision_digits=missing,
+                    sentinel_comparison=comparison,
+                )
+                records_by_id[leaf_id] = record
+                _checkpoint_stage_with_progress(
+                    path,
+                    _checkpoint_mapping(
+                        plan,
+                        selection,
+                        _ordered_selection_records(
+                            selection, records_by_id
                         ),
-                        trigger_ids=record.trigger_ids,
-                        sentinel=record.sentinel,
-                        missing_precision_digits=missing,
-                        sentinel_comparison=comparison,
-                    )
-                    records_by_id[leaf_id] = record
-                    _checkpoint_stage_with_progress(
-                        path,
-                        _checkpoint_mapping(
-                            plan,
-                            selection,
-                            _ordered_selection_records(
-                                selection, records_by_id
-                            ),
-                            attempts,
-                        ),
-                        context=context,
-                        digits=80,
-                        duration_seconds=stage_duration,
-                        record=record,
-                    )
+                        attempts,
+                    ),
+                    context=context,
+                    digits=80,
+                    duration_seconds=stage_duration,
+                    record=record,
+                )
 
         if record.state in {"PRODUCED", "UNRESOLVED"}:
             with progress_scope(**context):
@@ -3500,7 +4733,9 @@ def validate_campaign_checkpoint(
     require_complete_campaign: bool = False,
 ) -> CampaignRunSummary:
     path = Path(checkpoint_path)
-    selection, records, attempts, state = _load_checkpoint_with_attempts(plan, path)
+    selection, records, attempts, state, checkpoint_schema_version = (
+        _load_checkpoint_with_attempts(plan, path)
+    )
     if require_complete_campaign:
         expected_ids = B_PRIME_RELEASE_DOMAIN.production_leaf_ids
         if selection.leaf_ids != expected_ids:
@@ -3539,6 +4774,7 @@ def validate_campaign_checkpoint(
                 leaf_by_id[record.leaf_id],
                 record,
                 plan.precision_factory_identity,
+                checkpoint_schema_version=checkpoint_schema_version,
             )
             for record in records
         ):
@@ -3617,6 +4853,14 @@ def _load_checkpoint_for_solved_leaf_import(
     """Authenticate an old checkpoint while permitting operational campaign drift."""
 
     value, bindings, records, _attempts = _read_checkpoint_envelope(path)
+    if (
+        value["schema_version"] != CAMPAIGN_CHECKPOINT_SCHEMA_VERSION
+        and value.get("state") == "PARTIAL"
+    ):
+        raise ValueError(
+            "incomplete historical campaign checkpoint is read-only; "
+            "it cannot publish current solved-leaf evidence"
+        )
     if set(bindings) != {
         "campaign_id",
         "campaign_bindings",
@@ -3711,7 +4955,10 @@ def _load_checkpoint_for_solved_leaf_import(
         if record.role != leaf.role:
             raise ValueError("campaign checkpoint record role is invalid")
         _validate_record_semantics(
-            leaf, record, plan.precision_factory_identity
+            leaf,
+            record,
+            plan.precision_factory_identity,
+            checkpoint_schema_version=value["schema_version"],
         )
     expected_state = (
         "COMPLETE"
@@ -3740,7 +4987,17 @@ def merge_campaign_checkpoints(
     attempt_values: list[CampaignExecutionAttempt] = []
     seen_attempts: set[str] = set()
     for path in paths:
-        selection, records, attempts, _ = _load_checkpoint_with_attempts(plan, path)
+        selection, records, attempts, state, schema_version = (
+            _load_checkpoint_with_attempts(plan, path)
+        )
+        if (
+            schema_version != CAMPAIGN_CHECKPOINT_SCHEMA_VERSION
+            and state == "PARTIAL"
+        ):
+            raise ValueError(
+                "incomplete historical campaign checkpoint is read-only; "
+                "it cannot be merged into schema 6"
+            )
         selected_ids.update(selection.leaf_ids)
         for record in records:
             existing = record_by_leaf.get(record.leaf_id)
@@ -3762,6 +5019,14 @@ def merge_campaign_checkpoints(
         for leaf_id in canonical_ids
         if leaf_id in record_by_leaf
     )
+    leaf_by_id = {leaf.leaf_id: leaf for leaf in plan.leaves}
+    for record in records:
+        _validate_record_semantics(
+            leaf_by_id[record.leaf_id],
+            record,
+            plan.precision_factory_identity,
+            checkpoint_schema_version=CAMPAIGN_CHECKPOINT_SCHEMA_VERSION,
+        )
     merged_index = {
         leaf_id: index
         for index, leaf_id in enumerate(
@@ -4207,6 +5472,94 @@ class NativeCampaignStageBackend:
             leaf, digits, previous_outcomes, None
         )
 
+    def execute_promoted_stage_after_failed_preflight(
+        self,
+        leaf: CampaignLeafPlan,
+        digits: int,
+        predecessor: CampaignExecutionAttempt,
+    ) -> StageOutcome:
+        return self.execute_promoted_stage_after_failed_preflight_with_predictor(
+            leaf, digits, predecessor, None
+        )
+
+    def execute_promoted_stage_after_failed_preflight_with_predictor(
+        self,
+        leaf: CampaignLeafPlan,
+        digits: int,
+        predecessor: CampaignExecutionAttempt,
+        response_predictor: complex | None,
+    ) -> StageOutcome:
+        if digits != 120 or digits not in self.precision_capabilities.digits:
+            raise NativeResourceUnavailableError(
+                "failed-preflight recovery requires 120-digit capability"
+            )
+        if not isinstance(predecessor, CampaignExecutionAttempt):
+            raise ValueError("failed-preflight predecessor type is invalid")
+        _validate_failed_preflight_predecessor(predecessor, leaf)
+        if self.julia_adapter is None:
+            raise NativeResourceUnavailableError(
+                "M02 Julia precision worker is unavailable"
+            )
+        base_backend = JuliaPrecisionRootBackend(
+            self.identity, self.julia_adapter, 120
+        )
+        refinement_backend = JuliaPrecisionRootBackend(
+            self.identity, self.julia_adapter, 120, refinement=1
+        )
+        base = _run_component_with_progress(
+            leaf.job,
+            base_backend,
+            "primary",
+            response_predictor,
+        )
+        refinement = _run_component_with_progress(
+            leaf.job,
+            refinement_backend,
+            "self-refinement",
+            response_predictor,
+        )
+        refinement_delta = _component_result_delta(refinement, base)
+        base_radius = sum(base.error_channels.values())
+        refinement_radius = sum(refinement.error_channels.values())
+        refinement_enclosed = (
+            base.status is ComponentStatus.CONVERGED
+            and refinement.status is ComponentStatus.CONVERGED
+            and abs(refinement_delta) <= base_radius + refinement_radius
+        )
+        component_result = {
+            "evidence_kind": "package-owned-julia-promoted-component-engine",
+            "result": base.to_mapping(),
+            "self_refinement_result": refinement.to_mapping(),
+            "scientific_runtime": base_backend.scientific_runtime_for(
+                leaf.job
+            ),
+            "self_refinement_scientific_runtime": (
+                refinement_backend.scientific_runtime_for(leaf.job)
+            ),
+            "failed_preflight_predecessor": predecessor.to_mapping(),
+            "comparison_kind": _FAILED_PREFLIGHT_COMPARISON_KIND,
+            "precision_ladder_discrepancy_applicable": False,
+            "same_precision_refinement_discrepancy_abs": abs(
+                refinement_delta
+            ),
+        }
+        local_radius = base_radius + abs(refinement_delta)
+        return StageOutcome(
+            digits=120,
+            numerical_state=base.status.value,
+            component_result=component_result,
+            local_disk_radius_abs=local_radius,
+            signed_error_channels=_component_stage_signed_error_channels(
+                component_result,
+                base,
+                repeat_delta=refinement_delta,
+                precision_ladder_applicable=False,
+            ),
+            self_refinement_enclosed=refinement_enclosed,
+            discrepancy_from_previous_abs=None,
+            discrepancy_enclosed=None,
+        )
+
     def execute_promoted_stage_with_predictor(
         self,
         leaf: CampaignLeafPlan,
@@ -4271,7 +5624,9 @@ class NativeCampaignStageBackend:
             "self_refinement_result": (
                 None if repeat_result is None else repeat_result.to_mapping()
             ),
-            "scientific_runtime": primary_backend.scientific_runtime,
+            "scientific_runtime": primary_backend.scientific_runtime_for(
+                leaf.job
+            ),
         }
         if self_refinement_skipped_reason is not None:
             component_result["self_refinement_skipped_reason"] = (

@@ -2,6 +2,7 @@ module GeneralizedSasakiNakamura
 
 include("Homogeneous/Kerr.jl")
 include("Homogeneous/Coordinates.jl")
+include("Homogeneous/FactoredSolutions.jl")
 include("Homogeneous/AsymptoticExpansionCoefficients.jl")
 include("Homogeneous/InitialConditions.jl")
 include("Homogeneous/ConversionFactors.jl")
@@ -12,6 +13,32 @@ include("Homogeneous/ComplexFrequencies.jl")
 
 using .Coordinates
 export r_from_rstar, rstar_from_r # Useful to be exposed
+export GSNBranchConvention, GSNBranchCell, gsn_branch_convention, branch_cell
+export full_convention_equal, branch_cell_compatible, assert_no_branch_crossing
+export infinity_contour_tangent, horizon_contour_tangent
+export contour_angle_deformation
+using .FactoredSolutions
+export CarrierKind, INFINITY_OUTGOING, HORIZON_INGOING, HORIZON_OUTGOING
+export RegularRemainderContract
+export regular_remainder_contract
+export scattering_column_convention, radial_derivative_convention
+export determinant_convention, factored_remainder_state_convention
+export PlaneWaveCarrier, FactoredEndpointState, RawEndpointState
+export CarrierChangeDiagnostics
+export carrier_log, carrier_value, carrier_log_derivative
+export carrier_log_derivative_derivative
+export reconstruct_state, factor_state, change_carrier
+export carrier_change_diagnostics
+export assert_independent_reference_fixture_available
+export assert_regularised_gsn_production_ready
+using .InitialConditions
+export RemainderRegularityEvidence, FactoredInitialCondition
+export factored_infinity_outgoing_initialconditions
+export factored_horizon_ingoing_initialconditions
+export factored_horizon_outgoing_initialconditions
+export legacy_raw_infinity_outgoing_rho_initialconditions
+export legacy_raw_horizon_ingoing_rho_initialconditions
+export legacy_raw_horizon_outgoing_rho_initialconditions
 using .Solutions
 
 using SpinWeightedSpheroidalHarmonics
@@ -251,6 +278,7 @@ function GSN_radial(
                 end
 
                 p = omega - m*Kerr.omega_horizon(a)
+                convention = gsn_branch_convention(omega, p)
 
                 # First solve for r in terms of rho,
                 # the distance along the rotated path on the complex plane
@@ -260,22 +288,31 @@ function GSN_radial(
                 if isnothing(rsmp)
                     r_from_rho, rsmp = ComplexFrequencies.solve_r_from_rho(
                         s, m, a, omega, lambda,
-                        -angle(p), -angle(omega),
-                        rho_min, rho_max; sign_pos=ComplexFrequencies.determine_sign(omega), sign_neg=ComplexFrequencies.determine_sign(p)
+                        convention.horizon_contour_angle,
+                        convention.infinity_contour_angle,
+                        rho_min, rho_max;
+                        sign_pos=convention.infinity_sign,
+                        sign_neg=convention.horizon_sign,
                     )
                     if isnan(rsmp)
                         rsmp = 0 # Optimization has failed actually
                     end
                 else
                     r_from_rho = ComplexFrequencies.solve_r_from_rho(
-                        a, -angle(p), -angle(omega),
-                        rsmp, rho_min, rho_max; sign_pos=ComplexFrequencies.determine_sign(omega), sign_neg=ComplexFrequencies.determine_sign(p)
+                        a,
+                        convention.horizon_contour_angle,
+                        convention.infinity_contour_angle,
+                        rsmp, rho_min, rho_max;
+                        sign_pos=convention.infinity_sign,
+                        sign_neg=convention.horizon_sign,
                     )
                 end
 
                 if method == "Riccati"
                     Phiinsoln, _, _ = ComplexFrequencies.solve_Phiin(
-                        s, m, a, -angle(omega), -angle(p),
+                        s, m, a,
+                        convention.infinity_contour_angle,
+                        convention.horizon_contour_angle,
                         omega, lambda, r_from_rho,
                         rsmp, rho_min, rho_max;
                         initialconditions_order=horizon_expansion_order, dtype=data_type,
@@ -286,7 +323,9 @@ function GSN_radial(
                 elseif method == "linear"
                     Phiinsoln = nothing
                     Xinsoln, _, _ = ComplexFrequencies.solve_Xin(
-                        s, m, a, -angle(omega), -angle(p),
+                        s, m, a,
+                        convention.infinity_contour_angle,
+                        convention.horizon_contour_angle,
                         omega, lambda, r_from_rho,
                         rsmp, rho_min, rho_max;
                         initialconditions_order=horizon_expansion_order, dtype=data_type,
@@ -298,11 +337,20 @@ function GSN_radial(
 
                 # Extract the incidence and reflection amplitudes (NOTE: transmisson amplitude is *always* 1)
                 Bref_SN, Binc_SN = ComplexFrequencies.BrefBinc_SN_from_Xin(
-                    s, m, a, -angle(omega), omega, lambda, Xinsoln, r_from_rho, rsmp, rho_max; order=infinity_expansion_order
+                    s, m, a, convention.infinity_contour_angle,
+                    omega, lambda, Xinsoln, r_from_rho, rsmp, rho_max;
+                    order=infinity_expansion_order
                 )
 
                 # Construct the full, 'semi-analytical' GSN solution *in rho*
-                semianalytical_Xinsoln_rho(rho) = ComplexFrequencies.semianalytical_Xin(s, m, a, -angle(omega), -angle(p), omega, lambda, Xinsoln, r_from_rho, rsmp, rho_min, rho_max, horizon_expansion_order, infinity_expansion_order, rho)
+                semianalytical_Xinsoln_rho(rho) = ComplexFrequencies.semianalytical_Xin(
+                    s, m, a,
+                    convention.infinity_contour_angle,
+                    convention.horizon_contour_angle,
+                    omega, lambda, Xinsoln, r_from_rho, rsmp,
+                    rho_min, rho_max, horizon_expansion_order,
+                    infinity_expansion_order, rho
+                )
 
                 return GSNRadialFunction(
                     mode,
@@ -389,6 +437,7 @@ function GSN_radial(
                 end
 
                 p = omega - m*Kerr.omega_horizon(a)
+                convention = gsn_branch_convention(omega, p)
 
                 # First solve for r in terms of rho,
                 # the distance along the rotated path on the complex plane
@@ -398,22 +447,31 @@ function GSN_radial(
                 if isnothing(rsmp)
                     r_from_rho, rsmp = ComplexFrequencies.solve_r_from_rho(
                         s, m, a, omega, lambda,
-                        -angle(p), -angle(omega),
-                        rho_min, rho_max; sign_pos=ComplexFrequencies.determine_sign(omega), sign_neg=ComplexFrequencies.determine_sign(p)
+                        convention.horizon_contour_angle,
+                        convention.infinity_contour_angle,
+                        rho_min, rho_max;
+                        sign_pos=convention.infinity_sign,
+                        sign_neg=convention.horizon_sign,
                     )
                     if isnan(rsmp)
                         rsmp = 0 # Optimization has failed actually
                     end
                 else
                     r_from_rho = ComplexFrequencies.solve_r_from_rho(
-                        a, -angle(p), -angle(omega),
-                        rsmp, rho_min, rho_max; sign_pos=ComplexFrequencies.determine_sign(omega), sign_neg=ComplexFrequencies.determine_sign(p)
+                        a,
+                        convention.horizon_contour_angle,
+                        convention.infinity_contour_angle,
+                        rsmp, rho_min, rho_max;
+                        sign_pos=convention.infinity_sign,
+                        sign_neg=convention.horizon_sign,
                     )
                 end
 
                 if method == "Riccati"
                     Phiupsoln, _, _ = ComplexFrequencies.solve_Phiup(
-                        s, m, a, -angle(omega), -angle(p),
+                        s, m, a,
+                        convention.infinity_contour_angle,
+                        convention.horizon_contour_angle,
                         omega, lambda, r_from_rho,
                         rsmp, rho_min, rho_max;
                         initialconditions_order=infinity_expansion_order, dtype=data_type,
@@ -424,7 +482,9 @@ function GSN_radial(
                 elseif method == "linear"
                     Phiupsoln = nothing
                     Xupsoln, _, _ = ComplexFrequencies.solve_Xup(
-                        s, m, a, -angle(omega), -angle(p),
+                        s, m, a,
+                        convention.infinity_contour_angle,
+                        convention.horizon_contour_angle,
                         omega, lambda, r_from_rho,
                         rsmp, rho_min, rho_max;
                         initialconditions_order=infinity_expansion_order, dtype=data_type,
@@ -436,11 +496,20 @@ function GSN_radial(
 
                 # Extract the incidence and reflection amplitudes (NOTE: transmisson amplitude is *always* 1)
                 Cref_SN, Cinc_SN = ComplexFrequencies.CrefCinc_SN_from_Xup(
-                    s, m, a, -angle(p), omega, lambda, Xupsoln, r_from_rho, rsmp, rho_min; order=horizon_expansion_order
+                    s, m, a, convention.horizon_contour_angle,
+                    omega, lambda, Xupsoln, r_from_rho, rsmp, rho_min;
+                    order=horizon_expansion_order
                 )
 
                 # Construct the full, 'semi-analytical' GSN solution *in rho*
-                semianalytical_Xupsoln_rho(rho) = ComplexFrequencies.semianalytical_Xup(s, m, a, -angle(omega), -angle(p), omega, lambda, Xupsoln, r_from_rho, rsmp, rho_min, rho_max, horizon_expansion_order, infinity_expansion_order, rho)
+                semianalytical_Xupsoln_rho(rho) = ComplexFrequencies.semianalytical_Xup(
+                    s, m, a,
+                    convention.infinity_contour_angle,
+                    convention.horizon_contour_angle,
+                    omega, lambda, Xupsoln, r_from_rho, rsmp,
+                    rho_min, rho_max, horizon_expansion_order,
+                    infinity_expansion_order, rho
+                )
 
                 return GSNRadialFunction(
                     mode,
@@ -633,11 +702,15 @@ function GSN_radial(s::Int, l::Int, m::Int, a, omega; data_type=Solutions._DEFAU
         rhoout = _MIN_absrho
 
         p = omega - m*Kerr.omega_horizon(a)
+        convention = gsn_branch_convention(omega, p)
         lambda = spin_weighted_spheroidal_eigenvalue(s, l, m, a*omega)
         _, rsmp = ComplexFrequencies.solve_r_from_rho(
             s, m, a, omega, lambda,
-            -angle(p), -angle(omega),
-            rhoin, rhoout; sign_pos=ComplexFrequencies.determine_sign(omega), sign_neg=ComplexFrequencies.determine_sign(p)
+            convention.horizon_contour_angle,
+            convention.infinity_contour_angle,
+            rhoin, rhoout;
+            sign_pos=convention.infinity_sign,
+            sign_neg=convention.horizon_sign,
         )
 
         while(isnan(rsmp))
@@ -652,8 +725,11 @@ function GSN_radial(s::Int, l::Int, m::Int, a, omega; data_type=Solutions._DEFAU
 
             _, rsmp = ComplexFrequencies.solve_r_from_rho(
                 s, m, a, omega, lambda,
-                -angle(p), -angle(omega),
-                rhoin, rhoout; sign_pos=ComplexFrequencies.determine_sign(omega), sign_neg=ComplexFrequencies.determine_sign(p)
+                convention.horizon_contour_angle,
+                convention.infinity_contour_angle,
+                rhoin, rhoout;
+                sign_pos=convention.infinity_sign,
+                sign_neg=convention.horizon_sign,
             )
         end
         # Solve Xin and Xup using the updated settings

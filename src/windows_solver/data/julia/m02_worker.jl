@@ -11,8 +11,40 @@ const GSN = GeneralizedSasakiNakamura
 const CF = GeneralizedSasakiNakamura.ComplexFrequencies
 const Kerr = GeneralizedSasakiNakamura.Kerr
 const Potentials = GeneralizedSasakiNakamura.Potentials
+const Solutions = GeneralizedSasakiNakamura.Solutions
+const GSNBranchConvention = GSN.GSNBranchConvention
 const PROGRESS_PREFIX = "@@KERR_QNM_PROGRESS@@"
 const PROGRESS_SCHEMA = "windows-solver.progress/1"
+const CONDITIONING_SCHEMA = "windows-solver.m02-conditioning/2"
+const HOMOGENEOUS_REPRESENTATION_ID = "factored-plane-wave-gsn/v1"
+const FACTORED_HOMOGENEOUS_ODE_SCOPE_ID =
+    "factored-homogeneous-gsn/v1"
+const ASYMPTOTIC_SERIES_EVALUATION_ID =
+    "typed-batch-horner-compensated/v1"
+const CONDITIONING_DIAGNOSTICS_ID = "series-recurrence-basis-fd/v1"
+const BRANCH_CONVENTION_ID = "gsn-complex-rho/v1"
+const SCATTERING_EXTRACTION_ID = "scaled-factored-horizon-basis/v1"
+const SCATTERING_COLUMN_CONVENTION_ID =
+    "column1=horizon-ingoing-Cref;column2=horizon-outgoing-Cinc/v1"
+const RADIAL_DERIVATIVE_CONVENTION_ID = "state2=dX/drho/v1"
+const HORIZON_DETERMINANT_CONVENTION_ID = "cinc-over-cref-minus-R/v1"
+const HORIZON_DETERMINANT_NORMALISATION_ID =
+    "cinc-over-cref-minus-reflectivity/v1"
+const EXTERIOR_DETERMINANT_CONVENTION_ID =
+    "wronskian-perturbed-Xin-with-Xup/v1"
+const EXTERIOR_DETERMINANT_NORMALISATION_ID =
+    "unit-asymptotic-branch-wronskian/v1"
+const REGULAR_REMAINDER_CONTRACT_ID =
+    "known-carrier-times-regular-remainder/v1"
+const FACTORED_REMAINDER_STATE_CONVENTION_ID =
+    "state1=Y;state2=dY/drho/v1"
+const HORIZON_DETERMINANT_FAMILY_ID = "horizon-scattering/v1"
+const EXTERIOR_DETERMINANT_FAMILY_ID = "exterior-wronskian/v1"
+const RELIABLE_DIGIT_SAFETY_MARGIN = 8
+const REQUIRED_DIGIT_GUARD = 6
+const SCATTERING_CHART_SAFETY_FACTOR = 64
+const REGULARISED_GSN_ACTIVATION_STATUS =
+    "blocked-pending-human-math-review-and-independent-reference/v1"
 const ACTIVE_PROGRESS_CONTEXT = Ref(Dict{String,Any}())
 const ODE_PROGRESS_INTERVAL_SECONDS = 15.0
 const ODE_ALGORITHM_CONFIGURED = "AutoVern9(Rosenbrock23(autodiff=false))"
@@ -54,9 +86,15 @@ struct RootReadoutResourceLimit <: WorkerControlFailure
     details::Dict{String,Any}
 end
 
+struct NumericalControlFailure <: WorkerControlFailure
+    message::String
+    details::Dict{String,Any}
+end
+
 Base.showerror(io::IO, failure::ODEResourceLimit) = print(io, failure.message)
 Base.showerror(io::IO, failure::ODESolverFailure) = print(io, failure.message)
 Base.showerror(io::IO, failure::RootReadoutResourceLimit) = print(io, failure.message)
+Base.showerror(io::IO, failure::NumericalControlFailure) = print(io, failure.message)
 failure_details(failure::WorkerControlFailure) = failure.details
 
 mutable struct ODEObservationState
@@ -151,6 +189,14 @@ function control_failure_context(request)
     return Dict{String,Any}(
         "retryable" => true,
         "precision_digits" => parse_integer(request, "precision_digits"),
+        "request_sha256" => required(request, "request_sha256"),
+        "job_id" => required(request, "job_id"),
+        "leaf_id" => required(request, "leaf_id"),
+        "role" => required(request, "role"),
+        "job_policy_sha256" => required(request, "job_policy_sha256"),
+        "backend_identity_sha256" =>
+            required(request, "backend_identity_sha256"),
+        "refinement_level" => required(request, "refinement_level"),
         "root_phase" => ACTIVE_PHASE[],
         "newton_index" => ACTIVE_NEWTON_INDEX[],
         "determinant_index" => DETERMINANT_INDEX_REQUEST[],
@@ -444,6 +490,13 @@ function flatten_request(document)
     flattened = Dict{String,Any}(
         "schema_version" => required(document, "schema_version"),
         "operation" => required(document, "operation"),
+        "job_id" => required(document, "job_id"),
+        "leaf_id" => required(document, "leaf_id"),
+        "role" => required(document, "role"),
+        "job_policy_sha256" => required(document, "job_policy_sha256"),
+        "backend_identity_sha256" =>
+            required(document, "backend_identity_sha256"),
+        "refinement_level" => required(document, "refinement_level"),
         "s" => required(mode, "s"),
         "ell" => required(mode, "ell"),
         "m" => required(mode, "m"),
@@ -497,6 +550,28 @@ function flatten_request(document)
             execution_resource, "homogeneous_leg_wall_clock_seconds"
         ),
     )
+    for key in (
+        "homogeneous_representation",
+        "asymptotic_series_evaluation",
+        "conditioning_diagnostics",
+        "branch_convention",
+        "radial_derivative_convention",
+        "regular_remainder_contract",
+        "factored_remainder_state_convention",
+        "reliable_digit_safety_margin",
+        "required_digit_guard",
+        "regularised_gsn_activation_status",
+        "determinant_family",
+        "scattering_diagnostics_applicable",
+        "scattering_coefficient_extraction",
+        "horizon_determinant_chart",
+        "scattering_chart_safety_factor",
+        "scattering_column_convention",
+        "determinant_convention",
+        "determinant_normalisation",
+    )
+        flattened[key] = required(policy, key)
+    end
     if mechanism != "horizon-admittance"
         support = required(document, "support")
         for key in ("lower", "upper", "centre", "half_width")
@@ -516,6 +591,66 @@ function flatten_request(document)
         end
     end
     return flattened
+end
+
+function validate_regularised_gsn_policy(request)
+    expected_common = Dict{String,Any}(
+        "homogeneous_representation" => HOMOGENEOUS_REPRESENTATION_ID,
+        "asymptotic_series_evaluation" => ASYMPTOTIC_SERIES_EVALUATION_ID,
+        "conditioning_diagnostics" => CONDITIONING_DIAGNOSTICS_ID,
+        "branch_convention" => BRANCH_CONVENTION_ID,
+        "radial_derivative_convention" => RADIAL_DERIVATIVE_CONVENTION_ID,
+        "regular_remainder_contract" => REGULAR_REMAINDER_CONTRACT_ID,
+        "factored_remainder_state_convention" =>
+            FACTORED_REMAINDER_STATE_CONVENTION_ID,
+        "reliable_digit_safety_margin" =>
+            string(RELIABLE_DIGIT_SAFETY_MARGIN),
+        "required_digit_guard" => string(REQUIRED_DIGIT_GUARD),
+        "regularised_gsn_activation_status" =>
+            REGULARISED_GSN_ACTIVATION_STATUS,
+    )
+    for (key, expected) in expected_common
+        required(request, key) == expected ||
+            error("regularised GSN policy identity $(key) is invalid")
+    end
+
+    horizon = string(required(request, "mechanism_id")) ==
+        "horizon-admittance"
+    expected_mechanism = if horizon
+        Dict{String,Any}(
+            "determinant_family" => HORIZON_DETERMINANT_FAMILY_ID,
+            "scattering_diagnostics_applicable" => true,
+            "scattering_coefficient_extraction" => SCATTERING_EXTRACTION_ID,
+            "horizon_determinant_chart" =>
+                HORIZON_DETERMINANT_NORMALISATION_ID,
+            "scattering_chart_safety_factor" =>
+                string(SCATTERING_CHART_SAFETY_FACTOR),
+            "scattering_column_convention" =>
+                SCATTERING_COLUMN_CONVENTION_ID,
+            "determinant_convention" =>
+                HORIZON_DETERMINANT_CONVENTION_ID,
+            "determinant_normalisation" =>
+                HORIZON_DETERMINANT_NORMALISATION_ID,
+        )
+    else
+        Dict{String,Any}(
+            "determinant_family" => EXTERIOR_DETERMINANT_FAMILY_ID,
+            "scattering_diagnostics_applicable" => false,
+            "scattering_coefficient_extraction" => nothing,
+            "horizon_determinant_chart" => nothing,
+            "scattering_chart_safety_factor" => nothing,
+            "scattering_column_convention" => nothing,
+            "determinant_convention" =>
+                EXTERIOR_DETERMINANT_CONVENTION_ID,
+            "determinant_normalisation" =>
+                EXTERIOR_DETERMINANT_NORMALISATION_ID,
+        )
+    end
+    for (key, expected) in expected_mechanism
+        isequal(required(request, key), expected) ||
+            error("regularised GSN mechanism policy $(key) is invalid")
+    end
+    return nothing
 end
 
 function parse_real(::Type{T}, request, key) where {T<:AbstractFloat}
@@ -622,365 +757,519 @@ function angular_constants(::Type{BigFloat}, s, ell, m, a, omega, seed_A, pad, d
     return A, A + c^2 - T(2m) * c
 end
 
-function homogeneous_rho_rhs!(du, state, parameters, rho)
-    radius = parameters.radius_from_rho(rho)
-    F = parameters.sign * exp(im * parameters.beta) * Potentials.sF(
-        parameters.s,
-        parameters.m,
-        parameters.a,
-        parameters.omega,
-        parameters.lambda,
-        radius,
-    )
-    U = exp(2im * parameters.beta) * Potentials.sU(
-        parameters.s,
-        parameters.m,
-        parameters.a,
-        parameters.omega,
-        parameters.lambda,
-        radius,
-    )
-    du[1] = state[2]
-    du[2] = F * state[2] + U * state[1]
-    return nothing
+struct DeterminantDiagnostics{T<:AbstractFloat}
+    representation_id::String
+    determinant_family::String
+    scattering_diagnostics_applicable::Bool
+    maximum_series_digits_lost::T
+    maximum_recurrence_digits_lost::T
+    maximum_series_evaluation_spread::T
+    maximum_last_term_ratio::T
+    minimum_asymptotic_predicted_reliable_digits::T
+    maximum_basis_condition::Union{Nothing,T}
+    maximum_basis_backward_error::Union{Nothing,T}
+    maximum_matching_reconstruction_residual::Union{Nothing,T}
+    endpoint_remainders_regular::Bool
+    maximum_endpoint_reconstruction_error::T
+    raw_determinant_abs::Union{Nothing,T}
+    normalised_determinant_abs::T
+    minimum_cref_chart_margin::Union{Nothing,T}
+    maximum_carrier_change_error::Union{Nothing,T}
+    maximum_contour_angle_deformation::T
 end
 
-function solve_homogeneous_endpoint(
-    ::Type{T},
-    request,
-    omega::Complex{T},
-    lambda::Complex{T},
-    radius_from_rho,
-    beta,
-    sign,
-    start_rho::T,
-    stop_rho::T,
-    seed;
-    ode_leg::String,
-) where {T<:AbstractFloat}
-    parameters = (
-        s=parse_integer(request, "s"),
-        m=parse_integer(request, "m"),
-        a=parse_real(T, request, "spin"),
-        omega=omega,
-        lambda=lambda,
-        radius_from_rho=radius_from_rho,
-        beta=beta,
-        sign=sign,
-    )
-    initial = Complex{T}[seed[1], seed[2]]
-    problem = ODEProblem(
-        homogeneous_rho_rhs!,
-        initial,
-        (start_rho, stop_rho),
-        parameters,
-    )
-    algorithm = AutoVern9(Rosenbrock23(autodiff=false))
-    observation_callback, observation = ode_observation_factory(
-        request, ode_leg, (start_rho, stop_rho), algorithm
-    )
-    solve_arguments = observation_callback === nothing ?
-        NamedTuple() : (; callback=observation_callback)
-    ode_maxiters = parse_integer(request, "homogeneous_ode_maxiters")
-    solution = solve(
-        problem,
-        algorithm;
-        reltol=parse_real(T, request, "ode_relative_tolerance"),
-        abstol=parse_real(T, request, "ode_absolute_tolerance"),
-        maxiters=ode_maxiters,
-        tstops=[stop_rho],
-        save_everystep=false,
-        save_start=false,
-        save_end=true,
-        dense=false,
-        solve_arguments...
-    )
-    observe_ode_solution(ode_leg, solution, observation)
-    endpoint = solution.u[end]
-    return Complex{T}[endpoint[1], endpoint[2]]
+struct DeterminantEvaluation{T<:AbstractFloat}
+    value::Complex{T}
+    diagnostics::DeterminantDiagnostics{T}
 end
 
-function solve_xin_at_match(
-    ::Type{T},
-    request,
-    omega::Complex{T},
-    lambda::Complex{T},
-    radius_from_rho,
-    beta_negative,
-    sign_negative,
-    rs_match,
-    rho_in::T,
-) where {T<:AbstractFloat}
-    seed = CF.Xin_initialconditions(
-        parse_integer(request, "s"),
-        parse_integer(request, "m"),
-        parse_real(T, request, "spin"),
-        beta_negative,
-        omega,
-        lambda,
-        radius_from_rho,
-        rs_match,
-        rho_in;
-        order=parse_integer(request, "endpoint_series_order"),
-        dtype=Complex{T},
-    )
-    raw = solve_homogeneous_endpoint(
-        T,
-        request,
-        omega,
-        lambda,
-        radius_from_rho,
-        beta_negative,
-        sign_negative,
-        rho_in,
+struct FiniteDifferenceDiagnostics{T<:AbstractFloat}
+    d_plus_abs::T
+    d_minus_abs::T
+    difference_abs::T
+    kappa::T
+    finite_difference_digits_lost::T
+    derivative_abs::T
+    h::T
+    axis::String
+    d_plus_abs_saturated::Bool
+    d_plus_abs_underflowed::Bool
+    d_minus_abs_saturated::Bool
+    d_minus_abs_underflowed::Bool
+    difference_abs_saturated::Bool
+    difference_abs_underflowed::Bool
+    kappa_saturated::Bool
+    kappa_underflowed::Bool
+    kappa_is_infinite::Bool
+    kappa_is_indeterminate::Bool
+    derivative_abs_saturated::Bool
+    derivative_abs_underflowed::Bool
+    underflow_observed::Bool
+    saturation_observed::Bool
+    saturation_status::String
+end
+
+struct FiniteDifferenceRangeError <: Exception
+    message::String
+    status::String
+end
+
+Base.showerror(io::IO, failure::FiniteDifferenceRangeError) =
+    print(io, failure.message)
+
+mutable struct ConditioningAccumulator{T<:AbstractFloat}
+    maximum_series_digits_lost::T
+    maximum_recurrence_digits_lost::T
+    maximum_series_evaluation_spread::T
+    maximum_last_term_ratio::T
+    minimum_asymptotic_predicted_reliable_digits::Union{Nothing,T}
+    maximum_basis_condition::Union{Nothing,T}
+    maximum_basis_backward_error::Union{Nothing,T}
+    maximum_matching_reconstruction_residual::Union{Nothing,T}
+    endpoint_remainders_regular::Bool
+    maximum_endpoint_reconstruction_error::T
+    maximum_fd_digits_lost::T
+    finite_difference_saturation_observed::Bool
+    finite_difference_underflow_observed::Bool
+    minimum_cref_chart_margin::Union{Nothing,T}
+    maximum_carrier_change_error::Union{Nothing,T}
+    maximum_contour_angle_deformation::T
+    determinant_count::Int
+end
+
+function ConditioningAccumulator(::Type{T}) where {T<:AbstractFloat}
+    return ConditioningAccumulator{T}(
         zero(T),
-        seed;
-        ode_leg="Xin_inner_to_match",
-    )
-    return Complex{T}[
-        raw[1],
-        sign_negative * exp(-im * beta_negative) * raw[2],
-    ]
-end
-
-function xup_outer_to_match_raw(
-    ::Type{T},
-    request,
-    omega::Complex{T},
-    lambda::Complex{T},
-    radius_from_rho,
-    beta_positive,
-    sign_positive,
-    rs_match,
-    rho_out::T,
-) where {T<:AbstractFloat}
-    seed = CF.Xup_initialconditions(
-        parse_integer(request, "s"),
-        parse_integer(request, "m"),
-        parse_real(T, request, "spin"),
-        beta_positive,
-        omega,
-        lambda,
-        radius_from_rho,
-        rs_match,
-        rho_out;
-        order=parse_integer(request, "endpoint_series_order"),
-        dtype=Complex{T},
-    )
-    return solve_homogeneous_endpoint(
-        T,
-        request,
-        omega,
-        lambda,
-        radius_from_rho,
-        beta_positive,
-        sign_positive,
-        rho_out,
         zero(T),
-        seed;
-        ode_leg="Xup_outer_to_match",
-    )
-end
-
-function solve_xup_at_match(
-    ::Type{T},
-    request,
-    omega::Complex{T},
-    lambda::Complex{T},
-    radius_from_rho,
-    beta_positive,
-    sign_positive,
-    rs_match,
-    rho_out::T,
-) where {T<:AbstractFloat}
-    raw = xup_outer_to_match_raw(
-        T,
-        request,
-        omega,
-        lambda,
-        radius_from_rho,
-        beta_positive,
-        sign_positive,
-        rs_match,
-        rho_out,
-    )
-    return Complex{T}[
-        raw[1],
-        sign_positive * exp(-im * beta_positive) * raw[2],
-    ]
-end
-
-function solve_xup_scattering_coefficients(
-    ::Type{T},
-    request,
-    omega::Complex{T},
-    lambda::Complex{T},
-    radius_from_rho,
-    beta_negative,
-    beta_positive,
-    sign_negative,
-    sign_positive,
-    rs_match,
-    rho_in::T,
-    rho_out::T,
-) where {T<:AbstractFloat}
-    outer_at_match = xup_outer_to_match_raw(
-        T,
-        request,
-        omega,
-        lambda,
-        radius_from_rho,
-        beta_positive,
-        sign_positive,
-        rs_match,
-        rho_out,
-    )
-    inner_seed = Complex{T}[
-        outer_at_match[1],
-        sign_negative * exp(im * beta_negative) *
-            sign_positive * exp(-im * beta_positive) *
-            outer_at_match[2],
-    ]
-    raw_inner = solve_homogeneous_endpoint(
-        T,
-        request,
-        omega,
-        lambda,
-        radius_from_rho,
-        beta_negative,
-        sign_negative,
         zero(T),
-        rho_in,
-        inner_seed;
-        ode_leg="Xup_match_to_inner",
-    )
-    xup_inner = Complex{T}[
-        raw_inner[1],
-        sign_negative * exp(-im * beta_negative) * raw_inner[2],
-    ]
-    xup_endpoint(_rho) = xup_inner
-    return CF.CrefCinc_SN_from_Xup(
-        parse_integer(request, "s"),
-        parse_integer(request, "m"),
-        parse_real(T, request, "spin"),
-        beta_negative,
-        omega,
-        lambda,
-        xup_endpoint,
-        radius_from_rho,
-        rs_match,
-        rho_in;
-        order=parse_integer(request, "endpoint_series_order"),
-        dtype=Complex{T},
+        zero(T),
+        nothing,
+        nothing,
+        nothing,
+        nothing,
+        true,
+        zero(T),
+        zero(T),
+        false,
+        false,
+        nothing,
+        nothing,
+        zero(T),
+        0,
     )
 end
 
-function branch_values(
-    ::Type{T}, request, omega::Complex{T}, match_radius::T, branch::Symbol
+struct DeterminantRequestContext{T<:AbstractFloat}
+    frozen_convention::GSNBranchConvention{T}
+    frozen_branch_cell::GSN.GSNBranchCell
+    conditioning::ConditioningAccumulator{T}
+end
+
+function build_determinant_request_context(
+    ::Type{T}, request, reference_omega::Complex{T}
 ) where {T<:AbstractFloat}
-    branch in (:xin, :xup, :xup_scattering) ||
-        error("unsupported homogeneous branch request")
+    a = parse_real(T, request, "spin")
+    m = parse_integer(request, "m")
+    geometry = Kerr.stable_horizon_geometry(a)
+    p_horizon = reference_omega - T(m) * geometry.omega_horizon
+    frozen_convention = GSN.gsn_branch_convention(
+        reference_omega, p_horizon
+    )
+    return DeterminantRequestContext{T}(
+        frozen_convention,
+        GSN.branch_cell(frozen_convention),
+        ConditioningAccumulator(T),
+    )
+end
+
+function required_reliable_digits(::Type{T}, request) where {T<:AbstractFloat}
+    tolerance = parse_real(T, request, "root_correction_tolerance")
+    zero(T) < tolerance < one(T) ||
+        error("root correction tolerance must lie strictly between zero and one")
+    return -log10(tolerance) + T(REQUIRED_DIGIT_GUARD)
+end
+
+function build_sample_spectral_context(
+    ::Type{T},
+    request,
+    omega::Complex{T},
+    context::DeterminantRequestContext{T},
+) where {T<:AbstractFloat}
     s = parse_integer(request, "s")
     ell = parse_integer(request, "ell")
     m = parse_integer(request, "m")
     digits = parse_integer(request, "precision_digits")
+    bits = parse_integer(request, "working_precision_bits")
     pad = parse_integer(request, "angular_pad")
     a = parse_real(T, request, "spin")
     seed_A = parse_complex(T, request, "angular_A_re", "angular_A_im")
     _, lambda = progress_operation("angular") do
         angular_constants(T, s, ell, m, a, omega, seed_A, pad, digits)
     end
-    relative_tolerance = parse_real(T, request, "ode_relative_tolerance")
-    absolute_tolerance = parse_real(T, request, "ode_absolute_tolerance")
+    spectral = CF.build_homogeneous_spectral_context(
+        s,
+        m,
+        a,
+        omega,
+        lambda,
+        digits,
+        bits,
+        parse_integer(request, "endpoint_series_order"),
+        context.frozen_convention,
+    )
+    spectral.frozen_branch_cell == context.frozen_branch_cell ||
+        error("sample spectral context changed the request branch cell")
+    spectral.frozen_branch_cell.version == BRANCH_CONVENTION_ID ||
+        error("sample spectral context changed the branch convention identity")
+    return spectral
+end
+
+function build_worker_contour_context(
+    ::Type{T},
+    request,
+    spectral::CF.HomogeneousSpectralContext{T},
+    match_radius::T,
+    label::String,
+) where {T<:AbstractFloat}
     rho_in = parse_real(T, request, "rho_in")
     rho_out = parse_real(T, request, "rho_out")
-    rs_match = GSN.rstar_from_r(a, match_radius)
-    p_h = omega - T(m) * Kerr.omega_horizon(a)
-    beta_negative = -angle(p_h)
-    beta_positive = -angle(omega)
-    sign_negative = CF.determine_sign(p_h)
-    sign_positive = CF.determine_sign(omega)
-    dtype = Complex{T}
-    radius_from_rho = progress_operation("r-from-rho") do
-        observation_factory = (leg, tspan, algorithm) ->
-            ode_observation_factory(request, leg, tspan, algorithm)
+    rstar_match = T(GSN.rstar_from_r(spectral.a, match_radius))
+    algorithm = AutoVern9(Rosenbrock23(autodiff=false))
+    observation_factory = (leg, tspan, ode_algorithm) ->
+        ode_observation_factory(request, leg, tspan, ode_algorithm)
+    raw_radius_from_rho = progress_operation("r-from-rho"; payload=Dict(
+        "contour_label" => label,
+    )) do
         CF.solve_r_from_rho(
-            a, beta_negative, beta_positive, rs_match, rho_in, rho_out;
-            sign_neg=sign_negative,
-            sign_pos=sign_positive,
-            dtype=dtype,
-            reltol=relative_tolerance,
-            abstol=absolute_tolerance,
+            spectral.a,
+            spectral.convention.horizon_contour_angle,
+            spectral.convention.infinity_contour_angle,
+            rstar_match,
+            rho_in,
+            rho_out;
+            sign_neg=spectral.convention.horizon_sign,
+            sign_pos=spectral.convention.infinity_sign,
+            dtype=Complex{T},
+            odealgo=algorithm,
+            reltol=parse_real(T, request, "ode_relative_tolerance"),
+            abstol=parse_real(T, request, "ode_absolute_tolerance"),
             ode_maxiters=parse_integer(request, "homogeneous_ode_maxiters"),
             ode_observation_factory=observation_factory,
             ode_solution_observer=observe_ode_solution,
         )
     end
-
-    xin_match = nothing
-    xup_match = nothing
-    Cref = nothing
-    Cinc = nothing
-    if branch == :xin
-        xin_radius_from_rho = observed_radial_map(radius_from_rho, "Xin", rho_in, rho_out)
-        xin_match = progress_operation("Xin") do
-            solve_xin_at_match(
-                T,
-                request,
-                omega,
-                lambda,
-                xin_radius_from_rho,
-                beta_negative,
-                sign_negative,
-                rs_match,
-                rho_in,
-            )
-        end
-    elseif branch == :xup
-        xup_radius_from_rho = observed_radial_map(radius_from_rho, "Xup", rho_in, rho_out)
-        xup_match = progress_operation("Xup") do
-            solve_xup_at_match(
-                T,
-                request,
-                omega,
-                lambda,
-                xup_radius_from_rho,
-                beta_positive,
-                sign_positive,
-                rs_match,
-                rho_out,
-            )
-        end
-    else
-        # The direct coefficient determinant consumes only Xup.  Its outer-to-match
-        # and match-to-inner propagation is two homogeneous legs; Xin is absent
-        # entirely, improving on the earlier three-leg optimization target.
-        xup_radius_from_rho = observed_radial_map(radius_from_rho, "Xup", rho_in, rho_out)
-        Cref, Cinc = progress_operation("Xup") do
-            solve_xup_scattering_coefficients(
-                T,
-                request,
-                omega,
-                lambda,
-                xup_radius_from_rho,
-                beta_negative,
-                beta_positive,
-                sign_negative,
-                sign_positive,
-                rs_match,
-                rho_in,
-                rho_out,
-            )
-        end
-    end
-
-    return (
-        xin=xin_match,
-        xup=xup_match,
-        Cref=Cref,
-        Cinc=Cinc,
-        lambda=lambda,
+    radius_from_rho = observed_radial_map(
+        raw_radius_from_rho, label, rho_in, rho_out
     )
+    return CF.build_contour_context(
+        spectral,
+        match_radius,
+        rstar_match,
+        rho_in,
+        rho_out,
+        radius_from_rho,
+    )
+end
+
+function endpoint_conditioning_summary(preparations...)
+    isempty(preparations) && error("at least one endpoint preparation is required")
+    maximum_series_digits_lost = maximum(
+        preparation.assessment.maximum_series_evaluation_digits_lost
+        for preparation in preparations
+    )
+    maximum_recurrence_digits_lost = maximum(
+        preparation.assessment.maximum_recurrence_digits_lost
+        for preparation in preparations
+    )
+    maximum_series_evaluation_spread = maximum(
+        preparation.assessment.maximum_series_evaluation_spread
+        for preparation in preparations
+    )
+    maximum_last_term_ratio = maximum(
+        preparation.assessment.maximum_last_term_ratio
+        for preparation in preparations
+    )
+    minimum_asymptotic_predicted_reliable_digits = minimum(
+        preparation.assessment.predicted_reliable_digits
+        for preparation in preparations
+    )
+    endpoint_remainders_regular = all(
+        preparation.initial_condition.regularity.finite
+        for preparation in preparations
+    )
+    maximum_endpoint_reconstruction_error = maximum(
+        max(
+            preparation.initial_condition.regularity.relative_X_reconstruction_error,
+            preparation.initial_condition.regularity.relative_Xrho_reconstruction_error,
+            preparation.initial_condition.regularity.Xrho_backward_residual,
+        )
+        for preparation in preparations
+    )
+    return (
+        maximum_series_digits_lost=maximum_series_digits_lost,
+        maximum_recurrence_digits_lost=maximum_recurrence_digits_lost,
+        maximum_series_evaluation_spread=maximum_series_evaluation_spread,
+        maximum_last_term_ratio=maximum_last_term_ratio,
+        minimum_asymptotic_predicted_reliable_digits=
+            minimum_asymptotic_predicted_reliable_digits,
+        endpoint_remainders_regular=endpoint_remainders_regular,
+        maximum_endpoint_reconstruction_error=
+            maximum_endpoint_reconstruction_error,
+    )
+end
+
+function emit_asymptotic_preparation(preparation)
+    assessment = preparation.assessment
+    progress_emit("asymptotic_series_evaluated"; payload=Dict(
+        "branch" => string(preparation.branch),
+        "adequate" => assessment.adequate,
+        "maximum_series_digits_lost" =>
+            string(assessment.maximum_series_evaluation_digits_lost),
+        "maximum_recurrence_digits_lost" =>
+            string(assessment.maximum_recurrence_digits_lost),
+        "maximum_series_evaluation_spread" =>
+            string(assessment.maximum_series_evaluation_spread),
+        "maximum_last_term_ratio" =>
+            string(assessment.maximum_last_term_ratio),
+        "predicted_reliable_digits" =>
+            string(assessment.predicted_reliable_digits),
+        "required_reliable_digits" => string(assessment.required_digits),
+    ))
+    return nothing
+end
+
+function emit_factored_solution(solution)
+    diagnostics = solution.diagnostics
+    diagnostics.representation_id == HOMOGENEOUS_REPRESENTATION_ID ||
+        error("package factored representation identity changed")
+    diagnostics.ode_scope_id == FACTORED_HOMOGENEOUS_ODE_SCOPE_ID ||
+        error("package factored ODE scope identity changed")
+    progress_emit("factored_ode_completed"; payload=Dict(
+        "branch" => string(diagnostics.branch),
+        "ode_leg" => diagnostics.ode_leg,
+        "representation_id" => diagnostics.representation_id,
+        "ode_scope_id" => diagnostics.ode_scope_id,
+        "factored_homogeneous_rhs_evaluations" =>
+            diagnostics.factored_homogeneous_rhs_evaluations,
+        "maximum_remainder_state_norm" =>
+            string(diagnostics.maximum_remainder_state_norm),
+        "minimum_remainder_state_norm" =>
+            string(diagnostics.minimum_remainder_state_norm),
+        "maximum_absolute_real_carrier_log" =>
+            string(diagnostics.maximum_absolute_real_carrier_log),
+        "endpoint_only_saved_points" =>
+            diagnostics.endpoint_only_saved_points,
+        "maximum_contour_angle_deformation" => string(
+            diagnostics.contour_deformation.maximum_absolute
+        ),
+    ))
+    return nothing
+end
+
+function record_determinant!(
+    accumulator::ConditioningAccumulator{T},
+    diagnostics::DeterminantDiagnostics{T},
+) where {T<:AbstractFloat}
+    accumulator.maximum_series_digits_lost = max(
+        accumulator.maximum_series_digits_lost,
+        diagnostics.maximum_series_digits_lost,
+    )
+    accumulator.maximum_recurrence_digits_lost = max(
+        accumulator.maximum_recurrence_digits_lost,
+        diagnostics.maximum_recurrence_digits_lost,
+    )
+    accumulator.maximum_series_evaluation_spread = max(
+        accumulator.maximum_series_evaluation_spread,
+        diagnostics.maximum_series_evaluation_spread,
+    )
+    accumulator.maximum_last_term_ratio = max(
+        accumulator.maximum_last_term_ratio,
+        diagnostics.maximum_last_term_ratio,
+    )
+    accumulator.minimum_asymptotic_predicted_reliable_digits =
+        accumulator.minimum_asymptotic_predicted_reliable_digits === nothing ?
+            diagnostics.minimum_asymptotic_predicted_reliable_digits :
+            min(
+                accumulator.minimum_asymptotic_predicted_reliable_digits,
+                diagnostics.minimum_asymptotic_predicted_reliable_digits,
+            )
+    accumulator.endpoint_remainders_regular &=
+        diagnostics.endpoint_remainders_regular
+    accumulator.maximum_endpoint_reconstruction_error = max(
+        accumulator.maximum_endpoint_reconstruction_error,
+        diagnostics.maximum_endpoint_reconstruction_error,
+    )
+    accumulator.maximum_contour_angle_deformation = max(
+        accumulator.maximum_contour_angle_deformation,
+        diagnostics.maximum_contour_angle_deformation,
+    )
+    if diagnostics.scattering_diagnostics_applicable
+        for (field, value) in (
+            (:maximum_basis_condition, diagnostics.maximum_basis_condition),
+            (:maximum_basis_backward_error,
+                diagnostics.maximum_basis_backward_error),
+            (:maximum_matching_reconstruction_residual,
+                diagnostics.maximum_matching_reconstruction_residual),
+            (:maximum_carrier_change_error,
+                diagnostics.maximum_carrier_change_error),
+        )
+            value === nothing && error("missing horizon scattering diagnostic")
+            previous = getfield(accumulator, field)
+            setfield!(
+                accumulator,
+                field,
+                previous === nothing ? value : max(previous, value),
+            )
+        end
+        diagnostics.minimum_cref_chart_margin === nothing &&
+            error("missing horizon Cref chart margin")
+        accumulator.minimum_cref_chart_margin =
+            accumulator.minimum_cref_chart_margin === nothing ?
+                diagnostics.minimum_cref_chart_margin :
+                min(
+                    accumulator.minimum_cref_chart_margin,
+                    diagnostics.minimum_cref_chart_margin,
+                )
+    end
+    accumulator.determinant_count += 1
+    return accumulator
+end
+
+function record_finite_difference!(
+    accumulator::ConditioningAccumulator{T},
+    diagnostics::FiniteDifferenceDiagnostics{T},
+) where {T<:AbstractFloat}
+    accumulator.maximum_fd_digits_lost = max(
+        accumulator.maximum_fd_digits_lost,
+        diagnostics.finite_difference_digits_lost,
+    )
+    accumulator.finite_difference_saturation_observed |=
+        diagnostics.saturation_observed
+    accumulator.finite_difference_underflow_observed |=
+        diagnostics.underflow_observed
+    return accumulator
+end
+
+function numerical_control_failure(
+    request,
+    failure_code::String,
+    message::String,
+    diagnostics::Dict{String,Any};
+    retryable::Bool=false,
+)
+    details = merge(control_failure_context(request), Dict{String,Any}(
+        "failure_code" => failure_code,
+        "failure_class" => "CONTROL",
+        "retryable" => retryable,
+        "diagnostics" => diagnostics,
+    ))
+    return NumericalControlFailure(message, details)
+end
+
+function translate_numerical_control_failure(
+    request,
+    failure;
+    finite_difference_axis=nothing,
+    finite_difference_h=nothing,
+)
+    failure isa WorkerControlFailure && return failure
+    if failure isa FiniteDifferenceRangeError
+        finite_difference_axis in ("real", "imaginary") || return failure
+        finite_difference_h isa AbstractFloat || return failure
+        isfinite(finite_difference_h) && finite_difference_h > 0 ||
+            return failure
+        diagnostics = Dict{String,Any}(
+            "reason" => failure.status,
+            "range_status" => failure.status,
+            "operation" => "finite-difference-derivative/v1",
+            "axis" => finite_difference_axis,
+            "h" => string(finite_difference_h),
+        )
+        return numerical_control_failure(
+            request,
+            "ALGEBRAIC_REPRESENTATION_SINGULAR",
+            sprint(showerror, failure),
+            diagnostics;
+            retryable=false,
+        )
+    end
+    if failure isa CF.FactoredPropagationError
+        raw_code = string(failure.reason)
+        failure_code = if raw_code in (
+            "INVALID_ASYMPTOTIC_INPUT",
+            "PRECISION_MISMATCH",
+            "NONFINITE_ASYMPTOTIC_DATA",
+        )
+            "ASYMPTOTIC_SERIES_INVALID"
+        else
+            raw_code
+        end
+        recognized = failure_code in (
+            "ASYMPTOTIC_SERIES_INVALID",
+            "INSUFFICIENT_ASYMPTOTIC_PRECISION",
+            "PHYSICAL_SINGULAR_LIMIT",
+            "ALGEBRAIC_REPRESENTATION_SINGULAR",
+            "CARRIER_CHANGE_INCONSISTENT",
+        )
+        recognized || return failure
+        diagnostics = Dict{String,Any}(
+            "reason" => raw_code,
+            "precision_bits" => failure.precision_bits,
+            "factored_homogeneous_rhs_evaluations" =>
+                failure.factored_homogeneous_rhs_evaluations,
+            "avoided_ode_scope" => failure.avoided_ode_scope,
+        )
+        retryable = false
+        if failure_code == "INSUFFICIENT_ASYMPTOTIC_PRECISION"
+            assessment = failure.assessment
+            assessment === nothing && return failure
+            failure.avoided_ode_scope ==
+                FACTORED_HOMOGENEOUS_ODE_SCOPE_ID ||
+                error("inadequate preflight reported an unexpected ODE scope")
+            factored_homogeneous_rhs_evaluations =
+                failure.factored_homogeneous_rhs_evaluations
+            factored_homogeneous_rhs_evaluations == 0 ||
+                error("inadequate asymptotic preflight followed factored RHS work")
+            diagnostics = merge(diagnostics, Dict{String,Any}(
+                "predicted_reliable_digits" =>
+                    string(assessment.predicted_reliable_digits),
+                "required_reliable_digits" =>
+                    string(assessment.required_digits),
+                "asymptotic_preflight_avoided_ode" => true,
+                "asymptotic_preflight_reason" => failure_code,
+                "maximum_series_digits_lost" =>
+                    string(assessment.maximum_series_evaluation_digits_lost),
+                "maximum_recurrence_digits_lost" =>
+                    string(assessment.maximum_recurrence_digits_lost),
+            ))
+            retryable = true
+        end
+        return numerical_control_failure(
+            request,
+            failure_code,
+            sprint(showerror, failure),
+            diagnostics;
+            retryable=retryable,
+        )
+    end
+    if failure isa Solutions.ScatteringExtractionError
+        failure_code = string(failure.reason)
+        failure_code in (
+            "SCATTERING_BASIS_ILL_CONDITIONED",
+            "SCATTERING_CHART_ILL_CONDITIONED",
+        ) || return failure
+        diagnostics = Dict{String,Any}(
+            "reason" => failure_code,
+            "precision_bits" => failure.precision_bits,
+        )
+        return numerical_control_failure(
+            request,
+            failure_code,
+            sprint(showerror, failure),
+            diagnostics,
+        )
+    end
+    return failure
 end
 
 wronskian(left, right) = left[1] * right[2] - left[2] * right[1]
@@ -1152,50 +1441,296 @@ function integrate_real_branch(
     )
 end
 
-function determinant(::Type{T}, request, omega::Complex{T}, amplitude::Complex{T}) where {T<:AbstractFloat}
-    mechanism = string(required(request, "mechanism_id"))
-    mechanism in ALLOWED_MECHANISMS ||
-        error("unsupported mechanism_id $(repr(mechanism))")
+function evaluate_horizon_determinant(
+    ::Type{T},
+    request,
+    context::DeterminantRequestContext{T},
+    omega::Complex{T},
+    amplitude::Complex{T},
+) where {T<:AbstractFloat}
+    readout = parse_real(T, request, "readout_radius")
+    spectral = build_sample_spectral_context(T, request, omega, context)
+    contour = build_worker_contour_context(
+        T, request, spectral, readout, "Xup"
+    )
+    required_digits = required_reliable_digits(T, request)
+    preparations = CF.prepare_factored_horizon_determinant_branches(
+        spectral, contour, required_digits
+    )
+    for preparation in (
+        preparations.infinity_outgoing,
+        preparations.horizon_ingoing,
+        preparations.horizon_outgoing,
+    )
+        emit_asymptotic_preparation(preparation)
+    end
+    factored_homogeneous_rhs_counter = Ref(0)
+    observation_factory = (leg, tspan, algorithm) ->
+        ode_observation_factory(request, leg, tspan, algorithm)
+    propagation = progress_operation("Xup") do
+        CF.solve_factored_xup_scattering_endpoint(
+            spectral,
+            contour,
+            preparations;
+            odealgo=AutoVern9(Rosenbrock23(autodiff=false)),
+            reltol=parse_real(T, request, "ode_relative_tolerance"),
+            abstol=parse_real(T, request, "ode_absolute_tolerance"),
+            ode_maxiters=parse_integer(request, "homogeneous_ode_maxiters"),
+            ode_observation_factory=observation_factory,
+            ode_solution_observer=observe_ode_solution,
+            ode_exception_passthrough=error ->
+                error isa ODEResourceLimit || error isa ODESolverFailure,
+            factored_homogeneous_rhs_counter=
+                factored_homogeneous_rhs_counter,
+        )
+    end
+    emit_factored_solution(propagation.infinity_outer_to_match)
+    emit_factored_solution(propagation.horizon_match_to_inner)
+    transition_diagnostics = propagation.carrier_transition.diagnostics
+    transition_error = max(
+        transition_diagnostics.X_reconstruction_error,
+        transition_diagnostics.Xrho_reconstruction_error,
+    )
+    progress_emit("carrier_changed"; payload=Dict(
+        "source_carrier" =>
+            string(propagation.carrier_transition.source_carrier.kind),
+        "target_carrier" =>
+            string(propagation.carrier_transition.target_carrier.kind),
+        "X_reconstruction_error" =>
+            string(transition_diagnostics.X_reconstruction_error),
+        "Xrho_reconstruction_error" =>
+            string(transition_diagnostics.Xrho_reconstruction_error),
+    ))
+
+    basis = Solutions.build_common_horizon_basis(
+        preparations.horizon_ingoing.initial_condition,
+        preparations.horizon_outgoing.initial_condition,
+    )
+    coefficients = Solutions.solve_scaled_factored_scattering(
+        propagation.horizon_match_to_inner.endpoint,
+        propagation.horizon_match_to_inner.carrier,
+        basis,
+    )
+    coefficient_diagnostics = coefficients.diagnostics
+    coefficient_diagnostics.extraction_id == SCATTERING_EXTRACTION_ID ||
+        error("package scattering extraction identity changed")
+    coefficient_diagnostics.column_convention ==
+        SCATTERING_COLUMN_CONVENTION_ID ||
+        error("package scattering column convention changed")
+    coefficient_diagnostics.factored_state_convention ==
+        FACTORED_REMAINDER_STATE_CONVENTION_ID ||
+        error("package factored scattering state convention changed")
+    progress_emit("scattering_coefficients_extracted"; payload=Dict(
+        "Cref" => progress_complex(coefficients.Cref),
+        "Cinc" => progress_complex(coefficients.Cinc),
+        "basis_condition" =>
+            string(coefficient_diagnostics.condition_frobenius),
+        "basis_backward_error" =>
+            string(coefficient_diagnostics.backward_error),
+        "matching_reconstruction_residual" => string(
+            coefficient_diagnostics.matching_reconstruction_residual
+        ),
+        "column_norm_1" => string(coefficient_diagnostics.column_norm_1),
+        "column_norm_2" => string(coefficient_diagnostics.column_norm_2),
+    ))
+
+    chart_denominator = T(2) * im * spectral.p_horizon - amplitude
+    chart_scale = max(T(2) * abs(spectral.p_horizon), abs(amplitude))
+    if iszero(chart_denominator)
+        throw(numerical_control_failure(
+            request,
+            "ALGEBRAIC_REPRESENTATION_SINGULAR",
+            "horizon reflectivity chart denominator is exactly zero",
+            Dict{String,Any}(
+                "chart_denominator_abs" => string(abs(chart_denominator)),
+                "chart_scale_abs" => string(chart_scale),
+            ),
+        ))
+    end
+    chart_relative_margin = abs(chart_denominator) /
+        max(chart_scale, floatmin(T))
+    chart_relative_margin > sqrt(eps(T)) || throw(
+        numerical_control_failure(
+            request,
+            "SCATTERING_CHART_ILL_CONDITIONED",
+            "horizon reflectivity chart denominator is numerically unresolved",
+            Dict{String,Any}(
+                "chart_denominator_abs" => string(abs(chart_denominator)),
+                "chart_scale_abs" => string(chart_scale),
+                "chart_relative_margin" => string(chart_relative_margin),
+            ),
+        )
+    )
+    reflectivity = amplitude / (T(2) * im * spectral.p_horizon - amplitude)
+    endpoint_summary = endpoint_conditioning_summary(
+        preparations.infinity_outgoing,
+        preparations.horizon_ingoing,
+        preparations.horizon_outgoing,
+    )
+    coefficient_scale = max(
+        abs(coefficients.Cref), abs(coefficients.Cinc), floatmin(T)
+    )
+    chart_inputs = Solutions.ScatteringChartErrorInputs{T}(
+        coefficient_scale,
+        endpoint_summary.maximum_series_evaluation_spread,
+        parse_real(T, request, "ode_relative_tolerance"),
+    )
+    chart = Solutions.evaluate_normalised_horizon_determinant(
+        coefficients, reflectivity, chart_inputs
+    )
+    chart_assessment = chart.assessment
+    for (field, expected) in (
+        (:homogeneous_representation, HOMOGENEOUS_REPRESENTATION_ID),
+        (:branch_convention, BRANCH_CONVENTION_ID),
+        (:scattering_coefficient_extraction, SCATTERING_EXTRACTION_ID),
+        (:scattering_column_convention,
+            SCATTERING_COLUMN_CONVENTION_ID),
+        (:radial_derivative_convention,
+            RADIAL_DERIVATIVE_CONVENTION_ID),
+        (:determinant_convention,
+            HORIZON_DETERMINANT_CONVENTION_ID),
+        (:regular_remainder_contract, REGULAR_REMAINDER_CONTRACT_ID),
+        (:factored_remainder_state_convention,
+            FACTORED_REMAINDER_STATE_CONVENTION_ID),
+        (:horizon_determinant_chart,
+            HORIZON_DETERMINANT_NORMALISATION_ID),
+    )
+        getfield(chart_assessment, field) == expected || error(
+            "package horizon chart $(String(field)) identity changed"
+        )
+    end
+    normalised_determinant_abs =
+        chart_assessment.normalised_determinant_abs
+    normalised_determinant_abs === nothing &&
+        error("safe horizon chart omitted its normalised determinant")
+    carrier_change_error = max(
+        transition_error, coefficient_diagnostics.carrier_change_error
+    )
+    diagnostics = DeterminantDiagnostics{T}(
+        HOMOGENEOUS_REPRESENTATION_ID,
+        HORIZON_DETERMINANT_FAMILY_ID,
+        true,
+        endpoint_summary.maximum_series_digits_lost,
+        endpoint_summary.maximum_recurrence_digits_lost,
+        endpoint_summary.maximum_series_evaluation_spread,
+        endpoint_summary.maximum_last_term_ratio,
+        endpoint_summary.minimum_asymptotic_predicted_reliable_digits,
+        coefficient_diagnostics.condition_frobenius,
+        coefficient_diagnostics.backward_error,
+        coefficient_diagnostics.matching_reconstruction_residual,
+        endpoint_summary.endpoint_remainders_regular,
+        endpoint_summary.maximum_endpoint_reconstruction_error,
+        chart_assessment.raw_determinant_abs,
+        normalised_determinant_abs,
+        chart_assessment.cref_chart_margin,
+        carrier_change_error,
+        spectral.contour_deformation.maximum_absolute,
+    )
+    record_determinant!(context.conditioning, diagnostics)
+    progress_emit("horizon_chart_evaluated"; payload=Dict(
+        "Cinc_abs" => string(chart_assessment.cinc_abs),
+        "Cref_abs" => string(chart_assessment.cref_abs),
+        "reflectivity_abs" => string(abs(reflectivity)),
+        "raw_determinant_abs" =>
+            string(chart_assessment.raw_determinant_abs),
+        "normalised_determinant_abs" =>
+            string(normalised_determinant_abs),
+        "cref_chart_margin" =>
+            string(chart_assessment.cref_chart_margin),
+    ))
+    progress_emit("determinant_chart_evaluated"; payload=Dict(
+        "determinant_family" => HORIZON_DETERMINANT_FAMILY_ID,
+        "determinant_convention" =>
+            HORIZON_DETERMINANT_CONVENTION_ID,
+        "determinant_normalisation" =>
+            HORIZON_DETERMINANT_NORMALISATION_ID,
+        "normalised_determinant_abs" =>
+            string(normalised_determinant_abs),
+    ))
+    return DeterminantEvaluation{T}(chart.value, diagnostics)
+end
+
+function evaluate_exterior_determinant(
+    ::Type{T},
+    request,
+    context::DeterminantRequestContext{T},
+    omega::Complex{T},
+    amplitude::Complex{T},
+) where {T<:AbstractFloat}
     readout = parse_real(T, request, "readout_radius")
     a = parse_real(T, request, "spin")
-    m = parse_integer(request, "m")
-
-    if mechanism == "horizon-admittance"
-        branches = branch_values(T, request, omega, readout, :xup_scattering)
-        p_h = omega - T(m) * Kerr.omega_horizon(a)
-        denominator = T(2) * im * p_h - amplitude
-        denominator_abs = abs(denominator)
-        iszero(denominator_abs) && error("zero horizon chart denominator")
-        chart_scale_abs = max(T(2) * abs(p_h), abs(amplitude))
-        chart_condition_abs = denominator_abs / chart_scale_abs
-        chart_condition_threshold = sqrt(eps(T))
-        isfinite(chart_condition_abs) &&
-            chart_condition_abs > chart_condition_threshold ||
-            error("horizon chart denominator is numerically singular")
-        reflectivity = amplitude / denominator
-        chart_ratio = iszero(p_h) ? T(Inf) : abs(amplitude) / (T(2) * abs(p_h))
-        progress_emit("horizon_chart_evaluated"; payload=Dict(
-            "Cinc" => progress_complex(branches.Cinc),
-            "Cref" => progress_complex(branches.Cref),
-            "horizon_frequency" => progress_complex(p_h),
-            "reflectivity" => progress_complex(reflectivity),
-            "chart_denominator" => progress_complex(denominator),
-            "Cinc_abs" => string(abs(branches.Cinc)),
-            "Cref_abs" => string(abs(branches.Cref)),
-            "horizon_frequency_abs" => string(abs(p_h)),
-            "reflectivity_abs" => string(abs(reflectivity)),
-            "chart_denominator_abs" => string(denominator_abs),
-            "chart_scale_abs" => string(chart_scale_abs),
-            "chart_condition_abs" => string(chart_condition_abs),
-            "chart_condition_threshold" => string(chart_condition_threshold),
-            "chart_ratio" => string(chart_ratio),
-        ))
-        return branches.Cinc - reflectivity * branches.Cref
-    end
-
     lower, _ = exterior_support_contract(T, request, a, readout)
-    lower_branches = branch_values(T, request, omega, lower, :xin)
-    readout_branches = branch_values(T, request, omega, readout, :xup)
+    spectral = build_sample_spectral_context(T, request, omega, context)
+    lower_contour = build_worker_contour_context(
+        T, request, spectral, lower, "Xin"
+    )
+    readout_contour = build_worker_contour_context(
+        T, request, spectral, readout, "Xup"
+    )
+    required_digits = required_reliable_digits(T, request)
+    horizon_ingoing = CF.prepare_factored_horizon_ingoing(
+        spectral, lower_contour, required_digits
+    )
+    infinity_outgoing = CF.prepare_factored_infinity_outgoing(
+        spectral, readout_contour, required_digits
+    )
+    emit_asymptotic_preparation(horizon_ingoing)
+    emit_asymptotic_preparation(infinity_outgoing)
+    # Authenticate both distinct match-radius preparations before testing
+    # either assessment. An inadequate branch exits before readiness,
+    # observers, or any factored homogeneous RHS evaluation.
+    CF.assert_factored_exterior_preparations_ready(
+        spectral,
+        lower_contour,
+        horizon_ingoing,
+        readout_contour,
+        infinity_outgoing,
+    )
+
+    factored_homogeneous_rhs_counter = Ref(0)
+    observation_factory = (leg, tspan, algorithm) ->
+        ode_observation_factory(request, leg, tspan, algorithm)
+    common_solve_options = (
+        odealgo=AutoVern9(Rosenbrock23(autodiff=false)),
+        reltol=parse_real(T, request, "ode_relative_tolerance"),
+        abstol=parse_real(T, request, "ode_absolute_tolerance"),
+        ode_maxiters=parse_integer(request, "homogeneous_ode_maxiters"),
+        ode_observation_factory=observation_factory,
+        ode_solution_observer=observe_ode_solution,
+        ode_exception_passthrough=error ->
+            error isa ODEResourceLimit || error isa ODESolverFailure,
+        factored_homogeneous_rhs_counter=factored_homogeneous_rhs_counter,
+    )
+    xin_propagated = progress_operation("Xin") do
+        CF.solve_factored_xin_to_match(
+            spectral,
+            lower_contour,
+            horizon_ingoing;
+            common_solve_options...,
+        )
+    end
+    xup_propagated = progress_operation("Xup") do
+        CF.solve_factored_xup_to_match(
+            spectral,
+            readout_contour,
+            infinity_outgoing;
+            common_solve_options...,
+        )
+    end
+    emit_factored_solution(xin_propagated)
+    emit_factored_solution(xup_propagated)
+    xin_match = CF.reconstruct_factored_match_state(
+        xin_propagated, spectral, lower_contour
+    )
+    xup_match = CF.reconstruct_factored_match_state(
+        xup_propagated, spectral, readout_contour
+    )
+    xin_match.radial_derivative_convention ==
+        CF.MATCH_RADIAL_DERIVATIVE_CONVENTION_ID ||
+        error("package returned an unexpected Xin match derivative convention")
+    xup_match.radial_derivative_convention ==
+        CF.MATCH_RADIAL_DERIVATIVE_CONVENTION_ID ||
+        error("package returned an unexpected Xup match derivative convention")
     perturbed_in = progress_operation("perturbed integration"; payload=Dict(
         "branch" => "Xin",
     )) do
@@ -1203,21 +1738,84 @@ function determinant(::Type{T}, request, omega::Complex{T}, amplitude::Complex{T
             T,
             request,
             omega,
-            lower_branches.lambda,
+            spectral.lambda,
             lower,
             readout,
-            lower_branches.xin,
+            Complex{T}[xin_match.X, xin_match.dX_drstar],
             amplitude;
             ode_leg="perturbed_Xin",
         )
     end
-    return progress_operation("Wronskian") do
-        wronskian(perturbed_in, readout_branches.xup)
+    value = progress_operation("Wronskian") do
+        wronskian(
+            perturbed_in,
+            Complex{T}[xup_match.X, xup_match.dX_drstar],
+        )
+    end
+    endpoint_summary = endpoint_conditioning_summary(
+        horizon_ingoing, infinity_outgoing
+    )
+    diagnostics = DeterminantDiagnostics{T}(
+        HOMOGENEOUS_REPRESENTATION_ID,
+        EXTERIOR_DETERMINANT_FAMILY_ID,
+        false,
+        endpoint_summary.maximum_series_digits_lost,
+        endpoint_summary.maximum_recurrence_digits_lost,
+        endpoint_summary.maximum_series_evaluation_spread,
+        endpoint_summary.maximum_last_term_ratio,
+        endpoint_summary.minimum_asymptotic_predicted_reliable_digits,
+        nothing,
+        nothing,
+        nothing,
+        endpoint_summary.endpoint_remainders_regular,
+        endpoint_summary.maximum_endpoint_reconstruction_error,
+        nothing,
+        abs(value),
+        nothing,
+        nothing,
+        spectral.contour_deformation.maximum_absolute,
+    )
+    record_determinant!(context.conditioning, diagnostics)
+    progress_emit("determinant_chart_evaluated"; payload=Dict(
+        "determinant_family" => EXTERIOR_DETERMINANT_FAMILY_ID,
+        "determinant_convention" =>
+            EXTERIOR_DETERMINANT_CONVENTION_ID,
+        "determinant_normalisation" =>
+            EXTERIOR_DETERMINANT_NORMALISATION_ID,
+        "normalised_determinant_abs" => string(abs(value)),
+    ))
+    return DeterminantEvaluation{T}(value, diagnostics)
+end
+
+function determinant(
+    ::Type{T},
+    request,
+    context::DeterminantRequestContext{T},
+    omega::Complex{T},
+    amplitude::Complex{T},
+) where {T<:AbstractFloat}
+    mechanism = string(required(request, "mechanism_id"))
+    mechanism in ALLOWED_MECHANISMS ||
+        error("unsupported mechanism_id $(repr(mechanism))")
+    try
+        if mechanism == "horizon-admittance"
+            return evaluate_horizon_determinant(
+                T, request, context, omega, amplitude
+            )
+        end
+        return evaluate_exterior_determinant(
+            T, request, context, omega, amplitude
+        )
+    catch failure
+        translated = translate_numerical_control_failure(request, failure)
+        translated === failure && rethrow()
+        throw(translated)
     end
 end
 
 function determinant_progress(
-    ::Type{T}, request, omega::Complex{T}, amplitude::Complex{T},
+    ::Type{T}, request, evaluation_context::DeterminantRequestContext{T},
+    omega::Complex{T}, amplitude::Complex{T},
     purpose::String, current::Complex{T},
 ) where {T<:AbstractFloat}
     started = time_ns()
@@ -1236,18 +1834,22 @@ function determinant_progress(
             "purpose" => purpose,
             "omega" => progress_complex(omega),
         ))
-        value = determinant(T, request, omega, amplitude)
+        evaluation = determinant(
+            T, request, evaluation_context, omega, amplitude
+        )
         elapsed_seconds = (time_ns() - started) / 1.0e9
         LAST_DETERMINANT_SECONDS[] = elapsed_seconds
         progress_emit("determinant_completed"; context=context, payload=Dict(
             "purpose" => purpose,
             "omega" => progress_complex(omega),
-            "determinant_real" => string(real(value)),
-            "determinant_imag" => string(imag(value)),
-            "determinant_abs" => string(abs(value)),
+            "determinant_real" => string(real(evaluation.value)),
+            "determinant_imag" => string(imag(evaluation.value)),
+            "determinant_abs" => string(abs(evaluation.value)),
+            "determinant_family" =>
+                evaluation.diagnostics.determinant_family,
             "elapsed_seconds" => elapsed_seconds,
         ))
-        return value
+        return evaluation
     end
 end
 
@@ -1291,18 +1893,460 @@ function enforce_root_readout_feasibility(request)
     ))
 end
 
-function bounded_newton(::Type{T}, request, initial::Complex{T}, amplitude::Complex{T}) where {T<:AbstractFloat}
+function validate_finite_difference_offset(
+    offset::Complex{T}; axis::String
+) where {T<:AbstractFloat}
+    axis in ("real", "imaginary") ||
+        throw(ArgumentError("finite-difference axis must be real or imaginary"))
+    all(isfinite, (real(offset), imag(offset))) ||
+        throw(ArgumentError("finite-difference offset must be finite"))
+    axis == "real" && !iszero(imag(offset)) &&
+        throw(ArgumentError("real finite-difference offset must be real"))
+    axis == "imaginary" && !iszero(real(offset)) &&
+        throw(ArgumentError("imaginary finite-difference offset must be imaginary"))
+    h = axis == "real" ? abs(real(offset)) : abs(imag(offset))
+    iszero(h) && throw(ArgumentError("finite-difference offset must be nonzero"))
+    isfinite(h) || throw(ArgumentError("finite-difference step must be finite"))
+    return h
+end
+
+function validated_frequency_step(
+    ::Type{T}, request
+) where {T<:AbstractFloat}
     frequency_step = parse_real(T, request, "frequency_step")
+    isfinite(frequency_step) && frequency_step > zero(T) &&
+        return frequency_step
+    throw(numerical_control_failure(
+        request,
+        "ALGEBRAIC_REPRESENTATION_SINGULAR",
+        "finite-difference frequency_step must be positive and finite",
+        Dict{String,Any}(
+            "reason" => "INVALID_FREQUENCY_STEP",
+            "range_status" => "invalid-frequency-step/v1",
+            "operation" => "finite-difference-request-policy/v1",
+            "axis" => "request-policy",
+            "h" => string(frequency_step),
+        );
+        retryable=false,
+    ))
+end
+
+function validate_finite_difference_inputs(
+    d_plus_value::Complex{T},
+    d_minus_value::Complex{T},
+    offset::Complex{T};
+    axis::String,
+) where {T<:AbstractFloat}
+    all(isfinite, (
+        real(d_plus_value),
+        imag(d_plus_value),
+        real(d_minus_value),
+        imag(d_minus_value),
+    )) || throw(ArgumentError("finite-difference inputs must be finite"))
+    return validate_finite_difference_offset(offset; axis=axis)
+end
+
+struct _FDScaledValue{T<:AbstractFloat}
+    fraction::T
+    exponent::BigInt
+end
+
+function _fd_normalized_scaled(
+    value::T, exponent::BigInt
+) where {T<:AbstractFloat}
+    iszero(value) && return _FDScaledValue{T}(zero(T), BigInt(0))
+    isfinite(value) || error("finite-difference scaled value is nonfinite")
+    fraction, adjustment = frexp(value)
+    return _FDScaledValue{T}(
+        fraction,
+        exponent + BigInt(adjustment),
+    )
+end
+
+function _fd_scaled_value(value::T) where {T<:AbstractFloat}
+    return _fd_normalized_scaled(value, BigInt(0))
+end
+
+function _fd_component_difference(
+    left::T, right::T
+) where {T<:AbstractFloat}
+    difference = left - right
+    if isfinite(difference)
+        return _fd_scaled_value(difference)
+    end
+    # An overflow here can only arise from subtracting finite, oppositely
+    # signed values.  Halving both operands is exact in binary arithmetic for
+    # this large-value case and retains the one missing power of two explicitly.
+    half_difference = left / T(2) - right / T(2)
+    isfinite(half_difference) ||
+        error("finite-difference component difference cannot be represented")
+    return _fd_normalized_scaled(half_difference, BigInt(1))
+end
+
+function _fd_scale_fraction_down(
+    value::_FDScaledValue{T}, common_exponent::BigInt
+) where {T<:AbstractFloat}
+    iszero(value.fraction) && return zero(T)
+    shift = value.exponent - common_exponent
+    shift > 0 && error("finite-difference scaling direction is invalid")
+    # Terms this far below the common exponent cannot affect a rounded T norm
+    # or positive sum.  Avoid passing an extreme BigFloat exponent through Int.
+    shift < -BigInt(precision(T) + 4) && return zero(T)
+    return ldexp(value.fraction, Int(shift))
+end
+
+
+function _fd_scaled_norm(
+    real_value::_FDScaledValue{T},
+    imaginary_value::_FDScaledValue{T},
+) where {T<:AbstractFloat}
+    iszero(real_value.fraction) && iszero(imaginary_value.fraction) &&
+        return _FDScaledValue{T}(zero(T), BigInt(0))
+    common_exponent = if iszero(real_value.fraction)
+        imaginary_value.exponent
+    elseif iszero(imaginary_value.fraction)
+        real_value.exponent
+    else
+        max(real_value.exponent, imaginary_value.exponent)
+    end
+    scaled_real = _fd_scale_fraction_down(real_value, common_exponent)
+    scaled_imaginary = _fd_scale_fraction_down(
+        imaginary_value, common_exponent
+    )
+    return _fd_normalized_scaled(
+        hypot(scaled_real, scaled_imaginary),
+        common_exponent,
+    )
+end
+
+function _fd_scaled_norm(value::Complex{T}) where {T<:AbstractFloat}
+    return _fd_scaled_norm(
+        _fd_scaled_value(real(value)),
+        _fd_scaled_value(imag(value)),
+    )
+end
+
+function _fd_scaled_sum(
+    left::_FDScaledValue{T}, right::_FDScaledValue{T}
+) where {T<:AbstractFloat}
+    iszero(left.fraction) && return right
+    iszero(right.fraction) && return left
+    common_exponent = max(left.exponent, right.exponent)
+    return _fd_normalized_scaled(
+        _fd_scale_fraction_down(left, common_exponent) +
+            _fd_scale_fraction_down(right, common_exponent),
+        common_exponent,
+    )
+end
+
+function _fd_scaled_ratio(
+    numerator::_FDScaledValue{T}, denominator::_FDScaledValue{T}
+) where {T<:AbstractFloat}
+    iszero(denominator.fraction) &&
+        throw(ArgumentError("finite-difference scaled denominator is zero"))
+    return _fd_normalized_scaled(
+        numerator.fraction / denominator.fraction,
+        numerator.exponent - denominator.exponent,
+    )
+end
+
+function _fd_materialize_clamped(
+    value::_FDScaledValue{T}
+) where {T<:AbstractFloat}
+    iszero(value.fraction) && return zero(T), false, false
+    maximum_fraction, maximum_exponent = frexp(floatmax(T))
+    magnitude_fraction = abs(value.fraction)
+    maximum_exponent_big = BigInt(maximum_exponent)
+    if value.exponent > maximum_exponent_big ||
+            (value.exponent == maximum_exponent_big &&
+             magnitude_fraction > maximum_fraction)
+        clamped = signbit(value.fraction) ? -floatmax(T) : floatmax(T)
+        return clamped, true, false
+    end
+    value.exponent < BigInt(typemin(Int)) && return zero(T), false, true
+    materialized = ldexp(value.fraction, Int(value.exponent))
+    isfinite(materialized) ||
+        error("finite-difference scaled materialization is nonfinite")
+    underflowed = iszero(materialized) && !iszero(value.fraction)
+    return materialized, false, underflowed
+end
+
+function _fd_materialize_derivative(
+    value::_FDScaledValue{T}
+) where {T<:AbstractFloat}
+    materialized, saturated, underflowed = _fd_materialize_clamped(value)
+    saturated && throw(FiniteDifferenceRangeError(
+        "finite-difference derivative exceeds the arithmetic range",
+        "derivative-overflow/v1",
+    ))
+    underflowed && throw(FiniteDifferenceRangeError(
+        "finite-difference derivative underflows the arithmetic range",
+        "derivative-underflow/v1",
+    ))
+    return materialized
+end
+
+function _fd_derivative_component(
+    difference::_FDScaledValue{T},
+    orientation::T,
+    h::_FDScaledValue{T},
+) where {T<:AbstractFloat}
+    iszero(difference.fraction) && return zero(T)
+    scaled = _fd_normalized_scaled(
+        difference.fraction * orientation / (T(2) * h.fraction),
+        difference.exponent - h.exponent,
+    )
+    return _fd_materialize_derivative(scaled)
+end
+
+function build_finite_difference_diagnostics(
+    d_plus_value::Complex{T},
+    d_minus_value::Complex{T},
+    offset::Complex{T};
+    axis::String,
+) where {T<:AbstractFloat}
+    h = validate_finite_difference_inputs(
+        d_plus_value, d_minus_value, offset; axis=axis
+    )
+
+    plus_norm = _fd_scaled_norm(d_plus_value)
+    minus_norm = _fd_scaled_norm(d_minus_value)
+    real_difference = _fd_component_difference(
+        real(d_plus_value), real(d_minus_value)
+    )
+    imaginary_difference = _fd_component_difference(
+        imag(d_plus_value), imag(d_minus_value)
+    )
+    difference_norm = _fd_scaled_norm(
+        real_difference, imaginary_difference
+    )
+    numerator_norm = _fd_scaled_sum(plus_norm, minus_norm)
+
+    d_plus_abs, d_plus_abs_saturated, d_plus_abs_underflowed =
+        _fd_materialize_clamped(plus_norm)
+    d_minus_abs, d_minus_abs_saturated, d_minus_abs_underflowed =
+        _fd_materialize_clamped(minus_norm)
+    difference_abs, difference_abs_saturated, difference_abs_underflowed =
+        _fd_materialize_clamped(difference_norm)
+
+    kappa_is_infinite = iszero(difference_norm.fraction) &&
+        !iszero(numerator_norm.fraction)
+    kappa_is_indeterminate = iszero(difference_norm.fraction) &&
+        iszero(numerator_norm.fraction)
+    kappa, kappa_saturated, kappa_underflowed = if (
+        kappa_is_infinite || kappa_is_indeterminate
+    )
+        floatmax(T), true, false
+    else
+        value, saturated, underflowed = _fd_materialize_clamped(
+            _fd_scaled_ratio(numerator_norm, difference_norm)
+        )
+        max(one(T), value), saturated, underflowed
+    end
+    kappa_underflowed && error(
+        "finite-difference cancellation ratio underflowed below its unit lower bound"
+    )
+    finite_difference_digits_lost = log10(kappa)
+
+    offset_sign = axis == "real" ? sign(real(offset)) : sign(imag(offset))
+    derivative_real_difference = axis == "real" ?
+        real_difference : imaginary_difference
+    derivative_imaginary_difference = axis == "real" ?
+        imaginary_difference : real_difference
+    derivative_real_orientation = offset_sign
+    derivative_imaginary_orientation = axis == "real" ?
+        offset_sign : -offset_sign
+    h_scaled = _fd_scaled_value(h)
+    derivative = complex(
+        _fd_derivative_component(
+            derivative_real_difference,
+            derivative_real_orientation,
+            h_scaled,
+        ),
+        _fd_derivative_component(
+            derivative_imaginary_difference,
+            derivative_imaginary_orientation,
+            h_scaled,
+        ),
+    )
+    all(isfinite, (real(derivative), imag(derivative))) ||
+        error("finite-difference derivative is nonfinite")
+    derivative_abs, derivative_abs_saturated, derivative_abs_underflowed =
+        _fd_materialize_clamped(
+            _fd_scaled_norm(derivative)
+        )
+
+    underflow_observed = any((
+        d_plus_abs_underflowed,
+        d_minus_abs_underflowed,
+        difference_abs_underflowed,
+        kappa_underflowed,
+        derivative_abs_underflowed,
+    ))
+    saturation_observed = any((
+        d_plus_abs_saturated,
+        d_minus_abs_saturated,
+        difference_abs_saturated,
+        kappa_saturated,
+        derivative_abs_saturated,
+    )) || underflow_observed
+    saturation_status = if kappa_is_infinite
+        "kappa-infinite-lower-bound/v1"
+    elseif kappa_is_indeterminate
+        "kappa-indeterminate-lower-bound/v1"
+    elseif kappa_saturated
+        "kappa-clamped-lower-bound/v1"
+    elseif underflow_observed
+        "magnitude-underflowed/v1"
+    elseif saturation_observed
+        "magnitude-clamped/v1"
+    else
+        "none/v1"
+    end
+    diagnostics = FiniteDifferenceDiagnostics{T}(
+        d_plus_abs,
+        d_minus_abs,
+        difference_abs,
+        kappa,
+        finite_difference_digits_lost,
+        derivative_abs,
+        h,
+        axis,
+        d_plus_abs_saturated,
+        d_plus_abs_underflowed,
+        d_minus_abs_saturated,
+        d_minus_abs_underflowed,
+        difference_abs_saturated,
+        difference_abs_underflowed,
+        kappa_saturated,
+        kappa_underflowed,
+        kappa_is_infinite,
+        kappa_is_indeterminate,
+        derivative_abs_saturated,
+        derivative_abs_underflowed,
+        underflow_observed,
+        saturation_observed,
+        saturation_status,
+    )
+    all(isfinite, (
+        diagnostics.d_plus_abs,
+        diagnostics.d_minus_abs,
+        diagnostics.difference_abs,
+        diagnostics.kappa,
+        diagnostics.finite_difference_digits_lost,
+        diagnostics.derivative_abs,
+        diagnostics.h,
+    )) || error("finite-difference conditioning evidence is nonfinite")
+    return derivative, diagnostics
+end
+
+function finite_difference_pair(
+    ::Type{T},
+    request,
+    evaluation_context::DeterminantRequestContext{T},
+    omega::Complex{T},
+    amplitude::Complex{T},
+    offset::Complex{T},
+    label::String,
+    current::Complex{T};
+    axis::String,
+) where {T<:AbstractFloat}
+    # Reject malformed stencils before either expensive determinant/ODE sample.
+    h = validate_finite_difference_offset(offset; axis=axis)
+    d_plus = determinant_progress(
+        T,
+        request,
+        evaluation_context,
+        omega + offset,
+        amplitude,
+        "$(label) +",
+        current,
+    )
+    d_minus = determinant_progress(
+        T,
+        request,
+        evaluation_context,
+        omega - offset,
+        amplitude,
+        "$(label) -",
+        current,
+    )
+    derivative, diagnostics = try
+        build_finite_difference_diagnostics(
+            d_plus.value,
+            d_minus.value,
+            offset;
+            axis=axis,
+        )
+    catch failure
+        failure isa FiniteDifferenceRangeError || rethrow()
+        translated = translate_numerical_control_failure(
+            request,
+            failure;
+            finite_difference_axis=axis,
+            finite_difference_h=h,
+        )
+        translated === failure && rethrow()
+        throw(translated)
+    end
+    record_finite_difference!(evaluation_context.conditioning, diagnostics)
+    progress_emit("conditioning_evaluated"; payload=Dict(
+        "estimate_kind" => "finite-difference-cancellation/not-a-bound/v1",
+        "axis" => diagnostics.axis,
+        "h" => string(diagnostics.h),
+        "d_plus_abs" => string(diagnostics.d_plus_abs),
+        "d_minus_abs" => string(diagnostics.d_minus_abs),
+        "difference_abs" => string(diagnostics.difference_abs),
+        "kappa_fd" => string(diagnostics.kappa),
+        "finite_difference_digits_lost" =>
+            string(diagnostics.finite_difference_digits_lost),
+        "derivative_abs" => string(diagnostics.derivative_abs),
+        "d_plus_abs_saturated" => diagnostics.d_plus_abs_saturated,
+        "d_plus_abs_underflowed" => diagnostics.d_plus_abs_underflowed,
+        "d_minus_abs_saturated" => diagnostics.d_minus_abs_saturated,
+        "d_minus_abs_underflowed" => diagnostics.d_minus_abs_underflowed,
+        "difference_abs_saturated" => diagnostics.difference_abs_saturated,
+        "difference_abs_underflowed" =>
+            diagnostics.difference_abs_underflowed,
+        "kappa_saturated" => diagnostics.kappa_saturated,
+        "kappa_underflowed" => diagnostics.kappa_underflowed,
+        "kappa_is_infinite" => diagnostics.kappa_is_infinite,
+        "kappa_is_indeterminate" => diagnostics.kappa_is_indeterminate,
+        "derivative_abs_saturated" => diagnostics.derivative_abs_saturated,
+        "derivative_abs_underflowed" =>
+            diagnostics.derivative_abs_underflowed,
+        "underflow_observed" => diagnostics.underflow_observed,
+        "saturation_observed" => diagnostics.saturation_observed,
+        "saturation_status" => diagnostics.saturation_status,
+    ))
+    return derivative, diagnostics
+end
+
+function bounded_newton(
+    ::Type{T},
+    request,
+    evaluation_context::DeterminantRequestContext{T},
+    initial::Complex{T},
+    amplitude::Complex{T},
+) where {T<:AbstractFloat}
+    frequency_step = validated_frequency_step(T, request)
     tolerance = parse_real(T, request, "root_correction_tolerance")
     maximum_iterations = parse_integer(request, "max_newton_iterations")
     value = initial
     best_value = value
     ACTIVE_NEWTON_INDEX[] = 1
     initial_determinant = determinant_progress(
-        T, request, value, amplitude, "initial best", value
+        T,
+        request,
+        evaluation_context,
+        value,
+        amplitude,
+        "initial best",
+        value,
     )
     enforce_root_readout_feasibility(request)
-    best_residual = abs(initial_determinant)
+    best_residual = abs(initial_determinant.value)
+    best_evaluation = initial_determinant
     # The first iteration evaluates the determinant at the initial frequency,
     # which is exactly the value just computed above.  The determinant is a
     # deterministic function of the frequency and the request controls, so carry
@@ -1318,11 +2362,20 @@ function bounded_newton(::Type{T}, request, initial::Complex{T}, amplitude::Comp
             carried_available = false
             carried_residual
         else
-            determinant_progress(T, request, value, amplitude, "residual", value)
+            determinant_progress(
+                T,
+                request,
+                evaluation_context,
+                value,
+                amplitude,
+                "residual",
+                value,
+            )
         end
-        magnitude = abs(residual)
+        magnitude = abs(residual.value)
         if magnitude < best_residual
             best_value, best_residual = value, magnitude
+            best_evaluation = residual
         end
         newton_context = Dict{String,Any}(
             "newton_index" => iteration,
@@ -1337,10 +2390,17 @@ function bounded_newton(::Type{T}, request, initial::Complex{T}, amplitude::Comp
             "acceptance_threshold" => string(tolerance),
         ))
         h = frequency_step * (one(T) + abs(value))
-        derivative = (
-            determinant_progress(T, request, value + h, amplitude, "derivative +h", value) -
-            determinant_progress(T, request, value - h, amplitude, "derivative -h", value)
-        ) / (T(2) * h)
+        derivative, _ = finite_difference_pair(
+            T,
+            request,
+            evaluation_context,
+            value,
+            amplitude,
+            Complex{T}(h, zero(T)),
+            "derivative h",
+            value;
+            axis="real",
+        )
         derivative_abs = abs(derivative)
         if !isfinite(derivative_abs) || iszero(derivative)
             progress_emit("newton_iteration_completed"; context=newton_context, payload=Dict(
@@ -1357,7 +2417,7 @@ function bounded_newton(::Type{T}, request, initial::Complex{T}, amplitude::Comp
             ))
             break
         end
-        raw_step = residual / derivative
+        raw_step = residual.value / derivative
         correction_abs = magnitude / derivative_abs
         if correction_abs <= tolerance
             progress_emit("newton_iteration_completed"; context=newton_context, payload=Dict(
@@ -1373,7 +2433,7 @@ function bounded_newton(::Type{T}, request, initial::Complex{T}, amplitude::Comp
                 "resulting_determinant_abs" => string(magnitude),
                 "elapsed_seconds" => (time_ns() - iteration_started) / 1.0e9,
             ))
-            return value, magnitude, derivative, true
+            return value, magnitude, derivative, true, residual
         end
         step = raw_step
         maximum_step = parse(T, "0.006")
@@ -1387,9 +2447,15 @@ function bounded_newton(::Type{T}, request, initial::Complex{T}, amplitude::Comp
         )
             candidate = value - damping * step
             candidate_residual = determinant_progress(
-                T, request, candidate, amplitude, "damping $(damping)", value
+                T,
+                request,
+                evaluation_context,
+                candidate,
+                amplitude,
+                "damping $(damping)",
+                value,
             )
-            candidate_abs = abs(candidate_residual)
+            candidate_abs = abs(candidate_residual.value)
             decision_context = merge(
                 newton_context,
                 Dict{String,Any}("candidate_omega" => progress_complex(candidate)),
@@ -1410,6 +2476,7 @@ function bounded_newton(::Type{T}, request, initial::Complex{T}, amplitude::Comp
                 resulting_abs = candidate_abs
                 if candidate_abs < best_residual
                     best_value, best_residual = candidate, candidate_abs
+                    best_evaluation = candidate_residual
                 end
                 break
             end
@@ -1434,43 +2501,75 @@ function bounded_newton(::Type{T}, request, initial::Complex{T}, amplitude::Comp
         ))
         !accepted && break
     end
-    return best_value, best_residual, nothing, false
+    return best_value, best_residual, nothing, false, best_evaluation
 end
 
 numeric_text(value) = string(value)
 
 function final_derivative(
-    ::Type{T}, request, root::Complex{T}, amplitude::Complex{T},
+    ::Type{T}, request,
+    evaluation_context::DeterminantRequestContext{T},
+    root::Complex{T}, amplitude::Complex{T},
     offset::Complex{T}, label::String,
 ) where {T<:AbstractFloat}
-    return (
-        determinant_progress(
-            T, request, root + offset, amplitude, "$(label) +", root
-        ) -
-        determinant_progress(
-            T, request, root - offset, amplitude, "$(label) -", root
-        )
-    ) / (T(2) * offset)
+    axis = iszero(imag(offset)) ? "real" : "imaginary"
+    derivative, _ = finite_difference_pair(
+        T,
+        request,
+        evaluation_context,
+        root,
+        amplitude,
+        offset,
+        label,
+        root;
+        axis=axis,
+    )
+    return derivative
 end
 
-function solve_once(::Type{T}, request, initial::Complex{T}, amplitude::Complex{T}) where {T<:AbstractFloat}
-    root, residual, accepted_derivative, newton_converged =
-        bounded_newton(T, request, initial, amplitude)
+function solve_once(
+    ::Type{T},
+    request,
+    evaluation_context::DeterminantRequestContext{T},
+    initial::Complex{T},
+    amplitude::Complex{T},
+) where {T<:AbstractFloat}
+    root, residual, accepted_derivative, newton_converged, root_evaluation =
+        bounded_newton(T, request, evaluation_context, initial, amplitude)
     h = parse_real(T, request, "frequency_step") * (one(T) + abs(root))
     real_offset = Complex{T}(h, zero(T))
     derivative_real_base = isnothing(accepted_derivative) ?
         final_derivative(
-            T, request, root, amplitude, real_offset, "final derivative h"
+            T,
+            request,
+            evaluation_context,
+            root,
+            amplitude,
+            real_offset,
+            "final derivative h",
         ) : accepted_derivative
     derivative_real_half = final_derivative(
-        T, request, root, amplitude, real_offset / T(2), "final derivative h/2"
+        T,
+        request,
+        evaluation_context,
+        root,
+        amplitude,
+        real_offset / T(2),
+        "final derivative h/2",
     )
     derivative_real_double = final_derivative(
-        T, request, root, amplitude, T(2) * real_offset, "final derivative 2h"
+        T,
+        request,
+        evaluation_context,
+        root,
+        amplitude,
+        T(2) * real_offset,
+        "final derivative 2h",
     )
     derivative_imaginary = final_derivative(
         T,
         request,
+        evaluation_context,
         root,
         amplitude,
         Complex{T}(zero(T), h),
@@ -1519,11 +2618,13 @@ function solve_once(::Type{T}, request, initial::Complex{T}, amplitude::Complex{
         "correction_upper_bound" => string(correction_upper_bound),
         "accepted" => converged,
     ))
-    return root, residual, derivative_lower_bound_abs, converged
+    return root, residual, derivative_lower_bound_abs, converged, root_evaluation
 end
 
 function solve_phase(
-    ::Type{T}, request, phase::String, initial::Complex{T}, amplitude::Complex{T};
+    ::Type{T}, request,
+    evaluation_context::DeterminantRequestContext{T},
+    phase::String, initial::Complex{T}, amplitude::Complex{T};
     seed_kind="AUTHENTICATED_BACKGROUND",
     requested_seed_kind=seed_kind,
     fallback_initial=nothing,
@@ -1560,7 +2661,9 @@ function solve_phase(
                 "fallback_reason" => reason,
                 "fallback_error_type" => error_type,
             ))
-            solve_once(T, request, selected_initial, amplitude)
+            solve_once(
+                T, request, evaluation_context, selected_initial, amplitude
+            )
         end
     end
 
@@ -1648,9 +2751,148 @@ function refined_request(::Type{T}, request, kind::Symbol) where {T<:AbstractFlo
     return output
 end
 
+function conditioning_response(
+    ::Type{T},
+    request,
+    context::DeterminantRequestContext{T},
+    digits::Int,
+) where {T<:AbstractFloat}
+    accumulator = context.conditioning
+    accumulator.determinant_count > 0 ||
+        error("conditioning response requires at least one determinant")
+    minimum_asymptotic =
+        accumulator.minimum_asymptotic_predicted_reliable_digits
+    minimum_asymptotic === nothing &&
+        error("conditioning response lacks asymptotic preflight evidence")
+    horizon = string(required(request, "mechanism_id")) ==
+        "horizon-admittance"
+    basis_digits_lost = if horizon
+        basis_condition = accumulator.maximum_basis_condition
+        basis_condition === nothing &&
+            error("horizon conditioning lacks a basis condition")
+        log10(max(one(T), basis_condition))
+    else
+        zero(T)
+    end
+    horizon_fields = (
+        maximum_basis_condition=accumulator.maximum_basis_condition,
+        maximum_basis_backward_error=
+            accumulator.maximum_basis_backward_error,
+        maximum_matching_reconstruction_residual=
+            accumulator.maximum_matching_reconstruction_residual,
+        minimum_cref_chart_margin=accumulator.minimum_cref_chart_margin,
+        maximum_carrier_change_error=
+            accumulator.maximum_carrier_change_error,
+    )
+    if horizon
+        for (field, value) in pairs(horizon_fields)
+            value === nothing && error(
+                "horizon conditioning lacks $(String(field))"
+            )
+            isfinite(value) && value >= zero(T) || error(
+                "horizon conditioning has invalid $(String(field))"
+            )
+        end
+    else
+        all(isnothing, values(horizon_fields)) || error(
+            "exterior conditioning contains horizon-only evidence"
+        )
+    end
+    effective_digits_lost = max(
+        accumulator.maximum_series_digits_lost,
+        accumulator.maximum_recurrence_digits_lost,
+        accumulator.maximum_fd_digits_lost,
+        basis_digits_lost,
+    )
+    predicted_reliable_digits = min(
+        T(digits) - effective_digits_lost -
+            T(RELIABLE_DIGIT_SAFETY_MARGIN),
+        minimum_asymptotic,
+    )
+    required_digits = required_reliable_digits(T, request)
+    precision_limited = predicted_reliable_digits < required_digits
+    evidence = Dict{String,Any}(
+        "schema" => CONDITIONING_SCHEMA,
+        "determinant_family" => horizon ?
+            HORIZON_DETERMINANT_FAMILY_ID :
+            EXTERIOR_DETERMINANT_FAMILY_ID,
+        "scattering_diagnostics_applicable" => horizon,
+        "homogeneous_representation" => HOMOGENEOUS_REPRESENTATION_ID,
+        "branch_convention" => BRANCH_CONVENTION_ID,
+        "scattering_column_convention" => horizon ?
+            SCATTERING_COLUMN_CONVENTION_ID : nothing,
+        "radial_derivative_convention" =>
+            RADIAL_DERIVATIVE_CONVENTION_ID,
+        "determinant_convention" => horizon ?
+            HORIZON_DETERMINANT_CONVENTION_ID :
+            EXTERIOR_DETERMINANT_CONVENTION_ID,
+        "determinant_normalisation" => horizon ?
+            HORIZON_DETERMINANT_NORMALISATION_ID :
+            EXTERIOR_DETERMINANT_NORMALISATION_ID,
+        "regular_remainder_contract" => REGULAR_REMAINDER_CONTRACT_ID,
+        "factored_remainder_state_convention" =>
+            FACTORED_REMAINDER_STATE_CONVENTION_ID,
+        "maximum_series_digits_lost" =>
+            string(accumulator.maximum_series_digits_lost),
+        "maximum_recurrence_digits_lost" =>
+            string(accumulator.maximum_recurrence_digits_lost),
+        "maximum_series_evaluation_spread" =>
+            string(accumulator.maximum_series_evaluation_spread),
+        "maximum_last_term_ratio" =>
+            string(accumulator.maximum_last_term_ratio),
+        "minimum_asymptotic_predicted_reliable_digits" =>
+            string(minimum_asymptotic),
+        "maximum_basis_condition" => horizon ?
+            string(accumulator.maximum_basis_condition) : nothing,
+        "maximum_basis_backward_error" => horizon ?
+            string(accumulator.maximum_basis_backward_error) : nothing,
+        "maximum_matching_reconstruction_residual" => horizon ?
+            string(accumulator.maximum_matching_reconstruction_residual) :
+            nothing,
+        "endpoint_remainders_regular" =>
+            accumulator.endpoint_remainders_regular,
+        "maximum_endpoint_reconstruction_error" =>
+            string(accumulator.maximum_endpoint_reconstruction_error),
+        "maximum_fd_digits_lost" =>
+            string(accumulator.maximum_fd_digits_lost),
+        "predicted_reliable_digits" => string(predicted_reliable_digits),
+        "required_reliable_digits" => string(required_digits),
+        "precision_limited" => precision_limited,
+        "asymptotic_preflight_avoided_ode" => false,
+        "minimum_cref_chart_margin" => horizon ?
+            string(accumulator.minimum_cref_chart_margin) : nothing,
+        "maximum_carrier_change_error" => horizon ?
+            string(accumulator.maximum_carrier_change_error) : nothing,
+        "maximum_contour_angle_deformation" =>
+            string(accumulator.maximum_contour_angle_deformation),
+    )
+    progress_emit("conditioning_evaluated"; payload=Dict(
+        "estimate_kind" => "empirical-conditioning/not-a-bound/v1",
+        "determinant_family" => evidence["determinant_family"],
+        "maximum_series_digits_lost" =>
+            evidence["maximum_series_digits_lost"],
+        "maximum_recurrence_digits_lost" =>
+            evidence["maximum_recurrence_digits_lost"],
+        "maximum_fd_digits_lost" => evidence["maximum_fd_digits_lost"],
+        "finite_difference_saturation_observed" =>
+            accumulator.finite_difference_saturation_observed,
+        "finite_difference_underflow_observed" =>
+            accumulator.finite_difference_underflow_observed,
+        "predicted_reliable_digits" =>
+            evidence["predicted_reliable_digits"],
+        "required_reliable_digits" =>
+            evidence["required_reliable_digits"],
+        "precision_limited" => precision_limited,
+    ))
+    return evidence
+end
+
 function result_fields(::Type{T}, request, digits::Int, bits::Int) where {T<:AbstractFloat}
     omega = parse_complex(T, request, "omega_re", "omega_im")
     amplitude = parse_complex(T, request, "amplitude_re", "amplitude_im")
+    evaluation_context = build_determinant_request_context(
+        T, request, omega
+    )
 
     primary_initial = omega
     fallback_initial = nothing
@@ -1685,9 +2927,14 @@ function result_fields(::Type{T}, request, digits::Int, bits::Int) where {T<:Abs
             end
         end
     end
-    root, residual, derivative_abs, primary_converged =
+    root, residual, derivative_abs, primary_converged, root_evaluation =
         solve_phase(
-            T, request, "PRIMARY", primary_initial, amplitude;
+            T,
+            request,
+            evaluation_context,
+            "PRIMARY",
+            primary_initial,
+            amplitude;
             seed_kind=primary_seed_kind,
             requested_seed_kind=primary_requested_seed_kind,
             fallback_initial=fallback_initial,
@@ -1695,10 +2942,22 @@ function result_fields(::Type{T}, request, digits::Int, bits::Int) where {T<:Abs
             fallback_reason=primary_fallback_reason,
         )
     branch_tolerance = parse_real(T, request, "branch_enclosure_radius_abs")
+    raw_determinant_abs = root_evaluation.diagnostics.raw_determinant_abs
+    horizon = string(required(request, "mechanism_id")) ==
+        "horizon-admittance"
+    horizon == (raw_determinant_abs !== nothing) ||
+        error("root determinant raw-magnitude applicability is inconsistent")
+    raw_determinant_abs === nothing ||
+        (isfinite(raw_determinant_abs) &&
+         raw_determinant_abs >= zero(T)) ||
+        error("root raw determinant magnitude is invalid")
     if !primary_converged
+        numerical_conditioning = conditioning_response(
+            T, request, evaluation_context, digits
+        )
         branch_valid = abs(root - omega) <= branch_tolerance
         return [
-            "schema_version" => 1,
+            "schema_version" => 2,
             "status" => "ok",
             "adapter" => "package-owned-julia-gsn-root-readout",
             "request_sha256" => string(required(request, "request_sha256")),
@@ -1707,6 +2966,8 @@ function result_fields(::Type{T}, request, digits::Int, bits::Int) where {T<:Abs
             "root_omega_re" => numeric_text(real(root)),
             "root_omega_im" => numeric_text(imag(root)),
             "root_residual_abs" => numeric_text(residual),
+            "raw_determinant_abs" => raw_determinant_abs === nothing ?
+                nothing : numeric_text(raw_determinant_abs),
             "root_derivative_abs" => numeric_text(derivative_abs),
             "root_converged" => false,
             "branch_authentication_contract_version" => 3,
@@ -1718,21 +2979,40 @@ function result_fields(::Type{T}, request, digits::Int, bits::Int) where {T<:Abs
             "seed_path_radius_abs" => nothing,
             "diagnostic_roots" => Dict{String,Any}(),
             "diagnostics_skipped_reason" => "PRIMARY_NOT_CONVERGED",
+            "numerical_conditioning" => numerical_conditioning,
         ]
     end
-    truncation_root, truncation_residual, truncation_derivative, truncation_converged = solve_phase(
-        T, refined_request(T, request, :truncation), "TRUNCATION", root, amplitude;
+    truncation_root, truncation_residual, truncation_derivative,
+        truncation_converged, _ = solve_phase(
+        T,
+        refined_request(T, request, :truncation),
+        evaluation_context,
+        "TRUNCATION",
+        root,
+        amplitude;
         seed_kind="ACCEPTED_PRIMARY",
     )
-    resolution_root, resolution_residual, resolution_derivative, resolution_converged = solve_phase(
-        T, refined_request(T, request, :resolution), "RESOLUTION", root, amplitude;
+    resolution_root, resolution_residual, resolution_derivative,
+        resolution_converged, _ = solve_phase(
+        T,
+        refined_request(T, request, :resolution),
+        evaluation_context,
+        "RESOLUTION",
+        root,
+        amplitude;
         seed_kind="ACCEPTED_PRIMARY",
     )
     alternate = omega + Complex{T}(T("0.00025"), T("0.000125")) *
         (one(T) + abs(omega))
-    seed_path_root, seed_path_residual, seed_path_derivative, seed_path_converged =
+    seed_path_root, seed_path_residual, seed_path_derivative,
+        seed_path_converged, _ =
         solve_phase(
-            T, request, "SEED-PATH", alternate, amplitude;
+            T,
+            request,
+            evaluation_context,
+            "SEED-PATH",
+            alternate,
+            amplitude;
             seed_kind="INDEPENDENT_SEED_PATH",
         )
     branch_valid = abs(root - omega) <= branch_tolerance && all(
@@ -1746,9 +3026,12 @@ function result_fields(::Type{T}, request, digits::Int, bits::Int) where {T<:Abs
         seed_path_converged,
         branch_valid,
     ))
+    numerical_conditioning = conditioning_response(
+        T, request, evaluation_context, digits
+    )
 
     return [
-        "schema_version" => 1,
+        "schema_version" => 2,
         "status" => "ok",
         "adapter" => "package-owned-julia-gsn-root-readout",
         "request_sha256" => string(required(request, "request_sha256")),
@@ -1757,6 +3040,8 @@ function result_fields(::Type{T}, request, digits::Int, bits::Int) where {T<:Abs
         "root_omega_re" => numeric_text(real(root)),
         "root_omega_im" => numeric_text(imag(root)),
         "root_residual_abs" => numeric_text(residual),
+        "raw_determinant_abs" => raw_determinant_abs === nothing ?
+            nothing : numeric_text(raw_determinant_abs),
         "root_derivative_abs" => numeric_text(derivative_abs),
         "root_converged" => converged,
         "branch_authentication_contract_version" => 3,
@@ -1790,6 +3075,7 @@ function result_fields(::Type{T}, request, digits::Int, bits::Int) where {T<:Abs
             ),
         ),
         "diagnostics_skipped_reason" => nothing,
+        "numerical_conditioning" => numerical_conditioning,
     ]
 end
 
@@ -1802,6 +3088,7 @@ function evaluate_request(request)
     bits = ceil(Int, digits * log2(10)) + 32
     parse_integer(request, "working_precision_bits") == bits ||
         error("working precision bits do not match decimal precision policy")
+    validate_regularised_gsn_policy(request)
     string(required(request, "resource_policy_schema")) ==
         "windows-solver.execution-resource-policy/1" ||
         error("execution resource policy schema is invalid")
@@ -1894,4 +3181,6 @@ function main()
     end
 end
 
-exit(main())
+if abspath(PROGRAM_FILE) == abspath(@__FILE__)
+    exit(main())
+end

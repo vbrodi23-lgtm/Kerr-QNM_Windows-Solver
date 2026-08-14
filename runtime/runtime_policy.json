@@ -23,11 +23,47 @@
     "executable_relative_path": "julia/bin/julia.exe",
     "required_by": "M02 package-owned GSN F/U cache production and 80/120-digit promoted root readouts"
   },
+  "scientific_result_identity": {
+    "homogeneous_representation": "factored-plane-wave-gsn/v1",
+    "asymptotic_series_evaluation": "typed-batch-horner-compensated/v1",
+    "conditioning_diagnostics": "series-recurrence-basis-fd/v1",
+    "reliable_digit_safety_margin": "8",
+    "required_digit_guard": "6",
+    "branch_convention": "gsn-complex-rho/v1",
+    "radial_derivative_convention": "state2=dX/drho/v1",
+    "regular_remainder_contract": "known-carrier-times-regular-remainder/v1",
+    "factored_remainder_state_convention": "state1=Y;state2=dY/drho/v1",
+    "determinant_families": {
+      "horizon-scattering/v1": {
+        "scattering_diagnostics_applicable": true,
+        "scattering_coefficient_extraction": "scaled-factored-horizon-basis/v1",
+        "horizon_determinant_chart": "cinc-over-cref-minus-reflectivity/v1",
+        "scattering_chart_safety_factor": "64",
+        "scattering_column_convention": "column1=horizon-ingoing-Cref;column2=horizon-outgoing-Cinc/v1",
+        "determinant_convention": "cinc-over-cref-minus-R/v1",
+        "determinant_normalisation": "cinc-over-cref-minus-reflectivity/v1"
+      },
+      "exterior-wronskian/v1": {
+        "scattering_diagnostics_applicable": false,
+        "scattering_coefficient_extraction": null,
+        "horizon_determinant_chart": null,
+        "scattering_chart_safety_factor": null,
+        "scattering_column_convention": null,
+        "determinant_convention": "wronskian-perturbed-Xin-with-Xup/v1",
+        "determinant_normalisation": "unit-asymptotic-branch-wronskian/v1"
+      }
+    }
+  },
   "scientific_sources": [
     {
       "id": "gsn-kerr",
       "lifecycle": "gsn-cache",
       "path": "src/windows_solver/data/julia/GeneralizedSasakiNakamura.jl/src/Homogeneous/Kerr.jl"
+    },
+    {
+      "id": "gsn-coordinates",
+      "lifecycle": "dependency",
+      "path": "src/windows_solver/data/julia/GeneralizedSasakiNakamura.jl/src/Homogeneous/Coordinates.jl"
     },
     {
       "id": "gsn-potentials",
@@ -38,6 +74,31 @@
       "id": "m02-julia-worker",
       "lifecycle": "worker",
       "path": "src/windows_solver/data/julia/m02_worker.jl"
+    },
+    {
+      "id": "gsn-factored-solutions",
+      "lifecycle": "dependency",
+      "path": "src/windows_solver/data/julia/GeneralizedSasakiNakamura.jl/src/Homogeneous/FactoredSolutions.jl"
+    },
+    {
+      "id": "gsn-complex-frequencies",
+      "lifecycle": "dependency",
+      "path": "src/windows_solver/data/julia/GeneralizedSasakiNakamura.jl/src/Homogeneous/ComplexFrequencies.jl"
+    },
+    {
+      "id": "gsn-initial-conditions",
+      "lifecycle": "dependency",
+      "path": "src/windows_solver/data/julia/GeneralizedSasakiNakamura.jl/src/Homogeneous/InitialConditions.jl"
+    },
+    {
+      "id": "gsn-asymptotic-expansion-coefficients",
+      "lifecycle": "dependency",
+      "path": "src/windows_solver/data/julia/GeneralizedSasakiNakamura.jl/src/Homogeneous/AsymptoticExpansionCoefficients.jl"
+    },
+    {
+      "id": "gsn-solutions",
+      "lifecycle": "dependency",
+      "path": "src/windows_solver/data/julia/GeneralizedSasakiNakamura.jl/src/Homogeneous/Solutions.jl"
     },
     {
       "id": "gsn-cache-producer",
