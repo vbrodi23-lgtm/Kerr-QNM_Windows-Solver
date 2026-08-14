@@ -626,8 +626,16 @@ struct ScatteringCoefficients{T<:AbstractFloat}
     diagnostics::BasisSolveDiagnostics{T}
 end
 
+function _saturated_hypot(left::T, right::T) where {T<:AbstractFloat}
+    scale = max(left, right)
+    iszero(scale) && return zero(T)
+    normalised = hypot(left / scale, right / scale)
+    return scale <= floatmax(T) / normalised ?
+        scale * normalised : floatmax(T)
+end
+
 _state_norm(state::FactoredEndpointState) =
-    hypot(abs(state.Y), abs(state.Yrho))
+    _saturated_hypot(abs(state.Y), abs(state.Yrho))
 
 function _four_norm(a, b, c, d)
     return hypot(hypot(abs(a), abs(b)), hypot(abs(c), abs(d)))
@@ -1028,7 +1036,7 @@ function _solve_scaled_factored_scattering_unchecked(
         )
         residual_norm = _state_norm(residual)
         target_norm = _state_norm(target)
-        coefficient_norm = hypot(abs(z1), abs(z2))
+        coefficient_norm = _saturated_hypot(abs(z1), abs(z2))
         basis_two_norm = _stable_matrix_two_norm(
             scaled_a,
             scaled_b,

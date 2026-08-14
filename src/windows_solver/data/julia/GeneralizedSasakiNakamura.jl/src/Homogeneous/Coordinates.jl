@@ -247,7 +247,11 @@ function r_from_rstar(a, rstar)
         The maximum of h'_u occurs when |a| -> 1 with value ~ 1.328
         =#
         upper_offset = coordinate_type(7) / coordinate_type(5)
-        return rp + find_zero(f, (zero(coordinate_type), upper_offset))
+        return rp + find_zero(
+            f,
+            (zero(coordinate_type), upper_offset),
+            Roots.Bisection(),
+        )
     else
         # Use Newton method instead; for large rstar, rstar \approx r
         derivative(x) = sign(x) * ((rp + abs(x))^2 + typed_a^2) /

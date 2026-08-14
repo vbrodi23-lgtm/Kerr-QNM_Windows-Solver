@@ -32,7 +32,9 @@ function factored_spec_parameters(::Type{T}) where {T<:AbstractFloat}
     )
 end
 
-function factored_spec_context(::Type{T}) where {T<:AbstractFloat}
+function factored_spec_context(
+    ::Type{T}; outer_radius::T=T(14)
+) where {T<:AbstractFloat}
     parameters = factored_spec_parameters(T)
     geometry = KERR_FACTORED.stable_horizon_geometry(parameters.a)
     p_horizon = parameters.omega - T(parameters.m) *
@@ -62,7 +64,7 @@ function factored_spec_context(::Type{T}) where {T<:AbstractFloat}
         if rho < zero(T)
             return complex(geometry.rplus + T(1) / T(10), -T(1) / T(50))
         elseif rho > zero(T)
-            return complex(match_radius + T(2), T(1) / T(50))
+            return complex(outer_radius, T(1) / T(50))
         end
         return complex(match_radius, zero(T))
     end
@@ -212,7 +214,7 @@ end
 end
 
 @testset "adequate preflight reaches the non-bypassable readiness gate" begin
-    prepared = factored_spec_context(Float64)
+    prepared = factored_spec_context(Float64; outer_radius=1.0e12)
     branch = CF_FACTORED.prepare_factored_infinity_outgoing(
         prepared.spectral, prepared.contour, 0.0
     )

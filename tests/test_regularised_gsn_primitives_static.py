@@ -87,7 +87,8 @@ class RegularisedGsnPrimitiveSourceTests(unittest.TestCase):
 
         self.assertIn("coordinate_type = promote_type(", coordinates)
         self.assertIn("upper_offset = coordinate_type(7) / coordinate_type(5)", coordinates)
-        self.assertIn("find_zero(f, (zero(coordinate_type), upper_offset))", coordinates)
+        self.assertIn("(zero(coordinate_type), upper_offset)", coordinates)
+        self.assertIn("Roots.Bisection(),", coordinates)
         self.assertNotIn("find_zero(f, (0, 1.4))", coordinates)
         self.assertIn("negative-rstar BigFloat inverse round trip", self.read(JULIA_TESTS))
 

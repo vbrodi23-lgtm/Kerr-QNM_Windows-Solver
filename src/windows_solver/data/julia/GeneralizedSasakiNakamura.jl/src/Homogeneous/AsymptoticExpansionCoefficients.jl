@@ -10,6 +10,8 @@ export AsymptoticFamily
 export INFINITY_INGOING_SERIES, INFINITY_OUTGOING_SERIES
 export HORIZON_INGOING_SERIES, HORIZON_OUTGOING_SERIES
 export AsymptoticFailureReason, AsymptoticConstructionError
+export INVALID_ASYMPTOTIC_INPUT, INVALID_ASYMPTOTIC_ORDER
+export PRECISION_MISMATCH, NONFINITE_ASYMPTOTIC_DATA
 export PHYSICAL_SINGULAR_LIMIT, ALGEBRAIC_REPRESENTATION_SINGULAR
 export SeriesKey, TypedTaylorWorkspace, RecurrenceEvidence
 export AsymptoticSeries, AsymptoticSeriesBundle
@@ -72,6 +74,31 @@ struct SeriesKey{T<:AbstractFloat}
     family::AsymptoticFamily
     max_order::Int
     precision_bits::Int
+
+    # Suppress Julia's automatically generated unvalidated outer constructor.
+    # All inferred-type construction must pass through the checked SeriesKey
+    # method below before reaching this exact typed storage constructor.
+    function SeriesKey{T}(
+        s::Int,
+        m::Int,
+        a::T,
+        omega::Complex{T},
+        lambda::Complex{T},
+        family::AsymptoticFamily,
+        max_order::Int,
+        precision_bits::Int,
+    ) where {T<:AbstractFloat}
+        return new{T}(
+            s,
+            m,
+            a,
+            omega,
+            lambda,
+            family,
+            max_order,
+            precision_bits,
+        )
+    end
 end
 
 struct TypedTaylorWorkspace{T<:AbstractFloat}
@@ -474,37 +501,37 @@ end
 
 function _potential_workspaces(key::SeriesKey{T}) where {T}
     if key.family == INFINITY_INGOING_SERIES
-        P_function(z) = PminusInf_z(
+        P_function = z -> PminusInf_z(
             key.s, key.m, key.a, key.omega, key.lambda, z
         )
-        Q_function(z) = QminusInf_z(
+        Q_function = z -> QminusInf_z(
             key.s, key.m, key.a, key.omega, key.lambda, z
         )
         P = _typed_taylor_workspace(key, P_function, key.max_order, "PminusInf")
         Q = _typed_taylor_workspace(key, Q_function, key.max_order + 1, "QminusInf")
     elseif key.family == INFINITY_OUTGOING_SERIES
-        P_function(z) = PplusInf_z(
+        P_function = z -> PplusInf_z(
             key.s, key.m, key.a, key.omega, key.lambda, z
         )
-        Q_function(z) = QplusInf_z(
+        Q_function = z -> QplusInf_z(
             key.s, key.m, key.a, key.omega, key.lambda, z
         )
         P = _typed_taylor_workspace(key, P_function, key.max_order, "PplusInf")
         Q = _typed_taylor_workspace(key, Q_function, key.max_order + 1, "QplusInf")
     elseif key.family == HORIZON_INGOING_SERIES
-        P_function(x) = PminusH(
+        P_function = x -> PminusH(
             key.s, key.m, key.a, key.omega, key.lambda, x
         )
-        Q_function(x) = QminusH(
+        Q_function = x -> QminusH(
             key.s, key.m, key.a, key.omega, key.lambda, x
         )
         P = _typed_taylor_workspace(key, P_function, key.max_order, "PminusH")
         Q = _typed_taylor_workspace(key, Q_function, key.max_order, "QminusH")
     else
-        P_function(x) = PplusH(
+        P_function = x -> PplusH(
             key.s, key.m, key.a, key.omega, key.lambda, x
         )
-        Q_function(x) = QplusH(
+        Q_function = x -> QplusH(
             key.s, key.m, key.a, key.omega, key.lambda, x
         )
         P = _typed_taylor_workspace(key, P_function, key.max_order, "PplusH")
