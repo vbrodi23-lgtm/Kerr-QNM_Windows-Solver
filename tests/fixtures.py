@@ -96,7 +96,7 @@ def valid_numerical_conditioning(
         raise ValueError("conditioning fixture mechanism is invalid")
 
     return {
-        "schema": "windows-solver.m02-conditioning/2",
+        "schema": "windows-solver.m02-conditioning/3",
         "determinant_family": (
             "horizon-scattering/v1" if horizon else "exterior-wronskian/v1"
         ),
@@ -124,6 +124,10 @@ def valid_numerical_conditioning(
             "known-carrier-times-regular-remainder/v1"
         ),
         "factored_remainder_state_convention": "state1=Y;state2=dY/drho/v1",
+        "human_math_review_receipt_status": "absent-unapproved/v1",
+        "human_math_review_receipt_sha256": None,
+        "independent_reference_fixture_receipt_status": "absent-unreviewed/v1",
+        "independent_reference_fixture_receipt_sha256": None,
         "maximum_series_digits_lost": "4.2500",
         "maximum_recurrence_digits_lost": "7.1250",
         "maximum_series_evaluation_spread": "1.25E-20",

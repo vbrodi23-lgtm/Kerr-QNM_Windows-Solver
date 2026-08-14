@@ -27,6 +27,41 @@ from windows_solver.root_readout_cache import root_readout_identity_sha256
 
 
 class NumericalConditioningEvidenceTests(unittest.TestCase):
+    def test_current_evidence_binds_both_independent_activation_gates(self):
+        evidence = response_engine.NumericalConditioningEvidence.from_mapping(
+            valid_numerical_conditioning()
+        )
+
+        self.assertEqual(evidence.schema, "windows-solver.m02-conditioning/3")
+        self.assertEqual(
+            evidence.human_math_review_receipt_status,
+            "absent-unapproved/v1",
+        )
+        self.assertIsNone(evidence.human_math_review_receipt_sha256)
+        self.assertEqual(
+            evidence.independent_reference_fixture_receipt_status,
+            "absent-unreviewed/v1",
+        )
+        self.assertIsNone(
+            evidence.independent_reference_fixture_receipt_sha256
+        )
+
+    def test_current_evidence_rejects_either_gate_identity_tamper(self):
+        mutations = {
+            "human_math_review_receipt_status": "approved/v1",
+            "human_math_review_receipt_sha256": "0" * 64,
+            "independent_reference_fixture_receipt_status": "reviewed/v1",
+            "independent_reference_fixture_receipt_sha256": "1" * 64,
+        }
+        for field, invalid in mutations.items():
+            with self.subTest(field=field):
+                mapping = valid_numerical_conditioning()
+                mapping[field] = invalid
+                with self.assertRaises(ValueError):
+                    response_engine.NumericalConditioningEvidence.from_mapping(
+                        mapping
+                    )
+
     def test_complete_evidence_round_trips_without_binary64_conversion(self):
         """Catches dropping precision or any required schema-2 evidence field."""
 

@@ -262,8 +262,12 @@ class RegularisedGsnWorkerSourceTests(unittest.TestCase):
         self.assertIn('include("m02_worker.jl")', self.fd_spec)
 
     def test_worker_emits_exact_mechanism_honest_conditioning_contract(self) -> None:
+        conditioning = self.worker[
+            self.worker.index("function conditioning_response(") :
+            self.worker.index("function result_fields(")
+        ]
         for identity in (
-            '"windows-solver.m02-conditioning/2"',
+            '"windows-solver.m02-conditioning/3"',
             '"horizon-scattering/v1"',
             '"exterior-wronskian/v1"',
             '"factored-plane-wave-gsn/v1"',
@@ -283,12 +287,16 @@ class RegularisedGsnWorkerSourceTests(unittest.TestCase):
             "scattering_diagnostics_applicable",
             "maximum_basis_condition",
             "maximum_basis_backward_error",
+            "human_math_review_receipt_status",
+            "human_math_review_receipt_sha256",
+            "independent_reference_fixture_receipt_status",
+            "independent_reference_fixture_receipt_sha256",
             "maximum_matching_reconstruction_residual",
             "minimum_cref_chart_margin",
             "maximum_carrier_change_error",
-            "raw_determinant_abs",
         ):
-            self.assertIn(f'"{field}"', self.worker)
+            self.assertIn(f'"{field}"', conditioning)
+        self.assertIn('"raw_determinant_abs"', self.worker)
         self.assertIn("horizon ?", self.worker)
         self.assertIn(": nothing", self.worker)
 

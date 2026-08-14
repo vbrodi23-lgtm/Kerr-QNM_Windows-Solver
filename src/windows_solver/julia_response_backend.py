@@ -1905,6 +1905,10 @@ class JuliaPrecisionRootBackend:
             "factored_remainder_state_convention",
             "determinant_family",
             "scattering_diagnostics_applicable",
+            "human_math_review_receipt_status",
+            "human_math_review_receipt_sha256",
+            "independent_reference_fixture_receipt_status",
+            "independent_reference_fixture_receipt_sha256",
         )
         if any(
             policy.get(field) != getattr(numerical_conditioning, field)

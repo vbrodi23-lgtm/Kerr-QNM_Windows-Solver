@@ -73,7 +73,7 @@ ERROR_CHANNELS = (
 )
 _RECORDED_ROOT_MAPPING_TOLERANCE_ABS = 5.0e-9
 _DIAGNOSTIC_ROOT_FAMILIES = ("truncation", "resolution", "seed-path")
-NUMERICAL_CONDITIONING_SCHEMA = "windows-solver.m02-conditioning/2"
+NUMERICAL_CONDITIONING_SCHEMA = "windows-solver.m02-conditioning/3"
 WORKER_RESPONSE_RECEIPT_SCHEMA = "windows-solver.worker-response-receipt/1"
 _WORKER_RESPONSE_RECEIPT_FIELDS = frozenset({
     "schema",
@@ -223,6 +223,12 @@ _NUMERICAL_CONDITIONING_IDENTITY_FIELDS = (
     "determinant_normalisation",
     "regular_remainder_contract",
     "factored_remainder_state_convention",
+)
+_NUMERICAL_CONDITIONING_GATE_FIELDS = (
+    "human_math_review_receipt_status",
+    "human_math_review_receipt_sha256",
+    "independent_reference_fixture_receipt_status",
+    "independent_reference_fixture_receipt_sha256",
 )
 _NUMERICAL_CONDITIONING_SIGNED_DECIMAL_FIELDS = frozenset({
     "minimum_asymptotic_predicted_reliable_digits",
@@ -973,6 +979,10 @@ class NumericalConditioningEvidence:
     determinant_normalisation: str
     regular_remainder_contract: str
     factored_remainder_state_convention: str
+    human_math_review_receipt_status: str
+    human_math_review_receipt_sha256: str | None
+    independent_reference_fixture_receipt_status: str
+    independent_reference_fixture_receipt_sha256: str | None
     maximum_series_digits_lost: Decimal
     maximum_recurrence_digits_lost: Decimal
     maximum_series_evaluation_spread: Decimal
@@ -996,6 +1006,12 @@ class NumericalConditioningEvidence:
         if self.schema != NUMERICAL_CONDITIONING_SCHEMA:
             raise ValueError("numerical conditioning schema is invalid")
         for field, expected in _REGULARISED_GSN_COMMON_IDENTITIES.items():
+            if getattr(self, field) != expected:
+                raise ValueError(
+                    f"numerical conditioning {field} identity is invalid"
+                )
+        for field in _NUMERICAL_CONDITIONING_GATE_FIELDS:
+            expected = _REGULARISED_GSN_COMMON_PRECISION_POLICY[field]
             if getattr(self, field) != expected:
                 raise ValueError(
                     f"numerical conditioning {field} identity is invalid"
@@ -1069,6 +1085,10 @@ class NumericalConditioningEvidence:
                 field: getattr(self, field)
                 for field in _NUMERICAL_CONDITIONING_IDENTITY_FIELDS
             },
+            **{
+                field: getattr(self, field)
+                for field in _NUMERICAL_CONDITIONING_GATE_FIELDS
+            },
         }
         for field in _NUMERICAL_CONDITIONING_DECIMAL_FIELDS:
             value = getattr(self, field)
@@ -1083,6 +1103,7 @@ class NumericalConditioningEvidence:
             "schema",
             "scattering_diagnostics_applicable",
             *_NUMERICAL_CONDITIONING_IDENTITY_FIELDS,
+            *_NUMERICAL_CONDITIONING_GATE_FIELDS,
             *_NUMERICAL_CONDITIONING_DECIMAL_FIELDS,
             *_NUMERICAL_CONDITIONING_BOOLEAN_FIELDS,
         }
@@ -1117,6 +1138,10 @@ class NumericalConditioningEvidence:
             **{
                 field: value[field]
                 for field in _NUMERICAL_CONDITIONING_IDENTITY_FIELDS
+            },
+            **{
+                field: value[field]
+                for field in _NUMERICAL_CONDITIONING_GATE_FIELDS
             },
             **decimal_values,
             **boolean_values,

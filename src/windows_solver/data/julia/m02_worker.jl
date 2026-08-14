@@ -15,7 +15,7 @@ const Solutions = GeneralizedSasakiNakamura.Solutions
 const GSNBranchConvention = GSN.GSNBranchConvention
 const PROGRESS_PREFIX = "@@KERR_QNM_PROGRESS@@"
 const PROGRESS_SCHEMA = "windows-solver.progress/1"
-const CONDITIONING_SCHEMA = "windows-solver.m02-conditioning/2"
+const CONDITIONING_SCHEMA = "windows-solver.m02-conditioning/3"
 const HOMOGENEOUS_REPRESENTATION_ID = "factored-plane-wave-gsn/v1"
 const FACTORED_HOMOGENEOUS_ODE_SCOPE_ID =
     "factored-homogeneous-gsn/v1"
@@ -2849,6 +2849,14 @@ function conditioning_response(
         "regular_remainder_contract" => REGULAR_REMAINDER_CONTRACT_ID,
         "factored_remainder_state_convention" =>
             FACTORED_REMAINDER_STATE_CONVENTION_ID,
+        "human_math_review_receipt_status" =>
+            HUMAN_MATH_REVIEW_RECEIPT_STATUS,
+        "human_math_review_receipt_sha256" =>
+            HUMAN_MATH_REVIEW_RECEIPT_SHA256,
+        "independent_reference_fixture_receipt_status" =>
+            INDEPENDENT_REFERENCE_FIXTURE_RECEIPT_STATUS,
+        "independent_reference_fixture_receipt_sha256" =>
+            INDEPENDENT_REFERENCE_FIXTURE_RECEIPT_SHA256,
         "maximum_series_digits_lost" =>
             string(accumulator.maximum_series_digits_lost),
         "maximum_recurrence_digits_lost" =>
