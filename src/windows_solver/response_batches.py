@@ -2746,6 +2746,43 @@ def _validate_current_promoted_runtime(
         raise _UnauthenticatedComponentEvidence(
             "campaign promoted scientific runtime policy disagrees with mechanism"
         )
+    receipts = tuple(
+        readout.worker_response_receipt for readout in result.raw_readouts
+    )
+    has_receipts = any(receipt is not None for receipt in receipts)
+    if not allow_historical_conditioning_absence and not has_receipts:
+        raise _UnauthenticatedComponentEvidence(
+            "campaign current promoted worker response receipt is missing"
+        )
+    if has_receipts:
+        if not all(receipt is not None for receipt in receipts):
+            raise _UnauthenticatedComponentEvidence(
+                "campaign promoted worker response receipts are incomplete"
+            )
+        expected_runtime_sha256 = hashlib.sha256(
+            canonical_json_bytes(dict(runtime))
+        ).hexdigest()
+        for receipt in receipts:
+            assert receipt is not None
+            binding = receipt["request_binding"]
+            if (
+                receipt["scientific_runtime_sha256"]
+                != expected_runtime_sha256
+                or binding.get("job_id") != leaf.job.job_id
+                or binding.get("leaf_id") != leaf.leaf_id
+                or binding.get("role") != leaf.role
+                or binding.get("mechanism_id") != leaf.job.mechanism_id
+                or binding.get("job_policy_sha256")
+                != leaf.job.policy.identity_sha256
+                or binding.get("backend_identity_sha256")
+                != leaf.job.backend_identity.identity_sha256
+                or binding.get("precision_digits") != outcome.digits
+                or binding.get("refinement_level")
+                != expected_refinement_level
+            ):
+                raise _UnauthenticatedComponentEvidence(
+                    "campaign promoted worker response receipt identity is invalid"
+                )
 
 
 def _validate_component_result(

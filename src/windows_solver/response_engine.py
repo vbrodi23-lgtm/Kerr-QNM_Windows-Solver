@@ -74,6 +74,19 @@ ERROR_CHANNELS = (
 _RECORDED_ROOT_MAPPING_TOLERANCE_ABS = 5.0e-9
 _DIAGNOSTIC_ROOT_FAMILIES = ("truncation", "resolution", "seed-path")
 NUMERICAL_CONDITIONING_SCHEMA = "windows-solver.m02-conditioning/2"
+WORKER_RESPONSE_RECEIPT_SCHEMA = "windows-solver.worker-response-receipt/1"
+_WORKER_RESPONSE_RECEIPT_FIELDS = frozenset({
+    "schema",
+    "request_binding",
+    "request_sha256",
+    "scientific_runtime_sha256",
+    "worker_response_schema_version",
+    "root_residual_abs_text",
+    "raw_determinant_abs_text",
+    "raw_determinant_evidence_status",
+    "receipt_sha256",
+})
+_HEX_64 = re.compile(r"[0-9a-f]{64}")
 HORIZON_DETERMINANT_FAMILY = "horizon-scattering/v1"
 EXTERIOR_DETERMINANT_FAMILY = "exterior-wronskian/v1"
 HORIZON_SCATTERING_COLUMN_CONVENTION = (
@@ -235,6 +248,63 @@ def _conditioning_decimal_from_text(value: object, subject: str) -> Decimal:
 
 def _sha256(value: object) -> str:
     return hashlib.sha256(canonical_json_bytes(value)).hexdigest()
+
+
+def _validated_worker_response_receipt(
+    value: object,
+) -> Mapping[str, object] | None:
+    if value is None:
+        return None
+    if not isinstance(value, Mapping) or set(value) != (
+        _WORKER_RESPONSE_RECEIPT_FIELDS
+    ):
+        raise ValueError("worker response receipt fields are invalid")
+    if value["schema"] != WORKER_RESPONSE_RECEIPT_SCHEMA:
+        raise ValueError("worker response receipt schema is invalid")
+    request_binding = value["request_binding"]
+    if not isinstance(request_binding, Mapping):
+        raise ValueError("worker response receipt request binding is invalid")
+    for field in (
+        "request_sha256",
+        "scientific_runtime_sha256",
+        "receipt_sha256",
+    ):
+        if not isinstance(value[field], str) or _HEX_64.fullmatch(value[field]) is None:
+            raise ValueError(f"worker response receipt {field} is invalid")
+    if value["request_sha256"] != _sha256(dict(request_binding)):
+        raise ValueError("worker response receipt request digest is invalid")
+    if value["worker_response_schema_version"] != 3:
+        raise ValueError("worker response receipt wire schema is invalid")
+    residual = _conditioning_decimal_from_text(
+        value["root_residual_abs_text"],
+        "worker response receipt root residual",
+    )
+    if residual < 0:
+        raise ValueError("worker response receipt root residual is negative")
+    raw_text = value["raw_determinant_abs_text"]
+    if raw_text is not None:
+        raw = _conditioning_decimal_from_text(
+            raw_text, "worker response receipt raw determinant"
+        )
+        if raw < 0:
+            raise ValueError("worker response receipt raw determinant is negative")
+    status = value["raw_determinant_evidence_status"]
+    if status not in {
+        "available/v1",
+        "unavailable-overflow/v1",
+        "not-applicable/v1",
+    }:
+        raise ValueError("worker response receipt determinant status is invalid")
+    if (status == "available/v1") != (raw_text is not None):
+        raise ValueError("worker response receipt determinant evidence is inconsistent")
+    material = {key: value[key] for key in value if key != "receipt_sha256"}
+    if value["receipt_sha256"] != _sha256(material):
+        raise ValueError("worker response receipt digest is invalid")
+    return {
+        **material,
+        "request_binding": dict(request_binding),
+        "receipt_sha256": value["receipt_sha256"],
+    }
 
 
 def _finite_complex(value: complex, subject: str) -> complex:
@@ -1070,6 +1140,7 @@ class RootReadout:
     normalised_determinant_abs: Decimal | None = None
     raw_determinant_abs: Decimal | None = None
     raw_determinant_evidence_status: str | None = None
+    worker_response_receipt: Mapping[str, object] | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "omega", _finite_complex(self.omega, "root omega"))
@@ -1153,6 +1224,35 @@ class RootReadout:
         elif self.raw_determinant_evidence_status is not None:
             raise ValueError(
                 "raw determinant evidence status requires numerical conditioning"
+            )
+        receipt = _validated_worker_response_receipt(
+            self.worker_response_receipt
+        )
+        if receipt is not None:
+            if (
+                self.normalised_determinant_abs is None
+                or Decimal(receipt["root_residual_abs_text"])
+                != self.normalised_determinant_abs
+                or (
+                    None
+                    if receipt["raw_determinant_abs_text"] is None
+                    else Decimal(receipt["raw_determinant_abs_text"])
+                )
+                != self.raw_determinant_abs
+                or receipt["raw_determinant_evidence_status"]
+                != self.raw_determinant_evidence_status
+            ):
+                raise ValueError(
+                    "worker response receipt disagrees with root readout evidence"
+                )
+            copied_receipt = dict(receipt)
+            copied_receipt["request_binding"] = MappingProxyType(
+                dict(receipt["request_binding"])
+            )
+            object.__setattr__(
+                self,
+                "worker_response_receipt",
+                MappingProxyType(copied_receipt),
             )
         if (
             self.normalised_determinant_abs is not None
@@ -1279,6 +1379,13 @@ class RootReadout:
             output["raw_determinant_evidence_status"] = (
                 self.raw_determinant_evidence_status
             )
+        if self.worker_response_receipt is not None:
+            output["worker_response_receipt"] = {
+                **dict(self.worker_response_receipt),
+                "request_binding": dict(
+                    self.worker_response_receipt["request_binding"]
+                ),
+            }
         return output
 
     @classmethod
@@ -1357,6 +1464,7 @@ class RootReadout:
                 if "raw_determinant_evidence_status" not in value
                 else value["raw_determinant_evidence_status"]
             ),
+            worker_response_receipt=value.get("worker_response_receipt"),
         )
 
 

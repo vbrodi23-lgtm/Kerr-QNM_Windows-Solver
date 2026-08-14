@@ -28,6 +28,11 @@ from windows_solver.julia_response_backend import (
     _run_streamed_julia,
 )
 from windows_solver.progress import PROGRESS_SCHEMA, ProgressEventKind, activate_progress
+from windows_solver.root_readout_cache import (
+    ROOT_READOUT_STORE_DIRECTORY_NAME,
+    RootReadoutStore,
+    runtime_identity_sha256,
+)
 from windows_solver.response_batches import (
     PrecisionCapabilities,
     build_campaign_selection,
@@ -77,8 +82,139 @@ class FakeAdapter:
         self.requests.append(request)
         return valid_schema_three_julia_root_response(request)
 
+    def evaluate_for_validation(self, request):
+        return SimpleNamespace(
+            response=self.evaluate(request),
+            request_binding=dict(request),
+            request_sha256=hashlib.sha256(
+                canonical_json_bytes(request)
+            ).hexdigest(),
+            runtime_identity_sha256=hashlib.sha256(
+                canonical_json_bytes(
+                    JuliaPrecisionRootBackend(
+                        VettedNativeDeterminantKernel.identity,
+                        self,
+                        request["precision_digits"],
+                        refinement=request["refinement_level"],
+                    ).scientific_runtime_for(_deep_job())
+                )
+            ).hexdigest(),
+            reused=False,
+            cached_worker_response_receipt=None,
+        )
+
+    def retain_validated_readout(self, evaluation, receipt):
+        return None
+
+    def invalidate_validated_readout(self, evaluation):
+        return None
+
 
 class JuliaResponseBackendTests(unittest.TestCase):
+    @staticmethod
+    def _cache_adapter(root, runner):
+        depot = root / "depot"
+        depot.mkdir()
+        for name in ("julia.exe", "Project.toml", "Manifest.toml", "worker.jl"):
+            (root / name).write_text(name, encoding="ascii")
+        store = RootReadoutStore(root / ROOT_READOUT_STORE_DIRECTORY_NAME)
+        adapter = JuliaResponseAdapter(
+            root / "julia.exe",
+            root,
+            depot,
+            root / "worker.jl",
+            dict(FakeAdapter.runtime_provenance),
+            runner,
+            readout_cache=store,
+        )
+        return adapter, store
+
+    def test_invalid_fresh_success_is_rejected_before_cache_publication(self):
+        """Catches adapter-only checks retaining a mechanism-swapped success."""
+
+        def runner(command, **kwargs):
+            request = json.loads(Path(command[-2]).read_text(encoding="utf-8"))
+            response = valid_schema_three_julia_root_response(request)
+            response["numerical_conditioning"]["determinant_family"] = (
+                "cinc-over-cref-minus-R/v1"
+            )
+            response["numerical_conditioning"][
+                "scattering_diagnostics_applicable"
+            ] = True
+            response["request_sha256"] = request["request_sha256"]
+            Path(command[-1]).write_bytes(canonical_json_bytes(response))
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            adapter, store = self._cache_adapter(Path(temporary), runner)
+            backend = JuliaPrecisionRootBackend(
+                VettedNativeDeterminantKernel.identity, adapter, 80
+            )
+            with self.assertRaises(JuliaResponseBackendError):
+                backend.read_root(_deep_job(), 0.0j)
+            self.assertEqual(store.stored_count, 0)
+
+    def test_invalid_cached_success_is_evicted_then_valid_retry_is_reused(self):
+        """Catches one poisoned entry permanently blocking exact recomputation."""
+
+        calls = []
+
+        def runner(command, **kwargs):
+            calls.append(tuple(command))
+            request = json.loads(Path(command[-2]).read_text(encoding="utf-8"))
+            response = valid_schema_three_julia_root_response(request)
+            response["request_sha256"] = request["request_sha256"]
+            Path(command[-1]).write_bytes(canonical_json_bytes(response))
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            adapter, store = self._cache_adapter(Path(temporary), runner)
+            job = _deep_job()
+            backend = JuliaPrecisionRootBackend(
+                VettedNativeDeterminantKernel.identity, adapter, 80
+            )
+            request = backend._request(job, 0.0j)
+            request_sha256 = hashlib.sha256(
+                canonical_json_bytes(request)
+            ).hexdigest()
+            poisoned = valid_schema_three_julia_root_response(request)
+            poisoned["schema_version"] = 2
+            poisoned["request_sha256"] = request_sha256
+            store.publish(
+                request_sha256=request_sha256,
+                runtime_identity=runtime_identity_sha256(
+                    adapter.runtime_provenance
+                ),
+                response=poisoned,
+            )
+
+            with self.assertRaisesRegex(
+                JuliaResponseBackendError, "response contract is invalid"
+            ):
+                backend.read_root(job, 0.0j)
+            self.assertEqual(store.stored_count, 0)
+            self.assertEqual(calls, [])
+
+            first = backend.read_root(job, 0.0j)
+            second = backend.read_root(job, 0.0j)
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(second.to_mapping(), first.to_mapping())
+            self.assertEqual(store.stored_count, 1)
+
+    def test_worker_response_receipt_preserves_exact_determinant_text(self):
+        """Catches reducing exact worker decimal evidence to one binary64 bin."""
+
+        readout = JuliaPrecisionRootBackend(
+            VettedNativeDeterminantKernel.identity, FakeAdapter(), 80
+        ).read_root(_deep_job(), 0.0j)
+
+        receipt = readout.worker_response_receipt
+        self.assertEqual(
+            receipt["root_residual_abs_text"],
+            str(readout.normalised_determinant_abs),
+        )
+        self.assertEqual(len(receipt["receipt_sha256"]), 64)
+
     def test_success_wire_schema_is_three_and_worker_errors_remain_schema_one(self):
         """Catches changing the successful wire without preserving error parsing."""
 

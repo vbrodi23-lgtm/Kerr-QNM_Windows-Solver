@@ -30,7 +30,7 @@ from typing import Mapping
 from .contracts import canonical_json_bytes
 
 
-ROOT_READOUT_CACHE_SCHEMA_VERSION = 1
+ROOT_READOUT_CACHE_SCHEMA_VERSION = 2
 ROOT_READOUT_STORE_DIRECTORY_NAME = "root-readouts-" + "v" + str(
     ROOT_READOUT_CACHE_SCHEMA_VERSION
 )
@@ -42,6 +42,7 @@ _ENTRY_FIELDS = frozenset({
     "runtime_identity_sha256",
     "created_utc",
     "response",
+    "worker_response_receipt",
 })
 
 
@@ -130,6 +131,7 @@ class RootReadoutLookup:
     status: RootReadoutLookupStatus
     path: Path | None = None
     response: Mapping[str, object] | None = None
+    worker_response_receipt: Mapping[str, object] | None = None
     reason: str | None = None
 
 
@@ -153,7 +155,7 @@ class RootReadoutStore:
     @staticmethod
     def _validate_entry(
         value: object, *, request_sha256: str, runtime_identity: str
-    ) -> Mapping[str, object]:
+    ) -> tuple[Mapping[str, object], Mapping[str, object] | None]:
         if not isinstance(value, Mapping) or set(value) != _ENTRY_FIELDS:
             raise ValueError("root-readout cache entry fields are invalid")
         if value["schema_version"] != ROOT_READOUT_CACHE_SCHEMA_VERSION:
@@ -187,7 +189,10 @@ class RootReadoutStore:
             raise ValueError("root-readout cache response is not a successful readout")
         if response.get("request_sha256") != request_sha256:
             raise ValueError("root-readout cache response request digest is invalid")
-        return response
+        receipt = value["worker_response_receipt"]
+        if receipt is not None and not isinstance(receipt, Mapping):
+            raise ValueError("root-readout cache worker response receipt is invalid")
+        return response, receipt
 
     def lookup(
         self, *, request_sha256: str, runtime_identity: str
@@ -201,7 +206,7 @@ class RootReadoutStore:
         if not path.is_file() or path.is_symlink():
             return RootReadoutLookup(RootReadoutLookupStatus.MISSING, path=path)
         try:
-            response = self._validate_entry(
+            response, receipt = self._validate_entry(
                 _load_json(path),
                 request_sha256=request_sha256,
                 runtime_identity=runtime_identity,
@@ -211,7 +216,12 @@ class RootReadoutStore:
                 RootReadoutLookupStatus.CORRUPT, path=path, reason=str(error)
             )
         return RootReadoutLookup(
-            RootReadoutLookupStatus.HIT, path=path, response=dict(response)
+            RootReadoutLookupStatus.HIT,
+            path=path,
+            response=dict(response),
+            worker_response_receipt=(
+                None if receipt is None else dict(receipt)
+            ),
         )
 
     def publish(
@@ -220,6 +230,7 @@ class RootReadoutStore:
         request_sha256: str,
         runtime_identity: str,
         response: Mapping[str, object],
+        worker_response_receipt: Mapping[str, object] | None = None,
     ) -> Path:
         """Retain one successful readout for reuse after an interruption."""
 
@@ -240,5 +251,24 @@ class RootReadoutStore:
             .isoformat()
             .replace("+00:00", "Z"),
             "response": dict(response),
+            "worker_response_receipt": (
+                None
+                if worker_response_receipt is None
+                else dict(worker_response_receipt)
+            ),
         })
         return path
+
+    def invalidate(
+        self, *, request_sha256: str, runtime_identity: str
+    ) -> bool:
+        """Remove only the exact entry rejected by post-worker validation."""
+
+        identity = root_readout_identity_sha256(
+            request_sha256=request_sha256, runtime_identity=runtime_identity
+        )
+        path = self._entry_path(identity)
+        if not path.is_file() or path.is_symlink():
+            return False
+        path.unlink()
+        return True

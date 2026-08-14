@@ -31,6 +31,7 @@ from .response_engine import (
     NumericalConditioningEvidence,
     ResponseComponentJob,
     RootReadout,
+    WORKER_RESPONSE_RECEIPT_SCHEMA,
     _exterior_support,
     mode_specific_branch_enclosure_radius,
     regularised_gsn_mechanism_contract,
@@ -1219,6 +1220,18 @@ def _resolve_readout_cache(runtime_root: Path) -> RootReadoutStore | None:
 
 
 @dataclass(frozen=True, slots=True)
+class JuliaResponseEvaluation:
+    """One worker response plus the exact identities required to validate it."""
+
+    response: Mapping[str, object]
+    request_binding: Mapping[str, object]
+    request_sha256: str
+    runtime_identity_sha256: str
+    reused: bool
+    cached_worker_response_receipt: Mapping[str, object] | None
+
+
+@dataclass(frozen=True, slots=True)
 class JuliaResponseAdapter:
     julia_executable: Path
     julia_project: Path
@@ -1312,7 +1325,9 @@ class JuliaResponseAdapter:
             _resolve_readout_cache(runtime),
         )
 
-    def _reuse_readout(self, request_sha256: str) -> dict[str, object] | None:
+    def _reuse_readout(
+        self, request_sha256: str
+    ) -> tuple[dict[str, object], dict[str, object] | None] | None:
         """Return an already-computed readout for this exact request, if any."""
 
         store = self.readout_cache
@@ -1348,10 +1363,20 @@ class JuliaResponseAdapter:
             request_sha256=request_sha256,
             store_path=str(lookup.path),
         )
-        return dict(lookup.response or {})
+        return (
+            dict(lookup.response or {}),
+            (
+                None
+                if lookup.worker_response_receipt is None
+                else dict(lookup.worker_response_receipt)
+            ),
+        )
 
     def _retain_readout(
-        self, request_sha256: str, response: Mapping[str, object]
+        self,
+        request_sha256: str,
+        response: Mapping[str, object],
+        worker_response_receipt: Mapping[str, object] | None = None,
     ) -> None:
         """Retain a validated readout so an interrupted stage can resume."""
 
@@ -1363,6 +1388,7 @@ class JuliaResponseAdapter:
                 request_sha256=request_sha256,
                 runtime_identity=runtime_identity_sha256(self.runtime_provenance),
                 response=response,
+                worker_response_receipt=worker_response_receipt,
             )
         except (OSError, ValueError) as error:
             emit_progress(
@@ -1379,6 +1405,51 @@ class JuliaResponseAdapter:
         )
 
     def evaluate(self, request: Mapping[str, object]) -> dict[str, object]:
+        """Generic adapter entry point retaining its successful wire response."""
+
+        return dict(self._evaluate(request, retain_fresh=True).response)
+
+    def evaluate_for_validation(
+        self, request: Mapping[str, object]
+    ) -> JuliaResponseEvaluation:
+        """Return a response without publishing it before scientific validation."""
+
+        return self._evaluate(request, retain_fresh=False)
+
+    def retain_validated_readout(
+        self,
+        evaluation: JuliaResponseEvaluation,
+        worker_response_receipt: Mapping[str, object],
+    ) -> None:
+        if evaluation.reused:
+            return
+        self._retain_readout(
+            evaluation.request_sha256,
+            evaluation.response,
+            worker_response_receipt,
+        )
+
+    def invalidate_validated_readout(
+        self, evaluation: JuliaResponseEvaluation
+    ) -> None:
+        if not evaluation.reused or self.readout_cache is None:
+            return
+        try:
+            self.readout_cache.invalidate(
+                request_sha256=evaluation.request_sha256,
+                runtime_identity=evaluation.runtime_identity_sha256,
+            )
+        except (OSError, ValueError) as error:
+            emit_progress(
+                ProgressEventKind.ROOT_READOUT_CACHE_CORRUPT,
+                request_sha256=evaluation.request_sha256,
+                error_type=type(error).__name__,
+                message=str(error),
+            )
+
+    def _evaluate(
+        self, request: Mapping[str, object], *, retain_fresh: bool
+    ) -> JuliaResponseEvaluation:
         request_document = dict(request)
         execution_resource = _validated_execution_resource_policy(
             request_document["execution_resource"]
@@ -1389,9 +1460,18 @@ class JuliaResponseAdapter:
         request_sha256 = hashlib.sha256(
             canonical_json_bytes(request_document)
         ).hexdigest()
+        runtime_identity = runtime_identity_sha256(self.runtime_provenance)
         reused = self._reuse_readout(request_sha256)
         if reused is not None:
-            return reused
+            response, receipt = reused
+            return JuliaResponseEvaluation(
+                response=response,
+                request_binding=request_document,
+                request_sha256=request_sha256,
+                runtime_identity_sha256=runtime_identity,
+                reused=True,
+                cached_worker_response_receipt=receipt,
+            )
         document = dict(request_document)
         document["request_sha256"] = request_sha256
         timeout = int(execution_resource["worker_request_wall_clock_seconds"])
@@ -1482,8 +1562,16 @@ class JuliaResponseAdapter:
             _raise_worker_failure(details)
         if response.get("request_sha256") != request_sha256:
             raise JuliaResponseBackendError("M02 Julia response request digest mismatch")
-        self._retain_readout(request_sha256, response)
-        return response
+        if retain_fresh:
+            self._retain_readout(request_sha256, response)
+        return JuliaResponseEvaluation(
+            response=dict(response),
+            request_binding=request_document,
+            request_sha256=request_sha256,
+            runtime_identity_sha256=runtime_identity,
+            reused=False,
+            cached_worker_response_receipt=None,
+        )
 
 
 def _precision_policy(job: ResponseComponentJob, digits: int, refinement: int) -> dict[str, object]:
@@ -1667,7 +1755,42 @@ class JuliaPrecisionRootBackend:
             primary_predictor,
             primary_predictor_kind,
         )
-        response = self.adapter.evaluate(request)
+        evaluate_for_validation = getattr(
+            self.adapter, "evaluate_for_validation", None
+        )
+        if evaluate_for_validation is None:
+            response = self.adapter.evaluate(request)
+            evaluation = JuliaResponseEvaluation(
+                response=response,
+                request_binding=dict(request),
+                request_sha256=hashlib.sha256(
+                    canonical_json_bytes(request)
+                ).hexdigest(),
+                runtime_identity_sha256=runtime_identity_sha256(
+                    self.adapter.runtime_provenance
+                ),
+                reused=False,
+                cached_worker_response_receipt=None,
+            )
+        else:
+            evaluation = evaluate_for_validation(request)
+        try:
+            return self._read_root_response(job, request, evaluation)
+        except JuliaResponseBackendError:
+            invalidate = getattr(
+                self.adapter, "invalidate_validated_readout", None
+            )
+            if invalidate is not None:
+                invalidate(evaluation)
+            raise
+
+    def _read_root_response(
+        self,
+        job: ResponseComponentJob,
+        request: Mapping[str, object],
+        evaluation: JuliaResponseEvaluation,
+    ) -> RootReadout:
+        response = dict(evaluation.response)
         expected_fields = {
             "schema_version",
             "status",
@@ -1997,8 +2120,36 @@ class JuliaPrecisionRootBackend:
                 ),
                 converged=raw["root_converged"],
             )
+        receipt_material = {
+            "schema": WORKER_RESPONSE_RECEIPT_SCHEMA,
+            "request_binding": dict(evaluation.request_binding),
+            "request_sha256": evaluation.request_sha256,
+            "scientific_runtime_sha256": hashlib.sha256(
+                canonical_json_bytes(self.scientific_runtime_for(job))
+            ).hexdigest(),
+            "worker_response_schema_version": response["schema_version"],
+            "root_residual_abs_text": response["root_residual_abs"],
+            "raw_determinant_abs_text": response["raw_determinant_abs"],
+            "raw_determinant_evidence_status": (
+                response["raw_determinant_evidence_status"]
+            ),
+        }
+        worker_response_receipt = {
+            **receipt_material,
+            "receipt_sha256": hashlib.sha256(
+                canonical_json_bytes(receipt_material)
+            ).hexdigest(),
+        }
+        if (
+            evaluation.reused
+            and dict(evaluation.cached_worker_response_receipt or {})
+            != worker_response_receipt
+        ):
+            raise JuliaResponseBackendError(
+                "M02 cached worker response receipt is invalid"
+            )
         try:
-            return RootReadout(
+            readout = RootReadout(
                 omega=root,
                 determinant_residual_abs=_finite_text(
                     response["root_residual_abs"], "root_residual_abs"
@@ -2024,11 +2175,16 @@ class JuliaPrecisionRootBackend:
                 raw_determinant_abs=raw_determinant_abs,
                 raw_determinant_evidence_status=
                     raw_determinant_evidence_status,
+                worker_response_receipt=worker_response_receipt,
             )
         except ValueError as error:
             raise JuliaResponseBackendError(
                 "M02 Julia diagnostic root evidence is inconsistent"
             ) from error
+        retain = getattr(self.adapter, "retain_validated_readout", None)
+        if retain is not None:
+            retain(evaluation, worker_response_receipt)
+        return readout
 
     def closed_form_horizon_response(
         self, job: ResponseComponentJob
