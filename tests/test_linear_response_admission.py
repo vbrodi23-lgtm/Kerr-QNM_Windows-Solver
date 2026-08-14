@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from contextlib import redirect_stderr, redirect_stdout
 from copy import deepcopy
 import hashlib
+import io
 import json
 from pathlib import Path
 import subprocess
@@ -12,6 +14,7 @@ from unittest.mock import patch
 
 from windows_solver.artifacts import ArtifactEnvelope
 from windows_solver.builtin import default_registry
+from windows_solver.cli import main
 from windows_solver.contracts import (
     Capability,
     CarrierState,
@@ -331,6 +334,14 @@ class LinearResponseAdmissionTests(unittest.TestCase):
         review_policy.start()
         self.addCleanup(review_policy.stop)
 
+    def invoke_cli(self, arguments: list[str]) -> tuple[int, dict, str]:
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with redirect_stdout(stdout), redirect_stderr(stderr):
+            status = main(arguments)
+        output = json.loads(stdout.getvalue()) if stdout.getvalue() else {}
+        return status, output, stderr.getvalue()
+
     def test_role_scoped_request_derives_exact_sparse_spectral_upstream(self) -> None:
         request = b_prime_request().for_capability(Capability.SPECTRAL_CORE)
         self.assertEqual(
@@ -504,6 +515,20 @@ class LinearResponseAdmissionTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "human mathematical review"):
             LinearResponseAdmissionPackage.from_mapping(unapproved_review)
+
+        mismatched_review = deepcopy(mapping)
+        mismatched_review["regularised_gsn_review_receipts"][
+            "human_math_review_receipt_sha256"
+        ] = "0" * 64
+        material = {
+            key: value for key, value in mismatched_review.items()
+            if key != "admission_id"
+        }
+        mismatched_review["admission_id"] = (
+            "m02-admission-" + _sha256(canonical_json_bytes(material))
+        )
+        with self.assertRaisesRegex(ValueError, "installed policy"):
+            LinearResponseAdmissionPackage.from_mapping(mismatched_review)
 
         mismatched_spectral = deepcopy(mapping)
         mismatched_spectral["spectral_upstream_receipt"]["payload_sha256"] = (
@@ -715,7 +740,7 @@ class LinearResponseAdmissionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "covariance|Gram"):
             _validate_projective_reduction_bindings(reduction, forged)
 
-    def test_cli_validates_blocks_unapproved_admission_and_loads_sealed_package(
+    def test_cli_blocks_unapproved_admission_and_loaded_package(
         self,
     ) -> None:
         root = Path(__file__).resolve().parents[1]
@@ -752,34 +777,25 @@ class LinearResponseAdmissionTests(unittest.TestCase):
                 "--admission-id", admission_id,
                 "--output", "exported.json",
             )
-            self.assertEqual(exported.returncode, 0, exported.stderr)
-            self.assertEqual(
-                (directory / "exported.json").read_bytes(),
-                canonical_json_bytes(package.to_mapping()),
-            )
+            self.assertEqual(exported.returncode, 2)
+            self.assertIn("human mathematical review receipt", exported.stderr)
+            self.assertFalse((directory / "exported.json").exists())
 
             planned = invoke(
                 "plan", "request.json",
                 "--linear-response-admission", "admitted.json",
                 "--linear-response-admission-id", admission_id,
             )
-            self.assertEqual(planned.returncode, 0, planned.stderr)
-            self.assertEqual(json.loads(planned.stdout)["unavailable_capabilities"], [])
+            self.assertEqual(planned.returncode, 2)
+            self.assertIn("human mathematical review receipt", planned.stderr)
 
-            first = invoke(
+            blocked_run = invoke(
                 "run", "request.json", "--store", "store",
                 "--linear-response-admission", "admitted.json",
                 "--linear-response-admission-id", admission_id,
             )
-            second = invoke(
-                "run", "request.json", "--store", "store",
-                "--linear-response-admission", "admitted.json",
-                "--linear-response-admission-id", admission_id,
-            )
-            self.assertEqual(first.returncode, 0, first.stderr)
-            self.assertEqual(second.returncode, 0, second.stderr)
-            self.assertEqual(json.loads(first.stdout)["provider_execution_count"], 3)
-            self.assertEqual(json.loads(second.stdout)["cache_hit_count"], 3)
+            self.assertEqual(blocked_run.returncode, 2)
+            self.assertIn("human mathematical review receipt", blocked_run.stderr)
 
             unpinned = invoke(
                 "plan", "request.json",
@@ -789,7 +805,6 @@ class LinearResponseAdmissionTests(unittest.TestCase):
             self.assertIn("detached admission ID", unpinned.stderr)
 
     def test_admission_identity_separates_persistent_cache(self) -> None:
-        root = Path(__file__).resolve().parents[1]
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
             packages: list[tuple[Path, LinearResponseAdmissionPackage]] = []
@@ -808,33 +823,22 @@ class LinearResponseAdmissionTests(unittest.TestCase):
 
             def run(
                 package_path: Path, package: LinearResponseAdmissionPackage
-            ) -> subprocess.CompletedProcess[str]:
-                return subprocess.run(
-                    [
-                        sys.executable,
-                        "-m",
-                        "windows_solver",
-                        "run",
-                        str(package_path.parent / "request.json"),
-                        "--store",
-                        str(directory / "shared-store"),
-                        "--linear-response-admission",
-                        str(package_path),
-                        "--linear-response-admission-id",
-                        package.admission_id,
-                    ],
-                    cwd=directory,
-                    env={"PYTHONPATH": str(root / "src")},
-                    text=True,
-                    capture_output=True,
-                )
+            ) -> tuple[int, dict, str]:
+                return self.invoke_cli([
+                    "run",
+                    str(package_path.parent / "request.json"),
+                    "--store",
+                    str(directory / "shared-store"),
+                    "--linear-response-admission",
+                    str(package_path),
+                    "--linear-response-admission-id",
+                    package.admission_id,
+                ])
 
-            first = run(*packages[0])
-            second = run(*packages[1])
-            self.assertEqual(first.returncode, 0, first.stderr)
-            self.assertEqual(second.returncode, 0, second.stderr)
-            first_run = json.loads(first.stdout)
-            second_run = json.loads(second.stdout)
+            first_status, first_run, first_error = run(*packages[0])
+            second_status, second_run, second_error = run(*packages[1])
+            self.assertEqual(first_status, 0, first_error)
+            self.assertEqual(second_status, 0, second_error)
             self.assertEqual(first_run["provider_execution_count"], 3)
             self.assertEqual(second_run["provider_execution_count"], 1)
             self.assertEqual(second_run["cache_hit_count"], 2)

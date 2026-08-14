@@ -698,6 +698,10 @@ class LinearResponseAdmissionPackage:
         review_receipts = _validate_regularised_gsn_review_receipts(
             mapping["regularised_gsn_review_receipts"]
         )
+        if dict(review_receipts) != _current_regularised_gsn_review_receipts():
+            raise ValueError(
+                "regularised GSN review receipts do not match the installed policy"
+            )
         spectral_upstream_receipt = _validate_spectral_upstream_receipt(
             request, mapping["spectral_upstream_receipt"]
         )
