@@ -1,5 +1,10 @@
 # Handover — horizon detector rewrite (PR #46)
 
+> **Continuation:** Read
+> `docs/engineering/2026-08-15-pr46-codex-handover.md` for the current branch
+> state, the completed Task 1 evidence, and the blocking review findings on the
+> latest Task 2 checkpoint. The state/next-step sections below are historical.
+
 Branch `claude/read-this-5em1in`, 13 commits off `main` at `53e04b4` (the PR #45
 merge). Draft, not merged.
 
