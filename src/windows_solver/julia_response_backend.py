@@ -438,7 +438,7 @@ class _WindowsKillOnCloseJob:
 
 
 def promoted_precision_numerical_controls() -> dict[str, object]:
-    """Return the calibrated root/ODE/derivative controls for promoted tiers.
+    """Return the provisional promoted control profile.
 
     The scientific root target is a property of the physics, not of the
     arithmetic: 1e-18 at base and 1e-20 at refinement, for **both** the 80- and
@@ -464,10 +464,12 @@ def promoted_precision_numerical_controls() -> dict[str, object]:
     for r(rho) and only has to avoid dominating the determinant error budget;
     it does not need the homogeneous solve's local-error target.
 
-    These values are the starting profile. They are not a second guessed table:
-    ``tools/calibrate_leaf13_horizon_controls.jl`` measures the determinant
-    response to each control and the selected profile is committed with its
-    calibration receipt.
+    These values are explicitly ``UNMEASURED``. The horizon request policy
+    carries that status, and release admission remains blocked until
+    ``tools/calibrate_leaf13_horizon_controls.jl`` produces a valid native
+    receipt and a reviewed profile is committed. Arithmetic work can use this
+    bounded provisional profile to obtain that evidence; it cannot call the
+    profile calibrated merely because the values are present in source.
     """
 
     return {

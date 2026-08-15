@@ -126,6 +126,8 @@ HORIZON_BASIS_AT_MATCH_EXTRACTION = "scaled-horizon-basis-at-match/v1"
 VERIFIED_ENDPOINT_ERROR_MODEL = (
     "verified-endpoint-control-equivalence-absolute-error/v2"
 )
+PROMOTED_CONTROL_PROFILE_LABEL = "provisional promoted control profile"
+PROMOTED_CONTROL_PROFILE_CALIBRATION_STATUS = "UNMEASURED"
 
 _REGULARISED_GSN_COMMON_IDENTITIES: Mapping[str, str] = MappingProxyType({
     "homogeneous_representation": "factored-plane-wave-gsn/v1",
@@ -171,6 +173,8 @@ REGULARISED_GSN_PRECISION_POLICY: Mapping[str, object] = MappingProxyType({
     "determinant_normalisation": HORIZON_DETERMINANT_NORMALISATION,
     "horizon_contour": REAL_INNER_HORIZON_CONTOUR,
     "determinant_error_model": VERIFIED_ENDPOINT_ERROR_MODEL,
+    "control_profile_label": PROMOTED_CONTROL_PROFILE_LABEL,
+    "calibration_status": PROMOTED_CONTROL_PROFILE_CALIBRATION_STATUS,
 })
 
 
@@ -236,6 +240,8 @@ def regularised_gsn_precision_policy(
         {
             "horizon_contour": REAL_INNER_HORIZON_CONTOUR,
             "determinant_error_model": VERIFIED_ENDPOINT_ERROR_MODEL,
+            "control_profile_label": PROMOTED_CONTROL_PROFILE_LABEL,
+            "calibration_status": PROMOTED_CONTROL_PROFILE_CALIBRATION_STATUS,
         }
         if horizon
         else {}

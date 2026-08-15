@@ -119,6 +119,11 @@ def _current_regularised_gsn_review_receipts() -> dict[str, object]:
         )
     }
     _validate_regularised_gsn_review_receipts(receipts)
+    if policy.get("calibration_status") != "MEASURED":
+        raise ValueError(
+            "regularised GSN release admission blocked: provisional promoted "
+            "control profile has no accepted native calibration receipt"
+        )
     return receipts
 
 

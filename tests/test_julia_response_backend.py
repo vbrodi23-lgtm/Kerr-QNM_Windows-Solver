@@ -1091,9 +1091,10 @@ class JuliaResponseBackendTests(unittest.TestCase):
             "residual_upper_bound = magnitude + residual_error_abs", worker
         )
         self.assertIn(
-            "derivative_lower_bound = derivative_abs - derivative_error_abs",
+            "lower_bound_abs = abs(value) - step_disagreement_abs -",
             worker,
         )
+        self.assertIn("propagated_error_abs", worker)
         self.assertIn(
             "correction_abs = residual_upper_bound / derivative_lower_bound",
             worker,
@@ -1104,7 +1105,7 @@ class JuliaResponseBackendTests(unittest.TestCase):
         # A slope indistinguishable from determinant noise is named, not
         # divided by.
         self.assertIn("DETERMINANT_UNCERTAINTY_TOO_LARGE", worker)
-        self.assertIn("derivative_lower_bound <= zero(T)", worker)
+        self.assertIn("lower_bound_abs > zero(T)", worker)
         # Damping compares error-inclusive bounds too.
         self.assertIn(
             "candidate_improves = candidate_upper_bound < residual_upper_bound",
@@ -1244,6 +1245,7 @@ class JuliaResponseBackendTests(unittest.TestCase):
             Path(__file__).resolve().parents[1] / ".github/workflows/ci.yml"
         ).read_text(encoding="utf-8")
         self.assertIn("m02_worker_finite_difference_spec.jl", workflow)
+        self.assertIn("leaf13_horizon_harness_spec.jl", workflow)
 
     def test_package_worker_confines_fine_steps_and_stores_only_endpoints(self):
         worker = (
@@ -1593,6 +1595,19 @@ class JuliaResponseBackendTests(unittest.TestCase):
             step = float(candidate["frequency_step"])
             self.assertLess(float(candidate["frequency_step_minimum"]), step)
             self.assertGreater(float(candidate["frequency_step_maximum"]), step)
+
+    def test_horizon_control_profile_is_explicitly_unmeasured(self):
+        job = _deep_job()
+        horizon = JuliaPrecisionRootBackend(
+            VettedNativeDeterminantKernel.identity,
+            FakeAdapter(),
+            80,
+        )._request(job, 0.0j)["policy"]
+        self.assertEqual(
+            horizon["control_profile_label"],
+            "provisional promoted control profile",
+        )
+        self.assertEqual(horizon["calibration_status"], "UNMEASURED")
 
     def test_promoted_nonconvergence_preserves_authenticated_branch(self):
         """Catches relabelling an in-radius Julia failure as branch loss."""

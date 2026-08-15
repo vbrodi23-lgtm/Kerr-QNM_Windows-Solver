@@ -26,6 +26,42 @@ param(
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
 $PackageRoot = $PSScriptRoot
+
+function Assert-HexDigest {
+    param([object]$Value, [string]$Subject)
+    if (($Value -isnot [string]) -or $Value -notmatch '^[0-9a-f]{64}$') {
+        throw "$Subject is missing or is not a lowercase SHA-256 digest."
+    }
+}
+
+function Assert-FiniteNumberText {
+    param([object]$Value, [string]$Subject, [switch]$Optional)
+    if ($null -eq $Value) {
+        if ($Optional) { return }
+        throw "$Subject is missing."
+    }
+    $Parsed = 0.0
+    $Style = [Globalization.NumberStyles]::Float
+    $Culture = [Globalization.CultureInfo]::InvariantCulture
+    if (-not [double]::TryParse(
+        [string]$Value, $Style, $Culture, [ref]$Parsed
+    )) {
+        throw "$Subject is not numeric."
+    }
+    if ([double]::IsNaN($Parsed) -or [double]::IsInfinity($Parsed)) {
+        throw "$Subject is nonfinite."
+    }
+}
+
+function Assert-CalibrationEventIdentity {
+    param([object]$Event)
+    if ($null -eq $Event.identity) {
+        throw "Calibration event '$($Event.kind)' has no identity."
+    }
+    Assert-HexDigest $Event.identity.source_sha256 "Calibration source SHA"
+    Assert-HexDigest $Event.identity.manifest_sha256 "Calibration manifest SHA"
+    Assert-HexDigest $Event.identity.policy_sha256 "Calibration policy SHA"
+}
 . (Join-Path $PackageRoot "runtime\resolve-runtime-root.ps1")
 $ResolvedRuntimeRoot = Resolve-KerrQnmRuntimeRoot -PackageRoot $PackageRoot `
     -PortableRuntime:$PortableRuntime -OverrideRoot $RuntimeRoot
@@ -88,6 +124,7 @@ $env:KERR_QNM_PROGRESS = "0"
 
 $CalibrationPrefix = "@@LEAF13_HORIZON_CONTROL_CALIBRATION@@"
 $Lines = New-Object System.Collections.Generic.List[string]
+$Events = New-Object System.Collections.Generic.List[object]
 Push-Location $PackageRoot
 try {
     & $JuliaExecutable --startup-file=no --history-file=no `
@@ -96,16 +133,15 @@ try {
             $Line = [string]$_
             if ($Line.StartsWith($CalibrationPrefix)) {
                 $Payload = $Line.Substring($CalibrationPrefix.Length)
-                $Lines.Add($Payload) | Out-Null
                 try {
                     $Event = $Payload | ConvertFrom-Json
-                    Write-Host ("    {0}" -f $Event.kind) -ForegroundColor DarkCyan
                 }
                 catch {
-                    # A line that does not parse is still retained verbatim in
-                    # the receipt; the run is not failed for a display problem.
-                    Write-Host "    (unparsed calibration event)" -ForegroundColor DarkYellow
+                    throw "Calibration harness emitted malformed JSON: $Payload"
                 }
+                $Lines.Add($Payload) | Out-Null
+                $Events.Add($Event) | Out-Null
+                Write-Host ("    {0}" -f $Event.kind) -ForegroundColor DarkCyan
             }
             else {
                 Write-Host $Line
@@ -117,8 +153,6 @@ finally {
     Pop-Location
 }
 
-Set-Content -LiteralPath $ResolvedOutputPath -Value $Lines -Encoding UTF8
-
 if ($CalibrationExitCode -ne 0) {
     throw "Horizon control calibration failed with exit code $CalibrationExitCode."
 }
@@ -126,6 +160,67 @@ if ($Lines.Count -eq 0) {
     throw "Horizon control calibration produced no receipt events."
 }
 
+$RequiredKinds = @(
+    "calibration_started",
+    "control_rung_measured",
+    "control_response_measured",
+    "derivative_ladder_measured",
+    "calibration_completed"
+)
+foreach ($Kind in $RequiredKinds) {
+    if (-not ($Events | Where-Object { $_.kind -eq $Kind })) {
+        throw "Horizon control calibration omitted required event '$Kind'."
+    }
+}
+
+$RungLabels = New-Object 'System.Collections.Generic.HashSet[string]'
+foreach ($Event in $Events) {
+    Assert-CalibrationEventIdentity $Event
+    if ($Event.kind -ne "control_rung_measured") { continue }
+    $Row = $Event.payload
+    if ([string]::IsNullOrWhiteSpace([string]$Row.label)) {
+        throw "Calibration control rung has no label."
+    }
+    if (-not $RungLabels.Add([string]$Row.label)) {
+        throw "Calibration contains duplicate rung label '$($Row.label)'."
+    }
+    if ($Row.succeeded -eq $true) {
+        $Evidence = $Row.determinant_error
+        if ($null -eq $Evidence) {
+            throw "Successful rung '$($Row.label)' has no determinant-error evidence."
+        }
+        Assert-FiniteNumberText $Evidence.central_determinant_re `
+            "Rung '$($Row.label)' determinant real part"
+        Assert-FiniteNumberText $Evidence.central_determinant_im `
+            "Rung '$($Row.label)' determinant imaginary part"
+        Assert-FiniteNumberText $Evidence.endpoint_disagreement_abs `
+            "Rung '$($Row.label)' endpoint discrepancy"
+        Assert-FiniteNumberText $Evidence.control_disagreement_abs `
+            "Rung '$($Row.label)' control discrepancy" -Optional
+        Assert-FiniteNumberText $Evidence.equivalence_disagreement_abs `
+            "Rung '$($Row.label)' equivalence discrepancy" -Optional
+        Assert-FiniteNumberText $Evidence.precision_disagreement_abs `
+            "Rung '$($Row.label)' precision discrepancy" -Optional
+        Assert-FiniteNumberText $Evidence.safety_factor `
+            "Rung '$($Row.label)' determinant safety factor"
+        Assert-FiniteNumberText $Evidence.numerical_error_abs `
+            "Rung '$($Row.label)' determinant absolute error"
+        if ([string]::IsNullOrWhiteSpace([string]$Evidence.error_model_id)) {
+            throw "Successful rung '$($Row.label)' has no error-model identity."
+        }
+    }
+    else {
+        if (
+            $null -eq $Row.failure -or
+            [string]::IsNullOrWhiteSpace([string]$Row.failure.failure_code)
+        ) {
+            throw "Failed rung '$($Row.label)' has no typed failure code."
+        }
+    }
+}
+
+Set-Content -LiteralPath $ResolvedOutputPath -Value $Lines -Encoding UTF8
+
 Write-Host "Horizon control calibration receipt written:" -ForegroundColor Green
 Write-Host "    $ResolvedOutputPath"
-Write-Host "Select a control profile from this evidence and commit it with the receipt."
+Write-Host "Review this native evidence before replacing the UNMEASURED profile status."

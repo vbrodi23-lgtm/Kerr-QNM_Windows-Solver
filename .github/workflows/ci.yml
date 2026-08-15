@@ -97,6 +97,8 @@ jobs:
         run: |
           julia --startup-file=no --history-file=no --project="$M02_PROJECT" \
             src/windows_solver/data/julia/m02_worker_finite_difference_spec.jl
+          julia --startup-file=no --history-file=no --project="$M02_PROJECT" \
+            tools/leaf13_horizon_harness_spec.jl
 
   test:
     strategy:

@@ -1334,6 +1334,8 @@ class JuliaSchemaThreeConditioningTests(unittest.TestCase):
             "determinant_error_model": (
                 "verified-endpoint-control-equivalence-absolute-error/v2"
             ),
+            "control_profile_label": "provisional promoted control profile",
+            "calibration_status": "UNMEASURED",
             "asymptotic_series_evaluation": (
                 "typed-batch-horner-compensated/v1"
             ),
@@ -1412,13 +1414,20 @@ class JuliaSchemaThreeConditioningTests(unittest.TestCase):
         )
         self.assertNotIn("horizon_contour", policy)
         self.assertNotIn("determinant_error_model", policy)
+        self.assertNotIn("control_profile_label", policy)
+        self.assertNotIn("calibration_status", policy)
         runtime_policy = backend.scientific_runtime_for(job)[
             "regularised_gsn_precision_policy"
         ]
         self.assertEqual(
             set(runtime_policy),
             set(response_engine.REGULARISED_GSN_PRECISION_POLICY)
-            - {"horizon_contour", "determinant_error_model"},
+            - {
+                "horizon_contour",
+                "determinant_error_model",
+                "control_profile_label",
+                "calibration_status",
+            },
         )
         self.assertEqual(
             runtime_policy,

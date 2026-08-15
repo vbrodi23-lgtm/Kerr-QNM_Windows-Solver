@@ -758,7 +758,12 @@ function flatten_request(document)
     # every exterior receipt main ever produced for a change that never touched
     # that path.
     if mechanism == "horizon-admittance"
-        for key in ("horizon_contour", "determinant_error_model")
+        for key in (
+            "horizon_contour",
+            "determinant_error_model",
+            "control_profile_label",
+            "calibration_status",
+        )
             flattened[key] = required(policy, key)
         end
     end
@@ -836,6 +841,9 @@ function validate_regularised_gsn_policy(request)
                 HORIZON_DETERMINANT_NORMALISATION_ID,
             "horizon_contour" => REAL_INNER_HORIZON_CONTOUR_ID,
             "determinant_error_model" => VERIFIED_ENDPOINT_ERROR_MODEL_ID,
+            "control_profile_label" => PROMOTED_CONTROL_PROFILE_LABEL,
+            "calibration_status" =>
+                PROMOTED_CONTROL_PROFILE_CALIBRATION_STATUS,
         )
     else
         Dict{String,Any}(
@@ -860,7 +868,12 @@ function validate_regularised_gsn_policy(request)
     # merely null. A null would still change the exterior policy mapping, and
     # receipt reuse is decided by exact equality against it.
     if !horizon
-        for key in ("horizon_contour", "determinant_error_model")
+        for key in (
+            "horizon_contour",
+            "determinant_error_model",
+            "control_profile_label",
+            "calibration_status",
+        )
             haskey(request, key) &&
                 error("exterior request carries horizon-only policy $(key)")
         end
@@ -996,6 +1009,8 @@ end
 
 const VERIFIED_ENDPOINT_ERROR_MODEL_ID =
     "verified-endpoint-control-equivalence-absolute-error/v2"
+const PROMOTED_CONTROL_PROFILE_LABEL = "provisional promoted control profile"
+const PROMOTED_CONTROL_PROFILE_CALIBRATION_STATUS = "UNMEASURED"
 
 struct DeterminantErrorBreakdown{T<:AbstractFloat}
     endpoint_disagreement_abs::T

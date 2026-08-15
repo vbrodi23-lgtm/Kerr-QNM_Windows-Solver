@@ -91,13 +91,15 @@ PRE_REWRITE_HORIZON_PRECISION_POLICY = {
     "scattering_diagnostics_applicable": True,
 }
 
-# The four identities the rewrite actually changed. Every one of them names a
-# different calculation, not a different spelling of the same one.
+# The calculation identities changed by the rewrite plus the two horizon-only
+# controls that explicitly keep the unmeasured profile out of release.
 REWRITTEN_HORIZON_IDENTITY_FIELDS = {
     "homogeneous_representation",
     "scattering_coefficient_extraction",
     "horizon_contour",
     "determinant_error_model",
+    "control_profile_label",
+    "calibration_status",
 }
 
 
@@ -161,7 +163,12 @@ class MechanismScopedPolicyTests(unittest.TestCase):
         exterior = response_engine.regularised_gsn_precision_policy(
             "exterior-fixed-r3"
         )
-        for field in ("horizon_contour", "determinant_error_model"):
+        for field in (
+            "horizon_contour",
+            "determinant_error_model",
+            "control_profile_label",
+            "calibration_status",
+        ):
             with self.subTest(field=field):
                 self.assertIn(field, horizon)
                 self.assertNotIn(field, exterior)

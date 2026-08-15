@@ -11,6 +11,9 @@ FD_SPEC_SOURCE = (
     REPO_ROOT
     / "src/windows_solver/data/julia/m02_worker_finite_difference_spec.jl"
 )
+HARNESS_COMMON_SOURCE = REPO_ROOT / "tools/leaf13_horizon_harness_common.jl"
+CALIBRATION_SOURCE = REPO_ROOT / "tools/calibrate_leaf13_horizon_controls.jl"
+BENCHMARK_SOURCE = REPO_ROOT / "tools/benchmark_leaf13_factored_legs.jl"
 
 
 class RegularisedGsnWorkerSourceTests(unittest.TestCase):
@@ -18,6 +21,23 @@ class RegularisedGsnWorkerSourceTests(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.worker = WORKER_SOURCE.read_text(encoding="utf-8")
         cls.fd_spec = FD_SPEC_SOURCE.read_text(encoding="utf-8")
+        cls.harness_common = HARNESS_COMMON_SOURCE.read_text(encoding="utf-8")
+        cls.calibration = CALIBRATION_SOURCE.read_text(encoding="utf-8")
+        cls.benchmark = BENCHMARK_SOURCE.read_text(encoding="utf-8")
+
+    def test_leaf13_harnesses_share_the_canonical_determinant_api(self) -> None:
+        self.assertIn("module Leaf13HorizonHarnessCommon", self.harness_common)
+        self.assertIn("determinant_error_abs(T, evaluation)", self.harness_common)
+        self.assertNotIn("evaluation.numerical_error_abs", self.calibration)
+        self.assertNotIn("evaluation.numerical_error_abs", self.benchmark)
+        self.assertNotIn("include_string", self.calibration)
+        self.assertNotIn("split(", self.calibration)
+        for source in (self.calibration, self.benchmark):
+            self.assertIn(
+                'include(joinpath(@__DIR__, "leaf13_horizon_harness_common.jl"))',
+                source,
+            )
+            self.assertIn("if abspath(PROGRAM_FILE) == @__FILE__", source)
 
     def test_worker_no_longer_owns_raw_homogeneous_production_path(self) -> None:
         for retired in (
