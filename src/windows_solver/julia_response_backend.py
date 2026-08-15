@@ -33,6 +33,7 @@ from .response_engine import (
     ResponseComponentJob,
     RootAuthenticationEvidence,
     RootReadout,
+    VERIFIED_ENDPOINT_ERROR_MODEL,
     WORKER_RESPONSE_RECEIPT_SCHEMA,
     _exterior_support,
     mode_specific_branch_enclosure_radius,
@@ -1527,6 +1528,7 @@ def _valid_determinant_uncertainty_diagnostics(
         "correction_without_error",
         "root_correction_tolerance",
         "derivative_lower_bound_abs",
+        "root_authentication",
     })
     fields = frozenset(diagnostics)
     if fields in {newton_fields, authenticated_derivative_fields}:
@@ -1544,6 +1546,9 @@ def _valid_determinant_uncertainty_diagnostics(
         return lower is not None and lower <= 0
     if fields != small_determinant_fields:
         return False
+    numeric_small_determinant_fields = (
+        small_determinant_fields - {"root_authentication"}
+    )
     values = {
         name: _diagnostic_decimal(
             diagnostics,
@@ -1552,9 +1557,35 @@ def _valid_determinant_uncertainty_diagnostics(
             positive=name
             in {"root_correction_tolerance", "derivative_lower_bound_abs"},
         )
-        for name in small_determinant_fields
+        for name in numeric_small_determinant_fields
     }
     if any(value is None for value in values.values()):
+        return False
+    try:
+        authentication = RootAuthenticationEvidence.from_mapping(
+            diagnostics["root_authentication"]
+        )
+        authentication.validate_binding(
+            determinant_abs=values["determinant_abs"],
+            derivative_abs=authentication.derivative_estimate.magnitude(),
+            expected_error_model_id=VERIFIED_ENDPOINT_ERROR_MODEL,
+            root_correction_tolerance=values[
+                "root_correction_tolerance"
+            ],
+            accepted=False,
+        )
+    except (KeyError, ValueError):
+        return False
+    if (
+        authentication.accepted
+        or authentication.error_breakdown is None
+        or authentication.error_breakdown.numerical_error_abs
+        != values["determinant_error_abs"]
+        or authentication.derivative_lower_bound_abs
+        != values["derivative_lower_bound_abs"]
+        or authentication.correction_upper_bound
+        != values["correction_upper_bound"]
+    ):
         return False
     return (
         values["correction_upper_bound"]

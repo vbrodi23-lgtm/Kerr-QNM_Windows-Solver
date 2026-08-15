@@ -335,6 +335,136 @@ def control_failure_stage(failure_code: str) -> str:
     )
 
 
+def valid_control_failure_diagnostics(
+    failure_code: str,
+    *,
+    precision_bits: int = 298,
+) -> dict[str, object]:
+    """Return the exact typed diagnostic shape for one control failure."""
+
+    factored = {
+        "reason": failure_code,
+        "precision_bits": precision_bits,
+        "factored_homogeneous_rhs_evaluations": 0,
+        "avoided_ode_scope": "factored-homogeneous-gsn/v1",
+    }
+    if failure_code == "ASYMPTOTIC_SERIES_INVALID":
+        factored["reason"] = "NONFINITE_ASYMPTOTIC_DATA"
+    if failure_code == "INSUFFICIENT_ASYMPTOTIC_PRECISION":
+        return {
+            **factored,
+            "predicted_reliable_digits": "11.25000000000000000001",
+            "required_reliable_digits": "24",
+            "asymptotic_preflight_avoided_ode": True,
+            "asymptotic_preflight_reason": failure_code,
+            "maximum_series_digits_lost": "37.5",
+            "maximum_recurrence_digits_lost": "12.25",
+        }
+    if failure_code in {
+        "ASYMPTOTIC_SERIES_INVALID",
+        "PHYSICAL_SINGULAR_LIMIT",
+        "CARRIER_CHANGE_INCONSISTENT",
+        "INVALID_FACTORED_PROPAGATION_INPUT",
+        "FACTORED_PROPAGATION_PRECISION_MISMATCH",
+        "NONFINITE_FACTORED_PROPAGATION_DATA",
+        "FACTORED_ODE_FAILURE",
+        "NO_VERIFIED_HORIZON_ENDPOINT",
+    }:
+        return factored
+    if failure_code in {
+        "SCATTERING_BASIS_ILL_CONDITIONED",
+        "SCATTERING_CHART_ILL_CONDITIONED",
+    }:
+        return {"reason": failure_code, "precision_bits": precision_bits}
+    if failure_code == "ALGEBRAIC_REPRESENTATION_SINGULAR":
+        return {
+            "reason": "derivative-overflow/v1",
+            "range_status": "derivative-overflow/v1",
+            "operation": "finite-difference-derivative/v1",
+            "axis": "real",
+            "h": "1e-6",
+        }
+    if failure_code == "COORDINATE_INVERSION_STALLED":
+        return {
+            "reason": failure_code,
+            "range_status": "coordinate-inversion-stalled/v1",
+            "operation": "coordinate-inversion/v1",
+            "stall_reason": "microscopic-step",
+            "ode_leg": "r_from_rho_real_inner",
+            "ode_t_current": "-1e-11",
+            "ode_t_end": "-100",
+            "ode_span_abs": "100",
+            "ode_span_fraction": "1e-13",
+            "ode_rhs_evaluations": 200000,
+            "ode_accepted_steps": 12500,
+            "ode_last_accepted_step_abs": "8.1e-17",
+            "ode_min_accepted_step_abs": "8.0e-17",
+            "elapsed_leg_seconds": 8.75,
+        }
+    if failure_code == "DETERMINANT_UNCERTAINTY_TOO_LARGE":
+        residual_upper = Decimal("1e-28") + Decimal("2e-18")
+        correction_upper = residual_upper / Decimal(2)
+        return {
+            "determinant_abs": "1e-28",
+            "determinant_error_abs": "2e-18",
+            "correction_upper_bound": str(correction_upper),
+            "correction_without_error": "5e-29",
+            "root_correction_tolerance": "1e-18",
+            "derivative_lower_bound_abs": "2",
+            "root_authentication": {
+                "central_determinant_re": "1e-28",
+                "central_determinant_im": "0",
+                "determinant_error": {
+                    "endpoint_disagreement_abs": "1e-18",
+                    "control_disagreement_abs": None,
+                    "equivalence_disagreement_abs": None,
+                    "precision_disagreement_abs": None,
+                    "safety_factor": "2",
+                    "numerical_error_abs": "2e-18",
+                    "error_model_id": (
+                        "verified-endpoint-control-equivalence-absolute-error/v2"
+                    ),
+                },
+                "residual_upper_bound_abs": str(residual_upper),
+                "derivative_authentication": {
+                    "derivative_re": "2",
+                    "derivative_im": "0",
+                    "propagated_error_abs": "0",
+                    "step_disagreement_abs": "0",
+                    "lower_bound_abs": "2",
+                    "selected_step": "5e-7",
+                    "axis": "real",
+                },
+                "correction_upper_bound": str(correction_upper),
+                "root_correction_tolerance": "1e-18",
+                "accepted": False,
+            },
+        }
+    if failure_code == "FINITE_DIFFERENCE_NOISE_LIMIT":
+        return {
+            "nominal_step": "1e-6",
+            "minimum_step": "1e-8",
+            "maximum_step": "1e-4",
+            "attempts": [{
+                "h": "1e-6",
+                "real_step_convergent": False,
+                "complex_axis_consistent": True,
+                "noise_resolved": False,
+                "derivative_abs": "2.4",
+                "derivative_uncertainty_abs": "1e-8",
+                "base_derivative_error_abs": "2e-8",
+                "half_derivative_error_abs": "3e-8",
+                "double_derivative_error_abs": "4e-8",
+                "imaginary_derivative_error_abs": "5e-8",
+                "derivative_error_abs": "3e-8",
+                "accepted": False,
+            }],
+        }
+    raise AssertionError(
+        f"missing typed diagnostic fixture for {failure_code}"
+    )
+
+
 def valid_root_authentication(mechanism_id: str) -> dict[str, object]:
     """Return the worker's error-aware root authentication record.
 

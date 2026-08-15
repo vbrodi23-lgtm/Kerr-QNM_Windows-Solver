@@ -32,7 +32,10 @@ from windows_solver.response_batches import (
     PrecisionCapabilities,
     build_campaign_plan,
 )
-from tests.fixtures import valid_numerical_conditioning
+from tests.fixtures import (
+    root_authentication_for_readout,
+    valid_numerical_conditioning,
+)
 
 
 # Copied verbatim from `regularised_gsn_precision_policy("exterior-fixed-r3")`
@@ -260,6 +263,21 @@ class ReceiptCompatibilityTests(unittest.TestCase):
                     canonical_json_bytes(material)
                 ).hexdigest(),
             },
+            root_authentication=(
+                response_engine.RootAuthenticationEvidence.from_mapping(
+                    root_authentication_for_readout(
+                        mechanism_id=job.mechanism_id,
+                        determinant_abs=Decimal("1E-12"),
+                        derivative_abs=Decimal("2"),
+                        root_correction_tolerance=Decimal(
+                            request_binding["policy"][
+                                "root_correction_tolerance"
+                            ]
+                        ),
+                        accepted=False,
+                    )
+                )
+            ),
         )
 
     def _validate(self, mechanism, policy):

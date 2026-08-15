@@ -39,12 +39,18 @@ from windows_solver.response_engine import (
     LadderLevel,
     NumericalPolicy,
     NumericalConditioningEvidence,
+    RootAuthenticationEvidence,
     RootReadout,
     VettedNativeDeterminantKernel,
     regularised_gsn_precision_policy,
 )
 from windows_solver.solved_leaf_cache import SolvedLeafStore
-from tests.fixtures import control_failure_stage, valid_numerical_conditioning
+from tests.fixtures import (
+    control_failure_stage,
+    root_authentication_for_readout,
+    valid_control_failure_diagnostics,
+    valid_numerical_conditioning,
+)
 
 
 def leaf_id(role, mode_label, coordinate, mechanism_id):
@@ -110,6 +116,7 @@ def remove_promotion_decision_and_reseal(
             "raw_determinant_abs",
             "raw_determinant_evidence_status",
             "worker_response_receipt",
+            "root_authentication",
         ):
             baseline.pop(name, None)
     if historical_shape:
@@ -340,21 +347,6 @@ def _with_baseline_conditioning(
 
     def conditioned(readout, readout_id):
         existing_receipt = readout.worker_response_receipt
-        updated = replace(
-            readout,
-            diagnostic_readouts=(readout.diagnostic_readouts or None),
-            numerical_conditioning=evidence,
-            normalised_determinant_abs=Decimal(
-                str(readout.determinant_residual_abs)
-            ),
-            raw_determinant_abs=(
-                Decimal(str(readout.determinant_residual_abs))
-                if raw_status == "available/v1"
-                else None
-            ),
-            raw_determinant_evidence_status=raw_status,
-            worker_response_receipt=None,
-        )
         if existing_receipt is not None:
             request_binding = dict(existing_receipt["request_binding"])
             scientific_runtime_sha256 = existing_receipt[
@@ -379,10 +371,52 @@ def _with_baseline_conditioning(
                 "precision_digits": outcome.digits,
                 "refinement_level": 0,
                 "synthetic_readout_id": readout_id,
+                "policy": {
+                    "root_correction_tolerance": "1e-18",
+                },
             }
             scientific_runtime_sha256 = hashlib.sha256(
                 canonical_json_bytes(scientific_runtime)
             ).hexdigest()
+        request_policy = request_binding.get("policy")
+        if not isinstance(request_policy, dict):
+            request_binding = dict(request_binding)
+            request_binding["policy"] = {
+                "root_correction_tolerance": "1e-18",
+            }
+            request_policy = request_binding["policy"]
+        correction_tolerance = Decimal(
+            request_policy["root_correction_tolerance"]
+        )
+        derivative = Decimal(str(readout.determinant_derivative_abs))
+        normalised = Decimal(str(readout.determinant_residual_abs))
+        if readout.converged:
+            normalised = min(
+                normalised,
+                derivative * correction_tolerance / Decimal(10),
+            )
+        authentication = RootAuthenticationEvidence.from_mapping(
+            root_authentication_for_readout(
+                mechanism_id=result.mechanism_id,
+                determinant_abs=normalised,
+                derivative_abs=derivative,
+                root_correction_tolerance=correction_tolerance,
+                accepted=readout.converged,
+            )
+        )
+        updated = replace(
+            readout,
+            determinant_residual_abs=float(normalised),
+            diagnostic_readouts=(readout.diagnostic_readouts or None),
+            numerical_conditioning=evidence,
+            normalised_determinant_abs=normalised,
+            raw_determinant_abs=(
+                normalised if raw_status == "available/v1" else None
+            ),
+            raw_determinant_evidence_status=raw_status,
+            worker_response_receipt=None,
+            root_authentication=authentication,
+        )
         receipt_material = {
             "schema": "windows-solver.worker-response-receipt/1",
             "request_binding": request_binding,
@@ -995,6 +1029,7 @@ class PromotedConditioningDecisionTests(unittest.TestCase):
                 "raw_determinant_abs",
                 "raw_determinant_evidence_status",
                 "worker_response_receipt",
+                "root_authentication",
             ):
                 readout.pop(field, None)
         source_sha256 = hashlib.sha256(
@@ -1546,14 +1581,14 @@ class PromotedResourceContainmentTests(unittest.TestCase):
                 },
             })
         if error_class is julia_backend.JuliaNumericalControlError:
-            error.worker_failure["failure"]["diagnostics"] = {
-                "predicted_reliable_digits": "11.25000000000000000001",
-                "required_reliable_digits": "24",
-                "asymptotic_preflight_avoided_ode": True,
-                "asymptotic_preflight_reason": failure_code,
-                "factored_homogeneous_rhs_evaluations": 0,
-                "avoided_ode_scope": "factored-homogeneous-gsn/v1",
-            }
+            error.worker_failure["failure"]["diagnostics"] = (
+                valid_control_failure_diagnostics(
+                    failure_code,
+                    precision_bits=(
+                        math.ceil(precision_digits * math.log2(10)) + 32
+                    ),
+                )
+            )
         return error
 
     def _run_with_failure(self, error_class, failure_code, *, timed_out=False):
