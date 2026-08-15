@@ -1133,6 +1133,11 @@ $candidate | ConvertTo-Json -Compress | Set-Content -LiteralPath $env:M02_TEST_J
             "available/v1",
             "unavailable-overflow/v1",
             "not-applicable/v1",
+            "coordinate-inversion-stalled/v1",
+            "coordinate-inversion/v1",
+            "finite-difference-derivative/v1",
+            "invalid-frequency-step/v1",
+            "finite-difference-request-policy/v1",
         })
         lineage_character = r"A-Za-z0-9_/:;=+\-"
         approved_identity = re.compile(
