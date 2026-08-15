@@ -207,11 +207,38 @@ def regularised_gsn_precision_policy(
     builds a genuine solution basis from three independent legs seeded on a
     verified real-inner contour. Receipts written under the previous horizon
     identities describe a different calculation and are correctly treated as
-    stale. Exterior receipts are unaffected -- that path is unchanged.
+    stale.
+
+    The exterior policy is byte-identical to the one on ``main``, because the
+    exterior path did not change. That is not a courtesy -- receipt reuse is
+    decided by exact equality against this mapping, so an exterior policy that
+    merely *gained a key* would retire every exterior receipt ``main`` ever
+    produced, on account of a rewrite that never touched them.
+
+    Hence ``horizon_contour`` and ``determinant_error_model``, both introduced
+    by this rewrite, appear only under the mechanism they describe. Adding them
+    as ``None`` to the exterior policy would be the same category error stated
+    twice: it claims the exterior mechanism has a horizon contour whose value
+    happens to be nothing, and it invalidates receipts to say so.
+
+    The older mechanism-specific keys (``scattering_coefficient_extraction``,
+    ``horizon_determinant_chart``, ``scattering_chart_safety_factor``) do carry
+    an explicit ``None`` on the exterior side. They are kept exactly as they
+    are for the same reason the new ones are omitted: they are already part of
+    ``main``'s exterior policy, and normalising them now would break the very
+    compatibility this function exists to preserve.
     """
 
     contract = regularised_gsn_mechanism_contract(mechanism_id)
     horizon = contract["scattering_diagnostics_applicable"] is True
+    horizon_only: dict[str, object] = (
+        {
+            "horizon_contour": REAL_INNER_HORIZON_CONTOUR,
+            "determinant_error_model": VERIFIED_ENDPOINT_ERROR_MODEL,
+        }
+        if horizon
+        else {}
+    )
     return MappingProxyType({
         **_REGULARISED_GSN_COMMON_PRECISION_POLICY,
         **contract,
@@ -229,10 +256,7 @@ def regularised_gsn_precision_policy(
             "cinc-over-cref-minus-reflectivity/v1" if horizon else None
         ),
         "scattering_chart_safety_factor": "64" if horizon else None,
-        "horizon_contour": REAL_INNER_HORIZON_CONTOUR if horizon else None,
-        "determinant_error_model": (
-            VERIFIED_ENDPOINT_ERROR_MODEL if horizon else None
-        ),
+        **horizon_only,
     })
 
 _NUMERICAL_CONDITIONING_DECIMAL_FIELDS = (

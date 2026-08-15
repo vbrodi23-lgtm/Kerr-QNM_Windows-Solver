@@ -1388,19 +1388,23 @@ class JuliaSchemaThreeConditioningTests(unittest.TestCase):
         self.assertIsNone(policy["horizon_determinant_chart"])
         self.assertIsNone(policy["scattering_chart_safety_factor"])
         # The exterior path is unchanged by the horizon rewrite: it keeps the
-        # original representation and carries no horizon contour or
-        # determinant-error model.
+        # original representation, and the identities the rewrite introduced
+        # are absent rather than null. A null would still change the policy
+        # mapping, and receipt reuse is decided by exact equality against it --
+        # so every exterior receipt main produced would go stale for a change
+        # that never touched the exterior determinant.
         self.assertEqual(
             policy["homogeneous_representation"], "factored-plane-wave-gsn/v1"
         )
-        self.assertIsNone(policy["horizon_contour"])
-        self.assertIsNone(policy["determinant_error_model"])
+        self.assertNotIn("horizon_contour", policy)
+        self.assertNotIn("determinant_error_model", policy)
         runtime_policy = backend.scientific_runtime_for(job)[
             "regularised_gsn_precision_policy"
         ]
         self.assertEqual(
             set(runtime_policy),
-            set(response_engine.REGULARISED_GSN_PRECISION_POLICY),
+            set(response_engine.REGULARISED_GSN_PRECISION_POLICY)
+            - {"horizon_contour", "determinant_error_model"},
         )
         self.assertEqual(
             runtime_policy,

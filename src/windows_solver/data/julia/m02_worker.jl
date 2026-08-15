@@ -749,10 +749,18 @@ function flatten_request(document)
         "scattering_column_convention",
         "determinant_convention",
         "determinant_normalisation",
-        "horizon_contour",
-        "determinant_error_model",
     )
         flattened[key] = required(policy, key)
+    end
+    # Introduced by the horizon rewrite, and carried only under the mechanism
+    # they describe. Receipt reuse is decided by exact equality against the
+    # policy mapping, so adding them as nulls on the exterior side would retire
+    # every exterior receipt main ever produced for a change that never touched
+    # that path.
+    if mechanism == "horizon-admittance"
+        for key in ("horizon_contour", "determinant_error_model")
+            flattened[key] = required(policy, key)
+        end
     end
     if mechanism != "horizon-admittance"
         support = required(document, "support")
@@ -842,13 +850,20 @@ function validate_regularised_gsn_policy(request)
                 EXTERIOR_DETERMINANT_CONVENTION_ID,
             "determinant_normalisation" =>
                 EXTERIOR_DETERMINANT_NORMALISATION_ID,
-            "horizon_contour" => nothing,
-            "determinant_error_model" => nothing,
         )
     end
     for (key, expected) in expected_mechanism
         isequal(required(request, key), expected) ||
             error("regularised GSN mechanism policy $(key) is invalid")
+    end
+    # The horizon-only identities must be absent from an exterior request, not
+    # merely null. A null would still change the exterior policy mapping, and
+    # receipt reuse is decided by exact equality against it.
+    if !horizon
+        for key in ("horizon_contour", "determinant_error_model")
+            haskey(request, key) &&
+                error("exterior request carries horizon-only policy $(key)")
+        end
     end
     return nothing
 end
