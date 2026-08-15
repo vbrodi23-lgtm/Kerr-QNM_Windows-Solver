@@ -460,6 +460,31 @@ class JuliaResponseBackendTests(unittest.TestCase):
                 # actually stores.
                 json.loads(json.dumps(readout.to_mapping()["root_authentication"]))
 
+    def test_readout_rejects_authentication_detached_after_persistence(self):
+        """Catches a coherent certificate being moved onto another readout."""
+
+        readout = JuliaPrecisionRootBackend(
+            VettedNativeDeterminantKernel.identity, FakeAdapter(), 80
+        ).read_root(_job_for_mechanism("horizon-admittance"), 0.0j)
+        mapping = readout.to_mapping()
+        authentication = dict(mapping["root_authentication"])
+        authentication["central_determinant"] = {
+            "real": "2E-60",
+            "imaginary": "0",
+        }
+        authentication["residual_upper_bound_abs"] = "3.4E-60"
+        with localcontext() as context:
+            context.prec = 180
+            authentication["correction_upper_bound"] = str(
+                Decimal("3.4E-60") / Decimal("2.4")
+            )
+        mapping["root_authentication"] = authentication
+
+        with self.assertRaisesRegex(
+            ValueError, "root authentication.*root readout"
+        ):
+            RootReadout.from_mapping(mapping)
+
     def test_backend_rejects_authentication_disagreeing_with_its_family(self):
         """Catches an error-aware decision made from an absent error term."""
 

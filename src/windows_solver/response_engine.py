@@ -1869,6 +1869,66 @@ class RootReadout:
                 "normalised_determinant_abs disagrees with "
                 "determinant_residual_abs"
             )
+        authentication = self.root_authentication
+        if authentication is not None:
+            if (
+                self.numerical_conditioning is None
+                or self.normalised_determinant_abs is None
+            ):
+                raise ValueError(
+                    "root authentication requires a conditioned root readout"
+                )
+            expected_error_model_id = (
+                VERIFIED_ENDPOINT_ERROR_MODEL
+                if self.numerical_conditioning.scattering_diagnostics_applicable
+                else None
+            )
+            if authentication.error_model_id != expected_error_model_id:
+                raise ValueError(
+                    "root authentication model disagrees with root readout"
+                )
+            with localcontext() as context:
+                context.prec = _ROOT_AUTHENTICATION_CHECK_DIGITS
+                if not authentication._relation_matches(
+                    authentication.central_determinant.magnitude(),
+                    self.normalised_determinant_abs,
+                    self.normalised_determinant_abs,
+                ):
+                    raise ValueError(
+                        "root authentication determinant disagrees with root "
+                        "readout"
+                    )
+                derivative_abs = float(
+                    authentication.derivative_estimate.magnitude()
+                )
+            if not math.isclose(
+                derivative_abs,
+                self.determinant_derivative_abs,
+                rel_tol=1.0e-15,
+                abs_tol=0.0,
+            ):
+                raise ValueError(
+                    "root authentication derivative disagrees with root readout"
+                )
+            if self.converged and receipt is not None:
+                request_policy = receipt["request_binding"].get("policy")
+                if not isinstance(request_policy, Mapping):
+                    raise ValueError(
+                        "root authentication receipt policy is invalid"
+                    )
+                correction_tolerance = _conditioning_decimal_from_text(
+                    request_policy.get("root_correction_tolerance"),
+                    "root authentication receipt correction tolerance",
+                )
+                if (
+                    correction_tolerance < 0
+                    or authentication.correction_upper_bound
+                    > correction_tolerance
+                ):
+                    raise ValueError(
+                        "root authentication exceeds the root readout correction "
+                        "target"
+                    )
         object.__setattr__(
             self,
             "source_root_mapping",
