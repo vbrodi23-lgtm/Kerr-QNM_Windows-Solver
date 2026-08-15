@@ -93,9 +93,9 @@ _POLISHED_BASELINES = {
     ),
 }
 _POLISHED_IDENTITIES = {
-    "b-prime-leaf-4c8594e4a59486a1c56206e41cd7f7f3ff1ab5193a5ff6b699cbe9492bc45355": "af2fd8349e2a071f0b8c50004963a0e0fe7c4d8d6e6ae7c0f74f1f1485609508",
-    "b-prime-leaf-0f36daefa853de1280f17c8b8ef89bbaf9b34f5e5044a5eb85bc563d3896b60d": "37c6ed02e830114f774f1b4b0fd8c1f199fa759147fc8855435a3445426fec78",
-    "b-prime-leaf-08b8dc3df83fc1304a61d8b6105c412a316a44816ca229d375573fdf72ac0a57": "a853181c4fa27517c8b72836e1babf64a7ce74968b9128266bb898d998406f69",
+    "b-prime-leaf-4c8594e4a59486a1c56206e41cd7f7f3ff1ab5193a5ff6b699cbe9492bc45355": "62f36d7217898d9968f0f3d2e44f30a076afe054febb2cc576f941a8968159c3",
+    "b-prime-leaf-0f36daefa853de1280f17c8b8ef89bbaf9b34f5e5044a5eb85bc563d3896b60d": "fba08bef6e2d43a171dcbc8dea177deef7b237ccbc8446c43278c0f82ed349a6",
+    "b-prime-leaf-08b8dc3df83fc1304a61d8b6105c412a316a44816ca229d375573fdf72ac0a57": "cb4a971f19df2eb997ff57199ffbb19e8258ef919871bffacc03559ecb10b543",
 }
 
 
@@ -898,7 +898,7 @@ class SolvedLeafCacheTests(unittest.TestCase):
         )
         self.assertEqual(
             scientific_computation_identity_sha256(plan, leaf),
-            "3e53114753ca751b7fe5567390402b9f104bd442208d492ec18fbcbc03bc5b3a",
+            "feeb5628e6549afda7f968dcc90ca01fbe9b418d05d888d4cefb38296f77d5b2",
         )
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

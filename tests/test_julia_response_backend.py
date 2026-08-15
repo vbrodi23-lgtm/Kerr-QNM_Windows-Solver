@@ -624,9 +624,33 @@ class JuliaResponseBackendTests(unittest.TestCase):
 
         self.assertIn('"root_correction_tolerance"', worker)
         self.assertIn('"newton_correction_estimate_abs"', worker)
-        self.assertIn("correction_abs = magnitude / derivative_abs", worker)
+        # Acceptance compares error-inclusive quantities. Using |D| / |D'|
+        # treats a determinant that is small only because its own noise
+        # cancelled as though the root were located.
+        self.assertIn(
+            "residual_upper_bound = magnitude + residual_error_abs", worker
+        )
+        self.assertIn(
+            "derivative_lower_bound = derivative_abs - derivative_error_abs",
+            worker,
+        )
+        self.assertIn(
+            "correction_abs = residual_upper_bound / derivative_lower_bound",
+            worker,
+        )
         self.assertIn("correction_abs <= tolerance", worker)
+        self.assertNotIn("correction_abs = magnitude / derivative_abs", worker)
         self.assertNotIn("best_residual <= tolerance", worker)
+        # A slope indistinguishable from determinant noise is named, not
+        # divided by.
+        self.assertIn("DETERMINANT_UNCERTAINTY_TOO_LARGE", worker)
+        self.assertIn("derivative_lower_bound <= zero(T)", worker)
+        # Damping compares error-inclusive bounds too.
+        self.assertIn(
+            "candidate_improves = candidate_upper_bound < residual_upper_bound",
+            worker,
+        )
+        self.assertNotIn("if candidate_abs < magnitude", worker)
 
     def test_package_worker_uses_stable_two_ended_determinants(self):
         """Catches singular horizon reconstruction and common-flow exterior roots."""

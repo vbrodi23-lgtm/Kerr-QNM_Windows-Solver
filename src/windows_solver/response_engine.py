@@ -151,14 +151,17 @@ _REGULARISED_GSN_COMMON_PRECISION_POLICY: Mapping[str, object] = MappingProxyTyp
 })
 REGULARISED_GSN_PRECISION_POLICY: Mapping[str, object] = MappingProxyType({
     **_REGULARISED_GSN_COMMON_PRECISION_POLICY,
+    "homogeneous_representation": HORIZON_HOMOGENEOUS_REPRESENTATION,
     "determinant_family": HORIZON_DETERMINANT_FAMILY,
     "scattering_diagnostics_applicable": True,
-    "scattering_coefficient_extraction": "scaled-factored-horizon-basis/v1",
+    "scattering_coefficient_extraction": HORIZON_BASIS_AT_MATCH_EXTRACTION,
     "horizon_determinant_chart": "cinc-over-cref-minus-reflectivity/v1",
     "scattering_chart_safety_factor": "64",
     "scattering_column_convention": HORIZON_SCATTERING_COLUMN_CONVENTION,
     "determinant_convention": HORIZON_DETERMINANT_CONVENTION,
     "determinant_normalisation": HORIZON_DETERMINANT_NORMALISATION,
+    "horizon_contour": REAL_INNER_HORIZON_CONTOUR,
+    "determinant_error_model": VERIFIED_ENDPOINT_ERROR_MODEL,
 })
 
 

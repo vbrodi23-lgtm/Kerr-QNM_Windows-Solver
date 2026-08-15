@@ -1309,12 +1309,19 @@ class JuliaSchemaThreeConditioningTests(unittest.TestCase):
         expected = {
             "determinant_family": "horizon-scattering/v1",
             "scattering_diagnostics_applicable": True,
-            "homogeneous_representation": "factored-plane-wave-gsn/v1",
+            # The horizon determinant is built from three independent legs on
+            # a verified real-inner contour, so it carries its own
+            # representation, contour, extraction, and error-model identities.
+            "homogeneous_representation": (
+                "factored-three-leg-horizon-basis-at-match-gsn/v1"
+            ),
+            "horizon_contour": "real-inner-tortoise-contour/v1",
+            "determinant_error_model": "verified-endpoint-absolute-error/v1",
             "asymptotic_series_evaluation": (
                 "typed-batch-horner-compensated/v1"
             ),
             "scattering_coefficient_extraction": (
-                "scaled-factored-horizon-basis/v1"
+                "scaled-horizon-basis-at-match/v1"
             ),
             "horizon_determinant_chart": (
                 "cinc-over-cref-minus-reflectivity/v1"
@@ -1377,6 +1384,14 @@ class JuliaSchemaThreeConditioningTests(unittest.TestCase):
         self.assertIsNone(policy["scattering_coefficient_extraction"])
         self.assertIsNone(policy["horizon_determinant_chart"])
         self.assertIsNone(policy["scattering_chart_safety_factor"])
+        # The exterior path is unchanged by the horizon rewrite: it keeps the
+        # original representation and carries no horizon contour or
+        # determinant-error model.
+        self.assertEqual(
+            policy["homogeneous_representation"], "factored-plane-wave-gsn/v1"
+        )
+        self.assertIsNone(policy["horizon_contour"])
+        self.assertIsNone(policy["determinant_error_model"])
         runtime_policy = backend.scientific_runtime_for(job)[
             "regularised_gsn_precision_policy"
         ]
@@ -1474,6 +1489,10 @@ class JuliaNumericalControlFailureTests(unittest.TestCase):
         "FACTORED_PROPAGATION_PRECISION_MISMATCH",
         "NONFINITE_FACTORED_PROPAGATION_DATA",
         "FACTORED_ODE_FAILURE",
+        "NO_VERIFIED_HORIZON_ENDPOINT",
+        "COORDINATE_INVERSION_STALLED",
+        "DETERMINANT_UNCERTAINTY_TOO_LARGE",
+        "FINITE_DIFFERENCE_NOISE_LIMIT",
     )
 
     @staticmethod
