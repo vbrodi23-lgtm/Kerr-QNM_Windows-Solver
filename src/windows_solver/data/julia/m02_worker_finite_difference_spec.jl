@@ -31,6 +31,10 @@ function finite_difference_control_request(;
         "frequency_step_minimum" => frequency_step_minimum,
         "frequency_step_maximum" => frequency_step_maximum,
         "determinant_error_safety_factor" => determinant_error_safety_factor,
+        # Needed only to build a real DeterminantRequestContext for the
+        # executed caller-chain testsets; the algebraic testsets ignore them.
+        "spin" => "0.95",
+        "m" => 2,
     )
 end
 
@@ -61,6 +65,224 @@ end
 @testset "centred stencil propagates unequal endpoint errors" begin
     @test propagated_centered_difference_error(2.0, 6.0, 2.0) == 2.0
     @test propagated_centered_difference_error(1.0, 9.0, 0.5) == 10.0
+end
+
+#####
+##### Executed caller-chain specification
+#####
+#
+# The helper above is pure algebra. Asserting it alone leaves the question that
+# actually matters unanswered: whether the error a sample carries reaches the
+# bound the ladder decides on, through finite_difference_pair, final_derivative
+# and the rung search as production calls them. These testsets execute that
+# chain against a controlled determinant.
+
+const SPEC_ROOT = complex(0.5, -0.1)
+
+"""
+    spec_determinant_evaluator(; slope, plus_error, minus_error, calls)
+
+Return a determinant evaluator with an exactly known derivative.
+
+`D(omega) = slope * (omega - SPEC_ROOT)` is linear, so every centred difference
+returns `slope` exactly at every step. Step disagreement is therefore zero by
+construction and the only thing that can move the derivative lower bound is the
+propagated determinant error -- which is what these tests are about.
+
+The two half-stencil samples carry deliberately unequal errors so a chain that
+silently used one endpoint twice, or averaged before propagating, would show up.
+"""
+function spec_determinant_evaluator(;
+    slope::ComplexF64=complex(2.0, 0.0),
+    plus_error::Float64=1.0e-12,
+    minus_error::Float64=5.0e-13,
+    calls::Union{Nothing,Vector{ComplexF64}}=nothing,
+)
+    return function (
+        value_type, request, context, omega, amplitude, purpose, current
+    )
+        calls === nothing || push!(calls, ComplexF64(omega))
+        error_abs = real(omega) >= real(SPEC_ROOT) ? plus_error : minus_error
+        breakdown = DeterminantErrorBreakdown{Float64}(
+            error_abs, nothing, nothing, nothing, 1.0, error_abs
+        )
+        return (
+            value=slope * (omega - SPEC_ROOT),
+            error_breakdown=breakdown,
+            error_model_id="specification-evaluator/v1",
+        )
+    end
+end
+
+function spec_request_context(request)
+    return build_determinant_request_context(Float64, request, SPEC_ROOT)
+end
+
+@testset "sample errors reach the accepted bound through the real chain" begin
+    request = finite_difference_control_request()
+    context = spec_request_context(request)
+    calls = ComplexF64[]
+    evaluator = spec_determinant_evaluator(calls=calls)
+
+    ladder = evaluate_derivative_step_ladder(
+        Float64,
+        request,
+        context,
+        SPEC_ROOT,
+        complex(0.0, 0.0),
+        nothing;
+        authenticate_controls=true,
+        determinant_evaluator=evaluator,
+    )
+
+    # A linear determinant differentiates exactly, so the estimate is the slope
+    # and the step disagreement is zero at every rung.
+    @test ladder.derivative_real_half ≈ complex(2.0, 0.0)
+    @test ladder.derivative_uncertainty_abs ≈ 0.0 atol = 1.0e-9
+
+    # The accepted derivative is the h/2 estimate, so the reported step is h/2
+    # and the reported error is the error propagated at that step, not at h.
+    authentication = ladder.derivative_authentication
+    @test authentication.step ≈ ladder.h / 2
+    expected_error = propagated_centered_difference_error(
+        1.0e-12, 5.0e-13, ladder.h / 2
+    )
+    @test authentication.propagated_error_abs ≈ expected_error
+    @test ladder.derivative_error_abs ≈ expected_error
+    # Unequal endpoint errors must not collapse to either one alone.
+    @test authentication.propagated_error_abs !=
+        propagated_centered_difference_error(1.0e-12, 1.0e-12, ladder.h / 2)
+
+    # The lower bound is the estimate less both the step disagreement and the
+    # propagated error, and it is what acceptance was decided on.
+    @test authentication.lower_bound_abs ≈
+        abs(ladder.derivative_real_half) -
+        ladder.derivative_uncertainty_abs -
+        expected_error
+    @test authentication.lower_bound_abs > 0
+
+    # Four samples per rung -- h, h/2, 2h, ih -- each a centred pair.
+    @test length(calls) == 8
+    @test ladder.rung_index == 1
+end
+
+@testset "unresolved noise exhausts the range with a typed failure" begin
+    request = finite_difference_control_request()
+    context = spec_request_context(request)
+    calls = ComplexF64[]
+    # An error far larger than the derivative can never leave a positive lower
+    # bound at any step, so every rung must be rejected.
+    evaluator = spec_determinant_evaluator(
+        plus_error=1.0e6, minus_error=1.0e6, calls=calls
+    )
+
+    failure = try
+        evaluate_derivative_step_ladder(
+            Float64,
+            request,
+            context,
+            SPEC_ROOT,
+            complex(0.0, 0.0),
+            nothing;
+            authenticate_controls=true,
+            determinant_evaluator=evaluator,
+        )
+        nothing
+    catch caught
+        caught
+    end
+
+    @test failure isa NumericalControlFailure
+    details = failure_details(failure)
+    @test details["failure_code"] == "FINITE_DIFFERENCE_NOISE_LIMIT"
+    attempts = details["attempts"]
+    # Exhaustion is finite and every attempt records which condition failed.
+    @test !isempty(attempts)
+    @test length(attempts) <= MAXIMUM_FREQUENCY_STEP_RUNGS
+    @test all(attempt -> attempt["accepted"] == false, attempts)
+    @test all(attempt -> attempt["noise_resolved"] == false, attempts)
+    @test length(calls) == 8 * length(attempts)
+end
+
+@testset "unauthenticated control keeps the single-step historical path" begin
+    request = finite_difference_control_request()
+    context = spec_request_context(request)
+    calls = ComplexF64[]
+    evaluator = spec_determinant_evaluator(calls=calls)
+
+    ladder = evaluate_derivative_step_ladder(
+        Float64,
+        request,
+        context,
+        SPEC_ROOT,
+        complex(0.0, 0.0),
+        nothing;
+        authenticate_controls=false,
+        determinant_evaluator=evaluator,
+    )
+
+    # No rung search: one step, taken at the nominal policy value. The exterior
+    # scientific identity is unchanged by this work, so its derivative
+    # selection must be unchanged too -- otherwise two runs under one identity
+    # could disagree.
+    @test ladder.rung_count == 1
+    @test ladder.rung_index == 1
+    @test ladder.h ≈ validated_frequency_step(Float64, request) *
+        (1.0 + abs(SPEC_ROOT))
+    @test length(calls) == 8
+    @test ladder.derivative_real_half ≈ complex(2.0, 0.0)
+
+    # The accepted Newton derivative is reused on this path, which removes the
+    # base pair.
+    reuse_calls = ComplexF64[]
+    reused = evaluate_derivative_step_ladder(
+        Float64,
+        request,
+        context,
+        SPEC_ROOT,
+        complex(0.0, 0.0),
+        complex(2.0, 0.0);
+        authenticate_controls=false,
+        determinant_evaluator=spec_determinant_evaluator(calls=reuse_calls),
+    )
+    @test reused.derivative_real_base ≈ complex(2.0, 0.0)
+    @test length(reuse_calls) == 6
+end
+
+@testset "a narrow range cannot silently sample outside policy" begin
+    # The authenticated search needs room for h/2 and 2h; a range narrower than
+    # a factor of four has none, and must be refused rather than evaluated
+    # outside the configured bounds.
+    request = finite_difference_control_request(
+        frequency_step="1e-6",
+        frequency_step_minimum="1e-6",
+        frequency_step_maximum="2e-6",
+    )
+    context = spec_request_context(request)
+    @test_throws NumericalControlFailure evaluate_derivative_step_ladder(
+        Float64,
+        request,
+        context,
+        SPEC_ROOT,
+        complex(0.0, 0.0),
+        nothing;
+        authenticate_controls=true,
+        determinant_evaluator=spec_determinant_evaluator(),
+    )
+
+    # The unauthenticated path only ever uses the nominal step, so the same
+    # narrow policy remains usable there.
+    ladder = evaluate_derivative_step_ladder(
+        Float64,
+        request,
+        context,
+        SPEC_ROOT,
+        complex(0.0, 0.0),
+        nothing;
+        authenticate_controls=false,
+        determinant_evaluator=spec_determinant_evaluator(),
+    )
+    @test ladder.rung_count == 1
 end
 
 @testset "frequency step rungs are finite bounded and de-duplicated" begin

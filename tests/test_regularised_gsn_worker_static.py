@@ -134,6 +134,91 @@ class RegularisedGsnWorkerSourceTests(unittest.TestCase):
         self.assertIn("safety_factor * maximum(available_components)", estimate)
         self.assertNotIn("/ abs(", estimate)
 
+    def test_unauthenticated_families_keep_the_single_step_control(self) -> None:
+        """Catches the rung search silently changing exterior results.
+
+        The exterior scientific identity is deliberately unchanged by this
+        work, so exterior receipts written before it stay valid and reusable.
+        If exterior derivative selection changed, two runs under one identity
+        could disagree and the identity would stop meaning what it claims.
+        """
+
+        self.assertIn(
+            "function evaluate_single_derivative_step(", self.worker
+        )
+        ladder = self._function_slice(
+            "evaluate_derivative_step_ladder", "root_authentication_text"
+        )
+        # The unauthenticated path returns before any rung construction or
+        # frequency-range validation happens.
+        gate = ladder.index(
+            "authenticate_controls || return evaluate_single_derivative_step("
+        )
+        for rung_only in (
+            "validated_frequency_steps(",
+            "frequency_step_rungs(",
+            "FINITE_DIFFERENCE_NOISE_LIMIT",
+        ):
+            self.assertIn(rung_only, ladder)
+            self.assertLess(gate, ladder.index(rung_only))
+
+        single = self._function_slice(
+            "evaluate_single_derivative_step", "evaluate_derivative_step_ladder"
+        )
+        # It uses the nominal step alone and never consults the rung bounds.
+        self.assertIn("validated_frequency_step(T, request)", single)
+        for rung_only in (
+            "validated_frequency_steps(",
+            "frequency_step_rungs(",
+            "MAXIMUM_FREQUENCY_STEP_RUNGS",
+        ):
+            self.assertNotIn(rung_only, single)
+        # It keeps the historical accept-or-fail contract rather than stepping
+        # to another rung.
+        self.assertIn(
+            "determinant frequency derivative estimates do not agree", single
+        )
+        # The four-fold width requirement belongs to the rung search alone, so
+        # the Newton loop's step validation must not import it.
+        nominal_validator = self._function_slice(
+            "validated_frequency_step", "frequency_step_rungs"
+        )
+        self.assertNotIn("validated_frequency_steps(", nominal_validator)
+
+    def test_every_finite_difference_sample_stays_inside_policy(self) -> None:
+        for contract in (
+            "function admissible_frequency_step_interval(",
+            "frequency step rung samples escaped their bounds",
+        ):
+            self.assertIn(contract, self.worker)
+        rungs = self._function_slice(
+            "frequency_step_rungs", "validate_finite_difference_inputs"
+        )
+        # Admissibility is stated over the samples, not merely over the rung.
+        self.assertIn("admissible_frequency_step_interval(", rungs)
+        self.assertIn("minimum_step <= step / T(2)", rungs)
+        self.assertIn("T(2) * step <= maximum_step", rungs)
+
+    def test_finite_difference_chain_is_executable_against_a_fake(self) -> None:
+        """Source-grep assertions cannot prove error propagation; execute it."""
+
+        self.assertIn("determinant_evaluator=nothing", self.worker)
+        self.assertIn(
+            "evaluator = determinant_evaluator !== nothing ? "
+            "determinant_evaluator :",
+            self.worker,
+        )
+        for executed in (
+            "sample errors reach the accepted bound through the real chain",
+            "unresolved noise exhausts the range with a typed failure",
+            "unauthenticated control keeps the single-step historical path",
+            "a narrow range cannot silently sample outside policy",
+        ):
+            self.assertIn(executed, self.fd_spec)
+        # The executed testsets must drive the ladder, not just the helper.
+        self.assertIn("evaluate_derivative_step_ladder(", self.fd_spec)
+        self.assertIn("determinant_evaluator=evaluator", self.fd_spec)
+
     def test_horizon_error_breakdown_is_complete_and_absolute(self) -> None:
         for field in (
             "endpoint_disagreement_abs::T",

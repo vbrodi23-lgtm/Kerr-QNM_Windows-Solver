@@ -659,10 +659,24 @@ class JuliaResponseBackendTests(unittest.TestCase):
             "root_evaluation =",
             worker,
         )
-        # The accepted Newton derivative is reused at the first step rung
-        # rather than recomputed; later rungs evaluate their own.
-        self.assertIn("!isnothing(accepted_derivative)", worker)
-        self.assertIn("!authenticate_controls", worker)
+        # The accepted Newton derivative is reused only on the unauthenticated
+        # single-step path. The authenticated search must not reuse it: that
+        # value was computed without an authenticated error term, so reusing it
+        # would place an unauthenticated estimate inside an authenticated bound.
+        single_step = worker[
+            worker.index("function evaluate_single_derivative_step(") :
+            worker.index("function evaluate_derivative_step_ladder(")
+        ]
+        self.assertIn("isnothing(accepted_derivative) ?", single_step)
+        ladder = worker[
+            worker.index("function evaluate_derivative_step_ladder(") :
+            worker.index("function root_authentication_text(")
+        ]
+        self.assertNotIn("accepted_derivative,\n            nothing,", ladder)
+        self.assertIn(
+            "authenticate_controls || return evaluate_single_derivative_step(",
+            ladder,
+        )
         # The seed determinant is carried, not recomputed, but every later
         # iteration still evaluates its own residual at its own frequency.
         bounded_newton = worker[

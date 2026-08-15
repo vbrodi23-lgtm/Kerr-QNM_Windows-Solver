@@ -177,10 +177,26 @@ end
 - Modify: `tests/test_progress.py`
 - Modify: `tests/test_campaign_reports.py`
 
+**Already delivered in the Task 2 fix round.** The worker began emitting
+`root_authentication` while the backend still consumed a closed schema-3 field
+set, so the pushed checkpoint could not have parsed its own worker output. The
+minimum needed to close that was pulled forward rather than left staged:
+
+- Worker response schema is version 4, held in one `WORKER_RESPONSE_WIRE_SCHEMA`
+  constant so the receipt validator cannot drift from the parser.
+- `DeterminantErrorBreakdown`, `RootAuthenticationEvidence` and `DecimalComplex`
+  exist as strict closed-key immutable value types.
+- The backend cross-checks that the error model is published exactly by the
+  family that computes one.
+- End-to-end parsing tests cover horizon success, exterior success,
+  non-converged, missing record, and malformed record.
+
+What remains below is the broader work: persistence through readouts, caches and
+reports, the normalized typed-failure envelope, the progress registry, and the
+same-frequency cross-precision term.
+
 **Interfaces:**
-- Worker response schema becomes version 4.
-- Add Python `DeterminantErrorEvidence` and `RootAuthenticationEvidence`
-  immutable value types with strict closed-key mapping validation.
+- Add remaining Python evidence types with strict closed-key validation.
 - Every typed numerical failure has `failure_code`, `stage`, and a
   `diagnostics` mapping. `COORDINATE_INVERSION_STALLED` must arrive as
   `JuliaNumericalControlError`, not generic `JuliaResponseBackendError`.

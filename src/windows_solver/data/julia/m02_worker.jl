@@ -3424,11 +3424,16 @@ function finite_difference_pair(
     current::Complex{T};
     axis::String,
     authenticate_controls::Bool=false,
+    determinant_evaluator=nothing,
 ) where {T<:AbstractFloat}
     # Reject malformed stencils before either expensive determinant/ODE sample.
     h = validate_finite_difference_offset(offset; axis=axis)
-    evaluator = authenticate_controls ?
-        authenticated_determinant_progress : determinant_progress
+    # `determinant_evaluator` exists so the specification can execute this whole
+    # chain against a controlled determinant. Production always leaves it
+    # `nothing` and the authenticated/plain selection below applies.
+    evaluator = determinant_evaluator !== nothing ? determinant_evaluator :
+        (authenticate_controls ?
+            authenticated_determinant_progress : determinant_progress)
     d_plus = evaluator(
         T, request, evaluation_context, omega + offset, amplitude,
         "$(label) +", current,
@@ -3885,6 +3890,7 @@ function final_derivative(
     root::Complex{T}, amplitude::Complex{T},
     offset::Complex{T}, label::String,
     ; authenticate_controls::Bool,
+    determinant_evaluator=nothing,
 ) where {T<:AbstractFloat}
     axis = iszero(imag(offset)) ? "real" : "imaginary"
     derivative, diagnostics, derivative_error_abs = finite_difference_pair(
@@ -3898,8 +3904,106 @@ function final_derivative(
         root;
         axis=axis,
         authenticate_controls=authenticate_controls,
+        determinant_evaluator=determinant_evaluator,
     )
     return derivative, diagnostics, derivative_error_abs
+end
+
+"""
+    evaluate_single_derivative_step(T, request, context, root, amplitude,
+                                    accepted_derivative)
+
+Evaluate the derivative controls at the nominal step only.
+
+This is the historical path and it is used wherever horizon authentication does
+not apply -- the exterior Wronskian family, and the diagnostic phases of any
+family. Those paths publish no determinant error model, so there is no noise
+term to balance a step against and nothing for a rung search to optimise.
+
+Keeping them here is not merely conservatism. The exterior scientific identity
+is deliberately unchanged by this work, which means exterior receipts written
+before it remain valid and reusable. If exterior derivative selection changed,
+two runs under one identity could disagree, and the identity would no longer
+mean what it claims.
+"""
+function evaluate_single_derivative_step(
+    ::Type{T},
+    request,
+    evaluation_context::DeterminantRequestContext{T},
+    root::Complex{T},
+    amplitude::Complex{T},
+    accepted_derivative,
+    ; determinant_evaluator=nothing,
+) where {T<:AbstractFloat}
+    h = validated_frequency_step(T, request) * (one(T) + abs(root))
+    isfinite(h) && h > zero(T) ||
+        error("scaled frequency step is nonfinite or nonpositive")
+    real_offset = Complex{T}(h, zero(T))
+    base, _, base_error_abs = isnothing(accepted_derivative) ?
+        final_derivative(
+            T, request, evaluation_context, root, amplitude,
+            real_offset, "final derivative h";
+            authenticate_controls=false,
+            determinant_evaluator=determinant_evaluator,
+        ) : (accepted_derivative, nothing, zero(T))
+    half, _, half_error_abs = final_derivative(
+        T, request, evaluation_context, root, amplitude,
+        real_offset / T(2), "final derivative h/2";
+        authenticate_controls=false,
+        determinant_evaluator=determinant_evaluator,
+    )
+    double, _, double_error_abs = final_derivative(
+        T, request, evaluation_context, root, amplitude,
+        T(2) * real_offset, "final derivative 2h";
+        authenticate_controls=false,
+        determinant_evaluator=determinant_evaluator,
+    )
+    imaginary, _, imaginary_error_abs = final_derivative(
+        T, request, evaluation_context, root, amplitude,
+        Complex{T}(zero(T), h), "final derivative ih";
+        authenticate_controls=false,
+        determinant_evaluator=determinant_evaluator,
+    )
+    fine_difference = abs(half - base)
+    coarse_difference = abs(base - double)
+    axis_difference = abs(imaginary - half)
+    real_step_convergent = fine_difference <= coarse_difference
+    complex_axis_consistent = axis_difference <= coarse_difference
+    real_step_convergent && complex_axis_consistent ||
+        error("determinant frequency derivative estimates do not agree")
+    uncertainty = maximum((
+        fine_difference, abs(double - half), axis_difference
+    ))
+    derivative_lower_bound_abs = abs(half) - uncertainty
+    derivative_authentication = DerivativeAuthentication{T}(
+        half,
+        half_error_abs,
+        uncertainty,
+        derivative_lower_bound_abs,
+        h / T(2),
+        "real",
+    )
+    return (
+        h=h,
+        derivative_real_base=base,
+        derivative_real_half=half,
+        derivative_real_double=double,
+        derivative_imaginary=imaginary,
+        fine_step_difference_abs=fine_difference,
+        coarse_step_difference_abs=coarse_difference,
+        complex_axis_difference_abs=axis_difference,
+        real_step_convergent=real_step_convergent,
+        complex_axis_consistent=complex_axis_consistent,
+        derivative_uncertainty_abs=uncertainty,
+        base_error_abs=base_error_abs,
+        half_error_abs=half_error_abs,
+        double_error_abs=double_error_abs,
+        imaginary_error_abs=imaginary_error_abs,
+        derivative_error_abs=half_error_abs,
+        derivative_authentication=derivative_authentication,
+        rung_index=1,
+        rung_count=1,
+    )
 end
 
 """
@@ -3937,7 +4041,15 @@ function evaluate_derivative_step_ladder(
     amplitude::Complex{T},
     accepted_derivative,
     ; authenticate_controls::Bool,
+    determinant_evaluator=nothing,
 ) where {T<:AbstractFloat}
+    # Without an error model there is no noise term for a rung search to
+    # balance, and changing selection for those families would change results
+    # under an unchanged scientific identity.
+    authenticate_controls || return evaluate_single_derivative_step(
+        T, request, evaluation_context, root, amplitude, accepted_derivative;
+        determinant_evaluator=determinant_evaluator,
+    )
     scale = one(T) + abs(root)
     nominal_policy, minimum_policy, maximum_policy =
         validated_frequency_steps(T, request)
@@ -3951,33 +4063,35 @@ function evaluate_derivative_step_ladder(
     attempts = Dict{String,Any}[]
     for (index, h) in enumerate(rungs)
         real_offset = Complex{T}(h, zero(T))
-        base, _, base_error_abs = (
-            index == 1 && !isnothing(accepted_derivative) &&
-                !authenticate_controls
-        ) ? (
-            accepted_derivative,
-            nothing,
-            zero(T),
-        ) :
+        # The authenticated path never reuses the Newton derivative: that value
+        # was computed without an authenticated error term, so reusing it would
+        # put an unauthenticated estimate inside an authenticated bound. The
+        # unauthenticated path, which does reuse it, is handled above by
+        # evaluate_single_derivative_step.
+        base, _, base_error_abs =
             final_derivative(
                 T, request, evaluation_context, root, amplitude,
                 real_offset, "final derivative h";
                 authenticate_controls=authenticate_controls,
+                determinant_evaluator=determinant_evaluator,
             )
         half, _, half_error_abs = final_derivative(
             T, request, evaluation_context, root, amplitude,
             real_offset / T(2), "final derivative h/2";
             authenticate_controls=authenticate_controls,
+            determinant_evaluator=determinant_evaluator,
         )
         double, _, double_error_abs = final_derivative(
             T, request, evaluation_context, root, amplitude,
             T(2) * real_offset, "final derivative 2h";
             authenticate_controls=authenticate_controls,
+            determinant_evaluator=determinant_evaluator,
         )
         imaginary, _, imaginary_error_abs = final_derivative(
             T, request, evaluation_context, root, amplitude,
             Complex{T}(zero(T), h), "final derivative ih";
             authenticate_controls=authenticate_controls,
+            determinant_evaluator=determinant_evaluator,
         )
         fine_difference = abs(half - base)
         coarse_difference = abs(base - double)
