@@ -523,15 +523,23 @@ class JuliaResponseBackendTests(unittest.TestCase):
         self.assertIn(
             'progress_operation("r-from-rho"; payload=Dict(', worker
         )
+        # The coordinate map draws its own tolerance pair. Collapsing the pair,
+        # or sharing the homogeneous solve's local-error target, is what pinned
+        # Leaf 13's coordinate leg at 8.1e-17 steps.
+        self.assertIn("function coordinate_ode_tolerances(", worker)
         self.assertIn(
-            'reltol=parse_real(T, request, "ode_relative_tolerance")', worker
+            'reltol=parse_real(T, request, "coordinate_ode_relative_tolerance")',
+            worker,
         )
         self.assertIn(
-            'abstol=parse_real(T, request, "ode_absolute_tolerance")', worker
+            'abstol=parse_real(T, request, "coordinate_ode_absolute_tolerance")',
+            worker,
         )
+        self.assertIn("reltol=tolerances.reltol", worker)
+        self.assertIn("abstol=tolerances.abstol", worker)
         self.assertNotIn("tolerance = min(", worker)
-        self.assertNotIn("reltol=tolerance", worker)
-        self.assertNotIn("abstol=tolerance", worker)
+        self.assertNotIn("reltol=tolerance,", worker)
+        self.assertNotIn("abstol=tolerance,", worker)
 
     def test_package_worker_observes_every_promoted_ode_leg_before_use(self):
         root = Path(__file__).resolve().parents[1]
@@ -628,7 +636,8 @@ class JuliaResponseBackendTests(unittest.TestCase):
             / "src/windows_solver/data/julia/m02_worker.jl"
         ).read_text(encoding="utf-8")
 
-        self.assertIn("Solutions.solve_scaled_factored_scattering(", worker)
+        self.assertIn("Solutions.solve_scaled_horizon_basis_at_match(", worker)
+        self.assertIn("Solutions.build_match_horizon_basis(", worker)
         self.assertIn("Solutions.evaluate_normalised_horizon_determinant(", worker)
         self.assertIn(
             "reflectivity = amplitude / "
@@ -1498,6 +1507,9 @@ class JuliaResponseBackendTests(unittest.TestCase):
                 "homogeneous_ode_maxiters",
                 "max_accepted_steps_per_homogeneous_leg",
                 "max_rhs_evaluations_per_homogeneous_leg",
+                "coordinate_stall_rhs_threshold",
+                "coordinate_stall_minimum_span_fraction",
+                "coordinate_stall_minimum_step_fraction",
                 "homogeneous_leg_wall_clock_seconds",
                 "sha256",
             },
