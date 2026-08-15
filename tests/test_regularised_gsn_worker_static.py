@@ -60,12 +60,96 @@ class RegularisedGsnWorkerSourceTests(unittest.TestCase):
 
     def test_all_needed_preflights_precede_factored_homogeneous_solves(self) -> None:
         horizon = self._function_slice(
-            "evaluate_horizon_determinant", "evaluate_exterior_determinant"
+            "evaluate_horizon_determinant", "horizon_endpoint_rho_candidates"
         )
-        prepare = horizon.index("CF.prepare_factored_horizon_determinant_branches(")
-        solve = horizon.index("CF.solve_factored_xup_scattering_endpoint(")
-        self.assertLess(prepare, solve)
-        self.assertNotIn("CF.assert_factored_preflights_adequate(", horizon)
+        # Outer leg: preparation and its adequacy gate precede the solve.
+        outer_prepare = horizon.index("CF.prepare_factored_infinity_outgoing(")
+        outer_gate = horizon.index("CF.assert_factored_preflights_adequate(")
+        outer_solve = horizon.index("CF.solve_factored_xup_to_match(")
+        self.assertLess(outer_prepare, outer_gate)
+        self.assertLess(outer_gate, outer_solve)
+
+        # Horizon legs: the geometry gate and endpoint verification precede
+        # any horizon propagation, so an escaping contour is rejected before
+        # a homogeneous ODE is ever started.
+        candidates = horizon.index("CF.horizon_endpoint_candidates(")
+        verified = horizon.index("CF.select_verified_horizon_endpoints(")
+        horizon_solve = horizon.index(
+            "CF.solve_verified_horizon_basis_to_match("
+        )
+        self.assertLess(candidates, verified)
+        self.assertLess(verified, horizon_solve)
+
+    def test_horizon_determinant_cannot_use_the_mixed_inner_leg(self) -> None:
+        """The removed graph must not come back through any production path.
+
+        The mixed match-to-inner leg propagated the infinity solution into
+        horizon coordinates instead of building an independent basis, and did
+        it on a contour that escapes toward complex infinity. It is not slow
+        for want of tuning; it is the wrong calculation.
+        """
+
+        horizon = self._function_slice(
+            "evaluate_horizon_determinant", "horizon_endpoint_rho_candidates"
+        )
+        chart = self._function_slice(
+            "evaluate_horizon_chart", "estimate_horizon_determinant_error"
+        )
+        for forbidden in (
+            "solve_factored_xup_scattering_endpoint",
+            "Xup_match_to_inner",
+            "horizon_match_to_inner",
+            "solve_factored_horizon_match_to_inner",
+            "build_common_horizon_basis",
+        ):
+            self.assertNotIn(forbidden, horizon)
+            self.assertNotIn(forbidden, chart)
+
+    def test_horizon_determinant_carries_an_absolute_error(self) -> None:
+        for contract in (
+            "numerical_error_abs::Union{Nothing,T}",
+            "error_model_id::Union{Nothing,String}",
+            "VERIFIED_ENDPOINT_ERROR_MODEL_ID",
+            "function estimate_horizon_determinant_error(",
+        ):
+            self.assertIn(contract, self.worker)
+        estimate = self._function_slice(
+            "estimate_horizon_determinant_error",
+            "evaluate_horizon_reflectivity_chart",
+        )
+        # The endpoint disagreement is an absolute quantity. Dividing it by
+        # |D| would report catastrophic error precisely at a root, where the
+        # determinant is small by construction.
+        self.assertIn("abs(reference_value - verification_value)", estimate)
+        self.assertNotIn("/ abs(", estimate)
+
+    def test_coordinate_controls_are_separate_from_homogeneous_controls(
+        self,
+    ) -> None:
+        for contract in (
+            "function coordinate_ode_tolerances(",
+            '"coordinate_ode_relative_tolerance"',
+            '"coordinate_ode_absolute_tolerance"',
+            '"homogeneous_ode_relative_tolerance"',
+            '"homogeneous_ode_absolute_tolerance"',
+            "COORDINATE_INVERSION_STALLED",
+            "function throw_coordinate_inversion_stalled(",
+        ):
+            self.assertIn(contract, self.worker)
+        outer = self._function_slice(
+            "build_worker_outer_contour",
+            "build_worker_real_inner_horizon_contour",
+        )
+        inner = self._function_slice(
+            "build_worker_real_inner_horizon_contour",
+            "emit_coordinate_identity",
+        )
+        for slice_text in (outer, inner):
+            self.assertIn("coordinate_ode_tolerances(T, request)", slice_text)
+            self.assertIn("r_at_rho_zero=Complex{T}(match_radius)", slice_text)
+            self.assertNotIn('"ode_relative_tolerance"', slice_text)
+
+    def test_exterior_determinant_preflight_ordering_is_unchanged(self) -> None:
 
         exterior = self._function_slice(
             "evaluate_exterior_determinant", "determinant"
@@ -86,15 +170,26 @@ class RegularisedGsnWorkerSourceTests(unittest.TestCase):
 
     def test_package_owns_factored_propagation_and_scattering_math(self) -> None:
         for call in (
-            "CF.solve_factored_xup_scattering_endpoint(",
+            "CF.build_real_inner_horizon_contour(",
+            "CF.horizon_endpoint_candidates(",
+            "CF.select_verified_horizon_endpoints(",
+            "CF.solve_verified_horizon_basis_to_match(",
             "CF.solve_factored_xin_to_match(",
             "CF.solve_factored_xup_to_match(",
             "CF.reconstruct_factored_match_state(",
-            "Solutions.build_common_horizon_basis(",
-            "Solutions.solve_scaled_factored_scattering(",
+            "Solutions.build_match_horizon_basis(",
+            "Solutions.solve_scaled_horizon_basis_at_match(",
             "Solutions.evaluate_normalised_horizon_determinant(",
         ):
             self.assertIn(call, self.worker)
+        # The inner-endpoint extraction pair had the mixed inner leg as its
+        # only consumer. The package still exports both -- the exterior family
+        # and the package test suite use them -- but the worker must not.
+        for retired in (
+            "Solutions.build_common_horizon_basis(",
+            "Solutions.solve_scaled_factored_scattering(",
+        ):
+            self.assertNotIn(retired, self.worker)
         self.assertIn(
             "reflectivity = amplitude / (T(2) * im * spectral.p_horizon - amplitude)",
             self.worker,
@@ -341,13 +436,22 @@ class RegularisedGsnWorkerSourceTests(unittest.TestCase):
     def test_registered_conditioning_progress_is_literal(self) -> None:
         for event in (
             "asymptotic_series_evaluated",
-            "carrier_changed",
             "factored_ode_completed",
             "scattering_coefficients_extracted",
             "determinant_chart_evaluated",
             "conditioning_evaluated",
+            # Geometry gate and error-model evidence.
+            "horizon_endpoint_candidate",
+            "horizon_endpoints_verified",
+            "coordinate_identity_checked",
+            "determinant_error_estimated",
         ):
             self.assertIn(f'progress_emit("{event}"', self.worker)
+        # carrier_changed belonged to the removed mixed inner leg. The carrier
+        # change still happens inside the match-basis build, and its
+        # reconstruction error is reported with the extracted coefficients.
+        self.assertNotIn('progress_emit("carrier_changed"', self.worker)
+        self.assertIn("carrier_change_error", self.worker)
 
     def test_error_envelope_stays_on_operational_schema_one(self) -> None:
         main = self.worker[self.worker.index("function main()") :]
@@ -359,19 +463,25 @@ class RegularisedGsnWorkerSourceTests(unittest.TestCase):
         self,
     ) -> None:
         passthrough = re.compile(
-            r"ode_exception_passthrough=error\s*->\s*"
             r"error isa ODEResourceLimit\s*\|\|\s*"
             r"error isa ODESolverFailure"
         )
         horizon = self._function_slice(
-            "evaluate_horizon_determinant", "evaluate_exterior_determinant"
+            "evaluate_horizon_determinant", "horizon_endpoint_rho_candidates"
         )
         exterior = self._function_slice(
             "evaluate_exterior_determinant", "determinant"
         )
         self.assertRegex(horizon, passthrough)
         self.assertRegex(exterior, passthrough)
+        # A stalled coordinate map is a typed control failure too: it must
+        # reach the campaign as COORDINATE_INVERSION_STALLED rather than being
+        # wrapped as a generic propagation error.
+        self.assertIn("error isa CoordinateInversionStalled", horizon)
         self.assertIn("function throw_ode_resource_limit(", self.worker)
+        self.assertIn(
+            "function throw_coordinate_inversion_stalled(", self.worker
+        )
 
     def _function_slice(self, name: str, next_name: str) -> str:
         start = self.worker.index(f"function {name}(")

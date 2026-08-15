@@ -993,37 +993,74 @@ class JuliaResponseBackendTests(unittest.TestCase):
         )
         self.assertEqual(request["refinement_level"], 1)
 
-    def test_promoted_policy_refines_80_without_changing_120_contract(self):
-        """Catches coupling scientific solve targets to BigFloat storage digits."""
+    def test_scientific_root_target_is_independent_of_storage_digits(self):
+        """Catches coupling scientific solve targets to BigFloat storage digits.
+
+        The previous table derived the 120-digit controls from the digit count,
+        producing a 1e-102 root target -- 108 required reliable digits -- for a
+        calculation whose scientific requirement is 24. More stored digits do
+        not make a QNM root more accurately defined; they buy guard precision.
+        """
 
         job = _deep_job()
         adapter = FakeAdapter()
-        policy80_refined = JuliaPrecisionRootBackend(
-            VettedNativeDeterminantKernel.identity, adapter, 80, refinement=1
-        )._request(job, 0.0j)["policy"]
-        policy120 = JuliaPrecisionRootBackend(
-            VettedNativeDeterminantKernel.identity, adapter, 120
-        )._request(job, 0.0j)["policy"]
-        policy120_refined = JuliaPrecisionRootBackend(
-            VettedNativeDeterminantKernel.identity, adapter, 120, refinement=1
-        )._request(job, 0.0j)["policy"]
 
+        def policy(digits: int, refinement: int) -> dict[str, object]:
+            return JuliaPrecisionRootBackend(
+                VettedNativeDeterminantKernel.identity,
+                adapter,
+                digits,
+                refinement=refinement,
+            )._request(job, 0.0j)["policy"]
+
+        policy80, policy80_refined = policy(80, 0), policy(80, 1)
+        policy120, policy120_refined = policy(120, 0), policy(120, 1)
+
+        # The scientific target is a property of the physics, so it is the
+        # same at both storage tiers.
+        for base, refined in ((policy80, policy80_refined),
+                              (policy120, policy120_refined)):
+            self.assertEqual(base["root_correction_tolerance"], "1e-18")
+            self.assertEqual(refined["root_correction_tolerance"], "1e-20")
         self.assertEqual(
-            policy80_refined["root_correction_tolerance"], "1e-20"
+            policy120["root_correction_tolerance"],
+            policy80["root_correction_tolerance"],
         )
-        self.assertEqual(policy80_refined["ode_relative_tolerance"], "1e-20")
-        self.assertEqual(policy80_refined["ode_absolute_tolerance"], "1e-20")
-        self.assertEqual(policy80_refined["frequency_step"], "1e-7")
-        self.assertEqual(policy120["root_correction_tolerance"], "1e-102")
-        self.assertEqual(policy120["ode_relative_tolerance"], "1e-102")
-        self.assertEqual(policy120["ode_absolute_tolerance"], "1e-104")
-        self.assertEqual(policy120["frequency_step"], "1e-60")
         self.assertEqual(
-            policy120_refined["root_correction_tolerance"], "1e-106"
+            policy120_refined["root_correction_tolerance"],
+            policy80_refined["root_correction_tolerance"],
         )
-        self.assertEqual(policy120_refined["ode_relative_tolerance"], "1e-106")
-        self.assertEqual(policy120_refined["ode_absolute_tolerance"], "1e-108")
-        self.assertEqual(policy120_refined["frequency_step"], "1e-60")
+
+        # The extra 120-digit precision is spent as guard: ODE controls are
+        # tightened by a bounded factor over the healthy 80-digit level, not
+        # driven toward the arithmetic floor.
+        for field in (
+            "homogeneous_ode_relative_tolerance",
+            "coordinate_ode_relative_tolerance",
+        ):
+            exponent80 = int(policy80[field].split("e-")[1])
+            exponent120 = int(policy120[field].split("e-")[1])
+            self.assertGreater(exponent120, exponent80)
+            self.assertLess(exponent120 - exponent80, 40)
+
+        # The coordinate map is never driven harder than the homogeneous solve.
+        for candidate in (policy80, policy80_refined,
+                          policy120, policy120_refined):
+            coordinate = int(
+                candidate["coordinate_ode_relative_tolerance"].split("e-")[1]
+            )
+            homogeneous = int(
+                candidate["homogeneous_ode_relative_tolerance"].split("e-")[1]
+            )
+            self.assertLessEqual(coordinate, homogeneous)
+
+        # The derivative step stays in a bounded, calibratable range rather
+        # than sitting at a digit-derived 1e-60.
+        for candidate in (policy80, policy120):
+            self.assertEqual(candidate["frequency_step"], "1e-6")
+            step = float(candidate["frequency_step"])
+            self.assertLess(float(candidate["frequency_step_minimum"]), step)
+            self.assertGreater(float(candidate["frequency_step_maximum"]), step)
 
     def test_promoted_nonconvergence_preserves_authenticated_branch(self):
         """Catches relabelling an in-radius Julia failure as branch loss."""

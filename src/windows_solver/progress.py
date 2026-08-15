@@ -60,6 +60,14 @@ class ProgressEventKind(StrEnum):
     FACTORED_ODE_COMPLETED = "factored_ode_completed"
     SCATTERING_COEFFICIENTS_EXTRACTED = "scattering_coefficients_extracted"
     DETERMINANT_CHART_EVALUATED = "determinant_chart_evaluated"
+    # Real-inner horizon geometry gate. Candidates are reported individually so
+    # a NO_VERIFIED_HORIZON_ENDPOINT failure can be read back to the exact
+    # radial-approach or series condition that rejected each one.
+    HORIZON_ENDPOINT_CANDIDATE = "horizon_endpoint_candidate"
+    HORIZON_ENDPOINTS_VERIFIED = "horizon_endpoints_verified"
+    COORDINATE_IDENTITY_CHECKED = "coordinate_identity_checked"
+    COORDINATE_INVERSION_STALLED = "coordinate_inversion_stalled"
+    DETERMINANT_ERROR_ESTIMATED = "determinant_error_estimated"
     CONDITIONING_EVALUATED = "conditioning_evaluated"
     CANDIDATE_EVALUATED = "candidate_evaluated"
     DAMPING_DECIDED = "damping_decided"
