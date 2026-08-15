@@ -1104,6 +1104,8 @@ $candidate | ConvertTo-Json -Compress | Set-Content -LiteralPath $env:M02_TEST_J
             "same-precision-120-base-vs-refinement/v1",
             "typed-batch-horner-compensated/v1",
             "scaled-factored-horizon-basis/v1",
+            "approved/v1",
+            "reviewed/v1",
             "absent-unapproved/v1",
             "absent-unreviewed/v1",
             "cinc-over-cref-minus-reflectivity/v1",

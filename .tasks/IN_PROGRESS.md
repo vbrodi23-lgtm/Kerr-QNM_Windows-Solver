@@ -21,7 +21,7 @@ track the regular remainder rather than an enormous carrier normalisation.
 - [ ] Version and strictly validate the Julia request/response/cache identity; persist conditioning evidence through root readouts, promotion decisions, progress, reports, and runtime/source receipts.
 - [ ] Add a load-bearing equivalence matrix and static/mocked contracts for raw↔factored initial states, three-branch endpoint regularity under binary64/BigFloat, low-order explicit↔recurrence coefficients, per-order↔batch coefficients, BigFloat precision preservation, Cramer↔scaled extraction, synthetic independently scaled basis recovery/reconstruction, raw↔normalised determinants, schema closure, persistence, promotion, and source ownership.
 - [ ] Preserve an explicit failing review boundary for a small independently generated high-precision GSN reference fixture; do not fabricate reference values from the implementation under test.
-- [ ] Preserve a fail-loud production-activation gate for human review of carrier signs, `Cref`/`Cinc` column order, horizon normalisation, and the `Cinc/Cref − R` chart.
+- [ ] Preserve a fail-loud mathematical-claim/release gate for human review of carrier signs, `Cref`/`Cinc` column order, horizon normalisation, and the `Cinc/Cref − R` chart, while allowing the promoted numerical path to execute and emit explicitly unapproved evidence for that review.
 - [ ] Obtain native PowerShell evidence for the promoted Leaf 13 readout before claiming mathematical or performance validation.
 
 ### Dependencies
@@ -32,14 +32,14 @@ track the regular remainder rather than an enormous carrier normalisation.
 ### Evidence Output
 
 Factored GSN source and strict cross-language contracts, lightweight algebraic
-and static test evidence, explicit unactivated math-review gate, and the exact
+and static test evidence, explicit unapproved mathematical-claim gate, and the exact
 PowerShell command/log requirements for native Leaf 13 validation.
 
 ### Verification
 
 - `python .tasks/validate_board.py`
 - Focused static and mocked Python tests that do not launch Julia, Kerr solves, or PowerShell.
-- Julia algebraic/unit tests and the Leaf 13 promoted readout are execution-airgapped to the operator.
+- Vendored Julia algebraic/unit tests run under pinned Julia 1.10.11 in hosted CI; the Leaf 13 promoted readout remains operator-native evidence.
 
 ### Review Focus
 
@@ -56,6 +56,8 @@ preservation, and cache/provenance separation from historical raw-state leaves.
 - Run a time-boxed, performance-only Leaf 13 diagnostic through the existing post-readiness factored executor, measuring the outer-to-match and match-to-inner legs separately before any further hardening.
 - Preserve the production gate and existing worker contour while prototyping a horizon basis at the match point: use a real positive inner tortoise ray that demonstrably approaches `r_plus`, authenticate both horizon endpoint series before any homogeneous RHS evaluation, propagate the pure ingoing/outgoing remainders independently to the match point, and solve the scaled physical-state basis there.
 - Emit the contour-approach, endpoint-conditioning, per-leg RHS/step, basis-condition, coefficient, and reconstruction evidence needed to decide whether the prototype merits production integration; do not treat this performance prototype as a mathematical activation receipt.
-- Run only permitted static/mocked checks, independently review the diff, then stop for human math review and native PowerShell execution.
+- Keep the external review receipts fail-closed at the mathematical-claim/release boundary, not inside the factored ODE executor, so native campaigns can generate the evidence required to satisfy those receipts.
+- Keep structural `m02-validate` available for unapproved evidence, but require SHA-bound `approved/v1` human-review and `reviewed/v1` independent-reference receipts before sealing a schema-2 release-admissible package.
+- Run the load-bearing factored Julia regression directly (without the unrelated full vendor suite), focused Python checks, and the complete Python suite; independently review the diff, then publish a hotfix for native PowerShell resumption without reinterpreting execution as mathematical approval.
 
 ---

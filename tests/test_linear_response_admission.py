@@ -1,16 +1,20 @@
 from __future__ import annotations
 
+from contextlib import redirect_stderr, redirect_stdout
 from copy import deepcopy
 import hashlib
+import io
 import json
 from pathlib import Path
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from windows_solver.artifacts import ArtifactEnvelope
 from windows_solver.builtin import default_registry
+from windows_solver.cli import main
 from windows_solver.contracts import (
     Capability,
     CarrierState,
@@ -32,6 +36,7 @@ from windows_solver.linear_response_admission import (
     _validate_projective_reduction_bindings,
     admit_linear_response_bundle,
     load_linear_response_admission,
+    validate_linear_response_bundle,
 )
 from windows_solver.providers import ProviderUnavailableError
 from windows_solver.response_reduction import (
@@ -53,6 +58,14 @@ from tests.test_linear_response_evidence_intake import _write_manifest
 
 def _sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+_APPROVED_REGULARISED_GSN_REVIEW_POLICY = {
+    "human_math_review_receipt_status": "approved/v1",
+    "human_math_review_receipt_sha256": "a" * 64,
+    "independent_reference_fixture_receipt_status": "reviewed/v1",
+    "independent_reference_fixture_receipt_sha256": "b" * 64,
+}
 
 
 def _write_json(path: Path, value: object) -> None:
@@ -262,7 +275,91 @@ def _admission_fixture(
     return admission_path
 
 
+class RegularisedGSNReleaseGateTests(unittest.TestCase):
+    def test_structural_validation_remains_open_without_review_receipts(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            manifest = _admission_fixture(Path(temporary), complete=True)
+
+            summary = validate_linear_response_bundle(manifest)
+
+        self.assertEqual(summary["produced_leaf_count"], 212)
+        self.assertFalse(summary["scientific_claims_admitted"])
+        self.assertFalse(summary["release_admissible"])
+
+    def test_structural_validation_rejects_incomplete_lineage(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            manifest_path = _admission_fixture(directory, complete=True)
+            payload_path = directory / "payload.json"
+            payload = json.loads(payload_path.read_text(encoding="utf-8"))
+            payload["lineage"]["source_sha256s"].pop()
+            _write_json(payload_path, payload)
+
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["payload"]["sha256"] = _sha256(payload_path.read_bytes())
+            _write_json(manifest_path, manifest)
+
+            with self.assertRaisesRegex(
+                ValueError, "admission payload lineage omits evidence receipts"
+            ):
+                validate_linear_response_bundle(manifest_path)
+
+    def test_release_admission_is_blocked_without_review_receipts(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            manifest = _admission_fixture(Path(temporary), complete=True)
+
+            with self.assertRaisesRegex(
+                ValueError, "human mathematical review receipt"
+            ):
+                admit_linear_response_bundle(manifest)
+
+    def test_each_review_receipt_must_be_sha_bound(self) -> None:
+        policies = {
+            "missing_human_digest": {
+                **_APPROVED_REGULARISED_GSN_REVIEW_POLICY,
+                "human_math_review_receipt_sha256": None,
+            },
+            "unreviewed_reference": {
+                **_APPROVED_REGULARISED_GSN_REVIEW_POLICY,
+                "independent_reference_fixture_receipt_status": (
+                    "absent-unreviewed/v1"
+                ),
+                "independent_reference_fixture_receipt_sha256": None,
+            },
+        }
+        for label, policy in policies.items():
+            with (
+                self.subTest(label=label),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                manifest = _admission_fixture(Path(temporary), complete=True)
+                with patch(
+                    "windows_solver.linear_response_admission."
+                    "regularised_gsn_precision_policy",
+                    return_value=policy,
+                ):
+                    with self.assertRaises(ValueError):
+                        admit_linear_response_bundle(manifest)
+
+
 class LinearResponseAdmissionTests(unittest.TestCase):
+    def setUp(self) -> None:
+        review_policy = patch(
+            "windows_solver.linear_response_admission."
+            "regularised_gsn_precision_policy",
+            return_value=_APPROVED_REGULARISED_GSN_REVIEW_POLICY,
+        )
+        review_policy.start()
+        self.addCleanup(review_policy.stop)
+
+    def invoke_cli(self, arguments: list[str]) -> tuple[int, dict, str]:
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with redirect_stdout(stdout), redirect_stderr(stderr):
+            status = main(arguments)
+        output = json.loads(stdout.getvalue()) if stdout.getvalue() else {}
+        return status, output, stderr.getvalue()
+
     def test_role_scoped_request_derives_exact_sparse_spectral_upstream(self) -> None:
         request = b_prime_request().for_capability(Capability.SPECTRAL_CORE)
         self.assertEqual(
@@ -287,6 +384,10 @@ class LinearResponseAdmissionTests(unittest.TestCase):
             )
             self.assertTrue(package.release_admissible)
             self.assertFalse(package.scientific_claims_admitted)
+            self.assertEqual(
+                dict(package.regularised_gsn_review_receipts),
+                _APPROVED_REGULARISED_GSN_REVIEW_POLICY,
+            )
             self.assertEqual(package.evidence_receipt["produced_count"], 212)
             self.assertEqual(package.reduction_receipt["row_count"], 57)
 
@@ -407,6 +508,7 @@ class LinearResponseAdmissionTests(unittest.TestCase):
                 _admission_fixture(Path(temporary), complete=True)
             )
         mapping = package.to_mapping()
+        self.assertEqual(mapping["schema_version"], 2)
         self.assertEqual(LinearResponseAdmissionPackage.from_mapping(mapping), package)
         forged = deepcopy(mapping)
         forged["evidence_receipt"]["produced_count"] = 211
@@ -417,6 +519,34 @@ class LinearResponseAdmissionTests(unittest.TestCase):
         malformed["evidence_receipt"]["unresolved_leaf_ids"] = [{}]
         with self.assertRaisesRegex(ValueError, "unresolved leaf IDs"):
             LinearResponseAdmissionPackage.from_mapping(malformed)
+
+        unapproved_review = deepcopy(mapping)
+        unapproved_review["regularised_gsn_review_receipts"][
+            "human_math_review_receipt_status"
+        ] = "absent-unapproved/v1"
+        material = {
+            key: value for key, value in unapproved_review.items()
+            if key != "admission_id"
+        }
+        unapproved_review["admission_id"] = (
+            "m02-admission-" + _sha256(canonical_json_bytes(material))
+        )
+        with self.assertRaisesRegex(ValueError, "human mathematical review"):
+            LinearResponseAdmissionPackage.from_mapping(unapproved_review)
+
+        mismatched_review = deepcopy(mapping)
+        mismatched_review["regularised_gsn_review_receipts"][
+            "human_math_review_receipt_sha256"
+        ] = "0" * 64
+        material = {
+            key: value for key, value in mismatched_review.items()
+            if key != "admission_id"
+        }
+        mismatched_review["admission_id"] = (
+            "m02-admission-" + _sha256(canonical_json_bytes(material))
+        )
+        with self.assertRaisesRegex(ValueError, "installed policy"):
+            LinearResponseAdmissionPackage.from_mapping(mismatched_review)
 
         mismatched_spectral = deepcopy(mapping)
         mismatched_spectral["spectral_upstream_receipt"]["payload_sha256"] = (
@@ -628,11 +758,14 @@ class LinearResponseAdmissionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "covariance|Gram"):
             _validate_projective_reduction_bindings(reduction, forged)
 
-    def test_cli_validates_admits_exports_and_runs_cold_then_warm(self) -> None:
+    def test_cli_blocks_unapproved_admission_and_loaded_package(
+        self,
+    ) -> None:
         root = Path(__file__).resolve().parents[1]
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
-            _admission_fixture(directory, complete=True)
+            manifest = _admission_fixture(directory, complete=True)
+            package = admit_linear_response_bundle(manifest)
 
             def invoke(*arguments: str) -> subprocess.CompletedProcess[str]:
                 return subprocess.run(
@@ -647,50 +780,40 @@ class LinearResponseAdmissionTests(unittest.TestCase):
             self.assertEqual(validated.returncode, 0, validated.stderr)
             self.assertFalse(json.loads(validated.stdout)["release_admissible"])
 
-            admitted = invoke(
+            blocked = invoke(
                 "m02-admit", "admission-input.json", "--output", "admitted.json"
             )
-            self.assertEqual(admitted.returncode, 0, admitted.stderr)
-            admitted_summary = json.loads(admitted.stdout)
-            self.assertTrue(admitted_summary["release_admissible"])
-            admission_id = admitted_summary["admission_id"]
-            package = LinearResponseAdmissionPackage.from_mapping(
-                json.loads((directory / "admitted.json").read_text(encoding="utf-8"))
-            )
+            self.assertEqual(blocked.returncode, 2)
+            self.assertIn("human mathematical review receipt", blocked.stderr)
+            self.assertFalse((directory / "admitted.json").exists())
+
+            _write_json(directory / "admitted.json", package.to_mapping())
+            admission_id = package.admission_id
 
             exported = invoke(
                 "m02-export", "admitted.json",
                 "--admission-id", admission_id,
                 "--output", "exported.json",
             )
-            self.assertEqual(exported.returncode, 0, exported.stderr)
-            self.assertEqual(
-                (directory / "exported.json").read_bytes(),
-                canonical_json_bytes(package.to_mapping()),
-            )
+            self.assertEqual(exported.returncode, 2)
+            self.assertIn("human mathematical review receipt", exported.stderr)
+            self.assertFalse((directory / "exported.json").exists())
 
             planned = invoke(
                 "plan", "request.json",
                 "--linear-response-admission", "admitted.json",
                 "--linear-response-admission-id", admission_id,
             )
-            self.assertEqual(planned.returncode, 0, planned.stderr)
-            self.assertEqual(json.loads(planned.stdout)["unavailable_capabilities"], [])
+            self.assertEqual(planned.returncode, 2)
+            self.assertIn("human mathematical review receipt", planned.stderr)
 
-            first = invoke(
+            blocked_run = invoke(
                 "run", "request.json", "--store", "store",
                 "--linear-response-admission", "admitted.json",
                 "--linear-response-admission-id", admission_id,
             )
-            second = invoke(
-                "run", "request.json", "--store", "store",
-                "--linear-response-admission", "admitted.json",
-                "--linear-response-admission-id", admission_id,
-            )
-            self.assertEqual(first.returncode, 0, first.stderr)
-            self.assertEqual(second.returncode, 0, second.stderr)
-            self.assertEqual(json.loads(first.stdout)["provider_execution_count"], 3)
-            self.assertEqual(json.loads(second.stdout)["cache_hit_count"], 3)
+            self.assertEqual(blocked_run.returncode, 2)
+            self.assertIn("human mathematical review receipt", blocked_run.stderr)
 
             unpinned = invoke(
                 "plan", "request.json",
@@ -700,7 +823,6 @@ class LinearResponseAdmissionTests(unittest.TestCase):
             self.assertIn("detached admission ID", unpinned.stderr)
 
     def test_admission_identity_separates_persistent_cache(self) -> None:
-        root = Path(__file__).resolve().parents[1]
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
             packages: list[tuple[Path, LinearResponseAdmissionPackage]] = []
@@ -719,33 +841,22 @@ class LinearResponseAdmissionTests(unittest.TestCase):
 
             def run(
                 package_path: Path, package: LinearResponseAdmissionPackage
-            ) -> subprocess.CompletedProcess[str]:
-                return subprocess.run(
-                    [
-                        sys.executable,
-                        "-m",
-                        "windows_solver",
-                        "run",
-                        str(package_path.parent / "request.json"),
-                        "--store",
-                        str(directory / "shared-store"),
-                        "--linear-response-admission",
-                        str(package_path),
-                        "--linear-response-admission-id",
-                        package.admission_id,
-                    ],
-                    cwd=directory,
-                    env={"PYTHONPATH": str(root / "src")},
-                    text=True,
-                    capture_output=True,
-                )
+            ) -> tuple[int, dict, str]:
+                return self.invoke_cli([
+                    "run",
+                    str(package_path.parent / "request.json"),
+                    "--store",
+                    str(directory / "shared-store"),
+                    "--linear-response-admission",
+                    str(package_path),
+                    "--linear-response-admission-id",
+                    package.admission_id,
+                ])
 
-            first = run(*packages[0])
-            second = run(*packages[1])
-            self.assertEqual(first.returncode, 0, first.stderr)
-            self.assertEqual(second.returncode, 0, second.stderr)
-            first_run = json.loads(first.stdout)
-            second_run = json.loads(second.stdout)
+            first_status, first_run, first_error = run(*packages[0])
+            second_status, second_run, second_error = run(*packages[1])
+            self.assertEqual(first_status, 0, first_error)
+            self.assertEqual(second_status, 0, second_error)
             self.assertEqual(first_run["provider_execution_count"], 3)
             self.assertEqual(second_run["provider_execution_count"], 1)
             self.assertEqual(second_run["cache_hit_count"], 2)

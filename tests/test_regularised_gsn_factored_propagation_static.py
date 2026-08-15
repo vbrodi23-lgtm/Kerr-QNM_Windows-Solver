@@ -15,6 +15,10 @@ JULIA_SPEC = REPO_ROOT / (
     "factored_propagation_spec.jl"
 )
 WORKER_SOURCE = REPO_ROOT / "src/windows_solver/data/julia/m02_worker.jl"
+CI_WORKFLOW = REPO_ROOT / ".github/workflows/ci.yml"
+M02_MANIFEST_SEED = REPO_ROOT / (
+    "src/windows_solver/data/julia/m02_project/Manifest.seed.toml"
+)
 
 
 class RegularisedGsnFactoredPropagationSourceTests(unittest.TestCase):
@@ -23,6 +27,52 @@ class RegularisedGsnFactoredPropagationSourceTests(unittest.TestCase):
         cls.source = COMPLEX_FREQUENCIES_SOURCE.read_text(encoding="utf-8")
         cls.spec = JULIA_SPEC.read_text(encoding="utf-8")
         cls.worker = WORKER_SOURCE.read_text(encoding="utf-8")
+        cls.workflow = CI_WORKFLOW.read_text(encoding="utf-8")
+        cls.manifest_seed = M02_MANIFEST_SEED.read_text(encoding="utf-8")
+
+    def test_ci_runs_the_load_bearing_factored_spec_not_the_full_vendor_suite(
+        self,
+    ) -> None:
+        self.assertIn(
+            "M02_PROJECT_SEED: src/windows_solver/data/julia/m02_project",
+            self.workflow,
+        )
+        self.assertIn(
+            'read(joinpath(seed_project, "Manifest.seed.toml"), String)',
+            self.workflow,
+        )
+        self.assertIn("let manifest = read", self.workflow)
+        self.assertIn(
+            'manifest = replace(manifest, seed_path => pinned_path)',
+            self.workflow,
+        )
+        self.assertIn('--project="$M02_PROJECT"', self.workflow)
+        self.assertNotIn("Pkg.develop(", self.workflow)
+        self.assertNotIn("Pkg.resolve()", self.workflow)
+        self.assertIn(
+            'include(joinpath(ENV["GSN_PROJECT"], "test", '
+            '"factored_propagation_spec.jl"))',
+            self.workflow,
+        )
+        self.assertNotIn("Pkg.test()", self.workflow)
+
+        gsn_entry = re.search(
+            r"\[\[deps\.GeneralizedSasakiNakamura\]\]\n"
+            r"(?P<body>.*?)(?=\n\[\[deps\.)",
+            self.manifest_seed,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(gsn_entry)
+        gsn_body = gsn_entry.group("body")
+        for dependency in ("HDF5", "LsqFit", "Printf", "Serialization"):
+            self.assertIn(f'"{dependency}"', gsn_body)
+        self.assertIn('version = "0.9.0"', gsn_body)
+        self.assertIn(
+            'path = "../vendor/GeneralizedSasakiNakamura.jl"',
+            gsn_body,
+        )
+        for package in ("HDF5", "LsqFit"):
+            self.assertIn(f"[[deps.{package}]]", self.manifest_seed)
 
     def test_contexts_are_typed_and_bind_frozen_cell_to_sample_deformation(
         self,
@@ -126,19 +176,24 @@ class RegularisedGsnFactoredPropagationSourceTests(unittest.TestCase):
         self.assertIn("U_rho + F_rho * q - q_rho - q^2", algebra)
         self.assertIn("synthetic nonzero q_rho transformed algebra", self.spec)
 
-    def test_inadequate_preflight_precedes_readiness_observers_and_rhs(self) -> None:
+    def test_inadequate_preflight_precedes_observers_and_rhs(self) -> None:
         solve_endpoint = self._function("solve_factored_endpoint")
         provenance = solve_endpoint.index("_assert_preparation_provenance(")
         preflight = solve_endpoint.index("_assert_factored_preflight_adequate(")
-        readiness = solve_endpoint.index(
-            "assert_regularised_gsn_production_ready()"
-        )
         execute = solve_endpoint.index(
             "_execute_factored_endpoint_after_readiness("
         )
         self.assertLess(provenance, preflight)
-        self.assertLess(preflight, readiness)
-        self.assertLess(readiness, execute)
+        self.assertLess(preflight, execute)
+        self.assertNotIn(
+            "assert_regularised_gsn_production_ready()", solve_endpoint
+        )
+        match_to_inner = self._function(
+            "solve_factored_horizon_match_to_inner"
+        )
+        self.assertNotIn(
+            "assert_regularised_gsn_production_ready()", match_to_inner
+        )
         self.assertIn("INSUFFICIENT_ASYMPTOTIC_PRECISION", self.source)
         self.assertIn(
             'FACTORED_HOMOGENEOUS_ODE_SCOPE_ID = "factored-homogeneous-gsn/v1"',
@@ -419,7 +474,8 @@ class RegularisedGsnFactoredPropagationSourceTests(unittest.TestCase):
             "transformed factored RHS identity",
             "production carriers have q_rho zero",
             "inadequate preflight performs zero factored homogeneous RHS evaluations",
-            "adequate preflight reaches the non-bypassable readiness gate",
+            "adequate preflight executes the public numerical solver",
+            "carrier transition executes the public match-to-inner solver",
             "compatible contour deformation and branch crossing rejection",
             "carrier change preserves X and Xrho at rho zero",
             "Float64 and BigFloat branch preparation",

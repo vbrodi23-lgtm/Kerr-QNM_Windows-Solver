@@ -33,7 +33,7 @@ function factored_spec_parameters(::Type{T}) where {T<:AbstractFloat}
 end
 
 function factored_spec_context(
-    ::Type{T}; outer_radius::T=T(14)
+    ::Type{T}; outer_radius::T=T(14), inner_rstar::T=-T(50)
 ) where {T<:AbstractFloat}
     parameters = factored_spec_parameters(T)
     geometry = KERR_FACTORED.stable_horizon_geometry(parameters.a)
@@ -60,9 +60,12 @@ function factored_spec_context(
     ))
     rho_in = -one(T)
     rho_out = one(T)
+    inner_radius = complex(
+        T(COORD_FACTORED.r_from_rstar(parameters.a, inner_rstar)), zero(T)
+    )
     radius_from_rho = function (rho::T)
         if rho < zero(T)
-            return complex(geometry.rplus + T(1) / T(10), -T(1) / T(50))
+            return inner_radius
         elseif rho > zero(T)
             return complex(outer_radius, T(1) / T(50))
         end
@@ -213,35 +216,62 @@ end
     @test observer_factory_calls[] == 0
 end
 
-@testset "adequate preflight reaches the non-bypassable readiness gate" begin
+@testset "adequate preflight executes the public numerical solver" begin
     prepared = factored_spec_context(Float64; outer_radius=1.0e12)
     branch = CF_FACTORED.prepare_factored_infinity_outgoing(
         prepared.spectral, prepared.contour, 0.0
     )
     rhs_count = Ref(0)
     observer_factory_calls = Ref(0)
-    error = try
-        CF_FACTORED.solve_factored_endpoint(
-            prepared.spectral,
-            prepared.contour,
-            branch,
-            prepared.contour.rho_out,
-            zero(Float64);
-            ode_leg="test_readiness",
-            factored_homogeneous_rhs_counter=rhs_count,
-            ode_observation_factory=(_leg, _span, _algorithm) -> begin
-                observer_factory_calls[] += 1
-                (nothing, nothing)
-            end,
-        )
-        nothing
-    catch caught
-        caught
-    end
-    @test error isa ErrorException
-    @test occursin("human mathematical review receipt", error.msg)
-    @test rhs_count[] == 0
-    @test observer_factory_calls[] == 0
+    solution = CF_FACTORED.solve_factored_endpoint(
+        prepared.spectral,
+        prepared.contour,
+        branch,
+        prepared.contour.rho_out,
+        zero(Float64);
+        ode_leg="test_public_numerical_solver",
+        factored_homogeneous_rhs_counter=rhs_count,
+        ode_observation_factory=(_leg, _span, _algorithm) -> begin
+            observer_factory_calls[] += 1
+            (nothing, nothing)
+        end,
+    )
+    @test solution isa CF_FACTORED.FactoredODESolution{Float64}
+    @test solution.diagnostics.factored_homogeneous_rhs_evaluations > 0
+    @test rhs_count[] > 0
+    @test observer_factory_calls[] == 1
+end
+
+@testset "carrier transition executes the public match-to-inner solver" begin
+    prepared = factored_spec_context(Float64)
+    horizon = CF_FACTORED.prepare_factored_horizon_ingoing(
+        prepared.spectral, prepared.contour, 0.0
+    )
+    @test horizon.assessment.adequate
+    infinity_carrier = FS_FACTORED.PlaneWaveCarrier(
+        FS_FACTORED.INFINITY_OUTGOING,
+        prepared.spectral.omega,
+        prepared.contour.rstar_match,
+        prepared.spectral.convention,
+    )
+    transition = CF_FACTORED.change_factored_infinity_to_horizon_at_match(
+        prepared.spectral,
+        prepared.contour,
+        FS_FACTORED.FactoredEndpointState(1.0 + 0.0im, 0.0 + 0.0im),
+        infinity_carrier,
+    )
+    rhs_count = Ref(0)
+    solution = CF_FACTORED.solve_factored_horizon_match_to_inner(
+        prepared.spectral,
+        prepared.contour,
+        horizon,
+        transition;
+        ode_leg="test_public_match_to_inner_solver",
+        factored_homogeneous_rhs_counter=rhs_count,
+    )
+    @test solution isa CF_FACTORED.FactoredODESolution{Float64}
+    @test solution.diagnostics.factored_homogeneous_rhs_evaluations > 0
+    @test rhs_count[] > 0
 end
 
 @testset "compatible contour deformation and branch crossing rejection" begin
