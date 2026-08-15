@@ -239,7 +239,16 @@ end
     request = finite_difference_control_request()
     context = spec_request_context(request)
     calls = ComplexF64[]
-    evaluator = spec_determinant_evaluator(calls=calls)
+    # This path is deliberately fixed at the production 1e-6 policy step.
+    # Around the nonzero complex SPEC_ROOT, forming omega +/- h and then
+    # subtracting SPEC_ROOT introduces an O(eps/h) derivative perturbation.
+    # With unit curvature that perturbation is larger than the O(h^2) cubic
+    # signal which is meant to establish strict h/2 -> h -> 2h convergence.
+    # A larger, still analytic curvature keeps the same derivative-selection
+    # contract while giving the convergence comparison a deterministic margin.
+    evaluator = spec_determinant_evaluator(
+        curvature=complex(100.0, 0.0), calls=calls
+    )
 
     ladder = evaluate_derivative_step_ladder(
         Float64,
@@ -261,7 +270,9 @@ end
     @test ladder.h ≈ validated_frequency_step(Float64, request) *
         (1.0 + abs(SPEC_ROOT))
     @test length(calls) == 8
-    @test ladder.derivative_real_half ≈ complex(2.0, 0.0) atol = 1.0e-9
+    @test ladder.derivative_real_half ≈
+        complex(2.0, 0.0) + complex(100.0, 0.0) * (ladder.h / 2)^2
+        atol = 1.0e-9
 
     # The accepted Newton derivative is reused on this path, which removes the
     # base pair.
@@ -274,7 +285,9 @@ end
         complex(0.0, 0.0),
         complex(2.0, 0.0);
         authenticate_controls=false,
-        determinant_evaluator=spec_determinant_evaluator(calls=reuse_calls),
+        determinant_evaluator=spec_determinant_evaluator(
+            curvature=complex(100.0, 0.0), calls=reuse_calls
+        ),
     )
     @test reused.derivative_real_base ≈ complex(2.0, 0.0) atol = 1.0e-9
     @test length(reuse_calls) == 6
