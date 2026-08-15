@@ -342,7 +342,11 @@ def valid_root_authentication(mechanism_id: str) -> dict[str, object]:
                 "endpoint_disagreement_abs": "2.1875E-62",
                 "control_disagreement_abs": "1E-62",
                 "equivalence_disagreement_abs": "5E-63",
-                "precision_disagreement_abs": None,
+                # Populated, and deliberately not the largest component: a
+                # reader that silently substituted it for the maximum would
+                # still produce a plausible-looking bound, so the fixture makes
+                # the two distinguishable.
+                "precision_disagreement_abs": "3E-63",
                 "safety_factor": "64",
                 "numerical_error_abs": "1.4E-60",
             }

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import csv
 from dataclasses import dataclass
+from decimal import Decimal
 import hashlib
 import json
 import math
@@ -32,6 +33,35 @@ from .response_reduction import (
     SignedErrorContribution,
     build_projective_row_plans,
     reduce_projective_rows,
+)
+
+
+# The terms of the acceptance comparison itself, so a reader can re-derive the
+# decision from a report row instead of taking `converged` on faith. Absent for
+# determinant families that publish no error model, which is why every column
+# is nullable rather than defaulted.
+#
+# Deliberately a sibling of CONDITIONING_REPORT_COLUMNS rather than part of it.
+# Conditioning describes how healthy the arithmetic of a solve was; this
+# describes what the acceptance decision was made on. They answer different
+# questions, they can be present independently, and the conditioning tuple is
+# pinned by contract and mirrored into the live progress mapping -- widening it
+# would put acceptance terms on a dashboard that reports solve health.
+AUTHENTICATION_REPORT_COLUMNS = (
+    "determinant_error_model",
+    "determinant_error_abs",
+    "determinant_error_safety_factor",
+    "endpoint_disagreement_abs",
+    "control_disagreement_abs",
+    "equivalence_disagreement_abs",
+    "precision_disagreement_abs",
+    "residual_upper_bound_abs",
+    "derivative_lower_bound_abs",
+    "derivative_propagated_error_abs",
+    "derivative_step_disagreement_abs",
+    "derivative_selected_step",
+    "derivative_axis",
+    "correction_upper_bound",
 )
 
 
@@ -95,6 +125,7 @@ LEAF_COLUMNS = (
     "baseline_determinant_residual",
     "baseline_newton_correction",
     *CONDITIONING_REPORT_COLUMNS,
+    *AUTHENTICATION_REPORT_COLUMNS,
     "signed_root_crosscheck_real",
     "signed_root_crosscheck_imaginary",
     "signed_root_crosscheck_magnitude",
@@ -329,6 +360,60 @@ def _conditioning_report_fields(readout: object) -> dict[str, object]:
     return output
 
 
+def _authentication_report_fields(readout: object) -> dict[str, object]:
+    """Project the acceptance comparison's own terms onto report columns.
+
+    Reported as the worker's decimal text, not as floats. These numbers live at
+    1e-60 and below; rendering them through binary64 would round several of
+    them to the same value and quietly destroy the comparison the columns exist
+    to expose.
+    """
+
+    output: dict[str, object] = {
+        name: None for name in AUTHENTICATION_REPORT_COLUMNS
+    }
+    authentication = _optional_evidence_value(readout, "root_authentication")
+    if authentication is None:
+        return output
+    for column, name in (
+        ("residual_upper_bound_abs", "residual_upper_bound_abs"),
+        ("derivative_lower_bound_abs", "derivative_lower_bound_abs"),
+        ("derivative_propagated_error_abs", "derivative_propagated_error_abs"),
+        (
+            "derivative_step_disagreement_abs",
+            "derivative_step_disagreement_abs",
+        ),
+        ("derivative_selected_step", "selected_step"),
+        ("derivative_axis", "derivative_axis"),
+        ("correction_upper_bound", "correction_upper_bound"),
+        ("determinant_error_model", "error_model_id"),
+    ):
+        output[column] = _decimal_report_text(
+            _optional_evidence_value(authentication, name)
+        )
+    breakdown = _optional_evidence_value(authentication, "error_breakdown")
+    if breakdown is None:
+        return output
+    for column, name in (
+        ("determinant_error_abs", "numerical_error_abs"),
+        ("determinant_error_safety_factor", "safety_factor"),
+        ("endpoint_disagreement_abs", "endpoint_disagreement_abs"),
+        ("control_disagreement_abs", "control_disagreement_abs"),
+        ("equivalence_disagreement_abs", "equivalence_disagreement_abs"),
+        ("precision_disagreement_abs", "precision_disagreement_abs"),
+    ):
+        output[column] = _decimal_report_text(
+            _optional_evidence_value(breakdown, name)
+        )
+    return output
+
+
+def _decimal_report_text(value: object) -> object:
+    """Return a ``Decimal`` as exact text, leaving anything else alone."""
+
+    return str(value) if isinstance(value, Decimal) else value
+
+
 def _root_correction_tolerance_for_precision(digits: int) -> float:
     """Return the Newton-correction threshold governing one M02 stage.
 
@@ -491,6 +576,7 @@ def _leaf_row(
             for name in ERROR_CHANNELS
         },
         **_conditioning_report_fields(result.baseline),
+        **_authentication_report_fields(result.baseline),
     })
     if record.state != "PRODUCED" or result.response is None:
         row["relative_disk_state"] = "UNRESOLVED"

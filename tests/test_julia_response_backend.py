@@ -44,6 +44,7 @@ from windows_solver.response_engine import (
     LadderLevel,
     NumericalPolicy,
     RootAuthenticationEvidence,
+    RootReadout,
     VettedNativeDeterminantKernel,
     WORKER_RESPONSE_WIRE_SCHEMA,
     _diagnostic_response_channel,
@@ -422,6 +423,42 @@ class JuliaResponseBackendTests(unittest.TestCase):
                 self.assertIsInstance(
                     authentication.central_determinant.real, Decimal
                 )
+
+    def test_authentication_survives_the_readout_round_trip(self):
+        """Catches evidence dropped the first time a readout is written down.
+
+        A readout is serialised into caches and solved-leaf material and read
+        back later. Evidence the round trip discards is evidence that exists
+        only inside the process that produced it, which is the same as not
+        having it: the acceptance can be re-asserted from the stored flag but
+        no longer re-checked.
+        """
+
+        for mechanism in ("horizon-admittance", "exterior-fixed-r3"):
+            with self.subTest(mechanism=mechanism):
+                job = _job_for_mechanism(mechanism)
+                backend = JuliaPrecisionRootBackend(
+                    VettedNativeDeterminantKernel.identity, FakeAdapter(), 80
+                )
+                readout = backend.read_root(job, 0.0j)
+
+                restored = RootReadout.from_mapping(readout.to_mapping())
+                original = readout.root_authentication
+                recovered = restored.root_authentication
+
+                self.assertIsNotNone(recovered)
+                # Equal as values, digit for digit -- not merely both present.
+                self.assertEqual(recovered, original)
+                self.assertEqual(
+                    recovered.central_determinant.real,
+                    original.central_determinant.real,
+                )
+                self.assertEqual(
+                    recovered.error_breakdown, original.error_breakdown
+                )
+                # The written form is JSON-safe, since that is what a cache
+                # actually stores.
+                json.loads(json.dumps(readout.to_mapping()["root_authentication"]))
 
     def test_backend_rejects_authentication_disagreeing_with_its_family(self):
         """Catches an error-aware decision made from an absent error term."""

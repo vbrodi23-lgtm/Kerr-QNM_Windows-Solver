@@ -704,3 +704,124 @@ class CampaignReportTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AuthenticationReportColumnTests(unittest.TestCase):
+    """The acceptance comparison must survive into the report a human reads."""
+
+    def _fields(self, readout):
+        from windows_solver.campaign_reports import (
+            _authentication_report_fields,
+        )
+
+        return _authentication_report_fields(readout)
+
+    def test_authentication_columns_stay_a_sibling_of_conditioning(self):
+        """Catches acceptance terms leaking into the solve-health surface.
+
+        ``CONDITIONING_REPORT_COLUMNS`` is pinned by contract and mirrored into
+        the live progress mapping, which reports how healthy a solve's
+        arithmetic is. Acceptance evidence answers a different question and is
+        present or absent independently, so it rides beside conditioning in the
+        leaf row rather than inside it.
+        """
+
+        from windows_solver.campaign_reports import (
+            AUTHENTICATION_REPORT_COLUMNS,
+            CONDITIONING_REPORT_COLUMNS,
+            LEAF_COLUMNS,
+        )
+
+        self.assertEqual(
+            set(AUTHENTICATION_REPORT_COLUMNS)
+            & set(CONDITIONING_REPORT_COLUMNS),
+            set(),
+        )
+        self.assertTrue(set(AUTHENTICATION_REPORT_COLUMNS) <= set(LEAF_COLUMNS))
+        # No column is silently dropped by a name collision in the leaf row.
+        self.assertEqual(len(LEAF_COLUMNS), len(set(LEAF_COLUMNS)))
+
+    def test_report_row_carries_every_term_of_the_acceptance_comparison(self):
+        """Catches a report that shows ``converged`` and nothing behind it.
+
+        A row saying a root converged, without the residual bound, derivative
+        bound and error components the decision came from, cannot be audited --
+        only believed. These columns exist so the comparison can be re-derived
+        from the row itself.
+        """
+
+        from windows_solver.campaign_reports import (
+            AUTHENTICATION_REPORT_COLUMNS,
+        )
+        from windows_solver.response_engine import RootAuthenticationEvidence
+        from tests.fixtures import valid_root_authentication
+
+        authentication = RootAuthenticationEvidence.from_mapping(
+            valid_root_authentication("horizon-admittance")
+        )
+        fields = self._fields(
+            SimpleNamespace(root_authentication=authentication)
+        )
+
+        self.assertEqual(
+            set(AUTHENTICATION_REPORT_COLUMNS) - set(fields), set()
+        )
+        # Exact decimal text, not a binary64 rendering: at 1e-60 and below the
+        # float round trip collapses distinct components onto one another.
+        self.assertEqual(fields["determinant_error_abs"], "1.4E-60")
+        self.assertEqual(fields["endpoint_disagreement_abs"], "2.1875E-62")
+        self.assertEqual(fields["control_disagreement_abs"], "1E-62")
+        self.assertEqual(fields["equivalence_disagreement_abs"], "5E-63")
+        self.assertEqual(fields["precision_disagreement_abs"], "3E-63")
+        self.assertEqual(fields["determinant_error_safety_factor"], "64")
+        self.assertEqual(fields["residual_upper_bound_abs"], "2.4E-60")
+        self.assertEqual(fields["derivative_lower_bound_abs"], "2.4")
+        self.assertEqual(fields["correction_upper_bound"], "1E-60")
+        self.assertEqual(fields["derivative_axis"], "real")
+        self.assertEqual(
+            fields["determinant_error_model"],
+            "verified-endpoint-control-equivalence-absolute-error/v2",
+        )
+
+        # The decision re-derives from the row alone.
+        from decimal import Decimal
+
+        self.assertEqual(
+            Decimal(fields["residual_upper_bound_abs"])
+            / Decimal(fields["derivative_lower_bound_abs"]),
+            Decimal(fields["correction_upper_bound"]),
+        )
+
+    def test_a_family_without_an_error_model_leaves_the_columns_empty(self):
+        """Absent evidence must read as absent, never as a defaulted zero.
+
+        A zero in these columns would claim a measured, perfect agreement. The
+        exterior Wronskian path publishes no error model in this revision, so
+        its columns have to stay null.
+        """
+
+        from windows_solver.campaign_reports import (
+            AUTHENTICATION_REPORT_COLUMNS,
+        )
+        from windows_solver.response_engine import RootAuthenticationEvidence
+        from tests.fixtures import valid_root_authentication
+
+        authentication = RootAuthenticationEvidence.from_mapping(
+            valid_root_authentication("exterior-fixed-r3")
+        )
+        fields = self._fields(
+            SimpleNamespace(root_authentication=authentication)
+        )
+
+        self.assertIsNone(fields["determinant_error_abs"])
+        self.assertIsNone(fields["determinant_error_model"])
+        self.assertIsNone(fields["precision_disagreement_abs"])
+        # The comparison's own terms are still present; only the error model is
+        # missing.
+        self.assertEqual(fields["residual_upper_bound_abs"], "2.4E-60")
+
+        # A readout that predates the record leaves every column null rather
+        # than failing, so historical checkpoints stay projectable.
+        historical = self._fields(SimpleNamespace())
+        for column in AUTHENTICATION_REPORT_COLUMNS:
+            self.assertIsNone(historical[column])

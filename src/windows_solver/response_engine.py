@@ -1057,6 +1057,16 @@ class DecimalComplex:
 
         return (self.real * self.real + self.imaginary * self.imaginary).sqrt()
 
+    def to_mapping(self) -> dict[str, str]:
+        """Return the worker's wire form, digit for digit.
+
+        ``str`` on a ``Decimal`` is exact, so a readout that is written and
+        read back carries the same digits the worker produced rather than a
+        binary64 shadow of them.
+        """
+
+        return {"real": str(self.real), "imaginary": str(self.imaginary)}
+
 
 def _authentication_complex_from_mapping(
     value: object, subject: str
@@ -1187,6 +1197,18 @@ class DeterminantErrorBreakdown:
             )
         return cls(**parsed)
 
+    def to_mapping(self) -> dict[str, str | None]:
+        """Return the wire form ``from_mapping`` accepts, unchanged."""
+
+        return {
+            field: (
+                None
+                if (value := getattr(self, field)) is None
+                else str(value)
+            )
+            for field in sorted(_DETERMINANT_ERROR_BREAKDOWN_FIELDS)
+        }
+
 
 @dataclass(frozen=True, slots=True)
 class RootAuthenticationEvidence:
@@ -1302,6 +1324,37 @@ class RootAuthenticationEvidence:
             error_model_id=model,
             **decimals,
         )
+
+    def to_mapping(self) -> dict[str, object]:
+        """Return the wire form ``from_mapping`` accepts, unchanged.
+
+        A root readout that survives a cache round trip without this record is
+        a root whose acceptance can no longer be re-checked -- only re-asserted.
+        The point of carrying every term of the comparison is lost if the terms
+        stop at the first place the readout is written down.
+        """
+
+        return {
+            "central_determinant": self.central_determinant.to_mapping(),
+            "error_breakdown": (
+                None
+                if self.error_breakdown is None
+                else self.error_breakdown.to_mapping()
+            ),
+            "residual_upper_bound_abs": str(self.residual_upper_bound_abs),
+            "derivative_estimate": self.derivative_estimate.to_mapping(),
+            "derivative_propagated_error_abs": str(
+                self.derivative_propagated_error_abs
+            ),
+            "derivative_step_disagreement_abs": str(
+                self.derivative_step_disagreement_abs
+            ),
+            "derivative_lower_bound_abs": str(self.derivative_lower_bound_abs),
+            "selected_step": str(self.selected_step),
+            "derivative_axis": self.derivative_axis,
+            "correction_upper_bound": str(self.correction_upper_bound),
+            "error_model_id": self.error_model_id,
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -1793,6 +1846,10 @@ class RootReadout:
             output["raw_determinant_evidence_status"] = (
                 self.raw_determinant_evidence_status
             )
+        if self.root_authentication is not None:
+            output["root_authentication"] = (
+                self.root_authentication.to_mapping()
+            )
         if self.worker_response_receipt is not None:
             output["worker_response_receipt"] = {
                 **dict(self.worker_response_receipt),
@@ -1879,6 +1936,13 @@ class RootReadout:
                 else value["raw_determinant_evidence_status"]
             ),
             worker_response_receipt=value.get("worker_response_receipt"),
+            root_authentication=(
+                None
+                if value.get("root_authentication") is None
+                else RootAuthenticationEvidence.from_mapping(
+                    value["root_authentication"]
+                )
+            ),
         )
 
 
