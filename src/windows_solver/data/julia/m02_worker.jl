@@ -2950,12 +2950,18 @@ function validated_frequency_steps(
         (nominal_step, minimum_step, maximum_step),
     )
     valid_order = minimum_step <= nominal_step <= maximum_step
-    valid_values && valid_order &&
+    # A range narrower than a factor of four cannot hold any rung whose h/2 and
+    # 2h samples both stay inside it, so the ladder could never honour the
+    # policy it was given. Reject that here rather than deep inside the search.
+    valid_width = valid_values &&
+        maximum_step >= T(4) * minimum_step
+    valid_values && valid_order && valid_width &&
         return nominal_step, minimum_step, maximum_step
     throw(numerical_control_failure(
         request,
         "ALGEBRAIC_REPRESENTATION_SINGULAR",
-        "finite-difference frequency steps must be finite, positive, and ordered",
+        "finite-difference frequency steps must be finite, positive, ordered, " *
+        "and at least a factor of four wide",
         Dict{String,Any}(
             "reason" => "INVALID_FREQUENCY_STEP",
             "range_status" => "invalid-frequency-step/v1",
@@ -2977,6 +2983,26 @@ function validated_frequency_step(
     return nominal_step
 end
 
+"""
+    admissible_frequency_step_interval(minimum_step, maximum_step)
+
+Return the interval of rungs whose every sample stays inside policy.
+
+Each rung `h` evaluates the stencil at `h/2`, `h`, `2h` and `ih`, and the
+accepted derivative is the `h/2` estimate -- so `h/2` is also the step the
+authentication record reports. Bounding only `h` therefore leaves the finest
+sample below `minimum_step` and the coarsest above `maximum_step`, which means
+the configured range would not actually be the range that was evaluated.
+
+Admissibility is consequently `2*minimum_step <= h <= maximum_step/2`, which is
+non-empty only when `maximum_step >= 4*minimum_step`.
+"""
+function admissible_frequency_step_interval(
+    minimum_step::T, maximum_step::T
+) where {T<:AbstractFloat}
+    return T(2) * minimum_step, maximum_step / T(2)
+end
+
 function frequency_step_rungs(
     nominal_step::T, minimum_step::T, maximum_step::T
 ) where {T<:AbstractFloat}
@@ -2989,27 +3015,43 @@ function frequency_step_rungs(
     ) || throw(ArgumentError(
         "frequency step rungs require finite positive bounds"
     ))
-    rungs = T[nominal_step]
-    step = nominal_step
+    finest, coarsest = admissible_frequency_step_interval(
+        minimum_step, maximum_step
+    )
+    finest <= coarsest || throw(ArgumentError(
+        "frequency step bounds are too narrow to sample h/2, h, and 2h " *
+        "inside the configured range"
+    ))
+    # The nominal step is a preference for where to begin searching; the hard
+    # contract is that no evaluated sample escapes policy. Anchoring inside the
+    # admissible interval honours both.
+    anchor = min(max(nominal_step, finest), coarsest)
+    rungs = T[anchor]
+    step = anchor
     for _ in 1:(MAXIMUM_FREQUENCY_STEP_RUNGS - 1)
-        step >= maximum_step && break
-        candidate = min(maximum_step, step * T(4))
+        step >= coarsest && break
+        candidate = min(coarsest, step * T(4))
         candidate == step && break
         push!(rungs, candidate)
         step = candidate
     end
-    step = nominal_step
+    step = anchor
     for _ in 1:(MAXIMUM_FREQUENCY_STEP_RUNGS - length(rungs))
-        step <= minimum_step && break
-        candidate = max(minimum_step, step / T(4))
+        step <= finest && break
+        candidate = max(finest, step / T(4))
         candidate == step && break
         push!(rungs, candidate)
         step = candidate
     end
     unique!(rungs)
-    all(step -> minimum_step <= step <= maximum_step, rungs) || error(
-        "frequency step rung construction escaped its bounds"
-    )
+    # Assert the property the interval exists to guarantee: every sample the
+    # ladder will actually evaluate, and the step it will actually report, lie
+    # within the configured policy range.
+    all(
+        step -> minimum_step <= step / T(2) &&
+            T(2) * step <= maximum_step,
+        rungs,
+    ) || error("frequency step rung samples escaped their bounds")
     length(rungs) <= MAXIMUM_FREQUENCY_STEP_RUNGS || error(
         "frequency step rung construction exceeded its bound"
     )
@@ -4529,7 +4571,7 @@ function result_fields(::Type{T}, request, digits::Int, bits::Int) where {T<:Abs
         )
         branch_valid = abs(root - omega) <= branch_tolerance
         return [
-            "schema_version" => 3,
+            "schema_version" => 4,
             "status" => "ok",
             "adapter" => "package-owned-julia-gsn-root-readout",
             "request_sha256" => string(required(request, "request_sha256")),
@@ -4607,7 +4649,7 @@ function result_fields(::Type{T}, request, digits::Int, bits::Int) where {T<:Abs
     )
 
     return [
-        "schema_version" => 3,
+        "schema_version" => 4,
         "status" => "ok",
         "adapter" => "package-owned-julia-gsn-root-readout",
         "request_sha256" => string(required(request, "request_sha256")),

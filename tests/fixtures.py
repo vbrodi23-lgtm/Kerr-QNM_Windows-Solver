@@ -236,7 +236,7 @@ def current_promoted_component_payload(
             "scientific_runtime_sha256": hashlib.sha256(
                 canonical_json_bytes(scientific_runtime)
             ).hexdigest(),
-            "worker_response_schema_version": 3,
+            "worker_response_schema_version": 4,
             "root_residual_abs_text": str(
                 updated.normalised_determinant_abs
             ),
@@ -288,7 +288,52 @@ def current_promoted_component_payload(
     return payload
 
 
-def valid_schema_three_julia_root_response(
+def valid_root_authentication(mechanism_id: str) -> dict[str, object]:
+    """Return the worker's error-aware root authentication record.
+
+    The error breakdown and model identity are published only by families that
+    compute one, so the exterior Wronskian path carries nulls. Keeping that
+    asymmetry here is deliberate: it is the property the backend cross-checks
+    against ``scattering_diagnostics_applicable``.
+    """
+
+    horizon = mechanism_id == "horizon-admittance"
+    # The record is arithmetically coherent so tests can assert the real
+    # relationships rather than merely the field shapes:
+    #   numerical_error_abs   = safety_factor * max(components) = 64 * 2.1875E-62
+    #   residual_upper_bound  = |D| + eta_D  = 1E-60 + 1.4E-60
+    #   correction_upper_bound= residual_upper_bound / derivative_lower_bound
+    return {
+        "central_determinant": {"real": "1E-60", "imaginary": "0"},
+        "error_breakdown": (
+            {
+                "endpoint_disagreement_abs": "2.1875E-62",
+                "control_disagreement_abs": "1E-62",
+                "equivalence_disagreement_abs": "5E-63",
+                "precision_disagreement_abs": None,
+                "safety_factor": "64",
+                "numerical_error_abs": "1.4E-60",
+            }
+            if horizon
+            else None
+        ),
+        "residual_upper_bound_abs": "2.4E-60" if horizon else "1E-60",
+        "derivative_estimate": {"real": "2.5", "imaginary": "0"},
+        "derivative_propagated_error_abs": "1E-54" if horizon else "0",
+        "derivative_step_disagreement_abs": "2E-54",
+        "derivative_lower_bound_abs": "2.4",
+        "selected_step": "1E-6",
+        "derivative_axis": "real",
+        "correction_upper_bound": (
+            "1E-60" if horizon else "4.1666666666666666666666666667E-61"
+        ),
+        "error_model_id": (
+            "verified-endpoint-control-equivalence-absolute-error/v2" if horizon else None
+        ),
+    }
+
+
+def valid_julia_root_response(
     request: dict[str, object],
 ) -> dict[str, object]:
     """Return a complete successful promoted-worker response for one request."""
@@ -306,7 +351,7 @@ def valid_schema_three_julia_root_response(
         "seed-path": "4E-55",
     }
     return {
-        "schema_version": 3,
+        "schema_version": 4,
         "status": "ok",
         "adapter": "package-owned-julia-gsn-root-readout",
         "request_sha256": "e" * 64,
@@ -326,6 +371,9 @@ def valid_schema_three_julia_root_response(
             else "not-applicable/v1"
         ),
         "root_derivative_abs": "2.5",
+        "root_authentication": valid_root_authentication(
+            request["mechanism_id"]
+        ),
         "root_converged": True,
         "branch_authentication_contract_version": 3,
         "root_branch_continuation_valid": True,

@@ -78,6 +78,12 @@ HISTORICAL_NUMERICAL_CONDITIONING_SCHEMA = (
     "windows-solver.m02-conditioning/2"
 )
 WORKER_RESPONSE_RECEIPT_SCHEMA = "windows-solver.worker-response-receipt/1"
+# The promoted worker's root-readout wire schema. Version 4 adds the
+# root_authentication record: the error-aware terms that decide whether a small
+# determinant is a located root or an unresolved one. The receipt records the
+# version it observed so a cached receipt cannot be replayed against a
+# different wire contract.
+WORKER_RESPONSE_WIRE_SCHEMA = 4
 _WORKER_RESPONSE_RECEIPT_FIELDS = frozenset({
     "schema",
     "request_binding",
@@ -320,7 +326,7 @@ def _validated_worker_response_receipt(
             raise ValueError(f"worker response receipt {field} is invalid")
     if value["request_sha256"] != _sha256(dict(request_binding)):
         raise ValueError("worker response receipt request digest is invalid")
-    if value["worker_response_schema_version"] != 3:
+    if value["worker_response_schema_version"] != WORKER_RESPONSE_WIRE_SCHEMA:
         raise ValueError("worker response receipt wire schema is invalid")
     residual = _conditioning_decimal_from_text(
         value["root_residual_abs_text"],
@@ -1003,6 +1009,247 @@ class DiagnosticRootReadout:
             determinant_residual_abs=float(value["determinant_residual_abs"]),
             determinant_derivative_abs=float(value["determinant_derivative_abs"]),
             converged=value["converged"],
+        )
+
+
+_DETERMINANT_ERROR_BREAKDOWN_FIELDS = frozenset({
+    "endpoint_disagreement_abs",
+    "control_disagreement_abs",
+    "equivalence_disagreement_abs",
+    "precision_disagreement_abs",
+    "safety_factor",
+    "numerical_error_abs",
+})
+_ROOT_AUTHENTICATION_FIELDS = frozenset({
+    "central_determinant",
+    "error_breakdown",
+    "residual_upper_bound_abs",
+    "derivative_estimate",
+    "derivative_propagated_error_abs",
+    "derivative_step_disagreement_abs",
+    "derivative_lower_bound_abs",
+    "selected_step",
+    "derivative_axis",
+    "correction_upper_bound",
+    "error_model_id",
+})
+
+
+@dataclass(frozen=True, slots=True)
+class DecimalComplex:
+    """A complex value whose components keep the worker's exact decimal text.
+
+    Collapsing these to binary64 would discard most of the precision the
+    promoted worker was run at, which is the opposite of what a 120-digit
+    pipeline needs from its evidence records.
+    """
+
+    real: Decimal
+    imaginary: Decimal
+
+    def magnitude(self) -> Decimal:
+        """Return |z| at the current decimal context precision."""
+
+        return (self.real * self.real + self.imaginary * self.imaginary).sqrt()
+
+
+def _authentication_complex_from_mapping(
+    value: object, subject: str
+) -> DecimalComplex:
+    """Parse a worker complex value, preserving its decimal text exactly."""
+
+    if not isinstance(value, Mapping) or set(value) != {"real", "imaginary"}:
+        raise ValueError(f"{subject} must carry real and imaginary text")
+    return DecimalComplex(
+        real=_conditioning_decimal_from_text(value["real"], f"{subject} real"),
+        imaginary=_conditioning_decimal_from_text(
+            value["imaginary"], f"{subject} imaginary"
+        ),
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class DeterminantErrorBreakdown:
+    """The absolute components aggregated into one determinant error bound.
+
+    Every component is absolute. None is divided by ``|D|``: near a QNM the
+    determinant is small by construction, so a relative measure would report
+    catastrophic error exactly where the answer is best.
+
+    ``control``, ``equivalence`` and ``precision`` are optional because they
+    require a second evaluation that a given call may not have performed. The
+    endpoint term is always present for a horizon determinant -- it comes from
+    the reference/verification endpoint pair the geometry gate guarantees.
+    """
+
+    endpoint_disagreement_abs: Decimal
+    control_disagreement_abs: Decimal | None
+    equivalence_disagreement_abs: Decimal | None
+    precision_disagreement_abs: Decimal | None
+    safety_factor: Decimal
+    numerical_error_abs: Decimal
+
+    def __post_init__(self) -> None:
+        required = ("endpoint_disagreement_abs", "safety_factor",
+                    "numerical_error_abs")
+        for name in required:
+            value = getattr(self, name)
+            if type(value) is not Decimal or not value.is_finite() or value < 0:
+                raise ValueError(
+                    f"determinant error breakdown {name} must be a finite "
+                    "nonnegative decimal"
+                )
+        if self.safety_factor <= 0:
+            raise ValueError(
+                "determinant error breakdown safety factor must be positive"
+            )
+        for name in ("control_disagreement_abs", "equivalence_disagreement_abs",
+                     "precision_disagreement_abs"):
+            value = getattr(self, name)
+            if value is None:
+                continue
+            if type(value) is not Decimal or not value.is_finite() or value < 0:
+                raise ValueError(
+                    f"determinant error breakdown {name} must be a finite "
+                    "nonnegative decimal"
+                )
+
+    @classmethod
+    def from_mapping(cls, value: object) -> "DeterminantErrorBreakdown":
+        if not isinstance(value, Mapping) or set(value) != (
+            _DETERMINANT_ERROR_BREAKDOWN_FIELDS
+        ):
+            raise ValueError("determinant error breakdown fields are invalid")
+        optional = {
+            "control_disagreement_abs",
+            "equivalence_disagreement_abs",
+            "precision_disagreement_abs",
+        }
+        parsed: dict[str, Decimal | None] = {}
+        for field in sorted(_DETERMINANT_ERROR_BREAKDOWN_FIELDS):
+            raw = value[field]
+            if field in optional and raw is None:
+                parsed[field] = None
+                continue
+            parsed[field] = _conditioning_decimal_from_text(
+                raw, f"determinant error breakdown {field}"
+            )
+        return cls(**parsed)
+
+
+@dataclass(frozen=True, slots=True)
+class RootAuthenticationEvidence:
+    """The error-aware record proving a root was resolved, not merely small.
+
+    ``|D|`` alone cannot decide a QNM root: a determinant that is small only
+    because its own noise cancelled is indistinguishable from a located one.
+    What decides it is ``(|D| + eta_D) / (|D'| - disagreement - eta_D')``, and
+    this record carries every term of that comparison so the decision can be
+    re-checked rather than trusted.
+
+    ``error_breakdown`` and ``error_model_id`` are absent for determinant
+    families that publish no error model -- the exterior Wronskian path, which
+    this revision leaves unchanged.
+    """
+
+    central_determinant: DecimalComplex
+    error_breakdown: DeterminantErrorBreakdown | None
+    residual_upper_bound_abs: Decimal
+    derivative_estimate: DecimalComplex
+    derivative_propagated_error_abs: Decimal
+    derivative_step_disagreement_abs: Decimal
+    derivative_lower_bound_abs: Decimal
+    selected_step: Decimal
+    derivative_axis: str
+    correction_upper_bound: Decimal
+    error_model_id: str | None
+
+    def __post_init__(self) -> None:
+        for name in (
+            "residual_upper_bound_abs",
+            "derivative_propagated_error_abs",
+            "derivative_step_disagreement_abs",
+            "derivative_lower_bound_abs",
+            "selected_step",
+            "correction_upper_bound",
+        ):
+            value = getattr(self, name)
+            if type(value) is not Decimal or not value.is_finite() or value < 0:
+                raise ValueError(
+                    f"root authentication {name} must be a finite nonnegative "
+                    "decimal"
+                )
+        if self.selected_step <= 0:
+            raise ValueError(
+                "root authentication selected step must be positive"
+            )
+        if self.derivative_lower_bound_abs <= 0:
+            raise ValueError(
+                "root authentication derivative lower bound must be positive"
+            )
+        if self.derivative_axis not in {"real", "imaginary"}:
+            raise ValueError("root authentication derivative axis is invalid")
+        for name in ("central_determinant", "derivative_estimate"):
+            if not isinstance(getattr(self, name), DecimalComplex):
+                raise ValueError(
+                    f"root authentication {name} has invalid type"
+                )
+        if self.error_breakdown is not None and not isinstance(
+            self.error_breakdown, DeterminantErrorBreakdown
+        ):
+            raise ValueError("root authentication error breakdown has invalid type")
+        if (self.error_breakdown is None) != (self.error_model_id is None):
+            raise ValueError(
+                "root authentication error breakdown and model identity must "
+                "be present together"
+            )
+        if self.error_model_id is not None and not self.error_model_id:
+            raise ValueError("root authentication error model identity is empty")
+
+    @classmethod
+    def from_mapping(cls, value: object) -> "RootAuthenticationEvidence":
+        if not isinstance(value, Mapping) or set(value) != (
+            _ROOT_AUTHENTICATION_FIELDS
+        ):
+            raise ValueError("root authentication fields are invalid")
+        breakdown_value = value["error_breakdown"]
+        breakdown = (
+            None
+            if breakdown_value is None
+            else DeterminantErrorBreakdown.from_mapping(breakdown_value)
+        )
+        model = value["error_model_id"]
+        if model is not None and not isinstance(model, str):
+            raise ValueError("root authentication error model identity is invalid")
+        axis = value["derivative_axis"]
+        if not isinstance(axis, str):
+            raise ValueError("root authentication derivative axis is invalid")
+        decimals = {
+            field: _conditioning_decimal_from_text(
+                value[field], f"root authentication {field}"
+            )
+            for field in (
+                "residual_upper_bound_abs",
+                "derivative_propagated_error_abs",
+                "derivative_step_disagreement_abs",
+                "derivative_lower_bound_abs",
+                "selected_step",
+                "correction_upper_bound",
+            )
+        }
+        return cls(
+            central_determinant=_authentication_complex_from_mapping(
+                value["central_determinant"],
+                "root authentication central determinant",
+            ),
+            error_breakdown=breakdown,
+            derivative_estimate=_authentication_complex_from_mapping(
+                value["derivative_estimate"],
+                "root authentication derivative estimate",
+            ),
+            derivative_axis=axis,
+            error_model_id=model,
+            **decimals,
         )
 
 

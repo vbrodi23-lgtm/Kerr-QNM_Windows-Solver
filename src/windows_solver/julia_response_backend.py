@@ -31,6 +31,7 @@ from .response_engine import (
     NumericalConditioningEvidence,
     NUMERICAL_CONDITIONING_SCHEMA,
     ResponseComponentJob,
+    RootAuthenticationEvidence,
     RootReadout,
     WORKER_RESPONSE_RECEIPT_SCHEMA,
     _exterior_support,
@@ -1944,6 +1945,7 @@ class JuliaPrecisionRootBackend:
             "raw_determinant_abs",
             "raw_determinant_evidence_status",
             "root_derivative_abs",
+            "root_authentication",
             "root_converged",
             "branch_authentication_contract_version",
             "root_branch_continuation_valid",
@@ -1970,7 +1972,7 @@ class JuliaPrecisionRootBackend:
                     "branch_authentication_contract_version",
                 )
             )
-            or response["schema_version"] != 3
+            or response["schema_version"] != 4
             or response["status"] != "ok"
             or response["adapter"] != "package-owned-julia-gsn-root-readout"
             or response["precision_digits"] != self.digits
@@ -1996,6 +1998,25 @@ class JuliaPrecisionRootBackend:
         if numerical_conditioning.schema != NUMERICAL_CONDITIONING_SCHEMA:
             raise JuliaResponseBackendError(
                 "M02 Julia current conditioning schema is required"
+            )
+        try:
+            root_authentication = RootAuthenticationEvidence.from_mapping(
+                response["root_authentication"]
+            )
+        except ValueError as error:
+            raise JuliaResponseBackendError(
+                "M02 Julia root authentication evidence is invalid"
+            ) from error
+        # The error model is published exactly by the families that compute one.
+        # A horizon determinant without a breakdown would mean an error-aware
+        # acceptance decision was made from an absent error term.
+        horizon_family = (
+            numerical_conditioning.scattering_diagnostics_applicable is True
+        )
+        if horizon_family != (root_authentication.error_breakdown is not None):
+            raise JuliaResponseBackendError(
+                "M02 Julia root authentication error model does not match the "
+                "determinant family"
             )
         converged = response["root_converged"]
         diagnostics_skipped_reason = response.get("diagnostics_skipped_reason")

@@ -9,7 +9,7 @@ import unittest
 
 from tests.fixtures import (
     valid_numerical_conditioning,
-    valid_schema_three_julia_root_response,
+    valid_julia_root_response,
 )
 from windows_solver.contracts import canonical_json_bytes
 from windows_solver.julia_response_backend import (
@@ -746,7 +746,7 @@ class PromotedRuntimeProvenancePersistenceTests(unittest.TestCase):
                         )
                     )
                 ).hexdigest(),
-                "worker_response_schema_version": 3,
+                "worker_response_schema_version": 4,
                 "root_residual_abs_text": "1E-12",
                 "raw_determinant_abs_text": None,
                 "raw_determinant_evidence_status": "not-applicable/v1",
@@ -1050,7 +1050,7 @@ class JuliaSchemaThreeConditioningTests(unittest.TestCase):
 
         def evaluate(self, request):
             self.requests.append(request)
-            response = valid_schema_three_julia_root_response(request)
+            response = valid_julia_root_response(request)
             if self.mutate is not None:
                 self.mutate(response)
             return response
@@ -1237,7 +1237,7 @@ class JuliaSchemaThreeConditioningTests(unittest.TestCase):
         """Catches float/string drift passing equality-based schema checks."""
 
         request = self._backend()._request(self._job(), 0.0j)
-        expected = valid_schema_three_julia_root_response(request)
+        expected = valid_julia_root_response(request)
         fields = (
             "schema_version",
             "precision_digits",

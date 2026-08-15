@@ -387,7 +387,20 @@ end
     @test_throws ArgumentError validate_finite_difference_inputs(
         valid_plus, valid_minus, complex(Inf, 0.0); axis="real"
     )
+    # The composite entry point runs the same validation before any algebra.
+    # The two input classes keep distinct types on purpose: a nonfinite stencil
+    # value is a numerical condition and must stay a FiniteDifferenceRangeError
+    # so translate_numerical_control_failure can type it as
+    # ALGEBRAIC_REPRESENTATION_SINGULAR (asserted above at "nonfinite stencil
+    # values are typed range failures"), while a malformed offset or axis is a
+    # caller error and stays an ArgumentError.
     @test_throws ArgumentError build_finite_difference_diagnostics(
+        valid_plus, valid_minus, 0.0 + 0.0im; axis="real"
+    )
+    @test_throws ArgumentError build_finite_difference_diagnostics(
+        valid_plus, valid_minus, 0.1 + 0.0im; axis="diagonal"
+    )
+    @test_throws FiniteDifferenceRangeError build_finite_difference_diagnostics(
         complex(Inf, 0.0), valid_minus, 0.1 + 0.0im; axis="real"
     )
 end

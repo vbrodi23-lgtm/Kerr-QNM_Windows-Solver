@@ -390,7 +390,7 @@ def _with_baseline_conditioning(
                 canonical_json_bytes(request_binding)
             ).hexdigest(),
             "scientific_runtime_sha256": scientific_runtime_sha256,
-            "worker_response_schema_version": 3,
+            "worker_response_schema_version": 4,
             "root_residual_abs_text": str(
                 updated.normalised_determinant_abs
             ),
