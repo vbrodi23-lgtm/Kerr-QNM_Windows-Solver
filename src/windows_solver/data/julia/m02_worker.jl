@@ -2458,8 +2458,7 @@ function evaluate_horizon_determinant(
         ),
         max(
             coefficient_diagnostics.matching_reconstruction_residual,
-            verification.coefficient_diagnostics
-                .matching_reconstruction_residual,
+            verification.coefficient_diagnostics.matching_reconstruction_residual,
         ),
         endpoint_summary.endpoint_remainders_regular,
         endpoint_summary.maximum_endpoint_reconstruction_error,
