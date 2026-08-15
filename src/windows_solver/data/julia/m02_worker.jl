@@ -953,7 +953,123 @@ struct DeterminantDiagnostics{T<:AbstractFloat}
 end
 
 const VERIFIED_ENDPOINT_ERROR_MODEL_ID =
-    "verified-endpoint-absolute-error/v1"
+    "verified-endpoint-control-equivalence-absolute-error/v2"
+
+struct DeterminantErrorBreakdown{T<:AbstractFloat}
+    endpoint_disagreement_abs::T
+    control_disagreement_abs::Union{Nothing,T}
+    equivalence_disagreement_abs::Union{Nothing,T}
+    precision_disagreement_abs::Union{Nothing,T}
+    safety_factor::T
+    numerical_error_abs::T
+
+    function DeterminantErrorBreakdown{T}(
+        endpoint_disagreement_abs::T,
+        control_disagreement_abs::Union{Nothing,T},
+        equivalence_disagreement_abs::Union{Nothing,T},
+        precision_disagreement_abs::Union{Nothing,T},
+        safety_factor::T,
+        numerical_error_abs::T,
+    ) where {T<:AbstractFloat}
+        available_components = T[endpoint_disagreement_abs]
+        for component in (
+            control_disagreement_abs,
+            equivalence_disagreement_abs,
+            precision_disagreement_abs,
+        )
+            component === nothing || push!(available_components, component)
+        end
+        all(value -> isfinite(value) && value >= zero(T), available_components) ||
+            throw(ArgumentError(
+                "determinant error components must be finite and nonnegative"
+            ))
+        isfinite(safety_factor) && safety_factor > zero(T) ||
+            throw(ArgumentError(
+                "determinant error safety factor must be finite and positive"
+            ))
+        expected_error_abs = safety_factor * maximum(available_components)
+        isfinite(expected_error_abs) || throw(ArgumentError(
+            "determinant numerical error is nonfinite"
+        ))
+        numerical_error_abs == expected_error_abs || throw(ArgumentError(
+            "determinant numerical error does not match its component maximum"
+        ))
+        new{T}(
+            endpoint_disagreement_abs,
+            control_disagreement_abs,
+            equivalence_disagreement_abs,
+            precision_disagreement_abs,
+            safety_factor,
+            numerical_error_abs,
+        )
+    end
+end
+
+struct DerivativeAuthentication{T<:AbstractFloat}
+    value::Complex{T}
+    propagated_error_abs::T
+    step_disagreement_abs::T
+    lower_bound_abs::T
+    step::T
+    axis::String
+
+    function DerivativeAuthentication{T}(
+        value::Complex{T},
+        propagated_error_abs::T,
+        step_disagreement_abs::T,
+        lower_bound_abs::T,
+        step::T,
+        axis::String,
+    ) where {T<:AbstractFloat}
+        all(isfinite, (
+            real(value),
+            imag(value),
+            propagated_error_abs,
+            step_disagreement_abs,
+            lower_bound_abs,
+            step,
+        )) || throw(ArgumentError(
+            "derivative authentication values must be finite"
+        ))
+        propagated_error_abs >= zero(T) || throw(ArgumentError(
+            "propagated derivative error must be nonnegative"
+        ))
+        step_disagreement_abs >= zero(T) || throw(ArgumentError(
+            "derivative step disagreement must be nonnegative"
+        ))
+        step > zero(T) || throw(ArgumentError(
+            "authenticated derivative step must be positive"
+        ))
+        axis in ("real", "imaginary") || throw(ArgumentError(
+            "authenticated derivative axis is invalid"
+        ))
+        expected_lower_bound = abs(value) - step_disagreement_abs -
+            propagated_error_abs
+        lower_bound_abs == expected_lower_bound || throw(ArgumentError(
+            "derivative lower bound is inconsistent"
+        ))
+        lower_bound_abs > zero(T) || throw(ArgumentError(
+            "authenticated derivative lower bound must be positive"
+        ))
+        new{T}(
+            value,
+            propagated_error_abs,
+            step_disagreement_abs,
+            lower_bound_abs,
+            step,
+            axis,
+        )
+    end
+end
+
+struct RootAuthentication{T<:AbstractFloat}
+    central_determinant::Complex{T}
+    error_breakdown::Union{Nothing,DeterminantErrorBreakdown{T}}
+    residual_upper_bound_abs::T
+    derivative::DerivativeAuthentication{T}
+    correction_upper_bound::T
+    error_model_id::Union{Nothing,String}
+end
 
 """
     DeterminantEvaluation
@@ -973,7 +1089,7 @@ the historical contract.
 """
 struct DeterminantEvaluation{T<:AbstractFloat}
     value::Complex{T}
-    numerical_error_abs::Union{Nothing,T}
+    error_breakdown::Union{Nothing,DeterminantErrorBreakdown{T}}
     error_model_id::Union{Nothing,String}
     diagnostics::DeterminantDiagnostics{T}
 end
@@ -2156,29 +2272,44 @@ function evaluate_horizon_chart(
     )
 end
 
-"""
-    estimate_horizon_determinant_error(T, request, reference, verification)
-
-Bound the absolute determinant error from the reference/verification endpoint
-disagreement.
-
-The bound is `safety_factor * |D_ref - D_ver|`, an absolute quantity. It is
-deliberately *not* divided by |D|: near a QNM the determinant is small by
-construction, so a relative measure would report catastrophic error exactly
-where the answer is best. The endpoint term is one contribution; the root
-authentication path folds in control, equivalence, and cross-precision terms.
-"""
-function estimate_horizon_determinant_error(
-    ::Type{T}, request, reference_value::Complex{T},
-    verification_value::Complex{T},
+function determinant_error_breakdown(
+    ::Type{T},
+    request,
+    endpoint_disagreement_abs::T;
+    control_disagreement_abs::Union{Nothing,T}=nothing,
+    equivalence_disagreement_abs::Union{Nothing,T}=nothing,
+    precision_disagreement_abs::Union{Nothing,T}=nothing,
 ) where {T<:AbstractFloat}
     safety_factor = parse_real(T, request, "determinant_error_safety_factor")
-    safety_factor > zero(T) ||
-        error("determinant error safety factor must be positive")
-    endpoint_disagreement = abs(reference_value - verification_value)
-    isfinite(endpoint_disagreement) ||
-        error("horizon determinant endpoint disagreement is nonfinite")
-    return safety_factor * endpoint_disagreement
+    available_components = T[endpoint_disagreement_abs]
+    for component in (
+        control_disagreement_abs,
+        equivalence_disagreement_abs,
+        precision_disagreement_abs,
+    )
+        component === nothing || push!(available_components, component)
+    end
+    numerical_error_abs = safety_factor * maximum(available_components)
+    return DeterminantErrorBreakdown{T}(
+        endpoint_disagreement_abs,
+        control_disagreement_abs,
+        equivalence_disagreement_abs,
+        precision_disagreement_abs,
+        safety_factor,
+        numerical_error_abs,
+    )
+end
+
+function maximum_optional_discrepancy(
+    ::Type{T}, values...
+) where {T<:AbstractFloat}
+    available = T[T(value) for value in values if value !== nothing]
+    isempty(available) && return nothing
+    all(value -> isfinite(value) && value >= zero(T), available) ||
+        throw(ArgumentError(
+            "optional determinant discrepancies must be finite and nonnegative"
+        ))
+    return maximum(available)
 end
 
 function evaluate_horizon_reflectivity_chart(
@@ -2269,10 +2400,10 @@ function evaluate_horizon_reflectivity_chart(
             string(chart_assessment.normalised_determinant_abs),
         "cref_chart_margin" =>
             string(chart_assessment.cref_chart_margin),
-        "raw_normalised_equivalence_error" =>
-            chart_assessment.raw_normalised_equivalence_error === nothing ?
+        "equivalence_disagreement_abs" =>
+            chart_assessment.equivalence_disagreement_abs === nothing ?
                 nothing :
-                string(chart_assessment.raw_normalised_equivalence_error),
+                string(chart_assessment.equivalence_disagreement_abs),
     ))
     return (value=chart.value, assessment=chart_assessment)
 end
@@ -2419,14 +2550,31 @@ function evaluate_horizon_determinant(
         T, request, spectral, amplitude, xup_match,
         outer_contour, inner_contour, verification_basis, "verification",
     )
-    numerical_error_abs = estimate_horizon_determinant_error(
-        T, request, reference.value, verification.value
+    endpoint_disagreement_abs = abs(
+        reference.value - verification.value
+    )
+    equivalence_disagreement_abs = maximum_optional_discrepancy(
+        T,
+        reference.assessment.equivalence_disagreement_abs,
+        verification.assessment.equivalence_disagreement_abs,
+    )
+    error_breakdown = determinant_error_breakdown(
+        T,
+        request,
+        endpoint_disagreement_abs;
+        equivalence_disagreement_abs=equivalence_disagreement_abs,
     )
     progress_emit("determinant_error_estimated"; payload=Dict(
         "error_model_id" => VERIFIED_ENDPOINT_ERROR_MODEL_ID,
-        "endpoint_disagreement_abs" =>
-            string(abs(reference.value - verification.value)),
-        "numerical_error_abs" => string(numerical_error_abs),
+        "endpoint_disagreement_abs" => string(endpoint_disagreement_abs),
+        "control_disagreement_abs" => nothing,
+        "equivalence_disagreement_abs" =>
+            equivalence_disagreement_abs === nothing ? nothing :
+            string(equivalence_disagreement_abs),
+        "precision_disagreement_abs" => nothing,
+        "safety_factor" => string(error_breakdown.safety_factor),
+        "numerical_error_abs" =>
+            string(error_breakdown.numerical_error_abs),
         "determinant_abs" => string(abs(reference.value)),
         "reference_cref_fraction" => string(reference.cref_fraction),
         "verification_cref_fraction" => string(verification.cref_fraction),
@@ -2482,12 +2630,13 @@ function evaluate_horizon_determinant(
         "horizon_contour_id" => endpoints.contour_id,
         "normalised_determinant_abs" =>
             string(chart_assessment.normalised_determinant_abs),
-        "numerical_error_abs" => string(numerical_error_abs),
+        "numerical_error_abs" =>
+            string(error_breakdown.numerical_error_abs),
         "error_model_id" => VERIFIED_ENDPOINT_ERROR_MODEL_ID,
     ))
     return DeterminantEvaluation{T}(
         reference.value,
-        numerical_error_abs,
+        error_breakdown,
         VERIFIED_ENDPOINT_ERROR_MODEL_ID,
         diagnostics,
     )
@@ -2788,25 +2937,83 @@ function validate_finite_difference_offset(
     return h
 end
 
-function validated_frequency_step(
+const MAXIMUM_FREQUENCY_STEP_RUNGS = 64
+
+function validated_frequency_steps(
     ::Type{T}, request
 ) where {T<:AbstractFloat}
-    frequency_step = parse_real(T, request, "frequency_step")
-    isfinite(frequency_step) && frequency_step > zero(T) &&
-        return frequency_step
+    nominal_step = parse_real(T, request, "frequency_step")
+    minimum_step = parse_real(T, request, "frequency_step_minimum")
+    maximum_step = parse_real(T, request, "frequency_step_maximum")
+    valid_values = all(
+        value -> isfinite(value) && value > zero(T),
+        (nominal_step, minimum_step, maximum_step),
+    )
+    valid_order = minimum_step <= nominal_step <= maximum_step
+    valid_values && valid_order &&
+        return nominal_step, minimum_step, maximum_step
     throw(numerical_control_failure(
         request,
         "ALGEBRAIC_REPRESENTATION_SINGULAR",
-        "finite-difference frequency_step must be positive and finite",
+        "finite-difference frequency steps must be finite, positive, and ordered",
         Dict{String,Any}(
             "reason" => "INVALID_FREQUENCY_STEP",
             "range_status" => "invalid-frequency-step/v1",
             "operation" => "finite-difference-request-policy/v1",
             "axis" => "request-policy",
-            "h" => string(frequency_step),
+            "h" => string(nominal_step),
+            "frequency_step" => string(nominal_step),
+            "frequency_step_minimum" => string(minimum_step),
+            "frequency_step_maximum" => string(maximum_step),
         );
         retryable=false,
     ))
+end
+
+function validated_frequency_step(
+    ::Type{T}, request
+) where {T<:AbstractFloat}
+    nominal_step, _, _ = validated_frequency_steps(T, request)
+    return nominal_step
+end
+
+function frequency_step_rungs(
+    nominal_step::T, minimum_step::T, maximum_step::T
+) where {T<:AbstractFloat}
+    minimum_step <= nominal_step <= maximum_step || throw(ArgumentError(
+        "frequency step bounds do not enclose the nominal step"
+    ))
+    all(
+        value -> isfinite(value) && value > zero(T),
+        (nominal_step, minimum_step, maximum_step),
+    ) || throw(ArgumentError(
+        "frequency step rungs require finite positive bounds"
+    ))
+    rungs = T[nominal_step]
+    step = nominal_step
+    for _ in 1:(MAXIMUM_FREQUENCY_STEP_RUNGS - 1)
+        step >= maximum_step && break
+        candidate = min(maximum_step, step * T(4))
+        candidate == step && break
+        push!(rungs, candidate)
+        step = candidate
+    end
+    step = nominal_step
+    for _ in 1:(MAXIMUM_FREQUENCY_STEP_RUNGS - length(rungs))
+        step <= minimum_step && break
+        candidate = max(minimum_step, step / T(4))
+        candidate == step && break
+        push!(rungs, candidate)
+        step = candidate
+    end
+    unique!(rungs)
+    all(step -> minimum_step <= step <= maximum_step, rungs) || error(
+        "frequency step rung construction escaped its bounds"
+    )
+    length(rungs) <= MAXIMUM_FREQUENCY_STEP_RUNGS || error(
+        "frequency step rung construction exceeded its bound"
+    )
+    return rungs
 end
 
 function validate_finite_difference_inputs(
@@ -3121,6 +3328,23 @@ function build_finite_difference_diagnostics(
     return derivative, diagnostics
 end
 
+function propagated_centered_difference_error(
+    eta_plus::T, eta_minus::T, h::T
+) where {T<:AbstractFloat}
+    all(value -> isfinite(value) && value >= zero(T), (eta_plus, eta_minus)) ||
+        throw(ArgumentError(
+            "finite-difference determinant errors must be finite and nonnegative"
+        ))
+    isfinite(h) && !iszero(h) || throw(ArgumentError(
+        "finite-difference error propagation requires a finite nonzero step"
+    ))
+    propagated = (eta_plus + eta_minus) / (T(2) * abs(h))
+    isfinite(propagated) || throw(ArgumentError(
+        "propagated finite-difference error is nonfinite"
+    ))
+    return propagated
+end
+
 function finite_difference_pair(
     ::Type{T},
     request,
@@ -3131,26 +3355,19 @@ function finite_difference_pair(
     label::String,
     current::Complex{T};
     axis::String,
+    authenticate_controls::Bool=false,
 ) where {T<:AbstractFloat}
     # Reject malformed stencils before either expensive determinant/ODE sample.
     h = validate_finite_difference_offset(offset; axis=axis)
-    d_plus = determinant_progress(
-        T,
-        request,
-        evaluation_context,
-        omega + offset,
-        amplitude,
-        "$(label) +",
-        current,
+    evaluator = authenticate_controls ?
+        authenticated_determinant_progress : determinant_progress
+    d_plus = evaluator(
+        T, request, evaluation_context, omega + offset, amplitude,
+        "$(label) +", current,
     )
-    d_minus = determinant_progress(
-        T,
-        request,
-        evaluation_context,
-        omega - offset,
-        amplitude,
-        "$(label) -",
-        current,
+    d_minus = evaluator(
+        T, request, evaluation_context, omega - offset, amplitude,
+        "$(label) -", current,
     )
     derivative, diagnostics = try
         build_finite_difference_diagnostics(
@@ -3174,9 +3391,11 @@ function finite_difference_pair(
     #     eta_D' = (eta_D(w+h) + eta_D(w-h)) / (2|h|)
     # This is the term that says how much of the derivative magnitude is
     # attributable to determinant noise rather than to real slope.
-    derivative_error_abs = (
-        determinant_error_abs(T, d_plus) + determinant_error_abs(T, d_minus)
-    ) / (T(2) * abs(h))
+    derivative_error_abs = propagated_centered_difference_error(
+        determinant_error_abs(T, d_plus),
+        determinant_error_abs(T, d_minus),
+        h,
+    )
     record_finite_difference!(evaluation_context.conditioning, diagnostics)
     progress_emit("conditioning_evaluated"; payload=Dict(
         "estimate_kind" => "finite-difference-cancellation/not-a-bound/v1",
@@ -3221,8 +3440,9 @@ acceptance test below to its historical form. The horizon family always
 publishes one.
 """
 function determinant_error_abs(::Type{T}, evaluation) where {T<:AbstractFloat}
-    error_abs = evaluation.numerical_error_abs
-    error_abs === nothing && return zero(T)
+    breakdown = evaluation.error_breakdown
+    breakdown === nothing && return zero(T)
+    error_abs = breakdown.numerical_error_abs
     isfinite(error_abs) && error_abs >= zero(T) ||
         error("determinant numerical error must be finite and nonnegative")
     return T(error_abs)
@@ -3243,6 +3463,118 @@ function determinant_upper_bound_abs(
     ::Type{T}, evaluation
 ) where {T<:AbstractFloat}
     return abs(evaluation.value) + determinant_error_abs(T, evaluation)
+end
+
+function determinant_is_better(
+    ::Type{T}, candidate, incumbent
+) where {T<:AbstractFloat}
+    return determinant_upper_bound_abs(T, candidate) <
+        determinant_upper_bound_abs(T, incumbent)
+end
+
+function tight_control_request(
+    ::Type{T}, request
+) where {T<:AbstractFloat}
+    get(request, "tight_control_request_depth", 0) == 0 || error(
+        "tight-control determinant evaluation must not recursively tighten"
+    )
+    output = copy(request)
+    for key in (
+        "ode_relative_tolerance",
+        "ode_absolute_tolerance",
+        "homogeneous_ode_relative_tolerance",
+        "homogeneous_ode_absolute_tolerance",
+        "coordinate_ode_relative_tolerance",
+        "coordinate_ode_absolute_tolerance",
+    )
+        haskey(request, key) || continue
+        output[key] = numeric_text(parse_real(T, request, key) / T(2))
+    end
+    haskey(request, "support_subinterval_count") &&
+        (output["support_subinterval_count"] =
+            2 * parse_integer(request, "support_subinterval_count"))
+    haskey(request, "angular_pad") &&
+        (output["angular_pad"] = parse_integer(request, "angular_pad") + 8)
+    output["tight_control_request_depth"] = 1
+    return output
+end
+
+function authenticated_determinant_progress(
+    ::Type{T},
+    request,
+    evaluation_context::DeterminantRequestContext{T},
+    omega::Complex{T},
+    amplitude::Complex{T},
+    purpose::String,
+    current::Complex{T};
+    base_evaluation=nothing,
+) where {T<:AbstractFloat}
+    base_frequency = omega
+    tight_frequency = omega
+    base_frequency == tight_frequency || error(
+        "tight-control determinant comparison changed frequency"
+    )
+    base = base_evaluation === nothing ? determinant_progress(
+        T,
+        request,
+        evaluation_context,
+        base_frequency,
+        amplitude,
+        "$(purpose) base controls",
+        current,
+    ) : base_evaluation
+    # The exterior family deliberately has no determinant-error certificate in
+    # this revision. Return its historical evaluation without an extra solve.
+    base.error_breakdown === nothing && return base
+    tight = determinant_progress(
+        T,
+        tight_control_request(T, request),
+        evaluation_context,
+        tight_frequency,
+        amplitude,
+        "$(purpose) tight controls",
+        current,
+    )
+    tight.error_breakdown === nothing && error(
+        "tight horizon determinant omitted its error breakdown"
+    )
+    endpoint_disagreement_abs = max(
+        base.error_breakdown.endpoint_disagreement_abs,
+        tight.error_breakdown.endpoint_disagreement_abs,
+    )
+    equivalence_disagreement_abs = maximum_optional_discrepancy(
+        T,
+        base.error_breakdown.equivalence_disagreement_abs,
+        tight.error_breakdown.equivalence_disagreement_abs,
+    )
+    control_disagreement_abs = abs(base.value - tight.value)
+    error_breakdown = determinant_error_breakdown(
+        T,
+        request,
+        endpoint_disagreement_abs;
+        control_disagreement_abs=control_disagreement_abs,
+        equivalence_disagreement_abs=equivalence_disagreement_abs,
+        precision_disagreement_abs=nothing,
+    )
+    progress_emit("determinant_error_estimated"; payload=Dict(
+        "error_model_id" => VERIFIED_ENDPOINT_ERROR_MODEL_ID,
+        "endpoint_disagreement_abs" => string(endpoint_disagreement_abs),
+        "control_disagreement_abs" => string(control_disagreement_abs),
+        "equivalence_disagreement_abs" =>
+            equivalence_disagreement_abs === nothing ? nothing :
+            string(equivalence_disagreement_abs),
+        "precision_disagreement_abs" => nothing,
+        "safety_factor" => string(error_breakdown.safety_factor),
+        "numerical_error_abs" =>
+            string(error_breakdown.numerical_error_abs),
+        "determinant_abs" => string(abs(base.value)),
+    ))
+    return DeterminantEvaluation{T}(
+        base.value,
+        error_breakdown,
+        VERIFIED_ENDPOINT_ERROR_MODEL_ID,
+        base.diagnostics,
+    )
 end
 
 function bounded_newton(
@@ -3269,6 +3601,9 @@ function bounded_newton(
     )
     enforce_root_readout_feasibility(request)
     best_residual = abs(initial_determinant.value)
+    best_upper_bound = determinant_upper_bound_abs(
+        T, initial_determinant
+    )
     best_evaluation = initial_determinant
     # The first iteration evaluates the determinant at the initial frequency,
     # which is exactly the value just computed above.  The determinant is a
@@ -3296,8 +3631,9 @@ function bounded_newton(
             )
         end
         magnitude = abs(residual.value)
-        if magnitude < best_residual
+        if determinant_is_better(T, residual, best_evaluation)
             best_value, best_residual = value, magnitude
+            best_upper_bound = determinant_upper_bound_abs(T, residual)
             best_evaluation = residual
         end
         newton_context = Dict{String,Any}(
@@ -3309,6 +3645,8 @@ function bounded_newton(
             "current_omega" => progress_complex(value),
             "determinant_abs" => string(magnitude),
             "best_determinant_abs" => string(best_residual),
+            "best_determinant_upper_bound_abs" =>
+                string(best_upper_bound),
             "acceptance_metric" => "newton_correction_estimate_abs",
             "acceptance_threshold" => string(tolerance),
         ))
@@ -3438,8 +3776,11 @@ function bounded_newton(
                 accepted = true
                 selected_damping = damping
                 resulting_abs = candidate_abs
-                if candidate_abs < best_residual
+                if determinant_is_better(
+                    T, candidate_residual, best_evaluation
+                )
                     best_value, best_residual = candidate, candidate_abs
+                    best_upper_bound = candidate_upper_bound
                     best_evaluation = candidate_residual
                 end
                 break
@@ -3475,9 +3816,10 @@ function final_derivative(
     evaluation_context::DeterminantRequestContext{T},
     root::Complex{T}, amplitude::Complex{T},
     offset::Complex{T}, label::String,
+    ; authenticate_controls::Bool,
 ) where {T<:AbstractFloat}
     axis = iszero(imag(offset)) ? "real" : "imaginary"
-    derivative, _ = finite_difference_pair(
+    derivative, diagnostics, derivative_error_abs = finite_difference_pair(
         T,
         request,
         evaluation_context,
@@ -3487,13 +3829,15 @@ function final_derivative(
         label,
         root;
         axis=axis,
+        authenticate_controls=authenticate_controls,
     )
-    return derivative
+    return derivative, diagnostics, derivative_error_abs
 end
 
 """
     evaluate_derivative_step_ladder(T, request, context, root, amplitude,
-                                    accepted_derivative, root_error_abs)
+                                    accepted_derivative;
+                                    authenticate_controls)
 
 Select a finite-difference step at which the derivative is actually resolved.
 
@@ -3524,49 +3868,48 @@ function evaluate_derivative_step_ladder(
     root::Complex{T},
     amplitude::Complex{T},
     accepted_derivative,
-    root_error_abs::T,
+    ; authenticate_controls::Bool,
 ) where {T<:AbstractFloat}
     scale = one(T) + abs(root)
-    nominal = parse_real(T, request, "frequency_step") * scale
-    minimum_step = parse_real(T, request, "frequency_step_minimum") * scale
-    maximum_step = parse_real(T, request, "frequency_step_maximum") * scale
-    minimum_step < maximum_step ||
-        error("frequency step bounds must satisfy minimum < maximum")
-
-    # Walk outward from the nominal step: coarser first (truncation error is
-    # the cheaper failure to escape), then finer.
-    rungs = T[]
-    step = nominal
-    while step <= maximum_step
-        push!(rungs, step)
-        step *= T(4)
-    end
-    step = nominal / T(4)
-    while step >= minimum_step
-        push!(rungs, step)
-        step /= T(4)
-    end
+    nominal_policy, minimum_policy, maximum_policy =
+        validated_frequency_steps(T, request)
+    nominal = nominal_policy * scale
+    minimum_step = minimum_policy * scale
+    maximum_step = maximum_policy * scale
+    all(isfinite, (nominal, minimum_step, maximum_step)) ||
+        error("scaled frequency steps are nonfinite")
+    rungs = frequency_step_rungs(nominal, minimum_step, maximum_step)
 
     attempts = Dict{String,Any}[]
     for (index, h) in enumerate(rungs)
         real_offset = Complex{T}(h, zero(T))
-        base = (index == 1 && !isnothing(accepted_derivative)) ?
-            accepted_derivative :
+        base, _, base_error_abs = (
+            index == 1 && !isnothing(accepted_derivative) &&
+                !authenticate_controls
+        ) ? (
+            accepted_derivative,
+            nothing,
+            zero(T),
+        ) :
             final_derivative(
                 T, request, evaluation_context, root, amplitude,
-                real_offset, "final derivative h",
+                real_offset, "final derivative h";
+                authenticate_controls=authenticate_controls,
             )
-        half = final_derivative(
+        half, _, half_error_abs = final_derivative(
             T, request, evaluation_context, root, amplitude,
-            real_offset / T(2), "final derivative h/2",
+            real_offset / T(2), "final derivative h/2";
+            authenticate_controls=authenticate_controls,
         )
-        double = final_derivative(
+        double, _, double_error_abs = final_derivative(
             T, request, evaluation_context, root, amplitude,
-            T(2) * real_offset, "final derivative 2h",
+            T(2) * real_offset, "final derivative 2h";
+            authenticate_controls=authenticate_controls,
         )
-        imaginary = final_derivative(
+        imaginary, _, imaginary_error_abs = final_derivative(
             T, request, evaluation_context, root, amplitude,
-            Complex{T}(zero(T), h), "final derivative ih",
+            Complex{T}(zero(T), h), "final derivative ih";
+            authenticate_controls=authenticate_controls,
         )
         fine_difference = abs(half - base)
         coarse_difference = abs(base - double)
@@ -3576,10 +3919,11 @@ function evaluate_derivative_step_ladder(
         uncertainty = maximum((
             fine_difference, abs(double - half), axis_difference
         ))
-        derivative_error_abs = root_error_abs / abs(h / T(2))
+        derivative_error_abs = half_error_abs
         derivative_abs = abs(half)
-        noise_resolved =
-            derivative_abs - uncertainty - derivative_error_abs > zero(T)
+        derivative_lower_bound_abs =
+            derivative_abs - uncertainty - derivative_error_abs
+        noise_resolved = derivative_lower_bound_abs > zero(T)
         accepted = real_step_convergent && complex_axis_consistent &&
             noise_resolved
         push!(attempts, Dict{String,Any}(
@@ -3589,11 +3933,24 @@ function evaluate_derivative_step_ladder(
             "noise_resolved" => noise_resolved,
             "derivative_abs" => string(derivative_abs),
             "derivative_uncertainty_abs" => string(uncertainty),
+            "base_derivative_error_abs" => string(base_error_abs),
+            "half_derivative_error_abs" => string(half_error_abs),
+            "double_derivative_error_abs" => string(double_error_abs),
+            "imaginary_derivative_error_abs" =>
+                string(imaginary_error_abs),
             "derivative_error_abs" => string(derivative_error_abs),
             "accepted" => accepted,
         ))
         progress_emit("frequency_step_evaluated"; payload=last(attempts))
         if accepted
+            derivative_authentication = DerivativeAuthentication{T}(
+                half,
+                half_error_abs,
+                uncertainty,
+                derivative_lower_bound_abs,
+                h / T(2),
+                "real",
+            )
             return (
                 h=h,
                 derivative_real_base=base,
@@ -3606,7 +3963,12 @@ function evaluate_derivative_step_ladder(
                 real_step_convergent=real_step_convergent,
                 complex_axis_consistent=complex_axis_consistent,
                 derivative_uncertainty_abs=uncertainty,
-                derivative_error_abs=derivative_error_abs,
+                base_error_abs=base_error_abs,
+                half_error_abs=half_error_abs,
+                double_error_abs=double_error_abs,
+                imaginary_error_abs=imaginary_error_abs,
+                derivative_error_abs=half_error_abs,
+                derivative_authentication=derivative_authentication,
                 rung_index=index,
                 rung_count=length(rungs),
             )
@@ -3620,10 +3982,53 @@ function evaluate_derivative_step_ladder(
             "nominal_step" => string(nominal),
             "minimum_step" => string(minimum_step),
             "maximum_step" => string(maximum_step),
-            "determinant_error_abs" => string(root_error_abs),
             "attempts" => attempts,
         ),
     ))
+end
+
+function root_authentication_text(
+    authentication::RootAuthentication
+)
+    breakdown = authentication.error_breakdown
+    return Dict{String,Any}(
+        "central_determinant" =>
+            progress_complex(authentication.central_determinant),
+        "error_breakdown" => breakdown === nothing ? nothing :
+            Dict{String,Any}(
+                "endpoint_disagreement_abs" =>
+                    numeric_text(breakdown.endpoint_disagreement_abs),
+                "control_disagreement_abs" =>
+                    breakdown.control_disagreement_abs === nothing ? nothing :
+                    numeric_text(breakdown.control_disagreement_abs),
+                "equivalence_disagreement_abs" =>
+                    breakdown.equivalence_disagreement_abs === nothing ?
+                    nothing :
+                    numeric_text(breakdown.equivalence_disagreement_abs),
+                "precision_disagreement_abs" =>
+                    breakdown.precision_disagreement_abs === nothing ?
+                    nothing :
+                    numeric_text(breakdown.precision_disagreement_abs),
+                "safety_factor" => numeric_text(breakdown.safety_factor),
+                "numerical_error_abs" =>
+                    numeric_text(breakdown.numerical_error_abs),
+            ),
+        "residual_upper_bound_abs" =>
+            numeric_text(authentication.residual_upper_bound_abs),
+        "derivative_estimate" =>
+            progress_complex(authentication.derivative.value),
+        "derivative_propagated_error_abs" =>
+            numeric_text(authentication.derivative.propagated_error_abs),
+        "derivative_step_disagreement_abs" =>
+            numeric_text(authentication.derivative.step_disagreement_abs),
+        "derivative_lower_bound_abs" =>
+            numeric_text(authentication.derivative.lower_bound_abs),
+        "selected_step" => numeric_text(authentication.derivative.step),
+        "derivative_axis" => authentication.derivative.axis,
+        "correction_upper_bound" =>
+            numeric_text(authentication.correction_upper_bound),
+        "error_model_id" => authentication.error_model_id,
+    )
 end
 
 function solve_once(
@@ -3632,9 +4037,25 @@ function solve_once(
     evaluation_context::DeterminantRequestContext{T},
     initial::Complex{T},
     amplitude::Complex{T},
+    ; authenticate_controls::Bool,
 ) where {T<:AbstractFloat}
     root, residual, accepted_derivative, newton_converged, root_evaluation =
         bounded_newton(T, request, evaluation_context, initial, amplitude)
+    horizon_authentication = authenticate_controls &&
+        root_evaluation.error_breakdown !== nothing
+    if horizon_authentication
+        root_evaluation = authenticated_determinant_progress(
+            T,
+            request,
+            evaluation_context,
+            root,
+            amplitude,
+            "final root authentication",
+            root;
+            base_evaluation=root_evaluation,
+        )
+        residual = abs(root_evaluation.value)
+    end
     root_error_abs = determinant_error_abs(T, root_evaluation)
     ladder = evaluate_derivative_step_ladder(
         T,
@@ -3642,8 +4063,8 @@ function solve_once(
         evaluation_context,
         root,
         amplitude,
-        accepted_derivative,
-        root_error_abs,
+        accepted_derivative;
+        authenticate_controls=horizon_authentication,
     )
     h = ladder.h
     derivative_real_base = ladder.derivative_real_base
@@ -3661,9 +4082,9 @@ function solve_once(
     # between step sizes and axes, and the propagated determinant noise. Both
     # are subtracted -- the step ladder measures how the estimate moves, not
     # how far it sits from the truth.
-    derivative_error_abs = ladder.derivative_error_abs
-    derivative_lower_bound_abs =
-        derivative_abs - derivative_uncertainty_abs - derivative_error_abs
+    derivative_authentication = ladder.derivative_authentication
+    derivative_error_abs = derivative_authentication.propagated_error_abs
+    derivative_lower_bound_abs = derivative_authentication.lower_bound_abs
     isfinite(derivative_abs) && isfinite(derivative_uncertainty_abs) &&
         isfinite(derivative_error_abs) ||
         error("determinant frequency derivative controls are unusable")
@@ -3728,7 +4149,16 @@ function solve_once(
         "correction_upper_bound" => string(correction_upper_bound),
         "accepted" => converged,
     ))
-    return root, residual, derivative_lower_bound_abs, converged, root_evaluation
+    root_authentication = RootAuthentication{T}(
+        root_evaluation.value,
+        root_evaluation.error_breakdown,
+        residual_upper_bound,
+        derivative_authentication,
+        correction_upper_bound,
+        root_evaluation.error_model_id,
+    )
+    return root, residual, derivative_lower_bound_abs, converged,
+        root_evaluation, root_authentication
 end
 
 function solve_phase(
@@ -3772,7 +4202,12 @@ function solve_phase(
                 "fallback_error_type" => error_type,
             ))
             solve_once(
-                T, request, evaluation_context, selected_initial, amplitude
+                T,
+                request,
+                evaluation_context,
+                selected_initial,
+                amplitude;
+                authenticate_controls=(phase == "PRIMARY"),
             )
         end
     end
@@ -3846,24 +4281,10 @@ function refined_request(::Type{T}, request, kind::Symbol) where {T<:AbstractFlo
     if kind == :truncation
         output["endpoint_series_order"] = parse_integer(request, "endpoint_series_order") + 8
     elseif kind == :resolution
-        # Tighten every ODE control the determinant actually consumes. The
-        # difference between the base and tightened determinant is the control
-        # contribution to the absolute determinant error, so a control that is
-        # not tightened here is a control whose effect is never measured.
-        for key in (
-            "ode_relative_tolerance",
-            "ode_absolute_tolerance",
-            "homogeneous_ode_relative_tolerance",
-            "homogeneous_ode_absolute_tolerance",
-            "coordinate_ode_relative_tolerance",
-            "coordinate_ode_absolute_tolerance",
-        )
-            haskey(request, key) || continue
-            output[key] = numeric_text(parse_real(T, request, key) / T(2))
-        end
-        output["support_subinterval_count"] =
-            2 * parse_integer(request, "support_subinterval_count")
-        output["angular_pad"] = parse_integer(request, "angular_pad") + 8
+        # The resolution phase uses the same one-rung bounded request as final
+        # authentication, but solve_phase disables authentication for every
+        # diagnostic phase, so this request is never tightened recursively.
+        return tight_control_request(T, request)
     else
         error("unknown root diagnostic refinement")
     end
@@ -4056,7 +4477,8 @@ function result_fields(::Type{T}, request, digits::Int, bits::Int) where {T<:Abs
             end
         end
     end
-    root, residual, derivative_abs, primary_converged, root_evaluation =
+    root, residual, derivative_abs, primary_converged, root_evaluation,
+        root_authentication =
         solve_phase(
             T,
             request,
@@ -4121,6 +4543,8 @@ function result_fields(::Type{T}, request, digits::Int, bits::Int) where {T<:Abs
             "raw_determinant_evidence_status" =>
                 raw_determinant_evidence_status,
             "root_derivative_abs" => numeric_text(derivative_abs),
+            "root_authentication" =>
+                root_authentication_text(root_authentication),
             "root_converged" => false,
             "branch_authentication_contract_version" => 3,
             "root_branch_continuation_valid" => branch_valid,
@@ -4135,7 +4559,7 @@ function result_fields(::Type{T}, request, digits::Int, bits::Int) where {T<:Abs
         ]
     end
     truncation_root, truncation_residual, truncation_derivative,
-        truncation_converged, _ = solve_phase(
+        truncation_converged, _, _ = solve_phase(
         T,
         refined_request(T, request, :truncation),
         evaluation_context,
@@ -4145,7 +4569,7 @@ function result_fields(::Type{T}, request, digits::Int, bits::Int) where {T<:Abs
         seed_kind="ACCEPTED_PRIMARY",
     )
     resolution_root, resolution_residual, resolution_derivative,
-        resolution_converged, _ = solve_phase(
+        resolution_converged, _, _ = solve_phase(
         T,
         refined_request(T, request, :resolution),
         evaluation_context,
@@ -4157,7 +4581,7 @@ function result_fields(::Type{T}, request, digits::Int, bits::Int) where {T<:Abs
     alternate = omega + Complex{T}(T("0.00025"), T("0.000125")) *
         (one(T) + abs(omega))
     seed_path_root, seed_path_residual, seed_path_derivative,
-        seed_path_converged, _ =
+        seed_path_converged, _, _ =
         solve_phase(
             T,
             request,
@@ -4197,6 +4621,8 @@ function result_fields(::Type{T}, request, digits::Int, bits::Int) where {T<:Abs
         "raw_determinant_evidence_status" =>
             raw_determinant_evidence_status,
         "root_derivative_abs" => numeric_text(derivative_abs),
+        "root_authentication" =>
+            root_authentication_text(root_authentication),
         "root_converged" => converged,
         "branch_authentication_contract_version" => 3,
         "root_branch_continuation_valid" => branch_valid,

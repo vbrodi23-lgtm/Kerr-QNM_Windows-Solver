@@ -7,7 +7,12 @@ using Test
 
 include("m02_worker.jl")
 
-function finite_difference_control_request(; frequency_step="1e-6")
+function finite_difference_control_request(;
+    frequency_step="1e-6",
+    frequency_step_minimum="1e-12",
+    frequency_step_maximum="1e-3",
+    determinant_error_safety_factor="8",
+)
     digest = repeat("0", 64)
     return Dict{String,Any}(
         "precision_digits" => 80,
@@ -23,6 +28,85 @@ function finite_difference_control_request(; frequency_step="1e-6")
         "resource_policy_version" => 1,
         "resource_policy_sha256" => digest,
         "frequency_step" => frequency_step,
+        "frequency_step_minimum" => frequency_step_minimum,
+        "frequency_step_maximum" => frequency_step_maximum,
+        "determinant_error_safety_factor" => determinant_error_safety_factor,
+    )
+end
+
+@testset "determinant error breakdown validates and aggregates absolute components" begin
+    request = finite_difference_control_request()
+    breakdown = determinant_error_breakdown(
+        Float64,
+        request,
+        2.0;
+        control_disagreement_abs=3.0,
+        equivalence_disagreement_abs=5.0,
+        precision_disagreement_abs=nothing,
+    )
+    @test breakdown.endpoint_disagreement_abs == 2.0
+    @test breakdown.control_disagreement_abs == 3.0
+    @test breakdown.equivalence_disagreement_abs == 5.0
+    @test breakdown.precision_disagreement_abs === nothing
+    @test breakdown.safety_factor == 8.0
+    @test breakdown.numerical_error_abs == 40.0
+    @test_throws ArgumentError determinant_error_breakdown(
+        Float64, request, -1.0
+    )
+    @test_throws ArgumentError determinant_error_breakdown(
+        Float64, request, 1.0; control_disagreement_abs=Inf
+    )
+end
+
+@testset "centred stencil propagates unequal endpoint errors" begin
+    @test propagated_centered_difference_error(2.0, 6.0, 2.0) == 2.0
+    @test propagated_centered_difference_error(1.0, 9.0, 0.5) == 10.0
+end
+
+@testset "frequency step rungs are finite bounded and de-duplicated" begin
+    request = finite_difference_control_request(
+        frequency_step="1e-6",
+        frequency_step_minimum="1e-6",
+        frequency_step_maximum="1e-3",
+    )
+    nominal, minimum_step, maximum_step = validated_frequency_steps(
+        Float64, request
+    )
+    @test minimum_step <= nominal <= maximum_step
+    rungs = frequency_step_rungs(nominal, minimum_step, maximum_step)
+    @test all(isfinite, rungs)
+    @test all(step -> minimum_step <= step <= maximum_step, rungs)
+    @test length(rungs) == length(unique(rungs))
+    @test length(rungs) <= MAXIMUM_FREQUENCY_STEP_RUNGS
+    for invalid in ("0", "-1", "Inf", "NaN")
+        @test_throws NumericalControlFailure validated_frequency_steps(
+            Float64,
+            finite_difference_control_request(frequency_step=invalid),
+        )
+    end
+    @test_throws NumericalControlFailure validated_frequency_steps(
+        Float64,
+        finite_difference_control_request(
+            frequency_step="1e-8",
+            frequency_step_minimum="1e-6",
+        ),
+    )
+end
+
+@testset "determinant ranking includes absolute numerical error" begin
+    smaller_raw_larger_bound = (
+        value=complex(1.0, 0.0),
+        error_breakdown=(numerical_error_abs=10.0,),
+    )
+    larger_raw_smaller_bound = (
+        value=complex(2.0, 0.0),
+        error_breakdown=(numerical_error_abs=0.5,),
+    )
+    @test determinant_is_better(
+        Float64, larger_raw_smaller_bound, smaller_raw_larger_bound
+    )
+    @test !determinant_is_better(
+        Float64, smaller_raw_larger_bound, larger_raw_smaller_bound
     )
 end
 

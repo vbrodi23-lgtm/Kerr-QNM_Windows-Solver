@@ -404,6 +404,11 @@ end
         safe.raw_determinant
     @test safe.raw_determinant ≈
         coefficients.Cref * something(safe.normalised_determinant)
+    @test safe.equivalence_disagreement_abs ≈ abs(
+        something(safe.raw_determinant) / coefficients.Cref -
+        something(safe.normalised_determinant)
+    )
+    @test safe.equivalence_disagreement_abs >= 0
     @test safe.equivalence_relative_error <= 32 * eps(Float64)
 
     boundary = SOL.assess_horizon_determinant_chart(

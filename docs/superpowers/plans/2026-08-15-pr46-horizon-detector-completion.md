@@ -126,7 +126,7 @@ end
 ```
 
 - Use error model identity
-  `verified-endpoint-control-equivalence-absolute-error/v2`; add the precision
+  `verified-endpoint-control-equivalence-absolute-error/v2`. Add the precision
   component only when an exact same-frequency cross-precision evaluation is
   available.
 - Each online Newton evaluation includes endpoint and absolute raw/normalised
@@ -228,8 +228,9 @@ end
 **Interfaces:**
 - Distinguish coordinate-map, homogeneous-GSN, and exterior perturbed-radial
   controls in policy material.
-- Horizon identity uses the v2 determinant-error model and current real-inner
-  contour/basis identities.
+- Horizon identity uses the
+  `verified-endpoint-control-equivalence-absolute-error/v2` model and current
+  real-inner contour/basis identities.
 - Exterior scientific identity projects only exterior-relevant policy and
   implementation identity material.
 
@@ -238,7 +239,7 @@ end
 - [ ] Add a main-generated exterior receipt compatibility fixture and a failing
   test showing horizon-only changes do not stale it.
 - [ ] Add a failing test showing every historical horizon receipt is stale under
-  the v2 error-model identity.
+  the `verified-endpoint-control-equivalence-absolute-error/v2` identity.
 - [ ] Run focused tests and preserve the expected red output.
 - [ ] Implement mechanism-scoped identity projections and refresh only the
   horizon-dependent frozen digests.

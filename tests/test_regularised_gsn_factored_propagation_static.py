@@ -425,7 +425,7 @@ class RegularisedGsnFactoredPropagationSourceTests(unittest.TestCase):
 
         chart_start = self.worker.index("function evaluate_horizon_chart(")
         chart_end = self.worker.index(
-            "function estimate_horizon_determinant_error", chart_start
+            "function determinant_error_breakdown", chart_start
         )
         chart = self.worker[chart_start:chart_end]
         basis_call = chart.index("Solutions.build_match_horizon_basis(")

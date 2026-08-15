@@ -1430,6 +1430,7 @@ struct DeterminantChartAssessment{T<:AbstractFloat}
     cinc_abs::T
     raw_cancellation_ratio::Union{Nothing,T}
     raw_cancellation_ratio_saturated::Bool
+    equivalence_disagreement_abs::Union{Nothing,T}
     equivalence_relative_error::Union{Nothing,T}
     homogeneous_representation::String
     branch_convention::String
@@ -1647,6 +1648,7 @@ function assess_horizon_determinant_chart(
                     raw_value.raw_determinant_evidence_status,
                 raw_cancellation_ratio=nothing,
                 raw_cancellation_ratio_saturated=false,
+                equivalence_disagreement_abs=nothing,
                 equivalence_relative_error=nothing,
             )
         else
@@ -1697,6 +1699,30 @@ function assess_horizon_determinant_chart(
                     rethrow()
                 end
             end
+            equivalence_disagreement_abs = try
+                if normalised_determinant === nothing || iszero(Cref)
+                    nothing
+                else
+                    value = abs(
+                        raw_value.raw_determinant / Cref -
+                        normalised_determinant
+                    )
+                    _assert_scattering_real(
+                        value,
+                        precision_bits,
+                        "absolute raw/normalised determinant discrepancy";
+                        nonnegative=true,
+                    )
+                    value
+                end
+            catch error
+                if error isa ScatteringExtractionError &&
+                        error.reason == NONFINITE_SCATTERING_DATA
+                    nothing
+                else
+                    rethrow()
+                end
+            end
             (
                 raw_determinant=raw_value.raw_determinant,
                 raw_determinant_abs=raw_value.raw_determinant_abs,
@@ -1704,6 +1730,8 @@ function assess_horizon_determinant_chart(
                     raw_value.raw_determinant_evidence_status,
                 raw_cancellation_ratio=cancellation.ratio,
                 raw_cancellation_ratio_saturated=cancellation.saturated,
+                equivalence_disagreement_abs=
+                    equivalence_disagreement_abs,
                 equivalence_relative_error=equivalence_relative_error,
             )
         end
@@ -1722,6 +1750,7 @@ function assess_horizon_determinant_chart(
             cinc_abs,
             raw_diagnostic.raw_cancellation_ratio,
             raw_diagnostic.raw_cancellation_ratio_saturated,
+            raw_diagnostic.equivalence_disagreement_abs,
             raw_diagnostic.equivalence_relative_error,
             HOMOGENEOUS_REPRESENTATION_ID,
             GSN_BRANCH_CONVENTION_ID,

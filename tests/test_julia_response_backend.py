@@ -454,7 +454,9 @@ class JuliaResponseBackendTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
 
         self.assertIn("initial_determinant = determinant_progress(", worker)
-        self.assertIn("best_residual = abs(initial_determinant.value)", worker)
+        self.assertIn(
+            "best_upper_bound = determinant_upper_bound_abs(", worker
+        )
         self.assertIn("carried_residual = initial_determinant", worker)
         self.assertIn("carried_available = true", worker)
         self.assertIn("carried_available = false", worker)
@@ -470,9 +472,8 @@ class JuliaResponseBackendTests(unittest.TestCase):
         )
         # The accepted Newton derivative is reused at the first step rung
         # rather than recomputed; later rungs evaluate their own.
-        self.assertIn(
-            "(index == 1 && !isnothing(accepted_derivative)) ?", worker
-        )
+        self.assertIn("!isnothing(accepted_derivative)", worker)
+        self.assertIn("!authenticate_controls", worker)
         # The seed determinant is carried, not recomputed, but every later
         # iteration still evaluates its own residual at its own frequency.
         bounded_newton = worker[
@@ -724,7 +725,24 @@ class JuliaResponseBackendTests(unittest.TestCase):
 
         self.assertNotIn('value -= parse(T, "0.125") * step', worker)
         self.assertIn("!accepted && break", worker)
-        self.assertIn("best_value, best_residual = candidate, candidate_abs", worker)
+        self.assertRegex(
+            worker,
+            r"determinant_is_better\(\s*T,\s*candidate_residual,\s*"
+            r"best_evaluation\s*\)",
+        )
+
+    def test_error_model_identity_is_the_complete_v2_certificate(self):
+        root = Path(__file__).resolve().parents[1]
+        worker = (root / "src/windows_solver/data/julia/m02_worker.jl").read_text(
+            encoding="utf-8"
+        )
+        engine = (root / "src/windows_solver/response_engine.py").read_text(
+            encoding="utf-8"
+        )
+        identity = "verified-endpoint-control-equivalence-absolute-error/v2"
+        self.assertIn(identity, worker)
+        self.assertIn(identity, engine)
+        self.assertNotIn("verified-endpoint-absolute-error/v1", engine)
 
     def test_package_worker_cross_checks_frequency_derivatives(self):
         worker = (
@@ -749,6 +767,24 @@ class JuliaResponseBackendTests(unittest.TestCase):
             worker,
         )
         self.assertIn("derivative_control_completed", worker)
+        for contract in (
+            "struct DerivativeAuthentication{T<:AbstractFloat}",
+            "propagated_error_abs::T",
+            "step_disagreement_abs::T",
+            "lower_bound_abs::T",
+            "root_authentication",
+            '"central_determinant"',
+            '"residual_upper_bound_abs"',
+            '"selected_step"',
+            '"error_model_id"',
+        ):
+            self.assertIn(contract, worker)
+
+    def test_ci_executes_the_worker_finite_difference_spec(self):
+        workflow = (
+            Path(__file__).resolve().parents[1] / ".github/workflows/ci.yml"
+        ).read_text(encoding="utf-8")
+        self.assertIn("m02_worker_finite_difference_spec.jl", workflow)
 
     def test_package_worker_confines_fine_steps_and_stores_only_endpoints(self):
         worker = (

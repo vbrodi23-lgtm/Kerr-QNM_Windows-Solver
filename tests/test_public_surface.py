@@ -1108,6 +1108,7 @@ $candidate | ConvertTo-Json -Compress | Set-Content -LiteralPath $env:M02_TEST_J
             "real-inner-tortoise-contour/v1",
             "scaled-horizon-basis-at-match/v1",
             "verified-endpoint-absolute-error/v1",
+            "verified-endpoint-control-equivalence-absolute-error/v2",
             "approved/v1",
             "reviewed/v1",
             "absent-unapproved/v1",

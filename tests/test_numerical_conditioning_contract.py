@@ -1316,7 +1316,9 @@ class JuliaSchemaThreeConditioningTests(unittest.TestCase):
                 "factored-three-leg-horizon-basis-at-match-gsn/v1"
             ),
             "horizon_contour": "real-inner-tortoise-contour/v1",
-            "determinant_error_model": "verified-endpoint-absolute-error/v1",
+            "determinant_error_model": (
+                "verified-endpoint-control-equivalence-absolute-error/v2"
+            ),
             "asymptotic_series_evaluation": (
                 "typed-batch-horner-compensated/v1"
             ),

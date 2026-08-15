@@ -103,7 +103,7 @@ class RegularisedGsnWorkerSourceTests(unittest.TestCase):
             "evaluate_horizon_determinant", "horizon_endpoint_rho_candidates"
         )
         chart = self._function_slice(
-            "evaluate_horizon_chart", "estimate_horizon_determinant_error"
+            "evaluate_horizon_chart", "determinant_error_breakdown"
         )
         for forbidden in (
             "solve_factored_xup_scattering_endpoint",
@@ -117,21 +117,40 @@ class RegularisedGsnWorkerSourceTests(unittest.TestCase):
 
     def test_horizon_determinant_carries_an_absolute_error(self) -> None:
         for contract in (
-            "numerical_error_abs::Union{Nothing,T}",
+            "struct DeterminantErrorBreakdown{T<:AbstractFloat}",
+            "error_breakdown::Union{Nothing,DeterminantErrorBreakdown{T}}",
             "error_model_id::Union{Nothing,String}",
             "VERIFIED_ENDPOINT_ERROR_MODEL_ID",
-            "function estimate_horizon_determinant_error(",
+            "function determinant_error_breakdown(",
         ):
             self.assertIn(contract, self.worker)
         estimate = self._function_slice(
-            "estimate_horizon_determinant_error",
+            "determinant_error_breakdown",
             "evaluate_horizon_reflectivity_chart",
         )
         # The endpoint disagreement is an absolute quantity. Dividing it by
         # |D| would report catastrophic error precisely at a root, where the
         # determinant is small by construction.
-        self.assertIn("abs(reference_value - verification_value)", estimate)
+        self.assertIn("safety_factor * maximum(available_components)", estimate)
         self.assertNotIn("/ abs(", estimate)
+
+    def test_horizon_error_breakdown_is_complete_and_absolute(self) -> None:
+        for field in (
+            "endpoint_disagreement_abs::T",
+            "control_disagreement_abs::Union{Nothing,T}",
+            "equivalence_disagreement_abs::Union{Nothing,T}",
+            "precision_disagreement_abs::Union{Nothing,T}",
+            "safety_factor::T",
+            "numerical_error_abs::T",
+        ):
+            self.assertIn(field, self.worker)
+        horizon = self._function_slice(
+            "evaluate_horizon_determinant", "horizon_endpoint_rho_candidates"
+        )
+        self.assertIn("reference.assessment.equivalence_disagreement_abs", horizon)
+        self.assertIn("verification.assessment.equivalence_disagreement_abs", horizon)
+        self.assertIn("endpoint_disagreement_abs", horizon)
+        self.assertIn("equivalence_disagreement_abs", horizon)
 
     def test_coordinate_controls_are_separate_from_homogeneous_controls(
         self,
@@ -294,8 +313,12 @@ class RegularisedGsnWorkerSourceTests(unittest.TestCase):
         self.assertIn("d_minus.value", pair)
         self.assertNotIn("difference = d_plus.value - d_minus.value", pair)
         validation = pair.index("validate_finite_difference_offset(")
-        first_evaluation = pair.index("d_plus = determinant_progress(")
+        first_evaluation = pair.index("d_plus = evaluator(")
         self.assertLess(validation, first_evaluation)
+        self.assertIn(
+            "authenticated_determinant_progress : determinant_progress",
+            pair,
+        )
 
         self.assertIn("build_finite_difference_diagnostics(", self.fd_spec)
         self.assertIn("axis=axis", self.fd_spec)
@@ -393,6 +416,57 @@ class RegularisedGsnWorkerSourceTests(unittest.TestCase):
             '"factored_homogeneous_rhs_evaluations"',
         ):
             self.assertIn(contract, self.fd_spec)
+
+    def test_final_derivatives_preserve_each_stencil_error(self) -> None:
+        pair = self._function_slice("finite_difference_pair", "bounded_newton")
+        final = self._function_slice(
+            "final_derivative", "evaluate_derivative_step_ladder"
+        )
+        ladder = self._function_slice(
+            "evaluate_derivative_step_ladder", "solve_once"
+        )
+        self.assertIn("propagated_centered_difference_error(", pair)
+        self.assertIn("return derivative, diagnostics, derivative_error_abs", final)
+        for name in ("base_error_abs", "half_error_abs", "double_error_abs", "imaginary_error_abs"):
+            self.assertIn(name, ladder)
+        self.assertIn("derivative_error_abs=half_error_abs", ladder)
+        self.assertNotIn("root_error_abs / abs(h / T(2))", ladder)
+
+    def test_frequency_step_ladder_is_validated_bounded_and_unique(self) -> None:
+        for contract in (
+            "const MAXIMUM_FREQUENCY_STEP_RUNGS",
+            "function validated_frequency_steps(",
+            "minimum_step <= nominal_step <= maximum_step",
+            "function frequency_step_rungs(",
+            "unique!(rungs)",
+        ):
+            self.assertIn(contract, self.worker)
+        self.assertIn("length(rungs) <= MAXIMUM_FREQUENCY_STEP_RUNGS", self.fd_spec)
+        self.assertIn("length(rungs) == length(unique(rungs))", self.fd_spec)
+
+    def test_primary_authentication_tightens_only_exact_frequencies(self) -> None:
+        for contract in (
+            "function tight_control_request(",
+            "function authenticated_determinant_progress(",
+            "base_frequency == tight_frequency",
+            "abs(base.value - tight.value)",
+            "authenticate_controls=(phase == \"PRIMARY\")",
+        ):
+            self.assertIn(contract, self.worker)
+        refined = self._function_slice("refined_request", "conditioning_response")
+        self.assertNotIn("authenticated_determinant_progress(", refined)
+
+    def test_final_authentication_leaves_exterior_derivative_path_unchanged(
+        self,
+    ) -> None:
+        solve_once = self._function_slice("solve_once", "solve_phase")
+        self.assertIn(
+            "horizon_authentication = authenticate_controls &&", solve_once
+        )
+        self.assertIn("root_evaluation.error_breakdown !== nothing", solve_once)
+        self.assertIn(
+            "authenticate_controls=horizon_authentication", solve_once
+        )
 
     def test_worker_main_is_guarded_so_pure_julia_spec_can_include_it(self) -> None:
         self.assertIn(

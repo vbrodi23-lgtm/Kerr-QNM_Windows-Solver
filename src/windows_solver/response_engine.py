@@ -116,7 +116,9 @@ HORIZON_HOMOGENEOUS_REPRESENTATION = (
 )
 REAL_INNER_HORIZON_CONTOUR = "real-inner-tortoise-contour/v1"
 HORIZON_BASIS_AT_MATCH_EXTRACTION = "scaled-horizon-basis-at-match/v1"
-VERIFIED_ENDPOINT_ERROR_MODEL = "verified-endpoint-absolute-error/v1"
+VERIFIED_ENDPOINT_ERROR_MODEL = (
+    "verified-endpoint-control-equivalence-absolute-error/v2"
+)
 
 _REGULARISED_GSN_COMMON_IDENTITIES: Mapping[str, str] = MappingProxyType({
     "homogeneous_representation": "factored-plane-wave-gsn/v1",
