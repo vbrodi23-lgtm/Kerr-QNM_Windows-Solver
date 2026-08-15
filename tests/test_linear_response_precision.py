@@ -1140,6 +1140,9 @@ class PrimaryPrecisionTests(unittest.TestCase):
         contract = _primary_recovery_precision_contract()
 
         self.assertEqual(contract["recovery_digits"], [80, 120])
+        # The scientific root target is the same at both storage tiers; the
+        # 120-digit tier spends its extra digits as bounded guard precision
+        # rather than demanding a 1e-102 root.
         self.assertEqual(
             contract["promoted_numerical_controls"],
             {
@@ -1148,27 +1151,51 @@ class PrimaryPrecisionTests(unittest.TestCase):
                         "root_correction_tolerance": "1e-18",
                         "ode_relative_tolerance": "1e-18",
                         "ode_absolute_tolerance": "1e-20",
+                        "homogeneous_ode_relative_tolerance": "1e-18",
+                        "homogeneous_ode_absolute_tolerance": "1e-20",
+                        "coordinate_ode_relative_tolerance": "1e-18",
+                        "coordinate_ode_absolute_tolerance": "1e-20",
                         "frequency_step": "1e-6",
+                        "frequency_step_minimum": "1e-12",
+                        "frequency_step_maximum": "1e-3",
                     },
                     "refinement": {
                         "root_correction_tolerance": "1e-20",
                         "ode_relative_tolerance": "1e-20",
                         "ode_absolute_tolerance": "1e-20",
+                        "homogeneous_ode_relative_tolerance": "1e-22",
+                        "homogeneous_ode_absolute_tolerance": "1e-24",
+                        "coordinate_ode_relative_tolerance": "1e-20",
+                        "coordinate_ode_absolute_tolerance": "1e-22",
                         "frequency_step": "1e-7",
+                        "frequency_step_minimum": "1e-14",
+                        "frequency_step_maximum": "1e-4",
                     },
                 },
                 "120": {
                     "base": {
-                        "root_correction_tolerance": "1e-102",
-                        "ode_relative_tolerance": "1e-102",
-                        "ode_absolute_tolerance": "1e-104",
-                        "frequency_step": "1e-60",
+                        "root_correction_tolerance": "1e-18",
+                        "ode_relative_tolerance": "1e-24",
+                        "ode_absolute_tolerance": "1e-26",
+                        "homogeneous_ode_relative_tolerance": "1e-24",
+                        "homogeneous_ode_absolute_tolerance": "1e-26",
+                        "coordinate_ode_relative_tolerance": "1e-20",
+                        "coordinate_ode_absolute_tolerance": "1e-22",
+                        "frequency_step": "1e-6",
+                        "frequency_step_minimum": "1e-16",
+                        "frequency_step_maximum": "1e-3",
                     },
                     "refinement": {
-                        "root_correction_tolerance": "1e-106",
-                        "ode_relative_tolerance": "1e-106",
-                        "ode_absolute_tolerance": "1e-108",
-                        "frequency_step": "1e-60",
+                        "root_correction_tolerance": "1e-20",
+                        "ode_relative_tolerance": "1e-28",
+                        "ode_absolute_tolerance": "1e-30",
+                        "homogeneous_ode_relative_tolerance": "1e-28",
+                        "homogeneous_ode_absolute_tolerance": "1e-30",
+                        "coordinate_ode_relative_tolerance": "1e-22",
+                        "coordinate_ode_absolute_tolerance": "1e-24",
+                        "frequency_step": "1e-7",
+                        "frequency_step_minimum": "1e-18",
+                        "frequency_step_maximum": "1e-4",
                     },
                 },
             },

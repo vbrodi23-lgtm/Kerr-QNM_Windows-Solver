@@ -76,6 +76,22 @@ jobs:
             using GeneralizedSasakiNakamura
             include(joinpath(ENV["GSN_PROJECT"], "test", "factored_propagation_spec.jl"))
           '
+      - name: Run real-inner horizon contour and match-basis regression
+        shell: bash
+        run: |
+          julia --startup-file=no --history-file=no --project="$M02_PROJECT" -e '
+            using Test
+            using GeneralizedSasakiNakamura
+            include(joinpath(ENV["GSN_PROJECT"], "test", "real_inner_horizon_spec.jl"))
+          '
+      - name: Run scaled scattering and determinant equivalence regression
+        shell: bash
+        run: |
+          julia --startup-file=no --history-file=no --project="$M02_PROJECT" -e '
+            using Test
+            using GeneralizedSasakiNakamura
+            include(joinpath(ENV["GSN_PROJECT"], "test", "scaled_scattering_spec.jl"))
+          '
 
   test:
     strategy:
