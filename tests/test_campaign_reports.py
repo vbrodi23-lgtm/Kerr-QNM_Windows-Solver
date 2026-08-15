@@ -774,9 +774,18 @@ class AuthenticationReportColumnTests(unittest.TestCase):
         self.assertEqual(fields["equivalence_disagreement_abs"], "5E-63")
         self.assertEqual(fields["precision_disagreement_abs"], "3E-63")
         self.assertEqual(fields["determinant_error_safety_factor"], "64")
+        self.assertEqual(fields["central_determinant_re"], "1E-60")
+        self.assertEqual(fields["central_determinant_im"], "0")
         self.assertEqual(fields["residual_upper_bound_abs"], "2.4E-60")
+        self.assertEqual(
+            fields["derivative_re"],
+            "2.400000000000000000000000000000000000000000000000000003",
+        )
+        self.assertEqual(fields["derivative_im"], "0")
         self.assertEqual(fields["derivative_lower_bound_abs"], "2.4")
         self.assertEqual(fields["correction_upper_bound"], "1E-60")
+        self.assertEqual(fields["root_correction_tolerance"], "1E-18")
+        self.assertIs(fields["root_authentication_accepted"], True)
         self.assertEqual(fields["derivative_axis"], "real")
         self.assertEqual(
             fields["determinant_error_model"],

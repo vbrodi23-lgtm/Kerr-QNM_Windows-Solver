@@ -612,6 +612,98 @@ class CampaignProgressReporterTests(unittest.TestCase):
             self.assertIn(expected, dashboard)
         self.assertIn("dt last/min/proposed=0.25/1e-12/-", compact)
 
+    def test_root_authentication_reaches_live_status_and_dashboard(self):
+        reporter = CampaignProgressReporter(
+            "normal", self.reporter_checkpoint, io.StringIO()
+        )
+        reporter.publish(_event(
+            ProgressEventKind.PRECISION_STAGE_STARTED,
+            leaf_id="leaf-13",
+            leaf_index=13,
+            leaf_count=212,
+            mechanism_id="horizon-admittance",
+            precision_digits=80,
+        ))
+        root_authentication = {
+            "central_determinant_re": "1e-60",
+            "central_determinant_im": "-2e-61",
+            "determinant_error": {
+                "endpoint_disagreement_abs": "2e-62",
+                "control_disagreement_abs": "1e-62",
+                "equivalence_disagreement_abs": "5e-63",
+                "precision_disagreement_abs": None,
+                "safety_factor": "64",
+                "numerical_error_abs": "1.28e-60",
+                "error_model_id": (
+                    "verified-endpoint-control-equivalence-absolute-error/v2"
+                ),
+            },
+            "residual_upper_bound_abs": "2.299803902718557e-60",
+            "derivative_authentication": {
+                "derivative_re": "2.5",
+                "derivative_im": "-0.25",
+                "propagated_error_abs": "1e-12",
+                "step_disagreement_abs": "2e-12",
+                "lower_bound_abs": "2.512468905277154",
+                "selected_step": "5e-7",
+                "axis": "real",
+            },
+            "correction_upper_bound": "9.15357579817089e-61",
+            "root_correction_tolerance": "1e-18",
+            "accepted": True,
+        }
+        reporter.publish(_payload_event(
+            ProgressEventKind.DERIVATIVE_CONTROL_COMPLETED,
+            {"root_authentication": root_authentication},
+            leaf_id="leaf-13",
+            leaf_index=13,
+            leaf_count=212,
+            mechanism_id="horizon-admittance",
+            precision_digits=80,
+            phase="PRIMARY",
+        ))
+
+        live = reporter._live_execution_mapping()
+        expected = {
+            "central_determinant_re": "1e-60",
+            "central_determinant_im": "-2e-61",
+            "determinant_error_abs": "1.28e-60",
+            "determinant_error_safety_factor": "64",
+            "endpoint_disagreement_abs": "2e-62",
+            "control_disagreement_abs": "1e-62",
+            "equivalence_disagreement_abs": "5e-63",
+            "precision_disagreement_abs": None,
+            "residual_upper_bound_abs": "2.299803902718557e-60",
+            "derivative_re": "2.5",
+            "derivative_im": "-0.25",
+            "derivative_propagated_error_abs": "1e-12",
+            "derivative_step_disagreement_abs": "2e-12",
+            "derivative_lower_bound_abs": "2.512468905277154",
+            "derivative_selected_step": "5e-7",
+            "derivative_axis": "real",
+            "correction_upper_bound": "9.15357579817089e-61",
+            "root_correction_tolerance": "1e-18",
+            "root_authentication_accepted": True,
+        }
+        for name, value in expected.items():
+            self.assertEqual(live[name], value, name)
+        self.assertEqual(
+            live["determinant_error_model"],
+            "verified-endpoint-control-equivalence-absolute-error/v2",
+        )
+
+        status = json.loads(
+            Path(f"{self.reporter_checkpoint}.status.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        for name, value in expected.items():
+            self.assertEqual(status["live_execution"][name], value, name)
+        dashboard = "\n".join(reporter._current_execution_lines(compact=True))
+        self.assertIn("ROOT AUTHENTICATION", dashboard)
+        self.assertIn("9.15357579817089e-61 / 1e-18", dashboard)
+        self.assertIn("accepted=True", dashboard)
+
     def test_operational_terminal_events_cannot_leave_live_solver_running(self):
         for terminal_kind in (
             ProgressEventKind.LEAF_FAILED,

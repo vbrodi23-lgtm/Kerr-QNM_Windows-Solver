@@ -48,6 +48,8 @@ from .response_reduction import (
 # pinned by contract and mirrored into the live progress mapping -- widening it
 # would put acceptance terms on a dashboard that reports solve health.
 AUTHENTICATION_REPORT_COLUMNS = (
+    "central_determinant_re",
+    "central_determinant_im",
     "determinant_error_model",
     "determinant_error_abs",
     "determinant_error_safety_factor",
@@ -56,12 +58,16 @@ AUTHENTICATION_REPORT_COLUMNS = (
     "equivalence_disagreement_abs",
     "precision_disagreement_abs",
     "residual_upper_bound_abs",
+    "derivative_re",
+    "derivative_im",
     "derivative_lower_bound_abs",
     "derivative_propagated_error_abs",
     "derivative_step_disagreement_abs",
     "derivative_selected_step",
     "derivative_axis",
     "correction_upper_bound",
+    "root_correction_tolerance",
+    "root_authentication_accepted",
 )
 
 
@@ -376,6 +382,8 @@ def _authentication_report_fields(readout: object) -> dict[str, object]:
     if authentication is None:
         return output
     for column, name in (
+        ("central_determinant_re", "central_determinant_re"),
+        ("central_determinant_im", "central_determinant_im"),
         ("residual_upper_bound_abs", "residual_upper_bound_abs"),
         ("derivative_lower_bound_abs", "derivative_lower_bound_abs"),
         ("derivative_propagated_error_abs", "derivative_propagated_error_abs"),
@@ -386,11 +394,24 @@ def _authentication_report_fields(readout: object) -> dict[str, object]:
         ("derivative_selected_step", "selected_step"),
         ("derivative_axis", "derivative_axis"),
         ("correction_upper_bound", "correction_upper_bound"),
+        ("root_correction_tolerance", "root_correction_tolerance"),
+        ("root_authentication_accepted", "accepted"),
         ("determinant_error_model", "error_model_id"),
     ):
         output[column] = _decimal_report_text(
             _optional_evidence_value(authentication, name)
         )
+    derivative = _optional_evidence_value(
+        authentication, "derivative_authentication"
+    )
+    if derivative is not None:
+        for column, name in (
+            ("derivative_re", "derivative_re"),
+            ("derivative_im", "derivative_im"),
+        ):
+            output[column] = _decimal_report_text(
+                _optional_evidence_value(derivative, name)
+            )
     breakdown = _optional_evidence_value(authentication, "error_breakdown")
     if breakdown is None:
         return output

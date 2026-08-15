@@ -4685,6 +4685,8 @@ function solve_once(
         ))
     end
     progress_emit("derivative_control_completed"; payload=Dict(
+        "root_authentication" =>
+            root_authentication_text(root_authentication),
         "derivative_real_half" => progress_complex(derivative_real_half),
         "derivative_real_base" => progress_complex(derivative_real_base),
         "derivative_real_double" => progress_complex(derivative_real_double),
