@@ -468,7 +468,11 @@ class JuliaResponseBackendTests(unittest.TestCase):
             "root_evaluation =",
             worker,
         )
-        self.assertIn("isnothing(accepted_derivative) ?", worker)
+        # The accepted Newton derivative is reused at the first step rung
+        # rather than recomputed; later rungs evaluate their own.
+        self.assertIn(
+            "(index == 1 && !isnothing(accepted_derivative)) ?", worker
+        )
         # The seed determinant is carried, not recomputed, but every later
         # iteration still evaluates its own residual at its own frequency.
         bounded_newton = worker[

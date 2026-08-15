@@ -68,6 +68,9 @@ class ProgressEventKind(StrEnum):
     COORDINATE_IDENTITY_CHECKED = "coordinate_identity_checked"
     COORDINATE_INVERSION_STALLED = "coordinate_inversion_stalled"
     DETERMINANT_ERROR_ESTIMATED = "determinant_error_estimated"
+    # One rung of the finite-difference step search. Reported per attempt so an
+    # exhausted range can be read back to which condition each step failed.
+    FREQUENCY_STEP_EVALUATED = "frequency_step_evaluated"
     CONDITIONING_EVALUATED = "conditioning_evaluated"
     CANDIDATE_EVALUATED = "candidate_evaluated"
     DAMPING_DECIDED = "damping_decided"

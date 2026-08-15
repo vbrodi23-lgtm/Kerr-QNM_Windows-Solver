@@ -3300,6 +3300,141 @@ function final_derivative(
     return derivative
 end
 
+"""
+    evaluate_derivative_step_ladder(T, request, context, root, amplitude,
+                                    accepted_derivative, root_error_abs)
+
+Select a finite-difference step at which the derivative is actually resolved.
+
+For a centred difference the derivative error behaves as
+
+    delta_D' ~ |D'''| h^2 / 6  +  eta_D / h
+
+so there is an interior optimum: too large a step and truncation dominates, too
+small and determinant noise does. A single fixed step -- the digit-derived 1e-60
+being the extreme case -- cannot be right across modes, because both terms
+depend on quantities that are properties of the problem rather than of the
+arithmetic.
+
+Starting from the calibrated nominal step, each rung is tested on the existing
+`h/2, h, 2h, ih` ladder and accepted only when the real-axis estimates converge,
+the real and imaginary axes agree, and the propagated determinant noise leaves a
+positive derivative bound. Otherwise the step moves to the next bounded rung
+within `[frequency_step_minimum, frequency_step_maximum]`.
+
+Exhausting the range is reported as `FINITE_DIFFERENCE_NOISE_LIMIT` -- a
+specific numerical diagnosis -- rather than an indefinite precision escalation
+or a bare "estimates do not agree".
+"""
+function evaluate_derivative_step_ladder(
+    ::Type{T},
+    request,
+    evaluation_context::DeterminantRequestContext{T},
+    root::Complex{T},
+    amplitude::Complex{T},
+    accepted_derivative,
+    root_error_abs::T,
+) where {T<:AbstractFloat}
+    scale = one(T) + abs(root)
+    nominal = parse_real(T, request, "frequency_step") * scale
+    minimum_step = parse_real(T, request, "frequency_step_minimum") * scale
+    maximum_step = parse_real(T, request, "frequency_step_maximum") * scale
+    minimum_step < maximum_step ||
+        error("frequency step bounds must satisfy minimum < maximum")
+
+    # Walk outward from the nominal step: coarser first (truncation error is
+    # the cheaper failure to escape), then finer.
+    rungs = T[]
+    step = nominal
+    while step <= maximum_step
+        push!(rungs, step)
+        step *= T(4)
+    end
+    step = nominal / T(4)
+    while step >= minimum_step
+        push!(rungs, step)
+        step /= T(4)
+    end
+
+    attempts = Dict{String,Any}[]
+    for (index, h) in enumerate(rungs)
+        real_offset = Complex{T}(h, zero(T))
+        base = (index == 1 && !isnothing(accepted_derivative)) ?
+            accepted_derivative :
+            final_derivative(
+                T, request, evaluation_context, root, amplitude,
+                real_offset, "final derivative h",
+            )
+        half = final_derivative(
+            T, request, evaluation_context, root, amplitude,
+            real_offset / T(2), "final derivative h/2",
+        )
+        double = final_derivative(
+            T, request, evaluation_context, root, amplitude,
+            T(2) * real_offset, "final derivative 2h",
+        )
+        imaginary = final_derivative(
+            T, request, evaluation_context, root, amplitude,
+            Complex{T}(zero(T), h), "final derivative ih",
+        )
+        fine_difference = abs(half - base)
+        coarse_difference = abs(base - double)
+        axis_difference = abs(imaginary - half)
+        real_step_convergent = fine_difference <= coarse_difference
+        complex_axis_consistent = axis_difference <= coarse_difference
+        uncertainty = maximum((
+            fine_difference, abs(double - half), axis_difference
+        ))
+        derivative_error_abs = root_error_abs / abs(h / T(2))
+        derivative_abs = abs(half)
+        noise_resolved =
+            derivative_abs - uncertainty - derivative_error_abs > zero(T)
+        accepted = real_step_convergent && complex_axis_consistent &&
+            noise_resolved
+        push!(attempts, Dict{String,Any}(
+            "h" => string(h),
+            "real_step_convergent" => real_step_convergent,
+            "complex_axis_consistent" => complex_axis_consistent,
+            "noise_resolved" => noise_resolved,
+            "derivative_abs" => string(derivative_abs),
+            "derivative_uncertainty_abs" => string(uncertainty),
+            "derivative_error_abs" => string(derivative_error_abs),
+            "accepted" => accepted,
+        ))
+        progress_emit("frequency_step_evaluated"; payload=last(attempts))
+        if accepted
+            return (
+                h=h,
+                derivative_real_base=base,
+                derivative_real_half=half,
+                derivative_real_double=double,
+                derivative_imaginary=imaginary,
+                fine_step_difference_abs=fine_difference,
+                coarse_step_difference_abs=coarse_difference,
+                complex_axis_difference_abs=axis_difference,
+                real_step_convergent=real_step_convergent,
+                complex_axis_consistent=complex_axis_consistent,
+                derivative_uncertainty_abs=uncertainty,
+                derivative_error_abs=derivative_error_abs,
+                rung_index=index,
+                rung_count=length(rungs),
+            )
+        end
+    end
+    throw(numerical_control_failure(
+        request,
+        "FINITE_DIFFERENCE_NOISE_LIMIT",
+        "no frequency step in the configured range resolves the determinant derivative",
+        Dict{String,Any}(
+            "nominal_step" => string(nominal),
+            "minimum_step" => string(minimum_step),
+            "maximum_step" => string(maximum_step),
+            "determinant_error_abs" => string(root_error_abs),
+            "attempts" => attempts,
+        ),
+    ))
+end
+
 function solve_once(
     ::Type{T},
     request,
@@ -3309,72 +3444,33 @@ function solve_once(
 ) where {T<:AbstractFloat}
     root, residual, accepted_derivative, newton_converged, root_evaluation =
         bounded_newton(T, request, evaluation_context, initial, amplitude)
-    h = parse_real(T, request, "frequency_step") * (one(T) + abs(root))
-    real_offset = Complex{T}(h, zero(T))
-    derivative_real_base = isnothing(accepted_derivative) ?
-        final_derivative(
-            T,
-            request,
-            evaluation_context,
-            root,
-            amplitude,
-            real_offset,
-            "final derivative h",
-        ) : accepted_derivative
-    derivative_real_half = final_derivative(
+    root_error_abs = determinant_error_abs(T, root_evaluation)
+    ladder = evaluate_derivative_step_ladder(
         T,
         request,
         evaluation_context,
         root,
         amplitude,
-        real_offset / T(2),
-        "final derivative h/2",
+        accepted_derivative,
+        root_error_abs,
     )
-    derivative_real_double = final_derivative(
-        T,
-        request,
-        evaluation_context,
-        root,
-        amplitude,
-        T(2) * real_offset,
-        "final derivative 2h",
-    )
-    derivative_imaginary = final_derivative(
-        T,
-        request,
-        evaluation_context,
-        root,
-        amplitude,
-        Complex{T}(zero(T), h),
-        "final derivative ih",
-    )
-    fine_step_difference_abs = abs(
-        derivative_real_half - derivative_real_base
-    )
-    coarse_step_difference_abs = abs(
-        derivative_real_base - derivative_real_double
-    )
-    complex_axis_difference_abs = abs(
-        derivative_imaginary - derivative_real_half
-    )
-    real_step_convergent =
-        fine_step_difference_abs <= coarse_step_difference_abs
-    complex_axis_consistent =
-        complex_axis_difference_abs <= coarse_step_difference_abs
-    real_step_convergent && complex_axis_consistent ||
-        error("determinant frequency derivative estimates do not agree")
-    derivative_uncertainty_abs = maximum((
-        fine_step_difference_abs,
-        abs(derivative_real_double - derivative_real_half),
-        complex_axis_difference_abs,
-    ))
+    h = ladder.h
+    derivative_real_base = ladder.derivative_real_base
+    derivative_real_half = ladder.derivative_real_half
+    derivative_real_double = ladder.derivative_real_double
+    derivative_imaginary = ladder.derivative_imaginary
+    fine_step_difference_abs = ladder.fine_step_difference_abs
+    coarse_step_difference_abs = ladder.coarse_step_difference_abs
+    complex_axis_difference_abs = ladder.complex_axis_difference_abs
+    real_step_convergent = ladder.real_step_convergent
+    complex_axis_consistent = ladder.complex_axis_consistent
+    derivative_uncertainty_abs = ladder.derivative_uncertainty_abs
     derivative_abs = abs(derivative_real_half)
     # Two independent contributions reduce the usable derivative: disagreement
     # between step sizes and axes, and the propagated determinant noise. Both
     # are subtracted -- the step ladder measures how the estimate moves, not
     # how far it sits from the truth.
-    root_error_abs = determinant_error_abs(T, root_evaluation)
-    derivative_error_abs = root_error_abs / abs(h / T(2))
+    derivative_error_abs = ladder.derivative_error_abs
     derivative_lower_bound_abs =
         derivative_abs - derivative_uncertainty_abs - derivative_error_abs
     isfinite(derivative_abs) && isfinite(derivative_uncertainty_abs) &&
