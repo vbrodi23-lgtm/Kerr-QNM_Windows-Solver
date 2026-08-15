@@ -334,11 +334,9 @@ def valid_root_authentication(mechanism_id: str) -> dict[str, object]:
         # 1E-60 with a 1.4E-60 error bound, the exterior one is 2.4E-60 with no
         # error model, and both give a 2.4E-60 residual bound over a 2.4
         # derivative bound.
-        "central_determinant": {
-            "real": "1E-60" if horizon else "2.4E-60",
-            "imaginary": "0",
-        },
-        "error_breakdown": (
+        "central_determinant_re": "1E-60" if horizon else "2.4E-60",
+        "central_determinant_im": "0",
+        "determinant_error": (
             {
                 "endpoint_disagreement_abs": "2.1875E-62",
                 "control_disagreement_abs": "1E-62",
@@ -350,30 +348,32 @@ def valid_root_authentication(mechanism_id: str) -> dict[str, object]:
                 "precision_disagreement_abs": "3E-63",
                 "safety_factor": "64",
                 "numerical_error_abs": "1.4E-60",
+                "error_model_id": (
+                    "verified-endpoint-control-equivalence-absolute-error/v2"
+                ),
             }
             if horizon
             else None
         ),
         "residual_upper_bound_abs": "2.4E-60",
-        "derivative_estimate": {
+        "derivative_authentication": {
             # The horizon estimate exceeds the lower bound by exactly the
             # 1E-54 propagated error plus 2E-54 step disagreement below.
-            "real": (
+            "derivative_re": (
                 "2.400000000000000000000000000000000000000000000000000003"
                 if horizon
                 else "2.4"
             ),
-            "imaginary": "0",
+            "derivative_im": "0",
+            "propagated_error_abs": "1E-54" if horizon else "0",
+            "step_disagreement_abs": "2E-54",
+            "lower_bound_abs": "2.4",
+            "selected_step": "1E-6",
+            "axis": "real",
         },
-        "derivative_propagated_error_abs": "1E-54" if horizon else "0",
-        "derivative_step_disagreement_abs": "2E-54",
-        "derivative_lower_bound_abs": "2.4",
-        "selected_step": "1E-6",
-        "derivative_axis": "real",
         "correction_upper_bound": "1E-60",
-        "error_model_id": (
-            "verified-endpoint-control-equivalence-absolute-error/v2" if horizon else None
-        ),
+        "root_correction_tolerance": "1E-18",
+        "accepted": True,
     }
 
 
@@ -389,6 +389,12 @@ def valid_julia_root_response(
 
     omega = request["omega"]
     policy = request["policy"]
+    root_authentication = valid_root_authentication(
+        request["mechanism_id"]
+    )
+    root_authentication["root_correction_tolerance"] = policy[
+        "root_correction_tolerance"
+    ]
     radii = {
         "truncation": "2E-55",
         "resolution": "3E-55",
@@ -423,9 +429,7 @@ def valid_julia_root_response(
             if request["mechanism_id"] == "horizon-admittance"
             else "2.4"
         ),
-        "root_authentication": valid_root_authentication(
-            request["mechanism_id"]
-        ),
+        "root_authentication": root_authentication,
         "root_converged": True,
         "branch_authentication_contract_version": 3,
         "root_branch_continuation_valid": True,

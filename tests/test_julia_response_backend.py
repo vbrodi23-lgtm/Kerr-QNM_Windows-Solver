@@ -468,10 +468,8 @@ class JuliaResponseBackendTests(unittest.TestCase):
         ).read_root(_job_for_mechanism("horizon-admittance"), 0.0j)
         mapping = readout.to_mapping()
         authentication = dict(mapping["root_authentication"])
-        authentication["central_determinant"] = {
-            "real": "2E-60",
-            "imaginary": "0",
-        }
+        authentication["central_determinant_re"] = "2E-60"
+        authentication["central_determinant_im"] = "0"
         authentication["residual_upper_bound_abs"] = "3.4E-60"
         with localcontext() as context:
             context.prec = 180
@@ -522,12 +520,9 @@ class JuliaResponseBackendTests(unittest.TestCase):
             def evaluate(self, request):
                 response = super().evaluate(request)
                 authentication = dict(response["root_authentication"])
-                authentication["error_breakdown"] = None
-                authentication["error_model_id"] = None
-                authentication["central_determinant"] = {
-                    "real": "2.4E-60",
-                    "imaginary": "0",
-                }
+                authentication["determinant_error"] = None
+                authentication["central_determinant_re"] = "2.4E-60"
+                authentication["central_determinant_im"] = "0"
                 authentication["residual_upper_bound_abs"] = "2.4E-60"
                 authentication["correction_upper_bound"] = "1E-60"
                 response["root_authentication"] = authentication
@@ -558,11 +553,17 @@ class JuliaResponseBackendTests(unittest.TestCase):
 
     def test_backend_rejects_a_malformed_root_authentication_record(self):
         for mutate, description in (
-            (lambda record: record.__setitem__("derivative_axis", "diagonal"),
+            (lambda record: record["derivative_authentication"].__setitem__(
+                "axis", "diagonal"
+            ),
              "invalid axis"),
-            (lambda record: record.__setitem__("derivative_lower_bound_abs", "0"),
+            (lambda record: record["derivative_authentication"].__setitem__(
+                "lower_bound_abs", "0"
+            ),
              "non-positive derivative bound"),
-            (lambda record: record.__setitem__("selected_step", "-1e-6"),
+            (lambda record: record["derivative_authentication"].__setitem__(
+                "selected_step", "-1e-6"
+            ),
              "negative step"),
             (lambda record: record.pop("correction_upper_bound"),
              "missing field"),
@@ -585,17 +586,24 @@ class JuliaResponseBackendTests(unittest.TestCase):
     def test_backend_rejects_arithmetically_inconsistent_root_authentication(self):
         """Catches a certificate whose conclusion does not follow from its terms."""
 
-        for field, replacement in (
-            ("residual_upper_bound_abs", "9E-60"),
-            ("derivative_lower_bound_abs", "2.3"),
-            ("correction_upper_bound", "1E-100"),
+        for field, replacement, nested in (
+            ("residual_upper_bound_abs", "9E-60", False),
+            ("lower_bound_abs", "2.3", True),
+            ("correction_upper_bound", "1E-100", False),
         ):
             with self.subTest(field=field):
                 class InconsistentAdapter(FakeAdapter):
                     def evaluate(self, request):
                         response = super().evaluate(request)
                         authentication = dict(response["root_authentication"])
-                        authentication[field] = replacement
+                        if nested:
+                            derivative = dict(
+                                authentication["derivative_authentication"]
+                            )
+                            derivative[field] = replacement
+                            authentication["derivative_authentication"] = derivative
+                        else:
+                            authentication[field] = replacement
                         response["root_authentication"] = authentication
                         return response
 
@@ -616,10 +624,8 @@ class JuliaResponseBackendTests(unittest.TestCase):
 
         def changed_central(response):
             authentication = dict(response["root_authentication"])
-            authentication["central_determinant"] = {
-                "real": "2E-60",
-                "imaginary": "0",
-            }
+            authentication["central_determinant_re"] = "2E-60"
+            authentication["central_determinant_im"] = "0"
             authentication["residual_upper_bound_abs"] = "3.4E-60"
             authentication["correction_upper_bound"] = str(
                 Decimal("3.4E-60") / Decimal("2.4")
@@ -628,19 +634,21 @@ class JuliaResponseBackendTests(unittest.TestCase):
 
         def changed_derivative(response):
             authentication = dict(response["root_authentication"])
-            authentication["derivative_estimate"] = {
-                "real": (
-                    "3.000000000000000000000000000000000000000000000000000003"
-                ),
-                "imaginary": "0",
-            }
-            authentication["derivative_lower_bound_abs"] = "3"
+            derivative = dict(authentication["derivative_authentication"])
+            derivative["derivative_re"] = (
+                "3.000000000000000000000000000000000000000000000000000003"
+            )
+            derivative["derivative_im"] = "0"
+            derivative["lower_bound_abs"] = "3"
+            authentication["derivative_authentication"] = derivative
             authentication["correction_upper_bound"] = "8E-61"
             response["root_authentication"] = authentication
 
         def changed_model(response):
             authentication = dict(response["root_authentication"])
-            authentication["error_model_id"] = "unrecognised-model/v999"
+            determinant_error = dict(authentication["determinant_error"])
+            determinant_error["error_model_id"] = "unrecognised-model/v999"
+            authentication["determinant_error"] = determinant_error
             response["root_authentication"] = authentication
 
         for description, mutate in (
@@ -672,10 +680,8 @@ class JuliaResponseBackendTests(unittest.TestCase):
             def evaluate(self, request):
                 response = super().evaluate(request)
                 authentication = dict(response["root_authentication"])
-                authentication["central_determinant"] = {
-                    "real": "1E-10",
-                    "imaginary": "0",
-                }
+                authentication["central_determinant_re"] = "1E-10"
+                authentication["central_determinant_im"] = "0"
                 with localcontext() as context:
                     context.prec = 180
                     residual_upper = Decimal("1E-10") + Decimal("1.4E-60")
@@ -1233,7 +1239,7 @@ class JuliaResponseBackendTests(unittest.TestCase):
             "step_disagreement_abs::T",
             "lower_bound_abs::T",
             "root_authentication",
-            '"central_determinant"',
+            '"central_determinant_re"',
             '"residual_upper_bound_abs"',
             '"selected_step"',
             '"error_model_id"',

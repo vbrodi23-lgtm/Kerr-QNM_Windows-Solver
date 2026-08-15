@@ -1145,10 +1145,8 @@ class JuliaSchemaThreeConditioningTests(unittest.TestCase):
             response["root_residual_abs"] = normalised
             response["raw_determinant_abs"] = raw
             authentication = dict(response["root_authentication"])
-            authentication["central_determinant"] = {
-                "real": normalised,
-                "imaginary": "0",
-            }
+            authentication["central_determinant_re"] = normalised
+            authentication["central_determinant_im"] = "0"
             with localcontext() as context:
                 context.prec = 180
                 residual_upper = Decimal(normalised) + Decimal("1.4E-60")

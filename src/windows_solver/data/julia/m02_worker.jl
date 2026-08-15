@@ -1150,6 +1150,8 @@ struct RootAuthentication{T<:AbstractFloat}
     derivative::DerivativeAuthentication{T}
     correction_upper_bound::T
     error_model_id::Union{Nothing,String}
+    root_correction_tolerance::T
+    accepted::Bool
 end
 
 """
@@ -4532,13 +4534,16 @@ function evaluate_derivative_step_ladder(
 end
 
 function root_authentication_text(
-    authentication::RootAuthentication
+    authentication::RootAuthentication;
+    accepted::Bool=authentication.accepted,
 )
     breakdown = authentication.error_breakdown
     return Dict{String,Any}(
-        "central_determinant" =>
-            progress_complex(authentication.central_determinant),
-        "error_breakdown" => breakdown === nothing ? nothing :
+        "central_determinant_re" =>
+            numeric_text(real(authentication.central_determinant)),
+        "central_determinant_im" =>
+            numeric_text(imag(authentication.central_determinant)),
+        "determinant_error" => breakdown === nothing ? nothing :
             Dict{String,Any}(
                 "endpoint_disagreement_abs" =>
                     numeric_text(breakdown.endpoint_disagreement_abs),
@@ -4556,22 +4561,31 @@ function root_authentication_text(
                 "safety_factor" => numeric_text(breakdown.safety_factor),
                 "numerical_error_abs" =>
                     numeric_text(breakdown.numerical_error_abs),
+                "error_model_id" => authentication.error_model_id,
             ),
         "residual_upper_bound_abs" =>
             numeric_text(authentication.residual_upper_bound_abs),
-        "derivative_estimate" =>
-            progress_complex(authentication.derivative.value),
-        "derivative_propagated_error_abs" =>
-            numeric_text(authentication.derivative.propagated_error_abs),
-        "derivative_step_disagreement_abs" =>
-            numeric_text(authentication.derivative.step_disagreement_abs),
-        "derivative_lower_bound_abs" =>
-            numeric_text(authentication.derivative.lower_bound_abs),
-        "selected_step" => numeric_text(authentication.derivative.step),
-        "derivative_axis" => authentication.derivative.axis,
+        "derivative_authentication" => Dict{String,Any}(
+            "derivative_re" =>
+                numeric_text(real(authentication.derivative.value)),
+            "derivative_im" =>
+                numeric_text(imag(authentication.derivative.value)),
+            "propagated_error_abs" => numeric_text(
+                authentication.derivative.propagated_error_abs
+            ),
+            "step_disagreement_abs" => numeric_text(
+                authentication.derivative.step_disagreement_abs
+            ),
+            "lower_bound_abs" =>
+                numeric_text(authentication.derivative.lower_bound_abs),
+            "selected_step" => numeric_text(authentication.derivative.step),
+            "axis" => authentication.derivative.axis,
+        ),
         "correction_upper_bound" =>
             numeric_text(authentication.correction_upper_bound),
-        "error_model_id" => authentication.error_model_id,
+        "root_correction_tolerance" =>
+            numeric_text(authentication.root_correction_tolerance),
+        "accepted" => accepted,
     )
 end
 
@@ -4636,6 +4650,16 @@ function solve_once(
     residual_upper_bound = residual + root_error_abs
     correction_upper_bound = residual_upper_bound / derivative_lower_bound_abs
     converged = newton_converged && correction_upper_bound <= tolerance
+    root_authentication = RootAuthentication{T}(
+        root_evaluation.value,
+        root_evaluation.error_breakdown,
+        residual_upper_bound,
+        derivative_authentication,
+        correction_upper_bound,
+        root_evaluation.error_model_id,
+        tolerance,
+        converged,
+    )
     if !converged && correction_upper_bound > tolerance &&
             residual / derivative_lower_bound_abs <= tolerance
         # The determinant itself is small enough, but its error is not. This is
@@ -4654,6 +4678,8 @@ function solve_once(
                 "root_correction_tolerance" => string(tolerance),
                 "derivative_lower_bound_abs" =>
                     string(derivative_lower_bound_abs),
+                "root_authentication" =>
+                    root_authentication_text(root_authentication),
             );
             stage="root-authentication",
         ))
@@ -4676,14 +4702,6 @@ function solve_once(
         "correction_upper_bound" => string(correction_upper_bound),
         "accepted" => converged,
     ))
-    root_authentication = RootAuthentication{T}(
-        root_evaluation.value,
-        root_evaluation.error_breakdown,
-        residual_upper_bound,
-        derivative_authentication,
-        correction_upper_bound,
-        root_evaluation.error_model_id,
-    )
     return root, residual, derivative_lower_bound_abs, converged,
         root_evaluation, root_authentication
 end
@@ -5149,7 +5167,9 @@ function result_fields(::Type{T}, request, digits::Int, bits::Int) where {T<:Abs
             raw_determinant_evidence_status,
         "root_derivative_abs" => numeric_text(derivative_abs),
         "root_authentication" =>
-            root_authentication_text(root_authentication),
+            root_authentication_text(
+                root_authentication; accepted=converged
+            ),
         "root_converged" => converged,
         "branch_authentication_contract_version" => 3,
         "root_branch_continuation_valid" => branch_valid,

@@ -2478,6 +2478,10 @@ class JuliaPrecisionRootBackend:
                 response["root_authentication"]
             )
         except ValueError as error:
+            if "accepted flag is inconsistent" in str(error):
+                raise JuliaResponseBackendError(
+                    "M02 Julia converged root exceeds its correction target"
+                ) from error
             raise JuliaResponseBackendError(
                 "M02 Julia root authentication evidence is invalid"
             ) from error
@@ -2602,28 +2606,27 @@ class JuliaPrecisionRootBackend:
             if horizon_family
             else None
         )
-        try:
-            root_authentication.validate_binding(
-                determinant_abs=normalised_determinant_abs,
-                derivative_abs=root_derivative_abs_decimal,
-                expected_error_model_id=expected_error_model_id,
-            )
-        except ValueError as error:
-            raise JuliaResponseBackendError(
-                "M02 Julia root authentication evidence is inconsistent"
-            ) from error
         root_correction_tolerance = _finite_decimal_text(
             policy.get("root_correction_tolerance"),
             "root_correction_tolerance",
             nonnegative=True,
         )
-        if converged and (
-            root_authentication.correction_upper_bound
-            > root_correction_tolerance
-        ):
+        if root_correction_tolerance <= 0:
             raise JuliaResponseBackendError(
-                "M02 Julia converged root exceeds its correction target"
+                "M02 Julia root correction tolerance is invalid"
             )
+        try:
+            root_authentication.validate_binding(
+                determinant_abs=normalised_determinant_abs,
+                derivative_abs=root_derivative_abs_decimal,
+                expected_error_model_id=expected_error_model_id,
+                root_correction_tolerance=root_correction_tolerance,
+                accepted=converged,
+            )
+        except ValueError as error:
+            raise JuliaResponseBackendError(
+                "M02 Julia root authentication evidence is inconsistent"
+            ) from error
         raw_determinant_abs = (
             None
             if response["raw_determinant_abs"] is None
