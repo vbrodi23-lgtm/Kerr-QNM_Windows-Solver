@@ -384,6 +384,45 @@ class JuliaResponseBackendTests(unittest.TestCase):
                     / authentication.derivative_lower_bound_abs,
                 )
 
+    def test_readout_carries_the_authentication_past_the_backend(self):
+        """Catches convergence surviving while its evidence is discarded.
+
+        Once the worker output is gone, a stored ``converged`` flag is an
+        assertion with nothing behind it. The readout therefore carries the
+        terms the decision was made on, so it can be re-checked rather than
+        trusted.
+        """
+
+        for mechanism, horizon in (
+            ("horizon-admittance", True),
+            ("exterior-fixed-r3", False),
+        ):
+            with self.subTest(mechanism=mechanism):
+                job = _job_for_mechanism(mechanism)
+                backend = JuliaPrecisionRootBackend(
+                    VettedNativeDeterminantKernel.identity, FakeAdapter(), 80
+                )
+
+                readout = backend.read_root(job, 0.0j)
+
+                authentication = readout.root_authentication
+                self.assertIsInstance(authentication, RootAuthenticationEvidence)
+                self.assertEqual(
+                    authentication.error_breakdown is not None, horizon
+                )
+                # The acceptance comparison is reconstructible from the stored
+                # readout alone.
+                self.assertGreater(authentication.derivative_lower_bound_abs, 0)
+                self.assertEqual(
+                    authentication.correction_upper_bound,
+                    authentication.residual_upper_bound_abs
+                    / authentication.derivative_lower_bound_abs,
+                )
+                # Decimal text survives; it is not narrowed to binary64.
+                self.assertIsInstance(
+                    authentication.central_determinant.real, Decimal
+                )
+
     def test_backend_rejects_authentication_disagreeing_with_its_family(self):
         """Catches an error-aware decision made from an absent error term."""
 

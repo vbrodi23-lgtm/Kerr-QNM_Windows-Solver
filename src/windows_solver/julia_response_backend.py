@@ -2366,6 +2366,7 @@ class JuliaPrecisionRootBackend:
                 raw_determinant_evidence_status=
                     raw_determinant_evidence_status,
                 worker_response_receipt=worker_response_receipt,
+                root_authentication=root_authentication,
             )
         except ValueError as error:
             raise JuliaResponseBackendError(

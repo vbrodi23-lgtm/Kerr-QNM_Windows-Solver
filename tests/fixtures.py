@@ -329,7 +329,14 @@ def valid_root_authentication(mechanism_id: str) -> dict[str, object]:
     #   residual_upper_bound  = |D| + eta_D  = 1E-60 + 1.4E-60
     #   correction_upper_bound= residual_upper_bound / derivative_lower_bound
     return {
-        "central_determinant": {"real": "1E-60", "imaginary": "0"},
+        # Chosen so both families divide exactly: the horizon determinant is
+        # 1E-60 with a 1.4E-60 error bound, the exterior one is 2.4E-60 with no
+        # error model, and both give a 2.4E-60 residual bound over a 2.4
+        # derivative bound.
+        "central_determinant": {
+            "real": "1E-60" if horizon else "2.4E-60",
+            "imaginary": "0",
+        },
         "error_breakdown": (
             {
                 "endpoint_disagreement_abs": "2.1875E-62",
@@ -342,16 +349,14 @@ def valid_root_authentication(mechanism_id: str) -> dict[str, object]:
             if horizon
             else None
         ),
-        "residual_upper_bound_abs": "2.4E-60" if horizon else "1E-60",
+        "residual_upper_bound_abs": "2.4E-60",
         "derivative_estimate": {"real": "2.5", "imaginary": "0"},
         "derivative_propagated_error_abs": "1E-54" if horizon else "0",
         "derivative_step_disagreement_abs": "2E-54",
         "derivative_lower_bound_abs": "2.4",
         "selected_step": "1E-6",
         "derivative_axis": "real",
-        "correction_upper_bound": (
-            "1E-60" if horizon else "4.1666666666666666666666666667E-61"
-        ),
+        "correction_upper_bound": "1E-60",
         "error_model_id": (
             "verified-endpoint-control-equivalence-absolute-error/v2" if horizon else None
         ),

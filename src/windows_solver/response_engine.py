@@ -1495,6 +1495,11 @@ class RootReadout:
     raw_determinant_abs: Decimal | None = None
     raw_determinant_evidence_status: str | None = None
     worker_response_receipt: Mapping[str, object] | None = None
+    # The error-aware terms the convergence decision was actually made on.
+    # Carried past the backend so a stored readout can be re-checked rather
+    # than trusted: without it, "converged" is an assertion with no evidence
+    # behind it once the worker output is gone.
+    root_authentication: RootAuthenticationEvidence | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "omega", _finite_complex(self.omega, "root omega"))
@@ -1524,6 +1529,10 @@ class RootReadout:
             )
         ):
             raise ValueError("root readout numerical conditioning has invalid type")
+        if self.root_authentication is not None and not isinstance(
+            self.root_authentication, RootAuthenticationEvidence
+        ):
+            raise ValueError("root readout root authentication has invalid type")
         for name in ("normalised_determinant_abs", "raw_determinant_abs"):
             value = getattr(self, name)
             if value is None:
