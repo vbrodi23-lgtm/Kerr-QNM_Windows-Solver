@@ -151,6 +151,35 @@ class PublicSurfaceTests(unittest.TestCase):
         self.assertIn("Resolve-KerrQnmRuntimeRoot", launcher)
         self.assertIn('Join-Path $ResolvedRuntimeRoot "python-runtime.json"', launcher)
         self.assertIn('$RuntimeReceipt.python.venv', launcher)
+
+        # Every entry point reads the one receipt the bootstrap actually
+        # writes, and reads it in the shape it is actually written. The
+        # calibration harness shipped looking for an "m02-runtime.json" with
+        # julia/project/depot at the top level -- a file nothing writes, in a
+        # shape nothing produces -- so it failed on its own preflight before
+        # reaching a determinant. Source assertions are weak evidence, but the
+        # alternative here is provisioning a Julia runtime in CI, and the
+        # failure mode this catches is a literal filename, not behaviour.
+        calibrate = (root / "m02-calibrate-horizon.ps1").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn(
+            'Join-Path $ResolvedRuntimeRoot "python-runtime.json"', calibrate
+        )
+        # The quoted literal, not the bare name: the comment above the fix
+        # names the old file in order to explain it, and should keep doing so.
+        self.assertNotIn('"m02-runtime.json"', calibrate)
+        self.assertIn("$Receipt.julia_runtime", calibrate)
+        for field in ("executable", "project", "depot"):
+            self.assertIn(f"$JuliaRuntime.{field}", calibrate)
+        # The receipt keys the harness reads must be the ones the bootstrap
+        # emits and the Python adapter validates.
+        self.assertIn("julia_runtime", bootstrap)
+        adapter = (
+            root / "src" / "windows_solver" / "julia_response_backend.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn('receipt.get("julia_runtime")', adapter)
+        self.assertIn('{"requested", "executable", "depot", "project"}', adapter)
         self.assertIn(r'Join-Path $VenvRoot "Scripts\python.exe"', bootstrap)
         self.assertIn(r'Join-Path $RuntimeRoot "python-env', bootstrap)
         self.assertIn("$NumericalEnvironmentId", bootstrap)

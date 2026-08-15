@@ -81,21 +81,34 @@ if (-not $SkipBootstrap) {
     }
 }
 
-$ReceiptPath = Join-Path $ResolvedRuntimeRoot "m02-runtime.json"
+# The bootstrap writes one runtime receipt, `python-runtime.json`, and records
+# the Julia runtime inside it under `julia_runtime`. This script previously
+# looked for an `m02-runtime.json` carrying `julia`/`project`/`depot` at the top
+# level. No such file is written by anything in this repository and no such
+# shape exists, so the harness could not run at all -- it failed on its own
+# preflight before reaching a single determinant. `solver.ps1`,
+# `julia_response_backend.py` and `gsn_cache_producer.py` all read the real
+# receipt; this was the one consumer that had invented its own.
+$ReceiptPath = Join-Path $ResolvedRuntimeRoot "python-runtime.json"
 if (-not (Test-Path -LiteralPath $ReceiptPath -PathType Leaf)) {
     throw "M02 runtime receipt is absent: $ReceiptPath"
 }
 $Receipt = Get-Content -LiteralPath $ReceiptPath -Raw | ConvertFrom-Json
-$JuliaExecutable = [string]$Receipt.julia
-$JuliaProject = [string]$Receipt.project
-$JuliaDepot = [string]$Receipt.depot
+$JuliaRuntime = $Receipt.julia_runtime
+if ($null -eq $JuliaRuntime -or $JuliaRuntime.requested -ne $true) {
+    throw ("M02 Julia runtime is not provisioned; run " +
+        ".\runtime\bootstrap.ps1 -WithM02")
+}
+$JuliaExecutable = [string]$JuliaRuntime.executable
+$JuliaProject = [string]$JuliaRuntime.project
+$JuliaDepot = [string]$JuliaRuntime.depot
 foreach ($Field in @(
-    @{ Name = "julia"; Value = $JuliaExecutable },
+    @{ Name = "executable"; Value = $JuliaExecutable },
     @{ Name = "project"; Value = $JuliaProject },
     @{ Name = "depot"; Value = $JuliaDepot }
 )) {
     if ([string]::IsNullOrWhiteSpace($Field.Value)) {
-        throw "M02 runtime receipt is missing '$($Field.Name)'."
+        throw "M02 runtime receipt julia_runtime is missing '$($Field.Name)'."
     }
 }
 
