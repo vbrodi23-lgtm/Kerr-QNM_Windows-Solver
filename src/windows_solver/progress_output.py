@@ -80,6 +80,7 @@ _NORMAL_FALLBACK_KINDS = _NORMAL_KINDS | frozenset(
         ProgressEventKind.ODE_SOLVE_COMPLETED,
         ProgressEventKind.ODE_SOLVE_FAILED,
         ProgressEventKind.ODE_RESOURCE_LIMIT,
+        ProgressEventKind.COORDINATE_INVERSION_STALLED,
         ProgressEventKind.ROOT_READOUT_RESOURCE_INFEASIBLE,
     }
 )
@@ -119,6 +120,7 @@ _FORCED_STATUS_KINDS = frozenset(
         ProgressEventKind.ODE_SOLVE_COMPLETED,
         ProgressEventKind.ODE_SOLVE_FAILED,
         ProgressEventKind.ODE_RESOURCE_LIMIT,
+        ProgressEventKind.COORDINATE_INVERSION_STALLED,
         ProgressEventKind.ROOT_READOUT_RESOURCE_INFEASIBLE,
         ProgressEventKind.WORKER_HEARTBEAT,
         ProgressEventKind.ERROR,
@@ -142,6 +144,7 @@ _DASHBOARD_FORCED_KINDS = frozenset(
         ProgressEventKind.CONDITIONING_EVALUATED,
         ProgressEventKind.ODE_SOLVE_FAILED,
         ProgressEventKind.ODE_RESOURCE_LIMIT,
+        ProgressEventKind.COORDINATE_INVERSION_STALLED,
         ProgressEventKind.ROOT_READOUT_RESOURCE_INFEASIBLE,
         ProgressEventKind.WORKER_HEARTBEAT,
         ProgressEventKind.LEAF_COMPLETED,

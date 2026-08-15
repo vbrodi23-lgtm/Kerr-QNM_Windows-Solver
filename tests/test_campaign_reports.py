@@ -455,7 +455,10 @@ class CampaignReportTests(unittest.TestCase):
         self.assertNotIn("  64 CONVERGED", table)
         self.assertEqual(_root_correction_tolerance_for_precision(64), 2.0e-11)
         self.assertEqual(_root_correction_tolerance_for_precision(80), 1.0e-18)
-        self.assertEqual(_root_correction_tolerance_for_precision(120), 1.0e-102)
+        # The promoted target is the same at both storage tiers. It was
+        # previously reconstructed from the digit count as 1e-102, which is a
+        # threshold no promoted request has ever carried.
+        self.assertEqual(_root_correction_tolerance_for_precision(120), 1.0e-18)
 
     def test_dashboard_throttles_fast_inner_events_but_forces_heartbeat(self):
         """Catches terminal redraw volume scaling with determinant operations."""
@@ -562,6 +565,43 @@ class CampaignReportTests(unittest.TestCase):
                 stage_row["newton_correction"], 3.50e-11 / 36.1
             )
             self.assertEqual(stage_row["root_displacement_abs"], 0.0)
+
+    def test_report_tolerance_follows_policy_not_storage_precision(self):
+        """Catches reports reconstructing the solve target from digit count.
+
+        The promoted threshold is a property of the physics, so it is the same
+        at both storage tiers. Deriving it from precision produced ``1e-102``
+        for a 120-digit stage while the request actually carried ``1e-18``,
+        making ``newton_correction_over_tolerance`` wrong by roughly eighty
+        orders of magnitude -- a converged root reads as hopelessly
+        under-converged.
+        """
+
+        from windows_solver.campaign_reports import (
+            _root_correction_tolerance_for_precision as tolerance_for,
+        )
+        from windows_solver.julia_response_backend import (
+            promoted_precision_numerical_controls,
+        )
+
+        controls = promoted_precision_numerical_controls()
+        for digits in (80, 120):
+            with self.subTest(digits=digits):
+                self.assertEqual(
+                    tolerance_for(digits),
+                    float(
+                        controls[str(digits)]["base"][
+                            "root_correction_tolerance"
+                        ]
+                    ),
+                )
+        # Same physics target at both tiers, and emphatically not 1e-102.
+        self.assertEqual(tolerance_for(120), tolerance_for(80))
+        self.assertGreater(tolerance_for(120), 1.0e-30)
+        # Binary64 is not a promoted tier and keeps its own threshold.
+        self.assertEqual(tolerance_for(64), 2.0e-11)
+        with self.assertRaises(ValueError):
+            tolerance_for(96)
 
             reporter = CampaignProgressReporter("normal", checkpoint, io.StringIO())
             reporter._campaign_report_model = model

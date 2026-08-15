@@ -1712,6 +1712,49 @@ class CampaignProgressReporterTests(unittest.TestCase):
             ProgressEventKind.REQUEST_INTERRUPTED.value, "request_interrupted"
         )
 
+    def test_every_worker_emitted_event_is_registered_in_python(self):
+        """Catches a Julia event name the Python registry cannot parse.
+
+        The worker and the registry are edited in different languages by
+        different changes, so a new emission can reach a campaign that has no
+        name for it. Reading the emissions out of the worker source keeps the
+        comparison honest rather than restating a hand-maintained list.
+        """
+
+        import re
+
+        worker = (
+            Path(__file__).resolve().parents[1]
+            / "src/windows_solver/data/julia/m02_worker.jl"
+        ).read_text(encoding="utf-8")
+        emitted = set(
+            re.findall(r'progress_emit\(\s*"([a-z_0-9]+)"', worker)
+        )
+        self.assertTrue(emitted, "worker must emit progress events")
+        registered = {kind.value for kind in ProgressEventKind}
+        self.assertEqual(sorted(emitted - registered), [])
+
+    def test_terminal_control_failures_share_normal_mode_visibility(self):
+        """Catches a terminal control failure that is silent outside trace.
+
+        A coordinate stall ends a leg exactly as a resource limit does. If one
+        is surfaced at normal verbosity and the other is not, the operator sees
+        a run stop for no stated reason -- which is the condition the stall
+        watchdog was added to eliminate.
+        """
+
+        from windows_solver import progress_output
+
+        for peer_set in (
+            progress_output._NORMAL_FALLBACK_KINDS,
+            progress_output._FORCED_STATUS_KINDS,
+            progress_output._DASHBOARD_FORCED_KINDS,
+        ):
+            if ProgressEventKind.ODE_RESOURCE_LIMIT in peer_set:
+                self.assertIn(
+                    ProgressEventKind.COORDINATE_INVERSION_STALLED, peer_set
+                )
+
     def test_reporter_contains_stream_and_trace_failures(self):
         class BrokenStream:
             def write(self, value):

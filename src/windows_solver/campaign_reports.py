@@ -23,6 +23,7 @@ from .response_batches import (
     STAGE_SIGNED_ERROR_FAMILIES,
     validate_campaign_checkpoint,
 )
+from .julia_response_backend import promoted_precision_numerical_controls
 from .precision_tiers import precision_tier_presentation
 from .response_engine import ComponentResult, ERROR_CHANNELS
 from .response_reduction import (
@@ -329,15 +330,29 @@ def _conditioning_report_fields(readout: object) -> dict[str, object]:
 
 
 def _root_correction_tolerance_for_precision(digits: int) -> float:
-    """Return the Newton-correction threshold governing one M02 stage."""
+    """Return the Newton-correction threshold governing one M02 stage.
+
+    The promoted threshold is read from the policy the solver was actually
+    given, not reconstructed from the stored digit count. Those two answers used
+    to differ enormously: a 120-digit stage was reported against ``1e-102``
+    while the request carried ``1e-18``, so ``newton_correction_over_tolerance``
+    was wrong by some eighty orders of magnitude and a converged root read as
+    hopelessly under-converged.
+
+    The scientific target is a property of the physics rather than of the
+    arithmetic, which is exactly why it cannot be derived from precision.
+    """
 
     if digits == 64:
+        # Binary64 is not a promoted tier and carries no policy entry.
         return 2.0e-11
-    if digits == 80:
-        return 1.0e-18
-    if digits == 120:
-        return 1.0e-102
-    raise ValueError("campaign report stage precision is invalid")
+    controls = promoted_precision_numerical_controls()
+    tier = controls.get(str(digits))
+    if not isinstance(tier, Mapping):
+        raise ValueError("campaign report stage precision is invalid")
+    base = tier["base"]
+    assert isinstance(base, Mapping)
+    return float(base["root_correction_tolerance"])
 
 
 def _precision_stage_rows(
