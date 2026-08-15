@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import hashlib
 from pathlib import Path
 from types import SimpleNamespace
@@ -172,6 +173,42 @@ class NativeCampaignBackendTests(unittest.TestCase):
         self.backend = NativeCampaignStageBackend(
             native, self.capabilities, generated, julia
         )
+
+    def test_main_era_full_resource_policy_attempt_remains_readable(self):
+        """Catches a same-version policy expansion breaking attempt history."""
+
+        mapping = copy.deepcopy(_failed_preflight_attempt(self.leaf).to_mapping())
+        failure = mapping["failure_receipt"]["failure"]
+        current_policy = failure["request_binding"]["execution_resource"]
+        legacy_policy = {
+            name: value
+            for name, value in current_policy.items()
+            if name not in {
+                "coordinate_stall_rhs_threshold",
+                "coordinate_stall_minimum_span_fraction",
+                "coordinate_stall_minimum_step_fraction",
+                "sha256",
+            }
+        }
+        legacy_policy["sha256"] = hashlib.sha256(
+            canonical_json_bytes(legacy_policy)
+        ).hexdigest()
+        failure["execution_resource_policy"] = legacy_policy
+        material = {
+            name: value
+            for name, value in mapping.items()
+            if name != "attempt_sha256"
+        }
+        mapping["attempt_sha256"] = hashlib.sha256(
+            canonical_json_bytes(material)
+        ).hexdigest()
+
+        restored = CampaignExecutionAttempt.from_mapping(mapping)
+
+        restored_policy = restored.failure_receipt["failure"][
+            "execution_resource_policy"
+        ]
+        self.assertEqual(restored_policy, legacy_policy)
 
     def test_deep_binary64_stage_derives_trigger_diagnostics(self):
         result = _result(self.leaf.job, 1.0 + 0.5j)
