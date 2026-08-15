@@ -83,6 +83,11 @@ struct ODESolverFailure <: ODEControlFailure
     details::Dict{String,Any}
 end
 
+struct CoordinateInversionStalled <: ODEControlFailure
+    message::String
+    details::Dict{String,Any}
+end
+
 struct RootReadoutResourceLimit <: WorkerControlFailure
     message::String
     details::Dict{String,Any}
@@ -95,6 +100,8 @@ end
 
 Base.showerror(io::IO, failure::ODEResourceLimit) = print(io, failure.message)
 Base.showerror(io::IO, failure::ODESolverFailure) = print(io, failure.message)
+Base.showerror(io::IO, failure::CoordinateInversionStalled) =
+    print(io, failure.message)
 Base.showerror(io::IO, failure::RootReadoutResourceLimit) = print(io, failure.message)
 Base.showerror(io::IO, failure::NumericalControlFailure) = print(io, failure.message)
 failure_details(failure::WorkerControlFailure) = failure.details
@@ -250,6 +257,64 @@ function throw_ode_resource_limit(
     ))
 end
 
+const COORDINATE_ODE_LEG_PREFIX = "r_from_rho"
+
+is_coordinate_ode_leg(leg::AbstractString) =
+    startswith(String(leg), COORDINATE_ODE_LEG_PREFIX)
+
+"""
+    throw_coordinate_inversion_stalled(state, stats, t_current, ...)
+
+Fail a coordinate-inversion leg that is making no progress.
+
+Leaf 13 spent 87.8 s and 2,000,002 RHS evaluations covering 1.01e-11 of a 5000
+span before hitting the generic RHS ceiling, with accepted steps pinned at
+8.1e-17. That is a diagnosable condition -- an impossible local-error target
+against the coordinate map -- but the generic resource limit reports it only as
+"ran out of budget". This watchdog names it, and fires long before the hard
+ceiling so the budget is not consumed proving the same point.
+"""
+function throw_coordinate_inversion_stalled(
+    state::ODEObservationState, stats, t_current;
+    proposed_step=nothing, span, span_fraction, reason::String,
+)
+    snapshot = merge(
+        ode_snapshot_payload(
+            state, stats, t_current; proposed_step=proposed_step
+        ),
+        Dict{String,Any}(
+            "ode_retcode" => "CoordinateInversionStalled",
+            "ode_endpoint_reached" => false,
+            "ode_span_abs" => string(span),
+            "ode_span_fraction" => span_fraction === nothing ?
+                nothing : string(span_fraction),
+        ),
+    )
+    LAST_ODE_SNAPSHOT[] = snapshot
+    details = merge(control_failure_context(state.request), Dict{String,Any}(
+        "failure_code" => "COORDINATE_INVERSION_STALLED",
+        "failure_class" => "CONTROL",
+        "stall_reason" => reason,
+        "elapsed_leg_seconds" => snapshot["elapsed_seconds"],
+        "ode_leg" => state.leg,
+        "ode_snapshot" => snapshot,
+    ))
+    progress_emit(
+        "coordinate_inversion_stalled";
+        payload=merge(snapshot, Dict{String,Any}(
+            "failure_code" => "COORDINATE_INVERSION_STALLED",
+            "failure_class" => "CONTROL",
+            "stall_reason" => reason,
+            "execution_resource_policy" =>
+                resource_policy_identity(state.request),
+        )),
+    )
+    throw(CoordinateInversionStalled(
+        "$(state.leg) stalled near rho=$(t_current) ($(reason))",
+        details,
+    ))
+end
+
 function ode_observation_factory(request, leg, tspan, _algorithm)
     NEXT_ODE_SOLVE_ID[] += 1
     started = time_ns()
@@ -321,6 +386,48 @@ function ode_observation_factory(request, leg, tspan, _algorithm)
                     "rhs_evaluations", "rhs_evaluations";
                     proposed_step=proposed_step,
                 )
+            end
+            if is_coordinate_ode_leg(state.leg)
+                stall_threshold = parse_integer(
+                    request, "coordinate_stall_rhs_threshold"
+                )
+                if Int(stats.nf) >= stall_threshold
+                    span = abs(Float64(state.t_end) - Float64(state.t_start))
+                    covered = abs(
+                        Float64(real(integrator.t)) - Float64(state.t_start)
+                    )
+                    span_fraction = span > 0 ? covered / span : nothing
+                    minimum_fraction = parse(
+                        Float64,
+                        string(required(
+                            request, "coordinate_stall_minimum_span_fraction"
+                        )),
+                    )
+                    minimum_step_fraction = parse(
+                        Float64,
+                        string(required(
+                            request, "coordinate_stall_minimum_step_fraction"
+                        )),
+                    )
+                    last_step = state.last_accepted_step === nothing ?
+                        nothing : Float64(state.last_accepted_step)
+                    stalled_span = span_fraction !== nothing &&
+                        span_fraction < minimum_fraction
+                    stalled_step = last_step !== nothing && span > 0 &&
+                        last_step <= minimum_step_fraction * span
+                    if stalled_span && stalled_step
+                        throw_coordinate_inversion_stalled(
+                            state, stats, integrator.t;
+                            proposed_step=proposed_step,
+                            span=span,
+                            span_fraction=span_fraction,
+                            reason="span fraction $(span_fraction) below " *
+                                "$(minimum_fraction) with accepted step " *
+                                "$(last_step) after $(Int(stats.nf)) RHS " *
+                                "evaluations",
+                        )
+                    end
+                end
             end
             if sampled_at >= state.next_report_ns
                 state.next_report_ns = sampled_at + interval
@@ -790,10 +897,36 @@ struct DeterminantDiagnostics{T<:AbstractFloat}
     maximum_contour_angle_deformation::T
 end
 
+const VERIFIED_ENDPOINT_ERROR_MODEL_ID =
+    "verified-endpoint-absolute-error/v1"
+
+"""
+    DeterminantEvaluation
+
+A determinant value together with a bound on its own numerical error.
+
+`numerical_error_abs` is an *absolute* bound on |D|, never a relative one. The
+QNM condition is Cinc = 0, so near a root the determinant is a small quantity
+whose relative accuracy is necessarily poor; that is expected and is not
+evidence of ill conditioning. What decides whether a root is resolved is the
+absolute determinant error measured against the local |D'| scale, which is what
+Newton acceptance consumes.
+
+The horizon family must always populate it. The exterior family is unchanged in
+this revision and may leave it `nothing`, in which case acceptance falls back to
+the historical contract.
+"""
 struct DeterminantEvaluation{T<:AbstractFloat}
     value::Complex{T}
+    numerical_error_abs::Union{Nothing,T}
+    error_model_id::Union{Nothing,String}
     diagnostics::DeterminantDiagnostics{T}
 end
+
+DeterminantEvaluation{T}(
+    value::Complex{T}, diagnostics::DeterminantDiagnostics{T}
+) where {T<:AbstractFloat} =
+    DeterminantEvaluation{T}(value, nothing, nothing, diagnostics)
 
 struct FiniteDifferenceDiagnostics{T<:AbstractFloat}
     d_plus_abs::T
@@ -936,6 +1069,33 @@ function build_sample_spectral_context(
     return spectral
 end
 
+"""
+    coordinate_ode_tolerances(T, request)
+
+Return the coordinate-map ODE tolerances.
+
+The coordinate inversion is a scalar quadrature for r(rho); it is not the
+homogeneous GSN solve and must not inherit its local-error target. Driving it
+at the homogeneous tolerance is what pinned Leaf 13 at 8.1e-17 steps. The
+coordinate map only has to be accurate enough not to dominate the determinant
+error budget, which is what the calibration harness measures.
+"""
+function coordinate_ode_tolerances(::Type{T}, request) where {T<:AbstractFloat}
+    return (
+        reltol=parse_real(T, request, "coordinate_ode_relative_tolerance"),
+        abstol=parse_real(T, request, "coordinate_ode_absolute_tolerance"),
+    )
+end
+
+"""
+    build_worker_contour_context(T, request, spectral, match_radius, label)
+
+Build the joined contour context used by the exterior determinant family.
+
+The horizon determinant no longer uses this: it builds an outer-only map and a
+separate real-inner horizon map, so nothing constructs a -5000 -> +5000 joined
+coordinate solve for a horizon calculation that reads at most ~100 units inside.
+"""
 function build_worker_contour_context(
     ::Type{T},
     request,
@@ -947,6 +1107,7 @@ function build_worker_contour_context(
     rho_out = parse_real(T, request, "rho_out")
     rstar_match = T(GSN.rstar_from_r(spectral.a, match_radius))
     algorithm = AutoVern9(Rosenbrock23(autodiff=false))
+    tolerances = coordinate_ode_tolerances(T, request)
     observation_factory = (leg, tspan, ode_algorithm) ->
         ode_observation_factory(request, leg, tspan, ode_algorithm)
     raw_radius_from_rho = progress_operation("r-from-rho"; payload=Dict(
@@ -963,11 +1124,12 @@ function build_worker_contour_context(
             sign_pos=spectral.convention.infinity_sign,
             dtype=Complex{T},
             odealgo=algorithm,
-            reltol=parse_real(T, request, "ode_relative_tolerance"),
-            abstol=parse_real(T, request, "ode_absolute_tolerance"),
+            reltol=tolerances.reltol,
+            abstol=tolerances.abstol,
             ode_maxiters=parse_integer(request, "homogeneous_ode_maxiters"),
             ode_observation_factory=observation_factory,
             ode_solution_observer=observe_ode_solution,
+            r_at_rho_zero=Complex{T}(match_radius),
         )
     end
     radius_from_rho = observed_radial_map(
@@ -980,6 +1142,194 @@ function build_worker_contour_context(
         rho_in,
         rho_out,
         radius_from_rho,
+    )
+end
+
+"""
+    assert_match_radius_identity(T, spectral, match_radius, rstar_match)
+
+Fail unless `rstar_from_r(a, match_radius)` reproduces the supplied
+`rstar_match`.
+
+Production now seeds the coordinate ODE with `r(0) = match_radius` directly
+rather than recovering it through `r_from_rstar`. That is exact when the two
+coordinates agree, so the identity is checked explicitly instead of being
+implicitly re-derived by a numerical inverse.
+"""
+function assert_match_radius_identity(
+    ::Type{T},
+    spectral::CF.HomogeneousSpectralContext{T},
+    match_radius::T,
+    rstar_match::T,
+) where {T<:AbstractFloat}
+    canonical = T(GSN.rstar_from_r(spectral.a, match_radius))
+    canonical == rstar_match || error(
+        "match radius identity failed: rstar_from_r(a, match_radius)=" *
+        "$(canonical) does not equal rstar_match=$(rstar_match)"
+    )
+    return nothing
+end
+
+"""
+    build_worker_outer_contour(T, request, spectral, match_radius, label)
+
+Build the infinity-side contour on `0 -> +rho_out` only.
+"""
+function build_worker_outer_contour(
+    ::Type{T},
+    request,
+    spectral::CF.HomogeneousSpectralContext{T},
+    match_radius::T,
+    label::String,
+) where {T<:AbstractFloat}
+    rho_out = parse_real(T, request, "rho_out")
+    rstar_match = T(GSN.rstar_from_r(spectral.a, match_radius))
+    assert_match_radius_identity(T, spectral, match_radius, rstar_match)
+    algorithm = AutoVern9(Rosenbrock23(autodiff=false))
+    tolerances = coordinate_ode_tolerances(T, request)
+    observation_factory = (leg, tspan, ode_algorithm) ->
+        ode_observation_factory(request, leg, tspan, ode_algorithm)
+    raw_radius_from_rho = progress_operation("r-from-rho"; payload=Dict(
+        "contour_label" => label,
+    )) do
+        CF.solve_r_from_rho(
+            spectral.a,
+            spectral.convention.infinity_contour_angle,
+            rstar_match,
+            rho_out;
+            sign=spectral.convention.infinity_sign,
+            dtype=Complex{T},
+            odealgo=algorithm,
+            reltol=tolerances.reltol,
+            abstol=tolerances.abstol,
+            ode_maxiters=parse_integer(request, "homogeneous_ode_maxiters"),
+            ode_observation_factory=observation_factory,
+            ode_solution_observer=observe_ode_solution,
+            ode_leg="r_from_rho_positive",
+            r_at_rho_zero=Complex{T}(match_radius),
+            verbose=false,
+        )
+    end
+    radius_from_rho = observed_radial_map(
+        raw_radius_from_rho, label, zero(T), rho_out
+    )
+    emit_coordinate_identity(
+        T, spectral, radius_from_rho, rstar_match,
+        Complex{T}(spectral.convention.infinity_sign) *
+            exp(complex(zero(T), spectral.convention.infinity_contour_angle)),
+        range(zero(T), rho_out; length=9), label,
+    )
+    return CF.build_outer_contour_context(
+        spectral, match_radius, rstar_match, rho_out, radius_from_rho
+    )
+end
+
+"""
+    build_worker_real_inner_horizon_contour(T, request, spectral, match_radius,
+                                            label)
+
+Build the horizon-side contour on `0 -> rho_inner_min` with a unit real tangent.
+
+`rho_inner_min` is roughly -100 rather than -5000: the geometry gate only
+samples candidates within that window, so nothing is gained by integrating the
+coordinate map two orders of magnitude further than any endpoint that will ever
+be selected.
+"""
+function build_worker_real_inner_horizon_contour(
+    ::Type{T},
+    request,
+    spectral::CF.HomogeneousSpectralContext{T},
+    match_radius::T,
+    label::String,
+) where {T<:AbstractFloat}
+    rho_inner_min = parse_real(T, request, "horizon_rho_inner_min")
+    rho_inner_min < zero(T) || error(
+        "horizon_rho_inner_min must be negative"
+    )
+    rstar_match = T(GSN.rstar_from_r(spectral.a, match_radius))
+    assert_match_radius_identity(T, spectral, match_radius, rstar_match)
+    algorithm = AutoVern9(Rosenbrock23(autodiff=false))
+    tolerances = coordinate_ode_tolerances(T, request)
+    observation_factory = (leg, tspan, ode_algorithm) ->
+        ode_observation_factory(request, leg, tspan, ode_algorithm)
+    raw_radius_from_rho = progress_operation("r-from-rho"; payload=Dict(
+        "contour_label" => label,
+    )) do
+        # beta = 0, sign = +1: r_*(rho) = rstar_match + rho, so the map runs
+        # along the real tortoise axis toward the horizon.
+        CF.solve_r_from_rho(
+            spectral.a,
+            zero(T),
+            rstar_match,
+            rho_inner_min;
+            sign=Int8(1),
+            dtype=Complex{T},
+            odealgo=algorithm,
+            reltol=tolerances.reltol,
+            abstol=tolerances.abstol,
+            ode_maxiters=parse_integer(request, "homogeneous_ode_maxiters"),
+            ode_observation_factory=observation_factory,
+            ode_solution_observer=observe_ode_solution,
+            ode_leg="r_from_rho_real_inner",
+            r_at_rho_zero=Complex{T}(match_radius),
+            verbose=false,
+        )
+    end
+    radius_from_rho = observed_radial_map(
+        raw_radius_from_rho, label, rho_inner_min, zero(T)
+    )
+    emit_coordinate_identity(
+        T, spectral, radius_from_rho, rstar_match,
+        complex(one(T), zero(T)),
+        range(zero(T), rho_inner_min; length=9), label,
+    )
+    return CF.build_real_inner_horizon_contour(
+        spectral, match_radius, rstar_match, rho_inner_min, radius_from_rho
+    )
+end
+
+"""
+    emit_coordinate_identity(T, spectral, radius_from_rho, rstar_match,
+                             tangent, samples, label)
+
+Check and report the coordinate identity `r_*(rho) = rstar_match + tangent*rho`
+at retained checkpoints along a constructed map.
+
+This is the direct test that the coordinate solve produced the contour it was
+asked for. It is what distinguishes "the horizon expansion is inadequate" from
+"the map is not going where the expansion assumes".
+"""
+function emit_coordinate_identity(
+    ::Type{T},
+    spectral::CF.HomogeneousSpectralContext{T},
+    radius_from_rho,
+    rstar_match::T,
+    tangent::Complex{T},
+    samples,
+    label::String,
+) where {T<:AbstractFloat}
+    maximum_absolute = zero(T)
+    maximum_relative = zero(T)
+    for rho in samples
+        typed_rho = T(rho)
+        radius = Complex{T}(radius_from_rho(typed_rho))
+        isfinite(real(radius)) && isfinite(imag(radius)) || continue
+        expected = complex(rstar_match, zero(T)) + tangent * typed_rho
+        observed = Complex{T}(GSN.rstar_from_r(spectral.a, radius))
+        residual = abs(observed - expected)
+        scale = max(abs(expected), one(T))
+        maximum_absolute = max(maximum_absolute, residual)
+        maximum_relative = max(maximum_relative, residual / scale)
+    end
+    progress_emit("coordinate_identity_checked"; payload=Dict{String,Any}(
+        "contour_label" => label,
+        "maximum_absolute_residual" => string(maximum_absolute),
+        "maximum_relative_residual" => string(maximum_relative),
+        "sample_count" => length(samples),
+    ))
+    return (
+        maximum_absolute=maximum_absolute,
+        maximum_relative=maximum_relative,
     )
 end
 
