@@ -1517,6 +1517,98 @@ class JuliaNumericalControlFailureTests(unittest.TestCase):
     )
 
     @staticmethod
+    def _diagnostics(code: str) -> dict[str, object]:
+        factored = {
+            "reason": code,
+            "precision_bits": 298,
+            "factored_homogeneous_rhs_evaluations": 0,
+            "avoided_ode_scope": "factored-homogeneous-gsn/v1",
+        }
+        if code == "ASYMPTOTIC_SERIES_INVALID":
+            factored["reason"] = "NONFINITE_ASYMPTOTIC_DATA"
+        if code == "INSUFFICIENT_ASYMPTOTIC_PRECISION":
+            return {
+                **factored,
+                "predicted_reliable_digits": "11.25",
+                "required_reliable_digits": "24",
+                "asymptotic_preflight_avoided_ode": True,
+                "asymptotic_preflight_reason": code,
+                "maximum_series_digits_lost": "37.5",
+                "maximum_recurrence_digits_lost": "12.25",
+            }
+        if code in {
+            "ASYMPTOTIC_SERIES_INVALID",
+            "PHYSICAL_SINGULAR_LIMIT",
+            "CARRIER_CHANGE_INCONSISTENT",
+            "INVALID_FACTORED_PROPAGATION_INPUT",
+            "FACTORED_PROPAGATION_PRECISION_MISMATCH",
+            "NONFINITE_FACTORED_PROPAGATION_DATA",
+            "FACTORED_ODE_FAILURE",
+            "NO_VERIFIED_HORIZON_ENDPOINT",
+        }:
+            return factored
+        if code in {
+            "SCATTERING_BASIS_ILL_CONDITIONED",
+            "SCATTERING_CHART_ILL_CONDITIONED",
+        }:
+            return {"reason": code, "precision_bits": 298}
+        if code == "ALGEBRAIC_REPRESENTATION_SINGULAR":
+            return {
+                "reason": "derivative-overflow/v1",
+                "range_status": "derivative-overflow/v1",
+                "operation": "finite-difference-derivative/v1",
+                "axis": "real",
+                "h": "1e-6",
+            }
+        if code == "COORDINATE_INVERSION_STALLED":
+            return {
+                "reason": code,
+                "range_status": "coordinate-inversion-stalled/v1",
+                "operation": "coordinate-inversion/v1",
+                "stall_reason": "microscopic-step",
+                "ode_leg": "r_from_rho_real_inner",
+                "ode_t_current": "-1e-11",
+                "ode_t_end": "-100",
+                "ode_span_abs": "100",
+                "ode_span_fraction": "1e-13",
+                "ode_rhs_evaluations": 200000,
+                "ode_accepted_steps": 12500,
+                "ode_last_accepted_step_abs": "8.1e-17",
+                "ode_min_accepted_step_abs": "8.0e-17",
+                "elapsed_leg_seconds": 8.75,
+            }
+        if code == "DETERMINANT_UNCERTAINTY_TOO_LARGE":
+            return {
+                "determinant_abs": "1e-28",
+                "determinant_error_abs": "2e-18",
+                "correction_upper_bound": "1.1e-18",
+                "correction_without_error": "5e-29",
+                "root_correction_tolerance": "1e-18",
+                "derivative_lower_bound_abs": "2",
+            }
+        if code == "FINITE_DIFFERENCE_NOISE_LIMIT":
+            return {
+                "nominal_step": "1e-6",
+                "minimum_step": "1e-8",
+                "maximum_step": "1e-4",
+                "attempts": [{
+                    "h": "1e-6",
+                    "real_step_convergent": False,
+                    "complex_axis_consistent": True,
+                    "noise_resolved": False,
+                    "derivative_abs": "2.4",
+                    "derivative_uncertainty_abs": "1e-8",
+                    "base_derivative_error_abs": "2e-8",
+                    "half_derivative_error_abs": "3e-8",
+                    "double_derivative_error_abs": "4e-8",
+                    "imaginary_derivative_error_abs": "5e-8",
+                    "derivative_error_abs": "3e-8",
+                    "accepted": False,
+                }],
+            }
+        raise AssertionError(f"missing diagnostic fixture for {code}")
+
+    @staticmethod
     def _details(code: str, *, include_identity: bool = True):
         policy = julia_backend._execution_resource_policy()
         failure = {
@@ -1524,16 +1616,11 @@ class JuliaNumericalControlFailureTests(unittest.TestCase):
             "failure_class": "CONTROL",
             "retryable": code == "INSUFFICIENT_ASYMPTOTIC_PRECISION",
             "stage": control_failure_stage(code),
-            "diagnostics": {
-                "predicted_reliable_digits": "11.25",
-                "required_reliable_digits": "24",
-                "asymptotic_preflight_avoided_ode": True,
-                "asymptotic_preflight_reason": (
-                    "INSUFFICIENT_ASYMPTOTIC_PRECISION"
-                ),
-                "factored_homogeneous_rhs_evaluations": 0,
-                "avoided_ode_scope": "factored-homogeneous-gsn/v1",
-            },
+            "diagnostics": (
+                JuliaNumericalControlFailureTests._diagnostics(code)
+                if code in JuliaNumericalControlFailureTests.CODES
+                else {"reason": code}
+            ),
         }
         if include_identity:
             failure["execution_resource_policy"] = policy
@@ -1699,6 +1786,52 @@ class JuliaNumericalControlFailureTests(unittest.TestCase):
                     details["failure"].pop("diagnostics")
                 else:
                     details["failure"]["diagnostics"] = diagnostics
+                julia_backend._require_worker_resource_identity(details, policy)
+                with self.assertRaises(JuliaResponseBackendError) as raised:
+                    julia_backend._raise_worker_failure(details)
+                self.assertIs(type(raised.exception), JuliaResponseBackendError)
+
+    def test_each_code_rejects_arbitrary_or_structurally_mutated_diagnostics(self):
+        """Catches treating a code label as a substitute for its evidence."""
+
+        for code in self.CODES:
+            baseline = self._diagnostics(code)
+            mutations = {
+                "arbitrary": {"anything": "goes"},
+                "missing_field": {
+                    key: value
+                    for index, (key, value) in enumerate(baseline.items())
+                    if index != 0
+                },
+                "unexpected_field": {**baseline, "unreviewed": True},
+            }
+            for label, diagnostics in mutations.items():
+                with self.subTest(code=code, mutation=label):
+                    policy, details = self._details(code)
+                    details["failure"]["diagnostics"] = diagnostics
+                    julia_backend._require_worker_resource_identity(
+                        details, policy
+                    )
+                    with self.assertRaises(
+                        JuliaResponseBackendError
+                    ) as raised:
+                        julia_backend._raise_worker_failure(details)
+                    self.assertIs(
+                        type(raised.exception), JuliaResponseBackendError
+                    )
+
+    def test_each_code_rejects_a_stage_it_cannot_emit_from(self):
+        """Catches relabelling diagnostics as a different pipeline failure."""
+
+        for code in self.CODES:
+            with self.subTest(code=code):
+                policy, details = self._details(code)
+                current = details["failure"]["stage"]
+                details["failure"]["stage"] = (
+                    "coordinate-inversion"
+                    if current != "coordinate-inversion"
+                    else "finite-difference"
+                )
                 julia_backend._require_worker_resource_identity(details, policy)
                 with self.assertRaises(JuliaResponseBackendError) as raised:
                     julia_backend._raise_worker_failure(details)

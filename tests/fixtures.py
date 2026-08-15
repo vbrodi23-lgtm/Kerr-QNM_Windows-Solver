@@ -293,6 +293,7 @@ CONTROL_FAILURE_STAGE_FOR_CODE = {
     "NO_VERIFIED_HORIZON_ENDPOINT": "horizon-endpoint-geometry",
     "INSUFFICIENT_ASYMPTOTIC_PRECISION": "asymptotic-preflight",
     "ASYMPTOTIC_SERIES_INVALID": "asymptotic-preflight",
+    "ALGEBRAIC_REPRESENTATION_SINGULAR": "finite-difference",
     "FINITE_DIFFERENCE_NOISE_LIMIT": "finite-difference",
     "DETERMINANT_UNCERTAINTY_TOO_LARGE": "root-authentication",
     "SCATTERING_BASIS_ILL_CONDITIONED": "scattering-extraction",

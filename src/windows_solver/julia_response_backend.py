@@ -1197,6 +1197,461 @@ CONTROL_FAILURE_STAGES = frozenset({
 })
 
 
+_FACTORED_DIAGNOSTIC_FIELDS = frozenset({
+    "reason",
+    "precision_bits",
+    "factored_homogeneous_rhs_evaluations",
+    "avoided_ode_scope",
+})
+_FACTORED_FAILURE_STAGES = {
+    "ASYMPTOTIC_SERIES_INVALID": "asymptotic-preflight",
+    "PHYSICAL_SINGULAR_LIMIT": "homogeneous-propagation",
+    "CARRIER_CHANGE_INCONSISTENT": "homogeneous-propagation",
+    "INVALID_FACTORED_PROPAGATION_INPUT": "homogeneous-propagation",
+    "FACTORED_PROPAGATION_PRECISION_MISMATCH": "homogeneous-propagation",
+    "NONFINITE_FACTORED_PROPAGATION_DATA": "homogeneous-propagation",
+    "FACTORED_ODE_FAILURE": "homogeneous-propagation",
+    "NO_VERIFIED_HORIZON_ENDPOINT": "horizon-endpoint-geometry",
+}
+_ASYMPTOTIC_SERIES_INVALID_REASONS = frozenset({
+    "INVALID_ASYMPTOTIC_INPUT",
+    "PRECISION_MISMATCH",
+    "NONFINITE_ASYMPTOTIC_DATA",
+})
+
+
+def _has_exact_fields(
+    value: Mapping[str, object], fields: frozenset[str]
+) -> bool:
+    return set(value) == fields
+
+
+def _is_nonnegative_int(value: object) -> bool:
+    return type(value) is int and value >= 0
+
+
+def _is_positive_int(value: object) -> bool:
+    return type(value) is int and value > 0
+
+
+def _diagnostic_decimal(
+    diagnostics: Mapping[str, object],
+    name: str,
+    *,
+    nonnegative: bool = False,
+    positive: bool = False,
+) -> Decimal | None:
+    try:
+        value = _finite_decimal_text(
+            diagnostics.get(name), f"failure {name}", nonnegative=nonnegative
+        )
+    except JuliaResponseBackendError:
+        return None
+    if positive and value <= 0:
+        return None
+    return value
+
+
+def _valid_factored_diagnostics(
+    code: str, stage: object, diagnostics: Mapping[str, object]
+) -> bool:
+    if stage != _FACTORED_FAILURE_STAGES.get(code):
+        return False
+    if not _has_exact_fields(diagnostics, _FACTORED_DIAGNOSTIC_FIELDS):
+        return False
+    reason = diagnostics.get("reason")
+    if code == "ASYMPTOTIC_SERIES_INVALID":
+        if reason not in _ASYMPTOTIC_SERIES_INVALID_REASONS:
+            return False
+    elif reason != code:
+        return False
+    rhs = diagnostics.get("factored_homogeneous_rhs_evaluations")
+    return (
+        _is_positive_int(diagnostics.get("precision_bits"))
+        and _is_nonnegative_int(rhs)
+        and diagnostics.get("avoided_ode_scope")
+        == "factored-homogeneous-gsn/v1"
+        and (code != "NO_VERIFIED_HORIZON_ENDPOINT" or rhs == 0)
+    )
+
+
+def _valid_insufficient_precision_diagnostics(
+    stage: object, diagnostics: Mapping[str, object]
+) -> bool:
+    fields = _FACTORED_DIAGNOSTIC_FIELDS | {
+        "predicted_reliable_digits",
+        "required_reliable_digits",
+        "asymptotic_preflight_avoided_ode",
+        "asymptotic_preflight_reason",
+        "maximum_series_digits_lost",
+        "maximum_recurrence_digits_lost",
+    }
+    if stage != "asymptotic-preflight" or not _has_exact_fields(
+        diagnostics, frozenset(fields)
+    ):
+        return False
+    predicted = _diagnostic_decimal(
+        diagnostics, "predicted_reliable_digits"
+    )
+    required = _diagnostic_decimal(
+        diagnostics, "required_reliable_digits", positive=True
+    )
+    series_loss = _diagnostic_decimal(
+        diagnostics, "maximum_series_digits_lost", nonnegative=True
+    )
+    recurrence_loss = _diagnostic_decimal(
+        diagnostics, "maximum_recurrence_digits_lost", nonnegative=True
+    )
+    return (
+        predicted is not None
+        and required is not None
+        and predicted < required
+        and series_loss is not None
+        and recurrence_loss is not None
+        and diagnostics.get("reason")
+        == "INSUFFICIENT_ASYMPTOTIC_PRECISION"
+        and _is_positive_int(diagnostics.get("precision_bits"))
+        and diagnostics.get("factored_homogeneous_rhs_evaluations") == 0
+        and diagnostics.get("avoided_ode_scope")
+        == "factored-homogeneous-gsn/v1"
+        and diagnostics.get("asymptotic_preflight_avoided_ode") is True
+        and diagnostics.get("asymptotic_preflight_reason")
+        == "INSUFFICIENT_ASYMPTOTIC_PRECISION"
+    )
+
+
+def _valid_scattering_diagnostics(
+    code: str, stage: object, diagnostics: Mapping[str, object]
+) -> bool:
+    expected_stage = (
+        "scattering-extraction"
+        if code == "SCATTERING_BASIS_ILL_CONDITIONED"
+        else "determinant-chart"
+    )
+    if stage != expected_stage:
+        return False
+    package_fields = frozenset({"reason", "precision_bits"})
+    if _has_exact_fields(diagnostics, package_fields):
+        return (
+            diagnostics.get("reason") == code
+            and _is_positive_int(diagnostics.get("precision_bits"))
+        )
+    if code != "SCATTERING_CHART_ILL_CONDITIONED" or not _has_exact_fields(
+        diagnostics,
+        frozenset({
+            "chart_denominator_abs",
+            "chart_scale_abs",
+            "chart_relative_margin",
+        }),
+    ):
+        return False
+    denominator = _diagnostic_decimal(
+        diagnostics, "chart_denominator_abs", positive=True
+    )
+    scale = _diagnostic_decimal(diagnostics, "chart_scale_abs", positive=True)
+    margin = _diagnostic_decimal(
+        diagnostics, "chart_relative_margin", positive=True
+    )
+    return denominator is not None and scale is not None and margin is not None
+
+
+def _valid_coordinate_stall_diagnostics(
+    stage: object, diagnostics: Mapping[str, object]
+) -> bool:
+    fields = frozenset({
+        "reason",
+        "range_status",
+        "operation",
+        "stall_reason",
+        "ode_leg",
+        "ode_t_current",
+        "ode_t_end",
+        "ode_span_abs",
+        "ode_span_fraction",
+        "ode_rhs_evaluations",
+        "ode_accepted_steps",
+        "ode_last_accepted_step_abs",
+        "ode_min_accepted_step_abs",
+        "elapsed_leg_seconds",
+    })
+    if stage != "coordinate-inversion" or not _has_exact_fields(
+        diagnostics, fields
+    ):
+        return False
+    if (
+        diagnostics.get("reason") != "COORDINATE_INVERSION_STALLED"
+        or diagnostics.get("range_status")
+        != "coordinate-inversion-stalled/v1"
+        or diagnostics.get("operation") != "coordinate-inversion/v1"
+        or not isinstance(diagnostics.get("stall_reason"), str)
+        or not diagnostics["stall_reason"]
+        or not isinstance(diagnostics.get("ode_leg"), str)
+        or not diagnostics["ode_leg"].startswith("r_from_rho")
+        or not _is_nonnegative_int(diagnostics.get("ode_rhs_evaluations"))
+        or not _is_nonnegative_int(diagnostics.get("ode_accepted_steps"))
+    ):
+        return False
+    for name in ("ode_t_current", "ode_t_end"):
+        if _diagnostic_decimal(diagnostics, name) is None:
+            return False
+    if _diagnostic_decimal(
+        diagnostics, "ode_span_abs", positive=True
+    ) is None:
+        return False
+    for name in (
+        "ode_span_fraction",
+        "ode_last_accepted_step_abs",
+        "ode_min_accepted_step_abs",
+    ):
+        value = diagnostics.get(name)
+        if value is not None and _diagnostic_decimal(
+            diagnostics, name, nonnegative=True
+        ) is None:
+            return False
+    elapsed = diagnostics.get("elapsed_leg_seconds")
+    try:
+        elapsed_seconds = _finite_text(elapsed, "failure elapsed_leg_seconds")
+    except JuliaResponseBackendError:
+        return False
+    return elapsed_seconds >= 0
+
+
+def _valid_finite_difference_noise_diagnostics(
+    stage: object, diagnostics: Mapping[str, object]
+) -> bool:
+    fields = frozenset({
+        "nominal_step",
+        "minimum_step",
+        "maximum_step",
+        "attempts",
+    })
+    if stage != "finite-difference" or not _has_exact_fields(
+        diagnostics, fields
+    ):
+        return False
+    nominal = _diagnostic_decimal(diagnostics, "nominal_step", positive=True)
+    minimum = _diagnostic_decimal(diagnostics, "minimum_step", positive=True)
+    maximum = _diagnostic_decimal(diagnostics, "maximum_step", positive=True)
+    attempts = diagnostics.get("attempts")
+    if (
+        nominal is None
+        or minimum is None
+        or maximum is None
+        or not minimum <= nominal <= maximum
+        or not isinstance(attempts, list)
+        or not 1 <= len(attempts) <= 64
+    ):
+        return False
+    attempt_fields = frozenset({
+        "h",
+        "real_step_convergent",
+        "complex_axis_consistent",
+        "noise_resolved",
+        "derivative_abs",
+        "derivative_uncertainty_abs",
+        "base_derivative_error_abs",
+        "half_derivative_error_abs",
+        "double_derivative_error_abs",
+        "imaginary_derivative_error_abs",
+        "derivative_error_abs",
+        "accepted",
+    })
+    numeric_fields = attempt_fields - {
+        "real_step_convergent",
+        "complex_axis_consistent",
+        "noise_resolved",
+        "accepted",
+    }
+    for attempt in attempts:
+        if not isinstance(attempt, Mapping) or not _has_exact_fields(
+            attempt, attempt_fields
+        ):
+            return False
+        if any(
+            type(attempt.get(name)) is not bool
+            for name in (
+                "real_step_convergent",
+                "complex_axis_consistent",
+                "noise_resolved",
+                "accepted",
+            )
+        ):
+            return False
+        for name in numeric_fields:
+            if _diagnostic_decimal(
+                attempt,
+                name,
+                nonnegative=True,
+                positive=name == "h",
+            ) is None:
+                return False
+        h = _diagnostic_decimal(attempt, "h", positive=True)
+        if h is None or not minimum <= h <= maximum:
+            return False
+        if attempt["derivative_error_abs"] != attempt[
+            "half_derivative_error_abs"
+        ]:
+            return False
+        gates_pass = (
+            attempt["real_step_convergent"]
+            and attempt["complex_axis_consistent"]
+            and attempt["noise_resolved"]
+        )
+        if attempt["accepted"] is not gates_pass or attempt["accepted"]:
+            return False
+    return True
+
+
+def _valid_determinant_uncertainty_diagnostics(
+    stage: object, diagnostics: Mapping[str, object]
+) -> bool:
+    if stage != "root-authentication":
+        return False
+    newton_fields = frozenset({
+        "determinant_abs",
+        "determinant_error_abs",
+        "derivative_abs",
+        "derivative_error_abs",
+        "derivative_lower_bound_abs",
+        "frequency_step",
+    })
+    authenticated_derivative_fields = newton_fields | {
+        "derivative_uncertainty_abs"
+    }
+    small_determinant_fields = frozenset({
+        "determinant_abs",
+        "determinant_error_abs",
+        "correction_upper_bound",
+        "correction_without_error",
+        "root_correction_tolerance",
+        "derivative_lower_bound_abs",
+    })
+    fields = frozenset(diagnostics)
+    if fields in {newton_fields, authenticated_derivative_fields}:
+        for name in fields - {"derivative_lower_bound_abs"}:
+            if _diagnostic_decimal(
+                diagnostics,
+                name,
+                nonnegative=True,
+                positive=name == "frequency_step",
+            ) is None:
+                return False
+        lower = _diagnostic_decimal(
+            diagnostics, "derivative_lower_bound_abs"
+        )
+        return lower is not None and lower <= 0
+    if fields != small_determinant_fields:
+        return False
+    values = {
+        name: _diagnostic_decimal(
+            diagnostics,
+            name,
+            nonnegative=True,
+            positive=name
+            in {"root_correction_tolerance", "derivative_lower_bound_abs"},
+        )
+        for name in small_determinant_fields
+    }
+    if any(value is None for value in values.values()):
+        return False
+    return (
+        values["correction_upper_bound"]
+        > values["root_correction_tolerance"]
+        and values["correction_without_error"]
+        <= values["root_correction_tolerance"]
+    )
+
+
+def _valid_algebraic_singularity_diagnostics(
+    stage: object, diagnostics: Mapping[str, object]
+) -> bool:
+    if _has_exact_fields(diagnostics, _FACTORED_DIAGNOSTIC_FIELDS):
+        return (
+            stage == "homogeneous-propagation"
+            and diagnostics.get("reason")
+            == "ALGEBRAIC_REPRESENTATION_SINGULAR"
+            and _is_positive_int(diagnostics.get("precision_bits"))
+            and _is_nonnegative_int(
+                diagnostics.get("factored_homogeneous_rhs_evaluations")
+            )
+            and diagnostics.get("avoided_ode_scope")
+            == "factored-homogeneous-gsn/v1"
+        )
+    fd_fields = frozenset({"reason", "range_status", "operation", "axis", "h"})
+    if _has_exact_fields(diagnostics, fd_fields):
+        h = _diagnostic_decimal(diagnostics, "h", positive=True)
+        return (
+            stage == "finite-difference"
+            and isinstance(diagnostics.get("reason"), str)
+            and diagnostics["reason"]
+            and diagnostics.get("range_status") == diagnostics["reason"]
+            and diagnostics.get("operation")
+            == "finite-difference-derivative/v1"
+            and diagnostics.get("axis") in {"real", "imaginary"}
+            and h is not None
+        )
+    chart_fields = frozenset({"chart_denominator_abs", "chart_scale_abs"})
+    if _has_exact_fields(diagnostics, chart_fields):
+        denominator = _diagnostic_decimal(
+            diagnostics, "chart_denominator_abs", nonnegative=True
+        )
+        scale = _diagnostic_decimal(
+            diagnostics, "chart_scale_abs", nonnegative=True
+        )
+        return (
+            stage == "determinant-chart"
+            and denominator == 0
+            and scale is not None
+        )
+    guard_fields = frozenset({
+        "guard_precision_digits",
+        "guard_working_precision_bits",
+        "determinant_abs",
+        "guard_determinant_abs",
+    })
+    if _has_exact_fields(diagnostics, guard_fields):
+        return (
+            stage == "determinant-chart"
+            and _is_positive_int(diagnostics.get("guard_precision_digits"))
+            and _is_positive_int(
+                diagnostics.get("guard_working_precision_bits")
+            )
+            and isinstance(diagnostics.get("determinant_abs"), str)
+            and isinstance(diagnostics.get("guard_determinant_abs"), str)
+        )
+    policy_base = frozenset({
+        "reason",
+        "range_status",
+        "operation",
+        "axis",
+        "h",
+        "frequency_step",
+    })
+    policy_wide = policy_base | {
+        "frequency_step_minimum",
+        "frequency_step_maximum",
+    }
+    if frozenset(diagnostics) not in {policy_base, policy_wide}:
+        return False
+    return (
+        stage in {"request-policy", "determinant-chart"}
+        and diagnostics.get("reason") == "INVALID_FREQUENCY_STEP"
+        and diagnostics.get("range_status") == "invalid-frequency-step/v1"
+        and diagnostics.get("operation")
+        == "finite-difference-request-policy/v1"
+        and diagnostics.get("axis") == "request-policy"
+        and all(
+            isinstance(diagnostics.get(name), str)
+            for name in frozenset(diagnostics) - {
+                "reason",
+                "range_status",
+                "operation",
+                "axis",
+            }
+        )
+    )
+
+
 def _valid_numerical_control_diagnostics(
     failure: Mapping[str, object],
 ) -> bool:
@@ -1211,34 +1666,30 @@ def _valid_numerical_control_diagnostics(
     diagnostics = failure.get("diagnostics")
     if not isinstance(diagnostics, Mapping) or not diagnostics:
         return False
-    if failure.get("stage") not in CONTROL_FAILURE_STAGES:
+    stage = failure.get("stage")
+    if stage not in CONTROL_FAILURE_STAGES:
         return False
     code = failure.get("failure_code")
-    if code != "INSUFFICIENT_ASYMPTOTIC_PRECISION":
-        return True
-    try:
-        predicted_reliable_digits = _finite_decimal_text(
-            diagnostics.get("predicted_reliable_digits"),
-            "failure predicted_reliable_digits",
-        )
-        required_reliable_digits = _finite_decimal_text(
-            diagnostics.get("required_reliable_digits"),
-            "failure required_reliable_digits",
-            nonnegative=True,
-        )
-    except JuliaResponseBackendError:
+    if not isinstance(code, str):
         return False
-    return (
-        predicted_reliable_digits < required_reliable_digits
-        and diagnostics.get("asymptotic_preflight_avoided_ode") is True
-        and diagnostics.get("asymptotic_preflight_reason") == code
-        and type(
-            diagnostics.get("factored_homogeneous_rhs_evaluations")
-        ) is int
-        and diagnostics["factored_homogeneous_rhs_evaluations"] == 0
-        and diagnostics.get("avoided_ode_scope")
-        == "factored-homogeneous-gsn/v1"
-    )
+    if code in _FACTORED_FAILURE_STAGES:
+        return _valid_factored_diagnostics(code, stage, diagnostics)
+    if code == "INSUFFICIENT_ASYMPTOTIC_PRECISION":
+        return _valid_insufficient_precision_diagnostics(stage, diagnostics)
+    if code in {
+        "SCATTERING_BASIS_ILL_CONDITIONED",
+        "SCATTERING_CHART_ILL_CONDITIONED",
+    }:
+        return _valid_scattering_diagnostics(code, stage, diagnostics)
+    if code == "COORDINATE_INVERSION_STALLED":
+        return _valid_coordinate_stall_diagnostics(stage, diagnostics)
+    if code == "FINITE_DIFFERENCE_NOISE_LIMIT":
+        return _valid_finite_difference_noise_diagnostics(stage, diagnostics)
+    if code == "DETERMINANT_UNCERTAINTY_TOO_LARGE":
+        return _valid_determinant_uncertainty_diagnostics(stage, diagnostics)
+    if code == "ALGEBRAIC_REPRESENTATION_SINGULAR":
+        return _valid_algebraic_singularity_diagnostics(stage, diagnostics)
+    return False
 
 
 def _timeout_worker_failure_details(
