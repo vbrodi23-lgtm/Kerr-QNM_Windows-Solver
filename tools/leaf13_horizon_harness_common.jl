@@ -324,8 +324,32 @@ function derivative_ladder_execution(request, step_exponents)
                             axis=axis,
                             authenticate_controls=true,
                         )
-                    lower_bound_abs = abs(derivative) -
-                        propagated_error_abs
+                    candidate = derivative_authentication_candidate(
+                        derivative,
+                        propagated_error_abs,
+                        zero(BigFloat),
+                        h,
+                        axis,
+                    )
+                    authentication = candidate.authentication
+                    authentication === nothing && throw(
+                        finite_difference_noise_limit(
+                            request,
+                            h,
+                            h,
+                            h,
+                            [Dict{String,Any}(
+                                "h" => string(h),
+                                "axis" => axis,
+                                "noise_resolved" => false,
+                                "derivative_abs" => string(abs(derivative)),
+                                "derivative_error_abs" =>
+                                    string(propagated_error_abs),
+                                "derivative_uncertainty_abs" => "0.0",
+                                "accepted" => false,
+                            )],
+                        )
+                    )
                     push!(results, Dict{String,Any}(
                         "step_exponent" => exponent,
                         "h" => string(h),
@@ -336,8 +360,10 @@ function derivative_ladder_execution(request, step_exponents)
                         "derivative_abs" => string(abs(derivative)),
                         "propagated_error_abs" =>
                             string(propagated_error_abs),
+                        "step_disagreement_abs" =>
+                            string(authentication.step_disagreement_abs),
                         "derivative_lower_bound_abs" =>
-                            string(lower_bound_abs),
+                            string(authentication.lower_bound_abs),
                         "kappa_fd" => string(diagnostics.kappa),
                         "finite_difference_digits_lost" =>
                             string(diagnostics.finite_difference_digits_lost),

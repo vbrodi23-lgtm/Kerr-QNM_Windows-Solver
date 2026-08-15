@@ -28,6 +28,15 @@ class RegularisedGsnWorkerSourceTests(unittest.TestCase):
     def test_leaf13_harnesses_share_the_canonical_determinant_api(self) -> None:
         self.assertIn("module Leaf13HorizonHarnessCommon", self.harness_common)
         self.assertIn("determinant_error_abs(T, evaluation)", self.harness_common)
+        self.assertIn(
+            "derivative_authentication_candidate(", self.harness_common
+        )
+        self.assertIn(
+            "authentication.lower_bound_abs", self.harness_common
+        )
+        self.assertNotIn(
+            "lower_bound_abs = abs(derivative) -", self.harness_common
+        )
         self.assertNotIn("evaluation.numerical_error_abs", self.calibration)
         self.assertNotIn("evaluation.numerical_error_abs", self.benchmark)
         self.assertNotIn("include_string", self.calibration)
