@@ -19,8 +19,10 @@ export ScatteringFailureReason, ScatteringExtractionError
 export INVALID_SCATTERING_INPUT, SCATTERING_PRECISION_MISMATCH
 export NONFINITE_SCATTERING_DATA, SCATTERING_BASIS_ILL_CONDITIONED
 export SCATTERING_CHART_ILL_CONDITIONED
-export build_common_horizon_basis
+export build_common_horizon_basis, build_match_horizon_basis
 export solve_scaled_factored_scattering
+export solve_scaled_horizon_basis_at_match
+export HORIZON_BASIS_AT_MATCH_EXTRACTION_ID
 export unscaled_cramer_scattering_coefficients
 export ScatteringChartErrorInputs, DeterminantChartAssessment
 export DeterminantChartEvaluation
@@ -38,6 +40,8 @@ _DEFAULTTOLERANCE = 1e-12
 
 const HOMOGENEOUS_REPRESENTATION_ID = "factored-plane-wave-gsn/v1"
 const SCATTERING_EXTRACTION_ID = "scaled-factored-horizon-basis/v1"
+const HORIZON_BASIS_AT_MATCH_EXTRACTION_ID =
+    horizon_basis_at_match_extraction_id
 const HORIZON_DETERMINANT_CHART_ID =
     "cinc-over-cref-minus-reflectivity/v1"
 const BASIS_CONDITION_ESTIMATE_KIND =
@@ -595,6 +599,227 @@ function build_common_horizon_basis(
     ))
 end
 
+"""
+    build_match_horizon_basis(ingoing_state, ingoing_carrier,
+                              outgoing_state, outgoing_carrier,
+                              match_radius, precision_bits)
+
+Build the horizon solution basis from two *propagated* horizon branches that
+have already been integrated to the matching point `rho = 0`.
+
+This is the match-side counterpart of [`build_common_horizon_basis`], which
+builds the basis from asymptotic series at the inner endpoint. Here both
+columns are ODE endpoints, so no series regularity evidence exists to check;
+what is checked instead is that the two carriers are genuine horizon-ingoing
+and horizon-outgoing carriers sharing one convention, wave number, and match
+point, exactly as the inner-endpoint builder requires.
+
+Column 2 is changed into column 1's carrier at `rho = 0`, so the returned basis
+is expressed in a single common carrier and can be consumed by
+[`solve_scaled_horizon_basis_at_match`].
+"""
+function build_match_horizon_basis(
+    ingoing_state::FactoredEndpointState{T},
+    ingoing_carrier::PlaneWaveCarrier{T},
+    outgoing_state::FactoredEndpointState{T},
+    outgoing_carrier::PlaneWaveCarrier{T},
+    match_radius::Complex{T},
+    precision_bits::Int,
+)::CommonCarrierHorizonBasis{T} where {T<:AbstractFloat}
+    return _with_scattering_precision(T, precision_bits) do
+        ingoing_carrier.kind == HORIZON_INGOING ||
+            throw(_scattering_error(
+                INVALID_SCATTERING_INPUT,
+                precision_bits,
+                "match-basis column 1 carrier must be horizon ingoing (Cref)",
+            ))
+        outgoing_carrier.kind == HORIZON_OUTGOING ||
+            throw(_scattering_error(
+                INVALID_SCATTERING_INPUT,
+                precision_bits,
+                "match-basis column 2 carrier must be horizon outgoing (Cinc)",
+            ))
+        _assert_scattering_carrier(
+            ingoing_carrier, precision_bits, "match-basis ingoing carrier"
+        )
+        _assert_scattering_carrier(
+            outgoing_carrier, precision_bits, "match-basis outgoing carrier"
+        )
+        full_convention_equal(
+            ingoing_carrier.convention, outgoing_carrier.convention
+        ) || throw(_scattering_error(
+            INVALID_SCATTERING_INPUT,
+            precision_bits,
+            "match-basis carriers do not share one branch convention",
+        ))
+        isequal(
+            ingoing_carrier.wave_number, outgoing_carrier.wave_number
+        ) && isequal(
+            ingoing_carrier.rstar_match, outgoing_carrier.rstar_match
+        ) || throw(_scattering_error(
+            INVALID_SCATTERING_INPUT,
+            precision_bits,
+            "match-basis carriers differ in match point or wave number",
+        ))
+        _assert_scattering_state(
+            ingoing_state, precision_bits, "match-basis ingoing column"
+        )
+        _assert_scattering_state(
+            outgoing_state, precision_bits, "match-basis outgoing column"
+        )
+
+        rho_endpoint = zero(T)
+        column_2 = try
+            change_carrier(
+                outgoing_state,
+                outgoing_carrier,
+                ingoing_carrier,
+                rho_endpoint,
+            )
+        catch error
+            error isa ArgumentError || rethrow()
+            detail = sprint(showerror, error)
+            reason = occursin("nonfinite", detail) ||
+                occursin("underflow", detail) ?
+                NONFINITE_SCATTERING_DATA : INVALID_SCATTERING_INPUT
+            throw(_scattering_error(
+                reason,
+                precision_bits,
+                "match-basis outgoing-to-ingoing carrier change failed: $detail",
+            ))
+        end
+        carrier_change = try
+            carrier_change_diagnostics(
+                outgoing_state,
+                column_2,
+                outgoing_carrier,
+                ingoing_carrier,
+                rho_endpoint,
+            )
+        catch error
+            error isa ArgumentError || rethrow()
+            throw(_scattering_error(
+                NONFINITE_SCATTERING_DATA,
+                precision_bits,
+                "match-basis carrier-change diagnostics failed: " *
+                sprint(showerror, error),
+            ))
+        end
+        _assert_scattering_state(
+            column_2, precision_bits, "match-basis common-carrier column 2"
+        )
+        for (name, value, nonnegative) in (
+            ("match-basis carrier-change X error",
+                carrier_change.X_reconstruction_error, true),
+            ("match-basis carrier-change Xrho error",
+                carrier_change.Xrho_reconstruction_error, true),
+            ("match-basis carrier ratio magnitude",
+                carrier_change.carrier_ratio_magnitude, true),
+            ("match-basis carrier ratio phase",
+                carrier_change.carrier_ratio_phase, false),
+        )
+            _assert_scattering_real(
+                value, precision_bits, name; nonnegative=nonnegative
+            )
+        end
+        carrier_change.carrier_ratio_magnitude > zero(T) ||
+            throw(_scattering_error(
+                NONFINITE_SCATTERING_DATA,
+                precision_bits,
+                "match-basis carrier ratio magnitude must be nonzero",
+            ))
+
+        # TODO: [HUMAN MATH REVIEW REQUIRED — verify the branch-specific plane-wave carriers, the transformed complex-contour GSN equation, the carrier change at ρ=0, the factored horizon basis, and the Cinc/Cref determinant chart against the current GSN amplitude and branch conventions.]
+        return CommonCarrierHorizonBasis{T}(
+            ingoing_state,
+            column_2,
+            ingoing_carrier,
+            outgoing_carrier,
+            rho_endpoint,
+            match_radius,
+            precision_bits,
+            RegularRemainderContract(),
+            carrier_change,
+        )
+    end
+end
+
+function build_match_horizon_basis(
+    ingoing_state::FactoredEndpointState,
+    ingoing_carrier::PlaneWaveCarrier,
+    outgoing_state::FactoredEndpointState,
+    outgoing_carrier::PlaneWaveCarrier,
+    match_radius::Complex,
+    precision_bits::Int,
+)
+    throw(_scattering_error(
+        SCATTERING_PRECISION_MISMATCH,
+        precision_bits,
+        "match-basis states and carriers do not share one exact real component type",
+    ))
+end
+
+"""
+    solve_scaled_horizon_basis_at_match(target, target_carrier, basis)
+
+Recover `Cref` and `Cinc` from a horizon basis expressed at the matching point.
+
+`target` is the physical infinity-outgoing solution factored into the basis
+common carrier (see `FactoredSolutions.factor_physical_match_state`). The two
+basis columns are independently scaled to unit norm before the 2x2 solve, so a
+large magnitude disparity between the ingoing and outgoing columns — which is
+exactly what a near-extremal horizon produces — does not by itself make the
+system look singular.
+
+The returned coefficients carry the full `BasisSolveDiagnostics`: column norms,
+the scaled basis determinant, a Frobenius condition estimate, the basis
+backward error, the matching reconstruction residual, and the carrier-change
+reconstruction errors. Diagnostics are stamped with the
+`scaled-horizon-basis-at-match/v1` extraction identity to distinguish them from
+inner-endpoint extractions.
+"""
+function solve_scaled_horizon_basis_at_match(
+    target::FactoredEndpointState{T},
+    target_carrier::PlaneWaveCarrier{T},
+    basis::CommonCarrierHorizonBasis{T},
+) where {T<:AbstractFloat}
+    return _with_scattering_precision(T, basis.precision_bits) do
+        _assert_scattering_carrier(
+            target_carrier,
+            basis.precision_bits,
+            "horizon match-basis target carrier",
+        )
+        _same_carrier(target_carrier, basis.common_carrier) ||
+            throw(_scattering_error(
+                INVALID_SCATTERING_INPUT,
+                basis.precision_bits,
+                "match-basis target is not in the common horizon-ingoing carrier",
+            ))
+        iszero(basis.rho_endpoint) || throw(_scattering_error(
+            INVALID_SCATTERING_INPUT,
+            basis.precision_bits,
+            "horizon match basis must be expressed at rho = 0",
+        ))
+        return _solve_scaled_factored_scattering_unchecked(
+            target,
+            basis;
+            extraction_id=horizon_basis_at_match_extraction_id,
+        )
+    end
+end
+
+function solve_scaled_horizon_basis_at_match(
+    target::FactoredEndpointState,
+    target_carrier::PlaneWaveCarrier,
+    basis::CommonCarrierHorizonBasis,
+)
+    throw(_scattering_error(
+        SCATTERING_PRECISION_MISMATCH,
+        basis.precision_bits,
+        "match-basis target, carrier, and basis do not share one exact real component type",
+    ))
+end
+
 struct BasisSolveDiagnostics{T<:AbstractFloat}
     precision_bits::Int
     condition_frobenius::T
@@ -799,7 +1024,8 @@ end
 
 function _solve_scaled_factored_scattering_unchecked(
     target::FactoredEndpointState{T},
-    basis::CommonCarrierHorizonBasis{T},
+    basis::CommonCarrierHorizonBasis{T};
+    extraction_id::String=SCATTERING_EXTRACTION_ID,
 )::ScatteringCoefficients{T} where {T<:AbstractFloat}
     precision_bits = basis.precision_bits
     return _with_scattering_precision(T, precision_bits) do
@@ -1085,7 +1311,7 @@ function _solve_scaled_factored_scattering_unchecked(
             legacy_relative_disagreement_cref,
             legacy_relative_disagreement_cinc,
             carrier_change_error,
-            SCATTERING_EXTRACTION_ID,
+            extraction_id,
             scattering_column_convention,
             factored_remainder_state_convention,
         )

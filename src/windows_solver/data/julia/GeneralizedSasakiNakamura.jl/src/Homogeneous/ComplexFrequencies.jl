@@ -50,6 +50,17 @@ export solve_factored_horizon_match_to_inner
 export solve_factored_xup_scattering_endpoint
 export solve_factored_xin_to_match, solve_factored_xup_to_match
 export solve_factored_exterior_matches, reconstruct_factored_match_state
+export RealInnerHorizonContour, HorizonEndpointCandidate
+export RealInnerHorizonEndpoint, VerifiedHorizonEndpoints
+export VerifiedHorizonBasisSolution
+export REAL_INNER_HORIZON_CONTOUR_ID
+export DEFAULT_HORIZON_ENDPOINT_CANDIDATES
+export DEFAULT_MAXIMUM_HORIZON_DISTANCE
+export build_outer_contour_context, build_real_inner_horizon_contour
+export horizon_endpoint_candidates, select_verified_horizon_endpoints
+export prepare_real_inner_horizon_endpoint
+export solve_factored_horizon_branch_to_match
+export solve_verified_horizon_basis_to_match
 
 function _begin_ode_observation(factory, leg, tspan, odealgo)
     factory === nothing && return nothing, nothing
@@ -82,11 +93,20 @@ function solve_r_from_rho(
     reltol=_DEFAULTTOLERANCE, abstol=_DEFAULTTOLERANCE,
     ode_maxiters=10^7,
     ode_observation_factory=nothing, ode_solution_observer=nothing,
-    ode_leg="r_from_rho"
+    ode_leg="r_from_rho",
+    r_at_rho_zero=nothing,
 )
     p = (a=a, beta=beta, sign=sign)
-    # Initial condition at rho = 0
-    r0 = r_from_rstar(a, rs_mp)
+    # Initial condition at rho = 0.
+    #
+    # By construction r_*(0) = rs_mp, so r(0) is the radius whose tortoise
+    # coordinate is rs_mp. When the caller already holds that radius — the
+    # production path always does, because rs_mp was built as
+    # rstar_from_r(a, match_radius) — passing it directly avoids a numerical
+    # inverse round trip that can only lose accuracy. The fallback keeps the
+    # historical behaviour for callers that supply rs_mp alone.
+    r0 = r_at_rho_zero === nothing ?
+        r_from_rstar(a, rs_mp) : r_at_rho_zero
     u0 = SA[dtype(r0)]
 
     rhospan = (0, rho_end)
@@ -115,7 +135,8 @@ function solve_r_from_rho(
     dtype=_DEFAULTDATATYPE, odealgo=_DEFAULTSOLVER,
     reltol=_DEFAULTTOLERANCE, abstol=_DEFAULTTOLERANCE,
     ode_maxiters=10^7,
-    ode_observation_factory=nothing, ode_solution_observer=nothing
+    ode_observation_factory=nothing, ode_solution_observer=nothing,
+    r_at_rho_zero=nothing,
 )
     # Obtain r_from_rho for positive rho
     r_from_rhopos = solve_r_from_rho(
@@ -125,7 +146,8 @@ function solve_r_from_rho(
         ode_maxiters=ode_maxiters,
         ode_observation_factory=ode_observation_factory,
         ode_solution_observer=ode_solution_observer,
-        ode_leg="r_from_rho_positive"
+        ode_leg="r_from_rho_positive",
+        r_at_rho_zero=r_at_rho_zero,
     )
 
     # Obtain r_from_rho for negative rho
@@ -136,7 +158,8 @@ function solve_r_from_rho(
         ode_maxiters=ode_maxiters,
         ode_observation_factory=ode_observation_factory,
         ode_solution_observer=ode_solution_observer,
-        ode_leg="r_from_rho_negative"
+        ode_leg="r_from_rho_negative",
+        r_at_rho_zero=r_at_rho_zero,
     )
 
     # Stitch together the two solutions
@@ -231,6 +254,8 @@ const _FACTORED_DEFAULTSOLVER = AutoVern9(Rosenbrock23(autodiff=false))
     INSUFFICIENT_ASYMPTOTIC_PRECISION = 4
     CARRIER_CHANGE_INCONSISTENT = 5
     FACTORED_ODE_FAILURE = 6
+    NO_VERIFIED_HORIZON_ENDPOINT = 7
+    COORDINATE_INVERSION_STALLED = 8
 end
 
 @enum FactoredODESolveExceptionDisposition begin
@@ -2626,6 +2651,930 @@ function reconstruct_factored_match_state(
 end
 
 # Legacy raw-comparator equation
+#####
+##### Real-inner horizon contour, geometry gate, and horizon basis at match
+#####
+#
+# The frequency-aligned negative contour is chosen so that the *infinity*
+# carrier stays bounded; nothing forces it to approach r_plus.  For sufficiently
+# damped modes it does the opposite and runs off toward complex infinity, which
+# makes every horizon expansion evaluated on it meaningless.  The contour below
+# is built for the horizon instead: it advances r_* along the positive real axis
+# from the matching point, so r_* -> -infinity and therefore r -> r_plus from
+# the exterior as rho becomes more negative.
+#
+#     r_*(rho) = rstar_match + rho,    dr_*/drho = 1,    rho < 0
+#
+# In the underlying coordinate ODE that is beta = 0, sign = +1, tangent = 1+0im.
+
+const REAL_INNER_HORIZON_CONTOUR_ID = real_inner_horizon_contour_id
+const DEFAULT_HORIZON_ENDPOINT_CANDIDATES = (-10, -25, -50, -75, -100)
+const DEFAULT_MAXIMUM_HORIZON_DISTANCE = 0.1
+
+struct RealInnerHorizonContour{T<:AbstractFloat,F}
+    contour_id::String
+    match_radius::T
+    rstar_match::T
+    rho_min::T
+    tangent::Complex{T}
+    radius_from_rho::F
+    precision_bits::Int
+    convention::GSNBranchConvention{T}
+    frozen_branch_cell::GSNBranchCell
+    contour_deformation::ContourAngleDeformation{T}
+end
+
+struct HorizonEndpointCandidate{T<:AbstractFloat}
+    rho::T
+    radius::Complex{T}
+    horizon_distance::T
+    imaginary_radius_abs::T
+    exterior::Bool
+    approaches_horizon::Bool
+    within_maximum_distance::Bool
+    ingoing_adequate::Bool
+    outgoing_adequate::Bool
+    ingoing_evaluation::SeriesEvaluation{T}
+    outgoing_evaluation::SeriesEvaluation{T}
+    ingoing_assessment::AsymptoticConditioningAssessment{T}
+    outgoing_assessment::AsymptoticConditioningAssessment{T}
+end
+
+function _describe_horizon_candidate(candidate::HorizonEndpointCandidate)
+    return string(
+        "rho=", candidate.rho,
+        " distance=", candidate.horizon_distance,
+        " exterior=", candidate.exterior,
+        " approaching=", candidate.approaches_horizon,
+        " within_max=", candidate.within_maximum_distance,
+        " ingoing=", candidate.ingoing_adequate,
+        " outgoing=", candidate.outgoing_adequate,
+    )
+end
+
+function _candidate_adequate(candidate::HorizonEndpointCandidate)
+    return candidate.rho < zero(candidate.rho) &&
+        candidate.exterior &&
+        candidate.approaches_horizon &&
+        candidate.within_maximum_distance &&
+        candidate.ingoing_adequate &&
+        candidate.outgoing_adequate
+end
+
+struct RealInnerHorizonEndpoint{T<:AbstractFloat}
+    branch::CarrierKind
+    state::FactoredEndpointState{T}
+    carrier::PlaneWaveCarrier{T}
+    rho::T
+    radius::Complex{T}
+    horizon_distance::T
+    assessment::AsymptoticConditioningAssessment{T}
+    regularity::RemainderRegularityEvidence{T}
+    required_digits::T
+    precision_bits::Int
+    endpoint_order::Int
+    contour_id::String
+    frozen_branch_cell::GSNBranchCell
+    contour_deformation::ContourAngleDeformation{T}
+end
+
+function _real_inner_endpoint_regularity(
+    branch::CarrierKind,
+    state::FactoredEndpointState{T},
+    carrier::PlaneWaveCarrier{T},
+    rho::T,
+    radius::Complex{T},
+) where {T<:AbstractFloat}
+    raw = reconstruct_state(state, carrier, rho)
+    recovered = factor_state(raw.X, raw.Xrho, carrier, rho)
+    carrier_magnitude = abs(carrier_value(carrier, rho))
+    remainder_norm = abs(state.Y)
+    remainder_derivative_norm = abs(state.Yrho)
+    y_scale = max(remainder_norm, floatmin(T))
+    yrho_scale = max(remainder_derivative_norm, floatmin(T))
+    relative_X_error = abs(recovered.Y - state.Y) / y_scale
+    relative_Xrho_error = abs(recovered.Yrho - state.Yrho) / yrho_scale
+    # The Yrho recovery subtracts q*Y, so its backward residual is measured
+    # against the scale that subtraction actually operates on.
+    backward_scale = max(
+        remainder_derivative_norm,
+        abs(carrier_log_derivative(carrier)) * remainder_norm,
+        floatmin(T),
+    )
+    backward_residual = abs(recovered.Yrho - state.Yrho) / backward_scale
+    carrier_operation_scale = max(
+        one(T),
+        abs(carrier_log_derivative(carrier)) * max(abs(rho), one(T)),
+    )
+    reconstruction_tolerance = T(256) * eps(T) * carrier_operation_scale
+    finite = all(
+        isfinite,
+        (
+            carrier_magnitude,
+            remainder_norm,
+            remainder_derivative_norm,
+            relative_X_error,
+            relative_Xrho_error,
+            backward_residual,
+        ),
+    )
+    return RemainderRegularityEvidence{T}(
+        branch,
+        rho,
+        radius,
+        finite,
+        remainder_norm,
+        remainder_derivative_norm,
+        carrier_magnitude,
+        relative_X_error,
+        relative_Xrho_error,
+        backward_residual,
+        carrier_operation_scale,
+        reconstruction_tolerance,
+    )
+end
+
+struct VerifiedHorizonEndpoints{T<:AbstractFloat}
+    reference::HorizonEndpointCandidate{T}
+    verification::HorizonEndpointCandidate{T}
+    candidates::Vector{HorizonEndpointCandidate{T}}
+    maximum_horizon_distance::T
+    contour_id::String
+end
+
+struct VerifiedHorizonBasisSolution{T<:AbstractFloat}
+    ingoing::FactoredODESolution{T}
+    outgoing::FactoredODESolution{T}
+    ingoing_endpoint::RealInnerHorizonEndpoint{T}
+    outgoing_endpoint::RealInnerHorizonEndpoint{T}
+    rho_endpoint::T
+    horizon_distance::T
+end
+
+"""
+    build_outer_contour_context(spectral, match_radius, rstar_match, rho_out,
+                                radius_from_rho)
+
+Build the contour context used by the infinity-outgoing leg alone.
+
+This is [`build_contour_context`] restricted to the outer half of the map. The
+horizon determinant no longer shares one joined `rho_in < 0 < rho_out` contour
+with the infinity leg, so the outer context is constructed with a nominal
+negative endpoint that no horizon preparation reads.
+"""
+function build_outer_contour_context(
+    spectral::HomogeneousSpectralContext{T},
+    match_radius::T,
+    rstar_match::T,
+    rho_out::T,
+    radius_from_rho::F,
+) where {T<:AbstractFloat,F}
+    rho_out > zero(T) || throw(ArgumentError(
+        "outer contour requires a positive rho_out"
+    ))
+    return build_contour_context(
+        spectral,
+        match_radius,
+        rstar_match,
+        -rho_out,
+        rho_out,
+        radius_from_rho,
+    )
+end
+
+"""
+    build_real_inner_horizon_contour(spectral, match_radius, rho_min,
+                                     radius_from_rho)
+
+Build the horizon-side contour whose radial map genuinely approaches `r_plus`.
+
+`radius_from_rho` must be the solution of the coordinate ODE taken with
+`beta = 0` and `sign = +1`, so that `r_*(rho) = rstar_match + rho`. The
+constructed context is validated the same way the joined contour is: the
+supplied `rstar_match` must equal `rstar_from_r(a, match_radius)` exactly, and
+`radius_from_rho(0)` must reproduce `match_radius`.
+
+No horizon expansion may be evaluated on a contour built any other way; that is
+what [`horizon_endpoint_candidates`] and [`select_verified_horizon_endpoints`]
+enforce before any homogeneous ODE is started.
+"""
+function build_real_inner_horizon_contour(
+    spectral::HomogeneousSpectralContext{T},
+    match_radius::T,
+    rstar_match::T,
+    rho_min::T,
+    radius_from_rho::F,
+) where {T<:AbstractFloat,F}
+    return _translate_factored_failure(
+        T,
+        spectral.precision_bits,
+        "real-inner horizon contour construction",
+    ) do
+        _with_factored_precision(T, spectral.precision_bits) do
+            _assert_spectral_context_provenance(spectral)
+            all(isfinite, (match_radius, rstar_match, rho_min)) ||
+                throw(ArgumentError(
+                    "real-inner contour scalars must be finite"
+                ))
+            all(
+                value -> _factored_precision_matches(
+                    value, spectral.precision_bits
+                ),
+                (match_radius, rstar_match, rho_min),
+            ) || throw(ArgumentError(
+                "real-inner contour scalars do not preserve spectral precision"
+            ))
+            rho_min < zero(T) || throw(ArgumentError(
+                "real-inner horizon contour requires rho_min < 0"
+            ))
+            geometry = stable_horizon_geometry(spectral.a)
+            match_radius > geometry.rplus || throw(ArgumentError(
+                "match radius must lie outside the outer horizon"
+            ))
+            canonical_rstar_match = T(rstar_from_r(
+                spectral.a, match_radius
+            ))
+            _exact_factored_value(
+                rstar_match, canonical_rstar_match
+            ) || throw(ArgumentError(
+                "rstar_match must equal Coordinates.rstar_from_r(a, match_radius)"
+            ))
+            raw_match_radius = radius_from_rho(zero(T))
+            typed_match_radius = Complex{T}(raw_match_radius)
+            _finite_factored_complex(typed_match_radius) ||
+                throw(ArgumentError(
+                    "real-inner radius_from_rho returned a nonfinite match radius"
+                ))
+            _factored_precision_matches(
+                typed_match_radius, spectral.precision_bits
+            ) || throw(ArgumentError(
+                "real-inner radius_from_rho narrowed the match-radius precision"
+            ))
+            match_radius_tolerance = T(256) * eps(T) *
+                max(one(T), abs(match_radius))
+            abs(
+                typed_match_radius - complex(match_radius, zero(T))
+            ) <= match_radius_tolerance || throw(ArgumentError(
+                "real-inner radius_from_rho(0) does not reproduce match_radius"
+            ))
+            tangent = complex(one(T), zero(T))
+            return RealInnerHorizonContour{T,F}(
+                REAL_INNER_HORIZON_CONTOUR_ID,
+                match_radius,
+                canonical_rstar_match,
+                rho_min,
+                tangent,
+                radius_from_rho,
+                spectral.precision_bits,
+                spectral.convention,
+                spectral.frozen_branch_cell,
+                spectral.contour_deformation,
+            )
+        end
+    end
+end
+
+"""
+    horizon_endpoint_candidates(spectral, contour, required_digits;
+                                rho_candidates, maximum_horizon_distance)
+
+Evaluate the bounded candidate set for the horizon endpoint.
+
+For each candidate `rho` the radial map is sampled and the ingoing and outgoing
+horizon series are evaluated and assessed. A candidate is adequate only when all
+of the following hold:
+
+  * `rho < 0`
+  * `Re(r) > r_plus`  — the endpoint is still exterior
+  * `|Im(r)|` is negligible against the horizon distance — the real-inner
+    contour must not have wandered off the real axis
+  * `|r - r_plus|` decreases as `rho` becomes more negative
+  * `|r - r_plus| <= maximum_horizon_distance`
+  * both horizon series pass their preflight at `required_digits`
+
+The radial-approach conditions are evaluated before the series assessments are
+consulted for adequacy, so an escaping contour can never be rescued by a
+different truncation order.
+"""
+function horizon_endpoint_candidates(
+    spectral::HomogeneousSpectralContext{T},
+    contour::RealInnerHorizonContour{T},
+    required_digits::T;
+    rho_candidates=DEFAULT_HORIZON_ENDPOINT_CANDIDATES,
+    maximum_horizon_distance::T=T(DEFAULT_MAXIMUM_HORIZON_DISTANCE),
+) where {T<:AbstractFloat}
+    return _translate_factored_failure(
+        T,
+        spectral.precision_bits,
+        "horizon endpoint candidate evaluation",
+    ) do
+        _with_factored_precision(T, spectral.precision_bits) do
+            _assert_real_inner_contour_provenance(spectral, contour)
+            maximum_horizon_distance > zero(T) || throw(ArgumentError(
+                "maximum horizon distance must be positive"
+            ))
+            isempty(rho_candidates) && throw(ArgumentError(
+                "horizon endpoint candidate set must be nonempty"
+            ))
+            geometry = stable_horizon_geometry(spectral.a)
+            rplus = complex(T(geometry.rplus), zero(T))
+            ingoing_series = _branch_series(spectral.series, HORIZON_INGOING)
+            outgoing_series = _branch_series(
+                spectral.series, HORIZON_OUTGOING
+            )
+            ordered = sort(collect(T.(rho_candidates)); rev=true)
+            candidates = Vector{HorizonEndpointCandidate{T}}()
+            previous_distance = T(Inf)
+            for rho in ordered
+                rho >= contour.rho_min || throw(ArgumentError(
+                    "horizon endpoint candidate lies beyond the contour rho_min"
+                ))
+                radius = Complex{T}(contour.radius_from_rho(rho))
+                _finite_factored_complex(radius) || throw(_factored_error(
+                    T,
+                    NONFINITE_FACTORED_PROPAGATION_DATA,
+                    spectral.precision_bits,
+                    "real-inner radial map returned a nonfinite radius",
+                ))
+                horizon_distance = abs(radius - rplus)
+                imaginary_radius_abs = abs(imag(radius))
+                exterior = real(radius) > T(geometry.rplus)
+                # The real-inner contour is real by construction, so any
+                # imaginary part is numerical drift.  Compare it against the
+                # horizon distance rather than an absolute floor so the test
+                # stays meaningful as the endpoint approaches r_plus.
+                on_real_axis = imaginary_radius_abs <=
+                    sqrt(eps(T)) * max(horizon_distance, one(T))
+                approaches_horizon = horizon_distance < previous_distance
+                within_maximum_distance =
+                    horizon_distance <= maximum_horizon_distance
+                ingoing_evaluation = evaluate_horizon_asymptotic_series(
+                    ingoing_series, radius; order=spectral.endpoint_order
+                )
+                outgoing_evaluation = evaluate_horizon_asymptotic_series(
+                    outgoing_series, radius; order=spectral.endpoint_order
+                )
+                ingoing_assessment = assess_asymptotic_preflight(
+                    ingoing_series, ingoing_evaluation, required_digits
+                )
+                outgoing_assessment = assess_asymptotic_preflight(
+                    outgoing_series, outgoing_evaluation, required_digits
+                )
+                push!(candidates, HorizonEndpointCandidate{T}(
+                    rho,
+                    radius,
+                    horizon_distance,
+                    imaginary_radius_abs,
+                    exterior && on_real_axis,
+                    approaches_horizon,
+                    within_maximum_distance,
+                    ingoing_assessment.adequate,
+                    outgoing_assessment.adequate,
+                    ingoing_evaluation,
+                    outgoing_evaluation,
+                    ingoing_assessment,
+                    outgoing_assessment,
+                ))
+                previous_distance = horizon_distance
+            end
+            return candidates
+        end
+    end
+end
+
+"""
+    select_verified_horizon_endpoints(spectral, candidates;
+                                      maximum_horizon_distance)
+
+Select the reference and verification horizon endpoints.
+
+The reference endpoint is the *nearest* adequate candidate — the one with the
+largest `rho`, hence the shortest homogeneous leg — and the verification
+endpoint is the next deeper adequate candidate. Two adequate endpoints are
+required: one alone cannot supply the endpoint-disagreement term that the
+absolute determinant error is built from.
+
+Throws `NO_VERIFIED_HORIZON_ENDPOINT` when fewer than two candidates are
+adequate, before any homogeneous ODE has been started.
+"""
+function select_verified_horizon_endpoints(
+    spectral::HomogeneousSpectralContext{T},
+    candidates::Vector{HorizonEndpointCandidate{T}};
+    maximum_horizon_distance::T=T(DEFAULT_MAXIMUM_HORIZON_DISTANCE),
+) where {T<:AbstractFloat}
+    adequate = filter(_candidate_adequate, candidates)
+    if length(adequate) < 2
+        detail = isempty(candidates) ? "no candidates were evaluated" :
+            join(map(_describe_horizon_candidate, candidates), "; ")
+        throw(_factored_error(
+            T,
+            NO_VERIFIED_HORIZON_ENDPOINT,
+            spectral.precision_bits,
+            "fewer than two horizon endpoints passed the radial-approach and " *
+            "dual-series gate: " * detail,
+        ))
+    end
+    ordered = sort(adequate; by=candidate -> candidate.rho, rev=true)
+    return VerifiedHorizonEndpoints{T}(
+        ordered[1],
+        ordered[2],
+        candidates,
+        maximum_horizon_distance,
+        REAL_INNER_HORIZON_CONTOUR_ID,
+    )
+end
+
+function _assert_real_inner_contour_provenance(
+    spectral::HomogeneousSpectralContext{T},
+    contour::RealInnerHorizonContour{T},
+) where {T<:AbstractFloat}
+    contour.contour_id == REAL_INNER_HORIZON_CONTOUR_ID || throw(
+        _factored_error(
+            T,
+            INVALID_FACTORED_PROPAGATION_INPUT,
+            spectral.precision_bits,
+            "real-inner horizon contour identity changed",
+        )
+    )
+    contour.precision_bits == spectral.precision_bits || throw(
+        _factored_error(
+            T,
+            FACTORED_PROPAGATION_PRECISION_MISMATCH,
+            spectral.precision_bits,
+            "real-inner horizon contour precision does not match the spectral context",
+        )
+    )
+    contour.frozen_branch_cell == spectral.frozen_branch_cell || throw(
+        _factored_error(
+            T,
+            INVALID_FACTORED_PROPAGATION_INPUT,
+            spectral.precision_bits,
+            "real-inner horizon contour changed the frozen branch cell",
+        )
+    )
+    isequal(contour.tangent, complex(one(T), zero(T))) || throw(
+        _factored_error(
+            T,
+            INVALID_FACTORED_PROPAGATION_INPUT,
+            spectral.precision_bits,
+            "real-inner horizon contour tangent must be exactly 1 + 0im",
+        )
+    )
+    return nothing
+end
+
+"""
+    prepare_real_inner_horizon_endpoint(spectral, contour, candidate, branch,
+                                        required_digits)
+
+Build the seed state and explicit-tangent carrier for one horizon branch at a
+verified endpoint.
+
+The endpoint state is `(Y, dY/drho)` taken from the horizon series evaluation,
+with the radial derivative converted to the contour parameter through
+
+    dY/drho = tangent * (Delta / (r^2 + a^2)) * dY/dr
+
+and the carrier is the horizon carrier rebound to the real-inner tangent (see
+`FactoredSolutions.horizon_carrier_with_explicit_tangent`). An inadequate
+preflight cannot be prepared: the assessment is re-checked here so a caller
+cannot bypass the gate by constructing an endpoint directly.
+"""
+function prepare_real_inner_horizon_endpoint(
+    spectral::HomogeneousSpectralContext{T},
+    contour::RealInnerHorizonContour{T},
+    candidate::HorizonEndpointCandidate{T},
+    branch::CarrierKind,
+    required_digits::T,
+) where {T<:AbstractFloat}
+    return _translate_factored_failure(
+        T,
+        spectral.precision_bits,
+        "real-inner horizon endpoint preparation",
+    ) do
+        _with_factored_precision(T, spectral.precision_bits) do
+            _assert_real_inner_contour_provenance(spectral, contour)
+            (branch === HORIZON_INGOING || branch === HORIZON_OUTGOING) ||
+                throw(_factored_error(
+                    T,
+                    INVALID_FACTORED_PROPAGATION_INPUT,
+                    spectral.precision_bits,
+                    "real-inner endpoint branch must be a horizon branch",
+                ))
+            _candidate_adequate(candidate) || throw(_factored_error(
+                T,
+                NO_VERIFIED_HORIZON_ENDPOINT,
+                spectral.precision_bits,
+                "real-inner endpoint preparation refused an unverified candidate",
+            ))
+            evaluation = branch === HORIZON_INGOING ?
+                candidate.ingoing_evaluation : candidate.outgoing_evaluation
+            assessment = branch === HORIZON_INGOING ?
+                candidate.ingoing_assessment : candidate.outgoing_assessment
+            assessment.adequate || throw(_factored_error(
+                T,
+                INSUFFICIENT_ASYMPTOTIC_PRECISION,
+                spectral.precision_bits,
+                "real-inner horizon seed cannot bypass an inadequate preflight",
+                assessment=assessment,
+            ))
+            radius = candidate.radius
+            radial_factor = Delta(spectral.a, radius) /
+                (radius^2 + complex(spectral.a^2, zero(T)))
+            _finite_factored_complex(radial_factor) || throw(_factored_error(
+                T,
+                NONFINITE_FACTORED_PROPAGATION_DATA,
+                spectral.precision_bits,
+                "real-inner endpoint radial factor is nonfinite",
+            ))
+            state = FactoredEndpointState{T}(
+                Complex{T}(evaluation.series_eval_horner),
+                Complex{T}(
+                    contour.tangent * radial_factor *
+                    evaluation.series_derivative_horner
+                ),
+            )
+            _finite_factored_complex(state.Y) &&
+                _finite_factored_complex(state.Yrho) ||
+                throw(_factored_error(
+                    T,
+                    NONFINITE_FACTORED_PROPAGATION_DATA,
+                    spectral.precision_bits,
+                    "real-inner horizon endpoint state is nonfinite",
+                ))
+            carrier = horizon_carrier_with_explicit_tangent(
+                branch,
+                spectral.p_horizon,
+                contour.rstar_match,
+                spectral.convention,
+                contour.tangent,
+            )
+            regularity = _real_inner_endpoint_regularity(
+                branch, state, carrier, candidate.rho, radius
+            )
+            regularity.finite || throw(_factored_error(
+                T,
+                NONFINITE_FACTORED_PROPAGATION_DATA,
+                spectral.precision_bits,
+                "real-inner horizon endpoint regularity evidence is nonfinite",
+            ))
+            max(
+                regularity.relative_X_reconstruction_error,
+                regularity.Xrho_backward_residual,
+            ) <= regularity.reconstruction_tolerance || throw(
+                _factored_error(
+                    T,
+                    NONFINITE_FACTORED_PROPAGATION_DATA,
+                    spectral.precision_bits,
+                    "real-inner horizon endpoint failed its reconstruction gate",
+                )
+            )
+            return RealInnerHorizonEndpoint{T}(
+                branch,
+                state,
+                carrier,
+                candidate.rho,
+                radius,
+                candidate.horizon_distance,
+                assessment,
+                regularity,
+                required_digits,
+                spectral.precision_bits,
+                spectral.endpoint_order,
+                REAL_INNER_HORIZON_CONTOUR_ID,
+                spectral.frozen_branch_cell,
+                spectral.contour_deformation,
+            )
+        end
+    end
+end
+
+"""
+    solve_factored_horizon_branch_to_match(spectral, contour, endpoint; ...)
+
+Propagate one pure horizon branch from its verified real-inner endpoint to the
+matching point `rho = 0`.
+
+This replaces the mixed `Xup_match_to_inner` leg. Nothing about the infinity
+solution enters here: the branch is a genuine homogeneous solution of the
+factored GSN equation seeded from its own horizon expansion, so the two horizon
+legs form an actual solution basis rather than one propagated solution carried
+into horizon coordinates.
+"""
+function solve_factored_horizon_branch_to_match(
+    spectral::HomogeneousSpectralContext{T},
+    contour::RealInnerHorizonContour{T},
+    endpoint::RealInnerHorizonEndpoint{T};
+    odealgo=_FACTORED_DEFAULTSOLVER,
+    reltol::Union{Nothing,T}=nothing,
+    abstol::Union{Nothing,T}=nothing,
+    ode_maxiters::Int=10^7,
+    verbose::Bool=false,
+    ode_observation_factory=nothing,
+    ode_solution_observer=nothing,
+    ode_exception_passthrough=_never_passthrough_ode_exception,
+    ode_leg::AbstractString="horizon_branch_to_match",
+    factored_homogeneous_rhs_counter::Base.RefValue{Int}=Ref(0),
+) where {T<:AbstractFloat}
+    _assert_real_inner_contour_provenance(spectral, contour)
+    endpoint.contour_id == REAL_INNER_HORIZON_CONTOUR_ID || throw(
+        _factored_error(
+            T,
+            INVALID_FACTORED_PROPAGATION_INPUT,
+            spectral.precision_bits,
+            "horizon branch endpoint was not prepared on the real-inner contour",
+        )
+    )
+    endpoint.assessment.adequate || throw(_factored_error(
+        T,
+        INSUFFICIENT_ASYMPTOTIC_PRECISION,
+        spectral.precision_bits,
+        "horizon branch leg refused an inadequate endpoint preflight",
+        assessment=endpoint.assessment,
+    ))
+    typed_reltol = _resolve_factored_tolerance(
+        T, spectral.precision_bits, reltol, "relative tolerance"
+    )
+    typed_abstol = _resolve_factored_tolerance(
+        T, spectral.precision_bits, abstol, "absolute tolerance"
+    )
+    return _execute_real_inner_horizon_leg(
+        spectral,
+        contour,
+        endpoint;
+        odealgo=odealgo,
+        reltol=typed_reltol,
+        abstol=typed_abstol,
+        ode_maxiters=ode_maxiters,
+        verbose=verbose,
+        ode_observation_factory=ode_observation_factory,
+        ode_solution_observer=ode_solution_observer,
+        ode_exception_passthrough=ode_exception_passthrough,
+        ode_leg=ode_leg,
+        factored_homogeneous_rhs_counter=factored_homogeneous_rhs_counter,
+    )
+end
+
+"""
+    solve_verified_horizon_basis_to_match(spectral, contour, candidate,
+                                          required_digits; ...)
+
+Propagate both horizon branches from one verified endpoint to the matching
+point, returning the pair that forms the horizon solution basis there.
+"""
+function solve_verified_horizon_basis_to_match(
+    spectral::HomogeneousSpectralContext{T},
+    contour::RealInnerHorizonContour{T},
+    candidate::HorizonEndpointCandidate{T},
+    required_digits::T;
+    ode_leg_prefix::AbstractString="horizon",
+    kwargs...,
+) where {T<:AbstractFloat}
+    ingoing_endpoint = prepare_real_inner_horizon_endpoint(
+        spectral, contour, candidate, HORIZON_INGOING, required_digits
+    )
+    outgoing_endpoint = prepare_real_inner_horizon_endpoint(
+        spectral, contour, candidate, HORIZON_OUTGOING, required_digits
+    )
+    ingoing = solve_factored_horizon_branch_to_match(
+        spectral,
+        contour,
+        ingoing_endpoint;
+        ode_leg="$(ode_leg_prefix)_ingoing_inner_to_match",
+        kwargs...,
+    )
+    outgoing = solve_factored_horizon_branch_to_match(
+        spectral,
+        contour,
+        outgoing_endpoint;
+        ode_leg="$(ode_leg_prefix)_outgoing_inner_to_match",
+        kwargs...,
+    )
+    return VerifiedHorizonBasisSolution{T}(
+        ingoing,
+        outgoing,
+        ingoing_endpoint,
+        outgoing_endpoint,
+        candidate.rho,
+        candidate.horizon_distance,
+    )
+end
+
+function _execute_real_inner_horizon_leg(
+    spectral::HomogeneousSpectralContext{T},
+    contour::RealInnerHorizonContour{T},
+    endpoint::RealInnerHorizonEndpoint{T};
+    odealgo=_FACTORED_DEFAULTSOLVER,
+    reltol::T=_factored_default_tolerance(T),
+    abstol::T=_factored_default_tolerance(T),
+    ode_maxiters::Int=10^7,
+    verbose::Bool=false,
+    ode_observation_factory=nothing,
+    ode_solution_observer=nothing,
+    ode_exception_passthrough=_never_passthrough_ode_exception,
+    ode_leg::AbstractString="horizon_branch_to_match",
+    factored_homogeneous_rhs_counter::Base.RefValue{Int}=Ref(0),
+) where {T<:AbstractFloat}
+    return _with_factored_precision(T, spectral.precision_bits) do
+    start_rho = endpoint.rho
+    stop_rho = zero(T)
+    carrier = endpoint.carrier
+    all(
+        value -> _factored_precision_matches(
+            value, spectral.precision_bits
+        ),
+        (
+            start_rho,
+            reltol,
+            abstol,
+            endpoint.state.Y,
+            endpoint.state.Yrho,
+            carrier.wave_number,
+            carrier.rstar_match,
+            carrier.log_at_match,
+            carrier.q,
+        ),
+    ) || throw(_factored_error(
+        T,
+        FACTORED_PROPAGATION_PRECISION_MISMATCH,
+        spectral.precision_bits,
+        "real-inner horizon seed or controls do not preserve context precision",
+    ))
+    all(isfinite, (start_rho, reltol, abstol)) || throw(_factored_error(
+        T,
+        NONFINITE_FACTORED_PROPAGATION_DATA,
+        spectral.precision_bits,
+        "real-inner horizon ODE controls must be finite",
+    ))
+    start_rho < stop_rho || throw(_factored_error(
+        T,
+        INVALID_FACTORED_PROPAGATION_INPUT,
+        spectral.precision_bits,
+        "real-inner horizon leg must start strictly inside the matching point",
+    ))
+    reltol > zero(T) && abstol > zero(T) || throw(_factored_error(
+        T,
+        INVALID_FACTORED_PROPAGATION_INPUT,
+        spectral.precision_bits,
+        "real-inner horizon ODE tolerances must be positive",
+    ))
+    ode_maxiters > 0 || throw(_factored_error(
+        T,
+        INVALID_FACTORED_PROPAGATION_INPUT,
+        spectral.precision_bits,
+        "real-inner horizon ODE maxiters must be positive",
+    ))
+    tangent = contour.tangent
+    initial_norm = hypot(
+        abs(endpoint.state.Y), abs(endpoint.state.Yrho)
+    )
+    initial_carrier_log = T(abs(real(carrier_log(carrier, start_rho))))
+    isfinite(initial_norm) && isfinite(initial_carrier_log) || throw(
+        _factored_error(
+            T,
+            NONFINITE_FACTORED_PROPAGATION_DATA,
+            spectral.precision_bits,
+            "real-inner horizon initial diagnostics are nonfinite",
+        )
+    )
+    accumulator = _FactoredDiagnosticAccumulator{T}(
+        0, initial_norm, initial_norm, initial_carrier_log
+    )
+    internal_callback = _factored_internal_callback(accumulator, carrier)
+    rhospan = (start_rho, stop_rho)
+    external_callback, observation = _begin_ode_observation(
+        ode_observation_factory, String(ode_leg), rhospan, odealgo
+    )
+    callback = _combine_factored_callbacks(
+        external_callback, internal_callback
+    )
+    rhs_count_before = factored_homogeneous_rhs_counter[]
+    parameters = FactoredGSNParameters(
+        spectral.s,
+        spectral.m,
+        spectral.a,
+        spectral.omega,
+        spectral.lambda,
+        contour.radius_from_rho,
+        tangent,
+        carrier,
+        spectral.precision_bits,
+        rhs_count_before,
+        factored_homogeneous_rhs_counter,
+    )
+    initial_values = Complex{T}[endpoint.state.Y, endpoint.state.Yrho]
+    odeprob = ODEProblem(
+        factored_GSN_linear_eqn!, initial_values, rhospan, parameters
+    )
+    odesoln = try
+        solve(
+            odeprob,
+            odealgo;
+            maxiters=ode_maxiters,
+            reltol=reltol,
+            abstol=abstol,
+            tstops=[stop_rho],
+            save_everystep=false,
+            save_start=false,
+            save_end=true,
+            dense=false,
+            callback=callback,
+            verbose=verbose,
+        )
+    catch error
+        _throw_or_wrap_factored_ode_failure(
+            error,
+            ode_exception_passthrough,
+            T,
+            spectral.precision_bits,
+            endpoint.assessment,
+            _factored_rhs_evaluation_count(parameters),
+        )
+    end
+    _finish_ode_observation(
+        ode_solution_observer, String(ode_leg), odesoln, observation
+    )
+    _assert_successful_factored_ode_result(
+        odesoln,
+        T,
+        spectral.precision_bits,
+        endpoint.assessment,
+        _factored_rhs_evaluation_count(parameters),
+    )
+    length(odesoln.u) == 1 && length(odesoln.t) == 1 || throw(
+        _factored_error(
+            T,
+            FACTORED_ODE_FAILURE,
+            spectral.precision_bits,
+            "real-inner horizon leg violated the endpoint-only save contract";
+            assessment=endpoint.assessment,
+            factored_homogeneous_rhs_evaluations=
+                _factored_rhs_evaluation_count(parameters),
+        )
+    )
+    reached_rho = T(last(odesoln.t))
+    endpoint_tolerance = T(64) * eps(T)
+    abs(reached_rho - stop_rho) <= endpoint_tolerance || throw(
+        _factored_error(
+            T,
+            FACTORED_ODE_FAILURE,
+            spectral.precision_bits,
+            "real-inner horizon leg did not reach the matching point";
+            assessment=endpoint.assessment,
+            factored_homogeneous_rhs_evaluations=
+                _factored_rhs_evaluation_count(parameters),
+        )
+    )
+    endpoint_values = last(odesoln.u)
+    match_state = FactoredEndpointState{T}(
+        Complex{T}(endpoint_values[1]), Complex{T}(endpoint_values[2])
+    )
+    _finite_factored_complex(match_state.Y) &&
+        _finite_factored_complex(match_state.Yrho) || throw(
+            _factored_error(
+                T,
+                NONFINITE_FACTORED_PROPAGATION_DATA,
+                spectral.precision_bits,
+                "real-inner horizon leg endpoint state is nonfinite";
+                assessment=endpoint.assessment,
+                factored_homogeneous_rhs_evaluations=
+                    _factored_rhs_evaluation_count(parameters),
+            )
+        )
+    solver_stats = hasproperty(odesoln, :destats) ?
+        getproperty(odesoln, :destats) : nothing
+    accepted_steps = solver_stats !== nothing &&
+        hasproperty(solver_stats, :naccept) ?
+            Int(getproperty(solver_stats, :naccept)) :
+            accumulator.accepted_steps
+    rejected_steps = solver_stats !== nothing &&
+        hasproperty(solver_stats, :nreject) ?
+            Int(getproperty(solver_stats, :nreject)) : 0
+    diagnostics = FactoredODEDiagnostics{T}(
+        endpoint.branch,
+        String(ode_leg),
+        HOMOGENEOUS_REPRESENTATION_ID,
+        FACTORED_HOMOGENEOUS_ODE_SCOPE_ID,
+        spectral.precision_bits,
+        accepted_steps,
+        rejected_steps,
+        accumulator.maximum_remainder_state_norm,
+        accumulator.minimum_remainder_state_norm,
+        accumulator.maximum_absolute_real_carrier_log,
+        endpoint.regularity,
+        endpoint.assessment,
+        spectral.convention,
+        endpoint.frozen_branch_cell,
+        endpoint.contour_deformation,
+        _factored_rhs_evaluation_count(parameters),
+        length(odesoln.u),
+    )
+    return FactoredODESolution{T}(
+        match_state, carrier, stop_rho, diagnostics
+    )
+    end
+end
+
 function GSN_linear_eqn(u, p, rho)
     r = p.r_from_rho(rho)
     _sF = p.sign * exp(1im*p.beta)*sF(p.s, p.m, p.a, p.omega, p.lambda, r)
