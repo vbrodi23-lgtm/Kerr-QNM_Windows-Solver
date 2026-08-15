@@ -507,6 +507,7 @@ end
         ingoing_carrier,
         outgoing_state,
         outgoing_carrier,
+        tangent,
         complex(context.match_radius, zero(T)),
         bits,
     )
@@ -528,6 +529,7 @@ end
         ingoing_carrier,
         outgoing_state,
         outgoing_carrier,
+        tangent,
         complex(context.match_radius, zero(T)),
         bits,
     )
@@ -572,6 +574,7 @@ end
         outgoing_carrier,
         other,
         ingoing_carrier,
+        tangent,
         complex(context.match_radius, zero(T)),
         precision(T),
     )

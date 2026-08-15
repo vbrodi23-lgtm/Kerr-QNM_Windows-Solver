@@ -2100,6 +2100,7 @@ function evaluate_horizon_chart(
         ingoing.carrier,
         outgoing.endpoint,
         outgoing.carrier,
+        inner_contour.tangent,
         Complex{T}(inner_contour.match_radius),
         spectral.precision_bits,
     )

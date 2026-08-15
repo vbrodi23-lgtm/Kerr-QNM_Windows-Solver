@@ -212,6 +212,8 @@ function _assert_scattering_carrier(
     carrier::PlaneWaveCarrier{T},
     precision_bits::Int,
     name::AbstractString,
+    ;
+    carrier_tangent::Union{Nothing,Complex{T}}=nothing,
 ) where {T<:AbstractFloat}
     _assert_scattering_complex(
         carrier.wave_number, precision_bits, "$name wave number"
@@ -280,14 +282,36 @@ function _assert_scattering_carrier(
         "$name wave number is zero",
     ))
     canonical_carrier = try
-        PlaneWaveCarrier(
-            carrier.kind,
-            carrier.wave_number,
-            carrier.rstar_match,
-            carrier.convention,
-        )
+        if carrier_tangent === nothing
+            PlaneWaveCarrier(
+                carrier.kind,
+                carrier.wave_number,
+                carrier.rstar_match,
+                carrier.convention,
+            )
+        else
+            leg === :horizon || throw(ArgumentError(
+                "only a horizon carrier may declare an explicit tangent"
+            ))
+            _assert_scattering_complex(
+                carrier_tangent,
+                precision_bits,
+                "$name explicit coordinate tangent",
+            )
+            iszero(carrier_tangent) && throw(ArgumentError(
+                "explicit carrier tangent must be nonzero"
+            ))
+            horizon_carrier_with_explicit_tangent(
+                carrier.kind,
+                carrier.wave_number,
+                carrier.rstar_match,
+                carrier.convention,
+                carrier_tangent,
+            )
+        end
     catch error
-        error isa ArgumentError || rethrow()
+        (error isa ArgumentError || error isa ScatteringExtractionError) ||
+            rethrow()
         throw(_scattering_error(
             INVALID_SCATTERING_INPUT,
             precision_bits,
@@ -298,7 +322,8 @@ function _assert_scattering_carrier(
     _same_carrier(carrier, canonical_carrier) || throw(_scattering_error(
         INVALID_SCATTERING_INPUT,
         precision_bits,
-        "$name q or match-point logarithm is not canonical",
+        "$name q or match-point logarithm is not canonical for its " *
+            "declared coordinate tangent",
     ))
     return carrier
 end
@@ -308,6 +333,7 @@ struct CommonCarrierHorizonBasis{T<:AbstractFloat}
     column_2::FactoredEndpointState{T}
     common_carrier::PlaneWaveCarrier{T}
     outgoing_source_carrier::PlaneWaveCarrier{T}
+    carrier_tangent::Union{Nothing,Complex{T}}
     rho_endpoint::T
     r_endpoint::Complex{T}
     precision_bits::Int
@@ -579,6 +605,7 @@ function build_common_horizon_basis(
             column_2,
             ingoing.carrier,
             outgoing.carrier,
+            nothing,
             rho_endpoint,
             ingoing.regularity.r_endpoint,
             precision_bits,
@@ -602,7 +629,7 @@ end
 """
     build_match_horizon_basis(ingoing_state, ingoing_carrier,
                               outgoing_state, outgoing_carrier,
-                              match_radius, precision_bits)
+                              carrier_tangent, match_radius, precision_bits)
 
 Build the horizon solution basis from two *propagated* horizon branches that
 have already been integrated to the matching point `rho = 0`.
@@ -612,7 +639,9 @@ builds the basis from asymptotic series at the inner endpoint. Here both
 columns are ODE endpoints, so no series regularity evidence exists to check;
 what is checked instead is that the two carriers are genuine horizon-ingoing
 and horizon-outgoing carriers sharing one convention, wave number, and match
-point, exactly as the inner-endpoint builder requires.
+point, exactly as the inner-endpoint builder requires. `carrier_tangent`
+declares the coordinate derivative used by both propagated states, allowing
+their explicit-tangent carriers to be reconstructed and validated exactly.
 
 Column 2 is changed into column 1's carrier at `rho = 0`, so the returned basis
 is expressed in a single common carrier and can be consumed by
@@ -623,6 +652,7 @@ function build_match_horizon_basis(
     ingoing_carrier::PlaneWaveCarrier{T},
     outgoing_state::FactoredEndpointState{T},
     outgoing_carrier::PlaneWaveCarrier{T},
+    carrier_tangent::Complex{T},
     match_radius::Complex{T},
     precision_bits::Int,
 )::CommonCarrierHorizonBasis{T} where {T<:AbstractFloat}
@@ -640,10 +670,16 @@ function build_match_horizon_basis(
                 "match-basis column 2 carrier must be horizon outgoing (Cinc)",
             ))
         _assert_scattering_carrier(
-            ingoing_carrier, precision_bits, "match-basis ingoing carrier"
+            ingoing_carrier,
+            precision_bits,
+            "match-basis ingoing carrier";
+            carrier_tangent=carrier_tangent,
         )
         _assert_scattering_carrier(
-            outgoing_carrier, precision_bits, "match-basis outgoing carrier"
+            outgoing_carrier,
+            precision_bits,
+            "match-basis outgoing carrier";
+            carrier_tangent=carrier_tangent,
         )
         full_convention_equal(
             ingoing_carrier.convention, outgoing_carrier.convention
@@ -735,6 +771,7 @@ function build_match_horizon_basis(
             column_2,
             ingoing_carrier,
             outgoing_carrier,
+            carrier_tangent,
             rho_endpoint,
             match_radius,
             precision_bits,
@@ -749,6 +786,7 @@ function build_match_horizon_basis(
     ingoing_carrier::PlaneWaveCarrier,
     outgoing_state::FactoredEndpointState,
     outgoing_carrier::PlaneWaveCarrier,
+    carrier_tangent::Complex,
     match_radius::Complex,
     precision_bits::Int,
 )
@@ -787,7 +825,8 @@ function solve_scaled_horizon_basis_at_match(
         _assert_scattering_carrier(
             target_carrier,
             basis.precision_bits,
-            "horizon match-basis target carrier",
+            "horizon match-basis target carrier";
+            carrier_tangent=basis.carrier_tangent,
         )
         _same_carrier(target_carrier, basis.common_carrier) ||
             throw(_scattering_error(
@@ -1043,12 +1082,16 @@ function _solve_scaled_factored_scattering_unchecked(
                 "scattering basis carrier slots do not match Cref/Cinc order",
             ))
         _assert_scattering_carrier(
-            basis.common_carrier, precision_bits, "common horizon carrier"
+            basis.common_carrier,
+            precision_bits,
+            "common horizon carrier";
+            carrier_tangent=basis.carrier_tangent,
         )
         _assert_scattering_carrier(
             basis.outgoing_source_carrier,
             precision_bits,
-            "outgoing source carrier",
+            "outgoing source carrier";
+            carrier_tangent=basis.carrier_tangent,
         )
         full_convention_equal(
             basis.common_carrier.convention,
@@ -1330,7 +1373,8 @@ function solve_scaled_factored_scattering(
         _assert_scattering_carrier(
             target_carrier,
             basis.precision_bits,
-            "propagated scattering target carrier",
+            "propagated scattering target carrier";
+            carrier_tangent=basis.carrier_tangent,
         )
         _same_carrier(target_carrier, basis.common_carrier) ||
             throw(_scattering_error(

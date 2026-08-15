@@ -10,6 +10,10 @@ COMPLEX_FREQUENCIES_SOURCE = REPO_ROOT / (
     "src/windows_solver/data/julia/GeneralizedSasakiNakamura.jl/src/"
     "Homogeneous/ComplexFrequencies.jl"
 )
+SOLUTIONS_SOURCE = REPO_ROOT / (
+    "src/windows_solver/data/julia/GeneralizedSasakiNakamura.jl/src/"
+    "Homogeneous/Solutions.jl"
+)
 JULIA_SPEC = REPO_ROOT / (
     "src/windows_solver/data/julia/GeneralizedSasakiNakamura.jl/test/"
     "factored_propagation_spec.jl"
@@ -29,6 +33,7 @@ class RegularisedGsnFactoredPropagationSourceTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.source = COMPLEX_FREQUENCIES_SOURCE.read_text(encoding="utf-8")
+        cls.solutions = SOLUTIONS_SOURCE.read_text(encoding="utf-8")
         cls.spec = JULIA_SPEC.read_text(encoding="utf-8")
         cls.real_inner_spec = REAL_INNER_HORIZON_SPEC.read_text(
             encoding="utf-8"
@@ -373,6 +378,65 @@ class RegularisedGsnFactoredPropagationSourceTests(unittest.TestCase):
             "coordinate identity rejects nonfinite and excessive residuals",
         ):
             self.assertIn(behavior, self.real_inner_spec)
+
+    def test_match_basis_validates_the_declared_real_inner_carrier_tangent(
+        self,
+    ) -> None:
+        basis_struct = self.solutions[
+            self.solutions.index("struct CommonCarrierHorizonBasis") :
+            self.solutions.index("function build_common_horizon_basis")
+        ]
+        self.assertIn(
+            "carrier_tangent::Union{Nothing,Complex{T}}", basis_struct
+        )
+
+        validator_start = self.solutions.index(
+            "function _assert_scattering_carrier("
+        )
+        validator_end = self.solutions.index(
+            "struct CommonCarrierHorizonBasis", validator_start
+        )
+        validator = self.solutions[validator_start:validator_end]
+        self.assertIn("carrier_tangent", validator)
+        self.assertIn("if carrier_tangent === nothing", validator)
+        self.assertIn("PlaneWaveCarrier(", validator)
+        self.assertIn(
+            "horizon_carrier_with_explicit_tangent(", validator
+        )
+        self.assertNotRegex(
+            validator,
+            r"carrier\.q\s*/|/\s*carrier\.wave_number",
+        )
+
+        match_builder_start = self.solutions.index(
+            "function build_match_horizon_basis("
+        )
+        match_builder_end = self.solutions.index(
+            "function solve_scaled_horizon_basis_at_match(",
+            match_builder_start,
+        )
+        match_builder = self.solutions[
+            match_builder_start:match_builder_end
+        ]
+        self.assertIn("carrier_tangent::Complex{T}", match_builder)
+        self.assertIn(
+            "carrier_tangent=carrier_tangent", match_builder
+        )
+
+        chart_start = self.worker.index("function evaluate_horizon_chart(")
+        chart_end = self.worker.index(
+            "function estimate_horizon_determinant_error", chart_start
+        )
+        chart = self.worker[chart_start:chart_end]
+        basis_call = chart.index("Solutions.build_match_horizon_basis(")
+        tangent_argument = chart.index("inner_contour.tangent", basis_call)
+        precision_argument = chart.index("spectral.precision_bits", basis_call)
+        self.assertLess(tangent_argument, precision_argument)
+
+        self.assertIn(
+            "match-basis column scaling does not move the coefficients",
+            self.real_inner_spec,
+        )
 
     def test_all_determinant_branches_are_authenticated_before_adequacy(self) -> None:
         for name, provenance_call, first_solve_call in (
