@@ -57,12 +57,23 @@ function benchmark_request()
         "readout_radius" => "6.0",
         "ode_relative_tolerance" => "1e-18",
         "ode_absolute_tolerance" => "1e-20",
+        "homogeneous_ode_relative_tolerance" => "1e-18",
+        "homogeneous_ode_absolute_tolerance" => "1e-20",
+        "coordinate_ode_relative_tolerance" => "1e-18",
+        "coordinate_ode_absolute_tolerance" => "1e-20",
         "endpoint_series_order" => 28,
         "support_subinterval_count" => 256,
         "angular_pad" => 18,
         "rho_in" => "-5000",
         "rho_out" => "5000",
+        "horizon_rho_inner_min" => "-100",
+        "horizon_endpoint_rho_candidates" =>
+            ["-10", "-25", "-50", "-75", "-100"],
+        "horizon_maximum_endpoint_distance" => "0.1",
+        "determinant_error_safety_factor" => "64",
         "frequency_step" => "1e-6",
+        "frequency_step_minimum" => "1e-12",
+        "frequency_step_maximum" => "1e-3",
         "root_correction_tolerance" => "1e-18",
         "branch_enclosure_radius_abs" => "0.005",
         "max_newton_iterations" => 16,
@@ -76,7 +87,11 @@ function benchmark_request()
         "max_accepted_steps_per_homogeneous_leg" => 3_000_000,
         "max_rhs_evaluations_per_homogeneous_leg" => 3_000_000,
         "homogeneous_leg_wall_clock_seconds" => 1200,
-        "homogeneous_representation" => HOMOGENEOUS_REPRESENTATION_ID,
+        "coordinate_stall_rhs_threshold" => 200_000,
+        "coordinate_stall_minimum_span_fraction" => "1e-6",
+        "coordinate_stall_minimum_step_fraction" => "1e-12",
+        "homogeneous_representation" =>
+            HORIZON_HOMOGENEOUS_REPRESENTATION_ID,
         "asymptotic_series_evaluation" =>
             ASYMPTOTIC_SERIES_EVALUATION_ID,
         "conditioning_diagnostics" => CONDITIONING_DIAGNOSTICS_ID,
@@ -99,7 +114,8 @@ function benchmark_request()
             INDEPENDENT_REFERENCE_FIXTURE_RECEIPT_SHA256,
         "determinant_family" => HORIZON_DETERMINANT_FAMILY_ID,
         "scattering_diagnostics_applicable" => true,
-        "scattering_coefficient_extraction" => SCATTERING_EXTRACTION_ID,
+        "scattering_coefficient_extraction" =>
+            HORIZON_BASIS_AT_MATCH_EXTRACTION_ID,
         "horizon_determinant_chart" =>
             HORIZON_DETERMINANT_NORMALISATION_ID,
         "scattering_chart_safety_factor" =>
@@ -109,6 +125,8 @@ function benchmark_request()
         "determinant_convention" => HORIZON_DETERMINANT_CONVENTION_ID,
         "determinant_normalisation" =>
             HORIZON_DETERMINANT_NORMALISATION_ID,
+        "horizon_contour" => REAL_INNER_HORIZON_CONTOUR_ID,
+        "determinant_error_model" => VERIFIED_ENDPOINT_ERROR_MODEL_ID,
     )
 end
 

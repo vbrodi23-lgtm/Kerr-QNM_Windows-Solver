@@ -2979,6 +2979,13 @@ function finite_difference_pair(
         translated === failure && rethrow()
         throw(translated)
     end
+    # Propagate the endpoint determinant errors through the centred stencil:
+    #     eta_D' = (eta_D(w+h) + eta_D(w-h)) / (2|h|)
+    # This is the term that says how much of the derivative magnitude is
+    # attributable to determinant noise rather than to real slope.
+    derivative_error_abs = (
+        determinant_error_abs(T, d_plus) + determinant_error_abs(T, d_minus)
+    ) / (T(2) * abs(h))
     record_finite_difference!(evaluation_context.conditioning, diagnostics)
     progress_emit("conditioning_evaluated"; payload=Dict(
         "estimate_kind" => "finite-difference-cancellation/not-a-bound/v1",
@@ -3008,8 +3015,43 @@ function finite_difference_pair(
         "underflow_observed" => diagnostics.underflow_observed,
         "saturation_observed" => diagnostics.saturation_observed,
         "saturation_status" => diagnostics.saturation_status,
+        "derivative_error_abs" => string(derivative_error_abs),
     ))
-    return derivative, diagnostics
+    return derivative, diagnostics, derivative_error_abs
+end
+
+"""
+    determinant_error_abs(T, evaluation)
+
+Return the absolute numerical error carried by a determinant evaluation.
+
+Families that do not yet publish an error model return zero, which reduces the
+acceptance test below to its historical form. The horizon family always
+publishes one.
+"""
+function determinant_error_abs(::Type{T}, evaluation) where {T<:AbstractFloat}
+    error_abs = evaluation.numerical_error_abs
+    error_abs === nothing && return zero(T)
+    isfinite(error_abs) && error_abs >= zero(T) ||
+        error("determinant numerical error must be finite and nonnegative")
+    return T(error_abs)
+end
+
+"""
+    determinant_upper_bound_abs(T, evaluation)
+
+Return `|D| + eta_D`, the quantity Newton acceptance and damping compare.
+
+Using `|D|` alone treats a determinant that is small only because its own noise
+happens to cancel as though the root were located. Near a QNM the determinant is
+small by construction, so the magnitude on its own carries no information about
+whether the frequency is resolved -- only the magnitude measured against its own
+error does.
+"""
+function determinant_upper_bound_abs(
+    ::Type{T}, evaluation
+) where {T<:AbstractFloat}
+    return abs(evaluation.value) + determinant_error_abs(T, evaluation)
 end
 
 function bounded_newton(
@@ -3080,7 +3122,7 @@ function bounded_newton(
             "acceptance_threshold" => string(tolerance),
         ))
         h = frequency_step * (one(T) + abs(value))
-        derivative, _ = finite_difference_pair(
+        derivative, _, derivative_error_abs = finite_difference_pair(
             T,
             request,
             evaluation_context,
@@ -3092,6 +3134,13 @@ function bounded_newton(
             axis="real",
         )
         derivative_abs = abs(derivative)
+        residual_error_abs = determinant_error_abs(T, residual)
+        residual_upper_bound = magnitude + residual_error_abs
+        # How much of the derivative magnitude survives once the propagated
+        # determinant noise is removed. A nonpositive bound means the slope is
+        # not resolved at this step, so no correction computed from it can be
+        # trusted.
+        derivative_lower_bound = derivative_abs - derivative_error_abs
         if !isfinite(derivative_abs) || iszero(derivative)
             progress_emit("newton_iteration_completed"; context=newton_context, payload=Dict(
                 "derivative_abs" => string(derivative_abs),
@@ -3108,10 +3157,33 @@ function bounded_newton(
             break
         end
         raw_step = residual.value / derivative
-        correction_abs = magnitude / derivative_abs
+        if derivative_lower_bound <= zero(T)
+            # The derivative is indistinguishable from determinant noise. Say
+            # so, rather than accepting a correction computed by dividing one
+            # unresolved quantity by another.
+            throw(numerical_control_failure(
+                request,
+                "DETERMINANT_UNCERTAINTY_TOO_LARGE",
+                "determinant derivative is not resolved above its own numerical error",
+                Dict{String,Any}(
+                    "determinant_abs" => string(magnitude),
+                    "determinant_error_abs" => string(residual_error_abs),
+                    "derivative_abs" => string(derivative_abs),
+                    "derivative_error_abs" => string(derivative_error_abs),
+                    "derivative_lower_bound_abs" =>
+                        string(derivative_lower_bound),
+                    "frequency_step" => string(h),
+                ),
+            ))
+        end
+        correction_abs = residual_upper_bound / derivative_lower_bound
         if correction_abs <= tolerance
             progress_emit("newton_iteration_completed"; context=newton_context, payload=Dict(
                 "derivative_abs" => string(derivative_abs),
+                "derivative_error_abs" => string(derivative_error_abs),
+                "derivative_lower_bound_abs" =>
+                    string(derivative_lower_bound),
+                "determinant_error_abs" => string(residual_error_abs),
                 "raw_step" => progress_complex(raw_step),
                 "correction_abs" => string(correction_abs),
                 "applied_step" => progress_complex(zero(Complex{T})),
@@ -3146,6 +3218,13 @@ function bounded_newton(
                 value,
             )
             candidate_abs = abs(candidate_residual.value)
+            # Compare error-inclusive bounds, not raw magnitudes. A candidate
+            # whose determinant is smaller only because its noise is larger has
+            # not moved closer to the root.
+            candidate_upper_bound = determinant_upper_bound_abs(
+                T, candidate_residual
+            )
+            candidate_improves = candidate_upper_bound < residual_upper_bound
             decision_context = merge(
                 newton_context,
                 Dict{String,Any}("candidate_omega" => progress_complex(candidate)),
@@ -3154,9 +3233,13 @@ function bounded_newton(
                 "damping" => string(damping),
                 "candidate_omega" => progress_complex(candidate),
                 "candidate_determinant_abs" => string(candidate_abs),
-                "accepted" => candidate_abs < magnitude,
+                "candidate_determinant_error_abs" =>
+                    string(determinant_error_abs(T, candidate_residual)),
+                "candidate_upper_bound_abs" => string(candidate_upper_bound),
+                "current_upper_bound_abs" => string(residual_upper_bound),
+                "accepted" => candidate_improves,
             ))
-            if candidate_abs < magnitude
+            if candidate_improves
                 value = candidate
                 carried_value = candidate
                 carried_residual = candidate_residual
@@ -3286,13 +3369,60 @@ function solve_once(
         complex_axis_difference_abs,
     ))
     derivative_abs = abs(derivative_real_half)
-    derivative_lower_bound_abs = derivative_abs - derivative_uncertainty_abs
+    # Two independent contributions reduce the usable derivative: disagreement
+    # between step sizes and axes, and the propagated determinant noise. Both
+    # are subtracted -- the step ladder measures how the estimate moves, not
+    # how far it sits from the truth.
+    root_error_abs = determinant_error_abs(T, root_evaluation)
+    derivative_error_abs = root_error_abs / abs(h / T(2))
+    derivative_lower_bound_abs =
+        derivative_abs - derivative_uncertainty_abs - derivative_error_abs
     isfinite(derivative_abs) && isfinite(derivative_uncertainty_abs) &&
-        derivative_lower_bound_abs > zero(T) ||
+        isfinite(derivative_error_abs) ||
         error("determinant frequency derivative controls are unusable")
-    correction_upper_bound = residual / derivative_lower_bound_abs
     tolerance = parse_real(T, request, "root_correction_tolerance")
+    if derivative_lower_bound_abs <= zero(T)
+        throw(numerical_control_failure(
+            request,
+            "DETERMINANT_UNCERTAINTY_TOO_LARGE",
+            "root determinant derivative is not resolved above its own numerical error",
+            Dict{String,Any}(
+                "determinant_abs" => string(residual),
+                "determinant_error_abs" => string(root_error_abs),
+                "derivative_abs" => string(derivative_abs),
+                "derivative_uncertainty_abs" =>
+                    string(derivative_uncertainty_abs),
+                "derivative_error_abs" => string(derivative_error_abs),
+                "derivative_lower_bound_abs" =>
+                    string(derivative_lower_bound_abs),
+                "frequency_step" => string(h),
+            ),
+        ))
+    end
+    residual_upper_bound = residual + root_error_abs
+    correction_upper_bound = residual_upper_bound / derivative_lower_bound_abs
     converged = newton_converged && correction_upper_bound <= tolerance
+    if !converged && correction_upper_bound > tolerance &&
+            residual / derivative_lower_bound_abs <= tolerance
+        # The determinant itself is small enough, but its error is not. This is
+        # not a converged root and must never be recorded as one; it is a
+        # request for tighter controls or more guard precision.
+        throw(numerical_control_failure(
+            request,
+            "DETERMINANT_UNCERTAINTY_TOO_LARGE",
+            "root determinant is small but its absolute error exceeds the correction tolerance",
+            Dict{String,Any}(
+                "determinant_abs" => string(residual),
+                "determinant_error_abs" => string(root_error_abs),
+                "correction_upper_bound" => string(correction_upper_bound),
+                "correction_without_error" =>
+                    string(residual / derivative_lower_bound_abs),
+                "root_correction_tolerance" => string(tolerance),
+                "derivative_lower_bound_abs" =>
+                    string(derivative_lower_bound_abs),
+            ),
+        ))
+    end
     progress_emit("derivative_control_completed"; payload=Dict(
         "derivative_real_half" => progress_complex(derivative_real_half),
         "derivative_real_base" => progress_complex(derivative_real_base),
@@ -3304,7 +3434,10 @@ function solve_once(
         "real_step_convergent" => real_step_convergent,
         "complex_axis_consistent" => complex_axis_consistent,
         "derivative_uncertainty_abs" => string(derivative_uncertainty_abs),
+        "determinant_error_abs" => string(root_error_abs),
+        "derivative_error_abs" => string(derivative_error_abs),
         "derivative_lower_bound_abs" => string(derivative_lower_bound_abs),
+        "residual_upper_bound_abs" => string(residual_upper_bound),
         "correction_upper_bound" => string(correction_upper_bound),
         "accepted" => converged,
     ))
