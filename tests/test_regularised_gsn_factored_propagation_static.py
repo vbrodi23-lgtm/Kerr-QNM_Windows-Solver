@@ -42,7 +42,7 @@ class RegularisedGsnFactoredPropagationSourceTests(unittest.TestCase):
         cls.workflow = CI_WORKFLOW.read_text(encoding="utf-8")
         cls.manifest_seed = M02_MANIFEST_SEED.read_text(encoding="utf-8")
 
-    def test_ci_runs_the_load_bearing_factored_spec_not_the_full_vendor_suite(
+    def test_ci_runs_the_complete_vendored_suite_from_the_pinned_project(
         self,
     ) -> None:
         self.assertIn(
@@ -63,12 +63,7 @@ class RegularisedGsnFactoredPropagationSourceTests(unittest.TestCase):
         self.assertNotIn("Pkg.resolve()", self.workflow)
         self.assertIn(
             'include(joinpath(ENV["GSN_PROJECT"], "test", '
-            '"factored_propagation_spec.jl"))',
-            self.workflow,
-        )
-        self.assertIn(
-            'include(joinpath(ENV["GSN_PROJECT"], "test", '
-            '"real_inner_horizon_spec.jl"))',
+            '"runtests.jl"))',
             self.workflow,
         )
         self.assertNotIn("Pkg.test()", self.workflow)
