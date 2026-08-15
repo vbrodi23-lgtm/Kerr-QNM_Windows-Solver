@@ -29,6 +29,18 @@ export carrier_log, carrier_value, carrier_log_derivative
 export carrier_log_derivative_derivative
 export reconstruct_state, factor_state, change_carrier
 export carrier_change_diagnostics
+# `using .FactoredSolutions` makes these visible *inside* this module; a
+# consumer that writes `using GeneralizedSasakiNakamura` only sees what this
+# module itself exports. The block above mirrors FactoredSolutions' export list
+# for exactly that reason, and the horizon rewrite added four names to that list
+# without extending the mirror -- so `m02_worker.jl` called
+# `factor_physical_match_state` unqualified and died with an UndefVarError on
+# the first real horizon determinant. Nothing caught it earlier because the
+# failure is at call time, not load time: the package precompiles cleanly and
+# the probe reports "packages loaded".
+export horizon_carrier_with_explicit_tangent, factor_physical_match_state
+export real_inner_horizon_contour_id
+export horizon_basis_at_match_extraction_id
 export human_math_review_receipt_status, human_math_review_receipt_sha256
 export independent_reference_fixture_receipt_status
 export independent_reference_fixture_receipt_sha256

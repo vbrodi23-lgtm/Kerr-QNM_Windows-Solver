@@ -6,6 +6,16 @@ from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+GSN_MODULE_SOURCE = (
+    REPO_ROOT
+    / "src/windows_solver/data/julia/GeneralizedSasakiNakamura.jl"
+    / "src/GeneralizedSasakiNakamura.jl"
+)
+FACTORED_SOLUTIONS_SOURCE = (
+    REPO_ROOT
+    / "src/windows_solver/data/julia/GeneralizedSasakiNakamura.jl"
+    / "src/Homogeneous/FactoredSolutions.jl"
+)
 WORKER_SOURCE = REPO_ROOT / "src/windows_solver/data/julia/m02_worker.jl"
 FD_SPEC_SOURCE = (
     REPO_ROOT
@@ -265,6 +275,55 @@ class RegularisedGsnWorkerSourceTests(unittest.TestCase):
         self.assertIn("verification.assessment.equivalence_disagreement_abs", horizon)
         self.assertIn("endpoint_disagreement_abs", horizon)
         self.assertIn("equivalence_disagreement_abs", horizon)
+
+    def test_every_factored_solutions_export_is_reachable_from_the_package(
+        self,
+    ) -> None:
+        """Catches a submodule name that never reaches `using` consumers.
+
+        `using .FactoredSolutions` makes its exports visible *inside*
+        GeneralizedSasakiNakamura. A consumer writing
+        `using GeneralizedSasakiNakamura` sees only what the top-level module
+        itself exports, so the package deliberately mirrors the whole
+        FactoredSolutions export list.
+
+        The horizon rewrite added four names to that list and did not extend
+        the mirror. `m02_worker.jl` calls `factor_physical_match_state`
+        unqualified, so the first real horizon determinant died with
+        `UndefVarError: factor_physical_match_state not defined`. Nothing
+        caught it: Julia resolves a global at call time, so the package
+        precompiles cleanly, the bootstrap probe reports "packages loaded", and
+        every Julia spec that exercises the package qualifies its calls or runs
+        inside the module. Only a real solve reaches the unqualified call.
+        """
+
+        def exported(path: Path) -> set[str]:
+            names: set[str] = set()
+            for line in path.read_text(encoding="utf-8").splitlines():
+                stripped = line.strip()
+                if not stripped.startswith("export "):
+                    continue
+                body = stripped[len("export "):].split("#", 1)[0]
+                names.update(
+                    part.strip() for part in body.split(",") if part.strip()
+                )
+            return names
+
+        submodule = exported(FACTORED_SOLUTIONS_SOURCE)
+        package = exported(GSN_MODULE_SOURCE)
+        self.assertTrue(submodule, "FactoredSolutions exports nothing")
+        missing = sorted(submodule - package)
+        self.assertEqual(
+            missing,
+            [],
+            "FactoredSolutions exports not re-exported by the package: "
+            f"{missing}",
+        )
+
+        # And the specific name whose absence broke the calibration run, so the
+        # regression is pinned by name and not only by the set invariant.
+        self.assertIn("factor_physical_match_state", package)
+        self.assertIn("factor_physical_match_state(", self.worker)
 
     def test_the_precision_term_is_populated_rather_than_declared(self) -> None:
         """A component that is always ``nothing`` is a field, not a measurement.
