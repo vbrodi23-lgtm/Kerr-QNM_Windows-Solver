@@ -286,6 +286,24 @@ class RegularisedGSNReleaseGateTests(unittest.TestCase):
         self.assertFalse(summary["scientific_claims_admitted"])
         self.assertFalse(summary["release_admissible"])
 
+    def test_structural_validation_rejects_incomplete_lineage(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            manifest_path = _admission_fixture(directory, complete=True)
+            payload_path = directory / "payload.json"
+            payload = json.loads(payload_path.read_text(encoding="utf-8"))
+            payload["lineage"]["source_sha256s"].pop()
+            _write_json(payload_path, payload)
+
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["payload"]["sha256"] = _sha256(payload_path.read_bytes())
+            _write_json(manifest_path, manifest)
+
+            with self.assertRaisesRegex(
+                ValueError, "admission payload lineage omits evidence receipts"
+            ):
+                validate_linear_response_bundle(manifest_path)
+
     def test_release_admission_is_blocked_without_review_receipts(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             manifest = _admission_fixture(Path(temporary), complete=True)

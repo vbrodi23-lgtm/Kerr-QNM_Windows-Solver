@@ -618,6 +618,23 @@ def _validate_projective_reduction_bindings(
             )
 
 
+def _validate_payload_lineage(
+    payload: Mapping[str, object],
+    evidence_receipt: Mapping[str, object],
+    source_files: Mapping[str, object],
+    reduction: CampaignReductionSummary,
+) -> None:
+    lineage_hashes = set(payload["lineage"]["source_sha256s"])
+    required_lineage = {
+        evidence_receipt["bundle_sha256"],
+        evidence_receipt["manifest_sha256"],
+        source_files["reduction"],
+        *(item.removeprefix("sha256:") for item in reduction.source_hashes),
+    }
+    if not required_lineage.issubset(lineage_hashes):
+        raise ValueError("admission payload lineage omits evidence receipts")
+
+
 @dataclass(frozen=True, slots=True)
 class LinearResponseAdmissionPackage:
     request: Mapping[str, object]
@@ -719,15 +736,9 @@ class LinearResponseAdmissionPackage:
         )
         for name, digest in source_files.items():
             _digest(digest, f"admission {name} source SHA-256")
-        lineage_hashes = set(payload["lineage"]["source_sha256s"])
-        required_lineage = {
-            evidence_receipt["bundle_sha256"],
-            evidence_receipt["manifest_sha256"],
-            source_files["reduction"],
-            *(item.removeprefix("sha256:") for item in reduction.source_hashes),
-        }
-        if not required_lineage.issubset(lineage_hashes):
-            raise ValueError("admission payload lineage omits evidence receipts")
+        _validate_payload_lineage(
+            payload, evidence_receipt, source_files, reduction
+        )
         material = {
             key: item for key, item in mapping.items() if key != "admission_id"
         }
@@ -833,6 +844,9 @@ def _validated_admission_material(
     source_files = {
         name: _digest_bytes(data) for name, (_, data) in loaded.items()
     }
+    _validate_payload_lineage(
+        payload, evidence_receipt, source_files, reduction
+    )
     return {
         "request": request.to_mapping(),
         "payload": deepcopy(dict(payload)),
