@@ -7,7 +7,12 @@ using Test
 
 include("m02_worker.jl")
 
-function finite_difference_control_request(; frequency_step="1e-6")
+function finite_difference_control_request(;
+    frequency_step="1e-6",
+    frequency_step_minimum="1e-12",
+    frequency_step_maximum="1e-3",
+    determinant_error_safety_factor="8",
+)
     digest = repeat("0", 64)
     return Dict{String,Any}(
         "precision_digits" => 80,
@@ -23,6 +28,432 @@ function finite_difference_control_request(; frequency_step="1e-6")
         "resource_policy_version" => 1,
         "resource_policy_sha256" => digest,
         "frequency_step" => frequency_step,
+        "frequency_step_minimum" => frequency_step_minimum,
+        "frequency_step_maximum" => frequency_step_maximum,
+        "determinant_error_safety_factor" => determinant_error_safety_factor,
+        # Needed only to build a real DeterminantRequestContext for the
+        # executed caller-chain testsets; the algebraic testsets ignore them.
+        "spin" => "0.95",
+        "m" => 2,
+    )
+end
+
+@testset "determinant error breakdown validates and aggregates absolute components" begin
+    request = finite_difference_control_request()
+    breakdown = determinant_error_breakdown(
+        Float64,
+        request,
+        2.0;
+        control_disagreement_abs=3.0,
+        equivalence_disagreement_abs=5.0,
+        precision_disagreement_abs=nothing,
+    )
+    @test breakdown.endpoint_disagreement_abs == 2.0
+    @test breakdown.control_disagreement_abs == 3.0
+    @test breakdown.equivalence_disagreement_abs == 5.0
+    @test breakdown.precision_disagreement_abs === nothing
+    @test breakdown.safety_factor == 8.0
+    @test breakdown.numerical_error_abs == 40.0
+    @test_throws ArgumentError determinant_error_breakdown(
+        Float64, request, -1.0
+    )
+    @test_throws ArgumentError determinant_error_breakdown(
+        Float64, request, 1.0; control_disagreement_abs=Inf
+    )
+end
+
+@testset "centred stencil propagates unequal endpoint errors" begin
+    @test propagated_centered_difference_error(2.0, 6.0, 2.0) == 2.0
+    @test propagated_centered_difference_error(1.0, 9.0, 0.5) == 10.0
+end
+
+@testset "derivative authentication derives its own lower bound" begin
+    authentication = DerivativeAuthentication{Float64}(
+        complex(2.0, 0.0),
+        0.25,
+        0.5,
+        1.0e-6,
+        "real",
+    )
+    @test authentication.lower_bound_abs == 1.25
+    # A caller cannot inject a separately rounded lower bound.
+    @test_throws MethodError DerivativeAuthentication{Float64}(
+        complex(2.0, 0.0),
+        0.25,
+        0.5,
+        1.25,
+        1.0e-6,
+        "real",
+    )
+end
+
+#####
+##### Executed caller-chain specification
+#####
+#
+# The helper above is pure algebra. Asserting it alone leaves the question that
+# actually matters unanswered: whether the error a sample carries reaches the
+# bound the ladder decides on, through finite_difference_pair, final_derivative
+# and the rung search as production calls them. These testsets execute that
+# chain against a controlled determinant.
+
+const SPEC_ROOT = complex(0.5, -0.1)
+
+"""
+    spec_determinant_evaluator(; slope, curvature, plus_error, minus_error, calls)
+
+Return a determinant evaluator with an analytically known step response.
+
+`D(omega) = slope * z + curvature * z^3`, where `z = omega - SPEC_ROOT`. The
+cubic term is not decoration: a purely linear determinant differentiates
+*exactly* at every step, so `fine_difference` and `coarse_difference` are both
+rounding noise and `real_step_convergent` becomes a coin flip between two
+eps-level values. Hosted CI duly rejected the first rung on one run. With
+curvature the centred difference at step `h` is `slope + curvature*h^2`, giving
+
+    fine   = |D'(h/2) - D'(h)|  = 0.75 * |curvature| * h^2
+    coarse = |D'(h)  - D'(2h)| = 3.00 * |curvature| * h^2
+
+so convergence and axis consistency hold by a definite margin rather than by
+luck, and the accepted rung is deterministic.
+
+The two half-stencil samples carry deliberately unequal errors so a chain that
+silently used one endpoint twice, or averaged before propagating, would show up.
+"""
+function spec_determinant_evaluator(;
+    slope::ComplexF64=complex(2.0, 0.0),
+    curvature::ComplexF64=complex(1.0, 0.0),
+    plus_error::Float64=1.0e-12,
+    minus_error::Float64=5.0e-13,
+    calls::Union{Nothing,Vector{ComplexF64}}=nothing,
+)
+    return function (
+        value_type, request, context, omega, amplitude, purpose, current
+    )
+        calls === nothing || push!(calls, ComplexF64(omega))
+        error_abs = real(omega) >= real(SPEC_ROOT) ? plus_error : minus_error
+        breakdown = DeterminantErrorBreakdown{Float64}(
+            error_abs, nothing, nothing, nothing, 1.0, error_abs
+        )
+        offset = omega - SPEC_ROOT
+        return (
+            value=slope * offset + curvature * offset^3,
+            error_breakdown=breakdown,
+            error_model_id="specification-evaluator/v1",
+        )
+    end
+end
+
+function spec_request_context(request)
+    return build_determinant_request_context(Float64, request, SPEC_ROOT)
+end
+
+@testset "sample errors reach the accepted bound through the real chain" begin
+    request = finite_difference_control_request()
+    context = spec_request_context(request)
+    calls = ComplexF64[]
+    evaluator = spec_determinant_evaluator(calls=calls)
+
+    ladder = evaluate_derivative_step_ladder(
+        Float64,
+        request,
+        context,
+        SPEC_ROOT,
+        complex(0.0, 0.0),
+        nothing;
+        authenticate_controls=true,
+        determinant_evaluator=evaluator,
+    )
+
+    # The centred difference at step s returns slope + curvature*s^2, so the
+    # accepted h/2 estimate carries a known, tiny truncation offset.
+    @test ladder.derivative_real_half ≈
+        complex(2.0, 0.0) + complex(1.0, 0.0) * (ladder.h / 2)^2
+    @test ladder.derivative_real_half ≈ complex(2.0, 0.0) atol = 1.0e-9
+    # Step disagreement is the analytic 3.75 * |curvature| * h^2, and it is
+    # small enough not to threaten the lower bound.
+    @test ladder.derivative_uncertainty_abs ≈ 3.75 * ladder.h^2 rtol = 1.0e-6
+    @test ladder.real_step_convergent
+    @test ladder.complex_axis_consistent
+
+    # The accepted derivative is the h/2 estimate, so the reported step is h/2
+    # and the reported error is the error propagated at that step, not at h.
+    authentication = ladder.derivative_authentication
+    @test authentication.step ≈ ladder.h / 2
+    expected_error = propagated_centered_difference_error(
+        1.0e-12, 5.0e-13, ladder.h / 2
+    )
+    @test authentication.propagated_error_abs ≈ expected_error
+    @test ladder.derivative_error_abs ≈ expected_error
+    # Unequal endpoint errors must not collapse to either one alone.
+    @test authentication.propagated_error_abs !=
+        propagated_centered_difference_error(1.0e-12, 1.0e-12, ladder.h / 2)
+
+    # The lower bound is the estimate less both the step disagreement and the
+    # propagated error, and it is what acceptance was decided on.
+    @test authentication.lower_bound_abs ≈
+        abs(ladder.derivative_real_half) -
+        ladder.derivative_uncertainty_abs -
+        expected_error
+    @test authentication.lower_bound_abs > 0
+
+    # Four samples per rung -- h, h/2, 2h, ih -- each a centred pair. The
+    # count is stated against the rung actually selected rather than an assumed
+    # one: which rung wins depends on the interplay of truncation and noise at
+    # this fixture's scale, and is not what this testset is about. What matters
+    # is that the search is bounded and that the reported error and bound below
+    # belong to the rung it settled on.
+    @test 1 <= ladder.rung_index <= ladder.rung_count
+    @test length(calls) == 8 * ladder.rung_index
+    # The selected step is admissible: its own samples stay inside policy.
+    nominal, minimum_step, maximum_step = validated_frequency_steps(
+        Float64, request
+    )
+    scale = 1.0 + abs(SPEC_ROOT)
+    @test minimum_step * scale <= ladder.h / 2
+    @test 2 * ladder.h <= maximum_step * scale
+end
+
+@testset "unresolved noise exhausts the range with a typed failure" begin
+    request = finite_difference_control_request()
+    context = spec_request_context(request)
+    calls = ComplexF64[]
+    # An error far larger than the derivative can never leave a positive lower
+    # bound at any step, so every rung must be rejected.
+    evaluator = spec_determinant_evaluator(
+        plus_error=1.0e6, minus_error=1.0e6, calls=calls
+    )
+
+    failure = try
+        evaluate_derivative_step_ladder(
+            Float64,
+            request,
+            context,
+            SPEC_ROOT,
+            complex(0.0, 0.0),
+            nothing;
+            authenticate_controls=true,
+            determinant_evaluator=evaluator,
+        )
+        nothing
+    catch caught
+        caught
+    end
+
+    @test failure isa NumericalControlFailure
+    details = failure_details(failure)
+    @test details["failure_code"] == "FINITE_DIFFERENCE_NOISE_LIMIT"
+    # The typed failure carries its per-code evidence under "diagnostics"; the
+    # stage says where in the pipeline the code was raised.
+    @test details["stage"] == "finite-difference"
+    attempts = details["diagnostics"]["attempts"]
+    # Exhaustion is finite and every attempt records which condition failed.
+    @test !isempty(attempts)
+    @test length(attempts) <= MAXIMUM_FREQUENCY_STEP_RUNGS
+    @test all(attempt -> attempt["accepted"] == false, attempts)
+    @test all(attempt -> attempt["noise_resolved"] == false, attempts)
+    @test length(calls) == 8 * length(attempts)
+end
+
+@testset "unauthenticated control keeps the single-step historical path" begin
+    request = finite_difference_control_request()
+    context = spec_request_context(request)
+    calls = ComplexF64[]
+    # This path is deliberately fixed at the production 1e-6 policy step.
+    # Around the nonzero complex SPEC_ROOT, forming omega +/- h and then
+    # subtracting SPEC_ROOT introduces an O(eps/h) derivative perturbation.
+    # With unit curvature that perturbation is larger than the O(h^2) cubic
+    # signal which is meant to establish strict h/2 -> h -> 2h convergence.
+    # A larger, still analytic curvature keeps the same derivative-selection
+    # contract while giving the convergence comparison a deterministic margin.
+    evaluator = spec_determinant_evaluator(
+        curvature=complex(100.0, 0.0), calls=calls
+    )
+
+    ladder = evaluate_derivative_step_ladder(
+        Float64,
+        request,
+        context,
+        SPEC_ROOT,
+        complex(0.0, 0.0),
+        nothing;
+        authenticate_controls=false,
+        determinant_evaluator=evaluator,
+    )
+
+    # No rung search: one step, taken at the nominal policy value. The exterior
+    # scientific identity is unchanged by this work, so its derivative
+    # selection must be unchanged too -- otherwise two runs under one identity
+    # could disagree.
+    @test ladder.rung_count == 1
+    @test ladder.rung_index == 1
+    @test ladder.h ≈ validated_frequency_step(Float64, request) *
+        (1.0 + abs(SPEC_ROOT))
+    @test length(calls) == 8
+    @test ladder.derivative_real_half ≈
+        complex(2.0, 0.0) + complex(100.0, 0.0) * (ladder.h / 2)^2
+        atol = 1.0e-9
+    @test ladder.derivative_authentication.step ≈ ladder.h / 2
+    @test ladder.derivative_authentication.propagated_error_abs == 0.0
+    @test ladder.derivative_error_abs == 0.0
+
+    # The accepted Newton derivative is reused on this path, which removes the
+    # base pair.
+    reuse_calls = ComplexF64[]
+    reused = evaluate_derivative_step_ladder(
+        Float64,
+        request,
+        context,
+        SPEC_ROOT,
+        complex(0.0, 0.0),
+        complex(2.0, 0.0);
+        authenticate_controls=false,
+        determinant_evaluator=spec_determinant_evaluator(
+            curvature=complex(100.0, 0.0), calls=reuse_calls
+        ),
+    )
+    @test reused.derivative_real_base ≈ complex(2.0, 0.0) atol = 1.0e-9
+    @test length(reuse_calls) == 6
+end
+
+@testset "a narrow range cannot silently sample outside policy" begin
+    # The authenticated search needs room for h/2 and 2h; a range narrower than
+    # a factor of four has none, and must be refused rather than evaluated
+    # outside the configured bounds.
+    request = finite_difference_control_request(
+        frequency_step="1e-6",
+        frequency_step_minimum="1e-6",
+        frequency_step_maximum="2e-6",
+    )
+    context = spec_request_context(request)
+    @test_throws NumericalControlFailure evaluate_derivative_step_ladder(
+        Float64,
+        request,
+        context,
+        SPEC_ROOT,
+        complex(0.0, 0.0),
+        nothing;
+        authenticate_controls=true,
+        determinant_evaluator=spec_determinant_evaluator(),
+    )
+
+    # The unauthenticated path only ever uses the nominal step, so the same
+    # narrow policy remains usable there.
+    ladder = evaluate_derivative_step_ladder(
+        Float64,
+        request,
+        context,
+        SPEC_ROOT,
+        complex(0.0, 0.0),
+        nothing;
+        authenticate_controls=false,
+        # As in the dedicated historical-path test above, make the analytic
+        # O(h^2) signal dominate the unavoidable O(eps/h) cancellation at the
+        # nonzero complex fixture root.  This test is about policy bounds, not
+        # a second test of Float64 subtraction noise.
+        determinant_evaluator=spec_determinant_evaluator(
+            curvature=complex(100.0, 0.0)
+        ),
+    )
+    @test ladder.rung_count == 1
+end
+
+@testset "frequency step rungs are finite bounded and de-duplicated" begin
+    request = finite_difference_control_request(
+        frequency_step="1e-6",
+        frequency_step_minimum="1e-6",
+        frequency_step_maximum="1e-3",
+    )
+    nominal, minimum_step, maximum_step = validated_frequency_steps(
+        Float64, request
+    )
+    @test minimum_step <= nominal <= maximum_step
+    rungs = frequency_step_rungs(nominal, minimum_step, maximum_step)
+    @test all(isfinite, rungs)
+    @test length(rungs) == length(unique(rungs))
+    @test length(rungs) <= MAXIMUM_FREQUENCY_STEP_RUNGS
+
+    # Every rung evaluates h/2, h and 2h, and reports h/2 as the accepted step.
+    # Bounding h alone would let the finest sample fall below the configured
+    # minimum and the coarsest rise above the configured maximum, so the range
+    # actually evaluated would not be the range that was configured. Assert the
+    # samples, not just the rung.
+    for step in rungs
+        @test minimum_step <= step / 2 <= maximum_step
+        @test minimum_step <= step <= maximum_step
+        @test minimum_step <= 2 * step <= maximum_step
+    end
+
+    # The accepted step reported by the ladder is h/2 and must also be inside
+    # policy for whichever rung is selected.
+    finest, coarsest = admissible_frequency_step_interval(
+        minimum_step, maximum_step
+    )
+    @test all(step -> finest <= step <= coarsest, rungs)
+    @test minimum(rungs) / 2 >= minimum_step
+    @test 2 * maximum(rungs) <= maximum_step
+
+    for invalid in ("0", "-1", "Inf", "NaN")
+        @test_throws NumericalControlFailure validated_frequency_steps(
+            Float64,
+            finite_difference_control_request(frequency_step=invalid),
+        )
+    end
+    @test_throws NumericalControlFailure validated_frequency_steps(
+        Float64,
+        finite_difference_control_request(
+            frequency_step="1e-8",
+            frequency_step_minimum="1e-6",
+        ),
+    )
+    # A range narrower than a factor of four cannot hold any admissible rung,
+    # so it is rejected at policy validation rather than deep in the search.
+    @test_throws NumericalControlFailure validated_frequency_steps(
+        Float64,
+        finite_difference_control_request(
+            frequency_step="1e-6",
+            frequency_step_minimum="1e-6",
+            frequency_step_maximum="2e-6",
+        ),
+    )
+end
+
+@testset "rung anchoring keeps a boundary nominal step admissible" begin
+    # A nominal step sitting on the policy boundary would sample 2h outside the
+    # maximum. The anchor moves inside the admissible interval instead, and the
+    # samples stay in range.
+    request = finite_difference_control_request(
+        frequency_step="1e-3",
+        frequency_step_minimum="1e-9",
+        frequency_step_maximum="1e-3",
+    )
+    nominal, minimum_step, maximum_step = validated_frequency_steps(
+        Float64, request
+    )
+    @test nominal == maximum_step
+    rungs = frequency_step_rungs(nominal, minimum_step, maximum_step)
+    @test !isempty(rungs)
+    for step in rungs
+        @test minimum_step <= step / 2
+        @test 2 * step <= maximum_step
+    end
+    @test maximum(rungs) <= maximum_step / 2
+end
+
+@testset "determinant ranking includes absolute numerical error" begin
+    smaller_raw_larger_bound = (
+        value=complex(1.0, 0.0),
+        error_breakdown=(numerical_error_abs=10.0,),
+    )
+    larger_raw_smaller_bound = (
+        value=complex(2.0, 0.0),
+        error_breakdown=(numerical_error_abs=0.5,),
+    )
+    @test determinant_is_better(
+        Float64, larger_raw_smaller_bound, smaller_raw_larger_bound
+    )
+    @test !determinant_is_better(
+        Float64, smaller_raw_larger_bound, larger_raw_smaller_bound
     )
 end
 
@@ -303,7 +734,20 @@ end
     @test_throws ArgumentError validate_finite_difference_inputs(
         valid_plus, valid_minus, complex(Inf, 0.0); axis="real"
     )
+    # The composite entry point runs the same validation before any algebra.
+    # The two input classes keep distinct types on purpose: a nonfinite stencil
+    # value is a numerical condition and must stay a FiniteDifferenceRangeError
+    # so translate_numerical_control_failure can type it as
+    # ALGEBRAIC_REPRESENTATION_SINGULAR (asserted above at "nonfinite stencil
+    # values are typed range failures"), while a malformed offset or axis is a
+    # caller error and stays an ArgumentError.
     @test_throws ArgumentError build_finite_difference_diagnostics(
+        valid_plus, valid_minus, 0.0 + 0.0im; axis="real"
+    )
+    @test_throws ArgumentError build_finite_difference_diagnostics(
+        valid_plus, valid_minus, 0.1 + 0.0im; axis="diagonal"
+    )
+    @test_throws FiniteDifferenceRangeError build_finite_difference_diagnostics(
         complex(Inf, 0.0), valid_minus, 0.1 + 0.0im; axis="real"
     )
 end
@@ -385,4 +829,77 @@ end
     @test materialized == 0.0
     @test !upper_clamped
     @test underflowed
+end
+
+@testset "the precision guard restates only the stored precision" begin
+    # One definition of the mantissa policy, so the guard cannot ask for a
+    # width the request validator would reject.
+    @test working_precision_bits_for(80) == ceil(Int, 80 * log2(10)) + 32
+    @test working_precision_bits_for(120) == ceil(Int, 120 * log2(10)) + 32
+    @test working_precision_bits_for(120) > working_precision_bits_for(80)
+
+    request = finite_difference_control_request()
+    request["precision_digits"] = 120
+    request["working_precision_bits"] = working_precision_bits_for(120)
+    guard = precision_guard_request(Float64, request)
+
+    @test parse_integer(guard, "precision_digits") == PRECISION_GUARD_DIGITS
+    @test parse_integer(guard, "working_precision_bits") ==
+        working_precision_bits_for(PRECISION_GUARD_DIGITS)
+    @test guard["precision_guard_request_depth"] == 1
+    # Everything that is not the stored precision survives untouched. If a
+    # control moved too, the guard would re-measure the control disagreement
+    # under the name of a precision effect and the budget would double-count.
+    moved = Set(["precision_digits", "working_precision_bits",
+                 "precision_guard_request_depth"])
+    for key in keys(request)
+        key in moved && continue
+        @test guard[key] == request[key]
+    end
+    @test issetequal(keys(guard), union(keys(request), moved))
+    # The original is untouched: the guard is a copy, not an in-place edit.
+    @test parse_integer(request, "precision_digits") == 120
+
+    @test_throws ErrorException precision_guard_request(Float64, guard)
+end
+
+@testset "the precision guard keeps the branch and drops the conditioning" begin
+    request = finite_difference_control_request()
+    context = spec_request_context(request)
+    context.conditioning.determinant_count = 7
+    context.conditioning.maximum_series_digits_lost = 3.5
+
+    guard_context = precision_guard_context(Float64, context)
+
+    # Same branch cell: the guard compares two evaluations of one determinant,
+    # not two determinants.
+    @test guard_context.frozen_branch_cell == context.frozen_branch_cell
+    @test guard_context.frozen_convention == context.frozen_convention
+    # Fresh accumulator: the reported conditioning envelope describes the solve
+    # whose value is reported, and the guard's value never is.
+    @test guard_context.conditioning !== context.conditioning
+    @test guard_context.conditioning.determinant_count == 0
+    @test guard_context.conditioning.maximum_series_digits_lost == 0.0
+    @test context.conditioning.determinant_count == 7
+end
+
+@testset "the lowest stored-precision rung has nothing to compare against" begin
+    request = finite_difference_control_request()
+    @test parse_integer(request, "precision_digits") == PRECISION_GUARD_DIGITS
+    context = spec_request_context(request)
+
+    # Absent, not zero. Zero would claim the comparison was made and agreed.
+    @test precision_guard_disagreement(
+        Float64,
+        request,
+        context,
+        SPEC_ROOT,
+        complex(0.0, 0.0),
+        "spec",
+        SPEC_ROOT,
+        nothing,
+    ) === nothing
+
+    @test round_to_working_precision(Float64, complex(1.5, -2.25)) ==
+        complex(1.5, -2.25)
 end

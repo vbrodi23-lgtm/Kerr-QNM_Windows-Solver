@@ -39,12 +39,18 @@ from windows_solver.response_engine import (
     LadderLevel,
     NumericalPolicy,
     NumericalConditioningEvidence,
+    RootAuthenticationEvidence,
     RootReadout,
     VettedNativeDeterminantKernel,
     regularised_gsn_precision_policy,
 )
 from windows_solver.solved_leaf_cache import SolvedLeafStore
-from tests.fixtures import valid_numerical_conditioning
+from tests.fixtures import (
+    control_failure_stage,
+    root_authentication_for_readout,
+    valid_control_failure_diagnostics,
+    valid_numerical_conditioning,
+)
 
 
 def leaf_id(role, mode_label, coordinate, mechanism_id):
@@ -110,6 +116,7 @@ def remove_promotion_decision_and_reseal(
             "raw_determinant_abs",
             "raw_determinant_evidence_status",
             "worker_response_receipt",
+            "root_authentication",
         ):
             baseline.pop(name, None)
     if historical_shape:
@@ -340,21 +347,6 @@ def _with_baseline_conditioning(
 
     def conditioned(readout, readout_id):
         existing_receipt = readout.worker_response_receipt
-        updated = replace(
-            readout,
-            diagnostic_readouts=(readout.diagnostic_readouts or None),
-            numerical_conditioning=evidence,
-            normalised_determinant_abs=Decimal(
-                str(readout.determinant_residual_abs)
-            ),
-            raw_determinant_abs=(
-                Decimal(str(readout.determinant_residual_abs))
-                if raw_status == "available/v1"
-                else None
-            ),
-            raw_determinant_evidence_status=raw_status,
-            worker_response_receipt=None,
-        )
         if existing_receipt is not None:
             request_binding = dict(existing_receipt["request_binding"])
             scientific_runtime_sha256 = existing_receipt[
@@ -379,10 +371,52 @@ def _with_baseline_conditioning(
                 "precision_digits": outcome.digits,
                 "refinement_level": 0,
                 "synthetic_readout_id": readout_id,
+                "policy": {
+                    "root_correction_tolerance": "1e-18",
+                },
             }
             scientific_runtime_sha256 = hashlib.sha256(
                 canonical_json_bytes(scientific_runtime)
             ).hexdigest()
+        request_policy = request_binding.get("policy")
+        if not isinstance(request_policy, dict):
+            request_binding = dict(request_binding)
+            request_binding["policy"] = {
+                "root_correction_tolerance": "1e-18",
+            }
+            request_policy = request_binding["policy"]
+        correction_tolerance = Decimal(
+            request_policy["root_correction_tolerance"]
+        )
+        derivative = Decimal(str(readout.determinant_derivative_abs))
+        normalised = Decimal(str(readout.determinant_residual_abs))
+        if readout.converged:
+            normalised = min(
+                normalised,
+                derivative * correction_tolerance / Decimal(10),
+            )
+        authentication = RootAuthenticationEvidence.from_mapping(
+            root_authentication_for_readout(
+                mechanism_id=result.mechanism_id,
+                determinant_abs=normalised,
+                derivative_abs=derivative,
+                root_correction_tolerance=correction_tolerance,
+                accepted=readout.converged,
+            )
+        )
+        updated = replace(
+            readout,
+            determinant_residual_abs=float(normalised),
+            diagnostic_readouts=(readout.diagnostic_readouts or None),
+            numerical_conditioning=evidence,
+            normalised_determinant_abs=normalised,
+            raw_determinant_abs=(
+                normalised if raw_status == "available/v1" else None
+            ),
+            raw_determinant_evidence_status=raw_status,
+            worker_response_receipt=None,
+            root_authentication=authentication,
+        )
         receipt_material = {
             "schema": "windows-solver.worker-response-receipt/1",
             "request_binding": request_binding,
@@ -390,7 +424,7 @@ def _with_baseline_conditioning(
                 canonical_json_bytes(request_binding)
             ).hexdigest(),
             "scientific_runtime_sha256": scientific_runtime_sha256,
-            "worker_response_schema_version": 3,
+            "worker_response_schema_version": 4,
             "root_residual_abs_text": str(
                 updated.normalised_determinant_abs
             ),
@@ -995,6 +1029,7 @@ class PromotedConditioningDecisionTests(unittest.TestCase):
                 "raw_determinant_abs",
                 "raw_determinant_evidence_status",
                 "worker_response_receipt",
+                "root_authentication",
             ):
                 readout.pop(field, None)
         source_sha256 = hashlib.sha256(
@@ -1140,6 +1175,9 @@ class PrimaryPrecisionTests(unittest.TestCase):
         contract = _primary_recovery_precision_contract()
 
         self.assertEqual(contract["recovery_digits"], [80, 120])
+        # The scientific root target is the same at both storage tiers; the
+        # 120-digit tier spends its extra digits as bounded guard precision
+        # rather than demanding a 1e-102 root.
         self.assertEqual(
             contract["promoted_numerical_controls"],
             {
@@ -1148,27 +1186,51 @@ class PrimaryPrecisionTests(unittest.TestCase):
                         "root_correction_tolerance": "1e-18",
                         "ode_relative_tolerance": "1e-18",
                         "ode_absolute_tolerance": "1e-20",
+                        "homogeneous_ode_relative_tolerance": "1e-18",
+                        "homogeneous_ode_absolute_tolerance": "1e-20",
+                        "coordinate_ode_relative_tolerance": "1e-18",
+                        "coordinate_ode_absolute_tolerance": "1e-20",
                         "frequency_step": "1e-6",
+                        "frequency_step_minimum": "1e-12",
+                        "frequency_step_maximum": "1e-3",
                     },
                     "refinement": {
                         "root_correction_tolerance": "1e-20",
                         "ode_relative_tolerance": "1e-20",
                         "ode_absolute_tolerance": "1e-20",
+                        "homogeneous_ode_relative_tolerance": "1e-22",
+                        "homogeneous_ode_absolute_tolerance": "1e-24",
+                        "coordinate_ode_relative_tolerance": "1e-20",
+                        "coordinate_ode_absolute_tolerance": "1e-22",
                         "frequency_step": "1e-7",
+                        "frequency_step_minimum": "1e-14",
+                        "frequency_step_maximum": "1e-4",
                     },
                 },
                 "120": {
                     "base": {
-                        "root_correction_tolerance": "1e-102",
-                        "ode_relative_tolerance": "1e-102",
-                        "ode_absolute_tolerance": "1e-104",
-                        "frequency_step": "1e-60",
+                        "root_correction_tolerance": "1e-18",
+                        "ode_relative_tolerance": "1e-24",
+                        "ode_absolute_tolerance": "1e-26",
+                        "homogeneous_ode_relative_tolerance": "1e-24",
+                        "homogeneous_ode_absolute_tolerance": "1e-26",
+                        "coordinate_ode_relative_tolerance": "1e-20",
+                        "coordinate_ode_absolute_tolerance": "1e-22",
+                        "frequency_step": "1e-6",
+                        "frequency_step_minimum": "1e-16",
+                        "frequency_step_maximum": "1e-3",
                     },
                     "refinement": {
-                        "root_correction_tolerance": "1e-106",
-                        "ode_relative_tolerance": "1e-106",
-                        "ode_absolute_tolerance": "1e-108",
-                        "frequency_step": "1e-60",
+                        "root_correction_tolerance": "1e-20",
+                        "ode_relative_tolerance": "1e-28",
+                        "ode_absolute_tolerance": "1e-30",
+                        "homogeneous_ode_relative_tolerance": "1e-28",
+                        "homogeneous_ode_absolute_tolerance": "1e-30",
+                        "coordinate_ode_relative_tolerance": "1e-22",
+                        "coordinate_ode_absolute_tolerance": "1e-24",
+                        "frequency_step": "1e-7",
+                        "frequency_step_minimum": "1e-18",
+                        "frequency_step_maximum": "1e-4",
                     },
                 },
             },
@@ -1459,6 +1521,10 @@ class PromotedResourceContainmentTests(unittest.TestCase):
                     if error_class is julia_backend.JuliaNumericalControlError
                     else True
                 ),
+                # A control receipt records where in the pipeline it failed as
+                # well as what failed; several codes can arise at more than one
+                # point, so the code alone cannot be attributed.
+                "stage": control_failure_stage(failure_code),
                 "precision_digits": precision_digits,
                 "readout_index": 1,
                 "readout_role": "baseline",
@@ -1515,14 +1581,14 @@ class PromotedResourceContainmentTests(unittest.TestCase):
                 },
             })
         if error_class is julia_backend.JuliaNumericalControlError:
-            error.worker_failure["failure"]["diagnostics"] = {
-                "predicted_reliable_digits": "11.25000000000000000001",
-                "required_reliable_digits": "24",
-                "asymptotic_preflight_avoided_ode": True,
-                "asymptotic_preflight_reason": failure_code,
-                "factored_homogeneous_rhs_evaluations": 0,
-                "avoided_ode_scope": "factored-homogeneous-gsn/v1",
-            }
+            error.worker_failure["failure"]["diagnostics"] = (
+                valid_control_failure_diagnostics(
+                    failure_code,
+                    precision_bits=(
+                        math.ceil(precision_digits * math.log2(10)) + 32
+                    ),
+                )
+            )
         return error
 
     def _run_with_failure(self, error_class, failure_code, *, timed_out=False):
@@ -3060,7 +3126,7 @@ class PromotedResourceContainmentTests(unittest.TestCase):
             legacy = json.loads(checkpoint.read_text(encoding="utf-8"))
             legacy["schema_version"] = 3
             source_history_v3_sha256 = (
-                "7949e077764bfb262d7241be60b57fbf4105e120a52cb8b32cbc8c1a32497d32"
+                "f552bf5b4438f34299e311d447c23bbb125bcd6c547c701530ca4820694f60be"
             )
             self.assertEqual(
                 _checkpoint_precision_contract_sha256(3),
@@ -3120,7 +3186,7 @@ class PromotedResourceContainmentTests(unittest.TestCase):
             historical = json.loads(checkpoint.read_text(encoding="utf-8"))
             historical["schema_version"] = 5
             source_history_v5_sha256 = (
-                "7949e077764bfb262d7241be60b57fbf4105e120a52cb8b32cbc8c1a32497d32"
+                "f552bf5b4438f34299e311d447c23bbb125bcd6c547c701530ca4820694f60be"
             )
             self.assertEqual(
                 _checkpoint_precision_contract_sha256(5),

@@ -612,6 +612,98 @@ class CampaignProgressReporterTests(unittest.TestCase):
             self.assertIn(expected, dashboard)
         self.assertIn("dt last/min/proposed=0.25/1e-12/-", compact)
 
+    def test_root_authentication_reaches_live_status_and_dashboard(self):
+        reporter = CampaignProgressReporter(
+            "normal", self.reporter_checkpoint, io.StringIO()
+        )
+        reporter.publish(_event(
+            ProgressEventKind.PRECISION_STAGE_STARTED,
+            leaf_id="leaf-13",
+            leaf_index=13,
+            leaf_count=212,
+            mechanism_id="horizon-admittance",
+            precision_digits=80,
+        ))
+        root_authentication = {
+            "central_determinant_re": "1e-60",
+            "central_determinant_im": "-2e-61",
+            "determinant_error": {
+                "endpoint_disagreement_abs": "2e-62",
+                "control_disagreement_abs": "1e-62",
+                "equivalence_disagreement_abs": "5e-63",
+                "precision_disagreement_abs": None,
+                "safety_factor": "64",
+                "numerical_error_abs": "1.28e-60",
+                "error_model_id": (
+                    "verified-endpoint-control-equivalence-absolute-error/v2"
+                ),
+            },
+            "residual_upper_bound_abs": "2.299803902718557e-60",
+            "derivative_authentication": {
+                "derivative_re": "2.5",
+                "derivative_im": "-0.25",
+                "propagated_error_abs": "1e-12",
+                "step_disagreement_abs": "2e-12",
+                "lower_bound_abs": "2.512468905277154",
+                "selected_step": "5e-7",
+                "axis": "real",
+            },
+            "correction_upper_bound": "9.15357579817089e-61",
+            "root_correction_tolerance": "1e-18",
+            "accepted": True,
+        }
+        reporter.publish(_payload_event(
+            ProgressEventKind.DERIVATIVE_CONTROL_COMPLETED,
+            {"root_authentication": root_authentication},
+            leaf_id="leaf-13",
+            leaf_index=13,
+            leaf_count=212,
+            mechanism_id="horizon-admittance",
+            precision_digits=80,
+            phase="PRIMARY",
+        ))
+
+        live = reporter._live_execution_mapping()
+        expected = {
+            "central_determinant_re": "1e-60",
+            "central_determinant_im": "-2e-61",
+            "determinant_error_abs": "1.28e-60",
+            "determinant_error_safety_factor": "64",
+            "endpoint_disagreement_abs": "2e-62",
+            "control_disagreement_abs": "1e-62",
+            "equivalence_disagreement_abs": "5e-63",
+            "precision_disagreement_abs": None,
+            "residual_upper_bound_abs": "2.299803902718557e-60",
+            "derivative_re": "2.5",
+            "derivative_im": "-0.25",
+            "derivative_propagated_error_abs": "1e-12",
+            "derivative_step_disagreement_abs": "2e-12",
+            "derivative_lower_bound_abs": "2.512468905277154",
+            "derivative_selected_step": "5e-7",
+            "derivative_axis": "real",
+            "correction_upper_bound": "9.15357579817089e-61",
+            "root_correction_tolerance": "1e-18",
+            "root_authentication_accepted": True,
+        }
+        for name, value in expected.items():
+            self.assertEqual(live[name], value, name)
+        self.assertEqual(
+            live["determinant_error_model"],
+            "verified-endpoint-control-equivalence-absolute-error/v2",
+        )
+
+        status = json.loads(
+            Path(f"{self.reporter_checkpoint}.status.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        for name, value in expected.items():
+            self.assertEqual(status["live_execution"][name], value, name)
+        dashboard = "\n".join(reporter._current_execution_lines(compact=True))
+        self.assertIn("ROOT AUTHENTICATION", dashboard)
+        self.assertIn("9.15357579817089e-61 / 1e-18", dashboard)
+        self.assertIn("accepted=True", dashboard)
+
     def test_operational_terminal_events_cannot_leave_live_solver_running(self):
         for terminal_kind in (
             ProgressEventKind.LEAF_FAILED,
@@ -1711,6 +1803,49 @@ class CampaignProgressReporterTests(unittest.TestCase):
         self.assertEqual(
             ProgressEventKind.REQUEST_INTERRUPTED.value, "request_interrupted"
         )
+
+    def test_every_worker_emitted_event_is_registered_in_python(self):
+        """Catches a Julia event name the Python registry cannot parse.
+
+        The worker and the registry are edited in different languages by
+        different changes, so a new emission can reach a campaign that has no
+        name for it. Reading the emissions out of the worker source keeps the
+        comparison honest rather than restating a hand-maintained list.
+        """
+
+        import re
+
+        worker = (
+            Path(__file__).resolve().parents[1]
+            / "src/windows_solver/data/julia/m02_worker.jl"
+        ).read_text(encoding="utf-8")
+        emitted = set(
+            re.findall(r'progress_emit\(\s*"([a-z_0-9]+)"', worker)
+        )
+        self.assertTrue(emitted, "worker must emit progress events")
+        registered = {kind.value for kind in ProgressEventKind}
+        self.assertEqual(sorted(emitted - registered), [])
+
+    def test_terminal_control_failures_share_normal_mode_visibility(self):
+        """Catches a terminal control failure that is silent outside trace.
+
+        A coordinate stall ends a leg exactly as a resource limit does. If one
+        is surfaced at normal verbosity and the other is not, the operator sees
+        a run stop for no stated reason -- which is the condition the stall
+        watchdog was added to eliminate.
+        """
+
+        from windows_solver import progress_output
+
+        for peer_set in (
+            progress_output._NORMAL_FALLBACK_KINDS,
+            progress_output._FORCED_STATUS_KINDS,
+            progress_output._DASHBOARD_FORCED_KINDS,
+        ):
+            if ProgressEventKind.ODE_RESOURCE_LIMIT in peer_set:
+                self.assertIn(
+                    ProgressEventKind.COORDINATE_INVERSION_STALLED, peer_set
+                )
 
     def test_reporter_contains_stream_and_trace_failures(self):
         class BrokenStream:

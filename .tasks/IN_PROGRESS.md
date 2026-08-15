@@ -50,14 +50,10 @@ preservation, and cache/provenance separation from historical raw-state leaves.
 
 ### Plan
 
-- Implement representation primitives and precision-preserving asymptotics in the vendored GSN package, with tests written before production changes.
-- Move promoted horizon and exterior orchestration onto the canonical factored endpoint solver and scaled coefficient extraction.
-- Propagate conditioning evidence through strict Julia/Python schemas, promotion policy, progress, reports, and runtime identity.
-- Run a time-boxed, performance-only Leaf 13 diagnostic through the existing post-readiness factored executor, measuring the outer-to-match and match-to-inner legs separately before any further hardening.
-- Preserve the production gate and existing worker contour while prototyping a horizon basis at the match point: use a real positive inner tortoise ray that demonstrably approaches `r_plus`, authenticate both horizon endpoint series before any homogeneous RHS evaluation, propagate the pure ingoing/outgoing remainders independently to the match point, and solve the scaled physical-state basis there.
-- Emit the contour-approach, endpoint-conditioning, per-leg RHS/step, basis-condition, coefficient, and reconstruction evidence needed to decide whether the prototype merits production integration; do not treat this performance prototype as a mathematical activation receipt.
-- Keep the external review receipts fail-closed at the mathematical-claim/release boundary, not inside the factored ODE executor, so native campaigns can generate the evidence required to satisfy those receipts.
-- Keep structural `m02-validate` available for unapproved evidence, but require SHA-bound `approved/v1` human-review and `reviewed/v1` independent-reference receipts before sealing a schema-2 release-admissible package.
-- Run the load-bearing factored Julia regression directly (without the unrelated full vendor suite), focused Python checks, and the complete Python suite; independently review the diff, then publish a hotfix for native PowerShell resumption without reinterpreting execution as mathematical approval.
+- Enforce coordinate identity and verified real-inner endpoint geometry before any homogeneous ODE, then retain only the three-leg production horizon graph.
+- Complete the absolute determinant-error certificate and propagate each stencil sample's actual error through bounded Newton and final derivative authentication.
+- Carry the certificate through strict Julia/Python schemas, failures, progress, caches, reports, and mechanism-scoped scientific identity without changing exterior behavior.
+- Calibrate the 80/120 controls from a validated receipt, add executable worker/Julia CI gates, and run only the bounded Leaf 13 and five-mode regression evidence set.
+- Preserve fail-closed human mathematical review and independent-reference release gates; execution evidence remains explicitly unapproved until those receipts exist.
 
 ---

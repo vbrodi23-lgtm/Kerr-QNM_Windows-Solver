@@ -16,6 +16,9 @@ export carrier_log, carrier_value, carrier_log_derivative
 export carrier_log_derivative_derivative
 export reconstruct_state, factor_state, change_carrier
 export carrier_change_diagnostics
+export horizon_carrier_with_explicit_tangent, factor_physical_match_state
+export real_inner_horizon_contour_id
+export horizon_basis_at_match_extraction_id
 export human_math_review_receipt_status, human_math_review_receipt_sha256
 export independent_reference_fixture_receipt_status
 export independent_reference_fixture_receipt_sha256
@@ -25,6 +28,12 @@ export assert_regularised_gsn_production_ready
 
 const REGULAR_REMAINDER_CONTRACT_ID =
     "known-carrier-times-regular-remainder/v1"
+const REAL_INNER_HORIZON_CONTOUR_ID = "real-inner-tortoise-contour/v1"
+const real_inner_horizon_contour_id = REAL_INNER_HORIZON_CONTOUR_ID
+const HORIZON_BASIS_AT_MATCH_EXTRACTION_ID =
+    "scaled-horizon-basis-at-match/v1"
+const horizon_basis_at_match_extraction_id =
+    HORIZON_BASIS_AT_MATCH_EXTRACTION_ID
 const regular_remainder_contract = REGULAR_REMAINDER_CONTRACT_ID
 const scattering_column_convention =
     "column1=horizon-ingoing-Cref;column2=horizon-outgoing-Cinc/v1"
@@ -202,6 +211,91 @@ function factor_state(
     Y = raw.X / A
     Yrho = raw.Xrho / A - q * Y
     return FactoredEndpointState(Y, Yrho)
+end
+
+"""
+    horizon_carrier_with_explicit_tangent(kind, wave_number, rstar_match,
+                                          convention, tangent)
+
+Return the horizon plane-wave carrier whose exponent derivative follows an
+explicitly supplied tortoise tangent instead of the frequency-aligned contour
+tangent implied by `convention`.
+
+The real-inner horizon contour advances `r_*` along the positive real axis, so
+its tangent is `1 + 0im` rather than the deformed infinity tangent. The carrier
+logarithm at the matching point is unchanged; only the exponent derivative
+
+    q = ∓ i * p_horizon * tangent
+
+is rebound, with the minus sign taken for `HORIZON_INGOING` and the plus sign
+for `HORIZON_OUTGOING`. Keeping `log_at_match` canonical means a state factored
+against this carrier remains directly comparable with the canonical horizon
+carriers at `rho = 0`.
+"""
+function horizon_carrier_with_explicit_tangent(
+    kind::CarrierKind,
+    wave_number::Number,
+    rstar_match::Real,
+    convention::GSNBranchConvention,
+    tangent::Number,
+)
+    (kind === HORIZON_INGOING || kind === HORIZON_OUTGOING) ||
+        throw(ArgumentError(
+            "explicit-tangent carrier must be a horizon branch"
+        ))
+    canonical = PlaneWaveCarrier(
+        kind, wave_number, rstar_match, convention
+    )
+    T = typeof(canonical.rstar_match)
+    typed_tangent = Complex{T}(tangent)
+    _finite_complex(typed_tangent) ||
+        throw(ArgumentError("explicit carrier tangent must be finite"))
+    iszero(typed_tangent) &&
+        throw(ArgumentError("explicit carrier tangent must be nonzero"))
+    carrier_sign = kind === HORIZON_INGOING ? -one(T) : one(T)
+    q = carrier_sign * complex(zero(T), one(T)) *
+        canonical.wave_number * typed_tangent
+    _finite_complex(q) ||
+        throw(ArgumentError("explicit-tangent carrier q is nonfinite"))
+    return PlaneWaveCarrier{T}(
+        canonical.kind,
+        canonical.wave_number,
+        canonical.rstar_match,
+        canonical.log_at_match,
+        q,
+        canonical.convention,
+    )
+end
+
+"""
+    factor_physical_match_state(X, dX_drstar, carrier, tangent)
+
+Factor a physical matching-point state given as `(X, dX/dr_*)` against
+`carrier`, whose contour advances `r_*` with the supplied `tangent`.
+
+The factored state convention stores `dY/dρ`, so the supplied tortoise
+derivative is converted with `dX/dρ = tangent * dX/dr_*` before factoring at
+`ρ = 0`. This is the conversion that lets an infinity-contour solution be
+compared against horizon-contour columns that use a different tangent.
+"""
+function factor_physical_match_state(
+    X::Number,
+    dX_drstar::Number,
+    carrier::PlaneWaveCarrier{T},
+    tangent::Number,
+) where {T<:AbstractFloat}
+    typed_X = Complex{T}(X)
+    typed_derivative = Complex{T}(dX_drstar)
+    typed_tangent = Complex{T}(tangent)
+    _finite_complex(typed_X) && _finite_complex(typed_derivative) ||
+        throw(ArgumentError("physical match state must be finite"))
+    _finite_complex(typed_tangent) ||
+        throw(ArgumentError("physical match tangent must be finite"))
+    iszero(typed_tangent) &&
+        throw(ArgumentError("physical match tangent must be nonzero"))
+    return factor_state(
+        typed_X, typed_tangent * typed_derivative, carrier, zero(T)
+    )
 end
 
 function _assert_carrier_change_compatible(

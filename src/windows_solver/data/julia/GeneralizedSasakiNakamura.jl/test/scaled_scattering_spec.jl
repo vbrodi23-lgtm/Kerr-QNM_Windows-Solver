@@ -35,6 +35,7 @@ function synthetic_basis(::Type{T}, scale_1::T, scale_2::T) where {T<:AbstractFl
         column_2,
         common_carrier,
         outgoing_source_carrier,
+        nothing,
         zero(T),
         zero(Complex{T}),
         precision_bits,
@@ -53,6 +54,7 @@ function synthetic_basis_from_columns(
         column_2,
         template.common_carrier,
         template.outgoing_source_carrier,
+        template.carrier_tangent,
         template.rho_endpoint,
         template.r_endpoint,
         template.precision_bits,
@@ -308,6 +310,7 @@ end
         column_2,
         basis.common_carrier,
         basis.outgoing_source_carrier,
+        basis.carrier_tangent,
         basis.rho_endpoint,
         basis.r_endpoint,
         basis.precision_bits,
@@ -401,6 +404,11 @@ end
         safe.raw_determinant
     @test safe.raw_determinant ≈
         coefficients.Cref * something(safe.normalised_determinant)
+    @test safe.equivalence_disagreement_abs ≈ abs(
+        something(safe.raw_determinant) / coefficients.Cref -
+        something(safe.normalised_determinant)
+    )
+    @test safe.equivalence_disagreement_abs >= 0
     @test safe.equivalence_relative_error <= 32 * eps(Float64)
 
     boundary = SOL.assess_horizon_determinant_chart(

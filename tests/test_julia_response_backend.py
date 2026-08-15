@@ -43,11 +43,14 @@ from windows_solver.response_batches import (
 from windows_solver.response_engine import (
     LadderLevel,
     NumericalPolicy,
+    RootAuthenticationEvidence,
+    RootReadout,
     VettedNativeDeterminantKernel,
+    WORKER_RESPONSE_WIRE_SCHEMA,
     _diagnostic_response_channel,
 )
 from windows_solver.progress_output import CampaignProgressReporter
-from tests.fixtures import valid_schema_three_julia_root_response
+from tests.fixtures import valid_julia_root_response
 
 
 def _deep_job():
@@ -57,6 +60,19 @@ def _deep_job():
         precision_capabilities=PrecisionCapabilities((64, 80, 120)),
     )
     return next(leaf.job for leaf in plan.leaves if leaf.role == "deep")
+
+
+def _job_for_mechanism(mechanism_id: str):
+    plan = build_campaign_plan(
+        policy=NumericalPolicy(),
+        backend_identity=VettedNativeDeterminantKernel.identity,
+        precision_capabilities=PrecisionCapabilities((64, 80, 120)),
+    )
+    return next(
+        leaf.job
+        for leaf in plan.leaves
+        if leaf.job.mechanism_id == mechanism_id
+    )
 
 
 class FakeAdapter:
@@ -80,7 +96,7 @@ class FakeAdapter:
 
     def evaluate(self, request):
         self.requests.append(request)
-        return valid_schema_three_julia_root_response(request)
+        return valid_julia_root_response(request)
 
     def evaluate_for_validation(self, request):
         return SimpleNamespace(
@@ -134,7 +150,7 @@ class JuliaResponseBackendTests(unittest.TestCase):
 
         def runner(command, **kwargs):
             request = json.loads(Path(command[-2]).read_text(encoding="utf-8"))
-            response = valid_schema_three_julia_root_response(request)
+            response = valid_julia_root_response(request)
             response["numerical_conditioning"]["determinant_family"] = (
                 "cinc-over-cref-minus-R/v1"
             )
@@ -162,7 +178,7 @@ class JuliaResponseBackendTests(unittest.TestCase):
         def runner(command, **kwargs):
             calls.append(tuple(command))
             request = json.loads(Path(command[-2]).read_text(encoding="utf-8"))
-            response = valid_schema_three_julia_root_response(request)
+            response = valid_julia_root_response(request)
             response["request_sha256"] = request["request_sha256"]
             Path(command[-1]).write_bytes(canonical_json_bytes(response))
             return SimpleNamespace(returncode=0, stdout="", stderr="")
@@ -177,7 +193,7 @@ class JuliaResponseBackendTests(unittest.TestCase):
             request_sha256 = hashlib.sha256(
                 canonical_json_bytes(request)
             ).hexdigest()
-            poisoned = valid_schema_three_julia_root_response(request)
+            poisoned = valid_julia_root_response(request)
             poisoned["schema_version"] = 2
             poisoned["request_sha256"] = request_sha256
             store.publish(
@@ -223,7 +239,7 @@ class JuliaResponseBackendTests(unittest.TestCase):
         def runner(command, **kwargs):
             calls.append(tuple(command))
             request = json.loads(Path(command[-2]).read_text(encoding="utf-8"))
-            response = valid_schema_three_julia_root_response(request)
+            response = valid_julia_root_response(request)
             response["request_sha256"] = request["request_sha256"]
             Path(command[-1]).write_bytes(canonical_json_bytes(response))
             return SimpleNamespace(returncode=0, stdout="", stderr="")
@@ -259,8 +275,14 @@ class JuliaResponseBackendTests(unittest.TestCase):
             backend.read_root(_deep_job(), 0.0j)
             self.assertEqual(len(calls), 2)
 
-    def test_success_wire_schema_is_three_and_worker_errors_remain_schema_one(self):
-        """Catches changing the successful wire without preserving error parsing."""
+    def test_success_wire_schema_is_four_and_worker_errors_remain_schema_one(self):
+        """Catches changing the successful wire without preserving error parsing.
+
+        The success wire and the error envelope are versioned independently.
+        Schema 4 adds the root_authentication record; the error envelope stays
+        at 1 so a worker that fails early is still parseable by a backend that
+        cannot read the newer success shape.
+        """
 
         request = JuliaPrecisionRootBackend(
             VettedNativeDeterminantKernel.identity,
@@ -268,9 +290,10 @@ class JuliaResponseBackendTests(unittest.TestCase):
             80,
         )._request(_deep_job(), 0.0j)
         self.assertEqual(
-            valid_schema_three_julia_root_response(request)["schema_version"],
-            3,
+            valid_julia_root_response(request)["schema_version"],
+            WORKER_RESPONSE_WIRE_SCHEMA,
         )
+        self.assertEqual(WORKER_RESPONSE_WIRE_SCHEMA, 4)
         root = Path(__file__).resolve().parents[1]
         worker = (
             root / "src/windows_solver/data/julia/m02_worker.jl"
@@ -279,13 +302,437 @@ class JuliaResponseBackendTests(unittest.TestCase):
             worker.index("function result_fields(") :
             worker.index("function evaluate_request(")
         ]
-        self.assertEqual(result_fields.count('"schema_version" => 3'), 2)
+        self.assertEqual(result_fields.count('"schema_version" => 4'), 2)
+        self.assertNotIn('"schema_version" => 3', result_fields)
         error_path = worker[
             worker.rindex("catch failure") : worker.index(
                 "if abspath(PROGRAM_FILE)"
             )
         ]
         self.assertGreaterEqual(error_path.count('"schema_version" => 1'), 2)
+
+    def test_worker_root_authentication_reaches_the_backend_end_to_end(self):
+        """Catches a worker record the live backend cannot actually consume.
+
+        The producer and consumer are written in different languages and tested
+        by different suites, so a field can be added on one side and rejected
+        on the other while both suites stay green. This drives a full readout
+        for both determinant families and for a non-converged result.
+        """
+
+        for mechanism, horizon in (
+            ("horizon-admittance", True),
+            ("exterior-fixed-r3", False),
+        ):
+            with self.subTest(mechanism=mechanism):
+                job = _job_for_mechanism(mechanism)
+                adapter = FakeAdapter()
+                backend = JuliaPrecisionRootBackend(
+                    VettedNativeDeterminantKernel.identity, adapter, 80
+                )
+
+                readout = backend.read_root(job, 0.0j)
+
+                self.assertTrue(readout.converged)
+                response = adapter.evaluate(adapter.requests[0])
+                self.assertEqual(
+                    response["schema_version"], WORKER_RESPONSE_WIRE_SCHEMA
+                )
+                authentication = RootAuthenticationEvidence.from_mapping(
+                    response["root_authentication"]
+                )
+                # The error model is published exactly by the family that
+                # computes one.
+                self.assertEqual(
+                    authentication.error_breakdown is not None, horizon
+                )
+                self.assertEqual(
+                    authentication.error_model_id is not None, horizon
+                )
+                if horizon:
+                    breakdown = authentication.error_breakdown
+                    self.assertEqual(
+                        authentication.error_model_id,
+                        "verified-endpoint-control-equivalence-absolute-error/v2",
+                    )
+                    # The aggregate is the safety factor times the largest
+                    # available component -- absolute throughout, never
+                    # divided by |D|.
+                    components = [
+                        breakdown.endpoint_disagreement_abs,
+                        breakdown.control_disagreement_abs,
+                        breakdown.equivalence_disagreement_abs,
+                        breakdown.precision_disagreement_abs,
+                    ]
+                    available = [item for item in components if item is not None]
+                    self.assertEqual(
+                        breakdown.numerical_error_abs,
+                        breakdown.safety_factor * max(available),
+                    )
+                    # The residual bound is |D| + eta_D, computed in decimal
+                    # so the worker's precision survives the comparison.
+                    self.assertEqual(
+                        authentication.residual_upper_bound_abs,
+                        authentication.central_determinant.magnitude()
+                        + breakdown.numerical_error_abs,
+                    )
+                # The acceptance comparison must be reconstructible from the
+                # record alone, not merely reported alongside it.
+                self.assertGreater(authentication.derivative_lower_bound_abs, 0)
+                self.assertLessEqual(
+                    authentication.correction_upper_bound,
+                    authentication.residual_upper_bound_abs
+                    / authentication.derivative_lower_bound_abs,
+                )
+
+    def test_readout_carries_the_authentication_past_the_backend(self):
+        """Catches convergence surviving while its evidence is discarded.
+
+        Once the worker output is gone, a stored ``converged`` flag is an
+        assertion with nothing behind it. The readout therefore carries the
+        terms the decision was made on, so it can be re-checked rather than
+        trusted.
+        """
+
+        for mechanism, horizon in (
+            ("horizon-admittance", True),
+            ("exterior-fixed-r3", False),
+        ):
+            with self.subTest(mechanism=mechanism):
+                job = _job_for_mechanism(mechanism)
+                backend = JuliaPrecisionRootBackend(
+                    VettedNativeDeterminantKernel.identity, FakeAdapter(), 80
+                )
+
+                readout = backend.read_root(job, 0.0j)
+
+                authentication = readout.root_authentication
+                self.assertIsInstance(authentication, RootAuthenticationEvidence)
+                self.assertEqual(
+                    authentication.error_breakdown is not None, horizon
+                )
+                # The acceptance comparison is reconstructible from the stored
+                # readout alone.
+                self.assertGreater(authentication.derivative_lower_bound_abs, 0)
+                self.assertEqual(
+                    authentication.correction_upper_bound,
+                    authentication.residual_upper_bound_abs
+                    / authentication.derivative_lower_bound_abs,
+                )
+                # Decimal text survives; it is not narrowed to binary64.
+                self.assertIsInstance(
+                    authentication.central_determinant.real, Decimal
+                )
+
+    def test_authentication_survives_the_readout_round_trip(self):
+        """Catches evidence dropped the first time a readout is written down.
+
+        A readout is serialised into caches and solved-leaf material and read
+        back later. Evidence the round trip discards is evidence that exists
+        only inside the process that produced it, which is the same as not
+        having it: the acceptance can be re-asserted from the stored flag but
+        no longer re-checked.
+        """
+
+        for mechanism in ("horizon-admittance", "exterior-fixed-r3"):
+            with self.subTest(mechanism=mechanism):
+                job = _job_for_mechanism(mechanism)
+                backend = JuliaPrecisionRootBackend(
+                    VettedNativeDeterminantKernel.identity, FakeAdapter(), 80
+                )
+                readout = backend.read_root(job, 0.0j)
+
+                restored = RootReadout.from_mapping(readout.to_mapping())
+                original = readout.root_authentication
+                recovered = restored.root_authentication
+
+                self.assertIsNotNone(recovered)
+                # Equal as values, digit for digit -- not merely both present.
+                self.assertEqual(recovered, original)
+                self.assertEqual(
+                    recovered.central_determinant.real,
+                    original.central_determinant.real,
+                )
+                self.assertEqual(
+                    recovered.error_breakdown, original.error_breakdown
+                )
+                # The written form is JSON-safe, since that is what a cache
+                # actually stores.
+                json.loads(json.dumps(readout.to_mapping()["root_authentication"]))
+
+    def test_readout_rejects_authentication_detached_after_persistence(self):
+        """Catches a coherent certificate being moved onto another readout."""
+
+        readout = JuliaPrecisionRootBackend(
+            VettedNativeDeterminantKernel.identity, FakeAdapter(), 80
+        ).read_root(_job_for_mechanism("horizon-admittance"), 0.0j)
+        mapping = readout.to_mapping()
+        authentication = dict(mapping["root_authentication"])
+        authentication["central_determinant_re"] = "2E-60"
+        authentication["central_determinant_im"] = "0"
+        authentication["residual_upper_bound_abs"] = "3.4E-60"
+        with localcontext() as context:
+            context.prec = 180
+            authentication["correction_upper_bound"] = str(
+                Decimal("3.4E-60") / Decimal("2.4")
+            )
+        mapping["root_authentication"] = authentication
+
+        with self.assertRaisesRegex(
+            ValueError, "root authentication.*root readout"
+        ):
+            RootReadout.from_mapping(mapping)
+
+    def test_main_era_exterior_worker_receipt_remains_readable(self):
+        """Catches a wire migration retiring unchanged exterior readouts."""
+
+        readout = JuliaPrecisionRootBackend(
+            VettedNativeDeterminantKernel.identity, FakeAdapter(), 80
+        ).read_root(_job_for_mechanism("exterior-fixed-r3"), 0.0j)
+        mapping = readout.to_mapping()
+        mapping["root_authentication"] = None
+        receipt = dict(mapping["worker_response_receipt"])
+        receipt["worker_response_schema_version"] = 3
+        material = {
+            key: value
+            for key, value in receipt.items()
+            if key != "receipt_sha256"
+        }
+        receipt["receipt_sha256"] = hashlib.sha256(
+            canonical_json_bytes(material)
+        ).hexdigest()
+        mapping["worker_response_receipt"] = receipt
+
+        restored = RootReadout.from_mapping(mapping)
+
+        self.assertIsNone(restored.root_authentication)
+        self.assertEqual(
+            restored.worker_response_receipt[
+                "worker_response_schema_version"
+            ],
+            3,
+        )
+
+    def test_backend_rejects_authentication_disagreeing_with_its_family(self):
+        """Catches an error-aware decision made from an absent error term."""
+
+        class MismatchedAdapter(FakeAdapter):
+            def evaluate(self, request):
+                response = super().evaluate(request)
+                authentication = dict(response["root_authentication"])
+                authentication["determinant_error"] = None
+                authentication["central_determinant_re"] = "2.4E-60"
+                authentication["central_determinant_im"] = "0"
+                authentication["residual_upper_bound_abs"] = "2.4E-60"
+                authentication["correction_upper_bound"] = "1E-60"
+                response["root_authentication"] = authentication
+                return response
+
+        backend = JuliaPrecisionRootBackend(
+            VettedNativeDeterminantKernel.identity, MismatchedAdapter(), 80
+        )
+        with self.assertRaisesRegex(
+            JuliaResponseBackendError, "error model does not match"
+        ):
+            backend.read_root(_job_for_mechanism("horizon-admittance"), 0.0j)
+
+    def test_backend_rejects_a_missing_root_authentication_record(self):
+        class LegacyAdapter(FakeAdapter):
+            def evaluate(self, request):
+                response = super().evaluate(request)
+                del response["root_authentication"]
+                return response
+
+        backend = JuliaPrecisionRootBackend(
+            VettedNativeDeterminantKernel.identity, LegacyAdapter(), 80
+        )
+        with self.assertRaisesRegex(
+            JuliaResponseBackendError, "response fields are invalid"
+        ):
+            backend.read_root(_deep_job(), 0.0j)
+
+    def test_backend_rejects_a_malformed_root_authentication_record(self):
+        for mutate, description in (
+            (lambda record: record["derivative_authentication"].__setitem__(
+                "axis", "diagonal"
+            ),
+             "invalid axis"),
+            (lambda record: record["derivative_authentication"].__setitem__(
+                "lower_bound_abs", "0"
+            ),
+             "non-positive derivative bound"),
+            (lambda record: record["derivative_authentication"].__setitem__(
+                "selected_step", "-1e-6"
+            ),
+             "negative step"),
+            (lambda record: record.pop("correction_upper_bound"),
+             "missing field"),
+        ):
+            with self.subTest(description=description):
+                class BrokenAdapter(FakeAdapter):
+                    def evaluate(self, request):
+                        response = super().evaluate(request)
+                        record = dict(response["root_authentication"])
+                        mutate(record)
+                        response["root_authentication"] = record
+                        return response
+
+                backend = JuliaPrecisionRootBackend(
+                    VettedNativeDeterminantKernel.identity, BrokenAdapter(), 80
+                )
+                with self.assertRaises(JuliaResponseBackendError):
+                    backend.read_root(_deep_job(), 0.0j)
+
+    def test_backend_rejects_arithmetically_inconsistent_root_authentication(self):
+        """Catches a certificate whose conclusion does not follow from its terms."""
+
+        for field, replacement, nested in (
+            ("residual_upper_bound_abs", "9E-60", False),
+            ("lower_bound_abs", "2.3", True),
+            ("correction_upper_bound", "1E-100", False),
+        ):
+            with self.subTest(field=field):
+                class InconsistentAdapter(FakeAdapter):
+                    def evaluate(self, request):
+                        response = super().evaluate(request)
+                        authentication = dict(response["root_authentication"])
+                        if nested:
+                            derivative = dict(
+                                authentication["derivative_authentication"]
+                            )
+                            derivative[field] = replacement
+                            authentication["derivative_authentication"] = derivative
+                        else:
+                            authentication[field] = replacement
+                        response["root_authentication"] = authentication
+                        return response
+
+                backend = JuliaPrecisionRootBackend(
+                    VettedNativeDeterminantKernel.identity,
+                    InconsistentAdapter(),
+                    80,
+                )
+                with self.assertRaisesRegex(
+                    JuliaResponseBackendError, "root authentication evidence"
+                ):
+                    backend.read_root(
+                        _job_for_mechanism("horizon-admittance"), 0.0j
+                    )
+
+    def test_backend_binds_authentication_to_response_and_policy(self):
+        """Catches a coherent certificate attached to the wrong result or model."""
+
+        def changed_central(response):
+            authentication = dict(response["root_authentication"])
+            authentication["central_determinant_re"] = "2E-60"
+            authentication["central_determinant_im"] = "0"
+            authentication["residual_upper_bound_abs"] = "3.4E-60"
+            authentication["correction_upper_bound"] = str(
+                Decimal("3.4E-60") / Decimal("2.4")
+            )
+            response["root_authentication"] = authentication
+
+        def changed_derivative(response):
+            authentication = dict(response["root_authentication"])
+            derivative = dict(authentication["derivative_authentication"])
+            derivative["derivative_re"] = (
+                "3.000000000000000000000000000000000000000000000000000003"
+            )
+            derivative["derivative_im"] = "0"
+            derivative["lower_bound_abs"] = "3"
+            authentication["derivative_authentication"] = derivative
+            authentication["correction_upper_bound"] = "8E-61"
+            response["root_authentication"] = authentication
+
+        def changed_model(response):
+            authentication = dict(response["root_authentication"])
+            determinant_error = dict(authentication["determinant_error"])
+            determinant_error["error_model_id"] = "unrecognised-model/v999"
+            authentication["determinant_error"] = determinant_error
+            response["root_authentication"] = authentication
+
+        for description, mutate in (
+            ("central determinant", changed_central),
+            ("derivative", changed_derivative),
+            ("error model", changed_model),
+        ):
+            with self.subTest(description=description):
+                class DetachedAdapter(FakeAdapter):
+                    def evaluate(self, request):
+                        response = super().evaluate(request)
+                        mutate(response)
+                        return response
+
+                backend = JuliaPrecisionRootBackend(
+                    VettedNativeDeterminantKernel.identity,
+                    DetachedAdapter(),
+                    80,
+                )
+                with self.assertRaises(JuliaResponseBackendError):
+                    backend.read_root(
+                        _job_for_mechanism("horizon-admittance"), 0.0j
+                    )
+
+    def test_backend_rejects_converged_root_above_declared_correction_target(self):
+        """Catches a coherent large correction being labelled as solved."""
+
+        class FalseSolvedAdapter(FakeAdapter):
+            def evaluate(self, request):
+                response = super().evaluate(request)
+                authentication = dict(response["root_authentication"])
+                authentication["central_determinant_re"] = "1E-10"
+                authentication["central_determinant_im"] = "0"
+                with localcontext() as context:
+                    context.prec = 180
+                    residual_upper = Decimal("1E-10") + Decimal("1.4E-60")
+                    correction_upper = residual_upper / Decimal("2.4")
+                authentication["residual_upper_bound_abs"] = str(
+                    residual_upper
+                )
+                authentication["correction_upper_bound"] = str(correction_upper)
+                response["root_authentication"] = authentication
+                response["root_residual_abs"] = "1E-10"
+                return response
+
+        backend = JuliaPrecisionRootBackend(
+            VettedNativeDeterminantKernel.identity,
+            FalseSolvedAdapter(),
+            80,
+        )
+        with self.assertRaisesRegex(
+            JuliaResponseBackendError, "correction target"
+        ):
+            backend.read_root(_job_for_mechanism("horizon-admittance"), 0.0j)
+
+    def test_non_converged_response_still_carries_authentication(self):
+        class NonconvergedAdapter(FakeAdapter):
+            def evaluate(self, request):
+                response = super().evaluate(request)
+                response.update({
+                    "root_converged": False,
+                    "root_displacement_abs": "0",
+                    "truncation_radius_abs": None,
+                    "resolution_radius_abs": None,
+                    "seed_path_radius_abs": None,
+                    "diagnostic_roots": {},
+                    "diagnostics_skipped_reason": "PRIMARY_NOT_CONVERGED",
+                })
+                return response
+
+        adapter = NonconvergedAdapter()
+        backend = JuliaPrecisionRootBackend(
+            VettedNativeDeterminantKernel.identity, adapter, 80
+        )
+
+        readout = backend.read_root(_deep_job(), 0.0j)
+
+        self.assertFalse(readout.converged)
+        response = adapter.evaluate(adapter.requests[0])
+        self.assertIsNotNone(
+            RootAuthenticationEvidence.from_mapping(
+                response["root_authentication"]
+            )
+        )
 
     def test_worker_control_failure_binds_request_job_and_refinement(self):
         root = Path(__file__).resolve().parents[1]
@@ -454,7 +901,9 @@ class JuliaResponseBackendTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
 
         self.assertIn("initial_determinant = determinant_progress(", worker)
-        self.assertIn("best_residual = abs(initial_determinant.value)", worker)
+        self.assertIn(
+            "best_upper_bound = determinant_upper_bound_abs(", worker
+        )
         self.assertIn("carried_residual = initial_determinant", worker)
         self.assertIn("carried_available = true", worker)
         self.assertIn("carried_available = false", worker)
@@ -468,7 +917,24 @@ class JuliaResponseBackendTests(unittest.TestCase):
             "root_evaluation =",
             worker,
         )
-        self.assertIn("isnothing(accepted_derivative) ?", worker)
+        # The accepted Newton derivative is reused only on the unauthenticated
+        # single-step path. The authenticated search must not reuse it: that
+        # value was computed without an authenticated error term, so reusing it
+        # would place an unauthenticated estimate inside an authenticated bound.
+        single_step = worker[
+            worker.index("function evaluate_single_derivative_step(") :
+            worker.index("function evaluate_derivative_step_ladder(")
+        ]
+        self.assertIn("isnothing(accepted_derivative) ?", single_step)
+        ladder = worker[
+            worker.index("function evaluate_derivative_step_ladder(") :
+            worker.index("function root_authentication_text(")
+        ]
+        self.assertNotIn("accepted_derivative,\n            nothing,", ladder)
+        self.assertIn(
+            "authenticate_controls || return evaluate_single_derivative_step(",
+            ladder,
+        )
         # The seed determinant is carried, not recomputed, but every later
         # iteration still evaluates its own residual at its own frequency.
         bounded_newton = worker[
@@ -523,15 +989,23 @@ class JuliaResponseBackendTests(unittest.TestCase):
         self.assertIn(
             'progress_operation("r-from-rho"; payload=Dict(', worker
         )
+        # The coordinate map draws its own tolerance pair. Collapsing the pair,
+        # or sharing the homogeneous solve's local-error target, is what pinned
+        # Leaf 13's coordinate leg at 8.1e-17 steps.
+        self.assertIn("function coordinate_ode_tolerances(", worker)
         self.assertIn(
-            'reltol=parse_real(T, request, "ode_relative_tolerance")', worker
+            'reltol=parse_real(T, request, "coordinate_ode_relative_tolerance")',
+            worker,
         )
         self.assertIn(
-            'abstol=parse_real(T, request, "ode_absolute_tolerance")', worker
+            'abstol=parse_real(T, request, "coordinate_ode_absolute_tolerance")',
+            worker,
         )
+        self.assertIn("reltol=tolerances.reltol", worker)
+        self.assertIn("abstol=tolerances.abstol", worker)
         self.assertNotIn("tolerance = min(", worker)
-        self.assertNotIn("reltol=tolerance", worker)
-        self.assertNotIn("abstol=tolerance", worker)
+        self.assertNotIn("reltol=tolerance,", worker)
+        self.assertNotIn("abstol=tolerance,", worker)
 
     def test_package_worker_observes_every_promoted_ode_leg_before_use(self):
         root = Path(__file__).resolve().parents[1]
@@ -616,9 +1090,34 @@ class JuliaResponseBackendTests(unittest.TestCase):
 
         self.assertIn('"root_correction_tolerance"', worker)
         self.assertIn('"newton_correction_estimate_abs"', worker)
-        self.assertIn("correction_abs = magnitude / derivative_abs", worker)
+        # Acceptance compares error-inclusive quantities. Using |D| / |D'|
+        # treats a determinant that is small only because its own noise
+        # cancelled as though the root were located.
+        self.assertIn(
+            "residual_upper_bound = magnitude + residual_error_abs", worker
+        )
+        self.assertIn(
+            "lower_bound_abs = abs(value) - step_disagreement_abs -",
+            worker,
+        )
+        self.assertIn("propagated_error_abs", worker)
+        self.assertIn(
+            "correction_abs = residual_upper_bound / derivative_lower_bound",
+            worker,
+        )
         self.assertIn("correction_abs <= tolerance", worker)
+        self.assertNotIn("correction_abs = magnitude / derivative_abs", worker)
         self.assertNotIn("best_residual <= tolerance", worker)
+        # A slope indistinguishable from determinant noise is named, not
+        # divided by.
+        self.assertIn("DETERMINANT_UNCERTAINTY_TOO_LARGE", worker)
+        self.assertIn("lower_bound_abs > zero(T)", worker)
+        # Damping compares error-inclusive bounds too.
+        self.assertIn(
+            "candidate_improves = candidate_upper_bound < residual_upper_bound",
+            worker,
+        )
+        self.assertNotIn("if candidate_abs < magnitude", worker)
 
     def test_package_worker_uses_stable_two_ended_determinants(self):
         """Catches singular horizon reconstruction and common-flow exterior roots."""
@@ -628,7 +1127,8 @@ class JuliaResponseBackendTests(unittest.TestCase):
             / "src/windows_solver/data/julia/m02_worker.jl"
         ).read_text(encoding="utf-8")
 
-        self.assertIn("Solutions.solve_scaled_factored_scattering(", worker)
+        self.assertIn("Solutions.solve_scaled_horizon_basis_at_match(", worker)
+        self.assertIn("Solutions.build_match_horizon_basis(", worker)
         self.assertIn("Solutions.evaluate_normalised_horizon_determinant(", worker)
         self.assertIn(
             "reflectivity = amplitude / "
@@ -687,7 +1187,28 @@ class JuliaResponseBackendTests(unittest.TestCase):
 
         self.assertNotIn('value -= parse(T, "0.125") * step', worker)
         self.assertIn("!accepted && break", worker)
-        self.assertIn("best_value, best_residual = candidate, candidate_abs", worker)
+        self.assertRegex(
+            worker,
+            r"determinant_is_better\(\s*T,\s*candidate_residual,\s*"
+            r"best_evaluation\s*\)",
+        )
+
+    def test_error_model_identity_is_the_complete_v2_certificate(self):
+        root = Path(__file__).resolve().parents[1]
+        worker = (root / "src/windows_solver/data/julia/m02_worker.jl").read_text(
+            encoding="utf-8"
+        )
+        engine = (root / "src/windows_solver/response_engine.py").read_text(
+            encoding="utf-8"
+        )
+        identity = "verified-endpoint-control-equivalence-absolute-error/v2"
+        self.assertIn(identity, worker)
+        self.assertIn(identity, engine)
+        # The superseded single-component identity must not linger: it named an
+        # error model with only the endpoint term, so reusing it would let a
+        # receipt claim control and equivalence evidence it never carried.
+        self.assertNotIn("verified-endpoint-absolute-error/v1", engine)
+        self.assertNotIn("verified-endpoint-absolute-error/v1", worker)
 
     def test_package_worker_cross_checks_frequency_derivatives(self):
         worker = (
@@ -712,6 +1233,34 @@ class JuliaResponseBackendTests(unittest.TestCase):
             worker,
         )
         self.assertIn("derivative_control_completed", worker)
+        for contract in (
+            "struct DerivativeAuthentication{T<:AbstractFloat}",
+            "propagated_error_abs::T",
+            "step_disagreement_abs::T",
+            "lower_bound_abs::T",
+            "root_authentication",
+            '"central_determinant_re"',
+            '"residual_upper_bound_abs"',
+            '"selected_step"',
+            '"error_model_id"',
+        ):
+            self.assertIn(contract, worker)
+
+    def test_ci_executes_the_worker_finite_difference_spec(self):
+        workflow = (
+            Path(__file__).resolve().parents[1] / ".github/workflows/ci.yml"
+        ).read_text(encoding="utf-8")
+        package_tests = (
+            Path(__file__).resolve().parents[1]
+            / "src/windows_solver/data/julia/GeneralizedSasakiNakamura.jl/test/runtests.jl"
+        ).read_text(encoding="utf-8")
+        self.assertIn(
+            'joinpath(ENV["GSN_PROJECT"], "test", "runtests.jl")',
+            workflow,
+        )
+        self.assertIn('include("real_inner_horizon_spec.jl")', package_tests)
+        self.assertIn("m02_worker_finite_difference_spec.jl", workflow)
+        self.assertIn("leaf13_horizon_harness_spec.jl", workflow)
 
     def test_package_worker_confines_fine_steps_and_stores_only_endpoints(self):
         worker = (
@@ -993,37 +1542,87 @@ class JuliaResponseBackendTests(unittest.TestCase):
         )
         self.assertEqual(request["refinement_level"], 1)
 
-    def test_promoted_policy_refines_80_without_changing_120_contract(self):
-        """Catches coupling scientific solve targets to BigFloat storage digits."""
+    def test_scientific_root_target_is_independent_of_storage_digits(self):
+        """Catches coupling scientific solve targets to BigFloat storage digits.
+
+        The previous table derived the 120-digit controls from the digit count,
+        producing a 1e-102 root target -- 108 required reliable digits -- for a
+        calculation whose scientific requirement is 24. More stored digits do
+        not make a QNM root more accurately defined; they buy guard precision.
+        """
 
         job = _deep_job()
         adapter = FakeAdapter()
-        policy80_refined = JuliaPrecisionRootBackend(
-            VettedNativeDeterminantKernel.identity, adapter, 80, refinement=1
-        )._request(job, 0.0j)["policy"]
-        policy120 = JuliaPrecisionRootBackend(
-            VettedNativeDeterminantKernel.identity, adapter, 120
-        )._request(job, 0.0j)["policy"]
-        policy120_refined = JuliaPrecisionRootBackend(
-            VettedNativeDeterminantKernel.identity, adapter, 120, refinement=1
-        )._request(job, 0.0j)["policy"]
 
+        def policy(digits: int, refinement: int) -> dict[str, object]:
+            return JuliaPrecisionRootBackend(
+                VettedNativeDeterminantKernel.identity,
+                adapter,
+                digits,
+                refinement=refinement,
+            )._request(job, 0.0j)["policy"]
+
+        policy80, policy80_refined = policy(80, 0), policy(80, 1)
+        policy120, policy120_refined = policy(120, 0), policy(120, 1)
+
+        # The scientific target is a property of the physics, so it is the
+        # same at both storage tiers.
+        for base, refined in ((policy80, policy80_refined),
+                              (policy120, policy120_refined)):
+            self.assertEqual(base["root_correction_tolerance"], "1e-18")
+            self.assertEqual(refined["root_correction_tolerance"], "1e-20")
         self.assertEqual(
-            policy80_refined["root_correction_tolerance"], "1e-20"
+            policy120["root_correction_tolerance"],
+            policy80["root_correction_tolerance"],
         )
-        self.assertEqual(policy80_refined["ode_relative_tolerance"], "1e-20")
-        self.assertEqual(policy80_refined["ode_absolute_tolerance"], "1e-20")
-        self.assertEqual(policy80_refined["frequency_step"], "1e-7")
-        self.assertEqual(policy120["root_correction_tolerance"], "1e-102")
-        self.assertEqual(policy120["ode_relative_tolerance"], "1e-102")
-        self.assertEqual(policy120["ode_absolute_tolerance"], "1e-104")
-        self.assertEqual(policy120["frequency_step"], "1e-60")
         self.assertEqual(
-            policy120_refined["root_correction_tolerance"], "1e-106"
+            policy120_refined["root_correction_tolerance"],
+            policy80_refined["root_correction_tolerance"],
         )
-        self.assertEqual(policy120_refined["ode_relative_tolerance"], "1e-106")
-        self.assertEqual(policy120_refined["ode_absolute_tolerance"], "1e-108")
-        self.assertEqual(policy120_refined["frequency_step"], "1e-60")
+
+        # The extra 120-digit precision is spent as guard: ODE controls are
+        # tightened by a bounded factor over the healthy 80-digit level, not
+        # driven toward the arithmetic floor.
+        for field in (
+            "homogeneous_ode_relative_tolerance",
+            "coordinate_ode_relative_tolerance",
+        ):
+            exponent80 = int(policy80[field].split("e-")[1])
+            exponent120 = int(policy120[field].split("e-")[1])
+            self.assertGreater(exponent120, exponent80)
+            self.assertLess(exponent120 - exponent80, 40)
+
+        # The coordinate map is never driven harder than the homogeneous solve.
+        for candidate in (policy80, policy80_refined,
+                          policy120, policy120_refined):
+            coordinate = int(
+                candidate["coordinate_ode_relative_tolerance"].split("e-")[1]
+            )
+            homogeneous = int(
+                candidate["homogeneous_ode_relative_tolerance"].split("e-")[1]
+            )
+            self.assertLessEqual(coordinate, homogeneous)
+
+        # The derivative step stays in a bounded, calibratable range rather
+        # than sitting at a digit-derived 1e-60.
+        for candidate in (policy80, policy120):
+            self.assertEqual(candidate["frequency_step"], "1e-6")
+            step = float(candidate["frequency_step"])
+            self.assertLess(float(candidate["frequency_step_minimum"]), step)
+            self.assertGreater(float(candidate["frequency_step_maximum"]), step)
+
+    def test_horizon_control_profile_is_explicitly_unmeasured(self):
+        job = _deep_job()
+        horizon = JuliaPrecisionRootBackend(
+            VettedNativeDeterminantKernel.identity,
+            FakeAdapter(),
+            80,
+        )._request(job, 0.0j)["policy"]
+        self.assertEqual(
+            horizon["control_profile_label"],
+            "provisional promoted control profile",
+        )
+        self.assertEqual(horizon["calibration_status"], "UNMEASURED")
 
     def test_promoted_nonconvergence_preserves_authenticated_branch(self):
         """Catches relabelling an in-radius Julia failure as branch loss."""
@@ -1035,7 +1634,6 @@ class JuliaResponseBackendTests(unittest.TestCase):
                     "root_omega_re": request["omega"]["real"],
                     "root_omega_im": request["omega"]["imaginary"],
                     "root_displacement_abs": "0",
-                    "root_residual_abs": "5e-11",
                     "root_converged": False,
                 })
                 return response
@@ -1461,6 +2059,9 @@ class JuliaResponseBackendTests(unittest.TestCase):
                 "homogeneous_ode_maxiters",
                 "max_accepted_steps_per_homogeneous_leg",
                 "max_rhs_evaluations_per_homogeneous_leg",
+                "coordinate_stall_rhs_threshold",
+                "coordinate_stall_minimum_span_fraction",
+                "coordinate_stall_minimum_step_fraction",
                 "homogeneous_leg_wall_clock_seconds",
                 "sha256",
             },

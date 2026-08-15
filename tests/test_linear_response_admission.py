@@ -66,6 +66,11 @@ _APPROVED_REGULARISED_GSN_REVIEW_POLICY = {
     "independent_reference_fixture_receipt_status": "reviewed/v1",
     "independent_reference_fixture_receipt_sha256": "b" * 64,
 }
+_MEASURED_REGULARISED_GSN_POLICY = {
+    **_APPROVED_REGULARISED_GSN_REVIEW_POLICY,
+    "control_profile_label": "provisional promoted control profile",
+    "calibration_status": "MEASURED",
+}
 
 
 def _write_json(path: Path, value: object) -> None:
@@ -313,6 +318,22 @@ class RegularisedGSNReleaseGateTests(unittest.TestCase):
             ):
                 admit_linear_response_bundle(manifest)
 
+    def test_release_admission_is_blocked_for_unmeasured_controls(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            manifest = _admission_fixture(Path(temporary), complete=True)
+            policy = {
+                **_APPROVED_REGULARISED_GSN_REVIEW_POLICY,
+                "control_profile_label": "provisional promoted control profile",
+                "calibration_status": "UNMEASURED",
+            }
+            with patch(
+                "windows_solver.linear_response_admission."
+                "regularised_gsn_precision_policy",
+                return_value=policy,
+            ):
+                with self.assertRaisesRegex(ValueError, "calibration receipt"):
+                    admit_linear_response_bundle(manifest)
+
     def test_each_review_receipt_must_be_sha_bound(self) -> None:
         policies = {
             "missing_human_digest": {
@@ -347,7 +368,7 @@ class LinearResponseAdmissionTests(unittest.TestCase):
         review_policy = patch(
             "windows_solver.linear_response_admission."
             "regularised_gsn_precision_policy",
-            return_value=_APPROVED_REGULARISED_GSN_REVIEW_POLICY,
+            return_value=_MEASURED_REGULARISED_GSN_POLICY,
         )
         review_policy.start()
         self.addCleanup(review_policy.stop)

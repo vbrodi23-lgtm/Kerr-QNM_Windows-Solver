@@ -199,7 +199,7 @@ class CampaignPlanTests(unittest.TestCase):
         with self.subTest(contract="identity"):
             self.assertEqual(
                 scientific_computation_identity_sha256(plan, primary),
-                "5710cf7b3f53aab8602c07d170dad3e8e1e2527b0c179a27c191607e2babf575",
+                "3e37cdbce6edc37e3357e38d646fd34ab840becdfefc3bb998a54db5e179f01f",
             )
             self.assertEqual(
                 scientific_computation_identity_sha256(plan, control),

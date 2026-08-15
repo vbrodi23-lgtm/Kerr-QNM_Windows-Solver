@@ -68,14 +68,19 @@ jobs:
             Pkg.instantiate()
             Pkg.precompile()
           '
-      - name: Run load-bearing factored GSN regression
+      - name: Run complete vendored GSN unit set
         shell: bash
         run: |
           julia --startup-file=no --history-file=no --project="$M02_PROJECT" -e '
-            using Test
-            using GeneralizedSasakiNakamura
-            include(joinpath(ENV["GSN_PROJECT"], "test", "factored_propagation_spec.jl"))
+            include(joinpath(ENV["GSN_PROJECT"], "test", "runtests.jl"))
           '
+      - name: Run worker determinant and finite-difference authentication regression
+        shell: bash
+        run: |
+          julia --startup-file=no --history-file=no --project="$M02_PROJECT" \
+            src/windows_solver/data/julia/m02_worker_finite_difference_spec.jl
+          julia --startup-file=no --history-file=no --project="$M02_PROJECT" \
+            tools/leaf13_horizon_harness_spec.jl
 
   test:
     strategy:

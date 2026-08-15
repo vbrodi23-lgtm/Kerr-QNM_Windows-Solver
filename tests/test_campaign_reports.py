@@ -455,7 +455,10 @@ class CampaignReportTests(unittest.TestCase):
         self.assertNotIn("  64 CONVERGED", table)
         self.assertEqual(_root_correction_tolerance_for_precision(64), 2.0e-11)
         self.assertEqual(_root_correction_tolerance_for_precision(80), 1.0e-18)
-        self.assertEqual(_root_correction_tolerance_for_precision(120), 1.0e-102)
+        # The promoted target is the same at both storage tiers. It was
+        # previously reconstructed from the digit count as 1e-102, which is a
+        # threshold no promoted request has ever carried.
+        self.assertEqual(_root_correction_tolerance_for_precision(120), 1.0e-18)
 
     def test_dashboard_throttles_fast_inner_events_but_forces_heartbeat(self):
         """Catches terminal redraw volume scaling with determinant operations."""
@@ -563,6 +566,43 @@ class CampaignReportTests(unittest.TestCase):
             )
             self.assertEqual(stage_row["root_displacement_abs"], 0.0)
 
+    def test_report_tolerance_follows_policy_not_storage_precision(self):
+        """Catches reports reconstructing the solve target from digit count.
+
+        The promoted threshold is a property of the physics, so it is the same
+        at both storage tiers. Deriving it from precision produced ``1e-102``
+        for a 120-digit stage while the request actually carried ``1e-18``,
+        making ``newton_correction_over_tolerance`` wrong by roughly eighty
+        orders of magnitude -- a converged root reads as hopelessly
+        under-converged.
+        """
+
+        from windows_solver.campaign_reports import (
+            _root_correction_tolerance_for_precision as tolerance_for,
+        )
+        from windows_solver.julia_response_backend import (
+            promoted_precision_numerical_controls,
+        )
+
+        controls = promoted_precision_numerical_controls()
+        for digits in (80, 120):
+            with self.subTest(digits=digits):
+                self.assertEqual(
+                    tolerance_for(digits),
+                    float(
+                        controls[str(digits)]["base"][
+                            "root_correction_tolerance"
+                        ]
+                    ),
+                )
+        # Same physics target at both tiers, and emphatically not 1e-102.
+        self.assertEqual(tolerance_for(120), tolerance_for(80))
+        self.assertGreater(tolerance_for(120), 1.0e-30)
+        # Binary64 is not a promoted tier and keeps its own threshold.
+        self.assertEqual(tolerance_for(64), 2.0e-11)
+        with self.assertRaises(ValueError):
+            tolerance_for(96)
+
             reporter = CampaignProgressReporter("normal", checkpoint, io.StringIO())
             reporter._campaign_report_model = model
             table = "\n".join(reporter._precision_stage_table_lines())
@@ -664,3 +704,133 @@ class CampaignReportTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AuthenticationReportColumnTests(unittest.TestCase):
+    """The acceptance comparison must survive into the report a human reads."""
+
+    def _fields(self, readout):
+        from windows_solver.campaign_reports import (
+            _authentication_report_fields,
+        )
+
+        return _authentication_report_fields(readout)
+
+    def test_authentication_columns_stay_a_sibling_of_conditioning(self):
+        """Catches acceptance terms leaking into the solve-health surface.
+
+        ``CONDITIONING_REPORT_COLUMNS`` is pinned by contract and mirrored into
+        the live progress mapping, which reports how healthy a solve's
+        arithmetic is. Acceptance evidence answers a different question and is
+        present or absent independently, so it rides beside conditioning in the
+        leaf row rather than inside it.
+        """
+
+        from windows_solver.campaign_reports import (
+            AUTHENTICATION_REPORT_COLUMNS,
+            CONDITIONING_REPORT_COLUMNS,
+            LEAF_COLUMNS,
+        )
+
+        self.assertEqual(
+            set(AUTHENTICATION_REPORT_COLUMNS)
+            & set(CONDITIONING_REPORT_COLUMNS),
+            set(),
+        )
+        self.assertTrue(set(AUTHENTICATION_REPORT_COLUMNS) <= set(LEAF_COLUMNS))
+        # No column is silently dropped by a name collision in the leaf row.
+        self.assertEqual(len(LEAF_COLUMNS), len(set(LEAF_COLUMNS)))
+
+    def test_report_row_carries_every_term_of_the_acceptance_comparison(self):
+        """Catches a report that shows ``converged`` and nothing behind it.
+
+        A row saying a root converged, without the residual bound, derivative
+        bound and error components the decision came from, cannot be audited --
+        only believed. These columns exist so the comparison can be re-derived
+        from the row itself.
+        """
+
+        from windows_solver.campaign_reports import (
+            AUTHENTICATION_REPORT_COLUMNS,
+        )
+        from windows_solver.response_engine import RootAuthenticationEvidence
+        from tests.fixtures import valid_root_authentication
+
+        authentication = RootAuthenticationEvidence.from_mapping(
+            valid_root_authentication("horizon-admittance")
+        )
+        fields = self._fields(
+            SimpleNamespace(root_authentication=authentication)
+        )
+
+        self.assertEqual(
+            set(AUTHENTICATION_REPORT_COLUMNS) - set(fields), set()
+        )
+        # Exact decimal text, not a binary64 rendering: at 1e-60 and below the
+        # float round trip collapses distinct components onto one another.
+        self.assertEqual(fields["determinant_error_abs"], "1.4E-60")
+        self.assertEqual(fields["endpoint_disagreement_abs"], "2.1875E-62")
+        self.assertEqual(fields["control_disagreement_abs"], "1E-62")
+        self.assertEqual(fields["equivalence_disagreement_abs"], "5E-63")
+        self.assertEqual(fields["precision_disagreement_abs"], "3E-63")
+        self.assertEqual(fields["determinant_error_safety_factor"], "64")
+        self.assertEqual(fields["central_determinant_re"], "1E-60")
+        self.assertEqual(fields["central_determinant_im"], "0")
+        self.assertEqual(fields["residual_upper_bound_abs"], "2.4E-60")
+        self.assertEqual(
+            fields["derivative_re"],
+            "2.400000000000000000000000000000000000000000000000000003",
+        )
+        self.assertEqual(fields["derivative_im"], "0")
+        self.assertEqual(fields["derivative_lower_bound_abs"], "2.4")
+        self.assertEqual(fields["correction_upper_bound"], "1E-60")
+        self.assertEqual(fields["root_correction_tolerance"], "1E-18")
+        self.assertIs(fields["root_authentication_accepted"], True)
+        self.assertEqual(fields["derivative_axis"], "real")
+        self.assertEqual(
+            fields["determinant_error_model"],
+            "verified-endpoint-control-equivalence-absolute-error/v2",
+        )
+
+        # The decision re-derives from the row alone.
+        from decimal import Decimal
+
+        self.assertEqual(
+            Decimal(fields["residual_upper_bound_abs"])
+            / Decimal(fields["derivative_lower_bound_abs"]),
+            Decimal(fields["correction_upper_bound"]),
+        )
+
+    def test_a_family_without_an_error_model_leaves_the_columns_empty(self):
+        """Absent evidence must read as absent, never as a defaulted zero.
+
+        A zero in these columns would claim a measured, perfect agreement. The
+        exterior Wronskian path publishes no error model in this revision, so
+        its columns have to stay null.
+        """
+
+        from windows_solver.campaign_reports import (
+            AUTHENTICATION_REPORT_COLUMNS,
+        )
+        from windows_solver.response_engine import RootAuthenticationEvidence
+        from tests.fixtures import valid_root_authentication
+
+        authentication = RootAuthenticationEvidence.from_mapping(
+            valid_root_authentication("exterior-fixed-r3")
+        )
+        fields = self._fields(
+            SimpleNamespace(root_authentication=authentication)
+        )
+
+        self.assertIsNone(fields["determinant_error_abs"])
+        self.assertIsNone(fields["determinant_error_model"])
+        self.assertIsNone(fields["precision_disagreement_abs"])
+        # The comparison's own terms are still present; only the error model is
+        # missing.
+        self.assertEqual(fields["residual_upper_bound_abs"], "2.4E-60")
+
+        # A readout that predates the record leaves every column null rather
+        # than failing, so historical checkpoints stay projectable.
+        historical = self._fields(SimpleNamespace())
+        for column in AUTHENTICATION_REPORT_COLUMNS:
+            self.assertIsNone(historical[column])

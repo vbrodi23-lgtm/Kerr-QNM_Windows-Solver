@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import csv
 from dataclasses import dataclass
+from decimal import Decimal
 import hashlib
 import json
 import math
@@ -23,6 +24,7 @@ from .response_batches import (
     STAGE_SIGNED_ERROR_FAMILIES,
     validate_campaign_checkpoint,
 )
+from .julia_response_backend import promoted_precision_numerical_controls
 from .precision_tiers import precision_tier_presentation
 from .response_engine import ComponentResult, ERROR_CHANNELS
 from .response_reduction import (
@@ -31,6 +33,41 @@ from .response_reduction import (
     SignedErrorContribution,
     build_projective_row_plans,
     reduce_projective_rows,
+)
+
+
+# The terms of the acceptance comparison itself, so a reader can re-derive the
+# decision from a report row instead of taking `converged` on faith. Absent for
+# determinant families that publish no error model, which is why every column
+# is nullable rather than defaulted.
+#
+# Deliberately a sibling of CONDITIONING_REPORT_COLUMNS rather than part of it.
+# Conditioning describes how healthy the arithmetic of a solve was; this
+# describes what the acceptance decision was made on. They answer different
+# questions, they can be present independently, and the conditioning tuple is
+# pinned by contract and mirrored into the live progress mapping -- widening it
+# would put acceptance terms on a dashboard that reports solve health.
+AUTHENTICATION_REPORT_COLUMNS = (
+    "central_determinant_re",
+    "central_determinant_im",
+    "determinant_error_model",
+    "determinant_error_abs",
+    "determinant_error_safety_factor",
+    "endpoint_disagreement_abs",
+    "control_disagreement_abs",
+    "equivalence_disagreement_abs",
+    "precision_disagreement_abs",
+    "residual_upper_bound_abs",
+    "derivative_re",
+    "derivative_im",
+    "derivative_lower_bound_abs",
+    "derivative_propagated_error_abs",
+    "derivative_step_disagreement_abs",
+    "derivative_selected_step",
+    "derivative_axis",
+    "correction_upper_bound",
+    "root_correction_tolerance",
+    "root_authentication_accepted",
 )
 
 
@@ -94,6 +131,7 @@ LEAF_COLUMNS = (
     "baseline_determinant_residual",
     "baseline_newton_correction",
     *CONDITIONING_REPORT_COLUMNS,
+    *AUTHENTICATION_REPORT_COLUMNS,
     "signed_root_crosscheck_real",
     "signed_root_crosscheck_imaginary",
     "signed_root_crosscheck_magnitude",
@@ -328,16 +366,99 @@ def _conditioning_report_fields(readout: object) -> dict[str, object]:
     return output
 
 
+def _authentication_report_fields(readout: object) -> dict[str, object]:
+    """Project the acceptance comparison's own terms onto report columns.
+
+    Reported as the worker's decimal text, not as floats. These numbers live at
+    1e-60 and below; rendering them through binary64 would round several of
+    them to the same value and quietly destroy the comparison the columns exist
+    to expose.
+    """
+
+    output: dict[str, object] = {
+        name: None for name in AUTHENTICATION_REPORT_COLUMNS
+    }
+    authentication = _optional_evidence_value(readout, "root_authentication")
+    if authentication is None:
+        return output
+    for column, name in (
+        ("central_determinant_re", "central_determinant_re"),
+        ("central_determinant_im", "central_determinant_im"),
+        ("residual_upper_bound_abs", "residual_upper_bound_abs"),
+        ("derivative_lower_bound_abs", "derivative_lower_bound_abs"),
+        ("derivative_propagated_error_abs", "derivative_propagated_error_abs"),
+        (
+            "derivative_step_disagreement_abs",
+            "derivative_step_disagreement_abs",
+        ),
+        ("derivative_selected_step", "selected_step"),
+        ("derivative_axis", "derivative_axis"),
+        ("correction_upper_bound", "correction_upper_bound"),
+        ("root_correction_tolerance", "root_correction_tolerance"),
+        ("root_authentication_accepted", "accepted"),
+        ("determinant_error_model", "error_model_id"),
+    ):
+        output[column] = _decimal_report_text(
+            _optional_evidence_value(authentication, name)
+        )
+    derivative = _optional_evidence_value(
+        authentication, "derivative_authentication"
+    )
+    if derivative is not None:
+        for column, name in (
+            ("derivative_re", "derivative_re"),
+            ("derivative_im", "derivative_im"),
+        ):
+            output[column] = _decimal_report_text(
+                _optional_evidence_value(derivative, name)
+            )
+    breakdown = _optional_evidence_value(authentication, "error_breakdown")
+    if breakdown is None:
+        return output
+    for column, name in (
+        ("determinant_error_abs", "numerical_error_abs"),
+        ("determinant_error_safety_factor", "safety_factor"),
+        ("endpoint_disagreement_abs", "endpoint_disagreement_abs"),
+        ("control_disagreement_abs", "control_disagreement_abs"),
+        ("equivalence_disagreement_abs", "equivalence_disagreement_abs"),
+        ("precision_disagreement_abs", "precision_disagreement_abs"),
+    ):
+        output[column] = _decimal_report_text(
+            _optional_evidence_value(breakdown, name)
+        )
+    return output
+
+
+def _decimal_report_text(value: object) -> object:
+    """Return a ``Decimal`` as exact text, leaving anything else alone."""
+
+    return str(value) if isinstance(value, Decimal) else value
+
+
 def _root_correction_tolerance_for_precision(digits: int) -> float:
-    """Return the Newton-correction threshold governing one M02 stage."""
+    """Return the Newton-correction threshold governing one M02 stage.
+
+    The promoted threshold is read from the policy the solver was actually
+    given, not reconstructed from the stored digit count. Those two answers used
+    to differ enormously: a 120-digit stage was reported against ``1e-102``
+    while the request carried ``1e-18``, so ``newton_correction_over_tolerance``
+    was wrong by some eighty orders of magnitude and a converged root read as
+    hopelessly under-converged.
+
+    The scientific target is a property of the physics rather than of the
+    arithmetic, which is exactly why it cannot be derived from precision.
+    """
 
     if digits == 64:
+        # Binary64 is not a promoted tier and carries no policy entry.
         return 2.0e-11
-    if digits == 80:
-        return 1.0e-18
-    if digits == 120:
-        return 1.0e-102
-    raise ValueError("campaign report stage precision is invalid")
+    controls = promoted_precision_numerical_controls()
+    tier = controls.get(str(digits))
+    if not isinstance(tier, Mapping):
+        raise ValueError("campaign report stage precision is invalid")
+    base = tier["base"]
+    assert isinstance(base, Mapping)
+    return float(base["root_correction_tolerance"])
 
 
 def _precision_stage_rows(
@@ -476,6 +597,7 @@ def _leaf_row(
             for name in ERROR_CHANNELS
         },
         **_conditioning_report_fields(result.baseline),
+        **_authentication_report_fields(result.baseline),
     })
     if record.state != "PRODUCED" or result.response is None:
         row["relative_disk_state"] = "UNRESOLVED"

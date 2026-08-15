@@ -80,6 +80,7 @@ _NORMAL_FALLBACK_KINDS = _NORMAL_KINDS | frozenset(
         ProgressEventKind.ODE_SOLVE_COMPLETED,
         ProgressEventKind.ODE_SOLVE_FAILED,
         ProgressEventKind.ODE_RESOURCE_LIMIT,
+        ProgressEventKind.COORDINATE_INVERSION_STALLED,
         ProgressEventKind.ROOT_READOUT_RESOURCE_INFEASIBLE,
     }
 )
@@ -116,9 +117,11 @@ _FORCED_STATUS_KINDS = frozenset(
         ProgressEventKind.PRECISION_STAGE_STARTED,
         ProgressEventKind.ASYMPTOTIC_SERIES_EVALUATED,
         ProgressEventKind.CONDITIONING_EVALUATED,
+        ProgressEventKind.DERIVATIVE_CONTROL_COMPLETED,
         ProgressEventKind.ODE_SOLVE_COMPLETED,
         ProgressEventKind.ODE_SOLVE_FAILED,
         ProgressEventKind.ODE_RESOURCE_LIMIT,
+        ProgressEventKind.COORDINATE_INVERSION_STALLED,
         ProgressEventKind.ROOT_READOUT_RESOURCE_INFEASIBLE,
         ProgressEventKind.WORKER_HEARTBEAT,
         ProgressEventKind.ERROR,
@@ -140,8 +143,10 @@ _DASHBOARD_FORCED_KINDS = frozenset(
         ProgressEventKind.ROOT_PHASE_COMPLETED,
         ProgressEventKind.ASYMPTOTIC_SERIES_EVALUATED,
         ProgressEventKind.CONDITIONING_EVALUATED,
+        ProgressEventKind.DERIVATIVE_CONTROL_COMPLETED,
         ProgressEventKind.ODE_SOLVE_FAILED,
         ProgressEventKind.ODE_RESOURCE_LIMIT,
+        ProgressEventKind.COORDINATE_INVERSION_STALLED,
         ProgressEventKind.ROOT_READOUT_RESOURCE_INFEASIBLE,
         ProgressEventKind.WORKER_HEARTBEAT,
         ProgressEventKind.LEAF_COMPLETED,
@@ -168,6 +173,8 @@ _DASHBOARD_LIVE_KINDS = frozenset(
         ProgressEventKind.SCATTERING_COEFFICIENTS_EXTRACTED,
         ProgressEventKind.DETERMINANT_CHART_EVALUATED,
         ProgressEventKind.CONDITIONING_EVALUATED,
+        ProgressEventKind.DETERMINANT_ERROR_ESTIMATED,
+        ProgressEventKind.DERIVATIVE_CONTROL_COMPLETED,
     }
 )
 _LEAF_TIMING_WINDOW = 10
@@ -235,6 +242,31 @@ _CONDITIONING_LIVE_STATE_KEYS = (
     "asymptotic_preflight_adequate",
     "asymptotic_preflight_avoided_ode",
 )
+_DETERMINANT_ERROR_LIVE_STATE_KEYS = (
+    "determinant_error_model",
+    "determinant_error_abs",
+    "determinant_error_safety_factor",
+    "endpoint_disagreement_abs",
+    "control_disagreement_abs",
+    "equivalence_disagreement_abs",
+    "precision_disagreement_abs",
+)
+_AUTHENTICATION_LIVE_STATE_KEYS = (
+    "central_determinant_re",
+    "central_determinant_im",
+    *_DETERMINANT_ERROR_LIVE_STATE_KEYS,
+    "residual_upper_bound_abs",
+    "derivative_re",
+    "derivative_im",
+    "derivative_propagated_error_abs",
+    "derivative_step_disagreement_abs",
+    "derivative_lower_bound_abs",
+    "derivative_selected_step",
+    "derivative_axis",
+    "correction_upper_bound",
+    "root_correction_tolerance",
+    "root_authentication_accepted",
+)
 _PRECISION_LIVE_STATE_KEYS = (
     "phase",
     "seed_kind",
@@ -257,6 +289,7 @@ _PRECISION_LIVE_STATE_KEYS = (
     "epsilon",
     "amplitude",
     *_CONDITIONING_LIVE_STATE_KEYS,
+    *_AUTHENTICATION_LIVE_STATE_KEYS,
     *_RADIAL_PROGRESS_STATE_KEYS,
     *_ODE_PROGRESS_STATE_KEYS,
 )
@@ -942,6 +975,7 @@ class CampaignProgressReporter:
                     "determinant_index_newton",
                     "determinant_abs",
                     "suboperation",
+                    *_AUTHENTICATION_LIVE_STATE_KEYS,
                     *_RADIAL_PROGRESS_STATE_KEYS,
                 ):
                     self._dashboard_state.pop(name, None)
@@ -966,6 +1000,7 @@ class CampaignProgressReporter:
         if acceptance_threshold is not None:
             self._dashboard_state["acceptance_threshold"] = acceptance_threshold
         self._update_conditioning_dashboard_state(kind, payload)
+        self._update_authentication_dashboard_state(kind, payload)
         if kind == ProgressEventKind.SUBOPERATION_PROGRESS.value:
             self._dashboard_state.update({
                 "radial_suboperation": (
@@ -1314,6 +1349,82 @@ class CampaignProgressReporter:
             })
         elif kind == ProgressEventKind.DETERMINANT_CHART_EVALUATED.value:
             self._dashboard_state["determinant_chart"] = "Cinc/Cref − R"
+
+    def _update_authentication_dashboard_state(
+        self, kind: str, payload: Mapping[str, object]
+    ) -> None:
+        """Retain the exact terms behind the current root decision."""
+
+        authentication = payload.get("root_authentication")
+        if isinstance(authentication, Mapping):
+            for name in (
+                "central_determinant_re",
+                "central_determinant_im",
+                "residual_upper_bound_abs",
+                "correction_upper_bound",
+                "root_correction_tolerance",
+            ):
+                if authentication.get(name) is not None:
+                    self._dashboard_state[name] = authentication[name]
+            accepted = authentication.get("accepted")
+            if type(accepted) is bool:
+                self._dashboard_state["root_authentication_accepted"] = accepted
+
+            derivative = authentication.get("derivative_authentication")
+            if isinstance(derivative, Mapping):
+                derivative_names = {
+                    "derivative_re": "derivative_re",
+                    "derivative_im": "derivative_im",
+                    "derivative_propagated_error_abs": "propagated_error_abs",
+                    "derivative_step_disagreement_abs": "step_disagreement_abs",
+                    "derivative_lower_bound_abs": "lower_bound_abs",
+                    "derivative_selected_step": "selected_step",
+                    "derivative_axis": "axis",
+                }
+                for state_name, payload_name in derivative_names.items():
+                    if derivative.get(payload_name) is not None:
+                        self._dashboard_state[state_name] = derivative[payload_name]
+
+            determinant_error = authentication.get("determinant_error")
+            if determinant_error is None:
+                for name in _DETERMINANT_ERROR_LIVE_STATE_KEYS:
+                    self._dashboard_state.pop(name, None)
+            elif isinstance(determinant_error, Mapping):
+                error_names = {
+                    "determinant_error_model": "error_model_id",
+                    "determinant_error_abs": "numerical_error_abs",
+                    "determinant_error_safety_factor": "safety_factor",
+                    "endpoint_disagreement_abs": "endpoint_disagreement_abs",
+                    "control_disagreement_abs": "control_disagreement_abs",
+                    "equivalence_disagreement_abs": (
+                        "equivalence_disagreement_abs"
+                    ),
+                    "precision_disagreement_abs": "precision_disagreement_abs",
+                }
+                for state_name, payload_name in error_names.items():
+                    value = determinant_error.get(payload_name)
+                    if value is None:
+                        self._dashboard_state.pop(state_name, None)
+                    else:
+                        self._dashboard_state[state_name] = value
+            return
+
+        if kind == ProgressEventKind.DETERMINANT_ERROR_ESTIMATED.value:
+            direct_names = {
+                "determinant_error_model": "error_model_id",
+                "determinant_error_abs": "numerical_error_abs",
+                "determinant_error_safety_factor": "safety_factor",
+                "endpoint_disagreement_abs": "endpoint_disagreement_abs",
+                "control_disagreement_abs": "control_disagreement_abs",
+                "equivalence_disagreement_abs": "equivalence_disagreement_abs",
+                "precision_disagreement_abs": "precision_disagreement_abs",
+            }
+            for state_name, payload_name in direct_names.items():
+                value = payload.get(payload_name)
+                if value is None:
+                    self._dashboard_state.pop(state_name, None)
+                else:
+                    self._dashboard_state[state_name] = value
 
     def _promotion_reason(
         self, leaf_id: object, precision_digits: object
@@ -1863,6 +1974,9 @@ class CampaignProgressReporter:
         radial = self._radial_progress_text()
         ode_lines = self._ode_progress_lines(compact=compact)
         conditioning_lines = self._conditioning_progress_lines(compact=compact)
+        authentication_lines = self._authentication_progress_lines(
+            compact=compact
+        )
         if compact:
             suboperation_text = self._dashboard_value(suboperation)
             if radial is not None:
@@ -1881,6 +1995,7 @@ class CampaignProgressReporter:
                 f" |D|            {determinant_abs} | Best |D| {best_determinant_abs}",
                 *ode_lines,
                 *conditioning_lines,
+                *authentication_lines,
             ]
         return [
             "",
@@ -1912,6 +2027,7 @@ class CampaignProgressReporter:
             self._dashboard_field_line("Radial progress", radial),
             *ode_lines,
             *conditioning_lines,
+            *authentication_lines,
         ]
 
     def _radial_progress_text(self) -> str | None:
@@ -2054,6 +2170,55 @@ class CampaignProgressReporter:
             self._dashboard_field_line("Chart", chart),
         ]
 
+    def _authentication_progress_lines(self, *, compact: bool) -> list[str]:
+        """Render the absolute-error certificate for the current root."""
+
+        state = self._dashboard_state
+        if not any(
+            state.get(name) is not None
+            for name in _AUTHENTICATION_LIVE_STATE_KEYS
+        ):
+            return []
+
+        def shown(name: str) -> str:
+            value = state.get(name)
+            return "-" if value is None else str(value)
+
+        determinant = (
+            f"D={shown('central_determinant_re')} "
+            f"{shown('central_determinant_im')}i; "
+            f"eta={shown('determinant_error_abs')}; "
+            f"residual<={shown('residual_upper_bound_abs')}"
+        )
+        derivative = (
+            f"D'={shown('derivative_re')} {shown('derivative_im')}i; "
+            f"lower={shown('derivative_lower_bound_abs')}; "
+            f"step={shown('derivative_selected_step')} "
+            f"({shown('derivative_axis')})"
+        )
+        decision = (
+            f"{shown('correction_upper_bound')} / "
+            f"{shown('root_correction_tolerance')}; "
+            f"accepted={shown('root_authentication_accepted')}"
+        )
+        if compact:
+            return [
+                " ROOT AUTHENTICATION",
+                f" Determinant     {determinant}",
+                f" Derivative      {derivative}",
+                f" Correction      {decision}",
+            ]
+        return [
+            "",
+            " ROOT AUTHENTICATION",
+            self._dashboard_field_line("Determinant", determinant),
+            self._dashboard_field_line("Derivative", derivative),
+            self._dashboard_field_line("Correction", decision),
+            self._dashboard_field_line(
+                "Error model", shown("determinant_error_model")
+            ),
+        ]
+
     def _live_execution_mapping(self) -> dict[str, object]:
         state = self._dashboard_state
         mode = state.get("mode")
@@ -2115,6 +2280,10 @@ class CampaignProgressReporter:
             **{
                 name: state.get(name)
                 for name in _CONDITIONING_LIVE_STATE_KEYS
+            },
+            **{
+                name: state.get(name)
+                for name in _AUTHENTICATION_LIVE_STATE_KEYS
             },
             "series_digits_lost_max": state.get(
                 "maximum_series_digits_lost"

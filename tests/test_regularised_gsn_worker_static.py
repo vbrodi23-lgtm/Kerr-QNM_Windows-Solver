@@ -11,6 +11,9 @@ FD_SPEC_SOURCE = (
     REPO_ROOT
     / "src/windows_solver/data/julia/m02_worker_finite_difference_spec.jl"
 )
+HARNESS_COMMON_SOURCE = REPO_ROOT / "tools/leaf13_horizon_harness_common.jl"
+CALIBRATION_SOURCE = REPO_ROOT / "tools/calibrate_leaf13_horizon_controls.jl"
+BENCHMARK_SOURCE = REPO_ROOT / "tools/benchmark_leaf13_factored_legs.jl"
 
 
 class RegularisedGsnWorkerSourceTests(unittest.TestCase):
@@ -18,6 +21,32 @@ class RegularisedGsnWorkerSourceTests(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.worker = WORKER_SOURCE.read_text(encoding="utf-8")
         cls.fd_spec = FD_SPEC_SOURCE.read_text(encoding="utf-8")
+        cls.harness_common = HARNESS_COMMON_SOURCE.read_text(encoding="utf-8")
+        cls.calibration = CALIBRATION_SOURCE.read_text(encoding="utf-8")
+        cls.benchmark = BENCHMARK_SOURCE.read_text(encoding="utf-8")
+
+    def test_leaf13_harnesses_share_the_canonical_determinant_api(self) -> None:
+        self.assertIn("module Leaf13HorizonHarnessCommon", self.harness_common)
+        self.assertIn("determinant_error_abs(T, evaluation)", self.harness_common)
+        self.assertIn(
+            "derivative_authentication_candidate(", self.harness_common
+        )
+        self.assertIn(
+            "authentication.lower_bound_abs", self.harness_common
+        )
+        self.assertNotIn(
+            "lower_bound_abs = abs(derivative) -", self.harness_common
+        )
+        self.assertNotIn("evaluation.numerical_error_abs", self.calibration)
+        self.assertNotIn("evaluation.numerical_error_abs", self.benchmark)
+        self.assertNotIn("include_string", self.calibration)
+        self.assertNotIn("split(", self.calibration)
+        for source in (self.calibration, self.benchmark):
+            self.assertIn(
+                'include(joinpath(@__DIR__, "leaf13_horizon_harness_common.jl"))',
+                source,
+            )
+            self.assertIn("if abspath(PROGRAM_FILE) == @__FILE__", source)
 
     def test_worker_no_longer_owns_raw_homogeneous_production_path(self) -> None:
         for retired in (
@@ -60,12 +89,303 @@ class RegularisedGsnWorkerSourceTests(unittest.TestCase):
 
     def test_all_needed_preflights_precede_factored_homogeneous_solves(self) -> None:
         horizon = self._function_slice(
-            "evaluate_horizon_determinant", "evaluate_exterior_determinant"
+            "evaluate_horizon_determinant", "horizon_endpoint_rho_candidates"
         )
-        prepare = horizon.index("CF.prepare_factored_horizon_determinant_branches(")
-        solve = horizon.index("CF.solve_factored_xup_scattering_endpoint(")
-        self.assertLess(prepare, solve)
-        self.assertNotIn("CF.assert_factored_preflights_adequate(", horizon)
+        # The complete inner geometry and dual-series gate must pass before
+        # even preparing the outer leg.  Otherwise invalid horizon geometry
+        # can still consume the expensive Xup homogeneous solve.
+        self.assertIn(
+            "CF.horizon_endpoint_geometry_candidates(", horizon
+        )
+        geometry = horizon.index(
+            "CF.horizon_endpoint_geometry_candidates("
+        )
+        candidates = horizon.index("CF.horizon_endpoint_candidates(")
+        verified = horizon.index("CF.select_verified_horizon_endpoints(")
+        outer_contour = horizon.index("build_worker_outer_contour(")
+        outer_prepare = horizon.index("CF.prepare_factored_infinity_outgoing(")
+        outer_gate = horizon.index("CF.assert_factored_preflights_adequate(")
+        outer_solve = horizon.index("CF.solve_factored_xup_to_match(")
+        self.assertLess(geometry, candidates)
+        self.assertLess(candidates, verified)
+        self.assertLess(verified, outer_contour)
+        self.assertLess(verified, outer_prepare)
+        self.assertLess(outer_prepare, outer_gate)
+        self.assertLess(outer_gate, outer_solve)
+
+        # The verified endpoint pair also precedes both horizon propagations.
+        horizon_solve = horizon.index(
+            "CF.solve_verified_horizon_basis_to_match("
+        )
+        self.assertLess(verified, horizon_solve)
+
+    def test_horizon_determinant_cannot_use_the_mixed_inner_leg(self) -> None:
+        """The removed graph must not come back through any production path.
+
+        The mixed match-to-inner leg propagated the infinity solution into
+        horizon coordinates instead of building an independent basis, and did
+        it on a contour that escapes toward complex infinity. It is not slow
+        for want of tuning; it is the wrong calculation.
+        """
+
+        horizon = self._function_slice(
+            "evaluate_horizon_determinant", "horizon_endpoint_rho_candidates"
+        )
+        chart = self._function_slice(
+            "evaluate_horizon_chart", "determinant_error_breakdown"
+        )
+        for forbidden in (
+            "solve_factored_xup_scattering_endpoint",
+            "Xup_match_to_inner",
+            "horizon_match_to_inner",
+            "solve_factored_horizon_match_to_inner",
+            "build_common_horizon_basis",
+        ):
+            self.assertNotIn(forbidden, horizon)
+            self.assertNotIn(forbidden, chart)
+
+    def test_horizon_determinant_carries_an_absolute_error(self) -> None:
+        for contract in (
+            "struct DeterminantErrorBreakdown{T<:AbstractFloat}",
+            "error_breakdown::Union{Nothing,DeterminantErrorBreakdown{T}}",
+            "error_model_id::Union{Nothing,String}",
+            "VERIFIED_ENDPOINT_ERROR_MODEL_ID",
+            "function determinant_error_breakdown(",
+        ):
+            self.assertIn(contract, self.worker)
+        estimate = self._function_slice(
+            "determinant_error_breakdown",
+            "evaluate_horizon_reflectivity_chart",
+        )
+        # The endpoint disagreement is an absolute quantity. Dividing it by
+        # |D| would report catastrophic error precisely at a root, where the
+        # determinant is small by construction.
+        self.assertIn("safety_factor * maximum(available_components)", estimate)
+        self.assertNotIn("/ abs(", estimate)
+
+    def test_unauthenticated_families_keep_the_single_step_control(self) -> None:
+        """Catches the rung search silently changing exterior results.
+
+        The exterior scientific identity is deliberately unchanged by this
+        work, so exterior receipts written before it stay valid and reusable.
+        If exterior derivative selection changed, two runs under one identity
+        could disagree and the identity would stop meaning what it claims.
+        """
+
+        self.assertIn(
+            "function evaluate_single_derivative_step(", self.worker
+        )
+        ladder = self._function_slice(
+            "evaluate_derivative_step_ladder", "root_authentication_text"
+        )
+        # The unauthenticated path returns before any rung construction or
+        # frequency-range validation happens.
+        gate = ladder.index(
+            "authenticate_controls || return evaluate_single_derivative_step("
+        )
+        for rung_only in (
+            "validated_frequency_steps(",
+            "frequency_step_rungs(",
+            "finite_difference_noise_limit(",
+        ):
+            self.assertIn(rung_only, ladder)
+            self.assertLess(gate, ladder.index(rung_only))
+
+        single = self._function_slice(
+            "evaluate_single_derivative_step", "evaluate_derivative_step_ladder"
+        )
+        # It uses the nominal step alone and never consults the rung bounds.
+        self.assertIn("validated_frequency_step(T, request)", single)
+        for rung_only in (
+            "validated_frequency_steps(",
+            "frequency_step_rungs(",
+            "MAXIMUM_FREQUENCY_STEP_RUNGS",
+        ):
+            self.assertNotIn(rung_only, single)
+        # It keeps the historical accept-or-fail contract rather than stepping
+        # to another rung.
+        self.assertIn(
+            "determinant frequency derivative estimates do not agree", single
+        )
+        # The four-fold width requirement belongs to the rung search alone, so
+        # the Newton loop's step validation must not import it.
+        nominal_validator = self._function_slice(
+            "validated_frequency_step", "frequency_step_rungs"
+        )
+        self.assertNotIn("validated_frequency_steps(", nominal_validator)
+
+    def test_every_finite_difference_sample_stays_inside_policy(self) -> None:
+        for contract in (
+            "function admissible_frequency_step_interval(",
+            "frequency step rung samples escaped their bounds",
+        ):
+            self.assertIn(contract, self.worker)
+        rungs = self._function_slice(
+            "frequency_step_rungs", "validate_finite_difference_inputs"
+        )
+        # Admissibility is stated over the samples, not merely over the rung.
+        self.assertIn("admissible_frequency_step_interval(", rungs)
+        self.assertIn("minimum_step <= step / T(2)", rungs)
+        self.assertIn("T(2) * step <= maximum_step", rungs)
+
+    def test_finite_difference_chain_is_executable_against_a_fake(self) -> None:
+        """Source-grep assertions cannot prove error propagation; execute it."""
+
+        self.assertIn("determinant_evaluator=nothing", self.worker)
+        self.assertIn(
+            "evaluator = determinant_evaluator !== nothing ? "
+            "determinant_evaluator :",
+            self.worker,
+        )
+        for executed in (
+            "sample errors reach the accepted bound through the real chain",
+            "unresolved noise exhausts the range with a typed failure",
+            "unauthenticated control keeps the single-step historical path",
+            "a narrow range cannot silently sample outside policy",
+        ):
+            self.assertIn(executed, self.fd_spec)
+        # The executed testsets must drive the ladder, not just the helper.
+        self.assertIn("evaluate_derivative_step_ladder(", self.fd_spec)
+        self.assertIn("determinant_evaluator=evaluator", self.fd_spec)
+
+    def test_horizon_error_breakdown_is_complete_and_absolute(self) -> None:
+        for field in (
+            "endpoint_disagreement_abs::T",
+            "control_disagreement_abs::Union{Nothing,T}",
+            "equivalence_disagreement_abs::Union{Nothing,T}",
+            "precision_disagreement_abs::Union{Nothing,T}",
+            "safety_factor::T",
+            "numerical_error_abs::T",
+        ):
+            self.assertIn(field, self.worker)
+        horizon = self._function_slice(
+            "evaluate_horizon_determinant", "horizon_endpoint_rho_candidates"
+        )
+        self.assertIn("reference.assessment.equivalence_disagreement_abs", horizon)
+        self.assertIn("verification.assessment.equivalence_disagreement_abs", horizon)
+        self.assertIn("endpoint_disagreement_abs", horizon)
+        self.assertIn("equivalence_disagreement_abs", horizon)
+
+    def test_the_precision_term_is_populated_rather_than_declared(self) -> None:
+        """A component that is always ``nothing`` is a field, not a measurement.
+
+        ``precision_disagreement_abs`` shipped declared and permanently unset.
+        Asserting the struct field alone would have passed throughout, so these
+        assertions target the path that gives it a value.
+        """
+
+        for contract in (
+            "working_precision_bits_for(digits::Integer) =",
+            "const PRECISION_GUARD_DIGITS",
+            "function precision_guard_request(",
+            "function precision_guard_context(",
+            "function precision_guard_disagreement(",
+            "round_to_working_precision(::Type{T}, value::Complex)",
+            "run_at_working_precision(body, ::Type{BigFloat}",
+        ):
+            self.assertIn(contract, self.worker)
+
+        # The mantissa policy has exactly one definition. A second one is how a
+        # guard ends up asking for a width the request validator would reject.
+        self.assertEqual(
+            self.worker.count("ceil(Int, digits * log2(10)) + 32"), 1
+        )
+
+        start = self.worker.index("function precision_guard_request(")
+        guard = self.worker[
+            start:self.worker.index("run_at_working_precision(body", start)
+        ]
+        # Only the stored precision moves. Relaxing a control here would
+        # re-measure the control disagreement and double-count it in the budget.
+        for control in (
+            "ode_relative_tolerance",
+            "ode_absolute_tolerance",
+            "frequency_step",
+            "determinant_error_safety_factor",
+        ):
+            self.assertNotIn(control, guard)
+
+        authenticated = self._function_slice(
+            "authenticated_determinant_progress", "bounded_newton"
+        )
+        self.assertIn(
+            "precision_disagreement_abs=precision_disagreement_abs",
+            authenticated,
+        )
+        self.assertNotIn("precision_disagreement_abs=nothing", authenticated)
+
+        for executed in (
+            "the precision guard restates only the stored precision",
+            "the precision guard keeps the branch and drops the conditioning",
+            "the lowest stored-precision rung has nothing to compare against",
+        ):
+            self.assertIn(executed, self.fd_spec)
+
+    def test_coordinate_controls_are_separate_from_homogeneous_controls(
+        self,
+    ) -> None:
+        for contract in (
+            "function coordinate_ode_tolerances(",
+            '"coordinate_ode_relative_tolerance"',
+            '"coordinate_ode_absolute_tolerance"',
+            '"homogeneous_ode_relative_tolerance"',
+            '"homogeneous_ode_absolute_tolerance"',
+            "COORDINATE_INVERSION_STALLED",
+            "function throw_coordinate_inversion_stalled(",
+            '"ode_rejected_steps" => Int(stats.nreject)',
+            '"current_r_re" => string(real(current_radius))',
+            '"current_r_im" => string(imag(current_radius))',
+            '"coordinate_identity_residual_abs" =>',
+        ):
+            self.assertIn(contract, self.worker)
+        outer = self._function_slice(
+            "build_worker_outer_contour",
+            "build_worker_real_inner_horizon_contour",
+        )
+        inner = self._function_slice(
+            "build_worker_real_inner_horizon_contour",
+            "coordinate_identity_diagnostics",
+        )
+        for slice_text in (outer, inner):
+            self.assertIn("coordinate_ode_tolerances(T, request)", slice_text)
+            self.assertIn("r_at_rho_zero=Complex{T}(match_radius)", slice_text)
+            self.assertNotIn('"ode_relative_tolerance"', slice_text)
+
+    def test_coordinate_identity_is_a_typed_tolerance_gate(self) -> None:
+        for contract in (
+            "struct CoordinateIdentityEvidence{T<:AbstractFloat}",
+            "maximum_absolute_residual::T",
+            "maximum_relative_residual::T",
+            "absolute_tolerance::T",
+            "relative_tolerance::T",
+            "function assert_coordinate_identity(",
+            "coordinate_ode_tolerances(T, request)",
+            '"COORDINATE_IDENTITY_MISMATCH"',
+        ):
+            self.assertIn(contract, self.worker)
+
+        identity = self._function_slice(
+            "throw_coordinate_identity_mismatch",
+            "endpoint_conditioning_summary",
+        )
+        self.assertIn("Kerr.Delta(", identity)
+        self.assertIn("numerical_control_failure(", identity)
+        self.assertIn('"coordinate_identity_checked"', identity)
+        self.assertNotIn("|| continue", identity)
+
+        outer = self._function_slice(
+            "build_worker_outer_contour",
+            "build_worker_real_inner_horizon_contour",
+        )
+        inner = self._function_slice(
+            "build_worker_real_inner_horizon_contour",
+            "coordinate_identity_diagnostics",
+        )
+        for body in (outer, inner):
+            self.assertIn("assert_coordinate_identity(", body)
+            self.assertNotIn("emit_coordinate_identity(", body)
+
+    def test_exterior_determinant_preflight_ordering_is_unchanged(self) -> None:
 
         exterior = self._function_slice(
             "evaluate_exterior_determinant", "determinant"
@@ -86,15 +406,26 @@ class RegularisedGsnWorkerSourceTests(unittest.TestCase):
 
     def test_package_owns_factored_propagation_and_scattering_math(self) -> None:
         for call in (
-            "CF.solve_factored_xup_scattering_endpoint(",
+            "CF.build_real_inner_horizon_contour(",
+            "CF.horizon_endpoint_candidates(",
+            "CF.select_verified_horizon_endpoints(",
+            "CF.solve_verified_horizon_basis_to_match(",
             "CF.solve_factored_xin_to_match(",
             "CF.solve_factored_xup_to_match(",
             "CF.reconstruct_factored_match_state(",
-            "Solutions.build_common_horizon_basis(",
-            "Solutions.solve_scaled_factored_scattering(",
+            "Solutions.build_match_horizon_basis(",
+            "Solutions.solve_scaled_horizon_basis_at_match(",
             "Solutions.evaluate_normalised_horizon_determinant(",
         ):
             self.assertIn(call, self.worker)
+        # The inner-endpoint extraction pair had the mixed inner leg as its
+        # only consumer. The package still exports both -- the exterior family
+        # and the package test suite use them -- but the worker must not.
+        for retired in (
+            "Solutions.build_common_horizon_basis(",
+            "Solutions.solve_scaled_factored_scattering(",
+        ):
+            self.assertNotIn(retired, self.worker)
         self.assertIn(
             "reflectivity = amplitude / (T(2) * im * spectral.p_horizon - amplitude)",
             self.worker,
@@ -155,8 +486,12 @@ class RegularisedGsnWorkerSourceTests(unittest.TestCase):
         self.assertIn("d_minus.value", pair)
         self.assertNotIn("difference = d_plus.value - d_minus.value", pair)
         validation = pair.index("validate_finite_difference_offset(")
-        first_evaluation = pair.index("d_plus = determinant_progress(")
+        first_evaluation = pair.index("d_plus = evaluator(")
         self.assertLess(validation, first_evaluation)
+        self.assertIn(
+            "authenticated_determinant_progress : determinant_progress",
+            pair,
+        )
 
         self.assertIn("build_finite_difference_diagnostics(", self.fd_spec)
         self.assertIn("axis=axis", self.fd_spec)
@@ -255,6 +590,77 @@ class RegularisedGsnWorkerSourceTests(unittest.TestCase):
         ):
             self.assertIn(contract, self.fd_spec)
 
+    def test_final_derivatives_preserve_each_stencil_error(self) -> None:
+        pair = self._function_slice("finite_difference_pair", "bounded_newton")
+        final = self._function_slice(
+            "final_derivative", "evaluate_derivative_step_ladder"
+        )
+        ladder = self._function_slice(
+            "evaluate_derivative_step_ladder", "solve_once"
+        )
+        self.assertIn("propagated_centered_difference_error(", pair)
+        self.assertIn("return derivative, diagnostics, derivative_error_abs", final)
+        for name in ("base_error_abs", "half_error_abs", "double_error_abs", "imaginary_error_abs"):
+            self.assertIn(name, ladder)
+        self.assertIn("derivative_error_abs=half_error_abs", ladder)
+        self.assertNotIn("root_error_abs / abs(h / T(2))", ladder)
+
+    def test_derivative_authentication_derives_one_lower_bound(self) -> None:
+        authentication = self.worker[
+            self.worker.index("struct DerivativeAuthentication") :
+            self.worker.index("struct RootAuthentication")
+        ]
+        self.assertIn(
+            "lower_bound_abs = abs(value) - step_disagreement_abs -",
+            authentication,
+        )
+        self.assertNotIn(
+            "step_disagreement_abs::T,\n        lower_bound_abs::T,",
+            authentication,
+        )
+        ladder = self._function_slice(
+            "evaluate_derivative_step_ladder", "root_authentication_text"
+        )
+        self.assertNotIn(
+            "derivative_abs - uncertainty - derivative_error_abs", ladder
+        )
+
+    def test_frequency_step_ladder_is_validated_bounded_and_unique(self) -> None:
+        for contract in (
+            "const MAXIMUM_FREQUENCY_STEP_RUNGS",
+            "function validated_frequency_steps(",
+            "minimum_step <= nominal_step <= maximum_step",
+            "function frequency_step_rungs(",
+            "unique!(rungs)",
+        ):
+            self.assertIn(contract, self.worker)
+        self.assertIn("length(rungs) <= MAXIMUM_FREQUENCY_STEP_RUNGS", self.fd_spec)
+        self.assertIn("length(rungs) == length(unique(rungs))", self.fd_spec)
+
+    def test_primary_authentication_tightens_only_exact_frequencies(self) -> None:
+        for contract in (
+            "function tight_control_request(",
+            "function authenticated_determinant_progress(",
+            "base_frequency == tight_frequency",
+            "abs(base.value - tight.value)",
+            "authenticate_controls=(phase == \"PRIMARY\")",
+        ):
+            self.assertIn(contract, self.worker)
+        refined = self._function_slice("refined_request", "conditioning_response")
+        self.assertNotIn("authenticated_determinant_progress(", refined)
+
+    def test_final_authentication_leaves_exterior_derivative_path_unchanged(
+        self,
+    ) -> None:
+        solve_once = self._function_slice("solve_once", "solve_phase")
+        self.assertIn(
+            "horizon_authentication = authenticate_controls &&", solve_once
+        )
+        self.assertIn("root_evaluation.error_breakdown !== nothing", solve_once)
+        self.assertIn(
+            "authenticate_controls=horizon_authentication", solve_once
+        )
+
     def test_worker_main_is_guarded_so_pure_julia_spec_can_include_it(self) -> None:
         self.assertIn(
             'abspath(PROGRAM_FILE) == abspath(@__FILE__)', self.worker
@@ -341,13 +747,22 @@ class RegularisedGsnWorkerSourceTests(unittest.TestCase):
     def test_registered_conditioning_progress_is_literal(self) -> None:
         for event in (
             "asymptotic_series_evaluated",
-            "carrier_changed",
             "factored_ode_completed",
             "scattering_coefficients_extracted",
             "determinant_chart_evaluated",
             "conditioning_evaluated",
+            # Geometry gate and error-model evidence.
+            "horizon_endpoint_candidate",
+            "horizon_endpoints_verified",
+            "coordinate_identity_checked",
+            "determinant_error_estimated",
         ):
             self.assertIn(f'progress_emit("{event}"', self.worker)
+        # carrier_changed belonged to the removed mixed inner leg. The carrier
+        # change still happens inside the match-basis build, and its
+        # reconstruction error is reported with the extracted coefficients.
+        self.assertNotIn('progress_emit("carrier_changed"', self.worker)
+        self.assertIn("carrier_change_error", self.worker)
 
     def test_error_envelope_stays_on_operational_schema_one(self) -> None:
         main = self.worker[self.worker.index("function main()") :]
@@ -359,19 +774,35 @@ class RegularisedGsnWorkerSourceTests(unittest.TestCase):
         self,
     ) -> None:
         passthrough = re.compile(
-            r"ode_exception_passthrough=error\s*->\s*"
             r"error isa ODEResourceLimit\s*\|\|\s*"
             r"error isa ODESolverFailure"
         )
         horizon = self._function_slice(
-            "evaluate_horizon_determinant", "evaluate_exterior_determinant"
+            "evaluate_horizon_determinant", "horizon_endpoint_rho_candidates"
         )
         exterior = self._function_slice(
             "evaluate_exterior_determinant", "determinant"
         )
         self.assertRegex(horizon, passthrough)
         self.assertRegex(exterior, passthrough)
+        # A stalled coordinate map is a typed control failure too: it must
+        # reach the campaign as COORDINATE_INVERSION_STALLED rather than being
+        # wrapped as a generic propagation error.
+        self.assertIn("error isa CoordinateInversionStalled", horizon)
         self.assertIn("function throw_ode_resource_limit(", self.worker)
+        self.assertIn(
+            "function throw_coordinate_inversion_stalled(", self.worker
+        )
+        coordinate_solver = (
+            REPO_ROOT
+            / "src/windows_solver/data/julia"
+            / "GeneralizedSasakiNakamura.jl/src/Homogeneous"
+            / "ComplexFrequencies.jl"
+        ).read_text(encoding="utf-8")
+        self.assertIn(
+            "p = (a=a, beta=beta, sign=sign, rs_mp=rs_mp)",
+            coordinate_solver,
+        )
 
     def _function_slice(self, name: str, next_name: str) -> str:
         start = self.worker.index(f"function {name}(")

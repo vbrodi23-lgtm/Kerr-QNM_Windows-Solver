@@ -8,7 +8,7 @@ one typed boundary; importing this module cannot start a numerical solve.
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, localcontext
 from enum import Enum
 from fractions import Fraction
 from functools import lru_cache
@@ -78,6 +78,13 @@ HISTORICAL_NUMERICAL_CONDITIONING_SCHEMA = (
     "windows-solver.m02-conditioning/2"
 )
 WORKER_RESPONSE_RECEIPT_SCHEMA = "windows-solver.worker-response-receipt/1"
+# The promoted worker's root-readout wire schema. Version 4 adds the
+# root_authentication record: the error-aware terms that decide whether a small
+# determinant is a located root or an unresolved one. The receipt records the
+# version it observed so a cached receipt cannot be replayed against a
+# different wire contract.
+WORKER_RESPONSE_WIRE_SCHEMA = 4
+HISTORICAL_WORKER_RESPONSE_WIRE_SCHEMAS = frozenset({3})
 _WORKER_RESPONSE_RECEIPT_FIELDS = frozenset({
     "schema",
     "request_binding",
@@ -106,6 +113,22 @@ EXTERIOR_DETERMINANT_NORMALISATION = (
     "unit-asymptotic-branch-wronskian/v1"
 )
 
+# Horizon-side identities for the verified three-leg basis. These are new
+# identities rather than revisions of the old ones because the calculation they
+# describe is different: three independent legs on a contour that provably
+# approaches r_plus, versus one propagated solution carried down a contour that
+# does not.
+HORIZON_HOMOGENEOUS_REPRESENTATION = (
+    "factored-three-leg-horizon-basis-at-match-gsn/v1"
+)
+REAL_INNER_HORIZON_CONTOUR = "real-inner-tortoise-contour/v1"
+HORIZON_BASIS_AT_MATCH_EXTRACTION = "scaled-horizon-basis-at-match/v1"
+VERIFIED_ENDPOINT_ERROR_MODEL = (
+    "verified-endpoint-control-equivalence-absolute-error/v2"
+)
+PROMOTED_CONTROL_PROFILE_LABEL = "provisional promoted control profile"
+PROMOTED_CONTROL_PROFILE_CALIBRATION_STATUS = "UNMEASURED"
+
 _REGULARISED_GSN_COMMON_IDENTITIES: Mapping[str, str] = MappingProxyType({
     "homogeneous_representation": "factored-plane-wave-gsn/v1",
     "branch_convention": "gsn-complex-rho/v1",
@@ -115,6 +138,7 @@ _REGULARISED_GSN_COMMON_IDENTITIES: Mapping[str, str] = MappingProxyType({
 })
 REGULARISED_GSN_CONDITIONING_IDENTITIES: Mapping[str, object] = MappingProxyType({
     **_REGULARISED_GSN_COMMON_IDENTITIES,
+    "homogeneous_representation": HORIZON_HOMOGENEOUS_REPRESENTATION,
     "determinant_family": HORIZON_DETERMINANT_FAMILY,
     "scattering_diagnostics_applicable": True,
     "scattering_column_convention": HORIZON_SCATTERING_COLUMN_CONVENTION,
@@ -138,14 +162,19 @@ _REGULARISED_GSN_COMMON_PRECISION_POLICY: Mapping[str, object] = MappingProxyTyp
 })
 REGULARISED_GSN_PRECISION_POLICY: Mapping[str, object] = MappingProxyType({
     **_REGULARISED_GSN_COMMON_PRECISION_POLICY,
+    "homogeneous_representation": HORIZON_HOMOGENEOUS_REPRESENTATION,
     "determinant_family": HORIZON_DETERMINANT_FAMILY,
     "scattering_diagnostics_applicable": True,
-    "scattering_coefficient_extraction": "scaled-factored-horizon-basis/v1",
+    "scattering_coefficient_extraction": HORIZON_BASIS_AT_MATCH_EXTRACTION,
     "horizon_determinant_chart": "cinc-over-cref-minus-reflectivity/v1",
     "scattering_chart_safety_factor": "64",
     "scattering_column_convention": HORIZON_SCATTERING_COLUMN_CONVENTION,
     "determinant_convention": HORIZON_DETERMINANT_CONVENTION,
     "determinant_normalisation": HORIZON_DETERMINANT_NORMALISATION,
+    "horizon_contour": REAL_INNER_HORIZON_CONTOUR,
+    "determinant_error_model": VERIFIED_ENDPOINT_ERROR_MODEL,
+    "control_profile_label": PROMOTED_CONTROL_PROFILE_LABEL,
+    "calibration_status": PROMOTED_CONTROL_PROFILE_CALIBRATION_STATUS,
 })
 
 
@@ -176,20 +205,65 @@ def regularised_gsn_mechanism_contract(
 def regularised_gsn_precision_policy(
     mechanism_id: str,
 ) -> Mapping[str, object]:
-    """Bind precision controls to the determinant family actually evaluated."""
+    """Bind precision controls to the determinant family actually evaluated.
+
+    The horizon family carries its own homogeneous-representation identity: it
+    no longer propagates one solution through a mixed match-to-inner leg, but
+    builds a genuine solution basis from three independent legs seeded on a
+    verified real-inner contour. Receipts written under the previous horizon
+    identities describe a different calculation and are correctly treated as
+    stale.
+
+    The exterior policy is byte-identical to the one on ``main``, because the
+    exterior path did not change. That is not a courtesy -- receipt reuse is
+    decided by exact equality against this mapping, so an exterior policy that
+    merely *gained a key* would retire every exterior receipt ``main`` ever
+    produced, on account of a rewrite that never touched them.
+
+    Hence ``horizon_contour`` and ``determinant_error_model``, both introduced
+    by this rewrite, appear only under the mechanism they describe. Adding them
+    as ``None`` to the exterior policy would be the same category error stated
+    twice: it claims the exterior mechanism has a horizon contour whose value
+    happens to be nothing, and it invalidates receipts to say so.
+
+    The older mechanism-specific keys (``scattering_coefficient_extraction``,
+    ``horizon_determinant_chart``, ``scattering_chart_safety_factor``) do carry
+    an explicit ``None`` on the exterior side. They are kept exactly as they
+    are for the same reason the new ones are omitted: they are already part of
+    ``main``'s exterior policy, and normalising them now would break the very
+    compatibility this function exists to preserve.
+    """
 
     contract = regularised_gsn_mechanism_contract(mechanism_id)
     horizon = contract["scattering_diagnostics_applicable"] is True
+    horizon_only: dict[str, object] = (
+        {
+            "horizon_contour": REAL_INNER_HORIZON_CONTOUR,
+            "determinant_error_model": VERIFIED_ENDPOINT_ERROR_MODEL,
+            "control_profile_label": PROMOTED_CONTROL_PROFILE_LABEL,
+            "calibration_status": PROMOTED_CONTROL_PROFILE_CALIBRATION_STATUS,
+        }
+        if horizon
+        else {}
+    )
     return MappingProxyType({
         **_REGULARISED_GSN_COMMON_PRECISION_POLICY,
         **contract,
+        "homogeneous_representation": (
+            HORIZON_HOMOGENEOUS_REPRESENTATION
+            if horizon
+            else _REGULARISED_GSN_COMMON_PRECISION_POLICY[
+                "homogeneous_representation"
+            ]
+        ),
         "scattering_coefficient_extraction": (
-            "scaled-factored-horizon-basis/v1" if horizon else None
+            HORIZON_BASIS_AT_MATCH_EXTRACTION if horizon else None
         ),
         "horizon_determinant_chart": (
             "cinc-over-cref-minus-reflectivity/v1" if horizon else None
         ),
         "scattering_chart_safety_factor": "64" if horizon else None,
+        **horizon_only,
     })
 
 _NUMERICAL_CONDITIONING_DECIMAL_FIELDS = (
@@ -283,7 +357,9 @@ def _validated_worker_response_receipt(
             raise ValueError(f"worker response receipt {field} is invalid")
     if value["request_sha256"] != _sha256(dict(request_binding)):
         raise ValueError("worker response receipt request digest is invalid")
-    if value["worker_response_schema_version"] != 3:
+    if value["worker_response_schema_version"] not in (
+        HISTORICAL_WORKER_RESPONSE_WIRE_SCHEMAS | {WORKER_RESPONSE_WIRE_SCHEMA}
+    ):
         raise ValueError("worker response receipt wire schema is invalid")
     residual = _conditioning_decimal_from_text(
         value["root_residual_abs_text"],
@@ -969,6 +1045,605 @@ class DiagnosticRootReadout:
         )
 
 
+# Wide enough that re-forming the worker's product in decimal is exact well
+# past the tolerance below, cheap enough to run on every parsed receipt.
+_ERROR_BUDGET_CHECK_DIGITS = 60
+_ERROR_BUDGET_AGGREGATE_TOLERANCE = Decimal("1e-40")
+_ROOT_AUTHENTICATION_CHECK_DIGITS = 180
+_ROOT_AUTHENTICATION_RELATIVE_TOLERANCE = Decimal("1e-50")
+
+_DETERMINANT_ERROR_EVIDENCE_FIELDS = frozenset({
+    "endpoint_disagreement_abs",
+    "control_disagreement_abs",
+    "equivalence_disagreement_abs",
+    "precision_disagreement_abs",
+    "safety_factor",
+    "numerical_error_abs",
+    "error_model_id",
+})
+_DERIVATIVE_AUTHENTICATION_FIELDS = frozenset({
+    "derivative_re",
+    "derivative_im",
+    "propagated_error_abs",
+    "step_disagreement_abs",
+    "lower_bound_abs",
+    "selected_step",
+    "axis",
+})
+_ROOT_AUTHENTICATION_FIELDS = frozenset({
+    "central_determinant_re",
+    "central_determinant_im",
+    "determinant_error",
+    "residual_upper_bound_abs",
+    "derivative_authentication",
+    "correction_upper_bound",
+    "root_correction_tolerance",
+    "accepted",
+})
+
+
+@dataclass(frozen=True, slots=True)
+class DecimalComplex:
+    """A complex value whose components keep the worker's exact decimal text.
+
+    Collapsing these to binary64 would discard most of the precision the
+    promoted worker was run at, which is the opposite of what a 120-digit
+    pipeline needs from its evidence records.
+    """
+
+    real: Decimal
+    imaginary: Decimal
+
+    def magnitude(self) -> Decimal:
+        """Return |z| at the current decimal context precision."""
+
+        return (self.real * self.real + self.imaginary * self.imaginary).sqrt()
+
+    def to_mapping(self) -> dict[str, str]:
+        """Return the worker's wire form, digit for digit.
+
+        ``str`` on a ``Decimal`` is exact, so a readout that is written and
+        read back carries the same digits the worker produced rather than a
+        binary64 shadow of them.
+        """
+
+        return {"real": str(self.real), "imaginary": str(self.imaginary)}
+
+
+def _authentication_complex_from_mapping(
+    value: object, subject: str
+) -> DecimalComplex:
+    """Parse a worker complex value, preserving its decimal text exactly."""
+
+    if not isinstance(value, Mapping) or set(value) != {"real", "imaginary"}:
+        raise ValueError(f"{subject} must carry real and imaginary text")
+    return DecimalComplex(
+        real=_conditioning_decimal_from_text(value["real"], f"{subject} real"),
+        imaginary=_conditioning_decimal_from_text(
+            value["imaginary"], f"{subject} imaginary"
+        ),
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class DeterminantErrorEvidence:
+    """The absolute components aggregated into one determinant error bound.
+
+    Every component is absolute. None is divided by ``|D|``: near a QNM the
+    determinant is small by construction, so a relative measure would report
+    catastrophic error exactly where the answer is best.
+
+    ``control``, ``equivalence`` and ``precision`` are optional because they
+    require a second evaluation that a given call may not have performed. The
+    endpoint term is always present for a horizon determinant -- it comes from
+    the reference/verification endpoint pair the geometry gate guarantees.
+    """
+
+    endpoint_disagreement_abs: Decimal
+    control_disagreement_abs: Decimal | None
+    equivalence_disagreement_abs: Decimal | None
+    precision_disagreement_abs: Decimal | None
+    safety_factor: Decimal
+    numerical_error_abs: Decimal
+    error_model_id: str
+
+    def __post_init__(self) -> None:
+        required = ("endpoint_disagreement_abs", "safety_factor",
+                    "numerical_error_abs")
+        for name in required:
+            value = getattr(self, name)
+            if type(value) is not Decimal or not value.is_finite() or value < 0:
+                raise ValueError(
+                    f"determinant error breakdown {name} must be a finite "
+                    "nonnegative decimal"
+                )
+        if self.safety_factor <= 0:
+            raise ValueError(
+                "determinant error breakdown safety factor must be positive"
+            )
+        for name in ("control_disagreement_abs", "equivalence_disagreement_abs",
+                     "precision_disagreement_abs"):
+            value = getattr(self, name)
+            if value is None:
+                continue
+            if type(value) is not Decimal or not value.is_finite() or value < 0:
+                raise ValueError(
+                    f"determinant error breakdown {name} must be a finite "
+                    "nonnegative decimal"
+                )
+        if not isinstance(self.error_model_id, str) or not self.error_model_id:
+            raise ValueError(
+                "determinant error evidence error_model_id must be nonempty"
+            )
+        self._check_aggregate()
+
+    def components(self) -> tuple[Decimal, ...]:
+        """Return the components the reported bound is the maximum over."""
+
+        optional = (
+            self.control_disagreement_abs,
+            self.equivalence_disagreement_abs,
+            self.precision_disagreement_abs,
+        )
+        return (self.endpoint_disagreement_abs,) + tuple(
+            value for value in optional if value is not None
+        )
+
+    def _check_aggregate(self) -> None:
+        """Reject a bound that does not follow from the components beside it.
+
+        The breakdown exists so an acceptance decision can be re-derived rather
+        than trusted. A record whose ``numerical_error_abs`` does not follow
+        from its own parts defeats that entirely, and it is the one corruption
+        a downstream reader cannot notice: the aggregate looks like a perfectly
+        ordinary number on its own.
+
+        The comparison is relative, not exact. The worker forms the product in
+        binary floating point and serialises the result; re-forming it in
+        decimal cannot reproduce those bits. The tolerance is far wider than
+        that round trip and far narrower than any corruption that would matter.
+        """
+
+        with localcontext() as context:
+            context.prec = _ERROR_BUDGET_CHECK_DIGITS
+            expected = self.safety_factor * max(self.components())
+            if expected == 0:
+                if self.numerical_error_abs != 0:
+                    raise ValueError(
+                        "determinant error breakdown reports a positive bound "
+                        "over components that are all zero"
+                    )
+                return
+            if abs(self.numerical_error_abs - expected) > (
+                _ERROR_BUDGET_AGGREGATE_TOLERANCE * expected
+            ):
+                raise ValueError(
+                    "determinant error breakdown numerical_error_abs does not "
+                    "match its component maximum times the safety factor"
+                )
+
+    @classmethod
+    def from_mapping(cls, value: object) -> "DeterminantErrorEvidence":
+        if not isinstance(value, Mapping) or set(value) != (
+            _DETERMINANT_ERROR_EVIDENCE_FIELDS
+        ):
+            raise ValueError("determinant error evidence fields are invalid")
+        optional = {
+            "control_disagreement_abs",
+            "equivalence_disagreement_abs",
+            "precision_disagreement_abs",
+        }
+        parsed: dict[str, Decimal | None] = {}
+        for field in sorted(
+            _DETERMINANT_ERROR_EVIDENCE_FIELDS - {"error_model_id"}
+        ):
+            raw = value[field]
+            if field in optional and raw is None:
+                parsed[field] = None
+                continue
+            parsed[field] = _conditioning_decimal_from_text(
+                raw, f"determinant error breakdown {field}"
+            )
+        model = value["error_model_id"]
+        if not isinstance(model, str):
+            raise ValueError(
+                "determinant error evidence error_model_id is invalid"
+            )
+        return cls(error_model_id=model, **parsed)
+
+    def to_mapping(self) -> dict[str, str | None]:
+        """Return the wire form ``from_mapping`` accepts, unchanged."""
+
+        return {
+            field: (
+                None
+                if (value := getattr(self, field)) is None
+                else str(value)
+            )
+            for field in sorted(
+                _DETERMINANT_ERROR_EVIDENCE_FIELDS - {"error_model_id"}
+            )
+        } | {
+            "error_model_id": self.error_model_id,
+        }
+
+
+DeterminantErrorBreakdown = DeterminantErrorEvidence
+
+
+def _authentication_relation_matches(
+    actual: Decimal,
+    expected: Decimal,
+    *source_terms: Decimal,
+) -> bool:
+    """Compare a serialized bound with its worker-precision derivation."""
+
+    scale = max((abs(actual), abs(expected), *(abs(v) for v in source_terms)))
+    if scale == 0:
+        return actual == expected
+    return abs(actual - expected) <= (
+        _ROOT_AUTHENTICATION_RELATIVE_TOLERANCE * scale
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class DerivativeAuthenticationEvidence:
+    """The accepted derivative and every subtraction in its lower bound."""
+
+    derivative_re: Decimal
+    derivative_im: Decimal
+    propagated_error_abs: Decimal
+    step_disagreement_abs: Decimal
+    lower_bound_abs: Decimal
+    selected_step: Decimal
+    axis: str
+
+    def __post_init__(self) -> None:
+        for name in (
+            "derivative_re",
+            "derivative_im",
+            "propagated_error_abs",
+            "step_disagreement_abs",
+            "lower_bound_abs",
+            "selected_step",
+        ):
+            value = getattr(self, name)
+            if type(value) is not Decimal or not value.is_finite():
+                raise ValueError(
+                    f"derivative authentication {name} must be finite"
+                )
+        for name in (
+            "propagated_error_abs",
+            "step_disagreement_abs",
+            "lower_bound_abs",
+            "selected_step",
+        ):
+            if getattr(self, name) < 0:
+                raise ValueError(
+                    f"derivative authentication {name} must be nonnegative"
+                )
+        if self.lower_bound_abs <= 0:
+            raise ValueError(
+                "derivative authentication lower bound must be positive"
+            )
+        if self.selected_step <= 0:
+            raise ValueError(
+                "derivative authentication selected step must be positive"
+            )
+        if self.axis not in {"real", "imaginary"}:
+            raise ValueError("derivative authentication axis is invalid")
+        with localcontext() as context:
+            context.prec = _ROOT_AUTHENTICATION_CHECK_DIGITS
+            derivative_abs = self.derivative_estimate.magnitude()
+            expected = (
+                derivative_abs
+                - self.step_disagreement_abs
+                - self.propagated_error_abs
+            )
+            if not _authentication_relation_matches(
+                self.lower_bound_abs,
+                expected,
+                derivative_abs,
+                self.step_disagreement_abs,
+                self.propagated_error_abs,
+            ):
+                raise ValueError(
+                    "derivative authentication lower bound is inconsistent"
+                )
+
+    @property
+    def derivative_estimate(self) -> DecimalComplex:
+        return DecimalComplex(self.derivative_re, self.derivative_im)
+
+    @classmethod
+    def from_mapping(cls, value: object) -> "DerivativeAuthenticationEvidence":
+        if not isinstance(value, Mapping) or set(value) != (
+            _DERIVATIVE_AUTHENTICATION_FIELDS
+        ):
+            raise ValueError("derivative authentication fields are invalid")
+        axis = value["axis"]
+        if not isinstance(axis, str):
+            raise ValueError("derivative authentication axis is invalid")
+        return cls(
+            axis=axis,
+            **{
+                field: _conditioning_decimal_from_text(
+                    value[field], f"derivative authentication {field}"
+                )
+                for field in sorted(
+                    _DERIVATIVE_AUTHENTICATION_FIELDS - {"axis"}
+                )
+            },
+        )
+
+    def to_mapping(self) -> dict[str, str]:
+        return {
+            "derivative_re": str(self.derivative_re),
+            "derivative_im": str(self.derivative_im),
+            "propagated_error_abs": str(self.propagated_error_abs),
+            "step_disagreement_abs": str(self.step_disagreement_abs),
+            "lower_bound_abs": str(self.lower_bound_abs),
+            "selected_step": str(self.selected_step),
+            "axis": self.axis,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class RootAuthenticationEvidence:
+    """Closed certificate for the error-aware root-acceptance decision."""
+
+    central_determinant_re: Decimal
+    central_determinant_im: Decimal
+    determinant_error: DeterminantErrorEvidence | None
+    residual_upper_bound_abs: Decimal
+    derivative_authentication: DerivativeAuthenticationEvidence
+    correction_upper_bound: Decimal
+    root_correction_tolerance: Decimal
+    accepted: bool
+
+    def __post_init__(self) -> None:
+        for name in (
+            "central_determinant_re",
+            "central_determinant_im",
+            "residual_upper_bound_abs",
+            "correction_upper_bound",
+            "root_correction_tolerance",
+        ):
+            value = getattr(self, name)
+            if type(value) is not Decimal or not value.is_finite():
+                raise ValueError(f"root authentication {name} must be finite")
+        for name in (
+            "residual_upper_bound_abs",
+            "correction_upper_bound",
+            "root_correction_tolerance",
+        ):
+            if getattr(self, name) < 0:
+                raise ValueError(
+                    f"root authentication {name} must be nonnegative"
+                )
+        if self.root_correction_tolerance <= 0:
+            raise ValueError(
+                "root authentication correction tolerance must be positive"
+            )
+        if self.determinant_error is not None and not isinstance(
+            self.determinant_error, DeterminantErrorEvidence
+        ):
+            raise ValueError("root authentication determinant error is invalid")
+        if not isinstance(
+            self.derivative_authentication, DerivativeAuthenticationEvidence
+        ):
+            raise ValueError(
+                "root authentication derivative authentication is invalid"
+            )
+        if type(self.accepted) is not bool:
+            raise ValueError("root authentication accepted flag is invalid")
+        self._check_decision_arithmetic()
+
+    @property
+    def central_determinant(self) -> DecimalComplex:
+        return DecimalComplex(
+            self.central_determinant_re,
+            self.central_determinant_im,
+        )
+
+    @property
+    def error_breakdown(self) -> DeterminantErrorEvidence | None:
+        return self.determinant_error
+
+    @property
+    def error_model_id(self) -> str | None:
+        return (
+            None
+            if self.determinant_error is None
+            else self.determinant_error.error_model_id
+        )
+
+    @property
+    def derivative_estimate(self) -> DecimalComplex:
+        return self.derivative_authentication.derivative_estimate
+
+    @property
+    def derivative_propagated_error_abs(self) -> Decimal:
+        return self.derivative_authentication.propagated_error_abs
+
+    @property
+    def derivative_step_disagreement_abs(self) -> Decimal:
+        return self.derivative_authentication.step_disagreement_abs
+
+    @property
+    def derivative_lower_bound_abs(self) -> Decimal:
+        return self.derivative_authentication.lower_bound_abs
+
+    @property
+    def selected_step(self) -> Decimal:
+        return self.derivative_authentication.selected_step
+
+    @property
+    def derivative_axis(self) -> str:
+        return self.derivative_authentication.axis
+
+    def _check_decision_arithmetic(self) -> None:
+        with localcontext() as context:
+            context.prec = _ROOT_AUTHENTICATION_CHECK_DIGITS
+            determinant_abs = self.central_determinant.magnitude()
+            determinant_error_abs = (
+                Decimal(0)
+                if self.determinant_error is None
+                else self.determinant_error.numerical_error_abs
+            )
+            expected_residual = determinant_abs + determinant_error_abs
+            if not _authentication_relation_matches(
+                self.residual_upper_bound_abs,
+                expected_residual,
+                determinant_abs,
+                determinant_error_abs,
+            ):
+                raise ValueError(
+                    "root authentication residual upper bound is inconsistent"
+                )
+            expected_correction = (
+                self.residual_upper_bound_abs
+                / self.derivative_authentication.lower_bound_abs
+            )
+            if not _authentication_relation_matches(
+                self.correction_upper_bound,
+                expected_correction,
+            ):
+                raise ValueError(
+                    "root authentication correction upper bound is inconsistent"
+                )
+            if (
+                self.accepted
+                and self.correction_upper_bound
+                > self.root_correction_tolerance
+            ):
+                raise ValueError(
+                    "root authentication accepted flag is inconsistent"
+                )
+
+    def validate_binding(
+        self,
+        *,
+        determinant_abs: Decimal,
+        derivative_abs: Decimal,
+        expected_error_model_id: str | None,
+        root_correction_tolerance: Decimal | None = None,
+        accepted: bool | None = None,
+    ) -> None:
+        """Bind this certificate to result scalars and mechanism policy."""
+
+        if type(determinant_abs) is not Decimal or not determinant_abs.is_finite():
+            raise ValueError("root authentication determinant binding is invalid")
+        if type(derivative_abs) is not Decimal or not derivative_abs.is_finite():
+            raise ValueError("root authentication derivative binding is invalid")
+        if determinant_abs < 0 or derivative_abs <= 0:
+            raise ValueError("root authentication scalar binding is invalid")
+        if self.error_model_id != expected_error_model_id:
+            raise ValueError("root authentication error model identity is inconsistent")
+        with localcontext() as context:
+            context.prec = _ROOT_AUTHENTICATION_CHECK_DIGITS
+            certificate_determinant_abs = self.central_determinant.magnitude()
+            if not _authentication_relation_matches(
+                certificate_determinant_abs,
+                determinant_abs,
+                determinant_abs,
+            ):
+                raise ValueError(
+                    "root authentication central determinant is inconsistent"
+                )
+            certificate_derivative_abs = self.derivative_estimate.magnitude()
+            if not _authentication_relation_matches(
+                certificate_derivative_abs,
+                derivative_abs,
+                derivative_abs,
+            ):
+                raise ValueError(
+                    "root authentication derivative estimate is inconsistent"
+                )
+            if root_correction_tolerance is not None and not (
+                type(root_correction_tolerance) is Decimal
+                and root_correction_tolerance.is_finite()
+                and _authentication_relation_matches(
+                    self.root_correction_tolerance,
+                    root_correction_tolerance,
+                    root_correction_tolerance,
+                )
+            ):
+                raise ValueError(
+                    "root authentication correction tolerance is inconsistent"
+                )
+            if accepted is True and not self.accepted:
+                raise ValueError(
+                    "root authentication acceptance binding is inconsistent"
+                )
+
+    @classmethod
+    def from_mapping(cls, value: object) -> "RootAuthenticationEvidence":
+        if not isinstance(value, Mapping) or set(value) != (
+            _ROOT_AUTHENTICATION_FIELDS
+        ):
+            raise ValueError("root authentication fields are invalid")
+        accepted = value["accepted"]
+        if type(accepted) is not bool:
+            raise ValueError("root authentication accepted flag is invalid")
+        determinant_error_value = value["determinant_error"]
+        return cls(
+            central_determinant_re=_conditioning_decimal_from_text(
+                value["central_determinant_re"],
+                "root authentication central determinant real",
+            ),
+            central_determinant_im=_conditioning_decimal_from_text(
+                value["central_determinant_im"],
+                "root authentication central determinant imaginary",
+            ),
+            determinant_error=(
+                None
+                if determinant_error_value is None
+                else DeterminantErrorEvidence.from_mapping(
+                    determinant_error_value
+                )
+            ),
+            residual_upper_bound_abs=_conditioning_decimal_from_text(
+                value["residual_upper_bound_abs"],
+                "root authentication residual upper bound",
+            ),
+            derivative_authentication=(
+                DerivativeAuthenticationEvidence.from_mapping(
+                    value["derivative_authentication"]
+                )
+            ),
+            correction_upper_bound=_conditioning_decimal_from_text(
+                value["correction_upper_bound"],
+                "root authentication correction upper bound",
+            ),
+            root_correction_tolerance=_conditioning_decimal_from_text(
+                value["root_correction_tolerance"],
+                "root authentication correction tolerance",
+            ),
+            accepted=accepted,
+        )
+
+    def to_mapping(self) -> dict[str, object]:
+        return {
+            "central_determinant_re": str(self.central_determinant_re),
+            "central_determinant_im": str(self.central_determinant_im),
+            "determinant_error": (
+                None
+                if self.determinant_error is None
+                else self.determinant_error.to_mapping()
+            ),
+            "residual_upper_bound_abs": str(self.residual_upper_bound_abs),
+            "derivative_authentication": (
+                self.derivative_authentication.to_mapping()
+            ),
+            "correction_upper_bound": str(self.correction_upper_bound),
+            "root_correction_tolerance": str(
+                self.root_correction_tolerance
+            ),
+            "accepted": self.accepted,
+        }
+
+
 @dataclass(frozen=True, slots=True)
 class NumericalConditioningEvidence:
     schema: str
@@ -1012,10 +1687,28 @@ class NumericalConditioningEvidence:
         }:
             raise ValueError("numerical conditioning schema is invalid")
         for field, expected in _REGULARISED_GSN_COMMON_IDENTITIES.items():
+            if field == "homogeneous_representation":
+                # Family-dependent: the horizon determinant builds a three-leg
+                # solution basis on a verified real-inner contour, which is a
+                # different calculation from the exterior Wronskian's single
+                # factored representation.
+                continue
             if getattr(self, field) != expected:
                 raise ValueError(
                     f"numerical conditioning {field} identity is invalid"
                 )
+        expected_representation = (
+            HORIZON_HOMOGENEOUS_REPRESENTATION
+            if self.determinant_family == HORIZON_DETERMINANT_FAMILY
+            else _REGULARISED_GSN_COMMON_IDENTITIES[
+                "homogeneous_representation"
+            ]
+        )
+        if self.homogeneous_representation != expected_representation:
+            raise ValueError(
+                "numerical conditioning homogeneous_representation identity "
+                "is invalid"
+            )
         if self.schema == NUMERICAL_CONDITIONING_SCHEMA:
             for field in _NUMERICAL_CONDITIONING_GATE_FIELDS:
                 expected = _REGULARISED_GSN_COMMON_PRECISION_POLICY[field]
@@ -1193,6 +1886,11 @@ class RootReadout:
     raw_determinant_abs: Decimal | None = None
     raw_determinant_evidence_status: str | None = None
     worker_response_receipt: Mapping[str, object] | None = None
+    # The error-aware terms the convergence decision was actually made on.
+    # Carried past the backend so a stored readout can be re-checked rather
+    # than trusted: without it, "converged" is an assertion with no evidence
+    # behind it once the worker output is gone.
+    root_authentication: RootAuthenticationEvidence | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "omega", _finite_complex(self.omega, "root omega"))
@@ -1222,6 +1920,10 @@ class RootReadout:
             )
         ):
             raise ValueError("root readout numerical conditioning has invalid type")
+        if self.root_authentication is not None and not isinstance(
+            self.root_authentication, RootAuthenticationEvidence
+        ):
+            raise ValueError("root readout root authentication has invalid type")
         for name in ("normalised_determinant_abs", "raw_determinant_abs"):
             value = getattr(self, name)
             if value is None:
@@ -1281,6 +1983,15 @@ class RootReadout:
             self.worker_response_receipt
         )
         if receipt is not None:
+            current_wire = (
+                receipt["worker_response_schema_version"]
+                == WORKER_RESPONSE_WIRE_SCHEMA
+            )
+            if current_wire != (self.root_authentication is not None):
+                raise ValueError(
+                    "worker response receipt authentication schema is "
+                    "inconsistent"
+                )
             if (
                 self.normalised_determinant_abs is None
                 or Decimal(receipt["root_residual_abs_text"])
@@ -1315,6 +2026,73 @@ class RootReadout:
                 "normalised_determinant_abs disagrees with "
                 "determinant_residual_abs"
             )
+        authentication = self.root_authentication
+        if authentication is not None:
+            if (
+                self.numerical_conditioning is None
+                or self.normalised_determinant_abs is None
+            ):
+                raise ValueError(
+                    "root authentication requires a conditioned root readout"
+                )
+            expected_error_model_id = (
+                VERIFIED_ENDPOINT_ERROR_MODEL
+                if self.numerical_conditioning.scattering_diagnostics_applicable
+                else None
+            )
+            if authentication.error_model_id != expected_error_model_id:
+                raise ValueError(
+                    "root authentication model disagrees with root readout"
+                )
+            if self.converged and not authentication.accepted:
+                raise ValueError(
+                    "root authentication acceptance disagrees with root readout"
+                )
+            with localcontext() as context:
+                context.prec = _ROOT_AUTHENTICATION_CHECK_DIGITS
+                if not _authentication_relation_matches(
+                    authentication.central_determinant.magnitude(),
+                    self.normalised_determinant_abs,
+                    self.normalised_determinant_abs,
+                ):
+                    raise ValueError(
+                        "root authentication determinant disagrees with root "
+                        "readout"
+                    )
+                derivative_abs = float(
+                    authentication.derivative_estimate.magnitude()
+                )
+            if not math.isclose(
+                derivative_abs,
+                self.determinant_derivative_abs,
+                rel_tol=1.0e-15,
+                abs_tol=0.0,
+            ):
+                raise ValueError(
+                    "root authentication derivative disagrees with root readout"
+                )
+            if receipt is not None:
+                request_policy = receipt["request_binding"].get("policy")
+                if not isinstance(request_policy, Mapping):
+                    raise ValueError(
+                        "root authentication receipt policy is invalid"
+                    )
+                correction_tolerance = _conditioning_decimal_from_text(
+                    request_policy.get("root_correction_tolerance"),
+                    "root authentication receipt correction tolerance",
+                )
+                if (
+                    correction_tolerance <= 0
+                    or not _authentication_relation_matches(
+                        authentication.root_correction_tolerance,
+                        correction_tolerance,
+                        correction_tolerance,
+                    )
+                ):
+                    raise ValueError(
+                        "root authentication correction target disagrees with "
+                        "the root readout receipt"
+                    )
         object.__setattr__(
             self,
             "source_root_mapping",
@@ -1431,6 +2209,10 @@ class RootReadout:
             output["raw_determinant_evidence_status"] = (
                 self.raw_determinant_evidence_status
             )
+        if self.root_authentication is not None:
+            output["root_authentication"] = (
+                self.root_authentication.to_mapping()
+            )
         if self.worker_response_receipt is not None:
             output["worker_response_receipt"] = {
                 **dict(self.worker_response_receipt),
@@ -1517,6 +2299,13 @@ class RootReadout:
                 else value["raw_determinant_evidence_status"]
             ),
             worker_response_receipt=value.get("worker_response_receipt"),
+            root_authentication=(
+                None
+                if value.get("root_authentication") is None
+                else RootAuthenticationEvidence.from_mapping(
+                    value["root_authentication"]
+                )
+            ),
         )
 
 

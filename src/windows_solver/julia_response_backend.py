@@ -31,7 +31,9 @@ from .response_engine import (
     NumericalConditioningEvidence,
     NUMERICAL_CONDITIONING_SCHEMA,
     ResponseComponentJob,
+    RootAuthenticationEvidence,
     RootReadout,
+    VERIFIED_ENDPOINT_ERROR_MODEL,
     WORKER_RESPONSE_RECEIPT_SCHEMA,
     _exterior_support,
     mode_specific_branch_enclosure_radius,
@@ -76,6 +78,9 @@ _DEFAULT_COOPERATIVE_MARGIN_SECONDS = 120
 _DEFAULT_HOMOGENEOUS_ODE_MAXITERS = 10_000_000
 _DEFAULT_HOMOGENEOUS_MAX_ACCEPTED_STEPS = 1_000_000
 _DEFAULT_HOMOGENEOUS_MAX_RHS_EVALUATIONS = 2_000_000
+_DEFAULT_COORDINATE_STALL_RHS_THRESHOLD = 200_000
+_DEFAULT_COORDINATE_STALL_MINIMUM_SPAN_FRACTION = "1e-6"
+_DEFAULT_COORDINATE_STALL_MINIMUM_STEP_FRACTION = "1e-12"
 NUMERICAL_CONTROL_FAILURE_CODES = frozenset({
     "SCATTERING_BASIS_ILL_CONDITIONED",
     "SCATTERING_CHART_ILL_CONDITIONED",
@@ -88,6 +93,18 @@ NUMERICAL_CONTROL_FAILURE_CODES = frozenset({
     "FACTORED_PROPAGATION_PRECISION_MISMATCH",
     "NONFINITE_FACTORED_PROPAGATION_DATA",
     "FACTORED_ODE_FAILURE",
+    # Fewer than two horizon endpoints passed the radial-approach and
+    # dual-series gate. Raised before any homogeneous ODE starts.
+    "NO_VERIFIED_HORIZON_ENDPOINT",
+    # The coordinate map made no meaningful progress. Distinguishes an
+    # impossible local-error target from an exhausted resource budget.
+    "COORDINATE_INVERSION_STALLED",
+    # The central determinant is small but its absolute error is too large to
+    # call the root located. Never reported as a solved root.
+    "DETERMINANT_UNCERTAINTY_TOO_LARGE",
+    # The finite-difference ladder was exhausted without a step at which the
+    # derivative estimates agree and determinant noise does not dominate.
+    "FINITE_DIFFERENCE_NOISE_LIMIT",
 })
 
 
@@ -199,6 +216,21 @@ def _execution_resource_policy() -> dict[str, object]:
                 "KERR_QNM_JULIA_HOMOGENEOUS_LEG_TIMEOUT_SECONDS"
             )
         ),
+        # Coordinate-inversion stall detection. The threshold is generous
+        # relative to a healthy coordinate solve (2,978 RHS evaluations for the
+        # exact 80-digit Leaf 13 positive leg) but far below the 2,000,002 the
+        # stalled run consumed, so a pathological map is named rather than
+        # allowed to spend the whole budget proving the same point.
+        "coordinate_stall_rhs_threshold": _positive_environment_integer(
+            "KERR_QNM_JULIA_COORDINATE_STALL_RHS_THRESHOLD",
+            _DEFAULT_COORDINATE_STALL_RHS_THRESHOLD,
+        ),
+        "coordinate_stall_minimum_span_fraction": (
+            _DEFAULT_COORDINATE_STALL_MINIMUM_SPAN_FRACTION
+        ),
+        "coordinate_stall_minimum_step_fraction": (
+            _DEFAULT_COORDINATE_STALL_MINIMUM_STEP_FRACTION
+        ),
     }
     return {
         **material,
@@ -216,6 +248,9 @@ def _validated_execution_resource_policy(value: object) -> dict[str, object]:
         "max_accepted_steps_per_homogeneous_leg",
         "max_rhs_evaluations_per_homogeneous_leg",
         "homogeneous_leg_wall_clock_seconds",
+        "coordinate_stall_rhs_threshold",
+        "coordinate_stall_minimum_span_fraction",
+        "coordinate_stall_minimum_step_fraction",
         "sha256",
     }
     if not isinstance(value, Mapping) or set(value) != expected:
@@ -232,12 +267,39 @@ def _validated_execution_resource_policy(value: object) -> dict[str, object]:
         "homogeneous_ode_maxiters",
         "max_accepted_steps_per_homogeneous_leg",
         "max_rhs_evaluations_per_homogeneous_leg",
+        "coordinate_stall_rhs_threshold",
     ):
         item = copied[name]
         if isinstance(item, bool) or not isinstance(item, int) or item < 1:
             raise JuliaResponseBackendError(
                 f"execution-resource policy {name} is invalid"
             )
+    for name in (
+        "coordinate_stall_minimum_span_fraction",
+        "coordinate_stall_minimum_step_fraction",
+    ):
+        item = copied[name]
+        if not isinstance(item, str):
+            raise JuliaResponseBackendError(
+                f"execution-resource policy {name} is invalid"
+            )
+        try:
+            fraction = float(item)
+        except ValueError as error:
+            raise JuliaResponseBackendError(
+                f"execution-resource policy {name} is invalid"
+            ) from error
+        if not 0.0 < fraction < 1.0:
+            raise JuliaResponseBackendError(
+                f"execution-resource policy {name} is invalid"
+            )
+    if (
+        copied["coordinate_stall_rhs_threshold"]
+        >= copied["max_rhs_evaluations_per_homogeneous_leg"]
+    ):
+        raise JuliaResponseBackendError(
+            "coordinate stall threshold must fire before the RHS ceiling"
+        )
     leg_timeout = copied["homogeneous_leg_wall_clock_seconds"]
     if leg_timeout is not None and (
         isinstance(leg_timeout, bool)
@@ -377,7 +439,39 @@ class _WindowsKillOnCloseJob:
 
 
 def promoted_precision_numerical_controls() -> dict[str, object]:
-    """Return the canonical root/ODE/derivative controls for promoted tiers."""
+    """Return the provisional promoted control profile.
+
+    The scientific root target is a property of the physics, not of the
+    arithmetic: 1e-18 at base and 1e-20 at refinement, for **both** the 80- and
+    120-digit tiers. Through ``required_reliable_digits`` those correspond to 24
+    and 26 required reliable digits.
+
+    The previous table derived the 120-digit controls mechanically from the
+    stored digit count (``10**-(digits - 18)``), which demanded a 1e-102 root
+    target -- hence 108 required reliable digits -- and applied that same
+    tolerance to the coordinate map. That is what pinned Leaf 13's coordinate
+    solve at 8.1e-17 steps: 2,000,002 RHS evaluations and 87.8 s to cover
+    1.01e-11 of a 5000 span. More stored digits do not make a QNM root more
+    accurately defined; they buy guard precision against cancellation, carrier
+    changes, and finite differencing.
+
+    So the 120-digit tier keeps the same scientific target as the 80-digit tier
+    and spends its extra digits as guard: its ODE controls are tightened by a
+    bounded factor over the demonstrated-healthy 80-digit level (1e-18 / 1e-20
+    homogeneous, reached in 2,978 RHS evaluations on the exact Leaf 13 leg),
+    not driven to the arithmetic floor.
+
+    The coordinate map gets its own, looser controls. It is a scalar quadrature
+    for r(rho) and only has to avoid dominating the determinant error budget;
+    it does not need the homogeneous solve's local-error target.
+
+    These values are explicitly ``UNMEASURED``. The horizon request policy
+    carries that status, and release admission remains blocked until
+    ``tools/calibrate_leaf13_horizon_controls.jl`` produces a valid native
+    receipt and a reviewed profile is committed. Arithmetic work can use this
+    bounded provisional profile to obtain that evidence; it cannot call the
+    profile calibrated merely because the values are present in source.
+    """
 
     return {
         "80": {
@@ -385,29 +479,73 @@ def promoted_precision_numerical_controls() -> dict[str, object]:
                 "root_correction_tolerance": "1e-18",
                 "ode_relative_tolerance": "1e-18",
                 "ode_absolute_tolerance": "1e-20",
+                "homogeneous_ode_relative_tolerance": "1e-18",
+                "homogeneous_ode_absolute_tolerance": "1e-20",
+                "coordinate_ode_relative_tolerance": "1e-18",
+                "coordinate_ode_absolute_tolerance": "1e-20",
                 "frequency_step": "1e-6",
+                "frequency_step_minimum": "1e-12",
+                "frequency_step_maximum": "1e-3",
             },
             "refinement": {
                 "root_correction_tolerance": "1e-20",
                 "ode_relative_tolerance": "1e-20",
                 "ode_absolute_tolerance": "1e-20",
+                "homogeneous_ode_relative_tolerance": "1e-22",
+                "homogeneous_ode_absolute_tolerance": "1e-24",
+                "coordinate_ode_relative_tolerance": "1e-20",
+                "coordinate_ode_absolute_tolerance": "1e-22",
                 "frequency_step": "1e-7",
+                "frequency_step_minimum": "1e-14",
+                "frequency_step_maximum": "1e-4",
             },
         },
         "120": {
             "base": {
-                "root_correction_tolerance": "1e-102",
-                "ode_relative_tolerance": "1e-102",
-                "ode_absolute_tolerance": "1e-104",
-                "frequency_step": "1e-60",
+                "root_correction_tolerance": "1e-18",
+                "ode_relative_tolerance": "1e-24",
+                "ode_absolute_tolerance": "1e-26",
+                "homogeneous_ode_relative_tolerance": "1e-24",
+                "homogeneous_ode_absolute_tolerance": "1e-26",
+                "coordinate_ode_relative_tolerance": "1e-20",
+                "coordinate_ode_absolute_tolerance": "1e-22",
+                "frequency_step": "1e-6",
+                "frequency_step_minimum": "1e-16",
+                "frequency_step_maximum": "1e-3",
             },
             "refinement": {
-                "root_correction_tolerance": "1e-106",
-                "ode_relative_tolerance": "1e-106",
-                "ode_absolute_tolerance": "1e-108",
-                "frequency_step": "1e-60",
+                "root_correction_tolerance": "1e-20",
+                "ode_relative_tolerance": "1e-28",
+                "ode_absolute_tolerance": "1e-30",
+                "homogeneous_ode_relative_tolerance": "1e-28",
+                "homogeneous_ode_absolute_tolerance": "1e-30",
+                "coordinate_ode_relative_tolerance": "1e-22",
+                "coordinate_ode_absolute_tolerance": "1e-24",
+                "frequency_step": "1e-7",
+                "frequency_step_minimum": "1e-18",
+                "frequency_step_maximum": "1e-4",
             },
         },
+    }
+
+
+def horizon_geometry_controls() -> dict[str, object]:
+    """Return the real-inner horizon endpoint gate configuration.
+
+    The candidate ladder is bounded and shallow on purpose. The prototype
+    reached 80.92/81.13 reliable digits at rho = -50 against 35.99/37.28 at
+    rho = -25, so useful endpoints live within tens of units of the matching
+    point, not thousands. ``horizon_rho_inner_min`` therefore bounds the
+    coordinate map at -100 rather than -5000.
+    """
+
+    return {
+        "horizon_rho_inner_min": "-100",
+        "horizon_endpoint_rho_candidates": [
+            "-10", "-25", "-50", "-75", "-100",
+        ],
+        "horizon_maximum_endpoint_distance": "0.1",
+        "determinant_error_safety_factor": "64",
     }
 
 
@@ -1049,40 +1187,556 @@ def _raise_worker_failure(details: Mapping[str, object]) -> None:
     raise failure
 
 
+CONTROL_FAILURE_STAGES = frozenset({
+    "request-policy",
+    "coordinate-inversion",
+    "horizon-endpoint-geometry",
+    "asymptotic-preflight",
+    "homogeneous-propagation",
+    "scattering-extraction",
+    "determinant-chart",
+    "finite-difference",
+    "root-authentication",
+})
+
+
+_FACTORED_DIAGNOSTIC_FIELDS = frozenset({
+    "reason",
+    "precision_bits",
+    "factored_homogeneous_rhs_evaluations",
+    "avoided_ode_scope",
+})
+_FACTORED_FAILURE_STAGES = {
+    "ASYMPTOTIC_SERIES_INVALID": "asymptotic-preflight",
+    "PHYSICAL_SINGULAR_LIMIT": "homogeneous-propagation",
+    "CARRIER_CHANGE_INCONSISTENT": "homogeneous-propagation",
+    "INVALID_FACTORED_PROPAGATION_INPUT": "homogeneous-propagation",
+    "FACTORED_PROPAGATION_PRECISION_MISMATCH": "homogeneous-propagation",
+    "NONFINITE_FACTORED_PROPAGATION_DATA": "homogeneous-propagation",
+    "FACTORED_ODE_FAILURE": "homogeneous-propagation",
+    "NO_VERIFIED_HORIZON_ENDPOINT": "horizon-endpoint-geometry",
+}
+_ASYMPTOTIC_SERIES_INVALID_REASONS = frozenset({
+    "INVALID_ASYMPTOTIC_INPUT",
+    "PRECISION_MISMATCH",
+    "NONFINITE_ASYMPTOTIC_DATA",
+})
+
+
+def _has_exact_fields(
+    value: Mapping[str, object], fields: frozenset[str]
+) -> bool:
+    return set(value) == fields
+
+
+def _is_nonnegative_int(value: object) -> bool:
+    return type(value) is int and value >= 0
+
+
+def _is_positive_int(value: object) -> bool:
+    return type(value) is int and value > 0
+
+
+def _diagnostic_decimal(
+    diagnostics: Mapping[str, object],
+    name: str,
+    *,
+    nonnegative: bool = False,
+    positive: bool = False,
+) -> Decimal | None:
+    try:
+        value = _finite_decimal_text(
+            diagnostics.get(name), f"failure {name}", nonnegative=nonnegative
+        )
+    except JuliaResponseBackendError:
+        return None
+    if positive and value <= 0:
+        return None
+    return value
+
+
+def _valid_factored_diagnostics(
+    code: str, stage: object, diagnostics: Mapping[str, object]
+) -> bool:
+    if stage != _FACTORED_FAILURE_STAGES.get(code):
+        return False
+    if not _has_exact_fields(diagnostics, _FACTORED_DIAGNOSTIC_FIELDS):
+        return False
+    reason = diagnostics.get("reason")
+    if code == "ASYMPTOTIC_SERIES_INVALID":
+        if reason not in _ASYMPTOTIC_SERIES_INVALID_REASONS:
+            return False
+    elif reason != code:
+        return False
+    rhs = diagnostics.get("factored_homogeneous_rhs_evaluations")
+    return (
+        _is_positive_int(diagnostics.get("precision_bits"))
+        and _is_nonnegative_int(rhs)
+        and diagnostics.get("avoided_ode_scope")
+        == "factored-homogeneous-gsn/v1"
+        and (code != "NO_VERIFIED_HORIZON_ENDPOINT" or rhs == 0)
+    )
+
+
+def _valid_insufficient_precision_diagnostics(
+    stage: object, diagnostics: Mapping[str, object]
+) -> bool:
+    fields = _FACTORED_DIAGNOSTIC_FIELDS | {
+        "predicted_reliable_digits",
+        "required_reliable_digits",
+        "asymptotic_preflight_avoided_ode",
+        "asymptotic_preflight_reason",
+        "maximum_series_digits_lost",
+        "maximum_recurrence_digits_lost",
+    }
+    if stage != "asymptotic-preflight" or not _has_exact_fields(
+        diagnostics, frozenset(fields)
+    ):
+        return False
+    predicted = _diagnostic_decimal(
+        diagnostics, "predicted_reliable_digits"
+    )
+    required = _diagnostic_decimal(
+        diagnostics, "required_reliable_digits", positive=True
+    )
+    series_loss = _diagnostic_decimal(
+        diagnostics, "maximum_series_digits_lost", nonnegative=True
+    )
+    recurrence_loss = _diagnostic_decimal(
+        diagnostics, "maximum_recurrence_digits_lost", nonnegative=True
+    )
+    return (
+        predicted is not None
+        and required is not None
+        and predicted < required
+        and series_loss is not None
+        and recurrence_loss is not None
+        and diagnostics.get("reason")
+        == "INSUFFICIENT_ASYMPTOTIC_PRECISION"
+        and _is_positive_int(diagnostics.get("precision_bits"))
+        and diagnostics.get("factored_homogeneous_rhs_evaluations") == 0
+        and diagnostics.get("avoided_ode_scope")
+        == "factored-homogeneous-gsn/v1"
+        and diagnostics.get("asymptotic_preflight_avoided_ode") is True
+        and diagnostics.get("asymptotic_preflight_reason")
+        == "INSUFFICIENT_ASYMPTOTIC_PRECISION"
+    )
+
+
+def _valid_scattering_diagnostics(
+    code: str, stage: object, diagnostics: Mapping[str, object]
+) -> bool:
+    expected_stage = (
+        "scattering-extraction"
+        if code == "SCATTERING_BASIS_ILL_CONDITIONED"
+        else "determinant-chart"
+    )
+    if stage != expected_stage:
+        return False
+    package_fields = frozenset({"reason", "precision_bits"})
+    if _has_exact_fields(diagnostics, package_fields):
+        return (
+            diagnostics.get("reason") == code
+            and _is_positive_int(diagnostics.get("precision_bits"))
+        )
+    if code != "SCATTERING_CHART_ILL_CONDITIONED" or not _has_exact_fields(
+        diagnostics,
+        frozenset({
+            "chart_denominator_abs",
+            "chart_scale_abs",
+            "chart_relative_margin",
+        }),
+    ):
+        return False
+    denominator = _diagnostic_decimal(
+        diagnostics, "chart_denominator_abs", positive=True
+    )
+    scale = _diagnostic_decimal(diagnostics, "chart_scale_abs", positive=True)
+    margin = _diagnostic_decimal(
+        diagnostics, "chart_relative_margin", positive=True
+    )
+    return denominator is not None and scale is not None and margin is not None
+
+
+def _valid_coordinate_stall_diagnostics(
+    stage: object, diagnostics: Mapping[str, object]
+) -> bool:
+    fields = frozenset({
+        "reason",
+        "range_status",
+        "operation",
+        "stall_reason",
+        "ode_leg",
+        "ode_t_current",
+        "ode_t_end",
+        "ode_span_abs",
+        "ode_span_fraction",
+        "ode_rhs_evaluations",
+        "ode_accepted_steps",
+        "ode_rejected_steps",
+        "ode_last_accepted_step_abs",
+        "ode_min_accepted_step_abs",
+        "current_r_re",
+        "current_r_im",
+        "coordinate_identity_residual_abs",
+        "elapsed_leg_seconds",
+    })
+    if stage != "coordinate-inversion" or not _has_exact_fields(
+        diagnostics, fields
+    ):
+        return False
+    if (
+        diagnostics.get("reason") != "COORDINATE_INVERSION_STALLED"
+        or diagnostics.get("range_status")
+        != "coordinate-inversion-stalled/v1"
+        or diagnostics.get("operation") != "coordinate-inversion/v1"
+        or not isinstance(diagnostics.get("stall_reason"), str)
+        or not diagnostics["stall_reason"]
+        or not isinstance(diagnostics.get("ode_leg"), str)
+        or not diagnostics["ode_leg"].startswith("r_from_rho")
+        or not _is_nonnegative_int(diagnostics.get("ode_rhs_evaluations"))
+        or not _is_nonnegative_int(diagnostics.get("ode_accepted_steps"))
+        or not _is_nonnegative_int(diagnostics.get("ode_rejected_steps"))
+    ):
+        return False
+    for name in (
+        "ode_t_current",
+        "ode_t_end",
+        "current_r_re",
+        "current_r_im",
+    ):
+        if _diagnostic_decimal(diagnostics, name) is None:
+            return False
+    if _diagnostic_decimal(
+        diagnostics, "ode_span_abs", positive=True
+    ) is None:
+        return False
+    if _diagnostic_decimal(
+        diagnostics, "coordinate_identity_residual_abs", nonnegative=True
+    ) is None:
+        return False
+    for name in (
+        "ode_span_fraction",
+        "ode_last_accepted_step_abs",
+        "ode_min_accepted_step_abs",
+    ):
+        value = diagnostics.get(name)
+        if value is not None and _diagnostic_decimal(
+            diagnostics, name, nonnegative=True
+        ) is None:
+            return False
+    elapsed = diagnostics.get("elapsed_leg_seconds")
+    try:
+        elapsed_seconds = _finite_text(elapsed, "failure elapsed_leg_seconds")
+    except JuliaResponseBackendError:
+        return False
+    return elapsed_seconds >= 0
+
+
+def _valid_finite_difference_noise_diagnostics(
+    stage: object, diagnostics: Mapping[str, object]
+) -> bool:
+    fields = frozenset({
+        "nominal_step",
+        "minimum_step",
+        "maximum_step",
+        "attempts",
+    })
+    if stage != "finite-difference" or not _has_exact_fields(
+        diagnostics, fields
+    ):
+        return False
+    nominal = _diagnostic_decimal(diagnostics, "nominal_step", positive=True)
+    minimum = _diagnostic_decimal(diagnostics, "minimum_step", positive=True)
+    maximum = _diagnostic_decimal(diagnostics, "maximum_step", positive=True)
+    attempts = diagnostics.get("attempts")
+    if (
+        nominal is None
+        or minimum is None
+        or maximum is None
+        or not minimum <= nominal <= maximum
+        or not isinstance(attempts, list)
+        or not 1 <= len(attempts) <= 64
+    ):
+        return False
+    attempt_fields = frozenset({
+        "h",
+        "real_step_convergent",
+        "complex_axis_consistent",
+        "noise_resolved",
+        "derivative_abs",
+        "derivative_uncertainty_abs",
+        "base_derivative_error_abs",
+        "half_derivative_error_abs",
+        "double_derivative_error_abs",
+        "imaginary_derivative_error_abs",
+        "derivative_error_abs",
+        "accepted",
+    })
+    numeric_fields = attempt_fields - {
+        "real_step_convergent",
+        "complex_axis_consistent",
+        "noise_resolved",
+        "accepted",
+    }
+    for attempt in attempts:
+        if not isinstance(attempt, Mapping) or not _has_exact_fields(
+            attempt, attempt_fields
+        ):
+            return False
+        if any(
+            type(attempt.get(name)) is not bool
+            for name in (
+                "real_step_convergent",
+                "complex_axis_consistent",
+                "noise_resolved",
+                "accepted",
+            )
+        ):
+            return False
+        for name in numeric_fields:
+            if _diagnostic_decimal(
+                attempt,
+                name,
+                nonnegative=True,
+                positive=name == "h",
+            ) is None:
+                return False
+        h = _diagnostic_decimal(attempt, "h", positive=True)
+        if h is None or not minimum <= h <= maximum:
+            return False
+        if attempt["derivative_error_abs"] != attempt[
+            "half_derivative_error_abs"
+        ]:
+            return False
+        gates_pass = (
+            attempt["real_step_convergent"]
+            and attempt["complex_axis_consistent"]
+            and attempt["noise_resolved"]
+        )
+        if attempt["accepted"] is not gates_pass or attempt["accepted"]:
+            return False
+    return True
+
+
+def _valid_determinant_uncertainty_diagnostics(
+    stage: object, diagnostics: Mapping[str, object]
+) -> bool:
+    if stage != "root-authentication":
+        return False
+    newton_fields = frozenset({
+        "determinant_abs",
+        "determinant_error_abs",
+        "derivative_abs",
+        "derivative_error_abs",
+        "derivative_lower_bound_abs",
+        "frequency_step",
+    })
+    authenticated_derivative_fields = newton_fields | {
+        "derivative_uncertainty_abs"
+    }
+    small_determinant_fields = frozenset({
+        "determinant_abs",
+        "determinant_error_abs",
+        "correction_upper_bound",
+        "correction_without_error",
+        "root_correction_tolerance",
+        "derivative_lower_bound_abs",
+        "root_authentication",
+    })
+    fields = frozenset(diagnostics)
+    if fields in {newton_fields, authenticated_derivative_fields}:
+        for name in fields - {"derivative_lower_bound_abs"}:
+            if _diagnostic_decimal(
+                diagnostics,
+                name,
+                nonnegative=True,
+                positive=name == "frequency_step",
+            ) is None:
+                return False
+        lower = _diagnostic_decimal(
+            diagnostics, "derivative_lower_bound_abs"
+        )
+        return lower is not None and lower <= 0
+    if fields != small_determinant_fields:
+        return False
+    numeric_small_determinant_fields = (
+        small_determinant_fields - {"root_authentication"}
+    )
+    values = {
+        name: _diagnostic_decimal(
+            diagnostics,
+            name,
+            nonnegative=True,
+            positive=name
+            in {"root_correction_tolerance", "derivative_lower_bound_abs"},
+        )
+        for name in numeric_small_determinant_fields
+    }
+    if any(value is None for value in values.values()):
+        return False
+    try:
+        authentication = RootAuthenticationEvidence.from_mapping(
+            diagnostics["root_authentication"]
+        )
+        authentication.validate_binding(
+            determinant_abs=values["determinant_abs"],
+            derivative_abs=authentication.derivative_estimate.magnitude(),
+            expected_error_model_id=VERIFIED_ENDPOINT_ERROR_MODEL,
+            root_correction_tolerance=values[
+                "root_correction_tolerance"
+            ],
+            accepted=False,
+        )
+    except (KeyError, ValueError):
+        return False
+    if (
+        authentication.accepted
+        or authentication.error_breakdown is None
+        or authentication.error_breakdown.numerical_error_abs
+        != values["determinant_error_abs"]
+        or authentication.derivative_lower_bound_abs
+        != values["derivative_lower_bound_abs"]
+        or authentication.correction_upper_bound
+        != values["correction_upper_bound"]
+    ):
+        return False
+    return (
+        values["correction_upper_bound"]
+        > values["root_correction_tolerance"]
+        and values["correction_without_error"]
+        <= values["root_correction_tolerance"]
+    )
+
+
+def _valid_algebraic_singularity_diagnostics(
+    stage: object, diagnostics: Mapping[str, object]
+) -> bool:
+    if _has_exact_fields(diagnostics, _FACTORED_DIAGNOSTIC_FIELDS):
+        return (
+            stage == "homogeneous-propagation"
+            and diagnostics.get("reason")
+            == "ALGEBRAIC_REPRESENTATION_SINGULAR"
+            and _is_positive_int(diagnostics.get("precision_bits"))
+            and _is_nonnegative_int(
+                diagnostics.get("factored_homogeneous_rhs_evaluations")
+            )
+            and diagnostics.get("avoided_ode_scope")
+            == "factored-homogeneous-gsn/v1"
+        )
+    fd_fields = frozenset({"reason", "range_status", "operation", "axis", "h"})
+    if _has_exact_fields(diagnostics, fd_fields):
+        h = _diagnostic_decimal(diagnostics, "h", positive=True)
+        return (
+            stage == "finite-difference"
+            and isinstance(diagnostics.get("reason"), str)
+            and diagnostics["reason"]
+            and diagnostics.get("range_status") == diagnostics["reason"]
+            and diagnostics.get("operation")
+            == "finite-difference-derivative/v1"
+            and diagnostics.get("axis") in {"real", "imaginary"}
+            and h is not None
+        )
+    chart_fields = frozenset({"chart_denominator_abs", "chart_scale_abs"})
+    if _has_exact_fields(diagnostics, chart_fields):
+        denominator = _diagnostic_decimal(
+            diagnostics, "chart_denominator_abs", nonnegative=True
+        )
+        scale = _diagnostic_decimal(
+            diagnostics, "chart_scale_abs", nonnegative=True
+        )
+        return (
+            stage == "determinant-chart"
+            and denominator == 0
+            and scale is not None
+        )
+    guard_fields = frozenset({
+        "guard_precision_digits",
+        "guard_working_precision_bits",
+        "determinant_abs",
+        "guard_determinant_abs",
+    })
+    if _has_exact_fields(diagnostics, guard_fields):
+        return (
+            stage == "determinant-chart"
+            and _is_positive_int(diagnostics.get("guard_precision_digits"))
+            and _is_positive_int(
+                diagnostics.get("guard_working_precision_bits")
+            )
+            and isinstance(diagnostics.get("determinant_abs"), str)
+            and isinstance(diagnostics.get("guard_determinant_abs"), str)
+        )
+    policy_base = frozenset({
+        "reason",
+        "range_status",
+        "operation",
+        "axis",
+        "h",
+        "frequency_step",
+    })
+    policy_wide = policy_base | {
+        "frequency_step_minimum",
+        "frequency_step_maximum",
+    }
+    if frozenset(diagnostics) not in {policy_base, policy_wide}:
+        return False
+    return (
+        stage in {"request-policy", "determinant-chart"}
+        and diagnostics.get("reason") == "INVALID_FREQUENCY_STEP"
+        and diagnostics.get("range_status") == "invalid-frequency-step/v1"
+        and diagnostics.get("operation")
+        == "finite-difference-request-policy/v1"
+        and diagnostics.get("axis") == "request-policy"
+        and all(
+            isinstance(diagnostics.get(name), str)
+            for name in frozenset(diagnostics) - {
+                "reason",
+                "range_status",
+                "operation",
+                "axis",
+            }
+        )
+    )
+
+
 def _valid_numerical_control_diagnostics(
     failure: Mapping[str, object],
 ) -> bool:
-    """Return whether a recognized control receipt carries typed evidence."""
+    """Return whether a recognized control receipt carries typed evidence.
+
+    A failure code says what went wrong; the stage says where. Several codes can
+    arise at more than one point in the pipeline, so a receipt without a stage
+    cannot be attributed -- and a receipt without diagnostics degrades to a
+    generic backend error, losing the named diagnosis entirely.
+    """
 
     diagnostics = failure.get("diagnostics")
     if not isinstance(diagnostics, Mapping) or not diagnostics:
         return False
-    code = failure.get("failure_code")
-    if code != "INSUFFICIENT_ASYMPTOTIC_PRECISION":
-        return True
-    try:
-        predicted_reliable_digits = _finite_decimal_text(
-            diagnostics.get("predicted_reliable_digits"),
-            "failure predicted_reliable_digits",
-        )
-        required_reliable_digits = _finite_decimal_text(
-            diagnostics.get("required_reliable_digits"),
-            "failure required_reliable_digits",
-            nonnegative=True,
-        )
-    except JuliaResponseBackendError:
+    stage = failure.get("stage")
+    if stage not in CONTROL_FAILURE_STAGES:
         return False
-    return (
-        predicted_reliable_digits < required_reliable_digits
-        and diagnostics.get("asymptotic_preflight_avoided_ode") is True
-        and diagnostics.get("asymptotic_preflight_reason") == code
-        and type(
-            diagnostics.get("factored_homogeneous_rhs_evaluations")
-        ) is int
-        and diagnostics["factored_homogeneous_rhs_evaluations"] == 0
-        and diagnostics.get("avoided_ode_scope")
-        == "factored-homogeneous-gsn/v1"
-    )
+    code = failure.get("failure_code")
+    if not isinstance(code, str):
+        return False
+    if code in _FACTORED_FAILURE_STAGES:
+        return _valid_factored_diagnostics(code, stage, diagnostics)
+    if code == "INSUFFICIENT_ASYMPTOTIC_PRECISION":
+        return _valid_insufficient_precision_diagnostics(stage, diagnostics)
+    if code in {
+        "SCATTERING_BASIS_ILL_CONDITIONED",
+        "SCATTERING_CHART_ILL_CONDITIONED",
+    }:
+        return _valid_scattering_diagnostics(code, stage, diagnostics)
+    if code == "COORDINATE_INVERSION_STALLED":
+        return _valid_coordinate_stall_diagnostics(stage, diagnostics)
+    if code == "FINITE_DIFFERENCE_NOISE_LIMIT":
+        return _valid_finite_difference_noise_diagnostics(stage, diagnostics)
+    if code == "DETERMINANT_UNCERTAINTY_TOO_LARGE":
+        return _valid_determinant_uncertainty_diagnostics(stage, diagnostics)
+    if code == "ALGEBRAIC_REPRESENTATION_SINGULAR":
+        return _valid_algebraic_singularity_diagnostics(stage, diagnostics)
+    return False
 
 
 def _timeout_worker_failure_details(
@@ -1589,6 +2243,7 @@ def _precision_policy(job: ResponseComponentJob, digits: int, refinement: int) -
     return {
         "readout_radius": format(job.policy.readout_radius, ".17g"),
         **controls,
+        **horizon_geometry_controls(),
         **regularised_gsn_precision_policy(job.mechanism_id),
         "endpoint_series_order": job.policy.endpoint_series_order + 8 * refinement,
         "support_subinterval_count": job.policy.support_subinterval_count * (2 ** refinement),
@@ -1809,6 +2464,7 @@ class JuliaPrecisionRootBackend:
             "raw_determinant_abs",
             "raw_determinant_evidence_status",
             "root_derivative_abs",
+            "root_authentication",
             "root_converged",
             "branch_authentication_contract_version",
             "root_branch_continuation_valid",
@@ -1835,7 +2491,7 @@ class JuliaPrecisionRootBackend:
                     "branch_authentication_contract_version",
                 )
             )
-            or response["schema_version"] != 3
+            or response["schema_version"] != 4
             or response["status"] != "ok"
             or response["adapter"] != "package-owned-julia-gsn-root-readout"
             or response["precision_digits"] != self.digits
@@ -1861,6 +2517,29 @@ class JuliaPrecisionRootBackend:
         if numerical_conditioning.schema != NUMERICAL_CONDITIONING_SCHEMA:
             raise JuliaResponseBackendError(
                 "M02 Julia current conditioning schema is required"
+            )
+        try:
+            root_authentication = RootAuthenticationEvidence.from_mapping(
+                response["root_authentication"]
+            )
+        except ValueError as error:
+            if "accepted flag is inconsistent" in str(error):
+                raise JuliaResponseBackendError(
+                    "M02 Julia converged root exceeds its correction target"
+                ) from error
+            raise JuliaResponseBackendError(
+                "M02 Julia root authentication evidence is invalid"
+            ) from error
+        # The error model is published exactly by the families that compute one.
+        # A horizon determinant without a breakdown would mean an error-aware
+        # acceptance decision was made from an absent error term.
+        horizon_family = (
+            numerical_conditioning.scattering_diagnostics_applicable is True
+        )
+        if horizon_family != (root_authentication.error_breakdown is not None):
+            raise JuliaResponseBackendError(
+                "M02 Julia root authentication error model does not match the "
+                "determinant family"
             )
         converged = response["root_converged"]
         diagnostics_skipped_reason = response.get("diagnostics_skipped_reason")
@@ -1958,6 +2637,41 @@ class JuliaPrecisionRootBackend:
             "root_residual_abs",
             nonnegative=True,
         )
+        root_derivative_abs_decimal = _finite_decimal_text(
+            response["root_derivative_abs"],
+            "root_derivative_abs",
+            nonnegative=True,
+        )
+        if root_derivative_abs_decimal <= 0:
+            raise JuliaResponseBackendError(
+                "M02 Julia root derivative magnitude is invalid"
+            )
+        expected_error_model_id = (
+            policy.get("determinant_error_model")
+            if horizon_family
+            else None
+        )
+        root_correction_tolerance = _finite_decimal_text(
+            policy.get("root_correction_tolerance"),
+            "root_correction_tolerance",
+            nonnegative=True,
+        )
+        if root_correction_tolerance <= 0:
+            raise JuliaResponseBackendError(
+                "M02 Julia root correction tolerance is invalid"
+            )
+        try:
+            root_authentication.validate_binding(
+                determinant_abs=normalised_determinant_abs,
+                derivative_abs=root_derivative_abs_decimal,
+                expected_error_model_id=expected_error_model_id,
+                root_correction_tolerance=root_correction_tolerance,
+                accepted=converged,
+            )
+        except ValueError as error:
+            raise JuliaResponseBackendError(
+                "M02 Julia root authentication evidence is inconsistent"
+            ) from error
         raw_determinant_abs = (
             None
             if response["raw_determinant_abs"] is None
@@ -2189,6 +2903,7 @@ class JuliaPrecisionRootBackend:
                 raw_determinant_evidence_status=
                     raw_determinant_evidence_status,
                 worker_response_receipt=worker_response_receipt,
+                root_authentication=root_authentication,
             )
         except ValueError as error:
             raise JuliaResponseBackendError(

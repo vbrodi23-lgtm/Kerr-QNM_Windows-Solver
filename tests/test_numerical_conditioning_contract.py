@@ -2,14 +2,17 @@ from __future__ import annotations
 
 import copy
 from dataclasses import replace
-from decimal import Decimal
+from decimal import Decimal, localcontext
 import hashlib
 import math
 import unittest
 
 from tests.fixtures import (
+    control_failure_stage,
+    root_authentication_for_readout,
+    valid_control_failure_diagnostics,
     valid_numerical_conditioning,
-    valid_schema_three_julia_root_response,
+    valid_julia_root_response,
 )
 from windows_solver.contracts import canonical_json_bytes
 from windows_solver.julia_response_backend import (
@@ -746,7 +749,7 @@ class PromotedRuntimeProvenancePersistenceTests(unittest.TestCase):
                         )
                     )
                 ).hexdigest(),
-                "worker_response_schema_version": 3,
+                "worker_response_schema_version": 4,
                 "root_residual_abs_text": "1E-12",
                 "raw_determinant_abs_text": None,
                 "raw_determinant_evidence_status": "not-applicable/v1",
@@ -778,6 +781,23 @@ class PromotedRuntimeProvenancePersistenceTests(unittest.TestCase):
                 "not-applicable/v1" if current_schema else None
             ),
             worker_response_receipt=worker_response_receipt,
+            root_authentication=(
+                response_engine.RootAuthenticationEvidence.from_mapping(
+                    root_authentication_for_readout(
+                        mechanism_id=job.mechanism_id,
+                        determinant_abs=Decimal("1E-12"),
+                        derivative_abs=Decimal("2"),
+                        root_correction_tolerance=Decimal(
+                            request_binding["policy"][
+                                "root_correction_tolerance"
+                            ]
+                        ),
+                        accepted=False,
+                    )
+                )
+                if current_schema
+                else None
+            ),
         )
         return response_engine.ComponentResult(
             job_id=job.job_id,
@@ -1050,7 +1070,7 @@ class JuliaSchemaThreeConditioningTests(unittest.TestCase):
 
         def evaluate(self, request):
             self.requests.append(request)
-            response = valid_schema_three_julia_root_response(request)
+            response = valid_julia_root_response(request)
             if self.mutate is not None:
                 self.mutate(response)
             return response
@@ -1097,7 +1117,9 @@ class JuliaSchemaThreeConditioningTests(unittest.TestCase):
             readout.numerical_conditioning.to_mapping(),
             valid_numerical_conditioning("exterior-light-ring"),
         )
-        self.assertEqual(readout.normalised_determinant_abs, Decimal("1E-60"))
+        self.assertEqual(
+            readout.normalised_determinant_abs, Decimal("2.4E-60")
+        )
         self.assertIsNone(readout.raw_determinant_abs)
         self.assertEqual(
             readout.raw_determinant_evidence_status,
@@ -1141,6 +1163,16 @@ class JuliaSchemaThreeConditioningTests(unittest.TestCase):
         def exact_magnitudes(response):
             response["root_residual_abs"] = normalised
             response["raw_determinant_abs"] = raw
+            authentication = dict(response["root_authentication"])
+            authentication["central_determinant_re"] = normalised
+            authentication["central_determinant_im"] = "0"
+            with localcontext() as context:
+                context.prec = 180
+                residual_upper = Decimal(normalised) + Decimal("1.4E-60")
+                correction_upper = residual_upper / Decimal("2.4")
+            authentication["residual_upper_bound_abs"] = str(residual_upper)
+            authentication["correction_upper_bound"] = str(correction_upper)
+            response["root_authentication"] = authentication
 
         readout = self._backend(self.Adapter(exact_magnitudes)).read_root(
             self._job(), 0.0j
@@ -1237,7 +1269,7 @@ class JuliaSchemaThreeConditioningTests(unittest.TestCase):
         """Catches float/string drift passing equality-based schema checks."""
 
         request = self._backend()._request(self._job(), 0.0j)
-        expected = valid_schema_three_julia_root_response(request)
+        expected = valid_julia_root_response(request)
         fields = (
             "schema_version",
             "precision_digits",
@@ -1309,12 +1341,23 @@ class JuliaSchemaThreeConditioningTests(unittest.TestCase):
         expected = {
             "determinant_family": "horizon-scattering/v1",
             "scattering_diagnostics_applicable": True,
-            "homogeneous_representation": "factored-plane-wave-gsn/v1",
+            # The horizon determinant is built from three independent legs on
+            # a verified real-inner contour, so it carries its own
+            # representation, contour, extraction, and error-model identities.
+            "homogeneous_representation": (
+                "factored-three-leg-horizon-basis-at-match-gsn/v1"
+            ),
+            "horizon_contour": "real-inner-tortoise-contour/v1",
+            "determinant_error_model": (
+                "verified-endpoint-control-equivalence-absolute-error/v2"
+            ),
+            "control_profile_label": "provisional promoted control profile",
+            "calibration_status": "UNMEASURED",
             "asymptotic_series_evaluation": (
                 "typed-batch-horner-compensated/v1"
             ),
             "scattering_coefficient_extraction": (
-                "scaled-factored-horizon-basis/v1"
+                "scaled-horizon-basis-at-match/v1"
             ),
             "horizon_determinant_chart": (
                 "cinc-over-cref-minus-reflectivity/v1"
@@ -1377,12 +1420,31 @@ class JuliaSchemaThreeConditioningTests(unittest.TestCase):
         self.assertIsNone(policy["scattering_coefficient_extraction"])
         self.assertIsNone(policy["horizon_determinant_chart"])
         self.assertIsNone(policy["scattering_chart_safety_factor"])
+        # The exterior path is unchanged by the horizon rewrite: it keeps the
+        # original representation, and the identities the rewrite introduced
+        # are absent rather than null. A null would still change the policy
+        # mapping, and receipt reuse is decided by exact equality against it --
+        # so every exterior receipt main produced would go stale for a change
+        # that never touched the exterior determinant.
+        self.assertEqual(
+            policy["homogeneous_representation"], "factored-plane-wave-gsn/v1"
+        )
+        self.assertNotIn("horizon_contour", policy)
+        self.assertNotIn("determinant_error_model", policy)
+        self.assertNotIn("control_profile_label", policy)
+        self.assertNotIn("calibration_status", policy)
         runtime_policy = backend.scientific_runtime_for(job)[
             "regularised_gsn_precision_policy"
         ]
         self.assertEqual(
             set(runtime_policy),
-            set(response_engine.REGULARISED_GSN_PRECISION_POLICY),
+            set(response_engine.REGULARISED_GSN_PRECISION_POLICY)
+            - {
+                "horizon_contour",
+                "determinant_error_model",
+                "control_profile_label",
+                "calibration_status",
+            },
         )
         self.assertEqual(
             runtime_policy,
@@ -1474,7 +1536,15 @@ class JuliaNumericalControlFailureTests(unittest.TestCase):
         "FACTORED_PROPAGATION_PRECISION_MISMATCH",
         "NONFINITE_FACTORED_PROPAGATION_DATA",
         "FACTORED_ODE_FAILURE",
+        "NO_VERIFIED_HORIZON_ENDPOINT",
+        "COORDINATE_INVERSION_STALLED",
+        "DETERMINANT_UNCERTAINTY_TOO_LARGE",
+        "FINITE_DIFFERENCE_NOISE_LIMIT",
     )
+
+    @staticmethod
+    def _diagnostics(code: str) -> dict[str, object]:
+        return valid_control_failure_diagnostics(code)
 
     @staticmethod
     def _details(code: str, *, include_identity: bool = True):
@@ -1483,16 +1553,12 @@ class JuliaNumericalControlFailureTests(unittest.TestCase):
             "failure_code": code,
             "failure_class": "CONTROL",
             "retryable": code == "INSUFFICIENT_ASYMPTOTIC_PRECISION",
-            "diagnostics": {
-                "predicted_reliable_digits": "11.25",
-                "required_reliable_digits": "24",
-                "asymptotic_preflight_avoided_ode": True,
-                "asymptotic_preflight_reason": (
-                    "INSUFFICIENT_ASYMPTOTIC_PRECISION"
-                ),
-                "factored_homogeneous_rhs_evaluations": 0,
-                "avoided_ode_scope": "factored-homogeneous-gsn/v1",
-            },
+            "stage": control_failure_stage(code),
+            "diagnostics": (
+                JuliaNumericalControlFailureTests._diagnostics(code)
+                if code in JuliaNumericalControlFailureTests.CODES
+                else {"reason": code}
+            ),
         }
         if include_identity:
             failure["execution_resource_policy"] = policy
@@ -1658,6 +1724,95 @@ class JuliaNumericalControlFailureTests(unittest.TestCase):
                     details["failure"].pop("diagnostics")
                 else:
                     details["failure"]["diagnostics"] = diagnostics
+                julia_backend._require_worker_resource_identity(details, policy)
+                with self.assertRaises(JuliaResponseBackendError) as raised:
+                    julia_backend._raise_worker_failure(details)
+                self.assertIs(type(raised.exception), JuliaResponseBackendError)
+
+    def test_each_code_rejects_arbitrary_or_structurally_mutated_diagnostics(self):
+        """Catches treating a code label as a substitute for its evidence."""
+
+        for code in self.CODES:
+            baseline = self._diagnostics(code)
+            mutations = {
+                "arbitrary": {"anything": "goes"},
+                "missing_field": {
+                    key: value
+                    for index, (key, value) in enumerate(baseline.items())
+                    if index != 0
+                },
+                "unexpected_field": {**baseline, "unreviewed": True},
+            }
+            for label, diagnostics in mutations.items():
+                with self.subTest(code=code, mutation=label):
+                    policy, details = self._details(code)
+                    details["failure"]["diagnostics"] = diagnostics
+                    julia_backend._require_worker_resource_identity(
+                        details, policy
+                    )
+                    with self.assertRaises(
+                        JuliaResponseBackendError
+                    ) as raised:
+                        julia_backend._raise_worker_failure(details)
+                    self.assertIs(
+                        type(raised.exception), JuliaResponseBackendError
+                    )
+
+    def test_coordinate_stall_receipt_requires_finite_state_evidence(self):
+        """Catches a typed stall receipt that cannot locate the failed map."""
+
+        baseline = self._diagnostics("COORDINATE_INVERSION_STALLED")
+        mutations = {
+            "missing_rejected_steps": "ode_rejected_steps",
+            "missing_current_radius": "current_r_re",
+            "missing_identity_residual": "coordinate_identity_residual_abs",
+        }
+        for label, field in mutations.items():
+            with self.subTest(label=label):
+                policy, details = self._details(
+                    "COORDINATE_INVERSION_STALLED"
+                )
+                diagnostics = copy.deepcopy(baseline)
+                diagnostics.pop(field)
+                details["failure"]["diagnostics"] = diagnostics
+                julia_backend._require_worker_resource_identity(
+                    details, policy
+                )
+                with self.assertRaises(JuliaResponseBackendError):
+                    julia_backend._raise_worker_failure(details)
+
+        invalid_values = {
+            "ode_rejected_steps": -1,
+            "current_r_re": "NaN",
+            "current_r_im": "Inf",
+            "coordinate_identity_residual_abs": "-1e-25",
+        }
+        for field, value in invalid_values.items():
+            with self.subTest(field=field, value=value):
+                policy, details = self._details(
+                    "COORDINATE_INVERSION_STALLED"
+                )
+                diagnostics = copy.deepcopy(baseline)
+                diagnostics[field] = value
+                details["failure"]["diagnostics"] = diagnostics
+                julia_backend._require_worker_resource_identity(
+                    details, policy
+                )
+                with self.assertRaises(JuliaResponseBackendError):
+                    julia_backend._raise_worker_failure(details)
+
+    def test_each_code_rejects_a_stage_it_cannot_emit_from(self):
+        """Catches relabelling diagnostics as a different pipeline failure."""
+
+        for code in self.CODES:
+            with self.subTest(code=code):
+                policy, details = self._details(code)
+                current = details["failure"]["stage"]
+                details["failure"]["stage"] = (
+                    "coordinate-inversion"
+                    if current != "coordinate-inversion"
+                    else "finite-difference"
+                )
                 julia_backend._require_worker_resource_identity(details, policy)
                 with self.assertRaises(JuliaResponseBackendError) as raised:
                     julia_backend._raise_worker_failure(details)
