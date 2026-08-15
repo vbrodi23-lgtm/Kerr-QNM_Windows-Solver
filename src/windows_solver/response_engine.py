@@ -127,6 +127,7 @@ _REGULARISED_GSN_COMMON_IDENTITIES: Mapping[str, str] = MappingProxyType({
 })
 REGULARISED_GSN_CONDITIONING_IDENTITIES: Mapping[str, object] = MappingProxyType({
     **_REGULARISED_GSN_COMMON_IDENTITIES,
+    "homogeneous_representation": HORIZON_HOMOGENEOUS_REPRESENTATION,
     "determinant_family": HORIZON_DETERMINANT_FAMILY,
     "scattering_diagnostics_applicable": True,
     "scattering_column_convention": HORIZON_SCATTERING_COLUMN_CONVENTION,
@@ -1043,10 +1044,28 @@ class NumericalConditioningEvidence:
         }:
             raise ValueError("numerical conditioning schema is invalid")
         for field, expected in _REGULARISED_GSN_COMMON_IDENTITIES.items():
+            if field == "homogeneous_representation":
+                # Family-dependent: the horizon determinant builds a three-leg
+                # solution basis on a verified real-inner contour, which is a
+                # different calculation from the exterior Wronskian's single
+                # factored representation.
+                continue
             if getattr(self, field) != expected:
                 raise ValueError(
                     f"numerical conditioning {field} identity is invalid"
                 )
+        expected_representation = (
+            HORIZON_HOMOGENEOUS_REPRESENTATION
+            if self.determinant_family == HORIZON_DETERMINANT_FAMILY
+            else _REGULARISED_GSN_COMMON_IDENTITIES[
+                "homogeneous_representation"
+            ]
+        )
+        if self.homogeneous_representation != expected_representation:
+            raise ValueError(
+                "numerical conditioning homogeneous_representation identity "
+                "is invalid"
+            )
         if self.schema == NUMERICAL_CONDITIONING_SCHEMA:
             for field in _NUMERICAL_CONDITIONING_GATE_FIELDS:
                 expected = _REGULARISED_GSN_COMMON_PRECISION_POLICY[field]

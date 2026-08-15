@@ -750,7 +750,6 @@ end
 
 function validate_regularised_gsn_policy(request)
     expected_common = Dict{String,Any}(
-        "homogeneous_representation" => HOMOGENEOUS_REPRESENTATION_ID,
         "asymptotic_series_evaluation" => ASYMPTOTIC_SERIES_EVALUATION_ID,
         "conditioning_diagnostics" => CONDITIONING_DIAGNOSTICS_ID,
         "branch_convention" => BRANCH_CONVENTION_ID,
@@ -779,9 +778,17 @@ function validate_regularised_gsn_policy(request)
         "horizon-admittance"
     expected_mechanism = if horizon
         Dict{String,Any}(
+            # The horizon family builds a solution basis from three
+            # independent legs on a verified real-inner contour, so it carries
+            # its own representation, contour, extraction, and error-model
+            # identities. Receipts written under the previous horizon
+            # identities describe a different calculation.
+            "homogeneous_representation" =>
+                HORIZON_HOMOGENEOUS_REPRESENTATION_ID,
             "determinant_family" => HORIZON_DETERMINANT_FAMILY_ID,
             "scattering_diagnostics_applicable" => true,
-            "scattering_coefficient_extraction" => SCATTERING_EXTRACTION_ID,
+            "scattering_coefficient_extraction" =>
+                HORIZON_BASIS_AT_MATCH_EXTRACTION_ID,
             "horizon_determinant_chart" =>
                 HORIZON_DETERMINANT_NORMALISATION_ID,
             "scattering_chart_safety_factor" =>
@@ -792,9 +799,12 @@ function validate_regularised_gsn_policy(request)
                 HORIZON_DETERMINANT_CONVENTION_ID,
             "determinant_normalisation" =>
                 HORIZON_DETERMINANT_NORMALISATION_ID,
+            "horizon_contour" => REAL_INNER_HORIZON_CONTOUR_ID,
+            "determinant_error_model" => VERIFIED_ENDPOINT_ERROR_MODEL_ID,
         )
     else
         Dict{String,Any}(
+            "homogeneous_representation" => HOMOGENEOUS_REPRESENTATION_ID,
             "determinant_family" => EXTERIOR_DETERMINANT_FAMILY_ID,
             "scattering_diagnostics_applicable" => false,
             "scattering_coefficient_extraction" => nothing,
@@ -805,6 +815,8 @@ function validate_regularised_gsn_policy(request)
                 EXTERIOR_DETERMINANT_CONVENTION_ID,
             "determinant_normalisation" =>
                 EXTERIOR_DETERMINANT_NORMALISATION_ID,
+            "horizon_contour" => nothing,
+            "determinant_error_model" => nothing,
         )
     end
     for (key, expected) in expected_mechanism
@@ -2241,7 +2253,7 @@ function evaluate_horizon_determinant(
         reference_basis.outgoing_endpoint,
     )
     diagnostics = DeterminantDiagnostics{T}(
-        HOMOGENEOUS_REPRESENTATION_ID,
+        HORIZON_HOMOGENEOUS_REPRESENTATION_ID,
         HORIZON_DETERMINANT_FAMILY_ID,
         true,
         endpoint_summary.maximum_series_digits_lost,
@@ -3504,7 +3516,9 @@ function conditioning_response(
             HORIZON_DETERMINANT_FAMILY_ID :
             EXTERIOR_DETERMINANT_FAMILY_ID,
         "scattering_diagnostics_applicable" => horizon,
-        "homogeneous_representation" => HOMOGENEOUS_REPRESENTATION_ID,
+        "homogeneous_representation" => horizon ?
+            HORIZON_HOMOGENEOUS_REPRESENTATION_ID :
+            HOMOGENEOUS_REPRESENTATION_ID,
         "branch_convention" => BRANCH_CONVENTION_ID,
         "scattering_column_convention" => horizon ?
             SCATTERING_COLUMN_CONVENTION_ID : nothing,

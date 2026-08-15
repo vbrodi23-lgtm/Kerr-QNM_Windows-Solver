@@ -101,7 +101,13 @@ def valid_numerical_conditioning(
             "horizon-scattering/v1" if horizon else "exterior-wronskian/v1"
         ),
         "scattering_diagnostics_applicable": horizon,
-        "homogeneous_representation": "factored-plane-wave-gsn/v1",
+        # The horizon family builds a three-leg solution basis on a verified
+        # real-inner contour; the exterior family is unchanged.
+        "homogeneous_representation": (
+            "factored-three-leg-horizon-basis-at-match-gsn/v1"
+            if horizon
+            else "factored-plane-wave-gsn/v1"
+        ),
         "branch_convention": "gsn-complex-rho/v1",
         "scattering_column_convention": (
             "column1=horizon-ingoing-Cref;"
