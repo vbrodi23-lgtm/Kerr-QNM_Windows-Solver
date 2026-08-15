@@ -84,6 +84,7 @@ WORKER_RESPONSE_RECEIPT_SCHEMA = "windows-solver.worker-response-receipt/1"
 # version it observed so a cached receipt cannot be replayed against a
 # different wire contract.
 WORKER_RESPONSE_WIRE_SCHEMA = 4
+HISTORICAL_WORKER_RESPONSE_WIRE_SCHEMAS = frozenset({3})
 _WORKER_RESPONSE_RECEIPT_FIELDS = frozenset({
     "schema",
     "request_binding",
@@ -350,7 +351,9 @@ def _validated_worker_response_receipt(
             raise ValueError(f"worker response receipt {field} is invalid")
     if value["request_sha256"] != _sha256(dict(request_binding)):
         raise ValueError("worker response receipt request digest is invalid")
-    if value["worker_response_schema_version"] != WORKER_RESPONSE_WIRE_SCHEMA:
+    if value["worker_response_schema_version"] not in (
+        HISTORICAL_WORKER_RESPONSE_WIRE_SCHEMAS | {WORKER_RESPONSE_WIRE_SCHEMA}
+    ):
         raise ValueError("worker response receipt wire schema is invalid")
     residual = _conditioning_decimal_from_text(
         value["root_residual_abs_text"],
@@ -1835,6 +1838,15 @@ class RootReadout:
             self.worker_response_receipt
         )
         if receipt is not None:
+            current_wire = (
+                receipt["worker_response_schema_version"]
+                == WORKER_RESPONSE_WIRE_SCHEMA
+            )
+            if current_wire != (self.root_authentication is not None):
+                raise ValueError(
+                    "worker response receipt authentication schema is "
+                    "inconsistent"
+                )
             if (
                 self.normalised_determinant_abs is None
                 or Decimal(receipt["root_residual_abs_text"])

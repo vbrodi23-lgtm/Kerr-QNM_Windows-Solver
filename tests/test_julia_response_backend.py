@@ -485,6 +485,36 @@ class JuliaResponseBackendTests(unittest.TestCase):
         ):
             RootReadout.from_mapping(mapping)
 
+    def test_main_era_exterior_worker_receipt_remains_readable(self):
+        """Catches a wire migration retiring unchanged exterior readouts."""
+
+        readout = JuliaPrecisionRootBackend(
+            VettedNativeDeterminantKernel.identity, FakeAdapter(), 80
+        ).read_root(_job_for_mechanism("exterior-fixed-r3"), 0.0j)
+        mapping = readout.to_mapping()
+        mapping["root_authentication"] = None
+        receipt = dict(mapping["worker_response_receipt"])
+        receipt["worker_response_schema_version"] = 3
+        material = {
+            key: value
+            for key, value in receipt.items()
+            if key != "receipt_sha256"
+        }
+        receipt["receipt_sha256"] = hashlib.sha256(
+            canonical_json_bytes(material)
+        ).hexdigest()
+        mapping["worker_response_receipt"] = receipt
+
+        restored = RootReadout.from_mapping(mapping)
+
+        self.assertIsNone(restored.root_authentication)
+        self.assertEqual(
+            restored.worker_response_receipt[
+                "worker_response_schema_version"
+            ],
+            3,
+        )
+
     def test_backend_rejects_authentication_disagreeing_with_its_family(self):
         """Catches an error-aware decision made from an absent error term."""
 
