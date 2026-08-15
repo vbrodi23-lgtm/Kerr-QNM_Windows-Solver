@@ -106,6 +106,18 @@ EXTERIOR_DETERMINANT_NORMALISATION = (
     "unit-asymptotic-branch-wronskian/v1"
 )
 
+# Horizon-side identities for the verified three-leg basis. These are new
+# identities rather than revisions of the old ones because the calculation they
+# describe is different: three independent legs on a contour that provably
+# approaches r_plus, versus one propagated solution carried down a contour that
+# does not.
+HORIZON_HOMOGENEOUS_REPRESENTATION = (
+    "factored-three-leg-horizon-basis-at-match-gsn/v1"
+)
+REAL_INNER_HORIZON_CONTOUR = "real-inner-tortoise-contour/v1"
+HORIZON_BASIS_AT_MATCH_EXTRACTION = "scaled-horizon-basis-at-match/v1"
+VERIFIED_ENDPOINT_ERROR_MODEL = "verified-endpoint-absolute-error/v1"
+
 _REGULARISED_GSN_COMMON_IDENTITIES: Mapping[str, str] = MappingProxyType({
     "homogeneous_representation": "factored-plane-wave-gsn/v1",
     "branch_convention": "gsn-complex-rho/v1",
@@ -176,20 +188,39 @@ def regularised_gsn_mechanism_contract(
 def regularised_gsn_precision_policy(
     mechanism_id: str,
 ) -> Mapping[str, object]:
-    """Bind precision controls to the determinant family actually evaluated."""
+    """Bind precision controls to the determinant family actually evaluated.
+
+    The horizon family carries its own homogeneous-representation identity: it
+    no longer propagates one solution through a mixed match-to-inner leg, but
+    builds a genuine solution basis from three independent legs seeded on a
+    verified real-inner contour. Receipts written under the previous horizon
+    identities describe a different calculation and are correctly treated as
+    stale. Exterior receipts are unaffected -- that path is unchanged.
+    """
 
     contract = regularised_gsn_mechanism_contract(mechanism_id)
     horizon = contract["scattering_diagnostics_applicable"] is True
     return MappingProxyType({
         **_REGULARISED_GSN_COMMON_PRECISION_POLICY,
         **contract,
+        "homogeneous_representation": (
+            HORIZON_HOMOGENEOUS_REPRESENTATION
+            if horizon
+            else _REGULARISED_GSN_COMMON_PRECISION_POLICY[
+                "homogeneous_representation"
+            ]
+        ),
         "scattering_coefficient_extraction": (
-            "scaled-factored-horizon-basis/v1" if horizon else None
+            HORIZON_BASIS_AT_MATCH_EXTRACTION if horizon else None
         ),
         "horizon_determinant_chart": (
             "cinc-over-cref-minus-reflectivity/v1" if horizon else None
         ),
         "scattering_chart_safety_factor": "64" if horizon else None,
+        "horizon_contour": REAL_INNER_HORIZON_CONTOUR if horizon else None,
+        "determinant_error_model": (
+            VERIFIED_ENDPOINT_ERROR_MODEL if horizon else None
+        ),
     })
 
 _NUMERICAL_CONDITIONING_DECIMAL_FIELDS = (

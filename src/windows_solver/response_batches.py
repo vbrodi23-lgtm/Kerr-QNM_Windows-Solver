@@ -826,6 +826,9 @@ def _validated_attempt_failure_receipt(value: object) -> dict[str, object]:
         "max_accepted_steps_per_homogeneous_leg",
         "max_rhs_evaluations_per_homogeneous_leg",
         "homogeneous_leg_wall_clock_seconds",
+        "coordinate_stall_rhs_threshold",
+        "coordinate_stall_minimum_span_fraction",
+        "coordinate_stall_minimum_step_fraction",
     }
     resource_policy_fields = frozenset(resource_policy) if isinstance(
         resource_policy, Mapping
@@ -854,11 +857,34 @@ def _validated_attempt_failure_receipt(value: object) -> dict[str, object]:
             "homogeneous_ode_maxiters",
             "max_accepted_steps_per_homogeneous_leg",
             "max_rhs_evaluations_per_homogeneous_leg",
+            "coordinate_stall_rhs_threshold",
         ):
             item = resource_policy[name]
             if isinstance(item, bool) or not isinstance(item, int) or item < 1:
                 raise ValueError(
                     "campaign execution attempt resource-policy limit is invalid"
+                )
+        for name in (
+            "coordinate_stall_minimum_span_fraction",
+            "coordinate_stall_minimum_step_fraction",
+        ):
+            fraction = resource_policy[name]
+            if not isinstance(fraction, str):
+                raise ValueError(
+                    "campaign execution attempt resource-policy stall "
+                    "fraction is invalid"
+                )
+            try:
+                parsed = float(fraction)
+            except ValueError as error:
+                raise ValueError(
+                    "campaign execution attempt resource-policy stall "
+                    "fraction is invalid"
+                ) from error
+            if not 0.0 < parsed < 1.0:
+                raise ValueError(
+                    "campaign execution attempt resource-policy stall "
+                    "fraction is invalid"
                 )
         leg_timeout = resource_policy["homogeneous_leg_wall_clock_seconds"]
         if leg_timeout is not None and (

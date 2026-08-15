@@ -76,6 +76,9 @@ _DEFAULT_COOPERATIVE_MARGIN_SECONDS = 120
 _DEFAULT_HOMOGENEOUS_ODE_MAXITERS = 10_000_000
 _DEFAULT_HOMOGENEOUS_MAX_ACCEPTED_STEPS = 1_000_000
 _DEFAULT_HOMOGENEOUS_MAX_RHS_EVALUATIONS = 2_000_000
+_DEFAULT_COORDINATE_STALL_RHS_THRESHOLD = 200_000
+_DEFAULT_COORDINATE_STALL_MINIMUM_SPAN_FRACTION = "1e-6"
+_DEFAULT_COORDINATE_STALL_MINIMUM_STEP_FRACTION = "1e-12"
 NUMERICAL_CONTROL_FAILURE_CODES = frozenset({
     "SCATTERING_BASIS_ILL_CONDITIONED",
     "SCATTERING_CHART_ILL_CONDITIONED",
@@ -88,6 +91,18 @@ NUMERICAL_CONTROL_FAILURE_CODES = frozenset({
     "FACTORED_PROPAGATION_PRECISION_MISMATCH",
     "NONFINITE_FACTORED_PROPAGATION_DATA",
     "FACTORED_ODE_FAILURE",
+    # Fewer than two horizon endpoints passed the radial-approach and
+    # dual-series gate. Raised before any homogeneous ODE starts.
+    "NO_VERIFIED_HORIZON_ENDPOINT",
+    # The coordinate map made no meaningful progress. Distinguishes an
+    # impossible local-error target from an exhausted resource budget.
+    "COORDINATE_INVERSION_STALLED",
+    # The central determinant is small but its absolute error is too large to
+    # call the root located. Never reported as a solved root.
+    "DETERMINANT_UNCERTAINTY_TOO_LARGE",
+    # The finite-difference ladder was exhausted without a step at which the
+    # derivative estimates agree and determinant noise does not dominate.
+    "FINITE_DIFFERENCE_NOISE_LIMIT",
 })
 
 
@@ -199,6 +214,21 @@ def _execution_resource_policy() -> dict[str, object]:
                 "KERR_QNM_JULIA_HOMOGENEOUS_LEG_TIMEOUT_SECONDS"
             )
         ),
+        # Coordinate-inversion stall detection. The threshold is generous
+        # relative to a healthy coordinate solve (2,978 RHS evaluations for the
+        # exact 80-digit Leaf 13 positive leg) but far below the 2,000,002 the
+        # stalled run consumed, so a pathological map is named rather than
+        # allowed to spend the whole budget proving the same point.
+        "coordinate_stall_rhs_threshold": _positive_environment_integer(
+            "KERR_QNM_JULIA_COORDINATE_STALL_RHS_THRESHOLD",
+            _DEFAULT_COORDINATE_STALL_RHS_THRESHOLD,
+        ),
+        "coordinate_stall_minimum_span_fraction": (
+            _DEFAULT_COORDINATE_STALL_MINIMUM_SPAN_FRACTION
+        ),
+        "coordinate_stall_minimum_step_fraction": (
+            _DEFAULT_COORDINATE_STALL_MINIMUM_STEP_FRACTION
+        ),
     }
     return {
         **material,
@@ -216,6 +246,9 @@ def _validated_execution_resource_policy(value: object) -> dict[str, object]:
         "max_accepted_steps_per_homogeneous_leg",
         "max_rhs_evaluations_per_homogeneous_leg",
         "homogeneous_leg_wall_clock_seconds",
+        "coordinate_stall_rhs_threshold",
+        "coordinate_stall_minimum_span_fraction",
+        "coordinate_stall_minimum_step_fraction",
         "sha256",
     }
     if not isinstance(value, Mapping) or set(value) != expected:
@@ -232,12 +265,39 @@ def _validated_execution_resource_policy(value: object) -> dict[str, object]:
         "homogeneous_ode_maxiters",
         "max_accepted_steps_per_homogeneous_leg",
         "max_rhs_evaluations_per_homogeneous_leg",
+        "coordinate_stall_rhs_threshold",
     ):
         item = copied[name]
         if isinstance(item, bool) or not isinstance(item, int) or item < 1:
             raise JuliaResponseBackendError(
                 f"execution-resource policy {name} is invalid"
             )
+    for name in (
+        "coordinate_stall_minimum_span_fraction",
+        "coordinate_stall_minimum_step_fraction",
+    ):
+        item = copied[name]
+        if not isinstance(item, str):
+            raise JuliaResponseBackendError(
+                f"execution-resource policy {name} is invalid"
+            )
+        try:
+            fraction = float(item)
+        except ValueError as error:
+            raise JuliaResponseBackendError(
+                f"execution-resource policy {name} is invalid"
+            ) from error
+        if not 0.0 < fraction < 1.0:
+            raise JuliaResponseBackendError(
+                f"execution-resource policy {name} is invalid"
+            )
+    if (
+        copied["coordinate_stall_rhs_threshold"]
+        >= copied["max_rhs_evaluations_per_homogeneous_leg"]
+    ):
+        raise JuliaResponseBackendError(
+            "coordinate stall threshold must fire before the RHS ceiling"
+        )
     leg_timeout = copied["homogeneous_leg_wall_clock_seconds"]
     if leg_timeout is not None and (
         isinstance(leg_timeout, bool)
@@ -377,7 +437,37 @@ class _WindowsKillOnCloseJob:
 
 
 def promoted_precision_numerical_controls() -> dict[str, object]:
-    """Return the canonical root/ODE/derivative controls for promoted tiers."""
+    """Return the calibrated root/ODE/derivative controls for promoted tiers.
+
+    The scientific root target is a property of the physics, not of the
+    arithmetic: 1e-18 at base and 1e-20 at refinement, for **both** the 80- and
+    120-digit tiers. Through ``required_reliable_digits`` those correspond to 24
+    and 26 required reliable digits.
+
+    The previous table derived the 120-digit controls mechanically from the
+    stored digit count (``10**-(digits - 18)``), which demanded a 1e-102 root
+    target -- hence 108 required reliable digits -- and applied that same
+    tolerance to the coordinate map. That is what pinned Leaf 13's coordinate
+    solve at 8.1e-17 steps: 2,000,002 RHS evaluations and 87.8 s to cover
+    1.01e-11 of a 5000 span. More stored digits do not make a QNM root more
+    accurately defined; they buy guard precision against cancellation, carrier
+    changes, and finite differencing.
+
+    So the 120-digit tier keeps the same scientific target as the 80-digit tier
+    and spends its extra digits as guard: its ODE controls are tightened by a
+    bounded factor over the demonstrated-healthy 80-digit level (1e-18 / 1e-20
+    homogeneous, reached in 2,978 RHS evaluations on the exact Leaf 13 leg),
+    not driven to the arithmetic floor.
+
+    The coordinate map gets its own, looser controls. It is a scalar quadrature
+    for r(rho) and only has to avoid dominating the determinant error budget;
+    it does not need the homogeneous solve's local-error target.
+
+    These values are the starting profile. They are not a second guessed table:
+    ``tools/calibrate_leaf13_horizon_controls.jl`` measures the determinant
+    response to each control and the selected profile is committed with its
+    calibration receipt.
+    """
 
     return {
         "80": {
@@ -385,29 +475,73 @@ def promoted_precision_numerical_controls() -> dict[str, object]:
                 "root_correction_tolerance": "1e-18",
                 "ode_relative_tolerance": "1e-18",
                 "ode_absolute_tolerance": "1e-20",
+                "homogeneous_ode_relative_tolerance": "1e-18",
+                "homogeneous_ode_absolute_tolerance": "1e-20",
+                "coordinate_ode_relative_tolerance": "1e-18",
+                "coordinate_ode_absolute_tolerance": "1e-20",
                 "frequency_step": "1e-6",
+                "frequency_step_minimum": "1e-12",
+                "frequency_step_maximum": "1e-3",
             },
             "refinement": {
                 "root_correction_tolerance": "1e-20",
                 "ode_relative_tolerance": "1e-20",
                 "ode_absolute_tolerance": "1e-20",
+                "homogeneous_ode_relative_tolerance": "1e-22",
+                "homogeneous_ode_absolute_tolerance": "1e-24",
+                "coordinate_ode_relative_tolerance": "1e-20",
+                "coordinate_ode_absolute_tolerance": "1e-22",
                 "frequency_step": "1e-7",
+                "frequency_step_minimum": "1e-14",
+                "frequency_step_maximum": "1e-4",
             },
         },
         "120": {
             "base": {
-                "root_correction_tolerance": "1e-102",
-                "ode_relative_tolerance": "1e-102",
-                "ode_absolute_tolerance": "1e-104",
-                "frequency_step": "1e-60",
+                "root_correction_tolerance": "1e-18",
+                "ode_relative_tolerance": "1e-24",
+                "ode_absolute_tolerance": "1e-26",
+                "homogeneous_ode_relative_tolerance": "1e-24",
+                "homogeneous_ode_absolute_tolerance": "1e-26",
+                "coordinate_ode_relative_tolerance": "1e-20",
+                "coordinate_ode_absolute_tolerance": "1e-22",
+                "frequency_step": "1e-6",
+                "frequency_step_minimum": "1e-16",
+                "frequency_step_maximum": "1e-3",
             },
             "refinement": {
-                "root_correction_tolerance": "1e-106",
-                "ode_relative_tolerance": "1e-106",
-                "ode_absolute_tolerance": "1e-108",
-                "frequency_step": "1e-60",
+                "root_correction_tolerance": "1e-20",
+                "ode_relative_tolerance": "1e-28",
+                "ode_absolute_tolerance": "1e-30",
+                "homogeneous_ode_relative_tolerance": "1e-28",
+                "homogeneous_ode_absolute_tolerance": "1e-30",
+                "coordinate_ode_relative_tolerance": "1e-22",
+                "coordinate_ode_absolute_tolerance": "1e-24",
+                "frequency_step": "1e-7",
+                "frequency_step_minimum": "1e-18",
+                "frequency_step_maximum": "1e-4",
             },
         },
+    }
+
+
+def horizon_geometry_controls() -> dict[str, object]:
+    """Return the real-inner horizon endpoint gate configuration.
+
+    The candidate ladder is bounded and shallow on purpose. The prototype
+    reached 80.92/81.13 reliable digits at rho = -50 against 35.99/37.28 at
+    rho = -25, so useful endpoints live within tens of units of the matching
+    point, not thousands. ``horizon_rho_inner_min`` therefore bounds the
+    coordinate map at -100 rather than -5000.
+    """
+
+    return {
+        "horizon_rho_inner_min": "-100",
+        "horizon_endpoint_rho_candidates": [
+            "-10", "-25", "-50", "-75", "-100",
+        ],
+        "horizon_maximum_endpoint_distance": "0.1",
+        "determinant_error_safety_factor": "64",
     }
 
 
@@ -1589,6 +1723,7 @@ def _precision_policy(job: ResponseComponentJob, digits: int, refinement: int) -
     return {
         "readout_radius": format(job.policy.readout_radius, ".17g"),
         **controls,
+        **horizon_geometry_controls(),
         **regularised_gsn_precision_policy(job.mechanism_id),
         "endpoint_series_order": job.policy.endpoint_series_order + 8 * refinement,
         "support_subinterval_count": job.policy.support_subinterval_count * (2 ** refinement),
