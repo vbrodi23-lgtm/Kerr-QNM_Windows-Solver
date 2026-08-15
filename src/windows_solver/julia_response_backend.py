@@ -1184,13 +1184,34 @@ def _raise_worker_failure(details: Mapping[str, object]) -> None:
     raise failure
 
 
+CONTROL_FAILURE_STAGES = frozenset({
+    "request-policy",
+    "coordinate-inversion",
+    "horizon-endpoint-geometry",
+    "asymptotic-preflight",
+    "homogeneous-propagation",
+    "scattering-extraction",
+    "determinant-chart",
+    "finite-difference",
+    "root-authentication",
+})
+
+
 def _valid_numerical_control_diagnostics(
     failure: Mapping[str, object],
 ) -> bool:
-    """Return whether a recognized control receipt carries typed evidence."""
+    """Return whether a recognized control receipt carries typed evidence.
+
+    A failure code says what went wrong; the stage says where. Several codes can
+    arise at more than one point in the pipeline, so a receipt without a stage
+    cannot be attributed -- and a receipt without diagnostics degrades to a
+    generic backend error, losing the named diagnosis entirely.
+    """
 
     diagnostics = failure.get("diagnostics")
     if not isinstance(diagnostics, Mapping) or not diagnostics:
+        return False
+    if failure.get("stage") not in CONTROL_FAILURE_STAGES:
         return False
     code = failure.get("failure_code")
     if code != "INSUFFICIENT_ASYMPTOTIC_PRECISION":

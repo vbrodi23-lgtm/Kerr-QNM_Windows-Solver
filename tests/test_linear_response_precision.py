@@ -44,7 +44,7 @@ from windows_solver.response_engine import (
     regularised_gsn_precision_policy,
 )
 from windows_solver.solved_leaf_cache import SolvedLeafStore
-from tests.fixtures import valid_numerical_conditioning
+from tests.fixtures import control_failure_stage, valid_numerical_conditioning
 
 
 def leaf_id(role, mode_label, coordinate, mechanism_id):
@@ -1486,6 +1486,10 @@ class PromotedResourceContainmentTests(unittest.TestCase):
                     if error_class is julia_backend.JuliaNumericalControlError
                     else True
                 ),
+                # A control receipt records where in the pipeline it failed as
+                # well as what failed; several codes can arise at more than one
+                # point, so the code alone cannot be attributed.
+                "stage": control_failure_stage(failure_code),
                 "precision_digits": precision_digits,
                 "readout_index": 1,
                 "readout_role": "baseline",

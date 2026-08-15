@@ -80,20 +80,29 @@ end
 const SPEC_ROOT = complex(0.5, -0.1)
 
 """
-    spec_determinant_evaluator(; slope, plus_error, minus_error, calls)
+    spec_determinant_evaluator(; slope, curvature, plus_error, minus_error, calls)
 
-Return a determinant evaluator with an exactly known derivative.
+Return a determinant evaluator with an analytically known step response.
 
-`D(omega) = slope * (omega - SPEC_ROOT)` is linear, so every centred difference
-returns `slope` exactly at every step. Step disagreement is therefore zero by
-construction and the only thing that can move the derivative lower bound is the
-propagated determinant error -- which is what these tests are about.
+`D(omega) = slope * z + curvature * z^3`, where `z = omega - SPEC_ROOT`. The
+cubic term is not decoration: a purely linear determinant differentiates
+*exactly* at every step, so `fine_difference` and `coarse_difference` are both
+rounding noise and `real_step_convergent` becomes a coin flip between two
+eps-level values. Hosted CI duly rejected the first rung on one run. With
+curvature the centred difference at step `h` is `slope + curvature*h^2`, giving
+
+    fine   = |D'(h/2) - D'(h)|  = 0.75 * |curvature| * h^2
+    coarse = |D'(h)  - D'(2h)| = 3.00 * |curvature| * h^2
+
+so convergence and axis consistency hold by a definite margin rather than by
+luck, and the accepted rung is deterministic.
 
 The two half-stencil samples carry deliberately unequal errors so a chain that
 silently used one endpoint twice, or averaged before propagating, would show up.
 """
 function spec_determinant_evaluator(;
     slope::ComplexF64=complex(2.0, 0.0),
+    curvature::ComplexF64=complex(1.0, 0.0),
     plus_error::Float64=1.0e-12,
     minus_error::Float64=5.0e-13,
     calls::Union{Nothing,Vector{ComplexF64}}=nothing,
@@ -106,8 +115,9 @@ function spec_determinant_evaluator(;
         breakdown = DeterminantErrorBreakdown{Float64}(
             error_abs, nothing, nothing, nothing, 1.0, error_abs
         )
+        offset = omega - SPEC_ROOT
         return (
-            value=slope * (omega - SPEC_ROOT),
+            value=slope * offset + curvature * offset^3,
             error_breakdown=breakdown,
             error_model_id="specification-evaluator/v1",
         )
@@ -135,10 +145,16 @@ end
         determinant_evaluator=evaluator,
     )
 
-    # A linear determinant differentiates exactly, so the estimate is the slope
-    # and the step disagreement is zero at every rung.
-    @test ladder.derivative_real_half ≈ complex(2.0, 0.0)
-    @test ladder.derivative_uncertainty_abs ≈ 0.0 atol = 1.0e-9
+    # The centred difference at step s returns slope + curvature*s^2, so the
+    # accepted h/2 estimate carries a known, tiny truncation offset.
+    @test ladder.derivative_real_half ≈
+        complex(2.0, 0.0) + complex(1.0, 0.0) * (ladder.h / 2)^2
+    @test ladder.derivative_real_half ≈ complex(2.0, 0.0) atol = 1.0e-9
+    # Step disagreement is the analytic 3.75 * |curvature| * h^2, and it is
+    # small enough not to threaten the lower bound.
+    @test ladder.derivative_uncertainty_abs ≈ 3.75 * ladder.h^2 rtol = 1.0e-6
+    @test ladder.real_step_convergent
+    @test ladder.complex_axis_consistent
 
     # The accepted derivative is the h/2 estimate, so the reported step is h/2
     # and the reported error is the error propagated at that step, not at h.
@@ -230,7 +246,7 @@ end
     @test ladder.h ≈ validated_frequency_step(Float64, request) *
         (1.0 + abs(SPEC_ROOT))
     @test length(calls) == 8
-    @test ladder.derivative_real_half ≈ complex(2.0, 0.0)
+    @test ladder.derivative_real_half ≈ complex(2.0, 0.0) atol = 1.0e-9
 
     # The accepted Newton derivative is reused on this path, which removes the
     # base pair.
@@ -245,7 +261,7 @@ end
         authenticate_controls=false,
         determinant_evaluator=spec_determinant_evaluator(calls=reuse_calls),
     )
-    @test reused.derivative_real_base ≈ complex(2.0, 0.0)
+    @test reused.derivative_real_base ≈ complex(2.0, 0.0) atol = 1.0e-9
     @test length(reuse_calls) == 6
 end
 

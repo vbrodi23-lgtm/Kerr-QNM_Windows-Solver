@@ -302,10 +302,37 @@ function throw_coordinate_inversion_stalled(
     details = merge(control_failure_context(state.request), Dict{String,Any}(
         "failure_code" => "COORDINATE_INVERSION_STALLED",
         "failure_class" => "CONTROL",
+        "retryable" => true,
+        "stage" => control_failure_stage("coordinate-inversion"),
         "stall_reason" => reason,
         "elapsed_leg_seconds" => snapshot["elapsed_seconds"],
         "ode_leg" => state.leg,
         "ode_snapshot" => snapshot,
+        # A recognised CONTROL receipt only reaches the campaign as a typed
+        # numerical-control failure when it carries a non-empty `diagnostics`
+        # mapping. Without it this degrades to a generic backend error and the
+        # named diagnosis the watchdog exists to produce is lost again.
+        "diagnostics" => Dict{String,Any}(
+            "reason" => "COORDINATE_INVERSION_STALLED",
+            "range_status" => "coordinate-inversion-stalled/v1",
+            "operation" => "coordinate-inversion/v1",
+            "stall_reason" => reason,
+            "ode_leg" => state.leg,
+            "ode_t_current" => string(t_current),
+            "ode_t_end" => string(state.t_end),
+            "ode_span_abs" => string(span),
+            "ode_span_fraction" => span_fraction === nothing ?
+                nothing : string(span_fraction),
+            "ode_rhs_evaluations" => Int(stats.nf),
+            "ode_accepted_steps" => Int(stats.naccept),
+            "ode_last_accepted_step_abs" =>
+                state.last_accepted_step === nothing ?
+                nothing : string(state.last_accepted_step),
+            "ode_min_accepted_step_abs" =>
+                state.minimum_accepted_step === nothing ?
+                nothing : string(state.minimum_accepted_step),
+            "elapsed_leg_seconds" => snapshot["elapsed_seconds"],
+        ),
     ))
     progress_emit(
         "coordinate_inversion_stalled";
@@ -1874,17 +1901,47 @@ function record_finite_difference!(
     return accumulator
 end
 
+"""
+    CONTROL_FAILURE_STAGES
+
+The pipeline stages a typed control failure can be attributed to.
+
+A failure code says *what* went wrong; the stage says *where*. Without it a
+campaign reading a receipt cannot tell an endpoint geometry rejection from a
+coordinate stall from a derivative that never resolved, because several codes
+can arise at more than one point in the pipeline.
+"""
+const CONTROL_FAILURE_STAGES = Set([
+    "request-policy",
+    "coordinate-inversion",
+    "horizon-endpoint-geometry",
+    "asymptotic-preflight",
+    "homogeneous-propagation",
+    "scattering-extraction",
+    "determinant-chart",
+    "finite-difference",
+    "root-authentication",
+])
+
+function control_failure_stage(stage::String)
+    stage in CONTROL_FAILURE_STAGES ||
+        error("unknown control failure stage $(repr(stage))")
+    return stage
+end
+
 function numerical_control_failure(
     request,
     failure_code::String,
     message::String,
     diagnostics::Dict{String,Any};
     retryable::Bool=false,
+    stage::String="determinant-chart",
 )
     details = merge(control_failure_context(request), Dict{String,Any}(
         "failure_code" => failure_code,
         "failure_class" => "CONTROL",
         "retryable" => retryable,
+        "stage" => control_failure_stage(stage),
         "diagnostics" => diagnostics,
     ))
     return NumericalControlFailure(message, details)
@@ -1915,6 +1972,7 @@ function translate_numerical_control_failure(
             sprint(showerror, failure),
             diagnostics;
             retryable=false,
+            stage="finite-difference",
         )
     end
     if failure isa CF.FactoredPropagationError
@@ -1974,12 +2032,25 @@ function translate_numerical_control_failure(
             ))
             retryable = true
         end
+        stage = if failure_code == "NO_VERIFIED_HORIZON_ENDPOINT"
+            "horizon-endpoint-geometry"
+        elseif failure_code == "COORDINATE_INVERSION_STALLED"
+            "coordinate-inversion"
+        elseif failure_code in (
+            "ASYMPTOTIC_SERIES_INVALID",
+            "INSUFFICIENT_ASYMPTOTIC_PRECISION",
+        )
+            "asymptotic-preflight"
+        else
+            "homogeneous-propagation"
+        end
         return numerical_control_failure(
             request,
             failure_code,
             sprint(showerror, failure),
             diagnostics;
             retryable=retryable,
+            stage=stage,
         )
     end
     if failure isa Solutions.ScatteringExtractionError
@@ -1996,7 +2067,9 @@ function translate_numerical_control_failure(
             request,
             failure_code,
             sprint(showerror, failure),
-            diagnostics,
+            diagnostics;
+            stage=failure_code == "SCATTERING_CHART_ILL_CONDITIONED" ?
+                "determinant-chart" : "scattering-extraction",
         )
     end
     return failure
@@ -2973,6 +3046,7 @@ function validated_frequency_steps(
             "frequency_step_maximum" => string(maximum_step),
         );
         retryable=false,
+        stage="request-policy",
     ))
 end
 
@@ -3775,7 +3849,8 @@ function bounded_newton(
                     "derivative_lower_bound_abs" =>
                         string(derivative_lower_bound),
                     "frequency_step" => string(h),
-                ),
+                );
+                stage="root-authentication",
             ))
         end
         correction_abs = residual_upper_bound / derivative_lower_bound
@@ -4165,7 +4240,8 @@ function evaluate_derivative_step_ladder(
             "minimum_step" => string(minimum_step),
             "maximum_step" => string(maximum_step),
             "attempts" => attempts,
-        ),
+        );
+        stage="finite-difference",
     ))
 end
 
@@ -4286,7 +4362,8 @@ function solve_once(
                 "derivative_lower_bound_abs" =>
                     string(derivative_lower_bound_abs),
                 "frequency_step" => string(h),
-            ),
+            );
+            stage="root-authentication",
         ))
     end
     residual_upper_bound = residual + root_error_abs
@@ -4310,7 +4387,8 @@ function solve_once(
                 "root_correction_tolerance" => string(tolerance),
                 "derivative_lower_bound_abs" =>
                     string(derivative_lower_bound_abs),
-            ),
+            );
+            stage="root-authentication",
         ))
     end
     progress_emit("derivative_control_completed"; payload=Dict(

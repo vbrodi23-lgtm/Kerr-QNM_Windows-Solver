@@ -83,6 +83,8 @@ def _failed_preflight_attempt(leaf):
         "failure_code": "INSUFFICIENT_ASYMPTOTIC_PRECISION",
         "failure_class": "CONTROL",
         "retryable": True,
+        # Where the failure happened, not only what failed.
+        "stage": "asymptotic-preflight",
         "precision_digits": 80,
         "request_sha256": hashlib.sha256(
             canonical_json_bytes(request_binding)

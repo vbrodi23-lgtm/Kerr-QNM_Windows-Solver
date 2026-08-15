@@ -8,6 +8,7 @@ import math
 import unittest
 
 from tests.fixtures import (
+    control_failure_stage,
     valid_numerical_conditioning,
     valid_julia_root_response,
 )
@@ -1504,6 +1505,7 @@ class JuliaNumericalControlFailureTests(unittest.TestCase):
             "failure_code": code,
             "failure_class": "CONTROL",
             "retryable": code == "INSUFFICIENT_ASYMPTOTIC_PRECISION",
+            "stage": control_failure_stage(code),
             "diagnostics": {
                 "predicted_reliable_digits": "11.25",
                 "required_reliable_digits": "24",

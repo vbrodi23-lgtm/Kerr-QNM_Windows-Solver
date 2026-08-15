@@ -288,6 +288,31 @@ def current_promoted_component_payload(
     return payload
 
 
+CONTROL_FAILURE_STAGE_FOR_CODE = {
+    "COORDINATE_INVERSION_STALLED": "coordinate-inversion",
+    "NO_VERIFIED_HORIZON_ENDPOINT": "horizon-endpoint-geometry",
+    "INSUFFICIENT_ASYMPTOTIC_PRECISION": "asymptotic-preflight",
+    "ASYMPTOTIC_SERIES_INVALID": "asymptotic-preflight",
+    "FINITE_DIFFERENCE_NOISE_LIMIT": "finite-difference",
+    "DETERMINANT_UNCERTAINTY_TOO_LARGE": "root-authentication",
+    "SCATTERING_BASIS_ILL_CONDITIONED": "scattering-extraction",
+    "SCATTERING_CHART_ILL_CONDITIONED": "determinant-chart",
+}
+"""Stage each control code is attributed to when a fixture synthesises one.
+
+A failure code says what went wrong; the stage says where. Several codes can
+arise at more than one point in the pipeline, so a receipt carrying only the
+code cannot be attributed. Shared here so the test modules that synthesise
+control receipts cannot drift apart on the answer.
+"""
+
+
+def control_failure_stage(failure_code: str) -> str:
+    return CONTROL_FAILURE_STAGE_FOR_CODE.get(
+        failure_code, "homogeneous-propagation"
+    )
+
+
 def valid_root_authentication(mechanism_id: str) -> dict[str, object]:
     """Return the worker's error-aware root authentication record.
 
