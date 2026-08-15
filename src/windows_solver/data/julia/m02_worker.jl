@@ -1047,6 +1047,14 @@ struct DeterminantErrorBreakdown{T<:AbstractFloat}
     end
 end
 
+struct UnresolvedDerivativeAuthentication{T<:AbstractFloat} <: Exception
+    lower_bound_abs::T
+    message::String
+end
+
+Base.showerror(io::IO, failure::UnresolvedDerivativeAuthentication) =
+    print(io, failure.message)
+
 struct DerivativeAuthentication{T<:AbstractFloat}
     value::Complex{T}
     propagated_error_abs::T
@@ -1059,39 +1067,27 @@ struct DerivativeAuthentication{T<:AbstractFloat}
         value::Complex{T},
         propagated_error_abs::T,
         step_disagreement_abs::T,
-        lower_bound_abs::T,
         step::T,
         axis::String,
     ) where {T<:AbstractFloat}
-        all(isfinite, (
+        axis in ("real", "imaginary") || throw(ArgumentError(
+            "authenticated derivative axis is invalid"
+        ))
+        lower_bound_abs = abs(value) - step_disagreement_abs -
+            propagated_error_abs
+        valid = all(isfinite, (
             real(value),
             imag(value),
             propagated_error_abs,
             step_disagreement_abs,
             lower_bound_abs,
             step,
-        )) || throw(ArgumentError(
-            "derivative authentication values must be finite"
-        ))
-        propagated_error_abs >= zero(T) || throw(ArgumentError(
-            "propagated derivative error must be nonnegative"
-        ))
-        step_disagreement_abs >= zero(T) || throw(ArgumentError(
-            "derivative step disagreement must be nonnegative"
-        ))
-        step > zero(T) || throw(ArgumentError(
-            "authenticated derivative step must be positive"
-        ))
-        axis in ("real", "imaginary") || throw(ArgumentError(
-            "authenticated derivative axis is invalid"
-        ))
-        expected_lower_bound = abs(value) - step_disagreement_abs -
-            propagated_error_abs
-        lower_bound_abs == expected_lower_bound || throw(ArgumentError(
-            "derivative lower bound is inconsistent"
-        ))
-        lower_bound_abs > zero(T) || throw(ArgumentError(
-            "authenticated derivative lower bound must be positive"
+        )) && propagated_error_abs >= zero(T) &&
+            step_disagreement_abs >= zero(T) && step > zero(T) &&
+            lower_bound_abs > zero(T)
+        valid || throw(UnresolvedDerivativeAuthentication{T}(
+            lower_bound_abs,
+            "derivative authentication has no finite positive lower bound",
         ))
         new{T}(
             value,
@@ -1100,6 +1096,34 @@ struct DerivativeAuthentication{T<:AbstractFloat}
             lower_bound_abs,
             step,
             axis,
+        )
+    end
+end
+
+function derivative_authentication_candidate(
+    value::Complex{T},
+    propagated_error_abs::T,
+    step_disagreement_abs::T,
+    step::T,
+    axis::String,
+) where {T<:AbstractFloat}
+    try
+        authentication = DerivativeAuthentication{T}(
+            value,
+            propagated_error_abs,
+            step_disagreement_abs,
+            step,
+            axis,
+        )
+        return (
+            authentication=authentication,
+            lower_bound_abs=authentication.lower_bound_abs,
+        )
+    catch failure
+        failure isa UnresolvedDerivativeAuthentication || rethrow()
+        return (
+            authentication=nothing,
+            lower_bound_abs=failure.lower_bound_abs,
         )
     end
 end
@@ -3553,11 +3577,12 @@ function finite_difference_pair(
     #     eta_D' = (eta_D(w+h) + eta_D(w-h)) / (2|h|)
     # This is the term that says how much of the derivative magnitude is
     # attributable to determinant noise rather than to real slope.
-    derivative_error_abs = propagated_centered_difference_error(
-        determinant_error_abs(T, d_plus),
-        determinant_error_abs(T, d_minus),
-        h,
-    )
+    derivative_error_abs = authenticate_controls ?
+        propagated_centered_difference_error(
+            determinant_error_abs(T, d_plus),
+            determinant_error_abs(T, d_minus),
+            h,
+        ) : zero(T)
     record_finite_difference!(evaluation_context.conditioning, diagnostics)
     progress_emit("conditioning_evaluated"; payload=Dict(
         "estimate_kind" => "finite-difference-cancellation/not-a-bound/v1",
@@ -4025,11 +4050,6 @@ function bounded_newton(
         derivative_abs = abs(derivative)
         residual_error_abs = determinant_error_abs(T, residual)
         residual_upper_bound = magnitude + residual_error_abs
-        # How much of the derivative magnitude survives once the propagated
-        # determinant noise is removed. A nonpositive bound means the slope is
-        # not resolved at this step, so no correction computed from it can be
-        # trusted.
-        derivative_lower_bound = derivative_abs - derivative_error_abs
         if !isfinite(derivative_abs) || iszero(derivative)
             progress_emit("newton_iteration_completed"; context=newton_context, payload=Dict(
                 "derivative_abs" => string(derivative_abs),
@@ -4045,27 +4065,35 @@ function bounded_newton(
             ))
             break
         end
-        raw_step = residual.value / derivative
-        if derivative_lower_bound <= zero(T)
-            # The derivative is indistinguishable from determinant noise. Say
-            # so, rather than accepting a correction computed by dividing one
-            # unresolved quantity by another.
-            throw(numerical_control_failure(
-                request,
-                "DETERMINANT_UNCERTAINTY_TOO_LARGE",
-                "determinant derivative is not resolved above its own numerical error",
-                Dict{String,Any}(
-                    "determinant_abs" => string(magnitude),
-                    "determinant_error_abs" => string(residual_error_abs),
-                    "derivative_abs" => string(derivative_abs),
-                    "derivative_error_abs" => string(derivative_error_abs),
-                    "derivative_lower_bound_abs" =>
-                        string(derivative_lower_bound),
-                    "frequency_step" => string(h),
-                );
-                stage="root-authentication",
+        derivative_candidate = derivative_authentication_candidate(
+            derivative,
+            derivative_error_abs,
+            zero(T),
+            h,
+            "real",
+        )
+        if derivative_candidate.authentication === nothing
+            progress_emit("newton_iteration_completed"; context=newton_context, payload=Dict(
+                "derivative_abs" => string(derivative_abs),
+                "derivative_error_abs" => string(derivative_error_abs),
+                "derivative_lower_bound_abs" =>
+                    string(derivative_candidate.lower_bound_abs),
+                "raw_step" => nothing,
+                "applied_step" => nothing,
+                "step_abs" => "0",
+                "clipped" => false,
+                "damping" => "0",
+                "accepted" => false,
+                "resulting_omega" => progress_complex(value),
+                "resulting_determinant_abs" => string(magnitude),
+                "elapsed_seconds" =>
+                    (time_ns() - iteration_started) / 1.0e9,
             ))
+            break
         end
+        derivative_lower_bound =
+            derivative_candidate.authentication.lower_bound_abs
+        raw_step = residual.value / derivative
         correction_abs = residual_upper_bound / derivative_lower_bound
         if correction_abs <= tolerance
             progress_emit("newton_iteration_completed"; context=newton_context, payload=Dict(
@@ -4172,6 +4200,27 @@ end
 
 numeric_text(value) = string(value)
 
+function finite_difference_noise_limit(
+    request,
+    nominal_step,
+    minimum_step,
+    maximum_step,
+    attempts,
+)
+    return numerical_control_failure(
+        request,
+        "FINITE_DIFFERENCE_NOISE_LIMIT",
+        "no frequency step in the configured range resolves the determinant derivative",
+        Dict{String,Any}(
+            "nominal_step" => string(nominal_step),
+            "minimum_step" => string(minimum_step),
+            "maximum_step" => string(maximum_step),
+            "attempts" => attempts,
+        );
+        stage="finite-difference",
+    )
+end
+
 function final_derivative(
     ::Type{T}, request,
     evaluation_context::DeterminantRequestContext{T},
@@ -4262,15 +4311,34 @@ function evaluate_single_derivative_step(
     uncertainty = maximum((
         fine_difference, abs(double - half), axis_difference
     ))
-    derivative_lower_bound_abs = abs(half) - uncertainty
-    derivative_authentication = DerivativeAuthentication{T}(
+    candidate = derivative_authentication_candidate(
         half,
-        half_error_abs,
+        zero(T),
         uncertainty,
-        derivative_lower_bound_abs,
         h / T(2),
         "real",
     )
+    if candidate.authentication === nothing
+        attempt = Dict{String,Any}(
+            "h" => string(h),
+            "real_step_convergent" => real_step_convergent,
+            "complex_axis_consistent" => complex_axis_consistent,
+            "noise_resolved" => false,
+            "derivative_abs" => string(abs(half)),
+            "derivative_uncertainty_abs" => string(uncertainty),
+            "base_derivative_error_abs" => string(base_error_abs),
+            "half_derivative_error_abs" => string(half_error_abs),
+            "double_derivative_error_abs" => string(double_error_abs),
+            "imaginary_derivative_error_abs" =>
+                string(imaginary_error_abs),
+            "derivative_error_abs" => string(zero(T)),
+            "accepted" => false,
+        )
+        throw(finite_difference_noise_limit(
+            request, h, h / T(2), T(2) * h, [attempt]
+        ))
+    end
+    derivative_authentication = candidate.authentication
     return (
         h=h,
         derivative_real_base=base,
@@ -4287,7 +4355,7 @@ function evaluate_single_derivative_step(
         half_error_abs=half_error_abs,
         double_error_abs=double_error_abs,
         imaginary_error_abs=imaginary_error_abs,
-        derivative_error_abs=half_error_abs,
+        derivative_error_abs=zero(T),
         derivative_authentication=derivative_authentication,
         rung_index=1,
         rung_count=1,
@@ -4389,11 +4457,17 @@ function evaluate_derivative_step_ladder(
         uncertainty = maximum((
             fine_difference, abs(double - half), axis_difference
         ))
-        derivative_error_abs = half_error_abs
         derivative_abs = abs(half)
-        derivative_lower_bound_abs =
-            derivative_abs - uncertainty - derivative_error_abs
-        noise_resolved = derivative_lower_bound_abs > zero(T)
+        candidate = derivative_authentication_candidate(
+            half,
+            half_error_abs,
+            uncertainty,
+            h / T(2),
+            "real",
+        )
+        derivative_error_abs = half_error_abs
+        derivative_lower_bound_abs = candidate.lower_bound_abs
+        noise_resolved = candidate.authentication !== nothing
         accepted = real_step_convergent && complex_axis_consistent &&
             noise_resolved
         push!(attempts, Dict{String,Any}(
@@ -4413,14 +4487,7 @@ function evaluate_derivative_step_ladder(
         ))
         progress_emit("frequency_step_evaluated"; payload=last(attempts))
         if accepted
-            derivative_authentication = DerivativeAuthentication{T}(
-                half,
-                half_error_abs,
-                uncertainty,
-                derivative_lower_bound_abs,
-                h / T(2),
-                "real",
-            )
+            derivative_authentication = candidate.authentication
             return (
                 h=h,
                 derivative_real_base=base,
@@ -4444,17 +4511,8 @@ function evaluate_derivative_step_ladder(
             )
         end
     end
-    throw(numerical_control_failure(
-        request,
-        "FINITE_DIFFERENCE_NOISE_LIMIT",
-        "no frequency step in the configured range resolves the determinant derivative",
-        Dict{String,Any}(
-            "nominal_step" => string(nominal),
-            "minimum_step" => string(minimum_step),
-            "maximum_step" => string(maximum_step),
-            "attempts" => attempts,
-        );
-        stage="finite-difference",
+    throw(finite_difference_noise_limit(
+        request, nominal, minimum_step, maximum_step, attempts
     ))
 end
 
@@ -4560,25 +4618,6 @@ function solve_once(
         isfinite(derivative_error_abs) ||
         error("determinant frequency derivative controls are unusable")
     tolerance = parse_real(T, request, "root_correction_tolerance")
-    if derivative_lower_bound_abs <= zero(T)
-        throw(numerical_control_failure(
-            request,
-            "DETERMINANT_UNCERTAINTY_TOO_LARGE",
-            "root determinant derivative is not resolved above its own numerical error",
-            Dict{String,Any}(
-                "determinant_abs" => string(residual),
-                "determinant_error_abs" => string(root_error_abs),
-                "derivative_abs" => string(derivative_abs),
-                "derivative_uncertainty_abs" =>
-                    string(derivative_uncertainty_abs),
-                "derivative_error_abs" => string(derivative_error_abs),
-                "derivative_lower_bound_abs" =>
-                    string(derivative_lower_bound_abs),
-                "frequency_step" => string(h),
-            );
-            stage="root-authentication",
-        ))
-    end
     residual_upper_bound = residual + root_error_abs
     correction_upper_bound = residual_upper_bound / derivative_lower_bound_abs
     converged = newton_converged && correction_upper_bound <= tolerance

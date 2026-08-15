@@ -67,6 +67,26 @@ end
     @test propagated_centered_difference_error(1.0, 9.0, 0.5) == 10.0
 end
 
+@testset "derivative authentication derives its own lower bound" begin
+    authentication = DerivativeAuthentication{Float64}(
+        complex(2.0, 0.0),
+        0.25,
+        0.5,
+        1.0e-6,
+        "real",
+    )
+    @test authentication.lower_bound_abs == 1.25
+    # A caller cannot inject a separately rounded lower bound.
+    @test_throws MethodError DerivativeAuthentication{Float64}(
+        complex(2.0, 0.0),
+        0.25,
+        0.5,
+        1.25,
+        1.0e-6,
+        "real",
+    )
+end
+
 #####
 ##### Executed caller-chain specification
 #####
@@ -273,6 +293,9 @@ end
     @test ladder.derivative_real_half ≈
         complex(2.0, 0.0) + complex(100.0, 0.0) * (ladder.h / 2)^2
         atol = 1.0e-9
+    @test ladder.derivative_authentication.step ≈ ladder.h / 2
+    @test ladder.derivative_authentication.propagated_error_abs == 0.0
+    @test ladder.derivative_error_abs == 0.0
 
     # The accepted Newton derivative is reused on this path, which removes the
     # base pair.

@@ -157,7 +157,7 @@ class RegularisedGsnWorkerSourceTests(unittest.TestCase):
         for rung_only in (
             "validated_frequency_steps(",
             "frequency_step_rungs(",
-            "FINITE_DIFFERENCE_NOISE_LIMIT",
+            "finite_difference_noise_limit(",
         ):
             self.assertIn(rung_only, ladder)
             self.assertLess(gate, ladder.index(rung_only))
@@ -571,6 +571,26 @@ class RegularisedGsnWorkerSourceTests(unittest.TestCase):
             self.assertIn(name, ladder)
         self.assertIn("derivative_error_abs=half_error_abs", ladder)
         self.assertNotIn("root_error_abs / abs(h / T(2))", ladder)
+
+    def test_derivative_authentication_derives_one_lower_bound(self) -> None:
+        authentication = self.worker[
+            self.worker.index("struct DerivativeAuthentication") :
+            self.worker.index("struct RootAuthentication")
+        ]
+        self.assertIn(
+            "lower_bound_abs = abs(value) - step_disagreement_abs -",
+            authentication,
+        )
+        self.assertNotIn(
+            "step_disagreement_abs::T,\n        lower_bound_abs::T,",
+            authentication,
+        )
+        ladder = self._function_slice(
+            "evaluate_derivative_step_ladder", "root_authentication_text"
+        )
+        self.assertNotIn(
+            "derivative_abs - uncertainty - derivative_error_abs", ladder
+        )
 
     def test_frequency_step_ladder_is_validated_bounded_and_unique(self) -> None:
         for contract in (
