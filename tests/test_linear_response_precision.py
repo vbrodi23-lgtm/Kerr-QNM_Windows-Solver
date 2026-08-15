@@ -3060,7 +3060,7 @@ class PromotedResourceContainmentTests(unittest.TestCase):
             legacy = json.loads(checkpoint.read_text(encoding="utf-8"))
             legacy["schema_version"] = 3
             source_history_v3_sha256 = (
-                "7949e077764bfb262d7241be60b57fbf4105e120a52cb8b32cbc8c1a32497d32"
+                "f552bf5b4438f34299e311d447c23bbb125bcd6c547c701530ca4820694f60be"
             )
             self.assertEqual(
                 _checkpoint_precision_contract_sha256(3),
@@ -3120,7 +3120,7 @@ class PromotedResourceContainmentTests(unittest.TestCase):
             historical = json.loads(checkpoint.read_text(encoding="utf-8"))
             historical["schema_version"] = 5
             source_history_v5_sha256 = (
-                "7949e077764bfb262d7241be60b57fbf4105e120a52cb8b32cbc8c1a32497d32"
+                "f552bf5b4438f34299e311d447c23bbb125bcd6c547c701530ca4820694f60be"
             )
             self.assertEqual(
                 _checkpoint_precision_contract_sha256(5),
