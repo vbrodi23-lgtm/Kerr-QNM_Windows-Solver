@@ -102,8 +102,12 @@ def _failed_preflight_attempt(leaf):
             for name in ("schema", "version", "sha256")
         },
         "diagnostics": {
+            "reason": "INSUFFICIENT_ASYMPTOTIC_PRECISION",
+            "precision_bits": request_binding["working_precision_bits"],
             "predicted_reliable_digits": "11",
             "required_reliable_digits": "24",
+            "maximum_series_digits_lost": "41",
+            "maximum_recurrence_digits_lost": "39",
             "asymptotic_preflight_avoided_ode": True,
             "asymptotic_preflight_reason": (
                 "INSUFFICIENT_ASYMPTOTIC_PRECISION"

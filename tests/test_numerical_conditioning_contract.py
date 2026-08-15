@@ -9,6 +9,7 @@ import unittest
 
 from tests.fixtures import (
     control_failure_stage,
+    root_authentication_for_readout,
     valid_numerical_conditioning,
     valid_julia_root_response,
 )
@@ -779,6 +780,23 @@ class PromotedRuntimeProvenancePersistenceTests(unittest.TestCase):
                 "not-applicable/v1" if current_schema else None
             ),
             worker_response_receipt=worker_response_receipt,
+            root_authentication=(
+                response_engine.RootAuthenticationEvidence.from_mapping(
+                    root_authentication_for_readout(
+                        mechanism_id=job.mechanism_id,
+                        determinant_abs=Decimal("1E-12"),
+                        derivative_abs=Decimal("2"),
+                        root_correction_tolerance=Decimal(
+                            request_binding["policy"][
+                                "root_correction_tolerance"
+                            ]
+                        ),
+                        accepted=False,
+                    )
+                )
+                if current_schema
+                else None
+            ),
         )
         return response_engine.ComponentResult(
             job_id=job.job_id,

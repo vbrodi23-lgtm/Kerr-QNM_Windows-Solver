@@ -169,6 +169,7 @@ def current_promoted_component_payload(
     from windows_solver.response_engine import (
         ComponentStatus,
         NumericalConditioningEvidence,
+        RootAuthenticationEvidence,
         regularised_gsn_precision_policy,
     )
 
@@ -197,20 +198,37 @@ def current_promoted_component_payload(
     }
 
     def conditioned(readout, readout_id):
+        correction_tolerance = Decimal("1e-18")
+        derivative = Decimal(str(readout.determinant_derivative_abs))
+        normalised = Decimal(str(readout.determinant_residual_abs))
+        if readout.converged:
+            normalised = min(
+                normalised,
+                derivative * correction_tolerance / Decimal(10),
+            )
+        authentication = RootAuthenticationEvidence.from_mapping(
+            root_authentication_for_readout(
+                mechanism_id=result.mechanism_id,
+                determinant_abs=normalised,
+                derivative_abs=derivative,
+                root_correction_tolerance=correction_tolerance,
+                accepted=readout.converged,
+            )
+        )
         updated = replace(
             readout,
+            determinant_residual_abs=float(normalised),
             diagnostic_readouts=(readout.diagnostic_readouts or None),
             numerical_conditioning=evidence,
-            normalised_determinant_abs=Decimal(
-                str(readout.determinant_residual_abs)
-            ),
+            normalised_determinant_abs=normalised,
             raw_determinant_abs=(
-                Decimal(str(readout.determinant_residual_abs))
+                normalised
                 if raw_status == "available/v1"
                 else None
             ),
             raw_determinant_evidence_status=raw_status,
             worker_response_receipt=None,
+            root_authentication=authentication,
         )
         request_binding = {
             "schema_version": 1,
@@ -226,6 +244,9 @@ def current_promoted_component_payload(
             "precision_digits": digits,
             "refinement_level": 0,
             "synthetic_readout_id": readout_id,
+            "policy": {
+                "root_correction_tolerance": str(correction_tolerance),
+            },
         }
         receipt_material = {
             "schema": "windows-solver.worker-response-receipt/1",
@@ -374,6 +395,53 @@ def valid_root_authentication(mechanism_id: str) -> dict[str, object]:
         "correction_upper_bound": "1E-60",
         "root_correction_tolerance": "1E-18",
         "accepted": True,
+    }
+
+
+def root_authentication_for_readout(
+    *,
+    mechanism_id: str,
+    determinant_abs: Decimal,
+    derivative_abs: Decimal,
+    root_correction_tolerance: Decimal,
+    accepted: bool,
+) -> dict[str, object]:
+    """Build exact synthetic evidence for a persisted promoted readout."""
+
+    horizon = mechanism_id == "horizon-admittance"
+    residual_upper = determinant_abs
+    correction_upper = residual_upper / derivative_abs
+    return {
+        "central_determinant_re": str(determinant_abs),
+        "central_determinant_im": "0",
+        "determinant_error": (
+            {
+                "endpoint_disagreement_abs": "0",
+                "control_disagreement_abs": None,
+                "equivalence_disagreement_abs": None,
+                "precision_disagreement_abs": None,
+                "safety_factor": "64",
+                "numerical_error_abs": "0",
+                "error_model_id": (
+                    "verified-endpoint-control-equivalence-absolute-error/v2"
+                ),
+            }
+            if horizon
+            else None
+        ),
+        "residual_upper_bound_abs": str(residual_upper),
+        "derivative_authentication": {
+            "derivative_re": str(derivative_abs),
+            "derivative_im": "0",
+            "propagated_error_abs": "0",
+            "step_disagreement_abs": "0",
+            "lower_bound_abs": str(derivative_abs),
+            "selected_step": "1E-6",
+            "axis": "real",
+        },
+        "correction_upper_bound": str(correction_upper),
+        "root_correction_tolerance": str(root_correction_tolerance),
+        "accepted": accepted,
     }
 
 
