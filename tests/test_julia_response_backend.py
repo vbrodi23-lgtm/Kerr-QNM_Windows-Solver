@@ -1250,6 +1250,15 @@ class JuliaResponseBackendTests(unittest.TestCase):
         workflow = (
             Path(__file__).resolve().parents[1] / ".github/workflows/ci.yml"
         ).read_text(encoding="utf-8")
+        package_tests = (
+            Path(__file__).resolve().parents[1]
+            / "src/windows_solver/data/julia/GeneralizedSasakiNakamura.jl/test/runtests.jl"
+        ).read_text(encoding="utf-8")
+        self.assertIn(
+            'joinpath(ENV["GSN_PROJECT"], "test", "runtests.jl")',
+            workflow,
+        )
+        self.assertIn('include("real_inner_horizon_spec.jl")', package_tests)
         self.assertIn("m02_worker_finite_difference_spec.jl", workflow)
         self.assertIn("leaf13_horizon_harness_spec.jl", workflow)
 
