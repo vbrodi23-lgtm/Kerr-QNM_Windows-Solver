@@ -1,149 +1,137 @@
-# Handover — PR #46 continuation after Codex review
+# Handover — PR #46 software completion and evidence boundary
 
-This note supersedes the **state and next-steps** sections of
-`2026-08-15-horizon-rewrite-handover.md`. That earlier note remains the useful
-history of the original implementation.
+This note supersedes the state and next-step sections of
+`2026-08-15-horizon-rewrite-handover.md`. That earlier note remains the history
+of the prototype and initial implementation.
 
-## Exact branch state
+## Current status
 
 - Repository: `vbrodi23-lgtm/Kerr-QNM_Windows-Solver`
-- Pull request: #46, draft, open, targeting `main` at `53e04b4`
+- Pull request: #46, open as a draft against `main`
 - Branch: `claude/read-this-5em1in`
-- Current pushed/local HEAD: `653013577bd1b3873eca4b698f44cf085e329f31`
-- Worktree at handover: clean; no interrupted fix-round changes exist
-- Current PR size: 19 commits, 28 changed files
-- Completion plan:
-  `docs/superpowers/plans/2026-08-15-pr46-horizon-detector-completion.md`
-- TaskPlanner item: `TASK-079` in `.tasks/IN_PROGRESS.md`
+- TaskPlanner authority: `TASK-079` in `.tasks/IN_PROGRESS.md`
+- Software repair: implemented and passing local and hosted software gates
+- Scientific release admission: blocked, intentionally and explicitly
 
-The branch is **not ready to merge**. The latest commit is a checkpoint with a
-known cross-language integration defect described below.
+The branch must remain draft. The software now fails closed around the known
+mechanisms, but no native Leaf 13 calibration/root receipt, human mathematical
+review receipt, or independent high-precision reference fixture exists yet.
 
-## Work added after the original handover
+## What the branch now enforces
 
-### Completion plan
+### Horizon graph and geometry
 
-Commit `b7ee632` added a five-task completion plan after a fresh architectural
-comparison of `main`, all PR #46 commits, the supplied repair plan, and the
-project research notes. The remaining work was divided as follows:
+The horizon path owns a real-inner tortoise contour,
 
-1. verified geometry before homogeneous work;
-2. complete determinant and derivative authentication;
-3. strict cross-language certificate, failure, and progress protocol;
-4. mechanism-scoped policy and compatibility identity;
-5. calibration, executable evidence gates, and PR closure.
+```text
+r_*(rho) = rstar_match + rho,  dr_*/drho = 1,  rho < 0,
+```
 
-### Task 1 — complete and pushed
+separate from the frequency-aligned outer contour. A geometry-first gate checks
+exterior radius, imaginary-radius tolerance, monotone approach to the horizon,
+maximum horizon distance, and both horizon series at a bounded candidate set.
+Two adequate endpoints are mandatory before any homogeneous ODE starts.
 
-Commits `ea06b01`, `5376675`, and `4caf283` enforce the geometry-first horizon
-ordering and repair the explicit-tangent carrier validation. In particular:
+Production then uses three independent solutions: infinity-outgoing to match,
+horizon-ingoing to match, and horizon-outgoing to match. The mixed
+match-to-inner Xup leg is absent from `evaluate_horizon_determinant` and is
+forbidden there by static CI. The two horizon columns are independently scaled
+and solved at match, with basis condition, backward-error, carrier, and
+reconstruction diagnostics retained.
 
-- endpoint geometry is represented separately from series adequacy;
-- invalid geometry cannot invoke either horizon-series assessment;
-- the configured maximum horizon distance is revalidated at selection time;
-- endpoint selection occurs before the outer Xup preparation or any
-  homogeneous ODE;
-- coordinate identity evidence is finite, tolerance-bearing, and fail-closed;
-- explicit-tangent horizon carriers preserve the canonical match logarithm.
+### Numerical policy and coordinate containment
 
-Hosted Julia workflow `31878328029` passed the load-bearing factored GSN,
-real-inner horizon/match-basis, and scaled-scattering/determinant-equivalence
-regressions. This corrects the earlier handover's statement that no Julia had
-ever been run: Julia has now executed successfully for the Task 1 tree.
+Working precision is separate from the scientific correction target. Both the
+80- and 120-digit tiers use correction tolerances of 1e-18 at base and 1e-20 at
+refinement; 120 digits provide guard precision rather than imposing 1e-102 ODE
+accuracy. Coordinate and homogeneous ODE tolerances are separate.
 
-### Task 2 — implemented, pushed, then rejected by independent review
+Coordinate maps start directly from the matching radius, verify the tortoise
+identity, and construct only the needed outer or roughly -100 real-inner span.
+The early coordinate-stall failure now records current and target rho, span
+fraction, RHS and accepted/rejected steps, minimum and last steps, current
+complex radius, and coordinate-identity residual.
 
-Commit `6530135` adds the determinant-error breakdown, tight-control and
-raw/normalised discrepancies, authenticated finite-difference estimates,
-error-aware damping/ranking/correction, a root-authentication record, and a
-worker Julia spec in CI.
+### Determinant and root authentication
 
-Local evidence for that commit was:
+The horizon determinant carries an absolute error certificate. Endpoint,
+control, raw/normalised-equivalence, and optional same-frequency precision
+discrepancies remain absolute quantities and are combined by the declared
+safety factor. Missing evidence remains absent rather than being encoded as
+zero.
 
-- focused Python: 181 passed, 6 skipped;
-- complete Python: 693 passed, 7 skipped, 0 failures;
-- Python compilation, TaskPlanner validation, and `git diff --check`: passed.
+The authenticated derivative uses the real-axis h/2 estimate; h, 2h, and ih
+provide disagreement, and the h/2 samples provide the propagated determinant
+error. One constructor derives the positive lower bound. Bounded exhaustion is
+`FINITE_DIFFERENCE_NOISE_LIMIT`; a small central determinant whose error blocks
+acceptance is `DETERMINANT_UNCERTAINTY_TOO_LARGE`.
 
-That green local result is **not sufficient**. An independent code review found
-one critical and three important defects. No fix-round code was started before
-this handover; HEAD is therefore a clean reproduction point.
+Newton damping, candidate ranking, best-iterate retention, and final acceptance
+compare error-inclusive determinant bounds. The complete closed certificate is
+transported through Julia responses and failures, Python parsing, readouts,
+caches, checkpoints, solved-leaf receipts, campaign reports, and progress.
+The exterior path retains its historical unauthenticated behavior and identity.
 
-## Critical defect at current HEAD
+### Calibration and admission
 
-`m02_worker.jl` now emits `root_authentication` in ordinary and non-converged
-result mappings while the Python backend still strictly consumes response
-schema 3. Valid worker output can therefore be rejected by the live backend,
-including the exterior path. The producer and consumer were staged in separate
-tasks, but that staging left the pushed checkpoint internally incompatible.
+The benchmark and calibration tools share one package-owned harness. Their
+receipts bind source, manifest, and policy identities and use the worker's
+canonical determinant-error accessor. The PowerShell wrapper rejects malformed
+or incomplete evidence.
 
-Fix this atomically. The preferred repair is to pull forward the minimum strict
-schema-4 parser/value types needed to consume the new record, while leaving the
-broader persistence, progress, cache, report, and typed-failure work in Task 3.
-An internal-only staging alternative is acceptable only if live schema-3
-behavior is fully preserved. Add strict end-to-end parsing tests for horizon
-success, exterior success, and non-converged responses.
+The committed controls are deliberately named a `provisional promoted control
+profile` with `calibration_status = "UNMEASURED"`. Release admission rejects
+that status. Nothing in this PR calls those values calibrated.
 
-## Other mandatory Task 2 review fixes
+## Verification completed
 
-1. **Finite-difference bounds cover only base `h`.** The implementation samples
-   `h/2` and `2h`, and records `h/2` as the accepted step, so endpoint rungs can
-   evaluate outside the configured minimum/maximum. Define admissibility so
-   every actual sample and selected step is inside policy, and test both bounds.
+Local verification at the final software code checkpoint:
 
-2. **Exterior behavior changed globally.** The new rung-list validation and
-   clamped attempts apply to every determinant family. Restore the historical
-   exterior ladder/validation path when horizon authentication is inapplicable.
-   Add an executable characterization test comparing attempted steps, selected
-   derivative, convergence, and emitted result with pre-Task-2 behavior.
+- `PYTHONPATH=src python -m unittest discover -s tests -q` — 730 tests passed,
+  7 skipped
+- focused worker and numerical-control contract tests — passed
+- `python .tasks/validate_board.py` — passed
+- `python tools/validate_release_manifest.py` — passed
+- `python -m compileall -q src tests tools` — passed
+- `git diff --check` — passed
 
-3. **Julia caller-chain coverage is too static.** The unequal-error test calls
-   only the propagation helper. Add an injectable/fake determinant evaluator
-   and execute the chain through `finite_difference_pair`, `final_derivative`,
-   and the ladder. Prove unequal-error propagation, accepted `h/2` error/lower
-   bound/step, same-frequency base/tight depth, finite exhaustion, and unchanged
-   exterior behavior. Source-grep assertions are not a substitute.
+Hosted workflow run `31891628648` on code commit `74f4181` passed:
 
-4. Revert unrelated future Task 4 wording edits in the completion plan unless
-   they are separately necessary and documented.
+- Ubuntu Python/package/provider gates
+- Windows Python/package/provider/PowerShell parity gates
+- pinned Julia 1.10.11 project materialization and precompile
+- complete vendored GSN unit suite
+- executable worker finite-difference/root-authentication specification
+- executable shared Leaf 13 harness specification
 
-5. `.superpowers/sdd/2026-08-15-pr46-horizon-detector-completion/task-2-report.md`
-   was accidentally tracked in `6530135`. Remove it from the Git index while
-   retaining local review notes outside the PR.
+This is software and internal numerical-contract evidence. It is not a native
+Leaf 13 scientific receipt.
 
-## Current CI
+## Required evidence still absent
 
-At handover, workflow `31879815097` for `6530135` was still running. The Julia
-job had passed setup, package materialization/precompile, the factored GSN
-regression, and the real-inner horizon regression; scaled scattering was in
-progress and the new worker determinant/finite-difference regression had not
-yet run. Ubuntu and Windows were running the Python test step. Inspect the final
-run rather than relying on this snapshot.
+Do not mark the PR ready or merge it as scientifically admitted until all of
+the following exist and are reviewed:
 
-## Recommended continuation order
+1. Fixed Leaf 13 determinant at 80 digits with verified endpoints, all three
+   propagation legs, finite coefficients, determinant error, and basis gates.
+2. Leaf 13 root with error-aware correction at or below 1e-18 and explicit
+   derivative/error evidence.
+3. A 120-digit coordinate-map receipt reaching its endpoint without stall.
+4. The bounded five-mode regression set from the completion plan.
+5. A reviewed calibration receipt and committed measured control profile.
+6. Human review of carrier signs, branch convention, basis-column order,
+   horizon normalization, and the Cinc/Cref minus reflectivity chart.
+7. An independently generated high-precision reference fixture.
 
-1. Fix all Task 2 review findings in one red-green slice; run the complete
-   Python suite and the executable Julia worker spec in hosted CI.
-2. Complete Task 3: schema 4, closed-key immutable evidence types, normalized
-   typed numerical failures, progress registry/rendering, persistence through
-   readouts/caches/reports, and exact same-frequency cross-precision evidence.
-3. Complete Task 4: mechanism-scoped policy and identity. Prove old horizon
-   receipts stale while a `main`-generated exterior receipt remains compatible.
-4. Complete Task 5: validate the calibration receipt contract, run the complete
-   vendored Julia package tests, and execute only Gates 1–4 from the completion
-   plan. Do not start the 212-leaf campaign.
-5. Perform a fresh whole-branch review, resolve every finding, push, and wait
-   for required checks. Keep the PR draft/blocked until native evidence exists.
+Do not start the 212-leaf campaign to obtain these gates. Run only the bounded
+Gate 1 through Gate 4 sequence documented in
+`docs/superpowers/plans/2026-08-15-pr46-horizon-detector-completion.md`.
 
-## Scientific evidence ceiling
+## Handover invariant
 
-No native Leaf 13 determinant, authenticated Leaf 13 root, 120-digit coordinate
-map, calibrated control profile, or five-mode horizon regression receipt has
-been produced. The committed profile remains an uncalibrated starting profile.
-Software/unit/hosted-CI evidence must not be described as scientific closure.
-
-The PR's target invariant remains:
-
-> A geometrically invalid horizon path, a precision-derived impossible
-> tolerance, or an unresolved tiny determinant can neither consume the old
-> resource path nor produce a false solved receipt; it must terminate with a
-> specific numerical diagnosis.
+The implemented repair guarantees that the known invalid contour, mixed Xup
+leg, digit-derived impossible tolerance, coordinate micro-step stall, and
+unresolved tiny determinant cannot silently produce the previous resource
+failure or a solved receipt. Any remaining limitation must terminate with a
+specific numerical diagnosis. Scientific correctness and calibrated production
+readiness remain separate evidence gates.
