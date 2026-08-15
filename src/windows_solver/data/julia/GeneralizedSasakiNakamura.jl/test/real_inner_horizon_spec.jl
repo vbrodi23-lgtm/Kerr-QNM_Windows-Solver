@@ -10,6 +10,10 @@
 using Test
 using DifferentialEquations
 
+# The worker main is guarded, so including it exposes the coordinate-identity
+# contract without starting a request or a solver campaign.
+include(joinpath(@__DIR__, "..", "..", "m02_worker.jl"))
+
 const CF_HORIZON = GeneralizedSasakiNakamura.ComplexFrequencies
 const FS_HORIZON = GeneralizedSasakiNakamura.FactoredSolutions
 const SOL_HORIZON = GeneralizedSasakiNakamura.Solutions
@@ -59,6 +63,50 @@ function real_inner_map(context, ::Type{T}; rho_min::T=-T(100)) where {T}
         abstol=T === Float64 ? 1e-14 : T(1) / T(10)^22,
         verbose=false,
         r_at_rho_zero=Complex{T}(context.match_radius),
+    )
+end
+
+function horizon_geometry_candidates(context, contour; maximum_distance)
+    return CF_HORIZON.horizon_endpoint_geometry_candidates(
+        context.spectral,
+        contour;
+        maximum_horizon_distance=maximum_distance,
+    )
+end
+
+function horizon_series_candidates(
+    context,
+    contour,
+    geometry_candidates;
+    required_digits,
+    maximum_distance,
+)
+    return CF_HORIZON.horizon_endpoint_candidates(
+        context.spectral,
+        contour,
+        geometry_candidates,
+        required_digits;
+        maximum_horizon_distance=maximum_distance,
+    )
+end
+
+function coordinate_identity_spec_request()
+    digest = repeat("0", 64)
+    return Dict{String,Any}(
+        "precision_digits" => 80,
+        "request_sha256" => digest,
+        "job_id" => "coordinate-identity-spec",
+        "leaf_id" => 13,
+        "role" => "specification",
+        "job_policy_sha256" => digest,
+        "backend_identity_sha256" => digest,
+        "refinement_level" => 0,
+        "resource_policy_schema" =>
+            "windows-solver.execution-resource-policy/1",
+        "resource_policy_version" => 1,
+        "resource_policy_sha256" => digest,
+        "coordinate_ode_relative_tolerance" => "1e-12",
+        "coordinate_ode_absolute_tolerance" => "1e-14",
     )
 end
 
@@ -131,26 +179,44 @@ end
         -T(100), radial,
     )
     required = T(12)
-    candidates = CF_HORIZON.horizon_endpoint_candidates(
-        context.spectral, contour, required
+    maximum_distance = T(1) / T(10)
+    geometry_candidates = horizon_geometry_candidates(
+        context, contour; maximum_distance=maximum_distance
+    )
+    candidates = horizon_series_candidates(
+        context,
+        contour,
+        geometry_candidates;
+        required_digits=required,
+        maximum_distance=maximum_distance,
     )
     @test length(candidates) == 5
-    @test all(candidate -> candidate.rho < zero(T), candidates)
-    @test all(candidate -> candidate.exterior, candidates)
+    @test all(candidate -> candidate.geometry.rho < zero(T), candidates)
+    @test all(candidate -> candidate.geometry.exterior, candidates)
     # Radial-approach conditions are recorded independently of the series
     # verdicts, so no truncation order can substitute for correct geometry.
     for candidate in candidates
-        @test candidate.approaches_horizon isa Bool
-        @test candidate.within_maximum_distance isa Bool
+        @test candidate.geometry.approaches_horizon isa Bool
+        @test candidate.geometry.within_maximum_distance isa Bool
     end
 
     # An unreachable distance bound leaves nothing adequate, and the failure is
     # raised before any homogeneous ODE has been started.
-    starved = CF_HORIZON.horizon_endpoint_candidates(
-        context.spectral, contour, required;
-        maximum_horizon_distance=T(1) / T(10)^40,
+    starved_maximum = T(1) / T(10)^40
+    starved_geometry = horizon_geometry_candidates(
+        context, contour; maximum_distance=starved_maximum
     )
-    @test all(candidate -> !candidate.within_maximum_distance, starved)
+    starved = horizon_series_candidates(
+        context,
+        contour,
+        starved_geometry;
+        required_digits=required,
+        maximum_distance=starved_maximum,
+    )
+    @test all(
+        candidate -> !candidate.geometry.within_maximum_distance,
+        starved,
+    )
     failure = try
         CF_HORIZON.select_verified_horizon_endpoints(
             context.spectral, starved;
@@ -165,6 +231,41 @@ end
     @test failure.factored_homogeneous_rhs_evaluations == 0
 end
 
+@testset "invalid geometry does not evaluate either horizon series" begin
+    T = BigFloat
+    context = horizon_spec_context(T)
+    radial = real_inner_map(context, T)
+    contour = CF_HORIZON.build_real_inner_horizon_contour(
+        context.spectral, context.match_radius, context.rstar_match,
+        -T(100), radial,
+    )
+    invalid = CF_HORIZON.HorizonEndpointGeometryCandidate{T}(
+        -T(10),
+        complex(T(NaN), zero(T)),
+        T(Inf),
+        zero(T),
+        false,
+        false,
+        false,
+        false,
+        contour.contour_id,
+        contour.precision_bits,
+        contour.frozen_branch_cell,
+    )
+    candidates = horizon_series_candidates(
+        context,
+        contour,
+        [invalid];
+        required_digits=T(12),
+        maximum_distance=T(1) / T(10),
+    )
+    @test length(candidates) == 1
+    @test candidates[1].ingoing_evaluation === nothing
+    @test candidates[1].outgoing_evaluation === nothing
+    @test !candidates[1].ingoing_adequate
+    @test !candidates[1].outgoing_adequate
+end
+
 @testset "verification requires a second adequate endpoint" begin
     T = BigFloat
     context = horizon_spec_context(T)
@@ -173,13 +274,23 @@ end
         context.spectral, context.match_radius, context.rstar_match,
         -T(100), radial,
     )
-    candidates = CF_HORIZON.horizon_endpoint_candidates(
-        context.spectral, contour, T(12)
+    maximum_distance = T(1) / T(10)
+    geometry_candidates = horizon_geometry_candidates(
+        context, contour; maximum_distance=maximum_distance
+    )
+    candidates = horizon_series_candidates(
+        context,
+        contour,
+        geometry_candidates;
+        required_digits=T(12),
+        maximum_distance=maximum_distance,
     )
     adequate = filter(
-        candidate -> candidate.rho < zero(T) && candidate.exterior &&
-            candidate.approaches_horizon &&
-            candidate.within_maximum_distance &&
+        candidate -> candidate.geometry.rho < zero(T) &&
+            candidate.geometry.exterior &&
+            candidate.geometry.on_real_axis &&
+            candidate.geometry.approaches_horizon &&
+            candidate.geometry.within_maximum_distance &&
             candidate.ingoing_adequate && candidate.outgoing_adequate,
         candidates,
     )
@@ -189,7 +300,8 @@ end
         )
         # Reference is the nearest adequate endpoint (shortest leg);
         # verification is the next one deeper.
-        @test endpoints.reference.rho > endpoints.verification.rho
+        @test endpoints.reference.geometry.rho >
+            endpoints.verification.geometry.rho
         @test endpoints.contour_id ==
             CF_HORIZON.REAL_INNER_HORIZON_CONTOUR_ID
     end
@@ -207,6 +319,118 @@ end
     end
     @test failure isa CF_HORIZON.FactoredPropagationError
     @test failure.reason == CF_HORIZON.NO_VERIFIED_HORIZON_ENDPOINT
+end
+
+@testset "selector revalidates the configured maximum horizon distance" begin
+    T = BigFloat
+    context = horizon_spec_context(T)
+    radial = real_inner_map(context, T)
+    contour = CF_HORIZON.build_real_inner_horizon_contour(
+        context.spectral, context.match_radius, context.rstar_match,
+        -T(100), radial,
+    )
+    original_maximum = T(1) / T(10)
+    geometry_candidates = horizon_geometry_candidates(
+        context, contour; maximum_distance=original_maximum
+    )
+    candidates = horizon_series_candidates(
+        context,
+        contour,
+        geometry_candidates;
+        required_digits=T(12),
+        maximum_distance=original_maximum,
+    )
+    positive_distances = [
+        candidate.geometry.horizon_distance for candidate in candidates
+        if candidate.geometry.horizon_distance > zero(T)
+    ]
+    tighter_maximum = minimum(positive_distances) / T(2)
+    failure = try
+        CF_HORIZON.select_verified_horizon_endpoints(
+            context.spectral,
+            candidates;
+            maximum_horizon_distance=tighter_maximum,
+        )
+        nothing
+    catch error
+        error
+    end
+    @test failure isa CF_HORIZON.FactoredPropagationError
+    @test failure.reason == CF_HORIZON.NO_VERIFIED_HORIZON_ENDPOINT
+end
+
+@testset "coordinate identity rejects nonfinite and excessive residuals" begin
+    T = Float64
+    context = horizon_spec_context(T)
+    request = coordinate_identity_spec_request()
+    tangent = complex(one(T), zero(T))
+    at_match(_rho) = complex(context.match_radius, zero(T))
+
+    evidence = assert_coordinate_identity(
+        T,
+        request,
+        context.spectral,
+        at_match,
+        context.rstar_match,
+        tangent,
+        (zero(T),),
+        "coordinate-identity-valid",
+    )
+    @test evidence isa CoordinateIdentityEvidence{T}
+    @test isfinite(evidence.maximum_absolute_residual)
+    @test isfinite(evidence.maximum_relative_residual)
+    @test isfinite(evidence.absolute_tolerance)
+    @test isfinite(evidence.relative_tolerance)
+
+    excessive = try
+        assert_coordinate_identity(
+            T,
+            request,
+            context.spectral,
+            at_match,
+            context.rstar_match,
+            tangent,
+            (zero(T), -one(T)),
+            "coordinate-identity-excessive",
+        )
+        nothing
+    catch error
+        error
+    end
+    @test excessive isa NumericalControlFailure
+    @test failure_details(excessive)["failure_code"] ==
+        "COORDINATE_IDENTITY_MISMATCH"
+    excessive_diagnostics = failure_details(excessive)["diagnostics"]
+    for field in (
+        "maximum_absolute_residual",
+        "maximum_relative_residual",
+        "absolute_tolerance",
+        "relative_tolerance",
+        "coordinate_ode_relative_tolerance",
+        "coordinate_ode_absolute_tolerance",
+    )
+        @test haskey(excessive_diagnostics, field)
+    end
+
+    nonfinite_map(_rho) = complex(T(NaN), zero(T))
+    nonfinite = try
+        assert_coordinate_identity(
+            T,
+            request,
+            context.spectral,
+            nonfinite_map,
+            context.rstar_match,
+            tangent,
+            (zero(T),),
+            "coordinate-identity-nonfinite",
+        )
+        nothing
+    catch error
+        error
+    end
+    @test nonfinite isa NumericalControlFailure
+    @test failure_details(nonfinite)["failure_code"] ==
+        "COORDINATE_IDENTITY_MISMATCH"
 end
 
 @testset "explicit-tangent horizon carriers keep the canonical match point" begin

@@ -1268,8 +1268,8 @@ function build_worker_outer_contour(
     radius_from_rho = observed_radial_map(
         raw_radius_from_rho, label, zero(T), rho_out
     )
-    emit_coordinate_identity(
-        T, spectral, radius_from_rho, rstar_match,
+    assert_coordinate_identity(
+        T, request, spectral, radius_from_rho, rstar_match,
         Complex{T}(spectral.convention.infinity_sign) *
             exp(complex(zero(T), spectral.convention.infinity_contour_angle)),
         range(zero(T), rho_out; length=9), label,
@@ -1333,8 +1333,8 @@ function build_worker_real_inner_horizon_contour(
     radius_from_rho = observed_radial_map(
         raw_radius_from_rho, label, rho_inner_min, zero(T)
     )
-    emit_coordinate_identity(
-        T, spectral, radius_from_rho, rstar_match,
+    assert_coordinate_identity(
+        T, request, spectral, radius_from_rho, rstar_match,
         complex(one(T), zero(T)),
         range(zero(T), rho_inner_min; length=9), label,
     )
@@ -1344,18 +1344,92 @@ function build_worker_real_inner_horizon_contour(
 end
 
 """
-    emit_coordinate_identity(T, spectral, radius_from_rho, rstar_match,
-                             tangent, samples, label)
+    assert_coordinate_identity(T, request, spectral, radius_from_rho,
+                               rstar_match, tangent, samples, label)
 
-Check and report the coordinate identity `r_*(rho) = rstar_match + tangent*rho`
-at retained checkpoints along a constructed map.
+Validate and report the coordinate identity
+`r_*(rho) = rstar_match + tangent*rho` at retained checkpoints.
 
 This is the direct test that the coordinate solve produced the contour it was
 asked for. It is what distinguishes "the horizon expansion is inadequate" from
-"the map is not going where the expansion assumes".
+"the map is not going where the expansion assumes". The admissible residual is
+derived from the coordinate ODE's own absolute and relative controls, projected
+to tortoise coordinates by `|dr_*/dr| = |(r^2+a^2)/Delta|`; working precision
+does not define a second tolerance table.
 """
-function emit_coordinate_identity(
+struct CoordinateIdentityEvidence{T<:AbstractFloat}
+    maximum_absolute_residual::T
+    maximum_relative_residual::T
+    absolute_tolerance::T
+    relative_tolerance::T
+    maximum_absolute_residual_over_tolerance::T
+    maximum_relative_residual_over_tolerance::T
+    sample_count::Int
+end
+
+function coordinate_identity_diagnostics(
+    evidence::CoordinateIdentityEvidence{T},
+    tolerances,
+    label::String;
+    failure_reason=nothing,
+    failing_rho=nothing,
+) where {T<:AbstractFloat}
+    return Dict{String,Any}(
+        "contour_label" => label,
+        "maximum_absolute_residual" =>
+            string(evidence.maximum_absolute_residual),
+        "maximum_relative_residual" =>
+            string(evidence.maximum_relative_residual),
+        "absolute_tolerance" => string(evidence.absolute_tolerance),
+        "relative_tolerance" => string(evidence.relative_tolerance),
+        "maximum_absolute_residual_over_tolerance" =>
+            string(evidence.maximum_absolute_residual_over_tolerance),
+        "maximum_relative_residual_over_tolerance" =>
+            string(evidence.maximum_relative_residual_over_tolerance),
+        "coordinate_ode_relative_tolerance" => string(tolerances.reltol),
+        "coordinate_ode_absolute_tolerance" => string(tolerances.abstol),
+        "sample_count" => evidence.sample_count,
+        "failure_reason" => failure_reason,
+        "failing_rho" => failing_rho === nothing ?
+            nothing : string(failing_rho),
+    )
+end
+
+function throw_coordinate_identity_mismatch(
+    request,
+    evidence::CoordinateIdentityEvidence,
+    tolerances,
+    label::String,
+    reason::String;
+    failing_rho=nothing,
+)
+    diagnostics = coordinate_identity_diagnostics(
+        evidence,
+        tolerances,
+        label;
+        failure_reason=reason,
+        failing_rho=failing_rho,
+    )
+    progress_emit(
+        "coordinate_identity_checked";
+        payload=merge(diagnostics, Dict{String,Any}(
+            "passed" => false,
+            "failure_code" => "COORDINATE_IDENTITY_MISMATCH",
+        )),
+    )
+    throw(numerical_control_failure(
+        request,
+        "COORDINATE_IDENTITY_MISMATCH",
+        "$(label) failed the coordinate identity gate: $(reason)",
+        diagnostics;
+        retryable=true,
+    ))
+end
+
+
+function assert_coordinate_identity(
     ::Type{T},
+    request,
     spectral::CF.HomogeneousSpectralContext{T},
     radius_from_rho,
     rstar_match::T,
@@ -1363,29 +1437,132 @@ function emit_coordinate_identity(
     samples,
     label::String,
 ) where {T<:AbstractFloat}
+    tolerances = coordinate_ode_tolerances(T, request)
+    all(isfinite, (tolerances.reltol, tolerances.abstol)) &&
+        tolerances.reltol > zero(T) && tolerances.abstol > zero(T) ||
+        error("coordinate ODE tolerances must be finite and positive")
+    sample_count = length(samples)
+    sample_count > 0 || error("coordinate identity requires retained samples")
     maximum_absolute = zero(T)
     maximum_relative = zero(T)
+    absolute_tolerance = zero(T)
+    relative_tolerance = zero(T)
+    maximum_absolute_ratio = zero(T)
+    maximum_relative_ratio = zero(T)
+    evidence() = CoordinateIdentityEvidence{T}(
+        maximum_absolute,
+        maximum_relative,
+        absolute_tolerance,
+        relative_tolerance,
+        maximum_absolute_ratio,
+        maximum_relative_ratio,
+        sample_count,
+    )
     for rho in samples
         typed_rho = T(rho)
         radius = Complex{T}(radius_from_rho(typed_rho))
-        isfinite(real(radius)) && isfinite(imag(radius)) || continue
+        if !(isfinite(typed_rho) && isfinite(real(radius)) &&
+             isfinite(imag(radius)))
+            throw_coordinate_identity_mismatch(
+                request,
+                evidence(),
+                tolerances,
+                label,
+                "NONFINITE_COORDINATE_IDENTITY_SAMPLE";
+                failing_rho=typed_rho,
+            )
+        end
         expected = complex(rstar_match, zero(T)) + tangent * typed_rho
         observed = Complex{T}(GSN.rstar_from_r(spectral.a, radius))
+        delta = Complex{T}(Kerr.Delta(spectral.a, radius))
+        radial_error_tolerance = tolerances.abstol +
+            tolerances.reltol * max(abs(radius), one(T))
+        tortoise_jacobian = abs(
+            (radius^2 + complex(spectral.a^2, zero(T))) / delta
+        )
+        if !(isfinite(real(expected)) && isfinite(imag(expected)) &&
+             isfinite(real(observed)) && isfinite(imag(observed)) &&
+             isfinite(radial_error_tolerance) &&
+             isfinite(tortoise_jacobian))
+            throw_coordinate_identity_mismatch(
+                request,
+                evidence(),
+                tolerances,
+                label,
+                "NONFINITE_COORDINATE_IDENTITY_PROJECTION";
+                failing_rho=typed_rho,
+            )
+        end
         residual = abs(observed - expected)
         scale = max(abs(expected), one(T))
+        relative_residual = residual / scale
+        sample_absolute_tolerance =
+            tortoise_jacobian * radial_error_tolerance
+        sample_relative_tolerance = sample_absolute_tolerance / scale
+        if !(isfinite(residual) && isfinite(relative_residual) &&
+             isfinite(sample_absolute_tolerance) &&
+             isfinite(sample_relative_tolerance) &&
+             sample_absolute_tolerance > zero(T) &&
+             sample_relative_tolerance > zero(T))
+            throw_coordinate_identity_mismatch(
+                request,
+                evidence(),
+                tolerances,
+                label,
+                "NONFINITE_COORDINATE_IDENTITY_RESIDUAL";
+                failing_rho=typed_rho,
+            )
+        end
         maximum_absolute = max(maximum_absolute, residual)
-        maximum_relative = max(maximum_relative, residual / scale)
+        maximum_relative = max(maximum_relative, relative_residual)
+        absolute_tolerance = max(
+            absolute_tolerance, sample_absolute_tolerance
+        )
+        relative_tolerance = max(
+            relative_tolerance, sample_relative_tolerance
+        )
+        maximum_absolute_ratio = max(
+            maximum_absolute_ratio,
+            residual / sample_absolute_tolerance,
+        )
+        maximum_relative_ratio = max(
+            maximum_relative_ratio,
+            relative_residual / sample_relative_tolerance,
+        )
     end
-    progress_emit("coordinate_identity_checked"; payload=Dict{String,Any}(
-        "contour_label" => label,
-        "maximum_absolute_residual" => string(maximum_absolute),
-        "maximum_relative_residual" => string(maximum_relative),
-        "sample_count" => length(samples),
-    ))
-    return (
-        maximum_absolute=maximum_absolute,
-        maximum_relative=maximum_relative,
+    result = evidence()
+    all(isfinite, (
+        result.maximum_absolute_residual,
+        result.maximum_relative_residual,
+        result.absolute_tolerance,
+        result.relative_tolerance,
+        result.maximum_absolute_residual_over_tolerance,
+        result.maximum_relative_residual_over_tolerance,
+    )) || throw_coordinate_identity_mismatch(
+        request,
+        result,
+        tolerances,
+        label,
+        "NONFINITE_COORDINATE_IDENTITY_EVIDENCE",
     )
+    if result.maximum_absolute_residual_over_tolerance > one(T) ||
+       result.maximum_relative_residual_over_tolerance > one(T)
+        throw_coordinate_identity_mismatch(
+            request,
+            result,
+            tolerances,
+            label,
+            "COORDINATE_IDENTITY_RESIDUAL_EXCEEDS_TOLERANCE",
+        )
+    end
+    diagnostics = coordinate_identity_diagnostics(
+        result, tolerances, label
+    )
+    progress_emit("coordinate_identity_checked"; payload=Dict{String,Any}(
+        diagnostics...,
+        "passed" => true,
+    ))
+    return result
 end
 
 """
@@ -2147,6 +2324,48 @@ function evaluate_horizon_determinant(
         factored_homogeneous_rhs_counter=factored_homogeneous_rhs_counter,
     )
 
+    maximum_horizon_distance = parse_real(
+        T, request, "horizon_maximum_endpoint_distance"
+    )
+    inner_contour = build_worker_real_inner_horizon_contour(
+        T, request, spectral, readout, "horizon-real-inner"
+    )
+    geometry_candidates = CF.horizon_endpoint_geometry_candidates(
+        spectral,
+        inner_contour;
+        rho_candidates=horizon_endpoint_rho_candidates(T, request),
+        maximum_horizon_distance=maximum_horizon_distance,
+    )
+    candidates = CF.horizon_endpoint_candidates(
+        spectral,
+        inner_contour,
+        geometry_candidates,
+        required_digits;
+        maximum_horizon_distance=maximum_horizon_distance,
+    )
+    for candidate in candidates
+        emit_horizon_endpoint_candidate(candidate)
+    end
+    endpoints = CF.select_verified_horizon_endpoints(
+        spectral,
+        candidates;
+        maximum_horizon_distance=maximum_horizon_distance,
+    )
+    progress_emit("horizon_endpoints_verified"; payload=Dict(
+        "reference_rho" => string(endpoints.reference.geometry.rho),
+        "reference_horizon_distance" =>
+            string(endpoints.reference.geometry.horizon_distance),
+        "verification_rho" =>
+            string(endpoints.verification.geometry.rho),
+        "verification_horizon_distance" =>
+            string(endpoints.verification.geometry.horizon_distance),
+        "horizon_contour_id" => endpoints.contour_id,
+        "candidate_count" => length(candidates),
+    ))
+
+    # No homogeneous ODE is permitted before the verified endpoint pair
+    # exists. The outer coordinate map and infinity preparation begin only
+    # after that gate, so invalid horizon geometry has zero homogeneous cost.
     outer_contour = build_worker_outer_contour(
         T, request, spectral, readout, "Xup-outer"
     )
@@ -2165,39 +2384,6 @@ function evaluate_horizon_determinant(
         )
     end
     emit_factored_solution(xup_match)
-
-    inner_contour = build_worker_real_inner_horizon_contour(
-        T, request, spectral, readout, "horizon-real-inner"
-    )
-    candidates = CF.horizon_endpoint_candidates(
-        spectral,
-        inner_contour,
-        required_digits;
-        rho_candidates=horizon_endpoint_rho_candidates(T, request),
-        maximum_horizon_distance=parse_real(
-            T, request, "horizon_maximum_endpoint_distance"
-        ),
-    )
-    for candidate in candidates
-        emit_horizon_endpoint_candidate(candidate)
-    end
-    endpoints = CF.select_verified_horizon_endpoints(
-        spectral,
-        candidates;
-        maximum_horizon_distance=parse_real(
-            T, request, "horizon_maximum_endpoint_distance"
-        ),
-    )
-    progress_emit("horizon_endpoints_verified"; payload=Dict(
-        "reference_rho" => string(endpoints.reference.rho),
-        "reference_horizon_distance" =>
-            string(endpoints.reference.horizon_distance),
-        "verification_rho" => string(endpoints.verification.rho),
-        "verification_horizon_distance" =>
-            string(endpoints.verification.horizon_distance),
-        "horizon_contour_id" => endpoints.contour_id,
-        "candidate_count" => length(candidates),
-    ))
 
     reference_basis = progress_operation("horizon-reference") do
         CF.solve_verified_horizon_basis_to_match(
@@ -2319,19 +2505,24 @@ function horizon_endpoint_rho_candidates(::Type{T}, request) where {T<:AbstractF
 end
 
 function emit_horizon_endpoint_candidate(candidate)
+    geometry = candidate.geometry
     progress_emit("horizon_endpoint_candidate"; payload=Dict(
-        "rho" => string(candidate.rho),
-        "radius" => progress_complex(candidate.radius),
-        "horizon_distance" => string(candidate.horizon_distance),
-        "imaginary_radius_abs" => string(candidate.imaginary_radius_abs),
-        "exterior" => candidate.exterior,
-        "approaches_horizon" => candidate.approaches_horizon,
-        "within_maximum_distance" => candidate.within_maximum_distance,
+        "rho" => string(geometry.rho),
+        "radius" => progress_complex(geometry.radius),
+        "horizon_distance" => string(geometry.horizon_distance),
+        "imaginary_radius_abs" => string(geometry.imaginary_radius_abs),
+        "exterior" => geometry.exterior,
+        "on_real_axis" => geometry.on_real_axis,
+        "approaches_horizon" => geometry.approaches_horizon,
+        "within_maximum_distance" => geometry.within_maximum_distance,
+        "horizon_contour_id" => geometry.contour_id,
         "ingoing_adequate" => candidate.ingoing_adequate,
         "outgoing_adequate" => candidate.outgoing_adequate,
         "ingoing_predicted_reliable_digits" =>
+            candidate.ingoing_assessment === nothing ? nothing :
             string(candidate.ingoing_assessment.predicted_reliable_digits),
         "outgoing_predicted_reliable_digits" =>
+            candidate.outgoing_assessment === nothing ? nothing :
             string(candidate.outgoing_assessment.predicted_reliable_digits),
     ))
 end

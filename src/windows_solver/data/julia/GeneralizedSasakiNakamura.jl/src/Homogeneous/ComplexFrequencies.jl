@@ -50,13 +50,15 @@ export solve_factored_horizon_match_to_inner
 export solve_factored_xup_scattering_endpoint
 export solve_factored_xin_to_match, solve_factored_xup_to_match
 export solve_factored_exterior_matches, reconstruct_factored_match_state
-export RealInnerHorizonContour, HorizonEndpointCandidate
+export RealInnerHorizonContour
+export HorizonEndpointGeometryCandidate, HorizonEndpointCandidate
 export RealInnerHorizonEndpoint, VerifiedHorizonEndpoints
 export VerifiedHorizonBasisSolution
 export REAL_INNER_HORIZON_CONTOUR_ID
 export DEFAULT_HORIZON_ENDPOINT_CANDIDATES
 export DEFAULT_MAXIMUM_HORIZON_DISTANCE
 export build_outer_contour_context, build_real_inner_horizon_contour
+export horizon_endpoint_geometry_candidates
 export horizon_endpoint_candidates, select_verified_horizon_endpoints
 export prepare_real_inner_horizon_endpoint
 export solve_factored_horizon_branch_to_match
@@ -2684,41 +2686,76 @@ struct RealInnerHorizonContour{T<:AbstractFloat,F}
     contour_deformation::ContourAngleDeformation{T}
 end
 
-struct HorizonEndpointCandidate{T<:AbstractFloat}
+struct HorizonEndpointGeometryCandidate{T<:AbstractFloat}
     rho::T
     radius::Complex{T}
     horizon_distance::T
     imaginary_radius_abs::T
     exterior::Bool
+    on_real_axis::Bool
     approaches_horizon::Bool
     within_maximum_distance::Bool
+    contour_id::String
+    precision_bits::Int
+    frozen_branch_cell::GSNBranchCell
+end
+
+struct HorizonEndpointCandidate{T<:AbstractFloat}
+    geometry::HorizonEndpointGeometryCandidate{T}
     ingoing_adequate::Bool
     outgoing_adequate::Bool
-    ingoing_evaluation::SeriesEvaluation{T}
-    outgoing_evaluation::SeriesEvaluation{T}
-    ingoing_assessment::AsymptoticConditioningAssessment{T}
-    outgoing_assessment::AsymptoticConditioningAssessment{T}
+    ingoing_evaluation::Union{Nothing,SeriesEvaluation{T}}
+    outgoing_evaluation::Union{Nothing,SeriesEvaluation{T}}
+    ingoing_assessment::Union{Nothing,AsymptoticConditioningAssessment{T}}
+    outgoing_assessment::Union{Nothing,AsymptoticConditioningAssessment{T}}
 end
 
 function _describe_horizon_candidate(candidate::HorizonEndpointCandidate)
+    geometry = candidate.geometry
     return string(
-        "rho=", candidate.rho,
-        " distance=", candidate.horizon_distance,
-        " exterior=", candidate.exterior,
-        " approaching=", candidate.approaches_horizon,
-        " within_max=", candidate.within_maximum_distance,
+        "rho=", geometry.rho,
+        " distance=", geometry.horizon_distance,
+        " exterior=", geometry.exterior,
+        " real_axis=", geometry.on_real_axis,
+        " approaching=", geometry.approaches_horizon,
+        " within_max=", geometry.within_maximum_distance,
         " ingoing=", candidate.ingoing_adequate,
         " outgoing=", candidate.outgoing_adequate,
     )
 end
 
-function _candidate_adequate(candidate::HorizonEndpointCandidate)
-    return candidate.rho < zero(candidate.rho) &&
+function _geometry_candidate_adequate(
+    candidate::HorizonEndpointGeometryCandidate{T},
+    maximum_horizon_distance::T,
+) where {T<:AbstractFloat}
+    return all(isfinite, (
+            candidate.rho,
+            real(candidate.radius),
+            imag(candidate.radius),
+            candidate.horizon_distance,
+            candidate.imaginary_radius_abs,
+        )) &&
+        candidate.rho < zero(T) &&
         candidate.exterior &&
+        candidate.on_real_axis &&
         candidate.approaches_horizon &&
         candidate.within_maximum_distance &&
+        candidate.horizon_distance <= maximum_horizon_distance
+end
+
+function _candidate_adequate(
+    candidate::HorizonEndpointCandidate{T},
+    maximum_horizon_distance::T,
+) where {T<:AbstractFloat}
+    return _geometry_candidate_adequate(
+            candidate.geometry, maximum_horizon_distance
+        ) &&
         candidate.ingoing_adequate &&
-        candidate.outgoing_adequate
+        candidate.outgoing_adequate &&
+        candidate.ingoing_evaluation !== nothing &&
+        candidate.outgoing_evaluation !== nothing &&
+        candidate.ingoing_assessment !== nothing &&
+        candidate.outgoing_assessment !== nothing
 end
 
 struct RealInnerHorizonEndpoint{T<:AbstractFloat}
@@ -2935,14 +2972,16 @@ function build_real_inner_horizon_contour(
 end
 
 """
-    horizon_endpoint_candidates(spectral, contour, required_digits;
-                                rho_candidates, maximum_horizon_distance)
+    horizon_endpoint_geometry_candidates(spectral, contour;
+                                         rho_candidates,
+                                         maximum_horizon_distance)
 
-Evaluate the bounded candidate set for the horizon endpoint.
+Screen the bounded horizon endpoint set using radial geometry alone.
 
-For each candidate `rho` the radial map is sampled and the ingoing and outgoing
-horizon series are evaluated and assessed. A candidate is adequate only when all
-of the following hold:
+For each candidate `rho` the radial map is sampled and its approach to the
+horizon is recorded. This phase owns no asymptotic series and cannot invoke a
+series assessment. A candidate passes the geometry gate only when all of the
+following hold:
 
   * `rho < 0`
   * `Re(r) > r_plus`  — the endpoint is still exterior
@@ -2950,42 +2989,40 @@ of the following hold:
     contour must not have wandered off the real axis
   * `|r - r_plus|` decreases as `rho` becomes more negative
   * `|r - r_plus| <= maximum_horizon_distance`
-  * both horizon series pass their preflight at `required_digits`
 
-The radial-approach conditions are evaluated before the series assessments are
-consulted for adequacy, so an escaping contour can never be rescued by a
-different truncation order.
+The result carries contour provenance so a later series phase cannot assess a
+candidate from another contour, precision, or branch cell.
 """
-function horizon_endpoint_candidates(
+function horizon_endpoint_geometry_candidates(
     spectral::HomogeneousSpectralContext{T},
-    contour::RealInnerHorizonContour{T},
-    required_digits::T;
+    contour::RealInnerHorizonContour{T};
     rho_candidates=DEFAULT_HORIZON_ENDPOINT_CANDIDATES,
     maximum_horizon_distance::T=T(DEFAULT_MAXIMUM_HORIZON_DISTANCE),
 ) where {T<:AbstractFloat}
     return _translate_factored_failure(
         T,
         spectral.precision_bits,
-        "horizon endpoint candidate evaluation",
+        "horizon endpoint geometry evaluation",
     ) do
         _with_factored_precision(T, spectral.precision_bits) do
             _assert_real_inner_contour_provenance(spectral, contour)
-            maximum_horizon_distance > zero(T) || throw(ArgumentError(
-                "maximum horizon distance must be positive"
-            ))
+            isfinite(maximum_horizon_distance) &&
+                maximum_horizon_distance > zero(T) ||
+                throw(ArgumentError(
+                    "maximum horizon distance must be finite and positive"
+                ))
             isempty(rho_candidates) && throw(ArgumentError(
                 "horizon endpoint candidate set must be nonempty"
             ))
             geometry = stable_horizon_geometry(spectral.a)
             rplus = complex(T(geometry.rplus), zero(T))
-            ingoing_series = _branch_series(spectral.series, HORIZON_INGOING)
-            outgoing_series = _branch_series(
-                spectral.series, HORIZON_OUTGOING
-            )
             ordered = sort(collect(T.(rho_candidates)); rev=true)
-            candidates = Vector{HorizonEndpointCandidate{T}}()
+            candidates = Vector{HorizonEndpointGeometryCandidate{T}}()
             previous_distance = T(Inf)
             for rho in ordered
+                isfinite(rho) && rho < zero(T) || throw(ArgumentError(
+                    "horizon endpoint candidates must be finite and negative"
+                ))
                 rho >= contour.rho_min || throw(ArgumentError(
                     "horizon endpoint candidate lies beyond the contour rho_min"
                 ))
@@ -3008,6 +3045,117 @@ function horizon_endpoint_candidates(
                 approaches_horizon = horizon_distance < previous_distance
                 within_maximum_distance =
                     horizon_distance <= maximum_horizon_distance
+                push!(candidates, HorizonEndpointGeometryCandidate{T}(
+                    rho,
+                    radius,
+                    horizon_distance,
+                    imaginary_radius_abs,
+                    exterior,
+                    on_real_axis,
+                    approaches_horizon,
+                    within_maximum_distance,
+                    contour.contour_id,
+                    contour.precision_bits,
+                    contour.frozen_branch_cell,
+                ))
+                previous_distance = horizon_distance
+            end
+            return candidates
+        end
+    end
+end
+
+function _assert_horizon_geometry_candidate_provenance(
+    spectral::HomogeneousSpectralContext{T},
+    contour::RealInnerHorizonContour{T},
+    candidate::HorizonEndpointGeometryCandidate{T},
+) where {T<:AbstractFloat}
+    candidate.contour_id == contour.contour_id || throw(_factored_error(
+        T,
+        INVALID_FACTORED_PROPAGATION_INPUT,
+        spectral.precision_bits,
+        "horizon geometry candidate changed contour identity",
+    ))
+    candidate.precision_bits == contour.precision_bits || throw(
+        _factored_error(
+            T,
+            FACTORED_PROPAGATION_PRECISION_MISMATCH,
+            spectral.precision_bits,
+            "horizon geometry candidate changed contour precision",
+        )
+    )
+    candidate.frozen_branch_cell == contour.frozen_branch_cell || throw(
+        _factored_error(
+            T,
+            INVALID_FACTORED_PROPAGATION_INPUT,
+            spectral.precision_bits,
+            "horizon geometry candidate changed the frozen branch cell",
+        )
+    )
+    return nothing
+end
+
+
+"""
+    horizon_endpoint_candidates(spectral, contour, geometry_candidates,
+                                required_digits; maximum_horizon_distance)
+
+Assess horizon series only for candidates that already pass the radial gate.
+
+Geometry failures remain in the returned vector with absent series evidence so
+their rejection is diagnosable, but neither the ingoing nor outgoing horizon
+series is evaluated for them. The configured maximum distance is checked again
+against the measured distance rather than trusting the stored boolean verdict.
+"""
+function horizon_endpoint_candidates(
+    spectral::HomogeneousSpectralContext{T},
+    contour::RealInnerHorizonContour{T},
+    geometry_candidates::Vector{HorizonEndpointGeometryCandidate{T}},
+    required_digits::T;
+    maximum_horizon_distance::T=T(DEFAULT_MAXIMUM_HORIZON_DISTANCE),
+) where {T<:AbstractFloat}
+    return _translate_factored_failure(
+        T,
+        spectral.precision_bits,
+        "horizon endpoint series evaluation",
+    ) do
+        _with_factored_precision(T, spectral.precision_bits) do
+            _assert_real_inner_contour_provenance(spectral, contour)
+            isfinite(maximum_horizon_distance) &&
+                maximum_horizon_distance > zero(T) ||
+                throw(ArgumentError(
+                    "maximum horizon distance must be finite and positive"
+                ))
+            isempty(geometry_candidates) && throw(ArgumentError(
+                "horizon endpoint geometry candidate set must be nonempty"
+            ))
+            ingoing_series = _branch_series(
+                spectral.series, HORIZON_INGOING
+            )
+            outgoing_series = _branch_series(
+                spectral.series, HORIZON_OUTGOING
+            )
+            candidates = Vector{HorizonEndpointCandidate{T}}()
+            for geometry_candidate in geometry_candidates
+                _assert_horizon_geometry_candidate_provenance(
+                    spectral, contour, geometry_candidate
+                )
+                geometry_adequate = _geometry_candidate_adequate(
+                    geometry_candidate, maximum_horizon_distance
+                )
+                if !geometry_adequate
+                    push!(candidates, HorizonEndpointCandidate{T}(
+                        geometry_candidate,
+                        false,
+                        false,
+                        nothing,
+                        nothing,
+                        nothing,
+                        nothing,
+                    ))
+                    continue
+                end
+                radius = geometry_candidate.radius
                 ingoing_evaluation = evaluate_horizon_asymptotic_series(
                     ingoing_series, radius; order=spectral.endpoint_order
                 )
@@ -3021,13 +3169,7 @@ function horizon_endpoint_candidates(
                     outgoing_series, outgoing_evaluation, required_digits
                 )
                 push!(candidates, HorizonEndpointCandidate{T}(
-                    rho,
-                    radius,
-                    horizon_distance,
-                    imaginary_radius_abs,
-                    exterior && on_real_axis,
-                    approaches_horizon,
-                    within_maximum_distance,
+                    geometry_candidate,
                     ingoing_assessment.adequate,
                     outgoing_assessment.adequate,
                     ingoing_evaluation,
@@ -3035,7 +3177,6 @@ function horizon_endpoint_candidates(
                     ingoing_assessment,
                     outgoing_assessment,
                 ))
-                previous_distance = horizon_distance
             end
             return candidates
         end
@@ -3062,7 +3203,16 @@ function select_verified_horizon_endpoints(
     candidates::Vector{HorizonEndpointCandidate{T}};
     maximum_horizon_distance::T=T(DEFAULT_MAXIMUM_HORIZON_DISTANCE),
 ) where {T<:AbstractFloat}
-    adequate = filter(_candidate_adequate, candidates)
+    isfinite(maximum_horizon_distance) &&
+        maximum_horizon_distance > zero(T) || throw(ArgumentError(
+            "maximum horizon distance must be finite and positive"
+        ))
+    adequate = filter(
+        candidate -> _candidate_adequate(
+                candidate, maximum_horizon_distance
+            ) && candidate.geometry.horizon_distance <= maximum_horizon_distance,
+        candidates,
+    )
     if length(adequate) < 2
         detail = isempty(candidates) ? "no candidates were evaluated" :
             join(map(_describe_horizon_candidate, candidates), "; ")
@@ -3074,7 +3224,9 @@ function select_verified_horizon_endpoints(
             "dual-series gate: " * detail,
         ))
     end
-    ordered = sort(adequate; by=candidate -> candidate.rho, rev=true)
+    ordered = sort(
+        adequate; by=candidate -> candidate.geometry.rho, rev=true
+    )
     return VerifiedHorizonEndpoints{T}(
         ordered[1],
         ordered[2],
@@ -3161,7 +3313,9 @@ function prepare_real_inner_horizon_endpoint(
                     spectral.precision_bits,
                     "real-inner endpoint branch must be a horizon branch",
                 ))
-            _candidate_adequate(candidate) || throw(_factored_error(
+            _candidate_adequate(
+                candidate, candidate.geometry.horizon_distance
+            ) || throw(_factored_error(
                 T,
                 NO_VERIFIED_HORIZON_ENDPOINT,
                 spectral.precision_bits,
@@ -3171,6 +3325,18 @@ function prepare_real_inner_horizon_endpoint(
                 candidate.ingoing_evaluation : candidate.outgoing_evaluation
             assessment = branch === HORIZON_INGOING ?
                 candidate.ingoing_assessment : candidate.outgoing_assessment
+            evaluation === nothing && throw(_factored_error(
+                T,
+                NO_VERIFIED_HORIZON_ENDPOINT,
+                spectral.precision_bits,
+                "real-inner endpoint has no series evaluation",
+            ))
+            assessment === nothing && throw(_factored_error(
+                T,
+                NO_VERIFIED_HORIZON_ENDPOINT,
+                spectral.precision_bits,
+                "real-inner endpoint has no series assessment",
+            ))
             assessment.adequate || throw(_factored_error(
                 T,
                 INSUFFICIENT_ASYMPTOTIC_PRECISION,
@@ -3178,7 +3344,8 @@ function prepare_real_inner_horizon_endpoint(
                 "real-inner horizon seed cannot bypass an inadequate preflight",
                 assessment=assessment,
             ))
-            radius = candidate.radius
+            geometry_candidate = candidate.geometry
+            radius = geometry_candidate.radius
             radial_factor = Delta(spectral.a, radius) /
                 (radius^2 + complex(spectral.a^2, zero(T)))
             _finite_factored_complex(radial_factor) || throw(_factored_error(
@@ -3210,7 +3377,7 @@ function prepare_real_inner_horizon_endpoint(
                 contour.tangent,
             )
             regularity = _real_inner_endpoint_regularity(
-                branch, state, carrier, candidate.rho, radius
+                branch, state, carrier, geometry_candidate.rho, radius
             )
             regularity.finite || throw(_factored_error(
                 T,
@@ -3233,9 +3400,9 @@ function prepare_real_inner_horizon_endpoint(
                 branch,
                 state,
                 carrier,
-                candidate.rho,
+                geometry_candidate.rho,
                 radius,
-                candidate.horizon_distance,
+                geometry_candidate.horizon_distance,
                 assessment,
                 regularity,
                 required_digits,
@@ -3355,8 +3522,8 @@ function solve_verified_horizon_basis_to_match(
         outgoing,
         ingoing_endpoint,
         outgoing_endpoint,
-        candidate.rho,
-        candidate.horizon_distance,
+        candidate.geometry.rho,
+        candidate.geometry.horizon_distance,
     )
 end
 

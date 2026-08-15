@@ -14,6 +14,10 @@ JULIA_SPEC = REPO_ROOT / (
     "src/windows_solver/data/julia/GeneralizedSasakiNakamura.jl/test/"
     "factored_propagation_spec.jl"
 )
+REAL_INNER_HORIZON_SPEC = REPO_ROOT / (
+    "src/windows_solver/data/julia/GeneralizedSasakiNakamura.jl/test/"
+    "real_inner_horizon_spec.jl"
+)
 WORKER_SOURCE = REPO_ROOT / "src/windows_solver/data/julia/m02_worker.jl"
 CI_WORKFLOW = REPO_ROOT / ".github/workflows/ci.yml"
 M02_MANIFEST_SEED = REPO_ROOT / (
@@ -26,6 +30,9 @@ class RegularisedGsnFactoredPropagationSourceTests(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.source = COMPLEX_FREQUENCIES_SOURCE.read_text(encoding="utf-8")
         cls.spec = JULIA_SPEC.read_text(encoding="utf-8")
+        cls.real_inner_spec = REAL_INNER_HORIZON_SPEC.read_text(
+            encoding="utf-8"
+        )
         cls.worker = WORKER_SOURCE.read_text(encoding="utf-8")
         cls.workflow = CI_WORKFLOW.read_text(encoding="utf-8")
         cls.manifest_seed = M02_MANIFEST_SEED.read_text(encoding="utf-8")
@@ -52,6 +59,11 @@ class RegularisedGsnFactoredPropagationSourceTests(unittest.TestCase):
         self.assertIn(
             'include(joinpath(ENV["GSN_PROJECT"], "test", '
             '"factored_propagation_spec.jl"))',
+            self.workflow,
+        )
+        self.assertIn(
+            'include(joinpath(ENV["GSN_PROJECT"], "test", '
+            '"real_inner_horizon_spec.jl"))',
             self.workflow,
         )
         self.assertNotIn("Pkg.test()", self.workflow)
@@ -312,6 +324,55 @@ class RegularisedGsnFactoredPropagationSourceTests(unittest.TestCase):
         self.assertIn("change_carrier(", change)
         self.assertIn("carrier_change_diagnostics(", change)
         self.assertIn("zero(T)", change)
+
+    def test_horizon_geometry_screening_is_separate_from_series_preflight(
+        self,
+    ) -> None:
+        for contract in (
+            "HorizonEndpointGeometryCandidate",
+            "horizon_endpoint_geometry_candidates",
+        ):
+            self.assertIn(f"export {contract}", self.source)
+
+        geometry_struct = self.source[
+            self.source.index("struct HorizonEndpointGeometryCandidate") :
+            self.source.index("struct HorizonEndpointCandidate")
+        ]
+        for forbidden in (
+            "SeriesEvaluation",
+            "AsymptoticConditioningAssessment",
+            "ingoing",
+            "outgoing",
+        ):
+            self.assertNotIn(forbidden, geometry_struct)
+
+        geometry = self._function("horizon_endpoint_geometry_candidates")
+        self.assertIn("within_maximum_distance", geometry)
+        self.assertNotIn("evaluate_horizon_asymptotic_series(", geometry)
+        self.assertNotIn("assess_asymptotic_preflight(", geometry)
+
+        series = self._function("horizon_endpoint_candidates")
+        self.assertIn(
+            "geometry_candidates::Vector{HorizonEndpointGeometryCandidate{T}}",
+            series,
+        )
+        radial_gate = series.index("_geometry_candidate_adequate(")
+        ingoing_series = series.index("evaluate_horizon_asymptotic_series(")
+        self.assertLess(radial_gate, ingoing_series)
+
+        selector = self._function("select_verified_horizon_endpoints")
+        self.assertIn(
+            "candidate.geometry.horizon_distance <= "
+            "maximum_horizon_distance",
+            selector,
+        )
+
+        for behavior in (
+            "invalid geometry does not evaluate either horizon series",
+            "selector revalidates the configured maximum horizon distance",
+            "coordinate identity rejects nonfinite and excessive residuals",
+        ):
+            self.assertIn(behavior, self.real_inner_spec)
 
     def test_all_determinant_branches_are_authenticated_before_adequacy(self) -> None:
         for name, provenance_call, first_solve_call in (

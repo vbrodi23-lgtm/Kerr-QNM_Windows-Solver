@@ -62,22 +62,32 @@ class RegularisedGsnWorkerSourceTests(unittest.TestCase):
         horizon = self._function_slice(
             "evaluate_horizon_determinant", "horizon_endpoint_rho_candidates"
         )
-        # Outer leg: preparation and its adequacy gate precede the solve.
+        # The complete inner geometry and dual-series gate must pass before
+        # even preparing the outer leg.  Otherwise invalid horizon geometry
+        # can still consume the expensive Xup homogeneous solve.
+        self.assertIn(
+            "CF.horizon_endpoint_geometry_candidates(", horizon
+        )
+        geometry = horizon.index(
+            "CF.horizon_endpoint_geometry_candidates("
+        )
+        candidates = horizon.index("CF.horizon_endpoint_candidates(")
+        verified = horizon.index("CF.select_verified_horizon_endpoints(")
+        outer_contour = horizon.index("build_worker_outer_contour(")
         outer_prepare = horizon.index("CF.prepare_factored_infinity_outgoing(")
         outer_gate = horizon.index("CF.assert_factored_preflights_adequate(")
         outer_solve = horizon.index("CF.solve_factored_xup_to_match(")
+        self.assertLess(geometry, candidates)
+        self.assertLess(candidates, verified)
+        self.assertLess(verified, outer_contour)
+        self.assertLess(verified, outer_prepare)
         self.assertLess(outer_prepare, outer_gate)
         self.assertLess(outer_gate, outer_solve)
 
-        # Horizon legs: the geometry gate and endpoint verification precede
-        # any horizon propagation, so an escaping contour is rejected before
-        # a homogeneous ODE is ever started.
-        candidates = horizon.index("CF.horizon_endpoint_candidates(")
-        verified = horizon.index("CF.select_verified_horizon_endpoints(")
+        # The verified endpoint pair also precedes both horizon propagations.
         horizon_solve = horizon.index(
             "CF.solve_verified_horizon_basis_to_match("
         )
-        self.assertLess(candidates, verified)
         self.assertLess(verified, horizon_solve)
 
     def test_horizon_determinant_cannot_use_the_mixed_inner_leg(self) -> None:
@@ -142,12 +152,46 @@ class RegularisedGsnWorkerSourceTests(unittest.TestCase):
         )
         inner = self._function_slice(
             "build_worker_real_inner_horizon_contour",
-            "emit_coordinate_identity",
+            "coordinate_identity_diagnostics",
         )
         for slice_text in (outer, inner):
             self.assertIn("coordinate_ode_tolerances(T, request)", slice_text)
             self.assertIn("r_at_rho_zero=Complex{T}(match_radius)", slice_text)
             self.assertNotIn('"ode_relative_tolerance"', slice_text)
+
+    def test_coordinate_identity_is_a_typed_tolerance_gate(self) -> None:
+        for contract in (
+            "struct CoordinateIdentityEvidence{T<:AbstractFloat}",
+            "maximum_absolute_residual::T",
+            "maximum_relative_residual::T",
+            "absolute_tolerance::T",
+            "relative_tolerance::T",
+            "function assert_coordinate_identity(",
+            "coordinate_ode_tolerances(T, request)",
+            '"COORDINATE_IDENTITY_MISMATCH"',
+        ):
+            self.assertIn(contract, self.worker)
+
+        identity = self._function_slice(
+            "throw_coordinate_identity_mismatch",
+            "endpoint_conditioning_summary",
+        )
+        self.assertIn("Kerr.Delta(", identity)
+        self.assertIn("numerical_control_failure(", identity)
+        self.assertIn('"coordinate_identity_checked"', identity)
+        self.assertNotIn("|| continue", identity)
+
+        outer = self._function_slice(
+            "build_worker_outer_contour",
+            "build_worker_real_inner_horizon_contour",
+        )
+        inner = self._function_slice(
+            "build_worker_real_inner_horizon_contour",
+            "coordinate_identity_diagnostics",
+        )
+        for body in (outer, inner):
+            self.assertIn("assert_coordinate_identity(", body)
+            self.assertNotIn("emit_coordinate_identity(", body)
 
     def test_exterior_determinant_preflight_ordering_is_unchanged(self) -> None:
 
