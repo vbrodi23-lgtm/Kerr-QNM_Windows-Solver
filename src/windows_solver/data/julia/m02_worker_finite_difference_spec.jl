@@ -347,7 +347,13 @@ end
         complex(0.0, 0.0),
         nothing;
         authenticate_controls=false,
-        determinant_evaluator=spec_determinant_evaluator(),
+        # As in the dedicated historical-path test above, make the analytic
+        # O(h^2) signal dominate the unavoidable O(eps/h) cancellation at the
+        # nonzero complex fixture root.  This test is about policy bounds, not
+        # a second test of Float64 subtraction noise.
+        determinant_evaluator=spec_determinant_evaluator(
+            curvature=complex(100.0, 0.0)
+        ),
     )
     @test ladder.rung_count == 1
 end
