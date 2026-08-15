@@ -98,7 +98,10 @@ function solve_r_from_rho(
     ode_leg="r_from_rho",
     r_at_rho_zero=nothing,
 )
-    p = (a=a, beta=beta, sign=sign)
+    # Keep the exact coordinate origin with the integrator so an observation
+    # callback can authenticate r_*(rho) even when it aborts before a solution
+    # object exists.
+    p = (a=a, beta=beta, sign=sign, rs_mp=rs_mp)
     # Initial condition at rho = 0.
     #
     # By construction r_*(0) = rs_mp, so r(0) is the radius whose tortoise

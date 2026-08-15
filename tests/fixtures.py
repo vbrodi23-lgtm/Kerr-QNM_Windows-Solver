@@ -397,8 +397,12 @@ def valid_control_failure_diagnostics(
             "ode_span_fraction": "1e-13",
             "ode_rhs_evaluations": 200000,
             "ode_accepted_steps": 12500,
+            "ode_rejected_steps": 187500,
             "ode_last_accepted_step_abs": "8.1e-17",
             "ode_min_accepted_step_abs": "8.0e-17",
+            "current_r_re": "1.4358898943540674",
+            "current_r_im": "0",
+            "coordinate_identity_residual_abs": "2.1e-25",
             "elapsed_leg_seconds": 8.75,
         }
     if failure_code == "DETERMINANT_UNCERTAINTY_TOO_LARGE":

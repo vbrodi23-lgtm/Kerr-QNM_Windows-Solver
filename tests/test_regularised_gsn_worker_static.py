@@ -332,6 +332,10 @@ class RegularisedGsnWorkerSourceTests(unittest.TestCase):
             '"homogeneous_ode_absolute_tolerance"',
             "COORDINATE_INVERSION_STALLED",
             "function throw_coordinate_inversion_stalled(",
+            '"ode_rejected_steps" => Int(stats.nreject)',
+            '"current_r_re" => string(real(current_radius))',
+            '"current_r_im" => string(imag(current_radius))',
+            '"coordinate_identity_residual_abs" =>',
         ):
             self.assertIn(contract, self.worker)
         outer = self._function_slice(
@@ -788,6 +792,16 @@ class RegularisedGsnWorkerSourceTests(unittest.TestCase):
         self.assertIn("function throw_ode_resource_limit(", self.worker)
         self.assertIn(
             "function throw_coordinate_inversion_stalled(", self.worker
+        )
+        coordinate_solver = (
+            REPO_ROOT
+            / "src/windows_solver/data/julia"
+            / "GeneralizedSasakiNakamura.jl/src/Homogeneous"
+            / "ComplexFrequencies.jl"
+        ).read_text(encoding="utf-8")
+        self.assertIn(
+            "p = (a=a, beta=beta, sign=sign, rs_mp=rs_mp)",
+            coordinate_solver,
         )
 
     def _function_slice(self, name: str, next_name: str) -> str:

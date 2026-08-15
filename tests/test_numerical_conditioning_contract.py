@@ -1758,6 +1758,49 @@ class JuliaNumericalControlFailureTests(unittest.TestCase):
                         type(raised.exception), JuliaResponseBackendError
                     )
 
+    def test_coordinate_stall_receipt_requires_finite_state_evidence(self):
+        """Catches a typed stall receipt that cannot locate the failed map."""
+
+        baseline = self._diagnostics("COORDINATE_INVERSION_STALLED")
+        mutations = {
+            "missing_rejected_steps": "ode_rejected_steps",
+            "missing_current_radius": "current_r_re",
+            "missing_identity_residual": "coordinate_identity_residual_abs",
+        }
+        for label, field in mutations.items():
+            with self.subTest(label=label):
+                policy, details = self._details(
+                    "COORDINATE_INVERSION_STALLED"
+                )
+                diagnostics = copy.deepcopy(baseline)
+                diagnostics.pop(field)
+                details["failure"]["diagnostics"] = diagnostics
+                julia_backend._require_worker_resource_identity(
+                    details, policy
+                )
+                with self.assertRaises(JuliaResponseBackendError):
+                    julia_backend._raise_worker_failure(details)
+
+        invalid_values = {
+            "ode_rejected_steps": -1,
+            "current_r_re": "NaN",
+            "current_r_im": "Inf",
+            "coordinate_identity_residual_abs": "-1e-25",
+        }
+        for field, value in invalid_values.items():
+            with self.subTest(field=field, value=value):
+                policy, details = self._details(
+                    "COORDINATE_INVERSION_STALLED"
+                )
+                diagnostics = copy.deepcopy(baseline)
+                diagnostics[field] = value
+                details["failure"]["diagnostics"] = diagnostics
+                julia_backend._require_worker_resource_identity(
+                    details, policy
+                )
+                with self.assertRaises(JuliaResponseBackendError):
+                    julia_backend._raise_worker_failure(details)
+
     def test_each_code_rejects_a_stage_it_cannot_emit_from(self):
         """Catches relabelling diagnostics as a different pipeline failure."""
 

@@ -1373,8 +1373,12 @@ def _valid_coordinate_stall_diagnostics(
         "ode_span_fraction",
         "ode_rhs_evaluations",
         "ode_accepted_steps",
+        "ode_rejected_steps",
         "ode_last_accepted_step_abs",
         "ode_min_accepted_step_abs",
+        "current_r_re",
+        "current_r_im",
+        "coordinate_identity_residual_abs",
         "elapsed_leg_seconds",
     })
     if stage != "coordinate-inversion" or not _has_exact_fields(
@@ -1392,13 +1396,23 @@ def _valid_coordinate_stall_diagnostics(
         or not diagnostics["ode_leg"].startswith("r_from_rho")
         or not _is_nonnegative_int(diagnostics.get("ode_rhs_evaluations"))
         or not _is_nonnegative_int(diagnostics.get("ode_accepted_steps"))
+        or not _is_nonnegative_int(diagnostics.get("ode_rejected_steps"))
     ):
         return False
-    for name in ("ode_t_current", "ode_t_end"):
+    for name in (
+        "ode_t_current",
+        "ode_t_end",
+        "current_r_re",
+        "current_r_im",
+    ):
         if _diagnostic_decimal(diagnostics, name) is None:
             return False
     if _diagnostic_decimal(
         diagnostics, "ode_span_abs", positive=True
+    ) is None:
+        return False
+    if _diagnostic_decimal(
+        diagnostics, "coordinate_identity_residual_abs", nonnegative=True
     ) is None:
         return False
     for name in (

@@ -284,7 +284,8 @@ ceiling so the budget is not consumed proving the same point.
 """
 function throw_coordinate_inversion_stalled(
     state::ODEObservationState, stats, t_current;
-    proposed_step=nothing, span, span_fraction, reason::String,
+    proposed_step=nothing, span, span_fraction, current_radius,
+    coordinate_identity_residual_abs, reason::String,
 )
     snapshot = merge(
         ode_snapshot_payload(
@@ -296,6 +297,10 @@ function throw_coordinate_inversion_stalled(
             "ode_span_abs" => string(span),
             "ode_span_fraction" => span_fraction === nothing ?
                 nothing : string(span_fraction),
+            "current_r_re" => string(real(current_radius)),
+            "current_r_im" => string(imag(current_radius)),
+            "coordinate_identity_residual_abs" =>
+                string(coordinate_identity_residual_abs),
         ),
     )
     LAST_ODE_SNAPSHOT[] = snapshot
@@ -325,12 +330,17 @@ function throw_coordinate_inversion_stalled(
                 nothing : string(span_fraction),
             "ode_rhs_evaluations" => Int(stats.nf),
             "ode_accepted_steps" => Int(stats.naccept),
+            "ode_rejected_steps" => Int(stats.nreject),
             "ode_last_accepted_step_abs" =>
                 state.last_accepted_step === nothing ?
                 nothing : string(state.last_accepted_step),
             "ode_min_accepted_step_abs" =>
                 state.minimum_accepted_step === nothing ?
                 nothing : string(state.minimum_accepted_step),
+            "current_r_re" => snapshot["current_r_re"],
+            "current_r_im" => snapshot["current_r_im"],
+            "coordinate_identity_residual_abs" =>
+                snapshot["coordinate_identity_residual_abs"],
             "elapsed_leg_seconds" => snapshot["elapsed_seconds"],
         ),
     ))
@@ -451,11 +461,25 @@ function ode_observation_factory(request, leg, tspan, _algorithm)
                     stalled_step = last_step !== nothing && span > 0 &&
                         last_step <= minimum_step_fraction * span
                     if stalled_span && stalled_step
+                        current_radius = integrator.u[1]
+                        tangent = integrator.p.sign *
+                            exp(1im * integrator.p.beta)
+                        expected_rstar = integrator.p.rs_mp +
+                            tangent * integrator.t
+                        observed_rstar = GSN.rstar_from_r(
+                            integrator.p.a, current_radius
+                        )
+                        coordinate_identity_residual_abs = abs(
+                            observed_rstar - expected_rstar
+                        )
                         throw_coordinate_inversion_stalled(
                             state, stats, integrator.t;
                             proposed_step=proposed_step,
                             span=span,
                             span_fraction=span_fraction,
+                            current_radius=current_radius,
+                            coordinate_identity_residual_abs=
+                                coordinate_identity_residual_abs,
                             reason="span fraction $(span_fraction) below " *
                                 "$(minimum_fraction) with accepted step " *
                                 "$(last_step) after $(Int(stats.nf)) RHS " *
