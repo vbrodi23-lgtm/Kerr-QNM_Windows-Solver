@@ -16,6 +16,9 @@ JULIA_SPEC = REPO_ROOT / (
 )
 WORKER_SOURCE = REPO_ROOT / "src/windows_solver/data/julia/m02_worker.jl"
 CI_WORKFLOW = REPO_ROOT / ".github/workflows/ci.yml"
+M02_MANIFEST_SEED = REPO_ROOT / (
+    "src/windows_solver/data/julia/m02_project/Manifest.seed.toml"
+)
 
 
 class RegularisedGsnFactoredPropagationSourceTests(unittest.TestCase):
@@ -25,6 +28,7 @@ class RegularisedGsnFactoredPropagationSourceTests(unittest.TestCase):
         cls.spec = JULIA_SPEC.read_text(encoding="utf-8")
         cls.worker = WORKER_SOURCE.read_text(encoding="utf-8")
         cls.workflow = CI_WORKFLOW.read_text(encoding="utf-8")
+        cls.manifest_seed = M02_MANIFEST_SEED.read_text(encoding="utf-8")
 
     def test_ci_runs_the_load_bearing_factored_spec_not_the_full_vendor_suite(
         self,
@@ -43,17 +47,32 @@ class RegularisedGsnFactoredPropagationSourceTests(unittest.TestCase):
             self.workflow,
         )
         self.assertIn('--project="$M02_PROJECT"', self.workflow)
-        self.assertIn(
-            'Pkg.develop(PackageSpec(path=abspath(ENV["GSN_PROJECT"])))',
-            self.workflow,
-        )
-        self.assertIn("Pkg.resolve()", self.workflow)
+        self.assertNotIn("Pkg.develop(", self.workflow)
+        self.assertNotIn("Pkg.resolve()", self.workflow)
         self.assertIn(
             'include(joinpath(ENV["GSN_PROJECT"], "test", '
             '"factored_propagation_spec.jl"))',
             self.workflow,
         )
         self.assertNotIn("Pkg.test()", self.workflow)
+
+        gsn_entry = re.search(
+            r"\[\[deps\.GeneralizedSasakiNakamura\]\]\n"
+            r"(?P<body>.*?)(?=\n\[\[deps\.)",
+            self.manifest_seed,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(gsn_entry)
+        gsn_body = gsn_entry.group("body")
+        for dependency in ("HDF5", "LsqFit", "Printf", "Serialization"):
+            self.assertIn(f'"{dependency}"', gsn_body)
+        self.assertIn('version = "0.9.0"', gsn_body)
+        self.assertIn(
+            'path = "../vendor/GeneralizedSasakiNakamura.jl"',
+            gsn_body,
+        )
+        for package in ("HDF5", "LsqFit"):
+            self.assertIn(f"[[deps.{package}]]", self.manifest_seed)
 
     def test_contexts_are_typed_and_bind_frozen_cell_to_sample_deformation(
         self,

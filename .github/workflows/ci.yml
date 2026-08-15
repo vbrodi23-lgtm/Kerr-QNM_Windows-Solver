@@ -65,9 +65,6 @@ jobs:
         run: |
           julia --startup-file=no --history-file=no --project="$M02_PROJECT" -e '
             using Pkg
-            Pkg.develop(PackageSpec(path=abspath(ENV["ANGULAR_PROJECT"])))
-            Pkg.develop(PackageSpec(path=abspath(ENV["GSN_PROJECT"])))
-            Pkg.resolve()
             Pkg.instantiate()
             Pkg.precompile()
           '
