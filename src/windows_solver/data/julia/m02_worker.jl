@@ -2976,11 +2976,37 @@ function validated_frequency_steps(
     ))
 end
 
+"""
+    validated_frequency_step(T, request)
+
+Validate the nominal derivative step alone.
+
+This is the historical contract and it deliberately does not require the
+minimum/maximum pair to be four-fold wide. Only the authenticated rung search
+samples `h/2` and `2h` around a rung and therefore needs that width; the Newton
+loop and the unauthenticated derivative control use the nominal step directly,
+and must not start failing on a policy that has always been usable for them.
+"""
 function validated_frequency_step(
     ::Type{T}, request
 ) where {T<:AbstractFloat}
-    nominal_step, _, _ = validated_frequency_steps(T, request)
-    return nominal_step
+    nominal_step = parse_real(T, request, "frequency_step")
+    isfinite(nominal_step) && nominal_step > zero(T) &&
+        return nominal_step
+    throw(numerical_control_failure(
+        request,
+        "ALGEBRAIC_REPRESENTATION_SINGULAR",
+        "finite-difference frequency step must be finite and positive",
+        Dict{String,Any}(
+            "reason" => "INVALID_FREQUENCY_STEP",
+            "range_status" => "invalid-frequency-step/v1",
+            "operation" => "finite-difference-request-policy/v1",
+            "axis" => "request-policy",
+            "h" => string(nominal_step),
+            "frequency_step" => string(nominal_step),
+        );
+        retryable=false,
+    ))
 end
 
 """

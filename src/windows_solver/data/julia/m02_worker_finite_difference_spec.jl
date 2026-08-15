@@ -75,9 +75,29 @@ end
     @test minimum_step <= nominal <= maximum_step
     rungs = frequency_step_rungs(nominal, minimum_step, maximum_step)
     @test all(isfinite, rungs)
-    @test all(step -> minimum_step <= step <= maximum_step, rungs)
     @test length(rungs) == length(unique(rungs))
     @test length(rungs) <= MAXIMUM_FREQUENCY_STEP_RUNGS
+
+    # Every rung evaluates h/2, h and 2h, and reports h/2 as the accepted step.
+    # Bounding h alone would let the finest sample fall below the configured
+    # minimum and the coarsest rise above the configured maximum, so the range
+    # actually evaluated would not be the range that was configured. Assert the
+    # samples, not just the rung.
+    for step in rungs
+        @test minimum_step <= step / 2 <= maximum_step
+        @test minimum_step <= step <= maximum_step
+        @test minimum_step <= 2 * step <= maximum_step
+    end
+
+    # The accepted step reported by the ladder is h/2 and must also be inside
+    # policy for whichever rung is selected.
+    finest, coarsest = admissible_frequency_step_interval(
+        minimum_step, maximum_step
+    )
+    @test all(step -> finest <= step <= coarsest, rungs)
+    @test minimum(rungs) / 2 >= minimum_step
+    @test 2 * maximum(rungs) <= maximum_step
+
     for invalid in ("0", "-1", "Inf", "NaN")
         @test_throws NumericalControlFailure validated_frequency_steps(
             Float64,
@@ -91,6 +111,38 @@ end
             frequency_step_minimum="1e-6",
         ),
     )
+    # A range narrower than a factor of four cannot hold any admissible rung,
+    # so it is rejected at policy validation rather than deep in the search.
+    @test_throws NumericalControlFailure validated_frequency_steps(
+        Float64,
+        finite_difference_control_request(
+            frequency_step="1e-6",
+            frequency_step_minimum="1e-6",
+            frequency_step_maximum="2e-6",
+        ),
+    )
+end
+
+@testset "rung anchoring keeps a boundary nominal step admissible" begin
+    # A nominal step sitting on the policy boundary would sample 2h outside the
+    # maximum. The anchor moves inside the admissible interval instead, and the
+    # samples stay in range.
+    request = finite_difference_control_request(
+        frequency_step="1e-3",
+        frequency_step_minimum="1e-9",
+        frequency_step_maximum="1e-3",
+    )
+    nominal, minimum_step, maximum_step = validated_frequency_steps(
+        Float64, request
+    )
+    @test nominal == maximum_step
+    rungs = frequency_step_rungs(nominal, minimum_step, maximum_step)
+    @test !isempty(rungs)
+    for step in rungs
+        @test minimum_step <= step / 2
+        @test 2 * step <= maximum_step
+    end
+    @test maximum(rungs) <= maximum_step / 2
 end
 
 @testset "determinant ranking includes absolute numerical error" begin
