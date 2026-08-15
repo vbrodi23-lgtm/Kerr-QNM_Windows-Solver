@@ -354,7 +354,16 @@ def valid_root_authentication(mechanism_id: str) -> dict[str, object]:
             else None
         ),
         "residual_upper_bound_abs": "2.4E-60",
-        "derivative_estimate": {"real": "2.5", "imaginary": "0"},
+        "derivative_estimate": {
+            # The horizon estimate exceeds the lower bound by exactly the
+            # 1E-54 propagated error plus 2E-54 step disagreement below.
+            "real": (
+                "2.400000000000000000000000000000000000000000000000000003"
+                if horizon
+                else "2.4"
+            ),
+            "imaginary": "0",
+        },
         "derivative_propagated_error_abs": "1E-54" if horizon else "0",
         "derivative_step_disagreement_abs": "2E-54",
         "derivative_lower_bound_abs": "2.4",
@@ -393,7 +402,11 @@ def valid_julia_root_response(
         "working_precision_bits": request["working_precision_bits"],
         "root_omega_re": omega["real"],
         "root_omega_im": omega["imaginary"],
-        "root_residual_abs": "1E-60",
+        "root_residual_abs": (
+            "1E-60"
+            if request["mechanism_id"] == "horizon-admittance"
+            else "2.4E-60"
+        ),
         "raw_determinant_abs": (
             "6.75E+220"
             if request["mechanism_id"] == "horizon-admittance"
@@ -404,7 +417,11 @@ def valid_julia_root_response(
             if request["mechanism_id"] == "horizon-admittance"
             else "not-applicable/v1"
         ),
-        "root_derivative_abs": "2.5",
+        "root_derivative_abs": (
+            "2.400000000000000000000000000000000000000000000000000003"
+            if request["mechanism_id"] == "horizon-admittance"
+            else "2.4"
+        ),
         "root_authentication": valid_root_authentication(
             request["mechanism_id"]
         ),

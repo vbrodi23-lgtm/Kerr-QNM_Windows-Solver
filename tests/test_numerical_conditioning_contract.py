@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import copy
 from dataclasses import replace
-from decimal import Decimal
+from decimal import Decimal, localcontext
 import hashlib
 import math
 import unittest
@@ -1098,7 +1098,9 @@ class JuliaSchemaThreeConditioningTests(unittest.TestCase):
             readout.numerical_conditioning.to_mapping(),
             valid_numerical_conditioning("exterior-light-ring"),
         )
-        self.assertEqual(readout.normalised_determinant_abs, Decimal("1E-60"))
+        self.assertEqual(
+            readout.normalised_determinant_abs, Decimal("2.4E-60")
+        )
         self.assertIsNone(readout.raw_determinant_abs)
         self.assertEqual(
             readout.raw_determinant_evidence_status,
@@ -1142,6 +1144,18 @@ class JuliaSchemaThreeConditioningTests(unittest.TestCase):
         def exact_magnitudes(response):
             response["root_residual_abs"] = normalised
             response["raw_determinant_abs"] = raw
+            authentication = dict(response["root_authentication"])
+            authentication["central_determinant"] = {
+                "real": normalised,
+                "imaginary": "0",
+            }
+            with localcontext() as context:
+                context.prec = 180
+                residual_upper = Decimal(normalised) + Decimal("1.4E-60")
+                correction_upper = residual_upper / Decimal("2.4")
+            authentication["residual_upper_bound_abs"] = str(residual_upper)
+            authentication["correction_upper_bound"] = str(correction_upper)
+            response["root_authentication"] = authentication
 
         readout = self._backend(self.Adapter(exact_magnitudes)).read_root(
             self._job(), 0.0j

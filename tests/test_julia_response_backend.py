@@ -469,6 +469,12 @@ class JuliaResponseBackendTests(unittest.TestCase):
                 authentication = dict(response["root_authentication"])
                 authentication["error_breakdown"] = None
                 authentication["error_model_id"] = None
+                authentication["central_determinant"] = {
+                    "real": "2.4E-60",
+                    "imaginary": "0",
+                }
+                authentication["residual_upper_bound_abs"] = "2.4E-60"
+                authentication["correction_upper_bound"] = "1E-60"
                 response["root_authentication"] = authentication
                 return response
 
@@ -521,6 +527,122 @@ class JuliaResponseBackendTests(unittest.TestCase):
                 with self.assertRaises(JuliaResponseBackendError):
                     backend.read_root(_deep_job(), 0.0j)
 
+    def test_backend_rejects_arithmetically_inconsistent_root_authentication(self):
+        """Catches a certificate whose conclusion does not follow from its terms."""
+
+        for field, replacement in (
+            ("residual_upper_bound_abs", "9E-60"),
+            ("derivative_lower_bound_abs", "2.3"),
+            ("correction_upper_bound", "1E-100"),
+        ):
+            with self.subTest(field=field):
+                class InconsistentAdapter(FakeAdapter):
+                    def evaluate(self, request):
+                        response = super().evaluate(request)
+                        authentication = dict(response["root_authentication"])
+                        authentication[field] = replacement
+                        response["root_authentication"] = authentication
+                        return response
+
+                backend = JuliaPrecisionRootBackend(
+                    VettedNativeDeterminantKernel.identity,
+                    InconsistentAdapter(),
+                    80,
+                )
+                with self.assertRaisesRegex(
+                    JuliaResponseBackendError, "root authentication evidence"
+                ):
+                    backend.read_root(
+                        _job_for_mechanism("horizon-admittance"), 0.0j
+                    )
+
+    def test_backend_binds_authentication_to_response_and_policy(self):
+        """Catches a coherent certificate attached to the wrong result or model."""
+
+        def changed_central(response):
+            authentication = dict(response["root_authentication"])
+            authentication["central_determinant"] = {
+                "real": "2E-60",
+                "imaginary": "0",
+            }
+            authentication["residual_upper_bound_abs"] = "3.4E-60"
+            authentication["correction_upper_bound"] = str(
+                Decimal("3.4E-60") / Decimal("2.4")
+            )
+            response["root_authentication"] = authentication
+
+        def changed_derivative(response):
+            authentication = dict(response["root_authentication"])
+            authentication["derivative_estimate"] = {
+                "real": (
+                    "3.000000000000000000000000000000000000000000000000000003"
+                ),
+                "imaginary": "0",
+            }
+            authentication["derivative_lower_bound_abs"] = "3"
+            authentication["correction_upper_bound"] = "8E-61"
+            response["root_authentication"] = authentication
+
+        def changed_model(response):
+            authentication = dict(response["root_authentication"])
+            authentication["error_model_id"] = "unrecognised-model/v999"
+            response["root_authentication"] = authentication
+
+        for description, mutate in (
+            ("central determinant", changed_central),
+            ("derivative", changed_derivative),
+            ("error model", changed_model),
+        ):
+            with self.subTest(description=description):
+                class DetachedAdapter(FakeAdapter):
+                    def evaluate(self, request):
+                        response = super().evaluate(request)
+                        mutate(response)
+                        return response
+
+                backend = JuliaPrecisionRootBackend(
+                    VettedNativeDeterminantKernel.identity,
+                    DetachedAdapter(),
+                    80,
+                )
+                with self.assertRaises(JuliaResponseBackendError):
+                    backend.read_root(
+                        _job_for_mechanism("horizon-admittance"), 0.0j
+                    )
+
+    def test_backend_rejects_converged_root_above_declared_correction_target(self):
+        """Catches a coherent large correction being labelled as solved."""
+
+        class FalseSolvedAdapter(FakeAdapter):
+            def evaluate(self, request):
+                response = super().evaluate(request)
+                authentication = dict(response["root_authentication"])
+                authentication["central_determinant"] = {
+                    "real": "1E-10",
+                    "imaginary": "0",
+                }
+                with localcontext() as context:
+                    context.prec = 180
+                    residual_upper = Decimal("1E-10") + Decimal("1.4E-60")
+                    correction_upper = residual_upper / Decimal("2.4")
+                authentication["residual_upper_bound_abs"] = str(
+                    residual_upper
+                )
+                authentication["correction_upper_bound"] = str(correction_upper)
+                response["root_authentication"] = authentication
+                response["root_residual_abs"] = "1E-10"
+                return response
+
+        backend = JuliaPrecisionRootBackend(
+            VettedNativeDeterminantKernel.identity,
+            FalseSolvedAdapter(),
+            80,
+        )
+        with self.assertRaisesRegex(
+            JuliaResponseBackendError, "correction target"
+        ):
+            backend.read_root(_job_for_mechanism("horizon-admittance"), 0.0j)
+
     def test_non_converged_response_still_carries_authentication(self):
         class NonconvergedAdapter(FakeAdapter):
             def evaluate(self, request):
@@ -528,7 +650,6 @@ class JuliaResponseBackendTests(unittest.TestCase):
                 response.update({
                     "root_converged": False,
                     "root_displacement_abs": "0",
-                    "root_residual_abs": "5e-11",
                     "truncation_radius_abs": None,
                     "resolution_radius_abs": None,
                     "seed_path_radius_abs": None,
@@ -1428,7 +1549,6 @@ class JuliaResponseBackendTests(unittest.TestCase):
                     "root_omega_re": request["omega"]["real"],
                     "root_omega_im": request["omega"]["imaginary"],
                     "root_displacement_abs": "0",
-                    "root_residual_abs": "5e-11",
                     "root_converged": False,
                 })
                 return response

@@ -1040,6 +1040,8 @@ class DiagnosticRootReadout:
 # past the tolerance below, cheap enough to run on every parsed receipt.
 _ERROR_BUDGET_CHECK_DIGITS = 60
 _ERROR_BUDGET_AGGREGATE_TOLERANCE = Decimal("1e-40")
+_ROOT_AUTHENTICATION_CHECK_DIGITS = 180
+_ROOT_AUTHENTICATION_RELATIVE_TOLERANCE = Decimal("1e-50")
 
 _DETERMINANT_ERROR_BREAKDOWN_FIELDS = frozenset({
     "endpoint_disagreement_abs",
@@ -1302,6 +1304,119 @@ class RootAuthenticationEvidence:
             )
         if self.error_model_id is not None and not self.error_model_id:
             raise ValueError("root authentication error model identity is empty")
+        self._check_decision_arithmetic()
+
+    @staticmethod
+    def _relation_matches(
+        actual: Decimal,
+        expected: Decimal,
+        *source_terms: Decimal,
+    ) -> bool:
+        """Compare a reported bound with its derivation at worker precision.
+
+        The worker computes in binary floating point and serialises each term
+        separately, so recomputing from decimal text cannot require bitwise
+        equality.  The scale includes the source terms because a lower bound
+        may be small after subtracting two O(1) quantities; comparing only to
+        the small result would reject an honest final-bit serialization
+        difference.
+        """
+
+        scale = max((abs(actual), abs(expected), *(abs(v) for v in source_terms)))
+        if scale == 0:
+            return actual == expected
+        return abs(actual - expected) <= (
+            _ROOT_AUTHENTICATION_RELATIVE_TOLERANCE * scale
+        )
+
+    def _check_decision_arithmetic(self) -> None:
+        """Reject a certificate whose acceptance result is not derivable."""
+
+        with localcontext() as context:
+            context.prec = _ROOT_AUTHENTICATION_CHECK_DIGITS
+            determinant_abs = self.central_determinant.magnitude()
+            determinant_error_abs = (
+                Decimal(0)
+                if self.error_breakdown is None
+                else self.error_breakdown.numerical_error_abs
+            )
+            expected_residual = determinant_abs + determinant_error_abs
+            if not self._relation_matches(
+                self.residual_upper_bound_abs,
+                expected_residual,
+                determinant_abs,
+                determinant_error_abs,
+            ):
+                raise ValueError(
+                    "root authentication residual upper bound is inconsistent"
+                )
+
+            derivative_abs = self.derivative_estimate.magnitude()
+            expected_derivative_lower = (
+                derivative_abs
+                - self.derivative_step_disagreement_abs
+                - self.derivative_propagated_error_abs
+            )
+            if not self._relation_matches(
+                self.derivative_lower_bound_abs,
+                expected_derivative_lower,
+                derivative_abs,
+                self.derivative_step_disagreement_abs,
+                self.derivative_propagated_error_abs,
+            ):
+                raise ValueError(
+                    "root authentication derivative lower bound is inconsistent"
+                )
+
+            expected_correction = (
+                self.residual_upper_bound_abs
+                / self.derivative_lower_bound_abs
+            )
+            if not self._relation_matches(
+                self.correction_upper_bound,
+                expected_correction,
+            ):
+                raise ValueError(
+                    "root authentication correction upper bound is inconsistent"
+                )
+
+    def validate_binding(
+        self,
+        *,
+        determinant_abs: Decimal,
+        derivative_abs: Decimal,
+        expected_error_model_id: str | None,
+    ) -> None:
+        """Bind this certificate to the scalar result and mechanism policy."""
+
+        if type(determinant_abs) is not Decimal or not determinant_abs.is_finite():
+            raise ValueError("root authentication determinant binding is invalid")
+        if type(derivative_abs) is not Decimal or not derivative_abs.is_finite():
+            raise ValueError("root authentication derivative binding is invalid")
+        if determinant_abs < 0 or derivative_abs <= 0:
+            raise ValueError("root authentication scalar binding is invalid")
+        if self.error_model_id != expected_error_model_id:
+            raise ValueError("root authentication error model identity is inconsistent")
+        with localcontext() as context:
+            context.prec = _ROOT_AUTHENTICATION_CHECK_DIGITS
+            certificate_determinant_abs = self.central_determinant.magnitude()
+            if not self._relation_matches(
+                certificate_determinant_abs,
+                determinant_abs,
+                determinant_abs,
+            ):
+                raise ValueError(
+                    "root authentication central determinant is inconsistent"
+                )
+            certificate_derivative_abs = self.derivative_estimate.magnitude()
+            if not self._relation_matches(
+                certificate_derivative_abs,
+                derivative_abs,
+                derivative_abs,
+            ):
+                raise ValueError(
+                    "root authentication derivative estimate is inconsistent"
+                )
 
     @classmethod
     def from_mapping(cls, value: object) -> "RootAuthenticationEvidence":

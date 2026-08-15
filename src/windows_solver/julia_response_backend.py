@@ -2135,6 +2135,42 @@ class JuliaPrecisionRootBackend:
             "root_residual_abs",
             nonnegative=True,
         )
+        root_derivative_abs_decimal = _finite_decimal_text(
+            response["root_derivative_abs"],
+            "root_derivative_abs",
+            nonnegative=True,
+        )
+        if root_derivative_abs_decimal <= 0:
+            raise JuliaResponseBackendError(
+                "M02 Julia root derivative magnitude is invalid"
+            )
+        expected_error_model_id = (
+            policy.get("determinant_error_model")
+            if horizon_family
+            else None
+        )
+        try:
+            root_authentication.validate_binding(
+                determinant_abs=normalised_determinant_abs,
+                derivative_abs=root_derivative_abs_decimal,
+                expected_error_model_id=expected_error_model_id,
+            )
+        except ValueError as error:
+            raise JuliaResponseBackendError(
+                "M02 Julia root authentication evidence is inconsistent"
+            ) from error
+        root_correction_tolerance = _finite_decimal_text(
+            policy.get("root_correction_tolerance"),
+            "root_correction_tolerance",
+            nonnegative=True,
+        )
+        if converged and (
+            root_authentication.correction_upper_bound
+            > root_correction_tolerance
+        ):
+            raise JuliaResponseBackendError(
+                "M02 Julia converged root exceeds its correction target"
+            )
         raw_determinant_abs = (
             None
             if response["raw_determinant_abs"] is None
