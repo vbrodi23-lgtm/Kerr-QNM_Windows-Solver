@@ -17,6 +17,14 @@ const PROGRESS_PREFIX = "@@KERR_QNM_PROGRESS@@"
 const PROGRESS_SCHEMA = "windows-solver.progress/1"
 const CONDITIONING_SCHEMA = "windows-solver.m02-conditioning/3"
 const HOMOGENEOUS_REPRESENTATION_ID = "factored-plane-wave-gsn/v1"
+# The horizon determinant no longer propagates one solution through a mixed
+# match-to-inner leg; it builds an actual solution basis from three independent
+# legs, so it carries its own representation identity.
+const HORIZON_HOMOGENEOUS_REPRESENTATION_ID =
+    "factored-three-leg-horizon-basis-at-match-gsn/v1"
+const REAL_INNER_HORIZON_CONTOUR_ID = "real-inner-tortoise-contour/v1"
+const HORIZON_BASIS_AT_MATCH_EXTRACTION_ID =
+    "scaled-horizon-basis-at-match/v1"
 const FACTORED_HOMOGENEOUS_ODE_SCOPE_ID =
     "factored-homogeneous-gsn/v1"
 const ASYMPTOTIC_SERIES_EVALUATION_ID =
@@ -624,12 +632,36 @@ function flatten_request(document)
         "readout_radius" => required(policy, "readout_radius"),
         "ode_relative_tolerance" => required(policy, "ode_relative_tolerance"),
         "ode_absolute_tolerance" => required(policy, "ode_absolute_tolerance"),
+        "homogeneous_ode_relative_tolerance" => required(
+            policy, "homogeneous_ode_relative_tolerance"
+        ),
+        "homogeneous_ode_absolute_tolerance" => required(
+            policy, "homogeneous_ode_absolute_tolerance"
+        ),
+        "coordinate_ode_relative_tolerance" => required(
+            policy, "coordinate_ode_relative_tolerance"
+        ),
+        "coordinate_ode_absolute_tolerance" => required(
+            policy, "coordinate_ode_absolute_tolerance"
+        ),
         "endpoint_series_order" => required(policy, "endpoint_series_order"),
         "support_subinterval_count" => required(policy, "support_subinterval_count"),
         "angular_pad" => required(policy, "angular_pad"),
         "rho_in" => required(policy, "rho_in"),
         "rho_out" => required(policy, "rho_out"),
+        "horizon_rho_inner_min" => required(policy, "horizon_rho_inner_min"),
+        "horizon_endpoint_rho_candidates" => required(
+            policy, "horizon_endpoint_rho_candidates"
+        ),
+        "horizon_maximum_endpoint_distance" => required(
+            policy, "horizon_maximum_endpoint_distance"
+        ),
+        "determinant_error_safety_factor" => required(
+            policy, "determinant_error_safety_factor"
+        ),
         "frequency_step" => required(policy, "frequency_step"),
+        "frequency_step_minimum" => required(policy, "frequency_step_minimum"),
+        "frequency_step_maximum" => required(policy, "frequency_step_maximum"),
         "root_correction_tolerance" => required(
             policy, "root_correction_tolerance"
         ),
@@ -658,6 +690,15 @@ function flatten_request(document)
         "homogeneous_leg_wall_clock_seconds" => required(
             execution_resource, "homogeneous_leg_wall_clock_seconds"
         ),
+        "coordinate_stall_rhs_threshold" => required(
+            execution_resource, "coordinate_stall_rhs_threshold"
+        ),
+        "coordinate_stall_minimum_span_fraction" => required(
+            execution_resource, "coordinate_stall_minimum_span_fraction"
+        ),
+        "coordinate_stall_minimum_step_fraction" => required(
+            execution_resource, "coordinate_stall_minimum_step_fraction"
+        ),
     )
     for key in (
         "homogeneous_representation",
@@ -681,6 +722,8 @@ function flatten_request(document)
         "scattering_column_convention",
         "determinant_convention",
         "determinant_normalisation",
+        "horizon_contour",
+        "determinant_error_model",
     )
         flattened[key] = required(policy, key)
     end
@@ -1333,6 +1376,20 @@ function emit_coordinate_identity(
     )
 end
 
+"""
+    endpoint_regularity(preparation)
+
+Return the remainder-regularity evidence for an endpoint preparation.
+
+Series-seeded preparations carry it under their initial condition; real-inner
+horizon endpoints are built from an explicit-tangent carrier rather than a
+`FactoredInitialCondition`, so they carry it directly.
+"""
+endpoint_regularity(preparation::CF.FactoredEndpointPreparation) =
+    preparation.initial_condition.regularity
+endpoint_regularity(endpoint::CF.RealInnerHorizonEndpoint) =
+    endpoint.regularity
+
 function endpoint_conditioning_summary(preparations...)
     isempty(preparations) && error("at least one endpoint preparation is required")
     maximum_series_digits_lost = maximum(
@@ -1356,14 +1413,14 @@ function endpoint_conditioning_summary(preparations...)
         for preparation in preparations
     )
     endpoint_remainders_regular = all(
-        preparation.initial_condition.regularity.finite
+        endpoint_regularity(preparation).finite
         for preparation in preparations
     )
     maximum_endpoint_reconstruction_error = maximum(
         max(
-            preparation.initial_condition.regularity.relative_X_reconstruction_error,
-            preparation.initial_condition.regularity.relative_Xrho_reconstruction_error,
-            preparation.initial_condition.regularity.Xrho_backward_residual,
+            endpoint_regularity(preparation).relative_X_reconstruction_error,
+            endpoint_regularity(preparation).relative_Xrho_reconstruction_error,
+            endpoint_regularity(preparation).Xrho_backward_residual,
         )
         for preparation in preparations
     )
@@ -1576,6 +1633,8 @@ function translate_numerical_control_failure(
             "FACTORED_PROPAGATION_PRECISION_MISMATCH",
             "NONFINITE_FACTORED_PROPAGATION_DATA",
             "FACTORED_ODE_FAILURE",
+            "NO_VERIFIED_HORIZON_ENDPOINT",
+            "COORDINATE_INVERSION_STALLED",
         )
         recognized || return failure
         diagnostics = Dict{String,Any}(
@@ -1807,88 +1866,77 @@ function integrate_real_branch(
     )
 end
 
-function evaluate_horizon_determinant(
+"""
+    evaluate_horizon_chart(T, request, spectral, amplitude, xup_match,
+                           outer_contour, inner_contour, basis_solution, role)
+
+Extract Cref/Cinc at the matching point from one verified horizon basis and
+evaluate the reflectivity chart.
+
+`xup_match` is the infinity-outgoing solution already propagated to `rho = 0`;
+it is reconstructed to a physical `(X, dX/dr_*)` pair and re-factored into the
+horizon-ingoing carrier so that all three solutions are expressed in one
+carrier before the 2x2 solve. The two horizon columns come from independent
+homogeneous legs seeded at a verified real-inner endpoint, so they form an
+actual solution basis rather than one solution carried into horizon
+coordinates.
+"""
+function evaluate_horizon_chart(
     ::Type{T},
     request,
-    context::DeterminantRequestContext{T},
-    omega::Complex{T},
+    spectral::CF.HomogeneousSpectralContext{T},
     amplitude::Complex{T},
+    xup_match::CF.FactoredODESolution{T},
+    outer_contour,
+    inner_contour::CF.RealInnerHorizonContour{T},
+    basis_solution::CF.VerifiedHorizonBasisSolution{T},
+    role::String,
 ) where {T<:AbstractFloat}
-    readout = parse_real(T, request, "readout_radius")
-    spectral = build_sample_spectral_context(T, request, omega, context)
-    contour = build_worker_contour_context(
-        T, request, spectral, readout, "Xup"
+    outer_raw = reconstruct_state(
+        xup_match.endpoint, xup_match.carrier, zero(T)
     )
-    required_digits = required_reliable_digits(T, request)
-    preparations = CF.prepare_factored_horizon_determinant_branches(
-        spectral, contour, required_digits
+    # The infinity leg stores dX/drho along its own contour; convert back to
+    # the tortoise derivative before re-factoring against the horizon tangent.
+    outer_dX_drstar = outer_raw.Xrho / outer_contour.infinity_tangent
+    ingoing = basis_solution.ingoing
+    outgoing = basis_solution.outgoing
+    target = factor_physical_match_state(
+        outer_raw.X,
+        outer_dX_drstar,
+        ingoing.carrier,
+        inner_contour.tangent,
     )
-    for preparation in (
-        preparations.infinity_outgoing,
-        preparations.horizon_ingoing,
-        preparations.horizon_outgoing,
+    basis = Solutions.build_match_horizon_basis(
+        ingoing.endpoint,
+        ingoing.carrier,
+        outgoing.endpoint,
+        outgoing.carrier,
+        Complex{T}(inner_contour.match_radius),
+        spectral.precision_bits,
     )
-        emit_asymptotic_preparation(preparation)
-    end
-    factored_homogeneous_rhs_counter = Ref(0)
-    observation_factory = (leg, tspan, algorithm) ->
-        ode_observation_factory(request, leg, tspan, algorithm)
-    propagation = progress_operation("Xup") do
-        CF.solve_factored_xup_scattering_endpoint(
-            spectral,
-            contour,
-            preparations;
-            odealgo=AutoVern9(Rosenbrock23(autodiff=false)),
-            reltol=parse_real(T, request, "ode_relative_tolerance"),
-            abstol=parse_real(T, request, "ode_absolute_tolerance"),
-            ode_maxiters=parse_integer(request, "homogeneous_ode_maxiters"),
-            ode_observation_factory=observation_factory,
-            ode_solution_observer=observe_ode_solution,
-            ode_exception_passthrough=error ->
-                error isa ODEResourceLimit || error isa ODESolverFailure,
-            factored_homogeneous_rhs_counter=
-                factored_homogeneous_rhs_counter,
-        )
-    end
-    emit_factored_solution(propagation.infinity_outer_to_match)
-    emit_factored_solution(propagation.horizon_match_to_inner)
-    transition_diagnostics = propagation.carrier_transition.diagnostics
-    transition_error = max(
-        transition_diagnostics.X_reconstruction_error,
-        transition_diagnostics.Xrho_reconstruction_error,
-    )
-    progress_emit("carrier_changed"; payload=Dict(
-        "source_carrier" =>
-            string(propagation.carrier_transition.source_carrier.kind),
-        "target_carrier" =>
-            string(propagation.carrier_transition.target_carrier.kind),
-        "X_reconstruction_error" =>
-            string(transition_diagnostics.X_reconstruction_error),
-        "Xrho_reconstruction_error" =>
-            string(transition_diagnostics.Xrho_reconstruction_error),
-    ))
-
-    basis = Solutions.build_common_horizon_basis(
-        preparations.horizon_ingoing.initial_condition,
-        preparations.horizon_outgoing.initial_condition,
-    )
-    coefficients = Solutions.solve_scaled_factored_scattering(
-        propagation.horizon_match_to_inner.endpoint,
-        propagation.horizon_match_to_inner.carrier,
-        basis,
+    coefficients = Solutions.solve_scaled_horizon_basis_at_match(
+        target, ingoing.carrier, basis
     )
     coefficient_diagnostics = coefficients.diagnostics
-    coefficient_diagnostics.extraction_id == SCATTERING_EXTRACTION_ID ||
-        error("package scattering extraction identity changed")
+    coefficient_diagnostics.extraction_id ==
+        HORIZON_BASIS_AT_MATCH_EXTRACTION_ID ||
+        error("package horizon match-basis extraction identity changed")
     coefficient_diagnostics.column_convention ==
         SCATTERING_COLUMN_CONVENTION_ID ||
         error("package scattering column convention changed")
     coefficient_diagnostics.factored_state_convention ==
         FACTORED_REMAINDER_STATE_CONVENTION_ID ||
         error("package factored scattering state convention changed")
+    cref_abs = abs(coefficients.Cref)
+    cinc_abs = abs(coefficients.Cinc)
+    cref_fraction = cref_abs / max(hypot(cref_abs, cinc_abs), floatmin(T))
     progress_emit("scattering_coefficients_extracted"; payload=Dict(
+        "basis_role" => role,
+        "endpoint_rho" => string(basis_solution.rho_endpoint),
+        "horizon_distance" => string(basis_solution.horizon_distance),
         "Cref" => progress_complex(coefficients.Cref),
         "Cinc" => progress_complex(coefficients.Cinc),
+        "cref_fraction" => string(cref_fraction),
         "basis_condition" =>
             string(coefficient_diagnostics.condition_frobenius),
         "basis_backward_error" =>
@@ -1896,10 +1944,61 @@ function evaluate_horizon_determinant(
         "matching_reconstruction_residual" => string(
             coefficient_diagnostics.matching_reconstruction_residual
         ),
+        "scaled_basis_determinant_abs" => string(
+            coefficient_diagnostics.scaled_basis_determinant_abs
+        ),
         "column_norm_1" => string(coefficient_diagnostics.column_norm_1),
         "column_norm_2" => string(coefficient_diagnostics.column_norm_2),
+        "carrier_change_error" =>
+            string(coefficient_diagnostics.carrier_change_error),
     ))
+    chart = evaluate_horizon_reflectivity_chart(
+        T, request, spectral, amplitude, coefficients, basis_solution
+    )
+    return (
+        value=chart.value,
+        assessment=chart.assessment,
+        coefficients=coefficients,
+        coefficient_diagnostics=coefficient_diagnostics,
+        cref_fraction=cref_fraction,
+        basis_solution=basis_solution,
+        role=role,
+    )
+end
 
+"""
+    estimate_horizon_determinant_error(T, request, reference, verification)
+
+Bound the absolute determinant error from the reference/verification endpoint
+disagreement.
+
+The bound is `safety_factor * |D_ref - D_ver|`, an absolute quantity. It is
+deliberately *not* divided by |D|: near a QNM the determinant is small by
+construction, so a relative measure would report catastrophic error exactly
+where the answer is best. The endpoint term is one contribution; the root
+authentication path folds in control, equivalence, and cross-precision terms.
+"""
+function estimate_horizon_determinant_error(
+    ::Type{T}, request, reference_value::Complex{T},
+    verification_value::Complex{T},
+) where {T<:AbstractFloat}
+    safety_factor = parse_real(T, request, "determinant_error_safety_factor")
+    safety_factor > zero(T) ||
+        error("determinant error safety factor must be positive")
+    endpoint_disagreement = abs(reference_value - verification_value)
+    isfinite(endpoint_disagreement) ||
+        error("horizon determinant endpoint disagreement is nonfinite")
+    return safety_factor * endpoint_disagreement
+end
+
+function evaluate_horizon_reflectivity_chart(
+    ::Type{T},
+    request,
+    spectral::CF.HomogeneousSpectralContext{T},
+    amplitude::Complex{T},
+    coefficients,
+    basis_solution,
+) where {T<:AbstractFloat}
     chart_denominator = T(2) * im * spectral.p_horizon - amplitude
     chart_scale = max(T(2) * abs(spectral.p_horizon), abs(amplitude))
     if iszero(chart_denominator)
@@ -1928,18 +2027,17 @@ function evaluate_horizon_determinant(
         )
     )
     reflectivity = amplitude / (T(2) * im * spectral.p_horizon - amplitude)
-    endpoint_summary = endpoint_conditioning_summary(
-        preparations.infinity_outgoing,
-        preparations.horizon_ingoing,
-        preparations.horizon_outgoing,
+    series_spread = max(
+        basis_solution.ingoing_endpoint.assessment.maximum_series_evaluation_spread,
+        basis_solution.outgoing_endpoint.assessment.maximum_series_evaluation_spread,
     )
     coefficient_scale = max(
         abs(coefficients.Cref), abs(coefficients.Cinc), floatmin(T)
     )
     chart_inputs = Solutions.ScatteringChartErrorInputs{T}(
         coefficient_scale,
-        endpoint_summary.maximum_series_evaluation_spread,
-        parse_real(T, request, "ode_relative_tolerance"),
+        series_spread,
+        parse_real(T, request, "homogeneous_ode_relative_tolerance"),
     )
     chart = Solutions.evaluate_normalised_horizon_determinant(
         coefficients, reflectivity, chart_inputs
@@ -1948,7 +2046,8 @@ function evaluate_horizon_determinant(
     for (field, expected) in (
         (:homogeneous_representation, HOMOGENEOUS_REPRESENTATION_ID),
         (:branch_convention, BRANCH_CONVENTION_ID),
-        (:scattering_coefficient_extraction, SCATTERING_EXTRACTION_ID),
+        (:scattering_coefficient_extraction,
+            HORIZON_BASIS_AT_MATCH_EXTRACTION_ID),
         (:scattering_column_convention,
             SCATTERING_COLUMN_CONVENTION_ID),
         (:radial_derivative_convention,
@@ -1965,35 +2064,8 @@ function evaluate_horizon_determinant(
             "package horizon chart $(String(field)) identity changed"
         )
     end
-    normalised_determinant_abs =
-        chart_assessment.normalised_determinant_abs
-    normalised_determinant_abs === nothing &&
+    chart_assessment.normalised_determinant_abs === nothing &&
         error("safe horizon chart omitted its normalised determinant")
-    carrier_change_error = max(
-        transition_error, coefficient_diagnostics.carrier_change_error
-    )
-    diagnostics = DeterminantDiagnostics{T}(
-        HOMOGENEOUS_REPRESENTATION_ID,
-        HORIZON_DETERMINANT_FAMILY_ID,
-        true,
-        endpoint_summary.maximum_series_digits_lost,
-        endpoint_summary.maximum_recurrence_digits_lost,
-        endpoint_summary.maximum_series_evaluation_spread,
-        endpoint_summary.maximum_last_term_ratio,
-        endpoint_summary.minimum_asymptotic_predicted_reliable_digits,
-        coefficient_diagnostics.condition_frobenius,
-        coefficient_diagnostics.backward_error,
-        coefficient_diagnostics.matching_reconstruction_residual,
-        endpoint_summary.endpoint_remainders_regular,
-        endpoint_summary.maximum_endpoint_reconstruction_error,
-        chart_assessment.raw_determinant_abs,
-        chart_assessment.raw_determinant_evidence_status,
-        normalised_determinant_abs,
-        chart_assessment.cref_chart_margin,
-        carrier_change_error,
-        spectral.contour_deformation.maximum_absolute,
-    )
-    record_determinant!(context.conditioning, diagnostics)
     progress_emit("horizon_chart_evaluated"; payload=Dict(
         "Cinc_abs" => string(chart_assessment.cinc_abs),
         "Cref_abs" => string(chart_assessment.cref_abs),
@@ -2004,20 +2076,252 @@ function evaluate_horizon_determinant(
         "raw_determinant_evidence_status" =>
             chart_assessment.raw_determinant_evidence_status,
         "normalised_determinant_abs" =>
-            string(normalised_determinant_abs),
+            string(chart_assessment.normalised_determinant_abs),
         "cref_chart_margin" =>
             string(chart_assessment.cref_chart_margin),
+        "raw_normalised_equivalence_error" =>
+            chart_assessment.raw_normalised_equivalence_error === nothing ?
+                nothing :
+                string(chart_assessment.raw_normalised_equivalence_error),
     ))
+    return (value=chart.value, assessment=chart_assessment)
+end
+
+"""
+    evaluate_horizon_determinant(T, request, context, omega, amplitude)
+
+Evaluate the horizon determinant on the three-leg verified horizon-basis graph.
+
+    infinity outgoing:  outer endpoint  -> match
+    horizon ingoing:    real-inner endpoint -> match
+    horizon outgoing:   real-inner endpoint -> match
+
+The two horizon legs are independent homogeneous solutions seeded from their
+own expansions at a verified real-inner endpoint, so at the matching point they
+form an actual solution basis. That replaces the previous mixed leg, which
+carried the propagated infinity solution from the match point down to the inner
+endpoint in horizon coordinates and cost ~1.96M RHS evaluations against 10,820
+for the horizon pair.
+
+Both horizon legs are repeated from the verification endpoint. The outer leg is
+computed once and reused, since it does not depend on the horizon endpoint. The
+disagreement between the two determinant values is the endpoint contribution to
+the absolute determinant error.
+"""
+function evaluate_horizon_determinant(
+    ::Type{T},
+    request,
+    context::DeterminantRequestContext{T},
+    omega::Complex{T},
+    amplitude::Complex{T},
+) where {T<:AbstractFloat}
+    readout = parse_real(T, request, "readout_radius")
+    spectral = build_sample_spectral_context(T, request, omega, context)
+    required_digits = required_reliable_digits(T, request)
+    factored_homogeneous_rhs_counter = Ref(0)
+    observation_factory = (leg, tspan, algorithm) ->
+        ode_observation_factory(request, leg, tspan, algorithm)
+    passthrough = error ->
+        error isa ODEResourceLimit || error isa ODESolverFailure ||
+            error isa CoordinateInversionStalled
+    leg_controls = (
+        odealgo=AutoVern9(Rosenbrock23(autodiff=false)),
+        reltol=parse_real(T, request, "homogeneous_ode_relative_tolerance"),
+        abstol=parse_real(T, request, "homogeneous_ode_absolute_tolerance"),
+        ode_maxiters=parse_integer(request, "homogeneous_ode_maxiters"),
+        ode_observation_factory=observation_factory,
+        ode_solution_observer=observe_ode_solution,
+        ode_exception_passthrough=passthrough,
+        factored_homogeneous_rhs_counter=factored_homogeneous_rhs_counter,
+    )
+
+    outer_contour = build_worker_outer_contour(
+        T, request, spectral, readout, "Xup-outer"
+    )
+    outer_preparation = CF.prepare_factored_infinity_outgoing(
+        spectral, outer_contour, required_digits
+    )
+    emit_asymptotic_preparation(outer_preparation)
+    CF.assert_factored_preflights_adequate(outer_preparation)
+    xup_match = progress_operation("Xup") do
+        CF.solve_factored_xup_to_match(
+            spectral,
+            outer_contour,
+            outer_preparation;
+            ode_leg="Xup_outer_to_match",
+            leg_controls...,
+        )
+    end
+    emit_factored_solution(xup_match)
+
+    inner_contour = build_worker_real_inner_horizon_contour(
+        T, request, spectral, readout, "horizon-real-inner"
+    )
+    candidates = CF.horizon_endpoint_candidates(
+        spectral,
+        inner_contour,
+        required_digits;
+        rho_candidates=horizon_endpoint_rho_candidates(T, request),
+        maximum_horizon_distance=parse_real(
+            T, request, "horizon_maximum_endpoint_distance"
+        ),
+    )
+    for candidate in candidates
+        emit_horizon_endpoint_candidate(candidate)
+    end
+    endpoints = CF.select_verified_horizon_endpoints(
+        spectral,
+        candidates;
+        maximum_horizon_distance=parse_real(
+            T, request, "horizon_maximum_endpoint_distance"
+        ),
+    )
+    progress_emit("horizon_endpoints_verified"; payload=Dict(
+        "reference_rho" => string(endpoints.reference.rho),
+        "reference_horizon_distance" =>
+            string(endpoints.reference.horizon_distance),
+        "verification_rho" => string(endpoints.verification.rho),
+        "verification_horizon_distance" =>
+            string(endpoints.verification.horizon_distance),
+        "horizon_contour_id" => endpoints.contour_id,
+        "candidate_count" => length(candidates),
+    ))
+
+    reference_basis = progress_operation("horizon-reference") do
+        CF.solve_verified_horizon_basis_to_match(
+            spectral,
+            inner_contour,
+            endpoints.reference,
+            required_digits;
+            ode_leg_prefix="horizon_reference",
+            leg_controls...,
+        )
+    end
+    emit_factored_solution(reference_basis.ingoing)
+    emit_factored_solution(reference_basis.outgoing)
+    verification_basis = progress_operation("horizon-verification") do
+        CF.solve_verified_horizon_basis_to_match(
+            spectral,
+            inner_contour,
+            endpoints.verification,
+            required_digits;
+            ode_leg_prefix="horizon_verification",
+            leg_controls...,
+        )
+    end
+    emit_factored_solution(verification_basis.ingoing)
+    emit_factored_solution(verification_basis.outgoing)
+
+    reference = evaluate_horizon_chart(
+        T, request, spectral, amplitude, xup_match,
+        outer_contour, inner_contour, reference_basis, "reference",
+    )
+    verification = evaluate_horizon_chart(
+        T, request, spectral, amplitude, xup_match,
+        outer_contour, inner_contour, verification_basis, "verification",
+    )
+    numerical_error_abs = estimate_horizon_determinant_error(
+        T, request, reference.value, verification.value
+    )
+    progress_emit("determinant_error_estimated"; payload=Dict(
+        "error_model_id" => VERIFIED_ENDPOINT_ERROR_MODEL_ID,
+        "endpoint_disagreement_abs" =>
+            string(abs(reference.value - verification.value)),
+        "numerical_error_abs" => string(numerical_error_abs),
+        "determinant_abs" => string(abs(reference.value)),
+        "reference_cref_fraction" => string(reference.cref_fraction),
+        "verification_cref_fraction" => string(verification.cref_fraction),
+    ))
+
+    chart_assessment = reference.assessment
+    coefficient_diagnostics = reference.coefficient_diagnostics
+    endpoint_summary = endpoint_conditioning_summary(
+        outer_preparation,
+        reference_basis.ingoing_endpoint,
+        reference_basis.outgoing_endpoint,
+    )
+    diagnostics = DeterminantDiagnostics{T}(
+        HOMOGENEOUS_REPRESENTATION_ID,
+        HORIZON_DETERMINANT_FAMILY_ID,
+        true,
+        endpoint_summary.maximum_series_digits_lost,
+        endpoint_summary.maximum_recurrence_digits_lost,
+        endpoint_summary.maximum_series_evaluation_spread,
+        endpoint_summary.maximum_last_term_ratio,
+        endpoint_summary.minimum_asymptotic_predicted_reliable_digits,
+        max(
+            coefficient_diagnostics.condition_frobenius,
+            verification.coefficient_diagnostics.condition_frobenius,
+        ),
+        max(
+            coefficient_diagnostics.backward_error,
+            verification.coefficient_diagnostics.backward_error,
+        ),
+        max(
+            coefficient_diagnostics.matching_reconstruction_residual,
+            verification.coefficient_diagnostics
+                .matching_reconstruction_residual,
+        ),
+        endpoint_summary.endpoint_remainders_regular,
+        endpoint_summary.maximum_endpoint_reconstruction_error,
+        chart_assessment.raw_determinant_abs,
+        chart_assessment.raw_determinant_evidence_status,
+        chart_assessment.normalised_determinant_abs,
+        chart_assessment.cref_chart_margin,
+        max(
+            coefficient_diagnostics.carrier_change_error,
+            verification.coefficient_diagnostics.carrier_change_error,
+        ),
+        spectral.contour_deformation.maximum_absolute,
+    )
+    record_determinant!(context.conditioning, diagnostics)
     progress_emit("determinant_chart_evaluated"; payload=Dict(
         "determinant_family" => HORIZON_DETERMINANT_FAMILY_ID,
         "determinant_convention" =>
             HORIZON_DETERMINANT_CONVENTION_ID,
         "determinant_normalisation" =>
             HORIZON_DETERMINANT_NORMALISATION_ID,
+        "horizon_contour_id" => endpoints.contour_id,
         "normalised_determinant_abs" =>
-            string(normalised_determinant_abs),
+            string(chart_assessment.normalised_determinant_abs),
+        "numerical_error_abs" => string(numerical_error_abs),
+        "error_model_id" => VERIFIED_ENDPOINT_ERROR_MODEL_ID,
     ))
-    return DeterminantEvaluation{T}(chart.value, diagnostics)
+    return DeterminantEvaluation{T}(
+        reference.value,
+        numerical_error_abs,
+        VERIFIED_ENDPOINT_ERROR_MODEL_ID,
+        diagnostics,
+    )
+end
+
+function horizon_endpoint_rho_candidates(::Type{T}, request) where {T<:AbstractFloat}
+    raw = required(request, "horizon_endpoint_rho_candidates")
+    raw isa AbstractVector || error(
+        "horizon_endpoint_rho_candidates must be a list"
+    )
+    isempty(raw) && error(
+        "horizon_endpoint_rho_candidates must be nonempty"
+    )
+    return T[parse(T, string(value)) for value in raw]
+end
+
+function emit_horizon_endpoint_candidate(candidate)
+    progress_emit("horizon_endpoint_candidate"; payload=Dict(
+        "rho" => string(candidate.rho),
+        "radius" => progress_complex(candidate.radius),
+        "horizon_distance" => string(candidate.horizon_distance),
+        "imaginary_radius_abs" => string(candidate.imaginary_radius_abs),
+        "exterior" => candidate.exterior,
+        "approaches_horizon" => candidate.approaches_horizon,
+        "within_maximum_distance" => candidate.within_maximum_distance,
+        "ingoing_adequate" => candidate.ingoing_adequate,
+        "outgoing_adequate" => candidate.outgoing_adequate,
+        "ingoing_predicted_reliable_digits" =>
+            string(candidate.ingoing_assessment.predicted_reliable_digits),
+        "outgoing_predicted_reliable_digits" =>
+            string(candidate.outgoing_assessment.predicted_reliable_digits),
+    ))
 end
 
 function evaluate_exterior_determinant(
@@ -3110,12 +3414,21 @@ function refined_request(::Type{T}, request, kind::Symbol) where {T<:AbstractFlo
     if kind == :truncation
         output["endpoint_series_order"] = parse_integer(request, "endpoint_series_order") + 8
     elseif kind == :resolution
-        output["ode_relative_tolerance"] = numeric_text(
-            parse_real(T, request, "ode_relative_tolerance") / T(2)
+        # Tighten every ODE control the determinant actually consumes. The
+        # difference between the base and tightened determinant is the control
+        # contribution to the absolute determinant error, so a control that is
+        # not tightened here is a control whose effect is never measured.
+        for key in (
+            "ode_relative_tolerance",
+            "ode_absolute_tolerance",
+            "homogeneous_ode_relative_tolerance",
+            "homogeneous_ode_absolute_tolerance",
+            "coordinate_ode_relative_tolerance",
+            "coordinate_ode_absolute_tolerance",
         )
-        output["ode_absolute_tolerance"] = numeric_text(
-            parse_real(T, request, "ode_absolute_tolerance") / T(2)
-        )
+            haskey(request, key) || continue
+            output[key] = numeric_text(parse_real(T, request, key) / T(2))
+        end
         output["support_subinterval_count"] =
             2 * parse_integer(request, "support_subinterval_count")
         output["angular_pad"] = parse_integer(request, "angular_pad") + 8
