@@ -223,7 +223,10 @@ end
     @test failure isa NumericalControlFailure
     details = failure_details(failure)
     @test details["failure_code"] == "FINITE_DIFFERENCE_NOISE_LIMIT"
-    attempts = details["attempts"]
+    # The typed failure carries its per-code evidence under "diagnostics"; the
+    # stage says where in the pipeline the code was raised.
+    @test details["stage"] == "finite-difference"
+    attempts = details["diagnostics"]["attempts"]
     # Exhaustion is finite and every attempt records which condition failed.
     @test !isempty(attempts)
     @test length(attempts) <= MAXIMUM_FREQUENCY_STEP_RUNGS
@@ -784,4 +787,77 @@ end
     @test materialized == 0.0
     @test !upper_clamped
     @test underflowed
+end
+
+@testset "the precision guard restates only the stored precision" begin
+    # One definition of the mantissa policy, so the guard cannot ask for a
+    # width the request validator would reject.
+    @test working_precision_bits_for(80) == ceil(Int, 80 * log2(10)) + 32
+    @test working_precision_bits_for(120) == ceil(Int, 120 * log2(10)) + 32
+    @test working_precision_bits_for(120) > working_precision_bits_for(80)
+
+    request = finite_difference_control_request()
+    request["precision_digits"] = 120
+    request["working_precision_bits"] = working_precision_bits_for(120)
+    guard = precision_guard_request(Float64, request)
+
+    @test parse_integer(guard, "precision_digits") == PRECISION_GUARD_DIGITS
+    @test parse_integer(guard, "working_precision_bits") ==
+        working_precision_bits_for(PRECISION_GUARD_DIGITS)
+    @test guard["precision_guard_request_depth"] == 1
+    # Everything that is not the stored precision survives untouched. If a
+    # control moved too, the guard would re-measure the control disagreement
+    # under the name of a precision effect and the budget would double-count.
+    moved = Set(["precision_digits", "working_precision_bits",
+                 "precision_guard_request_depth"])
+    for key in keys(request)
+        key in moved && continue
+        @test guard[key] == request[key]
+    end
+    @test issetequal(keys(guard), union(keys(request), moved))
+    # The original is untouched: the guard is a copy, not an in-place edit.
+    @test parse_integer(request, "precision_digits") == 120
+
+    @test_throws ErrorException precision_guard_request(Float64, guard)
+end
+
+@testset "the precision guard keeps the branch and drops the conditioning" begin
+    request = finite_difference_control_request()
+    context = spec_request_context(request)
+    context.conditioning.determinant_count = 7
+    context.conditioning.maximum_series_digits_lost = 3.5
+
+    guard_context = precision_guard_context(Float64, context)
+
+    # Same branch cell: the guard compares two evaluations of one determinant,
+    # not two determinants.
+    @test guard_context.frozen_branch_cell == context.frozen_branch_cell
+    @test guard_context.frozen_convention == context.frozen_convention
+    # Fresh accumulator: the reported conditioning envelope describes the solve
+    # whose value is reported, and the guard's value never is.
+    @test guard_context.conditioning !== context.conditioning
+    @test guard_context.conditioning.determinant_count == 0
+    @test guard_context.conditioning.maximum_series_digits_lost == 0.0
+    @test context.conditioning.determinant_count == 7
+end
+
+@testset "the lowest stored-precision rung has nothing to compare against" begin
+    request = finite_difference_control_request()
+    @test parse_integer(request, "precision_digits") == PRECISION_GUARD_DIGITS
+    context = spec_request_context(request)
+
+    # Absent, not zero. Zero would claim the comparison was made and agreed.
+    @test precision_guard_disagreement(
+        Float64,
+        request,
+        context,
+        SPEC_ROOT,
+        complex(0.0, 0.0),
+        "spec",
+        SPEC_ROOT,
+        nothing,
+    ) === nothing
+
+    @test round_to_working_precision(Float64, complex(1.5, -2.25)) ==
+        complex(1.5, -2.25)
 end

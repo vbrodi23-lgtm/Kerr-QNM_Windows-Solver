@@ -237,6 +237,61 @@ class RegularisedGsnWorkerSourceTests(unittest.TestCase):
         self.assertIn("endpoint_disagreement_abs", horizon)
         self.assertIn("equivalence_disagreement_abs", horizon)
 
+    def test_the_precision_term_is_populated_rather_than_declared(self) -> None:
+        """A component that is always ``nothing`` is a field, not a measurement.
+
+        ``precision_disagreement_abs`` shipped declared and permanently unset.
+        Asserting the struct field alone would have passed throughout, so these
+        assertions target the path that gives it a value.
+        """
+
+        for contract in (
+            "working_precision_bits_for(digits::Integer) =",
+            "const PRECISION_GUARD_DIGITS",
+            "function precision_guard_request(",
+            "function precision_guard_context(",
+            "function precision_guard_disagreement(",
+            "round_to_working_precision(::Type{T}, value::Complex)",
+            "run_at_working_precision(body, ::Type{BigFloat}",
+        ):
+            self.assertIn(contract, self.worker)
+
+        # The mantissa policy has exactly one definition. A second one is how a
+        # guard ends up asking for a width the request validator would reject.
+        self.assertEqual(
+            self.worker.count("ceil(Int, digits * log2(10)) + 32"), 1
+        )
+
+        start = self.worker.index("function precision_guard_request(")
+        guard = self.worker[
+            start:self.worker.index("run_at_working_precision(body", start)
+        ]
+        # Only the stored precision moves. Relaxing a control here would
+        # re-measure the control disagreement and double-count it in the budget.
+        for control in (
+            "ode_relative_tolerance",
+            "ode_absolute_tolerance",
+            "frequency_step",
+            "determinant_error_safety_factor",
+        ):
+            self.assertNotIn(control, guard)
+
+        authenticated = self._function_slice(
+            "authenticated_determinant_progress", "bounded_newton"
+        )
+        self.assertIn(
+            "precision_disagreement_abs=precision_disagreement_abs",
+            authenticated,
+        )
+        self.assertNotIn("precision_disagreement_abs=nothing", authenticated)
+
+        for executed in (
+            "the precision guard restates only the stored precision",
+            "the precision guard keeps the branch and drops the conditioning",
+            "the lowest stored-precision rung has nothing to compare against",
+        ):
+            self.assertIn(executed, self.fd_spec)
+
     def test_coordinate_controls_are_separate_from_homogeneous_controls(
         self,
     ) -> None:

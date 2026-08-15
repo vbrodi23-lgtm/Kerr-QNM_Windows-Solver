@@ -8,7 +8,7 @@ one typed boundary; importing this module cannot start a numerical solve.
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, localcontext
 from enum import Enum
 from fractions import Fraction
 from functools import lru_cache
@@ -1012,6 +1012,11 @@ class DiagnosticRootReadout:
         )
 
 
+# Wide enough that re-forming the worker's product in decimal is exact well
+# past the tolerance below, cheap enough to run on every parsed receipt.
+_ERROR_BUDGET_CHECK_DIGITS = 60
+_ERROR_BUDGET_AGGREGATE_TOLERANCE = Decimal("1e-40")
+
 _DETERMINANT_ERROR_BREAKDOWN_FIELDS = frozenset({
     "endpoint_disagreement_abs",
     "control_disagreement_abs",
@@ -1112,6 +1117,52 @@ class DeterminantErrorBreakdown:
                 raise ValueError(
                     f"determinant error breakdown {name} must be a finite "
                     "nonnegative decimal"
+                )
+        self._check_aggregate()
+
+    def components(self) -> tuple[Decimal, ...]:
+        """Return the components the reported bound is the maximum over."""
+
+        optional = (
+            self.control_disagreement_abs,
+            self.equivalence_disagreement_abs,
+            self.precision_disagreement_abs,
+        )
+        return (self.endpoint_disagreement_abs,) + tuple(
+            value for value in optional if value is not None
+        )
+
+    def _check_aggregate(self) -> None:
+        """Reject a bound that does not follow from the components beside it.
+
+        The breakdown exists so an acceptance decision can be re-derived rather
+        than trusted. A record whose ``numerical_error_abs`` does not follow
+        from its own parts defeats that entirely, and it is the one corruption
+        a downstream reader cannot notice: the aggregate looks like a perfectly
+        ordinary number on its own.
+
+        The comparison is relative, not exact. The worker forms the product in
+        binary floating point and serialises the result; re-forming it in
+        decimal cannot reproduce those bits. The tolerance is far wider than
+        that round trip and far narrower than any corruption that would matter.
+        """
+
+        with localcontext() as context:
+            context.prec = _ERROR_BUDGET_CHECK_DIGITS
+            expected = self.safety_factor * max(self.components())
+            if expected == 0:
+                if self.numerical_error_abs != 0:
+                    raise ValueError(
+                        "determinant error breakdown reports a positive bound "
+                        "over components that are all zero"
+                    )
+                return
+            if abs(self.numerical_error_abs - expected) > (
+                _ERROR_BUDGET_AGGREGATE_TOLERANCE * expected
+            ):
+                raise ValueError(
+                    "determinant error breakdown numerical_error_abs does not "
+                    "match its component maximum times the safety factor"
                 )
 
     @classmethod

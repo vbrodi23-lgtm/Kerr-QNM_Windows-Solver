@@ -3646,6 +3646,189 @@ function tight_control_request(
     return output
 end
 
+"""
+    working_precision_bits_for(digits)
+
+Return the BigFloat mantissa width the precision policy assigns to `digits`.
+
+One definition, used both by request validation and by the precision guard, so
+the guard cannot drift into a mantissa width the policy would reject.
+"""
+working_precision_bits_for(digits::Integer) =
+    ceil(Int, digits * log2(10)) + 32
+
+const PRECISION_GUARD_DIGITS = 80
+
+"""
+    precision_guard_request(T, request)
+
+Return the request restated at the lower stored-precision rung with every
+numerical control left exactly as it is.
+
+`tight_control_request` answers "is the determinant limited by its ODE and
+series controls". It cannot answer "is the determinant limited by the width of
+the arithmetic carrying it", because tightening the controls at a fixed
+mantissa moves both at once. Reducing the mantissa while holding the controls
+fixed separates the two: whatever changes is attributable to precision alone.
+
+Only the stored-precision fields move. If this also relaxed the tolerances it
+would re-measure the control disagreement under a second name, and the maximum
+that feeds the error budget would double-count one effect while still missing
+the other.
+"""
+function precision_guard_request(::Type{T}, request) where {T<:AbstractFloat}
+    get(request, "precision_guard_request_depth", 0) == 0 || error(
+        "precision-guard determinant evaluation must not recursively reduce"
+    )
+    output = copy(request)
+    output["precision_digits"] = PRECISION_GUARD_DIGITS
+    output["working_precision_bits"] =
+        working_precision_bits_for(PRECISION_GUARD_DIGITS)
+    output["precision_guard_request_depth"] = 1
+    return output
+end
+
+"""
+    run_at_working_precision(body, T, bits)
+
+Run `body` with `T`'s working precision set to `bits`.
+
+`BigFloat` carries its precision globally, so the guard evaluation has to be
+scoped rather than requested. Fixed-width element types have no dial to turn,
+so they run the body unchanged -- which is what the finite-difference specs
+exercise.
+"""
+run_at_working_precision(body, ::Type{BigFloat}, bits::Integer) =
+    setprecision(BigFloat, bits) do
+        body()
+    end
+
+run_at_working_precision(body, ::Type{<:AbstractFloat}, ::Integer) = body()
+
+"""
+    precision_guard_context(T, evaluation_context)
+
+Return the reported evaluation context restated at the ambient working
+precision, and prove it still names the same branch.
+
+The frozen convention is not a label: `infinity_contour_angle` and its
+companions enter the contour geometry numerically, and they are derived from
+the frequency the request opened with -- which is not the frequency being
+authenticated. Recomputing the convention from the authenticated frequency
+would tilt the contour, so the guard would be measuring a contour deformation
+and reporting it as a precision effect. Rounding the existing convention keeps
+the geometry and moves only the mantissa, which is the one variable the guard
+is allowed to change.
+
+`GSNBranchCell` holds only identity strings and half-plane signs, so a correct
+rounding leaves it identical. If it does not, the reduced mantissa moved a
+half-plane sign across its boundary and the two evaluations are no longer the
+same determinant -- an error, not a disagreement to average in.
+
+The guard gets a fresh conditioning accumulator. The reported conditioning
+envelope describes the solve whose value is reported; folding a measurement
+instrument's own conditioning into it would widen the envelope around a number
+that was never returned.
+
+Must be called inside the guard precision scope: `T(...)` reads the ambient
+precision, which is the entire point.
+"""
+function precision_guard_context(
+    ::Type{T}, evaluation_context::DeterminantRequestContext{T}
+) where {T<:AbstractFloat}
+    frozen = evaluation_context.frozen_convention
+    guard_convention = GSNBranchConvention{T}(
+        T(frozen.infinity_contour_angle),
+        T(frozen.horizon_contour_angle),
+        frozen.infinity_sign,
+        frozen.horizon_sign,
+        T(frozen.omega_argument),
+        T(frozen.p_horizon_argument),
+        frozen.tortoise_branch_id,
+        frozen.infinity_carrier_id,
+        frozen.horizon_ingoing_carrier_id,
+        frozen.horizon_outgoing_carrier_id,
+    )
+    guard_cell = GSN.branch_cell(guard_convention)
+    guard_cell == evaluation_context.frozen_branch_cell || error(
+        "precision guard moved the frozen branch cell"
+    )
+    return DeterminantRequestContext{T}(
+        guard_convention, guard_cell, ConditioningAccumulator(T)
+    )
+end
+
+"""
+    round_to_working_precision(T, value)
+
+Return `value` carried at the ambient working precision.
+
+The package refuses spectral inputs whose mantissa width disagrees with the
+declared precision, and it is right to: silently mixing widths is how a
+"120-digit" result ends up resting on an 80-digit intermediate. The guard
+therefore has to state the reduction explicitly. Rounding the frequency is not
+a distortion of the comparison -- at 80 digits the frequency genuinely is not
+known past 80 digits, and the determinant's sensitivity to that is part of what
+the guard is measuring.
+"""
+round_to_working_precision(::Type{T}, value::Complex) where {T<:AbstractFloat} =
+    Complex{T}(T(real(value)), T(imag(value)))
+
+"""
+    precision_guard_disagreement(T, request, ...)
+
+Return `|D_full - D_guard|` at one frequency, or `nothing` when the request is
+already at the lowest stored-precision rung.
+
+At 80 digits there is no lower rung the policy defines, so there is nothing to
+compare against and the term is absent rather than zero -- absent says "not
+measured", zero would claim "measured and identical".
+"""
+function precision_guard_disagreement(
+    ::Type{T},
+    request,
+    evaluation_context::DeterminantRequestContext{T},
+    omega::Complex{T},
+    amplitude::Complex{T},
+    purpose::String,
+    current::Complex{T},
+    base,
+) where {T<:AbstractFloat}
+    parse_integer(request, "precision_digits") > PRECISION_GUARD_DIGITS ||
+        return nothing
+    guard_request = precision_guard_request(T, request)
+    guard_bits = parse_integer(guard_request, "working_precision_bits")
+    guard = run_at_working_precision(T, guard_bits) do
+        determinant_progress(
+            T,
+            guard_request,
+            precision_guard_context(T, evaluation_context),
+            round_to_working_precision(T, omega),
+            round_to_working_precision(T, amplitude),
+            "$(purpose) precision guard",
+            current,
+        )
+    end
+    guard.diagnostics.determinant_family ==
+        base.diagnostics.determinant_family || error(
+        "precision-guard determinant changed the determinant family"
+    )
+    disagreement = abs(base.value - guard.value)
+    isfinite(disagreement) || throw(numerical_control_failure(
+        request,
+        "ALGEBRAIC_REPRESENTATION_SINGULAR",
+        "cross-precision determinant disagreement is nonfinite",
+        Dict{String,Any}(
+            "guard_precision_digits" => PRECISION_GUARD_DIGITS,
+            "guard_working_precision_bits" => guard_bits,
+            "determinant_abs" => string(abs(base.value)),
+            "guard_determinant_abs" => string(abs(guard.value)),
+        );
+        stage="determinant-chart",
+    ))
+    return T(disagreement)
+end
+
 function authenticated_determinant_progress(
     ::Type{T},
     request,
@@ -3695,13 +3878,23 @@ function authenticated_determinant_progress(
         tight.error_breakdown.equivalence_disagreement_abs,
     )
     control_disagreement_abs = abs(base.value - tight.value)
+    precision_disagreement_abs = precision_guard_disagreement(
+        T,
+        request,
+        evaluation_context,
+        base_frequency,
+        amplitude,
+        purpose,
+        current,
+        base,
+    )
     error_breakdown = determinant_error_breakdown(
         T,
         request,
         endpoint_disagreement_abs;
         control_disagreement_abs=control_disagreement_abs,
         equivalence_disagreement_abs=equivalence_disagreement_abs,
-        precision_disagreement_abs=nothing,
+        precision_disagreement_abs=precision_disagreement_abs,
     )
     progress_emit("determinant_error_estimated"; payload=Dict(
         "error_model_id" => VERIFIED_ENDPOINT_ERROR_MODEL_ID,
@@ -3710,7 +3903,12 @@ function authenticated_determinant_progress(
         "equivalence_disagreement_abs" =>
             equivalence_disagreement_abs === nothing ? nothing :
             string(equivalence_disagreement_abs),
-        "precision_disagreement_abs" => nothing,
+        "precision_disagreement_abs" =>
+            precision_disagreement_abs === nothing ? nothing :
+            string(precision_disagreement_abs),
+        "guard_precision_digits" =>
+            precision_disagreement_abs === nothing ? nothing :
+            PRECISION_GUARD_DIGITS,
         "safety_factor" => string(error_breakdown.safety_factor),
         "numerical_error_abs" =>
             string(error_breakdown.numerical_error_abs),
@@ -4925,7 +5123,7 @@ function evaluate_request(request)
     parse_integer(request, "s") == -2 || error("M02 worker requires spin weight s=-2")
     digits = parse_integer(request, "precision_digits")
     digits in (80, 120) || error("precision_digits must be 80 or 120")
-    bits = ceil(Int, digits * log2(10)) + 32
+    bits = working_precision_bits_for(digits)
     parse_integer(request, "working_precision_bits") == bits ||
         error("working precision bits do not match decimal precision policy")
     validate_regularised_gsn_policy(request)
