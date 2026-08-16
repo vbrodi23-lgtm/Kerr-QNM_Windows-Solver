@@ -973,7 +973,7 @@ class JuliaResponseBackendTests(unittest.TestCase):
             / "src/windows_solver/data/julia/m02_worker.jl"
         ).read_text(encoding="utf-8")
 
-        self.assertIn("initial_determinant = determinant_progress(", worker)
+        self.assertIn("initial_determinant = determinant_evaluator(", worker)
         self.assertIn(
             "best_upper_bound = determinant_upper_bound_abs(", worker
         )
@@ -987,9 +987,10 @@ class JuliaResponseBackendTests(unittest.TestCase):
         )
         self.assertIn(
             "root, residual, accepted_derivative, newton_converged, "
-            "root_evaluation =",
+            "root_evaluation,",
             worker,
         )
+        self.assertIn("propagate_derivative_error=true", worker)
         # The accepted Newton derivative is reused only on the unauthenticated
         # single-step path. The authenticated search must not reuse it: that
         # value was computed without an authenticated error term, so reusing it
@@ -1147,7 +1148,13 @@ class JuliaResponseBackendTests(unittest.TestCase):
         self.assertIn('progress_emit("root_readout_resource_infeasible"', worker)
         self.assertIn('"ROOT_READOUT_RESOURCE_INFEASIBLE"', worker)
         self.assertIn("minimum_remaining_determinant_count::Int=8", worker)
-        self.assertIn("minimum_remaining_determinant_count=2", worker)
+        self.assertIn(
+            "diagnostic_newton_remaining_determinant_count(", worker
+        )
+        self.assertIn(
+            "minimum_remaining_determinant_count=remaining_determinants",
+            worker,
+        )
         self.assertIn('"estimator" => "first-determinant-linear-lower-bound/v1"', worker)
         self.assertIn('"diagnostics_skipped_reason" => "PRIMARY_NOT_CONVERGED"', worker)
         primary_guard = worker.index("if !primary_converged")
@@ -1748,9 +1755,13 @@ class JuliaResponseBackendTests(unittest.TestCase):
                     "root_converged": False,
                     "root_branch_continuation_valid": False,
                 })
-                response["diagnostic_roots"]["truncation"]["root_omega_re"] = self.shifted(
+                truncation = response["diagnostic_roots"]["truncation"]
+                truncation["root_omega_re"] = self.shifted(
                     request["omega"]["real"], "0.006"
                 )
+                truncation["displacement_from_primary_abs"] = "0.006"
+                truncation["branch_authenticated"] = False
+                truncation["root_converged"] = False
                 return response
 
         job = _deep_job()
@@ -1784,9 +1795,13 @@ class JuliaResponseBackendTests(unittest.TestCase):
                     "root_converged": False,
                     "root_branch_continuation_valid": self.branch_valid,
                 })
-                response["diagnostic_roots"]["truncation"]["root_omega_re"] = self.shifted(
+                truncation = response["diagnostic_roots"]["truncation"]
+                truncation["root_omega_re"] = self.shifted(
                     request["omega"]["real"], self.displacement
                 )
+                truncation["displacement_from_primary_abs"] = self.displacement
+                truncation["branch_authenticated"] = self.branch_valid
+                truncation["root_converged"] = self.branch_valid
                 return response
 
         job = _deep_job()
@@ -1823,6 +1838,7 @@ class JuliaResponseBackendTests(unittest.TestCase):
                 for raw in response["diagnostic_roots"].values():
                     raw["root_omega_re"] = response["root_omega_re"]
                     raw["root_omega_im"] = response["root_omega_im"]
+                    raw["displacement_from_primary_abs"] = "0"
                 response["truncation_radius_abs"] = "0"
                 response["resolution_radius_abs"] = "0"
                 response["seed_path_radius_abs"] = "0"
@@ -1979,6 +1995,9 @@ class JuliaResponseBackendTests(unittest.TestCase):
                     )
                     raw["root_omega_im"] = self.shifted(
                         request["omega"]["imaginary"], imaginary_delta
+                    )
+                    raw["displacement_from_primary_abs"] = (
+                        str(radius) if family == "truncation" else "0"
                     )
                 return response
 

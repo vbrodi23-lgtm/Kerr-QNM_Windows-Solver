@@ -3155,9 +3155,9 @@ function enforce_root_readout_feasibility(
     request,
     minimum_remaining_determinant_count::Int=8,
 )
-    minimum_remaining_determinant_count > 0 ||
+    minimum_remaining_determinant_count >= 0 ||
         throw(ArgumentError(
-            "minimum remaining determinant count must be positive"
+            "minimum remaining determinant count must be nonnegative"
         ))
     measured_seconds = LAST_DETERMINANT_SECONDS[]
     request_elapsed_seconds = (time_ns() - REQUEST_STARTED_NS[]) / 1.0e9
@@ -4188,6 +4188,26 @@ function diagnostic_determinant_progress(
     )
 end
 
+function diagnostic_newton_remaining_determinant_count(
+    ::Type{T},
+    request,
+    evaluation_context::DeterminantRequestContext{T},
+    initial::Complex{T},
+    amplitude::Complex{T},
+) where {T<:AbstractFloat}
+    h = validated_frequency_step(T, request) * (one(T) + abs(initial))
+    offset = Complex{T}(h, zero(T))
+    return count(
+        sample -> matching_authenticated_determinant(
+            evaluation_context,
+            request,
+            sample,
+            amplitude,
+        ) === nothing,
+        (initial + offset, initial - offset),
+    )
+end
+
 function bounded_newton(
     ::Type{T},
     request,
@@ -4196,6 +4216,7 @@ function bounded_newton(
     amplitude::Complex{T},
     ; determinant_evaluator=determinant_progress,
     minimum_remaining_determinant_count::Int=8,
+    propagate_derivative_error::Bool=false,
 ) where {T<:AbstractFloat}
     frequency_step = validated_frequency_step(T, request)
     tolerance = parse_real(T, request, "root_correction_tolerance")
@@ -4276,6 +4297,7 @@ function bounded_newton(
             "derivative h",
             value;
             axis="real",
+            authenticate_controls=propagate_derivative_error,
             determinant_evaluator=determinant_evaluator,
         )
         derivative_abs = abs(derivative)
@@ -4344,7 +4366,8 @@ function bounded_newton(
                 "resulting_determinant_abs" => string(magnitude),
                 "elapsed_seconds" => (time_ns() - iteration_started) / 1.0e9,
             ))
-            return value, magnitude, derivative, true, residual
+            return value, magnitude, derivative, true, residual,
+                derivative_candidate.authentication
         end
         step = raw_step
         maximum_step = parse(T, "0.006")
@@ -4426,7 +4449,8 @@ function bounded_newton(
         ))
         !accepted && break
     end
-    return best_value, best_residual, nothing, false, best_evaluation
+    return best_value, best_residual, nothing, false, best_evaluation,
+        nothing
 end
 
 numeric_text(value) = string(value)
@@ -4811,8 +4835,10 @@ function solve_once(
     amplitude::Complex{T},
     ; authenticate_controls::Bool,
 ) where {T<:AbstractFloat}
-    root, residual, accepted_derivative, newton_converged, root_evaluation =
-        bounded_newton(T, request, evaluation_context, initial, amplitude)
+    root, residual, accepted_derivative, newton_converged, root_evaluation,
+        _ = bounded_newton(
+            T, request, evaluation_context, initial, amplitude
+        )
     horizon_authentication = authenticate_controls &&
         root_evaluation.error_breakdown !== nothing
     if horizon_authentication
@@ -4922,6 +4948,32 @@ function solve_once(
         root_evaluation, root_authentication
 end
 
+function diagnostic_consistency_newton(
+    ::Type{T},
+    request,
+    evaluation_context::DeterminantRequestContext{T},
+    initial::Complex{T},
+    amplitude::Complex{T};
+    determinant_evaluator=diagnostic_determinant_progress,
+    minimum_remaining_determinant_count::Int,
+) where {T<:AbstractFloat}
+    # A diagnostic Newton step authenticates its one required h stencil against
+    # the determinant-error evidence carried by the two endpoint samples. It
+    # deliberately does not claim the h/2, 2h, and ih cross-step certificate
+    # reserved for full authentication.
+    return bounded_newton(
+        T,
+        request,
+        evaluation_context,
+        initial,
+        amplitude;
+        determinant_evaluator=determinant_evaluator,
+        minimum_remaining_determinant_count=
+            minimum_remaining_determinant_count,
+        propagate_derivative_error=true,
+    )
+end
+
 function solve_full_authentication(
     ::Type{T},
     request,
@@ -5023,22 +5075,29 @@ function solve_diagnostic_consistency(
     initial::Complex{T},
     amplitude::Complex{T},
     authenticated_primary_root::Complex{T};
-    newton_solver=bounded_newton,
+    newton_solver=diagnostic_consistency_newton,
     determinant_evaluator=diagnostic_determinant_progress,
     full_authenticator=solve_full_authentication,
 ) where {T<:AbstractFloat}
     reuse_count_before = AUTHENTICATED_EVIDENCE_REUSE_COUNT_PHASE[]
+    remaining_determinants =
+        diagnostic_newton_remaining_determinant_count(
+            T, request, evaluation_context, initial, amplitude
+        )
     root, residual, accepted_derivative, newton_converged,
-        root_evaluation = newton_solver(
+        root_evaluation, accepted_derivative_authentication =
+        newton_solver(
             T,
             request,
             evaluation_context,
             initial,
             amplitude;
             determinant_evaluator=determinant_evaluator,
-            # One centred Newton stencil remains after the carried initial
-            # determinant. PRIMARY retains the historical default of eight.
-            minimum_remaining_determinant_count=2,
+            # At most one centred Newton stencil remains after the carried
+            # initial determinant. Exact PRIMARY evidence can reduce the
+            # number of actual determinant solves to zero. PRIMARY itself
+            # retains the historical default of eight.
+            minimum_remaining_determinant_count=remaining_determinants,
         )
     tolerance = parse_real(T, request, "root_correction_tolerance")
     branch_identity = string(required(request, "branch_convention"))
@@ -5058,7 +5117,12 @@ function solve_diagnostic_consistency(
 
     if !newton_converged
         escalation_reason = "NEWTON_CORRECTION_UNRESOLVED"
-    elseif accepted_derivative === nothing
+    elseif accepted_derivative === nothing ||
+            accepted_derivative_authentication === nothing ||
+            !isequal(
+                accepted_derivative_authentication.value,
+                accepted_derivative,
+            )
         escalation_reason = "DERIVATIVE_ESTIMATE_UNRESOLVED"
     elseif root_evaluation.error_breakdown === nothing
         escalation_reason = "DETERMINANT_ERROR_EVIDENCE_MISSING"
@@ -5068,34 +5132,26 @@ function solve_diagnostic_consistency(
     )
         escalation_reason = "DETERMINANT_ERROR_MODEL_MISMATCH"
     else
-        h = validated_frequency_step(T, request) * (one(T) + abs(root))
-        candidate = derivative_authentication_candidate(
-            accepted_derivative,
-            zero(T),
-            zero(T),
-            h,
-            "real",
-        )
-        derivative_authentication = candidate.authentication
-        derivative_lower_bound_abs = candidate.lower_bound_abs
-        if derivative_authentication === nothing
-            escalation_reason = "DERIVATIVE_ESTIMATE_UNRESOLVED"
-        else
-            root_error_abs = determinant_error_abs(T, root_evaluation)
-            residual_upper_bound = residual + root_error_abs
-            correction_upper_bound =
-                residual_upper_bound / derivative_lower_bound_abs
-            if !isfinite(correction_upper_bound)
-                escalation_reason = "CORRECTION_UPPER_BOUND_UNRESOLVED"
-            elseif correction_upper_bound > tolerance
-                escalation_reason =
-                    "CORRECTION_UPPER_BOUND_EXCEEDS_TOLERANCE"
-            elseif branch_identity != BRANCH_CONVENTION_ID
-                escalation_reason = "BRANCH_IDENTITY_UNAUTHENTICATED"
-            elseif !branch_authenticated
-                escalation_reason =
-                    "ROOT_DISPLACEMENT_EXCEEDS_PHASE_LIMIT"
-            end
+        # This is the ordinary one-stencil, error-aware Newton evidence. Its
+        # lower bound includes propagated determinant noise, but it does not
+        # claim the cross-step/axis ladder reserved for full authentication.
+        derivative_authentication = accepted_derivative_authentication
+        derivative_lower_bound_abs =
+            derivative_authentication.lower_bound_abs
+        root_error_abs = determinant_error_abs(T, root_evaluation)
+        residual_upper_bound = residual + root_error_abs
+        correction_upper_bound =
+            residual_upper_bound / derivative_lower_bound_abs
+        if !isfinite(correction_upper_bound)
+            escalation_reason = "CORRECTION_UPPER_BOUND_UNRESOLVED"
+        elseif correction_upper_bound > tolerance
+            escalation_reason =
+                "CORRECTION_UPPER_BOUND_EXCEEDS_TOLERANCE"
+        elseif branch_identity != BRANCH_CONVENTION_ID
+            escalation_reason = "BRANCH_IDENTITY_UNAUTHENTICATED"
+        elseif !branch_authenticated
+            escalation_reason =
+                "ROOT_DISPLACEMENT_EXCEEDS_PHASE_LIMIT"
         end
     end
 

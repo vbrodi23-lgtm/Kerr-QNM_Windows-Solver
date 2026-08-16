@@ -687,12 +687,18 @@ class RegularisedGsnWorkerSourceTests(unittest.TestCase):
         diagnostic = self._function_slice(
             "solve_diagnostic_consistency", "solve_phase"
         )
-        self.assertIn("bounded_newton(", diagnostic)
+        self.assertIn("diagnostic_consistency_newton", diagnostic)
         self.assertIn("solve_full_authentication", diagnostic)
         self.assertNotIn("evaluate_derivative_step_ladder(", diagnostic)
         self.assertNotIn('"final derivative h/2"', diagnostic)
         self.assertNotIn('"final derivative 2h"', diagnostic)
         self.assertNotIn('"final derivative ih"', diagnostic)
+        diagnostic_newton = self._function_slice(
+            "diagnostic_consistency_newton", "solve_full_authentication"
+        )
+        self.assertIn("bounded_newton(", diagnostic_newton)
+        self.assertIn("propagate_derivative_error=true", diagnostic_newton)
+        self.assertNotIn("evaluate_derivative_step_ladder(", diagnostic_newton)
 
         phase = self._function_slice("solve_phase", "refined_request")
         self.assertIn("solve_role::RootSolveRole", phase)

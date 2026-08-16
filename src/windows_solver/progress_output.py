@@ -677,22 +677,39 @@ class CampaignProgressReporter:
                     "resulting_determinant_abs"
                 ),
                 "converged": payload.get("converged"),
-                "solve_role": payload.get("solve_role"),
-                "full_authentication_escalated": payload.get(
-                    "full_authentication_escalated"
-                ),
-                "escalation_reason": payload.get("escalation_reason"),
-                "authenticated_evidence_reused": payload.get(
-                    "authenticated_evidence_reused"
-                ),
-                "determinant_count_phase": payload.get("determinant_count"),
-                "control_identity": payload.get("control_identity"),
-                "branch_authenticated": payload.get("branch_authenticated"),
-                "correction_upper_bound": payload.get(
-                    "correction_upper_bound"
-                ),
                 "elapsed_seconds": payload.get("elapsed_seconds"),
             }
+            workflow_keys = (
+                "solve_role",
+                "full_authentication_escalated",
+                "escalation_reason",
+                "authenticated_evidence_reused",
+                "determinant_count",
+                "control_identity",
+                "branch_authenticated",
+                "correction_upper_bound",
+            )
+            if any(key in payload for key in workflow_keys):
+                root_solve.update({
+                    "solve_role": payload.get("solve_role"),
+                    "full_authentication_escalated": payload.get(
+                        "full_authentication_escalated"
+                    ),
+                    "escalation_reason": payload.get("escalation_reason"),
+                    "authenticated_evidence_reused": payload.get(
+                        "authenticated_evidence_reused"
+                    ),
+                    "determinant_count_phase": payload.get(
+                        "determinant_count"
+                    ),
+                    "control_identity": payload.get("control_identity"),
+                    "branch_authenticated": payload.get(
+                        "branch_authenticated"
+                    ),
+                    "correction_upper_bound": payload.get(
+                        "correction_upper_bound"
+                    ),
+                })
             record["root_solve"] = root_solve
             if context["phase"] == "PRIMARY" and root_key not in self._completed_primary_roots:
                 self._completed_primary_roots.add(root_key)

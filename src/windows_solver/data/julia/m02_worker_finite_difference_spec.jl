@@ -1032,6 +1032,8 @@ function spec_full_authentication_outcome(
         escalation_reason=nothing,
         authenticated_evidence_reused=false,
         correction_upper_bound=correction_upper_bound,
+        root_correction_tolerance=
+            parse_real(Float64, request, "root_correction_tolerance"),
         determinant_error_abs=determinant_error_abs(Float64, evaluation),
         error_model_id=evaluation.error_model_id,
         branch_identity=BRANCH_CONVENTION_ID,
@@ -1084,6 +1086,17 @@ end
     @test !result.full_authentication_escalated
     @test result.escalation_reason === nothing
     @test result.correction_upper_bound <= 2.0e-11
+    h = validated_frequency_step(Float64, request) *
+        (1.0 + abs(SPEC_ROOT))
+    expected_derivative_error =
+        propagated_centered_difference_error(1.0e-12, 1.0e-12, h)
+    @test result.derivative_lower_bound_abs ≈
+        abs(complex(2.0 + h^2, 0.0)) - expected_derivative_error
+    @test result.derivative_lower_bound_abs < abs(complex(2.0 + h^2, 0.0))
+    @test result.determinant_error_abs == 1.0e-12
+    @test result.correction_upper_bound ≈
+        (result.residual + result.determinant_error_abs) /
+        result.derivative_lower_bound_abs
     @test length(calls) == 3
     @test all(!occursin("final derivative", purpose) for purpose in purposes)
     @test !any(
@@ -1102,8 +1115,11 @@ end
         determinant_evaluator=nothing,
         minimum_remaining_determinant_count=2,
     )
+        derivative_authentication = DerivativeAuthentication{Float64}(
+            complex(2.0, 0.0), 1.0e-12, 0.0, 1.0e-6, "real"
+        )
         return displaced, 0.0, complex(2.0, 0.0), true,
-            spec_root_evaluation(displaced)
+            spec_root_evaluation(displaced), derivative_authentication
     end
     full_authenticator = (
         value_type, sample_request, sample_context, initial, amplitude
@@ -1141,7 +1157,7 @@ end
     )
         return initial, 1.0, nothing, false, spec_root_evaluation(
             initial; value=complex(1.0, 0.0)
-        )
+        ), nothing
     end
     full_calls = Ref(0)
     successful_full = function (
@@ -1232,7 +1248,30 @@ end
     different_branch_context = build_determinant_request_context(
         Float64, request, SPEC_ROOT + complex(0.1, 0.0)
     )
+    append!(
+        different_branch_context.authenticated_evidence.entries,
+        context.authenticated_evidence.entries,
+    )
     @test reuse_authenticated_determinant(
         different_branch_context, request, SPEC_ROOT, amplitude
     ) === nothing
+
+    h = validated_frequency_step(Float64, request) *
+        (1.0 + abs(SPEC_ROOT))
+    for sample in (
+        SPEC_ROOT + complex(h, 0.0),
+        SPEC_ROOT - complex(h, 0.0),
+    )
+        remember_authenticated_determinant!(
+            context,
+            request,
+            sample,
+            amplitude,
+            spec_root_evaluation(sample),
+            "PRIMARY",
+        )
+    end
+    @test diagnostic_newton_remaining_determinant_count(
+        Float64, request, context, SPEC_ROOT, amplitude
+    ) == 0
 end

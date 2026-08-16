@@ -1034,6 +1034,7 @@ class DiagnosticRootReadout:
             optional_evidence = (
                 self.correction_upper_bound,
                 self.determinant_error_abs,
+                self.error_model_id,
                 self.derivative_lower_bound_abs,
                 self.root_correction_tolerance,
                 self.displacement_from_primary_abs,
@@ -1081,7 +1082,12 @@ class DiagnosticRootReadout:
             raise ValueError(
                 "diagnostic derivative magnitude and lower bound disagree"
             )
-        if self.error_model_id is not None and (
+        if self.error_model_id is None:
+            if self.determinant_error_abs != 0.0:
+                raise ValueError(
+                    "diagnostic determinant error requires its model identity"
+                )
+        elif (
             not isinstance(self.error_model_id, str)
             or not self.error_model_id
         ):
