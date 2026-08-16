@@ -436,13 +436,17 @@ class RegularisedGsnWorkerSourceTests(unittest.TestCase):
         )
 
     def test_horizon_chart_identity_assertion_remains_fail_closed(self) -> None:
+        expectations = self.worker[
+            self.worker.index("const HORIZON_CHART_IDENTITY_EXPECTATIONS") :
+            self.worker.index("function assert_horizon_chart_identities")
+        ]
+        self.assertIn(
+            "HORIZON_BASIS_AT_MATCH_EXTRACTION_ID",
+            expectations,
+        )
         assertion = self._function_slice(
             "assert_horizon_chart_identities",
             "evaluate_horizon_reflectivity_chart",
-        )
-        self.assertIn(
-            "HORIZON_BASIS_AT_MATCH_EXTRACTION_ID",
-            assertion,
         )
         self.assertIn(
             "getfield(chart_assessment, field) == expected || error(",
