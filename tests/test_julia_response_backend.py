@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import fields
 from decimal import Decimal, localcontext
 import hashlib
 import io
@@ -27,7 +28,12 @@ from windows_solver.julia_response_backend import (
     _mode_specific_branch_enclosure_radius,
     _run_streamed_julia,
 )
-from windows_solver.progress import PROGRESS_SCHEMA, ProgressEventKind, activate_progress
+from windows_solver.progress import (
+    PROGRESS_SCHEMA,
+    ProgressContext,
+    ProgressEventKind,
+    activate_progress,
+)
 from windows_solver.root_readout_cache import (
     ROOT_READOUT_STORE_DIRECTORY_NAME,
     RootReadoutStore,
@@ -1669,6 +1675,89 @@ class JuliaResponseBackendTests(unittest.TestCase):
         python_kinds = {kind.value for kind in ProgressEventKind}
 
         self.assertEqual(worker_kinds - python_kinds, set())
+
+    def test_every_literal_worker_progress_context_field_is_registered_in_python(
+        self,
+    ):
+        worker = (
+            Path(__file__).resolve().parents[1]
+            / "src/windows_solver/data/julia/m02_worker.jl"
+        ).read_text(encoding="utf-8")
+        lines = worker.splitlines()
+        assignment_pattern = re.compile(
+            r"^\s*(context|[A-Za-z_][A-Za-z0-9_]*_context)\s*=\s*(.*)$"
+        )
+        context_blocks = []
+        assigned_context_names = set()
+        for index, line in enumerate(lines):
+            match = assignment_pattern.match(line)
+            if match is None:
+                continue
+            name, expression = match.groups()
+            if not expression.startswith(("Dict", "merge(")):
+                continue
+            assigned_context_names.add(name)
+            balance = expression.count("(") - expression.count(")")
+            cursor = index
+            while balance > 0:
+                cursor += 1
+                self.assertLess(cursor, len(lines), name)
+                continuation = lines[cursor]
+                expression += "\n" + continuation
+                balance += continuation.count("(") - continuation.count(")")
+            self.assertEqual(balance, 0, name)
+            context_blocks.append(expression)
+
+        # This deliberately bounded inventory prevents the audit itself from
+        # silently overlooking a new worker context construction style.
+        self.assertEqual(len(context_blocks), 8)
+        self.assertEqual(
+            assigned_context_names,
+            {
+                "context",
+                "newton_context",
+                "decision_context",
+                "seed_context",
+                "completion_context",
+            },
+        )
+        scoped_context_names = set(
+            re.findall(r"progress_scope\(\s*([A-Za-z_][A-Za-z0-9_]*)\s*\)", worker)
+        )
+        explicit_context_names = set(
+            re.findall(r"\bcontext\s*=\s*([a-z][A-Za-z0-9_]*)", worker)
+        )
+        self.assertEqual(
+            (scoped_context_names | explicit_context_names)
+            - assigned_context_names,
+            set(),
+        )
+
+        worker_context_keys = {
+            key
+            for block in context_blocks
+            for key in re.findall(r'"([^"]+)"\s*=>', block)
+        }
+        self.assertEqual(
+            worker_context_keys,
+            {
+                "suboperation",
+                "determinant_purpose",
+                "determinant_index",
+                "determinant_index_phase",
+                "current_omega",
+                "candidate_omega",
+                "newton_index",
+                "newton_limit",
+                "phase",
+                "root_phase",
+                "seed_omega",
+                "seed_kind",
+                "fallback_used",
+            },
+        )
+        python_context_keys = {field.name for field in fields(ProgressContext)}
+        self.assertEqual(worker_context_keys - python_context_keys, set())
 
     def test_unknown_reserved_julia_progress_kind_is_fail_closed(self):
         line = JULIA_PROGRESS_PREFIX + json.dumps({
