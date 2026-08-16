@@ -827,8 +827,21 @@ class RegularisedGsnWorkerSourceTests(unittest.TestCase):
         staged = self._function_slice(
             "solve_staged_primary_authentication", "solve_diagnostic_consistency"
         )
-        self.assertIn("derivative_real_double=nothing", staged)
-        self.assertIn("derivative_imaginary=nothing", staged)
+        constructor_start = staged.index(
+            "root_authentication = RootAuthentication{T}("
+        )
+        constructor_end = staged.index("result = (", constructor_start)
+        constructor = staged[constructor_start:constructor_end]
+        self.assertIn(
+            "STAGED_REAL_AXIS_AUTHENTICATION_STRATEGY_ID",
+            constructor,
+        )
+        self.assertRegex(
+            constructor,
+            r"derivative_real_half,\s+nothing,\s+nothing,",
+        )
+        self.assertIn('"derivative_real_double" => nothing', staged)
+        self.assertIn('"derivative_imaginary" => nothing', staged)
 
     def test_primary_authentication_tightens_only_exact_frequencies(self) -> None:
         for contract in (

@@ -1382,7 +1382,7 @@ end
         @test !result.full_authentication_escalated
         @test result.root_authentication === nothing
     end
-    @test observed_initials == last.(phase_initials)
+    @test Tuple(observed_initials) == last.(phase_initials)
 end
 
 

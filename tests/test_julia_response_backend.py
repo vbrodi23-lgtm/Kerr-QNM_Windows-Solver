@@ -369,7 +369,7 @@ class JuliaResponseBackendTests(unittest.TestCase):
                 expected_phases = {
                     "truncation": "TRUNCATION",
                     "resolution": "RESOLUTION",
-                    "seed-path": "SEED_PATH",
+                    "seed-path": "SEED-PATH",
                 }
                 for family, diagnostic in (
                     readout.diagnostic_readouts or {}
