@@ -952,6 +952,8 @@ function diagnostic_consistency_request()
     request = finite_difference_control_request()
     merge!(request, Dict{String,Any}(
         "mechanism_id" => "horizon-admittance",
+        "omega_re" => string(real(SPEC_ROOT)),
+        "omega_im" => string(imag(SPEC_ROOT)),
         "working_precision_bits" => 298,
         "root_correction_tolerance" => "2e-11",
         "branch_enclosure_radius_abs" => "0.005",
