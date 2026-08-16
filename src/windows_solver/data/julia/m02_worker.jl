@@ -2465,6 +2465,33 @@ function maximum_optional_discrepancy(
     return maximum(available)
 end
 
+const HORIZON_CHART_IDENTITY_EXPECTATIONS = (
+    (:homogeneous_representation, HOMOGENEOUS_REPRESENTATION_ID),
+    (:branch_convention, BRANCH_CONVENTION_ID),
+    (:scattering_coefficient_extraction,
+        HORIZON_BASIS_AT_MATCH_EXTRACTION_ID),
+    (:scattering_column_convention,
+        SCATTERING_COLUMN_CONVENTION_ID),
+    (:radial_derivative_convention,
+        RADIAL_DERIVATIVE_CONVENTION_ID),
+    (:determinant_convention,
+        HORIZON_DETERMINANT_CONVENTION_ID),
+    (:regular_remainder_contract, REGULAR_REMAINDER_CONTRACT_ID),
+    (:factored_remainder_state_convention,
+        FACTORED_REMAINDER_STATE_CONVENTION_ID),
+    (:horizon_determinant_chart,
+        HORIZON_DETERMINANT_NORMALISATION_ID),
+)
+
+function assert_horizon_chart_identities(chart_assessment)
+    for (field, expected) in HORIZON_CHART_IDENTITY_EXPECTATIONS
+        getfield(chart_assessment, field) == expected || error(
+            "package horizon chart $(String(field)) identity changed"
+        )
+    end
+    return nothing
+end
+
 function evaluate_horizon_reflectivity_chart(
     ::Type{T},
     request,
@@ -2517,27 +2544,7 @@ function evaluate_horizon_reflectivity_chart(
         coefficients, reflectivity, chart_inputs
     )
     chart_assessment = chart.assessment
-    for (field, expected) in (
-        (:homogeneous_representation, HOMOGENEOUS_REPRESENTATION_ID),
-        (:branch_convention, BRANCH_CONVENTION_ID),
-        (:scattering_coefficient_extraction,
-            HORIZON_BASIS_AT_MATCH_EXTRACTION_ID),
-        (:scattering_column_convention,
-            SCATTERING_COLUMN_CONVENTION_ID),
-        (:radial_derivative_convention,
-            RADIAL_DERIVATIVE_CONVENTION_ID),
-        (:determinant_convention,
-            HORIZON_DETERMINANT_CONVENTION_ID),
-        (:regular_remainder_contract, REGULAR_REMAINDER_CONTRACT_ID),
-        (:factored_remainder_state_convention,
-            FACTORED_REMAINDER_STATE_CONVENTION_ID),
-        (:horizon_determinant_chart,
-            HORIZON_DETERMINANT_NORMALISATION_ID),
-    )
-        getfield(chart_assessment, field) == expected || error(
-            "package horizon chart $(String(field)) identity changed"
-        )
-    end
+    assert_horizon_chart_identities(chart_assessment)
     chart_assessment.normalised_determinant_abs === nothing &&
         error("safe horizon chart omitted its normalised determinant")
     progress_emit("horizon_chart_evaluated"; payload=Dict(

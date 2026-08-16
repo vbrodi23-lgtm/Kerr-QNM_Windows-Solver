@@ -50,6 +50,7 @@ preservation, and cache/provenance separation from historical raw-state leaves.
 
 ### Plan
 
+- Propagate each coefficient extractor's identity through the determinant chart, retain the worker's exact horizon-at-match assertion, and cover both valid extraction paths plus forged-identity rejection.
 - Enforce coordinate identity and verified real-inner endpoint geometry before any homogeneous ODE, then retain only the three-leg production horizon graph.
 - Complete the absolute determinant-error certificate and propagate each stencil sample's actual error through bounded Newton and final derivative authentication.
 - Carry the certificate through strict Julia/Python schemas, failures, progress, caches, reports, and mechanism-scoped scientific identity without changing exterior behavior.

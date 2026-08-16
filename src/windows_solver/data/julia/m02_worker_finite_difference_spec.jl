@@ -62,6 +62,45 @@ end
     )
 end
 
+function horizon_chart_identity_assessment(;
+    extraction_id=HORIZON_BASIS_AT_MATCH_EXTRACTION_ID,
+)
+    return (
+        homogeneous_representation=HOMOGENEOUS_REPRESENTATION_ID,
+        branch_convention=BRANCH_CONVENTION_ID,
+        scattering_coefficient_extraction=extraction_id,
+        scattering_column_convention=SCATTERING_COLUMN_CONVENTION_ID,
+        radial_derivative_convention=RADIAL_DERIVATIVE_CONVENTION_ID,
+        determinant_convention=HORIZON_DETERMINANT_CONVENTION_ID,
+        regular_remainder_contract=REGULAR_REMAINDER_CONTRACT_ID,
+        factored_remainder_state_convention=
+            FACTORED_REMAINDER_STATE_CONVENTION_ID,
+        horizon_determinant_chart=HORIZON_DETERMINANT_NORMALISATION_ID,
+    )
+end
+
+@testset "worker accepts the horizon-at-match chart identity" begin
+    @test assert_horizon_chart_identities(
+        horizon_chart_identity_assessment()
+    ) === nothing
+end
+
+@testset "worker rejects a forged coefficient extraction identity" begin
+    failure = try
+        assert_horizon_chart_identities(
+            horizon_chart_identity_assessment(
+                extraction_id="forged-horizon-extraction/v1"
+            )
+        )
+        nothing
+    catch caught
+        caught
+    end
+    @test failure isa ErrorException
+    @test sprint(showerror, failure) ==
+        "package horizon chart scattering_coefficient_extraction identity changed"
+end
+
 @testset "centred stencil propagates unequal endpoint errors" begin
     @test propagated_centered_difference_error(2.0, 6.0, 2.0) == 2.0
     @test propagated_centered_difference_error(1.0, 9.0, 0.5) == 10.0

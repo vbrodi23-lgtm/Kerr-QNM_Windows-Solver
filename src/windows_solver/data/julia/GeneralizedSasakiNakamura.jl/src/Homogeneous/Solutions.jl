@@ -1754,7 +1754,7 @@ function assess_horizon_determinant_chart(
             raw_diagnostic.equivalence_relative_error,
             HOMOGENEOUS_REPRESENTATION_ID,
             GSN_BRANCH_CONVENTION_ID,
-            SCATTERING_EXTRACTION_ID,
+            coefficients.diagnostics.extraction_id,
             scattering_column_convention,
             radial_derivative_convention,
             determinant_convention,

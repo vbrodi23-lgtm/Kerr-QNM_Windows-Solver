@@ -435,6 +435,36 @@ class RegularisedGsnWorkerSourceTests(unittest.TestCase):
             r"(?:state|endpoint|solution)\s*(?:\./|/)=\s*(?:maximum|abs)\(",
         )
 
+    def test_horizon_chart_identity_assertion_remains_fail_closed(self) -> None:
+        assertion = self._function_slice(
+            "assert_horizon_chart_identities",
+            "evaluate_horizon_reflectivity_chart",
+        )
+        self.assertIn(
+            "HORIZON_BASIS_AT_MATCH_EXTRACTION_ID",
+            assertion,
+        )
+        self.assertIn(
+            "getfield(chart_assessment, field) == expected || error(",
+            assertion,
+        )
+        chart = self._function_slice(
+            "evaluate_horizon_reflectivity_chart",
+            "evaluate_horizon_determinant",
+        )
+        self.assertIn(
+            "assert_horizon_chart_identities(chart_assessment)",
+            chart,
+        )
+        self.assertIn(
+            "worker accepts the horizon-at-match chart identity",
+            self.fd_spec,
+        )
+        self.assertIn(
+            "worker rejects a forged coefficient extraction identity",
+            self.fd_spec,
+        )
+
     def test_determinants_are_typed_and_fd_consumes_values_with_evidence(self) -> None:
         for contract in (
             "struct DeterminantDiagnostics{T<:AbstractFloat}",
