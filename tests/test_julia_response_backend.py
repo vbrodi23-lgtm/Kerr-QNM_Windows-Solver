@@ -565,6 +565,10 @@ class JuliaResponseBackendTests(unittest.TestCase):
                 "selected_step", "-1e-6"
             ),
              "negative step"),
+            (lambda record: record.pop("determinant_error"),
+             "missing determinant-error certificate"),
+            (lambda record: record.pop("derivative_authentication"),
+             "missing derivative certificate"),
             (lambda record: record.pop("correction_upper_bound"),
              "missing field"),
         ):
@@ -672,6 +676,51 @@ class JuliaResponseBackendTests(unittest.TestCase):
                     backend.read_root(
                         _job_for_mechanism("horizon-admittance"), 0.0j
                     )
+
+    def test_promoted_root_at_shared_correction_threshold_is_converged(self):
+        """The error-aware upper bound is accepted at the inclusive 2e-11 edge."""
+
+        class BoundaryAdapter(FakeAdapter):
+            def evaluate(self, request):
+                response = super().evaluate(request)
+                authentication = dict(response["root_authentication"])
+                with localcontext() as context:
+                    context.prec = 180
+                    tolerance = Decimal("2e-11")
+                    derivative_lower_bound = Decimal(
+                        authentication["derivative_authentication"][
+                            "lower_bound_abs"
+                        ]
+                    )
+                    residual_upper = tolerance * derivative_lower_bound
+                    determinant_error = Decimal(
+                        authentication["determinant_error"][
+                            "numerical_error_abs"
+                        ]
+                    )
+                    determinant_abs = residual_upper - determinant_error
+                authentication["central_determinant_re"] = str(determinant_abs)
+                authentication["central_determinant_im"] = "0"
+                authentication["residual_upper_bound_abs"] = str(residual_upper)
+                authentication["correction_upper_bound"] = str(tolerance)
+                response["root_authentication"] = authentication
+                response["root_residual_abs"] = str(determinant_abs)
+                return response
+
+        job = _job_for_mechanism("horizon-admittance")
+        for digits, refinement in ((80, 0), (80, 1), (120, 0), (120, 1)):
+            with self.subTest(digits=digits, refinement=refinement):
+                readout = JuliaPrecisionRootBackend(
+                    VettedNativeDeterminantKernel.identity,
+                    BoundaryAdapter(),
+                    digits,
+                    refinement=refinement,
+                ).read_root(job, 0.0j)
+                self.assertTrue(readout.converged)
+                self.assertEqual(
+                    readout.root_authentication.correction_upper_bound,
+                    Decimal("2e-11"),
+                )
 
     def test_backend_rejects_converged_root_above_declared_correction_target(self):
         """Catches a coherent large correction being labelled as solved."""
@@ -1226,6 +1275,16 @@ class JuliaResponseBackendTests(unittest.TestCase):
         ):
             self.assertIn(evidence, worker)
         self.assertIn("correction_upper_bound", worker)
+        self.assertIn(
+            "correction_upper_bound = residual_upper_bound / "
+            "derivative_lower_bound_abs",
+            worker,
+        )
+        self.assertIn(
+            "converged = newton_converged && "
+            "correction_upper_bound <= tolerance",
+            worker,
+        )
         self.assertIn("real_step_convergent", worker)
         self.assertIn("complex_axis_consistent", worker)
         self.assertIn(
@@ -1503,7 +1562,7 @@ class JuliaResponseBackendTests(unittest.TestCase):
         self.assertEqual(request["precision_digits"], 80)
         self.assertEqual(request["working_precision_bits"], 298)
         self.assertEqual(
-            request["policy"]["root_correction_tolerance"], "1e-18"
+            request["policy"]["root_correction_tolerance"], "2e-11"
         )
         self.assertEqual(request["policy"]["ode_relative_tolerance"], "1e-18")
         self.assertEqual(request["policy"]["ode_absolute_tolerance"], "1e-20")
@@ -1547,7 +1606,7 @@ class JuliaResponseBackendTests(unittest.TestCase):
 
         The previous table derived the 120-digit controls from the digit count,
         producing a 1e-102 root target -- 108 required reliable digits -- for a
-        calculation whose scientific requirement is 24. More stored digits do
+        calculation whose established acceptance threshold is 2e-11. More stored digits do
         not make a QNM root more accurately defined; they buy guard precision.
         """
 
@@ -1569,8 +1628,8 @@ class JuliaResponseBackendTests(unittest.TestCase):
         # same at both storage tiers.
         for base, refined in ((policy80, policy80_refined),
                               (policy120, policy120_refined)):
-            self.assertEqual(base["root_correction_tolerance"], "1e-18")
-            self.assertEqual(refined["root_correction_tolerance"], "1e-20")
+            self.assertEqual(base["root_correction_tolerance"], "2e-11")
+            self.assertEqual(refined["root_correction_tolerance"], "2e-11")
         self.assertEqual(
             policy120["root_correction_tolerance"],
             policy80["root_correction_tolerance"],

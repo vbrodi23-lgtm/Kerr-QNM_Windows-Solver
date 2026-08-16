@@ -198,7 +198,7 @@ def current_promoted_component_payload(
     }
 
     def conditioned(readout, readout_id):
-        correction_tolerance = Decimal("1e-18")
+        correction_tolerance = Decimal("2e-11")
         derivative = Decimal(str(readout.determinant_derivative_abs))
         normalised = Decimal(str(readout.determinant_residual_abs))
         if readout.converged:
@@ -413,7 +413,7 @@ def valid_control_failure_diagnostics(
             "determinant_error_abs": "2e-18",
             "correction_upper_bound": str(correction_upper),
             "correction_without_error": "5e-29",
-            "root_correction_tolerance": "1e-18",
+            "root_correction_tolerance": "2e-11",
             "derivative_lower_bound_abs": "2",
             "root_authentication": {
                 "central_determinant_re": "1e-28",
@@ -440,7 +440,7 @@ def valid_control_failure_diagnostics(
                     "axis": "real",
                 },
                 "correction_upper_bound": str(correction_upper),
-                "root_correction_tolerance": "1e-18",
+                "root_correction_tolerance": "2e-11",
                 "accepted": False,
             },
         }
@@ -527,7 +527,7 @@ def valid_root_authentication(mechanism_id: str) -> dict[str, object]:
             "axis": "real",
         },
         "correction_upper_bound": "1E-60",
-        "root_correction_tolerance": "1E-18",
+        "root_correction_tolerance": "2E-11",
         "accepted": True,
     }
 

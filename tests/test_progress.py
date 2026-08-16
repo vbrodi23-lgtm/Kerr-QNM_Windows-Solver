@@ -649,7 +649,7 @@ class CampaignProgressReporterTests(unittest.TestCase):
                 "axis": "real",
             },
             "correction_upper_bound": "9.15357579817089e-61",
-            "root_correction_tolerance": "1e-18",
+            "root_correction_tolerance": "2e-11",
             "accepted": True,
         }
         reporter.publish(_payload_event(
@@ -682,7 +682,7 @@ class CampaignProgressReporterTests(unittest.TestCase):
             "derivative_selected_step": "5e-7",
             "derivative_axis": "real",
             "correction_upper_bound": "9.15357579817089e-61",
-            "root_correction_tolerance": "1e-18",
+            "root_correction_tolerance": "2e-11",
             "root_authentication_accepted": True,
         }
         for name, value in expected.items():
@@ -701,7 +701,7 @@ class CampaignProgressReporterTests(unittest.TestCase):
             self.assertEqual(status["live_execution"][name], value, name)
         dashboard = "\n".join(reporter._current_execution_lines(compact=True))
         self.assertIn("ROOT AUTHENTICATION", dashboard)
-        self.assertIn("9.15357579817089e-61 / 1e-18", dashboard)
+        self.assertIn("9.15357579817089e-61 / 2e-11", dashboard)
         self.assertIn("accepted=True", dashboard)
 
     def test_operational_terminal_events_cannot_leave_live_solver_running(self):

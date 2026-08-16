@@ -454,11 +454,11 @@ class CampaignReportTests(unittest.TestCase):
         self.assertIn("BigFloat 120 dec", table)
         self.assertNotIn("  64 CONVERGED", table)
         self.assertEqual(_root_correction_tolerance_for_precision(64), 2.0e-11)
-        self.assertEqual(_root_correction_tolerance_for_precision(80), 1.0e-18)
+        self.assertEqual(_root_correction_tolerance_for_precision(80), 2.0e-11)
         # The promoted target is the same at both storage tiers. It was
         # previously reconstructed from the digit count as 1e-102, which is a
         # threshold no promoted request has ever carried.
-        self.assertEqual(_root_correction_tolerance_for_precision(120), 1.0e-18)
+        self.assertEqual(_root_correction_tolerance_for_precision(120), 2.0e-11)
 
     def test_dashboard_throttles_fast_inner_events_but_forces_heartbeat(self):
         """Catches terminal redraw volume scaling with determinant operations."""
@@ -571,7 +571,7 @@ class CampaignReportTests(unittest.TestCase):
 
         The promoted threshold is a property of the physics, so it is the same
         at both storage tiers. Deriving it from precision produced ``1e-102``
-        for a 120-digit stage while the request actually carried ``1e-18``,
+        for a 120-digit stage while the request actually carried the former uncalibrated ``1e-18``,
         making ``newton_correction_over_tolerance`` wrong by roughly eighty
         orders of magnitude -- a converged root reads as hopelessly
         under-converged.
@@ -784,7 +784,7 @@ class AuthenticationReportColumnTests(unittest.TestCase):
         self.assertEqual(fields["derivative_im"], "0")
         self.assertEqual(fields["derivative_lower_bound_abs"], "2.4")
         self.assertEqual(fields["correction_upper_bound"], "1E-60")
-        self.assertEqual(fields["root_correction_tolerance"], "1E-18")
+        self.assertEqual(fields["root_correction_tolerance"], "2E-11")
         self.assertIs(fields["root_authentication_accepted"], True)
         self.assertEqual(fields["derivative_axis"], "real")
         self.assertEqual(

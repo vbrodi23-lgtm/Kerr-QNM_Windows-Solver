@@ -372,7 +372,7 @@ def _with_baseline_conditioning(
                 "refinement_level": 0,
                 "synthetic_readout_id": readout_id,
                 "policy": {
-                    "root_correction_tolerance": "1e-18",
+                    "root_correction_tolerance": "2e-11",
                 },
             }
             scientific_runtime_sha256 = hashlib.sha256(
@@ -382,7 +382,7 @@ def _with_baseline_conditioning(
         if not isinstance(request_policy, dict):
             request_binding = dict(request_binding)
             request_binding["policy"] = {
-                "root_correction_tolerance": "1e-18",
+                "root_correction_tolerance": "2e-11",
             }
             request_policy = request_binding["policy"]
         correction_tolerance = Decimal(
@@ -1183,7 +1183,7 @@ class PrimaryPrecisionTests(unittest.TestCase):
             {
                 "80": {
                     "base": {
-                        "root_correction_tolerance": "1e-18",
+                        "root_correction_tolerance": "2e-11",
                         "ode_relative_tolerance": "1e-18",
                         "ode_absolute_tolerance": "1e-20",
                         "homogeneous_ode_relative_tolerance": "1e-18",
@@ -1195,7 +1195,7 @@ class PrimaryPrecisionTests(unittest.TestCase):
                         "frequency_step_maximum": "1e-3",
                     },
                     "refinement": {
-                        "root_correction_tolerance": "1e-20",
+                        "root_correction_tolerance": "2e-11",
                         "ode_relative_tolerance": "1e-20",
                         "ode_absolute_tolerance": "1e-20",
                         "homogeneous_ode_relative_tolerance": "1e-22",
@@ -1209,7 +1209,7 @@ class PrimaryPrecisionTests(unittest.TestCase):
                 },
                 "120": {
                     "base": {
-                        "root_correction_tolerance": "1e-18",
+                        "root_correction_tolerance": "2e-11",
                         "ode_relative_tolerance": "1e-24",
                         "ode_absolute_tolerance": "1e-26",
                         "homogeneous_ode_relative_tolerance": "1e-24",
@@ -1221,7 +1221,7 @@ class PrimaryPrecisionTests(unittest.TestCase):
                         "frequency_step_maximum": "1e-3",
                     },
                     "refinement": {
-                        "root_correction_tolerance": "1e-20",
+                        "root_correction_tolerance": "2e-11",
                         "ode_relative_tolerance": "1e-28",
                         "ode_absolute_tolerance": "1e-30",
                         "homogeneous_ode_relative_tolerance": "1e-28",
