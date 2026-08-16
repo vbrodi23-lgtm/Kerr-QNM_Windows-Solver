@@ -110,7 +110,7 @@ function leaf13_policy(
         "frequency_step" => String(frequency_step),
         "frequency_step_minimum" => String(frequency_step_minimum),
         "frequency_step_maximum" => String(frequency_step_maximum),
-        "root_correction_tolerance" => "1e-18",
+        "root_correction_tolerance" => "2e-11",
         "branch_enclosure_radius_abs" => "0.005",
         "max_newton_iterations" => 16,
         "homogeneous_representation" =>

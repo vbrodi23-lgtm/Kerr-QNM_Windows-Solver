@@ -48,9 +48,11 @@ keeping `log_at_match` canonical), `factor_physical_match_state`,
 
 ### Numerical policy (commits `2cc0fb5`, `9e3afde`, `2f4dabc`)
 
-Root target is now 1e-18 base / 1e-20 refinement at **both** 80 and 120 digits
-(24 and 26 required reliable digits). The 120-digit tier spends its extra digits
-as bounded guard, not as a 1e-102 root demand. `coordinate_ode_*` is split from
+Root acceptance now matches the established binary64 threshold of 2e-11 at
+base and refinement for both 80 and 120 digits. The former 1e-18 / 1e-20
+promoted thresholds were uncalibrated policy choices, not scientific
+requirements. The 120-digit tier spends its extra digits as bounded guard, not
+as a stricter root demand. `coordinate_ode_*` is split from
 `homogeneous_ode_*`. The horizon determinant builds an outer map `0 → +ρ_out`
 and a horizon map `0 → horizon_rho_inner_min` (≈ −100) instead of one joined
 −5000 → +5000 solve. Both seed `r(0) = match_radius` directly with the
@@ -114,7 +116,7 @@ compiled, or run. Treat first Julia CI as the real syntax check.
 None of the four evidence gates were run:
 
 1. Fixed Leaf 13 determinant at 80 digits
-2. Leaf 13 root with error-aware bound ≤ 1e-18
+2. Leaf 13 root with error-aware bound ≤ 2e-11
 3. 120-digit coordinate map reaching its endpoint
 4. Regressions: 220 a/M=0.95, 221 a/M=0.99, 331 a/M=0.95, 441 a/M=0.95,
    220 a/M=0.9999

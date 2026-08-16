@@ -441,10 +441,12 @@ class _WindowsKillOnCloseJob:
 def promoted_precision_numerical_controls() -> dict[str, object]:
     """Return the provisional promoted control profile.
 
-    The scientific root target is a property of the physics, not of the
-    arithmetic: 1e-18 at base and 1e-20 at refinement, for **both** the 80- and
-    120-digit tiers. Through ``required_reliable_digits`` those correspond to 24
-    and 26 required reliable digits.
+    Scientific root acceptance uses the solver's established binary64
+    correction threshold of 2e-11 at base and refinement, for both the 80- and
+    120-digit tiers. The former 1e-18 and 1e-20 promoted thresholds were
+    uncalibrated policy choices, not scientific requirements. Working precision
+    supplies guard digits against cancellation, carrier changes, and finite
+    differencing; it does not silently tighten the root-acceptance criterion.
 
     The previous table derived the 120-digit controls mechanically from the
     stored digit count (``10**-(digits - 18)``), which demanded a 1e-102 root
@@ -452,22 +454,22 @@ def promoted_precision_numerical_controls() -> dict[str, object]:
     tolerance to the coordinate map. That is what pinned Leaf 13's coordinate
     solve at 8.1e-17 steps: 2,000,002 RHS evaluations and 87.8 s to cover
     1.01e-11 of a 5000 span. More stored digits do not make a QNM root more
-    accurately defined; they buy guard precision against cancellation, carrier
-    changes, and finite differencing.
+    accurately defined.
 
-    So the 120-digit tier keeps the same scientific target as the 80-digit tier
-    and spends its extra digits as guard: its ODE controls are tightened by a
-    bounded factor over the demonstrated-healthy 80-digit level (1e-18 / 1e-20
-    homogeneous, reached in 2,978 RHS evaluations on the exact Leaf 13 leg),
-    not driven to the arithmetic floor.
+    The 120-digit tier therefore spends its extra digits as guard. Its ODE
+    controls are tightened by a bounded factor over the demonstrated-healthy
+    80-digit level (1e-18 / 1e-20 homogeneous, reached in 2,978 RHS evaluations
+    on the exact Leaf 13 leg), not driven to the arithmetic floor.
 
     The coordinate map gets its own, looser controls. It is a scalar quadrature
     for r(rho) and only has to avoid dominating the determinant error budget;
     it does not need the homogeneous solve's local-error target.
 
-    These values are explicitly ``UNMEASURED``. The horizon request policy
-    carries that status, and release admission remains blocked until
-    ``tools/calibrate_leaf13_horizon_controls.jl`` produces a valid native
+    The ODE, coordinate, and finite-difference control values remain explicitly
+    ``UNMEASURED``. The root-acceptance threshold is not a calibration claim:
+    it is the existing binary64 scientific standard. The horizon request policy
+    carries the control-profile status, and release admission remains blocked
+    until ``tools/calibrate_leaf13_horizon_controls.jl`` produces a valid native
     receipt and a reviewed profile is committed. Arithmetic work can use this
     bounded provisional profile to obtain that evidence; it cannot call the
     profile calibrated merely because the values are present in source.
@@ -476,7 +478,7 @@ def promoted_precision_numerical_controls() -> dict[str, object]:
     return {
         "80": {
             "base": {
-                "root_correction_tolerance": "1e-18",
+                "root_correction_tolerance": "2e-11",
                 "ode_relative_tolerance": "1e-18",
                 "ode_absolute_tolerance": "1e-20",
                 "homogeneous_ode_relative_tolerance": "1e-18",
@@ -488,7 +490,7 @@ def promoted_precision_numerical_controls() -> dict[str, object]:
                 "frequency_step_maximum": "1e-3",
             },
             "refinement": {
-                "root_correction_tolerance": "1e-20",
+                "root_correction_tolerance": "2e-11",
                 "ode_relative_tolerance": "1e-20",
                 "ode_absolute_tolerance": "1e-20",
                 "homogeneous_ode_relative_tolerance": "1e-22",
@@ -502,7 +504,7 @@ def promoted_precision_numerical_controls() -> dict[str, object]:
         },
         "120": {
             "base": {
-                "root_correction_tolerance": "1e-18",
+                "root_correction_tolerance": "2e-11",
                 "ode_relative_tolerance": "1e-24",
                 "ode_absolute_tolerance": "1e-26",
                 "homogeneous_ode_relative_tolerance": "1e-24",
@@ -514,7 +516,7 @@ def promoted_precision_numerical_controls() -> dict[str, object]:
                 "frequency_step_maximum": "1e-3",
             },
             "refinement": {
-                "root_correction_tolerance": "1e-20",
+                "root_correction_tolerance": "2e-11",
                 "ode_relative_tolerance": "1e-28",
                 "ode_absolute_tolerance": "1e-30",
                 "homogeneous_ode_relative_tolerance": "1e-28",

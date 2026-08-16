@@ -28,8 +28,10 @@ Python 3.12, `unittest`, PowerShell 5.1/7, GitHub Actions.
 - Select two verified horizon endpoints before starting any homogeneous ODE,
   including the outer Xup solve.
 - Horizon geometry is assessed before either horizon series is evaluated.
-- Root tolerances remain `1e-18` base and `1e-20` refinement at both 80 and
-  120 decimal working digits.
+- Root acceptance uses the established binary64 tolerance of `2e-11` at base
+  and refinement for both 80 and 120 decimal working digits. The former
+  `1e-18` / `1e-20` promoted values were uncalibrated policy choices, not
+  scientific requirements.
 - Coordinate, homogeneous GSN, and exterior perturbed-radial controls remain
   distinct policy classes.
 - A horizon determinant always carries an absolute error certificate. Relative
@@ -222,7 +224,7 @@ same-frequency cross-precision term.
 - [ ] Aggregate an optional same-frequency 80/120 discrepancy when both exact
   samples are present; never compare determinants evaluated at different roots.
 - [ ] Delete the report-only `1e-102` 120-digit correction target. Reports must
-  use the persisted request tolerance/certificate (`1e-18` base or `1e-20`
+  use the persisted request tolerance/certificate (`2e-11` at base and
   refinement), never reconstruct policy from storage precision.
 - [ ] Run focused tests green.
 - [ ] Commit this slice.
@@ -250,8 +252,9 @@ same-frequency cross-precision term.
 - Exterior scientific identity projects only exterior-relevant policy and
   implementation identity material.
 
-- [ ] Add a failing fixture showing 120 working digits still means root target
-  `1e-18`/`1e-20` and never implies `1e-102` ODE accuracy.
+- [ ] Add a failing fixture showing binary64, 80-digit, and 120-digit roots all
+  use the `2e-11` target and working precision never silently tightens
+  scientific acceptance or implies `1e-102` ODE accuracy.
 - [ ] Add a main-generated exterior receipt compatibility fixture and a failing
   test showing horizon-only changes do not stale it.
 - [ ] Add a failing test showing every historical horizon receipt is stale under
@@ -305,7 +308,7 @@ pair, selected profile, rationale, and its own receipt digest.
 - [ ] Run native Gate 2: 120-digit coordinate map reaches its endpoint without a
   microscopic-step stall and reports acceptable identity residuals.
 - [ ] Run native Gate 3: Leaf 13 root has accepted `h/2,h,2h,ih` controls and
-  correction upper bound `<= 1e-18` with `etaD` and `etaDprime` recorded.
+  correction upper bound `<= 2e-11` with `etaD` and `etaDprime` recorded.
 - [ ] Run native Gate 4: horizon regressions `220@0.95`, `221@0.99`,
   `331@0.95`, `441@0.95`, `220@0.9999`; prove exterior behavior and receipt
   compatibility are unchanged.

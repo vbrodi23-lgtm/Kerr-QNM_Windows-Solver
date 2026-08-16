@@ -406,11 +406,11 @@ def valid_control_failure_diagnostics(
             "elapsed_leg_seconds": 8.75,
         }
     if failure_code == "DETERMINANT_UNCERTAINTY_TOO_LARGE":
-        residual_upper = Decimal("1e-28") + Decimal("2e-18")
+        residual_upper = Decimal("1e-28") + Decimal("4.0000000000000002e-11")
         correction_upper = residual_upper / Decimal(2)
         return {
             "determinant_abs": "1e-28",
-            "determinant_error_abs": "2e-18",
+            "determinant_error_abs": "4.0000000000000002e-11",
             "correction_upper_bound": str(correction_upper),
             "correction_without_error": "5e-29",
             "root_correction_tolerance": "2e-11",
@@ -419,12 +419,12 @@ def valid_control_failure_diagnostics(
                 "central_determinant_re": "1e-28",
                 "central_determinant_im": "0",
                 "determinant_error": {
-                    "endpoint_disagreement_abs": "1e-18",
+                    "endpoint_disagreement_abs": "2.0000000000000001e-11",
                     "control_disagreement_abs": None,
                     "equivalence_disagreement_abs": None,
                     "precision_disagreement_abs": None,
                     "safety_factor": "2",
-                    "numerical_error_abs": "2e-18",
+                    "numerical_error_abs": "4.0000000000000002e-11",
                     "error_model_id": (
                         "verified-endpoint-control-equivalence-absolute-error/v2"
                     ),
