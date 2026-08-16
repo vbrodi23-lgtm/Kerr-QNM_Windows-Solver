@@ -1147,6 +1147,51 @@ end
     end
 end
 
+@testset "seed path keeps its independent seed and rejects a wrong root" begin
+    request = diagnostic_consistency_request()
+    context = spec_request_context(request)
+    independent_seed =
+        SPEC_ROOT + complex(0.00025, 0.000125) * (1.0 + abs(SPEC_ROOT))
+    wrong_root = SPEC_ROOT + complex(0.01, 0.0)
+    observed_initial = Ref(zero(ComplexF64))
+    newton_solver = function (
+        value_type, sample_request, sample_context, initial, amplitude;
+        determinant_evaluator=nothing,
+        minimum_remaining_determinant_count=2,
+    )
+        observed_initial[] = initial
+        derivative_authentication = DerivativeAuthentication{Float64}(
+            complex(2.0, 0.0), 1.0e-12, 0.0, 1.0e-6, "real"
+        )
+        return wrong_root, 0.0, complex(2.0, 0.0), true,
+            spec_root_evaluation(wrong_root), derivative_authentication
+    end
+    full_authenticator = (
+        value_type, sample_request, sample_context, initial, amplitude
+    ) -> spec_full_authentication_outcome(
+        sample_request, wrong_root; converged=true
+    )
+
+    result = solve_diagnostic_consistency(
+        Float64,
+        request,
+        context,
+        "SEED-PATH",
+        independent_seed,
+        complex(0.0, 0.0),
+        SPEC_ROOT;
+        newton_solver=newton_solver,
+        full_authenticator=full_authenticator,
+    )
+
+    @test observed_initial[] == independent_seed
+    @test result.full_authentication_escalated
+    @test result.escalation_reason ==
+        "ROOT_DISPLACEMENT_EXCEEDS_PHASE_LIMIT"
+    @test !result.branch_authenticated
+    @test !result.converged
+end
+
 @testset "insufficient diagnostic evidence escalates fail closed" begin
     request = diagnostic_consistency_request()
     context = spec_request_context(request)

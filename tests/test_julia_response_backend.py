@@ -1963,6 +1963,49 @@ class JuliaResponseBackendTests(unittest.TestCase):
         ):
             backend.read_root(job, 0.0j)
 
+    def test_promoted_backend_keeps_diagnostic_certificate_fail_closed(self):
+        class MissingErrorModelAdapter(FakeAdapter):
+            def evaluate(self, request):
+                response = super().evaluate(request)
+                response["diagnostic_roots"]["resolution"][
+                    "error_model_id"
+                ] = None
+                return response
+
+        class AboveToleranceAdapter(FakeAdapter):
+            def evaluate(self, request):
+                response = super().evaluate(request)
+                resolution = response["diagnostic_roots"]["resolution"]
+                resolution.update({
+                    "root_residual_abs": "7.4e-11",
+                    "determinant_error_abs": "1e-12",
+                    "correction_upper_bound": "3e-11",
+                    "root_converged": True,
+                })
+                return response
+
+        job = _deep_job()
+        for adapter, message in (
+            (
+                MissingErrorModelAdapter(),
+                "diagnostic scientific identity is invalid",
+            ),
+            (
+                AboveToleranceAdapter(),
+                "diagnostic root evidence is inconsistent",
+            ),
+        ):
+            with self.subTest(adapter=type(adapter).__name__):
+                backend = JuliaPrecisionRootBackend(
+                    VettedNativeDeterminantKernel.identity,
+                    adapter,
+                    80,
+                )
+                with self.assertRaisesRegex(
+                    JuliaResponseBackendError, message
+                ):
+                    backend.read_root(job, 0.0j)
+
     def test_promoted_sub_ulp_diagnostic_shifts_survive_response_reduction(self):
         """Catches rounding signed BigFloat control deltas into absolute roots."""
 

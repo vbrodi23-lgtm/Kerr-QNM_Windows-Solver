@@ -726,6 +726,7 @@ class RegularisedGsnWorkerSourceTests(unittest.TestCase):
         for executed in (
             "resolved diagnostic correction stops before the final derivative ladder",
             "truncation and resolution reject a materially displaced root",
+            "seed path keeps its independent seed and rejects a wrong root",
             "insufficient diagnostic evidence escalates fail closed",
             "authenticated determinant reuse requires exact scientific inputs",
         ):
@@ -755,6 +756,15 @@ class RegularisedGsnWorkerSourceTests(unittest.TestCase):
         )
         self.assertIn("solve_once(", primary)
         self.assertIn("authenticate_controls=true", primary)
+        self.assertNotIn("solve_diagnostic_consistency(", primary)
+        for forwarded in (
+            "root=root",
+            "residual=residual",
+            "root_evaluation=root_evaluation",
+            "root_authentication=root_authentication",
+            "correction_upper_bound=root_authentication.correction_upper_bound",
+        ):
+            self.assertIn(forwarded, primary)
 
         solve_once = self._function_slice("solve_once", "solve_full_authentication")
         for retained in (
