@@ -16,6 +16,11 @@ FACTORED_SOLUTIONS_SOURCE = (
     / "src/windows_solver/data/julia/GeneralizedSasakiNakamura.jl"
     / "src/Homogeneous/FactoredSolutions.jl"
 )
+SOLUTIONS_SOURCE = (
+    REPO_ROOT
+    / "src/windows_solver/data/julia/GeneralizedSasakiNakamura.jl"
+    / "src/Homogeneous/Solutions.jl"
+)
 WORKER_SOURCE = REPO_ROOT / "src/windows_solver/data/julia/m02_worker.jl"
 FD_SPEC_SOURCE = (
     REPO_ROOT
@@ -275,6 +280,50 @@ class RegularisedGsnWorkerSourceTests(unittest.TestCase):
         self.assertIn("verification.assessment.equivalence_disagreement_abs", horizon)
         self.assertIn("endpoint_disagreement_abs", horizon)
         self.assertIn("equivalence_disagreement_abs", horizon)
+
+    def test_the_chart_assessment_reports_its_own_extraction_identity(
+        self,
+    ) -> None:
+        """Catches a provenance record that asserts a default instead.
+
+        `DeterminantChartAssessment` built its
+        `scattering_coefficient_extraction` field from the module constant
+        `SCATTERING_EXTRACTION_ID` ("scaled-factored-horizon-basis/v1"). The
+        horizon path extracts through `solve_scaled_horizon_basis_at_match`,
+        whose coefficients carry `scaled-horizon-basis-at-match/v1`, so the
+        chart described how the coefficients *would* have been produced by the
+        legacy path rather than how they were. The worker cross-checks that
+        field against the extraction it asked for and correctly refused the
+        result -- `package horizon chart scattering_coefficient_extraction
+        identity changed` -- which is the gate working, but only after a real
+        120-digit solve got that far.
+
+        An assessment is a provenance record. It has to read its provenance
+        from the object it is assessing.
+        """
+
+        solutions = SOLUTIONS_SOURCE.read_text(encoding="utf-8")
+        start = solutions.index("DeterminantChartAssessment{T}(")
+        end = solutions.index("CREF_ERROR_ESTIMATE_KIND", start)
+        construction = solutions[start:end]
+        self.assertIn("coefficients.diagnostics.extraction_id", construction)
+        # The constant survives as the default for the legacy extraction path;
+        # what must not come back is it being passed here as a positional
+        # field of the assessment.
+        self.assertNotRegex(construction, r"(?m)^\s+SCATTERING_EXTRACTION_ID,")
+        self.assertIn(
+            "extraction_id::String=SCATTERING_EXTRACTION_ID", solutions
+        )
+        # The worker's expectation and the package's horizon extraction must
+        # name the same identity.
+        self.assertIn(
+            "extraction_id=horizon_basis_at_match_extraction_id", solutions
+        )
+        self.assertIn(
+            "(:scattering_coefficient_extraction,\n"
+            "            HORIZON_BASIS_AT_MATCH_EXTRACTION_ID)",
+            self.worker,
+        )
 
     def test_every_factored_solutions_export_is_reachable_from_the_package(
         self,

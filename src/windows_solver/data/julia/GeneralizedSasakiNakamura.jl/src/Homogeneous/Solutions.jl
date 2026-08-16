@@ -1754,7 +1754,16 @@ function assess_horizon_determinant_chart(
             raw_diagnostic.equivalence_relative_error,
             HOMOGENEOUS_REPRESENTATION_ID,
             GSN_BRANCH_CONVENTION_ID,
-            SCATTERING_EXTRACTION_ID,
+            # The extraction identity of the coefficients actually handed in,
+            # not a constant. Hardcoding `SCATTERING_EXTRACTION_ID` made the
+            # assessment assert how the coefficients *would* have been produced
+            # by the legacy path, so a chart built on
+            # `scaled-horizon-basis-at-match/v1` coefficients still reported
+            # `scaled-factored-horizon-basis/v1`. The worker cross-checks this
+            # field against the extraction it requested and correctly refused
+            # the result. An assessment is a provenance record; it has to read
+            # its provenance from the thing it is assessing.
+            coefficients.diagnostics.extraction_id,
             scattering_column_convention,
             radial_derivative_convention,
             determinant_convention,
