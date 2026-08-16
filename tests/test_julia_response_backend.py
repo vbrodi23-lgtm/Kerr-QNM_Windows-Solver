@@ -275,12 +275,12 @@ class JuliaResponseBackendTests(unittest.TestCase):
             backend.read_root(_deep_job(), 0.0j)
             self.assertEqual(len(calls), 2)
 
-    def test_success_wire_schema_is_five_and_worker_errors_remain_schema_one(self):
+    def test_success_wire_schema_is_six_and_worker_errors_remain_schema_one(self):
         """Catches changing the successful wire without preserving error parsing.
 
         The success wire and the error envelope are versioned independently.
-        Schema 5 adds diagnostic-role, escalation, exact-reuse, control, and
-        error-aware correction evidence; the error envelope stays at 1.
+        Schema 6 adds staged-authentication strategy and phase telemetry while
+        preserving schema-5 reads; the error envelope stays at 1.
         """
 
         request = JuliaPrecisionRootBackend(
@@ -292,7 +292,7 @@ class JuliaResponseBackendTests(unittest.TestCase):
             valid_julia_root_response(request)["schema_version"],
             WORKER_RESPONSE_WIRE_SCHEMA,
         )
-        self.assertEqual(WORKER_RESPONSE_WIRE_SCHEMA, 5)
+        self.assertEqual(WORKER_RESPONSE_WIRE_SCHEMA, 6)
         root = Path(__file__).resolve().parents[1]
         worker = (
             root / "src/windows_solver/data/julia/m02_worker.jl"
@@ -301,8 +301,8 @@ class JuliaResponseBackendTests(unittest.TestCase):
             worker.index("function result_fields(") :
             worker.index("function evaluate_request(")
         ]
-        self.assertEqual(result_fields.count('"schema_version" => 5'), 2)
-        self.assertNotIn('"schema_version" => 4', result_fields)
+        self.assertEqual(result_fields.count('"schema_version" => 6'), 2)
+        self.assertNotIn('"schema_version" => 5', result_fields)
         error_path = worker[
             worker.rindex("catch failure") : worker.index(
                 "if abspath(PROGRAM_FILE)"
@@ -348,14 +348,56 @@ class JuliaResponseBackendTests(unittest.TestCase):
                 self.assertEqual(
                     authentication.error_model_id is not None, horizon
                 )
+                self.assertEqual(
+                    authentication.authentication_strategy,
+                    (
+                        "staged-real-axis-h-h2/v1"
+                        if horizon
+                        else "full-h-h2-2h-ih-ladder/v1"
+                    ),
+                )
+                self.assertIsNotNone(authentication.derivative_real_base)
+                self.assertIsNotNone(authentication.derivative_real_half)
+                self.assertEqual(
+                    authentication.derivative_real_double is None,
+                    horizon,
+                )
+                self.assertEqual(
+                    authentication.derivative_imaginary is None,
+                    horizon,
+                )
+                expected_phases = {
+                    "truncation": "TRUNCATION",
+                    "resolution": "RESOLUTION",
+                    "seed-path": "SEED_PATH",
+                }
                 for family, diagnostic in (
                     readout.diagnostic_readouts or {}
                 ).items():
                     self.assertEqual(
                         diagnostic.solve_role, "DIAGNOSTIC_CONSISTENCY"
                     )
+                    self.assertEqual(
+                        diagnostic.authentication_mode,
+                        "DIAGNOSTIC_CONSISTENCY",
+                    )
+                    self.assertEqual(
+                        diagnostic.root_phase,
+                        expected_phases[family],
+                    )
+                    self.assertFalse(diagnostic.authoritative)
                     self.assertIsNotNone(
                         diagnostic.correction_upper_bound, family
+                    )
+                    self.assertIsNotNone(
+                        diagnostic.residual_upper_bound_abs, family
+                    )
+                    self.assertIsNotNone(
+                        diagnostic.required_derivative_lower_bound_abs, family
+                    )
+                    self.assertEqual(
+                        diagnostic.determinant_count_phase,
+                        diagnostic.determinant_count,
                     )
                     self.assertEqual(
                         diagnostic.branch_identity,
@@ -408,6 +450,108 @@ class JuliaResponseBackendTests(unittest.TestCase):
                     authentication.residual_upper_bound_abs
                     / authentication.derivative_lower_bound_abs,
                 )
+
+    def test_current_staged_authentication_evidence_is_fail_closed(self):
+        """The v6 strategy must neither omit nor invent derivative directions."""
+
+        def drop_strategy(authentication):
+            authentication.pop("authentication_strategy")
+
+        def invent_double(authentication):
+            evidence = dict(authentication["derivative_evidence"])
+            evidence["real_double"] = {
+                "real": authentication["derivative_authentication"][
+                    "derivative_re"
+                ],
+                "imaginary": authentication["derivative_authentication"][
+                    "derivative_im"
+                ],
+            }
+            authentication["derivative_evidence"] = evidence
+
+        def invent_imaginary(authentication):
+            evidence = dict(authentication["derivative_evidence"])
+            evidence["imaginary"] = {
+                "real": authentication["derivative_authentication"][
+                    "derivative_re"
+                ],
+                "imaginary": authentication["derivative_authentication"][
+                    "derivative_im"
+                ],
+            }
+            authentication["derivative_evidence"] = evidence
+
+        def claim_full_ladder(authentication):
+            authentication["authentication_strategy"] = (
+                "full-h-h2-2h-ih-ladder/v1"
+            )
+
+        for mutate in (
+            drop_strategy,
+            invent_double,
+            invent_imaginary,
+            claim_full_ladder,
+        ):
+            with self.subTest(mutation=mutate.__name__):
+                class ForgedAdapter(FakeAdapter):
+                    def evaluate(self, request):
+                        response = super().evaluate(request)
+                        authentication = dict(response["root_authentication"])
+                        mutate(authentication)
+                        response["root_authentication"] = authentication
+                        return response
+
+                with self.assertRaises(JuliaResponseBackendError):
+                    JuliaPrecisionRootBackend(
+                        VettedNativeDeterminantKernel.identity,
+                        ForgedAdapter(),
+                        80,
+                    ).read_root(
+                        _job_for_mechanism("horizon-admittance"),
+                        0.0j,
+                    )
+
+    def test_current_diagnostic_workflow_identity_is_fail_closed(self):
+        """Diagnostic evidence cannot claim PRIMARY authority or the wrong phase."""
+
+        def claim_authority(record):
+            record["authoritative"] = True
+
+        def claim_primary_mode(record):
+            record["authentication_mode"] = "STAGED_FULL_AUTHENTICATION"
+
+        def claim_wrong_phase(record):
+            record["root_phase"] = "TRUNCATION"
+
+        def omit_phase_count(record):
+            record.pop("determinant_count_phase")
+
+        for mutate in (
+            claim_authority,
+            claim_primary_mode,
+            claim_wrong_phase,
+            omit_phase_count,
+        ):
+            with self.subTest(mutation=mutate.__name__):
+                class ForgedAdapter(FakeAdapter):
+                    def evaluate(self, request):
+                        response = super().evaluate(request)
+                        record = dict(
+                            response["diagnostic_roots"]["resolution"]
+                        )
+                        mutate(record)
+                        response["diagnostic_roots"]["resolution"] = record
+                        return response
+
+                with self.assertRaises(JuliaResponseBackendError):
+                    JuliaPrecisionRootBackend(
+                        VettedNativeDeterminantKernel.identity,
+                        ForgedAdapter(),
+                        80,
+                    ).read_root(
+                        _job_for_mechanism("horizon-admittance"),
+                        0.0j,
+                    )
 
     def test_readout_carries_the_authentication_past_the_backend(self):
         """Catches convergence surviving while its evidence is discarded.

@@ -91,6 +91,30 @@ function root_solve_role_text(role::RootSolveRole)
     error("unknown root solve role")
 end
 
+@enum RootAuthenticationMode begin
+    STAGED_FULL_AUTHENTICATION
+    DIAGNOSTIC_CONSISTENCY_AUTHENTICATION
+    FULL_AUTHENTICATION_ESCALATION
+    LEGACY_FULL_AUTHENTICATION
+end
+
+function authentication_mode_text(mode::RootAuthenticationMode)
+    mode === STAGED_FULL_AUTHENTICATION &&
+        return "STAGED_FULL_AUTHENTICATION"
+    mode === DIAGNOSTIC_CONSISTENCY_AUTHENTICATION &&
+        return "DIAGNOSTIC_CONSISTENCY"
+    mode === FULL_AUTHENTICATION_ESCALATION &&
+        return "FULL_AUTHENTICATION_ESCALATION"
+    mode === LEGACY_FULL_AUTHENTICATION &&
+        return "FULL_AUTHENTICATION"
+    error("unknown root authentication mode")
+end
+
+const STAGED_REAL_AXIS_AUTHENTICATION_STRATEGY_ID =
+    "staged-real-axis-h-h2/v1"
+const FULL_DERIVATIVE_LADDER_AUTHENTICATION_STRATEGY_ID =
+    "full-h-h2-2h-ih-ladder/v1"
+
 abstract type WorkerControlFailure <: Exception end
 abstract type ODEControlFailure <: WorkerControlFailure end
 
@@ -1189,6 +1213,11 @@ struct RootAuthentication{T<:AbstractFloat}
     error_model_id::Union{Nothing,String}
     root_correction_tolerance::T
     accepted::Bool
+    authentication_strategy::String
+    derivative_real_base::Complex{T}
+    derivative_real_half::Complex{T}
+    derivative_real_double::Union{Nothing,Complex{T}}
+    derivative_imaginary::Union{Nothing,Complex{T}}
 end
 
 """
@@ -4776,6 +4805,26 @@ function root_authentication_text(
     accepted::Bool=authentication.accepted,
 )
     breakdown = authentication.error_breakdown
+    strategy = authentication.authentication_strategy
+    if strategy == STAGED_REAL_AXIS_AUTHENTICATION_STRATEGY_ID
+        authentication.derivative_real_double === nothing || error(
+            "staged root authentication fabricated a 2h derivative"
+        )
+        authentication.derivative_imaginary === nothing || error(
+            "staged root authentication fabricated an ih derivative"
+        )
+    elseif strategy == FULL_DERIVATIVE_LADDER_AUTHENTICATION_STRATEGY_ID
+        authentication.derivative_real_double === nothing && error(
+            "full root authentication omitted its 2h derivative"
+        )
+        authentication.derivative_imaginary === nothing && error(
+            "full root authentication omitted its ih derivative"
+        )
+    else
+        error("root authentication strategy is invalid")
+    end
+    derivative_evidence(value) = value === nothing ? nothing :
+        progress_complex(value)
     return Dict{String,Any}(
         "central_determinant_re" =>
             numeric_text(real(authentication.central_determinant)),
@@ -4818,6 +4867,17 @@ function root_authentication_text(
                 numeric_text(authentication.derivative.lower_bound_abs),
             "selected_step" => numeric_text(authentication.derivative.step),
             "axis" => authentication.derivative.axis,
+        ),
+        "authentication_strategy" => strategy,
+        "derivative_evidence" => Dict{String,Any}(
+            "real_base" =>
+                derivative_evidence(authentication.derivative_real_base),
+            "real_half" =>
+                derivative_evidence(authentication.derivative_real_half),
+            "real_double" =>
+                derivative_evidence(authentication.derivative_real_double),
+            "imaginary" =>
+                derivative_evidence(authentication.derivative_imaginary),
         ),
         "correction_upper_bound" =>
             numeric_text(authentication.correction_upper_bound),
@@ -4899,6 +4959,11 @@ function solve_once(
         root_evaluation.error_model_id,
         tolerance,
         converged,
+        FULL_DERIVATIVE_LADDER_AUTHENTICATION_STRATEGY_ID,
+        derivative_real_base,
+        derivative_real_half,
+        derivative_real_double,
+        derivative_imaginary,
     )
     if !converged && correction_upper_bound > tolerance &&
             residual / derivative_lower_bound_abs <= tolerance
@@ -4927,6 +4992,8 @@ function solve_once(
     progress_emit("derivative_control_completed"; payload=Dict(
         "root_authentication" =>
             root_authentication_text(root_authentication),
+        "authentication_strategy" =>
+            FULL_DERIVATIVE_LADDER_AUTHENTICATION_STRATEGY_ID,
         "derivative_real_half" => progress_complex(derivative_real_half),
         "derivative_real_base" => progress_complex(derivative_real_base),
         "derivative_real_double" => progress_complex(derivative_real_double),
@@ -4997,6 +5064,9 @@ function solve_full_authentication(
         branch_identity == BRANCH_CONVENTION_ID &&
         abs(root - reference_root) <=
             parse_real(T, request, "branch_enclosure_radius_abs")
+    residual_upper_bound_abs =
+        root_authentication.residual_upper_bound_abs
+    tolerance = root_authentication.root_correction_tolerance
     return (
         root=root,
         residual=residual,
@@ -5005,13 +5075,21 @@ function solve_full_authentication(
         root_evaluation=root_evaluation,
         root_authentication=root_authentication,
         solve_role=FULL_AUTHENTICATION,
+        authentication_mode=LEGACY_FULL_AUTHENTICATION,
+        authoritative=true,
         full_authentication_escalated=false,
         escalation_reason=nothing,
         authenticated_evidence_reused=
             AUTHENTICATED_EVIDENCE_REUSE_COUNT_PHASE[] > 0,
+        residual_upper_bound_abs=residual_upper_bound_abs,
+        required_derivative_lower_bound_abs=
+            residual_upper_bound_abs / tolerance,
         correction_upper_bound=root_authentication.correction_upper_bound,
-        root_correction_tolerance=
-            root_authentication.root_correction_tolerance,
+        root_correction_tolerance=tolerance,
+        raw_step_disagreement_abs=nothing,
+        guarded_step_disagreement_abs=nothing,
+        propagated_derivative_error_abs=
+            root_authentication.derivative.propagated_error_abs,
         determinant_error_abs=
             determinant_error_abs(T, root_evaluation),
         error_model_id=root_evaluation.error_model_id,
@@ -5019,6 +5097,398 @@ function solve_full_authentication(
         branch_authenticated=branch_authenticated,
         control_identity=phase_control_identity(request),
     )
+end
+
+function authentication_progress_payload(
+    phase::String,
+    mode::RootAuthenticationMode,
+    authoritative::Bool,
+    full_authentication_escalated::Bool,
+    escalation_reason,
+    determinant_count_phase::Int;
+    residual_upper_bound_abs=nothing,
+    derivative_lower_bound_abs=nothing,
+    required_derivative_lower_bound_abs=nothing,
+    correction_upper_bound=nothing,
+    root_correction_tolerance=nothing,
+    raw_step_disagreement_abs=nothing,
+    guarded_step_disagreement_abs=nothing,
+    propagated_derivative_error_abs=nothing,
+)
+    encoded(value) = value === nothing ? nothing : string(value)
+    return Dict{String,Any}(
+        "phase" => phase,
+        "root_phase" => phase,
+        "authentication_mode" => authentication_mode_text(mode),
+        "authoritative" => authoritative,
+        "full_authentication_escalated" =>
+            full_authentication_escalated,
+        "escalation_reason" => escalation_reason,
+        "determinant_count_phase" => determinant_count_phase,
+        "residual_upper_bound_abs" => encoded(residual_upper_bound_abs),
+        "derivative_lower_bound_abs" => encoded(derivative_lower_bound_abs),
+        "required_derivative_lower_bound_abs" =>
+            encoded(required_derivative_lower_bound_abs),
+        "correction_upper_bound" => encoded(correction_upper_bound),
+        "root_correction_tolerance" => encoded(root_correction_tolerance),
+        "raw_step_disagreement_abs" => encoded(raw_step_disagreement_abs),
+        "guarded_step_disagreement_abs" =>
+            encoded(guarded_step_disagreement_abs),
+        "propagated_derivative_error_abs" =>
+            encoded(propagated_derivative_error_abs),
+    )
+end
+
+function authentication_progress_payload(phase::String, result)
+    return authentication_progress_payload(
+        phase,
+        result.authentication_mode,
+        result.authoritative,
+        result.full_authentication_escalated,
+        result.escalation_reason,
+        DETERMINANT_INDEX_PHASE[];
+        residual_upper_bound_abs=result.residual_upper_bound_abs,
+        derivative_lower_bound_abs=result.derivative_lower_bound_abs,
+        required_derivative_lower_bound_abs=
+            result.required_derivative_lower_bound_abs,
+        correction_upper_bound=result.correction_upper_bound,
+        root_correction_tolerance=result.root_correction_tolerance,
+        raw_step_disagreement_abs=result.raw_step_disagreement_abs,
+        guarded_step_disagreement_abs=result.guarded_step_disagreement_abs,
+        propagated_derivative_error_abs=
+            result.propagated_derivative_error_abs,
+    )
+end
+
+function solve_staged_primary_authentication(
+    ::Type{T},
+    request,
+    evaluation_context::DeterminantRequestContext{T},
+    initial::Complex{T},
+    amplitude::Complex{T};
+    newton_solver=bounded_newton,
+    central_authenticator=authenticated_determinant_progress,
+    half_derivative_evaluator=final_derivative,
+    full_authenticator=solve_full_authentication,
+) where {T<:AbstractFloat}
+    phase = "PRIMARY"
+    tolerance = parse_real(T, request, "root_correction_tolerance")
+    progress_emit("primary_staged_authentication_started"; payload=
+        authentication_progress_payload(
+            phase,
+            STAGED_FULL_AUTHENTICATION,
+            true,
+            false,
+            nothing,
+            DETERMINANT_INDEX_PHASE[];
+            root_correction_tolerance=tolerance,
+        )
+    )
+
+    root, residual, newton_derivative, newton_converged,
+        root_evaluation, _ = newton_solver(
+            T,
+            request,
+            evaluation_context,
+            initial,
+            amplitude;
+            determinant_evaluator=determinant_progress,
+            minimum_remaining_determinant_count=7,
+            propagate_derivative_error=false,
+        )
+
+    escalation_reason = nothing
+    authenticated_root_evaluation = nothing
+    derivative_real_half = nothing
+    propagated_derivative_error_abs = nothing
+    raw_step_disagreement_abs = nothing
+    guarded_step_disagreement_abs = nothing
+    derivative_lower_bound_abs = nothing
+    residual_upper_bound_abs = nothing
+    required_derivative_lower_bound_abs = nothing
+    correction_upper_bound = nothing
+
+    if !newton_converged
+        escalation_reason = "STAGED_NEWTON_NOT_CONVERGED"
+    elseif newton_derivative === nothing
+        escalation_reason = "STAGED_NEWTON_DERIVATIVE_MISSING"
+    elseif !all(isfinite, (
+        real(newton_derivative), imag(newton_derivative),
+        abs(newton_derivative),
+    )) || iszero(newton_derivative)
+        escalation_reason = "STAGED_NEWTON_DERIVATIVE_INVALID"
+    elseif root_evaluation.error_breakdown === nothing ||
+            root_evaluation.error_model_id === nothing ||
+            !isequal(
+                root_evaluation.error_model_id,
+                required(request, "determinant_error_model"),
+            )
+        escalation_reason =
+            "STAGED_DETERMINANT_ERROR_MODEL_UNAVAILABLE"
+    else
+        authenticated_root_evaluation = try
+            central_authenticator(
+                T,
+                request,
+                evaluation_context,
+                root,
+                amplitude,
+                "staged primary central root",
+                root;
+                base_evaluation=root_evaluation,
+            )
+        catch failure
+            failure isa InterruptException && rethrow()
+            failure isa ODEControlFailure && rethrow()
+            failure isa RootReadoutResourceLimit && rethrow()
+            failure isa NumericalControlFailure || rethrow()
+            nothing
+        end
+        if authenticated_root_evaluation === nothing ||
+                authenticated_root_evaluation.error_breakdown === nothing ||
+                authenticated_root_evaluation.error_model_id === nothing ||
+                !isequal(
+                    authenticated_root_evaluation.error_model_id,
+                    required(request, "determinant_error_model"),
+                )
+            escalation_reason =
+                "STAGED_DETERMINANT_ERROR_MODEL_UNAVAILABLE"
+        end
+    end
+
+    if escalation_reason === nothing
+        residual = abs(authenticated_root_evaluation.value)
+        root_error_abs =
+            determinant_error_abs(T, authenticated_root_evaluation)
+        residual_upper_bound_abs = residual + root_error_abs
+        required_derivative_lower_bound_abs =
+            residual_upper_bound_abs / tolerance
+        h = validated_frequency_step(T, request) * (one(T) + abs(root))
+        derivative_sample = try
+            half_derivative_evaluator(
+                T,
+                request,
+                evaluation_context,
+                root,
+                amplitude,
+                Complex{T}(h / T(2), zero(T)),
+                "staged derivative h/2";
+                authenticate_controls=true,
+                determinant_evaluator=nothing,
+            )
+        catch failure
+            failure isa InterruptException && rethrow()
+            failure isa ODEControlFailure && rethrow()
+            failure isa RootReadoutResourceLimit && rethrow()
+            failure isa NumericalControlFailure || rethrow()
+            nothing
+        end
+        if derivative_sample === nothing
+            escalation_reason =
+                "STAGED_DERIVATIVE_LOWER_BOUND_UNRESOLVED"
+        else
+            derivative_real_half, _, propagated_derivative_error_abs =
+                derivative_sample
+            if !all(isfinite, (
+                real(derivative_real_half),
+                imag(derivative_real_half),
+                propagated_derivative_error_abs,
+            )) || propagated_derivative_error_abs < zero(T)
+                escalation_reason =
+                    "STAGED_DERIVATIVE_LOWER_BOUND_UNRESOLVED"
+            else
+                raw_step_disagreement_abs =
+                    abs(derivative_real_half - newton_derivative)
+                safety_factor =
+                    authenticated_root_evaluation.error_breakdown.safety_factor
+                if !isfinite(safety_factor) ||
+                        safety_factor <= zero(T)
+                    escalation_reason =
+                        "STAGED_DERIVATIVE_LOWER_BOUND_UNRESOLVED"
+                else
+                    # TODO: [HUMAN MATH REVIEW REQUIRED - justify the staged derivative-disagreement safety multiplier before final merge]
+                    guarded_step_disagreement_abs =
+                        safety_factor * raw_step_disagreement_abs
+                    candidate = derivative_authentication_candidate(
+                        derivative_real_half,
+                        propagated_derivative_error_abs,
+                        guarded_step_disagreement_abs,
+                        h / T(2),
+                        "real",
+                    )
+                    if candidate.authentication === nothing
+                        derivative_lower_bound_abs =
+                            candidate.lower_bound_abs
+                        escalation_reason =
+                            "STAGED_DERIVATIVE_LOWER_BOUND_UNRESOLVED"
+                    else
+                        derivative_authentication =
+                            candidate.authentication
+                        derivative_lower_bound_abs =
+                            derivative_authentication.lower_bound_abs
+                        correction_upper_bound =
+                            residual_upper_bound_abs /
+                            derivative_lower_bound_abs
+                        if !isfinite(correction_upper_bound) ||
+                                correction_upper_bound > tolerance
+                            escalation_reason =
+                                "STAGED_CORRECTION_UPPER_BOUND_ABOVE_TOLERANCE"
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    reference_root = parse_complex(T, request, "omega_re", "omega_im")
+    branch_identity = string(required(request, "branch_convention"))
+    branch_authenticated =
+        branch_identity == BRANCH_CONVENTION_ID &&
+        abs(root - reference_root) <=
+            parse_real(T, request, "branch_enclosure_radius_abs")
+    if escalation_reason === nothing && !branch_authenticated
+        escalation_reason =
+            "STAGED_BRANCH_AUTHENTICATION_UNRESOLVED"
+    end
+
+    if escalation_reason === nothing
+        derivative_authentication = DerivativeAuthentication{T}(
+            derivative_real_half,
+            propagated_derivative_error_abs,
+            guarded_step_disagreement_abs,
+            validated_frequency_step(T, request) *
+                (one(T) + abs(root)) / T(2),
+            "real",
+        )
+        root_authentication = RootAuthentication{T}(
+            authenticated_root_evaluation.value,
+            authenticated_root_evaluation.error_breakdown,
+            residual_upper_bound_abs,
+            derivative_authentication,
+            correction_upper_bound,
+            authenticated_root_evaluation.error_model_id,
+            tolerance,
+            true,
+            STAGED_REAL_AXIS_AUTHENTICATION_STRATEGY_ID,
+            newton_derivative,
+            derivative_real_half,
+            nothing,
+            nothing,
+        )
+        result = (
+            root=root,
+            residual=residual,
+            derivative_lower_bound_abs=derivative_lower_bound_abs,
+            converged=true,
+            root_evaluation=authenticated_root_evaluation,
+            root_authentication=root_authentication,
+            solve_role=FULL_AUTHENTICATION,
+            authentication_mode=STAGED_FULL_AUTHENTICATION,
+            authoritative=true,
+            full_authentication_escalated=false,
+            escalation_reason=nothing,
+            authenticated_evidence_reused=
+                AUTHENTICATED_EVIDENCE_REUSE_COUNT_PHASE[] > 0,
+            residual_upper_bound_abs=residual_upper_bound_abs,
+            required_derivative_lower_bound_abs=
+                required_derivative_lower_bound_abs,
+            correction_upper_bound=correction_upper_bound,
+            root_correction_tolerance=tolerance,
+            raw_step_disagreement_abs=raw_step_disagreement_abs,
+            guarded_step_disagreement_abs=
+                guarded_step_disagreement_abs,
+            propagated_derivative_error_abs=
+                propagated_derivative_error_abs,
+            determinant_error_abs=
+                determinant_error_abs(T, authenticated_root_evaluation),
+            error_model_id=authenticated_root_evaluation.error_model_id,
+            branch_identity=branch_identity,
+            branch_authenticated=branch_authenticated,
+            control_identity=phase_control_identity(request),
+        )
+        staged_payload = authentication_progress_payload(phase, result)
+        progress_emit("primary_staged_derivative_accepted";
+            payload=staged_payload
+        )
+        progress_emit("derivative_control_completed"; payload=merge(
+            staged_payload,
+            Dict{String,Any}(
+                "root_authentication" =>
+                    root_authentication_text(root_authentication),
+                "authentication_strategy" =>
+                    STAGED_REAL_AXIS_AUTHENTICATION_STRATEGY_ID,
+                "derivative_real_half" =>
+                    progress_complex(derivative_real_half),
+                "derivative_real_base" =>
+                    progress_complex(newton_derivative),
+                "derivative_real_double" => nothing,
+                "derivative_imaginary" => nothing,
+                "fine_step_difference_abs" =>
+                    string(raw_step_disagreement_abs),
+                "coarse_step_difference_abs" => nothing,
+                "complex_axis_difference_abs" => nothing,
+                "real_step_convergent" => nothing,
+                "complex_axis_consistent" => nothing,
+                "derivative_uncertainty_abs" =>
+                    string(guarded_step_disagreement_abs),
+                "determinant_error_abs" =>
+                    string(result.determinant_error_abs),
+                "derivative_error_abs" =>
+                    string(propagated_derivative_error_abs),
+                "accepted" => true,
+            ),
+        ))
+        progress_emit("primary_staged_authentication_completed";
+            payload=staged_payload
+        )
+        return result
+    end
+
+    rejected_payload = authentication_progress_payload(
+        phase,
+        STAGED_FULL_AUTHENTICATION,
+        true,
+        true,
+        escalation_reason,
+        DETERMINANT_INDEX_PHASE[];
+        residual_upper_bound_abs=residual_upper_bound_abs,
+        derivative_lower_bound_abs=derivative_lower_bound_abs,
+        required_derivative_lower_bound_abs=
+            required_derivative_lower_bound_abs,
+        correction_upper_bound=correction_upper_bound,
+        root_correction_tolerance=tolerance,
+        raw_step_disagreement_abs=raw_step_disagreement_abs,
+        guarded_step_disagreement_abs=guarded_step_disagreement_abs,
+        propagated_derivative_error_abs=
+            propagated_derivative_error_abs,
+    )
+    progress_emit("primary_staged_derivative_rejected";
+        payload=rejected_payload
+    )
+    progress_emit("primary_full_authentication_escalated";
+        payload=merge(rejected_payload, Dict(
+            "authentication_mode" =>
+                authentication_mode_text(FULL_AUTHENTICATION_ESCALATION),
+        ))
+    )
+    full = full_authenticator(
+        T, request, evaluation_context, root, amplitude
+    )
+    full.root_authentication === nothing && error(
+        "PRIMARY full-authentication escalation omitted its certificate"
+    )
+    result = merge(full, (
+        authentication_mode=FULL_AUTHENTICATION_ESCALATION,
+        authoritative=true,
+        full_authentication_escalated=true,
+        escalation_reason=escalation_reason,
+        raw_step_disagreement_abs=raw_step_disagreement_abs,
+        guarded_step_disagreement_abs=guarded_step_disagreement_abs,
+    ))
+    progress_emit("primary_full_authentication_completed";
+        payload=authentication_progress_payload(phase, result)
+    )
+    return result
 end
 
 function solve_legacy_exterior_diagnostic_consistency(
@@ -5044,20 +5514,33 @@ function solve_legacy_exterior_diagnostic_consistency(
         branch_identity == BRANCH_CONVENTION_ID &&
         abs(root - authenticated_primary_root) <=
             parse_real(T, request, "branch_enclosure_radius_abs")
+    residual_upper_bound_abs =
+        root_authentication.residual_upper_bound_abs
+    tolerance = root_authentication.root_correction_tolerance
     return (
         root=root,
         residual=residual,
         derivative_lower_bound_abs=derivative_lower_bound_abs,
         converged=converged,
         root_evaluation=root_evaluation,
-        root_authentication=root_authentication,
+        # Diagnostics may consume a full certificate internally, but only
+        # PRIMARY publishes the authoritative RootAuthentication.
+        root_authentication=nothing,
         solve_role=DIAGNOSTIC_CONSISTENCY,
+        authentication_mode=DIAGNOSTIC_CONSISTENCY_AUTHENTICATION,
+        authoritative=false,
         full_authentication_escalated=false,
         escalation_reason=nothing,
         authenticated_evidence_reused=false,
+        residual_upper_bound_abs=residual_upper_bound_abs,
+        required_derivative_lower_bound_abs=
+            residual_upper_bound_abs / tolerance,
         correction_upper_bound=root_authentication.correction_upper_bound,
-        root_correction_tolerance=
-            root_authentication.root_correction_tolerance,
+        root_correction_tolerance=tolerance,
+        raw_step_disagreement_abs=nothing,
+        guarded_step_disagreement_abs=nothing,
+        propagated_derivative_error_abs=
+            root_authentication.derivative.propagated_error_abs,
         determinant_error_abs=
             determinant_error_abs(T, root_evaluation),
         error_model_id=root_evaluation.error_model_id,
@@ -5079,6 +5562,18 @@ function solve_diagnostic_consistency(
     determinant_evaluator=diagnostic_determinant_progress,
     full_authenticator=solve_full_authentication,
 ) where {T<:AbstractFloat}
+    tolerance = parse_real(T, request, "root_correction_tolerance")
+    progress_emit("diagnostic_consistency_started"; payload=
+        authentication_progress_payload(
+            phase,
+            DIAGNOSTIC_CONSISTENCY_AUTHENTICATION,
+            false,
+            false,
+            nothing,
+            DETERMINANT_INDEX_PHASE[];
+            root_correction_tolerance=tolerance,
+        )
+    )
     reuse_count_before = AUTHENTICATED_EVIDENCE_REUSE_COUNT_PHASE[]
     remaining_determinants =
         diagnostic_newton_remaining_determinant_count(
@@ -5096,10 +5591,9 @@ function solve_diagnostic_consistency(
             # At most one centred Newton stencil remains after the carried
             # initial determinant. Exact PRIMARY evidence can reduce the
             # number of actual determinant solves to zero. PRIMARY itself
-            # retains the historical default of eight.
+            # retains its separate staged/full resource policy.
             minimum_remaining_determinant_count=remaining_determinants,
         )
-    tolerance = parse_real(T, request, "root_correction_tolerance")
     branch_identity = string(required(request, "branch_convention"))
     displacement = abs(root - authenticated_primary_root)
     branch_authenticated =
@@ -5112,6 +5606,8 @@ function solve_diagnostic_consistency(
     escalation_reason = nothing
     derivative_authentication = nothing
     derivative_lower_bound_abs = zero(T)
+    residual_upper_bound_abs = nothing
+    required_derivative_lower_bound_abs = nothing
     correction_upper_bound = T(Inf)
     root_error_abs = zero(T)
 
@@ -5139,9 +5635,11 @@ function solve_diagnostic_consistency(
         derivative_lower_bound_abs =
             derivative_authentication.lower_bound_abs
         root_error_abs = determinant_error_abs(T, root_evaluation)
-        residual_upper_bound = residual + root_error_abs
+        residual_upper_bound_abs = residual + root_error_abs
+        required_derivative_lower_bound_abs =
+            residual_upper_bound_abs / tolerance
         correction_upper_bound =
-            residual_upper_bound / derivative_lower_bound_abs
+            residual_upper_bound_abs / derivative_lower_bound_abs
         if !isfinite(correction_upper_bound)
             escalation_reason = "CORRECTION_UPPER_BOUND_UNRESOLVED"
         elseif correction_upper_bound > tolerance
@@ -5156,7 +5654,7 @@ function solve_diagnostic_consistency(
     end
 
     if escalation_reason === nothing
-        return (
+        result = (
             root=root,
             residual=residual,
             derivative_lower_bound_abs=derivative_lower_bound_abs,
@@ -5164,29 +5662,62 @@ function solve_diagnostic_consistency(
             root_evaluation=root_evaluation,
             root_authentication=nothing,
             solve_role=DIAGNOSTIC_CONSISTENCY,
+            authentication_mode=DIAGNOSTIC_CONSISTENCY_AUTHENTICATION,
+            authoritative=false,
             full_authentication_escalated=false,
             escalation_reason=nothing,
             authenticated_evidence_reused=reused,
+            residual_upper_bound_abs=residual_upper_bound_abs,
+            required_derivative_lower_bound_abs=
+                required_derivative_lower_bound_abs,
             correction_upper_bound=correction_upper_bound,
             root_correction_tolerance=tolerance,
+            raw_step_disagreement_abs=nothing,
+            guarded_step_disagreement_abs=nothing,
+            propagated_derivative_error_abs=
+                derivative_authentication.propagated_error_abs,
             determinant_error_abs=root_error_abs,
             error_model_id=root_evaluation.error_model_id,
             branch_identity=branch_identity,
             branch_authenticated=true,
             control_identity=phase_control_identity(request),
         )
+        progress_emit("diagnostic_consistency_completed";
+            payload=authentication_progress_payload(phase, result)
+        )
+        return result
     end
 
-    progress_emit("root_phase_authentication_escalated"; payload=Dict(
-        "phase" => phase,
-        "solve_role" =>
-            root_solve_role_text(DIAGNOSTIC_CONSISTENCY),
-        "full_authentication_escalated" => true,
-        "escalation_reason" => escalation_reason,
-        "authenticated_evidence_reused" => reused,
-        "determinant_count" => DETERMINANT_INDEX_PHASE[],
-        "control_identity" => phase_control_identity(request),
+    escalation_payload = authentication_progress_payload(
+        phase,
+        FULL_AUTHENTICATION_ESCALATION,
+        false,
+        true,
+        escalation_reason,
+        DETERMINANT_INDEX_PHASE[];
+        residual_upper_bound_abs=residual_upper_bound_abs,
+        derivative_lower_bound_abs=derivative_lower_bound_abs,
+        required_derivative_lower_bound_abs=
+            required_derivative_lower_bound_abs,
+        correction_upper_bound=correction_upper_bound,
+        root_correction_tolerance=tolerance,
+        propagated_derivative_error_abs=
+            derivative_authentication === nothing ? nothing :
+            derivative_authentication.propagated_error_abs,
+    )
+    progress_emit("root_phase_authentication_escalated"; payload=merge(
+        escalation_payload,
+        Dict{String,Any}(
+            "solve_role" =>
+                root_solve_role_text(DIAGNOSTIC_CONSISTENCY),
+            "authenticated_evidence_reused" => reused,
+            "determinant_count" => DETERMINANT_INDEX_PHASE[],
+            "control_identity" => phase_control_identity(request),
+        ),
     ))
+    progress_emit("diagnostic_full_authentication_escalated";
+        payload=escalation_payload
+    )
     # Escalation uses the complete PRIMARY machinery and propagates every typed
     # numerical-control failure. Missing evidence can never become success.
     full = full_authenticator(
@@ -5199,26 +5730,42 @@ function solve_diagnostic_consistency(
         full.branch_identity == BRANCH_CONVENTION_ID &&
         full_displacement <=
             parse_real(T, request, "branch_enclosure_radius_abs")
-    return (
+    result = (
         root=full.root,
         residual=full.residual,
         derivative_lower_bound_abs=full.derivative_lower_bound_abs,
         converged=full.converged && full_branch_authenticated,
         root_evaluation=full.root_evaluation,
-        root_authentication=full.root_authentication,
+        # The full ladder was used to decide this diagnostic, but the phase
+        # remains non-authoritative and cannot publish RootAuthentication.
+        root_authentication=nothing,
         solve_role=DIAGNOSTIC_CONSISTENCY,
+        authentication_mode=FULL_AUTHENTICATION_ESCALATION,
+        authoritative=false,
         full_authentication_escalated=true,
         escalation_reason=escalation_reason,
         authenticated_evidence_reused=
             reused || full.authenticated_evidence_reused,
+        residual_upper_bound_abs=full.residual_upper_bound_abs,
+        required_derivative_lower_bound_abs=
+            full.required_derivative_lower_bound_abs,
         correction_upper_bound=full.correction_upper_bound,
         root_correction_tolerance=full.root_correction_tolerance,
+        raw_step_disagreement_abs=full.raw_step_disagreement_abs,
+        guarded_step_disagreement_abs=
+            full.guarded_step_disagreement_abs,
+        propagated_derivative_error_abs=
+            full.propagated_derivative_error_abs,
         determinant_error_abs=full.determinant_error_abs,
         error_model_id=full.error_model_id,
         branch_identity=full.branch_identity,
         branch_authenticated=full_branch_authenticated,
         control_identity=phase_control_identity(request),
     )
+    progress_emit("diagnostic_full_authentication_completed";
+        payload=authentication_progress_payload(phase, result)
+    )
+    return result
 end
 
 function solve_phase(
@@ -5242,6 +5789,7 @@ function solve_phase(
     LAST_DETERMINANT_PURPOSE[] = nothing
     context = Dict{String,Any}(
         "phase" => phase,
+        "root_phase" => phase,
         "seed_omega" => progress_complex(initial),
         "current_omega" => progress_complex(initial),
     )
@@ -5256,6 +5804,16 @@ function solve_phase(
             "fallback_used" => used,
         )
         return progress_scope(seed_context) do
+            selected_mode = if solve_role === FULL_AUTHENTICATION
+                if string(required(request, "mechanism_id")) ==
+                        "horizon-admittance"
+                    STAGED_FULL_AUTHENTICATION
+                else
+                    LEGACY_FULL_AUTHENTICATION
+                end
+            else
+                DIAGNOSTIC_CONSISTENCY_AUTHENTICATION
+            end
             progress_emit("root_seed_selected"; payload=Dict(
                 "requested_seed_kind" => requested_seed_kind,
                 "seed_kind" => selected_kind,
@@ -5263,9 +5821,23 @@ function solve_phase(
                 "fallback_used" => used,
                 "fallback_reason" => reason,
                 "fallback_error_type" => error_type,
+                "root_phase" => phase,
                 "solve_role" => root_solve_role_text(solve_role),
+                "authentication_mode" =>
+                    authentication_mode_text(selected_mode),
+                "authoritative" => solve_role === FULL_AUTHENTICATION,
             ))
             if solve_role === FULL_AUTHENTICATION
+                if string(required(request, "mechanism_id")) ==
+                        "horizon-admittance"
+                    return solve_staged_primary_authentication(
+                        T,
+                        request,
+                        evaluation_context,
+                        selected_initial,
+                        amplitude,
+                    )
+                end
                 return solve_full_authentication(
                     T,
                     request,
@@ -5300,15 +5872,35 @@ function solve_phase(
         end
     end
 
+    initial_mode = if solve_role === FULL_AUTHENTICATION
+        if string(required(request, "mechanism_id")) ==
+                "horizon-admittance"
+            STAGED_FULL_AUTHENTICATION
+        else
+            LEGACY_FULL_AUTHENTICATION
+        end
+    else
+        DIAGNOSTIC_CONSISTENCY_AUTHENTICATION
+    end
     return progress_scope(context) do
-        progress_emit("root_phase_started"; payload=Dict(
-            "seed_omega" => progress_complex(initial),
-            "current_omega" => progress_complex(initial),
-            "solve_role" => root_solve_role_text(solve_role),
-            "full_authentication_escalated" => false,
-            "escalation_reason" => nothing,
-            "authenticated_evidence_reused" => false,
-            "control_identity" => phase_control_identity(request),
+        progress_emit("root_phase_started"; payload=merge(
+            authentication_progress_payload(
+                phase,
+                initial_mode,
+                solve_role === FULL_AUTHENTICATION,
+                false,
+                nothing,
+                0;
+                root_correction_tolerance=
+                    parse_real(T, request, "root_correction_tolerance"),
+            ),
+            Dict{String,Any}(
+                "seed_omega" => progress_complex(initial),
+                "current_omega" => progress_complex(initial),
+                "solve_role" => root_solve_role_text(solve_role),
+                "authenticated_evidence_reused" => false,
+                "control_identity" => phase_control_identity(request),
+            ),
         ))
         actual_initial = initial
         actual_kind = seed_kind
@@ -5357,7 +5949,9 @@ function solve_phase(
             end
         end
         result = merge(result, (
+            root_phase=phase,
             determinant_count=DETERMINANT_INDEX_PHASE[],
+            determinant_count_phase=DETERMINANT_INDEX_PHASE[],
         ))
         completion_context = Dict{String,Any}(
             "seed_omega" => progress_complex(actual_initial),
@@ -5366,28 +5960,25 @@ function solve_phase(
             "fallback_used" => fallback_used,
         )
         progress_scope(completion_context) do
-            progress_emit("root_phase_completed"; payload=Dict(
-                "resulting_omega" => progress_complex(result.root),
-                "resulting_determinant_abs" => string(result.residual),
-                "derivative_abs" =>
-                    string(result.derivative_lower_bound_abs),
-                "correction_upper_bound" =>
-                    string(result.correction_upper_bound),
-                "root_correction_tolerance" =>
-                    string(result.root_correction_tolerance),
-                "branch_identity" => result.branch_identity,
-                "branch_authenticated" => result.branch_authenticated,
-                "control_identity" => result.control_identity,
-                "solve_role" =>
-                    root_solve_role_text(result.solve_role),
-                "full_authentication_escalated" =>
-                    result.full_authentication_escalated,
-                "escalation_reason" => result.escalation_reason,
-                "authenticated_evidence_reused" =>
-                    result.authenticated_evidence_reused,
-                "determinant_count" => result.determinant_count,
-                "converged" => result.converged,
-                "elapsed_seconds" => (time_ns() - started) / 1.0e9,
+            progress_emit("root_phase_completed"; payload=merge(
+                authentication_progress_payload(phase, result),
+                Dict{String,Any}(
+                    "resulting_omega" => progress_complex(result.root),
+                    "resulting_determinant_abs" => string(result.residual),
+                    "derivative_abs" =>
+                        string(result.derivative_lower_bound_abs),
+                    "branch_identity" => result.branch_identity,
+                    "branch_authenticated" => result.branch_authenticated,
+                    "control_identity" => result.control_identity,
+                    "solve_role" =>
+                        root_solve_role_text(result.solve_role),
+                    "authenticated_evidence_reused" =>
+                        result.authenticated_evidence_reused,
+                    "determinant_count" => result.determinant_count,
+                    "converged" => result.converged,
+                    "elapsed_seconds" =>
+                        (time_ns() - started) / 1.0e9,
+                ),
             ))
         end
         result
@@ -5556,6 +6147,7 @@ end
 
 function diagnostic_root_text(result, authenticated_primary_root)
     return Dict{String,Any}(
+        "root_phase" => result.root_phase,
         "root_omega_re" => numeric_text(real(result.root)),
         "root_omega_im" => numeric_text(imag(result.root)),
         "root_residual_abs" => numeric_text(result.residual),
@@ -5564,24 +6156,40 @@ function diagnostic_root_text(result, authenticated_primary_root)
         "determinant_error_abs" =>
             numeric_text(result.determinant_error_abs),
         "error_model_id" => result.error_model_id,
+        "residual_upper_bound_abs" =>
+            numeric_text(result.residual_upper_bound_abs),
         "derivative_lower_bound_abs" =>
             numeric_text(result.derivative_lower_bound_abs),
+        "required_derivative_lower_bound_abs" =>
+            numeric_text(result.required_derivative_lower_bound_abs),
         "correction_upper_bound" =>
             numeric_text(result.correction_upper_bound),
         "root_correction_tolerance" =>
             numeric_text(result.root_correction_tolerance),
+        "raw_step_disagreement_abs" =>
+            result.raw_step_disagreement_abs === nothing ? nothing :
+            numeric_text(result.raw_step_disagreement_abs),
+        "guarded_step_disagreement_abs" =>
+            result.guarded_step_disagreement_abs === nothing ? nothing :
+            numeric_text(result.guarded_step_disagreement_abs),
+        "propagated_derivative_error_abs" =>
+            numeric_text(result.propagated_derivative_error_abs),
         "displacement_from_primary_abs" =>
             numeric_text(abs(result.root - authenticated_primary_root)),
         "branch_identity" => result.branch_identity,
         "branch_authenticated" => result.branch_authenticated,
         "control_identity" => result.control_identity,
         "solve_role" => root_solve_role_text(result.solve_role),
+        "authentication_mode" =>
+            authentication_mode_text(result.authentication_mode),
+        "authoritative" => result.authoritative,
         "full_authentication_escalated" =>
             result.full_authentication_escalated,
         "escalation_reason" => result.escalation_reason,
         "authenticated_evidence_reused" =>
             result.authenticated_evidence_reused,
         "determinant_count" => result.determinant_count,
+        "determinant_count_phase" => result.determinant_count_phase,
         "root_converged" => result.converged,
     )
 end
@@ -5683,7 +6291,7 @@ function result_fields(::Type{T}, request, digits::Int, bits::Int) where {T<:Abs
         )
         branch_valid = abs(root - omega) <= branch_tolerance
         return [
-            "schema_version" => 5,
+            "schema_version" => 6,
             "status" => "ok",
             "adapter" => "package-owned-julia-gsn-root-readout",
             "request_sha256" => string(required(request, "request_sha256")),
@@ -5763,7 +6371,7 @@ function result_fields(::Type{T}, request, digits::Int, bits::Int) where {T<:Abs
     )
 
     return [
-        "schema_version" => 5,
+        "schema_version" => 6,
         "status" => "ok",
         "adapter" => "package-owned-julia-gsn-root-readout",
         "request_sha256" => string(required(request, "request_sha256")),

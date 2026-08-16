@@ -704,6 +704,57 @@ class CampaignProgressReporterTests(unittest.TestCase):
         self.assertIn("9.15357579817089e-61 / 2e-11", dashboard)
         self.assertIn("accepted=True", dashboard)
 
+    def test_staged_authentication_workflow_fields_reach_live_telemetry(self):
+        reporter = CampaignProgressReporter(
+            "normal", self.reporter_checkpoint, io.StringIO()
+        )
+        reporter.publish(_payload_event(
+            ProgressEventKind.PRIMARY_STAGED_AUTHENTICATION_COMPLETED,
+            {
+                "phase": "PRIMARY",
+                "root_phase": "PRIMARY",
+                "authentication_mode": "STAGED_FULL_AUTHENTICATION",
+                "authoritative": True,
+                "full_authentication_escalated": False,
+                "escalation_reason": None,
+                "determinant_count_phase": 8,
+                "residual_upper_bound_abs": "2.8e-14",
+                "derivative_lower_bound_abs": "2",
+                "required_derivative_lower_bound_abs": "1.4e-3",
+                "correction_upper_bound": "1.4e-14",
+                "root_correction_tolerance": "2e-11",
+                "raw_step_disagreement_abs": "1e-9",
+                "guarded_step_disagreement_abs": "6.4e-8",
+                "propagated_derivative_error_abs": "1e-12",
+            },
+            leaf_id="leaf-13",
+            leaf_index=13,
+            leaf_count=212,
+            mechanism_id="horizon-admittance",
+            precision_digits=80,
+            phase="PRIMARY",
+        ))
+
+        live = reporter._live_execution_mapping()
+        expected = {
+            "root_phase": "PRIMARY",
+            "authentication_mode": "STAGED_FULL_AUTHENTICATION",
+            "authoritative": True,
+            "full_authentication_escalated": False,
+            "escalation_reason": None,
+            "phase_determinant_count": 8,
+            "phase_residual_upper_bound_abs": "2.8e-14",
+            "phase_derivative_lower_bound_abs": "2",
+            "phase_required_derivative_lower_bound_abs": "1.4e-3",
+            "phase_correction_upper_bound": "1.4e-14",
+            "phase_root_correction_tolerance": "2e-11",
+            "phase_raw_step_disagreement_abs": "1e-9",
+            "phase_guarded_step_disagreement_abs": "6.4e-8",
+            "phase_propagated_derivative_error_abs": "1e-12",
+        }
+        for name, value in expected.items():
+            self.assertEqual(live[name], value, name)
+
     def test_diagnostic_role_escalation_reuse_and_count_reach_live_telemetry(
         self,
     ):

@@ -45,32 +45,50 @@ _QUIET_KINDS = frozenset(
         ProgressEventKind.ERROR,
     }
 )
-_NORMAL_KINDS = _QUIET_KINDS | frozenset(
+_AUTHENTICATION_WORKFLOW_KINDS = frozenset(
     {
-        ProgressEventKind.SOLVED_LEAF_CACHE_SCANNED,
-        ProgressEventKind.CAMPAIGN_STARTED,
-        ProgressEventKind.CHECKPOINT_WRITING,
-        ProgressEventKind.CHECKPOINT_WRITTEN,
-        ProgressEventKind.PRECISION_STAGE_STARTED,
-        ProgressEventKind.PRECISION_STAGE_COMPLETED,
-        ProgressEventKind.COMPONENT_PASS_STARTED,
-        ProgressEventKind.COMPONENT_PASS_COMPLETED,
-        ProgressEventKind.AMPLITUDE_READOUT_STARTED,
-        ProgressEventKind.AMPLITUDE_READOUT_COMPLETED,
-        ProgressEventKind.ROOT_PHASE_STARTED,
-        ProgressEventKind.ROOT_SEED_SELECTED,
-        ProgressEventKind.ROOT_PHASE_AUTHENTICATION_ESCALATED,
-        ProgressEventKind.ROOT_PHASE_COMPLETED,
-        ProgressEventKind.NEWTON_ITERATION_STARTED,
-        ProgressEventKind.NEWTON_ITERATION_COMPLETED,
-        ProgressEventKind.REQUEST_STARTED,
-        ProgressEventKind.REQUEST_VALIDATED,
-        ProgressEventKind.REQUEST_COMPLETED,
-        ProgressEventKind.REQUEST_FAILED,
-        ProgressEventKind.REQUEST_INTERRUPTED,
-        ProgressEventKind.LEAF_CACHE_PUBLISHED,
-        ProgressEventKind.ROOT_READOUT_REUSED,
+        ProgressEventKind.PRIMARY_STAGED_AUTHENTICATION_STARTED,
+        ProgressEventKind.PRIMARY_STAGED_DERIVATIVE_ACCEPTED,
+        ProgressEventKind.PRIMARY_STAGED_DERIVATIVE_REJECTED,
+        ProgressEventKind.PRIMARY_STAGED_AUTHENTICATION_COMPLETED,
+        ProgressEventKind.PRIMARY_FULL_AUTHENTICATION_ESCALATED,
+        ProgressEventKind.PRIMARY_FULL_AUTHENTICATION_COMPLETED,
+        ProgressEventKind.DIAGNOSTIC_CONSISTENCY_STARTED,
+        ProgressEventKind.DIAGNOSTIC_CONSISTENCY_COMPLETED,
+        ProgressEventKind.DIAGNOSTIC_FULL_AUTHENTICATION_ESCALATED,
+        ProgressEventKind.DIAGNOSTIC_FULL_AUTHENTICATION_COMPLETED,
     }
+)
+_NORMAL_KINDS = (
+    _QUIET_KINDS
+    | _AUTHENTICATION_WORKFLOW_KINDS
+    | frozenset(
+        {
+            ProgressEventKind.SOLVED_LEAF_CACHE_SCANNED,
+            ProgressEventKind.CAMPAIGN_STARTED,
+            ProgressEventKind.CHECKPOINT_WRITING,
+            ProgressEventKind.CHECKPOINT_WRITTEN,
+            ProgressEventKind.PRECISION_STAGE_STARTED,
+            ProgressEventKind.PRECISION_STAGE_COMPLETED,
+            ProgressEventKind.COMPONENT_PASS_STARTED,
+            ProgressEventKind.COMPONENT_PASS_COMPLETED,
+            ProgressEventKind.AMPLITUDE_READOUT_STARTED,
+            ProgressEventKind.AMPLITUDE_READOUT_COMPLETED,
+            ProgressEventKind.ROOT_PHASE_STARTED,
+            ProgressEventKind.ROOT_SEED_SELECTED,
+            ProgressEventKind.ROOT_PHASE_AUTHENTICATION_ESCALATED,
+            ProgressEventKind.ROOT_PHASE_COMPLETED,
+            ProgressEventKind.NEWTON_ITERATION_STARTED,
+            ProgressEventKind.NEWTON_ITERATION_COMPLETED,
+            ProgressEventKind.REQUEST_STARTED,
+            ProgressEventKind.REQUEST_VALIDATED,
+            ProgressEventKind.REQUEST_COMPLETED,
+            ProgressEventKind.REQUEST_FAILED,
+            ProgressEventKind.REQUEST_INTERRUPTED,
+            ProgressEventKind.LEAF_CACHE_PUBLISHED,
+            ProgressEventKind.ROOT_READOUT_REUSED,
+        }
+    )
 )
 _NORMAL_FALLBACK_KINDS = _NORMAL_KINDS | frozenset(
     {
@@ -127,7 +145,7 @@ _FORCED_STATUS_KINDS = frozenset(
         ProgressEventKind.WORKER_HEARTBEAT,
         ProgressEventKind.ERROR,
     }
-)
+) | _AUTHENTICATION_WORKFLOW_KINDS
 _STATUS_INTERVAL_SECONDS = 0.25
 _DASHBOARD_INTERVAL_SECONDS = 0.25
 _DASHBOARD_FORCED_KINDS = frozenset(
@@ -156,7 +174,7 @@ _DASHBOARD_FORCED_KINDS = frozenset(
         ProgressEventKind.LEAF_FAILED,
         ProgressEventKind.LEAF_INTERRUPTED,
     }
-)
+) | _AUTHENTICATION_WORKFLOW_KINDS
 _DASHBOARD_LIVE_KINDS = frozenset(
     {
         ProgressEventKind.NEWTON_ITERATION_STARTED,
@@ -681,35 +699,32 @@ class CampaignProgressReporter:
             }
             workflow_keys = (
                 "solve_role",
+                "authentication_mode",
+                "authoritative",
                 "full_authentication_escalated",
                 "escalation_reason",
                 "authenticated_evidence_reused",
                 "determinant_count",
+                "determinant_count_phase",
                 "control_identity",
                 "branch_authenticated",
+                "residual_upper_bound_abs",
+                "derivative_lower_bound_abs",
+                "required_derivative_lower_bound_abs",
                 "correction_upper_bound",
+                "root_correction_tolerance",
+                "raw_step_disagreement_abs",
+                "guarded_step_disagreement_abs",
+                "propagated_derivative_error_abs",
             )
             if any(key in payload for key in workflow_keys):
                 root_solve.update({
-                    "solve_role": payload.get("solve_role"),
-                    "full_authentication_escalated": payload.get(
-                        "full_authentication_escalated"
-                    ),
-                    "escalation_reason": payload.get("escalation_reason"),
-                    "authenticated_evidence_reused": payload.get(
-                        "authenticated_evidence_reused"
-                    ),
-                    "determinant_count_phase": payload.get(
-                        "determinant_count"
-                    ),
-                    "control_identity": payload.get("control_identity"),
-                    "branch_authenticated": payload.get(
-                        "branch_authenticated"
-                    ),
-                    "correction_upper_bound": payload.get(
-                        "correction_upper_bound"
-                    ),
+                    name: payload.get(name)
+                    for name in workflow_keys
                 })
+                root_solve["determinant_count_phase"] = payload.get(
+                    "determinant_count_phase", payload.get("determinant_count")
+                )
             record["root_solve"] = root_solve
             if context["phase"] == "PRIMARY" and root_key not in self._completed_primary_roots:
                 self._completed_primary_roots.add(root_key)
@@ -1142,11 +1157,22 @@ class CampaignProgressReporter:
         elif kind == ProgressEventKind.ROOT_PHASE_STARTED.value:
             self._dashboard_state["root_status"] = "SEARCHING"
             for name in (
+                "root_phase",
                 "solve_role",
+                "authentication_mode",
+                "authoritative",
                 "full_authentication_escalated",
                 "escalation_reason",
                 "authenticated_evidence_reused",
                 "control_identity",
+                "residual_upper_bound_abs",
+                "derivative_lower_bound_abs",
+                "required_derivative_lower_bound_abs",
+                "correction_upper_bound",
+                "root_correction_tolerance",
+                "raw_step_disagreement_abs",
+                "guarded_step_disagreement_abs",
+                "propagated_derivative_error_abs",
             ):
                 self._dashboard_state[name] = payload.get(name)
             self._dashboard_state["phase_determinant_count"] = 0
@@ -1157,26 +1183,63 @@ class CampaignProgressReporter:
             self._dashboard_state["escalation_reason"] = payload.get(
                 "escalation_reason"
             )
-            self._dashboard_state["solve_role"] = payload.get("solve_role")
-            self._dashboard_state["authenticated_evidence_reused"] = (
-                payload.get("authenticated_evidence_reused")
-            )
+            for name in (
+                "root_phase",
+                "solve_role",
+                "authentication_mode",
+                "authoritative",
+                "authenticated_evidence_reused",
+            ):
+                self._dashboard_state[name] = payload.get(name)
             self._dashboard_state["phase_determinant_count"] = payload.get(
-                "determinant_count"
+                "determinant_count_phase", payload.get("determinant_count")
+            )
+        elif kind in {
+            event_kind.value
+            for event_kind in _AUTHENTICATION_WORKFLOW_KINDS
+        }:
+            for name in (
+                "root_phase",
+                "authentication_mode",
+                "authoritative",
+                "full_authentication_escalated",
+                "escalation_reason",
+                "residual_upper_bound_abs",
+                "derivative_lower_bound_abs",
+                "required_derivative_lower_bound_abs",
+                "correction_upper_bound",
+                "root_correction_tolerance",
+                "raw_step_disagreement_abs",
+                "guarded_step_disagreement_abs",
+                "propagated_derivative_error_abs",
+            ):
+                self._dashboard_state[name] = payload.get(name)
+            self._dashboard_state["phase_determinant_count"] = payload.get(
+                "determinant_count_phase"
             )
         elif kind == ProgressEventKind.ROOT_PHASE_COMPLETED.value:
             for name in (
+                "root_phase",
                 "solve_role",
+                "authentication_mode",
+                "authoritative",
                 "full_authentication_escalated",
                 "escalation_reason",
                 "authenticated_evidence_reused",
                 "control_identity",
                 "branch_authenticated",
+                "residual_upper_bound_abs",
+                "derivative_lower_bound_abs",
+                "required_derivative_lower_bound_abs",
                 "correction_upper_bound",
+                "root_correction_tolerance",
+                "raw_step_disagreement_abs",
+                "guarded_step_disagreement_abs",
+                "propagated_derivative_error_abs",
             ):
                 self._dashboard_state[name] = payload.get(name)
             self._dashboard_state["phase_determinant_count"] = payload.get(
-                "determinant_count"
+                "determinant_count_phase", payload.get("determinant_count")
             )
             converged = payload.get("converged")
             if converged is True:
@@ -1852,7 +1915,10 @@ class CampaignProgressReporter:
             ("Mechanism", context.get("mechanism_id")),
             ("Precision", context.get("precision_digits")),
             ("Phase", context.get("phase")),
+            ("RootPhase", context.get("root_phase")),
             ("SolveRole", context.get("solve_role")),
+            ("AuthenticationMode", context.get("authentication_mode")),
+            ("Authoritative", context.get("authoritative")),
             (
                 "FullAuthEscalated",
                 context.get("full_authentication_escalated"),
@@ -2330,7 +2396,10 @@ class CampaignProgressReporter:
             "precision_digits": precision_digits,
             "precision_label": precision_label,
             "phase": state.get("phase"),
+            "root_phase": state.get("root_phase"),
             "solve_role": state.get("solve_role"),
+            "authentication_mode": state.get("authentication_mode"),
+            "authoritative": state.get("authoritative"),
             "full_authentication_escalated": state.get(
                 "full_authentication_escalated"
             ),
@@ -2345,8 +2414,29 @@ class CampaignProgressReporter:
             "phase_branch_authenticated": state.get(
                 "branch_authenticated"
             ),
+            "phase_residual_upper_bound_abs": state.get(
+                "residual_upper_bound_abs"
+            ),
+            "phase_derivative_lower_bound_abs": state.get(
+                "derivative_lower_bound_abs"
+            ),
+            "phase_required_derivative_lower_bound_abs": state.get(
+                "required_derivative_lower_bound_abs"
+            ),
             "phase_correction_upper_bound": state.get(
                 "correction_upper_bound"
+            ),
+            "phase_root_correction_tolerance": state.get(
+                "root_correction_tolerance"
+            ),
+            "phase_raw_step_disagreement_abs": state.get(
+                "raw_step_disagreement_abs"
+            ),
+            "phase_guarded_step_disagreement_abs": state.get(
+                "guarded_step_disagreement_abs"
+            ),
+            "phase_propagated_derivative_error_abs": state.get(
+                "propagated_derivative_error_abs"
             ),
             "promotion_reason": state.get("promotion_reason"),
             "seed_kind": state.get("seed_kind"),

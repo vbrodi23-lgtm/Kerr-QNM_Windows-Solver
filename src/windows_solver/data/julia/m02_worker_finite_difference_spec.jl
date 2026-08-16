@@ -1019,6 +1019,11 @@ function spec_full_authentication_outcome(
         evaluation.error_model_id,
         parse_real(Float64, request, "root_correction_tolerance"),
         converged,
+        FULL_DERIVATIVE_LADDER_AUTHENTICATION_STRATEGY_ID,
+        derivative.value,
+        derivative.value,
+        derivative.value,
+        derivative.value,
     )
     return (
         root=root,
@@ -1028,12 +1033,21 @@ function spec_full_authentication_outcome(
         root_evaluation=evaluation,
         root_authentication=authentication,
         solve_role=FULL_AUTHENTICATION,
+        authentication_mode=LEGACY_FULL_AUTHENTICATION,
+        authoritative=true,
         full_authentication_escalated=false,
         escalation_reason=nothing,
         authenticated_evidence_reused=false,
+        residual_upper_bound_abs=residual_upper_bound,
+        required_derivative_lower_bound_abs=
+            residual_upper_bound /
+            parse_real(Float64, request, "root_correction_tolerance"),
         correction_upper_bound=correction_upper_bound,
         root_correction_tolerance=
             parse_real(Float64, request, "root_correction_tolerance"),
+        raw_step_disagreement_abs=nothing,
+        guarded_step_disagreement_abs=nothing,
+        propagated_derivative_error_abs=derivative.propagated_error_abs,
         determinant_error_abs=determinant_error_abs(Float64, evaluation),
         error_model_id=evaluation.error_model_id,
         branch_identity=BRANCH_CONVENTION_ID,
@@ -1322,6 +1336,56 @@ end
 end
 
 
+@testset "all diagnostic phases stop after resolved Newton consistency evidence" begin
+    request = diagnostic_consistency_request()
+    context = spec_request_context(request)
+    observed_initials = ComplexF64[]
+    resolved_newton = function (
+        value_type, sample_request, sample_context, initial, amplitude;
+        determinant_evaluator=nothing,
+        minimum_remaining_determinant_count=2,
+    )
+        push!(observed_initials, initial)
+        evaluation = spec_root_evaluation(initial)
+        derivative = DerivativeAuthentication{Float64}(
+            complex(2.0, 0.0), 1.0e-12, 0.0, 1.0e-6, "real"
+        )
+        return initial, abs(evaluation.value), derivative.value, true,
+            evaluation, derivative
+    end
+    full_authenticator = (
+        value_type, sample_request, sample_context, initial, amplitude
+    ) -> error("resolved diagnostic must not run full authentication")
+
+    phase_initials = (
+        ("TRUNCATION", SPEC_ROOT),
+        ("RESOLUTION", SPEC_ROOT),
+        ("SEED-PATH", SPEC_ROOT + complex(1.0e-4, 5.0e-5)),
+    )
+    for (phase, initial) in phase_initials
+        result = solve_diagnostic_consistency(
+            Float64,
+            request,
+            context,
+            phase,
+            initial,
+            complex(0.0, 0.0),
+            SPEC_ROOT;
+            newton_solver=resolved_newton,
+            full_authenticator=full_authenticator,
+        )
+        @test result.root == initial
+        @test result.converged
+        @test result.authentication_mode ==
+            DIAGNOSTIC_CONSISTENCY_AUTHENTICATION
+        @test !result.authoritative
+        @test !result.full_authentication_escalated
+        @test result.root_authentication === nothing
+    end
+    @test observed_initials == last.(phase_initials)
+end
+
+
 #####
 ##### Staged authoritative PRIMARY specification
 #####
@@ -1488,6 +1552,43 @@ end
     @test newton_failure.escalation_reason ==
         "STAGED_NEWTON_NOT_CONVERGED"
 
+    derivative_missing = solve_staged_primary_authentication(
+        Float64, request, context, SPEC_ROOT, amplitude;
+        newton_solver=spec_staged_newton(
+            SPEC_ROOT, base; derivative=nothing, converged=true
+        ),
+        central_authenticator=never_central,
+        half_derivative_evaluator=never_half,
+        full_authenticator=successful_full,
+    )
+    @test derivative_missing.escalation_reason ==
+        "STAGED_NEWTON_DERIVATIVE_MISSING"
+
+    function staged_invalid_derivative_newton(derivative)
+        return function (
+            value_type, sample_request, sample_context, initial,
+            sample_amplitude; determinant_evaluator=nothing,
+            minimum_remaining_determinant_count=7,
+            propagate_derivative_error=false,
+        )
+            return SPEC_ROOT, abs(base.value), derivative, true, base, nothing
+        end
+    end
+    for derivative in (
+        zero(ComplexF64),
+        complex(NaN, 0.0),
+    )
+        invalid = solve_staged_primary_authentication(
+            Float64, request, context, SPEC_ROOT, amplitude;
+            newton_solver=staged_invalid_derivative_newton(derivative),
+            central_authenticator=never_central,
+            half_derivative_evaluator=never_half,
+            full_authenticator=successful_full,
+        )
+        @test invalid.escalation_reason ==
+            "STAGED_NEWTON_DERIVATIVE_INVALID"
+    end
+
     missing_model = (
         value=zero(ComplexF64),
         error_breakdown=nothing,
@@ -1541,7 +1642,24 @@ end
     )
     @test no_lower_bound.escalation_reason ==
         "STAGED_DERIVATIVE_LOWER_BOUND_UNRESOLVED"
-    @test full_calls[] == 4
+
+    nonfinite_lower_bound = solve_staged_primary_authentication(
+        Float64, request, context, SPEC_ROOT, amplitude;
+        newton_solver=spec_staged_newton(SPEC_ROOT, unresolved),
+        central_authenticator=(
+            value_type, sample_request, sample_context, root,
+            sample_amplitude, purpose, current; base_evaluation=nothing,
+        ) -> unresolved,
+        half_derivative_evaluator=(
+            value_type, sample_request, sample_context, root,
+            sample_amplitude, offset, label; authenticate_controls,
+            determinant_evaluator=nothing,
+        ) -> (complex(Inf, 0.0), nothing, 0.0),
+        full_authenticator=successful_full,
+    )
+    @test nonfinite_lower_bound.escalation_reason ==
+        "STAGED_DERIVATIVE_LOWER_BOUND_UNRESOLVED"
+    @test full_calls[] == 8
 end
 
 @testset "diagnostic consistency remains non-authoritative in both modes" begin

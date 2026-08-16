@@ -529,6 +529,39 @@ def valid_root_authentication(mechanism_id: str) -> dict[str, object]:
         "correction_upper_bound": "1E-60",
         "root_correction_tolerance": "2E-11",
         "accepted": True,
+        "authentication_strategy": (
+            "staged-real-axis-h-h2/v1"
+            if horizon
+            else "full-h-h2-2h-ih-ladder/v1"
+        ),
+        "derivative_evidence": {
+            "real_base": {
+                "real": (
+                    "2.400000000000000000000000000000000000000000000000000003"
+                    if horizon
+                    else "2.4"
+                ),
+                "imaginary": "0",
+            },
+            "real_half": {
+                "real": (
+                    "2.400000000000000000000000000000000000000000000000000003"
+                    if horizon
+                    else "2.4"
+                ),
+                "imaginary": "0",
+            },
+            "real_double": (
+                None
+                if horizon
+                else {"real": "2.4", "imaginary": "0"}
+            ),
+            "imaginary": (
+                None
+                if horizon
+                else {"real": "2.4", "imaginary": "0"}
+            ),
+        },
     }
 
 
@@ -576,6 +609,31 @@ def root_authentication_for_readout(
         "correction_upper_bound": str(correction_upper),
         "root_correction_tolerance": str(root_correction_tolerance),
         "accepted": accepted,
+        "authentication_strategy": (
+            "staged-real-axis-h-h2/v1"
+            if horizon
+            else "full-h-h2-2h-ih-ladder/v1"
+        ),
+        "derivative_evidence": {
+            "real_base": {
+                "real": str(derivative_abs),
+                "imaginary": "0",
+            },
+            "real_half": {
+                "real": str(derivative_abs),
+                "imaginary": "0",
+            },
+            "real_double": (
+                None
+                if horizon
+                else {"real": str(derivative_abs), "imaginary": "0"}
+            ),
+            "imaginary": (
+                None
+                if horizon
+                else {"real": str(derivative_abs), "imaginary": "0"}
+            ),
+        },
     }
 
 
@@ -603,7 +661,7 @@ def valid_julia_root_response(
         "seed-path": "4E-55",
     }
     return {
-        "schema_version": 5,
+        "schema_version": 6,
         "status": "ok",
         "adapter": "package-owned-julia-gsn-root-readout",
         "request_sha256": "e" * 64,
@@ -656,7 +714,17 @@ def valid_julia_root_response(
                     if request["mechanism_id"] == "horizon-admittance"
                     else None
                 ),
+                "residual_upper_bound_abs": (
+                    "1.1E-60"
+                    if request["mechanism_id"] == "horizon-admittance"
+                    else "1E-60"
+                ),
                 "derivative_lower_bound_abs": "2.5",
+                "required_derivative_lower_bound_abs": (
+                    "5.5E-50"
+                    if request["mechanism_id"] == "horizon-admittance"
+                    else "5E-50"
+                ),
                 "correction_upper_bound": (
                     "4.4E-61"
                     if request["mechanism_id"] == "horizon-admittance"
@@ -665,15 +733,28 @@ def valid_julia_root_response(
                 "root_correction_tolerance": policy[
                     "root_correction_tolerance"
                 ],
+                "raw_step_disagreement_abs": None,
+                "guarded_step_disagreement_abs": None,
+                "propagated_derivative_error_abs": "0",
                 "displacement_from_primary_abs": radius,
                 "branch_identity": policy["branch_convention"],
                 "branch_authenticated": True,
                 "control_identity": f"fixture-{phase}-controls/v1",
+                "root_phase": {
+                    "truncation": "TRUNCATION",
+                    "resolution": "RESOLUTION",
+                    "seed-path": "SEED-PATH",
+                }[phase],
                 "solve_role": "DIAGNOSTIC_CONSISTENCY",
+                "authentication_mode": "DIAGNOSTIC_CONSISTENCY",
+                "authoritative": False,
                 "full_authentication_escalated": False,
                 "escalation_reason": None,
                 "authenticated_evidence_reused": phase == "resolution",
                 "determinant_count": 0 if phase == "resolution" else 3,
+                "determinant_count_phase": (
+                    0 if phase == "resolution" else 3
+                ),
                 "root_converged": True,
             }
             for phase, radius in radii.items()
