@@ -41,10 +41,12 @@ reconstruction diagnostics retained.
 
 ### Numerical policy and coordinate containment
 
-Working precision is separate from the scientific correction target. Both the
-80- and 120-digit tiers use correction tolerances of 1e-18 at base and 1e-20 at
-refinement; 120 digits provide guard precision rather than imposing 1e-102 ODE
-accuracy. Coordinate and homogeneous ODE tolerances are separate.
+Working precision is separate from the scientific correction target. Binary64,
+80-digit, and 120-digit roots all use the established 2e-11 correction
+threshold at base and refinement. The former promoted 1e-18 and 1e-20 values
+were uncalibrated policy choices, not scientific requirements; 120 digits
+provide guard precision rather than a stricter acceptance criterion or 1e-102
+ODE accuracy. Coordinate and homogeneous ODE tolerances are separate.
 
 Coordinate maps start directly from the matching radius, verify the tortoise
 identity, and construct only the needed outer or roughly -100 real-inner span.
@@ -114,7 +116,7 @@ the following exist and are reviewed:
 
 1. Fixed Leaf 13 determinant at 80 digits with verified endpoints, all three
    propagation legs, finite coefficients, determinant error, and basis gates.
-2. Leaf 13 root with error-aware correction at or below 1e-18 and explicit
+2. Leaf 13 root with error-aware correction at or below 2e-11 and explicit
    derivative/error evidence.
 3. A 120-digit coordinate-map receipt reaching its endpoint without stall.
 4. The bounded five-mode regression set from the completion plan.

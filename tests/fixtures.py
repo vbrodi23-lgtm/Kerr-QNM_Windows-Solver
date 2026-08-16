@@ -198,7 +198,7 @@ def current_promoted_component_payload(
     }
 
     def conditioned(readout, readout_id):
-        correction_tolerance = Decimal("1e-18")
+        correction_tolerance = Decimal("2e-11")
         derivative = Decimal(str(readout.determinant_derivative_abs))
         normalised = Decimal(str(readout.determinant_residual_abs))
         if readout.converged:
@@ -406,25 +406,25 @@ def valid_control_failure_diagnostics(
             "elapsed_leg_seconds": 8.75,
         }
     if failure_code == "DETERMINANT_UNCERTAINTY_TOO_LARGE":
-        residual_upper = Decimal("1e-28") + Decimal("2e-18")
+        residual_upper = Decimal("1e-28") + Decimal("4.0000000000000002e-11")
         correction_upper = residual_upper / Decimal(2)
         return {
             "determinant_abs": "1e-28",
-            "determinant_error_abs": "2e-18",
+            "determinant_error_abs": "4.0000000000000002e-11",
             "correction_upper_bound": str(correction_upper),
             "correction_without_error": "5e-29",
-            "root_correction_tolerance": "1e-18",
+            "root_correction_tolerance": "2e-11",
             "derivative_lower_bound_abs": "2",
             "root_authentication": {
                 "central_determinant_re": "1e-28",
                 "central_determinant_im": "0",
                 "determinant_error": {
-                    "endpoint_disagreement_abs": "1e-18",
+                    "endpoint_disagreement_abs": "2.0000000000000001e-11",
                     "control_disagreement_abs": None,
                     "equivalence_disagreement_abs": None,
                     "precision_disagreement_abs": None,
                     "safety_factor": "2",
-                    "numerical_error_abs": "2e-18",
+                    "numerical_error_abs": "4.0000000000000002e-11",
                     "error_model_id": (
                         "verified-endpoint-control-equivalence-absolute-error/v2"
                     ),
@@ -440,7 +440,7 @@ def valid_control_failure_diagnostics(
                     "axis": "real",
                 },
                 "correction_upper_bound": str(correction_upper),
-                "root_correction_tolerance": "1e-18",
+                "root_correction_tolerance": "2e-11",
                 "accepted": False,
             },
         }
@@ -527,8 +527,41 @@ def valid_root_authentication(mechanism_id: str) -> dict[str, object]:
             "axis": "real",
         },
         "correction_upper_bound": "1E-60",
-        "root_correction_tolerance": "1E-18",
+        "root_correction_tolerance": "2E-11",
         "accepted": True,
+        "authentication_strategy": (
+            "staged-real-axis-h-h2/v1"
+            if horizon
+            else "full-h-h2-2h-ih-ladder/v1"
+        ),
+        "derivative_evidence": {
+            "real_base": {
+                "real": (
+                    "2.400000000000000000000000000000000000000000000000000003"
+                    if horizon
+                    else "2.4"
+                ),
+                "imaginary": "0",
+            },
+            "real_half": {
+                "real": (
+                    "2.400000000000000000000000000000000000000000000000000003"
+                    if horizon
+                    else "2.4"
+                ),
+                "imaginary": "0",
+            },
+            "real_double": (
+                None
+                if horizon
+                else {"real": "2.4", "imaginary": "0"}
+            ),
+            "imaginary": (
+                None
+                if horizon
+                else {"real": "2.4", "imaginary": "0"}
+            ),
+        },
     }
 
 
@@ -576,6 +609,31 @@ def root_authentication_for_readout(
         "correction_upper_bound": str(correction_upper),
         "root_correction_tolerance": str(root_correction_tolerance),
         "accepted": accepted,
+        "authentication_strategy": (
+            "staged-real-axis-h-h2/v1"
+            if horizon
+            else "full-h-h2-2h-ih-ladder/v1"
+        ),
+        "derivative_evidence": {
+            "real_base": {
+                "real": str(derivative_abs),
+                "imaginary": "0",
+            },
+            "real_half": {
+                "real": str(derivative_abs),
+                "imaginary": "0",
+            },
+            "real_double": (
+                None
+                if horizon
+                else {"real": str(derivative_abs), "imaginary": "0"}
+            ),
+            "imaginary": (
+                None
+                if horizon
+                else {"real": str(derivative_abs), "imaginary": "0"}
+            ),
+        },
     }
 
 
@@ -603,7 +661,7 @@ def valid_julia_root_response(
         "seed-path": "4E-55",
     }
     return {
-        "schema_version": 4,
+        "schema_version": 6,
         "status": "ok",
         "adapter": "package-owned-julia-gsn-root-readout",
         "request_sha256": "e" * 64,
@@ -646,6 +704,57 @@ def valid_julia_root_response(
                 "root_omega_im": omega["imaginary"],
                 "root_residual_abs": "1E-60",
                 "root_derivative_abs": "2.5",
+                "determinant_error_abs": (
+                    "1E-61"
+                    if request["mechanism_id"] == "horizon-admittance"
+                    else "0"
+                ),
+                "error_model_id": (
+                    "verified-endpoint-control-equivalence-absolute-error/v2"
+                    if request["mechanism_id"] == "horizon-admittance"
+                    else None
+                ),
+                "residual_upper_bound_abs": (
+                    "1.1E-60"
+                    if request["mechanism_id"] == "horizon-admittance"
+                    else "1E-60"
+                ),
+                "derivative_lower_bound_abs": "2.5",
+                "required_derivative_lower_bound_abs": (
+                    "5.5E-50"
+                    if request["mechanism_id"] == "horizon-admittance"
+                    else "5E-50"
+                ),
+                "correction_upper_bound": (
+                    "4.4E-61"
+                    if request["mechanism_id"] == "horizon-admittance"
+                    else "4E-61"
+                ),
+                "root_correction_tolerance": policy[
+                    "root_correction_tolerance"
+                ],
+                "raw_step_disagreement_abs": None,
+                "guarded_step_disagreement_abs": None,
+                "propagated_derivative_error_abs": "0",
+                "displacement_from_primary_abs": radius,
+                "branch_identity": policy["branch_convention"],
+                "branch_authenticated": True,
+                "control_identity": f"fixture-{phase}-controls/v1",
+                "root_phase": {
+                    "truncation": "TRUNCATION",
+                    "resolution": "RESOLUTION",
+                    "seed-path": "SEED-PATH",
+                }[phase],
+                "solve_role": "DIAGNOSTIC_CONSISTENCY",
+                "authentication_mode": "DIAGNOSTIC_CONSISTENCY",
+                "authoritative": False,
+                "full_authentication_escalated": False,
+                "escalation_reason": None,
+                "authenticated_evidence_reused": phase == "resolution",
+                "determinant_count": 0 if phase == "resolution" else 3,
+                "determinant_count_phase": (
+                    0 if phase == "resolution" else 3
+                ),
                 "root_converged": True,
             }
             for phase, radius in radii.items()

@@ -47,12 +47,42 @@ class ProgressEventKind(StrEnum):
     AMPLITUDE_READOUT_COMPLETED = "amplitude_readout_completed"
     ROOT_PHASE_STARTED = "root_phase_started"
     ROOT_SEED_SELECTED = "root_seed_selected"
+    ROOT_PHASE_AUTHENTICATION_ESCALATED = (
+        "root_phase_authentication_escalated"
+    )
+    PRIMARY_STAGED_AUTHENTICATION_STARTED = (
+        "primary_staged_authentication_started"
+    )
+    PRIMARY_STAGED_DERIVATIVE_ACCEPTED = (
+        "primary_staged_derivative_accepted"
+    )
+    PRIMARY_STAGED_DERIVATIVE_REJECTED = (
+        "primary_staged_derivative_rejected"
+    )
+    PRIMARY_STAGED_AUTHENTICATION_COMPLETED = (
+        "primary_staged_authentication_completed"
+    )
+    PRIMARY_FULL_AUTHENTICATION_ESCALATED = (
+        "primary_full_authentication_escalated"
+    )
+    PRIMARY_FULL_AUTHENTICATION_COMPLETED = (
+        "primary_full_authentication_completed"
+    )
+    DIAGNOSTIC_CONSISTENCY_STARTED = "diagnostic_consistency_started"
+    DIAGNOSTIC_CONSISTENCY_COMPLETED = "diagnostic_consistency_completed"
+    DIAGNOSTIC_FULL_AUTHENTICATION_ESCALATED = (
+        "diagnostic_full_authentication_escalated"
+    )
+    DIAGNOSTIC_FULL_AUTHENTICATION_COMPLETED = (
+        "diagnostic_full_authentication_completed"
+    )
     ROOT_PHASE_COMPLETED = "root_phase_completed"
     NEWTON_ITERATION_STARTED = "newton_iteration_started"
     NEWTON_ITERATION_COMPLETED = "newton_iteration_completed"
     DETERMINANT_STARTED = "determinant_started"
     DETERMINANT_COMPLETED = "determinant_completed"
     DETERMINANT_EVALUATED = "determinant_evaluated"
+    DETERMINANT_EVIDENCE_REUSED = "determinant_evidence_reused"
     HORIZON_CHART_EVALUATED = "horizon_chart_evaluated"
     DERIVATIVE_CONTROL_COMPLETED = "derivative_control_completed"
     ASYMPTOTIC_SERIES_EVALUATED = "asymptotic_series_evaluated"

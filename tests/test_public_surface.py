@@ -1107,6 +1107,8 @@ $candidate | ConvertTo-Json -Compress | Set-Content -LiteralPath $env:M02_TEST_J
             "factored-three-leg-horizon-basis-at-match-gsn/v1",
             "real-inner-tortoise-contour/v1",
             "scaled-horizon-basis-at-match/v1",
+            "staged-real-axis-h-h2/v1",
+            "full-h-h2-2h-ih-ladder/v1",
             "verified-endpoint-absolute-error/v1",
             "verified-endpoint-control-equivalence-absolute-error/v2",
             "approved/v1",

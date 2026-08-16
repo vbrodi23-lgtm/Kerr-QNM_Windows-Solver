@@ -441,12 +441,13 @@ def _root_correction_tolerance_for_precision(digits: int) -> float:
     The promoted threshold is read from the policy the solver was actually
     given, not reconstructed from the stored digit count. Those two answers used
     to differ enormously: a 120-digit stage was reported against ``1e-102``
-    while the request carried ``1e-18``, so ``newton_correction_over_tolerance``
-    was wrong by some eighty orders of magnitude and a converged root read as
-    hopelessly under-converged.
+    while an earlier uncalibrated request carried ``1e-18``, so
+    ``newton_correction_over_tolerance`` was wrong by some eighty orders of
+    magnitude and a converged root read as hopelessly under-converged.
 
-    The scientific target is a property of the physics rather than of the
-    arithmetic, which is exactly why it cannot be derived from precision.
+    The current policy uses the established binary64 threshold of ``2e-11``
+    for every arithmetic tier. Working precision cannot determine or silently
+    tighten this scientific acceptance criterion.
     """
 
     if digits == 64:

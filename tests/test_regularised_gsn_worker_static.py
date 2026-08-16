@@ -435,6 +435,40 @@ class RegularisedGsnWorkerSourceTests(unittest.TestCase):
             r"(?:state|endpoint|solution)\s*(?:\./|/)=\s*(?:maximum|abs)\(",
         )
 
+    def test_horizon_chart_identity_assertion_remains_fail_closed(self) -> None:
+        expectations = self.worker[
+            self.worker.index("const HORIZON_CHART_IDENTITY_EXPECTATIONS") :
+            self.worker.index("function assert_horizon_chart_identities")
+        ]
+        self.assertIn(
+            "HORIZON_BASIS_AT_MATCH_EXTRACTION_ID",
+            expectations,
+        )
+        assertion = self._function_slice(
+            "assert_horizon_chart_identities",
+            "evaluate_horizon_reflectivity_chart",
+        )
+        self.assertIn(
+            "getfield(chart_assessment, field) == expected || error(",
+            assertion,
+        )
+        chart = self._function_slice(
+            "evaluate_horizon_reflectivity_chart",
+            "evaluate_horizon_determinant",
+        )
+        self.assertIn(
+            "assert_horizon_chart_identities(chart_assessment)",
+            chart,
+        )
+        self.assertIn(
+            "worker accepts the horizon-at-match chart identity",
+            self.fd_spec,
+        )
+        self.assertIn(
+            "worker rejects a forged coefficient extraction identity",
+            self.fd_spec,
+        )
+
     def test_determinants_are_typed_and_fd_consumes_values_with_evidence(self) -> None:
         for contract in (
             "struct DeterminantDiagnostics{T<:AbstractFloat}",
@@ -637,17 +671,191 @@ class RegularisedGsnWorkerSourceTests(unittest.TestCase):
         self.assertIn("length(rungs) <= MAXIMUM_FREQUENCY_STEP_RUNGS", self.fd_spec)
         self.assertIn("length(rungs) == length(unique(rungs))", self.fd_spec)
 
+
+    def test_promoted_root_roles_separate_primary_authentication_from_diagnostics(
+        self,
+    ) -> None:
+        for contract in (
+            "@enum RootSolveRole",
+            "FULL_AUTHENTICATION",
+            "DIAGNOSTIC_CONSISTENCY",
+            "function solve_full_authentication(",
+            "function solve_diagnostic_consistency(",
+        ):
+            self.assertIn(contract, self.worker)
+
+        diagnostic = self._function_slice(
+            "solve_diagnostic_consistency", "solve_phase"
+        )
+        self.assertIn("diagnostic_consistency_newton", diagnostic)
+        self.assertIn("solve_full_authentication", diagnostic)
+        self.assertNotIn("evaluate_derivative_step_ladder(", diagnostic)
+        self.assertNotIn('"final derivative h/2"', diagnostic)
+        self.assertNotIn('"final derivative 2h"', diagnostic)
+        self.assertNotIn('"final derivative ih"', diagnostic)
+        diagnostic_newton = self._function_slice(
+            "diagnostic_consistency_newton", "solve_full_authentication"
+        )
+        self.assertIn("bounded_newton(", diagnostic_newton)
+        self.assertIn("propagate_derivative_error=true", diagnostic_newton)
+        self.assertNotIn("evaluate_derivative_step_ladder(", diagnostic_newton)
+
+        phase = self._function_slice("solve_phase", "refined_request")
+        self.assertIn("solve_role::RootSolveRole", phase)
+        self.assertNotIn('authenticate_controls=(phase == "PRIMARY")', phase)
+
+    def test_diagnostic_reuse_is_exact_and_phase_telemetry_is_complete(
+        self,
+    ) -> None:
+        for contract in (
+            "function remember_authenticated_determinant!(",
+            "function reuse_authenticated_determinant(",
+            "isequal(evidence.request, request)",
+            "GSN.full_convention_equal(",
+            "evidence.frozen_branch_cell == context.frozen_branch_cell",
+            '"solve_role"',
+            '"full_authentication_escalated"',
+            '"escalation_reason"',
+            '"authenticated_evidence_reused"',
+            '"determinant_count"',
+            '"control_identity"',
+            '"correction_upper_bound"',
+            '"branch_authenticated"',
+        ):
+            self.assertIn(contract, self.worker)
+        for executed in (
+            "resolved diagnostic correction stops before the final derivative ladder",
+            "truncation and resolution reject a materially displaced root",
+            "seed path keeps its independent seed and rejects a wrong root",
+            "insufficient diagnostic evidence escalates fail closed",
+            "authenticated determinant reuse requires exact scientific inputs",
+        ):
+            self.assertIn(executed, self.fd_spec)
+
+    def test_seed_path_keeps_its_independent_seed_and_diagnostic_role(
+        self,
+    ) -> None:
+        result_fields = self._function_slice("result_fields", "evaluate_request")
+        alternate = result_fields.index(
+            'alternate = omega + Complex{T}(T("0.00025"), T("0.000125"))'
+        )
+        seed_phase = result_fields.index('"SEED-PATH"', alternate)
+        independent = result_fields.index(
+            'seed_kind="INDEPENDENT_SEED_PATH"', seed_phase
+        )
+        diagnostic_role = result_fields.index(
+            "solve_role=DIAGNOSTIC_CONSISTENCY", seed_phase
+        )
+        self.assertLess(alternate, seed_phase)
+        self.assertLess(seed_phase, independent)
+        self.assertLess(seed_phase, diagnostic_role)
+
+    def test_primary_stages_h_and_authenticated_h_over_two_before_full_escalation(
+        self,
+    ) -> None:
+        for contract in (
+            "@enum RootAuthenticationMode",
+            "STAGED_FULL_AUTHENTICATION",
+            "FULL_AUTHENTICATION_ESCALATION",
+            "DIAGNOSTIC_CONSISTENCY_AUTHENTICATION",
+            "function solve_staged_primary_authentication(",
+            "function solve_full_authentication(",
+            "STAGED_NEWTON_NOT_CONVERGED",
+            "STAGED_NEWTON_DERIVATIVE_MISSING",
+            "STAGED_DETERMINANT_ERROR_MODEL_UNAVAILABLE",
+            "STAGED_NEWTON_DERIVATIVE_INVALID",
+            "STAGED_DERIVATIVE_LOWER_BOUND_UNRESOLVED",
+            "STAGED_CORRECTION_UPPER_BOUND_ABOVE_TOLERANCE",
+        ):
+            self.assertIn(contract, self.worker)
+
+        staged = self._function_slice(
+            "solve_staged_primary_authentication", "solve_diagnostic_consistency"
+        )
+        self.assertIn("bounded_newton", staged)
+        self.assertIn("authenticated_determinant_progress", staged)
+        self.assertIn('"staged derivative h/2"', staged)
+        self.assertNotIn('"final derivative 2h"', staged)
+        self.assertNotIn('"final derivative ih"', staged)
+        self.assertIn("raw_step_disagreement_abs", staged)
+        self.assertIn("guarded_step_disagreement_abs", staged)
+        self.assertIn(
+            "TODO: [HUMAN MATH REVIEW REQUIRED - justify the staged "
+            "derivative-disagreement safety multiplier before final merge]",
+            staged,
+        )
+
+        full = self._function_slice(
+            "solve_full_authentication", "solve_staged_primary_authentication"
+        )
+        self.assertIn("solve_once(", full)
+        self.assertIn("authenticate_controls=true", full)
+        solve_once = self._function_slice("solve_once", "solve_full_authentication")
+        self.assertIn("evaluate_derivative_step_ladder(", solve_once)
+        for retained in (
+            '"final derivative h/2"',
+            '"final derivative 2h"',
+            '"final derivative ih"',
+        ):
+            self.assertIn(retained, self.worker)
+
+    def test_staged_and_diagnostic_progress_events_are_literal_and_registered(
+        self,
+    ) -> None:
+        for event in (
+            "primary_staged_authentication_started",
+            "primary_staged_derivative_accepted",
+            "primary_staged_derivative_rejected",
+            "primary_staged_authentication_completed",
+            "primary_full_authentication_escalated",
+            "primary_full_authentication_completed",
+            "diagnostic_consistency_started",
+            "diagnostic_consistency_completed",
+            "diagnostic_full_authentication_escalated",
+            "diagnostic_full_authentication_completed",
+        ):
+            self.assertIn(f'progress_emit("{event}"', self.worker)
+
+    def test_staged_evidence_never_fabricates_unexecuted_directions(self) -> None:
+        authentication = self._function_slice(
+            "root_authentication_text", "solve_once"
+        )
+        self.assertIn('"authentication_strategy"', authentication)
+        self.assertIn('"derivative_evidence"', authentication)
+        self.assertIn('"real_double"', authentication)
+        self.assertIn('"imaginary"', authentication)
+        staged = self._function_slice(
+            "solve_staged_primary_authentication", "solve_diagnostic_consistency"
+        )
+        constructor_start = staged.index(
+            "root_authentication = RootAuthentication{T}("
+        )
+        constructor_end = staged.index("result = (", constructor_start)
+        constructor = staged[constructor_start:constructor_end]
+        self.assertIn(
+            "STAGED_REAL_AXIS_AUTHENTICATION_STRATEGY_ID",
+            constructor,
+        )
+        self.assertRegex(
+            constructor,
+            r"derivative_real_half,\s+nothing,\s+nothing,",
+        )
+        self.assertIn('"derivative_real_double" => nothing', staged)
+        self.assertIn('"derivative_imaginary" => nothing', staged)
+
     def test_primary_authentication_tightens_only_exact_frequencies(self) -> None:
         for contract in (
             "function tight_control_request(",
             "function authenticated_determinant_progress(",
             "base_frequency == tight_frequency",
             "abs(base.value - tight.value)",
-            "authenticate_controls=(phase == \"PRIMARY\")",
+            "solve_role=FULL_AUTHENTICATION",
+            "remember_authenticated_determinant!(",
         ):
             self.assertIn(contract, self.worker)
         refined = self._function_slice("refined_request", "conditioning_response")
         self.assertNotIn("authenticated_determinant_progress(", refined)
+        self.assertIn("return tight_control_request(T, request)", refined)
 
     def test_final_authentication_leaves_exterior_derivative_path_unchanged(
         self,

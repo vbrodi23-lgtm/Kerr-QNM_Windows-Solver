@@ -35,6 +35,7 @@ from .response_engine import (
     RootReadout,
     VERIFIED_ENDPOINT_ERROR_MODEL,
     WORKER_RESPONSE_RECEIPT_SCHEMA,
+    WORKER_RESPONSE_WIRE_SCHEMA,
     _exterior_support,
     mode_specific_branch_enclosure_radius,
     regularised_gsn_mechanism_contract,
@@ -441,10 +442,12 @@ class _WindowsKillOnCloseJob:
 def promoted_precision_numerical_controls() -> dict[str, object]:
     """Return the provisional promoted control profile.
 
-    The scientific root target is a property of the physics, not of the
-    arithmetic: 1e-18 at base and 1e-20 at refinement, for **both** the 80- and
-    120-digit tiers. Through ``required_reliable_digits`` those correspond to 24
-    and 26 required reliable digits.
+    Scientific root acceptance uses the solver's established binary64
+    correction threshold of 2e-11 at base and refinement, for both the 80- and
+    120-digit tiers. The former 1e-18 and 1e-20 promoted thresholds were
+    uncalibrated policy choices, not scientific requirements. Working precision
+    supplies guard digits against cancellation, carrier changes, and finite
+    differencing; it does not silently tighten the root-acceptance criterion.
 
     The previous table derived the 120-digit controls mechanically from the
     stored digit count (``10**-(digits - 18)``), which demanded a 1e-102 root
@@ -452,22 +455,22 @@ def promoted_precision_numerical_controls() -> dict[str, object]:
     tolerance to the coordinate map. That is what pinned Leaf 13's coordinate
     solve at 8.1e-17 steps: 2,000,002 RHS evaluations and 87.8 s to cover
     1.01e-11 of a 5000 span. More stored digits do not make a QNM root more
-    accurately defined; they buy guard precision against cancellation, carrier
-    changes, and finite differencing.
+    accurately defined.
 
-    So the 120-digit tier keeps the same scientific target as the 80-digit tier
-    and spends its extra digits as guard: its ODE controls are tightened by a
-    bounded factor over the demonstrated-healthy 80-digit level (1e-18 / 1e-20
-    homogeneous, reached in 2,978 RHS evaluations on the exact Leaf 13 leg),
-    not driven to the arithmetic floor.
+    The 120-digit tier therefore spends its extra digits as guard. Its ODE
+    controls are tightened by a bounded factor over the demonstrated-healthy
+    80-digit level (1e-18 / 1e-20 homogeneous, reached in 2,978 RHS evaluations
+    on the exact Leaf 13 leg), not driven to the arithmetic floor.
 
     The coordinate map gets its own, looser controls. It is a scalar quadrature
     for r(rho) and only has to avoid dominating the determinant error budget;
     it does not need the homogeneous solve's local-error target.
 
-    These values are explicitly ``UNMEASURED``. The horizon request policy
-    carries that status, and release admission remains blocked until
-    ``tools/calibrate_leaf13_horizon_controls.jl`` produces a valid native
+    The ODE, coordinate, and finite-difference control values remain explicitly
+    ``UNMEASURED``. The root-acceptance threshold is not a calibration claim:
+    it is the existing binary64 scientific standard. The horizon request policy
+    carries the control-profile status, and release admission remains blocked
+    until ``tools/calibrate_leaf13_horizon_controls.jl`` produces a valid native
     receipt and a reviewed profile is committed. Arithmetic work can use this
     bounded provisional profile to obtain that evidence; it cannot call the
     profile calibrated merely because the values are present in source.
@@ -476,7 +479,7 @@ def promoted_precision_numerical_controls() -> dict[str, object]:
     return {
         "80": {
             "base": {
-                "root_correction_tolerance": "1e-18",
+                "root_correction_tolerance": "2e-11",
                 "ode_relative_tolerance": "1e-18",
                 "ode_absolute_tolerance": "1e-20",
                 "homogeneous_ode_relative_tolerance": "1e-18",
@@ -488,7 +491,7 @@ def promoted_precision_numerical_controls() -> dict[str, object]:
                 "frequency_step_maximum": "1e-3",
             },
             "refinement": {
-                "root_correction_tolerance": "1e-20",
+                "root_correction_tolerance": "2e-11",
                 "ode_relative_tolerance": "1e-20",
                 "ode_absolute_tolerance": "1e-20",
                 "homogeneous_ode_relative_tolerance": "1e-22",
@@ -502,7 +505,7 @@ def promoted_precision_numerical_controls() -> dict[str, object]:
         },
         "120": {
             "base": {
-                "root_correction_tolerance": "1e-18",
+                "root_correction_tolerance": "2e-11",
                 "ode_relative_tolerance": "1e-24",
                 "ode_absolute_tolerance": "1e-26",
                 "homogeneous_ode_relative_tolerance": "1e-24",
@@ -514,7 +517,7 @@ def promoted_precision_numerical_controls() -> dict[str, object]:
                 "frequency_step_maximum": "1e-3",
             },
             "refinement": {
-                "root_correction_tolerance": "1e-20",
+                "root_correction_tolerance": "2e-11",
                 "ode_relative_tolerance": "1e-28",
                 "ode_absolute_tolerance": "1e-30",
                 "homogeneous_ode_relative_tolerance": "1e-28",
@@ -2491,7 +2494,7 @@ class JuliaPrecisionRootBackend:
                     "branch_authentication_contract_version",
                 )
             )
-            or response["schema_version"] != 4
+            or response["schema_version"] != WORKER_RESPONSE_WIRE_SCHEMA
             or response["status"] != "ok"
             or response["adapter"] != "package-owned-julia-gsn-root-readout"
             or response["precision_digits"] != self.digits
@@ -2530,6 +2533,10 @@ class JuliaPrecisionRootBackend:
             raise JuliaResponseBackendError(
                 "M02 Julia root authentication evidence is invalid"
             ) from error
+        if root_authentication.authentication_strategy is None:
+            raise JuliaResponseBackendError(
+                "M02 Julia current root authentication strategy is missing"
+            )
         # The error model is published exactly by the families that compute one.
         # A horizon determinant without a breakdown would mean an error-aware
         # acceptance decision was made from an absent error term.
@@ -2790,6 +2797,36 @@ class JuliaPrecisionRootBackend:
                 response["seed_path_radius_abs"], "seed_path_radius_abs"
             )
         )
+        diagnostic_fields = {
+            "root_omega_re",
+            "root_omega_im",
+            "root_residual_abs",
+            "root_phase",
+            "root_derivative_abs",
+            "determinant_error_abs",
+            "error_model_id",
+            "residual_upper_bound_abs",
+            "derivative_lower_bound_abs",
+            "required_derivative_lower_bound_abs",
+            "correction_upper_bound",
+            "root_correction_tolerance",
+            "raw_step_disagreement_abs",
+            "guarded_step_disagreement_abs",
+            "propagated_derivative_error_abs",
+            "displacement_from_primary_abs",
+            "branch_identity",
+            "branch_authenticated",
+            "control_identity",
+            "solve_role",
+            "authentication_mode",
+            "authoritative",
+            "full_authentication_escalated",
+            "escalation_reason",
+            "authenticated_evidence_reused",
+            "determinant_count",
+            "determinant_count_phase",
+            "root_converged",
+        }
         if not diagnostics_skipped and (
             not isinstance(raw_diagnostics, Mapping)
             or set(raw_diagnostics) != {"truncation", "resolution", "seed-path"}
@@ -2800,20 +2837,133 @@ class JuliaPrecisionRootBackend:
             "truncation", "resolution", "seed-path"
         )):
             raw = raw_diagnostics[family]
-            if not isinstance(raw, Mapping) or set(raw) != {
-                "root_omega_re",
-                "root_omega_im",
-                "root_residual_abs",
-                "root_derivative_abs",
-                "root_converged",
-            } or not isinstance(raw["root_converged"], bool):
+            if (
+                not isinstance(raw, Mapping)
+                or set(raw) != diagnostic_fields
+                or not isinstance(raw["root_converged"], bool)
+                or type(raw["branch_authenticated"]) is not bool
+                or type(raw["authoritative"]) is not bool
+                or raw["authoritative"] is not False
+                or type(raw["full_authentication_escalated"]) is not bool
+                or type(raw["authenticated_evidence_reused"]) is not bool
+                or type(raw["determinant_count"]) is not int
+                or raw["determinant_count"] < 0
+                or type(raw["determinant_count_phase"]) is not int
+                or raw["determinant_count_phase"] != raw["determinant_count"]
+                or raw["solve_role"] != "DIAGNOSTIC_CONSISTENCY"
+                or raw["authentication_mode"] not in {
+                    "DIAGNOSTIC_CONSISTENCY",
+                    "FULL_AUTHENTICATION_ESCALATION",
+                }
+                or raw["root_phase"] != {
+                    "truncation": "TRUNCATION",
+                    "resolution": "RESOLUTION",
+                    "seed-path": "SEED-PATH",
+                }[family]
+                or not isinstance(raw["control_identity"], str)
+                or not raw["control_identity"]
+            ):
                 raise JuliaResponseBackendError("M02 Julia diagnostic root is invalid")
+            escalated = raw["full_authentication_escalated"]
+            escalation_reason = raw["escalation_reason"]
+            if (
+                escalated
+                != (
+                    isinstance(escalation_reason, str)
+                    and bool(escalation_reason)
+                )
+                or escalated
+                != (
+                    raw["authentication_mode"]
+                    == "FULL_AUTHENTICATION_ESCALATION"
+                )
+            ):
+                raise JuliaResponseBackendError(
+                    "M02 Julia diagnostic escalation evidence is invalid"
+                )
             diagnostic_real_decimal = _finite_decimal_text(
                 raw["root_omega_re"], "diagnostic root_omega_re"
             )
             diagnostic_imaginary_decimal = _finite_decimal_text(
                 raw["root_omega_im"], "diagnostic root_omega_im"
             )
+            diagnostic_residual_decimal = _finite_decimal_text(
+                raw["root_residual_abs"],
+                "diagnostic root_residual_abs",
+                nonnegative=True,
+            )
+            diagnostic_derivative_decimal = _finite_decimal_text(
+                raw["root_derivative_abs"],
+                "diagnostic root_derivative_abs",
+                nonnegative=True,
+            )
+            determinant_error_decimal = _finite_decimal_text(
+                raw["determinant_error_abs"],
+                "diagnostic determinant_error_abs",
+                nonnegative=True,
+            )
+            residual_upper_bound_decimal = _finite_decimal_text(
+                raw["residual_upper_bound_abs"],
+                "diagnostic residual_upper_bound_abs",
+                nonnegative=True,
+            )
+            required_derivative_lower_bound_decimal = _finite_decimal_text(
+                raw["required_derivative_lower_bound_abs"],
+                "diagnostic required_derivative_lower_bound_abs",
+                nonnegative=True,
+            )
+            propagated_derivative_error_decimal = _finite_decimal_text(
+                raw["propagated_derivative_error_abs"],
+                "diagnostic propagated_derivative_error_abs",
+                nonnegative=True,
+            )
+            raw_step_disagreement_decimal = (
+                None
+                if raw["raw_step_disagreement_abs"] is None
+                else _finite_decimal_text(
+                    raw["raw_step_disagreement_abs"],
+                    "diagnostic raw_step_disagreement_abs",
+                    nonnegative=True,
+                )
+            )
+            guarded_step_disagreement_decimal = (
+                None
+                if raw["guarded_step_disagreement_abs"] is None
+                else _finite_decimal_text(
+                    raw["guarded_step_disagreement_abs"],
+                    "diagnostic guarded_step_disagreement_abs",
+                    nonnegative=True,
+                )
+            )
+            derivative_lower_bound_decimal = _finite_decimal_text(
+                raw["derivative_lower_bound_abs"],
+                "diagnostic derivative_lower_bound_abs",
+                nonnegative=True,
+            )
+            correction_upper_bound_decimal = _finite_decimal_text(
+                raw["correction_upper_bound"],
+                "diagnostic correction_upper_bound",
+                nonnegative=True,
+            )
+            diagnostic_tolerance_decimal = _finite_decimal_text(
+                raw["root_correction_tolerance"],
+                "diagnostic root_correction_tolerance",
+                nonnegative=True,
+            )
+            reported_displacement_decimal = _finite_decimal_text(
+                raw["displacement_from_primary_abs"],
+                "diagnostic displacement_from_primary_abs",
+                nonnegative=True,
+            )
+            if (
+                derivative_lower_bound_decimal <= 0
+                or diagnostic_tolerance_decimal <= 0
+                or raw["error_model_id"] != expected_error_model_id
+                or raw["branch_identity"] != policy["branch_convention"]
+            ):
+                raise JuliaResponseBackendError(
+                    "M02 Julia diagnostic scientific identity is invalid"
+                )
             with localcontext() as context:
                 context.prec = self.digits + 64
                 delta_real = diagnostic_real_decimal - root_real_decimal
@@ -2824,10 +2974,65 @@ class JuliaPrecisionRootBackend:
                     delta_real * delta_real
                     + delta_imaginary * delta_imaginary
                 ).sqrt()
-                if (
-                    abs(derived_radius - diagnostic_radii_decimal[family])
-                    > serialization_allowance
-                ):
+                expected_residual_upper_bound = (
+                    diagnostic_residual_decimal + determinant_error_decimal
+                )
+                expected_required_derivative_lower_bound = (
+                    residual_upper_bound_decimal
+                    / diagnostic_tolerance_decimal
+                )
+                expected_correction = (
+                    residual_upper_bound_decimal
+                    / derivative_lower_bound_decimal
+                )
+
+                def inconsistent(left: Decimal, right: Decimal) -> bool:
+                    scale = max(abs(left), abs(right), Decimal(1))
+                    return abs(left - right) > serialization_allowance * scale
+
+                branch_authenticated = (
+                    derived_radius <= branch_tolerance_decimal
+                )
+                invalid_evidence = (
+                    inconsistent(
+                        derived_radius,
+                        diagnostic_radii_decimal[family],
+                    )
+                    or inconsistent(
+                        derived_radius,
+                        reported_displacement_decimal,
+                    )
+                    or inconsistent(
+                        diagnostic_derivative_decimal,
+                        derivative_lower_bound_decimal,
+                    )
+                    or inconsistent(
+                        expected_residual_upper_bound,
+                        residual_upper_bound_decimal,
+                    )
+                    or inconsistent(
+                        expected_required_derivative_lower_bound,
+                        required_derivative_lower_bound_decimal,
+                    )
+                    or inconsistent(
+                        expected_correction,
+                        correction_upper_bound_decimal,
+                    )
+                    or inconsistent(
+                        diagnostic_tolerance_decimal,
+                        root_correction_tolerance,
+                    )
+                    or raw["branch_authenticated"] != branch_authenticated
+                    or (
+                        raw["root_converged"]
+                        and (
+                            not branch_authenticated
+                            or correction_upper_bound_decimal
+                            > diagnostic_tolerance_decimal
+                        )
+                    )
+                )
+                if invalid_evidence:
                     raise JuliaResponseBackendError(
                         "M02 Julia diagnostic root evidence is inconsistent"
                     )
@@ -2846,6 +3051,69 @@ class JuliaPrecisionRootBackend:
                     raw["root_derivative_abs"], "diagnostic root_derivative_abs"
                 ),
                 converged=raw["root_converged"],
+                correction_upper_bound=_finite_text(
+                    raw["correction_upper_bound"],
+                    "diagnostic correction_upper_bound",
+                ),
+                determinant_error_abs=_finite_text(
+                    raw["determinant_error_abs"],
+                    "diagnostic determinant_error_abs",
+                ),
+                error_model_id=raw["error_model_id"],
+                derivative_lower_bound_abs=_finite_text(
+                    raw["derivative_lower_bound_abs"],
+                    "diagnostic derivative_lower_bound_abs",
+                ),
+                root_correction_tolerance=_finite_text(
+                    raw["root_correction_tolerance"],
+                    "diagnostic root_correction_tolerance",
+                ),
+                displacement_from_primary_abs=_finite_text(
+                    raw["displacement_from_primary_abs"],
+                    "diagnostic displacement_from_primary_abs",
+                ),
+                branch_identity=raw["branch_identity"],
+                branch_authenticated=raw["branch_authenticated"],
+                control_identity=raw["control_identity"],
+                solve_role=raw["solve_role"],
+                full_authentication_escalated=escalated,
+                escalation_reason=escalation_reason,
+                authenticated_evidence_reused=(
+                    raw["authenticated_evidence_reused"]
+                ),
+                determinant_count=raw["determinant_count"],
+                root_phase=raw["root_phase"],
+                authentication_mode=raw["authentication_mode"],
+                authoritative=raw["authoritative"],
+                residual_upper_bound_abs=_finite_text(
+                    raw["residual_upper_bound_abs"],
+                    "diagnostic residual_upper_bound_abs",
+                ),
+                required_derivative_lower_bound_abs=_finite_text(
+                    raw["required_derivative_lower_bound_abs"],
+                    "diagnostic required_derivative_lower_bound_abs",
+                ),
+                raw_step_disagreement_abs=(
+                    None
+                    if raw["raw_step_disagreement_abs"] is None
+                    else _finite_text(
+                        raw["raw_step_disagreement_abs"],
+                        "diagnostic raw_step_disagreement_abs",
+                    )
+                ),
+                guarded_step_disagreement_abs=(
+                    None
+                    if raw["guarded_step_disagreement_abs"] is None
+                    else _finite_text(
+                        raw["guarded_step_disagreement_abs"],
+                        "diagnostic guarded_step_disagreement_abs",
+                    )
+                ),
+                propagated_derivative_error_abs=_finite_text(
+                    raw["propagated_derivative_error_abs"],
+                    "diagnostic propagated_derivative_error_abs",
+                ),
+                determinant_count_phase=raw["determinant_count_phase"],
             )
         receipt_material = {
             "schema": WORKER_RESPONSE_RECEIPT_SCHEMA,

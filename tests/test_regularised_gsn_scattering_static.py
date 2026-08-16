@@ -26,6 +26,7 @@ class RegularisedGsnScatteringSourceTests(unittest.TestCase):
         for identity in (
             "factored-plane-wave-gsn/v1",
             "scaled-factored-horizon-basis/v1",
+            "scaled-horizon-basis-at-match/v1",
             "cinc-over-cref-minus-reflectivity/v1",
             "scaled-basis-frobenius-condition/not-a-bound/v1",
             "empirical-cref-error/not-a-bound/v1",
@@ -163,6 +164,21 @@ class RegularisedGsnScatteringSourceTests(unittest.TestCase):
         ]
         self.assertIn("_relative_scattering_disagreement", comparator_try)
         self.assertIn("_assert_scattering_real", comparator_try)
+
+    def test_chart_preserves_the_coefficient_extraction_identity(self) -> None:
+        chart = self._function("assess_horizon_determinant_chart")
+        construction = chart[chart.index("return DeterminantChartAssessment") :]
+        self.assertIn(
+            "coefficients.diagnostics.extraction_id",
+            construction,
+        )
+        self.assertNotIn("SCATTERING_EXTRACTION_ID", construction)
+        self.assertIn(
+            "determinant chart preserves coefficient extraction identity",
+            self.spec,
+        )
+        self.assertIn('"legacy extraction"', self.spec)
+        self.assertIn('"horizon-at-match extraction"', self.spec)
 
     def test_chart_is_strict_and_has_no_raw_fallback(self) -> None:
         assess = self._function("assess_horizon_determinant_chart")

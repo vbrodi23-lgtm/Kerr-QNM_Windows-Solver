@@ -103,6 +103,40 @@ end
     end
 end
 
+@testset "determinant chart preserves coefficient extraction identity" begin
+    basis = synthetic_basis(Float64, 2.0, 3.0)
+    target = FS.FactoredEndpointState{Float64}(4.0 + 0im, 6.0 + 0im)
+    for (label, extractor, expected_identity) in (
+        (
+            "legacy extraction",
+            SOL.solve_scaled_factored_scattering,
+            SOL.SCATTERING_EXTRACTION_ID,
+        ),
+        (
+            "horizon-at-match extraction",
+            SOL.solve_scaled_horizon_basis_at_match,
+            SOL.HORIZON_BASIS_AT_MATCH_EXTRACTION_ID,
+        ),
+    )
+        @testset "$label" begin
+            coefficients = extractor(
+                target, basis.common_carrier, basis
+            )
+            assessment = SOL.assess_horizon_determinant_chart(
+                coefficients,
+                zero(ComplexF64),
+                abs(coefficients.Cref) / 65,
+            )
+            @test coefficients.diagnostics.extraction_id ==
+                expected_identity
+            @test assessment.scattering_coefficient_extraction ==
+                coefficients.diagnostics.extraction_id
+            @test assessment.scattering_coefficient_extraction ==
+                expected_identity
+        end
+    end
+end
+
 function exercise_coefficient_scale_and_phase_recovery(
     ::Type{T}
 ) where {T<:AbstractFloat}
