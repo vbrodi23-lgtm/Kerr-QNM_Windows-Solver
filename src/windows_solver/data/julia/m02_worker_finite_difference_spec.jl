@@ -1320,3 +1320,274 @@ end
         Float64, request, context, SPEC_ROOT, amplitude
     ) == 0
 end
+
+
+#####
+##### Staged authoritative PRIMARY specification
+#####
+
+function spec_staged_evaluation(
+    root::ComplexF64;
+    value::ComplexF64=complex(1.0e-12, 0.0),
+    numerical_error_abs::Float64=1.0e-12,
+    safety_factor::Float64=8.0,
+)
+    endpoint_error = numerical_error_abs / safety_factor
+    breakdown = DeterminantErrorBreakdown{Float64}(
+        endpoint_error,
+        nothing,
+        nothing,
+        nothing,
+        safety_factor,
+        numerical_error_abs,
+    )
+    return (
+        value=value,
+        error_breakdown=breakdown,
+        error_model_id="specification-evaluator/v1",
+    )
+end
+
+function spec_staged_newton(
+    root::ComplexF64,
+    evaluation;
+    derivative::Union{Nothing,ComplexF64}=complex(2.0, 0.0),
+    converged::Bool=true,
+)
+    return function (
+        value_type, request, context, initial, amplitude;
+        determinant_evaluator=determinant_progress,
+        minimum_remaining_determinant_count=7,
+        propagate_derivative_error=false,
+    )
+        authentication = derivative === nothing ? nothing :
+            DerivativeAuthentication{Float64}(
+                derivative, 0.0, 0.0,
+                validated_frequency_step(Float64, request) *
+                    (1.0 + abs(root)),
+                "real",
+            )
+        return root, abs(evaluation.value), derivative, converged,
+            evaluation, authentication
+    end
+end
+
+@testset "staged PRIMARY accepts authenticated h and h/2 evidence without 2h or ih" begin
+    request = diagnostic_consistency_request()
+    context = spec_request_context(request)
+    root_evaluation = spec_staged_evaluation(SPEC_ROOT)
+    labels = String[]
+    central_calls = Ref(0)
+    full_calls = Ref(0)
+
+    central_authenticator = function (
+        value_type, sample_request, sample_context, root, amplitude,
+        purpose, current; base_evaluation=nothing,
+    )
+        central_calls[] += 1
+        @test base_evaluation === root_evaluation
+        return root_evaluation
+    end
+    half_derivative_evaluator = function (
+        value_type, sample_request, sample_context, root, amplitude,
+        offset, label; authenticate_controls, determinant_evaluator=nothing,
+    )
+        push!(labels, label)
+        @test authenticate_controls
+        @test iszero(imag(offset))
+        h = validated_frequency_step(Float64, sample_request) *
+            (1.0 + abs(root))
+        @test real(offset) == h / 2
+        return complex(2.0 + 1.0e-7, 0.0), nothing, 1.0e-12
+    end
+    full_authenticator = function (
+        value_type, sample_request, sample_context, initial, amplitude
+    )
+        full_calls[] += 1
+        error("full authentication must not run on staged acceptance")
+    end
+
+    result = solve_staged_primary_authentication(
+        Float64,
+        request,
+        context,
+        SPEC_ROOT,
+        complex(0.0, 0.0);
+        newton_solver=spec_staged_newton(SPEC_ROOT, root_evaluation),
+        central_authenticator=central_authenticator,
+        half_derivative_evaluator=half_derivative_evaluator,
+        full_authenticator=full_authenticator,
+    )
+
+    @test result.authentication_mode == STAGED_FULL_AUTHENTICATION
+    @test result.authoritative
+    @test !result.full_authentication_escalated
+    @test result.escalation_reason === nothing
+    @test result.converged
+    @test central_calls[] == 1
+    @test full_calls[] == 0
+    @test labels == ["staged derivative h/2"]
+    @test result.residual_upper_bound_abs ==
+        abs(root_evaluation.value) +
+        determinant_error_abs(Float64, root_evaluation)
+    @test result.required_derivative_lower_bound_abs ==
+        result.residual_upper_bound_abs /
+        parse_real(Float64, request, "root_correction_tolerance")
+    @test result.raw_step_disagreement_abs ≈ 1.0e-7
+    @test result.guarded_step_disagreement_abs ≈ 8.0e-7
+    @test result.propagated_derivative_error_abs == 1.0e-12
+    @test result.derivative_lower_bound_abs ≈
+        abs(complex(2.0 + 1.0e-7, 0.0)) - 8.0e-7 - 1.0e-12
+    @test result.correction_upper_bound ==
+        result.residual_upper_bound_abs / result.derivative_lower_bound_abs
+
+    evidence = root_authentication_text(result.root_authentication)
+    @test evidence["authentication_strategy"] ==
+        STAGED_REAL_AXIS_AUTHENTICATION_STRATEGY_ID
+    @test evidence["derivative_evidence"]["real_base"] !== nothing
+    @test evidence["derivative_evidence"]["real_half"] !== nothing
+    @test evidence["derivative_evidence"]["real_double"] === nothing
+    @test evidence["derivative_evidence"]["imaginary"] === nothing
+end
+
+@testset "staged PRIMARY escalates every inconclusive certificate fail closed" begin
+    request = diagnostic_consistency_request()
+    context = spec_request_context(request)
+    amplitude = complex(0.0, 0.0)
+    full_calls = Ref(0)
+    successful_full = function (
+        value_type, sample_request, sample_context, initial, sample_amplitude
+    )
+        full_calls[] += 1
+        return spec_full_authentication_outcome(
+            sample_request, SPEC_ROOT; converged=true
+        )
+    end
+    never_central = (
+        value_type, sample_request, sample_context, root, sample_amplitude,
+        purpose, current; base_evaluation=nothing,
+    ) -> error("central authentication should not run")
+    never_half = (
+        value_type, sample_request, sample_context, root, sample_amplitude,
+        offset, label; authenticate_controls, determinant_evaluator=nothing,
+    ) -> error("half derivative should not run")
+
+    base = spec_staged_evaluation(SPEC_ROOT)
+    newton_failure = solve_staged_primary_authentication(
+        Float64, request, context, SPEC_ROOT, amplitude;
+        newton_solver=spec_staged_newton(
+            SPEC_ROOT, base; derivative=nothing, converged=false
+        ),
+        central_authenticator=never_central,
+        half_derivative_evaluator=never_half,
+        full_authenticator=successful_full,
+    )
+    @test newton_failure.authentication_mode ==
+        FULL_AUTHENTICATION_ESCALATION
+    @test newton_failure.full_authentication_escalated
+    @test newton_failure.escalation_reason ==
+        "STAGED_NEWTON_NOT_CONVERGED"
+
+    missing_model = (
+        value=zero(ComplexF64),
+        error_breakdown=nothing,
+        error_model_id=nothing,
+    )
+    unavailable = solve_staged_primary_authentication(
+        Float64, request, context, SPEC_ROOT, amplitude;
+        newton_solver=spec_staged_newton(SPEC_ROOT, missing_model),
+        central_authenticator=never_central,
+        half_derivative_evaluator=never_half,
+        full_authenticator=successful_full,
+    )
+    @test unavailable.escalation_reason ==
+        "STAGED_DETERMINANT_ERROR_MODEL_UNAVAILABLE"
+
+    above = spec_staged_evaluation(
+        SPEC_ROOT; value=complex(1.0e-8, 0.0),
+        numerical_error_abs=1.0e-12,
+    )
+    above_tolerance = solve_staged_primary_authentication(
+        Float64, request, context, SPEC_ROOT, amplitude;
+        newton_solver=spec_staged_newton(SPEC_ROOT, above),
+        central_authenticator=(
+            value_type, sample_request, sample_context, root,
+            sample_amplitude, purpose, current; base_evaluation=nothing,
+        ) -> above,
+        half_derivative_evaluator=(
+            value_type, sample_request, sample_context, root,
+            sample_amplitude, offset, label; authenticate_controls,
+            determinant_evaluator=nothing,
+        ) -> (complex(2.0, 0.0), nothing, 1.0e-12),
+        full_authenticator=successful_full,
+    )
+    @test above_tolerance.escalation_reason ==
+        "STAGED_CORRECTION_UPPER_BOUND_ABOVE_TOLERANCE"
+
+    unresolved = spec_staged_evaluation(SPEC_ROOT)
+    no_lower_bound = solve_staged_primary_authentication(
+        Float64, request, context, SPEC_ROOT, amplitude;
+        newton_solver=spec_staged_newton(SPEC_ROOT, unresolved),
+        central_authenticator=(
+            value_type, sample_request, sample_context, root,
+            sample_amplitude, purpose, current; base_evaluation=nothing,
+        ) -> unresolved,
+        half_derivative_evaluator=(
+            value_type, sample_request, sample_context, root,
+            sample_amplitude, offset, label; authenticate_controls,
+            determinant_evaluator=nothing,
+        ) -> (complex(1.0e-12, 0.0), nothing, 1.0),
+        full_authenticator=successful_full,
+    )
+    @test no_lower_bound.escalation_reason ==
+        "STAGED_DERIVATIVE_LOWER_BOUND_UNRESOLVED"
+    @test full_calls[] == 4
+end
+
+@testset "diagnostic consistency remains non-authoritative in both modes" begin
+    request = diagnostic_consistency_request()
+    context = spec_request_context(request)
+
+    cheap = solve_diagnostic_consistency(
+        Float64,
+        request,
+        context,
+        "TRUNCATION",
+        SPEC_ROOT,
+        complex(0.0, 0.0),
+        SPEC_ROOT;
+        determinant_evaluator=spec_determinant_evaluator(),
+    )
+    @test cheap.authentication_mode ==
+        DIAGNOSTIC_CONSISTENCY_AUTHENTICATION
+    @test !cheap.authoritative
+    @test cheap.root_authentication === nothing
+
+    unresolved_newton = function (
+        value_type, sample_request, sample_context, initial, amplitude;
+        determinant_evaluator=nothing,
+        minimum_remaining_determinant_count=2,
+    )
+        return initial, 1.0, nothing, false,
+            spec_root_evaluation(initial; value=complex(1.0, 0.0)), nothing
+    end
+    escalated = solve_diagnostic_consistency(
+        Float64,
+        request,
+        context,
+        "RESOLUTION",
+        SPEC_ROOT,
+        complex(0.0, 0.0),
+        SPEC_ROOT;
+        newton_solver=unresolved_newton,
+        full_authenticator=(
+            value_type, sample_request, sample_context, initial, amplitude,
+        ) -> spec_full_authentication_outcome(
+            sample_request, SPEC_ROOT; converged=true
+        ),
+    )
+    @test escalated.authentication_mode ==
+        FULL_AUTHENTICATION_ESCALATION
+    @test !escalated.authoritative
+    @test escalated.root_authentication === nothing
+end

@@ -750,31 +750,85 @@ class RegularisedGsnWorkerSourceTests(unittest.TestCase):
         self.assertLess(seed_phase, independent)
         self.assertLess(seed_phase, diagnostic_role)
 
-    def test_primary_keeps_the_complete_authenticated_certificate(self) -> None:
-        primary = self._function_slice(
-            "solve_full_authentication", "solve_diagnostic_consistency"
-        )
-        self.assertIn("solve_once(", primary)
-        self.assertIn("authenticate_controls=true", primary)
-        self.assertNotIn("solve_diagnostic_consistency(", primary)
-        for forwarded in (
-            "root=root",
-            "residual=residual",
-            "root_evaluation=root_evaluation",
-            "root_authentication=root_authentication",
-            "correction_upper_bound=root_authentication.correction_upper_bound",
+    def test_primary_stages_h_and_authenticated_h_over_two_before_full_escalation(
+        self,
+    ) -> None:
+        for contract in (
+            "@enum RootAuthenticationMode",
+            "STAGED_FULL_AUTHENTICATION",
+            "FULL_AUTHENTICATION_ESCALATION",
+            "DIAGNOSTIC_CONSISTENCY_AUTHENTICATION",
+            "function solve_staged_primary_authentication(",
+            "function solve_full_authentication(",
+            "STAGED_NEWTON_NOT_CONVERGED",
+            "STAGED_NEWTON_DERIVATIVE_MISSING",
+            "STAGED_DETERMINANT_ERROR_MODEL_UNAVAILABLE",
+            "STAGED_NEWTON_DERIVATIVE_INVALID",
+            "STAGED_DERIVATIVE_LOWER_BOUND_UNRESOLVED",
+            "STAGED_CORRECTION_UPPER_BOUND_ABOVE_TOLERANCE",
         ):
-            self.assertIn(forwarded, primary)
+            self.assertIn(contract, self.worker)
 
+        staged = self._function_slice(
+            "solve_staged_primary_authentication", "solve_diagnostic_consistency"
+        )
+        self.assertIn("bounded_newton", staged)
+        self.assertIn("authenticated_determinant_progress", staged)
+        self.assertIn('"staged derivative h/2"', staged)
+        self.assertNotIn('"final derivative 2h"', staged)
+        self.assertNotIn('"final derivative ih"', staged)
+        self.assertIn("raw_step_disagreement_abs", staged)
+        self.assertIn("guarded_step_disagreement_abs", staged)
+        self.assertIn(
+            "TODO: [HUMAN MATH REVIEW REQUIRED - justify the staged "
+            "derivative-disagreement safety multiplier before final merge]",
+            staged,
+        )
+
+        full = self._function_slice(
+            "solve_full_authentication", "solve_staged_primary_authentication"
+        )
+        self.assertIn("solve_once(", full)
+        self.assertIn("authenticate_controls=true", full)
         solve_once = self._function_slice("solve_once", "solve_full_authentication")
+        self.assertIn("evaluate_derivative_step_ladder(", solve_once)
         for retained in (
-            "authenticated_determinant_progress(",
-            "evaluate_derivative_step_ladder(",
-            "authenticate_controls=horizon_authentication",
-            "correction_upper_bound = residual_upper_bound / "
-            "derivative_lower_bound_abs",
+            '"final derivative h/2"',
+            '"final derivative 2h"',
+            '"final derivative ih"',
         ):
-            self.assertIn(retained, solve_once)
+            self.assertIn(retained, self.worker)
+
+    def test_staged_and_diagnostic_progress_events_are_literal_and_registered(
+        self,
+    ) -> None:
+        for event in (
+            "primary_staged_authentication_started",
+            "primary_staged_derivative_accepted",
+            "primary_staged_derivative_rejected",
+            "primary_staged_authentication_completed",
+            "primary_full_authentication_escalated",
+            "primary_full_authentication_completed",
+            "diagnostic_consistency_started",
+            "diagnostic_consistency_completed",
+            "diagnostic_full_authentication_escalated",
+            "diagnostic_full_authentication_completed",
+        ):
+            self.assertIn(f'progress_emit("{event}"', self.worker)
+
+    def test_staged_evidence_never_fabricates_unexecuted_directions(self) -> None:
+        authentication = self._function_slice(
+            "root_authentication_text", "solve_once"
+        )
+        self.assertIn('"authentication_strategy"', authentication)
+        self.assertIn('"derivative_evidence"', authentication)
+        self.assertIn('"real_double"', authentication)
+        self.assertIn('"imaginary"', authentication)
+        staged = self._function_slice(
+            "solve_staged_primary_authentication", "solve_diagnostic_consistency"
+        )
+        self.assertIn("derivative_real_double=nothing", staged)
+        self.assertIn("derivative_imaginary=nothing", staged)
 
     def test_primary_authentication_tightens_only_exact_frequencies(self) -> None:
         for contract in (

@@ -1867,6 +1867,20 @@ class CampaignProgressReporterTests(unittest.TestCase):
         self.assertEqual(ProgressEventKind.REQUEST_VALIDATED.value, "request_validated")
         self.assertEqual(ProgressEventKind.REQUEST_COMPLETED.value, "request_completed")
         self.assertEqual(ProgressEventKind.REQUEST_FAILED.value, "request_failed")
+        for name in (
+            "PRIMARY_STAGED_AUTHENTICATION_STARTED",
+            "PRIMARY_STAGED_DERIVATIVE_ACCEPTED",
+            "PRIMARY_STAGED_DERIVATIVE_REJECTED",
+            "PRIMARY_STAGED_AUTHENTICATION_COMPLETED",
+            "PRIMARY_FULL_AUTHENTICATION_ESCALATED",
+            "PRIMARY_FULL_AUTHENTICATION_COMPLETED",
+            "DIAGNOSTIC_CONSISTENCY_STARTED",
+            "DIAGNOSTIC_CONSISTENCY_COMPLETED",
+            "DIAGNOSTIC_FULL_AUTHENTICATION_ESCALATED",
+            "DIAGNOSTIC_FULL_AUTHENTICATION_COMPLETED",
+        ):
+            event = getattr(ProgressEventKind, name)
+            self.assertEqual(event.value, name.lower())
         self.assertEqual(ProgressEventKind.LEAF_INTERRUPTED.value, "leaf_interrupted")
         self.assertEqual(
             ProgressEventKind.CAMPAIGN_INTERRUPTED.value, "campaign_interrupted"
