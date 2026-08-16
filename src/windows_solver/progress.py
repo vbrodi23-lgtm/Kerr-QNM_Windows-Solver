@@ -179,6 +179,7 @@ _STRING_CONTEXT_KEYS = frozenset(
         "component_pass",
         "readout_role",
         "phase",
+        "root_phase",
         "seed_kind",
         "determinant_purpose",
         "suboperation",
@@ -245,6 +246,7 @@ class ProgressContext:
     epsilon: float | None = None
     amplitude: Mapping[str, object] | None = None
     phase: str | None = None
+    root_phase: str | None = None
     seed_kind: str | None = None
     fallback_used: bool | None = None
     newton_index: int | None = None
