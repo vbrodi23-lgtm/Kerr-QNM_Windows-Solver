@@ -704,6 +704,77 @@ class CampaignProgressReporterTests(unittest.TestCase):
         self.assertIn("9.15357579817089e-61 / 2e-11", dashboard)
         self.assertIn("accepted=True", dashboard)
 
+    def test_diagnostic_role_escalation_reuse_and_count_reach_live_telemetry(
+        self,
+    ):
+        reporter = CampaignProgressReporter(
+            "normal", self.reporter_checkpoint, io.StringIO()
+        )
+        context = {
+            "leaf_id": "leaf-13",
+            "leaf_index": 13,
+            "leaf_count": 212,
+            "mechanism_id": "horizon-admittance",
+            "precision_digits": 80,
+            "phase": "RESOLUTION",
+        }
+        reporter.publish(_payload_event(
+            ProgressEventKind.ROOT_PHASE_STARTED,
+            {
+                "solve_role": "DIAGNOSTIC_CONSISTENCY",
+                "full_authentication_escalated": False,
+                "escalation_reason": None,
+                "authenticated_evidence_reused": False,
+                "control_identity": "resolution-controls/v1",
+            },
+            **context,
+        ))
+        reporter.publish(_payload_event(
+            ProgressEventKind.ROOT_PHASE_AUTHENTICATION_ESCALATED,
+            {
+                "solve_role": "DIAGNOSTIC_CONSISTENCY",
+                "full_authentication_escalated": True,
+                "escalation_reason": "DERIVATIVE_ESTIMATE_UNRESOLVED",
+                "authenticated_evidence_reused": True,
+                "determinant_count": 2,
+            },
+            **context,
+        ))
+        live = reporter._live_execution_mapping()
+        self.assertEqual(live["solve_role"], "DIAGNOSTIC_CONSISTENCY")
+        self.assertIs(live["full_authentication_escalated"], True)
+        self.assertEqual(
+            live["escalation_reason"], "DERIVATIVE_ESTIMATE_UNRESOLVED"
+        )
+        self.assertIs(live["authenticated_evidence_reused"], True)
+        self.assertEqual(live["phase_determinant_count"], 2)
+
+        reporter.publish(_payload_event(
+            ProgressEventKind.ROOT_PHASE_COMPLETED,
+            {
+                "resulting_omega": {"real": "0.5", "imaginary": "-0.1"},
+                "resulting_determinant_abs": "1e-30",
+                "converged": True,
+                "solve_role": "DIAGNOSTIC_CONSISTENCY",
+                "full_authentication_escalated": True,
+                "escalation_reason": "DERIVATIVE_ESTIMATE_UNRESOLVED",
+                "authenticated_evidence_reused": True,
+                "determinant_count": 5,
+                "control_identity": "resolution-controls/v1",
+                "branch_authenticated": True,
+                "correction_upper_bound": "1e-14",
+                "elapsed_seconds": 1.0,
+            },
+            **context,
+        ))
+        live = reporter._live_execution_mapping()
+        self.assertEqual(live["phase_determinant_count"], 5)
+        self.assertEqual(
+            live["phase_control_identity"], "resolution-controls/v1"
+        )
+        self.assertIs(live["phase_branch_authenticated"], True)
+        self.assertEqual(live["phase_correction_upper_bound"], "1e-14")
+
     def test_operational_terminal_events_cannot_leave_live_solver_running(self):
         for terminal_kind in (
             ProgressEventKind.LEAF_FAILED,

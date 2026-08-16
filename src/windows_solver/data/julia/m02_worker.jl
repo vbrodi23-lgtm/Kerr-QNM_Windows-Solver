@@ -65,6 +65,7 @@ const ACTIVE_PHASE = Ref{Union{Nothing,String}}(nothing)
 const ACTIVE_NEWTON_INDEX = Ref(0)
 const DETERMINANT_INDEX_REQUEST = Ref(0)
 const DETERMINANT_INDEX_PHASE = Ref(0)
+const AUTHENTICATED_EVIDENCE_REUSE_COUNT_PHASE = Ref(0)
 const LAST_DETERMINANT_PURPOSE = Ref{Union{Nothing,String}}(nothing)
 const LAST_DETERMINANT_SECONDS = Ref(0.0)
 const LAST_ODE_SNAPSHOT = Ref{Union{Nothing,Dict{String,Any}}}(nothing)
@@ -77,6 +78,18 @@ const ALLOWED_MECHANISMS = Set([
     "exterior-alpha-half",
     "exterior-alpha-one",
 ])
+
+@enum RootSolveRole begin
+    FULL_AUTHENTICATION
+    DIAGNOSTIC_CONSISTENCY
+end
+
+function root_solve_role_text(role::RootSolveRole)
+    role === FULL_AUTHENTICATION && return "FULL_AUTHENTICATION"
+    role === DIAGNOSTIC_CONSISTENCY &&
+        return "DIAGNOSTIC_CONSISTENCY"
+    error("unknown root solve role")
+end
 
 abstract type WorkerControlFailure <: Exception end
 abstract type ODEControlFailure <: WorkerControlFailure end
@@ -1282,10 +1295,28 @@ function ConditioningAccumulator(::Type{T}) where {T<:AbstractFloat}
     )
 end
 
+struct AuthenticatedDeterminantEvidence{T<:AbstractFloat}
+    request::Dict{String,Any}
+    frozen_convention::GSNBranchConvention{T}
+    frozen_branch_cell::GSN.GSNBranchCell
+    omega::Complex{T}
+    amplitude::Complex{T}
+    evaluation
+    source_phase::String
+end
+
+mutable struct AuthenticatedDeterminantEvidenceStore
+    entries::Vector{Any}
+end
+
+AuthenticatedDeterminantEvidenceStore() =
+    AuthenticatedDeterminantEvidenceStore(Any[])
+
 struct DeterminantRequestContext{T<:AbstractFloat}
     frozen_convention::GSNBranchConvention{T}
     frozen_branch_cell::GSN.GSNBranchCell
     conditioning::ConditioningAccumulator{T}
+    authenticated_evidence::AuthenticatedDeterminantEvidenceStore
 end
 
 function build_determinant_request_context(
@@ -1302,6 +1333,86 @@ function build_determinant_request_context(
         frozen_convention,
         GSN.branch_cell(frozen_convention),
         ConditioningAccumulator(T),
+        AuthenticatedDeterminantEvidenceStore(),
+    )
+end
+
+function authenticated_determinant_inputs_match(
+    evidence::AuthenticatedDeterminantEvidence{T},
+    request,
+    context::DeterminantRequestContext{T},
+    omega::Complex{T},
+    amplitude::Complex{T},
+) where {T<:AbstractFloat}
+    return isequal(evidence.request, request) &&
+        evidence.omega == omega &&
+        evidence.amplitude == amplitude &&
+        GSN.full_convention_equal(
+            evidence.frozen_convention, context.frozen_convention
+        ) &&
+        evidence.frozen_branch_cell == context.frozen_branch_cell
+end
+
+function remember_authenticated_determinant!(
+    context::DeterminantRequestContext{T},
+    request,
+    omega::Complex{T},
+    amplitude::Complex{T},
+    evaluation,
+    source_phase::String,
+) where {T<:AbstractFloat}
+    evidence = AuthenticatedDeterminantEvidence{T}(
+        deepcopy(Dict{String,Any}(request)),
+        context.frozen_convention,
+        context.frozen_branch_cell,
+        omega,
+        amplitude,
+        evaluation,
+        source_phase,
+    )
+    push!(context.authenticated_evidence.entries, evidence)
+    return evaluation
+end
+
+function matching_authenticated_determinant(
+    context::DeterminantRequestContext{T},
+    request,
+    omega::Complex{T},
+    amplitude::Complex{T},
+) where {T<:AbstractFloat}
+    for evidence in Iterators.reverse(
+        context.authenticated_evidence.entries
+    )
+        evidence isa AuthenticatedDeterminantEvidence{T} || continue
+        authenticated_determinant_inputs_match(
+            evidence, request, context, omega, amplitude
+        ) && return evidence
+    end
+    return nothing
+end
+
+function reuse_authenticated_determinant(
+    context::DeterminantRequestContext{T},
+    request,
+    omega::Complex{T},
+    amplitude::Complex{T},
+) where {T<:AbstractFloat}
+    evidence = matching_authenticated_determinant(
+        context, request, omega, amplitude
+    )
+    return evidence === nothing ? nothing : evidence.evaluation
+end
+
+function phase_control_identity(request)
+    # This is deliberately stricter than the minimum reuse contract: every
+    # flattened request input is represented, so changing any numerical,
+    # branch, endpoint, angular, extraction, or error-model control prevents
+    # reuse. Operational differences may conservatively prevent reuse; they can
+    # never permit reuse across different scientific calculations.
+    keys_sorted = sort!(collect(keys(request)))
+    return join(
+        ("$(key)=$(repr(request[key]))" for key in keys_sorted),
+        "|",
     )
 end
 
@@ -3040,9 +3151,15 @@ function determinant_progress(
     end
 end
 
-function enforce_root_readout_feasibility(request)
+function enforce_root_readout_feasibility(
+    request,
+    minimum_remaining_determinant_count::Int=8,
+)
+    minimum_remaining_determinant_count > 0 ||
+        throw(ArgumentError(
+            "minimum remaining determinant count must be positive"
+        ))
     measured_seconds = LAST_DETERMINANT_SECONDS[]
-    minimum_remaining_determinant_count = 8
     request_elapsed_seconds = (time_ns() - REQUEST_STARTED_NS[]) / 1.0e9
     remaining_wall_time_seconds = max(
         0.0,
@@ -3842,7 +3959,10 @@ function precision_guard_context(
         "precision guard moved the frozen branch cell"
     )
     return DeterminantRequestContext{T}(
-        guard_convention, guard_cell, ConditioningAccumulator(T)
+        guard_convention,
+        guard_cell,
+        ConditioningAccumulator(T),
+        AuthenticatedDeterminantEvidenceStore(),
     )
 end
 
@@ -3944,9 +4064,10 @@ function authenticated_determinant_progress(
     # The exterior family deliberately has no determinant-error certificate in
     # this revision. Return its historical evaluation without an extra solve.
     base.error_breakdown === nothing && return base
+    tight_request = tight_control_request(T, request)
     tight = determinant_progress(
         T,
-        tight_control_request(T, request),
+        tight_request,
         evaluation_context,
         tight_frequency,
         amplitude,
@@ -4002,11 +4123,68 @@ function authenticated_determinant_progress(
             string(error_breakdown.numerical_error_abs),
         "determinant_abs" => string(abs(base.value)),
     ))
-    return DeterminantEvaluation{T}(
+    authenticated = DeterminantEvaluation{T}(
         base.value,
         error_breakdown,
         VERIFIED_ENDPOINT_ERROR_MODEL_ID,
         base.diagnostics,
+    )
+    source_phase = ACTIVE_PHASE[] === nothing ?
+        "UNSCOPED" : ACTIVE_PHASE[]
+    # These samples become reusable only after the full comparison and error
+    # aggregation above succeeded. The tight sample is the exact calculation
+    # requested by RESOLUTION at the accepted PRIMARY frequency.
+    remember_authenticated_determinant!(
+        evaluation_context,
+        request,
+        base_frequency,
+        amplitude,
+        authenticated,
+        source_phase,
+    )
+    remember_authenticated_determinant!(
+        evaluation_context,
+        tight_request,
+        tight_frequency,
+        amplitude,
+        tight,
+        source_phase,
+    )
+    return authenticated
+end
+
+function diagnostic_determinant_progress(
+    ::Type{T},
+    request,
+    evaluation_context::DeterminantRequestContext{T},
+    omega::Complex{T},
+    amplitude::Complex{T},
+    purpose::String,
+    current::Complex{T},
+) where {T<:AbstractFloat}
+    evidence = matching_authenticated_determinant(
+        evaluation_context, request, omega, amplitude
+    )
+    if evidence !== nothing
+        AUTHENTICATED_EVIDENCE_REUSE_COUNT_PHASE[] += 1
+        progress_emit("determinant_evidence_reused"; payload=Dict(
+            "purpose" => purpose,
+            "omega" => progress_complex(omega),
+            "source_phase" => evidence.source_phase,
+            "control_identity" => phase_control_identity(request),
+            "authenticated_evidence_reuse_count_phase" =>
+                AUTHENTICATED_EVIDENCE_REUSE_COUNT_PHASE[],
+        ))
+        return evidence.evaluation
+    end
+    return determinant_progress(
+        T,
+        request,
+        evaluation_context,
+        omega,
+        amplitude,
+        purpose,
+        current,
     )
 end
 
@@ -4016,6 +4194,8 @@ function bounded_newton(
     evaluation_context::DeterminantRequestContext{T},
     initial::Complex{T},
     amplitude::Complex{T},
+    ; determinant_evaluator=determinant_progress,
+    minimum_remaining_determinant_count::Int=8,
 ) where {T<:AbstractFloat}
     frequency_step = validated_frequency_step(T, request)
     tolerance = parse_real(T, request, "root_correction_tolerance")
@@ -4023,7 +4203,7 @@ function bounded_newton(
     value = initial
     best_value = value
     ACTIVE_NEWTON_INDEX[] = 1
-    initial_determinant = determinant_progress(
+    initial_determinant = determinant_evaluator(
         T,
         request,
         evaluation_context,
@@ -4032,7 +4212,9 @@ function bounded_newton(
         "initial best",
         value,
     )
-    enforce_root_readout_feasibility(request)
+    enforce_root_readout_feasibility(
+        request, minimum_remaining_determinant_count
+    )
     best_residual = abs(initial_determinant.value)
     best_upper_bound = determinant_upper_bound_abs(
         T, initial_determinant
@@ -4053,7 +4235,7 @@ function bounded_newton(
             carried_available = false
             carried_residual
         else
-            determinant_progress(
+            determinant_evaluator(
                 T,
                 request,
                 evaluation_context,
@@ -4094,6 +4276,7 @@ function bounded_newton(
             "derivative h",
             value;
             axis="real",
+            determinant_evaluator=determinant_evaluator,
         )
         derivative_abs = abs(derivative)
         residual_error_abs = determinant_error_abs(T, residual)
@@ -4174,7 +4357,7 @@ function bounded_newton(
             one(T), parse(T, "0.5"), parse(T, "0.25"), parse(T, "0.125")
         )
             candidate = value - damping * step
-            candidate_residual = determinant_progress(
+            candidate_residual = determinant_evaluator(
                 T,
                 request,
                 evaluation_context,
@@ -4301,8 +4484,8 @@ end
 Evaluate the derivative controls at the nominal step only.
 
 This is the historical path and it is used wherever horizon authentication does
-not apply -- the exterior Wronskian family, and the diagnostic phases of any
-family. Those paths publish no determinant error model, so there is no noise
+not apply -- the exterior Wronskian family, including its legacy diagnostic
+phases. Those paths publish no determinant error model, so there is no noise
 term to balance a step against and nothing for a rung search to optimise.
 
 Keeping them here is not merely conservatism. The exterior scientific identity
@@ -4739,10 +4922,255 @@ function solve_once(
         root_evaluation, root_authentication
 end
 
+function solve_full_authentication(
+    ::Type{T},
+    request,
+    evaluation_context::DeterminantRequestContext{T},
+    initial::Complex{T},
+    amplitude::Complex{T},
+) where {T<:AbstractFloat}
+    raw = solve_once(
+        T,
+        request,
+        evaluation_context,
+        initial,
+        amplitude;
+        authenticate_controls=true,
+    )
+    root, residual, derivative_lower_bound_abs, converged,
+        root_evaluation, root_authentication = raw
+    reference_root = parse_complex(T, request, "omega_re", "omega_im")
+    branch_identity = string(required(request, "branch_convention"))
+    branch_authenticated =
+        branch_identity == BRANCH_CONVENTION_ID &&
+        abs(root - reference_root) <=
+            parse_real(T, request, "branch_enclosure_radius_abs")
+    return (
+        root=root,
+        residual=residual,
+        derivative_lower_bound_abs=derivative_lower_bound_abs,
+        converged=converged,
+        root_evaluation=root_evaluation,
+        root_authentication=root_authentication,
+        solve_role=FULL_AUTHENTICATION,
+        full_authentication_escalated=false,
+        escalation_reason=nothing,
+        authenticated_evidence_reused=
+            AUTHENTICATED_EVIDENCE_REUSE_COUNT_PHASE[] > 0,
+        correction_upper_bound=root_authentication.correction_upper_bound,
+        root_correction_tolerance=
+            root_authentication.root_correction_tolerance,
+        determinant_error_abs=
+            determinant_error_abs(T, root_evaluation),
+        error_model_id=root_evaluation.error_model_id,
+        branch_identity=branch_identity,
+        branch_authenticated=branch_authenticated,
+        control_identity=phase_control_identity(request),
+    )
+end
+
+function solve_legacy_exterior_diagnostic_consistency(
+    ::Type{T},
+    request,
+    evaluation_context::DeterminantRequestContext{T},
+    initial::Complex{T},
+    amplitude::Complex{T},
+    authenticated_primary_root::Complex{T},
+) where {T<:AbstractFloat}
+    raw = solve_once(
+        T,
+        request,
+        evaluation_context,
+        initial,
+        amplitude;
+        authenticate_controls=false,
+    )
+    root, residual, derivative_lower_bound_abs, converged,
+        root_evaluation, root_authentication = raw
+    branch_identity = string(required(request, "branch_convention"))
+    branch_authenticated =
+        branch_identity == BRANCH_CONVENTION_ID &&
+        abs(root - authenticated_primary_root) <=
+            parse_real(T, request, "branch_enclosure_radius_abs")
+    return (
+        root=root,
+        residual=residual,
+        derivative_lower_bound_abs=derivative_lower_bound_abs,
+        converged=converged,
+        root_evaluation=root_evaluation,
+        root_authentication=root_authentication,
+        solve_role=DIAGNOSTIC_CONSISTENCY,
+        full_authentication_escalated=false,
+        escalation_reason=nothing,
+        authenticated_evidence_reused=false,
+        correction_upper_bound=root_authentication.correction_upper_bound,
+        root_correction_tolerance=
+            root_authentication.root_correction_tolerance,
+        determinant_error_abs=
+            determinant_error_abs(T, root_evaluation),
+        error_model_id=root_evaluation.error_model_id,
+        branch_identity=branch_identity,
+        branch_authenticated=branch_authenticated,
+        control_identity=phase_control_identity(request),
+    )
+end
+
+function solve_diagnostic_consistency(
+    ::Type{T},
+    request,
+    evaluation_context::DeterminantRequestContext{T},
+    phase::String,
+    initial::Complex{T},
+    amplitude::Complex{T},
+    authenticated_primary_root::Complex{T};
+    newton_solver=bounded_newton,
+    determinant_evaluator=diagnostic_determinant_progress,
+    full_authenticator=solve_full_authentication,
+) where {T<:AbstractFloat}
+    reuse_count_before = AUTHENTICATED_EVIDENCE_REUSE_COUNT_PHASE[]
+    root, residual, accepted_derivative, newton_converged,
+        root_evaluation = newton_solver(
+            T,
+            request,
+            evaluation_context,
+            initial,
+            amplitude;
+            determinant_evaluator=determinant_evaluator,
+            # One centred Newton stencil remains after the carried initial
+            # determinant. PRIMARY retains the historical default of eight.
+            minimum_remaining_determinant_count=2,
+        )
+    tolerance = parse_real(T, request, "root_correction_tolerance")
+    branch_identity = string(required(request, "branch_convention"))
+    displacement = abs(root - authenticated_primary_root)
+    branch_authenticated =
+        branch_identity == BRANCH_CONVENTION_ID &&
+        displacement <=
+            parse_real(T, request, "branch_enclosure_radius_abs")
+    reused = AUTHENTICATED_EVIDENCE_REUSE_COUNT_PHASE[] >
+        reuse_count_before
+
+    escalation_reason = nothing
+    derivative_authentication = nothing
+    derivative_lower_bound_abs = zero(T)
+    correction_upper_bound = T(Inf)
+    root_error_abs = zero(T)
+
+    if !newton_converged
+        escalation_reason = "NEWTON_CORRECTION_UNRESOLVED"
+    elseif accepted_derivative === nothing
+        escalation_reason = "DERIVATIVE_ESTIMATE_UNRESOLVED"
+    elseif root_evaluation.error_breakdown === nothing
+        escalation_reason = "DETERMINANT_ERROR_EVIDENCE_MISSING"
+    elseif !isequal(
+        root_evaluation.error_model_id,
+        required(request, "determinant_error_model"),
+    )
+        escalation_reason = "DETERMINANT_ERROR_MODEL_MISMATCH"
+    else
+        h = validated_frequency_step(T, request) * (one(T) + abs(root))
+        candidate = derivative_authentication_candidate(
+            accepted_derivative,
+            zero(T),
+            zero(T),
+            h,
+            "real",
+        )
+        derivative_authentication = candidate.authentication
+        derivative_lower_bound_abs = candidate.lower_bound_abs
+        if derivative_authentication === nothing
+            escalation_reason = "DERIVATIVE_ESTIMATE_UNRESOLVED"
+        else
+            root_error_abs = determinant_error_abs(T, root_evaluation)
+            residual_upper_bound = residual + root_error_abs
+            correction_upper_bound =
+                residual_upper_bound / derivative_lower_bound_abs
+            if !isfinite(correction_upper_bound)
+                escalation_reason = "CORRECTION_UPPER_BOUND_UNRESOLVED"
+            elseif correction_upper_bound > tolerance
+                escalation_reason =
+                    "CORRECTION_UPPER_BOUND_EXCEEDS_TOLERANCE"
+            elseif branch_identity != BRANCH_CONVENTION_ID
+                escalation_reason = "BRANCH_IDENTITY_UNAUTHENTICATED"
+            elseif !branch_authenticated
+                escalation_reason =
+                    "ROOT_DISPLACEMENT_EXCEEDS_PHASE_LIMIT"
+            end
+        end
+    end
+
+    if escalation_reason === nothing
+        return (
+            root=root,
+            residual=residual,
+            derivative_lower_bound_abs=derivative_lower_bound_abs,
+            converged=true,
+            root_evaluation=root_evaluation,
+            root_authentication=nothing,
+            solve_role=DIAGNOSTIC_CONSISTENCY,
+            full_authentication_escalated=false,
+            escalation_reason=nothing,
+            authenticated_evidence_reused=reused,
+            correction_upper_bound=correction_upper_bound,
+            root_correction_tolerance=tolerance,
+            determinant_error_abs=root_error_abs,
+            error_model_id=root_evaluation.error_model_id,
+            branch_identity=branch_identity,
+            branch_authenticated=true,
+            control_identity=phase_control_identity(request),
+        )
+    end
+
+    progress_emit("root_phase_authentication_escalated"; payload=Dict(
+        "phase" => phase,
+        "solve_role" =>
+            root_solve_role_text(DIAGNOSTIC_CONSISTENCY),
+        "full_authentication_escalated" => true,
+        "escalation_reason" => escalation_reason,
+        "authenticated_evidence_reused" => reused,
+        "determinant_count" => DETERMINANT_INDEX_PHASE[],
+        "control_identity" => phase_control_identity(request),
+    ))
+    # Escalation uses the complete PRIMARY machinery and propagates every typed
+    # numerical-control failure. Missing evidence can never become success.
+    full = full_authenticator(
+        T, request, evaluation_context, root, amplitude
+    )
+    full.root_authentication === nothing &&
+        error("full diagnostic authentication omitted its certificate")
+    full_displacement = abs(full.root - authenticated_primary_root)
+    full_branch_authenticated =
+        full.branch_identity == BRANCH_CONVENTION_ID &&
+        full_displacement <=
+            parse_real(T, request, "branch_enclosure_radius_abs")
+    return (
+        root=full.root,
+        residual=full.residual,
+        derivative_lower_bound_abs=full.derivative_lower_bound_abs,
+        converged=full.converged && full_branch_authenticated,
+        root_evaluation=full.root_evaluation,
+        root_authentication=full.root_authentication,
+        solve_role=DIAGNOSTIC_CONSISTENCY,
+        full_authentication_escalated=true,
+        escalation_reason=escalation_reason,
+        authenticated_evidence_reused=
+            reused || full.authenticated_evidence_reused,
+        correction_upper_bound=full.correction_upper_bound,
+        root_correction_tolerance=full.root_correction_tolerance,
+        determinant_error_abs=full.determinant_error_abs,
+        error_model_id=full.error_model_id,
+        branch_identity=full.branch_identity,
+        branch_authenticated=full_branch_authenticated,
+        control_identity=phase_control_identity(request),
+    )
+end
+
 function solve_phase(
     ::Type{T}, request,
     evaluation_context::DeterminantRequestContext{T},
     phase::String, initial::Complex{T}, amplitude::Complex{T};
+    solve_role::RootSolveRole,
+    authenticated_primary_root=nothing,
     seed_kind="AUTHENTICATED_BACKGROUND",
     requested_seed_kind=seed_kind,
     fallback_initial=nothing,
@@ -4754,6 +5182,7 @@ function solve_phase(
     ACTIVE_PHASE_STARTED_NS[] = started
     ACTIVE_NEWTON_INDEX[] = 0
     DETERMINANT_INDEX_PHASE[] = 0
+    AUTHENTICATED_EVIDENCE_REUSE_COUNT_PHASE[] = 0
     LAST_DETERMINANT_PURPOSE[] = nothing
     context = Dict{String,Any}(
         "phase" => phase,
@@ -4778,14 +5207,39 @@ function solve_phase(
                 "fallback_used" => used,
                 "fallback_reason" => reason,
                 "fallback_error_type" => error_type,
+                "solve_role" => root_solve_role_text(solve_role),
             ))
-            solve_once(
+            if solve_role === FULL_AUTHENTICATION
+                return solve_full_authentication(
+                    T,
+                    request,
+                    evaluation_context,
+                    selected_initial,
+                    amplitude,
+                )
+            end
+            authenticated_primary_root === nothing && error(
+                "diagnostic consistency requires an authenticated PRIMARY root"
+            )
+            if string(required(request, "mechanism_id")) ==
+                    "horizon-admittance"
+                return solve_diagnostic_consistency(
+                    T,
+                    request,
+                    evaluation_context,
+                    phase,
+                    selected_initial,
+                    amplitude,
+                    authenticated_primary_root,
+                )
+            end
+            return solve_legacy_exterior_diagnostic_consistency(
                 T,
                 request,
                 evaluation_context,
                 selected_initial,
-                amplitude;
-                authenticate_controls=(phase == "PRIMARY"),
+                amplitude,
+                authenticated_primary_root,
             )
         end
     end
@@ -4794,6 +5248,11 @@ function solve_phase(
         progress_emit("root_phase_started"; payload=Dict(
             "seed_omega" => progress_complex(initial),
             "current_omega" => progress_complex(initial),
+            "solve_role" => root_solve_role_text(solve_role),
+            "full_authentication_escalated" => false,
+            "escalation_reason" => nothing,
+            "authenticated_evidence_reused" => false,
+            "control_identity" => phase_control_identity(request),
         ))
         actual_initial = initial
         actual_kind = seed_kind
@@ -4820,48 +5279,72 @@ function solve_phase(
                 fallback_error_type,
             )
         end
-        if actual_kind != "FALLBACK_BACKGROUND" && fallback_initial !== nothing
-            if !result[4] || abs(result[1] - fallback_initial) > parse_real(T, request, "branch_enclosure_radius_abs")
-                if !result[4]
-                    fallback_reason = "PREDICTOR_NEWTON_FAILED"
-                else
-                    fallback_reason = "PREDICTOR_BRANCH_ESCAPE"
-                end
+        if actual_kind != "FALLBACK_BACKGROUND" &&
+                fallback_initial !== nothing
+            branch_radius = parse_real(
+                T, request, "branch_enclosure_radius_abs"
+            )
+            if !result.converged ||
+                    abs(result.root - fallback_initial) > branch_radius
+                fallback_reason = result.converged ?
+                    "PREDICTOR_BRANCH_ESCAPE" :
+                    "PREDICTOR_NEWTON_FAILED"
                 fallback_used = true
                 actual_initial = fallback_initial
                 actual_kind = "FALLBACK_BACKGROUND"
                 result = solve_with_seed(
-                    actual_initial, actual_kind, fallback_used, fallback_reason
+                    actual_initial,
+                    actual_kind,
+                    fallback_used,
+                    fallback_reason,
                 )
             end
         end
+        result = merge(result, (
+            determinant_count=DETERMINANT_INDEX_PHASE[],
+        ))
         completion_context = Dict{String,Any}(
             "seed_omega" => progress_complex(actual_initial),
-            "current_omega" => progress_complex(result[1]),
+            "current_omega" => progress_complex(result.root),
             "seed_kind" => actual_kind,
             "fallback_used" => fallback_used,
         )
         progress_scope(completion_context) do
             progress_emit("root_phase_completed"; payload=Dict(
-                "resulting_omega" => progress_complex(result[1]),
-                "resulting_determinant_abs" => string(result[2]),
-                "derivative_abs" => string(result[3]),
-                "converged" => result[4],
+                "resulting_omega" => progress_complex(result.root),
+                "resulting_determinant_abs" => string(result.residual),
+                "derivative_abs" =>
+                    string(result.derivative_lower_bound_abs),
+                "correction_upper_bound" =>
+                    string(result.correction_upper_bound),
+                "root_correction_tolerance" =>
+                    string(result.root_correction_tolerance),
+                "branch_identity" => result.branch_identity,
+                "branch_authenticated" => result.branch_authenticated,
+                "control_identity" => result.control_identity,
+                "solve_role" =>
+                    root_solve_role_text(result.solve_role),
+                "full_authentication_escalated" =>
+                    result.full_authentication_escalated,
+                "escalation_reason" => result.escalation_reason,
+                "authenticated_evidence_reused" =>
+                    result.authenticated_evidence_reused,
+                "determinant_count" => result.determinant_count,
+                "converged" => result.converged,
                 "elapsed_seconds" => (time_ns() - started) / 1.0e9,
             ))
         end
         result
     end
 end
-
 function refined_request(::Type{T}, request, kind::Symbol) where {T<:AbstractFloat}
     output = copy(request)
     if kind == :truncation
         output["endpoint_series_order"] = parse_integer(request, "endpoint_series_order") + 8
     elseif kind == :resolution
-        # The resolution phase uses the same one-rung bounded request as final
-        # authentication, but solve_phase disables authentication for every
-        # diagnostic phase, so this request is never tightened recursively.
+        # PRIMARY already evaluates this exact control identity while building
+        # its determinant-error certificate. The diagnostic evaluator may reuse
+        # that sample only at an exactly identical frequency and request.
         return tight_control_request(T, request)
     else
         error("unknown root diagnostic refinement")
@@ -5015,6 +5498,38 @@ function conditioning_response(
     return evidence
 end
 
+function diagnostic_root_text(result, authenticated_primary_root)
+    return Dict{String,Any}(
+        "root_omega_re" => numeric_text(real(result.root)),
+        "root_omega_im" => numeric_text(imag(result.root)),
+        "root_residual_abs" => numeric_text(result.residual),
+        "root_derivative_abs" =>
+            numeric_text(result.derivative_lower_bound_abs),
+        "determinant_error_abs" =>
+            numeric_text(result.determinant_error_abs),
+        "error_model_id" => result.error_model_id,
+        "derivative_lower_bound_abs" =>
+            numeric_text(result.derivative_lower_bound_abs),
+        "correction_upper_bound" =>
+            numeric_text(result.correction_upper_bound),
+        "root_correction_tolerance" =>
+            numeric_text(result.root_correction_tolerance),
+        "displacement_from_primary_abs" =>
+            numeric_text(abs(result.root - authenticated_primary_root)),
+        "branch_identity" => result.branch_identity,
+        "branch_authenticated" => result.branch_authenticated,
+        "control_identity" => result.control_identity,
+        "solve_role" => root_solve_role_text(result.solve_role),
+        "full_authentication_escalated" =>
+            result.full_authentication_escalated,
+        "escalation_reason" => result.escalation_reason,
+        "authenticated_evidence_reused" =>
+            result.authenticated_evidence_reused,
+        "determinant_count" => result.determinant_count,
+        "root_converged" => result.converged,
+    )
+end
+
 function result_fields(::Type{T}, request, digits::Int, bits::Int) where {T<:AbstractFloat}
     omega = parse_complex(T, request, "omega_re", "omega_im")
     amplitude = parse_complex(T, request, "amplitude_re", "amplitude_im")
@@ -5055,21 +5570,26 @@ function result_fields(::Type{T}, request, digits::Int, bits::Int) where {T<:Abs
             end
         end
     end
-    root, residual, derivative_abs, primary_converged, root_evaluation,
-        root_authentication =
-        solve_phase(
-            T,
-            request,
-            evaluation_context,
-            "PRIMARY",
-            primary_initial,
-            amplitude;
-            seed_kind=primary_seed_kind,
-            requested_seed_kind=primary_requested_seed_kind,
-            fallback_initial=fallback_initial,
-            fallback_used=primary_fallback_used,
-            fallback_reason=primary_fallback_reason,
-        )
+    primary = solve_phase(
+        T,
+        request,
+        evaluation_context,
+        "PRIMARY",
+        primary_initial,
+        amplitude;
+        seed_kind=primary_seed_kind,
+        requested_seed_kind=primary_requested_seed_kind,
+        fallback_initial=fallback_initial,
+        fallback_used=primary_fallback_used,
+        fallback_reason=primary_fallback_reason,
+        solve_role=FULL_AUTHENTICATION,
+    )
+    root = primary.root
+    residual = primary.residual
+    derivative_abs = primary.derivative_lower_bound_abs
+    primary_converged = primary.converged
+    root_evaluation = primary.root_evaluation
+    root_authentication = primary.root_authentication
     branch_tolerance = parse_real(T, request, "branch_enclosure_radius_abs")
     raw_determinant_abs = root_evaluation.diagnostics.raw_determinant_abs
     raw_determinant_evidence_status =
@@ -5107,7 +5627,7 @@ function result_fields(::Type{T}, request, digits::Int, bits::Int) where {T<:Abs
         )
         branch_valid = abs(root - omega) <= branch_tolerance
         return [
-            "schema_version" => 4,
+            "schema_version" => 5,
             "status" => "ok",
             "adapter" => "package-owned-julia-gsn-root-readout",
             "request_sha256" => string(required(request, "request_sha256")),
@@ -5136,8 +5656,7 @@ function result_fields(::Type{T}, request, digits::Int, bits::Int) where {T<:Abs
             "numerical_conditioning" => numerical_conditioning,
         ]
     end
-    truncation_root, truncation_residual, truncation_derivative,
-        truncation_converged, _, _ = solve_phase(
+    truncation = solve_phase(
         T,
         refined_request(T, request, :truncation),
         evaluation_context,
@@ -5145,9 +5664,10 @@ function result_fields(::Type{T}, request, digits::Int, bits::Int) where {T<:Abs
         root,
         amplitude;
         seed_kind="ACCEPTED_PRIMARY",
+        solve_role=DIAGNOSTIC_CONSISTENCY,
+        authenticated_primary_root=root,
     )
-    resolution_root, resolution_residual, resolution_derivative,
-        resolution_converged, _, _ = solve_phase(
+    resolution = solve_phase(
         T,
         refined_request(T, request, :resolution),
         evaluation_context,
@@ -5155,29 +5675,31 @@ function result_fields(::Type{T}, request, digits::Int, bits::Int) where {T<:Abs
         root,
         amplitude;
         seed_kind="ACCEPTED_PRIMARY",
+        solve_role=DIAGNOSTIC_CONSISTENCY,
+        authenticated_primary_root=root,
     )
     alternate = omega + Complex{T}(T("0.00025"), T("0.000125")) *
         (one(T) + abs(omega))
-    seed_path_root, seed_path_residual, seed_path_derivative,
-        seed_path_converged, _, _ =
-        solve_phase(
-            T,
-            request,
-            evaluation_context,
-            "SEED-PATH",
-            alternate,
-            amplitude;
-            seed_kind="INDEPENDENT_SEED_PATH",
-        )
+    seed_path = solve_phase(
+        T,
+        request,
+        evaluation_context,
+        "SEED-PATH",
+        alternate,
+        amplitude;
+        seed_kind="INDEPENDENT_SEED_PATH",
+        solve_role=DIAGNOSTIC_CONSISTENCY,
+        authenticated_primary_root=root,
+    )
     branch_valid = abs(root - omega) <= branch_tolerance && all(
-        abs(candidate - root) <= branch_tolerance
-        for candidate in (truncation_root, resolution_root, seed_path_root)
+        result.branch_authenticated
+        for result in (truncation, resolution, seed_path)
     )
     converged = all((
         primary_converged,
-        truncation_converged,
-        resolution_converged,
-        seed_path_converged,
+        truncation.converged,
+        resolution.converged,
+        seed_path.converged,
         branch_valid,
     ))
     numerical_conditioning = conditioning_response(
@@ -5185,7 +5707,7 @@ function result_fields(::Type{T}, request, digits::Int, bits::Int) where {T<:Abs
     )
 
     return [
-        "schema_version" => 4,
+        "schema_version" => 5,
         "status" => "ok",
         "adapter" => "package-owned-julia-gsn-root-readout",
         "request_sha256" => string(required(request, "request_sha256")),
@@ -5208,31 +5730,16 @@ function result_fields(::Type{T}, request, digits::Int, bits::Int) where {T<:Abs
         "root_branch_continuation_valid" => branch_valid,
         "branch_tolerance_abs" => numeric_text(branch_tolerance),
         "root_displacement_abs" => numeric_text(abs(root - omega)),
-        "truncation_radius_abs" => numeric_text(abs(truncation_root - root)),
-        "resolution_radius_abs" => numeric_text(abs(resolution_root - root)),
-        "seed_path_radius_abs" => numeric_text(abs(seed_path_root - root)),
+        "truncation_radius_abs" =>
+            numeric_text(abs(truncation.root - root)),
+        "resolution_radius_abs" =>
+            numeric_text(abs(resolution.root - root)),
+        "seed_path_radius_abs" =>
+            numeric_text(abs(seed_path.root - root)),
         "diagnostic_roots" => Dict(
-            "truncation" => Dict(
-                "root_omega_re" => numeric_text(real(truncation_root)),
-                "root_omega_im" => numeric_text(imag(truncation_root)),
-                "root_residual_abs" => numeric_text(truncation_residual),
-                "root_derivative_abs" => numeric_text(truncation_derivative),
-                "root_converged" => truncation_converged,
-            ),
-            "resolution" => Dict(
-                "root_omega_re" => numeric_text(real(resolution_root)),
-                "root_omega_im" => numeric_text(imag(resolution_root)),
-                "root_residual_abs" => numeric_text(resolution_residual),
-                "root_derivative_abs" => numeric_text(resolution_derivative),
-                "root_converged" => resolution_converged,
-            ),
-            "seed-path" => Dict(
-                "root_omega_re" => numeric_text(real(seed_path_root)),
-                "root_omega_im" => numeric_text(imag(seed_path_root)),
-                "root_residual_abs" => numeric_text(seed_path_residual),
-                "root_derivative_abs" => numeric_text(seed_path_derivative),
-                "root_converged" => seed_path_converged,
-            ),
+            "truncation" => diagnostic_root_text(truncation, root),
+            "resolution" => diagnostic_root_text(resolution, root),
+            "seed-path" => diagnostic_root_text(seed_path, root),
         ),
         "diagnostics_skipped_reason" => nothing,
         "numerical_conditioning" => numerical_conditioning,
@@ -5288,6 +5795,7 @@ function main()
     ACTIVE_NEWTON_INDEX[] = 0
     DETERMINANT_INDEX_REQUEST[] = 0
     DETERMINANT_INDEX_PHASE[] = 0
+    AUTHENTICATED_EVIDENCE_REUSE_COUNT_PHASE[] = 0
     LAST_DETERMINANT_PURPOSE[] = nothing
     LAST_DETERMINANT_SECONDS[] = 0.0
     LAST_ODE_SNAPSHOT[] = nothing

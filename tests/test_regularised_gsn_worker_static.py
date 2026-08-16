@@ -766,11 +766,13 @@ class RegularisedGsnWorkerSourceTests(unittest.TestCase):
             "function authenticated_determinant_progress(",
             "base_frequency == tight_frequency",
             "abs(base.value - tight.value)",
-            "authenticate_controls=(phase == \"PRIMARY\")",
+            "solve_role=FULL_AUTHENTICATION",
+            "remember_authenticated_determinant!(",
         ):
             self.assertIn(contract, self.worker)
         refined = self._function_slice("refined_request", "conditioning_response")
         self.assertNotIn("authenticated_determinant_progress(", refined)
+        self.assertIn("return tight_control_request(T, request)", refined)
 
     def test_final_authentication_leaves_exterior_derivative_path_unchanged(
         self,

@@ -59,6 +59,7 @@ _NORMAL_KINDS = _QUIET_KINDS | frozenset(
         ProgressEventKind.AMPLITUDE_READOUT_COMPLETED,
         ProgressEventKind.ROOT_PHASE_STARTED,
         ProgressEventKind.ROOT_SEED_SELECTED,
+        ProgressEventKind.ROOT_PHASE_AUTHENTICATION_ESCALATED,
         ProgressEventKind.ROOT_PHASE_COMPLETED,
         ProgressEventKind.NEWTON_ITERATION_STARTED,
         ProgressEventKind.NEWTON_ITERATION_COMPLETED,
@@ -140,6 +141,7 @@ _DASHBOARD_FORCED_KINDS = frozenset(
         ProgressEventKind.PRECISION_STAGE_COMPLETED,
         ProgressEventKind.ROOT_PHASE_STARTED,
         ProgressEventKind.ROOT_SEED_SELECTED,
+        ProgressEventKind.ROOT_PHASE_AUTHENTICATION_ESCALATED,
         ProgressEventKind.ROOT_PHASE_COMPLETED,
         ProgressEventKind.ASYMPTOTIC_SERIES_EVALUATED,
         ProgressEventKind.CONDITIONING_EVALUATED,
@@ -675,6 +677,20 @@ class CampaignProgressReporter:
                     "resulting_determinant_abs"
                 ),
                 "converged": payload.get("converged"),
+                "solve_role": payload.get("solve_role"),
+                "full_authentication_escalated": payload.get(
+                    "full_authentication_escalated"
+                ),
+                "escalation_reason": payload.get("escalation_reason"),
+                "authenticated_evidence_reused": payload.get(
+                    "authenticated_evidence_reused"
+                ),
+                "determinant_count_phase": payload.get("determinant_count"),
+                "control_identity": payload.get("control_identity"),
+                "branch_authenticated": payload.get("branch_authenticated"),
+                "correction_upper_bound": payload.get(
+                    "correction_upper_bound"
+                ),
                 "elapsed_seconds": payload.get("elapsed_seconds"),
             }
             record["root_solve"] = root_solve
@@ -1108,7 +1124,43 @@ class CampaignProgressReporter:
                 self._discard_leaf_outcomes(next_leaf)
         elif kind == ProgressEventKind.ROOT_PHASE_STARTED.value:
             self._dashboard_state["root_status"] = "SEARCHING"
+            for name in (
+                "solve_role",
+                "full_authentication_escalated",
+                "escalation_reason",
+                "authenticated_evidence_reused",
+                "control_identity",
+            ):
+                self._dashboard_state[name] = payload.get(name)
+            self._dashboard_state["phase_determinant_count"] = 0
+        elif kind == (
+            ProgressEventKind.ROOT_PHASE_AUTHENTICATION_ESCALATED.value
+        ):
+            self._dashboard_state["full_authentication_escalated"] = True
+            self._dashboard_state["escalation_reason"] = payload.get(
+                "escalation_reason"
+            )
+            self._dashboard_state["solve_role"] = payload.get("solve_role")
+            self._dashboard_state["authenticated_evidence_reused"] = (
+                payload.get("authenticated_evidence_reused")
+            )
+            self._dashboard_state["phase_determinant_count"] = payload.get(
+                "determinant_count"
+            )
         elif kind == ProgressEventKind.ROOT_PHASE_COMPLETED.value:
+            for name in (
+                "solve_role",
+                "full_authentication_escalated",
+                "escalation_reason",
+                "authenticated_evidence_reused",
+                "control_identity",
+                "branch_authenticated",
+                "correction_upper_bound",
+            ):
+                self._dashboard_state[name] = payload.get(name)
+            self._dashboard_state["phase_determinant_count"] = payload.get(
+                "determinant_count"
+            )
             converged = payload.get("converged")
             if converged is True:
                 self._dashboard_state["root_status"] = "CONVERGED"
@@ -1783,6 +1835,17 @@ class CampaignProgressReporter:
             ("Mechanism", context.get("mechanism_id")),
             ("Precision", context.get("precision_digits")),
             ("Phase", context.get("phase")),
+            ("SolveRole", context.get("solve_role")),
+            (
+                "FullAuthEscalated",
+                context.get("full_authentication_escalated"),
+            ),
+            ("EscalationReason", context.get("escalation_reason")),
+            (
+                "AuthenticatedReuse",
+                context.get("authenticated_evidence_reused"),
+            ),
+            ("PhaseDeterminants", context.get("phase_determinant_count")),
             ("Newton", context.get("newton_index")),
             ("CurrentOmega", context.get("current_omega")),
             ("DeterminantAbs", context.get("determinant_abs")),
@@ -2250,6 +2313,24 @@ class CampaignProgressReporter:
             "precision_digits": precision_digits,
             "precision_label": precision_label,
             "phase": state.get("phase"),
+            "solve_role": state.get("solve_role"),
+            "full_authentication_escalated": state.get(
+                "full_authentication_escalated"
+            ),
+            "escalation_reason": state.get("escalation_reason"),
+            "authenticated_evidence_reused": state.get(
+                "authenticated_evidence_reused"
+            ),
+            "phase_determinant_count": state.get(
+                "phase_determinant_count"
+            ),
+            "phase_control_identity": state.get("control_identity"),
+            "phase_branch_authenticated": state.get(
+                "branch_authenticated"
+            ),
+            "phase_correction_upper_bound": state.get(
+                "correction_upper_bound"
+            ),
             "promotion_reason": state.get("promotion_reason"),
             "seed_kind": state.get("seed_kind"),
             "seed_authenticated": state.get("seed_authenticated"),

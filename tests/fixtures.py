@@ -603,7 +603,7 @@ def valid_julia_root_response(
         "seed-path": "4E-55",
     }
     return {
-        "schema_version": 4,
+        "schema_version": 5,
         "status": "ok",
         "adapter": "package-owned-julia-gsn-root-readout",
         "request_sha256": "e" * 64,
@@ -646,6 +646,34 @@ def valid_julia_root_response(
                 "root_omega_im": omega["imaginary"],
                 "root_residual_abs": "1E-60",
                 "root_derivative_abs": "2.5",
+                "determinant_error_abs": (
+                    "1E-61"
+                    if request["mechanism_id"] == "horizon-admittance"
+                    else "0"
+                ),
+                "error_model_id": (
+                    "verified-endpoint-control-equivalence-absolute-error/v2"
+                    if request["mechanism_id"] == "horizon-admittance"
+                    else None
+                ),
+                "derivative_lower_bound_abs": "2.5",
+                "correction_upper_bound": (
+                    "4.4E-61"
+                    if request["mechanism_id"] == "horizon-admittance"
+                    else "4E-61"
+                ),
+                "root_correction_tolerance": policy[
+                    "root_correction_tolerance"
+                ],
+                "displacement_from_primary_abs": radius,
+                "branch_identity": policy["branch_convention"],
+                "branch_authenticated": True,
+                "control_identity": f"fixture-{phase}-controls/v1",
+                "solve_role": "DIAGNOSTIC_CONSISTENCY",
+                "full_authentication_escalated": False,
+                "escalation_reason": None,
+                "authenticated_evidence_reused": phase == "resolution",
+                "determinant_count": 0 if phase == "resolution" else 3,
                 "root_converged": True,
             }
             for phase, radius in radii.items()

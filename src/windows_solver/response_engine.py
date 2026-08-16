@@ -78,13 +78,14 @@ HISTORICAL_NUMERICAL_CONDITIONING_SCHEMA = (
     "windows-solver.m02-conditioning/2"
 )
 WORKER_RESPONSE_RECEIPT_SCHEMA = "windows-solver.worker-response-receipt/1"
-# The promoted worker's root-readout wire schema. Version 4 adds the
-# root_authentication record: the error-aware terms that decide whether a small
-# determinant is a located root or an unresolved one. The receipt records the
-# version it observed so a cached receipt cannot be replayed against a
-# different wire contract.
-WORKER_RESPONSE_WIRE_SCHEMA = 4
-HISTORICAL_WORKER_RESPONSE_WIRE_SCHEMAS = frozenset({3})
+# The promoted worker's root-readout wire schema. Version 4 added the
+# root_authentication record. Version 5 records each diagnostic phase's
+# correction/error evidence, scientific role, escalation, exact-evidence
+# reuse, branch/control identity, and determinant count. Error responses remain
+# independently versioned at 1.
+WORKER_RESPONSE_WIRE_SCHEMA = 5
+HISTORICAL_WORKER_RESPONSE_WIRE_SCHEMAS = frozenset({3, 4})
+_ROOT_AUTHENTICATION_WIRE_SCHEMAS = frozenset({4, 5})
 _WORKER_RESPONSE_RECEIPT_FIELDS = frozenset({
     "schema",
     "request_binding",
@@ -995,6 +996,20 @@ class DiagnosticRootReadout:
     determinant_residual_abs: float
     determinant_derivative_abs: float
     converged: bool
+    correction_upper_bound: float | None = None
+    determinant_error_abs: float | None = None
+    error_model_id: str | None = None
+    derivative_lower_bound_abs: float | None = None
+    root_correction_tolerance: float | None = None
+    displacement_from_primary_abs: float | None = None
+    branch_identity: str | None = None
+    branch_authenticated: bool | None = None
+    control_identity: str | None = None
+    solve_role: str | None = None
+    full_authentication_escalated: bool | None = None
+    escalation_reason: str | None = None
+    authenticated_evidence_reused: bool | None = None
+    determinant_count: int | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -1015,12 +1030,124 @@ class DiagnosticRootReadout:
         if type(self.converged) is not bool:
             raise ValueError("converged must be a built-in bool")
 
+        if self.solve_role is None:
+            optional_evidence = (
+                self.correction_upper_bound,
+                self.determinant_error_abs,
+                self.derivative_lower_bound_abs,
+                self.root_correction_tolerance,
+                self.displacement_from_primary_abs,
+                self.branch_identity,
+                self.branch_authenticated,
+                self.control_identity,
+                self.full_authentication_escalated,
+                self.escalation_reason,
+                self.authenticated_evidence_reused,
+                self.determinant_count,
+            )
+            if any(item is not None for item in optional_evidence):
+                raise ValueError(
+                    "diagnostic workflow evidence must be complete or absent"
+                )
+            return
+
+        if self.solve_role != "DIAGNOSTIC_CONSISTENCY":
+            raise ValueError("diagnostic solve role is invalid")
+        numeric_fields = (
+            "correction_upper_bound",
+            "determinant_error_abs",
+            "derivative_lower_bound_abs",
+            "root_correction_tolerance",
+            "displacement_from_primary_abs",
+        )
+        for name in numeric_fields:
+            raw = getattr(self, name)
+            if raw is None:
+                raise ValueError(f"{name} is required")
+            value = float(raw)
+            if not math.isfinite(value) or value < 0.0:
+                raise ValueError(f"{name} must be finite and nonnegative")
+            object.__setattr__(self, name, value)
+        if self.derivative_lower_bound_abs <= 0.0:
+            raise ValueError("diagnostic derivative lower bound must be positive")
+        if self.root_correction_tolerance <= 0.0:
+            raise ValueError("diagnostic root correction tolerance must be positive")
+        if not math.isclose(
+            self.determinant_derivative_abs,
+            self.derivative_lower_bound_abs,
+            rel_tol=1.0e-15,
+            abs_tol=0.0,
+        ):
+            raise ValueError(
+                "diagnostic derivative magnitude and lower bound disagree"
+            )
+        if self.error_model_id is not None and (
+            not isinstance(self.error_model_id, str)
+            or not self.error_model_id
+        ):
+            raise ValueError("diagnostic error model identity is invalid")
+        for name in ("branch_identity", "control_identity"):
+            value = getattr(self, name)
+            if not isinstance(value, str) or not value:
+                raise ValueError(f"{name} must be a nonempty string")
+        for name in (
+            "branch_authenticated",
+            "full_authentication_escalated",
+            "authenticated_evidence_reused",
+        ):
+            if type(getattr(self, name)) is not bool:
+                raise ValueError(f"{name} must be a built-in bool")
+        if (
+            type(self.determinant_count) is not int
+            or self.determinant_count < 0
+        ):
+            raise ValueError("determinant_count must be a nonnegative integer")
+        if self.full_authentication_escalated != (
+            self.escalation_reason is not None
+        ):
+            raise ValueError(
+                "diagnostic escalation reason is inconsistent"
+            )
+        if self.escalation_reason is not None and (
+            not isinstance(self.escalation_reason, str)
+            or not self.escalation_reason
+        ):
+            raise ValueError(
+                "diagnostic escalation reason must be nonempty"
+            )
+        derived_displacement = abs(self.omega_delta_from_primary)
+        binary64_resolution = 2.0 * max(
+            math.ulp(self.omega_delta_from_primary.real),
+            math.ulp(self.omega_delta_from_primary.imag),
+            math.ulp(self.displacement_from_primary_abs),
+            1.0e-300,
+        )
+        if not math.isclose(
+            self.displacement_from_primary_abs,
+            derived_displacement,
+            rel_tol=1.0e-12,
+            abs_tol=binary64_resolution,
+        ):
+            raise ValueError(
+                "diagnostic displacement evidence is inconsistent"
+            )
+        if self.converged and (
+            not self.branch_authenticated
+            or self.correction_upper_bound > self.root_correction_tolerance
+        ):
+            raise ValueError(
+                "diagnostic convergence exceeds its authenticated bounds"
+            )
+
     @property
     def newton_correction_estimate(self) -> float:
+        # Retain the historical signed-root uncertainty propagation. The new
+        # error-aware correction is additional diagnostic evidence, not a
+        # replacement for this response-space reduction quantity.
         return self.determinant_residual_abs / self.determinant_derivative_abs
 
     def to_mapping(self) -> dict[str, object]:
-        return {
+        output: dict[str, object] = {
             "omega_delta_from_primary": _complex_mapping(
                 self.omega_delta_from_primary
             ),
@@ -1029,11 +1156,36 @@ class DiagnosticRootReadout:
             "newton_correction_estimate": self.newton_correction_estimate,
             "converged": self.converged,
         }
+        if self.solve_role is not None:
+            output.update({
+                "correction_upper_bound": self.correction_upper_bound,
+                "determinant_error_abs": self.determinant_error_abs,
+                "error_model_id": self.error_model_id,
+                "derivative_lower_bound_abs": self.derivative_lower_bound_abs,
+                "root_correction_tolerance": self.root_correction_tolerance,
+                "displacement_from_primary_abs": (
+                    self.displacement_from_primary_abs
+                ),
+                "branch_identity": self.branch_identity,
+                "branch_authenticated": self.branch_authenticated,
+                "control_identity": self.control_identity,
+                "solve_role": self.solve_role,
+                "full_authentication_escalated": (
+                    self.full_authentication_escalated
+                ),
+                "escalation_reason": self.escalation_reason,
+                "authenticated_evidence_reused": (
+                    self.authenticated_evidence_reused
+                ),
+                "determinant_count": self.determinant_count,
+            })
+        return output
 
     @classmethod
     def from_mapping(cls, value: object) -> "DiagnosticRootReadout":
         if not isinstance(value, Mapping):
             raise ValueError("diagnostic root readout must be an object")
+        has_workflow_evidence = "solve_role" in value
         return cls(
             omega_delta_from_primary=_complex_from_mapping(
                 value.get("omega_delta_from_primary"),
@@ -1042,8 +1194,77 @@ class DiagnosticRootReadout:
             determinant_residual_abs=float(value["determinant_residual_abs"]),
             determinant_derivative_abs=float(value["determinant_derivative_abs"]),
             converged=value["converged"],
+            correction_upper_bound=(
+                float(value["correction_upper_bound"])
+                if has_workflow_evidence
+                else None
+            ),
+            determinant_error_abs=(
+                float(value["determinant_error_abs"])
+                if has_workflow_evidence
+                else None
+            ),
+            error_model_id=(
+                value.get("error_model_id")
+                if has_workflow_evidence
+                else None
+            ),
+            derivative_lower_bound_abs=(
+                float(value["derivative_lower_bound_abs"])
+                if has_workflow_evidence
+                else None
+            ),
+            root_correction_tolerance=(
+                float(value["root_correction_tolerance"])
+                if has_workflow_evidence
+                else None
+            ),
+            displacement_from_primary_abs=(
+                float(value["displacement_from_primary_abs"])
+                if has_workflow_evidence
+                else None
+            ),
+            branch_identity=(
+                value.get("branch_identity")
+                if has_workflow_evidence
+                else None
+            ),
+            branch_authenticated=(
+                value.get("branch_authenticated")
+                if has_workflow_evidence
+                else None
+            ),
+            control_identity=(
+                value.get("control_identity")
+                if has_workflow_evidence
+                else None
+            ),
+            solve_role=(
+                value.get("solve_role")
+                if has_workflow_evidence
+                else None
+            ),
+            full_authentication_escalated=(
+                value.get("full_authentication_escalated")
+                if has_workflow_evidence
+                else None
+            ),
+            escalation_reason=(
+                value.get("escalation_reason")
+                if has_workflow_evidence
+                else None
+            ),
+            authenticated_evidence_reused=(
+                value.get("authenticated_evidence_reused")
+                if has_workflow_evidence
+                else None
+            ),
+            determinant_count=(
+                value.get("determinant_count")
+                if has_workflow_evidence
+                else None
+            ),
         )
-
 
 # Wide enough that re-forming the worker's product in decimal is exact well
 # past the tolerance below, cheap enough to run on every parsed receipt.
@@ -1983,11 +2204,11 @@ class RootReadout:
             self.worker_response_receipt
         )
         if receipt is not None:
-            current_wire = (
+            authentication_wire = (
                 receipt["worker_response_schema_version"]
-                == WORKER_RESPONSE_WIRE_SCHEMA
+                in _ROOT_AUTHENTICATION_WIRE_SCHEMAS
             )
-            if current_wire != (self.root_authentication is not None):
+            if authentication_wire != (self.root_authentication is not None):
                 raise ValueError(
                     "worker response receipt authentication schema is "
                     "inconsistent"

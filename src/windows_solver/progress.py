@@ -47,12 +47,16 @@ class ProgressEventKind(StrEnum):
     AMPLITUDE_READOUT_COMPLETED = "amplitude_readout_completed"
     ROOT_PHASE_STARTED = "root_phase_started"
     ROOT_SEED_SELECTED = "root_seed_selected"
+    ROOT_PHASE_AUTHENTICATION_ESCALATED = (
+        "root_phase_authentication_escalated"
+    )
     ROOT_PHASE_COMPLETED = "root_phase_completed"
     NEWTON_ITERATION_STARTED = "newton_iteration_started"
     NEWTON_ITERATION_COMPLETED = "newton_iteration_completed"
     DETERMINANT_STARTED = "determinant_started"
     DETERMINANT_COMPLETED = "determinant_completed"
     DETERMINANT_EVALUATED = "determinant_evaluated"
+    DETERMINANT_EVIDENCE_REUSED = "determinant_evidence_reused"
     HORIZON_CHART_EVALUATED = "horizon_chart_evaluated"
     DERIVATIVE_CONTROL_COMPLETED = "derivative_control_completed"
     ASYMPTOTIC_SERIES_EVALUATED = "asymptotic_series_evaluated"

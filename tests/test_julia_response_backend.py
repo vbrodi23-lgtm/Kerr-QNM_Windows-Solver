@@ -275,13 +275,12 @@ class JuliaResponseBackendTests(unittest.TestCase):
             backend.read_root(_deep_job(), 0.0j)
             self.assertEqual(len(calls), 2)
 
-    def test_success_wire_schema_is_four_and_worker_errors_remain_schema_one(self):
+    def test_success_wire_schema_is_five_and_worker_errors_remain_schema_one(self):
         """Catches changing the successful wire without preserving error parsing.
 
         The success wire and the error envelope are versioned independently.
-        Schema 4 adds the root_authentication record; the error envelope stays
-        at 1 so a worker that fails early is still parseable by a backend that
-        cannot read the newer success shape.
+        Schema 5 adds diagnostic-role, escalation, exact-reuse, control, and
+        error-aware correction evidence; the error envelope stays at 1.
         """
 
         request = JuliaPrecisionRootBackend(
@@ -293,7 +292,7 @@ class JuliaResponseBackendTests(unittest.TestCase):
             valid_julia_root_response(request)["schema_version"],
             WORKER_RESPONSE_WIRE_SCHEMA,
         )
-        self.assertEqual(WORKER_RESPONSE_WIRE_SCHEMA, 4)
+        self.assertEqual(WORKER_RESPONSE_WIRE_SCHEMA, 5)
         root = Path(__file__).resolve().parents[1]
         worker = (
             root / "src/windows_solver/data/julia/m02_worker.jl"
@@ -302,8 +301,8 @@ class JuliaResponseBackendTests(unittest.TestCase):
             worker.index("function result_fields(") :
             worker.index("function evaluate_request(")
         ]
-        self.assertEqual(result_fields.count('"schema_version" => 4'), 2)
-        self.assertNotIn('"schema_version" => 3', result_fields)
+        self.assertEqual(result_fields.count('"schema_version" => 5'), 2)
+        self.assertNotIn('"schema_version" => 4', result_fields)
         error_path = worker[
             worker.rindex("catch failure") : worker.index(
                 "if abspath(PROGRAM_FILE)"
@@ -349,6 +348,31 @@ class JuliaResponseBackendTests(unittest.TestCase):
                 self.assertEqual(
                     authentication.error_model_id is not None, horizon
                 )
+                for family, diagnostic in (
+                    readout.diagnostic_readouts or {}
+                ).items():
+                    self.assertEqual(
+                        diagnostic.solve_role, "DIAGNOSTIC_CONSISTENCY"
+                    )
+                    self.assertIsNotNone(
+                        diagnostic.correction_upper_bound, family
+                    )
+                    self.assertEqual(
+                        diagnostic.branch_identity,
+                        adapter.requests[0]["policy"]["branch_convention"],
+                    )
+                    self.assertGreaterEqual(diagnostic.determinant_count, 0)
+                    self.assertEqual(
+                        diagnostic.full_authentication_escalated,
+                        diagnostic.escalation_reason is not None,
+                    )
+                if horizon:
+                    self.assertTrue(
+                        readout.diagnostic_readouts[
+                            "resolution"
+                        ].authenticated_evidence_reused
+                    )
+
                 if horizon:
                     breakdown = authentication.error_breakdown
                     self.assertEqual(
@@ -1122,7 +1146,8 @@ class JuliaResponseBackendTests(unittest.TestCase):
 
         self.assertIn('progress_emit("root_readout_resource_infeasible"', worker)
         self.assertIn('"ROOT_READOUT_RESOURCE_INFEASIBLE"', worker)
-        self.assertIn('"minimum_remaining_determinant_count" => 8', worker)
+        self.assertIn("minimum_remaining_determinant_count::Int=8", worker)
+        self.assertIn("minimum_remaining_determinant_count=2", worker)
         self.assertIn('"estimator" => "first-determinant-linear-lower-bound/v1"', worker)
         self.assertIn('"diagnostics_skipped_reason" => "PRIMARY_NOT_CONVERGED"', worker)
         primary_guard = worker.index("if !primary_converged")
