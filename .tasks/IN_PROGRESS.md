@@ -55,6 +55,7 @@ preservation, and cache/provenance separation from historical raw-state leaves.
 - Complete the absolute determinant-error certificate and propagate each stencil sample's actual error through bounded Newton and final derivative authentication.
 - Carry the certificate through strict Julia/Python schemas, failures, progress, caches, reports, and mechanism-scoped scientific identity without changing exterior behavior.
 - Use the established binary64 root-correction threshold of 2e-11 for binary64, 80-digit, and 120-digit acceptance while preserving the mandatory error-aware determinant and derivative certificate.
+- Keep Julia's reserved progress context synchronized with Python's strict `ProgressContext` schema, including independent `phase` and `root_phase` fields, and cover the staged event-to-status path plus future context-key drift.
 - Calibrate the 80/120 ODE and finite-difference controls from a validated receipt, add executable worker/Julia CI gates, and run only the bounded Leaf 13 and five-mode regression evidence set.
 - Preserve fail-closed human mathematical review and independent-reference release gates; execution evidence remains explicitly unapproved until those receipts exist.
 
