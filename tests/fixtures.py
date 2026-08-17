@@ -684,11 +684,7 @@ def valid_julia_root_response(
             if request["mechanism_id"] == "horizon-admittance"
             else "not-applicable/v1"
         ),
-        "root_derivative_abs": (
-            "2.400000000000000000000000000000000000000000000000000003"
-            if request["mechanism_id"] == "horizon-admittance"
-            else "2.4"
-        ),
+        "root_derivative_abs": "2.4",
         "root_authentication": root_authentication,
         "root_converged": True,
         "branch_authentication_contract_version": 3,

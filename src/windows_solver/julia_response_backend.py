@@ -2651,7 +2651,14 @@ class JuliaPrecisionRootBackend:
         )
         if root_derivative_abs_decimal <= 0:
             raise JuliaResponseBackendError(
-                "M02 Julia root derivative magnitude is invalid"
+                "M02 Julia root derivative lower bound is invalid"
+            )
+        if (
+            root_derivative_abs_decimal
+            != root_authentication.derivative_lower_bound_abs
+        ):
+            raise JuliaResponseBackendError(
+                "M02 Julia root derivative lower bound is inconsistent"
             )
         expected_error_model_id = (
             policy.get("determinant_error_model")
@@ -2670,7 +2677,7 @@ class JuliaPrecisionRootBackend:
         try:
             root_authentication.validate_binding(
                 determinant_abs=normalised_determinant_abs,
-                derivative_abs=root_derivative_abs_decimal,
+                derivative_abs=root_authentication.derivative_estimate.magnitude(),
                 expected_error_model_id=expected_error_model_id,
                 root_correction_tolerance=root_correction_tolerance,
                 accepted=converged,
@@ -3149,8 +3156,8 @@ class JuliaPrecisionRootBackend:
                 determinant_residual_abs=_finite_text(
                     response["root_residual_abs"], "root_residual_abs"
                 ),
-                determinant_derivative_abs=_finite_text(
-                    response["root_derivative_abs"], "root_derivative_abs"
+                determinant_derivative_abs=float(
+                    root_authentication.derivative_estimate.magnitude()
                 ),
                 converged=converged,
                 root_reference_id=job.root.root_reference_id,
