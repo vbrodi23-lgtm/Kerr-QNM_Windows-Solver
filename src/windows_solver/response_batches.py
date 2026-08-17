@@ -33,14 +33,18 @@ from .response_engine import (
     HISTORICAL_NUMERICAL_CONDITIONING_SCHEMA,
     NUMERICAL_CONDITIONING_SCHEMA,
     NumericalPolicy,
+    PROMOTED_HORIZON_COMPONENT_IDENTITY,
+    PROMOTED_HORIZON_RESPONSE_METHOD,
     PROMOTED_ROOT_READOUT_POLICY,
     RECORDED_REPLAY_BACKEND_ID,
     RecordedReplayBackend,
     ResponseComponentJob,
     VettedNativeDeterminantKernel,
+    UNCALIBRATED_ANALYTIC_RESPONSE,
     regularised_gsn_precision_policy,
     root_readout_preserves_authenticated_branch,
     run_component,
+    run_promoted_horizon_component,
 )
 from .gsn_cache_producer import (
     GeneratedGsnCache,
@@ -70,12 +74,17 @@ from .solved_leaf_cache import (
 
 
 CAMPAIGN_SCHEMA_VERSION = 2
-CAMPAIGN_CHECKPOINT_SCHEMA_VERSION = 6
+CAMPAIGN_CHECKPOINT_SCHEMA_VERSION = 7
 _LEGACY_CAMPAIGN_CHECKPOINT_SCHEMA_VERSION = 3
-_HISTORICAL_CAMPAIGN_CHECKPOINT_SCHEMA_VERSIONS = frozenset({3, 4, 5})
+_HISTORICAL_CAMPAIGN_CHECKPOINT_SCHEMA_VERSIONS = frozenset({3, 4, 5, 6})
+_PROMOTION_DECISION_CHECKPOINT_SCHEMA_VERSION = 6
+_FAILED_PREFLIGHT_CHECKPOINT_SCHEMA_VERSION = 6
 _PRECISION_DIGITS = frozenset({64, 80, 120})
 _FAILED_PREFLIGHT_COMPARISON_KIND = (
     "same-precision-120-base-vs-refinement/v1"
+)
+_FAILED_PREFLIGHT_SINGLE_HORIZON_KIND = (
+    "single-promoted-horizon-root-after-80-preflight/v1"
 )
 _FACTORED_HOMOGENEOUS_ODE_SCOPE_ID = "factored-homogeneous-gsn/v1"
 STAGE_SIGNED_ERROR_FAMILIES = (
@@ -491,6 +500,7 @@ def _component_stage_signed_error_channels(
     *,
     repeat_delta: complex = 0.0j,
     precision_delta: complex = 0.0j,
+    repeat_applicable: bool = True,
     precision_ladder_applicable: bool = True,
 ) -> tuple[Mapping[str, object], ...]:
     """Preserve the authenticated component engine's six error channels."""
@@ -512,17 +522,23 @@ def _component_stage_signed_error_channels(
     }
     deltas["repeat-polish"] = complex(repeat_delta)
     deltas["precision-ladder-discrepancy"] = complex(precision_delta)
+    applicability = result.error_channel_applicability
+    not_applicable = {
+        family
+        for family, channel in family_sources.items()
+        if channel is not None and not applicability[channel]
+    }
+    if not repeat_applicable:
+        not_applicable.add("repeat-polish")
+    if not precision_ladder_applicable:
+        not_applicable.add("precision-ladder-discrepancy")
     return explicit_stage_signed_error_channels(
         component_result,
         family_deltas=deltas,
         source_kind="authenticated-component-error-channel",
         source_id=result.job_id,
         units="M-delta-omega-per-native-coordinate",
-        not_applicable_families=(
-            frozenset()
-            if precision_ladder_applicable
-            else frozenset({"precision-ladder-discrepancy"})
-        ),
+        not_applicable_families=frozenset(not_applicable),
     )
 
 
@@ -1177,12 +1193,23 @@ def _validate_failed_preflight_attempt_request(
     predictor_kind = request_binding.get("primary_predictor_kind")
     predictor_value: complex | None = None
     if raw_predictor is not None:
+        dedicated_baseline_predictor = (
+            leaf.role == "primary"
+            and leaf.mechanism_id == "horizon-admittance"
+            and precision_digits in (80, 120)
+            and refinement_level == 0
+            and amplitude_value == 0.0j
+            and predictor_kind is None
+        )
         if (
             not isinstance(raw_predictor, Mapping)
             or set(raw_predictor) != {"real", "imaginary"}
-            or predictor_kind not in {
-                "EPSILON_CONTINUATION", "SPIN_CONTINUATION"
-            }
+            or (
+                not dedicated_baseline_predictor
+                and predictor_kind not in {
+                    "EPSILON_CONTINUATION", "SPIN_CONTINUATION"
+                }
+            )
         ):
             raise ValueError("failed-preflight request predictor is invalid")
         try:
@@ -1272,6 +1299,38 @@ def _validate_failed_preflight_predecessor(
         allowed_refinement_levels=frozenset({0}),
         required_failure_code="INSUFFICIENT_ASYMPTOTIC_PRECISION",
     )
+
+
+def _failed_preflight_primary_root_predictor(
+    attempt: CampaignExecutionAttempt,
+) -> complex:
+    """Recover the binary64 baseline predictor bound into the failed request."""
+
+    failure = attempt.failure_receipt.get("failure")
+    request = (
+        None if not isinstance(failure, Mapping) else failure.get("request_binding")
+    )
+    raw = None if not isinstance(request, Mapping) else request.get(
+        "primary_predictor"
+    )
+    if not isinstance(raw, Mapping) or set(raw) != {"real", "imaginary"}:
+        raise ValueError(
+            "failed-preflight promoted horizon predictor evidence is missing"
+        )
+    try:
+        predictor = complex(
+            float(Decimal(raw["real"])),
+            float(Decimal(raw["imaginary"])),
+        )
+    except (InvalidOperation, TypeError, ValueError) as error:
+        raise ValueError(
+            "failed-preflight promoted horizon predictor evidence is invalid"
+        ) from error
+    if not math.isfinite(predictor.real) or not math.isfinite(predictor.imag):
+        raise ValueError(
+            "failed-preflight promoted horizon predictor evidence is invalid"
+        )
+    return predictor
 
 
 def _validate_failed_preflight_recovery_failure(
@@ -1552,8 +1611,9 @@ def _previous_primary_recovery_precision_contract() -> dict[str, object]:
     }
 
 
-def _failed_preflight_recovery_precision_contract() -> dict[str, object]:
-    """Bind the only admissible 80-preflight-to-120 alternate terminal gate."""
+def _multi_readout_failed_preflight_recovery_precision_contract(
+) -> dict[str, object]:
+    """Return the exact paired recovery contract from checkpoint schema 6."""
 
     return {
         "schema": "windows-solver.failed-preflight-recovery/1",
@@ -1585,6 +1645,26 @@ def _failed_preflight_recovery_precision_contract() -> dict[str, object]:
     }
 
 
+def _failed_preflight_recovery_precision_contract() -> dict[str, object]:
+    """Bind recovery, with the primary horizon single-readout override."""
+
+    return {
+        **_multi_readout_failed_preflight_recovery_precision_contract(),
+        "primary_horizon_override": {
+            "component_scientific_identity": (
+                PROMOTED_HORIZON_COMPONENT_IDENTITY
+            ),
+            "base_refinement_levels": [0],
+            "amplitude_readout_count": 1,
+            "self_refinement_required": False,
+            "precision_ladder_discrepancy_applicable": False,
+            "terminal_gate": (
+                "root-phases-branch-and-conditioning-adequate"
+            ),
+        },
+    }
+
+
 def _primary_recovery_precision_contract() -> dict[str, object]:
     """Return the canonical PRIMARY promoted-precision policy fragment."""
 
@@ -1593,8 +1673,59 @@ def _primary_recovery_precision_contract() -> dict[str, object]:
     return {
         **_previous_primary_recovery_precision_contract(),
         "promoted_numerical_controls": promoted_precision_numerical_controls(),
+        "promoted_horizon_component": {
+            "component_scientific_identity": (
+                PROMOTED_HORIZON_COMPONENT_IDENTITY
+            ),
+            "response_method": PROMOTED_HORIZON_RESPONSE_METHOD,
+            "amplitude_readout_count": 1,
+            "amplitudes": [
+                {"real": 0.0, "imaginary": 0.0},
+            ],
+            "finite_amplitude_readout_count": 0,
+            "self_refinement_required": False,
+            "primary_root_predictor": "previous-stage-baseline-omega",
+            "response_uncertainty_status": (
+                UNCALIBRATED_ANALYTIC_RESPONSE
+            ),
+        },
+        "precision120_gates": {
+            "root_not_converged": True,
+            "primary_rejected": True,
+            "truncation_rejected": True,
+            "resolution_rejected": True,
+            "branch_invalid": True,
+            "conditioning_precision_limited": True,
+            "required_reliable_digits_not_met": True,
+            "typed_retryable_control_failure": True,
+            "self_refinement_required": False,
+            "response_discrepancy_required": False,
+        },
+        "precision120_terminal_success": {
+            "component_status": ComponentStatus.CONVERGED.value,
+            "primary_accepted": True,
+            "truncation_accepted": True,
+            "resolution_accepted": True,
+            "branch_valid": True,
+            "conditioning_precision_limited": False,
+            "required_reliable_digits_met": True,
+        },
         "failed_preflight_alternate": (
             _failed_preflight_recovery_precision_contract()
+        ),
+    }
+
+
+def _multi_readout_primary_recovery_precision_contract() -> dict[str, object]:
+    """Return the exact PRIMARY contract before the single-readout component."""
+
+    from .julia_response_backend import promoted_precision_numerical_controls
+
+    return {
+        **_previous_primary_recovery_precision_contract(),
+        "promoted_numerical_controls": promoted_precision_numerical_controls(),
+        "failed_preflight_alternate": (
+            _multi_readout_failed_preflight_recovery_precision_contract()
         ),
     }
 
@@ -1683,6 +1814,44 @@ def _response_uncertainty_contract() -> dict[str, object]:
     """Bind the live diagnostic-root reduction used by every precision tier."""
 
     return {
+        "version": 4,
+        "promoted_root_readout_policy": PROMOTED_ROOT_READOUT_POLICY,
+        "promoted_primary_horizon_component_identity": (
+            PROMOTED_HORIZON_COMPONENT_IDENTITY
+        ),
+        "promoted_primary_horizon_response_method": (
+            PROMOTED_HORIZON_RESPONSE_METHOD
+        ),
+        "promoted_primary_horizon_finite_amplitude_ladder": (
+            "not-required-not-executed"
+        ),
+        "promoted_primary_horizon_response_uncertainty": (
+            UNCALIBRATED_ANALYTIC_RESPONSE
+        ),
+        "primary_disk": "combined_signed_secant_two_finest_level_richardson",
+        "diagnostic_phases": {
+            "binary64": ["TRUNCATION", "RESOLUTION", "SEED-PATH"],
+            "promoted": ["TRUNCATION", "RESOLUTION"],
+        },
+        "diagnostic_disk": "signed_phase_secants_two_finest_level_richardson",
+        "containment_increment": (
+            "max_axis_of_max_zero_control_distance_plus_control_radius_"
+            "minus_primary_combined_radius"
+        ),
+        "baseline_diagnostic_displacement_excluded": True,
+        "promoted_seed_path": "omitted-not-required",
+        "promoted_seed_path_error_channel": (
+            "explicitly-not-applicable"
+        ),
+        "root_space_displacements": "branch_continuation_only",
+        "units": "dimensionless_response",
+    }
+
+
+def _multi_readout_response_uncertainty_contract() -> dict[str, object]:
+    """Return the exact response contract from checkpoint schema 6."""
+
+    return {
         "version": 3,
         "promoted_root_readout_policy": PROMOTED_ROOT_READOUT_POLICY,
         "primary_disk": "combined_signed_secant_two_finest_level_richardson",
@@ -1740,10 +1909,14 @@ def _legacy_leaf_precision_contract(leaf: CampaignLeafPlan) -> dict[str, object]
 def _leaf_precision_contract(leaf: CampaignLeafPlan) -> dict[str, object]:
     contract = _legacy_leaf_precision_contract(leaf)
     if leaf.role == "primary":
-        contract["primary_recovery"] = _primary_recovery_precision_contract()
+        contract["primary_recovery"] = (
+            _primary_recovery_precision_contract()
+            if leaf.mechanism_id == "horizon-admittance"
+            else _multi_readout_primary_recovery_precision_contract()
+        )
     elif leaf.role == "deep":
         contract["failed_preflight_recovery"] = (
-            _failed_preflight_recovery_precision_contract()
+            _multi_readout_failed_preflight_recovery_precision_contract()
         )
     contract["root_convergence"] = _root_convergence_precision_contract()
     return contract
@@ -1786,7 +1959,14 @@ def _scientific_computation_identity_material(
         "precision_factory_identity": plan.precision_factory_identity.to_mapping(),
         "precision_contract": precision_contract,
         "response_uncertainty_contract": (
-            _response_uncertainty_contract()
+            (
+                _response_uncertainty_contract()
+                if (
+                    leaf.role == "primary"
+                    and leaf.mechanism_id == "horizon-admittance"
+                )
+                else _multi_readout_response_uncertainty_contract()
+            )
             if response_uncertainty_contract is None
             else dict(response_uncertainty_contract)
         ),
@@ -1840,6 +2020,29 @@ def _raw_residual_primary_scientific_computation_identity_sha256(
         _raw_residual_leaf_precision_contract(leaf),
         response_uncertainty_contract=(
             _previous_response_uncertainty_contract()
+        ),
+    ))
+
+
+def _multi_readout_primary_scientific_computation_identity_sha256(
+    plan: CampaignPlan,
+    leaf: CampaignLeafPlan,
+) -> str:
+    """Derive the immediate predecessor PRIMARY multi-readout identity."""
+
+    if leaf.role != "primary":
+        raise ValueError("multi-readout identity requires a PRIMARY leaf")
+    contract = _legacy_leaf_precision_contract(leaf)
+    contract["primary_recovery"] = (
+        _multi_readout_primary_recovery_precision_contract()
+    )
+    contract["root_convergence"] = _root_convergence_precision_contract()
+    return _sha256(_scientific_computation_identity_material(
+        plan,
+        leaf,
+        contract,
+        response_uncertainty_contract=(
+            _multi_readout_response_uncertainty_contract()
         ),
     ))
 
@@ -2103,8 +2306,9 @@ def _checkpoint_precision_contract_sha256(schema_version: int) -> str:
         ),
     }
     if schema_version in {3, 4, 5}:
-        historical_primary = dict(_primary_recovery_precision_contract())
-        historical_primary.pop("failed_preflight_alternate")
+        historical_primary = (
+            _multi_readout_primary_recovery_precision_contract()
+        )
         material.update(
             {
                 "primary_recovery": historical_primary,
@@ -2113,6 +2317,22 @@ def _checkpoint_precision_contract_sha256(schema_version: int) -> str:
                 ),
             }
         )
+    elif schema_version == 6:
+        historical_primary = (
+            _multi_readout_primary_recovery_precision_contract()
+        )
+        historical_primary["failed_preflight_alternate"] = (
+            _multi_readout_failed_preflight_recovery_precision_contract()
+        )
+        material.update({
+            "primary_recovery": historical_primary,
+            "failed_preflight_recovery": (
+                _multi_readout_failed_preflight_recovery_precision_contract()
+            ),
+            "response_uncertainty": (
+                _multi_readout_response_uncertainty_contract()
+            ),
+        })
     elif schema_version == CAMPAIGN_CHECKPOINT_SCHEMA_VERSION:
         material.update(
             {
@@ -2556,17 +2776,37 @@ def _promotion_conditioning(
     return result.baseline.numerical_conditioning
 
 
+def _single_promoted_horizon_result(
+    outcome: StageOutcome,
+) -> ComponentResult | None:
+    raw_result = outcome.component_result.get("result")
+    if not isinstance(raw_result, Mapping):
+        return None
+    result = ComponentResult.from_mapping(raw_result)
+    if result.component_scientific_identity != (
+        PROMOTED_HORIZON_COMPONENT_IDENTITY
+    ):
+        return None
+    if result.to_mapping() != raw_result:
+        raise ValueError("promoted horizon component result is not canonical")
+    return result
+
+
 def _promotion_decision(
     outcome: StageOutcome,
     *,
     existing_requested: bool,
     requested_reason: str,
     suppressed_reason: str,
+    allow_nonconvergence_suppression: bool = True,
 ) -> dict[str, object]:
     evidence = _promotion_conditioning(outcome)
     requested = existing_requested
     reason = requested_reason if requested else suppressed_reason
-    if outcome.numerical_state == ComponentStatus.NOT_CONVERGED.value:
+    if (
+        allow_nonconvergence_suppression
+        and outcome.numerical_state == ComponentStatus.NOT_CONVERGED.value
+    ):
         if evidence is None:
             reason = "LEGACY_CONDITIONING_EVIDENCE_ABSENT"
         else:
@@ -2704,7 +2944,15 @@ def _validate_attached_promotion_decision(
 
 
 def _primary_existing_requires_precision120(outcome: StageOutcome) -> bool:
-    gates = _primary_recovery_precision_contract()["precision120_gates"]
+    analytic = _single_promoted_horizon_result(outcome)
+    if analytic is not None:
+        return (
+            analytic.status is not ComponentStatus.CONVERGED
+            or not _component_conditioning_is_adequate(analytic)
+        )
+    gates = _previous_primary_recovery_precision_contract()[
+        "precision120_gates"
+    ]
     if not isinstance(gates, Mapping):
         raise ValueError("PRIMARY 120-digit gate contract is invalid")
     if outcome.numerical_state == gates["component_status"]:
@@ -2720,11 +2968,21 @@ def _primary_existing_requires_precision120(outcome: StageOutcome) -> bool:
 
 def _primary_precision120_decision(outcome: StageOutcome) -> dict[str, object]:
     existing_requested = _primary_existing_requires_precision120(outcome)
+    analytic = _single_promoted_horizon_result(outcome)
     return _promotion_decision(
         outcome,
         existing_requested=existing_requested,
-        requested_reason="CONVERGED_REFINEMENT_OR_DISCREPANCY_GATE",
-        suppressed_reason="CONVERGED_PROMOTION_GATES_SATISFIED",
+        requested_reason=(
+            "PROMOTED_ROOT_OR_CONDITIONING_GATE"
+            if analytic is not None
+            else "CONVERGED_REFINEMENT_OR_DISCREPANCY_GATE"
+        ),
+        suppressed_reason=(
+            "PROMOTED_ROOT_EVIDENCE_ACCEPTED"
+            if analytic is not None
+            else "CONVERGED_PROMOTION_GATES_SATISFIED"
+        ),
+        allow_nonconvergence_suppression=analytic is None,
     )
 
 
@@ -2757,7 +3015,17 @@ def _primary_requires_precision120(outcome: StageOutcome) -> bool:
 
 
 def _primary_precision120_terminal_state(outcome: StageOutcome) -> str:
-    success = _primary_recovery_precision_contract()[
+    analytic = _single_promoted_horizon_result(outcome)
+    if analytic is not None:
+        return (
+            "PRODUCED"
+            if (
+                analytic.status is ComponentStatus.CONVERGED
+                and _component_conditioning_is_adequate(analytic)
+            )
+            else "UNRESOLVED"
+        )
+    success = _previous_primary_recovery_precision_contract()[
         "precision120_terminal_success"
     ]
     if not isinstance(success, Mapping):
@@ -2808,10 +3076,22 @@ def _validate_current_promoted_runtime(
 
     payload = outcome.component_result
     runtime = payload.get(runtime_key)
-    package_promoted = (
-        payload.get("evidence_kind")
-        == "package-owned-julia-promoted-component-engine"
+    evidence_kind = payload.get("evidence_kind")
+    package_promoted = evidence_kind in {
+        "package-owned-julia-promoted-component-engine",
+        "package-owned-julia-single-promoted-horizon-component",
+    }
+    single_horizon = (
+        evidence_kind
+        == "package-owned-julia-single-promoted-horizon-component"
     )
+    if single_horizon != (
+        result.component_scientific_identity
+        == PROMOTED_HORIZON_COMPONENT_IDENTITY
+    ):
+        raise _UnauthenticatedComponentEvidence(
+            "campaign promoted component identity disagrees with evidence kind"
+        )
     conditioned = tuple(
         readout.numerical_conditioning is not None
         for readout in result.raw_readouts
@@ -2973,16 +3253,45 @@ def _validate_component_result(
     result = ComponentResult.from_mapping(raw_result)
     if result.to_mapping() != raw_result:
         raise ValueError("campaign component result is not canonical")
-    if result.status is ComponentStatus.CONVERGED:
-        body_is_valid = (
-            result.usable
-            and result.response is not None
-            and result.signed_root_crosscheck is not None
-            and result.convergence_basis in {
-                "ORDER_RESOLVED",
-                "TRUNCATION_BELOW_ROOT_RESOLUTION",
-            }
+    analytic_horizon = result.component_scientific_identity == (
+        PROMOTED_HORIZON_COMPONENT_IDENTITY
+    )
+    if analytic_horizon and not (
+        leaf.role == "primary"
+        and leaf.mechanism_id == "horizon-admittance"
+        and outcome.digits in (80, 120)
+        and result.response_method == PROMOTED_HORIZON_RESPONSE_METHOD
+        and result.response_uncertainty_status
+        == UNCALIBRATED_ANALYTIC_RESPONSE
+        and result.finite_amplitude_ladder_required is False
+        and result.finite_amplitude_ladder_executed is False
+        and result.finite_amplitude_readout_count == 0
+        and not any(result.error_channel_applicability.values())
+    ):
+        raise _UnauthenticatedComponentEvidence(
+            "campaign promoted analytic horizon identity is invalid"
         )
+    if result.status is ComponentStatus.CONVERGED:
+        if analytic_horizon:
+            body_is_valid = (
+                result.usable
+                and result.response is not None
+                and result.signed_root_crosscheck is None
+                and result.closed_form_response == result.response
+                and result.convergence_basis
+                == "PRIMARY_TRUNCATION_RESOLUTION_FIXED_ROOT"
+                and not result.levels
+            )
+        else:
+            body_is_valid = (
+                result.usable
+                and result.response is not None
+                and result.signed_root_crosscheck is not None
+                and result.convergence_basis in {
+                    "ORDER_RESOLVED",
+                    "TRUNCATION_BELOW_ROOT_RESOLUTION",
+                }
+            )
     else:
         body_is_valid = (
             not result.usable
@@ -2995,6 +3304,98 @@ def _validate_component_result(
         raise ValueError(
             "campaign production component result status/body contract is invalid"
         )
+    if analytic_horizon:
+        required_payload_fields = {
+            "evidence_kind",
+            "result",
+            "self_refinement_result",
+            "self_refinement_skipped_reason",
+            "scientific_runtime",
+            "primary_root_predictor_source",
+            "precision_ladder_discrepancy_applicable",
+            "precision_ladder_discrepancy_reason",
+        }
+        failed_preflight_fields = {
+            "failed_preflight_predecessor",
+            "comparison_kind",
+        }
+        if frozenset(payload) not in {
+            frozenset(required_payload_fields),
+            frozenset(required_payload_fields | {"promotion_decision"}),
+            frozenset(required_payload_fields | failed_preflight_fields),
+        }:
+            raise _UnauthenticatedComponentEvidence(
+                "campaign promoted analytic horizon payload fields are invalid"
+            )
+        discrepancy_applicable = payload.get(
+            "precision_ladder_discrepancy_applicable"
+        )
+        if (
+            payload.get("self_refinement_result") is not None
+            or payload.get("self_refinement_skipped_reason")
+            != "NOT_REQUIRED_BY_V1_4_PROMOTED_ROOT_POLICY"
+            or payload.get("primary_root_predictor_source")
+            not in {
+                "PREVIOUS_STAGE_BASELINE_OMEGA",
+                "FAILED_80_REQUEST_BINARY64_BASELINE_OMEGA",
+            }
+            or type(discrepancy_applicable) is not bool
+            or outcome.self_refinement_enclosed is not None
+            or outcome.deep_diagnostics is not None
+        ):
+            raise _UnauthenticatedComponentEvidence(
+                "campaign promoted analytic horizon execution evidence is invalid"
+            )
+        failed_preflight = "failed_preflight_predecessor" in payload
+        if failed_preflight != (
+            payload.get("primary_root_predictor_source")
+            == "FAILED_80_REQUEST_BINARY64_BASELINE_OMEGA"
+        ) or (
+            failed_preflight
+            and payload.get("comparison_kind")
+            != _FAILED_PREFLIGHT_SINGLE_HORIZON_KIND
+        ):
+            raise _UnauthenticatedComponentEvidence(
+                "campaign promoted analytic predictor provenance is invalid"
+            )
+        discrepancy_reason = payload.get(
+            "precision_ladder_discrepancy_reason"
+        )
+        if discrepancy_applicable:
+            discrepancy_valid = (
+                discrepancy_reason is None
+                and outcome.discrepancy_from_previous_abs is not None
+                and outcome.discrepancy_enclosed is not None
+            )
+        else:
+            discrepancy_valid = (
+                discrepancy_reason
+                in {
+                    "BINARY64_COMPONENT_RESPONSE_UNAVAILABLE",
+                    "PREVIOUS_PROMOTED_COMPONENT_RESPONSE_UNAVAILABLE",
+                }
+                and outcome.discrepancy_from_previous_abs is None
+                and outcome.discrepancy_enclosed is None
+            )
+        if not discrepancy_valid:
+            raise _UnauthenticatedComponentEvidence(
+                "campaign promoted analytic discrepancy evidence is invalid"
+            )
+        applicable_stage_family = (
+            "precision-ladder-discrepancy"
+            if discrepancy_applicable
+            else None
+        )
+        for channel in outcome.signed_error_channels:
+            expected_derivation = (
+                "explicit-signed-precision-ladder-discrepancy"
+                if channel["family"] == applicable_stage_family
+                else f"not-applicable-{channel['family']}"
+            )
+            if channel["provenance"]["derivation"] != expected_derivation:
+                raise _UnauthenticatedComponentEvidence(
+                    "campaign promoted analytic uncertainty applicability is invalid"
+                )
     job = leaf.job
     if (
         result.job_id != job.job_id
@@ -3034,12 +3435,20 @@ def _validate_component_result(
             else dict(job.source_root_mapping)
         ),
     }
+    if analytic_horizon:
+        expected_lineage["component_scientific_identity"] = (
+            PROMOTED_HORIZON_COMPONENT_IDENTITY
+        )
     if dict(result.lineage) != expected_lineage:
         raise _UnauthenticatedComponentEvidence(
             "campaign production component lineage is invalid"
         )
     if job.backend_identity.backend_id != RECORDED_REPLAY_BACKEND_ID:
-        if result.status is ComponentStatus.CONVERGED and len(result.levels) < 4:
+        if (
+            not analytic_horizon
+            and result.status is ComponentStatus.CONVERGED
+            and len(result.levels) < 4
+        ):
             raise _UnauthenticatedComponentEvidence(
                 "campaign production diagnostic root evidence is incomplete"
             )
@@ -3121,6 +3530,43 @@ def _validate_failed_preflight_recovery_stage(
     outcome: StageOutcome,
 ) -> tuple[CampaignExecutionAttempt, bool]:
     """Validate a self-contained 120-base/120-refinement recovery stage."""
+
+    analytic = _single_promoted_horizon_result(outcome)
+    if analytic is not None:
+        component = outcome.component_result
+        if (
+            outcome.digits != 120
+            or outcome.deep_diagnostics is not None
+            or outcome.self_refinement_enclosed is not None
+            or outcome.discrepancy_from_previous_abs is not None
+            or outcome.discrepancy_enclosed is not None
+            or component.get("comparison_kind")
+            != _FAILED_PREFLIGHT_SINGLE_HORIZON_KIND
+            or component.get("precision_ladder_discrepancy_applicable")
+            is not False
+        ):
+            raise ValueError(
+                "failed-preflight promoted horizon recovery fields are invalid"
+            )
+        predecessor = CampaignExecutionAttempt.from_mapping(
+            component.get("failed_preflight_predecessor")
+        )
+        _validate_failed_preflight_predecessor(predecessor, leaf)
+        predictor = _failed_preflight_primary_root_predictor(predecessor)
+        request = predecessor.failure_receipt["failure"]["request_binding"]
+        expected_predictor = {
+            "real": format(predictor.real, ".17g"),
+            "imaginary": format(predictor.imag, ".17g"),
+        }
+        if request.get("primary_predictor") != expected_predictor:
+            raise ValueError(
+                "failed-preflight promoted horizon predictor binding is invalid"
+            )
+        produced = (
+            analytic.status is ComponentStatus.CONVERGED
+            and _component_conditioning_is_adequate(analytic)
+        )
+        return predecessor, produced
 
     if (
         outcome.digits != 120
@@ -3285,7 +3731,22 @@ def _validate_primary_record_semantics(
         return all(production_flags)
 
     precision80 = stages[1]
-    if (
+    analytic80 = _single_promoted_horizon_result(precision80) is not None
+    if analytic80:
+        if (
+            precision80.deep_diagnostics is not None
+            or precision80.self_refinement_enclosed is not None
+            or precision80.component_result.get(
+                "precision_ladder_discrepancy_applicable"
+            )
+            is not False
+            or precision80.discrepancy_from_previous_abs is not None
+            or precision80.discrepancy_enclosed is not None
+        ):
+            raise ValueError(
+                "campaign promoted analytic PRIMARY 80-digit evidence is incomplete"
+            )
+    elif (
         precision80.deep_diagnostics is not None
         or precision80.self_refinement_enclosed is None
         or precision80.discrepancy_from_previous_abs is None
@@ -3307,8 +3768,12 @@ def _validate_primary_record_semantics(
         expected_state = _terminal_state(
             precision80,
             enclosed=(
-                bool(precision80.self_refinement_enclosed)
-                and bool(precision80.discrepancy_enclosed)
+                True
+                if analytic80
+                else (
+                    bool(precision80.self_refinement_enclosed)
+                    and bool(precision80.discrepancy_enclosed)
+                )
             ),
         )
         if (
@@ -3389,7 +3854,7 @@ def _validate_record_semantics(
 
     digits = tuple(stage.digits for stage in stages)
     if digits == (64, 120):
-        if checkpoint_schema_version != CAMPAIGN_CHECKPOINT_SCHEMA_VERSION:
+        if checkpoint_schema_version < _FAILED_PREFLIGHT_CHECKPOINT_SCHEMA_VERSION:
             raise ValueError(
                 "historical checkpoints cannot claim failed-preflight recovery"
             )
@@ -3453,10 +3918,12 @@ def _validate_record_semantics(
             stages,
             production_flags,
             promotion_decision_required=(
-                checkpoint_schema_version >= CAMPAIGN_CHECKPOINT_SCHEMA_VERSION
+                checkpoint_schema_version
+                >= _PROMOTION_DECISION_CHECKPOINT_SCHEMA_VERSION
             ),
             failed_preflight_pending_allowed=(
-                checkpoint_schema_version == CAMPAIGN_CHECKPOINT_SCHEMA_VERSION
+                checkpoint_schema_version
+                >= _FAILED_PREFLIGHT_CHECKPOINT_SCHEMA_VERSION
             ),
         )
 
@@ -3484,7 +3951,8 @@ def _validate_record_semantics(
             record.state == "MISSING_PRECISION"
             and record.missing_precision_digits == 80
         ) or (
-            checkpoint_schema_version == CAMPAIGN_CHECKPOINT_SCHEMA_VERSION
+            checkpoint_schema_version
+            >= _FAILED_PREFLIGHT_CHECKPOINT_SCHEMA_VERSION
             and record.state == "MISSING_PRECISION"
             and record.missing_precision_digits == 120
         )
@@ -3524,7 +3992,8 @@ def _validate_record_semantics(
         precision80,
         decision,
         required=(
-            checkpoint_schema_version >= CAMPAIGN_CHECKPOINT_SCHEMA_VERSION
+            checkpoint_schema_version
+            >= _PROMOTION_DECISION_CHECKPOINT_SCHEMA_VERSION
         ),
     )
     requires120 = decision["state"] == "REQUESTED"
@@ -3716,6 +4185,9 @@ def _authenticated_solved_leaf_lookup(
         return current
 
     predecessor_identities = (
+        _multi_readout_primary_scientific_computation_identity_sha256(
+            plan, leaf
+        ),
         _raw_residual_primary_scientific_computation_identity_sha256(
             plan, leaf
         ),
@@ -3815,6 +4287,33 @@ def _authenticated_solved_leaf_lookup(
 
 
 def _validate_precision120(outcome: StageOutcome) -> None:
+    if _single_promoted_horizon_result(outcome) is not None:
+        applicable = outcome.component_result.get(
+            "precision_ladder_discrepancy_applicable"
+        )
+        if (
+            outcome.deep_diagnostics is not None
+            or outcome.self_refinement_enclosed is not None
+            or type(applicable) is not bool
+            or (
+                applicable
+                and (
+                    outcome.discrepancy_from_previous_abs is None
+                    or outcome.discrepancy_enclosed is None
+                )
+            )
+            or (
+                not applicable
+                and (
+                    outcome.discrepancy_from_previous_abs is not None
+                    or outcome.discrepancy_enclosed is not None
+                )
+            )
+        ):
+            raise ValueError(
+                "campaign promoted analytic 120-digit evidence is incomplete"
+            )
+        return
     if (
         outcome.deep_diagnostics is not None
         or outcome.self_refinement_enclosed is not None
@@ -4405,6 +4904,86 @@ def run_campaign_selection(
     return summary
 
 
+def _migrate_schema6_single_promoted_horizon_checkpoint(
+    plan: CampaignPlan,
+    selection: CampaignSelection,
+    records: Sequence[CampaignLeafRecord],
+    attempts: Sequence[CampaignExecutionAttempt],
+    available: PrecisionCapabilities,
+) -> tuple[
+    tuple[CampaignLeafRecord, ...],
+    tuple[CampaignExecutionAttempt, ...],
+]:
+    """Retain canonical binary64 work and discard stale horizon promotion.
+
+    Inputs have already passed the complete schema-6 authentication path.  The
+    migration changes no binary64 stage bytes: it removes only stages and
+    attempts belonging to primary horizon leaves whose binary64 baseline
+    requested promotion under the predecessor component architecture.
+    """
+
+    leaf_by_id = {leaf.leaf_id: leaf for leaf in plan.leaves}
+    affected_leaf_ids: set[str] = set()
+    migrated_records: list[CampaignLeafRecord] = []
+    for record in records:
+        leaf = leaf_by_id[record.leaf_id]
+        first = record.stages[0].outcome
+        production = _validate_component_result(
+            leaf,
+            first,
+            allow_historical_conditioning_absence=True,
+        )
+        affected = (
+            leaf.role == "primary"
+            and leaf.mechanism_id == "horizon-admittance"
+            and _primary_binary64_promotes(first, production=production)
+        )
+        if not affected:
+            migrated_records.append(record)
+            continue
+        affected_leaf_ids.add(record.leaf_id)
+        missing = 80 if 80 not in available.digits else None
+        migrated_records.append(CampaignLeafRecord(
+            leaf_id=record.leaf_id,
+            role=record.role,
+            state=("MISSING_PRECISION" if missing is not None else "IN_PROGRESS"),
+            stages=(record.stages[0],),
+            missing_precision_digits=missing,
+        ))
+
+    retained_attempts = tuple(
+        attempt
+        for attempt in attempts
+        if attempt.leaf_id not in affected_leaf_ids
+    )
+    renumbered_attempts = tuple(
+        replace(attempt, attempt_ordinal=index)
+        for index, attempt in enumerate(retained_attempts, start=1)
+    )
+    predecessor_by_leaf = {
+        attempt.leaf_id: attempt
+        for attempt in renumbered_attempts
+        if (
+            attempt.precision_digits == 80
+            and attempt.failure_code == "INSUFFICIENT_ASYMPTOTIC_PRECISION"
+        )
+    }
+    materialized_records: list[CampaignLeafRecord] = []
+    for record in migrated_records:
+        if tuple(stage.outcome.digits for stage in record.stages) == (64, 120):
+            predecessor = predecessor_by_leaf.get(record.leaf_id)
+            if predecessor is None:
+                raise ValueError(
+                    "schema-6 migration lost a retained preflight predecessor"
+                )
+            record = _record_with_materialized_failed_preflight_predecessor(
+                record,
+                predecessor,
+            )
+        materialized_records.append(record)
+    return tuple(materialized_records), renumbered_attempts
+
+
 def _run_campaign_selection_active(
     plan: CampaignPlan,
     selection: CampaignSelection,
@@ -4429,7 +5008,36 @@ def _run_campaign_selection_active(
         )
         if loaded_selection != selection:
             raise ValueError("campaign checkpoint selection does not match request")
-        if (
+        if loaded_schema_version == 6:
+            existing, loaded_attempts = (
+                _migrate_schema6_single_promoted_horizon_checkpoint(
+                    plan,
+                    selection,
+                    existing,
+                    loaded_attempts,
+                    available,
+                )
+            )
+            _atomic_json(
+                path,
+                _checkpoint_mapping(
+                    plan,
+                    selection,
+                    existing,
+                    loaded_attempts,
+                ),
+            )
+            loaded_schema_version = CAMPAIGN_CHECKPOINT_SCHEMA_VERSION
+            loaded_state = (
+                "COMPLETE"
+                if len(existing) == len(selection.leaf_ids)
+                and all(
+                    record.state in {"PRODUCED", "UNRESOLVED"}
+                    for record in existing
+                )
+                else "PARTIAL"
+            )
+        elif (
             loaded_schema_version != CAMPAIGN_CHECKPOINT_SCHEMA_VERSION
             and loaded_state == "PARTIAL"
         ):
@@ -4912,10 +5520,25 @@ def _run_campaign_selection_active(
                         stage_count=len(record.stages),
                     )
                 continue
-            if (
-                not isinstance(outcome80, StageOutcome)
-                or outcome80.digits != 80
-                or outcome80.self_refinement_enclosed is None
+            if not isinstance(outcome80, StageOutcome) or outcome80.digits != 80:
+                raise ValueError("campaign backend returned incomplete 80-digit evidence")
+            analytic80 = _single_promoted_horizon_result(outcome80) is not None
+            if analytic80:
+                if (
+                    outcome80.self_refinement_enclosed is not None
+                    or outcome80.component_result.get(
+                        "precision_ladder_discrepancy_applicable"
+                    )
+                    is not False
+                    or outcome80.discrepancy_from_previous_abs is not None
+                    or outcome80.discrepancy_enclosed is not None
+                ):
+                    raise ValueError(
+                        "campaign backend returned incomplete promoted analytic "
+                        "80-digit evidence"
+                    )
+            elif (
+                outcome80.self_refinement_enclosed is None
                 or outcome80.discrepancy_from_previous_abs is None
                 or outcome80.discrepancy_enclosed is None
             ):
@@ -4950,8 +5573,12 @@ def _run_campaign_selection_active(
                     state = _terminal_state(
                         outcome80,
                         enclosed=(
-                            bool(outcome80.self_refinement_enclosed)
-                            and bool(outcome80.discrepancy_enclosed)
+                            True
+                            if analytic80
+                            else (
+                                bool(outcome80.self_refinement_enclosed)
+                                and bool(outcome80.discrepancy_enclosed)
+                            )
                         ),
                     )
                     missing = None
@@ -5103,16 +5730,11 @@ def _run_campaign_selection_active(
                     digits=precision120_digits,
                 )
                 continue
-            if (
-                not isinstance(outcome120, StageOutcome)
-                or outcome120.digits != 120
-                or outcome120.discrepancy_from_previous_abs is None
-                or outcome120.discrepancy_enclosed is None
-            ):
+            if not isinstance(outcome120, StageOutcome) or outcome120.digits != 120:
                 raise ValueError("campaign backend returned incomplete 120-digit evidence")
+            _validate_precision120(outcome120)
             executed += 1
             if leaf.role == "primary":
-                _validate_precision120(outcome120)
                 if not _validate_component_result(
                     leaf,
                     outcome120,
@@ -5286,8 +5908,10 @@ def import_campaign_checkpoint_to_solved_leaf_store(
         and "records" not in diagnostic
     ):
         return SolvedLeafImportSummary(0, 0, (), str(store.root))
-    _, records, _ = _load_checkpoint_for_solved_leaf_import(
+    _, records, _, checkpoint_schema_version = (
+        _load_checkpoint_for_solved_leaf_import(
         plan, path
+        )
     )
     leaf_by_id = {leaf.leaf_id: leaf for leaf in plan.leaves}
     imported: list[str] = []
@@ -5297,6 +5921,18 @@ def import_campaign_checkpoint_to_solved_leaf_store(
             skipped += 1
             continue
         leaf = leaf_by_id[record.leaf_id]
+        if (
+            checkpoint_schema_version == 6
+            and leaf.role == "primary"
+            and leaf.mechanism_id == "horizon-admittance"
+            and len(record.stages) > 1
+        ):
+            # Schema 6 promoted horizon stages used the multiplied component
+            # engine.  They remain authenticated history, never current cache
+            # evidence.  A campaign resume performs the lossless binary64
+            # migration and recomputes promotion under the new identity.
+            skipped += 1
+            continue
         try:
             _validate_cacheable_leaf_record(plan, leaf, record)
         except _NonProductionSolvedLeafRecord:
@@ -5321,7 +5957,7 @@ def import_campaign_checkpoint_to_solved_leaf_store(
 
 def _load_checkpoint_for_solved_leaf_import(
     plan: CampaignPlan, path: Path
-) -> tuple[CampaignSelection, tuple[CampaignLeafRecord, ...], str]:
+) -> tuple[CampaignSelection, tuple[CampaignLeafRecord, ...], str, int]:
     """Authenticate an old checkpoint while permitting operational campaign drift."""
 
     value, bindings, records, _attempts = _read_checkpoint_envelope(path)
@@ -5447,7 +6083,7 @@ def _load_checkpoint_for_solved_leaf_import(
     )
     if value["state"] != expected_state or value["release_admissible"] is not False:
         raise ValueError("campaign checkpoint state is invalid")
-    return selection, records, expected_state
+    return selection, records, expected_state, value["schema_version"]
 
 
 def merge_campaign_checkpoints(
@@ -5469,13 +6105,33 @@ def merge_campaign_checkpoints(
         selection, records, attempts, state, schema_version = (
             _load_checkpoint_with_attempts(plan, path)
         )
+        if schema_version == 6:
+            records, attempts = (
+                _migrate_schema6_single_promoted_horizon_checkpoint(
+                    plan,
+                    selection,
+                    records,
+                    attempts,
+                    plan.precision_capabilities,
+                )
+            )
+            state = (
+                "COMPLETE"
+                if len(records) == len(selection.leaf_ids)
+                and all(
+                    record.state in {"PRODUCED", "UNRESOLVED"}
+                    for record in records
+                )
+                else "PARTIAL"
+            )
         if (
             schema_version != CAMPAIGN_CHECKPOINT_SCHEMA_VERSION
+            and schema_version != 6
             and state == "PARTIAL"
         ):
             raise ValueError(
                 "incomplete historical campaign checkpoint is read-only; "
-                "it cannot be merged into schema 6"
+                "it cannot be merged into the current checkpoint schema"
             )
         selected_ids.update(selection.leaf_ids)
         for record in records:
@@ -5840,6 +6496,54 @@ def _run_component_with_progress(
         return result
 
 
+def _run_promoted_horizon_component_with_progress(
+    job: ResponseComponentJob,
+    backend: object,
+    primary_root_predictor: complex,
+) -> ComponentResult:
+    """Run the one-readout promoted horizon boundary with pass telemetry."""
+
+    started = time.monotonic()
+    with progress_scope(component_pass="promoted"):
+        emit_progress(ProgressEventKind.COMPONENT_PASS_STARTED)
+        try:
+            result = run_promoted_horizon_component(
+                job,
+                backend,  # type: ignore[arg-type]
+                primary_root_predictor,
+            )
+        except KeyboardInterrupt:
+            raise
+        except BaseException as error:
+            emit_progress(
+                ProgressEventKind.ERROR,
+                component_pass="promoted",
+                error_type=type(error).__name__,
+                message=str(error),
+                elapsed_seconds=time.monotonic() - started,
+            )
+            raise
+        emit_progress(
+            ProgressEventKind.COMPONENT_PASS_COMPLETED,
+            component_pass="promoted",
+            status=result.status.value,
+            readout_count=len(result.raw_readouts),
+            elapsed_seconds=time.monotonic() - started,
+        )
+        return result
+
+
+def _is_single_promoted_horizon_stage(
+    leaf: CampaignLeafPlan,
+    digits: int,
+) -> bool:
+    return (
+        leaf.role == "primary"
+        and leaf.mechanism_id == "horizon-admittance"
+        and digits in (80, 120)
+    )
+
+
 class NativeCampaignStageBackend:
     """Package-owned binary64 and Julia BigFloat M02 campaign backend."""
 
@@ -5979,6 +6683,56 @@ class NativeCampaignStageBackend:
             raise NativeResourceUnavailableError(
                 "M02 Julia precision worker is unavailable"
             )
+        if _is_single_promoted_horizon_stage(leaf, digits):
+            primary_root_predictor = _failed_preflight_primary_root_predictor(
+                predecessor
+            )
+            primary_backend = JuliaPrecisionRootBackend(
+                self.identity, self.julia_adapter, 120
+            )
+            result = _run_promoted_horizon_component_with_progress(
+                leaf.job,
+                primary_backend,
+                primary_root_predictor,
+            )
+            component_result = {
+                "evidence_kind": (
+                    "package-owned-julia-single-promoted-horizon-component"
+                ),
+                "result": result.to_mapping(),
+                "self_refinement_result": None,
+                "self_refinement_skipped_reason": (
+                    "NOT_REQUIRED_BY_V1_4_PROMOTED_ROOT_POLICY"
+                ),
+                "scientific_runtime": primary_backend.scientific_runtime_for(
+                    leaf.job
+                ),
+                "primary_root_predictor_source": (
+                    "FAILED_80_REQUEST_BINARY64_BASELINE_OMEGA"
+                ),
+                "precision_ladder_discrepancy_applicable": False,
+                "precision_ladder_discrepancy_reason": (
+                    "BINARY64_COMPONENT_RESPONSE_UNAVAILABLE"
+                ),
+                "failed_preflight_predecessor": predecessor.to_mapping(),
+                "comparison_kind": _FAILED_PREFLIGHT_SINGLE_HORIZON_KIND,
+            }
+            local_radius = sum(result.error_channels.values())
+            return StageOutcome(
+                digits=120,
+                numerical_state=result.status.value,
+                component_result=component_result,
+                local_disk_radius_abs=local_radius,
+                signed_error_channels=_component_stage_signed_error_channels(
+                    component_result,
+                    result,
+                    repeat_applicable=False,
+                    precision_ladder_applicable=False,
+                ),
+                self_refinement_enclosed=None,
+                discrepancy_from_previous_abs=None,
+                discrepancy_enclosed=None,
+            )
         base_backend = JuliaPrecisionRootBackend(
             self.identity, self.julia_adapter, 120
         )
@@ -6058,14 +6812,94 @@ class NativeCampaignStageBackend:
         primary_backend = JuliaPrecisionRootBackend(
             self.identity, self.julia_adapter, digits
         )
+        previous_result = ComponentResult.from_mapping(
+            previous_outcomes[-1].component_result["result"]
+        )
+        if _is_single_promoted_horizon_stage(leaf, digits):
+            primary_root_predictor = previous_result.baseline.omega
+            result = _run_promoted_horizon_component_with_progress(
+                leaf.job,
+                primary_backend,
+                primary_root_predictor,
+            )
+            previous_response = previous_result.response
+            precision_ladder_applicable = (
+                result.response is not None and previous_response is not None
+            )
+            precision_delta = (
+                result.response - previous_response
+                if precision_ladder_applicable
+                else None
+            )
+            discrepancy = (
+                None if precision_delta is None else abs(precision_delta)
+            )
+            discrepancy_enclosed = (
+                None
+                if precision_delta is None
+                else discrepancy
+                <= (
+                    sum(result.error_channels.values())
+                    + previous_outcomes[-1].local_disk_radius_abs
+                )
+            )
+            component_result = {
+                "evidence_kind": (
+                    "package-owned-julia-single-promoted-horizon-component"
+                ),
+                "result": result.to_mapping(),
+                "self_refinement_result": None,
+                "self_refinement_skipped_reason": (
+                    "NOT_REQUIRED_BY_V1_4_PROMOTED_ROOT_POLICY"
+                ),
+                "scientific_runtime": primary_backend.scientific_runtime_for(
+                    leaf.job
+                ),
+                "primary_root_predictor_source": (
+                    "PREVIOUS_STAGE_BASELINE_OMEGA"
+                ),
+                "precision_ladder_discrepancy_applicable": (
+                    precision_ladder_applicable
+                ),
+                "precision_ladder_discrepancy_reason": (
+                    None
+                    if precision_ladder_applicable
+                    else (
+                        "BINARY64_COMPONENT_RESPONSE_UNAVAILABLE"
+                        if previous_outcomes[-1].digits == 64
+                        else "PREVIOUS_PROMOTED_COMPONENT_RESPONSE_UNAVAILABLE"
+                    )
+                ),
+            }
+            local_radius = (
+                sum(result.error_channels.values())
+                + (0.0 if discrepancy is None else discrepancy)
+            )
+            return StageOutcome(
+                digits=digits,
+                numerical_state=result.status.value,
+                component_result=component_result,
+                local_disk_radius_abs=local_radius,
+                signed_error_channels=_component_stage_signed_error_channels(
+                    component_result,
+                    result,
+                    precision_delta=(
+                        0.0j if precision_delta is None else precision_delta
+                    ),
+                    repeat_applicable=False,
+                    precision_ladder_applicable=(
+                        precision_ladder_applicable
+                    ),
+                ),
+                self_refinement_enclosed=None,
+                discrepancy_from_previous_abs=discrepancy,
+                discrepancy_enclosed=discrepancy_enclosed,
+            )
         result = _run_component_with_progress(
             leaf.job,
             primary_backend,
             "primary",
             response_predictor,
-        )
-        previous_result = ComponentResult.from_mapping(
-            previous_outcomes[-1].component_result["result"]
         )
         precision_delta = _component_result_delta(result, previous_result)
         base_radius = sum(result.error_channels.values())

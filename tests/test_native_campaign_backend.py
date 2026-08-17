@@ -76,10 +76,14 @@ def _result(job, response: complex, *, radius: float = 1.0e-7):
     )
 
 
-def _failed_preflight_attempt(leaf):
+def _failed_preflight_attempt(leaf, *, primary_predictor=None):
     request_binding = JuliaPrecisionRootBackend(
         leaf.job.backend_identity, object(), 80
-    )._request(leaf.job, 0.0j)
+    )._request(
+        leaf.job,
+        0.0j,
+        primary_predictor=primary_predictor,
+    )
     failure = {
         "failure_code": "INSUFFICIENT_ASYMPTOTIC_PRECISION",
         "failure_class": "CONTROL",

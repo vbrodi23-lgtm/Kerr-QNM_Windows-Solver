@@ -6,10 +6,11 @@ import io
 import json
 from pathlib import Path
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
-from windows_solver.cli import main
+from windows_solver.cli import _campaign_selected, main
 from windows_solver.artifacts import ArtifactStore
 from windows_solver.builtin import ProblemContractProvider
 from windows_solver.contracts import canonical_json_bytes
@@ -425,6 +426,68 @@ class CliTests(unittest.TestCase):
         self.assertEqual(status, 130)
         self.assertEqual(output, {})
         self.assertEqual(json.loads(error)["error"]["code"], "INTERRUPTED")
+
+    def test_complete_schema_six_resume_enters_checkpoint_migration(self) -> None:
+        plan = SimpleNamespace(
+            backend_identity=object(), campaign_id="campaign-1"
+        )
+        selection = SimpleNamespace(
+            selection_id="selection-1", leaf_ids=("leaf-1",)
+        )
+        cached = SimpleNamespace(state="COMPLETE", selection_id="selection-1")
+        migrated = SimpleNamespace()
+        backend = object()
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            checkpoint = root / "checkpoint.json"
+            checkpoint.write_bytes(canonical_json_bytes({"schema_version": 6}))
+            with (
+                patch(
+                    "windows_solver.cli._campaign_plan_and_selection",
+                    return_value=(plan, selection, None),
+                ),
+                patch(
+                    "windows_solver.cli.validate_campaign_checkpoint",
+                    return_value=cached,
+                ),
+                patch(
+                    "windows_solver.cli._validate_campaign_capability_superset"
+                ),
+                patch(
+                    "windows_solver.cli._load_campaign_backend",
+                    return_value=backend,
+                ) as load_backend,
+                patch(
+                    "windows_solver.cli.run_campaign_selection",
+                    return_value=migrated,
+                ) as run_campaign,
+                patch(
+                    "windows_solver.cli.import_campaign_checkpoint_to_solved_leaf_store"
+                ) as import_cache,
+                patch(
+                    "windows_solver.cli._campaign_console_mapping",
+                    return_value={"migrated": True},
+                ),
+                patch("windows_solver.cli.Path.cwd", return_value=root),
+            ):
+                status, output = _campaign_selected(
+                    "campaign-resume",
+                    root / "selection.json",
+                    Path("checkpoint.json"),
+                )
+
+        self.assertEqual(status, 0)
+        self.assertEqual(output, {"migrated": True})
+        load_backend.assert_called_once_with(
+            None,
+            plan=plan,
+            selection=selection,
+        )
+        run_campaign.assert_called_once()
+        self.assertIs(run_campaign.call_args.args[2], backend)
+        self.assertTrue(run_campaign.call_args.kwargs["resume"])
+        import_cache.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -16,6 +16,9 @@ from windows_solver.response_batches import (
     PrecisionCapabilities,
     StageOutcome,
     build_campaign_plan,
+    _is_single_promoted_horizon_stage,
+    _primary_precision120_terminal_state,
+    _primary_requires_precision120,
     synthetic_stage_signed_error_channels,
 )
 import windows_solver.response_engine as response_engine
@@ -34,9 +37,11 @@ from windows_solver.response_engine import (
     VettedNativeDeterminantKernel,
 )
 from windows_solver.gsn_cache_producer import GeneratedGsnCache, GsnParameterPair
+from windows_solver.julia_response_backend import JuliaPrecisionRootBackend
 from windows_solver.response_engine import NativeDeterminantAdapter, RootReadout
 from pathlib import Path
 from types import SimpleNamespace
+from tests.test_native_campaign_backend import _failed_preflight_attempt
 
 
 OPERATOR_OMEGA = complex(
@@ -512,6 +517,24 @@ class FakeJuliaPrecisionBackend(FakePromotedBackend):
             ),
         }
 
+    def _request(
+        self,
+        job,
+        amplitude,
+        primary_predictor=None,
+        primary_predictor_kind=None,
+    ):
+        return JuliaPrecisionRootBackend(
+            self.identity,
+            object(),
+            self.digits,
+        )._request(
+            job,
+            amplitude,
+            primary_predictor,
+            primary_predictor_kind,
+        )
+
 
 class PromotedHorizonStageTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -532,6 +555,31 @@ class PromotedHorizonStageTests(unittest.TestCase):
             generated,
             SimpleNamespace(),
         )
+
+    def test_dedicated_routing_scope_excludes_binary64_deep_and_exterior(self):
+        plan = build_campaign_plan(
+            policy=NumericalPolicy(),
+            backend_identity=VettedNativeDeterminantKernel.identity,
+            precision_capabilities=PrecisionCapabilities((64, 80, 120)),
+        )
+        exterior = next(
+            leaf
+            for leaf in plan.leaves
+            if leaf.role == "primary"
+            and leaf.mechanism_id != "horizon-admittance"
+        )
+        deep_horizon = next(
+            leaf
+            for leaf in plan.leaves
+            if leaf.role == "deep"
+            and leaf.mechanism_id == "horizon-admittance"
+        )
+
+        self.assertTrue(_is_single_promoted_horizon_stage(self.leaf, 80))
+        self.assertTrue(_is_single_promoted_horizon_stage(self.leaf, 120))
+        self.assertFalse(_is_single_promoted_horizon_stage(self.leaf, 64))
+        self.assertFalse(_is_single_promoted_horizon_stage(exterior, 80))
+        self.assertFalse(_is_single_promoted_horizon_stage(deep_horizon, 80))
 
     def test_julia80_uses_binary64_baseline_as_single_root_predictor(self):
         predictor = complex(0.70001, -0.12002)
@@ -606,9 +654,19 @@ class PromotedHorizonStageTests(unittest.TestCase):
             120,
         )
 
+        def backend_factory(identity, adapter, digits, refinement=0):
+            if digits == 120:
+                return julia_backend
+            return JuliaPrecisionRootBackend(
+                identity,
+                adapter,
+                digits,
+                refinement=refinement,
+            )
+
         with patch(
             "windows_solver.response_batches.JuliaPrecisionRootBackend",
-            return_value=julia_backend,
+            side_effect=backend_factory,
         ) as backend_type:
             outcome = self.backend.execute_promoted_stage_with_predictor(
                 self.leaf,
@@ -617,10 +675,15 @@ class PromotedHorizonStageTests(unittest.TestCase):
                 response_predictor=None,
             )
 
-        backend_type.assert_called_once_with(
-            self.leaf.job.backend_identity,
-            self.backend.julia_adapter,
-            120,
+        self.assertEqual(
+            [call.args[2] for call in backend_type.call_args_list].count(120),
+            1,
+        )
+        self.assertFalse(
+            any(
+                len(call.args) >= 4 and call.args[3] == 1
+                for call in backend_type.call_args_list
+            )
         )
         self.assertEqual(
             julia_backend.calls,
@@ -629,6 +692,166 @@ class PromotedHorizonStageTests(unittest.TestCase):
         self.assertIsNone(outcome.self_refinement_enclosed)
         self.assertIsNotNone(outcome.discrepancy_from_previous_abs)
         self.assertIsNotNone(outcome.discrepancy_enclosed)
+
+    def test_failed_preflight_julia120_is_one_readout_without_refinement(self):
+        predictor = complex(0.70001, -0.12002)
+        predecessor = _failed_preflight_attempt(
+            self.leaf,
+            primary_predictor=predictor,
+        )
+        julia_backend = FakeJuliaPrecisionBackend(
+            self.leaf.job,
+            _promoted_baseline(self.leaf.job),
+            120,
+        )
+
+        def backend_factory(identity, adapter, digits, refinement=0):
+            if digits == 120:
+                return julia_backend
+            return JuliaPrecisionRootBackend(
+                identity,
+                adapter,
+                digits,
+                refinement=refinement,
+            )
+
+        with patch(
+            "windows_solver.response_batches.JuliaPrecisionRootBackend",
+            side_effect=backend_factory,
+        ) as backend_type:
+            outcome = (
+                self.backend
+                .execute_promoted_stage_after_failed_preflight_with_predictor(
+                    self.leaf,
+                    120,
+                    predecessor,
+                    response_predictor=complex(99.0, 88.0),
+                )
+            )
+
+        self.assertEqual(
+            [call.args[2] for call in backend_type.call_args_list].count(120),
+            1,
+        )
+        self.assertFalse(
+            any(
+                len(call.args) >= 4 and call.args[3] == 1
+                for call in backend_type.call_args_list
+            )
+        )
+        self.assertEqual(
+            julia_backend.calls,
+            [(self.leaf.job, 0.0j, predictor)],
+        )
+        self.assertIsNone(outcome.self_refinement_enclosed)
+        self.assertIsNone(outcome.discrepancy_from_previous_abs)
+        self.assertIsNone(outcome.discrepancy_enclosed)
+        self.assertIsNone(
+            outcome.component_result["self_refinement_result"]
+        )
+        self.assertEqual(
+            outcome.component_result["self_refinement_skipped_reason"],
+            "NOT_REQUIRED_BY_V1_4_PROMOTED_ROOT_POLICY",
+        )
+
+    def test_80_to_120_gate_uses_root_and_conditioning_not_self_refinement(self):
+        previous = _stage_from_result(
+            64,
+            _binary64_nonconverged_result(
+                self.leaf.job,
+                complex(0.70001, -0.12002),
+            ),
+        )
+
+        def outcome_for(baseline):
+            backend = FakeJuliaPrecisionBackend(self.leaf.job, baseline, 80)
+            with patch(
+                "windows_solver.response_batches.JuliaPrecisionRootBackend",
+                return_value=backend,
+            ):
+                return self.backend.execute_promoted_stage_with_predictor(
+                    self.leaf,
+                    80,
+                    (previous,),
+                    response_predictor=None,
+                )
+
+        adequate = outcome_for(_promoted_baseline(self.leaf.job))
+        self.assertFalse(_primary_requires_precision120(adequate))
+        self.assertIsNone(adequate.self_refinement_enclosed)
+
+        failed_root = _promoted_baseline(self.leaf.job)
+        object.__setattr__(failed_root, "converged", False)
+        self.assertTrue(_primary_requires_precision120(outcome_for(failed_root)))
+
+        inadequate = _promoted_baseline(self.leaf.job)
+        object.__setattr__(
+            inadequate.numerical_conditioning,
+            "predicted_reliable_digits",
+            inadequate.numerical_conditioning.required_reliable_digits
+            - Decimal(1),
+        )
+        object.__setattr__(
+            inadequate.numerical_conditioning,
+            "precision_limited",
+            True,
+        )
+        self.assertTrue(_primary_requires_precision120(outcome_for(inadequate)))
+
+    def test_julia120_terminal_gate_uses_root_and_conditioning(self):
+        binary64 = _stage_from_result(
+            64,
+            _binary64_nonconverged_result(
+                self.leaf.job,
+                complex(0.70001, -0.12002),
+            ),
+        )
+        precision80 = _stage_from_result(
+            80,
+            response_engine.run_promoted_horizon_component(
+                self.leaf.job,
+                FakePromotedBackend(
+                    self.leaf.job,
+                    _promoted_baseline(self.leaf.job),
+                ),
+                complex(0.70001, -0.12002),
+            ),
+        )
+
+        def outcome_for(baseline):
+            backend = FakeJuliaPrecisionBackend(self.leaf.job, baseline, 120)
+            with patch(
+                "windows_solver.response_batches.JuliaPrecisionRootBackend",
+                return_value=backend,
+            ):
+                return self.backend.execute_promoted_stage_with_predictor(
+                    self.leaf,
+                    120,
+                    (binary64, precision80),
+                    response_predictor=None,
+                )
+
+        adequate = outcome_for(_promoted_baseline(self.leaf.job))
+        self.assertEqual(
+            _primary_precision120_terminal_state(adequate),
+            "PRODUCED",
+        )
+        inadequate = _promoted_baseline(self.leaf.job)
+        object.__setattr__(
+            inadequate.numerical_conditioning,
+            "predicted_reliable_digits",
+            inadequate.numerical_conditioning.required_reliable_digits
+            - Decimal(1),
+        )
+        object.__setattr__(
+            inadequate.numerical_conditioning,
+            "precision_limited",
+            True,
+        )
+        self.assertEqual(
+            _primary_precision120_terminal_state(outcome_for(inadequate)),
+            "UNRESOLVED",
+        )
 
 
 if __name__ == "__main__":

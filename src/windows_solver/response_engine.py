@@ -4016,7 +4016,7 @@ class ComponentResult:
         )
 
     def to_mapping(self) -> dict[str, object]:
-        return {
+        output = {
             "job_id": self.job_id,
             "leaf_id": self.leaf_id,
             "mechanism_id": self.mechanism_id,
@@ -4035,27 +4035,33 @@ class ComponentResult:
                 else _complex_mapping(self.closed_form_response)
             ),
             "error_channels": dict(self.error_channels),
-            "error_channel_applicability": dict(
-                self.error_channel_applicability
-            ),
-            "component_scientific_identity": (
-                self.component_scientific_identity
-            ),
-            "response_method": self.response_method,
-            "finite_amplitude_ladder_required": (
-                self.finite_amplitude_ladder_required
-            ),
-            "finite_amplitude_ladder_executed": (
-                self.finite_amplitude_ladder_executed
-            ),
-            "finite_amplitude_readout_count": (
-                self.finite_amplitude_readout_count
-            ),
-            "response_uncertainty_status": self.response_uncertainty_status,
             "baseline": self.baseline.to_mapping(),
             "levels": [level.to_mapping() for level in self.levels],
             "lineage": dict(self.lineage),
         }
+        if self.component_scientific_identity is not None:
+            output.update({
+                "error_channel_applicability": dict(
+                    self.error_channel_applicability
+                ),
+                "component_scientific_identity": (
+                    self.component_scientific_identity
+                ),
+                "response_method": self.response_method,
+                "finite_amplitude_ladder_required": (
+                    self.finite_amplitude_ladder_required
+                ),
+                "finite_amplitude_ladder_executed": (
+                    self.finite_amplitude_ladder_executed
+                ),
+                "finite_amplitude_readout_count": (
+                    self.finite_amplitude_readout_count
+                ),
+                "response_uncertainty_status": (
+                    self.response_uncertainty_status
+                ),
+            })
+        return output
 
     @classmethod
     def from_mapping(cls, value: object) -> "ComponentResult":
