@@ -2306,9 +2306,10 @@ def _checkpoint_precision_contract_sha256(schema_version: int) -> str:
         ),
     }
     if schema_version in {3, 4, 5}:
-        historical_primary = (
+        historical_primary = dict(
             _multi_readout_primary_recovery_precision_contract()
         )
+        historical_primary.pop("failed_preflight_alternate")
         material.update(
             {
                 "primary_recovery": historical_primary,
