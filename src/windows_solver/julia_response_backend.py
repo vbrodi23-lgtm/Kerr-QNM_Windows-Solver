@@ -27,10 +27,15 @@ from typing import Callable, Mapping
 from .contracts import canonical_json_bytes
 from .response_engine import (
     BackendIdentity,
+    FixedRootDiagnosticEvidence,
     DiagnosticRootReadout,
+    HISTORICAL_WORKER_RESPONSE_RECEIPT_SCHEMA,
     NumericalConditioningEvidence,
     NUMERICAL_CONDITIONING_SCHEMA,
     ResponseComponentJob,
+    PrimaryRootAcceptanceEvidence,
+    PROMOTED_ROOT_ACCEPTANCE_METRIC,
+    PROMOTED_ROOT_READOUT_POLICY,
     RootAuthenticationEvidence,
     RootReadout,
     VERIFIED_ENDPOINT_ERROR_MODEL,
@@ -2261,11 +2266,16 @@ def _precision_policy(job: ResponseComponentJob, digits: int, refinement: int) -
 
 
 def _validate_mechanism_precision_policy(
-    mechanism_id: str, policy: Mapping[str, object]
+    mechanism_id: str,
+    policy: Mapping[str, object],
+    *,
+    promoted_policy_required: bool = True,
 ) -> None:
     """Fail closed when a request authenticates the wrong determinant family."""
 
-    expected = regularised_gsn_precision_policy(mechanism_id)
+    expected = dict(regularised_gsn_precision_policy(mechanism_id))
+    if not promoted_policy_required:
+        expected.pop("promoted_root_readout_policy")
     if any(policy.get(field) != value for field, value in expected.items()):
         raise ValueError(
             "regularised GSN precision policy disagrees with response mechanism"
@@ -2453,6 +2463,559 @@ class JuliaPrecisionRootBackend:
         request: Mapping[str, object],
         evaluation: JuliaResponseEvaluation,
     ) -> RootReadout:
+        response_schema = evaluation.response.get("schema_version")
+        policy = request.get("policy")
+        current_request = (
+            isinstance(policy, Mapping)
+            and policy.get("promoted_root_readout_policy")
+            == PROMOTED_ROOT_READOUT_POLICY
+        )
+        if response_schema == WORKER_RESPONSE_WIRE_SCHEMA and current_request:
+            return self._read_root_response_v7(job, request, evaluation)
+        if response_schema == 6 and not current_request:
+            return self._read_root_response_v6(job, request, evaluation)
+        raise JuliaResponseBackendError(
+            "M02 Julia response policy/wire schema is inconsistent"
+        )
+
+    def _read_root_response_v7(
+        self,
+        job: ResponseComponentJob,
+        request: Mapping[str, object],
+        evaluation: JuliaResponseEvaluation,
+    ) -> RootReadout:
+        response = dict(evaluation.response)
+        expected_fields = {
+            "schema_version",
+            "status",
+            "adapter",
+            "request_sha256",
+            "precision_digits",
+            "working_precision_bits",
+            "promoted_root_readout_policy",
+            "root_omega_re",
+            "root_omega_im",
+            "root_residual_abs",
+            "raw_determinant_abs",
+            "raw_determinant_evidence_status",
+            "root_derivative_abs",
+            "primary_acceptance",
+            "root_converged",
+            "branch_authentication_contract_version",
+            "root_branch_continuation_valid",
+            "branch_tolerance_abs",
+            "root_displacement_abs",
+            "truncation_radius_abs",
+            "resolution_radius_abs",
+            "seed_path_radius_abs",
+            "seed_path_required",
+            "seed_path_executed",
+            "seed_path_determinant_count",
+            "diagnostic_roots",
+            "diagnostics_skipped_reason",
+            "numerical_conditioning",
+        }
+        if set(response) != expected_fields:
+            raise JuliaResponseBackendError("M02 Julia response fields are invalid")
+        if (
+            any(
+                type(response[name]) is not int
+                for name in (
+                    "schema_version",
+                    "precision_digits",
+                    "working_precision_bits",
+                    "branch_authentication_contract_version",
+                    "seed_path_determinant_count",
+                )
+            )
+            or response["schema_version"] != WORKER_RESPONSE_WIRE_SCHEMA
+            or response["status"] != "ok"
+            or response["adapter"] != "package-owned-julia-gsn-root-readout"
+            or response["request_sha256"] != evaluation.request_sha256
+            or response["precision_digits"] != self.digits
+            or response["working_precision_bits"]
+            != math.ceil(self.digits * math.log2(10)) + 32
+            or response["promoted_root_readout_policy"]
+            != PROMOTED_ROOT_READOUT_POLICY
+            or type(response["root_converged"]) is not bool
+            or response["branch_authentication_contract_version"] != 4
+            or type(response["root_branch_continuation_valid"]) is not bool
+            or response["seed_path_required"] is not False
+            or response["seed_path_executed"] is not False
+            or response["seed_path_determinant_count"] != 0
+            or response["seed_path_radius_abs"] is not None
+        ):
+            raise JuliaResponseBackendError("M02 Julia response contract is invalid")
+
+        policy = request.get("policy")
+        if not isinstance(policy, Mapping):
+            raise JuliaResponseBackendError("M02 Julia request policy is invalid")
+        try:
+            _validate_mechanism_precision_policy(job.mechanism_id, policy)
+        except ValueError as error:
+            raise JuliaResponseBackendError(
+                "M02 Julia request policy disagrees with response mechanism"
+            ) from error
+        if policy.get("promoted_root_readout_policy") != (
+            PROMOTED_ROOT_READOUT_POLICY
+        ):
+            raise JuliaResponseBackendError(
+                "M02 Julia promoted root policy identity is invalid"
+            )
+
+        try:
+            numerical_conditioning = NumericalConditioningEvidence.from_mapping(
+                response["numerical_conditioning"]
+            )
+        except ValueError as error:
+            raise JuliaResponseBackendError(
+                "M02 Julia numerical conditioning evidence is invalid"
+            ) from error
+        if numerical_conditioning.schema != NUMERICAL_CONDITIONING_SCHEMA:
+            raise JuliaResponseBackendError(
+                "M02 Julia current conditioning schema is required"
+            )
+        conditioning_identity_fields = (
+            "homogeneous_representation",
+            "branch_convention",
+            "scattering_column_convention",
+            "radial_derivative_convention",
+            "determinant_convention",
+            "determinant_normalisation",
+            "regular_remainder_contract",
+            "factored_remainder_state_convention",
+            "determinant_family",
+            "scattering_diagnostics_applicable",
+            "human_math_review_receipt_status",
+            "human_math_review_receipt_sha256",
+            "independent_reference_fixture_receipt_status",
+            "independent_reference_fixture_receipt_sha256",
+        )
+        if any(
+            policy.get(field) != getattr(numerical_conditioning, field)
+            for field in conditioning_identity_fields
+        ):
+            raise JuliaResponseBackendError(
+                "M02 Julia numerical conditioning identity disagrees with request policy"
+            )
+        mechanism_contract = regularised_gsn_mechanism_contract(
+            job.mechanism_id
+        )
+        if any(
+            getattr(numerical_conditioning, field) != expected
+            for field, expected in mechanism_contract.items()
+        ):
+            raise JuliaResponseBackendError(
+                "M02 Julia numerical conditioning determinant family disagrees "
+                "with response mechanism"
+            )
+
+        try:
+            primary_acceptance = PrimaryRootAcceptanceEvidence.from_mapping(
+                response["primary_acceptance"]
+            )
+        except ValueError as error:
+            raise JuliaResponseBackendError(
+                "M02 Julia PRIMARY acceptance evidence is invalid"
+            ) from error
+        expected_error_model_id = (
+            policy.get("determinant_error_model")
+            if numerical_conditioning.scattering_diagnostics_applicable
+            else None
+        )
+        if primary_acceptance.error_model_id != expected_error_model_id:
+            raise JuliaResponseBackendError(
+                "M02 Julia PRIMARY determinant telemetry identity is invalid"
+            )
+
+        root_real_decimal = _finite_decimal_text(
+            response["root_omega_re"], "root_omega_re"
+        )
+        root_imaginary_decimal = _finite_decimal_text(
+            response["root_omega_im"], "root_omega_im"
+        )
+        normalised_determinant_abs = _finite_decimal_text(
+            response["root_residual_abs"],
+            "root_residual_abs",
+            nonnegative=True,
+        )
+        root_derivative_abs_decimal = _finite_decimal_text(
+            response["root_derivative_abs"],
+            "root_derivative_abs",
+            nonnegative=True,
+        )
+        root_correction_tolerance = _finite_decimal_text(
+            policy.get("root_correction_tolerance"),
+            "root_correction_tolerance",
+            nonnegative=True,
+        )
+        branch_tolerance_decimal = _finite_decimal_text(
+            response["branch_tolerance_abs"],
+            "branch_tolerance_abs",
+            nonnegative=True,
+        )
+        expected_branch_tolerance_decimal = _finite_decimal_text(
+            policy["branch_enclosure_radius_abs"],
+            "branch_enclosure_radius_abs",
+            nonnegative=True,
+        )
+        root_displacement_decimal = _finite_decimal_text(
+            response["root_displacement_abs"],
+            "root_displacement_abs",
+            nonnegative=True,
+        )
+        with localcontext() as context:
+            context.prec = self.digits + 64
+            serialization_allowance = Decimal(1).scaleb(-self.digits)
+
+            def inconsistent(left: Decimal, right: Decimal) -> bool:
+                scale = max(abs(left), abs(right), Decimal(1))
+                return abs(left - right) > serialization_allowance * scale
+
+            primary_residual = primary_acceptance.determinant.magnitude()
+            primary_derivative_abs = primary_acceptance.derivative.magnitude()
+            delta_real = root_real_decimal - Decimal(
+                format(job.root.omega.real, ".17g")
+            )
+            delta_imaginary = root_imaginary_decimal - Decimal(
+                format(job.root.omega.imag, ".17g")
+            )
+            derived_displacement = (
+                delta_real * delta_real + delta_imaginary * delta_imaginary
+            ).sqrt()
+            if (
+                inconsistent(primary_residual, normalised_determinant_abs)
+                or inconsistent(primary_derivative_abs, root_derivative_abs_decimal)
+                or inconsistent(
+                    primary_acceptance.root_correction_tolerance,
+                    root_correction_tolerance,
+                )
+                or inconsistent(
+                    branch_tolerance_decimal,
+                    expected_branch_tolerance_decimal,
+                )
+                or inconsistent(derived_displacement, root_displacement_decimal)
+            ):
+                raise JuliaResponseBackendError(
+                    "M02 Julia PRIMARY response binding is inconsistent"
+                )
+
+        raw_determinant_abs = (
+            None
+            if response["raw_determinant_abs"] is None
+            else _finite_decimal_text(
+                response["raw_determinant_abs"],
+                "raw_determinant_abs",
+                nonnegative=True,
+            )
+        )
+        raw_status = response["raw_determinant_evidence_status"]
+        if job.mechanism_id == "horizon-admittance":
+            if raw_status == "available/v1":
+                if raw_determinant_abs is None:
+                    raise JuliaResponseBackendError(
+                        "M02 Julia available raw horizon determinant lacks its magnitude"
+                    )
+            elif raw_status == "unavailable-overflow/v1":
+                if raw_determinant_abs is not None:
+                    raise JuliaResponseBackendError(
+                        "M02 Julia unavailable raw horizon determinant carries a magnitude"
+                    )
+            else:
+                raise JuliaResponseBackendError(
+                    "M02 Julia horizon raw determinant evidence status is invalid"
+                )
+        elif raw_status != "not-applicable/v1" or raw_determinant_abs is not None:
+            raise JuliaResponseBackendError(
+                "M02 Julia exterior Wronskian claims raw horizon evidence"
+            )
+
+        diagnostics_skipped_reason = response["diagnostics_skipped_reason"]
+        diagnostics_skipped = diagnostics_skipped_reason == (
+            "PRIMARY_NOT_CONVERGED"
+        )
+        expected_skip_reason = (
+            None
+            if primary_acceptance.accepted
+            else "PRIMARY_NOT_CONVERGED"
+        )
+        if diagnostics_skipped_reason != expected_skip_reason:
+            raise JuliaResponseBackendError(
+                "M02 Julia diagnostic skip evidence is inconsistent"
+            )
+        raw_diagnostics = response["diagnostic_roots"]
+        diagnostic_wire_fields = {
+            "policy_id",
+            "root_phase",
+            "fixed_root",
+            "root_omega_re",
+            "root_omega_im",
+            "determinant_re",
+            "determinant_im",
+            "root_residual_abs",
+            "primary_derivative_re",
+            "primary_derivative_im",
+            "derivative_source",
+            "acceptance_metric",
+            "correction_abs",
+            "root_correction_tolerance",
+            "determinant_error_abs",
+            "error_model_id",
+            "displacement_from_primary_abs",
+            "branch_identity",
+            "branch_authenticated",
+            "control_identity",
+            "solve_role",
+            "authoritative",
+            "determinant_count",
+            "root_converged",
+        }
+        expected_families = {"truncation", "resolution"}
+        if (
+            not isinstance(raw_diagnostics, Mapping)
+            or (
+                bool(raw_diagnostics)
+                if diagnostics_skipped
+                else set(raw_diagnostics) != expected_families
+            )
+        ):
+            raise JuliaResponseBackendError(
+                "M02 Julia fixed-root diagnostics are invalid"
+            )
+        radii_decimal: dict[str, Decimal] = {}
+        diagnostics: dict[str, DiagnosticRootReadout] = {}
+        for family in (() if diagnostics_skipped else ("truncation", "resolution")):
+            raw = raw_diagnostics[family]
+            expected_phase = {
+                "truncation": "TRUNCATION",
+                "resolution": "RESOLUTION",
+            }[family]
+            if (
+                not isinstance(raw, Mapping)
+                or set(raw) != diagnostic_wire_fields
+                or raw["root_phase"] != expected_phase
+                or raw["solve_role"] != "FIXED_ROOT_DIAGNOSTIC"
+                or raw["authoritative"] is not False
+                or raw["fixed_root"] is not True
+                or raw["derivative_source"] != "PRIMARY_COMPLEX"
+                or raw["acceptance_metric"]
+                != PROMOTED_ROOT_ACCEPTANCE_METRIC
+                or type(raw["root_converged"]) is not bool
+                or type(raw["branch_authenticated"]) is not bool
+                or type(raw["determinant_count"]) is not int
+                or raw["determinant_count"] != 1
+            ):
+                raise JuliaResponseBackendError(
+                    "M02 Julia fixed-root diagnostic contract is invalid"
+                )
+            diagnostic_real = _finite_decimal_text(
+                raw["root_omega_re"], "fixed-root omega real"
+            )
+            diagnostic_imaginary = _finite_decimal_text(
+                raw["root_omega_im"], "fixed-root omega imaginary"
+            )
+            reported_residual = _finite_decimal_text(
+                raw["root_residual_abs"],
+                "fixed-root residual",
+                nonnegative=True,
+            )
+            displacement = _finite_decimal_text(
+                raw["displacement_from_primary_abs"],
+                "fixed-root displacement",
+                nonnegative=True,
+            )
+            if (
+                diagnostic_real != root_real_decimal
+                or diagnostic_imaginary != root_imaginary_decimal
+                or displacement != 0
+                or raw["primary_derivative_re"]
+                != str(primary_acceptance.derivative.real)
+                or raw["primary_derivative_im"]
+                != str(primary_acceptance.derivative.imaginary)
+                or raw["branch_identity"] != policy["branch_convention"]
+                or raw["error_model_id"] != expected_error_model_id
+            ):
+                raise JuliaResponseBackendError(
+                    "M02 Julia fixed-root diagnostic binding is inconsistent"
+                )
+            evidence_mapping = {
+                "policy_id": raw["policy_id"],
+                "acceptance_metric": raw["acceptance_metric"],
+                "root_phase": raw["root_phase"],
+                "determinant_re": raw["determinant_re"],
+                "determinant_im": raw["determinant_im"],
+                "primary_derivative_re": raw["primary_derivative_re"],
+                "primary_derivative_im": raw["primary_derivative_im"],
+                "correction_abs": raw["correction_abs"],
+                "root_correction_tolerance": raw[
+                    "root_correction_tolerance"
+                ],
+                "determinant_error_abs": raw["determinant_error_abs"],
+                "error_model_id": raw["error_model_id"],
+                "control_identity": raw["control_identity"],
+                "branch_identity": raw["branch_identity"],
+                "branch_authenticated": raw["branch_authenticated"],
+                "determinant_count": raw["determinant_count"],
+                "accepted": raw["root_converged"],
+                "fixed_root": raw["fixed_root"],
+                "derivative_source": raw["derivative_source"],
+            }
+            try:
+                evidence = FixedRootDiagnosticEvidence.from_mapping(
+                    evidence_mapping
+                )
+            except ValueError as error:
+                raise JuliaResponseBackendError(
+                    "M02 Julia fixed-root diagnostic evidence is inconsistent"
+                ) from error
+            with localcontext() as context:
+                context.prec = self.digits + 64
+                if inconsistent(
+                    evidence.determinant.magnitude(), reported_residual
+                ) or inconsistent(
+                    evidence.root_correction_tolerance,
+                    root_correction_tolerance,
+                ):
+                    raise JuliaResponseBackendError(
+                        "M02 Julia fixed-root diagnostic scalar is inconsistent"
+                    )
+            radii_decimal[family] = displacement
+            diagnostics[family] = DiagnosticRootReadout(
+                omega_delta_from_primary=0.0j,
+                determinant_residual_abs=float(reported_residual),
+                determinant_derivative_abs=float(
+                    evidence.primary_derivative.magnitude()
+                ),
+                converged=evidence.accepted,
+                fixed_root_evidence=evidence,
+            )
+
+        if diagnostics_skipped:
+            if (
+                response["truncation_radius_abs"] is not None
+                or response["resolution_radius_abs"] is not None
+            ):
+                raise JuliaResponseBackendError(
+                    "M02 Julia skipped diagnostic radii are inconsistent"
+                )
+            truncation_radius = None
+            resolution_radius = None
+        else:
+            for family, field in (
+                ("truncation", "truncation_radius_abs"),
+                ("resolution", "resolution_radius_abs"),
+            ):
+                radius = _finite_decimal_text(
+                    response[field], field, nonnegative=True
+                )
+                if radius != 0 or radius != radii_decimal[family]:
+                    raise JuliaResponseBackendError(
+                        "M02 Julia fixed-root diagnostic radius is inconsistent"
+                    )
+            truncation_radius = 0.0
+            resolution_radius = 0.0
+
+        derived_branch_valid = (
+            derived_displacement <= branch_tolerance_decimal
+            and all(
+                evidence.fixed_root_evidence.branch_authenticated
+                for evidence in diagnostics.values()
+            )
+        )
+        if response["root_branch_continuation_valid"] != derived_branch_valid:
+            raise JuliaResponseBackendError(
+                "M02 Julia branch-continuation evidence is inconsistent"
+            )
+        expected_converged = (
+            primary_acceptance.accepted
+            and not diagnostics_skipped
+            and all(item.converged for item in diagnostics.values())
+            and derived_branch_valid
+        )
+        if response["root_converged"] != expected_converged:
+            raise JuliaResponseBackendError(
+                "M02 Julia final root convergence evidence is inconsistent"
+            )
+
+        receipt_material = {
+            "schema": WORKER_RESPONSE_RECEIPT_SCHEMA,
+            "request_binding": dict(evaluation.request_binding),
+            "request_sha256": evaluation.request_sha256,
+            "scientific_runtime_sha256": hashlib.sha256(
+                canonical_json_bytes(self.scientific_runtime_for(job))
+            ).hexdigest(),
+            "worker_response_schema_version": response["schema_version"],
+            "root_residual_abs_text": response["root_residual_abs"],
+            "raw_determinant_abs_text": response["raw_determinant_abs"],
+            "raw_determinant_evidence_status": raw_status,
+            "promoted_root_readout_policy": PROMOTED_ROOT_READOUT_POLICY,
+            "primary_acceptance_sha256": hashlib.sha256(
+                canonical_json_bytes(primary_acceptance.to_mapping())
+            ).hexdigest(),
+        }
+        worker_response_receipt = {
+            **receipt_material,
+            "receipt_sha256": hashlib.sha256(
+                canonical_json_bytes(receipt_material)
+            ).hexdigest(),
+        }
+        if (
+            evaluation.reused
+            and dict(evaluation.cached_worker_response_receipt or {})
+            != worker_response_receipt
+        ):
+            raise JuliaResponseBackendError(
+                "M02 cached worker response receipt is invalid"
+            )
+
+        root = complex(float(root_real_decimal), float(root_imaginary_decimal))
+        try:
+            readout = RootReadout(
+                omega=root,
+                determinant_residual_abs=float(normalised_determinant_abs),
+                determinant_derivative_abs=float(root_derivative_abs_decimal),
+                converged=response["root_converged"],
+                root_reference_id=job.root.root_reference_id,
+                branch_id=(
+                    job.root.branch_id
+                    if derived_branch_valid
+                    else "nonmatching-julia-continuation"
+                ),
+                equation_id=job.equation_id,
+                truncation_radius=truncation_radius,
+                resolution_radius=resolution_radius,
+                seed_path_radius=None,
+                diagnostic_readouts=(
+                    None if diagnostics_skipped else diagnostics
+                ),
+                diagnostics_skipped_reason=diagnostics_skipped_reason,
+                numerical_conditioning=numerical_conditioning,
+                normalised_determinant_abs=normalised_determinant_abs,
+                raw_determinant_abs=raw_determinant_abs,
+                raw_determinant_evidence_status=raw_status,
+                worker_response_receipt=worker_response_receipt,
+                root_authentication=None,
+                promoted_root_readout_policy=PROMOTED_ROOT_READOUT_POLICY,
+                primary_acceptance=primary_acceptance,
+                seed_path_required=False,
+                seed_path_executed=False,
+                seed_path_determinant_count=0,
+            )
+        except ValueError as error:
+            raise JuliaResponseBackendError(
+                "M02 Julia promoted root evidence is inconsistent"
+            ) from error
+        retain = getattr(self.adapter, "retain_validated_readout", None)
+        if retain is not None:
+            retain(evaluation, worker_response_receipt)
+        return readout
+
+    def _read_root_response_v6(
+        self,
+        job: ResponseComponentJob,
+        request: Mapping[str, object],
+        evaluation: JuliaResponseEvaluation,
+    ) -> RootReadout:
         response = dict(evaluation.response)
         expected_fields = {
             "schema_version",
@@ -2494,7 +3057,7 @@ class JuliaPrecisionRootBackend:
                     "branch_authentication_contract_version",
                 )
             )
-            or response["schema_version"] != WORKER_RESPONSE_WIRE_SCHEMA
+            or response["schema_version"] != 6
             or response["status"] != "ok"
             or response["adapter"] != "package-owned-julia-gsn-root-readout"
             or response["precision_digits"] != self.digits
@@ -2584,7 +3147,11 @@ class JuliaPrecisionRootBackend:
         if not isinstance(policy, Mapping):
             raise JuliaResponseBackendError("M02 Julia request policy is invalid")
         try:
-            _validate_mechanism_precision_policy(job.mechanism_id, policy)
+            _validate_mechanism_precision_policy(
+                job.mechanism_id,
+                policy,
+                promoted_policy_required=False,
+            )
         except ValueError as error:
             raise JuliaResponseBackendError(
                 "M02 Julia request policy disagrees with response mechanism"
@@ -3123,7 +3690,7 @@ class JuliaPrecisionRootBackend:
                 determinant_count_phase=raw["determinant_count_phase"],
             )
         receipt_material = {
-            "schema": WORKER_RESPONSE_RECEIPT_SCHEMA,
+            "schema": HISTORICAL_WORKER_RESPONSE_RECEIPT_SCHEMA,
             "request_binding": dict(evaluation.request_binding),
             "request_sha256": evaluation.request_sha256,
             "scientific_runtime_sha256": hashlib.sha256(

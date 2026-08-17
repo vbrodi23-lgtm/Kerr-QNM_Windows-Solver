@@ -191,6 +191,88 @@ class RootPhaseProgressProtocolTests(unittest.TestCase):
         self.assertEqual(live["phase_correction_upper_bound"], "1.4e-14")
         self.assertEqual(live["phase_root_correction_tolerance"], "2e-11")
 
+    def test_binary64_parity_phase_evidence_crosses_the_status_boundary(
+        self,
+    ) -> None:
+        payload = {
+            "phase": "PRIMARY",
+            "root_phase": "PRIMARY",
+            "solve_role": "BINARY64_PARITY_PRIMARY",
+            "promoted_root_readout_policy": (
+                "binary64-parity-primary-fixed-root-diagnostics/v1"
+            ),
+            "acceptance_metric": (
+                "abs-determinant-over-abs-complex-derivative/v1"
+            ),
+            "correction_abs": "1.8815244360414661e-13",
+            "root_correction_tolerance": "2e-11",
+            "derivative_abs": "10",
+            "derivative": {"real": "6", "imaginary": "8"},
+            "determinant_error_abs": "1e-9",
+            "error_model_id": "verified-endpoint-absolute-error/v1",
+            "post_newton_determinant_count": 0,
+            "determinant_count": 7,
+            "authoritative": True,
+            "branch_authenticated": True,
+            "converged": True,
+            "resulting_omega": {
+                "real": "0.7445824721058474",
+                "imaginary": "-0.1596868021340079",
+            },
+            "resulting_determinant_abs": "1e-12",
+            "elapsed_seconds": 1.0,
+        }
+        event = {
+            "schema": PROGRESS_SCHEMA,
+            "kind": ProgressEventKind.ROOT_PHASE_COMPLETED.value,
+            "context": {
+                "phase": "PRIMARY",
+                "root_phase": "PRIMARY",
+            },
+            "payload": payload,
+        }
+
+        with TemporaryDirectory() as directory:
+            checkpoint = Path(directory) / "checkpoint.json"
+            reporter = CampaignProgressReporter(
+                "quiet",
+                checkpoint,
+                io.StringIO(),
+            )
+            with activate_progress(reporter), progress_scope(
+                leaf_id="leaf-13",
+                precision_digits=80,
+                mechanism_id="horizon-admittance",
+            ):
+                self.assertTrue(
+                    _forward_julia_progress_line(
+                        JULIA_PROGRESS_PREFIX + json.dumps(event)
+                    )
+                )
+
+            status = json.loads(
+                Path(f"{checkpoint}.status.json").read_text(encoding="utf-8")
+            )
+
+        self.assertEqual(
+            status["payload"]["correction_abs"], payload["correction_abs"]
+        )
+        live = status["live_execution"]
+        self.assertEqual(
+            live["phase_promoted_root_readout_policy"],
+            payload["promoted_root_readout_policy"],
+        )
+        self.assertEqual(
+            live["phase_acceptance_metric"], payload["acceptance_metric"]
+        )
+        self.assertEqual(live["phase_correction_abs"], payload["correction_abs"])
+        self.assertEqual(live["phase_derivative"], payload["derivative"])
+        self.assertEqual(live["phase_post_newton_determinant_count"], 0)
+        self.assertEqual(
+            live["phase_determinant_error_abs"],
+            payload["determinant_error_abs"],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -50,13 +50,26 @@ preservation, and cache/provenance separation from historical raw-state leaves.
 
 ### Plan
 
-- Propagate each coefficient extractor's identity through the determinant chart, retain the worker's exact horizon-at-match assertion, and cover both valid extraction paths plus forged-identity rejection.
-- Enforce coordinate identity and verified real-inner endpoint geometry before any homogeneous ODE, then retain only the three-leg production horizon graph.
-- Complete the absolute determinant-error certificate and propagate each stencil sample's actual error through bounded Newton and final derivative authentication.
-- Carry the certificate through strict Julia/Python schemas, failures, progress, caches, reports, and mechanism-scoped scientific identity without changing exterior behavior.
-- Use the established binary64 root-correction threshold of 2e-11 for binary64, 80-digit, and 120-digit acceptance while preserving the mandatory error-aware determinant and derivative certificate.
-- Keep Julia's reserved progress context synchronized with Python's strict `ProgressContext` schema, including independent `phase` and `root_phase` fields, and cover the staged event-to-status path plus future context-key drift.
-- Calibrate the 80/120 ODE and finite-difference controls from a validated receipt, add executable worker/Julia CI gates, and run only the bounded Leaf 13 and five-mode regression evidence set.
-- Preserve fail-closed human mathematical review and independent-reference release gates; execution evidence remains explicitly unapproved until those receipts exist.
+- Preserve the package-owned factored GSN determinant, contour, carrier, branch,
+  conditioning, and naturally available determinant-error telemetry unchanged.
+- Apply the operator-validated promoted-readout policy identity
+  `binary64-parity-primary-fixed-root-diagnostics/v1`: PRIMARY accepts exactly
+  when raw `|D / Dprime| <= 2e-11`, retains complex `Dprime`, and performs no
+  determinant evaluation after Newton convergence.
+- Hold the accepted PRIMARY frequency fixed for TRUNCATION and RESOLUTION,
+  reuse complex `Dprime`, evaluate exactly one determinant in each phase, add
+  eight endpoint-series orders only for TRUNCATION, and halve only homogeneous
+  ODE relative/absolute tolerances for RESOLUTION.
+- Omit routine SEED-PATH work explicitly with required/executed flags and a
+  zero determinant count; do not synthesize an independent solve or radius.
+- Version the worker response and response receipt, and strictly bind the
+  changed request/runtime, root-readout-cache, solved-leaf-cache, convergence,
+  and uncertainty identities so incompatible evidence is stale rather than
+  reused.
+- Prove determinant budgets, fixed-root invariance, raw acceptance, control
+  isolation, schema honesty, cache invalidation, and final convergence using
+  static/parser/mocked/unit tests only. Do not execute Julia, Kerr determinants,
+  ODE benchmarks, Leaf 13, or the 212-leaf campaign; native mathematical and
+  performance validation is the operator's successful Leaf 13 v1.4 receipt.
 
 ---

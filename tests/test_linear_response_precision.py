@@ -35,19 +35,25 @@ from windows_solver.response_batches import (
 from windows_solver.response_engine import (
     ComponentResult,
     ComponentStatus,
+    DecimalComplex,
     DiagnosticRootReadout,
+    FixedRootDiagnosticEvidence,
     LadderLevel,
     NumericalPolicy,
     NumericalConditioningEvidence,
-    RootAuthenticationEvidence,
+    PrimaryRootAcceptanceEvidence,
+    PROMOTED_ROOT_ACCEPTANCE_METRIC,
+    PROMOTED_ROOT_READOUT_POLICY,
     RootReadout,
     VettedNativeDeterminantKernel,
+    VERIFIED_ENDPOINT_ERROR_MODEL,
+    WORKER_RESPONSE_RECEIPT_SCHEMA,
+    WORKER_RESPONSE_WIRE_SCHEMA,
     regularised_gsn_precision_policy,
 )
 from windows_solver.solved_leaf_cache import SolvedLeafStore
 from tests.fixtures import (
     control_failure_stage,
-    root_authentication_for_readout,
     valid_control_failure_diagnostics,
     valid_numerical_conditioning,
 )
@@ -117,6 +123,11 @@ def remove_promotion_decision_and_reseal(
             "raw_determinant_evidence_status",
             "worker_response_receipt",
             "root_authentication",
+            "promoted_root_readout_policy",
+            "primary_acceptance",
+            "seed_path_required",
+            "seed_path_executed",
+            "seed_path_determinant_count",
         ):
             baseline.pop(name, None)
     if historical_shape:
@@ -373,6 +384,9 @@ def _with_baseline_conditioning(
                 "synthetic_readout_id": readout_id,
                 "policy": {
                     "root_correction_tolerance": "2e-11",
+                    "promoted_root_readout_policy": (
+                        PROMOTED_ROOT_READOUT_POLICY
+                    ),
                 },
             }
             scientific_runtime_sha256 = hashlib.sha256(
@@ -383,8 +397,20 @@ def _with_baseline_conditioning(
             request_binding = dict(request_binding)
             request_binding["policy"] = {
                 "root_correction_tolerance": "2e-11",
+                "promoted_root_readout_policy": (
+                    PROMOTED_ROOT_READOUT_POLICY
+                ),
             }
             request_policy = request_binding["policy"]
+        elif request_policy.get("promoted_root_readout_policy") != (
+            PROMOTED_ROOT_READOUT_POLICY
+        ):
+            request_binding = dict(request_binding)
+            request_policy = dict(request_policy)
+            request_policy["promoted_root_readout_policy"] = (
+                PROMOTED_ROOT_READOUT_POLICY
+            )
+            request_binding["policy"] = request_policy
         correction_tolerance = Decimal(
             request_policy["root_correction_tolerance"]
         )
@@ -395,19 +421,70 @@ def _with_baseline_conditioning(
                 normalised,
                 derivative * correction_tolerance / Decimal(10),
             )
-        authentication = RootAuthenticationEvidence.from_mapping(
-            root_authentication_for_readout(
-                mechanism_id=result.mechanism_id,
-                determinant_abs=normalised,
-                derivative_abs=derivative,
-                root_correction_tolerance=correction_tolerance,
-                accepted=readout.converged,
+        else:
+            normalised = max(
+                normalised,
+                derivative * correction_tolerance * Decimal(2),
             )
+        correction = normalised / derivative
+        error_model_id = (
+            VERIFIED_ENDPOINT_ERROR_MODEL if horizon else None
         )
+        primary = PrimaryRootAcceptanceEvidence(
+            policy_id=PROMOTED_ROOT_READOUT_POLICY,
+            acceptance_metric=PROMOTED_ROOT_ACCEPTANCE_METRIC,
+            determinant=DecimalComplex(normalised, Decimal(0)),
+            derivative=DecimalComplex(derivative, Decimal(0)),
+            correction_abs=correction,
+            root_correction_tolerance=correction_tolerance,
+            accepted=readout.converged,
+            newton_determinant_count=3,
+            post_newton_determinant_count=0,
+            determinant_error_abs=Decimal(0),
+            error_model_id=error_model_id,
+        )
+        diagnostic_readouts = None
+        if readout.converged:
+            diagnostic_readouts = {}
+            for family, phase in (
+                ("truncation", "TRUNCATION"),
+                ("resolution", "RESOLUTION"),
+            ):
+                fixed = FixedRootDiagnosticEvidence(
+                    policy_id=PROMOTED_ROOT_READOUT_POLICY,
+                    acceptance_metric=PROMOTED_ROOT_ACCEPTANCE_METRIC,
+                    root_phase=phase,
+                    determinant=DecimalComplex(normalised, Decimal(0)),
+                    primary_derivative=primary.derivative,
+                    correction_abs=correction,
+                    root_correction_tolerance=correction_tolerance,
+                    determinant_error_abs=Decimal(0),
+                    error_model_id=error_model_id,
+                    control_identity=f"fixture-{family}-controls/v2",
+                    branch_identity="gsn-complex-rho/v1",
+                    branch_authenticated=True,
+                    determinant_count=1,
+                    accepted=True,
+                    fixed_root=True,
+                    derivative_source="PRIMARY_COMPLEX",
+                )
+                diagnostic_readouts[family] = DiagnosticRootReadout(
+                    omega_delta_from_primary=0.0j,
+                    determinant_residual_abs=float(normalised),
+                    determinant_derivative_abs=float(derivative),
+                    converged=True,
+                    fixed_root_evidence=fixed,
+                )
         updated = replace(
             readout,
             determinant_residual_abs=float(normalised),
-            diagnostic_readouts=(readout.diagnostic_readouts or None),
+            truncation_radius=0.0 if readout.converged else None,
+            resolution_radius=0.0 if readout.converged else None,
+            seed_path_radius=None,
+            diagnostic_readouts=diagnostic_readouts,
+            diagnostics_skipped_reason=(
+                None if readout.converged else "PRIMARY_NOT_CONVERGED"
+            ),
             numerical_conditioning=evidence,
             normalised_determinant_abs=normalised,
             raw_determinant_abs=(
@@ -415,16 +492,21 @@ def _with_baseline_conditioning(
             ),
             raw_determinant_evidence_status=raw_status,
             worker_response_receipt=None,
-            root_authentication=authentication,
+            root_authentication=None,
+            promoted_root_readout_policy=PROMOTED_ROOT_READOUT_POLICY,
+            primary_acceptance=primary,
+            seed_path_required=False,
+            seed_path_executed=False,
+            seed_path_determinant_count=0,
         )
         receipt_material = {
-            "schema": "windows-solver.worker-response-receipt/1",
+            "schema": WORKER_RESPONSE_RECEIPT_SCHEMA,
             "request_binding": request_binding,
             "request_sha256": hashlib.sha256(
                 canonical_json_bytes(request_binding)
             ).hexdigest(),
             "scientific_runtime_sha256": scientific_runtime_sha256,
-            "worker_response_schema_version": 4,
+            "worker_response_schema_version": WORKER_RESPONSE_WIRE_SCHEMA,
             "root_residual_abs_text": str(
                 updated.normalised_determinant_abs
             ),
@@ -434,10 +516,13 @@ def _with_baseline_conditioning(
                 else str(updated.raw_determinant_abs)
             ),
             "raw_determinant_evidence_status": raw_status,
+            "promoted_root_readout_policy": PROMOTED_ROOT_READOUT_POLICY,
+            "primary_acceptance_sha256": hashlib.sha256(
+                canonical_json_bytes(primary.to_mapping())
+            ).hexdigest(),
         }
         return replace(
             updated,
-            diagnostic_readouts=(updated.diagnostic_readouts or None),
             worker_response_receipt={
                 **receipt_material,
                 "receipt_sha256": hashlib.sha256(
@@ -1030,6 +1115,11 @@ class PromotedConditioningDecisionTests(unittest.TestCase):
                 "raw_determinant_evidence_status",
                 "worker_response_receipt",
                 "root_authentication",
+                "promoted_root_readout_policy",
+                "primary_acceptance",
+                "seed_path_required",
+                "seed_path_executed",
+                "seed_path_determinant_count",
             ):
                 readout.pop(field, None)
         source_sha256 = hashlib.sha256(
@@ -1153,12 +1243,28 @@ class PrimaryPrecisionTests(unittest.TestCase):
         self.assertEqual(
             _root_convergence_precision_contract(),
             {
-                "version": 1,
-                "metric": "newton_correction_estimate_abs",
-                "definition": "determinant_residual_abs_over_derivative_abs",
-                "binary64_tolerance_abs": 2.0e-11,
+                "version": 2,
+                "metric": "abs-determinant-over-abs-complex-derivative/v1",
+                "definition": "abs_D_over_abs_complex_PRIMARY_Dprime",
+                "tolerance_abs": 2.0e-11,
+                "precision_tiers": ["binary64", "julia80", "julia120"],
                 "derivative_requirement": "finite_strictly_positive",
-                "required_phases": [
+                "promoted": {
+                    "policy_id": (
+                        "binary64-parity-primary-fixed-root-diagnostics/v1"
+                    ),
+                    "required_phases": [
+                        "PRIMARY",
+                        "TRUNCATION",
+                        "RESOLUTION",
+                    ],
+                    "primary_post_newton_determinant_count": 0,
+                    "truncation_determinant_count": 1,
+                    "resolution_determinant_count": 1,
+                    "fixed_root_diagnostics_reuse_complex_primary_derivative": True,
+                    "seed_path_required": False,
+                },
+                "binary64_required_phases": [
                     "PRIMARY",
                     "TRUNCATION",
                     "RESOLUTION",
