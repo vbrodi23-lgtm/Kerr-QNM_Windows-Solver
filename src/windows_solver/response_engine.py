@@ -4217,7 +4217,7 @@ def _validate_promoted_horizon_baseline(
     job: ResponseComponentJob,
     baseline: RootReadout,
 ) -> None:
-    """Re-check the v1.4 single-readout evidence before using its derivative."""
+    """Re-check operator-validated single-readout evidence before using it."""
 
     if baseline.promoted_root_readout_policy != PROMOTED_ROOT_READOUT_POLICY:
         raise ValueError("promoted root-readout policy identity is invalid")

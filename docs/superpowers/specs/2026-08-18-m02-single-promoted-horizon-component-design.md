@@ -3,13 +3,13 @@
 ## Authority and scope
 
 This design records the operator-approved production contract supplied on
-2026-08-18. The attached `M02_Leaf13_FullPrimary_FastDiagnostics_v1.4.ps1`
+2026-08-18. The attached operator fast-diagnostics PowerShell tester
 is the normative numerical reference; the written production requirements
 control wherever tester compatibility scaffolding differs.
 
 The change applies only to primary `horizon-admittance` campaign leaves at
 Julia precision 80 or 120. Binary64 components, exterior mechanisms,
-control/deep validation ladders, and the Julia worker's v1.4 numerical kernel
+control/deep validation ladders, and the Julia worker's operator-validated numerical kernel
 remain unchanged.
 
 ## Execution boundary
@@ -93,4 +93,4 @@ promotion. Completed unaffected binary64 leaves are not recomputed.
 Verification is limited to static, parser, schema, compile, and mocked/unit
 tests. No Julia worker, Kerr determinant, ODE solve, Leaf 13, finite-amplitude
 ladder, campaign, or PowerShell production tester is executed in this
-environment. Mathematical validation is the operator's v1.4 receipt.
+environment. Mathematical validation is the operator's fast-diagnostics receipt.
