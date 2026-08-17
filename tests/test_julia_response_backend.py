@@ -132,6 +132,35 @@ class FakeAdapter:
         return None
 
 
+def _set_distinct_derivative_binding(response, wire_derivative_abs):
+    authentication = dict(response["root_authentication"])
+    derivative_authentication = dict(
+        authentication["derivative_authentication"]
+    )
+    derivative_authentication.update({
+        "derivative_re": "10",
+        "derivative_im": "0",
+        "propagated_error_abs": "1",
+        "step_disagreement_abs": "1",
+        "lower_bound_abs": "8",
+    })
+    authentication["derivative_authentication"] = derivative_authentication
+    derivative_evidence = dict(authentication["derivative_evidence"])
+    derivative_evidence.update({
+        "real_base": {"real": "9", "imaginary": "0"},
+        "real_half": {"real": "10", "imaginary": "0"},
+    })
+    authentication["derivative_evidence"] = derivative_evidence
+    with localcontext() as context:
+        context.prec = 180
+        authentication["correction_upper_bound"] = str(
+            Decimal(authentication["residual_upper_bound_abs"]) / Decimal("8")
+        )
+    response["root_authentication"] = authentication
+    response["root_derivative_abs"] = wire_derivative_abs
+    return response
+
+
 class JuliaResponseBackendTests(unittest.TestCase):
     @staticmethod
     def _cache_adapter(root, runner):
@@ -850,6 +879,56 @@ class JuliaResponseBackendTests(unittest.TestCase):
                     backend.read_root(
                         _job_for_mechanism("horizon-admittance"), 0.0j
                     )
+
+    def test_backend_accepts_distinct_raw_derivative_and_wire_lower_bound(self):
+        class DistinctDerivativeAdapter(FakeAdapter):
+            def evaluate(self, request):
+                return _set_distinct_derivative_binding(
+                    super().evaluate(request), "8"
+                )
+
+        readout = JuliaPrecisionRootBackend(
+            VettedNativeDeterminantKernel.identity,
+            DistinctDerivativeAdapter(),
+            80,
+        ).read_root(_job_for_mechanism("horizon-admittance"), 0.0j)
+
+        authentication = readout.root_authentication
+        self.assertEqual(
+            authentication.derivative_estimate.magnitude(), Decimal("10")
+        )
+        self.assertEqual(
+            authentication.derivative_lower_bound_abs, Decimal("8")
+        )
+        self.assertEqual(readout.determinant_derivative_abs, 10.0)
+
+    def test_backend_rejects_incorrect_wire_derivative_lower_bound(self):
+        class IncorrectLowerBoundAdapter(FakeAdapter):
+            def evaluate(self, request):
+                return _set_distinct_derivative_binding(
+                    super().evaluate(request), "7.9"
+                )
+
+        with self.assertRaises(JuliaResponseBackendError):
+            JuliaPrecisionRootBackend(
+                VettedNativeDeterminantKernel.identity,
+                IncorrectLowerBoundAdapter(),
+                80,
+            ).read_root(_job_for_mechanism("horizon-admittance"), 0.0j)
+
+    def test_backend_rejects_raw_derivative_as_wire_lower_bound(self):
+        class RawDerivativeAdapter(FakeAdapter):
+            def evaluate(self, request):
+                return _set_distinct_derivative_binding(
+                    super().evaluate(request), "10"
+                )
+
+        with self.assertRaises(JuliaResponseBackendError):
+            JuliaPrecisionRootBackend(
+                VettedNativeDeterminantKernel.identity,
+                RawDerivativeAdapter(),
+                80,
+            ).read_root(_job_for_mechanism("horizon-admittance"), 0.0j)
 
     def test_promoted_root_at_shared_correction_threshold_is_converged(self):
         """The error-aware upper bound is accepted at the inclusive 2e-11 edge."""

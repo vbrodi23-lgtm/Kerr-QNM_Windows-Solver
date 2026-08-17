@@ -2498,7 +2498,7 @@ function evaluate_horizon_chart(
     outer_dX_drstar = outer_raw.Xrho / outer_contour.infinity_tangent
     ingoing = basis_solution.ingoing
     outgoing = basis_solution.outgoing
-    target = factor_physical_match_state(
+    target = GSN.FactoredSolutions.factor_physical_match_state(
         outer_raw.X,
         outer_dX_drstar,
         ingoing.carrier,

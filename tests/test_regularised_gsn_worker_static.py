@@ -144,6 +144,23 @@ class RegularisedGsnWorkerSourceTests(unittest.TestCase):
             self.assertNotIn(forbidden, horizon)
             self.assertNotIn(forbidden, chart)
 
+    def test_horizon_match_state_conversion_uses_package_namespace(self) -> None:
+        chart = self._function_slice(
+            "evaluate_horizon_chart", "determinant_error_breakdown"
+        )
+        self.assertIn(
+            "target = GSN.FactoredSolutions.factor_physical_match_state(",
+            chart,
+        )
+        self.assertNotRegex(
+            chart,
+            r"(?<![\w.])factor_physical_match_state\(",
+        )
+        self.assertNotRegex(
+            self.worker,
+            r"(?m)^function\s+factor_physical_match_state\(",
+        )
+
     def test_horizon_determinant_carries_an_absolute_error(self) -> None:
         for contract in (
             "struct DeterminantErrorBreakdown{T<:AbstractFloat}",
