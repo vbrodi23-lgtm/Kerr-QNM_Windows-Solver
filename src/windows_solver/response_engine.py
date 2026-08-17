@@ -4281,6 +4281,10 @@ def run_promoted_horizon_component(
 
     if job.role != "primary" or job.mechanism_id != "horizon-admittance":
         raise ValueError("promoted component runner requires a primary horizon job")
+    if not math.isfinite(job.spin) or abs(job.spin) >= 1.0:
+        raise ValueError(
+            "promoted horizon Kerr spin must be finite and subextremal"
+        )
     if backend.identity != job.backend_identity:
         raise ValueError("response backend identity does not match job")
     predictor = _finite_complex(primary_predictor, "PRIMARY root predictor")

@@ -414,10 +414,10 @@ class PromotedHorizonComponentTests(unittest.TestCase):
                 zero_frequency,
             )
 
-    def test_extremal_spin_roundoff_uses_horizon_radius_clamp(self):
+    def test_near_extremal_spin_uses_horizon_radius_clamp(self):
         rounded_job = replace(
             self.job,
-            spin=math.nextafter(1.0, math.inf),
+            spin=math.nextafter(1.0, 0.0),
         )
         baseline = _promoted_baseline(rounded_job)
 
@@ -431,6 +431,27 @@ class PromotedHorizonComponentTests(unittest.TestCase):
         self.assertIsNotNone(result.response)
         self.assertTrue(math.isfinite(result.response.real))
         self.assertTrue(math.isfinite(result.response.imag))
+
+    def test_rejects_nonfinite_or_non_subextremal_spin(self):
+        for spin, label in (
+            (math.nan, "nan"),
+            (math.inf, "positive infinity"),
+            (-math.inf, "negative infinity"),
+            (1.0, "positive extremal"),
+            (-1.0, "negative extremal"),
+            (math.nextafter(1.0, math.inf), "positive superextremal"),
+            (math.nextafter(-1.0, -math.inf), "negative superextremal"),
+        ):
+            with self.subTest(label=label):
+                invalid_job = replace(self.job, spin=spin)
+                baseline = _promoted_baseline(invalid_job)
+
+                with self.assertRaisesRegex(ValueError, "Kerr spin"):
+                    self._runner()(
+                        invalid_job,
+                        FakePromotedBackend(invalid_job, baseline),
+                        invalid_job.root.omega,
+                    )
 
     def test_rejects_zero_or_nonfinite_retained_complex_derivative(self):
         for derivative, label in (
