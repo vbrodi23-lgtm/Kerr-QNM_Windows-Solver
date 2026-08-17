@@ -1,4 +1,4 @@
-"""The horizon rewrite must retire horizon receipts and only horizon receipts.
+"""Mechanism and promoted-readout policy identities retire stale receipts.
 
 Receipt reuse is decided by exact equality against
 ``regularised_gsn_precision_policy(mechanism_id)``. That makes the policy
@@ -8,10 +8,8 @@ mapping load-bearing in both directions at once:
   calculation -- one solution propagated through a mixed match-to-inner leg,
   not a basis built from three independent legs on a verified real-inner
   contour. It must not be reusable.
-* An exterior receipt written on ``main`` describes exactly the calculation
-  this branch still performs. It must remain reusable, because retiring it
-  would discard real computed evidence to record a change that never touched
-  the exterior path.
+* The binary64-parity promoted acceptance policy changes both determinant
+  families' readout semantics, so a pre-policy exterior receipt is stale too.
 
 Nothing about the second property is automatic. Adding a horizon-only field to
 the shared policy as ``None`` is enough to break it, silently, with no failing
@@ -33,15 +31,12 @@ from windows_solver.response_batches import (
     build_campaign_plan,
 )
 from tests.fixtures import (
-    root_authentication_for_readout,
     valid_numerical_conditioning,
 )
 
 
-# Copied verbatim from `regularised_gsn_precision_policy("exterior-fixed-r3")`
-# as it stands on `main`. Pinned as a literal on purpose: importing `main` at
-# test time is not possible, and re-deriving the expectation from the code
-# under test would assert only that the function equals itself.
+# The pre-policy exterior identity from ``main``. The determinant mathematics
+# is unchanged, but the promoted root acceptance/readout policy is not.
 MAIN_EXTERIOR_PRECISION_POLICY = {
     "asymptotic_series_evaluation": "typed-batch-horner-compensated/v1",
     "branch_convention": "gsn-complex-rho/v1",
@@ -97,6 +92,7 @@ PRE_REWRITE_HORIZON_PRECISION_POLICY = {
 # The calculation identities changed by the rewrite plus the two horizon-only
 # controls that explicitly keep the unmeasured profile out of release.
 REWRITTEN_HORIZON_IDENTITY_FIELDS = {
+    "promoted_root_readout_policy",
     "homogeneous_representation",
     "scattering_coefficient_extraction",
     "horizon_contour",
@@ -107,26 +103,24 @@ REWRITTEN_HORIZON_IDENTITY_FIELDS = {
 
 
 class MechanismScopedPolicyTests(unittest.TestCase):
-    def test_every_exterior_policy_is_unchanged_from_main(self):
-        """Catches a horizon change retiring receipts it never touched.
-
-        Exact equality, key set included. A policy that merely *gained* a key
-        -- say ``horizon_contour: None`` -- compares unequal to the mapping
-        stored in a ``main`` receipt, so every exterior receipt ever produced
-        would be rejected as stale by a rewrite that did not alter the exterior
-        determinant by a single digit.
-        """
+    def test_every_exterior_policy_changes_only_for_promoted_root_acceptance(self):
+        """The exterior determinant is stable while its root policy is revised."""
 
         for mechanism in response_engine._EXTERIOR_PROFILE_IDS:
             with self.subTest(mechanism=mechanism):
                 policy = dict(
                     response_engine.regularised_gsn_precision_policy(mechanism)
                 )
-                self.assertEqual(policy, MAIN_EXTERIOR_PRECISION_POLICY)
-                # Stated separately because a key set that grows while every
-                # shared value still matches is the exact failure above.
+                expected = {
+                    **MAIN_EXTERIOR_PRECISION_POLICY,
+                    "promoted_root_readout_policy": (
+                        response_engine.PROMOTED_ROOT_READOUT_POLICY
+                    ),
+                }
+                self.assertEqual(policy, expected)
                 self.assertEqual(
-                    set(policy), set(MAIN_EXTERIOR_PRECISION_POLICY)
+                    set(policy) - set(MAIN_EXTERIOR_PRECISION_POLICY),
+                    {"promoted_root_readout_policy"},
                 )
 
     def test_horizon_policy_differs_in_exactly_the_rewritten_identities(self):
@@ -217,6 +211,26 @@ class ReceiptCompatibilityTests(unittest.TestCase):
         request_binding = JuliaPrecisionRootBackend(
             job.backend_identity, object(), 80
         )._request(job, 0.0j)
+        determinant = Decimal("1E-10")
+        derivative = Decimal("2")
+        correction = determinant / derivative
+        primary = response_engine.PrimaryRootAcceptanceEvidence(
+            policy_id=response_engine.PROMOTED_ROOT_READOUT_POLICY,
+            acceptance_metric=response_engine.PROMOTED_ROOT_ACCEPTANCE_METRIC,
+            determinant=response_engine.DecimalComplex(determinant, Decimal(0)),
+            derivative=response_engine.DecimalComplex(derivative, Decimal(0)),
+            correction_abs=correction,
+            root_correction_tolerance=Decimal("2E-11"),
+            accepted=False,
+            newton_determinant_count=3,
+            post_newton_determinant_count=0,
+            determinant_error_abs=Decimal(0),
+            error_model_id=(
+                response_engine.VERIFIED_ENDPOINT_ERROR_MODEL
+                if horizon
+                else None
+            ),
+        )
         material = {
             "schema": response_engine.WORKER_RESPONSE_RECEIPT_SCHEMA,
             "request_binding": request_binding,
@@ -229,15 +243,21 @@ class ReceiptCompatibilityTests(unittest.TestCase):
             "worker_response_schema_version": (
                 response_engine.WORKER_RESPONSE_WIRE_SCHEMA
             ),
-            "root_residual_abs_text": "1E-12",
-            "raw_determinant_abs_text": "1E-12" if horizon else None,
+            "root_residual_abs_text": str(determinant),
+            "raw_determinant_abs_text": str(determinant) if horizon else None,
             "raw_determinant_evidence_status": (
                 "available/v1" if horizon else "not-applicable/v1"
             ),
+            "promoted_root_readout_policy": (
+                response_engine.PROMOTED_ROOT_READOUT_POLICY
+            ),
+            "primary_acceptance_sha256": hashlib.sha256(
+                canonical_json_bytes(primary.to_mapping())
+            ).hexdigest(),
         }
         return response_engine.RootReadout(
             omega=job.root.omega,
-            determinant_residual_abs=1.0e-12,
+            determinant_residual_abs=float(determinant),
             determinant_derivative_abs=2.0,
             converged=False,
             root_reference_id=job.root.root_reference_id,
@@ -252,8 +272,8 @@ class ReceiptCompatibilityTests(unittest.TestCase):
                     valid_numerical_conditioning(job.mechanism_id)
                 )
             ),
-            normalised_determinant_abs=Decimal("1E-12"),
-            raw_determinant_abs=Decimal("1E-12") if horizon else None,
+            normalised_determinant_abs=determinant,
+            raw_determinant_abs=determinant if horizon else None,
             raw_determinant_evidence_status=(
                 "available/v1" if horizon else "not-applicable/v1"
             ),
@@ -263,21 +283,14 @@ class ReceiptCompatibilityTests(unittest.TestCase):
                     canonical_json_bytes(material)
                 ).hexdigest(),
             },
-            root_authentication=(
-                response_engine.RootAuthenticationEvidence.from_mapping(
-                    root_authentication_for_readout(
-                        mechanism_id=job.mechanism_id,
-                        determinant_abs=Decimal("1E-12"),
-                        derivative_abs=Decimal("2"),
-                        root_correction_tolerance=Decimal(
-                            request_binding["policy"][
-                                "root_correction_tolerance"
-                            ]
-                        ),
-                        accepted=False,
-                    )
-                )
+            root_authentication=None,
+            promoted_root_readout_policy=(
+                response_engine.PROMOTED_ROOT_READOUT_POLICY
             ),
+            primary_acceptance=primary,
+            seed_path_required=False,
+            seed_path_executed=False,
+            seed_path_determinant_count=0,
         )
 
     def _validate(self, mechanism, policy):
@@ -339,10 +352,21 @@ class ReceiptCompatibilityTests(unittest.TestCase):
             leaf, outcome, result
         )
 
-    def test_a_main_generated_exterior_receipt_stays_reusable(self):
-        """The exterior path did not change, so its evidence still counts."""
+    def test_a_pre_policy_exterior_receipt_is_rejected_as_stale(self):
+        with self.assertRaises(
+            response_batches._UnauthenticatedComponentEvidence
+        ):
+            self._validate(
+                "exterior-light-ring", MAIN_EXTERIOR_PRECISION_POLICY
+            )
 
-        self._validate("exterior-light-ring", MAIN_EXTERIOR_PRECISION_POLICY)
+    def test_the_current_exterior_policy_is_accepted(self):
+        self._validate(
+            "exterior-light-ring",
+            response_engine.regularised_gsn_precision_policy(
+                "exterior-light-ring"
+            ),
+        )
 
     def test_a_pre_rewrite_horizon_receipt_is_rejected_as_stale(self):
         """A receipt for a calculation this branch no longer performs."""

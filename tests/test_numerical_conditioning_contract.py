@@ -9,7 +9,6 @@ import unittest
 
 from tests.fixtures import (
     control_failure_stage,
-    root_authentication_for_readout,
     valid_control_failure_diagnostics,
     valid_numerical_conditioning,
     valid_julia_root_response,
@@ -698,6 +697,7 @@ class PromotedRuntimeProvenancePersistenceTests(unittest.TestCase):
             )
         )
         for field in (
+            "promoted_root_readout_policy",
             "human_math_review_receipt_status",
             "human_math_review_receipt_sha256",
             "independent_reference_fixture_receipt_status",
@@ -732,10 +732,31 @@ class PromotedRuntimeProvenancePersistenceTests(unittest.TestCase):
             else None
         )
         worker_response_receipt = None
+        primary_acceptance = None
+        determinant_abs = Decimal("1E-10")
         if current_schema:
             request_binding = JuliaPrecisionRootBackend(
                 job.backend_identity, object(), 80
             )._request(job, 0.0j)
+            primary_acceptance = response_engine.PrimaryRootAcceptanceEvidence(
+                policy_id=response_engine.PROMOTED_ROOT_READOUT_POLICY,
+                acceptance_metric=(
+                    response_engine.PROMOTED_ROOT_ACCEPTANCE_METRIC
+                ),
+                determinant=response_engine.DecimalComplex(
+                    determinant_abs, Decimal(0)
+                ),
+                derivative=response_engine.DecimalComplex(
+                    Decimal(2), Decimal(0)
+                ),
+                correction_abs=Decimal("5E-11"),
+                root_correction_tolerance=Decimal("2E-11"),
+                accepted=False,
+                newton_determinant_count=3,
+                post_newton_determinant_count=0,
+                determinant_error_abs=Decimal(0),
+                error_model_id=None,
+            )
             receipt_material = {
                 "schema": response_engine.WORKER_RESPONSE_RECEIPT_SCHEMA,
                 "request_binding": request_binding,
@@ -749,10 +770,18 @@ class PromotedRuntimeProvenancePersistenceTests(unittest.TestCase):
                         )
                     )
                 ).hexdigest(),
-                "worker_response_schema_version": 4,
-                "root_residual_abs_text": "1E-12",
+                "worker_response_schema_version": (
+                    response_engine.WORKER_RESPONSE_WIRE_SCHEMA
+                ),
+                "root_residual_abs_text": str(determinant_abs),
                 "raw_determinant_abs_text": None,
                 "raw_determinant_evidence_status": "not-applicable/v1",
+                "promoted_root_readout_policy": (
+                    response_engine.PROMOTED_ROOT_READOUT_POLICY
+                ),
+                "primary_acceptance_sha256": hashlib.sha256(
+                    canonical_json_bytes(primary_acceptance.to_mapping())
+                ).hexdigest(),
             }
             worker_response_receipt = {
                 **receipt_material,
@@ -762,7 +791,9 @@ class PromotedRuntimeProvenancePersistenceTests(unittest.TestCase):
             }
         baseline = response_engine.RootReadout(
             omega=job.root.omega,
-            determinant_residual_abs=1.0e-12,
+            determinant_residual_abs=(
+                float(determinant_abs) if current_schema else 1.0e-12
+            ),
             determinant_derivative_abs=2.0,
             converged=False,
             root_reference_id=job.root.root_reference_id,
@@ -774,30 +805,23 @@ class PromotedRuntimeProvenancePersistenceTests(unittest.TestCase):
             diagnostics_skipped_reason="PRIMARY_NOT_CONVERGED",
             numerical_conditioning=conditioning,
             normalised_determinant_abs=(
-                Decimal("1E-12") if current_schema else None
+                determinant_abs if current_schema else None
             ),
             raw_determinant_abs=None,
             raw_determinant_evidence_status=(
                 "not-applicable/v1" if current_schema else None
             ),
             worker_response_receipt=worker_response_receipt,
-            root_authentication=(
-                response_engine.RootAuthenticationEvidence.from_mapping(
-                    root_authentication_for_readout(
-                        mechanism_id=job.mechanism_id,
-                        determinant_abs=Decimal("1E-12"),
-                        derivative_abs=Decimal("2"),
-                        root_correction_tolerance=Decimal(
-                            request_binding["policy"][
-                                "root_correction_tolerance"
-                            ]
-                        ),
-                        accepted=False,
-                    )
-                )
+            root_authentication=None,
+            promoted_root_readout_policy=(
+                response_engine.PROMOTED_ROOT_READOUT_POLICY
                 if current_schema
                 else None
             ),
+            primary_acceptance=primary_acceptance,
+            seed_path_required=False if current_schema else None,
+            seed_path_executed=False if current_schema else None,
+            seed_path_determinant_count=0 if current_schema else None,
         )
         return response_engine.ComponentResult(
             job_id=job.job_id,
@@ -849,6 +873,24 @@ class PromotedRuntimeProvenancePersistenceTests(unittest.TestCase):
             self_refinement_enclosed=False,
             discrepancy_from_previous_abs=0.0,
             discrepancy_enclosed=True,
+        )
+
+    def test_skipped_promoted_diagnostics_survive_dataclass_replacement(self):
+        """Catches immutable empty diagnostic evidence becoming unparsable."""
+
+        leaf = self._leaf()
+        result = self._result(
+            leaf.job,
+            current_schema=True,
+        )
+
+        replaced = replace(result.baseline, worker_response_receipt=None)
+
+        self.assertFalse(replaced.converged)
+        self.assertEqual(replaced.diagnostic_readouts, {})
+        self.assertEqual(
+            replaced.diagnostics_skipped_reason,
+            "PRIMARY_NOT_CONVERGED",
         )
 
     @staticmethod
@@ -980,6 +1022,14 @@ class PromotedRuntimeProvenancePersistenceTests(unittest.TestCase):
             historical_schema_two_conditioning(leaf.job.mechanism_id)
         )
         baseline.pop("worker_response_receipt")
+        for field in (
+            "promoted_root_readout_policy",
+            "primary_acceptance",
+            "seed_path_required",
+            "seed_path_executed",
+            "seed_path_determinant_count",
+        ):
+            baseline.pop(field)
         historical = replace(
             current,
             baseline=response_engine.RootReadout.from_mapping(baseline),
@@ -1118,7 +1168,7 @@ class JuliaSchemaThreeConditioningTests(unittest.TestCase):
             valid_numerical_conditioning("exterior-light-ring"),
         )
         self.assertEqual(
-            readout.normalised_determinant_abs, Decimal("2.4E-60")
+            readout.normalised_determinant_abs, Decimal("1E-12")
         )
         self.assertIsNone(readout.raw_determinant_abs)
         self.assertEqual(
@@ -1163,16 +1213,18 @@ class JuliaSchemaThreeConditioningTests(unittest.TestCase):
         def exact_magnitudes(response):
             response["root_residual_abs"] = normalised
             response["raw_determinant_abs"] = raw
-            authentication = dict(response["root_authentication"])
-            authentication["central_determinant_re"] = normalised
-            authentication["central_determinant_im"] = "0"
+            primary = dict(response["primary_acceptance"])
+            primary["determinant_re"] = normalised
+            primary["determinant_im"] = "0"
             with localcontext() as context:
                 context.prec = 180
-                residual_upper = Decimal(normalised) + Decimal("1.4E-60")
-                correction_upper = residual_upper / Decimal("2.4")
-            authentication["residual_upper_bound_abs"] = str(residual_upper)
-            authentication["correction_upper_bound"] = str(correction_upper)
-            response["root_authentication"] = authentication
+                derivative_abs = (
+                    Decimal(primary["derivative_re"]) ** 2
+                    + Decimal(primary["derivative_im"]) ** 2
+                ).sqrt()
+                correction = Decimal(normalised) / derivative_abs
+            primary["correction_abs"] = str(correction)
+            response["primary_acceptance"] = primary
 
         readout = self._backend(self.Adapter(exact_magnitudes)).read_root(
             self._job(), 0.0j
@@ -1261,7 +1313,8 @@ class JuliaSchemaThreeConditioningTests(unittest.TestCase):
                     )
                 )
                 with self.assertRaisesRegex(
-                    JuliaResponseBackendError, "response contract is invalid"
+                    JuliaResponseBackendError,
+                    "response policy/wire schema is inconsistent",
                 ):
                     self._backend(adapter).read_root(self._job(), 0.0j)
 
@@ -1284,10 +1337,7 @@ class JuliaSchemaThreeConditioningTests(unittest.TestCase):
                             response.__setitem__(field, drift)
                         )
                     )
-                    with self.assertRaisesRegex(
-                        JuliaResponseBackendError,
-                        "response contract is invalid",
-                    ):
+                    with self.assertRaises(JuliaResponseBackendError):
                         self._backend(adapter).read_root(self._job(), 0.0j)
 
     def test_schema_three_success_status_must_be_exactly_ok(self):
@@ -1339,6 +1389,9 @@ class JuliaSchemaThreeConditioningTests(unittest.TestCase):
         backend = self._backend()
         request = backend._request(self._job(), 0.0j)
         expected = {
+            "promoted_root_readout_policy": (
+                "binary64-parity-primary-fixed-root-diagnostics/v1"
+            ),
             "determinant_family": "horizon-scattering/v1",
             "scattering_diagnostics_applicable": True,
             # The horizon determinant is built from three independent legs on

@@ -1140,6 +1140,8 @@ $candidate | ConvertTo-Json -Compress | Set-Content -LiteralPath $env:M02_TEST_J
             "finite-difference-derivative/v1",
             "invalid-frequency-step/v1",
             "finite-difference-request-policy/v1",
+            "binary64-parity-primary-fixed-root-diagnostics/v1",
+            "abs-determinant-over-abs-complex-derivative/v1",
         })
         lineage_character = r"A-Za-z0-9_/:;=+\-"
         approved_identity = re.compile(

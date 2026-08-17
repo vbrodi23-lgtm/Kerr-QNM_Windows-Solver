@@ -33,6 +33,7 @@ from .response_engine import (
     HISTORICAL_NUMERICAL_CONDITIONING_SCHEMA,
     NUMERICAL_CONDITIONING_SCHEMA,
     NumericalPolicy,
+    PROMOTED_ROOT_READOUT_POLICY,
     RECORDED_REPLAY_BACKEND_ID,
     RecordedReplayBackend,
     ResponseComponentJob,
@@ -1648,12 +1649,26 @@ def _root_convergence_precision_contract() -> dict[str, object]:
     """Bind the local estimator and its independent acceptance safeguards."""
 
     return {
-        "version": 1,
-        "metric": "newton_correction_estimate_abs",
-        "definition": "determinant_residual_abs_over_derivative_abs",
-        "binary64_tolerance_abs": _BINARY64_ROOT_CORRECTION_TOLERANCE_ABS,
+        "version": 2,
+        "metric": "abs-determinant-over-abs-complex-derivative/v1",
+        "definition": "abs_D_over_abs_complex_PRIMARY_Dprime",
+        "tolerance_abs": _BINARY64_ROOT_CORRECTION_TOLERANCE_ABS,
+        "precision_tiers": ["binary64", "julia80", "julia120"],
         "derivative_requirement": "finite_strictly_positive",
-        "required_phases": [
+        "promoted": {
+            "policy_id": PROMOTED_ROOT_READOUT_POLICY,
+            "required_phases": [
+                "PRIMARY",
+                "TRUNCATION",
+                "RESOLUTION",
+            ],
+            "primary_post_newton_determinant_count": 0,
+            "truncation_determinant_count": 1,
+            "resolution_determinant_count": 1,
+            "fixed_root_diagnostics_reuse_complex_primary_derivative": True,
+            "seed_path_required": False,
+        },
+        "binary64_required_phases": [
             "PRIMARY",
             "TRUNCATION",
             "RESOLUTION",
@@ -1666,6 +1681,32 @@ def _root_convergence_precision_contract() -> dict[str, object]:
 
 def _response_uncertainty_contract() -> dict[str, object]:
     """Bind the live diagnostic-root reduction used by every precision tier."""
+
+    return {
+        "version": 3,
+        "promoted_root_readout_policy": PROMOTED_ROOT_READOUT_POLICY,
+        "primary_disk": "combined_signed_secant_two_finest_level_richardson",
+        "diagnostic_phases": {
+            "binary64": ["TRUNCATION", "RESOLUTION", "SEED-PATH"],
+            "promoted": ["TRUNCATION", "RESOLUTION"],
+        },
+        "diagnostic_disk": "signed_phase_secants_two_finest_level_richardson",
+        "containment_increment": (
+            "max_axis_of_max_zero_control_distance_plus_control_radius_"
+            "minus_primary_combined_radius"
+        ),
+        "baseline_diagnostic_displacement_excluded": True,
+        "promoted_seed_path": "omitted-not-required",
+        "promoted_seed_path_error_channel": (
+            "schema-retained-zero-not-applicable"
+        ),
+        "root_space_displacements": "branch_continuation_only",
+        "units": "dimensionless_response",
+    }
+
+
+def _previous_response_uncertainty_contract() -> dict[str, object]:
+    """Return the exact uncertainty contract used by predecessor receipts."""
 
     return {
         "version": 2,
@@ -1725,6 +1766,8 @@ def _scientific_computation_identity_material(
     plan: CampaignPlan,
     leaf: CampaignLeafPlan,
     precision_contract: Mapping[str, object],
+    *,
+    response_uncertainty_contract: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     return {
         "schema_version": 1,
@@ -1742,7 +1785,11 @@ def _scientific_computation_identity_material(
         "response_job": leaf.job.to_mapping(),
         "precision_factory_identity": plan.precision_factory_identity.to_mapping(),
         "precision_contract": precision_contract,
-        "response_uncertainty_contract": _response_uncertainty_contract(),
+        "response_uncertainty_contract": (
+            _response_uncertainty_contract()
+            if response_uncertainty_contract is None
+            else dict(response_uncertainty_contract)
+        ),
     }
 
 
@@ -1769,7 +1816,12 @@ def _legacy_primary_scientific_computation_identity_sha256(
     if leaf.leaf_id not in {item.leaf_id for item in plan.leaves}:
         raise ValueError("legacy PRIMARY identity is outside the campaign plan")
     return _sha256(_scientific_computation_identity_material(
-        plan, leaf, _legacy_leaf_precision_contract(leaf)
+        plan,
+        leaf,
+        _legacy_leaf_precision_contract(leaf),
+        response_uncertainty_contract=(
+            _previous_response_uncertainty_contract()
+        ),
     ))
 
 
@@ -1783,7 +1835,12 @@ def _raw_residual_primary_scientific_computation_identity_sha256(
     if leaf.leaf_id not in {item.leaf_id for item in plan.leaves}:
         raise ValueError("raw-residual identity is outside the campaign plan")
     return _sha256(_scientific_computation_identity_material(
-        plan, leaf, _raw_residual_leaf_precision_contract(leaf)
+        plan,
+        leaf,
+        _raw_residual_leaf_precision_contract(leaf),
+        response_uncertainty_contract=(
+            _previous_response_uncertainty_contract()
+        ),
     ))
 
 
@@ -1801,7 +1858,14 @@ def _previous_primary_scientific_computation_identity_sha256(
         _previous_primary_recovery_precision_contract()
     )
     return _sha256(
-        _scientific_computation_identity_material(plan, leaf, contract)
+        _scientific_computation_identity_material(
+            plan,
+            leaf,
+            contract,
+            response_uncertainty_contract=(
+                _previous_response_uncertainty_contract()
+            ),
+        )
     )
 
 
@@ -2044,7 +2108,9 @@ def _checkpoint_precision_contract_sha256(schema_version: int) -> str:
         material.update(
             {
                 "primary_recovery": historical_primary,
-                "response_uncertainty": _response_uncertainty_contract(),
+                "response_uncertainty": (
+                    _previous_response_uncertainty_contract()
+                ),
             }
         )
     elif schema_version == CAMPAIGN_CHECKPOINT_SCHEMA_VERSION:
@@ -2716,6 +2782,7 @@ def _historical_regularised_gsn_precision_policy(
 ) -> dict[str, object]:
     policy = dict(regularised_gsn_precision_policy(mechanism_id))
     for field in (
+        "promoted_root_readout_policy",
         "human_math_review_receipt_status",
         "human_math_review_receipt_sha256",
         "independent_reference_fixture_receipt_status",
@@ -2805,6 +2872,14 @@ def _validate_current_promoted_runtime(
         expected_policy = dict(
             regularised_gsn_precision_policy(leaf.job.mechanism_id)
         )
+        if any(
+            readout.promoted_root_readout_policy
+            != PROMOTED_ROOT_READOUT_POLICY
+            for readout in result.raw_readouts
+        ):
+            raise _UnauthenticatedComponentEvidence(
+                "campaign promoted root-readout policy identity is invalid"
+            )
     elif (
         allow_historical_conditioning_absence
         and conditioning_schemas

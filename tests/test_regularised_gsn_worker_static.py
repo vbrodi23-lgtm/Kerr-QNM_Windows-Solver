@@ -749,23 +749,13 @@ class RegularisedGsnWorkerSourceTests(unittest.TestCase):
         ):
             self.assertIn(executed, self.fd_spec)
 
-    def test_seed_path_keeps_its_independent_seed_and_diagnostic_role(
-        self,
-    ) -> None:
+    def test_promoted_result_fields_do_not_execute_a_seed_path(self) -> None:
         result_fields = self._function_slice("result_fields", "evaluate_request")
-        alternate = result_fields.index(
-            'alternate = omega + Complex{T}(T("0.00025"), T("0.000125"))'
-        )
-        seed_phase = result_fields.index('"SEED-PATH"', alternate)
-        independent = result_fields.index(
-            'seed_kind="INDEPENDENT_SEED_PATH"', seed_phase
-        )
-        diagnostic_role = result_fields.index(
-            "solve_role=DIAGNOSTIC_CONSISTENCY", seed_phase
-        )
-        self.assertLess(alternate, seed_phase)
-        self.assertLess(seed_phase, independent)
-        self.assertLess(seed_phase, diagnostic_role)
+        self.assertNotIn('"SEED-PATH"', result_fields)
+        self.assertNotIn('seed_kind="INDEPENDENT_SEED_PATH"', result_fields)
+        self.assertIn('"seed_path_required" => false', result_fields)
+        self.assertIn('"seed_path_executed" => false', result_fields)
+        self.assertIn('"seed_path_determinant_count" => 0', result_fields)
 
     def test_primary_stages_h_and_authenticated_h_over_two_before_full_escalation(
         self,
@@ -860,7 +850,9 @@ class RegularisedGsnWorkerSourceTests(unittest.TestCase):
         self.assertIn('"derivative_real_double" => nothing', staged)
         self.assertIn('"derivative_imaginary" => nothing', staged)
 
-    def test_primary_authentication_tightens_only_exact_frequencies(self) -> None:
+    def test_legacy_tight_control_authentication_is_not_used_by_refinements(
+        self,
+    ) -> None:
         for contract in (
             "function tight_control_request(",
             "function authenticated_determinant_progress(",
@@ -872,7 +864,11 @@ class RegularisedGsnWorkerSourceTests(unittest.TestCase):
             self.assertIn(contract, self.worker)
         refined = self._function_slice("refined_request", "conditioning_response")
         self.assertNotIn("authenticated_determinant_progress(", refined)
-        self.assertIn("return tight_control_request(T, request)", refined)
+        self.assertNotIn("tight_control_request", refined)
+        self.assertIn('output["endpoint_series_order"]', refined)
+        self.assertIn('"homogeneous_ode_relative_tolerance"', refined)
+        self.assertIn('"homogeneous_ode_absolute_tolerance"', refined)
+        self.assertIn("return output", refined)
 
     def test_final_authentication_leaves_exterior_derivative_path_unchanged(
         self,
@@ -1027,6 +1023,97 @@ class RegularisedGsnWorkerSourceTests(unittest.TestCase):
         self.assertIn(
             "p = (a=a, beta=beta, sign=sign, rs_mp=rs_mp)",
             coordinate_solver,
+        )
+
+    def test_promoted_primary_uses_binary64_parity_acceptance(self) -> None:
+        bounded = self._function_slice(
+            "bounded_newton", "finite_difference_noise_limit"
+        )
+        primary = self._function_slice(
+            "solve_binary64_parity_primary", "solve_fixed_root_diagnostic"
+        )
+
+        self.assertIn("PROMOTED_ROOT_READOUT_POLICY_ID", bounded)
+        self.assertIn("PROMOTED_ROOT_ACCEPTANCE_METRIC_ID", bounded)
+        self.assertRegex(
+            bounded,
+            r"correction_abs\s*=\s*binary64_parity\s*\?\s*"
+            r"magnitude\s*/\s*derivative_abs",
+        )
+        self.assertRegex(
+            bounded,
+            r"candidate_improves\s*=\s*binary64_parity\s*\?\s*"
+            r"candidate_abs\s*<\s*magnitude",
+        )
+        self.assertIn("magnitude < best_residual", bounded)
+        self.assertIn("derivative=newton_derivative", primary)
+        self.assertIn("minimum_remaining_determinant_count=2", primary)
+        self.assertIn("post_newton_determinant_count=0", primary)
+        self.assertNotIn("authenticated_determinant_progress", primary)
+        self.assertNotIn("final_derivative(", primary)
+
+    def test_fixed_root_diagnostics_reuse_the_complex_primary_derivative(self) -> None:
+        diagnostic = self._function_slice(
+            "solve_fixed_root_diagnostic", "solve_full_authentication"
+        )
+
+        self.assertEqual(diagnostic.count("determinant_progress("), 1)
+        self.assertIn("omega_primary", diagnostic)
+        self.assertIn("derivative=primary_derivative", diagnostic)
+        self.assertIn(
+            "correction_abs = residual / abs(primary_derivative)", diagnostic
+        )
+        self.assertIn("DETERMINANT_INDEX_PHASE[] == 1", diagnostic)
+        self.assertNotIn("bounded_newton(", diagnostic)
+        self.assertNotIn("finite_difference", diagnostic)
+        self.assertNotIn("authenticated_determinant", diagnostic)
+
+    def test_resolution_refines_only_homogeneous_ode_tolerances(self) -> None:
+        refined = self._function_slice("refined_request", "conditioning_response")
+        resolution = refined[refined.index("kind == :resolution") :]
+
+        self.assertIn('"homogeneous_ode_relative_tolerance"', resolution)
+        self.assertIn('"homogeneous_ode_absolute_tolerance"', resolution)
+        for forbidden in (
+            '"angular_pad"',
+            '"coordinate_ode_relative_tolerance"',
+            '"coordinate_ode_absolute_tolerance"',
+            '"endpoint_series_order" =',
+            "tight_control_request(",
+        ):
+            self.assertNotIn(forbidden, resolution)
+
+    def test_promoted_result_omits_seed_path_without_simulating_it(self) -> None:
+        result_fields = self._function_slice("result_fields", "evaluate_request")
+
+        self.assertIn('"seed_path_required" => false', result_fields)
+        self.assertIn('"seed_path_executed" => false', result_fields)
+        self.assertIn('"seed_path_determinant_count" => 0', result_fields)
+        self.assertNotIn('"SEED-PATH"', result_fields)
+        self.assertNotIn("alternate =", result_fields)
+        self.assertNotIn("seed_path = solve_phase(", result_fields)
+        self.assertEqual(result_fields.count("solve_fixed_root_diagnostic"), 0)
+
+    def test_promoted_worker_versions_and_validates_the_readout_policy(self) -> None:
+        validation = self._function_slice(
+            "validate_regularised_gsn_policy", "parse_real"
+        )
+        result_fields = self._function_slice("result_fields", "evaluate_request")
+
+        self.assertIn(
+            'const PROMOTED_ROOT_READOUT_POLICY_ID =\n'
+            '    "binary64-parity-primary-fixed-root-diagnostics/v1"',
+            self.worker,
+        )
+        self.assertIn('"promoted_root_readout_policy"', validation)
+        self.assertEqual(result_fields.count('"schema_version" => 7'), 2)
+        self.assertEqual(
+            len(re.findall(
+                r'"promoted_root_readout_policy"\s*=>\s*'
+                r"PROMOTED_ROOT_READOUT_POLICY_ID",
+                result_fields,
+            )),
+            2,
         )
 
     def _function_slice(self, name: str, next_name: str) -> str:

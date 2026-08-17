@@ -16,6 +16,10 @@ const GSNBranchConvention = GSN.GSNBranchConvention
 const PROGRESS_PREFIX = "@@KERR_QNM_PROGRESS@@"
 const PROGRESS_SCHEMA = "windows-solver.progress/1"
 const CONDITIONING_SCHEMA = "windows-solver.m02-conditioning/3"
+const PROMOTED_ROOT_READOUT_POLICY_ID =
+    "binary64-parity-primary-fixed-root-diagnostics/v1"
+const PROMOTED_ROOT_ACCEPTANCE_METRIC_ID =
+    "abs-determinant-over-abs-complex-derivative/v1"
 const HOMOGENEOUS_REPRESENTATION_ID = "factored-plane-wave-gsn/v1"
 # The horizon determinant no longer propagates one solution through a mixed
 # match-to-inner leg; it builds an actual solution basis from three independent
@@ -82,12 +86,18 @@ const ALLOWED_MECHANISMS = Set([
 @enum RootSolveRole begin
     FULL_AUTHENTICATION
     DIAGNOSTIC_CONSISTENCY
+    BINARY64_PARITY_PRIMARY
+    FIXED_ROOT_DIAGNOSTIC
 end
 
 function root_solve_role_text(role::RootSolveRole)
     role === FULL_AUTHENTICATION && return "FULL_AUTHENTICATION"
     role === DIAGNOSTIC_CONSISTENCY &&
         return "DIAGNOSTIC_CONSISTENCY"
+    role === BINARY64_PARITY_PRIMARY &&
+        return "BINARY64_PARITY_PRIMARY"
+    role === FIXED_ROOT_DIAGNOSTIC &&
+        return "FIXED_ROOT_DIAGNOSTIC"
     error("unknown root solve role")
 end
 
@@ -757,6 +767,9 @@ function flatten_request(document)
             policy, "branch_enclosure_radius_abs"
         ),
         "max_newton_iterations" => required(policy, "max_newton_iterations"),
+        "promoted_root_readout_policy" => required(
+            policy, "promoted_root_readout_policy"
+        ),
         "resource_policy_schema" => required(execution_resource, "schema"),
         "resource_policy_version" => required(execution_resource, "version"),
         "resource_policy_sha256" => required(execution_resource, "sha256"),
@@ -869,6 +882,8 @@ function validate_regularised_gsn_policy(request)
             INDEPENDENT_REFERENCE_FIXTURE_RECEIPT_STATUS,
         "independent_reference_fixture_receipt_sha256" =>
             INDEPENDENT_REFERENCE_FIXTURE_RECEIPT_SHA256,
+        "promoted_root_readout_policy" =>
+            PROMOTED_ROOT_READOUT_POLICY_ID,
     )
     for (key, expected) in expected_common
         required(request, key) == expected ||
@@ -3204,7 +3219,8 @@ function enforce_root_readout_feasibility(
         "failure_class" => "CONTROL",
         "limiting_resource" => "cooperative_request_deadline",
         "measured_determinant_seconds" => measured_seconds,
-        "minimum_remaining_determinant_count" => 8,
+        "minimum_remaining_determinant_count" =>
+            minimum_remaining_determinant_count,
         "remaining_wall_time_seconds" => remaining_wall_time_seconds,
         "estimated_mandatory_seconds" => estimated_mandatory_seconds,
         "estimator" => "first-determinant-linear-lower-bound/v1",
@@ -3735,9 +3751,10 @@ function finite_difference_pair(
 ) where {T<:AbstractFloat}
     # Reject malformed stencils before either expensive determinant/ODE sample.
     h = validate_finite_difference_offset(offset; axis=axis)
-    # `determinant_evaluator` exists so the specification can execute this whole
-    # chain against a controlled determinant. Production always leaves it
-    # `nothing` and the authenticated/plain selection below applies.
+    # `determinant_evaluator` exists so specifications and production policies
+    # can select the exact determinant work performed by this stencil. The
+    # promoted binary64-parity path passes the plain evaluator explicitly;
+    # historical callers use the authenticated/plain selection below.
     evaluator = determinant_evaluator !== nothing ? determinant_evaluator :
         (authenticate_controls ?
             authenticated_determinant_progress : determinant_progress)
@@ -3832,7 +3849,9 @@ end
 """
     determinant_upper_bound_abs(T, evaluation)
 
-Return `|D| + eta_D`, the quantity Newton acceptance and damping compare.
+Return `|D| + eta_D`, the quantity historical authenticated Newton acceptance
+and damping compare. The promoted binary64-parity path deliberately compares
+raw `|D|` and retains this upper bound only as telemetry.
 
 Using `|D|` alone treats a determinant that is small only because its own noise
 happens to cancel as though the root were located. Near a QNM the determinant is
@@ -4246,7 +4265,13 @@ function bounded_newton(
     ; determinant_evaluator=determinant_progress,
     minimum_remaining_determinant_count::Int=8,
     propagate_derivative_error::Bool=false,
+    acceptance_policy=nothing,
 ) where {T<:AbstractFloat}
+    binary64_parity = acceptance_policy ==
+        PROMOTED_ROOT_READOUT_POLICY_ID
+    (acceptance_policy === nothing || binary64_parity) || error(
+        "unknown promoted root acceptance policy"
+    )
     frequency_step = validated_frequency_step(T, request)
     tolerance = parse_real(T, request, "root_correction_tolerance")
     maximum_iterations = parse_integer(request, "max_newton_iterations")
@@ -4270,6 +4295,7 @@ function bounded_newton(
         T, initial_determinant
     )
     best_evaluation = initial_determinant
+    best_derivative = nothing
     # The first iteration evaluates the determinant at the initial frequency,
     # which is exactly the value just computed above.  The determinant is a
     # deterministic function of the frequency and the request controls, so carry
@@ -4296,10 +4322,14 @@ function bounded_newton(
             )
         end
         magnitude = abs(residual.value)
-        if determinant_is_better(T, residual, best_evaluation)
+        residual_is_better = binary64_parity ?
+            magnitude < best_residual :
+            determinant_is_better(T, residual, best_evaluation)
+        if residual_is_better
             best_value, best_residual = value, magnitude
             best_upper_bound = determinant_upper_bound_abs(T, residual)
             best_evaluation = residual
+            best_derivative = nothing
         end
         newton_context = Dict{String,Any}(
             "newton_index" => iteration,
@@ -4312,7 +4342,9 @@ function bounded_newton(
             "best_determinant_abs" => string(best_residual),
             "best_determinant_upper_bound_abs" =>
                 string(best_upper_bound),
-            "acceptance_metric" => "newton_correction_estimate_abs",
+            "acceptance_metric" => binary64_parity ?
+                PROMOTED_ROOT_ACCEPTANCE_METRIC_ID :
+                "newton_correction_estimate_abs",
             "acceptance_threshold" => string(tolerance),
         ))
         h = frequency_step * (one(T) + abs(value))
@@ -4347,42 +4379,47 @@ function bounded_newton(
             ))
             break
         end
-        derivative_candidate = derivative_authentication_candidate(
-            derivative,
-            derivative_error_abs,
-            zero(T),
-            h,
-            "real",
-        )
-        if derivative_candidate.authentication === nothing
-            progress_emit("newton_iteration_completed"; context=newton_context, payload=Dict(
-                "derivative_abs" => string(derivative_abs),
-                "derivative_error_abs" => string(derivative_error_abs),
-                "derivative_lower_bound_abs" =>
-                    string(derivative_candidate.lower_bound_abs),
-                "raw_step" => nothing,
-                "applied_step" => nothing,
-                "step_abs" => "0",
-                "clipped" => false,
-                "damping" => "0",
-                "accepted" => false,
-                "resulting_omega" => progress_complex(value),
-                "resulting_determinant_abs" => string(magnitude),
-                "elapsed_seconds" =>
-                    (time_ns() - iteration_started) / 1.0e9,
-            ))
-            break
+        derivative_authentication = nothing
+        derivative_lower_bound = derivative_abs
+        if !binary64_parity
+            derivative_candidate = derivative_authentication_candidate(
+                derivative,
+                derivative_error_abs,
+                zero(T),
+                h,
+                "real",
+            )
+            if derivative_candidate.authentication === nothing
+                progress_emit("newton_iteration_completed"; context=newton_context, payload=Dict(
+                    "derivative_abs" => string(derivative_abs),
+                    "derivative_error_abs" => string(derivative_error_abs),
+                    "derivative_lower_bound_abs" =>
+                        string(derivative_candidate.lower_bound_abs),
+                    "raw_step" => nothing,
+                    "applied_step" => nothing,
+                    "step_abs" => "0",
+                    "clipped" => false,
+                    "damping" => "0",
+                    "accepted" => false,
+                    "resulting_omega" => progress_complex(value),
+                    "resulting_determinant_abs" => string(magnitude),
+                    "elapsed_seconds" =>
+                        (time_ns() - iteration_started) / 1.0e9,
+                ))
+                break
+            end
+            derivative_authentication = derivative_candidate.authentication
+            derivative_lower_bound = derivative_authentication.lower_bound_abs
         end
-        derivative_lower_bound =
-            derivative_candidate.authentication.lower_bound_abs
+        value == best_value && (best_derivative = derivative)
         raw_step = residual.value / derivative
-        correction_abs = residual_upper_bound / derivative_lower_bound
+        correction_abs = binary64_parity ?
+            magnitude / derivative_abs :
+            residual_upper_bound / derivative_lower_bound
         if correction_abs <= tolerance
-            progress_emit("newton_iteration_completed"; context=newton_context, payload=Dict(
+            completion_payload = Dict{String,Any}(
                 "derivative_abs" => string(derivative_abs),
                 "derivative_error_abs" => string(derivative_error_abs),
-                "derivative_lower_bound_abs" =>
-                    string(derivative_lower_bound),
                 "determinant_error_abs" => string(residual_error_abs),
                 "raw_step" => progress_complex(raw_step),
                 "correction_abs" => string(correction_abs),
@@ -4394,9 +4431,18 @@ function bounded_newton(
                 "resulting_omega" => progress_complex(value),
                 "resulting_determinant_abs" => string(magnitude),
                 "elapsed_seconds" => (time_ns() - iteration_started) / 1.0e9,
-            ))
+            )
+            if !binary64_parity
+                completion_payload["derivative_lower_bound_abs"] =
+                    string(derivative_lower_bound)
+            end
+            progress_emit(
+                "newton_iteration_completed";
+                context=newton_context,
+                payload=completion_payload,
+            )
             return value, magnitude, derivative, true, residual,
-                derivative_candidate.authentication
+                derivative_authentication
         end
         step = raw_step
         maximum_step = parse(T, "0.006")
@@ -4419,13 +4465,12 @@ function bounded_newton(
                 value,
             )
             candidate_abs = abs(candidate_residual.value)
-            # Compare error-inclusive bounds, not raw magnitudes. A candidate
-            # whose determinant is smaller only because its noise is larger has
-            # not moved closer to the root.
             candidate_upper_bound = determinant_upper_bound_abs(
                 T, candidate_residual
             )
-            candidate_improves = candidate_upper_bound < residual_upper_bound
+            candidate_improves = binary64_parity ?
+                candidate_abs < magnitude :
+                candidate_upper_bound < residual_upper_bound
             decision_context = merge(
                 newton_context,
                 Dict{String,Any}("candidate_omega" => progress_complex(candidate)),
@@ -4438,6 +4483,9 @@ function bounded_newton(
                     string(determinant_error_abs(T, candidate_residual)),
                 "candidate_upper_bound_abs" => string(candidate_upper_bound),
                 "current_upper_bound_abs" => string(residual_upper_bound),
+                "comparison_metric" => binary64_parity ?
+                    "raw_determinant_abs" :
+                    "determinant_upper_bound_abs",
                 "accepted" => candidate_improves,
             ))
             if candidate_improves
@@ -4448,9 +4496,9 @@ function bounded_newton(
                 accepted = true
                 selected_damping = damping
                 resulting_abs = candidate_abs
-                if determinant_is_better(
-                    T, candidate_residual, best_evaluation
-                )
+                if !binary64_parity && determinant_is_better(
+                        T, candidate_residual, best_evaluation
+                    )
                     best_value, best_residual = candidate, candidate_abs
                     best_upper_bound = candidate_upper_bound
                     best_evaluation = candidate_residual
@@ -4478,8 +4526,14 @@ function bounded_newton(
         ))
         !accepted && break
     end
-    return best_value, best_residual, nothing, false, best_evaluation,
-        nothing
+    if binary64_parity
+        best_derivative === nothing && error(
+            "binary64-parity Newton did not retain a finite derivative"
+        )
+        return best_value, best_residual, best_derivative, false,
+            best_evaluation, nothing
+    end
+    return best_value, best_residual, nothing, false, best_evaluation, nothing
 end
 
 numeric_text(value) = string(value)
@@ -5038,6 +5092,128 @@ function diagnostic_consistency_newton(
         minimum_remaining_determinant_count=
             minimum_remaining_determinant_count,
         propagate_derivative_error=true,
+    )
+end
+
+function solve_binary64_parity_primary(
+    ::Type{T},
+    request,
+    evaluation_context::DeterminantRequestContext{T},
+    initial::Complex{T},
+    amplitude::Complex{T};
+    newton_solver=bounded_newton,
+) where {T<:AbstractFloat}
+    determinant_count_before = DETERMINANT_INDEX_PHASE[]
+    root, residual, newton_derivative, newton_converged,
+        root_evaluation, _ = newton_solver(
+            T,
+            request,
+            evaluation_context,
+            initial,
+            amplitude;
+            determinant_evaluator=determinant_progress,
+            minimum_remaining_determinant_count=2,
+            propagate_derivative_error=false,
+            acceptance_policy=PROMOTED_ROOT_READOUT_POLICY_ID,
+        )
+    newton_derivative === nothing && error(
+        "binary64-parity PRIMARY omitted its complex Newton derivative"
+    )
+    derivative_abs = abs(newton_derivative)
+    isfinite(derivative_abs) && derivative_abs > zero(T) || error(
+        "binary64-parity PRIMARY derivative is invalid"
+    )
+    correction_abs = residual / derivative_abs
+    tolerance = parse_real(T, request, "root_correction_tolerance")
+    accepted = newton_converged && correction_abs <= tolerance
+    branch_identity = string(required(request, "branch_convention"))
+    reference_root = parse_complex(T, request, "omega_re", "omega_im")
+    branch_authenticated =
+        branch_identity == BRANCH_CONVENTION_ID &&
+        abs(root - reference_root) <=
+            parse_real(T, request, "branch_enclosure_radius_abs")
+    determinant_count_after_newton = DETERMINANT_INDEX_PHASE[]
+    determinant_count_after_newton >= determinant_count_before || error(
+        "PRIMARY determinant counter moved backwards"
+    )
+    return (
+        root=root,
+        residual=residual,
+        derivative=newton_derivative,
+        derivative_abs=derivative_abs,
+        correction_abs=correction_abs,
+        converged=accepted,
+        root_evaluation=root_evaluation,
+        root_authentication=nothing,
+        solve_role=BINARY64_PARITY_PRIMARY,
+        authoritative=true,
+        acceptance_metric=PROMOTED_ROOT_ACCEPTANCE_METRIC_ID,
+        root_correction_tolerance=tolerance,
+        newton_determinant_count=
+            determinant_count_after_newton - determinant_count_before,
+        post_newton_determinant_count=0,
+        determinant_error_abs=determinant_error_abs(T, root_evaluation),
+        error_model_id=root_evaluation.error_model_id,
+        branch_identity=branch_identity,
+        branch_authenticated=branch_authenticated,
+        control_identity=phase_control_identity(request),
+    )
+end
+
+function solve_fixed_root_diagnostic(
+    ::Type{T},
+    request,
+    evaluation_context::DeterminantRequestContext{T},
+    phase::String,
+    omega_primary::Complex{T},
+    amplitude::Complex{T},
+    primary_derivative::Complex{T},
+) where {T<:AbstractFloat}
+    phase in ("TRUNCATION", "RESOLUTION") || error(
+        "fixed-root diagnostic phase is invalid"
+    )
+    derivative_abs = abs(primary_derivative)
+    isfinite(derivative_abs) && derivative_abs > zero(T) || error(
+        "fixed-root diagnostic PRIMARY derivative is invalid"
+    )
+    root_evaluation = determinant_progress(
+        T,
+        request,
+        evaluation_context,
+        omega_primary,
+        amplitude,
+        "fixed PRIMARY root",
+        omega_primary,
+    )
+    DETERMINANT_INDEX_PHASE[] == 1 || error(
+        "fixed-root diagnostic must evaluate exactly one determinant"
+    )
+    residual = abs(root_evaluation.value)
+    correction_abs = residual / abs(primary_derivative)
+    tolerance = parse_real(T, request, "root_correction_tolerance")
+    branch_identity = string(required(request, "branch_convention"))
+    branch_authenticated = branch_identity == BRANCH_CONVENTION_ID
+    return (
+        root=omega_primary,
+        residual=residual,
+        derivative=primary_derivative,
+        derivative_abs=derivative_abs,
+        correction_abs=correction_abs,
+        converged=
+            correction_abs <= tolerance && branch_authenticated,
+        root_evaluation=root_evaluation,
+        root_authentication=nothing,
+        solve_role=FIXED_ROOT_DIAGNOSTIC,
+        authoritative=false,
+        fixed_root=true,
+        derivative_source="PRIMARY_COMPLEX",
+        acceptance_metric=PROMOTED_ROOT_ACCEPTANCE_METRIC_ID,
+        root_correction_tolerance=tolerance,
+        determinant_error_abs=determinant_error_abs(T, root_evaluation),
+        error_model_id=root_evaluation.error_model_id,
+        branch_identity=branch_identity,
+        branch_authenticated=branch_authenticated,
+        control_identity=phase_control_identity(request),
     )
 end
 
@@ -5774,6 +5950,7 @@ function solve_phase(
     phase::String, initial::Complex{T}, amplitude::Complex{T};
     solve_role::RootSolveRole,
     authenticated_primary_root=nothing,
+    primary_derivative=nothing,
     seed_kind="AUTHENTICATED_BACKGROUND",
     requested_seed_kind=seed_kind,
     fallback_initial=nothing,
@@ -5811,10 +5988,12 @@ function solve_phase(
                 else
                     LEGACY_FULL_AUTHENTICATION
                 end
-            else
+            elseif solve_role === DIAGNOSTIC_CONSISTENCY
                 DIAGNOSTIC_CONSISTENCY_AUTHENTICATION
+            else
+                nothing
             end
-            progress_emit("root_seed_selected"; payload=Dict(
+            seed_payload = Dict{String,Any}(
                 "requested_seed_kind" => requested_seed_kind,
                 "seed_kind" => selected_kind,
                 "seed_omega" => progress_complex(selected_initial),
@@ -5823,10 +6002,48 @@ function solve_phase(
                 "fallback_error_type" => error_type,
                 "root_phase" => phase,
                 "solve_role" => root_solve_role_text(solve_role),
-                "authentication_mode" =>
-                    authentication_mode_text(selected_mode),
-                "authoritative" => solve_role === FULL_AUTHENTICATION,
-            ))
+                "authoritative" => solve_role in (
+                    FULL_AUTHENTICATION, BINARY64_PARITY_PRIMARY
+                ),
+            )
+            if selected_mode !== nothing
+                seed_payload["authentication_mode"] =
+                    authentication_mode_text(selected_mode)
+            else
+                seed_payload["promoted_root_readout_policy"] =
+                    PROMOTED_ROOT_READOUT_POLICY_ID
+                seed_payload["acceptance_metric"] =
+                    PROMOTED_ROOT_ACCEPTANCE_METRIC_ID
+            end
+            progress_emit("root_seed_selected"; payload=seed_payload)
+            if solve_role === BINARY64_PARITY_PRIMARY
+                return solve_binary64_parity_primary(
+                    T,
+                    request,
+                    evaluation_context,
+                    selected_initial,
+                    amplitude,
+                )
+            elseif solve_role === FIXED_ROOT_DIAGNOSTIC
+                authenticated_primary_root === nothing && error(
+                    "fixed-root diagnostic requires the PRIMARY root"
+                )
+                primary_derivative === nothing && error(
+                    "fixed-root diagnostic requires the complex PRIMARY derivative"
+                )
+                selected_initial == authenticated_primary_root || error(
+                    "fixed-root diagnostic moved the PRIMARY frequency"
+                )
+                return solve_fixed_root_diagnostic(
+                    T,
+                    request,
+                    evaluation_context,
+                    phase,
+                    authenticated_primary_root,
+                    amplitude,
+                    primary_derivative,
+                )
+            end
             if solve_role === FULL_AUTHENTICATION
                 if string(required(request, "mechanism_id")) ==
                         "horizon-admittance"
@@ -5879,12 +6096,32 @@ function solve_phase(
         else
             LEGACY_FULL_AUTHENTICATION
         end
-    else
+    elseif solve_role === DIAGNOSTIC_CONSISTENCY
         DIAGNOSTIC_CONSISTENCY_AUTHENTICATION
+    else
+        nothing
     end
     return progress_scope(context) do
-        progress_emit("root_phase_started"; payload=merge(
-            authentication_progress_payload(
+        phase_started_payload = Dict{String,Any}(
+            "phase" => phase,
+            "root_phase" => phase,
+            "seed_omega" => progress_complex(initial),
+            "current_omega" => progress_complex(initial),
+            "solve_role" => root_solve_role_text(solve_role),
+            "control_identity" => phase_control_identity(request),
+            "root_correction_tolerance" => string(
+                parse_real(T, request, "root_correction_tolerance")
+            ),
+        )
+        if initial_mode === nothing
+            phase_started_payload["promoted_root_readout_policy"] =
+                PROMOTED_ROOT_READOUT_POLICY_ID
+            phase_started_payload["acceptance_metric"] =
+                PROMOTED_ROOT_ACCEPTANCE_METRIC_ID
+            phase_started_payload["authoritative"] =
+                solve_role === BINARY64_PARITY_PRIMARY
+        else
+            merge!(phase_started_payload, authentication_progress_payload(
                 phase,
                 initial_mode,
                 solve_role === FULL_AUTHENTICATION,
@@ -5893,15 +6130,10 @@ function solve_phase(
                 0;
                 root_correction_tolerance=
                     parse_real(T, request, "root_correction_tolerance"),
-            ),
-            Dict{String,Any}(
-                "seed_omega" => progress_complex(initial),
-                "current_omega" => progress_complex(initial),
-                "solve_role" => root_solve_role_text(solve_role),
-                "authenticated_evidence_reused" => false,
-                "control_identity" => phase_control_identity(request),
-            ),
-        ))
+            ))
+            phase_started_payload["authenticated_evidence_reused"] = false
+        end
+        progress_emit("root_phase_started"; payload=phase_started_payload)
         actual_initial = initial
         actual_kind = seed_kind
         fallback_error_type = nothing
@@ -5953,6 +6185,12 @@ function solve_phase(
             determinant_count=DETERMINANT_INDEX_PHASE[],
             determinant_count_phase=DETERMINANT_INDEX_PHASE[],
         ))
+        if solve_role === BINARY64_PARITY_PRIMARY
+            result = merge(result, (
+                newton_determinant_count=DETERMINANT_INDEX_PHASE[],
+                post_newton_determinant_count=0,
+            ))
+        end
         completion_context = Dict{String,Any}(
             "seed_omega" => progress_complex(actual_initial),
             "current_omega" => progress_complex(result.root),
@@ -5960,39 +6198,70 @@ function solve_phase(
             "fallback_used" => fallback_used,
         )
         progress_scope(completion_context) do
-            progress_emit("root_phase_completed"; payload=merge(
-                authentication_progress_payload(phase, result),
-                Dict{String,Any}(
-                    "resulting_omega" => progress_complex(result.root),
-                    "resulting_determinant_abs" => string(result.residual),
-                    "derivative_abs" =>
-                        string(result.derivative_lower_bound_abs),
-                    "branch_identity" => result.branch_identity,
-                    "branch_authenticated" => result.branch_authenticated,
-                    "control_identity" => result.control_identity,
-                    "solve_role" =>
-                        root_solve_role_text(result.solve_role),
-                    "authenticated_evidence_reused" =>
-                        result.authenticated_evidence_reused,
-                    "determinant_count" => result.determinant_count,
-                    "converged" => result.converged,
-                    "elapsed_seconds" =>
-                        (time_ns() - started) / 1.0e9,
-                ),
-            ))
+            completed_payload = Dict{String,Any}(
+                "phase" => phase,
+                "root_phase" => phase,
+                "resulting_omega" => progress_complex(result.root),
+                "resulting_determinant_abs" => string(result.residual),
+                "branch_identity" => result.branch_identity,
+                "branch_authenticated" => result.branch_authenticated,
+                "control_identity" => result.control_identity,
+                "solve_role" => root_solve_role_text(result.solve_role),
+                "determinant_count" => result.determinant_count,
+                "converged" => result.converged,
+                "elapsed_seconds" => (time_ns() - started) / 1.0e9,
+            )
+            if solve_role in (
+                BINARY64_PARITY_PRIMARY, FIXED_ROOT_DIAGNOSTIC
+            )
+                merge!(completed_payload, Dict{String,Any}(
+                    "promoted_root_readout_policy" =>
+                        PROMOTED_ROOT_READOUT_POLICY_ID,
+                    "acceptance_metric" => result.acceptance_metric,
+                    "correction_abs" => string(result.correction_abs),
+                    "root_correction_tolerance" =>
+                        string(result.root_correction_tolerance),
+                    "derivative_abs" => string(result.derivative_abs),
+                    "derivative" => progress_complex(result.derivative),
+                    "authoritative" => result.authoritative,
+                    "determinant_error_abs" =>
+                        string(result.determinant_error_abs),
+                    "error_model_id" => result.error_model_id,
+                ))
+                if solve_role === BINARY64_PARITY_PRIMARY
+                    completed_payload["post_newton_determinant_count"] =
+                        result.post_newton_determinant_count
+                else
+                    completed_payload["fixed_root"] = result.fixed_root
+                    completed_payload["derivative_source"] =
+                        result.derivative_source
+                end
+            else
+                merge!(completed_payload,
+                    authentication_progress_payload(phase, result)
+                )
+                completed_payload["derivative_abs"] =
+                    string(result.derivative_lower_bound_abs)
+                completed_payload["authenticated_evidence_reused"] =
+                    result.authenticated_evidence_reused
+            end
+            progress_emit("root_phase_completed"; payload=completed_payload)
         end
         result
     end
 end
+
 function refined_request(::Type{T}, request, kind::Symbol) where {T<:AbstractFloat}
     output = copy(request)
     if kind == :truncation
         output["endpoint_series_order"] = parse_integer(request, "endpoint_series_order") + 8
     elseif kind == :resolution
-        # PRIMARY already evaluates this exact control identity while building
-        # its determinant-error certificate. The diagnostic evaluator may reuse
-        # that sample only at an exactly identical frequency and request.
-        return tight_control_request(T, request)
+        for key in (
+            "homogeneous_ode_relative_tolerance",
+            "homogeneous_ode_absolute_tolerance",
+        )
+            output[key] = numeric_text(parse_real(T, request, key) / T(2))
+        end
     else
         error("unknown root diagnostic refinement")
     end
@@ -6145,6 +6414,62 @@ function conditioning_response(
     return evidence
 end
 
+function primary_acceptance_text(result)
+    return Dict{String,Any}(
+        "policy_id" => PROMOTED_ROOT_READOUT_POLICY_ID,
+        "acceptance_metric" => result.acceptance_metric,
+        "determinant_re" => numeric_text(real(result.root_evaluation.value)),
+        "determinant_im" => numeric_text(imag(result.root_evaluation.value)),
+        "derivative_re" => numeric_text(real(result.derivative)),
+        "derivative_im" => numeric_text(imag(result.derivative)),
+        "correction_abs" => numeric_text(result.correction_abs),
+        "root_correction_tolerance" =>
+            numeric_text(result.root_correction_tolerance),
+        "accepted" => result.converged,
+        "newton_determinant_count" => result.newton_determinant_count,
+        "post_newton_determinant_count" =>
+            result.post_newton_determinant_count,
+        "determinant_error_abs" =>
+            numeric_text(result.determinant_error_abs),
+        "error_model_id" => result.error_model_id,
+    )
+end
+
+function fixed_root_diagnostic_text(result, authenticated_primary_root)
+    result.root == authenticated_primary_root || error(
+        "fixed-root diagnostic moved the accepted PRIMARY frequency"
+    )
+    return Dict{String,Any}(
+        "policy_id" => PROMOTED_ROOT_READOUT_POLICY_ID,
+        "root_phase" => result.root_phase,
+        "fixed_root" => result.fixed_root,
+        "root_omega_re" => numeric_text(real(result.root)),
+        "root_omega_im" => numeric_text(imag(result.root)),
+        "determinant_re" => numeric_text(real(result.root_evaluation.value)),
+        "determinant_im" => numeric_text(imag(result.root_evaluation.value)),
+        "root_residual_abs" => numeric_text(result.residual),
+        "primary_derivative_re" => numeric_text(real(result.derivative)),
+        "primary_derivative_im" => numeric_text(imag(result.derivative)),
+        "derivative_source" => result.derivative_source,
+        "acceptance_metric" => result.acceptance_metric,
+        "correction_abs" => numeric_text(result.correction_abs),
+        "root_correction_tolerance" =>
+            numeric_text(result.root_correction_tolerance),
+        "determinant_error_abs" =>
+            numeric_text(result.determinant_error_abs),
+        "error_model_id" => result.error_model_id,
+        "displacement_from_primary_abs" =>
+            numeric_text(abs(result.root - authenticated_primary_root)),
+        "branch_identity" => result.branch_identity,
+        "branch_authenticated" => result.branch_authenticated,
+        "control_identity" => result.control_identity,
+        "solve_role" => root_solve_role_text(result.solve_role),
+        "authoritative" => result.authoritative,
+        "determinant_count" => result.determinant_count,
+        "root_converged" => result.converged,
+    )
+end
+
 function diagnostic_root_text(result, authenticated_primary_root)
     return Dict{String,Any}(
         "root_phase" => result.root_phase,
@@ -6246,14 +6571,14 @@ function result_fields(::Type{T}, request, digits::Int, bits::Int) where {T<:Abs
         fallback_initial=fallback_initial,
         fallback_used=primary_fallback_used,
         fallback_reason=primary_fallback_reason,
-        solve_role=FULL_AUTHENTICATION,
+        solve_role=BINARY64_PARITY_PRIMARY,
     )
     root = primary.root
     residual = primary.residual
-    derivative_abs = primary.derivative_lower_bound_abs
+    derivative = primary.derivative
+    derivative_abs = primary.derivative_abs
     primary_converged = primary.converged
     root_evaluation = primary.root_evaluation
-    root_authentication = primary.root_authentication
     branch_tolerance = parse_real(T, request, "branch_enclosure_radius_abs")
     raw_determinant_abs = root_evaluation.diagnostics.raw_determinant_abs
     raw_determinant_evidence_status =
@@ -6289,14 +6614,16 @@ function result_fields(::Type{T}, request, digits::Int, bits::Int) where {T<:Abs
         numerical_conditioning = conditioning_response(
             T, request, evaluation_context, digits
         )
-        branch_valid = abs(root - omega) <= branch_tolerance
+        branch_valid = primary.branch_authenticated
         return [
-            "schema_version" => 6,
+            "schema_version" => 7,
             "status" => "ok",
             "adapter" => "package-owned-julia-gsn-root-readout",
             "request_sha256" => string(required(request, "request_sha256")),
             "precision_digits" => digits,
             "working_precision_bits" => bits,
+            "promoted_root_readout_policy" =>
+                PROMOTED_ROOT_READOUT_POLICY_ID,
             "root_omega_re" => numeric_text(real(root)),
             "root_omega_im" => numeric_text(imag(root)),
             "root_residual_abs" => numeric_text(residual),
@@ -6305,16 +6632,18 @@ function result_fields(::Type{T}, request, digits::Int, bits::Int) where {T<:Abs
             "raw_determinant_evidence_status" =>
                 raw_determinant_evidence_status,
             "root_derivative_abs" => numeric_text(derivative_abs),
-            "root_authentication" =>
-                root_authentication_text(root_authentication),
+            "primary_acceptance" => primary_acceptance_text(primary),
             "root_converged" => false,
-            "branch_authentication_contract_version" => 3,
+            "branch_authentication_contract_version" => 4,
             "root_branch_continuation_valid" => branch_valid,
             "branch_tolerance_abs" => numeric_text(branch_tolerance),
             "root_displacement_abs" => numeric_text(abs(root - omega)),
             "truncation_radius_abs" => nothing,
             "resolution_radius_abs" => nothing,
             "seed_path_radius_abs" => nothing,
+            "seed_path_required" => false,
+            "seed_path_executed" => false,
+            "seed_path_determinant_count" => 0,
             "diagnostic_roots" => Dict{String,Any}(),
             "diagnostics_skipped_reason" => "PRIMARY_NOT_CONVERGED",
             "numerical_conditioning" => numerical_conditioning,
@@ -6328,8 +6657,9 @@ function result_fields(::Type{T}, request, digits::Int, bits::Int) where {T<:Abs
         root,
         amplitude;
         seed_kind="ACCEPTED_PRIMARY",
-        solve_role=DIAGNOSTIC_CONSISTENCY,
+        solve_role=FIXED_ROOT_DIAGNOSTIC,
         authenticated_primary_root=root,
+        primary_derivative=derivative,
     )
     resolution = solve_phase(
         T,
@@ -6339,31 +6669,18 @@ function result_fields(::Type{T}, request, digits::Int, bits::Int) where {T<:Abs
         root,
         amplitude;
         seed_kind="ACCEPTED_PRIMARY",
-        solve_role=DIAGNOSTIC_CONSISTENCY,
+        solve_role=FIXED_ROOT_DIAGNOSTIC,
         authenticated_primary_root=root,
+        primary_derivative=derivative,
     )
-    alternate = omega + Complex{T}(T("0.00025"), T("0.000125")) *
-        (one(T) + abs(omega))
-    seed_path = solve_phase(
-        T,
-        request,
-        evaluation_context,
-        "SEED-PATH",
-        alternate,
-        amplitude;
-        seed_kind="INDEPENDENT_SEED_PATH",
-        solve_role=DIAGNOSTIC_CONSISTENCY,
-        authenticated_primary_root=root,
-    )
-    branch_valid = abs(root - omega) <= branch_tolerance && all(
+    branch_valid = primary.branch_authenticated && all(
         result.branch_authenticated
-        for result in (truncation, resolution, seed_path)
+        for result in (truncation, resolution)
     )
     converged = all((
         primary_converged,
         truncation.converged,
         resolution.converged,
-        seed_path.converged,
         branch_valid,
     ))
     numerical_conditioning = conditioning_response(
@@ -6371,12 +6688,14 @@ function result_fields(::Type{T}, request, digits::Int, bits::Int) where {T<:Abs
     )
 
     return [
-        "schema_version" => 6,
+        "schema_version" => 7,
         "status" => "ok",
         "adapter" => "package-owned-julia-gsn-root-readout",
         "request_sha256" => string(required(request, "request_sha256")),
         "precision_digits" => digits,
         "working_precision_bits" => bits,
+        "promoted_root_readout_policy" =>
+            PROMOTED_ROOT_READOUT_POLICY_ID,
         "root_omega_re" => numeric_text(real(root)),
         "root_omega_im" => numeric_text(imag(root)),
         "root_residual_abs" => numeric_text(residual),
@@ -6385,12 +6704,9 @@ function result_fields(::Type{T}, request, digits::Int, bits::Int) where {T<:Abs
         "raw_determinant_evidence_status" =>
             raw_determinant_evidence_status,
         "root_derivative_abs" => numeric_text(derivative_abs),
-        "root_authentication" =>
-            root_authentication_text(
-                root_authentication; accepted=converged
-            ),
+        "primary_acceptance" => primary_acceptance_text(primary),
         "root_converged" => converged,
-        "branch_authentication_contract_version" => 3,
+        "branch_authentication_contract_version" => 4,
         "root_branch_continuation_valid" => branch_valid,
         "branch_tolerance_abs" => numeric_text(branch_tolerance),
         "root_displacement_abs" => numeric_text(abs(root - omega)),
@@ -6398,12 +6714,13 @@ function result_fields(::Type{T}, request, digits::Int, bits::Int) where {T<:Abs
             numeric_text(abs(truncation.root - root)),
         "resolution_radius_abs" =>
             numeric_text(abs(resolution.root - root)),
-        "seed_path_radius_abs" =>
-            numeric_text(abs(seed_path.root - root)),
+        "seed_path_radius_abs" => nothing,
+        "seed_path_required" => false,
+        "seed_path_executed" => false,
+        "seed_path_determinant_count" => 0,
         "diagnostic_roots" => Dict(
-            "truncation" => diagnostic_root_text(truncation, root),
-            "resolution" => diagnostic_root_text(resolution, root),
-            "seed-path" => diagnostic_root_text(seed_path, root),
+            "truncation" => fixed_root_diagnostic_text(truncation, root),
+            "resolution" => fixed_root_diagnostic_text(resolution, root),
         ),
         "diagnostics_skipped_reason" => nothing,
         "numerical_conditioning" => numerical_conditioning,

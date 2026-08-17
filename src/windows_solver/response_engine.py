@@ -73,21 +73,32 @@ ERROR_CHANNELS = (
 )
 _RECORDED_ROOT_MAPPING_TOLERANCE_ABS = 5.0e-9
 _DIAGNOSTIC_ROOT_FAMILIES = ("truncation", "resolution", "seed-path")
+_PROMOTED_FIXED_ROOT_DIAGNOSTIC_FAMILIES = ("truncation", "resolution")
 NUMERICAL_CONDITIONING_SCHEMA = "windows-solver.m02-conditioning/3"
 HISTORICAL_NUMERICAL_CONDITIONING_SCHEMA = (
     "windows-solver.m02-conditioning/2"
 )
-WORKER_RESPONSE_RECEIPT_SCHEMA = "windows-solver.worker-response-receipt/1"
+PROMOTED_ROOT_READOUT_POLICY = (
+    "binary64-parity-primary-fixed-root-diagnostics/v1"
+)
+PROMOTED_ROOT_ACCEPTANCE_METRIC = (
+    "abs-determinant-over-abs-complex-derivative/v1"
+)
+WORKER_RESPONSE_RECEIPT_SCHEMA = "windows-solver.worker-response-receipt/2"
+HISTORICAL_WORKER_RESPONSE_RECEIPT_SCHEMA = (
+    "windows-solver.worker-response-receipt/1"
+)
 # The promoted worker's root-readout wire schema. Version 4 added the
 # root_authentication record. Version 5 records each diagnostic phase's
 # correction/error evidence and workflow role. Version 6 identifies staged
 # versus escalated authentication and represents unexecuted 2h/ih derivative
-# directions explicitly as absent. Error responses remain independently
-# versioned at 1.
-WORKER_RESPONSE_WIRE_SCHEMA = 6
-HISTORICAL_WORKER_RESPONSE_WIRE_SCHEMAS = frozenset({3, 4, 5})
+# directions explicitly as absent. Version 7 replaces promoted acceptance with
+# binary64-parity PRIMARY Newton and fixed-root TRUNCATION/RESOLUTION evidence.
+# Error responses remain independently versioned at 1.
+WORKER_RESPONSE_WIRE_SCHEMA = 7
+HISTORICAL_WORKER_RESPONSE_WIRE_SCHEMAS = frozenset({3, 4, 5, 6})
 _ROOT_AUTHENTICATION_WIRE_SCHEMAS = frozenset({4, 5, 6})
-_WORKER_RESPONSE_RECEIPT_FIELDS = frozenset({
+_HISTORICAL_WORKER_RESPONSE_RECEIPT_FIELDS = frozenset({
     "schema",
     "request_binding",
     "request_sha256",
@@ -98,6 +109,10 @@ _WORKER_RESPONSE_RECEIPT_FIELDS = frozenset({
     "raw_determinant_evidence_status",
     "receipt_sha256",
 })
+_WORKER_RESPONSE_RECEIPT_FIELDS = _HISTORICAL_WORKER_RESPONSE_RECEIPT_FIELDS | {
+    "promoted_root_readout_policy",
+    "primary_acceptance_sha256",
+}
 _HEX_64 = re.compile(r"[0-9a-f]{64}")
 HORIZON_DETERMINANT_FAMILY = "horizon-scattering/v1"
 EXTERIOR_DETERMINANT_FAMILY = "exterior-wronskian/v1"
@@ -148,6 +163,7 @@ REGULARISED_GSN_CONDITIONING_IDENTITIES: Mapping[str, object] = MappingProxyType
     "determinant_normalisation": HORIZON_DETERMINANT_NORMALISATION,
 })
 _REGULARISED_GSN_COMMON_PRECISION_POLICY: Mapping[str, object] = MappingProxyType({
+    "promoted_root_readout_policy": PROMOTED_ROOT_READOUT_POLICY,
     "homogeneous_representation": "factored-plane-wave-gsn/v1",
     "asymptotic_series_evaluation": "typed-batch-horner-compensated/v1",
     "conditioning_diagnostics": "series-recurrence-basis-fd/v1",
@@ -216,11 +232,12 @@ def regularised_gsn_precision_policy(
     identities describe a different calculation and are correctly treated as
     stale.
 
-    The exterior policy is byte-identical to the one on ``main``, because the
-    exterior path did not change. That is not a courtesy -- receipt reuse is
-    decided by exact equality against this mapping, so an exterior policy that
-    merely *gained a key* would retire every exterior receipt ``main`` ever
-    produced, on account of a rewrite that never touched them.
+    The determinant-family identities remain mechanism-scoped. The promoted
+    root-readout identity is intentionally common to both families, because
+    binary64-parity PRIMARY acceptance and fixed-root diagnostics change how
+    every promoted result is accepted and recorded even when the underlying
+    exterior determinant mathematics is unchanged. Pre-policy receipts for
+    both families are therefore stale by construction.
 
     Hence ``horizon_contour`` and ``determinant_error_model``, both introduced
     by this rewrite, appear only under the mechanism they describe. Adding them
@@ -341,11 +358,19 @@ def _validated_worker_response_receipt(
 ) -> Mapping[str, object] | None:
     if value is None:
         return None
-    if not isinstance(value, Mapping) or set(value) != (
-        _WORKER_RESPONSE_RECEIPT_FIELDS
-    ):
+    if not isinstance(value, Mapping):
         raise ValueError("worker response receipt fields are invalid")
-    if value["schema"] != WORKER_RESPONSE_RECEIPT_SCHEMA:
+    fields = set(value)
+    current = fields == _WORKER_RESPONSE_RECEIPT_FIELDS
+    historical = fields == _HISTORICAL_WORKER_RESPONSE_RECEIPT_FIELDS
+    if not (current or historical):
+        raise ValueError("worker response receipt fields are invalid")
+    expected_schema = (
+        WORKER_RESPONSE_RECEIPT_SCHEMA
+        if current
+        else HISTORICAL_WORKER_RESPONSE_RECEIPT_SCHEMA
+    )
+    if value["schema"] != expected_schema:
         raise ValueError("worker response receipt schema is invalid")
     request_binding = value["request_binding"]
     if not isinstance(request_binding, Mapping):
@@ -359,10 +384,24 @@ def _validated_worker_response_receipt(
             raise ValueError(f"worker response receipt {field} is invalid")
     if value["request_sha256"] != _sha256(dict(request_binding)):
         raise ValueError("worker response receipt request digest is invalid")
-    if value["worker_response_schema_version"] not in (
-        HISTORICAL_WORKER_RESPONSE_WIRE_SCHEMAS | {WORKER_RESPONSE_WIRE_SCHEMA}
-    ):
+    wire_schema = value["worker_response_schema_version"]
+    allowed_wire_schemas = (
+        {WORKER_RESPONSE_WIRE_SCHEMA}
+        if current
+        else HISTORICAL_WORKER_RESPONSE_WIRE_SCHEMAS
+    )
+    if wire_schema not in allowed_wire_schemas:
         raise ValueError("worker response receipt wire schema is invalid")
+    if current:
+        if (
+            value["promoted_root_readout_policy"]
+            != PROMOTED_ROOT_READOUT_POLICY
+            or not isinstance(value["primary_acceptance_sha256"], str)
+            or _HEX_64.fullmatch(value["primary_acceptance_sha256"]) is None
+        ):
+            raise ValueError(
+                "worker response receipt promoted policy identity is invalid"
+            )
     residual = _conditioning_decimal_from_text(
         value["root_residual_abs_text"],
         "worker response receipt root residual",
@@ -991,7 +1030,7 @@ class DeterminantPartials:
 
 @dataclass(frozen=True, slots=True)
 class DiagnosticRootReadout:
-    """One non-primary solve retained for response-space error reduction."""
+    """One non-primary diagnostic retained for response-space reduction."""
 
     omega_delta_from_primary: complex
     determinant_residual_abs: float
@@ -1020,6 +1059,7 @@ class DiagnosticRootReadout:
     guarded_step_disagreement_abs: float | None = None
     propagated_derivative_error_abs: float | None = None
     determinant_count_phase: int | None = None
+    fixed_root_evidence: FixedRootDiagnosticEvidence | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -1039,6 +1079,68 @@ class DiagnosticRootReadout:
             raise ValueError("diagnostic determinant derivative must be positive")
         if type(self.converged) is not bool:
             raise ValueError("converged must be a built-in bool")
+
+        if self.fixed_root_evidence is not None:
+            if not isinstance(
+                self.fixed_root_evidence, FixedRootDiagnosticEvidence
+            ):
+                raise ValueError("fixed-root diagnostic evidence has invalid type")
+            legacy_workflow_evidence = (
+                self.correction_upper_bound,
+                self.determinant_error_abs,
+                self.error_model_id,
+                self.derivative_lower_bound_abs,
+                self.root_correction_tolerance,
+                self.displacement_from_primary_abs,
+                self.branch_identity,
+                self.branch_authenticated,
+                self.control_identity,
+                self.solve_role,
+                self.full_authentication_escalated,
+                self.escalation_reason,
+                self.authenticated_evidence_reused,
+                self.determinant_count,
+                self.root_phase,
+                self.authentication_mode,
+                self.authoritative,
+                self.residual_upper_bound_abs,
+                self.required_derivative_lower_bound_abs,
+                self.raw_step_disagreement_abs,
+                self.guarded_step_disagreement_abs,
+                self.propagated_derivative_error_abs,
+                self.determinant_count_phase,
+            )
+            if any(item is not None for item in legacy_workflow_evidence):
+                raise ValueError(
+                    "fixed-root evidence cannot carry legacy diagnostic workflow"
+                )
+            if self.omega_delta_from_primary != 0.0j:
+                raise ValueError("fixed-root diagnostic moved the PRIMARY root")
+            with localcontext() as context:
+                context.prec = _ROOT_AUTHENTICATION_CHECK_DIGITS
+                residual = float(self.fixed_root_evidence.determinant.magnitude())
+                derivative = float(
+                    self.fixed_root_evidence.primary_derivative.magnitude()
+                )
+            if not math.isclose(
+                self.determinant_residual_abs,
+                residual,
+                rel_tol=1.0e-15,
+                abs_tol=0.0,
+            ) or not math.isclose(
+                self.determinant_derivative_abs,
+                derivative,
+                rel_tol=1.0e-15,
+                abs_tol=0.0,
+            ):
+                raise ValueError(
+                    "fixed-root diagnostic scalars disagree with exact evidence"
+                )
+            if self.converged != self.fixed_root_evidence.accepted:
+                raise ValueError(
+                    "fixed-root diagnostic convergence is inconsistent"
+                )
+            return
 
         if self.solve_role is None:
             optional_evidence = (
@@ -1328,6 +1430,10 @@ class DiagnosticRootReadout:
                         self.determinant_count_phase
                     ),
                 })
+        if self.fixed_root_evidence is not None:
+            output["fixed_root_evidence"] = (
+                self.fixed_root_evidence.to_mapping()
+            )
         return output
 
     @classmethod
@@ -1460,6 +1566,13 @@ class DiagnosticRootReadout:
                 if "authentication_mode" in value
                 else None
             ),
+            fixed_root_evidence=(
+                None
+                if "fixed_root_evidence" not in value
+                else FixedRootDiagnosticEvidence.from_mapping(
+                    value["fixed_root_evidence"]
+                )
+            ),
         )
 
 # Wide enough that re-forming the worker's product in decimal is exact well
@@ -1554,6 +1667,315 @@ def _authentication_complex_from_mapping(
             value["imaginary"], f"{subject} imaginary"
         ),
     )
+
+
+@dataclass(frozen=True, slots=True)
+class PrimaryRootAcceptanceEvidence:
+    """Exact evidence for the promoted binary64-parity PRIMARY decision."""
+
+    policy_id: str
+    acceptance_metric: str
+    determinant: DecimalComplex
+    derivative: DecimalComplex
+    correction_abs: Decimal
+    root_correction_tolerance: Decimal
+    accepted: bool
+    newton_determinant_count: int
+    post_newton_determinant_count: int
+    determinant_error_abs: Decimal
+    error_model_id: str | None
+
+    def __post_init__(self) -> None:
+        if self.policy_id != PROMOTED_ROOT_READOUT_POLICY:
+            raise ValueError("PRIMARY promoted policy identity is invalid")
+        if self.acceptance_metric != PROMOTED_ROOT_ACCEPTANCE_METRIC:
+            raise ValueError("PRIMARY acceptance metric identity is invalid")
+        if not isinstance(self.determinant, DecimalComplex):
+            raise ValueError("PRIMARY determinant evidence is invalid")
+        if not isinstance(self.derivative, DecimalComplex):
+            raise ValueError("PRIMARY derivative evidence is invalid")
+        for name in (
+            "correction_abs",
+            "root_correction_tolerance",
+            "determinant_error_abs",
+        ):
+            value = getattr(self, name)
+            if type(value) is not Decimal or not value.is_finite() or value < 0:
+                raise ValueError(f"PRIMARY {name} must be finite and nonnegative")
+        if self.root_correction_tolerance <= 0:
+            raise ValueError("PRIMARY correction tolerance must be positive")
+        if type(self.accepted) is not bool:
+            raise ValueError("PRIMARY accepted flag is invalid")
+        if (
+            type(self.newton_determinant_count) is not int
+            or self.newton_determinant_count < 1
+        ):
+            raise ValueError("PRIMARY Newton determinant count is invalid")
+        if (
+            type(self.post_newton_determinant_count) is not int
+            or self.post_newton_determinant_count != 0
+        ):
+            raise ValueError("PRIMARY performed post-Newton determinant work")
+        if self.error_model_id is None:
+            if self.determinant_error_abs != 0:
+                raise ValueError(
+                    "PRIMARY determinant telemetry lacks its error-model identity"
+                )
+        elif not isinstance(self.error_model_id, str) or not self.error_model_id:
+            raise ValueError("PRIMARY error-model identity is invalid")
+        with localcontext() as context:
+            context.prec = _ROOT_AUTHENTICATION_CHECK_DIGITS
+            derivative_abs = self.derivative.magnitude()
+            if derivative_abs <= 0:
+                raise ValueError("PRIMARY derivative magnitude must be positive")
+            expected_correction = self.determinant.magnitude() / derivative_abs
+            if not _authentication_relation_matches(
+                self.correction_abs, expected_correction
+            ):
+                raise ValueError("PRIMARY raw correction is inconsistent")
+            if self.accepted != (
+                self.correction_abs <= self.root_correction_tolerance
+            ):
+                raise ValueError("PRIMARY acceptance decision is inconsistent")
+
+    def to_mapping(self) -> dict[str, object]:
+        return {
+            "policy_id": self.policy_id,
+            "acceptance_metric": self.acceptance_metric,
+            "determinant_re": str(self.determinant.real),
+            "determinant_im": str(self.determinant.imaginary),
+            "derivative_re": str(self.derivative.real),
+            "derivative_im": str(self.derivative.imaginary),
+            "correction_abs": str(self.correction_abs),
+            "root_correction_tolerance": str(self.root_correction_tolerance),
+            "accepted": self.accepted,
+            "newton_determinant_count": self.newton_determinant_count,
+            "post_newton_determinant_count": (
+                self.post_newton_determinant_count
+            ),
+            "determinant_error_abs": str(self.determinant_error_abs),
+            "error_model_id": self.error_model_id,
+        }
+
+    @classmethod
+    def from_mapping(cls, value: object) -> "PrimaryRootAcceptanceEvidence":
+        fields = {
+            "policy_id",
+            "acceptance_metric",
+            "determinant_re",
+            "determinant_im",
+            "derivative_re",
+            "derivative_im",
+            "correction_abs",
+            "root_correction_tolerance",
+            "accepted",
+            "newton_determinant_count",
+            "post_newton_determinant_count",
+            "determinant_error_abs",
+            "error_model_id",
+        }
+        if not isinstance(value, Mapping) or set(value) != fields:
+            raise ValueError("PRIMARY acceptance evidence fields are invalid")
+        if type(value["accepted"]) is not bool:
+            raise ValueError("PRIMARY accepted flag is invalid")
+        return cls(
+            policy_id=str(value["policy_id"]),
+            acceptance_metric=str(value["acceptance_metric"]),
+            determinant=DecimalComplex(
+                _conditioning_decimal_from_text(
+                    value["determinant_re"], "PRIMARY determinant real"
+                ),
+                _conditioning_decimal_from_text(
+                    value["determinant_im"], "PRIMARY determinant imaginary"
+                ),
+            ),
+            derivative=DecimalComplex(
+                _conditioning_decimal_from_text(
+                    value["derivative_re"], "PRIMARY derivative real"
+                ),
+                _conditioning_decimal_from_text(
+                    value["derivative_im"], "PRIMARY derivative imaginary"
+                ),
+            ),
+            correction_abs=_conditioning_decimal_from_text(
+                value["correction_abs"], "PRIMARY correction"
+            ),
+            root_correction_tolerance=_conditioning_decimal_from_text(
+                value["root_correction_tolerance"], "PRIMARY tolerance"
+            ),
+            accepted=value["accepted"],
+            newton_determinant_count=value["newton_determinant_count"],
+            post_newton_determinant_count=(
+                value["post_newton_determinant_count"]
+            ),
+            determinant_error_abs=_conditioning_decimal_from_text(
+                value["determinant_error_abs"],
+                "PRIMARY determinant error telemetry",
+            ),
+            error_model_id=value["error_model_id"],
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class FixedRootDiagnosticEvidence:
+    """One fixed-frequency determinant checked with the complex PRIMARY D′."""
+
+    policy_id: str
+    acceptance_metric: str
+    root_phase: str
+    determinant: DecimalComplex
+    primary_derivative: DecimalComplex
+    correction_abs: Decimal
+    root_correction_tolerance: Decimal
+    determinant_error_abs: Decimal
+    error_model_id: str | None
+    control_identity: str
+    branch_identity: str
+    branch_authenticated: bool
+    determinant_count: int
+    accepted: bool
+    fixed_root: bool
+    derivative_source: str
+
+    def __post_init__(self) -> None:
+        if self.policy_id != PROMOTED_ROOT_READOUT_POLICY:
+            raise ValueError("fixed-root promoted policy identity is invalid")
+        if self.acceptance_metric != PROMOTED_ROOT_ACCEPTANCE_METRIC:
+            raise ValueError("fixed-root acceptance metric is invalid")
+        if self.root_phase not in {"TRUNCATION", "RESOLUTION"}:
+            raise ValueError("fixed-root diagnostic phase is invalid")
+        if not isinstance(self.determinant, DecimalComplex):
+            raise ValueError("fixed-root determinant evidence is invalid")
+        if not isinstance(self.primary_derivative, DecimalComplex):
+            raise ValueError("fixed-root PRIMARY derivative evidence is invalid")
+        if self.fixed_root is not True:
+            raise ValueError("fixed-root diagnostic moved the PRIMARY frequency")
+        if self.derivative_source != "PRIMARY_COMPLEX":
+            raise ValueError("fixed-root derivative source is invalid")
+        if type(self.determinant_count) is not int or self.determinant_count != 1:
+            raise ValueError("fixed-root diagnostic determinant count is not one")
+        if type(self.branch_authenticated) is not bool or type(self.accepted) is not bool:
+            raise ValueError("fixed-root boolean evidence is invalid")
+        for name in ("control_identity", "branch_identity"):
+            if not isinstance(getattr(self, name), str) or not getattr(self, name):
+                raise ValueError(f"fixed-root {name} is invalid")
+        for name in (
+            "correction_abs",
+            "root_correction_tolerance",
+            "determinant_error_abs",
+        ):
+            item = getattr(self, name)
+            if type(item) is not Decimal or not item.is_finite() or item < 0:
+                raise ValueError(f"fixed-root {name} is invalid")
+        if self.root_correction_tolerance <= 0:
+            raise ValueError("fixed-root correction tolerance must be positive")
+        if self.error_model_id is None:
+            if self.determinant_error_abs != 0:
+                raise ValueError("fixed-root error telemetry lacks its model")
+        elif not isinstance(self.error_model_id, str) or not self.error_model_id:
+            raise ValueError("fixed-root error-model identity is invalid")
+        with localcontext() as context:
+            context.prec = _ROOT_AUTHENTICATION_CHECK_DIGITS
+            derivative_abs = self.primary_derivative.magnitude()
+            if derivative_abs <= 0:
+                raise ValueError("fixed-root PRIMARY derivative is zero")
+            expected = self.determinant.magnitude() / derivative_abs
+            if not _authentication_relation_matches(self.correction_abs, expected):
+                raise ValueError("fixed-root raw correction is inconsistent")
+            expected_accepted = (
+                self.branch_authenticated
+                and self.correction_abs <= self.root_correction_tolerance
+            )
+            if self.accepted != expected_accepted:
+                raise ValueError("fixed-root acceptance decision is inconsistent")
+
+    def to_mapping(self) -> dict[str, object]:
+        return {
+            "policy_id": self.policy_id,
+            "acceptance_metric": self.acceptance_metric,
+            "root_phase": self.root_phase,
+            "determinant_re": str(self.determinant.real),
+            "determinant_im": str(self.determinant.imaginary),
+            "primary_derivative_re": str(self.primary_derivative.real),
+            "primary_derivative_im": str(self.primary_derivative.imaginary),
+            "correction_abs": str(self.correction_abs),
+            "root_correction_tolerance": str(self.root_correction_tolerance),
+            "determinant_error_abs": str(self.determinant_error_abs),
+            "error_model_id": self.error_model_id,
+            "control_identity": self.control_identity,
+            "branch_identity": self.branch_identity,
+            "branch_authenticated": self.branch_authenticated,
+            "determinant_count": self.determinant_count,
+            "accepted": self.accepted,
+            "fixed_root": self.fixed_root,
+            "derivative_source": self.derivative_source,
+        }
+
+    @classmethod
+    def from_mapping(cls, value: object) -> "FixedRootDiagnosticEvidence":
+        fields = {
+            "policy_id",
+            "acceptance_metric",
+            "root_phase",
+            "determinant_re",
+            "determinant_im",
+            "primary_derivative_re",
+            "primary_derivative_im",
+            "correction_abs",
+            "root_correction_tolerance",
+            "determinant_error_abs",
+            "error_model_id",
+            "control_identity",
+            "branch_identity",
+            "branch_authenticated",
+            "determinant_count",
+            "accepted",
+            "fixed_root",
+            "derivative_source",
+        }
+        if not isinstance(value, Mapping) or set(value) != fields:
+            raise ValueError("fixed-root diagnostic evidence fields are invalid")
+        return cls(
+            policy_id=str(value["policy_id"]),
+            acceptance_metric=str(value["acceptance_metric"]),
+            root_phase=str(value["root_phase"]),
+            determinant=DecimalComplex(
+                _conditioning_decimal_from_text(
+                    value["determinant_re"], "fixed-root determinant real"
+                ),
+                _conditioning_decimal_from_text(
+                    value["determinant_im"], "fixed-root determinant imaginary"
+                ),
+            ),
+            primary_derivative=DecimalComplex(
+                _conditioning_decimal_from_text(
+                    value["primary_derivative_re"],
+                    "fixed-root PRIMARY derivative real",
+                ),
+                _conditioning_decimal_from_text(
+                    value["primary_derivative_im"],
+                    "fixed-root PRIMARY derivative imaginary",
+                ),
+            ),
+            correction_abs=_conditioning_decimal_from_text(
+                value["correction_abs"], "fixed-root correction"
+            ),
+            root_correction_tolerance=_conditioning_decimal_from_text(
+                value["root_correction_tolerance"], "fixed-root tolerance"
+            ),
+            determinant_error_abs=_conditioning_decimal_from_text(
+                value["determinant_error_abs"],
+                "fixed-root determinant error telemetry",
+            ),
+            error_model_id=value["error_model_id"],
+            control_identity=str(value["control_identity"]),
+            branch_identity=str(value["branch_identity"]),
+            branch_authenticated=value["branch_authenticated"],
+            determinant_count=value["determinant_count"],
+            accepted=value["accepted"],
+            fixed_root=value["fixed_root"],
+            derivative_source=str(value["derivative_source"]),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -2455,11 +2877,15 @@ class RootReadout:
     raw_determinant_abs: Decimal | None = None
     raw_determinant_evidence_status: str | None = None
     worker_response_receipt: Mapping[str, object] | None = None
-    # The error-aware terms the convergence decision was actually made on.
-    # Carried past the backend so a stored readout can be re-checked rather
-    # than trusted: without it, "converged" is an assertion with no evidence
-    # behind it once the worker output is gone.
+    # Historical error-aware acceptance terms. Current promoted readouts carry
+    # their raw binary64-parity decision in ``primary_acceptance`` below. Both
+    # forms survive the backend so persisted convergence can be re-checked.
     root_authentication: RootAuthenticationEvidence | None = None
+    promoted_root_readout_policy: str | None = None
+    primary_acceptance: PrimaryRootAcceptanceEvidence | None = None
+    seed_path_required: bool | None = None
+    seed_path_executed: bool | None = None
+    seed_path_determinant_count: int | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "omega", _finite_complex(self.omega, "root omega"))
@@ -2493,6 +2919,62 @@ class RootReadout:
             self.root_authentication, RootAuthenticationEvidence
         ):
             raise ValueError("root readout root authentication has invalid type")
+        promoted = self.promoted_root_readout_policy is not None
+        if promoted:
+            if self.promoted_root_readout_policy != PROMOTED_ROOT_READOUT_POLICY:
+                raise ValueError("root readout promoted policy identity is invalid")
+            if not isinstance(
+                self.primary_acceptance, PrimaryRootAcceptanceEvidence
+            ):
+                raise ValueError("root readout PRIMARY acceptance is missing")
+            if self.root_authentication is not None:
+                raise ValueError(
+                    "binary64-parity readout cannot carry legacy authentication"
+                )
+            if (
+                self.seed_path_required is not False
+                or self.seed_path_executed is not False
+                or self.seed_path_determinant_count != 0
+                or self.seed_path_radius is not None
+            ):
+                raise ValueError("root readout SEED-PATH omission is inconsistent")
+            with localcontext() as context:
+                context.prec = _ROOT_AUTHENTICATION_CHECK_DIGITS
+                primary_residual = self.primary_acceptance.determinant.magnitude()
+                primary_derivative = self.primary_acceptance.derivative.magnitude()
+            if (
+                self.normalised_determinant_abs is None
+                or not _authentication_relation_matches(
+                    self.normalised_determinant_abs,
+                    primary_residual,
+                    primary_residual,
+                )
+                or not math.isclose(
+                    self.determinant_derivative_abs,
+                    float(primary_derivative),
+                    rel_tol=1.0e-15,
+                    abs_tol=0.0,
+                )
+            ):
+                raise ValueError(
+                    "root readout scalars disagree with PRIMARY acceptance"
+                )
+            if self.converged and not self.primary_acceptance.accepted:
+                raise ValueError(
+                    "converged root readout has rejected PRIMARY acceptance"
+                )
+        elif any(
+            value is not None
+            for value in (
+                self.primary_acceptance,
+                self.seed_path_required,
+                self.seed_path_executed,
+                self.seed_path_determinant_count,
+            )
+        ):
+            raise ValueError(
+                "promoted root evidence requires its policy identity"
+            )
         for name in ("normalised_determinant_abs", "raw_determinant_abs"):
             value = getattr(self, name)
             if value is None:
@@ -2577,6 +3059,17 @@ class RootReadout:
                 raise ValueError(
                     "worker response receipt disagrees with root readout evidence"
                 )
+            if receipt["schema"] == WORKER_RESPONSE_RECEIPT_SCHEMA:
+                if (
+                    not promoted
+                    or receipt["promoted_root_readout_policy"]
+                    != self.promoted_root_readout_policy
+                    or receipt["primary_acceptance_sha256"]
+                    != _sha256(self.primary_acceptance.to_mapping())
+                ):
+                    raise ValueError(
+                        "worker response receipt disagrees with promoted acceptance"
+                    )
             copied_receipt = dict(receipt)
             copied_receipt["request_binding"] = MappingProxyType(
                 dict(receipt["request_binding"])
@@ -2668,18 +3161,44 @@ class RootReadout:
             _validated_source_root_mapping(self.source_root_mapping),
         )
         diagnostics = self.diagnostic_readouts
-        if diagnostics is None:
+        diagnostics_were_skipped = (
+            isinstance(diagnostics, Mapping)
+            and not diagnostics
+            and self.diagnostics_skipped_reason == "PRIMARY_NOT_CONVERGED"
+            and not self.converged
+        )
+        if diagnostics is None or diagnostics_were_skipped:
             object.__setattr__(self, "diagnostic_readouts", MappingProxyType({}))
         else:
+            expected_diagnostic_families = (
+                _PROMOTED_FIXED_ROOT_DIAGNOSTIC_FAMILIES
+                if promoted
+                else _DIAGNOSTIC_ROOT_FAMILIES
+            )
             if not isinstance(diagnostics, Mapping) or set(diagnostics) != set(
-                _DIAGNOSTIC_ROOT_FAMILIES
+                expected_diagnostic_families
             ):
                 raise ValueError("diagnostic root readouts are incomplete")
             copied: dict[str, DiagnosticRootReadout] = {}
-            for family in _DIAGNOSTIC_ROOT_FAMILIES:
+            for family in expected_diagnostic_families:
                 readout = diagnostics[family]
                 if not isinstance(readout, DiagnosticRootReadout):
                     raise ValueError("diagnostic root readout has invalid type")
+                if promoted:
+                    evidence = readout.fixed_root_evidence
+                    if (
+                        evidence is None
+                        or evidence.root_phase
+                        != {
+                            "truncation": "TRUNCATION",
+                            "resolution": "RESOLUTION",
+                        }[family]
+                        or evidence.primary_derivative
+                        != self.primary_acceptance.derivative
+                    ):
+                        raise ValueError(
+                            "fixed-root diagnostic did not reuse PRIMARY derivative"
+                        )
                 copied[family] = readout
             if self.converged and not all(item.converged for item in copied.values()):
                 raise ValueError("converged primary readout has failed diagnostics")
@@ -2711,30 +3230,33 @@ class RootReadout:
                         f"{family} diagnostic root displacement is inconsistent"
                     )
         skipped = self.diagnostics_skipped_reason
+        diagnostic_radii = (
+            (self.truncation_radius, self.resolution_radius)
+            if promoted
+            else (
+                self.truncation_radius,
+                self.resolution_radius,
+                self.seed_path_radius,
+            )
+        )
         if skipped is not None:
             if (
                 skipped != "PRIMARY_NOT_CONVERGED"
                 or self.converged
                 or self.diagnostic_readouts
-                or any(
-                    value is not None
-                    for value in (
-                        self.truncation_radius,
-                        self.resolution_radius,
-                        self.seed_path_radius,
-                    )
-                )
+                or any(value is not None for value in diagnostic_radii)
+                or (promoted and self.primary_acceptance.accepted)
             ):
                 raise ValueError("root diagnostic skip evidence is inconsistent")
-        elif any(
-            value is None
-            for value in (
-                self.truncation_radius,
-                self.resolution_radius,
-                self.seed_path_radius,
-            )
-        ):
+        elif any(value is None for value in diagnostic_radii):
             raise ValueError("root diagnostic radii are missing without a reason")
+        if (
+            promoted
+            and skipped is None
+            and set(self.diagnostic_readouts)
+            != set(_PROMOTED_FIXED_ROOT_DIAGNOSTIC_FAMILIES)
+        ):
+            raise ValueError("promoted fixed-root diagnostics are incomplete")
 
     @property
     def newton_correction_estimate(self) -> float:
@@ -2762,7 +3284,7 @@ class RootReadout:
         if self.diagnostic_readouts:
             output["diagnostic_readouts"] = {
                 family: self.diagnostic_readouts[family].to_mapping()
-                for family in _DIAGNOSTIC_ROOT_FAMILIES
+                for family in self.diagnostic_readouts
             }
         if self.diagnostics_skipped_reason is not None:
             output["diagnostics_skipped_reason"] = self.diagnostics_skipped_reason
@@ -2782,6 +3304,18 @@ class RootReadout:
             output["root_authentication"] = (
                 self.root_authentication.to_mapping()
             )
+        if self.promoted_root_readout_policy is not None:
+            output.update({
+                "promoted_root_readout_policy": (
+                    self.promoted_root_readout_policy
+                ),
+                "primary_acceptance": self.primary_acceptance.to_mapping(),
+                "seed_path_required": self.seed_path_required,
+                "seed_path_executed": self.seed_path_executed,
+                "seed_path_determinant_count": (
+                    self.seed_path_determinant_count
+                ),
+            })
         if self.worker_response_receipt is not None:
             output["worker_response_receipt"] = {
                 **dict(self.worker_response_receipt),
@@ -2823,9 +3357,11 @@ class RootReadout:
                 if "diagnostic_readouts" not in value
                 else {
                     family: DiagnosticRootReadout.from_mapping(
-                        value["diagnostic_readouts"][family]
+                        diagnostic
                     )
-                    for family in _DIAGNOSTIC_ROOT_FAMILIES
+                    for family, diagnostic in value[
+                        "diagnostic_readouts"
+                    ].items()
                 }
             ),
             source_root_mapping=_validated_source_root_mapping(
@@ -2875,6 +3411,21 @@ class RootReadout:
                     value["root_authentication"]
                 )
             ),
+            promoted_root_readout_policy=value.get(
+                "promoted_root_readout_policy"
+            ),
+            primary_acceptance=(
+                None
+                if value.get("primary_acceptance") is None
+                else PrimaryRootAcceptanceEvidence.from_mapping(
+                    value["primary_acceptance"]
+                )
+            ),
+            seed_path_required=value.get("seed_path_required"),
+            seed_path_executed=value.get("seed_path_executed"),
+            seed_path_determinant_count=value.get(
+                "seed_path_determinant_count"
+            ),
         )
 
 
@@ -2899,6 +3450,20 @@ def root_readout_preserves_authenticated_branch(
 
     expected_source = _validated_source_root_mapping(source_root_mapping)
     branch_radius = mode_specific_branch_enclosure_radius(authenticated_root)
+    diagnostic_radii_preserve_branch = (
+        readout.truncation_radius is not None
+        and readout.resolution_radius is not None
+        and readout.truncation_radius <= branch_radius
+        and readout.resolution_radius <= branch_radius
+        and (
+            readout.promoted_root_readout_policy
+            == PROMOTED_ROOT_READOUT_POLICY
+            or (
+                readout.seed_path_radius is not None
+                and readout.seed_path_radius <= branch_radius
+            )
+        )
+    )
     return (
         readout.root_reference_id == authenticated_root.root_reference_id
         and readout.branch_id == authenticated_root.branch_id
@@ -2910,14 +3475,7 @@ def root_readout_preserves_authenticated_branch(
         <= ROOT_BRANCH_CONTINUATION_TOLERANCE_ABS
         and (
             readout.diagnostics_skipped_reason == "PRIMARY_NOT_CONVERGED"
-            or (
-                readout.truncation_radius is not None
-                and readout.resolution_radius is not None
-                and readout.seed_path_radius is not None
-                and readout.truncation_radius <= branch_radius
-                and readout.resolution_radius <= branch_radius
-                and readout.seed_path_radius <= branch_radius
-            )
+            or diagnostic_radii_preserve_branch
         )
     )
 
@@ -3765,23 +4323,33 @@ def run_component(
     live_diagnostics = all(item.diagnostic_readouts for item in signed_readouts)
     if not live_diagnostics and any(item.diagnostic_readouts for item in signed_readouts):
         raise ValueError("signed diagnostic root evidence is incomplete")
-    diagnostic_channels = (
-        {
+    if live_diagnostics:
+        diagnostic_families = tuple(signed_readouts[0].diagnostic_readouts)
+        if any(
+            tuple(item.diagnostic_readouts) != diagnostic_families
+            for item in signed_readouts[1:]
+        ) or frozenset(diagnostic_families) not in {
+            frozenset(_DIAGNOSTIC_ROOT_FAMILIES),
+            frozenset(_PROMOTED_FIXED_ROOT_DIAGNOSTIC_FAMILIES),
+        }:
+            raise ValueError("signed diagnostic root families are inconsistent")
+        diagnostic_channels = {
             family: _diagnostic_response_channel(
                 levels,
                 family,
                 primary_center=combined_estimate.center,
                 primary_radius=combined_estimate.root_radius,
             )
-            for family in _DIAGNOSTIC_ROOT_FAMILIES
+            for family in diagnostic_families
         }
-        if live_diagnostics
-        else {
+        if "seed-path" not in diagnostic_channels:
+            diagnostic_channels["seed-path"] = 0.0
+    else:
+        diagnostic_channels = {
             "truncation": max(item.truncation_radius for item in raw),
             "resolution": max(item.resolution_radius for item in raw),
             "seed-path": max(item.seed_path_radius for item in raw),
         }
-    )
     channels = {
         "signed-root": combined_estimate.root_radius,
         **diagnostic_channels,

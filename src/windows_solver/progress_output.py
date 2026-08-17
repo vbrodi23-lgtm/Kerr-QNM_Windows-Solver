@@ -287,6 +287,18 @@ _AUTHENTICATION_LIVE_STATE_KEYS = (
     "root_correction_tolerance",
     "root_authentication_accepted",
 )
+_PROMOTED_ACCEPTANCE_LIVE_STATE_KEYS = (
+    "promoted_root_readout_policy",
+    "acceptance_metric",
+    "correction_abs",
+    "derivative_abs",
+    "derivative",
+    "post_newton_determinant_count",
+    "fixed_root",
+    "derivative_source",
+    "determinant_error_abs",
+    "error_model_id",
+)
 _PRECISION_LIVE_STATE_KEYS = (
     "phase",
     "seed_kind",
@@ -310,6 +322,7 @@ _PRECISION_LIVE_STATE_KEYS = (
     "amplitude",
     *_CONDITIONING_LIVE_STATE_KEYS,
     *_AUTHENTICATION_LIVE_STATE_KEYS,
+    *_PROMOTED_ACCEPTANCE_LIVE_STATE_KEYS,
     *_RADIAL_PROGRESS_STATE_KEYS,
     *_ODE_PROGRESS_STATE_KEYS,
 )
@@ -716,6 +729,7 @@ class CampaignProgressReporter:
                 "raw_step_disagreement_abs",
                 "guarded_step_disagreement_abs",
                 "propagated_derivative_error_abs",
+                *_PROMOTED_ACCEPTANCE_LIVE_STATE_KEYS,
             )
             if any(key in payload for key in workflow_keys):
                 root_solve.update({
@@ -1173,6 +1187,7 @@ class CampaignProgressReporter:
                 "raw_step_disagreement_abs",
                 "guarded_step_disagreement_abs",
                 "propagated_derivative_error_abs",
+                *_PROMOTED_ACCEPTANCE_LIVE_STATE_KEYS,
             ):
                 self._dashboard_state[name] = payload.get(name)
             self._dashboard_state["phase_determinant_count"] = 0
@@ -1212,6 +1227,7 @@ class CampaignProgressReporter:
                 "raw_step_disagreement_abs",
                 "guarded_step_disagreement_abs",
                 "propagated_derivative_error_abs",
+                *_PROMOTED_ACCEPTANCE_LIVE_STATE_KEYS,
             ):
                 self._dashboard_state[name] = payload.get(name)
             self._dashboard_state["phase_determinant_count"] = payload.get(
@@ -1236,6 +1252,7 @@ class CampaignProgressReporter:
                 "raw_step_disagreement_abs",
                 "guarded_step_disagreement_abs",
                 "propagated_derivative_error_abs",
+                *_PROMOTED_ACCEPTANCE_LIVE_STATE_KEYS,
             ):
                 self._dashboard_state[name] = payload.get(name)
             self._dashboard_state["phase_determinant_count"] = payload.get(
@@ -2438,6 +2455,22 @@ class CampaignProgressReporter:
             "phase_propagated_derivative_error_abs": state.get(
                 "propagated_derivative_error_abs"
             ),
+            "phase_promoted_root_readout_policy": state.get(
+                "promoted_root_readout_policy"
+            ),
+            "phase_acceptance_metric": state.get("acceptance_metric"),
+            "phase_correction_abs": state.get("correction_abs"),
+            "phase_derivative_abs": state.get("derivative_abs"),
+            "phase_derivative": state.get("derivative"),
+            "phase_post_newton_determinant_count": state.get(
+                "post_newton_determinant_count"
+            ),
+            "phase_fixed_root": state.get("fixed_root"),
+            "phase_derivative_source": state.get("derivative_source"),
+            "phase_determinant_error_abs": state.get(
+                "determinant_error_abs"
+            ),
+            "phase_error_model_id": state.get("error_model_id"),
             "promotion_reason": state.get("promotion_reason"),
             "seed_kind": state.get("seed_kind"),
             "seed_authenticated": state.get("seed_authenticated"),
