@@ -1142,6 +1142,10 @@ $candidate | ConvertTo-Json -Compress | Set-Content -LiteralPath $env:M02_TEST_J
             "finite-difference-request-policy/v1",
             "binary64-parity-primary-fixed-root-diagnostics/v1",
             "abs-determinant-over-abs-complex-derivative/v1",
+            "single-promoted-root-analytic-horizon-component/v1",
+            "analytic-horizon-from-promoted-primary-derivative/v1",
+            "single-promoted-horizon-root-after-80-preflight/v1",
+            "NOT_REQUIRED_BY_V1_4_PROMOTED_ROOT_POLICY",
         })
         lineage_character = r"A-Za-z0-9_/:;=+\-"
         approved_identity = re.compile(

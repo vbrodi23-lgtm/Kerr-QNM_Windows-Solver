@@ -84,6 +84,13 @@ PROMOTED_ROOT_READOUT_POLICY = (
 PROMOTED_ROOT_ACCEPTANCE_METRIC = (
     "abs-determinant-over-abs-complex-derivative/v1"
 )
+PROMOTED_HORIZON_COMPONENT_IDENTITY = (
+    "single-promoted-root-analytic-horizon-component/v1"
+)
+PROMOTED_HORIZON_RESPONSE_METHOD = (
+    "analytic-horizon-from-promoted-primary-derivative/v1"
+)
+UNCALIBRATED_ANALYTIC_RESPONSE = "UNCALIBRATED_ANALYTIC_RESPONSE"
 WORKER_RESPONSE_RECEIPT_SCHEMA = "windows-solver.worker-response-receipt/2"
 HISTORICAL_WORKER_RESPONSE_RECEIPT_SCHEMA = (
     "windows-solver.worker-response-receipt/1"
@@ -3899,8 +3906,72 @@ class ComponentResult:
     baseline: RootReadout
     levels: tuple[LadderLevel, ...]
     lineage: Mapping[str, object]
+    component_scientific_identity: str | None = None
+    response_method: str | None = None
+    finite_amplitude_ladder_required: bool = True
+    finite_amplitude_ladder_executed: bool = True
+    finite_amplitude_readout_count: int | None = None
+    response_uncertainty_status: str | None = None
+    error_channel_applicability: Mapping[str, bool] | None = None
 
     def __post_init__(self) -> None:
+        if self.finite_amplitude_readout_count is None:
+            object.__setattr__(
+                self,
+                "finite_amplitude_readout_count",
+                4 * len(self.levels),
+            )
+        elif (
+            type(self.finite_amplitude_readout_count) is not int
+            or self.finite_amplitude_readout_count < 0
+        ):
+            raise ValueError(
+                "finite-amplitude readout count must be a nonnegative integer"
+            )
+        for name in (
+            "finite_amplitude_ladder_required",
+            "finite_amplitude_ladder_executed",
+        ):
+            if type(getattr(self, name)) is not bool:
+                raise ValueError(f"{name} must be a built-in bool")
+        applicability = self.error_channel_applicability
+        if applicability is None:
+            applicability = {name: True for name in ERROR_CHANNELS}
+        elif (
+            not isinstance(applicability, Mapping)
+            or set(applicability) != set(ERROR_CHANNELS)
+            or any(type(value) is not bool for value in applicability.values())
+        ):
+            raise ValueError("component error-channel applicability is invalid")
+        object.__setattr__(
+            self,
+            "error_channel_applicability",
+            MappingProxyType(dict(applicability)),
+        )
+        if set(self.error_channels) != set(ERROR_CHANNELS):
+            raise ValueError("component error channels are invalid")
+        for name, value in self.error_channels.items():
+            converted = float(value)
+            if not math.isfinite(converted) or converted < 0.0:
+                raise ValueError(
+                    f"component error channel {name} must be finite and nonnegative"
+                )
+        if self.component_scientific_identity == PROMOTED_HORIZON_COMPONENT_IDENTITY:
+            if (
+                self.mechanism_id != "horizon-admittance"
+                or self.response_method != PROMOTED_HORIZON_RESPONSE_METHOD
+                or self.finite_amplitude_ladder_required
+                or self.finite_amplitude_ladder_executed
+                or self.finite_amplitude_readout_count != 0
+                or self.levels
+                or self.signed_root_crosscheck is not None
+                or self.response_uncertainty_status
+                != UNCALIBRATED_ANALYTIC_RESPONSE
+                or any(self.error_channel_applicability.values())
+            ):
+                raise ValueError(
+                    "promoted analytic horizon component evidence is inconsistent"
+                )
         conditioned_readouts = tuple(
             readout
             for readout in self.raw_readouts
@@ -3925,6 +3996,10 @@ class ComponentResult:
         return self.status is ComponentStatus.CONVERGED and self.response is not None
 
     @property
+    def response_uncertainty_calibrated(self) -> bool:
+        return self.response_uncertainty_status != UNCALIBRATED_ANALYTIC_RESPONSE
+
+    @property
     def raw_readouts(self) -> tuple[RootReadout, ...]:
         return (
             self.baseline,
@@ -3941,7 +4016,7 @@ class ComponentResult:
         )
 
     def to_mapping(self) -> dict[str, object]:
-        return {
+        output = {
             "job_id": self.job_id,
             "leaf_id": self.leaf_id,
             "mechanism_id": self.mechanism_id,
@@ -3964,6 +4039,29 @@ class ComponentResult:
             "levels": [level.to_mapping() for level in self.levels],
             "lineage": dict(self.lineage),
         }
+        if self.component_scientific_identity is not None:
+            output.update({
+                "error_channel_applicability": dict(
+                    self.error_channel_applicability
+                ),
+                "component_scientific_identity": (
+                    self.component_scientific_identity
+                ),
+                "response_method": self.response_method,
+                "finite_amplitude_ladder_required": (
+                    self.finite_amplitude_ladder_required
+                ),
+                "finite_amplitude_ladder_executed": (
+                    self.finite_amplitude_ladder_executed
+                ),
+                "finite_amplitude_readout_count": (
+                    self.finite_amplitude_readout_count
+                ),
+                "response_uncertainty_status": (
+                    self.response_uncertainty_status
+                ),
+            })
+        return output
 
     @classmethod
     def from_mapping(cls, value: object) -> "ComponentResult":
@@ -3992,6 +4090,25 @@ class ComponentResult:
             baseline=RootReadout.from_mapping(value["baseline"]),
             levels=tuple(LadderLevel.from_mapping(item) for item in value["levels"]),
             lineage=dict(value["lineage"]),
+            component_scientific_identity=value.get(
+                "component_scientific_identity"
+            ),
+            response_method=value.get("response_method"),
+            finite_amplitude_ladder_required=value.get(
+                "finite_amplitude_ladder_required", True
+            ),
+            finite_amplitude_ladder_executed=value.get(
+                "finite_amplitude_ladder_executed", True
+            ),
+            finite_amplitude_readout_count=value.get(
+                "finite_amplitude_readout_count"
+            ),
+            response_uncertainty_status=value.get(
+                "response_uncertainty_status"
+            ),
+            error_channel_applicability=value.get(
+                "error_channel_applicability"
+            ),
         )
 
 
@@ -4053,6 +4170,212 @@ def _validated_result(
     if validator is not None:
         validator(job, result)
     return result
+
+
+def _promoted_horizon_result(
+    job: ResponseComponentJob,
+    *,
+    status: ComponentStatus,
+    baseline: RootReadout,
+    response: complex | None,
+) -> ComponentResult:
+    """Build honest evidence for one promoted horizon baseline readout."""
+
+    return ComponentResult(
+        job_id=job.job_id,
+        leaf_id=job.leaf_id,
+        mechanism_id=job.mechanism_id,
+        status=status,
+        convergence_basis=(
+            "PRIMARY_TRUNCATION_RESOLUTION_FIXED_ROOT"
+            if status is ComponentStatus.CONVERGED
+            else "UNRESOLVED"
+        ),
+        response=response,
+        signed_root_crosscheck=None,
+        closed_form_response=response,
+        error_channels={name: 0.0 for name in ERROR_CHANNELS},
+        baseline=baseline,
+        levels=(),
+        lineage={
+            **_result_lineage(job),
+            "component_scientific_identity": (
+                PROMOTED_HORIZON_COMPONENT_IDENTITY
+            ),
+        },
+        component_scientific_identity=PROMOTED_HORIZON_COMPONENT_IDENTITY,
+        response_method=PROMOTED_HORIZON_RESPONSE_METHOD,
+        finite_amplitude_ladder_required=False,
+        finite_amplitude_ladder_executed=False,
+        finite_amplitude_readout_count=0,
+        response_uncertainty_status=UNCALIBRATED_ANALYTIC_RESPONSE,
+        error_channel_applicability={name: False for name in ERROR_CHANNELS},
+    )
+
+
+def _validate_promoted_horizon_baseline(
+    job: ResponseComponentJob,
+    baseline: RootReadout,
+) -> None:
+    """Re-check operator-validated single-readout evidence before using it."""
+
+    if baseline.promoted_root_readout_policy != PROMOTED_ROOT_READOUT_POLICY:
+        raise ValueError("promoted root-readout policy identity is invalid")
+    primary = baseline.primary_acceptance
+    if primary is None:
+        raise ValueError("promoted baseline PRIMARY evidence is missing")
+    if not primary.accepted:
+        raise ValueError("promoted baseline PRIMARY evidence was rejected")
+    if primary.post_newton_determinant_count != 0:
+        raise ValueError("promoted PRIMARY performed post-Newton determinants")
+    if baseline.seed_path_required is not False:
+        raise ValueError("promoted SEED-PATH must not be required")
+    if baseline.seed_path_executed is not False:
+        raise ValueError("promoted SEED-PATH must not be executed")
+    if baseline.seed_path_determinant_count != 0:
+        raise ValueError("promoted SEED-PATH determinant budget is not zero")
+
+    for family, phase in (
+        ("truncation", "TRUNCATION"),
+        ("resolution", "RESOLUTION"),
+    ):
+        diagnostic = baseline.diagnostic_readouts.get(family)
+        evidence = (
+            None if diagnostic is None else diagnostic.fixed_root_evidence
+        )
+        if evidence is None:
+            raise ValueError(f"promoted {phase} fixed-root evidence is missing")
+        if not evidence.accepted:
+            raise ValueError(f"promoted {phase} fixed-root evidence was rejected")
+        if evidence.determinant_count != 1:
+            raise ValueError(f"promoted {phase} determinant budget is not one")
+        if not evidence.fixed_root:
+            raise ValueError(f"promoted {phase} moved the PRIMARY root")
+        if evidence.derivative_source != "PRIMARY_COMPLEX":
+            raise ValueError(f"promoted {phase} did not reuse PRIMARY derivative")
+        if evidence.primary_derivative != primary.derivative:
+            raise ValueError(f"promoted {phase} PRIMARY derivative is inconsistent")
+
+    conditioning = baseline.numerical_conditioning
+    if (
+        conditioning is None
+        or conditioning.determinant_convention
+        != HORIZON_DETERMINANT_CONVENTION
+    ):
+        raise ValueError("promoted horizon determinant convention is invalid")
+    if baseline.branch_id != job.root.branch_id:
+        raise ValueError("promoted baseline branch identity is invalid")
+
+
+def run_promoted_horizon_component(
+    job: ResponseComponentJob,
+    backend: RootReadoutBackend,
+    primary_predictor: complex,
+) -> ComponentResult:
+    """Run one promoted baseline and derive the horizon response algebraically.
+
+    This is deliberately not a finite-amplitude component runner.  The Julia
+    root readout already performs PRIMARY plus the two fixed-root diagnostics;
+    its retained complex PRIMARY derivative supplies the implicit response.
+    """
+
+    if job.role != "primary" or job.mechanism_id != "horizon-admittance":
+        raise ValueError("promoted component runner requires a primary horizon job")
+    if not math.isfinite(job.spin) or abs(job.spin) >= 1.0:
+        raise ValueError(
+            "promoted horizon Kerr spin must be finite and subextremal"
+        )
+    if backend.identity != job.backend_identity:
+        raise ValueError("response backend identity does not match job")
+    predictor = _finite_complex(primary_predictor, "PRIMARY root predictor")
+    binder = getattr(backend, "bind_job", None)
+    if binder is not None:
+        job = binder(job)
+    if backend.identity != job.backend_identity:
+        raise ValueError("bound response backend identity does not match job")
+
+    amplitude = 0.0j
+    with progress_scope(
+        readout_index=1,
+        readout_role="baseline",
+        epsilon=None,
+        amplitude={"real": 0.0, "imaginary": 0.0},
+    ):
+        started = time.monotonic()
+        emit_progress(ProgressEventKind.AMPLITUDE_READOUT_STARTED)
+        baseline = backend.read_root(
+            job,
+            amplitude,
+            primary_predictor=predictor,
+        )
+        emit_progress(
+            ProgressEventKind.AMPLITUDE_READOUT_COMPLETED,
+            current_omega={
+                "real": baseline.omega.real,
+                "imaginary": baseline.omega.imag,
+            },
+            determinant_abs=baseline.determinant_residual_abs,
+            derivative_abs=baseline.determinant_derivative_abs,
+            converged=baseline.converged,
+            elapsed_seconds=time.monotonic() - started,
+        )
+
+    initial_status = _identity_status(job, baseline)
+    if initial_status is not None:
+        return _validated_result(
+            backend,
+            job,
+            _promoted_horizon_result(
+                job,
+                status=initial_status,
+                baseline=baseline,
+                response=None,
+            ),
+        )
+
+    _validate_promoted_horizon_baseline(job, baseline)
+    primary = baseline.primary_acceptance
+    assert primary is not None
+    derivative = primary.derivative
+    if (
+        not derivative.real.is_finite()
+        or not derivative.imaginary.is_finite()
+    ):
+        raise ValueError("promoted PRIMARY derivative must be finite")
+    derivative_complex = complex(
+        float(derivative.real),
+        float(derivative.imaginary),
+    )
+    if derivative_complex == 0.0j or not (
+        math.isfinite(derivative_complex.real)
+        and math.isfinite(derivative_complex.imag)
+    ):
+        raise ValueError("promoted PRIMARY derivative must be finite and nonzero")
+
+    horizon_radius = 1.0 + math.sqrt(
+        max(0.0, 1.0 - job.spin * job.spin)
+    )
+    omega_h = job.spin / (2.0 * horizon_radius)
+    horizon_frequency = baseline.omega - job.mode.m * omega_h
+    if horizon_frequency == 0.0j or not (
+        math.isfinite(horizon_frequency.real)
+        and math.isfinite(horizon_frequency.imag)
+    ):
+        raise ValueError("promoted horizon frequency must be finite and nonzero")
+    response = 1.0 / (2.0j * horizon_frequency * derivative_complex)
+    if not math.isfinite(response.real) or not math.isfinite(response.imag):
+        raise ValueError("promoted analytic horizon response is nonfinite")
+
+    return _validated_result(
+        backend,
+        job,
+        _promoted_horizon_result(
+            job,
+            status=ComponentStatus.CONVERGED,
+            baseline=baseline,
+            response=response,
+        ),
+    )
 
 
 def run_component(

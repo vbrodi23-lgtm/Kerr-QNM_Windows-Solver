@@ -18,12 +18,18 @@ from windows_solver.progress import activate_progress
 from windows_solver.progress_output import CampaignProgressReporter
 from windows_solver.linear_response import B_PRIME_RELEASE_DOMAIN
 from windows_solver.response_batches import (
+    CAMPAIGN_CHECKPOINT_SCHEMA_VERSION,
+    CampaignLeafRecord,
+    CampaignStageRecord,
     PrecisionCapabilities,
     StageOutcome,
+    _checkpoint_mapping,
     _checkpoint_precision_contract_sha256,
     _primary_recovery_precision_contract,
+    _primary_precision120_decision,
     _root_convergence_precision_contract,
     _produced_response,
+    _stage_with_promotion_decision,
     build_campaign_plan,
     build_campaign_selection,
     import_campaign_checkpoint_to_solved_leaf_store,
@@ -1043,7 +1049,7 @@ class PromotedConditioningDecisionTests(unittest.TestCase):
         self.assertEqual(decision["state"], "REQUESTED")
         self.assertEqual(decision["reason"], "SENTINEL_TRIGGER_FALSE_NEGATIVE")
 
-    def test_schema_five_cannot_strip_conditioning_and_promotion_decision(self):
+    def test_current_schema_cannot_strip_conditioning_and_promotion_decision(self):
         temporary, _, _, _ = self._run(evidence={
             "predicted_reliable_digits": "11.25",
             "required_reliable_digits": "24",
@@ -1052,7 +1058,9 @@ class PromotedConditioningDecisionTests(unittest.TestCase):
         self.addCleanup(temporary.cleanup)
         checkpoint = Path(temporary.name) / "conditioning.json"
         forged = json.loads(checkpoint.read_text(encoding="utf-8"))
-        self.assertEqual(forged["schema_version"], 6)
+        self.assertEqual(
+            forged["schema_version"], CAMPAIGN_CHECKPOINT_SCHEMA_VERSION
+        )
         remove_promotion_decision_and_reseal(
             forged, remove_conditioning=True
         )
@@ -1068,7 +1076,7 @@ class PromotedConditioningDecisionTests(unittest.TestCase):
         ):
             validate_campaign_checkpoint(plan, checkpoint)
 
-    def test_schema_six_rejects_resealed_package_evidence_downgraded_to_historical_shape(self):
+    def test_current_schema_rejects_resealed_package_evidence_downgraded_to_historical_shape(self):
         """Catches current checkpoints inferring history from missing evidence."""
 
         temporary, _, _, _ = self._run(evidence={
@@ -1079,7 +1087,9 @@ class PromotedConditioningDecisionTests(unittest.TestCase):
         self.addCleanup(temporary.cleanup)
         checkpoint = Path(temporary.name) / "conditioning.json"
         forged = json.loads(checkpoint.read_text(encoding="utf-8"))
-        self.assertEqual(forged["schema_version"], 6)
+        self.assertEqual(
+            forged["schema_version"], CAMPAIGN_CHECKPOINT_SCHEMA_VERSION
+        )
         component = forged["records"][0]["stages"][1]["component_result"]
         component["scientific_runtime"].pop(
             "regularised_gsn_precision_policy"
@@ -1779,7 +1789,9 @@ class PromotedResourceContainmentTests(unittest.TestCase):
         checkpoint = json.loads(
             (root / "checkpoint.json").read_text(encoding="utf-8")
         )
-        self.assertEqual(checkpoint["schema_version"], 6)
+        self.assertEqual(
+            checkpoint["schema_version"], CAMPAIGN_CHECKPOINT_SCHEMA_VERSION
+        )
         self.assertEqual(len(checkpoint["attempts"]), 1)
         self.assertEqual(
             checkpoint["attempts_sha256"],
@@ -3257,7 +3269,7 @@ class PromotedResourceContainmentTests(unittest.TestCase):
         self.assertEqual(earliest_loaded.state, "COMPLETE")
         self.assertEqual(earliest_loaded.attempts, ())
 
-    def test_incomplete_schema_five_checkpoint_cannot_resume_as_schema_six(self):
+    def test_incomplete_schema_five_checkpoint_cannot_resume_as_current(self):
         plan, _, _, incident, _ = self._plan_and_leaves()
         selection = build_campaign_selection(
             plan, role="primary", leaf_ids=(incident.leaf_id,)
@@ -3333,6 +3345,173 @@ class PromotedResourceContainmentTests(unittest.TestCase):
                     checkpoint,
                     SolvedLeafStore(Path(temporary) / "solved"),
                 )
+
+    def test_schema_six_resume_keeps_binary64_and_drops_old_horizon_promotion(self):
+        plan, capabilities, selection, incident, following = (
+            self._plan_and_leaves()
+        )
+        provenance = {
+            "precision_factory_identity": (
+                plan.precision_factory_identity.to_mapping()
+            ),
+            "available_precision_digits": list(capabilities.digits),
+        }
+
+        binary64 = CampaignStageRecord(
+            _authenticated_primary_stage(
+                incident, 64, ComponentStatus.NOT_CONVERGED
+            ),
+            provenance,
+        )
+        old_promoted_outcome = _authenticated_primary_stage(
+            incident,
+            80,
+            ComponentStatus.CONVERGED,
+            self_refinement_enclosed=True,
+            discrepancy_from_previous_abs=1.0e-9,
+            discrepancy_enclosed=True,
+        )
+        old_promoted = CampaignStageRecord(
+            _stage_with_promotion_decision(
+                old_promoted_outcome,
+                _primary_precision120_decision(old_promoted_outcome),
+            ),
+            provenance,
+        )
+        old_horizon_record = CampaignLeafRecord(
+            leaf_id=incident.leaf_id,
+            role=incident.role,
+            state="PRODUCED",
+            stages=(binary64, old_promoted),
+        )
+
+        unaffected_binary64 = CampaignStageRecord(
+            _authenticated_primary_stage(
+                following, 64, ComponentStatus.CONVERGED
+            ),
+            provenance,
+        )
+        unaffected_record = CampaignLeafRecord(
+            leaf_id=following.leaf_id,
+            role=following.role,
+            state="PRODUCED",
+            stages=(unaffected_binary64,),
+        )
+
+        class StopAfterMigration(RuntimeError):
+            pass
+
+        class ResumeBackend:
+            identity = plan.backend_identity
+            precision_capabilities = capabilities
+
+            def __init__(self):
+                self.calls = []
+
+            def execute_stage(self, leaf, digits):
+                self.calls.append((leaf.leaf_id, digits))
+                raise StopAfterMigration("checkpoint must migrate first")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            checkpoint = Path(temporary) / "schema6.json"
+            schema6 = _checkpoint_mapping(
+                plan,
+                selection,
+                (old_horizon_record, unaffected_record),
+            )
+            schema6["schema_version"] = 6
+            schema6["bindings"]["precision_contract_sha256"] = (
+                _checkpoint_precision_contract_sha256(6)
+            )
+            checkpoint.write_bytes(canonical_json_bytes(schema6))
+            original_checkpoint = checkpoint.read_bytes()
+
+            incompatible_backend = ResumeBackend()
+            incompatible_backend.precision_capabilities = (
+                PrecisionCapabilities((64,))
+            )
+            with self.assertRaisesRegex(
+                ValueError,
+                "precision availability",
+            ):
+                run_campaign_selection(
+                    plan,
+                    selection,
+                    incompatible_backend,
+                    checkpoint,
+                    resume=True,
+                )
+            self.assertEqual(checkpoint.read_bytes(), original_checkpoint)
+
+            loaded = validate_campaign_checkpoint(plan, checkpoint)
+            self.assertEqual(loaded.state, "COMPLETE")
+            imported = import_campaign_checkpoint_to_solved_leaf_store(
+                plan,
+                checkpoint,
+                SolvedLeafStore(Path(temporary) / "solved"),
+            )
+            self.assertEqual(imported.imported_count, 1)
+            self.assertEqual(imported.skipped_count, 1)
+            self.assertEqual(imported.leaf_ids, (following.leaf_id,))
+            merged_path = Path(temporary) / "merged-schema7.json"
+            merged = merge_campaign_checkpoints(
+                plan,
+                (checkpoint,),
+                merged_path,
+            )
+            self.assertEqual(merged.state, "PARTIAL")
+            merged_records = {
+                record.leaf_id: record for record in merged.records
+            }
+            self.assertEqual(
+                merged_records[incident.leaf_id].stages,
+                (binary64,),
+            )
+            self.assertEqual(
+                merged_records[following.leaf_id], unaffected_record
+            )
+            self.assertEqual(
+                json.loads(merged_path.read_text(encoding="utf-8"))[
+                    "schema_version"
+                ],
+                CAMPAIGN_CHECKPOINT_SCHEMA_VERSION,
+            )
+
+            backend = ResumeBackend()
+            with self.assertRaisesRegex(
+                StopAfterMigration, "checkpoint must migrate first"
+            ):
+                run_campaign_selection(
+                    plan,
+                    selection,
+                    backend,
+                    checkpoint,
+                    resume=True,
+                )
+
+            migrated = json.loads(checkpoint.read_text(encoding="utf-8"))
+
+        self.assertEqual(backend.calls, [(incident.leaf_id, 80)])
+        self.assertEqual(
+            migrated["schema_version"], CAMPAIGN_CHECKPOINT_SCHEMA_VERSION
+        )
+        migrated_records = {
+            record["leaf_id"]: record for record in migrated["records"]
+        }
+        incident_record = migrated_records[incident.leaf_id]
+        self.assertEqual(incident_record["state"], "IN_PROGRESS")
+        self.assertEqual(len(incident_record["stages"]), 1)
+        self.assertEqual(
+            incident_record["stages"][0], binary64.to_mapping()
+        )
+        self.assertNotIn(
+            old_promoted.stage_sha256,
+            {stage["stage_sha256"] for stage in incident_record["stages"]},
+        )
+        self.assertEqual(
+            migrated_records[following.leaf_id],
+            unaffected_record.to_mapping(),
+        )
 
     def test_component_status_body_contract_is_enforced_at_every_primary_tier(self) -> None:
         """Catches sealed status/body contradictions accepted as production."""

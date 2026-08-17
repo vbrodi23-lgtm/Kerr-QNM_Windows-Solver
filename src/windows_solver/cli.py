@@ -47,6 +47,7 @@ from .response_engine import (
     validate_response_checkpoint,
 )
 from .response_batches import (
+    CAMPAIGN_CHECKPOINT_SCHEMA_VERSION,
     CampaignLeafRecord,
     CampaignRunSummary,
     NativeCampaignStageBackend,
@@ -89,6 +90,13 @@ def _validate_reduction_component_checkpoint_binding(
             "campaign reduction component lacks a checkpoint production result"
         )
     result = ComponentResult.from_mapping(raw_result)
+    if (
+        isinstance(component, ResolvedComponentEvidence)
+        and not result.response_uncertainty_calibrated
+    ):
+        raise ValueError(
+            "campaign reduction rejects uncalibrated analytic responses"
+        )
     expected_channels: list[dict[str, object]] = []
     for raw_channel in outcome.signed_error_channels:
         channel = dict(raw_channel)
@@ -739,12 +747,18 @@ def _campaign_selected(
             raise ValueError("campaign resume requires an existing checkpoint")
         if command == "campaign-resume":
             cached = validate_campaign_checkpoint(plan, checkpoint)
+            checkpoint_document = _load_strict_json(
+                checkpoint, "campaign checkpoint"
+            )
+            checkpoint_is_current = checkpoint_document.get(
+                "schema_version"
+            ) == CAMPAIGN_CHECKPOINT_SCHEMA_VERSION
             _validate_campaign_capability_superset(cached, descriptor, plan)
             if cached.selection_id != selection.selection_id:
                 raise ValueError("campaign checkpoint selection does not match request")
             if reporter is not None:
                 reporter.bind_campaign_reports(plan)
-            if cached.state == "COMPLETE":
+            if cached.state == "COMPLETE" and checkpoint_is_current:
                 import_campaign_checkpoint_to_solved_leaf_store(
                     plan, checkpoint, SolvedLeafStore.default()
                 )
