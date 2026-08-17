@@ -71,5 +71,14 @@ preservation, and cache/provenance separation from historical raw-state leaves.
   static/parser/mocked/unit tests only. Do not execute Julia, Kerr determinants,
   ODE benchmarks, Leaf 13, or the 212-leaf campaign; native mathematical and
   performance validation is the operator's successful Leaf 13 v1.4 receipt.
+- Replace the outer promoted PRIMARY horizon component multiplier with one
+  zero-amplitude Julia root readout, using the immediately preceding baseline
+  omega as its root predictor, then derive the response from the retained
+  complex PRIMARY derivative without signed-amplitude or self-refinement work.
+- Bind the new `single-promoted-root-analytic-horizon-component/v1` identity,
+  represent all unmeasured response-uncertainty channels as non-applicable,
+  keep admission fail-closed as `UNCALIBRATED_ANALYTIC_RESPONSE`, and migrate
+  authenticated predecessor checkpoints by retaining canonical binary64 stages
+  while dropping old promoted horizon multi-readout stages.
 
 ---
