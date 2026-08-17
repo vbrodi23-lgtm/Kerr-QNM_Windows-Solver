@@ -2793,6 +2793,45 @@ def _single_promoted_horizon_result(
     return result
 
 
+def _validate_single_promoted_horizon_predictor_binding(
+    previous: StageOutcome,
+    promoted: StageOutcome,
+) -> None:
+    """Bind a persisted analytic request to the preceding baseline root."""
+
+    result = _single_promoted_horizon_result(promoted)
+    if result is None:
+        return
+    raw_previous = previous.component_result.get("result")
+    if not isinstance(raw_previous, Mapping):
+        raise _UnauthenticatedComponentEvidence(
+            "promoted horizon predictor predecessor is missing"
+        )
+    previous_result = ComponentResult.from_mapping(raw_previous)
+    if previous_result.to_mapping() != raw_previous:
+        raise _UnauthenticatedComponentEvidence(
+            "promoted horizon predictor predecessor is not canonical"
+        )
+    receipt = result.baseline.worker_response_receipt
+    request = (
+        None if not isinstance(receipt, Mapping)
+        else receipt.get("request_binding")
+    )
+    expected_predictor = {
+        "real": format(previous_result.baseline.omega.real, ".17g"),
+        "imaginary": format(previous_result.baseline.omega.imag, ".17g"),
+    }
+    if (
+        not isinstance(request, Mapping)
+        or request.get("amplitude") != {"real": "0", "imaginary": "0"}
+        or request.get("primary_predictor") != expected_predictor
+        or "primary_predictor_kind" in request
+    ):
+        raise _UnauthenticatedComponentEvidence(
+            "promoted horizon PRIMARY predictor binding is invalid"
+        )
+
+
 def _promotion_decision(
     outcome: StageOutcome,
     *,
@@ -3844,6 +3883,11 @@ def _validate_record_semantics(
         )
         for stage in stages
     )
+    for previous, promoted in zip(stages, stages[1:]):
+        _validate_single_promoted_horizon_predictor_binding(
+            previous,
+            promoted,
+        )
     production = all(production_flags)
     first = stages[0]
     if (
@@ -5009,7 +5053,8 @@ def _run_campaign_selection_active(
         )
         if loaded_selection != selection:
             raise ValueError("campaign checkpoint selection does not match request")
-        if loaded_schema_version == 6:
+        migrated_schema6 = loaded_schema_version == 6
+        if migrated_schema6:
             existing, loaded_attempts = (
                 _migrate_schema6_single_promoted_horizon_checkpoint(
                     plan,
@@ -5018,15 +5063,6 @@ def _run_campaign_selection_active(
                     loaded_attempts,
                     available,
                 )
-            )
-            _atomic_json(
-                path,
-                _checkpoint_mapping(
-                    plan,
-                    selection,
-                    existing,
-                    loaded_attempts,
-                ),
             )
             loaded_schema_version = CAMPAIGN_CHECKPOINT_SCHEMA_VERSION
             loaded_state = (
@@ -5065,6 +5101,23 @@ def _run_campaign_selection_active(
                     raise ValueError(
                         "campaign backend precision availability is not a permitted superset"
                     )
+        if migrated_schema6:
+            leaf_by_id = {leaf.leaf_id: leaf for leaf in plan.leaves}
+            for record in existing:
+                _validate_record_semantics(
+                    leaf_by_id[record.leaf_id],
+                    record,
+                    plan.precision_factory_identity,
+                )
+            _atomic_json(
+                path,
+                _checkpoint_mapping(
+                    plan,
+                    selection,
+                    existing,
+                    loaded_attempts,
+                ),
+            )
         attempts = list(loaded_attempts)
     else:
         if resume:

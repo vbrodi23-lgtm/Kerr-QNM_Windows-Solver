@@ -2,23 +2,33 @@ from __future__ import annotations
 
 from dataclasses import replace
 from decimal import Decimal, localcontext
+import hashlib
 import math
 import unittest
 from unittest.mock import patch
 
 from tests.fixtures import valid_numerical_conditioning
+from windows_solver.cli import _validate_reduction_component_checkpoint_binding
+from windows_solver.contracts import canonical_json_bytes
 from windows_solver.progress import (
     ProgressEventKind,
     activate_progress,
 )
 from windows_solver.response_batches import (
+    CampaignLeafRecord,
+    CampaignStageRecord,
     NativeCampaignStageBackend,
     PrecisionCapabilities,
+    STAGE_SIGNED_ERROR_FAMILIES,
     StageOutcome,
     build_campaign_plan,
     _is_single_promoted_horizon_stage,
+    _primary_precision120_decision,
     _primary_precision120_terminal_state,
     _primary_requires_precision120,
+    _stage_with_promotion_decision,
+    _validate_record_semantics,
+    _validate_single_promoted_horizon_predictor_binding,
     synthetic_stage_signed_error_channels,
 )
 import windows_solver.response_engine as response_engine
@@ -39,6 +49,10 @@ from windows_solver.response_engine import (
 from windows_solver.gsn_cache_producer import GeneratedGsnCache, GsnParameterPair
 from windows_solver.julia_response_backend import JuliaPrecisionRootBackend
 from windows_solver.response_engine import NativeDeterminantAdapter, RootReadout
+from windows_solver.response_reduction import (
+    ResolvedComponentEvidence,
+    SignedErrorContribution,
+)
 from pathlib import Path
 from types import SimpleNamespace
 from tests.test_native_campaign_backend import _failed_preflight_attempt
@@ -214,6 +228,62 @@ class FakePromotedBackend:
         raise AssertionError("dedicated promoted runner called generic closed form")
 
 
+def _with_worker_receipt(job, baseline, digits, primary_predictor):
+    runtime = {
+        "precision_digits": digits,
+        "working_precision_bits": math.ceil(digits * math.log2(10)) + 32,
+        "refinement_level": 0,
+        "regularised_gsn_precision_policy": dict(
+            response_engine.regularised_gsn_precision_policy(
+                job.mechanism_id
+            )
+        ),
+    }
+    request = JuliaPrecisionRootBackend(
+        job.backend_identity,
+        object(),
+        digits,
+    )._request(
+        job,
+        0.0j,
+        primary_predictor,
+        None,
+    )
+    material = {
+        "schema": response_engine.WORKER_RESPONSE_RECEIPT_SCHEMA,
+        "request_binding": request,
+        "request_sha256": hashlib.sha256(
+            canonical_json_bytes(request)
+        ).hexdigest(),
+        "scientific_runtime_sha256": hashlib.sha256(
+            canonical_json_bytes(runtime)
+        ).hexdigest(),
+        "worker_response_schema_version": (
+            response_engine.WORKER_RESPONSE_WIRE_SCHEMA
+        ),
+        "root_residual_abs_text": str(
+            baseline.normalised_determinant_abs
+        ),
+        "raw_determinant_abs_text": str(baseline.raw_determinant_abs),
+        "raw_determinant_evidence_status": (
+            baseline.raw_determinant_evidence_status
+        ),
+        "promoted_root_readout_policy": PROMOTED_ROOT_READOUT_POLICY,
+        "primary_acceptance_sha256": hashlib.sha256(
+            canonical_json_bytes(
+                baseline.primary_acceptance.to_mapping()
+            )
+        ).hexdigest(),
+    }
+    receipt = {
+        **material,
+        "receipt_sha256": hashlib.sha256(
+            canonical_json_bytes(material)
+        ).hexdigest(),
+    }
+    return replace(baseline, worker_response_receipt=receipt)
+
+
 class PromotedHorizonComponentTests(unittest.TestCase):
     def setUp(self) -> None:
         self.leaf = _primary_horizon_leaf()
@@ -343,6 +413,24 @@ class PromotedHorizonComponentTests(unittest.TestCase):
                 FakePromotedBackend(zero_job, baseline),
                 zero_frequency,
             )
+
+    def test_extremal_spin_roundoff_uses_horizon_radius_clamp(self):
+        rounded_job = replace(
+            self.job,
+            spin=math.nextafter(1.0, math.inf),
+        )
+        baseline = _promoted_baseline(rounded_job)
+
+        result = self._runner()(
+            rounded_job,
+            FakePromotedBackend(rounded_job, baseline),
+            rounded_job.root.omega,
+        )
+
+        self.assertEqual(result.status, ComponentStatus.CONVERGED)
+        self.assertIsNotNone(result.response)
+        self.assertTrue(math.isfinite(result.response.real))
+        self.assertTrue(math.isfinite(result.response.imag))
 
     def test_rejects_zero_or_nonfinite_retained_complex_derivative(self):
         for derivative, label in (
@@ -555,6 +643,59 @@ class PromotedHorizonStageTests(unittest.TestCase):
             generated,
             SimpleNamespace(),
         )
+
+    def _record_with_receipt_predictor(self, receipt_predictor):
+        predictor = self.leaf.job.root.omega + complex(1.0e-4, -1.0e-4)
+        previous = _stage_from_result(
+            64,
+            _binary64_nonconverged_result(self.leaf.job, predictor),
+        )
+        baseline = _with_worker_receipt(
+            self.leaf.job,
+            _promoted_baseline(self.leaf.job),
+            80,
+            receipt_predictor,
+        )
+        julia_backend = FakeJuliaPrecisionBackend(
+            self.leaf.job,
+            baseline,
+            80,
+        )
+        with patch(
+            "windows_solver.response_batches.JuliaPrecisionRootBackend",
+            return_value=julia_backend,
+        ):
+            promoted = self.backend.execute_promoted_stage_with_predictor(
+                self.leaf,
+                80,
+                (previous,),
+                response_predictor=complex(99.0, 88.0),
+            )
+        promoted = _stage_with_promotion_decision(
+            promoted,
+            _primary_precision120_decision(promoted),
+        )
+        plan = build_campaign_plan(
+            policy=NumericalPolicy(),
+            backend_identity=VettedNativeDeterminantKernel.identity,
+            precision_capabilities=PrecisionCapabilities((64, 80, 120)),
+        )
+        provenance = {
+            "precision_factory_identity": (
+                plan.precision_factory_identity.to_mapping()
+            ),
+            "available_precision_digits": [64, 80, 120],
+        }
+        record = CampaignLeafRecord(
+            leaf_id=self.leaf.leaf_id,
+            role=self.leaf.role,
+            state="PRODUCED",
+            stages=(
+                CampaignStageRecord(previous, provenance),
+                CampaignStageRecord(promoted, provenance),
+            ),
+        )
+        return plan, predictor, promoted, record
 
     def test_dedicated_routing_scope_excludes_binary64_deep_and_exterior(self):
         plan = build_campaign_plan(
@@ -852,6 +993,154 @@ class PromotedHorizonStageTests(unittest.TestCase):
             _primary_precision120_terminal_state(outcome_for(inadequate)),
             "UNRESOLVED",
         )
+
+    def test_checkpoint_binds_promoted_predictor_to_previous_baseline(self):
+        plan, predictor, _, valid = self._record_with_receipt_predictor(
+            self.leaf.job.root.omega + complex(1.0e-4, -1.0e-4)
+        )
+        self.assertTrue(_validate_record_semantics(
+            self.leaf,
+            valid,
+            plan.precision_factory_identity,
+        ))
+
+        for wrong_predictor, label in (
+            (None, "missing"),
+            (self.leaf.job.root.omega, "catalog root"),
+            (complex(99.0, 88.0), "response predictor"),
+        ):
+            with self.subTest(label=label):
+                plan, _, _, record = self._record_with_receipt_predictor(
+                    wrong_predictor
+                )
+                with self.assertRaisesRegex(ValueError, "predictor binding"):
+                    _validate_record_semantics(
+                        self.leaf,
+                        record,
+                        plan.precision_factory_identity,
+                    )
+        self.assertNotEqual(predictor, self.leaf.job.root.omega)
+
+    def test_checkpoint_binds_julia120_predictor_at_both_entry_paths(self):
+        promoted80 = response_engine.run_promoted_horizon_component(
+            self.leaf.job,
+            FakePromotedBackend(
+                self.leaf.job,
+                _promoted_baseline(self.leaf.job),
+            ),
+            self.leaf.job.root.omega,
+        )
+        predecessors = (
+            (
+                "normal",
+                _stage_from_result(80, promoted80),
+                promoted80.baseline.omega,
+            ),
+            (
+                "failed-preflight",
+                _stage_from_result(
+                    64,
+                    _binary64_nonconverged_result(
+                        self.leaf.job,
+                        self.leaf.job.root.omega
+                        + complex(1.0e-4, -1.0e-4),
+                    ),
+                ),
+                self.leaf.job.root.omega
+                + complex(1.0e-4, -1.0e-4),
+            ),
+        )
+        for label, previous, expected in predecessors:
+            with self.subTest(label=label):
+                valid = _stage_from_result(
+                    120,
+                    response_engine.run_promoted_horizon_component(
+                        self.leaf.job,
+                        FakePromotedBackend(
+                            self.leaf.job,
+                            _with_worker_receipt(
+                                self.leaf.job,
+                                _promoted_baseline(self.leaf.job),
+                                120,
+                                expected,
+                            ),
+                        ),
+                        expected,
+                    ),
+                )
+                _validate_single_promoted_horizon_predictor_binding(
+                    previous,
+                    valid,
+                )
+                wrong = _stage_from_result(
+                    120,
+                    response_engine.run_promoted_horizon_component(
+                        self.leaf.job,
+                        FakePromotedBackend(
+                            self.leaf.job,
+                            _with_worker_receipt(
+                                self.leaf.job,
+                                _promoted_baseline(self.leaf.job),
+                                120,
+                                complex(99.0, 88.0),
+                            ),
+                        ),
+                        expected,
+                    ),
+                )
+                with self.assertRaisesRegex(ValueError, "predictor binding"):
+                    _validate_single_promoted_horizon_predictor_binding(
+                        previous,
+                        wrong,
+                    )
+
+    def test_reduction_rejects_uncalibrated_analytic_response(self):
+        _, _, promoted, record = self._record_with_receipt_predictor(
+            self.leaf.job.root.omega + complex(1.0e-4, -1.0e-4)
+        )
+        result = ComponentResult.from_mapping(
+            promoted.component_result["result"]
+        )
+        source_receipt = "sha256:" + "1" * 64
+        contributions = []
+        for channel in promoted.signed_error_channels:
+            scope = channel["scope"]
+            channel_id = (
+                f"local:{self.leaf.leaf_id}:{channel['family']}"
+                if scope == "local"
+                else channel["channel_id"]
+            )
+            shared_group = (
+                self.leaf.leaf_id
+                if scope == "local"
+                else channel["shared_group"]
+            )
+            delta = channel["signed_delta"]
+            contributions.append(SignedErrorContribution(
+                channel_id=channel_id,
+                family=channel["family"],
+                shared_group=shared_group,
+                delta=complex(delta["real"], delta["imaginary"]),
+                units=channel["units"],
+                source_receipt=source_receipt,
+                scope=scope,
+            ))
+        component = ResolvedComponentEvidence(
+            component_id=self.leaf.leaf_id,
+            centre=result.response,
+            units=contributions[0].units,
+            contributions=tuple(contributions),
+            recorded_discrepancies=(),
+            required_families=STAGE_SIGNED_ERROR_FAMILIES,
+            evidence_kind="authenticated-campaign",
+        )
+
+        with self.assertRaisesRegex(ValueError, "uncalibrated"):
+            _validate_reduction_component_checkpoint_binding(
+                component,
+                record,
+                frozenset({source_receipt}),
+            )
 
 
 if __name__ == "__main__":

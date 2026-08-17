@@ -3424,6 +3424,24 @@ class PromotedResourceContainmentTests(unittest.TestCase):
                 _checkpoint_precision_contract_sha256(6)
             )
             checkpoint.write_bytes(canonical_json_bytes(schema6))
+            original_checkpoint = checkpoint.read_bytes()
+
+            incompatible_backend = ResumeBackend()
+            incompatible_backend.precision_capabilities = (
+                PrecisionCapabilities((64,))
+            )
+            with self.assertRaisesRegex(
+                ValueError,
+                "precision availability",
+            ):
+                run_campaign_selection(
+                    plan,
+                    selection,
+                    incompatible_backend,
+                    checkpoint,
+                    resume=True,
+                )
+            self.assertEqual(checkpoint.read_bytes(), original_checkpoint)
 
             loaded = validate_campaign_checkpoint(plan, checkpoint)
             self.assertEqual(loaded.state, "COMPLETE")

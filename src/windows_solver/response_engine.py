@@ -4348,7 +4348,9 @@ def run_promoted_horizon_component(
     ):
         raise ValueError("promoted PRIMARY derivative must be finite and nonzero")
 
-    horizon_radius = 1.0 + math.sqrt(1.0 - job.spin * job.spin)
+    horizon_radius = 1.0 + math.sqrt(
+        max(0.0, 1.0 - job.spin * job.spin)
+    )
     omega_h = job.spin / (2.0 * horizon_radius)
     horizon_frequency = baseline.omega - job.mode.m * omega_h
     if horizon_frequency == 0.0j or not (

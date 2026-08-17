@@ -90,6 +90,13 @@ def _validate_reduction_component_checkpoint_binding(
             "campaign reduction component lacks a checkpoint production result"
         )
     result = ComponentResult.from_mapping(raw_result)
+    if (
+        isinstance(component, ResolvedComponentEvidence)
+        and not result.response_uncertainty_calibrated
+    ):
+        raise ValueError(
+            "campaign reduction rejects uncalibrated analytic responses"
+        )
     expected_channels: list[dict[str, object]] = []
     for raw_channel in outcome.signed_error_channels:
         channel = dict(raw_channel)
