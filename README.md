@@ -47,16 +47,34 @@ identity. Admission and replay therefore reject catalog or root drift. See [the
 M01 release baseline](docs/release-baseline.md) and [the M02 PowerShell
 handoff](docs/m02-admission-powershell.md).
 
-M02 software work through PR #40 is merged, including the managed Julia/GSN
-runtime, checkpoint and cache contracts, promoted-precision worker, determinant
-repairs, strict convergence serialization, and high-precision ODE
-optimizations. This is not a scientific completion claim. TASK-075 remains open
-only for the missing immutable receipt for the independent Black Hole
-Perturbation Toolkit Mathematica spheroidal validation source. TASK-076 then
-owns native Windows/Ubuntu cold/warm execution proof; TASK-077 owns the complete
-212-leaf campaign; and TASK-078 owns reduction, provider admission, and M02
-closure. PR #30 separately added a fail-closed M03 contract precursor, but no
-M03 field artifact or provider is admitted.
+M02 software work through PR #52 is merged, including the managed Julia/GSN
+runtime, checkpoint and cache contracts, promoted-precision worker, and the
+horizon-determinant rewrite: a three-leg solution basis on a verified
+real-inner tortoise contour, absolute error-aware Newton acceptance, and a
+mechanism-scoped precision policy that keeps exterior receipts written before
+the rewrite reusable while correctly retiring stale horizon ones. The
+promoted primary `horizon-admittance` component now performs one Julia root
+readout per precision stage in place of a multi-readout finite-amplitude
+ladder: PRIMARY accepts on `|D| / |D'| <= 2e-11` with zero post-Newton
+determinant evaluations and retains the accepted complex derivative;
+TRUNCATION and RESOLUTION each evaluate exactly one further determinant at
+the fixed PRIMARY frequency by reusing that derivative rather than resolving
+it independently. The derived response carries component identity
+`single-promoted-root-analytic-horizon-component/v1` and uncertainty status
+`UNCALIBRATED_ANALYTIC_RESPONSE`, with every error channel marked
+not-applicable rather than measured-zero; admission fails closed on that
+status.
+
+TASK-075 remains open only for the missing immutable receipt for the
+independent Black Hole Perturbation Toolkit Mathematica spheroidal validation
+source. TASK-079 is in progress alongside it, regularising the promoted GSN
+propagation and determinant conditioning that TASK-075 depends on; its
+acceptance criteria are unmet pending native operator execution evidence for
+the promoted Leaf 13 readout. TASK-076, blocked on both, then owns native
+Windows/Ubuntu cold/warm execution proof; TASK-077 owns the complete 212-leaf
+campaign; and TASK-078 owns reduction, provider admission, and M02 closure.
+PR #30 separately added a fail-closed M03 contract precursor, but no M03
+field artifact or provider is admitted.
 
 The live delivery authority is [the TaskPlanner board](.tasks/README.md), with
 the active item in [.tasks/IN_PROGRESS.md](.tasks/IN_PROGRESS.md), the next
