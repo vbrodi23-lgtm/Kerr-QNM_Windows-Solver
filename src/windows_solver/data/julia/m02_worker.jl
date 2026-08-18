@@ -2777,19 +2777,53 @@ function evaluate_horizon_determinant(
     inner_contour = build_worker_real_inner_horizon_contour(
         T, request, spectral, readout, "horizon-real-inner"
     )
-    geometry_candidates = CF.horizon_endpoint_geometry_candidates(
-        spectral,
-        inner_contour;
-        rho_candidates=horizon_endpoint_rho_candidates(T, request),
-        maximum_horizon_distance=maximum_horizon_distance,
+    rho_candidates = horizon_endpoint_rho_candidates(T, request)
+    rho_floor = horizon_endpoint_rho_floor(T, request)
+    endpoint_orders = CF.horizon_endpoint_order_ladder(
+        spectral.endpoint_order;
+        maximum_order=horizon_endpoint_maximum_order(
+            request, spectral.endpoint_order
+        ),
     )
-    candidates = CF.horizon_endpoint_candidates(
-        spectral,
-        inner_contour,
-        geometry_candidates,
-        required_digits;
-        maximum_horizon_distance=maximum_horizon_distance,
-    )
+    local candidates
+    while true
+        geometry_candidates = CF.horizon_endpoint_geometry_candidates(
+            spectral,
+            inner_contour;
+            rho_candidates=rho_candidates,
+            maximum_horizon_distance=maximum_horizon_distance,
+        )
+        candidates = CF.horizon_endpoint_candidates(
+            spectral,
+            inner_contour,
+            geometry_candidates,
+            required_digits;
+            maximum_horizon_distance=maximum_horizon_distance,
+            endpoint_orders=endpoint_orders,
+        )
+        limitation = CF.diagnose_horizon_endpoint_limitation(
+            candidates, maximum_horizon_distance
+        )
+        progress_emit("horizon_endpoint_depth_attempt"; payload=Dict(
+            "deepest_rho" => string(minimum(rho_candidates)),
+            "candidate_count" => length(rho_candidates),
+            "limitation" => limitation,
+            "endpoint_order_ladder" => endpoint_orders,
+        ))
+        # Only depth-answerable limitations earn another round. Deepening moves
+        # the expansion point closer to the horizon, which shrinks the series
+        # parameter, so it repairs both a shallow geometry and a series that
+        # simply needed more terms. A precision limitation is arithmetic
+        # cancellation instead: no depth removes it, and it is the one
+        # diagnosis that should escalate the digit tier.
+        limitation == CF.HORIZON_ENDPOINT_GEOMETRY_LIMITED ||
+            limitation == CF.HORIZON_ENDPOINT_ORDER_LIMITED || break
+        deeper = CF.deepen_horizon_endpoint_rho_candidates(
+            rho_candidates, rho_floor
+        )
+        deeper === nothing && break
+        rho_candidates = deeper
+    end
     for candidate in candidates
         emit_horizon_endpoint_candidate(candidate)
     end
@@ -2968,6 +3002,26 @@ function horizon_endpoint_rho_candidates(::Type{T}, request) where {T<:AbstractF
     return T[parse(T, string(value)) for value in raw]
 end
 
+# The declared floor on how deep the endpoint search may go, and the ceiling on
+# how many series orders one radius may be tried at. Both are request
+# overridable so a leaf can be given more room without recompiling the worker.
+const HORIZON_ENDPOINT_RHO_FLOOR_DEFAULT = -400
+const HORIZON_ENDPOINT_MAXIMUM_ORDER_FACTOR = 4
+
+function horizon_endpoint_rho_floor(::Type{T}, request) where {T<:AbstractFloat}
+    haskey(request, "horizon_endpoint_rho_floor") || return T(
+        HORIZON_ENDPOINT_RHO_FLOOR_DEFAULT
+    )
+    return parse_real(T, request, "horizon_endpoint_rho_floor")
+end
+
+function horizon_endpoint_maximum_order(request, base_order::Integer)
+    haskey(request, "horizon_endpoint_maximum_order") || return (
+        HORIZON_ENDPOINT_MAXIMUM_ORDER_FACTOR * Int(base_order)
+    )
+    return parse_integer(request, "horizon_endpoint_maximum_order")
+end
+
 function emit_horizon_endpoint_candidate(candidate)
     geometry = candidate.geometry
     progress_emit("horizon_endpoint_candidate"; payload=Dict(
@@ -2982,6 +3036,7 @@ function emit_horizon_endpoint_candidate(candidate)
         "horizon_contour_id" => geometry.contour_id,
         "ingoing_adequate" => candidate.ingoing_adequate,
         "outgoing_adequate" => candidate.outgoing_adequate,
+        "endpoint_order" => candidate.endpoint_order,
         "ingoing_predicted_reliable_digits" =>
             candidate.ingoing_assessment === nothing ? nothing :
             string(candidate.ingoing_assessment.predicted_reliable_digits),

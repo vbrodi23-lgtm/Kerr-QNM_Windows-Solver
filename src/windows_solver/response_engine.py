@@ -74,6 +74,19 @@ ERROR_CHANNELS = (
 _RECORDED_ROOT_MAPPING_TOLERANCE_ABS = 5.0e-9
 _DIAGNOSTIC_ROOT_FAMILIES = ("truncation", "resolution", "seed-path")
 _PROMOTED_FIXED_ROOT_DIAGNOSTIC_FAMILIES = ("truncation", "resolution")
+# Four levels are the fewest the Richardson/holdout estimate and the observed
+# order ratios can be built from, so they are also the fewest a recovered
+# window may contain.
+LADDER_WINDOW_MINIMUM_LEVELS = 4
+RESOLVED_WINDOW_RECOVERY_POLICY = (
+    "finest-resolved-consecutive-epsilon-window/v1"
+)
+RESOLVED_WINDOW_EXCLUSION_REASON = "SIGNAL_BELOW_ROOT_NOISE_FLOOR"
+AMPLITUDE_EXPANSION_RECOVERY_POLICY = (
+    "coarser-amplitude-expansion-with-resolved-window/v1"
+)
+AMPLITUDE_EXPANSION_GROWTH = 2.0
+AMPLITUDE_EXPANSION_MAXIMUM_LEVELS = 3
 NUMERICAL_CONDITIONING_SCHEMA = "windows-solver.m02-conditioning/3"
 HISTORICAL_NUMERICAL_CONDITIONING_SCHEMA = (
     "windows-solver.m02-conditioning/2"
@@ -3913,6 +3926,7 @@ class ComponentResult:
     finite_amplitude_readout_count: int | None = None
     response_uncertainty_status: str | None = None
     error_channel_applicability: Mapping[str, bool] | None = None
+    resolved_window: Mapping[str, object] | None = None
 
     def __post_init__(self) -> None:
         if self.finite_amplitude_readout_count is None:
@@ -4061,6 +4075,8 @@ class ComponentResult:
                     self.response_uncertainty_status
                 ),
             })
+        if self.resolved_window is not None:
+            output["resolved_window"] = dict(self.resolved_window)
         return output
 
     @classmethod
@@ -4109,6 +4125,7 @@ class ComponentResult:
             error_channel_applicability=value.get(
                 "error_channel_applicability"
             ),
+            resolved_window=value.get("resolved_window"),
         )
 
 
@@ -4378,6 +4395,225 @@ def run_promoted_horizon_component(
     )
 
 
+@dataclass(frozen=True, slots=True)
+class _LadderVerdict:
+    """What one consecutive epsilon window establishes on its own evidence."""
+
+    outcome: str
+    convergence_basis: str | None = None
+    status: ComponentStatus | None = None
+    real_estimate: _AxisEstimate | None = None
+    imaginary_estimate: _AxisEstimate | None = None
+    combined_estimate: _AxisEstimate | None = None
+
+
+def _evaluate_ladder_window(
+    job: ResponseComponentJob, window: Sequence[LadderLevel]
+) -> _LadderVerdict:
+    """Decide whether one consecutive epsilon window resolves the response."""
+
+    if len(window) < LADDER_WINDOW_MINIMUM_LEVELS:
+        return _LadderVerdict("continue")
+    finest = window[-1]
+    real_estimate = _axis_estimate(window, "real")
+    imaginary_estimate = _axis_estimate(window, "imaginary")
+    combined_estimate = _axis_estimate(window, "combined")
+    estimates: dict[str, _AxisEstimate] = {
+        "real_estimate": real_estimate,
+        "imaginary_estimate": imaginary_estimate,
+        "combined_estimate": combined_estimate,
+    }
+    axis_difference = abs(real_estimate.center - imaginary_estimate.center)
+    axis_allowance = job.policy.axis_tolerance_factor * max(
+        real_estimate.root_radius
+        + imaginary_estimate.root_radius
+        + real_estimate.amplitude_radius
+        + imaginary_estimate.amplitude_radius,
+        job.policy.absolute_axis_floor,
+    )
+    if axis_difference > axis_allowance:
+        return _LadderVerdict(
+            "unresolved", status=ComponentStatus.AXIS_MISMATCH, **estimates
+        )
+    if not finest.signal_resolved(job.policy.signal_to_root_factor):
+        return _LadderVerdict(
+            "unresolved", status=ComponentStatus.NOISE_FLOOR, **estimates
+        )
+
+    epsilons = [item.epsilon for item in window]
+    real_values = [item.real_secant for item in window]
+    imaginary_values = [item.imaginary_secant for item in window]
+    real_orders = _observed_orders(epsilons, real_values)
+    imaginary_orders = _observed_orders(epsilons, imaginary_values)
+    even_orders = _positive_orders(
+        epsilons, [item.even_remainder_abs for item in window]
+    )
+    real_order_ok = (
+        bool(real_orders)
+        and real_orders[-1] >= 2.0 - job.policy.order_tolerance
+    )
+    imaginary_order_ok = (
+        bool(imaginary_orders)
+        and imaginary_orders[-1] >= 2.0 - job.policy.order_tolerance
+    )
+    even_order_ok = (
+        not even_orders
+        or even_orders[-1] >= 2.0 - job.policy.even_order_tolerance
+    )
+    root_limited = (
+        abs(real_values[-1] - real_values[-2])
+        <= window[-1].real_radius + window[-2].real_radius + 1.0e-15
+        and abs(imaginary_values[-1] - imaginary_values[-2])
+        <= window[-1].imaginary_radius + window[-2].imaginary_radius + 1.0e-15
+    )
+    even_resolved = (
+        finest.even_remainder_abs <= finest.even_remainder_noise + 1.0e-15
+    )
+    if root_limited and (even_resolved or even_order_ok):
+        return _LadderVerdict(
+            "converged",
+            convergence_basis="TRUNCATION_BELOW_ROOT_RESOLUTION",
+            **estimates,
+        )
+    if real_order_ok and imaginary_order_ok and even_order_ok:
+        return _LadderVerdict(
+            "converged", convergence_basis="ORDER_RESOLVED", **estimates
+        )
+    return _LadderVerdict("continue", **estimates)
+
+
+def _resolved_level_runs(
+    job: ResponseComponentJob, levels: Sequence[LadderLevel]
+) -> list[list[LadderLevel]]:
+    """Split the ladder into maximal runs of signal-resolved levels."""
+
+    factor = job.policy.signal_to_root_factor
+    runs: list[list[LadderLevel]] = []
+    current: list[LadderLevel] = []
+    for level in levels:
+        if level.signal_resolved(factor):
+            current.append(level)
+            continue
+        if current:
+            runs.append(current)
+        current = []
+    if current:
+        runs.append(current)
+    return runs
+
+
+def _recover_resolved_window(
+    job: ResponseComponentJob, levels: Sequence[LadderLevel]
+) -> tuple[list[LadderLevel], _LadderVerdict] | None:
+    """Fall back to the finest resolved window that still converges.
+
+    The ladder walks from coarse to fine, so a collapsing physical response
+    crosses the root noise floor at the fine end while the coarse levels stay
+    resolved.  Discarding the whole component there throws away evidence it has
+    already paid for.  Widening epsilon is also the cheaper recovery than
+    promoting arithmetic precision, so windows shrink from the fine end first
+    and precision promotion is left to the signed roots that remain root
+    limited.
+    """
+
+    runs = [
+        run
+        for run in _resolved_level_runs(job, levels)
+        if len(run) >= LADDER_WINDOW_MINIMUM_LEVELS
+    ]
+    if not runs:
+        return None
+    run = runs[-1]
+    for size in range(len(run), LADDER_WINDOW_MINIMUM_LEVELS - 1, -1):
+        window = run[:size]
+        verdict = _evaluate_ladder_window(job, window)
+        if verdict.outcome == "converged":
+            return window, verdict
+    return None
+
+
+def _resolved_window_record(
+    levels: Sequence[LadderLevel],
+    window: Sequence[LadderLevel],
+    policy: str = RESOLVED_WINDOW_RECOVERY_POLICY,
+) -> dict[str, object]:
+    included = {level.epsilon for level in window}
+    return {
+        "policy": policy,
+        "included_epsilons": [level.epsilon for level in window],
+        "excluded_epsilons": [
+            level.epsilon for level in levels if level.epsilon not in included
+        ],
+        "exclusion_reason": RESOLVED_WINDOW_EXCLUSION_REASON,
+    }
+
+
+def _expansion_epsilons(policy: NumericalPolicy) -> tuple[float, ...]:
+    """Amplitudes coarser than any the policy declares, coarsest last."""
+
+    coarsest = policy.epsilons[0]
+    return tuple(
+        coarsest * (AMPLITUDE_EXPANSION_GROWTH ** (index + 1))
+        for index in range(AMPLITUDE_EXPANSION_MAXIMUM_LEVELS)
+    )
+
+
+def _expand_amplitude_ladder(
+    job: ResponseComponentJob,
+    levels: Sequence[LadderLevel],
+    build_level: Callable[[float], LadderLevel],
+    record_rays: Callable[[LadderLevel], None],
+) -> tuple[list[LadderLevel], list[LadderLevel], _LadderVerdict] | None:
+    """Widen the amplitude until the signed displacements clear root noise.
+
+    A response that has physically collapsed leaves a signal proportional to
+    epsilon sitting under a root error that does not shrink with it, so every
+    level the policy declares can be noise while the same component at a wider
+    amplitude is perfectly resolvable.  The ladder cannot reach there on its
+    own because it only ever walks finer.
+    """
+
+    if not levels:
+        return None
+    runs = _resolved_level_runs(job, levels)
+    retained = list(runs[0]) if runs else []
+    # The predictors finished on the fine end of the ladder; re-seed them from
+    # the coarsest level actually read, which is the nearest evidence to where
+    # the expansion is going.
+    record_rays(levels[0])
+    factor = job.policy.signal_to_root_factor
+    expansion: list[LadderLevel] = []
+    for epsilon in _expansion_epsilons(job.policy):
+        level = build_level(epsilon)
+        for readout in (
+            level.real_plus,
+            level.real_minus,
+            level.imaginary_plus,
+            level.imaginary_minus,
+        ):
+            if _identity_status(job, readout) is not None:
+                return None
+        record_rays(level)
+        expansion.append(level)
+        if not level.signal_resolved(factor):
+            continue
+        window = sorted(
+            [item for item in expansion if item.signal_resolved(factor)]
+            + retained,
+            key=lambda item: item.epsilon,
+            reverse=True,
+        )
+        verdict = _evaluate_ladder_window(job, window)
+        if verdict.outcome == "converged":
+            combined = sorted(
+                list(levels) + expansion,
+                key=lambda item: item.epsilon,
+                reverse=True,
+            )
+            return combined, window, verdict
+    return None
+
+
 def run_component(
     job: ResponseComponentJob,
     backend: RootReadoutBackend,
@@ -4462,6 +4698,9 @@ def run_component(
         )
 
     levels: list[LadderLevel] = []
+    window: list[LadderLevel] = []
+    resolved_window: dict[str, object] | None = None
+    pending_status: ComponentStatus | None = None
     convergence_basis = "UNRESOLVED"
     real_estimate: _AxisEstimate | None = None
     imaginary_estimate: _AxisEstimate | None = None
@@ -4487,8 +4726,8 @@ def run_component(
             "EPSILON_CONTINUATION",
         )
 
-    for epsilon in job.policy.epsilons:
-        level = LadderLevel(
+    def build_level(epsilon: float) -> LadderLevel:
+        return LadderLevel(
             epsilon=epsilon,
             real_plus=read_root(
                 "real-plus",
@@ -4519,6 +4758,17 @@ def run_component(
                 ),
             ),
         )
+
+    def record_rays(level: LadderLevel) -> None:
+        ray_states.update({
+            "real-plus": (level.epsilon, level.real_plus),
+            "real-minus": (level.epsilon, level.real_minus),
+            "imaginary-plus": (level.epsilon, level.imaginary_plus),
+            "imaginary-minus": (level.epsilon, level.imaginary_minus),
+        })
+
+    for epsilon in job.policy.epsilons:
+        level = build_level(epsilon)
         levels.append(level)
         for readout in (
             level.real_plus,
@@ -4533,81 +4783,60 @@ def run_component(
                     job,
                     _unresolved_result(job, status, baseline, levels),
                 )
-        ray_states.update({
-            "real-plus": (epsilon, level.real_plus),
-            "real-minus": (epsilon, level.real_minus),
-            "imaginary-plus": (epsilon, level.imaginary_plus),
-            "imaginary-minus": (epsilon, level.imaginary_minus),
-        })
-        if len(levels) < 4:
+        record_rays(level)
+        verdict = _evaluate_ladder_window(job, levels)
+        if verdict.outcome == "continue":
             continue
-
-        real_estimate = _axis_estimate(levels, "real")
-        imaginary_estimate = _axis_estimate(levels, "imaginary")
-        combined_estimate = _axis_estimate(levels, "combined")
-        axis_difference = abs(real_estimate.center - imaginary_estimate.center)
-        axis_allowance = job.policy.axis_tolerance_factor * max(
-            real_estimate.root_radius
-            + imaginary_estimate.root_radius
-            + real_estimate.amplitude_radius
-            + imaginary_estimate.amplitude_radius,
-            job.policy.absolute_axis_floor,
-        )
-        if axis_difference > axis_allowance:
-            return _validated_result(
-                backend,
-                job,
-                _unresolved_result(
-                    job, ComponentStatus.AXIS_MISMATCH, baseline, levels
-                ),
-            )
-        if not level.signal_resolved(job.policy.signal_to_root_factor):
-            return _validated_result(
-                backend,
-                job,
-                _unresolved_result(
-                    job, ComponentStatus.NOISE_FLOOR, baseline, levels
-                ),
-            )
-
-        epsilons = [item.epsilon for item in levels]
-        real_values = [item.real_secant for item in levels]
-        imaginary_values = [item.imaginary_secant for item in levels]
-        real_orders = _observed_orders(epsilons, real_values)
-        imaginary_orders = _observed_orders(epsilons, imaginary_values)
-        even_orders = _positive_orders(
-            epsilons, [item.even_remainder_abs for item in levels]
-        )
-        real_order_ok = bool(real_orders) and real_orders[-1] >= 2.0 - job.policy.order_tolerance
-        imaginary_order_ok = (
-            bool(imaginary_orders)
-            and imaginary_orders[-1] >= 2.0 - job.policy.order_tolerance
-        )
-        even_order_ok = (
-            not even_orders
-            or even_orders[-1] >= 2.0 - job.policy.even_order_tolerance
-        )
-        root_limited = (
-            abs(real_values[-1] - real_values[-2])
-            <= levels[-1].real_radius + levels[-2].real_radius + 1.0e-15
-            and abs(imaginary_values[-1] - imaginary_values[-2])
-            <= levels[-1].imaginary_radius + levels[-2].imaginary_radius + 1.0e-15
-        )
-        even_resolved = level.even_remainder_abs <= level.even_remainder_noise + 1.0e-15
-        if root_limited and (even_resolved or even_order_ok):
-            convergence_basis = "TRUNCATION_BELOW_ROOT_RESOLUTION"
-            break
-        if real_order_ok and imaginary_order_ok and even_order_ok:
-            convergence_basis = "ORDER_RESOLVED"
-            break
+        if verdict.outcome == "unresolved":
+            assert verdict.status is not None
+            if verdict.status is not ComponentStatus.NOISE_FLOOR:
+                return _validated_result(
+                    backend,
+                    job,
+                    _unresolved_result(job, verdict.status, baseline, levels),
+                )
+            recovery = _recover_resolved_window(job, levels)
+            if recovery is None:
+                pending_status = ComponentStatus.NOISE_FLOOR
+                break
+            window, verdict = recovery
+            resolved_window = _resolved_window_record(levels, window)
+        else:
+            window = list(levels)
+        real_estimate = verdict.real_estimate
+        imaginary_estimate = verdict.imaginary_estimate
+        combined_estimate = verdict.combined_estimate
+        assert verdict.convergence_basis is not None
+        convergence_basis = verdict.convergence_basis
+        break
     else:
-        return _validated_result(
-            backend,
-            job,
-            _unresolved_result(
-                job, ComponentStatus.NOT_CONVERGED, baseline, levels
-            ),
+        pending_status = ComponentStatus.NOT_CONVERGED
+
+    if pending_status is not None:
+        # The ladder only ever walks finer, so once it is exhausted or has sunk
+        # into the root noise there is no coarser evidence left inside it to
+        # fall back on. Widening the amplitude is the move that recovers a
+        # physically collapsed response, and it is cheaper than promoting the
+        # arithmetic tier, so it is tried first and precision promotion is left
+        # to the signed roots that stay root limited afterwards.
+        expansion = _expand_amplitude_ladder(
+            job, levels, build_level, record_rays
         )
+        if expansion is None:
+            return _validated_result(
+                backend,
+                job,
+                _unresolved_result(job, pending_status, baseline, levels),
+            )
+        levels, window, verdict = expansion
+        resolved_window = _resolved_window_record(
+            levels, window, AMPLITUDE_EXPANSION_RECOVERY_POLICY
+        )
+        real_estimate = verdict.real_estimate
+        imaginary_estimate = verdict.imaginary_estimate
+        combined_estimate = verdict.combined_estimate
+        assert verdict.convergence_basis is not None
+        convergence_basis = verdict.convergence_basis
 
     if real_estimate is None or imaginary_estimate is None or combined_estimate is None:
         return _validated_result(
@@ -4627,7 +4856,7 @@ def run_component(
         combined_estimate.amplitude_radius,
         0.0 if closed_form is None else abs(closed_form - signed_center),
     )
-    raw = (baseline, *(item for level in levels for item in (
+    raw = (baseline, *(item for level in window for item in (
         level.real_plus,
         level.real_minus,
         level.imaginary_plus,
@@ -4658,7 +4887,7 @@ def run_component(
             raise ValueError("signed diagnostic root families are inconsistent")
         diagnostic_channels = {
             family: _diagnostic_response_channel(
-                levels,
+                window,
                 family,
                 primary_center=combined_estimate.center,
                 primary_radius=combined_estimate.root_radius,
@@ -4695,6 +4924,7 @@ def run_component(
             baseline=baseline,
             levels=tuple(levels),
             lineage=_result_lineage(job),
+            resolved_window=resolved_window,
         ),
     )
 

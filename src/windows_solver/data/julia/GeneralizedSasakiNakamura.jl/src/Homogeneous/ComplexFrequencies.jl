@@ -2711,7 +2711,19 @@ struct HorizonEndpointCandidate{T<:AbstractFloat}
     outgoing_evaluation::Union{Nothing,SeriesEvaluation{T}}
     ingoing_assessment::Union{Nothing,AsymptoticConditioningAssessment{T}}
     outgoing_assessment::Union{Nothing,AsymptoticConditioningAssessment{T}}
+    endpoint_order::Union{Nothing,Int}
 end
+
+# Why a candidate failed decides what fixes it. A candidate whose series is
+# still converging needs more order; one whose arithmetic has been eaten by
+# cancellation needs more precision; one already past its optimal truncation at
+# this radius needs a radius nearer the horizon, and neither more order nor
+# more precision will move it.
+const HORIZON_ENDPOINT_ADEQUATE = "adequate/v1"
+const HORIZON_ENDPOINT_ORDER_LIMITED = "insufficient-series-order/v1"
+const HORIZON_ENDPOINT_PRECISION_LIMITED =
+    "insufficient-arithmetic-precision/v1"
+const HORIZON_ENDPOINT_GEOMETRY_LIMITED = "insufficient-geometric-depth/v1"
 
 function _describe_horizon_candidate(candidate::HorizonEndpointCandidate)
     geometry = candidate.geometry
@@ -2759,6 +2771,174 @@ function _candidate_adequate(
         candidate.outgoing_evaluation !== nothing &&
         candidate.ingoing_assessment !== nothing &&
         candidate.outgoing_assessment !== nothing
+end
+
+"""
+    horizon_endpoint_limitation(candidate, maximum_horizon_distance)
+
+Name the single constraint that keeps `candidate` from being usable.
+"""
+function horizon_endpoint_limitation(
+    candidate::HorizonEndpointCandidate{T},
+    maximum_horizon_distance::T,
+) where {T<:AbstractFloat}
+    _geometry_candidate_adequate(
+        candidate.geometry, maximum_horizon_distance
+    ) || return HORIZON_ENDPOINT_GEOMETRY_LIMITED
+    _candidate_adequate(candidate, maximum_horizon_distance) &&
+        return HORIZON_ENDPOINT_ADEQUATE
+    assessments = filter(
+        !isnothing,
+        (candidate.ingoing_assessment, candidate.outgoing_assessment),
+    )
+    isempty(assessments) && return HORIZON_ENDPOINT_GEOMETRY_LIMITED
+    binding = argmin(
+        assessment -> assessment.predicted_reliable_digits, assessments
+    )
+    # A last-term ratio at or above one means the series has already passed its
+    # smallest term at this radius. Adding orders makes the tail grow and no
+    # number of digits outruns a divergent remainder; only a radius nearer the
+    # horizon moves this candidate.
+    binding.maximum_last_term_ratio >= one(T) &&
+        return HORIZON_ENDPOINT_GEOMETRY_LIMITED
+    arithmetic_loss = binding.maximum_recurrence_digits_lost +
+        binding.maximum_series_evaluation_digits_lost
+    return arithmetic_loss >= binding.maximum_truncation_digits_lost ?
+        HORIZON_ENDPOINT_PRECISION_LIMITED :
+        HORIZON_ENDPOINT_ORDER_LIMITED
+end
+
+"""
+    diagnose_horizon_endpoint_limitation(candidates, maximum_horizon_distance)
+
+Name the constraint binding the candidate set as a whole.
+
+Two adequate endpoints are required, so the diagnosis describes why the set
+cannot supply them. The remedy is read from the candidate that came closest to
+passing: it is the one a single change of order, precision, or depth is most
+likely to move.
+"""
+function diagnose_horizon_endpoint_limitation(
+    candidates::Vector{HorizonEndpointCandidate{T}},
+    maximum_horizon_distance::T,
+) where {T<:AbstractFloat}
+    adequate = count(
+        candidate -> _candidate_adequate(candidate, maximum_horizon_distance),
+        candidates,
+    )
+    adequate >= 2 && return HORIZON_ENDPOINT_ADEQUATE
+    reachable = filter(
+        candidate -> _geometry_candidate_adequate(
+                candidate.geometry, maximum_horizon_distance
+            ) &&
+            !_candidate_adequate(candidate, maximum_horizon_distance) &&
+            candidate.ingoing_assessment !== nothing &&
+            candidate.outgoing_assessment !== nothing,
+        candidates,
+    )
+    isempty(reachable) && return HORIZON_ENDPOINT_GEOMETRY_LIMITED
+    best = argmax(
+        candidate -> min(
+            candidate.ingoing_assessment.predicted_reliable_digits,
+            candidate.outgoing_assessment.predicted_reliable_digits,
+        ),
+        reachable,
+    )
+    return horizon_endpoint_limitation(best, maximum_horizon_distance)
+end
+
+"""
+    horizon_endpoint_order_ladder(base_order; maximum_order)
+
+The endpoint series orders tried at one radius, coarsest first.
+
+Doubling keeps the ladder short: each extra entry costs a full series
+evaluation, and the search stops at the first adequate order anyway.
+"""
+function horizon_endpoint_order_ladder(
+    base_order::Integer; maximum_order::Integer=4 * base_order
+)
+    base_order > 0 || throw(ArgumentError(
+        "horizon endpoint base order must be positive"
+    ))
+    maximum_order >= base_order || throw(ArgumentError(
+        "horizon endpoint maximum order must not precede the base order"
+    ))
+    orders = Int[]
+    order = Int(base_order)
+    while order < maximum_order
+        push!(orders, order)
+        order += order
+    end
+    push!(orders, Int(maximum_order))
+    return orders
+end
+
+"""
+    deepen_horizon_endpoint_rho_candidates(candidates, floor_rho)
+
+Extend the endpoint candidate depths toward the declared coordinate floor.
+
+Moving the expansion point closer to the horizon shrinks the series parameter,
+so a deeper candidate repairs both a geometry that never came within the
+maximum horizon distance and a series that simply needed more terms.
+
+Returns `nothing` once the floor has been reached, which is how the caller
+learns that no further depth is available and the failure is real.
+"""
+function deepen_horizon_endpoint_rho_candidates(
+    candidates::Vector{T},
+    floor_rho::T;
+    growth::T=T(3) / T(2),
+    added::Int=2,
+) where {T<:AbstractFloat}
+    isempty(candidates) && return nothing
+    growth > one(T) || throw(ArgumentError(
+        "horizon endpoint depth growth must exceed one"
+    ))
+    floor_rho < zero(T) || throw(ArgumentError(
+        "horizon endpoint coordinate floor must be negative"
+    ))
+    deepest = minimum(candidates)
+    deepest <= floor_rho && return nothing
+    extended = copy(candidates)
+    current = deepest
+    for _ in 1:added
+        current = current * growth
+        current < floor_rho && (current = floor_rho)
+        current in extended || push!(extended, current)
+        current == floor_rho && break
+    end
+    length(extended) == length(candidates) && return nothing
+    return sort(extended; rev=true)
+end
+
+function _best_prefix_assessment(
+    series,
+    radius,
+    required_digits::T,
+    orders::Vector{Int},
+) where {T<:AbstractFloat}
+    best_order = nothing
+    best_evaluation = nothing
+    best_assessment = nothing
+    for order in orders
+        evaluation = evaluate_horizon_asymptotic_series(
+            series, radius; order=order
+        )
+        assessment = assess_asymptotic_preflight(
+            series, evaluation, required_digits
+        )
+        if best_assessment === nothing ||
+            assessment.predicted_reliable_digits >
+                best_assessment.predicted_reliable_digits
+            best_order = order
+            best_evaluation = evaluation
+            best_assessment = assessment
+        end
+        assessment.adequate && break
+    end
+    return best_order, best_evaluation, best_assessment
 end
 
 struct RealInnerHorizonEndpoint{T<:AbstractFloat}
@@ -3116,6 +3296,7 @@ function horizon_endpoint_candidates(
     geometry_candidates::Vector{HorizonEndpointGeometryCandidate{T}},
     required_digits::T;
     maximum_horizon_distance::T=T(DEFAULT_MAXIMUM_HORIZON_DISTANCE),
+    endpoint_orders::Union{Nothing,Vector{Int}}=nothing,
 ) where {T<:AbstractFloat}
     return _translate_factored_failure(
         T,
@@ -3155,22 +3336,21 @@ function horizon_endpoint_candidates(
                         nothing,
                         nothing,
                         nothing,
+                        nothing,
                     ))
                     continue
                 end
                 radius = geometry_candidate.radius
-                ingoing_evaluation = evaluate_horizon_asymptotic_series(
-                    ingoing_series, radius; order=spectral.endpoint_order
-                )
-                outgoing_evaluation = evaluate_horizon_asymptotic_series(
-                    outgoing_series, radius; order=spectral.endpoint_order
-                )
-                ingoing_assessment = assess_asymptotic_preflight(
-                    ingoing_series, ingoing_evaluation, required_digits
-                )
-                outgoing_assessment = assess_asymptotic_preflight(
-                    outgoing_series, outgoing_evaluation, required_digits
-                )
+                orders = endpoint_orders === nothing ?
+                    Int[spectral.endpoint_order] : endpoint_orders
+                ingoing_order, ingoing_evaluation, ingoing_assessment =
+                    _best_prefix_assessment(
+                        ingoing_series, radius, required_digits, orders
+                    )
+                outgoing_order, outgoing_evaluation, outgoing_assessment =
+                    _best_prefix_assessment(
+                        outgoing_series, radius, required_digits, orders
+                    )
                 push!(candidates, HorizonEndpointCandidate{T}(
                     geometry_candidate,
                     ingoing_assessment.adequate,
@@ -3179,6 +3359,7 @@ function horizon_endpoint_candidates(
                     outgoing_evaluation,
                     ingoing_assessment,
                     outgoing_assessment,
+                    max(ingoing_order, outgoing_order),
                 ))
             end
             return candidates
@@ -3219,12 +3400,15 @@ function select_verified_horizon_endpoints(
     if length(adequate) < 2
         detail = isempty(candidates) ? "no candidates were evaluated" :
             join(map(_describe_horizon_candidate, candidates), "; ")
+        limitation = diagnose_horizon_endpoint_limitation(
+            candidates, maximum_horizon_distance
+        )
         throw(_factored_error(
             T,
             NO_VERIFIED_HORIZON_ENDPOINT,
             spectral.precision_bits,
             "fewer than two horizon endpoints passed the radial-approach and " *
-            "dual-series gate: " * detail,
+            "dual-series gate [limitation=" * limitation * "]: " * detail,
         ))
     end
     ordered = sort(
