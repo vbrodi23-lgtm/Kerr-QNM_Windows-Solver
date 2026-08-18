@@ -272,7 +272,7 @@ same-frequency cross-precision term.
 - Modify: `m02-calibrate-horizon.ps1`
 - Modify: `tools/benchmark_leaf13_factored_legs.jl`
 - Modify: `.github/workflows/ci.yml`
-- Modify: `docs/engineering/2026-08-15-horizon-rewrite-handover.md`
+- Archived: `historical-records/m02/pr46-horizon-rewrite/2026-08-15-horizon-rewrite-handover.md`
 - Modify: `.tasks/IN_PROGRESS.md`
 - Modify: `.tasks/DONE.md`
 - Modify: `.tasks/WORK_LOG.md`

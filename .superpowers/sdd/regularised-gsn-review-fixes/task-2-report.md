@@ -12,7 +12,7 @@ solved-leaf cache quarantine.
 
 - `src/windows_solver/response_batches.py`
 - `tests/test_linear_response_precision.py`
-- `.superpowers/sdd/regularised-gsn-review-fixes/progress.md`
+- `historical-records/m02/regularised-gsn-review/progress.md`
 
 ## RED evidence
 

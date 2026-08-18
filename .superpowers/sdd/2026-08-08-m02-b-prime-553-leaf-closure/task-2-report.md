@@ -9,7 +9,7 @@ DONE
 - `tools/compute_kerr_qnm_overlay.py` — literal 44-target enumerator, authenticated-parent boundary, canonical two-schedule cohort continuation, multi-inversion assignment, exact-target polish/refinement, reverse/path gates, deterministic checkpoint/receipt serialization, and atomic publication.
 - `src/windows_solver/data/kerr_qnm_m02_overlay_44.csv` — real 44-row numerical sparse overlay.
 - `src/windows_solver/data/kerr_qnm_m02_overlay_receipt.json` — strict canonical receipt binding parents, target set, policy, generator, backend, runtime, validation extrema, and artifact bytes.
-- `task-2-overlay-checkpoint.json` — complete 44-row checkpoint bound to the same generator/backend/runtime/parents/policy/target set.
+- `historical-records/m02/spectral-overlay-44/task-2-overlay-checkpoint.json` — complete 44-row checkpoint bound to the same generator/backend/runtime/parents/policy/target set.
 - `src/windows_solver/spectrum.py` — strict overlay receipt/CSV loading and validation, exact disjoint base-plus-overlay selection, and payload provenance while preserving the base carrier surface and sole spectral provider owner.
 - `src/windows_solver/data/release_domain_manifest.json`, `src/windows_solver/release_manifest.py`, and `pyproject.toml` — release hash/count/module ownership and package-data bindings.
 - `tests/test_spectral_extension.py` and `tests/test_release_manifest.py` — red/green builder, checkpoint, exact-target, runtime-union, immutable-parent, manifest, and fail-closed regression coverage.
@@ -32,7 +32,7 @@ Final focused verification passed 56 tests.
 ## Exact generator command and runtime
 
 ```text
-PYTHONPATH=src:tools python tools/compute_kerr_qnm_overlay.py --base-catalog src/windows_solver/data/kerr_qnm_roots_2736.csv --base-receipt src/windows_solver/data/kerr_qnm_lattice_receipt.json --output-catalog src/windows_solver/data/kerr_qnm_m02_overlay_44.csv --output-receipt src/windows_solver/data/kerr_qnm_m02_overlay_receipt.json --checkpoint .superpowers/sdd/2026-08-08-m02-b-prime-553-leaf-closure/task-2-overlay-checkpoint.json --workers 4
+PYTHONPATH=src:tools python tools/compute_kerr_qnm_overlay.py --base-catalog src/windows_solver/data/kerr_qnm_roots_2736.csv --base-receipt src/windows_solver/data/kerr_qnm_lattice_receipt.json --output-catalog src/windows_solver/data/kerr_qnm_m02_overlay_44.csv --output-receipt src/windows_solver/data/kerr_qnm_m02_overlay_receipt.json --checkpoint historical-records/m02/spectral-overlay-44/task-2-overlay-checkpoint.json --workers 4
 ```
 
 - Python: `3.12.13`

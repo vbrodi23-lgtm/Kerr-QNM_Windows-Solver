@@ -29,7 +29,7 @@ GeneralizedSasakiNakamura package, BigFloat at 298 bits.
 ### Task 1: Red prototype contracts
 
 **Files:**
-- Create: `src/windows_solver/data/julia/horizon_basis_at_match_prototype_spec.jl`
+- Archived: `historical-records/m02/horizon-basis-at-match/horizon_basis_at_match_prototype_spec.jl`
 
 - [x] Pin the physical-state carrier/factor round trip for a non-aligned real
   tangent.
@@ -41,7 +41,7 @@ GeneralizedSasakiNakamura package, BigFloat at 298 bits.
 ### Task 2: Prototype implementation
 
 **Files:**
-- Create: `tools/benchmark_leaf13_horizon_basis_at_match.jl`
+- Archived: `historical-records/m02/horizon-basis-at-match/benchmark_leaf13_horizon_basis_at_match.jl`
 
 - [x] Build and verify the real inner radial map.
 - [x] Select the nearest endpoint that passes both horizon preflights.

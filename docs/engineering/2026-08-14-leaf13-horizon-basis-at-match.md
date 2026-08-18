@@ -84,10 +84,10 @@ consistency evidence, not a mathematical validation receipt.
 JULIA_DEPOT_PATH=/tmp/kerr-julia.plLFjF/depot \
   /tmp/kerr-julia.plLFjF/julia-1.10.11/bin/julia \
   --project=/tmp/kerr-julia.plLFjF/m02-project \
-  src/windows_solver/data/julia/horizon_basis_at_match_prototype_spec.jl
+  historical-records/m02/horizon-basis-at-match/horizon_basis_at_match_prototype_spec.jl
 
 JULIA_DEPOT_PATH=/tmp/kerr-julia.plLFjF/depot \
   /tmp/kerr-julia.plLFjF/julia-1.10.11/bin/julia \
   --project=/tmp/kerr-julia.plLFjF/m02-project \
-  tools/benchmark_leaf13_horizon_basis_at_match.jl
+  historical-records/m02/horizon-basis-at-match/benchmark_leaf13_horizon_basis_at_match.jl
 ```
