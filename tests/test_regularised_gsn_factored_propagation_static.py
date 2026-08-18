@@ -356,9 +356,26 @@ class RegularisedGsnFactoredPropagationSourceTests(unittest.TestCase):
             "geometry_candidates::Vector{HorizonEndpointGeometryCandidate{T}}",
             series,
         )
+        # Series evaluation has exactly one owner. The order ladder evaluates a
+        # series per candidate radius per order, so the candidate loop must
+        # reach it only through the prefix search rather than calling the
+        # evaluator itself; two call sites would let one of them escape the
+        # radial gate below.
+        self.assertNotIn("evaluate_horizon_asymptotic_series(", series)
+        prefix_search = self._function("_best_prefix_assessment")
+        self.assertIn(
+            "evaluate_horizon_asymptotic_series(", prefix_search
+        )
+        self.assertIn("assess_asymptotic_preflight(", prefix_search)
+
         radial_gate = series.index("_geometry_candidate_adequate(")
-        ingoing_series = series.index("evaluate_horizon_asymptotic_series(")
+        ingoing_series = series.index("_best_prefix_assessment(")
         self.assertLess(radial_gate, ingoing_series)
+        # The gate has to abandon the candidate, not merely precede the series.
+        # Recording an inadequate geometry and falling through would evaluate
+        # both series at a radius the geometry already rejected.
+        short_circuit = series.index("continue", radial_gate)
+        self.assertLess(short_circuit, ingoing_series)
 
         selector = self._function("select_verified_horizon_endpoints")
         self.assertIn(

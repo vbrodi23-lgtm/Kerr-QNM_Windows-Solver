@@ -1145,6 +1145,8 @@ $candidate | ConvertTo-Json -Compress | Set-Content -LiteralPath $env:M02_TEST_J
             "single-promoted-root-analytic-horizon-component/v1",
             "analytic-horizon-from-promoted-primary-derivative/v1",
             "single-promoted-horizon-root-after-80-preflight/v1",
+            "finest-resolved-consecutive-epsilon-window/v1",
+            "coarser-amplitude-expansion-with-resolved-window/v1",
             "NOT_REQUIRED_BY_V1_4_PROMOTED_ROOT_POLICY",
         })
         lineage_character = r"A-Za-z0-9_/:;=+\-"

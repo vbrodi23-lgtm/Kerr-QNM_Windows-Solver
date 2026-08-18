@@ -94,6 +94,10 @@ class ProgressEventKind(StrEnum):
     # a NO_VERIFIED_HORIZON_ENDPOINT failure can be read back to the exact
     # radial-approach or series condition that rejected each one.
     HORIZON_ENDPOINT_CANDIDATE = "horizon_endpoint_candidate"
+    # One round of the endpoint depth and order search. Reported per round so an
+    # exhausted search can be read back to the depth it reached and the
+    # limitation that stopped it rather than to a bare endpoint failure.
+    HORIZON_ENDPOINT_DEPTH_ATTEMPT = "horizon_endpoint_depth_attempt"
     HORIZON_ENDPOINTS_VERIFIED = "horizon_endpoints_verified"
     COORDINATE_IDENTITY_CHECKED = "coordinate_identity_checked"
     COORDINATE_INVERSION_STALLED = "coordinate_inversion_stalled"
