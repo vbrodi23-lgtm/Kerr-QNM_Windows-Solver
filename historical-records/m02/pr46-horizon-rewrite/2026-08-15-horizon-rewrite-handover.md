@@ -1,7 +1,7 @@
 # Handover — horizon detector rewrite (PR #46)
 
 > **Continuation:** Read
-> `docs/engineering/2026-08-15-pr46-codex-handover.md` for the current branch
+> `historical-records/m02/pr46-horizon-rewrite/2026-08-15-pr46-codex-handover.md` for the current branch
 > state, the completed Task 1 evidence, and the blocking review findings on the
 > latest Task 2 checkpoint. The state/next-step sections below are historical.
 
