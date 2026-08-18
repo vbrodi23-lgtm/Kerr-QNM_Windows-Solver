@@ -59,9 +59,11 @@ ladder: PRIMARY accepts on `|D| / |D'| <= 2e-11` with zero post-Newton
 determinant evaluations and retains the accepted complex derivative;
 TRUNCATION and RESOLUTION each evaluate exactly one further determinant at
 the fixed PRIMARY frequency by reusing that derivative rather than resolving
-it independently. This is not a scientific completion claim — the derived
-response carries an explicit `UNCALIBRATED_ANALYTIC_RESPONSE` uncertainty
-status, and admission stays fail-closed on it.
+it independently. The derived response carries component identity
+`single-promoted-root-analytic-horizon-component/v1` and uncertainty status
+`UNCALIBRATED_ANALYTIC_RESPONSE`, with every error channel marked
+not-applicable rather than measured-zero; admission fails closed on that
+status.
 
 TASK-075 remains open only for the missing immutable receipt for the
 independent Black Hole Perturbation Toolkit Mathematica spheroidal validation
