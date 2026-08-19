@@ -19,32 +19,61 @@ from pathlib import Path, PureWindowsPath
 import re
 import tempfile
 import time
-from typing import Mapping, Sequence
+from typing import Callable, Mapping, Sequence
 
 from .contracts import canonical_json_bytes
+from .adaptive_controls import (
+    ODE_CALIBRATION_BLOCKER,
+    MissingODECalibrationError,
+    ODEErrorBudget,
+)
 from .linear_response import B_PRIME_RELEASE_DOMAIN, BPrimeLeaf
 from .response_engine import (
     BackendIdentity,
     ComponentResult,
     ComponentStatus,
+    FixedRootDeterminantSample,
     NativeDeterminantAdapter,
     NativeResourceUnavailableError,
     NumericalConditioningEvidence,
     HISTORICAL_NUMERICAL_CONDITIONING_SCHEMA,
     NUMERICAL_CONDITIONING_SCHEMA,
     NumericalPolicy,
+    HISTORICAL_PROMOTED_ROOT_READOUT_POLICY,
+    BOUNDED_ANALYTIC_RESPONSE,
+    BOUNDED_DERIVATIVE_RESPONSE,
+    EXTERIOR_DERIVATIVE_COMPONENT_IDENTITY,
+    EXTERIOR_DERIVATIVE_RESPONSE_DISK_IDENTITY,
+    EXTERIOR_DERIVATIVE_METHOD,
+    FIXED_ROOT_AXIS_VALIDATION_IDENTITY,
+    FIXED_ROOT_DERIVATIVE_CONDITIONING_IDENTITY,
+    FULL_COMPLEX_LADDER_VALIDATION_IDENTITY,
     PROMOTED_HORIZON_COMPONENT_IDENTITY,
+    PROMOTED_HORIZON_COMPONENT_V2_IDENTITY,
     PROMOTED_HORIZON_RESPONSE_METHOD,
+    PROMOTED_HORIZON_RESPONSE_METHOD_V2,
     PROMOTED_ROOT_READOUT_POLICY,
     RECORDED_REPLAY_BACKEND_ID,
     RecordedReplayBackend,
     ResponseComponentJob,
+    RootReadout,
     VettedNativeDeterminantKernel,
+    WORKER_RESPONSE_RECEIPT_SCHEMA,
     UNCALIBRATED_ANALYTIC_RESPONSE,
     regularised_gsn_precision_policy,
     root_readout_preserves_authenticated_branch,
+    regularised_gsn_mechanism_contract,
     run_component,
+    run_promoted_exterior_component,
     run_promoted_horizon_component,
+    run_selective_readout_promotion,
+)
+from .partial_component_checkpoint import PartialComponentJournal
+from .precision_tiers import (
+    PrecisionTier,
+    nominal_decimal_digits,
+    precision_tier,
+    working_precision_bits,
 )
 from .gsn_cache_producer import (
     GeneratedGsnCache,
@@ -61,10 +90,16 @@ from .julia_response_backend import (
     JuliaResponseAdapter,
     JuliaResponseBackendError,
     JuliaWorkerTimeoutError,
+    _execution_resource_policy,
+    _exterior_support,
+    _mode_specific_branch_enclosure_radius,
     _validated_execution_resource_policy,
     _valid_numerical_control_diagnostics,
+    horizon_geometry_controls,
+    promoted_precision_numerical_controls,
     worker_failure_payload as _julia_worker_failure_payload,
 )
+from .root_readout_cache import runtime_identity_sha256
 from .progress import PROGRESS_SCHEMA, ProgressEventKind, emit_progress, progress_scope
 from .solved_leaf_cache import (
     SolvedLeafLookup,
@@ -73,10 +108,22 @@ from .solved_leaf_cache import (
 )
 
 
-CAMPAIGN_SCHEMA_VERSION = 2
-CAMPAIGN_CHECKPOINT_SCHEMA_VERSION = 7
+CAMPAIGN_SCHEMA_VERSION = 3
+CAMPAIGN_CHECKPOINT_SCHEMA_VERSION = 8
 _LEGACY_CAMPAIGN_CHECKPOINT_SCHEMA_VERSION = 3
-_HISTORICAL_CAMPAIGN_CHECKPOINT_SCHEMA_VERSIONS = frozenset({3, 4, 5, 6})
+_HISTORICAL_CAMPAIGN_CHECKPOINT_SCHEMA_VERSIONS = frozenset({3, 4, 5, 6, 7})
+_SCHEMA7_CAMPAIGN_ID = (
+    "b-prime-campaign-0e93d89e98650d1e2db109d41ca0b68919067f6627ccd320fddc1e83f4720024"
+)
+_SCHEMA7_CAMPAIGN_SOURCE_SHA256 = (
+    "504133318d896d436f92399dd8ea95424bbac3889fa8043ba3ed89bfab65d968"
+)
+_SCHEMA7_ENGINE_SOURCE_SHA256 = (
+    "6bc9938b91d7de59669574b89b58a6bec8335d48f8b0678815350b0fba977be4"
+)
+_SCHEMA7_PRECISION_CONTRACT_SHA256 = (
+    "3f6364f6fc28eebeeb788af20524f8ada3c97f23e41fb68f4ead3da365368dcb"
+)
 _PROMOTION_DECISION_CHECKPOINT_SCHEMA_VERSION = 6
 _FAILED_PREFLIGHT_CHECKPOINT_SCHEMA_VERSION = 6
 _PRECISION_DIGITS = frozenset({64, 80, 120})
@@ -159,7 +206,7 @@ def _campaign_source_sha256() -> str:
 def _campaign_engine_identity_sha256() -> str:
     return _sha256({
         "path": "src/windows_solver/response_engine.py",
-        "contract_version": 1,
+        "contract_version": 2,
     })
 
 
@@ -805,6 +852,10 @@ _CONTAINABLE_EXCEPTION_TYPES = (
     JuliaWorkerTimeoutError,
     JuliaNumericalControlError,
 )
+_RETRYABLE_NUMERICAL_CONTROL_FAILURE_CODES = frozenset({
+    "INSUFFICIENT_ASYMPTOTIC_PRECISION",
+    "HORIZON_ARITHMETIC_INADEQUATE",
+})
 
 
 def _validated_attempt_failure_receipt(value: object) -> dict[str, object]:
@@ -827,7 +878,7 @@ def _validated_attempt_failure_receipt(value: object) -> dict[str, object]:
         raise ValueError("campaign execution attempt is not containable")
     if code in NUMERICAL_CONTROL_FAILURE_CODES and (
         failure.get("retryable")
-        is not (code == "INSUFFICIENT_ASYMPTOTIC_PRECISION")
+        is not (code in _RETRYABLE_NUMERICAL_CONTROL_FAILURE_CODES)
         or not _valid_numerical_control_diagnostics(failure)
     ):
         raise ValueError(
@@ -1071,6 +1122,101 @@ class CampaignExecutionAttempt:
         return attempt
 
 
+def _schema7_precision_policy(
+    job: ResponseComponentJob,
+    digits: int,
+    refinement: int,
+) -> dict[str, object]:
+    """Reconstruct the exact promoted policy emitted by checkpoint schema 7."""
+
+    level = "base" if refinement == 0 else "refinement"
+    regularised = dict(regularised_gsn_precision_policy(job.mechanism_id))
+    regularised["promoted_root_readout_policy"] = (
+        HISTORICAL_PROMOTED_ROOT_READOUT_POLICY
+    )
+    return {
+        "readout_radius": format(job.policy.readout_radius, ".17g"),
+        **promoted_precision_numerical_controls()[str(digits)][level],
+        **horizon_geometry_controls(),
+        **regularised,
+        "endpoint_series_order": job.policy.endpoint_series_order + 8 * refinement,
+        "support_subinterval_count": (
+            job.policy.support_subinterval_count * (2 ** refinement)
+        ),
+        "angular_pad": 18 + 8 * refinement,
+        "rho_in": "-5000",
+        "rho_out": "5000",
+        "branch_enclosure_radius_abs": format(
+            _mode_specific_branch_enclosure_radius(job), ".17g"
+        ),
+        "max_newton_iterations": 16,
+    }
+
+
+def _schema7_julia_root_request(
+    job: ResponseComponentJob,
+    digits: int,
+    refinement: int,
+    amplitude: complex,
+    predictor: complex | None,
+    predictor_kind: str | None,
+) -> dict[str, object]:
+    """Reconstruct an origin/main schema-7 request byte-for-byte."""
+
+    request: dict[str, object] = {
+        "schema_version": 1,
+        "operation": "root-readout",
+        "job_id": job.job_id,
+        "leaf_id": job.leaf_id,
+        "role": job.role,
+        "job_policy_sha256": job.policy.identity_sha256,
+        "backend_identity_sha256": job.backend_identity.identity_sha256,
+        "refinement_level": refinement,
+        "mode": {
+            "s": job.mode.s,
+            "ell": job.mode.ell,
+            "m": job.mode.m,
+            "n": job.mode.n,
+        },
+        "spin": format(job.spin, ".17g"),
+        "omega": {
+            "real": format(job.root.omega.real, ".17g"),
+            "imaginary": format(job.root.omega.imag, ".17g"),
+        },
+        "angular_A": {
+            "real": format(
+                job.root.angular_separation_constant.real, ".17g"
+            ),
+            "imaginary": format(
+                job.root.angular_separation_constant.imag, ".17g"
+            ),
+        },
+        "mechanism_id": job.mechanism_id,
+        "amplitude": {
+            "real": format(complex(amplitude).real, ".17g"),
+            "imaginary": format(complex(amplitude).imag, ".17g"),
+        },
+        "precision_digits": digits,
+        "working_precision_bits": math.ceil(digits * math.log2(10)) + 32,
+        "policy": _schema7_precision_policy(job, digits, refinement),
+        "execution_resource": _execution_resource_policy(),
+    }
+    if predictor is not None:
+        request["primary_predictor"] = {
+            "real": format(predictor.real, ".17g"),
+            "imaginary": format(predictor.imag, ".17g"),
+        }
+        if predictor_kind is not None:
+            request["primary_predictor_kind"] = predictor_kind
+    if job.mechanism_id != "horizon-admittance":
+        support = _exterior_support(job.spin, job.mechanism_id)
+        request["support"] = {
+            name: format(value, ".17g")
+            for name, value in support.to_mapping().items()
+        }
+    return request
+
+
 def _validate_failed_preflight_attempt_request(
     attempt: CampaignExecutionAttempt,
     leaf: CampaignLeafPlan,
@@ -1078,6 +1224,7 @@ def _validate_failed_preflight_attempt_request(
     precision_digits: int,
     allowed_refinement_levels: frozenset[int],
     required_failure_code: str | None,
+    checkpoint_schema_version: int = CAMPAIGN_CHECKPOINT_SCHEMA_VERSION,
 ) -> None:
     """Authenticate a preflight failure against its canonical worker request."""
 
@@ -1194,8 +1341,7 @@ def _validate_failed_preflight_attempt_request(
     predictor_value: complex | None = None
     if raw_predictor is not None:
         dedicated_baseline_predictor = (
-            leaf.role == "primary"
-            and leaf.mechanism_id == "horizon-admittance"
+            leaf.mechanism_id == "horizon-admittance"
             and precision_digits in (80, 120)
             and refinement_level == 0
             and amplitude_value == 0.0j
@@ -1246,17 +1392,37 @@ def _validate_failed_preflight_attempt_request(
         validated_resource,
     ):
         raise ValueError("failed-preflight request resource binding is invalid")
-    expected_request = JuliaPrecisionRootBackend(
-        leaf.job.backend_identity,
-        object(),
-        precision_digits,
-        refinement=refinement_level,
-    )._request(
-        leaf.job,
-        amplitude_value,
-        predictor_value,
-        predictor_kind,
-    )
+    if checkpoint_schema_version == 7:
+        expected_request = _schema7_julia_root_request(
+            leaf.job,
+            precision_digits,
+            refinement_level,
+            amplitude_value,
+            predictor_value,
+            predictor_kind,
+        )
+    else:
+        request_policy = request_binding.get("policy")
+        request_budget = (
+            request_policy.get("ode_error_budget")
+            if isinstance(request_policy, Mapping)
+            else None
+        )
+        validated_budget = _ode_error_budget_from_mapping(request_budget)
+        if validated_budget is None:
+            raise ValueError("failed-preflight request ODE budget is invalid")
+        expected_request = JuliaPrecisionRootBackend(
+            leaf.job.backend_identity,
+            object(),
+            precision_digits,
+            refinement=refinement_level,
+            ode_error_budget=validated_budget,
+        )._request(
+            leaf.job,
+            amplitude_value,
+            predictor_value,
+            predictor_kind,
+        )
     expected_request["execution_resource"] = validated_resource
     if dict(request_binding) != expected_request:
         raise ValueError("failed-preflight canonical request contract is invalid")
@@ -1289,6 +1455,8 @@ def _validate_failed_preflight_attempt_request(
 def _validate_failed_preflight_predecessor(
     attempt: CampaignExecutionAttempt,
     leaf: CampaignLeafPlan,
+    *,
+    checkpoint_schema_version: int = CAMPAIGN_CHECKPOINT_SCHEMA_VERSION,
 ) -> None:
     """Authenticate the sole 80-digit control predecessor for recovery."""
 
@@ -1298,6 +1466,7 @@ def _validate_failed_preflight_predecessor(
         precision_digits=80,
         allowed_refinement_levels=frozenset({0}),
         required_failure_code="INSUFFICIENT_ASYMPTOTIC_PRECISION",
+        checkpoint_schema_version=checkpoint_schema_version,
     )
 
 
@@ -1333,9 +1502,34 @@ def _failed_preflight_primary_root_predictor(
     return predictor
 
 
+def _failed_preflight_exterior_root_predictor(
+    attempt: CampaignExecutionAttempt,
+) -> complex:
+    """Recover the exact predictor or authenticated request root for exterior."""
+
+    failure = attempt.failure_receipt.get("failure")
+    request = (
+        None if not isinstance(failure, Mapping) else failure.get("request_binding")
+    )
+    if not isinstance(request, Mapping):
+        raise ValueError("failed-preflight exterior request evidence is missing")
+    raw = request.get("primary_predictor", request.get("omega"))
+    if not isinstance(raw, Mapping) or set(raw) != {"real", "imaginary"}:
+        raise ValueError("failed-preflight exterior predictor evidence is missing")
+    try:
+        predictor = complex(float(Decimal(raw["real"])), float(Decimal(raw["imaginary"])))
+    except (InvalidOperation, TypeError, ValueError) as error:
+        raise ValueError("failed-preflight exterior predictor evidence is invalid") from error
+    if not (math.isfinite(predictor.real) and math.isfinite(predictor.imag)):
+        raise ValueError("failed-preflight exterior predictor evidence is invalid")
+    return predictor
+
+
 def _validate_failed_preflight_recovery_failure(
     attempt: CampaignExecutionAttempt,
     leaf: CampaignLeafPlan,
+    *,
+    checkpoint_schema_version: int = CAMPAIGN_CHECKPOINT_SCHEMA_VERSION,
 ) -> None:
     """Authenticate a contained failure from either 120-digit recovery pass."""
 
@@ -1345,12 +1539,15 @@ def _validate_failed_preflight_recovery_failure(
         precision_digits=120,
         allowed_refinement_levels=frozenset({0, 1}),
         required_failure_code=None,
+        checkpoint_schema_version=checkpoint_schema_version,
     )
 
 
 def _failed_preflight_predecessor_for_leaf(
     attempts: Sequence[CampaignExecutionAttempt],
     leaf: CampaignLeafPlan,
+    *,
+    checkpoint_schema_version: int = CAMPAIGN_CHECKPOINT_SCHEMA_VERSION,
 ) -> CampaignExecutionAttempt | None:
     candidates = tuple(
         attempt
@@ -1366,17 +1563,63 @@ def _failed_preflight_predecessor_for_leaf(
         raise ValueError("campaign has duplicate failed-preflight predecessors")
     if not candidates:
         return None
-    _validate_failed_preflight_predecessor(candidates[0], leaf)
+    _validate_failed_preflight_predecessor(
+        candidates[0],
+        leaf,
+        checkpoint_schema_version=checkpoint_schema_version,
+    )
     return candidates[0]
+
+
+def _endpoint_arithmetic_predecessor_for_leaf(
+    attempts: Sequence[CampaignExecutionAttempt],
+    leaf: CampaignLeafPlan,
+) -> CampaignExecutionAttempt | None:
+    candidates = tuple(
+        attempt
+        for attempt in attempts
+        if (
+            attempt.leaf_id == leaf.leaf_id
+            and attempt.precision_digits == 80
+            and attempt.failure_code == "HORIZON_ARITHMETIC_INADEQUATE"
+        )
+    )
+    if len(candidates) > 1:
+        raise ValueError("campaign has duplicate endpoint-arithmetic predecessors")
+    if not candidates:
+        return None
+    _validate_endpoint_arithmetic_predecessor(candidates[0], leaf)
+    return candidates[0]
+
+
+def _validate_endpoint_arithmetic_predecessor(
+    attempt: CampaignExecutionAttempt,
+    leaf: CampaignLeafPlan,
+) -> None:
+    """Authenticate an 80-digit endpoint arithmetic retry predecessor."""
+
+    _validate_failed_preflight_attempt_request(
+        attempt,
+        leaf,
+        precision_digits=80,
+        allowed_refinement_levels=frozenset({0}),
+        required_failure_code="HORIZON_ARITHMETIC_INADEQUATE",
+    )
 
 
 def _failed_preflight_recovery_failure_for_leaf(
     attempts: Sequence[CampaignExecutionAttempt],
     leaf: CampaignLeafPlan,
+    *,
+    checkpoint_schema_version: int = CAMPAIGN_CHECKPOINT_SCHEMA_VERSION,
 ) -> CampaignExecutionAttempt | None:
     """Return a durable failed 120-digit recovery, if one was recorded."""
 
-    predecessor = _failed_preflight_predecessor_for_leaf(attempts, leaf)
+    predecessor = _failed_preflight_predecessor_for_leaf(
+        attempts,
+        leaf,
+        checkpoint_schema_version=checkpoint_schema_version,
+    )
     if predecessor is None:
         return None
     candidates = tuple(
@@ -1390,7 +1633,11 @@ def _failed_preflight_recovery_failure_for_leaf(
         return None
     if candidates[0].attempt_ordinal <= predecessor.attempt_ordinal:
         raise ValueError("failed-preflight recovery failure order is invalid")
-    _validate_failed_preflight_recovery_failure(candidates[0], leaf)
+    _validate_failed_preflight_recovery_failure(
+        candidates[0],
+        leaf,
+        checkpoint_schema_version=checkpoint_schema_version,
+    )
     return candidates[0]
 
 
@@ -1652,7 +1899,7 @@ def _failed_preflight_recovery_precision_contract() -> dict[str, object]:
         **_multi_readout_failed_preflight_recovery_precision_contract(),
         "primary_horizon_override": {
             "component_scientific_identity": (
-                PROMOTED_HORIZON_COMPONENT_IDENTITY
+                PROMOTED_HORIZON_COMPONENT_V2_IDENTITY
             ),
             "base_refinement_levels": [0],
             "amplitude_readout_count": 1,
@@ -1662,6 +1909,7 @@ def _failed_preflight_recovery_precision_contract() -> dict[str, object]:
                 "root-phases-branch-and-conditioning-adequate"
             ),
         },
+        "exterior_override": _exterior_derivative_component_contract(),
     }
 
 
@@ -1675,9 +1923,9 @@ def _primary_recovery_precision_contract() -> dict[str, object]:
         "promoted_numerical_controls": promoted_precision_numerical_controls(),
         "promoted_horizon_component": {
             "component_scientific_identity": (
-                PROMOTED_HORIZON_COMPONENT_IDENTITY
+                PROMOTED_HORIZON_COMPONENT_V2_IDENTITY
             ),
-            "response_method": PROMOTED_HORIZON_RESPONSE_METHOD,
+            "response_method": PROMOTED_HORIZON_RESPONSE_METHOD_V2,
             "amplitude_readout_count": 1,
             "amplitudes": [
                 {"real": 0.0, "imaginary": 0.0},
@@ -1686,7 +1934,7 @@ def _primary_recovery_precision_contract() -> dict[str, object]:
             "self_refinement_required": False,
             "primary_root_predictor": "previous-stage-baseline-omega",
             "response_uncertainty_status": (
-                UNCALIBRATED_ANALYTIC_RESPONSE
+                BOUNDED_ANALYTIC_RESPONSE
             ),
         },
         "precision120_gates": {
@@ -1726,6 +1974,40 @@ def _multi_readout_primary_recovery_precision_contract() -> dict[str, object]:
         "promoted_numerical_controls": promoted_precision_numerical_controls(),
         "failed_preflight_alternate": (
             _multi_readout_failed_preflight_recovery_precision_contract()
+        ),
+    }
+
+
+def _exterior_derivative_component_contract() -> dict[str, object]:
+    return {
+            "component_scientific_identity": (
+                EXTERIOR_DERIVATIVE_COMPONENT_IDENTITY
+            ),
+            "response_method": EXTERIOR_DERIVATIVE_METHOD,
+            "response_uncertainty_status": BOUNDED_DERIVATIVE_RESPONSE,
+            "response_disk": EXTERIOR_DERIVATIVE_RESPONSE_DISK_IDENTITY,
+            "derivative_conditioning": (
+                FIXED_ROOT_DERIVATIVE_CONDITIONING_IDENTITY
+            ),
+            "axis_validation": FIXED_ROOT_AXIS_VALIDATION_IDENTITY,
+            "full_validation": FULL_COMPLEX_LADDER_VALIDATION_IDENTITY,
+            "perturbed_root_ladder_required": False,
+    }
+
+
+def _exterior_derivative_primary_recovery_precision_contract() -> dict[str, object]:
+    """Bind promoted exterior work to fixed-root derivative evidence."""
+
+    from .julia_response_backend import promoted_precision_numerical_controls
+
+    return {
+        **_previous_primary_recovery_precision_contract(),
+        "promoted_numerical_controls": promoted_precision_numerical_controls(),
+        "promoted_exterior_component": (
+            _exterior_derivative_component_contract()
+        ),
+        "failed_preflight_alternate": (
+            _failed_preflight_recovery_precision_contract()
         ),
     }
 
@@ -1814,19 +2096,34 @@ def _response_uncertainty_contract() -> dict[str, object]:
     """Bind the live diagnostic-root reduction used by every precision tier."""
 
     return {
-        "version": 4,
+        "version": 5,
         "promoted_root_readout_policy": PROMOTED_ROOT_READOUT_POLICY,
         "promoted_primary_horizon_component_identity": (
-            PROMOTED_HORIZON_COMPONENT_IDENTITY
+            PROMOTED_HORIZON_COMPONENT_V2_IDENTITY
         ),
         "promoted_primary_horizon_response_method": (
-            PROMOTED_HORIZON_RESPONSE_METHOD
+            PROMOTED_HORIZON_RESPONSE_METHOD_V2
         ),
         "promoted_primary_horizon_finite_amplitude_ladder": (
             "not-required-not-executed"
         ),
         "promoted_primary_horizon_response_uncertainty": (
-            UNCALIBRATED_ANALYTIC_RESPONSE
+            BOUNDED_ANALYTIC_RESPONSE
+        ),
+        "promoted_exterior_component_identity": (
+            EXTERIOR_DERIVATIVE_COMPONENT_IDENTITY
+        ),
+        "promoted_exterior_response_method": EXTERIOR_DERIVATIVE_METHOD,
+        "promoted_exterior_response_uncertainty": BOUNDED_DERIVATIVE_RESPONSE,
+        "promoted_exterior_response_disk": (
+            EXTERIOR_DERIVATIVE_RESPONSE_DISK_IDENTITY
+        ),
+        "promoted_exterior_derivative_conditioning": (
+            FIXED_ROOT_DERIVATIVE_CONDITIONING_IDENTITY
+        ),
+        "promoted_exterior_axis_validation": FIXED_ROOT_AXIS_VALIDATION_IDENTITY,
+        "promoted_exterior_full_validation": (
+            FULL_COMPLEX_LADDER_VALIDATION_IDENTITY
         ),
         "primary_disk": "combined_signed_secant_two_finest_level_richardson",
         "diagnostic_phases": {
@@ -1846,6 +2143,53 @@ def _response_uncertainty_contract() -> dict[str, object]:
         "root_space_displacements": "branch_continuation_only",
         "units": "dimensionless_response",
     }
+
+
+def _schema7_failed_preflight_recovery_precision_contract() -> dict[str, object]:
+    contract = _failed_preflight_recovery_precision_contract()
+    contract.pop("exterior_override")
+    override = dict(contract["primary_horizon_override"])
+    override["component_scientific_identity"] = (
+        PROMOTED_HORIZON_COMPONENT_IDENTITY
+    )
+    contract["primary_horizon_override"] = override
+    return contract
+
+
+def _schema7_primary_recovery_precision_contract() -> dict[str, object]:
+    contract = _primary_recovery_precision_contract()
+    horizon = dict(contract["promoted_horizon_component"])
+    horizon.update({
+        "component_scientific_identity": PROMOTED_HORIZON_COMPONENT_IDENTITY,
+        "response_method": PROMOTED_HORIZON_RESPONSE_METHOD,
+        "response_uncertainty_status": UNCALIBRATED_ANALYTIC_RESPONSE,
+    })
+    contract["promoted_horizon_component"] = horizon
+    contract["failed_preflight_alternate"] = (
+        _schema7_failed_preflight_recovery_precision_contract()
+    )
+    return contract
+
+
+def _schema7_response_uncertainty_contract() -> dict[str, object]:
+    contract = _response_uncertainty_contract()
+    contract["version"] = 4
+    contract["promoted_root_readout_policy"] = (
+        HISTORICAL_PROMOTED_ROOT_READOUT_POLICY
+    )
+    contract["promoted_primary_horizon_component_identity"] = (
+        PROMOTED_HORIZON_COMPONENT_IDENTITY
+    )
+    contract["promoted_primary_horizon_response_method"] = (
+        PROMOTED_HORIZON_RESPONSE_METHOD
+    )
+    contract["promoted_primary_horizon_response_uncertainty"] = (
+        UNCALIBRATED_ANALYTIC_RESPONSE
+    )
+    for name in tuple(contract):
+        if name.startswith("promoted_exterior_"):
+            contract.pop(name)
+    return contract
 
 
 def _multi_readout_response_uncertainty_contract() -> dict[str, object]:
@@ -1912,11 +2256,11 @@ def _leaf_precision_contract(leaf: CampaignLeafPlan) -> dict[str, object]:
         contract["primary_recovery"] = (
             _primary_recovery_precision_contract()
             if leaf.mechanism_id == "horizon-admittance"
-            else _multi_readout_primary_recovery_precision_contract()
+            else _exterior_derivative_primary_recovery_precision_contract()
         )
     elif leaf.role == "deep":
         contract["failed_preflight_recovery"] = (
-            _multi_readout_failed_preflight_recovery_precision_contract()
+            _failed_preflight_recovery_precision_contract()
         )
     contract["root_convergence"] = _root_convergence_precision_contract()
     return contract
@@ -1961,10 +2305,7 @@ def _scientific_computation_identity_material(
         "response_uncertainty_contract": (
             (
                 _response_uncertainty_contract()
-                if (
-                    leaf.role == "primary"
-                    and leaf.mechanism_id == "horizon-admittance"
-                )
+                if leaf.role in {"primary", "deep"}
                 else _multi_readout_response_uncertainty_contract()
             )
             if response_uncertainty_contract is None
@@ -2298,6 +2639,60 @@ def _checkpoint_bindings(
     }
 
 
+def _schema7_precision_factory_identity() -> PrecisionFactoryIdentity:
+    return PrecisionFactoryIdentity(
+        "windows_solver.response_batches:NativeCampaignStageBackend.from_selection",
+        _SCHEMA7_CAMPAIGN_SOURCE_SHA256,
+    )
+
+
+def _schema7_campaign_bindings(plan: CampaignPlan) -> dict[str, object]:
+    bindings = dict(plan.bindings)
+    bindings.update({
+        "schema_version": 2,
+        "engine_source_sha256": _SCHEMA7_ENGINE_SOURCE_SHA256,
+        "campaign_source_sha256": _SCHEMA7_CAMPAIGN_SOURCE_SHA256,
+        "precision_factory_identity": (
+            _schema7_precision_factory_identity().to_mapping()
+        ),
+    })
+    return bindings
+
+
+def _schema7_selection_mapping(
+    selection: CampaignSelection,
+) -> dict[str, object]:
+    material = {
+        "campaign_id": _SCHEMA7_CAMPAIGN_ID,
+        "role": selection.role,
+        "leaf_ids": list(selection.leaf_ids),
+        "cohort_ids": list(selection.cohort_ids),
+    }
+    return {
+        "selection_id": f"campaign-selection-{_sha256(material)}",
+        "role": selection.role,
+        "leaf_ids": list(selection.leaf_ids),
+        "cohort_ids": list(selection.cohort_ids),
+    }
+
+
+def _schema7_checkpoint_bindings(
+    plan: CampaignPlan,
+    selection: CampaignSelection,
+) -> dict[str, object]:
+    current = _checkpoint_bindings(plan, selection)
+    return {
+        **current,
+        "campaign_id": _SCHEMA7_CAMPAIGN_ID,
+        "campaign_bindings": _schema7_campaign_bindings(plan),
+        "selection": _schema7_selection_mapping(selection),
+        "precision_factory_identity": (
+            _schema7_precision_factory_identity().to_mapping()
+        ),
+        "precision_contract_sha256": _SCHEMA7_PRECISION_CONTRACT_SHA256,
+    }
+
+
 def _checkpoint_precision_contract_sha256(schema_version: int) -> str:
     material: dict[str, object] = {
         "promotion_gates": list(B_PRIME_RELEASE_DOMAIN.precision_promotion_gates),
@@ -2334,6 +2729,14 @@ def _checkpoint_precision_contract_sha256(schema_version: int) -> str:
                 _multi_readout_response_uncertainty_contract()
             ),
         })
+    elif schema_version == 7:
+        material.update({
+            "primary_recovery": _schema7_primary_recovery_precision_contract(),
+            "failed_preflight_recovery": (
+                _schema7_failed_preflight_recovery_precision_contract()
+            ),
+            "response_uncertainty": _schema7_response_uncertainty_contract(),
+        })
     elif schema_version == CAMPAIGN_CHECKPOINT_SCHEMA_VERSION:
         material.update(
             {
@@ -2346,7 +2749,10 @@ def _checkpoint_precision_contract_sha256(schema_version: int) -> str:
         )
     elif schema_version != _LEGACY_CAMPAIGN_CHECKPOINT_SCHEMA_VERSION:
         raise ValueError("campaign checkpoint precision contract schema is invalid")
-    return _sha256(material)
+    digest = _sha256(material)
+    if schema_version == 7 and digest != _SCHEMA7_PRECISION_CONTRACT_SHA256:
+        raise RuntimeError("frozen schema-7 precision contract drifted")
+    return digest
 
 
 def _historical_checkpoint_precision_contract_sha256s(
@@ -2373,6 +2779,8 @@ def _checkpoint_bindings_match_schema(
 ) -> bool:
     if not isinstance(bindings, Mapping):
         return False
+    if schema_version == 7:
+        return dict(bindings) == _schema7_checkpoint_bindings(plan, selection)
     current = _checkpoint_bindings(plan, selection)
     if dict(bindings) == current:
         return True
@@ -2546,7 +2954,12 @@ def _load_checkpoint_with_attempts(
             role=str(selection_value["role"]),
             leaf_ids=selection_value["leaf_ids"],
         )
-    if selection.to_mapping() != selection_value:
+    expected_selection_value = (
+        _schema7_selection_mapping(selection)
+        if value["schema_version"] == 7
+        else selection.to_mapping()
+    )
+    if expected_selection_value != selection_value:
         raise ValueError("campaign checkpoint selection identity is invalid")
     if not _checkpoint_bindings_match_schema(
         plan, selection, bindings, value["schema_version"]
@@ -2573,10 +2986,15 @@ def _load_checkpoint_with_attempts(
         digits = tuple(stage.outcome.digits for stage in record.stages)
         if digits not in {(64,), (64, 80), (64, 120), (64, 80, 120)}:
             raise ValueError("campaign checkpoint precision stage order is invalid")
+        factory_identity = (
+            _schema7_precision_factory_identity()
+            if value["schema_version"] == 7
+            else plan.precision_factory_identity
+        )
         _validate_record_semantics(
             leaf,
             record,
-            plan.precision_factory_identity,
+            factory_identity,
             checkpoint_schema_version=value["schema_version"],
         )
     if tuple(attempt.attempt_ordinal for attempt in attempts) != tuple(
@@ -2607,8 +3025,15 @@ def _load_checkpoint_with_attempts(
         digits = tuple(stage.outcome.digits for stage in record.stages)
         leaf = leaf_by_id[record.leaf_id]
         predecessor = _failed_preflight_predecessor_for_leaf(
+            attempts,
+            leaf,
+            checkpoint_schema_version=value["schema_version"],
+        )
+        endpoint_arithmetic = _endpoint_arithmetic_predecessor_for_leaf(
             attempts, leaf
         )
+        if predecessor is not None and endpoint_arithmetic is not None:
+            raise ValueError("campaign has conflicting 80-digit retry predecessors")
         pending_recovery = (
             digits == (64,)
             and record.state in {"IN_PROGRESS", "MISSING_PRECISION"}
@@ -2618,7 +3043,9 @@ def _load_checkpoint_with_attempts(
             )
         )
         recovery_failure = _failed_preflight_recovery_failure_for_leaf(
-            attempts, leaf
+            attempts,
+            leaf,
+            checkpoint_schema_version=value["schema_version"],
         )
         if predecessor is not None and not (
             pending_recovery or digits == (64, 120)
@@ -2626,10 +3053,17 @@ def _load_checkpoint_with_attempts(
             raise ValueError(
                 "failed-preflight predecessor has incompatible stage evidence"
             )
+        if endpoint_arithmetic is not None and not (
+            pending_recovery or digits == (64, 120)
+        ):
+            raise ValueError(
+                "endpoint-arithmetic predecessor has incompatible stage evidence"
+            )
         if (
             record.missing_precision_digits == 120
             and digits == (64,)
             and predecessor is None
+            and endpoint_arithmetic is None
         ):
             raise ValueError(
                 "missing 120-digit recovery lacks a failed-preflight predecessor"
@@ -2640,13 +3074,22 @@ def _load_checkpoint_with_attempts(
             )
         if digits != (64, 120):
             continue
-        embedded = record.stages[-1].outcome.component_result.get(
-            "failed_preflight_predecessor"
-        )
-        if predecessor is None or predecessor.to_mapping() != embedded:
-            raise ValueError(
-                "failed-preflight recovery predecessor does not match checkpoint"
+        if endpoint_arithmetic is not None:
+            embedded = record.stages[-1].outcome.component_result.get(
+                "endpoint_arithmetic_predecessor"
             )
+            if endpoint_arithmetic.to_mapping() != embedded:
+                raise ValueError(
+                    "endpoint-arithmetic predecessor does not match checkpoint"
+                )
+        else:
+            embedded = record.stages[-1].outcome.component_result.get(
+                "failed_preflight_predecessor"
+            )
+            if predecessor is None or predecessor.to_mapping() != embedded:
+                raise ValueError(
+                    "failed-preflight recovery predecessor does not match checkpoint"
+                )
     expected_state = (
         "COMPLETE"
         if len(records) == len(selection.leaf_ids)
@@ -2784,13 +3227,509 @@ def _single_promoted_horizon_result(
     if not isinstance(raw_result, Mapping):
         return None
     result = ComponentResult.from_mapping(raw_result)
-    if result.component_scientific_identity != (
-        PROMOTED_HORIZON_COMPONENT_IDENTITY
-    ):
+    if result.component_scientific_identity not in {
+        PROMOTED_HORIZON_COMPONENT_IDENTITY,
+        PROMOTED_HORIZON_COMPONENT_V2_IDENTITY,
+    }:
         return None
     if result.to_mapping() != raw_result:
         raise ValueError("promoted horizon component result is not canonical")
     return result
+
+
+_SELECTIVE_STAGE_EVIDENCE_KIND = "package-owned-selective-readout-promotion"
+_SELECTIVE_TIER_SEQUENCE = (
+    "bigfloat-40",
+    "bigfloat-80",
+    "bigfloat-120",
+)
+
+_SELECTIVE_TIER_JOURNAL_SCHEMA = (
+    "windows-solver.selective-tier-journal-evidence/1"
+)
+_SELECTIVE_JOURNAL_WRAPPER_SCHEMA = (
+    "windows-solver.promoted-component-journal-receipt/1"
+)
+
+
+def _ode_error_budget_from_mapping(value: object) -> ODEErrorBudget | None:
+    if not isinstance(value, Mapping):
+        return None
+    try:
+        budget = ODEErrorBudget(
+            required_root_correction_abs=value["required_root_correction_abs"],
+            determinant_derivative_lower_bound_abs=value[
+                "determinant_derivative_lower_bound_abs"
+            ],
+            determinant_error_budget_abs=value["determinant_error_budget_abs"],
+            determinant_allocations=value["determinant_allocations"],
+            coordinate_reltol=value["coordinate_reltol"],
+            coordinate_abstol=value["coordinate_abstol"],
+            homogeneous_reltol=value["homogeneous_reltol"],
+            homogeneous_abstol=value["homogeneous_abstol"],
+            precision_tier=value["precision_tier"],
+            calibration_identity=value["calibration_identity"],
+        )
+    except (KeyError, TypeError, ValueError):
+        return None
+    return budget if budget.to_mapping() == dict(value) else None
+
+
+def _validate_selective_tier_journal(
+    leaf: CampaignLeafPlan,
+    tier_label: str,
+    plan: object,
+    evidence: object,
+    predecessor_readouts: Mapping[complex, RootReadout],
+) -> tuple[Mapping[str, object], dict[complex, RootReadout]]:
+    """Authenticate one semantic tier from canonical requests, not labels."""
+
+    expected_fields = {
+        "schema", "configured", "component_identity", "precision_tier",
+        "journal", "journal_sha256", "promoted_work_unit_ids",
+        "scientific_runtime", "scientific_runtime_sha256",
+        "ode_error_budget", "ode_error_budget_sha256",
+    }
+    if not isinstance(evidence, Mapping) or set(evidence) != expected_fields:
+        raise _UnauthenticatedComponentEvidence(
+            "campaign selective tier journal evidence is invalid"
+        )
+    tier = precision_tier(tier_label)
+    digits = nominal_decimal_digits(tier)
+    bits = working_precision_bits(tier)
+    component_identity = (
+        f"selective-signed-root-promotion-component/v1/{tier_label}"
+    )
+    runtime = evidence.get("scientific_runtime")
+    budget = evidence.get("ode_error_budget")
+    runtime_sha256 = evidence.get("scientific_runtime_sha256")
+    budget_sha256 = evidence.get("ode_error_budget_sha256")
+    validated_budget = _ode_error_budget_from_mapping(budget)
+    if (
+        evidence.get("schema") != _SELECTIVE_TIER_JOURNAL_SCHEMA
+        or evidence.get("configured") is not True
+        or evidence.get("component_identity") != component_identity
+        or evidence.get("precision_tier") != tier_label
+        or not isinstance(runtime, Mapping)
+        or runtime_sha256 != _sha256(dict(runtime))
+        or runtime.get("precision_digits") != digits
+        or runtime.get("working_precision_bits") != bits
+        or runtime.get("semantic_precision_tier") != tier_label
+        or runtime.get("refinement_level") != 0
+        or runtime.get("regularised_gsn_precision_policy")
+        != dict(regularised_gsn_precision_policy(leaf.job.mechanism_id))
+        or not isinstance(budget, Mapping)
+        or validated_budget is None
+        or validated_budget.to_mapping() != dict(budget)
+        or budget_sha256 != _sha256(dict(budget))
+        or budget.get("schema") != "windows-solver.ode-error-budget/1"
+        or budget.get("precision_tier") != tier_label
+        or budget.get("nominal_decimal_digits") != digits
+        or budget.get("working_precision_bits") != bits
+        or not isinstance(budget.get("calibration_identity"), str)
+        or not budget["calibration_identity"]
+    ):
+        raise _UnauthenticatedComponentEvidence(
+            "campaign selective tier runtime or ODE budget is invalid"
+        )
+    raw_journal = evidence.get("journal")
+    try:
+        journal = PartialComponentJournal.from_mapping(raw_journal)
+    except ValueError as error:
+        raise _UnauthenticatedComponentEvidence(
+            "campaign selective tier journal is invalid"
+        ) from error
+    promoted_ids = evidence.get("promoted_work_unit_ids")
+    if (
+        not isinstance(promoted_ids, list)
+        or not promoted_ids
+        or len(promoted_ids) != len(set(promoted_ids))
+        or tuple(promoted_ids) != journal.expected_work_unit_ids
+        or set(journal.entries) != set(promoted_ids)
+        or not journal.complete
+        or evidence.get("journal_sha256")
+        != journal.to_mapping()["journal_sha256"]
+    ):
+        raise _UnauthenticatedComponentEvidence(
+            "campaign selective tier journal plan is invalid"
+        )
+    if not isinstance(plan, list) or len(plan) != len(promoted_ids):
+        raise _UnauthenticatedComponentEvidence(
+            "campaign selective tier readout plan is invalid"
+        )
+    expected_readouts: dict[tuple[str, float], complex] = {}
+    for item in plan:
+        if not isinstance(item, Mapping):
+            raise _UnauthenticatedComponentEvidence(
+                "campaign selective tier readout plan is invalid"
+            )
+        role = item.get("readout_role")
+        epsilon = item.get("epsilon")
+        if (
+            role not in {
+                "real_plus", "real_minus", "imaginary_plus", "imaginary_minus"
+            }
+            or isinstance(epsilon, bool)
+            or not isinstance(epsilon, (int, float))
+            or not math.isfinite(float(epsilon))
+            or float(epsilon) <= 0.0
+        ):
+            raise _UnauthenticatedComponentEvidence(
+                "campaign selective tier readout plan is invalid"
+            )
+        value = float(epsilon)
+        amplitude = {
+            "real_plus": complex(value, 0.0),
+            "real_minus": complex(-value, 0.0),
+            "imaginary_plus": complex(0.0, value),
+            "imaginary_minus": complex(0.0, -value),
+        }[role]
+        expected_readouts[(role.replace("_", "-"), value)] = amplitude
+    contract = regularised_gsn_mechanism_contract(leaf.job.mechanism_id)
+    observed_readouts: dict[tuple[str, float], complex] = {}
+    promoted_readouts: dict[complex, RootReadout] = {}
+    request_backend = JuliaPrecisionRootBackend(
+        leaf.job.backend_identity,
+        object(),
+        digits,
+        ode_error_budget=validated_budget,
+    )
+    for work_unit_id in promoted_ids:
+        entry = journal.entries[work_unit_id]
+        wrapper = entry.to_mapping()["worker_response_receipt"]
+        if (
+            set(wrapper) != {"schema", "kind", "output"}
+            or wrapper.get("schema") != _SELECTIVE_JOURNAL_WRAPPER_SCHEMA
+            or wrapper.get("kind") != "root-readout"
+            or not isinstance(wrapper.get("output"), Mapping)
+        ):
+            raise _UnauthenticatedComponentEvidence(
+                "campaign selective tier journal output wrapper is invalid"
+            )
+        try:
+            readout = RootReadout.from_mapping(wrapper["output"])
+        except ValueError as error:
+            raise _UnauthenticatedComponentEvidence(
+                "campaign selective tier root readout is invalid"
+            ) from error
+        receipt = readout.worker_response_receipt
+        request = None if receipt is None else receipt.get("request_binding")
+        role, _, epsilon_text = entry.readout_role.partition("@")
+        observed_readouts[(role, entry.epsilon)] = entry.amplitude
+        request_amplitude = (
+            request.get("amplitude") if isinstance(request, Mapping) else None
+        )
+        predecessor = predecessor_readouts.get(entry.amplitude)
+        expected_request = (
+            None
+            if predecessor is None
+            else request_backend.preview_root_request(
+                leaf.job,
+                entry.amplitude,
+                predecessor.omega,
+                None,
+                entry.readout_role,
+            )
+        )
+        expected_request_fields = {
+            "schema_version", "operation", "job_id", "leaf_id", "role",
+            "job_policy_sha256", "backend_identity_sha256",
+            "refinement_level", "mode", "spin", "omega", "angular_A",
+            "mechanism_id", "amplitude", "precision_digits",
+            "working_precision_bits", "semantic_precision_tier", "policy",
+            "execution_resource", "primary_predictor",
+        }
+        if leaf.job.mechanism_id != "horizon-admittance":
+            expected_request_fields.add("support")
+        if (
+            entry.component_scientific_identity != component_identity
+            or entry.leaf_id != leaf.leaf_id
+            or entry.job_id != leaf.job.job_id
+            or entry.policy_sha256 != leaf.job.policy.identity_sha256
+            or entry.backend_identity
+            != leaf.job.backend_identity.identity_sha256
+            or entry.determinant_family != contract["determinant_family"]
+            or entry.determinant_normalisation
+            != contract["determinant_normalisation"]
+            or entry.precision_tier is not tier
+            or entry.mpfr_bits != bits
+            or entry.refinement_level != 0
+            or not epsilon_text
+            or float(epsilon_text) != entry.epsilon
+            or abs(entry.amplitude) != entry.epsilon
+            or receipt is None
+            or receipt.get("schema") != WORKER_RESPONSE_RECEIPT_SCHEMA
+            or receipt.get("request_sha256") != entry.request_sha256
+            or receipt.get("scientific_runtime_sha256") != runtime_sha256
+            or not isinstance(request, Mapping)
+            or expected_request is None
+            or dict(request) != expected_request
+            or set(request) != expected_request_fields
+            or request.get("schema_version") != 1
+            or request.get("operation") != "root-readout"
+            or _sha256(dict(request)) != entry.request_sha256
+            or request.get("job_id") != leaf.job.job_id
+            or request.get("leaf_id") != leaf.leaf_id
+            or request.get("role") != leaf.role
+            or request.get("mechanism_id") != leaf.job.mechanism_id
+            or request.get("job_policy_sha256")
+            != leaf.job.policy.identity_sha256
+            or request.get("backend_identity_sha256")
+            != leaf.job.backend_identity.identity_sha256
+            or request.get("precision_digits") != digits
+            or request.get("working_precision_bits") != bits
+            or request.get("semantic_precision_tier") != tier_label
+            or request.get("refinement_level") != 0
+            or request.get("mode") != {
+                "s": leaf.job.mode.s,
+                "ell": leaf.job.mode.ell,
+                "m": leaf.job.mode.m,
+                "n": leaf.job.mode.n,
+            }
+            or request.get("spin") != format(leaf.job.spin, ".17g")
+            or request.get("omega") != {
+                "real": format(leaf.job.root.omega.real, ".17g"),
+                "imaginary": format(leaf.job.root.omega.imag, ".17g"),
+            }
+            or request.get("angular_A") != {
+                "real": format(
+                    leaf.job.root.angular_separation_constant.real, ".17g"
+                ),
+                "imaginary": format(
+                    leaf.job.root.angular_separation_constant.imag, ".17g"
+                ),
+            }
+            or not isinstance(request.get("execution_resource"), Mapping)
+            or not isinstance(request.get("primary_predictor"), Mapping)
+            or not isinstance(request_amplitude, Mapping)
+            or float(request_amplitude.get("real", "nan"))
+            != entry.amplitude.real
+            or float(request_amplitude.get("imaginary", "nan"))
+            != entry.amplitude.imag
+            or not isinstance(request.get("policy"), Mapping)
+            or request["policy"].get("ode_error_budget") != dict(budget)
+            or not root_readout_preserves_authenticated_branch(
+                readout,
+                leaf.job.root,
+                equation_id=leaf.job.equation_id,
+                source_root_mapping=leaf.job.source_root_mapping,
+            )
+        ):
+            raise _UnauthenticatedComponentEvidence(
+                "campaign selective tier canonical worker request or receipt "
+                "identity is invalid"
+            )
+        promoted_readouts[entry.amplitude] = readout
+    if observed_readouts != expected_readouts:
+        raise _UnauthenticatedComponentEvidence(
+            "campaign selective tier journal work units are invalid"
+        )
+    return runtime, promoted_readouts
+
+
+def _selective_predecessor_readouts(
+    leaf: CampaignLeafPlan,
+    predecessor: StageOutcome | None,
+) -> dict[complex, RootReadout]:
+    if predecessor is None or predecessor.digits != 64:
+        raise _UnauthenticatedComponentEvidence(
+            "campaign selective binary predecessor is missing"
+        )
+    raw_result = predecessor.component_result.get("result")
+    if not isinstance(raw_result, Mapping):
+        raise _UnauthenticatedComponentEvidence(
+            "campaign selective binary predecessor is invalid"
+        )
+    result = ComponentResult.from_mapping(raw_result)
+    if (
+        result.to_mapping() != raw_result
+        or result.job_id != leaf.job.job_id
+        or result.leaf_id != leaf.leaf_id
+    ):
+        raise _UnauthenticatedComponentEvidence(
+            "campaign selective binary predecessor is invalid"
+        )
+    readouts = {0.0j: result.baseline}
+    for level in result.levels:
+        readouts.update({
+            complex(level.epsilon, 0.0): level.real_plus,
+            complex(-level.epsilon, 0.0): level.real_minus,
+            complex(0.0, level.epsilon): level.imaginary_plus,
+            complex(0.0, -level.epsilon): level.imaginary_minus,
+        })
+    return readouts
+
+
+def _validate_selective_stage(
+    leaf: CampaignLeafPlan,
+    outcome: StageOutcome,
+    predecessor: StageOutcome | None = None,
+) -> tuple[ComponentResult, bool] | None:
+    """Validate terminal semantic-tier evidence without legacy stage claims."""
+
+    payload = outcome.component_result
+    if payload.get("evidence_kind") != _SELECTIVE_STAGE_EVIDENCE_KIND:
+        return None
+    expected_fields = {
+        "evidence_kind",
+        "result",
+        "scientific_runtime",
+        "legacy_campaign_stage_digits",
+        "semantic_precision_tier",
+        "semantic_selective_tier_trace",
+        "whole_component_promotion_used",
+    }
+    raw_result = payload.get("result")
+    trace = payload.get("semantic_selective_tier_trace")
+    if (
+        set(payload) != expected_fields
+        or outcome.digits != 80
+        or payload.get("legacy_campaign_stage_digits") != 80
+        or payload.get("whole_component_promotion_used") is not False
+        or not isinstance(trace, list)
+        or tuple(trace) not in {
+            _SELECTIVE_TIER_SEQUENCE[:1],
+            _SELECTIVE_TIER_SEQUENCE[:2],
+            _SELECTIVE_TIER_SEQUENCE,
+        }
+        or payload.get("semantic_precision_tier") != trace[-1]
+        or outcome.self_refinement_enclosed is not None
+        or outcome.discrepancy_from_previous_abs is not None
+        or outcome.discrepancy_enclosed is not None
+        or outcome.deep_diagnostics is not None
+        or not isinstance(raw_result, Mapping)
+    ):
+        raise _UnauthenticatedComponentEvidence(
+            "campaign selective stage execution contract is invalid"
+        )
+    runtime = payload.get("scientific_runtime")
+    if (
+        not isinstance(runtime, Mapping)
+        or runtime.get("semantic_precision_tier") != trace[-1]
+    ):
+        raise _UnauthenticatedComponentEvidence(
+            "campaign selective stage runtime tier is invalid"
+        )
+    result = ComponentResult.from_mapping(raw_result)
+    if (
+        result.to_mapping() != raw_result
+        or result.job_id != leaf.job.job_id
+        or result.leaf_id != leaf.leaf_id
+        or result.mechanism_id != leaf.mechanism_id
+        or result.status.value != outcome.numerical_state
+        or dict(result.lineage) != {
+            "leaf_id": leaf.job.leaf_id,
+            "root_reference_id": leaf.job.root.root_reference_id,
+            "root_identity_sha256": leaf.job.root.identity_sha256,
+            "policy_sha256": leaf.job.policy.identity_sha256,
+            "backend_identity_sha256": leaf.job.backend_identity.identity_sha256,
+            "equation_id": leaf.job.equation_id,
+            "sampling_coordinate": leaf.job.sampling_coordinate.to_mapping(),
+            "source_root_mapping": leaf.job.source_root_mapping,
+        }
+    ):
+        raise _UnauthenticatedComponentEvidence(
+            "campaign selective stage component identity is invalid"
+        )
+    window = result.resolved_window
+    if not isinstance(window, Mapping):
+        raise _UnauthenticatedComponentEvidence(
+            "campaign selective stage recovery evidence is missing"
+        )
+    current_plan = window.get("executed_readout_specific_promotion_plan")
+    promoted_counts = window.get("promoted_readout_count_by_tier")
+    prior = window.get("prior_tier_recovery_evidence")
+    journal = window.get("journal_evidence")
+    if (
+        window.get("selective_promotion_policy")
+        != "readout-specific-semantic-tier/v1"
+        or window.get("executed_precision_tier") != trace[-1]
+        or not isinstance(current_plan, list)
+        or not current_plan
+        or not isinstance(promoted_counts, Mapping)
+        or set(promoted_counts) != set(trace)
+        or any(type(count) is not int or count < 1 for count in promoted_counts.values())
+        or not isinstance(prior, list)
+        or len(prior) != len(trace) - 1
+        or not isinstance(journal, Mapping)
+    ):
+        raise _UnauthenticatedComponentEvidence(
+            "campaign selective stage tier evidence is invalid"
+        )
+
+    def valid_plan(value: object) -> bool:
+        return (
+            isinstance(value, list)
+            and bool(value)
+            and all(
+                isinstance(item, Mapping)
+                and set(item) == {"epsilon", "readout_role"}
+                and item["readout_role"] in {
+                    "real_plus", "real_minus",
+                    "imaginary_plus", "imaginary_minus",
+                }
+                and isinstance(item["epsilon"], (int, float))
+                and not isinstance(item["epsilon"], bool)
+                and math.isfinite(float(item["epsilon"]))
+                and float(item["epsilon"]) > 0.0
+                for item in value
+            )
+        )
+
+    if not valid_plan(current_plan):
+        raise _UnauthenticatedComponentEvidence(
+            "campaign selective stage readout plan is invalid"
+        )
+    predecessor_readouts = _selective_predecessor_readouts(leaf, predecessor)
+    for index, evidence in enumerate(prior):
+        if (
+            not isinstance(evidence, Mapping)
+            or evidence.get("executed_precision_tier") != trace[index]
+            or not valid_plan(
+                evidence.get("executed_readout_specific_promotion_plan")
+            )
+            or not isinstance(evidence.get("journal_evidence"), Mapping)
+        ):
+            raise _UnauthenticatedComponentEvidence(
+                "campaign selective prior-tier evidence is invalid"
+            )
+        _, predecessor_readouts = _validate_selective_tier_journal(
+            leaf,
+            trace[index],
+            evidence["executed_readout_specific_promotion_plan"],
+            evidence["journal_evidence"],
+            predecessor_readouts,
+        )
+    current_runtime, _ = _validate_selective_tier_journal(
+        leaf, trace[-1], current_plan, journal, predecessor_readouts
+    )
+    if dict(runtime) != dict(current_runtime):
+        raise _UnauthenticatedComponentEvidence(
+            "campaign selective stage runtime disagrees with tier evidence"
+        )
+    for readout in result.raw_readouts:
+        if not root_readout_preserves_authenticated_branch(
+            readout,
+            leaf.job.root,
+            equation_id=leaf.job.equation_id,
+            source_root_mapping=leaf.job.source_root_mapping,
+        ):
+            raise _UnauthenticatedComponentEvidence(
+                "campaign selective root evidence is invalid"
+            )
+    produced = result.status is ComponentStatus.CONVERGED
+    if produced != result.usable:
+        raise _UnauthenticatedComponentEvidence(
+            "campaign selective terminal result body is invalid"
+        )
+    if not produced and (
+        tuple(trace) != _SELECTIVE_TIER_SEQUENCE
+        or window.get("next_precision_tier") is not None
+    ):
+        raise _UnauthenticatedComponentEvidence(
+            "campaign selective exhaustion evidence is invalid"
+        )
+    return result, produced
 
 
 def _validate_single_promoted_horizon_predictor_binding(
@@ -2964,6 +3903,41 @@ def _stage_with_promotion_decision(
     )
 
 
+def _stage_with_endpoint_arithmetic_predecessor(
+    outcome: StageOutcome, predecessor: CampaignExecutionAttempt
+) -> StageOutcome:
+    component_result = dict(outcome.component_result)
+    if "endpoint_arithmetic_predecessor" in component_result:
+        raise ValueError("endpoint-arithmetic predecessor is already attached")
+    component_result["endpoint_arithmetic_predecessor"] = (
+        predecessor.to_mapping()
+    )
+    source_sha256 = _sha256(component_result)
+    channels = []
+    for raw in outcome.signed_error_channels:
+        copied = dict(raw)
+        provenance = dict(copied["provenance"])
+        provenance["source_sha256"] = source_sha256
+        copied["provenance"] = provenance
+        channels.append(copied)
+    return replace(
+        outcome,
+        component_result=component_result,
+        signed_error_channels=tuple(channels),
+    )
+
+
+def _embedded_endpoint_arithmetic_predecessor(
+    outcome: StageOutcome, leaf: CampaignLeafPlan
+) -> CampaignExecutionAttempt | None:
+    raw = outcome.component_result.get("endpoint_arithmetic_predecessor")
+    if raw is None:
+        return None
+    predecessor = CampaignExecutionAttempt.from_mapping(raw)
+    _validate_endpoint_arithmetic_predecessor(predecessor, leaf)
+    return predecessor
+
+
 def _validate_attached_promotion_decision(
     outcome: StageOutcome,
     expected: Mapping[str, object],
@@ -2990,6 +3964,17 @@ def _primary_existing_requires_precision120(outcome: StageOutcome) -> bool:
             analytic.status is not ComponentStatus.CONVERGED
             or not _component_conditioning_is_adequate(analytic)
         )
+    if outcome.component_result.get("evidence_kind") == (
+        "package-owned-julia-single-promoted-horizon-component"
+    ):
+        raw_result = outcome.component_result.get("result")
+        if not isinstance(raw_result, Mapping):
+            return True
+        result = ComponentResult.from_mapping(raw_result)
+        return (
+            result.status is not ComponentStatus.CONVERGED
+            or not _component_conditioning_is_adequate(result)
+        )
     gates = _previous_primary_recovery_precision_contract()[
         "precision120_gates"
     ]
@@ -3009,20 +3994,24 @@ def _primary_existing_requires_precision120(outcome: StageOutcome) -> bool:
 def _primary_precision120_decision(outcome: StageOutcome) -> dict[str, object]:
     existing_requested = _primary_existing_requires_precision120(outcome)
     analytic = _single_promoted_horizon_result(outcome)
+    promoted_horizon_stage = analytic is not None or (
+        outcome.component_result.get("evidence_kind")
+        == "package-owned-julia-single-promoted-horizon-component"
+    )
     return _promotion_decision(
         outcome,
         existing_requested=existing_requested,
         requested_reason=(
             "PROMOTED_ROOT_OR_CONDITIONING_GATE"
-            if analytic is not None
+            if promoted_horizon_stage
             else "CONVERGED_REFINEMENT_OR_DISCREPANCY_GATE"
         ),
         suppressed_reason=(
             "PROMOTED_ROOT_EVIDENCE_ACCEPTED"
-            if analytic is not None
+            if promoted_horizon_stage
             else "CONVERGED_PROMOTION_GATES_SATISFIED"
         ),
-        allow_nonconvergence_suppression=analytic is None,
+        allow_nonconvergence_suppression=not promoted_horizon_stage,
     )
 
 
@@ -3065,6 +4054,10 @@ def _primary_precision120_terminal_state(outcome: StageOutcome) -> str:
             )
             else "UNRESOLVED"
         )
+    if outcome.component_result.get("evidence_kind") == (
+        "package-owned-julia-single-promoted-horizon-component"
+    ):
+        return "UNRESOLVED"
     success = _previous_primary_recovery_precision_contract()[
         "precision120_terminal_success"
     ]
@@ -3120,15 +4113,26 @@ def _validate_current_promoted_runtime(
     package_promoted = evidence_kind in {
         "package-owned-julia-promoted-component-engine",
         "package-owned-julia-single-promoted-horizon-component",
+        "package-owned-julia-fixed-root-exterior-derivative-component",
     }
     single_horizon = (
         evidence_kind
         == "package-owned-julia-single-promoted-horizon-component"
     )
-    if single_horizon != (
-        result.component_scientific_identity
-        == PROMOTED_HORIZON_COMPONENT_IDENTITY
-    ):
+    result_is_single_horizon = (
+        result.component_scientific_identity in {
+            PROMOTED_HORIZON_COMPONENT_IDENTITY,
+            PROMOTED_HORIZON_COMPONENT_V2_IDENTITY,
+        }
+        or (
+            single_horizon
+            and
+            result.component_scientific_identity is None
+            and result.mechanism_id == "horizon-admittance"
+            and result.status is not ComponentStatus.CONVERGED
+        )
+    )
+    if single_horizon != result_is_single_horizon:
         raise _UnauthenticatedComponentEvidence(
             "campaign promoted component identity disagrees with evidence kind"
         )
@@ -3170,6 +4174,54 @@ def _validate_current_promoted_runtime(
         raise _UnauthenticatedComponentEvidence(
             "campaign promoted scientific runtime precision is invalid"
         )
+    if result.component_scientific_identity == (
+        EXTERIOR_DERIVATIVE_COMPONENT_IDENTITY
+    ):
+        assert result.derivative_evidence is not None
+        runtime_provenance = {
+            name: value
+            for name, value in runtime.items()
+            if name not in {
+                "precision_digits",
+                "working_precision_bits",
+                "semantic_precision_tier",
+                "refinement_level",
+                "regularised_gsn_precision_policy",
+            }
+        }
+        expected_sample_runtime = runtime_identity_sha256(runtime_provenance)
+        expected_scientific_runtime = hashlib.sha256(
+            canonical_json_bytes(dict(runtime))
+        ).hexdigest()
+        expected_sample_tier = runtime.get("semantic_precision_tier")
+        expected_sample_bits = runtime.get("working_precision_bits")
+        if (
+            not isinstance(expected_sample_tier, str)
+            or expected_sample_tier != f"bigfloat-{outcome.digits}"
+        ):
+            raise _UnauthenticatedComponentEvidence(
+                "campaign fixed-root sample precision tier is invalid"
+            )
+        for raw_sample in result.derivative_evidence["fixed_root_samples"]:
+            sample = FixedRootDeterminantSample.from_mapping(raw_sample)
+            if (
+                sample.precision_tier.value != expected_sample_tier
+                or sample.working_precision_bits != expected_sample_bits
+            ):
+                raise _UnauthenticatedComponentEvidence(
+                    "campaign fixed-root sample precision is invalid"
+                )
+            if (
+                sample.worker_response_receipt.get("runtime_identity_sha256")
+                != expected_sample_runtime
+                or sample.worker_response_receipt.get(
+                    "scientific_runtime_sha256"
+                )
+                != expected_scientific_runtime
+            ):
+                raise _UnauthenticatedComponentEvidence(
+                    "campaign fixed-root sample runtime identity is invalid"
+                )
     if not has_conditioning:
         if "regularised_gsn_precision_policy" in runtime:
             raise _UnauthenticatedComponentEvidence(
@@ -3192,9 +4244,15 @@ def _validate_current_promoted_runtime(
         expected_policy = dict(
             regularised_gsn_precision_policy(leaf.job.mechanism_id)
         )
+        allowed_readout_policies = (
+            {HISTORICAL_PROMOTED_ROOT_READOUT_POLICY}
+            if result.component_scientific_identity
+            == PROMOTED_HORIZON_COMPONENT_IDENTITY
+            else {PROMOTED_ROOT_READOUT_POLICY}
+        )
         if any(
             readout.promoted_root_readout_policy
-            != PROMOTED_ROOT_READOUT_POLICY
+            not in allowed_readout_policies
             for readout in result.raw_readouts
         ):
             raise _UnauthenticatedComponentEvidence(
@@ -3293,10 +4351,23 @@ def _validate_component_result(
     result = ComponentResult.from_mapping(raw_result)
     if result.to_mapping() != raw_result:
         raise ValueError("campaign component result is not canonical")
-    analytic_horizon = result.component_scientific_identity == (
+    historical_horizon = result.component_scientific_identity == (
         PROMOTED_HORIZON_COMPONENT_IDENTITY
     )
-    if analytic_horizon and not (
+    bounded_horizon = result.component_scientific_identity == (
+        PROMOTED_HORIZON_COMPONENT_V2_IDENTITY
+    )
+    analytic_horizon = historical_horizon or bounded_horizon
+    promoted_horizon_stage = analytic_horizon or (
+        payload.get("evidence_kind")
+        == "package-owned-julia-single-promoted-horizon-component"
+        and result.mechanism_id == "horizon-admittance"
+        and result.status is not ComponentStatus.CONVERGED
+    )
+    exterior_derivative = result.component_scientific_identity == (
+        EXTERIOR_DERIVATIVE_COMPONENT_IDENTITY
+    )
+    if historical_horizon and not (
         leaf.role == "primary"
         and leaf.mechanism_id == "horizon-admittance"
         and outcome.digits in (80, 120)
@@ -3311,6 +4382,40 @@ def _validate_component_result(
         raise _UnauthenticatedComponentEvidence(
             "campaign promoted analytic horizon identity is invalid"
         )
+    if bounded_horizon and not (
+        leaf.role == "primary"
+        and leaf.mechanism_id == "horizon-admittance"
+        and outcome.digits in (80, 120)
+        and result.response_method == PROMOTED_HORIZON_RESPONSE_METHOD_V2
+        and result.response_uncertainty_status
+        in {BOUNDED_ANALYTIC_RESPONSE, "UNBOUNDED_ANALYTIC_RESPONSE"}
+        and result.finite_amplitude_ladder_required is False
+        and result.finite_amplitude_ladder_executed is False
+        and result.finite_amplitude_readout_count == 0
+        and result.error_channel_applicability["resolution"]
+        == (result.status is ComponentStatus.CONVERGED)
+        and not any(
+            applicable
+            for name, applicable in result.error_channel_applicability.items()
+            if name != "resolution"
+        )
+    ):
+        raise _UnauthenticatedComponentEvidence(
+            "campaign bounded promoted horizon identity is invalid"
+        )
+    if exterior_derivative and not (
+        leaf.mechanism_id.startswith("exterior-")
+        and outcome.digits in (80, 120)
+        and result.response_method == EXTERIOR_DERIVATIVE_METHOD
+        and result.response_uncertainty_status
+        in {BOUNDED_DERIVATIVE_RESPONSE, "UNBOUNDED_DERIVATIVE_RESPONSE"}
+        and result.finite_amplitude_ladder_required is False
+        and result.finite_amplitude_ladder_executed is False
+        and result.finite_amplitude_readout_count == 0
+    ):
+        raise _UnauthenticatedComponentEvidence(
+            "campaign promoted exterior derivative identity is invalid"
+        )
     if result.status is ComponentStatus.CONVERGED:
         if analytic_horizon:
             body_is_valid = (
@@ -3320,6 +4425,16 @@ def _validate_component_result(
                 and result.closed_form_response == result.response
                 and result.convergence_basis
                 == "PRIMARY_TRUNCATION_RESOLUTION_FIXED_ROOT"
+                and not result.levels
+            )
+        elif exterior_derivative:
+            body_is_valid = (
+                result.usable
+                and result.response is not None
+                and result.signed_root_crosscheck is None
+                and result.closed_form_response is None
+                and result.convergence_basis
+                == "FIXED_ROOT_REAL_H_H2_DERIVATIVE_DISK"
                 and not result.levels
             )
         else:
@@ -3338,13 +4453,16 @@ def _validate_component_result(
             and result.response is None
             and result.signed_root_crosscheck is None
             and result.closed_form_response is None
-            and result.convergence_basis == "UNRESOLVED"
+            and result.convergence_basis in {
+                "UNRESOLVED",
+                "UNRESOLVED_FIXED_ROOT_DERIVATIVE",
+            }
         )
     if not body_is_valid:
         raise ValueError(
             "campaign production component result status/body contract is invalid"
         )
-    if analytic_horizon:
+    if promoted_horizon_stage:
         required_payload_fields = {
             "evidence_kind",
             "result",
@@ -3421,15 +4539,15 @@ def _validate_component_result(
             raise _UnauthenticatedComponentEvidence(
                 "campaign promoted analytic discrepancy evidence is invalid"
             )
-        applicable_stage_family = (
-            "precision-ladder-discrepancy"
-            if discrepancy_applicable
-            else None
-        )
+        applicable_stage_families = set()
+        if discrepancy_applicable:
+            applicable_stage_families.add("precision-ladder-discrepancy")
+        if bounded_horizon and result.status is ComponentStatus.CONVERGED:
+            applicable_stage_families.add("resolution-angular-refinement")
         for channel in outcome.signed_error_channels:
             expected_derivation = (
-                "explicit-signed-precision-ladder-discrepancy"
-                if channel["family"] == applicable_stage_family
+                f"explicit-signed-{channel['family']}"
+                if channel["family"] in applicable_stage_families
                 else f"not-applicable-{channel['family']}"
             )
             if channel["provenance"]["derivation"] != expected_derivation:
@@ -3475,9 +4593,9 @@ def _validate_component_result(
             else dict(job.source_root_mapping)
         ),
     }
-    if analytic_horizon:
+    if analytic_horizon or exterior_derivative:
         expected_lineage["component_scientific_identity"] = (
-            PROMOTED_HORIZON_COMPONENT_IDENTITY
+            result.component_scientific_identity
         )
     if dict(result.lineage) != expected_lineage:
         raise _UnauthenticatedComponentEvidence(
@@ -3486,6 +4604,7 @@ def _validate_component_result(
     if job.backend_identity.backend_id != RECORDED_REPLAY_BACKEND_ID:
         if (
             not analytic_horizon
+            and not exterior_derivative
             and result.status is ComponentStatus.CONVERGED
             and len(result.levels) < 4
         ):
@@ -3862,7 +4981,15 @@ def _validate_record_semantics(
     previous_available: set[int] = set()
     for stage in record.stages:
         provenance = stage.runner_provenance
-        if provenance["precision_factory_identity"] != factory_identity.to_mapping():
+        provenance_identity = provenance["precision_factory_identity"]
+        current_factory = provenance_identity == factory_identity.to_mapping()
+        preserved_schema7_binary64 = (
+            checkpoint_schema_version == CAMPAIGN_CHECKPOINT_SCHEMA_VERSION
+            and stage.outcome.digits == 64
+            and provenance_identity
+            == _schema7_precision_factory_identity().to_mapping()
+        )
+        if not (current_factory or preserved_schema7_binary64):
             raise ValueError("campaign stage precision factory provenance is invalid")
         available = set(provenance["available_precision_digits"])
         if not previous_available.issubset(available):
@@ -3873,15 +5000,24 @@ def _validate_record_semantics(
         checkpoint_schema_version
         in _HISTORICAL_CAMPAIGN_CHECKPOINT_SCHEMA_VERSIONS
     )
+    selective_validations = tuple(
+        _validate_selective_stage(
+            leaf,
+            stage,
+            stages[0] if index > 0 else None,
+        )
+        for index, stage in enumerate(stages)
+    )
     production_flags = tuple(
-        _validate_component_result(
+        validation is not None
+        or _validate_component_result(
             leaf,
             stage,
             allow_historical_conditioning_absence=(
                 allow_historical_conditioning_absence
             ),
         )
-        for stage in stages
+        for stage, validation in zip(stages, selective_validations)
     )
     for previous, promoted in zip(stages, stages[1:]):
         _validate_single_promoted_horizon_predictor_binding(
@@ -3898,7 +5034,63 @@ def _validate_record_semantics(
         raise ValueError("campaign binary64 stage refinement fields are invalid")
 
     digits = tuple(stage.digits for stage in stages)
+    if len(stages) == 2 and selective_validations[1] is not None:
+        _, selective_produced = selective_validations[1]
+        if (
+            leaf.role != "primary"
+            or not _primary_binary64_promotes(
+                first, production=production_flags[0]
+            )
+            or record.state
+            != ("PRODUCED" if selective_produced else "UNRESOLVED")
+            or record.missing_precision_digits is not None
+            or record.trigger_ids
+            or record.sentinel
+            or record.sentinel_comparison is not None
+        ):
+            raise ValueError(
+                "campaign selective semantic terminal state is inconsistent"
+            )
+        return all(production_flags)
     if digits == (64, 120):
+        endpoint_predecessor = _embedded_endpoint_arithmetic_predecessor(
+            stages[1], leaf
+        )
+        if endpoint_predecessor is not None:
+            _validate_precision120(stages[1])
+            if not all(production_flags):
+                raise ValueError(
+                    "endpoint-arithmetic recovery lacks canonical production "
+                    "evidence"
+                )
+            if leaf.role == "primary":
+                role_fields_valid = (
+                    _primary_binary64_promotes(
+                        first, production=production_flags[0]
+                    )
+                    and not record.trigger_ids
+                    and not record.sentinel
+                    and record.sentinel_comparison is None
+                )
+                expected_state = _primary_precision120_terminal_state(
+                    stages[1]
+                )
+            else:
+                role_fields_valid = True
+                expected_state = _terminal_state(
+                    stages[1], enclosed=bool(stages[1].discrepancy_enclosed)
+                )
+                if leaf.role == "deep" and record.sentinel:
+                    expected_state = "UNRESOLVED"
+            if (
+                not role_fields_valid
+                or record.state != expected_state
+                or record.missing_precision_digits is not None
+            ):
+                raise ValueError(
+                    "endpoint-arithmetic recovery terminal state is invalid"
+                )
+            return True
         if checkpoint_schema_version < _FAILED_PREFLIGHT_CHECKPOINT_SCHEMA_VERSION:
             raise ValueError(
                 "historical checkpoints cannot claim failed-preflight recovery"
@@ -4460,6 +5652,56 @@ def _failed_preflight_recovery_record(
     )
 
 
+def _endpoint_arithmetic_recovery_record(
+    plan: CampaignPlan,
+    available: PrecisionCapabilities,
+    leaf: CampaignLeafPlan,
+    record: CampaignLeafRecord,
+    outcome: StageOutcome,
+    predecessor: CampaignExecutionAttempt,
+) -> CampaignLeafRecord:
+    """Validate a direct 120-digit retry after typed endpoint arithmetic loss."""
+
+    if not isinstance(outcome, StageOutcome) or outcome.digits != 120:
+        raise ValueError(
+            "campaign backend returned invalid endpoint-arithmetic "
+            "120-digit evidence"
+        )
+    outcome = _stage_with_endpoint_arithmetic_predecessor(
+        outcome, predecessor
+    )
+    embedded = _embedded_endpoint_arithmetic_predecessor(outcome, leaf)
+    if embedded is None or embedded.to_mapping() != predecessor.to_mapping():
+        raise ValueError("endpoint-arithmetic recovery embedded the wrong attempt")
+    _validate_precision120(outcome)
+    if leaf.role == "primary":
+        if not _validate_component_result(
+            leaf, outcome, allow_historical_conditioning_absence=False
+        ):
+            raise ValueError(
+                "endpoint-arithmetic recovery lacks canonical production evidence"
+            )
+        state = _primary_precision120_terminal_state(outcome)
+    else:
+        state = _terminal_state(
+            outcome, enclosed=bool(outcome.discrepancy_enclosed)
+        )
+        if leaf.role == "deep" and record.sentinel:
+            state = "UNRESOLVED"
+    return CampaignLeafRecord(
+        leaf_id=record.leaf_id,
+        role=record.role,
+        state=state,
+        stages=(
+            *record.stages,
+            _campaign_stage_record(plan, available, outcome),
+        ),
+        trigger_ids=record.trigger_ids,
+        sentinel=record.sentinel,
+        sentinel_comparison=record.sentinel_comparison,
+    )
+
+
 def _execute_campaign_stage(
     backend: object,
     leaf: CampaignLeafPlan,
@@ -4539,6 +5781,34 @@ def _execute_campaign_stage_after_failed_preflight(
     if not callable(execute):
         raise ValueError(
             "campaign backend lacks failed-preflight 120 refinement support"
+        )
+    return execute(leaf, 120, predecessor)
+
+
+def _execute_campaign_stage_after_endpoint_arithmetic(
+    backend: object,
+    leaf: CampaignLeafPlan,
+    predecessor: CampaignExecutionAttempt,
+    response_predictor: complex | None = None,
+) -> StageOutcome:
+    """Run exact 120-digit recovery without fabricating an 80 stage."""
+
+    _validate_endpoint_arithmetic_predecessor(predecessor, leaf)
+    with_predictor = getattr(
+        backend,
+        "execute_promoted_stage_after_endpoint_arithmetic_with_predictor",
+        None,
+    )
+    if with_predictor is not None:
+        if not callable(with_predictor):
+            raise ValueError("endpoint-arithmetic predictor backend is invalid")
+        return with_predictor(leaf, 120, predecessor, response_predictor)
+    execute = getattr(
+        backend, "execute_promoted_stage_after_endpoint_arithmetic", None
+    )
+    if not callable(execute):
+        raise ValueError(
+            "campaign backend lacks endpoint-arithmetic 120 recovery support"
         )
     return execute(leaf, 120, predecessor)
 
@@ -4664,6 +5934,46 @@ def _execute_failed_preflight_recovery_with_progress(
     return outcome, time.monotonic() - started
 
 
+def _execute_endpoint_arithmetic_recovery_with_progress(
+    backend: object,
+    leaf: CampaignLeafPlan,
+    predecessor: CampaignExecutionAttempt,
+    context: Mapping[str, object],
+    response_predictor: complex | None = None,
+) -> tuple[StageOutcome, float]:
+    started = time.monotonic()
+    with progress_scope(
+        **context,
+        precision_digits=120,
+        component_pass="promoted",
+    ):
+        emit_progress(ProgressEventKind.PRECISION_STAGE_STARTED)
+        try:
+            outcome = _execute_campaign_stage_after_endpoint_arithmetic(
+                backend,
+                leaf,
+                predecessor,
+                response_predictor,
+            )
+        except KeyboardInterrupt:
+            raise
+        except BaseException as error:
+            worker_failure = _worker_failure_payload(error)
+            emit_progress(
+                ProgressEventKind.LEAF_FAILED,
+                precision_digits=120,
+                error_type=type(error).__name__,
+                message=str(error),
+                elapsed_seconds=time.monotonic() - started,
+                **(
+                    {} if worker_failure is None
+                    else {"worker_failure": worker_failure}
+                ),
+            )
+            raise
+    return outcome, time.monotonic() - started
+
+
 def _numerical_failure_promotion_decision(
     failure: Mapping[str, object], digits: int
 ) -> dict[str, object] | None:
@@ -4674,8 +5984,8 @@ def _numerical_failure_promotion_decision(
     required: str | None = None
     limited: bool | None = None
     preflight: bool | None = None
-    requested = code == "INSUFFICIENT_ASYMPTOTIC_PRECISION"
-    if requested:
+    requested = code in _RETRYABLE_NUMERICAL_CONTROL_FAILURE_CODES
+    if code == "INSUFFICIENT_ASYMPTOTIC_PRECISION":
         diagnostics = failure.get("diagnostics")
         if not isinstance(diagnostics, Mapping):
             raise ValueError("asymptotic precision failure diagnostics are missing")
@@ -5446,7 +6756,11 @@ def _run_campaign_selection_active(
                     attempt.failure_code
                     == "INSUFFICIENT_ASYMPTOTIC_PRECISION"
                 )
-                if failed_preflight and 120 not in available.digits:
+                endpoint_arithmetic = (
+                    attempt.failure_code == "HORIZON_ARITHMETIC_INADEQUATE"
+                )
+                retry_at_120 = failed_preflight or endpoint_arithmetic
+                if retry_at_120 and 120 not in available.digits:
                     record = CampaignLeafRecord(
                         leaf_id=record.leaf_id,
                         role=record.role,
@@ -5469,18 +6783,29 @@ def _run_campaign_selection_active(
                     context=context,
                     digits=precision80_digits,
                 )
-                if not failed_preflight or 120 not in available.digits:
+                if not retry_at_120 or 120 not in available.digits:
                     continue
                 try:
-                    outcome120, recovery_duration = (
-                        _execute_failed_preflight_recovery_with_progress(
-                            backend,
-                            leaf,
-                            attempt,
-                            context,
-                            response_predictor,
+                    if failed_preflight:
+                        outcome120, recovery_duration = (
+                            _execute_failed_preflight_recovery_with_progress(
+                                backend,
+                                leaf,
+                                attempt,
+                                context,
+                                response_predictor,
+                            )
                         )
-                    )
+                    else:
+                        outcome120, recovery_duration = (
+                            _execute_endpoint_arithmetic_recovery_with_progress(
+                                backend,
+                                leaf,
+                                attempt,
+                                context,
+                                response_predictor,
+                            )
+                        )
                 except _CONTAINABLE_EXCEPTION_TYPES as recovery_error:
                     recovery_attempt = _execution_attempt_from_failure(
                         recovery_error,
@@ -5505,6 +6830,41 @@ def _run_campaign_selection_active(
                         context=context,
                         digits=120,
                     )
+                    continue
+                if endpoint_arithmetic:
+                    record = _endpoint_arithmetic_recovery_record(
+                        plan, available, leaf, record, outcome120, attempt
+                    )
+                    records_by_id[leaf_id] = record
+                    executed += 1
+                    _checkpoint_stage_with_progress(
+                        path,
+                        _checkpoint_mapping(
+                            plan,
+                            selection,
+                            _ordered_selection_records(
+                                selection, records_by_id
+                            ),
+                            attempts,
+                        ),
+                        context=context,
+                        digits=120,
+                        duration_seconds=recovery_duration,
+                        record=record,
+                    )
+                    with progress_scope(**context):
+                        _publish_terminal_solved_leaf(
+                            plan, leaf, record, solved_leaf_store
+                        )
+                    response = _produced_response(record)
+                    if response is not None:
+                        continuation_responses[continuation_key] = response
+                    with progress_scope(**context):
+                        emit_progress(
+                            ProgressEventKind.LEAF_COMPLETED,
+                            state=record.state,
+                            stage_count=len(record.stages),
+                        )
                     continue
                 if (
                     not isinstance(outcome120, StageOutcome)
@@ -5576,8 +6936,13 @@ def _run_campaign_selection_active(
                 continue
             if not isinstance(outcome80, StageOutcome) or outcome80.digits != 80:
                 raise ValueError("campaign backend returned incomplete 80-digit evidence")
+            selective80 = _validate_selective_stage(
+                leaf, outcome80, record.stages[0].outcome
+            )
             analytic80 = _single_promoted_horizon_result(outcome80) is not None
-            if analytic80:
+            if selective80 is not None:
+                pass
+            elif analytic80:
                 if (
                     outcome80.self_refinement_enclosed is not None
                     or outcome80.component_result.get(
@@ -5598,7 +6963,39 @@ def _run_campaign_selection_active(
             ):
                 raise ValueError("campaign backend returned incomplete 80-digit evidence")
             executed += 1
-            if leaf.role == "primary":
+            if selective80 is not None:
+                if leaf.role != "primary":
+                    raise ValueError(
+                        "selective semantic recovery requires a PRIMARY leaf"
+                    )
+                _, selective_produced = selective80
+                record = CampaignLeafRecord(
+                    leaf_id=record.leaf_id,
+                    role=record.role,
+                    state="PRODUCED" if selective_produced else "UNRESOLVED",
+                    stages=(
+                        *record.stages,
+                        _campaign_stage_record(plan, available, outcome80),
+                    ),
+                    missing_precision_digits=None,
+                )
+                records_by_id[leaf_id] = record
+                _checkpoint_stage_with_progress(
+                    path,
+                    _checkpoint_mapping(
+                        plan,
+                        selection,
+                        _ordered_selection_records(
+                            selection, records_by_id
+                        ),
+                        attempts,
+                    ),
+                    context=context,
+                    digits=precision80_digits,
+                    duration_seconds=stage_duration,
+                    record=record,
+                )
+            elif leaf.role == "primary":
                 if not _validate_component_result(
                     leaf,
                     outcome80,
@@ -6587,13 +7984,55 @@ def _run_promoted_horizon_component_with_progress(
         return result
 
 
+def _run_promoted_exterior_component_with_progress(
+    job: ResponseComponentJob,
+    backend: object,
+    primary_root_predictor: complex,
+) -> ComponentResult:
+    """Run one baseline plus fixed-root determinant derivative samples."""
+
+    started = time.monotonic()
+    with progress_scope(component_pass="promoted"):
+        emit_progress(ProgressEventKind.COMPONENT_PASS_STARTED)
+        try:
+            result = run_promoted_exterior_component(
+                job,
+                backend,  # type: ignore[arg-type]
+                primary_root_predictor,
+                derivative_step=job.policy.epsilons[0],
+            )
+        except KeyboardInterrupt:
+            raise
+        except BaseException as error:
+            emit_progress(
+                ProgressEventKind.ERROR,
+                component_pass="promoted",
+                error_type=type(error).__name__,
+                message=str(error),
+                elapsed_seconds=time.monotonic() - started,
+            )
+            raise
+        emit_progress(
+            ProgressEventKind.COMPONENT_PASS_COMPLETED,
+            component_pass="promoted",
+            status=result.status.value,
+            readout_count=len(result.raw_readouts),
+            fixed_root_determinant_count=(
+                0
+                if result.derivative_evidence is None
+                else result.derivative_evidence["determinant_count"]
+            ),
+            elapsed_seconds=time.monotonic() - started,
+        )
+        return result
+
+
 def _is_single_promoted_horizon_stage(
     leaf: CampaignLeafPlan,
     digits: int,
 ) -> bool:
     return (
-        leaf.role == "primary"
-        and leaf.mechanism_id == "horizon-admittance"
+        leaf.mechanism_id == "horizon-admittance"
         and digits in (80, 120)
     )
 
@@ -6609,6 +8048,12 @@ class NativeCampaignStageBackend:
         precision_capabilities: PrecisionCapabilities,
         generated_cache: GeneratedGsnCache,
         julia_adapter: JuliaResponseAdapter | None = None,
+        ode_error_budget: ODEErrorBudget | None = None,
+        ode_error_budgets: (
+            Mapping[int, ODEErrorBudget]
+            | Callable[[int], ODEErrorBudget | None]
+            | None
+        ) = None,
     ) -> None:
         if any(
             digits > 64 for digits in precision_capabilities.digits
@@ -6620,6 +8065,26 @@ class NativeCampaignStageBackend:
         self.precision_capabilities = precision_capabilities
         self.generated_cache = generated_cache
         self.julia_adapter = julia_adapter
+        if ode_error_budget is not None and ode_error_budgets is not None:
+            raise ValueError("ODE error budget sources are mutually exclusive")
+        self.ode_error_budget = ode_error_budget
+        self.ode_error_budgets = ode_error_budgets
+
+    def _ode_error_budget_for_digits(self, digits: int) -> ODEErrorBudget:
+        source = self.ode_error_budgets
+        budget = (
+            source(digits)
+            if callable(source)
+            else (None if source is None else source.get(digits))
+        )
+        if budget is None:
+            budget = self.ode_error_budget
+        if budget is None:
+            raise MissingODECalibrationError(ODE_CALIBRATION_BLOCKER)
+        mapping = budget.to_mapping()
+        if mapping.get("nominal_decimal_digits") != digits:
+            raise MissingODECalibrationError(ODE_CALIBRATION_BLOCKER)
+        return budget
 
     @classmethod
     def from_selection(
@@ -6719,6 +8184,89 @@ class NativeCampaignStageBackend:
             leaf, digits, predecessor, None
         )
 
+    def execute_promoted_stage_after_endpoint_arithmetic(
+        self,
+        leaf: CampaignLeafPlan,
+        digits: int,
+        predecessor: CampaignExecutionAttempt,
+    ) -> StageOutcome:
+        return self.execute_promoted_stage_after_endpoint_arithmetic_with_predictor(
+            leaf, digits, predecessor, None
+        )
+
+    def execute_promoted_stage_after_endpoint_arithmetic_with_predictor(
+        self,
+        leaf: CampaignLeafPlan,
+        digits: int,
+        predecessor: CampaignExecutionAttempt,
+        response_predictor: complex | None,
+    ) -> StageOutcome:
+        if (
+            digits != 120
+            or digits not in self.precision_capabilities.digits
+            or not _is_single_promoted_horizon_stage(leaf, digits)
+        ):
+            raise NativeResourceUnavailableError(
+                "endpoint-arithmetic recovery requires a 120-digit "
+                "primary horizon capability"
+            )
+        _validate_endpoint_arithmetic_predecessor(predecessor, leaf)
+        if self.julia_adapter is None:
+            raise NativeResourceUnavailableError(
+                "M02 Julia precision worker is unavailable"
+            )
+        budget = self._ode_error_budget_for_digits(120)
+        primary_root_predictor = _failed_preflight_primary_root_predictor(
+            predecessor
+        )
+        primary_backend = JuliaPrecisionRootBackend(
+            self.identity,
+            self.julia_adapter,
+            120,
+            ode_error_budget=budget,
+        )
+        result = _run_promoted_horizon_component_with_progress(
+            leaf.job,
+            primary_backend,
+            primary_root_predictor,
+        )
+        component_result = {
+            "evidence_kind": (
+                "package-owned-julia-single-promoted-horizon-component"
+            ),
+            "result": result.to_mapping(),
+            "self_refinement_result": None,
+            "self_refinement_skipped_reason": (
+                "NOT_REQUIRED_BY_V1_4_PROMOTED_ROOT_POLICY"
+            ),
+            "scientific_runtime": primary_backend.scientific_runtime_for(
+                leaf.job
+            ),
+            "primary_root_predictor_source": (
+                "FAILED_80_REQUEST_BINARY64_BASELINE_OMEGA"
+            ),
+            "precision_ladder_discrepancy_applicable": False,
+            "precision_ladder_discrepancy_reason": (
+                "BINARY64_COMPONENT_RESPONSE_UNAVAILABLE"
+            ),
+        }
+        local_radius = sum(result.error_channels.values())
+        return StageOutcome(
+            digits=120,
+            numerical_state=result.status.value,
+            component_result=component_result,
+            local_disk_radius_abs=local_radius,
+            signed_error_channels=_component_stage_signed_error_channels(
+                component_result,
+                result,
+                repeat_applicable=False,
+                precision_ladder_applicable=False,
+            ),
+            self_refinement_enclosed=None,
+            discrepancy_from_previous_abs=None,
+            discrepancy_enclosed=None,
+        )
+
     def execute_promoted_stage_after_failed_preflight_with_predictor(
         self,
         leaf: CampaignLeafPlan,
@@ -6741,8 +8289,12 @@ class NativeCampaignStageBackend:
             primary_root_predictor = _failed_preflight_primary_root_predictor(
                 predecessor
             )
+            budget = self._ode_error_budget_for_digits(120)
             primary_backend = JuliaPrecisionRootBackend(
-                self.identity, self.julia_adapter, 120
+                self.identity,
+                self.julia_adapter,
+                120,
+                ode_error_budget=budget,
             )
             result = _run_promoted_horizon_component_with_progress(
                 leaf.job,
@@ -6787,62 +8339,52 @@ class NativeCampaignStageBackend:
                 discrepancy_from_previous_abs=None,
                 discrepancy_enclosed=None,
             )
+        budget = self._ode_error_budget_for_digits(120)
         base_backend = JuliaPrecisionRootBackend(
-            self.identity, self.julia_adapter, 120
+            self.identity,
+            self.julia_adapter,
+            120,
+            ode_error_budget=budget,
         )
-        refinement_backend = JuliaPrecisionRootBackend(
-            self.identity, self.julia_adapter, 120, refinement=1
+        primary_root_predictor = _failed_preflight_exterior_root_predictor(
+            predecessor
         )
-        base = _run_component_with_progress(
+        base = _run_promoted_exterior_component_with_progress(
             leaf.job,
             base_backend,
-            "primary",
-            response_predictor,
+            primary_root_predictor,
         )
-        refinement = _run_component_with_progress(
-            leaf.job,
-            refinement_backend,
-            "self-refinement",
-            response_predictor,
-        )
-        refinement_delta = _component_result_delta(refinement, base)
         base_radius = sum(base.error_channels.values())
-        refinement_radius = sum(refinement.error_channels.values())
-        refinement_enclosed = (
-            base.status is ComponentStatus.CONVERGED
-            and refinement.status is ComponentStatus.CONVERGED
-            and abs(refinement_delta) <= base_radius + refinement_radius
-        )
         component_result = {
-            "evidence_kind": "package-owned-julia-promoted-component-engine",
+            "evidence_kind": (
+                "package-owned-julia-fixed-root-exterior-derivative-component"
+            ),
             "result": base.to_mapping(),
-            "self_refinement_result": refinement.to_mapping(),
+            "self_refinement_result": None,
+            "self_refinement_skipped_reason": (
+                "NOT_REQUIRED_BY_FIXED_ROOT_DERIVATIVE_POLICY"
+            ),
             "scientific_runtime": base_backend.scientific_runtime_for(
                 leaf.job
             ),
-            "self_refinement_scientific_runtime": (
-                refinement_backend.scientific_runtime_for(leaf.job)
-            ),
             "failed_preflight_predecessor": predecessor.to_mapping(),
-            "comparison_kind": _FAILED_PREFLIGHT_COMPARISON_KIND,
-            "precision_ladder_discrepancy_applicable": False,
-            "same_precision_refinement_discrepancy_abs": abs(
-                refinement_delta
+            "comparison_kind": (
+                "failed-preflight-120-fixed-root-exterior-derivative/v1"
             ),
+            "precision_ladder_discrepancy_applicable": False,
         }
-        local_radius = base_radius + abs(refinement_delta)
         return StageOutcome(
             digits=120,
             numerical_state=base.status.value,
             component_result=component_result,
-            local_disk_radius_abs=local_radius,
+            local_disk_radius_abs=base_radius,
             signed_error_channels=_component_stage_signed_error_channels(
                 component_result,
                 base,
-                repeat_delta=refinement_delta,
+                repeat_applicable=False,
                 precision_ladder_applicable=False,
             ),
-            self_refinement_enclosed=refinement_enclosed,
+            self_refinement_enclosed=None,
             discrepancy_from_previous_abs=None,
             discrepancy_enclosed=None,
         )
@@ -6863,11 +8405,106 @@ class NativeCampaignStageBackend:
             raise ValueError("promoted precision prior-stage sequence is invalid")
         if self.julia_adapter is None:
             raise NativeResourceUnavailableError("M02 Julia precision worker is unavailable")
-        primary_backend = JuliaPrecisionRootBackend(
-            self.identity, self.julia_adapter, digits
-        )
         previous_result = ComponentResult.from_mapping(
             previous_outcomes[-1].component_result["result"]
+        )
+        recovery = previous_result.resolved_window
+        selective_plan = (
+            None
+            if not isinstance(recovery, Mapping)
+            else recovery.get("readout_specific_promotion_plan")
+        )
+        selective_tier = (
+            None
+            if not isinstance(recovery, Mapping)
+            else recovery.get("next_precision_tier")
+        )
+        if selective_plan:
+            semantic_trace: list[str] = []
+            result = previous_result
+            selective_backend = None
+            while selective_plan:
+                semantic_digits = {
+                    "bigfloat-40": 40,
+                    "bigfloat-80": 80,
+                    "bigfloat-120": 120,
+                }.get(selective_tier)
+                if semantic_digits is None:
+                    raise ValueError("selective promotion precision tier is invalid")
+                budget = self._ode_error_budget_for_digits(semantic_digits)
+                selective_backend = JuliaPrecisionRootBackend(
+                    self.identity,
+                    self.julia_adapter,
+                    semantic_digits,
+                    ode_error_budget=budget,
+                )
+                result = run_selective_readout_promotion(
+                    leaf.job,
+                    result,
+                    selective_backend,
+                    response_predictor,
+                )
+                semantic_trace.append(f"bigfloat-{semantic_digits}")
+                if result.status is ComponentStatus.CONVERGED:
+                    break
+                recovery = result.resolved_window
+                selective_plan = (
+                    None
+                    if not isinstance(recovery, Mapping)
+                    else recovery.get("readout_specific_promotion_plan")
+                )
+                selective_tier = (
+                    None
+                    if not isinstance(recovery, Mapping)
+                    else recovery.get("next_precision_tier")
+                )
+                if semantic_digits == 120:
+                    break
+            assert selective_backend is not None
+            previous_response = previous_result.response
+            precision_delta = (
+                None
+                if result.response is None or previous_response is None
+                else result.response - previous_response
+            )
+            local_radius = sum(result.error_channels.values()) + (
+                0.0 if precision_delta is None else abs(precision_delta)
+            )
+            component_result = {
+                "evidence_kind": "package-owned-selective-readout-promotion",
+                "result": result.to_mapping(),
+                "scientific_runtime": selective_backend.scientific_runtime_for(
+                    leaf.job
+                ),
+                "legacy_campaign_stage_digits": digits,
+                "semantic_precision_tier": semantic_trace[-1],
+                "semantic_selective_tier_trace": semantic_trace,
+                "whole_component_promotion_used": False,
+            }
+            return StageOutcome(
+                digits=digits,
+                numerical_state=result.status.value,
+                component_result=component_result,
+                local_disk_radius_abs=local_radius,
+                signed_error_channels=_component_stage_signed_error_channels(
+                    component_result,
+                    result,
+                    precision_delta=0.0j if precision_delta is None else precision_delta,
+                    repeat_applicable=False,
+                    precision_ladder_applicable=precision_delta is not None,
+                ),
+                self_refinement_enclosed=None,
+                discrepancy_from_previous_abs=(
+                    None if precision_delta is None else abs(precision_delta)
+                ),
+                discrepancy_enclosed=None,
+            )
+        budget = self._ode_error_budget_for_digits(digits)
+        primary_backend = JuliaPrecisionRootBackend(
+            self.identity,
+            self.julia_adapter,
+            digits,
+            ode_error_budget=budget,
         )
         if _is_single_promoted_horizon_stage(leaf, digits):
             primary_root_predictor = previous_result.baseline.omega
@@ -6949,11 +8586,10 @@ class NativeCampaignStageBackend:
                 discrepancy_from_previous_abs=discrepancy,
                 discrepancy_enclosed=discrepancy_enclosed,
             )
-        result = _run_component_with_progress(
+        result = _run_promoted_exterior_component_with_progress(
             leaf.job,
             primary_backend,
-            "primary",
-            response_predictor,
+            previous_result.baseline.omega,
         )
         precision_delta = _component_result_delta(result, previous_result)
         base_radius = sum(result.error_channels.values())
@@ -6964,29 +8600,11 @@ class NativeCampaignStageBackend:
         repeat_delta = 0.0j
         repeat_result = None
         self_refinement_enclosed = None
-        self_refinement_skipped_reason = None
-        if digits == 80:
-            if result.status is not ComponentStatus.CONVERGED:
-                self_refinement_enclosed = False
-                self_refinement_skipped_reason = "PRIMARY_NOT_CONVERGED"
-            else:
-                repeat_backend = JuliaPrecisionRootBackend(
-                    self.identity, self.julia_adapter, digits, refinement=1
-                )
-                repeat_result = _run_component_with_progress(
-                    leaf.job,
-                    repeat_backend,
-                    "self-refinement",
-                    response_predictor,
-                )
-                repeat_delta = _component_result_delta(repeat_result, result)
-                repeat_radius = sum(repeat_result.error_channels.values())
-                self_refinement_enclosed = (
-                    result.status == repeat_result.status
-                    and abs(repeat_delta) <= base_radius + repeat_radius
-                )
+        self_refinement_skipped_reason = "NOT_REQUIRED_BY_FIXED_ROOT_DERIVATIVE_POLICY"
         component_result = {
-            "evidence_kind": "package-owned-julia-promoted-component-engine",
+            "evidence_kind": (
+                "package-owned-julia-fixed-root-exterior-derivative-component"
+            ),
             "result": result.to_mapping(),
             "self_refinement_result": (
                 None if repeat_result is None else repeat_result.to_mapping()
@@ -6995,10 +8613,9 @@ class NativeCampaignStageBackend:
                 leaf.job
             ),
         }
-        if self_refinement_skipped_reason is not None:
-            component_result["self_refinement_skipped_reason"] = (
-                self_refinement_skipped_reason
-            )
+        component_result["self_refinement_skipped_reason"] = (
+            self_refinement_skipped_reason
+        )
         local_radius = base_radius + abs(repeat_delta) + abs(precision_delta)
         return StageOutcome(
             digits=digits,

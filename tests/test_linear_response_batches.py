@@ -12,6 +12,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+import windows_solver.response_batches as response_batches
 from windows_solver.contracts import canonical_json_bytes, canonical_text_sha256
 from windows_solver.linear_response import B_PRIME_RELEASE_DOMAIN
 from windows_solver.response_batches import (
@@ -182,6 +183,112 @@ def _produced_stage_outcome(leaf, response, *, baseline_delta=0.0j):
 
 
 class CampaignPlanTests(unittest.TestCase):
+    def test_deep_promoted_contracts_follow_mechanism_not_role(self) -> None:
+        plan = build_campaign_plan(
+            policy=NumericalPolicy(),
+            backend_identity=_FROZEN_IDENTITY_TEST_BACKEND,
+            precision_capabilities=PrecisionCapabilities((64, 80, 120)),
+        )
+        deep_horizon = next(
+            leaf
+            for leaf in plan.leaves
+            if leaf.role == "deep"
+            and leaf.mechanism_id == "horizon-admittance"
+        )
+        deep_exterior = next(
+            leaf
+            for leaf in plan.leaves
+            if leaf.role == "deep"
+            and leaf.mechanism_id != "horizon-admittance"
+        )
+
+        horizon = response_batches._leaf_precision_contract(deep_horizon)[
+            "failed_preflight_recovery"
+        ]["primary_horizon_override"]
+        exterior = response_batches._leaf_precision_contract(deep_exterior)[
+            "failed_preflight_recovery"
+        ]["exterior_override"]
+        self.assertEqual(
+            horizon["component_scientific_identity"],
+            "single-promoted-root-bounded-analytic-horizon-component/v2",
+        )
+        self.assertEqual(
+            exterior["component_scientific_identity"],
+            "fixed-root-exterior-derivative-component/v1",
+        )
+        self.assertEqual(
+            exterior["response_disk"],
+            "exterior-derivative-response-disk/v1",
+        )
+        self.assertFalse(exterior["perturbed_root_ladder_required"])
+        historical = response_batches._scientific_computation_identity_material(
+            plan,
+            deep_exterior,
+            response_batches._legacy_leaf_precision_contract(deep_exterior),
+            response_uncertainty_contract=(
+                response_batches._multi_readout_response_uncertainty_contract()
+            ),
+        )
+        self.assertNotEqual(
+            scientific_computation_identity_sha256(plan, deep_exterior),
+            hashlib.sha256(canonical_json_bytes(historical)).hexdigest(),
+        )
+
+    def test_current_and_schema7_scientific_contracts_are_distinct(self) -> None:
+        current = response_batches._response_uncertainty_contract()
+        historical = response_batches._schema7_response_uncertainty_contract()
+
+        self.assertEqual(current["version"], 5)
+        self.assertEqual(
+            current["promoted_primary_horizon_component_identity"],
+            "single-promoted-root-bounded-analytic-horizon-component/v2",
+        )
+        self.assertEqual(
+            current["promoted_primary_horizon_response_uncertainty"],
+            "BOUNDED_ANALYTIC_RESPONSE",
+        )
+        self.assertEqual(
+            current["promoted_exterior_component_identity"],
+            "fixed-root-exterior-derivative-component/v1",
+        )
+        self.assertEqual(
+            current["promoted_exterior_response_disk"],
+            "exterior-derivative-response-disk/v1",
+        )
+        self.assertEqual(
+            current["promoted_exterior_derivative_conditioning"],
+            "fixed-root-h-h2-conditioning/v1",
+        )
+        self.assertEqual(
+            current["promoted_exterior_axis_validation"],
+            "fixed-root-holomorphic-axis-validation/v1",
+        )
+        self.assertEqual(
+            current["promoted_exterior_full_validation"],
+            "full-complex-ladder-validation/v1",
+        )
+
+        self.assertEqual(historical["version"], 4)
+        self.assertEqual(
+            historical["promoted_root_readout_policy"],
+            "binary64-parity-primary-fixed-root-diagnostics/v1",
+        )
+        self.assertEqual(
+            historical["promoted_primary_horizon_component_identity"],
+            "single-promoted-root-analytic-horizon-component/v1",
+        )
+        self.assertEqual(
+            historical["promoted_primary_horizon_response_uncertainty"],
+            "UNCALIBRATED_ANALYTIC_RESPONSE",
+        )
+        self.assertFalse(
+            any(key.startswith("promoted_exterior_") for key in historical)
+        )
+        self.assertEqual(
+            response_batches._checkpoint_precision_contract_sha256(7),
+            "3f6364f6fc28eebeeb788af20524f8ada3c97f23e41fb68f4ead3da365368dcb",
+        )
+
     def test_primary_recovery_identity_and_checkpoint_binding(self) -> None:
         """Catches omitting the root-convergence policy from leaf identities."""
 
@@ -194,20 +301,20 @@ class CampaignPlanTests(unittest.TestCase):
         control = next(item for item in plan.leaves if item.role == "control")
         deep = next(item for item in plan.leaves if item.role == "deep")
 
-        self.assertEqual(CAMPAIGN_SCHEMA_VERSION, 2)
-        self.assertEqual(CAMPAIGN_CHECKPOINT_SCHEMA_VERSION, 7)
+        self.assertEqual(CAMPAIGN_SCHEMA_VERSION, 3)
+        self.assertEqual(CAMPAIGN_CHECKPOINT_SCHEMA_VERSION, 8)
         with self.subTest(contract="identity"):
             self.assertEqual(
                 scientific_computation_identity_sha256(plan, primary),
-                "bc0a9c294bd03ed45bfafc0afbba04415645eb60a1f458409a68df6c87a87f81",
+                "84f765093afa21f76ba4d150e8613d100c6bbaa6b1109283092c0d3ed2f3cdbe",
             )
             self.assertEqual(
                 scientific_computation_identity_sha256(plan, control),
-                "1c8a56139e6127b293f8fe13336b44feda79bcfd08035fceedafca5a7086797a",
+                "38667f5e83151b2b1af735dca839809775644274a8e865dd14fde2fe5fa703c5",
             )
             self.assertEqual(
                 scientific_computation_identity_sha256(plan, deep),
-                "242f3caa92648705bf520782a2387c66e8423aad3fe4171d0ed0306e2ff72b2b",
+                "6dafc7823d248b32fef7c393b4b7cfeeeb39b287c51d89c88ec17423bdb911ff",
             )
 
         leaf = primary
@@ -578,8 +685,8 @@ class CampaignPlanTests(unittest.TestCase):
             "available_precision_digits": [64],
         })
 
-        self.assertEqual(CAMPAIGN_SCHEMA_VERSION, 2)
-        self.assertEqual(CAMPAIGN_CHECKPOINT_SCHEMA_VERSION, 7)
+        self.assertEqual(CAMPAIGN_SCHEMA_VERSION, 3)
+        self.assertEqual(CAMPAIGN_CHECKPOINT_SCHEMA_VERSION, 8)
         self.assertEqual(record.to_mapping()["signed_error_channels"], list(channels))
         forged = record.to_mapping()
         injected = dict(forged["signed_error_channels"][0])

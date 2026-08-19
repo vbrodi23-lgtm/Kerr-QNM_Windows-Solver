@@ -362,7 +362,9 @@ class RegularisedGsnFactoredPropagationSourceTests(unittest.TestCase):
         # evaluator itself; two call sites would let one of them escape the
         # radial gate below.
         self.assertNotIn("evaluate_horizon_asymptotic_series(", series)
-        prefix_search = self._function("_best_prefix_assessment")
+        prefix_search = self._function(
+            "select_horizon_endpoint_best_prefix"
+        )
         self.assertIn(
             "evaluate_horizon_asymptotic_series(", prefix_search
         )

@@ -50,6 +50,19 @@ preservation, and cache/provenance separation from historical raw-state leaves.
 
 ### Plan
 
+- Repair PR #55 under the air-gapped architecture plan at
+  `docs/superpowers/plans/2026-08-19-m02-promoted-response-architecture-repair.md`:
+  add semantic precision tiers, provenance-bound uncertainty disks, adaptive
+  endpoint/error-budget policies, and an atomic per-work-unit journal before
+  changing promoted execution routing.
+- Replace promoted exterior perturbed-root production with an authenticated
+  baseline plus fixed-root determinant derivative and selected validation;
+  restrict the full complex ladder to explicit validation reasons.
+- Bound analytic promoted-horizon responses through explicit p_H and D′ disks;
+  make unbounded/zero-containing evidence unusable by projective reduction.
+- Complete adaptive horizon depth/order/best-prefix search and low-signal
+  window backtracking, then add selective readout promotion, immutable
+  checkpoint migration, targeted operator scripts, and an engineering note.
 - Preserve the package-owned factored GSN determinant, contour, carrier, branch,
   conditioning, and naturally available determinant-error telemetry unchanged.
 - Apply the operator-validated promoted-readout policy identity
@@ -80,5 +93,27 @@ preservation, and cache/provenance separation from historical raw-state leaves.
   keep admission fail-closed as `UNCALIBRATED_ANALYTIC_RESPONSE`, and migrate
   authenticated predecessor checkpoints by retaining canonical binary64 stages
   while dropping old promoted horizon multi-readout stages.
+
+### Work Log
+
+- 2026-08-19 — Task 3 recovery implementation completed under the strict
+  air-gap: adaptive two-endpoint horizon search, cap-reused outer endpoint
+  selection, exhaustive safe-window backtracking/selective semantic-tier
+  promotion, request-bound ODE-budget controls with the exact missing-math
+  blocker, partial-component resume journal, immutable checkpoint migration,
+  two operator-only PowerShell entry points, and the engineering note. Focused
+  synthetic/static tests pass; no Julia, Kerr determinant, ODE/angular/QNM
+  solve, M02 campaign, or PowerShell script was executed. TASK-079 remains In
+  Progress pending human math review and native operator evidence.
+- 2026-08-19 — Final P1 remediation keeps TASK-079 open while making
+  `HORIZON_ARITHMETIC_INADEQUATE` the only endpoint outcome that promotes,
+  versioning the live checkpoint as schema 8 with schema-7 historical parsing,
+  migrating real authenticated campaign records to a normal resumable
+  destination with a provenance sidecar, binding current horizon-v2 and
+  fixed-root exterior scientific contracts, searching all deterministic Julia
+  prefixes to each maximum order, and making the light-ring stop/resume branch
+  wait for the process tree and cold-start when no checkpoint exists. Full safe
+  Python discovery passed 885 tests with 7 skips; native/human evidence remains
+  outstanding and the task was not moved to Done.
 
 ---

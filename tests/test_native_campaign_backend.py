@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import hashlib
 from pathlib import Path
+import tempfile
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -11,10 +12,13 @@ from windows_solver.contracts import canonical_json_bytes
 from windows_solver.gsn_cache_producer import GeneratedGsnCache, GsnParameterPair
 from windows_solver.julia_response_backend import JuliaPrecisionRootBackend
 from windows_solver.response_batches import (
+    B_PRIME_RELEASE_DOMAIN,
     CampaignExecutionAttempt,
     NativeCampaignStageBackend,
     PrecisionCapabilities,
+    build_campaign_selection,
     build_campaign_plan,
+    run_campaign_selection,
 )
 from windows_solver.response_engine import (
     ComponentResult,
@@ -24,6 +28,11 @@ from windows_solver.response_engine import (
     RootReadout,
     VettedNativeDeterminantKernel,
     ERROR_CHANNELS,
+)
+from tests.fixtures import (
+    control_failure_stage,
+    synthetic_ode_error_budget,
+    valid_control_failure_diagnostics,
 )
 
 
@@ -78,7 +87,10 @@ def _result(job, response: complex, *, radius: float = 1.0e-7):
 
 def _failed_preflight_attempt(leaf, *, primary_predictor=None):
     request_binding = JuliaPrecisionRootBackend(
-        leaf.job.backend_identity, object(), 80
+        leaf.job.backend_identity,
+        object(),
+        80,
+        ode_error_budget=synthetic_ode_error_budget(80),
     )._request(
         leaf.job,
         0.0j,
@@ -151,6 +163,44 @@ def _failed_preflight_attempt(leaf, *, primary_predictor=None):
     )
 
 
+def _endpoint_arithmetic_attempt(leaf, *, primary_predictor):
+    attempt = _failed_preflight_attempt(
+        leaf, primary_predictor=primary_predictor
+    )
+    mapping = copy.deepcopy(attempt.to_mapping())
+    failure = mapping["failure_receipt"]["failure"]
+    failure["failure_code"] = "HORIZON_ARITHMETIC_INADEQUATE"
+    failure["stage"] = control_failure_stage(
+        "HORIZON_ARITHMETIC_INADEQUATE"
+    )
+    failure["diagnostics"] = valid_control_failure_diagnostics(
+        "HORIZON_ARITHMETIC_INADEQUATE",
+        precision_bits=failure["request_binding"]["working_precision_bits"],
+    )
+    failure["promotion_decision"] = {
+        "schema": "windows-solver.precision-promotion-decision/1",
+        "from_precision_digits": 80,
+        "to_precision_digits": 120,
+        "state": "REQUESTED",
+        "reason": "HORIZON_ARITHMETIC_INADEQUATE",
+        "predicted_reliable_digits": None,
+        "required_reliable_digits": None,
+        "precision_limited": None,
+        "asymptotic_preflight_avoided_ode": None,
+    }
+    mapping["failure_code"] = "HORIZON_ARITHMETIC_INADEQUATE"
+    mapping["failure_receipt"]["worker_error_message"] = (
+        "endpoint arithmetic inadequate"
+    )
+    content = {
+        key: value for key, value in mapping.items() if key != "attempt_sha256"
+    }
+    mapping["attempt_sha256"] = hashlib.sha256(
+        canonical_json_bytes(content)
+    ).hexdigest()
+    return CampaignExecutionAttempt.from_mapping(mapping)
+
+
 class NativeCampaignBackendTests(unittest.TestCase):
     def setUp(self):
         self.capabilities = PrecisionCapabilities((64, 80, 120))
@@ -159,7 +209,12 @@ class NativeCampaignBackendTests(unittest.TestCase):
             backend_identity=VettedNativeDeterminantKernel.identity,
             precision_capabilities=self.capabilities,
         )
-        self.leaf = next(leaf for leaf in self.plan.leaves if leaf.role == "deep")
+        self.leaf = next(
+            leaf
+            for leaf in self.plan.leaves
+            if leaf.role == "deep"
+            and leaf.mechanism_id != "horizon-admittance"
+        )
         generated = GeneratedGsnCache(
             ("gsn-000001",),
             Path(".runtime/generated/gsn/gsn-selection-test.json"),
@@ -179,7 +234,14 @@ class NativeCampaignBackendTests(unittest.TestCase):
             kernel=SimpleNamespace(),
         )
         self.backend = NativeCampaignStageBackend(
-            native, self.capabilities, generated, julia
+            native,
+            self.capabilities,
+            generated,
+            julia,
+            ode_error_budgets={
+                80: synthetic_ode_error_budget(80),
+                120: synthetic_ode_error_budget(120),
+            },
         )
 
     def test_main_era_full_resource_policy_attempt_remains_readable(self):
@@ -246,26 +308,27 @@ class NativeCampaignBackendTests(unittest.TestCase):
     def test_promoted_stage_records_repeat_and_prior_discrepancies(self):
         previous_result = _result(self.leaf.job, 1.0 + 0.0j)
         primary = _result(self.leaf.job, 1.0 + 2.0e-8j)
-        repeat = _result(self.leaf.job, 1.0 + 2.5e-8j)
         previous = SimpleNamespace(
             digits=64,
             component_result={"result": previous_result.to_mapping()},
             local_disk_radius_abs=1.0e-6,
         )
         with patch(
-            "windows_solver.response_batches.run_component",
-            side_effect=(primary, repeat),
+            "windows_solver.response_batches.run_promoted_exterior_component",
+            return_value=primary,
         ) as run:
             outcome = self.backend.execute_promoted_stage(
                 self.leaf, 80, (previous,)
             )
 
-        self.assertEqual(run.call_count, 2)
+        self.assertEqual(run.call_count, 1)
         self.assertAlmostEqual(outcome.discrepancy_from_previous_abs, 2.0e-8)
         self.assertTrue(outcome.discrepancy_enclosed)
-        self.assertTrue(outcome.self_refinement_enclosed)
-        self.assertIsNotNone(
-            outcome.component_result["self_refinement_result"]
+        self.assertIsNone(outcome.self_refinement_enclosed)
+        self.assertIsNone(outcome.component_result["self_refinement_result"])
+        self.assertEqual(
+            outcome.component_result["self_refinement_skipped_reason"],
+            "NOT_REQUIRED_BY_FIXED_ROOT_DERIVATIVE_POLICY",
         )
         ledger_radius = sum(
             abs(complex(
@@ -311,7 +374,7 @@ class NativeCampaignBackendTests(unittest.TestCase):
             local_disk_radius_abs=1.0e-6,
         )
         with patch(
-            "windows_solver.response_batches.run_component",
+            "windows_solver.response_batches.run_promoted_exterior_component",
             return_value=primary,
         ) as run:
             outcome = self.backend.execute_promoted_stage(
@@ -320,31 +383,30 @@ class NativeCampaignBackendTests(unittest.TestCase):
 
         self.assertEqual(run.call_count, 1)
         self.assertEqual(outcome.numerical_state, "NOT_CONVERGED")
-        self.assertIs(outcome.self_refinement_enclosed, False)
+        self.assertIsNone(outcome.self_refinement_enclosed)
         self.assertIsNone(outcome.component_result["self_refinement_result"])
         self.assertEqual(
             outcome.component_result["self_refinement_skipped_reason"],
-            "PRIMARY_NOT_CONVERGED",
+            "NOT_REQUIRED_BY_FIXED_ROOT_DERIVATIVE_POLICY",
         )
 
-    def test_failed_preflight_recovery_runs_120_base_and_refinement(self):
+    def test_failed_preflight_recovery_uses_fixed_root_derivative_once(self):
         predecessor = _failed_preflight_attempt(self.leaf)
         base = _result(self.leaf.job, 1.0 + 2.0e-8j)
-        refinement = _result(self.leaf.job, 1.0 + 2.5e-8j)
 
         with patch(
-            "windows_solver.response_batches.run_component",
-            side_effect=(base, refinement),
+            "windows_solver.response_batches.run_promoted_exterior_component",
+            return_value=base,
         ) as run:
             outcome = self.backend.execute_promoted_stage_after_failed_preflight(
                 self.leaf, 120, predecessor
             )
 
-        self.assertEqual(run.call_count, 2)
+        self.assertEqual(run.call_count, 1)
         self.assertEqual(outcome.digits, 120)
         self.assertIsNone(outcome.discrepancy_from_previous_abs)
         self.assertIsNone(outcome.discrepancy_enclosed)
-        self.assertTrue(outcome.self_refinement_enclosed)
+        self.assertIsNone(outcome.self_refinement_enclosed)
         component = outcome.component_result
         self.assertEqual(
             component["failed_preflight_predecessor"],
@@ -352,16 +414,109 @@ class NativeCampaignBackendTests(unittest.TestCase):
         )
         self.assertEqual(
             component["comparison_kind"],
-            "same-precision-120-base-vs-refinement/v1",
+            "failed-preflight-120-fixed-root-exterior-derivative/v1",
         )
         self.assertIs(
             component["precision_ladder_discrepancy_applicable"], False
         )
+        self.assertIsNone(component["self_refinement_result"])
         self.assertEqual(
-            component["self_refinement_scientific_runtime"][
-                "refinement_level"
-            ],
-            1,
+            component["self_refinement_skipped_reason"],
+            "NOT_REQUIRED_BY_FIXED_ROOT_DERIVATIVE_POLICY",
+        )
+
+    def test_endpoint_arithmetic_recovery_accepts_authenticated_missing_80_stage(self):
+        leaf = next(
+            item
+            for item in self.plan.leaves
+            if item.role == "primary"
+            and item.mechanism_id == "horizon-admittance"
+        )
+        predictor = leaf.job.root.omega + complex(1.0e-5, -2.0e-5)
+        predecessor = _endpoint_arithmetic_attempt(
+            leaf, primary_predictor=predictor
+        )
+        recovered = _result(leaf.job, 0.25 - 0.125j, radius=1.0e-12)
+        with patch(
+            "windows_solver.response_batches.run_promoted_horizon_component",
+            return_value=recovered,
+        ) as run:
+            outcome = self.backend.execute_promoted_stage_after_endpoint_arithmetic(
+                leaf, 120, predecessor
+            )
+
+        self.assertEqual(run.call_count, 1)
+        self.assertEqual(outcome.digits, 120)
+        self.assertEqual(
+            run.call_args.args[2], predictor
+        )
+        self.assertNotIn(
+            "failed_preflight_predecessor", outcome.component_result
+        )
+
+    def test_deep_horizon_campaign_accepts_bounded_analytic_stage(self):
+        from tests.test_promoted_horizon_component import (
+            FakeJuliaPrecisionBackend,
+            _promoted_baseline,
+            _with_worker_receipt,
+        )
+
+        deep = next(
+            leaf
+            for leaf in self.plan.leaves
+            if leaf.role == "deep"
+            and leaf.mechanism_id == "horizon-admittance"
+            and leaf.leaf_id
+            in set(B_PRIME_RELEASE_DOMAIN.fixed_precision_sentinel_leaf_ids)
+        )
+        generated = GeneratedGsnCache(
+            ("gsn-000001",),
+            Path(".runtime/generated/gsn/gsn-selection-test.json"),
+            "a" * 64,
+            (GsnParameterPair(19, 20, deep.job.mode.m),),
+        )
+        backend = NativeCampaignStageBackend(
+            self.backend.native_adapter,
+            self.capabilities,
+            generated,
+            self.backend.julia_adapter,
+            ode_error_budgets={
+                80: synthetic_ode_error_budget(80),
+                120: synthetic_ode_error_budget(120),
+            },
+        )
+        predictor = deep.job.root.omega
+        promoted = _with_worker_receipt(
+            deep.job,
+            _promoted_baseline(deep.job),
+            80,
+            predictor,
+        )
+        julia = FakeJuliaPrecisionBackend(deep.job, promoted, 80)
+        selection = build_campaign_selection(
+            self.plan, role="deep", leaf_ids=(deep.leaf_id,)
+        )
+
+        with tempfile.TemporaryDirectory() as temporary, patch(
+            "windows_solver.response_batches.run_component",
+            return_value=_result(deep.job, 0.25 - 0.125j),
+        ), patch(
+            "windows_solver.response_batches.JuliaPrecisionRootBackend",
+            return_value=julia,
+        ):
+            summary = run_campaign_selection(
+                self.plan,
+                selection,
+                backend,
+                Path(temporary) / "deep-horizon.json",
+                resume=False,
+            )
+
+        self.assertEqual(summary.state, "COMPLETE")
+        self.assertEqual(summary.records[0].state, "PRODUCED")
+        self.assertEqual(
+            tuple(stage.outcome.digits for stage in summary.records[0].stages),
+            (64, 80),
         )
 
 

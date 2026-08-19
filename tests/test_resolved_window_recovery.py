@@ -11,17 +11,23 @@ amplitude.
 from __future__ import annotations
 
 import unittest
+import tempfile
+from pathlib import Path
+from unittest.mock import patch
+from dataclasses import replace
 
 from windows_solver.response_engine import (
     AMPLITUDE_EXPANSION_RECOVERY_POLICY,
     BackendIdentity,
     ComponentResult,
     ComponentStatus,
+    DiagnosticRootReadout,
     NumericalPolicy,
     ResponseComponentJob,
     RootReadout,
     run_component,
 )
+from windows_solver.partial_component_checkpoint import PartialComponentJournal
 
 
 EXTERIOR_LEAF_ID = (
@@ -80,6 +86,22 @@ class CollapsedResponseBackend:
         return [abs(value) for value in self.amplitudes if value != 0.0j]
 
 
+class ImaginaryAxisLimitedBackend(CollapsedResponseBackend):
+    def read_root(self, job, amplitude, primary_predictor=None) -> RootReadout:
+        value = complex(amplitude)
+        self.amplitudes.append(value)
+        response = self.response if value.real else complex(1.0e-10, 0.0)
+        return RootReadout(
+            omega=job.root.omega + response * value + self.cubic * value**3,
+            determinant_residual_abs=self.root_noise,
+            determinant_derivative_abs=1.0,
+            converged=True,
+            root_reference_id=job.root.root_reference_id,
+            branch_id=job.root.branch_id,
+            equation_id=job.equation_id,
+        )
+
+
 def _exterior_job() -> ResponseComponentJob:
     return ResponseComponentJob.from_leaf_id(
         EXTERIOR_LEAF_ID,
@@ -89,6 +111,94 @@ def _exterior_job() -> ResponseComponentJob:
 
 
 class ResolvedWindowRecoveryTests(unittest.TestCase):
+    def test_generic_component_journal_resumes_signed_and_expanded_readouts(self):
+        job = _exterior_job()
+
+        class DiagnosticBackend(CollapsedResponseBackend):
+            def read_root(self, job, amplitude, primary_predictor=None):
+                output = super().read_root(job, amplitude, primary_predictor)
+                diagnostic = DiagnosticRootReadout(
+                    omega_delta_from_primary=0.0j,
+                    determinant_residual_abs=self.root_noise,
+                    determinant_derivative_abs=1.0,
+                    converged=True,
+                )
+                return replace(output, diagnostic_readouts={
+                    family: diagnostic
+                    for family in ("truncation", "resolution", "seed-path")
+                })
+
+        class InterruptAfterFirstSigned(DiagnosticBackend):
+            def read_root(self, job, amplitude, primary_predictor=None):
+                if len(self.amplitudes) == 2:
+                    raise KeyboardInterrupt("synthetic interruption")
+                return super().read_root(job, amplitude, primary_predictor)
+
+        with tempfile.TemporaryDirectory() as temporary, patch.dict(
+            "os.environ",
+            {"KERR_QNM_PARTIAL_COMPONENT_JOURNAL_ROOT": temporary},
+        ):
+            interrupted = InterruptAfterFirstSigned()
+            with self.assertRaises(KeyboardInterrupt):
+                run_component(job, interrupted)
+
+            journals = tuple(Path(temporary).glob("*.json"))
+            self.assertEqual(len(journals), 1)
+            stopped = PartialComponentJournal.load(journals[0])
+            self.assertEqual(
+                {entry.readout_role for entry in stopped.entries.values()},
+                {"baseline", "real-plus@0.004"},
+            )
+
+            resumed = DiagnosticBackend()
+            result = run_component(job, resumed)
+
+            self.assertEqual(result.status, ComponentStatus.CONVERGED)
+            self.assertNotIn(0.0j, resumed.amplitudes)
+            self.assertNotIn(complex(0.004, 0.0), resumed.amplitudes)
+            self.assertIn(complex(0.008, 0.0), resumed.amplitudes)
+            final = PartialComponentJournal.load(journals[0])
+            roles = {entry.readout_role for entry in final.entries.values()}
+            self.assertIn("real-plus@0.008", roles)
+            self.assertIn("imaginary-minus@0.008", roles)
+            first_signed = next(
+                entry for entry in final.entries.values()
+                if entry.readout_role == "real-plus@0.004"
+            )
+            self.assertEqual(
+                first_signed.worker_response_receipt["kind"], "root-readout"
+            )
+            self.assertIn(
+                "diagnostic_readouts",
+                first_signed.worker_response_receipt["output"],
+            )
+
+    def test_production_recovery_serializes_only_failing_axis_pair_promotion(self):
+        job = _exterior_job()
+        backend = ImaginaryAxisLimitedBackend(
+            response=complex(0.125, -0.375), cubic=0.0j
+        )
+
+        result = run_component(job, backend)
+
+        self.assertEqual(result.status, ComponentStatus.AXIS_MISMATCH)
+        recovery = result.resolved_window
+        self.assertIsNotNone(recovery)
+        self.assertEqual(recovery["recovery_disposition"], "PROMOTE_READOUTS")
+        self.assertEqual(recovery["next_precision_tier"], "bigfloat-40")
+        self.assertEqual(recovery["exact_added_epsilons"], [0.008, 0.016])
+        self.assertTrue(recovery["candidate_windows"])
+        self.assertTrue(recovery["signal_noise_ratios"])
+        self.assertTrue(recovery["window_diagnostics"])
+        self.assertTrue(recovery["branch_margins"])
+        plan = recovery["readout_specific_promotion_plan"]
+        self.assertTrue(plan)
+        self.assertEqual(
+            {item["readout_role"] for item in plan},
+            {"imaginary_plus", "imaginary_minus"},
+        )
+        self.assertNotIn("real_plus", {item["readout_role"] for item in plan})
+
     def test_collapsed_response_recovers_by_widening_the_amplitude(self):
         """The 0.9999 light-ring rows must resolve instead of returning noise."""
 

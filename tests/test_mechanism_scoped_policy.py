@@ -31,6 +31,7 @@ from windows_solver.response_batches import (
     build_campaign_plan,
 )
 from tests.fixtures import (
+    synthetic_ode_error_budget,
     valid_numerical_conditioning,
 )
 
@@ -209,7 +210,10 @@ class ReceiptCompatibilityTests(unittest.TestCase):
     def _readout(self, job, runtime):
         horizon = job.mechanism_id == "horizon-admittance"
         request_binding = JuliaPrecisionRootBackend(
-            job.backend_identity, object(), 80
+            job.backend_identity,
+            object(),
+            80,
+            ode_error_budget=synthetic_ode_error_budget(80),
         )._request(job, 0.0j)
         determinant = Decimal("1E-10")
         derivative = Decimal("2")

@@ -48,6 +48,7 @@ from windows_solver.response_batches import (
 )
 from windows_solver.response_engine import (
     DecimalComplex,
+    FixedRootDeterminantSample,
     LadderLevel,
     NumericalPolicy,
     RootAuthenticationEvidence,
@@ -58,6 +59,7 @@ from windows_solver.response_engine import (
 )
 from windows_solver.progress_output import CampaignProgressReporter
 from tests.fixtures import (
+    synthetic_ode_error_budget,
     valid_julia_root_response,
     valid_legacy_julia_root_response,
     valid_root_authentication,
@@ -98,6 +100,10 @@ class FakeAdapter:
 
     def __init__(self):
         self.requests = []
+
+    @staticmethod
+    def ode_error_budget_for_digits(digits):
+        return synthetic_ode_error_budget(digits)
 
     @staticmethod
     def shifted(value, delta):
@@ -182,6 +188,139 @@ def _set_distinct_derivative_binding(response, wire_derivative_abs):
 
 
 class JuliaResponseBackendTests(unittest.TestCase):
+    def test_schema8_horizon_derivative_error_availability_is_not_zero_claim(self):
+        job = _job_for_mechanism("horizon-admittance")
+        backend = JuliaPrecisionRootBackend(
+            VettedNativeDeterminantKernel.identity, FakeAdapter(), 80
+        )
+        request = backend._request(job, 0.0j)
+        response = valid_julia_root_response(request)
+        derivative = response["primary_acceptance"]["derivative_authentication"]
+        self.assertEqual(derivative["determinant_error_status"], "available/v1")
+        self.assertGreater(Decimal(derivative["propagated_error_abs"]), 0)
+        readout = backend._read_root_response_v7(
+            job,
+            request,
+            SimpleNamespace(
+                response=response,
+                request_binding=request,
+                request_sha256=response["request_sha256"],
+                runtime_identity_sha256="f" * 64,
+                reused=False,
+                cached_worker_response_receipt=None,
+            ),
+        )
+        self.assertEqual(
+            readout.primary_acceptance.derivative_authentication.determinant_error_status,
+            "available/v1",
+        )
+
+        response["primary_acceptance"]["derivative_authentication"][
+            "propagated_error_abs"
+        ] = "0"
+        with self.assertRaisesRegex(
+            JuliaResponseBackendError,
+            "PRIMARY acceptance evidence is invalid",
+        ):
+            backend._read_root_response_v7(
+                job,
+                request,
+                SimpleNamespace(
+                    response=response,
+                    request_binding=request,
+                    request_sha256=response["request_sha256"],
+                    runtime_identity_sha256="f" * 64,
+                    reused=False,
+                    cached_worker_response_receipt=None,
+                ),
+            )
+
+    def test_fixed_root_determinant_sample_boundary_preserves_evidence(self):
+        class FixedSampleAdapter(FakeAdapter):
+            def evaluate_for_validation(self, request):
+                self.requests.append(request)
+                request_sha256 = hashlib.sha256(
+                    canonical_json_bytes(request)
+                ).hexdigest()
+                response = {
+                    "schema_version": 1,
+                    "status": "ok",
+                    "operation": "fixed-root-determinant-sample",
+                    "request_sha256": request_sha256,
+                    "omega_re": request["fixed_omega"]["real"],
+                    "omega_im": request["fixed_omega"]["imaginary"],
+                    "amplitude_re": request["amplitude"]["real"],
+                    "amplitude_im": request["amplitude"]["imaginary"],
+                    "determinant_re": "0.006000000001",
+                    "determinant_im": "0.009",
+                    "determinant_error_abs": "4e-12",
+                    "determinant_error_status": "available/v1",
+                    "determinant_error_model_id": "synthetic-absolute-bound/v1",
+                    "determinant_family": "exterior-wronskian/v1",
+                    "determinant_normalisation": "unit-asymptotic-branch-wronskian/v1",
+                    "branch_identity": "gsn-complex-rho/v1",
+                    "branch_authenticated": True,
+                    "semantic_precision_tier": "bigfloat-80",
+                    "working_precision_bits": 298,
+                    "readout_role": request["readout_role"],
+                }
+                return SimpleNamespace(
+                    response=response,
+                    request_binding=dict(request),
+                    request_sha256=request_sha256,
+                    runtime_identity_sha256="f" * 64,
+                    reused=False,
+                    cached_worker_response_receipt=None,
+                )
+
+        job = _job_for_mechanism("exterior-light-ring")
+        adapter = FixedSampleAdapter()
+        backend = JuliaPrecisionRootBackend(
+            VettedNativeDeterminantKernel.identity, adapter, 80
+        )
+        sample = backend.sample_fixed_root_determinant(
+            job,
+            job.root.omega,
+            0.003 + 0.0j,
+            readout_role="coordinate-real-plus-h",
+        )
+        mapping = sample.to_mapping()
+
+        self.assertEqual(adapter.requests[0]["operation"], "fixed-root-determinant-sample")
+        self.assertEqual(mapping["omega"], {"imaginary": job.root.omega.imag, "real": job.root.omega.real})
+        self.assertEqual(mapping["determinant_family"], "exterior-wronskian/v1")
+        self.assertEqual(mapping["precision_tier"], "bigfloat-80")
+        self.assertEqual(mapping["working_precision_bits"], 298)
+        self.assertEqual(mapping["readout_role"], "coordinate-real-plus-h")
+        self.assertRegex(mapping["request_sha256"], r"^[0-9a-f]{64}$")
+        self.assertRegex(mapping["worker_response_receipt_sha256"], r"^[0-9a-f]{64}$")
+        self.assertEqual(
+            mapping["worker_response_receipt"]["request_binding"],
+            adapter.requests[0],
+        )
+        self.assertEqual(
+            mapping["worker_response_receipt"]["response_binding"][
+                "determinant_re"
+            ],
+            "0.006000000001",
+        )
+
+        for receipt_field, replacement in (
+            ("request_binding", {**adapter.requests[0], "readout_role": "tampered"}),
+            ("response_binding", {
+                **mapping["worker_response_receipt"]["response_binding"],
+                "determinant_re": "9",
+            }),
+        ):
+            with self.subTest(receipt_field=receipt_field):
+                tampered = json.loads(canonical_json_bytes(mapping))
+                tampered["worker_response_receipt"][receipt_field] = replacement
+                tampered["worker_response_receipt_sha256"] = hashlib.sha256(
+                    canonical_json_bytes(tampered["worker_response_receipt"])
+                ).hexdigest()
+                with self.assertRaisesRegex(ValueError, "receipt .* mismatch"):
+                    FixedRootDeterminantSample.from_mapping(tampered)
+
     @staticmethod
     def _cache_adapter(root, runner):
         depot = root / "depot"
@@ -219,7 +358,8 @@ class JuliaResponseBackendTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             adapter, store = self._cache_adapter(Path(temporary), runner)
             backend = JuliaPrecisionRootBackend(
-                VettedNativeDeterminantKernel.identity, adapter, 80
+                VettedNativeDeterminantKernel.identity, adapter, 80,
+                ode_error_budget=synthetic_ode_error_budget(80),
             )
             with self.assertRaises(JuliaResponseBackendError):
                 backend.read_root(_deep_job(), 0.0j)
@@ -242,7 +382,8 @@ class JuliaResponseBackendTests(unittest.TestCase):
             adapter, store = self._cache_adapter(Path(temporary), runner)
             job = _deep_job()
             backend = JuliaPrecisionRootBackend(
-                VettedNativeDeterminantKernel.identity, adapter, 80
+                VettedNativeDeterminantKernel.identity, adapter, 80,
+                ode_error_budget=synthetic_ode_error_budget(80),
             )
             request = backend._request(job, 0.0j)
             request_sha256 = hashlib.sha256(
@@ -303,7 +444,8 @@ class JuliaResponseBackendTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             adapter, store = self._cache_adapter(Path(temporary), runner)
             backend = JuliaPrecisionRootBackend(
-                VettedNativeDeterminantKernel.identity, adapter, 80
+                VettedNativeDeterminantKernel.identity, adapter, 80,
+                ode_error_budget=synthetic_ode_error_budget(80),
             )
             backend.read_root(_deep_job(), 0.0j)
             cache_path = next(store.root.glob("*.json"))
@@ -348,7 +490,7 @@ class JuliaResponseBackendTests(unittest.TestCase):
             valid_julia_root_response(request)["schema_version"],
             WORKER_RESPONSE_WIRE_SCHEMA,
         )
-        self.assertEqual(WORKER_RESPONSE_WIRE_SCHEMA, 7)
+        self.assertEqual(WORKER_RESPONSE_WIRE_SCHEMA, 8)
         root = Path(__file__).resolve().parents[1]
         worker = (
             root / "src/windows_solver/data/julia/m02_worker.jl"
@@ -357,7 +499,7 @@ class JuliaResponseBackendTests(unittest.TestCase):
             worker.index("function result_fields(") :
             worker.index("function evaluate_request(")
         ]
-        self.assertEqual(result_fields.count('"schema_version" => 7'), 2)
+        self.assertEqual(result_fields.count('"schema_version" => 8'), 2)
         self.assertNotIn('"schema_version" => 6', result_fields)
         error_path = worker[
             worker.rindex("catch failure") : worker.index(
@@ -1932,7 +2074,7 @@ class JuliaResponseBackendTests(unittest.TestCase):
                 self._force_stop_process(directory / "child.pid")
                 self._force_stop_process(directory / "parent.pid")
 
-    def test_promoted_backend_uses_practical_80_digit_policy(self):
+    def test_promoted_backend_consumes_recorded_80_digit_ode_budget(self):
         job = _deep_job()
         adapter = FakeAdapter()
         backend = JuliaPrecisionRootBackend(
@@ -1947,8 +2089,16 @@ class JuliaResponseBackendTests(unittest.TestCase):
         self.assertEqual(
             request["policy"]["root_correction_tolerance"], "2e-11"
         )
-        self.assertEqual(request["policy"]["ode_relative_tolerance"], "1e-18")
-        self.assertEqual(request["policy"]["ode_absolute_tolerance"], "1e-20")
+        budget = synthetic_ode_error_budget(80)
+        self.assertEqual(
+            float(request["policy"]["ode_relative_tolerance"]),
+            budget.homogeneous_reltol,
+        )
+        self.assertEqual(
+            float(request["policy"]["ode_absolute_tolerance"]),
+            budget.homogeneous_abstol,
+        )
+        self.assertEqual(request["policy"]["ode_error_budget"], budget.to_mapping())
         self.assertEqual(request["policy"]["frequency_step"], "1e-6")
         self.assertEqual(request["amplitude"], {
             "real": "0.001",
@@ -1964,7 +2114,7 @@ class JuliaResponseBackendTests(unittest.TestCase):
         )
         self.assertEqual(
             request["policy"]["promoted_root_readout_policy"],
-            "binary64-parity-primary-fixed-root-diagnostics/v1",
+            "binary64-parity-primary-fixed-root-diagnostics-frequency-disk/v2",
         )
         self.assertTrue(readout.converged)
         self.assertEqual(backend.scientific_runtime["precision_digits"], 80)
@@ -2028,28 +2178,27 @@ class JuliaResponseBackendTests(unittest.TestCase):
             policy80_refined["root_correction_tolerance"],
         )
 
-        # The extra 120-digit precision is spent as guard: ODE controls are
-        # tightened by a bounded factor over the healthy 80-digit level, not
-        # driven toward the arithmetic floor.
+        # Storage precision cannot silently alter local ODE targets. Both
+        # requests consume their own recorded calibration-derived budgets.
         for field in (
             "homogeneous_ode_relative_tolerance",
             "coordinate_ode_relative_tolerance",
         ):
-            exponent80 = int(policy80[field].split("e-")[1])
-            exponent120 = int(policy120[field].split("e-")[1])
-            self.assertGreater(exponent120, exponent80)
-            self.assertLess(exponent120 - exponent80, 40)
+            self.assertEqual(float(policy120[field]), float(policy80[field]))
 
-        # The coordinate map is never driven harder than the homogeneous solve.
+        # Each channel is exactly the reviewed allocation; no cross-channel
+        # ordering is inferred beyond that calibration receipt.
         for candidate in (policy80, policy80_refined,
                           policy120, policy120_refined):
-            coordinate = int(
-                candidate["coordinate_ode_relative_tolerance"].split("e-")[1]
+            budget = candidate["ode_error_budget"]
+            self.assertEqual(
+                float(candidate["coordinate_ode_relative_tolerance"]),
+                budget["coordinate_reltol"],
             )
-            homogeneous = int(
-                candidate["homogeneous_ode_relative_tolerance"].split("e-")[1]
+            self.assertEqual(
+                float(candidate["homogeneous_ode_relative_tolerance"]),
+                budget["homogeneous_reltol"],
             )
-            self.assertLessEqual(coordinate, homogeneous)
 
         # The derivative step stays in a bounded, calibratable range rather
         # than sitting at a digit-derived 1e-60.
@@ -2454,7 +2603,7 @@ class JuliaResponseBackendTests(unittest.TestCase):
             "SPIN_CONTINUATION",
         )
 
-    def test_refinement_tightens_every_resolution_control(self):
+    def test_refinement_preserves_recorded_ode_budget_and_refines_discrete_controls(self):
         job = _deep_job()
         adapter = FakeAdapter()
         backend = JuliaPrecisionRootBackend(
@@ -2464,7 +2613,10 @@ class JuliaResponseBackendTests(unittest.TestCase):
         backend.read_root(job, 0.0j)
 
         policy = adapter.requests[0]["policy"]
-        self.assertEqual(policy["ode_relative_tolerance"], "1e-20")
+        self.assertEqual(
+            float(policy["ode_relative_tolerance"]),
+            synthetic_ode_error_budget(80).homogeneous_reltol,
+        )
         self.assertEqual(policy["endpoint_series_order"], 36)
         self.assertEqual(policy["support_subinterval_count"], 512)
         self.assertEqual(policy["angular_pad"], 26)
@@ -2816,7 +2968,8 @@ class JuliaResponseBackendTests(unittest.TestCase):
                 root / "julia.exe", root, depot, root / "worker.jl", {}, runner
             )
             request = JuliaPrecisionRootBackend(
-                job.backend_identity, adapter, 80
+                job.backend_identity, adapter, 80,
+                ode_error_budget=synthetic_ode_error_budget(80),
             )._request(job, 0.0j)
             with self.assertRaises(JuliaResponseBackendError) as raised:
                 adapter.evaluate(request)
@@ -2884,7 +3037,8 @@ class JuliaResponseBackendTests(unittest.TestCase):
                 root / "julia.exe", root, depot, root / "worker.jl", {}, runner
             )
             request = JuliaPrecisionRootBackend(
-                job.backend_identity, adapter, 80
+                job.backend_identity, adapter, 80,
+                ode_error_budget=synthetic_ode_error_budget(80),
             )._request(job, 0.0j)
             with self.assertRaisesRegex(
                 JuliaResponseBackendError, "request identity mismatch"

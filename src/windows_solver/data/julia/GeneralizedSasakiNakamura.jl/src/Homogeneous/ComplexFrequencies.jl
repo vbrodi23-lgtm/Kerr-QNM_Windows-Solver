@@ -60,6 +60,14 @@ export DEFAULT_MAXIMUM_HORIZON_DISTANCE
 export build_outer_contour_context, build_real_inner_horizon_contour
 export horizon_endpoint_geometry_candidates
 export horizon_endpoint_candidates, select_verified_horizon_endpoints
+export select_horizon_endpoint_best_prefix
+export horizon_endpoint_prefix_orders
+export recover_verified_horizon_endpoint_pair
+export verified_horizon_endpoints_from_recovery
+export canonical_horizon_endpoint_search_evidence
+export NO_GEOMETRY_VALID_CANDIDATE, MAX_SERIES_ORDER_INADEQUATE
+export ARITHMETIC_PRECISION_INADEQUATE, COORDINATE_INVERSION_FAILURE
+export FEWER_THAN_TWO_VERIFIED_ENDPOINTS
 export prepare_real_inner_horizon_endpoint
 export solve_factored_horizon_branch_to_match
 export solve_verified_horizon_basis_to_match
@@ -2724,6 +2732,12 @@ const HORIZON_ENDPOINT_ORDER_LIMITED = "insufficient-series-order/v1"
 const HORIZON_ENDPOINT_PRECISION_LIMITED =
     "insufficient-arithmetic-precision/v1"
 const HORIZON_ENDPOINT_GEOMETRY_LIMITED = "insufficient-geometric-depth/v1"
+const NO_GEOMETRY_VALID_CANDIDATE = "no-geometry-valid-candidate/v1"
+const MAX_SERIES_ORDER_INADEQUATE = "maximum-series-order-inadequate/v1"
+const ARITHMETIC_PRECISION_INADEQUATE = "arithmetic-precision-inadequate/v1"
+const COORDINATE_INVERSION_FAILURE = "coordinate-inversion-failure/v1"
+const FEWER_THAN_TWO_VERIFIED_ENDPOINTS =
+    "fewer-than-two-verified-endpoints/v1"
 
 function _describe_horizon_candidate(candidate::HorizonEndpointCandidate)
     geometry = candidate.geometry
@@ -2913,7 +2927,24 @@ function deepen_horizon_endpoint_rho_candidates(
     return sort(extended; rev=true)
 end
 
-function _best_prefix_assessment(
+function horizon_endpoint_prefix_orders(
+    maximum_order::Int;
+    minimum_order::Int=4,
+    order_step::Int=4,
+)
+    maximum_order >= minimum_order || throw(ArgumentError(
+        "horizon prefix maximum order is below the minimum"
+    ))
+    order_step > 0 || throw(ArgumentError(
+        "horizon prefix order step must be positive"
+    ))
+    orders = collect(minimum_order:order_step:maximum_order)
+    orders[end] == maximum_order || push!(orders, maximum_order)
+    return orders
+end
+
+
+function select_horizon_endpoint_best_prefix(
     series,
     radius,
     required_digits::T,
@@ -2926,6 +2957,17 @@ function _best_prefix_assessment(
         evaluation = evaluate_horizon_asymptotic_series(
             series, radius; order=order
         )
+        # These are the actual scaled terminal terms and cancellation/spread
+        # diagnostics produced by the package evaluator. Ingoing and outgoing
+        # branches call this selector independently; no prefix is inferred
+        # from the total series value alone.
+        scaled_term_magnitudes = (
+            evaluation.last_term_magnitude,
+            evaluation.derivative_last_term_magnitude,
+        )
+        cancellation = evaluation.maximum_recurrence_cancellation_factor
+        last_term = maximum(scaled_term_magnitudes)
+        all(isfinite, (last_term, cancellation)) || continue
         assessment = assess_asymptotic_preflight(
             series, evaluation, required_digits
         )
@@ -2936,10 +2978,14 @@ function _best_prefix_assessment(
             best_evaluation = evaluation
             best_assessment = assessment
         end
-        assessment.adequate && break
+        # The recurrence was generated once in `series` to its maximum order.
+        # Evaluate the full schedule so later asymptotic growth cannot displace
+        # an earlier least-term prefix with the larger reliable-digit score.
     end
     return best_order, best_evaluation, best_assessment
 end
+
+const _best_prefix_assessment = select_horizon_endpoint_best_prefix
 
 struct RealInnerHorizonEndpoint{T<:AbstractFloat}
     branch::CarrierKind
@@ -3367,6 +3413,192 @@ function horizon_endpoint_candidates(
     end
 end
 
+struct HorizonEndpointRecovery{T<:AbstractFloat}
+    outcome::String
+    selected_pair::Vector{HorizonEndpointCandidate{T}}
+    candidates::Vector{HorizonEndpointCandidate{T}}
+    geometry_schedule::Vector{HorizonEndpointGeometryCandidate{T}}
+    endpoint_orders::Vector{Int}
+    policy_identity::String
+    homogeneous_rhs_evaluations_before_pair::Int
+end
+
+function _horizon_recovery_outcome(
+    candidates::Vector{HorizonEndpointCandidate{T}},
+    maximum_horizon_distance::T,
+) where {T<:AbstractFloat}
+    geometry_valid = filter(
+        candidate -> _geometry_candidate_adequate(
+            candidate.geometry, maximum_horizon_distance
+        ),
+        candidates,
+    )
+    isempty(geometry_valid) && return NO_GEOMETRY_VALID_CANDIDATE
+    adequate = filter(
+        candidate -> _candidate_adequate(
+            candidate, maximum_horizon_distance
+        ),
+        geometry_valid,
+    )
+    length(adequate) == 1 && return FEWER_THAN_TWO_VERIFIED_ENDPOINTS
+    any(
+        candidate -> horizon_endpoint_limitation(
+            candidate, maximum_horizon_distance
+        ) == HORIZON_ENDPOINT_PRECISION_LIMITED,
+        geometry_valid,
+    ) && return ARITHMETIC_PRECISION_INADEQUATE
+    return MAX_SERIES_ORDER_INADEQUATE
+end
+
+"""
+    recover_verified_horizon_endpoint_pair(...)
+
+Exhaust the complete depth schedule at one order before raising the order.
+Geometry is cached once and geometry-invalid radii are never retried. The two
+horizon branches retain their independently selected best prefixes, and no
+homogeneous RHS work is admitted through this preflight-only function.
+"""
+function recover_verified_horizon_endpoint_pair(
+    spectral::HomogeneousSpectralContext{T},
+    contour::RealInnerHorizonContour{T},
+    geometry_schedule::Vector{HorizonEndpointGeometryCandidate{T}},
+    required_digits::T;
+    maximum_horizon_distance::T=T(DEFAULT_MAXIMUM_HORIZON_DISTANCE),
+    endpoint_orders::Vector{Int}=Int[spectral.endpoint_order],
+    policy_identity::AbstractString,
+) where {T<:AbstractFloat}
+    isempty(endpoint_orders) && throw(ArgumentError(
+        "horizon endpoint order schedule must be nonempty"
+    ))
+    issorted(endpoint_orders) || throw(ArgumentError(
+        "horizon endpoint order schedule must be increasing"
+    ))
+    geometry_cache = Dict(
+        geometry.rho => geometry for geometry in geometry_schedule
+    )
+    geometry_invalid_rhos = Set(
+        geometry.rho for geometry in geometry_schedule
+        if !_geometry_candidate_adequate(geometry, maximum_horizon_distance)
+    )
+    trials = HorizonEndpointCandidate{T}[]
+    for geometry in geometry_schedule
+        geometry.rho in geometry_invalid_rhos || continue
+        push!(trials, HorizonEndpointCandidate{T}(
+            geometry, false, false, nothing, nothing, nothing, nothing, nothing
+        ))
+    end
+    verified_by_rho = Dict{T,HorizonEndpointCandidate{T}}()
+    for endpoint_order in endpoint_orders
+        # Depth is the inner loop: every usable radius is attempted at this
+        # order before the next order is considered.
+        for geometry in geometry_schedule
+            geometry.rho in geometry_invalid_rhos && continue
+            haskey(geometry_cache, geometry.rho) || error(
+                "horizon endpoint geometry cache lost a declared radius"
+            )
+            haskey(verified_by_rho, geometry.rho) && continue
+            assessed = horizon_endpoint_candidates(
+                spectral,
+                contour,
+                HorizonEndpointGeometryCandidate{T}[geometry],
+                required_digits;
+                maximum_horizon_distance=maximum_horizon_distance,
+                endpoint_orders=horizon_endpoint_prefix_orders(endpoint_order),
+            )[1]
+            push!(trials, assessed)
+            ingoing_best_prefix_order = assessed.ingoing_evaluation === nothing ?
+                nothing : assessed.ingoing_evaluation.order
+            outgoing_best_prefix_order = assessed.outgoing_evaluation === nothing ?
+                nothing : assessed.outgoing_evaluation.order
+            if _candidate_adequate(assessed, maximum_horizon_distance)
+                verified_by_rho[geometry.rho] = assessed
+            end
+            # The independent names above are intentionally retained at this
+            # boundary for canonical evidence and static schema review.
+            (ingoing_best_prefix_order, outgoing_best_prefix_order)
+        end
+        if length(verified_by_rho) >= 2
+            selected_pair = sort!(
+                collect(values(verified_by_rho));
+                by=candidate -> candidate.geometry.rho,
+                rev=true,
+            )[1:2]
+            return HorizonEndpointRecovery{T}(
+                HORIZON_ENDPOINT_ADEQUATE,
+                selected_pair,
+                trials,
+                copy(geometry_schedule),
+                copy(endpoint_orders),
+                String(policy_identity),
+                0,
+            )
+        end
+    end
+    return HorizonEndpointRecovery{T}(
+        _horizon_recovery_outcome(trials, maximum_horizon_distance),
+        HorizonEndpointCandidate{T}[],
+        trials,
+        copy(geometry_schedule),
+        copy(endpoint_orders),
+        String(policy_identity),
+        0,
+    )
+end
+
+function canonical_horizon_endpoint_search_evidence(
+    recovery::HorizonEndpointRecovery,
+)
+    candidate_evidence(candidate) = (
+        rho=string(candidate.geometry.rho),
+        endpoint_order=candidate.endpoint_order,
+        ingoing_best_prefix_order=(
+            candidate.ingoing_evaluation === nothing ? nothing :
+            candidate.ingoing_evaluation.order
+        ),
+        outgoing_best_prefix_order=(
+            candidate.outgoing_evaluation === nothing ? nothing :
+            candidate.outgoing_evaluation.order
+        ),
+        ingoing_adequate=candidate.ingoing_adequate,
+        outgoing_adequate=candidate.outgoing_adequate,
+    )
+    selected_rhos = Set(candidate.geometry.rho for candidate in recovery.selected_pair)
+    selected_pair = map(candidate_evidence, recovery.selected_pair)
+    rejected_candidates = map(
+        candidate_evidence,
+        filter(
+            candidate -> !(candidate.geometry.rho in selected_rhos),
+            recovery.candidates,
+        ),
+    )
+    return (
+        outcome=recovery.outcome,
+        policy_identity=recovery.policy_identity,
+        selected_pair=selected_pair,
+        rejected_candidates=rejected_candidates,
+        endpoint_orders=recovery.endpoint_orders,
+        homogeneous_rhs_evaluations_before_pair=
+            recovery.homogeneous_rhs_evaluations_before_pair,
+    )
+end
+
+function verified_horizon_endpoints_from_recovery(
+    recovery::HorizonEndpointRecovery{T},
+    maximum_horizon_distance::T,
+) where {T<:AbstractFloat}
+    length(recovery.selected_pair) == 2 || throw(ArgumentError(
+        "horizon endpoint recovery result does not contain a verified pair"
+    ))
+    pair = recovery.selected_pair
+    return VerifiedHorizonEndpoints{T}(
+        pair[1],
+        pair[2],
+        recovery.candidates,
+        maximum_horizon_distance,
+        REAL_INNER_HORIZON_CONTOUR_ID,
+    )
+end
+
 """
     select_verified_horizon_endpoints(spectral, candidates;
                                       maximum_horizon_distance)
@@ -3531,6 +3763,7 @@ function prepare_real_inner_horizon_endpoint(
                 "real-inner horizon seed cannot bypass an inadequate preflight",
                 assessment=assessment,
             ))
+            selected_endpoint_order = evaluation.order
             geometry_candidate = candidate.geometry
             radius = geometry_candidate.radius
             radial_factor = Delta(spectral.a, radius) /
@@ -3594,7 +3827,7 @@ function prepare_real_inner_horizon_endpoint(
                 regularity,
                 required_digits,
                 spectral.precision_bits,
-                spectral.endpoint_order,
+                selected_endpoint_order,
                 REAL_INNER_HORIZON_CONTOUR_ID,
                 spectral.frozen_branch_cell,
                 spectral.contour_deformation,

@@ -25,9 +25,15 @@ from types import SimpleNamespace
 from typing import Callable, Mapping
 
 from .contracts import canonical_json_bytes
+from .adaptive_controls import (
+    MissingODECalibrationError,
+    ODE_CALIBRATION_BLOCKER,
+    ODEErrorBudget,
+)
 from .response_engine import (
     BackendIdentity,
     FixedRootDiagnosticEvidence,
+    FixedRootDeterminantSample,
     DiagnosticRootReadout,
     HISTORICAL_WORKER_RESPONSE_RECEIPT_SCHEMA,
     NumericalConditioningEvidence,
@@ -46,6 +52,7 @@ from .response_engine import (
     regularised_gsn_mechanism_contract,
     regularised_gsn_precision_policy,
 )
+from .precision_tiers import PrecisionTier, precision_tier
 from .progress import (
     PROGRESS_SCHEMA,
     ProgressEventKind,
@@ -61,7 +68,7 @@ from .root_readout_cache import (
 )
 
 
-_PROMOTED_DIGITS = frozenset({80, 120})
+_PROMOTED_DIGITS = frozenset({40, 80, 120})
 JULIA_PROGRESS_PREFIX = "@@KERR_QNM_PROGRESS@@"
 _WORKER_HEARTBEAT_SECONDS = 2.0
 _PROCESS_REAP_SECONDS = 10.0
@@ -111,6 +118,11 @@ NUMERICAL_CONTROL_FAILURE_CODES = frozenset({
     # The finite-difference ladder was exhausted without a step at which the
     # derivative estimates agree and determinant noise does not dominate.
     "FINITE_DIFFERENCE_NOISE_LIMIT",
+    "HORIZON_GEOMETRY_EXHAUSTED",
+    "HORIZON_MAXIMUM_ORDER_INADEQUATE",
+    "HORIZON_ARITHMETIC_INADEQUATE",
+    "HORIZON_COORDINATE_INVERSION_FAILED",
+    "HORIZON_ONLY_ONE_ENDPOINT",
 })
 
 
@@ -1230,6 +1242,34 @@ _ASYMPTOTIC_SERIES_INVALID_REASONS = frozenset({
     "NONFINITE_ASYMPTOTIC_DATA",
 })
 
+_HORIZON_RECOVERY_FAILURES = {
+    "HORIZON_GEOMETRY_EXHAUSTED": (
+        "NO_GEOMETRY_VALID_CANDIDATE",
+        "horizon-endpoint-geometry",
+        False,
+    ),
+    "HORIZON_MAXIMUM_ORDER_INADEQUATE": (
+        "MAX_SERIES_ORDER_INADEQUATE",
+        "horizon-endpoint-geometry",
+        False,
+    ),
+    "HORIZON_ARITHMETIC_INADEQUATE": (
+        "ARITHMETIC_PRECISION_INADEQUATE",
+        "horizon-endpoint-geometry",
+        True,
+    ),
+    "HORIZON_COORDINATE_INVERSION_FAILED": (
+        "COORDINATE_INVERSION_FAILURE",
+        "coordinate-inversion",
+        False,
+    ),
+    "HORIZON_ONLY_ONE_ENDPOINT": (
+        "FEWER_THAN_TWO_VERIFIED_ENDPOINTS",
+        "horizon-endpoint-geometry",
+        False,
+    ),
+}
+
 
 def _has_exact_fields(
     value: Mapping[str, object], fields: frozenset[str]
@@ -1284,6 +1324,84 @@ def _valid_factored_diagnostics(
         == "factored-homogeneous-gsn/v1"
         and (code != "NO_VERIFIED_HORIZON_ENDPOINT" or rhs == 0)
     )
+
+
+def _valid_horizon_recovery_diagnostics(
+    code: str, stage: object, diagnostics: Mapping[str, object]
+) -> bool:
+    """Authenticate the typed endpoint-recovery outcome and its evidence."""
+
+    expected = _HORIZON_RECOVERY_FAILURES.get(code)
+    if expected is None or stage != expected[1]:
+        return False
+    if not _has_exact_fields(
+        diagnostics,
+        frozenset({
+            "recovery_outcome",
+            "recovery_evidence",
+            "next_precision_tier_allowed",
+        }),
+    ):
+        return False
+    outcome, _, next_tier = expected
+    if (
+        diagnostics.get("recovery_outcome") != outcome
+        or diagnostics.get("next_precision_tier_allowed") is not next_tier
+    ):
+        return False
+    evidence = diagnostics.get("recovery_evidence")
+    if not isinstance(evidence, Mapping) or not _has_exact_fields(
+        evidence,
+        frozenset({
+            "outcome",
+            "policy_identity",
+            "selected_pair",
+            "rejected_candidates",
+            "endpoint_orders",
+            "homogeneous_rhs_evaluations_before_pair",
+        }),
+    ):
+        return False
+    endpoint_orders = evidence.get("endpoint_orders")
+    if (
+        evidence.get("outcome") != outcome
+        or not isinstance(evidence.get("policy_identity"), str)
+        or not evidence["policy_identity"]
+        or evidence.get("selected_pair") != []
+        or not isinstance(evidence.get("rejected_candidates"), list)
+        or not isinstance(endpoint_orders, list)
+        or not endpoint_orders
+        or any(not _is_positive_int(order) for order in endpoint_orders)
+        or endpoint_orders != sorted(set(endpoint_orders))
+        or evidence.get("homogeneous_rhs_evaluations_before_pair") != 0
+    ):
+        return False
+    candidate_fields = frozenset({
+        "rho",
+        "endpoint_order",
+        "ingoing_best_prefix_order",
+        "outgoing_best_prefix_order",
+        "ingoing_adequate",
+        "outgoing_adequate",
+    })
+    for candidate in evidence["rejected_candidates"]:
+        if (
+            not isinstance(candidate, Mapping)
+            or not _has_exact_fields(candidate, candidate_fields)
+            or _diagnostic_decimal(candidate, "rho") is None
+            or type(candidate.get("ingoing_adequate")) is not bool
+            or type(candidate.get("outgoing_adequate")) is not bool
+        ):
+            return False
+        for name in (
+            "endpoint_order",
+            "ingoing_best_prefix_order",
+            "outgoing_best_prefix_order",
+        ):
+            value = candidate.get(name)
+            if value is not None and not _is_positive_int(value):
+                return False
+    return True
 
 
 def _valid_insufficient_precision_diagnostics(
@@ -1729,6 +1847,10 @@ def _valid_numerical_control_diagnostics(
         return False
     if code in _FACTORED_FAILURE_STAGES:
         return _valid_factored_diagnostics(code, stage, diagnostics)
+    if code in _HORIZON_RECOVERY_FAILURES:
+        if failure.get("retryable") is not _HORIZON_RECOVERY_FAILURES[code][2]:
+            return False
+        return _valid_horizon_recovery_diagnostics(code, stage, diagnostics)
     if code == "INSUFFICIENT_ASYMPTOTIC_PRECISION":
         return _valid_insufficient_precision_diagnostics(stage, diagnostics)
     if code in {
@@ -2241,16 +2363,68 @@ class JuliaResponseAdapter:
         )
 
 
-def _precision_policy(job: ResponseComponentJob, digits: int, refinement: int) -> dict[str, object]:
+def _adaptive_ode_request_controls(
+    digits: int,
+    budget: ODEErrorBudget | None,
+) -> dict[str, object]:
+    """Bind changed promoted requests to a reviewed, serialized ODE budget."""
+
+    if budget is None:
+        raise MissingODECalibrationError(ODE_CALIBRATION_BLOCKER)
+    expected_tier = {
+        40: PrecisionTier.BIGFLOAT_40,
+        80: PrecisionTier.BIGFLOAT_80,
+        120: PrecisionTier.BIGFLOAT_120,
+    }.get(digits)
+    if expected_tier is None or budget.precision_tier is not expected_tier:
+        raise ValueError("ODE error budget precision tier does not match request")
+
+    def encoded(value: float) -> str:
+        return format(value, ".17g")
+
+    return {
+        "coordinate_ode_relative_tolerance": encoded(budget.coordinate_reltol),
+        "coordinate_ode_absolute_tolerance": encoded(budget.coordinate_abstol),
+        "homogeneous_ode_relative_tolerance": encoded(budget.homogeneous_reltol),
+        "homogeneous_ode_absolute_tolerance": encoded(budget.homogeneous_abstol),
+        # The generic ODE aliases are authenticated to the homogeneous share;
+        # no fixed table is silently renamed for the changed identity.
+        "ode_relative_tolerance": encoded(budget.homogeneous_reltol),
+        "ode_absolute_tolerance": encoded(budget.homogeneous_abstol),
+        "ode_error_budget": budget.to_mapping(),
+    }
+
+
+def _precision_policy(
+    job: ResponseComponentJob,
+    digits: int,
+    refinement: int,
+    ode_error_budget: ODEErrorBudget | None = None,
+) -> dict[str, object]:
     if digits not in _PROMOTED_DIGITS:
-        raise ValueError("Julia response precision must be 80 or 120 digits")
+        raise ValueError("Julia response precision must be 40, 80, or 120 digits")
     if refinement not in (0, 1):
         raise ValueError("Julia response refinement level must be zero or one")
+    # Changed promoted identities never consult the historical provisional ODE
+    # table.  Establish the calibrated controls first so absence fails before
+    # request construction can reach any worker or ODE boundary.
+    ode_controls = _adaptive_ode_request_controls(digits, ode_error_budget)
     level = "base" if refinement == 0 else "refinement"
-    controls = promoted_precision_numerical_controls()[str(digits)][level]
-    return {
+    root_search_controls = {
+        (40, "base"): ("1e-6", "1e-12", "1e-3"),
+        (40, "refinement"): ("1e-7", "1e-14", "1e-4"),
+        (80, "base"): ("1e-6", "1e-12", "1e-3"),
+        (80, "refinement"): ("1e-7", "1e-14", "1e-4"),
+        (120, "base"): ("1e-6", "1e-16", "1e-3"),
+        (120, "refinement"): ("1e-7", "1e-18", "1e-4"),
+    }[(digits, level)]
+    policy = {
         "readout_radius": format(job.policy.readout_radius, ".17g"),
-        **controls,
+        "root_correction_tolerance": "2e-11",
+        "frequency_step": root_search_controls[0],
+        "frequency_step_minimum": root_search_controls[1],
+        "frequency_step_maximum": root_search_controls[2],
+        **ode_controls,
         **horizon_geometry_controls(),
         **regularised_gsn_precision_policy(job.mechanism_id),
         "endpoint_series_order": job.policy.endpoint_series_order + 8 * refinement,
@@ -2258,11 +2432,18 @@ def _precision_policy(job: ResponseComponentJob, digits: int, refinement: int) -
         "angular_pad": 18 + 8 * refinement,
         "rho_in": "-5000",
         "rho_out": "5000",
+        # The worker integrates the coordinate map once to the authenticated
+        # cap, then reuses that geometry while selecting the nearest endpoint
+        # whose existing infinity-series preflight is adequate.
+        "rho_out_candidate_schedule": [
+            "100", "250", "500", "1000", "2000", "5000"
+        ],
         "branch_enclosure_radius_abs": format(
             _mode_specific_branch_enclosure_radius(job), ".17g"
         ),
         "max_newton_iterations": 16,
     }
+    return policy
 
 
 def _validate_mechanism_precision_policy(
@@ -2286,16 +2467,31 @@ def _validate_mechanism_precision_policy(
 class JuliaPrecisionRootBackend:
     """Root-readout adapter consumed by the existing component engine."""
 
+    promoted_precision_backend = True
+
     identity: BackendIdentity
     adapter: JuliaResponseAdapter
     digits: int
     refinement: int = 0
+    ode_error_budget: ODEErrorBudget | None = None
 
     def __post_init__(self) -> None:
         if self.digits not in _PROMOTED_DIGITS:
-            raise ValueError("Julia precision backend requires 80 or 120 digits")
+            raise ValueError("Julia precision backend requires 40, 80, or 120 digits")
         if self.refinement not in (0, 1):
             raise ValueError("Julia precision refinement level is invalid")
+        if self.ode_error_budget is not None:
+            _adaptive_ode_request_controls(self.digits, self.ode_error_budget)
+
+    def _request_ode_error_budget(self) -> ODEErrorBudget | None:
+        if self.ode_error_budget is not None:
+            return self.ode_error_budget
+        provider = getattr(self.adapter, "ode_error_budget_for_digits", None)
+        if callable(provider):
+            budget = provider(self.digits)
+            _adaptive_ode_request_controls(self.digits, budget)
+            return budget
+        return None
 
     @property
     def scientific_runtime(self) -> dict[str, object]:
@@ -2303,6 +2499,7 @@ class JuliaPrecisionRootBackend:
             **dict(self.adapter.runtime_provenance),
             "precision_digits": self.digits,
             "working_precision_bits": math.ceil(self.digits * math.log2(10)) + 32,
+            "semantic_precision_tier": f"bigfloat-{self.digits}",
             "refinement_level": self.refinement,
         }
 
@@ -2360,7 +2557,13 @@ class JuliaPrecisionRootBackend:
             },
             "precision_digits": self.digits,
             "working_precision_bits": math.ceil(self.digits * math.log2(10)) + 32,
-            "policy": _precision_policy(job, self.digits, self.refinement),
+            "semantic_precision_tier": f"bigfloat-{self.digits}",
+            "policy": _precision_policy(
+                job,
+                self.digits,
+                self.refinement,
+                self._request_ode_error_budget(),
+            ),
             "execution_resource": _execution_resource_policy(),
         }
         _validate_mechanism_precision_policy(
@@ -2388,6 +2591,48 @@ class JuliaPrecisionRootBackend:
             }
         return request
 
+    def preview_root_request(
+        self,
+        job: ResponseComponentJob,
+        amplitude: complex,
+        primary_predictor: complex | None = None,
+        primary_predictor_kind: str | None = None,
+        readout_role: str | None = None,
+    ) -> dict[str, object]:
+        """Return the exact canonical request that ``read_root`` will send."""
+
+        del readout_role
+        return self._request(
+            job,
+            complex(amplitude),
+            primary_predictor,
+            primary_predictor_kind,
+        )
+
+    def preview_fixed_root_request(
+        self,
+        job: ResponseComponentJob,
+        omega: complex,
+        amplitude: complex,
+        readout_role: str,
+    ) -> dict[str, object]:
+        tier = {
+            40: PrecisionTier.BIGFLOAT_40,
+            80: PrecisionTier.BIGFLOAT_80,
+            120: PrecisionTier.BIGFLOAT_120,
+        }[self.digits]
+        fixed_omega = complex(omega)
+        return {
+            **self._request(job, complex(amplitude)),
+            "operation": "fixed-root-determinant-sample",
+            "fixed_omega": {
+                "real": format(fixed_omega.real, ".17g"),
+                "imaginary": format(fixed_omega.imag, ".17g"),
+            },
+            "readout_role": readout_role,
+            "semantic_precision_tier": tier.value,
+        }
+
     def read_root(
         self,
         job: ResponseComponentJob,
@@ -2396,6 +2641,150 @@ class JuliaPrecisionRootBackend:
     ) -> RootReadout:
         return self._read_root(
             job, amplitude, primary_predictor, primary_predictor_kind=None
+        )
+
+    def sample_fixed_root_determinant(
+        self,
+        job: ResponseComponentJob,
+        omega: complex,
+        amplitude: complex,
+        *,
+        readout_role: str,
+    ) -> FixedRootDeterminantSample:
+        """Evaluate one determinant while holding the authenticated root fixed."""
+
+        if job.backend_identity != self.identity:
+            raise ValueError("response job backend identity does not match Julia adapter")
+        fixed_omega = complex(omega)
+        converted_amplitude = complex(amplitude)
+        if not all(math.isfinite(value) for value in (
+            fixed_omega.real, fixed_omega.imag,
+            converted_amplitude.real, converted_amplitude.imag,
+        )):
+            raise ValueError("fixed-root determinant sample coordinates are invalid")
+        if not isinstance(readout_role, str) or not readout_role:
+            raise ValueError("fixed-root determinant readout role is invalid")
+        tier = {
+            40: PrecisionTier.BIGFLOAT_40,
+            80: PrecisionTier.BIGFLOAT_80,
+            120: PrecisionTier.BIGFLOAT_120,
+        }[self.digits]
+        contract = regularised_gsn_mechanism_contract(job.mechanism_id)
+        policy = _precision_policy(
+            job,
+            self.digits,
+            self.refinement,
+            self._request_ode_error_budget(),
+        )
+        request = self.preview_fixed_root_request(
+            job, fixed_omega, converted_amplitude, readout_role
+        )
+        evaluation = self.adapter.evaluate_for_validation(request)
+        response = evaluation.response
+        fields = {
+            "schema_version", "status", "operation", "request_sha256",
+            "omega_re", "omega_im", "amplitude_re", "amplitude_im",
+            "determinant_re", "determinant_im", "determinant_error_abs",
+            "determinant_error_status", "determinant_error_model_id",
+            "determinant_family", "determinant_normalisation",
+            "branch_identity", "branch_authenticated",
+            "semantic_precision_tier", "working_precision_bits",
+            "readout_role",
+        }
+        if (
+            not isinstance(response, Mapping)
+            or set(response) != fields
+            or response["schema_version"] != 1
+            or response["status"] != "ok"
+            or response["operation"] != "fixed-root-determinant-sample"
+            or response["request_sha256"] != evaluation.request_sha256
+            or response["determinant_family"] != contract["determinant_family"]
+            or response["determinant_normalisation"]
+            != contract["determinant_normalisation"]
+            or response["branch_identity"] != policy["branch_convention"]
+            or response["branch_authenticated"] is not True
+            or response["semantic_precision_tier"] != tier.value
+            or response["working_precision_bits"]
+            != request["working_precision_bits"]
+            or response["readout_role"] != readout_role
+        ):
+            raise JuliaResponseBackendError(
+                "M02 fixed-root determinant sample response is invalid"
+            )
+        response_omega = complex(
+            float(_finite_decimal_text(response["omega_re"], "sample omega real")),
+            float(_finite_decimal_text(response["omega_im"], "sample omega imaginary")),
+        )
+        response_amplitude = complex(
+            float(_finite_decimal_text(response["amplitude_re"], "sample amplitude real")),
+            float(_finite_decimal_text(response["amplitude_im"], "sample amplitude imaginary")),
+        )
+        if response_omega != fixed_omega or response_amplitude != converted_amplitude:
+            raise JuliaResponseBackendError(
+                "M02 fixed-root determinant sample moved its coordinates"
+            )
+        determinant = complex(
+            float(_finite_decimal_text(response["determinant_re"], "sample determinant real")),
+            float(_finite_decimal_text(response["determinant_im"], "sample determinant imaginary")),
+        )
+        determinant_error = float(_finite_decimal_text(
+            response["determinant_error_abs"],
+            "sample determinant error",
+            nonnegative=True,
+        ))
+        determinant_error_status = response["determinant_error_status"]
+        determinant_error_model_id = response["determinant_error_model_id"]
+        if (
+            determinant_error_status not in {"available/v1", "unavailable/v1"}
+            or (
+                determinant_error_status == "available/v1"
+                and (
+                    not isinstance(determinant_error_model_id, str)
+                    or not determinant_error_model_id
+                    or determinant_error <= 0.0
+                )
+            )
+            or (
+                determinant_error_status == "unavailable/v1"
+                and (determinant_error_model_id is not None or determinant_error != 0.0)
+            )
+        ):
+            raise JuliaResponseBackendError(
+                "M02 fixed-root determinant error evidence is invalid"
+            )
+        request_binding = json.loads(canonical_json_bytes(request))
+        response_binding = json.loads(canonical_json_bytes(dict(response)))
+        receipt = {
+            "schema": "windows-solver.fixed-root-determinant-sample-receipt/1",
+            "request_binding": request_binding,
+            "request_sha256": evaluation.request_sha256,
+            "response_binding": response_binding,
+            "response_sha256": hashlib.sha256(
+                canonical_json_bytes(response_binding)
+            ).hexdigest(),
+            "runtime_identity_sha256": evaluation.runtime_identity_sha256,
+            "scientific_runtime_sha256": hashlib.sha256(
+                canonical_json_bytes(self.scientific_runtime_for(job))
+            ).hexdigest(),
+        }
+        receipt_sha256 = hashlib.sha256(canonical_json_bytes(receipt)).hexdigest()
+        return FixedRootDeterminantSample(
+            omega=response_omega,
+            amplitude=response_amplitude,
+            determinant=determinant,
+            determinant_error_abs=determinant_error,
+            determinant_error_status=str(determinant_error_status),
+            determinant_error_model_id=determinant_error_model_id,
+            determinant_family=str(response["determinant_family"]),
+            determinant_normalisation=str(response["determinant_normalisation"]),
+            branch_identity=str(response["branch_identity"]),
+            branch_authenticated=response["branch_authenticated"],
+            request_sha256=evaluation.request_sha256,
+            worker_response_receipt=receipt,
+            worker_response_receipt_sha256=receipt_sha256,
+            precision_tier=precision_tier(response["semantic_precision_tier"]),
+            working_precision_bits=response["working_precision_bits"],
+            readout_role=readout_role,
         )
 
     def read_root_with_predictor_kind(

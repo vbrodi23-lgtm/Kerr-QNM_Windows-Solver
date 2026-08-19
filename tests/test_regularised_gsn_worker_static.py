@@ -100,18 +100,14 @@ class RegularisedGsnWorkerSourceTests(unittest.TestCase):
         geometry = horizon.index(
             "CF.horizon_endpoint_geometry_candidates("
         )
-        candidates = horizon.index("CF.horizon_endpoint_candidates(")
-        verified = horizon.index("CF.select_verified_horizon_endpoints(")
-        outer_contour = horizon.index("build_worker_outer_contour(")
-        outer_prepare = horizon.index("CF.prepare_factored_infinity_outgoing(")
-        outer_gate = horizon.index("CF.assert_factored_preflights_adequate(")
+        recovery = horizon.index("CF.recover_verified_horizon_endpoint_pair(")
+        verified = horizon.index("CF.verified_horizon_endpoints_from_recovery(")
+        outer_selection = horizon.index("select_worker_outer_endpoint(")
         outer_solve = horizon.index("CF.solve_factored_xup_to_match(")
-        self.assertLess(geometry, candidates)
-        self.assertLess(candidates, verified)
-        self.assertLess(verified, outer_contour)
-        self.assertLess(verified, outer_prepare)
-        self.assertLess(outer_prepare, outer_gate)
-        self.assertLess(outer_gate, outer_solve)
+        self.assertLess(geometry, recovery)
+        self.assertLess(recovery, verified)
+        self.assertLess(verified, outer_selection)
+        self.assertLess(outer_selection, outer_solve)
 
         # The verified endpoint pair also precedes both horizon propagations.
         horizon_solve = horizon.index(
@@ -424,8 +420,8 @@ class RegularisedGsnWorkerSourceTests(unittest.TestCase):
     def test_package_owns_factored_propagation_and_scattering_math(self) -> None:
         for call in (
             "CF.build_real_inner_horizon_contour(",
-            "CF.horizon_endpoint_candidates(",
-            "CF.select_verified_horizon_endpoints(",
+            "CF.recover_verified_horizon_endpoint_pair(",
+            "CF.verified_horizon_endpoints_from_recovery(",
             "CF.solve_verified_horizon_basis_to_match(",
             "CF.solve_factored_xin_to_match(",
             "CF.solve_factored_xup_to_match(",
@@ -1052,6 +1048,40 @@ class RegularisedGsnWorkerSourceTests(unittest.TestCase):
         self.assertNotIn("authenticated_determinant_progress", primary)
         self.assertNotIn("final_derivative(", primary)
 
+    def test_primary_serializes_derivative_specific_uncertainty_without_post_newton_work(self) -> None:
+        bounded = self._function_slice(
+            "bounded_newton", "finite_difference_noise_limit"
+        )
+        primary = self._function_slice(
+            "solve_binary64_parity_primary", "solve_fixed_root_diagnostic"
+        )
+        serialization = self._function_slice(
+            "primary_acceptance_text", "fixed_root_diagnostic_text"
+        )
+
+        self.assertIn('"derivative h/2"', bounded)
+        self.assertIn("derivative_authentication_candidate(", bounded)
+        self.assertIn("derivative_authentication=", primary)
+        self.assertIn('"derivative_authentication"', serialization)
+        self.assertIn("post_newton_determinant_count=0", primary)
+
+    def test_horizon_primary_propagates_real_h_and_h2_determinant_errors(self) -> None:
+        primary = self._function_slice(
+            "solve_binary64_parity_primary", "solve_fixed_root_diagnostic"
+        )
+        self.assertIn("propagate_primary_derivative_error", primary)
+        self.assertIn('"horizon-admittance"', primary)
+        self.assertIn(
+            "propagate_derivative_error=propagate_primary_derivative_error",
+            primary,
+        )
+        self.assertNotIn("propagate_derivative_error=false", primary)
+        acceptance = self._function_slice(
+            "primary_acceptance_text", "fixed_root_diagnostic_text"
+        )
+        self.assertIn("derivative_error_available", acceptance)
+        self.assertIn("propagated_error_abs > zero", acceptance)
+
     def test_fixed_root_diagnostics_reuse_the_complex_primary_derivative(self) -> None:
         diagnostic = self._function_slice(
             "solve_fixed_root_diagnostic", "solve_full_authentication"
@@ -1067,6 +1097,21 @@ class RegularisedGsnWorkerSourceTests(unittest.TestCase):
         self.assertNotIn("bounded_newton(", diagnostic)
         self.assertNotIn("finite_difference", diagnostic)
         self.assertNotIn("authenticated_determinant", diagnostic)
+
+    def test_fixed_root_sample_operation_evaluates_once_without_newton(self) -> None:
+        sample = self._function_slice(
+            "fixed_root_determinant_sample_fields", "evaluate_request"
+        )
+        dispatch = self._function_slice("evaluate_request", "main")
+
+        self.assertEqual(sample.count("determinant_progress("), 1)
+        self.assertIn('"fixed-root determinant sample"', sample)
+        self.assertIn('"fixed-root-determinant-sample"', sample)
+        self.assertIn('"semantic_precision_tier"', sample)
+        self.assertIn('"working_precision_bits"', sample)
+        self.assertNotIn("bounded_newton(", sample)
+        self.assertNotIn("solve_phase(", sample)
+        self.assertIn('operation == "fixed-root-determinant-sample"', dispatch)
 
     def test_resolution_refines_only_homogeneous_ode_tolerances(self) -> None:
         refined = self._function_slice("refined_request", "conditioning_response")
@@ -1102,11 +1147,11 @@ class RegularisedGsnWorkerSourceTests(unittest.TestCase):
 
         self.assertIn(
             'const PROMOTED_ROOT_READOUT_POLICY_ID =\n'
-            '    "binary64-parity-primary-fixed-root-diagnostics/v1"',
+            '    "binary64-parity-primary-fixed-root-diagnostics-frequency-disk/v2"',
             self.worker,
         )
         self.assertIn('"promoted_root_readout_policy"', validation)
-        self.assertEqual(result_fields.count('"schema_version" => 7'), 2)
+        self.assertEqual(result_fields.count('"schema_version" => 8'), 2)
         self.assertEqual(
             len(re.findall(
                 r'"promoted_root_readout_policy"\s*=>\s*'

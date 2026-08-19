@@ -5,6 +5,36 @@ import hashlib
 import math
 
 from windows_solver.contracts import canonical_json_bytes
+from windows_solver.adaptive_controls import ODEToleranceCalibration, derive_ode_error_budget
+from windows_solver.precision_tiers import PrecisionTier
+
+
+SYNTHETIC_ODE_CALIBRATION = ODEToleranceCalibration(
+    identity="synthetic-test-calibration/v1",
+    endpoint_series_fraction=0.10,
+    coordinate_inversion_fraction=0.15,
+    homogeneous_transport_fraction=0.35,
+    angular_fraction=0.15,
+    derivative_stencil_fraction=0.25,
+    coordinate_relative_factor=0.5,
+    coordinate_absolute_factor=0.25,
+    homogeneous_relative_factor=0.4,
+    homogeneous_absolute_factor=0.2,
+)
+
+
+def synthetic_ode_error_budget(digits: int):
+    tier = {
+        40: PrecisionTier.BIGFLOAT_40,
+        80: PrecisionTier.BIGFLOAT_80,
+        120: PrecisionTier.BIGFLOAT_120,
+    }[digits]
+    return derive_ode_error_budget(
+        required_root_correction_abs=1.0e-10,
+        determinant_derivative_lower_bound_abs=10.0,
+        precision_tier=tier,
+        calibration=SYNTHETIC_ODE_CALIBRATION,
+    )
 
 
 EXPECTED_KAPPA_SPINS = {
@@ -384,6 +414,11 @@ def current_promoted_component_payload(
 CONTROL_FAILURE_STAGE_FOR_CODE = {
     "COORDINATE_INVERSION_STALLED": "coordinate-inversion",
     "NO_VERIFIED_HORIZON_ENDPOINT": "horizon-endpoint-geometry",
+    "HORIZON_GEOMETRY_EXHAUSTED": "horizon-endpoint-geometry",
+    "HORIZON_MAXIMUM_ORDER_INADEQUATE": "horizon-endpoint-geometry",
+    "HORIZON_ARITHMETIC_INADEQUATE": "horizon-endpoint-geometry",
+    "HORIZON_COORDINATE_INVERSION_FAILED": "coordinate-inversion",
+    "HORIZON_ONLY_ONE_ENDPOINT": "horizon-endpoint-geometry",
     "INSUFFICIENT_ASYMPTOTIC_PRECISION": "asymptotic-preflight",
     "ASYMPTOTIC_SERIES_INVALID": "asymptotic-preflight",
     "ALGEBRAIC_REPRESENTATION_SINGULAR": "finite-difference",
@@ -420,6 +455,36 @@ def valid_control_failure_diagnostics(
         "factored_homogeneous_rhs_evaluations": 0,
         "avoided_ode_scope": "factored-homogeneous-gsn/v1",
     }
+    horizon_outcomes = {
+        "HORIZON_GEOMETRY_EXHAUSTED": "NO_GEOMETRY_VALID_CANDIDATE",
+        "HORIZON_MAXIMUM_ORDER_INADEQUATE": "MAX_SERIES_ORDER_INADEQUATE",
+        "HORIZON_ARITHMETIC_INADEQUATE": "ARITHMETIC_PRECISION_INADEQUATE",
+        "HORIZON_COORDINATE_INVERSION_FAILED": "COORDINATE_INVERSION_FAILURE",
+        "HORIZON_ONLY_ONE_ENDPOINT": "FEWER_THAN_TWO_VERIFIED_ENDPOINTS",
+    }
+    if failure_code in horizon_outcomes:
+        outcome = horizon_outcomes[failure_code]
+        return {
+            "recovery_outcome": outcome,
+            "recovery_evidence": {
+                "outcome": outcome,
+                "policy_identity": "adaptive-horizon-endpoint-recovery/v1",
+                "selected_pair": [],
+                "rejected_candidates": [{
+                    "rho": "-0.008",
+                    "endpoint_order": 28,
+                    "ingoing_best_prefix_order": 24,
+                    "outgoing_best_prefix_order": 20,
+                    "ingoing_adequate": False,
+                    "outgoing_adequate": False,
+                }],
+                "endpoint_orders": [28, 36, 44],
+                "homogeneous_rhs_evaluations_before_pair": 0,
+            },
+            "next_precision_tier_allowed": (
+                failure_code == "HORIZON_ARITHMETIC_INADEQUATE"
+            ),
+        }
     if failure_code == "ASYMPTOTIC_SERIES_INVALID":
         factored["reason"] = "NONFINITE_ASYMPTOTIC_DATA"
     if failure_code == "INSUFFICIENT_ASYMPTOTIC_PRECISION":
@@ -836,7 +901,7 @@ def valid_legacy_julia_root_response(
 def valid_julia_root_response(
     request: dict[str, object],
 ) -> dict[str, object]:
-    """Return one schema-7 binary64-parity promoted-worker response."""
+    """Return one schema-8 derivative-authenticated promoted-worker response."""
 
     omega = request["omega"]
     policy = request["policy"]
@@ -887,7 +952,7 @@ def valid_julia_root_response(
         }
 
     return {
-        "schema_version": 7,
+        "schema_version": 8,
         "status": "ok",
         "adapter": "package-owned-julia-gsn-root-readout",
         "request_sha256": hashlib.sha256(
@@ -896,7 +961,7 @@ def valid_julia_root_response(
         "precision_digits": request["precision_digits"],
         "working_precision_bits": request["working_precision_bits"],
         "promoted_root_readout_policy": (
-            "binary64-parity-primary-fixed-root-diagnostics/v1"
+            "binary64-parity-primary-fixed-root-diagnostics-frequency-disk/v2"
         ),
         "root_omega_re": omega["real"],
         "root_omega_im": omega["imaginary"],
@@ -908,7 +973,7 @@ def valid_julia_root_response(
         "root_derivative_abs": str(derivative_abs),
         "primary_acceptance": {
             "policy_id": (
-                "binary64-parity-primary-fixed-root-diagnostics/v1"
+                "binary64-parity-primary-fixed-root-diagnostics-frequency-disk/v2"
             ),
             "acceptance_metric": (
                 "abs-determinant-over-abs-complex-derivative/v1"
@@ -924,6 +989,19 @@ def valid_julia_root_response(
             "post_newton_determinant_count": 0,
             "determinant_error_abs": determinant_error_abs,
             "error_model_id": error_model_id,
+            "derivative_authentication": {
+                "derivative_re": derivative_re,
+                "derivative_im": derivative_im,
+                "propagated_error_abs": "1E-20",
+                "step_disagreement_abs": "2E-20",
+                "lower_bound_abs": "9.99999999999999999997",
+                "selected_step": "0.001",
+                "axis": "real",
+                "determinant_error_status": (
+                    "available/v1" if horizon else "unavailable/v1"
+                ),
+                "determinant_error_model_id": error_model_id,
+            },
         },
         "root_converged": True,
         "branch_authentication_contract_version": 4,

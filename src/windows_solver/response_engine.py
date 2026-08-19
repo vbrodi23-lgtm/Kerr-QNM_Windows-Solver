@@ -49,6 +49,26 @@ from .spectrum import (
     load_spectrum_catalog,
 )
 from .progress import ProgressEventKind, emit_progress, progress_scope
+from .precision_tiers import PrecisionTier, precision_tier, working_precision_bits
+from .partial_component_checkpoint import (
+    PartialComponentJournal,
+    PartialComponentWorkUnit,
+)
+from .response_uncertainty import (
+    ComplexDisk,
+    ZeroContainingDiskError,
+    exterior_response_disk,
+    horizon_response_disk,
+)
+from .response_ladder_recovery import (
+    LadderLevel as RecoveryLadderLevel,
+    LadderPolicy as RecoveryLadderPolicy,
+    LadderReadout as RecoveryLadderReadout,
+    LadderRecoveryResult,
+    RecoveryDisposition,
+    consecutive_windows,
+    recover_response_ladder,
+)
 
 
 ENGINE_SCHEMA_VERSION = 1
@@ -92,6 +112,9 @@ HISTORICAL_NUMERICAL_CONDITIONING_SCHEMA = (
     "windows-solver.m02-conditioning/2"
 )
 PROMOTED_ROOT_READOUT_POLICY = (
+    "binary64-parity-primary-fixed-root-diagnostics-frequency-disk/v2"
+)
+HISTORICAL_PROMOTED_ROOT_READOUT_POLICY = (
     "binary64-parity-primary-fixed-root-diagnostics/v1"
 )
 PROMOTED_ROOT_ACCEPTANCE_METRIC = (
@@ -103,7 +126,43 @@ PROMOTED_HORIZON_COMPONENT_IDENTITY = (
 PROMOTED_HORIZON_RESPONSE_METHOD = (
     "analytic-horizon-from-promoted-primary-derivative/v1"
 )
+PROMOTED_HORIZON_COMPONENT_V2_IDENTITY = (
+    "single-promoted-root-bounded-analytic-horizon-component/v2"
+)
+PROMOTED_HORIZON_RESPONSE_METHOD_V2 = (
+    "bounded-analytic-horizon-from-promoted-primary-derivative/v2"
+)
+PROMOTED_HORIZON_UNCERTAINTY_DERIVATION_IDENTITY = (
+    "primary-root-controls-and-derivative-disk/v1"
+)
 UNCALIBRATED_ANALYTIC_RESPONSE = "UNCALIBRATED_ANALYTIC_RESPONSE"
+BOUNDED_ANALYTIC_RESPONSE = "BOUNDED_ANALYTIC_RESPONSE"
+UNBOUNDED_ANALYTIC_RESPONSE = "UNBOUNDED_ANALYTIC_RESPONSE"
+BOUNDED_DERIVATIVE_RESPONSE = "BOUNDED_DERIVATIVE_RESPONSE"
+UNBOUNDED_DERIVATIVE_RESPONSE = "UNBOUNDED_DERIVATIVE_RESPONSE"
+FIXED_ROOT_DERIVATIVE_CONDITIONING_IDENTITY = (
+    "fixed-root-h-h2-conditioning/v1"
+)
+EXTERIOR_DERIVATIVE_COMPONENT_IDENTITY = (
+    "fixed-root-exterior-derivative-component/v1"
+)
+EXTERIOR_DERIVATIVE_RESPONSE_DISK_IDENTITY = (
+    "exterior-derivative-response-disk/v1"
+)
+EXTERIOR_DERIVATIVE_METHOD = "direct-fixed-root-determinant-derivative/v1"
+FIXED_ROOT_AXIS_VALIDATION_IDENTITY = "fixed-root-holomorphic-axis-validation/v1"
+FULL_COMPLEX_LADDER_VALIDATION_IDENTITY = "full-complex-ladder-validation/v1"
+FULL_LADDER_VALIDATION_REASONS = frozenset({
+    "RISK_SELECTED_SENTINEL",
+    "DERIVATIVE_DISAGREEMENT",
+    "PUBLICATION_VALIDATION",
+})
+DETERMINANT_ERROR_AVAILABLE = "available/v1"
+DETERMINANT_ERROR_UNAVAILABLE = "unavailable/v1"
+EXTERIOR_DETERMINANT_ERROR_MATH_REVIEW_BLOCKER = (
+    "TODO: [HUMAN MATH REVIEW REQUIRED - fixed-root exterior determinant "
+    "error model is unavailable]"
+)
 WORKER_RESPONSE_RECEIPT_SCHEMA = "windows-solver.worker-response-receipt/2"
 HISTORICAL_WORKER_RESPONSE_RECEIPT_SCHEMA = (
     "windows-solver.worker-response-receipt/1"
@@ -115,8 +174,8 @@ HISTORICAL_WORKER_RESPONSE_RECEIPT_SCHEMA = (
 # directions explicitly as absent. Version 7 replaces promoted acceptance with
 # binary64-parity PRIMARY Newton and fixed-root TRUNCATION/RESOLUTION evidence.
 # Error responses remain independently versioned at 1.
-WORKER_RESPONSE_WIRE_SCHEMA = 7
-HISTORICAL_WORKER_RESPONSE_WIRE_SCHEMAS = frozenset({3, 4, 5, 6})
+WORKER_RESPONSE_WIRE_SCHEMA = 8
+HISTORICAL_WORKER_RESPONSE_WIRE_SCHEMAS = frozenset({3, 4, 5, 6, 7})
 _ROOT_AUTHENTICATION_WIRE_SCHEMAS = frozenset({4, 5, 6})
 _HISTORICAL_WORKER_RESPONSE_RECEIPT_FIELDS = frozenset({
     "schema",
@@ -1704,9 +1763,13 @@ class PrimaryRootAcceptanceEvidence:
     post_newton_determinant_count: int
     determinant_error_abs: Decimal
     error_model_id: str | None
+    derivative_authentication: DerivativeAuthenticationEvidence | None = None
 
     def __post_init__(self) -> None:
-        if self.policy_id != PROMOTED_ROOT_READOUT_POLICY:
+        if self.policy_id not in {
+            PROMOTED_ROOT_READOUT_POLICY,
+            HISTORICAL_PROMOTED_ROOT_READOUT_POLICY,
+        }:
             raise ValueError("PRIMARY promoted policy identity is invalid")
         if self.acceptance_metric != PROMOTED_ROOT_ACCEPTANCE_METRIC:
             raise ValueError("PRIMARY acceptance metric identity is invalid")
@@ -1743,6 +1806,21 @@ class PrimaryRootAcceptanceEvidence:
                 )
         elif not isinstance(self.error_model_id, str) or not self.error_model_id:
             raise ValueError("PRIMARY error-model identity is invalid")
+        if (
+            self.derivative_authentication is not None
+            and not isinstance(
+                self.derivative_authentication,
+                DerivativeAuthenticationEvidence,
+            )
+        ):
+            raise ValueError("PRIMARY derivative authentication is invalid")
+        if (
+            self.derivative_authentication is not None
+            and self.derivative_authentication.derivative_estimate != self.derivative
+        ):
+            raise ValueError(
+                "PRIMARY derivative authentication disagrees with derivative"
+            )
         with localcontext() as context:
             context.prec = _ROOT_AUTHENTICATION_CHECK_DIGITS
             derivative_abs = self.derivative.magnitude()
@@ -1759,7 +1837,7 @@ class PrimaryRootAcceptanceEvidence:
                 raise ValueError("PRIMARY acceptance decision is inconsistent")
 
     def to_mapping(self) -> dict[str, object]:
-        return {
+        output = {
             "policy_id": self.policy_id,
             "acceptance_metric": self.acceptance_metric,
             "determinant_re": str(self.determinant.real),
@@ -1776,6 +1854,11 @@ class PrimaryRootAcceptanceEvidence:
             "determinant_error_abs": str(self.determinant_error_abs),
             "error_model_id": self.error_model_id,
         }
+        if self.derivative_authentication is not None:
+            output["derivative_authentication"] = (
+                self.derivative_authentication.to_mapping()
+            )
+        return output
 
     @classmethod
     def from_mapping(cls, value: object) -> "PrimaryRootAcceptanceEvidence":
@@ -1794,7 +1877,10 @@ class PrimaryRootAcceptanceEvidence:
             "determinant_error_abs",
             "error_model_id",
         }
-        if not isinstance(value, Mapping) or set(value) != fields:
+        if (
+            not isinstance(value, Mapping)
+            or set(value) not in (fields, fields | {"derivative_authentication"})
+        ):
             raise ValueError("PRIMARY acceptance evidence fields are invalid")
         if type(value["accepted"]) is not bool:
             raise ValueError("PRIMARY accepted flag is invalid")
@@ -1833,6 +1919,13 @@ class PrimaryRootAcceptanceEvidence:
                 "PRIMARY determinant error telemetry",
             ),
             error_model_id=value["error_model_id"],
+            derivative_authentication=(
+                None
+                if value.get("derivative_authentication") is None
+                else DerivativeAuthenticationEvidence.from_mapping(
+                    value["derivative_authentication"]
+                )
+            ),
         )
 
 
@@ -1858,7 +1951,10 @@ class FixedRootDiagnosticEvidence:
     derivative_source: str
 
     def __post_init__(self) -> None:
-        if self.policy_id != PROMOTED_ROOT_READOUT_POLICY:
+        if self.policy_id not in {
+            PROMOTED_ROOT_READOUT_POLICY,
+            HISTORICAL_PROMOTED_ROOT_READOUT_POLICY,
+        }:
             raise ValueError("fixed-root promoted policy identity is invalid")
         if self.acceptance_metric != PROMOTED_ROOT_ACCEPTANCE_METRIC:
             raise ValueError("fixed-root acceptance metric is invalid")
@@ -2170,6 +2266,8 @@ class DerivativeAuthenticationEvidence:
     lower_bound_abs: Decimal
     selected_step: Decimal
     axis: str
+    determinant_error_status: str = DETERMINANT_ERROR_UNAVAILABLE
+    determinant_error_model_id: str | None = None
 
     def __post_init__(self) -> None:
         for name in (
@@ -2205,6 +2303,20 @@ class DerivativeAuthenticationEvidence:
             )
         if self.axis not in {"real", "imaginary"}:
             raise ValueError("derivative authentication axis is invalid")
+        if self.determinant_error_status not in {
+            DETERMINANT_ERROR_AVAILABLE,
+            DETERMINANT_ERROR_UNAVAILABLE,
+        }:
+            raise ValueError("derivative determinant-error status is invalid")
+        if self.determinant_error_status == DETERMINANT_ERROR_AVAILABLE:
+            if (
+                not isinstance(self.determinant_error_model_id, str)
+                or not self.determinant_error_model_id
+                or self.propagated_error_abs <= 0
+            ):
+                raise ValueError("available derivative determinant error is invalid")
+        elif self.determinant_error_model_id is not None:
+            raise ValueError("unavailable derivative determinant error has a model")
         with localcontext() as context:
             context.prec = _ROOT_AUTHENTICATION_CHECK_DIGITS
             derivative_abs = self.derivative_estimate.magnitude()
@@ -2230,15 +2342,22 @@ class DerivativeAuthenticationEvidence:
 
     @classmethod
     def from_mapping(cls, value: object) -> "DerivativeAuthenticationEvidence":
-        if not isinstance(value, Mapping) or set(value) != (
-            _DERIVATIVE_AUTHENTICATION_FIELDS
-        ):
+        admitted_fields = _DERIVATIVE_AUTHENTICATION_FIELDS | {
+            "determinant_error_status", "determinant_error_model_id"
+        }
+        if not isinstance(value, Mapping) or set(value) not in {
+            _DERIVATIVE_AUTHENTICATION_FIELDS, admitted_fields
+        }:
             raise ValueError("derivative authentication fields are invalid")
         axis = value["axis"]
         if not isinstance(axis, str):
             raise ValueError("derivative authentication axis is invalid")
         return cls(
             axis=axis,
+            determinant_error_status=value.get(
+                "determinant_error_status", DETERMINANT_ERROR_UNAVAILABLE
+            ),
+            determinant_error_model_id=value.get("determinant_error_model_id"),
             **{
                 field: _conditioning_decimal_from_text(
                     value[field], f"derivative authentication {field}"
@@ -2258,6 +2377,8 @@ class DerivativeAuthenticationEvidence:
             "lower_bound_abs": str(self.lower_bound_abs),
             "selected_step": str(self.selected_step),
             "axis": self.axis,
+            "determinant_error_status": self.determinant_error_status,
+            "determinant_error_model_id": self.determinant_error_model_id,
         }
 
 
@@ -2941,7 +3062,10 @@ class RootReadout:
             raise ValueError("root readout root authentication has invalid type")
         promoted = self.promoted_root_readout_policy is not None
         if promoted:
-            if self.promoted_root_readout_policy != PROMOTED_ROOT_READOUT_POLICY:
+            if self.promoted_root_readout_policy not in {
+                PROMOTED_ROOT_READOUT_POLICY,
+                HISTORICAL_PROMOTED_ROOT_READOUT_POLICY,
+            }:
                 raise ValueError("root readout promoted policy identity is invalid")
             if not isinstance(
                 self.primary_acceptance, PrimaryRootAcceptanceEvidence
@@ -3535,6 +3659,369 @@ class RootReadoutBackend(Protocol):
     ) -> complex | None: ...
 
 
+@dataclass(frozen=True, slots=True)
+class FixedRootDeterminantSample:
+    """One determinant value evaluated at a fixed authenticated root."""
+
+    omega: complex
+    amplitude: complex
+    determinant: complex
+    determinant_error_abs: float
+    determinant_error_status: str
+    determinant_error_model_id: str | None
+    determinant_family: str
+    determinant_normalisation: str
+    branch_identity: str
+    branch_authenticated: bool
+    request_sha256: str
+    worker_response_receipt: Mapping[str, object]
+    worker_response_receipt_sha256: str
+    precision_tier: PrecisionTier
+    working_precision_bits: int
+    readout_role: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "omega", _finite_complex(self.omega, "sample omega"))
+        object.__setattr__(
+            self,
+            "amplitude",
+            _finite_complex(self.amplitude, "sample amplitude"),
+        )
+        object.__setattr__(
+            self,
+            "determinant",
+            _finite_complex(self.determinant, "sample determinant"),
+        )
+        error = float(self.determinant_error_abs)
+        if not math.isfinite(error) or error < 0.0:
+            raise ValueError("fixed-root determinant error must be nonnegative")
+        object.__setattr__(self, "determinant_error_abs", error)
+        if self.determinant_error_status not in {
+            DETERMINANT_ERROR_AVAILABLE,
+            DETERMINANT_ERROR_UNAVAILABLE,
+        }:
+            raise ValueError("fixed-root determinant error status is invalid")
+        if self.determinant_error_status == DETERMINANT_ERROR_AVAILABLE:
+            if (
+                not isinstance(self.determinant_error_model_id, str)
+                or not self.determinant_error_model_id
+                or error <= 0.0
+            ):
+                raise ValueError("available fixed-root determinant error is invalid")
+        elif self.determinant_error_model_id is not None or error != 0.0:
+            raise ValueError("unavailable fixed-root determinant error is invalid")
+        for name in (
+            "determinant_family",
+            "determinant_normalisation",
+            "branch_identity",
+            "readout_role",
+        ):
+            if not isinstance(getattr(self, name), str) or not getattr(self, name):
+                raise ValueError(f"fixed-root sample {name} is invalid")
+        if type(self.branch_authenticated) is not bool:
+            raise ValueError("fixed-root sample branch evidence is invalid")
+        if not _HEX_64.fullmatch(self.request_sha256):
+            raise ValueError("fixed-root sample request digest is invalid")
+        if not _HEX_64.fullmatch(self.worker_response_receipt_sha256):
+            raise ValueError("fixed-root sample worker receipt digest is invalid")
+        receipt = json.loads(canonical_json_bytes(dict(self.worker_response_receipt)))
+        if not isinstance(receipt, dict) or _sha256(receipt) != (
+            self.worker_response_receipt_sha256
+        ):
+            raise ValueError("fixed-root sample worker receipt digest mismatch")
+        receipt_fields = {
+            "schema", "request_binding", "request_sha256",
+            "response_binding", "response_sha256", "runtime_identity_sha256",
+            "scientific_runtime_sha256",
+        }
+        request_binding = receipt.get("request_binding")
+        response_binding = receipt.get("response_binding")
+        if (
+            set(receipt) != receipt_fields
+            or receipt.get("schema")
+            != "windows-solver.fixed-root-determinant-sample-receipt/1"
+            or not isinstance(request_binding, dict)
+            or _sha256(request_binding) != self.request_sha256
+            or receipt.get("request_sha256") != self.request_sha256
+            or not isinstance(response_binding, dict)
+            or _sha256(response_binding) != receipt.get("response_sha256")
+            or response_binding.get("request_sha256") != self.request_sha256
+            or response_binding.get("status") != "ok"
+            or response_binding.get("operation")
+            != "fixed-root-determinant-sample"
+            or response_binding.get("determinant_family")
+            != self.determinant_family
+            or response_binding.get("determinant_normalisation")
+            != self.determinant_normalisation
+            or response_binding.get("branch_identity") != self.branch_identity
+            or response_binding.get("branch_authenticated")
+            is not self.branch_authenticated
+            or response_binding.get("semantic_precision_tier")
+            != self.precision_tier.value
+            or response_binding.get("working_precision_bits")
+            != self.working_precision_bits
+            or response_binding.get("readout_role") != self.readout_role
+            or response_binding.get("determinant_error_status")
+            != self.determinant_error_status
+            or response_binding.get("determinant_error_model_id")
+            != self.determinant_error_model_id
+            or not isinstance(receipt.get("scientific_runtime_sha256"), str)
+            or not _HEX_64.fullmatch(receipt["scientific_runtime_sha256"])
+        ):
+            raise ValueError("fixed-root sample receipt identity mismatch")
+        try:
+            receipt_omega = complex(
+                float(response_binding["omega_re"]),
+                float(response_binding["omega_im"]),
+            )
+            receipt_amplitude = complex(
+                float(response_binding["amplitude_re"]),
+                float(response_binding["amplitude_im"]),
+            )
+            receipt_determinant = complex(
+                float(response_binding["determinant_re"]),
+                float(response_binding["determinant_im"]),
+            )
+            receipt_error = float(response_binding["determinant_error_abs"])
+        except (KeyError, TypeError, ValueError) as error:
+            raise ValueError("fixed-root sample receipt material mismatch") from error
+        if (
+            receipt_omega != self.omega
+            or receipt_amplitude != self.amplitude
+            or receipt_determinant != self.determinant
+            or receipt_error != self.determinant_error_abs
+        ):
+            raise ValueError("fixed-root sample receipt material mismatch")
+        object.__setattr__(self, "worker_response_receipt", MappingProxyType(receipt))
+        object.__setattr__(self, "precision_tier", precision_tier(self.precision_tier))
+        if (
+            isinstance(self.working_precision_bits, bool)
+            or not isinstance(self.working_precision_bits, int)
+            or self.working_precision_bits < 1
+        ):
+            raise ValueError("fixed-root sample working precision bits are invalid")
+
+    def to_mapping(self) -> dict[str, object]:
+        return {
+            "amplitude": _complex_mapping(self.amplitude),
+            "branch_authenticated": self.branch_authenticated,
+            "branch_identity": self.branch_identity,
+            "determinant": _complex_mapping(self.determinant),
+            "determinant_error_abs": self.determinant_error_abs,
+            "determinant_error_status": self.determinant_error_status,
+            "determinant_error_model_id": self.determinant_error_model_id,
+            "determinant_family": self.determinant_family,
+            "determinant_normalisation": self.determinant_normalisation,
+            "omega": _complex_mapping(self.omega),
+            "precision_tier": self.precision_tier.value,
+            "readout_role": self.readout_role,
+            "request_sha256": self.request_sha256,
+            "worker_response_receipt": dict(self.worker_response_receipt),
+            "worker_response_receipt_sha256": self.worker_response_receipt_sha256,
+            "working_precision_bits": self.working_precision_bits,
+        }
+
+    @classmethod
+    def from_mapping(cls, value: object) -> "FixedRootDeterminantSample":
+        fields = {
+            "amplitude", "branch_authenticated", "branch_identity",
+            "determinant", "determinant_error_abs", "determinant_error_status",
+            "determinant_error_model_id", "determinant_family",
+            "determinant_normalisation", "omega", "precision_tier",
+            "readout_role", "request_sha256", "worker_response_receipt",
+            "worker_response_receipt_sha256", "working_precision_bits",
+        }
+        if not isinstance(value, Mapping) or set(value) != fields:
+            raise ValueError("fixed-root determinant sample fields are invalid")
+        return cls(
+            omega=_complex_from_mapping(value["omega"], "sample omega"),
+            amplitude=_complex_from_mapping(value["amplitude"], "sample amplitude"),
+            determinant=_complex_from_mapping(value["determinant"], "sample determinant"),
+            determinant_error_abs=float(value["determinant_error_abs"]),
+            determinant_error_status=str(value["determinant_error_status"]),
+            determinant_error_model_id=value["determinant_error_model_id"],
+            determinant_family=str(value["determinant_family"]),
+            determinant_normalisation=str(value["determinant_normalisation"]),
+            branch_identity=str(value["branch_identity"]),
+            branch_authenticated=value["branch_authenticated"],
+            request_sha256=str(value["request_sha256"]),
+            worker_response_receipt=value["worker_response_receipt"],
+            worker_response_receipt_sha256=str(
+                value["worker_response_receipt_sha256"]
+            ),
+            precision_tier=precision_tier(value["precision_tier"]),
+            working_precision_bits=value["working_precision_bits"],
+            readout_role=str(value["readout_role"]),
+        )
+
+
+def _validate_exterior_derivative_checkpoint_evidence(
+    *,
+    evidence: dict[str, object],
+    samples: Sequence[FixedRootDeterminantSample],
+    baseline: RootReadout,
+    mechanism_id: str,
+    job_id: str,
+    leaf_id: str,
+    status: ComponentStatus,
+    response: complex | None,
+    error_channels: Mapping[str, float],
+) -> None:
+    """Recompute a persisted fixed-root derivative certificate from samples."""
+
+    if not samples:
+        if status is not ComponentStatus.DERIVATIVE_UNRESOLVED:
+            raise ValueError("bounded derivative evidence lacks fixed-root samples")
+        return
+    if len(samples) not in {4, 6}:
+        raise ValueError("component fixed-root determinant sample count is invalid")
+    validation_reason = evidence.get("validation_reason")
+    validation_identity = evidence.get("validation_policy_identity")
+    if len(samples) == 4:
+        if validation_reason is not None or validation_identity is not None:
+            raise ValueError("four-sample derivative evidence claims validation")
+    elif (
+        validation_reason not in FULL_LADDER_VALIDATION_REASONS
+        or validation_identity != FIXED_ROOT_AXIS_VALIDATION_IDENTITY
+    ):
+        raise ValueError("six-sample derivative validation policy is invalid")
+
+    h = samples[0].amplitude.real
+    if not math.isfinite(h) or h <= 0.0:
+        raise ValueError("component fixed-root derivative step is invalid")
+    expected = [
+        ("coordinate-real-plus-h", complex(h, 0.0)),
+        ("coordinate-real-minus-h", complex(-h, 0.0)),
+        ("coordinate-real-plus-h2", complex(h / 2.0, 0.0)),
+        ("coordinate-real-minus-h2", complex(-h / 2.0, 0.0)),
+    ]
+    if len(samples) == 6:
+        expected.extend([
+            ("coordinate-imaginary-plus-h2", complex(0.0, h / 2.0)),
+            ("coordinate-imaginary-minus-h2", complex(0.0, -h / 2.0)),
+        ])
+    conditioning = baseline.numerical_conditioning
+    contract = regularised_gsn_mechanism_contract(mechanism_id)
+    if conditioning is None:
+        raise ValueError("component derivative baseline conditioning is missing")
+    baseline_receipt = baseline.worker_response_receipt
+    baseline_runtime_sha256 = (
+        None
+        if not isinstance(baseline_receipt, Mapping)
+        else baseline_receipt.get("scientific_runtime_sha256")
+    )
+    if not isinstance(baseline_runtime_sha256, str):
+        raise ValueError("component derivative baseline runtime receipt is missing")
+    for sample, (role, amplitude) in zip(samples, expected):
+        request = sample.worker_response_receipt["request_binding"]
+        if (
+            sample.readout_role != role
+            or sample.amplitude != amplitude
+            or sample.omega != baseline.omega
+            or sample.determinant_family != contract["determinant_family"]
+            or sample.determinant_normalisation
+            != contract["determinant_normalisation"]
+            or sample.branch_identity != conditioning.branch_convention
+            or sample.branch_authenticated is not True
+            or request.get("job_id") != job_id
+            or request.get("leaf_id") != leaf_id
+            or sample.worker_response_receipt.get("scientific_runtime_sha256")
+            != baseline_runtime_sha256
+        ):
+            raise ValueError(
+                "component fixed-root sample baseline omega, job, or runtime binding is invalid"
+            )
+
+    coordinate, coarse, fine, propagated, disagreement = (
+        _fixed_root_coordinate_derivative(samples[:4], h)
+    )
+    expected_decision = {
+        "accepted": abs(fine) > coordinate.radius,
+        "identity": FIXED_ROOT_DERIVATIVE_CONDITIONING_IDENTITY,
+        "rejection_reason": None,
+        "selected_candidate": "h/2",
+    }
+    if not expected_decision["accepted"]:
+        expected_decision.update({
+            "rejection_reason": "DERIVATIVE_DISK_CONTAINS_ZERO",
+            "selected_candidate": None,
+        })
+    required_coordinate = {
+        "coordinate_derivative_disk": coordinate.to_mapping(),
+        "conditioning_decision": expected_decision,
+        "propagated_determinant_error_abs": propagated,
+        "raw_step_disagreement_abs": disagreement,
+    }
+    if status is ComponentStatus.CONVERGED:
+        required_coordinate.update({
+            "fine_derivative": _complex_mapping(fine),
+            "real_h_derivative": _complex_mapping(coarse),
+            "selected_step": h / 2.0,
+        })
+    for name, expected_value in required_coordinate.items():
+        if evidence.get(name) != expected_value:
+            raise ValueError(
+                f"component derivative evidence {name} is not sample-derived"
+            )
+    if not expected_decision["accepted"]:
+        if status is not ComponentStatus.DERIVATIVE_UNRESOLVED:
+            raise ValueError("rejected derivative disk was persisted as usable")
+        return
+
+    primary = baseline.primary_acceptance
+    authentication = None if primary is None else primary.derivative_authentication
+    if authentication is None:
+        raise ValueError("component frequency derivative authentication is missing")
+    frequency_radius = float(
+        authentication.propagated_error_abs
+        + authentication.step_disagreement_abs
+    )
+    frequency = ComplexDisk(
+        complex(float(authentication.derivative_re), float(authentication.derivative_im)),
+        frequency_radius,
+    )
+    if evidence.get("frequency_derivative_disk") != frequency.to_mapping():
+        raise ValueError("component frequency derivative disk is not PRIMARY-derived")
+    expected_frequency_provenance = {
+        "axis": authentication.axis,
+        "propagated_error_abs": str(authentication.propagated_error_abs),
+        "selected_step": str(authentication.selected_step),
+        "step_disagreement_abs": str(authentication.step_disagreement_abs),
+    }
+    if evidence.get("frequency_derivative_radius_provenance") != (
+        expected_frequency_provenance
+    ):
+        raise ValueError("component frequency derivative provenance is invalid")
+    expected_response = exterior_response_disk(
+        coordinate_derivative=coordinate,
+        frequency_derivative=frequency,
+    )
+    if (
+        evidence.get("response_disk") != expected_response.to_mapping()
+        or response != expected_response.centre
+        or error_channels.get("resolution") != expected_response.radius
+    ):
+        raise ValueError("component exterior response disk is not derivative-derived")
+
+    if len(samples) == 6:
+        imaginary = (
+            samples[4].determinant - samples[5].determinant
+        ) / (1.0j * h)
+        imaginary_error = (
+            samples[4].determinant_error_abs
+            + samples[5].determinant_error_abs
+        ) / h
+        difference = abs(imaginary - fine)
+        expected_validation = {
+            "agrees": difference <= imaginary_error + coordinate.radius,
+            "axis_difference_abs": difference,
+            "derivative": _complex_mapping(imaginary),
+            "propagated_error_abs": imaginary_error,
+        }
+        if evidence.get("imaginary_axis_validation") != expected_validation:
+            raise ValueError("component imaginary-axis validation is not sample-derived")
+
+
 @dataclass(slots=True)
 class NativeDeterminantAdapter:
     identity: BackendIdentity
@@ -3543,6 +4030,26 @@ class NativeDeterminantAdapter:
     def _check_job(self, job: ResponseComponentJob) -> None:
         if job.backend_identity != self.identity:
             raise ValueError("response job backend identity does not match adapter")
+
+    def preview_root_request(
+        self,
+        job: ResponseComponentJob,
+        amplitude: complex,
+        primary_predictor: complex | None = None,
+        primary_predictor_kind: str | None = None,
+        readout_role: str | None = None,
+    ) -> dict[str, object]:
+        """Bind binary64 work to a canonical pseudo-request identity."""
+
+        self._check_job(job)
+        return {
+            "schema": "windows-solver.native-root-readout-request/1",
+            "job": job.to_mapping(),
+            "policy_sha256": job.policy.identity_sha256,
+            "backend_identity_sha256": self.identity.identity_sha256,
+            "readout_role": readout_role,
+            "amplitude": _complex_mapping(complex(amplitude)),
+        }
 
     def read_root(
         self,
@@ -3728,6 +4235,7 @@ class ComponentStatus(str, Enum):
     AXIS_MISMATCH = "AXIS_MISMATCH"
     BRANCH_LOSS = "BRANCH_LOSS"
     NOT_CONVERGED = "NOT_CONVERGED"
+    DERIVATIVE_UNRESOLVED = "DERIVATIVE_UNRESOLVED"
 
 
 @dataclass(frozen=True, slots=True)
@@ -3927,6 +4435,8 @@ class ComponentResult:
     response_uncertainty_status: str | None = None
     error_channel_applicability: Mapping[str, bool] | None = None
     resolved_window: Mapping[str, object] | None = None
+    derivative_evidence: Mapping[str, object] | None = None
+    analytic_horizon_evidence: Mapping[str, object] | None = None
 
     def __post_init__(self) -> None:
         if self.finite_amplitude_readout_count is None:
@@ -3970,6 +4480,95 @@ class ComponentResult:
                 raise ValueError(
                     f"component error channel {name} must be finite and nonnegative"
                 )
+        if self.derivative_evidence is not None:
+            normalized_derivative_evidence = json.loads(
+                canonical_json_bytes(dict(self.derivative_evidence))
+            )
+            if not isinstance(normalized_derivative_evidence, dict):
+                raise ValueError("component derivative evidence is invalid")
+            raw_samples = normalized_derivative_evidence.get(
+                "fixed_root_samples"
+            )
+            if not isinstance(raw_samples, list):
+                raise ValueError(
+                    "component fixed-root determinant samples are invalid"
+                )
+            samples: list[FixedRootDeterminantSample] = []
+            for raw_sample in raw_samples:
+                sample = FixedRootDeterminantSample.from_mapping(raw_sample)
+                if sample.to_mapping() != raw_sample:
+                    raise ValueError(
+                        "component fixed-root determinant sample is not canonical"
+                    )
+                samples.append(sample)
+            if normalized_derivative_evidence.get("determinant_count") != len(
+                samples
+            ):
+                raise ValueError(
+                    "component fixed-root determinant count is inconsistent"
+                )
+            sample_identities = {
+                (
+                    sample.determinant_family,
+                    sample.determinant_normalisation,
+                    sample.branch_identity,
+                    sample.precision_tier,
+                    sample.working_precision_bits,
+                )
+                for sample in samples
+            }
+            if len(sample_identities) > 1:
+                raise ValueError(
+                    "component fixed-root determinant sample identities disagree"
+                )
+            normalized_derivative_evidence["fixed_root_samples"] = [
+                sample.to_mapping() for sample in samples
+            ]
+            object.__setattr__(
+                self,
+                "derivative_evidence",
+                MappingProxyType(normalized_derivative_evidence),
+            )
+        if self.analytic_horizon_evidence is not None:
+            normalized_horizon_evidence = json.loads(
+                canonical_json_bytes(dict(self.analytic_horizon_evidence))
+            )
+            if not isinstance(normalized_horizon_evidence, dict):
+                raise ValueError("component analytic horizon evidence is invalid")
+            object.__setattr__(
+                self,
+                "analytic_horizon_evidence",
+                MappingProxyType(normalized_horizon_evidence),
+            )
+        if self.component_scientific_identity == EXTERIOR_DERIVATIVE_COMPONENT_IDENTITY:
+            bounded = self.response_uncertainty_status == BOUNDED_DERIVATIVE_RESPONSE
+            unbounded = self.response_uncertainty_status == UNBOUNDED_DERIVATIVE_RESPONSE
+            if (
+                self.mechanism_id not in _EXTERIOR_PROFILE_IDS
+                or self.response_method != EXTERIOR_DERIVATIVE_METHOD
+                or self.finite_amplitude_ladder_required
+                or self.finite_amplitude_ladder_executed
+                or self.levels
+                or self.derivative_evidence is None
+                or not (bounded or unbounded)
+                or (bounded and (self.response is None or self.status is not ComponentStatus.CONVERGED))
+                or (unbounded and (self.response is not None or self.status is not ComponentStatus.DERIVATIVE_UNRESOLVED))
+            ):
+                raise ValueError(
+                    "promoted exterior derivative evidence is inconsistent"
+                )
+            assert self.derivative_evidence is not None
+            _validate_exterior_derivative_checkpoint_evidence(
+                evidence=dict(self.derivative_evidence),
+                samples=samples,
+                baseline=self.baseline,
+                mechanism_id=self.mechanism_id,
+                job_id=self.job_id,
+                leaf_id=self.leaf_id,
+                status=self.status,
+                response=self.response,
+                error_channels=self.error_channels,
+            )
         if self.component_scientific_identity == PROMOTED_HORIZON_COMPONENT_IDENTITY:
             if (
                 self.mechanism_id != "horizon-admittance"
@@ -3985,6 +4584,27 @@ class ComponentResult:
             ):
                 raise ValueError(
                     "promoted analytic horizon component evidence is inconsistent"
+                )
+        if self.component_scientific_identity == (
+            PROMOTED_HORIZON_COMPONENT_V2_IDENTITY
+        ):
+            bounded = self.response_uncertainty_status == BOUNDED_ANALYTIC_RESPONSE
+            unbounded = self.response_uncertainty_status == UNBOUNDED_ANALYTIC_RESPONSE
+            if (
+                self.mechanism_id != "horizon-admittance"
+                or self.response_method != PROMOTED_HORIZON_RESPONSE_METHOD_V2
+                or self.finite_amplitude_ladder_required
+                or self.finite_amplitude_ladder_executed
+                or self.finite_amplitude_readout_count != 0
+                or self.levels
+                or self.signed_root_crosscheck is not None
+                or self.analytic_horizon_evidence is None
+                or not (bounded or unbounded)
+                or (bounded and (self.response is None or self.status is not ComponentStatus.CONVERGED))
+                or (unbounded and (self.response is not None or self.status is not ComponentStatus.DERIVATIVE_UNRESOLVED))
+            ):
+                raise ValueError(
+                    "bounded promoted analytic horizon evidence is inconsistent"
                 )
         conditioned_readouts = tuple(
             readout
@@ -4011,7 +4631,11 @@ class ComponentResult:
 
     @property
     def response_uncertainty_calibrated(self) -> bool:
-        return self.response_uncertainty_status != UNCALIBRATED_ANALYTIC_RESPONSE
+        return self.response_uncertainty_status in {
+            None,
+            BOUNDED_DERIVATIVE_RESPONSE,
+            BOUNDED_ANALYTIC_RESPONSE,
+        }
 
     @property
     def raw_readouts(self) -> tuple[RootReadout, ...]:
@@ -4077,6 +4701,14 @@ class ComponentResult:
             })
         if self.resolved_window is not None:
             output["resolved_window"] = dict(self.resolved_window)
+        if self.derivative_evidence is not None:
+            output["derivative_evidence"] = json.loads(
+                canonical_json_bytes(dict(self.derivative_evidence))
+            )
+        if self.analytic_horizon_evidence is not None:
+            output["analytic_horizon_evidence"] = json.loads(
+                canonical_json_bytes(dict(self.analytic_horizon_evidence))
+            )
         return output
 
     @classmethod
@@ -4126,6 +4758,8 @@ class ComponentResult:
                 "error_channel_applicability"
             ),
             resolved_window=value.get("resolved_window"),
+            derivative_evidence=value.get("derivative_evidence"),
+            analytic_horizon_evidence=value.get("analytic_horizon_evidence"),
         )
 
 
@@ -4189,14 +4823,872 @@ def _validated_result(
     return result
 
 
+def _validate_promoted_exterior_baseline(
+    job: ResponseComponentJob,
+    baseline: RootReadout,
+) -> DerivativeAuthenticationEvidence:
+    if baseline.promoted_root_readout_policy != PROMOTED_ROOT_READOUT_POLICY:
+        raise ValueError("promoted root-readout policy identity is invalid")
+    primary = baseline.primary_acceptance
+    if primary is None or not primary.accepted:
+        raise ValueError("promoted baseline PRIMARY evidence is not accepted")
+    if primary.post_newton_determinant_count != 0:
+        raise ValueError("promoted PRIMARY performed post-Newton determinants")
+    authentication = primary.derivative_authentication
+    if authentication is None:
+        raise ValueError(
+            "promoted PRIMARY derivative-specific uncertainty evidence is missing"
+        )
+    if baseline.branch_id != job.root.branch_id:
+        raise ValueError("promoted baseline branch identity is invalid")
+    conditioning = baseline.numerical_conditioning
+    expected = regularised_gsn_mechanism_contract(job.mechanism_id)
+    if conditioning is None or any(
+        getattr(conditioning, field) != value
+        for field, value in expected.items()
+    ):
+        raise ValueError("promoted exterior determinant convention is invalid")
+    return authentication
+
+
+def _fixed_root_coordinate_derivative(
+    samples: Sequence[FixedRootDeterminantSample],
+    step: float,
+) -> tuple[ComplexDisk, complex, complex, float, float]:
+    plus_h, minus_h, plus_half, minus_half = samples
+    coarse = (plus_h.determinant - minus_h.determinant) / (2.0 * step)
+    fine = (plus_half.determinant - minus_half.determinant) / step
+    coarse_error = (
+        plus_h.determinant_error_abs + minus_h.determinant_error_abs
+    ) / (2.0 * step)
+    fine_error = (
+        plus_half.determinant_error_abs + minus_half.determinant_error_abs
+    ) / step
+    disagreement = abs(fine - coarse)
+    radius = fine_error + disagreement
+    if radius <= 0.0:
+        raise ValueError(
+            "fixed-root coordinate derivative lacks non-exact uncertainty"
+        )
+    return ComplexDisk(fine, radius), coarse, fine, fine_error, disagreement
+
+
+def full_ladder_validation_policy(reason: str) -> dict[str, str]:
+    """Bind the expensive legacy ladder to one explicit validation reason."""
+
+    if reason not in FULL_LADDER_VALIDATION_REASONS:
+        raise ValueError("full ladder validation reason is invalid")
+    return {
+        "identity": FULL_COMPLEX_LADDER_VALIDATION_IDENTITY,
+        "reason": reason,
+    }
+
+
+def run_promoted_full_ladder_validation(
+    job: ResponseComponentJob,
+    backend: RootReadoutBackend,
+    primary_predictor: complex,
+    *,
+    reason: str,
+) -> dict[str, object]:
+    """Execute the legacy ladder only behind an explicit validation policy."""
+
+    validation_policy = full_ladder_validation_policy(reason)
+    predictor = _finite_complex(primary_predictor, "PRIMARY root predictor")
+    result = run_component(
+        job,
+        backend,
+        response_predictor=predictor,
+        _promoted_validation_policy=validation_policy,
+    )
+    return {
+        "validation_policy": validation_policy,
+        "result": result,
+    }
+
+
+def _unresolved_promoted_exterior_derivative(
+    job: ResponseComponentJob,
+    baseline: RootReadout,
+    evidence: Mapping[str, object],
+) -> ComponentResult:
+    return ComponentResult(
+        job_id=job.job_id,
+        leaf_id=job.leaf_id,
+        mechanism_id=job.mechanism_id,
+        status=ComponentStatus.DERIVATIVE_UNRESOLVED,
+        convergence_basis="UNRESOLVED_FIXED_ROOT_DERIVATIVE",
+        response=None,
+        signed_root_crosscheck=None,
+        closed_form_response=None,
+        error_channels={name: 0.0 for name in ERROR_CHANNELS},
+        baseline=baseline,
+        levels=(),
+        lineage={
+            **_result_lineage(job),
+            "component_scientific_identity": EXTERIOR_DERIVATIVE_COMPONENT_IDENTITY,
+        },
+        component_scientific_identity=EXTERIOR_DERIVATIVE_COMPONENT_IDENTITY,
+        response_method=EXTERIOR_DERIVATIVE_METHOD,
+        finite_amplitude_ladder_required=False,
+        finite_amplitude_ladder_executed=False,
+        finite_amplitude_readout_count=0,
+        response_uncertainty_status=UNBOUNDED_DERIVATIVE_RESPONSE,
+        error_channel_applicability={name: False for name in ERROR_CHANNELS},
+        derivative_evidence=evidence,
+    )
+
+
+_PROMOTED_COMPONENT_JOURNAL_SCHEMA = (
+    "windows-solver.promoted-component-journal-receipt/1"
+)
+_GENERIC_COMPONENT_JOURNAL_IDENTITY = (
+    "same-equation-signed-root-component-journal/v1"
+)
+
+
+def _journal_json_value(value: object) -> object:
+    if isinstance(value, Mapping):
+        return {key: _journal_json_value(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return [_journal_json_value(item) for item in value]
+    return value
+
+
+class _JournaledPromotedExteriorBackend:
+    """Persist each expensive promoted readout before the next one begins."""
+
+    def __init__(
+        self,
+        backend: RootReadoutBackend,
+        journal: PartialComponentJournal,
+        units_by_role: Mapping[str, PartialComponentWorkUnit],
+        *,
+        exact_request_binding: bool = False,
+    ) -> None:
+        self._backend = backend
+        self._journal = journal
+        self._units_by_role = dict(units_by_role)
+        self._exact_request_binding = exact_request_binding
+        self.identity = backend.identity
+
+    def _reuse(self, role: str, kind: str) -> RootReadout | FixedRootDeterminantSample | None:
+        unit = self._units_by_role[role]
+        existing = self._journal.entries.get(unit.work_unit_id)
+        if existing is None:
+            return None
+        if PartialComponentWorkUnit.from_entry(existing) != unit:
+            raise ValueError("partial component journal entry identity mismatch")
+        receipt = existing.worker_response_receipt
+        if (
+            receipt.get("schema") != _PROMOTED_COMPONENT_JOURNAL_SCHEMA
+            or receipt.get("kind") != kind
+            or not isinstance(receipt.get("output"), Mapping)
+        ):
+            raise ValueError("partial component journal output wrapper is invalid")
+        if kind == "root-readout":
+            return RootReadout.from_mapping(_journal_json_value(receipt["output"]))
+        return FixedRootDeterminantSample.from_mapping(
+            _journal_json_value(receipt["output"])
+        )
+
+    def _record(
+        self,
+        role: str,
+        kind: str,
+        output: RootReadout | FixedRootDeterminantSample,
+    ) -> None:
+        unit = self._units_by_role[role]
+        if self._exact_request_binding:
+            output_request_sha256 = (
+                output.request_sha256
+                if isinstance(output, FixedRootDeterminantSample)
+                else (
+                    None
+                    if output.worker_response_receipt is None
+                    else output.worker_response_receipt.get("request_sha256")
+                )
+            )
+            if output_request_sha256 != unit.request_sha256:
+                raise ValueError(
+                    "partial component output request identity mismatch"
+                )
+        self._journal.record(unit.to_entry({
+            "schema": _PROMOTED_COMPONENT_JOURNAL_SCHEMA,
+            "kind": kind,
+            "output": output.to_mapping(),
+        }))
+
+    def read_root(
+        self,
+        job: ResponseComponentJob,
+        amplitude: complex,
+        primary_predictor: complex | None = None,
+    ) -> RootReadout:
+        if complex(amplitude) != 0.0j:
+            raise ValueError("journaled promoted baseline amplitude is invalid")
+        reused = self._reuse("baseline-root", "root-readout")
+        if reused is not None:
+            assert isinstance(reused, RootReadout)
+            return reused
+        output = self._backend.read_root(
+            job, amplitude, primary_predictor=primary_predictor
+        )
+        self._record("baseline-root", "root-readout", output)
+        return output
+
+    def sample_fixed_root_determinant(
+        self,
+        job: ResponseComponentJob,
+        omega: complex,
+        amplitude: complex,
+        *,
+        readout_role: str,
+    ) -> FixedRootDeterminantSample:
+        unit = self._units_by_role.get(readout_role)
+        if unit is None or unit.amplitude != complex(amplitude):
+            raise ValueError("fixed-root readout is outside the journal plan")
+        reused = self._reuse(readout_role, "fixed-root-determinant-sample")
+        if reused is not None:
+            assert isinstance(reused, FixedRootDeterminantSample)
+            return reused
+        output = self._backend.sample_fixed_root_determinant(
+            job,
+            omega,
+            amplitude,
+            readout_role=readout_role,
+        )
+        self._record(readout_role, "fixed-root-determinant-sample", output)
+        return output
+
+    def validate_component_result(
+        self, job: ResponseComponentJob, result: ComponentResult
+    ) -> None:
+        validator = getattr(self._backend, "validate_component_result", None)
+        if validator is not None:
+            validator(job, result)
+
+
+class _JournaledComponentReads:
+    """Journal ordinary component root reads at the engine call boundary."""
+
+    def __init__(
+        self,
+        backend: RootReadoutBackend,
+        journal: PartialComponentJournal,
+        units: Mapping[tuple[str, complex], PartialComponentWorkUnit],
+    ) -> None:
+        self.backend = backend
+        self.journal = journal
+        self.units = dict(units)
+
+    def read_root(
+        self,
+        job: ResponseComponentJob,
+        role: str,
+        amplitude: complex,
+        primary_predictor: complex | None,
+        primary_predictor_kind: str | None,
+    ) -> RootReadout:
+        key = (role, complex(amplitude))
+        unit = self.units.get(key)
+        if unit is None:
+            raise ValueError("component root readout is outside the journal plan")
+        existing = self.journal.entries.get(unit.work_unit_id)
+        if existing is not None:
+            if PartialComponentWorkUnit.from_entry(existing) != unit:
+                raise ValueError("partial component journal entry identity mismatch")
+            receipt = existing.worker_response_receipt
+            if (
+                receipt.get("schema") != _PROMOTED_COMPONENT_JOURNAL_SCHEMA
+                or receipt.get("kind") != "root-readout"
+                or not isinstance(receipt.get("output"), Mapping)
+            ):
+                raise ValueError("partial component journal output wrapper is invalid")
+            return RootReadout.from_mapping(
+                _journal_json_value(receipt["output"])
+            )
+        read_with_kind = getattr(
+            self.backend, "read_root_with_predictor_kind", None
+        )
+        if (
+            primary_predictor is not None
+            and primary_predictor_kind is not None
+            and callable(read_with_kind)
+        ):
+            output = read_with_kind(
+                job,
+                amplitude,
+                primary_predictor,
+                primary_predictor_kind,
+            )
+        else:
+            output = self.backend.read_root(
+                job,
+                amplitude,
+                primary_predictor=primary_predictor,
+            )
+        if output.worker_response_receipt is not None and (
+            output.worker_response_receipt.get("request_sha256")
+            != unit.request_sha256
+        ):
+            raise ValueError("partial component output request identity mismatch")
+        self.journal.record(unit.to_entry({
+            "schema": _PROMOTED_COMPONENT_JOURNAL_SCHEMA,
+            "kind": "root-readout",
+            "output": output.to_mapping(),
+        }))
+        return output
+
+
+def _generic_component_journal(
+    job: ResponseComponentJob,
+    backend: RootReadoutBackend,
+) -> _JournaledComponentReads | None:
+    existing_controller = getattr(backend, "_component_journal", None)
+    if isinstance(existing_controller, _JournaledComponentReads):
+        return existing_controller
+    root_text = os.environ.get("KERR_QNM_PARTIAL_COMPONENT_JOURNAL_ROOT", "")
+    if not root_text.strip():
+        return None
+    if getattr(backend, "promoted_precision_backend", False):
+        # Promoted runners own exact Julia request binding separately.
+        return None
+    contract = regularised_gsn_mechanism_contract(job.mechanism_id)
+    component_identity = str(getattr(
+        backend, "journal_component_identity", _GENERIC_COMPONENT_JOURNAL_IDENTITY
+    ))
+    planned: list[tuple[str, complex]] = [("baseline", 0.0j)]
+    for epsilon in (*job.policy.epsilons, *_expansion_epsilons(job)):
+        planned.extend((
+            ("real-plus", complex(epsilon, 0.0)),
+            ("real-minus", complex(-epsilon, 0.0)),
+            ("imaginary-plus", complex(0.0, epsilon)),
+            ("imaginary-minus", complex(0.0, -epsilon)),
+        ))
+    units: dict[tuple[str, complex], PartialComponentWorkUnit] = {}
+    for role, amplitude in planned:
+        epsilon = abs(amplitude)
+        recorded_role = (
+            role if epsilon == 0.0 else f"{role}@{epsilon}"
+        )
+        preview = getattr(backend, "preview_root_request", None)
+        request_binding = (
+            preview(job, amplitude, None, None, recorded_role)
+            if callable(preview)
+            else {
+                "schema": "windows-solver.native-root-readout-request/1",
+                "job": job.to_mapping(),
+                "policy_sha256": job.policy.identity_sha256,
+                "backend_identity_sha256": backend.identity.identity_sha256,
+                "readout_role": recorded_role,
+                "amplitude": _complex_mapping(amplitude),
+            }
+        )
+        tier_provider = getattr(backend, "precision_tier_for_request", None)
+        tier = (
+            precision_tier(tier_provider(role, amplitude))
+            if callable(tier_provider)
+            else PrecisionTier.BINARY64
+        )
+        units[(role, amplitude)] = PartialComponentWorkUnit(
+            component_scientific_identity=component_identity,
+            leaf_id=job.leaf_id,
+            job_id=job.job_id,
+            policy_sha256=job.policy.identity_sha256,
+            backend_identity=backend.identity.identity_sha256,
+            determinant_family=str(contract["determinant_family"]),
+            determinant_normalisation=str(contract["determinant_normalisation"]),
+            precision_tier=tier,
+            mpfr_bits=working_precision_bits(tier),
+            amplitude=amplitude,
+            epsilon=epsilon,
+            readout_role=recorded_role,
+            refinement_level=0,
+            request_sha256=_sha256(request_binding),
+        )
+    expected = tuple(unit.work_unit_id for unit in units.values())
+    journal_path = Path(root_text) / (
+        _sha256({
+            "job_id": job.job_id,
+            "component_scientific_identity": component_identity,
+        }) + ".json"
+    )
+    journal = (
+        PartialComponentJournal.load(journal_path)
+        if journal_path.exists()
+        else PartialComponentJournal.create(
+            journal_path, expected_work_unit_ids=expected
+        )
+    )
+    if journal.expected_work_unit_ids != expected:
+        raise ValueError("partial component journal plan identity mismatch")
+    return _JournaledComponentReads(backend, journal, units)
+
+
+def _journaled_promoted_exterior_backend(
+    job: ResponseComponentJob,
+    backend: RootReadoutBackend,
+    *,
+    predictor: complex,
+    derivative_step: float,
+    validation_reason: str | None,
+) -> RootReadoutBackend:
+    root_text = os.environ.get("KERR_QNM_PARTIAL_COMPONENT_JOURNAL_ROOT", "")
+    if not root_text.strip():
+        return backend
+    raw_tier = getattr(backend, "sample_tier", None)
+    if raw_tier is None:
+        digits = getattr(backend, "digits", None)
+        raw_tier = {
+            40: PrecisionTier.BIGFLOAT_40,
+            80: PrecisionTier.BIGFLOAT_80,
+            120: PrecisionTier.BIGFLOAT_120,
+        }.get(digits)
+    if raw_tier is None:
+        raise ValueError("journaled promoted backend lacks a semantic precision tier")
+    tier = precision_tier(raw_tier)
+    contract = regularised_gsn_mechanism_contract(job.mechanism_id)
+    planned = [
+        (0.0j, "baseline-root"),
+        (complex(derivative_step, 0.0), "coordinate-real-plus-h"),
+        (complex(-derivative_step, 0.0), "coordinate-real-minus-h"),
+        (complex(derivative_step / 2.0, 0.0), "coordinate-real-plus-h2"),
+        (complex(-derivative_step / 2.0, 0.0), "coordinate-real-minus-h2"),
+    ]
+    if validation_reason is not None:
+        planned.extend((
+            (complex(0.0, derivative_step / 2.0), "coordinate-imaginary-plus-h2"),
+            (complex(0.0, -derivative_step / 2.0), "coordinate-imaginary-minus-h2"),
+        ))
+    units: dict[str, PartialComponentWorkUnit] = {}
+    preview_root = getattr(backend, "preview_root_request", None)
+    preview_fixed = getattr(backend, "preview_fixed_root_request", None)
+    exact_request_binding = callable(preview_root) and callable(preview_fixed)
+    for amplitude, role in planned:
+        if role == "baseline-root" and callable(preview_root):
+            request_binding = preview_root(
+                job, amplitude, predictor, None, role
+            )
+        elif role != "baseline-root" and callable(preview_fixed):
+            request_binding = preview_fixed(
+                job, predictor, amplitude, role
+            )
+        else:
+            request_binding = {
+                "amplitude": _complex_mapping(amplitude),
+                "component_scientific_identity": EXTERIOR_DERIVATIVE_COMPONENT_IDENTITY,
+                "job_id": job.job_id,
+                "leaf_id": job.leaf_id,
+                "policy_sha256": job.policy.identity_sha256,
+                "precision_tier": tier.value,
+                "primary_predictor": _complex_mapping(predictor),
+                "readout_role": role,
+                "validation_reason": validation_reason,
+            }
+        request_sha256 = _sha256(request_binding)
+        units[role] = PartialComponentWorkUnit(
+            component_scientific_identity=EXTERIOR_DERIVATIVE_COMPONENT_IDENTITY,
+            leaf_id=job.leaf_id,
+            job_id=job.job_id,
+            policy_sha256=job.policy.identity_sha256,
+            backend_identity=job.backend_identity.identity_sha256,
+            determinant_family=str(contract["determinant_family"]),
+            determinant_normalisation=str(contract["determinant_normalisation"]),
+            precision_tier=tier,
+            mpfr_bits=working_precision_bits(tier),
+            amplitude=amplitude,
+            epsilon=abs(amplitude),
+            readout_role=role,
+            refinement_level=int(getattr(backend, "refinement", 0)),
+            request_sha256=request_sha256,
+        )
+    expected = tuple(unit.work_unit_id for unit in units.values())
+    journal_name = _sha256({
+        "job_id": job.job_id,
+        "component_scientific_identity": EXTERIOR_DERIVATIVE_COMPONENT_IDENTITY,
+    }) + ".json"
+    journal_path = Path(root_text) / journal_name
+    journal = (
+        PartialComponentJournal.load(journal_path)
+        if journal_path.exists()
+        else PartialComponentJournal.create(
+            journal_path, expected_work_unit_ids=expected
+        )
+    )
+    if journal.expected_work_unit_ids != expected:
+        raise ValueError("partial component journal plan identity mismatch")
+    return _JournaledPromotedExteriorBackend(
+        backend,
+        journal,
+        units,
+        exact_request_binding=exact_request_binding,
+    )
+
+
+def run_promoted_exterior_component(
+    job: ResponseComponentJob,
+    backend: RootReadoutBackend,
+    primary_predictor: complex,
+    *,
+    derivative_step: float,
+    validation_reason: str | None = None,
+) -> ComponentResult:
+    """Compute ``-D_c/D_omega`` without solving a perturbed root."""
+
+    if job.mechanism_id not in _EXTERIOR_PROFILE_IDS:
+        raise ValueError("promoted exterior runner requires an exterior job")
+    if (
+        validation_reason is not None
+        and validation_reason not in FULL_LADDER_VALIDATION_REASONS
+    ):
+        raise ValueError("promoted exterior validation reason is invalid")
+    step = float(derivative_step)
+    if not math.isfinite(step) or step <= 0.0:
+        raise ValueError("exterior derivative step must be finite and positive")
+    if backend.identity != job.backend_identity:
+        raise ValueError("response backend identity does not match job")
+    predictor = _finite_complex(primary_predictor, "PRIMARY root predictor")
+    binder = getattr(backend, "bind_job", None)
+    if binder is not None:
+        job = binder(job)
+    backend = _journaled_promoted_exterior_backend(
+        job,
+        backend,
+        predictor=predictor,
+        derivative_step=step,
+        validation_reason=validation_reason,
+    )
+    baseline = backend.read_root(job, 0.0j, primary_predictor=predictor)
+    initial_status = _identity_status(job, baseline)
+    if initial_status is not None:
+        return _validated_result(
+            backend, job, _unresolved_result(job, initial_status, baseline, ())
+        )
+    primary = baseline.primary_acceptance
+    if (
+        primary is not None
+        and primary.accepted
+        and primary.derivative_authentication is None
+    ):
+        result = _unresolved_promoted_exterior_derivative(
+            job,
+            baseline,
+            {
+                "conditioning_decision": {
+                    "accepted": False,
+                    "identity": FIXED_ROOT_DERIVATIVE_CONDITIONING_IDENTITY,
+                    "rejection_reason": (
+                        "MISSING_FREQUENCY_DERIVATIVE_AUTHENTICATION"
+                    ),
+                    "selected_candidate": None,
+                },
+                "determinant_count": 0,
+                "failure_code": (
+                    "MISSING_FREQUENCY_DERIVATIVE_AUTHENTICATION"
+                ),
+                "fixed_root_samples": [],
+                "response_disk_identity": (
+                    EXTERIOR_DERIVATIVE_RESPONSE_DISK_IDENTITY
+                ),
+            },
+        )
+        return _validated_result(backend, job, result)
+    frequency_authentication = _validate_promoted_exterior_baseline(job, baseline)
+    assert primary is not None
+    if (
+        frequency_authentication.determinant_error_status
+        != DETERMINANT_ERROR_AVAILABLE
+        or primary.error_model_id is None
+        or frequency_authentication.determinant_error_model_id
+        != primary.error_model_id
+    ):
+        result = _unresolved_promoted_exterior_derivative(
+            job,
+            baseline,
+            {
+                "conditioning_decision": {
+                    "accepted": False,
+                    "identity": FIXED_ROOT_DERIVATIVE_CONDITIONING_IDENTITY,
+                    "rejection_reason": "DETERMINANT_ERROR_MODEL_UNAVAILABLE",
+                    "selected_candidate": None,
+                },
+                "determinant_count": 0,
+                "determinant_error_provenance": {
+                    "derivative_status": (
+                        frequency_authentication.determinant_error_status
+                    ),
+                    "derivative_model_id": (
+                        frequency_authentication.determinant_error_model_id
+                    ),
+                    "primary_model_id": primary.error_model_id,
+                },
+                "failure_code": "DETERMINANT_ERROR_MODEL_UNAVAILABLE",
+                "fixed_root_samples": [],
+                "math_review_blocker": (
+                    EXTERIOR_DETERMINANT_ERROR_MATH_REVIEW_BLOCKER
+                ),
+                "response_disk_identity": (
+                    EXTERIOR_DERIVATIVE_RESPONSE_DISK_IDENTITY
+                ),
+            },
+        )
+        return _validated_result(backend, job, result)
+    sample_operation = getattr(backend, "sample_fixed_root_determinant", None)
+    if not callable(sample_operation):
+        raise ValueError("fixed-root determinant sample boundary is unavailable")
+
+    amplitudes_and_roles = (
+        (complex(step, 0.0), "coordinate-real-plus-h"),
+        (complex(-step, 0.0), "coordinate-real-minus-h"),
+        (complex(step / 2.0, 0.0), "coordinate-real-plus-h2"),
+        (complex(-step / 2.0, 0.0), "coordinate-real-minus-h2"),
+    )
+    samples = tuple(
+        sample_operation(
+            job,
+            baseline.omega,
+            amplitude,
+            readout_role=role,
+        )
+        for amplitude, role in amplitudes_and_roles
+    )
+    imaginary_axis_validation = None
+    if validation_reason is not None:
+        imaginary_step = step / 2.0
+        imaginary_samples = tuple(
+            sample_operation(
+                job,
+                baseline.omega,
+                amplitude,
+                readout_role=role,
+            )
+            for amplitude, role in (
+                (complex(0.0, imaginary_step), "coordinate-imaginary-plus-h2"),
+                (complex(0.0, -imaginary_step), "coordinate-imaginary-minus-h2"),
+            )
+        )
+        samples = (*samples, *imaginary_samples)
+    expected_contract = regularised_gsn_mechanism_contract(job.mechanism_id)
+    assert baseline.numerical_conditioning is not None
+    expected_branch_identity = baseline.numerical_conditioning.branch_convention
+    first = samples[0]
+    expected_samples = (*amplitudes_and_roles, *((
+        (complex(0.0, step / 2.0), "coordinate-imaginary-plus-h2"),
+        (complex(0.0, -step / 2.0), "coordinate-imaginary-minus-h2"),
+    ) if validation_reason is not None else ()))
+    for sample, (amplitude, role) in zip(samples, expected_samples):
+        if (
+            not isinstance(sample, FixedRootDeterminantSample)
+            or sample.omega != baseline.omega
+            or sample.amplitude != amplitude
+            or sample.readout_role != role
+            or not sample.branch_authenticated
+            or sample.branch_identity != expected_branch_identity
+            or sample.determinant_family != expected_contract["determinant_family"]
+            or sample.determinant_normalisation
+            != expected_contract["determinant_normalisation"]
+            or sample.precision_tier != first.precision_tier
+            or sample.working_precision_bits != first.working_precision_bits
+        ):
+            raise ValueError("fixed-root determinant sample binding is invalid")
+    unavailable_samples = tuple(
+        sample
+        for sample in samples
+        if sample.determinant_error_status != DETERMINANT_ERROR_AVAILABLE
+        or sample.determinant_error_model_id is None
+    )
+    if unavailable_samples:
+        return _validated_result(
+            backend,
+            job,
+            _unresolved_promoted_exterior_derivative(
+                job,
+                baseline,
+                {
+                    "conditioning_decision": {
+                        "accepted": False,
+                        "identity": FIXED_ROOT_DERIVATIVE_CONDITIONING_IDENTITY,
+                        "rejection_reason": "DETERMINANT_ERROR_MODEL_UNAVAILABLE",
+                        "selected_candidate": None,
+                    },
+                    "determinant_count": len(samples),
+                    "failure_code": "DETERMINANT_ERROR_MODEL_UNAVAILABLE",
+                    "fixed_root_samples": [
+                        sample.to_mapping() for sample in samples
+                    ],
+                    "math_review_blocker": (
+                        EXTERIOR_DETERMINANT_ERROR_MATH_REVIEW_BLOCKER
+                    ),
+                    "response_disk_identity": (
+                        EXTERIOR_DERIVATIVE_RESPONSE_DISK_IDENTITY
+                    ),
+                },
+            ),
+        )
+
+    coordinate_disk, coarse, fine, propagated_error, disagreement = (
+        _fixed_root_coordinate_derivative(samples[:4], step)
+    )
+    conditioning_decision = {
+        "accepted": abs(fine) > coordinate_disk.radius,
+        "identity": FIXED_ROOT_DERIVATIVE_CONDITIONING_IDENTITY,
+        "rejection_reason": None,
+        "selected_candidate": "h/2",
+    }
+    if not conditioning_decision["accepted"]:
+        conditioning_decision.update({
+            "rejection_reason": "DERIVATIVE_DISK_CONTAINS_ZERO",
+            "selected_candidate": None,
+        })
+        result = _unresolved_promoted_exterior_derivative(
+            job,
+            baseline,
+            {
+                "conditioning_decision": conditioning_decision,
+                "coordinate_derivative_disk": coordinate_disk.to_mapping(),
+                "determinant_count": len(samples),
+                "failure_code": "NO_ADMISSIBLE_FIXED_ROOT_DERIVATIVE_STEP",
+                "fixed_root_samples": [sample.to_mapping() for sample in samples],
+                "propagated_determinant_error_abs": propagated_error,
+                "raw_step_disagreement_abs": disagreement,
+                "response_disk_identity": EXTERIOR_DERIVATIVE_RESPONSE_DISK_IDENTITY,
+            },
+        )
+        return _validated_result(backend, job, result)
+    if validation_reason is not None:
+        imaginary_plus, imaginary_minus = samples[4:]
+        imaginary_step = step / 2.0
+        imaginary_derivative = (
+            imaginary_plus.determinant - imaginary_minus.determinant
+        ) / (2.0j * imaginary_step)
+        imaginary_error = (
+            imaginary_plus.determinant_error_abs
+            + imaginary_minus.determinant_error_abs
+        ) / (2.0 * imaginary_step)
+        axis_difference = abs(imaginary_derivative - fine)
+        agreement_radius = imaginary_error + coordinate_disk.radius
+        imaginary_axis_validation = {
+            "agrees": axis_difference <= agreement_radius,
+            "axis_difference_abs": axis_difference,
+            "derivative": _complex_mapping(imaginary_derivative),
+            "propagated_error_abs": imaginary_error,
+        }
+        if not imaginary_axis_validation["agrees"]:
+            raise ValueError("fixed-root derivative axes disagree")
+    frequency_radius = float(
+        frequency_authentication.propagated_error_abs
+        + frequency_authentication.step_disagreement_abs
+    )
+    if frequency_radius <= 0.0:
+        raise ValueError(
+            "promoted PRIMARY derivative lacks non-exact uncertainty"
+        )
+    frequency_disk = ComplexDisk(
+        complex(
+            float(frequency_authentication.derivative_re),
+            float(frequency_authentication.derivative_im),
+        ),
+        frequency_radius,
+    )
+    try:
+        response_disk = exterior_response_disk(
+            coordinate_derivative=coordinate_disk,
+            frequency_derivative=frequency_disk,
+        )
+    except ZeroContainingDiskError as error:
+        result = _unresolved_promoted_exterior_derivative(
+            job,
+            baseline,
+            {
+                "conditioning_decision": conditioning_decision,
+                "coordinate_derivative_disk": coordinate_disk.to_mapping(),
+                "determinant_count": len(samples),
+                "failure_code": "FREQUENCY_DERIVATIVE_DISK_CONTAINS_ZERO",
+                "fixed_root_samples": [sample.to_mapping() for sample in samples],
+                "response_disk_identity": EXTERIOR_DERIVATIVE_RESPONSE_DISK_IDENTITY,
+                "zero_containing_disk": error.disk_name,
+            },
+        )
+        return _validated_result(backend, job, result)
+    frequency_radius_provenance = {
+        "axis": frequency_authentication.axis,
+        "propagated_error_abs": str(
+            frequency_authentication.propagated_error_abs
+        ),
+        "selected_step": str(frequency_authentication.selected_step),
+        "step_disagreement_abs": str(
+            frequency_authentication.step_disagreement_abs
+        ),
+    }
+    derivative_evidence = {
+        "coordinate_derivative_disk": coordinate_disk.to_mapping(),
+        "conditioning_decision": conditioning_decision,
+        "coordinate_derivative_source": EXTERIOR_DERIVATIVE_METHOD,
+        "determinant_count": len(samples),
+        "fine_derivative": _complex_mapping(fine),
+        "fixed_root_samples": [sample.to_mapping() for sample in samples],
+        "frequency_derivative_disk": frequency_disk.to_mapping(),
+        "frequency_derivative_radius_provenance": frequency_radius_provenance,
+        "propagated_determinant_error_abs": propagated_error,
+        "raw_step_disagreement_abs": disagreement,
+        "real_h_derivative": _complex_mapping(coarse),
+        "response_disk": response_disk.to_mapping(),
+        "response_disk_identity": EXTERIOR_DERIVATIVE_RESPONSE_DISK_IDENTITY,
+        "selected_step": step / 2.0,
+        "shared_equation_source": True,
+        "imaginary_axis_validation": imaginary_axis_validation,
+        "validation_policy_identity": (
+            None
+            if validation_reason is None
+            else FIXED_ROOT_AXIS_VALIDATION_IDENTITY
+        ),
+        "validation_reason": validation_reason,
+    }
+    result = ComponentResult(
+        job_id=job.job_id,
+        leaf_id=job.leaf_id,
+        mechanism_id=job.mechanism_id,
+        status=ComponentStatus.CONVERGED,
+        convergence_basis="FIXED_ROOT_REAL_H_H2_DERIVATIVE_DISK",
+        response=response_disk.centre,
+        signed_root_crosscheck=None,
+        closed_form_response=None,
+        error_channels={
+            **{name: 0.0 for name in ERROR_CHANNELS},
+            "resolution": response_disk.radius,
+        },
+        baseline=baseline,
+        levels=(),
+        lineage={
+            **_result_lineage(job),
+            "component_scientific_identity": EXTERIOR_DERIVATIVE_COMPONENT_IDENTITY,
+        },
+        component_scientific_identity=EXTERIOR_DERIVATIVE_COMPONENT_IDENTITY,
+        response_method=EXTERIOR_DERIVATIVE_METHOD,
+        finite_amplitude_ladder_required=False,
+        finite_amplitude_ladder_executed=False,
+        finite_amplitude_readout_count=0,
+        response_uncertainty_status=BOUNDED_DERIVATIVE_RESPONSE,
+        error_channel_applicability={
+            name: name == "resolution" for name in ERROR_CHANNELS
+        },
+        derivative_evidence=derivative_evidence,
+    )
+    return _validated_result(backend, job, result)
+
+
 def _promoted_horizon_result(
     job: ResponseComponentJob,
     *,
     status: ComponentStatus,
     baseline: RootReadout,
-    response: complex | None,
+    response_disk: ComplexDisk | None,
+    evidence: Mapping[str, object],
 ) -> ComponentResult:
-    """Build honest evidence for one promoted horizon baseline readout."""
+    """Build bounded or explicitly unusable promoted horizon evidence."""
+
+    bounded = response_disk is not None
 
     return ComponentResult(
         job_id=job.job_id,
@@ -4208,32 +5700,48 @@ def _promoted_horizon_result(
             if status is ComponentStatus.CONVERGED
             else "UNRESOLVED"
         ),
-        response=response,
+        response=None if response_disk is None else response_disk.centre,
         signed_root_crosscheck=None,
-        closed_form_response=response,
-        error_channels={name: 0.0 for name in ERROR_CHANNELS},
+        closed_form_response=(
+            None if response_disk is None else response_disk.centre
+        ),
+        error_channels={
+            **{name: 0.0 for name in ERROR_CHANNELS},
+            "resolution": 0.0 if response_disk is None else response_disk.radius,
+        },
         baseline=baseline,
         levels=(),
         lineage={
             **_result_lineage(job),
             "component_scientific_identity": (
-                PROMOTED_HORIZON_COMPONENT_IDENTITY
+                PROMOTED_HORIZON_COMPONENT_V2_IDENTITY
             ),
         },
-        component_scientific_identity=PROMOTED_HORIZON_COMPONENT_IDENTITY,
-        response_method=PROMOTED_HORIZON_RESPONSE_METHOD,
+        component_scientific_identity=(
+            PROMOTED_HORIZON_COMPONENT_V2_IDENTITY
+        ),
+        response_method=(
+            PROMOTED_HORIZON_RESPONSE_METHOD_V2
+        ),
         finite_amplitude_ladder_required=False,
         finite_amplitude_ladder_executed=False,
         finite_amplitude_readout_count=0,
-        response_uncertainty_status=UNCALIBRATED_ANALYTIC_RESPONSE,
-        error_channel_applicability={name: False for name in ERROR_CHANNELS},
+        response_uncertainty_status=(
+            BOUNDED_ANALYTIC_RESPONSE
+            if bounded
+            else UNBOUNDED_ANALYTIC_RESPONSE
+        ),
+        error_channel_applicability={
+            name: bounded and name == "resolution" for name in ERROR_CHANNELS
+        },
+        analytic_horizon_evidence=evidence,
     )
 
 
 def _validate_promoted_horizon_baseline(
     job: ResponseComponentJob,
     baseline: RootReadout,
-) -> None:
+) -> DerivativeAuthenticationEvidence:
     """Re-check operator-validated single-readout evidence before using it."""
 
     if baseline.promoted_root_readout_policy != PROMOTED_ROOT_READOUT_POLICY:
@@ -4245,6 +5753,11 @@ def _validate_promoted_horizon_baseline(
         raise ValueError("promoted baseline PRIMARY evidence was rejected")
     if primary.post_newton_determinant_count != 0:
         raise ValueError("promoted PRIMARY performed post-Newton determinants")
+    derivative_authentication = primary.derivative_authentication
+    if derivative_authentication is None:
+        raise ValueError(
+            "promoted PRIMARY derivative-specific uncertainty evidence is missing"
+        )
     if baseline.seed_path_required is not False:
         raise ValueError("promoted SEED-PATH must not be required")
     if baseline.seed_path_executed is not False:
@@ -4282,6 +5795,7 @@ def _validate_promoted_horizon_baseline(
         raise ValueError("promoted horizon determinant convention is invalid")
     if baseline.branch_id != job.root.branch_id:
         raise ValueError("promoted baseline branch identity is invalid")
+    return derivative_authentication
 
 
 def run_promoted_horizon_component(
@@ -4296,8 +5810,13 @@ def run_promoted_horizon_component(
     its retained complex PRIMARY derivative supplies the implicit response.
     """
 
-    if job.role != "primary" or job.mechanism_id != "horizon-admittance":
-        raise ValueError("promoted component runner requires a primary horizon job")
+    if (
+        job.role not in {"primary", "deep"}
+        or job.mechanism_id != "horizon-admittance"
+    ):
+        raise ValueError(
+            "promoted component runner requires a promoted horizon job"
+        )
     if not math.isfinite(job.spin) or abs(job.spin) >= 1.0:
         raise ValueError(
             "promoted horizon Kerr spin must be finite and subextremal"
@@ -4342,26 +5861,15 @@ def run_promoted_horizon_component(
         return _validated_result(
             backend,
             job,
-            _promoted_horizon_result(
-                job,
-                status=initial_status,
-                baseline=baseline,
-                response=None,
-            ),
+            _unresolved_result(job, initial_status, baseline, ()),
         )
 
-    _validate_promoted_horizon_baseline(job, baseline)
+    derivative_authentication = _validate_promoted_horizon_baseline(job, baseline)
     primary = baseline.primary_acceptance
     assert primary is not None
-    derivative = primary.derivative
-    if (
-        not derivative.real.is_finite()
-        or not derivative.imaginary.is_finite()
-    ):
-        raise ValueError("promoted PRIMARY derivative must be finite")
     derivative_complex = complex(
-        float(derivative.real),
-        float(derivative.imaginary),
+        float(derivative_authentication.derivative_re),
+        float(derivative_authentication.derivative_im),
     )
     if derivative_complex == 0.0j or not (
         math.isfinite(derivative_complex.real)
@@ -4374,14 +5882,93 @@ def run_promoted_horizon_component(
     )
     omega_h = job.spin / (2.0 * horizon_radius)
     horizon_frequency = baseline.omega - job.mode.m * omega_h
-    if horizon_frequency == 0.0j or not (
-        math.isfinite(horizon_frequency.real)
-        and math.isfinite(horizon_frequency.imag)
-    ):
-        raise ValueError("promoted horizon frequency must be finite and nonzero")
-    response = 1.0 / (2.0j * horizon_frequency * derivative_complex)
-    if not math.isfinite(response.real) or not math.isfinite(response.imag):
-        raise ValueError("promoted analytic horizon response is nonfinite")
+    correction_evidence = {
+        "PRIMARY": primary.correction_abs,
+        **{
+            phase.upper(): baseline.diagnostic_readouts[phase]
+            .fixed_root_evidence.correction_abs
+            for phase in ("truncation", "resolution")
+        },
+    }
+    arithmetic_radius = (
+        math.ulp(baseline.omega.real)
+        + math.ulp(baseline.omega.imag)
+        + abs(job.mode.m) * math.ulp(omega_h)
+    )
+    root_radius = max(float(value) for value in correction_evidence.values())
+    horizon_frequency_disk = ComplexDisk(
+        horizon_frequency,
+        root_radius + arithmetic_radius,
+    )
+    primary_derivative_radius = float(
+        derivative_authentication.propagated_error_abs
+        + derivative_authentication.step_disagreement_abs
+    )
+    if primary_derivative_radius <= 0.0:
+        raise ValueError("promoted PRIMARY derivative uncertainty is not bounded")
+    derivative_radius = primary_derivative_radius
+    comparison_mapping = None
+    comparison_operation = getattr(
+        backend, "promoted_derivative_comparison", None
+    )
+    if callable(comparison_operation):
+        comparison = comparison_operation(job, baseline)
+        if not isinstance(comparison, ComplexDisk):
+            raise ValueError("promoted derivative comparison is invalid")
+        derivative_radius = max(
+            derivative_radius,
+            abs(comparison.centre - derivative_complex) + comparison.radius,
+        )
+        comparison_mapping = comparison.to_mapping()
+    derivative_disk = ComplexDisk(derivative_complex, derivative_radius)
+    evidence = {
+        "derivative_disk": derivative_disk.to_mapping(),
+        "derivative_radius_provenance": {
+            "axis": derivative_authentication.axis,
+            "independent_comparison": comparison_mapping,
+            "independent_comparison_omitted_reason": (
+                None
+                if comparison_mapping is not None
+                else "NOT_SELECTED_BY_RISK_POLICY"
+            ),
+            "propagated_error_abs": str(
+                derivative_authentication.propagated_error_abs
+            ),
+            "selected_step": str(derivative_authentication.selected_step),
+            "step_disagreement_abs": str(
+                derivative_authentication.step_disagreement_abs
+            ),
+        },
+        "horizon_frequency_disk": horizon_frequency_disk.to_mapping(),
+        "response_disk": None,
+        "root_radius_provenance": {
+            "arithmetic_radius_abs": arithmetic_radius,
+            "correction_abs": {
+                key: str(value) for key, value in correction_evidence.items()
+            },
+            "union_rule": "max-accepted-correction-plus-arithmetic/v1",
+        },
+        "uncertainty_derivation_identity": (
+            PROMOTED_HORIZON_UNCERTAINTY_DERIVATION_IDENTITY
+        ),
+        "zero_containing_disk": None,
+    }
+    try:
+        response_disk = horizon_response_disk(
+            horizon_frequency=horizon_frequency_disk,
+            determinant_derivative=derivative_disk,
+        )
+    except ZeroContainingDiskError as error:
+        evidence["zero_containing_disk"] = error.disk_name
+        result = _promoted_horizon_result(
+            job,
+            status=ComponentStatus.DERIVATIVE_UNRESOLVED,
+            baseline=baseline,
+            response_disk=None,
+            evidence=evidence,
+        )
+        return _validated_result(backend, job, result)
+    evidence["response_disk"] = response_disk.to_mapping()
 
     return _validated_result(
         backend,
@@ -4390,7 +5977,8 @@ def run_promoted_horizon_component(
             job,
             status=ComponentStatus.CONVERGED,
             baseline=baseline,
-            response=response,
+            response_disk=response_disk,
+            evidence=evidence,
         ),
     )
 
@@ -4516,29 +6104,46 @@ def _recover_resolved_window(
     limited.
     """
 
-    runs = [
-        run
-        for run in _resolved_level_runs(job, levels)
-        if len(run) >= LADDER_WINDOW_MINIMUM_LEVELS
-    ]
-    if not runs:
-        return None
-    run = runs[-1]
-    for size in range(len(run), LADDER_WINDOW_MINIMUM_LEVELS - 1, -1):
-        window = run[:size]
+    ordered = tuple(sorted(levels, key=lambda level: level.epsilon, reverse=True))
+    candidates: list[tuple[list[LadderLevel], _LadderVerdict]] = []
+    for raw_window in consecutive_windows(
+        ordered, LADDER_WINDOW_MINIMUM_LEVELS
+    ):
+        window = list(raw_window)
+        if not all(
+            level.signal_resolved(job.policy.signal_to_root_factor)
+            for level in window
+        ):
+            continue
         verdict = _evaluate_ladder_window(job, window)
         if verdict.outcome == "converged":
-            return window, verdict
-    return None
+            candidates.append((window, verdict))
+    if not candidates:
+        return None
+    # Finest admissible window first; equal fine endpoints prefer the shorter
+    # certificate and then the coarser start. Every window reached the existing
+    # signal, branch, axis, order, even-remainder, and diagnostic gates above.
+    return min(
+        candidates,
+        key=lambda item: (
+            item[0][-1].epsilon,
+            len(item[0]),
+            -item[0][0].epsilon,
+        ),
+    )
 
 
 def _resolved_window_record(
+    job: ResponseComponentJob,
     levels: Sequence[LadderLevel],
     window: Sequence[LadderLevel],
     policy: str = RESOLVED_WINDOW_RECOVERY_POLICY,
 ) -> dict[str, object]:
     included = {level.epsilon for level in window}
+    recovery = _response_ladder_recovery(job, levels)
+    record = _response_ladder_recovery_record(job, levels, recovery)
     return {
+        **record,
         "policy": policy,
         "included_epsilons": [level.epsilon for level in window],
         "excluded_epsilons": [
@@ -4548,13 +6153,163 @@ def _resolved_window_record(
     }
 
 
-def _expansion_epsilons(policy: NumericalPolicy) -> tuple[float, ...]:
+def _recovery_precision_tier(readout: RootReadout) -> PrecisionTier:
+    receipt = readout.worker_response_receipt
+    request = None if receipt is None else receipt.get("request_binding")
+    if isinstance(request, Mapping):
+        raw = request.get("semantic_precision_tier")
+        if isinstance(raw, str):
+            return precision_tier(raw)
+    return PrecisionTier.BINARY64
+
+
+def _response_ladder_recovery(
+    job: ResponseComponentJob,
+    levels: Sequence[LadderLevel],
+) -> LadderRecoveryResult:
+    converted = tuple(
+        RecoveryLadderLevel.from_signed_readouts(
+            epsilon=level.epsilon,
+            real_plus=RecoveryLadderReadout(
+                level.real_plus.omega,
+                level.real_plus.newton_correction_estimate,
+                _identity_status(job, level.real_plus) is None,
+                level.real_plus.converged,
+                _recovery_precision_tier(level.real_plus),
+            ),
+            real_minus=RecoveryLadderReadout(
+                level.real_minus.omega,
+                level.real_minus.newton_correction_estimate,
+                _identity_status(job, level.real_minus) is None,
+                level.real_minus.converged,
+                _recovery_precision_tier(level.real_minus),
+            ),
+            imaginary_plus=RecoveryLadderReadout(
+                level.imaginary_plus.omega,
+                level.imaginary_plus.newton_correction_estimate,
+                _identity_status(job, level.imaginary_plus) is None,
+                level.imaginary_plus.converged,
+                _recovery_precision_tier(level.imaginary_plus),
+            ),
+            imaginary_minus=RecoveryLadderReadout(
+                level.imaginary_minus.omega,
+                level.imaginary_minus.newton_correction_estimate,
+                _identity_status(job, level.imaginary_minus) is None,
+                level.imaginary_minus.converged,
+                _recovery_precision_tier(level.imaginary_minus),
+            ),
+        )
+        for level in levels
+    )
+    return recover_response_ladder(
+        converted,
+        policy=RecoveryLadderPolicy(
+            signal_factor=job.policy.signal_to_root_factor,
+            minimum_window=LADDER_WINDOW_MINIMUM_LEVELS,
+            maximum_epsilon=0.032 if job.mode.ell == 4 else 0.016,
+            required_order=2.0,
+            order_tolerance=job.policy.order_tolerance,
+            axis_tolerance_factor=job.policy.axis_tolerance_factor,
+            even_remainder_factor=job.policy.even_order_tolerance,
+        ),
+    )
+
+
+def _response_ladder_recovery_record(
+    job: ResponseComponentJob,
+    levels: Sequence[LadderLevel],
+    recovery: LadderRecoveryResult,
+) -> dict[str, object]:
+    candidate_windows = [
+        {
+            "epsilons": list(window.epsilons),
+            "signal_noise_ratios": [
+                {
+                    "epsilon": item.epsilon,
+                    "real": item.real_signal_ratio,
+                    "imaginary": item.imaginary_signal_ratio,
+                    "signal_ok": item.signal_ok,
+                }
+                for item in window.levels
+            ],
+            "real_order": window.real_order,
+            "imaginary_order": window.imaginary_order,
+            "real_order_ok": window.real_order_ok,
+            "imaginary_order_ok": window.imaginary_order_ok,
+            "axis_ok": window.axis_ok,
+            "even_remainder_ok": window.even_remainder_ok,
+            "branch_ok": window.branch_ok,
+            "diagnostic_ok": window.diagnostic_ok,
+            "reasons": list(window.reasons),
+        }
+        for window in recovery.candidate_windows
+    ]
+    branch_radius = mode_specific_branch_enclosure_radius(job.root)
+    branch_margins = []
+    for level in levels:
+        for role, readout in (
+            ("real_plus", level.real_plus),
+            ("real_minus", level.real_minus),
+            ("imaginary_plus", level.imaginary_plus),
+            ("imaginary_minus", level.imaginary_minus),
+        ):
+            branch_margins.append({
+                "epsilon": level.epsilon,
+                "readout_role": role,
+                "margin_abs": branch_radius - abs(readout.omega - job.root.omega),
+            })
+    promotion_plan = [
+        {"epsilon": epsilon, "readout_role": role}
+        for epsilon, role in recovery.readouts_to_promote
+    ]
+    return {
+        "recovery_disposition": recovery.disposition.value,
+        "candidate_windows": candidate_windows,
+        "signal_noise_ratios": [
+            item for window in candidate_windows
+            for item in window["signal_noise_ratios"]
+        ],
+        "selected_window": (
+            None
+            if recovery.selected_window is None
+            else list(recovery.selected_window.epsilons)
+        ),
+        "excluded_fine_levels": [
+            {"epsilon": item.epsilon, "reasons": list(item.reasons)}
+            for item in recovery.excluded_fine_levels
+        ],
+        "window_diagnostics": candidate_windows,
+        "branch_margins": branch_margins,
+        "exact_added_epsilons": sorted(
+            level.epsilon
+            for level in levels
+            if level.epsilon not in job.policy.epsilons
+        ),
+        "amplitudes_to_add": list(recovery.amplitudes_to_add),
+        "readout_specific_promotion_plan": promotion_plan,
+        "next_precision_tier": (
+            None
+            if recovery.next_precision_tier is None
+            else recovery.next_precision_tier.value
+        ),
+        "promoted_readout_count_by_tier": (
+            {}
+            if recovery.next_precision_tier is None
+            else {recovery.next_precision_tier.value: len(promotion_plan)}
+        ),
+    }
+
+
+def _expansion_epsilons(job: ResponseComponentJob) -> tuple[float, ...]:
     """Amplitudes coarser than any the policy declares, coarsest last."""
 
-    coarsest = policy.epsilons[0]
+    coarsest = job.policy.epsilons[0]
+    maximum = 0.032 if job.mode.ell == 4 else 0.016
     return tuple(
         coarsest * (AMPLITUDE_EXPANSION_GROWTH ** (index + 1))
         for index in range(AMPLITUDE_EXPANSION_MAXIMUM_LEVELS)
+        if coarsest * (AMPLITUDE_EXPANSION_GROWTH ** (index + 1))
+        <= maximum * (1.0 + 1.0e-12)
     )
 
 
@@ -4583,7 +6338,7 @@ def _expand_amplitude_ladder(
     record_rays(levels[0])
     factor = job.policy.signal_to_root_factor
     expansion: list[LadderLevel] = []
-    for epsilon in _expansion_epsilons(job.policy):
+    for epsilon in _expansion_epsilons(job):
         level = build_level(epsilon)
         for readout in (
             level.real_plus,
@@ -4611,6 +6366,9 @@ def _expand_amplitude_ladder(
                 reverse=True,
             )
             return combined, window, verdict
+    if isinstance(levels, list):
+        levels.extend(expansion)
+        levels.sort(key=lambda item: item.epsilon, reverse=True)
     return None
 
 
@@ -4618,9 +6376,24 @@ def run_component(
     job: ResponseComponentJob,
     backend: RootReadoutBackend,
     response_predictor: complex | None = None,
+    *,
+    _promoted_validation_policy: Mapping[str, str] | None = None,
 ) -> ComponentResult:
     """Run one job through same-equation zero and complex signed amplitudes."""
 
+    if getattr(backend, "promoted_precision_backend", False):
+        if (
+            _promoted_validation_policy is None
+            or dict(_promoted_validation_policy)
+            != full_ladder_validation_policy(
+                _promoted_validation_policy.get("reason", "")
+            )
+        ):
+            raise ValueError(
+                "promoted backend requires explicit full-ladder validation"
+            )
+    elif _promoted_validation_policy is not None:
+        raise ValueError("full-ladder validation token requires promoted backend")
     if backend.identity != job.backend_identity:
         raise ValueError("response backend identity does not match job")
     if response_predictor is not None:
@@ -4633,6 +6406,7 @@ def run_component(
     binder = getattr(backend, "bind_job", None)
     if binder is not None:
         job = binder(job)
+    journaled_reads = _generic_component_journal(job, backend)
     readout_index = 0
 
     def read_root(
@@ -4657,26 +6431,35 @@ def run_component(
         ):
             started = time.monotonic()
             emit_progress(ProgressEventKind.AMPLITUDE_READOUT_STARTED)
-            read_with_kind = getattr(
-                backend, "read_root_with_predictor_kind", None
-            )
-            if (
-                primary_predictor is not None
-                and primary_predictor_kind is not None
-                and callable(read_with_kind)
-            ):
-                result = read_with_kind(
+            if journaled_reads is not None:
+                result = journaled_reads.read_root(
                     job,
+                    role,
                     converted,
                     primary_predictor,
                     primary_predictor_kind,
                 )
             else:
-                result = backend.read_root(
-                    job,
-                    converted,
-                    primary_predictor=primary_predictor,
+                read_with_kind = getattr(
+                    backend, "read_root_with_predictor_kind", None
                 )
+                if (
+                    primary_predictor is not None
+                    and primary_predictor_kind is not None
+                    and callable(read_with_kind)
+                ):
+                    result = read_with_kind(
+                        job,
+                        converted,
+                        primary_predictor,
+                        primary_predictor_kind,
+                    )
+                else:
+                    result = backend.read_root(
+                        job,
+                        converted,
+                        primary_predictor=primary_predictor,
+                    )
             emit_progress(
                 ProgressEventKind.AMPLITUDE_READOUT_COMPLETED,
                 current_omega={
@@ -4790,17 +6573,24 @@ def run_component(
         if verdict.outcome == "unresolved":
             assert verdict.status is not None
             if verdict.status is not ComponentStatus.NOISE_FLOOR:
-                return _validated_result(
-                    backend,
-                    job,
-                    _unresolved_result(job, verdict.status, baseline, levels),
-                )
+                preliminary_recovery = _response_ladder_recovery(job, levels)
+                if preliminary_recovery.disposition not in {
+                    RecoveryDisposition.EXPAND_AMPLITUDE,
+                    RecoveryDisposition.PROMOTE_READOUTS,
+                }:
+                    return _validated_result(
+                        backend,
+                        job,
+                        _unresolved_result(job, verdict.status, baseline, levels),
+                    )
+                pending_status = verdict.status
+                break
             recovery = _recover_resolved_window(job, levels)
             if recovery is None:
                 pending_status = ComponentStatus.NOISE_FLOOR
                 break
             window, verdict = recovery
-            resolved_window = _resolved_window_record(levels, window)
+            resolved_window = _resolved_window_record(job, levels, window)
         else:
             window = list(levels)
         real_estimate = verdict.real_estimate
@@ -4823,14 +6613,21 @@ def run_component(
             job, levels, build_level, record_rays
         )
         if expansion is None:
+            recovery = _response_ladder_recovery(job, levels)
+            recovery_record = _response_ladder_recovery_record(
+                job, levels, recovery
+            )
+            unresolved = _unresolved_result(
+                job, pending_status, baseline, levels
+            )
             return _validated_result(
                 backend,
                 job,
-                _unresolved_result(job, pending_status, baseline, levels),
+                replace(unresolved, resolved_window=recovery_record),
             )
         levels, window, verdict = expansion
         resolved_window = _resolved_window_record(
-            levels, window, AMPLITUDE_EXPANSION_RECOVERY_POLICY
+            job, levels, window, AMPLITUDE_EXPANSION_RECOVERY_POLICY
         )
         real_estimate = verdict.real_estimate
         imaginary_estimate = verdict.imaginary_estimate
@@ -4876,15 +6673,27 @@ def run_component(
     if not live_diagnostics and any(item.diagnostic_readouts for item in signed_readouts):
         raise ValueError("signed diagnostic root evidence is incomplete")
     if live_diagnostics:
-        diagnostic_families = tuple(signed_readouts[0].diagnostic_readouts)
-        if any(
-            tuple(item.diagnostic_readouts) != diagnostic_families
-            for item in signed_readouts[1:]
-        ) or frozenset(diagnostic_families) not in {
+        family_sets = tuple(
+            frozenset(item.diagnostic_readouts) for item in signed_readouts
+        )
+        allowed_family_sets = {
             frozenset(_DIAGNOSTIC_ROOT_FAMILIES),
             frozenset(_PROMOTED_FIXED_ROOT_DIAGNOSTIC_FAMILIES),
-        }:
+        }
+        if (
+            any(families not in allowed_family_sets for families in family_sets)
+            or (
+                len(set(family_sets)) > 1
+                and not getattr(
+                    backend, "selective_readout_promotion_backend", False
+                )
+            )
+        ):
             raise ValueError("signed diagnostic root families are inconsistent")
+        diagnostic_families = tuple(
+            family for family in _DIAGNOSTIC_ROOT_FAMILIES
+            if all(family in families for families in family_sets)
+        )
         diagnostic_channels = {
             family: _diagnostic_response_channel(
                 window,
@@ -4927,6 +6736,298 @@ def run_component(
             resolved_window=resolved_window,
         ),
     )
+
+
+class _SelectiveReadoutPromotionBackend:
+    """Replay retained roots and execute only explicitly promoted readouts."""
+
+    selective_readout_promotion_backend = True
+
+    def __init__(
+        self,
+        previous: ComponentResult,
+        promoted_backend: RootReadoutBackend,
+        planned: frozenset[complex],
+    ) -> None:
+        self.identity = promoted_backend.identity
+        self._promoted_backend = promoted_backend
+        self._planned = planned
+        self._executed: set[complex] = set()
+        retained: dict[complex, RootReadout] = {0.0j: previous.baseline}
+        for level in previous.levels:
+            retained.update({
+                complex(level.epsilon, 0.0): level.real_plus,
+                complex(-level.epsilon, 0.0): level.real_minus,
+                complex(0.0, level.epsilon): level.imaginary_plus,
+                complex(0.0, -level.epsilon): level.imaginary_minus,
+            })
+        self._retained = retained
+        self._promotion_predictors = {
+            value: readout.omega for value, readout in retained.items()
+        }
+        self.executed_precision_tier = precision_tier(
+            f"bigfloat-{getattr(promoted_backend, 'digits')}"
+        )
+        self.journal_component_identity = (
+            "selective-signed-root-promotion-component/v1/"
+            f"{self.executed_precision_tier.value}"
+        )
+
+    @staticmethod
+    def _role(value: complex) -> str:
+        if value.real > 0.0:
+            return "real-plus"
+        if value.real < 0.0:
+            return "real-minus"
+        if value.imag > 0.0:
+            return "imaginary-plus"
+        if value.imag < 0.0:
+            return "imaginary-minus"
+        return "baseline"
+
+    def execute_all(
+        self,
+        job: ResponseComponentJob,
+        journaled: _JournaledComponentReads | None = None,
+    ) -> None:
+        for value in sorted(
+            self._planned, key=lambda item: (-abs(item), item.real, item.imag)
+        ):
+            retained = self._retained.get(value)
+            if retained is None:
+                raise ValueError("selective promotion requested an unknown retained readout")
+            if journaled is None:
+                output = self.read_root(job, value)
+            else:
+                output = journaled.read_root(
+                    job,
+                    self._role(value),
+                    value,
+                    retained.omega,
+                    None,
+                )
+            self._retained[value] = output
+            self._executed.add(value)
+
+    def read_root(self, job, amplitude, primary_predictor=None) -> RootReadout:
+        value = complex(amplitude)
+        retained = self._retained.get(value)
+        if retained is None:
+            raise ValueError("selective promotion requested an unplanned amplitude")
+        if value not in self._planned or value in self._executed:
+            return retained
+        return self._promoted_backend.read_root(
+            job, value, primary_predictor=retained.omega
+        )
+
+    def read_root_with_predictor_kind(
+        self, job, amplitude, primary_predictor, primary_predictor_kind
+    ) -> RootReadout:
+        return self.read_root(job, amplitude)
+
+    def preview_root_request(
+        self, job, amplitude, primary_predictor=None,
+        primary_predictor_kind=None, readout_role=None,
+    ) -> dict[str, object]:
+        value = complex(amplitude)
+        retained = self._retained.get(value)
+        if value in self._planned and retained is not None:
+            preview = getattr(self._promoted_backend, "preview_root_request", None)
+            if callable(preview):
+                return preview(
+                    job,
+                    value,
+                    self._promotion_predictors[value],
+                    None,
+                    readout_role,
+                )
+        return {
+            "schema": "windows-solver.retained-root-readout-request/1",
+            "job": job.to_mapping(),
+            "backend_identity_sha256": self.identity.identity_sha256,
+            "policy_sha256": job.policy.identity_sha256,
+            "readout_role": readout_role,
+            "amplitude": _complex_mapping(value),
+            "retained_root": None if retained is None else retained.to_mapping(),
+        }
+
+    def precision_tier_for_request(self, role, amplitude) -> PrecisionTier:
+        return (
+            self.executed_precision_tier
+            if complex(amplitude) in self._planned
+            else PrecisionTier.BINARY64
+        )
+
+    def closed_form_horizon_response(self, job) -> complex | None:
+        return None
+
+
+def run_selective_readout_promotion(
+    job: ResponseComponentJob,
+    previous: ComponentResult,
+    promoted_backend: RootReadoutBackend,
+    response_predictor: complex | None = None,
+) -> ComponentResult:
+    """Promote only recovery-plan roots, retaining all other ladder evidence."""
+
+    recovery = previous.resolved_window
+    if not isinstance(recovery, Mapping):
+        raise ValueError("selective promotion requires resolved-window evidence")
+    plan = recovery.get("readout_specific_promotion_plan")
+    next_tier = recovery.get("next_precision_tier")
+    if not isinstance(plan, list) or not plan or not isinstance(next_tier, str):
+        raise ValueError("selective promotion plan is invalid")
+    expected_tier = precision_tier(next_tier)
+    actual_tier = precision_tier(f"bigfloat-{getattr(promoted_backend, 'digits')}")
+    if actual_tier is not expected_tier:
+        raise ValueError("selective promotion precision tier is invalid")
+    role_to_amplitude = {
+        "real_plus": lambda epsilon: complex(epsilon, 0.0),
+        "real_minus": lambda epsilon: complex(-epsilon, 0.0),
+        "imaginary_plus": lambda epsilon: complex(0.0, epsilon),
+        "imaginary_minus": lambda epsilon: complex(0.0, -epsilon),
+    }
+    amplitudes: set[complex] = set()
+    for item in plan:
+        if not isinstance(item, Mapping) or set(item) != {"epsilon", "readout_role"}:
+            raise ValueError("selective promotion work item is invalid")
+        role = item["readout_role"]
+        if role not in role_to_amplitude:
+            raise ValueError("selective promotion readout role is invalid")
+        amplitudes.add(role_to_amplitude[role](float(item["epsilon"])))
+    selective = _SelectiveReadoutPromotionBackend(
+        previous, promoted_backend, frozenset(amplitudes)
+    )
+    journaled = _generic_component_journal(job, selective)
+    selective._component_journal = journaled
+    selective.execute_all(job, journaled)
+    result = run_component(job, selective, response_predictor)
+    scientific_runtime_provider = getattr(
+        promoted_backend, "scientific_runtime_for", None
+    )
+    scientific_runtime = (
+        scientific_runtime_provider(job)
+        if callable(scientific_runtime_provider)
+        else None
+    )
+    journal_evidence: dict[str, object] = {
+        "schema": "windows-solver.selective-tier-journal-evidence/1",
+        "configured": journaled is not None,
+        "component_identity": selective.journal_component_identity,
+        "precision_tier": actual_tier.value,
+    }
+    if journaled is not None:
+        promoted_work_unit_ids = tuple(
+            unit.work_unit_id
+            for (_, amplitude), unit in journaled.units.items()
+            if amplitude in amplitudes
+        )
+        promoted_entries = {
+            work_unit_id: journaled.journal.entries[work_unit_id]
+            for work_unit_id in promoted_work_unit_ids
+        }
+        journal_mapping = PartialComponentJournal(
+            journaled.journal.path,
+            promoted_work_unit_ids,
+            promoted_entries,
+        ).to_mapping()
+        ode_error_budgets = []
+        for work_unit_id in promoted_work_unit_ids:
+            entry = journaled.journal.entries.get(work_unit_id)
+            wrapper = None if entry is None else entry.worker_response_receipt
+            output = None if wrapper is None else wrapper.get("output")
+            root_receipt = (
+                output.get("worker_response_receipt")
+                if isinstance(output, Mapping)
+                else None
+            )
+            request = (
+                root_receipt.get("request_binding")
+                if isinstance(root_receipt, Mapping)
+                else None
+            )
+            policy = request.get("policy") if isinstance(request, Mapping) else None
+            budget = (
+                policy.get("ode_error_budget")
+                if isinstance(policy, Mapping)
+                else None
+            )
+            if isinstance(budget, Mapping):
+                ode_error_budgets.append(_journal_json_value(budget))
+        ode_error_budget = (
+            ode_error_budgets[0]
+            if ode_error_budgets
+            and all(item == ode_error_budgets[0] for item in ode_error_budgets)
+            else None
+        )
+        journal_evidence.update({
+            "journal": journal_mapping,
+            "journal_sha256": journal_mapping["journal_sha256"],
+            "promoted_work_unit_ids": list(promoted_work_unit_ids),
+            "scientific_runtime": scientific_runtime,
+            "scientific_runtime_sha256": (
+                None
+                if not isinstance(scientific_runtime, Mapping)
+                else _sha256(dict(scientific_runtime))
+            ),
+            "ode_error_budget": ode_error_budget,
+            "ode_error_budget_sha256": (
+                None if ode_error_budget is None else _sha256(ode_error_budget)
+            ),
+        })
+    result_window = dict(result.resolved_window or {})
+    previous_window = dict(previous.resolved_window or {})
+    promoted_counts = dict(
+        previous_window.get("promoted_readout_count_by_tier", {})
+    )
+    promoted_counts[actual_tier.value] = len(amplitudes)
+    retained_counts = {
+        PrecisionTier.BINARY64.value: 1 + 4 * len(previous.levels)
+    }
+    retained_counts.update({
+        tier: count
+        for tier, count in promoted_counts.items()
+        if tier != actual_tier.value
+    })
+    prior_evidence = list(
+        previous_window.get("prior_tier_recovery_evidence", [])
+    )
+    if previous_window.get("executed_precision_tier") is not None:
+        prior_evidence.append({
+            "executed_precision_tier": previous_window["executed_precision_tier"],
+            "executed_readout_specific_promotion_plan": [
+                dict(item) for item in previous_window.get(
+                    "executed_readout_specific_promotion_plan", []
+                )
+            ],
+            "promoted_readout_count_by_tier": dict(
+                previous_window.get("promoted_readout_count_by_tier", {})
+            ),
+            "journal_evidence": dict(
+                previous_window.get("journal_evidence", {})
+            ),
+            "status": previous.status.value,
+        })
+    result_window.update({
+        "selective_promotion_policy": "readout-specific-semantic-tier/v1",
+        "executed_precision_tier": actual_tier.value,
+        "executed_readout_specific_promotion_plan": [dict(item) for item in plan],
+        "promoted_readout_count_by_tier": promoted_counts,
+        "retained_readout_count_by_tier": retained_counts,
+        "prior_tier_recovery_evidence": prior_evidence,
+        "journal_evidence": journal_evidence,
+    })
+    if result.status is not ComponentStatus.CONVERGED:
+        result_window["next_precision_tier"] = {
+            PrecisionTier.BIGFLOAT_40: PrecisionTier.BIGFLOAT_80.value,
+            PrecisionTier.BIGFLOAT_80: PrecisionTier.BIGFLOAT_120.value,
+            PrecisionTier.BIGFLOAT_120: None,
+        }[actual_tier]
+        if not result_window.get("readout_specific_promotion_plan"):
+            result_window["readout_specific_promotion_plan"] = [
+                dict(item) for item in plan
+            ]
+    return replace(result, resolved_window=result_window)
 
 
 def _runtime_fingerprint() -> str:

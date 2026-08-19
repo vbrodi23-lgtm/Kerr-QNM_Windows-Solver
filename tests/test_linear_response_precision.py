@@ -60,6 +60,7 @@ from windows_solver.response_engine import (
 from windows_solver.solved_leaf_cache import SolvedLeafStore
 from tests.fixtures import (
     control_failure_stage,
+    synthetic_ode_error_budget,
     valid_control_failure_diagnostics,
     valid_numerical_conditioning,
 )
@@ -1261,7 +1262,8 @@ class PrimaryPrecisionTests(unittest.TestCase):
                 "derivative_requirement": "finite_strictly_positive",
                 "promoted": {
                     "policy_id": (
-                        "binary64-parity-primary-fixed-root-diagnostics/v1"
+                        "binary64-parity-primary-fixed-root-diagnostics-"
+                        "frequency-disk/v2"
                     ),
                     "required_phases": [
                         "PRIMARY",
@@ -1633,7 +1635,10 @@ class PromotedResourceContainmentTests(unittest.TestCase):
                 "failure_code": failure_code,
                 "failure_class": "CONTROL",
                 "retryable": (
-                    failure_code == "INSUFFICIENT_ASYMPTOTIC_PRECISION"
+                    failure_code in {
+                        "INSUFFICIENT_ASYMPTOTIC_PRECISION",
+                        "HORIZON_ARITHMETIC_INADEQUATE",
+                    }
                     if error_class is julia_backend.JuliaNumericalControlError
                     else True
                 ),
@@ -1676,6 +1681,9 @@ class PromotedResourceContainmentTests(unittest.TestCase):
                 object(),
                 precision_digits,
                 refinement=0,
+                ode_error_budget=synthetic_ode_error_budget(
+                    precision_digits
+                ),
             )._request(leaf.job, 0.0j)
             request_sha256 = hashlib.sha256(
                 canonical_json_bytes(request_binding)
@@ -1730,6 +1738,20 @@ class PromotedResourceContainmentTests(unittest.TestCase):
                     raise failure
                 return _authenticated_primary_stage(
                     leaf, digits, ComponentStatus.CONVERGED
+                )
+
+            def execute_promoted_stage_after_endpoint_arithmetic(
+                self, leaf, digits, predecessor
+            ):
+                self.calls.append((leaf.leaf_id, digits))
+                if failure_code != "HORIZON_ARITHMETIC_INADEQUATE":
+                    raise AssertionError("unexpected endpoint arithmetic route")
+                return _authenticated_primary_stage(
+                    leaf,
+                    digits,
+                    ComponentStatus.CONVERGED,
+                    discrepancy_from_previous_abs=1.0e-12,
+                    discrepancy_enclosed=True,
                 )
 
             def execute_promoted_stage_after_failed_preflight(
@@ -1872,11 +1894,23 @@ class PromotedResourceContainmentTests(unittest.TestCase):
                 self.assertIn((following.leaf_id, 64), backend.calls)
                 self.assertIs(
                     records[incident.leaf_id].to_mapping()["computed"],
-                    code == "INSUFFICIENT_ASYMPTOTIC_PRECISION",
+                    code in {
+                        "INSUFFICIENT_ASYMPTOTIC_PRECISION",
+                        "HORIZON_ARITHMETIC_INADEQUATE",
+                    },
                 )
 
                 persisted = summary.attempts[0].failure_receipt["failure"]
                 self.assertEqual(persisted["failure_code"], code)
+                if code.startswith("HORIZON_"):
+                    arithmetic = code == "HORIZON_ARITHMETIC_INADEQUATE"
+                    self.assertIs(persisted["retryable"], arithmetic)
+                    self.assertIs(
+                        persisted["diagnostics"][
+                            "next_precision_tier_allowed"
+                        ],
+                        arithmetic,
+                    )
                 self.assertEqual(
                     persisted["execution_resource_policy"]["sha256"],
                     persisted["request_binding"]["execution_resource"][
@@ -1888,14 +1922,21 @@ class PromotedResourceContainmentTests(unittest.TestCase):
                     decision["state"],
                     (
                         "REQUESTED"
-                        if code == "INSUFFICIENT_ASYMPTOTIC_PRECISION"
+                        if code in {
+                            "INSUFFICIENT_ASYMPTOTIC_PRECISION",
+                            "HORIZON_ARITHMETIC_INADEQUATE",
+                        }
                         else "SUPPRESSED"
                     ),
                 )
                 self.assertEqual(decision["reason"], code)
-                if code == "INSUFFICIENT_ASYMPTOTIC_PRECISION":
+                if code in {
+                    "INSUFFICIENT_ASYMPTOTIC_PRECISION",
+                    "HORIZON_ARITHMETIC_INADEQUATE",
+                }:
                     self.assertIn((incident.leaf_id, 120), backend.calls)
                     self.assertEqual(records[incident.leaf_id].state, "PRODUCED")
+                if code == "INSUFFICIENT_ASYMPTOTIC_PRECISION":
                     self.assertEqual(store.stored_count, 2)
                     imported_store = SolvedLeafStore(root / "imported-solved")
                     imported = import_campaign_checkpoint_to_solved_leaf_store(
@@ -1905,6 +1946,8 @@ class PromotedResourceContainmentTests(unittest.TestCase):
                     )
                     self.assertEqual(imported.imported_count, 2)
                     self.assertEqual(imported_store.stored_count, 2)
+                elif code == "HORIZON_ARITHMETIC_INADEQUATE":
+                    self.assertEqual(store.stored_count, 2)
                 else:
                     self.assertNotIn((incident.leaf_id, 120), backend.calls)
                 if code == "INSUFFICIENT_ASYMPTOTIC_PRECISION":
@@ -1925,6 +1968,29 @@ class PromotedResourceContainmentTests(unittest.TestCase):
                     reloaded.attempts[0].to_mapping(),
                     summary.attempts[0].to_mapping(),
                 )
+
+    def test_horizon_arithmetic_retryability_is_durably_containable(self):
+        """A retryable endpoint outcome is contained, not re-raised."""
+
+        run = self._run_with_failure(
+            julia_backend.JuliaNumericalControlError,
+            "HORIZON_ARITHMETIC_INADEQUATE",
+        )
+        temporary, _, _, _, incident, following, backend, _, summary = run
+        self.addCleanup(temporary.cleanup)
+
+        self.assertEqual(len(summary.attempts), 1)
+        attempt = summary.attempts[0]
+        self.assertEqual(attempt.leaf_id, incident.leaf_id)
+        self.assertEqual(attempt.failure_code, "HORIZON_ARITHMETIC_INADEQUATE")
+        self.assertEqual(attempt.state, "NUMERICAL_CONTROL_FAILURE")
+        self.assertTrue(attempt.failure_receipt["failure"]["retryable"])
+        self.assertEqual(
+            attempt.failure_receipt["failure"]["promotion_decision"]["state"],
+            "REQUESTED",
+        )
+        self.assertIn((incident.leaf_id, 120), backend.calls)
+        self.assertIn((following.leaf_id, 64), backend.calls)
 
     def test_insufficient_preflight_uses_authenticated_120_refinement_path(self):
         plan, capabilities, _, incident, _ = self._plan_and_leaves()

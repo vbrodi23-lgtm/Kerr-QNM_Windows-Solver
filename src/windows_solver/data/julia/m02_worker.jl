@@ -17,7 +17,7 @@ const PROGRESS_PREFIX = "@@KERR_QNM_PROGRESS@@"
 const PROGRESS_SCHEMA = "windows-solver.progress/1"
 const CONDITIONING_SCHEMA = "windows-solver.m02-conditioning/3"
 const PROMOTED_ROOT_READOUT_POLICY_ID =
-    "binary64-parity-primary-fixed-root-diagnostics/v1"
+    "binary64-parity-primary-fixed-root-diagnostics-frequency-disk/v2"
 const PROMOTED_ROOT_ACCEPTANCE_METRIC_ID =
     "abs-determinant-over-abs-complex-derivative/v1"
 const HOMOGENEOUS_REPRESENTATION_ID = "factored-plane-wave-gsn/v1"
@@ -726,6 +726,9 @@ function flatten_request(document)
         "amplitude_im" => required(amplitude, "imaginary"),
         "precision_digits" => required(document, "precision_digits"),
         "working_precision_bits" => required(document, "working_precision_bits"),
+        "semantic_precision_tier" => required(
+            document, "semantic_precision_tier"
+        ),
         "request_sha256" => required(document, "request_sha256"),
         "readout_radius" => required(policy, "readout_radius"),
         "ode_relative_tolerance" => required(policy, "ode_relative_tolerance"),
@@ -747,6 +750,9 @@ function flatten_request(document)
         "angular_pad" => required(policy, "angular_pad"),
         "rho_in" => required(policy, "rho_in"),
         "rho_out" => required(policy, "rho_out"),
+        "rho_out_candidate_schedule" => required(
+            policy, "rho_out_candidate_schedule"
+        ),
         "horizon_rho_inner_min" => required(policy, "horizon_rho_inner_min"),
         "horizon_endpoint_rho_candidates" => required(
             policy, "horizon_endpoint_rho_candidates"
@@ -858,6 +864,13 @@ function flatten_request(document)
         else
             "EPSILON_CONTINUATION"
         end
+    end
+    if string(required(document, "operation")) ==
+            "fixed-root-determinant-sample"
+        fixed_omega = required(document, "fixed_omega")
+        flattened["fixed_omega_re"] = required(fixed_omega, "real")
+        flattened["fixed_omega_im"] = required(fixed_omega, "imaginary")
+        flattened["readout_role"] = required(document, "readout_role")
     end
     return flattened
 end
@@ -1484,6 +1497,11 @@ function build_sample_spectral_context(
     _, lambda = progress_operation("angular") do
         angular_constants(T, s, ell, m, a, omega, seed_A, pad, digits)
     end
+    base_endpoint_order = parse_integer(request, "endpoint_series_order")
+    generated_endpoint_order = string(required(request, "mechanism_id")) ==
+        "horizon-admittance" ?
+        horizon_endpoint_maximum_order(request, base_endpoint_order) :
+        base_endpoint_order
     spectral = CF.build_homogeneous_spectral_context(
         s,
         m,
@@ -1492,7 +1510,7 @@ function build_sample_spectral_context(
         lambda,
         digits,
         bits,
-        parse_integer(request, "endpoint_series_order"),
+        generated_endpoint_order,
         context.frozen_convention,
     )
     spectral.frozen_branch_cell == context.frozen_branch_cell ||
@@ -1655,6 +1673,93 @@ function build_worker_outer_contour(
     return CF.build_outer_contour_context(
         spectral, match_radius, rstar_match, rho_out, radius_from_rho
     )
+end
+
+"""
+    select_worker_outer_endpoint(T, request, spectral, match_radius, label,
+                                 required_digits)
+
+Integrate the infinity coordinate map once to the declared cap, then reuse the
+same authenticated geometry to test the full increasing endpoint schedule.
+The first adequate endpoint is authoritative; every attempted candidate is
+retained in the progress evidence.
+"""
+function select_worker_outer_endpoint(
+    ::Type{T},
+    request,
+    spectral::CF.HomogeneousSpectralContext{T},
+    match_radius::T,
+    label::String,
+    required_digits::T,
+) where {T<:AbstractFloat}
+    cap_contour = build_worker_outer_contour(
+        T, request, spectral, match_radius, label
+    )
+    raw_schedule = required(request, "rho_out_candidate_schedule")
+    raw_schedule isa AbstractVector || error(
+        "rho_out_candidate_schedule must be an array"
+    )
+    candidate_schedule = T[parse(T, string(item)) for item in raw_schedule]
+    candidate_schedule = sort(unique(candidate_schedule))
+    isempty(candidate_schedule) && error(
+        "rho_out_candidate_schedule must not be empty"
+    )
+    all(isfinite(candidate) && candidate > zero(T) for candidate in candidate_schedule) ||
+        error("rho_out_candidate_schedule must contain positive finite values")
+    candidate_schedule[end] == cap_contour.rho_out || error(
+        "rho_out_candidate_schedule must end at the authenticated rho_out cap"
+    )
+
+    evidence = Dict{String,Any}[]
+    selected_contour = nothing
+    selected_preparation = nothing
+    final_preparation = nothing
+    for rho_out in candidate_schedule
+        contour = rho_out == cap_contour.rho_out ? cap_contour :
+            CF.build_outer_contour_context(
+                spectral,
+                match_radius,
+                cap_contour.rstar_match,
+                rho_out,
+                cap_contour.radius_from_rho,
+            )
+        preparation = CF.prepare_factored_infinity_outgoing(
+            spectral, contour, required_digits
+        )
+        final_preparation = preparation
+        assessment = preparation.assessment
+        push!(evidence, Dict(
+            "rho_out" => string(rho_out),
+            "adequate" => assessment.adequate,
+            "reason" => assessment.reason,
+            "predicted_reliable_digits" =>
+                string(assessment.predicted_reliable_digits),
+            "maximum_last_term_ratio" =>
+                string(assessment.maximum_last_term_ratio),
+            "maximum_series_evaluation_spread" =>
+                string(assessment.maximum_series_evaluation_spread),
+            "maximum_recurrence_cancellation_factor" =>
+                string(assessment.maximum_recurrence_cancellation_factor),
+            "endpoint_order" => preparation.endpoint_order,
+        ))
+        if selected_contour === nothing && assessment.adequate
+            selected_contour = contour
+            selected_preparation = preparation
+        end
+    end
+    if selected_contour === nothing
+        # Preserve the package-owned scientific failure classification at the
+        # cap instead of inventing a weaker worker-side acceptance gate.
+        CF.assert_factored_preflights_adequate(final_preparation)
+        error("unreachable: inadequate outer endpoint schedule")
+    end
+    progress_emit("outer_endpoint_selected"; payload=Dict(
+        "selected_rho_out" => string(selected_contour.rho_out),
+        "rho_out_cap" => string(cap_contour.rho_out),
+        "candidates" => evidence,
+        "geometry_reused_from_cap" => true,
+    ))
+    return selected_contour, selected_preparation
 end
 
 """
@@ -2180,6 +2285,34 @@ function numerical_control_failure(
         "diagnostics" => diagnostics,
     ))
     return NumericalControlFailure(message, details)
+end
+
+function horizon_endpoint_recovery_failure(request, outcome, evidence)
+    outcome_to_failure = Dict(
+        CF.NO_GEOMETRY_VALID_CANDIDATE => "HORIZON_GEOMETRY_EXHAUSTED",
+        CF.MAX_SERIES_ORDER_INADEQUATE => "HORIZON_MAXIMUM_ORDER_INADEQUATE",
+        CF.ARITHMETIC_PRECISION_INADEQUATE => "HORIZON_ARITHMETIC_INADEQUATE",
+        CF.COORDINATE_INVERSION_FAILURE => "HORIZON_COORDINATE_INVERSION_FAILED",
+        CF.FEWER_THAN_TWO_VERIFIED_ENDPOINTS => "HORIZON_ONLY_ONE_ENDPOINT",
+    )
+    haskey(outcome_to_failure, outcome) || error(
+        "unknown horizon endpoint recovery outcome $(repr(outcome))"
+    )
+    diagnostics = Dict{String,Any}(
+        "recovery_outcome" => outcome,
+        "recovery_evidence" => evidence,
+        "next_precision_tier_allowed" =>
+            outcome == CF.ARITHMETIC_PRECISION_INADEQUATE,
+    )
+    return numerical_control_failure(
+        request,
+        outcome_to_failure[outcome],
+        "horizon endpoint recovery failed: $(outcome)",
+        diagnostics;
+        retryable=outcome == CF.ARITHMETIC_PRECISION_INADEQUATE,
+        stage=outcome == CF.COORDINATE_INVERSION_FAILURE ?
+            "coordinate-inversion" : "horizon-endpoint-geometry",
+    )
 end
 
 function translate_numerical_control_failure(
@@ -2774,63 +2907,80 @@ function evaluate_horizon_determinant(
     maximum_horizon_distance = parse_real(
         T, request, "horizon_maximum_endpoint_distance"
     )
-    inner_contour = build_worker_real_inner_horizon_contour(
-        T, request, spectral, readout, "horizon-real-inner"
-    )
+    inner_contour = try
+        build_worker_real_inner_horizon_contour(
+            T, request, spectral, readout, "horizon-real-inner"
+        )
+    catch failure
+        failure isa CoordinateInversionStalled || rethrow()
+        throw(horizon_endpoint_recovery_failure(
+            request,
+            CF.COORDINATE_INVERSION_FAILURE,
+            Dict("coordinate_failure" => failure_details(failure)),
+        ))
+    end
     rho_candidates = horizon_endpoint_rho_candidates(T, request)
     rho_floor = horizon_endpoint_rho_floor(T, request)
+    endpoint_base_order = parse_integer(request, "endpoint_series_order")
     endpoint_orders = CF.horizon_endpoint_order_ladder(
-        spectral.endpoint_order;
+        endpoint_base_order;
         maximum_order=horizon_endpoint_maximum_order(
-            request, spectral.endpoint_order
+            request, endpoint_base_order
         ),
     )
-    local candidates
+    # Materialise the complete deterministic depth schedule first. The package
+    # recovery routine then exhausts this schedule at each order and caches the
+    # order-independent geometry, so an invalid radius is never retried.
     while true
-        geometry_candidates = CF.horizon_endpoint_geometry_candidates(
-            spectral,
-            inner_contour;
-            rho_candidates=rho_candidates,
-            maximum_horizon_distance=maximum_horizon_distance,
-        )
-        candidates = CF.horizon_endpoint_candidates(
-            spectral,
-            inner_contour,
-            geometry_candidates,
-            required_digits;
-            maximum_horizon_distance=maximum_horizon_distance,
-            endpoint_orders=endpoint_orders,
-        )
-        limitation = CF.diagnose_horizon_endpoint_limitation(
-            candidates, maximum_horizon_distance
-        )
-        progress_emit("horizon_endpoint_depth_attempt"; payload=Dict(
-            "deepest_rho" => string(minimum(rho_candidates)),
-            "candidate_count" => length(rho_candidates),
-            "limitation" => limitation,
-            "endpoint_order_ladder" => endpoint_orders,
-        ))
-        # Only depth-answerable limitations earn another round. Deepening moves
-        # the expansion point closer to the horizon, which shrinks the series
-        # parameter, so it repairs both a shallow geometry and a series that
-        # simply needed more terms. A precision limitation is arithmetic
-        # cancellation instead: no depth removes it, and it is the one
-        # diagnosis that should escalate the digit tier.
-        limitation == CF.HORIZON_ENDPOINT_GEOMETRY_LIMITED ||
-            limitation == CF.HORIZON_ENDPOINT_ORDER_LIMITED || break
         deeper = CF.deepen_horizon_endpoint_rho_candidates(
             rho_candidates, rho_floor
         )
         deeper === nothing && break
         rho_candidates = deeper
     end
+    geometry_candidates = CF.horizon_endpoint_geometry_candidates(
+        spectral,
+        inner_contour;
+        rho_candidates=rho_candidates,
+        maximum_horizon_distance=maximum_horizon_distance,
+    )
+    homogeneous_rhs_evaluations_before_pair =
+        factored_homogeneous_rhs_counter[]
+    homogeneous_rhs_evaluations_before_pair == 0 || error(
+        "horizon endpoint recovery began after homogeneous RHS work"
+    )
+    endpoint_recovery = CF.recover_verified_horizon_endpoint_pair(
+        spectral,
+        inner_contour,
+        geometry_candidates,
+        required_digits;
+        maximum_horizon_distance=maximum_horizon_distance,
+        endpoint_orders=endpoint_orders,
+        policy_identity=phase_control_identity(request),
+    )
+    candidates = endpoint_recovery.candidates
+    progress_emit("horizon_endpoint_search_completed"; payload=Dict(
+        "outcome" => endpoint_recovery.outcome,
+        "policy_identity" => endpoint_recovery.policy_identity,
+        "endpoint_order_ladder" => endpoint_orders,
+        "candidate_count" => length(candidates),
+        "homogeneous_rhs_evaluations_before_pair" =>
+            homogeneous_rhs_evaluations_before_pair,
+        "canonical_evidence" =>
+            CF.canonical_horizon_endpoint_search_evidence(endpoint_recovery),
+    ))
     for candidate in candidates
         emit_horizon_endpoint_candidate(candidate)
     end
-    endpoints = CF.select_verified_horizon_endpoints(
-        spectral,
-        candidates;
-        maximum_horizon_distance=maximum_horizon_distance,
+    if length(endpoint_recovery.selected_pair) != 2
+        throw(horizon_endpoint_recovery_failure(
+            request,
+            endpoint_recovery.outcome,
+            CF.canonical_horizon_endpoint_search_evidence(endpoint_recovery),
+        ))
+    end
+    endpoints = CF.verified_horizon_endpoints_from_recovery(
+        endpoint_recovery, maximum_horizon_distance
     )
     progress_emit("horizon_endpoints_verified"; payload=Dict(
         "reference_rho" => string(endpoints.reference.geometry.rho),
@@ -2847,11 +2997,8 @@ function evaluate_horizon_determinant(
     # No homogeneous ODE is permitted before the verified endpoint pair
     # exists. The outer coordinate map and infinity preparation begin only
     # after that gate, so invalid horizon geometry has zero homogeneous cost.
-    outer_contour = build_worker_outer_contour(
-        T, request, spectral, readout, "Xup-outer"
-    )
-    outer_preparation = CF.prepare_factored_infinity_outgoing(
-        spectral, outer_contour, required_digits
+    outer_contour, outer_preparation = select_worker_outer_endpoint(
+        T, request, spectral, readout, "Xup-outer", required_digits
     )
     emit_asymptotic_preparation(outer_preparation)
     CF.assert_factored_preflights_adequate(outer_preparation)
@@ -4351,6 +4498,7 @@ function bounded_newton(
     )
     best_evaluation = initial_determinant
     best_derivative = nothing
+    best_derivative_authentication = nothing
     # The first iteration evaluates the determinant at the initial frequency,
     # which is exactly the value just computed above.  The determinant is a
     # deterministic function of the frequency and the request controls, so carry
@@ -4385,6 +4533,7 @@ function bounded_newton(
             best_upper_bound = determinant_upper_bound_abs(T, residual)
             best_evaluation = residual
             best_derivative = nothing
+            best_derivative_authentication = nothing
         end
         newton_context = Dict{String,Any}(
             "newton_index" => iteration,
@@ -4436,7 +4585,30 @@ function bounded_newton(
         end
         derivative_authentication = nothing
         derivative_lower_bound = derivative_abs
-        if !binary64_parity
+        if binary64_parity
+            derivative_half, _, derivative_half_error_abs =
+                finite_difference_pair(
+                    T,
+                    request,
+                    evaluation_context,
+                    value,
+                    amplitude,
+                    Complex{T}(h / 2, zero(T)),
+                    "derivative h/2",
+                    value;
+                    axis="real",
+                    authenticate_controls=propagate_derivative_error,
+                    determinant_evaluator=determinant_evaluator,
+                )
+            derivative_candidate = derivative_authentication_candidate(
+                derivative,
+                derivative_error_abs + derivative_half_error_abs,
+                abs(derivative_half - derivative),
+                h,
+                "real",
+            )
+            derivative_authentication = derivative_candidate.authentication
+        else
             derivative_candidate = derivative_authentication_candidate(
                 derivative,
                 derivative_error_abs,
@@ -4466,7 +4638,10 @@ function bounded_newton(
             derivative_authentication = derivative_candidate.authentication
             derivative_lower_bound = derivative_authentication.lower_bound_abs
         end
-        value == best_value && (best_derivative = derivative)
+        if value == best_value
+            best_derivative = derivative
+            best_derivative_authentication = derivative_authentication
+        end
         raw_step = residual.value / derivative
         correction_abs = binary64_parity ?
             magnitude / derivative_abs :
@@ -4586,7 +4761,7 @@ function bounded_newton(
             "binary64-parity Newton did not retain a finite derivative"
         )
         return best_value, best_residual, best_derivative, false,
-            best_evaluation, nothing
+            best_evaluation, best_derivative_authentication
     end
     return best_value, best_residual, nothing, false, best_evaluation, nothing
 end
@@ -5159,8 +5334,11 @@ function solve_binary64_parity_primary(
     newton_solver=bounded_newton,
 ) where {T<:AbstractFloat}
     determinant_count_before = DETERMINANT_INDEX_PHASE[]
+    propagate_primary_derivative_error =
+        string(required(request, "mechanism_id")) == "horizon-admittance" &&
+        haskey(request, "determinant_error_model")
     root, residual, newton_derivative, newton_converged,
-        root_evaluation, _ = newton_solver(
+        root_evaluation, derivative_authentication = newton_solver(
             T,
             request,
             evaluation_context,
@@ -5168,7 +5346,7 @@ function solve_binary64_parity_primary(
             amplitude;
             determinant_evaluator=determinant_progress,
             minimum_remaining_determinant_count=2,
-            propagate_derivative_error=false,
+            propagate_derivative_error=propagate_primary_derivative_error,
             acceptance_policy=PROMOTED_ROOT_READOUT_POLICY_ID,
         )
     newton_derivative === nothing && error(
@@ -5209,6 +5387,7 @@ function solve_binary64_parity_primary(
         post_newton_determinant_count=0,
         determinant_error_abs=determinant_error_abs(T, root_evaluation),
         error_model_id=root_evaluation.error_model_id,
+        derivative_authentication=derivative_authentication,
         branch_identity=branch_identity,
         branch_authenticated=branch_authenticated,
         control_identity=phase_control_identity(request),
@@ -6470,6 +6649,13 @@ function conditioning_response(
 end
 
 function primary_acceptance_text(result)
+    derivative_authentication = result.derivative_authentication
+    derivative_error_available =
+        derivative_authentication !== nothing &&
+        result.error_model_id !== nothing &&
+        derivative_authentication.propagated_error_abs > zero(
+            derivative_authentication.propagated_error_abs
+        )
     return Dict{String,Any}(
         "policy_id" => PROMOTED_ROOT_READOUT_POLICY_ID,
         "acceptance_metric" => result.acceptance_metric,
@@ -6487,6 +6673,33 @@ function primary_acceptance_text(result)
         "determinant_error_abs" =>
             numeric_text(result.determinant_error_abs),
         "error_model_id" => result.error_model_id,
+        "derivative_authentication" =>
+            derivative_authentication === nothing ? nothing :
+            Dict{String,Any}(
+                "derivative_re" => numeric_text(
+                    real(derivative_authentication.value)
+                ),
+                "derivative_im" => numeric_text(
+                    imag(derivative_authentication.value)
+                ),
+                "propagated_error_abs" => numeric_text(
+                    derivative_authentication.propagated_error_abs
+                ),
+                "step_disagreement_abs" => numeric_text(
+                    derivative_authentication.step_disagreement_abs
+                ),
+                "lower_bound_abs" => numeric_text(
+                    derivative_authentication.lower_bound_abs
+                ),
+                "selected_step" => numeric_text(
+                    derivative_authentication.step
+                ),
+                "axis" => derivative_authentication.axis,
+                "determinant_error_status" => derivative_error_available ?
+                    "available/v1" : "unavailable/v1",
+                "determinant_error_model_id" => derivative_error_available ?
+                    result.error_model_id : nothing,
+            ),
     )
 end
 
@@ -6671,7 +6884,7 @@ function result_fields(::Type{T}, request, digits::Int, bits::Int) where {T<:Abs
         )
         branch_valid = primary.branch_authenticated
         return [
-            "schema_version" => 7,
+            "schema_version" => 8,
             "status" => "ok",
             "adapter" => "package-owned-julia-gsn-root-readout",
             "request_sha256" => string(required(request, "request_sha256")),
@@ -6743,7 +6956,7 @@ function result_fields(::Type{T}, request, digits::Int, bits::Int) where {T<:Abs
     )
 
     return [
-        "schema_version" => 7,
+        "schema_version" => 8,
         "status" => "ok",
         "adapter" => "package-owned-julia-gsn-root-readout",
         "request_sha256" => string(required(request, "request_sha256")),
@@ -6782,15 +6995,79 @@ function result_fields(::Type{T}, request, digits::Int, bits::Int) where {T<:Abs
     ]
 end
 
+function fixed_root_determinant_sample_fields(
+    ::Type{T}, request, digits::Int, bits::Int
+) where {T<:AbstractFloat}
+    fixed_omega = parse_complex(
+        T, request, "fixed_omega_re", "fixed_omega_im"
+    )
+    amplitude = parse_complex(T, request, "amplitude_re", "amplitude_im")
+    evaluation_context = build_determinant_request_context(
+        T, request, fixed_omega
+    )
+    evaluation = determinant_progress(
+        T,
+        request,
+        evaluation_context,
+        fixed_omega,
+        amplitude,
+        "fixed-root determinant sample",
+        fixed_omega,
+    )
+    DETERMINANT_INDEX_REQUEST[] == 1 || error(
+        "fixed-root determinant sample must evaluate exactly one determinant"
+    )
+    expected_tier = "bigfloat-$(digits)"
+    string(required(request, "semantic_precision_tier")) == expected_tier ||
+        error("fixed-root determinant semantic tier is invalid")
+    branch_identity = string(required(request, "branch_convention"))
+    error_available = evaluation.error_breakdown !== nothing &&
+        evaluation.error_model_id !== nothing
+    return [
+        "schema_version" => 1,
+        "status" => "ok",
+        "operation" => "fixed-root-determinant-sample",
+        "request_sha256" => string(required(request, "request_sha256")),
+        "omega_re" => numeric_text(real(fixed_omega)),
+        "omega_im" => numeric_text(imag(fixed_omega)),
+        "amplitude_re" => numeric_text(real(amplitude)),
+        "amplitude_im" => numeric_text(imag(amplitude)),
+        "determinant_re" => numeric_text(real(evaluation.value)),
+        "determinant_im" => numeric_text(imag(evaluation.value)),
+        "determinant_error_abs" => numeric_text(
+            determinant_error_abs(T, evaluation)
+        ),
+        "determinant_error_status" =>
+            error_available ? "available/v1" : "unavailable/v1",
+        "determinant_error_model_id" =>
+            error_available ? evaluation.error_model_id : nothing,
+        "determinant_family" => string(required(request, "determinant_family")),
+        "determinant_normalisation" => string(
+            required(request, "determinant_normalisation")
+        ),
+        "branch_identity" => branch_identity,
+        "branch_authenticated" => branch_identity == BRANCH_CONVENTION_ID,
+        "semantic_precision_tier" => expected_tier,
+        "working_precision_bits" => bits,
+        "readout_role" => string(required(request, "readout_role")),
+    ]
+end
+
 function evaluate_request(request)
     parse_integer(request, "schema_version") == 1 || error("unsupported schema_version")
-    string(required(request, "operation")) == "root-readout" || error("unsupported operation")
+    operation = string(required(request, "operation"))
+    operation in ("root-readout", "fixed-root-determinant-sample") ||
+        error("unsupported operation")
     parse_integer(request, "s") == -2 || error("M02 worker requires spin weight s=-2")
     digits = parse_integer(request, "precision_digits")
-    digits in (80, 120) || error("precision_digits must be 80 or 120")
+    digits in (40, 80, 120) || error(
+        "precision_digits must be 40, 80, or 120"
+    )
     bits = working_precision_bits_for(digits)
     parse_integer(request, "working_precision_bits") == bits ||
         error("working precision bits do not match decimal precision policy")
+    string(required(request, "semantic_precision_tier")) ==
+        "bigfloat-$(digits)" || error("semantic precision tier is invalid")
     validate_regularised_gsn_policy(request)
     string(required(request, "resource_policy_schema")) ==
         "windows-solver.execution-resource-policy/1" ||
@@ -6813,7 +7090,12 @@ function evaluate_request(request)
         parse_integer(request, "worker_request_wall_clock_seconds") ||
         error("cooperative deadline must precede the outer worker deadline")
     return setprecision(BigFloat, bits) do
-        result_fields(BigFloat, request, digits, bits)
+        if operation == "fixed-root-determinant-sample"
+            return fixed_root_determinant_sample_fields(
+                BigFloat, request, digits, bits
+            )
+        end
+        return result_fields(BigFloat, request, digits, bits)
     end
 end
 

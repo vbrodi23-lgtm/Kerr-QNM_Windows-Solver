@@ -36,6 +36,7 @@ from windows_solver.response_engine import (
     ComponentResult,
     ComponentStatus,
     DecimalComplex,
+    DerivativeAuthenticationEvidence,
     DiagnosticRootReadout,
     FixedRootDiagnosticEvidence,
     NumericalConditioningEvidence,
@@ -48,6 +49,7 @@ from windows_solver.response_engine import (
 )
 from windows_solver.gsn_cache_producer import GeneratedGsnCache, GsnParameterPair
 from windows_solver.julia_response_backend import JuliaPrecisionRootBackend
+from tests.fixtures import synthetic_ode_error_budget
 from windows_solver.response_engine import NativeDeterminantAdapter, RootReadout
 from windows_solver.response_reduction import (
     ResolvedComponentEvidence,
@@ -124,6 +126,9 @@ def _promoted_baseline(
         residual = determinant.magnitude()
         derivative_abs = derivative.magnitude()
         correction = residual / derivative_abs
+        derivative_lower_bound = (
+            derivative_abs - Decimal("1e-12") - Decimal("1e-12")
+        )
     primary = PrimaryRootAcceptanceEvidence(
         policy_id=PROMOTED_ROOT_READOUT_POLICY,
         acceptance_metric=PROMOTED_ROOT_ACCEPTANCE_METRIC,
@@ -140,6 +145,15 @@ def _promoted_baseline(
             else Decimal(0)
         ),
         error_model_id=error_model_id,
+        derivative_authentication=DerivativeAuthenticationEvidence(
+            derivative_re=derivative.real,
+            derivative_im=derivative.imaginary,
+            propagated_error_abs=Decimal("1e-12"),
+            step_disagreement_abs=Decimal("1e-12"),
+            lower_bound_abs=derivative_lower_bound,
+            selected_step=Decimal("5e-7"),
+            axis="real",
+        ),
     )
     diagnostics = {}
     for family, phase, value in (
@@ -232,6 +246,7 @@ def _with_worker_receipt(job, baseline, digits, primary_predictor):
     runtime = {
         "precision_digits": digits,
         "working_precision_bits": math.ceil(digits * math.log2(10)) + 32,
+        "semantic_precision_tier": f"bigfloat-{digits}",
         "refinement_level": 0,
         "regularised_gsn_precision_policy": dict(
             response_engine.regularised_gsn_precision_policy(
@@ -243,6 +258,7 @@ def _with_worker_receipt(job, baseline, digits, primary_predictor):
         job.backend_identity,
         object(),
         digits,
+        ode_error_budget=synthetic_ode_error_budget(digits),
     )._request(
         job,
         0.0j,
@@ -264,7 +280,11 @@ def _with_worker_receipt(job, baseline, digits, primary_predictor):
         "root_residual_abs_text": str(
             baseline.normalised_determinant_abs
         ),
-        "raw_determinant_abs_text": str(baseline.raw_determinant_abs),
+        "raw_determinant_abs_text": (
+            None
+            if baseline.raw_determinant_abs is None
+            else str(baseline.raw_determinant_abs)
+        ),
         "raw_determinant_evidence_status": (
             baseline.raw_determinant_evidence_status
         ),
@@ -357,11 +377,11 @@ class PromotedHorizonComponentTests(unittest.TestCase):
 
         self.assertEqual(
             result.component_scientific_identity,
-            "single-promoted-root-analytic-horizon-component/v1",
+            "single-promoted-root-bounded-analytic-horizon-component/v2",
         )
         self.assertEqual(
             result.response_method,
-            "analytic-horizon-from-promoted-primary-derivative/v1",
+            "bounded-analytic-horizon-from-promoted-primary-derivative/v2",
         )
         self.assertFalse(result.finite_amplitude_ladder_required)
         self.assertFalse(result.finite_amplitude_ladder_executed)
@@ -371,16 +391,17 @@ class PromotedHorizonComponentTests(unittest.TestCase):
         self.assertEqual(result.levels, ())
         self.assertEqual(
             result.response_uncertainty_status,
-            "UNCALIBRATED_ANALYTIC_RESPONSE",
+            "BOUNDED_ANALYTIC_RESPONSE",
         )
         self.assertEqual(
             result.error_channel_applicability,
-            {name: False for name in response_engine.ERROR_CHANNELS},
+            {
+                name: name == "resolution"
+                for name in response_engine.ERROR_CHANNELS
+            },
         )
-        self.assertFalse(result.response_uncertainty_calibrated)
-        self.assertEqual(result.error_channels, {
-            name: 0.0 for name in response_engine.ERROR_CHANNELS
-        })
+        self.assertTrue(result.response_uncertainty_calibrated)
+        self.assertGreater(sum(result.error_channels.values()), 0.0)
         restored = ComponentResult.from_mapping(result.to_mapping())
         self.assertEqual(restored, result)
         self.assertEqual(restored.to_mapping(), result.to_mapping())
@@ -407,12 +428,17 @@ class PromotedHorizonComponentTests(unittest.TestCase):
         )
         baseline = _promoted_baseline(zero_job, omega=zero_frequency)
 
-        with self.assertRaisesRegex(ValueError, "horizon frequency"):
-            self._runner()(
-                zero_job,
-                FakePromotedBackend(zero_job, baseline),
-                zero_frequency,
-            )
+        result = self._runner()(
+            zero_job,
+            FakePromotedBackend(zero_job, baseline),
+            zero_frequency,
+        )
+        self.assertEqual(result.status, ComponentStatus.DERIVATIVE_UNRESOLVED)
+        self.assertFalse(result.usable)
+        self.assertEqual(
+            result.response_uncertainty_status,
+            "UNBOUNDED_ANALYTIC_RESPONSE",
+        )
 
     def test_near_extremal_spin_uses_horizon_radius_clamp(self):
         rounded_job = replace(
@@ -556,7 +582,7 @@ class PromotedHorizonComponentTests(unittest.TestCase):
                     omega=job.root.omega,
                     conditioning_mechanism=job.mechanism_id,
                 )
-                with self.assertRaisesRegex(ValueError, "primary horizon"):
+                with self.assertRaisesRegex(ValueError, "promoted horizon"):
                     self._runner()(
                         job,
                         FakePromotedBackend(job, baseline),
@@ -618,6 +644,7 @@ class FakeJuliaPrecisionBackend(FakePromotedBackend):
         return {
             "precision_digits": self.digits,
             "working_precision_bits": math.ceil(self.digits * math.log2(10)) + 32,
+            "semantic_precision_tier": f"bigfloat-{self.digits}",
             "refinement_level": 0,
             "regularised_gsn_precision_policy": dict(
                 response_engine.regularised_gsn_precision_policy(
@@ -637,6 +664,7 @@ class FakeJuliaPrecisionBackend(FakePromotedBackend):
             self.identity,
             object(),
             self.digits,
+            ode_error_budget=synthetic_ode_error_budget(self.digits),
         )._request(
             job,
             amplitude,
@@ -718,7 +746,7 @@ class PromotedHorizonStageTests(unittest.TestCase):
         )
         return plan, predictor, promoted, record
 
-    def test_dedicated_routing_scope_excludes_binary64_deep_and_exterior(self):
+    def test_dedicated_routing_scope_is_mechanism_scoped(self):
         plan = build_campaign_plan(
             policy=NumericalPolicy(),
             backend_identity=VettedNativeDeterminantKernel.identity,
@@ -741,7 +769,57 @@ class PromotedHorizonStageTests(unittest.TestCase):
         self.assertTrue(_is_single_promoted_horizon_stage(self.leaf, 120))
         self.assertFalse(_is_single_promoted_horizon_stage(self.leaf, 64))
         self.assertFalse(_is_single_promoted_horizon_stage(exterior, 80))
-        self.assertFalse(_is_single_promoted_horizon_stage(deep_horizon, 80))
+        self.assertTrue(_is_single_promoted_horizon_stage(deep_horizon, 80))
+
+    def test_deep_horizon_ordinary_and_failed_preflight_use_horizon_runner(self):
+        plan = build_campaign_plan(
+            policy=NumericalPolicy(),
+            backend_identity=VettedNativeDeterminantKernel.identity,
+            precision_capabilities=PrecisionCapabilities((64, 80, 120)),
+        )
+        deep = next(
+            leaf
+            for leaf in plan.leaves
+            if leaf.role == "deep"
+            and leaf.mechanism_id == "horizon-admittance"
+        )
+        predictor = deep.job.root.omega + complex(2.0e-5, -1.0e-5)
+        previous = _stage_from_result(
+            64, _binary64_nonconverged_result(deep.job, predictor)
+        )
+        baseline80 = _promoted_baseline(deep.job)
+        baseline120 = _promoted_baseline(deep.job)
+        backends = {
+            80: FakeJuliaPrecisionBackend(deep.job, baseline80, 80),
+            120: FakeJuliaPrecisionBackend(deep.job, baseline120, 120),
+        }
+        predecessor = _failed_preflight_attempt(
+            deep, primary_predictor=predictor
+        )
+
+        with patch(
+            "windows_solver.response_batches.JuliaPrecisionRootBackend",
+            side_effect=lambda _identity, _adapter, digits, **_kwargs: (
+                backends[digits]
+            ),
+        ), patch(
+            "windows_solver.response_batches.run_promoted_exterior_component"
+        ) as exterior:
+            ordinary = self.backend.execute_promoted_stage_with_predictor(
+                deep, 80, (previous,), response_predictor=None
+            )
+            recovered = (
+                self.backend
+                .execute_promoted_stage_after_failed_preflight_with_predictor(
+                    deep, 120, predecessor, response_predictor=None
+                )
+            )
+
+        exterior.assert_not_called()
+        self.assertEqual(ordinary.digits, 80)
+        self.assertEqual(recovered.digits, 120)
+        self.assertEqual(backends[80].calls, [(deep.job, 0.0j, predictor)])
+        self.assertEqual(backends[120].calls, [(deep.job, 0.0j, predictor)])
 
     def test_julia80_uses_binary64_baseline_as_single_root_predictor(self):
         predictor = complex(0.70001, -0.12002)
@@ -816,7 +894,13 @@ class PromotedHorizonStageTests(unittest.TestCase):
             120,
         )
 
-        def backend_factory(identity, adapter, digits, refinement=0):
+        def backend_factory(
+            identity,
+            adapter,
+            digits,
+            refinement=0,
+            ode_error_budget=None,
+        ):
             if digits == 120:
                 return julia_backend
             return JuliaPrecisionRootBackend(
@@ -824,6 +908,7 @@ class PromotedHorizonStageTests(unittest.TestCase):
                 adapter,
                 digits,
                 refinement=refinement,
+                ode_error_budget=ode_error_budget,
             )
 
         with patch(
@@ -867,7 +952,13 @@ class PromotedHorizonStageTests(unittest.TestCase):
             120,
         )
 
-        def backend_factory(identity, adapter, digits, refinement=0):
+        def backend_factory(
+            identity,
+            adapter,
+            digits,
+            refinement=0,
+            ode_error_budget=None,
+        ):
             if digits == 120:
                 return julia_backend
             return JuliaPrecisionRootBackend(
@@ -875,6 +966,7 @@ class PromotedHorizonStageTests(unittest.TestCase):
                 adapter,
                 digits,
                 refinement=refinement,
+                ode_error_budget=ode_error_budget,
             )
 
         with patch(
@@ -1115,7 +1207,7 @@ class PromotedHorizonStageTests(unittest.TestCase):
                         wrong,
                     )
 
-    def test_reduction_rejects_uncalibrated_analytic_response(self):
+    def test_reduction_accepts_bounded_analytic_response(self):
         _, _, promoted, record = self._record_with_receipt_predictor(
             self.leaf.job.root.omega + complex(1.0e-4, -1.0e-4)
         )
@@ -1156,12 +1248,11 @@ class PromotedHorizonStageTests(unittest.TestCase):
             evidence_kind="authenticated-campaign",
         )
 
-        with self.assertRaisesRegex(ValueError, "uncalibrated"):
-            _validate_reduction_component_checkpoint_binding(
-                component,
-                record,
-                frozenset({source_receipt}),
-            )
+        _validate_reduction_component_checkpoint_binding(
+            component,
+            record,
+            frozenset({source_receipt}),
+        )
 
 
 if __name__ == "__main__":

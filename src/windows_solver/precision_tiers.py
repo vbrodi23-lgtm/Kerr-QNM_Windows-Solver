@@ -10,6 +10,81 @@ report projections.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import StrEnum
+import math
+
+
+class PrecisionTier(StrEnum):
+    """Authoritative semantic arithmetic tiers in promotion order."""
+
+    BINARY64 = "binary64"
+    BIGFLOAT_40 = "bigfloat-40"
+    BIGFLOAT_80 = "bigfloat-80"
+    BIGFLOAT_120 = "bigfloat-120"
+
+
+_SEMANTIC_ORDER = (
+    PrecisionTier.BINARY64,
+    PrecisionTier.BIGFLOAT_40,
+    PrecisionTier.BIGFLOAT_80,
+    PrecisionTier.BIGFLOAT_120,
+)
+_NOMINAL_DECIMAL_DIGITS: dict[PrecisionTier, int | float] = {
+    PrecisionTier.BINARY64: 15.95,
+    PrecisionTier.BIGFLOAT_40: 40,
+    PrecisionTier.BIGFLOAT_80: 80,
+    PrecisionTier.BIGFLOAT_120: 120,
+}
+
+
+def precision_tier(value: object) -> PrecisionTier:
+    """Normalize semantic tier input without interpreting legacy integers."""
+
+    if isinstance(value, PrecisionTier):
+        return value
+    if isinstance(value, str):
+        try:
+            return PrecisionTier(value)
+        except ValueError as error:
+            raise ValueError(f"unknown semantic precision tier: {value}") from error
+    raise ValueError("integer precision values require explicit legacy conversion")
+
+
+def precision_tier_from_legacy(value: object) -> PrecisionTier:
+    """Convert the historical mixed-unit boundary values explicitly."""
+
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError("legacy precision tier must be 64, 80, or 120")
+    try:
+        return {
+            64: PrecisionTier.BINARY64,
+            80: PrecisionTier.BIGFLOAT_80,
+            120: PrecisionTier.BIGFLOAT_120,
+        }[value]
+    except KeyError as error:
+        raise ValueError("legacy precision tier must be 64, 80, or 120") from error
+
+
+def next_precision_tier(value: PrecisionTier | str) -> PrecisionTier | None:
+    """Return the next semantic tier, or ``None`` at the terminal tier."""
+
+    current = precision_tier(value)
+    index = _SEMANTIC_ORDER.index(current)
+    return None if index + 1 == len(_SEMANTIC_ORDER) else _SEMANTIC_ORDER[index + 1]
+
+
+def nominal_decimal_digits(value: PrecisionTier | str) -> int | float:
+    return _NOMINAL_DECIMAL_DIGITS[precision_tier(value)]
+
+
+def working_precision_bits(value: PrecisionTier | str) -> int:
+    """Return actual binary significand/work precision for a semantic tier."""
+
+    tier = precision_tier(value)
+    if tier is PrecisionTier.BINARY64:
+        return 53
+    digits = int(_NOMINAL_DECIMAL_DIGITS[tier])
+    return math.ceil(digits * math.log2(10)) + 32
 
 
 @dataclass(frozen=True, slots=True)

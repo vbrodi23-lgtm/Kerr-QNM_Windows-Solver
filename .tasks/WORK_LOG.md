@@ -2,6 +2,80 @@
 
 Add the newest completed task or milestone-control entry immediately below this heading.
 
+## 2026-08-19 — TASK-079 adaptive recovery implementation ready for operator review
+
+- **Task:** TASK-079 — Regularise promoted GSN propagation and determinant conditioning.
+- **Deliverable:** Task 3 adds exhaustive two-endpoint horizon recovery with
+  independent branch prefixes, cap-reused nearest-adequate outer selection,
+  exhaustive safe-window backtracking and selective semantic-tier promotion,
+  request-bound ODE-budget controls, atomic partial-component resume,
+  destination-only authenticated checkpoint migration, two isolated
+  operator-only PowerShell entry points, and the architecture engineering note.
+- **Verification:** 34 focused synthetic/static tests and 48 existing worker
+  static tests passed; changed Python files compiled; the TaskPlanner board and
+  diff check passed. No Julia worker, Kerr determinant, ODE/angular/QNM solve,
+  M02 campaign, or PowerShell script was executed.
+- **Evidence ceiling:** TASK-079 remains In Progress. Native operator receipts,
+  calibrated determinant-to-ODE allocation, human mathematics review, and
+  release admission remain outstanding.
+- **Change reference:** local Task 3 commit; no push performed.
+- **Independent-review repair:** Production promoted readouts now consume the
+  durable partial journal, changed 40/80/120 requests fail before worker work
+  without a recorded ODE budget, safe-window recovery emits readout-specific
+  semantic-tier plans, endpoint failures are typed without a legacy-selector
+  fallback, and the light-ring report uses StrictMode-safe real schema keys.
+- **Final integration repair:** Ordinary signed and expanded root reads now
+  journal full outputs and resume exactly; Julia journal identities are the
+  exact ODE-budget-bound requests; and the campaign executes only the recorded
+  selective signed-pair plan at semantic BigFloat-40 while retaining binary64
+  readouts. A focused 42-test synthetic suite passed without a solver or
+  production-script run.
+- **Semantic-loop re-review:** Tier-keyed recorded ODE budgets now drive the
+  full selective BigFloat-40 → BigFloat-80 → BigFloat-120 sequence inside one
+  existing campaign stage, with per-tier journal identities, cumulative
+  retained evidence, exact missing-tier blockers, and no whole-component
+  fallback. Convergence and precision-exhaustion fakes passed in a focused
+  45-test safe regression.
+- **Campaign compatibility re-review:** A strict selective-stage terminal
+  contract now checkpoints and reloads converged semantic recovery as
+  `PRODUCED` and BigFloat-120 exhaustion as `UNRESOLVED`, while leaving legacy
+  self-refinement/discrepancy fields null. Focused `run_campaign_selection`
+  tests and a 35-test safe regression passed.
+- **Selective evidence-authentication re-review:** Every semantic tier now
+  checkpoints a complete canonical projection of its promoted journal entries,
+  exact current worker receipts, Julia requests, scientific runtime, and
+  recorded ODE budget. Reload authenticates request/runtime/budget/tier/job/
+  role/amplitude/work-unit bindings for current and prior tiers. Resealed
+  receipt-stripping and journal-digest forgeries fail closed; 17 focused safe
+  selective/journal tests passed without scientific execution. The final
+  selective/journal/recovery/ODE-budget regression comprised 38 passing tests.
+- **Canonical-request re-review:** Selective checkpoint validation now rebuilds
+  each full Julia request byte-for-byte, binding BF40 to its binary64
+  same-amplitude predecessor and BF80/BF120 to the preceding tier's journal
+  output. Fully resealed predictor, non-budget policy, and exterior-support
+  mutations fail closed. A 29-test focused safe regression passed.
+- **Full Python compatibility migration:** Synthetic promoted-request fixtures
+  now supply explicit recorded ODE budgets without restoring defaults;
+  historical failed-preflight receipts reconstruct from their own recorded
+  budget; all five endpoint recovery outcomes carry authenticated typed
+  evidence; intentional policy/cache identities and static ownership checks
+  were recomputed and migrated narrowly. Full safe discovery passed 881 tests
+  with 7 skips. No scientific solver, M02 campaign, Julia worker, or production
+  PowerShell entry point was executed.
+- **Endpoint/checkpoint architecture re-review:** Only typed horizon arithmetic
+  insufficiency now advances 80→120; the live checkpoint is schema 8 with
+  schema 7 historical; the migration consumes authenticated real campaign
+  records/attempts and emits a normal resumable destination plus sidecar while
+  preserving source bytes and unaffected evidence. Current scientific IDs bind
+  bounded analytic horizon v2 and fixed-root exterior derivative evidence.
+  Julia endpoint recovery statically searches all deterministic prefixes to
+  each maximum order, and the light-ring script waits for process-tree exit and
+  selects resume versus cold journal-reuse based on checkpoint existence. The
+  affected regression passed 279 tests with 6 skips; full safe discovery passed
+  885 tests with 7 skips; compile, manifest, board, and diff checks passed. No
+  prohibited numerical or PowerShell entry point was executed, and TASK-079
+  remains In Progress pending operator and human-math evidence.
+
 ## 2026-08-18 — TASK-079 promoted horizon component reduced to a single Julia readout
 
 - **Task:** TASK-079 — Regularise promoted GSN propagation and determinant conditioning.

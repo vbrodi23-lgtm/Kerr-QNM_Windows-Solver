@@ -9,6 +9,7 @@ import unittest
 
 from tests.fixtures import (
     control_failure_stage,
+    synthetic_ode_error_budget,
     valid_control_failure_diagnostics,
     valid_numerical_conditioning,
     valid_julia_root_response,
@@ -736,7 +737,10 @@ class PromotedRuntimeProvenancePersistenceTests(unittest.TestCase):
         determinant_abs = Decimal("1E-10")
         if current_schema:
             request_binding = JuliaPrecisionRootBackend(
-                job.backend_identity, object(), 80
+                job.backend_identity,
+                object(),
+                80,
+                ode_error_budget=synthetic_ode_error_budget(80),
             )._request(job, 0.0j)
             primary_acceptance = response_engine.PrimaryRootAcceptanceEvidence(
                 policy_id=response_engine.PROMOTED_ROOT_READOUT_POLICY,
@@ -1130,6 +1134,7 @@ class JuliaSchemaThreeConditioningTests(unittest.TestCase):
             response_engine.VettedNativeDeterminantKernel.identity,
             self.Adapter() if adapter is None else adapter,
             digits,
+            ode_error_budget=synthetic_ode_error_budget(digits),
         )
 
     def test_schema_three_success_requires_and_persists_conditioning(self):
@@ -1390,7 +1395,7 @@ class JuliaSchemaThreeConditioningTests(unittest.TestCase):
         request = backend._request(self._job(), 0.0j)
         expected = {
             "promoted_root_readout_policy": (
-                "binary64-parity-primary-fixed-root-diagnostics/v1"
+                "binary64-parity-primary-fixed-root-diagnostics-frequency-disk/v2"
             ),
             "determinant_family": "horizon-scattering/v1",
             "scattering_diagnostics_applicable": True,
@@ -1590,6 +1595,11 @@ class JuliaNumericalControlFailureTests(unittest.TestCase):
         "NONFINITE_FACTORED_PROPAGATION_DATA",
         "FACTORED_ODE_FAILURE",
         "NO_VERIFIED_HORIZON_ENDPOINT",
+        "HORIZON_GEOMETRY_EXHAUSTED",
+        "HORIZON_MAXIMUM_ORDER_INADEQUATE",
+        "HORIZON_ARITHMETIC_INADEQUATE",
+        "HORIZON_COORDINATE_INVERSION_FAILED",
+        "HORIZON_ONLY_ONE_ENDPOINT",
         "COORDINATE_INVERSION_STALLED",
         "DETERMINANT_UNCERTAINTY_TOO_LARGE",
         "FINITE_DIFFERENCE_NOISE_LIMIT",
@@ -1605,7 +1615,10 @@ class JuliaNumericalControlFailureTests(unittest.TestCase):
         failure = {
             "failure_code": code,
             "failure_class": "CONTROL",
-            "retryable": code == "INSUFFICIENT_ASYMPTOTIC_PRECISION",
+            "retryable": code in {
+                "INSUFFICIENT_ASYMPTOTIC_PRECISION",
+                "HORIZON_ARITHMETIC_INADEQUATE",
+            },
             "stage": control_failure_stage(code),
             "diagnostics": (
                 JuliaNumericalControlFailureTests._diagnostics(code)
