@@ -283,6 +283,7 @@ class SelectiveReadoutPromotionTests(unittest.TestCase):
                             baseline.primary_acceptance.to_mapping()
                         )
                     ).hexdigest(),
+                    "horizon_endpoint_search_evidence": None,
                 }
                 receipt = {
                     **material,
@@ -541,6 +542,64 @@ class SelectiveReadoutPromotionTests(unittest.TestCase):
             path = Path(temporary) / "forged-digest.json"
             path.write_bytes(canonical_json_bytes(forged))
             with self.assertRaisesRegex(ValueError, "journal"):
+                validate_campaign_checkpoint(self._last_campaign_plan, path)
+
+    def test_checkpoint_binds_terminal_readout_to_selective_journal_output(self):
+        """Catches a branch-valid terminal root detached from its tier journal."""
+
+        self._run_semantic_tier_loop(resolve_at_120=True, through_campaign=True)
+        forged = self._last_campaign_checkpoint
+        result = forged["records"][0]["stages"][-1][
+            "component_result"
+        ]["result"]
+        journal = self._current_selective_journal(forged)
+        entry = journal["journal"]["entries"][
+            journal["promoted_work_unit_ids"][0]
+        ]
+        role, _, epsilon_text = entry["readout_role"].partition("@")
+        level = next(
+            item
+            for item in result["levels"]
+            if item["epsilon"] == float(epsilon_text)
+        )
+        readout = level[role.replace("-", "_")]
+        readout["omega"]["real"] += 1.0e-12
+        if role.startswith("imaginary-"):
+            plus = complex(
+                level["imaginary_plus"]["omega"]["real"],
+                level["imaginary_plus"]["omega"]["imaginary"],
+            )
+            minus = complex(
+                level["imaginary_minus"]["omega"]["real"],
+                level["imaginary_minus"]["omega"]["imaginary"],
+            )
+            secant = (plus - minus) / (2.0j * level["epsilon"])
+            level["imaginary_secant"] = {
+                "real": secant.real,
+                "imaginary": secant.imag,
+            }
+        else:
+            plus = complex(
+                level["real_plus"]["omega"]["real"],
+                level["real_plus"]["omega"]["imaginary"],
+            )
+            minus = complex(
+                level["real_minus"]["omega"]["real"],
+                level["real_minus"]["omega"]["imaginary"],
+            )
+            secant = (plus - minus) / (2.0 * level["epsilon"])
+            level["real_secant"] = {
+                "real": secant.real,
+                "imaginary": secant.imag,
+            }
+        self._reseal_campaign(forged)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "detached-terminal-readout.json"
+            path.write_bytes(canonical_json_bytes(forged))
+            with self.assertRaisesRegex(
+                ValueError, "journal.*terminal|terminal.*journal"
+            ):
                 validate_campaign_checkpoint(self._last_campaign_plan, path)
 
     def test_checkpoint_rejects_resealed_selective_predictor_forgery(self):

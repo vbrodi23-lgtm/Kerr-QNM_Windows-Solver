@@ -26,8 +26,11 @@ serialization/migration, compilation, or static Julia/PowerShell inspection.
   disk excludes zero.
 - Horizon endpoint recovery: deterministic depth-first-per-order search,
   independent ingoing/outgoing best prefixes, cached geometry, two verified
-  endpoints, and policy-bound canonical evidence. The old five order-28 rows
-  for mode 222 at `a/M=0.9999` remain an exact regression fixture.
+  endpoints, and policy-bound canonical evidence. Successful searches are
+  persisted in worker wire schema 9 and sealed into response-receipt schema 3;
+  wire schema 8/receipt schema 2 and wire schemas 3--7/receipt schema 1 remain
+  read-only historical evidence. The old five order-28 rows for mode 222 at
+  `a/M=0.9999` remain an exact regression fixture.
 - Precision order is semantic:
   `binary64 -> bigfloat-40 -> bigfloat-80 -> bigfloat-120`. Decimal digits and
   MPFR bits are recorded separately; integer 40 is not inserted into the
@@ -50,6 +53,13 @@ validation roots, and diagnostic readouts. Resume validates the complete
 journal, reuses exact entries, schedules only missing identities, rejects a
 conflicting receipt, and preserves terminal journals as provenance.
 
+Promoted fixed-root determinant coordinates, values, and absolute-error bounds
+are parsed from the sealed worker decimal text. Finite differences are formed
+with `Decimal` arithmetic at a precision derived from the worker tier, and the
+resulting derivative and analytic-horizon disks are converted to binary64 only
+through an outward-rounding containment step. A long BigFloat decimal therefore
+cannot be silently collapsed before the response centre or radius is derived.
+
 Checkpoint migration authenticates the exact source SHA-256 and canonical
 bytes, parses real `CampaignLeafRecord` and `CampaignExecutionAttempt`
 structures under the historical schema-7 bindings, refuses an existing
@@ -65,8 +75,15 @@ exterior derivative/disk/validation policies; schema 7 retains its historical
 The nearest-adequate outer endpoint policy records the complete monotone
 candidate schedule ending at the existing cap, all rejection reasons, and the
 selected candidate. A promoted ODE request must consume an authenticated
-request-level error budget. The repository still lacks a justified conversion
-from determinant/root error to local ODE tolerances:
+request-level error budget. Every calibrated budget reachable by a leaf is
+bound into that leaf's scientific execution contract and solved-leaf identity;
+checkpoint resume, cache lookup, cache publication, promoted runtime evidence,
+and nested journal/request evidence are revalidated against the active
+contract. A budget-free predecessor cache entry is historical evidence only
+and is not migrated into a calibrated identity. Operational runtime provenance
+continues to exclude the budget fields, while the complete scientific-runtime
+digest includes them. The repository still lacks a justified conversion from
+determinant/root error to local ODE tolerances:
 
 `TODO: [HUMAN MATH REVIEW REQUIRED - calibrated conversion from determinant/root error budget to ODE local tolerances is not yet established]`
 

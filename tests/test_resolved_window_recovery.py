@@ -25,6 +25,8 @@ from windows_solver.response_engine import (
     NumericalPolicy,
     ResponseComponentJob,
     RootReadout,
+    _recover_resolved_window,
+    _response_ladder_recovery,
     run_component,
 )
 from windows_solver.partial_component_checkpoint import PartialComponentJournal
@@ -111,6 +113,84 @@ def _exterior_job() -> ResponseComponentJob:
 
 
 class ResolvedWindowRecoveryTests(unittest.TestCase):
+    def test_serialized_windows_use_runtime_absolute_axis_floor(self):
+        base = _exterior_job()
+        job = replace(
+            base,
+            policy=replace(base.policy, absolute_axis_floor=1.0e-9),
+        )
+
+        class SmallAxisOffset(CollapsedResponseBackend):
+            def read_root(self, job, amplitude, primary_predictor=None):
+                value = complex(amplitude)
+                self.amplitudes.append(value)
+                response = self.response + (
+                    0.0j if value.real else complex(1.0e-10, 0.0)
+                )
+                return RootReadout(
+                    omega=job.root.omega + response * value,
+                    determinant_residual_abs=self.root_noise,
+                    determinant_derivative_abs=1.0,
+                    converged=True,
+                    root_reference_id=job.root.root_reference_id,
+                    branch_id=job.root.branch_id,
+                    equation_id=job.equation_id,
+                )
+
+        result = run_component(
+            job,
+            SmallAxisOffset(
+                response=complex(0.125, -0.375),
+                root_noise=1.0e-16,
+                cubic=0.0j,
+            ),
+        )
+        runtime = _recover_resolved_window(job, result.levels)
+        serialized = _response_ladder_recovery(job, result.levels)
+
+        self.assertIsNotNone(runtime)
+        self.assertEqual(
+            serialized.selected_epsilons,
+            tuple(level.epsilon for level in runtime[0]),
+        )
+
+    def test_serialized_windows_share_runtime_even_order_alternative(self):
+        job = _exterior_job()
+
+        class EvenOrderBackend(CollapsedResponseBackend):
+            def read_root(self, job, amplitude, primary_predictor=None):
+                value = complex(amplitude)
+                self.amplitudes.append(value)
+                return RootReadout(
+                    omega=(
+                        job.root.omega
+                        + self.response * value
+                        + complex(1.0e-4, -2.0e-4) * value**2
+                    ),
+                    determinant_residual_abs=self.root_noise,
+                    determinant_derivative_abs=1.0,
+                    converged=True,
+                    root_reference_id=job.root.root_reference_id,
+                    branch_id=job.root.branch_id,
+                    equation_id=job.equation_id,
+                )
+
+        result = run_component(
+            job,
+            EvenOrderBackend(
+                response=complex(0.125, -0.375),
+                root_noise=1.0e-16,
+                cubic=0.0j,
+            ),
+        )
+        runtime = _recover_resolved_window(job, result.levels)
+        serialized = _response_ladder_recovery(job, result.levels)
+
+        self.assertIsNotNone(runtime)
+        self.assertEqual(
+            serialized.selected_epsilons,
+            tuple(level.epsilon for level in runtime[0]),
+        )
     def test_generic_component_journal_resumes_signed_and_expanded_readouts(self):
         job = _exterior_job()
 

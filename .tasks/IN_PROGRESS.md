@@ -115,5 +115,17 @@ preservation, and cache/provenance separation from historical raw-state leaves.
   wait for the process tree and cold-start when no checkpoint exists. Full safe
   Python discovery passed 885 tests with 7 skips; native/human evidence remains
   outstanding and the task was not moved to Done.
+- 2026-08-19 — PR #55 now has a visible checkpoint, and the independent-review
+  remediation binds reachable ODE budgets into scientific/cache identities,
+  rejects substituted checkpoint and journal evidence, recomputes persisted
+  horizon uncertainty, preserves promoted decimal precision through outward
+  binary64 containment, aligns adaptive endpoint/runtime gates, and seals every
+  successful horizon endpoint search in worker wire schema 9 and receipt schema
+  3. Full permitted Python discovery passes 919 tests with 7 skips; compilation,
+  TaskPlanner validation, and diff hygiene pass. No Julia worker, Kerr
+  determinant, ODE/angular/QNM solve, M02 campaign, or production PowerShell
+  script was executed. TASK-079 remains In Progress pending the exterior
+  determinant-error model, calibrated determinant-to-ODE allocation, native
+  operator receipts, and human mathematics review.
 
 ---

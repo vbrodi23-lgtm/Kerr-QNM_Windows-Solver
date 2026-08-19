@@ -37,6 +37,30 @@ def synthetic_ode_error_budget(digits: int):
     )
 
 
+def valid_horizon_endpoint_search_evidence() -> list[dict[str, object]]:
+    def candidate(rho: str, endpoint_order: int, adequate: bool):
+        return {
+            "rho": rho,
+            "endpoint_order": endpoint_order,
+            "ingoing_best_prefix_order": endpoint_order - 2,
+            "outgoing_best_prefix_order": endpoint_order - 1,
+            "ingoing_adequate": adequate,
+            "outgoing_adequate": adequate,
+        }
+
+    return [{
+        "outcome": "adequate/v1",
+        "policy_identity": "fixture-horizon-endpoint-policy/v1",
+        "selected_pair": [
+            candidate("-100", 30, True),
+            candidate("-120", 30, True),
+        ],
+        "rejected_candidates": [candidate("-80", 30, False)],
+        "endpoint_orders": [30, 38],
+        "homogeneous_rhs_evaluations_before_pair": 0,
+    }]
+
+
 EXPECTED_KAPPA_SPINS = {
     Fraction(1, 100): (0.999791731748236, "0x1.ffe4b3ad56fa5p-1"),
     Fraction(1, 200): (0.9999489834961278, "0x1.fff9502b91917p-1"),
@@ -226,6 +250,7 @@ def current_promoted_component_payload(
         else "not-applicable/v1"
     )
 
+    ode_error_budget = synthetic_ode_error_budget(digits).to_mapping()
     scientific_runtime = {
         "precision_digits": digits,
         "working_precision_bits": math.ceil(digits * math.log2(10)) + 32,
@@ -233,6 +258,10 @@ def current_promoted_component_payload(
         "regularised_gsn_precision_policy": dict(
             regularised_gsn_precision_policy(result.mechanism_id)
         ),
+        "ode_error_budget": ode_error_budget,
+        "ode_error_budget_sha256": hashlib.sha256(
+            canonical_json_bytes(ode_error_budget)
+        ).hexdigest(),
     }
 
     def conditioned(readout, readout_id):
@@ -370,6 +399,11 @@ def current_promoted_component_payload(
             "primary_acceptance_sha256": hashlib.sha256(
                 canonical_json_bytes(primary.to_mapping())
             ).hexdigest(),
+            "horizon_endpoint_search_evidence": (
+                valid_horizon_endpoint_search_evidence()
+                if evidence.scattering_diagnostics_applicable
+                else None
+            ),
         }
         return replace(
             updated,
@@ -456,11 +490,11 @@ def valid_control_failure_diagnostics(
         "avoided_ode_scope": "factored-homogeneous-gsn/v1",
     }
     horizon_outcomes = {
-        "HORIZON_GEOMETRY_EXHAUSTED": "NO_GEOMETRY_VALID_CANDIDATE",
-        "HORIZON_MAXIMUM_ORDER_INADEQUATE": "MAX_SERIES_ORDER_INADEQUATE",
-        "HORIZON_ARITHMETIC_INADEQUATE": "ARITHMETIC_PRECISION_INADEQUATE",
-        "HORIZON_COORDINATE_INVERSION_FAILED": "COORDINATE_INVERSION_FAILURE",
-        "HORIZON_ONLY_ONE_ENDPOINT": "FEWER_THAN_TWO_VERIFIED_ENDPOINTS",
+        "HORIZON_GEOMETRY_EXHAUSTED": "no-geometry-valid-candidate/v1",
+        "HORIZON_MAXIMUM_ORDER_INADEQUATE": "maximum-series-order-inadequate/v1",
+        "HORIZON_ARITHMETIC_INADEQUATE": "arithmetic-precision-inadequate/v1",
+        "HORIZON_COORDINATE_INVERSION_FAILED": "coordinate-inversion-failure/v1",
+        "HORIZON_ONLY_ONE_ENDPOINT": "fewer-than-two-verified-endpoints/v1",
     }
     if failure_code in horizon_outcomes:
         outcome = horizon_outcomes[failure_code]
@@ -901,7 +935,7 @@ def valid_legacy_julia_root_response(
 def valid_julia_root_response(
     request: dict[str, object],
 ) -> dict[str, object]:
-    """Return one schema-8 derivative-authenticated promoted-worker response."""
+    """Return one schema-9 derivative-authenticated promoted-worker response."""
 
     omega = request["omega"]
     policy = request["policy"]
@@ -952,7 +986,7 @@ def valid_julia_root_response(
         }
 
     return {
-        "schema_version": 8,
+        "schema_version": 9,
         "status": "ok",
         "adapter": "package-owned-julia-gsn-root-readout",
         "request_sha256": hashlib.sha256(
@@ -1021,5 +1055,8 @@ def valid_julia_root_response(
         "diagnostics_skipped_reason": None,
         "numerical_conditioning": valid_numerical_conditioning(
             request["mechanism_id"]
+        ),
+        "horizon_endpoint_search_evidence": (
+            valid_horizon_endpoint_search_evidence() if horizon else None
         ),
     }

@@ -970,7 +970,8 @@ function diagnostic_consistency_request()
         "angular_pad" => 24,
         "rho_in" => "-5000",
         "rho_out" => "5000",
-        "horizon_rho_inner_min" => "-100",
+        "horizon_rho_inner_min" => "-400",
+        "horizon_endpoint_rho_floor" => "-400",
         "horizon_endpoint_rho_candidates" =>
             Any["-10", "-25", "-50", "-75", "-100"],
         "horizon_maximum_endpoint_distance" => "0.1",

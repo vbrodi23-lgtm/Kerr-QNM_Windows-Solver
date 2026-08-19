@@ -188,6 +188,36 @@ def _set_distinct_derivative_binding(response, wire_derivative_abs):
 
 
 class JuliaResponseBackendTests(unittest.TestCase):
+    def test_successful_horizon_endpoint_evidence_is_sealed_in_receipt(self):
+        job = _job_for_mechanism("horizon-admittance")
+        backend = JuliaPrecisionRootBackend(
+            VettedNativeDeterminantKernel.identity, FakeAdapter(), 80
+        )
+
+        readout = backend.read_root(job, 0.0j)
+
+        evidence = readout.worker_response_receipt[
+            "horizon_endpoint_search_evidence"
+        ]
+        self.assertTrue(evidence)
+        self.assertEqual(evidence[0]["outcome"], "adequate/v1")
+        self.assertEqual(len(evidence[0]["selected_pair"]), 2)
+
+        class MissingEndpointAdapter(FakeAdapter):
+            def evaluate(self, request):
+                response = super().evaluate(request)
+                response["horizon_endpoint_search_evidence"] = []
+                return response
+
+        with self.assertRaisesRegex(
+            JuliaResponseBackendError, "horizon endpoint evidence"
+        ):
+            JuliaPrecisionRootBackend(
+                VettedNativeDeterminantKernel.identity,
+                MissingEndpointAdapter(),
+                80,
+            ).read_root(job, 0.0j)
+
     def test_schema8_horizon_derivative_error_availability_is_not_zero_claim(self):
         job = _job_for_mechanism("horizon-admittance")
         backend = JuliaPrecisionRootBackend(
@@ -251,7 +281,9 @@ class JuliaResponseBackendTests(unittest.TestCase):
                     "omega_im": request["fixed_omega"]["imaginary"],
                     "amplitude_re": request["amplitude"]["real"],
                     "amplitude_im": request["amplitude"]["imaginary"],
-                    "determinant_re": "0.006000000001",
+                    "determinant_re": (
+                        "0.0060000000010000000000000000000000000001"
+                    ),
                     "determinant_im": "0.009",
                     "determinant_error_abs": "4e-12",
                     "determinant_error_status": "available/v1",
@@ -292,6 +324,10 @@ class JuliaResponseBackendTests(unittest.TestCase):
         self.assertEqual(mapping["precision_tier"], "bigfloat-80")
         self.assertEqual(mapping["working_precision_bits"], 298)
         self.assertEqual(mapping["readout_role"], "coordinate-real-plus-h")
+        self.assertEqual(
+            str(sample.exact_determinant.real),
+            "0.0060000000010000000000000000000000000001",
+        )
         self.assertRegex(mapping["request_sha256"], r"^[0-9a-f]{64}$")
         self.assertRegex(mapping["worker_response_receipt_sha256"], r"^[0-9a-f]{64}$")
         self.assertEqual(
@@ -302,7 +338,7 @@ class JuliaResponseBackendTests(unittest.TestCase):
             mapping["worker_response_receipt"]["response_binding"][
                 "determinant_re"
             ],
-            "0.006000000001",
+            "0.0060000000010000000000000000000000000001",
         )
 
         for receipt_field, replacement in (
@@ -473,12 +509,13 @@ class JuliaResponseBackendTests(unittest.TestCase):
             backend.read_root(_deep_job(), 0.0j)
             self.assertEqual(len(calls), 2)
 
-    def test_success_wire_schema_is_seven_and_worker_errors_remain_schema_one(self):
+    def test_success_wire_schema_is_nine_and_worker_errors_remain_schema_one(self):
         """Catches changing the successful wire without preserving error parsing.
 
         The success wire and the error envelope are versioned independently.
-        Schema 7 records binary64-parity PRIMARY and fixed-root diagnostics;
-        the error envelope stays independently versioned at 1.
+        Schema 9 persists successful horizon endpoint searches on top of the
+        binary64-parity PRIMARY/fixed-root evidence; the error envelope stays
+        independently versioned at 1.
         """
 
         request = JuliaPrecisionRootBackend(
@@ -490,7 +527,7 @@ class JuliaResponseBackendTests(unittest.TestCase):
             valid_julia_root_response(request)["schema_version"],
             WORKER_RESPONSE_WIRE_SCHEMA,
         )
-        self.assertEqual(WORKER_RESPONSE_WIRE_SCHEMA, 8)
+        self.assertEqual(WORKER_RESPONSE_WIRE_SCHEMA, 9)
         root = Path(__file__).resolve().parents[1]
         worker = (
             root / "src/windows_solver/data/julia/m02_worker.jl"
@@ -499,7 +536,7 @@ class JuliaResponseBackendTests(unittest.TestCase):
             worker.index("function result_fields(") :
             worker.index("function evaluate_request(")
         ]
-        self.assertEqual(result_fields.count('"schema_version" => 8'), 2)
+        self.assertEqual(result_fields.count('"schema_version" => 9'), 2)
         self.assertNotIn('"schema_version" => 6', result_fields)
         error_path = worker[
             worker.rindex("catch failure") : worker.index(

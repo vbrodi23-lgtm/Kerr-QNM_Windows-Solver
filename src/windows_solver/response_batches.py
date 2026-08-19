@@ -63,6 +63,7 @@ from .response_engine import (
     regularised_gsn_precision_policy,
     root_readout_preserves_authenticated_branch,
     regularised_gsn_mechanism_contract,
+    _validate_promoted_horizon_checkpoint_evidence_for_job,
     run_component,
     run_promoted_exterior_component,
     run_promoted_horizon_component,
@@ -120,13 +121,6 @@ _SCHEMA7_CAMPAIGN_SOURCE_SHA256 = (
 )
 _SCHEMA7_ENGINE_SOURCE_SHA256 = (
     "6bc9938b91d7de59669574b89b58a6bec8335d48f8b0678815350b0fba977be4"
-)
-# The backend that produced the schema-7 checkpoints. The promoted readout
-# policy and worker wire schema have both moved since, so the current plan's
-# backend identity is a different digest; authenticating a schema-7 source
-# against it would reject the real stopped checkpoint as forged.
-_SCHEMA7_BACKEND_IDENTITY_SHA256 = (
-    "035f123f04d02079c6e7d7bed5255069c6152d53be266185b303af8c48c36f5c"
 )
 _SCHEMA7_PRECISION_CONTRACT_SHA256 = (
     "3f6364f6fc28eebeeb788af20524f8ada3c97f23e41fb68f4ead3da365368dcb"
@@ -1581,6 +1575,8 @@ def _failed_preflight_predecessor_for_leaf(
 def _endpoint_arithmetic_predecessor_for_leaf(
     attempts: Sequence[CampaignExecutionAttempt],
     leaf: CampaignLeafPlan,
+    *,
+    checkpoint_schema_version: int = CAMPAIGN_CHECKPOINT_SCHEMA_VERSION,
 ) -> CampaignExecutionAttempt | None:
     candidates = tuple(
         attempt
@@ -1595,13 +1591,19 @@ def _endpoint_arithmetic_predecessor_for_leaf(
         raise ValueError("campaign has duplicate endpoint-arithmetic predecessors")
     if not candidates:
         return None
-    _validate_endpoint_arithmetic_predecessor(candidates[0], leaf)
+    _validate_endpoint_arithmetic_predecessor(
+        candidates[0],
+        leaf,
+        checkpoint_schema_version=checkpoint_schema_version,
+    )
     return candidates[0]
 
 
 def _validate_endpoint_arithmetic_predecessor(
     attempt: CampaignExecutionAttempt,
     leaf: CampaignLeafPlan,
+    *,
+    checkpoint_schema_version: int = CAMPAIGN_CHECKPOINT_SCHEMA_VERSION,
 ) -> None:
     """Authenticate an 80-digit endpoint arithmetic retry predecessor."""
 
@@ -1611,6 +1613,7 @@ def _validate_endpoint_arithmetic_predecessor(
         precision_digits=80,
         allowed_refinement_levels=frozenset({0}),
         required_failure_code="HORIZON_ARITHMETIC_INADEQUATE",
+        checkpoint_schema_version=checkpoint_schema_version,
     )
 
 
@@ -2337,7 +2340,10 @@ def _scientific_computation_identity_material(
 
 
 def scientific_computation_identity_sha256(
-    plan: CampaignPlan, leaf: CampaignLeafPlan
+    plan: CampaignPlan,
+    leaf: CampaignLeafPlan,
+    *,
+    scientific_execution_contract: Mapping[str, object] | None = None,
 ) -> str:
     """Bind one requested calculation without binding campaign presentation code."""
 
@@ -2346,7 +2352,46 @@ def scientific_computation_identity_sha256(
     material = _scientific_computation_identity_material(
         plan, leaf, _leaf_precision_contract(leaf)
     )
+    if scientific_execution_contract is not None:
+        try:
+            canonical_contract = json.loads(
+                canonical_json_bytes(dict(scientific_execution_contract))
+            )
+        except (TypeError, ValueError) as error:
+            raise ValueError(
+                "solved-leaf scientific execution contract is invalid"
+            ) from error
+        if not isinstance(canonical_contract, dict):
+            raise ValueError(
+                "solved-leaf scientific execution contract is invalid"
+            )
+        material["scientific_execution_contract"] = canonical_contract
     return _sha256(material)
+
+
+def _backend_scientific_execution_contract(
+    backend: object,
+    leaf: CampaignLeafPlan,
+) -> dict[str, object] | None:
+    """Return one canonical backend-owned contract for cache/reuse identity."""
+
+    provider = getattr(backend, "scientific_execution_contract_for", None)
+    if not callable(provider):
+        return None
+    contract = provider(leaf)
+    if contract is None:
+        return None
+    if not isinstance(contract, Mapping):
+        raise ValueError("campaign scientific execution contract is invalid")
+    try:
+        canonical = json.loads(canonical_json_bytes(dict(contract)))
+    except (TypeError, ValueError) as error:
+        raise ValueError(
+            "campaign scientific execution contract is invalid"
+        ) from error
+    if not isinstance(canonical, dict) or canonical != dict(contract):
+        raise ValueError("campaign scientific execution contract is not canonical")
+    return canonical
 
 
 def _legacy_primary_scientific_computation_identity_sha256(
@@ -2674,7 +2719,6 @@ def _schema7_campaign_bindings(plan: CampaignPlan) -> dict[str, object]:
         "schema_version": 2,
         "engine_source_sha256": _SCHEMA7_ENGINE_SOURCE_SHA256,
         "campaign_source_sha256": _SCHEMA7_CAMPAIGN_SOURCE_SHA256,
-        "backend_identity_sha256": _SCHEMA7_BACKEND_IDENTITY_SHA256,
         "precision_factory_identity": (
             _schema7_precision_factory_identity().to_mapping()
         ),
@@ -3053,7 +3097,9 @@ def _load_checkpoint_with_attempts(
             checkpoint_schema_version=value["schema_version"],
         )
         endpoint_arithmetic = _endpoint_arithmetic_predecessor_for_leaf(
-            attempts, leaf
+            attempts,
+            leaf,
+            checkpoint_schema_version=value["schema_version"],
         )
         if predecessor is not None and endpoint_arithmetic is not None:
             raise ValueError("campaign has conflicting 80-digit retry predecessors")
@@ -3296,6 +3342,132 @@ def _ode_error_budget_from_mapping(value: object) -> ODEErrorBudget | None:
     except (KeyError, TypeError, ValueError):
         return None
     return budget if budget.to_mapping() == dict(value) else None
+
+
+_SCIENTIFIC_EXECUTION_CONTRACT_SCHEMA = (
+    "windows-solver.m02-scientific-execution-contract/1"
+)
+
+
+def _scientific_execution_contract_budgets(
+    contract: Mapping[str, object] | None,
+) -> dict[int, dict[str, object]] | None:
+    if contract is None or contract.get("schema") != (
+        _SCIENTIFIC_EXECUTION_CONTRACT_SCHEMA
+    ):
+        return None
+    expected_fields = {
+        "schema", "ode_error_budgets_by_nominal_decimal_digits"
+    }
+    raw_budgets = contract.get(
+        "ode_error_budgets_by_nominal_decimal_digits"
+    )
+    if set(contract) != expected_fields or not isinstance(raw_budgets, Mapping):
+        raise ValueError("campaign scientific execution contract is invalid")
+    budgets: dict[int, dict[str, object]] = {}
+    for raw_digits, raw_budget in raw_budgets.items():
+        if not isinstance(raw_digits, str) or raw_digits not in {
+            "40", "80", "120"
+        }:
+            raise ValueError("campaign scientific execution budget tier is invalid")
+        digits = int(raw_digits)
+        budget = _ode_error_budget_from_mapping(raw_budget)
+        if (
+            budget is None
+            or budget.to_mapping().get("nominal_decimal_digits") != digits
+        ):
+            raise ValueError("campaign scientific execution budget is invalid")
+        budgets[digits] = budget.to_mapping()
+    if not budgets:
+        raise ValueError("campaign scientific execution budgets are missing")
+    return budgets
+
+
+def _validate_record_scientific_execution_contract(
+    leaf: CampaignLeafPlan,
+    record: CampaignLeafRecord,
+    contract: Mapping[str, object] | None,
+) -> None:
+    """Reject promoted checkpoint/cache evidence from another ODE budget."""
+
+    budgets = _scientific_execution_contract_budgets(contract)
+    if budgets is None:
+        return
+
+    def validate_budget_evidence(value: object) -> None:
+        if isinstance(value, Mapping):
+            has_budget = "ode_error_budget" in value
+            has_digest = "ode_error_budget_sha256" in value
+            if has_budget or has_digest:
+                if not has_budget:
+                    raise ValueError(
+                        "campaign promoted ODE budget evidence is invalid"
+                    )
+                raw_budget = value.get("ode_error_budget")
+                budget = _ode_error_budget_from_mapping(raw_budget)
+                if budget is None or not isinstance(raw_budget, Mapping):
+                    raise ValueError(
+                        "campaign promoted ODE budget evidence is invalid"
+                    )
+                mapping = budget.to_mapping()
+                digits = mapping["nominal_decimal_digits"]
+                expected = budgets.get(digits)
+                if (
+                    expected is None
+                    or dict(raw_budget) != expected
+                    or (
+                        has_digest
+                        and value.get("ode_error_budget_sha256")
+                        != _sha256(expected)
+                    )
+                ):
+                    raise ValueError(
+                        "campaign promoted ODE budget disagrees with active "
+                        "scientific execution contract"
+                    )
+            for nested in value.values():
+                validate_budget_evidence(nested)
+        elif isinstance(value, (list, tuple)):
+            for nested in value:
+                validate_budget_evidence(nested)
+
+    for stage in record.stages:
+        payload = stage.outcome.component_result
+        promoted_runtimes = tuple(
+            payload.get(key)
+            for key in (
+                "scientific_runtime", "self_refinement_scientific_runtime"
+            )
+            if isinstance(payload.get(key), Mapping)
+            and payload[key].get("precision_digits") in {40, 80, 120}
+        )
+        if stage.outcome.digits in {80, 120} and not promoted_runtimes:
+            raise ValueError(
+                "campaign promoted scientific runtime is missing from the "
+                "active execution contract"
+            )
+        for runtime in promoted_runtimes:
+            assert isinstance(runtime, Mapping)
+            if (
+                "ode_error_budget" not in runtime
+                or "ode_error_budget_sha256" not in runtime
+            ):
+                raise ValueError(
+                    "campaign promoted scientific runtime lacks its ODE budget"
+                )
+            runtime_budget = _ode_error_budget_from_mapping(
+                runtime.get("ode_error_budget")
+            )
+            if (
+                runtime_budget is None
+                or runtime_budget.to_mapping()["nominal_decimal_digits"]
+                != runtime.get("precision_digits")
+            ):
+                raise ValueError(
+                    "campaign promoted runtime ODE budget tier disagrees with "
+                    "the active scientific execution contract"
+                )
+        validate_budget_evidence(payload)
 
 
 def _validate_selective_tier_journal(
@@ -3572,6 +3744,12 @@ def _selective_predecessor_readouts(
         raise _UnauthenticatedComponentEvidence(
             "campaign selective binary predecessor is invalid"
         )
+    return _component_readouts_by_amplitude(result)
+
+
+def _component_readouts_by_amplitude(
+    result: ComponentResult,
+) -> dict[complex, RootReadout]:
     readouts = {0.0j: result.baseline}
     for level in result.levels:
         readouts.update({
@@ -3704,6 +3882,7 @@ def _validate_selective_stage(
             "campaign selective stage readout plan is invalid"
         )
     predecessor_readouts = _selective_predecessor_readouts(leaf, predecessor)
+    expected_terminal_readouts = dict(predecessor_readouts)
     for index, evidence in enumerate(prior):
         if (
             not isinstance(evidence, Mapping)
@@ -3716,19 +3895,30 @@ def _validate_selective_stage(
             raise _UnauthenticatedComponentEvidence(
                 "campaign selective prior-tier evidence is invalid"
             )
-        _, predecessor_readouts = _validate_selective_tier_journal(
+        _, promoted_readouts = _validate_selective_tier_journal(
             leaf,
             trace[index],
             evidence["executed_readout_specific_promotion_plan"],
             evidence["journal_evidence"],
             predecessor_readouts,
         )
-    current_runtime, _ = _validate_selective_tier_journal(
+        expected_terminal_readouts.update(promoted_readouts)
+        predecessor_readouts = dict(expected_terminal_readouts)
+    current_runtime, promoted_readouts = _validate_selective_tier_journal(
         leaf, trace[-1], current_plan, journal, predecessor_readouts
     )
+    expected_terminal_readouts.update(promoted_readouts)
     if dict(runtime) != dict(current_runtime):
         raise _UnauthenticatedComponentEvidence(
             "campaign selective stage runtime disagrees with tier evidence"
+        )
+    terminal_readouts = _component_readouts_by_amplitude(result)
+    if any(
+        expected_terminal_readouts.get(amplitude) != readout
+        for amplitude, readout in terminal_readouts.items()
+    ):
+        raise _UnauthenticatedComponentEvidence(
+            "campaign selective terminal readouts disagree with tier journals"
         )
     for readout in result.raw_readouts:
         if not root_readout_preserves_authenticated_branch(
@@ -4219,6 +4409,24 @@ def _validate_current_promoted_runtime(
         raise _UnauthenticatedComponentEvidence(
             "campaign promoted scientific runtime precision is invalid"
         )
+    raw_budget = runtime.get("ode_error_budget")
+    raw_budget_sha256 = runtime.get("ode_error_budget_sha256")
+    validated_budget = _ode_error_budget_from_mapping(raw_budget)
+    if package_promoted and (
+        raw_budget is not None
+        or raw_budget_sha256 is not None
+        or not allow_historical_conditioning_absence
+    ):
+        if (
+            not isinstance(raw_budget, Mapping)
+            or validated_budget is None
+            or validated_budget.to_mapping() != dict(raw_budget)
+            or raw_budget.get("nominal_decimal_digits") != outcome.digits
+            or raw_budget_sha256 != _sha256(dict(raw_budget))
+        ):
+            raise _UnauthenticatedComponentEvidence(
+                "campaign promoted scientific runtime ODE budget is invalid"
+            )
     if result.component_scientific_identity == (
         EXTERIOR_DERIVATIVE_COMPONENT_IDENTITY
     ):
@@ -4232,6 +4440,8 @@ def _validate_current_promoted_runtime(
                 "semantic_precision_tier",
                 "refinement_level",
                 "regularised_gsn_precision_policy",
+                "ode_error_budget",
+                "ode_error_budget_sha256",
             }
         }
         expected_sample_runtime = runtime_identity_sha256(runtime_provenance)
@@ -4447,6 +4657,10 @@ def _validate_component_result(
     ):
         raise _UnauthenticatedComponentEvidence(
             "campaign bounded promoted horizon identity is invalid"
+        )
+    if bounded_horizon:
+        _validate_promoted_horizon_checkpoint_evidence_for_job(
+            result, leaf.job
         )
     if exterior_derivative and not (
         leaf.mechanism_id.startswith("exterior-")
@@ -5400,6 +5614,8 @@ def _authenticate_solved_leaf_hit(
     leaf: CampaignLeafPlan,
     store: SolvedLeafStore,
     lookup: SolvedLeafLookup,
+    *,
+    scientific_execution_contract: Mapping[str, object] | None = None,
 ) -> SolvedLeafLookup:
     if lookup.status is not SolvedLeafLookupStatus.HIT:
         return lookup
@@ -5410,6 +5626,9 @@ def _authenticate_solved_leaf_hit(
         if record.to_mapping() != lookup.receipt["record"]:
             raise ValueError("solved-leaf cache record is not canonical")
         _validate_cacheable_leaf_record(plan, leaf, record)
+        _validate_record_scientific_execution_contract(
+            leaf, record, scientific_execution_contract
+        )
     except (KeyError, TypeError, ValueError) as error:
         if lookup.path is not None:
             store.quarantine(lookup.path, str(error))
@@ -5489,15 +5708,29 @@ def _authenticated_solved_leaf_lookup(
     plan: CampaignPlan,
     leaf: CampaignLeafPlan,
     store: SolvedLeafStore,
+    *,
+    scientific_execution_contract: Mapping[str, object] | None = None,
 ) -> SolvedLeafLookup:
-    identity = scientific_computation_identity_sha256(plan, leaf)
+    identity = scientific_computation_identity_sha256(
+        plan,
+        leaf,
+        scientific_execution_contract=scientific_execution_contract,
+    )
     current = _authenticate_solved_leaf_hit(
-        plan, leaf, store, store.lookup(identity, leaf.leaf_id)
+        plan,
+        leaf,
+        store,
+        store.lookup(identity, leaf.leaf_id),
+        scientific_execution_contract=scientific_execution_contract,
     )
     if current.status in {
         SolvedLeafLookupStatus.HIT,
         SolvedLeafLookupStatus.CORRUPT,
     }:
+        return current
+    if scientific_execution_contract is not None:
+        # Budget-free predecessor identities are valid historical evidence but
+        # cannot be migrated across an explicitly trusted execution contract.
         return current
     if leaf.role != "primary":
         return current
@@ -6187,7 +6420,12 @@ def _checkpoint_stage_with_progress(
     digits: int,
     duration_seconds: float,
     record: CampaignLeafRecord,
+    leaf: CampaignLeafPlan,
+    scientific_execution_contract: Mapping[str, object] | None,
 ) -> None:
+    _validate_record_scientific_execution_contract(
+        leaf, record, scientific_execution_contract
+    )
     component_pass = "primary" if digits == 64 else "promoted"
     with progress_scope(
         **context,
@@ -6210,14 +6448,21 @@ def _publish_terminal_solved_leaf(
     leaf: CampaignLeafPlan,
     record: CampaignLeafRecord,
     store: SolvedLeafStore | None,
+    *,
+    scientific_execution_contract: Mapping[str, object] | None = None,
 ) -> None:
     if store is None or record.state not in {"PRODUCED", "UNRESOLVED"}:
         return
     try:
         _validate_cacheable_leaf_record(plan, leaf, record)
+        _validate_record_scientific_execution_contract(
+            leaf, record, scientific_execution_contract
+        )
         store.publish(
             scientific_identity_sha256=scientific_computation_identity_sha256(
-                plan, leaf
+                plan,
+                leaf,
+                scientific_execution_contract=scientific_execution_contract,
             ),
             leaf_id=leaf.leaf_id,
             record=record.to_mapping(),
@@ -6253,12 +6498,23 @@ def run_campaign_selection(
             raise ValueError("campaign resume requires an existing checkpoint")
         _load_checkpoint(plan, resume_path)
     execution_leaf_ids = _campaign_execution_leaf_ids(plan, selection)
+    leaf_by_id = {leaf.leaf_id: leaf for leaf in plan.leaves}
+    scientific_execution_contracts = {
+        leaf_id: _backend_scientific_execution_contract(
+            backend, leaf_by_id[leaf_id]
+        )
+        for leaf_id in execution_leaf_ids
+    }
     cache_lookups: dict[str, SolvedLeafLookup] = {}
     if solved_leaf_store is not None:
-        leaf_by_id = {leaf.leaf_id: leaf for leaf in plan.leaves}
         for leaf_id in execution_leaf_ids:
             cache_lookups[leaf_id] = _authenticated_solved_leaf_lookup(
-                plan, leaf_by_id[leaf_id], solved_leaf_store
+                plan,
+                leaf_by_id[leaf_id],
+                solved_leaf_store,
+                scientific_execution_contract=(
+                    scientific_execution_contracts[leaf_id]
+                ),
             )
         compatible = sum(
             lookup.status is SolvedLeafLookupStatus.HIT
@@ -6298,6 +6554,7 @@ def run_campaign_selection(
             resume=resume,
             solved_leaf_store=solved_leaf_store,
             cache_lookups=cache_lookups,
+            scientific_execution_contracts=scientific_execution_contracts,
         )
     except KeyboardInterrupt:
         interrupted_context = _ACTIVE_CAMPAIGN_LEAF_CONTEXT.get()
@@ -6426,12 +6683,16 @@ def _run_campaign_selection_active(
     resume: bool,
     solved_leaf_store: SolvedLeafStore | None,
     cache_lookups: Mapping[str, SolvedLeafLookup],
+    scientific_execution_contracts: Mapping[
+        str, Mapping[str, object] | None
+    ],
 ) -> CampaignRunSummary:
     if getattr(backend, "identity", None) != plan.backend_identity:
         raise ValueError("campaign backend identity does not match plan")
     available = getattr(backend, "precision_capabilities", None)
     if not isinstance(available, PrecisionCapabilities):
         raise ValueError("campaign backend precision capabilities are invalid")
+    leaf_by_id = {leaf.leaf_id: leaf for leaf in plan.leaves}
     path = Path(checkpoint_path)
     if path.exists():
         if not resume:
@@ -6489,6 +6750,11 @@ def _run_campaign_selection_active(
                     raise ValueError(
                         "campaign backend precision availability is not a permitted superset"
                     )
+            _validate_record_scientific_execution_contract(
+                leaf_by_id[record.leaf_id],
+                record,
+                scientific_execution_contracts.get(record.leaf_id),
+            )
         if migrated_schema6:
             leaf_by_id = {leaf.leaf_id: leaf for leaf in plan.leaves}
             for record in existing:
@@ -6516,11 +6782,13 @@ def _run_campaign_selection_active(
         len(record.stages) for record in records_by_id.values()
     )
     executed = 0
-    leaf_by_id = {leaf.leaf_id: leaf for leaf in plan.leaves}
     execution_leaf_ids = _campaign_execution_leaf_ids(plan, selection)
     continuation_responses: dict[tuple[str, str, str, str], complex] = {}
     for index, leaf_id in enumerate(execution_leaf_ids):
         leaf = leaf_by_id[leaf_id]
+        scientific_execution_contract = scientific_execution_contracts.get(
+            leaf_id
+        )
         continuation_key = _continuation_chain_key(leaf)
         response_predictor = continuation_responses.pop(
             continuation_key, None
@@ -6533,7 +6801,11 @@ def _run_campaign_selection_active(
         }:
             with progress_scope(**context):
                 _publish_terminal_solved_leaf(
-                    plan, leaf, record, solved_leaf_store
+                    plan,
+                    leaf,
+                    record,
+                    solved_leaf_store,
+                    scientific_execution_contract=scientific_execution_contract,
                 )
                 response = _produced_response(record)
                 if response is not None:
@@ -6548,7 +6820,10 @@ def _run_campaign_selection_active(
             lookup = cache_lookups.get(leaf.leaf_id)
             if lookup is None:
                 lookup = _authenticated_solved_leaf_lookup(
-                    plan, leaf, solved_leaf_store
+                    plan,
+                    leaf,
+                    solved_leaf_store,
+                    scientific_execution_contract=scientific_execution_contract,
                 )
             if lookup.status is SolvedLeafLookupStatus.HIT:
                 assert lookup.receipt is not None
@@ -6703,12 +6978,18 @@ def _run_campaign_selection_active(
                 digits=64,
                 duration_seconds=stage_duration,
                 record=record,
+                leaf=leaf,
+                scientific_execution_contract=scientific_execution_contract,
             )
 
         if record.state in {"PRODUCED", "UNRESOLVED"}:
             with progress_scope(**context):
                 _publish_terminal_solved_leaf(
-                    plan, leaf, record, solved_leaf_store
+                    plan,
+                    leaf,
+                    record,
+                    solved_leaf_store,
+                    scientific_execution_contract=scientific_execution_contract,
                 )
             response = _produced_response(record)
             if response is not None:
@@ -6788,10 +7069,18 @@ def _run_campaign_selection_active(
                     digits=120,
                     duration_seconds=recovery_duration,
                     record=record,
+                    leaf=leaf,
+                    scientific_execution_contract=scientific_execution_contract,
                 )
                 with progress_scope(**context):
                     _publish_terminal_solved_leaf(
-                        plan, leaf, record, solved_leaf_store
+                        plan,
+                        leaf,
+                        record,
+                        solved_leaf_store,
+                        scientific_execution_contract=(
+                            scientific_execution_contract
+                        ),
                     )
                 response = _produced_response(record)
                 if response is not None:
@@ -6929,10 +7218,20 @@ def _run_campaign_selection_active(
                         digits=120,
                         duration_seconds=recovery_duration,
                         record=record,
+                        leaf=leaf,
+                        scientific_execution_contract=(
+                            scientific_execution_contract
+                        ),
                     )
                     with progress_scope(**context):
                         _publish_terminal_solved_leaf(
-                            plan, leaf, record, solved_leaf_store
+                            plan,
+                            leaf,
+                            record,
+                            solved_leaf_store,
+                            scientific_execution_contract=(
+                                scientific_execution_contract
+                            ),
                         )
                     response = _produced_response(record)
                     if response is not None:
@@ -6997,10 +7296,18 @@ def _run_campaign_selection_active(
                     digits=120,
                     duration_seconds=recovery_duration,
                     record=record,
+                    leaf=leaf,
+                    scientific_execution_contract=scientific_execution_contract,
                 )
                 with progress_scope(**context):
                     _publish_terminal_solved_leaf(
-                        plan, leaf, record, solved_leaf_store
+                        plan,
+                        leaf,
+                        record,
+                        solved_leaf_store,
+                        scientific_execution_contract=(
+                            scientific_execution_contract
+                        ),
                     )
                 response = _produced_response(record)
                 if response is not None:
@@ -7060,6 +7367,8 @@ def _run_campaign_selection_active(
                     digits=precision80_digits,
                     duration_seconds=stage_duration,
                     record=record,
+                    leaf=leaf,
+                    scientific_execution_contract=scientific_execution_contract,
                 )
             elif leaf.role == "primary":
                 if not _validate_component_result(
@@ -7122,6 +7431,8 @@ def _run_campaign_selection_active(
                     digits=precision80_digits,
                     duration_seconds=stage_duration,
                     record=record,
+                    leaf=leaf,
+                    scientific_execution_contract=scientific_execution_contract,
                 )
             else:
                 comparison = None
@@ -7206,12 +7517,18 @@ def _run_campaign_selection_active(
                     digits=80,
                     duration_seconds=stage_duration,
                     record=record,
+                    leaf=leaf,
+                    scientific_execution_contract=scientific_execution_contract,
                 )
 
         if record.state in {"PRODUCED", "UNRESOLVED"}:
             with progress_scope(**context):
                 _publish_terminal_solved_leaf(
-                    plan, leaf, record, solved_leaf_store
+                    plan,
+                    leaf,
+                    record,
+                    solved_leaf_store,
+                    scientific_execution_contract=scientific_execution_contract,
                 )
             response = _produced_response(record)
             if response is not None:
@@ -7330,11 +7647,17 @@ def _run_campaign_selection_active(
                 digits=precision120_digits,
                 duration_seconds=stage_duration,
                 record=record,
+                leaf=leaf,
+                scientific_execution_contract=scientific_execution_contract,
             )
         if record.state in {"PRODUCED", "UNRESOLVED"}:
             with progress_scope(**context):
                 _publish_terminal_solved_leaf(
-                    plan, leaf, record, solved_leaf_store
+                    plan,
+                    leaf,
+                    record,
+                    solved_leaf_store,
+                    scientific_execution_contract=scientific_execution_contract,
                 )
             response = _produced_response(record)
             if response is not None:
@@ -8175,6 +8498,38 @@ class NativeCampaignStageBackend:
             raise MissingODECalibrationError(ODE_CALIBRATION_BLOCKER)
         return budget
 
+    def scientific_execution_contract_for(
+        self, leaf: CampaignLeafPlan
+    ) -> dict[str, object] | None:
+        """Bind every calibrated ODE budget reachable by this campaign leaf."""
+
+        if leaf.job.backend_identity != self.identity:
+            raise ValueError(
+                "campaign leaf backend identity does not match native backend"
+            )
+        promoted_digits = tuple(
+            digits
+            for digits in self.precision_capabilities.digits
+            if digits in (80, 120)
+        )
+        if not promoted_digits:
+            return None
+        reachable_digits = list(promoted_digits)
+        if (
+            leaf.role == "primary"
+            and leaf.mechanism_id == "exterior-light-ring"
+        ):
+            reachable_digits.insert(0, 40)
+        return {
+            "schema": "windows-solver.m02-scientific-execution-contract/1",
+            "ode_error_budgets_by_nominal_decimal_digits": {
+                str(digits): self._ode_error_budget_for_digits(
+                    digits
+                ).to_mapping()
+                for digits in reachable_digits
+            },
+        }
+
     @classmethod
     def from_selection(
         cls, plan: CampaignPlan, selection: CampaignSelection
@@ -8497,19 +8852,22 @@ class NativeCampaignStageBackend:
         previous_result = ComponentResult.from_mapping(
             previous_outcomes[-1].component_result["result"]
         )
-        recovery = previous_result.resolved_window
-        # The horizon mechanism owns its promoted stage outright: it is a
-        # single analytic readout, not a set of signed readouts that a
-        # selective plan could promote one at a time. A binary64 stage that
-        # recorded such a plan before the mechanism was decided must not
-        # divert the horizon leaf into the selective path, so the mechanism
-        # is consulted before the plan is.
+        # Bounded analytic horizon stages are selected by mechanism, never by
+        # a stale binary64 ladder-recovery hint.  Selective readout promotion
+        # is admitted only for PRIMARY exterior-light-ring components.
+        selective_recovery_allowed = (
+            leaf.role == "primary"
+            and leaf.mechanism_id == "exterior-light-ring"
+            and not _is_single_promoted_horizon_stage(leaf, digits)
+        )
+        recovery = (
+            previous_result.resolved_window
+            if selective_recovery_allowed
+            else None
+        )
         selective_plan = (
             None
-            if (
-                _is_single_promoted_horizon_stage(leaf, digits)
-                or not isinstance(recovery, Mapping)
-            )
+            if not isinstance(recovery, Mapping)
             else recovery.get("readout_specific_promotion_plan")
         )
         selective_tier = (

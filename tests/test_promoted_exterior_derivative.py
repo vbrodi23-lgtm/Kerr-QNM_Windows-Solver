@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import math
 from dataclasses import replace
 from decimal import Decimal, localcontext
 from pathlib import Path
@@ -12,6 +13,7 @@ from tests.test_promoted_horizon_component import (
     _promoted_baseline,
     _with_worker_receipt,
 )
+from tests.fixtures import synthetic_ode_error_budget
 from windows_solver.contracts import canonical_json_bytes
 from windows_solver.precision_tiers import PrecisionTier, working_precision_bits
 from windows_solver.response_batches import (
@@ -32,6 +34,9 @@ from windows_solver.response_engine import (
     FixedRootDeterminantSample,
     NumericalPolicy,
     VettedNativeDeterminantKernel,
+    _fixed_root_coordinate_derivative,
+    _JournaledComponentReads,
+    _JournaledPromotedExteriorBackend,
     regularised_gsn_precision_policy,
     run_promoted_exterior_component,
     run_promoted_full_ladder_validation,
@@ -39,7 +44,10 @@ from windows_solver.response_engine import (
     full_ladder_validation_policy,
 )
 from windows_solver.response_uncertainty import ComplexDisk, exterior_response_disk
-from windows_solver.partial_component_checkpoint import PartialComponentJournal
+from windows_solver.partial_component_checkpoint import (
+    PartialComponentJournal,
+    PartialComponentWorkUnit,
+)
 
 
 def _primary_exterior_leaf():
@@ -107,6 +115,13 @@ class FixedRootOnlyBackend:
         request_sha256 = hashlib.sha256(canonical_json_bytes(request)).hexdigest()
         derivative = 2.0 + 3.0j
         determinant = 1.0e-12 + derivative * converted
+        determinant_error_text = str(1.0e-9 * abs(converted))
+        determinant_error_decimal = Decimal(determinant_error_text)
+        determinant_error_abs = float(determinant_error_decimal)
+        if Decimal.from_float(determinant_error_abs) < determinant_error_decimal:
+            determinant_error_abs = math.nextafter(
+                determinant_error_abs, math.inf
+            )
         response = {
             "schema_version": 1,
             "status": "ok",
@@ -118,7 +133,7 @@ class FixedRootOnlyBackend:
             "amplitude_im": str(converted.imag),
             "determinant_re": str(determinant.real),
             "determinant_im": str(determinant.imag),
-            "determinant_error_abs": str(1.0e-9 * abs(converted)),
+            "determinant_error_abs": determinant_error_text,
             "determinant_error_status": "available/v1",
             "determinant_error_model_id": "synthetic-absolute-bound/v1",
             "determinant_family": "exterior-wronskian/v1",
@@ -149,7 +164,7 @@ class FixedRootOnlyBackend:
             omega=omega,
             amplitude=converted,
             determinant=determinant,
-            determinant_error_abs=1.0e-9 * abs(converted),
+            determinant_error_abs=determinant_error_abs,
             determinant_error_status="available/v1",
             determinant_error_model_id="synthetic-absolute-bound/v1",
             determinant_family="exterior-wronskian/v1",
@@ -168,6 +183,78 @@ class FixedRootOnlyBackend:
 
 
 class PromotedExteriorDerivativeTests(unittest.TestCase):
+    def test_fixed_root_derivative_uses_exact_worker_decimal_text(self) -> None:
+        leaf = _primary_exterior_leaf()
+        baseline = self._baseline_with_derivative_evidence(leaf)
+        backend = FixedRootOnlyBackend(leaf.job, baseline)
+
+        def exact_sample(amplitude, role, determinant_text):
+            sample = backend.sample_fixed_root_determinant(
+                leaf.job,
+                baseline.omega,
+                amplitude,
+                readout_role=role,
+            )
+            receipt = dict(sample.worker_response_receipt)
+            response = dict(receipt["response_binding"])
+            response.update({
+                "determinant_re": determinant_text,
+                "determinant_im": "0",
+                "determinant_error_abs": "1e-40",
+            })
+            receipt["response_binding"] = response
+            receipt["response_sha256"] = hashlib.sha256(
+                canonical_json_bytes(response)
+            ).hexdigest()
+            receipt_sha256 = hashlib.sha256(
+                canonical_json_bytes(receipt)
+            ).hexdigest()
+            exact_error = Decimal("1e-40")
+            bounded_error = float(exact_error)
+            if Decimal.from_float(bounded_error) < exact_error:
+                bounded_error = math.nextafter(bounded_error, math.inf)
+            return replace(
+                sample,
+                determinant=complex(float(Decimal(determinant_text)), 0.0),
+                determinant_error_abs=bounded_error,
+                worker_response_receipt=receipt,
+                worker_response_receipt_sha256=receipt_sha256,
+            )
+
+        step = 0.004
+        samples = (
+            exact_sample(
+                complex(step, 0.0),
+                "coordinate-real-plus-h",
+                "1.000000000000000000000000000004",
+            ),
+            exact_sample(
+                complex(-step, 0.0),
+                "coordinate-real-minus-h",
+                "0.999999999999999999999999999996",
+            ),
+            exact_sample(
+                complex(step / 2.0, 0.0),
+                "coordinate-real-plus-h2",
+                "1.000000000000000000000000000001",
+            ),
+            exact_sample(
+                complex(-step / 2.0, 0.0),
+                "coordinate-real-minus-h2",
+                "0.999999999999999999999999999999",
+            ),
+        )
+
+        disk, coarse, fine, propagated, disagreement = (
+            _fixed_root_coordinate_derivative(samples, step)
+        )
+
+        self.assertNotEqual(fine, 0.0j)
+        self.assertAlmostEqual(fine.real, 5.0e-28, delta=1.0e-42)
+        self.assertAlmostEqual(coarse.real, 1.0e-27, delta=1.0e-42)
+        self.assertGreater(disk.radius, propagated)
+        self.assertGreater(disagreement, 0.0)
+
     @staticmethod
     def _baseline_with_derivative_evidence(leaf):
         baseline = _promoted_baseline(
@@ -256,6 +343,93 @@ class PromotedExteriorDerivativeTests(unittest.TestCase):
         )
         self.assertFalse(mapping["finite_amplitude_ladder_executed"])
         self.assertEqual(mapping["finite_amplitude_readout_count"], 0)
+
+    def test_reused_fixed_sample_must_bind_nested_request_to_work_unit(self) -> None:
+        leaf = _primary_exterior_leaf()
+        baseline = self._baseline_with_derivative_evidence(leaf)
+        backend = FixedRootOnlyBackend(leaf.job, baseline)
+        role = "coordinate-real-plus-h"
+        sample = backend.sample_fixed_root_determinant(
+            leaf.job, baseline.omega, 0.004 + 0.0j, readout_role=role
+        )
+        unit = PartialComponentWorkUnit(
+            component_scientific_identity=EXTERIOR_DERIVATIVE_COMPONENT_IDENTITY,
+            leaf_id=leaf.job.leaf_id,
+            job_id=leaf.job.job_id,
+            policy_sha256=leaf.job.policy.identity_sha256,
+            backend_identity=leaf.job.backend_identity.identity_sha256,
+            determinant_family=sample.determinant_family,
+            determinant_normalisation=sample.determinant_normalisation,
+            precision_tier=sample.precision_tier,
+            mpfr_bits=sample.working_precision_bits,
+            amplitude=sample.amplitude,
+            epsilon=abs(sample.amplitude),
+            readout_role=role,
+            refinement_level=0,
+            request_sha256="0" * 64,
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            journal = PartialComponentJournal.create(
+                Path(temporary) / "fixed.json",
+                expected_work_unit_ids=(unit.work_unit_id,),
+            )
+            journal.record(unit.to_entry({
+                "schema": "windows-solver.promoted-component-journal-receipt/1",
+                "kind": "fixed-root-determinant-sample",
+                "output": sample.to_mapping(),
+            }))
+            guarded = _JournaledPromotedExteriorBackend(
+                backend,
+                journal,
+                {role: unit},
+                exact_request_binding=True,
+            )
+            with self.assertRaisesRegex(ValueError, "reused output request"):
+                guarded._reuse(role, "fixed-root-determinant-sample")
+
+    def test_reused_root_must_bind_nested_request_to_work_unit(self) -> None:
+        leaf = _primary_exterior_leaf()
+        baseline = self._baseline_with_derivative_evidence(leaf)
+        backend = FixedRootOnlyBackend(leaf.job, baseline)
+        unit = PartialComponentWorkUnit(
+            component_scientific_identity=(
+                "same-equation-signed-root-component-journal/v1"
+            ),
+            leaf_id=leaf.job.leaf_id,
+            job_id=leaf.job.job_id,
+            policy_sha256=leaf.job.policy.identity_sha256,
+            backend_identity=leaf.job.backend_identity.identity_sha256,
+            determinant_family="exterior-wronskian/v1",
+            determinant_normalisation=(
+                "unit-asymptotic-branch-wronskian/v1"
+            ),
+            precision_tier=PrecisionTier.BINARY64,
+            mpfr_bits=working_precision_bits(PrecisionTier.BINARY64),
+            amplitude=0.0j,
+            epsilon=0.0,
+            readout_role="baseline",
+            refinement_level=0,
+            request_sha256="0" * 64,
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            journal = PartialComponentJournal.create(
+                Path(temporary) / "root.json",
+                expected_work_unit_ids=(unit.work_unit_id,),
+            )
+            journal.record(unit.to_entry({
+                "schema": "windows-solver.promoted-component-journal-receipt/1",
+                "kind": "root-readout",
+                "output": baseline.to_mapping(),
+            }))
+            guarded = _JournaledComponentReads(
+                backend,
+                journal,
+                {("baseline", 0.0j): unit},
+            )
+            with self.assertRaisesRegex(ValueError, "reused output request"):
+                guarded.read_root(
+                    leaf.job, "baseline", 0.0j, None, None
+                )
 
     def test_production_partial_journal_resumes_baseline_without_backend_recompute(self) -> None:
         leaf = _primary_exterior_leaf()
@@ -591,6 +765,7 @@ class PromotedExteriorDerivativeTests(unittest.TestCase):
             self._baseline_with_derivative_evidence(leaf),
             omega=leaf.job.root.omega,
         )
+        budget = synthetic_ode_error_budget(80).to_mapping()
         runtime = {
             "precision_digits": 80,
             "working_precision_bits": 298,
@@ -599,6 +774,10 @@ class PromotedExteriorDerivativeTests(unittest.TestCase):
             "regularised_gsn_precision_policy": dict(
                 regularised_gsn_precision_policy(leaf.mechanism_id)
             ),
+            "ode_error_budget": budget,
+            "ode_error_budget_sha256": hashlib.sha256(
+                canonical_json_bytes(budget)
+            ).hexdigest(),
         }
         result = run_promoted_exterior_component(
             leaf.job,
@@ -709,6 +888,7 @@ class PromotedExteriorDerivativeTests(unittest.TestCase):
             self._baseline_with_derivative_evidence(leaf),
             omega=leaf.job.root.omega,
         )
+        budget = synthetic_ode_error_budget(80).to_mapping()
         runtime = {
             "precision_digits": 80,
             "working_precision_bits": 298,
@@ -717,6 +897,10 @@ class PromotedExteriorDerivativeTests(unittest.TestCase):
             "regularised_gsn_precision_policy": dict(
                 regularised_gsn_precision_policy(leaf.mechanism_id)
             ),
+            "ode_error_budget": budget,
+            "ode_error_budget_sha256": hashlib.sha256(
+                canonical_json_bytes(budget)
+            ).hexdigest(),
         }
         result = run_promoted_exterior_component(
             leaf.job,

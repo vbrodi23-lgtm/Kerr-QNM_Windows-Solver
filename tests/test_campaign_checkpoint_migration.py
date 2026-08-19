@@ -173,11 +173,15 @@ def _stopped_schema7_checkpoint():
     return plan, source
 
 
-def _origin_schema7_stopped_preflight_checkpoint():
+def _origin_schema7_stopped_preflight_checkpoint(
+    *,
+    retain_missing_precision: bool = False,
+    failure_code: str = "INSUFFICIENT_ASYMPTOTIC_PRECISION",
+):
     fixture = precision_tests.PromotedResourceContainmentTests()
     run = fixture._run_with_failure(
         julia_backend.JuliaNumericalControlError,
-        "INSUFFICIENT_ASYMPTOTIC_PRECISION",
+        failure_code,
     )
     temporary, root, plan, _, incident, _, _, _, _ = run
     mapping = json.loads((root / "checkpoint.json").read_bytes())
@@ -187,10 +191,14 @@ def _origin_schema7_stopped_preflight_checkpoint():
     record = next(
         item for item in mapping["records"] if item["leaf_id"] == incident.leaf_id
     )
-    record["state"] = "IN_PROGRESS"
+    record["state"] = (
+        "MISSING_PRECISION" if retain_missing_precision else "IN_PROGRESS"
+    )
     record["stages"] = record["stages"][:1]
     record["computed"] = False
-    record["missing_precision_digits"] = None
+    record["missing_precision_digits"] = (
+        120 if retain_missing_precision else None
+    )
     record["sentinel_comparison"] = None
     leaf_by_id = {leaf.leaf_id: leaf for leaf in plan.leaves}
     attempt = mapping["attempts"][0]
@@ -303,6 +311,45 @@ def _origin_schema7_promoted_component_checkpoint():
 
 
 class CampaignCheckpointMigrationTests(unittest.TestCase):
+    def test_invalidated_retry_predecessor_normalizes_missing_precision(self):
+        for failure_code in (
+            "INSUFFICIENT_ASYMPTOTIC_PRECISION",
+            "HORIZON_ARITHMETIC_INADEQUATE",
+        ):
+            with self.subTest(failure_code=failure_code):
+                plan, source_bytes = (
+                    _origin_schema7_stopped_preflight_checkpoint(
+                        retain_missing_precision=True,
+                        failure_code=failure_code,
+                    )
+                )
+                with tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    source = root / "missing-schema7.json"
+                    destination = root / "schema8.json"
+                    source.write_bytes(source_bytes)
+
+                    migrate_campaign_checkpoint(
+                        source,
+                        destination,
+                        plan=plan,
+                        expected_source_sha256=hashlib.sha256(
+                            source_bytes
+                        ).hexdigest(),
+                        changed_endpoint_policy_identities={},
+                    )
+
+                    migrated = json.loads(destination.read_bytes())
+                    validate_campaign_checkpoint(plan, destination)
+                    record = migrated["records"][0]
+                    self.assertEqual(record["state"], "IN_PROGRESS")
+                    self.assertIsNone(record["missing_precision_digits"])
+                    self.assertEqual(
+                        [stage["digits"] for stage in record["stages"]],
+                        [64],
+                    )
+                    self.assertEqual(migrated["attempts"], [])
+
     def test_schema7_promoted_component_suffixes_are_invalidated_by_identity(self):
         plan, source_bytes = _origin_schema7_promoted_component_checkpoint()
         historical = json.loads(source_bytes)
@@ -521,6 +568,58 @@ class CampaignCheckpointMigrationTests(unittest.TestCase):
 
             self.assertFalse(destination.exists())
             self.assertFalse(receipt.exists())
+
+    def test_authenticated_orphan_receipt_is_recovered_on_retry(self):
+        plan, source_bytes = _stopped_schema7_checkpoint()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "stopped-checkpoint.json"
+            destination = root / "migrated-checkpoint.json"
+            receipt = root / "migration-receipt.json"
+            source.write_bytes(source_bytes)
+
+            def hard_stop_after_receipt(
+                staged_checkpoint,
+                checkpoint,
+                staged_receipt,
+                receipt_target,
+            ):
+                del staged_checkpoint, checkpoint
+                migration_module._install_staged_file(
+                    staged_receipt, receipt_target
+                )
+                raise SystemExit("synthetic hard stop")
+
+            with patch.object(
+                migration_module,
+                "_install_staged_pair",
+                side_effect=hard_stop_after_receipt,
+            ), self.assertRaises(SystemExit):
+                migrate_campaign_checkpoint(
+                    source,
+                    destination,
+                    plan=plan,
+                    expected_source_sha256=hashlib.sha256(
+                        source_bytes
+                    ).hexdigest(),
+                    changed_endpoint_policy_identities={},
+                    migration_receipt_path=receipt,
+                )
+
+            self.assertFalse(destination.exists())
+            self.assertTrue(receipt.exists())
+            migrate_campaign_checkpoint(
+                source,
+                destination,
+                plan=plan,
+                expected_source_sha256=hashlib.sha256(
+                    source_bytes
+                ).hexdigest(),
+                changed_endpoint_policy_identities={},
+                migration_receipt_path=receipt,
+            )
+            validate_campaign_checkpoint(plan, destination)
+            self.assertTrue(receipt.exists())
 
     def test_source_late_race_installs_neither_output(self):
         plan, source_bytes = _stopped_schema7_checkpoint()

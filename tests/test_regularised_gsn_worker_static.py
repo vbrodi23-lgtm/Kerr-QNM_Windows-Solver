@@ -1151,7 +1151,7 @@ class RegularisedGsnWorkerSourceTests(unittest.TestCase):
             self.worker,
         )
         self.assertIn('"promoted_root_readout_policy"', validation)
-        self.assertEqual(result_fields.count('"schema_version" => 8'), 2)
+        self.assertEqual(result_fields.count('"schema_version" => 9'), 2)
         self.assertEqual(
             len(re.findall(
                 r'"promoted_root_readout_policy"\s*=>\s*'

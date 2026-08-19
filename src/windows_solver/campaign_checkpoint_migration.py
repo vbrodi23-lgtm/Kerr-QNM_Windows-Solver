@@ -209,7 +209,9 @@ def migrate_campaign_checkpoint(
     )
     if source.resolve() == destination.resolve():
         raise ValueError("campaign checkpoint migration requires a new destination")
-    if destination.exists() or receipt_path.exists():
+    destination_exists = destination.exists()
+    receipt_exists = receipt_path.exists()
+    if destination_exists and not receipt_exists:
         raise ValueError("campaign checkpoint migration destination already exists")
     source_bytes = _authenticated_source(source, expected_source_sha256)
     selection, records, attempts, _, _ = _load_checkpoint_with_attempts(
@@ -260,6 +262,7 @@ def migrate_campaign_checkpoint(
             retained_records.append(migrated)
 
     retained_attempts = []
+    invalidated_attempt_leaf_ids: set[str] = set()
     for attempt in attempts:
         matches = _endpoint_policy_matches(attempt.to_mapping(), changes)
         historical_request_identity_changed = attempt.precision_digits > 64
@@ -268,6 +271,7 @@ def migrate_campaign_checkpoint(
             or attempt.leaf_id in affected_leaf_ids
             or historical_request_identity_changed
         ):
+            invalidated_attempt_leaf_ids.add(attempt.leaf_id)
             invalidated.append({
                 "evidence_kind": "campaign-execution-attempt",
                 "leaf_id": attempt.leaf_id,
@@ -281,6 +285,28 @@ def migrate_campaign_checkpoint(
             })
         else:
             retained_attempts.append(attempt)
+
+    normalized_records: list[CampaignLeafRecord] = []
+    for record in retained_records:
+        digits = tuple(stage.outcome.digits for stage in record.stages)
+        if (
+            record.leaf_id in invalidated_attempt_leaf_ids
+            and record.state == "MISSING_PRECISION"
+            and record.missing_precision_digits == 120
+            and digits == (64,)
+        ):
+            record = CampaignLeafRecord(
+                leaf_id=record.leaf_id,
+                role=record.role,
+                state="IN_PROGRESS",
+                stages=record.stages,
+                trigger_ids=record.trigger_ids,
+                sentinel=record.sentinel,
+                missing_precision_digits=None,
+                sentinel_comparison=None,
+            )
+        normalized_records.append(record)
+    retained_records = normalized_records
 
     destination_value = _checkpoint_mapping(
         plan, selection, retained_records, retained_attempts
@@ -303,9 +329,38 @@ def migrate_campaign_checkpoint(
         **receipt_material,
         "migration_receipt_sha256": _digest(receipt_material),
     }
-    staged_destination = _stage_new_file(destination, destination_value)
-    staged_receipt = _stage_new_file(receipt_path, receipt)
+    expected_destination_bytes = canonical_json_bytes(destination_value)
+    expected_receipt_bytes = canonical_json_bytes(receipt)
+    if destination_exists and receipt_exists:
+        if (
+            destination.read_bytes() != expected_destination_bytes
+            or receipt_path.read_bytes() != expected_receipt_bytes
+        ):
+            raise ValueError(
+                "campaign checkpoint migration destination already exists"
+            )
+        _recheck_source(source, source_bytes)
+        _load_checkpoint_with_attempts(plan, destination)
+        return CampaignCheckpointMigrationResult(
+            expected_source_sha256,
+            hashlib.sha256(expected_destination_bytes).hexdigest(),
+            receipt["migration_receipt_sha256"],
+            len(retained_records),
+            len(invalidated),
+        )
+    if receipt_exists:
+        if receipt_path.read_bytes() != expected_receipt_bytes:
+            raise ValueError(
+                "campaign checkpoint migration destination already exists"
+            )
+        receipt_path.unlink()
+        _fsync_directory(receipt_path.parent)
+
+    staged_destination: Path | None = None
+    staged_receipt: Path | None = None
     try:
+        staged_destination = _stage_new_file(destination, destination_value)
+        staged_receipt = _stage_new_file(receipt_path, receipt)
         _load_checkpoint_with_attempts(plan, staged_destination)
         _recheck_source(source, source_bytes)
         _install_staged_pair(
@@ -322,8 +377,10 @@ def migrate_campaign_checkpoint(
             receipt_path.unlink(missing_ok=True)
             raise
     finally:
-        staged_destination.unlink(missing_ok=True)
-        staged_receipt.unlink(missing_ok=True)
+        if staged_destination is not None:
+            staged_destination.unlink(missing_ok=True)
+        if staged_receipt is not None:
+            staged_receipt.unlink(missing_ok=True)
     return CampaignCheckpointMigrationResult(
         expected_source_sha256,
         hashlib.sha256(destination.read_bytes()).hexdigest(),

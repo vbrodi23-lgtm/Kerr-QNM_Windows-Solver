@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import replace
 import hashlib
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -19,7 +20,11 @@ from windows_solver.julia_response_backend import (
     _precision_policy,
 )
 from windows_solver.contracts import canonical_json_bytes
-from windows_solver.response_batches import PrecisionCapabilities, build_campaign_plan
+from windows_solver.response_batches import (
+    NativeCampaignStageBackend,
+    PrecisionCapabilities,
+    build_campaign_plan,
+)
 from windows_solver.response_engine import (
     NumericalPolicy,
     VettedNativeDeterminantKernel,
@@ -140,6 +145,105 @@ class AdaptiveODEBudgetTests(unittest.TestCase):
             ))).hexdigest(),
         )
 
+    def test_scientific_runtime_binds_exact_ode_budget_and_digest(self) -> None:
+        job = self._job()
+        budget = derive_ode_error_budget(
+            required_root_correction_abs=1.0e-10,
+            determinant_derivative_lower_bound_abs=10.0,
+            precision_tier=PrecisionTier.BIGFLOAT_80,
+            calibration=CALIBRATION,
+        )
+        changed = derive_ode_error_budget(
+            required_root_correction_abs=5.0e-11,
+            determinant_derivative_lower_bound_abs=10.0,
+            precision_tier=PrecisionTier.BIGFLOAT_80,
+            calibration=CALIBRATION,
+        )
+
+        adapter = SimpleNamespace(runtime_provenance={})
+        runtime = JuliaPrecisionRootBackend(
+            job.backend_identity, adapter, 80, ode_error_budget=budget
+        ).scientific_runtime_for(job)
+        changed_runtime = JuliaPrecisionRootBackend(
+            job.backend_identity, adapter, 80, ode_error_budget=changed
+        ).scientific_runtime_for(job)
+
+        self.assertEqual(runtime["ode_error_budget"], budget.to_mapping())
+        self.assertEqual(
+            runtime["ode_error_budget_sha256"],
+            hashlib.sha256(
+                canonical_json_bytes(budget.to_mapping())
+            ).hexdigest(),
+        )
+        self.assertNotEqual(
+            runtime["ode_error_budget_sha256"],
+            changed_runtime["ode_error_budget_sha256"],
+        )
+
+    def test_native_execution_contract_binds_every_reachable_budget(self) -> None:
+        plan = build_campaign_plan(
+            policy=NumericalPolicy(),
+            backend_identity=VettedNativeDeterminantKernel.identity,
+            precision_capabilities=PrecisionCapabilities((64, 80, 120)),
+        )
+        leaf = next(
+            item for item in plan.leaves
+            if item.role == "primary"
+            and item.mechanism_id == "exterior-light-ring"
+        )
+        budgets = {
+            digits: derive_ode_error_budget(
+                required_root_correction_abs=10.0 ** (-digits // 4),
+                determinant_derivative_lower_bound_abs=10.0,
+                precision_tier=f"bigfloat-{digits}",
+                calibration=CALIBRATION,
+            )
+            for digits in (40, 80, 120)
+        }
+        backend = NativeCampaignStageBackend(
+            object(),
+            plan.precision_capabilities,
+            object(),
+            julia_adapter=object(),
+            ode_error_budgets=budgets,
+        )
+
+        contract = backend.scientific_execution_contract_for(leaf)
+
+        self.assertEqual(
+            contract["schema"],
+            "windows-solver.m02-scientific-execution-contract/1",
+        )
+        self.assertEqual(
+            contract["ode_error_budgets_by_nominal_decimal_digits"],
+            {
+                str(digits): budgets[digits].to_mapping()
+                for digits in (40, 80, 120)
+            },
+        )
+
+    def test_native_execution_contract_fails_closed_without_calibration(self) -> None:
+        plan = build_campaign_plan(
+            policy=NumericalPolicy(),
+            backend_identity=VettedNativeDeterminantKernel.identity,
+            precision_capabilities=PrecisionCapabilities((64, 80)),
+        )
+        leaf = next(
+            item for item in plan.leaves
+            if item.role == "primary"
+            and item.mechanism_id == "horizon-admittance"
+        )
+        backend = NativeCampaignStageBackend(
+            object(),
+            plan.precision_capabilities,
+            object(),
+            julia_adapter=object(),
+        )
+
+        with self.assertRaises(MissingODECalibrationError) as caught:
+            backend.scientific_execution_contract_for(leaf)
+        self.assertEqual(str(caught.exception), ODE_CALIBRATION_BLOCKER)
+
     def test_changed_ode_budget_rejects_existing_journal_plan(self) -> None:
         job = self._job()
         budget = derive_ode_error_budget(
@@ -201,6 +305,27 @@ class AdaptiveODEBudgetTests(unittest.TestCase):
         self.assertEqual(tight.calibration_identity, "synthetic-calibration/v1")
         self.assertEqual(tight.to_mapping()["nominal_decimal_digits"], 120)
         self.assertEqual(tight.to_mapping()["working_precision_bits"], 431)
+
+    def test_budget_total_must_equal_root_correction_times_derivative_bound(self) -> None:
+        budget = derive_ode_error_budget(
+            required_root_correction_abs=1.0e-10,
+            determinant_derivative_lower_bound_abs=10.0,
+            precision_tier=PrecisionTier.BIGFLOAT_80,
+            calibration=CALIBRATION,
+        )
+        doubled_total = 2.0 * budget.determinant_error_budget_abs
+        doubled_allocations = {
+            name: 2.0 * value
+            for name, value in budget.determinant_allocations.items()
+        }
+        with self.assertRaisesRegex(
+            ValueError, "root correction.*derivative lower bound"
+        ):
+            replace(
+                budget,
+                determinant_error_budget_abs=doubled_total,
+                determinant_allocations=doubled_allocations,
+            )
 
     def test_absent_calibration_fails_with_exact_human_math_blocker(self) -> None:
         with self.assertRaises(MissingODECalibrationError) as caught:

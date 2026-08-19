@@ -96,6 +96,11 @@ class ProductionLightRingResponseRecoveryScriptTests(unittest.TestCase):
             self.assertIn(field, self.source)
         self.assertNotIn("$Result.resolved_window.included_epsilons", self.source)
         self.assertNotIn("$Result.derivative_evidence.response_disk", self.source)
+        self.assertNotIn("$Result.response_uncertainty_status", self.source)
+        self.assertIn(
+            'Get-OptionalProperty $Result "response_uncertainty_status"',
+            self.source,
+        )
 
 
 if __name__ == "__main__":

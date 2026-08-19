@@ -66,6 +66,8 @@ from .response_ladder_recovery import (
     LadderReadout as RecoveryLadderReadout,
     LadderRecoveryResult,
     RecoveryDisposition,
+    WindowEvidence,
+    WindowLevelEvidence,
     consecutive_windows,
     recover_response_ladder,
 )
@@ -163,7 +165,10 @@ EXTERIOR_DETERMINANT_ERROR_MATH_REVIEW_BLOCKER = (
     "TODO: [HUMAN MATH REVIEW REQUIRED - fixed-root exterior determinant "
     "error model is unavailable]"
 )
-WORKER_RESPONSE_RECEIPT_SCHEMA = "windows-solver.worker-response-receipt/2"
+WORKER_RESPONSE_RECEIPT_SCHEMA = "windows-solver.worker-response-receipt/3"
+PREVIOUS_WORKER_RESPONSE_RECEIPT_SCHEMA = (
+    "windows-solver.worker-response-receipt/2"
+)
 HISTORICAL_WORKER_RESPONSE_RECEIPT_SCHEMA = (
     "windows-solver.worker-response-receipt/1"
 )
@@ -173,9 +178,11 @@ HISTORICAL_WORKER_RESPONSE_RECEIPT_SCHEMA = (
 # versus escalated authentication and represents unexecuted 2h/ih derivative
 # directions explicitly as absent. Version 7 replaces promoted acceptance with
 # binary64-parity PRIMARY Newton and fixed-root TRUNCATION/RESOLUTION evidence.
+# Version 8 added frequency-disk derivative authentication. Version 9 persists
+# every successful adaptive horizon endpoint search in the sealed response.
 # Error responses remain independently versioned at 1.
-WORKER_RESPONSE_WIRE_SCHEMA = 8
-HISTORICAL_WORKER_RESPONSE_WIRE_SCHEMAS = frozenset({3, 4, 5, 6, 7})
+WORKER_RESPONSE_WIRE_SCHEMA = 9
+HISTORICAL_WORKER_RESPONSE_WIRE_SCHEMAS = frozenset({3, 4, 5, 6, 7, 8})
 _ROOT_AUTHENTICATION_WIRE_SCHEMAS = frozenset({4, 5, 6})
 _HISTORICAL_WORKER_RESPONSE_RECEIPT_FIELDS = frozenset({
     "schema",
@@ -188,9 +195,14 @@ _HISTORICAL_WORKER_RESPONSE_RECEIPT_FIELDS = frozenset({
     "raw_determinant_evidence_status",
     "receipt_sha256",
 })
-_WORKER_RESPONSE_RECEIPT_FIELDS = _HISTORICAL_WORKER_RESPONSE_RECEIPT_FIELDS | {
-    "promoted_root_readout_policy",
-    "primary_acceptance_sha256",
+_PREVIOUS_WORKER_RESPONSE_RECEIPT_FIELDS = (
+    _HISTORICAL_WORKER_RESPONSE_RECEIPT_FIELDS | {
+        "promoted_root_readout_policy",
+        "primary_acceptance_sha256",
+    }
+)
+_WORKER_RESPONSE_RECEIPT_FIELDS = _PREVIOUS_WORKER_RESPONSE_RECEIPT_FIELDS | {
+    "horizon_endpoint_search_evidence",
 }
 _HEX_64 = re.compile(r"[0-9a-f]{64}")
 HORIZON_DETERMINANT_FAMILY = "horizon-scattering/v1"
@@ -432,6 +444,113 @@ def _sha256(value: object) -> str:
     return hashlib.sha256(canonical_json_bytes(value)).hexdigest()
 
 
+def _validated_successful_horizon_endpoint_search_evidence(
+    value: object,
+) -> list[dict[str, object]]:
+    """Authenticate persisted successful adaptive endpoint selections."""
+
+    if not isinstance(value, list) or not value:
+        raise ValueError("horizon endpoint search evidence is missing")
+    canonical = json.loads(canonical_json_bytes(value))
+    if not isinstance(canonical, list):
+        raise ValueError("horizon endpoint search evidence is invalid")
+    evidence_fields = {
+        "outcome",
+        "policy_identity",
+        "selected_pair",
+        "rejected_candidates",
+        "endpoint_orders",
+        "homogeneous_rhs_evaluations_before_pair",
+    }
+    candidate_fields = {
+        "rho",
+        "endpoint_order",
+        "ingoing_best_prefix_order",
+        "outgoing_best_prefix_order",
+        "ingoing_adequate",
+        "outgoing_adequate",
+    }
+
+    def candidate(item: object, *, selected: bool) -> tuple[str, int]:
+        if not isinstance(item, dict) or set(item) != candidate_fields:
+            raise ValueError("horizon endpoint candidate evidence is invalid")
+        try:
+            rho = _conditioning_decimal_from_text(
+                item["rho"], "horizon endpoint candidate rho"
+            )
+        except ValueError as error:
+            raise ValueError(
+                "horizon endpoint candidate evidence is invalid"
+            ) from error
+        order = item["endpoint_order"]
+        prefix_orders = (
+            item["ingoing_best_prefix_order"],
+            item["outgoing_best_prefix_order"],
+        )
+        if (
+            rho >= 0
+            or isinstance(order, bool)
+            or not isinstance(order, int)
+            or order < 1
+            or any(
+                value is not None
+                and (
+                    isinstance(value, bool)
+                    or not isinstance(value, int)
+                    or value < 1
+                )
+                for value in prefix_orders
+            )
+            or type(item["ingoing_adequate"]) is not bool
+            or type(item["outgoing_adequate"]) is not bool
+            or (
+                selected
+                and (
+                    item["ingoing_adequate"] is not True
+                    or item["outgoing_adequate"] is not True
+                    or any(value is None for value in prefix_orders)
+                )
+            )
+        ):
+            raise ValueError("horizon endpoint candidate evidence is invalid")
+        return str(rho), order
+
+    for item in canonical:
+        if not isinstance(item, dict) or set(item) != evidence_fields:
+            raise ValueError("horizon endpoint search evidence is invalid")
+        selected_pair = item["selected_pair"]
+        rejected = item["rejected_candidates"]
+        orders = item["endpoint_orders"]
+        if (
+            item["outcome"] != "adequate/v1"
+            or not isinstance(item["policy_identity"], str)
+            or not item["policy_identity"]
+            or not isinstance(selected_pair, list)
+            or len(selected_pair) != 2
+            or not isinstance(rejected, list)
+            or not isinstance(orders, list)
+            or not orders
+            or any(
+                isinstance(order, bool)
+                or not isinstance(order, int)
+                or order < 1
+                for order in orders
+            )
+            or orders != sorted(set(orders))
+            or item["homogeneous_rhs_evaluations_before_pair"] != 0
+        ):
+            raise ValueError("horizon endpoint search evidence is invalid")
+        identities = [
+            candidate(raw, selected=True) for raw in selected_pair
+        ]
+        identities.extend(
+            candidate(raw, selected=False) for raw in rejected
+        )
+        if len(identities) != len(set(identities)):
+            raise ValueError("horizon endpoint candidates are not unique")
+    return canonical
+
+
 def _validated_worker_response_receipt(
     value: object,
 ) -> Mapping[str, object] | None:
@@ -441,13 +560,18 @@ def _validated_worker_response_receipt(
         raise ValueError("worker response receipt fields are invalid")
     fields = set(value)
     current = fields == _WORKER_RESPONSE_RECEIPT_FIELDS
+    previous = fields == _PREVIOUS_WORKER_RESPONSE_RECEIPT_FIELDS
     historical = fields == _HISTORICAL_WORKER_RESPONSE_RECEIPT_FIELDS
-    if not (current or historical):
+    if not (current or previous or historical):
         raise ValueError("worker response receipt fields are invalid")
     expected_schema = (
         WORKER_RESPONSE_RECEIPT_SCHEMA
         if current
-        else HISTORICAL_WORKER_RESPONSE_RECEIPT_SCHEMA
+        else (
+            PREVIOUS_WORKER_RESPONSE_RECEIPT_SCHEMA
+            if previous
+            else HISTORICAL_WORKER_RESPONSE_RECEIPT_SCHEMA
+        )
     )
     if value["schema"] != expected_schema:
         raise ValueError("worker response receipt schema is invalid")
@@ -467,11 +591,13 @@ def _validated_worker_response_receipt(
     allowed_wire_schemas = (
         {WORKER_RESPONSE_WIRE_SCHEMA}
         if current
-        else HISTORICAL_WORKER_RESPONSE_WIRE_SCHEMAS
+        else (
+            {8} if previous else HISTORICAL_WORKER_RESPONSE_WIRE_SCHEMAS - {8}
+        )
     )
     if wire_schema not in allowed_wire_schemas:
         raise ValueError("worker response receipt wire schema is invalid")
-    if current:
+    if current or previous:
         if (
             value["promoted_root_readout_policy"]
             != PROMOTED_ROOT_READOUT_POLICY
@@ -480,6 +606,17 @@ def _validated_worker_response_receipt(
         ):
             raise ValueError(
                 "worker response receipt promoted policy identity is invalid"
+            )
+    if current:
+        mechanism_id = request_binding.get("mechanism_id")
+        endpoint_evidence = value["horizon_endpoint_search_evidence"]
+        if mechanism_id == "horizon-admittance":
+            _validated_successful_horizon_endpoint_search_evidence(
+                endpoint_evidence
+            )
+        elif endpoint_evidence is not None:
+            raise ValueError(
+                "exterior worker response carries horizon endpoint evidence"
             )
     residual = _conditioning_decimal_from_text(
         value["root_residual_abs_text"],
@@ -1731,6 +1868,51 @@ class DecimalComplex:
         """
 
         return {"real": str(self.real), "imaginary": str(self.imaginary)}
+
+
+def _bounded_binary64_disk_from_decimal(
+    centre: DecimalComplex,
+    radius: Decimal,
+    *,
+    subject: str,
+) -> ComplexDisk:
+    """Round an exact decimal disk to binary64 without losing containment."""
+
+    if (
+        not isinstance(centre, DecimalComplex)
+        or type(radius) is not Decimal
+        or not centre.real.is_finite()
+        or not centre.imaginary.is_finite()
+        or not radius.is_finite()
+        or radius <= 0
+    ):
+        raise ValueError(f"{subject} decimal disk is invalid")
+    precision = max(
+        50,
+        len(centre.real.as_tuple().digits) + 16,
+        len(centre.imaginary.as_tuple().digits) + 16,
+        len(radius.as_tuple().digits) + 16,
+    )
+    with localcontext() as context:
+        context.prec = precision
+        converted = complex(float(centre.real), float(centre.imaginary))
+        if not (
+            math.isfinite(converted.real) and math.isfinite(converted.imag)
+        ):
+            raise ValueError(f"{subject} centre is not binary64-representable")
+        rounding = DecimalComplex(
+            centre.real - Decimal.from_float(converted.real),
+            centre.imaginary - Decimal.from_float(converted.imag),
+        ).magnitude()
+        required_radius = radius + rounding
+        converted_radius = float(required_radius)
+        if not math.isfinite(converted_radius):
+            raise ValueError(f"{subject} radius is not binary64-representable")
+        if Decimal.from_float(converted_radius) < required_radius:
+            converted_radius = math.nextafter(converted_radius, math.inf)
+        if converted_radius == 0.0:
+            converted_radius = math.nextafter(0.0, math.inf)
+    return ComplexDisk(converted, converted_radius)
 
 
 def _authentication_complex_from_mapping(
@@ -3782,7 +3964,11 @@ class FixedRootDeterminantSample:
                 float(response_binding["determinant_re"]),
                 float(response_binding["determinant_im"]),
             )
-            receipt_error = float(response_binding["determinant_error_abs"])
+            raw_receipt_error = response_binding["determinant_error_abs"]
+            receipt_error_decimal = Decimal(str(raw_receipt_error))
+            receipt_error = float(receipt_error_decimal)
+            if Decimal.from_float(receipt_error) < receipt_error_decimal:
+                receipt_error = math.nextafter(receipt_error, math.inf)
         except (KeyError, TypeError, ValueError) as error:
             raise ValueError("fixed-root sample receipt material mismatch") from error
         if (
@@ -3800,6 +3986,47 @@ class FixedRootDeterminantSample:
             or self.working_precision_bits < 1
         ):
             raise ValueError("fixed-root sample working precision bits are invalid")
+
+    def _response_decimal(self, field: str, subject: str) -> Decimal:
+        response = self.worker_response_receipt["response_binding"]
+        value = response[field]
+        if isinstance(value, str):
+            return _conditioning_decimal_from_text(value, subject)
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+        ):
+            raise ValueError(f"{subject} must be finite decimal evidence")
+        return Decimal(str(value))
+
+    @property
+    def exact_amplitude(self) -> DecimalComplex:
+        return DecimalComplex(
+            self._response_decimal(
+                "amplitude_re", "fixed-root sample amplitude real"
+            ),
+            self._response_decimal(
+                "amplitude_im", "fixed-root sample amplitude imaginary"
+            ),
+        )
+
+    @property
+    def exact_determinant(self) -> DecimalComplex:
+        return DecimalComplex(
+            self._response_decimal(
+                "determinant_re", "fixed-root sample determinant real"
+            ),
+            self._response_decimal(
+                "determinant_im", "fixed-root sample determinant imaginary"
+            ),
+        )
+
+    @property
+    def exact_determinant_error_abs(self) -> Decimal:
+        return self._response_decimal(
+            "determinant_error_abs", "fixed-root sample determinant error"
+        )
 
     def to_mapping(self) -> dict[str, object]:
         return {
@@ -4413,6 +4640,255 @@ def _positive_orders(epsilons: Sequence[float], values: Sequence[float]) -> tupl
     return tuple(output)
 
 
+_PROMOTED_HORIZON_EVIDENCE_FIELDS = frozenset({
+    "derivative_disk",
+    "derivative_radius_provenance",
+    "horizon_frequency_disk",
+    "response_disk",
+    "root_radius_provenance",
+    "uncertainty_derivation_identity",
+    "zero_containing_disk",
+})
+
+
+def _complex_disk_from_mapping(value: object, subject: str) -> ComplexDisk:
+    if not isinstance(value, Mapping) or set(value) != {
+        "centre", "exact_zero_radius", "radius"
+    }:
+        raise ValueError(f"{subject} fields are invalid")
+    exact = value["exact_zero_radius"]
+    if type(exact) is not bool:
+        raise ValueError(f"{subject} exact-zero provenance is invalid")
+    return ComplexDisk(
+        _complex_from_mapping(value["centre"], f"{subject} centre"),
+        value["radius"],
+        exact_zero_radius=exact,
+    )
+
+
+def _promoted_horizon_correction_evidence(
+    baseline: RootReadout,
+) -> tuple[dict[str, Decimal], DerivativeAuthenticationEvidence]:
+    primary = baseline.primary_acceptance
+    authentication = (
+        None if primary is None else primary.derivative_authentication
+    )
+    diagnostics = baseline.diagnostic_readouts
+    if primary is None or authentication is None or not isinstance(
+        diagnostics, Mapping
+    ):
+        raise ValueError(
+            "promoted horizon checkpoint lacks PRIMARY derivative evidence"
+        )
+    corrections = {"PRIMARY": primary.correction_abs}
+    for family, phase in (
+        ("truncation", "TRUNCATION"),
+        ("resolution", "RESOLUTION"),
+    ):
+        diagnostic = diagnostics.get(family)
+        fixed = None if diagnostic is None else diagnostic.fixed_root_evidence
+        if fixed is None:
+            raise ValueError(
+                f"promoted horizon checkpoint lacks {phase} correction evidence"
+            )
+        corrections[phase] = fixed.correction_abs
+    return corrections, authentication
+
+
+def _validate_promoted_horizon_checkpoint_evidence(
+    *,
+    evidence: Mapping[str, object],
+    baseline: RootReadout,
+    status: ComponentStatus,
+    response: complex | None,
+    closed_form_response: complex | None,
+    error_channels: Mapping[str, float],
+) -> None:
+    """Recompute a persisted bounded-horizon certificate from stored inputs."""
+
+    if set(evidence) != _PROMOTED_HORIZON_EVIDENCE_FIELDS:
+        raise ValueError("component analytic horizon evidence fields are invalid")
+    if (
+        evidence.get("uncertainty_derivation_identity")
+        != PROMOTED_HORIZON_UNCERTAINTY_DERIVATION_IDENTITY
+    ):
+        raise ValueError("component horizon uncertainty derivation is invalid")
+
+    corrections, authentication = _promoted_horizon_correction_evidence(
+        baseline
+    )
+    expected_derivative = _bounded_binary64_disk_from_decimal(
+        authentication.derivative_estimate,
+        authentication.propagated_error_abs
+        + authentication.step_disagreement_abs,
+        subject="component horizon derivative",
+    )
+    derivative_centre = expected_derivative.centre
+    derivative_provenance = evidence.get("derivative_radius_provenance")
+    if not isinstance(derivative_provenance, Mapping) or set(
+        derivative_provenance
+    ) != {
+        "axis",
+        "independent_comparison",
+        "independent_comparison_omitted_reason",
+        "propagated_error_abs",
+        "selected_step",
+        "step_disagreement_abs",
+    }:
+        raise ValueError("component horizon derivative provenance is invalid")
+    comparison_mapping = derivative_provenance["independent_comparison"]
+    comparison_omission = derivative_provenance[
+        "independent_comparison_omitted_reason"
+    ]
+    derivative_radius = expected_derivative.radius
+    if comparison_mapping is None:
+        if comparison_omission != "NOT_SELECTED_BY_RISK_POLICY":
+            raise ValueError(
+                "component horizon derivative comparison omission is invalid"
+            )
+    else:
+        if comparison_omission is not None:
+            raise ValueError(
+                "component horizon derivative comparison provenance is invalid"
+            )
+        comparison = _complex_disk_from_mapping(
+            comparison_mapping, "component horizon derivative comparison disk"
+        )
+        derivative_radius = max(
+            derivative_radius,
+            abs(comparison.centre - derivative_centre) + comparison.radius,
+        )
+    expected_derivative_provenance = {
+        "axis": authentication.axis,
+        "independent_comparison": comparison_mapping,
+        "independent_comparison_omitted_reason": comparison_omission,
+        "propagated_error_abs": str(authentication.propagated_error_abs),
+        "selected_step": str(authentication.selected_step),
+        "step_disagreement_abs": str(
+            authentication.step_disagreement_abs
+        ),
+    }
+    if dict(derivative_provenance) != expected_derivative_provenance:
+        raise ValueError(
+            "component horizon derivative provenance is not PRIMARY-derived"
+        )
+    expected_derivative = ComplexDisk(derivative_centre, derivative_radius)
+    if evidence.get("derivative_disk") != expected_derivative.to_mapping():
+        raise ValueError("component horizon derivative disk is not PRIMARY-derived")
+
+    root_provenance = evidence.get("root_radius_provenance")
+    if not isinstance(root_provenance, Mapping) or set(root_provenance) != {
+        "arithmetic_radius_abs", "correction_abs", "union_rule"
+    }:
+        raise ValueError("component horizon root-radius provenance is invalid")
+    arithmetic_radius = root_provenance["arithmetic_radius_abs"]
+    if (
+        isinstance(arithmetic_radius, bool)
+        or not isinstance(arithmetic_radius, (int, float))
+        or not math.isfinite(float(arithmetic_radius))
+        or float(arithmetic_radius) < 0.0
+    ):
+        raise ValueError("component horizon arithmetic radius is invalid")
+    expected_corrections = {
+        name: str(value) for name, value in corrections.items()
+    }
+    if (
+        root_provenance.get("correction_abs") != expected_corrections
+        or root_provenance.get("union_rule")
+        != "max-accepted-correction-plus-arithmetic/v1"
+    ):
+        raise ValueError(
+            "component horizon root-radius provenance is not readout-derived"
+        )
+    expected_frequency_radius = max(
+        float(value) for value in corrections.values()
+    ) + float(arithmetic_radius)
+    frequency = _complex_disk_from_mapping(
+        evidence.get("horizon_frequency_disk"),
+        "component horizon frequency disk",
+    )
+    if frequency.radius != expected_frequency_radius:
+        raise ValueError("component horizon frequency disk radius is understated")
+
+    expected_response: ComplexDisk | None
+    expected_zero: str | None
+    try:
+        expected_response = horizon_response_disk(
+            horizon_frequency=frequency,
+            determinant_derivative=expected_derivative,
+        )
+        expected_zero = None
+    except ZeroContainingDiskError as error:
+        expected_response = None
+        expected_zero = error.disk_name
+    if evidence.get("zero_containing_disk") != expected_zero:
+        raise ValueError("component horizon zero-containing decision is invalid")
+    if expected_response is None:
+        if (
+            evidence.get("response_disk") is not None
+            or status is not ComponentStatus.DERIVATIVE_UNRESOLVED
+            or response is not None
+            or closed_form_response is not None
+            or any(float(value) != 0.0 for value in error_channels.values())
+        ):
+            raise ValueError("component unbounded horizon response is inconsistent")
+        return
+    if (
+        evidence.get("response_disk") != expected_response.to_mapping()
+        or status is not ComponentStatus.CONVERGED
+        or response != expected_response.centre
+        or closed_form_response != expected_response.centre
+        or error_channels.get("resolution") != expected_response.radius
+        or any(
+            float(value) != 0.0
+            for name, value in error_channels.items()
+            if name != "resolution"
+        )
+    ):
+        raise ValueError("component horizon response disk is not input-derived")
+
+
+def _validate_promoted_horizon_checkpoint_evidence_for_job(
+    result: "ComponentResult", job: ResponseComponentJob
+) -> None:
+    """Bind a structurally valid horizon certificate to the selected Kerr job."""
+
+    if result.component_scientific_identity != (
+        PROMOTED_HORIZON_COMPONENT_V2_IDENTITY
+    ):
+        return
+    if not math.isfinite(job.spin) or abs(job.spin) >= 1.0:
+        raise ValueError("component horizon job spin is invalid")
+    evidence = result.analytic_horizon_evidence
+    if not isinstance(evidence, Mapping):
+        raise ValueError("component analytic horizon evidence is missing")
+    horizon_radius = 1.0 + math.sqrt(
+        max(0.0, 1.0 - job.spin * job.spin)
+    )
+    omega_h = job.spin / (2.0 * horizon_radius)
+    expected_centre = result.baseline.omega - job.mode.m * omega_h
+    expected_arithmetic_radius = (
+        math.ulp(result.baseline.omega.real)
+        + math.ulp(result.baseline.omega.imag)
+        + abs(job.mode.m) * math.ulp(omega_h)
+    )
+    corrections, _ = _promoted_horizon_correction_evidence(result.baseline)
+    expected_frequency = ComplexDisk(
+        expected_centre,
+        max(float(value) for value in corrections.values())
+        + expected_arithmetic_radius,
+    )
+    root_provenance = evidence.get("root_radius_provenance")
+    if (
+        not isinstance(root_provenance, Mapping)
+        or root_provenance.get("arithmetic_radius_abs")
+        != expected_arithmetic_radius
+        or evidence.get("horizon_frequency_disk")
+        != expected_frequency.to_mapping()
+    ):
+        raise ValueError("component horizon frequency disk is not job-derived")
+
+
 @dataclass(frozen=True, slots=True)
 class ComponentResult:
     job_id: str
@@ -4606,6 +5082,15 @@ class ComponentResult:
                 raise ValueError(
                     "bounded promoted analytic horizon evidence is inconsistent"
                 )
+            assert self.analytic_horizon_evidence is not None
+            _validate_promoted_horizon_checkpoint_evidence(
+                evidence=self.analytic_horizon_evidence,
+                baseline=self.baseline,
+                status=self.status,
+                response=self.response,
+                closed_form_response=self.closed_form_response,
+                error_channels=self.error_channels,
+            )
         conditioned_readouts = tuple(
             readout
             for readout in self.raw_readouts
@@ -4856,21 +5341,88 @@ def _fixed_root_coordinate_derivative(
     step: float,
 ) -> tuple[ComplexDisk, complex, complex, float, float]:
     plus_h, minus_h, plus_half, minus_half = samples
-    coarse = (plus_h.determinant - minus_h.determinant) / (2.0 * step)
-    fine = (plus_half.determinant - minus_half.determinant) / step
-    coarse_error = (
-        plus_h.determinant_error_abs + minus_h.determinant_error_abs
-    ) / (2.0 * step)
-    fine_error = (
-        plus_half.determinant_error_abs + minus_half.determinant_error_abs
-    ) / step
-    disagreement = abs(fine - coarse)
-    radius = fine_error + disagreement
+    decimal_digits = max(
+        50,
+        math.ceil(
+            max(sample.working_precision_bits for sample in samples)
+            * math.log10(2.0)
+        ) + 16,
+    )
+
+    def subtract(
+        left: DecimalComplex, right: DecimalComplex
+    ) -> DecimalComplex:
+        return DecimalComplex(
+            left.real - right.real,
+            left.imaginary - right.imaginary,
+        )
+
+    def divide(value: DecimalComplex, denominator: Decimal) -> DecimalComplex:
+        return DecimalComplex(
+            value.real / denominator,
+            value.imaginary / denominator,
+        )
+
+    def outward_nonnegative(value: Decimal) -> float:
+        converted = float(value)
+        if not math.isfinite(converted):
+            raise ValueError(
+                "fixed-root derivative uncertainty is not representable"
+            )
+        if Decimal.from_float(converted) < value:
+            converted = math.nextafter(converted, math.inf)
+        return converted
+
+    with localcontext() as context:
+        context.prec = decimal_digits
+        coarse_denominator = (
+            plus_h.exact_amplitude.real - minus_h.exact_amplitude.real
+        )
+        fine_denominator = (
+            plus_half.exact_amplitude.real
+            - minus_half.exact_amplitude.real
+        )
+        if coarse_denominator <= 0 or fine_denominator <= 0:
+            raise ValueError("fixed-root coordinate derivative step is invalid")
+        coarse_exact = divide(
+            subtract(plus_h.exact_determinant, minus_h.exact_determinant),
+            coarse_denominator,
+        )
+        fine_exact = divide(
+            subtract(
+                plus_half.exact_determinant,
+                minus_half.exact_determinant,
+            ),
+            fine_denominator,
+        )
+        fine_error_exact = (
+            plus_half.exact_determinant_error_abs
+            + minus_half.exact_determinant_error_abs
+        ) / fine_denominator
+        disagreement_exact = subtract(
+            fine_exact, coarse_exact
+        ).magnitude()
+        radius_exact = fine_error_exact + disagreement_exact
+        if radius_exact <= 0:
+            raise ValueError(
+                "fixed-root coordinate derivative lacks non-exact uncertainty"
+            )
+
+        coordinate_disk = _bounded_binary64_disk_from_decimal(
+            fine_exact,
+            radius_exact,
+            subject="fixed-root coordinate derivative",
+        )
+        coarse = complex(float(coarse_exact.real), float(coarse_exact.imaginary))
+        fine = coordinate_disk.centre
+        radius = coordinate_disk.radius
+        fine_error = outward_nonnegative(fine_error_exact)
+        disagreement = outward_nonnegative(disagreement_exact)
     if radius <= 0.0:
         raise ValueError(
             "fixed-root coordinate derivative lacks non-exact uncertainty"
         )
-    return ComplexDisk(fine, radius), coarse, fine, fine_error, disagreement
+    return coordinate_disk, coarse, fine, fine_error, disagreement
 
 
 def full_ladder_validation_policy(reason: str) -> dict[str, str]:
@@ -4987,10 +5539,30 @@ class _JournaledPromotedExteriorBackend:
         ):
             raise ValueError("partial component journal output wrapper is invalid")
         if kind == "root-readout":
-            return RootReadout.from_mapping(_journal_json_value(receipt["output"]))
-        return FixedRootDeterminantSample.from_mapping(
-            _journal_json_value(receipt["output"])
-        )
+            output: RootReadout | FixedRootDeterminantSample = (
+                RootReadout.from_mapping(
+                    _journal_json_value(receipt["output"])
+                )
+            )
+        else:
+            output = FixedRootDeterminantSample.from_mapping(
+                _journal_json_value(receipt["output"])
+            )
+        if self._exact_request_binding:
+            output_request_sha256 = (
+                output.request_sha256
+                if isinstance(output, FixedRootDeterminantSample)
+                else (
+                    None
+                    if output.worker_response_receipt is None
+                    else output.worker_response_receipt.get("request_sha256")
+                )
+            )
+            if output_request_sha256 != unit.request_sha256:
+                raise ValueError(
+                    "partial component reused output request identity mismatch"
+                )
+        return output
 
     def _record(
         self,
@@ -5105,9 +5677,17 @@ class _JournaledComponentReads:
                 or not isinstance(receipt.get("output"), Mapping)
             ):
                 raise ValueError("partial component journal output wrapper is invalid")
-            return RootReadout.from_mapping(
+            output = RootReadout.from_mapping(
                 _journal_json_value(receipt["output"])
             )
+            if output.worker_response_receipt is not None and (
+                output.worker_response_receipt.get("request_sha256")
+                != unit.request_sha256
+            ):
+                raise ValueError(
+                    "partial component reused output request identity mismatch"
+                )
+            return output
         read_with_kind = getattr(
             self.backend, "read_root_with_predictor_kind", None
         )
@@ -5867,15 +6447,15 @@ def run_promoted_horizon_component(
     derivative_authentication = _validate_promoted_horizon_baseline(job, baseline)
     primary = baseline.primary_acceptance
     assert primary is not None
-    derivative_complex = complex(
-        float(derivative_authentication.derivative_re),
-        float(derivative_authentication.derivative_im),
-    )
-    if derivative_complex == 0.0j or not (
-        math.isfinite(derivative_complex.real)
-        and math.isfinite(derivative_complex.imag)
-    ):
+    if derivative_authentication.derivative_estimate.magnitude() <= 0:
         raise ValueError("promoted PRIMARY derivative must be finite and nonzero")
+    derivative_disk = _bounded_binary64_disk_from_decimal(
+        derivative_authentication.derivative_estimate,
+        derivative_authentication.propagated_error_abs
+        + derivative_authentication.step_disagreement_abs,
+        subject="promoted PRIMARY derivative",
+    )
+    derivative_complex = derivative_disk.centre
 
     horizon_radius = 1.0 + math.sqrt(
         max(0.0, 1.0 - job.spin * job.spin)
@@ -5900,13 +6480,7 @@ def run_promoted_horizon_component(
         horizon_frequency,
         root_radius + arithmetic_radius,
     )
-    primary_derivative_radius = float(
-        derivative_authentication.propagated_error_abs
-        + derivative_authentication.step_disagreement_abs
-    )
-    if primary_derivative_radius <= 0.0:
-        raise ValueError("promoted PRIMARY derivative uncertainty is not bounded")
-    derivative_radius = primary_derivative_radius
+    derivative_radius = derivative_disk.radius
     comparison_mapping = None
     comparison_operation = getattr(
         backend, "promoted_derivative_comparison", None
@@ -6141,6 +6715,14 @@ def _resolved_window_record(
 ) -> dict[str, object]:
     included = {level.epsilon for level in window}
     recovery = _response_ladder_recovery(job, levels)
+    runtime_epsilons = tuple(level.epsilon for level in window)
+    if (
+        recovery.disposition is not RecoveryDisposition.RECOVERED
+        or recovery.selected_epsilons != runtime_epsilons
+    ):
+        raise RuntimeError(
+            "serialized ladder recovery disagrees with the runtime window"
+        )
     record = _response_ladder_recovery_record(job, levels, recovery)
     return {
         **record,
@@ -6161,6 +6743,123 @@ def _recovery_precision_tier(readout: RootReadout) -> PrecisionTier:
         if isinstance(raw, str):
             return precision_tier(raw)
     return PrecisionTier.BINARY64
+
+
+def _runtime_ladder_window_evidence(
+    job: ResponseComponentJob,
+    window: Sequence[RecoveryLadderLevel],
+    policy: RecoveryLadderPolicy,
+    original_by_epsilon: Mapping[float, LadderLevel],
+) -> WindowEvidence:
+    """Serialize the exact gate decision used by ``_evaluate_ladder_window``."""
+
+    originals = tuple(original_by_epsilon[level.epsilon] for level in window)
+    level_evidence: list[WindowLevelEvidence] = []
+    for level in window:
+        real_ratio, imaginary_ratio = level.signal_ratios(
+            policy.signal_factor
+        )
+        level_evidence.append(WindowLevelEvidence(
+            epsilon=level.epsilon,
+            real_signal_ratio=real_ratio,
+            imaginary_signal_ratio=imaginary_ratio,
+            signal_ok=real_ratio > 1.0 and imaginary_ratio > 1.0,
+        ))
+    epsilons = tuple(level.epsilon for level in originals)
+    real_values = tuple(level.real_secant for level in originals)
+    imaginary_values = tuple(level.imaginary_secant for level in originals)
+    real_orders = _observed_orders(epsilons, real_values)
+    imaginary_orders = _observed_orders(epsilons, imaginary_values)
+    even_orders = _positive_orders(
+        epsilons,
+        tuple(level.even_remainder_abs for level in originals),
+    )
+    minimum_order = policy.required_order - policy.order_tolerance
+    real_order = None if not real_orders else real_orders[-1]
+    imaginary_order = None if not imaginary_orders else imaginary_orders[-1]
+    real_order_ok = real_order is not None and real_order >= minimum_order
+    imaginary_order_ok = (
+        imaginary_order is not None and imaginary_order >= minimum_order
+    )
+    even_order_ok = (
+        not even_orders
+        or even_orders[-1]
+        >= policy.required_order - job.policy.even_order_tolerance
+    )
+    finest = originals[-1]
+    root_limited = (
+        abs(real_values[-1] - real_values[-2])
+        <= originals[-1].real_radius + originals[-2].real_radius + 1.0e-15
+        and abs(imaginary_values[-1] - imaginary_values[-2])
+        <= (
+            originals[-1].imaginary_radius
+            + originals[-2].imaginary_radius
+            + 1.0e-15
+        )
+    )
+    even_resolved = (
+        finest.even_remainder_abs
+        <= finest.even_remainder_noise + 1.0e-15
+    )
+    even_remainder_ok = even_resolved or even_order_ok
+    real_estimate = _axis_estimate(originals, "real")
+    imaginary_estimate = _axis_estimate(originals, "imaginary")
+    axis_allowance = job.policy.axis_tolerance_factor * max(
+        real_estimate.root_radius
+        + imaginary_estimate.root_radius
+        + real_estimate.amplitude_radius
+        + imaginary_estimate.amplitude_radius,
+        job.policy.absolute_axis_floor,
+    )
+    axis_ok = (
+        abs(real_estimate.center - imaginary_estimate.center)
+        <= axis_allowance
+    )
+    branch_ok = all(
+        readout.branch_ok for level in window for readout in level.readouts
+    )
+    diagnostic_ok = all(
+        readout.diagnostic_ok
+        for level in window
+        for readout in level.readouts
+    )
+    signal_ok = all(item.signal_ok for item in level_evidence)
+    verdict = _evaluate_ladder_window(job, originals)
+    converged = verdict.outcome == "converged"
+    reasons: list[str] = []
+
+    def add(reason: str) -> None:
+        if reason not in reasons:
+            reasons.append(reason)
+
+    if not signal_ok:
+        add("SIGNAL_GATE")
+    if not axis_ok:
+        add("AXIS_GATE")
+    if not branch_ok:
+        add("BRANCH_GATE")
+    if not diagnostic_ok:
+        add("DIAGNOSTIC_GATE")
+    if not converged:
+        if not root_limited and not (real_order_ok and imaginary_order_ok):
+            add("ORDER_GATE")
+        if not even_remainder_ok:
+            add("EVEN_REMAINDER_GATE")
+        if not reasons:
+            add("RUNTIME_WINDOW_GATE")
+    return WindowEvidence(
+        epsilons=epsilons,
+        levels=tuple(level_evidence),
+        real_order=real_order,
+        imaginary_order=imaginary_order,
+        real_order_ok=real_order_ok,
+        imaginary_order_ok=imaginary_order_ok,
+        axis_ok=axis_ok,
+        even_remainder_ok=even_remainder_ok,
+        branch_ok=branch_ok,
+        diagnostic_ok=diagnostic_ok,
+        reasons=tuple(reasons),
+    )
 
 
 def _response_ladder_recovery(
@@ -6201,6 +6900,7 @@ def _response_ladder_recovery(
         )
         for level in levels
     )
+    original_by_epsilon = {level.epsilon: level for level in levels}
     return recover_response_ladder(
         converted,
         policy=RecoveryLadderPolicy(
@@ -6211,6 +6911,11 @@ def _response_ladder_recovery(
             order_tolerance=job.policy.order_tolerance,
             axis_tolerance_factor=job.policy.axis_tolerance_factor,
             even_remainder_factor=job.policy.even_order_tolerance,
+        ),
+        window_assessor=lambda window, policy: (
+            _runtime_ladder_window_evidence(
+                job, window, policy, original_by_epsilon
+            )
         ),
     )
 

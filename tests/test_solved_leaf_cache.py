@@ -23,6 +23,7 @@ from windows_solver.response_batches import (
     PrecisionCapabilities,
     StageOutcome,
     _authenticated_solved_leaf_lookup,
+    _validate_record_scientific_execution_contract,
     _validate_component_result,
     _validate_cacheable_leaf_record,
     build_campaign_plan,
@@ -48,6 +49,7 @@ from windows_solver.progress_output import CampaignProgressReporter
 from windows_solver.solved_leaf_cache import SolvedLeafLookupStatus, SolvedLeafStore
 from tests.fixtures import (
     current_promoted_component_payload,
+    synthetic_ode_error_budget,
     valid_numerical_conditioning,
 )
 
@@ -2144,6 +2146,158 @@ class SolvedLeafCacheTests(unittest.TestCase):
         ):
             self.assertEqual(
                 baseline, scientific_computation_identity_sha256(plan, leaf)
+            )
+
+    def test_scientific_execution_contract_changes_cache_identity(self):
+        plan = _plan()
+        leaf = next(item for item in plan.leaves if item.role == "primary")
+        baseline = scientific_computation_identity_sha256(plan, leaf)
+        first = {
+            "schema": "windows-solver.m02-scientific-execution-contract/1",
+            "ode_error_budgets_by_nominal_decimal_digits": {
+                "80": {"calibration_identity": "calibration-a/v1"},
+            },
+        }
+        changed = {
+            "schema": "windows-solver.m02-scientific-execution-contract/1",
+            "ode_error_budgets_by_nominal_decimal_digits": {
+                "80": {"calibration_identity": "calibration-b/v1"},
+            },
+        }
+
+        first_identity = scientific_computation_identity_sha256(
+            plan, leaf, scientific_execution_contract=first
+        )
+        changed_identity = scientific_computation_identity_sha256(
+            plan, leaf, scientific_execution_contract=changed
+        )
+
+        self.assertNotEqual(first_identity, baseline)
+        self.assertNotEqual(first_identity, changed_identity)
+        self.assertEqual(
+            baseline, scientific_computation_identity_sha256(plan, leaf)
+        )
+
+    def test_campaign_cache_reuse_is_scoped_to_backend_execution_contract(self):
+        plan = _plan()
+        selection = _primary(plan, 1)
+
+        class ContractBackend(_Backend):
+            def __init__(self, selected_plan, calibration):
+                super().__init__(selected_plan)
+                self.contract = {
+                    "schema": "synthetic-cache-execution-contract/1",
+                    "calibration_identity": calibration,
+                }
+
+            def scientific_execution_contract_for(self, leaf):
+                return self.contract
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            store = SolvedLeafStore(root / "solved")
+            first = ContractBackend(plan, "calibration-a/v1")
+            changed = ContractBackend(plan, "calibration-b/v1")
+            repeated = ContractBackend(plan, "calibration-b/v1")
+            with patch(
+                "windows_solver.response_batches._validate_record_semantics",
+                return_value=True,
+            ):
+                run_campaign_selection(
+                    plan, selection, first, root / "first.json",
+                    resume=False, solved_leaf_store=store,
+                )
+                run_campaign_selection(
+                    plan, selection, changed, root / "changed.json",
+                    resume=False, solved_leaf_store=store,
+                )
+                run_campaign_selection(
+                    plan, selection, repeated, root / "repeated.json",
+                    resume=False, solved_leaf_store=store,
+                )
+            stored_count = store.stored_count
+
+        self.assertEqual(first.calls, [(selection.leaf_ids[0], 64)])
+        self.assertEqual(changed.calls, [(selection.leaf_ids[0], 64)])
+        self.assertEqual(repeated.calls, [])
+        self.assertEqual(stored_count, 2)
+
+    def test_promoted_record_budget_must_match_active_execution_contract(self):
+        plan = build_campaign_plan(
+            policy=NumericalPolicy(),
+            backend_identity=VettedNativeDeterminantKernel.identity,
+            precision_capabilities=PrecisionCapabilities((64, 80, 120)),
+        )
+        leaf = next(
+            item for item in plan.leaves
+            if item.role == "primary"
+            and item.mechanism_id == "horizon-admittance"
+        )
+        expected_budget = synthetic_ode_error_budget(80).to_mapping()
+        contract = {
+            "schema": "windows-solver.m02-scientific-execution-contract/1",
+            "ode_error_budgets_by_nominal_decimal_digits": {
+                "80": expected_budget,
+                "120": synthetic_ode_error_budget(120).to_mapping(),
+            },
+        }
+
+        def record_for(runtime):
+            component = {"scientific_runtime": runtime}
+            outcome = StageOutcome(
+                digits=80,
+                numerical_state="NOT_CONVERGED",
+                component_result=component,
+                local_disk_radius_abs=1.0,
+                signed_error_channels=synthetic_stage_signed_error_channels(
+                    component, 1.0
+                ),
+            )
+            return CampaignLeafRecord(
+                leaf_id=leaf.leaf_id,
+                role=leaf.role,
+                state="IN_PROGRESS",
+                stages=(CampaignStageRecord(
+                    outcome,
+                    {
+                        "precision_factory_identity": (
+                            plan.precision_factory_identity.to_mapping()
+                        ),
+                        "available_precision_digits": [64, 80, 120],
+                    },
+                ),),
+            )
+
+        runtime = {
+            "precision_digits": 80,
+            "ode_error_budget": expected_budget,
+            "ode_error_budget_sha256": hashlib.sha256(
+                canonical_json_bytes(expected_budget)
+            ).hexdigest(),
+        }
+        _validate_record_scientific_execution_contract(
+            leaf, record_for(runtime), contract
+        )
+
+        changed_budget = synthetic_ode_error_budget(120).to_mapping()
+        changed_runtime = {
+            **runtime,
+            "ode_error_budget": changed_budget,
+            "ode_error_budget_sha256": hashlib.sha256(
+                canonical_json_bytes(changed_budget)
+            ).hexdigest(),
+        }
+        with self.assertRaisesRegex(
+            ValueError, "active scientific execution contract"
+        ):
+            _validate_record_scientific_execution_contract(
+                leaf, record_for(changed_runtime), contract
+            )
+        with self.assertRaisesRegex(ValueError, "lacks its ODE budget"):
+            _validate_record_scientific_execution_contract(
+                leaf,
+                record_for({"precision_digits": 80}),
+                contract,
             )
 
     def test_changed_science_executes_and_deleted_store_leaves_originating_path_intact(self):

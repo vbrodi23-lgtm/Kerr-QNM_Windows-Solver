@@ -217,6 +217,15 @@ class ODEErrorBudget:
         )
         if any(not math.isfinite(item) or item <= 0.0 for item in scalars):
             raise ValueError("ODE error budget values must be finite, positive, and representable")
+        derived_total = (
+            self.required_root_correction_abs
+            * self.determinant_derivative_lower_bound_abs
+        )
+        if self.determinant_error_budget_abs != derived_total:
+            raise ValueError(
+                "ODE determinant error budget must equal the root correction "
+                "times the determinant derivative lower bound"
+            )
         expected_names = (
             "endpoint_series",
             "coordinate_inversion",

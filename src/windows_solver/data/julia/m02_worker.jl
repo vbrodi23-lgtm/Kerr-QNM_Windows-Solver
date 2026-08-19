@@ -754,6 +754,9 @@ function flatten_request(document)
             policy, "rho_out_candidate_schedule"
         ),
         "horizon_rho_inner_min" => required(policy, "horizon_rho_inner_min"),
+        "horizon_endpoint_rho_floor" => required(
+            policy, "horizon_endpoint_rho_floor"
+        ),
         "horizon_endpoint_rho_candidates" => required(
             policy, "horizon_endpoint_rho_candidates"
         ),
@@ -1327,6 +1330,7 @@ mutable struct ConditioningAccumulator{T<:AbstractFloat}
     minimum_cref_chart_margin::Union{Nothing,T}
     maximum_carrier_change_error::Union{Nothing,T}
     maximum_contour_angle_deformation::T
+    horizon_endpoint_search_evidence::Vector{Any}
     determinant_count::Int
 end
 
@@ -1348,6 +1352,7 @@ function ConditioningAccumulator(::Type{T}) where {T<:AbstractFloat}
         nothing,
         nothing,
         zero(T),
+        Any[],
         0,
     )
 end
@@ -1768,10 +1773,9 @@ end
 
 Build the horizon-side contour on `0 -> rho_inner_min` with a unit real tangent.
 
-`rho_inner_min` is roughly -100 rather than -5000: the geometry gate only
-samples candidates within that window, so nothing is gained by integrating the
-coordinate map two orders of magnitude further than any endpoint that will ever
-be selected.
+`rho_inner_min` is the authenticated adaptive-search floor rather than the much
+deeper exterior asymptotic coordinate bound.  Sharing the policy value keeps
+every generated endpoint inside the contour that performs the inversion.
 """
 function build_worker_real_inner_horizon_contour(
     ::Type{T},
@@ -2982,6 +2986,10 @@ function evaluate_horizon_determinant(
     endpoints = CF.verified_horizon_endpoints_from_recovery(
         endpoint_recovery, maximum_horizon_distance
     )
+    push!(
+        context.conditioning.horizon_endpoint_search_evidence,
+        CF.canonical_horizon_endpoint_search_evidence(endpoint_recovery),
+    )
     progress_emit("horizon_endpoints_verified"; payload=Dict(
         "reference_rho" => string(endpoints.reference.geometry.rho),
         "reference_horizon_distance" =>
@@ -3184,6 +3192,12 @@ function emit_horizon_endpoint_candidate(candidate)
         "ingoing_adequate" => candidate.ingoing_adequate,
         "outgoing_adequate" => candidate.outgoing_adequate,
         "endpoint_order" => candidate.endpoint_order,
+        "ingoing_best_prefix_order" =>
+            candidate.ingoing_evaluation === nothing ? nothing :
+            candidate.ingoing_evaluation.order,
+        "outgoing_best_prefix_order" =>
+            candidate.outgoing_evaluation === nothing ? nothing :
+            candidate.outgoing_evaluation.order,
         "ingoing_predicted_reliable_digits" =>
             candidate.ingoing_assessment === nothing ? nothing :
             string(candidate.ingoing_assessment.predicted_reliable_digits),
@@ -6853,6 +6867,11 @@ function result_fields(::Type{T}, request, digits::Int, bits::Int) where {T<:Abs
         root_evaluation.diagnostics.raw_determinant_evidence_status
     horizon = string(required(request, "mechanism_id")) ==
         "horizon-admittance"
+    horizon_endpoint_evidence = if horizon
+        evaluation_context.conditioning.horizon_endpoint_search_evidence
+    else
+        nothing
+    end
     if horizon
         raw_determinant_evidence_status in (
             "available/v1", "unavailable-overflow/v1"
@@ -6884,7 +6903,7 @@ function result_fields(::Type{T}, request, digits::Int, bits::Int) where {T<:Abs
         )
         branch_valid = primary.branch_authenticated
         return [
-            "schema_version" => 8,
+            "schema_version" => 9,
             "status" => "ok",
             "adapter" => "package-owned-julia-gsn-root-readout",
             "request_sha256" => string(required(request, "request_sha256")),
@@ -6915,6 +6934,8 @@ function result_fields(::Type{T}, request, digits::Int, bits::Int) where {T<:Abs
             "diagnostic_roots" => Dict{String,Any}(),
             "diagnostics_skipped_reason" => "PRIMARY_NOT_CONVERGED",
             "numerical_conditioning" => numerical_conditioning,
+            "horizon_endpoint_search_evidence" =>
+                horizon_endpoint_evidence,
         ]
     end
     truncation = solve_phase(
@@ -6956,7 +6977,7 @@ function result_fields(::Type{T}, request, digits::Int, bits::Int) where {T<:Abs
     )
 
     return [
-        "schema_version" => 8,
+        "schema_version" => 9,
         "status" => "ok",
         "adapter" => "package-owned-julia-gsn-root-readout",
         "request_sha256" => string(required(request, "request_sha256")),
@@ -6992,6 +7013,7 @@ function result_fields(::Type{T}, request, digits::Int, bits::Int) where {T<:Abs
         ),
         "diagnostics_skipped_reason" => nothing,
         "numerical_conditioning" => numerical_conditioning,
+        "horizon_endpoint_search_evidence" => horizon_endpoint_evidence,
     ]
 end
 

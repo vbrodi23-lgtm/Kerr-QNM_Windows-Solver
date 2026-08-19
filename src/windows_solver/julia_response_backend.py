@@ -48,6 +48,7 @@ from .response_engine import (
     WORKER_RESPONSE_RECEIPT_SCHEMA,
     WORKER_RESPONSE_WIRE_SCHEMA,
     _exterior_support,
+    _validated_successful_horizon_endpoint_search_evidence,
     mode_specific_branch_enclosure_radius,
     regularised_gsn_mechanism_contract,
     regularised_gsn_precision_policy,
@@ -552,15 +553,15 @@ def promoted_precision_numerical_controls() -> dict[str, object]:
 def horizon_geometry_controls() -> dict[str, object]:
     """Return the real-inner horizon endpoint gate configuration.
 
-    The candidate ladder is bounded and shallow on purpose. The prototype
-    reached 80.92/81.13 reliable digits at rho = -50 against 35.99/37.28 at
-    rho = -25, so useful endpoints live within tens of units of the matching
-    point, not thousands. ``horizon_rho_inner_min`` therefore bounds the
-    coordinate map at -100 rather than -5000.
+    The initial candidate ladder is shallow on purpose, but adaptive recovery
+    may deepen it to rho = -400.  The real-inner contour and the recovery
+    search therefore share that same authenticated floor; otherwise recovery
+    would manufacture candidates outside the contour that must evaluate them.
     """
 
     return {
-        "horizon_rho_inner_min": "-100",
+        "horizon_rho_inner_min": "-400",
+        "horizon_endpoint_rho_floor": "-400",
         "horizon_endpoint_rho_candidates": [
             "-10", "-25", "-50", "-75", "-100",
         ],
@@ -1244,27 +1245,27 @@ _ASYMPTOTIC_SERIES_INVALID_REASONS = frozenset({
 
 _HORIZON_RECOVERY_FAILURES = {
     "HORIZON_GEOMETRY_EXHAUSTED": (
-        "NO_GEOMETRY_VALID_CANDIDATE",
+        "no-geometry-valid-candidate/v1",
         "horizon-endpoint-geometry",
         False,
     ),
     "HORIZON_MAXIMUM_ORDER_INADEQUATE": (
-        "MAX_SERIES_ORDER_INADEQUATE",
+        "maximum-series-order-inadequate/v1",
         "horizon-endpoint-geometry",
         False,
     ),
     "HORIZON_ARITHMETIC_INADEQUATE": (
-        "ARITHMETIC_PRECISION_INADEQUATE",
+        "arithmetic-precision-inadequate/v1",
         "horizon-endpoint-geometry",
         True,
     ),
     "HORIZON_COORDINATE_INVERSION_FAILED": (
-        "COORDINATE_INVERSION_FAILURE",
+        "coordinate-inversion-failure/v1",
         "coordinate-inversion",
         False,
     ),
     "HORIZON_ONLY_ONE_ENDPOINT": (
-        "FEWER_THAN_TWO_VERIFIED_ENDPOINTS",
+        "fewer-than-two-verified-endpoints/v1",
         "horizon-endpoint-geometry",
         False,
     ),
@@ -2512,11 +2513,19 @@ class JuliaPrecisionRootBackend:
             raise ValueError(
                 "response job backend identity does not match Julia adapter"
             )
+        budget = self._request_ode_error_budget()
+        if budget is None:
+            raise MissingODECalibrationError(ODE_CALIBRATION_BLOCKER)
+        budget_mapping = budget.to_mapping()
         return {
             **self.scientific_runtime,
             "regularised_gsn_precision_policy": dict(
                 regularised_gsn_precision_policy(job.mechanism_id)
             ),
+            "ode_error_budget": budget_mapping,
+            "ode_error_budget_sha256": hashlib.sha256(
+                canonical_json_bytes(budget_mapping)
+            ).hexdigest(),
         }
 
     def _request(
@@ -2723,15 +2732,24 @@ class JuliaPrecisionRootBackend:
             raise JuliaResponseBackendError(
                 "M02 fixed-root determinant sample moved its coordinates"
             )
-        determinant = complex(
-            float(_finite_decimal_text(response["determinant_re"], "sample determinant real")),
-            float(_finite_decimal_text(response["determinant_im"], "sample determinant imaginary")),
+        determinant_real = _finite_decimal_text(
+            response["determinant_re"], "sample determinant real"
         )
-        determinant_error = float(_finite_decimal_text(
+        determinant_imaginary = _finite_decimal_text(
+            response["determinant_im"], "sample determinant imaginary"
+        )
+        determinant = complex(
+            float(determinant_real),
+            float(determinant_imaginary),
+        )
+        determinant_error_decimal = _finite_decimal_text(
             response["determinant_error_abs"],
             "sample determinant error",
             nonnegative=True,
-        ))
+        )
+        determinant_error = float(determinant_error_decimal)
+        if Decimal.from_float(determinant_error) < determinant_error_decimal:
+            determinant_error = math.nextafter(determinant_error, math.inf)
         determinant_error_status = response["determinant_error_status"]
         determinant_error_model_id = response["determinant_error_model_id"]
         if (
@@ -2903,6 +2921,7 @@ class JuliaPrecisionRootBackend:
             "diagnostic_roots",
             "diagnostics_skipped_reason",
             "numerical_conditioning",
+            "horizon_endpoint_search_evidence",
         }
         if set(response) != expected_fields:
             raise JuliaResponseBackendError("M02 Julia response fields are invalid")
@@ -2997,6 +3016,22 @@ class JuliaPrecisionRootBackend:
             raise JuliaResponseBackendError(
                 "M02 Julia numerical conditioning determinant family disagrees "
                 "with response mechanism"
+            )
+        endpoint_evidence = response["horizon_endpoint_search_evidence"]
+        if job.mechanism_id == "horizon-admittance":
+            try:
+                endpoint_evidence = (
+                    _validated_successful_horizon_endpoint_search_evidence(
+                        endpoint_evidence
+                    )
+                )
+            except ValueError as error:
+                raise JuliaResponseBackendError(
+                    "M02 Julia successful horizon endpoint evidence is invalid"
+                ) from error
+        elif endpoint_evidence is not None:
+            raise JuliaResponseBackendError(
+                "M02 Julia exterior response carries horizon endpoint evidence"
             )
 
         try:
@@ -3341,6 +3376,7 @@ class JuliaPrecisionRootBackend:
             "primary_acceptance_sha256": hashlib.sha256(
                 canonical_json_bytes(primary_acceptance.to_mapping())
             ).hexdigest(),
+            "horizon_endpoint_search_evidence": endpoint_evidence,
         }
         worker_response_receipt = {
             **receipt_material,

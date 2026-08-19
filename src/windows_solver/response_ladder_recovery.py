@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import StrEnum
 import math
-from typing import Sequence, TypeVar
+from typing import Callable, Sequence, TypeVar
 
 from .precision_tiers import PrecisionTier, next_precision_tier
 
@@ -302,7 +302,13 @@ def _promotion_requests(
 
 
 def recover_response_ladder(
-    levels: Sequence[LadderLevel], *, policy: LadderPolicy
+    levels: Sequence[LadderLevel],
+    *,
+    policy: LadderPolicy,
+    window_assessor: (
+        Callable[[Sequence[LadderLevel], LadderPolicy], WindowEvidence]
+        | None
+    ) = None,
 ) -> LadderRecoveryResult:
     ordered = tuple(sorted(levels, key=lambda level: level.epsilon, reverse=True))
     if not ordered:
@@ -311,7 +317,8 @@ def recover_response_ladder(
         raise ValueError("response ladder epsilon values must be unique")
 
     windows = consecutive_windows(ordered, policy.minimum_window)
-    evidence = tuple(_assess_window(window, policy) for window in windows)
+    assessor = _assess_window if window_assessor is None else window_assessor
+    evidence = tuple(assessor(window, policy) for window in windows)
     admissible = tuple(item for item in evidence if item.admissible)
     if admissible:
         # Finest means the admissible window with the smallest fine endpoint;
@@ -326,8 +333,21 @@ def recover_response_ladder(
                 next(
                     (
                         item.reasons
-                        for item in evidence
-                        if item.epsilons == (level.epsilon,)
+                        for item in sorted(
+                            (
+                                candidate
+                                for candidate in evidence
+                                if (
+                                    level.epsilon in candidate.epsilons
+                                    and candidate.reasons
+                                )
+                            ),
+                            key=lambda candidate: (
+                                len(candidate.epsilons),
+                                candidate.epsilons[-1],
+                                -candidate.epsilons[0],
+                            ),
+                        )
                     ),
                     ("SIGNAL_GATE",)
                     if not all(

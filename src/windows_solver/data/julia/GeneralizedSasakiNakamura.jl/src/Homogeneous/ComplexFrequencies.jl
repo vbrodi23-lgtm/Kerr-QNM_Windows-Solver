@@ -3397,6 +3397,19 @@ function horizon_endpoint_candidates(
                     _best_prefix_assessment(
                         outgoing_series, radius, required_digits, orders
                     )
+                if ingoing_assessment === nothing || outgoing_assessment === nothing
+                    push!(candidates, HorizonEndpointCandidate{T}(
+                        geometry_candidate,
+                        false,
+                        false,
+                        ingoing_evaluation,
+                        outgoing_evaluation,
+                        ingoing_assessment,
+                        outgoing_assessment,
+                        nothing,
+                    ))
+                    continue
+                end
                 push!(candidates, HorizonEndpointCandidate{T}(
                     geometry_candidate,
                     ingoing_assessment.adequate,

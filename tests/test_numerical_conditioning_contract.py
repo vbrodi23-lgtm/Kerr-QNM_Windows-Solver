@@ -786,6 +786,7 @@ class PromotedRuntimeProvenancePersistenceTests(unittest.TestCase):
                 "primary_acceptance_sha256": hashlib.sha256(
                     canonical_json_bytes(primary_acceptance.to_mapping())
                 ).hexdigest(),
+                "horizon_endpoint_search_evidence": None,
             }
             worker_response_receipt = {
                 **receipt_material,
@@ -899,6 +900,7 @@ class PromotedRuntimeProvenancePersistenceTests(unittest.TestCase):
 
     @staticmethod
     def _current_runtime(job):
+        budget = synthetic_ode_error_budget(80).to_mapping()
         return {
             "julia_version": "1.10.11",
             "julia_executable_sha256": "a" * 64,
@@ -914,6 +916,10 @@ class PromotedRuntimeProvenancePersistenceTests(unittest.TestCase):
                     job.mechanism_id
                 )
             ),
+            "ode_error_budget": budget,
+            "ode_error_budget_sha256": hashlib.sha256(
+                canonical_json_bytes(budget)
+            ).hexdigest(),
         }
 
     def test_current_promoted_runtime_is_bound_to_job_and_precision(self):

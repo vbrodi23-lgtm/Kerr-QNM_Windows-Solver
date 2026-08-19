@@ -4,6 +4,8 @@ from pathlib import Path
 import re
 import unittest
 
+from windows_solver.julia_response_backend import horizon_geometry_controls
+
 
 ROOT = Path(__file__).resolve().parents[1]
 COMPLEX_FREQUENCIES = ROOT / (
@@ -81,6 +83,57 @@ class AdaptiveHorizonEndpointStaticTests(unittest.TestCase):
         self.assertIn("HORIZON_OUTGOING", candidate_builder)
         self.assertIn("ingoing_best_prefix_order", recovery)
         self.assertIn("outgoing_best_prefix_order", recovery)
+
+    def test_nonfinite_prefix_schedules_remain_typed_candidates(self) -> None:
+        candidate_builder = _function(
+            self.package_source, "horizon_endpoint_candidates"
+        )
+        self.assertIn(
+            "if ingoing_assessment === nothing || outgoing_assessment === nothing",
+            candidate_builder,
+        )
+        self.assertIn("nothing,", candidate_builder)
+        self.assertIn("continue", candidate_builder)
+
+    def test_worker_candidate_event_carries_both_selected_prefix_orders(self) -> None:
+        emitter = _function(self.worker_source, "emit_horizon_endpoint_candidate")
+        self.assertIn('"ingoing_best_prefix_order"', emitter)
+        self.assertIn('"outgoing_best_prefix_order"', emitter)
+        self.assertIn("candidate.ingoing_evaluation.order", emitter)
+        self.assertIn("candidate.outgoing_evaluation.order", emitter)
+
+    def test_successful_endpoint_certificate_is_persisted_in_worker_response(self) -> None:
+        determinant = _function(
+            self.worker_source, "evaluate_horizon_determinant"
+        )
+        result_fields = _function(self.worker_source, "result_fields")
+        self.assertIn(
+            "horizon_endpoint_search_evidence::Vector{Any}",
+            self.worker_source,
+        )
+        self.assertIn(
+            "context.conditioning.horizon_endpoint_search_evidence",
+            determinant,
+        )
+        self.assertIn(
+            '"horizon_endpoint_search_evidence"', result_fields
+        )
+        self.assertIn('"schema_version" => 9', result_fields)
+
+    def test_search_floor_and_real_inner_contour_share_one_signed_policy_bound(self) -> None:
+        controls = horizon_geometry_controls()
+        self.assertEqual(
+            controls["horizon_rho_inner_min"],
+            controls["horizon_endpoint_rho_floor"],
+        )
+        self.assertEqual(controls["horizon_endpoint_rho_floor"], "-400")
+        self.assertEqual(
+            controls["horizon_endpoint_rho_candidates"][-1], "-100"
+        )
+        flattening = _function(self.worker_source, "flatten_request")
+        self.assertIn(
+            '"horizon_endpoint_rho_floor" => required(', flattening
+        )
 
     def test_prefix_schedule_retains_intermediate_least_term_before_growth(self) -> None:
         selector = _function(

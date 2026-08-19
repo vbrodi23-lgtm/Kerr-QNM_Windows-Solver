@@ -2,6 +2,30 @@
 
 Add the newest completed task or milestone-control entry immediately below this heading.
 
+## 2026-08-19 — TASK-079 PR #55 checkpoint and review remediation
+
+- **Task:** TASK-079 — Regularise promoted GSN propagation and determinant conditioning.
+- **Deliverable:** Published a visible checkpoint to draft PR #55, then repaired
+  the independent review findings across promoted-horizon evidence
+  reconstruction, ODE-budget scientific identity and runtime binding,
+  request/journal/result authentication, schema-7 migration recovery, adaptive
+  endpoint contour/outcome/persistence contracts, fixed-root decimal
+  containment, mechanism dispatch, recovery-window parity, and strict operator
+  reporting.
+- **Verification:** Full permitted Python discovery passes 919 tests with 7
+  skips. Focused schema/static, promoted-response, precision, runtime/cache,
+  migration, and public-surface suites pass; changed Python compiles; the
+  TaskPlanner board and diff hygiene validate. No Julia worker, Kerr
+  determinant, radial or coordinate ODE, angular solve, QNM root solve, M02
+  campaign, or production PowerShell script was executed.
+- **Evidence ceiling:** TASK-079 remains In Progress. The exterior determinant
+  absolute-error model, calibrated determinant/root-to-local-ODE allocation,
+  native operator receipts, physical results, and human mathematics review
+  remain outstanding.
+- **Change reference:** Draft PR
+  [#55](https://github.com/vbrodi23-lgtm/Kerr-QNM_Windows-Solver/pull/55);
+  first visible checkpoint `c656a6bfbd37a57a3c564cb09efc29edf19b4707`.
+
 ## 2026-08-19 — TASK-079 adaptive recovery implementation ready for operator review
 
 - **Task:** TASK-079 — Regularise promoted GSN propagation and determinant conditioning.

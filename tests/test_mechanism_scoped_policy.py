@@ -32,6 +32,7 @@ from windows_solver.response_batches import (
 )
 from tests.fixtures import (
     synthetic_ode_error_budget,
+    valid_horizon_endpoint_search_evidence,
     valid_numerical_conditioning,
 )
 
@@ -258,6 +259,11 @@ class ReceiptCompatibilityTests(unittest.TestCase):
             "primary_acceptance_sha256": hashlib.sha256(
                 canonical_json_bytes(primary.to_mapping())
             ).hexdigest(),
+            "horizon_endpoint_search_evidence": (
+                valid_horizon_endpoint_search_evidence()
+                if horizon
+                else None
+            ),
         }
         return response_engine.RootReadout(
             omega=job.root.omega,

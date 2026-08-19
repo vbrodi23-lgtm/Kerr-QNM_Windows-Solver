@@ -62,6 +62,7 @@ from tests.fixtures import (
     control_failure_stage,
     synthetic_ode_error_budget,
     valid_control_failure_diagnostics,
+    valid_horizon_endpoint_search_evidence,
     valid_numerical_conditioning,
 )
 
@@ -352,6 +353,9 @@ def _with_baseline_conditioning(
     if horizon and raw_status is None:
         raw_status = "available/v1"
 
+    ode_error_budget = synthetic_ode_error_budget(
+        outcome.digits
+    ).to_mapping()
     scientific_runtime = {
         "precision_digits": outcome.digits,
         "working_precision_bits": (
@@ -361,6 +365,10 @@ def _with_baseline_conditioning(
         "regularised_gsn_precision_policy": dict(
             regularised_gsn_precision_policy(result.mechanism_id)
         ),
+        "ode_error_budget": ode_error_budget,
+        "ode_error_budget_sha256": hashlib.sha256(
+            canonical_json_bytes(ode_error_budget)
+        ).hexdigest(),
     }
 
     def conditioned(readout, readout_id):
@@ -527,6 +535,11 @@ def _with_baseline_conditioning(
             "primary_acceptance_sha256": hashlib.sha256(
                 canonical_json_bytes(primary.to_mapping())
             ).hexdigest(),
+            "horizon_endpoint_search_evidence": (
+                valid_horizon_endpoint_search_evidence()
+                if evidence.scattering_diagnostics_applicable
+                else None
+            ),
         }
         return replace(
             updated,

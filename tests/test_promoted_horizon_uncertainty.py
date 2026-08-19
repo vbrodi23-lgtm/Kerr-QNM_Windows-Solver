@@ -12,8 +12,11 @@ from tests.test_promoted_horizon_component import (
 )
 from windows_solver.response_engine import (
     BOUNDED_ANALYTIC_RESPONSE,
+    ComponentResult,
+    DecimalComplex,
     DerivativeAuthenticationEvidence,
     PROMOTED_HORIZON_COMPONENT_V2_IDENTITY,
+    _validate_promoted_horizon_checkpoint_evidence_for_job,
     run_promoted_horizon_component,
 )
 from windows_solver.response_uncertainty import (
@@ -118,6 +121,107 @@ class PromotedHorizonUncertaintyTests(unittest.TestCase):
             mapping["analytic_horizon_evidence"]["derivative_radius_provenance"]["step_disagreement_abs"],
             "6E-7",
         )
+
+    def test_promoted_horizon_disk_includes_decimal_to_binary64_rounding(self) -> None:
+        leaf = _primary_horizon_leaf()
+        derivative = DecimalComplex(
+            Decimal("1.0000000000000000000000000000000001"),
+            Decimal("0.1000000000000000000000000000000001"),
+        )
+        baseline = _promoted_baseline(leaf.job, derivative=derivative)
+        with localcontext() as context:
+            context.prec = 180
+            tiny = Decimal("1e-80")
+            lower_bound = derivative.magnitude() - tiny - tiny
+        authentication = DerivativeAuthenticationEvidence(
+            derivative_re=derivative.real,
+            derivative_im=derivative.imaginary,
+            propagated_error_abs=tiny,
+            step_disagreement_abs=tiny,
+            lower_bound_abs=lower_bound,
+            selected_step=Decimal("1e-5"),
+            axis="real",
+        )
+        baseline = replace(
+            baseline,
+            primary_acceptance=replace(
+                baseline.primary_acceptance,
+                derivative_authentication=authentication,
+            ),
+        )
+
+        result = run_promoted_horizon_component(
+            leaf.job,
+            FakePromotedBackend(leaf.job, baseline),
+            primary_predictor=baseline.omega,
+        )
+        radius = result.analytic_horizon_evidence[
+            "derivative_disk"
+        ]["radius"]
+
+        self.assertGreater(radius, 1.0e-30)
+        ComponentResult.from_mapping(result.to_mapping())
+
+    def test_deserialization_recomputes_response_disk_and_rejects_understatement(self) -> None:
+        leaf = _primary_horizon_leaf()
+        baseline = self._authenticated_derivative_baseline(leaf.job)
+        mapping = run_promoted_horizon_component(
+            leaf.job,
+            FakePromotedBackend(leaf.job, baseline),
+            primary_predictor=baseline.omega,
+        ).to_mapping()
+        understated = (
+            mapping["analytic_horizon_evidence"]["response_disk"]["radius"]
+            * 1.0e-12
+        )
+        mapping["analytic_horizon_evidence"]["response_disk"]["radius"] = (
+            understated
+        )
+        mapping["error_channels"]["resolution"] = understated
+
+        with self.assertRaisesRegex(ValueError, "horizon response disk"):
+            ComponentResult.from_mapping(mapping)
+
+    def test_job_validation_rejects_coherently_shifted_horizon_frequency(self) -> None:
+        leaf = _primary_horizon_leaf()
+        baseline = self._authenticated_derivative_baseline(leaf.job)
+        mapping = run_promoted_horizon_component(
+            leaf.job,
+            FakePromotedBackend(leaf.job, baseline),
+            primary_predictor=baseline.omega,
+        ).to_mapping()
+        evidence = mapping["analytic_horizon_evidence"]
+        frequency_mapping = evidence["horizon_frequency_disk"]
+        frequency = ComplexDisk(
+            complex(
+                frequency_mapping["centre"]["real"] + 1.0e-3,
+                frequency_mapping["centre"]["imaginary"],
+            ),
+            frequency_mapping["radius"],
+        )
+        derivative_mapping = evidence["derivative_disk"]
+        derivative = ComplexDisk(
+            complex(
+                derivative_mapping["centre"]["real"],
+                derivative_mapping["centre"]["imaginary"],
+            ),
+            derivative_mapping["radius"],
+        )
+        response = horizon_response_disk(
+            horizon_frequency=frequency,
+            determinant_derivative=derivative,
+        )
+        evidence["horizon_frequency_disk"] = frequency.to_mapping()
+        evidence["response_disk"] = response.to_mapping()
+        mapping["response"] = response.to_mapping()["centre"]
+        mapping["closed_form_response"] = response.to_mapping()["centre"]
+        mapping["error_channels"]["resolution"] = response.radius
+        restored = ComponentResult.from_mapping(mapping)
+
+        with self.assertRaisesRegex(ValueError, "horizon frequency disk"):
+            _validate_promoted_horizon_checkpoint_evidence_for_job(
+                restored, leaf.job
+            )
 
     def test_zero_containing_horizon_disk_is_typed_unusable(self) -> None:
         leaf = _primary_horizon_leaf()

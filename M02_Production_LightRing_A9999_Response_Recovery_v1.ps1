@@ -154,6 +154,7 @@ try {
         $Result = $_.stages[-1].component_result.result
         $ResolvedWindow = Get-OptionalProperty $Result "resolved_window"
         $DerivativeEvidence = Get-OptionalProperty $Result "derivative_evidence"
+        $ResponseUncertaintyStatus = Get-OptionalProperty $Result "response_uncertainty_status"
         [ordered]@{
             leaf_id = $_.leaf_id
             old_and_added_epsilons = @($Result.levels | ForEach-Object { $_.epsilon })
@@ -168,7 +169,7 @@ try {
             exact_added_epsilons = Get-OptionalProperty $ResolvedWindow "exact_added_epsilons"
             readout_specific_promotion_plan = Get-OptionalProperty $ResolvedWindow "readout_specific_promotion_plan"
             response_disk = Get-OptionalProperty $DerivativeEvidence "response_disk"
-            finite_amplitude_validation_status = $Result.response_uncertainty_status
+            finite_amplitude_validation_status = if ($null -eq $ResponseUncertaintyStatus) { "NOT_REPORTED_BY_COMPONENT" } else { $ResponseUncertaintyStatus }
             durable_resume_evidence = $DurableResume
         }
     })

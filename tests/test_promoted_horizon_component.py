@@ -7,7 +7,10 @@ import math
 import unittest
 from unittest.mock import patch
 
-from tests.fixtures import valid_numerical_conditioning
+from tests.fixtures import (
+    valid_horizon_endpoint_search_evidence,
+    valid_numerical_conditioning,
+)
 from windows_solver.cli import _validate_reduction_component_checkpoint_binding
 from windows_solver.contracts import canonical_json_bytes
 from windows_solver.progress import (
@@ -243,6 +246,7 @@ class FakePromotedBackend:
 
 
 def _with_worker_receipt(job, baseline, digits, primary_predictor):
+    budget = synthetic_ode_error_budget(digits).to_mapping()
     runtime = {
         "precision_digits": digits,
         "working_precision_bits": math.ceil(digits * math.log2(10)) + 32,
@@ -253,6 +257,10 @@ def _with_worker_receipt(job, baseline, digits, primary_predictor):
                 job.mechanism_id
             )
         ),
+        "ode_error_budget": budget,
+        "ode_error_budget_sha256": hashlib.sha256(
+            canonical_json_bytes(budget)
+        ).hexdigest(),
     }
     request = JuliaPrecisionRootBackend(
         job.backend_identity,
@@ -294,6 +302,11 @@ def _with_worker_receipt(job, baseline, digits, primary_predictor):
                 baseline.primary_acceptance.to_mapping()
             )
         ).hexdigest(),
+        "horizon_endpoint_search_evidence": (
+            valid_horizon_endpoint_search_evidence()
+            if job.mechanism_id == "horizon-admittance"
+            else None
+        ),
     }
     receipt = {
         **material,
@@ -641,6 +654,7 @@ class FakeJuliaPrecisionBackend(FakePromotedBackend):
         self.digits = digits
 
     def scientific_runtime_for(self, job):
+        budget = synthetic_ode_error_budget(self.digits).to_mapping()
         return {
             "precision_digits": self.digits,
             "working_precision_bits": math.ceil(self.digits * math.log2(10)) + 32,
@@ -651,6 +665,10 @@ class FakeJuliaPrecisionBackend(FakePromotedBackend):
                     job.mechanism_id
                 )
             ),
+            "ode_error_budget": budget,
+            "ode_error_budget_sha256": hashlib.sha256(
+                canonical_json_bytes(budget)
+            ).hexdigest(),
         }
 
     def _request(
