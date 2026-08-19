@@ -27,6 +27,7 @@ from windows_solver.julia_response_backend import (
     _forward_julia_progress_line,
     _mode_specific_branch_enclosure_radius,
     _run_streamed_julia,
+    _valid_numerical_control_diagnostics,
 )
 from windows_solver.progress import (
     PROGRESS_SCHEMA,
@@ -48,6 +49,7 @@ from windows_solver.response_batches import (
 )
 from windows_solver.response_engine import (
     DecimalComplex,
+    FixedRootDeterminantSample,
     LadderLevel,
     NumericalPolicy,
     RootAuthenticationEvidence,
@@ -58,6 +60,9 @@ from windows_solver.response_engine import (
 )
 from windows_solver.progress_output import CampaignProgressReporter
 from tests.fixtures import (
+    control_failure_stage,
+    synthetic_ode_error_budget,
+    valid_control_failure_diagnostics,
     valid_julia_root_response,
     valid_legacy_julia_root_response,
     valid_root_authentication,
@@ -98,6 +103,10 @@ class FakeAdapter:
 
     def __init__(self):
         self.requests = []
+
+    @staticmethod
+    def ode_error_budget_for_digits(digits):
+        return synthetic_ode_error_budget(digits)
 
     @staticmethod
     def shifted(value, delta):
@@ -182,6 +191,469 @@ def _set_distinct_derivative_binding(response, wire_derivative_abs):
 
 
 class JuliaResponseBackendTests(unittest.TestCase):
+    def test_horizon_endpoint_receipt_binds_attempted_rung_separately_from_best_prefix(self):
+        job = _job_for_mechanism("horizon-admittance")
+        backend = JuliaPrecisionRootBackend(
+            VettedNativeDeterminantKernel.identity, FakeAdapter(), 80
+        )
+        mapping = backend.read_root(job, 0.0j).to_mapping()
+        evidence = mapping["worker_response_receipt"][
+            "horizon_endpoint_search_evidence"
+        ][0]
+        selected = evidence["selected_pair"][0]
+        self.assertEqual(selected["attempted_endpoint_order"], 56)
+        selected.update({
+            "endpoint_order": 44,
+            "ingoing_best_prefix_order": 40,
+            "outgoing_best_prefix_order": 44,
+        })
+
+        repeated = [
+            candidate
+            for candidate in evidence["rejected_candidates"]
+            if candidate["rho"] == "-50"
+            and candidate["attempted_endpoint_order"] in (28, 56)
+        ]
+        self.assertEqual(len(repeated), 2)
+        for candidate in repeated:
+            candidate.update({
+                "endpoint_order": 20,
+                "ingoing_best_prefix_order": 16,
+                "outgoing_best_prefix_order": 20,
+            })
+
+        receipt = mapping["worker_response_receipt"]
+        receipt["receipt_sha256"] = hashlib.sha256(
+            canonical_json_bytes({
+                key: value for key, value in receipt.items()
+                if key != "receipt_sha256"
+            })
+        ).hexdigest()
+        RootReadout.from_mapping(mapping)
+
+    def test_horizon_failure_outcome_cannot_be_resealed_from_arithmetic_to_order(self):
+        job = _job_for_mechanism("horizon-admittance")
+        request = JuliaPrecisionRootBackend(
+            VettedNativeDeterminantKernel.identity, FakeAdapter(), 80
+        )._request(job, 0.0j)
+        failure = {
+            "failure_code": "HORIZON_ARITHMETIC_INADEQUATE",
+            "failure_class": "CONTROL",
+            "stage": control_failure_stage("HORIZON_ARITHMETIC_INADEQUATE"),
+            "retryable": True,
+            "diagnostics": valid_control_failure_diagnostics(
+                "HORIZON_ARITHMETIC_INADEQUATE",
+                precision_bits=request["working_precision_bits"],
+            ),
+        }
+        self.assertTrue(_valid_numerical_control_diagnostics(
+            failure, request_binding=request
+        ))
+
+        forged = json.loads(canonical_json_bytes(failure))
+        forged.update({
+            "failure_code": "HORIZON_MAXIMUM_ORDER_INADEQUATE",
+            "retryable": False,
+        })
+        diagnostics = forged["diagnostics"]
+        diagnostics.update({
+            "recovery_outcome": "maximum-series-order-inadequate/v1",
+            "next_precision_tier_allowed": False,
+        })
+        diagnostics["recovery_evidence"]["outcome"] = (
+            "maximum-series-order-inadequate/v1"
+        )
+        for candidate in diagnostics["recovery_evidence"][
+            "rejected_candidates"
+        ]:
+            candidate.update({
+                "limitation": "insufficient-series-order/v1",
+                "precision_limited": False,
+            })
+        self.assertFalse(_valid_numerical_control_diagnostics(
+            forged, request_binding=request
+        ))
+
+    def test_horizon_failure_outcome_cannot_be_resealed_from_order_to_arithmetic(self):
+        job = _job_for_mechanism("horizon-admittance")
+        request = JuliaPrecisionRootBackend(
+            VettedNativeDeterminantKernel.identity, FakeAdapter(), 80
+        )._request(job, 0.0j)
+        failure = {
+            "failure_code": "HORIZON_MAXIMUM_ORDER_INADEQUATE",
+            "failure_class": "CONTROL",
+            "stage": control_failure_stage(
+                "HORIZON_MAXIMUM_ORDER_INADEQUATE"
+            ),
+            "retryable": False,
+            "diagnostics": valid_control_failure_diagnostics(
+                "HORIZON_MAXIMUM_ORDER_INADEQUATE",
+                precision_bits=request["working_precision_bits"],
+            ),
+        }
+        self.assertTrue(_valid_numerical_control_diagnostics(
+            failure, request_binding=request
+        ))
+
+        forged = json.loads(canonical_json_bytes(failure))
+        forged.update({
+            "failure_code": "HORIZON_ARITHMETIC_INADEQUATE",
+            "retryable": True,
+        })
+        diagnostics = forged["diagnostics"]
+        diagnostics.update({
+            "recovery_outcome": "arithmetic-precision-inadequate/v1",
+            "next_precision_tier_allowed": True,
+        })
+        diagnostics["recovery_evidence"]["outcome"] = (
+            "arithmetic-precision-inadequate/v1"
+        )
+        for candidate in diagnostics["recovery_evidence"][
+            "rejected_candidates"
+        ]:
+            candidate.update({
+                "limitation": "insufficient-arithmetic-precision/v1",
+                "precision_limited": True,
+            })
+        self.assertFalse(_valid_numerical_control_diagnostics(
+            forged, request_binding=request
+        ))
+
+    def test_horizon_endpoint_receipt_rejects_resealed_policy_geometry_and_order_forgery(self):
+        job = _job_for_mechanism("horizon-admittance")
+        backend = JuliaPrecisionRootBackend(
+            VettedNativeDeterminantKernel.identity, FakeAdapter(), 80
+        )
+        original = backend.read_root(job, 0.0j).to_mapping()
+
+        for label, mutate in (
+            ("policy", lambda evidence: evidence.__setitem__("policy_identity", "forged/v1")),
+            ("rho", lambda evidence: evidence["selected_pair"][0].__setitem__("rho", "-399")),
+            ("endpoint-order", lambda evidence: evidence["selected_pair"][0].__setitem__("endpoint_order", 99)),
+            ("attempted-order", lambda evidence: evidence["selected_pair"][0].__setitem__("attempted_endpoint_order", 112)),
+            ("prefix-order", lambda evidence: evidence["selected_pair"][0].__setitem__("ingoing_best_prefix_order", 27)),
+            ("limitation", lambda evidence: evidence["selected_pair"][0].__setitem__("limitation", "insufficient-series-order/v1")),
+            ("precision-limited", lambda evidence: evidence["selected_pair"][0].__setitem__("precision_limited", True)),
+            ("pair-order", lambda evidence: evidence["selected_pair"].reverse()),
+            ("omitted-candidate", lambda evidence: evidence["rejected_candidates"].pop()),
+            (
+                "omitted-intermediate-selected-rho-trial",
+                lambda evidence: evidence["rejected_candidates"].remove(
+                    next(
+                        trial
+                        for trial in evidence["rejected_candidates"]
+                        if trial["rho"] == evidence["selected_pair"][0]["rho"]
+                        and trial["attempted_endpoint_order"] == 28
+                    )
+                ),
+            ),
+        ):
+            with self.subTest(label=label):
+                forged = json.loads(canonical_json_bytes(original))
+                receipt = forged["worker_response_receipt"]
+                mutate(receipt["horizon_endpoint_search_evidence"][0])
+                receipt["receipt_sha256"] = hashlib.sha256(
+                    canonical_json_bytes({
+                        key: value for key, value in receipt.items()
+                        if key != "receipt_sha256"
+                    })
+                ).hexdigest()
+                with self.assertRaisesRegex(ValueError, "horizon endpoint"):
+                    RootReadout.from_mapping(forged)
+
+    def test_horizon_failure_diagnostics_bind_exact_request_policy_geometry_and_orders(self):
+        job = _job_for_mechanism("horizon-admittance")
+        backend = JuliaPrecisionRootBackend(
+            VettedNativeDeterminantKernel.identity,
+            FakeAdapter(),
+            80,
+        )
+        request = backend._request(job, 0.0j)
+        for code in (
+            "HORIZON_ARITHMETIC_INADEQUATE",
+            "HORIZON_COORDINATE_INVERSION_FAILED",
+        ):
+            failure = {
+                "failure_code": code,
+                "failure_class": "CONTROL",
+                "stage": control_failure_stage(code),
+                "retryable": code == "HORIZON_ARITHMETIC_INADEQUATE",
+                "diagnostics": valid_control_failure_diagnostics(
+                    code, precision_bits=request["working_precision_bits"]
+                ),
+            }
+            self.assertTrue(
+                _valid_numerical_control_diagnostics(
+                    failure, request_binding=request
+                ),
+                f"canonical {code} fixture must reach the typed validator",
+            )
+            mutations = [
+                ("policy", lambda evidence: evidence.__setitem__("policy_identity", "forged/v1")),
+                ("endpoint-orders", lambda evidence: evidence.__setitem__("endpoint_orders", [28, 99, 112])),
+            ]
+            if code != "HORIZON_COORDINATE_INVERSION_FAILED":
+                mutations.append((
+                    "omitted-intermediate-order",
+                    lambda evidence: evidence["rejected_candidates"].remove(
+                        next(
+                            trial
+                            for trial in evidence["rejected_candidates"]
+                            if trial["rho"] == "-10"
+                            and trial["attempted_endpoint_order"] == 56
+                        )
+                    ),
+                ))
+            for label, mutate in mutations:
+                with self.subTest(code=code, label=label):
+                    forged = json.loads(canonical_json_bytes(failure))
+                    mutate(forged["diagnostics"]["recovery_evidence"])
+                    self.assertFalse(
+                        _valid_numerical_control_diagnostics(
+                            forged, request_binding=request
+                        )
+                    )
+
+    def test_horizon_failure_schedule_rejects_invalid_or_verified_rho_retry(self):
+        job = _job_for_mechanism("horizon-admittance")
+        request = JuliaPrecisionRootBackend(
+            VettedNativeDeterminantKernel.identity,
+            FakeAdapter(),
+            80,
+        )._request(job, 0.0j)
+        for code, retry in (
+            (
+                "HORIZON_GEOMETRY_EXHAUSTED",
+                {
+                    "rho": "-10",
+                    "attempted_endpoint_order": 28,
+                    "endpoint_order": 24,
+                    "ingoing_best_prefix_order": 20,
+                    "outgoing_best_prefix_order": 24,
+                    "ingoing_adequate": False,
+                    "outgoing_adequate": False,
+                    "limitation": "insufficient-series-order/v1",
+                    "precision_limited": False,
+                    "limitation_conditioning": {
+                        "binding_predicted_reliable_digits": "20",
+                        "maximum_last_term_ratio": "0.5",
+                        "maximum_recurrence_digits_lost": "1",
+                        "maximum_series_evaluation_digits_lost": "1",
+                        "maximum_truncation_digits_lost": "3",
+                    },
+                },
+            ),
+            (
+                "HORIZON_ONLY_ONE_ENDPOINT",
+                {
+                    "rho": "-10",
+                    "attempted_endpoint_order": 56,
+                    "endpoint_order": 48,
+                    "ingoing_best_prefix_order": 44,
+                    "outgoing_best_prefix_order": 48,
+                    "ingoing_adequate": False,
+                    "outgoing_adequate": False,
+                    "limitation": "insufficient-series-order/v1",
+                    "precision_limited": False,
+                    "limitation_conditioning": {
+                        "binding_predicted_reliable_digits": "20",
+                        "maximum_last_term_ratio": "0.5",
+                        "maximum_recurrence_digits_lost": "1",
+                        "maximum_series_evaluation_digits_lost": "1",
+                        "maximum_truncation_digits_lost": "3",
+                    },
+                },
+            ),
+        ):
+            failure = {
+                "failure_code": code,
+                "failure_class": "CONTROL",
+                "stage": control_failure_stage(code),
+                "retryable": False,
+                "diagnostics": valid_control_failure_diagnostics(
+                    code, precision_bits=request["working_precision_bits"]
+                ),
+            }
+            self.assertTrue(_valid_numerical_control_diagnostics(
+                failure, request_binding=request
+            ))
+            forged = json.loads(canonical_json_bytes(failure))
+            forged["diagnostics"]["recovery_evidence"][
+                "rejected_candidates"
+            ].append(retry)
+            self.assertFalse(_valid_numerical_control_diagnostics(
+                forged, request_binding=request
+            ))
+
+    def test_successful_horizon_endpoint_evidence_is_sealed_in_receipt(self):
+        job = _job_for_mechanism("horizon-admittance")
+        backend = JuliaPrecisionRootBackend(
+            VettedNativeDeterminantKernel.identity, FakeAdapter(), 80
+        )
+
+        readout = backend.read_root(job, 0.0j)
+
+        evidence = readout.worker_response_receipt[
+            "horizon_endpoint_search_evidence"
+        ]
+        self.assertTrue(evidence)
+        self.assertEqual(evidence[0]["outcome"], "adequate/v1")
+        self.assertEqual(len(evidence[0]["selected_pair"]), 2)
+
+        class MissingEndpointAdapter(FakeAdapter):
+            def evaluate(self, request):
+                response = super().evaluate(request)
+                response["horizon_endpoint_search_evidence"] = []
+                return response
+
+        with self.assertRaisesRegex(
+            JuliaResponseBackendError, "horizon endpoint evidence"
+        ):
+            JuliaPrecisionRootBackend(
+                VettedNativeDeterminantKernel.identity,
+                MissingEndpointAdapter(),
+                80,
+            ).read_root(job, 0.0j)
+
+    def test_schema8_horizon_derivative_error_availability_is_not_zero_claim(self):
+        job = _job_for_mechanism("horizon-admittance")
+        backend = JuliaPrecisionRootBackend(
+            VettedNativeDeterminantKernel.identity, FakeAdapter(), 80
+        )
+        request = backend._request(job, 0.0j)
+        response = valid_julia_root_response(request)
+        derivative = response["primary_acceptance"]["derivative_authentication"]
+        self.assertEqual(derivative["determinant_error_status"], "available/v1")
+        self.assertGreater(Decimal(derivative["propagated_error_abs"]), 0)
+        readout = backend._read_root_response_v7(
+            job,
+            request,
+            SimpleNamespace(
+                response=response,
+                request_binding=request,
+                request_sha256=response["request_sha256"],
+                runtime_identity_sha256="f" * 64,
+                reused=False,
+                cached_worker_response_receipt=None,
+            ),
+        )
+        self.assertEqual(
+            readout.primary_acceptance.derivative_authentication.determinant_error_status,
+            "available/v1",
+        )
+
+        response["primary_acceptance"]["derivative_authentication"][
+            "propagated_error_abs"
+        ] = "0"
+        with self.assertRaisesRegex(
+            JuliaResponseBackendError,
+            "PRIMARY acceptance evidence is invalid",
+        ):
+            backend._read_root_response_v7(
+                job,
+                request,
+                SimpleNamespace(
+                    response=response,
+                    request_binding=request,
+                    request_sha256=response["request_sha256"],
+                    runtime_identity_sha256="f" * 64,
+                    reused=False,
+                    cached_worker_response_receipt=None,
+                ),
+            )
+
+    def test_fixed_root_determinant_sample_boundary_preserves_evidence(self):
+        class FixedSampleAdapter(FakeAdapter):
+            def evaluate_for_validation(self, request):
+                self.requests.append(request)
+                request_sha256 = hashlib.sha256(
+                    canonical_json_bytes(request)
+                ).hexdigest()
+                response = {
+                    "schema_version": 1,
+                    "status": "ok",
+                    "operation": "fixed-root-determinant-sample",
+                    "request_sha256": request_sha256,
+                    "omega_re": request["fixed_omega"]["real"],
+                    "omega_im": request["fixed_omega"]["imaginary"],
+                    "amplitude_re": request["amplitude"]["real"],
+                    "amplitude_im": request["amplitude"]["imaginary"],
+                    "determinant_re": (
+                        "0.0060000000010000000000000000000000000001"
+                    ),
+                    "determinant_im": "0.009",
+                    "determinant_error_abs": "4e-12",
+                    "determinant_error_status": "available/v1",
+                    "determinant_error_model_id": "synthetic-absolute-bound/v1",
+                    "determinant_family": "exterior-wronskian/v1",
+                    "determinant_normalisation": "unit-asymptotic-branch-wronskian/v1",
+                    "branch_identity": "gsn-complex-rho/v1",
+                    "branch_authenticated": True,
+                    "semantic_precision_tier": "bigfloat-80",
+                    "working_precision_bits": 298,
+                    "readout_role": request["readout_role"],
+                }
+                return SimpleNamespace(
+                    response=response,
+                    request_binding=dict(request),
+                    request_sha256=request_sha256,
+                    runtime_identity_sha256="f" * 64,
+                    reused=False,
+                    cached_worker_response_receipt=None,
+                )
+
+        job = _job_for_mechanism("exterior-light-ring")
+        adapter = FixedSampleAdapter()
+        backend = JuliaPrecisionRootBackend(
+            VettedNativeDeterminantKernel.identity, adapter, 80
+        )
+        sample = backend.sample_fixed_root_determinant(
+            job,
+            job.root.omega,
+            0.003 + 0.0j,
+            readout_role="coordinate-real-plus-h",
+        )
+        mapping = sample.to_mapping()
+
+        self.assertEqual(adapter.requests[0]["operation"], "fixed-root-determinant-sample")
+        self.assertEqual(mapping["omega"], {"imaginary": job.root.omega.imag, "real": job.root.omega.real})
+        self.assertEqual(mapping["determinant_family"], "exterior-wronskian/v1")
+        self.assertEqual(mapping["precision_tier"], "bigfloat-80")
+        self.assertEqual(mapping["working_precision_bits"], 298)
+        self.assertEqual(mapping["readout_role"], "coordinate-real-plus-h")
+        self.assertEqual(
+            str(sample.exact_determinant.real),
+            "0.0060000000010000000000000000000000000001",
+        )
+        self.assertRegex(mapping["request_sha256"], r"^[0-9a-f]{64}$")
+        self.assertRegex(mapping["worker_response_receipt_sha256"], r"^[0-9a-f]{64}$")
+        self.assertEqual(
+            mapping["worker_response_receipt"]["request_binding"],
+            adapter.requests[0],
+        )
+        self.assertEqual(
+            mapping["worker_response_receipt"]["response_binding"][
+                "determinant_re"
+            ],
+            "0.0060000000010000000000000000000000000001",
+        )
+
+        for receipt_field, replacement in (
+            ("request_binding", {**adapter.requests[0], "readout_role": "tampered"}),
+            ("response_binding", {
+                **mapping["worker_response_receipt"]["response_binding"],
+                "determinant_re": "9",
+            }),
+        ):
+            with self.subTest(receipt_field=receipt_field):
+                tampered = json.loads(canonical_json_bytes(mapping))
+                tampered["worker_response_receipt"][receipt_field] = replacement
+                tampered["worker_response_receipt_sha256"] = hashlib.sha256(
+                    canonical_json_bytes(tampered["worker_response_receipt"])
+                ).hexdigest()
+                with self.assertRaisesRegex(ValueError, "receipt .* mismatch"):
+                    FixedRootDeterminantSample.from_mapping(tampered)
+
     @staticmethod
     def _cache_adapter(root, runner):
         depot = root / "depot"
@@ -219,7 +691,8 @@ class JuliaResponseBackendTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             adapter, store = self._cache_adapter(Path(temporary), runner)
             backend = JuliaPrecisionRootBackend(
-                VettedNativeDeterminantKernel.identity, adapter, 80
+                VettedNativeDeterminantKernel.identity, adapter, 80,
+                ode_error_budget=synthetic_ode_error_budget(80),
             )
             with self.assertRaises(JuliaResponseBackendError):
                 backend.read_root(_deep_job(), 0.0j)
@@ -242,7 +715,8 @@ class JuliaResponseBackendTests(unittest.TestCase):
             adapter, store = self._cache_adapter(Path(temporary), runner)
             job = _deep_job()
             backend = JuliaPrecisionRootBackend(
-                VettedNativeDeterminantKernel.identity, adapter, 80
+                VettedNativeDeterminantKernel.identity, adapter, 80,
+                ode_error_budget=synthetic_ode_error_budget(80),
             )
             request = backend._request(job, 0.0j)
             request_sha256 = hashlib.sha256(
@@ -303,7 +777,8 @@ class JuliaResponseBackendTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             adapter, store = self._cache_adapter(Path(temporary), runner)
             backend = JuliaPrecisionRootBackend(
-                VettedNativeDeterminantKernel.identity, adapter, 80
+                VettedNativeDeterminantKernel.identity, adapter, 80,
+                ode_error_budget=synthetic_ode_error_budget(80),
             )
             backend.read_root(_deep_job(), 0.0j)
             cache_path = next(store.root.glob("*.json"))
@@ -331,12 +806,13 @@ class JuliaResponseBackendTests(unittest.TestCase):
             backend.read_root(_deep_job(), 0.0j)
             self.assertEqual(len(calls), 2)
 
-    def test_success_wire_schema_is_seven_and_worker_errors_remain_schema_one(self):
+    def test_success_wire_schema_is_nine_and_worker_errors_remain_schema_one(self):
         """Catches changing the successful wire without preserving error parsing.
 
         The success wire and the error envelope are versioned independently.
-        Schema 7 records binary64-parity PRIMARY and fixed-root diagnostics;
-        the error envelope stays independently versioned at 1.
+        Schema 9 persists successful horizon endpoint searches on top of the
+        binary64-parity PRIMARY/fixed-root evidence; the error envelope stays
+        independently versioned at 1.
         """
 
         request = JuliaPrecisionRootBackend(
@@ -348,7 +824,7 @@ class JuliaResponseBackendTests(unittest.TestCase):
             valid_julia_root_response(request)["schema_version"],
             WORKER_RESPONSE_WIRE_SCHEMA,
         )
-        self.assertEqual(WORKER_RESPONSE_WIRE_SCHEMA, 7)
+        self.assertEqual(WORKER_RESPONSE_WIRE_SCHEMA, 9)
         root = Path(__file__).resolve().parents[1]
         worker = (
             root / "src/windows_solver/data/julia/m02_worker.jl"
@@ -357,7 +833,7 @@ class JuliaResponseBackendTests(unittest.TestCase):
             worker.index("function result_fields(") :
             worker.index("function evaluate_request(")
         ]
-        self.assertEqual(result_fields.count('"schema_version" => 7'), 2)
+        self.assertEqual(result_fields.count('"schema_version" => 9'), 2)
         self.assertNotIn('"schema_version" => 6', result_fields)
         error_path = worker[
             worker.rindex("catch failure") : worker.index(
@@ -1932,7 +2408,7 @@ class JuliaResponseBackendTests(unittest.TestCase):
                 self._force_stop_process(directory / "child.pid")
                 self._force_stop_process(directory / "parent.pid")
 
-    def test_promoted_backend_uses_practical_80_digit_policy(self):
+    def test_promoted_backend_consumes_recorded_80_digit_ode_budget(self):
         job = _deep_job()
         adapter = FakeAdapter()
         backend = JuliaPrecisionRootBackend(
@@ -1947,8 +2423,16 @@ class JuliaResponseBackendTests(unittest.TestCase):
         self.assertEqual(
             request["policy"]["root_correction_tolerance"], "2e-11"
         )
-        self.assertEqual(request["policy"]["ode_relative_tolerance"], "1e-18")
-        self.assertEqual(request["policy"]["ode_absolute_tolerance"], "1e-20")
+        budget = synthetic_ode_error_budget(80)
+        self.assertEqual(
+            float(request["policy"]["ode_relative_tolerance"]),
+            budget.homogeneous_reltol,
+        )
+        self.assertEqual(
+            float(request["policy"]["ode_absolute_tolerance"]),
+            budget.homogeneous_abstol,
+        )
+        self.assertEqual(request["policy"]["ode_error_budget"], budget.to_mapping())
         self.assertEqual(request["policy"]["frequency_step"], "1e-6")
         self.assertEqual(request["amplitude"], {
             "real": "0.001",
@@ -1964,7 +2448,7 @@ class JuliaResponseBackendTests(unittest.TestCase):
         )
         self.assertEqual(
             request["policy"]["promoted_root_readout_policy"],
-            "binary64-parity-primary-fixed-root-diagnostics/v1",
+            "binary64-parity-primary-fixed-root-diagnostics-frequency-disk/v2",
         )
         self.assertTrue(readout.converged)
         self.assertEqual(backend.scientific_runtime["precision_digits"], 80)
@@ -2028,28 +2512,27 @@ class JuliaResponseBackendTests(unittest.TestCase):
             policy80_refined["root_correction_tolerance"],
         )
 
-        # The extra 120-digit precision is spent as guard: ODE controls are
-        # tightened by a bounded factor over the healthy 80-digit level, not
-        # driven toward the arithmetic floor.
+        # Storage precision cannot silently alter local ODE targets. Both
+        # requests consume their own recorded calibration-derived budgets.
         for field in (
             "homogeneous_ode_relative_tolerance",
             "coordinate_ode_relative_tolerance",
         ):
-            exponent80 = int(policy80[field].split("e-")[1])
-            exponent120 = int(policy120[field].split("e-")[1])
-            self.assertGreater(exponent120, exponent80)
-            self.assertLess(exponent120 - exponent80, 40)
+            self.assertEqual(float(policy120[field]), float(policy80[field]))
 
-        # The coordinate map is never driven harder than the homogeneous solve.
+        # Each channel is exactly the reviewed allocation; no cross-channel
+        # ordering is inferred beyond that calibration receipt.
         for candidate in (policy80, policy80_refined,
                           policy120, policy120_refined):
-            coordinate = int(
-                candidate["coordinate_ode_relative_tolerance"].split("e-")[1]
+            budget = candidate["ode_error_budget"]
+            self.assertEqual(
+                float(candidate["coordinate_ode_relative_tolerance"]),
+                budget["coordinate_reltol"],
             )
-            homogeneous = int(
-                candidate["homogeneous_ode_relative_tolerance"].split("e-")[1]
+            self.assertEqual(
+                float(candidate["homogeneous_ode_relative_tolerance"]),
+                budget["homogeneous_reltol"],
             )
-            self.assertLessEqual(coordinate, homogeneous)
 
         # The derivative step stays in a bounded, calibratable range rather
         # than sitting at a digit-derived 1e-60.
@@ -2454,7 +2937,7 @@ class JuliaResponseBackendTests(unittest.TestCase):
             "SPIN_CONTINUATION",
         )
 
-    def test_refinement_tightens_every_resolution_control(self):
+    def test_refinement_preserves_recorded_ode_budget_and_refines_discrete_controls(self):
         job = _deep_job()
         adapter = FakeAdapter()
         backend = JuliaPrecisionRootBackend(
@@ -2464,7 +2947,10 @@ class JuliaResponseBackendTests(unittest.TestCase):
         backend.read_root(job, 0.0j)
 
         policy = adapter.requests[0]["policy"]
-        self.assertEqual(policy["ode_relative_tolerance"], "1e-20")
+        self.assertEqual(
+            float(policy["ode_relative_tolerance"]),
+            synthetic_ode_error_budget(80).homogeneous_reltol,
+        )
         self.assertEqual(policy["endpoint_series_order"], 36)
         self.assertEqual(policy["support_subinterval_count"], 512)
         self.assertEqual(policy["angular_pad"], 26)
@@ -2816,7 +3302,8 @@ class JuliaResponseBackendTests(unittest.TestCase):
                 root / "julia.exe", root, depot, root / "worker.jl", {}, runner
             )
             request = JuliaPrecisionRootBackend(
-                job.backend_identity, adapter, 80
+                job.backend_identity, adapter, 80,
+                ode_error_budget=synthetic_ode_error_budget(80),
             )._request(job, 0.0j)
             with self.assertRaises(JuliaResponseBackendError) as raised:
                 adapter.evaluate(request)
@@ -2884,7 +3371,8 @@ class JuliaResponseBackendTests(unittest.TestCase):
                 root / "julia.exe", root, depot, root / "worker.jl", {}, runner
             )
             request = JuliaPrecisionRootBackend(
-                job.backend_identity, adapter, 80
+                job.backend_identity, adapter, 80,
+                ode_error_budget=synthetic_ode_error_budget(80),
             )._request(job, 0.0j)
             with self.assertRaisesRegex(
                 JuliaResponseBackendError, "request identity mismatch"

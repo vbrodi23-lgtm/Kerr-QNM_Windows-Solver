@@ -60,7 +60,9 @@ from windows_solver.response_engine import (
 from windows_solver.solved_leaf_cache import SolvedLeafStore
 from tests.fixtures import (
     control_failure_stage,
+    synthetic_ode_error_budget,
     valid_control_failure_diagnostics,
+    valid_horizon_endpoint_search_evidence,
     valid_numerical_conditioning,
 )
 
@@ -351,6 +353,9 @@ def _with_baseline_conditioning(
     if horizon and raw_status is None:
         raw_status = "available/v1"
 
+    ode_error_budget = synthetic_ode_error_budget(
+        outcome.digits
+    ).to_mapping()
     scientific_runtime = {
         "precision_digits": outcome.digits,
         "working_precision_bits": (
@@ -360,11 +365,27 @@ def _with_baseline_conditioning(
         "regularised_gsn_precision_policy": dict(
             regularised_gsn_precision_policy(result.mechanism_id)
         ),
+        "ode_error_budget": ode_error_budget,
+        "ode_error_budget_sha256": hashlib.sha256(
+            canonical_json_bytes(ode_error_budget)
+        ).hexdigest(),
     }
 
-    def conditioned(readout, readout_id):
+    def conditioned(readout, readout_id, amplitude):
         existing_receipt = readout.worker_response_receipt
-        if existing_receipt is not None:
+        if receipt_job is not None:
+            if receipt_role != receipt_job.role:
+                raise AssertionError("synthetic receipt role disagrees with job")
+            request_binding = julia_backend.JuliaPrecisionRootBackend(
+                receipt_job.backend_identity,
+                object(),
+                outcome.digits,
+                ode_error_budget=synthetic_ode_error_budget(outcome.digits),
+            ).preview_root_request(receipt_job, amplitude)
+            scientific_runtime_sha256 = hashlib.sha256(
+                canonical_json_bytes(scientific_runtime)
+            ).hexdigest()
+        elif existing_receipt is not None:
             request_binding = dict(existing_receipt["request_binding"])
             scientific_runtime_sha256 = existing_receipt[
                 "scientific_runtime_sha256"
@@ -373,31 +394,7 @@ def _with_baseline_conditioning(
             raise AssertionError(
                 "synthetic current promoted evidence requires receipt lineage"
             )
-        else:
-            request_binding = {
-                "schema_version": 1,
-                "operation": "root-readout",
-                "job_id": receipt_job.job_id,
-                "leaf_id": receipt_job.leaf_id,
-                "role": receipt_role,
-                "mechanism_id": receipt_job.mechanism_id,
-                "job_policy_sha256": receipt_job.policy.identity_sha256,
-                "backend_identity_sha256": (
-                    receipt_job.backend_identity.identity_sha256
-                ),
-                "precision_digits": outcome.digits,
-                "refinement_level": 0,
-                "synthetic_readout_id": readout_id,
-                "policy": {
-                    "root_correction_tolerance": "2e-11",
-                    "promoted_root_readout_policy": (
-                        PROMOTED_ROOT_READOUT_POLICY
-                    ),
-                },
-            }
-            scientific_runtime_sha256 = hashlib.sha256(
-                canonical_json_bytes(scientific_runtime)
-            ).hexdigest()
+        del readout_id
         request_policy = request_binding.get("policy")
         if not isinstance(request_policy, dict):
             request_binding = dict(request_binding)
@@ -415,6 +412,31 @@ def _with_baseline_conditioning(
             request_policy = dict(request_policy)
             request_policy["promoted_root_readout_policy"] = (
                 PROMOTED_ROOT_READOUT_POLICY
+            )
+            request_binding["policy"] = request_policy
+        if evidence.scattering_diagnostics_applicable:
+            request_binding = dict(request_binding)
+            request_policy = dict(request_policy)
+            endpoint_series_order = request_policy.get(
+                "endpoint_series_order"
+            )
+            if not isinstance(endpoint_series_order, int):
+                endpoint_series_order = (
+                    receipt_job.policy.endpoint_series_order
+                    if receipt_job is not None
+                    else 28
+                )
+            request_policy.update({
+                **julia_backend.horizon_geometry_controls(),
+                "endpoint_series_order": endpoint_series_order,
+                "horizon_endpoint_recovery_policy_identity": (
+                    "adaptive-horizon-endpoint-recovery/v1"
+                ),
+                "horizon_endpoint_prefix_minimum_order": 4,
+                "horizon_endpoint_prefix_order_step": 4,
+            })
+            request_policy["horizon_endpoint_maximum_order"] = (
+                4 * int(request_policy["endpoint_series_order"])
             )
             request_binding["policy"] = request_policy
         correction_tolerance = Decimal(
@@ -526,6 +548,11 @@ def _with_baseline_conditioning(
             "primary_acceptance_sha256": hashlib.sha256(
                 canonical_json_bytes(primary.to_mapping())
             ).hexdigest(),
+            "horizon_endpoint_search_evidence": (
+                valid_horizon_endpoint_search_evidence(request_binding)
+                if evidence.scattering_diagnostics_applicable
+                else None
+            ),
         }
         return replace(
             updated,
@@ -540,13 +567,19 @@ def _with_baseline_conditioning(
     levels = tuple(
         replace(
             level,
-            real_plus=conditioned(level.real_plus, f"level-{index}-real-plus"),
-            real_minus=conditioned(level.real_minus, f"level-{index}-real-minus"),
+            real_plus=conditioned(
+                level.real_plus, f"level-{index}-real-plus", level.epsilon
+            ),
+            real_minus=conditioned(
+                level.real_minus, f"level-{index}-real-minus", -level.epsilon
+            ),
             imaginary_plus=conditioned(
-                level.imaginary_plus, f"level-{index}-imaginary-plus"
+                level.imaginary_plus, f"level-{index}-imaginary-plus",
+                complex(0.0, level.epsilon),
             ),
             imaginary_minus=conditioned(
-                level.imaginary_minus, f"level-{index}-imaginary-minus"
+                level.imaginary_minus, f"level-{index}-imaginary-minus",
+                complex(0.0, -level.epsilon),
             ),
         )
         for index, level in enumerate(result.levels)
@@ -554,7 +587,7 @@ def _with_baseline_conditioning(
     conditioned_outcome = _replace_component_result_fields(
         outcome,
         result_changes={
-            "baseline": conditioned(result.baseline, "baseline"),
+            "baseline": conditioned(result.baseline, "baseline", 0.0j),
             "levels": levels,
         },
     )
@@ -603,7 +636,10 @@ def _authenticated_failed_preflight_recovery_stage(leaf, predecessor):
         "precision_ladder_discrepancy_applicable": False,
         "same_precision_refinement_discrepancy_abs": 0.0,
         "self_refinement_result": _rebind_result_worker_receipts(
-            component["result"], refinement_runtime, refinement_level=1
+            component["result"],
+            refinement_runtime,
+            job=leaf.job,
+            refinement_level=1,
         ),
         "self_refinement_scientific_runtime": refinement_runtime,
     })
@@ -619,18 +655,27 @@ def _authenticated_failed_preflight_recovery_stage(leaf, predecessor):
 
 
 def _rebind_result_worker_receipts(
-    raw_result, scientific_runtime, *, refinement_level
+    raw_result, scientific_runtime, *, job, refinement_level
 ):
     """Rebind a synthetic component clone to its distinct refinement runtime."""
 
     result = ComponentResult.from_mapping(raw_result)
 
-    def rebound(readout):
+    request_backend = julia_backend.JuliaPrecisionRootBackend(
+        job.backend_identity,
+        object(),
+        scientific_runtime["precision_digits"],
+        refinement=refinement_level,
+        ode_error_budget=synthetic_ode_error_budget(
+            scientific_runtime["precision_digits"]
+        ),
+    )
+
+    def rebound(readout, amplitude):
         receipt = readout.worker_response_receipt
         if receipt is None:
             raise AssertionError("synthetic promoted readout receipt is missing")
-        request_binding = dict(receipt["request_binding"])
-        request_binding["refinement_level"] = refinement_level
+        request_binding = request_backend.preview_root_request(job, amplitude)
         material = {
             **{
                 key: value
@@ -644,6 +689,11 @@ def _rebind_result_worker_receipts(
             "scientific_runtime_sha256": hashlib.sha256(
                 canonical_json_bytes(scientific_runtime)
             ).hexdigest(),
+            "horizon_endpoint_search_evidence": (
+                valid_horizon_endpoint_search_evidence(request_binding)
+                if job.mechanism_id == "horizon-admittance"
+                else None
+            ),
         }
         return replace(
             readout,
@@ -659,16 +709,20 @@ def _rebind_result_worker_receipts(
     levels = tuple(
         replace(
             level,
-            real_plus=rebound(level.real_plus),
-            real_minus=rebound(level.real_minus),
-            imaginary_plus=rebound(level.imaginary_plus),
-            imaginary_minus=rebound(level.imaginary_minus),
+            real_plus=rebound(level.real_plus, level.epsilon),
+            real_minus=rebound(level.real_minus, -level.epsilon),
+            imaginary_plus=rebound(
+                level.imaginary_plus, complex(0.0, level.epsilon)
+            ),
+            imaginary_minus=rebound(
+                level.imaginary_minus, complex(0.0, -level.epsilon)
+            ),
         )
         for level in result.levels
     )
     return replace(
         result,
-        baseline=rebound(result.baseline),
+        baseline=rebound(result.baseline, 0.0j),
         levels=levels,
     ).to_mapping()
 
@@ -1261,7 +1315,8 @@ class PrimaryPrecisionTests(unittest.TestCase):
                 "derivative_requirement": "finite_strictly_positive",
                 "promoted": {
                     "policy_id": (
-                        "binary64-parity-primary-fixed-root-diagnostics/v1"
+                        "binary64-parity-primary-fixed-root-diagnostics-"
+                        "frequency-disk/v2"
                     ),
                     "required_phases": [
                         "PRIMARY",
@@ -1633,7 +1688,10 @@ class PromotedResourceContainmentTests(unittest.TestCase):
                 "failure_code": failure_code,
                 "failure_class": "CONTROL",
                 "retryable": (
-                    failure_code == "INSUFFICIENT_ASYMPTOTIC_PRECISION"
+                    failure_code in {
+                        "INSUFFICIENT_ASYMPTOTIC_PRECISION",
+                        "HORIZON_ARITHMETIC_INADEQUATE",
+                    }
                     if error_class is julia_backend.JuliaNumericalControlError
                     else True
                 ),
@@ -1676,6 +1734,9 @@ class PromotedResourceContainmentTests(unittest.TestCase):
                 object(),
                 precision_digits,
                 refinement=0,
+                ode_error_budget=synthetic_ode_error_budget(
+                    precision_digits
+                ),
             )._request(leaf.job, 0.0j)
             request_sha256 = hashlib.sha256(
                 canonical_json_bytes(request_binding)
@@ -1730,6 +1791,20 @@ class PromotedResourceContainmentTests(unittest.TestCase):
                     raise failure
                 return _authenticated_primary_stage(
                     leaf, digits, ComponentStatus.CONVERGED
+                )
+
+            def execute_promoted_stage_after_endpoint_arithmetic(
+                self, leaf, digits, predecessor
+            ):
+                self.calls.append((leaf.leaf_id, digits))
+                if failure_code != "HORIZON_ARITHMETIC_INADEQUATE":
+                    raise AssertionError("unexpected endpoint arithmetic route")
+                return _authenticated_primary_stage(
+                    leaf,
+                    digits,
+                    ComponentStatus.CONVERGED,
+                    discrepancy_from_previous_abs=1.0e-12,
+                    discrepancy_enclosed=True,
                 )
 
             def execute_promoted_stage_after_failed_preflight(
@@ -1872,11 +1947,23 @@ class PromotedResourceContainmentTests(unittest.TestCase):
                 self.assertIn((following.leaf_id, 64), backend.calls)
                 self.assertIs(
                     records[incident.leaf_id].to_mapping()["computed"],
-                    code == "INSUFFICIENT_ASYMPTOTIC_PRECISION",
+                    code in {
+                        "INSUFFICIENT_ASYMPTOTIC_PRECISION",
+                        "HORIZON_ARITHMETIC_INADEQUATE",
+                    },
                 )
 
                 persisted = summary.attempts[0].failure_receipt["failure"]
                 self.assertEqual(persisted["failure_code"], code)
+                if code.startswith("HORIZON_"):
+                    arithmetic = code == "HORIZON_ARITHMETIC_INADEQUATE"
+                    self.assertIs(persisted["retryable"], arithmetic)
+                    self.assertIs(
+                        persisted["diagnostics"][
+                            "next_precision_tier_allowed"
+                        ],
+                        arithmetic,
+                    )
                 self.assertEqual(
                     persisted["execution_resource_policy"]["sha256"],
                     persisted["request_binding"]["execution_resource"][
@@ -1888,14 +1975,21 @@ class PromotedResourceContainmentTests(unittest.TestCase):
                     decision["state"],
                     (
                         "REQUESTED"
-                        if code == "INSUFFICIENT_ASYMPTOTIC_PRECISION"
+                        if code in {
+                            "INSUFFICIENT_ASYMPTOTIC_PRECISION",
+                            "HORIZON_ARITHMETIC_INADEQUATE",
+                        }
                         else "SUPPRESSED"
                     ),
                 )
                 self.assertEqual(decision["reason"], code)
-                if code == "INSUFFICIENT_ASYMPTOTIC_PRECISION":
+                if code in {
+                    "INSUFFICIENT_ASYMPTOTIC_PRECISION",
+                    "HORIZON_ARITHMETIC_INADEQUATE",
+                }:
                     self.assertIn((incident.leaf_id, 120), backend.calls)
                     self.assertEqual(records[incident.leaf_id].state, "PRODUCED")
+                if code == "INSUFFICIENT_ASYMPTOTIC_PRECISION":
                     self.assertEqual(store.stored_count, 2)
                     imported_store = SolvedLeafStore(root / "imported-solved")
                     imported = import_campaign_checkpoint_to_solved_leaf_store(
@@ -1905,6 +1999,8 @@ class PromotedResourceContainmentTests(unittest.TestCase):
                     )
                     self.assertEqual(imported.imported_count, 2)
                     self.assertEqual(imported_store.stored_count, 2)
+                elif code == "HORIZON_ARITHMETIC_INADEQUATE":
+                    self.assertEqual(store.stored_count, 2)
                 else:
                     self.assertNotIn((incident.leaf_id, 120), backend.calls)
                 if code == "INSUFFICIENT_ASYMPTOTIC_PRECISION":
@@ -1925,6 +2021,29 @@ class PromotedResourceContainmentTests(unittest.TestCase):
                     reloaded.attempts[0].to_mapping(),
                     summary.attempts[0].to_mapping(),
                 )
+
+    def test_horizon_arithmetic_retryability_is_durably_containable(self):
+        """A retryable endpoint outcome is contained, not re-raised."""
+
+        run = self._run_with_failure(
+            julia_backend.JuliaNumericalControlError,
+            "HORIZON_ARITHMETIC_INADEQUATE",
+        )
+        temporary, _, _, _, incident, following, backend, _, summary = run
+        self.addCleanup(temporary.cleanup)
+
+        self.assertEqual(len(summary.attempts), 1)
+        attempt = summary.attempts[0]
+        self.assertEqual(attempt.leaf_id, incident.leaf_id)
+        self.assertEqual(attempt.failure_code, "HORIZON_ARITHMETIC_INADEQUATE")
+        self.assertEqual(attempt.state, "NUMERICAL_CONTROL_FAILURE")
+        self.assertTrue(attempt.failure_receipt["failure"]["retryable"])
+        self.assertEqual(
+            attempt.failure_receipt["failure"]["promotion_decision"]["state"],
+            "REQUESTED",
+        )
+        self.assertIn((incident.leaf_id, 120), backend.calls)
+        self.assertIn((following.leaf_id, 64), backend.calls)
 
     def test_insufficient_preflight_uses_authenticated_120_refinement_path(self):
         plan, capabilities, _, incident, _ = self._plan_and_leaves()

@@ -31,6 +31,8 @@ from windows_solver.response_batches import (
     build_campaign_plan,
 )
 from tests.fixtures import (
+    synthetic_ode_error_budget,
+    valid_horizon_endpoint_search_evidence,
     valid_numerical_conditioning,
 )
 
@@ -193,6 +195,7 @@ class ReceiptCompatibilityTests(unittest.TestCase):
         )
 
     def _runtime(self, job, policy):
+        budget = synthetic_ode_error_budget(80).to_mapping()
         return {
             "julia_version": "1.10.11",
             "julia_executable_sha256": "a" * 64,
@@ -204,12 +207,19 @@ class ReceiptCompatibilityTests(unittest.TestCase):
             "working_precision_bits": math.ceil(80 * math.log2(10)) + 32,
             "refinement_level": 0,
             "regularised_gsn_precision_policy": dict(policy),
+            "ode_error_budget": budget,
+            "ode_error_budget_sha256": hashlib.sha256(
+                canonical_json_bytes(budget)
+            ).hexdigest(),
         }
 
     def _readout(self, job, runtime):
         horizon = job.mechanism_id == "horizon-admittance"
         request_binding = JuliaPrecisionRootBackend(
-            job.backend_identity, object(), 80
+            job.backend_identity,
+            object(),
+            80,
+            ode_error_budget=synthetic_ode_error_budget(80),
         )._request(job, 0.0j)
         determinant = Decimal("1E-10")
         derivative = Decimal("2")
@@ -254,6 +264,11 @@ class ReceiptCompatibilityTests(unittest.TestCase):
             "primary_acceptance_sha256": hashlib.sha256(
                 canonical_json_bytes(primary.to_mapping())
             ).hexdigest(),
+            "horizon_endpoint_search_evidence": (
+                valid_horizon_endpoint_search_evidence(request_binding)
+                if horizon
+                else None
+            ),
         }
         return response_engine.RootReadout(
             omega=job.root.omega,

@@ -1496,3 +1496,4 @@ end
 include("factored_propagation_spec.jl")
 include("scaled_scattering_spec.jl")
 include("real_inner_horizon_spec.jl")
+include("horizon_endpoint_adaptive_spec.jl")
