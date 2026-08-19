@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from copy import deepcopy
 from fractions import Fraction
 import json
 import hashlib
@@ -9,6 +10,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -20,6 +22,7 @@ from windows_solver.response_batches import (
     CAMPAIGN_SCHEMA_VERSION,
     CampaignLeafRecord,
     CampaignStageRecord,
+    NativeCampaignStageBackend,
     PrecisionCapabilities,
     PrecisionFactoryIdentity,
     StageOutcome,
@@ -35,6 +38,7 @@ from windows_solver.response_batches import (
     run_campaign_selection,
     validate_campaign_checkpoint,
 )
+from windows_solver.julia_response_backend import JuliaPrecisionRootBackend
 from windows_solver.response_engine import (
     ComponentResult,
     ComponentStatus,
@@ -183,6 +187,136 @@ def _produced_stage_outcome(leaf, response, *, baseline_delta=0.0j):
 
 
 class CampaignPlanTests(unittest.TestCase):
+    def test_changed_empirical_receipt_resumes_after_retained_binary64(self) -> None:
+        """Catches a receipt change either reusing promoted work or rerunning 64."""
+
+        capabilities = PrecisionCapabilities((64, 80))
+        plan = build_campaign_plan(
+            policy=NumericalPolicy(),
+            backend_identity=VettedNativeDeterminantKernel.identity,
+            precision_capabilities=capabilities,
+        )
+        leaf = next(
+            item for item in plan.leaves
+            if item.role == "primary"
+            and item.mechanism_id == "horizon-admittance"
+        )
+        selection = build_campaign_selection(
+            plan, role="primary", leaf_ids=(leaf.leaf_id,)
+        )
+        native = NativeCampaignStageBackend(
+            object(), capabilities, object(), julia_adapter=object()
+        )
+        contract = native.scientific_execution_contract_for(leaf)
+        receipt = native.calibration_receipt
+        assert contract is not None and receipt is not None
+        runtime = JuliaPrecisionRootBackend(
+            leaf.job.backend_identity,
+            SimpleNamespace(runtime_provenance={}),
+            80,
+            empirical_control_profile=receipt.budget_for(
+                "horizon-scattering/v1", 80
+            ),
+            calibration_receipt=receipt,
+        ).scientific_runtime_for(leaf.job)
+
+        class Backend:
+            identity = plan.backend_identity
+            precision_capabilities = capabilities
+
+            def __init__(self, active_contract, active_runtime):
+                self.contract = active_contract
+                self.runtime = active_runtime
+                self.calls = []
+
+            def scientific_execution_contract_for(self, selected):
+                return self.contract
+
+            def execute_stage(self, selected, digits):
+                self.calls.append(digits)
+                produced = _produced_stage_outcome(
+                    selected, complex(0.01, -0.02)
+                )
+                result = ComponentResult.from_mapping(
+                    produced.component_result["result"]
+                )
+                unresolved = replace(
+                    result,
+                    status=ComponentStatus.NOT_CONVERGED,
+                    convergence_basis="UNRESOLVED",
+                    response=None,
+                    signed_root_crosscheck=None,
+                )
+                component = {
+                    "evidence_kind": "authenticated-test-component",
+                    "result": unresolved.to_mapping(),
+                }
+                return _synthetic_stage_outcome(
+                    digits=digits,
+                    numerical_state="NOT_CONVERGED",
+                    component_result=component,
+                    local_disk_radius_abs=1.0,
+                )
+
+            def execute_promoted_stage(self, selected, digits, previous):
+                self.calls.append(digits)
+                component = {
+                    "leaf_id": selected.leaf_id,
+                    "role": selected.role,
+                    "mechanism_id": selected.mechanism_id,
+                    "job_id": selected.job.job_id,
+                    "root_identity_sha256": (
+                        selected.job.root.identity_sha256
+                    ),
+                    "policy_sha256": selected.job.policy.identity_sha256,
+                    "backend_identity_sha256": (
+                        selected.job.backend_identity.identity_sha256
+                    ),
+                    "digits": digits,
+                    "scientific_runtime": self.runtime,
+                }
+                return _synthetic_stage_outcome(
+                    digits=digits,
+                    numerical_state="NOT_CONVERGED",
+                    component_result=component,
+                    local_disk_radius_abs=1.0,
+                    self_refinement_enclosed=True,
+                    discrepancy_from_previous_abs=0.0,
+                    discrepancy_enclosed=True,
+                )
+
+        first = Backend(contract, runtime)
+        changed_contract = deepcopy(contract)
+        changed_runtime = deepcopy(runtime)
+        changed_sha = "0" * 64
+        changed_contract["calibration_receipt"]["sha256"] = changed_sha
+        changed_runtime["promoted_control_calibration"][
+            "receipt_sha256"
+        ] = changed_sha
+        resumed = Backend(changed_contract, changed_runtime)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            checkpoint = Path(temporary) / "checkpoint.json"
+            with patch(
+                "windows_solver.response_batches._validate_component_result",
+                return_value=True,
+            ):
+                run_campaign_selection(
+                    plan, selection, first, checkpoint, resume=False
+                )
+                summary = run_campaign_selection(
+                    plan, selection, resumed, checkpoint, resume=True
+                )
+
+        self.assertEqual(first.calls, [64, 80])
+        self.assertEqual(resumed.calls, [80])
+        self.assertEqual(summary.reused_stage_count, 1)
+        self.assertEqual(summary.executed_stage_count, 1)
+        self.assertEqual(
+            tuple(stage.outcome.digits for stage in summary.records[0].stages),
+            (64, 80),
+        )
+
     def test_deep_promoted_contracts_follow_mechanism_not_role(self) -> None:
         plan = build_campaign_plan(
             policy=NumericalPolicy(),

@@ -582,6 +582,19 @@ class PublicSurfaceTests(unittest.TestCase):
         self.assertNotIn("$SelectionPath,", launcher)
         self.assertNotIn("$CheckpointPath,", launcher)
 
+    def test_m02_launcher_forwards_only_sha_pinned_calibration_overrides(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        launcher = (root / "m02.ps1").read_text(encoding="utf-8")
+
+        self.assertIn("[string]$CalibrationReceiptPath", launcher)
+        self.assertIn("[string]$CalibrationReceiptSha256", launcher)
+        self.assertIn(
+            "calibration receipt path and SHA-256 must be supplied together",
+            launcher,
+        )
+        self.assertIn('"--calibration-receipt-path"', launcher)
+        self.assertIn('"--calibration-receipt-sha256"', launcher)
+
     @unittest.skipUnless(os.name == "nt", "requires Windows PowerShell 5.1")
     def test_m02_launcher_binds_bootstrap_switches_at_the_script_boundary(
         self,

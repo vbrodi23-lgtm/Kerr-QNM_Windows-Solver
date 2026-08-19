@@ -59,6 +59,9 @@ from windows_solver.response_engine import (
     _diagnostic_response_channel,
 )
 from windows_solver.progress_output import CampaignProgressReporter
+from windows_solver.promoted_control_calibration import (
+    load_default_calibration_receipt,
+)
 from tests.fixtures import (
     control_failure_stage,
     synthetic_ode_error_budget,
@@ -191,6 +194,43 @@ def _set_distinct_derivative_binding(response, wire_derivative_abs):
 
 
 class JuliaResponseBackendTests(unittest.TestCase):
+    def test_empirical_exterior_root_requires_three_term_certificate(self):
+        job = _job_for_mechanism("exterior-light-ring")
+        receipt = load_default_calibration_receipt()
+        readout = JuliaPrecisionRootBackend(
+            VettedNativeDeterminantKernel.identity,
+            FakeAdapter(),
+            80,
+            empirical_control_profile=receipt.budget_for(
+                "exterior-wronskian/v1", 80
+            ),
+            calibration_receipt=receipt,
+        ).read_root(job, 0.0j)
+
+        certificate = readout.primary_acceptance
+        self.assertEqual(
+            certificate.error_model_id,
+            "exterior-determinant-absolute-error-certificate/empirical-v1",
+        )
+        self.assertEqual(
+            certificate.determinant_error_abs,
+            Decimal("48"),
+        )
+        self.assertEqual(
+            certificate.derivative_authentication.determinant_error_status,
+            "available/v1",
+        )
+        self.assertEqual(
+            readout.worker_response_receipt["request_binding"]["policy"][
+                "determinant_error_required_term_classes"
+            ],
+            [
+                "delta_same_point",
+                "delta_cross_precision",
+                "delta_endpoint_series",
+            ],
+        )
+
     def test_horizon_endpoint_receipt_binds_attempted_rung_separately_from_best_prefix(self):
         job = _job_for_mechanism("horizon-admittance")
         backend = JuliaPrecisionRootBackend(

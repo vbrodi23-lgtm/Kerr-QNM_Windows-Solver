@@ -6243,6 +6243,7 @@ def _generic_component_journal(
         _sha256({
             "job_id": job.job_id,
             "component_scientific_identity": component_identity,
+            "plan_sha256": _sha256(list(expected)),
         }) + ".json"
     )
     journal = (
@@ -6338,6 +6339,7 @@ def _journaled_promoted_exterior_backend(
     journal_name = _sha256({
         "job_id": job.job_id,
         "component_scientific_identity": EXTERIOR_DERIVATIVE_COMPONENT_IDENTITY,
+        "plan_sha256": _sha256(list(expected)),
     }) + ".json"
     journal_path = Path(root_text) / journal_name
     journal = (
@@ -8087,8 +8089,32 @@ def run_selective_readout_promotion(
         if callable(scientific_runtime_provider)
         else None
     )
+    empirical_calibration = (
+        scientific_runtime.get("promoted_control_calibration")
+        if isinstance(scientific_runtime, Mapping)
+        else None
+    )
+    empirical_profile = (
+        scientific_runtime.get("empirical_control_profile")
+        if isinstance(scientific_runtime, Mapping)
+        else None
+    )
+    empirical_profile_sha256 = (
+        scientific_runtime.get("empirical_control_profile_sha256")
+        if isinstance(scientific_runtime, Mapping)
+        else None
+    )
+    empirical_journal = (
+        isinstance(empirical_calibration, Mapping)
+        and isinstance(empirical_profile, Mapping)
+        and isinstance(empirical_profile_sha256, str)
+    )
     journal_evidence: dict[str, object] = {
-        "schema": "windows-solver.selective-tier-journal-evidence/1",
+        "schema": (
+            "windows-solver.selective-tier-journal-evidence/2"
+            if empirical_journal
+            else "windows-solver.selective-tier-journal-evidence/1"
+        ),
         "configured": journaled is not None,
         "component_identity": selective.journal_component_identity,
         "precision_tier": actual_tier.value,
@@ -8137,7 +8163,7 @@ def run_selective_readout_promotion(
             and all(item == ode_error_budgets[0] for item in ode_error_budgets)
             else None
         )
-        journal_evidence.update({
+        common_journal_evidence = {
             "journal": journal_mapping,
             "journal_sha256": journal_mapping["journal_sha256"],
             "promoted_work_unit_ids": list(promoted_work_unit_ids),
@@ -8147,11 +8173,25 @@ def run_selective_readout_promotion(
                 if not isinstance(scientific_runtime, Mapping)
                 else _sha256(dict(scientific_runtime))
             ),
-            "ode_error_budget": ode_error_budget,
-            "ode_error_budget_sha256": (
-                None if ode_error_budget is None else _sha256(ode_error_budget)
-            ),
-        })
+        }
+        if empirical_journal:
+            common_journal_evidence.update({
+                "promoted_control_calibration": dict(empirical_calibration),
+                "empirical_control_profile": dict(empirical_profile),
+                "empirical_control_profile_sha256": (
+                    empirical_profile_sha256
+                ),
+            })
+        else:
+            common_journal_evidence.update({
+                "ode_error_budget": ode_error_budget,
+                "ode_error_budget_sha256": (
+                    None
+                    if ode_error_budget is None
+                    else _sha256(ode_error_budget)
+                ),
+            })
+        journal_evidence.update(common_journal_evidence)
     result_window = dict(result.resolved_window or {})
     terminal_recovery = _response_ladder_recovery(job, result.levels)
     result_window.update(

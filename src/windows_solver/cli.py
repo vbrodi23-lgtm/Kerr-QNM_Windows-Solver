@@ -34,6 +34,7 @@ from .progress import (
     emit_progress,
 )
 from .progress_output import CampaignProgressReporter
+from .promoted_control_calibration import load_calibration_receipt
 from .response_engine import (
     BackendIdentity,
     ComponentResult,
@@ -226,6 +227,13 @@ def build_parser() -> argparse.ArgumentParser:
                 "--progress",
                 choices=tuple(mode.value for mode in ProgressMode),
                 default=ProgressMode.NORMAL.value,
+            )
+            campaign.add_argument(
+                "--calibration-receipt-path",
+                type=Path,
+            )
+            campaign.add_argument(
+                "--calibration-receipt-sha256",
             )
         if name == "campaign-validate":
             campaign.add_argument("--full", action="store_true")
@@ -653,11 +661,31 @@ def _campaign_backend_descriptor(value: object, base: Path):
     }
 
 
-def _load_campaign_backend(descriptor, *, plan=None, selection=None):
+def _load_campaign_backend(
+    descriptor,
+    *,
+    plan=None,
+    selection=None,
+    calibration_receipt_path: Path | None = None,
+    calibration_receipt_sha256: str | None = None,
+):
     if descriptor is None:
         if plan is None or selection is None:
             raise ValueError("native campaign backend requires the selected campaign leaves")
-        return NativeCampaignStageBackend.from_selection(plan, selection)
+        receipt = (
+            None
+            if calibration_receipt_path is None
+            else load_calibration_receipt(
+                calibration_receipt_path, str(calibration_receipt_sha256)
+            )
+        )
+        return NativeCampaignStageBackend.from_selection(
+            plan, selection, calibration_receipt=receipt
+        )
+    if calibration_receipt_path is not None:
+        raise ValueError(
+            "calibration receipt override requires the native campaign backend"
+        )
     module_name, factory_name = descriptor["factory"].split(":", 1)
     module_path = descriptor["module_path"]
     module = types.ModuleType(module_name)
@@ -702,6 +730,8 @@ def _campaign_selected(
     *,
     full: bool = False,
     reporter: CampaignProgressReporter | None = None,
+    calibration_receipt_path: Path | None = None,
+    calibration_receipt_sha256: str | None = None,
 ):
     if command in {"campaign-run", "campaign-resume"}:
         emit_progress(
@@ -765,7 +795,13 @@ def _campaign_selected(
                 return 0, _campaign_console_mapping(command, cached)
         elif reporter is not None:
             reporter.bind_campaign_reports(plan)
-        backend = _load_campaign_backend(descriptor, plan=plan, selection=selection)
+        backend = _load_campaign_backend(
+            descriptor,
+            plan=plan,
+            selection=selection,
+            calibration_receipt_path=calibration_receipt_path,
+            calibration_receipt_sha256=calibration_receipt_sha256,
+        )
         summary = run_campaign_selection(
             plan,
             selection,
@@ -1053,6 +1089,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         elif arguments.command in {
             "campaign-run", "campaign-resume", "campaign-validate"
         }:
+            calibration_path = getattr(
+                arguments, "calibration_receipt_path", None
+            )
+            calibration_sha256 = getattr(
+                arguments, "calibration_receipt_sha256", None
+            )
+            if (calibration_path is None) is not (
+                calibration_sha256 is None
+            ):
+                raise ValueError(
+                    "calibration receipt path and SHA-256 must be supplied together"
+                )
             reporter = None
             if arguments.command in {"campaign-run", "campaign-resume"}:
                 progress_checkpoint = resolve_campaign_relative_path(
@@ -1077,6 +1125,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                                 arguments.selection,
                                 arguments.checkpoint,
                                 reporter=reporter,
+                                calibration_receipt_path=calibration_path,
+                                calibration_receipt_sha256=calibration_sha256,
                             )
                         except KeyboardInterrupt:
                             emit_progress(

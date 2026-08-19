@@ -5,6 +5,8 @@ param(
     [switch]$RebuildRuntime,
     [switch]$PortableRuntime,
     [string]$RuntimeRoot,
+    [string]$CalibrationReceiptPath,
+    [string]$CalibrationReceiptSha256,
     [ValidateSet("quiet", "normal", "trace")]
     [string]$Progress = "normal"
 )
@@ -44,6 +46,30 @@ function Invoke-M02Command([string[]]$Arguments) {
 
 if ($SkipBootstrap -and $RebuildRuntime) {
     throw "-SkipBootstrap and -RebuildRuntime cannot be used together."
+}
+$HasCalibrationPath = -not [string]::IsNullOrWhiteSpace($CalibrationReceiptPath)
+$HasCalibrationSha256 = -not [string]::IsNullOrWhiteSpace($CalibrationReceiptSha256)
+if ($HasCalibrationPath -ne $HasCalibrationSha256) {
+    throw "calibration receipt path and SHA-256 must be supplied together"
+}
+$CalibrationArguments = @()
+if ($HasCalibrationPath) {
+    $ResolvedCalibrationReceiptPath = if ([IO.Path]::IsPathRooted($CalibrationReceiptPath)) {
+        [IO.Path]::GetFullPath($CalibrationReceiptPath)
+    }
+    else {
+        [IO.Path]::GetFullPath((Join-Path $PackageRoot $CalibrationReceiptPath))
+    }
+    if (-not (Test-Path -LiteralPath $ResolvedCalibrationReceiptPath -PathType Leaf)) {
+        throw "Calibration receipt is absent: $ResolvedCalibrationReceiptPath"
+    }
+    if ($CalibrationReceiptSha256 -notmatch '^[0-9A-Fa-f]{64}$') {
+        throw "Calibration receipt SHA-256 is invalid."
+    }
+    $CalibrationArguments = @(
+        "--calibration-receipt-path", $ResolvedCalibrationReceiptPath,
+        "--calibration-receipt-sha256", $CalibrationReceiptSha256.ToLowerInvariant()
+    )
 }
 
 if (-not $SkipBootstrap) {
@@ -107,14 +133,14 @@ try {
     Write-Host ("    Total   : {0}" -f $CampaignPlan.leaf_count)
     Write-Host "M02 live progress status:" -ForegroundColor Cyan
     Write-Host "    $CheckpointPath.status.json"
-    Invoke-M02Command -Arguments @(
+    Invoke-M02Command -Arguments (@(
         $Command,
         $Selection,
         "--checkpoint",
         $Checkpoint,
         "--progress",
         $Progress
-    )
+    ) + $CalibrationArguments)
     Invoke-M02Command -Arguments @(
         "campaign-validate",
         $Selection,
