@@ -8498,9 +8498,18 @@ class NativeCampaignStageBackend:
             previous_outcomes[-1].component_result["result"]
         )
         recovery = previous_result.resolved_window
+        # The horizon mechanism owns its promoted stage outright: it is a
+        # single analytic readout, not a set of signed readouts that a
+        # selective plan could promote one at a time. A binary64 stage that
+        # recorded such a plan before the mechanism was decided must not
+        # divert the horizon leaf into the selective path, so the mechanism
+        # is consulted before the plan is.
         selective_plan = (
             None
-            if not isinstance(recovery, Mapping)
+            if (
+                _is_single_promoted_horizon_stage(leaf, digits)
+                or not isinstance(recovery, Mapping)
+            )
             else recovery.get("readout_specific_promotion_plan")
         )
         selective_tier = (
