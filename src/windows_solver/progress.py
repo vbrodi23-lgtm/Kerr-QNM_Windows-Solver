@@ -101,6 +101,7 @@ class ProgressEventKind(StrEnum):
     HORIZON_ENDPOINT_SEARCH_COMPLETED = "horizon_endpoint_search_completed"
     HORIZON_ENDPOINTS_VERIFIED = "horizon_endpoints_verified"
     OUTER_ENDPOINT_SELECTED = "outer_endpoint_selected"
+    OUTER_ENDPOINT_PAIR_SELECTED = "outer_endpoint_pair_selected"
     COORDINATE_IDENTITY_CHECKED = "coordinate_identity_checked"
     COORDINATE_INVERSION_STALLED = "coordinate_inversion_stalled"
     DETERMINANT_ERROR_ESTIMATED = "determinant_error_estimated"

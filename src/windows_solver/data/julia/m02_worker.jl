@@ -52,6 +52,18 @@ const FACTORED_REMAINDER_STATE_CONVENTION_ID =
     "state1=Y;state2=dY/drho/v1"
 const HORIZON_DETERMINANT_FAMILY_ID = "horizon-scattering/v1"
 const EXTERIOR_DETERMINANT_FAMILY_ID = "exterior-wronskian/v1"
+const EXTERIOR_EMPIRICAL_ERROR_MODEL_ID =
+    "exterior-determinant-absolute-error-certificate/empirical-v1"
+const EXTERIOR_EMPIRICAL_ERROR_STATEMENT =
+    "conservative empirical certificate; not a formal interval enclosure"
+const EXTERIOR_EMPIRICAL_ERROR_MISSING_OUTCOME =
+    "EXTERIOR_DETERMINANT_CERTIFICATE_UNAVAILABLE"
+const EXTERIOR_EMPIRICAL_ERROR_TERM_CLASSES = [
+    "delta_same_point",
+    "delta_cross_precision",
+    "delta_endpoint_series",
+]
+const EXTERIOR_EMPIRICAL_ERROR_SAFETY_FACTOR = 64
 const RELIABLE_DIGIT_SAFETY_MARGIN = 8
 const REQUIRED_DIGIT_GUARD = 6
 const SCATTERING_CHART_SAFETY_FACTOR = 64
@@ -954,6 +966,20 @@ function validate_regularised_gsn_policy(request)
                 EXTERIOR_DETERMINANT_CONVENTION_ID,
             "determinant_normalisation" =>
                 EXTERIOR_DETERMINANT_NORMALISATION_ID,
+            "determinant_error_model" =>
+                EXTERIOR_EMPIRICAL_ERROR_MODEL_ID,
+            "determinant_error_safety_factor" =>
+                EXTERIOR_EMPIRICAL_ERROR_SAFETY_FACTOR,
+            "determinant_error_required_term_classes" =>
+                EXTERIOR_EMPIRICAL_ERROR_TERM_CLASSES,
+            "determinant_error_missing_evidence_outcome" =>
+                EXTERIOR_EMPIRICAL_ERROR_MISSING_OUTCOME,
+            "determinant_error_certificate_statement" =>
+                EXTERIOR_EMPIRICAL_ERROR_STATEMENT,
+            "determinant_error_preceding_precision_tier" =>
+                Dict(40 => "binary64", 80 => "bigfloat-40", 120 => "bigfloat-80")[
+                    parse_integer(request, "precision_digits")
+                ],
         )
     end
     for (key, expected) in expected_mechanism
@@ -966,7 +992,6 @@ function validate_regularised_gsn_policy(request)
     if !horizon
         for key in (
             "horizon_contour",
-            "determinant_error_model",
             "control_profile_label",
             "calibration_status",
         )
@@ -1769,6 +1794,105 @@ function select_worker_outer_endpoint(
         "geometry_reused_from_cap" => true,
     ))
     return selected_contour, selected_preparation
+end
+
+"""
+    select_worker_outer_endpoint_pair(T, request, spectral, match_radius,
+                                      label, required_digits)
+
+Choose the first two authenticated adequate infinity endpoints from the
+declared schedule.  Their same-point Wronskian disagreement is mandatory
+evidence for the promoted exterior empirical certificate; a single adequate
+endpoint is deliberately insufficient and fails before homogeneous ODE work.
+"""
+function select_worker_outer_endpoint_pair(
+    ::Type{T},
+    request,
+    spectral::CF.HomogeneousSpectralContext{T},
+    match_radius::T,
+    label::String,
+    required_digits::T,
+) where {T<:AbstractFloat}
+    cap_contour = build_worker_outer_contour(
+        T, request, spectral, match_radius, label
+    )
+    raw_schedule = required(request, "rho_out_candidate_schedule")
+    raw_schedule isa AbstractVector || error(
+        "rho_out_candidate_schedule must be an array"
+    )
+    candidate_schedule = T[parse(T, string(item)) for item in raw_schedule]
+    candidate_schedule = sort(unique(candidate_schedule))
+    isempty(candidate_schedule) && error(
+        "rho_out_candidate_schedule must not be empty"
+    )
+    all(isfinite(candidate) && candidate > zero(T) for candidate in candidate_schedule) ||
+        error("rho_out_candidate_schedule must contain positive finite values")
+    candidate_schedule[end] == cap_contour.rho_out || error(
+        "rho_out_candidate_schedule must end at the authenticated rho_out cap"
+    )
+
+    evidence = Dict{String,Any}[]
+    adequate = Any[]
+    final_preparation = nothing
+    for rho_out in candidate_schedule
+        contour = rho_out == cap_contour.rho_out ? cap_contour :
+            CF.build_outer_contour_context(
+                spectral,
+                match_radius,
+                cap_contour.rstar_match,
+                rho_out,
+                cap_contour.radius_from_rho,
+            )
+        preparation = CF.prepare_factored_infinity_outgoing(
+            spectral, contour, required_digits
+        )
+        final_preparation = preparation
+        assessment = preparation.assessment
+        push!(evidence, Dict(
+            "rho_out" => string(rho_out),
+            "adequate" => assessment.adequate,
+            "reason" => assessment.reason,
+            "predicted_reliable_digits" =>
+                string(assessment.predicted_reliable_digits),
+            "maximum_last_term_ratio" =>
+                string(assessment.maximum_last_term_ratio),
+            "maximum_series_evaluation_spread" =>
+                string(assessment.maximum_series_evaluation_spread),
+            "maximum_recurrence_cancellation_factor" =>
+                string(assessment.maximum_recurrence_cancellation_factor),
+            "endpoint_order" => preparation.endpoint_order,
+        ))
+        assessment.adequate && push!(adequate, (contour, preparation))
+    end
+    if length(adequate) < 2
+        throw(numerical_control_failure(
+            request,
+            EXTERIOR_EMPIRICAL_ERROR_MISSING_OUTCOME,
+            "two adequate exterior endpoints are required for the empirical determinant certificate",
+            Dict{String,Any}(
+                "reason" => "TWO_AUTHENTICATED_EXTERIOR_ENDPOINTS_REQUIRED",
+                "available_adequate_endpoint_count" => length(adequate),
+                "candidates" => evidence,
+                "factored_homogeneous_rhs_evaluations_before_pair" => 0,
+            );
+            stage="asymptotic-preflight",
+        ))
+    end
+    selected_contour, selected_preparation = adequate[1]
+    comparison_contour, comparison_preparation = adequate[2]
+    progress_emit("outer_endpoint_pair_selected"; payload=Dict(
+        "selected_rho_out" => string(selected_contour.rho_out),
+        "comparison_rho_out" => string(comparison_contour.rho_out),
+        "rho_out_cap" => string(cap_contour.rho_out),
+        "candidates" => evidence,
+        "geometry_reused_from_cap" => true,
+    ))
+    return (
+        selected_contour,
+        selected_preparation,
+        comparison_contour,
+        comparison_preparation,
+    )
 end
 
 """
@@ -3254,18 +3378,35 @@ function evaluate_exterior_determinant(
     lower_contour = build_worker_contour_context(
         T, request, spectral, lower, "Xin"
     )
-    readout_contour = build_worker_contour_context(
-        T, request, spectral, readout, "Xup"
-    )
     required_digits = required_reliable_digits(T, request)
     horizon_ingoing = CF.prepare_factored_horizon_ingoing(
         spectral, lower_contour, required_digits
     )
-    infinity_outgoing = CF.prepare_factored_infinity_outgoing(
-        spectral, readout_contour, required_digits
-    )
+    exterior_certificate_required =
+        exterior_empirical_certificate_required(request)
+    readout_contour, infinity_outgoing, comparison_contour,
+        comparison_outgoing = if exterior_certificate_required
+        select_worker_outer_endpoint_pair(
+            T,
+            request,
+            spectral,
+            readout,
+            "Xup",
+            required_digits,
+        )
+    else
+        contour = build_worker_contour_context(
+            T, request, spectral, readout, "Xup"
+        )
+        preparation = CF.prepare_factored_infinity_outgoing(
+            spectral, contour, required_digits
+        )
+        contour, preparation, nothing, nothing
+    end
     emit_asymptotic_preparation(horizon_ingoing)
     emit_asymptotic_preparation(infinity_outgoing)
+    comparison_outgoing === nothing ||
+        emit_asymptotic_preparation(comparison_outgoing)
     # Authenticate both distinct match-radius preparations before testing
     # either assessment. An inadequate branch exits before readiness,
     # observers, or any factored homogeneous RHS evaluation.
@@ -3307,20 +3448,42 @@ function evaluate_exterior_determinant(
             common_solve_options...,
         )
     end
+    comparison_xup_propagated = if comparison_contour === nothing
+        nothing
+    else
+        progress_operation("Xup comparison endpoint") do
+            CF.solve_factored_xup_to_match(
+                spectral,
+                comparison_contour,
+                comparison_outgoing;
+                common_solve_options...,
+            )
+        end
+    end
     emit_factored_solution(xin_propagated)
     emit_factored_solution(xup_propagated)
+    comparison_xup_propagated === nothing ||
+        emit_factored_solution(comparison_xup_propagated)
     xin_match = CF.reconstruct_factored_match_state(
         xin_propagated, spectral, lower_contour
     )
     xup_match = CF.reconstruct_factored_match_state(
         xup_propagated, spectral, readout_contour
     )
+    comparison_xup_match = comparison_xup_propagated === nothing ? nothing :
+        CF.reconstruct_factored_match_state(
+            comparison_xup_propagated, spectral, comparison_contour
+        )
     xin_match.radial_derivative_convention ==
         CF.MATCH_RADIAL_DERIVATIVE_CONVENTION_ID ||
         error("package returned an unexpected Xin match derivative convention")
     xup_match.radial_derivative_convention ==
         CF.MATCH_RADIAL_DERIVATIVE_CONVENTION_ID ||
         error("package returned an unexpected Xup match derivative convention")
+    comparison_xup_match === nothing ||
+        comparison_xup_match.radial_derivative_convention ==
+            CF.MATCH_RADIAL_DERIVATIVE_CONVENTION_ID ||
+        error("package returned an unexpected comparison Xup match derivative convention")
     perturbed_in = progress_operation("perturbed integration"; payload=Dict(
         "branch" => "Xin",
     )) do
@@ -3342,6 +3505,30 @@ function evaluate_exterior_determinant(
             Complex{T}[xup_match.X, xup_match.dX_drstar],
         )
     end
+    comparison_value = comparison_xup_match === nothing ? nothing :
+        progress_operation("Wronskian comparison endpoint") do
+            wronskian(
+                perturbed_in,
+                Complex{T}[
+                    comparison_xup_match.X,
+                    comparison_xup_match.dX_drstar,
+                ],
+            )
+        end
+    endpoint_series_disagreement_abs = comparison_value === nothing ? nothing :
+        abs(value - comparison_value)
+    exterior_certificate_required && (
+        endpoint_series_disagreement_abs === nothing ||
+        !isfinite(endpoint_series_disagreement_abs)
+    ) && throw(numerical_control_failure(
+        request,
+        EXTERIOR_EMPIRICAL_ERROR_MISSING_OUTCOME,
+        "exterior endpoint-series disagreement is unavailable",
+        Dict{String,Any}(
+            "reason" => "ENDPOINT_SERIES_DISAGREEMENT_UNAVAILABLE",
+        );
+        stage="determinant-chart",
+    ))
     endpoint_summary = endpoint_conditioning_summary(
         horizon_ingoing, infinity_outgoing
     )
@@ -3375,6 +3562,25 @@ function evaluate_exterior_determinant(
             EXTERIOR_DETERMINANT_NORMALISATION_ID,
         "normalised_determinant_abs" => string(abs(value)),
     ))
+    if exterior_certificate_required
+        endpoint_series_disagreement_abs === nothing && error(
+            "unreachable: exterior certificate endpoint disagreement is absent"
+        )
+        preliminary_breakdown = DeterminantErrorBreakdown{T}(
+            endpoint_series_disagreement_abs,
+            nothing,
+            nothing,
+            nothing,
+            one(T),
+            endpoint_series_disagreement_abs,
+        )
+        return DeterminantEvaluation{T}(
+            value,
+            preliminary_breakdown,
+            EXTERIOR_EMPIRICAL_ERROR_MODEL_ID,
+            diagnostics,
+        )
+    end
     return DeterminantEvaluation{T}(value, diagnostics)
 end
 
@@ -3404,7 +3610,7 @@ function determinant(
     end
 end
 
-function determinant_progress(
+function raw_determinant_progress(
     ::Type{T}, request, evaluation_context::DeterminantRequestContext{T},
     omega::Complex{T}, amplitude::Complex{T},
     purpose::String, current::Complex{T},
@@ -3442,6 +3648,45 @@ function determinant_progress(
         ))
         return evaluation
     end
+end
+
+function exterior_empirical_certificate_required(request)
+    string(required(request, "mechanism_id")) != "horizon-admittance" ||
+        return false
+    haskey(request, "determinant_error_model") || return false
+    string(required(request, "determinant_error_model")) ==
+        EXTERIOR_EMPIRICAL_ERROR_MODEL_ID || error(
+        "exterior determinant request carries an unsupported error model"
+    )
+    return true
+end
+
+"""Route every promoted exterior determinant through its mandatory receipt."""
+function determinant_progress(
+    ::Type{T}, request, evaluation_context::DeterminantRequestContext{T},
+    omega::Complex{T}, amplitude::Complex{T},
+    purpose::String, current::Complex{T},
+) where {T<:AbstractFloat}
+    if exterior_empirical_certificate_required(request)
+        started = time_ns()
+        authenticated = authenticated_determinant_progress(
+            T,
+            request,
+            evaluation_context,
+            omega,
+            amplitude,
+            purpose,
+            current,
+        )
+        # A resource-feasibility estimate must charge one full certificate,
+        # not only its final preceding-tier raw evaluation.
+        LAST_DETERMINANT_SECONDS[] = (time_ns() - started) / 1.0e9
+        LAST_DETERMINANT_PURPOSE[] = purpose
+        return authenticated
+    end
+    return raw_determinant_progress(
+        T, request, evaluation_context, omega, amplitude, purpose, current
+    )
 end
 
 function enforce_root_readout_feasibility(
@@ -4279,6 +4524,36 @@ the guard is measuring.
 round_to_working_precision(::Type{T}, value::Complex) where {T<:AbstractFloat} =
     Complex{T}(T(real(value)), T(imag(value)))
 
+"""Return the immediately preceding authenticated arithmetic tier."""
+function exterior_preceding_precision_policy(request)
+    digits = parse_integer(request, "precision_digits")
+    expected = Dict(
+        40 => "binary64",
+        80 => "bigfloat-40",
+        120 => "bigfloat-80",
+    )
+    haskey(expected, digits) || error(
+        "exterior empirical certificate has no preceding precision tier"
+    )
+    string(required(request, "determinant_error_preceding_precision_tier")) ==
+        expected[digits] || error(
+        "exterior empirical certificate preceding tier disagrees with request"
+    )
+    preceding_digits = Dict(40 => 64, 80 => 40, 120 => 80)[digits]
+    preceding_type = digits == 40 ? Float64 : BigFloat
+    preceding_bits = Dict(
+        40 => 53,
+        80 => working_precision_bits_for(40),
+        120 => working_precision_bits_for(80),
+    )[digits]
+    return (
+        tier=expected[digits],
+        digits=preceding_digits,
+        dtype=preceding_type,
+        bits=preceding_bits,
+    )
+end
+
 """
     precision_guard_disagreement(T, request, ...)
 
@@ -4334,6 +4609,89 @@ function precision_guard_disagreement(
     return T(disagreement)
 end
 
+function exterior_cross_precision_disagreement(
+    ::Type{T},
+    request,
+    evaluation_context::DeterminantRequestContext{T},
+    omega::Complex{T},
+    amplitude::Complex{T},
+    purpose::String,
+    current::Complex{T},
+    base,
+) where {T<:AbstractFloat}
+    preceding = exterior_preceding_precision_policy(request)
+    cross_request = copy(request)
+    cross_request["precision_digits"] = preceding.digits
+    cross_request["working_precision_bits"] = preceding.bits
+    cross_request["semantic_precision_tier"] = preceding.tier
+    cross_request["exterior_cross_precision_request_depth"] =
+        get(request, "exterior_cross_precision_request_depth", 0) + 1
+    cross = try
+        if preceding.dtype === Float64
+            raw_determinant_progress(
+                Float64,
+                cross_request,
+                precision_guard_context(Float64, evaluation_context),
+                round_to_working_precision(Float64, omega),
+                round_to_working_precision(Float64, amplitude),
+                "$(purpose) exterior cross precision",
+                round_to_working_precision(Float64, current),
+            )
+        else
+            run_at_working_precision(BigFloat, preceding.bits) do
+                raw_determinant_progress(
+                    BigFloat,
+                    cross_request,
+                    precision_guard_context(BigFloat, evaluation_context),
+                    round_to_working_precision(BigFloat, omega),
+                    round_to_working_precision(BigFloat, amplitude),
+                    "$(purpose) exterior cross precision",
+                    round_to_working_precision(BigFloat, current),
+                )
+            end
+        end
+    catch failure
+        failure isa InterruptException && rethrow()
+        throw(numerical_control_failure(
+            request,
+            EXTERIOR_EMPIRICAL_ERROR_MISSING_OUTCOME,
+            "exterior cross-precision determinant comparison is unavailable",
+            Dict{String,Any}(
+                "reason" => "CROSS_PRECISION_DISAGREEMENT_UNAVAILABLE",
+                "preceding_precision_tier" => preceding.tier,
+                "cause_type" => string(typeof(failure)),
+            );
+            stage="determinant-chart",
+        ))
+    end
+    cross.diagnostics.determinant_family ==
+        base.diagnostics.determinant_family || throw(
+        numerical_control_failure(
+            request,
+            EXTERIOR_EMPIRICAL_ERROR_MISSING_OUTCOME,
+            "exterior cross-precision comparison changed determinant family",
+            Dict{String,Any}(
+                "reason" => "CROSS_PRECISION_FAMILY_MISMATCH",
+                "preceding_precision_tier" => preceding.tier,
+            );
+            stage="determinant-chart",
+        )
+    )
+    cross_value = Complex{T}(T(real(cross.value)), T(imag(cross.value)))
+    disagreement = abs(base.value - cross_value)
+    isfinite(disagreement) || throw(numerical_control_failure(
+        request,
+        EXTERIOR_EMPIRICAL_ERROR_MISSING_OUTCOME,
+        "exterior cross-precision determinant disagreement is nonfinite",
+        Dict{String,Any}(
+            "reason" => "CROSS_PRECISION_DISAGREEMENT_NONFINITE",
+            "preceding_precision_tier" => preceding.tier,
+        );
+        stage="determinant-chart",
+    ))
+    return T(disagreement)
+end
+
 function authenticated_determinant_progress(
     ::Type{T},
     request,
@@ -4346,10 +4704,12 @@ function authenticated_determinant_progress(
 ) where {T<:AbstractFloat}
     base_frequency = omega
     tight_frequency = omega
+    exterior_certificate_unavailable =
+        "EXTERIOR_DETERMINANT_CERTIFICATE_UNAVAILABLE"
     base_frequency == tight_frequency || error(
         "tight-control determinant comparison changed frequency"
     )
-    base = base_evaluation === nothing ? determinant_progress(
+    base = base_evaluation === nothing ? raw_determinant_progress(
         T,
         request,
         evaluation_context,
@@ -4358,22 +4718,129 @@ function authenticated_determinant_progress(
         "$(purpose) base controls",
         current,
     ) : base_evaluation
-    # The exterior family deliberately has no determinant-error certificate in
-    # this revision. Return its historical evaluation without an extra solve.
-    base.error_breakdown === nothing && return base
+    exterior_certificate_required =
+        exterior_empirical_certificate_required(request)
+    if base.error_breakdown === nothing
+        exterior_certificate_required && throw(numerical_control_failure(
+            request,
+            exterior_certificate_unavailable,
+            "base exterior determinant omitted endpoint-series evidence",
+            Dict{String,Any}(
+                "reason" => "BASE_ENDPOINT_SERIES_EVIDENCE_UNAVAILABLE",
+            );
+            stage="determinant-chart",
+        ))
+        return base
+    end
     tight_request = tight_control_request(T, request)
-    tight = determinant_progress(
-        T,
-        tight_request,
-        evaluation_context,
-        tight_frequency,
-        amplitude,
-        "$(purpose) tight controls",
-        current,
-    )
-    tight.error_breakdown === nothing && error(
-        "tight horizon determinant omitted its error breakdown"
-    )
+    tight = try
+        raw_determinant_progress(
+            T,
+            tight_request,
+            evaluation_context,
+            tight_frequency,
+            amplitude,
+            "$(purpose) tight controls",
+            current,
+        )
+    catch failure
+        failure isa InterruptException && rethrow()
+        exterior_certificate_required || rethrow()
+        throw(numerical_control_failure(
+            request,
+            exterior_certificate_unavailable,
+            "tight-control exterior determinant comparison is unavailable",
+            Dict{String,Any}(
+                "reason" => "SAME_POINT_DISAGREEMENT_UNAVAILABLE",
+                "cause_type" => string(typeof(failure)),
+            );
+            stage="determinant-chart",
+        ))
+    end
+    if tight.error_breakdown === nothing
+        exterior_certificate_required && throw(numerical_control_failure(
+            request,
+            exterior_certificate_unavailable,
+            "tight exterior determinant omitted endpoint-series evidence",
+            Dict{String,Any}(
+                "reason" => "TIGHT_ENDPOINT_SERIES_EVIDENCE_UNAVAILABLE",
+            );
+            stage="determinant-chart",
+        ))
+        error("tight horizon determinant omitted its error breakdown")
+    end
+    if exterior_certificate_required
+        delta_same_point = abs(base.value - tight.value)
+        delta_endpoint_series = max(
+            base.error_breakdown.endpoint_disagreement_abs,
+            tight.error_breakdown.endpoint_disagreement_abs,
+        )
+        delta_cross_precision = exterior_cross_precision_disagreement(
+            T,
+            request,
+            evaluation_context,
+            base_frequency,
+            amplitude,
+            purpose,
+            current,
+            base,
+        )
+        all(isfinite, (
+            delta_same_point,
+            delta_cross_precision,
+            delta_endpoint_series,
+        )) || throw(numerical_control_failure(
+            request,
+            exterior_certificate_unavailable,
+            "exterior empirical determinant certificate has a nonfinite term",
+            Dict{String,Any}(
+                "reason" => "EXTERIOR_CERTIFICATE_TERM_NONFINITE",
+            );
+            stage="determinant-chart",
+        ))
+        error_breakdown = determinant_error_breakdown(
+            T,
+            request,
+            delta_endpoint_series;
+            control_disagreement_abs=delta_same_point,
+            precision_disagreement_abs=delta_cross_precision,
+        )
+        progress_emit("determinant_error_estimated"; payload=Dict(
+            "error_model_id" => EXTERIOR_EMPIRICAL_ERROR_MODEL_ID,
+            "certificate_statement" => EXTERIOR_EMPIRICAL_ERROR_STATEMENT,
+            "delta_same_point" => string(delta_same_point),
+            "delta_cross_precision" => string(delta_cross_precision),
+            "delta_endpoint_series" => string(delta_endpoint_series),
+            "safety_factor" => string(error_breakdown.safety_factor),
+            "numerical_error_abs" => string(error_breakdown.numerical_error_abs),
+            "determinant_abs" => string(abs(base.value)),
+        ))
+        authenticated = DeterminantEvaluation{T}(
+            base.value,
+            error_breakdown,
+            EXTERIOR_EMPIRICAL_ERROR_MODEL_ID,
+            base.diagnostics,
+        )
+        source_phase = ACTIVE_PHASE[] === nothing ?
+            "UNSCOPED" : ACTIVE_PHASE[]
+        remember_authenticated_determinant!(
+            evaluation_context,
+            request,
+            base_frequency,
+            amplitude,
+            authenticated,
+            source_phase,
+        )
+        remember_authenticated_determinant!(
+            evaluation_context,
+            tight_request,
+            tight_frequency,
+            amplitude,
+            tight,
+            source_phase,
+        )
+        return authenticated
+    end
     endpoint_disagreement_abs = max(
         base.error_breakdown.endpoint_disagreement_abs,
         tight.error_breakdown.endpoint_disagreement_abs,
@@ -7069,8 +7536,10 @@ function fixed_root_determinant_sample_fields(
         "fixed-root determinant sample",
         fixed_omega,
     )
-    DETERMINANT_INDEX_REQUEST[] == 1 || error(
-        "fixed-root determinant sample must evaluate exactly one determinant"
+    expected_determinant_count =
+        exterior_empirical_certificate_required(request) ? 3 : 1
+    DETERMINANT_INDEX_REQUEST[] == expected_determinant_count || error(
+        "fixed-root determinant sample did not complete its required certificate evaluations"
     )
     expected_tier = "bigfloat-$(digits)"
     string(required(request, "semantic_precision_tier")) == expected_tier ||

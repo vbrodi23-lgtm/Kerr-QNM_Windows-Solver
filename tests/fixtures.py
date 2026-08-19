@@ -558,6 +558,7 @@ CONTROL_FAILURE_STAGE_FOR_CODE = {
     "ALGEBRAIC_REPRESENTATION_SINGULAR": "finite-difference",
     "FINITE_DIFFERENCE_NOISE_LIMIT": "finite-difference",
     "DETERMINANT_UNCERTAINTY_TOO_LARGE": "root-authentication",
+    "EXTERIOR_DETERMINANT_CERTIFICATE_UNAVAILABLE": "determinant-chart",
     "SCATTERING_BASIS_ILL_CONDITIONED": "scattering-extraction",
     "SCATTERING_CHART_ILL_CONDITIONED": "determinant-chart",
 }
@@ -797,6 +798,12 @@ def valid_control_failure_diagnostics(
                 "root_correction_tolerance": "2e-11",
                 "accepted": False,
             },
+        }
+    if failure_code == "EXTERIOR_DETERMINANT_CERTIFICATE_UNAVAILABLE":
+        return {
+            "reason": "CROSS_PRECISION_DISAGREEMENT_UNAVAILABLE",
+            "preceding_precision_tier": "bigfloat-40",
+            "cause_type": "SyntheticCertificateComparisonFailure",
         }
     if failure_code == "FINITE_DIFFERENCE_NOISE_LIMIT":
         return {
@@ -1123,6 +1130,11 @@ def valid_julia_root_response(
     omega = request["omega"]
     policy = request["policy"]
     horizon = request["mechanism_id"] == "horizon-admittance"
+    exterior_empirical = (
+        not horizon
+        and policy.get("determinant_error_model")
+        == "exterior-determinant-absolute-error-certificate/empirical-v1"
+    )
     derivative_re = "6"
     derivative_im = "8"
     derivative_abs = Decimal("10")
@@ -1131,9 +1143,9 @@ def valid_julia_root_response(
     error_model_id = (
         "verified-endpoint-control-equivalence-absolute-error/v2"
         if horizon
-        else None
+        else policy.get("determinant_error_model") if exterior_empirical else None
     )
-    determinant_error_abs = "1" if horizon else "0"
+    determinant_error_abs = "1" if horizon else "48" if exterior_empirical else "0"
 
     def fixed_root(phase: str, determinant: str) -> dict[str, object]:
         correction = str(Decimal(determinant) / derivative_abs)
@@ -1215,7 +1227,9 @@ def valid_julia_root_response(
                 "selected_step": "0.001",
                 "axis": "real",
                 "determinant_error_status": (
-                    "available/v1" if horizon else "unavailable/v1"
+                    "available/v1"
+                    if horizon or exterior_empirical
+                    else "unavailable/v1"
                 ),
                 "determinant_error_model_id": error_model_id,
             },

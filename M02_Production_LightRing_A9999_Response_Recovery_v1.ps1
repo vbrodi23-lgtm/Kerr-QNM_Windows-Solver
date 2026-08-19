@@ -4,7 +4,9 @@ param(
     [switch]$ExerciseInterruptionResume,
     [switch]$SkipBootstrap,
     [switch]$PortableRuntime,
-    [string]$RuntimeRoot
+    [string]$RuntimeRoot,
+    [string]$CalibrationReceiptPath,
+    [string]$CalibrationReceiptSha256
 )
 
 $ErrorActionPreference = "Stop"
@@ -25,7 +27,11 @@ function Assert-ProductionCondition {
 }
 function Invoke-ProductionSolver {
     param([string[]]$Arguments)
-    & (Join-Path $PackageRoot "solver.ps1") @Arguments
+    $EffectiveArguments = @($Arguments)
+    if ($EffectiveArguments[0] -in @("campaign-run", "campaign-resume")) {
+        $EffectiveArguments += $CalibrationArguments
+    }
+    & (Join-Path $PackageRoot "solver.ps1") @EffectiveArguments
     if ($LASTEXITCODE -ne 0) { throw "Production solver command failed with exit code $LASTEXITCODE." }
 }
 function Get-OptionalProperty {
@@ -45,6 +51,30 @@ function Stop-ProductionProcessTree {
 }
 
 $ResolvedOutputRoot = [IO.Path]::GetFullPath((Join-Path $PackageRoot $OutputRoot))
+$HasCalibrationPath = -not [string]::IsNullOrWhiteSpace($CalibrationReceiptPath)
+$HasCalibrationSha256 = -not [string]::IsNullOrWhiteSpace($CalibrationReceiptSha256)
+if ($HasCalibrationPath -ne $HasCalibrationSha256) {
+    throw "calibration receipt path and SHA-256 must be supplied together"
+}
+$CalibrationArguments = @()
+if ($HasCalibrationPath) {
+    $ResolvedCalibrationReceiptPath = if ([IO.Path]::IsPathRooted($CalibrationReceiptPath)) {
+        [IO.Path]::GetFullPath($CalibrationReceiptPath)
+    }
+    else {
+        [IO.Path]::GetFullPath((Join-Path $PackageRoot $CalibrationReceiptPath))
+    }
+    if (-not (Test-Path -LiteralPath $ResolvedCalibrationReceiptPath -PathType Leaf)) {
+        throw "Calibration receipt is absent: $ResolvedCalibrationReceiptPath"
+    }
+    if ($CalibrationReceiptSha256 -notmatch '^[0-9A-Fa-f]{64}$') {
+        throw "Calibration receipt SHA-256 is invalid."
+    }
+    $CalibrationArguments = @(
+        "--calibration-receipt-path", $ResolvedCalibrationReceiptPath,
+        "--calibration-receipt-sha256", $CalibrationReceiptSha256.ToLowerInvariant()
+    )
+}
 $SelectionPath = Join-Path $ResolvedOutputRoot "selection.json"
 $CheckpointPath = Join-Path $ResolvedOutputRoot "checkpoint.json"
 $ReportPath = Join-Path $ResolvedOutputRoot "response-recovery-report.json"
@@ -96,6 +126,14 @@ try {
             "--progress",
             "trace"
         )
+        if ($HasCalibrationPath) {
+            $CampaignArguments += @(
+                "--calibration-receipt-path",
+                ("`"{0}`"" -f $ResolvedCalibrationReceiptPath),
+                "--calibration-receipt-sha256",
+                $CalibrationReceiptSha256.ToLowerInvariant()
+            )
+        }
         $CampaignProcess = Start-Process -FilePath $CurrentPowerShellExecutable `
             -ArgumentList $CampaignArguments -PassThru
         $CompletedReadoutCount = 0

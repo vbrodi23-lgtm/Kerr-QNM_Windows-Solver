@@ -52,6 +52,16 @@ class Production222EndpointRecoveryScriptTests(unittest.TestCase):
         ):
             self.assertIn(required, self.source)
 
+    def test_calibration_override_is_path_and_sha_pinned(self) -> None:
+        for required in (
+            "[string]$CalibrationReceiptPath",
+            "[string]$CalibrationReceiptSha256",
+            "calibration receipt path and SHA-256 must be supplied together",
+            '"--calibration-receipt-path"',
+            '"--calibration-receipt-sha256"',
+        ):
+            self.assertIn(required, self.source)
+
 
 if __name__ == "__main__":
     unittest.main()

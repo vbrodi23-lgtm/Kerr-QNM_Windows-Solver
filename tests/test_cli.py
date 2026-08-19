@@ -427,6 +427,55 @@ class CliTests(unittest.TestCase):
         self.assertEqual(output, {})
         self.assertEqual(json.loads(error)["error"]["code"], "INTERRUPTED")
 
+    def test_campaign_calibration_override_requires_path_and_sha_together(self) -> None:
+        status, output, error = self.invoke([
+            "campaign-run",
+            "selection.json",
+            "--checkpoint",
+            "checkpoint.json",
+            "--calibration-receipt-path",
+            "override.json",
+        ])
+
+        self.assertEqual(status, 2)
+        self.assertEqual(output, {})
+        diagnostic = json.loads(error)["error"]
+        self.assertEqual(diagnostic["code"], "INVALID_INPUT")
+        self.assertIn(
+            "calibration receipt path and SHA-256 must be supplied together",
+            diagnostic["message"],
+        )
+
+    def test_campaign_calibration_override_reaches_native_backend_loader(self) -> None:
+        digest = "a" * 64
+        with patch(
+            "windows_solver.cli._campaign_selected",
+            return_value=(0, {"command": "campaign-run", "state": "COMPLETE"}),
+        ) as selected:
+            status, output, error = self.invoke([
+                "campaign-run",
+                "selection.json",
+                "--checkpoint",
+                "checkpoint.json",
+                "--progress",
+                "quiet",
+                "--calibration-receipt-path",
+                "override.json",
+                "--calibration-receipt-sha256",
+                digest,
+            ])
+
+        self.assertEqual(status, 0)
+        self.assertEqual(error, "")
+        self.assertEqual(output["state"], "COMPLETE")
+        self.assertEqual(
+            selected.call_args.kwargs["calibration_receipt_path"],
+            Path("override.json"),
+        )
+        self.assertEqual(
+            selected.call_args.kwargs["calibration_receipt_sha256"], digest
+        )
+
     def test_complete_schema_six_resume_enters_checkpoint_migration(self) -> None:
         plan = SimpleNamespace(
             backend_identity=object(), campaign_id="campaign-1"
@@ -483,6 +532,8 @@ class CliTests(unittest.TestCase):
             None,
             plan=plan,
             selection=selection,
+            calibration_receipt_path=None,
+            calibration_receipt_sha256=None,
         )
         run_campaign.assert_called_once()
         self.assertIs(run_campaign.call_args.args[2], backend)

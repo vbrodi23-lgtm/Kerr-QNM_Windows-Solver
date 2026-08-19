@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from copy import deepcopy
 from decimal import Decimal
 import hashlib
 import io
@@ -11,15 +12,18 @@ from pathlib import Path
 import shutil
 import tempfile
 import threading
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
 import windows_solver.solved_leaf_cache as solved_leaf_cache_module
+import windows_solver.response_batches as response_batches
 from windows_solver.contracts import canonical_json_bytes
 from windows_solver.linear_response import B_PRIME_RELEASE_DOMAIN
 from windows_solver.response_batches import (
     CampaignLeafRecord,
     CampaignStageRecord,
+    NativeCampaignStageBackend,
     PrecisionCapabilities,
     StageOutcome,
     _authenticated_solved_leaf_lookup,
@@ -33,6 +37,7 @@ from windows_solver.response_batches import (
     run_campaign_selection,
     synthetic_stage_signed_error_channels,
 )
+from windows_solver.julia_response_backend import JuliaPrecisionRootBackend
 from windows_solver.response_engine import (
     BackendIdentity,
     ComponentResult,
@@ -2299,6 +2304,140 @@ class SolvedLeafCacheTests(unittest.TestCase):
                 record_for({"precision_digits": 80}),
                 contract,
             )
+
+    def test_promoted_record_empirical_receipt_must_match_active_contract(self):
+        """Catches accepting a promoted stage after its receipt SHA changes."""
+
+        plan = build_campaign_plan(
+            policy=NumericalPolicy(),
+            backend_identity=VettedNativeDeterminantKernel.identity,
+            precision_capabilities=PrecisionCapabilities((64, 80, 120)),
+        )
+        leaf = next(
+            item for item in plan.leaves
+            if item.role == "primary"
+            and item.mechanism_id == "horizon-admittance"
+        )
+        native = NativeCampaignStageBackend(
+            object(),
+            plan.precision_capabilities,
+            object(),
+            julia_adapter=object(),
+        )
+        receipt = native.calibration_receipt
+        assert receipt is not None
+        profile = receipt.budget_for("horizon-scattering/v1", 80)
+        runtime = JuliaPrecisionRootBackend(
+            leaf.job.backend_identity,
+            SimpleNamespace(runtime_provenance={}),
+            80,
+            empirical_control_profile=profile,
+            calibration_receipt=receipt,
+        ).scientific_runtime_for(leaf.job)
+        component = {"scientific_runtime": runtime}
+        outcome = StageOutcome(
+            digits=80,
+            numerical_state="NOT_CONVERGED",
+            component_result=component,
+            local_disk_radius_abs=1.0,
+            signed_error_channels=synthetic_stage_signed_error_channels(
+                component, 1.0
+            ),
+        )
+        record = CampaignLeafRecord(
+            leaf_id=leaf.leaf_id,
+            role=leaf.role,
+            state="IN_PROGRESS",
+            stages=(CampaignStageRecord(
+                outcome,
+                {
+                    "precision_factory_identity": (
+                        plan.precision_factory_identity.to_mapping()
+                    ),
+                    "available_precision_digits": [64, 80, 120],
+                },
+            ),),
+        )
+        contract = native.scientific_execution_contract_for(leaf)
+
+        _validate_record_scientific_execution_contract(leaf, record, contract)
+
+        changed = deepcopy(runtime)
+        changed["promoted_control_calibration"]["receipt_sha256"] = "0" * 64
+        changed_component = {"scientific_runtime": changed}
+        changed_record = replace(
+            record,
+            stages=(CampaignStageRecord(
+                replace(
+                    outcome,
+                    component_result=changed_component,
+                    signed_error_channels=synthetic_stage_signed_error_channels(
+                        changed_component, 1.0
+                    ),
+                ),
+                record.stages[0].runner_provenance,
+            ),),
+        )
+        with self.assertRaisesRegex(
+            ValueError, "active scientific execution contract"
+        ):
+            _validate_record_scientific_execution_contract(
+                leaf, changed_record, contract
+            )
+
+    def test_promoted_invalidation_preserves_binary64_and_resumes_first_tier(self):
+        """Catches receipt invalidation discarding authenticated binary64 work."""
+
+        plan = build_campaign_plan(
+            policy=NumericalPolicy(),
+            backend_identity=VettedNativeDeterminantKernel.identity,
+            precision_capabilities=PrecisionCapabilities((64, 80, 120)),
+        )
+        leaf = next(item for item in plan.leaves if item.role == "primary")
+
+        def stage(digits):
+            component = {
+                "leaf_id": leaf.leaf_id,
+                "digits": digits,
+            }
+            return CampaignStageRecord(
+                StageOutcome(
+                    digits=digits,
+                    numerical_state="NOT_CONVERGED",
+                    component_result=component,
+                    local_disk_radius_abs=1.0,
+                    signed_error_channels=synthetic_stage_signed_error_channels(
+                        component, 1.0
+                    ),
+                ),
+                {
+                    "precision_factory_identity": (
+                        plan.precision_factory_identity.to_mapping()
+                    ),
+                    "available_precision_digits": [64, 80, 120],
+                },
+            )
+
+        binary = stage(64)
+        promoted = stage(80)
+        record = CampaignLeafRecord(
+            leaf_id=leaf.leaf_id,
+            role=leaf.role,
+            state="UNRESOLVED",
+            stages=(binary, promoted),
+            trigger_ids=("binary64-trigger",),
+            sentinel=True,
+            sentinel_comparison={"status": "old-promoted-comparison"},
+        )
+
+        invalidated = response_batches._invalidate_promoted_record(record)
+
+        self.assertEqual(invalidated.stages, (binary,))
+        self.assertEqual(invalidated.state, "IN_PROGRESS")
+        self.assertEqual(invalidated.trigger_ids, record.trigger_ids)
+        self.assertTrue(invalidated.sentinel)
+        self.assertIsNone(invalidated.missing_precision_digits)
+        self.assertIsNone(invalidated.sentinel_comparison)
 
     def test_changed_science_executes_and_deleted_store_leaves_originating_path_intact(self):
         plan = _plan()

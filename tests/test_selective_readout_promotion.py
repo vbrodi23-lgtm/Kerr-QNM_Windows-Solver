@@ -15,12 +15,16 @@ from tests.test_native_campaign_backend import _result
 from tests.test_promoted_horizon_component import _promoted_baseline
 from tests.fixtures import synthetic_ode_error_budget
 import windows_solver.response_engine as response_engine
+import windows_solver.response_batches as response_batches
 from windows_solver.contracts import canonical_json_bytes
 from windows_solver.adaptive_controls import ODE_CALIBRATION_BLOCKER
 from windows_solver.gsn_cache_producer import GeneratedGsnCache, GsnParameterPair
 from windows_solver.julia_response_backend import JuliaPrecisionRootBackend
 from windows_solver.precision_tiers import PrecisionTier, working_precision_bits
 from windows_solver.partial_component_checkpoint import PartialComponentJournal
+from windows_solver.promoted_control_calibration import (
+    load_default_calibration_receipt,
+)
 from windows_solver.response_batches import (
     NativeCampaignStageBackend,
     PrecisionCapabilities,
@@ -89,6 +93,109 @@ class CampaignSampleAdapter(FakeAdapter):
 
 
 class SelectiveReadoutPromotionTests(unittest.TestCase):
+    def test_empirical_selective_journal_binds_receipt_without_ode_budget(self):
+        """Catches dropping the receipt SHA from partial promoted work."""
+
+        plan = build_campaign_plan(
+            policy=NumericalPolicy(),
+            backend_identity=VettedNativeDeterminantKernel.identity,
+            precision_capabilities=PrecisionCapabilities((64, 80, 120)),
+        )
+        leaf = next(
+            item for item in plan.leaves
+            if item.role == "primary"
+            and item.mechanism_id == "exterior-light-ring"
+        )
+        job = leaf.job
+
+        class BinaryAxisLimited:
+            identity = VettedNativeDeterminantKernel.identity
+
+            def read_root(self, selected, amplitude, primary_predictor=None):
+                value = complex(amplitude)
+                response = complex(0.01, -0.02) if value.real else 1.0e-10 + 0j
+                diagnostic = DiagnosticRootReadout(
+                    omega_delta_from_primary=0j,
+                    determinant_residual_abs=1.0e-12,
+                    determinant_derivative_abs=1.0,
+                    converged=True,
+                )
+                return RootReadout(
+                    omega=selected.root.omega + response * value,
+                    determinant_residual_abs=1.0e-12,
+                    determinant_derivative_abs=1.0,
+                    converged=True,
+                    root_reference_id=selected.root.root_reference_id,
+                    branch_id=selected.root.branch_id,
+                    equation_id=selected.equation_id,
+                    diagnostic_readouts={
+                        family: diagnostic
+                        for family in ("truncation", "resolution", "seed-path")
+                    },
+                )
+
+            def closed_form_horizon_response(self, selected):
+                return None
+
+        previous = run_component(job, BinaryAxisLimited())
+        receipt = load_default_calibration_receipt()
+        promoted = JuliaPrecisionRootBackend(
+            job.backend_identity,
+            FakeAdapter(),
+            40,
+            empirical_control_profile=receipt.budget_for(
+                "exterior-wronskian/v1", 40
+            ),
+            calibration_receipt=receipt,
+        )
+        with tempfile.TemporaryDirectory() as temporary, patch.dict(
+            "os.environ",
+            {"KERR_QNM_PARTIAL_COMPONENT_JOURNAL_ROOT": temporary},
+        ):
+            result = response_engine.run_selective_readout_promotion(
+                job, previous, promoted
+            )
+
+        evidence = result.resolved_window["journal_evidence"]
+        self.assertEqual(
+            evidence["schema"],
+            "windows-solver.selective-tier-journal-evidence/2",
+        )
+        self.assertNotIn("ode_error_budget", evidence)
+        self.assertEqual(
+            evidence["promoted_control_calibration"]["receipt_sha256"],
+            receipt.sha256,
+        )
+        self.assertEqual(
+            evidence["empirical_control_profile_sha256"],
+            promoted.scientific_runtime_for(job)[
+                "empirical_control_profile_sha256"
+            ],
+        )
+        binary_component = {"result": previous.to_mapping()}
+        predecessor = StageOutcome(
+            digits=64,
+            numerical_state=previous.status.value,
+            component_result=binary_component,
+            local_disk_radius_abs=sum(previous.error_channels.values()),
+            signed_error_channels=synthetic_stage_signed_error_channels(
+                binary_component, sum(previous.error_channels.values())
+            ),
+        )
+        validated_runtime, validated_readouts = (
+            response_batches._validate_selective_tier_journal(
+                leaf,
+                "bigfloat-40",
+                previous.resolved_window["readout_specific_promotion_plan"],
+                evidence,
+                response_batches._selective_predecessor_readouts(
+                    leaf, predecessor
+                ),
+            )
+        )
+        self.assertEqual(validated_runtime, promoted.scientific_runtime_for(job))
+        self.assertTrue(validated_readouts)
+
     def test_ordinary_component_cannot_mix_binary_and_promoted_diagnostic_sets(self):
         """Catches weakening the diagnostic-family gate outside selective recovery."""
 

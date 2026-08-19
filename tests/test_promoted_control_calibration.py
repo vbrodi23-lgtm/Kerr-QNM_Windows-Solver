@@ -15,8 +15,10 @@ from windows_solver.promoted_control_calibration import (
     EXTERIOR_DETERMINANT_ABSOLUTE_ERROR_CERTIFICATE,
     CalibrationReceiptError,
     DerivativeAuthenticationUnavailable,
+    ExteriorDeterminantCertificateUnavailable,
     PROMOTED_CONTROL_EMPIRICAL_CALIBRATION_IDENTITY,
     authenticated_derivative_lower_bound_abs,
+    empirical_exterior_determinant_error_abs,
     empirical_root_error_radius_abs,
     load_calibration_receipt,
     load_default_calibration_receipt,
@@ -139,6 +141,35 @@ class PromotedControlCalibrationTests(unittest.TestCase):
             self.assertEqual(
                 caught.exception.code,
                 DERIVATIVE_AUTHENTICATION_UNAVAILABLE,
+            )
+
+    def test_exterior_certificate_requires_all_three_disagreement_classes(self) -> None:
+        self.assertEqual(
+            empirical_exterior_determinant_error_abs(
+                delta_same_point=0.5,
+                delta_cross_precision=0.25,
+                delta_endpoint_series=0.75,
+            ),
+            48.0,
+        )
+        for missing in (
+            "delta_same_point",
+            "delta_cross_precision",
+            "delta_endpoint_series",
+        ):
+            values = {
+                "delta_same_point": 0.5,
+                "delta_cross_precision": 0.25,
+                "delta_endpoint_series": 0.75,
+            }
+            values[missing] = None
+            with self.subTest(missing=missing), self.assertRaises(
+                ExteriorDeterminantCertificateUnavailable
+            ) as caught:
+                empirical_exterior_determinant_error_abs(**values)
+            self.assertEqual(
+                caught.exception.code,
+                "EXTERIOR_DETERMINANT_CERTIFICATE_UNAVAILABLE",
             )
 
     def test_receipt_parser_rejects_implicit_operator_approval(self) -> None:

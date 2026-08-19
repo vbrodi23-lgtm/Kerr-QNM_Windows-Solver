@@ -54,6 +54,10 @@ from .response_engine import (
     regularised_gsn_precision_policy,
 )
 from .precision_tiers import PrecisionTier, precision_tier
+from .promoted_control_calibration import (
+    EmpiricalControlProfile,
+    PromotedControlCalibrationReceipt,
+)
 from .progress import (
     PROGRESS_SCHEMA,
     ProgressEventKind,
@@ -116,6 +120,9 @@ NUMERICAL_CONTROL_FAILURE_CODES = frozenset({
     # The central determinant is small but its absolute error is too large to
     # call the root located. Never reported as a solved root.
     "DETERMINANT_UNCERTAINTY_TOO_LARGE",
+    # An exterior promoted determinant lacked one of its mandatory empirical
+    # same-point, preceding-tier, or endpoint/series comparisons.
+    "EXTERIOR_DETERMINANT_CERTIFICATE_UNAVAILABLE",
     # The finite-difference ladder was exhausted without a step at which the
     # derivative estimates agree and determinant noise does not dominate.
     "FINITE_DIFFERENCE_NOISE_LIMIT",
@@ -1722,6 +1729,48 @@ def _valid_determinant_uncertainty_diagnostics(
     )
 
 
+def _valid_exterior_certificate_unavailable_diagnostics(
+    stage: object, diagnostics: Mapping[str, object]
+) -> bool:
+    """Validate the fail-closed receipt when an exterior term is missing."""
+
+    if stage not in {"asymptotic-preflight", "determinant-chart"}:
+        return False
+    reason = diagnostics.get("reason")
+    if reason not in {
+        "TWO_AUTHENTICATED_EXTERIOR_ENDPOINTS_REQUIRED",
+        "ENDPOINT_SERIES_DISAGREEMENT_UNAVAILABLE",
+        "BASE_ENDPOINT_SERIES_EVIDENCE_UNAVAILABLE",
+        "TIGHT_ENDPOINT_SERIES_EVIDENCE_UNAVAILABLE",
+        "SAME_POINT_DISAGREEMENT_UNAVAILABLE",
+        "CROSS_PRECISION_DISAGREEMENT_UNAVAILABLE",
+        "CROSS_PRECISION_FAMILY_MISMATCH",
+        "CROSS_PRECISION_DISAGREEMENT_NONFINITE",
+        "EXTERIOR_CERTIFICATE_TERM_NONFINITE",
+    }:
+        return False
+    allowed = {
+        "reason",
+        "available_adequate_endpoint_count",
+        "candidates",
+        "factored_homogeneous_rhs_evaluations_before_pair",
+        "preceding_precision_tier",
+        "cause_type",
+    }
+    if not set(diagnostics).issubset(allowed):
+        return False
+    if reason == "TWO_AUTHENTICATED_EXTERIOR_ENDPOINTS_REQUIRED":
+        return (
+            stage == "asymptotic-preflight"
+            and isinstance(diagnostics.get("available_adequate_endpoint_count"), int)
+            and diagnostics["available_adequate_endpoint_count"] < 2
+            and isinstance(diagnostics.get("candidates"), list)
+            and diagnostics.get("factored_homogeneous_rhs_evaluations_before_pair")
+            == 0
+        )
+    return stage == "determinant-chart"
+
+
 def _valid_algebraic_singularity_diagnostics(
     stage: object, diagnostics: Mapping[str, object]
 ) -> bool:
@@ -1865,6 +1914,10 @@ def _valid_numerical_control_diagnostics(
         return _valid_finite_difference_noise_diagnostics(stage, diagnostics)
     if code == "DETERMINANT_UNCERTAINTY_TOO_LARGE":
         return _valid_determinant_uncertainty_diagnostics(stage, diagnostics)
+    if code == "EXTERIOR_DETERMINANT_CERTIFICATE_UNAVAILABLE":
+        return _valid_exterior_certificate_unavailable_diagnostics(
+            stage, diagnostics
+        )
     if code == "ALGEBRAIC_REPRESENTATION_SINGULAR":
         return _valid_algebraic_singularity_diagnostics(stage, diagnostics)
     return False
@@ -2401,31 +2454,94 @@ def _precision_policy(
     digits: int,
     refinement: int,
     ode_error_budget: ODEErrorBudget | None = None,
+    *,
+    empirical_control_profile: EmpiricalControlProfile | None = None,
+    calibration_receipt: PromotedControlCalibrationReceipt | None = None,
 ) -> dict[str, object]:
     if digits not in _PROMOTED_DIGITS:
         raise ValueError("Julia response precision must be 40, 80, or 120 digits")
     if refinement not in (0, 1):
         raise ValueError("Julia response refinement level must be zero or one")
-    # Changed promoted identities never consult the historical provisional ODE
-    # table.  Establish the calibrated controls first so absence fails before
-    # request construction can reach any worker or ODE boundary.
-    ode_controls = _adaptive_ode_request_controls(digits, ode_error_budget)
     level = "base" if refinement == 0 else "refinement"
-    root_search_controls = {
-        (40, "base"): ("1e-6", "1e-12", "1e-3"),
-        (40, "refinement"): ("1e-7", "1e-14", "1e-4"),
-        (80, "base"): ("1e-6", "1e-12", "1e-3"),
-        (80, "refinement"): ("1e-7", "1e-14", "1e-4"),
-        (120, "base"): ("1e-6", "1e-16", "1e-3"),
-        (120, "refinement"): ("1e-7", "1e-18", "1e-4"),
-    }[(digits, level)]
+    if empirical_control_profile is not None or calibration_receipt is not None:
+        if (
+            empirical_control_profile is None
+            or calibration_receipt is None
+            or ode_error_budget is not None
+            or empirical_control_profile.nominal_decimal_digits != digits
+        ):
+            raise ValueError("empirical promoted controls are invalid")
+        expected_family = (
+            "horizon-scattering/v1"
+            if job.mechanism_id == "horizon-admittance"
+            else "exterior-wronskian/v1"
+        )
+        if (
+            empirical_control_profile.determinant_family != expected_family
+            or calibration_receipt.budget_for(expected_family, digits)
+            != empirical_control_profile
+        ):
+            raise ValueError(
+                "empirical control profile disagrees with determinant request"
+            )
+        profile_mapping = empirical_control_profile.to_mapping()
+        numerical_controls: dict[str, object] = {
+            **empirical_control_profile.controls_for_refinement(refinement),
+            "promoted_control_calibration_receipt_sha256": (
+                calibration_receipt.sha256
+            ),
+            "empirical_control_profile_sha256": hashlib.sha256(
+                canonical_json_bytes(profile_mapping)
+            ).hexdigest(),
+        }
+        if expected_family == "exterior-wronskian/v1":
+            numerical_controls.update({
+                "determinant_error_model": (
+                    calibration_receipt.certificate_identity
+                ),
+                "determinant_error_safety_factor": (
+                    calibration_receipt.certificate_safety_factor
+                ),
+                "determinant_error_required_term_classes": [
+                    "delta_same_point",
+                    "delta_cross_precision",
+                    "delta_endpoint_series",
+                ],
+                "determinant_error_missing_evidence_outcome": (
+                    "EXTERIOR_DETERMINANT_CERTIFICATE_UNAVAILABLE"
+                ),
+                "determinant_error_certificate_statement": (
+                    "conservative empirical certificate; not a formal interval enclosure"
+                ),
+                "determinant_error_preceding_precision_tier": {
+                    40: "binary64",
+                    80: "bigfloat-40",
+                    120: "bigfloat-80",
+                }[digits],
+            })
+    else:
+        # Legacy injected budgets remain readable for existing authenticated
+        # tests and evidence. New native production requests use the committed
+        # empirical receipt path above.
+        ode_controls = _adaptive_ode_request_controls(digits, ode_error_budget)
+        root_search_controls = {
+            (40, "base"): ("1e-6", "1e-12", "1e-3"),
+            (40, "refinement"): ("1e-7", "1e-14", "1e-4"),
+            (80, "base"): ("1e-6", "1e-12", "1e-3"),
+            (80, "refinement"): ("1e-7", "1e-14", "1e-4"),
+            (120, "base"): ("1e-6", "1e-16", "1e-3"),
+            (120, "refinement"): ("1e-7", "1e-18", "1e-4"),
+        }[(digits, level)]
+        numerical_controls = {
+            "root_correction_tolerance": "2e-11",
+            "frequency_step": root_search_controls[0],
+            "frequency_step_minimum": root_search_controls[1],
+            "frequency_step_maximum": root_search_controls[2],
+            **ode_controls,
+        }
     policy = {
         "readout_radius": format(job.policy.readout_radius, ".17g"),
-        "root_correction_tolerance": "2e-11",
-        "frequency_step": root_search_controls[0],
-        "frequency_step_minimum": root_search_controls[1],
-        "frequency_step_maximum": root_search_controls[2],
-        **ode_controls,
+        **numerical_controls,
         **horizon_geometry_controls(),
         **regularised_gsn_precision_policy(job.mechanism_id),
         "endpoint_series_order": job.policy.endpoint_series_order + 8 * refinement,
@@ -2486,6 +2602,8 @@ class JuliaPrecisionRootBackend:
     digits: int
     refinement: int = 0
     ode_error_budget: ODEErrorBudget | None = None
+    empirical_control_profile: EmpiricalControlProfile | None = None
+    calibration_receipt: PromotedControlCalibrationReceipt | None = None
 
     def __post_init__(self) -> None:
         if self.digits not in _PROMOTED_DIGITS:
@@ -2494,8 +2612,23 @@ class JuliaPrecisionRootBackend:
             raise ValueError("Julia precision refinement level is invalid")
         if self.ode_error_budget is not None:
             _adaptive_ode_request_controls(self.digits, self.ode_error_budget)
+        if (self.empirical_control_profile is None) is not (
+            self.calibration_receipt is None
+        ):
+            raise ValueError(
+                "empirical controls require both profile and calibration receipt"
+            )
+        if (
+            self.ode_error_budget is not None
+            and self.empirical_control_profile is not None
+        ):
+            raise ValueError(
+                "ODE error budget and empirical controls are mutually exclusive"
+            )
 
     def _request_ode_error_budget(self) -> ODEErrorBudget | None:
+        if self.empirical_control_profile is not None:
+            return None
         if self.ode_error_budget is not None:
             return self.ode_error_budget
         provider = getattr(self.adapter, "ode_error_budget_for_digits", None)
@@ -2524,6 +2657,52 @@ class JuliaPrecisionRootBackend:
             raise ValueError(
                 "response job backend identity does not match Julia adapter"
             )
+        profile = self.empirical_control_profile
+        receipt = self.calibration_receipt
+        if profile is not None and receipt is not None:
+            expected_family = (
+                "horizon-scattering/v1"
+                if job.mechanism_id == "horizon-admittance"
+                else "exterior-wronskian/v1"
+            )
+            if (
+                profile.determinant_family != expected_family
+                or profile.nominal_decimal_digits != self.digits
+                or receipt.budget_for(expected_family, self.digits) != profile
+            ):
+                raise ValueError(
+                    "empirical control profile disagrees with determinant request"
+                )
+            profile_mapping = profile.to_mapping()
+            return {
+                **self.scientific_runtime,
+                "regularised_gsn_precision_policy": dict(
+                    regularised_gsn_precision_policy(job.mechanism_id)
+                ),
+                "promoted_control_calibration": {
+                    "schema": (
+                        "windows-solver.promoted-control-calibration-binding/1"
+                    ),
+                    "receipt_identity": receipt.identity,
+                    "receipt_sha256": receipt.sha256,
+                    "execution_status": receipt.execution_status,
+                    "source_audit_sha256": receipt.source_audit_sha256,
+                    "determinant_family": expected_family,
+                    "determinant_certificate_identity": (
+                        receipt.certificate_identity
+                    ),
+                    "determinant_certificate_safety_factor": (
+                        receipt.certificate_safety_factor
+                    ),
+                    "derivative_floor_status": (
+                        receipt.derivative_floor_status_for(expected_family)
+                    ),
+                },
+                "empirical_control_profile": profile_mapping,
+                "empirical_control_profile_sha256": hashlib.sha256(
+                    canonical_json_bytes(profile_mapping)
+                ).hexdigest(),
+            }
         budget = self._request_ode_error_budget()
         if budget is None:
             raise MissingODECalibrationError(ODE_CALIBRATION_BLOCKER)
@@ -2583,6 +2762,8 @@ class JuliaPrecisionRootBackend:
                 self.digits,
                 self.refinement,
                 self._request_ode_error_budget(),
+                empirical_control_profile=self.empirical_control_profile,
+                calibration_receipt=self.calibration_receipt,
             ),
             "execution_resource": _execution_resource_policy(),
         }
@@ -2695,6 +2876,8 @@ class JuliaPrecisionRootBackend:
             self.digits,
             self.refinement,
             self._request_ode_error_budget(),
+            empirical_control_profile=self.empirical_control_profile,
+            calibration_receipt=self.calibration_receipt,
         )
         request = self.preview_fixed_root_request(
             job, fixed_omega, converted_amplitude, readout_role
@@ -2763,6 +2946,9 @@ class JuliaPrecisionRootBackend:
             determinant_error = math.nextafter(determinant_error, math.inf)
         determinant_error_status = response["determinant_error_status"]
         determinant_error_model_id = response["determinant_error_model_id"]
+        expected_error_model_id = request["policy"].get(
+            "determinant_error_model"
+        )
         if (
             determinant_error_status not in {"available/v1", "unavailable/v1"}
             or (
@@ -2780,6 +2966,17 @@ class JuliaPrecisionRootBackend:
         ):
             raise JuliaResponseBackendError(
                 "M02 fixed-root determinant error evidence is invalid"
+            )
+        if (
+            expected_error_model_id is not None
+            and determinant_error_status == "available/v1"
+            and determinant_error_model_id != expected_error_model_id
+        ) or (
+            determinant_error_status == "unavailable/v1"
+            and expected_error_model_id is not None
+        ):
+            raise JuliaResponseBackendError(
+                "M02 fixed-root determinant error model disagrees with request"
             )
         request_binding = json.loads(canonical_json_bytes(request))
         response_binding = json.loads(canonical_json_bytes(dict(response)))
@@ -3053,11 +3250,7 @@ class JuliaPrecisionRootBackend:
             raise JuliaResponseBackendError(
                 "M02 Julia PRIMARY acceptance evidence is invalid"
             ) from error
-        expected_error_model_id = (
-            policy.get("determinant_error_model")
-            if numerical_conditioning.scattering_diagnostics_applicable
-            else None
-        )
+        expected_error_model_id = policy.get("determinant_error_model")
         if primary_acceptance.error_model_id != expected_error_model_id:
             raise JuliaResponseBackendError(
                 "M02 Julia PRIMARY determinant telemetry identity is invalid"
@@ -3536,16 +3729,23 @@ class JuliaPrecisionRootBackend:
             raise JuliaResponseBackendError(
                 "M02 Julia current root authentication strategy is missing"
             )
-        # The error model is published exactly by the families that compute one.
-        # A horizon determinant without a breakdown would mean an error-aware
-        # acceptance decision was made from an absent error term.
+        # Any request carrying an error-model identity must carry a matching
+        # breakdown.  The empirical exterior certificate deliberately joins
+        # the existing horizon error-aware route here.
         horizon_family = (
             numerical_conditioning.scattering_diagnostics_applicable is True
         )
-        if horizon_family != (root_authentication.error_breakdown is not None):
+        policy = request["policy"]
+        if not isinstance(policy, Mapping):
+            raise JuliaResponseBackendError("M02 Julia request policy is invalid")
+        expected_error_model_id = policy.get("determinant_error_model")
+        if (
+            (expected_error_model_id is not None)
+            != (root_authentication.error_breakdown is not None)
+        ):
             raise JuliaResponseBackendError(
                 "M02 Julia root authentication error model does not match the "
-                "determinant family"
+                "request policy"
             )
         converged = response["root_converged"]
         diagnostics_skipped_reason = response.get("diagnostics_skipped_reason")
@@ -3579,9 +3779,6 @@ class JuliaPrecisionRootBackend:
             "branch_tolerance_abs",
             nonnegative=True,
         )
-        policy = request["policy"]
-        if not isinstance(policy, Mapping):
-            raise JuliaResponseBackendError("M02 Julia request policy is invalid")
         try:
             _validate_mechanism_precision_policy(
                 job.mechanism_id,
@@ -3663,11 +3860,6 @@ class JuliaPrecisionRootBackend:
             raise JuliaResponseBackendError(
                 "M02 Julia root derivative lower bound is inconsistent"
             )
-        expected_error_model_id = (
-            policy.get("determinant_error_model")
-            if horizon_family
-            else None
-        )
         root_correction_tolerance = _finite_decimal_text(
             policy.get("root_correction_tolerance"),
             "root_correction_tolerance",

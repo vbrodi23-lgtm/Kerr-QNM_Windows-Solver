@@ -349,6 +349,67 @@ class NativeCampaignBackendTests(unittest.TestCase):
         )
         self.assertAlmostEqual(ledger_radius, outcome.local_disk_radius_abs)
 
+    def test_default_promoted_stage_uses_committed_empirical_profile(self):
+        previous_result = _result(self.leaf.job, 1.0 + 0.0j)
+        promoted_result = _result(self.leaf.job, 1.0 + 2.0e-8j)
+        previous = SimpleNamespace(
+            digits=64,
+            component_result={"result": previous_result.to_mapping()},
+            local_disk_radius_abs=1.0e-6,
+        )
+        backend = NativeCampaignStageBackend(
+            self.backend.adapter,
+            self.capabilities,
+            self.backend.generated_cache,
+            self.backend.julia_adapter,
+        )
+
+        with patch(
+            "windows_solver.response_batches.run_promoted_exterior_component",
+            return_value=promoted_result,
+        ) as run:
+            backend.execute_promoted_stage(self.leaf, 80, (previous,))
+
+        promoted_backend = run.call_args.args[1]
+        self.assertIsNone(promoted_backend.ode_error_budget)
+        self.assertEqual(
+            promoted_backend.empirical_control_profile.determinant_family,
+            "exterior-wronskian/v1",
+        )
+        self.assertEqual(
+            promoted_backend.calibration_receipt.sha256,
+            "3353a1836e520f1e360cf30feb898e132c63db8ba5e691eb01b1ed01533243de",
+        )
+
+    def test_default_native_contract_never_requests_legacy_ode_budget(self):
+        """Regression for the PowerShell campaign's prior startup blocker."""
+
+        backend = NativeCampaignStageBackend(
+            self.backend.adapter,
+            self.capabilities,
+            self.backend.generated_cache,
+            self.backend.julia_adapter,
+        )
+
+        contract = backend.scientific_execution_contract_for(self.leaf)
+
+        self.assertEqual(
+            contract["schema"],
+            "windows-solver.m02-scientific-execution-contract/2",
+        )
+        self.assertNotIn("ode_error_budgets_by_nominal_decimal_digits", contract)
+        self.assertEqual(
+            contract["calibration_receipt"]["identity"],
+            "promoted-control-empirical-calibration/v1",
+        )
+        self.assertEqual(
+            contract["determinant_family"], "exterior-wronskian/v1"
+        )
+        self.assertEqual(
+            set(contract["empirical_control_profiles_by_nominal_decimal_digits"]),
+            {"80", "120"},
+        )
+
     def test_unsuccessful_promoted_primary_skips_self_refinement(self):
         previous_result = _result(self.leaf.job, 1.0 + 0.0j)
         baseline = RootReadout(
