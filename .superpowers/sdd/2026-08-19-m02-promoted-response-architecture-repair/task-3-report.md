@@ -333,3 +333,74 @@ Compilation, release-manifest validation, TaskPlanner validation, and
 solve, production M02 campaign, or PowerShell script was executed. Native
 operator receipts, calibrated determinant-to-ODE allocation, human mathematics
 review, and release admission remain open.
+
+### Final campaign-identity and migration re-review
+
+The final production-path REDs exposed three remaining architecture defects:
+the 80-digit endpoint-arithmetic attempt could not enter the ordinary 120-digit
+API without a fabricated 80 stage; origin/main schema-7 bindings were being
+reconstructed from current source material; and promoted deep horizon leaves
+were dispatched and validated as exterior multi-readout work. A dedicated
+endpoint-arithmetic recovery entry point now authenticates the exact failed
+80 request and executes the 120 horizon recovery directly. Frozen schema-7
+campaign/source/factory/request material reproduces the origin precision hash
+`3f6364f6fc28eebeeb788af20524f8ada3c97f23e41fb68f4ead3da365368dcb`.
+Current campaign/source identities are versioned independently, and every
+promoted exterior contract, including deep and failed-preflight work, binds the
+fixed-root derivative/disk/conditioning/validation policy.
+
+Promoted horizon dispatch is now mechanism-scoped for PRIMARY and deep leaves.
+The campaign has a distinct bounded-analytic deep terminal path: it accepts no
+fabricated self-refinement evidence, retains the real binary-to-promoted
+discrepancy when applicable, uses the existing promoted root/conditioning gate
+for 80→120, and preserves the sentinel false-negative audit. An actual
+`NativeCampaignStageBackend` synthetic campaign test reaches and checkpoints
+that path. All Native promoted Julia constructors consume the tier-matched
+recorded ODE budget before worker work.
+
+Migration preserves every retained historical `CampaignStageRecord` mapping
+exactly, while current validation narrowly admits the frozen schema-7 factory
+only for preserved binary64 stages. Checkpoint and sidecar bytes are staged and
+fsynced together, the source is rechecked immediately before and after install,
+and injected second-install or source-race failures roll back both outputs. The
+light-ring interruption launcher uses the current PowerShell executable with
+an explicit quoted `-File` argument list and retains process-tree termination,
+wait, checkpoint validation, and cold journal-reuse branches. These are static
+tests only; the PowerShell script was not executed.
+
+RED/GREEN evidence includes the real Native arithmetic predecessor test, exact
+origin schema-7 checkpoint fixture, deep-horizon campaign test, retained-stage
+identity assertion, transactional failure/race tests, and launcher parser/text
+test. Focused verification passed the 26 response-batch, 49 precision-campaign,
+28 Native/horizon, 6 migration, 34 endpoint/static/script, and 24 public-surface
+tests (6 skipped). Python compilation and diff checks passed. No Julia worker,
+Kerr determinant, ODE/angular/QNM solve, production M02 campaign, or production
+PowerShell script was executed. Operator and human-mathematics validation
+remain incomplete.
+
+### Deep promoted migration and terminal-state closure
+
+The final RED fixtures showed that schema-7 promoted stages could survive
+migration when their endpoint policy identifier itself had not changed, even
+though both the historical promoted horizon and exterior calculation
+identities had changed. Migration now truncates each real `CampaignLeafRecord`
+at its first stage above binary64 with reason
+`SCHEMA7_PROMOTED_COMPONENT_IDENTITY_CHANGED`. Tests cover historical horizon
+and exterior records and assert the retained binary64 stage mapping is exactly
+identical before and after migration.
+
+A second RED exercised a non-sentinel deep horizon through typed 80-digit
+endpoint-arithmetic failure, direct 120-digit bounded analytic recovery,
+checkpoint validation, and reload. It exposed both an unauthenticated payload
+shape and the use of a finite-amplitude discrepancy terminal rule for an
+analytic component with no such discrepancy. Endpoint-arithmetic evidence now
+authenticates its exact predecessor field, and live/reload paths share the
+mechanism-scoped bounded-horizon terminal rule. A converged non-sentinel is
+`PRODUCED`; a converged sentinel remains `UNRESOLVED` under the independent
+false-negative audit. Historical horizon-v1 role restrictions are unchanged.
+
+GREEN verification: the seven affected modules ran 158 tests successfully;
+full safe Python discovery ran 895 tests successfully with 7 skips. Python
+compilation, release-manifest validation, TaskPlanner validation, and
+`git diff --check` passed. No Julia worker, Kerr determinant, ODE/angular/QNM
+solve, M02 campaign, or production PowerShell entry point was executed.

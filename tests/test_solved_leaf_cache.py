@@ -93,9 +93,9 @@ _POLISHED_BASELINES = {
     ),
 }
 _POLISHED_IDENTITIES = {
-    "b-prime-leaf-4c8594e4a59486a1c56206e41cd7f7f3ff1ab5193a5ff6b699cbe9492bc45355": "786df5f901766261687f99b200f395c772bdab3f7638f628f1d8fbc6ebe51613",
-    "b-prime-leaf-0f36daefa853de1280f17c8b8ef89bbaf9b34f5e5044a5eb85bc563d3896b60d": "b489f6ca167021571e368173c0128ab0b2b4ced8a8c7525d0db3bccfee142b67",
-    "b-prime-leaf-08b8dc3df83fc1304a61d8b6105c412a316a44816ca229d375573fdf72ac0a57": "448e1ee419427faa5b2919b8515ac62755ec57a599c9f653bc0fe1a578ac2384",
+    "b-prime-leaf-4c8594e4a59486a1c56206e41cd7f7f3ff1ab5193a5ff6b699cbe9492bc45355": "ec654b7047015d7d38963416bd7625742f84f6c85fbb5a2479adc5ad65597fc7",
+    "b-prime-leaf-0f36daefa853de1280f17c8b8ef89bbaf9b34f5e5044a5eb85bc563d3896b60d": "540949cfd32735d6ce46f56b43aba6738ddf80764d35c8375a92c5e5ef1088d7",
+    "b-prime-leaf-08b8dc3df83fc1304a61d8b6105c412a316a44816ca229d375573fdf72ac0a57": "04dcd7cdc3c760185b21d4cecf595f80dd1bbd0aa9f4e929d9bc9c4bc9f3ff60",
 }
 
 
@@ -898,7 +898,7 @@ class SolvedLeafCacheTests(unittest.TestCase):
         )
         self.assertEqual(
             scientific_computation_identity_sha256(plan, leaf),
-            "8b80e555231fdc7a712fb1dc672e7f23e99bcc804b1b3518c8f182879893fff8",
+            "d87307db60bbd8a5f4bfcbadf60eb2272aceddffa2e3bcffa7bbfd6fc88403dd",
         )
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -956,7 +956,7 @@ class SolvedLeafCacheTests(unittest.TestCase):
         )
         self.assertEqual(
             legacy_identity,
-            "4f0833f9f3426decc9e2bde4b55e1b52af86e8ebce13cad99939bea1fa7fe974",
+            "885c3d1880fdb4cce1f9dfa2d6a5e14eaaae9405f89988d11460d29ff546d8b7",
         )
         selection = build_campaign_selection(
             plan, role="primary", leaf_ids=(leaf.leaf_id,)
@@ -1349,7 +1349,7 @@ class SolvedLeafCacheTests(unittest.TestCase):
         )
         self.assertEqual(
             legacy_identity,
-            "4f0833f9f3426decc9e2bde4b55e1b52af86e8ebce13cad99939bea1fa7fe974",
+            "885c3d1880fdb4cce1f9dfa2d6a5e14eaaae9405f89988d11460d29ff546d8b7",
         )
         selection = build_campaign_selection(
             plan, role="primary", leaf_ids=(leaf.leaf_id,)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+from dataclasses import replace
 import hashlib
 from pathlib import Path
 import tempfile
@@ -8,9 +9,14 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
+from tests.test_linear_response_batches import _produced_stage_outcome
+
 from windows_solver.contracts import canonical_json_bytes
 from windows_solver.gsn_cache_producer import GeneratedGsnCache, GsnParameterPair
-from windows_solver.julia_response_backend import JuliaPrecisionRootBackend
+from windows_solver.julia_response_backend import (
+    JuliaNumericalControlError,
+    JuliaPrecisionRootBackend,
+)
 from windows_solver.response_batches import (
     B_PRIME_RELEASE_DOMAIN,
     CampaignExecutionAttempt,
@@ -19,15 +25,19 @@ from windows_solver.response_batches import (
     build_campaign_selection,
     build_campaign_plan,
     run_campaign_selection,
+    synthetic_stage_signed_error_channels,
+    validate_campaign_checkpoint,
 )
 from windows_solver.response_engine import (
     ComponentResult,
     ComponentStatus,
+    DiagnosticRootReadout,
     NativeDeterminantAdapter,
     NumericalPolicy,
     RootReadout,
     VettedNativeDeterminantKernel,
     ERROR_CHANNELS,
+    run_promoted_horizon_component,
 )
 from tests.fixtures import (
     control_failure_stage,
@@ -466,8 +476,12 @@ class NativeCampaignBackendTests(unittest.TestCase):
             for leaf in self.plan.leaves
             if leaf.role == "deep"
             and leaf.mechanism_id == "horizon-admittance"
-            and leaf.leaf_id
-            in set(B_PRIME_RELEASE_DOMAIN.fixed_precision_sentinel_leaf_ids)
+            and leaf.leaf.mode_label == "221"
+            and leaf.job.spin < 0.9999
+        )
+        self.assertNotIn(
+            deep.leaf_id,
+            set(B_PRIME_RELEASE_DOMAIN.fixed_precision_sentinel_leaf_ids),
         )
         generated = GeneratedGsnCache(
             ("gsn-000001",),
@@ -476,7 +490,7 @@ class NativeCampaignBackendTests(unittest.TestCase):
             (GsnParameterPair(19, 20, deep.job.mode.m),),
         )
         backend = NativeCampaignStageBackend(
-            self.backend.native_adapter,
+            self.backend.adapter,
             self.capabilities,
             generated,
             self.backend.julia_adapter,
@@ -488,7 +502,7 @@ class NativeCampaignBackendTests(unittest.TestCase):
         predictor = deep.job.root.omega
         promoted = _with_worker_receipt(
             deep.job,
-            _promoted_baseline(deep.job),
+            _promoted_baseline(deep.job, omega=predictor),
             80,
             predictor,
         )
@@ -496,28 +510,255 @@ class NativeCampaignBackendTests(unittest.TestCase):
         selection = build_campaign_selection(
             self.plan, role="deep", leaf_ids=(deep.leaf_id,)
         )
+        promoted_result = run_promoted_horizon_component(
+            deep.job, julia, predictor
+        )
+        assert promoted_result.response is not None
+        binary = ComponentResult.from_mapping(
+            _produced_stage_outcome(
+                deep, promoted_result.response
+            ).component_result["result"]
+        )
+        binary = replace(
+            binary,
+            baseline=replace(
+                binary.baseline,
+                truncation_radius=1.0e-12,
+                resolution_radius=1.0e-12,
+                seed_path_radius=1.0e-12,
+                diagnostic_readouts={
+                    family: DiagnosticRootReadout(
+                        omega_delta_from_primary=delta,
+                        determinant_residual_abs=1.0e-13,
+                        determinant_derivative_abs=1.0,
+                        converged=True,
+                    )
+                    for family, delta in {
+                        "truncation": complex(1.0e-12, 0.0),
+                        "resolution": complex(0.0, 1.0e-12),
+                        "seed-path": complex(-1.0e-12, 0.0),
+                    }.items()
+                },
+            ),
+        )
 
         with tempfile.TemporaryDirectory() as temporary, patch(
             "windows_solver.response_batches.run_component",
-            return_value=_result(deep.job, 0.25 - 0.125j),
+            return_value=binary,
         ), patch(
             "windows_solver.response_batches.JuliaPrecisionRootBackend",
             return_value=julia,
         ):
+            checkpoint = Path(temporary) / "deep-horizon.json"
             summary = run_campaign_selection(
                 self.plan,
                 selection,
                 backend,
-                Path(temporary) / "deep-horizon.json",
+                checkpoint,
                 resume=False,
+            )
+            validated = validate_campaign_checkpoint(self.plan, checkpoint)
+            resumed = run_campaign_selection(
+                self.plan,
+                selection,
+                backend,
+                checkpoint,
+                resume=True,
             )
 
         self.assertEqual(summary.state, "COMPLETE")
+        self.assertEqual(validated.state, "COMPLETE")
+        self.assertEqual(resumed.executed_stage_count, 0)
+        self.assertEqual(resumed.reused_stage_count, 2)
         self.assertEqual(summary.records[0].state, "PRODUCED")
         self.assertEqual(
             tuple(stage.outcome.digits for stage in summary.records[0].stages),
             (64, 80),
         )
+
+    def test_deep_endpoint_arithmetic_uses_bounded_horizon_terminal_rule(self):
+        from tests.test_promoted_horizon_component import (
+            FakeJuliaPrecisionBackend,
+            _promoted_baseline,
+            _with_worker_receipt,
+        )
+
+        cases = (
+            ("221", False, ComponentStatus.CONVERGED, "PRODUCED"),
+            ("220", True, ComponentStatus.CONVERGED, "UNRESOLVED"),
+        )
+        for mode_label, sentinel, promoted_status, expected_state in cases:
+            with self.subTest(
+                mode_label=mode_label,
+                sentinel=sentinel,
+                promoted_status=promoted_status.value,
+            ):
+                deep = min(
+                    (
+                        leaf
+                        for leaf in self.plan.leaves
+                        if leaf.role == "deep"
+                        and leaf.mechanism_id == "horizon-admittance"
+                        and leaf.leaf.mode_label == mode_label
+                        and (
+                            leaf.leaf_id
+                            in set(
+                                B_PRIME_RELEASE_DOMAIN.fixed_precision_sentinel_leaf_ids
+                            )
+                        )
+                        is sentinel
+                    ),
+                    key=lambda leaf: leaf.job.spin,
+                )
+                predictor = deep.job.root.omega
+                promoted = _with_worker_receipt(
+                    deep.job,
+                    _promoted_baseline(deep.job, omega=predictor),
+                    120,
+                    predictor,
+                )
+                promoted_backend = FakeJuliaPrecisionBackend(
+                    deep.job, promoted, 120
+                )
+                promoted_result = run_promoted_horizon_component(
+                    deep.job, promoted_backend, predictor
+                )
+                promoted_result = replace(
+                    promoted_result, status=promoted_status
+                )
+                predecessor = _endpoint_arithmetic_attempt(
+                    deep, primary_predictor=predictor
+                )
+                error = JuliaNumericalControlError(
+                    "synthetic endpoint arithmetic inadequate",
+                    "HORIZON_ARITHMETIC_INADEQUATE",
+                )
+                error.worker_failure = copy.deepcopy(
+                    predecessor.failure_receipt
+                )
+                binary = ComponentResult.from_mapping(
+                    _produced_stage_outcome(
+                        deep, complex(1.0e-8, 2.0e-8)
+                    ).component_result["result"]
+                )
+                binary = replace(
+                    binary,
+                    baseline=replace(
+                        binary.baseline,
+                        truncation_radius=1.0e-12,
+                        resolution_radius=1.0e-12,
+                        seed_path_radius=1.0e-12,
+                        diagnostic_readouts={
+                            family: DiagnosticRootReadout(
+                                omega_delta_from_primary=delta,
+                                determinant_residual_abs=1.0e-13,
+                                determinant_derivative_abs=1.0,
+                                converged=True,
+                            )
+                            for family, delta in {
+                                "truncation": complex(1.0e-12, 0.0),
+                                "resolution": complex(0.0, 1.0e-12),
+                                "seed-path": complex(-1.0e-12, 0.0),
+                            }.items()
+                        },
+                    ),
+                )
+                binary_outcome = _produced_stage_outcome(
+                    deep, complex(1.0e-8, 2.0e-8)
+                )
+                binary_component = {
+                    **binary_outcome.component_result,
+                    "result": binary.to_mapping(),
+                }
+                binary_outcome = type(binary_outcome)(
+                    digits=binary_outcome.digits,
+                    numerical_state=binary_outcome.numerical_state,
+                    component_result=binary_component,
+                    local_disk_radius_abs=binary_outcome.local_disk_radius_abs,
+                    signed_error_channels=synthetic_stage_signed_error_channels(
+                        binary_component,
+                        binary_outcome.local_disk_radius_abs,
+                    ),
+                    deep_diagnostics={
+                        "condition_amplifier_abs": 10.0,
+                        "predicted_reliable_decimal_digits": (
+                            12.0 if sentinel else 8.0
+                        ),
+                        "step_richardson_disagreement_abs": 0.0,
+                        "repeat_polish_delta_abs": 0.0,
+                        "angular_refinement_delta_abs": 0.0,
+                        "independent_path_delta_abs": 0.0,
+                        "diagnostic_ceiling_abs": 1.0e-8,
+                        "denominator_or_calibration_disk_contains_zero": False,
+                    },
+                )
+                with patch(
+                    "windows_solver.response_batches.run_promoted_horizon_component",
+                    return_value=promoted_result,
+                ), patch(
+                    "windows_solver.response_batches.JuliaPrecisionRootBackend",
+                    side_effect=lambda *args, **kwargs: (
+                        promoted_backend
+                        if args[2] == 120
+                        else JuliaPrecisionRootBackend(*args, **kwargs)
+                    ),
+                ):
+                    recovered = self.backend.execute_promoted_stage_after_endpoint_arithmetic(
+                        deep, 120, predecessor
+                    )
+
+                class Backend:
+                    identity = self.plan.backend_identity
+                    precision_capabilities = self.capabilities
+
+                    def execute_stage(self, leaf, digits):
+                        if digits != 64:
+                            raise AssertionError("unexpected ordinary stage")
+                        return binary_outcome
+
+                    def execute_promoted_stage_with_predictor(
+                        self,
+                        leaf,
+                        digits,
+                        previous_outcomes,
+                        response_predictor,
+                    ):
+                        if digits != 80:
+                            raise AssertionError("unexpected promoted stage")
+                        raise error
+
+                    def execute_promoted_stage_after_endpoint_arithmetic(
+                        self, leaf, digits, attempt
+                    ):
+                        if digits != 120:
+                            raise AssertionError("unexpected recovery stage")
+                        return recovered
+
+                selection = build_campaign_selection(
+                    self.plan, role="deep", leaf_ids=(deep.leaf_id,)
+                )
+                with tempfile.TemporaryDirectory() as temporary:
+                    checkpoint = Path(temporary) / "deep-arithmetic.json"
+                    summary = run_campaign_selection(
+                        self.plan,
+                        selection,
+                        Backend(),
+                        checkpoint,
+                        resume=False,
+                    )
+                    validated = validate_campaign_checkpoint(
+                        self.plan, checkpoint
+                    )
+
+                self.assertEqual(summary.records[0].state, expected_state)
+                self.assertEqual(validated.records[0].state, expected_state)
+                self.assertEqual(
+                    tuple(
+                        stage.outcome.digits
+                        for stage in summary.records[0].stages
+                    ),
+                    (64, 120),
+                )
 
 
 if __name__ == "__main__":

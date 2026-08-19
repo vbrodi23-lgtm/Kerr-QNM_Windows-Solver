@@ -234,7 +234,8 @@ def migrate_campaign_checkpoint(
         retained_stages = list(record.stages)
         for index, stage in enumerate(record.stages):
             matches = _endpoint_policy_matches(stage.to_mapping(), changes)
-            if not matches:
+            promoted_component_identity_changed = stage.outcome.digits > 64
+            if not matches and not promoted_component_identity_changed:
                 continue
             affected_leaf_ids.add(record.leaf_id)
             retained_stages = list(record.stages[:index])
@@ -243,7 +244,11 @@ def migrate_campaign_checkpoint(
                 "leaf_id": record.leaf_id,
                 "first_invalidated_stage_index": index,
                 "old_endpoint_policy_identities": sorted(matches),
-                "reason": "ENDPOINT_POLICY_IDENTITY_CHANGED",
+                "reason": (
+                    "ENDPOINT_POLICY_IDENTITY_CHANGED"
+                    if matches
+                    else "SCHEMA7_PROMOTED_COMPONENT_IDENTITY_CHANGED"
+                ),
             })
             break
         migrated = (

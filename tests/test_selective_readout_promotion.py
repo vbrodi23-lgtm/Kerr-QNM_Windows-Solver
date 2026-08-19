@@ -849,6 +849,10 @@ class SelectiveReadoutPromotionTests(unittest.TestCase):
             capabilities,
             generated,
             adapter,
+            ode_error_budgets={
+                80: synthetic_ode_error_budget(80),
+                120: synthetic_ode_error_budget(120),
+            },
         )
         binary64_result = _result(leaf.job, 0.25 + 0.5j)
         previous = SimpleNamespace(

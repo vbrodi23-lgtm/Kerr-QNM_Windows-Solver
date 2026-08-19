@@ -1913,6 +1913,19 @@ def _failed_preflight_recovery_precision_contract() -> dict[str, object]:
     }
 
 
+def _mechanism_failed_preflight_recovery_precision_contract(
+    mechanism_id: str,
+) -> dict[str, object]:
+    """Bind a deep leaf only to the promoted component it can execute."""
+
+    contract = _failed_preflight_recovery_precision_contract()
+    if mechanism_id == "horizon-admittance":
+        contract.pop("exterior_override")
+    else:
+        contract.pop("primary_horizon_override")
+    return contract
+
+
 def _primary_recovery_precision_contract() -> dict[str, object]:
     """Return the canonical PRIMARY promoted-precision policy fragment."""
 
@@ -2260,7 +2273,9 @@ def _leaf_precision_contract(leaf: CampaignLeafPlan) -> dict[str, object]:
         )
     elif leaf.role == "deep":
         contract["failed_preflight_recovery"] = (
-            _failed_preflight_recovery_precision_contract()
+            _mechanism_failed_preflight_recovery_precision_contract(
+                leaf.mechanism_id
+            )
         )
     contract["root_convergence"] = _root_convergence_precision_contract()
     return contract
@@ -4070,6 +4085,28 @@ def _primary_precision120_terminal_state(outcome: StageOutcome) -> str:
     return "PRODUCED" if produced else "UNRESOLVED"
 
 
+def _endpoint_arithmetic_terminal_state(
+    leaf: CampaignLeafPlan,
+    outcome: StageOutcome,
+    *,
+    sentinel: bool,
+) -> str:
+    """Apply the promoted component's terminal rule after endpoint loss."""
+
+    if (
+        leaf.mechanism_id == "horizon-admittance"
+        and _single_promoted_horizon_result(outcome) is not None
+    ):
+        state = _primary_precision120_terminal_state(outcome)
+    else:
+        state = _terminal_state(
+            outcome, enclosed=bool(outcome.discrepancy_enclosed)
+        )
+    if leaf.role == "deep" and sentinel:
+        return "UNRESOLVED"
+    return state
+
+
 class _NonProductionSolvedLeafRecord(ValueError):
     """A valid orchestration record that is ineligible for scientific reuse."""
 
@@ -4383,7 +4420,7 @@ def _validate_component_result(
             "campaign promoted analytic horizon identity is invalid"
         )
     if bounded_horizon and not (
-        leaf.role == "primary"
+        leaf.role in {"primary", "deep"}
         and leaf.mechanism_id == "horizon-admittance"
         and outcome.digits in (80, 120)
         and result.response_method == PROMOTED_HORIZON_RESPONSE_METHOD_V2
@@ -4477,10 +4514,12 @@ def _validate_component_result(
             "failed_preflight_predecessor",
             "comparison_kind",
         }
+        endpoint_arithmetic_fields = {"endpoint_arithmetic_predecessor"}
         if frozenset(payload) not in {
             frozenset(required_payload_fields),
             frozenset(required_payload_fields | {"promotion_decision"}),
             frozenset(required_payload_fields | failed_preflight_fields),
+            frozenset(required_payload_fields | endpoint_arithmetic_fields),
         }:
             raise _UnauthenticatedComponentEvidence(
                 "campaign promoted analytic horizon payload fields are invalid"
@@ -4505,13 +4544,17 @@ def _validate_component_result(
                 "campaign promoted analytic horizon execution evidence is invalid"
             )
         failed_preflight = "failed_preflight_predecessor" in payload
-        if failed_preflight != (
+        endpoint_arithmetic = "endpoint_arithmetic_predecessor" in payload
+        failed_request = failed_preflight or endpoint_arithmetic
+        if failed_request != (
             payload.get("primary_root_predictor_source")
             == "FAILED_80_REQUEST_BINARY64_BASELINE_OMEGA"
         ) or (
             failed_preflight
             and payload.get("comparison_kind")
             != _FAILED_PREFLIGHT_SINGLE_HORIZON_KIND
+        ) or (
+            endpoint_arithmetic and "comparison_kind" in payload
         ):
             raise _UnauthenticatedComponentEvidence(
                 "campaign promoted analytic predictor provenance is invalid"
@@ -5072,16 +5115,22 @@ def _validate_record_semantics(
                     and not record.sentinel
                     and record.sentinel_comparison is None
                 )
-                expected_state = _primary_precision120_terminal_state(
-                    stages[1]
-                )
             else:
-                role_fields_valid = True
-                expected_state = _terminal_state(
-                    stages[1], enclosed=bool(stages[1].discrepancy_enclosed)
+                trigger_ids = _deep_trigger_ids(first)
+                sentinel = leaf.leaf_id in set(
+                    B_PRIME_RELEASE_DOMAIN.fixed_precision_sentinel_leaf_ids
                 )
-                if leaf.role == "deep" and record.sentinel:
-                    expected_state = "UNRESOLVED"
+                role_fields_valid = (
+                    leaf.role == "deep"
+                    and record.trigger_ids == trigger_ids
+                    and record.sentinel is sentinel
+                    and record.sentinel_comparison is None
+                )
+            expected_state = _endpoint_arithmetic_terminal_state(
+                leaf,
+                stages[1],
+                sentinel=record.sentinel,
+            )
             if (
                 not role_fields_valid
                 or record.state != expected_state
@@ -5198,7 +5247,10 @@ def _validate_record_semantics(
         return production
 
     precision80 = stages[1]
-    if (
+    analytic80 = _single_promoted_horizon_result(precision80) is not None
+    if analytic80:
+        _validate_precision120(precision80)
+    elif (
         precision80.deep_diagnostics is not None
         or precision80.self_refinement_enclosed is None
         or precision80.discrepancy_from_previous_abs is None
@@ -5208,6 +5260,10 @@ def _validate_record_semantics(
     expected_comparison = None
     false_negative = False
     if sentinel:
+        if precision80.discrepancy_from_previous_abs is None:
+            raise ValueError(
+                "campaign analytic sentinel lacks binary64 comparison"
+            )
         threshold = 0.25 * first.local_disk_radius_abs
         false_negative = (
             not trigger_ids
@@ -5222,8 +5278,16 @@ def _validate_record_semantics(
         }
     if record.sentinel_comparison != expected_comparison:
         raise ValueError("campaign sentinel comparison is invalid")
-    decision = _deep_precision120_decision(
-        precision80, sentinel_false_negative=false_negative
+    decision = (
+        _deep_precision120_decision(
+            precision80, sentinel_false_negative=True
+        )
+        if false_negative
+        else _primary_precision120_decision(precision80)
+        if analytic80
+        else _deep_precision120_decision(
+            precision80, sentinel_false_negative=False
+        )
     )
     _validate_attached_promotion_decision(
         precision80,
@@ -5250,8 +5314,12 @@ def _validate_record_semantics(
             != _terminal_state(
                 precision80,
                 enclosed=(
-                    bool(precision80.self_refinement_enclosed)
-                    and bool(precision80.discrepancy_enclosed)
+                    True
+                    if analytic80
+                    else (
+                        bool(precision80.self_refinement_enclosed)
+                        and bool(precision80.discrepancy_enclosed)
+                    )
                 ),
             )
             or record.missing_precision_digits is not None
@@ -5271,10 +5339,15 @@ def _validate_record_semantics(
         return production
     precision120 = stages[2]
     _validate_precision120(precision120)
+    analytic120 = _single_promoted_horizon_result(precision120) is not None
     if (
         record.state
-        != _terminal_state(
-            precision120, enclosed=bool(precision120.discrepancy_enclosed)
+        != (
+            _primary_precision120_terminal_state(precision120)
+            if analytic120
+            else _terminal_state(
+                precision120, enclosed=bool(precision120.discrepancy_enclosed)
+            )
         )
         or record.missing_precision_digits is not None
     ):
@@ -5674,20 +5747,17 @@ def _endpoint_arithmetic_recovery_record(
     if embedded is None or embedded.to_mapping() != predecessor.to_mapping():
         raise ValueError("endpoint-arithmetic recovery embedded the wrong attempt")
     _validate_precision120(outcome)
-    if leaf.role == "primary":
-        if not _validate_component_result(
-            leaf, outcome, allow_historical_conditioning_absence=False
-        ):
-            raise ValueError(
-                "endpoint-arithmetic recovery lacks canonical production evidence"
-            )
-        state = _primary_precision120_terminal_state(outcome)
-    else:
-        state = _terminal_state(
-            outcome, enclosed=bool(outcome.discrepancy_enclosed)
+    if not _validate_component_result(
+        leaf, outcome, allow_historical_conditioning_absence=False
+    ):
+        raise ValueError(
+            "endpoint-arithmetic recovery lacks canonical production evidence"
         )
-        if leaf.role == "deep" and record.sentinel:
-            state = "UNRESOLVED"
+    state = _endpoint_arithmetic_terminal_state(
+        leaf,
+        outcome,
+        sentinel=record.sentinel,
+    )
     return CampaignLeafRecord(
         leaf_id=record.leaf_id,
         role=record.role,
@@ -6943,19 +7013,7 @@ def _run_campaign_selection_active(
             if selective80 is not None:
                 pass
             elif analytic80:
-                if (
-                    outcome80.self_refinement_enclosed is not None
-                    or outcome80.component_result.get(
-                        "precision_ladder_discrepancy_applicable"
-                    )
-                    is not False
-                    or outcome80.discrepancy_from_previous_abs is not None
-                    or outcome80.discrepancy_enclosed is not None
-                ):
-                    raise ValueError(
-                        "campaign backend returned incomplete promoted analytic "
-                        "80-digit evidence"
-                    )
+                _validate_precision120(outcome80)
             elif (
                 outcome80.self_refinement_enclosed is None
                 or outcome80.discrepancy_from_previous_abs is None
@@ -7061,6 +7119,10 @@ def _run_campaign_selection_active(
                 comparison = None
                 false_negative = False
                 if record.sentinel:
+                    if outcome80.discrepancy_from_previous_abs is None:
+                        raise ValueError(
+                            "campaign analytic sentinel lacks binary64 comparison"
+                        )
                     threshold = 0.25 * record.stages[0].outcome.local_disk_radius_abs
                     false_negative = (
                         not record.trigger_ids
@@ -7073,8 +7135,16 @@ def _run_campaign_selection_active(
                         "trigger_threshold_abs": threshold,
                         "trigger_policy_false_negative": false_negative,
                     }
-                decision = _deep_precision120_decision(
-                    outcome80, sentinel_false_negative=false_negative
+                decision = (
+                    _deep_precision120_decision(
+                        outcome80, sentinel_false_negative=True
+                    )
+                    if false_negative
+                    else _primary_precision120_decision(outcome80)
+                    if analytic80
+                    else _deep_precision120_decision(
+                        outcome80, sentinel_false_negative=False
+                    )
                 )
                 outcome80 = _stage_with_promotion_decision(outcome80, decision)
                 requires120 = decision["state"] == "REQUESTED"
@@ -7085,8 +7155,12 @@ def _run_campaign_selection_active(
                     state = _terminal_state(
                         outcome80,
                         enclosed=(
-                            bool(outcome80.self_refinement_enclosed)
-                            and bool(outcome80.discrepancy_enclosed)
+                            True
+                            if analytic80
+                            else (
+                                bool(outcome80.self_refinement_enclosed)
+                                and bool(outcome80.discrepancy_enclosed)
+                            )
                         ),
                     )
                     missing = None
@@ -7208,15 +7282,22 @@ def _run_campaign_selection_active(
                 false_negative = (
                     record.state == "INVALID_SENTINEL_FALSE_NEGATIVE"
                 )
+                analytic120 = (
+                    _single_promoted_horizon_result(outcome120) is not None
+                )
                 record = CampaignLeafRecord(
                     leaf_id=record.leaf_id,
                     role=record.role,
                     state=(
                         "INVALID_SENTINEL_FALSE_NEGATIVE"
                         if false_negative
-                        else _terminal_state(
-                            outcome120,
-                            enclosed=bool(outcome120.discrepancy_enclosed),
+                        else (
+                            _primary_precision120_terminal_state(outcome120)
+                            if analytic120
+                            else _terminal_state(
+                                outcome120,
+                                enclosed=bool(outcome120.discrepancy_enclosed),
+                            )
                         )
                     ),
                     stages=(

@@ -13,6 +13,7 @@ import windows_solver.campaign_checkpoint_migration as migration_module
 
 from tests import test_linear_response_precision as precision_tests
 from windows_solver import julia_response_backend as julia_backend
+from windows_solver import response_batches as batch_module
 from windows_solver.campaign_checkpoint_migration import (
     CAMPAIGN_MIGRATION_SCHEMA,
     migrate_campaign_checkpoint,
@@ -216,7 +217,146 @@ def _origin_schema7_stopped_preflight_checkpoint():
     return plan, source
 
 
+def _origin_schema7_promoted_component_checkpoint():
+    fixture = precision_tests.PromotedResourceContainmentTests()
+    plan, capabilities, _, _, _ = fixture._plan_and_leaves()
+    selected = tuple(
+        leaf
+        for leaf in plan.leaves
+        if leaf.role == "primary"
+        and leaf.mechanism_id in {
+            "horizon-admittance",
+            "exterior-light-ring",
+        }
+    )[:2]
+    if {leaf.mechanism_id for leaf in selected} != {
+        "horizon-admittance",
+        "exterior-light-ring",
+    }:
+        selected = (
+            next(
+                leaf for leaf in plan.leaves
+                if leaf.role == "primary"
+                and leaf.mechanism_id == "horizon-admittance"
+            ),
+            next(
+                leaf for leaf in plan.leaves
+                if leaf.role == "primary"
+                and leaf.mechanism_id == "exterior-light-ring"
+            ),
+        )
+        selected = tuple(sorted(
+            selected,
+            key=lambda leaf: tuple(item.leaf_id for item in plan.leaves).index(
+                leaf.leaf_id
+            ),
+        ))
+    selection = batch_module.build_campaign_selection(
+        plan,
+        role="primary",
+        leaf_ids=tuple(leaf.leaf_id for leaf in selected),
+    )
+    provenance = {
+        "precision_factory_identity": (
+            plan.precision_factory_identity.to_mapping()
+        ),
+        "available_precision_digits": list(capabilities.digits),
+    }
+    records = []
+    for leaf in selected:
+        binary = batch_module.CampaignStageRecord(
+            precision_tests._authenticated_primary_stage(
+                leaf, 64, batch_module.ComponentStatus.NOT_CONVERGED
+            ),
+            provenance,
+        )
+        promoted_outcome = precision_tests._authenticated_primary_stage(
+            leaf,
+            80,
+            batch_module.ComponentStatus.CONVERGED,
+            self_refinement_enclosed=True,
+            discrepancy_from_previous_abs=1.0e-9,
+            discrepancy_enclosed=True,
+        )
+        promoted = batch_module.CampaignStageRecord(
+            batch_module._stage_with_promotion_decision(
+                promoted_outcome,
+                batch_module._primary_precision120_decision(
+                    promoted_outcome
+                ),
+            ),
+            provenance,
+        )
+        records.append(batch_module.CampaignLeafRecord(
+            leaf_id=leaf.leaf_id,
+            role=leaf.role,
+            state="PRODUCED",
+            stages=(binary, promoted),
+        ))
+    mapping = batch_module._checkpoint_mapping(
+        plan, selection, tuple(records)
+    )
+    mapping["schema_version"] = 7
+    _bind_origin_schema7(mapping)
+    precision_tests.reseal(mapping)
+    return plan, canonical_json_bytes(mapping)
+
+
 class CampaignCheckpointMigrationTests(unittest.TestCase):
+    def test_schema7_promoted_component_suffixes_are_invalidated_by_identity(self):
+        plan, source_bytes = _origin_schema7_promoted_component_checkpoint()
+        historical = json.loads(source_bytes)
+        leaf_by_id = {leaf.leaf_id: leaf for leaf in plan.leaves}
+        self.assertEqual(
+            {
+                leaf_by_id[record["leaf_id"]].mechanism_id
+                for record in historical["records"]
+            },
+            {"horizon-admittance", "exterior-light-ring"},
+        )
+        self.assertTrue(all(
+            record["stages"][1]["component_result"]["evidence_kind"]
+            == "package-owned-julia-promoted-component-engine"
+            for record in historical["records"]
+        ))
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "promoted-schema7.json"
+            destination = root / "schema8.json"
+            source.write_bytes(source_bytes)
+
+            migrate_campaign_checkpoint(
+                source,
+                destination,
+                plan=plan,
+                expected_source_sha256=hashlib.sha256(
+                    source_bytes
+                ).hexdigest(),
+                changed_endpoint_policy_identities={},
+            )
+
+            migrated = json.loads(destination.read_bytes())
+            validate_campaign_checkpoint(plan, destination)
+            self.assertEqual(len(migrated["records"]), 2)
+            for old, new in zip(historical["records"], migrated["records"]):
+                self.assertEqual(len(old["stages"]), 2)
+                self.assertEqual(new["stages"], old["stages"][:1])
+                self.assertEqual(new["state"], "IN_PROGRESS")
+            receipt = json.loads(
+                destination.with_name(
+                    f"{destination.name}.migration-receipt.json"
+                ).read_bytes()
+            )
+            invalidated = [
+                item for item in receipt["invalidated_evidence"]
+                if item["evidence_kind"] == "campaign-stage-suffix"
+            ]
+            self.assertEqual(len(invalidated), 2)
+            self.assertEqual(
+                {item["reason"] for item in invalidated},
+                {"SCHEMA7_PROMOTED_COMPONENT_IDENTITY_CHANGED"},
+            )
+
     def test_origin_schema7_preflight_request_migrates_without_current_budget(self):
         plan, source_bytes = _origin_schema7_stopped_preflight_checkpoint()
         with tempfile.TemporaryDirectory() as temporary:

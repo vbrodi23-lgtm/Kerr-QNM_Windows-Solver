@@ -199,15 +199,26 @@ class CampaignPlanTests(unittest.TestCase):
             leaf
             for leaf in plan.leaves
             if leaf.role == "deep"
-            and leaf.mechanism_id != "horizon-admittance"
+            and leaf.mechanism_id == "exterior-light-ring"
         )
 
-        horizon = response_batches._leaf_precision_contract(deep_horizon)[
-            "failed_preflight_recovery"
-        ]["primary_horizon_override"]
-        exterior = response_batches._leaf_precision_contract(deep_exterior)[
-            "failed_preflight_recovery"
-        ]["exterior_override"]
+        horizon_contract = response_batches._leaf_precision_contract(
+            deep_horizon
+        )["failed_preflight_recovery"]
+        exterior_contract = response_batches._leaf_precision_contract(
+            deep_exterior
+        )["failed_preflight_recovery"]
+        self.assertIn("primary_horizon_override", horizon_contract)
+        self.assertNotIn("exterior_override", horizon_contract)
+        self.assertIn("exterior_override", exterior_contract)
+        self.assertNotIn("primary_horizon_override", exterior_contract)
+        horizon = horizon_contract["primary_horizon_override"]
+        exterior = exterior_contract["exterior_override"]
+        comprehensive = (
+            response_batches._failed_preflight_recovery_precision_contract()
+        )
+        self.assertIn("primary_horizon_override", comprehensive)
+        self.assertIn("exterior_override", comprehensive)
         self.assertEqual(
             horizon["component_scientific_identity"],
             "single-promoted-root-bounded-analytic-horizon-component/v2",
@@ -232,6 +243,14 @@ class CampaignPlanTests(unittest.TestCase):
         self.assertNotEqual(
             scientific_computation_identity_sha256(plan, deep_exterior),
             hashlib.sha256(canonical_json_bytes(historical)).hexdigest(),
+        )
+        self.assertEqual(
+            scientific_computation_identity_sha256(plan, deep_horizon),
+            "1ca6eeef17446d2b93b261fab0b1ec907fea37780f65c6e9eea10e1413664800",
+        )
+        self.assertEqual(
+            scientific_computation_identity_sha256(plan, deep_exterior),
+            "13c0c8d488a5bad61548c016aafad3eeade00afcc5f32163d551831d05d20662",
         )
 
     def test_current_and_schema7_scientific_contracts_are_distinct(self) -> None:
@@ -314,7 +333,7 @@ class CampaignPlanTests(unittest.TestCase):
             )
             self.assertEqual(
                 scientific_computation_identity_sha256(plan, deep),
-                "6dafc7823d248b32fef7c393b4b7cfeeeb39b287c51d89c88ec17423bdb911ff",
+                "1ca6eeef17446d2b93b261fab0b1ec907fea37780f65c6e9eea10e1413664800",
             )
 
         leaf = primary

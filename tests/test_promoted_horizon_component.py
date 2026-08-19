@@ -691,6 +691,10 @@ class PromotedHorizonStageTests(unittest.TestCase):
             PrecisionCapabilities((64, 80, 120)),
             generated,
             SimpleNamespace(),
+            ode_error_budgets={
+                80: synthetic_ode_error_budget(80),
+                120: synthetic_ode_error_budget(120),
+            },
         )
 
     def _record_with_receipt_predictor(self, receipt_predictor):
@@ -821,6 +825,52 @@ class PromotedHorizonStageTests(unittest.TestCase):
         self.assertEqual(backends[80].calls, [(deep.job, 0.0j, predictor)])
         self.assertEqual(backends[120].calls, [(deep.job, 0.0j, predictor)])
 
+    def test_horizon_mechanism_precedes_stale_selective_recovery_plan(self):
+        plan = build_campaign_plan(
+            policy=NumericalPolicy(),
+            backend_identity=VettedNativeDeterminantKernel.identity,
+            precision_capabilities=PrecisionCapabilities((64, 80, 120)),
+        )
+        deep = next(
+            leaf
+            for leaf in plan.leaves
+            if leaf.role == "deep"
+            and leaf.mechanism_id == "horizon-admittance"
+        )
+        predictor = deep.job.root.omega + complex(2.0e-5, -1.0e-5)
+        previous_result = replace(
+            _binary64_nonconverged_result(deep.job, predictor),
+            resolved_window={
+                "readout_specific_promotion_plan": [
+                    {
+                        "epsilon": deep.job.policy.epsilons[0],
+                        "readout_roles": ["real-plus"],
+                    }
+                ],
+                "next_precision_tier": "bigfloat-80",
+            },
+        )
+        previous = _stage_from_result(64, previous_result)
+        promoted_backend = FakeJuliaPrecisionBackend(
+            deep.job, _promoted_baseline(deep.job), 80
+        )
+
+        with patch(
+            "windows_solver.response_batches.JuliaPrecisionRootBackend",
+            return_value=promoted_backend,
+        ), patch(
+            "windows_solver.response_batches.run_selective_readout_promotion"
+        ) as selective:
+            outcome = self.backend.execute_promoted_stage_with_predictor(
+                deep, 80, (previous,), response_predictor=None
+            )
+
+        selective.assert_not_called()
+        self.assertEqual(outcome.digits, 80)
+        self.assertEqual(
+            promoted_backend.calls, [(deep.job, 0.0j, predictor)]
+        )
+
     def test_julia80_uses_binary64_baseline_as_single_root_predictor(self):
         predictor = complex(0.70001, -0.12002)
         previous_result = _binary64_nonconverged_result(
@@ -849,6 +899,7 @@ class PromotedHorizonStageTests(unittest.TestCase):
             self.leaf.job.backend_identity,
             self.backend.julia_adapter,
             80,
+            ode_error_budget=synthetic_ode_error_budget(80),
         )
         self.assertEqual(
             julia_backend.calls,

@@ -75,6 +75,29 @@ Add the newest completed task or milestone-control entry immediately below this 
   885 tests with 7 skips; compile, manifest, board, and diff checks passed. No
   prohibited numerical or PowerShell entry point was executed, and TASK-079
   remains In Progress pending operator and human-math evidence.
+- **Final identity/dispatch re-review:** The real Native campaign now recovers
+  typed endpoint arithmetic directly from authenticated 80-digit failure to
+  120 digits without fabricating a legacy stage; frozen origin/main schema-7
+  source, factory, request, and precision bindings migrate to current schema 8;
+  and promoted dispatch/contracts are mechanism-scoped so deep horizon leaves
+  use bounded analytic evidence while all deep exterior leaves use fixed-root
+  derivative evidence. Retained historical stage mappings remain byte-for-byte
+  unchanged. Migration publishes its checkpoint/receipt pair transactionally
+  with source-race rollback, and the interruption script launches the current
+  PowerShell executable using quoted `-File` arguments. Focused synthetic/static
+  regressions and compilation passed; no prohibited scientific or operator
+  execution occurred.
+- **Deep-horizon reload and migration closure:** Schema-7 migration now cuts
+  every leaf record at its first promoted stage because both historical
+  horizon and exterior promoted calculations changed, while the retained
+  binary64 `CampaignStageRecord` mappings remain identical. Deep-leaf
+  scientific identities are mechanism-scoped. Bounded analytic deep-horizon
+  evidence now survives checkpoint validation/resume, including direct
+  80-control-failure to 120-digit endpoint-arithmetic recovery: a converged
+  non-sentinel is `PRODUCED`, while the sentinel audit remains `UNRESOLVED`.
+  The affected 158-test safe regression and full 895-test discovery passed
+  (7 skipped), together with compilation, manifest, board, and diff checks.
+  No prohibited scientific or PowerShell entry point was executed.
 
 ## 2026-08-18 — TASK-079 promoted horizon component reduced to a single Julia readout
 
