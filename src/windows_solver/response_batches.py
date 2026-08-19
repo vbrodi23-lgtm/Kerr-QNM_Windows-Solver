@@ -121,6 +121,13 @@ _SCHEMA7_CAMPAIGN_SOURCE_SHA256 = (
 _SCHEMA7_ENGINE_SOURCE_SHA256 = (
     "6bc9938b91d7de59669574b89b58a6bec8335d48f8b0678815350b0fba977be4"
 )
+# The backend that produced the schema-7 checkpoints. The promoted readout
+# policy and worker wire schema have both moved since, so the current plan's
+# backend identity is a different digest; authenticating a schema-7 source
+# against it would reject the real stopped checkpoint as forged.
+_SCHEMA7_BACKEND_IDENTITY_SHA256 = (
+    "035f123f04d02079c6e7d7bed5255069c6152d53be266185b303af8c48c36f5c"
+)
 _SCHEMA7_PRECISION_CONTRACT_SHA256 = (
     "3f6364f6fc28eebeeb788af20524f8ada3c97f23e41fb68f4ead3da365368dcb"
 )
@@ -2667,6 +2674,7 @@ def _schema7_campaign_bindings(plan: CampaignPlan) -> dict[str, object]:
         "schema_version": 2,
         "engine_source_sha256": _SCHEMA7_ENGINE_SOURCE_SHA256,
         "campaign_source_sha256": _SCHEMA7_CAMPAIGN_SOURCE_SHA256,
+        "backend_identity_sha256": _SCHEMA7_BACKEND_IDENTITY_SHA256,
         "precision_factory_identity": (
             _schema7_precision_factory_identity().to_mapping()
         ),
