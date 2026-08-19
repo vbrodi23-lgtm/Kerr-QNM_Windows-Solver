@@ -1,4 +1,4 @@
-# Promoted-Control Empirical Calibration v1 Design
+# Promoted-Control Empirical Calibration Design
 
 ## Authority and readiness boundary
 
@@ -51,7 +51,7 @@ receipt_derivative_floor_abs = null
 
 The null floor is not converted to zero and is not a claim of calibration.
 `CALIBRATION_DOMAIN_EXCEEDED` is reserved for a future receipt that contains a
-positive numeric floor. V1 calculation instead requires a finite positive
+positive numeric floor. The current calculation instead requires a finite positive
 current-run authenticated derivative lower bound:
 
 ```text
@@ -114,7 +114,7 @@ root_error_radius_abs = determinant_error_abs / L
 
 and exists only when both the determinant certificate and positive derivative
 lower bound are authenticated. The existing determinant-derivative route is the
-v1 production route. A new variational exterior-ODE derivative engine is out of
+current production route. A new variational exterior-ODE derivative engine is out of
 scope; the full signed-amplitude ladder remains validation-only.
 
 ## Native boundary and invalidation

@@ -426,13 +426,9 @@ _NUMERICAL_CONDITIONING_BOOLEAN_FIELDS = (
     "precision_limited",
     "asymptotic_preflight_avoided_ode",
 )
-_HORIZON_ENDPOINT_ORDER_LIMITED = "insufficient-series-order/" + "v" + "1"
-_HORIZON_ENDPOINT_PRECISION_LIMITED = (
-    "insufficient-arithmetic-precision/" + "v" + "1"
-)
-_HORIZON_ENDPOINT_GEOMETRY_LIMITED = (
-    "insufficient-geometric-depth/" + "v" + "1"
-)
+_HORIZON_ENDPOINT_ORDER_LIMITED = "insufficient-series-order/v1"
+_HORIZON_ENDPOINT_PRECISION_LIMITED = "insufficient-arithmetic-precision/v1"
+_HORIZON_ENDPOINT_GEOMETRY_LIMITED = "insufficient-geometric-depth/v1"
 
 
 def _conditioning_decimal_from_text(value: object, subject: str) -> Decimal:

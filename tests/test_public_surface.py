@@ -1177,6 +1177,17 @@ $candidate | ConvertTo-Json -Compress | Set-Content -LiteralPath $env:M02_TEST_J
             "M02_Production_LightRing_A9999_Response_Recovery_v1.ps1",
             "selective-signed-root-promotion-component/v1/",
             "unavailable/v1",
+            "insufficient-series-order/v1",
+            "insufficient-arithmetic-precision/v1",
+            "insufficient-geometric-depth/v1",
+            "promoted-control-empirical-calibration/v1",
+            "exterior-determinant-absolute-error-certificate/empirical-v1",
+            "operator-approved/v1",
+            "permitted/v1",
+            "blocked-pending-independent-review/v1",
+            "empirical-current-run-only/v1",
+            "data/promoted_control_empirical_calibration_v1.json",
+            "data/promoted_control_derivative_lower_bound_source_audit_v1.json",
         })
         lineage_character = r"A-Za-z0-9_/:;=+\-"
         approved_identity = re.compile(

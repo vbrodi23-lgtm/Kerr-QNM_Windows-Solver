@@ -1,4 +1,4 @@
-# Promoted-Control Empirical Calibration v1 Implementation Plan
+# Promoted-Control Empirical Calibration Implementation Plan
 
 **Goal:** Replace the impossible historical-floor blocker with the
 operator-approved, SHA-bound empirical control receipt and make every promoted
@@ -40,7 +40,7 @@ kernel definitions, production outputs, and all pre-existing receipts.
    - Add strict loader/override tests for digest mismatch, noncanonical bytes,
      wrong schema/status, absent family/tier, and changed identity invalidation.
    - Implement the receipt data model, canonical loader, and family/tier
-     empirical-control provider. V1 entries are not serialized
+     empirical-control provider. Current entries are not serialized
      determinant-to-ODE mathematical budgets.
    - Reuse the established BigFloat-80 ODE controls for BigFloat-40 while
      preserving its existing root-search step bounds; introduce no new numeric
@@ -66,7 +66,7 @@ kernel definitions, production outputs, and all pre-existing receipts.
    - Centralize `L = |D'| - step_disagreement_abs - propagated_error_abs`, reject
      nonpositive current-run bounds, and calculate empirical root disks as
      `determinant_error_abs / L`.
-   - Keep the existing authenticated determinant-derivative engine in v1; do
+   - Keep the existing authenticated determinant-derivative engine unchanged; do
      not add a variational exterior-ODE engine.
 
 4. **Regression and review checkpoint**

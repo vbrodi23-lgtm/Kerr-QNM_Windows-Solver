@@ -1,6 +1,6 @@
 """Operator-approved empirical controls for promoted determinant work.
 
-The v1 receipt deliberately does not claim a calibrated determinant-to-ODE
+The current receipt deliberately does not claim a calibrated determinant-to-ODE
 conversion or an archived derivative floor.  It authenticates the controls
 that may be used to produce test-only evidence and requires each usable result
 to carry current-run determinant and derivative error evidence.
@@ -60,7 +60,7 @@ SOURCE_AUDIT_RESOURCE = (
 # Replaced only when the canonical committed receipt changes.  It is not read
 # from a sidecar that could be changed together with the receipt.
 DEFAULT_CALIBRATION_RECEIPT_SHA256 = (
-    "d39b7f648a7f3de3a3dcfa20de3217c8b4cd78aa7a1deb17b5483a99120bcd58"
+    "3353a1836e520f1e360cf30feb898e132c63db8ba5e691eb01b1ed01533243de"
 )
 
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
@@ -106,6 +106,12 @@ class DerivativeAuthenticationUnavailable(ValueError):
     """A current-run derivative lower bound or empirical disk is unavailable."""
 
     code = DERIVATIVE_AUTHENTICATION_UNAVAILABLE
+
+
+class ExteriorDeterminantCertificateUnavailable(ValueError):
+    """A promoted exterior determinant lacks one mandatory error term."""
+
+    code = EXTERIOR_DETERMINANT_CERTIFICATE_UNAVAILABLE
 
 
 def _exact_fields(
@@ -263,6 +269,39 @@ def authenticated_derivative_lower_bound_abs(
             "current derivative lower bound is not positive"
         )
     return lower_bound
+
+
+def empirical_exterior_determinant_error_abs(
+    *,
+    delta_same_point: float | None,
+    delta_cross_precision: float | None,
+    delta_endpoint_series: float | None,
+) -> float:
+    """Return the operator-approved three-term empirical certificate."""
+
+    try:
+        disagreements = tuple(float(value) for value in (
+            delta_same_point,
+            delta_cross_precision,
+            delta_endpoint_series,
+        ))
+    except (TypeError, ValueError) as error:
+        raise ExteriorDeterminantCertificateUnavailable(
+            "all exterior determinant disagreement classes are required"
+        ) from error
+    if any(
+        not math.isfinite(value) or value < 0.0
+        for value in disagreements
+    ):
+        raise ExteriorDeterminantCertificateUnavailable(
+            "exterior determinant disagreements must be finite and nonnegative"
+        )
+    certificate = 64.0 * max(disagreements)
+    if not math.isfinite(certificate):
+        raise ExteriorDeterminantCertificateUnavailable(
+            "exterior determinant certificate is not finite"
+        )
+    return certificate
 
 
 def empirical_root_error_radius_abs(
@@ -502,7 +541,7 @@ def load_calibration_receipt(
 
 
 def load_default_calibration_receipt() -> PromotedControlCalibrationReceipt:
-    """Load the module-pinned committed canonical v1 receipt."""
+    """Load the module-pinned committed canonical calibration receipt."""
 
     package = files("windows_solver")
     try:
