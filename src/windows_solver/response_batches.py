@@ -132,6 +132,24 @@ _SCHEMA7_ENGINE_SOURCE_SHA256 = (
 _SCHEMA7_PRECISION_CONTRACT_SHA256 = (
     "3f6364f6fc28eebeeb788af20524f8ada3c97f23e41fb68f4ead3da365368dcb"
 )
+_SCHEMA7_ORDERED_LEAF_SET_SHA256 = (
+    "b84cbba359285dae8f283d11dff1c5ff63f4e7a03c5b77f5f0ebc09703016599"
+)
+_SCHEMA7_ROOT_SET_SHA256 = (
+    "477a3bcb8d629ba890bbb320723e365743685bdb89f23382d5ce22fbbbcc0a3f"
+)
+_SCHEMA7_POLICY_SHA256 = (
+    "2d7cee336c6126a11bccd652ee35e73de60837e9418476849b9026cd27bf6171"
+)
+_SCHEMA7_BACKEND_IDENTITY_SHA256 = (
+    "035f123f04d02079c6e7d7bed5255069c6152d53be266185b303af8c48c36f5c"
+)
+_SCHEMA7_PRECISION_CAPABILITIES_SHA256 = (
+    "7b4eda35c340dc53cf8a11bd5c657cddb1b04faa55a991ea874a13be6ee09b78"
+)
+_SCHEMA7_COHORT_SET_SHA256 = (
+    "ec538cf3ae5a11b4a16808e779a5721dc713ea9e1c67e6d94bdd248815d5f421"
+)
 _PROMOTION_DECISION_CHECKPOINT_SCHEMA_VERSION = 6
 _FAILED_PREFLIGHT_CHECKPOINT_SCHEMA_VERSION = 6
 _PRECISION_DIGITS = frozenset({64, 80, 120})
@@ -2743,17 +2761,23 @@ def _schema7_precision_factory_identity() -> PrecisionFactoryIdentity:
     )
 
 
-def _schema7_campaign_bindings(plan: CampaignPlan) -> dict[str, object]:
-    bindings = dict(plan.bindings)
-    bindings.update({
+def _schema7_campaign_bindings(_plan: CampaignPlan) -> dict[str, object]:
+    return {
         "schema_version": 2,
+        "ordered_leaf_set_sha256": _SCHEMA7_ORDERED_LEAF_SET_SHA256,
+        "root_set_sha256": _SCHEMA7_ROOT_SET_SHA256,
+        "policy_sha256": _SCHEMA7_POLICY_SHA256,
         "engine_source_sha256": _SCHEMA7_ENGINE_SOURCE_SHA256,
         "campaign_source_sha256": _SCHEMA7_CAMPAIGN_SOURCE_SHA256,
+        "backend_identity_sha256": _SCHEMA7_BACKEND_IDENTITY_SHA256,
+        "precision_capabilities_sha256": (
+            _SCHEMA7_PRECISION_CAPABILITIES_SHA256
+        ),
         "precision_factory_identity": (
             _schema7_precision_factory_identity().to_mapping()
         ),
-    })
-    return bindings
+        "cohort_set_sha256": _SCHEMA7_COHORT_SET_SHA256,
+    }
 
 
 def _schema7_selection_mapping(

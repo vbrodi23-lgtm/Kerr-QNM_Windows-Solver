@@ -343,6 +343,29 @@ def _origin_schema7_promoted_component_checkpoint():
 
 
 class CampaignCheckpointMigrationTests(unittest.TestCase):
+    def test_schema7_binding_uses_frozen_origin_not_current_platform_plan(self):
+        """Historical authentication cannot depend on current float rebuilds."""
+
+        plan, source_bytes = _stopped_schema7_checkpoint()
+        drifted_bindings = copy.deepcopy(plan.bindings)
+        drifted_bindings["root_set_sha256"] = "0" * 64
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / "schema7.json"
+            source.write_bytes(source_bytes)
+            with patch.object(
+                batch_module.CampaignPlan,
+                "bindings",
+                property(lambda _self: drifted_bindings),
+            ):
+                _selection, records, attempts, state, version = (
+                    batch_module._load_checkpoint_with_attempts(plan, source)
+                )
+
+        self.assertEqual(version, 7)
+        self.assertEqual(state, "PARTIAL")
+        self.assertTrue(records)
+        self.assertTrue(attempts)
+
     def test_invalidated_retry_predecessor_normalizes_missing_precision(self):
         for failure_code in (
             "INSUFFICIENT_ASYMPTOTIC_PRECISION",
