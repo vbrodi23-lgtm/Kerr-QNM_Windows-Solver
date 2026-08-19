@@ -3,6 +3,7 @@ from decimal import Decimal, localcontext
 from fractions import Fraction
 import hashlib
 import math
+from collections.abc import Mapping
 
 from windows_solver.contracts import canonical_json_bytes
 from windows_solver.adaptive_controls import ODEToleranceCalibration, derive_ode_error_budget
@@ -37,26 +38,128 @@ def synthetic_ode_error_budget(digits: int):
     )
 
 
-def valid_horizon_endpoint_search_evidence() -> list[dict[str, object]]:
-    def candidate(rho: str, endpoint_order: int, adequate: bool):
+def valid_horizon_endpoint_search_evidence(
+    request_binding: Mapping[str, object] | None = None,
+) -> list[dict[str, object]]:
+    policy = (
+        request_binding.get("policy", {})
+        if isinstance(request_binding, Mapping)
+        else {}
+    )
+    base_order = int(policy.get("endpoint_series_order", 28))
+    maximum_order = int(
+        policy.get("horizon_endpoint_maximum_order", 4 * base_order)
+    )
+    orders = []
+    order = base_order
+    while order < maximum_order:
+        orders.append(order)
+        order += order
+    orders.append(maximum_order)
+
+    def candidate(
+        rho: str,
+        attempted_endpoint_order: int,
+        adequate: bool,
+        ingoing_prefix: int,
+        outgoing_prefix: int,
+        limitation: str,
+    ):
+        if limitation in {
+            "adequate/v1", "insufficient-geometric-depth/v1"
+        }:
+            conditioning = {
+                "binding_predicted_reliable_digits": None,
+                "maximum_last_term_ratio": None,
+                "maximum_recurrence_digits_lost": None,
+                "maximum_series_evaluation_digits_lost": None,
+                "maximum_truncation_digits_lost": None,
+            }
+        else:
+            precision_limited = (
+                limitation == "insufficient-arithmetic-precision/v1"
+            )
+            conditioning = {
+                "binding_predicted_reliable_digits": "20",
+                "maximum_last_term_ratio": "0.5",
+                "maximum_recurrence_digits_lost": (
+                    "2" if precision_limited else "1"
+                ),
+                "maximum_series_evaluation_digits_lost": (
+                    "2" if precision_limited else "1"
+                ),
+                "maximum_truncation_digits_lost": "3",
+            }
         return {
             "rho": rho,
-            "endpoint_order": endpoint_order,
-            "ingoing_best_prefix_order": endpoint_order - 2,
-            "outgoing_best_prefix_order": endpoint_order - 1,
+            "attempted_endpoint_order": attempted_endpoint_order,
+            "endpoint_order": max(ingoing_prefix, outgoing_prefix),
+            "ingoing_best_prefix_order": ingoing_prefix,
+            "outgoing_best_prefix_order": outgoing_prefix,
             "ingoing_adequate": adequate,
             "outgoing_adequate": adequate,
+            "limitation": limitation,
+            "precision_limited": (
+                limitation == "insufficient-arithmetic-precision/v1"
+            ),
+            "limitation_conditioning": conditioning,
         }
+
+    raw_rhos = list(policy.get(
+        "horizon_endpoint_rho_candidates",
+        ["-10", "-25", "-50", "-75", "-100"],
+    ))
+    rho_floor = Decimal(policy.get("horizon_endpoint_rho_floor", "-400"))
+    rhos = [Decimal(value) for value in raw_rhos]
+    while min(rhos) > rho_floor:
+        current = min(rhos)
+        for _ in range(2):
+            current *= Decimal(3) / Decimal(2)
+            if current < rho_floor:
+                current = rho_floor
+            if current not in rhos:
+                rhos.append(current)
+            if current == rho_floor:
+                break
+    rho_text = [str(value) for value in rhos]
+    selected_rhos = sorted(rhos, reverse=True)[:2]
+    selected_text = {str(value) for value in selected_rhos}
+    selected_order = orders[1] if len(orders) > 1 else orders[0]
+    rejected_candidates = []
+    for trial_order in orders:
+        if trial_order > selected_order:
+            break
+        for rho in rho_text:
+            if trial_order == selected_order and rho in selected_text:
+                continue
+            rejected_candidates.append(candidate(
+                rho,
+                trial_order,
+                False,
+                max(4, trial_order - 12),
+                max(4, trial_order - 8),
+                "insufficient-series-order/v1",
+            ))
 
     return [{
         "outcome": "adequate/v1",
-        "policy_identity": "fixture-horizon-endpoint-policy/v1",
+        "policy_identity": policy.get(
+            "horizon_endpoint_recovery_policy_identity",
+            "adaptive-horizon-endpoint-recovery/v1",
+        ),
         "selected_pair": [
-            candidate("-100", 30, True),
-            candidate("-120", 30, True),
+            candidate(
+                str(rho),
+                selected_order,
+                True,
+                max(4, selected_order - 16),
+                max(4, selected_order - 12),
+                "adequate/v1",
+            )
+            for rho in selected_rhos
         ],
-        "rejected_candidates": [candidate("-80", 30, False)],
-        "endpoint_orders": [30, 38],
+        "rejected_candidates": rejected_candidates,
+        "endpoint_orders": orders,
         "homogeneous_rhs_evaluations_before_pair": 0,
     }]
 
@@ -234,6 +337,7 @@ def current_promoted_component_payload(
         WORKER_RESPONSE_WIRE_SCHEMA,
         regularised_gsn_precision_policy,
     )
+    from windows_solver.julia_response_backend import JuliaPrecisionRootBackend
 
     mapping = valid_numerical_conditioning(result.mechanism_id)
     mapping.update({
@@ -264,7 +368,14 @@ def current_promoted_component_payload(
         ).hexdigest(),
     }
 
-    def conditioned(readout, readout_id):
+    request_backend = JuliaPrecisionRootBackend(
+        leaf.job.backend_identity,
+        object(),
+        digits,
+        ode_error_budget=synthetic_ode_error_budget(digits),
+    )
+
+    def conditioned(readout, readout_id, amplitude):
         correction_tolerance = Decimal("2e-11")
         derivative = Decimal(str(readout.determinant_derivative_abs))
         normalised = Decimal(str(readout.determinant_residual_abs))
@@ -355,27 +466,10 @@ def current_promoted_component_payload(
             seed_path_executed=False,
             seed_path_determinant_count=0,
         )
-        request_binding = {
-            "schema_version": 1,
-            "operation": "root-readout",
-            "job_id": leaf.job.job_id,
-            "leaf_id": leaf.leaf_id,
-            "role": leaf.role,
-            "mechanism_id": leaf.mechanism_id,
-            "job_policy_sha256": leaf.job.policy.identity_sha256,
-            "backend_identity_sha256": (
-                leaf.job.backend_identity.identity_sha256
-            ),
-            "precision_digits": digits,
-            "refinement_level": 0,
-            "synthetic_readout_id": readout_id,
-            "policy": {
-                "root_correction_tolerance": str(correction_tolerance),
-                "promoted_root_readout_policy": (
-                    PROMOTED_ROOT_READOUT_POLICY
-                ),
-            },
-        }
+        del readout_id
+        request_binding = request_backend.preview_root_request(
+            leaf.job, amplitude
+        )
         receipt_material = {
             "schema": WORKER_RESPONSE_RECEIPT_SCHEMA,
             "request_binding": request_binding,
@@ -400,7 +494,7 @@ def current_promoted_component_payload(
                 canonical_json_bytes(primary.to_mapping())
             ).hexdigest(),
             "horizon_endpoint_search_evidence": (
-                valid_horizon_endpoint_search_evidence()
+                valid_horizon_endpoint_search_evidence(request_binding)
                 if evidence.scattering_diagnostics_applicable
                 else None
             ),
@@ -418,20 +512,26 @@ def current_promoted_component_payload(
     levels = tuple(
         replace(
             level,
-            real_plus=conditioned(level.real_plus, f"level-{index}-real-plus"),
-            real_minus=conditioned(level.real_minus, f"level-{index}-real-minus"),
+            real_plus=conditioned(
+                level.real_plus, f"level-{index}-real-plus", level.epsilon
+            ),
+            real_minus=conditioned(
+                level.real_minus, f"level-{index}-real-minus", -level.epsilon
+            ),
             imaginary_plus=conditioned(
-                level.imaginary_plus, f"level-{index}-imaginary-plus"
+                level.imaginary_plus, f"level-{index}-imaginary-plus",
+                complex(0.0, level.epsilon),
             ),
             imaginary_minus=conditioned(
-                level.imaginary_minus, f"level-{index}-imaginary-minus"
+                level.imaginary_minus, f"level-{index}-imaginary-minus",
+                complex(0.0, -level.epsilon),
             ),
         )
         for index, level in enumerate(result.levels)
     )
     conditioned_result = replace(
         result,
-        baseline=conditioned(result.baseline, "baseline"),
+        baseline=conditioned(result.baseline, "baseline", 0.0j),
         levels=levels,
     )
     payload: dict[str, object] = {
@@ -498,21 +598,104 @@ def valid_control_failure_diagnostics(
     }
     if failure_code in horizon_outcomes:
         outcome = horizon_outcomes[failure_code]
+        rhos = (
+            "-10", "-25", "-50", "-75", "-100", "-150", "-225",
+            "-337.5", "-400",
+        )
+        endpoint_orders = (28, 56, 112)
+        rejected_candidates = []
+        if failure_code == "HORIZON_GEOMETRY_EXHAUSTED":
+            rejected_candidates.extend({
+                "rho": rho,
+                "attempted_endpoint_order": None,
+                "endpoint_order": None,
+                "ingoing_best_prefix_order": None,
+                "outgoing_best_prefix_order": None,
+                "ingoing_adequate": False,
+                "outgoing_adequate": False,
+                "limitation": "insufficient-geometric-depth/v1",
+                "precision_limited": False,
+                "limitation_conditioning": {
+                    "binding_predicted_reliable_digits": None,
+                    "maximum_last_term_ratio": None,
+                    "maximum_recurrence_digits_lost": None,
+                    "maximum_series_evaluation_digits_lost": None,
+                    "maximum_truncation_digits_lost": None,
+                },
+            } for rho in rhos)
+        elif failure_code != "HORIZON_COORDINATE_INVERSION_FAILED":
+            for endpoint_order in endpoint_orders:
+                for rho in rhos:
+                    verified = (
+                        failure_code == "HORIZON_ONLY_ONE_ENDPOINT"
+                        and rho == "-10"
+                        and endpoint_order == endpoint_orders[0]
+                    )
+                    if (
+                        failure_code == "HORIZON_ONLY_ONE_ENDPOINT"
+                        and rho == "-10"
+                        and endpoint_order != endpoint_orders[0]
+                    ):
+                        continue
+                    rejected_candidates.append({
+                        "rho": rho,
+                        "attempted_endpoint_order": endpoint_order,
+                        "endpoint_order": max(4, endpoint_order - 8),
+                        "ingoing_best_prefix_order": max(
+                            4, endpoint_order - 12
+                        ),
+                        "outgoing_best_prefix_order": max(
+                            4, endpoint_order - 8
+                        ),
+                        "ingoing_adequate": verified,
+                        "outgoing_adequate": verified,
+                        "limitation": (
+                            "adequate/v1" if verified else (
+                                "insufficient-arithmetic-precision/v1"
+                                if failure_code
+                                == "HORIZON_ARITHMETIC_INADEQUATE"
+                                else "insufficient-series-order/v1"
+                            )
+                        ),
+                        "precision_limited": (
+                            not verified
+                            and failure_code
+                            == "HORIZON_ARITHMETIC_INADEQUATE"
+                        ),
+                        "limitation_conditioning": (
+                            {
+                                "binding_predicted_reliable_digits": None,
+                                "maximum_last_term_ratio": None,
+                                "maximum_recurrence_digits_lost": None,
+                                "maximum_series_evaluation_digits_lost": None,
+                                "maximum_truncation_digits_lost": None,
+                            }
+                            if verified
+                            else {
+                                "binding_predicted_reliable_digits": "20",
+                                "maximum_last_term_ratio": "0.5",
+                                "maximum_recurrence_digits_lost": (
+                                    "2" if failure_code
+                                    == "HORIZON_ARITHMETIC_INADEQUATE"
+                                    else "1"
+                                ),
+                                "maximum_series_evaluation_digits_lost": (
+                                    "2" if failure_code
+                                    == "HORIZON_ARITHMETIC_INADEQUATE"
+                                    else "1"
+                                ),
+                                "maximum_truncation_digits_lost": "3",
+                            }
+                        ),
+                    })
         return {
             "recovery_outcome": outcome,
             "recovery_evidence": {
                 "outcome": outcome,
                 "policy_identity": "adaptive-horizon-endpoint-recovery/v1",
                 "selected_pair": [],
-                "rejected_candidates": [{
-                    "rho": "-0.008",
-                    "endpoint_order": 28,
-                    "ingoing_best_prefix_order": 24,
-                    "outgoing_best_prefix_order": 20,
-                    "ingoing_adequate": False,
-                    "outgoing_adequate": False,
-                }],
-                "endpoint_orders": [28, 36, 44],
+                "rejected_candidates": rejected_candidates,
+                "endpoint_orders": list(endpoint_orders),
                 "homogeneous_rhs_evaluations_before_pair": 0,
             },
             "next_precision_tier_allowed": (
@@ -1057,6 +1240,6 @@ def valid_julia_root_response(
             request["mechanism_id"]
         ),
         "horizon_endpoint_search_evidence": (
-            valid_horizon_endpoint_search_evidence() if horizon else None
+            valid_horizon_endpoint_search_evidence(request) if horizon else None
         ),
     }

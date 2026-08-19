@@ -195,6 +195,7 @@ class ReceiptCompatibilityTests(unittest.TestCase):
         )
 
     def _runtime(self, job, policy):
+        budget = synthetic_ode_error_budget(80).to_mapping()
         return {
             "julia_version": "1.10.11",
             "julia_executable_sha256": "a" * 64,
@@ -206,6 +207,10 @@ class ReceiptCompatibilityTests(unittest.TestCase):
             "working_precision_bits": math.ceil(80 * math.log2(10)) + 32,
             "refinement_level": 0,
             "regularised_gsn_precision_policy": dict(policy),
+            "ode_error_budget": budget,
+            "ode_error_budget_sha256": hashlib.sha256(
+                canonical_json_bytes(budget)
+            ).hexdigest(),
         }
 
     def _readout(self, job, runtime):
@@ -260,7 +265,7 @@ class ReceiptCompatibilityTests(unittest.TestCase):
                 canonical_json_bytes(primary.to_mapping())
             ).hexdigest(),
             "horizon_endpoint_search_evidence": (
-                valid_horizon_endpoint_search_evidence()
+                valid_horizon_endpoint_search_evidence(request_binding)
                 if horizon
                 else None
             ),

@@ -7,7 +7,7 @@ explicit injected component backend.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from contextvars import ContextVar
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
@@ -63,6 +63,8 @@ from .response_engine import (
     regularised_gsn_precision_policy,
     root_readout_preserves_authenticated_branch,
     regularised_gsn_mechanism_contract,
+    _response_ladder_recovery,
+    _response_ladder_recovery_record,
     _validate_promoted_horizon_checkpoint_evidence_for_job,
     run_component,
     run_promoted_exterior_component,
@@ -100,6 +102,11 @@ from .julia_response_backend import (
     promoted_precision_numerical_controls,
     worker_failure_payload as _julia_worker_failure_payload,
 )
+
+# Keep checkpoint authentication independent of campaign-test/backend injection.
+# Execution may replace ``JuliaPrecisionRootBackend`` with a fake at the stage
+# boundary; canonical request reconstruction must always use the real builder.
+_CanonicalRequestJuliaPrecisionRootBackend = JuliaPrecisionRootBackend
 from .root_readout_cache import runtime_identity_sha256
 from .progress import PROGRESS_SCHEMA, ProgressEventKind, emit_progress, progress_scope
 from .solved_leaf_cache import (
@@ -859,7 +866,11 @@ _RETRYABLE_NUMERICAL_CONTROL_FAILURE_CODES = frozenset({
 })
 
 
-def _validated_attempt_failure_receipt(value: object) -> dict[str, object]:
+def _validated_attempt_failure_receipt(
+    value: object,
+    *,
+    checkpoint_schema_version: int = CAMPAIGN_CHECKPOINT_SCHEMA_VERSION,
+) -> dict[str, object]:
     if not isinstance(value, Mapping):
         raise ValueError("campaign execution attempt receipt is invalid")
     probe = JuliaResponseBackendError("attempt receipt validation")
@@ -880,7 +891,12 @@ def _validated_attempt_failure_receipt(value: object) -> dict[str, object]:
     if code in NUMERICAL_CONTROL_FAILURE_CODES and (
         failure.get("retryable")
         is not (code in _RETRYABLE_NUMERICAL_CONTROL_FAILURE_CODES)
-        or not _valid_numerical_control_diagnostics(failure)
+        or not _valid_numerical_control_diagnostics(
+            failure,
+            allow_historical_schema7_policy=(
+                checkpoint_schema_version == 7
+            ),
+        )
     ):
         raise ValueError(
             "campaign execution attempt receipt numerical-control diagnostics "
@@ -1012,6 +1028,11 @@ class CampaignExecutionAttempt:
     failure_code: str
     failure_receipt: Mapping[str, object]
     created_at_utc: str
+    _checkpoint_schema_version: int = field(
+        default=CAMPAIGN_CHECKPOINT_SCHEMA_VERSION,
+        compare=False,
+        repr=False,
+    )
 
     def __post_init__(self) -> None:
         if self.attempt_ordinal < 1 or self.leaf_index < 1:
@@ -1022,7 +1043,10 @@ class CampaignExecutionAttempt:
             raise ValueError("campaign execution attempt failure code is invalid")
         if self.state != _CONTAINABLE_FAILURE_STATES[self.failure_code]:
             raise ValueError("campaign execution attempt state is invalid")
-        receipt = _validated_attempt_failure_receipt(self.failure_receipt)
+        receipt = _validated_attempt_failure_receipt(
+            self.failure_receipt,
+            checkpoint_schema_version=self._checkpoint_schema_version,
+        )
         failure = receipt["failure"]
         assert isinstance(failure, Mapping)
         if failure["failure_code"] != self.failure_code:
@@ -1076,7 +1100,12 @@ class CampaignExecutionAttempt:
         return {**self.content, "attempt_sha256": self.attempt_sha256}
 
     @classmethod
-    def from_mapping(cls, value: object) -> "CampaignExecutionAttempt":
+    def from_mapping(
+        cls,
+        value: object,
+        *,
+        checkpoint_schema_version: int = CAMPAIGN_CHECKPOINT_SCHEMA_VERSION,
+    ) -> "CampaignExecutionAttempt":
         if not isinstance(value, Mapping) or set(value) != {
             "attempt_ordinal",
             "leaf_id",
@@ -1117,6 +1146,7 @@ class CampaignExecutionAttempt:
             failure_code=value["failure_code"],
             failure_receipt=value["failure_receipt"],
             created_at_utc=value["created_at_utc"],
+            _checkpoint_schema_version=checkpoint_schema_version,
         )
         if value["attempt_sha256"] != attempt.attempt_sha256:
             raise ValueError("campaign execution attempt digest is invalid")
@@ -2981,7 +3011,10 @@ def _read_checkpoint_envelope(
         ):
             raise ValueError("campaign checkpoint attempts digest is invalid")
         attempts = tuple(
-            CampaignExecutionAttempt.from_mapping(item) for item in raw_attempts
+            CampaignExecutionAttempt.from_mapping(
+                item, checkpoint_schema_version=version
+            )
+            for item in raw_attempts
         )
     return value, bindings, records, attempts
 
@@ -3913,12 +3946,53 @@ def _validate_selective_stage(
             "campaign selective stage runtime disagrees with tier evidence"
         )
     terminal_readouts = _component_readouts_by_amplitude(result)
-    if any(
-        expected_terminal_readouts.get(amplitude) != readout
-        for amplitude, readout in terminal_readouts.items()
-    ):
+    if terminal_readouts != expected_terminal_readouts:
         raise _UnauthenticatedComponentEvidence(
-            "campaign selective terminal readouts disagree with tier journals"
+            "campaign selective terminal readouts disagree with tier journals "
+            f"(terminal={sorted(map(str, terminal_readouts))}, "
+            f"expected={sorted(map(str, expected_terminal_readouts))})"
+        )
+    recovery_projection = _response_ladder_recovery(leaf.job, result.levels)
+    expected_window_projection = _response_ladder_recovery_record(
+        leaf.job, result.levels, recovery_projection
+    )
+    if result.status is not ComponentStatus.CONVERGED:
+        expected_window_projection["next_precision_tier"] = {
+            PrecisionTier.BIGFLOAT_40.value: PrecisionTier.BIGFLOAT_80.value,
+            PrecisionTier.BIGFLOAT_80.value: PrecisionTier.BIGFLOAT_120.value,
+            PrecisionTier.BIGFLOAT_120.value: None,
+        }[trace[-1]]
+        if not expected_window_projection.get(
+            "readout_specific_promotion_plan"
+        ):
+            expected_window_projection[
+                "readout_specific_promotion_plan"
+            ] = [dict(item) for item in current_plan]
+    projection_fields = {
+        "recovery_disposition",
+        "candidate_windows",
+        "signal_noise_ratios",
+        "selected_window",
+        "excluded_fine_levels",
+        "window_diagnostics",
+        "branch_margins",
+        "exact_added_epsilons",
+        "amplitudes_to_add",
+        "readout_specific_promotion_plan",
+        "next_precision_tier",
+    }
+    if any(
+        window.get(field) != expected_window_projection.get(field)
+        for field in projection_fields
+    ):
+        mismatched_projection_fields = sorted(
+            field
+            for field in projection_fields
+            if window.get(field) != expected_window_projection.get(field)
+        )
+        raise _UnauthenticatedComponentEvidence(
+            "campaign selective resolved-window projection is invalid: "
+            + ", ".join(mismatched_projection_fields)
         )
     for readout in result.raw_readouts:
         if not root_readout_preserves_authenticated_branch(
@@ -4569,6 +4643,81 @@ def _validate_current_promoted_runtime(
                 raise _UnauthenticatedComponentEvidence(
                     "campaign promoted worker response receipt identity is invalid"
                 )
+            if (
+                receipt.get("schema") == WORKER_RESPONSE_RECEIPT_SCHEMA
+                and conditioning_schemas == {NUMERICAL_CONDITIONING_SCHEMA}
+            ):
+                if validated_budget is None:
+                    raise _UnauthenticatedComponentEvidence(
+                        "campaign current promoted canonical request lacks an "
+                        "ODE budget"
+                    )
+
+                def request_complex(
+                    raw: object, subject: str
+                ) -> complex:
+                    if not isinstance(raw, Mapping) or set(raw) != {
+                        "real", "imaginary"
+                    }:
+                        raise _UnauthenticatedComponentEvidence(
+                            f"campaign promoted {subject} is invalid"
+                        )
+                    try:
+                        parts = tuple(
+                            Decimal(raw[name]) for name in ("real", "imaginary")
+                        )
+                    except (InvalidOperation, TypeError, ValueError) as error:
+                        raise _UnauthenticatedComponentEvidence(
+                            f"campaign promoted {subject} is invalid"
+                        ) from error
+                    if not all(part.is_finite() for part in parts):
+                        raise _UnauthenticatedComponentEvidence(
+                            f"campaign promoted {subject} is invalid"
+                        )
+                    return complex(*(float(part) for part in parts))
+
+                amplitude = request_complex(
+                    binding.get("amplitude"), "request amplitude"
+                )
+                raw_predictor = binding.get("primary_predictor")
+                predictor = (
+                    None
+                    if raw_predictor is None
+                    else request_complex(raw_predictor, "request predictor")
+                )
+                predictor_kind = binding.get("primary_predictor_kind")
+                if predictor_kind is not None and not isinstance(
+                    predictor_kind, str
+                ):
+                    raise _UnauthenticatedComponentEvidence(
+                        "campaign promoted request predictor kind is invalid"
+                    )
+                try:
+                    observed_resource = _validated_execution_resource_policy(
+                        binding.get("execution_resource")
+                    )
+                    expected_request = _CanonicalRequestJuliaPrecisionRootBackend(
+                        leaf.job.backend_identity,
+                        object(),
+                        outcome.digits,
+                        refinement=expected_refinement_level,
+                        ode_error_budget=validated_budget,
+                    ).preview_root_request(
+                        leaf.job,
+                        amplitude,
+                        predictor,
+                        predictor_kind,
+                    )
+                except (JuliaResponseBackendError, ValueError) as error:
+                    raise _UnauthenticatedComponentEvidence(
+                        "campaign promoted canonical worker request is invalid"
+                    ) from error
+                expected_request["execution_resource"] = observed_resource
+                if dict(binding) != expected_request:
+                    raise _UnauthenticatedComponentEvidence(
+                        "campaign promoted canonical worker request disagrees "
+                        "with the active job"
+                    )
 
 
 def _validate_component_result(
@@ -8507,6 +8656,8 @@ class NativeCampaignStageBackend:
             raise ValueError(
                 "campaign leaf backend identity does not match native backend"
             )
+        if leaf.role == "control":
+            return None
         promoted_digits = tuple(
             digits
             for digits in self.precision_capabilities.digits

@@ -24,12 +24,14 @@ from windows_solver.response_batches import (
     NativeCampaignStageBackend,
     PrecisionCapabilities,
     build_campaign_plan,
+    scientific_computation_identity_sha256,
 )
 from windows_solver.response_engine import (
     NumericalPolicy,
     VettedNativeDeterminantKernel,
     _journaled_promoted_exterior_backend,
 )
+from tests.fixtures import synthetic_ode_error_budget
 
 
 CALIBRATION = ODEToleranceCalibration(
@@ -243,6 +245,42 @@ class AdaptiveODEBudgetTests(unittest.TestCase):
         with self.assertRaises(MissingODECalibrationError) as caught:
             backend.scientific_execution_contract_for(leaf)
         self.assertEqual(str(caught.exception), ODE_CALIBRATION_BLOCKER)
+
+    def test_control_leaf_contract_ignores_unreachable_promoted_budgets(self) -> None:
+        plan = build_campaign_plan(
+            policy=NumericalPolicy(),
+            backend_identity=VettedNativeDeterminantKernel.identity,
+            precision_capabilities=PrecisionCapabilities((64, 80, 120)),
+        )
+        leaf = next(item for item in plan.leaves if item.role == "control")
+        missing = NativeCampaignStageBackend(
+            object(), plan.precision_capabilities, object(), julia_adapter=object()
+        )
+        changed = NativeCampaignStageBackend(
+            object(),
+            plan.precision_capabilities,
+            object(),
+            julia_adapter=object(),
+            ode_error_budgets={
+                80: synthetic_ode_error_budget(80),
+                120: synthetic_ode_error_budget(120),
+            },
+        )
+
+        self.assertIsNone(missing.scientific_execution_contract_for(leaf))
+        self.assertIsNone(changed.scientific_execution_contract_for(leaf))
+        self.assertEqual(
+            scientific_computation_identity_sha256(
+                plan,
+                leaf,
+                scientific_execution_contract=missing.scientific_execution_contract_for(leaf),
+            ),
+            scientific_computation_identity_sha256(
+                plan,
+                leaf,
+                scientific_execution_contract=changed.scientific_execution_contract_for(leaf),
+            ),
+        )
 
     def test_changed_ode_budget_rejects_existing_journal_plan(self) -> None:
         job = self._job()

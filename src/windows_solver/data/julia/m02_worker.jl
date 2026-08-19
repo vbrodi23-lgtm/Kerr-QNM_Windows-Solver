@@ -842,6 +842,10 @@ function flatten_request(document)
     # that path.
     if mechanism == "horizon-admittance"
         for key in (
+            "horizon_endpoint_recovery_policy_identity",
+            "horizon_endpoint_maximum_order",
+            "horizon_endpoint_prefix_minimum_order",
+            "horizon_endpoint_prefix_order_step",
             "horizon_contour",
             "determinant_error_model",
             "control_profile_label",
@@ -2319,6 +2323,26 @@ function horizon_endpoint_recovery_failure(request, outcome, evidence)
     )
 end
 
+function canonical_horizon_coordinate_failure_evidence(request)
+    endpoint_base_order = parse_integer(request, "endpoint_series_order")
+    endpoint_orders = CF.horizon_endpoint_order_ladder(
+        endpoint_base_order;
+        maximum_order=horizon_endpoint_maximum_order(
+            request, endpoint_base_order
+        ),
+    )
+    return Dict{String,Any}(
+        "outcome" => CF.COORDINATE_INVERSION_FAILURE,
+        "policy_identity" => string(required(
+            request, "horizon_endpoint_recovery_policy_identity"
+        )),
+        "selected_pair" => Any[],
+        "rejected_candidates" => Any[],
+        "endpoint_orders" => endpoint_orders,
+        "homogeneous_rhs_evaluations_before_pair" => 0,
+    )
+end
+
 function translate_numerical_control_failure(
     request,
     failure;
@@ -2920,7 +2944,7 @@ function evaluate_horizon_determinant(
         throw(horizon_endpoint_recovery_failure(
             request,
             CF.COORDINATE_INVERSION_FAILURE,
-            Dict("coordinate_failure" => failure_details(failure)),
+            canonical_horizon_coordinate_failure_evidence(request),
         ))
     end
     rho_candidates = horizon_endpoint_rho_candidates(T, request)
@@ -2960,7 +2984,15 @@ function evaluate_horizon_determinant(
         required_digits;
         maximum_horizon_distance=maximum_horizon_distance,
         endpoint_orders=endpoint_orders,
-        policy_identity=phase_control_identity(request),
+        prefix_minimum_order=parse_integer(
+            request, "horizon_endpoint_prefix_minimum_order"
+        ),
+        prefix_order_step=parse_integer(
+            request, "horizon_endpoint_prefix_order_step"
+        ),
+        policy_identity=string(required(
+            request, "horizon_endpoint_recovery_policy_identity"
+        )),
     )
     candidates = endpoint_recovery.candidates
     progress_emit("horizon_endpoint_search_completed"; payload=Dict(
@@ -3191,6 +3223,7 @@ function emit_horizon_endpoint_candidate(candidate)
         "horizon_contour_id" => geometry.contour_id,
         "ingoing_adequate" => candidate.ingoing_adequate,
         "outgoing_adequate" => candidate.outgoing_adequate,
+        "attempted_endpoint_order" => candidate.attempted_endpoint_order,
         "endpoint_order" => candidate.endpoint_order,
         "ingoing_best_prefix_order" =>
             candidate.ingoing_evaluation === nothing ? nothing :

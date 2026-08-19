@@ -426,6 +426,13 @@ _NUMERICAL_CONDITIONING_BOOLEAN_FIELDS = (
     "precision_limited",
     "asymptotic_preflight_avoided_ode",
 )
+_HORIZON_ENDPOINT_ORDER_LIMITED = "insufficient-series-order/" + "v" + "1"
+_HORIZON_ENDPOINT_PRECISION_LIMITED = (
+    "insufficient-arithmetic-precision/" + "v" + "1"
+)
+_HORIZON_ENDPOINT_GEOMETRY_LIMITED = (
+    "insufficient-geometric-depth/" + "v" + "1"
+)
 
 
 def _conditioning_decimal_from_text(value: object, subject: str) -> Decimal:
@@ -446,6 +453,12 @@ def _sha256(value: object) -> str:
 
 def _validated_successful_horizon_endpoint_search_evidence(
     value: object,
+    request_binding: Mapping[str, object],
+    *,
+    expected_outcome: str = "adequate/v1",
+    required_selected_count: int = 2,
+    allow_historical_schema7_policy: bool = False,
+    require_complete_candidate_schedule: bool = True,
 ) -> list[dict[str, object]]:
     """Authenticate persisted successful adaptive endpoint selections."""
 
@@ -462,7 +475,7 @@ def _validated_successful_horizon_endpoint_search_evidence(
         "endpoint_orders",
         "homogeneous_rhs_evaluations_before_pair",
     }
-    candidate_fields = {
+    historical_candidate_fields = {
         "rho",
         "endpoint_order",
         "ingoing_best_prefix_order",
@@ -470,9 +483,105 @@ def _validated_successful_horizon_endpoint_search_evidence(
         "ingoing_adequate",
         "outgoing_adequate",
     }
+    candidate_fields = historical_candidate_fields | {
+        "attempted_endpoint_order",
+        "limitation",
+        "limitation_conditioning",
+        "precision_limited",
+    }
+    limitation_conditioning_fields = {
+        "binding_predicted_reliable_digits",
+        "maximum_last_term_ratio",
+        "maximum_recurrence_digits_lost",
+        "maximum_series_evaluation_digits_lost",
+        "maximum_truncation_digits_lost",
+    }
 
-    def candidate(item: object, *, selected: bool) -> tuple[str, int]:
-        if not isinstance(item, dict) or set(item) != candidate_fields:
+    policy = request_binding.get("policy")
+    if not isinstance(policy, Mapping):
+        raise ValueError("horizon endpoint request policy is missing")
+    try:
+        base_order = policy["endpoint_series_order"]
+        if allow_historical_schema7_policy:
+            policy_identity = policy.get(
+                "horizon_endpoint_recovery_policy_identity",
+                "adaptive-horizon-endpoint-recovery/v1",
+            )
+            maximum_order = policy.get(
+                "horizon_endpoint_maximum_order", 4 * base_order
+            )
+            prefix_minimum = policy.get(
+                "horizon_endpoint_prefix_minimum_order", 4
+            )
+            prefix_step = policy.get("horizon_endpoint_prefix_order_step", 4)
+        else:
+            policy_identity = policy[
+                "horizon_endpoint_recovery_policy_identity"
+            ]
+            maximum_order = policy["horizon_endpoint_maximum_order"]
+            prefix_minimum = policy["horizon_endpoint_prefix_minimum_order"]
+            prefix_step = policy["horizon_endpoint_prefix_order_step"]
+        rho_floor = _conditioning_decimal_from_text(
+            policy["horizon_endpoint_rho_floor"], "horizon endpoint rho floor"
+        )
+        contour_floor = _conditioning_decimal_from_text(
+            policy["horizon_rho_inner_min"], "horizon inner contour floor"
+        )
+        rho_schedule = [
+            _conditioning_decimal_from_text(item, "horizon endpoint rho candidate")
+            for item in policy["horizon_endpoint_rho_candidates"]
+        ]
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError("horizon endpoint request policy is invalid") from error
+    if (
+        not isinstance(policy_identity, str)
+        or not policy_identity
+        or any(
+            isinstance(item, bool) or not isinstance(item, int) or item < 1
+            for item in (base_order, maximum_order, prefix_minimum, prefix_step)
+        )
+        or maximum_order < base_order
+        or rho_floor >= 0
+        or contour_floor != rho_floor
+        or not rho_schedule
+        or any(rho >= 0 or rho < rho_floor for rho in rho_schedule)
+        or len(rho_schedule) != len(set(rho_schedule))
+    ):
+        raise ValueError("horizon endpoint request policy is invalid")
+    while min(rho_schedule) > rho_floor:
+        current = min(rho_schedule)
+        for _ in range(2):
+            current *= Decimal(3) / Decimal(2)
+            if current < rho_floor:
+                current = rho_floor
+            if current not in rho_schedule:
+                rho_schedule.append(current)
+            if current == rho_floor:
+                break
+    expected_rho_schedule = tuple(rho_schedule)
+    expected_rhos = frozenset(expected_rho_schedule)
+    expected_orders: list[int] = []
+    order = base_order
+    while order < maximum_order:
+        expected_orders.append(order)
+        order += order
+    expected_orders.append(maximum_order)
+
+    def allowed_prefix_orders(maximum: int) -> frozenset[int]:
+        values = list(range(prefix_minimum, maximum + 1, prefix_step))
+        if not values or values[-1] != maximum:
+            values.append(maximum)
+        return frozenset(values)
+
+    def candidate(
+        item: object, *, selected: bool
+    ) -> tuple[Decimal, int | None]:
+        expected_fields = (
+            historical_candidate_fields
+            if allow_historical_schema7_policy
+            else candidate_fields
+        )
+        if not isinstance(item, dict) or set(item) != expected_fields:
             raise ValueError("horizon endpoint candidate evidence is invalid")
         try:
             rho = _conditioning_decimal_from_text(
@@ -482,24 +591,63 @@ def _validated_successful_horizon_endpoint_search_evidence(
             raise ValueError(
                 "horizon endpoint candidate evidence is invalid"
             ) from error
-        order = item["endpoint_order"]
-        prefix_orders = (
+        best_order = item["endpoint_order"]
+        attempted_order = (
+            best_order
+            if allow_historical_schema7_policy
+            else item["attempted_endpoint_order"]
+        )
+        candidate_prefix_orders = (
             item["ingoing_best_prefix_order"],
             item["outgoing_best_prefix_order"],
         )
         if (
-            rho >= 0
-            or isinstance(order, bool)
-            or not isinstance(order, int)
-            or order < 1
+            rho not in expected_rhos
+            or (
+                attempted_order is not None
+                and (
+                    isinstance(attempted_order, bool)
+                    or not isinstance(attempted_order, int)
+                    or attempted_order not in expected_orders
+                )
+            )
+            or (selected and attempted_order is None)
+            or (
+                best_order is not None
+                and (
+                    isinstance(best_order, bool)
+                    or not isinstance(best_order, int)
+                    or attempted_order is None
+                    or best_order not in allowed_prefix_orders(
+                        attempted_order
+                    )
+                )
+            )
             or any(
                 value is not None
                 and (
                     isinstance(value, bool)
                     or not isinstance(value, int)
-                    or value < 1
+                    or attempted_order is None
+                    or value not in allowed_prefix_orders(attempted_order)
                 )
-                for value in prefix_orders
+                for value in candidate_prefix_orders
+            )
+            or (
+                attempted_order is None
+                and any(value is not None for value in candidate_prefix_orders)
+            )
+            or (
+                best_order is None
+                and any(value is not None for value in candidate_prefix_orders)
+            )
+            or (
+                not allow_historical_schema7_policy
+                and best_order is not None
+                and (
+                    any(value is None for value in candidate_prefix_orders)
+                    or best_order != max(candidate_prefix_orders)
+                )
             )
             or type(item["ingoing_adequate"]) is not bool
             or type(item["outgoing_adequate"]) is not bool
@@ -508,12 +656,127 @@ def _validated_successful_horizon_endpoint_search_evidence(
                 and (
                     item["ingoing_adequate"] is not True
                     or item["outgoing_adequate"] is not True
-                    or any(value is None for value in prefix_orders)
+                    or any(value is None for value in candidate_prefix_orders)
                 )
             )
         ):
             raise ValueError("horizon endpoint candidate evidence is invalid")
-        return str(rho), order
+        if not allow_historical_schema7_policy:
+            limitation = item["limitation"]
+            precision_limited = item["precision_limited"]
+            limitation_conditioning = item["limitation_conditioning"]
+            allowed_limitations = {
+                "adequate/v1",
+                _HORIZON_ENDPOINT_ORDER_LIMITED,
+                _HORIZON_ENDPOINT_PRECISION_LIMITED,
+                _HORIZON_ENDPOINT_GEOMETRY_LIMITED,
+            }
+            both_adequate = (
+                item["ingoing_adequate"] is True
+                and item["outgoing_adequate"] is True
+            )
+            if (
+                not isinstance(limitation_conditioning, dict)
+                or set(limitation_conditioning)
+                != limitation_conditioning_fields
+            ):
+                raise ValueError(
+                    "horizon endpoint limitation conditioning is invalid"
+                )
+            raw_conditioning = tuple(limitation_conditioning.values())
+            if both_adequate or attempted_order is None:
+                if any(value is not None for value in raw_conditioning):
+                    raise ValueError(
+                        "horizon endpoint limitation conditioning is invalid"
+                    )
+                recomputed_limitation = (
+                    "adequate/v1" if both_adequate
+                    else _HORIZON_ENDPOINT_GEOMETRY_LIMITED
+                )
+            elif all(value is None for value in raw_conditioning):
+                recomputed_limitation = _HORIZON_ENDPOINT_GEOMETRY_LIMITED
+            elif any(value is None for value in raw_conditioning):
+                raise ValueError(
+                    "horizon endpoint limitation conditioning is incomplete"
+                )
+            else:
+                try:
+                    predicted = _conditioning_decimal_from_text(
+                        limitation_conditioning[
+                            "binding_predicted_reliable_digits"
+                        ],
+                        "horizon endpoint binding reliable digits",
+                    )
+                    last_term_ratio = _conditioning_decimal_from_text(
+                        limitation_conditioning[
+                            "maximum_last_term_ratio"
+                        ],
+                        "horizon endpoint maximum last-term ratio",
+                    )
+                    recurrence_loss = _conditioning_decimal_from_text(
+                        limitation_conditioning[
+                            "maximum_recurrence_digits_lost"
+                        ],
+                        "horizon endpoint recurrence digits lost",
+                    )
+                    evaluation_loss = _conditioning_decimal_from_text(
+                        limitation_conditioning[
+                            "maximum_series_evaluation_digits_lost"
+                        ],
+                        "horizon endpoint evaluation digits lost",
+                    )
+                    truncation_loss = _conditioning_decimal_from_text(
+                        limitation_conditioning[
+                            "maximum_truncation_digits_lost"
+                        ],
+                        "horizon endpoint truncation digits lost",
+                    )
+                except ValueError as error:
+                    raise ValueError(
+                        "horizon endpoint limitation conditioning is invalid"
+                    ) from error
+                if (
+                    not predicted.is_finite()
+                    or any(value < 0 for value in (
+                        last_term_ratio,
+                        recurrence_loss,
+                        evaluation_loss,
+                        truncation_loss,
+                    ))
+                ):
+                    raise ValueError(
+                        "horizon endpoint limitation conditioning is invalid"
+                    )
+                if last_term_ratio >= 1:
+                    recomputed_limitation = _HORIZON_ENDPOINT_GEOMETRY_LIMITED
+                elif recurrence_loss + evaluation_loss >= truncation_loss:
+                    recomputed_limitation = _HORIZON_ENDPOINT_PRECISION_LIMITED
+                else:
+                    recomputed_limitation = _HORIZON_ENDPOINT_ORDER_LIMITED
+            if (
+                limitation not in allowed_limitations
+                or type(precision_limited) is not bool
+                or limitation != recomputed_limitation
+                or precision_limited
+                is not (
+                    recomputed_limitation
+                    == _HORIZON_ENDPOINT_PRECISION_LIMITED
+                )
+                or (
+                    attempted_order is None
+                    and (
+                        limitation != _HORIZON_ENDPOINT_GEOMETRY_LIMITED
+                        or precision_limited is not False
+                        or best_order is not None
+                        or item["ingoing_adequate"] is not False
+                        or item["outgoing_adequate"] is not False
+                    )
+                )
+            ):
+                raise ValueError(
+                    "horizon endpoint candidate limitation is invalid"
+                )
+        return rho, attempted_order
 
     for item in canonical:
         if not isinstance(item, dict) or set(item) != evidence_fields:
@@ -522,11 +785,10 @@ def _validated_successful_horizon_endpoint_search_evidence(
         rejected = item["rejected_candidates"]
         orders = item["endpoint_orders"]
         if (
-            item["outcome"] != "adequate/v1"
-            or not isinstance(item["policy_identity"], str)
-            or not item["policy_identity"]
+            item["outcome"] != expected_outcome
+            or item["policy_identity"] != policy_identity
             or not isinstance(selected_pair, list)
-            or len(selected_pair) != 2
+            or len(selected_pair) != required_selected_count
             or not isinstance(rejected, list)
             or not isinstance(orders, list)
             or not orders
@@ -536,18 +798,211 @@ def _validated_successful_horizon_endpoint_search_evidence(
                 or order < 1
                 for order in orders
             )
-            or orders != sorted(set(orders))
+            or orders != expected_orders
             or item["homogeneous_rhs_evaluations_before_pair"] != 0
         ):
             raise ValueError("horizon endpoint search evidence is invalid")
-        identities = [
+        selected_identities = [
             candidate(raw, selected=True) for raw in selected_pair
         ]
-        identities.extend(
+        rejected_identities = [
             candidate(raw, selected=False) for raw in rejected
-        )
+        ]
+        identities = selected_identities + rejected_identities
         if len(identities) != len(set(identities)):
             raise ValueError("horizon endpoint candidates are not unique")
+        if allow_historical_schema7_policy:
+            continue
+        if not require_complete_candidate_schedule:
+            if selected_pair or rejected:
+                raise ValueError(
+                    "horizon coordinate failure carries endpoint trials"
+                )
+            continue
+
+        candidate_by_identity = {
+            identity: raw
+            for identity, raw in zip(
+                identities, (*selected_pair, *rejected), strict=True
+            )
+        }
+        observed_rhos = {rho for rho, _ in identities}
+        if observed_rhos != expected_rhos:
+            raise ValueError("horizon endpoint candidate schedule is incomplete")
+
+        invalid_rhos: set[Decimal] = set()
+        verified_by_rho: dict[Decimal, dict[str, object]] = {}
+        last_order_by_rho: dict[Decimal, int] = {}
+        for rho in expected_rho_schedule:
+            rho_trials = [
+                (order, candidate_by_identity[(candidate_rho, order)])
+                for candidate_rho, order in identities
+                if candidate_rho == rho
+            ]
+            invalid = [trial for order, trial in rho_trials if order is None]
+            ordered = [
+                trial for order, trial in sorted(
+                    (
+                        (order, trial) for order, trial in rho_trials
+                        if order is not None
+                    ),
+                    key=lambda pair: expected_orders.index(pair[0]),
+                )
+            ]
+            if invalid:
+                invalid_trial = invalid[0]
+                if (
+                    len(invalid) != 1
+                    or ordered
+                    or invalid_trial["ingoing_best_prefix_order"] is not None
+                    or invalid_trial["outgoing_best_prefix_order"] is not None
+                    or invalid_trial["ingoing_adequate"] is not False
+                    or invalid_trial["outgoing_adequate"] is not False
+                ):
+                    raise ValueError(
+                        "horizon endpoint invalid geometry was retried"
+                    )
+                invalid_rhos.add(rho)
+                continue
+            observed_orders = [
+                trial["attempted_endpoint_order"] for trial in ordered
+            ]
+            if (
+                not observed_orders
+                or observed_orders
+                != expected_orders[:len(observed_orders)]
+            ):
+                raise ValueError(
+                    "horizon endpoint trial order progression is incomplete"
+                )
+            adequate_trials = [
+                trial for trial in ordered
+                if trial["ingoing_adequate"] is True
+                and trial["outgoing_adequate"] is True
+            ]
+            if len(adequate_trials) > 1 or (
+                adequate_trials and adequate_trials[0] is not ordered[-1]
+            ):
+                raise ValueError(
+                    "horizon endpoint verified geometry was retried"
+                )
+            if adequate_trials:
+                verified_by_rho[rho] = adequate_trials[0]
+            last_order_by_rho[rho] = observed_orders[-1]
+
+        selected_expected = [
+            trial for rho, trial in sorted(
+                verified_by_rho.items(), key=lambda pair: pair[0], reverse=True
+            )[:required_selected_count]
+        ]
+        if required_selected_count:
+            if len(verified_by_rho) < required_selected_count:
+                raise ValueError("horizon endpoint selected pair is incomplete")
+            stop_order = min(
+                order for order in expected_orders
+                if sum(
+                    trial["attempted_endpoint_order"] <= order
+                    for trial in verified_by_rho.values()
+                ) >= required_selected_count
+            )
+            if selected_pair != selected_expected:
+                raise ValueError(
+                    "horizon endpoint selected pair is not the nearest "
+                    "adequate pair"
+                )
+            if any(
+                last_order_by_rho[rho] != (
+                    verified_by_rho[rho]["attempted_endpoint_order"]
+                    if rho in verified_by_rho
+                    else stop_order
+                )
+                for rho in expected_rho_schedule
+                if rho not in invalid_rhos
+            ):
+                raise ValueError(
+                    "horizon endpoint success trial schedule is incomplete"
+                )
+        else:
+            adequate_count = len(verified_by_rho)
+            if expected_outcome == "fewer-than-two-verified-endpoints/v1":
+                expected_adequate_count = 1
+            else:
+                expected_adequate_count = 0
+            if adequate_count != expected_adequate_count:
+                raise ValueError("horizon endpoint failure outcome is invalid")
+            if expected_outcome == "no-geometry-valid-candidate/v1":
+                if invalid_rhos != expected_rhos:
+                    raise ValueError(
+                        "horizon endpoint geometry exhaustion is incomplete"
+                    )
+            elif any(
+                last_order_by_rho[rho] != (
+                    verified_by_rho[rho]["attempted_endpoint_order"]
+                    if rho in verified_by_rho
+                    else expected_orders[-1]
+                )
+                for rho in expected_rho_schedule
+                if rho not in invalid_rhos
+            ):
+                raise ValueError(
+                    "horizon endpoint failure trial schedule is incomplete"
+                )
+
+        expected_trials: list[dict[str, object]] = []
+        for rho in expected_rho_schedule:
+            if rho in invalid_rhos:
+                expected_trials.append(candidate_by_identity[(rho, None)])
+        verified_rhos: set[Decimal] = set()
+        terminal_order = (
+            max(last_order_by_rho.values()) if last_order_by_rho else None
+        )
+        for order in expected_orders:
+            if terminal_order is not None and order > terminal_order:
+                break
+            for rho in expected_rho_schedule:
+                if rho in invalid_rhos or rho in verified_rhos:
+                    continue
+                trial = candidate_by_identity.get((rho, order))
+                if trial is None:
+                    raise ValueError(
+                        "horizon endpoint depth-before-order trial is missing"
+                    )
+                expected_trials.append(trial)
+                if (
+                    trial["ingoing_adequate"] is True
+                    and trial["outgoing_adequate"] is True
+                ):
+                    verified_rhos.add(rho)
+        selected_identity_set = set(selected_identities)
+        expected_rejected = [
+            trial for trial in expected_trials
+            if (
+                _conditioning_decimal_from_text(
+                    trial["rho"], "horizon endpoint candidate rho"
+                ),
+                trial["attempted_endpoint_order"],
+            ) not in selected_identity_set
+        ]
+        if rejected != expected_rejected:
+            raise ValueError(
+                "horizon endpoint rejected trial sequence is not canonical"
+            )
+        if required_selected_count:
+            recomputed_outcome = "adequate/v1"
+        elif not last_order_by_rho:
+            recomputed_outcome = "no-geometry-valid-candidate/v1"
+        elif len(verified_by_rho) == 1:
+            recomputed_outcome = "fewer-than-two-verified-endpoints/v1"
+        elif any(
+            trial["limitation"] == _HORIZON_ENDPOINT_PRECISION_LIMITED
+            for trial in (*selected_pair, *rejected)
+            if trial["attempted_endpoint_order"] is not None
+        ):
+            recomputed_outcome = "arithmetic-precision-inadequate/v1"
+        else:
+            recomputed_outcome = "maximum-series-order-inadequate/v1"
+        if item["outcome"] != recomputed_outcome:
+            raise ValueError("horizon endpoint recovery outcome is invalid")
     return canonical
 
 
@@ -612,7 +1067,7 @@ def _validated_worker_response_receipt(
         endpoint_evidence = value["horizon_endpoint_search_evidence"]
         if mechanism_id == "horizon-admittance":
             _validated_successful_horizon_endpoint_search_evidence(
-                endpoint_evidence
+                endpoint_evidence, request_binding
             )
         elif endpoint_evidence is not None:
             raise ValueError(
@@ -7607,6 +8062,27 @@ def run_selective_readout_promotion(
     selective._component_journal = journaled
     selective.execute_all(job, journaled)
     result = run_component(job, selective, response_predictor)
+    terminal_levels = {level.epsilon: level for level in result.levels}
+    for prior_level in previous.levels:
+        if prior_level.epsilon in terminal_levels:
+            continue
+        epsilon = prior_level.epsilon
+        terminal_levels[epsilon] = LadderLevel(
+            epsilon=epsilon,
+            real_plus=selective.read_root(job, complex(epsilon, 0.0)),
+            real_minus=selective.read_root(job, complex(-epsilon, 0.0)),
+            imaginary_plus=selective.read_root(job, complex(0.0, epsilon)),
+            imaginary_minus=selective.read_root(job, complex(0.0, -epsilon)),
+        )
+    if len(terminal_levels) != len(result.levels):
+        result = replace(
+            result,
+            levels=tuple(sorted(
+                terminal_levels.values(),
+                key=lambda level: level.epsilon,
+                reverse=True,
+            )),
+        )
     scientific_runtime_provider = getattr(
         promoted_backend, "scientific_runtime_for", None
     )
@@ -7681,6 +8157,10 @@ def run_selective_readout_promotion(
             ),
         })
     result_window = dict(result.resolved_window or {})
+    terminal_recovery = _response_ladder_recovery(job, result.levels)
+    result_window.update(
+        _response_ladder_recovery_record(job, result.levels, terminal_recovery)
+    )
     previous_window = dict(previous.resolved_window or {})
     promoted_counts = dict(
         previous_window.get("promoted_readout_count_by_tier", {})

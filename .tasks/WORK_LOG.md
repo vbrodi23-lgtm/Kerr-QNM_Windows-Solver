@@ -2,6 +2,23 @@
 
 Add the newest completed task or milestone-control entry immediately below this heading.
 
+## 2026-08-19 — TASK-079 exact recovery evidence re-review
+
+- **Task:** TASK-079 — Regularise promoted GSN propagation and determinant conditioning.
+- **Deliverable:** Bound horizon success/failure evidence to exact request
+  endpoint policy, geometry, order, and prefix controls; made selective
+  terminals preserve and exactly authenticate predecessor/journal readouts and
+  recomputed window evidence; scoped ODE-budget contracts to reachable leaf
+  roles only.
+- **Verification:** Strict RED/GREEN forgery and control-only tests; 294 focused
+  endpoint, promoted, selective, budget, precision, policy, recovery-window,
+  numerical-control, and cache tests passed. Changed Python compiled; release
+  manifest and board validators passed. Static Julia inspection only; no
+  solver, campaign, or PowerShell production execution.
+- **Evidence ceiling:** TASK-079 remains In Progress; native operator evidence,
+  calibration, physical results, and human mathematics review remain open.
+- **Change reference:** local remediation commit; no push performed.
+
 ## 2026-08-19 — TASK-079 PR #55 checkpoint and review remediation
 
 - **Task:** TASK-079 — Regularise promoted GSN propagation and determinant conditioning.

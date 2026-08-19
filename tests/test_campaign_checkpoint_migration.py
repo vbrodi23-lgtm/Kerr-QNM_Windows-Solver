@@ -136,6 +136,38 @@ def _bind_origin_schema7(mapping):
                     _ORIGIN_CAMPAIGN_BINDINGS["precision_factory_identity"]
                 )
             )
+    # Schema 7 predates the distinct attempted-rung and typed limitation
+    # fields. Keep its frozen failure receipt shape rather than relabelling
+    # historical evidence with the current schema.
+    for attempt in mapping.get("attempts", []):
+        receipt = attempt.get("failure_receipt")
+        failure = receipt.get("failure") if isinstance(receipt, dict) else None
+        diagnostics = (
+            failure.get("diagnostics") if isinstance(failure, dict) else None
+        )
+        evidence = (
+            diagnostics.get("recovery_evidence")
+            if isinstance(diagnostics, dict)
+            else None
+        )
+        if not isinstance(evidence, dict):
+            continue
+        for candidate in (
+            evidence.get("selected_pair", [])
+            + evidence.get("rejected_candidates", [])
+        ):
+            attempted = candidate.pop("attempted_endpoint_order", None)
+            if attempted is not None:
+                candidate["endpoint_order"] = attempted
+                candidate["ingoing_best_prefix_order"] = min(
+                    candidate["ingoing_best_prefix_order"], attempted
+                )
+                candidate["outgoing_best_prefix_order"] = min(
+                    candidate["outgoing_best_prefix_order"], attempted
+                )
+            candidate.pop("limitation", None)
+            candidate.pop("precision_limited", None)
+            candidate.pop("limitation_conditioning", None)
 
 
 def _stopped_schema7_checkpoint():

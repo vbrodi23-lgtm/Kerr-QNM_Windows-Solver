@@ -602,6 +602,25 @@ class SelectiveReadoutPromotionTests(unittest.TestCase):
             ):
                 validate_campaign_checkpoint(self._last_campaign_plan, path)
 
+    def test_checkpoint_rejects_resealed_selective_terminal_readout_omission(self):
+        """The terminal result must project every predecessor/journal readout."""
+
+        self._run_semantic_tier_loop(resolve_at_120=True, through_campaign=True)
+        forged = self._last_campaign_checkpoint
+        result = forged["records"][0]["stages"][-1][
+            "component_result"
+        ]["result"]
+        self.assertGreaterEqual(len(result["levels"]), 4)
+        result["levels"].pop(0)
+        self._reseal_campaign(forged)
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "omitted-terminal-readout.json"
+            path.write_bytes(canonical_json_bytes(forged))
+            with self.assertRaisesRegex(
+                ValueError, "terminal.*journal|resolved.window"
+            ):
+                validate_campaign_checkpoint(self._last_campaign_plan, path)
+
     def test_checkpoint_rejects_resealed_selective_predictor_forgery(self):
         """Catches self-consistent requests detached from predecessor roots."""
 

@@ -2720,6 +2720,7 @@ struct HorizonEndpointCandidate{T<:AbstractFloat}
     ingoing_assessment::Union{Nothing,AsymptoticConditioningAssessment{T}}
     outgoing_assessment::Union{Nothing,AsymptoticConditioningAssessment{T}}
     endpoint_order::Union{Nothing,Int}
+    attempted_endpoint_order::Union{Nothing,Int}
 end
 
 # Why a candidate failed decides what fixes it. A candidate whose series is
@@ -3343,6 +3344,7 @@ function horizon_endpoint_candidates(
     required_digits::T;
     maximum_horizon_distance::T=T(DEFAULT_MAXIMUM_HORIZON_DISTANCE),
     endpoint_orders::Union{Nothing,Vector{Int}}=nothing,
+    attempted_endpoint_order::Union{Nothing,Int}=nothing,
 ) where {T<:AbstractFloat}
     return _translate_factored_failure(
         T,
@@ -3365,6 +3367,13 @@ function horizon_endpoint_candidates(
             outgoing_series = _branch_series(
                 spectral.series, HORIZON_OUTGOING
             )
+            orders = endpoint_orders === nothing ?
+                Int[spectral.endpoint_order] : endpoint_orders
+            attempted_order = attempted_endpoint_order === nothing ?
+                last(orders) : attempted_endpoint_order
+            attempted_order == last(orders) || throw(ArgumentError(
+                "attempted endpoint order must equal the generated prefix maximum"
+            ))
             candidates = Vector{HorizonEndpointCandidate{T}}()
             for geometry_candidate in geometry_candidates
                 _assert_horizon_geometry_candidate_provenance(
@@ -3383,12 +3392,11 @@ function horizon_endpoint_candidates(
                         nothing,
                         nothing,
                         nothing,
+                        nothing,
                     ))
                     continue
                 end
                 radius = geometry_candidate.radius
-                orders = endpoint_orders === nothing ?
-                    Int[spectral.endpoint_order] : endpoint_orders
                 ingoing_order, ingoing_evaluation, ingoing_assessment =
                     _best_prefix_assessment(
                         ingoing_series, radius, required_digits, orders
@@ -3407,6 +3415,7 @@ function horizon_endpoint_candidates(
                         ingoing_assessment,
                         outgoing_assessment,
                         nothing,
+                        attempted_order,
                     ))
                     continue
                 end
@@ -3419,6 +3428,7 @@ function horizon_endpoint_candidates(
                     ingoing_assessment,
                     outgoing_assessment,
                     max(ingoing_order, outgoing_order),
+                    attempted_order,
                 ))
             end
             return candidates
@@ -3433,6 +3443,7 @@ struct HorizonEndpointRecovery{T<:AbstractFloat}
     geometry_schedule::Vector{HorizonEndpointGeometryCandidate{T}}
     endpoint_orders::Vector{Int}
     policy_identity::String
+    maximum_horizon_distance::T
     homogeneous_rhs_evaluations_before_pair::Int
 end
 
@@ -3478,6 +3489,8 @@ function recover_verified_horizon_endpoint_pair(
     required_digits::T;
     maximum_horizon_distance::T=T(DEFAULT_MAXIMUM_HORIZON_DISTANCE),
     endpoint_orders::Vector{Int}=Int[spectral.endpoint_order],
+    prefix_minimum_order::Int=4,
+    prefix_order_step::Int=4,
     policy_identity::AbstractString,
 ) where {T<:AbstractFloat}
     isempty(endpoint_orders) && throw(ArgumentError(
@@ -3497,7 +3510,8 @@ function recover_verified_horizon_endpoint_pair(
     for geometry in geometry_schedule
         geometry.rho in geometry_invalid_rhos || continue
         push!(trials, HorizonEndpointCandidate{T}(
-            geometry, false, false, nothing, nothing, nothing, nothing, nothing
+            geometry, false, false, nothing, nothing, nothing, nothing,
+            nothing, nothing
         ))
     end
     verified_by_rho = Dict{T,HorizonEndpointCandidate{T}}()
@@ -3516,7 +3530,12 @@ function recover_verified_horizon_endpoint_pair(
                 HorizonEndpointGeometryCandidate{T}[geometry],
                 required_digits;
                 maximum_horizon_distance=maximum_horizon_distance,
-                endpoint_orders=horizon_endpoint_prefix_orders(endpoint_order),
+                endpoint_orders=horizon_endpoint_prefix_orders(
+                    endpoint_order;
+                    minimum_order=prefix_minimum_order,
+                    order_step=prefix_order_step,
+                ),
+                attempted_endpoint_order=endpoint_order,
             )[1]
             push!(trials, assessed)
             ingoing_best_prefix_order = assessed.ingoing_evaluation === nothing ?
@@ -3543,6 +3562,7 @@ function recover_verified_horizon_endpoint_pair(
                 copy(geometry_schedule),
                 copy(endpoint_orders),
                 String(policy_identity),
+                maximum_horizon_distance,
                 0,
             )
         end
@@ -3554,6 +3574,7 @@ function recover_verified_horizon_endpoint_pair(
         copy(geometry_schedule),
         copy(endpoint_orders),
         String(policy_identity),
+        maximum_horizon_distance,
         0,
     )
 end
@@ -3561,26 +3582,74 @@ end
 function canonical_horizon_endpoint_search_evidence(
     recovery::HorizonEndpointRecovery,
 )
-    candidate_evidence(candidate) = (
-        rho=string(candidate.geometry.rho),
-        endpoint_order=candidate.endpoint_order,
-        ingoing_best_prefix_order=(
-            candidate.ingoing_evaluation === nothing ? nothing :
-            candidate.ingoing_evaluation.order
-        ),
-        outgoing_best_prefix_order=(
-            candidate.outgoing_evaluation === nothing ? nothing :
-            candidate.outgoing_evaluation.order
-        ),
-        ingoing_adequate=candidate.ingoing_adequate,
-        outgoing_adequate=candidate.outgoing_adequate,
+    function candidate_evidence(candidate)
+        limitation = horizon_endpoint_limitation(
+            candidate, recovery.maximum_horizon_distance
+        )
+        assessments = filter(
+            !isnothing,
+            (candidate.ingoing_assessment, candidate.outgoing_assessment),
+        )
+        binding = (
+            limitation == HORIZON_ENDPOINT_ADEQUATE || isempty(assessments)
+        ) ? nothing : argmin(
+                assessment -> assessment.predicted_reliable_digits,
+                assessments,
+            )
+        limitation_conditioning = binding === nothing ? (
+            binding_predicted_reliable_digits=nothing,
+            maximum_last_term_ratio=nothing,
+            maximum_recurrence_digits_lost=nothing,
+            maximum_series_evaluation_digits_lost=nothing,
+            maximum_truncation_digits_lost=nothing,
+        ) : (
+            binding_predicted_reliable_digits=string(
+                binding.predicted_reliable_digits
+            ),
+            maximum_last_term_ratio=string(binding.maximum_last_term_ratio),
+            maximum_recurrence_digits_lost=string(
+                binding.maximum_recurrence_digits_lost
+            ),
+            maximum_series_evaluation_digits_lost=string(
+                binding.maximum_series_evaluation_digits_lost
+            ),
+            maximum_truncation_digits_lost=string(
+                binding.maximum_truncation_digits_lost
+            ),
+        )
+        return (
+            rho=string(candidate.geometry.rho),
+            attempted_endpoint_order=candidate.attempted_endpoint_order,
+            endpoint_order=candidate.endpoint_order,
+            ingoing_best_prefix_order=(
+                candidate.ingoing_evaluation === nothing ? nothing :
+                candidate.ingoing_evaluation.order
+            ),
+            outgoing_best_prefix_order=(
+                candidate.outgoing_evaluation === nothing ? nothing :
+                candidate.outgoing_evaluation.order
+            ),
+            ingoing_adequate=candidate.ingoing_adequate,
+            outgoing_adequate=candidate.outgoing_adequate,
+            limitation=limitation,
+            precision_limited=(
+                limitation == HORIZON_ENDPOINT_PRECISION_LIMITED
+            ),
+            limitation_conditioning=limitation_conditioning,
+        )
+    end
+    selected_keys = Set(
+        (candidate.geometry.rho, candidate.attempted_endpoint_order)
+        for candidate in recovery.selected_pair
     )
-    selected_rhos = Set(candidate.geometry.rho for candidate in recovery.selected_pair)
     selected_pair = map(candidate_evidence, recovery.selected_pair)
     rejected_candidates = map(
         candidate_evidence,
         filter(
-            candidate -> !(candidate.geometry.rho in selected_rhos),
+            candidate -> !(
+                (candidate.geometry.rho, candidate.attempted_endpoint_order)
+                in selected_keys
+            ),
             recovery.candidates,
         ),
     )

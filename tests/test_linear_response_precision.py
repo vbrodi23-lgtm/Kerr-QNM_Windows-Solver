@@ -371,9 +371,21 @@ def _with_baseline_conditioning(
         ).hexdigest(),
     }
 
-    def conditioned(readout, readout_id):
+    def conditioned(readout, readout_id, amplitude):
         existing_receipt = readout.worker_response_receipt
-        if existing_receipt is not None:
+        if receipt_job is not None:
+            if receipt_role != receipt_job.role:
+                raise AssertionError("synthetic receipt role disagrees with job")
+            request_binding = julia_backend.JuliaPrecisionRootBackend(
+                receipt_job.backend_identity,
+                object(),
+                outcome.digits,
+                ode_error_budget=synthetic_ode_error_budget(outcome.digits),
+            ).preview_root_request(receipt_job, amplitude)
+            scientific_runtime_sha256 = hashlib.sha256(
+                canonical_json_bytes(scientific_runtime)
+            ).hexdigest()
+        elif existing_receipt is not None:
             request_binding = dict(existing_receipt["request_binding"])
             scientific_runtime_sha256 = existing_receipt[
                 "scientific_runtime_sha256"
@@ -382,31 +394,7 @@ def _with_baseline_conditioning(
             raise AssertionError(
                 "synthetic current promoted evidence requires receipt lineage"
             )
-        else:
-            request_binding = {
-                "schema_version": 1,
-                "operation": "root-readout",
-                "job_id": receipt_job.job_id,
-                "leaf_id": receipt_job.leaf_id,
-                "role": receipt_role,
-                "mechanism_id": receipt_job.mechanism_id,
-                "job_policy_sha256": receipt_job.policy.identity_sha256,
-                "backend_identity_sha256": (
-                    receipt_job.backend_identity.identity_sha256
-                ),
-                "precision_digits": outcome.digits,
-                "refinement_level": 0,
-                "synthetic_readout_id": readout_id,
-                "policy": {
-                    "root_correction_tolerance": "2e-11",
-                    "promoted_root_readout_policy": (
-                        PROMOTED_ROOT_READOUT_POLICY
-                    ),
-                },
-            }
-            scientific_runtime_sha256 = hashlib.sha256(
-                canonical_json_bytes(scientific_runtime)
-            ).hexdigest()
+        del readout_id
         request_policy = request_binding.get("policy")
         if not isinstance(request_policy, dict):
             request_binding = dict(request_binding)
@@ -424,6 +412,31 @@ def _with_baseline_conditioning(
             request_policy = dict(request_policy)
             request_policy["promoted_root_readout_policy"] = (
                 PROMOTED_ROOT_READOUT_POLICY
+            )
+            request_binding["policy"] = request_policy
+        if evidence.scattering_diagnostics_applicable:
+            request_binding = dict(request_binding)
+            request_policy = dict(request_policy)
+            endpoint_series_order = request_policy.get(
+                "endpoint_series_order"
+            )
+            if not isinstance(endpoint_series_order, int):
+                endpoint_series_order = (
+                    receipt_job.policy.endpoint_series_order
+                    if receipt_job is not None
+                    else 28
+                )
+            request_policy.update({
+                **julia_backend.horizon_geometry_controls(),
+                "endpoint_series_order": endpoint_series_order,
+                "horizon_endpoint_recovery_policy_identity": (
+                    "adaptive-horizon-endpoint-recovery/v1"
+                ),
+                "horizon_endpoint_prefix_minimum_order": 4,
+                "horizon_endpoint_prefix_order_step": 4,
+            })
+            request_policy["horizon_endpoint_maximum_order"] = (
+                4 * int(request_policy["endpoint_series_order"])
             )
             request_binding["policy"] = request_policy
         correction_tolerance = Decimal(
@@ -536,7 +549,7 @@ def _with_baseline_conditioning(
                 canonical_json_bytes(primary.to_mapping())
             ).hexdigest(),
             "horizon_endpoint_search_evidence": (
-                valid_horizon_endpoint_search_evidence()
+                valid_horizon_endpoint_search_evidence(request_binding)
                 if evidence.scattering_diagnostics_applicable
                 else None
             ),
@@ -554,13 +567,19 @@ def _with_baseline_conditioning(
     levels = tuple(
         replace(
             level,
-            real_plus=conditioned(level.real_plus, f"level-{index}-real-plus"),
-            real_minus=conditioned(level.real_minus, f"level-{index}-real-minus"),
+            real_plus=conditioned(
+                level.real_plus, f"level-{index}-real-plus", level.epsilon
+            ),
+            real_minus=conditioned(
+                level.real_minus, f"level-{index}-real-minus", -level.epsilon
+            ),
             imaginary_plus=conditioned(
-                level.imaginary_plus, f"level-{index}-imaginary-plus"
+                level.imaginary_plus, f"level-{index}-imaginary-plus",
+                complex(0.0, level.epsilon),
             ),
             imaginary_minus=conditioned(
-                level.imaginary_minus, f"level-{index}-imaginary-minus"
+                level.imaginary_minus, f"level-{index}-imaginary-minus",
+                complex(0.0, -level.epsilon),
             ),
         )
         for index, level in enumerate(result.levels)
@@ -568,7 +587,7 @@ def _with_baseline_conditioning(
     conditioned_outcome = _replace_component_result_fields(
         outcome,
         result_changes={
-            "baseline": conditioned(result.baseline, "baseline"),
+            "baseline": conditioned(result.baseline, "baseline", 0.0j),
             "levels": levels,
         },
     )
@@ -617,7 +636,10 @@ def _authenticated_failed_preflight_recovery_stage(leaf, predecessor):
         "precision_ladder_discrepancy_applicable": False,
         "same_precision_refinement_discrepancy_abs": 0.0,
         "self_refinement_result": _rebind_result_worker_receipts(
-            component["result"], refinement_runtime, refinement_level=1
+            component["result"],
+            refinement_runtime,
+            job=leaf.job,
+            refinement_level=1,
         ),
         "self_refinement_scientific_runtime": refinement_runtime,
     })
@@ -633,18 +655,27 @@ def _authenticated_failed_preflight_recovery_stage(leaf, predecessor):
 
 
 def _rebind_result_worker_receipts(
-    raw_result, scientific_runtime, *, refinement_level
+    raw_result, scientific_runtime, *, job, refinement_level
 ):
     """Rebind a synthetic component clone to its distinct refinement runtime."""
 
     result = ComponentResult.from_mapping(raw_result)
 
-    def rebound(readout):
+    request_backend = julia_backend.JuliaPrecisionRootBackend(
+        job.backend_identity,
+        object(),
+        scientific_runtime["precision_digits"],
+        refinement=refinement_level,
+        ode_error_budget=synthetic_ode_error_budget(
+            scientific_runtime["precision_digits"]
+        ),
+    )
+
+    def rebound(readout, amplitude):
         receipt = readout.worker_response_receipt
         if receipt is None:
             raise AssertionError("synthetic promoted readout receipt is missing")
-        request_binding = dict(receipt["request_binding"])
-        request_binding["refinement_level"] = refinement_level
+        request_binding = request_backend.preview_root_request(job, amplitude)
         material = {
             **{
                 key: value
@@ -658,6 +689,11 @@ def _rebind_result_worker_receipts(
             "scientific_runtime_sha256": hashlib.sha256(
                 canonical_json_bytes(scientific_runtime)
             ).hexdigest(),
+            "horizon_endpoint_search_evidence": (
+                valid_horizon_endpoint_search_evidence(request_binding)
+                if job.mechanism_id == "horizon-admittance"
+                else None
+            ),
         }
         return replace(
             readout,
@@ -673,16 +709,20 @@ def _rebind_result_worker_receipts(
     levels = tuple(
         replace(
             level,
-            real_plus=rebound(level.real_plus),
-            real_minus=rebound(level.real_minus),
-            imaginary_plus=rebound(level.imaginary_plus),
-            imaginary_minus=rebound(level.imaginary_minus),
+            real_plus=rebound(level.real_plus, level.epsilon),
+            real_minus=rebound(level.real_minus, -level.epsilon),
+            imaginary_plus=rebound(
+                level.imaginary_plus, complex(0.0, level.epsilon)
+            ),
+            imaginary_minus=rebound(
+                level.imaginary_minus, complex(0.0, -level.epsilon)
+            ),
         )
         for level in result.levels
     )
     return replace(
         result,
-        baseline=rebound(result.baseline),
+        baseline=rebound(result.baseline, 0.0j),
         levels=levels,
     ).to_mapping()
 

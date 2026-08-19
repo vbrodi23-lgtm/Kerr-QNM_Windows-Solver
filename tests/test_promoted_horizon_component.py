@@ -31,6 +31,7 @@ from windows_solver.response_batches import (
     _primary_requires_precision120,
     _stage_with_promotion_decision,
     _validate_record_semantics,
+    _validate_current_promoted_runtime,
     _validate_single_promoted_horizon_predictor_binding,
     synthetic_stage_signed_error_channels,
 )
@@ -303,7 +304,7 @@ def _with_worker_receipt(job, baseline, digits, primary_predictor):
             )
         ).hexdigest(),
         "horizon_endpoint_search_evidence": (
-            valid_horizon_endpoint_search_evidence()
+            valid_horizon_endpoint_search_evidence(request)
             if job.mechanism_id == "horizon-admittance"
             else None
         ),
@@ -792,6 +793,63 @@ class PromotedHorizonStageTests(unittest.TestCase):
         self.assertFalse(_is_single_promoted_horizon_stage(self.leaf, 64))
         self.assertFalse(_is_single_promoted_horizon_stage(exterior, 80))
         self.assertTrue(_is_single_promoted_horizon_stage(deep_horizon, 80))
+
+    def test_current_horizon_runtime_rejects_fully_resealed_noncanonical_request(self):
+        predictor = self.leaf.job.root.omega + complex(1.0e-4, -1.0e-4)
+        baseline = _with_worker_receipt(
+            self.leaf.job,
+            _promoted_baseline(self.leaf.job),
+            80,
+            predictor,
+        )
+        backend = FakeJuliaPrecisionBackend(self.leaf.job, baseline, 80)
+        result = response_engine.run_promoted_horizon_component(
+            self.leaf.job, backend, predictor
+        )
+        runtime = backend.scientific_runtime_for(self.leaf.job)
+        payload = {
+            "evidence_kind": "package-owned-julia-single-promoted-horizon-component",
+            "result": result.to_mapping(),
+            "self_refinement_result": None,
+            "self_refinement_skipped_reason": "NOT_REQUIRED_BY_V1_4_PROMOTED_ROOT_POLICY",
+            "scientific_runtime": runtime,
+            "primary_root_predictor_source": "PREVIOUS_STAGE_BASELINE_OMEGA",
+            "precision_ladder_discrepancy_applicable": False,
+            "precision_ladder_discrepancy_reason": "BINARY64_COMPONENT_RESPONSE_UNAVAILABLE",
+        }
+        outcome = StageOutcome(
+            digits=80,
+            numerical_state=result.status.value,
+            component_result=payload,
+            local_disk_radius_abs=sum(result.error_channels.values()),
+            signed_error_channels=synthetic_stage_signed_error_channels(
+                payload, sum(result.error_channels.values()),
+                precision_ladder_applicable=False,
+            ),
+        )
+        forged = result.to_mapping()
+        receipt = forged["baseline"]["worker_response_receipt"]
+        receipt["request_binding"]["policy"][
+            "horizon_endpoint_recovery_policy_identity"
+        ] = "forged-endpoint-policy/v1"
+        receipt["horizon_endpoint_search_evidence"][0][
+            "policy_identity"
+        ] = "forged-endpoint-policy/v1"
+        receipt["request_sha256"] = hashlib.sha256(
+            canonical_json_bytes(receipt["request_binding"])
+        ).hexdigest()
+        receipt["receipt_sha256"] = hashlib.sha256(canonical_json_bytes({
+            key: value for key, value in receipt.items()
+            if key != "receipt_sha256"
+        })).hexdigest()
+        forged_result = ComponentResult.from_mapping(forged)
+        with self.assertRaisesRegex(
+            ValueError, "canonical.*request|worker response receipt identity"
+        ):
+            _validate_current_promoted_runtime(
+                self.leaf, outcome, forged_result,
+                allow_historical_conditioning_absence=False,
+            )
 
     def test_deep_horizon_ordinary_and_failed_preflight_use_horizon_runner(self):
         plan = build_campaign_plan(

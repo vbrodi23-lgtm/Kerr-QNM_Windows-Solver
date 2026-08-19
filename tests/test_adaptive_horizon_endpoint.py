@@ -61,9 +61,10 @@ class AdaptiveHorizonEndpointStaticTests(unittest.TestCase):
         self.assertIn("continue", recovery)
         self.assertIn("length(verified_by_rho) >= 2", recovery)
         self.assertIn(
-            "endpoint_orders=horizon_endpoint_prefix_orders(endpoint_order)",
-            recovery,
+            "endpoint_orders=horizon_endpoint_prefix_orders(", recovery
         )
+        self.assertIn("minimum_order=prefix_minimum_order", recovery)
+        self.assertIn("order_step=prefix_order_step", recovery)
         self.assertNotIn("endpoint_orders=Int[endpoint_order]", recovery)
 
     def test_best_prefix_is_selected_independently_for_both_horizon_branches(self) -> None:
@@ -99,6 +100,7 @@ class AdaptiveHorizonEndpointStaticTests(unittest.TestCase):
         emitter = _function(self.worker_source, "emit_horizon_endpoint_candidate")
         self.assertIn('"ingoing_best_prefix_order"', emitter)
         self.assertIn('"outgoing_best_prefix_order"', emitter)
+        self.assertIn('"attempted_endpoint_order"', emitter)
         self.assertIn("candidate.ingoing_evaluation.order", emitter)
         self.assertIn("candidate.outgoing_evaluation.order", emitter)
 
@@ -174,8 +176,17 @@ class AdaptiveHorizonEndpointStaticTests(unittest.TestCase):
         self.assertIn("policy_identity", evidence)
         self.assertIn("selected_pair", evidence)
         self.assertIn("rejected_candidates", evidence)
+        self.assertIn("attempted_endpoint_order", evidence)
         self.assertIn("ingoing_best_prefix_order", evidence)
         self.assertIn("outgoing_best_prefix_order", evidence)
+        self.assertIn("limitation = horizon_endpoint_limitation(", evidence)
+        self.assertIn("limitation=limitation", evidence)
+        self.assertIn("precision_limited=", evidence)
+        self.assertIn("limitation_conditioning=", evidence)
+        self.assertIn("maximum_last_term_ratio", evidence)
+        self.assertIn("maximum_recurrence_digits_lost", evidence)
+        self.assertIn("maximum_series_evaluation_digits_lost", evidence)
+        self.assertIn("maximum_truncation_digits_lost", evidence)
 
     def test_worker_obtains_verified_pair_before_any_homogeneous_solve(self) -> None:
         determinant = _function(self.worker_source, "evaluate_horizon_determinant")
@@ -207,6 +218,30 @@ class AdaptiveHorizonEndpointStaticTests(unittest.TestCase):
             failure,
         )
         self.assertIn('"recovery_outcome" => outcome', failure)
+        coordinate = _function(
+            self.worker_source,
+            "canonical_horizon_coordinate_failure_evidence",
+        )
+        self.assertIn("horizon_endpoint_order_ladder", coordinate)
+        self.assertIn("horizon_endpoint_recovery_policy_identity", coordinate)
+        self.assertIn('"selected_pair" => Any[]', coordinate)
+        self.assertIn('"rejected_candidates" => Any[]', coordinate)
+        self.assertIn("failure isa CoordinateInversionStalled", determinant)
+        self.assertIn(
+            "canonical_horizon_coordinate_failure_evidence(request)",
+            determinant,
+        )
+        self.assertIn(
+            'stage=outcome == CF.COORDINATE_INVERSION_FAILURE ?', failure
+        )
+        self.assertIn('"coordinate-inversion"', failure)
+        canonical = _function(
+            self.package_source,
+            "canonical_horizon_endpoint_search_evidence",
+        )
+        self.assertIn("selected_keys", canonical)
+        self.assertIn("candidate.attempted_endpoint_order", canonical)
+        self.assertNotIn("selected_rhos", canonical)
 
 
 if __name__ == "__main__":

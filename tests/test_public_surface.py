@@ -1111,6 +1111,7 @@ $candidate | ConvertTo-Json -Compress | Set-Content -LiteralPath $env:M02_TEST_J
             "full-h-h2-2h-ih-ladder/v1",
             "verified-endpoint-absolute-error/v1",
             "verified-endpoint-control-equivalence-absolute-error/v2",
+            "adaptive-horizon-endpoint-recovery/v1",
             "adequate/v1",
             "no-geometry-valid-candidate/v1",
             "maximum-series-order-inadequate/v1",

@@ -1634,6 +1634,24 @@ class JuliaNumericalControlFailureTests(unittest.TestCase):
         }
         if include_identity:
             failure["execution_resource_policy"] = policy
+        if code.startswith("HORIZON_"):
+            plan = build_campaign_plan(
+                policy=response_engine.NumericalPolicy(),
+                backend_identity=(
+                    response_engine.VettedNativeDeterminantKernel.identity
+                ),
+                precision_capabilities=PrecisionCapabilities((64, 80, 120)),
+            )
+            leaf = next(
+                item for item in plan.leaves
+                if item.mechanism_id == "horizon-admittance"
+            )
+            failure["request_binding"] = JuliaPrecisionRootBackend(
+                leaf.job.backend_identity,
+                object(),
+                80,
+                ode_error_budget=synthetic_ode_error_budget(80),
+            )._request(leaf.job, 0.0j)
         return policy, {
             "worker_exit_code": 21,
             "worker_timed_out": False,

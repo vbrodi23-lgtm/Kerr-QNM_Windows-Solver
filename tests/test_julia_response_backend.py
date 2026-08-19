@@ -27,6 +27,7 @@ from windows_solver.julia_response_backend import (
     _forward_julia_progress_line,
     _mode_specific_branch_enclosure_radius,
     _run_streamed_julia,
+    _valid_numerical_control_diagnostics,
 )
 from windows_solver.progress import (
     PROGRESS_SCHEMA,
@@ -59,7 +60,9 @@ from windows_solver.response_engine import (
 )
 from windows_solver.progress_output import CampaignProgressReporter
 from tests.fixtures import (
+    control_failure_stage,
     synthetic_ode_error_budget,
+    valid_control_failure_diagnostics,
     valid_julia_root_response,
     valid_legacy_julia_root_response,
     valid_root_authentication,
@@ -188,6 +191,300 @@ def _set_distinct_derivative_binding(response, wire_derivative_abs):
 
 
 class JuliaResponseBackendTests(unittest.TestCase):
+    def test_horizon_endpoint_receipt_binds_attempted_rung_separately_from_best_prefix(self):
+        job = _job_for_mechanism("horizon-admittance")
+        backend = JuliaPrecisionRootBackend(
+            VettedNativeDeterminantKernel.identity, FakeAdapter(), 80
+        )
+        mapping = backend.read_root(job, 0.0j).to_mapping()
+        evidence = mapping["worker_response_receipt"][
+            "horizon_endpoint_search_evidence"
+        ][0]
+        selected = evidence["selected_pair"][0]
+        self.assertEqual(selected["attempted_endpoint_order"], 56)
+        selected.update({
+            "endpoint_order": 44,
+            "ingoing_best_prefix_order": 40,
+            "outgoing_best_prefix_order": 44,
+        })
+
+        repeated = [
+            candidate
+            for candidate in evidence["rejected_candidates"]
+            if candidate["rho"] == "-50"
+            and candidate["attempted_endpoint_order"] in (28, 56)
+        ]
+        self.assertEqual(len(repeated), 2)
+        for candidate in repeated:
+            candidate.update({
+                "endpoint_order": 20,
+                "ingoing_best_prefix_order": 16,
+                "outgoing_best_prefix_order": 20,
+            })
+
+        receipt = mapping["worker_response_receipt"]
+        receipt["receipt_sha256"] = hashlib.sha256(
+            canonical_json_bytes({
+                key: value for key, value in receipt.items()
+                if key != "receipt_sha256"
+            })
+        ).hexdigest()
+        RootReadout.from_mapping(mapping)
+
+    def test_horizon_failure_outcome_cannot_be_resealed_from_arithmetic_to_order(self):
+        job = _job_for_mechanism("horizon-admittance")
+        request = JuliaPrecisionRootBackend(
+            VettedNativeDeterminantKernel.identity, FakeAdapter(), 80
+        )._request(job, 0.0j)
+        failure = {
+            "failure_code": "HORIZON_ARITHMETIC_INADEQUATE",
+            "failure_class": "CONTROL",
+            "stage": control_failure_stage("HORIZON_ARITHMETIC_INADEQUATE"),
+            "retryable": True,
+            "diagnostics": valid_control_failure_diagnostics(
+                "HORIZON_ARITHMETIC_INADEQUATE",
+                precision_bits=request["working_precision_bits"],
+            ),
+        }
+        self.assertTrue(_valid_numerical_control_diagnostics(
+            failure, request_binding=request
+        ))
+
+        forged = json.loads(canonical_json_bytes(failure))
+        forged.update({
+            "failure_code": "HORIZON_MAXIMUM_ORDER_INADEQUATE",
+            "retryable": False,
+        })
+        diagnostics = forged["diagnostics"]
+        diagnostics.update({
+            "recovery_outcome": "maximum-series-order-inadequate/v1",
+            "next_precision_tier_allowed": False,
+        })
+        diagnostics["recovery_evidence"]["outcome"] = (
+            "maximum-series-order-inadequate/v1"
+        )
+        for candidate in diagnostics["recovery_evidence"][
+            "rejected_candidates"
+        ]:
+            candidate.update({
+                "limitation": "insufficient-series-order/v1",
+                "precision_limited": False,
+            })
+        self.assertFalse(_valid_numerical_control_diagnostics(
+            forged, request_binding=request
+        ))
+
+    def test_horizon_failure_outcome_cannot_be_resealed_from_order_to_arithmetic(self):
+        job = _job_for_mechanism("horizon-admittance")
+        request = JuliaPrecisionRootBackend(
+            VettedNativeDeterminantKernel.identity, FakeAdapter(), 80
+        )._request(job, 0.0j)
+        failure = {
+            "failure_code": "HORIZON_MAXIMUM_ORDER_INADEQUATE",
+            "failure_class": "CONTROL",
+            "stage": control_failure_stage(
+                "HORIZON_MAXIMUM_ORDER_INADEQUATE"
+            ),
+            "retryable": False,
+            "diagnostics": valid_control_failure_diagnostics(
+                "HORIZON_MAXIMUM_ORDER_INADEQUATE",
+                precision_bits=request["working_precision_bits"],
+            ),
+        }
+        self.assertTrue(_valid_numerical_control_diagnostics(
+            failure, request_binding=request
+        ))
+
+        forged = json.loads(canonical_json_bytes(failure))
+        forged.update({
+            "failure_code": "HORIZON_ARITHMETIC_INADEQUATE",
+            "retryable": True,
+        })
+        diagnostics = forged["diagnostics"]
+        diagnostics.update({
+            "recovery_outcome": "arithmetic-precision-inadequate/v1",
+            "next_precision_tier_allowed": True,
+        })
+        diagnostics["recovery_evidence"]["outcome"] = (
+            "arithmetic-precision-inadequate/v1"
+        )
+        for candidate in diagnostics["recovery_evidence"][
+            "rejected_candidates"
+        ]:
+            candidate.update({
+                "limitation": "insufficient-arithmetic-precision/v1",
+                "precision_limited": True,
+            })
+        self.assertFalse(_valid_numerical_control_diagnostics(
+            forged, request_binding=request
+        ))
+
+    def test_horizon_endpoint_receipt_rejects_resealed_policy_geometry_and_order_forgery(self):
+        job = _job_for_mechanism("horizon-admittance")
+        backend = JuliaPrecisionRootBackend(
+            VettedNativeDeterminantKernel.identity, FakeAdapter(), 80
+        )
+        original = backend.read_root(job, 0.0j).to_mapping()
+
+        for label, mutate in (
+            ("policy", lambda evidence: evidence.__setitem__("policy_identity", "forged/v1")),
+            ("rho", lambda evidence: evidence["selected_pair"][0].__setitem__("rho", "-399")),
+            ("endpoint-order", lambda evidence: evidence["selected_pair"][0].__setitem__("endpoint_order", 99)),
+            ("attempted-order", lambda evidence: evidence["selected_pair"][0].__setitem__("attempted_endpoint_order", 112)),
+            ("prefix-order", lambda evidence: evidence["selected_pair"][0].__setitem__("ingoing_best_prefix_order", 27)),
+            ("limitation", lambda evidence: evidence["selected_pair"][0].__setitem__("limitation", "insufficient-series-order/v1")),
+            ("precision-limited", lambda evidence: evidence["selected_pair"][0].__setitem__("precision_limited", True)),
+            ("pair-order", lambda evidence: evidence["selected_pair"].reverse()),
+            ("omitted-candidate", lambda evidence: evidence["rejected_candidates"].pop()),
+            (
+                "omitted-intermediate-selected-rho-trial",
+                lambda evidence: evidence["rejected_candidates"].remove(
+                    next(
+                        trial
+                        for trial in evidence["rejected_candidates"]
+                        if trial["rho"] == evidence["selected_pair"][0]["rho"]
+                        and trial["attempted_endpoint_order"] == 28
+                    )
+                ),
+            ),
+        ):
+            with self.subTest(label=label):
+                forged = json.loads(canonical_json_bytes(original))
+                receipt = forged["worker_response_receipt"]
+                mutate(receipt["horizon_endpoint_search_evidence"][0])
+                receipt["receipt_sha256"] = hashlib.sha256(
+                    canonical_json_bytes({
+                        key: value for key, value in receipt.items()
+                        if key != "receipt_sha256"
+                    })
+                ).hexdigest()
+                with self.assertRaisesRegex(ValueError, "horizon endpoint"):
+                    RootReadout.from_mapping(forged)
+
+    def test_horizon_failure_diagnostics_bind_exact_request_policy_geometry_and_orders(self):
+        job = _job_for_mechanism("horizon-admittance")
+        backend = JuliaPrecisionRootBackend(
+            VettedNativeDeterminantKernel.identity,
+            FakeAdapter(),
+            80,
+        )
+        request = backend._request(job, 0.0j)
+        for code in (
+            "HORIZON_ARITHMETIC_INADEQUATE",
+            "HORIZON_COORDINATE_INVERSION_FAILED",
+        ):
+            failure = {
+                "failure_code": code,
+                "failure_class": "CONTROL",
+                "stage": control_failure_stage(code),
+                "retryable": code == "HORIZON_ARITHMETIC_INADEQUATE",
+                "diagnostics": valid_control_failure_diagnostics(
+                    code, precision_bits=request["working_precision_bits"]
+                ),
+            }
+            self.assertTrue(
+                _valid_numerical_control_diagnostics(
+                    failure, request_binding=request
+                ),
+                f"canonical {code} fixture must reach the typed validator",
+            )
+            mutations = [
+                ("policy", lambda evidence: evidence.__setitem__("policy_identity", "forged/v1")),
+                ("endpoint-orders", lambda evidence: evidence.__setitem__("endpoint_orders", [28, 99, 112])),
+            ]
+            if code != "HORIZON_COORDINATE_INVERSION_FAILED":
+                mutations.append((
+                    "omitted-intermediate-order",
+                    lambda evidence: evidence["rejected_candidates"].remove(
+                        next(
+                            trial
+                            for trial in evidence["rejected_candidates"]
+                            if trial["rho"] == "-10"
+                            and trial["attempted_endpoint_order"] == 56
+                        )
+                    ),
+                ))
+            for label, mutate in mutations:
+                with self.subTest(code=code, label=label):
+                    forged = json.loads(canonical_json_bytes(failure))
+                    mutate(forged["diagnostics"]["recovery_evidence"])
+                    self.assertFalse(
+                        _valid_numerical_control_diagnostics(
+                            forged, request_binding=request
+                        )
+                    )
+
+    def test_horizon_failure_schedule_rejects_invalid_or_verified_rho_retry(self):
+        job = _job_for_mechanism("horizon-admittance")
+        request = JuliaPrecisionRootBackend(
+            VettedNativeDeterminantKernel.identity,
+            FakeAdapter(),
+            80,
+        )._request(job, 0.0j)
+        for code, retry in (
+            (
+                "HORIZON_GEOMETRY_EXHAUSTED",
+                {
+                    "rho": "-10",
+                    "attempted_endpoint_order": 28,
+                    "endpoint_order": 24,
+                    "ingoing_best_prefix_order": 20,
+                    "outgoing_best_prefix_order": 24,
+                    "ingoing_adequate": False,
+                    "outgoing_adequate": False,
+                    "limitation": "insufficient-series-order/v1",
+                    "precision_limited": False,
+                    "limitation_conditioning": {
+                        "binding_predicted_reliable_digits": "20",
+                        "maximum_last_term_ratio": "0.5",
+                        "maximum_recurrence_digits_lost": "1",
+                        "maximum_series_evaluation_digits_lost": "1",
+                        "maximum_truncation_digits_lost": "3",
+                    },
+                },
+            ),
+            (
+                "HORIZON_ONLY_ONE_ENDPOINT",
+                {
+                    "rho": "-10",
+                    "attempted_endpoint_order": 56,
+                    "endpoint_order": 48,
+                    "ingoing_best_prefix_order": 44,
+                    "outgoing_best_prefix_order": 48,
+                    "ingoing_adequate": False,
+                    "outgoing_adequate": False,
+                    "limitation": "insufficient-series-order/v1",
+                    "precision_limited": False,
+                    "limitation_conditioning": {
+                        "binding_predicted_reliable_digits": "20",
+                        "maximum_last_term_ratio": "0.5",
+                        "maximum_recurrence_digits_lost": "1",
+                        "maximum_series_evaluation_digits_lost": "1",
+                        "maximum_truncation_digits_lost": "3",
+                    },
+                },
+            ),
+        ):
+            failure = {
+                "failure_code": code,
+                "failure_class": "CONTROL",
+                "stage": control_failure_stage(code),
+                "retryable": False,
+                "diagnostics": valid_control_failure_diagnostics(
+                    code, precision_bits=request["working_precision_bits"]
+                ),
+            }
+            self.assertTrue(_valid_numerical_control_diagnostics(
+                failure, request_binding=request
+            ))
+            forged = json.loads(canonical_json_bytes(failure))
+            forged["diagnostics"]["recovery_evidence"][
+                "rejected_candidates"
+            ].append(retry)
+            self.assertFalse(_valid_numerical_control_diagnostics(
+                forged, request_binding=request
+            ))
+
     def test_successful_horizon_endpoint_evidence_is_sealed_in_receipt(self):
         job = _job_for_mechanism("horizon-admittance")
         backend = JuliaPrecisionRootBackend(

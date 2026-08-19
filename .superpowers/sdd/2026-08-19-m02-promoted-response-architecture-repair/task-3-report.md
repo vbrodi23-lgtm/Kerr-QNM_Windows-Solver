@@ -404,3 +404,30 @@ full safe Python discovery ran 895 tests successfully with 7 skips. Python
 compilation, release-manifest validation, TaskPlanner validation, and
 `git diff --check` passed. No Julia worker, Kerr determinant, ODE/angular/QNM
 solve, M02 campaign, or production PowerShell entry point was executed.
+
+### Exact endpoint, selective-terminal, and reachable-budget binding
+
+The final REDs demonstrated that a fully resealed successful endpoint receipt
+could substitute its policy label, candidate radius, maximum order, or selected
+prefix; typed endpoint failures admitted the same substitutions; a selective
+terminal checkpoint could omit authenticated predecessor levels; and a
+control-only leaf requested BigFloat budgets it can never execute.
+
+Endpoint success and failure evidence now shares one request-bound validator.
+It derives the complete depth schedule from the declared candidate ladder and
+contour/floor, derives the order ladder and legal prefix schedule from the
+declared request controls, and requires the exact recovery-policy identity.
+The worker receives those controls only for horizon requests. Selective
+terminal validation now requires exact predecessor-plus-journal readout
+equality and recomputes the complete recovery-window projection; execution
+preserves authenticated expanded levels in the terminal result. Scientific
+execution contracts now return no promoted ODE budget material for control
+leaves, so unreachable budget changes cannot alter their cache identity.
+
+GREEN verification passed 294 focused endpoint, promoted, selective, budget,
+precision-campaign, numerical-control, recovery-window, policy, and cache
+tests. Changed Python compiled, the release manifest and TaskPlanner board
+validated, and the cached diff passed whitespace checks. All checks were
+synthetic Python or static Julia inspection. No Julia worker, Kerr determinant,
+ODE/angular/QNM solve, M02 campaign, or production PowerShell entry point was
+executed. Operator and human-mathematics validation remain incomplete.

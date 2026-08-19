@@ -1088,8 +1088,10 @@ def _bind_failed_preflight_failure_to_request(
     if (
         not isinstance(structured, Mapping)
         or structured.get("failure_class") != "CONTROL"
-        or structured.get("failure_code")
-        != "INSUFFICIENT_ASYMPTOTIC_PRECISION"
+        or structured.get("failure_code") not in (
+            {"INSUFFICIENT_ASYMPTOTIC_PRECISION"}
+            | set(_HORIZON_RECOVERY_FAILURES)
+        )
     ):
         return bound
     expected_sha256 = hashlib.sha256(
@@ -1328,7 +1330,12 @@ def _valid_factored_diagnostics(
 
 
 def _valid_horizon_recovery_diagnostics(
-    code: str, stage: object, diagnostics: Mapping[str, object]
+    code: str,
+    stage: object,
+    diagnostics: Mapping[str, object],
+    request_binding: Mapping[str, object] | None,
+    *,
+    allow_historical_schema7_policy: bool = False,
 ) -> bool:
     """Authenticate the typed endpoint-recovery outcome and its evidence."""
 
@@ -1363,45 +1370,24 @@ def _valid_horizon_recovery_diagnostics(
         }),
     ):
         return False
-    endpoint_orders = evidence.get("endpoint_orders")
-    if (
-        evidence.get("outcome") != outcome
-        or not isinstance(evidence.get("policy_identity"), str)
-        or not evidence["policy_identity"]
-        or evidence.get("selected_pair") != []
-        or not isinstance(evidence.get("rejected_candidates"), list)
-        or not isinstance(endpoint_orders, list)
-        or not endpoint_orders
-        or any(not _is_positive_int(order) for order in endpoint_orders)
-        or endpoint_orders != sorted(set(endpoint_orders))
-        or evidence.get("homogeneous_rhs_evaluations_before_pair") != 0
-    ):
+    if request_binding is None:
         return False
-    candidate_fields = frozenset({
-        "rho",
-        "endpoint_order",
-        "ingoing_best_prefix_order",
-        "outgoing_best_prefix_order",
-        "ingoing_adequate",
-        "outgoing_adequate",
-    })
-    for candidate in evidence["rejected_candidates"]:
-        if (
-            not isinstance(candidate, Mapping)
-            or not _has_exact_fields(candidate, candidate_fields)
-            or _diagnostic_decimal(candidate, "rho") is None
-            or type(candidate.get("ingoing_adequate")) is not bool
-            or type(candidate.get("outgoing_adequate")) is not bool
-        ):
-            return False
-        for name in (
-            "endpoint_order",
-            "ingoing_best_prefix_order",
-            "outgoing_best_prefix_order",
-        ):
-            value = candidate.get(name)
-            if value is not None and not _is_positive_int(value):
-                return False
+    try:
+        _validated_successful_horizon_endpoint_search_evidence(
+            [dict(evidence)],
+            request_binding,
+            expected_outcome=outcome,
+            required_selected_count=0,
+            allow_historical_schema7_policy=(
+                allow_historical_schema7_policy
+            ),
+            require_complete_candidate_schedule=(
+                code != "HORIZON_COORDINATE_INVERSION_FAILED"
+                and not allow_historical_schema7_policy
+            ),
+        )
+    except ValueError:
+        return False
     return True
 
 
@@ -1828,6 +1814,9 @@ def _valid_algebraic_singularity_diagnostics(
 
 def _valid_numerical_control_diagnostics(
     failure: Mapping[str, object],
+    *,
+    request_binding: Mapping[str, object] | None = None,
+    allow_historical_schema7_policy: bool = False,
 ) -> bool:
     """Return whether a recognized control receipt carries typed evidence.
 
@@ -1851,7 +1840,18 @@ def _valid_numerical_control_diagnostics(
     if code in _HORIZON_RECOVERY_FAILURES:
         if failure.get("retryable") is not _HORIZON_RECOVERY_FAILURES[code][2]:
             return False
-        return _valid_horizon_recovery_diagnostics(code, stage, diagnostics)
+        if request_binding is None:
+            raw_request = failure.get("request_binding")
+            request_binding = raw_request if isinstance(raw_request, Mapping) else None
+        return _valid_horizon_recovery_diagnostics(
+            code,
+            stage,
+            diagnostics,
+            request_binding,
+            allow_historical_schema7_policy=(
+                allow_historical_schema7_policy
+            ),
+        )
     if code == "INSUFFICIENT_ASYMPTOTIC_PRECISION":
         return _valid_insufficient_precision_diagnostics(stage, diagnostics)
     if code in {
@@ -2444,6 +2444,17 @@ def _precision_policy(
         ),
         "max_newton_iterations": 16,
     }
+    if job.mechanism_id == "horizon-admittance":
+        policy.update({
+            "horizon_endpoint_recovery_policy_identity": (
+                "adaptive-horizon-endpoint-recovery/v1"
+            ),
+            "horizon_endpoint_maximum_order": (
+                4 * int(policy["endpoint_series_order"])
+            ),
+            "horizon_endpoint_prefix_minimum_order": 4,
+            "horizon_endpoint_prefix_order_step": 4,
+        })
     return policy
 
 
@@ -3022,7 +3033,7 @@ class JuliaPrecisionRootBackend:
             try:
                 endpoint_evidence = (
                     _validated_successful_horizon_endpoint_search_evidence(
-                        endpoint_evidence
+                        endpoint_evidence, request
                     )
                 )
             except ValueError as error:
