@@ -495,12 +495,12 @@ class RegularisedGsnWorkerSourceTests(unittest.TestCase):
             "record_finite_difference!",
         ):
             self.assertIn(contract, self.worker)
-        determinant_progress = self._function_slice(
-            "determinant_progress", "enforce_root_readout_feasibility"
+        raw_determinant_progress = self._function_slice(
+            "raw_determinant_progress", "exterior_empirical_certificate_required"
         )
-        self.assertIn("evaluation = determinant(", determinant_progress)
-        self.assertIn("evaluation.value", determinant_progress)
-        self.assertIn("return evaluation", determinant_progress)
+        self.assertIn("evaluation = determinant(", raw_determinant_progress)
+        self.assertIn("evaluation.value", raw_determinant_progress)
+        self.assertIn("return evaluation", raw_determinant_progress)
 
     def test_holomorphic_finite_difference_spec_exercises_production_helper(
         self,

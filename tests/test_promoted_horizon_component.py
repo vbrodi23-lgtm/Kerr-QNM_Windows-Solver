@@ -975,6 +975,7 @@ class PromotedHorizonStageTests(unittest.TestCase):
             self.leaf.job.backend_identity,
             self.backend.julia_adapter,
             80,
+            refinement=0,
             ode_error_budget=synthetic_ode_error_budget(80),
         )
         self.assertEqual(
