@@ -22,13 +22,15 @@ Add the newest completed task or milestone-control entry immediately below this 
   and partial-journal identities remain present while corrected requests use new
   content-addressed identities.
 - **Verification:** Full safe Python discovery passed 983 tests with 7 skips;
+  the 58 focused checkpoint/request/cache tests passed, including a frozen
+  historical-runtime control under simulated Linux and Windows CPython 3.12.14.
   Python compilation, TaskPlanner validation, and diff hygiene passed. Three
-  independent read-only reviews found no remaining P0–P3 issues. The genuine
-  Python-to-Julia worker CLI preflight is installed in hosted CI; Julia was not
-  available locally. No determinant, Newton, angular, coordinate, ODE, Kerr,
-  campaign, or PowerShell production execution was performed.
-- **Evidence ceiling:** TASK-079 remains In Progress pending hosted Julia CI,
-  native operator evidence, physical results, and human mathematics review.
+  independent read-only reviews found no remaining P0–P3 issues. Hosted CI's
+  genuine Python-to-Julia worker CLI preflight passed; Julia was not available
+  locally. No determinant, Newton, angular, coordinate, ODE, Kerr, campaign, or
+  PowerShell production execution was performed locally.
+- **Evidence ceiling:** TASK-079 remains In Progress pending native operator
+  evidence, physical results, and human mathematics review.
 - **Change reference:** draft PR
   [#59](https://github.com/vbrodi23-lgtm/Kerr-QNM_Windows-Solver/pull/59).
 

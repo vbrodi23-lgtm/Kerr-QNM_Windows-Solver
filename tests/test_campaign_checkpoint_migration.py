@@ -12,6 +12,7 @@ from unittest.mock import patch
 import windows_solver.campaign_checkpoint_migration as migration_module
 
 from tests import test_linear_response_precision as precision_tests
+from tests.fixtures import frozen_pr58_native_backend_identity
 from windows_solver import julia_response_backend as julia_backend
 from windows_solver import response_batches as batch_module
 from windows_solver.campaign_checkpoint_migration import (
@@ -26,7 +27,6 @@ from windows_solver.response_batches import (
 from windows_solver.response_engine import (
     HISTORICAL_PROMOTED_ROOT_READOUT_POLICY,
     NumericalPolicy,
-    VettedNativeDeterminantKernel,
     regularised_gsn_precision_policy,
 )
 
@@ -83,7 +83,7 @@ class Pr59CheckpointCompatibilityTests(unittest.TestCase):
 
         plan = batch_module.build_campaign_plan(
             policy=NumericalPolicy(),
-            backend_identity=VettedNativeDeterminantKernel.identity,
+            backend_identity=frozen_pr58_native_backend_identity(),
             precision_capabilities=batch_module.PrecisionCapabilities(
                 (64, 80, 120)
             ),

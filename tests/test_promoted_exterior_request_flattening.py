@@ -10,6 +10,7 @@ import unittest
 from unittest.mock import patch
 
 import windows_solver.response_engine as response_engine
+from tests.fixtures import frozen_pr58_native_backend_identity
 from windows_solver import julia_response_backend
 from windows_solver.contracts import canonical_json_bytes
 from windows_solver.julia_response_backend import JuliaPrecisionRootBackend
@@ -100,7 +101,7 @@ class PromotedExteriorRequestFlatteningTests(unittest.TestCase):
     def test_leaf_42_request_preserves_receipt_safety_factor_json_type(self):
         plan = build_campaign_plan(
             policy=NumericalPolicy(),
-            backend_identity=VettedNativeDeterminantKernel.identity,
+            backend_identity=frozen_pr58_native_backend_identity(),
             precision_capabilities=PrecisionCapabilities((64, 80, 120)),
         )
         receipt = load_default_calibration_receipt()

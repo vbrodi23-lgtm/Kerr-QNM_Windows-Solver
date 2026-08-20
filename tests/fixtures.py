@@ -24,6 +24,27 @@ SYNTHETIC_ODE_CALIBRATION = ODEToleranceCalibration(
 )
 
 
+def frozen_pr58_native_backend_identity():
+    """Return the backend identity bound into the preserved PR #58 run.
+
+    Production authenticates the CPython patch version and platform as part of
+    the backend identity.  Historical digest fixtures must therefore name the
+    runtime that produced them instead of inheriting whichever runner happens
+    to execute the test suite.
+    """
+
+    from windows_solver.response_engine import VettedNativeDeterminantKernel
+
+    return replace(
+        VettedNativeDeterminantKernel.identity,
+        runtime_fingerprint=(
+            "cpython-3.12.13-linux-python-64bit-"
+            "gsn-input-julia-exact-f-u-cache-contract-1-"
+            "adapted-source-native-gsn-adapter-contract-2"
+        ),
+    )
+
+
 def synthetic_ode_error_budget(digits: int):
     tier = {
         40: PrecisionTier.BIGFLOAT_40,

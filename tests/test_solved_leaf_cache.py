@@ -62,19 +62,13 @@ from windows_solver.root_readout_cache import (
 from windows_solver.solved_leaf_cache import SolvedLeafLookupStatus, SolvedLeafStore
 from tests.fixtures import (
     current_promoted_component_payload,
+    frozen_pr58_native_backend_identity,
     synthetic_ode_error_budget,
     valid_numerical_conditioning,
 )
 
 
-_FROZEN_MIGRATION_BACKEND_IDENTITY = replace(
-    VettedNativeDeterminantKernel.identity,
-    runtime_fingerprint=(
-        "cpython-3.12.13-linux-python-64bit-"
-        "gsn-input-julia-exact-f-u-cache-contract-1-"
-        "adapted-source-native-gsn-adapter-contract-2"
-    ),
-)
+_FROZEN_MIGRATION_BACKEND_IDENTITY = frozen_pr58_native_backend_identity()
 
 
 def _outcome(leaf, digits=64):
@@ -2524,7 +2518,7 @@ class SolvedLeafCacheTests(unittest.TestCase):
         capabilities = PrecisionCapabilities((64, 80, 120))
         plan = build_campaign_plan(
             policy=NumericalPolicy(),
-            backend_identity=VettedNativeDeterminantKernel.identity,
+            backend_identity=_FROZEN_MIGRATION_BACKEND_IDENTITY,
             precision_capabilities=capabilities,
         )
         all_selection = build_campaign_selection(plan, role="all")
