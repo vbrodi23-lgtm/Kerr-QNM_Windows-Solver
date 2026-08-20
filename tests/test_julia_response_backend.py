@@ -2135,6 +2135,7 @@ class JuliaResponseBackendTests(unittest.TestCase):
         )
         self.assertIn('include("real_inner_horizon_spec.jl")', package_tests)
         self.assertIn("m02_worker_finite_difference_spec.jl", workflow)
+        self.assertIn("m02_worker_request_contract_spec.jl", workflow)
         self.assertIn("leaf13_horizon_harness_spec.jl", workflow)
 
     def test_package_worker_confines_fine_steps_and_stores_only_endpoints(self):

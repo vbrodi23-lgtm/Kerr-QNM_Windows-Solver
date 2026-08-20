@@ -867,6 +867,15 @@ function flatten_request(document)
         end
     end
     if mechanism != "horizon-admittance"
+        for key in (
+            "determinant_error_model",
+            "determinant_error_required_term_classes",
+            "determinant_error_missing_evidence_outcome",
+            "determinant_error_certificate_statement",
+            "determinant_error_preceding_precision_tier",
+        )
+            flattened[key] = required(policy, key)
+        end
         support = required(document, "support")
         for key in ("lower", "upper", "centre", "half_width")
             flattened["support_$key"] = required(support, key)
