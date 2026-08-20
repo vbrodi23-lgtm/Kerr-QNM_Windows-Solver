@@ -37,15 +37,16 @@ class Leaf13MixedPhaseEndpointEvidenceTests(unittest.TestCase):
             },
         }
 
+    @staticmethod
+    def _truncation_evidence(request: dict[str, object]) -> dict[str, object]:
+        truncation_request = deepcopy(request)
+        truncation_request["policy"]["endpoint_series_order"] = 36
+        return valid_horizon_endpoint_search_evidence(truncation_request)[0]
+
     def test_accepts_primary_truncation_resolution_endpoint_evidence(self):
         request = self._request_binding()
         primary = valid_horizon_endpoint_search_evidence(request)[0]
-
-        truncation_request = deepcopy(request)
-        truncation_request["policy"]["endpoint_series_order"] = 36
-        truncation = valid_horizon_endpoint_search_evidence(
-            truncation_request
-        )[0]
+        truncation = self._truncation_evidence(request)
 
         # The Julia worker accumulates all three successful phases in one
         # response. TRUNCATION alone uses PRIMARY order + 8; RESOLUTION returns
@@ -78,12 +79,7 @@ class Leaf13MixedPhaseEndpointEvidenceTests(unittest.TestCase):
         request = self._request_binding()
         del request["policy"]["promoted_root_readout_policy"]
         primary = valid_horizon_endpoint_search_evidence(request)[0]
-
-        truncation_request = deepcopy(request)
-        truncation_request["policy"]["endpoint_series_order"] = 36
-        truncation = valid_horizon_endpoint_search_evidence(
-            truncation_request
-        )[0]
+        truncation = self._truncation_evidence(request)
 
         with self.assertRaisesRegex(
             ValueError, "horizon endpoint search evidence is invalid"
@@ -96,18 +92,24 @@ class Leaf13MixedPhaseEndpointEvidenceTests(unittest.TestCase):
         request = self._request_binding()
         request["operation"] = "fixed-root-determinant-sample"
         primary = valid_horizon_endpoint_search_evidence(request)[0]
-
-        truncation_request = deepcopy(request)
-        truncation_request["policy"]["endpoint_series_order"] = 36
-        truncation = valid_horizon_endpoint_search_evidence(
-            truncation_request
-        )[0]
+        truncation = self._truncation_evidence(request)
 
         with self.assertRaisesRegex(
             ValueError, "horizon endpoint search evidence is invalid"
         ):
             _validated_successful_horizon_endpoint_search_evidence(
                 [primary, truncation], request
+            )
+
+    def test_promoted_receipt_requires_original_endpoint_ladder(self):
+        request = self._request_binding()
+        truncation = self._truncation_evidence(request)
+
+        with self.assertRaisesRegex(
+            ValueError, "horizon endpoint PRIMARY evidence is missing"
+        ):
+            _validated_successful_horizon_endpoint_search_evidence(
+                [truncation], request
             )
 
 
