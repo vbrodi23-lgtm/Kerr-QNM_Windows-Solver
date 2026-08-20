@@ -556,12 +556,35 @@ def _validated_successful_horizon_endpoint_search_evidence(
                 break
     expected_rho_schedule = tuple(rho_schedule)
     expected_rhos = frozenset(expected_rho_schedule)
+    def endpoint_order_ladder(
+        candidate_base_order: int,
+    ) -> list[int]:
+        values: list[int] = []
+        order = candidate_base_order
+        while order < maximum_order:
+            values.append(order)
+            order += order
+        values.append(maximum_order)
+        return values
+
+    allowed_base_orders = {base_order}
+    if (
+        not allow_historical_schema7_policy
+        and request_binding.get("operation") == "root-readout"
+        and policy.get("promoted_root_readout_policy")
+        == PROMOTED_ROOT_READOUT_POLICY
+        and base_order + 8 <= maximum_order
+    ):
+        # Schema v9 accumulates PRIMARY, TRUNCATION, and RESOLUTION
+        # endpoint searches in one response. TRUNCATION alone raises
+        # the endpoint base order by exactly eight.
+        allowed_base_orders.add(base_order + 8)
+    expected_order_ladders = {
+        tuple(endpoint_order_ladder(candidate_base_order))
+        for candidate_base_order in sorted(allowed_base_orders)
+    }
     expected_orders: list[int] = []
-    order = base_order
-    while order < maximum_order:
-        expected_orders.append(order)
-        order += order
-    expected_orders.append(maximum_order)
+    observed_order_ladders: set[tuple[int, ...]] = set()
 
     def allowed_prefix_orders(maximum: int) -> frozenset[int]:
         values = list(range(prefix_minimum, maximum + 1, prefix_step))
@@ -781,12 +804,7 @@ def _validated_successful_horizon_endpoint_search_evidence(
         rejected = item["rejected_candidates"]
         orders = item["endpoint_orders"]
         if (
-            item["outcome"] != expected_outcome
-            or item["policy_identity"] != policy_identity
-            or not isinstance(selected_pair, list)
-            or len(selected_pair) != required_selected_count
-            or not isinstance(rejected, list)
-            or not isinstance(orders, list)
+            not isinstance(orders, list)
             or not orders
             or any(
                 isinstance(order, bool)
@@ -794,10 +812,21 @@ def _validated_successful_horizon_endpoint_search_evidence(
                 or order < 1
                 for order in orders
             )
-            or orders != expected_orders
+        ):
+            raise ValueError("horizon endpoint search evidence is invalid")
+        order_ladder = tuple(orders)
+        if (
+            order_ladder not in expected_order_ladders
+            or item["outcome"] != expected_outcome
+            or item["policy_identity"] != policy_identity
+            or not isinstance(selected_pair, list)
+            or len(selected_pair) != required_selected_count
+            or not isinstance(rejected, list)
             or item["homogeneous_rhs_evaluations_before_pair"] != 0
         ):
             raise ValueError("horizon endpoint search evidence is invalid")
+        expected_orders = list(order_ladder)
+        observed_order_ladders.add(order_ladder)
         selected_identities = [
             candidate(raw, selected=True) for raw in selected_pair
         ]
@@ -999,6 +1028,11 @@ def _validated_successful_horizon_endpoint_search_evidence(
             recomputed_outcome = "maximum-series-order-inadequate/v1"
         if item["outcome"] != recomputed_outcome:
             raise ValueError("horizon endpoint recovery outcome is invalid")
+    primary_order_ladder = tuple(
+        endpoint_order_ladder(base_order)
+    )
+    if primary_order_ladder not in observed_order_ladders:
+        raise ValueError("horizon endpoint PRIMARY evidence is missing")
     return canonical
 
 
