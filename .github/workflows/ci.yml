@@ -2,175 +2,325 @@ name: verify
 
 on:
   pull_request:
+  push:
+    branches: [main]
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  leaf13-source-patch:
-    if: github.event.pull_request.head.ref == 'fix/leaf13-mixed-phase-endpoint-evidence'
+  julia-factored-gsn:
     runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      M02_PROJECT: .ci/m02-project
+      M02_PROJECT_SEED: src/windows_solver/data/julia/m02_project
+      GSN_PROJECT: src/windows_solver/data/julia/GeneralizedSasakiNakamura.jl
+      ANGULAR_PROJECT: src/windows_solver/data/julia/SpinWeightedSpheroidalHarmonics.jl
+      JULIA_NUM_THREADS: "1"
+      JULIA_NUM_PRECOMPILE_TASKS: "4"
+      JULIA_PKG_PRECOMPILE_AUTO: "0"
     steps:
       - uses: actions/checkout@v4
+      - uses: julia-actions/setup-julia@v3
         with:
-          ref: ${{ github.event.pull_request.head.ref }}
-          fetch-depth: 0
+          version: "1.10.11"
+      - name: Materialize pinned M02 Julia project
+        shell: bash
+        run: |
+          julia --startup-file=no --history-file=no -e '
+            seed_project = abspath(ENV["M02_PROJECT_SEED"])
+            project = abspath(ENV["M02_PROJECT"])
+            mkpath(project)
+            cp(
+              joinpath(seed_project, "Project.toml"),
+              joinpath(project, "Project.toml");
+              force=true,
+            )
+            let manifest = read(joinpath(seed_project, "Manifest.seed.toml"), String)
+              for source in (ENV["GSN_PROJECT"], ENV["ANGULAR_PROJECT"])
+                source_path = abspath(source)
+                seed_path = string(
+                  "path = \"../vendor/", basename(source_path), "\""
+                )
+                pinned_path = string(
+                  "path = \"", replace(source_path, "\\" => "/"), "\""
+                )
+                occursin(seed_path, manifest) || error(
+                  "seed manifest lacks path dependency: $seed_path"
+                )
+                manifest = replace(manifest, seed_path => pinned_path)
+              end
+              occursin("../vendor/", manifest) && error(
+                "materialized manifest retains a seed vendor path"
+              )
+              write(joinpath(project, "Manifest.toml"), manifest)
+            end
+          '
+      - uses: julia-actions/cache@v3
+        with:
+          delete-old-caches: "false"
+      - name: Instantiate and precompile pinned M02 project
+        shell: bash
+        run: |
+          julia --startup-file=no --history-file=no --project="$M02_PROJECT" -e '
+            using Pkg
+            Pkg.instantiate()
+            Pkg.precompile()
+          '
+      - name: Run complete vendored GSN unit set
+        shell: bash
+        run: |
+          julia --startup-file=no --history-file=no --project="$M02_PROJECT" -e '
+            include(joinpath(ENV["GSN_PROJECT"], "test", "runtests.jl"))
+          '
+      - name: Run worker determinant and finite-difference authentication regression
+        shell: bash
+        run: |
+          julia --startup-file=no --history-file=no --project="$M02_PROJECT" \
+            src/windows_solver/data/julia/m02_worker_finite_difference_spec.jl
+          julia --startup-file=no --history-file=no --project="$M02_PROJECT" \
+            tools/leaf13_horizon_harness_spec.jl
+
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Install focused test dependencies
+      - name: Install package
         run: python -m pip install ".[numerical-tests]"
-      - name: Reconfirm the production regression is red
-        shell: bash
+      - name: Build and inspect wheel
+        shell: python
         run: |
-          set +e
-          PYTHONPATH=src python -m unittest -v \
-            tests.test_leaf13_mixed_phase_endpoint_evidence \
-            > leaf13-red.log 2>&1
-          status=$?
-          set -e
-          cat leaf13-red.log
-          if [ "$status" -eq 0 ]; then
-            echo "Leaf 13 regression unexpectedly passed before the repair" >&2
-            exit 1
-          fi
-          grep -q \
-            "test_accepts_primary_truncation_resolution_endpoint_evidence" \
-            leaf13-red.log
-          grep -q "horizon endpoint search evidence is invalid" leaf13-red.log
-      - name: Apply the mixed-phase endpoint validator repair
-        shell: bash
-        run: |
-          python - <<'PY'
           from pathlib import Path
+          import subprocess
+          import sys
+          import zipfile
 
-          path = Path("src/windows_solver/response_engine.py")
-          text = path.read_text(encoding="utf-8")
-          function_marker = (
-              "def _validated_successful_horizon_endpoint_search_evidence(\n"
+          subprocess.run(
+              [sys.executable, "-m", "pip", "wheel", ".", "--no-deps", "--wheel-dir", "dist"],
+              check=True,
           )
-          function_start = text.index(function_marker)
-          function_end = text.index("\ndef ", function_start + 1)
-          function = text[function_start:function_end]
-
-          old_orders = (
-              "    expected_orders: list[int] = []\n"
-              "    order = base_order\n"
-              "    while order < maximum_order:\n"
-              "        expected_orders.append(order)\n"
-              "        order += order\n"
-              "    expected_orders.append(maximum_order)\n"
-          )
-          new_orders = (
-              "    def endpoint_order_ladder(\n"
-              "        candidate_base_order: int,\n"
-              "    ) -> list[int]:\n"
-              "        values: list[int] = []\n"
-              "        order = candidate_base_order\n"
-              "        while order < maximum_order:\n"
-              "            values.append(order)\n"
-              "            order += order\n"
-              "        values.append(maximum_order)\n"
-              "        return values\n"
-              "\n"
-              "    allowed_base_orders = {base_order}\n"
-              "    if (\n"
-              "        not allow_historical_schema7_policy\n"
-              "        and request_binding.get(\"operation\") == \"root-readout\"\n"
-              "        and policy.get(\"promoted_root_readout_policy\")\n"
-              "        == PROMOTED_ROOT_READOUT_POLICY\n"
-              "        and base_order + 8 <= maximum_order\n"
-              "    ):\n"
-              "        # Schema v9 accumulates PRIMARY, TRUNCATION, and RESOLUTION\n"
-              "        # endpoint searches in one response. TRUNCATION alone raises\n"
-              "        # the endpoint base order by exactly eight.\n"
-              "        allowed_base_orders.add(base_order + 8)\n"
-              "    expected_order_ladders = {\n"
-              "        tuple(endpoint_order_ladder(candidate_base_order))\n"
-              "        for candidate_base_order in sorted(allowed_base_orders)\n"
-              "    }\n"
-              "    expected_orders: list[int] = []\n"
-              "    observed_order_ladders: set[tuple[int, ...]] = set()\n"
-          )
-          if function.count(old_orders) != 1:
-              raise SystemExit("endpoint order ladder patch marker is not unique")
-          function = function.replace(old_orders, new_orders)
-
-          mismatch_marker = "            or orders != expected_orders\n"
-          mismatch = function.index(mismatch_marker)
-          validation_start = function.rfind("        if (\n", 0, mismatch)
-          error_line = (
-              "            raise ValueError("
-              "\"horizon endpoint search evidence is invalid\")\n"
-          )
-          validation_end = function.index(error_line, mismatch) + len(error_line)
-          new_validation = (
-              "        if (\n"
-              "            not isinstance(orders, list)\n"
-              "            or not orders\n"
-              "            or any(\n"
-              "                isinstance(order, bool)\n"
-              "                or not isinstance(order, int)\n"
-              "                or order < 1\n"
-              "                for order in orders\n"
-              "            )\n"
-              "        ):\n"
-              "            raise ValueError(\"horizon endpoint search evidence is invalid\")\n"
-              "        order_ladder = tuple(orders)\n"
-              "        if (\n"
-              "            order_ladder not in expected_order_ladders\n"
-              "            or item[\"outcome\"] != expected_outcome\n"
-              "            or item[\"policy_identity\"] != policy_identity\n"
-              "            or not isinstance(selected_pair, list)\n"
-              "            or len(selected_pair) != required_selected_count\n"
-              "            or not isinstance(rejected, list)\n"
-              "            or item[\"homogeneous_rhs_evaluations_before_pair\"] != 0\n"
-              "        ):\n"
-              "            raise ValueError(\"horizon endpoint search evidence is invalid\")\n"
-              "        expected_orders = list(order_ladder)\n"
-              "        observed_order_ladders.add(order_ladder)\n"
-          )
-          function = (
-              function[:validation_start]
-              + new_validation
-              + function[validation_end:]
-          )
-
-          return_line = "    return canonical\n"
-          return_index = function.rfind(return_line)
-          if return_index < 0:
-              raise SystemExit("canonical return marker was not found")
-          primary_gate = (
-              "    primary_order_ladder = tuple(\n"
-              "        endpoint_order_ladder(base_order)\n"
-              "    )\n"
-              "    if primary_order_ladder not in observed_order_ladders:\n"
-              "        raise ValueError(\"horizon endpoint PRIMARY evidence is missing\")\n"
-          )
-          function = (
-              function[:return_index]
-              + primary_gate
-              + function[return_index:]
-          )
-          text = text[:function_start] + function + text[function_end:]
-          path.write_text(text, encoding="utf-8")
-          PY
-      - name: Prove the focused repair is green
-        shell: bash
+          wheels = list(Path("dist").glob("*.whl"))
+          if len(wheels) != 1:
+              raise AssertionError(f"expected one wheel, found {wheels}")
+          with zipfile.ZipFile(wheels[0]) as wheel:
+              names = set(wheel.namelist())
+          required = {
+              "windows_solver/linear_response_admission.py",
+              "windows_solver/data/kerr_qnm_roots_2736.csv",
+              "windows_solver/data/kerr_qnm_lattice_receipt.json",
+              "windows_solver/data/LICENSE-CANONICAL-BACKEND-MIT.txt",
+              "windows_solver/data/LICENSE-CC-BY-4.0.txt",
+              "windows_solver/data/LICENSE-QNM-MIT.txt",
+          }
+          missing = required - names
+          forbidden = {
+              name for name in names
+              if "roots_91" in name
+              or "benchmark_receipt" in name
+              or "independent_benchmarks" in name
+              or "catalog_receipt" in name
+          }
+          if missing or forbidden:
+              raise AssertionError(f"wheel data mismatch: missing={missing}, forbidden={forbidden}")
+      - name: Compile Python
+        run: python -m compileall -q src tests tools
+      - name: Run tests
+        run: python -m unittest discover -s tests -v
+      - name: Run M02 admission and cache gate
+        run: python -m unittest tests.test_linear_response_admission -v
+      - name: Run M02 head-tail-risk campaign smoke
+        run: solver campaign-smoke
+      - name: Plan full evidence request
+        run: solver plan examples/evidence-plan.json
+      - name: Run admitted provider
+        run: solver run examples/problem-contract.json --store "${{ runner.temp }}/solver-store"
+      - name: Run admitted spectrum provider
+        run: solver run examples/spectrum.json --store "${{ runner.temp }}/spectrum-store"
+      - name: Verify Windows PowerShell 5.1 launcher parity
+        if: runner.os == 'Windows'
+        shell: python
         run: |
-          python -m compileall -q src tests
-          PYTHONPATH=src python -m unittest -v \
-            tests.test_leaf13_mixed_phase_endpoint_evidence \
-            tests.test_julia_response_backend.JuliaResponseBackendTests.test_successful_horizon_endpoint_evidence_is_sealed_in_receipt \
-            tests.test_julia_response_backend.JuliaResponseBackendTests.test_horizon_endpoint_receipt_binds_attempted_rung_separately_from_best_prefix \
-            tests.test_julia_response_backend.JuliaResponseBackendTests.test_horizon_endpoint_receipt_rejects_resealed_policy_geometry_and_order_forgery \
-            tests.test_julia_response_backend.JuliaResponseBackendTests.test_horizon_failure_diagnostics_bind_exact_request_policy_geometry_and_orders
-          git diff --check
-      - name: Commit the production repair
-        shell: bash
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add src/windows_solver/response_engine.py
-          git commit -m "fix(m02): authenticate mixed-phase endpoint evidence"
-          git push origin "HEAD:${GITHUB_HEAD_REF}"
+          import json
+          import os
+          from pathlib import Path
+          import subprocess
+          import sys
+          import tempfile
+
+          root = Path.cwd()
+          windows_powershell = Path(os.environ["SystemRoot"]).joinpath(
+              "System32", "WindowsPowerShell", "v1.0", "powershell.exe"
+          )
+          module = [sys.executable, "-m", "windows_solver"]
+          launcher = [
+              str(windows_powershell),
+              "-NoLogo",
+              "-NoProfile",
+              "-NonInteractive",
+              "-ExecutionPolicy",
+              "Bypass",
+              "-File",
+              str(root / "solver.ps1"),
+          ]
+
+          def invoke(prefix, *arguments):
+              return subprocess.run(
+                  [*prefix, *(str(argument) for argument in arguments)],
+                  cwd=root,
+                  stdin=subprocess.DEVNULL,
+                  stdout=subprocess.PIPE,
+                  stderr=subprocess.PIPE,
+                  check=False,
+              )
+
+          def require(condition, message, *results):
+              if condition:
+                  return
+              details = "\n".join(
+                  f"rc={result.returncode} stdout={result.stdout!r} "
+                  f"stderr={result.stderr!r}"
+                  for result in results
+              )
+              raise AssertionError(f"{message}\n{details}")
+
+          request = root / "examples" / "evidence-plan.json"
+          direct = invoke(module, "plan", request)
+          wrapped = invoke(launcher, "plan", request)
+          require(
+              direct.returncode == wrapped.returncode == 0,
+              "Plan command failed through one Windows entry point.",
+              direct,
+              wrapped,
+          )
+          require(
+              direct.stdout == wrapped.stdout and direct.stderr == wrapped.stderr == b"",
+              "Windows entry points returned different plan streams.",
+              direct,
+              wrapped,
+          )
+
+          direct = invoke(module, "campaign-smoke")
+          wrapped = invoke(launcher, "campaign-smoke")
+          require(
+              direct.returncode == wrapped.returncode == 0,
+              "M02 campaign smoke failed through one Windows entry point.",
+              direct,
+              wrapped,
+          )
+          require(
+              direct.stdout == wrapped.stdout and direct.stderr == wrapped.stderr == b"",
+              "Windows entry points returned different M02 smoke streams.",
+              direct,
+              wrapped,
+          )
+
+          with tempfile.TemporaryDirectory() as temporary:
+              temporary = Path(temporary)
+              spectrum_request = root / "examples" / "spectrum.json"
+              direct = invoke(
+                  module,
+                  "run",
+                  spectrum_request,
+                  "--store",
+                  temporary / "module-spectrum",
+              )
+              wrapped = invoke(
+                  launcher,
+                  "run",
+                  spectrum_request,
+                  "--store",
+                  temporary / "launcher-spectrum",
+              )
+              require(
+                  direct.returncode == wrapped.returncode == 0,
+                  "Admitted spectrum failed through one Windows entry point.",
+                  direct,
+                  wrapped,
+              )
+              require(
+                  direct.stderr == wrapped.stderr == b"",
+                  "Admitted spectrum unexpectedly wrote stderr.",
+                  direct,
+                  wrapped,
+              )
+              direct_run = json.loads(direct.stdout)
+              wrapped_run = json.loads(wrapped.stdout)
+              require(
+                  direct_run["artifact_ids"] == wrapped_run["artifact_ids"]
+                  and direct_run["provider_execution_count"]
+                  == wrapped_run["provider_execution_count"]
+                  == 2,
+                  "Windows entry points returned different spectrum artifacts.",
+                  direct,
+                  wrapped,
+              )
+
+              direct = invoke(
+                  module,
+                  "run",
+                  request,
+                  "--store",
+                  temporary / "module-unavailable",
+              )
+              wrapped = invoke(
+                  launcher,
+                  "run",
+                  request,
+                  "--store",
+                  temporary / "launcher-unavailable",
+              )
+              require(
+                  direct.returncode == wrapped.returncode == 3,
+                  "Unavailable science did not return exit code 3.",
+                  direct,
+                  wrapped,
+              )
+              require(
+                  direct.stdout == wrapped.stdout == b"",
+                  "Unavailable science unexpectedly wrote stdout.",
+                  direct,
+                  wrapped,
+              )
+              direct_error = json.loads(direct.stderr)
+              wrapped_error = json.loads(wrapped.stderr)
+              require(
+                  direct_error["error"]["code"]
+                  == wrapped_error["error"]["code"]
+                  == "PROVIDER_UNAVAILABLE",
+                  "Windows entry points returned different error contracts.",
+                  direct,
+                  wrapped,
+              )
+              require(
+                  direct_error["error"]["run"]["unavailable_capability"]
+                  == wrapped_error["error"]["run"]["unavailable_capability"],
+                  "Windows entry points disagreed on unavailable capability.",
+                  direct,
+                  wrapped,
+              )
+
+              invalid = temporary / "invalid-study.json"
+              invalid.write_bytes(b"{}")
+              direct = invoke(module, "plan", invalid)
+              wrapped = invoke(launcher, "plan", invalid)
+              require(
+                  direct.returncode == wrapped.returncode == 2,
+                  "Invalid input did not return exit code 2.",
+                  direct,
+                  wrapped,
+              )
+              require(
+                  direct.stdout == wrapped.stdout == b""
+                  and direct.stderr == wrapped.stderr,
+                  "Windows entry points returned different invalid-input streams.",
+                  direct,
+                  wrapped,
+              )
