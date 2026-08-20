@@ -161,7 +161,10 @@ jobs:
           python -m compileall -q src tests
           PYTHONPATH=src python -m unittest -v \
             tests.test_leaf13_mixed_phase_endpoint_evidence \
-            tests.test_julia_response_backend
+            tests.test_julia_response_backend.JuliaResponseBackendTests.test_successful_horizon_endpoint_evidence_is_sealed_in_receipt \
+            tests.test_julia_response_backend.JuliaResponseBackendTests.test_horizon_endpoint_receipt_binds_attempted_rung_separately_from_best_prefix \
+            tests.test_julia_response_backend.JuliaResponseBackendTests.test_horizon_endpoint_receipt_rejects_resealed_policy_geometry_and_order_forgery \
+            tests.test_julia_response_backend.JuliaResponseBackendTests.test_horizon_failure_diagnostics_bind_exact_request_policy_geometry_and_orders
           git diff --check
       - name: Commit the production repair
         shell: bash
