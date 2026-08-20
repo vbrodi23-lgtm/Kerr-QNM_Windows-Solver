@@ -2385,6 +2385,131 @@ class SolvedLeafCacheTests(unittest.TestCase):
                 leaf, changed_record, contract
             )
 
+    def test_worker_source_change_keeps_promoted_horizon_record_compatible(self):
+        """A plumbing-only worker change must not retire accepted horizon work."""
+
+        capabilities = PrecisionCapabilities((64, 80))
+        plan = build_campaign_plan(
+            policy=NumericalPolicy(),
+            backend_identity=VettedNativeDeterminantKernel.identity,
+            precision_capabilities=capabilities,
+        )
+        leaf = next(
+            item for item in plan.leaves
+            if item.role == "primary"
+            and item.mechanism_id == "horizon-admittance"
+        )
+        selection = build_campaign_selection(
+            plan, role="primary", leaf_ids=(leaf.leaf_id,)
+        )
+        native = NativeCampaignStageBackend(
+            object(),
+            capabilities,
+            object(),
+            julia_adapter=object(),
+        )
+        receipt = native.calibration_receipt
+        assert receipt is not None
+        profile = receipt.budget_for("horizon-scattering/v1", 80)
+        old_runtime = JuliaPrecisionRootBackend(
+            leaf.job.backend_identity,
+            SimpleNamespace(runtime_provenance={"worker_sha256": "a" * 64}),
+            80,
+            empirical_control_profile=profile,
+            calibration_receipt=receipt,
+        ).scientific_runtime_for(leaf.job)
+        new_runtime = JuliaPrecisionRootBackend(
+            leaf.job.backend_identity,
+            SimpleNamespace(runtime_provenance={"worker_sha256": "b" * 64}),
+            80,
+            empirical_control_profile=profile,
+            calibration_receipt=receipt,
+        ).scientific_runtime_for(leaf.job)
+        self.assertNotEqual(old_runtime["worker_sha256"], new_runtime["worker_sha256"])
+
+        class Backend:
+            identity = plan.backend_identity
+            precision_capabilities = capabilities
+
+            def __init__(self, runtime):
+                self.runtime = runtime
+                self.calls = []
+
+            @staticmethod
+            def scientific_execution_contract_for(selected):
+                del selected
+                return native.scientific_execution_contract_for(leaf)
+
+            def execute_stage(self, selected, digits):
+                self.calls.append(digits)
+                return _production_outcome(
+                    selected,
+                    digits=digits,
+                    status=ComponentStatus.NOT_CONVERGED,
+                )
+
+            def execute_promoted_stage(self, selected, digits, previous):
+                del previous
+                self.calls.append(digits)
+                component = {
+                    "leaf_id": selected.leaf_id,
+                    "role": selected.role,
+                    "mechanism_id": selected.mechanism_id,
+                    "job_id": selected.job.job_id,
+                    "root_identity_sha256": (
+                        selected.job.root.identity_sha256
+                    ),
+                    "policy_sha256": selected.job.policy.identity_sha256,
+                    "backend_identity_sha256": (
+                        selected.job.backend_identity.identity_sha256
+                    ),
+                    "digits": digits,
+                    "scientific_runtime": self.runtime,
+                }
+                return StageOutcome(
+                    digits=digits,
+                    numerical_state="CONVERGED",
+                    component_result=component,
+                    signed_error_channels=synthetic_stage_signed_error_channels(
+                        component, 1.0
+                    ),
+                    local_disk_radius_abs=1.0,
+                    self_refinement_enclosed=True,
+                    discrepancy_from_previous_abs=0.0,
+                    discrepancy_enclosed=True,
+                )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            checkpoint = Path(temporary) / "checkpoint.json"
+            first = Backend(old_runtime)
+            resumed = Backend(new_runtime)
+            with patch(
+                "windows_solver.response_batches._validate_component_result",
+                return_value=True,
+            ):
+                run_campaign_selection(
+                    plan, selection, first, checkpoint, resume=False
+                )
+                summary = run_campaign_selection(
+                    plan, selection, resumed, checkpoint, resume=True
+                )
+
+            checkpoint_mapping = json.loads(checkpoint.read_text(encoding="utf-8"))
+
+        self.assertEqual(first.calls, [64, 80])
+        self.assertEqual(resumed.calls, [])
+        self.assertEqual(summary.executed_stage_count, 0)
+        self.assertEqual(summary.reused_stage_count, 2)
+        self.assertEqual(
+            tuple(stage.outcome.digits for stage in summary.records[0].stages),
+            (64, 80),
+        )
+        self.assertEqual(
+            checkpoint_mapping["records"][0]["stages"][1]
+            ["component_result"]["scientific_runtime"]["worker_sha256"],
+            "a" * 64,
+        )
+
     def test_promoted_invalidation_preserves_binary64_and_resumes_first_tier(self):
         """Catches receipt invalidation discarding authenticated binary64 work."""
 
