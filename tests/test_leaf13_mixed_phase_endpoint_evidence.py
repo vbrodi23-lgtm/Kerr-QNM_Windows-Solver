@@ -14,6 +14,7 @@ class Leaf13MixedPhaseEndpointEvidenceTests(unittest.TestCase):
     @staticmethod
     def _request_binding() -> dict[str, object]:
         return {
+            "operation": "root-readout",
             "mechanism_id": "horizon-admittance",
             "policy": {
                 "promoted_root_readout_policy": PROMOTED_ROOT_READOUT_POLICY,
@@ -76,6 +77,24 @@ class Leaf13MixedPhaseEndpointEvidenceTests(unittest.TestCase):
     def test_nonpromoted_receipt_cannot_claim_truncation_refinement(self):
         request = self._request_binding()
         del request["policy"]["promoted_root_readout_policy"]
+        primary = valid_horizon_endpoint_search_evidence(request)[0]
+
+        truncation_request = deepcopy(request)
+        truncation_request["policy"]["endpoint_series_order"] = 36
+        truncation = valid_horizon_endpoint_search_evidence(
+            truncation_request
+        )[0]
+
+        with self.assertRaisesRegex(
+            ValueError, "horizon endpoint search evidence is invalid"
+        ):
+            _validated_successful_horizon_endpoint_search_evidence(
+                [primary, truncation], request
+            )
+
+    def test_non_root_readout_cannot_claim_truncation_refinement(self):
+        request = self._request_binding()
+        request["operation"] = "fixed-root-determinant-sample"
         primary = valid_horizon_endpoint_search_evidence(request)[0]
 
         truncation_request = deepcopy(request)
