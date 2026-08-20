@@ -281,7 +281,8 @@ class AdaptiveODEBudgetTests(unittest.TestCase):
             policy["determinant_error_model"],
             "exterior-determinant-absolute-error-certificate/empirical-v1",
         )
-        self.assertEqual(policy["determinant_error_safety_factor"], "64")
+        self.assertIs(type(policy["determinant_error_safety_factor"]), int)
+        self.assertEqual(policy["determinant_error_safety_factor"], 64)
         self.assertEqual(
             policy["determinant_error_required_term_classes"],
             [

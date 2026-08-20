@@ -22,6 +22,9 @@ jobs:
       JULIA_PKG_PRECOMPILE_AUTO: "0"
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
       - uses: julia-actions/setup-julia@v3
         with:
           version: "1.10.11"
@@ -77,10 +80,24 @@ jobs:
       - name: Run worker determinant and finite-difference authentication regression
         shell: bash
         run: |
+          fixture="$RUNNER_TEMP/m02-promoted-request-contract.json"
+          preflight_batch="$RUNNER_TEMP/m02-promoted-request-batch.json"
+          preflight_response="$RUNNER_TEMP/m02-promoted-request-response.json"
+          PYTHONPATH=src python tools/preflight_m02_promoted_request.py \
+            --write-contract-fixture "$fixture"
+          PYTHONPATH=src python tools/preflight_m02_promoted_request.py \
+            --write-preflight-batch "$preflight_batch"
+          julia --startup-file=no --history-file=no --project="$M02_PROJECT" \
+            src/windows_solver/data/julia/m02_worker.jl \
+            --validate-request-batch "$preflight_batch" "$preflight_response"
+          PYTHONPATH=src python tools/preflight_m02_promoted_request.py \
+            --verify-preflight-response \
+            "$preflight_batch" "$preflight_response"
           julia --startup-file=no --history-file=no --project="$M02_PROJECT" \
             src/windows_solver/data/julia/m02_worker_finite_difference_spec.jl
           julia --startup-file=no --history-file=no --project="$M02_PROJECT" \
-            src/windows_solver/data/julia/m02_worker_request_contract_spec.jl
+            src/windows_solver/data/julia/m02_worker_request_contract_spec.jl \
+            "$fixture"
           julia --startup-file=no --history-file=no --project="$M02_PROJECT" \
             tools/leaf13_horizon_harness_spec.jl
 

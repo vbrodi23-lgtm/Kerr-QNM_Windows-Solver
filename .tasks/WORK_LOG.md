@@ -2,6 +2,36 @@
 
 Add the newest completed task or milestone-control entry immediately below this heading.
 
+## 2026-08-21 — TASK-079 PR #59 promoted-policy boundary repair
+
+- **Task:** TASK-079 — Regularise promoted GSN propagation and determinant conditioning.
+- **Deliverable:** Removed the exterior certificate safety factor from shared
+  horizon geometry, made current exterior requests carry the receipt-owned
+  integer `64` while preserving horizon string `"64"`, prohibited duplicate
+  authenticated policy fragments, and added a cached production-request
+  preflight that crosses canonical Python JSON into Julia flattening and policy
+  validation without numerical work. The preflight covers exterior 40/80/120
+  base/refinement and horizon 80/120 base/refinement requests and is bound to
+  backend, worker, calibration receipt, policy, capability, and request-set
+  identities.
+- **Compatibility:** Froze the PR #58 schema-8 checkpoint binding and schema-7
+  request identities; characterized the full saved campaign envelope with all
+  40 prior records and the exact nine accepted promoted-horizon leaves; proved
+  Leaf 42 remains nonterminal after the protocol failure, retries at BigFloat-80,
+  and proceeds to Leaf 43 without retiring prior work. Old exterior readout-cache
+  and partial-journal identities remain present while corrected requests use new
+  content-addressed identities.
+- **Verification:** Full safe Python discovery passed 983 tests with 7 skips;
+  Python compilation, TaskPlanner validation, and diff hygiene passed. Three
+  independent read-only reviews found no remaining P0–P3 issues. The genuine
+  Python-to-Julia worker CLI preflight is installed in hosted CI; Julia was not
+  available locally. No determinant, Newton, angular, coordinate, ODE, Kerr,
+  campaign, or PowerShell production execution was performed.
+- **Evidence ceiling:** TASK-079 remains In Progress pending hosted Julia CI,
+  native operator evidence, physical results, and human mathematics review.
+- **Change reference:** draft PR
+  [#59](https://github.com/vbrodi23-lgtm/Kerr-QNM_Windows-Solver/pull/59).
+
 ## 2026-08-19 — TASK-079 exact recovery evidence re-review
 
 - **Task:** TASK-079 — Regularise promoted GSN propagation and determinant conditioning.

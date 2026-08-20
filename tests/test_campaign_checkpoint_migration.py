@@ -25,6 +25,8 @@ from windows_solver.response_batches import (
 )
 from windows_solver.response_engine import (
     HISTORICAL_PROMOTED_ROOT_READOUT_POLICY,
+    NumericalPolicy,
+    VettedNativeDeterminantKernel,
     regularised_gsn_precision_policy,
 )
 
@@ -75,6 +77,92 @@ _ORIGIN_CAMPAIGN_BINDINGS = {
 }
 
 
+class Pr59CheckpointCompatibilityTests(unittest.TestCase):
+    def test_pr58_checkpoint_and_schema7_bindings_remain_byte_stable(self):
+        """Freeze current and historical identities used by Leaf 42 resume."""
+
+        plan = batch_module.build_campaign_plan(
+            policy=NumericalPolicy(),
+            backend_identity=VettedNativeDeterminantKernel.identity,
+            precision_capabilities=batch_module.PrecisionCapabilities(
+                (64, 80, 120)
+            ),
+        )
+        selection = batch_module.build_campaign_selection(plan, role="all")
+
+        self.assertEqual(
+            plan.campaign_id,
+            "b-prime-campaign-5bed3823a9c565d29b79292702a50b98dad1823b58cfb0ad2760ec3dcc5b7b8a",
+        )
+        self.assertEqual(
+            plan.policy.identity_sha256,
+            "2d7cee336c6126a11bccd652ee35e73de60837e9418476849b9026cd27bf6171",
+        )
+        self.assertEqual(
+            plan.precision_factory_identity.module_sha256,
+            "f9cf83ce874f0c93086aa79a29dc76ab043ce98d4e02df3558ccb49340beeb50",
+        )
+        self.assertEqual(
+            selection.selection_id,
+            "campaign-selection-f2b224d967cf66c80ca59e8029680e47ac440410f2e0b8fe56e2680a6892d4c0",
+        )
+        self.assertEqual(
+            batch_module._checkpoint_precision_contract_sha256(
+                CAMPAIGN_CHECKPOINT_SCHEMA_VERSION
+            ),
+            "6aed848e453a4a4b81331e857982447631d152a43521b9397dec250a42e5cb7b",
+        )
+        checkpoint_bindings = batch_module._checkpoint_bindings(
+            plan, selection
+        )
+        self.assertEqual(
+            checkpoint_bindings["selection_jobs_sha256"],
+            "32e39a65e273635434026133fca6f77fb137c816df5c6949b266d9734c9ac842",
+        )
+        self.assertEqual(
+            hashlib.sha256(
+                canonical_json_bytes(
+                    checkpoint_bindings["campaign_bindings"]
+                )
+            ).hexdigest(),
+            "5bed3823a9c565d29b79292702a50b98dad1823b58cfb0ad2760ec3dcc5b7b8a",
+        )
+        self.assertEqual(
+            hashlib.sha256(
+                canonical_json_bytes(checkpoint_bindings)
+            ).hexdigest(),
+            "d4b3fc99e0bcfc7557696d76104aebce1e55d6dba85334bb9eb2bd284cc81162",
+        )
+
+        expected_schema7_digests = {
+            "b-prime-leaf-28b8e2f139fae4ebbb839320057a127429f7a01a3cc2cac60b526815ad0e7252": (
+                "95fa2510c95393a691e4301eead301ff78cdde19a1498bca4dea76f9a9a5d32a"
+            ),
+            "b-prime-leaf-5a27a5fdc15f95de33d6773b16f89a9f594fe5ffd018f9ee94bbab91949fd653": (
+                "ed87c8cdef4156b6970f069f2a13061cf8e6b8a3e45092480ea7eb1cfe494794"
+            ),
+        }
+        leaves = {leaf.leaf_id: leaf for leaf in plan.leaves}
+        for leaf_id, expected_digest in expected_schema7_digests.items():
+            with self.subTest(leaf_id=leaf_id):
+                request = batch_module._schema7_julia_root_request(
+                    leaves[leaf_id].job,
+                    80,
+                    0,
+                    0.0j,
+                    None,
+                    None,
+                )
+                self.assertEqual(
+                    request["policy"]["determinant_error_safety_factor"],
+                    "64",
+                )
+                self.assertEqual(
+                    hashlib.sha256(canonical_json_bytes(request)).hexdigest(),
+                    expected_digest,
+                )
+
+
 def _origin_schema7_request(leaf, request):
     regularised = dict(regularised_gsn_precision_policy(leaf.job.mechanism_id))
     regularised["promoted_root_readout_policy"] = (
@@ -89,6 +177,7 @@ def _origin_schema7_request(leaf, request):
         "readout_radius": format(leaf.job.policy.readout_radius, ".17g"),
         **controls,
         **julia_backend.horizon_geometry_controls(),
+        "determinant_error_safety_factor": "64",
         **regularised,
         "endpoint_series_order": leaf.job.policy.endpoint_series_order,
         "support_subinterval_count": leaf.job.policy.support_subinterval_count,

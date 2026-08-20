@@ -37,7 +37,10 @@ from windows_solver.response_batches import (
     run_campaign_selection,
     synthetic_stage_signed_error_channels,
 )
-from windows_solver.julia_response_backend import JuliaPrecisionRootBackend
+from windows_solver.julia_response_backend import (
+    JuliaPrecisionRootBackend,
+    JuliaResponseBackendError,
+)
 from windows_solver.response_engine import (
     BackendIdentity,
     ComponentResult,
@@ -51,6 +54,11 @@ from windows_solver.response_engine import (
 )
 from windows_solver.progress import activate_progress
 from windows_solver.progress_output import CampaignProgressReporter
+from windows_solver.root_readout_cache import (
+    RootReadoutLookupStatus,
+    RootReadoutStore,
+    runtime_identity_sha256,
+)
 from windows_solver.solved_leaf_cache import SolvedLeafLookupStatus, SolvedLeafStore
 from tests.fixtures import (
     current_promoted_component_payload,
@@ -2508,6 +2516,295 @@ class SolvedLeafCacheTests(unittest.TestCase):
             checkpoint_mapping["records"][0]["stages"][1]
             ["component_result"]["scientific_runtime"]["worker_sha256"],
             "a" * 64,
+        )
+
+    def test_leaf42_type_repair_characterizes_full_checkpoint_resume(self):
+        """The protocol failure has no receipt and cannot retire prior work."""
+
+        capabilities = PrecisionCapabilities((64, 80, 120))
+        plan = build_campaign_plan(
+            policy=NumericalPolicy(),
+            backend_identity=VettedNativeDeterminantKernel.identity,
+            precision_capabilities=capabilities,
+        )
+        all_selection = build_campaign_selection(plan, role="all")
+        execution_ids = response_batches._campaign_execution_leaf_ids(
+            plan, all_selection
+        )
+        leaf_42_id = (
+            "b-prime-leaf-5a27a5fdc15f95de33d6773b16f89a9f594fe5ffd018f9ee94bbab91949fd653"
+        )
+        leaf_13_horizon_id = (
+            "b-prime-leaf-28b8e2f139fae4ebbb839320057a127429f7a01a3cc2cac60b526815ad0e7252"
+        )
+        self.assertEqual(execution_ids[40], leaf_42_id)
+        leaf_43_id = execution_ids[41]
+        # These are the exact nine promoted-horizon leaves in the preserved
+        # operator receipt inventory. The stage payloads below remain a safe
+        # orchestration model; they do not claim to recreate archived numerics.
+        promoted_horizon_ids = frozenset({
+            leaf_13_horizon_id,
+            "b-prime-leaf-9c8e2306e6b3deef2b45b7b7c4cfc7243e65d5c8a52d533c158b3d4d34b2bfde",
+            "b-prime-leaf-5ba0cad4211e48b2bf283536e5e9478bf91fe70667a246db98785d7826b8da8d",
+            "b-prime-leaf-c398b8a238c89e91bd0672fd032a211c0e39f43adb993102892017ae762bac05",
+            "b-prime-leaf-e5ca7b9ca2a529549bc3aa5af4aead758fddc114757d1e5cc96ff139e924f1e0",
+            "b-prime-leaf-10f14c3df33e2bac0e0c53b94018422df0f0e9b90a3af1f043ec960bcc584b23",
+            "b-prime-leaf-53afb256f4d9a517f36c216ae6d12ad9d599950e34f1179fe0b7d05e69b70973",
+            "b-prime-leaf-7fec2f65a174db68a3462684482dcd1f703c472d187b113a3f96e07f67f284e6",
+            "b-prime-leaf-a141a222ab4ee5c308d9105805c8d04e7b5df552dee0d8bfdc56d3f388e9c7de",
+        })
+        self.assertEqual(len(promoted_horizon_ids), 9)
+        self.assertTrue(all(
+            next(
+                leaf for leaf in plan.leaves if leaf.leaf_id == leaf_id
+            ).mechanism_id
+            == "horizon-admittance"
+            for leaf_id in promoted_horizon_ids
+        ))
+        selection = all_selection
+        leaf_by_id = {leaf.leaf_id: leaf for leaf in plan.leaves}
+        leaf_42 = leaf_by_id[leaf_42_id]
+        receipt = NativeCampaignStageBackend(
+            object(), capabilities, object(), julia_adapter=object()
+        ).calibration_receipt
+        assert receipt is not None
+        request_backend = JuliaPrecisionRootBackend(
+            leaf_42.job.backend_identity,
+            SimpleNamespace(runtime_provenance={}),
+            80,
+            empirical_control_profile=receipt.budget_for(
+                "exterior-wronskian/v1", 80
+            ),
+            calibration_receipt=receipt,
+        )
+        corrected_request = request_backend._request(leaf_42.job, 0.0j)
+        self.assertIs(
+            type(
+                corrected_request["policy"][
+                    "determinant_error_safety_factor"
+                ]
+            ),
+            int,
+        )
+        corrected_sha256 = hashlib.sha256(
+            canonical_json_bytes(corrected_request)
+        ).hexdigest()
+        obsolete_request = deepcopy(corrected_request)
+        obsolete_request["policy"]["determinant_error_safety_factor"] = "64"
+        obsolete_sha256 = hashlib.sha256(
+            canonical_json_bytes(obsolete_request)
+        ).hexdigest()
+        self.assertEqual(
+            obsolete_sha256,
+            "281e8f958ad79a541dedd368af78cadd1ff99899cb971008b652a684c0dc45cc",
+        )
+        self.assertEqual(
+            corrected_sha256,
+            "95934bdfb8cb9ccc070ba1a601b8c41a8cedecec7113b3228fc2d1c82ee11637",
+        )
+        self.assertNotEqual(obsolete_sha256, corrected_sha256)
+
+        class StopAfterLeaf42(RuntimeError):
+            pass
+
+        class Backend:
+            identity = plan.backend_identity
+            precision_capabilities = capabilities
+
+            def __init__(self, *, fail_leaf_42, stop_leaf_id=None):
+                self.fail_leaf_42 = fail_leaf_42
+                self.stop_leaf_id = stop_leaf_id
+                self.calls = []
+                self.promoted_request_sha256s = []
+
+            def execute_stage(self, leaf, digits):
+                self.calls.append((leaf.leaf_id, digits))
+                if leaf.leaf_id == self.stop_leaf_id:
+                    raise StopAfterLeaf42(
+                        "characterization stopped after repaired Leaf 42"
+                    )
+                status = (
+                    ComponentStatus.NOT_CONVERGED
+                    if leaf.leaf_id in promoted_horizon_ids | {leaf_42_id}
+                    else ComponentStatus.CONVERGED
+                )
+                return _production_outcome(leaf, digits=digits, status=status)
+
+            def execute_promoted_stage(self, leaf, digits, previous):
+                del previous
+                self.calls.append((leaf.leaf_id, digits))
+                if leaf.leaf_id == leaf_42_id and self.fail_leaf_42:
+                    raise JuliaResponseBackendError(
+                        "regularised GSN mechanism policy "
+                        "determinant_error_safety_factor is invalid"
+                    )
+                if leaf.leaf_id == leaf_42_id:
+                    emitted_request = request_backend._request(leaf.job, 0.0j)
+                    self.promoted_request_sha256s.append(hashlib.sha256(
+                        canonical_json_bytes(emitted_request)
+                    ).hexdigest())
+                outcome = _production_outcome(
+                    leaf, digits=digits, status=ComponentStatus.CONVERGED
+                )
+                outcome = replace(
+                    outcome,
+                    self_refinement_enclosed=True,
+                    discrepancy_from_previous_abs=0.0,
+                    discrepancy_enclosed=True,
+                )
+                return outcome
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkpoint = root / "leaf42-checkpoint.json"
+            readout_store = RootReadoutStore(root / "root-readouts")
+            runtime_identity = runtime_identity_sha256({
+                "worker_sha256": "f" * 64,
+            })
+            obsolete_cache_path = readout_store.publish(
+                request_sha256=obsolete_sha256,
+                runtime_identity=runtime_identity,
+                response={
+                    "status": "ok",
+                    "request_sha256": obsolete_sha256,
+                    "fixture": "obsolete promoted-exterior wire identity",
+                },
+            )
+            self.assertIs(
+                readout_store.lookup(
+                    request_sha256=corrected_sha256,
+                    runtime_identity=runtime_identity,
+                ).status,
+                RootReadoutLookupStatus.MISSING,
+            )
+            initial = Backend(fail_leaf_42=True)
+            reporter = CampaignProgressReporter(
+                "normal", checkpoint, io.StringIO()
+            )
+            with patch(
+                "windows_solver.response_batches._validate_component_result",
+                return_value=True,
+            ):
+                with activate_progress(reporter):
+                    with self.assertRaisesRegex(
+                        JuliaResponseBackendError,
+                        "determinant_error_safety_factor is invalid",
+                    ):
+                        run_campaign_selection(
+                            plan, selection, initial, checkpoint, resume=False
+                        )
+
+            partial_bytes = checkpoint.read_bytes()
+            partial = json.loads(partial_bytes)
+            status = json.loads(
+                Path(f"{checkpoint}.status.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(partial["state"], "PARTIAL")
+            self.assertEqual(len(partial["records"]), 41)
+            self.assertEqual(
+                sum(record["computed"] for record in partial["records"]), 40
+            )
+            current = next(
+                record
+                for record in partial["records"]
+                if record["leaf_id"] == leaf_42_id
+            )
+            self.assertEqual(current["leaf_id"], leaf_42_id)
+            self.assertFalse(current["computed"])
+            self.assertEqual([stage["digits"] for stage in current["stages"]], [64])
+            self.assertEqual(partial["attempts"], [])
+            self.assertNotIn(obsolete_sha256, partial_bytes.decode("utf-8"))
+            self.assertEqual(
+                status["persistence"]["current_leaf"],
+                {
+                    "leaf_id": leaf_42_id,
+                    "terminal_computed": False,
+                    "checkpoint_saved": True,
+                    "receipt_published": False,
+                    "publication_failed": False,
+                },
+            )
+            completed_before = {
+                record["leaf_id"]: deepcopy(record)
+                for record in partial["records"]
+                if record["computed"]
+            }
+            self.assertEqual(len(completed_before), 40)
+            promoted_horizon_before = {
+                leaf_id: completed_before[leaf_id]
+                for leaf_id in promoted_horizon_ids
+            }
+            self.assertTrue(all(
+                [stage["digits"] for stage in record["stages"]] == [64, 80]
+                for record in promoted_horizon_before.values()
+            ))
+
+            resumed_backend = Backend(
+                fail_leaf_42=False,
+                stop_leaf_id=leaf_43_id,
+            )
+            with patch(
+                "windows_solver.response_batches._validate_component_result",
+                return_value=True,
+            ):
+                with self.assertRaisesRegex(
+                    StopAfterLeaf42,
+                    "stopped after repaired Leaf 42",
+                ):
+                    run_campaign_selection(
+                        plan,
+                        selection,
+                        resumed_backend,
+                        checkpoint,
+                        resume=True,
+                    )
+            completed = json.loads(checkpoint.read_bytes())
+
+            completed_after = {
+                record["leaf_id"]: record
+                for record in completed["records"]
+                if record["leaf_id"] in completed_before
+            }
+            self.assertEqual(completed_after, completed_before)
+            self.assertTrue(obsolete_cache_path.is_file())
+            self.assertEqual(readout_store.stored_count, 1)
+            self.assertIs(
+                readout_store.lookup(
+                    request_sha256=obsolete_sha256,
+                    runtime_identity=runtime_identity,
+                ).status,
+                RootReadoutLookupStatus.HIT,
+            )
+            self.assertIs(
+                readout_store.lookup(
+                    request_sha256=corrected_sha256,
+                    runtime_identity=runtime_identity,
+                ).status,
+                RootReadoutLookupStatus.MISSING,
+            )
+
+        self.assertEqual(
+            resumed_backend.calls,
+            [(leaf_42_id, 80), (leaf_43_id, 64)],
+        )
+        self.assertEqual(
+            resumed_backend.promoted_request_sha256s,
+            [corrected_sha256],
+        )
+        self.assertEqual(completed["state"], "PARTIAL")
+        self.assertEqual(
+            sum(record["computed"] for record in completed["records"]),
+            41,
+        )
+        self.assertEqual(completed["attempts"], [])
+        corrected = next(
+            record
+            for record in completed["records"]
+            if record["leaf_id"] == leaf_42_id
+        )
+        self.assertTrue(corrected["computed"])
+        self.assertEqual(
+            [stage["digits"] for stage in corrected["stages"]], [64, 80]
         )
 
     def test_promoted_invalidation_preserves_binary64_and_resumes_first_tier(self):
