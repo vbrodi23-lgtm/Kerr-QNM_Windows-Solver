@@ -1,0 +1,189 @@
+name: leaf13-tdd-hotfix
+
+on:
+  push:
+    branches:
+      - fix/leaf13-mixed-phase-endpoint-evidence
+
+permissions:
+  contents: write
+
+jobs:
+  red-green:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/leaf13-mixed-phase-endpoint-evidence
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Detect completed patch
+        id: patch-state
+        shell: bash
+        run: |
+          if grep -q "expected_order_ladders =" src/windows_solver/response_engine.py; then
+            echo "applied=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "applied=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Verify regression is red
+        if: steps.patch-state.outputs.applied != 'true'
+        shell: bash
+        run: |
+          set +e
+          PYTHONPATH=src python -m unittest -v \
+            tests.test_leaf13_mixed_phase_endpoint_evidence \
+            > leaf13-red.log 2>&1
+          status=$?
+          set -e
+          cat leaf13-red.log
+          if [ "$status" -eq 0 ]; then
+            echo "Leaf 13 regression unexpectedly passed before the fix" >&2
+            exit 1
+          fi
+          grep -q \
+            "test_accepts_primary_truncation_resolution_endpoint_evidence" \
+            leaf13-red.log
+          grep -q "horizon endpoint search evidence is invalid" leaf13-red.log
+
+      - name: Apply minimal mixed-phase validator fix
+        if: steps.patch-state.outputs.applied != 'true'
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path("src/windows_solver/response_engine.py")
+          text = path.read_text(encoding="utf-8")
+
+          old_orders = '''    expected_orders: list[int] = []
+              order = base_order
+              while order < maximum_order:
+                  expected_orders.append(order)
+                  order += order
+              expected_orders.append(maximum_order)
+          '''.replace("          ", "")
+          new_orders = '''    def endpoint_order_ladder(candidate_base_order: int) -> list[int]:
+              values: list[int] = []
+              order = candidate_base_order
+              while order < maximum_order:
+                  values.append(order)
+                  order += order
+              values.append(maximum_order)
+              return values
+
+              allowed_base_orders = {base_order}
+              if (
+                  not allow_historical_schema7_policy
+                  and policy.get("promoted_root_readout_policy")
+                  == PROMOTED_ROOT_READOUT_POLICY
+                  and base_order + 8 <= maximum_order
+              ):
+                  # Wire schema 9 accumulates successful endpoint searches from
+                  # PRIMARY, TRUNCATION, and RESOLUTION in one sealed response.
+                  # TRUNCATION alone raises the base order by exactly eight.
+                  allowed_base_orders.add(base_order + 8)
+              expected_order_ladders = {
+                  tuple(ladder): ladder
+                  for ladder in (
+                      endpoint_order_ladder(candidate_base_order)
+                      for candidate_base_order in sorted(allowed_base_orders)
+                  )
+              }
+              expected_orders: list[int] = []
+              observed_order_ladders: set[tuple[int, ...]] = set()
+          '''.replace("          ", "")
+
+          old_item = '''        if (
+              item["outcome"] != expected_outcome
+              or item["policy_identity"] != policy_identity
+              or not isinstance(selected_pair, list)
+              or len(selected_pair) != required_selected_count
+              or not isinstance(rejected, list)
+              or not isinstance(orders, list)
+              or not orders
+              or any(
+                  isinstance(order, bool)
+                  or not isinstance(order, int)
+                  or order < 1
+                  for order in orders
+              )
+              or orders != expected_orders
+              or item["homogeneous_rhs_evaluations_before_pair"] != 0
+          ):
+              raise ValueError("horizon endpoint search evidence is invalid")
+          '''.replace("          ", "")
+          new_item = '''        if (
+              not isinstance(orders, list)
+              or not orders
+              or any(
+                  isinstance(order, bool)
+                  or not isinstance(order, int)
+                  or order < 1
+                  for order in orders
+              )
+          ):
+              raise ValueError("horizon endpoint search evidence is invalid")
+              expected_orders = expected_order_ladders.get(tuple(orders), [])
+              if (
+                  not expected_orders
+                  or item["outcome"] != expected_outcome
+                  or item["policy_identity"] != policy_identity
+                  or not isinstance(selected_pair, list)
+                  or len(selected_pair) != required_selected_count
+                  or not isinstance(rejected, list)
+                  or item["homogeneous_rhs_evaluations_before_pair"] != 0
+              ):
+                  raise ValueError("horizon endpoint search evidence is invalid")
+              observed_order_ladders.add(tuple(orders))
+          '''.replace("          ", "")
+
+          old_return = '''        if item["outcome"] != recomputed_outcome:
+              raise ValueError("horizon endpoint recovery outcome is invalid")
+              return canonical
+          '''.replace("          ", "")
+          new_return = '''        if item["outcome"] != recomputed_outcome:
+              raise ValueError("horizon endpoint recovery outcome is invalid")
+              primary_order_ladder = tuple(endpoint_order_ladder(base_order))
+              if primary_order_ladder not in observed_order_ladders:
+                  raise ValueError("horizon endpoint PRIMARY evidence is missing")
+              return canonical
+          '''.replace("          ", "")
+
+          replacements = (
+              (old_orders, new_orders, "order ladder"),
+              (old_item, new_item, "per-evidence validation"),
+              (old_return, new_return, "PRIMARY evidence gate"),
+          )
+          for old, new, label in replacements:
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(
+                      f"expected exactly one {label} patch site, found {count}"
+                  )
+              text = text.replace(old, new)
+
+          path.write_text(text, encoding="utf-8")
+          PY
+
+      - name: Verify focused regression is green
+        if: steps.patch-state.outputs.applied != 'true'
+        shell: bash
+        run: |
+          PYTHONPATH=src python -m unittest -v \
+            tests.test_leaf13_mixed_phase_endpoint_evidence
+
+      - name: Commit production fix
+        if: steps.patch-state.outputs.applied != 'true'
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/windows_solver/response_engine.py
+          git commit -m "fix(m02): authenticate mixed-phase endpoint evidence"
+          git push origin HEAD:fix/leaf13-mixed-phase-endpoint-evidence
