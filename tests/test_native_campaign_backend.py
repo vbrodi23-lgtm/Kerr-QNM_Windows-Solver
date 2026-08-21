@@ -340,6 +340,26 @@ class NativeCampaignBackendTests(unittest.TestCase):
             outcome.component_result["self_refinement_skipped_reason"],
             "NOT_REQUIRED_BY_FIXED_ROOT_DERIVATIVE_POLICY",
         )
+        self.assertIs(
+            outcome.component_result[
+                "precision_ladder_discrepancy_applicable"
+            ],
+            True,
+        )
+        self.assertIsNone(
+            outcome.component_result[
+                "precision_ladder_discrepancy_reason"
+            ]
+        )
+        repeat_channel = next(
+            item
+            for item in outcome.signed_error_channels
+            if item["family"] == "repeat-polish"
+        )
+        self.assertEqual(
+            repeat_channel["provenance"]["derivation"],
+            "not-applicable-repeat-polish",
+        )
         ledger_radius = sum(
             abs(complex(
                 item["signed_delta"]["real"],
@@ -348,6 +368,77 @@ class NativeCampaignBackendTests(unittest.TestCase):
             for item in outcome.signed_error_channels
         )
         self.assertAlmostEqual(ledger_radius, outcome.local_disk_radius_abs)
+
+    def test_promoted_exterior_never_labels_root_delta_as_response_delta(self):
+        job = self.leaf.job
+        unavailable = ComponentResult(
+            job_id=job.job_id,
+            leaf_id=job.leaf_id,
+            mechanism_id=job.mechanism_id,
+            status=ComponentStatus.NOT_CONVERGED,
+            convergence_basis="UNRESOLVED",
+            response=None,
+            signed_root_crosscheck=None,
+            closed_form_response=None,
+            error_channels={name: 0.0 for name in ERROR_CHANNELS},
+            baseline=RootReadout(
+                omega=job.root.omega + complex(1.0e-3, -2.0e-3),
+                determinant_residual_abs=1.0e-12,
+                determinant_derivative_abs=2.0,
+                converged=False,
+                root_reference_id=job.root.root_reference_id,
+                branch_id=job.root.branch_id,
+                equation_id=job.equation_id,
+                truncation_radius=None,
+                resolution_radius=None,
+                seed_path_radius=None,
+                diagnostics_skipped_reason="PRIMARY_NOT_CONVERGED",
+            ),
+            levels=(),
+            lineage=_lineage(job),
+        )
+        promoted = _result(job, 1.0 + 2.0e-8j)
+        previous = SimpleNamespace(
+            digits=64,
+            component_result={"result": unavailable.to_mapping()},
+            local_disk_radius_abs=1.0e-6,
+        )
+
+        with patch(
+            "windows_solver.response_batches.run_promoted_exterior_component",
+            return_value=promoted,
+        ):
+            outcome = self.backend.execute_promoted_stage(
+                self.leaf, 80, (previous,)
+            )
+
+        self.assertIsNone(outcome.discrepancy_from_previous_abs)
+        self.assertIsNone(outcome.discrepancy_enclosed)
+        self.assertIs(
+            outcome.component_result[
+                "precision_ladder_discrepancy_applicable"
+            ],
+            False,
+        )
+        self.assertEqual(
+            outcome.component_result[
+                "precision_ladder_discrepancy_reason"
+            ],
+            "BINARY64_COMPONENT_RESPONSE_UNAVAILABLE",
+        )
+        precision_channel = next(
+            item
+            for item in outcome.signed_error_channels
+            if item["family"] == "precision-ladder-discrepancy"
+        )
+        self.assertEqual(
+            precision_channel["provenance"]["derivation"],
+            "not-applicable-precision-ladder-discrepancy",
+        )
+        self.assertEqual(
+            precision_channel["signed_delta"],
+            {"real": 0.0, "imaginary": 0.0},
+        )
 
     def test_default_promoted_stage_uses_committed_empirical_profile(self):
         previous_result = _result(self.leaf.job, 1.0 + 0.0j)
@@ -489,6 +580,10 @@ class NativeCampaignBackendTests(unittest.TestCase):
         )
         self.assertIs(
             component["precision_ladder_discrepancy_applicable"], False
+        )
+        self.assertEqual(
+            component["precision_ladder_discrepancy_reason"],
+            "BINARY64_COMPONENT_RESPONSE_UNAVAILABLE",
         )
         self.assertIsNone(component["self_refinement_result"])
         self.assertEqual(

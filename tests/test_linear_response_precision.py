@@ -4068,7 +4068,7 @@ class DeepPrecisionTests(unittest.TestCase):
                     "digits": digits,
                     "numerical_state": "CONVERGED",
                     "component_result": {
-                        "kind": "deterministic-contract",
+                        "evidence_kind": "synthetic-orchestration-contract",
                         "leaf_id": leaf.leaf_id,
                         "digits": digits,
                     },

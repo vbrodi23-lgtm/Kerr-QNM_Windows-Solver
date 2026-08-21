@@ -11,6 +11,7 @@ from dataclasses import dataclass, field, replace
 from contextvars import ContextVar
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
+from enum import Enum
 import hashlib
 import json
 import math
@@ -164,6 +165,18 @@ _FAILED_PREFLIGHT_COMPARISON_KIND = (
 )
 _FAILED_PREFLIGHT_SINGLE_HORIZON_KIND = (
     "single-promoted-horizon-root-after-80-preflight/v1"
+)
+_FAILED_PREFLIGHT_FIXED_ROOT_EXTERIOR_KIND = (
+    "failed-preflight-120-fixed-root-exterior-derivative/v1"
+)
+_FIXED_ROOT_EXTERIOR_SELF_REFINEMENT_SKIPPED_REASON = (
+    "NOT_REQUIRED_BY_FIXED_ROOT_DERIVATIVE_POLICY"
+)
+_BINARY64_RESPONSE_UNAVAILABLE_REASON = (
+    "BINARY64_COMPONENT_RESPONSE_UNAVAILABLE"
+)
+_PREVIOUS_PROMOTED_RESPONSE_UNAVAILABLE_REASON = (
+    "PREVIOUS_PROMOTED_COMPONENT_RESPONSE_UNAVAILABLE"
 )
 _FACTORED_HOMOGENEOUS_ODE_SCOPE_ID = "factored-homogeneous-gsn/v1"
 STAGE_SIGNED_ERROR_FAMILIES = (
@@ -607,10 +620,30 @@ def _component_stage_signed_error_channels(
         for family, channel in family_sources.items()
         if channel is not None and not applicability[channel]
     }
+    identityless_fixed_readout_failure = (
+        component_result.get("evidence_kind")
+        in {
+            _ANALYTIC_HORIZON_EVIDENCE_KIND,
+            _FIXED_ROOT_EXTERIOR_EVIDENCE_KIND,
+        }
+        and result.component_scientific_identity is None
+        and result.status in _TYPED_FIXED_READOUT_FAILURE_STATUSES
+    )
+    if identityless_fixed_readout_failure:
+        # A baseline-only fixed-readout failure did not execute any response
+        # uncertainty phase.  ComponentResult's legacy unresolved defaults mark
+        # the six channels applicable, so override that transport default here
+        # instead of recording fabricated applicable zeroes.
+        not_applicable.update(
+            family for family, channel in family_sources.items()
+            if channel is not None
+        )
     if not repeat_applicable:
         not_applicable.add("repeat-polish")
     if not precision_ladder_applicable:
         not_applicable.add("precision-ladder-discrepancy")
+    for family in not_applicable:
+        deltas[family] = 0.0j
     return explicit_stage_signed_error_channels(
         component_result,
         family_deltas=deltas,
@@ -1398,8 +1431,7 @@ def _validate_failed_preflight_attempt_request(
     predictor_value: complex | None = None
     if raw_predictor is not None:
         dedicated_baseline_predictor = (
-            leaf.mechanism_id == "horizon-admittance"
-            and precision_digits in (80, 120)
+            precision_digits in (80, 120)
             and refinement_level == 0
             and amplitude_value == 0.0j
             and predictor_kind is None
@@ -1466,20 +1498,54 @@ def _validate_failed_preflight_attempt_request(
             else None
         )
         validated_budget = _ode_error_budget_from_mapping(request_budget)
-        if validated_budget is None:
+        if validated_budget is not None:
+            expected_request = _CanonicalRequestJuliaPrecisionRootBackend(
+                leaf.job.backend_identity,
+                object(),
+                precision_digits,
+                refinement=refinement_level,
+                ode_error_budget=validated_budget,
+            )._request(
+                leaf.job,
+                amplitude_value,
+                predictor_value,
+                predictor_kind,
+            )
+        elif isinstance(request_policy, Mapping):
+            receipt = load_default_calibration_receipt()
+            family = (
+                "horizon-scattering/v1"
+                if leaf.mechanism_id == "horizon-admittance"
+                else "exterior-wronskian/v1"
+            )
+            profile = receipt.budget_for(family, precision_digits)
+            profile_mapping = profile.to_mapping()
+            if (
+                request_policy.get(
+                    "promoted_control_calibration_receipt_sha256"
+                )
+                != receipt.sha256
+                or request_policy.get("empirical_control_profile_sha256")
+                != _sha256(profile_mapping)
+            ):
+                raise ValueError(
+                    "failed-preflight empirical control binding is invalid"
+                )
+            expected_request = _CanonicalRequestJuliaPrecisionRootBackend(
+                leaf.job.backend_identity,
+                object(),
+                precision_digits,
+                refinement=refinement_level,
+                empirical_control_profile=profile,
+                calibration_receipt=receipt,
+            )._request(
+                leaf.job,
+                amplitude_value,
+                predictor_value,
+                predictor_kind,
+            )
+        else:
             raise ValueError("failed-preflight request ODE budget is invalid")
-        expected_request = JuliaPrecisionRootBackend(
-            leaf.job.backend_identity,
-            object(),
-            precision_digits,
-            refinement=refinement_level,
-            ode_error_budget=validated_budget,
-        )._request(
-            leaf.job,
-            amplitude_value,
-            predictor_value,
-            predictor_kind,
-        )
     expected_request["execution_resource"] = validated_resource
     if dict(request_binding) != expected_request:
         raise ValueError("failed-preflight canonical request contract is invalid")
@@ -1702,6 +1768,54 @@ def _failed_preflight_recovery_failure_for_leaf(
     _validate_failed_preflight_recovery_failure(
         candidates[0],
         leaf,
+        checkpoint_schema_version=checkpoint_schema_version,
+    )
+    return candidates[0]
+
+
+def _ordinary_fixed_readout_precision120_failure_for_leaf(
+    attempts: Sequence[CampaignExecutionAttempt],
+    leaf: CampaignLeafPlan,
+    record: CampaignLeafRecord,
+    *,
+    checkpoint_schema_version: int = CAMPAIGN_CHECKPOINT_SCHEMA_VERSION,
+) -> CampaignExecutionAttempt | None:
+    """Return one durable max-precision failure after an admitted 80 stage."""
+
+    stages = tuple(stage.outcome for stage in record.stages)
+    if tuple(stage.digits for stage in stages) != (64, 80):
+        return None
+    if stages[1].component_result.get("evidence_kind") not in {
+        _ANALYTIC_HORIZON_EVIDENCE_KIND,
+        _FIXED_ROOT_EXTERIOR_EVIDENCE_KIND,
+    }:
+        return None
+    semantics = _promoted_stage_semantics(
+        stages[1], predecessor=stages[0]
+    )
+    if semantics.kind not in {
+        _PromotedStageKind.ANALYTIC_HORIZON,
+        _PromotedStageKind.FIXED_ROOT_EXTERIOR_DERIVATIVE,
+    }:
+        return None
+    candidates = tuple(
+        attempt
+        for attempt in attempts
+        if attempt.leaf_id == leaf.leaf_id
+        and attempt.precision_digits == 120
+    )
+    if len(candidates) > 1:
+        raise ValueError(
+            "campaign has duplicate ordinary 120-digit failures"
+        )
+    if not candidates:
+        return None
+    _validate_failed_preflight_attempt_request(
+        candidates[0],
+        leaf,
+        precision_digits=120,
+        allowed_refinement_levels=frozenset({0}),
+        required_failure_code=None,
         checkpoint_schema_version=checkpoint_schema_version,
     )
     return candidates[0]
@@ -3181,6 +3295,14 @@ def _load_checkpoint_with_attempts(
             leaf,
             checkpoint_schema_version=value["schema_version"],
         )
+        ordinary_precision120_failure = (
+            _ordinary_fixed_readout_precision120_failure_for_leaf(
+                attempts,
+                leaf,
+                record,
+                checkpoint_schema_version=value["schema_version"],
+            )
+        )
         if predecessor is not None and not (
             pending_recovery or digits == (64, 120)
         ):
@@ -3205,6 +3327,15 @@ def _load_checkpoint_with_attempts(
         if recovery_failure is not None and not pending_recovery:
             raise ValueError(
                 "failed-preflight recovery failure has incompatible stage evidence"
+            )
+        if ordinary_precision120_failure is not None and (
+            digits != (64, 80)
+            or record.state
+            not in {"IN_PROGRESS", "INVALID_SENTINEL_FALSE_NEGATIVE"}
+            or record.missing_precision_digits is not None
+        ):
+            raise ValueError(
+                "ordinary 120-digit failure has incompatible stage evidence"
             )
         if digits != (64, 120):
             continue
@@ -3372,11 +3503,157 @@ def _single_promoted_horizon_result(
 
 
 _SELECTIVE_STAGE_EVIDENCE_KIND = "package-owned-selective-readout-promotion"
+_LEGACY_FULL_LADDER_EVIDENCE_KIND = (
+    "package-owned-julia-promoted-component-engine"
+)
+_ANALYTIC_HORIZON_EVIDENCE_KIND = (
+    "package-owned-julia-single-promoted-horizon-component"
+)
+_FIXED_ROOT_EXTERIOR_EVIDENCE_KIND = (
+    "package-owned-julia-fixed-root-exterior-derivative-component"
+)
 _SELECTIVE_TIER_SEQUENCE = (
     "bigfloat-40",
     "bigfloat-80",
     "bigfloat-120",
 )
+_TYPED_FIXED_READOUT_FAILURE_STATUSES = frozenset({
+    ComponentStatus.BRANCH_LOSS,
+    ComponentStatus.NOT_CONVERGED,
+})
+
+
+class _PromotedStageKind(str, Enum):
+    LEGACY_FULL_LADDER = "LEGACY_FULL_LADDER"
+    SELECTIVE_READOUT = "SELECTIVE_READOUT"
+    ANALYTIC_HORIZON = "ANALYTIC_HORIZON"
+    FIXED_ROOT_EXTERIOR_DERIVATIVE = (
+        "FIXED_ROOT_EXTERIOR_DERIVATIVE"
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class _PromotedStageSemantics:
+    kind: _PromotedStageKind
+    result: ComponentResult
+    repeat_applicable: bool
+    precision_ladder_applicable: bool
+    terminal_admissible: bool
+    requires_precision120: bool
+
+
+def _claims_specialized_promoted_semantics(result: ComponentResult) -> bool:
+    """Return whether an identity-less result still claims a special path."""
+
+    return (
+        result.derivative_evidence is not None
+        or result.analytic_horizon_evidence is not None
+        or result.response_method in {
+            EXTERIOR_DERIVATIVE_METHOD,
+            PROMOTED_HORIZON_RESPONSE_METHOD,
+            PROMOTED_HORIZON_RESPONSE_METHOD_V2,
+        }
+        or result.response_uncertainty_status in {
+            BOUNDED_ANALYTIC_RESPONSE,
+            "UNBOUNDED_ANALYTIC_RESPONSE",
+            BOUNDED_DERIVATIVE_RESPONSE,
+            "UNBOUNDED_DERIVATIVE_RESPONSE",
+            UNCALIBRATED_ANALYTIC_RESPONSE,
+        }
+        or result.convergence_basis in {
+            "PRIMARY_TRUNCATION_RESOLUTION_FIXED_ROOT",
+            "FIXED_ROOT_REAL_H_H2_DERIVATIVE_DISK",
+            "UNRESOLVED_FIXED_ROOT_DERIVATIVE",
+        }
+        or result.status is ComponentStatus.DERIVATIVE_UNRESOLVED
+        or result.finite_amplitude_ladder_required is False
+        or result.finite_amplitude_ladder_executed is False
+    )
+
+
+def _classify_promoted_stage(
+    outcome: StageOutcome,
+) -> tuple[_PromotedStageKind, ComponentResult]:
+    """Authenticate a promoted wrapper against its component identity."""
+
+    if outcome.digits not in (80, 120):
+        raise _UnauthenticatedComponentEvidence(
+            "campaign promoted stage precision is invalid"
+        )
+    raw_result = outcome.component_result.get("result")
+    if not isinstance(raw_result, Mapping):
+        raise _UnauthenticatedComponentEvidence(
+            "campaign promoted stage component result is missing"
+        )
+    result = ComponentResult.from_mapping(raw_result)
+    if result.to_mapping() != raw_result:
+        raise _UnauthenticatedComponentEvidence(
+            "campaign promoted stage component result is not canonical"
+        )
+    evidence_kind = outcome.component_result.get("evidence_kind")
+    identity = result.component_scientific_identity
+    specialized_identity_claim = _claims_specialized_promoted_semantics(
+        result
+    )
+
+    if evidence_kind == _SELECTIVE_STAGE_EVIDENCE_KIND:
+        if identity is not None or specialized_identity_claim:
+            raise _UnauthenticatedComponentEvidence(
+                "campaign selective evidence disagrees with component identity"
+            )
+        return _PromotedStageKind.SELECTIVE_READOUT, result
+
+    analytic_identity = identity in {
+        PROMOTED_HORIZON_COMPONENT_IDENTITY,
+        PROMOTED_HORIZON_COMPONENT_V2_IDENTITY,
+    }
+    typed_analytic_failure = (
+        evidence_kind == _ANALYTIC_HORIZON_EVIDENCE_KIND
+        and identity is None
+        and result.mechanism_id == "horizon-admittance"
+        and result.status in _TYPED_FIXED_READOUT_FAILURE_STATUSES
+        and not specialized_identity_claim
+    )
+    if analytic_identity or typed_analytic_failure:
+        if evidence_kind != _ANALYTIC_HORIZON_EVIDENCE_KIND:
+            raise _UnauthenticatedComponentEvidence(
+                "campaign analytic evidence disagrees with component identity"
+            )
+        return _PromotedStageKind.ANALYTIC_HORIZON, result
+    if evidence_kind == _ANALYTIC_HORIZON_EVIDENCE_KIND:
+        raise _UnauthenticatedComponentEvidence(
+            "campaign analytic evidence lacks its component identity"
+        )
+
+    if identity == EXTERIOR_DERIVATIVE_COMPONENT_IDENTITY:
+        if evidence_kind != _FIXED_ROOT_EXTERIOR_EVIDENCE_KIND:
+            raise _UnauthenticatedComponentEvidence(
+                "campaign fixed-root exterior evidence kind is invalid"
+            )
+        return _PromotedStageKind.FIXED_ROOT_EXTERIOR_DERIVATIVE, result
+    typed_exterior_failure = (
+        evidence_kind == _FIXED_ROOT_EXTERIOR_EVIDENCE_KIND
+        and identity is None
+        and result.mechanism_id.startswith("exterior-")
+        and result.status in _TYPED_FIXED_READOUT_FAILURE_STATUSES
+        and not specialized_identity_claim
+    )
+    if typed_exterior_failure:
+        return _PromotedStageKind.FIXED_ROOT_EXTERIOR_DERIVATIVE, result
+    if evidence_kind == _FIXED_ROOT_EXTERIOR_EVIDENCE_KIND:
+        raise _UnauthenticatedComponentEvidence(
+            "campaign fixed-root exterior evidence lacks its component identity"
+        )
+
+    if (
+        evidence_kind == _LEGACY_FULL_LADDER_EVIDENCE_KIND
+        and identity is None
+        and not specialized_identity_claim
+    ):
+        return _PromotedStageKind.LEGACY_FULL_LADDER, result
+    raise _UnauthenticatedComponentEvidence(
+        "campaign promoted stage kind is unrecognized"
+    )
 
 _SELECTIVE_TIER_JOURNAL_SCHEMA = (
     "windows-solver.selective-tier-journal-evidence/1"
@@ -4201,8 +4478,11 @@ def _validate_selective_stage(
             "campaign selective stage runtime tier is invalid"
         )
     result = ComponentResult.from_mapping(raw_result)
+    classified_kind, classified_result = _classify_promoted_stage(outcome)
     if (
-        result.to_mapping() != raw_result
+        classified_kind is not _PromotedStageKind.SELECTIVE_READOUT
+        or classified_result.to_mapping() != result.to_mapping()
+        or result.to_mapping() != raw_result
         or result.job_id != leaf.job.job_id
         or result.leaf_id != leaf.leaf_id
         or result.mechanism_id != leaf.mechanism_id
@@ -4360,7 +4640,12 @@ def _validate_selective_stage(
             raise _UnauthenticatedComponentEvidence(
                 "campaign selective root evidence is invalid"
             )
-    produced = result.status is ComponentStatus.CONVERGED
+    semantics = _promoted_stage_semantics(outcome)
+    if semantics.kind is not _PromotedStageKind.SELECTIVE_READOUT:
+        raise _UnauthenticatedComponentEvidence(
+            "campaign selective stage changed classification"
+        )
+    produced = semantics.terminal_admissible
     if produced != result.usable:
         raise _UnauthenticatedComponentEvidence(
             "campaign selective terminal result body is invalid"
@@ -4375,24 +4660,38 @@ def _validate_selective_stage(
     return result, produced
 
 
-def _validate_single_promoted_horizon_predictor_binding(
+def _validate_fixed_readout_predictor_binding(
     previous: StageOutcome,
     promoted: StageOutcome,
 ) -> None:
-    """Bind a persisted analytic request to the preceding baseline root."""
+    """Bind an analytic/fixed-root request to the preceding baseline root."""
 
-    result = _single_promoted_horizon_result(promoted)
-    if result is None:
+    if not isinstance(promoted.component_result.get("result"), Mapping):
         return
+    kind, result = _classify_promoted_stage(promoted)
+    if kind not in {
+        _PromotedStageKind.ANALYTIC_HORIZON,
+        _PromotedStageKind.FIXED_ROOT_EXTERIOR_DERIVATIVE,
+    }:
+        return
+    _validate_promoted_result_predictor_binding(previous, result)
+
+
+def _validate_promoted_result_predictor_binding(
+    previous: StageOutcome,
+    result: ComponentResult,
+) -> None:
+    """Authenticate one promoted baseline predictor against its predecessor."""
+
     raw_previous = previous.component_result.get("result")
     if not isinstance(raw_previous, Mapping):
         raise _UnauthenticatedComponentEvidence(
-            "promoted horizon predictor predecessor is missing"
+            "promoted fixed-readout predictor predecessor is missing"
         )
     previous_result = ComponentResult.from_mapping(raw_previous)
     if previous_result.to_mapping() != raw_previous:
         raise _UnauthenticatedComponentEvidence(
-            "promoted horizon predictor predecessor is not canonical"
+            "promoted fixed-readout predictor predecessor is not canonical"
         )
     receipt = result.baseline.worker_response_receipt
     request = (
@@ -4410,8 +4709,19 @@ def _validate_single_promoted_horizon_predictor_binding(
         or "primary_predictor_kind" in request
     ):
         raise _UnauthenticatedComponentEvidence(
-            "promoted horizon PRIMARY predictor binding is invalid"
+            "promoted fixed-readout PRIMARY predictor binding is invalid"
         )
+
+
+def _validate_single_promoted_horizon_predictor_binding(
+    previous: StageOutcome,
+    promoted: StageOutcome,
+) -> None:
+    """Compatibility name for the now-shared fixed-readout binding gate."""
+
+    result = _single_promoted_horizon_result(promoted)
+    if result is not None:
+        _validate_promoted_result_predictor_binding(previous, result)
 
 
 def _promotion_decision(
@@ -4600,79 +4910,120 @@ def _validate_attached_promotion_decision(
         raise ValueError("precision promotion decision disagrees with stage evidence")
 
 
-def _primary_existing_requires_precision120(outcome: StageOutcome) -> bool:
-    analytic = _single_promoted_horizon_result(outcome)
-    if analytic is not None:
-        return (
-            analytic.status is not ComponentStatus.CONVERGED
-            or not _component_conditioning_is_adequate(analytic)
-        )
-    if outcome.component_result.get("evidence_kind") == (
-        "package-owned-julia-single-promoted-horizon-component"
-    ):
-        raw_result = outcome.component_result.get("result")
-        if not isinstance(raw_result, Mapping):
+def _primary_existing_requires_precision120(
+    outcome: StageOutcome,
+    *,
+    predecessor: StageOutcome | None = None,
+) -> bool:
+    if not isinstance(outcome.component_result.get("result"), Mapping):
+        gates = _previous_primary_recovery_precision_contract()[
+            "precision120_gates"
+        ]
+        if outcome.numerical_state == gates["component_status"]:
             return True
-        result = ComponentResult.from_mapping(raw_result)
+        if outcome.numerical_state != ComponentStatus.CONVERGED.value:
+            return False
         return (
-            result.status is not ComponentStatus.CONVERGED
-            or not _component_conditioning_is_adequate(result)
+            outcome.self_refinement_enclosed
+            is gates["self_refinement_enclosed"]
+            or outcome.discrepancy_enclosed is gates["discrepancy_enclosed"]
         )
-    gates = _previous_primary_recovery_precision_contract()[
-        "precision120_gates"
-    ]
-    if not isinstance(gates, Mapping):
-        raise ValueError("PRIMARY 120-digit gate contract is invalid")
-    if outcome.numerical_state == gates["component_status"]:
-        return True
-    if outcome.numerical_state != ComponentStatus.CONVERGED.value:
-        return False
-    return (
-        outcome.self_refinement_enclosed
-        is gates["self_refinement_enclosed"]
-        or outcome.discrepancy_enclosed is gates["discrepancy_enclosed"]
-    )
+    return _promoted_stage_semantics(
+        outcome, predecessor=predecessor
+    ).requires_precision120
 
 
-def _primary_precision120_decision(outcome: StageOutcome) -> dict[str, object]:
-    existing_requested = _primary_existing_requires_precision120(outcome)
-    analytic = _single_promoted_horizon_result(outcome)
-    promoted_horizon_stage = analytic is not None or (
-        outcome.component_result.get("evidence_kind")
-        == "package-owned-julia-single-promoted-horizon-component"
-    )
+def _primary_precision120_decision(
+    outcome: StageOutcome,
+    *,
+    predecessor: StageOutcome | None = None,
+) -> dict[str, object]:
+    raw_result = outcome.component_result.get("result")
+    if isinstance(raw_result, Mapping):
+        semantics = _promoted_stage_semantics(
+            outcome, predecessor=predecessor
+        )
+        existing_requested = semantics.requires_precision120
+        promoted_horizon_stage = (
+            semantics.kind is _PromotedStageKind.ANALYTIC_HORIZON
+        )
+        fixed_root_exterior = semantics.kind is (
+            _PromotedStageKind.FIXED_ROOT_EXTERIOR_DERIVATIVE
+        )
+    else:
+        existing_requested = _primary_existing_requires_precision120(outcome)
+        promoted_horizon_stage = False
+        fixed_root_exterior = False
     return _promotion_decision(
         outcome,
         existing_requested=existing_requested,
         requested_reason=(
             "PROMOTED_ROOT_OR_CONDITIONING_GATE"
             if promoted_horizon_stage
+            else "FIXED_ROOT_RESPONSE_OR_CONDITIONING_GATE"
+            if fixed_root_exterior
             else "CONVERGED_REFINEMENT_OR_DISCREPANCY_GATE"
         ),
         suppressed_reason=(
             "PROMOTED_ROOT_EVIDENCE_ACCEPTED"
             if promoted_horizon_stage
+            else "FIXED_ROOT_RESPONSE_EVIDENCE_ACCEPTED"
+            if fixed_root_exterior
             else "CONVERGED_PROMOTION_GATES_SATISFIED"
         ),
-        allow_nonconvergence_suppression=not promoted_horizon_stage,
+        allow_nonconvergence_suppression=(
+            not promoted_horizon_stage and not fixed_root_exterior
+        ),
     )
 
 
 def _deep_precision120_decision(
-    outcome: StageOutcome, *, sentinel_false_negative: bool
+    outcome: StageOutcome,
+    *,
+    sentinel_false_negative: bool,
+    predecessor: StageOutcome | None = None,
 ) -> dict[str, object]:
-    existing_requested = (
-        sentinel_false_negative or not bool(outcome.self_refinement_enclosed)
+    raw_result = outcome.component_result.get("result")
+    semantics = (
+        _promoted_stage_semantics(outcome, predecessor=predecessor)
+        if isinstance(raw_result, Mapping)
+        else None
     )
+    fixed_root_exterior = semantics is not None and semantics.kind is (
+        _PromotedStageKind.FIXED_ROOT_EXTERIOR_DERIVATIVE
+    )
+    analytic_horizon = semantics is not None and semantics.kind is (
+        _PromotedStageKind.ANALYTIC_HORIZON
+    )
+    if semantics is None or semantics.kind is (
+        _PromotedStageKind.LEGACY_FULL_LADDER
+    ):
+        stage_requested = not bool(outcome.self_refinement_enclosed)
+    else:
+        stage_requested = semantics.requires_precision120
+    existing_requested = sentinel_false_negative or stage_requested
     decision = _promotion_decision(
         outcome,
         existing_requested=existing_requested,
         requested_reason=(
             "SENTINEL_TRIGGER_FALSE_NEGATIVE"
             if sentinel_false_negative
+            else "PROMOTED_ROOT_OR_CONDITIONING_GATE"
+            if analytic_horizon
+            else "FIXED_ROOT_RESPONSE_OR_CONDITIONING_GATE"
+            if fixed_root_exterior
             else "CONVERGED_REFINEMENT_OR_DISCREPANCY_GATE"
         ),
-        suppressed_reason="CONVERGED_PROMOTION_GATES_SATISFIED",
+        suppressed_reason=(
+            "PROMOTED_ROOT_EVIDENCE_ACCEPTED"
+            if analytic_horizon
+            else "FIXED_ROOT_RESPONSE_EVIDENCE_ACCEPTED"
+            if fixed_root_exterior
+            else "CONVERGED_PROMOTION_GATES_SATISFIED"
+        ),
+        allow_nonconvergence_suppression=(
+            not fixed_root_exterior and not analytic_horizon
+        ),
     )
     if sentinel_false_negative:
         # This is an independent release-policy audit of the binary64 trigger,
@@ -4682,54 +5033,49 @@ def _deep_precision120_decision(
     return decision
 
 
-def _primary_requires_precision120(outcome: StageOutcome) -> bool:
-    return _primary_precision120_decision(outcome)["state"] == "REQUESTED"
+def _primary_requires_precision120(
+    outcome: StageOutcome,
+    *,
+    predecessor: StageOutcome | None = None,
+) -> bool:
+    return _primary_precision120_decision(
+        outcome, predecessor=predecessor
+    )["state"] == "REQUESTED"
 
 
-def _primary_precision120_terminal_state(outcome: StageOutcome) -> str:
-    analytic = _single_promoted_horizon_result(outcome)
-    if analytic is not None:
-        return (
-            "PRODUCED"
-            if (
-                analytic.status is ComponentStatus.CONVERGED
-                and _component_conditioning_is_adequate(analytic)
-            )
-            else "UNRESOLVED"
+def _primary_precision120_terminal_state(
+    outcome: StageOutcome,
+    *,
+    predecessor: StageOutcome | None = None,
+) -> str:
+    if not isinstance(outcome.component_result.get("result"), Mapping):
+        success = _previous_primary_recovery_precision_contract()[
+            "precision120_terminal_success"
+        ]
+        produced = (
+            outcome.numerical_state == success["component_status"]
+            and outcome.discrepancy_enclosed
+            is success["discrepancy_enclosed"]
         )
-    if outcome.component_result.get("evidence_kind") == (
-        "package-owned-julia-single-promoted-horizon-component"
-    ):
-        return "UNRESOLVED"
-    success = _previous_primary_recovery_precision_contract()[
-        "precision120_terminal_success"
-    ]
-    if not isinstance(success, Mapping):
-        raise ValueError("PRIMARY 120-digit terminal contract is invalid")
-    produced = (
-        outcome.numerical_state == success["component_status"]
-        and outcome.discrepancy_enclosed is success["discrepancy_enclosed"]
+        return "PRODUCED" if produced else "UNRESOLVED"
+    semantics = _promoted_stage_semantics(
+        outcome, predecessor=predecessor
     )
-    return "PRODUCED" if produced else "UNRESOLVED"
+    return "PRODUCED" if semantics.terminal_admissible else "UNRESOLVED"
 
 
 def _endpoint_arithmetic_terminal_state(
     leaf: CampaignLeafPlan,
     outcome: StageOutcome,
     *,
+    predecessor: StageOutcome,
     sentinel: bool,
 ) -> str:
     """Apply the promoted component's terminal rule after endpoint loss."""
 
-    if (
-        leaf.mechanism_id == "horizon-admittance"
-        and _single_promoted_horizon_result(outcome) is not None
-    ):
-        state = _primary_precision120_terminal_state(outcome)
-    else:
-        state = _terminal_state(
-            outcome, enclosed=bool(outcome.discrepancy_enclosed)
-        )
+    state = _primary_precision120_terminal_state(
+        outcome, predecessor=predecessor
+    )
     if leaf.role == "deep" and sentinel:
         return "UNRESOLVED"
     return state
@@ -4776,30 +5122,60 @@ def _validate_current_promoted_runtime(
     runtime = payload.get(runtime_key)
     evidence_kind = payload.get("evidence_kind")
     package_promoted = evidence_kind in {
-        "package-owned-julia-promoted-component-engine",
-        "package-owned-julia-single-promoted-horizon-component",
-        "package-owned-julia-fixed-root-exterior-derivative-component",
+        _LEGACY_FULL_LADDER_EVIDENCE_KIND,
+        _ANALYTIC_HORIZON_EVIDENCE_KIND,
+        _FIXED_ROOT_EXTERIOR_EVIDENCE_KIND,
     }
-    single_horizon = (
-        evidence_kind
-        == "package-owned-julia-single-promoted-horizon-component"
-    )
+    classified_kind: _PromotedStageKind | None = None
+    raw_primary_result = payload.get("result")
+    if (
+        outcome.digits in (80, 120)
+        and isinstance(raw_primary_result, Mapping)
+        and raw_primary_result == result.to_mapping()
+        and evidence_kind in {
+            _SELECTIVE_STAGE_EVIDENCE_KIND,
+            _LEGACY_FULL_LADDER_EVIDENCE_KIND,
+            _ANALYTIC_HORIZON_EVIDENCE_KIND,
+            _FIXED_ROOT_EXTERIOR_EVIDENCE_KIND,
+        }
+    ):
+        classified_kind, classified_result = _classify_promoted_stage(outcome)
+        assert classified_result.to_mapping() == result.to_mapping()
+    single_horizon = evidence_kind == _ANALYTIC_HORIZON_EVIDENCE_KIND
     result_is_single_horizon = (
-        result.component_scientific_identity in {
+        classified_kind is _PromotedStageKind.ANALYTIC_HORIZON
+        or result.component_scientific_identity in {
             PROMOTED_HORIZON_COMPONENT_IDENTITY,
             PROMOTED_HORIZON_COMPONENT_V2_IDENTITY,
         }
         or (
             single_horizon
-            and
-            result.component_scientific_identity is None
+            and result.component_scientific_identity is None
             and result.mechanism_id == "horizon-admittance"
-            and result.status is not ComponentStatus.CONVERGED
+            and result.status in _TYPED_FIXED_READOUT_FAILURE_STATUSES
+            and not _claims_specialized_promoted_semantics(result)
         )
     )
     if single_horizon != result_is_single_horizon:
         raise _UnauthenticatedComponentEvidence(
             "campaign promoted component identity disagrees with evidence kind"
+        )
+    fixed_exterior = evidence_kind == _FIXED_ROOT_EXTERIOR_EVIDENCE_KIND
+    result_is_fixed_exterior = (
+        classified_kind is _PromotedStageKind.FIXED_ROOT_EXTERIOR_DERIVATIVE
+        or result.component_scientific_identity
+        == EXTERIOR_DERIVATIVE_COMPONENT_IDENTITY
+        or (
+            fixed_exterior
+            and result.component_scientific_identity is None
+            and result.mechanism_id.startswith("exterior-")
+            and result.status in _TYPED_FIXED_READOUT_FAILURE_STATUSES
+            and not _claims_specialized_promoted_semantics(result)
+        )
+    )
+    if fixed_exterior != result_is_fixed_exterior:
+        raise _UnauthenticatedComponentEvidence(
+            "campaign fixed-root exterior identity disagrees with evidence kind"
         )
     conditioned = tuple(
         readout.numerical_conditioning is not None
@@ -5215,6 +5591,27 @@ def _validate_component_result(
     result = ComponentResult.from_mapping(raw_result)
     if result.to_mapping() != raw_result:
         raise ValueError("campaign component result is not canonical")
+    classified_kind: _PromotedStageKind | None = None
+    if result_key == "result" and outcome.digits in (80, 120) and (
+        payload.get("evidence_kind")
+        in {
+            _SELECTIVE_STAGE_EVIDENCE_KIND,
+            _LEGACY_FULL_LADDER_EVIDENCE_KIND,
+            _ANALYTIC_HORIZON_EVIDENCE_KIND,
+            _FIXED_ROOT_EXTERIOR_EVIDENCE_KIND,
+        }
+        or result.component_scientific_identity
+        in {
+            PROMOTED_HORIZON_COMPONENT_IDENTITY,
+            PROMOTED_HORIZON_COMPONENT_V2_IDENTITY,
+            EXTERIOR_DERIVATIVE_COMPONENT_IDENTITY,
+        }
+    ):
+        classified_kind, classified_result = _classify_promoted_stage(outcome)
+        if classified_result.to_mapping() != result.to_mapping():
+            raise _UnauthenticatedComponentEvidence(
+                "campaign promoted stage classification changed its result"
+            )
     historical_horizon = result.component_scientific_identity == (
         PROMOTED_HORIZON_COMPONENT_IDENTITY
     )
@@ -5231,6 +5628,15 @@ def _validate_component_result(
     exterior_derivative = result.component_scientific_identity == (
         EXTERIOR_DERIVATIVE_COMPONENT_IDENTITY
     )
+    fixed_root_exterior_stage = classified_kind is (
+        _PromotedStageKind.FIXED_ROOT_EXTERIOR_DERIVATIVE
+    )
+    if exterior_derivative and classified_kind is not (
+        _PromotedStageKind.FIXED_ROOT_EXTERIOR_DERIVATIVE
+    ):
+        raise _UnauthenticatedComponentEvidence(
+            "campaign promoted exterior stage classification is invalid"
+        )
     if historical_horizon and not (
         leaf.role == "primary"
         and leaf.mechanism_id == "horizon-admittance"
@@ -5396,8 +5802,9 @@ def _validate_component_result(
         if discrepancy_applicable:
             discrepancy_valid = (
                 discrepancy_reason is None
+                and result.response is not None
                 and outcome.discrepancy_from_previous_abs is not None
-                and outcome.discrepancy_enclosed is not None
+                and type(outcome.discrepancy_enclosed) is bool
             )
         else:
             discrepancy_valid = (
@@ -5428,6 +5835,142 @@ def _validate_component_result(
                 raise _UnauthenticatedComponentEvidence(
                     "campaign promoted analytic uncertainty applicability is invalid"
                 )
+    if fixed_root_exterior_stage:
+        required_payload_fields = {
+            "evidence_kind",
+            "result",
+            "self_refinement_result",
+            "self_refinement_skipped_reason",
+            "scientific_runtime",
+            "primary_root_predictor_source",
+            "precision_ladder_discrepancy_applicable",
+            "precision_ladder_discrepancy_reason",
+        }
+        failed_preflight_fields = {
+            "failed_preflight_predecessor",
+            "comparison_kind",
+        }
+        allowed_payload_fields = {
+            frozenset(required_payload_fields),
+            frozenset(required_payload_fields | {"promotion_decision"}),
+            frozenset(required_payload_fields | failed_preflight_fields),
+        }
+        if frozenset(payload) not in allowed_payload_fields:
+            raise _UnauthenticatedComponentEvidence(
+                "campaign fixed-root exterior payload fields are invalid"
+            )
+        failed_preflight = "failed_preflight_predecessor" in payload
+        discrepancy_applicable = payload.get(
+            "precision_ladder_discrepancy_applicable"
+        )
+        predictor_source = payload.get("primary_root_predictor_source")
+        if (
+            payload.get("self_refinement_result") is not None
+            or payload.get("self_refinement_skipped_reason")
+            != _FIXED_ROOT_EXTERIOR_SELF_REFINEMENT_SKIPPED_REASON
+            or outcome.self_refinement_enclosed is not None
+            or outcome.deep_diagnostics is not None
+            or type(discrepancy_applicable) is not bool
+            or predictor_source
+            != (
+                "FAILED_80_REQUEST_BINARY64_BASELINE_OMEGA"
+                if failed_preflight
+                else "PREVIOUS_STAGE_BASELINE_OMEGA"
+            )
+            or (
+                failed_preflight
+                and payload.get("comparison_kind")
+                != _FAILED_PREFLIGHT_FIXED_ROOT_EXTERIOR_KIND
+            )
+        ):
+            raise _UnauthenticatedComponentEvidence(
+                "campaign fixed-root exterior execution evidence is invalid"
+            )
+        discrepancy_reason = payload.get(
+            "precision_ladder_discrepancy_reason"
+        )
+        if discrepancy_applicable:
+            discrepancy_valid = (
+                discrepancy_reason is None
+                and result.response is not None
+                and outcome.discrepancy_from_previous_abs is not None
+                and type(outcome.discrepancy_enclosed) is bool
+            )
+        else:
+            discrepancy_valid = (
+                discrepancy_reason
+                in {
+                    _BINARY64_RESPONSE_UNAVAILABLE_REASON,
+                    _PREVIOUS_PROMOTED_RESPONSE_UNAVAILABLE_REASON,
+                }
+                and outcome.discrepancy_from_previous_abs is None
+                and outcome.discrepancy_enclosed is None
+            )
+        if not discrepancy_valid:
+            raise _UnauthenticatedComponentEvidence(
+                "campaign fixed-root exterior discrepancy evidence is invalid"
+            )
+        family_sources = {
+            "signed-root": "signed-root",
+            "centred-step-amplitude": "axis",
+            "refinement-holdout": "amplitude",
+            "truncation": "truncation",
+            "resolution-angular-refinement": "resolution",
+            "continuation-seed-path": "seed-path",
+        }
+        precision_channel_abs = None
+        identityless_typed_failure = (
+            result.component_scientific_identity is None
+            and result.status in _TYPED_FIXED_READOUT_FAILURE_STATUSES
+        )
+        for channel in outcome.signed_error_channels:
+            family = channel["family"]
+            if family in family_sources:
+                applicable = (
+                    False
+                    if identityless_typed_failure
+                    else result.error_channel_applicability[
+                        family_sources[family]
+                    ]
+                )
+            elif family == "precision-ladder-discrepancy":
+                applicable = discrepancy_applicable
+            else:
+                applicable = False
+            expected_derivation = (
+                f"explicit-signed-{family}"
+                if applicable
+                else f"not-applicable-{family}"
+            )
+            if channel["provenance"]["derivation"] != expected_derivation:
+                raise _UnauthenticatedComponentEvidence(
+                    "campaign fixed-root exterior uncertainty applicability is invalid"
+                )
+            signed = complex(
+                channel["signed_delta"]["real"],
+                channel["signed_delta"]["imaginary"],
+            )
+            if not applicable and signed != 0.0j:
+                raise _UnauthenticatedComponentEvidence(
+                    "campaign fixed-root exterior not-applicable channel is nonzero"
+                )
+            if family == "precision-ladder-discrepancy":
+                precision_channel_abs = abs(signed)
+        expected_precision_abs = (
+            None
+            if not discrepancy_applicable
+            else outcome.discrepancy_from_previous_abs
+        )
+        if (
+            precision_channel_abs is None
+            or (
+                discrepancy_applicable
+                and precision_channel_abs != expected_precision_abs
+            )
+        ):
+            raise _UnauthenticatedComponentEvidence(
+                "campaign fixed-root exterior precision channel is invalid"
+            )
     job = leaf.job
     if (
         result.job_id != job.job_id
@@ -5538,6 +6081,281 @@ def _component_conditioning_is_adequate(result: ComponentResult) -> bool:
     )
 
 
+def _validate_fixed_readout_precision_comparison(
+    outcome: StageOutcome,
+    result: ComponentResult,
+    predecessor: StageOutcome | None,
+) -> bool:
+    """Authenticate a promoted response comparison in response space."""
+
+    component = outcome.component_result
+    applicable = component.get(
+        "precision_ladder_discrepancy_applicable"
+    )
+    if type(applicable) is not bool:
+        raise _UnauthenticatedComponentEvidence(
+            "fixed-readout precision applicability is invalid"
+        )
+    precision_channel = next(
+        channel
+        for channel in outcome.signed_error_channels
+        if channel["family"] == "precision-ladder-discrepancy"
+    )
+    recorded_delta = complex(
+        precision_channel["signed_delta"]["real"],
+        precision_channel["signed_delta"]["imaginary"],
+    )
+    if predecessor is None:
+        if applicable:
+            raise _UnauthenticatedComponentEvidence(
+                "fixed-readout response comparison predecessor is missing"
+            )
+        if (
+            component.get("precision_ladder_discrepancy_reason")
+            not in {
+                _BINARY64_RESPONSE_UNAVAILABLE_REASON,
+                _PREVIOUS_PROMOTED_RESPONSE_UNAVAILABLE_REASON,
+            }
+            or recorded_delta != 0.0j
+            or outcome.discrepancy_from_previous_abs is not None
+            or outcome.discrepancy_enclosed is not None
+        ):
+            raise _UnauthenticatedComponentEvidence(
+                "fixed-readout inapplicable discrepancy is inconsistent"
+            )
+        return False
+
+    raw_previous = predecessor.component_result.get("result")
+    if not isinstance(raw_previous, Mapping):
+        raise _UnauthenticatedComponentEvidence(
+            "fixed-readout predecessor result is missing"
+        )
+    previous_result = ComponentResult.from_mapping(raw_previous)
+    if previous_result.to_mapping() != raw_previous:
+        raise _UnauthenticatedComponentEvidence(
+            "fixed-readout predecessor is not canonical"
+        )
+    expected_applicable = (
+        result.response is not None
+        and previous_result.response is not None
+    )
+    if applicable is not expected_applicable:
+        raise _UnauthenticatedComponentEvidence(
+            "fixed-readout precision applicability is inconsistent"
+        )
+    expected_reason = (
+        None
+        if expected_applicable
+        else (
+            _BINARY64_RESPONSE_UNAVAILABLE_REASON
+            if predecessor.digits == 64
+            else _PREVIOUS_PROMOTED_RESPONSE_UNAVAILABLE_REASON
+        )
+    )
+    if component.get("precision_ladder_discrepancy_reason") != expected_reason:
+        raise _UnauthenticatedComponentEvidence(
+            "fixed-readout precision reason is inconsistent"
+        )
+    if expected_applicable:
+        assert result.response is not None
+        assert previous_result.response is not None
+        expected_delta = result.response - previous_result.response
+        expected_abs = abs(expected_delta)
+        expected_enclosed = expected_abs <= (
+            sum(result.error_channels.values())
+            + predecessor.local_disk_radius_abs
+        )
+        if (
+            recorded_delta != expected_delta
+            or outcome.discrepancy_from_previous_abs != expected_abs
+            or outcome.discrepancy_enclosed is not expected_enclosed
+        ):
+            raise _UnauthenticatedComponentEvidence(
+                "fixed-readout response discrepancy is inconsistent"
+            )
+    elif (
+        recorded_delta != 0.0j
+        or outcome.discrepancy_from_previous_abs is not None
+        or outcome.discrepancy_enclosed is not None
+    ):
+        raise _UnauthenticatedComponentEvidence(
+            "fixed-readout inapplicable discrepancy is nonzero"
+        )
+    return applicable
+
+
+def _promoted_stage_semantics(
+    outcome: StageOutcome,
+    *,
+    predecessor: StageOutcome | None = None,
+) -> _PromotedStageSemantics:
+    """Return the single authenticated interpretation of a promoted stage."""
+
+    kind, result = _classify_promoted_stage(outcome)
+    if kind is _PromotedStageKind.SELECTIVE_READOUT:
+        return _PromotedStageSemantics(
+            kind=kind,
+            result=result,
+            repeat_applicable=False,
+            precision_ladder_applicable=False,
+            terminal_admissible=(result.status is ComponentStatus.CONVERGED),
+            requires_precision120=False,
+        )
+    if kind is _PromotedStageKind.ANALYTIC_HORIZON:
+        discrepancy_applicable = (
+            _validate_fixed_readout_precision_comparison(
+                outcome, result, predecessor
+            )
+        )
+        terminal = (
+            result.status is ComponentStatus.CONVERGED
+            and result.usable
+            and result.response is not None
+            and _component_conditioning_is_adequate(result)
+        )
+        return _PromotedStageSemantics(
+            kind=kind,
+            result=result,
+            repeat_applicable=False,
+            precision_ladder_applicable=discrepancy_applicable,
+            terminal_admissible=terminal,
+            requires_precision120=(outcome.digits == 80 and not terminal),
+        )
+    if kind is _PromotedStageKind.LEGACY_FULL_LADDER:
+        terminal = (
+            result.status is ComponentStatus.CONVERGED
+            and (
+                outcome.digits == 120
+                or outcome.self_refinement_enclosed is True
+            )
+            and outcome.discrepancy_enclosed is True
+        )
+        requires120 = (
+            outcome.digits == 80
+            and (
+                result.status is ComponentStatus.NOT_CONVERGED
+                or (
+                    result.status is ComponentStatus.CONVERGED
+                    and (
+                        outcome.self_refinement_enclosed is False
+                        or outcome.discrepancy_enclosed is False
+                    )
+                )
+            )
+        )
+        return _PromotedStageSemantics(
+            kind=kind,
+            result=result,
+            repeat_applicable=(outcome.digits == 80),
+            precision_ladder_applicable=True,
+            terminal_admissible=terminal,
+            requires_precision120=requires120,
+        )
+
+    discrepancy_applicable = _validate_fixed_readout_precision_comparison(
+        outcome, result, predecessor
+    )
+
+    terminal = (
+        result.status is ComponentStatus.CONVERGED
+        and result.usable
+        and result.response is not None
+        and result.response_uncertainty_status == BOUNDED_DERIVATIVE_RESPONSE
+        and _component_conditioning_is_adequate(result)
+        and (
+            not discrepancy_applicable
+            or outcome.discrepancy_enclosed is True
+        )
+    )
+    return _PromotedStageSemantics(
+        kind=kind,
+        result=result,
+        repeat_applicable=False,
+        precision_ladder_applicable=discrepancy_applicable,
+        terminal_admissible=terminal,
+        requires_precision120=(outcome.digits == 80 and not terminal),
+    )
+
+
+def _bind_fixed_root_exterior_precision_comparison(
+    outcome: StageOutcome,
+    predecessor: StageOutcome,
+) -> StageOutcome:
+    """Derive the response-tier comparison from the two persisted results."""
+
+    if outcome.component_result.get("evidence_kind") != (
+        _FIXED_ROOT_EXTERIOR_EVIDENCE_KIND
+    ):
+        return outcome
+    raw_result = outcome.component_result.get("result")
+    if not isinstance(raw_result, Mapping):
+        raise _UnauthenticatedComponentEvidence(
+            "fixed-root exterior result is missing"
+        )
+    result = ComponentResult.from_mapping(raw_result)
+    if result.to_mapping() != raw_result:
+        raise _UnauthenticatedComponentEvidence(
+            "fixed-root exterior result is not canonical"
+        )
+    raw_previous = predecessor.component_result.get("result")
+    if not isinstance(raw_previous, Mapping):
+        raise _UnauthenticatedComponentEvidence(
+            "fixed-root exterior predecessor result is missing"
+        )
+    previous_result = ComponentResult.from_mapping(raw_previous)
+    if previous_result.to_mapping() != raw_previous:
+        raise _UnauthenticatedComponentEvidence(
+            "fixed-root exterior predecessor is not canonical"
+        )
+    applicable = (
+        result.response is not None and previous_result.response is not None
+    )
+    delta = (
+        result.response - previous_result.response
+        if applicable
+        else None
+    )
+    discrepancy = None if delta is None else abs(delta)
+    enclosed = (
+        None
+        if discrepancy is None
+        else discrepancy
+        <= sum(result.error_channels.values())
+        + predecessor.local_disk_radius_abs
+    )
+    component = dict(outcome.component_result)
+    component.update({
+        "precision_ladder_discrepancy_applicable": applicable,
+        "precision_ladder_discrepancy_reason": (
+            None
+            if applicable
+            else (
+                _BINARY64_RESPONSE_UNAVAILABLE_REASON
+                if predecessor.digits == 64
+                else _PREVIOUS_PROMOTED_RESPONSE_UNAVAILABLE_REASON
+            )
+        ),
+    })
+    return replace(
+        outcome,
+        component_result=component,
+        local_disk_radius_abs=(
+            sum(result.error_channels.values())
+            + (0.0 if discrepancy is None else discrepancy)
+        ),
+        signed_error_channels=_component_stage_signed_error_channels(
+            component,
+            result,
+            repeat_applicable=False,
+            precision_delta=0.0j if delta is None else delta,
+            precision_ladder_applicable=applicable,
+        ),
+        self_refinement_enclosed=None,
+        discrepancy_from_previous_abs=discrepancy,
+        discrepancy_enclosed=enclosed,
+    )
+
+
 def _validate_failed_preflight_refinement_runtime(
     leaf: CampaignLeafPlan,
     value: object,
@@ -5561,11 +6379,13 @@ def _validate_failed_preflight_refinement_runtime(
 def _validate_failed_preflight_recovery_stage(
     leaf: CampaignLeafPlan,
     outcome: StageOutcome,
+    stage_predecessor: StageOutcome | None = None,
 ) -> tuple[CampaignExecutionAttempt, bool]:
     """Validate a self-contained 120-base/120-refinement recovery stage."""
 
-    analytic = _single_promoted_horizon_result(outcome)
-    if analytic is not None:
+    kind, classified_result = _classify_promoted_stage(outcome)
+    if kind is _PromotedStageKind.ANALYTIC_HORIZON:
+        analytic = classified_result
         component = outcome.component_result
         if (
             outcome.digits != 120
@@ -5600,6 +6420,56 @@ def _validate_failed_preflight_recovery_stage(
             and _component_conditioning_is_adequate(analytic)
         )
         return predecessor, produced
+
+    if kind is _PromotedStageKind.FIXED_ROOT_EXTERIOR_DERIVATIVE:
+        fixed_result = classified_result
+        component = outcome.component_result
+        if (
+            outcome.digits != 120
+            or component.get("comparison_kind")
+            != _FAILED_PREFLIGHT_FIXED_ROOT_EXTERIOR_KIND
+        ):
+            raise ValueError(
+                "failed-preflight fixed-root exterior recovery fields are invalid"
+            )
+        predecessor = CampaignExecutionAttempt.from_mapping(
+            component.get("failed_preflight_predecessor")
+        )
+        _validate_failed_preflight_predecessor(predecessor, leaf)
+        predictor = _failed_preflight_exterior_root_predictor(predecessor)
+        expected_predictor = {
+            "real": format(predictor.real, ".17g"),
+            "imaginary": format(predictor.imag, ".17g"),
+        }
+        receipt = fixed_result.baseline.worker_response_receipt
+        request = (
+            None
+            if not isinstance(receipt, Mapping)
+            else receipt.get("request_binding")
+        )
+        if (
+            not isinstance(request, Mapping)
+            or request.get("amplitude")
+            != {"real": "0", "imaginary": "0"}
+            or request.get("primary_predictor") != expected_predictor
+            or "primary_predictor_kind" in request
+        ):
+            raise ValueError(
+                "failed-preflight fixed-root exterior predictor binding is invalid"
+            )
+        semantics = _promoted_stage_semantics(
+            outcome, predecessor=stage_predecessor
+        )
+        if semantics.result != fixed_result:
+            raise ValueError(
+                "failed-preflight fixed-root exterior result changed"
+            )
+        return predecessor, semantics.terminal_admissible
+
+    if kind is _PromotedStageKind.SELECTIVE_READOUT:
+        raise ValueError(
+            "selective evidence cannot satisfy failed-preflight recovery"
+        )
 
     if (
         outcome.digits != 120
@@ -5716,6 +6586,7 @@ def _validate_failed_preflight_recovery_stage(
 
 
 def _validate_primary_record_semantics(
+    leaf: CampaignLeafPlan,
     record: CampaignLeafRecord,
     stages: tuple[StageOutcome, ...],
     production_flags: tuple[bool, ...],
@@ -5764,20 +6635,26 @@ def _validate_primary_record_semantics(
         return all(production_flags)
 
     precision80 = stages[1]
-    analytic80 = _single_promoted_horizon_result(precision80) is not None
-    if analytic80:
+    semantics80 = (
+        _promoted_stage_semantics(precision80, predecessor=first)
+        if isinstance(precision80.component_result.get("result"), Mapping)
+        else None
+    )
+    fixed_readout80 = (
+        semantics80 is not None
+        and semantics80.kind
+        in {
+            _PromotedStageKind.ANALYTIC_HORIZON,
+            _PromotedStageKind.FIXED_ROOT_EXTERIOR_DERIVATIVE,
+        }
+    )
+    if fixed_readout80:
         if (
             precision80.deep_diagnostics is not None
             or precision80.self_refinement_enclosed is not None
-            or precision80.component_result.get(
-                "precision_ladder_discrepancy_applicable"
-            )
-            is not False
-            or precision80.discrepancy_from_previous_abs is not None
-            or precision80.discrepancy_enclosed is not None
         ):
             raise ValueError(
-                "campaign promoted analytic PRIMARY 80-digit evidence is incomplete"
+                "campaign promoted fixed-readout PRIMARY 80-digit evidence is incomplete"
             )
     elif (
         precision80.deep_diagnostics is not None
@@ -5793,21 +6670,26 @@ def _validate_primary_record_semantics(
 
     _validate_attached_promotion_decision(
         precision80,
-        _primary_precision120_decision(precision80),
+        _primary_precision120_decision(
+            precision80, predecessor=first
+        ),
         required=promotion_decision_required,
     )
-    requires120 = _primary_requires_precision120(precision80)
+    requires120 = _primary_requires_precision120(
+        precision80, predecessor=first
+    )
     if not requires120:
-        expected_state = _terminal_state(
-            precision80,
-            enclosed=(
-                True
-                if analytic80
+        expected_state = (
+            "PRODUCED"
+            if (
+                semantics80.terminal_admissible
+                if semantics80 is not None
                 else (
                     bool(precision80.self_refinement_enclosed)
                     and bool(precision80.discrepancy_enclosed)
                 )
-            ),
+            )
+            else "UNRESOLVED"
         )
         if (
             len(stages) != 2
@@ -5832,13 +6714,15 @@ def _validate_primary_record_semantics(
         return all(production_flags)
 
     precision120 = stages[2]
-    _validate_precision120(precision120)
+    _validate_precision120(precision120, predecessor=precision80)
     if not production_flags[2]:
         raise ValueError(
             "campaign promoted PRIMARY stage lacks canonical production evidence"
         )
     if (
-        record.state != _primary_precision120_terminal_state(precision120)
+        record.state != _primary_precision120_terminal_state(
+            precision120, predecessor=precision80
+        )
         or record.missing_precision_digits is not None
     ):
         raise ValueError("campaign PRIMARY 120-digit terminal state is inconsistent")
@@ -5894,7 +6778,7 @@ def _validate_record_semantics(
         for stage, validation in zip(stages, selective_validations)
     )
     for previous, promoted in zip(stages, stages[1:]):
-        _validate_single_promoted_horizon_predictor_binding(
+        _validate_fixed_readout_predictor_binding(
             previous,
             promoted,
         )
@@ -5931,7 +6815,7 @@ def _validate_record_semantics(
             stages[1], leaf
         )
         if endpoint_predecessor is not None:
-            _validate_precision120(stages[1])
+            _validate_precision120(stages[1], predecessor=stages[0])
             if not all(production_flags):
                 raise ValueError(
                     "endpoint-arithmetic recovery lacks canonical production "
@@ -5960,6 +6844,7 @@ def _validate_record_semantics(
             expected_state = _endpoint_arithmetic_terminal_state(
                 leaf,
                 stages[1],
+                predecessor=stages[0],
                 sentinel=record.sentinel,
             )
             if (
@@ -5978,7 +6863,7 @@ def _validate_record_semantics(
         if leaf.role == "control":
             raise ValueError("control leaves cannot use failed-preflight recovery")
         _, recovery_produced = _validate_failed_preflight_recovery_stage(
-            leaf, stages[1]
+            leaf, stages[1], stages[0]
         )
         if not all(production_flags):
             raise ValueError(
@@ -6031,6 +6916,7 @@ def _validate_record_semantics(
 
     if leaf.role == "primary":
         return _validate_primary_record_semantics(
+            leaf,
             record,
             stages,
             production_flags,
@@ -6078,9 +6964,21 @@ def _validate_record_semantics(
         return production
 
     precision80 = stages[1]
-    analytic80 = _single_promoted_horizon_result(precision80) is not None
-    if analytic80:
-        _validate_precision120(precision80)
+    semantics80 = (
+        _promoted_stage_semantics(precision80, predecessor=first)
+        if isinstance(precision80.component_result.get("result"), Mapping)
+        else None
+    )
+    fixed_readout80 = (
+        semantics80 is not None
+        and semantics80.kind
+        in {
+            _PromotedStageKind.ANALYTIC_HORIZON,
+            _PromotedStageKind.FIXED_ROOT_EXTERIOR_DERIVATIVE,
+        }
+    )
+    if fixed_readout80:
+        _validate_precision120(precision80, predecessor=first)
     elif (
         precision80.deep_diagnostics is not None
         or precision80.self_refinement_enclosed is None
@@ -6091,33 +6989,39 @@ def _validate_record_semantics(
     expected_comparison = None
     false_negative = False
     if sentinel:
-        if precision80.discrepancy_from_previous_abs is None:
-            raise ValueError(
-                "campaign analytic sentinel lacks binary64 comparison"
+        if precision80.discrepancy_from_previous_abs is not None:
+            threshold = 0.25 * first.local_disk_radius_abs
+            false_negative = (
+                not trigger_ids
+                and precision80.discrepancy_from_previous_abs > threshold
             )
-        threshold = 0.25 * first.local_disk_radius_abs
-        false_negative = (
-            not trigger_ids
-            and precision80.discrepancy_from_previous_abs > threshold
-        )
-        expected_comparison = {
-            "binary64_to_80_discrepancy_abs": (
-                precision80.discrepancy_from_previous_abs
-            ),
-            "trigger_threshold_abs": threshold,
-            "trigger_policy_false_negative": false_negative,
-        }
+            expected_comparison = {
+                "binary64_to_80_discrepancy_abs": (
+                    precision80.discrepancy_from_previous_abs
+                ),
+                "trigger_threshold_abs": threshold,
+                "trigger_policy_false_negative": false_negative,
+            }
     if record.sentinel_comparison != expected_comparison:
         raise ValueError("campaign sentinel comparison is invalid")
     decision = (
         _deep_precision120_decision(
-            precision80, sentinel_false_negative=True
+            precision80,
+            sentinel_false_negative=True,
+            predecessor=first,
         )
         if false_negative
-        else _primary_precision120_decision(precision80)
-        if analytic80
+        else _primary_precision120_decision(
+            precision80, predecessor=first
+        )
+        if (
+            semantics80 is not None
+            and semantics80.kind is _PromotedStageKind.ANALYTIC_HORIZON
+        )
         else _deep_precision120_decision(
-            precision80, sentinel_false_negative=False
+            precision80,
+            sentinel_false_negative=False,
+            predecessor=first,
         )
     )
     _validate_attached_promotion_decision(
@@ -6136,22 +7040,23 @@ def _validate_record_semantics(
         ):
             raise ValueError("campaign sentinel false-negative state is invalid")
         if len(stages) == 3:
-            _validate_precision120(stages[2])
+            _validate_precision120(stages[2], predecessor=precision80)
         return production
     if not requires120:
         if (
             len(stages) != 2
             or record.state
-            != _terminal_state(
-                precision80,
-                enclosed=(
-                    True
-                    if analytic80
+            != (
+                "PRODUCED"
+                if (
+                    semantics80.terminal_admissible
+                    if semantics80 is not None
                     else (
                         bool(precision80.self_refinement_enclosed)
                         and bool(precision80.discrepancy_enclosed)
                     )
-                ),
+                )
+                else "UNRESOLVED"
             )
             or record.missing_precision_digits is not None
         ):
@@ -6169,13 +7074,21 @@ def _validate_record_semantics(
             raise ValueError("campaign promoted deep leaf is missing its 120-digit stage")
         return production
     precision120 = stages[2]
-    _validate_precision120(precision120)
-    analytic120 = _single_promoted_horizon_result(precision120) is not None
+    _validate_precision120(precision120, predecessor=precision80)
+    semantics120 = (
+        _promoted_stage_semantics(
+            precision120, predecessor=precision80
+        )
+        if isinstance(precision120.component_result.get("result"), Mapping)
+        else None
+    )
     if (
         record.state
         != (
-            _primary_precision120_terminal_state(precision120)
-            if analytic120
+            _primary_precision120_terminal_state(
+                precision120, predecessor=precision80
+            )
+            if semantics120 is not None
             else _terminal_state(
                 precision120, enclosed=bool(precision120.discrepancy_enclosed)
             )
@@ -6446,8 +7359,27 @@ def _authenticated_solved_leaf_lookup(
     return current
 
 
-def _validate_precision120(outcome: StageOutcome) -> None:
-    if _single_promoted_horizon_result(outcome) is not None:
+def _validate_precision120(
+    outcome: StageOutcome,
+    *,
+    predecessor: StageOutcome | None = None,
+) -> None:
+    if not isinstance(outcome.component_result.get("result"), Mapping):
+        if (
+            outcome.deep_diagnostics is not None
+            or outcome.self_refinement_enclosed is not None
+            or outcome.discrepancy_from_previous_abs is None
+            or outcome.discrepancy_enclosed is None
+        ):
+            raise ValueError("campaign 120-digit evidence is incomplete")
+        return
+    semantics = _promoted_stage_semantics(
+        outcome, predecessor=predecessor
+    )
+    if semantics.kind in {
+        _PromotedStageKind.ANALYTIC_HORIZON,
+        _PromotedStageKind.FIXED_ROOT_EXTERIOR_DERIVATIVE,
+    }:
         applicable = outcome.component_result.get(
             "precision_ladder_discrepancy_applicable"
         )
@@ -6471,9 +7403,11 @@ def _validate_precision120(outcome: StageOutcome) -> None:
             )
         ):
             raise ValueError(
-                "campaign promoted analytic 120-digit evidence is incomplete"
+                "campaign promoted fixed-readout evidence is incomplete"
             )
         return
+    if semantics.kind is _PromotedStageKind.SELECTIVE_READOUT:
+        raise ValueError("selective promoted evidence cannot be a 120-digit stage")
     if (
         outcome.deep_diagnostics is not None
         or outcome.self_refinement_enclosed is not None
@@ -6546,6 +7480,12 @@ def _failed_preflight_recovery_record(
         raise ValueError(
             "campaign backend returned invalid failed-preflight 120-digit evidence"
         )
+    if outcome.component_result.get("evidence_kind") == (
+        _FIXED_ROOT_EXTERIOR_EVIDENCE_KIND
+    ):
+        outcome = _bind_fixed_root_exterior_precision_comparison(
+            outcome, record.stages[0].outcome
+        )
     if not _validate_component_result(
         leaf, outcome, allow_historical_conditioning_absence=False
     ):
@@ -6553,7 +7493,7 @@ def _failed_preflight_recovery_record(
             "failed-preflight recovery lacks canonical base evidence"
         )
     embedded, recovery_produced = _validate_failed_preflight_recovery_stage(
-        leaf, outcome
+        leaf, outcome, record.stages[0].outcome
     )
     if embedded.to_mapping() != predecessor.to_mapping():
         raise ValueError(
@@ -6596,7 +7536,9 @@ def _endpoint_arithmetic_recovery_record(
     embedded = _embedded_endpoint_arithmetic_predecessor(outcome, leaf)
     if embedded is None or embedded.to_mapping() != predecessor.to_mapping():
         raise ValueError("endpoint-arithmetic recovery embedded the wrong attempt")
-    _validate_precision120(outcome)
+    _validate_precision120(
+        outcome, predecessor=record.stages[0].outcome
+    )
     if not _validate_component_result(
         leaf, outcome, allow_historical_conditioning_absence=False
     ):
@@ -6606,6 +7548,7 @@ def _endpoint_arithmetic_recovery_record(
     state = _endpoint_arithmetic_terminal_state(
         leaf,
         outcome,
+        predecessor=record.stages[0].outcome,
         sentinel=record.sentinel,
     )
     return CampaignLeafRecord(
@@ -7030,8 +7973,21 @@ def _checkpoint_stage_with_progress(
     duration_seconds: float,
     record: CampaignLeafRecord,
     leaf: CampaignLeafPlan,
+    factory_identity: PrecisionFactoryIdentity,
     scientific_execution_contract: Mapping[str, object] | None,
 ) -> None:
+    if any(
+        stage.outcome.component_result.get("evidence_kind")
+        in {
+            _SELECTIVE_STAGE_EVIDENCE_KIND,
+            _ANALYTIC_HORIZON_EVIDENCE_KIND,
+            _FIXED_ROOT_EXTERIOR_EVIDENCE_KIND,
+        }
+        for stage in record.stages[1:]
+    ):
+        # Close the live-admission -> durable-record join for every specialized
+        # promoted contract before replacing the last authenticated checkpoint.
+        _validate_record_semantics(leaf, record, factory_identity)
     _validate_record_scientific_execution_contract(
         leaf, record, scientific_execution_contract
     )
@@ -7610,6 +8566,7 @@ def _run_campaign_selection_active(
                 duration_seconds=stage_duration,
                 record=record,
                 leaf=leaf,
+                factory_identity=plan.precision_factory_identity,
                 scientific_execution_contract=scientific_execution_contract,
             )
 
@@ -7701,6 +8658,7 @@ def _run_campaign_selection_active(
                     duration_seconds=recovery_duration,
                     record=record,
                     leaf=leaf,
+                    factory_identity=plan.precision_factory_identity,
                     scientific_execution_contract=scientific_execution_contract,
                 )
                 with progress_scope(**context):
@@ -7850,6 +8808,7 @@ def _run_campaign_selection_active(
                         duration_seconds=recovery_duration,
                         record=record,
                         leaf=leaf,
+                        factory_identity=plan.precision_factory_identity,
                         scientific_execution_contract=(
                             scientific_execution_contract
                         ),
@@ -7882,6 +8841,14 @@ def _run_campaign_selection_active(
                         "campaign backend returned invalid failed-preflight "
                         "120-digit evidence"
                     )
+                if outcome120.component_result.get("evidence_kind") == (
+                    _FIXED_ROOT_EXTERIOR_EVIDENCE_KIND
+                ):
+                    outcome120 = (
+                        _bind_fixed_root_exterior_precision_comparison(
+                            outcome120, record.stages[0].outcome
+                        )
+                    )
                 if not _validate_component_result(
                     leaf,
                     outcome120,
@@ -7892,7 +8859,7 @@ def _run_campaign_selection_active(
                     )
                 embedded, recovery_produced = (
                     _validate_failed_preflight_recovery_stage(
-                        leaf, outcome120
+                        leaf, outcome120, record.stages[0].outcome
                     )
                 )
                 if embedded.to_mapping() != attempt.to_mapping():
@@ -7928,6 +8895,7 @@ def _run_campaign_selection_active(
                     duration_seconds=recovery_duration,
                     record=record,
                     leaf=leaf,
+                    factory_identity=plan.precision_factory_identity,
                     scientific_execution_contract=scientific_execution_contract,
                 )
                 with progress_scope(**context):
@@ -7955,17 +8923,48 @@ def _run_campaign_selection_active(
             selective80 = _validate_selective_stage(
                 leaf, outcome80, record.stages[0].outcome
             )
-            analytic80 = _single_promoted_horizon_result(outcome80) is not None
+            semantics80: _PromotedStageSemantics | None = None
             if selective80 is not None:
                 pass
-            elif analytic80:
-                _validate_precision120(outcome80)
-            elif (
-                outcome80.self_refinement_enclosed is None
-                or outcome80.discrepancy_from_previous_abs is None
-                or outcome80.discrepancy_enclosed is None
-            ):
-                raise ValueError("campaign backend returned incomplete 80-digit evidence")
+            else:
+                production80 = _validate_component_result(
+                    leaf,
+                    outcome80,
+                    allow_historical_conditioning_absence=False,
+                )
+                smoke80 = outcome80.component_result.get(
+                    "evidence_kind"
+                ) == "synthetic-orchestration-contract"
+                if not production80 and not smoke80:
+                    raise ValueError(
+                        "campaign promoted stage lacks canonical production evidence"
+                    )
+                if isinstance(
+                    outcome80.component_result.get("result"), Mapping
+                ):
+                    semantics80 = _promoted_stage_semantics(
+                        outcome80, predecessor=record.stages[0].outcome
+                    )
+                    if semantics80.kind in {
+                        _PromotedStageKind.ANALYTIC_HORIZON,
+                        _PromotedStageKind.FIXED_ROOT_EXTERIOR_DERIVATIVE,
+                    }:
+                        _validate_precision120(
+                            outcome80,
+                            predecessor=record.stages[0].outcome,
+                        )
+                if semantics80 is None and (
+                    outcome80.self_refinement_enclosed is None
+                    or outcome80.discrepancy_from_previous_abs is None
+                    or outcome80.discrepancy_enclosed is None
+                ):
+                    raise ValueError(
+                        "campaign backend returned incomplete 80-digit evidence"
+                    )
+            _validate_fixed_readout_predictor_binding(
+                record.stages[0].outcome,
+                outcome80,
+            )
             executed += 1
             if selective80 is not None:
                 if leaf.role != "primary":
@@ -7999,23 +8998,30 @@ def _run_campaign_selection_active(
                     duration_seconds=stage_duration,
                     record=record,
                     leaf=leaf,
+                    factory_identity=plan.precision_factory_identity,
                     scientific_execution_contract=scientific_execution_contract,
                 )
             elif leaf.role == "primary":
-                if not _validate_component_result(
-                    leaf,
-                    outcome80,
-                    allow_historical_conditioning_absence=False,
-                ):
-                    raise ValueError(
-                        "campaign promoted PRIMARY stage lacks canonical "
-                        "production evidence"
-                    )
                 outcome80 = _stage_with_promotion_decision(
-                    outcome80, _primary_precision120_decision(outcome80)
+                    outcome80,
+                    _primary_precision120_decision(
+                        outcome80,
+                        predecessor=record.stages[0].outcome,
+                    ),
+                )
+                semantics80 = (
+                    _promoted_stage_semantics(
+                        outcome80, predecessor=record.stages[0].outcome
+                    )
+                    if isinstance(
+                        outcome80.component_result.get("result"), Mapping
+                    )
+                    else None
                 )
                 _, precision120_digits = _primary_recovery_digits()
-                if _primary_requires_precision120(outcome80):
+                if _primary_requires_precision120(
+                    outcome80, predecessor=record.stages[0].outcome
+                ):
                     state = (
                         "MISSING_PRECISION"
                         if precision120_digits not in available.digits
@@ -8027,16 +9033,17 @@ def _run_campaign_selection_active(
                         else None
                     )
                 else:
-                    state = _terminal_state(
-                        outcome80,
-                        enclosed=(
-                            True
-                            if analytic80
+                    state = (
+                        "PRODUCED"
+                        if (
+                            semantics80.terminal_admissible
+                            if semantics80 is not None
                             else (
                                 bool(outcome80.self_refinement_enclosed)
                                 and bool(outcome80.discrepancy_enclosed)
                             )
-                        ),
+                        )
+                        else "UNRESOLVED"
                     )
                     missing = None
                 record = CampaignLeafRecord(
@@ -8063,55 +9070,78 @@ def _run_campaign_selection_active(
                     duration_seconds=stage_duration,
                     record=record,
                     leaf=leaf,
+                    factory_identity=plan.precision_factory_identity,
                     scientific_execution_contract=scientific_execution_contract,
                 )
             else:
                 comparison = None
                 false_negative = False
                 if record.sentinel:
-                    if outcome80.discrepancy_from_previous_abs is None:
-                        raise ValueError(
-                            "campaign analytic sentinel lacks binary64 comparison"
+                    if outcome80.discrepancy_from_previous_abs is not None:
+                        threshold = (
+                            0.25
+                            * record.stages[0].outcome.local_disk_radius_abs
                         )
-                    threshold = 0.25 * record.stages[0].outcome.local_disk_radius_abs
-                    false_negative = (
-                        not record.trigger_ids
-                        and outcome80.discrepancy_from_previous_abs > threshold
-                    )
-                    comparison = {
-                        "binary64_to_80_discrepancy_abs": (
-                            outcome80.discrepancy_from_previous_abs
-                        ),
-                        "trigger_threshold_abs": threshold,
-                        "trigger_policy_false_negative": false_negative,
-                    }
+                        false_negative = (
+                            not record.trigger_ids
+                            and outcome80.discrepancy_from_previous_abs
+                            > threshold
+                        )
+                        comparison = {
+                            "binary64_to_80_discrepancy_abs": (
+                                outcome80.discrepancy_from_previous_abs
+                            ),
+                            "trigger_threshold_abs": threshold,
+                            "trigger_policy_false_negative": false_negative,
+                        }
                 decision = (
                     _deep_precision120_decision(
-                        outcome80, sentinel_false_negative=True
+                        outcome80,
+                        sentinel_false_negative=True,
+                        predecessor=record.stages[0].outcome,
                     )
                     if false_negative
-                    else _primary_precision120_decision(outcome80)
-                    if analytic80
+                    else _primary_precision120_decision(
+                        outcome80,
+                        predecessor=record.stages[0].outcome,
+                    )
+                    if (
+                        semantics80 is not None
+                        and semantics80.kind
+                        is _PromotedStageKind.ANALYTIC_HORIZON
+                    )
                     else _deep_precision120_decision(
-                        outcome80, sentinel_false_negative=False
+                        outcome80,
+                        sentinel_false_negative=False,
+                        predecessor=record.stages[0].outcome,
                     )
                 )
                 outcome80 = _stage_with_promotion_decision(outcome80, decision)
+                semantics80 = (
+                    _promoted_stage_semantics(
+                        outcome80, predecessor=record.stages[0].outcome
+                    )
+                    if isinstance(
+                        outcome80.component_result.get("result"), Mapping
+                    )
+                    else None
+                )
                 requires120 = decision["state"] == "REQUESTED"
                 if false_negative and requires120:
                     state = "INVALID_SENTINEL_FALSE_NEGATIVE"
                     missing = 120
                 elif not requires120:
-                    state = _terminal_state(
-                        outcome80,
-                        enclosed=(
-                            True
-                            if analytic80
+                    state = (
+                        "PRODUCED"
+                        if (
+                            semantics80.terminal_admissible
+                            if semantics80 is not None
                             else (
                                 bool(outcome80.self_refinement_enclosed)
                                 and bool(outcome80.discrepancy_enclosed)
                             )
-                        ),
+                        )
+                        else "UNRESOLVED"
                     )
                     missing = None
                 elif 120 not in available.digits:
@@ -8149,6 +9179,7 @@ def _run_campaign_selection_active(
                     duration_seconds=stage_duration,
                     record=record,
                     leaf=leaf,
+                    factory_identity=plan.precision_factory_identity,
                     scientific_execution_contract=scientific_execution_contract,
                 )
 
@@ -8172,6 +9203,14 @@ def _run_campaign_selection_active(
                 )
             continue
         if len(record.stages) == 2:
+            if _ordinary_fixed_readout_precision120_failure_for_leaf(
+                attempts, leaf, record
+            ) is not None:
+                # A contained failure at the maximum configured tier is a
+                # durable operational outcome.  Preserve its append-only
+                # receipt and do not repeat the same expensive request on
+                # every resume.
+                continue
             precision120_digits = (
                 _primary_recovery_digits()[1]
                 if leaf.role == "primary"
@@ -8213,22 +9252,44 @@ def _run_campaign_selection_active(
                 continue
             if not isinstance(outcome120, StageOutcome) or outcome120.digits != 120:
                 raise ValueError("campaign backend returned incomplete 120-digit evidence")
-            _validate_precision120(outcome120)
+            production120 = _validate_component_result(
+                leaf,
+                outcome120,
+                allow_historical_conditioning_absence=False,
+            )
+            smoke120 = outcome120.component_result.get(
+                "evidence_kind"
+            ) == "synthetic-orchestration-contract"
+            if not production120 and not smoke120:
+                raise ValueError(
+                    "campaign promoted 120-digit stage lacks canonical "
+                    "production evidence"
+                )
+            _validate_precision120(
+                outcome120, predecessor=record.stages[1].outcome
+            )
+            semantics120 = (
+                _promoted_stage_semantics(
+                    outcome120, predecessor=record.stages[1].outcome
+                )
+                if isinstance(
+                    outcome120.component_result.get("result"), Mapping
+                )
+                else None
+            )
+            _validate_fixed_readout_predictor_binding(
+                record.stages[1].outcome,
+                outcome120,
+            )
             executed += 1
             if leaf.role == "primary":
-                if not _validate_component_result(
-                    leaf,
-                    outcome120,
-                    allow_historical_conditioning_absence=False,
-                ):
-                    raise ValueError(
-                        "campaign promoted PRIMARY stage lacks canonical "
-                        "production evidence"
-                    )
                 record = CampaignLeafRecord(
                     leaf_id=record.leaf_id,
                     role=record.role,
-                    state=_primary_precision120_terminal_state(outcome120),
+                    state=_primary_precision120_terminal_state(
+                        outcome120,
+                        predecessor=record.stages[1].outcome,
+                    ),
                     stages=(
                         *record.stages,
                         _campaign_stage_record(plan, available, outcome120),
@@ -8238,9 +9299,6 @@ def _run_campaign_selection_active(
                 false_negative = (
                     record.state == "INVALID_SENTINEL_FALSE_NEGATIVE"
                 )
-                analytic120 = (
-                    _single_promoted_horizon_result(outcome120) is not None
-                )
                 record = CampaignLeafRecord(
                     leaf_id=record.leaf_id,
                     role=record.role,
@@ -8248,8 +9306,11 @@ def _run_campaign_selection_active(
                         "INVALID_SENTINEL_FALSE_NEGATIVE"
                         if false_negative
                         else (
-                            _primary_precision120_terminal_state(outcome120)
-                            if analytic120
+                            _primary_precision120_terminal_state(
+                                outcome120,
+                                predecessor=record.stages[1].outcome,
+                            )
+                            if semantics120 is not None
                             else _terminal_state(
                                 outcome120,
                                 enclosed=bool(outcome120.discrepancy_enclosed),
@@ -8279,6 +9340,7 @@ def _run_campaign_selection_active(
                 duration_seconds=stage_duration,
                 record=record,
                 leaf=leaf,
+                factory_identity=plan.precision_factory_identity,
                 scientific_execution_contract=scientific_execution_contract,
             )
         if record.state in {"PRODUCED", "UNRESOLVED"}:
@@ -9548,16 +10610,20 @@ class NativeCampaignStageBackend:
             "result": base.to_mapping(),
             "self_refinement_result": None,
             "self_refinement_skipped_reason": (
-                "NOT_REQUIRED_BY_FIXED_ROOT_DERIVATIVE_POLICY"
+                _FIXED_ROOT_EXTERIOR_SELF_REFINEMENT_SKIPPED_REASON
             ),
             "scientific_runtime": base_backend.scientific_runtime_for(
                 leaf.job
             ),
-            "failed_preflight_predecessor": predecessor.to_mapping(),
-            "comparison_kind": (
-                "failed-preflight-120-fixed-root-exterior-derivative/v1"
+            "primary_root_predictor_source": (
+                "FAILED_80_REQUEST_BINARY64_BASELINE_OMEGA"
             ),
+            "failed_preflight_predecessor": predecessor.to_mapping(),
+            "comparison_kind": _FAILED_PREFLIGHT_FIXED_ROOT_EXTERIOR_KIND,
             "precision_ladder_discrepancy_applicable": False,
+            "precision_ladder_discrepancy_reason": (
+                _BINARY64_RESPONSE_UNAVAILABLE_REASON
+            ),
         }
         return StageOutcome(
             digits=120,
@@ -9779,44 +10845,44 @@ class NativeCampaignStageBackend:
             primary_backend,
             previous_result.baseline.omega,
         )
-        precision_delta = _component_result_delta(result, previous_result)
         base_radius = sum(result.error_channels.values())
-        discrepancy_enclosed = (
-            abs(precision_delta)
-            <= base_radius + previous_outcomes[-1].local_disk_radius_abs
-        )
-        repeat_delta = 0.0j
-        repeat_result = None
-        self_refinement_enclosed = None
-        self_refinement_skipped_reason = "NOT_REQUIRED_BY_FIXED_ROOT_DERIVATIVE_POLICY"
         component_result = {
             "evidence_kind": (
                 "package-owned-julia-fixed-root-exterior-derivative-component"
             ),
             "result": result.to_mapping(),
-            "self_refinement_result": (
-                None if repeat_result is None else repeat_result.to_mapping()
+            "self_refinement_result": None,
+            "self_refinement_skipped_reason": (
+                _FIXED_ROOT_EXTERIOR_SELF_REFINEMENT_SKIPPED_REASON
             ),
             "scientific_runtime": primary_backend.scientific_runtime_for(
                 leaf.job
             ),
+            "primary_root_predictor_source": (
+                "PREVIOUS_STAGE_BASELINE_OMEGA"
+            ),
+            "precision_ladder_discrepancy_applicable": False,
+            "precision_ladder_discrepancy_reason": (
+                _BINARY64_RESPONSE_UNAVAILABLE_REASON
+                if previous_outcomes[-1].digits == 64
+                else _PREVIOUS_PROMOTED_RESPONSE_UNAVAILABLE_REASON
+            ),
         }
-        component_result["self_refinement_skipped_reason"] = (
-            self_refinement_skipped_reason
-        )
-        local_radius = base_radius + abs(repeat_delta) + abs(precision_delta)
-        return StageOutcome(
+        unbound = StageOutcome(
             digits=digits,
             numerical_state=result.status.value,
             component_result=component_result,
-            local_disk_radius_abs=local_radius,
+            local_disk_radius_abs=base_radius,
             signed_error_channels=_component_stage_signed_error_channels(
                 component_result,
                 result,
-                repeat_delta=repeat_delta,
-                precision_delta=precision_delta,
+                repeat_applicable=False,
+                precision_ladder_applicable=False,
             ),
-            self_refinement_enclosed=self_refinement_enclosed,
-            discrepancy_from_previous_abs=abs(precision_delta),
-            discrepancy_enclosed=discrepancy_enclosed,
+            self_refinement_enclosed=None,
+            discrepancy_from_previous_abs=None,
+            discrepancy_enclosed=None,
+        )
+        return _bind_fixed_root_exterior_precision_comparison(
+            unbound, previous_outcomes[-1]
         )

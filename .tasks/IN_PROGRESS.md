@@ -111,6 +111,13 @@ preservation, and cache/provenance separation from historical raw-state leaves.
   determinant counts, preserve sealed schema-9 checkpoint mappings byte for
   byte, and bind promoted-exterior partial journals to the active scientific
   runtime so worker changes roll forward without deleting prior journal files.
+- Centralise promoted campaign-stage semantics across the complete lifecycle:
+  authenticate legacy ladder, selective readout, analytic horizon, and
+  fixed-root exterior derivative stages from both evidence kind and component
+  identity; make fixed-root self-refinement explicitly inapplicable; admit and
+  promote it through PRIMARY/deep/recovery policy; and prove atomic checkpoint,
+  solved-leaf cache, partial-journal, and zero-work resume behavior with the
+  real Leaf 42 orchestration path while faking only expensive numerical work.
 
 ### Work Log
 
