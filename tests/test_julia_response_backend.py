@@ -882,6 +882,70 @@ class JuliaResponseBackendTests(unittest.TestCase):
         ]
         self.assertGreaterEqual(error_path.count('"schema_version" => 1'), 2)
 
+    def test_fixed_root_wire_distinguishes_logical_and_raw_determinants(self):
+        """Catches collapsing one authenticated result into its raw samples."""
+
+        class CountedDiagnosticAdapter(FakeAdapter):
+            def evaluate(self, request):
+                response = super().evaluate(request)
+                response["schema_version"] = 10
+                raw_count = (
+                    1
+                    if request["mechanism_id"] == "horizon-admittance"
+                    else 3
+                )
+                for diagnostic in response["diagnostic_roots"].values():
+                    diagnostic["raw_determinant_evaluation_count"] = raw_count
+                return response
+
+        for mechanism, expected_raw_count in (
+            ("horizon-admittance", 1),
+            ("exterior-light-ring", 3),
+        ):
+            with self.subTest(mechanism=mechanism):
+                readout = JuliaPrecisionRootBackend(
+                    VettedNativeDeterminantKernel.identity,
+                    CountedDiagnosticAdapter(),
+                    80,
+                ).read_root(_job_for_mechanism(mechanism), 0.0j)
+                for diagnostic in readout.diagnostic_readouts.values():
+                    evidence = diagnostic.fixed_root_evidence
+                    self.assertEqual(evidence.determinant_count, 1)
+                    self.assertEqual(
+                        evidence.raw_determinant_evaluation_count,
+                        expected_raw_count,
+                    )
+
+    def test_fixed_root_wire_rejects_wrong_raw_count_or_json_type(self):
+        """Catches accepting a forged or JSON-coerced raw evaluation count."""
+
+        for bad_value in ("3", 3.0, True, 2, 4, None):
+            with self.subTest(bad_value=bad_value):
+                class ForgedRawCountAdapter(FakeAdapter):
+                    def evaluate(self, request):
+                        response = super().evaluate(request)
+                        response["schema_version"] = 10
+                        for diagnostic in response[
+                            "diagnostic_roots"
+                        ].values():
+                            diagnostic[
+                                "raw_determinant_evaluation_count"
+                            ] = bad_value
+                        return response
+
+                with self.assertRaisesRegex(
+                    JuliaResponseBackendError,
+                    "fixed-root diagnostic contract",
+                ):
+                    JuliaPrecisionRootBackend(
+                        VettedNativeDeterminantKernel.identity,
+                        ForgedRawCountAdapter(),
+                        80,
+                    ).read_root(
+                        _job_for_mechanism("exterior-light-ring"),
+                        0.0j,
+                    )
+
     def test_promoted_primary_acceptance_is_raw_binary64_parity(self):
         readout = JuliaPrecisionRootBackend(
             VettedNativeDeterminantKernel.identity, FakeAdapter(), 80
@@ -2135,6 +2199,7 @@ class JuliaResponseBackendTests(unittest.TestCase):
         )
         self.assertIn('include("real_inner_horizon_spec.jl")', package_tests)
         self.assertIn("m02_worker_finite_difference_spec.jl", workflow)
+        self.assertIn("m02_worker_fixed_root_diagnostic_spec.jl", workflow)
         self.assertIn("m02_worker_request_contract_spec.jl", workflow)
         self.assertIn("leaf13_horizon_harness_spec.jl", workflow)
 

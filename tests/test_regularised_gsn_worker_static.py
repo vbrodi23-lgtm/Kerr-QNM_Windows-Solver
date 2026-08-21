@@ -1093,7 +1093,6 @@ class RegularisedGsnWorkerSourceTests(unittest.TestCase):
         self.assertIn(
             "correction_abs = residual / abs(primary_derivative)", diagnostic
         )
-        self.assertIn("DETERMINANT_INDEX_PHASE[] == 1", diagnostic)
         self.assertNotIn("bounded_newton(", diagnostic)
         self.assertNotIn("finite_difference", diagnostic)
         self.assertNotIn("authenticated_determinant", diagnostic)
