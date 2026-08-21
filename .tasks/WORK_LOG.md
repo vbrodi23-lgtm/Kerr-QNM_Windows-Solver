@@ -2,6 +2,42 @@
 
 Add the newest completed task or milestone-control entry immediately below this heading.
 
+## 2026-08-21 — TASK-079 PR #60 authenticated determinant-count repair
+
+- **Task:** TASK-079 — Regularise promoted GSN propagation and determinant conditioning.
+- **Deliverable:** Replaced the fixed-root phase's stale raw `== 1` assertion
+  with one explicit logical authenticated determinant plus a separately
+  checked raw evaluation count. Promoted exterior TRUNCATION and RESOLUTION now
+  require three raw evaluations for base, tight-control, and preceding-tier
+  evidence; horizon diagnostics require one. Worker wire schema 10 persists
+  both counts, and Python rejects missing, Boolean, floating, string, wrong,
+  incomplete, or extra raw-count evidence. Persisted schema-10 receipts bind
+  the exact JSON-integer schema, mechanism/determinant-family join, and every
+  exterior certificate/calibration field; injected-budget compatibility
+  fixtures are explicitly classified as historical wire 9.
+- **Compatibility:** Preserved sealed schema-9 fixed-root mappings without
+  adding fields during reserialization, retained all completed checkpoint
+  records and accepted promoted-horizon work, and kept failed Leaf 42
+  nonterminal. Promoted-exterior partial journals now include the active
+  scientific-runtime digest in their content address and validate nested
+  response runtime receipts, so a worker change reruns Leaf 42 while leaving
+  the previous journal file untouched.
+- **Verification:** Full safe Python discovery passes 990 tests with 7 skips;
+  five focused checkpoint/cache/journal canaries preserve the PR #58 binding,
+  all 40 completed mappings, the nine accepted promoted-horizon leaves, and
+  nonterminal Leaf 42 retry order. Hosted Julia RED reached the exact obsolete
+  production assertion after the three-evaluation exterior certificate path;
+  the corrected composed Julia green run remains the draft PR CI gate because
+  Julia is unavailable locally. Three independent read-only reviews found no
+  remaining P0–P3 issue. Python compilation, TaskPlanner validation, and diff
+  hygiene pass.
+- **Evidence ceiling:** No production determinant, Newton, angular, coordinate,
+  ODE, Kerr, campaign, or PowerShell execution was performed. TASK-079 remains
+  In Progress pending PR CI, native operator evidence, physical results, and
+  human mathematics review.
+- **Change reference:** draft PR
+  [#60](https://github.com/vbrodi23-lgtm/Kerr-QNM_Windows-Solver/pull/60).
+
 ## 2026-08-21 — TASK-079 PR #59 promoted-policy boundary repair
 
 - **Task:** TASK-079 — Regularise promoted GSN propagation and determinant conditioning.

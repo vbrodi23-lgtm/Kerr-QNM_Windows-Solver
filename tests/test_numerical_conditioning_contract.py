@@ -5,6 +5,7 @@ from dataclasses import replace
 from decimal import Decimal, localcontext
 import hashlib
 import math
+from types import SimpleNamespace
 import unittest
 
 from tests.fixtures import (
@@ -27,6 +28,10 @@ from windows_solver.response_batches import (
 import windows_solver.response_batches as response_batches
 import windows_solver.response_engine as response_engine
 from windows_solver.root_readout_cache import root_readout_identity_sha256
+from windows_solver.promoted_control_calibration import (
+    EXTERIOR_DETERMINANT_ABSOLUTE_ERROR_CERTIFICATE,
+    load_default_calibration_receipt,
+)
 
 
 def historical_schema_two_conditioning(
@@ -736,12 +741,11 @@ class PromotedRuntimeProvenancePersistenceTests(unittest.TestCase):
         primary_acceptance = None
         determinant_abs = Decimal("1E-10")
         if current_schema:
-            request_binding = JuliaPrecisionRootBackend(
-                job.backend_identity,
-                object(),
-                80,
-                ode_error_budget=synthetic_ode_error_budget(80),
-            )._request(job, 0.0j)
+            request_binding = (
+                PromotedRuntimeProvenancePersistenceTests
+                ._current_backend(job)
+                ._request(job, 0.0j)
+            )
             primary_acceptance = response_engine.PrimaryRootAcceptanceEvidence(
                 policy_id=response_engine.PROMOTED_ROOT_READOUT_POLICY,
                 acceptance_metric=(
@@ -759,7 +763,11 @@ class PromotedRuntimeProvenancePersistenceTests(unittest.TestCase):
                 newton_determinant_count=3,
                 post_newton_determinant_count=0,
                 determinant_error_abs=Decimal(0),
-                error_model_id=None,
+                error_model_id=(
+                    response_engine.VERIFIED_ENDPOINT_ERROR_MODEL
+                    if job.mechanism_id == "horizon-admittance"
+                    else EXTERIOR_DETERMINANT_ABSOLUTE_ERROR_CERTIFICATE
+                ),
             )
             receipt_material = {
                 "schema": response_engine.WORKER_RESPONSE_RECEIPT_SCHEMA,
@@ -900,27 +908,34 @@ class PromotedRuntimeProvenancePersistenceTests(unittest.TestCase):
 
     @staticmethod
     def _current_runtime(job):
-        budget = synthetic_ode_error_budget(80).to_mapping()
-        return {
-            "julia_version": "1.10.11",
-            "julia_executable_sha256": "a" * 64,
-            "julia_manifest_sha256": "b" * 64,
-            "worker_sha256": "c" * 64,
-            "runtime_policy_sha256": "d" * 64,
-            "scientific_sources": [],
-            "precision_digits": 80,
-            "working_precision_bits": math.ceil(80 * math.log2(10)) + 32,
-            "refinement_level": 0,
-            "regularised_gsn_precision_policy": dict(
-                response_engine.regularised_gsn_precision_policy(
-                    job.mechanism_id
-                )
-            ),
-            "ode_error_budget": budget,
-            "ode_error_budget_sha256": hashlib.sha256(
-                canonical_json_bytes(budget)
-            ).hexdigest(),
-        }
+        return (
+            PromotedRuntimeProvenancePersistenceTests
+            ._current_backend(job)
+            .scientific_runtime_for(job)
+        )
+
+    @staticmethod
+    def _current_backend(job):
+        receipt = load_default_calibration_receipt()
+        family = (
+            "horizon-scattering/v1"
+            if job.mechanism_id == "horizon-admittance"
+            else "exterior-wronskian/v1"
+        )
+        return JuliaPrecisionRootBackend(
+            job.backend_identity,
+            SimpleNamespace(runtime_provenance={
+                "julia_version": "1.10.11",
+                "julia_executable_sha256": "a" * 64,
+                "julia_manifest_sha256": "b" * 64,
+                "worker_sha256": "c" * 64,
+                "runtime_policy_sha256": "d" * 64,
+                "scientific_sources": [],
+            }),
+            80,
+            empirical_control_profile=receipt.budget_for(family, 80),
+            calibration_receipt=receipt,
+        )
 
     def test_current_promoted_runtime_is_bound_to_job_and_precision(self):
         """Catches checkpoint provenance drifting from the computed result."""
@@ -1135,12 +1150,25 @@ class JuliaSchemaThreeConditioningTests(unittest.TestCase):
                 self.mutate(response)
             return response
 
-    def _backend(self, adapter=None, *, digits=80):
+    def _backend(
+        self,
+        adapter=None,
+        *,
+        digits=80,
+        mechanism_id="horizon-admittance",
+    ):
+        receipt = load_default_calibration_receipt()
+        family = (
+            "horizon-scattering/v1"
+            if mechanism_id == "horizon-admittance"
+            else "exterior-wronskian/v1"
+        )
         return JuliaPrecisionRootBackend(
             response_engine.VettedNativeDeterminantKernel.identity,
             self.Adapter() if adapter is None else adapter,
             digits,
-            ode_error_budget=synthetic_ode_error_budget(digits),
+            empirical_control_profile=receipt.budget_for(family, digits),
+            calibration_receipt=receipt,
         )
 
     def test_schema_three_success_requires_and_persists_conditioning(self):
@@ -1172,7 +1200,9 @@ class JuliaSchemaThreeConditioningTests(unittest.TestCase):
         """Catches presenting an exterior Wronskian as horizon scattering."""
 
         job = self._job("exterior-light-ring")
-        readout = self._backend().read_root(job, 0.0j)
+        readout = self._backend(
+            mechanism_id=job.mechanism_id
+        ).read_root(job, 0.0j)
 
         self.assertEqual(
             readout.numerical_conditioning.to_mapping(),
@@ -1211,7 +1241,10 @@ class JuliaSchemaThreeConditioningTests(unittest.TestCase):
         for label, mutate in mutations.items():
             with self.subTest(label=label):
                 with self.assertRaises(JuliaResponseBackendError):
-                    self._backend(self.Adapter(mutate)).read_root(job, 0.0j)
+                    self._backend(
+                        self.Adapter(mutate),
+                        mechanism_id=job.mechanism_id,
+                    ).read_root(job, 0.0j)
 
     def test_schema_three_preserves_exact_determinant_magnitudes(self):
         """Catches converting determinant evidence to binary64 before persistence."""
@@ -1466,8 +1499,8 @@ class JuliaSchemaThreeConditioningTests(unittest.TestCase):
     def test_exterior_precision_policy_is_wronskian_specific(self):
         """Catches a request authenticating horizon-only algebra for exterior work."""
 
-        backend = self._backend()
         job = self._job("exterior-throat-kappa")
+        backend = self._backend(mechanism_id=job.mechanism_id)
         policy = backend._request(job, 0.0j)["policy"]
 
         self.assertEqual(policy["determinant_family"], "exterior-wronskian/v1")
@@ -1484,17 +1517,18 @@ class JuliaSchemaThreeConditioningTests(unittest.TestCase):
         self.assertIsNone(policy["scattering_coefficient_extraction"])
         self.assertIsNone(policy["horizon_determinant_chart"])
         self.assertIsNone(policy["scattering_chart_safety_factor"])
-        # The exterior path is unchanged by the horizon rewrite: it keeps the
-        # original representation, and the identities the rewrite introduced
-        # are absent rather than null. A null would still change the policy
-        # mapping, and receipt reuse is decided by exact equality against it --
-        # so every exterior receipt main produced would go stale for a change
-        # that never touched the exterior determinant.
+        # The exterior determinant keeps its own representation and omits the
+        # horizon-only contour/calibration labels.  Its empirical determinant
+        # certificate is mechanism-specific request evidence, not horizon
+        # geometry.
         self.assertEqual(
             policy["homogeneous_representation"], "factored-plane-wave-gsn/v1"
         )
         self.assertNotIn("horizon_contour", policy)
-        self.assertNotIn("determinant_error_model", policy)
+        self.assertEqual(
+            policy["determinant_error_model"],
+            EXTERIOR_DETERMINANT_ABSOLUTE_ERROR_CERTIFICATE,
+        )
         self.assertNotIn("control_profile_label", policy)
         self.assertNotIn("calibration_status", policy)
         runtime_policy = backend.scientific_runtime_for(job)[
@@ -1521,8 +1555,8 @@ class JuliaSchemaThreeConditioningTests(unittest.TestCase):
     def test_backend_rejects_request_policy_drift_from_job_mechanism(self):
         """Catches policy/response agreement laundering the wrong determinant family."""
 
-        backend = self._backend()
         job = self._job("exterior-alpha-half")
+        backend = self._backend(mechanism_id=job.mechanism_id)
         request = backend._request(job, 0.0j)
         request["policy"]["determinant_family"] = "horizon-scattering/v1"
 

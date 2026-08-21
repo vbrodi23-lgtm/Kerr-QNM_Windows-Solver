@@ -56,6 +56,7 @@ from .response_engine import (
 )
 from .precision_tiers import PrecisionTier, precision_tier
 from .promoted_control_calibration import (
+    EXTERIOR_DETERMINANT_ABSOLUTE_ERROR_CERTIFICATE,
     EmpiricalControlProfile,
     PromotedControlCalibrationReceipt,
 )
@@ -2759,9 +2760,9 @@ def _precision_policy(
                 }[digits],
             })
     else:
-        # Legacy injected budgets remain readable for existing authenticated
-        # tests and evidence. New native production requests use the committed
-        # empirical receipt path above.
+        # Legacy injected budgets remain constructible for exact historical
+        # wire-9 fixture/checkpoint reconstruction. Current wire-10 exterior
+        # execution uses the committed empirical receipt path above.
         ode_controls = _adaptive_ode_request_controls(digits, ode_error_budget)
         root_search_controls = {
             (40, "base"): ("1e-6", "1e-12", "1e-3"),
@@ -3509,7 +3510,15 @@ class JuliaPrecisionRootBackend:
             raise JuliaResponseBackendError(
                 "M02 Julia PRIMARY acceptance evidence is invalid"
             ) from error
-        expected_error_model_id = policy.get("determinant_error_model")
+        expected_error_model_id = (
+            VERIFIED_ENDPOINT_ERROR_MODEL
+            if job.mechanism_id == "horizon-admittance"
+            else EXTERIOR_DETERMINANT_ABSOLUTE_ERROR_CERTIFICATE
+        )
+        if policy.get("determinant_error_model") != expected_error_model_id:
+            raise JuliaResponseBackendError(
+                "M02 Julia determinant certificate policy is invalid"
+            )
         if primary_acceptance.error_model_id != expected_error_model_id:
             raise JuliaResponseBackendError(
                 "M02 Julia PRIMARY determinant telemetry identity is invalid"
@@ -3655,8 +3664,12 @@ class JuliaPrecisionRootBackend:
             "solve_role",
             "authoritative",
             "determinant_count",
+            "raw_determinant_evaluation_count",
             "root_converged",
         }
+        expected_raw_determinant_count = (
+            1 if job.mechanism_id == "horizon-admittance" else 3
+        )
         expected_families = {"truncation", "resolution"}
         if (
             not isinstance(raw_diagnostics, Mapping)
@@ -3691,6 +3704,10 @@ class JuliaPrecisionRootBackend:
                 or type(raw["branch_authenticated"]) is not bool
                 or type(raw["determinant_count"]) is not int
                 or raw["determinant_count"] != 1
+                or type(raw["raw_determinant_evaluation_count"])
+                is not int
+                or raw["raw_determinant_evaluation_count"]
+                != expected_raw_determinant_count
             ):
                 raise JuliaResponseBackendError(
                     "M02 Julia fixed-root diagnostic contract is invalid"
@@ -3743,6 +3760,9 @@ class JuliaPrecisionRootBackend:
                 "branch_identity": raw["branch_identity"],
                 "branch_authenticated": raw["branch_authenticated"],
                 "determinant_count": raw["determinant_count"],
+                "raw_determinant_evaluation_count": raw[
+                    "raw_determinant_evaluation_count"
+                ],
                 "accepted": raw["root_converged"],
                 "fixed_root": raw["fixed_root"],
                 "derivative_source": raw["derivative_source"],

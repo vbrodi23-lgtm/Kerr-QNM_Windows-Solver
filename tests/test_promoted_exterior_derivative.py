@@ -6,9 +6,11 @@ from dataclasses import replace
 from decimal import Decimal, localcontext
 from pathlib import Path
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
+import windows_solver.response_engine as response_engine
 from tests.test_promoted_horizon_component import (
     _promoted_baseline,
     _with_worker_receipt,
@@ -24,6 +26,10 @@ from windows_solver.response_batches import (
     synthetic_stage_signed_error_channels,
 )
 from windows_solver.root_readout_cache import runtime_identity_sha256
+from windows_solver.julia_response_backend import JuliaPrecisionRootBackend
+from windows_solver.promoted_control_calibration import (
+    load_default_calibration_receipt,
+)
 from windows_solver.response_engine import (
     ComponentResult,
     EXTERIOR_DERIVATIVE_COMPONENT_IDENTITY,
@@ -476,6 +482,110 @@ class PromotedExteriorDerivativeTests(unittest.TestCase):
             self.assertTrue(final.complete)
             self.assertEqual(len(final.entries), 5)
 
+    def test_production_partial_journal_worker_change_reruns_baseline(self) -> None:
+        """A changed worker rolls forward without deleting the old journal."""
+
+        leaf = _primary_exterior_leaf()
+        baseline = self._baseline_with_derivative_evidence(leaf)
+
+        def runtime_bound_baseline(worker_sha256: str):
+            runtime = {"worker_sha256": worker_sha256}
+            receipt = response_engine._journal_json_value(
+                baseline.worker_response_receipt
+            )
+            receipt["scientific_runtime_sha256"] = hashlib.sha256(
+                canonical_json_bytes(runtime)
+            ).hexdigest()
+            material = {
+                key: value
+                for key, value in receipt.items()
+                if key != "receipt_sha256"
+            }
+            receipt["receipt_sha256"] = hashlib.sha256(
+                canonical_json_bytes(material)
+            ).hexdigest()
+            return runtime, replace(
+                baseline, worker_response_receipt=receipt
+            )
+
+        class ExactPreviewBackend(FixedRootOnlyBackend):
+            def __init__(self, job, baseline, runtime):
+                super().__init__(job, baseline)
+                self._runtime = runtime
+
+            def scientific_runtime_for(self, job):
+                return dict(self._runtime)
+
+            def preview_root_request(
+                self,
+                job,
+                amplitude,
+                primary_predictor,
+                primary_predictor_kind,
+                readout_role,
+            ):
+                return dict(
+                    self.baseline.worker_response_receipt[
+                        "request_binding"
+                    ]
+                )
+
+            def preview_fixed_root_request(
+                self, job, omega, amplitude, readout_role
+            ):
+                converted = complex(amplitude)
+                return {
+                    "amplitude": {
+                        "imaginary": converted.imag,
+                        "real": converted.real,
+                    },
+                    "job_id": job.job_id,
+                    "leaf_id": job.leaf_id,
+                    "omega": {
+                        "imaginary": omega.imag,
+                        "real": omega.real,
+                    },
+                    "readout_role": readout_role,
+                }
+
+        class InterruptAfterBaseline(ExactPreviewBackend):
+            def sample_fixed_root_determinant(self, *args, **kwargs):
+                raise KeyboardInterrupt("synthetic interruption")
+
+        runtime_a, baseline_a = runtime_bound_baseline("a" * 64)
+        runtime_b, baseline_b = runtime_bound_baseline("b" * 64)
+        with tempfile.TemporaryDirectory() as temporary, patch.dict(
+            "os.environ",
+            {"KERR_QNM_PARTIAL_COMPONENT_JOURNAL_ROOT": temporary},
+        ):
+            interrupted = InterruptAfterBaseline(
+                leaf.job, baseline_a, runtime_a
+            )
+            with self.assertRaises(KeyboardInterrupt):
+                run_promoted_exterior_component(
+                    leaf.job,
+                    interrupted,
+                    primary_predictor=baseline.omega,
+                    derivative_step=0.004,
+                )
+            old_path = next(Path(temporary).glob("*.json"))
+            old_bytes = old_path.read_bytes()
+
+            resumed = ExactPreviewBackend(leaf.job, baseline_b, runtime_b)
+            result = run_promoted_exterior_component(
+                leaf.job,
+                resumed,
+                primary_predictor=baseline.omega,
+                derivative_step=0.004,
+            )
+
+            self.assertEqual(resumed.root_amplitudes, [0.0j])
+            self.assertIsNotNone(result.response)
+            journals = tuple(Path(temporary).glob("*.json"))
+            self.assertEqual(len(journals), 2)
+            self.assertTrue(old_path.is_file())
+            self.assertEqual(old_path.read_bytes(), old_bytes)
+
     def test_non_primary_exterior_uses_the_same_fixed_root_contract(self) -> None:
         leaf = _deep_exterior_leaf()
         baseline = self._baseline_with_derivative_evidence(leaf)
@@ -765,26 +875,26 @@ class PromotedExteriorDerivativeTests(unittest.TestCase):
             self._baseline_with_derivative_evidence(leaf),
             omega=leaf.job.root.omega,
         )
-        budget = synthetic_ode_error_budget(80).to_mapping()
-        runtime = {
-            "precision_digits": 80,
-            "working_precision_bits": 298,
-            "semantic_precision_tier": "bigfloat-80",
-            "refinement_level": 0,
-            "regularised_gsn_precision_policy": dict(
-                regularised_gsn_precision_policy(leaf.mechanism_id)
+        runtime_provenance = {}
+        calibration_receipt = load_default_calibration_receipt()
+        runtime_backend = JuliaPrecisionRootBackend(
+            leaf.job.backend_identity,
+            SimpleNamespace(runtime_provenance=runtime_provenance),
+            80,
+            empirical_control_profile=calibration_receipt.budget_for(
+                "exterior-wronskian/v1", 80
             ),
-            "ode_error_budget": budget,
-            "ode_error_budget_sha256": hashlib.sha256(
-                canonical_json_bytes(budget)
-            ).hexdigest(),
-        }
+            calibration_receipt=calibration_receipt,
+        )
+        runtime = runtime_backend.scientific_runtime_for(leaf.job)
         result = run_promoted_exterior_component(
             leaf.job,
             FixedRootOnlyBackend(
                 leaf.job,
                 baseline,
-                runtime_identity=runtime_identity_sha256({}),
+                runtime_identity=runtime_identity_sha256(
+                    runtime_provenance
+                ),
             ),
             primary_predictor=baseline.omega,
             derivative_step=0.004,

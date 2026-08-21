@@ -356,9 +356,12 @@ def current_promoted_component_payload(
         VERIFIED_ENDPOINT_ERROR_MODEL,
         WORKER_RESPONSE_RECEIPT_SCHEMA,
         WORKER_RESPONSE_WIRE_SCHEMA,
-        regularised_gsn_precision_policy,
     )
     from windows_solver.julia_response_backend import JuliaPrecisionRootBackend
+    from windows_solver.promoted_control_calibration import (
+        EXTERIOR_DETERMINANT_ABSOLUTE_ERROR_CERTIFICATE,
+        load_default_calibration_receipt,
+    )
 
     mapping = valid_numerical_conditioning(result.mechanism_id)
     mapping.update({
@@ -375,26 +378,32 @@ def current_promoted_component_payload(
         else "not-applicable/v1"
     )
 
-    ode_error_budget = synthetic_ode_error_budget(digits).to_mapping()
-    scientific_runtime = {
-        "precision_digits": digits,
-        "working_precision_bits": math.ceil(digits * math.log2(10)) + 32,
-        "refinement_level": 0,
-        "regularised_gsn_precision_policy": dict(
-            regularised_gsn_precision_policy(result.mechanism_id)
-        ),
-        "ode_error_budget": ode_error_budget,
-        "ode_error_budget_sha256": hashlib.sha256(
-            canonical_json_bytes(ode_error_budget)
-        ).hexdigest(),
-    }
+    class _FixturePromotedAdapter:
+        runtime_provenance = {
+            "julia_version": "1.10.11",
+            "julia_executable_sha256": "a" * 64,
+            "julia_manifest_sha256": "b" * 64,
+            "worker_sha256": "c" * 64,
+            "runtime_policy_sha256": "d" * 64,
+            "scientific_sources": [],
+        }
 
+    calibration_receipt = load_default_calibration_receipt()
+    determinant_family = (
+        "horizon-scattering/v1"
+        if result.mechanism_id == "horizon-admittance"
+        else "exterior-wronskian/v1"
+    )
     request_backend = JuliaPrecisionRootBackend(
         leaf.job.backend_identity,
-        object(),
+        _FixturePromotedAdapter(),
         digits,
-        ode_error_budget=synthetic_ode_error_budget(digits),
+        empirical_control_profile=calibration_receipt.budget_for(
+            determinant_family, digits
+        ),
+        calibration_receipt=calibration_receipt,
     )
+    scientific_runtime = request_backend.scientific_runtime_for(leaf.job)
 
     def conditioned(readout, readout_id, amplitude):
         correction_tolerance = Decimal("2e-11")
@@ -414,7 +423,7 @@ def current_promoted_component_payload(
         error_model_id = (
             VERIFIED_ENDPOINT_ERROR_MODEL
             if evidence.scattering_diagnostics_applicable
-            else None
+            else EXTERIOR_DETERMINANT_ABSOLUTE_ERROR_CERTIFICATE
         )
         primary = PrimaryRootAcceptanceEvidence(
             policy_id=PROMOTED_ROOT_READOUT_POLICY,
@@ -453,6 +462,11 @@ def current_promoted_component_payload(
                     accepted=True,
                     fixed_root=True,
                     derivative_source="PRIMARY_COMPLEX",
+                    raw_determinant_evaluation_count=(
+                        1
+                        if evidence.scattering_diagnostics_applicable
+                        else 3
+                    ),
                 )
                 diagnostics[family] = DiagnosticRootReadout(
                     omega_delta_from_primary=0.0j,
@@ -1146,7 +1160,7 @@ def valid_legacy_julia_root_response(
 def valid_julia_root_response(
     request: dict[str, object],
 ) -> dict[str, object]:
-    """Return one schema-9 derivative-authenticated promoted-worker response."""
+    """Return one schema-10 derivative-authenticated promoted-worker response."""
 
     omega = request["omega"]
     policy = request["policy"]
@@ -1198,11 +1212,14 @@ def valid_julia_root_response(
             "solve_role": "FIXED_ROOT_DIAGNOSTIC",
             "authoritative": False,
             "determinant_count": 1,
+            "raw_determinant_evaluation_count": (
+                3 if exterior_empirical else 1
+            ),
             "root_converged": Decimal(correction) <= Decimal(tolerance),
         }
 
     return {
-        "schema_version": 9,
+        "schema_version": 10,
         "status": "ok",
         "adapter": "package-owned-julia-gsn-root-readout",
         "request_sha256": hashlib.sha256(

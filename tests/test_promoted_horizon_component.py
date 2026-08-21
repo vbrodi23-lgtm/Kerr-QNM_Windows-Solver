@@ -53,6 +53,9 @@ from windows_solver.response_engine import (
 )
 from windows_solver.gsn_cache_producer import GeneratedGsnCache, GsnParameterPair
 from windows_solver.julia_response_backend import JuliaPrecisionRootBackend
+from windows_solver.promoted_control_calibration import (
+    load_default_calibration_receipt,
+)
 from tests.fixtures import synthetic_ode_error_budget
 from windows_solver.response_engine import NativeDeterminantAdapter, RootReadout
 from windows_solver.response_reduction import (
@@ -190,6 +193,7 @@ def _promoted_baseline(
             accepted=True,
             fixed_root=True,
             derivative_source="PRIMARY_COMPLEX",
+            raw_determinant_evaluation_count=1,
         )
         diagnostics[family] = DiagnosticRootReadout(
             omega_delta_from_primary=0.0j,
@@ -247,32 +251,44 @@ class FakePromotedBackend:
 
 
 def _with_worker_receipt(job, baseline, digits, primary_predictor):
-    budget = synthetic_ode_error_budget(digits).to_mapping()
-    runtime = {
-        "precision_digits": digits,
-        "working_precision_bits": math.ceil(digits * math.log2(10)) + 32,
-        "semantic_precision_tier": f"bigfloat-{digits}",
-        "refinement_level": 0,
-        "regularised_gsn_precision_policy": dict(
-            response_engine.regularised_gsn_precision_policy(
-                job.mechanism_id
-            )
-        ),
-        "ode_error_budget": budget,
-        "ode_error_budget_sha256": hashlib.sha256(
-            canonical_json_bytes(budget)
-        ).hexdigest(),
-    }
-    request = JuliaPrecisionRootBackend(
+    calibration_receipt = load_default_calibration_receipt()
+    determinant_family = (
+        "horizon-scattering/v1"
+        if job.mechanism_id == "horizon-admittance"
+        else "exterior-wronskian/v1"
+    )
+    adapter = SimpleNamespace(runtime_provenance={})
+    backend = JuliaPrecisionRootBackend(
         job.backend_identity,
-        object(),
+        adapter,
         digits,
-        ode_error_budget=synthetic_ode_error_budget(digits),
-    )._request(
+        empirical_control_profile=calibration_receipt.budget_for(
+            determinant_family, digits
+        ),
+        calibration_receipt=calibration_receipt,
+    )
+    runtime = backend.scientific_runtime_for(job)
+    request = backend._request(
         job,
         0.0j,
         primary_predictor,
         None,
+    )
+    expected_raw_count = (
+        1 if job.mechanism_id == "horizon-admittance" else 3
+    )
+    baseline = replace(
+        baseline,
+        diagnostic_readouts={
+            family: replace(
+                diagnostic,
+                fixed_root_evidence=replace(
+                    diagnostic.fixed_root_evidence,
+                    raw_determinant_evaluation_count=expected_raw_count,
+                ),
+            )
+            for family, diagnostic in baseline.diagnostic_readouts.items()
+        },
     )
     material = {
         "schema": response_engine.WORKER_RESPONSE_RECEIPT_SCHEMA,
@@ -655,22 +671,26 @@ class FakeJuliaPrecisionBackend(FakePromotedBackend):
         self.digits = digits
 
     def scientific_runtime_for(self, job):
-        budget = synthetic_ode_error_budget(self.digits).to_mapping()
-        return {
-            "precision_digits": self.digits,
-            "working_precision_bits": math.ceil(self.digits * math.log2(10)) + 32,
-            "semantic_precision_tier": f"bigfloat-{self.digits}",
-            "refinement_level": 0,
-            "regularised_gsn_precision_policy": dict(
-                response_engine.regularised_gsn_precision_policy(
-                    job.mechanism_id
-                )
+        return self._production_request_backend(job).scientific_runtime_for(
+            job
+        )
+
+    def _production_request_backend(self, job):
+        calibration_receipt = load_default_calibration_receipt()
+        determinant_family = (
+            "horizon-scattering/v1"
+            if job.mechanism_id == "horizon-admittance"
+            else "exterior-wronskian/v1"
+        )
+        return JuliaPrecisionRootBackend(
+            self.identity,
+            SimpleNamespace(runtime_provenance={}),
+            self.digits,
+            empirical_control_profile=calibration_receipt.budget_for(
+                determinant_family, self.digits
             ),
-            "ode_error_budget": budget,
-            "ode_error_budget_sha256": hashlib.sha256(
-                canonical_json_bytes(budget)
-            ).hexdigest(),
-        }
+            calibration_receipt=calibration_receipt,
+        )
 
     def _request(
         self,
@@ -679,6 +699,8 @@ class FakeJuliaPrecisionBackend(FakePromotedBackend):
         primary_predictor=None,
         primary_predictor_kind=None,
     ):
+        # Failed-preflight fixtures in this module deliberately exercise the
+        # injected ODE-budget constructor used by their attempted request.
         return JuliaPrecisionRootBackend(
             self.identity,
             object(),
