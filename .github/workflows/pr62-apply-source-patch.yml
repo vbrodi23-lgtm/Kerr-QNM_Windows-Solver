@@ -1,0 +1,49 @@
+name: pr62-apply-source-patch
+
+on:
+  push:
+    branches:
+      - fix/m02-exterior-primary-derivative-error
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/m02-exterior-primary-derivative-error
+      - name: Apply exact Julia producer repair
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path("src/windows_solver/data/julia/m02_worker.jl")
+          text = path.read_text(encoding="utf-8")
+          old = '''    propagate_primary_derivative_error =
+              string(required(request, "mechanism_id")) == "horizon-admittance" &&
+              haskey(request, "determinant_error_model")
+          '''
+          new = '''    # `"horizon-admittance"` was originally the only promoted family
+              # carrying determinant-error evidence. Promoted exterior determinants now
+              # carry their own empirical certificate, so propagate any declared model.
+              propagate_primary_derivative_error =
+                  haskey(request, "determinant_error_model")
+          '''
+          if text.count(old) != 1:
+              raise SystemExit(f"expected exactly one stale producer block, found {text.count(old)}")
+          path.write_text(text.replace(old, new), encoding="utf-8")
+          PY
+          git diff --check
+          git diff -- src/windows_solver/data/julia/m02_worker.jl
+      - name: Commit source repair
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/windows_solver/data/julia/m02_worker.jl
+          git commit -m "fix(m02): propagate certified exterior derivative error"
+          git push origin HEAD:fix/m02-exterior-primary-derivative-error
