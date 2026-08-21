@@ -120,6 +120,19 @@ class _NoisyScientificFixedRootBackend(_ScientificFixedRootBackend):
         )
 
 
+class _FailingScientificFixedRootBackend(_ScientificFixedRootBackend):
+    """Raise one authenticated control failure at the worker boundary."""
+
+    def __init__(self, job, baseline, digits: int, failure) -> None:
+        super().__init__(job, baseline, digits)
+        self.failure = failure
+        self.read_calls = 0
+
+    def read_root(self, *args, **kwargs):
+        self.read_calls += 1
+        raise self.failure
+
+
 class PromotedExteriorCampaignFlowCanary(unittest.TestCase):
     """Leaf-42 production-path canary for the fixed-root exterior lifecycle."""
 
@@ -763,23 +776,14 @@ class PromotedExteriorCampaignFlowCanary(unittest.TestCase):
             self.leaf.job, baseline80, 80
         )
 
-        class Failing120Worker(_ScientificFixedRootBackend):
-            def __init__(self, job, baseline, failure):
-                super().__init__(job, baseline, 120)
-                self.failure = failure
-                self.read_calls = 0
-
-            def read_root(self, *args, **kwargs):
-                self.read_calls += 1
-                raise self.failure
-
         baseline120 = (
             exterior_derivative_fixtures.PromotedExteriorDerivativeTests
             ._baseline_with_derivative_evidence(self.leaf)
         )
-        worker120 = Failing120Worker(
+        worker120 = _FailingScientificFixedRootBackend(
             self.leaf.job,
             baseline120,
+            120,
             self._empirical_failed_preflight_error(self.leaf, digits=120),
         )
         workers = {80: worker80, 120: worker120}
@@ -817,9 +821,10 @@ class PromotedExteriorCampaignFlowCanary(unittest.TestCase):
         durable_bytes = checkpoint.read_bytes()
 
         resume_backend = self._native_backend()
-        resume_worker120 = Failing120Worker(
+        resume_worker120 = _FailingScientificFixedRootBackend(
             self.leaf.job,
             baseline120,
+            120,
             self._empirical_failed_preflight_error(self.leaf, digits=120),
         )
         with patch(
@@ -860,41 +865,32 @@ class PromotedExteriorCampaignFlowCanary(unittest.TestCase):
         )
         native = self._native_backend()
         failure = self._empirical_failed_preflight_error(self.leaf)
+        worker80 = _FailingScientificFixedRootBackend(
+            self.leaf.job,
+            (
+                exterior_derivative_fixtures
+                .PromotedExteriorDerivativeTests
+                ._baseline_with_derivative_evidence(self.leaf)
+            ),
+            80,
+            failure,
+        )
         worker120 = self._precision_backend(self.leaf, 120)
-
-        class RecoveryBackend:
-            identity = native.identity
-            precision_capabilities = native.precision_capabilities
-
-            def scientific_execution_contract_for(self, leaf):
-                return native.scientific_execution_contract_for(leaf)
-
-            def execute_stage(self, leaf, digits):
-                return native.execute_stage(leaf, digits)
-
-            def execute_promoted_stage(self, leaf, digits, previous):
-                raise failure
-
-            def execute_promoted_stage_after_failed_preflight(
-                self, leaf, digits, predecessor
-            ):
-                return native.execute_promoted_stage_after_failed_preflight(
-                    leaf, digits, predecessor
-                )
-
-        backend = RecoveryBackend()
         with patch(
             "windows_solver.response_batches.run_component",
             return_value=self._binary_result(),
         ), patch.object(
             native,
             "_julia_precision_backend_for",
-            return_value=worker120,
+            side_effect=lambda job, digits, refinement=0: {
+                80: worker80,
+                120: worker120,
+            }[digits],
         ):
             summary = run_campaign_selection(
                 self.plan,
                 selection,
-                backend,
+                native,
                 checkpoint,
                 resume=False,
                 solved_leaf_store=cache,
@@ -907,6 +903,7 @@ class PromotedExteriorCampaignFlowCanary(unittest.TestCase):
             (64, 120),
         )
         self.assertEqual(len(summary.attempts), 1)
+        self.assertEqual(worker80.read_calls, 1)
         recovered = record.stages[1].outcome
         self.assertIsNone(recovered.self_refinement_enclosed)
         self.assertIsNone(
@@ -922,7 +919,13 @@ class PromotedExteriorCampaignFlowCanary(unittest.TestCase):
         )
         self.assertEqual(cache.stored_count, 1)
 
-        class NoNumerics(RecoveryBackend):
+        class NoNumerics:
+            identity = native.identity
+            precision_capabilities = native.precision_capabilities
+
+            def scientific_execution_contract_for(self, leaf):
+                return native.scientific_execution_contract_for(leaf)
+
             def execute_stage(self, leaf, digits):
                 raise AssertionError("cache reload repeated binary numerics")
 
@@ -970,31 +973,21 @@ class PromotedExteriorCampaignFlowCanary(unittest.TestCase):
         )
         native = self._native_backend(deep)
         failure = self._empirical_failed_preflight_error(deep)
+        worker80 = _FailingScientificFixedRootBackend(
+            deep.job,
+            (
+                exterior_derivative_fixtures
+                .PromotedExteriorDerivativeTests
+                ._baseline_with_derivative_evidence(deep)
+            ),
+            80,
+            failure,
+        )
         worker120 = self._precision_backend(deep, 120)
         checkpoint = self.root / "deep-failed-preflight.json"
         selection = build_campaign_selection(
             self.plan, role="deep", leaf_ids=(deep.leaf_id,)
         )
-
-        class RecoveryBackend:
-            identity = native.identity
-            precision_capabilities = native.precision_capabilities
-
-            def scientific_execution_contract_for(self, leaf):
-                return native.scientific_execution_contract_for(leaf)
-
-            def execute_stage(self, leaf, digits):
-                return native.execute_stage(leaf, digits)
-
-            def execute_promoted_stage(self, leaf, digits, previous):
-                raise failure
-
-            def execute_promoted_stage_after_failed_preflight(
-                self, leaf, digits, predecessor
-            ):
-                return native.execute_promoted_stage_after_failed_preflight(
-                    leaf, digits, predecessor
-                )
 
         with patch(
             "windows_solver.response_batches.run_component",
@@ -1002,12 +995,15 @@ class PromotedExteriorCampaignFlowCanary(unittest.TestCase):
         ), patch.object(
             native,
             "_julia_precision_backend_for",
-            return_value=worker120,
+            side_effect=lambda job, digits, refinement=0: {
+                80: worker80,
+                120: worker120,
+            }[digits],
         ):
             summary = run_campaign_selection(
                 self.plan,
                 selection,
-                RecoveryBackend(),
+                native,
                 checkpoint,
                 resume=False,
             )

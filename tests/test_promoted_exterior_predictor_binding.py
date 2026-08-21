@@ -260,27 +260,15 @@ class PromotedExteriorPredictorBindingTests(unittest.TestCase):
         )
         native = self.flow._native_backend()
         failure = self.flow._empirical_failed_preflight_error(self.flow.leaf)
+        worker80 = campaign_fixtures._FailingScientificFixedRootBackend(
+            self.flow.leaf.job,
+            self._worker(
+                80, self.flow.leaf.job.root.omega
+            ).baseline,
+            80,
+            failure,
+        )
         worker120 = self.flow._precision_backend(self.flow.leaf, 120)
-
-        class RecoveryBackend:
-            identity = native.identity
-            precision_capabilities = native.precision_capabilities
-
-            def scientific_execution_contract_for(self, leaf):
-                return native.scientific_execution_contract_for(leaf)
-
-            def execute_stage(self, leaf, digits):
-                return native.execute_stage(leaf, digits)
-
-            def execute_promoted_stage(self, leaf, digits, previous):
-                raise failure
-
-            def execute_promoted_stage_after_failed_preflight(
-                self, leaf, digits, predecessor
-            ):
-                return native.execute_promoted_stage_after_failed_preflight(
-                    leaf, digits, predecessor
-                )
 
         with patch(
             "windows_solver.response_batches.run_component",
@@ -288,7 +276,10 @@ class PromotedExteriorPredictorBindingTests(unittest.TestCase):
         ), patch.object(
             native,
             "_julia_precision_backend_for",
-            return_value=worker120,
+            side_effect=lambda job, digits, refinement=0: {
+                80: worker80,
+                120: worker120,
+            }[digits],
         ), self.assertRaisesRegex(
             ValueError,
             "promoted fixed-readout PRIMARY predictor binding is invalid",
@@ -296,7 +287,7 @@ class PromotedExteriorPredictorBindingTests(unittest.TestCase):
             run_campaign_selection(
                 self.flow.plan,
                 selection,
-                RecoveryBackend(),
+                native,
                 checkpoint,
                 resume=False,
             )
