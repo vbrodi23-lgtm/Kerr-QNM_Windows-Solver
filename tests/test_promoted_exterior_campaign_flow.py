@@ -651,11 +651,12 @@ class PromotedExteriorCampaignFlowCanary(unittest.TestCase):
         ).records, summary.records)
 
     def test_leaf42_nonconverged_80_runs_bounded_120_to_terminal_checkpoint(self):
-        """A typed 80 root miss must reach the live 120 recovery decision."""
+        """A typed 80 root miss must survive the full durable lifecycle."""
 
         from tests.test_promoted_horizon_component import _with_worker_receipt
 
         checkpoint = self.root / "nonconverged-then-120.json"
+        cache = SolvedLeafStore(self.root / "nonconverged-solved-leaves")
         selection = build_campaign_selection(
             self.plan, role="primary", leaf_ids=(self.leaf.leaf_id,)
         )
@@ -725,6 +726,7 @@ class PromotedExteriorCampaignFlowCanary(unittest.TestCase):
                 backend,
                 checkpoint,
                 resume=False,
+                solved_leaf_store=cache,
             )
 
         record = summary.records[0]
@@ -755,10 +757,120 @@ class PromotedExteriorCampaignFlowCanary(unittest.TestCase):
             ).status,
             ComponentStatus.CONVERGED,
         )
+        raw_checkpoint = checkpoint.read_bytes()
+        self.assertEqual(
+            raw_checkpoint,
+            canonical_json_bytes(json.loads(raw_checkpoint)),
+        )
+        self.assertEqual(
+            tuple(checkpoint.parent.glob(f".{checkpoint.name}.*.tmp")),
+            (),
+        )
         self.assertEqual(
             validate_campaign_checkpoint(self.plan, checkpoint).records,
             summary.records,
         )
+
+        journal_paths = tuple(
+            sorted((self.root / "component-journals").glob("*.json"))
+        )
+        self.assertEqual(len(journal_paths), 2)
+        journals = tuple(
+            PartialComponentJournal.load(path) for path in journal_paths
+        )
+        self.assertEqual(
+            sorted(
+                (journal.complete, len(journal.entries))
+                for journal in journals
+            ),
+            [(False, 1), (True, 5)],
+        )
+        journal_bytes = {
+            path: path.read_bytes() for path in journal_paths
+        }
+
+        contract = backend.scientific_execution_contract_for(self.leaf)
+        scientific_identity = scientific_computation_identity_sha256(
+            self.plan,
+            self.leaf,
+            scientific_execution_contract=contract,
+        )
+        self.assertEqual(cache.stored_count, 1)
+        self.assertIs(
+            cache.lookup(scientific_identity, self.leaf.leaf_id).status,
+            SolvedLeafLookupStatus.HIT,
+        )
+        authenticated = _authenticated_solved_leaf_lookup(
+            self.plan,
+            self.leaf,
+            SolvedLeafStore(self.root / "nonconverged-solved-leaves"),
+            scientific_execution_contract=contract,
+        )
+        self.assertIs(authenticated.status, SolvedLeafLookupStatus.HIT)
+
+        cache_checkpoint = self.root / "nonconverged-cache-reload.json"
+        resume_backend = self._native_backend()
+        with patch(
+            "windows_solver.response_batches.run_component",
+            side_effect=AssertionError("resume repeated binary numerics"),
+        ), patch.object(
+            resume_backend,
+            "_julia_precision_backend_for",
+            side_effect=AssertionError("resume repeated promoted numerics"),
+        ):
+            resumed = run_campaign_selection(
+                self.plan,
+                selection,
+                resume_backend,
+                checkpoint,
+                resume=True,
+                solved_leaf_store=cache,
+            )
+            cached = run_campaign_selection(
+                self.plan,
+                selection,
+                resume_backend,
+                cache_checkpoint,
+                resume=False,
+                solved_leaf_store=SolvedLeafStore(
+                    self.root / "nonconverged-solved-leaves"
+                ),
+            )
+
+        self.assertEqual(resumed.executed_stage_count, 0)
+        self.assertEqual(resumed.reused_stage_count, 3)
+        self.assertEqual(cached.executed_stage_count, 0)
+        self.assertEqual(cached.reused_stage_count, 3)
+        self.assertEqual(resumed.records, summary.records)
+        self.assertEqual(cached.records, summary.records)
+        self.assertEqual(checkpoint.read_bytes(), raw_checkpoint)
+        cached_checkpoint_bytes = cache_checkpoint.read_bytes()
+        self.assertEqual(
+            cached_checkpoint_bytes,
+            canonical_json_bytes(json.loads(cached_checkpoint_bytes)),
+        )
+        self.assertEqual(
+            validate_campaign_checkpoint(
+                self.plan, cache_checkpoint
+            ).records,
+            summary.records,
+        )
+        self.assertEqual(
+            tuple(cache_checkpoint.parent.glob(
+                f".{cache_checkpoint.name}.*.tmp"
+            )),
+            (),
+        )
+        self.assertEqual(
+            tuple(
+                sorted(
+                    (self.root / "component-journals").glob("*.json")
+                )
+            ),
+            journal_paths,
+        )
+        for path, persisted in journal_bytes.items():
+            self.assertEqual(path.read_bytes(), persisted)
 
     def test_leaf42_terminal_120_failure_is_not_retried_on_resume(self):
         """A durable max-precision failure must not repeat expensive work."""

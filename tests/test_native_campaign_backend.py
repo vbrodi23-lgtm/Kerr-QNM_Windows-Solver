@@ -173,7 +173,12 @@ def _failed_preflight_attempt(leaf, *, primary_predictor=None):
     )
 
 
-def _endpoint_arithmetic_attempt(leaf, *, primary_predictor):
+def _endpoint_arithmetic_attempt(
+    leaf,
+    *,
+    primary_predictor,
+    request_backend=None,
+):
     attempt = _failed_preflight_attempt(
         leaf, primary_predictor=primary_predictor
     )
@@ -183,6 +188,20 @@ def _endpoint_arithmetic_attempt(leaf, *, primary_predictor):
     failure["stage"] = control_failure_stage(
         "HORIZON_ARITHMETIC_INADEQUATE"
     )
+    if request_backend is not None:
+        request_binding = request_backend._request(
+            leaf.job,
+            0.0j,
+            primary_predictor=primary_predictor,
+        )
+        failure["request_binding"] = request_binding
+        failure["request_sha256"] = hashlib.sha256(
+            canonical_json_bytes(request_binding)
+        ).hexdigest()
+        failure["execution_resource_policy"] = {
+            name: request_binding["execution_resource"][name]
+            for name in ("schema", "version", "sha256")
+        }
     failure["diagnostics"] = valid_control_failure_diagnostics(
         "HORIZON_ARITHMETIC_INADEQUATE",
         precision_bits=failure["request_binding"]["working_precision_bits"],
@@ -729,6 +748,7 @@ class NativeCampaignBackendTests(unittest.TestCase):
         )
 
     def test_deep_endpoint_arithmetic_uses_bounded_horizon_terminal_rule(self):
+        import windows_solver.response_batches as response_batches
         from tests.test_promoted_horizon_component import (
             FakeJuliaPrecisionBackend,
             _promoted_baseline,
@@ -736,14 +756,13 @@ class NativeCampaignBackendTests(unittest.TestCase):
         )
 
         cases = (
-            ("221", False, ComponentStatus.CONVERGED, "PRODUCED"),
-            ("220", True, ComponentStatus.CONVERGED, "UNRESOLVED"),
+            ("221", False, "PRODUCED"),
+            ("220", True, "UNRESOLVED"),
         )
-        for mode_label, sentinel, promoted_status, expected_state in cases:
+        for mode_label, sentinel, expected_state in cases:
             with self.subTest(
                 mode_label=mode_label,
                 sentinel=sentinel,
-                promoted_status=promoted_status.value,
             ):
                 deep = min(
                     (
@@ -763,23 +782,52 @@ class NativeCampaignBackendTests(unittest.TestCase):
                     key=lambda leaf: leaf.job.spin,
                 )
                 predictor = deep.job.root.omega
-                promoted = _with_worker_receipt(
+                promoted120 = _with_worker_receipt(
                     deep.job,
                     _promoted_baseline(deep.job, omega=predictor),
                     120,
                     predictor,
                 )
-                promoted_backend = FakeJuliaPrecisionBackend(
-                    deep.job, promoted, 120
+                worker120 = FakeJuliaPrecisionBackend(
+                    deep.job, promoted120, 120
                 )
-                promoted_result = run_promoted_horizon_component(
-                    deep.job, promoted_backend, predictor
+                calibration_receipt = worker120._production_request_backend(
+                    deep.job
+                ).calibration_receipt
+                backend = NativeCampaignStageBackend(
+                    self.backend.adapter,
+                    self.capabilities,
+                    self.backend.generated_cache,
+                    self.backend.julia_adapter,
+                    calibration_receipt=calibration_receipt,
                 )
-                promoted_result = replace(
-                    promoted_result, status=promoted_status
+                class EndpointFailingJuliaBackend(
+                    FakeJuliaPrecisionBackend
+                ):
+                    def read_root(
+                        self,
+                        job,
+                        amplitude,
+                        primary_predictor=None,
+                    ):
+                        self.calls.append(
+                            (job, amplitude, primary_predictor)
+                        )
+                        raise error
+
+                promoted80 = _with_worker_receipt(
+                    deep.job,
+                    _promoted_baseline(deep.job, omega=predictor),
+                    80,
+                    predictor,
                 )
+                request_backend80 = FakeJuliaPrecisionBackend(
+                    deep.job, promoted80, 80
+                )._production_request_backend(deep.job)
                 predecessor = _endpoint_arithmetic_attempt(
-                    deep, primary_predictor=predictor
+                    deep,
+                    primary_predictor=predictor,
+                    request_backend=request_backend80,
                 )
                 error = JuliaNumericalControlError(
                     "synthetic endpoint arithmetic inadequate",
@@ -787,6 +835,9 @@ class NativeCampaignBackendTests(unittest.TestCase):
                 )
                 error.worker_failure = copy.deepcopy(
                     predecessor.failure_receipt
+                )
+                worker80 = EndpointFailingJuliaBackend(
+                    deep.job, promoted80, 80
                 )
                 binary = ComponentResult.from_mapping(
                     _produced_stage_outcome(
@@ -815,86 +866,47 @@ class NativeCampaignBackendTests(unittest.TestCase):
                         },
                     ),
                 )
-                binary_outcome = _produced_stage_outcome(
-                    deep, complex(1.0e-8, 2.0e-8)
-                )
-                binary_component = {
-                    **binary_outcome.component_result,
-                    "result": binary.to_mapping(),
-                }
-                binary_outcome = type(binary_outcome)(
-                    digits=binary_outcome.digits,
-                    numerical_state=binary_outcome.numerical_state,
-                    component_result=binary_component,
-                    local_disk_radius_abs=binary_outcome.local_disk_radius_abs,
-                    signed_error_channels=synthetic_stage_signed_error_channels(
-                        binary_component,
-                        binary_outcome.local_disk_radius_abs,
-                    ),
-                    deep_diagnostics={
-                        "condition_amplifier_abs": 10.0,
-                        "predicted_reliable_decimal_digits": (
-                            12.0 if sentinel else 8.0
-                        ),
-                        "step_richardson_disagreement_abs": 0.0,
-                        "repeat_polish_delta_abs": 0.0,
-                        "angular_refinement_delta_abs": 0.0,
-                        "independent_path_delta_abs": 0.0,
-                        "diagnostic_ceiling_abs": 1.0e-8,
-                        "denominator_or_calibration_disk_contains_zero": False,
-                    },
-                )
-                with patch(
-                    "windows_solver.response_batches.run_promoted_horizon_component",
-                    return_value=promoted_result,
-                ), patch(
-                    "windows_solver.response_batches.JuliaPrecisionRootBackend",
-                    side_effect=lambda *args, **kwargs: (
-                        promoted_backend
-                        if args[2] == 120
-                        else JuliaPrecisionRootBackend(*args, **kwargs)
-                    ),
-                ):
-                    recovered = self.backend.execute_promoted_stage_after_endpoint_arithmetic(
-                        deep, 120, predecessor
-                    )
-
-                class Backend:
-                    identity = self.plan.backend_identity
-                    precision_capabilities = self.capabilities
-
-                    def execute_stage(self, leaf, digits):
-                        if digits != 64:
-                            raise AssertionError("unexpected ordinary stage")
-                        return binary_outcome
-
-                    def execute_promoted_stage_with_predictor(
-                        self,
-                        leaf,
-                        digits,
-                        previous_outcomes,
-                        response_predictor,
-                    ):
-                        if digits != 80:
-                            raise AssertionError("unexpected promoted stage")
-                        raise error
-
-                    def execute_promoted_stage_after_endpoint_arithmetic(
-                        self, leaf, digits, attempt
-                    ):
-                        if digits != 120:
-                            raise AssertionError("unexpected recovery stage")
-                        return recovered
 
                 selection = build_campaign_selection(
                     self.plan, role="deep", leaf_ids=(deep.leaf_id,)
                 )
-                with tempfile.TemporaryDirectory() as temporary:
+                workers = {80: worker80, 120: worker120}
+                with tempfile.TemporaryDirectory() as temporary, patch(
+                    "windows_solver.response_batches.run_component",
+                    return_value=binary,
+                ), patch.object(
+                    backend,
+                    "_julia_precision_backend_for",
+                    side_effect=lambda job, digits, refinement=0: workers[
+                        digits
+                    ],
+                ) as precision_backend_for, patch.object(
+                    backend,
+                    "execute_promoted_stage_with_predictor",
+                    wraps=backend.execute_promoted_stage_with_predictor,
+                ) as execute_promoted, patch.object(
+                    backend,
+                    (
+                        "execute_promoted_stage_after_endpoint_arithmetic_"
+                        "with_predictor"
+                    ),
+                    wraps=(
+                        backend
+                        .execute_promoted_stage_after_endpoint_arithmetic_with_predictor
+                    ),
+                ) as execute_recovery, patch.object(
+                    response_batches,
+                    "_execute_endpoint_arithmetic_recovery_with_progress",
+                    wraps=(
+                        response_batches
+                        ._execute_endpoint_arithmetic_recovery_with_progress
+                    ),
+                ) as recovery_with_progress:
                     checkpoint = Path(temporary) / "deep-arithmetic.json"
                     summary = run_campaign_selection(
                         self.plan,
                         selection,
-                        Backend(),
+                        backend,
                         checkpoint,
                         resume=False,
                     )
@@ -904,6 +916,39 @@ class NativeCampaignBackendTests(unittest.TestCase):
 
                 self.assertEqual(summary.records[0].state, expected_state)
                 self.assertEqual(validated.records[0].state, expected_state)
+                self.assertEqual(execute_promoted.call_count, 1)
+                self.assertEqual(execute_recovery.call_count, 1)
+                self.assertEqual(recovery_with_progress.call_count, 1)
+                self.assertEqual(
+                    [
+                        call.args[1]
+                        for call in precision_backend_for.call_args_list
+                    ],
+                    [80, 120],
+                )
+                self.assertEqual(
+                    worker80.calls,
+                    [(deep.job, 0.0j, predictor)],
+                )
+                self.assertEqual(
+                    worker120.calls,
+                    [(deep.job, 0.0j, predictor)],
+                )
+                self.assertEqual(len(summary.attempts), 1)
+                self.assertEqual(
+                    summary.attempts[0].failure_code,
+                    "HORIZON_ARITHMETIC_INADEQUATE",
+                )
+                self.assertEqual(
+                    execute_recovery.call_args.args[2].to_mapping(),
+                    summary.attempts[0].to_mapping(),
+                )
+                self.assertEqual(
+                    summary.records[0].stages[-1].outcome.component_result[
+                        "endpoint_arithmetic_predecessor"
+                    ],
+                    summary.attempts[0].to_mapping(),
+                )
                 self.assertEqual(
                     tuple(
                         stage.outcome.digits

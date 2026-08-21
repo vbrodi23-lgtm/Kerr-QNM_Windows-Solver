@@ -6357,15 +6357,6 @@ def _bind_fixed_readout_precision_comparison(
     )
 
 
-def _bind_fixed_root_exterior_precision_comparison(
-    outcome: StageOutcome,
-    predecessor: StageOutcome,
-) -> StageOutcome:
-    """Compatibility alias for the shared fixed-readout comparison binder."""
-
-    return _bind_fixed_readout_precision_comparison(outcome, predecessor)
-
-
 def _validate_failed_preflight_refinement_runtime(
     leaf: CampaignLeafPlan,
     value: object,
