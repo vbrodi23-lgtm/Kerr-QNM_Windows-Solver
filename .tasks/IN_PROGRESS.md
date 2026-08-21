@@ -93,6 +93,18 @@ preservation, and cache/provenance separation from historical raw-state leaves.
   keep admission fail-closed as `UNCALIBRATED_ANALYTIC_RESPONSE`, and migrate
   authenticated predecessor checkpoints by retaining canonical binary64 stages
   while dropping old promoted horizon multi-readout stages.
+- Repair the promoted-exterior certificate safety-factor type collision by
+  removing it from shared horizon geometry, validating the receipt-owned
+  exterior integer, and assembling authenticated policy fragments with
+  duplicate-key rejection.
+- Exercise production-generated promoted requests through canonical JSON and a
+  dedicated Julia flatten-and-policy-validation mode that cannot enter
+  determinant, Newton, angular, coordinate, or ODE work; cache that preflight
+  against backend, worker, calibration, policy, and precision-capability
+  identities before campaign numerical setup.
+- Prove checkpoint continuity without deletion: preserve completed records and
+  accepted horizon promotion, leave failed Leaf 42 non-terminal, invalidate its
+  corrected exterior request identity, and retry only that leaf.
 
 ### Work Log
 
@@ -127,5 +139,14 @@ preservation, and cache/provenance separation from historical raw-state leaves.
   script was executed. TASK-079 remains In Progress pending the exterior
   determinant-error model, calibrated determinant-to-ODE allocation, native
   operator receipts, and human mathematics review.
+- 2026-08-21 — PR #59 repairs the Leaf 42 exterior certificate type collision
+  with collision-safe policy assembly and a receipt-owned integer safety
+  factor, then adds an actual Python-request-to-Julia-policy no-solver launch
+  preflight. Full safe Python discovery passes 983 tests with 7 skips; exact
+  schema-8/schema-7 checkpoint identities, all 40 completed mappings, the nine
+  archived promoted-horizon leaf IDs, the nonterminal Leaf 42 transition, and
+  content-addressed cache/journal rollover are covered. Hosted Julia CI remains
+  pending; no scientific numerical or PowerShell execution was performed, so
+  TASK-079 remains In Progress.
 
 ---

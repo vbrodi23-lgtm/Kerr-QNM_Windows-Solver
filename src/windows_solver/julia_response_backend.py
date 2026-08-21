@@ -7,6 +7,7 @@ component reduction, error ledger, checkpoints, resume, and admission schema.
 
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation, localcontext
 import hashlib
@@ -65,6 +66,11 @@ from .progress import (
     emit_progress,
     ingest_external_progress,
 )
+from .promoted_request_preflight import (
+    PROMOTED_REQUEST_PREFLIGHT_CACHE_DIRECTORY_NAME,
+    PromotedRequestPreflightStore,
+    promoted_request_preflight_binding,
+)
 from .root_readout_cache import (
     ROOT_READOUT_STORE_DIRECTORY_NAME,
     RootReadoutLookupStatus,
@@ -99,6 +105,8 @@ _DEFAULT_HOMOGENEOUS_MAX_RHS_EVALUATIONS = 2_000_000
 _DEFAULT_COORDINATE_STALL_RHS_THRESHOLD = 200_000
 _DEFAULT_COORDINATE_STALL_MINIMUM_SPAN_FRACTION = "1e-6"
 _DEFAULT_COORDINATE_STALL_MINIMUM_STEP_FRACTION = "1e-12"
+_PROMOTED_REQUEST_PREFLIGHT_TIMEOUT_SECONDS = 600
+_PROMOTED_REQUEST_PREFLIGHT_OPERATION = "promoted-request-preflight"
 NUMERICAL_CONTROL_FAILURE_CODES = frozenset({
     "SCATTERING_BASIS_ILL_CONDITIONED",
     "SCATTERING_CHART_ILL_CONDITIONED",
@@ -573,8 +581,21 @@ def horizon_geometry_controls() -> dict[str, object]:
             "-10", "-25", "-50", "-75", "-100",
         ],
         "horizon_maximum_endpoint_distance": "0.1",
-        "determinant_error_safety_factor": "64",
     }
+
+
+def _merge_policy_fragments(
+    *fragments: Mapping[str, object],
+) -> dict[str, object]:
+    """Merge authenticated policy fragments without last-writer-wins drift."""
+
+    merged: dict[str, object] = {}
+    for fragment in fragments:
+        for key, value in fragment.items():
+            if key in merged:
+                raise ValueError(f"duplicate promoted policy field: {key}")
+            merged[key] = value
+    return merged
 
 
 def _forward_julia_progress_line(
@@ -2062,6 +2083,95 @@ def _resolve_readout_cache(runtime_root: Path) -> RootReadoutStore | None:
     return RootReadoutStore(Path(runtime_root) / ROOT_READOUT_STORE_DIRECTORY_NAME)
 
 
+def _resolve_promoted_request_preflight_cache(
+    runtime_root: Path,
+) -> PromotedRequestPreflightStore:
+    override = os.environ.get("KERR_QNM_PROMOTED_REQUEST_PREFLIGHT_CACHE_ROOT")
+    root = (
+        Path(override)
+        if override
+        else Path(runtime_root) / PROMOTED_REQUEST_PREFLIGHT_CACHE_DIRECTORY_NAME
+    )
+    return PromotedRequestPreflightStore(root)
+
+
+def _worker_request_document(
+    request: Mapping[str, object],
+) -> tuple[dict[str, object], dict[str, object], str]:
+    """Return the request binding, wire document, and canonical wire digest."""
+
+    request_binding = dict(request)
+    execution_resource = _validated_execution_resource_policy(
+        request_binding["execution_resource"]
+        if "execution_resource" in request_binding
+        else _execution_resource_policy()
+    )
+    request_binding["execution_resource"] = execution_resource
+    request_sha256 = hashlib.sha256(
+        canonical_json_bytes(request_binding)
+    ).hexdigest()
+    document = dict(request_binding)
+    document["request_sha256"] = request_sha256
+    return request_binding, document, request_sha256
+
+
+def _promoted_request_set(
+    requests: tuple[Mapping[str, object], ...],
+) -> tuple[dict[str, object], tuple[str, ...]]:
+    documents: list[dict[str, object]] = []
+    request_sha256s: list[str] = []
+    for request in requests:
+        _, document, request_sha256 = _worker_request_document(request)
+        documents.append(document)
+        request_sha256s.append(request_sha256)
+    payload = {
+        "schema_version": 1,
+        "operation": _PROMOTED_REQUEST_PREFLIGHT_OPERATION,
+        "requests": documents,
+    }
+    request_set_sha256 = hashlib.sha256(
+        canonical_json_bytes(payload)
+    ).hexdigest()
+    return {
+        **payload,
+        "request_set_sha256": request_set_sha256,
+    }, tuple(request_sha256s)
+
+
+def _validate_promoted_request_preflight_response(
+    response: Mapping[str, object],
+    *,
+    request_set_sha256: str,
+    request_sha256s: tuple[str, ...],
+) -> dict[str, object]:
+    expected_fields = {
+        "schema_version",
+        "status",
+        "operation",
+        "request_count",
+        "request_set_sha256",
+        "request_sha256s",
+    }
+    if not isinstance(response, Mapping) or set(response) != expected_fields:
+        raise JuliaResponseBackendError(
+            "M02 promoted-request preflight response fields are invalid"
+        )
+    if (
+        type(response["schema_version"]) is not int
+        or response["schema_version"] != 1
+        or response["status"] != "ok"
+        or response["operation"] != _PROMOTED_REQUEST_PREFLIGHT_OPERATION
+        or type(response["request_count"]) is not int
+        or response["request_count"] != len(request_sha256s)
+        or response["request_set_sha256"] != request_set_sha256
+        or response["request_sha256s"] != list(request_sha256s)
+    ):
+        raise JuliaResponseBackendError(
+            "M02 promoted-request preflight response authentication failed"
+        )
+    return dict(response)
+
+
 @dataclass(frozen=True, slots=True)
 class JuliaResponseEvaluation:
     """One worker response plus the exact identities required to validate it."""
@@ -2075,6 +2185,13 @@ class JuliaResponseEvaluation:
 
 
 @dataclass(frozen=True, slots=True)
+class PromotedRequestPreflightResult:
+    response: Mapping[str, object]
+    binding: Mapping[str, object]
+    reused: bool
+
+
+@dataclass(frozen=True, slots=True)
 class JuliaResponseAdapter:
     julia_executable: Path
     julia_project: Path
@@ -2084,6 +2201,9 @@ class JuliaResponseAdapter:
     runner: Callable[..., object] = subprocess.run
     julia_prefix_arguments: tuple[str, ...] = ()
     readout_cache: RootReadoutStore | None = None
+    promoted_request_preflight_cache: (
+        PromotedRequestPreflightStore | None
+    ) = None
 
     @classmethod
     def from_runtime_receipt(
@@ -2166,6 +2286,7 @@ class JuliaResponseAdapter:
             runner,
             tuple(declared_arguments),
             _resolve_readout_cache(runtime),
+            _resolve_promoted_request_preflight_cache(runtime),
         )
 
     def _reuse_readout(
@@ -2290,19 +2411,142 @@ class JuliaResponseAdapter:
                 message=str(error),
             )
 
+    def preflight_promoted_requests(
+        self,
+        requests: tuple[Mapping[str, object], ...],
+        *,
+        calibration_receipt_sha256: str,
+        policy_sha256: str,
+        precision_capabilities_sha256: str,
+    ) -> PromotedRequestPreflightResult:
+        """Validate actual promoted wire requests without numerical work."""
+
+        if not isinstance(requests, tuple) or not requests:
+            raise JuliaResponseBackendError(
+                "M02 promoted-request preflight matrix is empty"
+            )
+        batch, request_sha256s = _promoted_request_set(requests)
+        request_set_sha256 = str(batch["request_set_sha256"])
+        worker_sha256 = self.runtime_provenance.get("worker_sha256")
+        if not isinstance(worker_sha256, str):
+            raise JuliaResponseBackendError(
+                "M02 promoted-request preflight worker identity is absent"
+            )
+        try:
+            binding = promoted_request_preflight_binding(
+                python_backend_source_sha256=_sha256(Path(__file__).resolve()),
+                julia_worker_sha256=worker_sha256,
+                calibration_receipt_sha256=calibration_receipt_sha256,
+                policy_sha256=policy_sha256,
+                precision_capabilities_sha256=precision_capabilities_sha256,
+                request_set_sha256=request_set_sha256,
+            )
+        except ValueError as error:
+            raise JuliaResponseBackendError(str(error)) from error
+
+        store = self.promoted_request_preflight_cache
+        if store is not None:
+            try:
+                cached = store.lookup(binding)
+                if cached is not None:
+                    response = _validate_promoted_request_preflight_response(
+                        cached,
+                        request_set_sha256=request_set_sha256,
+                        request_sha256s=request_sha256s,
+                    )
+                    return PromotedRequestPreflightResult(
+                        response, binding, True
+                    )
+            except (OSError, ValueError, JuliaResponseBackendError):
+                # This is a reuse optimization, not scientific evidence. A
+                # malformed or unreadable entry is a miss; fresh Julia
+                # validation below can atomically replace it without requiring
+                # operators to delete a cache.
+                pass
+
+        with tempfile.TemporaryDirectory(
+            prefix="m02-promoted-request-preflight-"
+        ) as temporary:
+            directory = Path(temporary)
+            request_path = directory / "requests.json"
+            response_path = directory / "response.json"
+            request_path.write_bytes(canonical_json_bytes(batch))
+            environment = os.environ.copy()
+            environment["JULIA_DEPOT_PATH"] = str(self.julia_depot)
+            environment["JULIA_PKG_OFFLINE"] = "true"
+            command = (
+                str(self.julia_executable),
+                *self.julia_prefix_arguments,
+                "--startup-file=no",
+                "--history-file=no",
+                f"--project={self.julia_project}",
+                str(self.worker_script),
+                "--validate-request-batch",
+                str(request_path),
+                str(response_path),
+            )
+            try:
+                completed = self.runner(
+                    command,
+                    cwd=directory,
+                    env=environment,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=_PROMOTED_REQUEST_PREFLIGHT_TIMEOUT_SECONDS,
+                )
+            except subprocess.TimeoutExpired as error:
+                raise JuliaResponseBackendError(
+                    "M02 promoted-request preflight timed out"
+                ) from error
+            except (OSError, subprocess.SubprocessError) as error:
+                raise JuliaResponseBackendError(
+                    "M02 promoted-request preflight could not start: "
+                    f"{error}"
+                ) from error
+            response: dict[str, object] | None = None
+            if response_path.is_file() and not response_path.is_symlink():
+                response = _strict_json_file(
+                    response_path, "M02 promoted-request preflight response"
+                )
+            if getattr(completed, "returncode", None) != 0:
+                message = (
+                    response.get("message")
+                    if isinstance(response, Mapping)
+                    else None
+                )
+                if not isinstance(message, str) or not message:
+                    message = _bounded_text(
+                        getattr(completed, "stderr", ""), 4000
+                    ) or "Julia request validation failed"
+                raise JuliaResponseBackendError(
+                    f"M02 promoted-request preflight failed: {message}"
+                )
+            if response is None:
+                raise JuliaResponseBackendError(
+                    "M02 promoted-request preflight response is absent"
+                )
+        validated = _validate_promoted_request_preflight_response(
+            response,
+            request_set_sha256=request_set_sha256,
+            request_sha256s=request_sha256s,
+        )
+        if store is not None:
+            try:
+                store.publish(binding, validated)
+            except (OSError, ValueError):
+                # A successful no-solver Julia validation is authoritative even
+                # when its reusable optimization receipt cannot be retained.
+                pass
+        return PromotedRequestPreflightResult(validated, binding, False)
+
     def _evaluate(
         self, request: Mapping[str, object], *, retain_fresh: bool
     ) -> JuliaResponseEvaluation:
-        request_document = dict(request)
-        execution_resource = _validated_execution_resource_policy(
-            request_document["execution_resource"]
-            if "execution_resource" in request_document
-            else _execution_resource_policy()
+        request_document, document, request_sha256 = _worker_request_document(
+            request
         )
-        request_document["execution_resource"] = execution_resource
-        request_sha256 = hashlib.sha256(
-            canonical_json_bytes(request_document)
-        ).hexdigest()
+        execution_resource = request_document["execution_resource"]
         runtime_identity = runtime_identity_sha256(self.runtime_provenance)
         reused = self._reuse_readout(request_sha256)
         if reused is not None:
@@ -2315,8 +2559,6 @@ class JuliaResponseAdapter:
                 reused=True,
                 cached_worker_response_receipt=receipt,
             )
-        document = dict(request_document)
-        document["request_sha256"] = request_sha256
         timeout = int(execution_resource["worker_request_wall_clock_seconds"])
         with tempfile.TemporaryDirectory(prefix="m02-julia-readout-") as temporary:
             directory = Path(temporary)
@@ -2499,9 +2741,6 @@ def _precision_policy(
                 "determinant_error_model": (
                     calibration_receipt.certificate_identity
                 ),
-                "determinant_error_safety_factor": (
-                    calibration_receipt.certificate_safety_factor
-                ),
                 "determinant_error_required_term_classes": [
                     "delta_same_point",
                     "delta_cross_precision",
@@ -2539,38 +2778,58 @@ def _precision_policy(
             "frequency_step_maximum": root_search_controls[2],
             **ode_controls,
         }
-    policy = {
-        "readout_radius": format(job.policy.readout_radius, ".17g"),
-        **numerical_controls,
-        **horizon_geometry_controls(),
-        **regularised_gsn_precision_policy(job.mechanism_id),
-        "endpoint_series_order": job.policy.endpoint_series_order + 8 * refinement,
-        "support_subinterval_count": job.policy.support_subinterval_count * (2 ** refinement),
-        "angular_pad": 18 + 8 * refinement,
-        "rho_in": "-5000",
-        "rho_out": "5000",
-        # The worker integrates the coordinate map once to the authenticated
-        # cap, then reuses that geometry while selecting the nearest endpoint
-        # whose existing infinity-series preflight is adequate.
-        "rho_out_candidate_schedule": [
-            "100", "250", "500", "1000", "2000", "5000"
-        ],
-        "branch_enclosure_radius_abs": format(
-            _mode_specific_branch_enclosure_radius(job), ".17g"
-        ),
-        "max_newton_iterations": 16,
-    }
     if job.mechanism_id == "horizon-admittance":
-        policy.update({
+        numerical_controls["determinant_error_safety_factor"] = "64"
+    elif calibration_receipt is not None:
+        safety_factor = calibration_receipt.certificate_safety_factor
+        if type(safety_factor) is not int or safety_factor != 64:
+            raise ValueError(
+                "exterior determinant certificate safety factor is invalid"
+            )
+        numerical_controls["determinant_error_safety_factor"] = safety_factor
+    else:
+        # Historical checkpoint reconstruction is isolated in
+        # response_batches._schema7_precision_policy. Every request emitted by
+        # the current exterior constructor carries the Julia contract's exact
+        # integer representation.
+        numerical_controls["determinant_error_safety_factor"] = 64
+
+    endpoint_series_order = job.policy.endpoint_series_order + 8 * refinement
+    policy = _merge_policy_fragments(
+        {"readout_radius": format(job.policy.readout_radius, ".17g")},
+        horizon_geometry_controls(),
+        numerical_controls,
+        regularised_gsn_precision_policy(job.mechanism_id),
+        {
+            "endpoint_series_order": endpoint_series_order,
+            "support_subinterval_count": (
+                job.policy.support_subinterval_count * (2 ** refinement)
+            ),
+            "angular_pad": 18 + 8 * refinement,
+            "rho_in": "-5000",
+            "rho_out": "5000",
+            # The worker integrates the coordinate map once to the
+            # authenticated cap, then reuses that geometry while selecting the
+            # nearest endpoint whose existing infinity-series gate is adequate.
+            "rho_out_candidate_schedule": [
+                "100", "250", "500", "1000", "2000", "5000"
+            ],
+            "branch_enclosure_radius_abs": format(
+                _mode_specific_branch_enclosure_radius(job), ".17g"
+            ),
+            "max_newton_iterations": 16,
+        },
+        {
             "horizon_endpoint_recovery_policy_identity": (
                 "adaptive-horizon-endpoint-recovery/v1"
             ),
-            "horizon_endpoint_maximum_order": (
-                4 * int(policy["endpoint_series_order"])
-            ),
+            "horizon_endpoint_maximum_order": 4 * endpoint_series_order,
             "horizon_endpoint_prefix_minimum_order": 4,
             "horizon_endpoint_prefix_order_step": 4,
-        })
+        }
+        if job.mechanism_id == "horizon-admittance"
+        else {},
+    )
     return policy
 
 
@@ -4390,3 +4649,84 @@ class JuliaPrecisionRootBackend:
         if job.backend_identity != self.identity:
             raise ValueError("response job backend identity does not match Julia adapter")
         return None
+
+
+def promoted_request_preflight_documents(
+    exterior_job: ResponseComponentJob,
+    horizon_job: ResponseComponentJob,
+    adapter: object,
+    calibration_receipt: PromotedControlCalibrationReceipt,
+) -> tuple[dict[str, object], ...]:
+    """Build every supported promoted policy shape through production code."""
+
+    if exterior_job.mechanism_id != "exterior-light-ring":
+        raise ValueError("promoted-request preflight exterior job is invalid")
+    if horizon_job.mechanism_id != "horizon-admittance":
+        raise ValueError("promoted-request preflight horizon job is invalid")
+    matrix: list[tuple[ResponseComponentJob, str, int, int]] = []
+    for digits in (40, 80, 120):
+        for refinement in (0, 1):
+            matrix.append((
+                exterior_job,
+                "exterior-wronskian/v1",
+                digits,
+                refinement,
+            ))
+    for digits in (80, 120):
+        for refinement in (0, 1):
+            matrix.append((
+                horizon_job,
+                "horizon-scattering/v1",
+                digits,
+                refinement,
+            ))
+    requests: list[dict[str, object]] = []
+    for job, determinant_family, digits, refinement in matrix:
+        backend = JuliaPrecisionRootBackend(
+            job.backend_identity,
+            adapter,
+            digits,
+            refinement=refinement,
+            empirical_control_profile=calibration_receipt.budget_for(
+                determinant_family, digits
+            ),
+            calibration_receipt=calibration_receipt,
+        )
+        requests.append(backend.preview_root_request(job, 0.0j))
+    return tuple(requests)
+
+
+def build_promoted_request_contract_fixture(
+    requests: tuple[Mapping[str, object], ...],
+) -> dict[str, object]:
+    """Build the canonical Python-owned fixture consumed by the Julia spec."""
+
+    batch, _ = _promoted_request_set(requests)
+    documents = list(batch["requests"])
+    exterior = next(
+        document
+        for document in documents
+        if document["mechanism_id"] == "exterior-light-ring"
+        and document["precision_digits"] == 80
+        and document["refinement_level"] == 0
+    )
+    invalid_values = (
+        ("string", "64"),
+        ("floating-point", 64.0),
+        ("boolean", True),
+        ("wrong-integer", 63),
+        ("null", None),
+    )
+    invalid_cases: list[dict[str, object]] = []
+    for label, value in invalid_values:
+        request = copy.deepcopy(exterior)
+        request.pop("request_sha256")
+        request["policy"]["determinant_error_safety_factor"] = value
+        _, document, _ = _worker_request_document(request)
+        invalid_cases.append({"label": label, "document": document})
+    return {
+        "schema_version": 1,
+        "operation": "promoted-request-contract-fixture",
+        "requests": documents,
+        "invalid_exterior_cases": invalid_cases,
+    }

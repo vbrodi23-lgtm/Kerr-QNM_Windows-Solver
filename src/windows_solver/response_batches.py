@@ -104,6 +104,7 @@ from .julia_response_backend import (
     _validated_execution_resource_policy,
     _valid_numerical_control_diagnostics,
     horizon_geometry_controls,
+    promoted_request_preflight_documents,
     promoted_precision_numerical_controls,
     worker_failure_payload as _julia_worker_failure_payload,
 )
@@ -1192,6 +1193,8 @@ def _schema7_precision_policy(
         "readout_radius": format(job.policy.readout_radius, ".17g"),
         **promoted_precision_numerical_controls()[str(digits)][level],
         **horizon_geometry_controls(),
+        # Frozen schema-7 wire bytes predate the mechanism-owned split.
+        "determinant_error_safety_factor": "64",
         **regularised,
         "endpoint_series_order": job.policy.endpoint_series_order + 8 * refinement,
         "support_subinterval_count": (
@@ -4077,11 +4080,16 @@ def _validate_selective_tier_journal(
                     != raw_binding["determinant_certificate_identity"]
                     or request["policy"].get(
                         "determinant_error_safety_factor"
-                    ) != str(
-                        raw_binding[
-                            "determinant_certificate_safety_factor"
-                        ]
                     )
+                    != raw_binding[
+                        "determinant_certificate_safety_factor"
+                    ]
+                    or type(
+                        request["policy"].get(
+                            "determinant_error_safety_factor"
+                        )
+                    )
+                    is not int
                 )
             )
             or not root_readout_preserves_authenticated_branch(
@@ -9072,6 +9080,44 @@ def _is_single_promoted_horizon_stage(
     )
 
 
+def _preflight_promoted_request_contracts(
+    plan: CampaignPlan,
+    adapter: JuliaResponseAdapter,
+    calibration_receipt: PromotedControlCalibrationReceipt,
+):
+    jobs = {
+        leaf.mechanism_id: leaf.job
+        for leaf in plan.leaves
+        if leaf.role == "primary"
+        and leaf.mechanism_id in {
+            "exterior-light-ring", "horizon-admittance"
+        }
+        and (leaf.job.mode.ell, leaf.job.mode.m, leaf.job.mode.n) == (2, 2, 1)
+        and leaf.job.spin == 0.95
+    }
+    if set(jobs) != {
+        "exterior-light-ring",
+        "horizon-admittance",
+    }:
+        raise JuliaResponseBackendError(
+            "M02 promoted-request preflight jobs are absent from the campaign plan"
+        )
+    requests = promoted_request_preflight_documents(
+        jobs["exterior-light-ring"],
+        jobs["horizon-admittance"],
+        adapter,
+        calibration_receipt,
+    )
+    return adapter.preflight_promoted_requests(
+        requests,
+        calibration_receipt_sha256=calibration_receipt.sha256,
+        policy_sha256=plan.policy.identity_sha256,
+        precision_capabilities_sha256=(
+            plan.precision_capabilities.identity_sha256
+        ),
+    )
+
+
 class NativeCampaignStageBackend:
     """Package-owned binary64 and Julia BigFloat M02 campaign backend."""
 
@@ -9237,6 +9283,22 @@ class NativeCampaignStageBackend:
         *,
         calibration_receipt: PromotedControlCalibrationReceipt | None = None,
     ) -> "NativeCampaignStageBackend":
+        effective_calibration_receipt = calibration_receipt
+        julia_adapter = None
+        if any(digits > 64 for digits in plan.precision_capabilities.digits):
+            try:
+                if effective_calibration_receipt is None:
+                    effective_calibration_receipt = (
+                        load_default_calibration_receipt()
+                    )
+                julia_adapter = JuliaResponseAdapter.from_runtime_receipt()
+                _preflight_promoted_request_contracts(
+                    plan, julia_adapter, effective_calibration_receipt
+                )
+            except (JuliaResponseBackendError, OSError, ValueError) as error:
+                raise NativeResourceUnavailableError(
+                    f"promoted request preflight failed: {error}"
+                ) from error
         try:
             pairs = parameter_pairs_for_selection(plan, selection)
             generated = ensure_generated_gsn_cache(pairs)
@@ -9245,18 +9307,12 @@ class NativeCampaignStageBackend:
         kernel = VettedNativeDeterminantKernel.from_generated_resource(
             generated.path, generated.sha256
         )
-        julia_adapter = None
-        if any(digits > 64 for digits in plan.precision_capabilities.digits):
-            try:
-                julia_adapter = JuliaResponseAdapter.from_runtime_receipt()
-            except JuliaResponseBackendError as error:
-                raise NativeResourceUnavailableError(str(error)) from error
         return cls(
             NativeDeterminantAdapter(identity=kernel.identity, kernel=kernel),
             plan.precision_capabilities,
             generated,
             julia_adapter,
-            calibration_receipt=calibration_receipt,
+            calibration_receipt=effective_calibration_receipt,
         )
 
     def _cache_runtime(self) -> dict[str, object]:

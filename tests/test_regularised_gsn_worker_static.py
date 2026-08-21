@@ -984,7 +984,7 @@ class RegularisedGsnWorkerSourceTests(unittest.TestCase):
     def test_error_envelope_stays_on_operational_schema_one(self) -> None:
         main = self.worker[self.worker.index("function main()") :]
         catch_block = main[main.index("catch failure") :]
-        self.assertEqual(catch_block.count('"schema_version" => 1'), 2)
+        self.assertEqual(catch_block.count('"schema_version" => 1'), 3)
         self.assertNotIn('"schema_version" => 2', catch_block)
 
     def test_factored_solver_preserves_typed_resource_callback_failures(

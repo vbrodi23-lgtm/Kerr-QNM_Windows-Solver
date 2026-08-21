@@ -991,6 +991,15 @@ function validate_regularised_gsn_policy(request)
                 ],
         )
     end
+    if !horizon
+        safety_factor = required(request, "determinant_error_safety_factor")
+        typeof(safety_factor) === Int &&
+            safety_factor == EXTERIOR_EMPIRICAL_ERROR_SAFETY_FACTOR ||
+            error(
+                "regularised GSN mechanism policy " *
+                "determinant_error_safety_factor is invalid"
+            )
+    end
     for (key, expected) in expected_mechanism
         isequal(required(request, key), expected) ||
             error("regularised GSN mechanism policy $(key) is invalid")
@@ -7586,7 +7595,7 @@ function fixed_root_determinant_sample_fields(
     ]
 end
 
-function evaluate_request(request)
+function validate_worker_request_contract(request)
     parse_integer(request, "schema_version") == 1 || error("unsupported schema_version")
     operation = string(required(request, "operation"))
     operation in ("root-readout", "fixed-root-determinant-sample") ||
@@ -7622,6 +7631,63 @@ function evaluate_request(request)
     parse_integer(request, "cooperative_request_deadline_seconds") <
         parse_integer(request, "worker_request_wall_clock_seconds") ||
         error("cooperative deadline must precede the outer worker deadline")
+    return operation, digits, bits
+end
+
+function validate_request_batch(batch)
+    Set(keys(batch)) == Set((
+        "schema_version",
+        "operation",
+        "request_set_sha256",
+        "requests",
+    )) || error("promoted-request preflight batch fields are invalid")
+    parse_integer(batch, "schema_version") == 1 ||
+        error("promoted-request preflight schema is invalid")
+    string(required(batch, "operation")) == "promoted-request-preflight" ||
+        error("promoted-request preflight operation is invalid")
+    request_set_sha256 = string(required(batch, "request_set_sha256"))
+    length(request_set_sha256) == 64 ||
+        error("promoted-request preflight digest is invalid")
+    documents = required(batch, "requests")
+    documents isa Vector ||
+        error("promoted-request preflight requests are invalid")
+    length(documents) == 10 ||
+        error("promoted-request preflight request count is invalid")
+    observed = Set{Tuple{String,Int,Int}}()
+    request_sha256s = String[]
+    for document in documents
+        document isa AbstractDict ||
+            error("promoted-request preflight document is invalid")
+        request = flatten_request(document)
+        validate_worker_request_contract(request)
+        mechanism = string(required(request, "mechanism_id"))
+        digits = parse_integer(request, "precision_digits")
+        refinement = parse_integer(request, "refinement_level")
+        push!(observed, (mechanism, digits, refinement))
+        push!(request_sha256s, string(required(request, "request_sha256")))
+    end
+    expected = Set{Tuple{String,Int,Int}}(
+        ("exterior-light-ring", digits, refinement)
+        for digits in (40, 80, 120) for refinement in (0, 1)
+    )
+    union!(expected, Set{Tuple{String,Int,Int}}(
+        ("horizon-admittance", digits, refinement)
+        for digits in (80, 120) for refinement in (0, 1)
+    ))
+    observed == expected ||
+        error("promoted-request preflight matrix is invalid")
+    return Dict(
+        "schema_version" => 1,
+        "status" => "ok",
+        "operation" => "promoted-request-preflight",
+        "request_count" => length(documents),
+        "request_set_sha256" => request_set_sha256,
+        "request_sha256s" => request_sha256s,
+    )
+end
+
+function evaluate_request(request)
+    operation, digits, bits = validate_worker_request_contract(request)
     return setprecision(BigFloat, bits) do
         if operation == "fixed-root-determinant-sample"
             return fixed_root_determinant_sample_fields(
@@ -7636,6 +7702,31 @@ function main()
     if "--probe" in ARGS
         println("M02 Julia precision worker: packages loaded")
         return 0
+    end
+    if length(ARGS) == 3 && ARGS[1] == "--validate-request-batch"
+        request_path = abspath(ARGS[2])
+        response_path = abspath(ARGS[3])
+        try
+            batch = JSON.parsefile(request_path)
+            result = validate_request_batch(batch)
+            mkpath(dirname(response_path))
+            write(response_path, JSON.json(result))
+            return 0
+        catch failure
+            result = Dict(
+                "schema_version" => 1,
+                "status" => "error",
+                "operation" => "promoted-request-preflight",
+                "error_type" => string(typeof(failure)),
+                "message" => sprint(showerror, failure),
+            )
+            mkpath(dirname(response_path))
+            write(response_path, JSON.json(result))
+            @error "M02 promoted-request preflight failed" exception=(
+                failure, catch_backtrace()
+            )
+            return 21
+        end
     end
     length(ARGS) == 2 || error("usage: m02_worker.jl REQUEST_JSON RESPONSE_JSON")
     request_path = abspath(ARGS[1])
