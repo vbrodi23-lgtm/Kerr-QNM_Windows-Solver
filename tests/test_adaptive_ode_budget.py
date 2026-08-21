@@ -492,10 +492,10 @@ class AdaptiveODEBudgetTests(unittest.TestCase):
             calibration=CALIBRATION,
         )
         first = JuliaPrecisionRootBackend(
-            job.backend_identity, object(), 80, ode_error_budget=budget
+            job.backend_identity, FakeAdapter(), 80, ode_error_budget=budget
         )
         second = JuliaPrecisionRootBackend(
-            job.backend_identity, object(), 80, ode_error_budget=changed
+            job.backend_identity, FakeAdapter(), 80, ode_error_budget=changed
         )
         with tempfile.TemporaryDirectory() as temporary, patch.dict(
             "os.environ",

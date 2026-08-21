@@ -1093,9 +1093,23 @@ class RegularisedGsnWorkerSourceTests(unittest.TestCase):
         self.assertIn(
             "correction_abs = residual / abs(primary_derivative)", diagnostic
         )
+        self.assertIn(
+            "required_raw_determinant_evaluation_count(request)", diagnostic
+        )
+        self.assertIn(
+            "logical_authenticated_determinant_count=1", diagnostic
+        )
+        self.assertIn("raw_determinant_evaluation_count", diagnostic)
+        self.assertNotIn("DETERMINANT_INDEX_PHASE[] == 1", diagnostic)
         self.assertNotIn("bounded_newton(", diagnostic)
         self.assertNotIn("finite_difference", diagnostic)
-        self.assertNotIn("authenticated_determinant", diagnostic)
+        self.assertNotIn("authenticated_determinant_progress(", diagnostic)
+
+        wire = self._function_slice(
+            "fixed_root_diagnostic_text", "diagnostic_root_text"
+        )
+        self.assertIn('"determinant_count" => result.determinant_count', wire)
+        self.assertIn('"raw_determinant_evaluation_count"', wire)
 
     def test_fixed_root_sample_operation_evaluates_once_without_newton(self) -> None:
         sample = self._function_slice(
@@ -1150,7 +1164,7 @@ class RegularisedGsnWorkerSourceTests(unittest.TestCase):
             self.worker,
         )
         self.assertIn('"promoted_root_readout_policy"', validation)
-        self.assertEqual(result_fields.count('"schema_version" => 9'), 2)
+        self.assertEqual(result_fields.count('"schema_version" => 10'), 2)
         self.assertEqual(
             len(re.findall(
                 r'"promoted_root_readout_policy"\s*=>\s*'

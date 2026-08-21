@@ -23,13 +23,14 @@ mutable struct FixedRootSpecScenario
     raw_calls::Int
     missing_evidence_call::Union{Nothing,Int}
     extra_raw_evaluation::Bool
+    raw_values::Vector{Any}
 end
 
 FixedRootSpecScenario(;
     missing_evidence_call=nothing,
     extra_raw_evaluation=false,
 ) = FixedRootSpecScenario(
-    0, missing_evidence_call, extra_raw_evaluation
+    0, missing_evidence_call, extra_raw_evaluation, Any[]
 )
 
 mutable struct FixedRootSpecRequest <: AbstractDict{String,Any}
@@ -94,6 +95,7 @@ function determinant(
         error("synthetic preceding-precision evidence is unavailable")
     end
     value = complex(T(call) * T("1e-12"), zero(T))
+    push!(request.scenario.raw_values, value)
     diagnostics = fixed_root_spec_diagnostics(T, request, value)
     if request.scenario.missing_evidence_call == call
         return DeterminantEvaluation{T}(value, diagnostics)
@@ -200,14 +202,31 @@ function run_fixed_root_phase(
             authenticated_primary_root=omega_primary,
             primary_derivative=complex(one(BigFloat), zero(BigFloat)),
         )
-        return result, scenario
+        expected_cross_precision_disagreement = if length(
+            scenario.raw_values
+        ) >= 3
+            cross = scenario.raw_values[3]
+            cross_value = Complex{BigFloat}(
+                BigFloat(real(cross)), BigFloat(imag(cross))
+            )
+            abs(scenario.raw_values[1] - cross_value)
+        else
+            nothing
+        end
+        return (
+            result,
+            scenario,
+            omega_primary,
+            expected_cross_precision_disagreement,
+        )
     end
 end
 
 @testset "promoted exterior fixed-root phases return one logical authenticated determinant" begin
     exterior = production_document("exterior-light-ring")
     for phase in ("TRUNCATION", "RESOLUTION")
-        result, scenario = run_fixed_root_phase(exterior, phase)
+        result, scenario, omega_primary, expected_cross =
+            run_fixed_root_phase(exterior, phase)
         @test result.root_phase == phase
         @test result.fixed_root
         @test result.logical_authenticated_determinant_count == 1
@@ -226,27 +245,25 @@ end
             BigFloat("1e-12");
             rtol=BigFloat("1e-70"),
         )
-        @test isapprox(
-            breakdown.precision_disagreement_abs,
-            BigFloat("2e-12");
-            rtol=BigFloat("1e-70"),
-        )
+        @test expected_cross !== nothing
+        @test breakdown.precision_disagreement_abs == expected_cross
         @test breakdown.safety_factor == BigFloat(64)
         @test result.root_evaluation.error_model_id ==
             EXTERIOR_EMPIRICAL_ERROR_MODEL_ID
-        @test result.root == parse_complex(
-            BigFloat, flatten_request(exterior), "omega_re", "omega_im"
-        )
+        @test result.root == omega_primary
     end
 end
 
 @testset "horizon fixed-root phase keeps its one-raw one-logical contract" begin
     horizon = production_document("horizon-admittance")
-    result, scenario = run_fixed_root_phase(horizon, "TRUNCATION")
+    result, scenario, omega_primary, expected_cross =
+        run_fixed_root_phase(horizon, "TRUNCATION")
     @test result.logical_authenticated_determinant_count == 1
     @test result.determinant_count == 1
     @test result.raw_determinant_evaluation_count == 1
     @test scenario.raw_calls == 1
+    @test result.root == omega_primary
+    @test expected_cross === nothing
 end
 
 

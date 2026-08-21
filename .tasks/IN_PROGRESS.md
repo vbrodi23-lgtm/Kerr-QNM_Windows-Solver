@@ -70,9 +70,11 @@ preservation, and cache/provenance separation from historical raw-state leaves.
   when raw `|D / Dprime| <= 2e-11`, retains complex `Dprime`, and performs no
   determinant evaluation after Newton convergence.
 - Hold the accepted PRIMARY frequency fixed for TRUNCATION and RESOLUTION,
-  reuse complex `Dprime`, evaluate exactly one determinant in each phase, add
-  eight endpoint-series orders only for TRUNCATION, and halve only homogeneous
-  ODE relative/absolute tolerances for RESOLUTION.
+  reuse complex `Dprime`, and return exactly one logical authenticated
+  determinant in each phase. Account separately for the three raw evaluations
+  required by the promoted exterior empirical certificate and the single raw
+  horizon evaluation; add eight endpoint-series orders only for TRUNCATION,
+  and halve only homogeneous ODE relative/absolute tolerances for RESOLUTION.
 - Omit routine SEED-PATH work explicitly with required/executed flags and a
   zero determinant count; do not synthesize an independent solve or radius.
 - Version the worker response and response receipt, and strictly bind the
@@ -105,6 +107,10 @@ preservation, and cache/provenance separation from historical raw-state leaves.
 - Prove checkpoint continuity without deletion: preserve completed records and
   accepted horizon promotion, leave failed Leaf 42 non-terminal, invalidate its
   corrected exterior request identity, and retry only that leaf.
+- Version the successful worker wire as schema 10 with strict logical/raw
+  determinant counts, preserve sealed schema-9 checkpoint mappings byte for
+  byte, and bind promoted-exterior partial journals to the active scientific
+  runtime so worker changes roll forward without deleting prior journal files.
 
 ### Work Log
 
@@ -148,5 +154,22 @@ preservation, and cache/provenance separation from historical raw-state leaves.
   content-addressed cache/journal rollover are covered. Hosted Julia CI remains
   pending; no scientific numerical or PowerShell execution was performed, so
   TASK-079 remains In Progress.
+- 2026-08-21 — Draft PR #60 replaces the stale fixed-root raw-count assertion
+  with an explicit one-logical-result contract and mechanism-specific raw
+  counts: three for the promoted exterior empirical certificate and one for
+  horizon diagnostics. Worker wire schema 10 persists both counts with strict
+  Python type/value checks, while legacy schema-9 promoted-horizon mappings
+  remain byte-stable. Promoted-exterior journals are additionally bound to the
+  active scientific runtime so a worker change creates a new content-addressed
+  journal without deleting the old one. Persisted wire-10 receipts also bind
+  the exact mechanism, determinant family, JSON schema type, complete exterior
+  certificate/calibration policy, and mechanism-specific raw count; historical
+  injected-budget fixtures are explicitly wire 9. Full safe Python discovery
+  passes 990 tests with 7 skips, including the preserved 40-record checkpoint
+  and nine accepted promoted-horizon leaves. Three independent read-only
+  reviews report no remaining P0–P3 findings. Hosted Julia RED reached the
+  exact obsolete assertion; the final Julia green run remains the PR CI gate.
+  No production determinant, Newton, angular, coordinate, ODE, campaign, or
+  PowerShell run was performed. TASK-079 remains In Progress.
 
 ---

@@ -23,6 +23,7 @@ from windows_solver.julia_response_backend import JuliaPrecisionRootBackend
 from windows_solver.precision_tiers import PrecisionTier, working_precision_bits
 from windows_solver.partial_component_checkpoint import PartialComponentJournal
 from windows_solver.promoted_control_calibration import (
+    EXTERIOR_DETERMINANT_ABSOLUTE_ERROR_CERTIFICATE,
     load_default_calibration_receipt,
 )
 from windows_solver.response_batches import (
@@ -72,7 +73,7 @@ class CampaignSampleAdapter(FakeAdapter):
             "determinant_error_abs": format(1.0e-12 * abs(amplitude), ".17g"),
             "determinant_error_status": "available/v1",
             "determinant_error_model_id": (
-                "verified-endpoint-control-equivalence-absolute-error/v2"
+                EXTERIOR_DETERMINANT_ABSOLUTE_ERROR_CERTIFICATE
             ),
             "determinant_family": "exterior-wronskian/v1",
             "determinant_normalisation": "unit-asymptotic-branch-wronskian/v1",
@@ -361,6 +362,25 @@ class SelectiveReadoutPromotionTests(unittest.TestCase):
                     omega=job.root.omega + response * value,
                     conditioning_mechanism=job.mechanism_id,
                 )
+                # This fixture deliberately exercises the historical injected
+                # ODE-budget tier loop.  Persist it as wire 9, which predates
+                # the authenticated raw-count field, instead of claiming the
+                # current empirical exterior certificate contract.
+                baseline = replace(
+                    baseline,
+                    diagnostic_readouts={
+                        family: replace(
+                            diagnostic,
+                            fixed_root_evidence=replace(
+                                diagnostic.fixed_root_evidence,
+                                raw_determinant_evaluation_count=None,
+                            ),
+                        )
+                        for family, diagnostic in (
+                            baseline.diagnostic_readouts.items()
+                        )
+                    },
+                )
                 request = self.preview_root_request(
                     job, value, primary_predictor
                 )
@@ -375,7 +395,7 @@ class SelectiveReadoutPromotionTests(unittest.TestCase):
                         canonical_json_bytes(runtime)
                     ).hexdigest(),
                     "worker_response_schema_version": (
-                        response_engine.WORKER_RESPONSE_WIRE_SCHEMA
+                        9
                     ),
                     "root_residual_abs_text": str(
                         baseline.normalised_determinant_abs
@@ -1034,10 +1054,6 @@ class SelectiveReadoutPromotionTests(unittest.TestCase):
             capabilities,
             generated,
             adapter,
-            ode_error_budgets={
-                80: synthetic_ode_error_budget(80),
-                120: synthetic_ode_error_budget(120),
-            },
         )
         binary64_result = _result(leaf.job, 0.25 + 0.5j)
         previous = SimpleNamespace(
@@ -1061,7 +1077,11 @@ class SelectiveReadoutPromotionTests(unittest.TestCase):
             request for request in adapter.requests if request["operation"] == "root-readout"
         ]
 
-        self.assertEqual(operations, ["root-readout"])
+        self.assertEqual(
+            operations,
+            ["root-readout"]
+            + ["fixed-root-determinant-sample"] * 4,
+        )
         self.assertEqual(
             [request["amplitude"] for request in root_requests],
             [{"real": "0", "imaginary": "0"}],
@@ -1071,12 +1091,13 @@ class SelectiveReadoutPromotionTests(unittest.TestCase):
             mapping["component_scientific_identity"],
             EXTERIOR_DERIVATIVE_COMPONENT_IDENTITY,
         )
-        self.assertEqual(mapping["status"], "DERIVATIVE_UNRESOLVED")
+        self.assertEqual(mapping["status"], "CONVERGED")
+        self.assertNotIn("failure_code", mapping["derivative_evidence"])
         self.assertEqual(
-            mapping["derivative_evidence"]["failure_code"],
-            "DETERMINANT_ERROR_MODEL_UNAVAILABLE",
+            len(mapping["derivative_evidence"]["fixed_root_samples"]),
+            4,
         )
-        self.assertEqual(outcome.local_disk_radius_abs, 0.0)
+        self.assertGreater(outcome.local_disk_radius_abs, 0.0)
 
 
 if __name__ == "__main__":

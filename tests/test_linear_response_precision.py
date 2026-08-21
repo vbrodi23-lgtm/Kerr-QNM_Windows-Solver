@@ -9,6 +9,7 @@ import json
 import math
 from pathlib import Path
 import tempfile
+from types import SimpleNamespace
 import unittest
 
 import windows_solver.julia_response_backend as julia_backend
@@ -58,6 +59,10 @@ from windows_solver.response_engine import (
     regularised_gsn_precision_policy,
 )
 from windows_solver.solved_leaf_cache import SolvedLeafStore
+from windows_solver.promoted_control_calibration import (
+    EXTERIOR_DETERMINANT_ABSOLUTE_ERROR_CERTIFICATE,
+    load_default_calibration_receipt,
+)
 from tests.fixtures import (
     control_failure_stage,
     synthetic_ode_error_budget,
@@ -353,35 +358,66 @@ def _with_baseline_conditioning(
     if horizon and raw_status is None:
         raw_status = "available/v1"
 
-    ode_error_budget = synthetic_ode_error_budget(
-        outcome.digits
-    ).to_mapping()
-    scientific_runtime = {
-        "precision_digits": outcome.digits,
-        "working_precision_bits": (
-            math.ceil(outcome.digits * math.log2(10)) + 32
-        ),
-        "refinement_level": 0,
-        "regularised_gsn_precision_policy": dict(
-            regularised_gsn_precision_policy(result.mechanism_id)
-        ),
-        "ode_error_budget": ode_error_budget,
-        "ode_error_budget_sha256": hashlib.sha256(
-            canonical_json_bytes(ode_error_budget)
-        ).hexdigest(),
-    }
+    production_request_backend = None
+    if receipt_job is not None:
+        calibration_receipt = load_default_calibration_receipt()
+        determinant_family = (
+            "horizon-scattering/v1"
+            if horizon
+            else "exterior-wronskian/v1"
+        )
+        production_request_backend = julia_backend.JuliaPrecisionRootBackend(
+            receipt_job.backend_identity,
+            SimpleNamespace(runtime_provenance={
+                "julia_version": "1.10.11",
+                "julia_executable_sha256": "a" * 64,
+                "julia_manifest_sha256": "b" * 64,
+                "worker_sha256": "c" * 64,
+                "runtime_policy_sha256": "d" * 64,
+                "scientific_sources": [],
+            }),
+            outcome.digits,
+            empirical_control_profile=calibration_receipt.budget_for(
+                determinant_family, outcome.digits
+            ),
+            calibration_receipt=calibration_receipt,
+        )
+        scientific_runtime = production_request_backend.scientific_runtime_for(
+            receipt_job
+        )
+    elif isinstance(
+        outcome.component_result.get("scientific_runtime"), dict
+    ):
+        scientific_runtime = dict(
+            outcome.component_result["scientific_runtime"]
+        )
+    else:
+        ode_error_budget = synthetic_ode_error_budget(
+            outcome.digits
+        ).to_mapping()
+        scientific_runtime = {
+            "precision_digits": outcome.digits,
+            "working_precision_bits": (
+                math.ceil(outcome.digits * math.log2(10)) + 32
+            ),
+            "refinement_level": 0,
+            "regularised_gsn_precision_policy": dict(
+                regularised_gsn_precision_policy(result.mechanism_id)
+            ),
+            "ode_error_budget": ode_error_budget,
+            "ode_error_budget_sha256": hashlib.sha256(
+                canonical_json_bytes(ode_error_budget)
+            ).hexdigest(),
+        }
 
     def conditioned(readout, readout_id, amplitude):
         existing_receipt = readout.worker_response_receipt
         if receipt_job is not None:
             if receipt_role != receipt_job.role:
                 raise AssertionError("synthetic receipt role disagrees with job")
-            request_binding = julia_backend.JuliaPrecisionRootBackend(
-                receipt_job.backend_identity,
-                object(),
-                outcome.digits,
-                ode_error_budget=synthetic_ode_error_budget(outcome.digits),
-            ).preview_root_request(receipt_job, amplitude)
+            request_binding = production_request_backend.preview_root_request(
+                receipt_job, amplitude
+            )
             scientific_runtime_sha256 = hashlib.sha256(
                 canonical_json_bytes(scientific_runtime)
             ).hexdigest()
@@ -456,7 +492,9 @@ def _with_baseline_conditioning(
             )
         correction = normalised / derivative
         error_model_id = (
-            VERIFIED_ENDPOINT_ERROR_MODEL if horizon else None
+            VERIFIED_ENDPOINT_ERROR_MODEL
+            if horizon
+            else EXTERIOR_DETERMINANT_ABSOLUTE_ERROR_CERTIFICATE
         )
         primary = PrimaryRootAcceptanceEvidence(
             policy_id=PROMOTED_ROOT_READOUT_POLICY,
@@ -495,6 +533,7 @@ def _with_baseline_conditioning(
                     accepted=True,
                     fixed_root=True,
                     derivative_source="PRIMARY_COMPLEX",
+                    raw_determinant_evaluation_count=(1 if horizon else 3),
                 )
                 diagnostic_readouts[family] = DiagnosticRootReadout(
                     omega_delta_from_primary=0.0j,
@@ -661,14 +700,38 @@ def _rebind_result_worker_receipts(
 
     result = ComponentResult.from_mapping(raw_result)
 
+    calibration_receipt = load_default_calibration_receipt()
+    determinant_family = (
+        "horizon-scattering/v1"
+        if job.mechanism_id == "horizon-admittance"
+        else "exterior-wronskian/v1"
+    )
+    runtime_provenance = {
+        name: value
+        for name, value in scientific_runtime.items()
+        if name not in {
+            "precision_digits",
+            "working_precision_bits",
+            "semantic_precision_tier",
+            "refinement_level",
+            "regularised_gsn_precision_policy",
+            "ode_error_budget",
+            "ode_error_budget_sha256",
+            "promoted_control_calibration",
+            "empirical_control_profile",
+            "empirical_control_profile_sha256",
+        }
+    }
     request_backend = julia_backend.JuliaPrecisionRootBackend(
         job.backend_identity,
-        object(),
+        SimpleNamespace(runtime_provenance=runtime_provenance),
         scientific_runtime["precision_digits"],
         refinement=refinement_level,
-        ode_error_budget=synthetic_ode_error_budget(
-            scientific_runtime["precision_digits"]
+        empirical_control_profile=calibration_receipt.budget_for(
+            determinant_family,
+            scientific_runtime["precision_digits"],
         ),
+        calibration_receipt=calibration_receipt,
     )
 
     def rebound(readout, amplitude):

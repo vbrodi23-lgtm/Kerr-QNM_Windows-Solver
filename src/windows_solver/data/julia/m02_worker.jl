@@ -5926,6 +5926,9 @@ function solve_binary64_parity_primary(
     )
 end
 
+required_raw_determinant_evaluation_count(request) =
+    exterior_empirical_certificate_required(request) ? 3 : 1
+
 function solve_fixed_root_diagnostic(
     ::Type{T},
     request,
@@ -5942,6 +5945,10 @@ function solve_fixed_root_diagnostic(
     isfinite(derivative_abs) && derivative_abs > zero(T) || error(
         "fixed-root diagnostic PRIMARY derivative is invalid"
     )
+    raw_count_before = DETERMINANT_INDEX_PHASE[]
+    raw_count_before == 0 || error(
+        "fixed-root diagnostic began after an unexpected determinant evaluation"
+    )
     root_evaluation = determinant_progress(
         T,
         request,
@@ -5951,8 +5958,12 @@ function solve_fixed_root_diagnostic(
         "fixed PRIMARY root",
         omega_primary,
     )
-    DETERMINANT_INDEX_PHASE[] == 1 || error(
-        "fixed-root diagnostic must evaluate exactly one determinant"
+    raw_determinant_evaluation_count =
+        DETERMINANT_INDEX_PHASE[] - raw_count_before
+    expected_raw_count =
+        required_raw_determinant_evaluation_count(request)
+    raw_determinant_evaluation_count == expected_raw_count || error(
+        "fixed-root diagnostic did not complete its required determinant evaluations"
     )
     residual = abs(root_evaluation.value)
     correction_abs = residual / abs(primary_derivative)
@@ -5980,6 +5991,9 @@ function solve_fixed_root_diagnostic(
         branch_identity=branch_identity,
         branch_authenticated=branch_authenticated,
         control_identity=phase_control_identity(request),
+        logical_authenticated_determinant_count=1,
+        raw_determinant_evaluation_count=
+            raw_determinant_evaluation_count,
     )
 end
 
@@ -6946,9 +6960,18 @@ function solve_phase(
                 )
             end
         end
+        logical_determinant_count = if solve_role === FIXED_ROOT_DIAGNOSTIC
+            result.raw_determinant_evaluation_count ==
+                    DETERMINANT_INDEX_PHASE[] || error(
+                "fixed-root diagnostic raw determinant count is inconsistent"
+            )
+            result.logical_authenticated_determinant_count
+        else
+            DETERMINANT_INDEX_PHASE[]
+        end
         result = merge(result, (
             root_phase=phase,
-            determinant_count=DETERMINANT_INDEX_PHASE[],
+            determinant_count=logical_determinant_count,
             determinant_count_phase=DETERMINANT_INDEX_PHASE[],
         ))
         if solve_role === BINARY64_PARITY_PRIMARY
@@ -7001,6 +7024,9 @@ function solve_phase(
                     completed_payload["fixed_root"] = result.fixed_root
                     completed_payload["derivative_source"] =
                         result.derivative_source
+                    completed_payload[
+                        "raw_determinant_evaluation_count"
+                    ] = result.raw_determinant_evaluation_count
                 end
             else
                 merge!(completed_payload,
@@ -7266,6 +7292,8 @@ function fixed_root_diagnostic_text(result, authenticated_primary_root)
         "solve_role" => root_solve_role_text(result.solve_role),
         "authoritative" => result.authoritative,
         "determinant_count" => result.determinant_count,
+        "raw_determinant_evaluation_count" =>
+            result.raw_determinant_evaluation_count,
         "root_converged" => result.converged,
     )
 end
@@ -7421,7 +7449,7 @@ function result_fields(::Type{T}, request, digits::Int, bits::Int) where {T<:Abs
         )
         branch_valid = primary.branch_authenticated
         return [
-            "schema_version" => 9,
+            "schema_version" => 10,
             "status" => "ok",
             "adapter" => "package-owned-julia-gsn-root-readout",
             "request_sha256" => string(required(request, "request_sha256")),
@@ -7495,7 +7523,7 @@ function result_fields(::Type{T}, request, digits::Int, bits::Int) where {T<:Abs
     )
 
     return [
-        "schema_version" => 9,
+        "schema_version" => 10,
         "status" => "ok",
         "adapter" => "package-owned-julia-gsn-root-readout",
         "request_sha256" => string(required(request, "request_sha256")),
@@ -7555,7 +7583,7 @@ function fixed_root_determinant_sample_fields(
         fixed_omega,
     )
     expected_determinant_count =
-        exterior_empirical_certificate_required(request) ? 3 : 1
+        required_raw_determinant_evaluation_count(request)
     DETERMINANT_INDEX_REQUEST[] == expected_determinant_count || error(
         "fixed-root determinant sample did not complete its required certificate evaluations"
     )

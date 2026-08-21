@@ -275,6 +275,9 @@ class PromotedExteriorRequestFlatteningTests(unittest.TestCase):
                     corrected.preview_fixed_root_request(*args, **kwargs)
                 )
 
+            def scientific_runtime_for(self, *args, **kwargs):
+                return corrected.scientific_runtime_for(*args, **kwargs)
+
         with tempfile.TemporaryDirectory() as temporary, patch.dict(
             "os.environ",
             {"KERR_QNM_PARTIAL_COMPONENT_JOURNAL_ROOT": temporary},

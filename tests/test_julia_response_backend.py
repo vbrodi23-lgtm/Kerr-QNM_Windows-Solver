@@ -49,6 +49,7 @@ from windows_solver.response_batches import (
 )
 from windows_solver.response_engine import (
     DecimalComplex,
+    FixedRootDiagnosticEvidence,
     FixedRootDeterminantSample,
     LadderLevel,
     NumericalPolicy,
@@ -60,6 +61,7 @@ from windows_solver.response_engine import (
 )
 from windows_solver.progress_output import CampaignProgressReporter
 from windows_solver.promoted_control_calibration import (
+    EXTERIOR_DETERMINANT_ABSOLUTE_ERROR_CERTIFICATE,
     load_default_calibration_receipt,
 )
 from tests.fixtures import (
@@ -92,6 +94,40 @@ def _job_for_mechanism(mechanism_id: str):
         for leaf in plan.leaves
         if leaf.job.mechanism_id == mechanism_id
     )
+
+
+def _production_promoted_backend(mechanism_id: str, adapter):
+    job = _job_for_mechanism(mechanism_id)
+    receipt = load_default_calibration_receipt()
+    family = (
+        "horizon-scattering/v1"
+        if mechanism_id == "horizon-admittance"
+        else "exterior-wronskian/v1"
+    )
+    return job, JuliaPrecisionRootBackend(
+        VettedNativeDeterminantKernel.identity,
+        adapter,
+        80,
+        empirical_control_profile=receipt.budget_for(family, 80),
+        calibration_receipt=receipt,
+    )
+
+
+def _reseal_worker_response_receipt(mapping: dict[str, object]) -> None:
+    """Recompute both receipt digests after a persistence-forgery mutation."""
+
+    receipt = mapping["worker_response_receipt"]
+    request_binding = receipt["request_binding"]
+    receipt["request_sha256"] = hashlib.sha256(
+        canonical_json_bytes(request_binding)
+    ).hexdigest()
+    receipt["receipt_sha256"] = hashlib.sha256(
+        canonical_json_bytes({
+            key: value
+            for key, value in receipt.items()
+            if key != "receipt_sha256"
+        })
+    ).hexdigest()
 
 
 class FakeAdapter:
@@ -846,13 +882,13 @@ class JuliaResponseBackendTests(unittest.TestCase):
             backend.read_root(_deep_job(), 0.0j)
             self.assertEqual(len(calls), 2)
 
-    def test_success_wire_schema_is_nine_and_worker_errors_remain_schema_one(self):
+    def test_success_wire_schema_is_ten_and_worker_errors_remain_schema_one(self):
         """Catches changing the successful wire without preserving error parsing.
 
         The success wire and the error envelope are versioned independently.
-        Schema 9 persists successful horizon endpoint searches on top of the
-        binary64-parity PRIMARY/fixed-root evidence; the error envelope stays
-        independently versioned at 1.
+        Schema 10 distinguishes logical authenticated determinants from raw
+        certificate evaluations; the error envelope stays independently
+        versioned at 1.
         """
 
         request = JuliaPrecisionRootBackend(
@@ -864,7 +900,7 @@ class JuliaResponseBackendTests(unittest.TestCase):
             valid_julia_root_response(request)["schema_version"],
             WORKER_RESPONSE_WIRE_SCHEMA,
         )
-        self.assertEqual(WORKER_RESPONSE_WIRE_SCHEMA, 9)
+        self.assertEqual(WORKER_RESPONSE_WIRE_SCHEMA, 10)
         root = Path(__file__).resolve().parents[1]
         worker = (
             root / "src/windows_solver/data/julia/m02_worker.jl"
@@ -873,7 +909,7 @@ class JuliaResponseBackendTests(unittest.TestCase):
             worker.index("function result_fields(") :
             worker.index("function evaluate_request(")
         ]
-        self.assertEqual(result_fields.count('"schema_version" => 9'), 2)
+        self.assertEqual(result_fields.count('"schema_version" => 10'), 2)
         self.assertNotIn('"schema_version" => 6', result_fields)
         error_path = worker[
             worker.rindex("catch failure") : worker.index(
@@ -903,11 +939,10 @@ class JuliaResponseBackendTests(unittest.TestCase):
             ("exterior-light-ring", 3),
         ):
             with self.subTest(mechanism=mechanism):
-                readout = JuliaPrecisionRootBackend(
-                    VettedNativeDeterminantKernel.identity,
-                    CountedDiagnosticAdapter(),
-                    80,
-                ).read_root(_job_for_mechanism(mechanism), 0.0j)
+                job, backend = _production_promoted_backend(
+                    mechanism, CountedDiagnosticAdapter()
+                )
+                readout = backend.read_root(job, 0.0j)
                 for diagnostic in readout.diagnostic_readouts.values():
                     evidence = diagnostic.fixed_root_evidence
                     self.assertEqual(evidence.determinant_count, 1)
@@ -915,11 +950,65 @@ class JuliaResponseBackendTests(unittest.TestCase):
                         evidence.raw_determinant_evaluation_count,
                         expected_raw_count,
                     )
+                    current_mapping = evidence.to_mapping()
+                    self.assertEqual(
+                        current_mapping[
+                            "raw_determinant_evaluation_count"
+                        ],
+                        expected_raw_count,
+                    )
+                    forged_mapping = dict(current_mapping)
+                    forged_mapping[
+                        "raw_determinant_evaluation_count"
+                    ] = None
+                    with self.assertRaisesRegex(
+                        ValueError, "raw determinant evaluation count"
+                    ):
+                        FixedRootDiagnosticEvidence.from_mapping(
+                            forged_mapping
+                        )
+                    legacy_mapping = dict(current_mapping)
+                    legacy_mapping.pop(
+                        "raw_determinant_evaluation_count"
+                    )
+                    legacy = FixedRootDiagnosticEvidence.from_mapping(
+                        legacy_mapping
+                    )
+                    self.assertIsNone(
+                        legacy.raw_determinant_evaluation_count
+                    )
+                    self.assertEqual(legacy.to_mapping(), legacy_mapping)
+                if mechanism == "horizon-admittance":
+                    legacy_readout_mapping = readout.to_mapping()
+                    for diagnostic in legacy_readout_mapping[
+                        "diagnostic_readouts"
+                    ].values():
+                        diagnostic["fixed_root_evidence"].pop(
+                            "raw_determinant_evaluation_count"
+                        )
+                    receipt = legacy_readout_mapping[
+                        "worker_response_receipt"
+                    ]
+                    receipt["worker_response_schema_version"] = 9
+                    receipt_material = {
+                        key: value
+                        for key, value in receipt.items()
+                        if key != "receipt_sha256"
+                    }
+                    receipt["receipt_sha256"] = hashlib.sha256(
+                        canonical_json_bytes(receipt_material)
+                    ).hexdigest()
+                    restored = RootReadout.from_mapping(
+                        legacy_readout_mapping
+                    )
+                    self.assertEqual(
+                        restored.to_mapping(), legacy_readout_mapping
+                    )
 
     def test_fixed_root_wire_rejects_wrong_raw_count_or_json_type(self):
         """Catches accepting a forged or JSON-coerced raw evaluation count."""
 
-        for bad_value in ("3", 3.0, True, 2, 4, None):
+        for bad_value in ("3", 3.0, True, 1, 2, 4, 0, -1, None):
             with self.subTest(bad_value=bad_value):
                 class ForgedRawCountAdapter(FakeAdapter):
                     def evaluate(self, request):
@@ -937,14 +1026,153 @@ class JuliaResponseBackendTests(unittest.TestCase):
                     JuliaResponseBackendError,
                     "fixed-root diagnostic contract",
                 ):
-                    JuliaPrecisionRootBackend(
-                        VettedNativeDeterminantKernel.identity,
-                        ForgedRawCountAdapter(),
-                        80,
-                    ).read_root(
-                        _job_for_mechanism("exterior-light-ring"),
-                        0.0j,
+                    _production_promoted_backend(
+                        "exterior-light-ring", ForgedRawCountAdapter()
+                    )[1].read_root(
+                        _job_for_mechanism("exterior-light-ring"), 0.0j
                     )
+
+        class ForgedHorizonCountAdapter(FakeAdapter):
+            def evaluate(self, request):
+                response = super().evaluate(request)
+                for diagnostic in response["diagnostic_roots"].values():
+                    diagnostic["raw_determinant_evaluation_count"] = 3
+                return response
+
+        with self.assertRaisesRegex(
+            JuliaResponseBackendError,
+            "fixed-root diagnostic contract",
+        ):
+            _production_promoted_backend(
+                "horizon-admittance", ForgedHorizonCountAdapter()
+            )[1].read_root(
+                _job_for_mechanism("horizon-admittance"), 0.0j
+            )
+
+    def test_persisted_wire_ten_binds_raw_count_to_mechanism_certificate(self):
+        """Catches resealing exterior evidence as an uncertified one-call result."""
+
+        exterior_job, exterior_backend = _production_promoted_backend(
+            "exterior-light-ring", FakeAdapter()
+        )
+        exterior_mapping = exterior_backend.read_root(
+            exterior_job, 0.0j
+        ).to_mapping()
+        for label, replacement in (
+            ("missing", ...),
+            ("null", None),
+            ("horizon", "verified-endpoint-control-equivalence-absolute-error/v2"),
+            ("corrupt", "forged-exterior-error-model/v1"),
+        ):
+            with self.subTest(mechanism="exterior", model=label):
+                forged = json.loads(canonical_json_bytes(exterior_mapping))
+                policy = forged["worker_response_receipt"][
+                    "request_binding"
+                ]["policy"]
+                if replacement is ...:
+                    policy.pop("determinant_error_model")
+                else:
+                    policy["determinant_error_model"] = replacement
+                for diagnostic in forged["diagnostic_readouts"].values():
+                    diagnostic["fixed_root_evidence"][
+                        "raw_determinant_evaluation_count"
+                    ] = 1
+                _reseal_worker_response_receipt(forged)
+                with self.assertRaisesRegex(
+                    ValueError, "determinant.*policy|certificate"
+                ):
+                    RootReadout.from_mapping(forged)
+
+        horizon_job, horizon_backend = _production_promoted_backend(
+            "horizon-admittance", FakeAdapter()
+        )
+        forged_horizon = horizon_backend.read_root(
+            horizon_job, 0.0j
+        ).to_mapping()
+        forged_horizon["worker_response_receipt"]["request_binding"][
+            "policy"
+        ]["determinant_error_model"] = (
+            EXTERIOR_DETERMINANT_ABSOLUTE_ERROR_CERTIFICATE
+        )
+        for diagnostic in forged_horizon["diagnostic_readouts"].values():
+            diagnostic["fixed_root_evidence"][
+                "raw_determinant_evaluation_count"
+            ] = 3
+        _reseal_worker_response_receipt(forged_horizon)
+        with self.assertRaisesRegex(
+            ValueError, "determinant.*policy|certificate"
+        ):
+            RootReadout.from_mapping(forged_horizon)
+
+    def test_persisted_wire_schema_requires_an_exact_json_integer(self):
+        """Catches Python numeric equality accepting 10.0 as schema 10."""
+
+        job, backend = _production_promoted_backend(
+            "horizon-admittance", FakeAdapter()
+        )
+        valid_mapping = backend.read_root(job, 0.0j).to_mapping()
+        for bad_schema in (10.0, 9.0, True, "10", None):
+            with self.subTest(schema=bad_schema):
+                forged = json.loads(canonical_json_bytes(valid_mapping))
+                forged["worker_response_receipt"][
+                    "worker_response_schema_version"
+                ] = bad_schema
+                _reseal_worker_response_receipt(forged)
+                with self.assertRaisesRegex(
+                    ValueError, "wire schema"
+                ):
+                    RootReadout.from_mapping(forged)
+
+    def test_persisted_wire_ten_requires_the_complete_exterior_certificate(self):
+        """Catches resealing a partially stripped calibration-policy fragment."""
+
+        job, backend = _production_promoted_backend(
+            "exterior-light-ring", FakeAdapter()
+        )
+        valid_mapping = backend.read_root(job, 0.0j).to_mapping()
+        corrupt_values = {
+            "determinant_error_required_term_classes": ["delta_same_point"],
+            "determinant_error_missing_evidence_outcome": "forged-outcome/v1",
+            "determinant_error_certificate_statement": "formal enclosure",
+            "determinant_error_preceding_precision_tier": "bigfloat-80",
+            "determinant_error_safety_factor": "64",
+            "promoted_control_calibration_receipt_sha256": "0" * 64,
+            "empirical_control_profile_sha256": "0" * 64,
+        }
+        for field, bad_value in corrupt_values.items():
+            for mutation in ("missing", "corrupt"):
+                with self.subTest(field=field, mutation=mutation):
+                    forged = json.loads(
+                        canonical_json_bytes(valid_mapping)
+                    )
+                    policy = forged["worker_response_receipt"][
+                        "request_binding"
+                    ]["policy"]
+                    if mutation == "missing":
+                        policy.pop(field)
+                    else:
+                        policy[field] = bad_value
+                    _reseal_worker_response_receipt(forged)
+                    with self.assertRaisesRegex(
+                        ValueError, "determinant certificate policy"
+                    ):
+                        RootReadout.from_mapping(forged)
+
+    def test_persisted_wire_nine_rejects_schema_ten_raw_count_field(self):
+        """Catches smuggling a schema-10 raw count through a wire-9 receipt."""
+
+        job, backend = _production_promoted_backend(
+            "horizon-admittance", FakeAdapter()
+        )
+        forged = backend.read_root(job, 0.0j).to_mapping()
+        forged["worker_response_receipt"][
+            "worker_response_schema_version"
+        ] = 9
+        _reseal_worker_response_receipt(forged)
+        with self.assertRaisesRegex(
+            ValueError, "wire schema.*raw determinant|raw determinant.*wire schema"
+        ):
+            RootReadout.from_mapping(forged)
 
     def test_promoted_primary_acceptance_is_raw_binary64_parity(self):
         readout = JuliaPrecisionRootBackend(
@@ -1099,18 +1327,18 @@ class JuliaResponseBackendTests(unittest.TestCase):
             ).read_root(_deep_job(), 0.0j)
 
     def test_worker_promoted_policy_reaches_the_backend_end_to_end(self):
-        """The schema-v7 producer and consumer agree for both determinants."""
+        """The current producer and consumer agree for both determinants."""
 
         for mechanism, horizon in (
             ("horizon-admittance", True),
             ("exterior-fixed-r3", False),
         ):
             with self.subTest(mechanism=mechanism):
-                job = _job_for_mechanism(mechanism)
                 adapter = FakeAdapter()
-                readout = JuliaPrecisionRootBackend(
-                    VettedNativeDeterminantKernel.identity, adapter, 80
-                ).read_root(job, 0.0j)
+                job, backend = _production_promoted_backend(
+                    mechanism, adapter
+                )
+                readout = backend.read_root(job, 0.0j)
 
                 self.assertTrue(readout.converged)
                 self.assertIsNone(readout.root_authentication)
@@ -1122,7 +1350,14 @@ class JuliaResponseBackendTests(unittest.TestCase):
                     primary.determinant.magnitude()
                     / primary.derivative.magnitude(),
                 )
-                self.assertEqual(primary.error_model_id is not None, horizon)
+                self.assertEqual(
+                    primary.error_model_id,
+                    (
+                        "verified-endpoint-control-equivalence-absolute-error/v2"
+                        if horizon
+                        else EXTERIOR_DETERMINANT_ABSOLUTE_ERROR_CERTIFICATE
+                    ),
+                )
                 self.assertEqual(
                     set(readout.diagnostic_readouts),
                     {"truncation", "resolution"},
@@ -1130,6 +1365,10 @@ class JuliaResponseBackendTests(unittest.TestCase):
                 for diagnostic in readout.diagnostic_readouts.values():
                     evidence = diagnostic.fixed_root_evidence
                     self.assertEqual(evidence.determinant_count, 1)
+                    self.assertEqual(
+                        evidence.raw_determinant_evaluation_count,
+                        1 if horizon else 3,
+                    )
                     self.assertEqual(
                         evidence.primary_derivative, primary.derivative
                     )
@@ -1241,9 +1480,8 @@ class JuliaResponseBackendTests(unittest.TestCase):
 
         for mechanism in ("horizon-admittance", "exterior-fixed-r3"):
             with self.subTest(mechanism=mechanism):
-                job = _job_for_mechanism(mechanism)
-                backend = JuliaPrecisionRootBackend(
-                    VettedNativeDeterminantKernel.identity, FakeAdapter(), 80
+                job, backend = _production_promoted_backend(
+                    mechanism, FakeAdapter()
                 )
 
                 readout = backend.read_root(job, 0.0j)
@@ -1271,9 +1509,8 @@ class JuliaResponseBackendTests(unittest.TestCase):
 
         for mechanism in ("horizon-admittance", "exterior-fixed-r3"):
             with self.subTest(mechanism=mechanism):
-                job = _job_for_mechanism(mechanism)
-                backend = JuliaPrecisionRootBackend(
-                    VettedNativeDeterminantKernel.identity, FakeAdapter(), 80
+                job, backend = _production_promoted_backend(
+                    mechanism, FakeAdapter()
                 )
                 readout = backend.read_root(job, 0.0j)
 

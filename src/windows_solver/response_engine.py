@@ -54,6 +54,12 @@ from .partial_component_checkpoint import (
     PartialComponentJournal,
     PartialComponentWorkUnit,
 )
+from .promoted_control_calibration import (
+    DEFAULT_CALIBRATION_RECEIPT_SHA256,
+    EXTERIOR_DETERMINANT_ABSOLUTE_ERROR_CERTIFICATE,
+    EXTERIOR_DETERMINANT_CERTIFICATE_UNAVAILABLE,
+    load_default_calibration_receipt,
+)
 from .response_uncertainty import (
     ComplexDisk,
     ZeroContainingDiskError,
@@ -180,9 +186,11 @@ HISTORICAL_WORKER_RESPONSE_RECEIPT_SCHEMA = (
 # binary64-parity PRIMARY Newton and fixed-root TRUNCATION/RESOLUTION evidence.
 # Version 8 added frequency-disk derivative authentication. Version 9 persists
 # every successful adaptive horizon endpoint search in the sealed response.
+# Version 10 separates one logical authenticated fixed-root determinant from
+# the raw determinant evaluations required to construct its certificate.
 # Error responses remain independently versioned at 1.
-WORKER_RESPONSE_WIRE_SCHEMA = 9
-HISTORICAL_WORKER_RESPONSE_WIRE_SCHEMAS = frozenset({3, 4, 5, 6, 7, 8})
+WORKER_RESPONSE_WIRE_SCHEMA = 10
+HISTORICAL_WORKER_RESPONSE_WIRE_SCHEMAS = frozenset({3, 4, 5, 6, 7, 8, 9})
 _ROOT_AUTHENTICATION_WIRE_SCHEMAS = frozenset({4, 5, 6})
 _HISTORICAL_WORKER_RESPONSE_RECEIPT_FIELDS = frozenset({
     "schema",
@@ -1074,13 +1082,17 @@ def _validated_worker_response_receipt(
         raise ValueError("worker response receipt request digest is invalid")
     wire_schema = value["worker_response_schema_version"]
     allowed_wire_schemas = (
-        {WORKER_RESPONSE_WIRE_SCHEMA}
+        # Receipt schema 3 predates wire 10.  Sealed wire-9 checkpoints stay
+        # readable, while new live responses must satisfy the wire-10 parser.
+        {9, WORKER_RESPONSE_WIRE_SCHEMA}
         if current
         else (
-            {8} if previous else HISTORICAL_WORKER_RESPONSE_WIRE_SCHEMAS - {8}
+            {8}
+            if previous
+            else HISTORICAL_WORKER_RESPONSE_WIRE_SCHEMAS - {8, 9}
         )
     )
-    if wire_schema not in allowed_wire_schemas:
+    if type(wire_schema) is not int or wire_schema not in allowed_wire_schemas:
         raise ValueError("worker response receipt wire schema is invalid")
     if current or previous:
         if (
@@ -1103,6 +1115,8 @@ def _validated_worker_response_receipt(
             raise ValueError(
                 "exterior worker response carries horizon endpoint evidence"
             )
+        if wire_schema == WORKER_RESPONSE_WIRE_SCHEMA:
+            _current_authenticated_determinant_raw_count(request_binding)
     residual = _conditioning_decimal_from_text(
         value["root_residual_abs_text"],
         "worker response receipt root residual",
@@ -1134,6 +1148,110 @@ def _validated_worker_response_receipt(
         "request_binding": dict(request_binding),
         "receipt_sha256": value["receipt_sha256"],
     }
+
+
+def _current_authenticated_determinant_raw_count(
+    request_binding: Mapping[str, object],
+) -> int:
+    """Return the raw count bound to one current authenticated determinant.
+
+    Wire 10 records the implementation work behind one logical determinant.
+    Its count is a mechanism contract, not something an absent optional policy
+    field may silently downgrade.  Validate the determinant-family join before
+    interpreting the count so resealed hybrid requests fail closed.
+    """
+
+    mechanism_id = request_binding.get("mechanism_id")
+    policy = request_binding.get("policy")
+    if not isinstance(policy, Mapping):
+        raise ValueError(
+            "worker response receipt determinant policy is invalid"
+        )
+    try:
+        mechanism_contract = regularised_gsn_mechanism_contract(
+            mechanism_id
+        )
+    except (TypeError, ValueError) as error:
+        raise ValueError(
+            "worker response receipt determinant policy is invalid"
+        ) from error
+    if any(
+        policy.get(field) != expected
+        for field, expected in mechanism_contract.items()
+    ):
+        raise ValueError(
+            "worker response receipt determinant policy is invalid"
+        )
+    if mechanism_id == "horizon-admittance":
+        expected_error_model = VERIFIED_ENDPOINT_ERROR_MODEL
+        raw_count = 1
+    elif mechanism_id in _EXTERIOR_PROFILE_IDS:
+        expected_error_model = (
+            EXTERIOR_DETERMINANT_ABSOLUTE_ERROR_CERTIFICATE
+        )
+        raw_count = 3
+    else:  # guarded by regularised_gsn_mechanism_contract; kept fail-closed.
+        raise ValueError(
+            "worker response receipt determinant policy is invalid"
+        )
+    if policy.get("determinant_error_model") != expected_error_model:
+        raise ValueError(
+            "worker response receipt determinant certificate policy is invalid"
+        )
+    if raw_count == 3:
+        digits = request_binding.get("precision_digits")
+        preceding_tier = {
+            40: "binary64",
+            80: "bigfloat-40",
+            120: "bigfloat-80",
+        }.get(digits) if type(digits) is int else None
+        required_terms = policy.get(
+            "determinant_error_required_term_classes"
+        )
+        if (
+            type(required_terms) is not list
+            or required_terms != [
+                "delta_same_point",
+                "delta_cross_precision",
+                "delta_endpoint_series",
+            ]
+            or policy.get("determinant_error_missing_evidence_outcome")
+            != EXTERIOR_DETERMINANT_CERTIFICATE_UNAVAILABLE
+            or policy.get("determinant_error_certificate_statement")
+            != (
+                "conservative empirical certificate; not a formal interval "
+                "enclosure"
+            )
+            or policy.get("determinant_error_preceding_precision_tier")
+            != preceding_tier
+            or type(policy.get("determinant_error_safety_factor")) is not int
+            or policy.get("determinant_error_safety_factor") != 64
+            or policy.get("promoted_control_calibration_receipt_sha256")
+            != DEFAULT_CALIBRATION_RECEIPT_SHA256
+            or policy.get("empirical_control_profile_sha256")
+            != _current_empirical_control_profile_sha256(
+                "exterior-wronskian/v1", digits
+            )
+        ):
+            raise ValueError(
+                "worker response receipt determinant certificate policy is invalid"
+            )
+    return raw_count
+
+
+@lru_cache(maxsize=None)
+def _current_empirical_control_profile_sha256(
+    determinant_family: str,
+    digits: int,
+) -> str:
+    receipt = load_default_calibration_receipt()
+    try:
+        profile = receipt.budget_for(determinant_family, digits)
+    except (KeyError, ValueError) as error:
+        raise ValueError(
+            "worker response receipt determinant certificate policy is invalid"
+        ) from error
+    return _sha256(profile.to_mapping())
 
 
 def _finite_complex(value: complex, subject: str) -> complex:
@@ -2616,6 +2734,7 @@ class FixedRootDiagnosticEvidence:
     accepted: bool
     fixed_root: bool
     derivative_source: str
+    raw_determinant_evaluation_count: int | None = None
 
     def __post_init__(self) -> None:
         if self.policy_id not in {
@@ -2637,6 +2756,16 @@ class FixedRootDiagnosticEvidence:
             raise ValueError("fixed-root derivative source is invalid")
         if type(self.determinant_count) is not int or self.determinant_count != 1:
             raise ValueError("fixed-root diagnostic determinant count is not one")
+        if (
+            self.raw_determinant_evaluation_count is not None
+            and (
+                type(self.raw_determinant_evaluation_count) is not int
+                or self.raw_determinant_evaluation_count not in {1, 3}
+            )
+        ):
+            raise ValueError(
+                "fixed-root raw determinant evaluation count is invalid"
+            )
         if type(self.branch_authenticated) is not bool or type(self.accepted) is not bool:
             raise ValueError("fixed-root boolean evidence is invalid")
         for name in ("control_identity", "branch_identity"):
@@ -2673,7 +2802,7 @@ class FixedRootDiagnosticEvidence:
                 raise ValueError("fixed-root acceptance decision is inconsistent")
 
     def to_mapping(self) -> dict[str, object]:
-        return {
+        mapping = {
             "policy_id": self.policy_id,
             "acceptance_metric": self.acceptance_metric,
             "root_phase": self.root_phase,
@@ -2693,6 +2822,11 @@ class FixedRootDiagnosticEvidence:
             "fixed_root": self.fixed_root,
             "derivative_source": self.derivative_source,
         }
+        if self.raw_determinant_evaluation_count is not None:
+            mapping["raw_determinant_evaluation_count"] = (
+                self.raw_determinant_evaluation_count
+            )
+        return mapping
 
     @classmethod
     def from_mapping(cls, value: object) -> "FixedRootDiagnosticEvidence":
@@ -2716,8 +2850,25 @@ class FixedRootDiagnosticEvidence:
             "fixed_root",
             "derivative_source",
         }
-        if not isinstance(value, Mapping) or set(value) != fields:
+        current_fields = fields | {"raw_determinant_evaluation_count"}
+        if (
+            not isinstance(value, Mapping)
+            or (
+                set(value) != fields
+                and set(value) != current_fields
+            )
+        ):
             raise ValueError("fixed-root diagnostic evidence fields are invalid")
+        if (
+            set(value) == current_fields
+            and (
+                type(value["raw_determinant_evaluation_count"]) is not int
+                or value["raw_determinant_evaluation_count"] not in {1, 3}
+            )
+        ):
+            raise ValueError(
+                "fixed-root raw determinant evaluation count is invalid"
+            )
         return cls(
             policy_id=str(value["policy_id"]),
             acceptance_metric=str(value["acceptance_metric"]),
@@ -2758,6 +2909,9 @@ class FixedRootDiagnosticEvidence:
             accepted=value["accepted"],
             fixed_root=value["fixed_root"],
             derivative_source=str(value["derivative_source"]),
+            raw_determinant_evaluation_count=value.get(
+                "raw_determinant_evaluation_count"
+            ),
         )
 
 
@@ -3881,6 +4035,42 @@ class RootReadout:
                     raise ValueError(
                         "worker response receipt disagrees with promoted acceptance"
                     )
+                if (
+                    receipt["worker_response_schema_version"]
+                    == WORKER_RESPONSE_WIRE_SCHEMA
+                ):
+                    expected_raw_count = (
+                        _current_authenticated_determinant_raw_count(
+                            receipt["request_binding"]
+                        )
+                    )
+                    for diagnostic in (
+                        self.diagnostic_readouts or {}
+                    ).values():
+                        evidence = diagnostic.fixed_root_evidence
+                        if (
+                            evidence is not None
+                            and evidence.raw_determinant_evaluation_count
+                            != expected_raw_count
+                        ):
+                            raise ValueError(
+                                "worker response receipt disagrees with fixed-root "
+                                "raw determinant evidence"
+                            )
+                elif receipt["worker_response_schema_version"] == 9:
+                    for diagnostic in (
+                        self.diagnostic_readouts or {}
+                    ).values():
+                        evidence = diagnostic.fixed_root_evidence
+                        if (
+                            evidence is not None
+                            and evidence.raw_determinant_evaluation_count
+                            is not None
+                        ):
+                            raise ValueError(
+                                "worker response wire schema 9 carries a raw "
+                                "determinant evaluation count"
+                            )
             copied_receipt = dict(receipt)
             copied_receipt["request_binding"] = MappingProxyType(
                 dict(receipt["request_binding"])
@@ -6002,12 +6192,40 @@ class _JournaledPromotedExteriorBackend:
         units_by_role: Mapping[str, PartialComponentWorkUnit],
         *,
         exact_request_binding: bool = False,
+        scientific_runtime_sha256: str | None = None,
     ) -> None:
         self._backend = backend
         self._journal = journal
         self._units_by_role = dict(units_by_role)
         self._exact_request_binding = exact_request_binding
+        if scientific_runtime_sha256 is not None and (
+            not isinstance(scientific_runtime_sha256, str)
+            or _HEX_64.fullmatch(scientific_runtime_sha256) is None
+        ):
+            raise ValueError(
+                "partial component scientific runtime identity is invalid"
+            )
+        self._scientific_runtime_sha256 = scientific_runtime_sha256
         self.identity = backend.identity
+
+    def _validate_scientific_runtime(
+        self,
+        output: RootReadout | FixedRootDeterminantSample,
+        *,
+        reused: bool,
+    ) -> None:
+        if self._scientific_runtime_sha256 is None:
+            return
+        receipt = output.worker_response_receipt
+        if (
+            not isinstance(receipt, Mapping)
+            or receipt.get("scientific_runtime_sha256")
+            != self._scientific_runtime_sha256
+        ):
+            action = "reused output" if reused else "output"
+            raise ValueError(
+                f"partial component {action} scientific runtime identity mismatch"
+            )
 
     def _reuse(self, role: str, kind: str) -> RootReadout | FixedRootDeterminantSample | None:
         unit = self._units_by_role[role]
@@ -6047,6 +6265,7 @@ class _JournaledPromotedExteriorBackend:
                 raise ValueError(
                     "partial component reused output request identity mismatch"
                 )
+        self._validate_scientific_runtime(output, reused=True)
         return output
 
     def _record(
@@ -6070,6 +6289,7 @@ class _JournaledPromotedExteriorBackend:
                 raise ValueError(
                     "partial component output request identity mismatch"
                 )
+        self._validate_scientific_runtime(output, reused=False)
         self._journal.record(unit.to_entry({
             "schema": _PROMOTED_COMPONENT_JOURNAL_SCHEMA,
             "kind": kind,
@@ -6331,6 +6551,19 @@ def _journaled_promoted_exterior_backend(
     preview_root = getattr(backend, "preview_root_request", None)
     preview_fixed = getattr(backend, "preview_fixed_root_request", None)
     exact_request_binding = callable(preview_root) and callable(preview_fixed)
+    scientific_runtime_sha256 = None
+    if exact_request_binding:
+        runtime_provider = getattr(backend, "scientific_runtime_for", None)
+        if not callable(runtime_provider):
+            raise ValueError(
+                "journaled promoted backend lacks scientific runtime identity"
+            )
+        scientific_runtime = runtime_provider(job)
+        if not isinstance(scientific_runtime, Mapping):
+            raise ValueError(
+                "journaled promoted backend scientific runtime is invalid"
+            )
+        scientific_runtime_sha256 = _sha256(scientific_runtime)
     for amplitude, role in planned:
         if role == "baseline-root" and callable(preview_root):
             request_binding = preview_root(
@@ -6370,11 +6603,16 @@ def _journaled_promoted_exterior_backend(
             request_sha256=request_sha256,
         )
     expected = tuple(unit.work_unit_id for unit in units.values())
-    journal_name = _sha256({
+    journal_identity = {
         "job_id": job.job_id,
         "component_scientific_identity": EXTERIOR_DERIVATIVE_COMPONENT_IDENTITY,
         "plan_sha256": _sha256(list(expected)),
-    }) + ".json"
+    }
+    if scientific_runtime_sha256 is not None:
+        journal_identity["scientific_runtime_sha256"] = (
+            scientific_runtime_sha256
+        )
+    journal_name = _sha256(journal_identity) + ".json"
     journal_path = Path(root_text) / journal_name
     journal = (
         PartialComponentJournal.load(journal_path)
@@ -6390,6 +6628,7 @@ def _journaled_promoted_exterior_backend(
         journal,
         units,
         exact_request_binding=exact_request_binding,
+        scientific_runtime_sha256=scientific_runtime_sha256,
     )
 
 

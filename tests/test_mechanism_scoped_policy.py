@@ -20,18 +20,21 @@ from __future__ import annotations
 
 from decimal import Decimal
 import hashlib
-import math
+from types import SimpleNamespace
 import unittest
 
 from windows_solver import response_batches, response_engine
 from windows_solver.contracts import canonical_json_bytes
 from windows_solver.julia_response_backend import JuliaPrecisionRootBackend
+from windows_solver.promoted_control_calibration import (
+    EXTERIOR_DETERMINANT_ABSOLUTE_ERROR_CERTIFICATE,
+    load_default_calibration_receipt,
+)
 from windows_solver.response_batches import (
     PrecisionCapabilities,
     build_campaign_plan,
 )
 from tests.fixtures import (
-    synthetic_ode_error_budget,
     valid_horizon_endpoint_search_evidence,
     valid_numerical_conditioning,
 )
@@ -195,32 +198,39 @@ class ReceiptCompatibilityTests(unittest.TestCase):
         )
 
     def _runtime(self, job, policy):
-        budget = synthetic_ode_error_budget(80).to_mapping()
+        backend = self._request_backend(job)
+        runtime = backend.scientific_runtime_for(job)
         return {
-            "julia_version": "1.10.11",
-            "julia_executable_sha256": "a" * 64,
-            "julia_manifest_sha256": "b" * 64,
-            "worker_sha256": "c" * 64,
-            "runtime_policy_sha256": "d" * 64,
-            "scientific_sources": [],
-            "precision_digits": 80,
-            "working_precision_bits": math.ceil(80 * math.log2(10)) + 32,
-            "refinement_level": 0,
+            **runtime,
             "regularised_gsn_precision_policy": dict(policy),
-            "ode_error_budget": budget,
-            "ode_error_budget_sha256": hashlib.sha256(
-                canonical_json_bytes(budget)
-            ).hexdigest(),
         }
+
+    @staticmethod
+    def _request_backend(job):
+        receipt = load_default_calibration_receipt()
+        family = (
+            "horizon-scattering/v1"
+            if job.mechanism_id == "horizon-admittance"
+            else "exterior-wronskian/v1"
+        )
+        return JuliaPrecisionRootBackend(
+            job.backend_identity,
+            SimpleNamespace(runtime_provenance={
+                "julia_version": "1.10.11",
+                "julia_executable_sha256": "a" * 64,
+                "julia_manifest_sha256": "b" * 64,
+                "worker_sha256": "c" * 64,
+                "runtime_policy_sha256": "d" * 64,
+                "scientific_sources": [],
+            }),
+            80,
+            empirical_control_profile=receipt.budget_for(family, 80),
+            calibration_receipt=receipt,
+        )
 
     def _readout(self, job, runtime):
         horizon = job.mechanism_id == "horizon-admittance"
-        request_binding = JuliaPrecisionRootBackend(
-            job.backend_identity,
-            object(),
-            80,
-            ode_error_budget=synthetic_ode_error_budget(80),
-        )._request(job, 0.0j)
+        request_binding = self._request_backend(job)._request(job, 0.0j)
         determinant = Decimal("1E-10")
         derivative = Decimal("2")
         correction = determinant / derivative
@@ -238,7 +248,7 @@ class ReceiptCompatibilityTests(unittest.TestCase):
             error_model_id=(
                 response_engine.VERIFIED_ENDPOINT_ERROR_MODEL
                 if horizon
-                else None
+                else EXTERIOR_DETERMINANT_ABSOLUTE_ERROR_CERTIFICATE
             ),
         )
         material = {

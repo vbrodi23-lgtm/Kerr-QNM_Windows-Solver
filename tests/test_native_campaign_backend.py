@@ -555,10 +555,6 @@ class NativeCampaignBackendTests(unittest.TestCase):
             self.capabilities,
             generated,
             self.backend.julia_adapter,
-            ode_error_budgets={
-                80: synthetic_ode_error_budget(80),
-                120: synthetic_ode_error_budget(120),
-            },
         )
         predictor = deep.job.root.omega
         promoted = _with_worker_receipt(
