@@ -5867,7 +5867,6 @@ function solve_binary64_parity_primary(
 ) where {T<:AbstractFloat}
     determinant_count_before = DETERMINANT_INDEX_PHASE[]
     propagate_primary_derivative_error =
-        string(required(request, "mechanism_id")) == "horizon-admittance" &&
         haskey(request, "determinant_error_model")
     root, residual, newton_derivative, newton_converged,
         root_evaluation, derivative_authentication = newton_solver(
@@ -7593,8 +7592,11 @@ function fixed_root_determinant_sample_fields(
     branch_identity = string(required(request, "branch_convention"))
     error_available = evaluation.error_breakdown !== nothing &&
         evaluation.error_model_id !== nothing
+    numerical_conditioning = conditioning_response(
+        T, request, evaluation_context, digits
+    )
     return [
-        "schema_version" => 1,
+        "schema_version" => 2,
         "status" => "ok",
         "operation" => "fixed-root-determinant-sample",
         "request_sha256" => string(required(request, "request_sha256")),
@@ -7620,6 +7622,7 @@ function fixed_root_determinant_sample_fields(
         "semantic_precision_tier" => expected_tier,
         "working_precision_bits" => bits,
         "readout_role" => string(required(request, "readout_role")),
+        "numerical_conditioning" => numerical_conditioning,
     ]
 end
 

@@ -10,6 +10,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
+import windows_solver.response_batches as response_batches
 import windows_solver.response_engine as response_engine
 from tests.test_promoted_horizon_component import (
     _promoted_baseline,
@@ -33,6 +34,7 @@ from windows_solver.promoted_control_calibration import (
 )
 from windows_solver.response_engine import (
     ComponentResult,
+    ComponentStatus,
     EXTERIOR_DERIVATIVE_COMPONENT_IDENTITY,
     EXTERIOR_DERIVATIVE_RESPONSE_DISK_IDENTITY,
     FIXED_ROOT_AXIS_VALIDATION_IDENTITY,
@@ -40,12 +42,14 @@ from windows_solver.response_engine import (
     DerivativeAuthenticationEvidence,
     FixedRootDeterminantSample,
     NumericalPolicy,
+    PromotedRootSeal,
     VettedNativeDeterminantKernel,
     _fixed_root_coordinate_derivative,
     _JournaledComponentReads,
     _JournaledPromotedExteriorBackend,
     regularised_gsn_precision_policy,
     run_promoted_exterior_component,
+    run_promoted_exterior_response_from_seal,
     run_promoted_full_ladder_validation,
     run_component,
     full_ladder_validation_policy,
@@ -122,7 +126,7 @@ class FixedRootOnlyBackend:
         request_sha256 = hashlib.sha256(canonical_json_bytes(request)).hexdigest()
         derivative = 2.0 + 3.0j
         determinant = 1.0e-12 + derivative * converted
-        determinant_error_text = str(1.0e-9 * abs(converted))
+        determinant_error_text = str(1.0e-9 * max(abs(converted), 1.0e-12))
         determinant_error_decimal = Decimal(determinant_error_text)
         determinant_error_abs = float(determinant_error_decimal)
         if Decimal.from_float(determinant_error_abs) < determinant_error_decimal:
@@ -189,7 +193,342 @@ class FixedRootOnlyBackend:
         )
 
 
+class RootForbiddenFrequencyFallbackBackend(FixedRootOnlyBackend):
+    """Synthetic fixed-root boundary that makes accidental root work fatal."""
+
+    def __init__(self, job, baseline) -> None:
+        super().__init__(job, baseline)
+        self.sample_calls: list[tuple[complex, complex, str]] = []
+
+    def read_root(self, *args, **kwargs):
+        raise AssertionError("sealed response repair must not call read_root")
+
+    def sample_fixed_root_determinant(
+        self, job, omega, amplitude, *, readout_role
+    ) -> FixedRootDeterminantSample:
+        sample = super().sample_fixed_root_determinant(
+            job, omega, amplitude, readout_role=readout_role
+        )
+        self.sample_calls.append((complex(omega), complex(amplitude), readout_role))
+        # D(omega, c) = 5 omega + (2 + 3i)c.  The response runner must use
+        # omega differences for D_omega and amplitude differences for D_c.
+        determinant = 5.0 * complex(omega) + (2.0 + 3.0j) * complex(amplitude)
+        receipt = dict(sample.worker_response_receipt)
+        response = dict(receipt["response_binding"])
+        response.update({
+            "omega_re": str(omega.real),
+            "omega_im": str(omega.imag),
+            "determinant_re": str(determinant.real),
+            "determinant_im": str(determinant.imag),
+            "determinant_error_abs": "1e-18",
+        })
+        receipt["response_binding"] = response
+        receipt["response_sha256"] = hashlib.sha256(
+            canonical_json_bytes(response)
+        ).hexdigest()
+        return replace(
+            sample,
+            determinant=determinant,
+            determinant_error_abs=1.0e-18,
+            worker_response_receipt=receipt,
+            worker_response_receipt_sha256=hashlib.sha256(
+                canonical_json_bytes(receipt)
+            ).hexdigest(),
+        )
+
+
 class PromotedExteriorDerivativeTests(unittest.TestCase):
+    def test_sealed_root_recovers_frequency_stencil_without_a_root_call(self) -> None:
+        leaf = _primary_exterior_leaf()
+        baseline = _promoted_baseline(
+            leaf.job,
+            conditioning_mechanism=leaf.mechanism_id,
+        )
+        baseline = replace(baseline, omega=leaf.job.root.omega)
+        baseline = _with_worker_receipt(
+            leaf.job, baseline, 80, baseline.omega
+        )
+        self.assertEqual(
+            baseline.primary_acceptance.derivative_authentication
+            .determinant_error_status,
+            "unavailable/v1",
+        )
+        seal = PromotedRootSeal.derive(leaf.job, baseline)
+        backend = RootForbiddenFrequencyFallbackBackend(leaf.job, baseline)
+
+        result = run_promoted_exterior_response_from_seal(
+            leaf.job,
+            backend,
+            seal,
+            derivative_step=0.004,
+        )
+
+        self.assertEqual(result.status.value, "CONVERGED")
+        self.assertEqual(
+            [role for _, _, role in backend.sample_calls],
+            [
+                "frequency-real-plus-h",
+                "frequency-real-minus-h",
+                "frequency-real-plus-h2",
+                "frequency-real-minus-h2",
+                "coordinate-real-plus-h",
+                "coordinate-real-minus-h",
+                "coordinate-real-plus-h2",
+                "coordinate-real-minus-h2",
+            ],
+        )
+        evidence = result.derivative_evidence
+        self.assertEqual(
+            evidence["frequency_derivative_source"],
+            "fixed-root-frequency-h-h2-stencil/v1",
+        )
+        self.assertEqual(evidence["root_seal_sha256"], seal.sha256)
+
+    def test_frequency_only_repair_reuses_coordinate_stencil_at_the_sealed_root(
+        self,
+    ) -> None:
+        """A response-tier retry promotes only the Dω h/h2 family."""
+
+        leaf = _primary_exterior_leaf()
+        baseline = _promoted_baseline(
+            leaf.job,
+            conditioning_mechanism=leaf.mechanism_id,
+        )
+        baseline = replace(baseline, omega=leaf.job.root.omega)
+        baseline = _with_worker_receipt(
+            leaf.job, baseline, 80, baseline.omega
+        )
+        seal = PromotedRootSeal.derive(leaf.job, baseline)
+        original_backend = RootForbiddenFrequencyFallbackBackend(
+            leaf.job, baseline
+        )
+        original = run_promoted_exterior_response_from_seal(
+            leaf.job,
+            original_backend,
+            seal,
+            derivative_step=0.004,
+        )
+        self.assertEqual(len(original_backend.sample_calls), 8)
+
+        repaired_backend = RootForbiddenFrequencyFallbackBackend(
+            leaf.job, baseline
+        )
+        repaired_backend.sample_tier = PrecisionTier.BIGFLOAT_120
+        repaired = run_promoted_exterior_response_from_seal(
+            leaf.job,
+            repaired_backend,
+            seal,
+            derivative_step=0.004,
+            repair_families=frozenset({"frequency"}),
+            reusable_result=original,
+        )
+
+        self.assertEqual(
+            [role for _, _, role in repaired_backend.sample_calls],
+            [
+                "frequency-real-plus-h",
+                "frequency-real-minus-h",
+                "frequency-real-plus-h2",
+                "frequency-real-minus-h2",
+            ],
+        )
+        evidence = repaired.derivative_evidence
+        self.assertEqual(
+            evidence["response_repair_scope"]["recomputed_families"],
+            ["frequency"],
+        )
+        self.assertEqual(
+            evidence["response_repair_scope"]["reused_families"],
+            ["coordinate"],
+        )
+        samples = evidence["fixed_root_samples"]
+        frequency_tiers = {
+            sample["precision_tier"]
+            for sample in samples
+            if sample["readout_role"].startswith("frequency-")
+        }
+        coordinate_tiers = {
+            sample["precision_tier"]
+            for sample in samples
+            if sample["readout_role"].startswith("coordinate-")
+        }
+        self.assertEqual(frequency_tiers, {"bigfloat-120"})
+        self.assertEqual(coordinate_tiers, {"bigfloat-80"})
+        self.assertEqual(
+            ComponentResult.from_mapping(repaired.to_mapping()).to_mapping(),
+            repaired.to_mapping(),
+        )
+
+    def test_reused_stencil_must_match_the_immediate_sealed_predecessor(
+        self,
+    ) -> None:
+        """A repair cannot relabel independently sampled D_c as a reuse."""
+
+        leaf = _primary_exterior_leaf()
+        baseline = _promoted_baseline(
+            leaf.job,
+            conditioning_mechanism=leaf.mechanism_id,
+        )
+        baseline = replace(baseline, omega=leaf.job.root.omega)
+        baseline = _with_worker_receipt(
+            leaf.job, baseline, 80, baseline.omega
+        )
+        seal = PromotedRootSeal.derive(leaf.job, baseline)
+        predecessor = run_promoted_exterior_response_from_seal(
+            leaf.job,
+            RootForbiddenFrequencyFallbackBackend(leaf.job, baseline),
+            seal,
+            derivative_step=0.004,
+        )
+
+        class DifferentCoordinateBackend(RootForbiddenFrequencyFallbackBackend):
+            def sample_fixed_root_determinant(self, *args, **kwargs):
+                sample = super().sample_fixed_root_determinant(*args, **kwargs)
+                if not sample.readout_role.startswith("coordinate-"):
+                    return sample
+                determinant = sample.determinant + complex(1.0e-9, -2.0e-9)
+                receipt = dict(sample.worker_response_receipt)
+                response = dict(receipt["response_binding"])
+                response.update({
+                    "determinant_re": str(determinant.real),
+                    "determinant_im": str(determinant.imag),
+                })
+                receipt["response_binding"] = response
+                receipt["response_sha256"] = hashlib.sha256(
+                    canonical_json_bytes(response)
+                ).hexdigest()
+                return replace(
+                    sample,
+                    determinant=determinant,
+                    worker_response_receipt=receipt,
+                    worker_response_receipt_sha256=hashlib.sha256(
+                        canonical_json_bytes(receipt)
+                    ).hexdigest(),
+                )
+
+        independently_sampled = run_promoted_exterior_response_from_seal(
+            leaf.job,
+            DifferentCoordinateBackend(leaf.job, baseline),
+            seal,
+            derivative_step=0.004,
+        )
+        forged = independently_sampled.to_mapping()
+        forged["derivative_evidence"]["response_repair_scope"] = {
+            "schema": "windows-solver.fixed-root-response-repair-scope/1",
+            "requested_families": ["coordinate", "frequency"],
+            "recomputed_families": ["frequency"],
+            "reused_families": ["coordinate"],
+        }
+        forged_repair = ComponentResult.from_mapping(forged)
+
+        with self.assertRaisesRegex(
+            ValueError, "reused samples do not match their predecessor"
+        ):
+            response_batches._validate_root_sealed_response_reuse_binding(
+                predecessor,
+                forged_repair,
+            )
+
+    def _resume_sealed_response_journal(self, *, interrupt_after: int):
+        leaf = _primary_exterior_leaf()
+        baseline = _promoted_baseline(
+            leaf.job,
+            conditioning_mechanism=leaf.mechanism_id,
+        )
+        baseline = replace(baseline, omega=leaf.job.root.omega)
+        baseline = _with_worker_receipt(
+            leaf.job, baseline, 80, baseline.omega
+        )
+        seal = PromotedRootSeal.derive(leaf.job, baseline)
+
+        class InterruptingBackend(RootForbiddenFrequencyFallbackBackend):
+            def sample_fixed_root_determinant(self, *args, **kwargs):
+                if len(self.sample_calls) >= interrupt_after:
+                    raise KeyboardInterrupt("synthetic response-journal interrupt")
+                return super().sample_fixed_root_determinant(*args, **kwargs)
+
+        with tempfile.TemporaryDirectory() as temporary, patch.dict(
+            "os.environ",
+            {"KERR_QNM_PARTIAL_COMPONENT_JOURNAL_ROOT": temporary},
+        ):
+            interrupted_backend = InterruptingBackend(leaf.job, baseline)
+            interrupted_journal_backend = (
+                response_engine._journaled_promoted_exterior_response_backend(
+                    leaf.job,
+                    interrupted_backend,
+                    seal=seal,
+                    derivative_step=0.004,
+                    validation_reason=None,
+                )
+            )
+            with self.assertRaises(KeyboardInterrupt):
+                run_promoted_exterior_response_from_seal(
+                    leaf.job,
+                    interrupted_journal_backend,
+                    seal,
+                    derivative_step=0.004,
+                )
+
+            journals = tuple(Path(temporary).glob("*.json"))
+            self.assertEqual(len(journals), 1)
+            stopped = PartialComponentJournal.load(journals[0])
+            self.assertEqual(len(stopped.entries), interrupt_after)
+            self.assertTrue(
+                all(
+                    entry.root_seal_sha256 == seal.sha256
+                    for entry in stopped.entries.values()
+                )
+            )
+
+            resumed_backend = RootForbiddenFrequencyFallbackBackend(
+                leaf.job, baseline
+            )
+            resumed_journal_backend = (
+                response_engine._journaled_promoted_exterior_response_backend(
+                    leaf.job,
+                    resumed_backend,
+                    seal=seal,
+                    derivative_step=0.004,
+                    validation_reason=None,
+                )
+            )
+            result = run_promoted_exterior_response_from_seal(
+                leaf.job,
+                resumed_journal_backend,
+                seal,
+                derivative_step=0.004,
+            )
+            return result, resumed_backend, PartialComponentJournal.load(journals[0])
+
+    def test_sealed_response_journal_resumes_after_frequency_interrupt(self) -> None:
+        """I: no root read and completed Dω samples survive an interruption."""
+
+        result, resumed_backend, journal = self._resume_sealed_response_journal(
+            interrupt_after=2
+        )
+        self.assertEqual(result.status, ComponentStatus.CONVERGED)
+        self.assertEqual(len(resumed_backend.sample_calls), 6)
+        self.assertEqual(
+            [role for _, _, role in resumed_backend.sample_calls[:2]],
+            ["frequency-real-plus-h2", "frequency-real-minus-h2"],
+        )
+        self.assertTrue(journal.complete)
+        self.assertEqual(len(journal.entries), 8)
+
+    def test_sealed_response_journal_resumes_after_coordinate_interrupt(self) -> None:
+        """J: completed Dω and completed D_c samples are never recomputed."""
+
+        result, resumed_backend, journal = self._resume_sealed_response_journal(
+            interrupt_after=6
+        )
+        self.assertEqual(result.status, ComponentStatus.CONVERGED)
+        self.assertEqual(
+            [role for _, _, role in resumed_backend.sample_calls],
+            ["coordinate-real-plus-h2", "coordinate-real-minus-h2"],
+        )
+        self.assertTrue(journal.complete)
+        self.assertEqual(len(journal.entries), 8)
+
     def test_fixed_root_derivative_uses_exact_worker_decimal_text(self) -> None:
         leaf = _primary_exterior_leaf()
         baseline = self._baseline_with_derivative_evidence(leaf)
@@ -268,6 +607,7 @@ class PromotedExteriorDerivativeTests(unittest.TestCase):
             leaf.job,
             conditioning_mechanism=leaf.mechanism_id,
         )
+        baseline = replace(baseline, omega=leaf.job.root.omega)
         derivative = baseline.primary_acceptance.derivative
         with localcontext() as context:
             context.prec = 180
@@ -459,10 +799,15 @@ class PromotedExteriorDerivativeTests(unittest.TestCase):
                     derivative_step=0.004,
                 )
             journals = tuple(Path(temporary).glob("*.json"))
-            self.assertEqual(len(journals), 1)
-            stopped = PartialComponentJournal.load(journals[0])
-            self.assertEqual(len(stopped.entries), 1)
-            baseline_entry = next(iter(stopped.entries.values()))
+            self.assertEqual(len(journals), 2)
+            stopped = tuple(PartialComponentJournal.load(path) for path in journals)
+            root_journal = next(
+                journal for journal in stopped if len(journal.entries) == 1
+            )
+            response_journal = next(
+                journal for journal in stopped if len(journal.entries) == 0
+            )
+            baseline_entry = next(iter(root_journal.entries.values()))
             self.assertEqual(baseline_entry.readout_role, "baseline-root")
             self.assertIn(
                 "diagnostic_readouts",
@@ -479,9 +824,10 @@ class PromotedExteriorDerivativeTests(unittest.TestCase):
             self.assertEqual(resumed.root_amplitudes, [])
             self.assertEqual(len(resumed.sample_amplitudes), 4)
             self.assertIsNotNone(result.response)
-            final = PartialComponentJournal.load(journals[0])
-            self.assertTrue(final.complete)
-            self.assertEqual(len(final.entries), 5)
+            self.assertTrue(PartialComponentJournal.load(root_journal.path).complete)
+            final_response = PartialComponentJournal.load(response_journal.path)
+            self.assertTrue(final_response.complete)
+            self.assertEqual(len(final_response.entries), 4)
 
     def test_completed_production_partial_journal_reuses_all_reads_byte_stably(self) -> None:
         """An identical full assembly is a byte-stable, zero-worker replay."""
@@ -570,33 +916,41 @@ class PromotedExteriorDerivativeTests(unittest.TestCase):
             self.assertEqual(len(first_backend.sample_amplitudes), 4)
 
             journals = tuple(Path(temporary).glob("*.json"))
-            self.assertEqual(len(journals), 1)
-            journal_path = journals[0]
-            original_bytes = journal_path.read_bytes()
-            original = PartialComponentJournal.load(journal_path)
-            self.assertTrue(original.complete)
-            self.assertEqual(len(original.entries), 5)
+            self.assertEqual(len(journals), 2)
+            journal_paths = tuple(sorted(journals))
+            original_bytes = {
+                path: path.read_bytes() for path in journal_paths
+            }
+            original = {
+                path: PartialComponentJournal.load(path) for path in journal_paths
+            }
+            self.assertEqual(
+                sorted(len(journal.entries) for journal in original.values()),
+                [1, 4],
+            )
+            self.assertTrue(all(journal.complete for journal in original.values()))
 
-            for entry in original.entries.values():
-                output = entry.worker_response_receipt["output"]
-                output_receipt = output["worker_response_receipt"]
-                self.assertEqual(
-                    output_receipt["scientific_runtime_sha256"],
-                    scientific_runtime_sha256,
-                )
-                self.assertEqual(
-                    entry.request_sha256,
-                    (
-                        output_receipt["request_sha256"]
-                        if entry.readout_role == "baseline-root"
-                        else output["request_sha256"]
-                    ),
-                )
-                if entry.readout_role != "baseline-root":
+            for journal in original.values():
+                for entry in journal.entries.values():
+                    output = entry.worker_response_receipt["output"]
+                    output_receipt = output["worker_response_receipt"]
                     self.assertEqual(
-                        output_receipt["runtime_identity_sha256"],
-                        runtime_identity,
+                        output_receipt["scientific_runtime_sha256"],
+                        scientific_runtime_sha256,
                     )
+                    self.assertEqual(
+                        entry.request_sha256,
+                        (
+                            output_receipt["request_sha256"]
+                            if entry.readout_role == "baseline-root"
+                            else output["request_sha256"]
+                        ),
+                    )
+                    if entry.readout_role != "baseline-root":
+                        self.assertEqual(
+                            output_receipt["runtime_identity_sha256"],
+                            runtime_identity,
+                        )
 
             second_backend = ExactPreviewBackend()
             second_result = run_promoted_exterior_component(
@@ -612,11 +966,12 @@ class PromotedExteriorDerivativeTests(unittest.TestCase):
                 second_result.to_mapping(), first_result.to_mapping()
             )
             self.assertEqual(
-                tuple(Path(temporary).glob("*.json")), (journal_path,)
+                tuple(sorted(Path(temporary).glob("*.json"))), journal_paths
             )
-            self.assertEqual(journal_path.read_bytes(), original_bytes)
-            reloaded = PartialComponentJournal.load(journal_path)
-            self.assertEqual(reloaded.to_mapping(), original.to_mapping())
+            for path in journal_paths:
+                self.assertEqual(path.read_bytes(), original_bytes[path])
+                reloaded = PartialComponentJournal.load(path)
+                self.assertEqual(reloaded.to_mapping(), original[path].to_mapping())
 
     def test_production_partial_journal_worker_change_reruns_baseline(self) -> None:
         """A changed worker rolls forward without deleting the old journal."""
@@ -704,8 +1059,9 @@ class PromotedExteriorDerivativeTests(unittest.TestCase):
                     primary_predictor=baseline.omega,
                     derivative_step=0.004,
                 )
-            old_path = next(Path(temporary).glob("*.json"))
-            old_bytes = old_path.read_bytes()
+            old_paths = tuple(sorted(Path(temporary).glob("*.json")))
+            self.assertEqual(len(old_paths), 2)
+            old_bytes = {path: path.read_bytes() for path in old_paths}
 
             resumed = ExactPreviewBackend(leaf.job, baseline_b, runtime_b)
             result = run_promoted_exterior_component(
@@ -718,9 +1074,10 @@ class PromotedExteriorDerivativeTests(unittest.TestCase):
             self.assertEqual(resumed.root_amplitudes, [0.0j])
             self.assertIsNotNone(result.response)
             journals = tuple(Path(temporary).glob("*.json"))
-            self.assertEqual(len(journals), 2)
-            self.assertTrue(old_path.is_file())
-            self.assertEqual(old_path.read_bytes(), old_bytes)
+            self.assertEqual(len(journals), 4)
+            for path in old_paths:
+                self.assertTrue(path.is_file())
+                self.assertEqual(path.read_bytes(), old_bytes[path])
 
     def test_non_primary_exterior_uses_the_same_fixed_root_contract(self) -> None:
         leaf = _deep_exterior_leaf()
@@ -833,12 +1190,16 @@ class PromotedExteriorDerivativeTests(unittest.TestCase):
             leaf.job,
             conditioning_mechanism=leaf.mechanism_id,
         )
+        missing = replace(missing, omega=leaf.job.root.omega)
         missing = replace(
             missing,
             primary_acceptance=replace(
                 missing.primary_acceptance,
                 derivative_authentication=None,
             ),
+        )
+        missing = _with_worker_receipt(
+            leaf.job, missing, 80, missing.omega
         )
         missing_backend = FixedRootOnlyBackend(leaf.job, missing)
         missing_result = run_promoted_exterior_component(
@@ -851,9 +1212,9 @@ class PromotedExteriorDerivativeTests(unittest.TestCase):
         self.assertFalse(missing_result["usable"])
         self.assertEqual(
             missing_result["derivative_evidence"]["failure_code"],
-            "MISSING_FREQUENCY_DERIVATIVE_AUTHENTICATION",
+            "FREQUENCY_DERIVATIVE_DISK_CONTAINS_ZERO",
         )
-        self.assertEqual(missing_backend.sample_amplitudes, [])
+        self.assertEqual(len(missing_backend.sample_amplitudes), 8)
 
         class NoisyBackend(FixedRootOnlyBackend):
             def sample_fixed_root_determinant(self, *args, **kwargs):
@@ -898,6 +1259,8 @@ class PromotedExteriorDerivativeTests(unittest.TestCase):
             leaf.job,
             conditioning_mechanism=leaf.mechanism_id,
         )
+        baseline = replace(baseline, omega=leaf.job.root.omega)
+        baseline = _with_worker_receipt(leaf.job, baseline, 80, baseline.omega)
         backend = FixedRootOnlyBackend(leaf.job, baseline)
 
         result = run_promoted_exterior_component(
@@ -908,15 +1271,14 @@ class PromotedExteriorDerivativeTests(unittest.TestCase):
         ).to_mapping()
 
         self.assertEqual(result["status"], "DERIVATIVE_UNRESOLVED")
-        self.assertEqual(backend.sample_amplitudes, [])
+        self.assertEqual(len(backend.sample_amplitudes), 8)
         self.assertEqual(
             result["derivative_evidence"]["failure_code"],
-            "DETERMINANT_ERROR_MODEL_UNAVAILABLE",
+            "FREQUENCY_DERIVATIVE_DISK_CONTAINS_ZERO",
         )
         self.assertEqual(
-            result["derivative_evidence"]["math_review_blocker"],
-            "TODO: [HUMAN MATH REVIEW REQUIRED - fixed-root exterior "
-            "determinant error model is unavailable]",
+            result["derivative_evidence"]["frequency_derivative_source"],
+            "fixed-root-frequency-h-h2-stencil/v1",
         )
 
     def test_component_result_rejects_coherently_resealed_sample_ladder(self) -> None:

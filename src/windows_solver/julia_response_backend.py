@@ -3144,7 +3144,7 @@ class JuliaPrecisionRootBackend:
         )
         evaluation = self.adapter.evaluate_for_validation(request)
         response = evaluation.response
-        fields = {
+        historical_fields = {
             "schema_version", "status", "operation", "request_sha256",
             "omega_re", "omega_im", "amplitude_re", "amplitude_im",
             "determinant_re", "determinant_im", "determinant_error_abs",
@@ -3154,10 +3154,14 @@ class JuliaPrecisionRootBackend:
             "semantic_precision_tier", "working_precision_bits",
             "readout_role",
         }
+        current_fields = historical_fields | {"numerical_conditioning"}
         if (
             not isinstance(response, Mapping)
-            or set(response) != fields
-            or response["schema_version"] != 1
+            or (
+                set(response) != historical_fields
+                and set(response) != current_fields
+            )
+            or response["schema_version"] not in {1, 2}
             or response["status"] != "ok"
             or response["operation"] != "fixed-root-determinant-sample"
             or response["request_sha256"] != evaluation.request_sha256
@@ -3174,6 +3178,32 @@ class JuliaPrecisionRootBackend:
             raise JuliaResponseBackendError(
                 "M02 fixed-root determinant sample response is invalid"
             )
+        if response["schema_version"] == 1:
+            if set(response) != historical_fields:
+                raise JuliaResponseBackendError(
+                    "historical M02 fixed-root sample fields are invalid"
+                )
+            numerical_conditioning = None
+        else:
+            if set(response) != current_fields:
+                raise JuliaResponseBackendError(
+                    "M02 fixed-root sample conditioning fields are invalid"
+                )
+            try:
+                numerical_conditioning = NumericalConditioningEvidence.from_mapping(
+                    response["numerical_conditioning"]
+                )
+            except ValueError as error:
+                raise JuliaResponseBackendError(
+                    "M02 fixed-root sample conditioning is invalid"
+                ) from error
+            if any(
+                getattr(numerical_conditioning, field) != value
+                for field, value in contract.items()
+            ):
+                raise JuliaResponseBackendError(
+                    "M02 fixed-root sample conditioning disagrees with request"
+                )
         response_omega = complex(
             float(_finite_decimal_text(response["omega_re"], "sample omega real")),
             float(_finite_decimal_text(response["omega_im"], "sample omega imaginary")),
@@ -3241,7 +3271,11 @@ class JuliaPrecisionRootBackend:
         request_binding = json.loads(canonical_json_bytes(request))
         response_binding = json.loads(canonical_json_bytes(dict(response)))
         receipt = {
-            "schema": "windows-solver.fixed-root-determinant-sample-receipt/1",
+            "schema": (
+                "windows-solver.fixed-root-determinant-sample-receipt/2"
+                if response["schema_version"] == 2
+                else "windows-solver.fixed-root-determinant-sample-receipt/1"
+            ),
             "request_binding": request_binding,
             "request_sha256": evaluation.request_sha256,
             "response_binding": response_binding,
@@ -3271,6 +3305,7 @@ class JuliaPrecisionRootBackend:
             precision_tier=precision_tier(response["semantic_precision_tier"]),
             working_precision_bits=response["working_precision_bits"],
             readout_role=readout_role,
+            numerical_conditioning=numerical_conditioning,
         )
 
     def read_root_with_predictor_kind(

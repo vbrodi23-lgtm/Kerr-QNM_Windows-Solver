@@ -140,6 +140,12 @@ PROMOTED_HORIZON_COMPONENT_V2_IDENTITY = (
 PROMOTED_HORIZON_RESPONSE_METHOD_V2 = (
     "bounded-analytic-horizon-from-promoted-primary-derivative/v2"
 )
+PROMOTED_HORIZON_COMPONENT_V3_IDENTITY = (
+    "root-sealed-horizon-fixed-frequency-derivative-component/v3"
+)
+PROMOTED_HORIZON_RESPONSE_METHOD_V3 = (
+    "bounded-analytic-horizon-from-sealed-frequency-derivative/v3"
+)
 PROMOTED_HORIZON_UNCERTAINTY_DERIVATION_IDENTITY = (
     "primary-root-controls-and-derivative-disk/v1"
 )
@@ -158,6 +164,14 @@ EXTERIOR_DERIVATIVE_RESPONSE_DISK_IDENTITY = (
     "exterior-derivative-response-disk/v1"
 )
 EXTERIOR_DERIVATIVE_METHOD = "direct-fixed-root-determinant-derivative/v1"
+FIXED_ROOT_FREQUENCY_DERIVATIVE_METHOD = (
+    "fixed-root-frequency-h-h2-stencil/v1"
+)
+PROMOTED_ROOT_SEAL_SCHEMA = "windows-solver.promoted-root-seal/1"
+PROMOTED_ROOT_SEAL_IDENTITY = "authenticated-promoted-root-seal/v1"
+ROOT_SEALED_RESPONSE_REPAIR_IDENTITY = (
+    "root-sealed-fixed-root-response-repair/v1"
+)
 FIXED_ROOT_AXIS_VALIDATION_IDENTITY = "fixed-root-holomorphic-axis-validation/v1"
 FULL_COMPLEX_LADDER_VALIDATION_IDENTITY = "full-complex-ladder-validation/v1"
 FULL_LADDER_VALIDATION_REASONS = frozenset({
@@ -4481,6 +4495,185 @@ def root_readout_preserves_authenticated_branch(
     )
 
 
+@dataclass(frozen=True, slots=True)
+class PromotedRootSeal:
+    """A replayable authorization to perform response work at one fixed root.
+
+    The seal intentionally knows nothing about a response, Dω authentication,
+    D_c samples, validation, or a response uncertainty disk.  It is derived
+    only from the accepted promoted root readout and the immutable job identity.
+    """
+
+    schema: str
+    identity: str
+    leaf_id: str
+    job_id: str
+    mechanism_id: str
+    policy_sha256: str
+    backend_identity_sha256: str
+    root_evidence_sha256: str
+    root_readout: RootReadout
+
+    def __post_init__(self) -> None:
+        if self.schema != PROMOTED_ROOT_SEAL_SCHEMA:
+            raise ValueError("promoted root seal schema is invalid")
+        if self.identity != PROMOTED_ROOT_SEAL_IDENTITY:
+            raise ValueError("promoted root seal identity is invalid")
+        if not all(
+            isinstance(value, str) and value
+            for value in (
+                self.leaf_id,
+                self.job_id,
+                self.mechanism_id,
+                self.policy_sha256,
+                self.backend_identity_sha256,
+                self.root_evidence_sha256,
+            )
+        ):
+            raise ValueError("promoted root seal identity is incomplete")
+        if (
+            _HEX_64.fullmatch(self.policy_sha256) is None
+            or _HEX_64.fullmatch(self.backend_identity_sha256) is None
+            or _HEX_64.fullmatch(self.root_evidence_sha256) is None
+        ):
+            raise ValueError("promoted root seal digest is invalid")
+        if not isinstance(self.root_readout, RootReadout):
+            raise ValueError("promoted root seal root readout is invalid")
+        if _sha256(self.root_readout.to_mapping()) != self.root_evidence_sha256:
+            raise ValueError("promoted root seal root evidence digest mismatch")
+
+    @property
+    def sha256(self) -> str:
+        return _sha256(self.to_mapping())
+
+    def to_mapping(self) -> dict[str, object]:
+        return {
+            "schema": self.schema,
+            "identity": self.identity,
+            "leaf_id": self.leaf_id,
+            "job_id": self.job_id,
+            "mechanism_id": self.mechanism_id,
+            "policy_sha256": self.policy_sha256,
+            "backend_identity_sha256": self.backend_identity_sha256,
+            "root_evidence_sha256": self.root_evidence_sha256,
+            "root_readout": self.root_readout.to_mapping(),
+        }
+
+    @classmethod
+    def from_mapping(cls, value: object) -> "PromotedRootSeal":
+        fields = {
+            "schema",
+            "identity",
+            "leaf_id",
+            "job_id",
+            "mechanism_id",
+            "policy_sha256",
+            "backend_identity_sha256",
+            "root_evidence_sha256",
+            "root_readout",
+        }
+        if not isinstance(value, Mapping) or set(value) != fields:
+            raise ValueError("promoted root seal fields are invalid")
+        return cls(
+            schema=str(value["schema"]),
+            identity=str(value["identity"]),
+            leaf_id=str(value["leaf_id"]),
+            job_id=str(value["job_id"]),
+            mechanism_id=str(value["mechanism_id"]),
+            policy_sha256=str(value["policy_sha256"]),
+            backend_identity_sha256=str(value["backend_identity_sha256"]),
+            root_evidence_sha256=str(value["root_evidence_sha256"]),
+            root_readout=RootReadout.from_mapping(value["root_readout"]),
+        )
+
+    @classmethod
+    def derive(
+        cls,
+        job: ResponseComponentJob,
+        root_readout: RootReadout,
+    ) -> "PromotedRootSeal":
+        seal = cls(
+            schema=PROMOTED_ROOT_SEAL_SCHEMA,
+            identity=PROMOTED_ROOT_SEAL_IDENTITY,
+            leaf_id=job.leaf_id,
+            job_id=job.job_id,
+            mechanism_id=job.mechanism_id,
+            policy_sha256=job.policy.identity_sha256,
+            backend_identity_sha256=job.backend_identity.identity_sha256,
+            root_evidence_sha256=_sha256(root_readout.to_mapping()),
+            root_readout=root_readout,
+        )
+        seal.validate_for(job)
+        return seal
+
+    def validate_for(self, job: ResponseComponentJob) -> None:
+        if (
+            self.leaf_id != job.leaf_id
+            or self.job_id != job.job_id
+            or self.mechanism_id != job.mechanism_id
+            or self.policy_sha256 != job.policy.identity_sha256
+            or self.backend_identity_sha256 != job.backend_identity.identity_sha256
+        ):
+            raise ValueError("promoted root seal job binding is invalid")
+        baseline = self.root_readout
+        if (
+            baseline.promoted_root_readout_policy != PROMOTED_ROOT_READOUT_POLICY
+            or not baseline.converged
+            or baseline.primary_acceptance is None
+            or not baseline.primary_acceptance.accepted
+        ):
+            raise ValueError("promoted root seal PRIMARY evidence is not accepted")
+        primary = baseline.primary_acceptance
+        if (
+            primary.policy_id != PROMOTED_ROOT_READOUT_POLICY
+            or primary.acceptance_metric != PROMOTED_ROOT_ACCEPTANCE_METRIC
+            or primary.correction_abs > primary.root_correction_tolerance
+        ):
+            raise ValueError("promoted root seal PRIMARY acceptance is invalid")
+        expected_source_root_mapping = _validated_source_root_mapping(
+            job.source_root_mapping
+        )
+        if (
+            baseline.root_reference_id != job.root.root_reference_id
+            or baseline.branch_id != job.root.branch_id
+            or baseline.equation_id != job.equation_id
+            or baseline.source_root_mapping != expected_source_root_mapping
+        ):
+            raise ValueError("promoted root seal branch evidence is invalid")
+        conditioning = baseline.numerical_conditioning
+        if (
+            conditioning is None
+            or conditioning.precision_limited
+            or conditioning.predicted_reliable_digits
+            < conditioning.required_reliable_digits
+        ):
+            raise ValueError("promoted root seal conditioning is inadequate")
+        for family, phase in (
+            ("truncation", "TRUNCATION"),
+            ("resolution", "RESOLUTION"),
+        ):
+            diagnostic = baseline.diagnostic_readouts.get(family)
+            evidence = (
+                None if diagnostic is None else diagnostic.fixed_root_evidence
+            )
+            if (
+                evidence is None
+                or evidence.root_phase != phase
+                or not evidence.accepted
+                or not evidence.branch_authenticated
+                or evidence.branch_identity != conditioning.branch_convention
+                or not evidence.fixed_root
+                or evidence.derivative_source != "PRIMARY_COMPLEX"
+                or evidence.primary_derivative != primary.derivative
+                or evidence.correction_abs > evidence.root_correction_tolerance
+                or diagnostic.omega_delta_from_primary != 0.0j
+            ):
+                raise ValueError(
+                    "promoted root seal fixed-root diagnostic evidence is invalid"
+                )
+
+
+
 class NativeDeterminantKernel(Protocol):
     def evaluate_root(
         self,
@@ -4536,6 +4729,7 @@ class FixedRootDeterminantSample:
     precision_tier: PrecisionTier
     working_precision_bits: int
     readout_role: str
+    numerical_conditioning: NumericalConditioningEvidence | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "omega", _finite_complex(self.omega, "sample omega"))
@@ -4577,6 +4771,13 @@ class FixedRootDeterminantSample:
                 raise ValueError(f"fixed-root sample {name} is invalid")
         if type(self.branch_authenticated) is not bool:
             raise ValueError("fixed-root sample branch evidence is invalid")
+        if (
+            self.numerical_conditioning is not None
+            and not isinstance(
+                self.numerical_conditioning, NumericalConditioningEvidence
+            )
+        ):
+            raise ValueError("fixed-root sample conditioning is invalid")
         if not _HEX_64.fullmatch(self.request_sha256):
             raise ValueError("fixed-root sample request digest is invalid")
         if not _HEX_64.fullmatch(self.worker_response_receipt_sha256):
@@ -4596,7 +4797,10 @@ class FixedRootDeterminantSample:
         if (
             set(receipt) != receipt_fields
             or receipt.get("schema")
-            != "windows-solver.fixed-root-determinant-sample-receipt/1"
+            not in {
+                "windows-solver.fixed-root-determinant-sample-receipt/1",
+                "windows-solver.fixed-root-determinant-sample-receipt/2",
+            }
             or not isinstance(request_binding, dict)
             or _sha256(request_binding) != self.request_sha256
             or receipt.get("request_sha256") != self.request_sha256
@@ -4626,6 +4830,27 @@ class FixedRootDeterminantSample:
             or not _HEX_64.fullmatch(receipt["scientific_runtime_sha256"])
         ):
             raise ValueError("fixed-root sample receipt identity mismatch")
+        response_schema = response_binding.get("schema_version")
+        if response_schema == 1:
+            if (
+                receipt.get("schema")
+                != "windows-solver.fixed-root-determinant-sample-receipt/1"
+                or self.numerical_conditioning is not None
+            ):
+                raise ValueError("historical fixed-root sample conditioning is invalid")
+        elif response_schema == 2:
+            if (
+                receipt.get("schema")
+                != "windows-solver.fixed-root-determinant-sample-receipt/2"
+            ):
+                raise ValueError("fixed-root sample receipt schema is invalid")
+            conditioning = NumericalConditioningEvidence.from_mapping(
+                response_binding.get("numerical_conditioning")
+            )
+            if self.numerical_conditioning != conditioning:
+                raise ValueError("fixed-root sample conditioning receipt mismatch")
+        else:
+            raise ValueError("fixed-root sample response schema is invalid")
         try:
             receipt_omega = complex(
                 float(response_binding["omega_re"]),
@@ -4687,6 +4912,13 @@ class FixedRootDeterminantSample:
         )
 
     @property
+    def exact_omega(self) -> DecimalComplex:
+        return DecimalComplex(
+            self._response_decimal("omega_re", "fixed-root sample omega real"),
+            self._response_decimal("omega_im", "fixed-root sample omega imaginary"),
+        )
+
+    @property
     def exact_determinant(self) -> DecimalComplex:
         return DecimalComplex(
             self._response_decimal(
@@ -4704,7 +4936,7 @@ class FixedRootDeterminantSample:
         )
 
     def to_mapping(self) -> dict[str, object]:
-        return {
+        mapping = {
             "amplitude": _complex_mapping(self.amplitude),
             "branch_authenticated": self.branch_authenticated,
             "branch_identity": self.branch_identity,
@@ -4722,6 +4954,11 @@ class FixedRootDeterminantSample:
             "worker_response_receipt_sha256": self.worker_response_receipt_sha256,
             "working_precision_bits": self.working_precision_bits,
         }
+        if self.numerical_conditioning is not None:
+            mapping["numerical_conditioning"] = (
+                self.numerical_conditioning.to_mapping()
+            )
+        return mapping
 
     @classmethod
     def from_mapping(cls, value: object) -> "FixedRootDeterminantSample":
@@ -4733,7 +4970,10 @@ class FixedRootDeterminantSample:
             "readout_role", "request_sha256", "worker_response_receipt",
             "worker_response_receipt_sha256", "working_precision_bits",
         }
-        if not isinstance(value, Mapping) or set(value) != fields:
+        current_fields = fields | {"numerical_conditioning"}
+        if not isinstance(value, Mapping) or (
+            set(value) != fields and set(value) != current_fields
+        ):
             raise ValueError("fixed-root determinant sample fields are invalid")
         return cls(
             omega=_complex_from_mapping(value["omega"], "sample omega"),
@@ -4754,6 +4994,13 @@ class FixedRootDeterminantSample:
             precision_tier=precision_tier(value["precision_tier"]),
             working_precision_bits=value["working_precision_bits"],
             readout_role=str(value["readout_role"]),
+            numerical_conditioning=(
+                None
+                if "numerical_conditioning" not in value
+                else NumericalConditioningEvidence.from_mapping(
+                    value["numerical_conditioning"]
+                )
+            ),
         )
 
 
@@ -4770,6 +5017,23 @@ def _validate_exterior_derivative_checkpoint_evidence(
     error_channels: Mapping[str, float],
 ) -> None:
     """Recompute a persisted fixed-root derivative certificate from samples."""
+
+    if (
+        evidence.get("frequency_derivative_source")
+        == FIXED_ROOT_FREQUENCY_DERIVATIVE_METHOD
+    ):
+        _validate_sealed_exterior_frequency_stencil_evidence(
+            evidence=evidence,
+            samples=samples,
+            baseline=baseline,
+            mechanism_id=mechanism_id,
+            job_id=job_id,
+            leaf_id=leaf_id,
+            status=status,
+            response=response,
+            error_channels=error_channels,
+        )
+        return
 
     if not samples:
         if status is not ComponentStatus.DERIVATIVE_UNRESOLVED:
@@ -4814,6 +5078,74 @@ def _validate_exterior_derivative_checkpoint_evidence(
     )
     if not isinstance(baseline_runtime_sha256, str):
         raise ValueError("component derivative baseline runtime receipt is missing")
+    response_repair = (
+        evidence.get("response_repair_identity")
+        == ROOT_SEALED_RESPONSE_REPAIR_IDENTITY
+    )
+    if response_repair:
+        try:
+            seal = PromotedRootSeal.from_mapping(evidence.get("root_seal"))
+        except ValueError as error:
+            raise ValueError(
+                "component root-sealed response repair seal is invalid"
+            ) from error
+        if (
+            evidence.get("root_seal_sha256") != seal.sha256
+            or seal.leaf_id != leaf_id
+            or seal.job_id != job_id
+            or seal.mechanism_id != mechanism_id
+            or seal.root_readout.to_mapping() != baseline.to_mapping()
+        ):
+            raise ValueError(
+                "component root-sealed response repair binding is invalid"
+            )
+        scope = evidence.get("response_repair_scope")
+        if not isinstance(scope, Mapping) or set(scope) != {
+            "schema",
+            "requested_families",
+            "recomputed_families",
+            "reused_families",
+        }:
+            raise ValueError("component root-sealed response repair scope is invalid")
+        if scope.get("schema") != "windows-solver.fixed-root-response-repair-scope/1":
+            raise ValueError("component root-sealed response repair scope is invalid")
+        requested = scope.get("requested_families")
+        recomputed = scope.get("recomputed_families")
+        reused = scope.get("reused_families")
+        if any(
+            not isinstance(value, list)
+            or value != sorted(set(value))
+            or any(item not in {"frequency", "coordinate"} for item in value)
+            for value in (requested, recomputed, reused)
+        ):
+            raise ValueError("component root-sealed response repair scope is invalid")
+        assert isinstance(recomputed, list)
+        assert isinstance(reused, list)
+        sample_families = {
+            "frequency"
+            if sample.readout_role.startswith("frequency-")
+            else "coordinate"
+            for sample in samples
+        }
+        if (
+            set(recomputed) & set(reused)
+            or set(recomputed) | set(reused) != sample_families
+        ):
+            raise ValueError("component root-sealed response repair scope is invalid")
+        sample_runtime_sha256s = {
+            sample.worker_response_receipt.get("scientific_runtime_sha256")
+            for sample in samples
+        }
+        if (
+            len(sample_runtime_sha256s) != 1
+            or not isinstance(next(iter(sample_runtime_sha256s)), str)
+        ):
+            raise ValueError(
+                "component root-sealed response sample runtimes disagree"
+            )
+        expected_sample_runtime_sha256 = next(iter(sample_runtime_sha256s))
+    else:
+        expected_sample_runtime_sha256 = baseline_runtime_sha256
     for sample, (role, amplitude) in zip(samples, expected):
         request = sample.worker_response_receipt["request_binding"]
         if (
@@ -4828,7 +5160,7 @@ def _validate_exterior_derivative_checkpoint_evidence(
             or request.get("job_id") != job_id
             or request.get("leaf_id") != leaf_id
             or sample.worker_response_receipt.get("scientific_runtime_sha256")
-            != baseline_runtime_sha256
+            != expected_sample_runtime_sha256
         ):
             raise ValueError(
                 "component fixed-root sample baseline omega, job, or runtime binding is invalid"
@@ -4922,6 +5254,214 @@ def _validate_exterior_derivative_checkpoint_evidence(
         }
         if evidence.get("imaginary_axis_validation") != expected_validation:
             raise ValueError("component imaginary-axis validation is not sample-derived")
+
+
+def _validate_sealed_exterior_frequency_stencil_evidence(
+    *,
+    evidence: dict[str, object],
+    samples: Sequence[FixedRootDeterminantSample],
+    baseline: RootReadout,
+    mechanism_id: str,
+    job_id: str,
+    leaf_id: str,
+    status: ComponentStatus,
+    response: complex | None,
+    error_channels: Mapping[str, float],
+) -> None:
+    """Authenticate a response-only Dω/D_c repair anchored to one root seal."""
+
+    if len(samples) != 8:
+        raise ValueError("sealed response repair requires two complete stencils")
+    try:
+        seal = PromotedRootSeal.from_mapping(evidence.get("root_seal"))
+    except ValueError as error:
+        raise ValueError("sealed response repair root seal is invalid") from error
+    if (
+        evidence.get("root_seal_sha256") != seal.sha256
+        or evidence.get("response_repair_identity")
+        != ROOT_SEALED_RESPONSE_REPAIR_IDENTITY
+        or seal.leaf_id != leaf_id
+        or seal.job_id != job_id
+        or seal.mechanism_id != mechanism_id
+        or seal.root_readout.to_mapping() != baseline.to_mapping()
+    ):
+        raise ValueError("sealed response repair root binding is invalid")
+    scope = evidence.get("response_repair_scope")
+    if not isinstance(scope, Mapping) or set(scope) != {
+        "schema",
+        "requested_families",
+        "recomputed_families",
+        "reused_families",
+    }:
+        raise ValueError("sealed response repair scope is invalid")
+    if scope.get("schema") != "windows-solver.fixed-root-response-repair-scope/1":
+        raise ValueError("sealed response repair scope is invalid")
+    requested = scope.get("requested_families")
+    recomputed = scope.get("recomputed_families")
+    reused = scope.get("reused_families")
+    if any(
+        not isinstance(value, list)
+        or value != sorted(set(value))
+        or any(item not in {"frequency", "coordinate"} for item in value)
+        for value in (requested, recomputed, reused)
+    ):
+        raise ValueError("sealed response repair scope is invalid")
+    assert isinstance(recomputed, list)
+    assert isinstance(reused, list)
+    if (
+        set(recomputed) & set(reused)
+        or set(recomputed) | set(reused) != {"frequency", "coordinate"}
+    ):
+        raise ValueError("sealed response repair scope is invalid")
+
+    frequency_samples = samples[:4]
+    coordinate_samples = samples[4:]
+    h = coordinate_samples[0].amplitude.real
+    if not math.isfinite(h) or h <= 0.0:
+        raise ValueError("sealed response repair coordinate step is invalid")
+    if any(sample.amplitude != 0.0j for sample in frequency_samples):
+        raise ValueError("sealed response repair frequency samples moved amplitude")
+    expected_frequency = (
+        ("frequency-real-plus-h", baseline.omega + complex(h, 0.0)),
+        ("frequency-real-minus-h", baseline.omega + complex(-h, 0.0)),
+        ("frequency-real-plus-h2", baseline.omega + complex(h / 2.0, 0.0)),
+        ("frequency-real-minus-h2", baseline.omega + complex(-h / 2.0, 0.0)),
+    )
+    expected_coordinate = (
+        ("coordinate-real-plus-h", complex(h, 0.0)),
+        ("coordinate-real-minus-h", complex(-h, 0.0)),
+        ("coordinate-real-plus-h2", complex(h / 2.0, 0.0)),
+        ("coordinate-real-minus-h2", complex(-h / 2.0, 0.0)),
+    )
+    conditioning = baseline.numerical_conditioning
+    contract = regularised_gsn_mechanism_contract(mechanism_id)
+    if conditioning is None:
+        raise ValueError("sealed response repair baseline conditioning is missing")
+    def family_runtime(
+        family_samples: Sequence[FixedRootDeterminantSample],
+        subject: str,
+    ) -> str:
+        runtimes = {
+            sample.worker_response_receipt.get("scientific_runtime_sha256")
+            for sample in family_samples
+        }
+        if (
+            len(runtimes) != 1
+            or not isinstance(next(iter(runtimes)), str)
+        ):
+            raise ValueError(f"sealed response repair {subject} runtimes disagree")
+        return next(iter(runtimes))
+
+    frequency_runtime_sha256 = family_runtime(frequency_samples, "frequency")
+    coordinate_runtime_sha256 = family_runtime(coordinate_samples, "coordinate")
+    frequency_first = frequency_samples[0]
+    coordinate_first = coordinate_samples[0]
+    for sample, (role, omega) in zip(frequency_samples, expected_frequency):
+        request = sample.worker_response_receipt["request_binding"]
+        if (
+            sample.readout_role != role
+            or sample.omega != omega
+            or sample.determinant_family != contract["determinant_family"]
+            or sample.determinant_normalisation
+            != contract["determinant_normalisation"]
+            or sample.branch_identity != conditioning.branch_convention
+            or sample.branch_authenticated is not True
+            or sample.precision_tier != frequency_first.precision_tier
+            or sample.working_precision_bits
+            != frequency_first.working_precision_bits
+            or request.get("job_id") != job_id
+            or request.get("leaf_id") != leaf_id
+            or sample.worker_response_receipt.get("scientific_runtime_sha256")
+            != frequency_runtime_sha256
+        ):
+            raise ValueError("sealed response repair frequency sample binding is invalid")
+    for sample, (role, amplitude) in zip(coordinate_samples, expected_coordinate):
+        request = sample.worker_response_receipt["request_binding"]
+        if (
+            sample.readout_role != role
+            or sample.omega != baseline.omega
+            or sample.amplitude != amplitude
+            or sample.determinant_family != contract["determinant_family"]
+            or sample.determinant_normalisation
+            != contract["determinant_normalisation"]
+            or sample.branch_identity != conditioning.branch_convention
+            or sample.branch_authenticated is not True
+            or sample.precision_tier != coordinate_first.precision_tier
+            or sample.working_precision_bits
+            != coordinate_first.working_precision_bits
+            or request.get("job_id") != job_id
+            or request.get("leaf_id") != leaf_id
+            or sample.worker_response_receipt.get("scientific_runtime_sha256")
+            != coordinate_runtime_sha256
+        ):
+            raise ValueError("sealed response repair coordinate sample binding is invalid")
+    if any(
+        sample.determinant_error_status != DETERMINANT_ERROR_AVAILABLE
+        or sample.determinant_error_model_id is None
+        for sample in samples
+    ):
+        if status is not ComponentStatus.DERIVATIVE_UNRESOLVED:
+            raise ValueError("unavailable sealed response errors were persisted usable")
+        return
+
+    coordinate, coordinate_coarse, coordinate_fine, coordinate_error, coordinate_disagreement = (
+        _fixed_root_coordinate_derivative(coordinate_samples, h)
+    )
+    frequency, frequency_coarse, frequency_fine, frequency_error, frequency_disagreement = (
+        _fixed_root_frequency_derivative(frequency_samples)
+    )
+    coordinate_decision = {
+        "accepted": abs(coordinate_fine) > coordinate.radius,
+        "identity": FIXED_ROOT_DERIVATIVE_CONDITIONING_IDENTITY,
+        "rejection_reason": None,
+        "selected_candidate": "h/2",
+    }
+    if not coordinate_decision["accepted"]:
+        coordinate_decision.update({
+            "rejection_reason": "DERIVATIVE_DISK_CONTAINS_ZERO",
+            "selected_candidate": None,
+        })
+    required = {
+        "coordinate_derivative_disk": coordinate.to_mapping(),
+        "conditioning_decision": coordinate_decision,
+        "frequency_derivative_disk": frequency.to_mapping(),
+        "frequency_derivative_source": FIXED_ROOT_FREQUENCY_DERIVATIVE_METHOD,
+        "frequency_derivative_radius_provenance": {
+            "identity": FIXED_ROOT_FREQUENCY_DERIVATIVE_METHOD,
+            "propagated_determinant_error_abs": frequency_error,
+            "raw_step_disagreement_abs": frequency_disagreement,
+            "selected_step": h / 2.0,
+        },
+        "frequency_fine_derivative": _complex_mapping(frequency_fine),
+        "frequency_real_h_derivative": _complex_mapping(frequency_coarse),
+        "frequency_propagated_determinant_error_abs": frequency_error,
+        "frequency_raw_step_disagreement_abs": frequency_disagreement,
+        "propagated_determinant_error_abs": coordinate_error,
+        "raw_step_disagreement_abs": coordinate_disagreement,
+    }
+    for name, value in required.items():
+        if evidence.get(name) != value:
+            raise ValueError(
+                f"sealed response repair evidence {name} is not sample-derived"
+            )
+    if (
+        not coordinate_decision["accepted"]
+        or abs(frequency_fine) <= frequency.radius
+    ):
+        if status is not ComponentStatus.DERIVATIVE_UNRESOLVED:
+            raise ValueError("unbounded sealed response was persisted usable")
+        return
+    expected_response = exterior_response_disk(
+        coordinate_derivative=coordinate,
+        frequency_derivative=frequency,
+    )
+    if (
+        status is not ComponentStatus.CONVERGED
+        or evidence.get("response_disk") != expected_response.to_mapping()
+        or response != expected_response.centre
+        or error_channels.get("resolution") != expected_response.radius
+    ):
+        raise ValueError("sealed response repair disk is not sample-derived")
 
 
 @dataclass(slots=True)
@@ -5321,6 +5861,23 @@ _PROMOTED_HORIZON_EVIDENCE_FIELDS = frozenset({
     "horizon_frequency_disk",
     "response_disk",
     "root_radius_provenance",
+    "root_seal",
+    "root_seal_sha256",
+    "uncertainty_derivation_identity",
+    "zero_containing_disk",
+})
+
+_PROMOTED_HORIZON_V3_EVIDENCE_FIELDS = frozenset({
+    "derivative_disk",
+    "derivative_radius_provenance",
+    "derivative_source",
+    "fixed_root_samples",
+    "horizon_frequency_disk",
+    "response_disk",
+    "response_repair_identity",
+    "root_radius_provenance",
+    "root_seal",
+    "root_seal_sha256",
     "uncertainty_derivation_identity",
     "zero_containing_disk",
 })
@@ -5341,19 +5898,14 @@ def _complex_disk_from_mapping(value: object, subject: str) -> ComplexDisk:
     )
 
 
-def _promoted_horizon_correction_evidence(
+def _promoted_horizon_root_correction_evidence(
     baseline: RootReadout,
-) -> tuple[dict[str, Decimal], DerivativeAuthenticationEvidence]:
+) -> dict[str, Decimal]:
     primary = baseline.primary_acceptance
-    authentication = (
-        None if primary is None else primary.derivative_authentication
-    )
     diagnostics = baseline.diagnostic_readouts
-    if primary is None or authentication is None or not isinstance(
-        diagnostics, Mapping
-    ):
+    if primary is None or not isinstance(diagnostics, Mapping):
         raise ValueError(
-            "promoted horizon checkpoint lacks PRIMARY derivative evidence"
+            "promoted horizon checkpoint lacks PRIMARY root evidence"
         )
     corrections = {"PRIMARY": primary.correction_abs}
     for family, phase in (
@@ -5367,6 +5919,20 @@ def _promoted_horizon_correction_evidence(
                 f"promoted horizon checkpoint lacks {phase} correction evidence"
             )
         corrections[phase] = fixed.correction_abs
+    return corrections
+
+
+def _promoted_horizon_correction_evidence(
+    baseline: RootReadout,
+) -> tuple[dict[str, Decimal], DerivativeAuthenticationEvidence]:
+    corrections = _promoted_horizon_root_correction_evidence(baseline)
+    primary = baseline.primary_acceptance
+    assert primary is not None
+    authentication = primary.derivative_authentication
+    if authentication is None:
+        raise ValueError(
+            "promoted horizon checkpoint lacks PRIMARY derivative evidence"
+        )
     return corrections, authentication
 
 
@@ -5383,6 +5949,15 @@ def _validate_promoted_horizon_checkpoint_evidence(
 
     if set(evidence) != _PROMOTED_HORIZON_EVIDENCE_FIELDS:
         raise ValueError("component analytic horizon evidence fields are invalid")
+    try:
+        root_seal = PromotedRootSeal.from_mapping(evidence["root_seal"])
+    except ValueError as error:
+        raise ValueError("component horizon root seal is invalid") from error
+    if (
+        evidence.get("root_seal_sha256") != root_seal.sha256
+        or root_seal.root_readout.to_mapping() != baseline.to_mapping()
+    ):
+        raise ValueError("component horizon root seal does not bind the baseline")
     if (
         evidence.get("uncertainty_derivation_identity")
         != PROMOTED_HORIZON_UNCERTAINTY_DERIVATION_IDENTITY
@@ -5528,9 +6103,10 @@ def _validate_promoted_horizon_checkpoint_evidence_for_job(
 ) -> None:
     """Bind a structurally valid horizon certificate to the selected Kerr job."""
 
-    if result.component_scientific_identity != (
-        PROMOTED_HORIZON_COMPONENT_V2_IDENTITY
-    ):
+    if result.component_scientific_identity not in {
+        PROMOTED_HORIZON_COMPONENT_V2_IDENTITY,
+        PROMOTED_HORIZON_COMPONENT_V3_IDENTITY,
+    }:
         return
     if not math.isfinite(job.spin) or abs(job.spin) >= 1.0:
         raise ValueError("component horizon job spin is invalid")
@@ -5547,7 +6123,10 @@ def _validate_promoted_horizon_checkpoint_evidence_for_job(
         + math.ulp(result.baseline.omega.imag)
         + abs(job.mode.m) * math.ulp(omega_h)
     )
-    corrections, _ = _promoted_horizon_correction_evidence(result.baseline)
+    # This job-binding check verifies only the root-derived numerator disk.
+    # V3 deliberately permits PRIMARY Dω authentication to be absent because
+    # it reconstructs Dω from the sealed fixed-frequency stencil.
+    corrections = _promoted_horizon_root_correction_evidence(result.baseline)
     expected_frequency = ComplexDisk(
         expected_centre,
         max(float(value) for value in corrections.values())
@@ -5562,6 +6141,183 @@ def _validate_promoted_horizon_checkpoint_evidence_for_job(
         != expected_frequency.to_mapping()
     ):
         raise ValueError("component horizon frequency disk is not job-derived")
+
+
+def _validate_root_sealed_horizon_checkpoint_evidence(
+    *,
+    evidence: Mapping[str, object],
+    baseline: RootReadout,
+    mechanism_id: str,
+    job_id: str,
+    leaf_id: str,
+    status: ComponentStatus,
+    response: complex | None,
+    closed_form_response: complex | None,
+    error_channels: Mapping[str, float],
+) -> None:
+    """Validate the rootless fixed-frequency Dω horizon response path."""
+
+    if set(evidence) != _PROMOTED_HORIZON_V3_EVIDENCE_FIELDS:
+        raise ValueError("root-sealed horizon evidence fields are invalid")
+    try:
+        seal = PromotedRootSeal.from_mapping(evidence["root_seal"])
+    except ValueError as error:
+        raise ValueError("root-sealed horizon seal is invalid") from error
+    if (
+        evidence.get("root_seal_sha256") != seal.sha256
+        or seal.root_readout.to_mapping() != baseline.to_mapping()
+        or seal.mechanism_id != mechanism_id
+        or seal.job_id != job_id
+        or seal.leaf_id != leaf_id
+        or evidence.get("response_repair_identity")
+        != ROOT_SEALED_RESPONSE_REPAIR_IDENTITY
+        or evidence.get("derivative_source")
+        != FIXED_ROOT_FREQUENCY_DERIVATIVE_METHOD
+        or evidence.get("uncertainty_derivation_identity")
+        != PROMOTED_HORIZON_UNCERTAINTY_DERIVATION_IDENTITY
+    ):
+        raise ValueError("root-sealed horizon evidence binding is invalid")
+
+    corrections = _promoted_horizon_root_correction_evidence(baseline)
+    root_provenance = evidence.get("root_radius_provenance")
+    if not isinstance(root_provenance, Mapping) or set(root_provenance) != {
+        "arithmetic_radius_abs", "correction_abs", "union_rule"
+    }:
+        raise ValueError("root-sealed horizon root provenance is invalid")
+    arithmetic_radius = root_provenance["arithmetic_radius_abs"]
+    if (
+        isinstance(arithmetic_radius, bool)
+        or not isinstance(arithmetic_radius, (int, float))
+        or not math.isfinite(float(arithmetic_radius))
+        or float(arithmetic_radius) < 0.0
+        or root_provenance.get("correction_abs")
+        != {name: str(value) for name, value in corrections.items()}
+        or root_provenance.get("union_rule")
+        != "max-accepted-correction-plus-arithmetic/v1"
+    ):
+        raise ValueError("root-sealed horizon root provenance is invalid")
+    frequency = _complex_disk_from_mapping(
+        evidence.get("horizon_frequency_disk"),
+        "root-sealed horizon frequency disk",
+    )
+    expected_frequency_radius = max(
+        float(value) for value in corrections.values()
+    ) + float(arithmetic_radius)
+    if frequency.radius != expected_frequency_radius:
+        raise ValueError("root-sealed horizon frequency radius is invalid")
+
+    raw_samples = evidence.get("fixed_root_samples")
+    if not isinstance(raw_samples, list) or len(raw_samples) != 4:
+        raise ValueError("root-sealed horizon frequency stencil is invalid")
+    samples = tuple(FixedRootDeterminantSample.from_mapping(item) for item in raw_samples)
+    if [sample.to_mapping() for sample in samples] != raw_samples:
+        raise ValueError("root-sealed horizon frequency samples are not canonical")
+    h = samples[0].omega.real - baseline.omega.real
+    if not math.isfinite(h) or h <= 0.0:
+        raise ValueError("root-sealed horizon frequency step is invalid")
+    contract = regularised_gsn_mechanism_contract(mechanism_id)
+    conditioning = baseline.numerical_conditioning
+    if conditioning is None:
+        raise ValueError("root-sealed horizon conditioning is missing")
+    expected = (
+        ("frequency-real-plus-h", baseline.omega + complex(h, 0.0)),
+        ("frequency-real-minus-h", baseline.omega + complex(-h, 0.0)),
+        ("frequency-real-plus-h2", baseline.omega + complex(h / 2.0, 0.0)),
+        ("frequency-real-minus-h2", baseline.omega + complex(-h / 2.0, 0.0)),
+    )
+    first = samples[0]
+    for sample, (role, omega) in zip(samples, expected):
+        receipt = sample.worker_response_receipt
+        request = receipt.get("request_binding")
+        if (
+            sample.readout_role != role
+            or sample.omega != omega
+            or sample.amplitude != 0.0j
+            or sample.determinant_family != contract["determinant_family"]
+            or sample.determinant_normalisation
+            != contract["determinant_normalisation"]
+            or sample.branch_identity != conditioning.branch_convention
+            or sample.branch_authenticated is not True
+            or sample.precision_tier != first.precision_tier
+            or sample.working_precision_bits != first.working_precision_bits
+            or not isinstance(request, Mapping)
+            or request.get("job_id") != job_id
+            or request.get("leaf_id") != leaf_id
+        ):
+            raise ValueError("root-sealed horizon frequency sample binding is invalid")
+    unavailable = any(
+        sample.determinant_error_status != DETERMINANT_ERROR_AVAILABLE
+        or sample.determinant_error_model_id is None
+        for sample in samples
+    )
+    if unavailable:
+        expected_provenance = {
+            "identity": FIXED_ROOT_FREQUENCY_DERIVATIVE_METHOD,
+            "failure_code": "DETERMINANT_ERROR_MODEL_UNAVAILABLE",
+        }
+        if (
+            evidence.get("derivative_disk") is not None
+            or evidence.get("derivative_radius_provenance")
+            != expected_provenance
+            or evidence.get("response_disk") is not None
+            or evidence.get("zero_containing_disk")
+            != "DETERMINANT_ERROR_MODEL_UNAVAILABLE"
+            or status is not ComponentStatus.DERIVATIVE_UNRESOLVED
+            or response is not None
+            or closed_form_response is not None
+            or any(float(value) != 0.0 for value in error_channels.values())
+        ):
+            raise ValueError("root-sealed horizon unavailable derivative is invalid")
+        return
+
+    derivative, coarse, fine, propagated_error, disagreement = (
+        _fixed_root_frequency_derivative(samples)
+    )
+    expected_provenance = {
+        "identity": FIXED_ROOT_FREQUENCY_DERIVATIVE_METHOD,
+        "propagated_determinant_error_abs": propagated_error,
+        "raw_step_disagreement_abs": disagreement,
+        "selected_step": h / 2.0,
+    }
+    if (
+        evidence.get("derivative_disk") != derivative.to_mapping()
+        or evidence.get("derivative_radius_provenance") != expected_provenance
+    ):
+        raise ValueError("root-sealed horizon derivative is not sample-derived")
+    try:
+        response_disk = horizon_response_disk(
+            horizon_frequency=frequency,
+            determinant_derivative=derivative,
+        )
+        expected_zero = None
+    except ZeroContainingDiskError as error:
+        response_disk = None
+        expected_zero = error.disk_name
+    if evidence.get("zero_containing_disk") != expected_zero:
+        raise ValueError("root-sealed horizon zero-disk decision is invalid")
+    if response_disk is None:
+        if (
+            evidence.get("response_disk") is not None
+            or status is not ComponentStatus.DERIVATIVE_UNRESOLVED
+            or response is not None
+            or closed_form_response is not None
+            or any(float(value) != 0.0 for value in error_channels.values())
+        ):
+            raise ValueError("root-sealed horizon unbounded response is invalid")
+        return
+    if (
+        evidence.get("response_disk") != response_disk.to_mapping()
+        or status is not ComponentStatus.CONVERGED
+        or response != response_disk.centre
+        or closed_form_response != response_disk.centre
+        or error_channels.get("resolution") != response_disk.radius
+        or any(
+            float(value) != 0.0
+            for name, value in error_channels.items()
+            if name != "resolution"
+        )
+    ):
+        raise ValueError("root-sealed horizon response is not derivative-derived")
 
 
 @dataclass(frozen=True, slots=True)
@@ -5663,14 +6419,49 @@ class ComponentResult:
                     sample.determinant_family,
                     sample.determinant_normalisation,
                     sample.branch_identity,
-                    sample.precision_tier,
-                    sample.working_precision_bits,
                 )
                 for sample in samples
             }
             if len(sample_identities) > 1:
                 raise ValueError(
                     "component fixed-root determinant sample identities disagree"
+                )
+            tiers_by_family: dict[str, set[tuple[PrecisionTier, int]]] = {
+                "frequency": set(),
+                "coordinate": set(),
+            }
+            for sample in samples:
+                family = (
+                    "frequency"
+                    if sample.readout_role.startswith("frequency-")
+                    else "coordinate"
+                    if sample.readout_role.startswith("coordinate-")
+                    else None
+                )
+                if family is None:
+                    raise ValueError(
+                        "component fixed-root determinant sample role is invalid"
+                    )
+                tiers_by_family[family].add(
+                    (sample.precision_tier, sample.working_precision_bits)
+                )
+            if any(len(tiers) > 1 for tiers in tiers_by_family.values()):
+                raise ValueError(
+                    "component fixed-root derivative family mixes precision tiers"
+                )
+            used_tiers = {
+                tier
+                for tiers in tiers_by_family.values()
+                for tier in tiers
+            }
+            if (
+                len(used_tiers) > 1
+                and normalized_derivative_evidence.get(
+                    "response_repair_identity"
+                ) != ROOT_SEALED_RESPONSE_REPAIR_IDENTITY
+            ):
+                raise ValueError(
+                    "component non-repair derivative mixes precision tiers"
                 )
             normalized_derivative_evidence["fixed_root_samples"] = [
                 sample.to_mapping() for sample in samples
@@ -5761,6 +6552,45 @@ class ComponentResult:
             _validate_promoted_horizon_checkpoint_evidence(
                 evidence=self.analytic_horizon_evidence,
                 baseline=self.baseline,
+                status=self.status,
+                response=self.response,
+                closed_form_response=self.closed_form_response,
+                error_channels=self.error_channels,
+            )
+        if self.component_scientific_identity == (
+            PROMOTED_HORIZON_COMPONENT_V3_IDENTITY
+        ):
+            bounded = self.response_uncertainty_status == BOUNDED_ANALYTIC_RESPONSE
+            unbounded = self.response_uncertainty_status == UNBOUNDED_ANALYTIC_RESPONSE
+            if (
+                self.mechanism_id != "horizon-admittance"
+                or self.response_method != PROMOTED_HORIZON_RESPONSE_METHOD_V3
+                or self.finite_amplitude_ladder_required
+                or self.finite_amplitude_ladder_executed
+                or self.finite_amplitude_readout_count != 0
+                or self.levels
+                or self.signed_root_crosscheck is not None
+                or self.analytic_horizon_evidence is None
+                or not (bounded or unbounded)
+                or (bounded and (
+                    self.response is None
+                    or self.status is not ComponentStatus.CONVERGED
+                ))
+                or (unbounded and (
+                    self.response is not None
+                    or self.status is not ComponentStatus.DERIVATIVE_UNRESOLVED
+                ))
+            ):
+                raise ValueError(
+                    "root-sealed horizon component evidence is inconsistent"
+                )
+            assert self.analytic_horizon_evidence is not None
+            _validate_root_sealed_horizon_checkpoint_evidence(
+                evidence=self.analytic_horizon_evidence,
+                baseline=self.baseline,
+                mechanism_id=self.mechanism_id,
+                job_id=self.job_id,
+                leaf_id=self.leaf_id,
                 status=self.status,
                 response=self.response,
                 closed_form_response=self.closed_form_response,
@@ -6100,6 +6930,92 @@ def _fixed_root_coordinate_derivative(
     return coordinate_disk, coarse, fine, fine_error, disagreement
 
 
+def _fixed_root_frequency_derivative(
+    samples: Sequence[FixedRootDeterminantSample],
+) -> tuple[ComplexDisk, complex, complex, float, float]:
+    """Return the h/h2 Dω disk from fixed-amplitude determinant samples."""
+
+    plus_h, minus_h, plus_half, minus_half = samples
+    decimal_digits = max(
+        50,
+        math.ceil(
+            max(sample.working_precision_bits for sample in samples)
+            * math.log10(2.0)
+        ) + 16,
+    )
+
+    def subtract(
+        left: DecimalComplex, right: DecimalComplex
+    ) -> DecimalComplex:
+        return DecimalComplex(
+            left.real - right.real,
+            left.imaginary - right.imaginary,
+        )
+
+    def divide(value: DecimalComplex, denominator: Decimal) -> DecimalComplex:
+        return DecimalComplex(
+            value.real / denominator,
+            value.imaginary / denominator,
+        )
+
+    def outward_nonnegative(value: Decimal) -> float:
+        converted = float(value)
+        if not math.isfinite(converted):
+            raise ValueError(
+                "fixed-root frequency derivative uncertainty is not representable"
+            )
+        if Decimal.from_float(converted) < value:
+            converted = math.nextafter(converted, math.inf)
+        return converted
+
+    with localcontext() as context:
+        context.prec = decimal_digits
+        if any(sample.exact_omega.imaginary != plus_h.exact_omega.imaginary
+               for sample in samples):
+            raise ValueError("fixed-root frequency stencil moved the imaginary axis")
+        coarse_denominator = (
+            plus_h.exact_omega.real - minus_h.exact_omega.real
+        )
+        fine_denominator = (
+            plus_half.exact_omega.real - minus_half.exact_omega.real
+        )
+        if coarse_denominator <= 0 or fine_denominator <= 0:
+            raise ValueError("fixed-root frequency derivative step is invalid")
+        coarse_exact = divide(
+            subtract(plus_h.exact_determinant, minus_h.exact_determinant),
+            coarse_denominator,
+        )
+        fine_exact = divide(
+            subtract(
+                plus_half.exact_determinant,
+                minus_half.exact_determinant,
+            ),
+            fine_denominator,
+        )
+        fine_error_exact = (
+            plus_half.exact_determinant_error_abs
+            + minus_half.exact_determinant_error_abs
+        ) / fine_denominator
+        disagreement_exact = subtract(fine_exact, coarse_exact).magnitude()
+        radius_exact = fine_error_exact + disagreement_exact
+        if radius_exact <= 0:
+            raise ValueError(
+                "fixed-root frequency derivative lacks non-exact uncertainty"
+            )
+        frequency_disk = _bounded_binary64_disk_from_decimal(
+            fine_exact,
+            radius_exact,
+            subject="fixed-root frequency derivative",
+        )
+        coarse = complex(float(coarse_exact.real), float(coarse_exact.imaginary))
+        fine = frequency_disk.centre
+        fine_error = outward_nonnegative(fine_error_exact)
+        disagreement = outward_nonnegative(disagreement_exact)
+    if frequency_disk.radius <= 0.0:
+        raise ValueError("fixed-root frequency derivative lacks non-exact uncertainty")
+    return frequency_disk, coarse, fine, fine_error, disagreement
+
+
 def full_ladder_validation_policy(reason: str) -> dict[str, str]:
     """Bind the expensive legacy ladder to one explicit validation reason."""
 
@@ -6193,10 +7109,15 @@ class _JournaledPromotedExteriorBackend:
         *,
         exact_request_binding: bool = False,
         scientific_runtime_sha256: str | None = None,
+        expected_omega_by_role: Mapping[str, complex] | None = None,
     ) -> None:
         self._backend = backend
         self._journal = journal
         self._units_by_role = dict(units_by_role)
+        self._expected_omega_by_role = {
+            role: complex(omega)
+            for role, omega in (expected_omega_by_role or {}).items()
+        }
         self._exact_request_binding = exact_request_binding
         if scientific_runtime_sha256 is not None and (
             not isinstance(scientific_runtime_sha256, str)
@@ -6323,7 +7244,14 @@ class _JournaledPromotedExteriorBackend:
         readout_role: str,
     ) -> FixedRootDeterminantSample:
         unit = self._units_by_role.get(readout_role)
-        if unit is None or unit.amplitude != complex(amplitude):
+        if (
+            unit is None
+            or unit.amplitude != complex(amplitude)
+            or (
+                readout_role in self._expected_omega_by_role
+                and self._expected_omega_by_role[readout_role] != complex(omega)
+            )
+        ):
             raise ValueError("fixed-root readout is outside the journal plan")
         reused = self._reuse(readout_role, "fixed-root-determinant-sample")
         if reused is not None:
@@ -6344,6 +7272,23 @@ class _JournaledPromotedExteriorBackend:
         validator = getattr(self._backend, "validate_component_result", None)
         if validator is not None:
             validator(job, result)
+
+    def scientific_runtime_for(
+        self, job: ResponseComponentJob
+    ) -> Mapping[str, object]:
+        """Expose the underlying response-runtime receipt without root access."""
+
+        provider = getattr(self._backend, "scientific_runtime_for", None)
+        if not callable(provider):
+            raise ValueError(
+                "journaled promoted backend lacks scientific runtime identity"
+            )
+        runtime = provider(job)
+        if not isinstance(runtime, Mapping):
+            raise ValueError(
+                "journaled promoted backend scientific runtime is invalid"
+            )
+        return runtime
 
 
 class _JournaledComponentReads:
@@ -6535,18 +7480,9 @@ def _journaled_promoted_exterior_backend(
         raise ValueError("journaled promoted backend lacks a semantic precision tier")
     tier = precision_tier(raw_tier)
     contract = regularised_gsn_mechanism_contract(job.mechanism_id)
-    planned = [
-        (0.0j, "baseline-root"),
-        (complex(derivative_step, 0.0), "coordinate-real-plus-h"),
-        (complex(-derivative_step, 0.0), "coordinate-real-minus-h"),
-        (complex(derivative_step / 2.0, 0.0), "coordinate-real-plus-h2"),
-        (complex(-derivative_step / 2.0, 0.0), "coordinate-real-minus-h2"),
-    ]
-    if validation_reason is not None:
-        planned.extend((
-            (complex(0.0, derivative_step / 2.0), "coordinate-imaginary-plus-h2"),
-            (complex(0.0, -derivative_step / 2.0), "coordinate-imaginary-minus-h2"),
-        ))
+    # Root sealing is a checkpoint boundary: this journal owns only the root.
+    # Response samples are planned in a separate seal-bound journal below.
+    planned = [(0.0j, "baseline-root")]
     units: dict[str, PartialComponentWorkUnit] = {}
     preview_root = getattr(backend, "preview_root_request", None)
     preview_fixed = getattr(backend, "preview_fixed_root_request", None)
@@ -6606,6 +7542,7 @@ def _journaled_promoted_exterior_backend(
     journal_identity = {
         "job_id": job.job_id,
         "component_scientific_identity": EXTERIOR_DERIVATIVE_COMPONENT_IDENTITY,
+        "workflow_identity": PROMOTED_ROOT_SEAL_IDENTITY,
         "plan_sha256": _sha256(list(expected)),
     }
     if scientific_runtime_sha256 is not None:
@@ -6632,15 +7569,235 @@ def _journaled_promoted_exterior_backend(
     )
 
 
-def run_promoted_exterior_component(
+def _requires_fixed_root_frequency_stencil(
+    baseline: RootReadout,
+) -> bool:
+    primary = baseline.primary_acceptance
+    authentication = (
+        None if primary is None else primary.derivative_authentication
+    )
+    return not (
+        authentication is not None
+        and authentication.determinant_error_status == DETERMINANT_ERROR_AVAILABLE
+        and primary is not None
+        and primary.error_model_id is not None
+        and authentication.determinant_error_model_id == primary.error_model_id
+    )
+
+
+def _journaled_promoted_exterior_response_backend(
     job: ResponseComponentJob,
     backend: RootReadoutBackend,
-    primary_predictor: complex,
+    *,
+    seal: PromotedRootSeal,
+    derivative_step: float,
+    validation_reason: str | None,
+    repair_families: frozenset[str] | None = None,
+) -> RootReadoutBackend:
+    """Journal response-only work under a seal-bound immutable sample plan."""
+
+    root_text = os.environ.get("KERR_QNM_PARTIAL_COMPONENT_JOURNAL_ROOT", "")
+    if not root_text.strip():
+        return backend
+    raw_tier = getattr(backend, "sample_tier", None)
+    if raw_tier is None:
+        raw_tier = {
+            40: PrecisionTier.BIGFLOAT_40,
+            80: PrecisionTier.BIGFLOAT_80,
+            120: PrecisionTier.BIGFLOAT_120,
+        }.get(getattr(backend, "digits", None))
+    if raw_tier is None:
+        raise ValueError("sealed response backend lacks a semantic precision tier")
+    tier = precision_tier(raw_tier)
+    baseline = seal.root_readout
+    families = (
+        frozenset({"frequency", "coordinate"})
+        if repair_families is None
+        else frozenset(repair_families)
+    )
+    if not families or not families.issubset({"frequency", "coordinate"}):
+        raise ValueError("sealed response repair families are invalid")
+    planned: list[tuple[complex, complex, str]] = []
+    if (
+        "frequency" in families
+        and _requires_fixed_root_frequency_stencil(baseline)
+    ):
+        planned.extend((
+            (baseline.omega + complex(derivative_step, 0.0), 0.0j, "frequency-real-plus-h"),
+            (baseline.omega + complex(-derivative_step, 0.0), 0.0j, "frequency-real-minus-h"),
+            (baseline.omega + complex(derivative_step / 2.0, 0.0), 0.0j, "frequency-real-plus-h2"),
+            (baseline.omega + complex(-derivative_step / 2.0, 0.0), 0.0j, "frequency-real-minus-h2"),
+        ))
+    if "coordinate" in families:
+        planned.extend((
+            (baseline.omega, complex(derivative_step, 0.0), "coordinate-real-plus-h"),
+            (baseline.omega, complex(-derivative_step, 0.0), "coordinate-real-minus-h"),
+            (baseline.omega, complex(derivative_step / 2.0, 0.0), "coordinate-real-plus-h2"),
+            (baseline.omega, complex(-derivative_step / 2.0), "coordinate-real-minus-h2"),
+        ))
+    if validation_reason is not None:
+        planned.extend((
+            (baseline.omega, complex(0.0, derivative_step / 2.0), "coordinate-imaginary-plus-h2"),
+            (baseline.omega, complex(0.0, -derivative_step / 2.0), "coordinate-imaginary-minus-h2"),
+        ))
+    contract = regularised_gsn_mechanism_contract(job.mechanism_id)
+    preview_fixed = getattr(backend, "preview_fixed_root_request", None)
+    exact_request_binding = callable(preview_fixed)
+    scientific_runtime_sha256 = None
+    if exact_request_binding:
+        runtime_provider = getattr(backend, "scientific_runtime_for", None)
+        if not callable(runtime_provider):
+            raise ValueError("sealed response backend lacks scientific runtime identity")
+        runtime = runtime_provider(job)
+        if not isinstance(runtime, Mapping):
+            raise ValueError("sealed response backend scientific runtime is invalid")
+        scientific_runtime_sha256 = _sha256(runtime)
+    units: dict[str, PartialComponentWorkUnit] = {}
+    expected_omega: dict[str, complex] = {}
+    for omega, amplitude, role in planned:
+        request_binding = (
+            preview_fixed(job, omega, amplitude, role)
+            if callable(preview_fixed)
+            else {
+                "amplitude": _complex_mapping(amplitude),
+                "component_scientific_identity": ROOT_SEALED_RESPONSE_REPAIR_IDENTITY,
+                "job_id": job.job_id,
+                "leaf_id": job.leaf_id,
+                "omega": _complex_mapping(omega),
+                "policy_sha256": job.policy.identity_sha256,
+                "precision_tier": tier.value,
+                "readout_role": role,
+                "root_seal_sha256": seal.sha256,
+                "validation_reason": validation_reason,
+            }
+        )
+        units[role] = PartialComponentWorkUnit(
+            component_scientific_identity=ROOT_SEALED_RESPONSE_REPAIR_IDENTITY,
+            leaf_id=job.leaf_id,
+            job_id=job.job_id,
+            policy_sha256=job.policy.identity_sha256,
+            backend_identity=job.backend_identity.identity_sha256,
+            determinant_family=str(contract["determinant_family"]),
+            determinant_normalisation=str(contract["determinant_normalisation"]),
+            precision_tier=tier,
+            mpfr_bits=working_precision_bits(tier),
+            amplitude=amplitude,
+            epsilon=abs(amplitude),
+            readout_role=role,
+            refinement_level=int(getattr(backend, "refinement", 0)),
+            request_sha256=_sha256(request_binding),
+            root_seal_sha256=seal.sha256,
+        )
+        expected_omega[role] = omega
+    expected = tuple(unit.work_unit_id for unit in units.values())
+    journal_identity = {
+        "job_id": job.job_id,
+        "component_scientific_identity": ROOT_SEALED_RESPONSE_REPAIR_IDENTITY,
+        "root_seal_sha256": seal.sha256,
+        "repair_families": sorted(families),
+        "plan_sha256": _sha256(list(expected)),
+    }
+    if scientific_runtime_sha256 is not None:
+        journal_identity["scientific_runtime_sha256"] = scientific_runtime_sha256
+    journal_path = Path(root_text) / (_sha256(journal_identity) + ".json")
+    journal = (
+        PartialComponentJournal.load(journal_path)
+        if journal_path.exists()
+        else PartialComponentJournal.create(
+            journal_path, expected_work_unit_ids=expected
+        )
+    )
+    if journal.expected_work_unit_ids != expected:
+        raise ValueError("sealed response journal plan identity mismatch")
+    return _JournaledPromotedExteriorBackend(
+        backend,
+        journal,
+        units,
+        exact_request_binding=exact_request_binding,
+        scientific_runtime_sha256=scientific_runtime_sha256,
+        expected_omega_by_role=expected_omega,
+    )
+
+
+_FIXED_ROOT_FREQUENCY_STENCIL_ROLE_ORDER = (
+    "frequency-real-plus-h",
+    "frequency-real-minus-h",
+    "frequency-real-plus-h2",
+    "frequency-real-minus-h2",
+)
+_FIXED_ROOT_COORDINATE_STENCIL_ROLE_ORDER = (
+    "coordinate-real-plus-h",
+    "coordinate-real-minus-h",
+    "coordinate-real-plus-h2",
+    "coordinate-real-minus-h2",
+)
+
+
+def _reusable_sealed_stencil(
+    prior: ComponentResult | None,
+    seal: PromotedRootSeal,
+    roles: tuple[str, ...],
+) -> tuple[FixedRootDeterminantSample, ...] | None:
+    """Extract one complete, seal-bound derivative family for reuse.
+
+    The prior result is never treated as a new receipt.  We retain only a
+    complete named h/h2 family whose stored seal exactly equals this response
+    job's immutable root seal.  Any malformed or incomplete family is simply
+    not reusable and must be sampled again at the current response tier.
+    """
+
+    if prior is None or prior.derivative_evidence is None:
+        return None
+    if (
+        prior.job_id != seal.job_id
+        or prior.leaf_id != seal.leaf_id
+        or prior.mechanism_id != seal.mechanism_id
+        or prior.baseline.to_mapping() != seal.root_readout.to_mapping()
+    ):
+        return None
+    evidence = prior.derivative_evidence
+    if (
+        evidence.get("root_seal_sha256") != seal.sha256
+        or evidence.get("response_repair_identity")
+        not in {None, ROOT_SEALED_RESPONSE_REPAIR_IDENTITY}
+    ):
+        return None
+    raw_seal = evidence.get("root_seal")
+    try:
+        stored_seal = PromotedRootSeal.from_mapping(raw_seal)
+    except ValueError:
+        return None
+    if stored_seal.to_mapping() != seal.to_mapping():
+        return None
+    raw_samples = evidence.get("fixed_root_samples")
+    if not isinstance(raw_samples, list):
+        return None
+    try:
+        samples = tuple(FixedRootDeterminantSample.from_mapping(raw) for raw in raw_samples)
+    except ValueError:
+        return None
+    by_role = {sample.readout_role: sample for sample in samples}
+    if len(by_role) != len(samples) or any(role not in by_role for role in roles):
+        return None
+    return tuple(by_role[role] for role in roles)
+
+
+def run_promoted_exterior_response_from_seal(
+    job: ResponseComponentJob,
+    backend: RootReadoutBackend,
+    seal: PromotedRootSeal,
     *,
     derivative_step: float,
     validation_reason: str | None = None,
+    repair_families: frozenset[str] | None = None,
+    reusable_result: ComponentResult | None = None,
 ) -> ComponentResult:
-    """Compute ``-D_c/D_omega`` without solving a perturbed root."""
+    """Recover ``-D_c/D_omega`` at an already authenticated fixed root.
+
+    This entry point deliberately has no root-read API in its control flow.
+    Any backend that exposes one is treated solely as a fixed-root determinant
+    sampler; the supplied seal is the only permissible baseline.
+    """
 
     if job.mechanism_id not in _EXTERIOR_PROFILE_IDS:
         raise ValueError("promoted exterior runner requires an exterior job")
@@ -6654,95 +7811,65 @@ def run_promoted_exterior_component(
         raise ValueError("exterior derivative step must be finite and positive")
     if backend.identity != job.backend_identity:
         raise ValueError("response backend identity does not match job")
-    predictor = _finite_complex(primary_predictor, "PRIMARY root predictor")
     binder = getattr(backend, "bind_job", None)
     if binder is not None:
         job = binder(job)
-    backend = _journaled_promoted_exterior_backend(
-        job,
-        backend,
-        predictor=predictor,
-        derivative_step=step,
-        validation_reason=validation_reason,
+    if backend.identity != job.backend_identity:
+        raise ValueError("bound response backend identity does not match job")
+    seal.validate_for(job)
+    requested_families = (
+        frozenset({"frequency", "coordinate"})
+        if repair_families is None
+        else frozenset(repair_families)
     )
-    baseline = backend.read_root(job, 0.0j, primary_predictor=predictor)
-    initial_status = _identity_status(job, baseline)
-    if initial_status is not None:
-        return _validated_result(
-            backend, job, _unresolved_result(job, initial_status, baseline, ())
-        )
+    if (
+        not requested_families
+        or not requested_families.issubset({"frequency", "coordinate"})
+    ):
+        raise ValueError("sealed response repair families are invalid")
+    baseline = seal.root_readout
     primary = baseline.primary_acceptance
-    if (
-        primary is not None
-        and primary.accepted
-        and primary.derivative_authentication is None
-    ):
-        result = _unresolved_promoted_exterior_derivative(
-            job,
-            baseline,
-            {
-                "conditioning_decision": {
-                    "accepted": False,
-                    "identity": FIXED_ROOT_DERIVATIVE_CONDITIONING_IDENTITY,
-                    "rejection_reason": (
-                        "MISSING_FREQUENCY_DERIVATIVE_AUTHENTICATION"
-                    ),
-                    "selected_candidate": None,
-                },
-                "determinant_count": 0,
-                "failure_code": (
-                    "MISSING_FREQUENCY_DERIVATIVE_AUTHENTICATION"
-                ),
-                "fixed_root_samples": [],
-                "response_disk_identity": (
-                    EXTERIOR_DERIVATIVE_RESPONSE_DISK_IDENTITY
-                ),
-            },
-        )
-        return _validated_result(backend, job, result)
-    frequency_authentication = _validate_promoted_exterior_baseline(job, baseline)
     assert primary is not None
-    if (
-        frequency_authentication.determinant_error_status
-        != DETERMINANT_ERROR_AVAILABLE
-        or primary.error_model_id is None
-        or frequency_authentication.determinant_error_model_id
-        != primary.error_model_id
-    ):
-        result = _unresolved_promoted_exterior_derivative(
-            job,
-            baseline,
-            {
-                "conditioning_decision": {
-                    "accepted": False,
-                    "identity": FIXED_ROOT_DERIVATIVE_CONDITIONING_IDENTITY,
-                    "rejection_reason": "DETERMINANT_ERROR_MODEL_UNAVAILABLE",
-                    "selected_candidate": None,
-                },
-                "determinant_count": 0,
-                "determinant_error_provenance": {
-                    "derivative_status": (
-                        frequency_authentication.determinant_error_status
-                    ),
-                    "derivative_model_id": (
-                        frequency_authentication.determinant_error_model_id
-                    ),
-                    "primary_model_id": primary.error_model_id,
-                },
-                "failure_code": "DETERMINANT_ERROR_MODEL_UNAVAILABLE",
-                "fixed_root_samples": [],
-                "math_review_blocker": (
-                    EXTERIOR_DETERMINANT_ERROR_MATH_REVIEW_BLOCKER
-                ),
-                "response_disk_identity": (
-                    EXTERIOR_DERIVATIVE_RESPONSE_DISK_IDENTITY
-                ),
-            },
-        )
-        return _validated_result(backend, job, result)
     sample_operation = getattr(backend, "sample_fixed_root_determinant", None)
     if not callable(sample_operation):
         raise ValueError("fixed-root determinant sample boundary is unavailable")
+
+    frequency_authentication = primary.derivative_authentication
+    use_primary_frequency = not _requires_fixed_root_frequency_stencil(
+        baseline
+    )
+    frequency_samples: tuple[FixedRootDeterminantSample, ...] = ()
+    reused_families: set[str] = set()
+    recomputed_families: set[str] = set()
+    if not use_primary_frequency:
+        reusable_frequency = (
+            None
+            if "frequency" in requested_families
+            else _reusable_sealed_stencil(
+                reusable_result,
+                seal,
+                _FIXED_ROOT_FREQUENCY_STENCIL_ROLE_ORDER,
+            )
+        )
+        if reusable_frequency is not None:
+            frequency_samples = reusable_frequency
+            reused_families.add("frequency")
+        else:
+            frequency_samples = tuple(
+                sample_operation(
+                    job,
+                    baseline.omega + offset,
+                    0.0j,
+                    readout_role=role,
+                )
+                for offset, role in (
+                    (complex(step, 0.0), "frequency-real-plus-h"),
+                    (complex(-step, 0.0), "frequency-real-minus-h"),
+                    (complex(step / 2.0, 0.0), "frequency-real-plus-h2"),
+                    (complex(-step / 2.0), "frequency-real-minus-h2"),
+                )
+            )
+            recomputed_families.add("frequency")
 
     amplitudes_and_roles = (
         (complex(step, 0.0), "coordinate-real-plus-h"),
@@ -6750,15 +7877,29 @@ def run_promoted_exterior_component(
         (complex(step / 2.0, 0.0), "coordinate-real-plus-h2"),
         (complex(-step / 2.0, 0.0), "coordinate-real-minus-h2"),
     )
-    samples = tuple(
-        sample_operation(
-            job,
-            baseline.omega,
-            amplitude,
-            readout_role=role,
+    reusable_coordinate = (
+        None
+        if "coordinate" in requested_families
+        else _reusable_sealed_stencil(
+            reusable_result,
+            seal,
+            _FIXED_ROOT_COORDINATE_STENCIL_ROLE_ORDER,
         )
-        for amplitude, role in amplitudes_and_roles
     )
+    if reusable_coordinate is not None:
+        samples = reusable_coordinate
+        reused_families.add("coordinate")
+    else:
+        samples = tuple(
+            sample_operation(
+                job,
+                baseline.omega,
+                amplitude,
+                readout_role=role,
+            )
+            for amplitude, role in amplitudes_and_roles
+        )
+        recomputed_families.add("coordinate")
     imaginary_axis_validation = None
     if validation_reason is not None:
         imaginary_step = step / 2.0
@@ -6778,7 +7919,36 @@ def run_promoted_exterior_component(
     expected_contract = regularised_gsn_mechanism_contract(job.mechanism_id)
     assert baseline.numerical_conditioning is not None
     expected_branch_identity = baseline.numerical_conditioning.branch_convention
-    first = samples[0]
+    all_samples = (*frequency_samples, *samples)
+    frequency_first = (
+        None if not frequency_samples else frequency_samples[0]
+    )
+    coordinate_first = samples[0]
+    frequency_expected = (
+        (baseline.omega + complex(step, 0.0), 0.0j, "frequency-real-plus-h"),
+        (baseline.omega + complex(-step, 0.0), 0.0j, "frequency-real-minus-h"),
+        (baseline.omega + complex(step / 2.0, 0.0), 0.0j, "frequency-real-plus-h2"),
+        (baseline.omega + complex(-step / 2.0, 0.0), 0.0j, "frequency-real-minus-h2"),
+    )
+    for sample, (omega, amplitude, role) in zip(
+        frequency_samples, frequency_expected
+    ):
+        if (
+            not isinstance(sample, FixedRootDeterminantSample)
+            or sample.omega != omega
+            or sample.amplitude != amplitude
+            or sample.readout_role != role
+            or not sample.branch_authenticated
+            or sample.branch_identity != expected_branch_identity
+            or sample.determinant_family != expected_contract["determinant_family"]
+            or sample.determinant_normalisation
+            != expected_contract["determinant_normalisation"]
+            or frequency_first is None
+            or sample.precision_tier != frequency_first.precision_tier
+            or sample.working_precision_bits
+            != frequency_first.working_precision_bits
+        ):
+            raise ValueError("fixed-root frequency determinant sample binding is invalid")
     expected_samples = (*amplitudes_and_roles, *((
         (complex(0.0, step / 2.0), "coordinate-imaginary-plus-h2"),
         (complex(0.0, -step / 2.0), "coordinate-imaginary-minus-h2"),
@@ -6794,13 +7964,20 @@ def run_promoted_exterior_component(
             or sample.determinant_family != expected_contract["determinant_family"]
             or sample.determinant_normalisation
             != expected_contract["determinant_normalisation"]
-            or sample.precision_tier != first.precision_tier
-            or sample.working_precision_bits != first.working_precision_bits
+            or sample.precision_tier != coordinate_first.precision_tier
+            or sample.working_precision_bits
+            != coordinate_first.working_precision_bits
         ):
             raise ValueError("fixed-root determinant sample binding is invalid")
+    response_repair_scope = {
+        "schema": "windows-solver.fixed-root-response-repair-scope/1",
+        "requested_families": sorted(requested_families),
+        "recomputed_families": sorted(recomputed_families),
+        "reused_families": sorted(reused_families),
+    }
     unavailable_samples = tuple(
         sample
-        for sample in samples
+        for sample in all_samples
         if sample.determinant_error_status != DETERMINANT_ERROR_AVAILABLE
         or sample.determinant_error_model_id is None
     )
@@ -6818,10 +7995,10 @@ def run_promoted_exterior_component(
                         "rejection_reason": "DETERMINANT_ERROR_MODEL_UNAVAILABLE",
                         "selected_candidate": None,
                     },
-                    "determinant_count": len(samples),
+                    "determinant_count": len(all_samples),
                     "failure_code": "DETERMINANT_ERROR_MODEL_UNAVAILABLE",
                     "fixed_root_samples": [
-                        sample.to_mapping() for sample in samples
+                        sample.to_mapping() for sample in all_samples
                     ],
                     "math_review_blocker": (
                         EXTERIOR_DETERMINANT_ERROR_MATH_REVIEW_BLOCKER
@@ -6829,6 +8006,12 @@ def run_promoted_exterior_component(
                     "response_disk_identity": (
                         EXTERIOR_DERIVATIVE_RESPONSE_DISK_IDENTITY
                     ),
+                    "root_seal": seal.to_mapping(),
+                    "root_seal_sha256": seal.sha256,
+                    "response_repair_identity": (
+                        ROOT_SEALED_RESPONSE_REPAIR_IDENTITY
+                    ),
+                    "response_repair_scope": response_repair_scope,
                 },
             ),
         )
@@ -6853,12 +8036,18 @@ def run_promoted_exterior_component(
             {
                 "conditioning_decision": conditioning_decision,
                 "coordinate_derivative_disk": coordinate_disk.to_mapping(),
-                "determinant_count": len(samples),
+                "determinant_count": len(all_samples),
                 "failure_code": "NO_ADMISSIBLE_FIXED_ROOT_DERIVATIVE_STEP",
-                "fixed_root_samples": [sample.to_mapping() for sample in samples],
+                "fixed_root_samples": [sample.to_mapping() for sample in all_samples],
                 "propagated_determinant_error_abs": propagated_error,
                 "raw_step_disagreement_abs": disagreement,
                 "response_disk_identity": EXTERIOR_DERIVATIVE_RESPONSE_DISK_IDENTITY,
+                "root_seal": seal.to_mapping(),
+                "root_seal_sha256": seal.sha256,
+                "response_repair_identity": (
+                    ROOT_SEALED_RESPONSE_REPAIR_IDENTITY
+                ),
+                "response_repair_scope": response_repair_scope,
             },
         )
         return _validated_result(backend, job, result)
@@ -6882,21 +8071,108 @@ def run_promoted_exterior_component(
         }
         if not imaginary_axis_validation["agrees"]:
             raise ValueError("fixed-root derivative axes disagree")
-    frequency_radius = float(
-        frequency_authentication.propagated_error_abs
-        + frequency_authentication.step_disagreement_abs
-    )
-    if frequency_radius <= 0.0:
-        raise ValueError(
-            "promoted PRIMARY derivative lacks non-exact uncertainty"
+    if use_primary_frequency:
+        assert frequency_authentication is not None
+        frequency_radius = float(
+            frequency_authentication.propagated_error_abs
+            + frequency_authentication.step_disagreement_abs
         )
-    frequency_disk = ComplexDisk(
-        complex(
-            float(frequency_authentication.derivative_re),
-            float(frequency_authentication.derivative_im),
-        ),
-        frequency_radius,
-    )
+        if frequency_radius <= 0.0:
+            raise ValueError(
+                "promoted PRIMARY derivative lacks non-exact uncertainty"
+            )
+        frequency_disk = ComplexDisk(
+            complex(
+                float(frequency_authentication.derivative_re),
+                float(frequency_authentication.derivative_im),
+            ),
+            frequency_radius,
+        )
+        frequency_radius_provenance = {
+            "axis": frequency_authentication.axis,
+            "propagated_error_abs": str(
+                frequency_authentication.propagated_error_abs
+            ),
+            "selected_step": str(frequency_authentication.selected_step),
+            "step_disagreement_abs": str(
+                frequency_authentication.step_disagreement_abs
+            ),
+        }
+        frequency_derivative_source = "primary-derivative-authentication/v1"
+        frequency_fine = frequency_disk.centre
+        frequency_coarse = None
+        frequency_propagated_error = None
+        frequency_disagreement = None
+    else:
+        (
+            frequency_disk,
+            frequency_coarse,
+            frequency_fine,
+            frequency_propagated_error,
+            frequency_disagreement,
+        ) = _fixed_root_frequency_derivative(frequency_samples)
+        if abs(frequency_fine) <= frequency_disk.radius:
+            return _validated_result(
+                backend,
+                job,
+                _unresolved_promoted_exterior_derivative(
+                    job,
+                    baseline,
+                    {
+                        "conditioning_decision": conditioning_decision,
+                        "coordinate_derivative_disk": coordinate_disk.to_mapping(),
+                        "determinant_count": len(all_samples),
+                        "failure_code": "FREQUENCY_DERIVATIVE_DISK_CONTAINS_ZERO",
+                        "fixed_root_samples": [
+                            sample.to_mapping() for sample in all_samples
+                        ],
+                        "frequency_derivative_disk": frequency_disk.to_mapping(),
+                        "frequency_derivative_source": (
+                            FIXED_ROOT_FREQUENCY_DERIVATIVE_METHOD
+                        ),
+                        "frequency_derivative_radius_provenance": {
+                            "identity": FIXED_ROOT_FREQUENCY_DERIVATIVE_METHOD,
+                            "propagated_determinant_error_abs": (
+                                frequency_propagated_error
+                            ),
+                            "raw_step_disagreement_abs": (
+                                frequency_disagreement
+                            ),
+                            "selected_step": step / 2.0,
+                        },
+                        "frequency_fine_derivative": _complex_mapping(
+                            frequency_fine
+                        ),
+                        "frequency_real_h_derivative": _complex_mapping(
+                            frequency_coarse
+                        ),
+                        "frequency_propagated_determinant_error_abs": (
+                            frequency_propagated_error
+                        ),
+                        "frequency_raw_step_disagreement_abs": (
+                            frequency_disagreement
+                        ),
+                        "response_disk_identity": (
+                            EXTERIOR_DERIVATIVE_RESPONSE_DISK_IDENTITY
+                        ),
+                        "root_seal": seal.to_mapping(),
+                        "root_seal_sha256": seal.sha256,
+                        "response_repair_identity": (
+                            ROOT_SEALED_RESPONSE_REPAIR_IDENTITY
+                        ),
+                        "response_repair_scope": response_repair_scope,
+                        "propagated_determinant_error_abs": propagated_error,
+                        "raw_step_disagreement_abs": disagreement,
+                    },
+                ),
+            )
+        frequency_radius_provenance = {
+            "identity": FIXED_ROOT_FREQUENCY_DERIVATIVE_METHOD,
+            "propagated_determinant_error_abs": frequency_propagated_error,
+            "raw_step_disagreement_abs": frequency_disagreement,
+            "selected_step": step / 2.0,
+        }
+        frequency_derivative_source = FIXED_ROOT_FREQUENCY_DERIVATIVE_METHOD
     try:
         response_disk = exterior_response_disk(
             coordinate_derivative=coordinate_disk,
@@ -6909,38 +8185,53 @@ def run_promoted_exterior_component(
             {
                 "conditioning_decision": conditioning_decision,
                 "coordinate_derivative_disk": coordinate_disk.to_mapping(),
-                "determinant_count": len(samples),
+                "determinant_count": len(all_samples),
                 "failure_code": "FREQUENCY_DERIVATIVE_DISK_CONTAINS_ZERO",
-                "fixed_root_samples": [sample.to_mapping() for sample in samples],
+                "fixed_root_samples": [sample.to_mapping() for sample in all_samples],
                 "response_disk_identity": EXTERIOR_DERIVATIVE_RESPONSE_DISK_IDENTITY,
                 "zero_containing_disk": error.disk_name,
+                "root_seal": seal.to_mapping(),
+                "root_seal_sha256": seal.sha256,
+                "response_repair_identity": (
+                    ROOT_SEALED_RESPONSE_REPAIR_IDENTITY
+                ),
+                "response_repair_scope": response_repair_scope,
             },
         )
         return _validated_result(backend, job, result)
-    frequency_radius_provenance = {
-        "axis": frequency_authentication.axis,
-        "propagated_error_abs": str(
-            frequency_authentication.propagated_error_abs
-        ),
-        "selected_step": str(frequency_authentication.selected_step),
-        "step_disagreement_abs": str(
-            frequency_authentication.step_disagreement_abs
-        ),
-    }
     derivative_evidence = {
         "coordinate_derivative_disk": coordinate_disk.to_mapping(),
         "conditioning_decision": conditioning_decision,
         "coordinate_derivative_source": EXTERIOR_DERIVATIVE_METHOD,
-        "determinant_count": len(samples),
+        "determinant_count": len(all_samples),
         "fine_derivative": _complex_mapping(fine),
-        "fixed_root_samples": [sample.to_mapping() for sample in samples],
+        "fixed_root_samples": [sample.to_mapping() for sample in all_samples],
         "frequency_derivative_disk": frequency_disk.to_mapping(),
+        "frequency_derivative_source": frequency_derivative_source,
         "frequency_derivative_radius_provenance": frequency_radius_provenance,
+        "frequency_fine_derivative": (
+            None
+            if frequency_coarse is None
+            else _complex_mapping(frequency_fine)
+        ),
+        "frequency_real_h_derivative": (
+            None
+            if frequency_coarse is None
+            else _complex_mapping(frequency_coarse)
+        ),
+        "frequency_propagated_determinant_error_abs": (
+            frequency_propagated_error
+        ),
+        "frequency_raw_step_disagreement_abs": frequency_disagreement,
         "propagated_determinant_error_abs": propagated_error,
         "raw_step_disagreement_abs": disagreement,
         "real_h_derivative": _complex_mapping(coarse),
         "response_disk": response_disk.to_mapping(),
         "response_disk_identity": EXTERIOR_DERIVATIVE_RESPONSE_DISK_IDENTITY,
+        "root_seal": seal.to_mapping(),
+        "root_seal_sha256": seal.sha256,
+        "response_repair_identity": ROOT_SEALED_RESPONSE_REPAIR_IDENTITY,
+        "response_repair_scope": response_repair_scope,
         "selected_step": step / 2.0,
         "shared_equation_source": True,
         "imaginary_axis_validation": imaginary_axis_validation,
@@ -6982,6 +8273,82 @@ def run_promoted_exterior_component(
         derivative_evidence=derivative_evidence,
     )
     return _validated_result(backend, job, result)
+
+
+def run_promoted_exterior_component(
+    job: ResponseComponentJob,
+    backend: RootReadoutBackend,
+    primary_predictor: complex,
+    *,
+    derivative_step: float,
+    validation_reason: str | None = None,
+) -> ComponentResult:
+    """Seal one promoted root, then run only fixed-root response work."""
+
+    if job.mechanism_id not in _EXTERIOR_PROFILE_IDS:
+        raise ValueError("promoted exterior runner requires an exterior job")
+    if (
+        validation_reason is not None
+        and validation_reason not in FULL_LADDER_VALIDATION_REASONS
+    ):
+        raise ValueError("promoted exterior validation reason is invalid")
+    if not math.isfinite(float(derivative_step)) or float(derivative_step) <= 0.0:
+        raise ValueError("exterior derivative step must be finite and positive")
+    if backend.identity != job.backend_identity:
+        raise ValueError("response backend identity does not match job")
+    predictor = _finite_complex(primary_predictor, "PRIMARY root predictor")
+    binder = getattr(backend, "bind_job", None)
+    if binder is not None:
+        job = binder(job)
+    root_backend = _journaled_promoted_exterior_backend(
+        job,
+        backend,
+        predictor=predictor,
+        derivative_step=float(derivative_step),
+        validation_reason=validation_reason,
+    )
+    baseline = root_backend.read_root(job, 0.0j, primary_predictor=predictor)
+    initial_status = _identity_status(job, baseline)
+    if initial_status is not None:
+        return _validated_result(
+            root_backend, job, _unresolved_result(job, initial_status, baseline, ())
+        )
+    if not root_readout_preserves_authenticated_branch(
+        baseline,
+        job.root,
+        equation_id=job.equation_id,
+        source_root_mapping=job.source_root_mapping,
+    ):
+        return _validated_result(
+            root_backend,
+            job,
+            _unresolved_result(job, ComponentStatus.BRANCH_LOSS, baseline, ()),
+        )
+    conditioning = baseline.numerical_conditioning
+    if conditioning is not None and conditioning.precision_limited:
+        # This is root-specific telemetry.  Do not attempt fixed-root response
+        # work or fabricate a seal when the root itself explicitly needs more
+        # arithmetic.
+        return _validated_result(
+            root_backend,
+            job,
+            _unresolved_result(job, ComponentStatus.NOT_CONVERGED, baseline, ()),
+        )
+    seal = PromotedRootSeal.derive(job, baseline)
+    response_backend = _journaled_promoted_exterior_response_backend(
+        job,
+        backend,
+        seal=seal,
+        derivative_step=float(derivative_step),
+        validation_reason=validation_reason,
+    )
+    return run_promoted_exterior_response_from_seal(
+        job,
+        response_backend,
+        seal,
+        derivative_step=derivative_step,
+        validation_reason=validation_reason,
+    )
 
 
 def _promoted_horizon_result(
@@ -7044,10 +8411,238 @@ def _promoted_horizon_result(
     )
 
 
+def _root_sealed_horizon_result(
+    job: ResponseComponentJob,
+    *,
+    status: ComponentStatus,
+    baseline: RootReadout,
+    response_disk: ComplexDisk | None,
+    evidence: Mapping[str, object],
+) -> ComponentResult:
+    """Build the versioned horizon result produced without another root read."""
+
+    bounded = response_disk is not None
+    return ComponentResult(
+        job_id=job.job_id,
+        leaf_id=job.leaf_id,
+        mechanism_id=job.mechanism_id,
+        status=status,
+        convergence_basis=(
+            "PRIMARY_TRUNCATION_RESOLUTION_FIXED_ROOT"
+            if status is ComponentStatus.CONVERGED
+            else "UNRESOLVED"
+        ),
+        response=None if response_disk is None else response_disk.centre,
+        signed_root_crosscheck=None,
+        closed_form_response=(
+            None if response_disk is None else response_disk.centre
+        ),
+        error_channels={
+            **{name: 0.0 for name in ERROR_CHANNELS},
+            "resolution": 0.0 if response_disk is None else response_disk.radius,
+        },
+        baseline=baseline,
+        levels=(),
+        lineage={
+            **_result_lineage(job),
+            "component_scientific_identity": (
+                PROMOTED_HORIZON_COMPONENT_V3_IDENTITY
+            ),
+        },
+        component_scientific_identity=PROMOTED_HORIZON_COMPONENT_V3_IDENTITY,
+        response_method=PROMOTED_HORIZON_RESPONSE_METHOD_V3,
+        finite_amplitude_ladder_required=False,
+        finite_amplitude_ladder_executed=False,
+        finite_amplitude_readout_count=0,
+        response_uncertainty_status=(
+            BOUNDED_ANALYTIC_RESPONSE
+            if bounded
+            else UNBOUNDED_ANALYTIC_RESPONSE
+        ),
+        error_channel_applicability={
+            name: bounded and name == "resolution" for name in ERROR_CHANNELS
+        },
+        analytic_horizon_evidence=evidence,
+    )
+
+
+def _sealed_horizon_frequency_evidence(
+    job: ResponseComponentJob,
+    seal: PromotedRootSeal,
+) -> tuple[ComplexDisk, dict[str, object]]:
+    """Derive the horizon numerator disk exclusively from root-seal evidence."""
+
+    baseline = seal.root_readout
+    corrections = _promoted_horizon_root_correction_evidence(baseline)
+    horizon_radius = 1.0 + math.sqrt(max(0.0, 1.0 - job.spin * job.spin))
+    omega_h = job.spin / (2.0 * horizon_radius)
+    arithmetic_radius = (
+        math.ulp(baseline.omega.real)
+        + math.ulp(baseline.omega.imag)
+        + abs(job.mode.m) * math.ulp(omega_h)
+    )
+    frequency = ComplexDisk(
+        baseline.omega - job.mode.m * omega_h,
+        max(float(value) for value in corrections.values()) + arithmetic_radius,
+    )
+    return frequency, {
+        "arithmetic_radius_abs": arithmetic_radius,
+        "correction_abs": {
+            name: str(value) for name, value in corrections.items()
+        },
+        "union_rule": "max-accepted-correction-plus-arithmetic/v1",
+    }
+
+
+def run_promoted_horizon_response_from_seal(
+    job: ResponseComponentJob,
+    backend: RootReadoutBackend,
+    seal: PromotedRootSeal,
+    *,
+    derivative_step: float,
+) -> ComponentResult:
+    """Rebuild horizon Dω at a sealed root without invoking root solving."""
+
+    if job.mechanism_id != "horizon-admittance":
+        raise ValueError("root-sealed horizon repair requires a horizon job")
+    if not math.isfinite(job.spin) or abs(job.spin) >= 1.0:
+        raise ValueError("promoted horizon Kerr spin must be finite and subextremal")
+    step = float(derivative_step)
+    if not math.isfinite(step) or step <= 0.0:
+        raise ValueError("root-sealed horizon derivative step is invalid")
+    if backend.identity != job.backend_identity:
+        raise ValueError("response backend identity does not match job")
+    binder = getattr(backend, "bind_job", None)
+    if binder is not None:
+        job = binder(job)
+    if backend.identity != job.backend_identity:
+        raise ValueError("bound response backend identity does not match job")
+    seal.validate_for(job)
+    baseline = seal.root_readout
+    sample_operation = getattr(backend, "sample_fixed_root_determinant", None)
+    if not callable(sample_operation):
+        raise ValueError("fixed-root determinant sample boundary is unavailable")
+    samples = tuple(
+        sample_operation(job, baseline.omega + offset, 0.0j, readout_role=role)
+        for offset, role in (
+            (complex(step, 0.0), "frequency-real-plus-h"),
+            (complex(-step, 0.0), "frequency-real-minus-h"),
+            (complex(step / 2.0, 0.0), "frequency-real-plus-h2"),
+            (complex(-step / 2.0, 0.0), "frequency-real-minus-h2"),
+        )
+    )
+    contract = regularised_gsn_mechanism_contract(job.mechanism_id)
+    conditioning = baseline.numerical_conditioning
+    assert conditioning is not None
+    for sample, (offset, role) in zip(samples, (
+        (complex(step, 0.0), "frequency-real-plus-h"),
+        (complex(-step, 0.0), "frequency-real-minus-h"),
+        (complex(step / 2.0, 0.0), "frequency-real-plus-h2"),
+        (complex(-step / 2.0, 0.0), "frequency-real-minus-h2"),
+    )):
+        if (
+            not isinstance(sample, FixedRootDeterminantSample)
+            or sample.omega != baseline.omega + offset
+            or sample.amplitude != 0.0j
+            or sample.readout_role != role
+            or sample.determinant_family != contract["determinant_family"]
+            or sample.determinant_normalisation
+            != contract["determinant_normalisation"]
+            or sample.branch_identity != conditioning.branch_convention
+            or sample.branch_authenticated is not True
+        ):
+            raise ValueError("root-sealed horizon sample binding is invalid")
+    frequency, root_provenance = _sealed_horizon_frequency_evidence(job, seal)
+    base_evidence = {
+        "derivative_source": FIXED_ROOT_FREQUENCY_DERIVATIVE_METHOD,
+        "fixed_root_samples": [sample.to_mapping() for sample in samples],
+        "horizon_frequency_disk": frequency.to_mapping(),
+        "response_disk": None,
+        "response_repair_identity": ROOT_SEALED_RESPONSE_REPAIR_IDENTITY,
+        "root_radius_provenance": root_provenance,
+        "root_seal": seal.to_mapping(),
+        "root_seal_sha256": seal.sha256,
+        "uncertainty_derivation_identity": (
+            PROMOTED_HORIZON_UNCERTAINTY_DERIVATION_IDENTITY
+        ),
+        "zero_containing_disk": None,
+    }
+    unavailable = any(
+        sample.determinant_error_status != DETERMINANT_ERROR_AVAILABLE
+        or sample.determinant_error_model_id is None
+        for sample in samples
+    )
+    if unavailable:
+        evidence = {
+            **base_evidence,
+            "derivative_disk": None,
+            "derivative_radius_provenance": {
+                "identity": FIXED_ROOT_FREQUENCY_DERIVATIVE_METHOD,
+                "failure_code": "DETERMINANT_ERROR_MODEL_UNAVAILABLE",
+            },
+            "zero_containing_disk": "DETERMINANT_ERROR_MODEL_UNAVAILABLE",
+        }
+        return _validated_result(
+            backend,
+            job,
+            _root_sealed_horizon_result(
+                job,
+                status=ComponentStatus.DERIVATIVE_UNRESOLVED,
+                baseline=baseline,
+                response_disk=None,
+                evidence=evidence,
+            ),
+        )
+    derivative, _coarse, _fine, propagated_error, disagreement = (
+        _fixed_root_frequency_derivative(samples)
+    )
+    sampled_step = (samples[0].omega.real - samples[1].omega.real) / 2.0
+    evidence = {
+        **base_evidence,
+        "derivative_disk": derivative.to_mapping(),
+        "derivative_radius_provenance": {
+            "identity": FIXED_ROOT_FREQUENCY_DERIVATIVE_METHOD,
+            "propagated_determinant_error_abs": propagated_error,
+            "raw_step_disagreement_abs": disagreement,
+            "selected_step": sampled_step / 2.0,
+        },
+    }
+    try:
+        response_disk = horizon_response_disk(
+            horizon_frequency=frequency,
+            determinant_derivative=derivative,
+        )
+    except ZeroContainingDiskError as error:
+        evidence["zero_containing_disk"] = error.disk_name
+        return _validated_result(
+            backend,
+            job,
+            _root_sealed_horizon_result(
+                job,
+                status=ComponentStatus.DERIVATIVE_UNRESOLVED,
+                baseline=baseline,
+                response_disk=None,
+                evidence=evidence,
+            ),
+        )
+    evidence["response_disk"] = response_disk.to_mapping()
+    return _validated_result(
+        backend,
+        job,
+        _root_sealed_horizon_result(
+            job,
+            status=ComponentStatus.CONVERGED,
+            baseline=baseline,
+            response_disk=response_disk,
+            evidence=evidence,
+        ),
+    )
+
+
 def _validate_promoted_horizon_baseline(
     job: ResponseComponentJob,
     baseline: RootReadout,
-) -> DerivativeAuthenticationEvidence:
+) -> DerivativeAuthenticationEvidence | None:
     """Re-check operator-validated single-readout evidence before using it."""
 
     if baseline.promoted_root_readout_policy != PROMOTED_ROOT_READOUT_POLICY:
@@ -7060,10 +8655,6 @@ def _validate_promoted_horizon_baseline(
     if primary.post_newton_determinant_count != 0:
         raise ValueError("promoted PRIMARY performed post-Newton determinants")
     derivative_authentication = primary.derivative_authentication
-    if derivative_authentication is None:
-        raise ValueError(
-            "promoted PRIMARY derivative-specific uncertainty evidence is missing"
-        )
     if baseline.seed_path_required is not False:
         raise ValueError("promoted SEED-PATH must not be required")
     if baseline.seed_path_executed is not False:
@@ -7169,8 +8760,30 @@ def run_promoted_horizon_component(
             job,
             _unresolved_result(job, initial_status, baseline, ()),
         )
-
     derivative_authentication = _validate_promoted_horizon_baseline(job, baseline)
+
+    conditioning = baseline.numerical_conditioning
+    if conditioning is not None and conditioning.precision_limited:
+        # Precision-limited conditioning is root evidence, so report a typed
+        # root outcome.  It must remain distinct from every response failure.
+        return _validated_result(
+            backend,
+            job,
+            _unresolved_result(job, ComponentStatus.NOT_CONVERGED, baseline, ()),
+        )
+    root_seal = PromotedRootSeal.derive(job, baseline)
+    if _requires_fixed_root_frequency_stencil(baseline):
+        # Production Julia backends expose the fixed-root sampling boundary.
+        # Keep old test/replay adapters (which predate that boundary) readable
+        # without pretending that they performed a new derivative stencil.
+        if callable(getattr(backend, "sample_fixed_root_determinant", None)):
+            return run_promoted_horizon_response_from_seal(
+                job,
+                backend,
+                root_seal,
+                derivative_step=job.policy.epsilons[0],
+            )
+    assert derivative_authentication is not None
     primary = baseline.primary_acceptance
     assert primary is not None
     if derivative_authentication.derivative_estimate.magnitude() <= 0:
@@ -7222,6 +8835,8 @@ def run_promoted_horizon_component(
         comparison_mapping = comparison.to_mapping()
     derivative_disk = ComplexDisk(derivative_complex, derivative_radius)
     evidence = {
+        "root_seal": root_seal.to_mapping(),
+        "root_seal_sha256": root_seal.sha256,
         "derivative_disk": derivative_disk.to_mapping(),
         "derivative_radius_provenance": {
             "axis": derivative_authentication.axis,

@@ -1070,7 +1070,11 @@ class RegularisedGsnWorkerSourceTests(unittest.TestCase):
             "solve_binary64_parity_primary", "solve_fixed_root_diagnostic"
         )
         self.assertIn("propagate_primary_derivative_error", primary)
-        self.assertIn('"horizon-admittance"', primary)
+        self.assertNotIn('"horizon-admittance"', primary)
+        self.assertIn(
+            'haskey(request, "determinant_error_model")',
+            primary,
+        )
         self.assertIn(
             "propagate_derivative_error=propagate_primary_derivative_error",
             primary,
@@ -1122,6 +1126,9 @@ class RegularisedGsnWorkerSourceTests(unittest.TestCase):
         self.assertIn('"fixed-root-determinant-sample"', sample)
         self.assertIn('"semantic_precision_tier"', sample)
         self.assertIn('"working_precision_bits"', sample)
+        self.assertIn('"schema_version" => 2', sample)
+        self.assertIn('"numerical_conditioning" => numerical_conditioning', sample)
+        self.assertIn("conditioning_response(", sample)
         self.assertNotIn("bounded_newton(", sample)
         self.assertNotIn("solve_phase(", sample)
         self.assertIn('operation == "fixed-root-determinant-sample"', dispatch)

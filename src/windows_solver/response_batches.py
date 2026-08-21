@@ -51,8 +51,12 @@ from .response_engine import (
     FULL_COMPLEX_LADDER_VALIDATION_IDENTITY,
     PROMOTED_HORIZON_COMPONENT_IDENTITY,
     PROMOTED_HORIZON_COMPONENT_V2_IDENTITY,
+    PROMOTED_HORIZON_COMPONENT_V3_IDENTITY,
     PROMOTED_HORIZON_RESPONSE_METHOD,
     PROMOTED_HORIZON_RESPONSE_METHOD_V2,
+    PROMOTED_HORIZON_RESPONSE_METHOD_V3,
+    PromotedRootSeal,
+    ROOT_SEALED_RESPONSE_REPAIR_IDENTITY,
     PROMOTED_ROOT_READOUT_POLICY,
     RECORDED_REPLAY_BACKEND_ID,
     RecordedReplayBackend,
@@ -66,10 +70,13 @@ from .response_engine import (
     regularised_gsn_mechanism_contract,
     _response_ladder_recovery,
     _response_ladder_recovery_record,
+    _journaled_promoted_exterior_response_backend,
     _validate_promoted_horizon_checkpoint_evidence_for_job,
     run_component,
     run_promoted_exterior_component,
+    run_promoted_exterior_response_from_seal,
     run_promoted_horizon_component,
+    run_promoted_horizon_response_from_seal,
     run_selective_readout_promotion,
 )
 from .partial_component_checkpoint import PartialComponentJournal
@@ -124,9 +131,12 @@ from .solved_leaf_cache import (
 
 
 CAMPAIGN_SCHEMA_VERSION = 3
-CAMPAIGN_CHECKPOINT_SCHEMA_VERSION = 8
+CAMPAIGN_CHECKPOINT_SCHEMA_VERSION = 9
 _LEGACY_CAMPAIGN_CHECKPOINT_SCHEMA_VERSION = 3
-_HISTORICAL_CAMPAIGN_CHECKPOINT_SCHEMA_VERSIONS = frozenset({3, 4, 5, 6, 7})
+_HISTORICAL_CAMPAIGN_CHECKPOINT_SCHEMA_VERSIONS = frozenset({3, 4, 5, 6, 7, 8})
+_SCHEMA8_PRECISION_CONTRACT_SHA256 = (
+    "6aed848e453a4a4b81331e857982447631d152a43521b9397dec250a42e5cb7b"
+)
 _SCHEMA7_CAMPAIGN_ID = (
     "b-prime-campaign-0e93d89e98650d1e2db109d41ca0b68919067f6627ccd320fddc1e83f4720024"
 )
@@ -1122,7 +1132,14 @@ class CampaignExecutionAttempt:
                     "campaign execution attempt promotion decision is unexpected"
                 )
         elif raw_decision is None or (
-            _validated_promotion_decision(raw_decision) != expected_decision
+            _validated_promotion_decision(
+                raw_decision,
+                allow_historical=(
+                    self._checkpoint_schema_version
+                    < CAMPAIGN_CHECKPOINT_SCHEMA_VERSION
+                ),
+            )
+            != expected_decision
         ):
             raise ValueError(
                 "campaign execution attempt promotion decision is invalid"
@@ -1571,7 +1588,12 @@ def _validate_failed_preflight_attempt_request(
     if expected_decision is None:
         if decision is not None:
             raise ValueError("failed-preflight promotion decision is unexpected")
-    elif _validated_promotion_decision(decision) != expected_decision:
+    elif _validated_promotion_decision(
+        decision,
+        allow_historical=(
+            checkpoint_schema_version < CAMPAIGN_CHECKPOINT_SCHEMA_VERSION
+        ),
+    ) != expected_decision:
         raise ValueError("failed-preflight promotion decision is invalid")
 
 
@@ -2937,6 +2959,11 @@ def _schema7_checkpoint_bindings(
 
 
 def _checkpoint_precision_contract_sha256(schema_version: int) -> str:
+    if schema_version == 8:
+        # Schema 8 used the pre-root-seal promotion contract.  It remains
+        # readable only so the narrowly authenticated Leaf-42 recovery below
+        # can retain its already-paid-for root evidence.
+        return _SCHEMA8_PRECISION_CONTRACT_SHA256
     material: dict[str, object] = {
         "promotion_gates": list(B_PRIME_RELEASE_DOMAIN.precision_promotion_gates),
         "fixed_sentinel_leaf_ids": list(
@@ -3230,13 +3257,27 @@ def _load_checkpoint_with_attempts(
         if not record.stages or record.stages[0].outcome.digits != 64:
             raise ValueError("campaign checkpoint precision stages are invalid")
         digits = tuple(stage.outcome.digits for stage in record.stages)
-        if digits not in {(64,), (64, 80), (64, 120), (64, 80, 120)}:
+        if digits not in {
+            (64,),
+            (64, 80),
+            (64, 120),
+            (64, 80, 80),
+            (64, 80, 120),
+        }:
             raise ValueError("campaign checkpoint precision stage order is invalid")
         factory_identity = (
             _schema7_precision_factory_identity()
             if value["schema_version"] == 7
             else plan.precision_factory_identity
         )
+        if (
+            value["schema_version"] == 8
+            and _schema8_leaf42_root_seal_candidate(leaf, record) is not None
+        ):
+            # This exact pre-root-seal response failure is migrated by the
+            # active runner.  Do not reinterpret its obsolete promotion
+            # decision under the new root-only decision law while loading it.
+            continue
         _validate_record_semantics(
             leaf,
             record,
@@ -3461,7 +3502,13 @@ def _primary_binary64_promotes(
     )
 
 
-_PROMOTION_DECISION_SCHEMA = "windows-solver.precision-promotion-decision/1"
+# Version 2 makes the decision's meaning explicit: this document authorizes
+# *root* arithmetic promotion only.  A sealed response repair has a separate
+# identity and must never be smuggled through this decision.
+_PROMOTION_DECISION_SCHEMA = "windows-solver.precision-promotion-decision/2"
+_HISTORICAL_PROMOTION_DECISION_SCHEMA = (
+    "windows-solver.precision-promotion-decision/1"
+)
 _PROMOTION_DECISION_FIELDS = frozenset({
     "schema",
     "from_precision_digits",
@@ -3495,6 +3542,7 @@ def _single_promoted_horizon_result(
     if result.component_scientific_identity not in {
         PROMOTED_HORIZON_COMPONENT_IDENTITY,
         PROMOTED_HORIZON_COMPONENT_V2_IDENTITY,
+        PROMOTED_HORIZON_COMPONENT_V3_IDENTITY,
     }:
         return None
     if result.to_mapping() != raw_result:
@@ -3511,6 +3559,15 @@ _ANALYTIC_HORIZON_EVIDENCE_KIND = (
 )
 _FIXED_ROOT_EXTERIOR_EVIDENCE_KIND = (
     "package-owned-julia-fixed-root-exterior-derivative-component"
+)
+_ROOT_SEALED_RESPONSE_REPAIR_EVIDENCE_KIND = (
+    "package-owned-julia-root-sealed-response-repair"
+)
+_ROOT_SEAL_RESPONSE_MIGRATION_IDENTITY = (
+    "root-sealed-stale-exterior-response-discarded/v1"
+)
+_ROOT_SEAL_RESPONSE_MIGRATION_SCHEMA = (
+    "windows-solver.root-sealed-response-migration/1"
 )
 _SELECTIVE_TIER_SEQUENCE = (
     "bigfloat-40",
@@ -3538,6 +3595,12 @@ class _PromotedStageSemantics:
     result: ComponentResult
     repeat_applicable: bool
     precision_ladder_applicable: bool
+    root_sealed: bool
+    root_requires_precision120: bool
+    response_terminal_admissible: bool
+    response_requires_precision120: bool
+    response_repair_precision_digits: int | None
+    response_repair_families: frozenset[str]
     terminal_admissible: bool
     requires_precision120: bool
 
@@ -3552,6 +3615,7 @@ def _claims_specialized_promoted_semantics(result: ComponentResult) -> bool:
             EXTERIOR_DERIVATIVE_METHOD,
             PROMOTED_HORIZON_RESPONSE_METHOD,
             PROMOTED_HORIZON_RESPONSE_METHOD_V2,
+            PROMOTED_HORIZON_RESPONSE_METHOD_V3,
         }
         or result.response_uncertainty_status in {
             BOUNDED_ANALYTIC_RESPONSE,
@@ -3606,6 +3670,7 @@ def _classify_promoted_stage(
     analytic_identity = identity in {
         PROMOTED_HORIZON_COMPONENT_IDENTITY,
         PROMOTED_HORIZON_COMPONENT_V2_IDENTITY,
+        PROMOTED_HORIZON_COMPONENT_V3_IDENTITY,
     }
     typed_analytic_failure = (
         evidence_kind == _ANALYTIC_HORIZON_EVIDENCE_KIND
@@ -3615,7 +3680,13 @@ def _classify_promoted_stage(
         and not specialized_identity_claim
     )
     if analytic_identity or typed_analytic_failure:
-        if evidence_kind != _ANALYTIC_HORIZON_EVIDENCE_KIND:
+        if evidence_kind not in {
+            _ANALYTIC_HORIZON_EVIDENCE_KIND,
+            _ROOT_SEALED_RESPONSE_REPAIR_EVIDENCE_KIND,
+        } or (
+            evidence_kind == _ROOT_SEALED_RESPONSE_REPAIR_EVIDENCE_KIND
+            and identity != PROMOTED_HORIZON_COMPONENT_V3_IDENTITY
+        ):
             raise _UnauthenticatedComponentEvidence(
                 "campaign analytic evidence disagrees with component identity"
             )
@@ -3626,7 +3697,10 @@ def _classify_promoted_stage(
         )
 
     if identity == EXTERIOR_DERIVATIVE_COMPONENT_IDENTITY:
-        if evidence_kind != _FIXED_ROOT_EXTERIOR_EVIDENCE_KIND:
+        if evidence_kind not in {
+            _FIXED_ROOT_EXTERIOR_EVIDENCE_KIND,
+            _ROOT_SEALED_RESPONSE_REPAIR_EVIDENCE_KIND,
+        }:
             raise _UnauthenticatedComponentEvidence(
                 "campaign fixed-root exterior evidence kind is invalid"
             )
@@ -4674,6 +4748,30 @@ def _validate_fixed_readout_predictor_binding(
         _PromotedStageKind.FIXED_ROOT_EXTERIOR_DERIVATIVE,
     }:
         return
+    if (
+        promoted.component_result.get("evidence_kind")
+        == _ROOT_SEALED_RESPONSE_REPAIR_EVIDENCE_KIND
+    ):
+        raw_previous = previous.component_result.get("result")
+        if not isinstance(raw_previous, Mapping):
+            raise _UnauthenticatedComponentEvidence(
+                "root-sealed response repair predecessor is missing"
+            )
+        previous_result = ComponentResult.from_mapping(raw_previous)
+        if previous_result.to_mapping() != raw_previous:
+            raise _UnauthenticatedComponentEvidence(
+                "root-sealed response repair predecessor is not canonical"
+            )
+        seal = _sealed_root_for_result(result)
+        if (
+            seal is None
+            or seal.root_readout.to_mapping()
+            != previous_result.baseline.to_mapping()
+        ):
+            raise _UnauthenticatedComponentEvidence(
+                "root-sealed response repair changed its persisted root"
+            )
+        return
     _validate_promoted_result_predictor_binding(previous, result)
 
 
@@ -4771,11 +4869,23 @@ def _promotion_decision(
     }
 
 
-def _validated_promotion_decision(value: object) -> dict[str, object]:
+def _validated_promotion_decision(
+    value: object,
+    *,
+    allow_historical: bool = False,
+) -> dict[str, object]:
     if not isinstance(value, Mapping) or set(value) != _PROMOTION_DECISION_FIELDS:
         raise ValueError("precision promotion decision fields are invalid")
     if (
-        value["schema"] != _PROMOTION_DECISION_SCHEMA
+        value["schema"]
+        not in (
+            {_PROMOTION_DECISION_SCHEMA}
+            if not allow_historical
+            else {
+                _PROMOTION_DECISION_SCHEMA,
+                _HISTORICAL_PROMOTION_DECISION_SCHEMA,
+            }
+        )
         or type(value["from_precision_digits"]) is not int
         or value["from_precision_digits"] != 80
         or type(value["to_precision_digits"]) is not int
@@ -4822,6 +4932,11 @@ def _validated_promotion_decision(value: object) -> dict[str, object]:
         ):
             raise ValueError("precision promotion evidence is inconsistent")
     output = dict(value)
+    # Historical schema 1 encoded the same fields but predated the explicit
+    # root-only contract.  It is readable only while authenticating an old
+    # checkpoint; normalize it for semantic comparison and never emit it.
+    if output["schema"] == _HISTORICAL_PROMOTION_DECISION_SCHEMA:
+        output["schema"] = _PROMOTION_DECISION_SCHEMA
     if output["reason"] == "INSUFFICIENT_RELIABLE_DIGITS" and (
         output["state"] != "REQUESTED" or limited is not True
     ):
@@ -4896,6 +5011,7 @@ def _validate_attached_promotion_decision(
     expected: Mapping[str, object],
     *,
     required: bool,
+    allow_historical: bool = False,
 ) -> None:
     raw = outcome.component_result.get("promotion_decision")
     if raw is None:
@@ -4906,7 +5022,9 @@ def _validate_attached_promotion_decision(
             )
         # Schema 3/4 checkpoints predate the mandatory attached decision.
         return
-    if _validated_promotion_decision(raw) != dict(expected):
+    if _validated_promotion_decision(
+        raw, allow_historical=allow_historical
+    ) != dict(expected):
         raise ValueError("precision promotion decision disagrees with stage evidence")
 
 
@@ -4950,24 +5068,30 @@ def _primary_precision120_decision(
         fixed_root_exterior = semantics.kind is (
             _PromotedStageKind.FIXED_ROOT_EXTERIOR_DERIVATIVE
         )
+        root_reason = _root_precision120_reason(
+            outcome,
+            semantics.result,
+            _sealed_root_for_result(semantics.result),
+        )
     else:
         existing_requested = _primary_existing_requires_precision120(outcome)
         promoted_horizon_stage = False
         fixed_root_exterior = False
+        root_reason = None
     return _promotion_decision(
         outcome,
         existing_requested=existing_requested,
         requested_reason=(
-            "PROMOTED_ROOT_OR_CONDITIONING_GATE"
+            root_reason or "PROMOTED_ROOT_OR_CONDITIONING_GATE"
             if promoted_horizon_stage
-            else "FIXED_ROOT_RESPONSE_OR_CONDITIONING_GATE"
+            else root_reason or "ROOT_TYPED_RETRY_REQUIRED"
             if fixed_root_exterior
             else "CONVERGED_REFINEMENT_OR_DISCREPANCY_GATE"
         ),
         suppressed_reason=(
-            "PROMOTED_ROOT_EVIDENCE_ACCEPTED"
+            "ROOT_EVIDENCE_ACCEPTED"
             if promoted_horizon_stage
-            else "FIXED_ROOT_RESPONSE_EVIDENCE_ACCEPTED"
+            else "ROOT_EVIDENCE_ACCEPTED"
             if fixed_root_exterior
             else "CONVERGED_PROMOTION_GATES_SATISFIED"
         ),
@@ -4999,8 +5123,14 @@ def _deep_precision120_decision(
         _PromotedStageKind.LEGACY_FULL_LADDER
     ):
         stage_requested = not bool(outcome.self_refinement_enclosed)
+        root_reason = None
     else:
         stage_requested = semantics.requires_precision120
+        root_reason = _root_precision120_reason(
+            outcome,
+            semantics.result,
+            _sealed_root_for_result(semantics.result),
+        )
     existing_requested = sentinel_false_negative or stage_requested
     decision = _promotion_decision(
         outcome,
@@ -5008,16 +5138,16 @@ def _deep_precision120_decision(
         requested_reason=(
             "SENTINEL_TRIGGER_FALSE_NEGATIVE"
             if sentinel_false_negative
-            else "PROMOTED_ROOT_OR_CONDITIONING_GATE"
+            else root_reason or "PROMOTED_ROOT_OR_CONDITIONING_GATE"
             if analytic_horizon
-            else "FIXED_ROOT_RESPONSE_OR_CONDITIONING_GATE"
+            else root_reason or "ROOT_TYPED_RETRY_REQUIRED"
             if fixed_root_exterior
             else "CONVERGED_REFINEMENT_OR_DISCREPANCY_GATE"
         ),
         suppressed_reason=(
-            "PROMOTED_ROOT_EVIDENCE_ACCEPTED"
+            "ROOT_EVIDENCE_ACCEPTED"
             if analytic_horizon
-            else "FIXED_ROOT_RESPONSE_EVIDENCE_ACCEPTED"
+            else "ROOT_EVIDENCE_ACCEPTED"
             if fixed_root_exterior
             else "CONVERGED_PROMOTION_GATES_SATISFIED"
         ),
@@ -5125,7 +5255,11 @@ def _validate_current_promoted_runtime(
         _LEGACY_FULL_LADDER_EVIDENCE_KIND,
         _ANALYTIC_HORIZON_EVIDENCE_KIND,
         _FIXED_ROOT_EXTERIOR_EVIDENCE_KIND,
+        _ROOT_SEALED_RESPONSE_REPAIR_EVIDENCE_KIND,
     }
+    response_repair = (
+        evidence_kind == _ROOT_SEALED_RESPONSE_REPAIR_EVIDENCE_KIND
+    )
     classified_kind: _PromotedStageKind | None = None
     raw_primary_result = payload.get("result")
     if (
@@ -5137,16 +5271,22 @@ def _validate_current_promoted_runtime(
             _LEGACY_FULL_LADDER_EVIDENCE_KIND,
             _ANALYTIC_HORIZON_EVIDENCE_KIND,
             _FIXED_ROOT_EXTERIOR_EVIDENCE_KIND,
+            _ROOT_SEALED_RESPONSE_REPAIR_EVIDENCE_KIND,
         }
     ):
         classified_kind, classified_result = _classify_promoted_stage(outcome)
         assert classified_result.to_mapping() == result.to_mapping()
-    single_horizon = evidence_kind == _ANALYTIC_HORIZON_EVIDENCE_KIND
+    single_horizon = evidence_kind == _ANALYTIC_HORIZON_EVIDENCE_KIND or (
+        evidence_kind == _ROOT_SEALED_RESPONSE_REPAIR_EVIDENCE_KIND
+        and result.component_scientific_identity
+        == PROMOTED_HORIZON_COMPONENT_V3_IDENTITY
+    )
     result_is_single_horizon = (
         classified_kind is _PromotedStageKind.ANALYTIC_HORIZON
         or result.component_scientific_identity in {
             PROMOTED_HORIZON_COMPONENT_IDENTITY,
             PROMOTED_HORIZON_COMPONENT_V2_IDENTITY,
+            PROMOTED_HORIZON_COMPONENT_V3_IDENTITY,
         }
         or (
             single_horizon
@@ -5160,13 +5300,20 @@ def _validate_current_promoted_runtime(
         raise _UnauthenticatedComponentEvidence(
             "campaign promoted component identity disagrees with evidence kind"
         )
-    fixed_exterior = evidence_kind == _FIXED_ROOT_EXTERIOR_EVIDENCE_KIND
+    fixed_exterior = (
+        evidence_kind == _FIXED_ROOT_EXTERIOR_EVIDENCE_KIND
+        or (
+            evidence_kind == _ROOT_SEALED_RESPONSE_REPAIR_EVIDENCE_KIND
+            and result.component_scientific_identity
+            == EXTERIOR_DERIVATIVE_COMPONENT_IDENTITY
+        )
+    )
     result_is_fixed_exterior = (
         classified_kind is _PromotedStageKind.FIXED_ROOT_EXTERIOR_DERIVATIVE
         or result.component_scientific_identity
         == EXTERIOR_DERIVATIVE_COMPONENT_IDENTITY
         or (
-            fixed_exterior
+            evidence_kind == _FIXED_ROOT_EXTERIOR_EVIDENCE_KIND
             and result.component_scientific_identity is None
             and result.mechanism_id.startswith("exterior-")
             and result.status in _TYPED_FIXED_READOUT_FAILURE_STATUSES
@@ -5332,10 +5479,21 @@ def _validate_current_promoted_runtime(
             raise _UnauthenticatedComponentEvidence(
                 "campaign promoted scientific runtime ODE budget is invalid"
             )
-    if result.component_scientific_identity == (
-        EXTERIOR_DERIVATIVE_COMPONENT_IDENTITY
-    ):
-        assert result.derivative_evidence is not None
+    fixed_sample_evidence = (
+        result.derivative_evidence
+        if result.component_scientific_identity
+        == EXTERIOR_DERIVATIVE_COMPONENT_IDENTITY
+        else result.analytic_horizon_evidence
+        if result.component_scientific_identity
+        == PROMOTED_HORIZON_COMPONENT_V3_IDENTITY
+        else None
+    )
+    if isinstance(fixed_sample_evidence, Mapping):
+        raw_fixed_samples = fixed_sample_evidence.get("fixed_root_samples")
+        if not isinstance(raw_fixed_samples, list):
+            raise _UnauthenticatedComponentEvidence(
+                "campaign fixed-root sample evidence is invalid"
+            )
         runtime_provenance = {
             name: value
             for name, value in runtime.items()
@@ -5365,25 +5523,79 @@ def _validate_current_promoted_runtime(
             raise _UnauthenticatedComponentEvidence(
                 "campaign fixed-root sample precision tier is invalid"
             )
-        for raw_sample in result.derivative_evidence["fixed_root_samples"]:
+        reused_sample_families: frozenset[str] = frozenset()
+        if (
+            response_repair
+            and result.component_scientific_identity
+            == EXTERIOR_DERIVATIVE_COMPONENT_IDENTITY
+        ):
+            scope = fixed_sample_evidence.get("response_repair_scope")
+            if not isinstance(scope, Mapping):
+                raise _UnauthenticatedComponentEvidence(
+                    "campaign root-sealed response repair scope is invalid"
+                )
+            reused = scope.get("reused_families")
+            recomputed = scope.get("recomputed_families")
+            if (
+                not isinstance(reused, list)
+                or not isinstance(recomputed, list)
+                or any(
+                    item not in {"frequency", "coordinate"}
+                    for item in (*reused, *recomputed)
+                )
+                or set(reused) & set(recomputed)
+            ):
+                raise _UnauthenticatedComponentEvidence(
+                    "campaign root-sealed response repair scope is invalid"
+                )
+            reused_sample_families = frozenset(reused)
+        for raw_sample in raw_fixed_samples:
             sample = FixedRootDeterminantSample.from_mapping(raw_sample)
-            if (
-                sample.precision_tier.value != expected_sample_tier
-                or sample.working_precision_bits != expected_sample_bits
+            family = (
+                "frequency"
+                if sample.readout_role.startswith("frequency-")
+                else "coordinate"
+                if sample.readout_role.startswith("coordinate-")
+                else None
+            )
+            if family is None:
+                raise _UnauthenticatedComponentEvidence(
+                    "campaign fixed-root sample family is invalid"
+                )
+            if family not in reused_sample_families:
+                if (
+                    sample.precision_tier.value != expected_sample_tier
+                    or sample.working_precision_bits != expected_sample_bits
+                ):
+                    raise _UnauthenticatedComponentEvidence(
+                        "campaign fixed-root sample precision is invalid"
+                    )
+                if (
+                    sample.worker_response_receipt.get("runtime_identity_sha256")
+                    != expected_sample_runtime
+                    or sample.worker_response_receipt.get(
+                        "scientific_runtime_sha256"
+                    )
+                    != expected_scientific_runtime
+                ):
+                    raise _UnauthenticatedComponentEvidence(
+                        "campaign fixed-root sample runtime identity is invalid"
+                    )
+            elif not all(
+                isinstance(
+                    sample.worker_response_receipt.get(field), str
+                )
+                and re.fullmatch(
+                    r"[0-9a-f]{64}",
+                    sample.worker_response_receipt[field],
+                ) is not None
+                for field in (
+                    "runtime_identity_sha256",
+                    "scientific_runtime_sha256",
+                )
             ):
                 raise _UnauthenticatedComponentEvidence(
-                    "campaign fixed-root sample precision is invalid"
-                )
-            if (
-                sample.worker_response_receipt.get("runtime_identity_sha256")
-                != expected_sample_runtime
-                or sample.worker_response_receipt.get(
-                    "scientific_runtime_sha256"
-                )
-                != expected_scientific_runtime
-            ):
-                raise _UnauthenticatedComponentEvidence(
-                    "campaign fixed-root sample runtime identity is invalid"
+                    "campaign reused fixed-root sample runtime is invalid"
                 )
     if not has_conditioning:
         if "regularised_gsn_precision_policy" in runtime:
@@ -5440,11 +5652,23 @@ def _validate_current_promoted_runtime(
         raise _UnauthenticatedComponentEvidence(
             "campaign promoted scientific runtime policy disagrees with mechanism"
         )
-    receipts = tuple(
-        readout.worker_response_receipt for readout in result.raw_readouts
+    # A response-only repair is intentionally evaluated under a newer sample
+    # runtime while retaining an older sealed root receipt.  Validating that
+    # root receipt as if it belonged to this response tier would force a
+    # re-root, exactly the coupling this boundary removes.
+    receipts = (
+        ()
+        if response_repair
+        else tuple(
+            readout.worker_response_receipt for readout in result.raw_readouts
+        )
     )
     has_receipts = any(receipt is not None for receipt in receipts)
-    if not allow_historical_conditioning_absence and not has_receipts:
+    if (
+        not allow_historical_conditioning_absence
+        and not has_receipts
+        and not response_repair
+    ):
         raise _UnauthenticatedComponentEvidence(
             "campaign current promoted worker response receipt is missing"
         )
@@ -5599,11 +5823,13 @@ def _validate_component_result(
             _LEGACY_FULL_LADDER_EVIDENCE_KIND,
             _ANALYTIC_HORIZON_EVIDENCE_KIND,
             _FIXED_ROOT_EXTERIOR_EVIDENCE_KIND,
+            _ROOT_SEALED_RESPONSE_REPAIR_EVIDENCE_KIND,
         }
         or result.component_scientific_identity
         in {
             PROMOTED_HORIZON_COMPONENT_IDENTITY,
             PROMOTED_HORIZON_COMPONENT_V2_IDENTITY,
+            PROMOTED_HORIZON_COMPONENT_V3_IDENTITY,
             EXTERIOR_DERIVATIVE_COMPONENT_IDENTITY,
         }
     ):
@@ -5615,9 +5841,10 @@ def _validate_component_result(
     historical_horizon = result.component_scientific_identity == (
         PROMOTED_HORIZON_COMPONENT_IDENTITY
     )
-    bounded_horizon = result.component_scientific_identity == (
-        PROMOTED_HORIZON_COMPONENT_V2_IDENTITY
-    )
+    bounded_horizon = result.component_scientific_identity in {
+        PROMOTED_HORIZON_COMPONENT_V2_IDENTITY,
+        PROMOTED_HORIZON_COMPONENT_V3_IDENTITY,
+    }
     analytic_horizon = historical_horizon or bounded_horizon
     promoted_horizon_stage = analytic_horizon or (
         payload.get("evidence_kind")
@@ -5630,6 +5857,10 @@ def _validate_component_result(
     )
     fixed_root_exterior_stage = classified_kind is (
         _PromotedStageKind.FIXED_ROOT_EXTERIOR_DERIVATIVE
+    )
+    response_repair_stage = (
+        payload.get("evidence_kind")
+        == _ROOT_SEALED_RESPONSE_REPAIR_EVIDENCE_KIND
     )
     if exterior_derivative and classified_kind is not (
         _PromotedStageKind.FIXED_ROOT_EXTERIOR_DERIVATIVE
@@ -5656,7 +5887,10 @@ def _validate_component_result(
         leaf.role in {"primary", "deep"}
         and leaf.mechanism_id == "horizon-admittance"
         and outcome.digits in (80, 120)
-        and result.response_method == PROMOTED_HORIZON_RESPONSE_METHOD_V2
+        and result.response_method in {
+            PROMOTED_HORIZON_RESPONSE_METHOD_V2,
+            PROMOTED_HORIZON_RESPONSE_METHOD_V3,
+        }
         and result.response_uncertainty_status
         in {BOUNDED_ANALYTIC_RESPONSE, "UNBOUNDED_ANALYTIC_RESPONSE"}
         and result.finite_amplitude_ladder_required is False
@@ -5736,7 +5970,7 @@ def _validate_component_result(
         raise ValueError(
             "campaign production component result status/body contract is invalid"
         )
-    if promoted_horizon_stage:
+    if promoted_horizon_stage and not response_repair_stage:
         required_payload_fields = {
             "evidence_kind",
             "result",
@@ -5835,7 +6069,83 @@ def _validate_component_result(
                 raise _UnauthenticatedComponentEvidence(
                     "campaign promoted analytic uncertainty applicability is invalid"
                 )
-    if fixed_root_exterior_stage:
+    if response_repair_stage:
+        required_payload_fields = {
+            "evidence_kind",
+            "result",
+            "self_refinement_result",
+            "self_refinement_skipped_reason",
+            "scientific_runtime",
+            "root_seal_sha256",
+            "response_repair_scope",
+            "precision_ladder_discrepancy_applicable",
+            "precision_ladder_discrepancy_reason",
+        }
+        if (
+            outcome.digits not in (80, 120)
+            or frozenset(payload) != frozenset(required_payload_fields)
+            or payload.get("self_refinement_result") is not None
+            or payload.get("self_refinement_skipped_reason")
+            != _FIXED_ROOT_EXTERIOR_SELF_REFINEMENT_SKIPPED_REASON
+            or payload.get("response_repair_scope")
+            not in {
+                "fixed-root-domega-stencil-only/v1",
+                "fixed-root-dc-stencil-only/v1",
+                "fixed-root-domega-dc-stencils-only/v1",
+            }
+            or type(payload.get("precision_ladder_discrepancy_applicable"))
+            is not bool
+            or outcome.self_refinement_enclosed is not None
+            or outcome.deep_diagnostics is not None
+        ):
+            raise _UnauthenticatedComponentEvidence(
+                "campaign root-sealed response repair payload is invalid"
+            )
+        seal = _sealed_root_for_result(result)
+        if seal is None:
+            raise _UnauthenticatedComponentEvidence(
+                "campaign root-sealed response repair lacks a root seal"
+            )
+        try:
+            seal.validate_for(leaf.job)
+        except ValueError as error:
+            raise _UnauthenticatedComponentEvidence(
+                "campaign root-sealed response repair seal is not admissible"
+            ) from error
+        if payload.get("root_seal_sha256") != seal.sha256:
+            raise _UnauthenticatedComponentEvidence(
+                "campaign root-sealed response repair digest is invalid"
+            )
+        if result.component_scientific_identity == EXTERIOR_DERIVATIVE_COMPONENT_IDENTITY:
+            evidence = result.derivative_evidence
+            scope = None if not isinstance(evidence, Mapping) else evidence.get(
+                "response_repair_scope"
+            )
+            if not isinstance(scope, Mapping):
+                raise _UnauthenticatedComponentEvidence(
+                    "campaign root-sealed exterior repair scope is missing"
+                )
+            recomputed = scope.get("recomputed_families")
+            reused = scope.get("reused_families")
+            if not isinstance(recomputed, list) or not isinstance(reused, list):
+                raise _UnauthenticatedComponentEvidence(
+                    "campaign root-sealed exterior repair scope is invalid"
+                )
+            families = frozenset(recomputed)
+            expected_scope = (
+                "fixed-root-domega-stencil-only/v1"
+                if families == {"frequency"}
+                else "fixed-root-dc-stencil-only/v1"
+                if families == {"coordinate"}
+                else "fixed-root-domega-dc-stencils-only/v1"
+                if families == {"frequency", "coordinate"}
+                else None
+            )
+            if payload.get("response_repair_scope") != expected_scope:
+                raise _UnauthenticatedComponentEvidence(
+                    "campaign root-sealed exterior repair scope disagrees with samples"
+                )
+    if fixed_root_exterior_stage and not response_repair_stage:
         required_payload_fields = {
             "evidence_kind",
             "result",
@@ -6184,6 +6494,314 @@ def _validate_fixed_readout_precision_comparison(
     return applicable
 
 
+def _sealed_root_for_result(result: ComponentResult) -> PromotedRootSeal | None:
+    """Return the persisted seal only when it exactly owns this baseline."""
+
+    evidence = (
+        result.derivative_evidence
+        if result.derivative_evidence is not None
+        else result.analytic_horizon_evidence
+    )
+    if not isinstance(evidence, Mapping):
+        return None
+    raw = evidence.get("root_seal")
+    if raw is None:
+        return None
+    try:
+        seal = PromotedRootSeal.from_mapping(raw)
+    except ValueError as error:
+        raise _UnauthenticatedComponentEvidence(
+            "promoted root seal is invalid"
+        ) from error
+    if (
+        evidence.get("root_seal_sha256") != seal.sha256
+        or seal.root_readout.to_mapping() != result.baseline.to_mapping()
+        or seal.leaf_id != result.leaf_id
+        or seal.job_id != result.job_id
+        or seal.mechanism_id != result.mechanism_id
+    ):
+        raise _UnauthenticatedComponentEvidence(
+            "promoted root seal does not bind the component result"
+        )
+    return seal
+
+
+def _root_sealed_response_migration_pending(
+    result: ComponentResult,
+) -> bool:
+    """Recognize the sole schema-8 salvage marker without trusting response data."""
+
+    evidence = result.derivative_evidence
+    if not isinstance(evidence, Mapping):
+        return False
+    raw = evidence.get("stale_response_evidence")
+    if not isinstance(raw, Mapping) or set(raw) != {
+        "schema",
+        "identity",
+        "source_checkpoint_schema_version",
+        "source_stage_sha256",
+        "source_response_status",
+    }:
+        return False
+    return (
+        raw.get("schema") == _ROOT_SEAL_RESPONSE_MIGRATION_SCHEMA
+        and raw.get("identity") == _ROOT_SEAL_RESPONSE_MIGRATION_IDENTITY
+        and raw.get("source_checkpoint_schema_version") == 8
+        and isinstance(raw.get("source_stage_sha256"), str)
+        and re.fullmatch(r"[0-9a-f]{64}", raw["source_stage_sha256"])
+        is not None
+        and raw.get("source_response_status")
+        == ComponentStatus.DERIVATIVE_UNRESOLVED.value
+        and result.status is ComponentStatus.DERIVATIVE_UNRESOLVED
+        and result.response is None
+        and evidence.get("determinant_count") == 0
+        and evidence.get("fixed_root_samples") == []
+        and evidence.get("failure_code")
+        == "STALE_RESPONSE_EVIDENCE_DISCARDED"
+        and _sealed_root_for_result(result) is not None
+    )
+
+
+_ROOT_PRECISION_PROMOTION_REASONS = frozenset({
+    "ROOT_CONDITIONING_PRECISION_LIMITED",
+    "ROOT_NOT_CONVERGED",
+    "ROOT_PRIMARY_REJECTED",
+    "ROOT_CORRECTION_EXCEEDS_TOLERANCE",
+})
+
+
+def _root_precision120_reason(
+    outcome: StageOutcome,
+    result: ComponentResult,
+    root_seal: PromotedRootSeal | None,
+) -> str | None:
+    """Return an allowlisted root-only reason for an ordinary 120 root read.
+
+    This intentionally reads only the persisted root readout.  Component
+    status, response fields, derivative samples, response disks, validation,
+    and checkpoint/persistence state are not inputs to the decision.  A
+    branch mismatch remains fail-closed rather than being treated as an
+    arithmetic retry request.
+    """
+
+    if outcome.digits != 80 or root_seal is not None:
+        return None
+    baseline = result.baseline
+    if result.status is ComponentStatus.BRANCH_LOSS:
+        return None
+    if (
+        baseline.root_reference_id != result.lineage.get("root_reference_id")
+        or baseline.equation_id != result.lineage.get("equation_id")
+    ):
+        return None
+    conditioning = baseline.numerical_conditioning
+    if conditioning is not None and conditioning.precision_limited:
+        return "ROOT_CONDITIONING_PRECISION_LIMITED"
+    if not baseline.converged:
+        return "ROOT_NOT_CONVERGED"
+    primary = baseline.primary_acceptance
+    if primary is None or not primary.accepted:
+        return "ROOT_PRIMARY_REJECTED"
+    if primary.correction_abs > primary.root_correction_tolerance:
+        return "ROOT_CORRECTION_EXCEEDS_TOLERANCE"
+    return None
+
+
+def _root_requires_precision120(
+    outcome: StageOutcome,
+    result: ComponentResult,
+    root_seal: PromotedRootSeal | None,
+) -> bool:
+    """Whether an ordinary root solve is authorized by root evidence alone."""
+
+    reason = _root_precision120_reason(outcome, result, root_seal)
+    if reason is not None and reason not in _ROOT_PRECISION_PROMOTION_REASONS:
+        raise AssertionError("root promotion reason escaped its allowlist")
+    return reason is not None
+
+
+_FIXED_ROOT_FREQUENCY_STENCIL_ROLES = frozenset({
+    "frequency-real-plus-h",
+    "frequency-real-minus-h",
+    "frequency-real-plus-h2",
+    "frequency-real-minus-h2",
+})
+_FIXED_ROOT_COORDINATE_STENCIL_ROLES = frozenset({
+    "coordinate-real-plus-h",
+    "coordinate-real-minus-h",
+    "coordinate-real-plus-h2",
+    "coordinate-real-minus-h2",
+})
+
+
+def _validate_root_sealed_response_reuse_binding(
+    predecessor: ComponentResult,
+    repair: ComponentResult,
+) -> None:
+    """Bind every reused derivative family to its exact predecessor samples.
+
+    A root seal authenticates where fixed-root work may occur.  It is not a
+    licence to import a different historical response sample merely because it
+    happens to be attached to the same root.  The repair record therefore has
+    to retain byte-for-byte canonical samples from the immediately preceding
+    promoted result for each family it says it reused.
+    """
+
+    if (
+        predecessor.component_scientific_identity
+        != EXTERIOR_DERIVATIVE_COMPONENT_IDENTITY
+        or repair.component_scientific_identity
+        != EXTERIOR_DERIVATIVE_COMPONENT_IDENTITY
+    ):
+        raise ValueError("root-sealed response reuse has an invalid component")
+    predecessor_seal = _sealed_root_for_result(predecessor)
+    repair_seal = _sealed_root_for_result(repair)
+    if (
+        predecessor_seal is None
+        or repair_seal is None
+        or predecessor_seal.to_mapping() != repair_seal.to_mapping()
+    ):
+        raise ValueError("root-sealed response reuse changed the sealed root")
+    predecessor_evidence = predecessor.derivative_evidence
+    repair_evidence = repair.derivative_evidence
+    if not isinstance(predecessor_evidence, Mapping) or not isinstance(
+        repair_evidence, Mapping
+    ):
+        raise ValueError("root-sealed response reuse evidence is missing")
+    scope = repair_evidence.get("response_repair_scope")
+    if not isinstance(scope, Mapping):
+        raise ValueError("root-sealed response reuse scope is missing")
+    reused = scope.get("reused_families")
+    if not isinstance(reused, list):
+        raise ValueError("root-sealed response reuse scope is invalid")
+    roles_by_family = {
+        "frequency": _FIXED_ROOT_FREQUENCY_STENCIL_ROLES,
+        "coordinate": _FIXED_ROOT_COORDINATE_STENCIL_ROLES,
+    }
+    if any(family not in roles_by_family for family in reused):
+        raise ValueError("root-sealed response reuse family is invalid")
+    if not reused:
+        return
+
+    def samples_by_role(
+        evidence: Mapping[str, object],
+        *,
+        subject: str,
+    ) -> dict[str, dict[str, object]]:
+        raw_samples = evidence.get("fixed_root_samples")
+        if not isinstance(raw_samples, list):
+            raise ValueError(
+                f"root-sealed response {subject} samples are missing"
+            )
+        try:
+            samples = tuple(
+                FixedRootDeterminantSample.from_mapping(raw)
+                for raw in raw_samples
+            )
+        except ValueError as error:
+            raise ValueError(
+                f"root-sealed response {subject} samples are invalid"
+            ) from error
+        canonical = [sample.to_mapping() for sample in samples]
+        if canonical != raw_samples:
+            raise ValueError(
+                f"root-sealed response {subject} samples are not canonical"
+            )
+        by_role = {
+            sample.readout_role: mapping
+            for sample, mapping in zip(samples, canonical, strict=True)
+        }
+        if len(by_role) != len(samples):
+            raise ValueError(
+                f"root-sealed response {subject} samples have duplicate roles"
+            )
+        return by_role
+
+    predecessor_by_role = samples_by_role(
+        predecessor_evidence, subject="predecessor"
+    )
+    repair_by_role = samples_by_role(repair_evidence, subject="repair")
+    for family in reused:
+        for role in roles_by_family[family]:
+            if (
+                role not in predecessor_by_role
+                or role not in repair_by_role
+                or repair_by_role[role] != predecessor_by_role[role]
+            ):
+                raise ValueError(
+                    "root-sealed response reused samples do not match "
+                    "their predecessor"
+                )
+
+
+def _response_precision_limited_families(
+    result: ComponentResult,
+) -> frozenset[str]:
+    """Return only complete fixed-root stencils that request more precision.
+
+    A derivative estimate is an atomic h/h2 family.  We deliberately do not
+    infer a response retry from an incomplete stencil, a zero disk, a missing
+    determinant error model, or any component-level failure; those cases are
+    terminal response evidence, not arithmetic authority for the root.
+    """
+
+    evidence = (
+        result.derivative_evidence
+        if result.derivative_evidence is not None
+        else result.analytic_horizon_evidence
+    )
+    if not isinstance(evidence, Mapping):
+        return frozenset()
+    raw_samples = evidence.get("fixed_root_samples")
+    if not isinstance(raw_samples, list):
+        return frozenset()
+    try:
+        samples = tuple(
+            FixedRootDeterminantSample.from_mapping(item)
+            for item in raw_samples
+        )
+    except ValueError:
+        return frozenset()
+    by_role = {sample.readout_role: sample for sample in samples}
+    if len(by_role) != len(samples):
+        return frozenset()
+    families: dict[str, frozenset[str]] = {
+        "frequency": _FIXED_ROOT_FREQUENCY_STENCIL_ROLES,
+        "coordinate": _FIXED_ROOT_COORDINATE_STENCIL_ROLES,
+    }
+    limited: set[str] = set()
+    for family, roles in families.items():
+        members = tuple(by_role.get(role) for role in roles)
+        if any(member is None for member in members):
+            continue
+        typed_members = tuple(member for member in members if member is not None)
+        if all(
+            member.numerical_conditioning is not None
+            and member.numerical_conditioning.precision_limited
+            for member in typed_members
+        ):
+            limited.add(family)
+    return frozenset(limited)
+
+
+def _response_requires_precision120(
+    outcome: StageOutcome,
+    result: ComponentResult,
+    *,
+    root_sealed: bool,
+    response_terminal: bool,
+) -> bool:
+    """Escalate response samples only on their own current-tier telemetry."""
+
+    if (
+        outcome.digits != 80
+        or not root_sealed
+        or response_terminal
+    ):
+        return False
+    return bool(_response_precision_limited_families(result))
+
+
 def _promoted_stage_semantics(
     outcome: StageOutcome,
     *,
@@ -6198,6 +6816,14 @@ def _promoted_stage_semantics(
             result=result,
             repeat_applicable=False,
             precision_ladder_applicable=False,
+            root_sealed=False,
+            root_requires_precision120=False,
+            response_terminal_admissible=(
+                result.status is ComponentStatus.CONVERGED
+            ),
+            response_requires_precision120=False,
+            response_repair_precision_digits=None,
+            response_repair_families=frozenset(),
             terminal_admissible=(result.status is ComponentStatus.CONVERGED),
             requires_precision120=False,
         )
@@ -6207,19 +6833,40 @@ def _promoted_stage_semantics(
                 outcome, result, predecessor
             )
         )
-        terminal = (
+        root_seal = _sealed_root_for_result(result)
+        response_families = _response_precision_limited_families(result)
+        response_terminal = (
             result.status is ComponentStatus.CONVERGED
             and result.usable
             and result.response is not None
-            and _component_conditioning_is_adequate(result)
+            and not response_families
+        )
+        root_requires = _root_requires_precision120(
+            outcome, result, root_seal
+        )
+        response_requires = _response_requires_precision120(
+            outcome,
+            result,
+            root_sealed=root_seal is not None,
+            response_terminal=response_terminal,
         )
         return _PromotedStageSemantics(
             kind=kind,
             result=result,
             repeat_applicable=False,
             precision_ladder_applicable=discrepancy_applicable,
-            terminal_admissible=terminal,
-            requires_precision120=(outcome.digits == 80 and not terminal),
+            root_sealed=root_seal is not None,
+            root_requires_precision120=root_requires,
+            response_terminal_admissible=response_terminal,
+            response_requires_precision120=response_requires,
+            response_repair_precision_digits=(
+                120 if response_requires else None
+            ),
+            response_repair_families=(
+                response_families if response_requires else frozenset()
+            ),
+            terminal_admissible=(root_seal is not None and response_terminal),
+            requires_precision120=root_requires,
         )
     if kind is _PromotedStageKind.LEGACY_FULL_LADDER:
         terminal = (
@@ -6248,6 +6895,12 @@ def _promoted_stage_semantics(
             result=result,
             repeat_applicable=(outcome.digits == 80),
             precision_ladder_applicable=True,
+            root_sealed=False,
+            root_requires_precision120=requires120,
+            response_terminal_admissible=terminal,
+            response_requires_precision120=False,
+            response_repair_precision_digits=None,
+            response_repair_families=frozenset(),
             terminal_admissible=terminal,
             requires_precision120=requires120,
         )
@@ -6256,24 +6909,46 @@ def _promoted_stage_semantics(
         outcome, result, predecessor
     )
 
-    terminal = (
+    root_seal = _sealed_root_for_result(result)
+    response_families = _response_precision_limited_families(result)
+    response_terminal = (
         result.status is ComponentStatus.CONVERGED
         and result.usable
         and result.response is not None
         and result.response_uncertainty_status == BOUNDED_DERIVATIVE_RESPONSE
-        and _component_conditioning_is_adequate(result)
+        and not response_families
         and (
             not discrepancy_applicable
             or outcome.discrepancy_enclosed is True
         )
     )
+    root_requires = _root_requires_precision120(outcome, result, root_seal)
+    response_requires = _response_requires_precision120(
+        outcome,
+        result,
+        root_sealed=root_seal is not None,
+        response_terminal=response_terminal,
+    )
+    migration_repair = _root_sealed_response_migration_pending(result)
     return _PromotedStageSemantics(
         kind=kind,
         result=result,
         repeat_applicable=False,
         precision_ladder_applicable=discrepancy_applicable,
-        terminal_admissible=terminal,
-        requires_precision120=(outcome.digits == 80 and not terminal),
+        root_sealed=root_seal is not None,
+        root_requires_precision120=root_requires,
+        response_terminal_admissible=response_terminal,
+        response_requires_precision120=response_requires,
+        response_repair_precision_digits=(
+            80 if migration_repair else 120 if response_requires else None
+        ),
+        response_repair_families=(
+            frozenset({"frequency", "coordinate"})
+            if migration_repair
+            else response_families if response_requires else frozenset()
+        ),
+        terminal_admissible=(root_seal is not None and response_terminal),
+        requires_precision120=root_requires,
     )
 
 
@@ -6286,6 +6961,7 @@ def _bind_fixed_readout_precision_comparison(
     if outcome.component_result.get("evidence_kind") not in {
         _ANALYTIC_HORIZON_EVIDENCE_KIND,
         _FIXED_ROOT_EXTERIOR_EVIDENCE_KIND,
+        _ROOT_SEALED_RESPONSE_REPAIR_EVIDENCE_KIND,
     }:
         return outcome
     raw_result = outcome.component_result.get("result")
@@ -6593,6 +7269,7 @@ def _validate_primary_record_semantics(
     *,
     promotion_decision_required: bool,
     failed_preflight_pending_allowed: bool,
+    allow_historical_promotion_decision: bool,
 ) -> bool:
     first = stages[0]
     precision80_digits, precision120_digits = _primary_recovery_digits()
@@ -6674,11 +7351,26 @@ def _validate_primary_record_semantics(
             precision80, predecessor=first
         ),
         required=promotion_decision_required,
+        allow_historical=allow_historical_promotion_decision,
     )
-    requires120 = _primary_requires_precision120(
+    root_requires120 = _primary_requires_precision120(
         precision80, predecessor=first
     )
-    if not requires120:
+    response_repair_digits = (
+        None
+        if semantics80 is None
+        else semantics80.response_repair_precision_digits
+    )
+    response_requires_repair = bool(
+        semantics80 is not None
+        and semantics80.root_sealed
+        and not semantics80.root_requires_precision120
+        and response_repair_digits is not None
+    )
+    required_next_digits = (
+        precision120_digits if root_requires120 else response_repair_digits
+    )
+    if not (root_requires120 or response_requires_repair):
         expected_state = (
             "PRODUCED"
             if (
@@ -6700,32 +7392,60 @@ def _validate_primary_record_semantics(
         return all(production_flags)
 
     if len(stages) == 2:
+        assert required_next_digits is not None
         pending = (
             record.state == "IN_PROGRESS"
             and record.missing_precision_digits is None
         ) or (
             record.state == "MISSING_PRECISION"
-            and record.missing_precision_digits == precision120_digits
+            and record.missing_precision_digits == required_next_digits
         )
         if not pending:
             raise ValueError(
-                "campaign promoted PRIMARY leaf is missing its 120-digit stage"
+                "campaign promoted PRIMARY leaf is missing its root/response repair"
             )
         return all(production_flags)
 
-    precision120 = stages[2]
-    _validate_precision120(precision120, predecessor=precision80)
+    assert required_next_digits is not None
+    repair = stages[2]
+    if repair.digits != required_next_digits:
+        raise ValueError("campaign PRIMARY repair precision is invalid")
+    if repair.digits == 120:
+        _validate_precision120(repair, predecessor=precision80)
     if not production_flags[2]:
         raise ValueError(
-            "campaign promoted PRIMARY stage lacks canonical production evidence"
+            "campaign promoted PRIMARY repair lacks canonical production evidence"
+        )
+    if response_requires_repair and (
+        repair.component_result.get("evidence_kind")
+        != _ROOT_SEALED_RESPONSE_REPAIR_EVIDENCE_KIND
+    ):
+        raise ValueError("campaign PRIMARY response repair used a root stage")
+    if (
+        response_requires_repair
+        and semantics80 is not None
+        and semantics80.kind
+        is _PromotedStageKind.FIXED_ROOT_EXTERIOR_DERIVATIVE
+    ):
+        raw_predecessor = precision80.component_result.get("result")
+        raw_repair = repair.component_result.get("result")
+        if not isinstance(raw_predecessor, Mapping) or not isinstance(
+            raw_repair, Mapping
+        ):
+            raise ValueError(
+                "campaign PRIMARY root-sealed response results are missing"
+            )
+        _validate_root_sealed_response_reuse_binding(
+            ComponentResult.from_mapping(raw_predecessor),
+            ComponentResult.from_mapping(raw_repair),
         )
     if (
         record.state != _primary_precision120_terminal_state(
-            precision120, predecessor=precision80
+            repair, predecessor=precision80
         )
         or record.missing_precision_digits is not None
     ):
-        raise ValueError("campaign PRIMARY 120-digit terminal state is inconsistent")
+        raise ValueError("campaign PRIMARY repair terminal state is inconsistent")
     return all(production_flags)
 
 
@@ -6928,6 +7648,10 @@ def _validate_record_semantics(
                 checkpoint_schema_version
                 >= _FAILED_PREFLIGHT_CHECKPOINT_SCHEMA_VERSION
             ),
+            allow_historical_promotion_decision=(
+                checkpoint_schema_version
+                < CAMPAIGN_CHECKPOINT_SCHEMA_VERSION
+            ),
         )
 
     trigger_ids = _deep_trigger_ids(first)
@@ -7030,6 +7754,9 @@ def _validate_record_semantics(
         required=(
             checkpoint_schema_version
             >= _PROMOTION_DECISION_CHECKPOINT_SCHEMA_VERSION
+        ),
+        allow_historical=(
+            checkpoint_schema_version < CAMPAIGN_CHECKPOINT_SCHEMA_VERSION
         ),
     )
     requires120 = decision["state"] == "REQUESTED"
@@ -7622,6 +8349,26 @@ def _execute_campaign_stage(
     return execute(leaf, digits)
 
 
+def _execute_promoted_response_repair(
+    backend: object,
+    leaf: CampaignLeafPlan,
+    digits: int,
+    previous_stages: Sequence[CampaignStageRecord],
+) -> StageOutcome:
+    """Execute the root-forbidden promoted response repair boundary."""
+
+    execute = getattr(backend, "execute_promoted_response_repair", None)
+    if not callable(execute):
+        raise ValueError(
+            "campaign backend lacks root-sealed response repair support"
+        )
+    return execute(
+        leaf,
+        digits,
+        tuple(stage.outcome for stage in previous_stages),
+    )
+
+
 def _execute_campaign_stage_after_failed_preflight(
     backend: object,
     leaf: CampaignLeafPlan,
@@ -7741,6 +8488,48 @@ def _execute_campaign_stage_with_progress(
                 digits,
                 previous_stages,
                 response_predictor,
+            )
+        except KeyboardInterrupt:
+            raise
+        except BaseException as error:
+            worker_failure = _worker_failure_payload(error)
+            emit_progress(
+                ProgressEventKind.LEAF_FAILED,
+                precision_digits=digits,
+                error_type=type(error).__name__,
+                message=str(error),
+                elapsed_seconds=time.monotonic() - started,
+                **(
+                    {} if worker_failure is None
+                    else {"worker_failure": worker_failure}
+                ),
+            )
+            raise
+    return outcome, time.monotonic() - started
+
+
+def _execute_promoted_response_repair_with_progress(
+    backend: object,
+    leaf: CampaignLeafPlan,
+    digits: int,
+    context: Mapping[str, object],
+    previous_stages: Sequence[CampaignStageRecord],
+) -> tuple[StageOutcome, float]:
+    """Execute only seal-bound determinant stencil recovery work."""
+
+    started = time.monotonic()
+    with progress_scope(
+        **context,
+        precision_digits=digits,
+        component_pass="promoted-response-repair",
+    ):
+        emit_progress(ProgressEventKind.PRECISION_STAGE_STARTED)
+        try:
+            outcome = _execute_promoted_response_repair(
+                backend,
+                leaf,
+                digits,
+                previous_stages,
             )
         except KeyboardInterrupt:
             raise
@@ -8243,6 +9032,181 @@ def _migrate_schema6_single_promoted_horizon_checkpoint(
     return tuple(materialized_records), renumbered_attempts
 
 
+def _schema8_leaf42_root_seal_candidate(
+    leaf: CampaignLeafPlan,
+    record: CampaignLeafRecord,
+) -> tuple[ComponentResult, PromotedRootSeal] | None:
+    """Authenticate the one historical exterior shape safe to salvage.
+
+    Schema 8 coupled a missing PRIMARY Dω error certificate to a root retry.
+    Its stage hash is not enough to authorize reuse; this deliberately derives
+    a new seal from the full persisted root readout and accepts no derivative
+    estimate, sample, or uncertainty claim from the historical response.
+    """
+
+    if (
+        leaf.role != "primary"
+        or leaf.mechanism_id != "exterior-light-ring"
+        or tuple(stage.outcome.digits for stage in record.stages) != (64, 80)
+        or record.state not in {"IN_PROGRESS", "MISSING_PRECISION"}
+        or record.missing_precision_digits not in {None, 120}
+    ):
+        return None
+    binary, promoted = (stage.outcome for stage in record.stages)
+    if not _validate_component_result(
+        leaf, binary, allow_historical_conditioning_absence=True
+    ):
+        return None
+    raw = promoted.component_result.get("result")
+    if not isinstance(raw, Mapping):
+        return None
+    result = ComponentResult.from_mapping(raw)
+    if result.to_mapping() != raw:
+        return None
+    evidence = result.derivative_evidence
+    primary = result.baseline.primary_acceptance
+    authentication = (
+        None if primary is None else primary.derivative_authentication
+    )
+    if (
+        promoted.component_result.get("evidence_kind")
+        != _FIXED_ROOT_EXTERIOR_EVIDENCE_KIND
+        or promoted.numerical_state != ComponentStatus.DERIVATIVE_UNRESOLVED.value
+        or result.component_scientific_identity
+        != EXTERIOR_DERIVATIVE_COMPONENT_IDENTITY
+        or result.status is not ComponentStatus.DERIVATIVE_UNRESOLVED
+        or result.response is not None
+        or not isinstance(evidence, Mapping)
+        or evidence.get("determinant_count") != 0
+        or evidence.get("fixed_root_samples") != []
+        or evidence.get("root_seal") is not None
+        or primary is None
+        or not primary.accepted
+        or (
+            authentication is not None
+            and authentication.determinant_error_status
+            == "available/v1"
+        )
+    ):
+        return None
+    try:
+        return result, PromotedRootSeal.derive(leaf.job, result.baseline)
+    except ValueError:
+        return None
+
+
+def _migrate_schema8_root_sealed_exterior_checkpoint(
+    plan: CampaignPlan,
+    records: Sequence[CampaignLeafRecord],
+    attempts: Sequence[CampaignExecutionAttempt],
+) -> tuple[
+    tuple[CampaignLeafRecord, ...],
+    tuple[CampaignExecutionAttempt, ...],
+    bool,
+]:
+    """Convert only the Leaf-42 stale-response shape into a seal-bound repair.
+
+    The returned 80-digit stage retains the exact historical baseline but
+    deliberately replaces its stale Dω material with a pending-response
+    marker.  The campaign then appends a current-runtime, root-forbidden
+    response-only 80 stage; it never relabels old response evidence as new.
+    """
+
+    leaf_by_id = {leaf.leaf_id: leaf for leaf in plan.leaves}
+    migrated = False
+    affected_leaf_ids: set[str] = set()
+    output: list[CampaignLeafRecord] = []
+    for record in records:
+        leaf = leaf_by_id[record.leaf_id]
+        candidate = _schema8_leaf42_root_seal_candidate(leaf, record)
+        if candidate is None:
+            output.append(record)
+            continue
+        old_result, seal = candidate
+        old_stage = record.stages[1]
+        stale_evidence = {
+            "schema": _ROOT_SEAL_RESPONSE_MIGRATION_SCHEMA,
+            "identity": _ROOT_SEAL_RESPONSE_MIGRATION_IDENTITY,
+            "source_checkpoint_schema_version": 8,
+            "source_stage_sha256": old_stage.stage_sha256,
+            "source_response_status": old_result.status.value,
+        }
+        replacement_evidence = {
+            "conditioning_decision": {
+                "accepted": False,
+                "identity": FIXED_ROOT_DERIVATIVE_CONDITIONING_IDENTITY,
+                "rejection_reason": "STALE_RESPONSE_EVIDENCE_DISCARDED",
+                "selected_candidate": None,
+            },
+            "determinant_count": 0,
+            "failure_code": "STALE_RESPONSE_EVIDENCE_DISCARDED",
+            "fixed_root_samples": [],
+            "response_disk_identity": EXTERIOR_DERIVATIVE_RESPONSE_DISK_IDENTITY,
+            "response_repair_identity": ROOT_SEALED_RESPONSE_REPAIR_IDENTITY,
+            "root_seal": seal.to_mapping(),
+            "root_seal_sha256": seal.sha256,
+            "stale_response_evidence": stale_evidence,
+        }
+        replacement_result = replace(
+            old_result,
+            derivative_evidence=replacement_evidence,
+        )
+        component = dict(old_stage.outcome.component_result)
+        component.pop("promotion_decision", None)
+        component["result"] = replacement_result.to_mapping()
+        unbound = replace(
+            old_stage.outcome,
+            numerical_state=replacement_result.status.value,
+            component_result=component,
+            local_disk_radius_abs=sum(replacement_result.error_channels.values()),
+            signed_error_channels=_component_stage_signed_error_channels(
+                component,
+                replacement_result,
+                repeat_applicable=False,
+                precision_ladder_applicable=False,
+            ),
+            self_refinement_enclosed=None,
+            discrepancy_from_previous_abs=None,
+            discrepancy_enclosed=None,
+        )
+        replacement = _stage_with_promotion_decision(
+            unbound,
+            _primary_precision120_decision(
+                unbound, predecessor=record.stages[0].outcome
+            ),
+        )
+        output.append(CampaignLeafRecord(
+            leaf_id=record.leaf_id,
+            role=record.role,
+            state="IN_PROGRESS",
+            stages=(
+                record.stages[0],
+                CampaignStageRecord(replacement, old_stage.runner_provenance),
+            ),
+            trigger_ids=record.trigger_ids,
+            sentinel=record.sentinel,
+            missing_precision_digits=None,
+            sentinel_comparison=record.sentinel_comparison,
+        ))
+        affected_leaf_ids.add(record.leaf_id)
+        migrated = True
+    if not migrated:
+        return tuple(output), tuple(attempts), False
+    retained_attempts = tuple(
+        attempt
+        for attempt in attempts
+        if attempt.leaf_id not in affected_leaf_ids
+    )
+    # The migrated record now carries no old root retry authorization.  Any
+    # historical response-triggered 120 attempt is stale operational history,
+    # so keep only attempts for unaffected leaves and renumber append-only IDs.
+    retained_attempts = tuple(
+        replace(attempt, attempt_ordinal=index)
+        for index, attempt in enumerate(retained_attempts, start=1)
+    )
+    return tuple(output), retained_attempts, True
+
+
 def _run_campaign_selection_active(
     plan: CampaignPlan,
     selection: CampaignSelection,
@@ -8272,6 +9236,7 @@ def _run_campaign_selection_active(
         if loaded_selection != selection:
             raise ValueError("campaign checkpoint selection does not match request")
         migrated_schema6 = loaded_schema_version == 6
+        migrated_schema8 = False
         if migrated_schema6:
             existing, loaded_attempts = (
                 _migrate_schema6_single_promoted_horizon_checkpoint(
@@ -8292,6 +9257,21 @@ def _run_campaign_selection_active(
                 )
                 else "PARTIAL"
             )
+        elif loaded_schema_version == 8 and loaded_state == "PARTIAL":
+            existing, loaded_attempts, migrated_schema8 = (
+                _migrate_schema8_root_sealed_exterior_checkpoint(
+                    plan,
+                    existing,
+                    loaded_attempts,
+                )
+            )
+            if not migrated_schema8:
+                raise ValueError(
+                    "incomplete historical campaign checkpoint is read-only; "
+                    "preserve it as evidence and start with a fresh checkpoint path"
+                )
+            loaded_schema_version = CAMPAIGN_CHECKPOINT_SCHEMA_VERSION
+            loaded_state = "PARTIAL"
         elif (
             loaded_schema_version != CAMPAIGN_CHECKPOINT_SCHEMA_VERSION
             and loaded_state == "PARTIAL"
@@ -8346,7 +9326,7 @@ def _run_campaign_selection_active(
             )
             loaded_state = "PARTIAL"
         records_by_id = {record.leaf_id: record for record in existing}
-        if migrated_schema6 or invalidated_leaf_ids:
+        if migrated_schema6 or migrated_schema8 or invalidated_leaf_ids:
             leaf_by_id = {leaf.leaf_id: leaf for leaf in plan.leaves}
             for record in existing:
                 _validate_record_semantics(
@@ -9024,17 +10004,35 @@ def _run_campaign_selection_active(
                     else None
                 )
                 _, precision120_digits = _primary_recovery_digits()
-                if _primary_requires_precision120(
+                root_requires120 = _primary_requires_precision120(
                     outcome80, predecessor=record.stages[0].outcome
-                ):
+                )
+                response_repair_digits = (
+                    None
+                    if semantics80 is None
+                    else semantics80.response_repair_precision_digits
+                )
+                response_requires_repair = bool(
+                    semantics80 is not None
+                    and semantics80.root_sealed
+                    and not semantics80.root_requires_precision120
+                    and response_repair_digits is not None
+                )
+                required_next_digits = (
+                    precision120_digits
+                    if root_requires120
+                    else response_repair_digits
+                )
+                if root_requires120 or response_requires_repair:
+                    assert required_next_digits is not None
                     state = (
                         "MISSING_PRECISION"
-                        if precision120_digits not in available.digits
+                        if required_next_digits not in available.digits
                         else "IN_PROGRESS"
                     )
                     missing = (
-                        precision120_digits
-                        if precision120_digits not in available.digits
+                        required_next_digits
+                        if required_next_digits not in available.digits
                         else None
                     )
                 else:
@@ -9208,36 +10206,79 @@ def _run_campaign_selection_active(
                 )
             continue
         if len(record.stages) == 2:
-            if _ordinary_fixed_readout_precision120_failure_for_leaf(
-                attempts, leaf, record
-            ) is not None:
+            promoted_semantics = (
+                _promoted_stage_semantics(
+                    record.stages[1].outcome,
+                    predecessor=record.stages[0].outcome,
+                )
+                if isinstance(
+                    record.stages[1].outcome.component_result.get("result"),
+                    Mapping,
+                )
+                else None
+            )
+            response_repair_digits = (
+                None
+                if promoted_semantics is None
+                else promoted_semantics.response_repair_precision_digits
+            )
+            response_repair = bool(
+                leaf.role == "primary"
+                and promoted_semantics is not None
+                and promoted_semantics.root_sealed
+                and not promoted_semantics.root_requires_precision120
+                and response_repair_digits is not None
+            )
+            if (
+                not response_repair
+                and _ordinary_fixed_readout_precision120_failure_for_leaf(
+                    attempts, leaf, record
+                ) is not None
+            ):
                 # A contained failure at the maximum configured tier is a
                 # durable operational outcome.  Preserve its append-only
                 # receipt and do not repeat the same expensive request on
                 # every resume.
                 continue
-            precision120_digits = (
+            root_precision_digits = (
                 _primary_recovery_digits()[1]
                 if leaf.role == "primary"
                 else 120
             )
-            if precision120_digits not in available.digits:
+            next_digits = (
+                response_repair_digits if response_repair else root_precision_digits
+            )
+            assert next_digits is not None
+            if next_digits not in available.digits:
                 continue
             try:
-                outcome120, stage_duration = _execute_campaign_stage_with_progress(
-                    backend,
-                    leaf,
-                    precision120_digits,
-                    context,
-                    record.stages,
-                    response_predictor,
-                )
+                if response_repair:
+                    next_outcome, stage_duration = (
+                        _execute_promoted_response_repair_with_progress(
+                            backend,
+                            leaf,
+                            next_digits,
+                            context,
+                            record.stages,
+                        )
+                    )
+                else:
+                    next_outcome, stage_duration = (
+                        _execute_campaign_stage_with_progress(
+                            backend,
+                            leaf,
+                            next_digits,
+                            context,
+                            record.stages,
+                            response_predictor,
+                        )
+                    )
             except _CONTAINABLE_EXCEPTION_TYPES as error:
                 attempt = _execution_attempt_from_failure(
                     error,
                     leaf=leaf,
                     context=context,
-                    digits=precision120_digits,
+                    digits=next_digits,
                     attempt_ordinal=len(attempts) + 1,
                 )
                 if attempt is None:
@@ -9252,39 +10293,43 @@ def _run_campaign_selection_active(
                         attempts,
                     ),
                     context=context,
-                    digits=precision120_digits,
+                    digits=next_digits,
                 )
                 continue
-            if not isinstance(outcome120, StageOutcome) or outcome120.digits != 120:
-                raise ValueError("campaign backend returned incomplete 120-digit evidence")
+            if (
+                not isinstance(next_outcome, StageOutcome)
+                or next_outcome.digits != next_digits
+            ):
+                raise ValueError("campaign backend returned incomplete response/root evidence")
             production120 = _validate_component_result(
                 leaf,
-                outcome120,
+                next_outcome,
                 allow_historical_conditioning_absence=False,
             )
-            smoke120 = outcome120.component_result.get(
+            smoke120 = next_outcome.component_result.get(
                 "evidence_kind"
             ) == "synthetic-orchestration-contract"
             if not production120 and not smoke120:
                 raise ValueError(
-                    "campaign promoted 120-digit stage lacks canonical "
+                    "campaign promoted repair stage lacks canonical "
                     "production evidence"
                 )
-            _validate_precision120(
-                outcome120, predecessor=record.stages[1].outcome
-            )
+            if next_digits == 120:
+                _validate_precision120(
+                    next_outcome, predecessor=record.stages[1].outcome
+                )
             semantics120 = (
                 _promoted_stage_semantics(
-                    outcome120, predecessor=record.stages[1].outcome
+                    next_outcome, predecessor=record.stages[1].outcome
                 )
                 if isinstance(
-                    outcome120.component_result.get("result"), Mapping
+                    next_outcome.component_result.get("result"), Mapping
                 )
                 else None
             )
             _validate_fixed_readout_predictor_binding(
                 record.stages[1].outcome,
-                outcome120,
+                next_outcome,
             )
             executed += 1
             if leaf.role == "primary":
@@ -9292,12 +10337,12 @@ def _run_campaign_selection_active(
                     leaf_id=record.leaf_id,
                     role=record.role,
                     state=_primary_precision120_terminal_state(
-                        outcome120,
+                        next_outcome,
                         predecessor=record.stages[1].outcome,
                     ),
                     stages=(
                         *record.stages,
-                        _campaign_stage_record(plan, available, outcome120),
+                        _campaign_stage_record(plan, available, next_outcome),
                     ),
                 )
             else:
@@ -9312,23 +10357,23 @@ def _run_campaign_selection_active(
                         if false_negative
                         else (
                             _primary_precision120_terminal_state(
-                                outcome120,
+                                next_outcome,
                                 predecessor=record.stages[1].outcome,
                             )
                             if semantics120 is not None
                             else _terminal_state(
-                                outcome120,
-                                enclosed=bool(outcome120.discrepancy_enclosed),
+                                next_outcome,
+                                enclosed=bool(next_outcome.discrepancy_enclosed),
                             )
                         )
                     ),
                     stages=(
                         *record.stages,
-                        _campaign_stage_record(plan, available, outcome120),
+                        _campaign_stage_record(plan, available, next_outcome),
                     ),
                     trigger_ids=record.trigger_ids,
                     sentinel=record.sentinel,
-                    missing_precision_digits=120 if false_negative else None,
+                    missing_precision_digits=next_digits if false_negative else None,
                     sentinel_comparison=record.sentinel_comparison,
                 )
             records_by_id[leaf_id] = record
@@ -9341,7 +10386,7 @@ def _run_campaign_selection_active(
                     attempts,
                 ),
                 context=context,
-                digits=precision120_digits,
+                digits=next_digits,
                 duration_seconds=stage_duration,
                 record=record,
                 leaf=leaf,
@@ -10137,6 +11182,54 @@ def _run_promoted_exterior_component_with_progress(
         return result
 
 
+def _run_promoted_exterior_response_repair_with_progress(
+    job: ResponseComponentJob,
+    backend: object,
+    seal: PromotedRootSeal,
+    *,
+    repair_families: frozenset[str],
+    reusable_result: ComponentResult,
+) -> ComponentResult:
+    """Run only fixed-root response work; this path has no root operation."""
+
+    started = time.monotonic()
+    with progress_scope(component_pass="promoted-response-repair"):
+        emit_progress(ProgressEventKind.COMPONENT_PASS_STARTED)
+        try:
+            result = run_promoted_exterior_response_from_seal(
+                job,
+                backend,  # type: ignore[arg-type]
+                seal,
+                derivative_step=job.policy.epsilons[0],
+                repair_families=repair_families,
+                reusable_result=reusable_result,
+            )
+        except KeyboardInterrupt:
+            raise
+        except BaseException as error:
+            emit_progress(
+                ProgressEventKind.ERROR,
+                component_pass="promoted-response-repair",
+                error_type=type(error).__name__,
+                message=str(error),
+                elapsed_seconds=time.monotonic() - started,
+            )
+            raise
+        emit_progress(
+            ProgressEventKind.COMPONENT_PASS_COMPLETED,
+            component_pass="promoted-response-repair",
+            status=result.status.value,
+            readout_count=0,
+            fixed_root_determinant_count=(
+                0
+                if result.derivative_evidence is None
+                else result.derivative_evidence["determinant_count"]
+            ),
+            elapsed_seconds=time.monotonic() - started,
+        )
+        return result
+
+
 def _is_single_promoted_horizon_stage(
     leaf: CampaignLeafPlan,
     digits: int,
@@ -10443,6 +11536,134 @@ class NativeCampaignStageBackend:
     ) -> StageOutcome:
         return self.execute_promoted_stage_with_predictor(
             leaf, digits, previous_outcomes, None
+        )
+
+    def execute_promoted_response_repair(
+        self,
+        leaf: CampaignLeafPlan,
+        digits: int,
+        previous_outcomes: Sequence[StageOutcome],
+    ) -> StageOutcome:
+        """Repair response samples at a persisted root; never read a root."""
+
+        if (
+            leaf.mechanism_id not in {
+                "horizon-admittance",
+                "exterior-light-ring",
+            }
+            or digits not in self.precision_capabilities.digits
+            or digits not in (80, 120)
+            or tuple(stage.digits for stage in previous_outcomes) != (64, 80)
+        ):
+            raise NativeResourceUnavailableError(
+                "root-sealed response repair requires a 64/80 promoted predecessor"
+            )
+        if self.julia_adapter is None:
+            raise NativeResourceUnavailableError("M02 Julia precision worker is unavailable")
+        raw_previous = previous_outcomes[-1].component_result.get("result")
+        if not isinstance(raw_previous, Mapping):
+            raise ValueError("root-sealed response repair predecessor is missing")
+        previous_result = ComponentResult.from_mapping(raw_previous)
+        seal = _sealed_root_for_result(previous_result)
+        if seal is None:
+            raise ValueError("root-sealed response repair predecessor lacks a seal")
+        seal.validate_for(leaf.job)
+        response_backend = self._julia_precision_backend_for(leaf.job, digits)
+        if leaf.mechanism_id == "horizon-admittance":
+            result = run_promoted_horizon_response_from_seal(
+                leaf.job,
+                response_backend,
+                seal,
+                derivative_step=leaf.job.policy.epsilons[0],
+            )
+        else:
+            repair_families = _response_precision_limited_families(
+                previous_result
+            )
+            if _root_sealed_response_migration_pending(previous_result):
+                repair_families = frozenset({"frequency", "coordinate"})
+            if not repair_families:
+                raise ValueError(
+                    "root-sealed exterior repair lacks a precision-limited "
+                    "or migrated derivative family"
+                )
+            response_backend = _journaled_promoted_exterior_response_backend(
+                leaf.job,
+                response_backend,
+                seal=seal,
+                derivative_step=leaf.job.policy.epsilons[0],
+                validation_reason=None,
+                repair_families=repair_families,
+            )
+            result = _run_promoted_exterior_response_repair_with_progress(
+                leaf.job,
+                response_backend,
+                seal,
+                repair_families=repair_families,
+                reusable_result=previous_result,
+            )
+        if leaf.mechanism_id == "horizon-admittance":
+            response_repair_scope = "fixed-root-domega-stencil-only/v1"
+        else:
+            evidence = result.derivative_evidence
+            if not isinstance(evidence, Mapping):
+                raise ValueError("root-sealed exterior repair evidence is missing")
+            scope = evidence.get("response_repair_scope")
+            if not isinstance(scope, Mapping):
+                raise ValueError("root-sealed exterior repair scope is missing")
+            recomputed = scope.get("recomputed_families")
+            reused = scope.get("reused_families")
+            if not isinstance(recomputed, list) or not isinstance(reused, list):
+                raise ValueError("root-sealed exterior repair scope is invalid")
+            actual_families = frozenset(recomputed)
+            response_repair_scope = (
+                "fixed-root-domega-stencil-only/v1"
+                if actual_families == {"frequency"}
+                else "fixed-root-dc-stencil-only/v1"
+                if actual_families == {"coordinate"}
+                else "fixed-root-domega-dc-stencils-only/v1"
+                if actual_families == {"frequency", "coordinate"}
+                else None
+            )
+            if response_repair_scope is None:
+                raise ValueError("root-sealed exterior repair scope is invalid")
+        component_result = {
+            "evidence_kind": _ROOT_SEALED_RESPONSE_REPAIR_EVIDENCE_KIND,
+            "result": result.to_mapping(),
+            "self_refinement_result": None,
+            "self_refinement_skipped_reason": (
+                _FIXED_ROOT_EXTERIOR_SELF_REFINEMENT_SKIPPED_REASON
+            ),
+            "scientific_runtime": response_backend.scientific_runtime_for(
+                leaf.job
+            ),
+            "root_seal_sha256": seal.sha256,
+            "response_repair_scope": response_repair_scope,
+            "precision_ladder_discrepancy_applicable": False,
+            "precision_ladder_discrepancy_reason": (
+                _PREVIOUS_PROMOTED_RESPONSE_UNAVAILABLE_REASON
+                if previous_result.response is None
+                else None
+            ),
+        }
+        local_radius = sum(result.error_channels.values())
+        unbound = StageOutcome(
+            digits=digits,
+            numerical_state=result.status.value,
+            component_result=component_result,
+            local_disk_radius_abs=local_radius,
+            signed_error_channels=_component_stage_signed_error_channels(
+                component_result,
+                result,
+                repeat_applicable=False,
+                precision_ladder_applicable=False,
+            ),
+            self_refinement_enclosed=None,
+            discrepancy_from_previous_abs=None,
+            discrepancy_enclosed=None,
+        )
+        return _bind_fixed_readout_precision_comparison(
+            unbound, previous_outcomes[-1]
         )
 
     def execute_promoted_stage_after_failed_preflight(

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from decimal import Decimal
 from pathlib import Path
 import tempfile
 from unittest.mock import patch
@@ -20,6 +21,8 @@ from windows_solver.response_batches import (
     _classify_promoted_stage,
     _component_stage_signed_error_channels,
     _deep_precision120_decision,
+    _primary_precision120_decision,
+    _promoted_stage_semantics,
     _validate_component_result,
     _validate_record_semantics,
     _validate_selective_stage,
@@ -33,7 +36,9 @@ from windows_solver.response_engine import (
     ComponentResult,
     ComponentStatus,
     NumericalPolicy,
+    PromotedRootSeal,
     VettedNativeDeterminantKernel,
+    run_promoted_exterior_response_from_seal,
 )
 
 
@@ -208,7 +213,7 @@ class PromotedStageSemanticsRegressionTests(unittest.TestCase):
         }
         if with_promotion_decision:
             component["promotion_decision"] = {
-                "schema": "windows-solver.precision-promotion-decision/1",
+                "schema": "windows-solver.precision-promotion-decision/2",
                 "from_precision_digits": 80,
                 "to_precision_digits": 120,
                 "state": "SUPPRESSED",
@@ -435,7 +440,142 @@ class PromotedStageSemanticsRegressionTests(unittest.TestCase):
             decision["reason"], "CONVERGED_PROMOTION_GATES_SATISFIED"
         )
 
-    def test_identityless_analytic_branch_loss_reaches_120_terminal(
+    def test_root_promotion_decision_ignores_response_only_mutation(self) -> None:
+        """N: sealed-root promotion is invariant under response replacement."""
+
+        fixture = self.fixed_fixture
+        baseline = (
+            exterior_fixtures.PromotedExteriorDerivativeTests
+            ._baseline_with_derivative_evidence(fixture.leaf)
+        )
+        baseline = replace(baseline, omega=fixture.leaf.job.root.omega)
+        seal = PromotedRootSeal.derive(fixture.leaf.job, baseline)
+        resolved = run_promoted_exterior_response_from_seal(
+            fixture.leaf.job,
+            exterior_fixtures.FixedRootOnlyBackend(fixture.leaf.job, baseline),
+            seal,
+            derivative_step=0.004,
+        )
+        unresolved = run_promoted_exterior_response_from_seal(
+            fixture.leaf.job,
+            campaign_fixtures._NoisyScientificFixedRootBackend(
+                fixture.leaf.job, baseline, 80
+            ),
+            seal,
+            derivative_step=0.004,
+        )
+        self.assertEqual(resolved.baseline.to_mapping(), unresolved.baseline.to_mapping())
+        self.assertEqual(
+            resolved.derivative_evidence["root_seal_sha256"],
+            unresolved.derivative_evidence["root_seal_sha256"],
+        )
+
+        def stage(result: ComponentResult) -> StageOutcome:
+            component = {
+                "evidence_kind": (
+                    "package-owned-julia-fixed-root-exterior-derivative-component"
+                ),
+                "result": result.to_mapping(),
+                "precision_ladder_discrepancy_applicable": False,
+                "precision_ladder_discrepancy_reason": (
+                    "BINARY64_COMPONENT_RESPONSE_UNAVAILABLE"
+                ),
+            }
+            return StageOutcome(
+                digits=80,
+                numerical_state=result.status.value,
+                component_result=component,
+                local_disk_radius_abs=sum(result.error_channels.values()),
+                signed_error_channels=_component_stage_signed_error_channels(
+                    component,
+                    result,
+                    repeat_applicable=False,
+                    precision_ladder_applicable=False,
+                ),
+                self_refinement_enclosed=None,
+                discrepancy_from_previous_abs=None,
+                discrepancy_enclosed=None,
+            )
+
+        resolved_decision = _primary_precision120_decision(stage(resolved))
+        unresolved_decision = _primary_precision120_decision(stage(unresolved))
+        self.assertEqual(resolved_decision, unresolved_decision)
+        self.assertEqual(unresolved_decision["state"], "SUPPRESSED")
+
+    def test_root_conditioning_alone_changes_root_promotion_decision(self) -> None:
+        """O: a genuine root precision flag remains the sole 120 authority."""
+
+        fixture = self.fixed_fixture
+        baseline = (
+            exterior_fixtures.PromotedExteriorDerivativeTests
+            ._baseline_with_derivative_evidence(fixture.leaf)
+        )
+        baseline = replace(baseline, omega=fixture.leaf.job.root.omega)
+        conditioning = baseline.numerical_conditioning
+        self.assertIsNotNone(conditioning)
+        limited_baseline = replace(
+            baseline,
+            numerical_conditioning=replace(
+                conditioning,
+                predicted_reliable_digits=Decimal("11"),
+                required_reliable_digits=Decimal("24"),
+                precision_limited=True,
+            ),
+        )
+
+        def typed_root_stage(root_baseline) -> StageOutcome:
+            result = exterior_fixtures.response_engine._unresolved_result(
+                fixture.leaf.job,
+                ComponentStatus.NOT_CONVERGED,
+                root_baseline,
+                (),
+            )
+            component = {
+                "evidence_kind": (
+                    "package-owned-julia-fixed-root-exterior-derivative-component"
+                ),
+                "result": result.to_mapping(),
+                "precision_ladder_discrepancy_applicable": False,
+                "precision_ladder_discrepancy_reason": (
+                    "BINARY64_COMPONENT_RESPONSE_UNAVAILABLE"
+                ),
+            }
+            return StageOutcome(
+                digits=80,
+                numerical_state=result.status.value,
+                component_result=component,
+                local_disk_radius_abs=0.0,
+                signed_error_channels=_component_stage_signed_error_channels(
+                    component,
+                    result,
+                    repeat_applicable=False,
+                    precision_ladder_applicable=False,
+                ),
+                self_refinement_enclosed=None,
+                discrepancy_from_previous_abs=None,
+                discrepancy_enclosed=None,
+            )
+
+        adequate = _primary_precision120_decision(typed_root_stage(baseline))
+        limited = _primary_precision120_decision(
+            typed_root_stage(limited_baseline)
+        )
+        self.assertEqual(adequate["state"], "SUPPRESSED")
+        self.assertEqual(limited["state"], "REQUESTED")
+        self.assertEqual(
+            limited["reason"], "ROOT_CONDITIONING_PRECISION_LIMITED"
+        )
+
+    def test_fixed_readout_can_hold_a_sealed_unresolved_response(self) -> None:
+        """P: root completion and response terminality are separate states."""
+
+        binary, promoted = self._unbounded_fixed_root_stage()
+        semantics = _promoted_stage_semantics(promoted, predecessor=binary)
+        self.assertTrue(semantics.root_sealed)
+        self.assertFalse(semantics.root_requires_precision120)
+        self.assertFalse(semantics.response_terminal_admissible)
+
+    def test_identityless_analytic_branch_loss_never_requests_root_precision(
         self,
     ) -> None:
         try:
@@ -454,17 +594,16 @@ class PromotedStageSemanticsRegressionTests(unittest.TestCase):
             (
                 ComponentStatus.NOT_CONVERGED.value,
                 ComponentStatus.BRANCH_LOSS.value,
-                ComponentStatus.BRANCH_LOSS.value,
             ),
         )
         self.assertEqual(
             record.stages[1].outcome.component_result[
                 "promotion_decision"
             ]["state"],
-            "REQUESTED",
+            "SUPPRESSED",
         )
 
-    def test_bounded_analytic_120_terminates_after_identityless_80_failure(
+    def test_identityless_analytic_branch_loss_stays_terminal_even_if_120_is_good(
         self,
     ) -> None:
         try:
@@ -475,7 +614,7 @@ class PromotedStageSemanticsRegressionTests(unittest.TestCase):
             self.fail(f"typed analytic failure crashed admission: {error}")
 
         record = summary.records[0]
-        self.assertEqual(record.state, "PRODUCED")
+        self.assertEqual(record.state, "UNRESOLVED")
         self.assertEqual(
             tuple(
                 stage.outcome.numerical_state for stage in record.stages
@@ -483,7 +622,6 @@ class PromotedStageSemanticsRegressionTests(unittest.TestCase):
             (
                 ComponentStatus.NOT_CONVERGED.value,
                 ComponentStatus.BRANCH_LOSS.value,
-                ComponentStatus.CONVERGED.value,
             ),
         )
 

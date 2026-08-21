@@ -75,6 +75,7 @@ class PartialComponentEntry:
     request_sha256: str
     worker_response_receipt: Mapping[str, object]
     worker_response_receipt_sha256: str
+    root_seal_sha256: str | None = None
 
     def __post_init__(self) -> None:
         tier = precision_tier(self.precision_tier)
@@ -90,6 +91,11 @@ class PartialComponentEntry:
             raise ValueError("partial component request digest is invalid")
         if not _HEX_64.fullmatch(self.worker_response_receipt_sha256):
             raise ValueError("partial component worker receipt digest is invalid")
+        if (
+            self.root_seal_sha256 is not None
+            and _HEX_64.fullmatch(self.root_seal_sha256) is None
+        ):
+            raise ValueError("partial component root seal digest is invalid")
         normalized_receipt = json.loads(
             canonical_json_bytes(dict(self.worker_response_receipt))
         )
@@ -114,7 +120,7 @@ class PartialComponentEntry:
         )
 
     def work_unit_mapping(self) -> dict[str, object]:
-        return {
+        mapping = {
             "amplitude": _complex_mapping(self.amplitude),
             "backend_identity": self.backend_identity,
             "component_scientific_identity": self.component_scientific_identity,
@@ -131,6 +137,9 @@ class PartialComponentEntry:
             "refinement_level": self.refinement_level,
             "request_sha256": self.request_sha256,
         }
+        if self.root_seal_sha256 is not None:
+            mapping["root_seal_sha256"] = self.root_seal_sha256
+        return mapping
 
     @property
     def work_unit_id(self) -> str:
@@ -173,6 +182,7 @@ class PartialComponentEntry:
                 request_sha256=material["request_sha256"],
                 worker_response_receipt=material["worker_response_receipt"],
                 worker_response_receipt_sha256=material["worker_response_receipt_sha256"],
+                root_seal_sha256=material.get("root_seal_sha256"),
             )
         except (KeyError, TypeError) as error:
             raise ValueError("partial component journal entry fields are invalid") from error
@@ -201,6 +211,7 @@ class PartialComponentWorkUnit:
     readout_role: str
     refinement_level: int
     request_sha256: str
+    root_seal_sha256: str | None = None
 
     @classmethod
     def from_entry(cls, value: PartialComponentEntry) -> "PartialComponentWorkUnit":
@@ -220,6 +231,7 @@ class PartialComponentWorkUnit:
             readout_role=value.readout_role,
             refinement_level=value.refinement_level,
             request_sha256=value.request_sha256,
+            root_seal_sha256=value.root_seal_sha256,
         )
 
     def _identity_entry(self) -> PartialComponentEntry:
@@ -249,6 +261,7 @@ class PartialComponentWorkUnit:
             request_sha256=self.request_sha256,
             worker_response_receipt=receipt,
             worker_response_receipt_sha256=_digest(receipt),
+            root_seal_sha256=self.root_seal_sha256,
         )
 
 
