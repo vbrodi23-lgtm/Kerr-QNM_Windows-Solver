@@ -41,6 +41,8 @@ Base.length(request::FixedRootSpecRequest) = length(request.data)
 Base.iterate(request::FixedRootSpecRequest, state...) =
     iterate(request.data, state...)
 Base.getindex(request::FixedRootSpecRequest, key) = request.data[key]
+Base.get(request::FixedRootSpecRequest, key, default) =
+    get(request.data, key, default)
 Base.setindex!(request::FixedRootSpecRequest, value, key) =
     setindex!(request.data, value, key)
 Base.haskey(request::FixedRootSpecRequest, key) = haskey(request.data, key)
@@ -212,6 +214,26 @@ end
         @test result.determinant_count == 1
         @test result.raw_determinant_evaluation_count == 3
         @test scenario.raw_calls == 3
+        breakdown = result.root_evaluation.error_breakdown
+        @test breakdown !== nothing
+        @test isapprox(
+            breakdown.endpoint_disagreement_abs,
+            BigFloat("2e-17");
+            rtol=BigFloat("1e-70"),
+        )
+        @test isapprox(
+            breakdown.control_disagreement_abs,
+            BigFloat("1e-12");
+            rtol=BigFloat("1e-70"),
+        )
+        @test isapprox(
+            breakdown.precision_disagreement_abs,
+            BigFloat("2e-12");
+            rtol=BigFloat("1e-70"),
+        )
+        @test breakdown.safety_factor == BigFloat(64)
+        @test result.root_evaluation.error_model_id ==
+            EXTERIOR_EMPIRICAL_ERROR_MODEL_ID
         @test result.root == parse_complex(
             BigFloat, flatten_request(exterior), "omega_re", "omega_im"
         )
