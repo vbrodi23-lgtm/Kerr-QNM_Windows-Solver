@@ -1237,7 +1237,9 @@ class PromotedHorizonStageTests(unittest.TestCase):
 
         adequate = outcome_for(_promoted_baseline(self.leaf.job))
         self.assertEqual(
-            _primary_precision120_terminal_state(adequate),
+            _primary_precision120_terminal_state(
+                adequate, predecessor=precision80
+            ),
             "PRODUCED",
         )
         inadequate = _promoted_baseline(self.leaf.job)
@@ -1253,7 +1255,9 @@ class PromotedHorizonStageTests(unittest.TestCase):
             True,
         )
         self.assertEqual(
-            _primary_precision120_terminal_state(outcome_for(inadequate)),
+            _primary_precision120_terminal_state(
+                outcome_for(inadequate), predecessor=precision80
+            ),
             "UNRESOLVED",
         )
 

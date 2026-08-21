@@ -111,6 +111,13 @@ preservation, and cache/provenance separation from historical raw-state leaves.
   determinant counts, preserve sealed schema-9 checkpoint mappings byte for
   byte, and bind promoted-exterior partial journals to the active scientific
   runtime so worker changes roll forward without deleting prior journal files.
+- Centralise promoted campaign-stage semantics across the complete lifecycle:
+  authenticate legacy ladder, selective readout, analytic horizon, and
+  fixed-root exterior derivative stages from both evidence kind and component
+  identity; make fixed-root self-refinement explicitly inapplicable; admit and
+  promote it through PRIMARY/deep/recovery policy; and prove atomic checkpoint,
+  solved-leaf cache, partial-journal, and zero-work resume behavior with the
+  real Leaf 42 orchestration path while faking only expensive numerical work.
 
 ### Work Log
 
@@ -171,5 +178,22 @@ preservation, and cache/provenance separation from historical raw-state leaves.
   exact obsolete assertion; the final Julia green run remains the PR CI gate.
   No production determinant, Newton, angular, coordinate, ODE, campaign, or
   PowerShell run was performed. TASK-079 remains In Progress.
+- 2026-08-21 — Draft PR #61 centralises promoted-stage semantics across live
+  admission, PRIMARY/deep 80→120 decisions, terminal classification,
+  failed-preflight and endpoint recovery, checkpoint/cache authentication,
+  publication, reload, and resume. Fixed-root exterior self-refinement and
+  unavailable response comparisons remain explicitly not applicable; forged
+  Boolean enclosure or root-frequency discrepancy evidence fails closed.
+  Production-path Leaf 42 canaries retain `NativeCampaignStageBackend`, fake
+  only the numerical worker boundary, cross atomic checkpoint and solved-cache
+  persistence, and prove zero-call resume for complete journals and durable
+  max-precision failures. The existing 40 completed records, accepted promoted
+  horizon work, worker/request identities, and PR #60 journals remain
+  preserved without deleting checkpoints, caches, runtimes, or journals. Full
+  safe Python discovery passes 1,022 tests with 7 skips; the 231-test expanded
+  lifecycle matrix, compilation, TaskPlanner validation, and diff hygiene pass.
+  No production determinant, Newton, angular, coordinate, ODE, Kerr campaign,
+  or PowerShell run was performed. TASK-079 remains In Progress pending CI,
+  native operator evidence, physical results, and human mathematics review.
 
 ---

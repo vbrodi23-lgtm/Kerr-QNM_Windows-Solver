@@ -21,6 +21,7 @@ from windows_solver.precision_tiers import PrecisionTier, working_precision_bits
 from windows_solver.response_batches import (
     PrecisionCapabilities,
     StageOutcome,
+    _component_stage_signed_error_channels,
     _validate_component_result,
     build_campaign_plan,
     synthetic_stage_signed_error_channels,
@@ -482,6 +483,141 @@ class PromotedExteriorDerivativeTests(unittest.TestCase):
             self.assertTrue(final.complete)
             self.assertEqual(len(final.entries), 5)
 
+    def test_completed_production_partial_journal_reuses_all_reads_byte_stably(self) -> None:
+        """An identical full assembly is a byte-stable, zero-worker replay."""
+
+        leaf = _primary_exterior_leaf()
+        baseline = self._baseline_with_derivative_evidence(leaf)
+        scientific_runtime = {
+            "julia_version": "1.11.7",
+            "worker_sha256": "a" * 64,
+        }
+        scientific_runtime_sha256 = hashlib.sha256(
+            canonical_json_bytes(scientific_runtime)
+        ).hexdigest()
+        runtime_identity = "b" * 64
+        receipt = response_engine._journal_json_value(
+            baseline.worker_response_receipt
+        )
+        receipt["scientific_runtime_sha256"] = (
+            scientific_runtime_sha256
+        )
+        material = {
+            key: value
+            for key, value in receipt.items()
+            if key != "receipt_sha256"
+        }
+        receipt["receipt_sha256"] = hashlib.sha256(
+            canonical_json_bytes(material)
+        ).hexdigest()
+        baseline = replace(baseline, worker_response_receipt=receipt)
+
+        class ExactPreviewBackend(FixedRootOnlyBackend):
+            def __init__(self):
+                super().__init__(
+                    leaf.job,
+                    baseline,
+                    runtime_identity=runtime_identity,
+                )
+
+            def scientific_runtime_for(self, job):
+                return dict(scientific_runtime)
+
+            def preview_root_request(
+                self,
+                job,
+                amplitude,
+                primary_predictor,
+                primary_predictor_kind,
+                readout_role,
+            ):
+                return dict(
+                    self.baseline.worker_response_receipt[
+                        "request_binding"
+                    ]
+                )
+
+            def preview_fixed_root_request(
+                self, job, omega, amplitude, readout_role
+            ):
+                converted = complex(amplitude)
+                return {
+                    "amplitude": {
+                        "imaginary": converted.imag,
+                        "real": converted.real,
+                    },
+                    "job_id": job.job_id,
+                    "leaf_id": job.leaf_id,
+                    "omega": {
+                        "imaginary": omega.imag,
+                        "real": omega.real,
+                    },
+                    "readout_role": readout_role,
+                }
+
+        with tempfile.TemporaryDirectory() as temporary, patch.dict(
+            "os.environ",
+            {"KERR_QNM_PARTIAL_COMPONENT_JOURNAL_ROOT": temporary},
+        ):
+            first_backend = ExactPreviewBackend()
+            first_result = run_promoted_exterior_component(
+                leaf.job,
+                first_backend,
+                primary_predictor=baseline.omega,
+                derivative_step=0.004,
+            )
+            self.assertEqual(first_backend.root_amplitudes, [0.0j])
+            self.assertEqual(len(first_backend.sample_amplitudes), 4)
+
+            journals = tuple(Path(temporary).glob("*.json"))
+            self.assertEqual(len(journals), 1)
+            journal_path = journals[0]
+            original_bytes = journal_path.read_bytes()
+            original = PartialComponentJournal.load(journal_path)
+            self.assertTrue(original.complete)
+            self.assertEqual(len(original.entries), 5)
+
+            for entry in original.entries.values():
+                output = entry.worker_response_receipt["output"]
+                output_receipt = output["worker_response_receipt"]
+                self.assertEqual(
+                    output_receipt["scientific_runtime_sha256"],
+                    scientific_runtime_sha256,
+                )
+                self.assertEqual(
+                    entry.request_sha256,
+                    (
+                        output_receipt["request_sha256"]
+                        if entry.readout_role == "baseline-root"
+                        else output["request_sha256"]
+                    ),
+                )
+                if entry.readout_role != "baseline-root":
+                    self.assertEqual(
+                        output_receipt["runtime_identity_sha256"],
+                        runtime_identity,
+                    )
+
+            second_backend = ExactPreviewBackend()
+            second_result = run_promoted_exterior_component(
+                leaf.job,
+                second_backend,
+                primary_predictor=baseline.omega,
+                derivative_step=0.004,
+            )
+
+            self.assertEqual(second_backend.root_amplitudes, [])
+            self.assertEqual(second_backend.sample_amplitudes, [])
+            self.assertEqual(
+                second_result.to_mapping(), first_result.to_mapping()
+            )
+            self.assertEqual(
+                tuple(Path(temporary).glob("*.json")), (journal_path,)
+            )
+            self.assertEqual(journal_path.read_bytes(), original_bytes)
+            reloaded = PartialComponentJournal.load(journal_path)
+            self.assertEqual(reloaded.to_mapping(), original.to_mapping())
+
     def test_production_partial_journal_worker_change_reruns_baseline(self) -> None:
         """A changed worker rolls forward without deleting the old journal."""
 
@@ -909,15 +1045,24 @@ class PromotedExteriorDerivativeTests(unittest.TestCase):
                 "NOT_REQUIRED_BY_FIXED_ROOT_DERIVATIVE_POLICY"
             ),
             "scientific_runtime": runtime,
+            "primary_root_predictor_source": (
+                "PREVIOUS_STAGE_BASELINE_OMEGA"
+            ),
+            "precision_ladder_discrepancy_applicable": False,
+            "precision_ladder_discrepancy_reason": (
+                "BINARY64_COMPONENT_RESPONSE_UNAVAILABLE"
+            ),
         }
         outcome = StageOutcome(
             digits=80,
             numerical_state="CONVERGED",
             component_result=payload,
             local_disk_radius_abs=sum(result.error_channels.values()),
-            signed_error_channels=synthetic_stage_signed_error_channels(
+            signed_error_channels=_component_stage_signed_error_channels(
                 payload,
-                sum(result.error_channels.values()),
+                result,
+                repeat_applicable=False,
+                precision_ladder_applicable=False,
             ),
             self_refinement_enclosed=None,
             discrepancy_from_previous_abs=None,
@@ -933,9 +1078,11 @@ class PromotedExteriorDerivativeTests(unittest.TestCase):
         tampered = replace(
             outcome,
             component_result=tampered_payload,
-            signed_error_channels=synthetic_stage_signed_error_channels(
+            signed_error_channels=_component_stage_signed_error_channels(
                 tampered_payload,
-                sum(result.error_channels.values()),
+                result,
+                repeat_applicable=False,
+                precision_ladder_applicable=False,
             ),
         )
         with self.assertRaisesRegex(ValueError, "sample runtime identity"):
@@ -1033,15 +1180,24 @@ class PromotedExteriorDerivativeTests(unittest.TestCase):
                 "NOT_REQUIRED_BY_FIXED_ROOT_DERIVATIVE_POLICY"
             ),
             "scientific_runtime": runtime,
+            "primary_root_predictor_source": (
+                "PREVIOUS_STAGE_BASELINE_OMEGA"
+            ),
+            "precision_ladder_discrepancy_applicable": False,
+            "precision_ladder_discrepancy_reason": (
+                "BINARY64_COMPONENT_RESPONSE_UNAVAILABLE"
+            ),
         }
         outcome = StageOutcome(
             digits=80,
             numerical_state="CONVERGED",
             component_result=payload,
             local_disk_radius_abs=sum(result.error_channels.values()),
-            signed_error_channels=synthetic_stage_signed_error_channels(
+            signed_error_channels=_component_stage_signed_error_channels(
                 payload,
-                sum(result.error_channels.values()),
+                result,
+                repeat_applicable=False,
+                precision_ladder_applicable=False,
             ),
             self_refinement_enclosed=None,
             discrepancy_from_previous_abs=None,
