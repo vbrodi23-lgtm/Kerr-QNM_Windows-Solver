@@ -118,6 +118,12 @@ preservation, and cache/provenance separation from historical raw-state leaves.
   promote it through PRIMARY/deep/recovery policy; and prove atomic checkpoint,
   solved-leaf cache, partial-journal, and zero-work resume behavior with the
   real Leaf 42 orchestration path while faking only expensive numerical work.
+- Repair PR #62 with the approved root-seal architecture: derive and persist a
+  deterministic promoted-root seal solely from authenticated root evidence;
+  split root-precision escalation from response repair; recover missing Dω/D_c
+  at the sealed frequency without any further root call; version sample and
+  checkpoint evidence; migrate the partial Leaf 42 checkpoint without deleting
+  prior work; and remove the workflow carrier that mutates source after push.
 
 ### Work Log
 
@@ -195,5 +201,22 @@ preservation, and cache/provenance separation from historical raw-state leaves.
   No production determinant, Newton, angular, coordinate, ODE, Kerr campaign,
   or PowerShell run was performed. TASK-079 remains In Progress pending CI,
   native operator evidence, physical results, and human mathematics review.
+- 2026-08-21 — PR #62 completes the root-seal architecture repair: the Julia
+  PRIMARY now propagates existing exterior determinant-error evidence; a
+  deterministic authenticated root seal binds the accepted root/provenance;
+  ROOT precision and RESPONSE precision are independently classified; and
+  missing or precision-limited fixed-root Dω/Dc evidence is repaired by
+  response-only stencils at the sealed frequency. Checkpoint schema 9 migrates
+  the Leaf-42-shaped schema-8 predecessor by retaining its adequate 80-digit
+  root while discarding stale response evidence under the current runtime.
+  Partial journals bind every response work unit to the root-seal digest, and
+  horizon response repair follows the same no-re-root rule. The temporary
+  post-push source-mutation workflow and trigger were removed. Full permitted
+  Python discovery passes 1,037 tests with 7 skips; static compilation,
+  TaskPlanner validation, and diff hygiene pass. No Julia worker, Kerr
+  determinant, Newton, angular, coordinate, ODE, production campaign, or
+  PowerShell numerical execution was run. TASK-079 remains In Progress pending
+  hosted CI, native operator receipts, physical results, and human mathematics
+  review.
 
 ---

@@ -42,6 +42,7 @@ from windows_solver.response_engine import (
     DecimalComplex,
     DerivativeAuthenticationEvidence,
     DiagnosticRootReadout,
+    FixedRootDeterminantSample,
     FixedRootDiagnosticEvidence,
     NumericalConditioningEvidence,
     NumericalPolicy,
@@ -50,7 +51,11 @@ from windows_solver.response_engine import (
     PROMOTED_ROOT_READOUT_POLICY,
     RootReadout,
     VettedNativeDeterminantKernel,
+    PromotedRootSeal,
+    run_promoted_horizon_response_from_seal,
 )
+from windows_solver.precision_tiers import PrecisionTier, working_precision_bits
+from windows_solver.root_readout_cache import runtime_identity_sha256
 from windows_solver.gsn_cache_producer import GeneratedGsnCache, GsnParameterPair
 from windows_solver.julia_response_backend import JuliaPrecisionRootBackend
 from windows_solver.promoted_control_calibration import (
@@ -250,6 +255,82 @@ class FakePromotedBackend:
         raise AssertionError("dedicated promoted runner called generic closed form")
 
 
+class RootForbiddenHorizonResponseBackend:
+    """Fixed-frequency Dω boundary used to prove the root airgap."""
+
+    def __init__(self, job) -> None:
+        self.identity = job.backend_identity
+        self.calls: list[str] = []
+
+    def bind_job(self, job):
+        return job
+
+    def read_root(self, *args, **kwargs):
+        raise AssertionError("sealed horizon response repair called read_root")
+
+    def sample_fixed_root_determinant(self, job, omega, amplitude, *, readout_role):
+        self.calls.append(readout_role)
+        request = {
+            "job_id": job.job_id,
+            "leaf_id": job.leaf_id,
+            "omega": {"real": omega.real, "imaginary": omega.imag},
+            "amplitude": {"real": amplitude.real, "imaginary": amplitude.imag},
+            "readout_role": readout_role,
+        }
+        request_sha256 = hashlib.sha256(canonical_json_bytes(request)).hexdigest()
+        determinant = 5.0 * complex(omega)
+        error_text = "1e-18"
+        response = {
+            "schema_version": 1,
+            "status": "ok",
+            "operation": "fixed-root-determinant-sample",
+            "request_sha256": request_sha256,
+            "omega_re": str(omega.real),
+            "omega_im": str(omega.imag),
+            "amplitude_re": str(amplitude.real),
+            "amplitude_im": str(amplitude.imag),
+            "determinant_re": str(determinant.real),
+            "determinant_im": str(determinant.imag),
+            "determinant_error_abs": error_text,
+            "determinant_error_status": "available/v1",
+            "determinant_error_model_id": "synthetic-absolute-bound/v1",
+            "determinant_family": "horizon-scattering/v1",
+            "determinant_normalisation": "cinc-over-cref-minus-reflectivity/v1",
+            "branch_identity": "gsn-complex-rho/v1",
+            "branch_authenticated": True,
+            "semantic_precision_tier": "bigfloat-80",
+            "working_precision_bits": working_precision_bits(PrecisionTier.BIGFLOAT_80),
+            "readout_role": readout_role,
+        }
+        receipt = {
+            "schema": "windows-solver.fixed-root-determinant-sample-receipt/1",
+            "request_binding": request,
+            "request_sha256": request_sha256,
+            "response_binding": response,
+            "response_sha256": hashlib.sha256(canonical_json_bytes(response)).hexdigest(),
+            "runtime_identity_sha256": "a" * 64,
+            "scientific_runtime_sha256": "b" * 64,
+        }
+        return FixedRootDeterminantSample(
+            omega=omega,
+            amplitude=amplitude,
+            determinant=determinant,
+            determinant_error_abs=1.0e-18,
+            determinant_error_status="available/v1",
+            determinant_error_model_id="synthetic-absolute-bound/v1",
+            determinant_family="horizon-scattering/v1",
+            determinant_normalisation="cinc-over-cref-minus-reflectivity/v1",
+            branch_identity="gsn-complex-rho/v1",
+            branch_authenticated=True,
+            request_sha256=request_sha256,
+            worker_response_receipt=receipt,
+            worker_response_receipt_sha256=hashlib.sha256(canonical_json_bytes(receipt)).hexdigest(),
+            precision_tier=PrecisionTier.BIGFLOAT_80,
+            working_precision_bits=working_precision_bits(PrecisionTier.BIGFLOAT_80),
+            readout_role=readout_role,
+        )
+
+
 def _with_worker_receipt(job, baseline, digits, primary_predictor):
     calibration_receipt = load_default_calibration_receipt()
     determinant_family = (
@@ -346,6 +427,45 @@ class PromotedHorizonComponentTests(unittest.TestCase):
             "dedicated promoted horizon runner is missing",
         )
         return response_engine.run_promoted_horizon_component
+
+    def test_sealed_horizon_frequency_repair_never_reads_root(self):
+        baseline = _promoted_baseline(self.job, omega=self.job.root.omega)
+        primary = baseline.primary_acceptance
+        self.assertIsNotNone(primary)
+        baseline = replace(
+            baseline,
+            primary_acceptance=replace(
+                primary,
+                derivative_authentication=None,
+            ),
+        )
+        seal = PromotedRootSeal.derive(self.job, baseline)
+        backend = RootForbiddenHorizonResponseBackend(self.job)
+
+        result = run_promoted_horizon_response_from_seal(
+            self.job,
+            backend,
+            seal,
+            derivative_step=0.004,
+        )
+
+        self.assertEqual(result.status, ComponentStatus.CONVERGED)
+        self.assertEqual(
+            backend.calls,
+            [
+                "frequency-real-plus-h",
+                "frequency-real-minus-h",
+                "frequency-real-plus-h2",
+                "frequency-real-minus-h2",
+            ],
+        )
+        self.assertEqual(
+            result.component_scientific_identity,
+            "root-sealed-horizon-fixed-frequency-derivative-component/v3",
+        )
+        self.assertEqual(
+            result.analytic_horizon_evidence["root_seal_sha256"], seal.sha256
+        )
 
     def test_one_zero_amplitude_baseline_readout_and_no_epsilon_ladder(self):
         backend = FakePromotedBackend(self.job, self.baseline)
@@ -714,6 +834,154 @@ class FakeJuliaPrecisionBackend(FakePromotedBackend):
         )
 
 
+class FixedFrequencyJuliaBackend(FakeJuliaPrecisionBackend):
+    """Synthetic fixed-frequency boundary with production-shaped receipts."""
+
+    def __init__(
+        self,
+        job,
+        baseline,
+        digits,
+        *,
+        sample_precision_limited: bool,
+        forbid_root: bool = False,
+    ) -> None:
+        super().__init__(job, baseline, digits)
+        self.sample_tier = {
+            80: PrecisionTier.BIGFLOAT_80,
+            120: PrecisionTier.BIGFLOAT_120,
+        }[digits]
+        self.refinement = 0
+        self.forbid_root = forbid_root
+        self.sample_calls: list[str] = []
+        conditioning = baseline.numerical_conditioning
+        if conditioning is None:
+            raise ValueError("fixed-frequency fixture lacks conditioning")
+        self.sample_conditioning = replace(
+            conditioning,
+            predicted_reliable_digits=(
+                Decimal("11")
+                if sample_precision_limited
+                else conditioning.predicted_reliable_digits
+            ),
+            required_reliable_digits=(
+                Decimal("24")
+                if sample_precision_limited
+                else conditioning.required_reliable_digits
+            ),
+            precision_limited=sample_precision_limited,
+        )
+
+    def read_root(self, *args, **kwargs):
+        if self.forbid_root:
+            raise AssertionError("root-sealed horizon repair called read_root")
+        return super().read_root(*args, **kwargs)
+
+    def sample_fixed_root_determinant(
+        self,
+        job,
+        omega,
+        amplitude,
+        *,
+        readout_role,
+    ):
+        self.sample_calls.append(readout_role)
+        determinant = 5.0 * complex(omega)
+        request = {
+            "job_id": job.job_id,
+            "leaf_id": job.leaf_id,
+            "omega": {"real": omega.real, "imaginary": omega.imag},
+            "amplitude": {
+                "real": amplitude.real,
+                "imaginary": amplitude.imag,
+            },
+            "readout_role": readout_role,
+        }
+        request_sha256 = hashlib.sha256(
+            canonical_json_bytes(request)
+        ).hexdigest()
+        runtime = self.scientific_runtime_for(job)
+        runtime_provenance = {
+            name: value
+            for name, value in runtime.items()
+            if name not in {
+                "precision_digits",
+                "working_precision_bits",
+                "semantic_precision_tier",
+                "refinement_level",
+                "regularised_gsn_precision_policy",
+                "ode_error_budget",
+                "ode_error_budget_sha256",
+                "promoted_control_calibration",
+                "empirical_control_profile",
+                "empirical_control_profile_sha256",
+            }
+        }
+        response = {
+            "schema_version": 2,
+            "status": "ok",
+            "operation": "fixed-root-determinant-sample",
+            "request_sha256": request_sha256,
+            "omega_re": str(omega.real),
+            "omega_im": str(omega.imag),
+            "amplitude_re": str(amplitude.real),
+            "amplitude_im": str(amplitude.imag),
+            "determinant_re": str(determinant.real),
+            "determinant_im": str(determinant.imag),
+            "determinant_error_abs": "1e-18",
+            "determinant_error_status": "available/v1",
+            "determinant_error_model_id": "synthetic-absolute-bound/v1",
+            "determinant_family": "horizon-scattering/v1",
+            "determinant_normalisation": (
+                "cinc-over-cref-minus-reflectivity/v1"
+            ),
+            "branch_identity": "gsn-complex-rho/v1",
+            "branch_authenticated": True,
+            "semantic_precision_tier": self.sample_tier.value,
+            "working_precision_bits": working_precision_bits(self.sample_tier),
+            "readout_role": readout_role,
+            "numerical_conditioning": self.sample_conditioning.to_mapping(),
+        }
+        receipt = {
+            "schema": "windows-solver.fixed-root-determinant-sample-receipt/2",
+            "request_binding": request,
+            "request_sha256": request_sha256,
+            "response_binding": response,
+            "response_sha256": hashlib.sha256(
+                canonical_json_bytes(response)
+            ).hexdigest(),
+            "runtime_identity_sha256": runtime_identity_sha256(
+                runtime_provenance
+            ),
+            "scientific_runtime_sha256": hashlib.sha256(
+                canonical_json_bytes(runtime)
+            ).hexdigest(),
+        }
+        return FixedRootDeterminantSample(
+            omega=omega,
+            amplitude=amplitude,
+            determinant=determinant,
+            determinant_error_abs=1.0e-18,
+            determinant_error_status="available/v1",
+            determinant_error_model_id="synthetic-absolute-bound/v1",
+            determinant_family="horizon-scattering/v1",
+            determinant_normalisation=(
+                "cinc-over-cref-minus-reflectivity/v1"
+            ),
+            branch_identity="gsn-complex-rho/v1",
+            branch_authenticated=True,
+            request_sha256=request_sha256,
+            worker_response_receipt=receipt,
+            worker_response_receipt_sha256=hashlib.sha256(
+                canonical_json_bytes(receipt)
+            ).hexdigest(),
+            precision_tier=self.sample_tier,
+            working_precision_bits=working_precision_bits(self.sample_tier),
+            readout_role=readout_role,
+            numerical_conditioning=self.sample_conditioning,
+        )
+
+
 class PromotedHorizonStageTests(unittest.TestCase):
     def setUp(self) -> None:
         self.leaf = _primary_horizon_leaf()
@@ -736,6 +1004,123 @@ class PromotedHorizonStageTests(unittest.TestCase):
                 80: synthetic_ode_error_budget(80),
                 120: synthetic_ode_error_budget(120),
             },
+        )
+
+    def test_horizon_response_precision_repair_never_calls_the_120_root(self):
+        """The horizon path shares the root-seal airgap and response ladder."""
+
+        predictor = self.leaf.job.root.omega + complex(1.0e-4, -1.0e-4)
+        previous = _stage_from_result(
+            64,
+            _binary64_nonconverged_result(self.leaf.job, predictor),
+        )
+        baseline = _promoted_baseline(
+            self.leaf.job,
+            omega=self.leaf.job.root.omega,
+        )
+        primary = baseline.primary_acceptance
+        self.assertIsNotNone(primary)
+        baseline = replace(
+            baseline,
+            primary_acceptance=replace(
+                primary,
+                derivative_authentication=None,
+            ),
+        )
+        baseline = _with_worker_receipt(
+            self.leaf.job,
+            baseline,
+            80,
+            predictor,
+        )
+        workers = {
+            80: FixedFrequencyJuliaBackend(
+                self.leaf.job,
+                baseline,
+                80,
+                sample_precision_limited=True,
+            ),
+            120: FixedFrequencyJuliaBackend(
+                self.leaf.job,
+                baseline,
+                120,
+                sample_precision_limited=False,
+                forbid_root=True,
+            ),
+        }
+        with patch(
+            "windows_solver.response_batches.JuliaPrecisionRootBackend",
+            side_effect=lambda _identity, _adapter, digits, **_kwargs: (
+                workers[digits]
+            ),
+        ):
+            stage80 = self.backend.execute_promoted_stage_with_predictor(
+                self.leaf,
+                80,
+                (previous,),
+                response_predictor=predictor,
+            )
+            stage80 = _stage_with_promotion_decision(
+                stage80,
+                _primary_precision120_decision(
+                    stage80,
+                    predecessor=previous,
+                ),
+            )
+            repair = self.backend.execute_promoted_response_repair(
+                self.leaf,
+                120,
+                (previous, stage80),
+            )
+
+        result80 = ComponentResult.from_mapping(
+            stage80.component_result["result"]
+        )
+        repaired = ComponentResult.from_mapping(
+            repair.component_result["result"]
+        )
+        self.assertEqual(result80.status, ComponentStatus.CONVERGED)
+        self.assertEqual(repaired.status, ComponentStatus.CONVERGED)
+        self.assertEqual(
+            repair.component_result["evidence_kind"],
+            "package-owned-julia-root-sealed-response-repair",
+        )
+        self.assertEqual(
+            repair.component_result["response_repair_scope"],
+            "fixed-root-domega-stencil-only/v1",
+        )
+        self.assertEqual(workers[80].calls, [(self.leaf.job, 0.0j, predictor)])
+        self.assertEqual(workers[120].calls, [])
+        self.assertEqual(len(workers[80].sample_calls), 4)
+        self.assertEqual(len(workers[120].sample_calls), 4)
+
+        plan = build_campaign_plan(
+            policy=NumericalPolicy(),
+            backend_identity=VettedNativeDeterminantKernel.identity,
+            precision_capabilities=PrecisionCapabilities((64, 80, 120)),
+        )
+        provenance = {
+            "precision_factory_identity": (
+                plan.precision_factory_identity.to_mapping()
+            ),
+            "available_precision_digits": [64, 80, 120],
+        }
+        record = CampaignLeafRecord(
+            leaf_id=self.leaf.leaf_id,
+            role=self.leaf.role,
+            state="PRODUCED",
+            stages=(
+                CampaignStageRecord(previous, provenance),
+                CampaignStageRecord(stage80, provenance),
+                CampaignStageRecord(repair, provenance),
+            ),
+        )
+        self.assertTrue(
+            _validate_record_semantics(
+                self.leaf,
+                record,
+                plan.precision_factory_identity,
+            )
         )
 
     def _record_with_receipt_predictor(self, receipt_predictor):
@@ -864,14 +1249,11 @@ class PromotedHorizonStageTests(unittest.TestCase):
             key: value for key, value in receipt.items()
             if key != "receipt_sha256"
         })).hexdigest()
-        forged_result = ComponentResult.from_mapping(forged)
-        with self.assertRaisesRegex(
-            ValueError, "canonical.*request|worker response receipt identity"
-        ):
-            _validate_current_promoted_runtime(
-                self.leaf, outcome, forged_result,
-                allow_historical_conditioning_absence=False,
-            )
+        # The root seal is now a first-class binding.  A forged baseline
+        # receipt cannot even be parsed as a horizon component before runtime
+        # request authentication is reached.
+        with self.assertRaisesRegex(ValueError, "root seal"):
+            ComponentResult.from_mapping(forged)
 
     def test_deep_horizon_ordinary_and_failed_preflight_use_horizon_runner(self):
         plan = build_campaign_plan(

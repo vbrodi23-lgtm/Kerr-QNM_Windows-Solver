@@ -930,7 +930,7 @@ class PromotedConditioningDecisionTests(unittest.TestCase):
             "promotion_decision"
         ]
         self.assertEqual(decision, {
-            "schema": "windows-solver.precision-promotion-decision/1",
+            "schema": "windows-solver.precision-promotion-decision/2",
             "from_precision_digits": 80,
             "to_precision_digits": 120,
             "state": "REQUESTED",
@@ -1212,7 +1212,7 @@ class PromotedConditioningDecisionTests(unittest.TestCase):
             "regularised_gsn_precision_policy"
         )
         component["promotion_decision"] = {
-            "schema": "windows-solver.precision-promotion-decision/1",
+            "schema": "windows-solver.precision-promotion-decision/2",
             "from_precision_digits": 80,
             "to_precision_digits": 120,
             "state": "REQUESTED",

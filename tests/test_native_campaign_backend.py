@@ -142,7 +142,7 @@ def _failed_preflight_attempt(leaf, *, primary_predictor=None):
             "avoided_ode_scope": "factored-homogeneous-gsn/v1",
         },
         "promotion_decision": {
-            "schema": "windows-solver.precision-promotion-decision/1",
+            "schema": "windows-solver.precision-promotion-decision/2",
             "from_precision_digits": 80,
             "to_precision_digits": 120,
             "state": "REQUESTED",
@@ -207,7 +207,7 @@ def _endpoint_arithmetic_attempt(
         precision_bits=failure["request_binding"]["working_precision_bits"],
     )
     failure["promotion_decision"] = {
-        "schema": "windows-solver.precision-promotion-decision/1",
+        "schema": "windows-solver.precision-promotion-decision/2",
         "from_precision_digits": 80,
         "to_precision_digits": 120,
         "state": "REQUESTED",

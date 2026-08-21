@@ -120,6 +120,146 @@ class _NoisyScientificFixedRootBackend(_ScientificFixedRootBackend):
         )
 
 
+class _PrecisionLimitedResponseSampleBackend(_NoisyScientificFixedRootBackend):
+    """Expose response-tier conditioning without changing root evidence."""
+
+    def __init__(self, job, baseline, digits: int) -> None:
+        super().__init__(job, baseline, digits)
+        conditioning = baseline.numerical_conditioning
+        if conditioning is None:
+            raise ValueError("test baseline lacks numerical conditioning")
+        self.sample_conditioning = replace(
+            conditioning,
+            predicted_reliable_digits=Decimal("11"),
+            required_reliable_digits=Decimal("24"),
+            precision_limited=True,
+        )
+
+    def sample_fixed_root_determinant(self, *args, **kwargs):
+        sample = super().sample_fixed_root_determinant(*args, **kwargs)
+        receipt = dict(sample.worker_response_receipt)
+        response = dict(receipt["response_binding"])
+        response.update({
+            "schema_version": 2,
+            "numerical_conditioning": self.sample_conditioning.to_mapping(),
+        })
+        receipt.update({
+            "schema": (
+                "windows-solver.fixed-root-determinant-sample-receipt/2"
+            ),
+            "response_binding": response,
+            "response_sha256": hashlib.sha256(
+                canonical_json_bytes(response)
+            ).hexdigest(),
+        })
+        return replace(
+            sample,
+            numerical_conditioning=self.sample_conditioning,
+            worker_response_receipt=receipt,
+            worker_response_receipt_sha256=hashlib.sha256(
+                canonical_json_bytes(receipt)
+            ).hexdigest(),
+        )
+
+
+class _FrequencyLimitedResponseSampleBackend(_ScientificFixedRootBackend):
+    """Make only the Dω h/h2 family request a response-tier escalation."""
+
+    def __init__(self, job, baseline, digits: int) -> None:
+        super().__init__(job, baseline, digits)
+        conditioning = baseline.numerical_conditioning
+        if conditioning is None:
+            raise ValueError("test baseline lacks numerical conditioning")
+        self.frequency_conditioning = replace(
+            conditioning,
+            predicted_reliable_digits=Decimal("11"),
+            required_reliable_digits=Decimal("24"),
+            precision_limited=True,
+        )
+
+    def sample_fixed_root_determinant(self, *args, **kwargs):
+        sample = super().sample_fixed_root_determinant(*args, **kwargs)
+        conditioned = (
+            self.frequency_conditioning
+            if sample.readout_role.startswith("frequency-")
+            else self.baseline.numerical_conditioning
+        )
+        assert conditioned is not None
+        receipt = dict(sample.worker_response_receipt)
+        response = dict(receipt["response_binding"])
+        response.update({
+            "schema_version": 2,
+            "numerical_conditioning": conditioned.to_mapping(),
+        })
+        receipt.update({
+            "schema": "windows-solver.fixed-root-determinant-sample-receipt/2",
+            "response_binding": response,
+            "response_sha256": hashlib.sha256(
+                canonical_json_bytes(response)
+            ).hexdigest(),
+        })
+        return replace(
+            sample,
+            numerical_conditioning=conditioned,
+            worker_response_receipt=receipt,
+            worker_response_receipt_sha256=hashlib.sha256(
+                canonical_json_bytes(receipt)
+            ).hexdigest(),
+        )
+
+
+class _RootForbiddenScientificFixedRootBackend(_ScientificFixedRootBackend):
+    """A response worker whose root API is an executable air-gap alarm."""
+
+    def read_root(self, *args, **kwargs):
+        raise AssertionError("root-sealed response repair must not call read_root")
+
+    def sample_fixed_root_determinant(self, *args, **kwargs):
+        sample = super().sample_fixed_root_determinant(*args, **kwargs)
+        job = args[0]
+        receipt = dict(sample.worker_response_receipt)
+        receipt["scientific_runtime_sha256"] = hashlib.sha256(
+            canonical_json_bytes(self.scientific_runtime_for(job))
+        ).hexdigest()
+        return replace(
+            sample,
+            worker_response_receipt=receipt,
+            worker_response_receipt_sha256=hashlib.sha256(
+                canonical_json_bytes(receipt)
+            ).hexdigest(),
+        )
+
+
+class _RootForbiddenScientificFrequencyBackend(
+    _RootForbiddenScientificFixedRootBackend
+):
+    """A rootless response worker with independent fixed-frequency Dω data."""
+
+    def sample_fixed_root_determinant(self, *args, **kwargs):
+        sample = super().sample_fixed_root_determinant(*args, **kwargs)
+        determinant = 5.0 * sample.omega + (2.0 + 3.0j) * sample.amplitude
+        receipt = dict(sample.worker_response_receipt)
+        response = dict(receipt["response_binding"])
+        response.update({
+            "determinant_re": str(determinant.real),
+            "determinant_im": str(determinant.imag),
+            "determinant_error_abs": "1e-18",
+        })
+        receipt["response_binding"] = response
+        receipt["response_sha256"] = hashlib.sha256(
+            canonical_json_bytes(response)
+        ).hexdigest()
+        return replace(
+            sample,
+            determinant=determinant,
+            determinant_error_abs=1.0e-18,
+            worker_response_receipt=receipt,
+            worker_response_receipt_sha256=hashlib.sha256(
+                canonical_json_bytes(receipt)
+            ).hexdigest(),
+        )
+
+
 class _FailingScientificFixedRootBackend(_ScientificFixedRootBackend):
     """Raise one authenticated control failure at the worker boundary."""
 
@@ -436,12 +576,16 @@ class PromotedExteriorCampaignFlowCanary(unittest.TestCase):
         validated = validate_campaign_checkpoint(self.plan, checkpoint)
         self.assertEqual(validated.records, cold.records)
 
-        journal_paths = tuple((self.root / "component-journals").glob("*.json"))
-        self.assertEqual(len(journal_paths), 1)
-        journal = PartialComponentJournal.load(journal_paths[0])
-        self.assertTrue(journal.complete)
-        self.assertEqual(len(journal.entries), 5)
-        journal_bytes = journal_paths[0].read_bytes()
+        journal_paths = tuple(
+            sorted((self.root / "component-journals").glob("*.json"))
+        )
+        self.assertEqual(len(journal_paths), 2)
+        journals = tuple(PartialComponentJournal.load(path) for path in journal_paths)
+        self.assertEqual(
+            sorted((journal.complete, len(journal.entries)) for journal in journals),
+            [(True, 1), (True, 4)],
+        )
+        journal_bytes = {path: path.read_bytes() for path in journal_paths}
 
         contract = backend.scientific_execution_contract_for(self.leaf)
         scientific_identity = scientific_computation_identity_sha256(
@@ -492,7 +636,8 @@ class PromotedExteriorCampaignFlowCanary(unittest.TestCase):
         self.assertEqual(cached.executed_stage_count, 0)
         self.assertEqual(cached.reused_stage_count, 2)
         self.assertEqual(checkpoint.read_bytes(), raw_checkpoint)
-        self.assertEqual(journal_paths[0].read_bytes(), journal_bytes)
+        for path, persisted in journal_bytes.items():
+            self.assertEqual(path.read_bytes(), persisted)
 
     def test_live_rejects_mismatched_80_predictor_before_checkpoint(self):
         """A malformed promoted transition must not enter durable state."""
@@ -535,21 +680,17 @@ class PromotedExteriorCampaignFlowCanary(unittest.TestCase):
         )
 
     def test_live_rejects_mismatched_120_predictor_before_checkpoint(self):
-        """The 80→120 binding gate must run before the 120 checkpoint write."""
+        """Only a root-specific retry may invoke a 120 root predictor."""
 
         checkpoint = self.root / "mismatched-120-predictor.json"
         selection = build_campaign_selection(
             self.plan, role="primary", leaf_ids=(self.leaf.leaf_id,)
         )
         backend = self._native_backend()
-        baseline80 = (
-            exterior_derivative_fixtures.PromotedExteriorDerivativeTests
-            ._baseline_with_derivative_evidence(self.leaf)
-        )
         wrong_predictor = self.leaf.job.root.omega + complex(1.0e-5, -1.0e-5)
         workers = {
-            80: _NoisyScientificFixedRootBackend(
-                self.leaf.job, baseline80, 80
+            80: self._precision_backend(
+                self.leaf, 80, precision_limited=True
             ),
             120: self._precision_backend(
                 self.leaf, 120, primary_predictor=wrong_predictor
@@ -581,8 +722,8 @@ class PromotedExteriorCampaignFlowCanary(unittest.TestCase):
         )
         self.assertEqual(validated.records[0].state, "IN_PROGRESS")
 
-    def test_leaf42_unbounded_80_runs_bounded_120_to_terminal_checkpoint(self):
-        """The live campaign must execute, admit, persist, and reload 120."""
+    def test_leaf42_unbounded_80_terminalizes_without_a_root_escalation(self):
+        """An unbounded response cannot authorize a replacement root."""
 
         checkpoint = self.root / "unbounded-then-120.json"
         selection = build_campaign_selection(
@@ -616,17 +757,17 @@ class PromotedExteriorCampaignFlowCanary(unittest.TestCase):
             )
 
         record = summary.records[0]
-        self.assertEqual(summary.executed_stage_count, 3)
-        self.assertEqual(record.state, "PRODUCED")
+        self.assertEqual(summary.executed_stage_count, 2)
+        self.assertEqual(record.state, "UNRESOLVED")
         self.assertEqual(
             tuple(stage.outcome.digits for stage in record.stages),
-            (64, 80, 120),
+            (64, 80),
         )
         self.assertEqual(
             record.stages[1].outcome.component_result[
                 "promotion_decision"
             ]["state"],
-            "REQUESTED",
+            "SUPPRESSED",
         )
         self.assertEqual(
             ComponentResult.from_mapping(
@@ -634,18 +775,8 @@ class PromotedExteriorCampaignFlowCanary(unittest.TestCase):
             ).status,
             ComponentStatus.DERIVATIVE_UNRESOLVED,
         )
-        self.assertEqual(
-            ComponentResult.from_mapping(
-                record.stages[2].outcome.component_result["result"]
-            ).status,
-            ComponentStatus.CONVERGED,
-        )
-        self.assertIs(
-            record.stages[2].outcome.component_result[
-                "precision_ladder_discrepancy_applicable"
-            ],
-            False,
-        )
+        self.assertEqual(workers[120].root_amplitudes, [])
+        self.assertEqual(workers[120].sample_amplitudes, [])
         self.assertEqual(validate_campaign_checkpoint(
             self.plan, checkpoint
         ).records, summary.records)
@@ -774,7 +905,7 @@ class PromotedExteriorCampaignFlowCanary(unittest.TestCase):
         journal_paths = tuple(
             sorted((self.root / "component-journals").glob("*.json"))
         )
-        self.assertEqual(len(journal_paths), 2)
+        self.assertEqual(len(journal_paths), 3)
         journals = tuple(
             PartialComponentJournal.load(path) for path in journal_paths
         )
@@ -783,7 +914,7 @@ class PromotedExteriorCampaignFlowCanary(unittest.TestCase):
                 (journal.complete, len(journal.entries))
                 for journal in journals
             ),
-            [(False, 1), (True, 5)],
+            [(True, 1), (True, 1), (True, 4)],
         )
         journal_bytes = {
             path: path.read_bytes() for path in journal_paths
@@ -880,12 +1011,8 @@ class PromotedExteriorCampaignFlowCanary(unittest.TestCase):
             self.plan, role="primary", leaf_ids=(self.leaf.leaf_id,)
         )
         backend = self._native_backend()
-        baseline80 = (
-            exterior_derivative_fixtures.PromotedExteriorDerivativeTests
-            ._baseline_with_derivative_evidence(self.leaf)
-        )
-        worker80 = _NoisyScientificFixedRootBackend(
-            self.leaf.job, baseline80, 80
+        worker80 = self._precision_backend(
+            self.leaf, 80, precision_limited=True
         )
 
         baseline120 = (
@@ -1337,8 +1464,8 @@ class PromotedExteriorCampaignFlowCanary(unittest.TestCase):
             summary.records,
         )
 
-    def test_unbounded_fixed_root_80_requests_bounded_120(self):
-        """Catches a primary decision that ignores an unbounded derivative disk."""
+    def test_unbounded_fixed_root_80_cannot_request_a_root_retry(self):
+        """A response disk failure is not root-location evidence."""
 
         backend = self._native_backend()
         binary_result = self._binary_result()
@@ -1364,34 +1491,349 @@ class PromotedExteriorCampaignFlowCanary(unittest.TestCase):
                 self.leaf, 80, (binary,)
             )
             decision = _primary_precision120_decision(stage80)
-            stage120 = backend.execute_promoted_stage(
-                self.leaf, 120, (binary, stage80)
-            )
 
         result80 = ComponentResult.from_mapping(
             stage80.component_result["result"]
-        )
-        result120 = ComponentResult.from_mapping(
-            stage120.component_result["result"]
         )
         self.assertEqual(result80.status, ComponentStatus.DERIVATIVE_UNRESOLVED)
         self.assertEqual(
             result80.response_uncertainty_status,
             "UNBOUNDED_DERIVATIVE_RESPONSE",
         )
-        self.assertEqual(decision["state"], "REQUESTED")
+        self.assertEqual(decision["state"], "SUPPRESSED")
+        self.assertEqual(len(noisy80.sample_amplitudes), 4)
+        self.assertEqual(good120.root_amplitudes, [])
+        self.assertEqual(good120.sample_amplitudes, [])
+
+    def test_sealed_response_precision_repair_never_calls_the_120_root(self):
+        """A precision-limited response stencil may escalate without re-rooting."""
+
+        backend = self._native_backend()
+        baseline = self._precision_backend(self.leaf, 80).baseline
+        workers = {
+            80: _PrecisionLimitedResponseSampleBackend(
+                self.leaf.job, baseline, 80
+            ),
+            120: _RootForbiddenScientificFixedRootBackend(
+                self.leaf.job, baseline, 120
+            ),
+        }
+        checkpoint = self.root / "sealed-response-repair.json"
+        selection = build_campaign_selection(
+            self.plan, role="primary", leaf_ids=(self.leaf.leaf_id,)
+        )
+        with patch(
+            "windows_solver.response_batches.run_component",
+            return_value=self._binary_result(),
+        ), patch.object(
+            backend,
+            "_julia_precision_backend_for",
+            side_effect=lambda job, digits, refinement=0: workers[digits],
+        ):
+            summary = run_campaign_selection(
+                self.plan,
+                selection,
+                backend,
+                checkpoint,
+                resume=False,
+            )
+
+        record = summary.records[0]
+        self.assertEqual(
+            tuple(stage.outcome.digits for stage in record.stages),
+            (64, 80, 120),
+        )
+        stage80, stage120 = (stage.outcome for stage in record.stages[1:])
+        result80 = ComponentResult.from_mapping(stage80.component_result["result"])
+        result120 = ComponentResult.from_mapping(stage120.component_result["result"])
+        self.assertEqual(result80.status, ComponentStatus.DERIVATIVE_UNRESOLVED)
+        self.assertEqual(
+            stage80.component_result["promotion_decision"]["state"],
+            "SUPPRESSED",
+        )
+        self.assertFalse(result80.baseline.numerical_conditioning.precision_limited)
         self.assertEqual(result120.status, ComponentStatus.CONVERGED)
-        self.assertIs(
-            stage120.component_result[
-                "precision_ladder_discrepancy_applicable"
-            ],
-            False,
+        self.assertEqual(
+            stage120.component_result["evidence_kind"],
+            "package-owned-julia-root-sealed-response-repair",
         )
         self.assertEqual(
-            _primary_precision120_terminal_state(stage120), "PRODUCED"
+            stage120.component_result["response_repair_scope"],
+            "fixed-root-dc-stencil-only/v1",
         )
-        self.assertEqual(len(noisy80.sample_amplitudes), 4)
-        self.assertEqual(len(good120.sample_amplitudes), 4)
+        self.assertEqual(
+            result120.derivative_evidence["response_repair_scope"],
+            {
+                "schema": "windows-solver.fixed-root-response-repair-scope/1",
+                "requested_families": ["coordinate"],
+                "recomputed_families": ["coordinate"],
+                "reused_families": [],
+            },
+        )
+        self.assertEqual(result120.baseline.omega, result80.baseline.omega)
+        self.assertEqual(workers[80].root_amplitudes, [0.0j])
+        self.assertEqual(workers[120].root_amplitudes, [])
+        self.assertEqual(len(workers[80].sample_amplitudes), 4)
+        self.assertEqual(len(workers[120].sample_amplitudes), 4)
+        self.assertEqual(
+            validate_campaign_checkpoint(self.plan, checkpoint).records,
+            summary.records,
+        )
+
+    def test_frequency_only_response_repair_preserves_the_80_coordinate_stencil(
+        self,
+    ):
+        """A Dω-only 120 repair does not recompute D_c or the sealed root."""
+
+        from tests.test_promoted_horizon_component import _with_worker_receipt
+
+        backend = self._native_backend()
+        baseline = self._precision_backend(self.leaf, 80).baseline
+        primary = baseline.primary_acceptance
+        self.assertIsNotNone(primary)
+        authentication = primary.derivative_authentication
+        self.assertIsNotNone(authentication)
+        baseline = replace(
+            baseline,
+            primary_acceptance=replace(
+                primary,
+                derivative_authentication=replace(
+                    authentication,
+                    determinant_error_status="unavailable/v1",
+                    determinant_error_model_id=None,
+                ),
+            ),
+            worker_response_receipt=None,
+        )
+        baseline = _with_worker_receipt(
+            self.leaf.job, baseline, 80, baseline.omega
+        )
+        workers = {
+            80: _FrequencyLimitedResponseSampleBackend(
+                self.leaf.job, baseline, 80
+            ),
+            120: _RootForbiddenScientificFrequencyBackend(
+                self.leaf.job, baseline, 120
+            ),
+        }
+        checkpoint = self.root / "frequency-only-response-repair.json"
+        selection = build_campaign_selection(
+            self.plan, role="primary", leaf_ids=(self.leaf.leaf_id,)
+        )
+        with patch(
+            "windows_solver.response_batches.run_component",
+            return_value=self._binary_result(),
+        ), patch.object(
+            backend,
+            "_julia_precision_backend_for",
+            side_effect=lambda job, digits, refinement=0: workers[digits],
+        ):
+            summary = run_campaign_selection(
+                self.plan,
+                selection,
+                backend,
+                checkpoint,
+                resume=False,
+            )
+
+        record = summary.records[0]
+        self.assertEqual(
+            tuple(stage.outcome.digits for stage in record.stages),
+            (64, 80, 120),
+        )
+        repair = record.stages[2].outcome
+        repaired = ComponentResult.from_mapping(repair.component_result["result"])
+        self.assertEqual(repair.component_result["response_repair_scope"], "fixed-root-domega-stencil-only/v1")
+        self.assertEqual(
+            repaired.derivative_evidence["response_repair_scope"],
+            {
+                "schema": "windows-solver.fixed-root-response-repair-scope/1",
+                "requested_families": ["frequency"],
+                "recomputed_families": ["frequency"],
+                "reused_families": ["coordinate"],
+            },
+        )
+        self.assertEqual(workers[80].root_amplitudes, [0.0j])
+        self.assertEqual(workers[120].root_amplitudes, [])
+        self.assertEqual(len(workers[120].sample_amplitudes), 4)
+        self.assertEqual(
+            validate_campaign_checkpoint(self.plan, checkpoint).records,
+            summary.records,
+        )
+
+    def test_schema8_leaf42_response_failure_migrates_without_any_root_read(self):
+        """The stale Dω receipt is discarded while its accepted root is retained."""
+
+        from tests.test_promoted_horizon_component import _with_worker_receipt
+
+        backend, _workers, binary, promoted = self._native_stages()
+        result = ComponentResult.from_mapping(promoted.component_result["result"])
+        primary = result.baseline.primary_acceptance
+        self.assertIsNotNone(primary)
+        authentication = primary.derivative_authentication
+        self.assertIsNotNone(authentication)
+        stale_baseline = replace(
+            result.baseline,
+            primary_acceptance=replace(
+                primary,
+                derivative_authentication=replace(
+                    authentication,
+                    determinant_error_status="unavailable/v1",
+                    determinant_error_model_id=None,
+                ),
+            ),
+            worker_response_receipt=None,
+        )
+        stale_baseline = _with_worker_receipt(
+            self.leaf.job,
+            stale_baseline,
+            80,
+            stale_baseline.omega,
+        )
+        stale_result = replace(
+            result,
+            baseline=stale_baseline,
+            status=ComponentStatus.DERIVATIVE_UNRESOLVED,
+            convergence_basis="UNRESOLVED_FIXED_ROOT_DERIVATIVE",
+            response=None,
+            closed_form_response=None,
+            error_channels={name: 0.0 for name in result.error_channels},
+            response_uncertainty_status="UNBOUNDED_DERIVATIVE_RESPONSE",
+            error_channel_applicability={
+                name: False for name in result.error_channels
+            },
+            derivative_evidence={
+                "conditioning_decision": {
+                    "accepted": False,
+                    "identity": "fixed-root-h-h2-conditioning/v1",
+                    "rejection_reason": "DETERMINANT_ERROR_MODEL_UNAVAILABLE",
+                    "selected_candidate": None,
+                },
+                "determinant_count": 0,
+                "failure_code": "DETERMINANT_ERROR_MODEL_UNAVAILABLE",
+                "fixed_root_samples": [],
+                "response_disk_identity": "exterior-derivative-response-disk/v1",
+            },
+        )
+        old_component = dict(promoted.component_result)
+        old_component["result"] = stale_result.to_mapping()
+        old_unbound = replace(
+            promoted,
+            numerical_state=ComponentStatus.DERIVATIVE_UNRESOLVED.value,
+            component_result=old_component,
+            local_disk_radius_abs=0.0,
+            signed_error_channels=_component_stage_signed_error_channels(
+                old_component,
+                stale_result,
+                repeat_applicable=False,
+                precision_ladder_applicable=False,
+            ),
+            self_refinement_enclosed=None,
+            discrepancy_from_previous_abs=None,
+            discrepancy_enclosed=None,
+        )
+        old_stage = _stage_with_promotion_decision(
+            old_unbound,
+            {
+                "schema": "windows-solver.precision-promotion-decision/2",
+                "from_precision_digits": 80,
+                "to_precision_digits": 120,
+                "state": "REQUESTED",
+                "reason": "ROOT_TYPED_RETRY_REQUIRED",
+                "predicted_reliable_digits": str(
+                    stale_baseline.numerical_conditioning.predicted_reliable_digits
+                ),
+                "required_reliable_digits": str(
+                    stale_baseline.numerical_conditioning.required_reliable_digits
+                ),
+                "precision_limited": False,
+                "asymptotic_preflight_avoided_ode": (
+                    stale_baseline.numerical_conditioning
+                    .asymptotic_preflight_avoided_ode
+                ),
+            },
+        )
+        record = CampaignLeafRecord(
+            leaf_id=self.leaf.leaf_id,
+            role="primary",
+            state="IN_PROGRESS",
+            stages=(
+                _campaign_stage_record(self.plan, self.capabilities, binary),
+                response_batches.CampaignStageRecord(
+                    old_stage,
+                    response_batches.CampaignStageRecord(
+                        promoted,
+                        {
+                            "precision_factory_identity": (
+                                self.plan.precision_factory_identity.to_mapping()
+                            ),
+                            "available_precision_digits": list(
+                                self.capabilities.digits
+                            ),
+                        },
+                    ).runner_provenance,
+                ),
+            ),
+        )
+        selection = build_campaign_selection(
+            self.plan, role="primary", leaf_ids=(self.leaf.leaf_id,)
+        )
+        checkpoint = self.root / "leaf42-schema8-stale-response.json"
+        historical = response_batches._checkpoint_mapping(
+            self.plan, selection, (record,)
+        )
+        historical["schema_version"] = 8
+        historical["bindings"]["precision_contract_sha256"] = (
+            response_batches._SCHEMA8_PRECISION_CONTRACT_SHA256
+        )
+        checkpoint.write_bytes(canonical_json_bytes(historical))
+
+        response_worker = _RootForbiddenScientificFrequencyBackend(
+            self.leaf.job,
+            stale_baseline,
+            80,
+        )
+        resume_backend = self._native_backend()
+        with patch(
+            "windows_solver.response_batches.run_component",
+            side_effect=AssertionError("migration repeated binary numerics"),
+        ), patch.object(
+            resume_backend,
+            "_julia_precision_backend_for",
+            return_value=response_worker,
+        ):
+            summary = run_campaign_selection(
+                self.plan,
+                selection,
+                resume_backend,
+                checkpoint,
+                resume=True,
+            )
+
+        repaired = summary.records[0]
+        self.assertEqual(
+            tuple(stage.outcome.digits for stage in repaired.stages),
+            (64, 80, 80),
+        )
+        self.assertEqual(repaired.state, "PRODUCED")
+        migrated_result = ComponentResult.from_mapping(
+            repaired.stages[1].outcome.component_result["result"]
+        )
+        repair_result = ComponentResult.from_mapping(
+            repaired.stages[2].outcome.component_result["result"]
+        )
+        self.assertEqual(migrated_result.baseline.omega, stale_baseline.omega)
+        self.assertEqual(repair_result.baseline.omega, stale_baseline.omega)
+        self.assertEqual(response_worker.root_amplitudes, [])
+        self.assertEqual(len(response_worker.sample_amplitudes), 8)
+        self.assertEqual(
+            json.loads(checkpoint.read_bytes())["schema_version"],
+            response_batches.CAMPAIGN_CHECKPOINT_SCHEMA_VERSION,
+        )
+        self.assertEqual(
+            validate_campaign_checkpoint(self.plan, checkpoint).records,
+            summary.records,
+        )
 
     def test_fixed_root_payload_tampering_fails_closed(self):
         """Catches rehashed skip/applicability/refinement claims being trusted."""
