@@ -6277,35 +6277,36 @@ def _promoted_stage_semantics(
     )
 
 
-def _bind_fixed_root_exterior_precision_comparison(
+def _bind_fixed_readout_precision_comparison(
     outcome: StageOutcome,
     predecessor: StageOutcome,
 ) -> StageOutcome:
     """Derive the response-tier comparison from the two persisted results."""
 
-    if outcome.component_result.get("evidence_kind") != (
-        _FIXED_ROOT_EXTERIOR_EVIDENCE_KIND
-    ):
+    if outcome.component_result.get("evidence_kind") not in {
+        _ANALYTIC_HORIZON_EVIDENCE_KIND,
+        _FIXED_ROOT_EXTERIOR_EVIDENCE_KIND,
+    }:
         return outcome
     raw_result = outcome.component_result.get("result")
     if not isinstance(raw_result, Mapping):
         raise _UnauthenticatedComponentEvidence(
-            "fixed-root exterior result is missing"
+            "fixed-readout result is missing"
         )
     result = ComponentResult.from_mapping(raw_result)
     if result.to_mapping() != raw_result:
         raise _UnauthenticatedComponentEvidence(
-            "fixed-root exterior result is not canonical"
+            "fixed-readout result is not canonical"
         )
     raw_previous = predecessor.component_result.get("result")
     if not isinstance(raw_previous, Mapping):
         raise _UnauthenticatedComponentEvidence(
-            "fixed-root exterior predecessor result is missing"
+            "fixed-readout predecessor result is missing"
         )
     previous_result = ComponentResult.from_mapping(raw_previous)
     if previous_result.to_mapping() != raw_previous:
         raise _UnauthenticatedComponentEvidence(
-            "fixed-root exterior predecessor is not canonical"
+            "fixed-readout predecessor is not canonical"
         )
     applicable = (
         result.response is not None and previous_result.response is not None
@@ -6356,6 +6357,15 @@ def _bind_fixed_root_exterior_precision_comparison(
     )
 
 
+def _bind_fixed_root_exterior_precision_comparison(
+    outcome: StageOutcome,
+    predecessor: StageOutcome,
+) -> StageOutcome:
+    """Compatibility alias for the shared fixed-readout comparison binder."""
+
+    return _bind_fixed_readout_precision_comparison(outcome, predecessor)
+
+
 def _validate_failed_preflight_refinement_runtime(
     leaf: CampaignLeafPlan,
     value: object,
@@ -6391,12 +6401,8 @@ def _validate_failed_preflight_recovery_stage(
             outcome.digits != 120
             or outcome.deep_diagnostics is not None
             or outcome.self_refinement_enclosed is not None
-            or outcome.discrepancy_from_previous_abs is not None
-            or outcome.discrepancy_enclosed is not None
             or component.get("comparison_kind")
             != _FAILED_PREFLIGHT_SINGLE_HORIZON_KIND
-            or component.get("precision_ladder_discrepancy_applicable")
-            is not False
         ):
             raise ValueError(
                 "failed-preflight promoted horizon recovery fields are invalid"
@@ -6415,11 +6421,14 @@ def _validate_failed_preflight_recovery_stage(
             raise ValueError(
                 "failed-preflight promoted horizon predictor binding is invalid"
             )
-        produced = (
-            analytic.status is ComponentStatus.CONVERGED
-            and _component_conditioning_is_adequate(analytic)
+        semantics = _promoted_stage_semantics(
+            outcome, predecessor=stage_predecessor
         )
-        return predecessor, produced
+        if semantics.result != analytic:
+            raise ValueError(
+                "failed-preflight promoted horizon result changed"
+            )
+        return predecessor, semantics.terminal_admissible
 
     if kind is _PromotedStageKind.FIXED_ROOT_EXTERIOR_DERIVATIVE:
         fixed_result = classified_result
@@ -7480,10 +7489,11 @@ def _failed_preflight_recovery_record(
         raise ValueError(
             "campaign backend returned invalid failed-preflight 120-digit evidence"
         )
-    if outcome.component_result.get("evidence_kind") == (
-        _FIXED_ROOT_EXTERIOR_EVIDENCE_KIND
-    ):
-        outcome = _bind_fixed_root_exterior_precision_comparison(
+    if outcome.component_result.get("evidence_kind") in {
+        _ANALYTIC_HORIZON_EVIDENCE_KIND,
+        _FIXED_ROOT_EXTERIOR_EVIDENCE_KIND,
+    }:
+        outcome = _bind_fixed_readout_precision_comparison(
             outcome, record.stages[0].outcome
         )
     if not _validate_component_result(
@@ -7532,6 +7542,9 @@ def _endpoint_arithmetic_recovery_record(
         )
     outcome = _stage_with_endpoint_arithmetic_predecessor(
         outcome, predecessor
+    )
+    outcome = _bind_fixed_readout_precision_comparison(
+        outcome, record.stages[0].outcome
     )
     embedded = _embedded_endpoint_arithmetic_predecessor(outcome, leaf)
     if embedded is None or embedded.to_mapping() != predecessor.to_mapping():
@@ -8841,11 +8854,12 @@ def _run_campaign_selection_active(
                         "campaign backend returned invalid failed-preflight "
                         "120-digit evidence"
                     )
-                if outcome120.component_result.get("evidence_kind") == (
-                    _FIXED_ROOT_EXTERIOR_EVIDENCE_KIND
-                ):
+                if outcome120.component_result.get("evidence_kind") in {
+                    _ANALYTIC_HORIZON_EVIDENCE_KIND,
+                    _FIXED_ROOT_EXTERIOR_EVIDENCE_KIND,
+                }:
                     outcome120 = (
-                        _bind_fixed_root_exterior_precision_comparison(
+                        _bind_fixed_readout_precision_comparison(
                             outcome120, record.stages[0].outcome
                         )
                     )
@@ -10883,6 +10897,6 @@ class NativeCampaignStageBackend:
             discrepancy_from_previous_abs=None,
             discrepancy_enclosed=None,
         )
-        return _bind_fixed_root_exterior_precision_comparison(
+        return _bind_fixed_readout_precision_comparison(
             unbound, previous_outcomes[-1]
         )
