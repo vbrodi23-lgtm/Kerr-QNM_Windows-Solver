@@ -1202,6 +1202,7 @@ $candidate | ConvertTo-Json -Compress | Set-Content -LiteralPath $env:M02_TEST_J
             "exact-exterior-zero-coupling-background-root/v1",
             "survey-contained-failure/v1",
             "fixed-root-survey-preflight/v1",
+            "fixed-root-horizon-survey-preflight/v1",
             "fixed-root-exterior-survey/v1",
             "retained-survey-central-bridge/v1",
             "targeted-local-certification/v1",

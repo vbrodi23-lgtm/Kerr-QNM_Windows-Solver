@@ -27,6 +27,7 @@ from windows_solver.response_batches import (
     build_campaign_selection,
     run_campaign_selection,
     synthetic_stage_signed_error_channels,
+    validate_campaign_checkpoint,
 )
 from windows_solver.response_engine import (
     FULL_COMPLEX_LADDER_VALIDATION_IDENTITY,
@@ -51,6 +52,54 @@ class NoNumericalWorkBackend:
         raise AssertionError("checkpoint migration scheduled numerical work")
 
 
+class MigrationValidationBackend:
+    identity = VettedNativeDeterminantKernel.identity
+    precision_capabilities = PrecisionCapabilities((64, 80, 120))
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def scientific_execution_contract_for(self, leaf):
+        return None
+
+    def execute_evidence_stage(self, leaf, retained_record, policy):
+        self.calls += 1
+        self.assert_validate_policy(policy)
+        central = retained_record.stages[-1].outcome
+        result = central.component_result["result"]
+        payload = {
+            "evidence_kind": "independent-publication-validation/v1",
+            "execution_profile": ExecutionProfile.VALIDATE.value,
+            "result": result,
+            "heavy_local_stage_chain": [],
+            "validation_policy": {
+                "identity": FULL_COMPLEX_LADDER_VALIDATION_IDENTITY,
+                "reason": "PUBLICATION_VALIDATION",
+            },
+        }
+        radius = central.local_disk_radius_abs
+        return StageOutcome(
+            digits=80,
+            numerical_state="CONVERGED",
+            component_result=payload,
+            local_disk_radius_abs=radius,
+            signed_error_channels=synthetic_stage_signed_error_channels(
+                payload,
+                radius,
+                precision_ladder_applicable=False,
+            ),
+        )
+
+    @staticmethod
+    def assert_validate_policy(policy) -> None:
+        if (
+            policy.profile is not ExecutionProfile.VALIDATE
+            or not policy.allow_full_complex_root_ladder
+            or not policy.allow_independent_validation
+        ):
+            raise AssertionError("migrated evidence used the wrong validation policy")
+
+
 class StopAtFirstMissingSurveyBackend:
     precision_capabilities = PrecisionCapabilities((64, 80, 120))
 
@@ -70,6 +119,47 @@ class StopAtFirstMissingSurveyBackend:
     ):
         self.calls.append((leaf.leaf_id, digits))
         raise AssertionError("stopped at first genuinely missing survey result")
+
+
+class RecoverLegacyPartialThenStopBackend(StopAtFirstMissingSurveyBackend):
+    def __init__(self, identity, legacy_partial_leaf_id: str) -> None:
+        super().__init__(identity)
+        self.legacy_partial_leaf_id = legacy_partial_leaf_id
+        self.recovered_legacy_partial = False
+
+    def execute_profile_stage(self, leaf, digits, policy, survey_cache):
+        if self.recovered_legacy_partial:
+            raise AssertionError("stopped after recovering the legacy partial leaf")
+        self.calls.append((leaf.leaf_id, digits))
+        if leaf.leaf_id == self.legacy_partial_leaf_id:
+            self.recovered_legacy_partial = True
+        payload = {
+            "evidence_kind": "synthetic-survey-orchestration-contract",
+            "leaf_id": leaf.leaf_id,
+            "mechanism_id": leaf.mechanism_id,
+            "digits": digits,
+            "root_seal_accepted": True,
+            "branch_identity_preserved": True,
+            "domega_excludes_zero": True,
+            "cheap_derivative_refinement_agrees": True,
+            "bounded_response_disk": True,
+            "response": {"real": 1.0e-3, "imaginary": -2.0e-3},
+            "survey_promotion_required": False,
+            "survey_required_precision_digits": None,
+            "survey_failure_code": None,
+        }
+        radius = 1.0e-7
+        return StageOutcome(
+            digits=digits,
+            numerical_state="CONVERGED",
+            component_result=payload,
+            local_disk_radius_abs=radius,
+            signed_error_channels=synthetic_stage_signed_error_channels(
+                payload,
+                radius,
+                precision_ladder_applicable=False,
+            ),
+        )
 
 
 def _plan_and_produced_record():
@@ -193,6 +283,88 @@ class CampaignEvidenceMigrationTests(unittest.TestCase):
             },
         )
 
+    def test_schema9_nonterminal_stage_restarts_as_one_valid_survey_sequence(self):
+        fixture = (
+            Path(__file__).parent
+            / "fixtures"
+            / "m02_schema9_production_checkpoint.json.xz"
+        )
+        original_bytes = lzma.decompress(fixture.read_bytes())
+        original = json.loads(original_bytes)
+        legacy_partial = next(
+            record
+            for record in original["records"]
+            if record["state"] not in {"PRODUCED", "UNRESOLVED", "FAILED"}
+        )
+        completed_stage_sha256s = {
+            record["leaf_id"]: tuple(
+                stage["stage_sha256"] for stage in record["stages"]
+            )
+            for record in original["records"]
+            if record["state"] in {"PRODUCED", "UNRESOLVED", "FAILED"}
+        }
+        windows_identity = replace(
+            VettedNativeDeterminantKernel.identity,
+            runtime_fingerprint=(
+                "cpython-3.12.13-windows-python-64bit-"
+                "gsn-input-julia-exact-f-u-cache-contract-1-"
+                "adapted-source-native-gsn-adapter-contract-2"
+            ),
+        )
+        plan = build_campaign_plan(
+            policy=NumericalPolicy(),
+            backend_identity=windows_identity,
+            precision_capabilities=PrecisionCapabilities((64, 80, 120)),
+        )
+        selection = build_campaign_selection(plan, role="all")
+        backend = RecoverLegacyPartialThenStopBackend(
+            windows_identity,
+            legacy_partial["leaf_id"],
+        )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            checkpoint = Path(temporary) / "checkpoint.json"
+            checkpoint.write_bytes(original_bytes)
+            with self.assertRaisesRegex(
+                AssertionError,
+                "stopped after recovering the legacy partial leaf",
+            ):
+                run_campaign_selection(
+                    plan,
+                    selection,
+                    backend,
+                    checkpoint,
+                    resume=True,
+                    execution_profile=ExecutionProfile.SURVEY,
+                )
+            migrated = json.loads(checkpoint.read_text(encoding="utf-8"))
+
+        migrated_by_id = {
+            record["leaf_id"]: record for record in migrated["records"]
+        }
+        recovered = migrated_by_id[legacy_partial["leaf_id"]]
+        self.assertIn((legacy_partial["leaf_id"], 64), backend.calls)
+        self.assertEqual(recovered["state"], "PRODUCED")
+        self.assertEqual(
+            [stage["digits"] for stage in recovered["stages"]],
+            [64],
+        )
+        self.assertEqual(recovered["evidence"]["evidence_level"], "SCREENED")
+        self.assertNotEqual(
+            recovered["stages"][0]["stage_sha256"],
+            legacy_partial["stages"][0]["stage_sha256"],
+        )
+        self.assertEqual(
+            {
+                leaf_id: tuple(
+                    stage["stage_sha256"]
+                    for stage in migrated_by_id[leaf_id]["stages"]
+                )
+                for leaf_id in completed_stage_sha256s
+            },
+            completed_stage_sha256s,
+        )
+
     def test_schema9_completed_record_migrates_without_numerical_work(self):
         self.assertEqual(CAMPAIGN_CHECKPOINT_SCHEMA_VERSION, 10)
         plan, selection, record = _plan_and_produced_record()
@@ -230,29 +402,46 @@ class CampaignEvidenceMigrationTests(unittest.TestCase):
 
     def test_stronger_existing_evidence_is_never_downgraded(self):
         plan, selection, record = _plan_and_produced_record()
-        validated = CampaignEvidenceRecord.create(
-            leaf_id=record.leaf_id,
-            central_stage_sha256=record.stages[0].stage_sha256,
-            receipt=EvidenceReceipt(
-                execution_profile=ExecutionProfile.VALIDATE,
-                evidence_level=EvidenceLevel.VALIDATED,
-                receipt_sha256="a" * 64,
+        original = record.stages[0].outcome
+        payload = dict(original.component_result)
+        payload["validation_policy"] = {
+            "identity": FULL_COMPLEX_LADDER_VALIDATION_IDENTITY,
+            "reason": "PUBLICATION_VALIDATION",
+        }
+        outcome = StageOutcome(
+            digits=original.digits,
+            numerical_state=original.numerical_state,
+            component_result=payload,
+            local_disk_radius_abs=original.local_disk_radius_abs,
+            signed_error_channels=synthetic_stage_signed_error_channels(
+                payload, original.local_disk_radius_abs
             ),
+        )
+        stage = _campaign_stage_record(
+            plan, plan.precision_capabilities, outcome
         )
         record = CampaignLeafRecord(
             leaf_id=record.leaf_id,
             role=record.role,
             state=record.state,
-            stages=record.stages,
-            evidence=validated,
+            stages=(stage,),
         )
         backend = NoNumericalWorkBackend()
 
         with tempfile.TemporaryDirectory() as temporary:
             checkpoint = Path(temporary) / "checkpoint.json"
-            _atomic_json(
-                checkpoint, _checkpoint_mapping(plan, selection, (record,))
+            legacy = _checkpoint_mapping(plan, selection, (record,))
+            legacy["schema_version"] = 9
+            _atomic_json(checkpoint, legacy)
+            migrated = run_campaign_selection(
+                plan,
+                selection,
+                backend,
+                checkpoint,
+                resume=True,
+                execution_profile=ExecutionProfile.SURVEY,
             )
+            evidence_before = migrated.records[0].evidence
             summary = run_campaign_selection(
                 plan,
                 selection,
@@ -263,7 +452,7 @@ class CampaignEvidenceMigrationTests(unittest.TestCase):
             )
 
         self.assertEqual(backend.calls, 0)
-        self.assertEqual(summary.records[0].evidence, validated)
+        self.assertEqual(summary.records[0].evidence, evidence_before)
         self.assertEqual(
             summary.records[0].evidence.evidence_level,
             EvidenceLevel.VALIDATED,
@@ -318,6 +507,78 @@ class CampaignEvidenceMigrationTests(unittest.TestCase):
             summary.records[0].evidence.evidence_level,
             EvidenceLevel.VALIDATED,
         )
+
+    def test_migrated_certified_leaf_cannot_claim_validation_without_a_stage(self):
+        plan, selection, record = _plan_and_produced_record()
+        backend = NoNumericalWorkBackend()
+
+        with tempfile.TemporaryDirectory() as temporary:
+            checkpoint = Path(temporary) / "checkpoint.json"
+            legacy = _checkpoint_mapping(plan, selection, (record,))
+            legacy["schema_version"] = 9
+            _atomic_json(checkpoint, legacy)
+            migrated = run_campaign_selection(
+                plan,
+                selection,
+                backend,
+                checkpoint,
+                resume=True,
+                execution_profile=ExecutionProfile.SURVEY,
+            ).records[0]
+            assert migrated.evidence is not None
+            forged = replace(
+                migrated,
+                evidence=migrated.evidence.with_receipt(EvidenceReceipt(
+                    execution_profile=ExecutionProfile.VALIDATE,
+                    evidence_level=EvidenceLevel.VALIDATED,
+                    receipt_sha256="f" * 64,
+                )),
+            )
+            _atomic_json(
+                checkpoint,
+                _checkpoint_mapping(plan, selection, (forged,)),
+            )
+
+            with self.assertRaisesRegex(
+                ValueError,
+                "legacy.*receipt|upgrade.*receipt|upgrade.*level",
+            ):
+                validate_campaign_checkpoint(plan, checkpoint)
+
+    def test_migrated_certified_leaf_accepts_additive_validation_evidence(self):
+        plan, selection, record = _plan_and_produced_record()
+        migration_backend = NoNumericalWorkBackend()
+
+        with tempfile.TemporaryDirectory() as temporary:
+            checkpoint = Path(temporary) / "checkpoint.json"
+            legacy = _checkpoint_mapping(plan, selection, (record,))
+            legacy["schema_version"] = 9
+            _atomic_json(checkpoint, legacy)
+            migrated = run_campaign_selection(
+                plan,
+                selection,
+                migration_backend,
+                checkpoint,
+                resume=True,
+                execution_profile=ExecutionProfile.SURVEY,
+            ).records[0]
+            validation_backend = MigrationValidationBackend()
+            upgraded = run_campaign_selection(
+                plan,
+                selection,
+                validation_backend,
+                checkpoint,
+                resume=True,
+                execution_profile=ExecutionProfile.VALIDATE,
+            ).records[0]
+            restored = validate_campaign_checkpoint(plan, checkpoint).records[0]
+
+        self.assertEqual(migration_backend.calls, 0)
+        self.assertEqual(validation_backend.calls, 1)
+        self.assertEqual(upgraded.stages, migrated.stages)
+        self.assertEqual(len(upgraded.evidence_stages), 1)
+        self.assertEqual(upgraded.evidence.evidence_level, EvidenceLevel.VALIDATED)
+        self.assertEqual(restored, upgraded)
 
     def test_screened_record_is_rejected_at_release_reduction_boundary(self):
         plan, _, record = _plan_and_produced_record()

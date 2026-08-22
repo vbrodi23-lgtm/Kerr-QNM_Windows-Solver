@@ -8751,18 +8751,25 @@ def restore_survey_evidence_cache_from_result(
         return False
     raw_background = evidence.get("shared_background_root_seal")
     raw_domega = evidence.get("shared_domega_evidence")
-    if raw_background is None or raw_domega is None:
+    if raw_background is None:
+        if raw_domega is not None:
+            raise ValueError(
+                "persisted survey Domega lacks its background root"
+            )
         return False
     shared = SharedBackgroundRootSeal.from_mapping(raw_background)
-    domega = FixedRootDomegaEvidence.from_mapping(raw_domega)
     if shared.root_readout.to_mapping() != result.baseline.to_mapping():
         raise ValueError("persisted survey background changed the central root")
-    derivative_step = float.fromhex(domega.key.derivative_step_hex)
-    _validated_shared_domega_samples(domega, shared, derivative_step)
+    domega = None
+    if raw_domega is not None:
+        domega = FixedRootDomegaEvidence.from_mapping(raw_domega)
+        derivative_step = float.fromhex(domega.key.derivative_step_hex)
+        _validated_shared_domega_samples(domega, shared, derivative_step)
     cache.store_background_seal(
         shared.background_key, shared.to_mapping()
     )
-    cache.store_domega(domega)
+    if domega is not None:
+        cache.store_domega(domega)
     return True
 
 

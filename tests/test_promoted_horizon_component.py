@@ -11,6 +11,12 @@ from tests.fixtures import (
     valid_horizon_endpoint_search_evidence,
     valid_numerical_conditioning,
 )
+from windows_solver.campaign_policy import (
+    CampaignEvidenceRecord,
+    EvidenceLevel,
+    EvidenceReceipt,
+    ExecutionProfile,
+)
 from windows_solver.cli import _validate_reduction_component_checkpoint_binding
 from windows_solver.contracts import canonical_json_bytes
 from windows_solver.progress import (
@@ -1746,6 +1752,18 @@ class PromotedHorizonStageTests(unittest.TestCase):
     def test_reduction_accepts_bounded_analytic_response(self):
         _, _, promoted, record = self._record_with_receipt_predictor(
             self.leaf.job.root.omega + complex(1.0e-4, -1.0e-4)
+        )
+        record = replace(
+            record,
+            evidence=CampaignEvidenceRecord.create(
+                leaf_id=record.leaf_id,
+                central_stage_sha256=record.stages[-1].stage_sha256,
+                receipt=EvidenceReceipt(
+                    execution_profile=ExecutionProfile.CERTIFY,
+                    evidence_level=EvidenceLevel.CERTIFIED,
+                    receipt_sha256="2" * 64,
+                ),
+            ),
         )
         result = ComponentResult.from_mapping(
             promoted.component_result["result"]

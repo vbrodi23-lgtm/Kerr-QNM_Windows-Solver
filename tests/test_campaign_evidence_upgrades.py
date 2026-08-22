@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 import tempfile
 import unittest
 
 from windows_solver.campaign_policy import (
+    CampaignEvidenceRecord,
     CampaignExecutionPolicy,
     EvidenceLevel,
+    EvidenceReceipt,
     ExecutionProfile,
     SurveyEvidenceCache,
 )
@@ -26,6 +29,7 @@ from windows_solver.response_batches import (
     validate_campaign_checkpoint,
 )
 from windows_solver.response_engine import (
+    FULL_COMPLEX_LADDER_VALIDATION_IDENTITY,
     NumericalPolicy,
     VettedNativeDeterminantKernel,
 )
@@ -82,14 +86,38 @@ class EvidenceUpgradeBackend:
         central = retained_record.stages[-1].outcome.component_result["response"]
         response = complex(central["real"], central["imaginary"])
         response += self.centre_shift
+        result = {
+            "synthetic_test_response": {
+                "real": response.real,
+                "imaginary": response.imag,
+            }
+        }
         payload = {
-            "evidence_kind": "synthetic-profile-evidence-upgrade/v1",
+            "evidence_kind": (
+                "targeted-local-certification/v1"
+                if self.profile is ExecutionProfile.CERTIFY
+                else "independent-publication-validation/v1"
+            ),
             "execution_profile": self.profile.value,
             "leaf_id": leaf.leaf_id,
             "response": {
                 "real": response.real,
                 "imaginary": response.imag,
             },
+            "result": result,
+            "heavy_local_stage_chain": (
+                [{"digits": digits, "component_result": {"result": result}}]
+                if self.profile is ExecutionProfile.CERTIFY
+                else []
+            ),
+            "validation_policy": (
+                None
+                if self.profile is ExecutionProfile.CERTIFY
+                else {
+                    "identity": FULL_COMPLEX_LADDER_VALIDATION_IDENTITY,
+                    "reason": "PUBLICATION_VALIDATION",
+                }
+            ),
             "bounded_response_disk": True,
         }
         radius = 1.0e-8
@@ -218,6 +246,31 @@ class CampaignEvidenceUpgradeTests(unittest.TestCase):
                 execution_profile=ExecutionProfile.VALIDATE,
             )
         self.assertEqual(backend.calls, [])
+
+    def test_screened_centre_cannot_be_relabelled_without_upgrade_evidence(self):
+        plan, selection, checkpoint, screened = self._screened_checkpoint()
+        forged = replace(
+            screened,
+            evidence=CampaignEvidenceRecord.create(
+                leaf_id=screened.leaf_id,
+                central_stage_sha256=screened.stages[-1].stage_sha256,
+                receipt=EvidenceReceipt(
+                    execution_profile=ExecutionProfile.CERTIFY,
+                    evidence_level=EvidenceLevel.CERTIFIED,
+                    receipt_sha256="f" * 64,
+                ),
+            ),
+        )
+        _atomic_json(
+            checkpoint,
+            _checkpoint_mapping(plan, selection, (forged,)),
+        )
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "survey receipt|upgrade receipt",
+        ):
+            validate_campaign_checkpoint(plan, checkpoint)
 
     def test_one_evidence_queue_can_cross_primary_deep_and_control_roles(self):
         plan = build_campaign_plan(

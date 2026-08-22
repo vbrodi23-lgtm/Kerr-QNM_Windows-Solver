@@ -30,6 +30,7 @@ from .campaign_policy import (
     ExecutionProfile,
     SurveyEvidenceCache,
     evidence_level_at_least,
+    stronger_evidence_level,
 )
 from .contracts import canonical_json_bytes
 from .adaptive_controls import (
@@ -42,6 +43,7 @@ from .response_engine import (
     BackendIdentity,
     ComponentResult,
     ComponentStatus,
+    FixedRootDomegaEvidence,
     FixedRootDeterminantSample,
     NativeDeterminantAdapter,
     NativeResourceUnavailableError,
@@ -67,6 +69,7 @@ from .response_engine import (
     PromotedRootSeal,
     SharedBackgroundRootSeal,
     ROOT_SEALED_RESPONSE_REPAIR_IDENTITY,
+    PROMOTED_ROOT_ACCEPTANCE_METRIC,
     PROMOTED_ROOT_READOUT_POLICY,
     RECORDED_REPLAY_BACKEND_ID,
     RecordedReplayBackend,
@@ -6871,6 +6874,56 @@ def _root_requires_precision120(
     return reason is not None
 
 
+def _survey_root_precision_disposition(
+    job: ResponseComponentJob,
+    baseline: RootReadout,
+) -> tuple[str | None, str | None]:
+    """Classify a survey root without converting authentication into retry.
+
+    The first item is an allowlisted arithmetic-promotion reason.  The second
+    is a fail-closed identity/protocol/control failure.  Exactly one may be
+    populated.  This keeps BF40 -> BF80 escalation exclusive to authenticated
+    numerical insufficiency.
+    """
+
+    try:
+        branch_preserved = root_readout_preserves_authenticated_branch(
+            baseline,
+            job.root,
+            equation_id=job.equation_id,
+            source_root_mapping=job.source_root_mapping,
+        )
+    except ValueError:
+        return None, "ROOT_BRANCH_IDENTITY_INVALID"
+    if not branch_preserved:
+        return None, "ROOT_BRANCH_IDENTITY_INVALID"
+    if baseline.promoted_root_readout_policy != PROMOTED_ROOT_READOUT_POLICY:
+        return None, "ROOT_PROTOCOL_IDENTITY_INVALID"
+    conditioning = baseline.numerical_conditioning
+    contract = regularised_gsn_mechanism_contract(job.mechanism_id)
+    if conditioning is None or any(
+        getattr(conditioning, field) != expected
+        for field, expected in contract.items()
+    ):
+        return None, "ROOT_CONTROL_IDENTITY_INVALID"
+    if conditioning.precision_limited:
+        return "ROOT_CONDITIONING_PRECISION_LIMITED", None
+    if not baseline.converged:
+        return "ROOT_NOT_CONVERGED", None
+    primary = baseline.primary_acceptance
+    if (
+        primary is None
+        or primary.policy_id != PROMOTED_ROOT_READOUT_POLICY
+        or primary.acceptance_metric != PROMOTED_ROOT_ACCEPTANCE_METRIC
+    ):
+        return None, "ROOT_PROTOCOL_IDENTITY_INVALID"
+    if not primary.accepted:
+        return "ROOT_PRIMARY_REJECTED", None
+    if primary.correction_abs > primary.root_correction_tolerance:
+        return "ROOT_CORRECTION_EXCEEDS_TOLERANCE", None
+    return None, None
+
+
 _FIXED_ROOT_FREQUENCY_STENCIL_ROLES = frozenset({
     "frequency-real-plus-h",
     "frequency-real-minus-h",
@@ -7033,6 +7086,34 @@ def _response_precision_limited_families(
         ):
             limited.add(family)
     return frozenset(limited)
+
+
+def _fixed_root_response_repair_scope(result: ComponentResult) -> str:
+    """Return the authenticated public scope for one response-only repair."""
+
+    evidence = result.derivative_evidence
+    if not isinstance(evidence, Mapping):
+        raise ValueError("root-sealed exterior repair evidence is missing")
+    scope = evidence.get("response_repair_scope")
+    if not isinstance(scope, Mapping):
+        raise ValueError("root-sealed exterior repair scope is missing")
+    recomputed = scope.get("recomputed_families")
+    reused = scope.get("reused_families")
+    if not isinstance(recomputed, list) or not isinstance(reused, list):
+        raise ValueError("root-sealed exterior repair scope is invalid")
+    actual_families = frozenset(recomputed)
+    identity = (
+        "fixed-root-domega-stencil-only/v1"
+        if actual_families == {"frequency"}
+        else "fixed-root-dc-stencil-only/v1"
+        if actual_families == {"coordinate"}
+        else "fixed-root-domega-dc-stencils-only/v1"
+        if actual_families == {"frequency", "coordinate"}
+        else None
+    )
+    if identity is None:
+        raise ValueError("root-sealed exterior repair scope is invalid")
+    return identity
 
 
 def _response_requires_precision120(
@@ -7700,6 +7781,158 @@ def _validate_primary_record_semantics(
     return all(production_flags)
 
 
+def _legacy_migration_receipt_candidates(
+    record: CampaignLeafRecord,
+) -> tuple[EvidenceReceipt, ...]:
+    """Reconstruct every valid historical-schema receipt for one record."""
+
+    source = replace(record, evidence=None, evidence_stages=())
+    if source.state != "PRODUCED":
+        return ()
+    validated = _legacy_record_has_explicit_independent_validation(source)
+    profile = (
+        ExecutionProfile.VALIDATE
+        if validated
+        else ExecutionProfile.CERTIFY
+    )
+    level = EvidenceLevel.VALIDATED if validated else EvidenceLevel.CERTIFIED
+    return tuple(
+        EvidenceReceipt(
+            execution_profile=profile,
+            evidence_level=level,
+            receipt_sha256=_sha256({
+                "schema": "windows-solver.legacy-campaign-evidence-migration/1",
+                "leaf_id": source.leaf_id,
+                "source_checkpoint_schema_version": schema_version,
+                "source_record_sha256": source.record_sha256,
+                "inferred_execution_profile": profile.value,
+                "inferred_evidence_level": level.value,
+            }),
+        )
+        for schema_version in sorted(
+            _HISTORICAL_CAMPAIGN_CHECKPOINT_SCHEMA_VERSIONS
+        )
+    )
+
+
+def _validate_additive_evidence_chain(
+    record: CampaignLeafRecord,
+    initial_receipt: EvidenceReceipt,
+) -> None:
+    """Authenticate one initial receipt and every additive evidence stage."""
+
+    evidence = record.evidence
+    if evidence is None or initial_receipt not in evidence.receipts:
+        raise ValueError("campaign initial evidence receipt is invalid")
+    central_stage = next(
+        stage
+        for stage in record.stages
+        if stage.stage_sha256 == evidence.central_stage_sha256
+    )
+    central = _stage_response_centre(central_stage.outcome)
+    expected_receipt_ids = {initial_receipt.receipt_sha256}
+    expected_discrepancy_codes: set[str] = set()
+    established_level = initial_receipt.evidence_level
+    for evidence_stage in record.evidence_stages:
+        try:
+            profile = ExecutionProfile(
+                evidence_stage.outcome.component_result[
+                    "execution_profile"
+                ]
+            )
+        except (KeyError, TypeError, ValueError) as error:
+            raise ValueError(
+                "campaign evidence stage profile is invalid"
+            ) from error
+        if profile is ExecutionProfile.SURVEY:
+            raise ValueError("campaign survey stage cannot be upgrade evidence")
+        upgrade_policy = CampaignExecutionPolicy.for_profile(profile)
+        prerequisite = upgrade_policy.prerequisite_evidence_level
+        if (
+            prerequisite is None
+            or not evidence_level_at_least(established_level, prerequisite)
+        ):
+            raise ValueError(
+                "campaign evidence upgrade prerequisite is invalid"
+            )
+        component = evidence_stage.outcome.component_result
+        evidence_kind = component.get("evidence_kind")
+        if evidence_kind == "targeted-local-certification/v1":
+            heavy_chain = component.get("heavy_local_stage_chain")
+            if not isinstance(heavy_chain, list) or not heavy_chain:
+                raise ValueError(
+                    "campaign certification lacks heavy local evidence"
+                )
+            final_heavy = heavy_chain[-1]
+            if (
+                not isinstance(final_heavy, Mapping)
+                or final_heavy.get("digits")
+                != evidence_stage.outcome.digits
+                or not isinstance(final_heavy.get("component_result"), Mapping)
+                or final_heavy["component_result"].get("result")
+                != component.get("result")
+                or component.get("validation_policy") is not None
+            ):
+                raise ValueError(
+                    "campaign certification heavy evidence is invalid"
+                )
+        elif evidence_kind == "independent-publication-validation/v1":
+            if (
+                component.get("heavy_local_stage_chain") != []
+                or component.get("validation_policy") != {
+                    "identity": FULL_COMPLEX_LADDER_VALIDATION_IDENTITY,
+                    "reason": "PUBLICATION_VALIDATION",
+                }
+            ):
+                raise ValueError(
+                    "campaign publication validation evidence is invalid"
+                )
+        else:
+            raise ValueError("campaign evidence upgrade kind is invalid")
+        expected_receipt = _profile_evidence_receipt_sha256(
+            record, evidence_stage, upgrade_policy
+        )
+        has_receipt = any(
+            receipt.receipt_sha256 == expected_receipt
+            and receipt.execution_profile is profile
+            for receipt in evidence.receipts
+        )
+        candidate = _stage_response_centre(evidence_stage.outcome)
+        agrees = (
+            evidence_stage.outcome.numerical_state
+            == ComponentStatus.CONVERGED.value
+            and central is not None
+            and candidate is not None
+            and abs(candidate - central)
+            <= central_stage.outcome.local_disk_radius_abs
+        )
+        discrepancy = (
+            "CERTIFICATION_CENTRE_OUTSIDE_SCREENED_DISK"
+            if profile is ExecutionProfile.CERTIFY
+            else "VALIDATION_CENTRE_OUTSIDE_CERTIFIED_DISK"
+        )
+        if agrees:
+            expected_receipt_ids.add(expected_receipt)
+            established_level = stronger_evidence_level(
+                established_level,
+                upgrade_policy.target_evidence_level,
+            )
+        else:
+            expected_discrepancy_codes.add(discrepancy)
+        if has_receipt != agrees or (
+            not agrees and discrepancy not in evidence.discrepancy_codes
+        ):
+            raise ValueError("campaign evidence upgrade receipt is invalid")
+    if {
+        receipt.receipt_sha256 for receipt in evidence.receipts
+    } != expected_receipt_ids:
+        raise ValueError("campaign evidence upgrade receipt is invalid")
+    if set(evidence.discrepancy_codes) != expected_discrepancy_codes:
+        raise ValueError("campaign evidence upgrade discrepancy is invalid")
+    if evidence.evidence_level is not established_level:
+        raise ValueError("campaign evidence upgrade level is invalid")
+
+
 def _validate_record_semantics(
     leaf: CampaignLeafPlan,
     record: CampaignLeafRecord,
@@ -7748,7 +7981,11 @@ def _validate_record_semantics(
             or tuple(stage.digits for stage in stages) not in {(64,), (64, 80)}
         ):
             raise ValueError("campaign survey record fields are invalid")
-        screened = _survey_stage_is_screened(stages[-1])
+        screened_flags = tuple(
+            _validate_survey_stage_for_leaf(leaf, stage)
+            for stage in stages
+        )
+        screened = screened_flags[-1]
         if screened:
             if (
                 record.state != "PRODUCED"
@@ -7765,7 +8002,7 @@ def _validate_record_semantics(
             or record.evidence is not None
         ):
             raise ValueError("campaign unresolved survey evidence is invalid")
-        if record.evidence_stages:
+        if screened:
             assert record.evidence is not None
             central_stage = next(
                 stage
@@ -7773,91 +8010,27 @@ def _validate_record_semantics(
                 if stage.stage_sha256
                 == record.evidence.central_stage_sha256
             )
-            central = _stage_response_centre(central_stage.outcome)
-            for evidence_stage in record.evidence_stages:
-                try:
-                    profile = ExecutionProfile(
-                        evidence_stage.outcome.component_result[
-                            "execution_profile"
-                        ]
-                    )
-                except (KeyError, TypeError, ValueError) as error:
-                    raise ValueError(
-                        "campaign evidence stage profile is invalid"
-                    ) from error
-                if profile is ExecutionProfile.SURVEY:
-                    raise ValueError(
-                        "campaign survey stage cannot be upgrade evidence"
-                    )
-                component = evidence_stage.outcome.component_result
-                evidence_kind = component.get("evidence_kind")
-                if evidence_kind == "targeted-local-certification/v1":
-                    heavy_chain = component.get("heavy_local_stage_chain")
-                    if not isinstance(heavy_chain, list) or not heavy_chain:
-                        raise ValueError(
-                            "campaign certification lacks heavy local evidence"
-                        )
-                    final_heavy = heavy_chain[-1]
-                    if (
-                        not isinstance(final_heavy, Mapping)
-                        or final_heavy.get("digits")
-                        != evidence_stage.outcome.digits
-                        or not isinstance(
-                            final_heavy.get("component_result"), Mapping
-                        )
-                        or final_heavy["component_result"].get("result")
-                        != component.get("result")
-                        or component.get("validation_policy") is not None
-                    ):
-                        raise ValueError(
-                            "campaign certification heavy evidence is invalid"
-                        )
-                elif evidence_kind == (
-                    "independent-publication-validation/v1"
-                ):
-                    if (
-                        component.get("heavy_local_stage_chain") != []
-                        or component.get("validation_policy") != {
-                            "identity": (
-                                FULL_COMPLEX_LADDER_VALIDATION_IDENTITY
-                            ),
-                            "reason": "PUBLICATION_VALIDATION",
-                        }
-                    ):
-                        raise ValueError(
-                            "campaign publication validation evidence is invalid"
-                        )
-                upgrade_policy = CampaignExecutionPolicy.for_profile(profile)
-                expected_receipt = _profile_evidence_receipt_sha256(
-                    record, evidence_stage, upgrade_policy
-                )
-                has_receipt = any(
-                    receipt.receipt_sha256 == expected_receipt
-                    and receipt.execution_profile is profile
-                    for receipt in record.evidence.receipts
-                )
-                candidate = _stage_response_centre(evidence_stage.outcome)
-                agrees = (
-                    evidence_stage.outcome.numerical_state
-                    == ComponentStatus.CONVERGED.value
-                    and central is not None
-                    and candidate is not None
-                    and abs(candidate - central)
-                    <= central_stage.outcome.local_disk_radius_abs
-                )
-                discrepancy = (
-                    "CERTIFICATION_CENTRE_OUTSIDE_SCREENED_DISK"
-                    if profile is ExecutionProfile.CERTIFY
-                    else "VALIDATION_CENTRE_OUTSIDE_CERTIFIED_DISK"
-                )
-                if has_receipt != agrees or (
-                    not agrees
-                    and discrepancy not in record.evidence.discrepancy_codes
-                ):
-                    raise ValueError(
-                        "campaign evidence upgrade receipt is invalid"
-                    )
+            survey_receipt = _survey_evidence_record(
+                record.leaf_id,
+                central_stage,
+                CampaignExecutionPolicy.for_profile(
+                    ExecutionProfile.SURVEY
+                ),
+            ).receipts[0]
+            if survey_receipt not in record.evidence.receipts:
+                raise ValueError("campaign survey receipt is invalid")
+            _validate_additive_evidence_chain(record, survey_receipt)
         return True
+
+    if record.evidence is not None:
+        migration_receipts = tuple(
+            candidate
+            for candidate in _legacy_migration_receipt_candidates(record)
+            if candidate in record.evidence.receipts
+        )
+        if len(migration_receipts) != 1:
+            raise ValueError("campaign legacy evidence receipt is invalid")
+        _validate_additive_evidence_chain(record, migration_receipts[0])
     allow_historical_conditioning_absence = (
         checkpoint_schema_version
         in _HISTORICAL_CAMPAIGN_CHECKPOINT_SCHEMA_VERSIONS
@@ -9446,11 +9619,227 @@ def _survey_stage_is_screened(outcome: StageOutcome) -> bool:
     return (
         result.to_mapping() == raw_result
         and result.status is ComponentStatus.CONVERGED
+        and result.usable
+        and result.response_uncertainty_calibrated
         and response is not None
+        and not _response_precision_limited_families(result)
         and math.isfinite(complex(response).real)
         and math.isfinite(complex(response).imag)
         and math.isfinite(outcome.local_disk_radius_abs)
     )
+
+
+_SURVEY_PROFILE_METADATA_FIELDS = frozenset({
+    "execution_profile",
+    "leaf_id",
+    "mechanism_id",
+    "digits",
+    "bounded_response_disk",
+    "survey_promotion_required",
+    "survey_required_precision_digits",
+    "survey_failure_code",
+    "semantic_precision_tier_trace",
+    "root_failure_codes",
+})
+
+
+def _survey_unprofiled_outcome(outcome: StageOutcome) -> StageOutcome:
+    """Recover the canonical existing component wrapper under survey metadata."""
+
+    component = {
+        name: value
+        for name, value in outcome.component_result.items()
+        if name not in _SURVEY_PROFILE_METADATA_FIELDS
+    }
+    source_sha256 = _sha256(component)
+    channels: list[Mapping[str, object]] = []
+    for raw_channel in outcome.signed_error_channels:
+        channel = dict(raw_channel)
+        provenance = dict(channel["provenance"])
+        provenance["source_sha256"] = source_sha256
+        channel["provenance"] = provenance
+        channels.append(channel)
+    return replace(
+        outcome,
+        component_result=component,
+        signed_error_channels=tuple(channels),
+    )
+
+
+def _validate_exterior_survey_result(
+    leaf: CampaignLeafPlan,
+    outcome: StageOutcome,
+    result: ComponentResult,
+    *,
+    response_repair: bool = False,
+) -> None:
+    """Bind a fixed-root survey result to its exact leaf and shared seal."""
+
+    job = leaf.job
+    expected_lineage = {
+        "leaf_id": job.leaf_id,
+        "root_reference_id": job.root.root_reference_id,
+        "root_identity_sha256": job.root.identity_sha256,
+        "policy_sha256": job.policy.identity_sha256,
+        "backend_identity_sha256": job.backend_identity.identity_sha256,
+        "equation_id": job.equation_id,
+        "sampling_coordinate": job.sampling_coordinate.to_mapping(),
+        "source_root_mapping": (
+            None
+            if job.source_root_mapping is None
+            else dict(job.source_root_mapping)
+        ),
+        "component_scientific_identity": (
+            EXTERIOR_DERIVATIVE_COMPONENT_IDENTITY
+        ),
+    }
+    if (
+        result.job_id != job.job_id
+        or result.leaf_id != leaf.leaf_id
+        or result.mechanism_id != leaf.mechanism_id
+        or result.status.value != outcome.numerical_state
+        or result.component_scientific_identity
+        != EXTERIOR_DERIVATIVE_COMPONENT_IDENTITY
+        or dict(result.lineage) != expected_lineage
+    ):
+        raise _UnauthenticatedComponentEvidence(
+            "campaign survey component identity is invalid"
+        )
+    if not root_readout_preserves_authenticated_branch(
+        result.baseline,
+        job.root,
+        equation_id=job.equation_id,
+        source_root_mapping=job.source_root_mapping,
+    ):
+        raise _UnauthenticatedComponentEvidence(
+            "campaign survey baseline branch identity is invalid"
+        )
+    seal = _sealed_root_for_result(result)
+    if seal is None:
+        raise _UnauthenticatedComponentEvidence(
+            "campaign survey exterior result lacks its root seal"
+        )
+    try:
+        seal.validate_for(job)
+    except ValueError as error:
+        raise _UnauthenticatedComponentEvidence(
+            "campaign survey exterior root seal is invalid"
+        ) from error
+    evidence = result.derivative_evidence
+    if not isinstance(evidence, Mapping):
+        raise _UnauthenticatedComponentEvidence(
+            "campaign survey exterior derivative evidence is missing"
+        )
+    try:
+        shared = SharedBackgroundRootSeal.from_mapping(
+            evidence.get("shared_background_root_seal")
+        )
+        rebound = shared.bind(
+            job,
+            controls_sha256=shared.background_key.controls_sha256,
+            precision_tier=shared.background_key.precision_tier,
+            working_precision_bits=(
+                shared.background_key.working_precision_bits
+            ),
+        )
+    except ValueError as error:
+        raise _UnauthenticatedComponentEvidence(
+            "campaign survey shared background identity is invalid"
+        ) from error
+    if rebound.to_mapping() != seal.to_mapping():
+        raise _UnauthenticatedComponentEvidence(
+            "campaign survey shared background bound a different root"
+        )
+    runtime = outcome.component_result.get("scientific_runtime")
+    trace = outcome.component_result.get("semantic_precision_tier_trace")
+    exact_runtime_match = (
+        isinstance(runtime, Mapping)
+        and _sha256(dict(runtime))
+        == shared.background_key.controls_sha256
+        and isinstance(trace, list)
+        and bool(trace)
+        and trace[-1] == shared.background_key.precision_tier
+        and runtime.get("semantic_precision_tier")
+        == shared.background_key.precision_tier
+        and runtime.get("working_precision_bits")
+        == shared.background_key.working_precision_bits
+    )
+    repair_trace_match = (
+        response_repair
+        and isinstance(trace, list)
+        and shared.background_key.precision_tier in trace
+    )
+    if not (exact_runtime_match or repair_trace_match):
+        raise _UnauthenticatedComponentEvidence(
+            "campaign survey exterior control identity is invalid"
+        )
+    if _survey_stage_is_screened(outcome):
+        restored = SurveyEvidenceCache()
+        if not restore_survey_evidence_cache_from_result(result, restored):
+            raise _UnauthenticatedComponentEvidence(
+                "campaign screened exterior result lacks reusable survey evidence"
+            )
+
+
+def _validate_survey_stage_for_leaf(
+    leaf: CampaignLeafPlan,
+    outcome: StageOutcome,
+) -> bool:
+    """Authenticate survey routing plus any retained numerical component."""
+
+    payload = outcome.component_result
+    if (
+        payload.get("leaf_id") != leaf.leaf_id
+        or payload.get("mechanism_id") != leaf.mechanism_id
+        or payload.get("digits") != outcome.digits
+    ):
+        raise ValueError("campaign survey stage leaf identity is invalid")
+    synthetic = payload.get("evidence_kind") == (
+        "synthetic-survey-orchestration-contract"
+    )
+    if not synthetic and payload.get("execution_profile") != (
+        ExecutionProfile.SURVEY.value
+    ):
+        raise ValueError("campaign survey stage profile is invalid")
+    screened = _survey_stage_is_screened(outcome)
+    raw_result = payload.get("result")
+    if not isinstance(raw_result, Mapping):
+        return screened
+    try:
+        result = ComponentResult.from_mapping(raw_result)
+    except (TypeError, ValueError) as error:
+        raise ValueError("campaign survey component result is invalid") from error
+    if result.to_mapping() != raw_result:
+        raise ValueError("campaign survey component result is not canonical")
+    expected_radius = sum(result.error_channels.values())
+    tolerance = max(1.0e-15, expected_radius * 1.0e-12)
+    if abs(outcome.local_disk_radius_abs - expected_radius) > tolerance:
+        raise ValueError("campaign survey response disk radius is inconsistent")
+    if payload.get("evidence_kind") == "fixed-root-exterior-survey/v1":
+        _validate_exterior_survey_result(leaf, outcome, result)
+    else:
+        canonical = _survey_unprofiled_outcome(outcome)
+        if not _validate_component_result(
+            leaf,
+            canonical,
+            allow_historical_conditioning_absence=False,
+        ):
+            raise _UnauthenticatedComponentEvidence(
+                "campaign survey lacks canonical production evidence"
+            )
+        if (
+            payload.get("evidence_kind")
+            == _ROOT_SEALED_RESPONSE_REPAIR_EVIDENCE_KIND
+            and result.component_scientific_identity
+            == EXTERIOR_DERIVATIVE_COMPONENT_IDENTITY
+        ):
+            _validate_exterior_survey_result(
+                leaf,
+                outcome,
+                result,
+                response_repair=True,
+            )
+    return screened
 
 
 def _survey_evidence_record(
@@ -9556,6 +9945,31 @@ def _execute_contained_survey_stage(
     return outcome, False
 
 
+def _survey_resume_stages(
+    record: CampaignLeafRecord | None,
+) -> tuple[CampaignStageRecord, ...]:
+    """Return only a stage prefix produced by the survey execution contract.
+
+    Historical nonterminal records may already contain legacy production
+    stages.  They authenticate the old interrupted attempt, but they are not a
+    valid prefix for the new survey state machine.  Terminal records are
+    handled before this helper is reached; an unfinished legacy leaf restarts
+    its survey sequence while every completed historical record remains
+    byte-identical.
+    """
+
+    if record is None:
+        return ()
+    survey_stage = any(
+        stage.outcome.component_result.get("execution_profile")
+        == ExecutionProfile.SURVEY.value
+        or stage.outcome.component_result.get("evidence_kind")
+        == "synthetic-survey-orchestration-contract"
+        for stage in record.stages
+    )
+    return record.stages if survey_stage else ()
+
+
 def _run_survey_selection_active(
     plan: CampaignPlan,
     selection: CampaignSelection,
@@ -9618,7 +10032,12 @@ def _run_survey_selection_active(
             raise ValueError("campaign resume requires an existing checkpoint")
         records_by_id = {}
 
-    reused = sum(len(record.stages) for record in records_by_id.values())
+    reused = sum(
+        len(record.stages)
+        if record.state in {"PRODUCED", "UNRESOLVED", "FAILED"}
+        else len(_survey_resume_stages(record))
+        for record in records_by_id.values()
+    )
     executed = 0
     survey_cache = SurveyEvidenceCache()
     for record in records_by_id.values():
@@ -9650,7 +10069,7 @@ def _run_survey_selection_active(
         with progress_scope(**context):
             emit_progress(ProgressEventKind.LEAF_STARTED)
 
-        stages = [] if existing is None else list(existing.stages)
+        stages = list(_survey_resume_stages(existing))
         digits = 64 if not stages else stages[-1].outcome.digits
         if stages and digits == 64:
             payload = stages[-1].outcome.component_result
@@ -9681,7 +10100,7 @@ def _run_survey_selection_active(
                 state="FAILED",
                 stages=tuple(stages),
             )
-        elif _survey_stage_is_screened(outcome):
+        elif _validate_survey_stage_for_leaf(leaf, outcome):
             record = CampaignLeafRecord(
                 leaf_id=leaf_id,
                 role=leaf.role,
@@ -9716,7 +10135,7 @@ def _run_survey_selection_active(
                 executed += 1
                 screened = (
                     not promoted_failure
-                    and _survey_stage_is_screened(promoted)
+                    and _validate_survey_stage_for_leaf(leaf, promoted)
                 )
                 record = CampaignLeafRecord(
                     leaf_id=leaf_id,
@@ -12221,6 +12640,8 @@ def _run_promoted_exterior_response_repair_with_progress(
     *,
     repair_families: frozenset[str],
     reusable_result: ComponentResult,
+    shared_background_seal: SharedBackgroundRootSeal | None = None,
+    reusable_domega: FixedRootDomegaEvidence | None = None,
 ) -> ComponentResult:
     """Run only fixed-root response work; this path has no root operation."""
 
@@ -12235,6 +12656,8 @@ def _run_promoted_exterior_response_repair_with_progress(
                 derivative_step=job.policy.epsilons[0],
                 repair_families=repair_families,
                 reusable_result=reusable_result,
+                shared_background_seal=shared_background_seal,
+                reusable_domega=reusable_domega,
             )
         except KeyboardInterrupt:
             raise
@@ -12545,6 +12968,45 @@ class NativeCampaignStageBackend:
         )
 
     @staticmethod
+    def _binary64_horizon_survey_preflight(
+        leaf: CampaignLeafPlan,
+    ) -> StageOutcome:
+        """Authorize the existing BF80 horizon route without root ladders.
+
+        Binary64 has no calibrated fixed-root determinant-error boundary from
+        which to construct the required bounded analytic disk.  Recording that
+        authenticated numerical insufficiency is cheaper and more honest than
+        entering the generic signed-amplitude/root-diagnostic machinery.
+        """
+
+        payload = {
+            "evidence_kind": "fixed-root-horizon-survey-preflight/v1",
+            "execution_profile": ExecutionProfile.SURVEY.value,
+            "leaf_id": leaf.leaf_id,
+            "mechanism_id": leaf.mechanism_id,
+            "digits": 64,
+            "binary64_fixed_root_error_model_available": False,
+            "bounded_response_disk": False,
+            "response": None,
+            "survey_promotion_required": True,
+            "survey_required_precision_digits": 80,
+            "survey_failure_code": (
+                "BINARY64_BOUNDED_HORIZON_DISK_UNAVAILABLE"
+            ),
+        }
+        return StageOutcome(
+            digits=64,
+            numerical_state=ComponentStatus.DERIVATIVE_UNRESOLVED.value,
+            component_result=payload,
+            local_disk_radius_abs=0.0,
+            signed_error_channels=synthetic_stage_signed_error_channels(
+                payload,
+                0.0,
+                precision_ladder_applicable=False,
+            ),
+        )
+
+    @staticmethod
     def _profiled_survey_outcome(
         leaf: CampaignLeafPlan,
         outcome: StageOutcome,
@@ -12615,6 +13077,11 @@ class NativeCampaignStageBackend:
         last_result: ComponentResult | None = None
         last_scientific_runtime: Mapping[str, object] | None = None
         root_failure_codes: list[str] = []
+        terminal_root_failure_code: str | None = None
+        retained_seal: PromotedRootSeal | None = None
+        retained_shared: SharedBackgroundRootSeal | None = None
+        repair_families = frozenset[str]()
+        response_repair_executed = False
         for semantic_digits, tier in (
             (40, PrecisionTier.BIGFLOAT_40),
             (80, PrecisionTier.BIGFLOAT_80),
@@ -12629,69 +13096,160 @@ class NativeCampaignStageBackend:
             )
             controls_sha256 = _sha256(last_scientific_runtime)
             bits = working_precision_bits(tier)
-            shared = self._matching_survey_background(
-                leaf,
-                cache,
-                controls_sha256=controls_sha256,
-                tier=tier,
-            )
-            if shared is None:
-                predictor = leaf.job.root.omega
-                root_backend = _journaled_promoted_exterior_backend(
-                    leaf.job,
-                    backend,
-                    predictor=predictor,
-                    derivative_step=leaf.job.policy.epsilons[0],
-                    validation_reason=None,
+            if retained_seal is None:
+                shared = self._matching_survey_background(
+                    leaf,
+                    cache,
+                    controls_sha256=controls_sha256,
+                    tier=tier,
                 )
-                baseline = root_backend.read_root(
-                    leaf.job, 0.0j, primary_predictor=predictor
-                )
-                try:
-                    promoted = PromotedRootSeal.derive(leaf.job, baseline)
-                    shared = SharedBackgroundRootSeal.derive(
+                if shared is None:
+                    predictor = leaf.job.root.omega
+                    root_backend = _journaled_promoted_exterior_backend(
                         leaf.job,
-                        promoted,
-                        controls_sha256=controls_sha256,
-                        precision_tier=tier,
-                        working_precision_bits=bits,
+                        backend,
+                        predictor=predictor,
+                        derivative_step=leaf.job.policy.epsilons[0],
+                        validation_reason=None,
                     )
-                except ValueError as error:
-                    semantic_trace.append(tier.value)
-                    root_failure_codes.append(type(error).__name__)
-                    continue
-                cache.store_background_seal(
-                    shared.background_key, shared.to_mapping()
+                    baseline = root_backend.read_root(
+                        leaf.job, 0.0j, primary_predictor=predictor
+                    )
+                    promotion_reason, authentication_failure = (
+                        _survey_root_precision_disposition(
+                            leaf.job,
+                            baseline,
+                        )
+                    )
+                    if authentication_failure is not None:
+                        semantic_trace.append(tier.value)
+                        root_failure_codes.append(authentication_failure)
+                        terminal_root_failure_code = authentication_failure
+                        break
+                    if promotion_reason is not None:
+                        if promotion_reason not in _ROOT_PRECISION_PROMOTION_REASONS:
+                            raise AssertionError(
+                                "survey root promotion reason escaped its allowlist"
+                            )
+                        semantic_trace.append(tier.value)
+                        root_failure_codes.append(promotion_reason)
+                        terminal_root_failure_code = promotion_reason
+                        continue
+                    try:
+                        promoted = PromotedRootSeal.derive(leaf.job, baseline)
+                        shared = SharedBackgroundRootSeal.derive(
+                            leaf.job,
+                            promoted,
+                            controls_sha256=controls_sha256,
+                            precision_tier=tier,
+                            working_precision_bits=bits,
+                        )
+                    except ValueError:
+                        semantic_trace.append(tier.value)
+                        terminal_root_failure_code = (
+                            "ROOT_SEAL_AUTHENTICATION_INVALID"
+                        )
+                        root_failure_codes.append(terminal_root_failure_code)
+                        break
+                    cache.store_background_seal(
+                        shared.background_key, shared.to_mapping()
+                    )
+                seal = shared.bind(
+                    leaf.job,
+                    controls_sha256=controls_sha256,
+                    precision_tier=tier,
+                    working_precision_bits=bits,
                 )
-            seal = shared.bind(
-                leaf.job,
-                controls_sha256=controls_sha256,
-                precision_tier=tier,
-                working_precision_bits=bits,
-            )
+            else:
+                # The root is already authenticated.  A higher response tier is
+                # allowed to resample only the typed precision-limited fixed-root
+                # derivative families; it must never cross back into read_root().
+                if (
+                    semantic_digits != 80
+                    or retained_shared is None
+                    or last_result is None
+                    or not repair_families
+                ):
+                    raise AssertionError(
+                        "survey response repair state is inconsistent"
+                    )
+                seal = retained_seal
+                shared = retained_shared
             response_backend = _journaled_promoted_exterior_response_backend(
                 leaf.job,
                 backend,
                 seal=seal,
                 derivative_step=leaf.job.policy.epsilons[0],
                 validation_reason=None,
+                repair_families=(repair_families or None),
             )
-            last_result = run_exterior_survey_from_shared_seal(
-                leaf.job,
-                response_backend,
-                shared,
-                cache,
-                derivative_step=leaf.job.policy.epsilons[0],
-                controls_sha256=controls_sha256,
-                precision_tier=tier,
-                working_precision_bits=bits,
-            )
+            if repair_families:
+                assert last_result is not None
+                reusable_result = last_result
+                reusable_domega = None
+                if "frequency" not in repair_families:
+                    derivative_evidence = reusable_result.derivative_evidence
+                    raw_domega = (
+                        None
+                        if not isinstance(derivative_evidence, Mapping)
+                        else derivative_evidence.get("shared_domega_evidence")
+                    )
+                    if raw_domega is not None:
+                        reusable_domega = FixedRootDomegaEvidence.from_mapping(
+                            raw_domega
+                        )
+                else:
+                    # TODO: [HUMAN MATH REVIEW REQUIRED - establish a canonical
+                    # mixed-tier key for a BF80 Domega stencil sampled at a
+                    # retained BF40 root seal before permitting cross-mechanism
+                    # reuse; until then mixed-tier Domega is recomputed and
+                    # never cached.]
+                    reusable_domega = None
+                last_result = (
+                    _run_promoted_exterior_response_repair_with_progress(
+                        leaf.job,
+                        response_backend,
+                        seal,
+                        repair_families=repair_families,
+                        reusable_result=reusable_result,
+                        shared_background_seal=shared,
+                        reusable_domega=reusable_domega,
+                    )
+                )
+                response_repair_executed = True
+            else:
+                last_result = run_exterior_survey_from_shared_seal(
+                    leaf.job,
+                    response_backend,
+                    shared,
+                    cache,
+                    derivative_step=leaf.job.policy.epsilons[0],
+                    controls_sha256=controls_sha256,
+                    precision_tier=tier,
+                    working_precision_bits=bits,
+                )
             semantic_trace.append(tier.value)
+            limited_families = _response_precision_limited_families(
+                last_result
+            )
             if (
                 last_result.status is ComponentStatus.CONVERGED
                 and last_result.response is not None
+                and not limited_families
             ):
                 break
+            if (
+                semantic_digits == 40
+                and limited_families
+                and 80 in self.precision_capabilities.digits
+            ):
+                retained_seal = seal
+                retained_shared = shared
+                repair_families = limited_families
+                continue
+            # A fixed-root response failure without typed current-tier precision
+            # evidence is terminal for survey.  Record it and advance the atlas.
+            break
         if last_result is None:
             payload = {
                 "evidence_kind": "fixed-root-exterior-survey/v1",
@@ -12705,7 +13263,10 @@ class NativeCampaignStageBackend:
                 "response": None,
                 "survey_promotion_required": False,
                 "survey_required_precision_digits": None,
-                "survey_failure_code": "PROMOTED_ROOT_SEAL_UNRESOLVED",
+                "survey_failure_code": (
+                    terminal_root_failure_code
+                    or "PROMOTED_ROOT_SEAL_UNRESOLVED"
+                ),
                 "scientific_runtime": last_scientific_runtime,
             }
             return StageOutcome(
@@ -12719,29 +13280,37 @@ class NativeCampaignStageBackend:
                     precision_ladder_applicable=False,
                 ),
             )
-        payload = {
-            "evidence_kind": "fixed-root-exterior-survey/v1",
-            "execution_profile": ExecutionProfile.SURVEY.value,
-            "leaf_id": leaf.leaf_id,
-            "mechanism_id": leaf.mechanism_id,
-            "digits": 80,
-            "semantic_precision_tier_trace": semantic_trace,
-            "result": last_result.to_mapping(),
-            "bounded_response_disk": (
-                last_result.status is ComponentStatus.CONVERGED
-                and last_result.response is not None
-            ),
-            "survey_promotion_required": False,
-            "survey_required_precision_digits": None,
-            "survey_failure_code": (
-                None
-                if last_result.status is ComponentStatus.CONVERGED
-                else last_result.status.value
-            ),
-            "scientific_runtime": last_scientific_runtime,
-        }
+        if response_repair_executed:
+            assert retained_seal is not None
+            payload = {
+                "evidence_kind": _ROOT_SEALED_RESPONSE_REPAIR_EVIDENCE_KIND,
+                "result": last_result.to_mapping(),
+                "self_refinement_result": None,
+                "self_refinement_skipped_reason": (
+                    _FIXED_ROOT_EXTERIOR_SELF_REFINEMENT_SKIPPED_REASON
+                ),
+                "scientific_runtime": last_scientific_runtime,
+                "root_seal_sha256": retained_seal.sha256,
+                "response_repair_scope": (
+                    _fixed_root_response_repair_scope(last_result)
+                ),
+                "precision_ladder_discrepancy_applicable": False,
+                "precision_ladder_discrepancy_reason": (
+                    _PREVIOUS_PROMOTED_RESPONSE_UNAVAILABLE_REASON
+                ),
+                "semantic_precision_tier_trace": semantic_trace,
+                "root_failure_codes": root_failure_codes,
+            }
+        else:
+            payload = {
+                "evidence_kind": "fixed-root-exterior-survey/v1",
+                "semantic_precision_tier_trace": semantic_trace,
+                "root_failure_codes": root_failure_codes,
+                "result": last_result.to_mapping(),
+                "scientific_runtime": last_scientific_runtime,
+            }
         radius = sum(last_result.error_channels.values())
-        return StageOutcome(
+        outcome = StageOutcome(
             digits=80,
             numerical_state=last_result.status.value,
             component_result=payload,
@@ -12752,6 +13321,9 @@ class NativeCampaignStageBackend:
                 repeat_applicable=False,
                 precision_ladder_applicable=False,
             ),
+        )
+        return self._profiled_survey_outcome(
+            leaf, outcome, promotion_required=False
         )
 
     def execute_profile_stage(
@@ -12769,23 +13341,7 @@ class NativeCampaignStageBackend:
         if leaf.mechanism_id == "horizon-admittance":
             if digits != 64:
                 raise ValueError("horizon survey retains its binary64 route")
-            outcome = self.execute_stage(leaf, 64)
-            try:
-                authenticated_production = _validate_component_result(
-                    leaf,
-                    outcome,
-                    allow_historical_conditioning_absence=False,
-                )
-            except _UnauthenticatedComponentEvidence:
-                authenticated_production = False
-            promote = _primary_binary64_promotes(
-                outcome, production=authenticated_production
-            )
-            return self._profiled_survey_outcome(
-                leaf,
-                outcome,
-                promotion_required=promote,
-            )
+            return self._binary64_horizon_survey_preflight(leaf)
         if digits == 64:
             return self._binary64_exterior_survey_preflight(leaf)
         if digits != 80:
@@ -12810,11 +13366,44 @@ class NativeCampaignStageBackend:
             or tuple(item.digits for item in previous_outcomes) != (64,)
         ):
             raise ValueError("horizon survey promotion contract is invalid")
-        outcome = self.execute_promoted_stage_with_predictor(
-            leaf,
-            80,
-            previous_outcomes,
-            None,
+        primary_backend = self._julia_precision_backend_for(leaf.job, 80)
+        result = _run_promoted_horizon_component_with_progress(
+            leaf.job,
+            primary_backend,
+            leaf.job.root.omega,
+        )
+        component_result = {
+            "evidence_kind": _ANALYTIC_HORIZON_EVIDENCE_KIND,
+            "result": result.to_mapping(),
+            "self_refinement_result": None,
+            "self_refinement_skipped_reason": (
+                "NOT_REQUIRED_BY_V1_4_PROMOTED_ROOT_POLICY"
+            ),
+            "scientific_runtime": primary_backend.scientific_runtime_for(
+                leaf.job
+            ),
+            "primary_root_predictor_source": (
+                "PREVIOUS_STAGE_BASELINE_OMEGA"
+            ),
+            "precision_ladder_discrepancy_applicable": False,
+            "precision_ladder_discrepancy_reason": (
+                _BINARY64_RESPONSE_UNAVAILABLE_REASON
+            ),
+        }
+        outcome = StageOutcome(
+            digits=80,
+            numerical_state=result.status.value,
+            component_result=component_result,
+            local_disk_radius_abs=sum(result.error_channels.values()),
+            signed_error_channels=_component_stage_signed_error_channels(
+                component_result,
+                result,
+                repeat_applicable=False,
+                precision_ladder_applicable=False,
+            ),
+            self_refinement_enclosed=None,
+            discrepancy_from_previous_abs=None,
+            discrepancy_enclosed=None,
         )
         return self._profiled_survey_outcome(
             leaf, outcome, promotion_required=False
@@ -13088,28 +13677,7 @@ class NativeCampaignStageBackend:
         if leaf.mechanism_id == "horizon-admittance":
             response_repair_scope = "fixed-root-domega-stencil-only/v1"
         else:
-            evidence = result.derivative_evidence
-            if not isinstance(evidence, Mapping):
-                raise ValueError("root-sealed exterior repair evidence is missing")
-            scope = evidence.get("response_repair_scope")
-            if not isinstance(scope, Mapping):
-                raise ValueError("root-sealed exterior repair scope is missing")
-            recomputed = scope.get("recomputed_families")
-            reused = scope.get("reused_families")
-            if not isinstance(recomputed, list) or not isinstance(reused, list):
-                raise ValueError("root-sealed exterior repair scope is invalid")
-            actual_families = frozenset(recomputed)
-            response_repair_scope = (
-                "fixed-root-domega-stencil-only/v1"
-                if actual_families == {"frequency"}
-                else "fixed-root-dc-stencil-only/v1"
-                if actual_families == {"coordinate"}
-                else "fixed-root-domega-dc-stencils-only/v1"
-                if actual_families == {"frequency", "coordinate"}
-                else None
-            )
-            if response_repair_scope is None:
-                raise ValueError("root-sealed exterior repair scope is invalid")
+            response_repair_scope = _fixed_root_response_repair_scope(result)
         component_result = {
             "evidence_kind": _ROOT_SEALED_RESPONSE_REPAIR_EVIDENCE_KIND,
             "result": result.to_mapping(),

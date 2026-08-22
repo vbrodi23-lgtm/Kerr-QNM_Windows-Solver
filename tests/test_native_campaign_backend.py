@@ -25,10 +25,15 @@ from windows_solver.julia_response_backend import (
 from windows_solver.response_batches import (
     B_PRIME_RELEASE_DOMAIN,
     CampaignExecutionAttempt,
+    CampaignLeafRecord,
     NativeCampaignStageBackend,
     PrecisionCapabilities,
     StageOutcome,
+    _atomic_json,
     _campaign_stage_record,
+    _checkpoint_mapping,
+    _component_stage_signed_error_channels,
+    _survey_evidence_record,
     build_campaign_selection,
     build_campaign_plan,
     run_campaign_selection,
@@ -361,56 +366,490 @@ class NativeCampaignBackendTests(unittest.TestCase):
             80,
         )
 
-    def test_horizon_survey_promotes_only_authenticated_numerical_insufficiency(self):
+    def test_horizon_survey_binary64_preflight_never_enters_root_ladder(self):
+        """Catches survey accidentally routing through generic signed roots."""
+
         horizon = next(
             leaf
             for leaf in self.plan.leaves
             if leaf.role == "primary"
             and leaf.mechanism_id == "horizon-admittance"
         )
-        payload = {"evidence_kind": "synthetic-horizon-insufficiency/v1"}
-        unresolved = StageOutcome(
-            digits=64,
-            numerical_state=ComponentStatus.NOT_CONVERGED.value,
-            component_result=payload,
-            local_disk_radius_abs=0.0,
-            signed_error_channels=synthetic_stage_signed_error_channels(
-                payload, 0.0, precision_ladder_applicable=False
+        policy = CampaignExecutionPolicy.for_profile(ExecutionProfile.SURVEY)
+
+        with patch(
+            "windows_solver.response_batches._run_component_with_progress",
+            side_effect=AssertionError("survey entered the full root ladder"),
+        ):
+            outcome = self.backend.execute_profile_stage(
+                horizon,
+                64,
+                policy,
+                SurveyEvidenceCache(),
+            )
+
+        self.assertEqual(outcome.numerical_state, "DERIVATIVE_UNRESOLVED")
+        self.assertIs(
+            outcome.component_result["survey_promotion_required"], True
+        )
+        self.assertEqual(
+            outcome.component_result["survey_required_precision_digits"],
+            80,
+        )
+        self.assertEqual(
+            outcome.component_result["survey_failure_code"],
+            "BINARY64_BOUNDED_HORIZON_DISK_UNAVAILABLE",
+        )
+
+    def test_exterior_survey_branch_failure_does_not_promote_to_bf80(self):
+        """Catches treating branch/control failures as arithmetic shortage."""
+
+        from tests.test_promoted_horizon_component import (
+            _promoted_baseline,
+            _with_worker_receipt,
+        )
+
+        baseline = _with_worker_receipt(
+            self.leaf.job,
+            _promoted_baseline(
+                self.leaf.job,
+                omega=self.leaf.job.root.omega,
+                conditioning_mechanism=self.leaf.mechanism_id,
             ),
+            40,
+            self.leaf.job.root.omega,
+        )
+        branch_failure = replace(
+            baseline,
+            branch_id="synthetic-nonmatching-branch",
+        )
+        requested_digits = []
+
+        class RootBoundary:
+            def read_root(self, *args, **kwargs):
+                return branch_failure
+
+        def precision_backend(job, digits):
+            requested_digits.append(digits)
+            return SimpleNamespace(
+                digits=digits,
+                scientific_runtime_for=lambda selected: {
+                    "semantic_precision_tier": f"bigfloat-{digits}",
+                    "precision_digits": digits,
+                },
+            )
+
+        with (
+            patch.object(
+                self.backend,
+                "_julia_precision_backend_for",
+                side_effect=precision_backend,
+            ),
+            patch(
+                "windows_solver.response_batches."
+                "_journaled_promoted_exterior_backend",
+                return_value=RootBoundary(),
+            ),
+        ):
+            outcome = self.backend._run_native_exterior_survey(
+                self.leaf,
+                SurveyEvidenceCache(),
+            )
+
+        self.assertEqual(requested_digits, [40])
+        self.assertEqual(
+            outcome.component_result["semantic_precision_tier_trace"],
+            ["bigfloat-40"],
+        )
+        self.assertEqual(
+            outcome.component_result["survey_failure_code"],
+            "ROOT_BRANCH_IDENTITY_INVALID",
+        )
+        self.assertIs(
+            outcome.component_result["survey_promotion_required"], False
+        )
+
+    def test_exterior_survey_promotes_only_authenticated_precision_shortage(self):
+        """Catches removing the one permitted BF40 -> BF80 survey route."""
+
+        from tests.test_promoted_horizon_component import (
+            _promoted_baseline,
+            _with_worker_receipt,
+        )
+
+        baseline = _with_worker_receipt(
+            self.leaf.job,
+            _promoted_baseline(
+                self.leaf.job,
+                omega=self.leaf.job.root.omega,
+                conditioning_mechanism=self.leaf.mechanism_id,
+            ),
+            40,
+            self.leaf.job.root.omega,
+        )
+        limited_conditioning = replace(
+            baseline.numerical_conditioning,
+            predicted_reliable_digits=(
+                baseline.numerical_conditioning.required_reliable_digits - 1
+            ),
+            precision_limited=True,
+        )
+        precision_limited = replace(
+            baseline,
+            numerical_conditioning=limited_conditioning,
+        )
+        bf80_branch_failure = replace(
+            _with_worker_receipt(
+                self.leaf.job,
+                _promoted_baseline(
+                    self.leaf.job,
+                    omega=self.leaf.job.root.omega,
+                    conditioning_mechanism=self.leaf.mechanism_id,
+                ),
+                80,
+                self.leaf.job.root.omega,
+            ),
+            branch_id="synthetic-nonmatching-branch",
+        )
+        requested_digits = []
+
+        class RootBoundary:
+            def __init__(self, readout):
+                self.readout = readout
+
+            def read_root(self, *args, **kwargs):
+                return self.readout
+
+        def precision_backend(job, digits):
+            requested_digits.append(digits)
+            return SimpleNamespace(
+                digits=digits,
+                scientific_runtime_for=lambda selected: {
+                    "semantic_precision_tier": f"bigfloat-{digits}",
+                    "precision_digits": digits,
+                },
+            )
+
+        with (
+            patch.object(
+                self.backend,
+                "_julia_precision_backend_for",
+                side_effect=precision_backend,
+            ),
+            patch(
+                "windows_solver.response_batches."
+                "_journaled_promoted_exterior_backend",
+                side_effect=(
+                    RootBoundary(precision_limited),
+                    RootBoundary(bf80_branch_failure),
+                ),
+            ),
+        ):
+            outcome = self.backend._run_native_exterior_survey(
+                self.leaf,
+                SurveyEvidenceCache(),
+            )
+
+        self.assertEqual(requested_digits, [40, 80])
+        self.assertEqual(
+            outcome.component_result["root_failure_codes"],
+            [
+                "ROOT_CONDITIONING_PRECISION_LIMITED",
+                "ROOT_BRANCH_IDENTITY_INVALID",
+            ],
+        )
+        self.assertEqual(
+            outcome.component_result["survey_failure_code"],
+            "ROOT_BRANCH_IDENTITY_INVALID",
+        )
+
+    def test_exterior_response_promotion_reuses_seal_without_second_root(self):
+        """Catches BF40 response insufficiency re-entering a BF80 root solve."""
+
+        from tests.test_promoted_horizon_component import (
+            _promoted_baseline,
+            _with_worker_receipt,
+        )
+
+        baseline = _with_worker_receipt(
+            self.leaf.job,
+            _promoted_baseline(
+                self.leaf.job,
+                omega=self.leaf.job.root.omega,
+                conditioning_mechanism=self.leaf.mechanism_id,
+            ),
+            40,
+            self.leaf.job.root.omega,
+        )
+        root_reads = []
+        requested_digits = []
+
+        class RootBoundary:
+            def read_root(self, *args, **kwargs):
+                if root_reads:
+                    raise AssertionError("survey re-read a sealed root")
+                root_reads.append(1)
+                return baseline
+
+        unresolved = SimpleNamespace(
+            status=ComponentStatus.DERIVATIVE_UNRESOLVED,
+            response=None,
+            error_channels={},
+            to_mapping=lambda: {"synthetic": "precision-limited-response"},
+        )
+        repaired = _result(self.leaf.job, complex(-0.4, -0.6))
+
+        def precision_backend(job, digits):
+            requested_digits.append(digits)
+            return SimpleNamespace(
+                digits=digits,
+                scientific_runtime_for=lambda selected: {
+                    "semantic_precision_tier": f"bigfloat-{digits}",
+                    "precision_digits": digits,
+                },
+            )
+
+        with (
+            patch.object(
+                self.backend,
+                "_julia_precision_backend_for",
+                side_effect=precision_backend,
+            ),
+            patch(
+                "windows_solver.response_batches."
+                "_journaled_promoted_exterior_backend",
+                return_value=RootBoundary(),
+            ) as root_boundary,
+            patch(
+                "windows_solver.response_batches."
+                "_journaled_promoted_exterior_response_backend",
+                side_effect=lambda job, backend, **kwargs: backend,
+            ),
+            patch(
+                "windows_solver.response_batches."
+                "run_exterior_survey_from_shared_seal",
+                return_value=unresolved,
+            ),
+            patch(
+                "windows_solver.response_batches."
+                "_response_precision_limited_families",
+                return_value=frozenset({"frequency"}),
+            ),
+            patch(
+                "windows_solver.response_batches."
+                "_run_promoted_exterior_response_repair_with_progress",
+                return_value=repaired,
+            ) as response_repair,
+            patch(
+                "windows_solver.response_batches."
+                "_fixed_root_response_repair_scope",
+                return_value="fixed-root-domega-stencil-only/v1",
+            ),
+        ):
+            outcome = self.backend._run_native_exterior_survey(
+                self.leaf,
+                SurveyEvidenceCache(),
+            )
+
+        self.assertEqual(requested_digits, [40, 80])
+        self.assertEqual(root_reads, [1])
+        self.assertEqual(root_boundary.call_count, 1)
+        response_repair.assert_called_once()
+        self.assertEqual(outcome.component_result["result"], repaired.to_mapping())
+
+    def test_exterior_nonprecision_response_failure_does_not_promote(self):
+        """A response failure without typed precision evidence stops survey."""
+
+        from tests.test_promoted_horizon_component import (
+            _promoted_baseline,
+            _with_worker_receipt,
+        )
+
+        baseline = _with_worker_receipt(
+            self.leaf.job,
+            _promoted_baseline(
+                self.leaf.job,
+                omega=self.leaf.job.root.omega,
+                conditioning_mechanism=self.leaf.mechanism_id,
+            ),
+            40,
+            self.leaf.job.root.omega,
+        )
+        unresolved = ComponentResult(
+            job_id=self.leaf.job.job_id,
+            leaf_id=self.leaf.job.leaf_id,
+            mechanism_id=self.leaf.job.mechanism_id,
+            status=ComponentStatus.NOT_CONVERGED,
+            convergence_basis="UNRESOLVED",
+            response=None,
+            signed_root_crosscheck=None,
+            closed_form_response=None,
+            error_channels={name: 0.0 for name in ERROR_CHANNELS},
+            baseline=baseline,
+            levels=(),
+            lineage=_lineage(self.leaf.job),
+        )
+        root_reads = []
+        requested_digits = []
+
+        class RootBoundary:
+            def read_root(self, *args, **kwargs):
+                root_reads.append(1)
+                return baseline
+
+        def precision_backend(job, digits):
+            requested_digits.append(digits)
+            return SimpleNamespace(
+                digits=digits,
+                scientific_runtime_for=lambda selected: {
+                    "semantic_precision_tier": f"bigfloat-{digits}",
+                    "precision_digits": digits,
+                },
+            )
+
+        with (
+            patch.object(
+                self.backend,
+                "_julia_precision_backend_for",
+                side_effect=precision_backend,
+            ),
+            patch(
+                "windows_solver.response_batches."
+                "_journaled_promoted_exterior_backend",
+                return_value=RootBoundary(),
+            ),
+            patch(
+                "windows_solver.response_batches."
+                "_journaled_promoted_exterior_response_backend",
+                side_effect=lambda job, backend, **kwargs: backend,
+            ),
+            patch(
+                "windows_solver.response_batches."
+                "run_exterior_survey_from_shared_seal",
+                return_value=unresolved,
+            ),
+            patch(
+                "windows_solver.response_batches."
+                "_response_precision_limited_families",
+                return_value=frozenset(),
+            ),
+            patch(
+                "windows_solver.response_batches."
+                "_run_promoted_exterior_response_repair_with_progress",
+            ) as response_repair,
+        ):
+            outcome = self.backend._run_native_exterior_survey(
+                self.leaf,
+                SurveyEvidenceCache(),
+            )
+
+        self.assertEqual(requested_digits, [40])
+        self.assertEqual(root_reads, [1])
+        response_repair.assert_not_called()
+        self.assertEqual(outcome.numerical_state, "NOT_CONVERGED")
+        self.assertIs(
+            outcome.component_result["survey_promotion_required"], False
+        )
+
+    def test_resealed_survey_result_for_another_leaf_fails_reload(self):
+        """Catches survey persistence authenticating shape but not leaf identity."""
+
+        source = next(
+            leaf
+            for leaf in self.plan.leaves
+            if leaf.role == "primary"
+            and leaf.mechanism_id == "horizon-admittance"
+        )
+        foreign = next(
+            leaf
+            for leaf in self.plan.leaves
+            if leaf.role == source.role
+            and leaf.mechanism_id == source.mechanism_id
+            and leaf.leaf_id != source.leaf_id
+        )
+        result = _result(foreign.job, complex(0.01, -0.02))
+        payload = {
+            "evidence_kind": "native-task-008-component-engine",
+            "result": result.to_mapping(),
+            "scientific_runtime": self.backend._cache_runtime(),
+        }
+        raw = StageOutcome(
+            digits=64,
+            numerical_state=result.status.value,
+            component_result=payload,
+            local_disk_radius_abs=sum(result.error_channels.values()),
+            signed_error_channels=_component_stage_signed_error_channels(
+                payload,
+                result,
+            ),
+        )
+        outcome = self.backend._profiled_survey_outcome(
+            source,
+            raw,
+            promotion_required=False,
+        )
+        stage = _campaign_stage_record(
+            self.plan,
+            self.capabilities,
+            outcome,
+        )
+        policy = CampaignExecutionPolicy.for_profile(ExecutionProfile.SURVEY)
+        record = CampaignLeafRecord(
+            leaf_id=source.leaf_id,
+            role=source.role,
+            state="PRODUCED",
+            stages=(stage,),
+            evidence=_survey_evidence_record(
+                source.leaf_id,
+                stage,
+                policy,
+            ),
+        )
+        selection = build_campaign_selection(
+            self.plan,
+            role=source.role,
+            leaf_ids=(source.leaf_id,),
+        )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            checkpoint = Path(temporary) / "foreign-survey-result.json"
+            _atomic_json(
+                checkpoint,
+                _checkpoint_mapping(
+                    self.plan,
+                    selection,
+                    (record,),
+                ),
+            )
+            with self.assertRaisesRegex(
+                ValueError,
+                "survey|component.*identity|lineage",
+            ):
+                validate_campaign_checkpoint(self.plan, checkpoint)
+
+    def test_horizon_survey_preflight_records_only_numerical_insufficiency(self):
+        horizon = next(
+            leaf
+            for leaf in self.plan.leaves
+            if leaf.role == "primary"
+            and leaf.mechanism_id == "horizon-admittance"
         )
         policy = CampaignExecutionPolicy.for_profile(ExecutionProfile.SURVEY)
 
-        with (
-            patch.object(self.backend, "execute_stage", return_value=unresolved),
-            patch(
-                "windows_solver.response_batches._validate_component_result",
-                return_value=True,
-            ),
-        ):
-            authenticated = self.backend.execute_profile_stage(
-                horizon, 64, policy, SurveyEvidenceCache()
-            )
-        with (
-            patch.object(self.backend, "execute_stage", return_value=unresolved),
-            patch(
-                "windows_solver.response_batches._validate_component_result",
-                return_value=False,
-            ),
-        ):
-            unauthenticated = self.backend.execute_profile_stage(
-                horizon, 64, policy, SurveyEvidenceCache()
-            )
+        outcome = self.backend.execute_profile_stage(
+            horizon, 64, policy, SurveyEvidenceCache()
+        )
 
         self.assertIs(
-            authenticated.component_result["survey_promotion_required"], True
+            outcome.component_result["survey_promotion_required"], True
         )
         self.assertEqual(
-            authenticated.component_result["survey_required_precision_digits"],
+            outcome.component_result["survey_required_precision_digits"],
             80,
         )
-        self.assertIs(
-            unauthenticated.component_result["survey_promotion_required"],
-            False,
+        self.assertEqual(
+            outcome.component_result["survey_failure_code"],
+            "BINARY64_BOUNDED_HORIZON_DISK_UNAVAILABLE",
         )
 
     def test_horizon_survey_promotion_reuses_existing_bf80_route_only(self):
@@ -451,11 +890,23 @@ class NativeCampaignBackendTests(unittest.TestCase):
         )
         policy = CampaignExecutionPolicy.for_profile(ExecutionProfile.SURVEY)
 
-        with patch.object(
-            self.backend,
-            "execute_promoted_stage_with_predictor",
-            return_value=promoted,
-        ) as existing_bf80:
+        worker = SimpleNamespace(
+            scientific_runtime_for=lambda job: {
+                "precision_digits": 80,
+            }
+        )
+        with (
+            patch.object(
+                self.backend,
+                "_julia_precision_backend_for",
+                return_value=worker,
+            ) as backend_for,
+            patch(
+                "windows_solver.response_batches."
+                "_run_promoted_horizon_component_with_progress",
+                return_value=result,
+            ) as existing_bf80,
+        ):
             outcome = self.backend.execute_profile_promoted_stage(
                 horizon,
                 80,
@@ -464,8 +915,9 @@ class NativeCampaignBackendTests(unittest.TestCase):
                 SurveyEvidenceCache(),
             )
 
+        backend_for.assert_called_once_with(horizon.job, 80)
         existing_bf80.assert_called_once_with(
-            horizon, 80, (binary,), None
+            horizon.job, worker, horizon.job.root.omega
         )
         self.assertEqual(outcome.digits, 80)
         self.assertIs(

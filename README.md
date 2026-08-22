@@ -145,11 +145,18 @@ exterior background/Domega evidence. The checkpoint report directory contains
 `m02-leaves.csv` and the ordered `m02-triage.json` certification queue.
 
 Targeted evidence upgrades use the same solver behind explicit profiles and
-require an existing checkpoint:
+require an existing checkpoint. One triage artifact carries the mixed
+primary/deep/control queue; the selected profile filters it to risk,
+projective-controller, and sentinel entries that still need that evidence
+level. Low-risk leaves remain visible as `REVIEW` rather than silently joining
+the heavy queue. A centre discrepancy also forces `REVIEW`; it is never
+automatically sent through the same heavy profile again:
 
 ```powershell
-.\m02.ps1 -Profile certify
-.\m02.ps1 -Profile validate
+.\m02.ps1 -Profile certify `
+  -TriageQueue .\m02-output\m02-campaign-checkpoint.reports\m02-triage.json
+.\m02.ps1 -Profile validate `
+  -TriageQueue .\m02-output\m02-campaign-checkpoint.reports\m02-triage.json
 ```
 
 Certification and validation append evidence around the retained survey

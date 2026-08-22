@@ -776,6 +776,7 @@ def _campaign_selected(
             checkpoint_path=str(checkpoint),
         )
     plan, selection, descriptor = _campaign_plan_and_selection(selection_path)
+    checkpoint = resolve_campaign_relative_path(Path.cwd(), str(checkpoint))
     if triage_queue is not None:
         if (
             command != "campaign-resume"
@@ -787,12 +788,20 @@ def _campaign_selected(
         queue_value = _load_strict_json(
             triage_queue, "campaign triage queue"
         )
+        if not checkpoint.is_file():
+            raise ValueError(
+                "campaign triage queue requires an existing checkpoint"
+            )
         selection = build_campaign_evidence_queue_selection(
             plan,
             triage_leaf_ids_for_profile(
                 plan,
                 queue_value,
                 execution_profile,
+                checkpoint_source_receipt=(
+                    "sha256:"
+                    + hashlib.sha256(checkpoint.read_bytes()).hexdigest()
+                ),
                 limit=queue_limit,
             ),
         )
@@ -820,7 +829,6 @@ def _campaign_selected(
             "execution_profile": execution_profile.value,
             "release_admissible": False,
         }
-    checkpoint = resolve_campaign_relative_path(Path.cwd(), str(checkpoint))
     if command == "campaign-validate":
         summary = validate_campaign_checkpoint(
             plan, checkpoint, require_complete_campaign=full

@@ -17,6 +17,7 @@ from tests.fixtures import valid_control_failure_diagnostics
 import tests.test_promoted_exterior_derivative as exterior_derivative_fixtures
 from tests.test_promoted_exterior_derivative import FixedRootOnlyBackend
 from tests.test_solved_leaf_cache import _production_outcome
+from windows_solver.campaign_policy import EvidenceLevel, ExecutionProfile
 from windows_solver.contracts import canonical_json_bytes
 from windows_solver.gsn_cache_producer import GeneratedGsnCache, GsnParameterPair
 from windows_solver.julia_response_backend import (
@@ -42,6 +43,7 @@ from windows_solver.response_batches import (
     _validate_component_result,
     _validate_failed_preflight_recovery_stage,
     _validate_record_semantics,
+    _validate_survey_stage_for_leaf,
     build_campaign_plan,
     build_campaign_selection,
     run_campaign_selection,
@@ -74,6 +76,7 @@ class _ScientificFixedRootBackend(FixedRootOnlyBackend):
 
     def __init__(self, job, baseline, digits: int) -> None:
         tier = {
+            40: PrecisionTier.BIGFLOAT_40,
             80: PrecisionTier.BIGFLOAT_80,
             120: PrecisionTier.BIGFLOAT_120,
         }[digits]
@@ -1579,6 +1582,96 @@ class PromotedExteriorCampaignFlowCanary(unittest.TestCase):
             validate_campaign_checkpoint(self.plan, checkpoint).records,
             summary.records,
         )
+
+    def test_survey_bf80_response_repair_reuses_bf40_root_and_persists(self):
+        """The survey promotion is fixed-root work and reloads as SCREENED."""
+
+        backend = self._native_backend()
+        baseline = self._precision_backend(self.leaf, 40).baseline
+        workers = {
+            40: _PrecisionLimitedResponseSampleBackend(
+                self.leaf.job, baseline, 40
+            ),
+            80: _RootForbiddenScientificFixedRootBackend(
+                self.leaf.job, baseline, 80
+            ),
+        }
+        checkpoint = self.root / "survey-response-repair.json"
+        selection = build_campaign_selection(
+            self.plan, role="primary", leaf_ids=(self.leaf.leaf_id,)
+        )
+        with patch.object(
+            backend,
+            "_julia_precision_backend_for",
+            side_effect=lambda job, digits, refinement=0: workers[digits],
+        ):
+            summary = run_campaign_selection(
+                self.plan,
+                selection,
+                backend,
+                checkpoint,
+                resume=False,
+                execution_profile=ExecutionProfile.SURVEY,
+            )
+
+        record = summary.records[0]
+        self.assertEqual(record.state, "PRODUCED")
+        self.assertIsNotNone(record.evidence)
+        self.assertIs(
+            record.evidence.evidence_level, EvidenceLevel.SCREENED
+        )
+        self.assertEqual(
+            tuple(stage.outcome.digits for stage in record.stages), (64, 80)
+        )
+        survey = record.stages[-1].outcome
+        repaired = ComponentResult.from_mapping(
+            survey.component_result["result"]
+        )
+        self.assertEqual(
+            survey.component_result["evidence_kind"],
+            "package-owned-julia-root-sealed-response-repair",
+        )
+        self.assertEqual(
+            survey.component_result["semantic_precision_tier_trace"],
+            ["bigfloat-40", "bigfloat-80"],
+        )
+        self.assertEqual(
+            survey.component_result["response_repair_scope"],
+            "fixed-root-dc-stencil-only/v1",
+        )
+        self.assertEqual(repaired.baseline.omega, baseline.omega)
+        self.assertEqual(workers[40].root_amplitudes, [0.0j])
+        self.assertEqual(workers[80].root_amplitudes, [])
+        self.assertEqual(len(workers[40].sample_amplitudes), 4)
+        self.assertEqual(len(workers[80].sample_amplitudes), 4)
+        self.assertEqual(
+            validate_campaign_checkpoint(self.plan, checkpoint).records,
+            summary.records,
+        )
+
+        derivative_evidence = dict(repaired.derivative_evidence)
+        derivative_evidence["shared_background_root_seal"] = None
+        without_shared_background = replace(
+            repaired,
+            derivative_evidence=derivative_evidence,
+        )
+        tampered_payload = dict(survey.component_result)
+        tampered_payload["result"] = without_shared_background.to_mapping()
+        tampered = replace(
+            survey,
+            component_result=tampered_payload,
+            signed_error_channels=_component_stage_signed_error_channels(
+                tampered_payload,
+                without_shared_background,
+                repeat_applicable=False,
+                precision_ladder_applicable=False,
+            ),
+        )
+        with self.assertRaisesRegex(
+            ValueError,
+            "shared background|reusable survey evidence",
+        ):
+            _validate_survey_stage_for_leaf(self.leaf, tampered)
 
     def test_frequency_only_response_repair_preserves_the_80_coordinate_stencil(
         self,

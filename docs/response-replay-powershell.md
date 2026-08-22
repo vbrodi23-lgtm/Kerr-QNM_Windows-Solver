@@ -128,19 +128,24 @@ resumes the checkpoint, and performs full structural validation:
 This default creates the provisional atlas with `SCREENED` evidence. The
 checkpoint's sibling `<checkpoint-stem>.reports` directory contains separate
 screened/certified/validated fields in `m02-leaves.csv` and an explicit ordered
-queue in `m02-triage.json`. To add targeted evidence around an existing atlas,
-use a selection containing the queued leaves and resume explicitly:
+queue in `m02-triage.json`. Risk, projective-controller, and sentinel entries
+receive an evidence action; low-risk leaves remain visible as `REVIEW`. To add
+targeted evidence around an existing atlas, pass that one mixed
+primary/deep/control queue to the explicit profile:
 
 ```powershell
-.\solver.ps1 campaign-resume .\certification-selection.json `
-  --checkpoint .\m02-output\m02-campaign-checkpoint.json --profile certify
-.\solver.ps1 campaign-resume .\validation-selection.json `
-  --checkpoint .\m02-output\m02-campaign-checkpoint.json --profile validate
+.\m02.ps1 -Profile certify `
+  -TriageQueue .\m02-output\m02-campaign-checkpoint.reports\m02-triage.json
+.\m02.ps1 -Profile validate `
+  -TriageQueue .\m02-output\m02-campaign-checkpoint.reports\m02-triage.json
 ```
 
 `certify` requires `SCREENED`; `validate` requires `CERTIFIED`. Both are
 additive, and neither silently replaces the retained centre. Release and
-publication admission continue to reject `SCREENED`-only leaves.
+publication admission continue to reject `SCREENED`-only leaves. `-QueueLimit`
+can bound either run without splitting the queue by role. Any centre
+discrepancy is retained in the evidence record and changes the queue action to
+`REVIEW`, preventing automatic repetition or escalation.
 
 Use `.\m02.ps1 -RebuildRuntime` only when intentionally discarding the
 persistent managed runtime and provisioning it again. The campaign checkpoint

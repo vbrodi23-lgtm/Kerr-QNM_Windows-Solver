@@ -44,6 +44,7 @@ def triage_leaf_ids_for_profile(
     value: object,
     profile: ExecutionProfile,
     *,
+    checkpoint_source_receipt: str,
     limit: int | None = None,
 ) -> tuple[str, ...]:
     """Authenticate one unified mixed-role queue and select its next action."""
@@ -54,6 +55,16 @@ def triage_leaf_ids_for_profile(
         type(limit) is not int or limit <= 0
     ):
         raise ValueError("triage queue limit must be a positive integer")
+    if (
+        not isinstance(checkpoint_source_receipt, str)
+        or not checkpoint_source_receipt.startswith("sha256:")
+        or len(checkpoint_source_receipt) != 71
+        or any(
+            character not in "0123456789abcdef"
+            for character in checkpoint_source_receipt[7:]
+        )
+    ):
+        raise ValueError("campaign checkpoint source receipt is invalid")
     if not isinstance(value, Mapping) or set(value) != {
         "schema",
         "campaign_id",
@@ -73,6 +84,8 @@ def triage_leaf_ids_for_profile(
         or value.get("triage_sha256") != _sha256(content)
     ):
         raise ValueError("campaign triage report identity is invalid")
+    if value.get("checkpoint_source_receipt") != checkpoint_source_receipt:
+        raise ValueError("campaign triage queue targets a stale checkpoint")
     raw_entries = value.get("recommended_certification_queue")
     if not isinstance(raw_entries, list) or not raw_entries:
         raise ValueError("campaign triage queue is empty or invalid")
@@ -215,6 +228,12 @@ def build_campaign_triage(
     finite_precision_disagreement: list[tuple[float, str]] = []
     for leaf_id, record in records.items():
         row = rows.get(leaf_id, {})
+        if record.evidence is not None and record.evidence.discrepancy_codes:
+            reasons[leaf_id].add("EVIDENCE_DISCREPANCY")
+            scores[leaf_id] += 9500.0
+            metrics[leaf_id]["evidence_discrepancy_codes"] = list(
+                record.evidence.discrepancy_codes
+            )
         if record.state in {"UNRESOLVED", "FAILED"}:
             reasons[leaf_id].add(
                 "FAILED_SURVEY_LEAF"
@@ -343,25 +362,35 @@ def build_campaign_triage(
         and math.isfinite(float(row["nominal_angle"]))
     )
     if complete_angles:
-        controlling = min(
-            complete_angles, key=lambda row: float(row["nominal_angle"])
+        minimum_angle = min(
+            float(row["nominal_angle"]) for row in complete_angles
         )
-        controlling_ids = set(_json_ids(controlling.get("left_component_ids")))
-        controlling_ids.update(
-            _json_ids(controlling.get("right_component_ids"))
+        controlling_rows = tuple(
+            row
+            for row in complete_angles
+            if float(row["nominal_angle"]) == minimum_angle
         )
+        controlling_ids = {
+            leaf_id
+            for row in controlling_rows
+            for name in ("left_component_ids", "right_component_ids")
+            for leaf_id in _json_ids(row.get(name))
+        }
         for leaf_id in controlling_ids & set(records):
             reasons[leaf_id].update({
                 "SMALLEST_PROJECTIVE_ANGLE_ROW",
                 "PROJECTIVE_CLASSIFICATION_CONTROLLER",
             })
             scores[leaf_id] += 6000.0
-            metrics[leaf_id]["controlling_projective_row_id"] = controlling.get(
-                "row_id"
-            )
-            metrics[leaf_id]["controlling_nominal_angle"] = controlling.get(
-                "nominal_angle"
-            )
+            metrics[leaf_id]["controlling_projective_row_ids"] = [
+                row.get("row_id")
+                for row in controlling_rows
+                if leaf_id in {
+                    *(_json_ids(row.get("left_component_ids"))),
+                    *(_json_ids(row.get("right_component_ids"))),
+                }
+            ]
+            metrics[leaf_id]["controlling_nominal_angle"] = minimum_angle
 
     def add_sentinels(attribute: str, reason: str) -> None:
         groups: dict[str, list[str]] = {}
@@ -395,13 +424,19 @@ def build_campaign_triage(
     for rank, leaf_id in enumerate(ordered_ids, start=1):
         record = records[leaf_id]
         level = None if record.evidence is None else record.evidence.evidence_level
+        targeted = bool(reasons[leaf_id])
         action = (
-            "RESOLVE_SURVEY"
+            "REVIEW"
+            if (
+                record.evidence is not None
+                and bool(record.evidence.discrepancy_codes)
+            )
+            else "RESOLVE_SURVEY"
             if record.state in {"UNRESOLVED", "FAILED"}
             else "CERTIFY"
-            if level is EvidenceLevel.SCREENED
+            if level is EvidenceLevel.SCREENED and targeted
             else "VALIDATE"
-            if level is EvidenceLevel.CERTIFIED
+            if level is EvidenceLevel.CERTIFIED and targeted
             else "REVIEW"
         )
         leaf = leaf_plan[leaf_id]

@@ -20,6 +20,9 @@ from windows_solver.contracts import canonical_json_bytes
 from windows_solver.precision_tiers import PrecisionTier, working_precision_bits
 from windows_solver.response_batches import (
     PrecisionCapabilities,
+    StageOutcome,
+    _component_stage_signed_error_channels,
+    _validate_survey_stage_for_leaf,
     build_campaign_plan,
 )
 from windows_solver.response_engine import (
@@ -30,6 +33,7 @@ from windows_solver.response_engine import (
     regularised_gsn_precision_policy,
     restore_survey_evidence_cache_from_result,
     run_exterior_survey_from_shared_seal,
+    run_promoted_exterior_response_from_seal,
 )
 
 
@@ -232,6 +236,111 @@ class SurveyDomegaReuseTests(unittest.TestCase):
         self.assertEqual(
             restored.background_seal_mappings[0], shared.to_mapping()
         )
+
+    def test_persisted_response_repair_rehydrates_background_without_domega(self):
+        source, _, baseline, shared = _shared_seal()
+        result = run_promoted_exterior_response_from_seal(
+            source.job,
+            RootForbiddenFrequencyFallbackBackend(source.job, baseline),
+            PromotedRootSeal.derive(source.job, baseline),
+            derivative_step=0.004,
+            shared_background_seal=shared,
+        )
+        self.assertIsNone(
+            result.derivative_evidence["shared_domega_evidence"]
+        )
+
+        restored = SurveyEvidenceCache()
+        self.assertTrue(
+            restore_survey_evidence_cache_from_result(result, restored)
+        )
+        self.assertEqual(restored.domega_evidence_count, 0)
+        self.assertEqual(
+            restored.background_seal_mappings,
+            (shared.to_mapping(),),
+        )
+
+    def test_persisted_survey_stage_binds_real_fixed_root_evidence(self):
+        source, _, baseline, _ = _shared_seal()
+        runtime = {
+            **dict(regularised_gsn_precision_policy(source.mechanism_id)),
+            "semantic_precision_tier": PrecisionTier.BIGFLOAT_80.value,
+            "working_precision_bits": working_precision_bits(
+                PrecisionTier.BIGFLOAT_80
+            ),
+            "precision_digits": 80,
+        }
+        controls_sha256 = hashlib.sha256(
+            canonical_json_bytes(runtime)
+        ).hexdigest()
+        shared = SharedBackgroundRootSeal.derive(
+            source.job,
+            PromotedRootSeal.derive(source.job, baseline),
+            controls_sha256=controls_sha256,
+            precision_tier=PrecisionTier.BIGFLOAT_80,
+            working_precision_bits=working_precision_bits(
+                PrecisionTier.BIGFLOAT_80
+            ),
+        )
+        result = run_exterior_survey_from_shared_seal(
+            source.job,
+            RootForbiddenFrequencyFallbackBackend(source.job, baseline),
+            shared,
+            SurveyEvidenceCache(),
+            derivative_step=0.004,
+            controls_sha256=controls_sha256,
+            precision_tier=PrecisionTier.BIGFLOAT_80,
+            working_precision_bits=working_precision_bits(
+                PrecisionTier.BIGFLOAT_80
+            ),
+        )
+        payload = {
+            "evidence_kind": "fixed-root-exterior-survey/v1",
+            "execution_profile": "survey",
+            "leaf_id": source.leaf_id,
+            "mechanism_id": source.mechanism_id,
+            "digits": 80,
+            "semantic_precision_tier_trace": [
+                PrecisionTier.BIGFLOAT_80.value
+            ],
+            "result": result.to_mapping(),
+            "bounded_response_disk": True,
+            "survey_promotion_required": False,
+            "survey_required_precision_digits": None,
+            "survey_failure_code": None,
+            "scientific_runtime": runtime,
+        }
+        radius = sum(result.error_channels.values())
+        outcome = StageOutcome(
+            digits=80,
+            numerical_state=result.status.value,
+            component_result=payload,
+            local_disk_radius_abs=radius,
+            signed_error_channels=_component_stage_signed_error_channels(
+                payload,
+                result,
+                repeat_applicable=False,
+                precision_ladder_applicable=False,
+            ),
+        )
+
+        self.assertTrue(_validate_survey_stage_for_leaf(source, outcome))
+
+        changed_runtime = dict(runtime)
+        changed_runtime["precision_digits"] = 79
+        tampered_payload = {**payload, "scientific_runtime": changed_runtime}
+        tampered = replace(
+            outcome,
+            component_result=tampered_payload,
+            signed_error_channels=_component_stage_signed_error_channels(
+                tampered_payload,
+                result,
+                repeat_applicable=False,
+                precision_ladder_applicable=False,
+            ),
+        )
+        with self.assertRaisesRegex(ValueError, "control identity"):
+            _validate_survey_stage_for_leaf(source, tampered)
 
     def test_domega_cache_misses_on_normalisation_or_controls(self):
         source, _, baseline, shared = _shared_seal()
