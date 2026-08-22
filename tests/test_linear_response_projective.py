@@ -21,6 +21,7 @@ from windows_solver.response_batches import (
     build_campaign_plan,
     build_campaign_selection,
     explicit_stage_signed_error_channels,
+    _with_inferred_legacy_evidence,
 )
 from windows_solver.response_engine import (
     ComponentResult,
@@ -504,6 +505,10 @@ class ProjectiveRowPlanTests(unittest.TestCase):
                 ),
                 "available_precision_digits": [64],
             }),),
+        )
+        record = _with_inferred_legacy_evidence(
+            record,
+            source_checkpoint_schema_version=9,
         )
         selection = build_campaign_selection(
             plan, role="primary", leaf_ids=(leaf.leaf_id,)

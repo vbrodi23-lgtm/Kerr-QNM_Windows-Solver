@@ -439,17 +439,22 @@ class AdaptiveODEBudgetTests(unittest.TestCase):
             },
         )
 
-    def test_control_leaf_contract_ignores_unreachable_promoted_budgets(self) -> None:
+    def test_control_leaf_contract_binds_reachable_survey_budgets(self) -> None:
         plan = build_campaign_plan(
             policy=NumericalPolicy(),
             backend_identity=VettedNativeDeterminantKernel.identity,
             precision_capabilities=PrecisionCapabilities((64, 80, 120)),
         )
-        leaf = next(item for item in plan.leaves if item.role == "control")
+        leaf = next(
+            item
+            for item in plan.leaves
+            if item.role == "control"
+            and item.mechanism_id != "horizon-admittance"
+        )
         missing = NativeCampaignStageBackend(
             object(), plan.precision_capabilities, object(), julia_adapter=object()
         )
-        changed = NativeCampaignStageBackend(
+        incomplete = NativeCampaignStageBackend(
             object(),
             plan.precision_capabilities,
             object(),
@@ -459,19 +464,46 @@ class AdaptiveODEBudgetTests(unittest.TestCase):
                 120: synthetic_ode_error_budget(120),
             },
         )
+        changed = NativeCampaignStageBackend(
+            object(),
+            plan.precision_capabilities,
+            object(),
+            julia_adapter=object(),
+            ode_error_budgets={
+                40: synthetic_ode_error_budget(40),
+                80: synthetic_ode_error_budget(80),
+                120: synthetic_ode_error_budget(120),
+            },
+        )
 
-        self.assertIsNone(missing.scientific_execution_contract_for(leaf))
-        self.assertIsNone(changed.scientific_execution_contract_for(leaf))
+        missing_contract = missing.scientific_execution_contract_for(leaf)
+        with self.assertRaises(MissingODECalibrationError):
+            incomplete.scientific_execution_contract_for(leaf)
+        changed_contract = changed.scientific_execution_contract_for(leaf)
+        self.assertIsNotNone(missing_contract)
+        self.assertNotEqual(missing_contract, changed_contract)
         self.assertEqual(
+            set(
+                missing_contract[
+                    "empirical_control_profiles_by_nominal_decimal_digits"
+                ]
+            ),
+            {"40", "80", "120"},
+        )
+        self.assertEqual(
+            set(changed_contract["ode_error_budgets_by_nominal_decimal_digits"]),
+            {"40", "80", "120"},
+        )
+        self.assertNotEqual(
             scientific_computation_identity_sha256(
                 plan,
                 leaf,
-                scientific_execution_contract=missing.scientific_execution_contract_for(leaf),
+                scientific_execution_contract=changed_contract,
             ),
             scientific_computation_identity_sha256(
                 plan,
                 leaf,
-                scientific_execution_contract=changed.scientific_execution_contract_for(leaf),
+                scientific_execution_contract=missing_contract,
             ),
         )
 

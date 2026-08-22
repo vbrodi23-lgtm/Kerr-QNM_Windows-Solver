@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 from dataclasses import replace
 from decimal import Decimal, localcontext
 import math
@@ -181,6 +182,37 @@ class PromotedHorizonUncertaintyTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "horizon response disk"):
             ComponentResult.from_mapping(mapping)
+
+    def test_deserialization_allows_only_two_ulp_cross_platform_radius_replay(self) -> None:
+        leaf = _primary_horizon_leaf()
+        baseline = self._authenticated_derivative_baseline(leaf.job)
+        mapping = run_promoted_horizon_component(
+            leaf.job,
+            FakePromotedBackend(leaf.job, baseline),
+            primary_predictor=baseline.omega,
+        ).to_mapping()
+        radius = mapping["analytic_horizon_evidence"]["response_disk"][
+            "radius"
+        ]
+
+        portable = copy.deepcopy(mapping)
+        portable_radius = math.nextafter(
+            math.nextafter(radius, 0.0), 0.0
+        )
+        portable["analytic_horizon_evidence"]["response_disk"][
+            "radius"
+        ] = portable_radius
+        portable["error_channels"]["resolution"] = portable_radius
+        ComponentResult.from_mapping(portable)
+
+        forged = copy.deepcopy(mapping)
+        forged_radius = math.nextafter(portable_radius, 0.0)
+        forged["analytic_horizon_evidence"]["response_disk"][
+            "radius"
+        ] = forged_radius
+        forged["error_channels"]["resolution"] = forged_radius
+        with self.assertRaisesRegex(ValueError, "horizon response disk"):
+            ComponentResult.from_mapping(forged)
 
     def test_job_validation_rejects_coherently_shifted_horizon_frequency(self) -> None:
         leaf = _primary_horizon_leaf()

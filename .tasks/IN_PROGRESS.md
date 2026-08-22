@@ -124,9 +124,27 @@ preservation, and cache/provenance separation from historical raw-state leaves.
   at the sealed frequency without any further root call; version sample and
   checkpoint evidence; migrate the partial Leaf 42 checkpoint without deleting
   prior work; and remove the workflow carrier that mutates source after push.
+- Implement PR #63 from
+  `docs/superpowers/plans/2026-08-22-m02-survey-certify-validate.md`: add one
+  mechanism-general survey/certify/validate execution policy, preserve
+  numerical terminal states separately from monotone evidence levels, share
+  exact-identity sealed background and Dω evidence, migrate completed work
+  without numerical recomputation, generate a whole-atlas certification queue,
+  and keep SCREENED evidence outside release admission.
 
 ### Work Log
 
+- 2026-08-22 — PR #63 is live in draft with the mechanism-general
+  survey/certify/validate policy, monotone SCREENED/CERTIFIED/VALIDATED
+  evidence, exact sealed-background and Dω reuse, additive schema-9 migration,
+  unified mixed-role triage queue, and evidence-aware reporting/release gates.
+  The copied production checkpoint fixture was used only for migration tests;
+  no live checkpoint was mutated. Focused profile, migration, persistence, and
+  orchestration regressions pass 140 tests with 6 Windows-only skips, and the
+  full permitted Python suite passes 1,099 tests with 7 skips. No production
+  determinant, Kerr/GSN solve, M02 campaign, or PowerShell numerical execution
+  was run. TASK-079 remains In Progress pending hosted CI, native operator
+  logs, physical results, and human mathematics review.
 - 2026-08-19 — Task 3 recovery implementation completed under the strict
   air-gap: adaptive two-endpoint horizon search, cap-reused outer endpoint
   selection, exhaustive safe-window backtracking/selective semantic-tier
