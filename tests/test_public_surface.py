@@ -570,13 +570,23 @@ class PublicSurfaceTests(unittest.TestCase):
         self.assertIn('if ($RebuildRuntime)', launcher)
         self.assertIn('[ValidateSet("quiet", "normal", "trace")]', launcher)
         self.assertIn('[string]$Progress = "normal"', launcher)
+        self.assertIn('[ValidateSet("survey", "certify", "validate")]', launcher)
+        self.assertIn('[string]$Profile = "survey"', launcher)
+        self.assertIn("[string]$TriageQueue", launcher)
+        self.assertIn("[int]$QueueLimit = 0", launcher)
+        self.assertIn('"--triage-queue"', launcher)
+        self.assertIn('"--queue-limit"', launcher)
+        self.assertGreaterEqual(launcher.count('"--profile"'), 3)
         self.assertIn('"--progress"', launcher)
         self.assertIn("if ($CommandExitCode -eq 130)", launcher)
         self.assertIn("exit 130", launcher)
         self.assertIn("PipelineStoppedException", launcher)
         self.assertIn("PipelineStoppedException", solver_launcher)
         self.assertIn("-1073741510", solver_launcher)
-        self.assertIn('"campaign-plan",\n        $Selection\n', launcher)
+        self.assertIn(
+            '"campaign-plan",\n        "--profile",\n        $Profile,\n        $Selection\n',
+            launcher,
+        )
         self.assertEqual(launcher.count("$Selection,"), 2)
         self.assertEqual(launcher.count("\n        $Checkpoint,\n"), 2)
         self.assertNotIn("$SelectionPath,", launcher)
@@ -908,6 +918,8 @@ exit 0
             [
                 [
                     "campaign-plan",
+                    "--profile",
+                    "survey",
                     selection,
                 ],
                 [
@@ -917,12 +929,16 @@ exit 0
                     checkpoint,
                     "--progress",
                     "normal",
+                    "--profile",
+                    "survey",
                 ],
                 [
                     "campaign-validate",
                     selection,
                     "--checkpoint",
                     checkpoint,
+                    "--profile",
+                    "survey",
                     "--full",
                 ],
             ],
@@ -1182,6 +1198,14 @@ $candidate | ConvertTo-Json -Compress | Set-Content -LiteralPath $env:M02_TEST_J
             "authenticated-promoted-root-seal/v1",
             "root-sealed-fixed-root-response-repair/v1",
             "root-sealed-stale-exterior-response-discarded/v1",
+            "exterior-profile-amplitude-zero-background/v1",
+            "exact-exterior-zero-coupling-background-root/v1",
+            "survey-contained-failure/v1",
+            "fixed-root-survey-preflight/v1",
+            "fixed-root-exterior-survey/v1",
+            "retained-survey-central-bridge/v1",
+            "targeted-local-certification/v1",
+            "independent-publication-validation/v1",
             "fixed-root-domega-stencil-only/v1",
             "fixed-root-dc-stencil-only/v1",
             "fixed-root-domega-dc-stencils-only/v1",

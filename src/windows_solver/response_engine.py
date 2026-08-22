@@ -28,6 +28,12 @@ import time
 from types import MappingProxyType
 from typing import Any, Callable, Mapping, Protocol, Sequence
 
+from .campaign_policy import (
+    BackgroundRootKey,
+    FixedRootDomegaEvidence,
+    FixedRootDomegaKey,
+    SurveyEvidenceCache,
+)
 from .contracts import (
     Capability,
     ModeKey,
@@ -124,6 +130,12 @@ PROMOTED_ROOT_READOUT_POLICY = (
 )
 HISTORICAL_PROMOTED_ROOT_READOUT_POLICY = (
     "binary64-parity-primary-fixed-root-diagnostics/v1"
+)
+SHARED_BACKGROUND_ROOT_SEAL_SCHEMA = (
+    "windows-solver.shared-background-root-seal/1"
+)
+SHARED_BACKGROUND_ROOT_SEAL_IDENTITY = (
+    "exact-exterior-zero-coupling-background-root/v1"
 )
 PROMOTED_ROOT_ACCEPTANCE_METRIC = (
     "abs-determinant-over-abs-complex-derivative/v1"
@@ -4673,6 +4685,197 @@ class PromotedRootSeal:
                 )
 
 
+def _exterior_background_root_key(
+    job: ResponseComponentJob,
+    root_readout: RootReadout,
+    *,
+    controls_sha256: str,
+    precision_tier_value: PrecisionTier | str,
+    working_precision_bits_value: int,
+) -> BackgroundRootKey:
+    """Build the exact c = 0 reuse identity shared by exterior fibres."""
+
+    if job.mechanism_id not in _EXTERIOR_PROFILE_IDS:
+        raise ValueError("shared background root requires an exterior job")
+    tier = precision_tier(precision_tier_value)
+    bits = working_precision_bits_value
+    if (
+        type(bits) is not int
+        or bits != working_precision_bits(tier)
+    ):
+        raise ValueError("shared background root precision identity is invalid")
+    contract = regularised_gsn_mechanism_contract(job.mechanism_id)
+    conditioning = root_readout.numerical_conditioning
+    if conditioning is None or any(
+        getattr(conditioning, field) != expected
+        for field, expected in contract.items()
+    ):
+        raise ValueError("shared background determinant identity is invalid")
+    return BackgroundRootKey(
+        root_reference_id=job.root.root_reference_id,
+        branch_id=job.root.branch_id,
+        equation_id=job.equation_id,
+        mode_sha256=_sha256(job.mode.to_mapping()),
+        spin_binary64_hex=job.spin.hex(),
+        bound_root_sha256=job.root.identity_sha256,
+        determinant_family=str(contract["determinant_family"]),
+        determinant_convention=str(contract["determinant_convention"]),
+        determinant_normalisation=str(contract["determinant_normalisation"]),
+        backend_identity_sha256=job.backend_identity.identity_sha256,
+        numerical_policy_sha256=job.policy.identity_sha256,
+        controls_sha256=controls_sha256,
+        precision_tier=tier.value,
+        working_precision_bits=bits,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class SharedBackgroundRootSeal:
+    """One authenticated exterior c = 0 root reusable across exact fibres."""
+
+    background_key: BackgroundRootKey
+    source_leaf_id: str
+    source_job_id: str
+    source_mechanism_id: str
+    source_root_seal_sha256: str
+    root_evidence_sha256: str
+    root_readout: RootReadout
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.background_key, BackgroundRootKey):
+            raise ValueError("shared background root key is invalid")
+        if not all(
+            isinstance(value, str) and value
+            for value in (
+                self.source_leaf_id,
+                self.source_job_id,
+                self.source_mechanism_id,
+                self.source_root_seal_sha256,
+                self.root_evidence_sha256,
+            )
+        ):
+            raise ValueError("shared background source identity is invalid")
+        if (
+            _HEX_64.fullmatch(self.source_root_seal_sha256) is None
+            or _HEX_64.fullmatch(self.root_evidence_sha256) is None
+        ):
+            raise ValueError("shared background evidence digest is invalid")
+        if self.source_mechanism_id not in _EXTERIOR_PROFILE_IDS:
+            raise ValueError("shared background source is not exterior")
+        if not isinstance(self.root_readout, RootReadout):
+            raise ValueError("shared background root readout is invalid")
+        if _sha256(self.root_readout.to_mapping()) != self.root_evidence_sha256:
+            raise ValueError("shared background root evidence digest mismatch")
+
+    @property
+    def content(self) -> dict[str, object]:
+        return {
+            "schema": SHARED_BACKGROUND_ROOT_SEAL_SCHEMA,
+            "identity": SHARED_BACKGROUND_ROOT_SEAL_IDENTITY,
+            "background_key": self.background_key.to_mapping(),
+            "source_leaf_id": self.source_leaf_id,
+            "source_job_id": self.source_job_id,
+            "source_mechanism_id": self.source_mechanism_id,
+            "source_root_seal_sha256": self.source_root_seal_sha256,
+            "root_evidence_sha256": self.root_evidence_sha256,
+            "root_readout": self.root_readout.to_mapping(),
+        }
+
+    @property
+    def sha256(self) -> str:
+        return _sha256(self.content)
+
+    def to_mapping(self) -> dict[str, object]:
+        return {**self.content, "seal_sha256": self.sha256}
+
+    @classmethod
+    def derive(
+        cls,
+        job: ResponseComponentJob,
+        source_seal: PromotedRootSeal,
+        *,
+        controls_sha256: str,
+        precision_tier: PrecisionTier | str,
+        working_precision_bits: int,
+    ) -> "SharedBackgroundRootSeal":
+        source_seal.validate_for(job)
+        key = _exterior_background_root_key(
+            job,
+            source_seal.root_readout,
+            controls_sha256=controls_sha256,
+            precision_tier_value=precision_tier,
+            working_precision_bits_value=working_precision_bits,
+        )
+        return cls(
+            background_key=key,
+            source_leaf_id=job.leaf_id,
+            source_job_id=job.job_id,
+            source_mechanism_id=job.mechanism_id,
+            source_root_seal_sha256=source_seal.sha256,
+            root_evidence_sha256=source_seal.root_evidence_sha256,
+            root_readout=source_seal.root_readout,
+        )
+
+    def bind(
+        self,
+        job: ResponseComponentJob,
+        *,
+        controls_sha256: str,
+        precision_tier: PrecisionTier | str,
+        working_precision_bits: int,
+    ) -> PromotedRootSeal:
+        if job.mechanism_id not in _EXTERIOR_PROFILE_IDS:
+            raise ValueError("shared exterior background cannot bind this mechanism")
+        expected = _exterior_background_root_key(
+            job,
+            self.root_readout,
+            controls_sha256=controls_sha256,
+            precision_tier_value=precision_tier,
+            working_precision_bits_value=working_precision_bits,
+        )
+        if expected != self.background_key:
+            raise ValueError("shared background reuse identity does not match")
+        return PromotedRootSeal.derive(job, self.root_readout)
+
+    @classmethod
+    def from_mapping(cls, value: object) -> "SharedBackgroundRootSeal":
+        fields = {
+            "schema",
+            "identity",
+            "background_key",
+            "source_leaf_id",
+            "source_job_id",
+            "source_mechanism_id",
+            "source_root_seal_sha256",
+            "root_evidence_sha256",
+            "root_readout",
+            "seal_sha256",
+        }
+        if not isinstance(value, Mapping) or set(value) != fields:
+            raise ValueError("shared background root seal fields are invalid")
+        if (
+            value.get("schema") != SHARED_BACKGROUND_ROOT_SEAL_SCHEMA
+            or value.get("identity") != SHARED_BACKGROUND_ROOT_SEAL_IDENTITY
+        ):
+            raise ValueError("shared background root seal identity is invalid")
+        seal = cls(
+            background_key=BackgroundRootKey.from_mapping(
+                value["background_key"]
+            ),
+            source_leaf_id=str(value["source_leaf_id"]),
+            source_job_id=str(value["source_job_id"]),
+            source_mechanism_id=str(value["source_mechanism_id"]),
+            source_root_seal_sha256=str(value["source_root_seal_sha256"]),
+            root_evidence_sha256=str(value["root_evidence_sha256"]),
+            root_readout=RootReadout.from_mapping(value["root_readout"]),
+        )
+        if value.get("seal_sha256") != seal.sha256:
+            raise ValueError("shared background root seal digest is invalid")
+        if seal.to_mapping() != value:
+            raise ValueError("shared background root seal is not canonical")
+        return seal
+
+
 
 class NativeDeterminantKernel(Protocol):
     def evaluate_root(
@@ -5319,6 +5522,54 @@ def _validate_sealed_exterior_frequency_stencil_evidence(
     h = coordinate_samples[0].amplitude.real
     if not math.isfinite(h) or h <= 0.0:
         raise ValueError("sealed response repair coordinate step is invalid")
+    raw_shared_background = evidence.get("shared_background_root_seal")
+    raw_shared_domega = evidence.get("shared_domega_evidence")
+    shared_background: SharedBackgroundRootSeal | None = None
+    shared_domega: FixedRootDomegaEvidence | None = None
+    if raw_shared_background is not None:
+        try:
+            shared_background = SharedBackgroundRootSeal.from_mapping(
+                raw_shared_background
+            )
+        except ValueError as error:
+            raise ValueError(
+                "sealed response shared background evidence is invalid"
+            ) from error
+        background = shared_background.background_key
+        contract = regularised_gsn_mechanism_contract(mechanism_id)
+        if (
+            shared_background.root_readout.to_mapping()
+            != baseline.to_mapping()
+            or shared_background.root_evidence_sha256
+            != seal.root_evidence_sha256
+            or background.root_reference_id != baseline.root_reference_id
+            or background.branch_id != baseline.branch_id
+            or background.equation_id != baseline.equation_id
+            or background.determinant_family
+            != contract["determinant_family"]
+            or background.determinant_convention
+            != contract["determinant_convention"]
+            or background.determinant_normalisation
+            != contract["determinant_normalisation"]
+            or background.backend_identity_sha256
+            != seal.backend_identity_sha256
+            or background.numerical_policy_sha256 != seal.policy_sha256
+        ):
+            raise ValueError("sealed response shared background binding is invalid")
+    if raw_shared_domega is not None:
+        if shared_background is None:
+            raise ValueError("shared Domega lacks its background seal")
+        try:
+            shared_domega = FixedRootDomegaEvidence.from_mapping(
+                raw_shared_domega
+            )
+            reused_samples = _validated_shared_domega_samples(
+                shared_domega, shared_background, h
+            )
+        except ValueError as error:
+            raise ValueError("shared Domega evidence is invalid") from error
+        if tuple(reused_samples) != tuple(frequency_samples):
+            raise ValueError("shared Domega samples disagree with the component")
     if any(sample.amplitude != 0.0j for sample in frequency_samples):
         raise ValueError("sealed response repair frequency samples moved amplitude")
     expected_frequency = (
@@ -5356,6 +5607,12 @@ def _validate_sealed_exterior_frequency_stencil_evidence(
     coordinate_runtime_sha256 = family_runtime(coordinate_samples, "coordinate")
     frequency_first = frequency_samples[0]
     coordinate_first = coordinate_samples[0]
+    frequency_job_id = (
+        job_id if shared_domega is None else shared_domega.source_job_id
+    )
+    frequency_leaf_id = (
+        leaf_id if shared_domega is None else shared_domega.source_leaf_id
+    )
     for sample, (role, omega) in zip(frequency_samples, expected_frequency):
         request = sample.worker_response_receipt["request_binding"]
         if (
@@ -5369,8 +5626,8 @@ def _validate_sealed_exterior_frequency_stencil_evidence(
             or sample.precision_tier != frequency_first.precision_tier
             or sample.working_precision_bits
             != frequency_first.working_precision_bits
-            or request.get("job_id") != job_id
-            or request.get("leaf_id") != leaf_id
+            or request.get("job_id") != frequency_job_id
+            or request.get("leaf_id") != frequency_leaf_id
             or sample.worker_response_receipt.get("scientific_runtime_sha256")
             != frequency_runtime_sha256
         ):
@@ -6083,12 +6340,38 @@ def _validate_promoted_horizon_checkpoint_evidence(
         ):
             raise ValueError("component unbounded horizon response is inconsistent")
         return
+    stored_response_disk = evidence.get("response_disk")
+    response_disk_matches = stored_response_disk == expected_response.to_mapping()
+    if isinstance(stored_response_disk, Mapping):
+        stored_radius = stored_response_disk.get("radius")
+        expected_mapping = expected_response.to_mapping()
+        response_disk_matches = (
+            stored_response_disk.get("centre") == expected_mapping["centre"]
+            and stored_response_disk.get("exact_zero_radius")
+            == expected_mapping["exact_zero_radius"]
+            and isinstance(stored_radius, (int, float))
+            and not isinstance(stored_radius, bool)
+            # The originating Windows and replaying Linux C runtimes can
+            # round the complex magnitudes in this already-bounded formula
+            # two adjacent binary64 values apart.  This fixed ULP check is a
+            # serialization-portability rule, not a scientific tolerance.
+            and abs(float(stored_radius) - expected_response.radius)
+            <= 2.0 * max(
+                math.ulp(float(stored_radius)),
+                math.ulp(expected_response.radius),
+            )
+        )
     if (
-        evidence.get("response_disk") != expected_response.to_mapping()
+        not response_disk_matches
         or status is not ComponentStatus.CONVERGED
         or response != expected_response.centre
         or closed_form_response != expected_response.centre
-        or error_channels.get("resolution") != expected_response.radius
+        or error_channels.get("resolution")
+        != (
+            stored_response_disk.get("radius")
+            if isinstance(stored_response_disk, Mapping)
+            else expected_response.radius
+        )
         or any(
             float(value) != 0.0
             for name, value in error_channels.items()
@@ -7782,6 +8065,62 @@ def _reusable_sealed_stencil(
     return tuple(by_role[role] for role in roles)
 
 
+def _fixed_root_domega_key(
+    shared_seal: SharedBackgroundRootSeal,
+    derivative_step: float,
+) -> FixedRootDomegaKey:
+    background = shared_seal.background_key
+    return FixedRootDomegaKey(
+        background_key_sha256=background.sha256,
+        determinant_family=background.determinant_family,
+        determinant_normalisation=background.determinant_normalisation,
+        controls_sha256=background.controls_sha256,
+        precision_tier=background.precision_tier,
+        working_precision_bits=background.working_precision_bits,
+        derivative_method=FIXED_ROOT_FREQUENCY_DERIVATIVE_METHOD,
+        derivative_step_hex=float(derivative_step).hex(),
+    )
+
+
+def _validated_shared_domega_samples(
+    evidence: FixedRootDomegaEvidence,
+    shared_seal: SharedBackgroundRootSeal,
+    derivative_step: float,
+) -> tuple[FixedRootDeterminantSample, ...]:
+    expected_key = _fixed_root_domega_key(shared_seal, derivative_step)
+    if evidence.key != expected_key:
+        raise ValueError("shared Domega reuse identity does not match")
+    if (
+        evidence.source_leaf_id != shared_seal.source_leaf_id
+        or evidence.source_job_id != shared_seal.source_job_id
+        or evidence.source_root_seal_sha256
+        != shared_seal.source_root_seal_sha256
+    ):
+        raise ValueError("shared Domega source root identity does not match")
+    samples = tuple(
+        FixedRootDeterminantSample.from_mapping(item)
+        for item in evidence.frequency_samples
+    )
+    expected_roles = _FIXED_ROOT_FREQUENCY_STENCIL_ROLE_ORDER
+    if tuple(item.readout_role for item in samples) != expected_roles:
+        raise ValueError("shared Domega sample roles are invalid")
+    frequency, _coarse, _fine, propagated, disagreement = (
+        _fixed_root_frequency_derivative(samples)
+    )
+    expected_provenance = {
+        "identity": FIXED_ROOT_FREQUENCY_DERIVATIVE_METHOD,
+        "propagated_determinant_error_abs": propagated,
+        "raw_step_disagreement_abs": disagreement,
+        "selected_step": derivative_step / 2.0,
+    }
+    if (
+        evidence.derivative_disk != frequency.to_mapping()
+        or evidence.derivative_radius_provenance != expected_provenance
+    ):
+        raise ValueError("shared Domega evidence is not sample-derived")
+    return samples
+
+
 def run_promoted_exterior_response_from_seal(
     job: ResponseComponentJob,
     backend: RootReadoutBackend,
@@ -7791,6 +8130,8 @@ def run_promoted_exterior_response_from_seal(
     validation_reason: str | None = None,
     repair_families: frozenset[str] | None = None,
     reusable_result: ComponentResult | None = None,
+    shared_background_seal: SharedBackgroundRootSeal | None = None,
+    reusable_domega: FixedRootDomegaEvidence | None = None,
 ) -> ComponentResult:
     """Recover ``-D_c/D_omega`` at an already authenticated fixed root.
 
@@ -7817,6 +8158,25 @@ def run_promoted_exterior_response_from_seal(
     if backend.identity != job.backend_identity:
         raise ValueError("bound response backend identity does not match job")
     seal.validate_for(job)
+    if reusable_domega is not None and shared_background_seal is None:
+        raise ValueError("shared Domega evidence requires its background seal")
+    if shared_background_seal is not None:
+        rebound = shared_background_seal.bind(
+            job,
+            controls_sha256=(
+                shared_background_seal.background_key.controls_sha256
+            ),
+            precision_tier=(
+                shared_background_seal.background_key.precision_tier
+            ),
+            working_precision_bits=(
+                shared_background_seal.background_key.working_precision_bits
+            ),
+        )
+        if rebound.to_mapping() != seal.to_mapping():
+            raise ValueError("shared background seal bound the wrong response root")
+    if reusable_domega is not None and validation_reason is not None:
+        raise ValueError("validation cannot substitute shared Domega evidence")
     requested_families = (
         frozenset({"frequency", "coordinate"})
         if repair_families is None
@@ -7842,15 +8202,23 @@ def run_promoted_exterior_response_from_seal(
     reused_families: set[str] = set()
     recomputed_families: set[str] = set()
     if not use_primary_frequency:
-        reusable_frequency = (
-            None
-            if "frequency" in requested_families
-            else _reusable_sealed_stencil(
-                reusable_result,
-                seal,
-                _FIXED_ROOT_FREQUENCY_STENCIL_ROLE_ORDER,
+        if reusable_domega is not None:
+            assert shared_background_seal is not None
+            reusable_frequency = _validated_shared_domega_samples(
+                reusable_domega,
+                shared_background_seal,
+                step,
             )
-        )
+        else:
+            reusable_frequency = (
+                None
+                if "frequency" in requested_families
+                else _reusable_sealed_stencil(
+                    reusable_result,
+                    seal,
+                    _FIXED_ROOT_FREQUENCY_STENCIL_ROLE_ORDER,
+                )
+            )
         if reusable_frequency is not None:
             frequency_samples = reusable_frequency
             reused_families.add("frequency")
@@ -7975,6 +8343,14 @@ def run_promoted_exterior_response_from_seal(
         "recomputed_families": sorted(recomputed_families),
         "reused_families": sorted(reused_families),
     }
+    shared_background_mapping = (
+        None
+        if shared_background_seal is None
+        else shared_background_seal.to_mapping()
+    )
+    shared_domega_mapping = (
+        None if reusable_domega is None else reusable_domega.to_mapping()
+    )
     unavailable_samples = tuple(
         sample
         for sample in all_samples
@@ -8008,6 +8384,8 @@ def run_promoted_exterior_response_from_seal(
                     ),
                     "root_seal": seal.to_mapping(),
                     "root_seal_sha256": seal.sha256,
+                    "shared_background_root_seal": shared_background_mapping,
+                    "shared_domega_evidence": shared_domega_mapping,
                     "response_repair_identity": (
                         ROOT_SEALED_RESPONSE_REPAIR_IDENTITY
                     ),
@@ -8044,6 +8422,8 @@ def run_promoted_exterior_response_from_seal(
                 "response_disk_identity": EXTERIOR_DERIVATIVE_RESPONSE_DISK_IDENTITY,
                 "root_seal": seal.to_mapping(),
                 "root_seal_sha256": seal.sha256,
+                "shared_background_root_seal": shared_background_mapping,
+                "shared_domega_evidence": shared_domega_mapping,
                 "response_repair_identity": (
                     ROOT_SEALED_RESPONSE_REPAIR_IDENTITY
                 ),
@@ -8157,6 +8537,8 @@ def run_promoted_exterior_response_from_seal(
                         ),
                         "root_seal": seal.to_mapping(),
                         "root_seal_sha256": seal.sha256,
+                        "shared_background_root_seal": shared_background_mapping,
+                        "shared_domega_evidence": shared_domega_mapping,
                         "response_repair_identity": (
                             ROOT_SEALED_RESPONSE_REPAIR_IDENTITY
                         ),
@@ -8192,6 +8574,8 @@ def run_promoted_exterior_response_from_seal(
                 "zero_containing_disk": error.disk_name,
                 "root_seal": seal.to_mapping(),
                 "root_seal_sha256": seal.sha256,
+                "shared_background_root_seal": shared_background_mapping,
+                "shared_domega_evidence": shared_domega_mapping,
                 "response_repair_identity": (
                     ROOT_SEALED_RESPONSE_REPAIR_IDENTITY
                 ),
@@ -8230,6 +8614,8 @@ def run_promoted_exterior_response_from_seal(
         "response_disk_identity": EXTERIOR_DERIVATIVE_RESPONSE_DISK_IDENTITY,
         "root_seal": seal.to_mapping(),
         "root_seal_sha256": seal.sha256,
+        "shared_background_root_seal": shared_background_mapping,
+        "shared_domega_evidence": shared_domega_mapping,
         "response_repair_identity": ROOT_SEALED_RESPONSE_REPAIR_IDENTITY,
         "response_repair_scope": response_repair_scope,
         "selected_step": step / 2.0,
@@ -8273,6 +8659,111 @@ def run_promoted_exterior_response_from_seal(
         derivative_evidence=derivative_evidence,
     )
     return _validated_result(backend, job, result)
+
+
+def run_exterior_survey_from_shared_seal(
+    job: ResponseComponentJob,
+    backend: RootReadoutBackend,
+    shared_seal: SharedBackgroundRootSeal,
+    cache: SurveyEvidenceCache,
+    *,
+    derivative_step: float,
+    controls_sha256: str,
+    precision_tier: PrecisionTier | str,
+    working_precision_bits: int,
+) -> ComponentResult:
+    """Produce one exterior survey response without exposing a root reader."""
+
+    if not isinstance(cache, SurveyEvidenceCache):
+        raise ValueError("survey evidence cache is invalid")
+    seal = shared_seal.bind(
+        job,
+        controls_sha256=controls_sha256,
+        precision_tier=precision_tier,
+        working_precision_bits=working_precision_bits,
+    )
+    key = _fixed_root_domega_key(shared_seal, derivative_step)
+    reusable = cache.lookup_domega(key)
+    result = run_promoted_exterior_response_from_seal(
+        job,
+        backend,
+        seal,
+        derivative_step=derivative_step,
+        shared_background_seal=shared_seal,
+        reusable_domega=reusable,
+    )
+    if reusable is not None or result.derivative_evidence is None:
+        return result
+    evidence = result.derivative_evidence
+    if (
+        evidence.get("frequency_derivative_source")
+        != FIXED_ROOT_FREQUENCY_DERIVATIVE_METHOD
+        or not isinstance(evidence.get("frequency_derivative_disk"), Mapping)
+        or not isinstance(
+            evidence.get("frequency_derivative_radius_provenance"), Mapping
+        )
+    ):
+        return result
+    raw_samples = evidence.get("fixed_root_samples")
+    if not isinstance(raw_samples, list) or len(raw_samples) < 8:
+        return result
+    domega = FixedRootDomegaEvidence(
+        key=key,
+        source_leaf_id=job.leaf_id,
+        source_job_id=job.job_id,
+        source_root_seal_sha256=seal.sha256,
+        derivative_disk=evidence["frequency_derivative_disk"],
+        derivative_radius_provenance=evidence[
+            "frequency_derivative_radius_provenance"
+        ],
+        frequency_samples=tuple(raw_samples[:4]),
+    )
+    cache.store_domega(domega)
+    persisted_derivative_evidence = dict(evidence)
+    persisted_derivative_evidence["shared_domega_evidence"] = (
+        domega.to_mapping()
+    )
+    persisted = replace(
+        result,
+        derivative_evidence=persisted_derivative_evidence,
+    )
+    return _validated_result(backend, job, persisted)
+
+
+def restore_survey_evidence_cache_from_result(
+    result: ComponentResult,
+    cache: SurveyEvidenceCache,
+) -> bool:
+    """Rehydrate exact shared survey evidence from one persisted result.
+
+    A process restart must not turn an already authenticated background root or
+    Domega stencil into missing work.  Only the canonical, fully bound evidence
+    written into the component result is accepted; older results simply do not
+    contribute to this cache.
+    """
+
+    if not isinstance(result, ComponentResult) or not isinstance(
+        cache, SurveyEvidenceCache
+    ):
+        raise ValueError("persisted survey cache input is invalid")
+    evidence = result.derivative_evidence
+    if not isinstance(evidence, Mapping):
+        return False
+    raw_background = evidence.get("shared_background_root_seal")
+    raw_domega = evidence.get("shared_domega_evidence")
+    if raw_background is None or raw_domega is None:
+        return False
+    shared = SharedBackgroundRootSeal.from_mapping(raw_background)
+    domega = FixedRootDomegaEvidence.from_mapping(raw_domega)
+    if shared.root_readout.to_mapping() != result.baseline.to_mapping():
+        raise ValueError("persisted survey background changed the central root")
+    derivative_step = float.fromhex(domega.key.derivative_step_hex)
+    _validated_shared_domega_samples(domega, shared, derivative_step)
+    cache.store_background_seal(
+        shared.background_key, shared.to_mapping()
+    )
+    cache.store_domega(domega)
+    return True
 
 
 def run_promoted_exterior_component(

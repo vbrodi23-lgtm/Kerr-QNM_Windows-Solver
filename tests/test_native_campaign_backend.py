@@ -11,6 +11,11 @@ from unittest.mock import patch
 
 from tests.test_linear_response_batches import _produced_stage_outcome
 
+from windows_solver.campaign_policy import (
+    CampaignExecutionPolicy,
+    ExecutionProfile,
+    SurveyEvidenceCache,
+)
 from windows_solver.contracts import canonical_json_bytes
 from windows_solver.gsn_cache_producer import GeneratedGsnCache, GsnParameterPair
 from windows_solver.julia_response_backend import (
@@ -22,6 +27,8 @@ from windows_solver.response_batches import (
     CampaignExecutionAttempt,
     NativeCampaignStageBackend,
     PrecisionCapabilities,
+    StageOutcome,
+    _campaign_stage_record,
     build_campaign_selection,
     build_campaign_plan,
     run_campaign_selection,
@@ -334,6 +341,253 @@ class NativeCampaignBackendTests(unittest.TestCase):
         self.assertEqual(runtime["record_artifact_ids"], ["gsn-000001"])
         self.assertEqual(runtime["cache_sha256_observed"], "a" * 64)
 
+    def test_exterior_survey_binary64_preflight_dispatches_no_numerics(self):
+        policy = CampaignExecutionPolicy.for_profile(ExecutionProfile.SURVEY)
+        with patch.object(self.backend, "execute_stage") as legacy:
+            outcome = self.backend.execute_profile_stage(
+                self.leaf,
+                64,
+                policy,
+                SurveyEvidenceCache(),
+            )
+
+        legacy.assert_not_called()
+        self.assertEqual(outcome.digits, 64)
+        self.assertTrue(
+            outcome.component_result["survey_promotion_required"]
+        )
+        self.assertEqual(
+            outcome.component_result["survey_required_precision_digits"],
+            80,
+        )
+
+    def test_horizon_survey_promotes_only_authenticated_numerical_insufficiency(self):
+        horizon = next(
+            leaf
+            for leaf in self.plan.leaves
+            if leaf.role == "primary"
+            and leaf.mechanism_id == "horizon-admittance"
+        )
+        payload = {"evidence_kind": "synthetic-horizon-insufficiency/v1"}
+        unresolved = StageOutcome(
+            digits=64,
+            numerical_state=ComponentStatus.NOT_CONVERGED.value,
+            component_result=payload,
+            local_disk_radius_abs=0.0,
+            signed_error_channels=synthetic_stage_signed_error_channels(
+                payload, 0.0, precision_ladder_applicable=False
+            ),
+        )
+        policy = CampaignExecutionPolicy.for_profile(ExecutionProfile.SURVEY)
+
+        with (
+            patch.object(self.backend, "execute_stage", return_value=unresolved),
+            patch(
+                "windows_solver.response_batches._validate_component_result",
+                return_value=True,
+            ),
+        ):
+            authenticated = self.backend.execute_profile_stage(
+                horizon, 64, policy, SurveyEvidenceCache()
+            )
+        with (
+            patch.object(self.backend, "execute_stage", return_value=unresolved),
+            patch(
+                "windows_solver.response_batches._validate_component_result",
+                return_value=False,
+            ),
+        ):
+            unauthenticated = self.backend.execute_profile_stage(
+                horizon, 64, policy, SurveyEvidenceCache()
+            )
+
+        self.assertIs(
+            authenticated.component_result["survey_promotion_required"], True
+        )
+        self.assertEqual(
+            authenticated.component_result["survey_required_precision_digits"],
+            80,
+        )
+        self.assertIs(
+            unauthenticated.component_result["survey_promotion_required"],
+            False,
+        )
+
+    def test_horizon_survey_promotion_reuses_existing_bf80_route_only(self):
+        horizon = next(
+            leaf
+            for leaf in self.plan.leaves
+            if leaf.role == "primary"
+            and leaf.mechanism_id == "horizon-admittance"
+        )
+        binary_payload = {"evidence_kind": "synthetic-binary-horizon/v1"}
+        binary = StageOutcome(
+            digits=64,
+            numerical_state=ComponentStatus.NOT_CONVERGED.value,
+            component_result=binary_payload,
+            local_disk_radius_abs=0.0,
+            signed_error_channels=synthetic_stage_signed_error_channels(
+                binary_payload, 0.0, precision_ladder_applicable=False
+            ),
+        )
+        result = _result(horizon.job, complex(0.01, -0.02))
+        promoted_payload = {
+            "evidence_kind": (
+                "package-owned-julia-single-promoted-horizon-component"
+            ),
+            "result": result.to_mapping(),
+        }
+        radius = sum(result.error_channels.values())
+        promoted = StageOutcome(
+            digits=80,
+            numerical_state=ComponentStatus.CONVERGED.value,
+            component_result=promoted_payload,
+            local_disk_radius_abs=radius,
+            signed_error_channels=synthetic_stage_signed_error_channels(
+                promoted_payload,
+                radius,
+                precision_ladder_applicable=False,
+            ),
+        )
+        policy = CampaignExecutionPolicy.for_profile(ExecutionProfile.SURVEY)
+
+        with patch.object(
+            self.backend,
+            "execute_promoted_stage_with_predictor",
+            return_value=promoted,
+        ) as existing_bf80:
+            outcome = self.backend.execute_profile_promoted_stage(
+                horizon,
+                80,
+                (binary,),
+                policy,
+                SurveyEvidenceCache(),
+            )
+
+        existing_bf80.assert_called_once_with(
+            horizon, 80, (binary,), None
+        )
+        self.assertEqual(outcome.digits, 80)
+        self.assertIs(
+            outcome.component_result["bounded_response_disk"], True
+        )
+        self.assertIs(
+            outcome.component_result["survey_promotion_required"], False
+        )
+
+    def _retained_profile_record(self, result):
+        payload = {
+            "evidence_kind": "synthetic-retained-survey/v1",
+            "result": result.to_mapping(),
+        }
+        radius = sum(result.error_channels.values())
+        outcome = StageOutcome(
+            digits=80,
+            numerical_state=result.status.value,
+            component_result=payload,
+            local_disk_radius_abs=radius,
+            signed_error_channels=synthetic_stage_signed_error_channels(
+                payload,
+                radius,
+                precision_ladder_applicable=False,
+            ),
+        )
+        stage = _campaign_stage_record(
+            self.plan, self.capabilities, outcome
+        )
+        return SimpleNamespace(
+            evidence=SimpleNamespace(
+                central_stage_sha256=stage.stage_sha256
+            ),
+            stages=(stage,),
+        )
+
+    def test_certify_routes_the_existing_promoted_local_evidence_path(self):
+        central = _result(self.leaf.job, 1.0 + 0.5j)
+        retained = self._retained_profile_record(central)
+        heavy_payload = {
+            "evidence_kind": (
+                "package-owned-julia-fixed-root-exterior-derivative-component"
+            ),
+            "result": central.to_mapping(),
+            "scientific_runtime": {"precision_digits": 80},
+        }
+        heavy_radius = sum(central.error_channels.values())
+        heavy = StageOutcome(
+            digits=80,
+            numerical_state=central.status.value,
+            component_result=heavy_payload,
+            local_disk_radius_abs=heavy_radius,
+            signed_error_channels=synthetic_stage_signed_error_channels(
+                heavy_payload,
+                heavy_radius,
+                precision_ladder_applicable=False,
+            ),
+            discrepancy_from_previous_abs=0.0,
+            discrepancy_enclosed=True,
+        )
+        policy = CampaignExecutionPolicy.for_profile(ExecutionProfile.CERTIFY)
+
+        with patch.object(
+            self.backend,
+            "execute_promoted_stage_with_predictor",
+            return_value=heavy,
+        ) as promoted:
+            outcome = self.backend.execute_evidence_stage(
+                self.leaf, retained, policy
+            )
+
+        promoted.assert_called_once()
+        self.assertEqual(
+            outcome.component_result["execution_profile"], "certify"
+        )
+        self.assertEqual(
+            len(outcome.component_result["heavy_local_stage_chain"]), 1
+        )
+
+    def test_validate_routes_only_the_existing_full_ladder_boundary(self):
+        central = _result(self.leaf.job, 1.0 + 0.5j)
+        retained = self._retained_profile_record(central)
+        backend = SimpleNamespace(
+            scientific_runtime_for=lambda job: {"precision_digits": 80}
+        )
+        policy = CampaignExecutionPolicy.for_profile(ExecutionProfile.VALIDATE)
+
+        with (
+            patch.object(
+                self.backend,
+                "_julia_precision_backend_for",
+                return_value=backend,
+            ),
+            patch(
+                "windows_solver.response_batches.run_promoted_full_ladder_validation",
+                return_value={
+                    "validation_policy": {
+                        "identity": "full-complex-ladder-validation/v1",
+                        "reason": "PUBLICATION_VALIDATION",
+                    },
+                    "result": central,
+                },
+            ) as full_ladder,
+            patch.object(
+                self.backend,
+                "execute_promoted_stage_with_predictor",
+            ) as local_path,
+        ):
+            outcome = self.backend.execute_evidence_stage(
+                self.leaf, retained, policy
+            )
+
+        full_ladder.assert_called_once()
+        local_path.assert_not_called()
+        self.assertEqual(
+            outcome.component_result["execution_profile"], "validate"
+        )
+        self.assertEqual(
+            outcome.component_result["validation_policy"]["reason"],
+            "PUBLICATION_VALIDATION",
+        )
+
     def test_promoted_stage_records_repeat_and_prior_discrepancies(self):
         previous_result = _result(self.leaf.job, 1.0 + 0.0j)
         primary = _result(self.leaf.job, 1.0 + 2.0e-8j)
@@ -517,8 +771,34 @@ class NativeCampaignBackendTests(unittest.TestCase):
         )
         self.assertEqual(
             set(contract["empirical_control_profiles_by_nominal_decimal_digits"]),
-            {"80", "120"},
+            {"40", "80", "120"},
         )
+
+    def test_every_exterior_family_contract_includes_lowest_promoted_tier(self):
+        backend = NativeCampaignStageBackend(
+            self.backend.adapter,
+            self.capabilities,
+            self.backend.generated_cache,
+            self.backend.julia_adapter,
+        )
+        exterior = {
+            leaf.mechanism_id: leaf
+            for leaf in self.plan.leaves
+            if leaf.mechanism_id != "horizon-admittance"
+        }
+
+        self.assertEqual(len(exterior), 5)
+        for mechanism, leaf in exterior.items():
+            with self.subTest(mechanism=mechanism):
+                contract = backend.scientific_execution_contract_for(leaf)
+                self.assertEqual(
+                    set(
+                        contract[
+                            "empirical_control_profiles_by_nominal_decimal_digits"
+                        ]
+                    ),
+                    {"40", "80", "120"},
+                )
 
     def test_unsuccessful_promoted_primary_skips_self_refinement(self):
         previous_result = _result(self.leaf.job, 1.0 + 0.0j)

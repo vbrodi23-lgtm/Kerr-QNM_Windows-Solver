@@ -34,6 +34,11 @@ from .response_reduction import (
     build_projective_row_plans,
     reduce_projective_rows,
 )
+from .campaign_triage import (
+    CampaignTriageReport,
+    build_campaign_triage,
+    write_campaign_triage_report,
+)
 
 
 # The terms of the acceptance comparison itself, so a reader can re-derive the
@@ -115,6 +120,10 @@ LEAF_COLUMNS = (
     "spin_binary64_hex",
     "mechanism",
     "terminal_state",
+    "execution_profile",
+    "evidence_level",
+    "evidence_receipt_count",
+    "evidence_discrepancy_codes",
     "component_status",
     "precision_digits",
     "precision_tier",
@@ -258,6 +267,7 @@ class CampaignReportModel:
     checkpoint_source_receipt: str
     precision_stage_rows: tuple[Mapping[str, object], ...] = ()
     resource_failure_rows: tuple[Mapping[str, object], ...] = ()
+    triage_report: CampaignTriageReport | None = None
 
 
 def report_directory_for_checkpoint(checkpoint_path: str | os.PathLike[str]) -> Path:
@@ -551,6 +561,26 @@ def _leaf_row(
         "spin_binary64_hex": domain_leaf.spin.hex(),
         "mechanism": leaf.mechanism_id,
         "terminal_state": "PENDING" if record is None else record.state,
+        "execution_profile": (
+            ""
+            if record is None or record.evidence is None
+            else record.evidence.execution_profile.value
+        ),
+        "evidence_level": (
+            ""
+            if record is None or record.evidence is None
+            else record.evidence.evidence_level.value
+        ),
+        "evidence_receipt_count": (
+            0
+            if record is None or record.evidence is None
+            else len(record.evidence.receipts)
+        ),
+        "evidence_discrepancy_codes": (
+            ""
+            if record is None or record.evidence is None
+            else _json_cell(record.evidence.discrepancy_codes)
+        ),
         "run_provenance": provenance if record is not None else "",
         "root_reference_id": job.root.root_reference_id,
         "root_identity_sha256": job.root.identity_sha256,
@@ -563,6 +593,10 @@ def _leaf_row(
 
     stage = record.stages[-1]
     outcome = stage.outcome
+    if not row["execution_profile"]:
+        raw_profile = outcome.component_result.get("execution_profile")
+        if isinstance(raw_profile, str):
+            row["execution_profile"] = raw_profile
     precision = precision_tier_presentation(outcome.digits)
     result = _component_result(record)
     row.update({
@@ -581,6 +615,20 @@ def _leaf_row(
         "record_sha256": record.record_sha256,
         "stage_sha256": stage.stage_sha256,
     })
+    semantic_trace = outcome.component_result.get(
+        "semantic_precision_tier_trace"
+    )
+    if (
+        isinstance(semantic_trace, list)
+        and semantic_trace
+        and semantic_trace[-1] in {
+            "bigfloat-40", "bigfloat-80", "bigfloat-120"
+        }
+    ):
+        row["precision_tier"] = semantic_trace[-1]
+        row["precision_decimal_digits_nominal"] = semantic_trace[-1].rsplit(
+            "-", 1
+        )[-1]
     if result is None:
         return row
 
@@ -995,6 +1043,13 @@ def project_campaign_reports(
     resource_failure_rows = _resource_failure_rows(
         plan, summary, source_receipt=source_receipt
     )
+    triage_report = build_campaign_triage(
+        plan,
+        summary,
+        leaf_rows,
+        projective_rows,
+        checkpoint_source_receipt=source_receipt,
+    )
     return CampaignReportModel(
         leaf_rows=leaf_rows,
         precision_stage_rows=precision_stage_rows,
@@ -1002,6 +1057,7 @@ def project_campaign_reports(
         projective_rows=projective_rows,
         resource_failure_rows=resource_failure_rows,
         checkpoint_source_receipt=source_receipt,
+        triage_report=triage_report,
     )
 
 
@@ -1076,4 +1132,8 @@ def refresh_campaign_reports(
         RESOURCE_FAILURE_COLUMNS,
         model.resource_failure_rows,
     )
+    if model.triage_report is not None:
+        write_campaign_triage_report(
+            directory / "m02-triage.json", model.triage_report
+        )
     return model

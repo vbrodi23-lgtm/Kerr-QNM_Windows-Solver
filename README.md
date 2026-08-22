@@ -130,20 +130,33 @@ exact Julia 1.10.11 from the managed runtime, an existing system installation,
 or Juliaup before downloading solver-managed Julia. It then reuses or provisions
 the pinned numerical environment, contract-addressed persistent GSN/spheroidal
 source copies, M02 project, Julia depot/packages/artifacts/compiled cache, and
-the package-owned 80/120-digit worker. The complete 212-leaf campaign is a
-single resumable command:
+the package-owned promoted worker. The complete 212-leaf provisional atlas is
+a single resumable survey command:
 
 ```powershell
 .\m02.ps1
 ```
 
-On its first invocation the launcher bootstraps the runtime, generates the
-required exact F/U records, starts `campaign-run`, and validates the completed
-checkpoint. Later invocations cheaply validate receipts and executable health,
-reuse a compatible runtime and M02 environment, validate/reuse individual GSN
-pairs, and use `campaign-resume` against the same checkpoint. No historic cache,
-external precision plugin, cache digest, or source digest is an execution
-prerequisite.
+`survey` is the default execution profile. It records a bounded central
+response as `SCREENED`, advances past unresolved or contained failed leaves,
+and does not make heavy local or publication validation a prerequisite for
+atlas visibility. Later invocations reuse the checkpoint and exact shared
+exterior background/Domega evidence. The checkpoint report directory contains
+`m02-leaves.csv` and the ordered `m02-triage.json` certification queue.
+
+Targeted evidence upgrades use the same solver behind explicit profiles and
+require an existing checkpoint:
+
+```powershell
+.\m02.ps1 -Profile certify
+.\m02.ps1 -Profile validate
+```
+
+Certification and validation append evidence around the retained survey
+centre. A disagreement outside its retained disk is recorded for review rather
+than silently replacing the atlas value. `SCREENED` evidence is available to
+atlas and triage reports but remains inadmissible to release/publication
+reduction; those boundaries require at least `CERTIFIED` evidence.
 
 Generated coefficients live under the managed runtime's source-contract-scoped
 `generated\gsn\<contract-id>` directory (normally
@@ -199,10 +212,10 @@ solver response-plan SELECTION.json --checkpoint CHECKPOINT.json
 solver response-run SELECTION.json --checkpoint CHECKPOINT.json
 solver response-resume SELECTION.json --checkpoint CHECKPOINT.json
 solver response-validate SELECTION.json --checkpoint CHECKPOINT.json
-solver campaign-plan SELECTION.json
-solver campaign-run SELECTION.json --checkpoint CHECKPOINT.json [--progress quiet|normal|trace]
-solver campaign-resume SELECTION.json --checkpoint CHECKPOINT.json [--progress quiet|normal|trace]
-solver campaign-validate SELECTION.json --checkpoint CHECKPOINT.json [--full]
+solver campaign-plan SELECTION.json [--profile survey|certify|validate]
+solver campaign-run SELECTION.json --checkpoint CHECKPOINT.json [--profile survey] [--progress quiet|normal|trace]
+solver campaign-resume SELECTION.json --checkpoint CHECKPOINT.json [--profile survey|certify|validate] [--progress quiet|normal|trace]
+solver campaign-validate SELECTION.json --checkpoint CHECKPOINT.json [--profile survey|certify|validate] [--full]
 solver campaign-merge MANIFEST.json --output CHECKPOINT.json
 solver campaign-cache-import SELECTION.json --checkpoint CHECKPOINT.json [--store PATH]
 solver campaign-reduce REDUCTION-BUNDLE.json --output REDUCTION.json

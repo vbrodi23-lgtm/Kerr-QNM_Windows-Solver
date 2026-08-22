@@ -124,6 +124,13 @@ preservation, and cache/provenance separation from historical raw-state leaves.
   at the sealed frequency without any further root call; version sample and
   checkpoint evidence; migrate the partial Leaf 42 checkpoint without deleting
   prior work; and remove the workflow carrier that mutates source after push.
+- Implement PR #63 from
+  `docs/superpowers/plans/2026-08-22-m02-survey-certify-validate.md`: add one
+  mechanism-general survey/certify/validate execution policy, preserve
+  numerical terminal states separately from monotone evidence levels, share
+  exact-identity sealed background and Dω evidence, migrate completed work
+  without numerical recomputation, generate a whole-atlas certification queue,
+  and keep SCREENED evidence outside release admission.
 
 ### Work Log
 

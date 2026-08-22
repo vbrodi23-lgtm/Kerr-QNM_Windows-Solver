@@ -7,6 +7,10 @@ param(
     [string]$RuntimeRoot,
     [string]$CalibrationReceiptPath,
     [string]$CalibrationReceiptSha256,
+    [ValidateSet("survey", "certify", "validate")]
+    [string]$Profile = "survey",
+    [string]$TriageQueue,
+    [int]$QueueLimit = 0,
     [ValidateSet("quiet", "normal", "trace")]
     [string]$Progress = "normal"
 )
@@ -71,6 +75,29 @@ if ($HasCalibrationPath) {
         "--calibration-receipt-sha256", $CalibrationReceiptSha256.ToLowerInvariant()
     )
 }
+$HasTriageQueue = -not [string]::IsNullOrWhiteSpace($TriageQueue)
+if ($Profile -eq "survey" -and $HasTriageQueue) {
+    throw "A triage queue is valid only for certify or validate."
+}
+if ($QueueLimit -lt 0 -or ($QueueLimit -gt 0 -and -not $HasTriageQueue)) {
+    throw "A positive -QueueLimit requires -TriageQueue."
+}
+$TriageArguments = @()
+if ($HasTriageQueue) {
+    $ResolvedTriageQueue = if ([IO.Path]::IsPathRooted($TriageQueue)) {
+        [IO.Path]::GetFullPath($TriageQueue)
+    }
+    else {
+        [IO.Path]::GetFullPath((Join-Path $PackageRoot $TriageQueue))
+    }
+    if (-not (Test-Path -LiteralPath $ResolvedTriageQueue -PathType Leaf)) {
+        throw "M02 triage queue is absent: $ResolvedTriageQueue"
+    }
+    $TriageArguments = @("--triage-queue", $ResolvedTriageQueue)
+    if ($QueueLimit -gt 0) {
+        $TriageArguments += @("--queue-limit", [string]$QueueLimit)
+    }
+}
 
 if (-not $SkipBootstrap) {
     $BootstrapParameters = @{
@@ -107,6 +134,10 @@ if (-not (Test-Path -LiteralPath $SelectionPath -PathType Leaf)) {
 New-Item -ItemType Directory -Force -Path (Split-Path -Parent $CheckpointPath) |
     Out-Null
 
+if ($Profile -ne "survey" -and -not (Test-Path -LiteralPath $CheckpointPath -PathType Leaf)) {
+    throw "The $Profile profile requires an existing screened campaign checkpoint."
+}
+
 Push-Location $PackageRoot
 try {
     $Command = if (Test-Path -LiteralPath $CheckpointPath -PathType Leaf) {
@@ -117,6 +148,8 @@ try {
     }
     $CampaignPlan = Invoke-M02Command -Arguments @(
         "campaign-plan",
+        "--profile",
+        $Profile,
         $Selection
     ) | ConvertFrom-Json
     if (
@@ -139,13 +172,17 @@ try {
         "--checkpoint",
         $Checkpoint,
         "--progress",
-        $Progress
-    ) + $CalibrationArguments)
+        $Progress,
+        "--profile",
+        $Profile
+    ) + $CalibrationArguments + $TriageArguments)
     Invoke-M02Command -Arguments @(
         "campaign-validate",
         $Selection,
         "--checkpoint",
         $Checkpoint,
+        "--profile",
+        $Profile,
         "--full"
     )
 }

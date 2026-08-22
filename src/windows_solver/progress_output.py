@@ -1894,6 +1894,7 @@ class CampaignProgressReporter:
         self, record: Mapping[str, object]
     ) -> tuple[tuple[str, object], ...]:
         context = self._dashboard_state
+        evidence_counts = self._evidence_progress_counts()
         leaf = "-"
         if context.get("leaf_index") is not None and context.get("leaf_count") is not None:
             leaf = f"{context['leaf_index']}/{context['leaf_count']}"
@@ -1913,6 +1914,9 @@ class CampaignProgressReporter:
             ("RootStatus", context.get("root_status")),
             ("PrecisionStatus", context.get("precision_status")),
             ("Completed", self._completed_value(context.get("leaf_count"))),
+            ("Screened", evidence_counts["SCREENED"]),
+            ("Certified", evidence_counts["CERTIFIED"]),
+            ("Validated", evidence_counts["VALIDATED"]),
             ("Accepted", len(self._accepted_leaf_ids)),
             ("Rejected", len(self._rejected_leaf_ids)),
             ("Indeterminate", len(self._indeterminate_leaf_ids)),
@@ -1967,6 +1971,19 @@ class CampaignProgressReporter:
             *self._scientific_dashboard_fields(),
         )
 
+    def _evidence_progress_counts(self) -> dict[str, int]:
+        ranks = {"": -1, "SCREENED": 0, "CERTIFIED": 1, "VALIDATED": 2}
+        counts = {"SCREENED": 0, "CERTIFIED": 0, "VALIDATED": 0}
+        model = self._campaign_report_model
+        if model is None:
+            return counts
+        for row in model.leaf_rows:
+            rank = ranks.get(str(row.get("evidence_level") or ""), -1)
+            counts["SCREENED"] += rank >= 0
+            counts["CERTIFIED"] += rank >= 1
+            counts["VALIDATED"] += rank >= 2
+        return counts
+
     def _dashboard_lines(self, record: Mapping[str, object]) -> list[str]:
         fields = dict(self._dashboard_fields(record))
         lines = [
@@ -1976,6 +1993,9 @@ class CampaignProgressReporter:
             "",
             " CAMPAIGN",
             self._dashboard_field_line("Completed", fields.get("Completed")),
+            self._dashboard_field_line("Atlas screened", fields.get("Screened")),
+            self._dashboard_field_line("Certified", fields.get("Certified")),
+            self._dashboard_field_line("Validated", fields.get("Validated")),
             self._dashboard_field_line("Accepted", fields.get("Accepted")),
             self._dashboard_field_line("Unresolved", fields.get("Indeterminate")),
             self._dashboard_field_line("Rejected", fields.get("Rejected")),
@@ -2016,7 +2036,12 @@ class CampaignProgressReporter:
             "==============================================================",
             "",
             " CAMPAIGN",
-            self._dashboard_field_line("Completed", fields.get("Completed")),
+            (
+                f" Completed      {self._dashboard_value(fields.get('Completed'))}"
+                f" | S/C/V {self._dashboard_value(fields.get('Screened'))}/"
+                f"{self._dashboard_value(fields.get('Certified'))}/"
+                f"{self._dashboard_value(fields.get('Validated'))}"
+            ),
             (
                 f" Accepted       {self._dashboard_value(fields.get('Accepted'))}"
                 f" | Unresolved {self._dashboard_value(fields.get('Indeterminate'))}"

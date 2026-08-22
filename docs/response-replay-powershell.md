@@ -77,8 +77,8 @@ leaves. Provision CPython, NumPy/SciPy, and Julia once:
 
 ```powershell
 .\runtime\bootstrap.ps1 -WithM02
-.\solver.ps1 campaign-run .\campaign-selection.json --checkpoint .\primary-part.json
-.\solver.ps1 campaign-resume .\campaign-selection.json --checkpoint .\primary-part.json
+.\solver.ps1 campaign-run .\campaign-selection.json --checkpoint .\primary-part.json --profile survey
+.\solver.ps1 campaign-resume .\campaign-selection.json --checkpoint .\primary-part.json --profile survey
 .\solver.ps1 campaign-validate .\campaign-selection.json --checkpoint .\primary-part.json
 ```
 
@@ -110,10 +110,13 @@ accepted pairs. Index allocation is locked, index replacement is atomic, and
 the prior valid index is retained as `gsn-index.previous.json`. Measured hashes
 and producer metadata are observations, not development execution gates.
 
-The installed backend owns all declared precision stages. Binary64 uses the
-existing Python `StandardSN` path; 80/120-digit stages use the persistent
-managed Julia worker and return the same root-readout contract to the existing campaign
-runner. No separately supplied precision module is needed for M02.
+The installed backend owns all declared precision stages. The default survey
+retains the current efficient binary64 horizon path. Exterior survey checks the
+binary64 fixed-root capability, then uses the lowest existing adequate
+promoted tier (including semantic BF40 where calibrated), never automatically
+requesting 120 digits. Once a shared exterior root seal exists, response work
+has no root-read operation and may reuse exact-key Domega evidence across
+mechanisms. No separately supplied precision module is needed for M02.
 
 For the complete campaign, the root launcher selects all 212 leaves, starts or
 resumes the checkpoint, and performs full structural validation:
@@ -121,6 +124,23 @@ resumes the checkpoint, and performs full structural validation:
 ```powershell
 .\m02.ps1
 ```
+
+This default creates the provisional atlas with `SCREENED` evidence. The
+checkpoint's sibling `<checkpoint-stem>.reports` directory contains separate
+screened/certified/validated fields in `m02-leaves.csv` and an explicit ordered
+queue in `m02-triage.json`. To add targeted evidence around an existing atlas,
+use a selection containing the queued leaves and resume explicitly:
+
+```powershell
+.\solver.ps1 campaign-resume .\certification-selection.json `
+  --checkpoint .\m02-output\m02-campaign-checkpoint.json --profile certify
+.\solver.ps1 campaign-resume .\validation-selection.json `
+  --checkpoint .\m02-output\m02-campaign-checkpoint.json --profile validate
+```
+
+`certify` requires `SCREENED`; `validate` requires `CERTIFIED`. Both are
+additive, and neither silently replaces the retained centre. Release and
+publication admission continue to reject `SCREENED`-only leaves.
 
 Use `.\m02.ps1 -RebuildRuntime` only when intentionally discarding the
 persistent managed runtime and provisioning it again. The campaign checkpoint
