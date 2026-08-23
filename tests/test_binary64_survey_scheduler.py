@@ -9,6 +9,7 @@ import unittest
 from windows_solver.campaign_policy import empty_schema11_checkpoint
 from windows_solver.campaign_failures import CampaignSystemFailure
 from windows_solver.campaign_recovery import RecoverySelection
+from windows_solver.campaign_timing import CampaignTimingLog
 from windows_solver.campaign_survey import (
     AuthenticatedRootSeal,
     Binary64PassOutcome,
@@ -161,6 +162,18 @@ class Binary64SurveySchedulerTests(unittest.TestCase):
                 ).mechanism_id != "horizon-admittance"
             }
             self.assertEqual({4, 9}, exterior_counts)
+            exterior_timing = [
+                entry["tier_timing"]
+                for leaf_id, entry in ledger.items()
+                if next(
+                    leaf for leaf in self.plan.leaves if leaf.leaf_id == leaf_id
+                ).mechanism_id != "horizon-admittance"
+            ]
+            self.assertTrue(all(
+                timing and timing[0]["tier"] == "binary64"
+                and timing[0]["source"] == "direct"
+                for timing in exterior_timing
+            ))
             self.assertTrue(checkpoint_path.is_file())
 
     def test_typed_response_insufficiency_queues_and_advances_without_promotion(self) -> None:
@@ -316,6 +329,10 @@ class Binary64SurveySchedulerTests(unittest.TestCase):
                 "MethodError", durable["system_failures"][0]["cause_type"]
             )
             self.assertNotIn("FAILED", str(durable))
+            timing = CampaignTimingLog(
+                path.with_name(f"{path.name}.timing.jsonl")
+            ).read()
+            self.assertEqual("INTERRUPTED", timing[-1].state)
 
 
 if __name__ == "__main__":

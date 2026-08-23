@@ -11,6 +11,7 @@ from typing import Callable, Mapping, Sequence
 
 from .campaign_policy import validate_schema11_checkpoint
 from .contracts import canonical_json_bytes
+from .progress import ProgressEventKind, emit_progress, progress_scope
 
 
 class FailureDisposition(str, Enum):
@@ -196,6 +197,15 @@ def _abort_with_receipt(
     durable["state"] = "PARTIAL"
     durable = validate_schema11_checkpoint(durable)
     persist_checkpoint(copy.deepcopy(durable))
+    with progress_scope(
+        leaf_id=leaf_id,
+        system_failure_fingerprint=fingerprint_sha256,
+    ):
+        emit_progress(
+            ProgressEventKind.SYSTEM_FAILURE_RECORDED,
+            failure_code=failure_code,
+            cause_type=cause_type,
+        )
     raise CampaignSystemFailure(message, receipt=receipt, checkpoint=durable)
 
 

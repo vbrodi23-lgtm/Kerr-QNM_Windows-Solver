@@ -28,6 +28,8 @@ class ProgressEventKind(StrEnum):
     CAMPAIGN_COMPLETED = "campaign_completed"
     CAMPAIGN_FAILED = "campaign_failed"
     CAMPAIGN_INTERRUPTED = "campaign_interrupted"
+    CAMPAIGN_PASS_STARTED = "campaign_pass_started"
+    CAMPAIGN_PASS_COMPLETED = "campaign_pass_completed"
     LEAF_STARTED = "leaf_started"
     LEAF_REUSED = "leaf_reused"
     LEAF_CACHE_STALE = "leaf_cache_stale"
@@ -37,6 +39,13 @@ class ProgressEventKind(StrEnum):
     LEAF_COMPLETED = "leaf_completed"
     LEAF_FAILED = "leaf_failed"
     LEAF_INTERRUPTED = "leaf_interrupted"
+    LEAF_PASS_STARTED = "leaf_pass_started"
+    LEAF_PASS_DISPOSITION_RECORDED = "leaf_pass_disposition_recorded"
+    PROMOTION_QUEUED = "promotion_queued"
+    SURVEY_SAMPLE_STARTED = "survey_sample_started"
+    SURVEY_SAMPLE_COMPLETED = "survey_sample_completed"
+    SYSTEM_FAILURE_RECORDED = "system_failure_recorded"
+    REPORT_STATUS_CHANGED = "report_status_changed"
     CHECKPOINT_WRITING = "checkpoint_writing"
     CHECKPOINT_WRITTEN = "checkpoint_written"
     PRECISION_STAGE_STARTED = "precision_stage_started"
@@ -174,9 +183,24 @@ _INTEGER_CONTEXT_KEYS = frozenset(
         "determinant_index_leaf",
         "determinant_index_phase",
         "determinant_index_newton",
+        "promotion_queue_count",
+        "sample_count_used",
+        "sample_count_limit",
+        "root_read_count",
+        "root_read_limit",
+        "worker_launch_count",
+        "worker_launch_limit",
     }
 )
-_FLOAT_CONTEXT_KEYS = frozenset({"spin", "epsilon"})
+_FLOAT_CONTEXT_KEYS = frozenset({
+    "spin",
+    "epsilon",
+    "binary64_seconds",
+    "bf40_seconds",
+    "bf80_seconds",
+    "bf120_seconds",
+    "total_leaf_seconds",
+})
 _BOOLEAN_CONTEXT_KEYS = frozenset({"fallback_used"})
 _STRING_CONTEXT_KEYS = frozenset(
     {
@@ -190,6 +214,14 @@ _STRING_CONTEXT_KEYS = frozenset(
         "seed_kind",
         "determinant_purpose",
         "suboperation",
+        "execution_profile",
+        "survey_pass",
+        "pass_disposition",
+        "evidence_level",
+        "promotion_reason",
+        "report_state",
+        "system_failure_fingerprint",
+        "precision_tier",
     }
 )
 _MAPPING_CONTEXT_KEYS = frozenset(
@@ -229,6 +261,31 @@ def _validate_context_values(values: Mapping[str, object]) -> Mapping[str, objec
             raise ValueError(f"progress context {name} must be a string")
         if name in _MAPPING_CONTEXT_KEYS and not isinstance(value, Mapping):
             raise ValueError(f"progress context {name} must be a mapping")
+        if name in _INTEGER_CONTEXT_KEYS and value < 0:
+            raise ValueError(f"progress context {name} must be nonnegative")
+        if name in _FLOAT_CONTEXT_KEYS and (
+            not math.isfinite(float(value)) or value < 0
+        ):
+            raise ValueError(
+                f"progress context {name} must be finite and nonnegative"
+            )
+    enum_values = {
+        "execution_profile": {"SURVEY", "CERTIFY", "VALIDATE"},
+        "survey_pass": {"binary64", "promoted", "certify", "validate"},
+        "evidence_level": {"SCREENED", "CERTIFIED", "VALIDATED"},
+        "precision_tier": {"binary64", "BF40", "BF80", "BF120"},
+    }
+    for name, allowed in enum_values.items():
+        if values.get(name) is not None and values[name] not in allowed:
+            raise ValueError(f"progress context {name} is invalid")
+    fingerprint = values.get("system_failure_fingerprint")
+    if fingerprint is not None:
+        try:
+            valid_fingerprint = len(fingerprint) == 64 and int(fingerprint, 16) >= 0
+        except (TypeError, ValueError):
+            valid_fingerprint = False
+        if not valid_fingerprint:
+            raise ValueError("progress system failure fingerprint is invalid")
     return _mapping_snapshot(values)
 
 
@@ -264,6 +321,26 @@ class ProgressContext:
     determinant_index_newton: int | None = None
     determinant_purpose: str | None = None
     suboperation: str | None = None
+    execution_profile: str | None = None
+    survey_pass: str | None = None
+    pass_disposition: str | None = None
+    evidence_level: str | None = None
+    promotion_reason: str | None = None
+    promotion_queue_count: int | None = None
+    sample_count_used: int | None = None
+    sample_count_limit: int | None = None
+    root_read_count: int | None = None
+    root_read_limit: int | None = None
+    worker_launch_count: int | None = None
+    worker_launch_limit: int | None = None
+    report_state: str | None = None
+    system_failure_fingerprint: str | None = None
+    precision_tier: str | None = None
+    binary64_seconds: float | None = None
+    bf40_seconds: float | None = None
+    bf80_seconds: float | None = None
+    bf120_seconds: float | None = None
+    total_leaf_seconds: float | None = None
 
     def __post_init__(self) -> None:
         values = _validate_context_values(

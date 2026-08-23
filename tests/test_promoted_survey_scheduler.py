@@ -13,6 +13,7 @@ from windows_solver.campaign_policy import (
     empty_schema11_checkpoint,
 )
 from windows_solver.campaign_recovery import RecoverySelection
+from windows_solver.campaign_timing import CampaignTimingLog
 from windows_solver.campaign_survey import (
     AuthenticatedRootSeal,
     PromotedRootSolveResult,
@@ -266,6 +267,12 @@ class PromotedSurveySchedulerTests(unittest.TestCase):
         ]
         self.assertEqual(0, ledger["root_read_limit"])
         self.assertEqual(2, ledger["worker_launch_limit"])
+        self.assertEqual("BF40", ledger["tier_timing"][0]["tier"])
+        self.assertEqual("direct", ledger["tier_timing"][0]["source"])
+        self.assertEqual(
+            ["STARTED", "COMPLETED"],
+            [fragment["state"] for fragment in ledger["session_fragments"]],
+        )
 
     def test_response_queue_escalates_once_to_bf80_then_stops(self):
         result, calls = self._run(
@@ -353,6 +360,10 @@ class PromotedSurveySchedulerTests(unittest.TestCase):
                 )
             self.assertEqual([self.leaves[0].leaf_id], started)
             self.assertTrue(path.is_file())
+            timing = CampaignTimingLog(
+                path.with_name(f"{path.name}.timing.jsonl")
+            ).read()
+            self.assertEqual("INTERRUPTED", timing[-1].state)
 
 
 if __name__ == "__main__":

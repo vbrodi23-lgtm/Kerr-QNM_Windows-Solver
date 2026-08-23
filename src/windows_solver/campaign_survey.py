@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import hashlib
 import math
 import os
 from pathlib import Path
 import tempfile
+import time
 from typing import Callable, Mapping
+from uuid import uuid4
 
 from .campaign_policy import (
     EvidenceLevel,
@@ -33,6 +35,11 @@ from .campaign_failures import (
     classify_failure,
 )
 from .contracts import canonical_json_bytes
+from .campaign_timing import (
+    CampaignTimingLog,
+    TimingSessionRecorder,
+    fold_timing_fragments,
+)
 from .solved_leaf_cache import (
     SolvedLeafLookupStatus,
     SolvedLeafStore,
@@ -59,6 +66,7 @@ from .julia_response_backend import (
     JuliaResponseBackendError,
     JuliaRootReadoutResourceLimitError,
 )
+from .progress import ProgressEventKind, emit_progress, progress_scope
 
 
 RecordValidator = Callable[[str, Mapping[str, object]], None]
@@ -112,6 +120,8 @@ class Binary64PassOutcome:
     worker_launch_count: int = 0
     worker_launch_limit: int = 0
     evidence_receipts: tuple[Mapping[str, object], ...] = ()
+    tier_timing: tuple[Mapping[str, object], ...] = ()
+    session_fragments: tuple[Mapping[str, object], ...] = ()
 
     @classmethod
     def produced(
@@ -128,6 +138,8 @@ class Binary64PassOutcome:
         worker_launch_count: int = 0,
         worker_launch_limit: int = 0,
         evidence_receipts: tuple[Mapping[str, object], ...] = (),
+        tier_timing: tuple[Mapping[str, object], ...] = (),
+        session_fragments: tuple[Mapping[str, object], ...] = (),
     ) -> "Binary64PassOutcome":
         return cls(
             disposition=SurveyDisposition.COMPLETED,
@@ -142,6 +154,8 @@ class Binary64PassOutcome:
             worker_launch_count=worker_launch_count,
             worker_launch_limit=worker_launch_limit,
             evidence_receipts=evidence_receipts,
+            tier_timing=tier_timing,
+            session_fragments=session_fragments,
         )
 
 
@@ -189,6 +203,8 @@ class PromotedPassOutcome:
     worker_launch_count: int = 0
     worker_launch_limit: int = 3
     evidence_receipts: tuple[Mapping[str, object], ...] = ()
+    tier_timing: tuple[Mapping[str, object], ...] = ()
+    session_fragments: tuple[Mapping[str, object], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -252,8 +268,8 @@ def _record_pass_outcome(
         root_read_limit=outcome.root_read_limit,
         worker_launch_count=outcome.worker_launch_count,
         worker_launch_limit=outcome.worker_launch_limit,
-        tier_timing=(),
-        session_fragments=(),
+        tier_timing=outcome.tier_timing,
+        session_fragments=outcome.session_fragments,
     )
     return result
 
@@ -276,6 +292,9 @@ def run_binary64_survey(
     ] | None = None,
     solved_leaf_store: SolvedLeafStore | None = None,
     record_validator: RecordValidator | None = None,
+    timing_log: CampaignTimingLog | None = None,
+    clock: Callable[[], float] = time.monotonic,
+    session_id_factory: Callable[[], str] | None = None,
 ) -> Binary64SurveyRun:
     """Run only the binary64 pass; promotion is recorded and never executed."""
 
@@ -295,6 +314,13 @@ def run_binary64_survey(
     backgrounds: dict[str, CanonicalExteriorBackground] = {}
     completed = queued = reused = skipped = 0
     path = Path(checkpoint_path)
+    operational_timing = timing_log or CampaignTimingLog(
+        path.with_name(f"{path.name}.timing.jsonl")
+    )
+    make_session_id = session_id_factory or (lambda: uuid4().hex)
+
+    with progress_scope(execution_profile="SURVEY", survey_pass="binary64"):
+        emit_progress(ProgressEventKind.CAMPAIGN_PASS_STARTED)
 
     for leaf_id in selection.ordered_leaf_ids:
         leaf = leaves[leaf_id]
@@ -302,6 +328,14 @@ def run_binary64_survey(
             skipped += 1
             continue
         committed_before_leaf = result
+        timing_recorder: TimingSessionRecorder | None = None
+        with progress_scope(
+            leaf_id=leaf_id,
+            execution_profile="SURVEY",
+            survey_pass="binary64",
+            precision_tier="binary64",
+        ):
+            emit_progress(ProgressEventKind.LEAF_PASS_STARTED)
 
         def guarded(action: Callable[[], object]) -> object:
             try:
@@ -309,6 +343,11 @@ def run_binary64_survey(
             except KeyboardInterrupt:
                 raise
             except Exception as error:
+                if (
+                    timing_recorder is not None
+                    and timing_recorder.active_tier is not None
+                ):
+                    timing_recorder.interrupt_tier()
                 abort_unexpected_system_failure(
                     committed_before_leaf,
                     leaf_id=leaf_id,
@@ -379,6 +418,19 @@ def run_binary64_survey(
             )
             assert isinstance(result, dict)
             reused += 1
+            with progress_scope(
+                leaf_id=leaf_id,
+                execution_profile="SURVEY",
+                survey_pass="binary64",
+                pass_disposition=SurveyDisposition.CACHE_REUSED.value,
+                sample_count_used=0,
+                sample_count_limit=0,
+                root_read_count=0,
+                root_read_limit=0,
+                worker_launch_count=0,
+                worker_launch_limit=0,
+            ):
+                emit_progress(ProgressEventKind.LEAF_PASS_DISPOSITION_RECORDED)
             _atomic_json(path, result)
             binary64_ledger = result["survey_pass_ledger"]["binary64"]
             continue
@@ -436,7 +488,26 @@ def run_binary64_survey(
                     else equivalence_receipt_lookup(leaf, background)
                 ))
                 if backend is None:
+                    timing_recorder = TimingSessionRecorder(
+                        log=operational_timing,
+                        session_id=make_session_id(),
+                        leaf_id=leaf_id,
+                        execution_profile="SURVEY",
+                        survey_pass="binary64",
+                        clock=clock,
+                    )
+                    timing_recorder.start_tier("binary64")
                     backend = guarded(native_backend_factory)
+                elif timing_recorder is None:
+                    timing_recorder = TimingSessionRecorder(
+                        log=operational_timing,
+                        session_id=make_session_id(),
+                        leaf_id=leaf_id,
+                        execution_profile="SURVEY",
+                        survey_pass="binary64",
+                        clock=clock,
+                    )
+                    timing_recorder.start_tier("binary64")
                 batch = guarded(
                     lambda: backend.fixed_root_survey_with_optional_background(
                         job=leaf.job,
@@ -532,6 +603,17 @@ def run_binary64_survey(
                         sample_count=batch.sample_count,
                         sample_limit=batch.sample_limit,
                     )
+                assert timing_recorder is not None
+                timing_recorder.complete_tier()
+                timing_summary = fold_timing_fragments(timing_recorder.fragments)
+                outcome = replace(
+                    outcome,
+                    tier_timing=timing_summary.tier_timing_mappings(),
+                    session_fragments=tuple(
+                        fragment.to_mapping()
+                        for fragment in timing_recorder.fragments
+                    ),
+                )
         result = guarded(
             lambda: _record_pass_outcome(
                 result,
@@ -547,9 +629,46 @@ def run_binary64_survey(
             existing_records[leaf_id] = outcome.record
         elif outcome.queue_kind is not None:
             queued += 1
+            with progress_scope(
+                leaf_id=leaf_id,
+                execution_profile="SURVEY",
+                survey_pass="binary64",
+                pass_disposition=outcome.disposition.value,
+                promotion_reason=outcome.reason_code,
+                promotion_queue_count=queued,
+            ):
+                emit_progress(ProgressEventKind.PROMOTION_QUEUED)
+        with progress_scope(
+            leaf_id=leaf_id,
+            execution_profile="SURVEY",
+            survey_pass="binary64",
+            pass_disposition=outcome.disposition.value,
+            sample_count_used=outcome.sample_count,
+            sample_count_limit=outcome.sample_limit,
+            root_read_count=outcome.root_read_count,
+            root_read_limit=outcome.root_read_limit,
+            worker_launch_count=outcome.worker_launch_count,
+            worker_launch_limit=outcome.worker_launch_limit,
+            binary64_seconds=sum(
+                item["elapsed_seconds"] for item in outcome.tier_timing
+                if item["tier"] == "binary64"
+            ),
+            total_leaf_seconds=sum(
+                item["elapsed_seconds"] for item in outcome.tier_timing
+            ),
+        ):
+            emit_progress(ProgressEventKind.LEAF_PASS_DISPOSITION_RECORDED)
         _atomic_json(path, result)
         binary64_ledger = result["survey_pass_ledger"]["binary64"]
 
+    with progress_scope(execution_profile="SURVEY", survey_pass="binary64"):
+        emit_progress(
+            ProgressEventKind.CAMPAIGN_PASS_COMPLETED,
+            completed_count=completed,
+            queued_count=queued,
+            cache_reused_count=reused,
+            skipped_count=skipped,
+        )
     return Binary64SurveyRun(
         checkpoint=validate_schema11_checkpoint(result),
         completed_count=completed,
@@ -670,6 +789,7 @@ def _run_promoted_exterior_queue_entry(
         [object, JuliaFixedRootSurveyBatch, object, int],
         tuple[Mapping[str, object], str],
     ],
+    timing_recorder: TimingSessionRecorder,
 ) -> PromotedPassOutcome:
     queue_kind = PromotionQueueKind(entry["queue_kind"])
     seal: AuthenticatedRootSeal | None = None
@@ -688,6 +808,7 @@ def _run_promoted_exterior_queue_entry(
     for digits in (40, 80):
         tier = f"BF{digits}"
         tiers.append(tier)
+        timing_recorder.start_tier(tier)
         backend = backend_factory(leaf, digits)
         if seal is None:
             root_reads += 1
@@ -707,9 +828,10 @@ def _run_promoted_exterior_queue_entry(
                     and decision.disposition is FailureDisposition.PROMOTION_PENDING
                     and decision.failure_code in PROMOTION_ALLOWLIST
                 ):
+                    timing_recorder.complete_tier()
                     continue
                 if decision.disposition is FailureDisposition.PROMOTION_PENDING:
-                    return PromotedPassOutcome(
+                    outcome = PromotedPassOutcome(
                         disposition=SurveyDisposition.UNRESOLVED,
                         reason_code=decision.failure_code,
                         precision_tiers=tuple(tiers),
@@ -717,13 +839,17 @@ def _run_promoted_exterior_queue_entry(
                         root_read_count=root_reads,
                         worker_launch_count=worker_launches,
                     )
-                return _terminal_promoted_outcome(
+                    timing_recorder.complete_tier()
+                    return outcome
+                outcome = _terminal_promoted_outcome(
                     decision,
                     tiers=tuple(tiers),
                     sample_count=sample_count,
                     root_read_count=root_reads,
                     worker_launch_count=worker_launches,
                 )
+                timing_recorder.complete_tier()
+                return outcome
             if not isinstance(root_result, PromotedRootSolveResult):
                 raise ValueError("promoted PRIMARY runner returned an invalid result")
             if root_result.precision_tier != tier:
@@ -754,9 +880,10 @@ def _run_promoted_exterior_queue_entry(
                 and decision.disposition is FailureDisposition.PROMOTION_PENDING
                 and decision.failure_code in PROMOTION_ALLOWLIST
             ):
+                timing_recorder.complete_tier()
                 continue
             if decision.disposition is FailureDisposition.PROMOTION_PENDING:
-                return PromotedPassOutcome(
+                outcome = PromotedPassOutcome(
                     disposition=SurveyDisposition.UNRESOLVED,
                     reason_code=decision.failure_code,
                     precision_tiers=tuple(tiers),
@@ -764,13 +891,17 @@ def _run_promoted_exterior_queue_entry(
                     root_read_count=root_reads,
                     worker_launch_count=worker_launches,
                 )
-            return _terminal_promoted_outcome(
+                timing_recorder.complete_tier()
+                return outcome
+            outcome = _terminal_promoted_outcome(
                 decision,
                 tiers=tuple(tiers),
                 sample_count=sample_count,
                 root_read_count=root_reads,
                 worker_launch_count=worker_launches,
             )
+            timing_recorder.complete_tier()
+            return outcome
         if not isinstance(batch, JuliaFixedRootSurveyBatch):
             raise ValueError("promoted backend returned an invalid survey batch")
         if (
@@ -796,7 +927,7 @@ def _run_promoted_exterior_queue_entry(
             if not isinstance(built, tuple) or len(built) != 2:
                 raise ValueError("promoted record builder returned invalid data")
             record, stage_sha256 = built
-            return PromotedPassOutcome(
+            outcome = PromotedPassOutcome(
                 disposition=SurveyDisposition.COMPLETED,
                 reason_code="BOUNDED_PROMOTED_FIXED_ROOT_RESPONSE",
                 precision_tiers=tuple(tiers),
@@ -807,14 +938,17 @@ def _run_promoted_exterior_queue_entry(
                 worker_launch_count=worker_launches,
                 evidence_receipts=tuple(receipts),
             )
+            timing_recorder.complete_tier()
+            return outcome
         reason = str(screening.reason_code)
         if reason not in PROMOTION_ALLOWLIST:
             raise ValueError(
                 f"promoted screening returned an unknown reason: {reason}"
             )
         if digits == 40:
+            timing_recorder.complete_tier()
             continue
-        return PromotedPassOutcome(
+        outcome = PromotedPassOutcome(
             disposition=SurveyDisposition.UNRESOLVED,
             reason_code=reason,
             precision_tiers=tuple(tiers),
@@ -823,6 +957,8 @@ def _run_promoted_exterior_queue_entry(
             worker_launch_count=worker_launches,
             evidence_receipts=tuple(receipts),
         )
+        timing_recorder.complete_tier()
+        return outcome
     raise AssertionError("promoted survey precision ladder did not terminate")
 
 
@@ -896,8 +1032,8 @@ def _commit_promoted_outcome(
             if queue_kind is PromotionQueueKind.RESPONSE
             else outcome.worker_launch_limit
         ),
-        tier_timing=(),
-        session_fragments=(),
+        tier_timing=outcome.tier_timing,
+        session_fragments=outcome.session_fragments,
     )
     return result
 
@@ -920,6 +1056,9 @@ def run_promoted_survey(
         [object, JuliaFixedRootSurveyBatch, object, int],
         tuple[Mapping[str, object], str],
     ],
+    timing_log: CampaignTimingLog | None = None,
+    clock: Callable[[], float] = time.monotonic,
+    session_id_factory: Callable[[], str] | None = None,
 ) -> PromotedSurveyRun:
     """Consume only pending promotion entries through BF40/BF80 survey work."""
 
@@ -932,7 +1071,13 @@ def run_promoted_survey(
     preflight_campaign_supports(plan, selection.ordered_leaf_ids)
     leaves = {leaf.leaf_id: leaf for leaf in getattr(plan, "leaves")}
     path = Path(checkpoint_path)
+    operational_timing = timing_log or CampaignTimingLog(
+        path.with_name(f"{path.name}.timing.jsonl")
+    )
+    make_session_id = session_id_factory or (lambda: uuid4().hex)
     completed = unresolved = deferred = rejected = skipped = 0
+    with progress_scope(execution_profile="SURVEY", survey_pass="promoted"):
+        emit_progress(ProgressEventKind.CAMPAIGN_PASS_STARTED)
     entries = tuple(result["promotion_queue"]["entries"])
     for snapshot in entries:
         ordinal = int(snapshot["queue_ordinal"])
@@ -951,6 +1096,12 @@ def run_promoted_survey(
             raise ValueError("pending promotion already has a pass disposition")
         leaf = leaves[leaf_id]
         committed_before_leaf = result
+        with progress_scope(
+            leaf_id=leaf_id,
+            execution_profile="SURVEY",
+            survey_pass="promoted",
+        ):
+            emit_progress(ProgressEventKind.LEAF_PASS_STARTED)
 
         def guarded(action: Callable[[], object]) -> object:
             try:
@@ -978,14 +1129,41 @@ def run_promoted_survey(
                     ValueError("promoted horizon survey must use BF80 only")
                 ))
         else:
-            outcome = guarded(lambda: _run_promoted_exterior_queue_entry(
-                leaf,
-                snapshot,
-                root_seal_lookup=root_seal_lookup,
-                backend_factory=backend_factory,
-                primary_root_runner=primary_root_runner,
-                produced_record_builder=produced_record_builder,
-            ))
+            def execute_exterior() -> PromotedPassOutcome:
+                recorder = TimingSessionRecorder(
+                    log=operational_timing,
+                    session_id=make_session_id(),
+                    leaf_id=leaf_id,
+                    execution_profile="SURVEY",
+                    survey_pass="promoted",
+                    clock=clock,
+                )
+                try:
+                    timed_outcome = _run_promoted_exterior_queue_entry(
+                        leaf,
+                        snapshot,
+                        root_seal_lookup=root_seal_lookup,
+                        backend_factory=backend_factory,
+                        primary_root_runner=primary_root_runner,
+                        produced_record_builder=produced_record_builder,
+                        timing_recorder=recorder,
+                    )
+                except BaseException:
+                    if recorder.active_tier is not None:
+                        recorder.interrupt_tier()
+                    raise
+                if recorder.active_tier is not None:
+                    raise ValueError("promoted survey left an active timing tier")
+                summary = fold_timing_fragments(recorder.fragments)
+                return replace(
+                    timed_outcome,
+                    tier_timing=summary.tier_timing_mappings(),
+                    session_fragments=tuple(
+                        fragment.to_mapping() for fragment in recorder.fragments
+                    ),
+                )
+
+            outcome = guarded(execute_exterior)
         assert isinstance(outcome, PromotedPassOutcome)
         result = guarded(lambda: _commit_promoted_outcome(
             result,
@@ -1003,7 +1181,51 @@ def run_promoted_survey(
             deferred += 1
         elif outcome.disposition is SurveyDisposition.REJECTED:
             rejected += 1
+        timing_by_tier = {
+            item["tier"]: item["elapsed_seconds"] for item in outcome.tier_timing
+        }
+        with progress_scope(
+            leaf_id=leaf_id,
+            execution_profile="SURVEY",
+            survey_pass="promoted",
+            pass_disposition=outcome.disposition.value,
+            evidence_level=(
+                "SCREENED"
+                if outcome.disposition is SurveyDisposition.COMPLETED
+                else None
+            ),
+            sample_count_used=outcome.sample_count,
+            sample_count_limit=outcome.sample_limit,
+            root_read_count=outcome.root_read_count,
+            root_read_limit=(
+                0
+                if PromotionQueueKind(snapshot["queue_kind"])
+                is PromotionQueueKind.RESPONSE
+                else outcome.root_read_limit
+            ),
+            worker_launch_count=outcome.worker_launch_count,
+            worker_launch_limit=(
+                2
+                if PromotionQueueKind(snapshot["queue_kind"])
+                is PromotionQueueKind.RESPONSE
+                else outcome.worker_launch_limit
+            ),
+            bf40_seconds=timing_by_tier.get("BF40", 0.0),
+            bf80_seconds=timing_by_tier.get("BF80", 0.0),
+            bf120_seconds=0.0,
+            total_leaf_seconds=sum(timing_by_tier.values()),
+        ):
+            emit_progress(ProgressEventKind.LEAF_PASS_DISPOSITION_RECORDED)
         _atomic_json(path, result)
+    with progress_scope(execution_profile="SURVEY", survey_pass="promoted"):
+        emit_progress(
+            ProgressEventKind.CAMPAIGN_PASS_COMPLETED,
+            completed_count=completed,
+            unresolved_count=unresolved,
+            deferred_count=deferred,
+            rejected_count=rejected,
+            skipped_count=skipped,
+        )
     return PromotedSurveyRun(
         checkpoint=validate_schema11_checkpoint(result),
         completed_count=completed,

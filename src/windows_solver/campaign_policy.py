@@ -13,6 +13,7 @@ from enum import Enum
 from typing import Mapping, Sequence
 
 from .contracts import canonical_json_bytes
+from .campaign_timing import TimingFragment, fold_timing_fragments
 
 
 CAMPAIGN_CHECKPOINT_SCHEMA_VERSION = 11
@@ -154,6 +155,30 @@ def _validated_record(value: object) -> dict[str, object]:
     if not _is_sha256(supplied) or supplied != _sha256(content):
         raise ValueError("schema-11 numerical record digest is invalid")
     return record
+
+
+def _validated_pass_timing(
+    *,
+    leaf_id: str,
+    pass_value: str,
+    tier_timing: Sequence[Mapping[str, object]],
+    session_fragments: Sequence[Mapping[str, object]],
+) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+    fragments = [TimingFragment.from_mapping(item) for item in session_fragments]
+    if any(
+        fragment.leaf_id != leaf_id
+        or fragment.execution_profile != ExecutionProfile.SURVEY.value
+        or fragment.survey_pass != pass_value
+        for fragment in fragments
+    ):
+        raise ValueError("survey timing fragment binding is invalid")
+    expected = list(fold_timing_fragments(fragments).tier_timing_mappings())
+    supplied = [copy.deepcopy(dict(item)) for item in tier_timing]
+    if fragments and supplied != expected:
+        raise ValueError("survey tier timing disagrees with session fragments")
+    if not fragments and supplied:
+        raise ValueError("survey tier timing requires session fragments")
+    return supplied, [fragment.to_mapping() for fragment in fragments]
 
 
 def empty_schema11_checkpoint(
@@ -305,6 +330,12 @@ def record_survey_disposition(
         for name in count_names
     ):
         raise ValueError("survey disposition count exceeds its limit")
+    validated_timing, validated_fragments = _validated_pass_timing(
+        leaf_id=leaf_id,
+        pass_value=pass_value,
+        tier_timing=tier_timing,
+        session_fragments=session_fragments,
+    )
     content: dict[str, object] = {
         "leaf_id": leaf_id,
         "pass": pass_value,
@@ -314,8 +345,8 @@ def record_survey_disposition(
         "precision_tiers": list(precision_tiers),
         "reason_code": reason_code,
         **counters,
-        "tier_timing": [copy.deepcopy(dict(item)) for item in tier_timing],
-        "session_fragments": [copy.deepcopy(dict(item)) for item in session_fragments],
+        "tier_timing": validated_timing,
+        "session_fragments": validated_fragments,
         "disposition": disposition_value,
     }
     entry = {**content, "disposition_receipt_sha256": _sha256(content)}
@@ -490,6 +521,17 @@ def validate_schema11_checkpoint(
             }
             if receipt_hash != _sha256(content):
                 raise ValueError("schema-11 survey disposition receipt is invalid")
+            validated_timing, validated_fragments = _validated_pass_timing(
+                leaf_id=leaf_id,
+                pass_value=pass_name,
+                tier_timing=entry["tier_timing"],
+                session_fragments=entry["session_fragments"],
+            )
+            if (
+                entry["tier_timing"] != validated_timing
+                or entry["session_fragments"] != validated_fragments
+            ):
+                raise ValueError("schema-11 survey timing is not canonical")
 
     queue = result["promotion_queue"]
     if (
