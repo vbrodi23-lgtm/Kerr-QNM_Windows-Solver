@@ -135,6 +135,23 @@ class RootReadoutLookup:
     reason: str | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class RootReadoutStoredEntry:
+    """One self-addressed immutable root-readout cache entry.
+
+    This is intentionally a transport object rather than a root seal.  A
+    caller must still authenticate its worker receipt and bind the readout to
+    the current campaign/root before it may authorize fixed-root work.
+    """
+
+    path: Path
+    readout_identity_sha256: str
+    request_sha256: str
+    runtime_identity_sha256: str
+    response: Mapping[str, object]
+    worker_response_receipt: Mapping[str, object] | None
+
+
 class RootReadoutStore:
     """One immutable entry per (request, runtime) readout identity."""
 
@@ -153,9 +170,9 @@ class RootReadoutStore:
         return self.root / f"{readout_identity_sha256}.json"
 
     @staticmethod
-    def _validate_entry(
-        value: object, *, request_sha256: str, runtime_identity: str
-    ) -> tuple[Mapping[str, object], Mapping[str, object] | None]:
+    def _entry_from_mapping(
+        value: object, *, path: Path
+    ) -> RootReadoutStoredEntry:
         if not isinstance(value, Mapping) or set(value) != _ENTRY_FIELDS:
             raise ValueError("root-readout cache entry fields are invalid")
         if value["schema_version"] != ROOT_READOUT_CACHE_SCHEMA_VERSION:
@@ -170,18 +187,15 @@ class RootReadoutStore:
                 raise ValueError(f"root-readout cache {name} is invalid")
         if not isinstance(value["created_utc"], str) or not value["created_utc"]:
             raise ValueError("root-readout cache creation stamp is invalid")
-        # An entry is only reusable for the exact request and runtime it was
-        # recorded against; a mismatch here means the file does not describe the
-        # readout its own filename claims.
-        if value["request_sha256"] != request_sha256:
-            raise ValueError("root-readout cache request digest does not match")
-        if value["runtime_identity_sha256"] != runtime_identity:
-            raise ValueError("root-readout cache runtime identity does not match")
+        request_sha256 = value["request_sha256"]
+        runtime_identity = value["runtime_identity_sha256"]
         expected_identity = root_readout_identity_sha256(
             request_sha256=request_sha256, runtime_identity=runtime_identity
         )
         if value["readout_identity_sha256"] != expected_identity:
             raise ValueError("root-readout cache identity is not self-consistent")
+        if path.name != f"{expected_identity}.json" or path.is_symlink():
+            raise ValueError("root-readout cache filename does not match identity")
         response = value["response"]
         if not isinstance(response, Mapping):
             raise ValueError("root-readout cache response is invalid")
@@ -192,7 +206,67 @@ class RootReadoutStore:
         receipt = value["worker_response_receipt"]
         if receipt is not None and not isinstance(receipt, Mapping):
             raise ValueError("root-readout cache worker response receipt is invalid")
-        return response, receipt
+        return RootReadoutStoredEntry(
+            path=path,
+            readout_identity_sha256=expected_identity,
+            request_sha256=request_sha256,
+            runtime_identity_sha256=runtime_identity,
+            response=dict(response),
+            worker_response_receipt=(
+                None if receipt is None else dict(receipt)
+            ),
+        )
+
+    @classmethod
+    def _validate_entry(
+        cls, value: object, *, request_sha256: str, runtime_identity: str, path: Path
+    ) -> RootReadoutStoredEntry:
+        entry = cls._entry_from_mapping(value, path=path)
+        # An entry is only reusable for the exact request and runtime it was
+        # recorded against; a mismatch here means the file does not describe the
+        # readout its own filename claims.
+        if entry.request_sha256 != request_sha256:
+            raise ValueError("root-readout cache request digest does not match")
+        if entry.runtime_identity_sha256 != runtime_identity:
+            raise ValueError("root-readout cache runtime identity does not match")
+        return entry
+
+    @classmethod
+    def default(cls) -> "RootReadoutStore":
+        """Return the same cache location used by the promoted worker adapter."""
+
+        override = os.environ.get("KERR_QNM_ROOT_READOUT_CACHE_ROOT")
+        if override:
+            return cls(Path(override))
+        runtime_root = os.environ.get("KERR_QNM_RUNTIME_ROOT")
+        if runtime_root:
+            return cls(Path(runtime_root) / ROOT_READOUT_STORE_DIRECTORY_NAME)
+        local_app_data = os.environ.get("LOCALAPPDATA")
+        if os.name == "nt" and local_app_data:
+            return cls(
+                Path(local_app_data)
+                / "Kerr-QNM_Windows-Solver"
+                / "runtime-1"
+                / ROOT_READOUT_STORE_DIRECTORY_NAME
+            )
+        return cls(Path.cwd() / ".runtime" / ROOT_READOUT_STORE_DIRECTORY_NAME)
+
+    def entries(self) -> tuple[RootReadoutStoredEntry, ...]:
+        """Read every trusted entry, rejecting a corrupt cache instead of guessing."""
+
+        if not self.root.exists():
+            return ()
+        if not self.root.is_dir():
+            raise ValueError("root-readout cache store is not a directory")
+        result: list[RootReadoutStoredEntry] = []
+        for path in sorted(self.root.glob("*.json"), key=lambda item: item.name):
+            try:
+                result.append(self._entry_from_mapping(_load_json(path), path=path))
+            except (OSError, ValueError, UnicodeDecodeError) as error:
+                raise ValueError(
+                    f"root-readout cache entry is corrupt: {path}: {error}"
+                ) from error
+        return tuple(result)
 
     def lookup(
         self, *, request_sha256: str, runtime_identity: str
@@ -206,10 +280,11 @@ class RootReadoutStore:
         if not path.is_file() or path.is_symlink():
             return RootReadoutLookup(RootReadoutLookupStatus.MISSING, path=path)
         try:
-            response, receipt = self._validate_entry(
+            entry = self._validate_entry(
                 _load_json(path),
                 request_sha256=request_sha256,
                 runtime_identity=runtime_identity,
+                path=path,
             )
         except (OSError, ValueError, UnicodeDecodeError) as error:
             return RootReadoutLookup(
@@ -218,9 +293,11 @@ class RootReadoutStore:
         return RootReadoutLookup(
             RootReadoutLookupStatus.HIT,
             path=path,
-            response=dict(response),
+            response=dict(entry.response),
             worker_response_receipt=(
-                None if receipt is None else dict(receipt)
+                None
+                if entry.worker_response_receipt is None
+                else dict(entry.worker_response_receipt)
             ),
         )
 

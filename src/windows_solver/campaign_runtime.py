@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 import hashlib
 import math
+import os
 from pathlib import Path
 from typing import Mapping
 
@@ -37,6 +39,7 @@ from .response_batches import (
     CampaignStageRecord,
     NativeCampaignStageBackend,
     PrecisionCapabilities,
+    _ode_error_budget_from_mapping,
     _sealed_root_for_result,
     _run_promoted_exterior_component_with_progress,
     ensure_generated_gsn_cache,
@@ -51,13 +54,25 @@ from .response_engine import (
     ComponentResult,
     NativeDeterminantAdapter,
     PromotedRootSeal,
+    root_readout_preserves_authenticated_branch,
     run_promoted_horizon_component,
 )
+from .julia_response_backend import (
+    JuliaPrecisionRootBackend,
+    JuliaResponseBackendError,
+    JuliaResponseEvaluation,
+    _validated_execution_resource_policy,
+)
+from .promoted_control_calibration import load_default_calibration_receipt
+from .root_readout_cache import RootReadoutStore
 from .solved_leaf_cache import SolvedLeafLookupStatus, SolvedLeafStore
 
 
 _SCHEMA11_NUMERICAL_RECORD = "windows-solver.schema11-numerical-record/1"
 _FIXED_ROOT_STAGE = "windows-solver.fixed-root-screening-stage/1"
+_ROOT_READOUT_RECOVERY_INDEX_SCHEMA = (
+    "windows-solver.root-readout-recovery-index/v1"
+)
 
 
 def _sha256(value: object) -> str:
@@ -236,6 +251,269 @@ def _new_record_root_seal(
         return None
 
 
+class _CachedReadoutValidationAdapter:
+    """Pure provenance holder used to parse an already-completed worker reply."""
+
+    runtime_provenance: Mapping[str, object] = {}
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _is_sha256(value: object) -> bool:
+    if not isinstance(value, str) or len(value) != 64:
+        return False
+    try:
+        int(value, 16)
+    except ValueError:
+        return False
+    return True
+
+
+def _request_complex(value: object, subject: str) -> complex:
+    if not isinstance(value, Mapping) or set(value) != {"real", "imaginary"}:
+        raise ValueError(f"cached root-readout {subject} is invalid")
+    try:
+        result = complex(float(value["real"]), float(value["imaginary"]))
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError(f"cached root-readout {subject} is invalid") from error
+    if not math.isfinite(result.real) or not math.isfinite(result.imag):
+        raise ValueError(f"cached root-readout {subject} is invalid")
+    return result
+
+
+def _cached_readout_backend(source: object, request: Mapping[str, object]):
+    digits = request.get("precision_digits")
+    refinement = request.get("refinement_level")
+    policy = request.get("policy")
+    if (
+        type(digits) is not int
+        or digits not in {40, 80, 120}
+        or type(refinement) is not int
+        or refinement not in {0, 1}
+        or not isinstance(policy, Mapping)
+    ):
+        raise ValueError("cached root-readout request precision is invalid")
+    budget = _ode_error_budget_from_mapping(policy.get("ode_error_budget"))
+    if budget is not None:
+        return JuliaPrecisionRootBackend(
+            source.job.backend_identity,
+            _CachedReadoutValidationAdapter(),
+            digits,
+            refinement=refinement,
+            ode_error_budget=budget,
+        )
+    receipt = load_default_calibration_receipt()
+    family = (
+        "horizon-scattering/v1"
+        if source.mechanism_id == "horizon-admittance"
+        else "exterior-wronskian/v1"
+    )
+    profile = receipt.budget_for(family, digits)
+    if (
+        policy.get("promoted_control_calibration_receipt_sha256")
+        != receipt.sha256
+        or policy.get("empirical_control_profile_sha256")
+        != _sha256(profile.to_mapping())
+    ):
+        raise ValueError("cached root-readout control receipt is incompatible")
+    return JuliaPrecisionRootBackend(
+        source.job.backend_identity,
+        _CachedReadoutValidationAdapter(),
+        digits,
+        refinement=refinement,
+        empirical_control_profile=profile,
+        calibration_receipt=receipt,
+    )
+
+
+def _validated_cached_readout(
+    leaf_by_id: Mapping[str, object], entry: object
+) -> tuple[object, PromotedRootSeal]:
+    """Authenticate one retained worker readout against its originating leaf."""
+
+    response = getattr(entry, "response", None)
+    receipt = getattr(entry, "worker_response_receipt", None)
+    request_sha256 = getattr(entry, "request_sha256", None)
+    runtime_identity_sha256 = getattr(entry, "runtime_identity_sha256", None)
+    if (
+        not isinstance(response, Mapping)
+        or not isinstance(receipt, Mapping)
+        or not _is_sha256(request_sha256)
+        or not _is_sha256(runtime_identity_sha256)
+        or receipt.get("request_sha256") != request_sha256
+        or receipt.get("worker_response_schema_version")
+        != response.get("schema_version")
+        or not isinstance(receipt.get("request_binding"), Mapping)
+    ):
+        raise ValueError("cached root-readout receipt binding is invalid")
+    request = dict(receipt["request_binding"])
+    source = leaf_by_id.get(request.get("leaf_id"))
+    if source is None:
+        raise ValueError("cached root-readout source leaf is not in the plan")
+    if (
+        request.get("schema_version") != 1
+        or request.get("operation") != "root-readout"
+        or request.get("job_id") != source.job.job_id
+        or request.get("leaf_id") != source.leaf_id
+        or request.get("role") != source.role
+        or request.get("mechanism_id") != source.mechanism_id
+        or request.get("job_policy_sha256")
+        != source.job.policy.identity_sha256
+        or request.get("backend_identity_sha256")
+        != source.job.backend_identity.identity_sha256
+    ):
+        raise ValueError("cached root-readout source request is incompatible")
+    amplitude = _request_complex(request.get("amplitude"), "amplitude")
+    if amplitude != 0.0j:
+        raise ValueError("cached root-readout is not a zero-coupling root request")
+    predictor = (
+        None
+        if "primary_predictor" not in request
+        else _request_complex(request["primary_predictor"], "primary predictor")
+    )
+    predictor_kind = request.get("primary_predictor_kind")
+    if predictor_kind is not None and not isinstance(predictor_kind, str):
+        raise ValueError("cached root-readout predictor kind is invalid")
+    backend = _cached_readout_backend(source, request)
+    try:
+        resource = _validated_execution_resource_policy(
+            request.get("execution_resource")
+        )
+        expected_request = backend.preview_root_request(
+            source.job, amplitude, predictor, predictor_kind
+        )
+    except (JuliaResponseBackendError, ValueError) as error:
+        raise ValueError("cached root-readout request is invalid") from error
+    expected_request["execution_resource"] = resource
+    if request != expected_request:
+        raise ValueError("cached root-readout request is not canonical")
+    try:
+        parsed = backend._read_root_response(
+            source.job,
+            request,
+            JuliaResponseEvaluation(
+                response=dict(response),
+                request_binding=request,
+                request_sha256=request_sha256,
+                runtime_identity_sha256=runtime_identity_sha256,
+                reused=False,
+                cached_worker_response_receipt=None,
+            ),
+        )
+        parsed = replace(parsed, worker_response_receipt=dict(receipt))
+        return source, PromotedRootSeal.derive(source.job, parsed)
+    except (JuliaResponseBackendError, ValueError) as error:
+        raise ValueError("cached root-readout response is invalid") from error
+
+
+def _root_readout_compatible(source: object, target: object, seal: PromotedRootSeal) -> bool:
+    """Allow cross-leaf reuse only for the same root-solving identity."""
+
+    if (
+        source.job.root.to_mapping() != target.job.root.to_mapping()
+        or source.job.policy.identity_sha256 != target.job.policy.identity_sha256
+        or source.job.backend_identity.identity_sha256
+        != target.job.backend_identity.identity_sha256
+        or source.job.equation_id != target.job.equation_id
+        or source.job.sampling_coordinate.to_mapping()
+        != target.job.sampling_coordinate.to_mapping()
+    ):
+        return False
+    return root_readout_preserves_authenticated_branch(
+        seal.root_readout,
+        target.job.root,
+        equation_id=target.job.equation_id,
+        source_root_mapping=target.job.source_root_mapping,
+    )
+
+
+def _recovery_root_readout_references(
+    checkpoint: Mapping[str, object],
+) -> dict[Path, dict[str, Mapping[str, object]]]:
+    result: dict[Path, dict[str, Mapping[str, object]]] = {}
+    receipts = checkpoint.get("recovery_receipts")
+    if not isinstance(receipts, list):
+        raise ValueError("schema-11 recovery receipts are invalid")
+    fields = {
+        "path",
+        "source_sha256",
+        "readout_identity_sha256",
+        "request_sha256",
+        "runtime_identity_sha256",
+        "worker_response_receipt_sha256",
+    }
+    for receipt in receipts:
+        if not isinstance(receipt, Mapping):
+            continue
+        if receipt.get("schema") != _ROOT_READOUT_RECOVERY_INDEX_SCHEMA:
+            continue
+        if set(receipt) != {"schema", "store_path", "entries"}:
+            raise ValueError("root-readout recovery index fields are invalid")
+        store_path = receipt.get("store_path")
+        entries = receipt.get("entries")
+        if not isinstance(store_path, str) or not store_path or not isinstance(entries, list):
+            raise ValueError("root-readout recovery index is invalid")
+        by_identity = result.setdefault(Path(store_path), {})
+        for entry in entries:
+            if (
+                not isinstance(entry, Mapping)
+                or set(entry) != fields
+                or not isinstance(entry.get("path"), str)
+                or any(not _is_sha256(entry.get(name)) for name in fields - {"path"})
+            ):
+                raise ValueError("root-readout recovery index entry is invalid")
+            identity = str(entry["readout_identity_sha256"])
+            if identity in by_identity and dict(by_identity[identity]) != dict(entry):
+                raise ValueError("conflicting root-readout recovery index entry")
+            by_identity[identity] = dict(entry)
+    return result
+
+
+def _recovered_root_readout_entries(
+    checkpoint: Mapping[str, object],
+) -> tuple[object, ...]:
+    references = _recovery_root_readout_references(checkpoint)
+    if os.environ.get("KERR_QNM_ROOT_READOUT_CACHE", "1").strip() != "0":
+        references.setdefault(RootReadoutStore.default().root, {})
+    result: list[object] = []
+    for root, expected in sorted(references.items(), key=lambda item: str(item[0])):
+        try:
+            entries = RootReadoutStore(root).entries()
+        except ValueError as error:
+            raise ValueError(
+                f"trusted root-readout store is corrupt: {root}: {error}"
+            ) from error
+        observed: set[str] = set()
+        for entry in entries:
+            indexed = expected.get(entry.readout_identity_sha256)
+            if expected and indexed is None:
+                continue
+            if indexed is not None:
+                if (
+                    Path(str(indexed["path"])) != entry.path
+                    or indexed["request_sha256"] != entry.request_sha256
+                    or indexed["runtime_identity_sha256"]
+                    != entry.runtime_identity_sha256
+                    or _file_sha256(entry.path) != indexed["source_sha256"]
+                    or not isinstance(entry.worker_response_receipt, Mapping)
+                    or entry.worker_response_receipt.get("receipt_sha256")
+                    != indexed["worker_response_receipt_sha256"]
+                ):
+                    raise ValueError("recovered root-readout source no longer matches its index")
+                observed.add(entry.readout_identity_sha256)
+            result.append(entry)
+        missing = set(expected) - observed
+        if missing:
+            raise ValueError("recovered root-readout source is missing")
+    return tuple(result)
+
+
 def _root_index(
     plan: object,
     selection: object,
@@ -271,6 +549,17 @@ def _root_index(
         if seal is None:
             continue
         result.setdefault(source.job.root, []).append(seal)
+    for entry in _recovered_root_readout_entries(checkpoint):
+        source, seal = _validated_cached_readout(leaf_by_id, entry)
+        for target in leaf_by_id.values():
+            if _root_readout_compatible(source, target, seal):
+                result.setdefault(target.job.root, []).append(
+                    AuthenticatedRootSeal(
+                        fixed_root=seal.root_readout.omega,
+                        branch_identity=target.job.root.branch_id,
+                        root_seal_sha256=seal.sha256,
+                    )
+                )
     return {key: tuple(value) for key, value in result.items()}
 
 

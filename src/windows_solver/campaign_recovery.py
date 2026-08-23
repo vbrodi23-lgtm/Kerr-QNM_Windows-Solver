@@ -20,9 +20,12 @@ from .campaign_policy import (
     validate_schema11_checkpoint,
 )
 from .contracts import canonical_json_bytes
+from .response_engine import _validated_worker_response_receipt
+from .root_readout_cache import RootReadoutStore
 
 
 RECOVERY_RECEIPT_SCHEMA = "windows-solver.campaign-recovery/v1"
+ROOT_READOUT_RECOVERY_INDEX_SCHEMA = "windows-solver.root-readout-recovery-index/v1"
 _HEX_64 = re.compile(r"[0-9a-f]{64}")
 _SOLVED_RECEIPT_FIELDS = {
     "schema_version",
@@ -254,6 +257,38 @@ def _validated_solved_receipt(
     return record, identity
 
 
+def _root_readout_recovery_entry(
+    *, entry: object, source_sha256: str
+) -> dict[str, object]:
+    """Seal a cache address for later root authentication without numerics."""
+
+    receipt = getattr(entry, "worker_response_receipt", None)
+    if receipt is None:
+        raise ValueError("root-readout cache entry lacks a worker response receipt")
+    validated_receipt = _validated_worker_response_receipt(receipt)
+    if validated_receipt is None:
+        raise ValueError("root-readout cache entry lacks a worker response receipt")
+    request_sha256 = getattr(entry, "request_sha256", None)
+    response = getattr(entry, "response", None)
+    if (
+        not _is_sha256(request_sha256)
+        or not isinstance(response, Mapping)
+        or validated_receipt["request_sha256"] != request_sha256
+        or response.get("request_sha256") != request_sha256
+        or validated_receipt["worker_response_schema_version"]
+        != response.get("schema_version")
+    ):
+        raise ValueError("root-readout cache entry receipt binding is invalid")
+    return {
+        "path": str(entry.path),
+        "source_sha256": source_sha256,
+        "readout_identity_sha256": entry.readout_identity_sha256,
+        "request_sha256": request_sha256,
+        "runtime_identity_sha256": entry.runtime_identity_sha256,
+        "worker_response_receipt_sha256": validated_receipt["receipt_sha256"],
+    }
+
+
 def _candidate_like_solved_receipt(path: Path, value: object) -> bool:
     if _HEX_64.fullmatch(path.stem) is not None:
         return True
@@ -327,6 +362,7 @@ def recover_campaign(
     candidates: dict[str, list[_Candidate]] = {}
     ignored: list[dict[str, object]] = []
     source_artifacts: list[dict[str, object]] = []
+    root_readout_indices: list[dict[str, object]] = []
 
     for raw_path in source_checkpoints:
         path = Path(raw_path)
@@ -463,6 +499,12 @@ def recover_campaign(
         root = Path(raw_root)
         if root.exists() and not root.is_dir():
             raise ValueError(f"root-readout store is not a directory: {root}")
+        try:
+            entries = RootReadoutStore(root).entries()
+        except ValueError as error:
+            raise ValueError(
+                f"trusted root-readout store is corrupt: {root}: {error}"
+            ) from error
         source_artifacts.append(
             {
                 "kind": "root-readout-store",
@@ -470,10 +512,48 @@ def recover_campaign(
                 "status": "AVAILABLE" if root.is_dir() else "MISSING",
             }
         )
+        recovered_entries: list[dict[str, object]] = []
+        for entry in entries:
+            source_sha = _file_sha256(entry.path)
+            try:
+                recovered_entries.append(
+                    _root_readout_recovery_entry(
+                        entry=entry, source_sha256=source_sha
+                    )
+                )
+            except ValueError as error:
+                if "lacks a worker response receipt" in str(error):
+                    ignored.append(
+                        {
+                            "path": str(entry.path),
+                            "reason": "MISSING_WORKER_RESPONSE_RECEIPT",
+                        }
+                    )
+                    continue
+                raise ValueError(
+                    "trusted root-readout entry is corrupt: "
+                    f"{entry.path}: {error}"
+                ) from error
+            source_artifacts.append(
+                {
+                    "kind": "root-readout-entry",
+                    "path": str(entry.path),
+                    "sha256": source_sha,
+                }
+            )
+        if recovered_entries:
+            root_readout_indices.append(
+                {
+                    "schema": ROOT_READOUT_RECOVERY_INDEX_SCHEMA,
+                    "store_path": str(root),
+                    "entries": recovered_entries,
+                }
+            )
 
     candidate_checkpoint = empty_schema11_checkpoint(
         selection.campaign_id, selection.selection_id
     )
+    candidate_checkpoint["recovery_receipts"].extend(root_readout_indices)
     accepted_receipts: list[dict[str, object]] = []
     for leaf_id in selection.ordered_leaf_ids:
         leaf_candidates = candidates.get(leaf_id, [])
