@@ -199,6 +199,31 @@ def _abort_with_receipt(
     raise CampaignSystemFailure(message, receipt=receipt, checkpoint=durable)
 
 
+def abort_unexpected_system_failure(
+    checkpoint: Mapping[str, object],
+    *,
+    leaf_id: str,
+    error: Exception,
+    persist_checkpoint: Callable[[dict[str, object]], None],
+) -> None:
+    """Persist the last committed state and abort for an unexpected exception."""
+
+    material = {
+        "failure_code": "UNEXPECTED_SOFTWARE_ERROR",
+        "cause_type": type(error).__name__,
+        "message": str(error),
+    }
+    _abort_with_receipt(
+        checkpoint,
+        leaf_id=leaf_id,
+        failure_code="UNEXPECTED_SOFTWARE_ERROR",
+        cause_type=type(error).__name__,
+        message=str(error),
+        fingerprint_sha256=_sha256(material),
+        persist_checkpoint=persist_checkpoint,
+    )
+
+
 def run_guarded_pass(
     leaf_ids: Sequence[str],
     *,
@@ -269,6 +294,7 @@ __all__ = [
     "FailureDisposition",
     "FailureReport",
     "PROMOTION_ALLOWLIST",
+    "abort_unexpected_system_failure",
     "classify_failure",
     "run_guarded_pass",
 ]

@@ -2019,13 +2019,15 @@ def build_exterior_background_reuse_key(
     job: ResponseComponentJob,
     *,
     root_seal_sha256: str,
+    fixed_root: complex | None = None,
 ) -> ExteriorBackgroundReuseKey:
     if job.mechanism_id not in _EXTERIOR_PROFILE_IDS:
         raise ValueError("exterior background reuse requires an exterior job")
     contract = regularised_gsn_mechanism_contract(job.mechanism_id)
-    frequency_step = _BINARY64_FREQUENCY_STEP_SCALE * (
-        1.0 + abs(job.root.omega)
+    root = job.root.omega if fixed_root is None else _finite_complex(
+        fixed_root, "fixed root"
     )
+    frequency_step = _BINARY64_FREQUENCY_STEP_SCALE * (1.0 + abs(root))
     return ExteriorBackgroundReuseKey(
         root_seal_sha256=root_seal_sha256,
         root_identity=job.root.identity_sha256,
@@ -2200,11 +2202,14 @@ class BackgroundEquivalenceReceipt:
         reuse_key: ExteriorBackgroundReuseKey,
         job: ResponseComponentJob,
         canonical_background_sha256: str,
+        fixed_root: complex | None = None,
     ) -> "BackgroundEquivalenceReceipt":
         if job.mechanism_id not in _EXTERIOR_PROFILE_IDS:
             raise ValueError("background equivalence requires an exterior job")
         expected_key = build_exterior_background_reuse_key(
-            job, root_seal_sha256=reuse_key.root_seal_sha256
+            job,
+            root_seal_sha256=reuse_key.root_seal_sha256,
+            fixed_root=fixed_root,
         )
         if reuse_key != expected_key:
             raise ValueError("background equivalence reuse key mismatch")
@@ -2323,6 +2328,26 @@ class Binary64ReusedBackgroundBatch:
     def sample_count(self) -> int:
         return len(self.samples)
 
+    def to_mapping(self) -> dict[str, object]:
+        return {
+            "schema": "windows-solver.binary64-reused-background-batch/1",
+            "operation_identity": BINARY64_FIXED_ROOT_SURVEY_IDENTITY,
+            "leaf_id": self.leaf_id,
+            "job_id": self.job_id,
+            "mechanism_id": self.mechanism_id,
+            "fixed_root": _complex_mapping(self.fixed_root),
+            "branch_identity": self.branch_identity,
+            "coordinate_step": self.coordinate_step,
+            "support": self.support.to_mapping(),
+            "background_sha256": self.background_sha256,
+            "equivalence_receipt_sha256": self.equivalence_receipt_sha256,
+            "samples": [sample.to_mapping() for sample in self.samples],
+            "sample_count": self.sample_count,
+            "sample_limit": self.sample_limit,
+            "root_read_count": self.root_read_count,
+            "julia_launch_count": self.julia_launch_count,
+        }
+
 
 def exterior_background_reuse_admitted(
     job: ResponseComponentJob,
@@ -2340,6 +2365,7 @@ def exterior_background_reuse_admitted(
     expected_key = build_exterior_background_reuse_key(
         job,
         root_seal_sha256=background.reuse_key.root_seal_sha256,
+        fixed_root=background.fixed_root,
     )
     if (
         background.reuse_key != expected_key
@@ -2352,6 +2378,7 @@ def exterior_background_reuse_admitted(
         reuse_key=expected_key,
         job=job,
         canonical_background_sha256=background.sha256,
+        fixed_root=background.fixed_root,
     )
     return receipt.to_mapping() == expected_receipt.to_mapping()
 

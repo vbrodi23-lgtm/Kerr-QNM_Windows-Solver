@@ -1027,6 +1027,7 @@ class VettedNativeDeterminantKernel:
         expected_key = build_exterior_background_reuse_key(
             job,
             root_seal_sha256=background.reuse_key.root_seal_sha256,
+            fixed_root=background.fixed_root,
         )
         if background.reuse_key != expected_key:
             raise ValueError("background reuse key mismatch")
@@ -1041,6 +1042,7 @@ class VettedNativeDeterminantKernel:
             reuse_key=expected_key,
             job=job,
             canonical_background_sha256=background.sha256,
+            fixed_root=background.fixed_root,
         )
         if equivalence_receipt.to_mapping() != expected_receipt.to_mapping():
             raise ValueError("background equivalence proof mismatch")
