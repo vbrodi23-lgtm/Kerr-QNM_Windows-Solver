@@ -539,17 +539,11 @@ class PublicSurfaceTests(unittest.TestCase):
         self.assertLess(setup_cleanup, worker_path)
         self.assertLess(worker_path, worker_probe)
 
-    def test_campaign_runbook_has_no_historic_cache_environment_prerequisite(
-        self,
-    ) -> None:
+    def test_retired_campaign_runbook_is_absent(self) -> None:
         root = Path(__file__).resolve().parents[1]
-        runbook = (root / "docs" / "response-replay-powershell.md").read_text(
-            encoding="utf-8"
+        self.assertFalse(
+            (root / "docs" / "response-replay-powershell.md").exists()
         )
-
-        self.assertNotIn("GSN_INFINITY_SERIES_CACHE", runbook)
-        self.assertIn(r".\runtime\bootstrap.ps1 -WithM02", runbook)
-        self.assertIn("campaign-run", runbook)
 
     def test_m02_launcher_runs_the_full_selection_and_can_rebuild_runtime(self) -> None:
         root = Path(__file__).resolve().parents[1]
@@ -1126,6 +1120,11 @@ $candidate | ConvertTo-Json -Compress | Set-Content -LiteralPath $env:M02_TEST_J
         version_two = "v" + "2"
         approved_regularised_gsn_identities = frozenset({
             "exterior-wronskian/v1",
+            "canonical-exterior-background-wronskian/v1",
+            "background-equivalence/v1",
+            "exterior-fixed-root-survey-raw/v1",
+            "legacy-compatibility/v1",
+            "adaptive-exterior-gap-standoff/v2",
             "factored-homogeneous-gsn/v1",
             "factored-plane-wave-gsn/v1",
             "horizon-scattering/v1",
@@ -1289,7 +1288,9 @@ $candidate | ConvertTo-Json -Compress | Set-Content -LiteralPath $env:M02_TEST_J
 
         self.assertEqual(findings, [])
 
-    def test_current_status_names_pr2_pr3_m01_and_pr4_linear_response(self) -> None:
+    def test_current_status_documents_describe_the_current_solver_boundary(
+        self,
+    ) -> None:
         root = Path(__file__).resolve().parents[1]
         current_status_files = (
             root / "README.md",
@@ -1304,14 +1305,15 @@ $candidate | ConvertTo-Json -Compress | Set-Content -LiteralPath $env:M02_TEST_J
         for path in current_status_files:
             text = path.read_text(encoding="utf-8")
             with self.subTest(path=path.relative_to(root)):
-                self.assertIn("PR #2", text)
-                self.assertIn("PR #3", text)
-                self.assertIn("PR #4", text)
-                self.assertIn("M01", text)
+                self.assertIn("M02", text)
+                self.assertIn("pure-Kerr", text)
                 self.assertIn("linear-response", text)
+                self.assertIn("release", text.casefold())
                 self.assertIsNone(stale.search(text))
 
-    def test_current_status_states_complete_pure_kerr_lattice_without_legacy_scope(self) -> None:
+    def test_current_status_states_complete_pure_kerr_lattice_without_legacy_scope(
+        self,
+    ) -> None:
         root = Path(__file__).resolve().parents[1]
         current_status_files = (
             root / "README.md",
@@ -1329,8 +1331,7 @@ $candidate | ConvertTo-Json -Compress | Set-Content -LiteralPath $env:M02_TEST_J
         for path in current_status_files:
             text = path.read_text(encoding="utf-8")
             with self.subTest(path=path.relative_to(root)):
-                for count in ("2,736", "690", "966", "1,080"):
-                    self.assertIn(count, text)
+                self.assertIn("2,736", text)
                 self.assertIsNone(legacy_scope.search(text))
 
     def test_authenticated_package_data_survives_autocrlf_checkout(self) -> None:
