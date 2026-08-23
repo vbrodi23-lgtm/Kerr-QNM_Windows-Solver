@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+from contextlib import nullcontext
 import hashlib
 import io
 import json
@@ -9,6 +10,7 @@ import tempfile
 import time
 from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 from windows_solver.campaign_reports import (
     CampaignReportModel,
@@ -700,6 +702,64 @@ class CampaignReportTests(unittest.TestCase):
                 },
                 first_outputs,
             )
+
+    def test_basic_reports_survive_projective_and_triage_failures(self):
+        plan = self._plan()
+        leaf = plan.leaves[0]
+        record = self._produced_record(plan, leaf)
+        selection = build_campaign_selection(
+            plan, role="primary", leaf_ids=(leaf.leaf_id,)
+        )
+
+        for failure_kind in ("projective", "triage"):
+            with (
+                self.subTest(failure_kind=failure_kind),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                checkpoint = Path(temporary) / "checkpoint.json"
+                checkpoint.write_bytes(
+                    canonical_json_bytes(
+                        _checkpoint_mapping(plan, selection, (record,))
+                    )
+                )
+                triage = (
+                    (lambda _model, _directory: (_ for _ in ()).throw(
+                        RuntimeError("forced triage failure")
+                    ))
+                    if failure_kind == "triage"
+                    else None
+                )
+                projective_patch = (
+                    patch(
+                        "windows_solver.campaign_reports.reduce_projective_rows",
+                        side_effect=RuntimeError("forced projective failure"),
+                    )
+                    if failure_kind == "projective"
+                    else nullcontext()
+                )
+
+                with projective_patch:
+                    refresh_campaign_reports(
+                        plan,
+                        checkpoint,
+                        advanced_triage=triage,
+                    )
+
+                directory = Path(temporary) / "checkpoint.reports"
+                for name in (
+                    "m02-leaves.csv",
+                    "m02-precision-stages.csv",
+                    "m02-error-channels.csv",
+                    "m02-resource-failures.csv",
+                ):
+                    self.assertTrue((directory / name).is_file(), name)
+                status = json.loads(
+                    (directory / "m02-report-status.json").read_text()
+                )
+                self.assertEqual("COMPLETED", status["basic"]["status"])
+                self.assertEqual(
+                    "FAILED", status[failure_kind]["status"]
+                )
 
 
 if __name__ == "__main__":

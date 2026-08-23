@@ -16,8 +16,9 @@ import math
 import os
 from pathlib import Path
 import tempfile
-from typing import Mapping, Sequence
+from typing import Callable, Mapping, Sequence
 
+from .contracts import canonical_json_bytes
 from .response_batches import (
     CampaignLeafRecord,
     CampaignPlan,
@@ -245,6 +246,22 @@ RESOURCE_FAILURE_COLUMNS = (
     "attempt_sha256",
     "created_at_utc",
     "checkpoint_source_receipt",
+)
+
+PRECISION_STAGE_COLUMNS = (
+    "leaf_ordinal",
+    "leaf_id",
+    "stage_index",
+    "root",
+    "precision_digits",
+    "numerical_state",
+    "component_status",
+    "converged",
+    "branch_ok",
+    "determinant_abs",
+    "newton_correction",
+    "newton_correction_over_tolerance",
+    "root_displacement_abs",
 )
 
 
@@ -842,6 +859,7 @@ def project_campaign_reports(
     checkpoint_path: str | os.PathLike[str],
     *,
     run_provenance: Mapping[str, str] | None = None,
+    include_advanced: bool = True,
 ) -> CampaignReportModel:
     """Authenticate and normalize one committed checkpoint without changing it."""
 
@@ -881,6 +899,18 @@ def project_campaign_reports(
             source_receipt=source_receipt,
         )
     )
+    resource_failure_rows = _resource_failure_rows(
+        plan, summary, source_receipt=source_receipt
+    )
+    if not include_advanced:
+        return CampaignReportModel(
+            leaf_rows=leaf_rows,
+            precision_stage_rows=precision_stage_rows,
+            error_channel_rows=error_rows,
+            projective_rows=(),
+            resource_failure_rows=resource_failure_rows,
+            checkpoint_source_receipt=source_receipt,
+        )
 
     row_plans = build_projective_row_plans()
     projective_component_ids = {
@@ -992,9 +1022,6 @@ def project_campaign_reports(
         }
         for row_plan, result in zip(reduction.plans, reduction.results)
     )
-    resource_failure_rows = _resource_failure_rows(
-        plan, summary, source_receipt=source_receipt
-    )
     return CampaignReportModel(
         leaf_rows=leaf_rows,
         precision_stage_rows=precision_stage_rows,
@@ -1046,34 +1073,143 @@ def _atomic_csv(
         raise
 
 
+def _atomic_json(path: Path, value: object) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        dir=path.parent,
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+    )
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(canonical_json_bytes(value))
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_name, path)
+    except BaseException:
+        try:
+            os.unlink(temporary_name)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def _projection_status(
+    status: str, error: Exception | None = None
+) -> dict[str, object]:
+    return {
+        "status": status,
+        "error_type": None if error is None else type(error).__name__,
+        "message": None if error is None else str(error),
+    }
+
+
+def _write_report_status(
+    directory: Path,
+    checkpoint_source_receipt: str,
+    *,
+    basic: Mapping[str, object],
+    projective: Mapping[str, object],
+    triage: Mapping[str, object],
+) -> None:
+    content: dict[str, object] = {
+        "schema": "windows-solver.m02-report-status/v1",
+        "checkpoint_source_receipt": checkpoint_source_receipt,
+        "basic": dict(basic),
+        "projective": dict(projective),
+        "triage": dict(triage),
+    }
+    receipt = {
+        **content,
+        "receipt_sha256": hashlib.sha256(canonical_json_bytes(content)).hexdigest(),
+    }
+    _atomic_json(directory / "m02-report-status.json", receipt)
+
+
 def refresh_campaign_reports(
     plan: CampaignPlan,
     checkpoint_path: str | os.PathLike[str],
     *,
     run_provenance: Mapping[str, str] | None = None,
+    advanced_triage: Callable[[CampaignReportModel, Path], None] | None = None,
 ) -> CampaignReportModel:
-    """Atomically refresh all disposable CSV views beside a checkpoint."""
+    """Refresh basic reports first; contain projective and triage failures."""
 
-    model = project_campaign_reports(
-        plan,
-        checkpoint_path,
-        run_provenance=run_provenance,
-    )
     directory = report_directory_for_checkpoint(checkpoint_path)
-    _atomic_csv(directory / "m02-leaves.csv", LEAF_COLUMNS, model.leaf_rows)
-    _atomic_csv(
-        directory / "m02-error-channels.csv",
-        ERROR_CHANNEL_COLUMNS,
-        model.error_channel_rows,
+    try:
+        basic_model = project_campaign_reports(
+            plan,
+            checkpoint_path,
+            run_provenance=run_provenance,
+            include_advanced=False,
+        )
+        _atomic_csv(
+            directory / "m02-leaves.csv", LEAF_COLUMNS, basic_model.leaf_rows
+        )
+        _atomic_csv(
+            directory / "m02-precision-stages.csv",
+            PRECISION_STAGE_COLUMNS,
+            basic_model.precision_stage_rows,
+        )
+        _atomic_csv(
+            directory / "m02-error-channels.csv",
+            ERROR_CHANNEL_COLUMNS,
+            basic_model.error_channel_rows,
+        )
+        _atomic_csv(
+            directory / "m02-resource-failures.csv",
+            RESOURCE_FAILURE_COLUMNS,
+            basic_model.resource_failure_rows,
+        )
+    except Exception as error:
+        checkpoint_bytes = Path(checkpoint_path).read_bytes()
+        source_receipt = "sha256:" + hashlib.sha256(checkpoint_bytes).hexdigest()
+        _write_report_status(
+            directory,
+            source_receipt,
+            basic=_projection_status("FAILED", error),
+            projective=_projection_status("NOT_RUN"),
+            triage=_projection_status("NOT_RUN"),
+        )
+        raise
+
+    basic_status = _projection_status("COMPLETED")
+    projective_status = _projection_status("NOT_RUN")
+    triage_status = _projection_status(
+        "NOT_CONFIGURED" if advanced_triage is None else "NOT_RUN"
     )
-    _atomic_csv(
-        directory / "m02-projective.csv",
-        PROJECTIVE_COLUMNS,
-        model.projective_rows,
-    )
-    _atomic_csv(
-        directory / "m02-resource-failures.csv",
-        RESOURCE_FAILURE_COLUMNS,
-        model.resource_failure_rows,
+    model = basic_model
+    try:
+        advanced_model = project_campaign_reports(
+            plan,
+            checkpoint_path,
+            run_provenance=run_provenance,
+            include_advanced=True,
+        )
+        _atomic_csv(
+            directory / "m02-projective.csv",
+            PROJECTIVE_COLUMNS,
+            advanced_model.projective_rows,
+        )
+        model = advanced_model
+        projective_status = _projection_status("COMPLETED")
+    except Exception as error:
+        projective_status = _projection_status("FAILED", error)
+
+    if advanced_triage is not None and projective_status["status"] == "COMPLETED":
+        try:
+            advanced_triage(model, directory)
+            triage_status = _projection_status("COMPLETED")
+        except Exception as error:
+            triage_status = _projection_status("FAILED", error)
+    elif advanced_triage is not None:
+        triage_status = _projection_status("NOT_RUN")
+
+    _write_report_status(
+        directory,
+        basic_model.checkpoint_source_receipt,
+        basic=basic_status,
+        projective=projective_status,
+        triage=triage_status,
     )
     return model
