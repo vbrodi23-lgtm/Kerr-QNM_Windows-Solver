@@ -769,9 +769,6 @@ function flatten_request(document)
     angular = required(document, "angular_A")
     amplitude = required(document, "amplitude")
     policy = required(document, "policy")
-    policy isa AbstractDict && Set(keys(policy)) ==
-        FIXED_ROOT_SURVEY_POLICY_FIELDS ||
-        error("fixed-root survey policy fields are invalid")
     execution_resource = required(document, "execution_resource")
     mechanism = string(required(document, "mechanism_id"))
     mechanism in ALLOWED_MECHANISMS ||
@@ -7688,6 +7685,9 @@ function flatten_fixed_root_survey_request(document)
     angular = required(document, "angular_A")
     fixed_root = required(document, "fixed_root")
     policy = required(document, "policy")
+    policy isa AbstractDict && Set(keys(policy)) ==
+        FIXED_ROOT_SURVEY_POLICY_FIELDS ||
+        error("fixed-root survey policy fields are invalid")
     resource = required(document, "execution_resource")
     request = Dict{String,Any}(
         "schema_version" => required(document, "schema_version"),

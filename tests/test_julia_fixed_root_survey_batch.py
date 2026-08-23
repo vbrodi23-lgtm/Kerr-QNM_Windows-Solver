@@ -269,6 +269,29 @@ class JuliaFixedRootSurveyBatchTests(unittest.TestCase):
             self.assertNotIn(prohibited, body)
         self.assertIn("raw_determinant_progress", body)
 
+    def test_fixed_root_policy_shape_is_checked_only_by_fixed_root_parser(self):
+        worker = (
+            Path(__file__).parents[1]
+            / "src/windows_solver/data/julia/m02_worker.jl"
+        ).read_text(encoding="utf-8")
+        promoted_start = worker.index("function flatten_request(document)")
+        promoted_end = worker.index(
+            "\nfunction flatten_fixed_root_survey_request", promoted_start
+        )
+        fixed_start = promoted_end
+        fixed_end = worker.index(
+            "\nfunction validate_fixed_root_survey_policy", fixed_start
+        )
+
+        self.assertNotIn(
+            "FIXED_ROOT_SURVEY_POLICY_FIELDS",
+            worker[promoted_start:promoted_end],
+        )
+        self.assertIn(
+            "FIXED_ROOT_SURVEY_POLICY_FIELDS",
+            worker[fixed_start:fixed_end],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
