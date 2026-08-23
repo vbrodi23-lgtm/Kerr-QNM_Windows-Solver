@@ -187,6 +187,19 @@ class SolvedLeafStore:
     def lookup(
         self, scientific_identity_sha256: str, leaf_id: str
     ) -> SolvedLeafLookup:
+        lookup = self.lookup_readonly(scientific_identity_sha256, leaf_id)
+        if (
+            lookup.status is SolvedLeafLookupStatus.CORRUPT
+            and lookup.path is not None
+        ):
+            self.quarantine(lookup.path, str(lookup.reason))
+        return lookup
+
+    def lookup_readonly(
+        self, scientific_identity_sha256: str, leaf_id: str
+    ) -> SolvedLeafLookup:
+        """Inspect one cache identity without moving or rewriting any source file."""
+
         path = self._entry_path(scientific_identity_sha256)
         if path.exists():
             try:
@@ -198,7 +211,6 @@ class SolvedLeafStore:
                 ):
                     raise ValueError("solved-leaf cache object identity is invalid")
             except (OSError, ValueError) as error:
-                self.quarantine(path, str(error))
                 return SolvedLeafLookup(
                     SolvedLeafLookupStatus.CORRUPT,
                     path=path,
