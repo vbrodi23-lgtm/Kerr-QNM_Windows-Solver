@@ -7858,6 +7858,23 @@ def _validate_cacheable_leaf_record(
         )
 
 
+def validate_campaign_recovery_record(
+    plan: CampaignPlan,
+    leaf_id: str,
+    value: Mapping[str, object],
+) -> None:
+    """Authenticate one terminal recovery candidate against the current plan."""
+
+    leaf_by_id = {leaf.leaf_id: leaf for leaf in plan.leaves}
+    leaf = leaf_by_id.get(leaf_id)
+    if leaf is None:
+        raise ValueError("recovery record is outside the campaign plan")
+    record = CampaignLeafRecord.from_mapping(value)
+    if record.to_mapping() != value:
+        raise ValueError("recovery record is not canonical")
+    _validate_cacheable_leaf_record(plan, leaf, record)
+
+
 def _authenticate_solved_leaf_hit(
     plan: CampaignPlan,
     leaf: CampaignLeafPlan,

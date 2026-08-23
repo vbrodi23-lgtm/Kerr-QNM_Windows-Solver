@@ -16,6 +16,12 @@ from typing import Mapping, Sequence
 from .artifacts import ArtifactStore, ArtifactVerificationError
 from .builtin import default_registry
 from .contracts import canonical_json_bytes, load_study
+from .campaign_recovery import (
+    RecoverySelection,
+    recover_campaign,
+    validate_recovery_checkpoint,
+    validate_recovery_receipt,
+)
 from .engine import ExecutionEngine, RunRecord, verify_run_integrity
 from .evidence_intake import load_evidence_bundle
 from .linear_response_admission import (
@@ -62,6 +68,8 @@ from .response_batches import (
     resolve_campaign_relative_path,
     run_campaign_selection,
     run_predeclared_campaign_smoke,
+    scientific_computation_identity_sha256,
+    validate_campaign_recovery_record,
     validate_campaign_checkpoint,
     worker_failure_payload,
 )
@@ -249,6 +257,32 @@ def build_parser() -> argparse.ArgumentParser:
     campaign_import.add_argument("selection", type=Path)
     campaign_import.add_argument("--checkpoint", type=Path, required=True)
     campaign_import.add_argument("--store", type=Path)
+    campaign_recover = commands.add_parser(
+        "campaign-recover",
+        help="recover compatible terminal records without numerical work",
+    )
+    campaign_recover.add_argument("selection", type=Path)
+    campaign_recover.add_argument("--output", type=Path, required=True)
+    campaign_recover.add_argument("--receipt", type=Path, required=True)
+    campaign_recover.add_argument(
+        "--source-checkpoint", type=Path, action="append", default=[]
+    )
+    campaign_recover.add_argument(
+        "--solved-leaf-store", type=Path, action="append", default=[]
+    )
+    campaign_recover.add_argument(
+        "--root-readout-store", type=Path, action="append", default=[]
+    )
+    campaign_recover.add_argument("--oracle", type=Path)
+    campaign_recovery_validate = commands.add_parser(
+        "campaign-recovery-validate",
+        help="validate a schema-11 recovery candidate without numerical work",
+    )
+    campaign_recovery_validate.add_argument("selection", type=Path)
+    campaign_recovery_validate.add_argument(
+        "--checkpoint", type=Path, required=True
+    )
+    campaign_recovery_validate.add_argument("--receipt", type=Path)
     campaign_reduce = commands.add_parser(
         "campaign-reduce",
         help="reduce authenticated campaign checkpoints without backend work",
@@ -829,6 +863,99 @@ def _campaign_cache_import(
     return 0, {"command": "campaign-cache-import", **summary.to_mapping()}
 
 
+def _campaign_recover(
+    selection_path: Path,
+    output_path: Path,
+    receipt_path: Path,
+    *,
+    source_checkpoints: Sequence[Path],
+    solved_leaf_stores: Sequence[Path],
+    root_readout_stores: Sequence[Path],
+    oracle_path: Path | None,
+) -> tuple[int, object]:
+    plan, selection, _descriptor = _campaign_plan_and_selection(selection_path)
+    recovery_selection = _campaign_recovery_selection(plan, selection)
+    resolved_output = _resolve_recovery_path(output_path)
+    resolved_receipt = _resolve_recovery_path(receipt_path)
+    summary = recover_campaign(
+        recovery_selection,
+        output_path=resolved_output,
+        receipt_path=resolved_receipt,
+        source_checkpoints=tuple(
+            _resolve_recovery_path(path) for path in source_checkpoints
+        ),
+        solved_leaf_stores=tuple(
+            _resolve_recovery_path(path) for path in solved_leaf_stores
+        ),
+        root_readout_stores=tuple(
+            _resolve_recovery_path(path) for path in root_readout_stores
+        ),
+        oracle_path=(
+            None if oracle_path is None else _resolve_recovery_path(oracle_path)
+        ),
+        record_validator=lambda leaf_id, record: validate_campaign_recovery_record(
+            plan, leaf_id, record
+        ),
+    )
+    return 0, {"command": "campaign-recover", **summary.to_mapping()}
+
+
+def _campaign_recovery_selection(plan, selection) -> RecoverySelection:
+    leaf_by_id = {leaf.leaf_id: leaf for leaf in plan.leaves}
+    return RecoverySelection(
+        campaign_id=plan.campaign_id,
+        selection_id=selection.selection_id,
+        ordered_leaf_ids=tuple(selection.leaf_ids),
+        roles={leaf_id: leaf_by_id[leaf_id].role for leaf_id in selection.leaf_ids},
+        scientific_identities={
+            leaf_id: scientific_computation_identity_sha256(
+                plan, leaf_by_id[leaf_id]
+            )
+            for leaf_id in selection.leaf_ids
+        },
+    )
+
+
+def _resolve_recovery_path(path: Path) -> Path:
+    expanded = path.expanduser()
+    return (
+        expanded.resolve()
+        if expanded.is_absolute()
+        else (Path.cwd() / expanded).resolve()
+    )
+
+
+def _campaign_recovery_validate(
+    selection_path: Path,
+    checkpoint_path: Path,
+    receipt_path: Path | None = None,
+) -> tuple[int, object]:
+    plan, selection, _descriptor = _campaign_plan_and_selection(selection_path)
+    recovery_selection = _campaign_recovery_selection(plan, selection)
+    checkpoint = validate_recovery_checkpoint(
+        recovery_selection,
+        _resolve_recovery_path(checkpoint_path),
+        record_validator=lambda leaf_id, record: validate_campaign_recovery_record(
+            plan, leaf_id, record
+        ),
+    )
+    if receipt_path is not None:
+        validate_recovery_receipt(
+            recovery_selection,
+            _resolve_recovery_path(checkpoint_path),
+            _resolve_recovery_path(receipt_path),
+        )
+    return 0, {
+        "command": "campaign-recovery-validate",
+        "campaign_id": recovery_selection.campaign_id,
+        "selection_id": recovery_selection.selection_id,
+        "state": checkpoint["state"],
+        "result_count": len(checkpoint["records"]),
+        "checkpoint_path": str(_resolve_recovery_path(checkpoint_path)),
+        "release_admissible": False,
+    }
+
+
 def _campaign_console_mapping(
     command: str, summary: CampaignRunSummary
 ) -> dict[str, object]:
@@ -1163,6 +1290,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         elif arguments.command == "campaign-cache-import":
             status, output = _campaign_cache_import(
                 arguments.selection, arguments.checkpoint, arguments.store
+            )
+        elif arguments.command == "campaign-recover":
+            status, output = _campaign_recover(
+                arguments.selection,
+                arguments.output,
+                arguments.receipt,
+                source_checkpoints=arguments.source_checkpoint,
+                solved_leaf_stores=arguments.solved_leaf_store,
+                root_readout_stores=arguments.root_readout_store,
+                oracle_path=arguments.oracle,
+            )
+        elif arguments.command == "campaign-recovery-validate":
+            status, output = _campaign_recovery_validate(
+                arguments.selection, arguments.checkpoint, arguments.receipt
             )
         elif arguments.command == "campaign-reduce":
             status, output = _campaign_reduce(arguments.bundle, arguments.output)
