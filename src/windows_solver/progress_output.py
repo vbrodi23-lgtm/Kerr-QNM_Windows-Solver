@@ -350,6 +350,600 @@ def _json_value(value: object) -> object:
     return repr(value)
 
 
+class CleanTailDashboard:
+    """Append-only completed rows plus one carriage-return live line.
+
+    The renderer deliberately owns no scientific decisions.  It accepts an
+    authenticated checkpoint projection and never selects rows by terminal
+    height, so short consoles retain the same durable history as tall ones.
+    """
+
+    _FULL_COLUMNS = (
+        ("TIME", 5),
+        ("LEAF", 8),
+        ("MODE", 4),
+        ("SPIN", 5),
+        ("MECHANISM", 9),
+        ("PASS", 4),
+        ("EVIDENCE", 8),
+        ("PREC", 4),
+        ("f64", 4),
+        ("BF40", 4),
+        ("BF80", 4),
+        ("BF120", 5),
+        ("TOTAL", 5),
+        ("|RESPONSE|", 10),
+        ("REL.ERROR", 9),
+        ("STATE", 7),
+    )
+    _COMPACT_COLUMNS = (
+        ("T", 4),
+        ("LEAF", 8),
+        ("M", 3),
+        ("a", 4),
+        ("MECH", 6),
+        ("P", 3),
+        ("EV", 3),
+        ("PR", 3),
+        ("TOT", 5),
+        ("|R|", 7),
+        ("ERR", 7),
+        ("STATE", 7),
+    )
+
+    def __init__(
+        self,
+        stream: TextIO,
+        *,
+        width: int | None = None,
+        ansi: bool = False,
+    ) -> None:
+        self.stream = stream
+        self.width = max(1, width or self._stream_width(stream))
+        self.ansi = bool(ansi)
+        self._started = False
+        self._emitted_leaf_ids: set[str] = set()
+        self._live_text = ""
+
+    @staticmethod
+    def _stream_width(stream: TextIO) -> int:
+        try:
+            return max(1, os.get_terminal_size(stream.fileno()).columns)
+        except (AttributeError, OSError, ValueError):
+            return 120
+
+    @property
+    def compact(self) -> bool:
+        return self.width < 108
+
+    def start(
+        self,
+        historical_rows: tuple[Mapping[str, object], ...]
+        | list[Mapping[str, object]],
+        *,
+        counts: Mapping[str, object],
+        profile: str | None = None,
+        pass_name: str | None = None,
+        report_status: Mapping[str, object] | None = None,
+    ) -> None:
+        if self._started:
+            return
+        self._started = True
+        banner = "=" * 108
+        self._line(banner)
+        self._line("  M02 | DASHBOARD")
+        self._line(banner)
+        summary = " ".join(
+            f"{name.upper()}={counts[name]}" for name in sorted(counts)
+        )
+        qualifiers = " ".join(
+            part
+            for part in (
+                None if profile is None else f"PROFILE={profile}",
+                None if pass_name is None else f"PASS={pass_name}",
+            )
+            if part is not None
+        )
+        self._line(" ".join(part for part in (summary, qualifiers) if part))
+        if report_status:
+            status = " ".join(
+                f"{name}={value}" for name, value in report_status.items()
+            )
+            self._line(f"REPORTS {status}")
+        self._line(self._header())
+        for row in historical_rows:
+            self.complete(row)
+
+    def live(self, state: Mapping[str, object]) -> None:
+        if not self._started:
+            self.start((), counts={})
+        labels = {
+            "elapsed": "T" if self.compact else "TIME",
+            "counts": "C" if self.compact else "COUNTS",
+            "leaf": "L" if self.compact else "LEAF",
+            "profile": "PF" if self.compact else "PROFILE",
+            "pass": "P" if self.compact else "PASS",
+            "root": "R" if self.compact else "ROOT",
+            "mechanism": "M" if self.compact else "MECH",
+            "tier": "D" if self.compact else "TIER",
+            "phase": "PH" if self.compact else "PHASE",
+            "sample": "S" if self.compact else "SAMPLE",
+            "root_reads": "RR" if self.compact else "ROOTS",
+            "metric": "X" if self.compact else "METRIC",
+            "suboperation": "OP" if self.compact else "SUBOP",
+            "timing": "DT" if self.compact else "TIMING",
+            "last_activity_age": "AGE",
+        }
+        ordered = tuple(labels)
+        parts = [
+            f"{labels[name]}={self._plain(state[name])}"
+            for name in ordered
+            if state.get(name) is not None
+        ]
+        self._live_text = self._clip(" ".join(parts))
+        self.stream.write("\r" + self._live_text.ljust(self.width))
+        self.stream.flush()
+
+    def complete(self, row: Mapping[str, object]) -> None:
+        leaf_id = row.get("leaf_id")
+        if not isinstance(leaf_id, str) or not leaf_id:
+            raise ValueError("clean-tail completed row requires leaf_id")
+        if leaf_id in self._emitted_leaf_ids:
+            return
+        if not self._started:
+            self.start((), counts={})
+        prior_live = self._live_text
+        if prior_live:
+            self.stream.write("\r" + (" " * self.width) + "\r")
+        self.stream.write(self._clip(self._row(row)) + "\n")
+        self._emitted_leaf_ids.add(leaf_id)
+        if prior_live:
+            self.stream.write("\r" + prior_live.ljust(self.width))
+        self.stream.flush()
+
+    def finish_live(self) -> None:
+        if not self._live_text:
+            return
+        self.stream.write("\r" + self._live_text.ljust(self.width) + "\n")
+        self.stream.flush()
+        self._live_text = ""
+
+    def _line(self, value: str) -> None:
+        self.stream.write(self._clip(value) + "\n")
+
+    def _clip(self, value: str) -> str:
+        if len(value) <= self.width:
+            return value
+        if self.width == 1:
+            return "…"
+        return value[: self.width - 1] + "…"
+
+    @staticmethod
+    def _plain(value: object) -> str:
+        if value is None:
+            return "-"
+        if isinstance(value, float):
+            return format(value, ".4g")
+        return str(value).replace("\r", " ").replace("\n", " ")
+
+    @classmethod
+    def _cell(cls, value: object, width: int) -> str:
+        text = cls._plain(value)
+        if len(text) > width:
+            text = text[: max(0, width - 1)] + "~"
+        return text.ljust(width)
+
+    def _header(self) -> str:
+        columns = self._COMPACT_COLUMNS if self.compact else self._FULL_COLUMNS
+        return " ".join(self._cell(name, width) for name, width in columns).rstrip()
+
+    @staticmethod
+    def _seconds(row: Mapping[str, object], name: str) -> object:
+        value = row.get(name)
+        if value is None:
+            return "-"
+        prefix = "~" if row.get("reconstructed_timing") else ""
+        try:
+            return prefix + format(float(value), ".2f")
+        except (TypeError, ValueError, OverflowError):
+            return prefix + str(value)
+
+    def _row(self, row: Mapping[str, object]) -> str:
+        values = {
+            "TIME": row.get("completed_time", row.get("time", "-")),
+            "LEAF": row["leaf_id"],
+            "MODE": row.get("mode", "-"),
+            "SPIN": row.get("spin_or_Mkappa", row.get("spin", "-")),
+            "MECHANISM": row.get("mechanism", row.get("mechanism_id", "-")),
+            "PASS": row.get("survey_pass", row.get("pass", "-")),
+            "EVIDENCE": row.get("evidence_level", "-"),
+            "PREC": row.get("precision_tier", row.get("precision_digits", "-")),
+            "f64": self._seconds(row, "binary64_seconds"),
+            "BF40": self._seconds(row, "bf40_seconds"),
+            "BF80": self._seconds(row, "bf80_seconds"),
+            "BF120": self._seconds(row, "bf120_seconds"),
+            "TOTAL": self._seconds(row, "total_leaf_seconds"),
+            "|RESPONSE|": row.get("response_magnitude", "-"),
+            "REL.ERROR": row.get("relative_disk_radius", row.get("relative_error", "-")),
+            "STATE": row.get("terminal_state", row.get("state", "-")),
+        }
+        if self.compact:
+            compact_values = {
+                "T": values["TIME"],
+                "LEAF": values["LEAF"],
+                "M": values["MODE"],
+                "a": values["SPIN"],
+                "MECH": values["MECHANISM"],
+                "P": values["PASS"],
+                "EV": values["EVIDENCE"],
+                "PR": values["PREC"],
+                "TOT": values["TOTAL"],
+                "|R|": values["|RESPONSE|"],
+                "ERR": values["REL.ERROR"],
+                "STATE": values["STATE"],
+            }
+            columns = self._COMPACT_COLUMNS
+            return " ".join(
+                self._cell(compact_values[name], width) for name, width in columns
+            ).rstrip()
+        return " ".join(
+            self._cell(values[name], width) for name, width in self._FULL_COLUMNS
+        ).rstrip()
+
+
+def schema11_dashboard_snapshot(
+    checkpoint: Mapping[str, object],
+    *,
+    leaf_metadata: Mapping[str, Mapping[str, object]] | None = None,
+) -> tuple[tuple[dict[str, object], ...], dict[str, int], dict[str, object]]:
+    """Project authenticated schema-11 state without consulting reports."""
+
+    from .campaign_policy import validate_schema11_checkpoint
+
+    value = validate_schema11_checkpoint(checkpoint)
+    metadata = leaf_metadata or {}
+    binary = value["survey_pass_ledger"]["binary64"]
+    promoted = value["survey_pass_ledger"]["promoted"]
+    evidence = value["evidence_ledger"]
+    records = tuple(value["records"])
+    rows: list[dict[str, object]] = []
+    for ordinal, record in enumerate(records, start=1):
+        leaf_id = str(record["leaf_id"])
+        if record["state"] == "IN_PROGRESS":
+            continue
+        pass_name = "promoted" if leaf_id in promoted else "binary64"
+        pass_entry = promoted.get(leaf_id) or binary.get(leaf_id) or {}
+        tier_seconds = {
+            str(item.get("tier")): item.get("elapsed_seconds", 0.0)
+            for item in pass_entry.get("tier_timing", ())
+            if isinstance(item, Mapping)
+        }
+        fragments = pass_entry.get("session_fragments", ())
+        reconstructed = bool(
+            isinstance(fragments, list)
+            and any(
+                isinstance(item, Mapping)
+                and item.get("source") == "RECONSTRUCTED"
+                for item in fragments
+            )
+        )
+        details = dict(metadata.get(leaf_id, {}))
+        evidence_entry = evidence.get(leaf_id, {})
+        details.update(
+            {
+                "leaf_id": leaf_id,
+                "leaf_ordinal": details.get("leaf_ordinal", ordinal),
+                "survey_pass": pass_name,
+                "evidence_level": evidence_entry.get("evidence_level", "-"),
+                "precision_tier": _latest_precision_tier(record),
+                "binary64_seconds": tier_seconds.get("binary64", 0.0),
+                "bf40_seconds": tier_seconds.get("BF40", 0.0),
+                "bf80_seconds": tier_seconds.get("BF80", 0.0),
+                "bf120_seconds": tier_seconds.get("BF120", 0.0),
+                "total_leaf_seconds": sum(
+                    _finite_seconds(item) for item in tier_seconds.values()
+                ),
+                "response_magnitude": _record_response_magnitude(record),
+                "relative_disk_radius": _record_relative_error(record),
+                "terminal_state": record["state"],
+                "reconstructed_timing": reconstructed,
+            }
+        )
+        rows.append(details)
+    dispositions = tuple(binary.values()) + tuple(promoted.values())
+    counts = {
+        "completed": len(rows),
+        "queued": sum(
+            1
+            for item in value["promotion_queue"]["entries"]
+            if item.get("disposition") == "PENDING"
+        ),
+        "deferred": sum(
+            1 for item in dispositions if item.get("disposition") == "DEFERRED"
+        ),
+        "unresolved": sum(
+            1 for item in dispositions if item.get("disposition") == "UNRESOLVED"
+        ),
+        "rejected": sum(
+            1 for item in dispositions if item.get("disposition") == "REJECTED"
+        ),
+        "system_failures": len(value["system_failures"]),
+    }
+    report = value.get("report_status_receipt")
+    report_status: dict[str, object] = {}
+    if isinstance(report, Mapping):
+        for name in ("basic", "projective", "triage"):
+            item = report.get(name)
+            report_status[name] = (
+                item.get("status", "UNKNOWN") if isinstance(item, Mapping) else "UNKNOWN"
+            )
+    return tuple(rows), counts, report_status
+
+
+def _finite_seconds(value: object) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return 0.0
+    return number if math.isfinite(number) and number >= 0.0 else 0.0
+
+
+def _latest_precision_tier(record: Mapping[str, object]) -> object:
+    stages = record.get("stages")
+    if not isinstance(stages, list) or not stages:
+        return "-"
+    stage = stages[-1]
+    if not isinstance(stage, Mapping):
+        return "-"
+    return stage.get("precision_tier", stage.get("digits", "-"))
+
+
+def _record_component_result(record: Mapping[str, object]) -> Mapping[str, object]:
+    stages = record.get("stages")
+    if not isinstance(stages, list):
+        return {}
+    for stage in reversed(stages):
+        if not isinstance(stage, Mapping):
+            continue
+        candidates = (stage, stage.get("outcome"))
+        for candidate in candidates:
+            if not isinstance(candidate, Mapping):
+                continue
+            component = candidate.get("component_result")
+            if isinstance(component, Mapping):
+                return component
+    return {}
+
+
+def _record_response_magnitude(record: Mapping[str, object]) -> object:
+    component = _record_component_result(record)
+    direct = component.get("response_magnitude")
+    if direct is not None:
+        return direct
+    response = component.get("response")
+    if isinstance(response, Mapping):
+        try:
+            return abs(complex(float(response["real"]), float(response["imaginary"])))
+        except (KeyError, TypeError, ValueError, OverflowError):
+            return "-"
+    return "-"
+
+
+def _record_relative_error(record: Mapping[str, object]) -> object:
+    component = _record_component_result(record)
+    for name in ("relative_disk_radius", "relative_error"):
+        if component.get(name) is not None:
+            return component[name]
+    return "-"
+
+
+class Schema11ProgressReporter:
+    """Drive the PR65 clean-tail view from typed progress and checkpoint state."""
+
+    def __init__(
+        self,
+        checkpoint: Path | str,
+        *,
+        leaf_metadata: Mapping[str, Mapping[str, object]] | None = None,
+        profile: str = "survey",
+        pass_name: str | None = None,
+        stream: TextIO | None = None,
+        width: int | None = None,
+        mode: ProgressMode | str = ProgressMode.NORMAL,
+    ) -> None:
+        self.checkpoint = Path(checkpoint)
+        self.leaf_metadata = dict(leaf_metadata or {})
+        self.profile = profile
+        self.pass_name = pass_name
+        self.mode = ProgressMode(mode)
+        self.stream = stream or sys.stdout
+        self.dashboard = (
+            None
+            if self.mode is ProgressMode.QUIET
+            else CleanTailDashboard(self.stream, width=width, ansi=False)
+        )
+        self.diagnostics: list[str] = []
+        self._live: dict[str, object] = {
+            "profile": profile,
+            "pass": pass_name,
+        }
+        self._counts: dict[str, int] = {}
+        self._start_from_checkpoint()
+        self._write_status(None)
+
+    def _load(self) -> Mapping[str, object] | None:
+        if not self.checkpoint.is_file():
+            return None
+        value = json.loads(self.checkpoint.read_text(encoding="utf-8"))
+        if not isinstance(value, Mapping):
+            raise ValueError("schema-11 progress checkpoint is not an object")
+        return value
+
+    def _snapshot(self):
+        value = self._load()
+        if value is None:
+            return (), {}, {}
+        return schema11_dashboard_snapshot(
+            value, leaf_metadata=self.leaf_metadata
+        )
+
+    def _start_from_checkpoint(self) -> None:
+        try:
+            rows, counts, report_status = self._snapshot()
+            self._counts = dict(counts)
+            if self.dashboard is not None:
+                self.dashboard.start(
+                    rows,
+                    counts=counts,
+                    profile=self.profile,
+                    pass_name=self.pass_name,
+                    report_status=report_status,
+                )
+        except Exception as error:
+            self.diagnostics.append(f"{type(error).__name__}: {error}")
+            if self.dashboard is not None:
+                self.dashboard.start(
+                    (),
+                    counts={"checkpoint": "UNAVAILABLE"},
+                    profile=self.profile,
+                    pass_name=self.pass_name,
+                    report_status={"basic": "DEGRADED"},
+                )
+
+    def publish(self, event: ProgressEvent) -> None:
+        try:
+            context = event.context.to_mapping()
+            payload = dict(event.payload)
+            leaf_index = context.get("leaf_index")
+            leaf_count = context.get("leaf_count")
+            self._live.update(
+                {
+                    "elapsed": f"{event.monotonic_seconds:.1f}s",
+                    "counts": _count_text(self._counts),
+                    "leaf": (
+                        None
+                        if leaf_index is None
+                        else f"{leaf_index}/{leaf_count or '?'}"
+                    ),
+                    "profile": context.get("execution_profile", self.profile),
+                    "pass": context.get("survey_pass", self.pass_name),
+                    "root": context.get("root_phase"),
+                    "mechanism": context.get("mechanism_id"),
+                    "tier": context.get("precision_tier"),
+                    "phase": context.get("phase", event.kind.value),
+                    "sample": _ratio(
+                        context.get("sample_count_used"),
+                        context.get("sample_count_limit"),
+                    ),
+                    "root_reads": _ratio(
+                        context.get("root_read_count"),
+                        context.get("root_read_limit"),
+                    ),
+                    "metric": payload.get(
+                        "current_metric", payload.get("determinant_abs")
+                    ),
+                    "suboperation": context.get("suboperation"),
+                    "timing": context.get("total_leaf_seconds"),
+                    "last_activity_age": payload.get("last_activity_age_seconds"),
+                }
+            )
+            if event.kind is ProgressEventKind.LEAF_PASS_DISPOSITION_RECORDED:
+                rows, counts, _status = self._snapshot()
+                self._counts = dict(counts)
+                leaf_id = context.get("leaf_id")
+                for row in rows:
+                    if row["leaf_id"] == leaf_id:
+                        if self.dashboard is not None:
+                            self.dashboard.complete(row)
+                        break
+            elif event.kind in {
+                ProgressEventKind.CAMPAIGN_PASS_COMPLETED,
+                ProgressEventKind.CAMPAIGN_COMPLETED,
+                ProgressEventKind.CAMPAIGN_FAILED,
+                ProgressEventKind.CAMPAIGN_INTERRUPTED,
+                ProgressEventKind.SYSTEM_FAILURE_RECORDED,
+            }:
+                if self.dashboard is not None:
+                    self.dashboard.finish_live()
+            elif self.dashboard is not None:
+                self.dashboard.live(self._live)
+            self._write_status(event)
+        except Exception as error:
+            self.diagnostics.append(f"{type(error).__name__}: {error}")
+
+    def close(self) -> None:
+        if self.dashboard is not None:
+            self.dashboard.finish_live()
+        self._write_status(None)
+
+    def _write_status(self, event: ProgressEvent | None) -> None:
+        path = Path(f"{self.checkpoint}.status.json")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        rows, counts, reports = self._snapshot()
+        status = {
+            "schema": "windows-solver.schema11-progress-status/1",
+            "checkpoint_path": str(self.checkpoint),
+            "profile": self.profile,
+            "survey_pass": self.pass_name,
+            "counts": counts,
+            "report_status": reports,
+            "completed_leaf_ids": [row["leaf_id"] for row in rows],
+            "live_execution": dict(self._live),
+            "last_event": (
+                None if event is None else {
+                    "kind": event.kind.value,
+                    "context": event.context.to_mapping(),
+                    "payload": dict(event.payload),
+                    "monotonic_seconds": event.monotonic_seconds,
+                }
+            ),
+            "diagnostics": list(self.diagnostics),
+            "updated_at_utc": datetime.now(timezone.utc).isoformat(),
+        }
+        encoded = json.dumps(
+            _json_value(status),
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        descriptor, temporary_name = tempfile.mkstemp(
+            dir=path.parent, prefix=f".{path.name}.", suffix=".tmp"
+        )
+        try:
+            with os.fdopen(descriptor, "wb") as temporary:
+                temporary.write(encoded)
+                temporary.flush()
+                os.fsync(temporary.fileno())
+            os.replace(temporary_name, path)
+        except BaseException:
+            try:
+                os.unlink(temporary_name)
+            except FileNotFoundError:
+                pass
+            raise
+
+
+def _ratio(numerator: object, denominator: object) -> str | None:
+    if numerator is None and denominator is None:
+        return None
+    return f"{numerator if numerator is not None else '-'}/{denominator if denominator is not None else '-'}"
+
+
+def _count_text(counts: Mapping[str, object]) -> str:
+    labels = {
+        "completed": "done",
+        "queued": "queue",
+        "deferred": "defer",
+        "unresolved": "unres",
+        "rejected": "reject",
+        "system_failures": "sysfail",
+    }
+    return "/".join(
+        f"{labels[name]}:{counts[name]}" for name in labels if name in counts
+    )
+
+
 class CampaignProgressReporter:
     """Render out-of-band progress without allowing output failures to abort work."""
 
@@ -424,8 +1018,11 @@ class CampaignProgressReporter:
         self._last_dashboard_seconds: float | None = None
         self._dashboard_rendered_rows = 0
         self._terminal_dashboard = self._stream_is_terminal()
-        if self._terminal_dashboard:
-            self._terminal_dashboard = self._enable_virtual_terminal()
+        self._clean_tail = (
+            CleanTailDashboard(self.stream, ansi=False)
+            if self._terminal_dashboard
+            else None
+        )
         self._dashboard_state: dict[str, object] = {}
         self._campaign_report_plan: CampaignPlan | None = None
         self._campaign_report_model: CampaignReportModel | None = None
@@ -930,19 +1527,122 @@ class CampaignProgressReporter:
         return False
 
     def _dashboard(self, record: Mapping[str, object]) -> None:
-        lines = self._bounded_dashboard_lines(record)
-        if self._dashboard_rendered_rows:
-            # Redraw relative to the current cursor.  A saved screen position is
-            # not stable once a first render scrolls a short console.
-            self.stream.write(f"\x1b[{self._dashboard_rendered_rows}F")
-        # Erase only the dashboard region below the current cursor.  Do not use
-        # Clear-Host or ESC[2J: bootstrap and command history must remain in
-        # scrollback.
-        self.stream.write("\x1b[0J")
-        rendered = [self._color_dashboard_line(line) for line in lines]
-        self.stream.write("\n".join(rendered) + "\n")
-        self.stream.flush()
-        self._dashboard_rendered_rows = len(lines)
+        dashboard = self._clean_tail
+        if dashboard is None:
+            return
+        context = record["context"]
+        payload = record["payload"]
+        assert isinstance(context, Mapping)
+        assert isinstance(payload, Mapping)
+        if not dashboard._started:
+            historical = tuple(
+                self._clean_tail_row_from_report(row)
+                for row in (
+                    ()
+                    if self._campaign_report_model is None
+                    else self._campaign_report_model.leaf_rows
+                )
+                if row.get("terminal_state") != "PENDING"
+            )
+            dashboard.start(
+                historical,
+                counts={
+                    "completed": len(self._settled_leaf_ids),
+                    "accepted": len(self._accepted_leaf_ids),
+                    "unresolved": len(self._indeterminate_leaf_ids),
+                    "rejected": len(self._rejected_leaf_ids),
+                    "failed": len(self._failed_leaf_ids),
+                    "total": context.get("leaf_count", "-"),
+                },
+                profile="legacy",
+                pass_name="campaign",
+            )
+        kind = record["kind"]
+        live = self._live_execution_mapping()
+        live_line = {
+            "elapsed": f"{float(record['elapsed_seconds']):.1f}s",
+            "counts": (
+                f"done:{len(self._settled_leaf_ids)}"
+                f"/acc:{len(self._accepted_leaf_ids)}"
+                f"/unres:{len(self._indeterminate_leaf_ids)}"
+                f"/reject:{len(self._rejected_leaf_ids)}"
+                f"/fail:{len(self._failed_leaf_ids)}"
+                f"/cache:{self._cache_stored}"
+            ),
+            "leaf": self._index_limit(
+                live.get("leaf_index"), live.get("leaf_count")
+            ),
+            "profile": "legacy",
+            "pass": live.get("phase"),
+            "root": live.get("root"),
+            "mechanism": live.get("mechanism_id"),
+            "tier": live.get("precision_label"),
+            "phase": live.get("root_phase"),
+            "metric": live.get("determinant_abs"),
+            "suboperation": live.get("suboperation"),
+            "timing": live.get("elapsed_precision_seconds"),
+            "last_activity_age": live.get("last_activity_age_seconds"),
+        }
+        if kind in {
+            ProgressEventKind.LEAF_COMPLETED.value,
+            ProgressEventKind.LEAF_REUSED.value,
+            ProgressEventKind.LEAF_FAILED.value,
+        }:
+            dashboard.live(live_line)
+            dashboard.complete(self._clean_tail_row(record))
+        elif kind in {
+            ProgressEventKind.CAMPAIGN_COMPLETED.value,
+            ProgressEventKind.CAMPAIGN_FAILED.value,
+            ProgressEventKind.CAMPAIGN_INTERRUPTED.value,
+        }:
+            dashboard.finish_live()
+        else:
+            dashboard.live(live_line)
+
+    def _clean_tail_row_from_report(
+        self, row: Mapping[str, object]
+    ) -> dict[str, object]:
+        return {
+            "leaf_id": row.get("leaf_id"),
+            "leaf_ordinal": row.get("leaf_ordinal"),
+            "mode": row.get("mode"),
+            "spin_or_Mkappa": row.get("spin_or_Mkappa"),
+            "mechanism": row.get("mechanism"),
+            "survey_pass": "campaign",
+            "evidence_level": row.get("convergence_basis", "-"),
+            "precision_tier": row.get(
+                "precision_tier", row.get("precision_digits", "-")
+            ),
+            "response_magnitude": row.get("response_magnitude", "-"),
+            "relative_disk_radius": row.get("relative_disk_radius", "-"),
+            "terminal_state": row.get("terminal_state", "-"),
+        }
+
+    def _clean_tail_row(
+        self, record: Mapping[str, object]
+    ) -> dict[str, object]:
+        context = record["context"]
+        payload = record["payload"]
+        assert isinstance(context, Mapping)
+        assert isinstance(payload, Mapping)
+        leaf_id = context.get("leaf_id")
+        model = self._campaign_report_model
+        if model is not None:
+            for row in model.leaf_rows:
+                if row.get("leaf_id") == leaf_id:
+                    return self._clean_tail_row_from_report(row)
+        return {
+            "leaf_id": leaf_id,
+            "leaf_ordinal": context.get("leaf_index"),
+            "mode": context.get("mode"),
+            "spin": context.get("spin"),
+            "mechanism_id": context.get("mechanism_id"),
+            "survey_pass": "campaign",
+            "evidence_level": "-",
+            "precision_digits": context.get("precision_digits"),
+            "total_leaf_seconds": record.get("leaf_elapsed_seconds"),
+            "terminal_state": payload.get("state", "FAILED"),
+        }
 
     def _bounded_dashboard_lines(self, record: Mapping[str, object]) -> list[str]:
         columns, terminal_rows = self._terminal_dimensions()
@@ -2744,31 +3444,7 @@ class CampaignProgressReporter:
 
     @staticmethod
     def _color_dashboard_line(line: str) -> str:
-        stripped = line.strip()
-        color = None
-        if line.startswith("=") or stripped == "M02 KERR-QNM SCIENTIFIC DASHBOARD":
-            color = "96"
-        elif stripped == "CAMPAIGN":
-            color = "93"
-        elif stripped in {
-            "LATEST COMPLETED LEAF",
-            "CURRENTLY EXECUTING",
-            "LIVE ROOT SOLVE",
-            "PRECISION STAGE RESULTS",
-        }:
-            color = "95"
-        elif stripped == "CACHE":
-            color = "36"
-        elif line.startswith(" Accepted"):
-            color = "92"
-        elif (
-            line.startswith(" Last refresh:")
-            or line.startswith(" Dashboard refreshes")
-        ):
-            color = "90"
-        if color is None:
-            return line
-        return f"\x1b[{color}m{line}\x1b[0m"
+        return line
 
     def _completed_value(self, leaf_count: object) -> str:
         completed = len(self._settled_leaf_ids)
@@ -3116,6 +3792,8 @@ class CampaignProgressReporter:
             raise
 
     def close(self) -> None:
+        if self._clean_tail is not None:
+            self._clean_tail.finish_live()
         self._close_status()
 
     @staticmethod

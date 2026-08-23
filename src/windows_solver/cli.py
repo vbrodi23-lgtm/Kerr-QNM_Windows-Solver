@@ -22,6 +22,18 @@ from .campaign_recovery import (
     validate_recovery_checkpoint,
     validate_recovery_receipt,
 )
+from .campaign_policy import (
+    CAMPAIGN_CHECKPOINT_SCHEMA_VERSION as SCHEMA11_VERSION,
+    EvidenceLevel,
+    empty_schema11_checkpoint,
+    validate_schema11_checkpoint,
+)
+from .campaign_evidence import (
+    EvidencePassRequest,
+    EvidenceStrengtheningPolicy,
+)
+from .campaign_triage import WholeAtlasTriage
+from .campaign_survey import preflight_campaign_supports
 from .engine import ExecutionEngine, RunRecord, verify_run_integrity
 from .evidence_intake import load_evidence_bundle
 from .linear_response_admission import (
@@ -39,7 +51,12 @@ from .progress import (
     activate_progress,
     emit_progress,
 )
-from .progress_output import CampaignProgressReporter
+from .progress_output import (
+    CampaignProgressReporter,
+    Schema11ProgressReporter,
+    schema11_dashboard_snapshot,
+)
+from .campaign_reports import report_directory_for_checkpoint
 from .promoted_control_calibration import load_calibration_receipt
 from .response_engine import (
     BackendIdentity,
@@ -283,6 +300,34 @@ def build_parser() -> argparse.ArgumentParser:
         "--checkpoint", type=Path, required=True
     )
     campaign_recovery_validate.add_argument("--receipt", type=Path)
+    for name, help_text in (
+        ("campaign-survey-binary64", "run only the schema-11 binary64 survey pass"),
+        ("campaign-survey-promoted", "run only the queued schema-11 promoted survey pass"),
+        ("campaign-certify", "strengthen SCREENED evidence from an explicit queue"),
+        ("campaign-evidence-validate", "validate CERTIFIED evidence from an explicit queue"),
+    ):
+        campaign_pass = commands.add_parser(name, help=help_text)
+        campaign_pass.add_argument("selection", type=Path)
+        campaign_pass.add_argument("--checkpoint", type=Path, required=True)
+        campaign_pass.add_argument(
+            "--progress",
+            choices=tuple(mode.value for mode in ProgressMode),
+            default=ProgressMode.NORMAL.value,
+        )
+        campaign_pass.add_argument("--queue", type=Path)
+        campaign_pass.add_argument("--calibration-receipt-path", type=Path)
+        campaign_pass.add_argument("--calibration-receipt-sha256")
+    schema11_validate = commands.add_parser(
+        "campaign-schema11-validate",
+        help="validate a schema-11 checkpoint and one optional pass boundary",
+    )
+    schema11_validate.add_argument("selection", type=Path)
+    schema11_validate.add_argument("--checkpoint", type=Path, required=True)
+    schema11_validate.add_argument(
+        "--pass",
+        dest="pass_name",
+        choices=("binary64", "promoted", "certify", "validate"),
+    )
     campaign_reduce = commands.add_parser(
         "campaign-reduce",
         help="reduce authenticated campaign checkpoints without backend work",
@@ -956,6 +1001,289 @@ def _campaign_recovery_validate(
     }
 
 
+def _load_schema11_campaign(
+    selection_path: Path,
+    checkpoint_path: Path,
+):
+    plan, selection, descriptor = _campaign_plan_and_selection(selection_path)
+    recovery_selection = _campaign_recovery_selection(plan, selection)
+    resolved = _resolve_recovery_path(checkpoint_path)
+    value = _load_strict_json(resolved, "schema-11 campaign checkpoint")
+    checkpoint = validate_schema11_checkpoint(value)
+    if (
+        checkpoint["campaign_id"] != recovery_selection.campaign_id
+        or checkpoint["selection_id"] != recovery_selection.selection_id
+    ):
+        raise ValueError("schema-11 checkpoint does not match the selected campaign")
+    preflight_campaign_supports(plan, recovery_selection.ordered_leaf_ids)
+    return plan, selection, descriptor, recovery_selection, resolved, checkpoint
+
+
+def _schema11_leaf_metadata(plan, selection) -> dict[str, dict[str, object]]:
+    leaf_by_id = {leaf.leaf_id: leaf for leaf in plan.leaves}
+    return {
+        leaf_id: {
+            "leaf_ordinal": ordinal,
+            "role": leaf_by_id[leaf_id].role,
+            "mode": leaf_by_id[leaf_id].leaf.mode_label,
+            "spin_or_Mkappa": leaf_by_id[leaf_id].job.spin,
+            "mechanism": leaf_by_id[leaf_id].mechanism_id,
+        }
+        for ordinal, leaf_id in enumerate(selection.leaf_ids, start=1)
+    }
+
+
+def _campaign_schema11_validate(
+    selection_path: Path,
+    checkpoint_path: Path,
+    pass_name: str | None,
+) -> tuple[int, object]:
+    plan, selection, _descriptor, _recovery, resolved, checkpoint = (
+        _load_schema11_campaign(selection_path, checkpoint_path)
+    )
+    rows, counts, report_status = schema11_dashboard_snapshot(
+        checkpoint,
+        leaf_metadata=_schema11_leaf_metadata(plan, selection),
+    )
+    evidence_counts = {level.value: 0 for level in EvidenceLevel}
+    for item in checkpoint["evidence_ledger"].values():
+        evidence_counts[str(item["evidence_level"])] += 1
+    if pass_name == "promoted":
+        pending = [
+            item
+            for item in checkpoint["promotion_queue"]["entries"]
+            if item["disposition"] == "PENDING"
+        ]
+        if any(
+            item["leaf_id"] not in _recovery.scientific_identities
+            or item["scientific_computation_identity"]
+            != _recovery.scientific_identities[item["leaf_id"]]
+            for item in pending
+        ):
+            raise ValueError("promoted survey queue is stale")
+    if pass_name == "certify" and any(
+        item["evidence_level"] not in {
+            EvidenceLevel.SCREENED.value,
+            EvidenceLevel.CERTIFIED.value,
+            EvidenceLevel.VALIDATED.value,
+        }
+        for item in checkpoint["evidence_ledger"].values()
+    ):
+        raise ValueError("certification checkpoint contains invalid evidence")
+    if pass_name == "validate" and not any(
+        item["evidence_level"] == EvidenceLevel.CERTIFIED.value
+        for item in checkpoint["evidence_ledger"].values()
+    ):
+        raise ValueError("validation requires at least one CERTIFIED record")
+    return 0, {
+        "command": "campaign-schema11-validate",
+        "schema_version": SCHEMA11_VERSION,
+        "campaign_id": checkpoint["campaign_id"],
+        "selection_id": checkpoint["selection_id"],
+        "state": checkpoint["state"],
+        "recovered_terminal_count": len(rows),
+        "binary64_pass_count": len(
+            checkpoint["survey_pass_ledger"]["binary64"]
+        ),
+        "promoted_pass_count": len(
+            checkpoint["survey_pass_ledger"]["promoted"]
+        ),
+        "promotion_queue_count": counts["queued"],
+        "evidence_counts": evidence_counts,
+        "report_status": report_status,
+        "basic_report_directory": str(report_directory_for_checkpoint(resolved)),
+        "status_path": f"{resolved}.status.json",
+        "validated_pass": pass_name,
+        "release_admissible": False,
+    }
+
+
+def _campaign_schema11_pass(
+    command: str,
+    selection_path: Path,
+    checkpoint_path: Path,
+    *,
+    queue_path: Path | None,
+    progress_mode: str,
+    calibration_receipt_path: Path | None,
+    calibration_receipt_sha256: str | None,
+) -> tuple[int, object]:
+    if (calibration_receipt_path is None) is not (
+        calibration_receipt_sha256 is None
+    ):
+        raise ValueError(
+            "calibration receipt path and SHA-256 must be supplied together"
+        )
+    if command.startswith("campaign-survey-") and queue_path is not None:
+        raise ValueError("survey pass commands do not accept an evidence queue")
+    if command == "campaign-evidence-validate" and queue_path is None:
+        raise ValueError("validation requires an explicit queue")
+    (
+        plan,
+        selection,
+        _descriptor,
+        recovery_selection,
+        resolved,
+        checkpoint,
+    ) = _load_schema11_campaign(selection_path, checkpoint_path)
+    if command == "campaign-survey-binary64":
+        if calibration_receipt_path is not None:
+            raise ValueError("binary64 survey does not consume promoted calibration")
+        from .campaign_runtime import run_native_binary64_pass
+
+        reporter = Schema11ProgressReporter(
+            resolved,
+            leaf_metadata=_schema11_leaf_metadata(plan, selection),
+            profile="survey",
+            pass_name="binary64",
+            mode=progress_mode,
+        )
+        try:
+            with activate_progress(reporter):
+                result = run_native_binary64_pass(
+                    plan,
+                    selection,
+                    recovery_selection,
+                    checkpoint,
+                    checkpoint_path=resolved,
+                )
+        finally:
+            reporter.close()
+        validated = validate_schema11_checkpoint(result.checkpoint)
+        return 0, {
+            "command": command,
+            "campaign_id": validated["campaign_id"],
+            "selection_id": validated["selection_id"],
+            "schema_version": validated["schema_version"],
+            "checkpoint_path": str(resolved),
+            "completed_count": result.completed_count,
+            "queued_count": result.queued_count,
+            "cache_reused_count": result.cache_reused_count,
+            "skipped_count": result.skipped_count,
+            "release_admissible": False,
+        }
+    if command == "campaign-survey-promoted":
+        from .campaign_runtime import run_native_promoted_pass
+
+        receipt = (
+            None
+            if calibration_receipt_path is None
+            else load_calibration_receipt(
+                calibration_receipt_path, str(calibration_receipt_sha256)
+            )
+        )
+        reporter = Schema11ProgressReporter(
+            resolved,
+            leaf_metadata=_schema11_leaf_metadata(plan, selection),
+            profile="survey",
+            pass_name="promoted",
+            mode=progress_mode,
+        )
+        try:
+            with activate_progress(reporter):
+                result = run_native_promoted_pass(
+                    plan,
+                    selection,
+                    recovery_selection,
+                    checkpoint,
+                    checkpoint_path=resolved,
+                    calibration_receipt=receipt,
+                )
+        finally:
+            reporter.close()
+        validated = validate_schema11_checkpoint(result.checkpoint)
+        return 0, {
+            "command": command,
+            "campaign_id": validated["campaign_id"],
+            "selection_id": validated["selection_id"],
+            "schema_version": validated["schema_version"],
+            "checkpoint_path": str(resolved),
+            "completed_count": result.completed_count,
+            "unresolved_count": result.unresolved_count,
+            "deferred_count": result.deferred_count,
+            "rejected_count": result.rejected_count,
+            "skipped_count": result.skipped_count,
+            "release_admissible": False,
+        }
+    if command in {"campaign-certify", "campaign-evidence-validate"}:
+        from .campaign_runtime import run_native_evidence_pass
+
+        if command == "campaign-certify":
+            policy = EvidenceStrengtheningPolicy.certification()
+            resolved_queue = (
+                report_directory_for_checkpoint(resolved)
+                / "m02-certification-queue.json"
+                if queue_path is None
+                else _resolve_recovery_path(queue_path)
+            )
+            queue_value = _load_strict_json(
+                resolved_queue, "certification queue"
+            )
+            request = WholeAtlasTriage.from_mapping(
+                queue_value
+            ).evidence_request
+            profile_name = "certify"
+        else:
+            policy = EvidenceStrengtheningPolicy.validation()
+            assert queue_path is not None
+            resolved_queue = _resolve_recovery_path(queue_path)
+            queue_value = _load_strict_json(
+                resolved_queue, "validation queue"
+            )
+            raw_request = (
+                queue_value.get("evidence_request")
+                if isinstance(queue_value, Mapping)
+                and "evidence_request" in queue_value
+                else queue_value
+            )
+            request = EvidencePassRequest.from_mapping(raw_request)
+            profile_name = "validate"
+        if request.profile.value != profile_name:
+            raise ValueError("evidence queue profile does not match the command")
+        if request.evidence_policy_identity != policy.identity_sha256:
+            raise ValueError("evidence queue policy binding is stale")
+        receipt = (
+            None
+            if calibration_receipt_path is None
+            else load_calibration_receipt(
+                calibration_receipt_path, str(calibration_receipt_sha256)
+            )
+        )
+        reporter = Schema11ProgressReporter(
+            resolved,
+            leaf_metadata=_schema11_leaf_metadata(plan, selection),
+            profile=profile_name,
+            pass_name=None,
+            mode=progress_mode,
+        )
+        try:
+            with activate_progress(reporter):
+                result = run_native_evidence_pass(
+                    plan,
+                    selection,
+                    checkpoint,
+                    request,
+                    policy,
+                    checkpoint_path=resolved,
+                    calibration_receipt=receipt,
+                )
+        finally:
+            reporter.close()
+        validated = validate_schema11_checkpoint(result)
+        return 0, {
+            "command": command,
+            "campaign_id": validated["campaign_id"],
+            "selection_id": validated["selection_id"],
+            "schema_version": validated["schema_version"],
+            "checkpoint_path": str(resolved),
+            "queue_path": str(resolved_queue),
+            "processed_count": len(request.ordered_leaf_ids),
+            "profile": profile_name,
+            "release_admissible": False,
+        }
+    raise ValueError(f"schema-11 runtime adapter is unavailable for {command}")
+
+
 def _campaign_console_mapping(
     command: str, summary: CampaignRunSummary
 ) -> dict[str, object]:
@@ -1304,6 +1632,27 @@ def main(argv: Sequence[str] | None = None) -> int:
         elif arguments.command == "campaign-recovery-validate":
             status, output = _campaign_recovery_validate(
                 arguments.selection, arguments.checkpoint, arguments.receipt
+            )
+        elif arguments.command == "campaign-schema11-validate":
+            status, output = _campaign_schema11_validate(
+                arguments.selection,
+                arguments.checkpoint,
+                arguments.pass_name,
+            )
+        elif arguments.command in {
+            "campaign-survey-binary64",
+            "campaign-survey-promoted",
+            "campaign-certify",
+            "campaign-evidence-validate",
+        }:
+            status, output = _campaign_schema11_pass(
+                arguments.command,
+                arguments.selection,
+                arguments.checkpoint,
+                queue_path=arguments.queue,
+                progress_mode=arguments.progress,
+                calibration_receipt_path=arguments.calibration_receipt_path,
+                calibration_receipt_sha256=arguments.calibration_receipt_sha256,
             )
         elif arguments.command == "campaign-reduce":
             status, output = _campaign_reduce(arguments.bundle, arguments.output)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from decimal import Decimal
 import hashlib
+import json
 from pathlib import Path
 import tempfile
 import unittest
@@ -272,6 +273,41 @@ class PromotedSurveySchedulerTests(unittest.TestCase):
         self.assertEqual(
             ["STARTED", "COMPLETED"],
             [fragment["state"] for fragment in ledger["session_fragments"]],
+        )
+
+    def test_completed_disposition_is_committed_before_return(self):
+        checkpoint = self._checkpoint()
+        calls: list[int] = []
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "checkpoint.json"
+            result = run_promoted_survey(
+                self.plan,
+                self.selection,
+                checkpoint,
+                checkpoint_path=path,
+                root_seal_lookup=lambda leaf, entry: AuthenticatedRootSeal(
+                    leaf.job.root.omega,
+                    leaf.job.root.branch_id,
+                    entry["source_root_seal_sha256"],
+                ),
+                backend_factory=lambda leaf, digits: _Backend(
+                    leaf, digits, False, calls
+                ),
+                primary_root_runner=lambda *args: self.fail("unexpected root"),
+                horizon_runner=lambda leaf: self.fail("unexpected horizon"),
+                produced_record_builder=lambda leaf, batch, screening, digits: (
+                    _record(leaf.leaf_id, digits)
+                ),
+            )
+
+            durable = json.loads(path.read_text(encoding="utf-8"))
+
+        self.assertEqual(result.checkpoint, durable)
+        self.assertEqual(
+            "COMPLETED",
+            durable["survey_pass_ledger"]["promoted"][
+                self.leaves[0].leaf_id
+            ]["disposition"],
         )
 
     def test_response_queue_escalates_once_to_bf80_then_stops(self):

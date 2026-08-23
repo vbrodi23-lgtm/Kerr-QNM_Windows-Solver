@@ -545,7 +545,7 @@ class PublicSurfaceTests(unittest.TestCase):
             (root / "docs" / "response-replay-powershell.md").exists()
         )
 
-    def test_m02_launcher_runs_the_full_selection_and_can_rebuild_runtime(self) -> None:
+    def test_m02_launcher_exposes_separate_schema11_passes(self) -> None:
         root = Path(__file__).resolve().parents[1]
         launcher = (root / "m02.ps1").read_text(encoding="utf-8")
         solver_launcher = (root / "solver.ps1").read_text(encoding="utf-8")
@@ -557,10 +557,18 @@ class PublicSurfaceTests(unittest.TestCase):
         self.assertIsNone(selection["leaf_ids"])
         self.assertEqual(selection["precision_digits"], [64, 80, 120])
         self.assertIn("[switch]$RebuildRuntime", launcher)
+        self.assertIn("[switch]$NewCampaign", launcher)
+        self.assertIn('[ValidateSet("survey", "certify", "validate")]', launcher)
+        self.assertIn('[ValidateSet("binary64", "promoted")]', launcher)
         self.assertIn('"campaign-plan"', launcher)
-        self.assertIn('Write-Host "M02 B′ campaign"', launcher)
-        self.assertIn('campaign-resume', launcher)
-        self.assertIn('"--full"', launcher)
+        self.assertIn('Write-Host "M02 campaign startup"', launcher)
+        self.assertIn('"campaign-survey-binary64"', launcher)
+        self.assertIn('"campaign-survey-promoted"', launcher)
+        self.assertIn('"campaign-certify"', launcher)
+        self.assertIn('"campaign-evidence-validate"', launcher)
+        self.assertIn('"campaign-schema11-validate"', launcher)
+        self.assertNotIn('campaign-resume', launcher)
+        self.assertNotIn('"--full"', launcher)
         self.assertIn('if ($RebuildRuntime)', launcher)
         self.assertIn('[ValidateSet("quiet", "normal", "trace")]', launcher)
         self.assertIn('[string]$Progress = "normal"', launcher)
@@ -571,10 +579,7 @@ class PublicSurfaceTests(unittest.TestCase):
         self.assertIn("PipelineStoppedException", solver_launcher)
         self.assertIn("-1073741510", solver_launcher)
         self.assertIn('"campaign-plan",\n        $Selection\n', launcher)
-        self.assertEqual(launcher.count("$Selection,"), 2)
-        self.assertEqual(launcher.count("\n        $Checkpoint,\n"), 2)
         self.assertNotIn("$SelectionPath,", launcher)
-        self.assertNotIn("$CheckpointPath,", launcher)
 
     def test_m02_launcher_forwards_only_sha_pinned_calibration_overrides(self) -> None:
         root = Path(__file__).resolve().parents[1]
@@ -1116,6 +1121,8 @@ $candidate | ConvertTo-Json -Compress | Set-Content -LiteralPath $env:M02_TEST_J
             "windows-solver.recovery-summary/v1",
             "windows-solver.system-failure/v1",
             "windows-solver.m02-report-status/v1",
+            "windows-solver.m02-schema11-report-status/v1",
+            "binary64-horizon-production/v1",
             "adaptive-exterior-gap-standoff/v2",
             "factored-homogeneous-gsn/v1",
             "factored-plane-wave-gsn/v1",

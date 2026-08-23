@@ -10,7 +10,6 @@ readme = "README.md"
 requires-python = ">=3.12"
 license = "LicenseRef-Proprietary"
 license-files = [
-    "NOTICE.md",
     "src/windows_solver/data/LICENSE-CANONICAL-BACKEND-MIT.txt",
     "src/windows_solver/data/LICENSE-CC-BY-4.0.txt",
     "src/windows_solver/data/LICENSE-QNM-MIT.txt",

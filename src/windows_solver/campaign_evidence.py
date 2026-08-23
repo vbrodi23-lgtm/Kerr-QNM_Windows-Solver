@@ -32,6 +32,16 @@ def _sha256(value: object) -> str:
     return hashlib.sha256(canonical_json_bytes(value)).hexdigest()
 
 
+def checkpoint_evidence_source_sha256(
+    checkpoint: Mapping[str, object],
+) -> str:
+    """Bind scientific state while excluding disposable report status."""
+
+    material = dict(checkpoint)
+    material["report_status_receipt"] = None
+    return _sha256(material)
+
+
 def _is_sha256(value: object) -> bool:
     if not isinstance(value, str) or len(value) != 64:
         return False
@@ -259,7 +269,9 @@ def build_evidence_pass_request(
         "profile": policy.profile.value,
         "campaign_id": validated["campaign_id"],
         "selection_id": validated["selection_id"],
-        "source_checkpoint_sha256": _sha256(validated),
+        "source_checkpoint_sha256": checkpoint_evidence_source_sha256(
+            validated
+        ),
         "ordered_leaf_ids": list(ordered_leaf_ids),
         "evidence_policy_identity": policy.identity_sha256,
         "engine_identity": engine_identity,
@@ -312,6 +324,9 @@ def run_evidence_pass(
     execute_leaf: Callable[
         [str, EvidenceStrengtheningPolicy], EvidencePassOutcome
     ],
+    checkpoint_committed: Callable[
+        [Mapping[str, object]], Mapping[str, object]
+    ] | None = None,
 ) -> dict[str, object]:
     """Run one explicit evidence pass without replacing a numerical centre."""
 
@@ -329,7 +344,9 @@ def run_evidence_pass(
         or request.selection_id != result["selection_id"]
     ):
         raise ValueError("evidence request campaign binding is stale")
-    if request.source_checkpoint_sha256 != _sha256(result):
+    if request.source_checkpoint_sha256 != checkpoint_evidence_source_sha256(
+        result
+    ):
         raise ValueError("evidence request checkpoint binding is stale")
     record_by_leaf = {record["leaf_id"]: record for record in result["records"]}
     for leaf_id in request.ordered_leaf_ids:
@@ -343,6 +360,15 @@ def run_evidence_pass(
             )
 
     path = Path(checkpoint_path)
+
+    def persist(value: Mapping[str, object]) -> dict[str, object]:
+        durable = validate_schema11_checkpoint(value)
+        _atomic_json(path, durable)
+        if checkpoint_committed is not None:
+            durable = validate_schema11_checkpoint(checkpoint_committed(durable))
+        return durable
+
+    result = persist(result)
     for leaf_id in request.ordered_leaf_ids:
         committed_before_leaf = result
         try:
@@ -402,10 +428,10 @@ def run_evidence_pass(
                 committed_before_leaf,
                 leaf_id=leaf_id,
                 error=error,
-                persist_checkpoint=lambda value: _atomic_json(path, value),
+                persist_checkpoint=lambda value: persist(value),
             )
             raise AssertionError("system failure abort returned unexpectedly")
-        _atomic_json(path, result)
+        result = persist(result)
     return validate_schema11_checkpoint(result)
 
 
@@ -445,6 +471,7 @@ __all__ = [
     "EvidencePassRequest",
     "EvidenceStrengtheningPolicy",
     "build_evidence_pass_request",
+    "checkpoint_evidence_source_sha256",
     "require_release_evidence",
     "run_evidence_pass",
 ]

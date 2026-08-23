@@ -295,6 +295,9 @@ def run_binary64_survey(
     timing_log: CampaignTimingLog | None = None,
     clock: Callable[[], float] = time.monotonic,
     session_id_factory: Callable[[], str] | None = None,
+    checkpoint_committed: Callable[
+        [Mapping[str, object]], Mapping[str, object]
+    ] | None = None,
 ) -> Binary64SurveyRun:
     """Run only the binary64 pass; promotion is recorded and never executed."""
 
@@ -318,6 +321,14 @@ def run_binary64_survey(
         path.with_name(f"{path.name}.timing.jsonl")
     )
     make_session_id = session_id_factory or (lambda: uuid4().hex)
+
+    def persist(value: Mapping[str, object]) -> dict[str, object]:
+        durable = validate_schema11_checkpoint(value)
+        _atomic_json(path, durable)
+        if checkpoint_committed is not None:
+            durable = validate_schema11_checkpoint(checkpoint_committed(durable))
+        return durable
+    result = persist(result)
 
     with progress_scope(execution_profile="SURVEY", survey_pass="binary64"):
         emit_progress(ProgressEventKind.CAMPAIGN_PASS_STARTED)
@@ -352,7 +363,7 @@ def run_binary64_survey(
                     committed_before_leaf,
                     leaf_id=leaf_id,
                     error=error,
-                    persist_checkpoint=lambda value: _atomic_json(path, value),
+                    persist_checkpoint=lambda value: persist(value),
                 )
                 raise AssertionError("system failure abort returned unexpectedly")
 
@@ -418,6 +429,7 @@ def run_binary64_survey(
             )
             assert isinstance(result, dict)
             reused += 1
+            result = persist(result)
             with progress_scope(
                 leaf_id=leaf_id,
                 execution_profile="SURVEY",
@@ -431,7 +443,6 @@ def run_binary64_survey(
                 worker_launch_limit=0,
             ):
                 emit_progress(ProgressEventKind.LEAF_PASS_DISPOSITION_RECORDED)
-            _atomic_json(path, result)
             binary64_ledger = result["survey_pass_ledger"]["binary64"]
             continue
 
@@ -624,6 +635,7 @@ def run_binary64_survey(
             )
         )
         assert isinstance(result, dict)
+        result = persist(result)
         if outcome.disposition is SurveyDisposition.COMPLETED:
             completed += 1
             existing_records[leaf_id] = outcome.record
@@ -658,7 +670,6 @@ def run_binary64_survey(
             ),
         ):
             emit_progress(ProgressEventKind.LEAF_PASS_DISPOSITION_RECORDED)
-        _atomic_json(path, result)
         binary64_ledger = result["survey_pass_ledger"]["binary64"]
 
     with progress_scope(execution_profile="SURVEY", survey_pass="binary64"):
@@ -1059,6 +1070,9 @@ def run_promoted_survey(
     timing_log: CampaignTimingLog | None = None,
     clock: Callable[[], float] = time.monotonic,
     session_id_factory: Callable[[], str] | None = None,
+    checkpoint_committed: Callable[
+        [Mapping[str, object]], Mapping[str, object]
+    ] | None = None,
 ) -> PromotedSurveyRun:
     """Consume only pending promotion entries through BF40/BF80 survey work."""
 
@@ -1075,6 +1089,16 @@ def run_promoted_survey(
         path.with_name(f"{path.name}.timing.jsonl")
     )
     make_session_id = session_id_factory or (lambda: uuid4().hex)
+
+    def persist(value: Mapping[str, object]) -> dict[str, object]:
+        durable = validate_schema11_checkpoint(value)
+        _atomic_json(path, durable)
+        if checkpoint_committed is not None:
+            durable = validate_schema11_checkpoint(checkpoint_committed(durable))
+        return durable
+
+
+    result = persist(result)
     completed = unresolved = deferred = rejected = skipped = 0
     with progress_scope(execution_profile="SURVEY", survey_pass="promoted"):
         emit_progress(ProgressEventKind.CAMPAIGN_PASS_STARTED)
@@ -1113,7 +1137,7 @@ def run_promoted_survey(
                     committed_before_leaf,
                     leaf_id=leaf_id,
                     error=error,
-                    persist_checkpoint=lambda value: _atomic_json(path, value),
+                    persist_checkpoint=lambda value: persist(value),
                 )
                 raise AssertionError("system failure abort returned unexpectedly")
 
@@ -1181,6 +1205,7 @@ def run_promoted_survey(
             deferred += 1
         elif outcome.disposition is SurveyDisposition.REJECTED:
             rejected += 1
+        result = persist(result)
         timing_by_tier = {
             item["tier"]: item["elapsed_seconds"] for item in outcome.tier_timing
         }
@@ -1216,7 +1241,6 @@ def run_promoted_survey(
             total_leaf_seconds=sum(timing_by_tier.values()),
         ):
             emit_progress(ProgressEventKind.LEAF_PASS_DISPOSITION_RECORDED)
-        _atomic_json(path, result)
     with progress_scope(execution_profile="SURVEY", survey_pass="promoted"):
         emit_progress(
             ProgressEventKind.CAMPAIGN_PASS_COMPLETED,

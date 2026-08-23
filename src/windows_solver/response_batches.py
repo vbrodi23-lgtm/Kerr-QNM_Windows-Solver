@@ -7878,10 +7878,99 @@ def validate_campaign_recovery_record(
     leaf = leaf_by_id.get(leaf_id)
     if leaf is None:
         raise ValueError("recovery record is outside the campaign plan")
+    if value.get("schema") == "windows-solver.schema11-numerical-record/1":
+        _validate_schema11_survey_record(plan, leaf, value)
+        return
     record = CampaignLeafRecord.from_mapping(value)
     if record.to_mapping() != value:
         raise ValueError("recovery record is not canonical")
     _validate_cacheable_leaf_record(plan, leaf, record)
+
+
+def _validate_schema11_survey_record(
+    plan: CampaignPlan,
+    leaf: CampaignLeafPlan,
+    value: Mapping[str, object],
+) -> None:
+    fields = {
+        "schema",
+        "leaf_id",
+        "role",
+        "state",
+        "scientific_computation_identity",
+        "retained_centre",
+        "stages",
+        "record_sha256",
+    }
+    if set(value) != fields:
+        raise ValueError("schema-11 survey record fields are invalid")
+    if (
+        value["leaf_id"] != leaf.leaf_id
+        or value["role"] != leaf.role
+        or value["state"] != "PRODUCED"
+        or value["scientific_computation_identity"]
+        != scientific_computation_identity_sha256(plan, leaf)
+    ):
+        raise ValueError("schema-11 survey record identity is invalid")
+    content = {key: value[key] for key in value if key != "record_sha256"}
+    if value["record_sha256"] != _sha256(content):
+        raise ValueError("schema-11 survey record digest is invalid")
+    centre = value["retained_centre"]
+    if not isinstance(centre, Mapping) or set(centre) != {"real", "imaginary"}:
+        raise ValueError("schema-11 survey centre is invalid")
+    try:
+        response = complex(float(centre["real"]), float(centre["imaginary"]))
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError("schema-11 survey centre is invalid") from error
+    if not math.isfinite(response.real) or not math.isfinite(response.imag):
+        raise ValueError("schema-11 survey centre is invalid")
+    stages = value["stages"]
+    if not isinstance(stages, list) or len(stages) != 1:
+        raise ValueError("schema-11 survey stage is invalid")
+    stage = stages[0]
+    if not isinstance(stage, Mapping):
+        raise ValueError("schema-11 survey stage is invalid")
+    expected_stage_fields = {
+        "schema",
+        "operation_identity",
+        "precision_tier",
+        "fixed_root",
+        "root_seal_sha256",
+        "branch_identity",
+        "batch",
+        "response_disk",
+        "frequency_derivative_disk",
+        "coordinate_derivative_disk",
+        "root_correction_upper_bound",
+        "determinant_certificate_status",
+        "stage_sha256",
+    }
+    if (
+        set(stage) != expected_stage_fields
+        or stage["schema"] != "windows-solver.fixed-root-screening-stage/1"
+        or stage["branch_identity"] != leaf.job.root.branch_id
+        or stage["determinant_certificate_status"] != "not-claimed"
+    ):
+        raise ValueError("schema-11 survey stage contract is invalid")
+    stage_content = {key: stage[key] for key in stage if key != "stage_sha256"}
+    if stage["stage_sha256"] != _sha256(stage_content):
+        raise ValueError("schema-11 survey stage digest is invalid")
+    if not isinstance(stage["root_seal_sha256"], str) or re.fullmatch(
+        r"[0-9a-f]{64}", stage["root_seal_sha256"]
+    ) is None:
+        raise ValueError("schema-11 survey root seal is invalid")
+    batch = stage["batch"]
+    response_disk = stage["response_disk"]
+    if (
+        not isinstance(batch, Mapping)
+        or batch.get("leaf_id") != leaf.leaf_id
+        or batch.get("job_id") != leaf.job.job_id
+        or batch.get("mechanism_id") != leaf.mechanism_id
+        or batch.get("branch_identity") != leaf.job.root.branch_id
+        or not isinstance(response_disk, Mapping)
+        or response_disk.get("centre") != centre
+    ):
+        raise ValueError("schema-11 survey batch binding is invalid")
 
 
 def _authenticate_solved_leaf_hit(
