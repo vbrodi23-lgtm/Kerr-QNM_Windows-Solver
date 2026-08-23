@@ -92,6 +92,18 @@ _EXTERIOR_PROFILE_IDS: Mapping[str, str] = {
     "exterior-alpha-one": "alpha-one",
 }
 EXTERIOR_SUPPORT_POLICY_ID = "adaptive-exterior-gap-standoff/v2"
+BINARY64_FIXED_ROOT_SURVEY_IDENTITY = "exterior-fixed-root-survey-raw/v1"
+BINARY64_FIXED_ROOT_SAMPLE_ROLES = (
+    "D0",
+    "DOMEGA_REAL_PLUS_H",
+    "DOMEGA_REAL_MINUS_H",
+    "DOMEGA_REAL_PLUS_HALF_H",
+    "DOMEGA_REAL_MINUS_HALF_H",
+    "DC_PLUS_EPSILON",
+    "DC_MINUS_EPSILON",
+    "DC_PLUS_HALF_EPSILON",
+    "DC_MINUS_HALF_EPSILON",
+)
 ERROR_CHANNELS = (
     "signed-root",
     "truncation",
@@ -1787,6 +1799,231 @@ class ExteriorSupport:
             "centre": self.centre,
             "half_width": self.half_width,
         }
+
+
+@dataclass(frozen=True, slots=True)
+class Binary64FixedRootSample:
+    role: str
+    omega: complex
+    amplitude: complex
+    determinant: complex
+
+    def __post_init__(self) -> None:
+        if self.role not in BINARY64_FIXED_ROOT_SAMPLE_ROLES:
+            raise ValueError("binary64 fixed-root sample role is invalid")
+        object.__setattr__(self, "omega", _finite_complex(self.omega, "sample omega"))
+        object.__setattr__(
+            self, "amplitude", _finite_complex(self.amplitude, "sample amplitude")
+        )
+        object.__setattr__(
+            self,
+            "determinant",
+            _finite_complex(self.determinant, "sample determinant"),
+        )
+
+    def to_mapping(self) -> dict[str, object]:
+        return {
+            "role": self.role,
+            "omega": _complex_mapping(self.omega),
+            "amplitude": _complex_mapping(self.amplitude),
+            "determinant": _complex_mapping(self.determinant),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class Binary64FixedRootBatch:
+    leaf_id: str
+    job_id: str
+    mechanism_id: str
+    fixed_root: complex
+    branch_identity: str
+    frequency_step: float
+    coordinate_step: float
+    support: ExteriorSupport
+    samples: tuple[Binary64FixedRootSample, ...]
+    operation_identity: str = BINARY64_FIXED_ROOT_SURVEY_IDENTITY
+    sample_limit: int = 9
+    root_read_count: int = 0
+    julia_launch_count: int = 0
+
+    def __post_init__(self) -> None:
+        if self.operation_identity != BINARY64_FIXED_ROOT_SURVEY_IDENTITY:
+            raise ValueError("binary64 fixed-root operation identity is invalid")
+        for name in ("leaf_id", "job_id", "mechanism_id", "branch_identity"):
+            if not isinstance(getattr(self, name), str) or not getattr(self, name):
+                raise ValueError(f"binary64 fixed-root {name} is invalid")
+        object.__setattr__(
+            self, "fixed_root", _finite_complex(self.fixed_root, "fixed root")
+        )
+        if self.mechanism_id not in _EXTERIOR_PROFILE_IDS:
+            raise ValueError("binary64 fixed-root mechanism is not exterior")
+        if not isinstance(self.support, ExteriorSupport):
+            raise ValueError("binary64 fixed-root support is invalid")
+        for name in ("frequency_step", "coordinate_step"):
+            value = float(getattr(self, name))
+            if not math.isfinite(value) or value <= 0.0:
+                raise ValueError(f"binary64 fixed-root {name} is invalid")
+            object.__setattr__(self, name, value)
+        if (
+            self.sample_limit != 9
+            or self.root_read_count != 0
+            or self.julia_launch_count != 0
+        ):
+            raise ValueError("binary64 fixed-root work budget is invalid")
+        if self.sample_roles != BINARY64_FIXED_ROOT_SAMPLE_ROLES:
+            raise ValueError("binary64 fixed-root sample plan is invalid")
+        if len(self.samples) > self.sample_limit:
+            raise ValueError("binary64 fixed-root sample budget exceeded")
+        expected_points = (
+            (self.fixed_root, 0.0j),
+            (self.fixed_root + self.frequency_step, 0.0j),
+            (self.fixed_root - self.frequency_step, 0.0j),
+            (self.fixed_root + self.frequency_step / 2.0, 0.0j),
+            (self.fixed_root - self.frequency_step / 2.0, 0.0j),
+            (self.fixed_root, complex(self.coordinate_step, 0.0)),
+            (self.fixed_root, complex(-self.coordinate_step, 0.0)),
+            (self.fixed_root, complex(self.coordinate_step / 2.0, 0.0)),
+            (self.fixed_root, complex(-self.coordinate_step / 2.0, 0.0)),
+        )
+        if any(
+            sample.omega != omega or sample.amplitude != amplitude
+            for sample, (omega, amplitude) in zip(self.samples, expected_points)
+        ):
+            raise ValueError("binary64 fixed-root sample point is invalid")
+
+    @property
+    def sample_roles(self) -> tuple[str, ...]:
+        return tuple(sample.role for sample in self.samples)
+
+    @property
+    def sample_count(self) -> int:
+        return len(self.samples)
+
+    def to_mapping(self) -> dict[str, object]:
+        return {
+            "schema": "windows-solver.binary64-fixed-root-batch/1",
+            "operation_identity": self.operation_identity,
+            "leaf_id": self.leaf_id,
+            "job_id": self.job_id,
+            "mechanism_id": self.mechanism_id,
+            "fixed_root": _complex_mapping(self.fixed_root),
+            "branch_identity": self.branch_identity,
+            "frequency_step": self.frequency_step,
+            "coordinate_step": self.coordinate_step,
+            "support": self.support.to_mapping(),
+            "samples": [sample.to_mapping() for sample in self.samples],
+            "sample_count": self.sample_count,
+            "sample_limit": self.sample_limit,
+            "root_read_count": self.root_read_count,
+            "julia_launch_count": self.julia_launch_count,
+        }
+
+
+class Binary64SurveyDisposition(str, Enum):
+    PRODUCED = "PRODUCED"
+    PROMOTION_PENDING_RESPONSE = "PROMOTION_PENDING_RESPONSE"
+
+
+@dataclass(frozen=True, slots=True)
+class Binary64FixedRootScreening:
+    disposition: Binary64SurveyDisposition
+    response_disk: ComplexDisk | None
+    frequency_derivative_disk: ComplexDisk | None
+    coordinate_derivative_disk: ComplexDisk | None
+    root_correction_upper_bound: float | None
+    reason_code: str | None
+    determinant_certificate_status: str = "not-claimed"
+
+
+def _binary64_stencil_disk(
+    plus_h: complex,
+    minus_h: complex,
+    plus_half: complex,
+    minus_half: complex,
+    *,
+    coarse_denominator: float,
+    fine_denominator: float,
+) -> ComplexDisk:
+    coarse = (plus_h - minus_h) / coarse_denominator
+    fine = (plus_half - minus_half) / fine_denominator
+    arithmetic_radius = sum(
+        math.ulp(abs(value.real)) + math.ulp(abs(value.imag))
+        for value in (plus_h, minus_h, plus_half, minus_half, coarse, fine)
+    )
+    radius = abs(fine - coarse) + arithmetic_radius
+    if not math.isfinite(radius) or radius <= 0.0:
+        raise ValueError("binary64 derivative disk is not bounded")
+    return ComplexDisk(fine, radius)
+
+
+def screen_binary64_fixed_root_batch(
+    batch: Binary64FixedRootBatch,
+) -> Binary64FixedRootScreening:
+    """Reduce one raw nine-sample batch without claiming a certificate."""
+
+    if not isinstance(batch, Binary64FixedRootBatch):
+        raise ValueError("binary64 fixed-root batch is invalid")
+    values = {sample.role: sample.determinant for sample in batch.samples}
+    frequency = _binary64_stencil_disk(
+        values["DOMEGA_REAL_PLUS_H"],
+        values["DOMEGA_REAL_MINUS_H"],
+        values["DOMEGA_REAL_PLUS_HALF_H"],
+        values["DOMEGA_REAL_MINUS_HALF_H"],
+        coarse_denominator=2.0 * batch.frequency_step,
+        fine_denominator=batch.frequency_step,
+    )
+    coordinate = _binary64_stencil_disk(
+        values["DC_PLUS_EPSILON"],
+        values["DC_MINUS_EPSILON"],
+        values["DC_PLUS_HALF_EPSILON"],
+        values["DC_MINUS_HALF_EPSILON"],
+        coarse_denominator=2.0 * batch.coordinate_step,
+        fine_denominator=batch.coordinate_step,
+    )
+    frequency_lower = abs(frequency.centre) - frequency.radius
+    if frequency_lower <= 0.0:
+        return Binary64FixedRootScreening(
+            disposition=Binary64SurveyDisposition.PROMOTION_PENDING_RESPONSE,
+            response_disk=None,
+            frequency_derivative_disk=frequency,
+            coordinate_derivative_disk=coordinate,
+            root_correction_upper_bound=None,
+            reason_code="FINITE_DIFFERENCE_NOISE_LIMIT",
+        )
+    residual = values["D0"]
+    residual_radius = math.ulp(abs(residual.real)) + math.ulp(abs(residual.imag))
+    root_correction = (abs(residual) + residual_radius) / frequency_lower
+    if not math.isfinite(root_correction) or root_correction > 2.0e-11:
+        return Binary64FixedRootScreening(
+            disposition=Binary64SurveyDisposition.PROMOTION_PENDING_RESPONSE,
+            response_disk=None,
+            frequency_derivative_disk=frequency,
+            coordinate_derivative_disk=coordinate,
+            root_correction_upper_bound=root_correction,
+            reason_code="DETERMINANT_UNCERTAINTY_TOO_LARGE",
+        )
+    try:
+        response = exterior_response_disk(
+            coordinate_derivative=coordinate,
+            frequency_derivative=frequency,
+        )
+    except ZeroContainingDiskError:
+        return Binary64FixedRootScreening(
+            disposition=Binary64SurveyDisposition.PROMOTION_PENDING_RESPONSE,
+            response_disk=None,
+            frequency_derivative_disk=frequency,
+            coordinate_derivative_disk=coordinate,
+            root_correction_upper_bound=root_correction,
+            reason_code="FINITE_DIFFERENCE_NOISE_LIMIT",
+        )
+    return Binary64FixedRootScreening(
+        disposition=Binary64SurveyDisposition.PRODUCED,
+        response_disk=response,
+        frequency_derivative_disk=frequency,
+        coordinate_derivative_disk=coordinate,
+        root_correction_upper_bound=root_correction,
+        reason_code=None,
+    )
 
 
 def _exterior_support(spin: float, mechanism_id: str) -> ExteriorSupport:

@@ -24,6 +24,8 @@ from typing import Callable, Mapping
 
 from .response_engine import (
     BackendIdentity,
+    Binary64FixedRootBatch,
+    Binary64FixedRootSample,
     DiagnosticRootReadout,
     DeterminantPartials,
     ExteriorPerturbation,
@@ -31,6 +33,8 @@ from .response_engine import (
     NumericalPolicy,
     ResponseComponentJob,
     RootReadout,
+    _EXTERIOR_PROFILE_IDS,
+    _exterior_support,
     mode_specific_branch_enclosure_radius,
 )
 from .progress import ProgressEventKind, emit_progress, progress_scope
@@ -915,6 +919,68 @@ class VettedNativeDeterminantKernel:
             policy=policy,
             primary_predictor=primary_predictor,
             primary_predictor_kind=primary_predictor_kind,
+        )
+
+    def fixed_root_survey_batch(
+        self,
+        *,
+        job: ResponseComponentJob,
+        fixed_root: complex,
+        branch_identity: str,
+    ) -> Binary64FixedRootBatch:
+        """Evaluate the binary64 nine-sample exterior survey at one fixed root."""
+
+        if job.mechanism_id not in _EXTERIOR_PROFILE_IDS:
+            raise ValueError("binary64 fixed-root survey requires an exterior job")
+        root = complex(fixed_root)
+        if not math.isfinite(root.real) or not math.isfinite(root.imag):
+            raise ValueError("binary64 fixed-root survey root must be finite")
+        if branch_identity != job.root.branch_id:
+            raise ValueError("binary64 fixed-root survey branch identity mismatch")
+        support = _exterior_support(job.spin, job.mechanism_id)
+        profile_id = _EXTERIOR_PROFILE_IDS[job.mechanism_id]
+        frequency_step = _DERIVATIVE_STEP * (1.0 + abs(root))
+        coordinate_step = job.policy.epsilons[0]
+        planned = (
+            ("D0", root, 0.0j),
+            ("DOMEGA_REAL_PLUS_H", root + frequency_step, 0.0j),
+            ("DOMEGA_REAL_MINUS_H", root - frequency_step, 0.0j),
+            ("DOMEGA_REAL_PLUS_HALF_H", root + frequency_step / 2.0, 0.0j),
+            ("DOMEGA_REAL_MINUS_HALF_H", root - frequency_step / 2.0, 0.0j),
+            ("DC_PLUS_EPSILON", root, complex(coordinate_step, 0.0)),
+            ("DC_MINUS_EPSILON", root, complex(-coordinate_step, 0.0)),
+            ("DC_PLUS_HALF_EPSILON", root, complex(coordinate_step / 2.0, 0.0)),
+            ("DC_MINUS_HALF_EPSILON", root, complex(-coordinate_step / 2.0, 0.0)),
+        )
+        if len(planned) > 9:
+            raise RuntimeError("binary64 fixed-root sample budget exceeded")
+        sn = self._standard_sn(job, job.policy)
+        samples = []
+        for role, omega, amplitude in planned:
+            perturbation = ExteriorPerturbation(
+                amplitude=amplitude,
+                profile_id=profile_id,
+                support=support,
+            )
+            determinant = self._determinant(sn, omega, perturbation, job.policy)
+            samples.append(
+                Binary64FixedRootSample(
+                    role=role,
+                    omega=omega,
+                    amplitude=amplitude,
+                    determinant=determinant,
+                )
+            )
+        return Binary64FixedRootBatch(
+            leaf_id=job.leaf_id,
+            job_id=job.job_id,
+            mechanism_id=job.mechanism_id,
+            fixed_root=root,
+            branch_identity=branch_identity,
+            frequency_step=frequency_step,
+            coordinate_step=coordinate_step,
+            support=support,
+            samples=tuple(samples),
         )
 
     def horizon_partials(
