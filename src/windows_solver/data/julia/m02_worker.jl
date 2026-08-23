@@ -16,6 +16,65 @@ const GSNBranchConvention = GSN.GSNBranchConvention
 const PROGRESS_PREFIX = "@@KERR_QNM_PROGRESS@@"
 const PROGRESS_SCHEMA = "windows-solver.progress/1"
 const CONDITIONING_SCHEMA = "windows-solver.m02-conditioning/3"
+const FIXED_ROOT_SURVEY_BATCH_OPERATION = "fixed-root-survey-batch"
+const FIXED_ROOT_SURVEY_BATCH_SCHEMA =
+    "windows-solver.fixed-root-survey-batch/1"
+const FIXED_ROOT_SURVEY_IDENTITY = "exterior-fixed-root-survey-raw/v1"
+const CANONICAL_EXTERIOR_BACKGROUND_IDENTITY =
+    "canonical-exterior-background-wronskian/v1"
+const FIXED_ROOT_SURVEY_CONDITIONING_SCHEMA =
+    "windows-solver.fixed-root-survey-conditioning/1"
+const FIXED_ROOT_SURVEY_ROLES = [
+    "D0",
+    "DOMEGA_REAL_PLUS_H",
+    "DOMEGA_REAL_MINUS_H",
+    "DOMEGA_REAL_PLUS_HALF_H",
+    "DOMEGA_REAL_MINUS_HALF_H",
+    "DC_PLUS_EPSILON",
+    "DC_MINUS_EPSILON",
+    "DC_PLUS_HALF_EPSILON",
+    "DC_MINUS_HALF_EPSILON",
+]
+const FIXED_ROOT_SURVEY_BACKGROUND_ROLES = FIXED_ROOT_SURVEY_ROLES[1:5]
+const FIXED_ROOT_SURVEY_COORDINATE_ROLES = FIXED_ROOT_SURVEY_ROLES[6:9]
+const FIXED_ROOT_SURVEY_POLICY_FIELDS = Set((
+    "readout_radius",
+    "ode_relative_tolerance",
+    "ode_absolute_tolerance",
+    "homogeneous_ode_relative_tolerance",
+    "homogeneous_ode_absolute_tolerance",
+    "coordinate_ode_relative_tolerance",
+    "coordinate_ode_absolute_tolerance",
+    "endpoint_series_order",
+    "support_subinterval_count",
+    "angular_pad",
+    "rho_in",
+    "rho_out",
+    "rho_out_candidate_schedule",
+    "horizon_rho_inner_min",
+    "horizon_endpoint_rho_floor",
+    "horizon_endpoint_rho_candidates",
+    "horizon_maximum_endpoint_distance",
+    "homogeneous_representation",
+    "asymptotic_series_evaluation",
+    "conditioning_diagnostics",
+    "branch_convention",
+    "radial_derivative_convention",
+    "regular_remainder_contract",
+    "factored_remainder_state_convention",
+    "reliable_digit_safety_margin",
+    "required_digit_guard",
+    "determinant_family",
+    "scattering_diagnostics_applicable",
+    "scattering_coefficient_extraction",
+    "horizon_determinant_chart",
+    "scattering_chart_safety_factor",
+    "scattering_column_convention",
+    "determinant_convention",
+    "determinant_normalisation",
+    "promoted_control_calibration_receipt_sha256",
+    "empirical_control_profile_sha256",
+))
 const PROMOTED_ROOT_READOUT_POLICY_ID =
     "binary64-parity-primary-fixed-root-diagnostics-frequency-disk/v2"
 const PROMOTED_ROOT_ACCEPTANCE_METRIC_ID =
@@ -710,6 +769,9 @@ function flatten_request(document)
     angular = required(document, "angular_A")
     amplitude = required(document, "amplitude")
     policy = required(document, "policy")
+    policy isa AbstractDict && Set(keys(policy)) ==
+        FIXED_ROOT_SURVEY_POLICY_FIELDS ||
+        error("fixed-root survey policy fields are invalid")
     execution_resource = required(document, "execution_resource")
     mechanism = string(required(document, "mechanism_id"))
     mechanism in ALLOWED_MECHANISMS ||
@@ -3391,7 +3453,15 @@ function evaluate_exterior_determinant(
 ) where {T<:AbstractFloat}
     readout = parse_real(T, request, "readout_radius")
     a = parse_real(T, request, "spin")
-    lower, _ = exterior_support_contract(T, request, a, readout)
+    survey_background = get(request, "operation", nothing) ==
+        FIXED_ROOT_SURVEY_BATCH_OPERATION &&
+        string(required(request, "readout_role")) in
+            FIXED_ROOT_SURVEY_BACKGROUND_ROLES
+    lower = if survey_background
+        readout
+    else
+        exterior_support_contract(T, request, a, readout)[1]
+    end
     spectral = build_sample_spectral_context(T, request, omega, context)
     lower_contour = build_worker_contour_context(
         T, request, spectral, lower, "Xin"
@@ -3403,7 +3473,18 @@ function evaluate_exterior_determinant(
     exterior_certificate_required =
         exterior_empirical_certificate_required(request)
     readout_contour, infinity_outgoing, comparison_contour,
-        comparison_outgoing = if exterior_certificate_required
+        comparison_outgoing = if get(request, "operation", nothing) ==
+            FIXED_ROOT_SURVEY_BATCH_OPERATION
+        contour, preparation = select_worker_outer_endpoint(
+            T,
+            request,
+            spectral,
+            readout,
+            "Xup",
+            required_digits,
+        )
+        contour, preparation, nothing, nothing
+    elseif exterior_certificate_required
         select_worker_outer_endpoint_pair(
             T,
             request,
@@ -3502,20 +3583,24 @@ function evaluate_exterior_determinant(
         comparison_xup_match.radial_derivative_convention ==
             CF.MATCH_RADIAL_DERIVATIVE_CONVENTION_ID ||
         error("package returned an unexpected comparison Xup match derivative convention")
-    perturbed_in = progress_operation("perturbed integration"; payload=Dict(
-        "branch" => "Xin",
-    )) do
-        integrate_real_branch(
-            T,
-            request,
-            omega,
-            spectral.lambda,
-            lower,
-            readout,
-            Complex{T}[xin_match.X, xin_match.dX_drstar],
-            amplitude;
-            ode_leg="perturbed_Xin",
-        )
+    perturbed_in = if survey_background
+        Complex{T}[xin_match.X, xin_match.dX_drstar]
+    else
+        progress_operation("perturbed integration"; payload=Dict(
+            "branch" => "Xin",
+        )) do
+            integrate_real_branch(
+                T,
+                request,
+                omega,
+                spectral.lambda,
+                lower,
+                readout,
+                Complex{T}[xin_match.X, xin_match.dX_drstar],
+                amplitude;
+                ode_leg="perturbed_Xin",
+            )
+        end
     end
     value = progress_operation("Wronskian") do
         wronskian(
@@ -7562,6 +7647,445 @@ function result_fields(::Type{T}, request, digits::Int, bits::Int) where {T<:Abs
     ]
 end
 
+function flatten_fixed_root_survey_request(document)
+    expected_fields = Set((
+        "schema_version",
+        "schema",
+        "operation",
+        "identity",
+        "scientific_operation_identity",
+        "leaf_id",
+        "job_id",
+        "root_reference_id",
+        "root_seal_sha256",
+        "branch_identity",
+        "backend_identity_sha256",
+        "mode",
+        "spin",
+        "angular_A",
+        "mechanism_id",
+        "fixed_root",
+        "precision_digits",
+        "working_precision_bits",
+        "semantic_precision_tier",
+        "frequency_step",
+        "coordinate_step",
+        "sample_roles",
+        "maximum_sample_count",
+        "samples",
+        "policy",
+        "execution_resource",
+        "request_sha256",
+    ))
+    Set(keys(document)) == expected_fields ||
+        error("fixed-root survey request fields are invalid")
+    mode = required(document, "mode")
+    angular = required(document, "angular_A")
+    fixed_root = required(document, "fixed_root")
+    policy = required(document, "policy")
+    resource = required(document, "execution_resource")
+    request = Dict{String,Any}(
+        "schema_version" => required(document, "schema_version"),
+        "schema" => required(document, "schema"),
+        "operation" => required(document, "operation"),
+        "identity" => required(document, "identity"),
+        "scientific_operation_identity" =>
+            required(document, "scientific_operation_identity"),
+        "leaf_id" => required(document, "leaf_id"),
+        "job_id" => required(document, "job_id"),
+        "root_reference_id" => required(document, "root_reference_id"),
+        "root_seal_sha256" => required(document, "root_seal_sha256"),
+        "branch_identity" => required(document, "branch_identity"),
+        "backend_identity_sha256" =>
+            required(document, "backend_identity_sha256"),
+        "s" => required(mode, "s"),
+        "ell" => required(mode, "ell"),
+        "m" => required(mode, "m"),
+        "n" => required(mode, "n"),
+        "spin" => required(document, "spin"),
+        "angular_A_re" => required(angular, "real"),
+        "angular_A_im" => required(angular, "imaginary"),
+        "mechanism_id" => required(document, "mechanism_id"),
+        "fixed_root_re" => required(fixed_root, "real"),
+        "fixed_root_im" => required(fixed_root, "imaginary"),
+        "precision_digits" => required(document, "precision_digits"),
+        "working_precision_bits" => required(document, "working_precision_bits"),
+        "semantic_precision_tier" =>
+            required(document, "semantic_precision_tier"),
+        "frequency_step" => required(document, "frequency_step"),
+        "coordinate_step" => required(document, "coordinate_step"),
+        "sample_roles" => required(document, "sample_roles"),
+        "maximum_sample_count" => required(document, "maximum_sample_count"),
+        "samples" => required(document, "samples"),
+        "request_sha256" => required(document, "request_sha256"),
+    )
+    for (key, value) in policy
+        request[string(key)] = value
+    end
+    for key in (
+        "schema",
+        "version",
+        "sha256",
+        "worker_request_wall_clock_seconds",
+        "cooperative_request_deadline_seconds",
+        "homogeneous_ode_maxiters",
+        "max_accepted_steps_per_homogeneous_leg",
+        "max_rhs_evaluations_per_homogeneous_leg",
+        "homogeneous_leg_wall_clock_seconds",
+        "coordinate_stall_rhs_threshold",
+        "coordinate_stall_minimum_span_fraction",
+        "coordinate_stall_minimum_step_fraction",
+    )
+        output_key = key == "schema" ? "resource_policy_schema" :
+            key == "version" ? "resource_policy_version" :
+            key == "sha256" ? "resource_policy_sha256" : key
+        request[output_key] = required(resource, key)
+    end
+    return request
+end
+
+function validate_fixed_root_survey_policy(request)
+    # The flattened request contains envelope and resource fields too. Require
+    # every policy field above and reject every known certificate-only field.
+    for key in FIXED_ROOT_SURVEY_POLICY_FIELDS
+        haskey(request, key) || error("fixed-root survey policy lacks $(key)")
+    end
+    for key in (
+        "determinant_error_model",
+        "determinant_error_safety_factor",
+        "determinant_error_required_term_classes",
+        "determinant_error_missing_evidence_outcome",
+        "determinant_error_certificate_statement",
+        "determinant_error_preceding_precision_tier",
+        "human_math_review_receipt_status",
+        "human_math_review_receipt_sha256",
+        "independent_reference_fixture_receipt_status",
+        "independent_reference_fixture_receipt_sha256",
+        "promoted_root_readout_policy",
+        "root_correction_tolerance",
+        "max_newton_iterations",
+        "branch_enclosure_radius_abs",
+    )
+        haskey(request, key) &&
+            error("fixed-root survey request carries prohibited field $(key)")
+    end
+    expected = Dict{String,Any}(
+        "homogeneous_representation" => HOMOGENEOUS_REPRESENTATION_ID,
+        "asymptotic_series_evaluation" => ASYMPTOTIC_SERIES_EVALUATION_ID,
+        "conditioning_diagnostics" => CONDITIONING_DIAGNOSTICS_ID,
+        "branch_convention" => BRANCH_CONVENTION_ID,
+        "radial_derivative_convention" => RADIAL_DERIVATIVE_CONVENTION_ID,
+        "regular_remainder_contract" => REGULAR_REMAINDER_CONTRACT_ID,
+        "factored_remainder_state_convention" =>
+            FACTORED_REMAINDER_STATE_CONVENTION_ID,
+        "reliable_digit_safety_margin" =>
+            string(RELIABLE_DIGIT_SAFETY_MARGIN),
+        "required_digit_guard" => string(REQUIRED_DIGIT_GUARD),
+        "determinant_family" => EXTERIOR_DETERMINANT_FAMILY_ID,
+        "scattering_diagnostics_applicable" => false,
+        "scattering_coefficient_extraction" => nothing,
+        "horizon_determinant_chart" => nothing,
+        "scattering_chart_safety_factor" => nothing,
+        "scattering_column_convention" => nothing,
+        "determinant_convention" => EXTERIOR_DETERMINANT_CONVENTION_ID,
+        "determinant_normalisation" =>
+            EXTERIOR_DETERMINANT_NORMALISATION_ID,
+    )
+    for (key, value) in expected
+        isequal(required(request, key), value) ||
+            error("fixed-root survey policy $(key) is invalid")
+    end
+    for key in (
+        "promoted_control_calibration_receipt_sha256",
+        "empirical_control_profile_sha256",
+    )
+        length(string(required(request, key))) == 64 ||
+            error("fixed-root survey control receipt is invalid")
+    end
+    return nothing
+end
+
+function validate_fixed_root_survey_request(request)
+    parse_integer(request, "schema_version") == 1 ||
+        error("fixed-root survey schema version is invalid")
+    string(required(request, "schema")) == FIXED_ROOT_SURVEY_BATCH_SCHEMA ||
+        error("fixed-root survey schema is invalid")
+    string(required(request, "operation")) ==
+        FIXED_ROOT_SURVEY_BATCH_OPERATION ||
+        error("fixed-root survey operation is invalid")
+    string(required(request, "identity")) == FIXED_ROOT_SURVEY_IDENTITY ||
+        error("fixed-root survey identity is invalid")
+    mechanism = string(required(request, "mechanism_id"))
+    mechanism in ALLOWED_MECHANISMS && mechanism != "horizon-admittance" ||
+        error("fixed-root survey requires an exterior mechanism")
+    parse_integer(request, "s") == -2 ||
+        error("fixed-root survey requires spin weight s=-2")
+    digits = parse_integer(request, "precision_digits")
+    digits in (40, 80) || error("fixed-root survey permits BF40 or BF80 only")
+    bits = working_precision_bits_for(digits)
+    parse_integer(request, "working_precision_bits") == bits ||
+        error("fixed-root survey working precision is invalid")
+    string(required(request, "semantic_precision_tier")) ==
+        "bigfloat-$(digits)" || error("fixed-root survey tier is invalid")
+    parse_integer(request, "maximum_sample_count") == 9 ||
+        error("fixed-root survey sample budget is invalid")
+    for key in (
+        "leaf_id", "job_id", "root_reference_id", "branch_identity",
+        "backend_identity_sha256", "request_sha256", "root_seal_sha256",
+    )
+        value = string(required(request, key))
+        isempty(value) && error("fixed-root survey $(key) is invalid")
+        if key in ("root_seal_sha256", "backend_identity_sha256", "request_sha256")
+            occursin(r"^[0-9a-f]{64}$", value) ||
+                error("fixed-root survey $(key) digest is invalid")
+        end
+    end
+    validate_fixed_root_survey_policy(request)
+    string(required(request, "resource_policy_schema")) ==
+        "windows-solver.execution-resource-policy/1" ||
+        error("fixed-root survey resource policy is invalid")
+    parse_integer(request, "resource_policy_version") == 1 ||
+        error("fixed-root survey resource policy version is invalid")
+    occursin(
+        r"^[0-9a-f]{64}$",
+        string(required(request, "resource_policy_sha256")),
+    ) || error("fixed-root survey resource policy digest is invalid")
+    for key in (
+        "worker_request_wall_clock_seconds",
+        "cooperative_request_deadline_seconds",
+        "homogeneous_ode_maxiters",
+        "max_accepted_steps_per_homogeneous_leg",
+        "max_rhs_evaluations_per_homogeneous_leg",
+        "homogeneous_leg_wall_clock_seconds",
+        "coordinate_stall_rhs_threshold",
+    )
+        parse_integer(request, key) > 0 ||
+            error("fixed-root survey resource control $(key) is invalid")
+    end
+    parse_integer(request, "cooperative_request_deadline_seconds") <
+        parse_integer(request, "worker_request_wall_clock_seconds") ||
+        error("fixed-root survey cooperative deadline is invalid")
+
+    raw_roles = required(request, "sample_roles")
+    raw_roles isa Vector || error("fixed-root survey roles are invalid")
+    roles = String[string(role) for role in raw_roles]
+    length(unique(roles)) == length(roles) ||
+        error("fixed-root survey roles contain duplicates")
+    all(role in FIXED_ROOT_SURVEY_ROLES for role in roles) ||
+        error("fixed-root survey role is unknown")
+    length(roles) <= parse_integer(request, "maximum_sample_count") ||
+        error("fixed-root survey sample budget exceeded")
+    scientific_identity = string(required(
+        request, "scientific_operation_identity"
+    ))
+    valid_roles = if scientific_identity ==
+            CANONICAL_EXTERIOR_BACKGROUND_IDENTITY
+        roles == FIXED_ROOT_SURVEY_BACKGROUND_ROLES
+    elseif scientific_identity == FIXED_ROOT_SURVEY_IDENTITY
+        roles == FIXED_ROOT_SURVEY_ROLES ||
+            roles == FIXED_ROOT_SURVEY_COORDINATE_ROLES
+    else
+        false
+    end
+    valid_roles || error("fixed-root survey roles are out of order")
+    samples = required(request, "samples")
+    samples isa Vector && length(samples) == length(roles) ||
+        error("fixed-root survey samples are invalid")
+    root = parse_complex(
+        BigFloat, request, "fixed_root_re", "fixed_root_im"
+    )
+    frequency_step = parse_real(BigFloat, request, "frequency_step")
+    coordinate_step = parse_real(BigFloat, request, "coordinate_step")
+    frequency_step > 0 && coordinate_step > 0 ||
+        error("fixed-root survey steps are invalid")
+    expected_points = Dict(
+        "D0" => (root, zero(Complex{BigFloat})),
+        "DOMEGA_REAL_PLUS_H" => (root + frequency_step, zero(Complex{BigFloat})),
+        "DOMEGA_REAL_MINUS_H" => (root - frequency_step, zero(Complex{BigFloat})),
+        "DOMEGA_REAL_PLUS_HALF_H" =>
+            (root + frequency_step / 2, zero(Complex{BigFloat})),
+        "DOMEGA_REAL_MINUS_HALF_H" =>
+            (root - frequency_step / 2, zero(Complex{BigFloat})),
+        "DC_PLUS_EPSILON" => (root, complex(coordinate_step, zero(BigFloat))),
+        "DC_MINUS_EPSILON" => (root, complex(-coordinate_step, zero(BigFloat))),
+        "DC_PLUS_HALF_EPSILON" =>
+            (root, complex(coordinate_step / 2, zero(BigFloat))),
+        "DC_MINUS_HALF_EPSILON" =>
+            (root, complex(-coordinate_step / 2, zero(BigFloat))),
+    )
+    for (index, sample) in enumerate(samples)
+        sample isa AbstractDict || error("fixed-root survey sample is invalid")
+        role = roles[index]
+        coordinate_role = role in FIXED_ROOT_SURVEY_COORDINATE_ROLES
+        expected_fields = coordinate_role ?
+            Set(("role", "omega", "amplitude", "support")) :
+            Set(("role", "omega", "amplitude"))
+        Set(keys(sample)) == expected_fields ||
+            error("fixed-root survey sample fields are invalid")
+        string(required(sample, "role")) == role ||
+            error("fixed-root survey sample role binding is invalid")
+        omega_mapping = required(sample, "omega")
+        amplitude_mapping = required(sample, "amplitude")
+        omega = Complex{BigFloat}(
+            parse(BigFloat, string(required(omega_mapping, "real"))),
+            parse(BigFloat, string(required(omega_mapping, "imaginary"))),
+        )
+        amplitude = Complex{BigFloat}(
+            parse(BigFloat, string(required(amplitude_mapping, "real"))),
+            parse(BigFloat, string(required(amplitude_mapping, "imaginary"))),
+        )
+        expected_omega, expected_amplitude = expected_points[role]
+        coordinate_tolerance = BigFloat(8) * BigFloat(eps(Float64)) * max(
+            one(BigFloat),
+            abs(root),
+            frequency_step,
+            coordinate_step,
+        )
+        abs(omega - expected_omega) <= coordinate_tolerance &&
+            abs(amplitude - expected_amplitude) <= coordinate_tolerance ||
+            error("fixed-root survey sample coordinates are invalid")
+        if coordinate_role
+            support = required(sample, "support")
+            Set(keys(support)) == Set(("lower", "upper", "centre", "half_width")) ||
+                error("fixed-root survey support fields are invalid")
+        end
+    end
+    return digits, bits, roles, samples
+end
+
+function fixed_root_survey_conditioning_fields(
+    ::Type{T}, request, context::DeterminantRequestContext{T}, digits::Int
+) where {T<:AbstractFloat}
+    accumulator = context.conditioning
+    accumulator.determinant_count == 1 ||
+        error("fixed-root survey sample must evaluate one determinant")
+    minimum_asymptotic =
+        accumulator.minimum_asymptotic_predicted_reliable_digits
+    minimum_asymptotic === nothing &&
+        error("fixed-root survey lacks asymptotic evidence")
+    effective_digits_lost = max(
+        accumulator.maximum_series_digits_lost,
+        accumulator.maximum_recurrence_digits_lost,
+    )
+    predicted_reliable_digits = min(
+        T(digits) - effective_digits_lost - T(RELIABLE_DIGIT_SAFETY_MARGIN),
+        minimum_asymptotic,
+    )
+    required_digits = required_reliable_digits(T, request)
+    return Dict{String,Any}(
+        "schema" => FIXED_ROOT_SURVEY_CONDITIONING_SCHEMA,
+        "determinant_family" => EXTERIOR_DETERMINANT_FAMILY_ID,
+        "homogeneous_representation" => HOMOGENEOUS_REPRESENTATION_ID,
+        "branch_convention" => BRANCH_CONVENTION_ID,
+        "determinant_convention" => EXTERIOR_DETERMINANT_CONVENTION_ID,
+        "determinant_normalisation" =>
+            EXTERIOR_DETERMINANT_NORMALISATION_ID,
+        "maximum_series_digits_lost" =>
+            numeric_text(accumulator.maximum_series_digits_lost),
+        "maximum_recurrence_digits_lost" =>
+            numeric_text(accumulator.maximum_recurrence_digits_lost),
+        "minimum_asymptotic_predicted_reliable_digits" =>
+            numeric_text(minimum_asymptotic),
+        "endpoint_remainders_regular" =>
+            accumulator.endpoint_remainders_regular,
+        "maximum_endpoint_reconstruction_error" =>
+            numeric_text(accumulator.maximum_endpoint_reconstruction_error),
+        "maximum_contour_angle_deformation" =>
+            numeric_text(accumulator.maximum_contour_angle_deformation),
+        "predicted_reliable_digits" => numeric_text(predicted_reliable_digits),
+        "required_reliable_digits" => numeric_text(required_digits),
+        "precision_limited" => predicted_reliable_digits < required_digits,
+        "determinant_count" => accumulator.determinant_count,
+    )
+end
+
+function fixed_root_survey_batch_fields(request, digits::Int, bits::Int, roles, samples)
+    fixed_root = parse_complex(
+        BigFloat, request, "fixed_root_re", "fixed_root_im"
+    )
+    outputs = Any[]
+    for (index, sample) in enumerate(samples)
+        role = roles[index]
+        omega_mapping = required(sample, "omega")
+        amplitude_mapping = required(sample, "amplitude")
+        omega = Complex{BigFloat}(
+            parse(BigFloat, string(required(omega_mapping, "real"))),
+            parse(BigFloat, string(required(omega_mapping, "imaginary"))),
+        )
+        amplitude = Complex{BigFloat}(
+            parse(BigFloat, string(required(amplitude_mapping, "real"))),
+            parse(BigFloat, string(required(amplitude_mapping, "imaginary"))),
+        )
+        sample_request = copy(request)
+        sample_request["omega_re"] = numeric_text(real(omega))
+        sample_request["omega_im"] = numeric_text(imag(omega))
+        sample_request["amplitude_re"] = numeric_text(real(amplitude))
+        sample_request["amplitude_im"] = numeric_text(imag(amplitude))
+        sample_request["readout_role"] = role
+        if role in FIXED_ROOT_SURVEY_COORDINATE_ROLES
+            support = required(sample, "support")
+            for key in ("lower", "upper", "centre", "half_width")
+                sample_request["support_$(key)"] = required(support, key)
+            end
+        end
+        evaluation_context = build_determinant_request_context(
+            BigFloat, sample_request, fixed_root
+        )
+        before = DETERMINANT_INDEX_REQUEST[]
+        evaluation = raw_determinant_progress(
+            BigFloat,
+            sample_request,
+            evaluation_context,
+            omega,
+            amplitude,
+            "fixed-root survey $(role)",
+            fixed_root,
+        )
+        DETERMINANT_INDEX_REQUEST[] == before + 1 ||
+            error("fixed-root survey sample exceeded its raw determinant budget")
+        push!(outputs, Dict{String,Any}(
+            "role" => role,
+            "omega" => Dict(
+                "real" => numeric_text(real(omega)),
+                "imaginary" => numeric_text(imag(omega)),
+            ),
+            "amplitude" => Dict(
+                "real" => numeric_text(real(amplitude)),
+                "imaginary" => numeric_text(imag(amplitude)),
+            ),
+            "determinant" => Dict(
+                "real" => numeric_text(real(evaluation.value)),
+                "imaginary" => numeric_text(imag(evaluation.value)),
+            ),
+            "numerical_conditioning" => fixed_root_survey_conditioning_fields(
+                BigFloat, sample_request, evaluation_context, digits
+            ),
+        ))
+    end
+    length(outputs) == length(roles) ||
+        error("fixed-root survey response count is invalid")
+    return Dict{String,Any}(
+        "schema_version" => 1,
+        "status" => "ok",
+        "operation" => FIXED_ROOT_SURVEY_BATCH_OPERATION,
+        "identity" => FIXED_ROOT_SURVEY_IDENTITY,
+        "scientific_operation_identity" =>
+            string(required(request, "scientific_operation_identity")),
+        "request_sha256" => string(required(request, "request_sha256")),
+        "leaf_id" => string(required(request, "leaf_id")),
+        "job_id" => string(required(request, "job_id")),
+        "root_reference_id" => string(required(request, "root_reference_id")),
+        "root_seal_sha256" => string(required(request, "root_seal_sha256")),
+        "branch_identity" => string(required(request, "branch_identity")),
+        "semantic_precision_tier" => "bigfloat-$(digits)",
+        "working_precision_bits" => bits,
+        "sample_roles" => roles,
+        "maximum_sample_count" => 9,
+        "sample_count" => length(outputs),
+        "samples" => outputs,
+    )
+end
+
 function fixed_root_determinant_sample_fields(
     ::Type{T}, request, digits::Int, bits::Int
 ) where {T<:AbstractFloat}
@@ -7773,7 +8297,12 @@ function main()
     LAST_DETERMINANT_SECONDS[] = 0.0
     LAST_ODE_SNAPSHOT[] = nothing
     document = JSON.parsefile(request_path)
-    request = flatten_request(document)
+    request = if string(required(document, "operation")) ==
+            FIXED_ROOT_SURVEY_BATCH_OPERATION
+        flatten_fixed_root_survey_request(document)
+    else
+        flatten_request(document)
+    end
     try
         progress_emit("request_started"; payload=Dict(
             "request_sha256" => string(required(request, "request_sha256")),
@@ -7783,7 +8312,18 @@ function main()
             "request_sha256" => string(required(request, "request_sha256")),
             "execution_resource_policy" => resource_policy_identity(request),
         ))
-        result = Dict(evaluate_request(request))
+        result = if string(required(request, "operation")) ==
+                FIXED_ROOT_SURVEY_BATCH_OPERATION
+            digits, bits, roles, samples =
+                validate_fixed_root_survey_request(request)
+            setprecision(BigFloat, bits) do
+                fixed_root_survey_batch_fields(
+                    request, digits, bits, roles, samples
+                )
+            end
+        else
+            Dict(evaluate_request(request))
+        end
         mkpath(dirname(response_path))
         write(response_path, JSON.json(result))
         progress_emit("request_completed"; payload=Dict(
