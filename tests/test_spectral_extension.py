@@ -745,6 +745,12 @@ class TaskBoardRegressionTests(unittest.TestCase):
             config = json.loads(
                 (board / "config.json").read_text(encoding="utf-8")
             )
+            for filename in config["states"].values():
+                state_path = board / filename
+                if not state_path.exists():
+                    state_path.write_text(
+                        f"# {state_path.stem}\n", encoding="utf-8"
+                    )
             tasks = {
                 number: body
                 for state, filename in config["states"].items()
