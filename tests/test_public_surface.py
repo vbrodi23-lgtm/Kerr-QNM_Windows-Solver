@@ -664,21 +664,21 @@ if ($SolverArguments[0] -eq "campaign-plan") {
     '{"role_counts":{"primary":140,"control":24,"deep":48},"leaf_count":212}'
     exit 0
 }
-$checkpointIndex = [Array]::IndexOf($SolverArguments, "--checkpoint")
-if ($checkpointIndex -lt 0) {
-    exit 91
-}
-if ($SolverArguments[0] -eq "campaign-run") {
-    $checkpointArgument = $SolverArguments[$checkpointIndex + 1]
-    $checkpoint = if ([IO.Path]::IsPathRooted($checkpointArgument)) {
-        [IO.Path]::GetFullPath($checkpointArgument)
-    }
-    else {
-        [IO.Path]::GetFullPath((Join-Path $PSScriptRoot $checkpointArgument))
-    }
+if ($SolverArguments[0] -eq "campaign-recover") {
+    $outputIndex = [Array]::IndexOf($SolverArguments, "--output")
+    $checkpoint = [IO.Path]::GetFullPath($SolverArguments[$outputIndex + 1])
     New-Item -ItemType Directory -Force -Path (Split-Path -Parent $checkpoint) |
         Out-Null
     [IO.File]::WriteAllText($checkpoint, "{}")
+    exit 0
+}
+if ($SolverArguments[0] -eq "campaign-schema11-validate") {
+    '{"selection_id":"selection-1","schema_version":11,"recovered_terminal_count":0,"binary64_pass_count":0,"promotion_queue_count":0,"evidence_counts":{},"basic_report_directory":"reports"}'
+    exit 0
+}
+$checkpointIndex = [Array]::IndexOf($SolverArguments, "--checkpoint")
+if ($checkpointIndex -lt 0) {
+    exit 91
 }
 exit 0
 ''',
@@ -689,7 +689,11 @@ exit 0
             environment["M02_TEST_ARGUMENT_LOG"] = str(argument_log)
             environment["KERR_QNM_RUNTIME_ROOT"] = str(package_root / "managed")
 
-            for extra_arguments in ([], ["-RebuildRuntime"], ["-PortableRuntime"]):
+            for extra_arguments in (
+                ["-NewCampaign"],
+                ["-RebuildRuntime"],
+                ["-PortableRuntime"],
+            ):
                 result = subprocess.run(
                     [
                         str(windows_powershell),
@@ -812,7 +816,7 @@ $record = [ordered]@{ default = $default; portable = $portable } | ConvertTo-Jso
             self.assertTrue(Path(resolved["portable"]).samefile(expected_portable))
 
     @unittest.skipUnless(os.name == "nt", "requires Windows PowerShell 5.1")
-    def test_m02_public_default_invocation_forwards_safe_relative_paths(self) -> None:
+    def test_m02_public_default_invocation_resumes_binary64_only(self) -> None:
         root = Path(__file__).resolve().parents[1]
         windows_powershell = Path(os.environ["SystemRoot"]).joinpath(
             "System32", "WindowsPowerShell", "v1.0", "powershell.exe"
@@ -848,21 +852,13 @@ if ($SolverArguments[0] -eq "campaign-plan") {
     '{"role_counts":{"primary":140,"control":24,"deep":48},"leaf_count":212}'
     exit 0
 }
+if ($SolverArguments[0] -eq "campaign-schema11-validate") {
+    '{"selection_id":"selection-1","schema_version":11,"recovered_terminal_count":0,"binary64_pass_count":0,"promotion_queue_count":0,"evidence_counts":{},"basic_report_directory":"reports"}'
+    exit 0
+}
 $checkpointIndex = [Array]::IndexOf($SolverArguments, "--checkpoint")
 if ($checkpointIndex -lt 0) {
     exit 91
-}
-if ($SolverArguments[0] -eq "campaign-run") {
-    $checkpointArgument = $SolverArguments[$checkpointIndex + 1]
-    $checkpoint = if ([IO.Path]::IsPathRooted($checkpointArgument)) {
-        [IO.Path]::GetFullPath($checkpointArgument)
-    }
-    else {
-        [IO.Path]::GetFullPath((Join-Path $PSScriptRoot $checkpointArgument))
-    }
-    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $checkpoint) |
-        Out-Null
-    [IO.File]::WriteAllText($checkpoint, "{}")
 }
 exit 0
 ''',
@@ -871,6 +867,11 @@ exit 0
             environment = dict(os.environ)
             environment["M02_TEST_ARGUMENT_LOG"] = str(argument_log)
             environment["KERR_QNM_RUNTIME_ROOT"] = str(package_root / "managed")
+            checkpoint_path = (
+                package_root / "m02-output" / "m02-campaign-checkpoint.json"
+            )
+            checkpoint_path.parent.mkdir()
+            checkpoint_path.write_text("{}", encoding="utf-8")
             result = subprocess.run(
                 [
                     str(windows_powershell),
@@ -901,7 +902,7 @@ exit 0
             ]
 
         selection = r".\examples\m02-campaign.json"
-        checkpoint = r".\m02-output\m02-campaign-checkpoint.json"
+        checkpoint = str(checkpoint_path)
         self.assertEqual(
             calls,
             [
@@ -910,7 +911,13 @@ exit 0
                     selection,
                 ],
                 [
-                    "campaign-run",
+                    "campaign-schema11-validate",
+                    selection,
+                    "--checkpoint",
+                    checkpoint,
+                ],
+                [
+                    "campaign-survey-binary64",
                     selection,
                     "--checkpoint",
                     checkpoint,
@@ -918,21 +925,16 @@ exit 0
                     "normal",
                 ],
                 [
-                    "campaign-validate",
+                    "campaign-schema11-validate",
                     selection,
                     "--checkpoint",
                     checkpoint,
-                    "--full",
+                    "--pass",
+                    "binary64",
                 ],
             ],
         )
-        self.assertTrue(
-            all(
-                not Path(call[index]).is_absolute() and ":" not in call[index]
-                for call in calls[1:]
-                for index in (1, 3)
-            )
-        )
+        self.assertTrue(Path(checkpoint).is_absolute())
 
     def test_windows_ci_captures_native_streams_outside_powershell(self) -> None:
         root = Path(__file__).resolve().parents[1]
