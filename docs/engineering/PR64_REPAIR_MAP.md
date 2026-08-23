@@ -8,9 +8,11 @@
 >
 > **Execution rule:** The development agent may write, edit, inspect, statically validate, and run permitted software tests. It must not execute the production Kerr/GSN campaign or any production mathematical canary. Native PowerShell/Python/Julia acceptance is run by the operator and returned as logs.
 >
-> **Merge rule:** PR #64 remains draft until the mandatory commit-bound native acceptance gates pass against the exact PR head. No automated agent may merge it merely because Linux/Python tests pass.
+> **Branch rule:** PR #64 is append-only. Do not force-push, reset the remote branch, or close/recreate the PR. If local history diverges, rebuild local work from the current remote PR64 head and replay or reconstruct intended commits so every push is a normal fast-forward.
 >
-> **For `@PR Completion`:** Treat every invariant, gate, prohibition, artifact, and canary in this document as mandatory. Do not scope-reduce the repair to the currently failing mechanism, do not substitute a mocked proof for a named native boundary, do not move an unmet mandatory gate into follow-up work, and do not confuse an incident-specific regression fixture with the product’s operating contract.
+> **Merge rule:** Passing hosted checks, the full permitted suite, and mandatory native canaries does not automatically remove draft status. PR #64 remains draft until the operator personally reviews the exact-head acceptance receipt and gives explicit landing approval. Only then may the protected merge path be requested. No automated agent may mark the PR ready or merge it merely because checks pass.
+>
+> **For `@PR Completion`:** Treat every invariant, gate, prohibition, artifact, and canary in this document as mandatory. Do not scope-reduce the repair to the currently failing mechanism, do not substitute a mocked proof for a named native boundary, do not move an unmet mandatory gate into follow-up work, do not confuse an incident-specific regression fixture with the product’s operating contract, and do not infer an unresolved implementation decision where this contract has closed it.
 
 ---
 
@@ -254,6 +256,16 @@ flowchart TD
 24. **No scientific tolerance is weakened to make a repair pass.**
 25. **No full campaign is used as the first integration test.**
 26. **Missing incident fixtures do not block implementation.** They block only the matching incident-specific canary and any exact incident-recovery claim.
+27. **PR64 branch history is append-only.** No force-push, remote reset, or PR recreation is permitted.
+28. **Duplicate compatible evidence has deterministic precedence.** Numerical mappings remain byte-identical; compatible evidence is unioned monotonically; timestamps never decide scientific precedence.
+29. **Legacy compatibility is deterministic and fail-closed.** A missing schema-11-only identity may be reconstructed only when authenticated historical data determines it uniquely.
+30. **Any invalid selected support or request domain aborts preflight before leaf 1.** It is not recorded as REJECTED or DEFERRED merely to continue.
+31. **The first cross-mechanism Dω reuse requires a durable `background-equivalence/v1` receipt in addition to an exact reuse-key match.**
+32. **Promotion uses a closed static allowlist.** No broad typed-CONTROL fallback may request higher precision.
+33. **UNRESOLVED and DEFERRED are distinct.** UNRESOLVED means survey numerics are exhausted; DEFERRED means intentionally postponed without declaring numerical exhaustion.
+34. **The corrected governing dashboard contract is authoritative.** `M02-Dashboard.ps1` is a visual and ergonomic reference only, not a second authoritative renderer.
+35. **Native canaries use `examples/m02-campaign.json` and bind to the exact plan emitted by the tested PR head.** Legacy audited IDs authenticate recovery material but are not hard-coded production expectations.
+36. **Passing all gates leaves PR64 draft.** The implementation agent presents the acceptance receipt and stops until explicit operator landing approval.
 
 ---
 
@@ -382,6 +394,31 @@ SUPERSEDED_BY_CACHE
 
 Each entry binds leaf ID, pass identity, source/result hashes, operation identity, precision tiers, reason code, work budgets, timing, session fragments, and disposition receipt.
 
+Disposition meanings are exact:
+
+```text
+PROMOTION_PENDING_ROOT / PROMOTION_PENDING_RESPONSE
+= the current pass cannot produce a bounded response and a declared later survey tier remains available
+
+UNRESOLVED
+= all arithmetic tiers and work permitted by the current survey policy have been exhausted without an admissible bounded response
+
+DEFERRED
+= execution is intentionally postponed by explicit policy, resource scheduling, or operator instruction; numerical exhaustion is not asserted
+
+REJECTED
+= a validly constructed leaf fails an explicit scientific/domain rejection rule; invalid plan construction is not converted into REJECTED
+```
+
+Examples:
+
+```text
+binary64 insufficiency with BF40 available       → PROMOTION_PENDING_*
+BF40 insufficiency with BF80 allowed              → continue inside promoted pass
+BF80 still cannot bound the response              → UNRESOLVED
+operator/policy postpones an otherwise valid leaf → DEFERRED
+```
+
 ### 7.5 Promotion queue
 
 Queue entries are append-only and receive terminal outcomes:
@@ -486,15 +523,46 @@ selection membership
 Rules:
 
 ```text
-one valid candidate                   → accept
-multiple byte-identical candidates    → accept once; record duplicate sources
-stronger exact compatible candidate   → accept stronger terminal numerical record only when central mapping is identical
-conflicting terminal centres/states   → abort recovery
-corrupt alleged exact receipt         → abort recovery
-off-selection compatible record       → report and ignore
+one valid candidate                         → accept
+multiple candidates with identical numerical mappings
+                                            → preserve one byte-identical canonical numerical record
+                                            → union every compatible monotone evidence receipt in the separate evidence ledger
+conflicting terminal centres or states      → abort recovery
+corrupt alleged exact receipt               → abort recovery
+off-selection compatible record             → report and ignore
 ```
 
-No heuristic chooses a different centre.
+Evidence strength is ordered:
+
+```text
+VALIDATED > CERTIFIED > SCREENED > none
+```
+
+After evidence level, prefer greater authenticated evidence completeness. Authenticated precision is only a tiebreaker when it represents genuinely stronger evidence under the same scientific computation identity. Creation or modification timestamp is never scientific precedence. If otherwise equivalent outer receipts still need deterministic ordering, use canonical receipt SHA-256 ordering.
+
+The numerical record is never replaced merely because another wrapper is newer or carries stronger evidence. Stronger evidence is appended to the separate ledger. No heuristic chooses a different centre.
+
+#### 8.3.1 Legacy compatibility adapter
+
+A historical checkpoint or receipt may lack a schema-11-only identity field. Recovery must not automatically discard valid historical evidence, fabricate a value, or abort merely because a later schema added a field.
+
+A deterministic legacy adapter may issue a `legacy-compatibility/v1` receipt only when authenticated historical content reconstructs the missing identity uniquely and the realised scientific mapping is exactly compatible.
+
+For support identity:
+
+```text
+legacy receipt lacks support_policy_identity
+→ reconstruct the legacy realised lower / upper / centre / half-width and all other scientific identities
+→ compare against the current realised mapping
+→ exact compatible mapping
+    → issue legacy-compatibility/v1 receipt
+    → reuse permitted
+→ changed or non-uniquely reconstructable mapping
+    → preserve as forensic input
+    → treat as incompatible cache miss
+```
+
+An allegedly exact receipt that is internally corrupt still aborts. The adapter never guesses and never treats a missing field alone as proof of compatibility.
 
 ### 8.4 Generic recovery gate
 
@@ -654,6 +722,8 @@ resolve runtime/package receipts
 
 Preflight detects invalid support, unsupported mode/mechanism, missing data, malformed root receipt, request mismatch, stale queues, and checkpoint/selection mismatch before numerical work.
 
+If any selected leaf has invalid exterior support or an invalid request/domain contract, the entire requested pass aborts before leaf 1. The defect is a plan/preflight failure. It is not converted into a leaf-level REJECTED or DEFERRED state merely to continue the campaign. REJECTED remains reserved for a validly constructed leaf that fails an explicit scientific rejection rule.
+
 An empty historical cache is valid.
 
 ---
@@ -779,9 +849,28 @@ It carries no mechanism-specific support and produces D₀/Dω under one unpertu
 
 Exact key includes root seal, root/branch/angular identities, operation identity, determinant family/convention/normalization, readout/match convention, backend, controls, tier, working precision, and frequency-step policy.
 
+The exact reuse key is necessary but not sufficient for the first cross-mechanism reuse. Before the first reuse for each mechanism/contract version, the system must produce and authenticate a durable:
+
+```text
+background-equivalence/v1
+```
+
+receipt proving that the canonical zero-coupling background operation and the mechanism-specific c=0 route represent the same determinant under the declared family, normalization, branch, controls, and match/readout convention.
+
+```text
+first reuse for a mechanism/contract version
+→ exact reuse key matches
+→ valid background-equivalence/v1 receipt exists
+→ reuse permitted
+
+subsequent reuse under the exact same authenticated contract
+→ exact reuse key + valid equivalence receipt
+→ no repeated equivalence calculation required
+```
+
 D_c is never shared.
 
-If equivalence between the canonical background and each mechanism’s zero-coupling path is not established, cross-mechanism reuse is disabled. The mechanism-local 9-sample path remains valid.
+If equivalence is not established, cross-mechanism Dω reuse is disabled and the mechanism-local 9-sample path remains valid. No optimistic reuse is permitted.
 
 ---
 
@@ -912,15 +1001,51 @@ SCREENED-only evidence remains release-inadmissible.
 
 ## 19. Failure semantics and circuit breaker
 
-### Promotion
+### 19.1 Closed promotion allowlist
 
-Only allowlisted typed arithmetic insufficiency queues promotion.
+Only these existing typed numerical-insufficiency codes may request the next survey arithmetic tier:
 
-### Leaf-local terminal outcome
+```text
+INSUFFICIENT_ASYMPTOTIC_PRECISION
+HORIZON_ARITHMETIC_INADEQUATE
+FINITE_DIFFERENCE_NOISE_LIMIT
+DETERMINANT_UNCERTAINTY_TOO_LARGE
+```
+
+Each must also pass its existing structured-diagnostics validation. This set is closed. There is no fallback from “typed CONTROL failure” to promotion.
+
+The following are explicitly not promotable merely because they are typed:
+
+```text
+ODE_RESOURCE_LIMIT
+ROOT_READOUT_RESOURCE_INFEASIBLE
+COORDINATE_INVERSION_STALLED
+HORIZON_GEOMETRY_EXHAUSTED
+HORIZON_MAXIMUM_ORDER_INADEQUATE
+HORIZON_ONLY_ONE_ENDPOINT
+PHYSICAL_SINGULAR_LIMIT
+SCATTERING_BASIS_ILL_CONDITIONED
+SCATTERING_CHART_ILL_CONDITIONED
+ALGEBRAIC_REPRESENTATION_SINGULAR
+branch identity failures
+protocol or schema failures
+unknown failure codes
+```
+
+### 19.2 Leaf-local outcome semantics
 
 Only allowlisted structured numerical/control outcomes may produce UNRESOLVED, DEFERRED, or REJECTED.
 
-### System failure
+```text
+PROMOTION_PENDING_* = a later permitted survey tier remains
+UNRESOLVED          = permitted survey arithmetic/work is exhausted without a bounded response
+DEFERRED            = explicitly postponed by policy/operator/resource scheduling; exhaustion is not asserted
+REJECTED            = validly constructed leaf fails an explicit scientific rejection rule
+```
+
+DEFERRED must never be used as a softer label for unresolved numerics.
+
+### 19.3 System failure
 
 Abort on first MethodError, TypeError, unexpected ValueError, unknown exception/code, malformed JSON, schema/identity mismatch, digest inconsistency, missing mandatory field, protocol violation, budget breach, or survey reaching certificate code.
 
@@ -933,7 +1058,7 @@ checkpoint prior committed state
 abort immediately
 ```
 
-### Repetition breaker
+### 19.4 Repetition breaker
 
 The same allowlisted leaf-local fingerprint on two distinct leaves aborts before a third starts.
 
@@ -979,6 +1104,18 @@ Historical interrupted sessions are summed; reconstructed timing displays `~`. T
 
 `progress_output.py` becomes the authoritative in-process renderer; checkpoint and ledgers remain authoritative state.
 
+The corrected governing contract in this section is authoritative for layout behavior, state sources, and rendering mechanics. `M02-Dashboard.ps1` is a visual and ergonomic reference: port its clean compact aesthetic, restrained colour, historical rows, tier timings, response magnitude, relative error, and clear live status wherever compatible. It is not a second authoritative renderer and must not create an independent state model.
+
+Where the PS1 and this contract differ, this contract wins:
+
+```text
+exactly one physical live line
+heartbeat rewrites rather than appends
+checkpoint/ledgers provide authoritative counts
+no multi-line redraw or screen clearing
+no dependence on advanced reports
+```
+
 Exact model:
 
 ```text
@@ -1012,21 +1149,21 @@ One hundred heartbeat updates must add zero newline rows.
 
 | File | Governing responsibility |
 |---|---|
-| `campaign_policy.py` | Profiles, passes, dispositions, evidence levels, budgets |
-| `campaign_recovery.py` | Count-agnostic no-numerics recovery and receipts |
+| `campaign_policy.py` | Profiles, exact disposition meanings, closed promotion allowlist, evidence levels, budgets |
+| `campaign_recovery.py` | Count-agnostic no-numerics recovery, deterministic candidate precedence, legacy compatibility, receipts |
 | `campaign_failures.py` | Failure allowlist, system classification, circuit breaker |
 | `campaign_survey.py` | Cache-first binary64/promoted scheduling and queue |
 | `response_batches.py` | Plan/record integration and schema-11 envelope |
 | `solved_leaf_cache.py` | Exact terminal receipt authentication and reuse |
 | `root_readout_cache.py` | Root-seal lookup and authentication |
-| `response_engine.py` | Fixed-root screening math, background operation, support v2 |
+| `response_engine.py` | Fixed-root screening math, background-equivalence receipts, background operation, support v2 |
 | `native_response_kernel.py` | Binary64 raw fixed-root batch and budgets |
 | `julia_response_backend.py` | Promoted survey batch request/response |
 | `data/julia/m02_worker.jl` | Survey raw batch and certification boundary repair |
 | `campaign_reports.py` | Independent basic and advanced reports |
 | `campaign_triage.py` | Whole-atlas ranking and mixed-role queue |
 | `progress.py` | Typed pass/sample/queue/report/failure events |
-| `progress_output.py` | Clean-tail renderer and one live line |
+| `progress_output.py` | Authoritative clean-tail renderer, PS1-informed visual style, one live line |
 | `cli.py` | Generic recovery and pass-specific commands |
 | `m02.ps1` | Safe resume, explicit new campaign/pass, main dashboard |
 | `m02-recover.ps1` | Generic candidate recovery and verified cutover |
@@ -1041,24 +1178,24 @@ One hundred heartbeat updates must add zero newline rows.
 |---:|---|---|
 | 0 | Pure PR63 revert | Pre-PR63 permitted suite restored |
 | 1 | Schema-11 contracts and separate ledgers | Evidence/pass changes leave record hash unchanged |
-| 2 | Count-agnostic generic recovery | N valid inputs → N exact outputs; N=0 supported; no backend |
+| 2 | Count-agnostic generic recovery | N valid inputs → N exact outputs; deterministic evidence precedence; legacy adapter fail-closed; no backend |
 | 3 | Optional incident fixture registration | If complete fixture supplied, oracle is pinned; otherwise status is fixture-incomplete and work continues |
 | 4 | Cache-first scheduling | Exact hit causes zero backend calls |
 | 5 | Failure classifier and circuit breaker | MethodError aborts before next leaf |
 | 6 | Basic/advanced report split | Basic CSVs survive advanced failure |
-| 7 | Support v2 and full-plan preflight | All selected domains valid before leaf 1 |
+| 7 | Support v2 and full-plan preflight | Any invalid selected domain aborts before leaf 1; no REJECTED/DEFERRED conversion |
 | 8 | Binary64 raw fixed-root batch | ≤9 samples, zero root reads, zero Julia |
-| 9 | Canonical background Dω operation | Equivalence proven or reuse disabled |
+| 9 | Canonical background Dω operation | First reuse has exact key plus authenticated `background-equivalence/v1`; otherwise reuse disabled |
 | 10 | Binary64 survey and durable queue | Full mocked plan launches zero Julia |
 | 11 | Survey-only Julia batch | Survey cannot invoke certificate |
 | 12 | Julia precision-context repair | Native boundary specs pass |
-| 13 | Promoted survey | BF40→BF80 only on typed insufficiency |
+| 13 | Promoted survey | BF40→BF80 only for the closed four-code promotion allowlist |
 | 14 | Explicit certification and validation | Heavy work only under explicit profile |
 | 15 | Whole-atlas triage | Deterministic mixed-role queue |
 | 16 | Typed timing/progress | Fixed-root timing is direct and resumable |
-| 17 | Main dashboard and PowerShell | One live line, no implicit cold start |
+| 17 | Main dashboard and PowerShell | Governing layout authoritative; PS1 reference only; one live line; no implicit cold start |
 | 18 | Focused and full permitted suites | All software gates pass |
-| 19 | Operator native canaries | Exact-head acceptance receipt passes mandatory canaries |
+| 19 | Operator native canaries | `examples/m02-campaign.json` exact-head plan bound; receipt passes; PR remains draft pending operator review |
 
 No task waits for an unavailable incident ZIP unless that task is specifically the optional incident-fixture canary.
 
@@ -1084,7 +1221,16 @@ Mandatory generic tests include:
 - basic CSVs survive projective/triage failure;
 - centre disagreement does not overwrite;
 - synthetic 332/442 non-numerical pipeline;
-- dashboard historical/new rows once and heartbeats zero-growth.
+- dashboard historical/new rows once and heartbeats zero-growth;
+- duplicate identical numerical candidates preserve one canonical record and union compatible evidence by `VALIDATED > CERTIFIED > SCREENED > none` without timestamp precedence;
+- legacy missing schema-11 identity reconstructs only through a deterministic `legacy-compatibility/v1` adapter; ambiguous reconstruction becomes an incompatible cache miss;
+- one invalid selected support aborts preflight before leaf 1 and creates no REJECTED or DEFERRED numerical record;
+- first cross-mechanism Dω reuse requires both an exact key and a valid `background-equivalence/v1` receipt;
+- promotion accepts exactly the four closed allowlist codes and rejects broad typed-CONTROL promotion;
+- UNRESOLVED, DEFERRED, and PROMOTION_PENDING transition tests enforce their exact meanings;
+- dashboard contract overrides PS1 behavior where they differ and only one authoritative in-process renderer exists;
+- mandatory canaries bind to `examples/m02-campaign.json`, 212 leaves, 140/24/48 role counts, and exact-head emitted IDs;
+- simulated local-history divergence documentation/test harness permits only replay onto remote head and normal fast-forward.
 
 Optional incident test, only when the complete matching fixture exists:
 
@@ -1100,6 +1246,37 @@ Its absence does not make generic recovery tests fail.
 ---
 
 ## 26. Operator-run native canaries
+
+### 26.1 Canonical canary selection and exact-head plan binding
+
+The first native canaries use:
+
+```text
+repository path: examples/m02-campaign.json
+role: all
+leaf_ids: null
+cohort_ids: null
+current audited legacy selection ID: campaign-selection-36872f8039df4fa7fa1986fa777624b6b9645f657acf87914e4058ffce925b9b
+current audited legacy campaign ID: b-prime-campaign-ff79db99415efc7613df238129c2ad261380147d24723ea927f13ef749afd2d4
+legacy audited leaf count: 212
+legacy audited role counts: Primary 140, Control 24, Deep 48
+```
+
+The legacy IDs authenticate schema-9 and incident-recovery material. They are not hard-coded production expectations. PR64 changes scientific identities, including support-policy identity, so the exact-head `campaign-plan` may legitimately emit new campaign and selection IDs.
+
+Every mandatory canary must assert:
+
+```text
+artifact = examples/m02-campaign.json
+role = all
+leaf count = 212
+Primary = 140
+Control = 24
+Deep = 48
+campaign/selection IDs = exact values emitted by campaign-plan from the tested PR64 head
+```
+
+The canary harness binds to and records those emitted IDs. Production code and tests must not hard-code the legacy selection ID as the expected schema-11 result.
 
 ### Canary A — fresh-machine path
 
@@ -1152,26 +1329,53 @@ Run only if the complete matching fixture is available. Expected 48/45/3/0. If u
 
 ## 27. PR workflow and merge gates
 
-1. First commit is a pure PR63 revert.
+### 27.1 Append-only branch history
+
+PR64 keeps its existing remote branch and PR identity. Do not force-push, reset the remote branch, or close/recreate the PR.
+
+If local history cannot fast-forward the remote PR64 branch:
+
+```text
+fetch current remote PR64 head
+→ rebuild the local working branch from that head
+→ replay or cherry-pick intended local commits
+→ reconstruct any commit that cannot be replayed cleanly as a new commit on top
+→ push by normal fast-forward only
+```
+
+No force-push and no remote reset.
+
+### 27.2 Gates and landing authority
+
+1. First implementation commit is a pure PR63 revert unless the existing append-only remote history already contains governing-document commits; in that case, preserve them and place the pure revert as the next implementation commit with no forward repair mixed into it.
 2. Implement tasks in order with reviewable commits.
-3. Open/keep PR64 as draft after focused generic recovery, schema, cache, failure, and orchestration tests pass.
-4. Run full permitted software suite while draft is live.
-5. Operator runs mandatory Canaries A–G against exact PR head.
-6. Record commit-bound acceptance receipt with runtime/log/artifact hashes.
+3. Keep PR64 draft after focused generic recovery, schema, cache, failure, and orchestration tests pass.
+4. Run the full permitted software suite while draft is live.
+5. Operator runs mandatory Canaries A–G against the exact PR head and the exact-head plan binding in Section 26.1.
+6. Record the commit-bound acceptance receipt with runtime, plan, log, and artifact hashes.
 7. Exact PR63 Canary H is supplementary unless the complete fixture is supplied; its absence cannot block generic product completion.
-8. PR may leave draft only after mandatory canaries, hosted checks, and software suites pass.
-9. No autonomous merge; explicit operator approval required.
+8. Hosted checks, full permitted suite, and mandatory Canaries A–G must all pass.
+9. Passing those gates does not mark the PR ready. PR64 remains draft while the implementing agent presents the completed acceptance receipt and stops.
+10. The operator personally reviews the receipt and gives explicit landing approval in conversation.
+11. Only after that approval may the protected merge path be requested and the PR leave draft.
+12. No autonomous merge, no automatic ready-for-review transition, and no inferred approval.
 
 Required acceptance receipt includes:
 
 ```text
 PR head SHA
+remote PR64 branch head before native execution
+examples/m02-campaign.json blob SHA
+exact-head campaign ID and selection ID
+leaf count and Primary/Control/Deep counts
 Windows/PowerShell/Python/Julia runtime identities
 mandatory canary outcomes and log hashes
 generic recovery N/N counts
 checkpoint/basic-report hashes
+background-equivalence/v1 receipt hashes used by Dω reuse
 incident fixture status: PASS, INCOMPLETE, or NOT_SUPPLIED
 operator timestamp
+landing approval status: PENDING until explicit operator review
 ```
 
 ---
@@ -1180,6 +1384,7 @@ operator timestamp
 
 PR64 must not:
 
+- force-push, reset the remote PR64 branch, or close/recreate the PR to resolve history divergence;
 - require any operator-specific archive to build or run the solver;
 - embed the 48 count or incident SHA values in production modules;
 - stop generic implementation because an incident fixture is incomplete;
@@ -1197,15 +1402,22 @@ PR64 must not:
 - retry the same system defect across the campaign;
 - change retained central records during evidence upgrades;
 - reuse changed support mappings;
-- claim Dω reuse without equivalence;
+- claim Dω reuse from an exact key alone; the first reuse also requires `background-equivalence/v1`;
+- choose duplicate scientific evidence by newest timestamp;
+- guess a missing legacy identity or treat a missing schema-11-only field as automatic compatibility;
+- convert invalid full-plan support into REJECTED or DEFERRED to keep running;
+- promote any typed CONTROL failure outside the closed four-code allowlist;
+- use DEFERRED as a synonym for exhausted numerics;
 - couple basic CSVs to advanced reports;
 - infer dashboard counts from optional reports;
 - use multi-line redraw or heartbeat append growth;
+- maintain the PS1 and Python dashboards as separate authoritative state/rendering implementations;
+- hard-code the audited legacy selection ID as the expected PR64 schema-11 selection ID;
 - hard-code current modes or fix only light ring;
 - add production K2 modes;
 - weaken scientific tolerances;
 - use a full production campaign as first boundary test;
-- merge before mandatory native evidence passes.
+- mark PR64 ready, request merge, or merge merely because mandatory native evidence passes; explicit operator review and landing approval are still required.
 
 ---
 
@@ -1237,7 +1449,16 @@ SCREENED release admission                              rejected
 synthetic 332/442 pipeline                              accepted
 focused/full software checks                            PASS
 mandatory native canaries A–G                           PASS
+canonical canary artifact                               examples/m02-campaign.json
+exact-head plan counts                                  212 / 140 / 24 / 48
+first-use Dω equivalence receipts                       present where reuse occurs
+closed promotion allowlist                              exact four codes
+legacy compatibility adapter                            deterministic / fail-closed
+duplicate evidence precedence                          monotone / timestamp-independent
+invalid support preflight                              aborts before leaf 1
+PR64 branch history                                     append-only / fast-forward
 exact-head acceptance receipt                           present
+landing approval                                        PENDING until operator review
 ```
 
 ### Incident recovery status
@@ -1274,6 +1495,16 @@ Generic recovery tests: [N cases and outcomes].
 Incident fixture status: [PASS 48/45/3/0 | INCOMPLETE | NOT SUPPLIED].
 PR64 remains draft.
 Awaiting mandatory native PowerShell canary logs A–G against commit [SHA].
+```
+
+After A–G pass, the handoff changes to:
+
+```text
+Mandatory native canaries A–G: PASS.
+Exact-head acceptance receipt: [path/hash].
+PR64 remains draft.
+Landing approval: PENDING OPERATOR REVIEW.
+No ready-for-review transition or merge action has been taken.
 ```
 
 No agent may ask for the exact PR63 archive as a prerequisite to continue generic implementation. It may request it only when ready to run the optional exact incident canary, and must describe that scope accurately.
