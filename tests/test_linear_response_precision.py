@@ -3649,17 +3649,8 @@ class PromotedResourceContainmentTests(unittest.TestCase):
                 merged_records[incident.leaf_id].stages,
                 (binary64,),
             )
-            migrated_unaffected = merged_records[following.leaf_id]
             self.assertEqual(
-                migrated_unaffected.stages, unaffected_record.stages
-            )
-            self.assertEqual(
-                migrated_unaffected.state, unaffected_record.state
-            )
-            self.assertIsNotNone(migrated_unaffected.evidence)
-            self.assertEqual(
-                migrated_unaffected.evidence.evidence_level.value,
-                "CERTIFIED",
+                merged_records[following.leaf_id], unaffected_record
             )
             self.assertEqual(
                 json.loads(merged_path.read_text(encoding="utf-8"))[
@@ -3699,15 +3690,9 @@ class PromotedResourceContainmentTests(unittest.TestCase):
             old_promoted.stage_sha256,
             {stage["stage_sha256"] for stage in incident_record["stages"]},
         )
-        migrated_unaffected = CampaignLeafRecord.from_mapping(
-            migrated_records[following.leaf_id]
-        )
-        self.assertEqual(migrated_unaffected.stages, unaffected_record.stages)
-        self.assertEqual(migrated_unaffected.state, unaffected_record.state)
-        self.assertIsNotNone(migrated_unaffected.evidence)
         self.assertEqual(
-            migrated_unaffected.evidence.evidence_level.value,
-            "CERTIFIED",
+            migrated_records[following.leaf_id],
+            unaffected_record.to_mapping(),
         )
 
     def test_component_status_body_contract_is_enforced_at_every_primary_tier(self) -> None:

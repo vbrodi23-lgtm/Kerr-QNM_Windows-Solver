@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import replace
 import hashlib
 import json
 import os
@@ -56,7 +55,6 @@ from .response_batches import (
     PrecisionCapabilities,
     PrecisionFactoryIdentity,
     STAGE_SIGNED_ERROR_FAMILIES,
-    build_campaign_evidence_queue_selection,
     build_campaign_plan,
     build_campaign_selection,
     import_campaign_checkpoint_to_solved_leaf_store,
@@ -67,12 +65,6 @@ from .response_batches import (
     validate_campaign_checkpoint,
     worker_failure_payload,
 )
-from .campaign_policy import (
-    EvidenceLevel,
-    ExecutionProfile,
-    evidence_level_at_least,
-)
-from .campaign_triage import triage_leaf_ids_for_profile
 from .solved_leaf_cache import SolvedLeafStore
 from .response_engine import VettedNativeDeterminantKernel, NativeResourceUnavailableError
 from .response_reduction import (
@@ -88,15 +80,6 @@ def _validate_reduction_component_checkpoint_binding(
     record: CampaignLeafRecord,
     authenticated_receipts: frozenset[str],
 ) -> None:
-    if (
-        record.evidence is None
-        or not evidence_level_at_least(
-            record.evidence.evidence_level, EvidenceLevel.CERTIFIED
-        )
-    ):
-        raise ValueError(
-            "campaign release reduction rejects SCREENED-only evidence"
-        )
     if component.evidence_kind != "authenticated-campaign":
         raise ValueError("campaign reduction CLI accepts authenticated evidence only")
     if record.state not in {"PRODUCED", "UNRESOLVED"} or not record.stages:
@@ -231,11 +214,6 @@ def build_parser() -> argparse.ArgumentParser:
         "campaign-plan", help="materialize the exact B-prime campaign plan"
     )
     campaign_plan.add_argument("selection", type=Path)
-    campaign_plan.add_argument(
-        "--profile",
-        choices=tuple(profile.value for profile in ExecutionProfile),
-        default=ExecutionProfile.SURVEY.value,
-    )
     for name, help_text in (
         ("campaign-run", "execute one selected campaign cold"),
         ("campaign-resume", "resume one compatible selected campaign"),
@@ -244,11 +222,6 @@ def build_parser() -> argparse.ArgumentParser:
         campaign = commands.add_parser(name, help=help_text)
         campaign.add_argument("selection", type=Path)
         campaign.add_argument("--checkpoint", type=Path, required=True)
-        campaign.add_argument(
-            "--profile",
-            choices=tuple(profile.value for profile in ExecutionProfile),
-            default=ExecutionProfile.SURVEY.value,
-        )
         if name in {"campaign-run", "campaign-resume"}:
             campaign.add_argument(
                 "--progress",
@@ -262,9 +235,6 @@ def build_parser() -> argparse.ArgumentParser:
             campaign.add_argument(
                 "--calibration-receipt-sha256",
             )
-            if name == "campaign-resume":
-                campaign.add_argument("--triage-queue", type=Path)
-                campaign.add_argument("--queue-limit", type=int)
         if name == "campaign-validate":
             campaign.add_argument("--full", action="store_true")
     campaign_merge = commands.add_parser(
@@ -762,12 +732,7 @@ def _campaign_selected(
     reporter: CampaignProgressReporter | None = None,
     calibration_receipt_path: Path | None = None,
     calibration_receipt_sha256: str | None = None,
-    execution_profile: ExecutionProfile = ExecutionProfile.SURVEY,
-    triage_queue: Path | None = None,
-    queue_limit: int | None = None,
 ):
-    if not isinstance(execution_profile, ExecutionProfile):
-        raise ValueError("campaign execution profile is invalid")
     if command in {"campaign-run", "campaign-resume"}:
         emit_progress(
             ProgressEventKind.REQUEST_STARTED,
@@ -776,37 +741,6 @@ def _campaign_selected(
             checkpoint_path=str(checkpoint),
         )
     plan, selection, descriptor = _campaign_plan_and_selection(selection_path)
-    checkpoint = resolve_campaign_relative_path(Path.cwd(), str(checkpoint))
-    if triage_queue is not None:
-        if (
-            command != "campaign-resume"
-            or execution_profile is ExecutionProfile.SURVEY
-        ):
-            raise ValueError(
-                "triage queues require campaign-resume with certify or validate"
-            )
-        queue_value = _load_strict_json(
-            triage_queue, "campaign triage queue"
-        )
-        if not checkpoint.is_file():
-            raise ValueError(
-                "campaign triage queue requires an existing checkpoint"
-            )
-        selection = build_campaign_evidence_queue_selection(
-            plan,
-            triage_leaf_ids_for_profile(
-                plan,
-                queue_value,
-                execution_profile,
-                checkpoint_source_receipt=(
-                    "sha256:"
-                    + hashlib.sha256(checkpoint.read_bytes()).hexdigest()
-                ),
-                limit=queue_limit,
-            ),
-        )
-    elif queue_limit is not None:
-        raise ValueError("campaign queue limit requires --triage-queue")
     if command in {"campaign-run", "campaign-resume"}:
         emit_progress(
             ProgressEventKind.REQUEST_VALIDATED,
@@ -826,9 +760,9 @@ def _campaign_selected(
             "cohorts": [cohort.to_mapping() for cohort in plan.cohorts],
             "selection": selection.to_mapping(),
             "campaign": plan.to_mapping(),
-            "execution_profile": execution_profile.value,
             "release_admissible": False,
         }
+    checkpoint = resolve_campaign_relative_path(Path.cwd(), str(checkpoint))
     if command == "campaign-validate":
         summary = validate_campaign_checkpoint(
             plan, checkpoint, require_complete_campaign=full
@@ -837,14 +771,6 @@ def _campaign_selected(
         if not full and summary.selection_id != selection.selection_id:
             raise ValueError("campaign checkpoint selection does not match request")
     else:
-        if (
-            command == "campaign-run"
-            and execution_profile is not ExecutionProfile.SURVEY
-        ):
-            raise ValueError(
-                "certify and validate profiles require campaign-resume with "
-                "an existing screened checkpoint"
-            )
         if command == "campaign-run" and checkpoint.exists():
             raise ValueError("campaign cold execution refuses an existing checkpoint")
         if command == "campaign-resume" and not checkpoint.exists():
@@ -858,35 +784,15 @@ def _campaign_selected(
                 "schema_version"
             ) == CAMPAIGN_CHECKPOINT_SCHEMA_VERSION
             _validate_campaign_capability_superset(cached, descriptor, plan)
-            if execution_profile is ExecutionProfile.SURVEY:
-                if cached.selection_id != selection.selection_id:
-                    raise ValueError(
-                        "campaign checkpoint selection does not match request"
-                    )
-            elif not set(selection.leaf_ids).issubset({
-                record.leaf_id for record in cached.records
-            }):
-                raise ValueError(
-                    "campaign evidence selection is outside the checkpoint"
-                )
+            if cached.selection_id != selection.selection_id:
+                raise ValueError("campaign checkpoint selection does not match request")
             if reporter is not None:
                 reporter.bind_campaign_reports(plan)
-            if (
-                execution_profile is ExecutionProfile.SURVEY
-                and cached.state == "COMPLETE"
-                and checkpoint_is_current
-            ):
+            if cached.state == "COMPLETE" and checkpoint_is_current:
                 import_campaign_checkpoint_to_solved_leaf_store(
                     plan, checkpoint, SolvedLeafStore.default()
                 )
-                profiled_cached = (
-                    replace(cached, execution_profile=execution_profile)
-                    if isinstance(cached, CampaignRunSummary)
-                    else cached
-                )
-                return 0, _campaign_console_mapping(
-                    command, profiled_cached
-                )
+                return 0, _campaign_console_mapping(command, cached)
         elif reporter is not None:
             reporter.bind_campaign_reports(plan)
         backend = _load_campaign_backend(
@@ -903,14 +809,8 @@ def _campaign_selected(
             checkpoint,
             resume=command == "campaign-resume",
             solved_leaf_store=SolvedLeafStore.default(),
-            execution_profile=execution_profile,
         )
-    profiled_summary = (
-        replace(summary, execution_profile=execution_profile)
-        if isinstance(summary, CampaignRunSummary)
-        else summary
-    )
-    return 0, _campaign_console_mapping(command, profiled_summary)
+    return 0, _campaign_console_mapping(command, summary)
 
 
 def _campaign_cache_import(
@@ -941,8 +841,6 @@ def _campaign_console_mapping(
         "reused_stage_count": summary.reused_stage_count,
         "result_count": summary.result_count,
         "checkpoint_path": summary.checkpoint_path,
-        "execution_profile": summary.execution_profile.value,
-        "evidence_counts": summary.evidence_counts,
         "release_admissible": False,
     }
 
@@ -1186,10 +1084,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         elif arguments.command == "campaign-plan":
             status, output = _campaign_selected(
-                arguments.command,
-                arguments.selection,
-                Path("unused"),
-                execution_profile=ExecutionProfile(arguments.profile),
+                arguments.command, arguments.selection, Path("unused")
             )
         elif arguments.command in {
             "campaign-run", "campaign-resume", "campaign-validate"
@@ -1200,8 +1095,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             calibration_sha256 = getattr(
                 arguments, "calibration_receipt_sha256", None
             )
-            triage_queue = getattr(arguments, "triage_queue", None)
-            queue_limit = getattr(arguments, "queue_limit", None)
             if (calibration_path is None) is not (
                 calibration_sha256 is None
             ):
@@ -1222,9 +1115,6 @@ def main(argv: Sequence[str] | None = None) -> int:
                     arguments.selection,
                     arguments.checkpoint,
                     full=getattr(arguments, "full", False),
-                    execution_profile=ExecutionProfile(arguments.profile),
-                    triage_queue=triage_queue,
-                    queue_limit=queue_limit,
                 )
             else:
                 try:
@@ -1237,11 +1127,6 @@ def main(argv: Sequence[str] | None = None) -> int:
                                 reporter=reporter,
                                 calibration_receipt_path=calibration_path,
                                 calibration_receipt_sha256=calibration_sha256,
-                                execution_profile=ExecutionProfile(
-                                    arguments.profile
-                                ),
-                                triage_queue=triage_queue,
-                                queue_limit=queue_limit,
                             )
                         except KeyboardInterrupt:
                             emit_progress(

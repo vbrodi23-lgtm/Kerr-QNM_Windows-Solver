@@ -54,42 +54,6 @@ class ProgressBusTests(unittest.TestCase):
             )
             self.assertEqual(traced.progress, "trace")
 
-    def test_campaign_commands_default_to_survey_and_accept_evidence_profiles(self):
-        parser = build_parser()
-        planned = parser.parse_args(["campaign-plan", "selection.json"])
-        self.assertEqual(planned.profile, "survey")
-        for command in ("campaign-run", "campaign-resume", "campaign-validate"):
-            arguments = parser.parse_args(
-                [command, "selection.json", "--checkpoint", "checkpoint.json"]
-            )
-            self.assertEqual(arguments.profile, "survey")
-            for profile in ("survey", "certify", "validate"):
-                profiled = parser.parse_args(
-                    [
-                        command,
-                        "selection.json",
-                        "--checkpoint",
-                        "checkpoint.json",
-                        "--profile",
-                        profile,
-                    ]
-                )
-                self.assertEqual(profiled.profile, profile)
-        queued = parser.parse_args([
-            "campaign-resume",
-            "selection.json",
-            "--checkpoint",
-            "checkpoint.json",
-            "--profile",
-            "certify",
-            "--triage-queue",
-            "m02-triage.json",
-            "--queue-limit",
-            "12",
-        ])
-        self.assertEqual(queued.triage_queue, Path("m02-triage.json"))
-        self.assertEqual(queued.queue_limit, 12)
-
     def test_progress_context_carries_unambiguous_omega_and_counter_fields(self):
         observer = RecordingObserver()
         omega = {"real": 0.5, "imaginary": -0.1}
