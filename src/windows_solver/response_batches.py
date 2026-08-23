@@ -43,6 +43,7 @@ from .response_engine import (
     HISTORICAL_PROMOTED_ROOT_READOUT_POLICY,
     BOUNDED_ANALYTIC_RESPONSE,
     BOUNDED_DERIVATIVE_RESPONSE,
+    EXTERIOR_SUPPORT_POLICY_ID,
     EXTERIOR_DERIVATIVE_COMPONENT_IDENTITY,
     EXTERIOR_DERIVATIVE_RESPONSE_DISK_IDENTITY,
     EXTERIOR_DERIVATIVE_METHOD,
@@ -2503,7 +2504,7 @@ def _scientific_computation_identity_material(
     *,
     response_uncertainty_contract: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
-    return {
+    material: dict[str, object] = {
         "schema_version": 1,
         "leaf_id": leaf.leaf_id,
         "role": leaf.role,
@@ -2529,6 +2530,14 @@ def _scientific_computation_identity_material(
             else dict(response_uncertainty_contract)
         ),
     }
+    if leaf.mechanism_id != "horizon-admittance":
+        material["exterior_support"] = {
+            "policy_identity": EXTERIOR_SUPPORT_POLICY_ID,
+            "realised_mapping": _exterior_support(
+                leaf.job.spin, leaf.mechanism_id
+            ).to_mapping(),
+        }
+    return material
 
 
 def scientific_computation_identity_sha256(

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 import os
 from pathlib import Path
 import tempfile
@@ -22,6 +23,7 @@ from .solved_leaf_cache import (
     SolvedLeafLookupStatus,
     SolvedLeafStore,
 )
+from .response_engine import _EXTERIOR_PROFILE_IDS, _exterior_support
 
 
 RecordValidator = Callable[[str, Mapping[str, object]], None]
@@ -34,6 +36,48 @@ class CacheFirstOutcome:
     missing_leaf_ids: tuple[str, ...]
     checkpoint_path: str | None = None
     execution_result: object | None = None
+
+
+def preflight_campaign_supports(
+    plan: object, selected_leaf_ids: tuple[str, ...]
+) -> None:
+    """Validate every selected exterior support before any work is dispatched."""
+
+    leaves = tuple(getattr(plan, "leaves"))
+    leaf_by_id = {leaf.leaf_id: leaf for leaf in leaves}
+    if len(leaf_by_id) != len(leaves):
+        raise ValueError("campaign plan contains duplicate leaf identifiers")
+    if len(set(selected_leaf_ids)) != len(selected_leaf_ids):
+        raise ValueError("campaign selection contains duplicate leaf identifiers")
+    unknown = tuple(
+        leaf_id for leaf_id in selected_leaf_ids if leaf_id not in leaf_by_id
+    )
+    if unknown:
+        raise ValueError(
+            "campaign selection contains leaves outside the plan: "
+            + ", ".join(unknown)
+        )
+
+    readout_radius = float(getattr(getattr(plan, "policy"), "readout_radius"))
+    for leaf_id in selected_leaf_ids:
+        leaf = leaf_by_id[leaf_id]
+        if leaf.mechanism_id not in _EXTERIOR_PROFILE_IDS:
+            continue
+        spin = float(leaf.job.spin)
+        horizon = 1.0 + math.sqrt(max(0.0, 1.0 - spin * spin))
+        support = _exterior_support(spin, leaf.mechanism_id)
+        gap = support.centre - horizon
+        standoff = min(5.0e-4, gap / 4.0)
+        if gap <= 0.0 or standoff <= 0.0 or support.half_width <= 0.0:
+            raise ValueError(f"invalid exterior support for {leaf_id}")
+        if support.lower != support.centre - support.half_width:
+            raise ValueError(f"inconsistent exterior support lower bound for {leaf_id}")
+        if support.upper != support.centre + support.half_width:
+            raise ValueError(f"inconsistent exterior support upper bound for {leaf_id}")
+        if support.lower < horizon + standoff:
+            raise ValueError(f"exterior support violates horizon standoff for {leaf_id}")
+        if support.upper >= readout_radius:
+            raise ValueError(f"exterior support reaches the readout radius for {leaf_id}")
 
 
 def _atomic_json(path: Path, value: object) -> None:
@@ -139,4 +183,8 @@ def dispatch_cache_first(
     )
 
 
-__all__ = ["CacheFirstOutcome", "dispatch_cache_first"]
+__all__ = [
+    "CacheFirstOutcome",
+    "dispatch_cache_first",
+    "preflight_campaign_supports",
+]

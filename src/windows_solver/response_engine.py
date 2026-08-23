@@ -91,6 +91,7 @@ _EXTERIOR_PROFILE_IDS: Mapping[str, str] = {
     "exterior-alpha-half": "alpha-half",
     "exterior-alpha-one": "alpha-one",
 }
+EXTERIOR_SUPPORT_POLICY_ID = "adaptive-exterior-gap-standoff/v2"
 ERROR_CHANNELS = (
     "signed-root",
     "truncation",
@@ -1808,7 +1809,11 @@ def _exterior_support(spin: float, mechanism_id: str) -> ExteriorSupport:
         centre, width = horizon + 2.0 * scale, max(0.012, 0.5 * scale)
     else:
         centre, width = horizon + 4.0 * kappa, max(0.012, kappa)
-    width = min(width, centre - (horizon + 5.0e-4))
+    gap = centre - horizon
+    if gap <= 0.0:
+        raise ValueError("exterior profile centre is not outside horizon")
+    standoff = min(5.0e-4, gap / 4.0)
+    width = min(width, gap - standoff)
     if width <= 0.0:
         raise ValueError("exterior profile has no smooth support outside horizon")
     return ExteriorSupport(centre - width, centre + width, centre, width)

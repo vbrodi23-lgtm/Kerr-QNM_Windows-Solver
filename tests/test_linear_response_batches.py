@@ -384,7 +384,7 @@ class CampaignPlanTests(unittest.TestCase):
         )
         self.assertEqual(
             scientific_computation_identity_sha256(plan, deep_exterior),
-            "13c0c8d488a5bad61548c016aafad3eeade00afcc5f32163d551831d05d20662",
+            "a368636f652bf119a8800edffa453b4a7cd30ab86cdd0251e23b7f4d0ee35631",
         )
 
     def test_current_and_schema7_scientific_contracts_are_distinct(self) -> None:
@@ -463,7 +463,7 @@ class CampaignPlanTests(unittest.TestCase):
             )
             self.assertEqual(
                 scientific_computation_identity_sha256(plan, control),
-                "38667f5e83151b2b1af735dca839809775644274a8e865dd14fde2fe5fa703c5",
+                "6abdc44250cc694a63b012d5c10e479b28dc277665dd1a36cfe6210bbfd19727",
             )
             self.assertEqual(
                 scientific_computation_identity_sha256(plan, deep),
