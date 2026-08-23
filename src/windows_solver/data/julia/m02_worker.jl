@@ -4555,6 +4555,11 @@ run_at_working_precision(body, ::Type{BigFloat}, bits::Integer) =
 
 run_at_working_precision(body, ::Type{<:AbstractFloat}, ::Integer) = body()
 
+precision_context_value(::Type{T}, value) where {T<:AbstractFloat} = T(value)
+precision_context_value(::Type{BigFloat}, value) = BigFloat(
+    value, precision=precision(BigFloat)
+)
+
 """
     precision_guard_context(T, evaluation_context)
 
@@ -4584,16 +4589,16 @@ Must be called inside the guard precision scope: `T(...)` reads the ambient
 precision, which is the entire point.
 """
 function precision_guard_context(
-    ::Type{T}, evaluation_context::DeterminantRequestContext{T}
-) where {T<:AbstractFloat}
+    ::Type{T}, evaluation_context::DeterminantRequestContext{S}
+) where {T<:AbstractFloat,S<:AbstractFloat}
     frozen = evaluation_context.frozen_convention
     guard_convention = GSNBranchConvention{T}(
-        T(frozen.infinity_contour_angle),
-        T(frozen.horizon_contour_angle),
+        precision_context_value(T, frozen.infinity_contour_angle),
+        precision_context_value(T, frozen.horizon_contour_angle),
         frozen.infinity_sign,
         frozen.horizon_sign,
-        T(frozen.omega_argument),
-        T(frozen.p_horizon_argument),
+        precision_context_value(T, frozen.omega_argument),
+        precision_context_value(T, frozen.p_horizon_argument),
         frozen.tortoise_branch_id,
         frozen.infinity_carrier_id,
         frozen.horizon_ingoing_carrier_id,

@@ -922,6 +922,91 @@ end
     @test context.conditioning.determinant_count == 7
 end
 
+function bigfloat_precision_context(source_digits)
+    source_bits = working_precision_bits_for(source_digits)
+    return setprecision(BigFloat, source_bits) do
+        request = finite_difference_control_request()
+        root = complex(BigFloat("0.5"), BigFloat("-0.1"))
+        context = build_determinant_request_context(BigFloat, request, root)
+        context.conditioning.determinant_count = 7
+        context.conditioning.maximum_series_digits_lost = BigFloat("3.5")
+        context
+    end
+end
+
+@testset "BigFloat source context converts to Float64" begin
+    source = bigfloat_precision_context(80)
+    converted = precision_guard_context(Float64, source)
+    @test converted isa DeterminantRequestContext{Float64}
+    @test converted.frozen_branch_cell == source.frozen_branch_cell
+    @test converted.conditioning.determinant_count == 0
+    @test isempty(converted.authenticated_evidence.entries)
+end
+
+@testset "BF80 ambient context converts to BF40 ambient context" begin
+    source = bigfloat_precision_context(80)
+    target_bits = working_precision_bits_for(40)
+    converted = setprecision(BigFloat, target_bits) do
+        precision_guard_context(BigFloat, source)
+    end
+    @test converted isa DeterminantRequestContext{BigFloat}
+    @test precision(converted.frozen_convention.infinity_contour_angle) ==
+        target_bits
+    @test converted.frozen_branch_cell == source.frozen_branch_cell
+end
+
+@testset "BF120 ambient context converts to BF80 ambient context" begin
+    source = bigfloat_precision_context(120)
+    target_bits = working_precision_bits_for(80)
+    converted = setprecision(BigFloat, target_bits) do
+        precision_guard_context(BigFloat, source)
+    end
+    @test converted isa DeterminantRequestContext{BigFloat}
+    @test precision(converted.frozen_convention.p_horizon_argument) ==
+        target_bits
+    @test converted.frozen_branch_cell == source.frozen_branch_cell
+end
+
+@testset "precision context conversion fails on branch-cell change" begin
+    source = bigfloat_precision_context(80)
+    request = finite_difference_control_request()
+    other = setprecision(BigFloat, working_precision_bits_for(80)) do
+        build_determinant_request_context(
+            BigFloat,
+            request,
+            complex(BigFloat("-0.5"), BigFloat("0.1")),
+        )
+    end
+    @test other.frozen_branch_cell != source.frozen_branch_cell
+    forged = DeterminantRequestContext{BigFloat}(
+        source.frozen_convention,
+        other.frozen_branch_cell,
+        source.conditioning,
+        source.authenticated_evidence,
+    )
+    @test_throws ErrorException precision_guard_context(Float64, forged)
+end
+
+@testset "precision context conversion does not mutate its source" begin
+    source = bigfloat_precision_context(120)
+    frozen_before = source.frozen_convention
+    cell_before = source.frozen_branch_cell
+    count_before = source.conditioning.determinant_count
+    loss_before = source.conditioning.maximum_series_digits_lost
+    precision_before = precision(
+        source.frozen_convention.infinity_contour_angle
+    )
+    setprecision(BigFloat, working_precision_bits_for(80)) do
+        precision_guard_context(BigFloat, source)
+    end
+    @test source.frozen_convention == frozen_before
+    @test source.frozen_branch_cell == cell_before
+    @test source.conditioning.determinant_count == count_before
+    @test source.conditioning.maximum_series_digits_lost == loss_before
+    @test precision(source.frozen_convention.infinity_contour_angle) ==
+        precision_before
+end
+
 @testset "the lowest stored-precision rung has nothing to compare against" begin
     request = finite_difference_control_request()
     @test parse_integer(request, "precision_digits") == PRECISION_GUARD_DIGITS
