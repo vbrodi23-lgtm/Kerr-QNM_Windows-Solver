@@ -1,115 +1,60 @@
-# The Windows Solver
+# Kerr-QNM Windows Solver
 
-A native-Windows, evidence-graded nonlinear Kerr ringdown solver.
+A native-Windows, evidence-graded solver for Kerr quasinormal modes and staged linear-response calculations.
 
-The solver is organized around physical outputs: Kerr quasinormal-mode spectra, first-order frequency shifts, operator stability, quadratic mode couplings, waveforms, detector response, and inverse inference. A request selects an output; the planner computes only its mathematical dependency closure.
+The repository separates four things that must never be conflated:
 
-## Current release boundary
+```text
+software execution
+numerical acceptance
+scientific evidence
+release admission
+```
 
-The public control plane is working. It validates study contracts, plans dependencies, admits at most one production provider for each capability, stores content-addressed artifacts, resumes from verified cache entries, and reports evidence without conflating numerical success with a scientific conclusion.
+A process completing successfully is not, by itself, a scientific result. A numerically unresolved result may still be valid evidence. A screened result may be useful for an atlas while remaining inadmissible for publication or release.
 
-PR #1 admitted `problem-contract`; PR #2 computes and admits `spectral-core`
-alongside it. The pure-Kerr lattice contains 2,736 exact mode–spin roots:
-ℓ=2 contributes 690, ℓ=3 contributes 966, and ℓ=4 contributes 1,080.
-For every ℓ it includes every allowed m and n∈{0,1,2}. The ℓ=2 and ℓ=3
-domains use 40 inclusive uniform points from χ=0 to 0.95 plus χ∈{0.97, 0.98,
-0.99, 0.995, 0.997, 0.999}; ℓ=4 uses 40 inclusive uniform points from χ=0
-to 0.75. There is one pure-Kerr result per coordinate, with no polarization or
-EFT result axis.
+---
 
-Every requested node is polished with the coupled angular/Leaver determinant
-backend. The packaged catalog records exact rational χ keys, binary64 solver
-coordinates, Mω, angular A, residual and continued-fraction diagnostics,
-angular refinement, repeat-polish agreement, and branch-continuation evidence.
-All rows pass the declared numerical gates. Exact overlaps are compared with
-392 independently published Motohashi values; those values are comparison
-evidence and are not substituted for computed rows. The provider performs
-exact selection only—no interpolation, extrapolation, or nearby-spin aliasing.
-Formal root enclosure is not claimed and the scientific state remains
-`NOT_EVALUATED`.
+## Current boundary
 
-Providers beyond `linear-response` remain unavailable and fail closed. PR #3
-freezes the M01 release domain, source receipts, module ownership, conventions,
-evidence ceilings, and missing-input ledger without changing the accepted
-spectrum. PR #4 begins the distinct `linear-response` migration; PR #5 installs
-the M02 planner, resumable campaign, uncertainty/projective reduction, and
-fail-closed admission machinery. No M02 scientific evidence is shipped: the
-linear-response provider remains unavailable by default and can be registered
-only from a complete operator package that passes the 212-leaf and 57-row
-admission gates. The canonical M02 B′ campaign comprises 140 primary, 24
-control, and 48 deep leaves. Reduction inputs are value-bound to their
-authenticated checkpoint records, and all 57 payload comparisons are
-value-bound to the sealed reduction. Each produced record carries its complete
-checkpoint root identity; admission reconciles the resulting 48-root campaign
-set against the installed catalog before the package seals the spectral
-provider/request/payload
-identity. Admission and replay therefore reject catalog or root drift. See [the
-M01 release baseline](docs/release-baseline.md) and [the M02 PowerShell
-handoff](docs/m02-admission-powershell.md).
+The public control plane and authenticated pure-Kerr spectral catalogue are available. The packaged catalogue contains 2,736 roots over the declared ℓ, m, n, and spin domain, with exact-coordinate selection and recorded numerical diagnostics.
 
-M02 software work through PR #52 is merged, including the managed Julia/GSN
-runtime, checkpoint and cache contracts, promoted-precision worker, and the
-horizon-determinant rewrite: a three-leg solution basis on a verified
-real-inner tortoise contour, absolute error-aware Newton acceptance, and a
-mechanism-scoped precision policy that keeps exterior receipts written before
-the rewrite reusable while correctly retiring stale horizon ones. The
-promoted primary `horizon-admittance` component now performs one Julia root
-readout per precision stage in place of a multi-readout finite-amplitude
-ladder: PRIMARY accepts on `|D| / |D'| <= 2e-11` with zero post-Newton
-determinant evaluations and retains the accepted complex derivative;
-TRUNCATION and RESOLUTION each evaluate exactly one further determinant at
-the fixed PRIMARY frequency by reusing that derivative rather than resolving
-it independently. The derived response carries component identity
-`single-promoted-root-analytic-horizon-component/v1` and uncertainty status
-`UNCALIBRATED_ANALYTIC_RESPONSE`, with every error channel marked
-not-applicable rather than measured-zero; admission fails closed on that
-status.
+M02 linear response is an operator-run evidence pipeline. It can build and resume the response atlas, but the linear-response provider remains closed until the required certification, validation, reduction, and admission gates are satisfied.
 
-TASK-075 remains open only for the missing immutable receipt for the
-independent Black Hole Perturbation Toolkit Mathematica spheroidal validation
-source. TASK-079 is in progress alongside it, regularising the promoted GSN
-propagation and determinant conditioning that TASK-075 depends on; its
-acceptance criteria are unmet pending native operator execution evidence for
-the promoted Leaf 13 readout. TASK-076, blocked on both, then owns native
-Windows/Ubuntu cold/warm execution proof; TASK-077 owns the complete 212-leaf
-campaign; and TASK-078 owns reduction, provider admission, and M02 closure.
-PR #30 separately added a fail-closed M03 contract precursor, but no M03
-field artifact or provider is admitted.
+The machine-readable release authority is:
 
-The live delivery authority is [the TaskPlanner board](.tasks/README.md), with
-the active item in [.tasks/IN_PROGRESS.md](.tasks/IN_PROGRESS.md), the next
-dependency-ready item in [.tasks/NEXT.md](.tasks/NEXT.md), and chronological
-evidence in [.tasks/WORK_LOG.md](.tasks/WORK_LOG.md). Dated files under
-`docs/superpowers/` and `docs/keystone/` are historical design/implementation
-records; unchecked boxes there are not a second backlog. See the
-[documentation authority map](docs/README.md).
+```text
+src/windows_solver/data/release_domain_manifest.json
+```
 
-## Quick start on Windows
+The human reconciliation is:
 
-Clone or unpack the repository, open a 64-bit PowerShell in it, and provision a
-per-user managed runtime once:
+```text
+docs/release-baseline.md
+```
+
+Neither narrative documentation nor a successful campaign run may silently widen the admitted scientific scope.
+
+---
+
+## Windows quick start
+
+Open a 64-bit PowerShell in the repository root.
 
 ```powershell
 Set-ExecutionPolicy -Scope Process Bypass -Force
 .\runtime\bootstrap.ps1
 ```
 
-The normal runtime lives under
-`%LOCALAPPDATA%\Kerr-QNM_Windows-Solver\runtime-1\`, requires no administrator
-rights, adds no registry entry, and does not modify `PATH`. It persists when a
-solver ZIP is deleted or re-extracted. The bootstrap validates a healthy,
-64-bit CPython 3.12.13 first; if one is available it is used only as the source
-for the solver-owned virtual environment. Pinned NumPy/SciPy are installed only
-inside that environment, never into the system interpreter. A solver-managed
-CPython is downloaded only when no compatible interpreter exists.
+The normal managed runtime is stored under:
 
-Use checkout-local runtime bytes only when portability is explicitly needed:
-
-```powershell
-.\runtime\bootstrap.ps1 -PortableRuntime
+```text
+%LOCALAPPDATA%\Kerr-QNM_Windows-Solver\runtime-1\
 ```
 
-That mode uses the git-ignored `.runtime\` folder beside the checkout.
+It requires no administrator rights, does not modify the system `PATH`, and does not install packages into the system Python environment.
+
+Basic control-plane examples:
 
 ```powershell
 .\solver.ps1 plan .\examples\evidence-plan.json
@@ -117,96 +62,266 @@ That mode uses the git-ignored `.runtime\` folder beside the checkout.
 .\solver.ps1 run .\examples\spectrum.json --store .\.solver-store
 ```
 
-The core Python package has no required third-party Python dependency. Commands
-that execute the native response kernel, plus the complete packaged test suite,
-need the pinned NumPy and SciPy numerical tier:
+Provision the numerical Python tier when required:
 
 ```powershell
 .\runtime\bootstrap.ps1 -WithNumericalKernel
 ```
 
-The physical M02 campaign has a single stronger bootstrap tier. It validates an
-exact Julia 1.10.11 from the managed runtime, an existing system installation,
-or Juliaup before downloading solver-managed Julia. It then reuses or provisions
-the pinned numerical environment, contract-addressed persistent GSN/spheroidal
-source copies, M02 project, Julia depot/packages/artifacts/compiled cache, and
-the package-owned promoted worker. The complete 212-leaf provisional atlas is
-a single resumable survey command:
+Provision the complete M02 Python/Julia environment:
+
+```powershell
+.\runtime\bootstrap.ps1 -WithM02
+```
+
+The M02 environment is pinned to CPython 3.12 and Julia 1.10.11, with solver-owned package, depot, source, and generated-artifact locations.
+
+---
+
+## M02 campaign
+
+The canonical bundled selection is:
+
+```text
+examples/m02-campaign.json
+```
+
+For the current checkout it should resolve to the declared full-role campaign. The exact campaign ID, selection ID, leaf count, and role counts emitted by `campaign-plan` are authoritative for that commit. Do not hard-code an ID from an earlier checkpoint or pull request.
+
+Inspect the current plan before execution:
+
+```powershell
+.\solver.ps1 campaign-plan .\examples\m02-campaign.json --profile survey
+```
+
+### Start a new campaign
+
+A new campaign is always explicit:
+
+```powershell
+.\m02.ps1 `
+  -NewCampaign `
+  -Checkpoint .\m02-output\m02-campaign-checkpoint.json
+```
+
+A missing checkpoint never silently starts a new campaign.
+
+### Resume the binary64 survey
 
 ```powershell
 .\m02.ps1
 ```
 
-`survey` is the default execution profile. It records a bounded central
-response as `SCREENED`, advances past unresolved or contained failed leaves,
-and does not make heavy local or publication validation a prerequisite for
-atlas visibility. Later invocations reuse the checkpoint and exact shared
-exterior background/Domega evidence. The checkpoint report directory contains
-`m02-leaves.csv` and the ordered `m02-triage.json` certification queue.
-
-Targeted evidence upgrades use the same solver behind explicit profiles and
-require an existing checkpoint. One triage artifact carries the mixed
-primary/deep/control queue; the selected profile filters it to risk,
-projective-controller, and sentinel entries that still need that evidence
-level. Low-risk leaves remain visible as `REVIEW` rather than silently joining
-the heavy queue. A centre discrepancy also forces `REVIEW`; it is never
-automatically sent through the same heavy profile again:
+Equivalent explicit form:
 
 ```powershell
-.\m02.ps1 -Profile certify `
-  -TriageQueue .\m02-output\m02-campaign-checkpoint.reports\m02-triage.json
-.\m02.ps1 -Profile validate `
-  -TriageQueue .\m02-output\m02-campaign-checkpoint.reports\m02-triage.json
+.\m02.ps1 -Profile survey -SurveyPass binary64
 ```
 
-Certification and validation append evidence around the retained survey
-centre. A disagreement outside its retained disk is recorded for review rather
-than silently replacing the atlas value. `SCREENED` evidence is available to
-atlas and triage reports but remains inadmissible to release/publication
-reduction; those boundaries require at least `CERTIFIED` evidence.
+The binary64 survey:
 
-Generated coefficients live under the managed runtime's source-contract-scoped
-`generated\gsn\<contract-id>` directory (normally
-`%LOCALAPPDATA%\Kerr-QNM_Windows-Solver\runtime-1\generated\gsn\`). The
-`gsn-index.json` registry maps each scientific identity—spin weight, resolved
-`a/M`, binary64 campaign value, `m`, normalization, equation convention, and
-producer/consumer contract versions—to a short pair artifact such as
-`gsn-000001.json`. Direct-spin leaves retain their exact rational `a/M`;
-κ-derived leaves retain exact `Mκ` as origin metadata and use the exact integer
-ratio of the resolved campaign binary64 `a/M`. Every reuse validates the status
-and coefficient artifact itself. Missing or invalid records regenerate
-independently; measured SHA-256 values are recorded as observations only during
-development.
+- reuses exact compatible terminal records before constructing a backend;
+- performs the minimum fixed-root work required for a bounded response;
+- launches no Julia numerical worker;
+- records precision escalation in a durable promotion queue;
+- never performs promoted work inline;
+- advances only after committing the current pass disposition.
 
-To discard the persistent managed runtime and explicitly reprovision it, use:
+### Run the promoted survey
 
 ```powershell
-.\m02.ps1 -RebuildRuntime
+.\m02.ps1 -Profile survey -SurveyPass promoted
 ```
 
-The launcher resolves the virtual environment declared by the validated runtime
-receipt first, then its recorded interpreter source, an active `python` that is
-3.12 or newer, and finally the runtime selected by the Windows `py -3`
-launcher when that runtime is 3.12 or newer. Version probes report failure
-through the exit code alone, so a candidate that writes to stderr — notably the
-Windows App Execution Alias stub for `python.exe` — is skipped rather than
-aborting the launcher, and probe output never reaches command JSON.
+The promoted survey consumes only the durable promotion queue. It uses BF40 first and BF80 only for approved typed arithmetic insufficiency. BF120, publication certificates, diagnostic root ladders, and independent validation are not survey work.
 
-The equivalent Python commands are:
+### Certify screened results
+
+```powershell
+.\m02.ps1 -Profile certify
+```
+
+Certification consumes the canonical mixed-role triage queue and may add stronger local uncertainty and authentication evidence. It does not silently replace the retained numerical centre.
+
+### Validate selected publication or risk rows
+
+```powershell
+.\m02.ps1 -Profile validate -QueuePath <selection-or-queue.json>
+```
+
+Validation is explicit. It is reserved for publication rows, risk-selected sentinels, disagreement cases, near-zero components, projective controllers, and independent-route checks.
+
+There is no automatic transition between:
 
 ```text
-python -m windows_solver plan examples/evidence-plan.json
-python -m windows_solver run examples/problem-contract.json --store .solver-store
-python -m windows_solver run examples/spectrum.json --store .solver-store
+survey / binary64
+survey / promoted
+certify
+validate
 ```
 
-When running directly from a source checkout, set `PYTHONPATH=src` or install the package.
+---
 
-Study files are bounded to 4 MiB and 64 JSON nesting levels. Inputs beyond
-those limits return the same structured invalid-input contract as other schema
-errors.
+## Recovery
 
-## Commands
+Recovery is generic and count-agnostic. It may receive zero, one, or many compatible historical records.
+
+```powershell
+.\m02-recover.ps1 `
+  -Selection .\examples\m02-campaign.json `
+  -OutputCheckpoint .\m02-output\m02-campaign-checkpoint.schema11.candidate.json `
+  -Receipt .\m02-output\m02-recovery-receipt.json `
+  -SourceCheckpoint <optional-checkpoint> `
+  -SolvedLeafStore <optional-store> `
+  -RootReadoutStore <optional-store>
+```
+
+The recovery contract is:
+
+```text
+valid compatible terminal records supplied     N
+valid compatible terminal records recovered    N
+lost valid records                              0
+fabricated records                              0
+numerical recomputation                         0
+```
+
+`N` may be zero. No operator-specific archive, receipt count, filename, checkpoint hash, or incident fixture is a runtime prerequisite.
+
+Recovery writes a new candidate. Production cutover is a separate explicit action with a verified backup and atomic replacement.
+
+---
+
+## M02 state model
+
+M02 keeps scientific state, evidence strength, scheduler progress, and operational failure history separate.
+
+### Numerical record
+
+| State | Meaning |
+|---|---|
+| `PRODUCED` | Finite retained central response and bounded disk |
+| `UNRESOLVED` | The permitted numerical policy was exhausted without an admissible bounded response |
+| `REJECTED` | A validly constructed leaf failed an explicit scientific rejection rule |
+| `IN_PROGRESS` | Transient, never terminal |
+
+`FAILED` is not a numerical terminal state. It is operational history only.
+
+### Evidence level
+
+```text
+none → SCREENED → CERTIFIED → VALIDATED
+```
+
+Evidence upgrades are monotone and do not rewrite the retained numerical record.
+
+### Survey disposition
+
+| Disposition | Meaning |
+|---|---|
+| `CACHE_REUSED` | Exact terminal record reused with zero backend work |
+| `COMPLETED` | The requested survey pass completed |
+| `PROMOTION_PENDING_ROOT` | A later survey tier is required for the root |
+| `PROMOTION_PENDING_RESPONSE` | A later survey tier is required for the response |
+| `UNRESOLVED` | All work permitted by the active survey policy is exhausted |
+| `DEFERRED` | Explicitly postponed by policy, scheduling, or operator instruction |
+| `REJECTED` | Explicit scientific rejection after valid construction |
+
+A system defect, malformed worker response, schema defect, identity mismatch, unexpected exception, or work-budget breach writes a system-failure receipt and aborts the active pass. It is never converted into a completed scientific leaf.
+
+---
+
+## Dashboard
+
+The main M02 PowerShell window uses the Python in-process dashboard.
+
+Its rendering contract is:
+
+```text
+banner                         printed once
+campaign summary               printed once
+historical completed rows      printed once
+new completed row              appended once
+live execution                 exactly one bounded physical line
+heartbeat or state change      rewrites that same live line
+```
+
+The dashboard does not clear the screen, move the cursor upward, redraw multiple lines, or add heartbeat scrollback. It remains usable if advanced projective or triage reporting is degraded because authoritative counts come from the checkpoint and ledgers.
+
+Completed rows expose, where available:
+
+```text
+time
+leaf and mode
+spin
+mechanism
+survey pass
+evidence level
+precision tier
+binary64 / BF40 / BF80 / BF120 timing
+total timing
+response magnitude
+relative disk
+numerical state
+```
+
+Reconstructed historical timing is marked with `~`.
+
+---
+
+## Checkpoint reports
+
+After each committed checkpoint update, the basic projections are written independently:
+
+```text
+m02-leaves.csv
+m02-precision-stages.csv
+m02-error-channels.csv
+m02-resource-failures.csv
+```
+
+Advanced projections are separate:
+
+```text
+m02-projective.csv
+m02-triage.json
+```
+
+Projection status is recorded in:
+
+```text
+m02-report-status.json
+```
+
+An advanced-report failure must not remove or zero the basic campaign tables. A basic-report failure preserves the checkpoint and stops the active pass with an explicit reporting failure.
+
+The checkpoint and its ledgers are authoritative. CSV files and the dashboard are projections.
+
+---
+
+## Identity, caching, and immutability
+
+All reusable scientific work is content-addressed and identity-bound.
+
+Exact reuse requires agreement on every relevant scientific identity, including the root seal, branch, determinant family, normalization, mechanism or support mapping, numerical controls, precision tier, backend, and operation identity.
+
+Rules:
+
+- no approximate cache matching;
+- no nearby-spin aliases;
+- no timestamp-based scientific precedence;
+- no replacing a stronger terminal record with weaker or failed work;
+- no reusing a changed realised support mapping;
+- no cross-mechanism Dω reuse without exact-key agreement and an authenticated background-equivalence receipt;
+- no backend construction on an exact terminal cache hit.
+
+A valid `PRODUCED` record never becomes `UNRESOLVED`, `REJECTED`, or operationally failed. A valid `UNRESOLVED` record remains terminal on ordinary resume and runs again only through explicit requeue under a changed policy or selection.
+
+---
+
+## General command surface
+
+Core commands:
 
 ```text
 solver plan STUDY.json
@@ -214,74 +329,122 @@ solver run STUDY.json [--store PATH]
 solver verify RUN_ID [--store PATH] [--profile research|publication]
 solver inspect RUN_ID [--store PATH]
 solver export RUN_ID --output PACKAGE.json [--store PATH]
-solver validate-evidence BUNDLE
-solver response-plan SELECTION.json --checkpoint CHECKPOINT.json
-solver response-run SELECTION.json --checkpoint CHECKPOINT.json
-solver response-resume SELECTION.json --checkpoint CHECKPOINT.json
-solver response-validate SELECTION.json --checkpoint CHECKPOINT.json
-solver campaign-plan SELECTION.json [--profile survey|certify|validate]
-solver campaign-run SELECTION.json --checkpoint CHECKPOINT.json [--profile survey] [--progress quiet|normal|trace]
-solver campaign-resume SELECTION.json --checkpoint CHECKPOINT.json [--profile survey|certify|validate] [--progress quiet|normal|trace]
-solver campaign-validate SELECTION.json --checkpoint CHECKPOINT.json [--profile survey|certify|validate] [--full]
+```
+
+Campaign commands:
+
+```text
+solver campaign-plan SELECTION.json
+solver campaign-run SELECTION.json --checkpoint CHECKPOINT.json
+solver campaign-resume SELECTION.json --checkpoint CHECKPOINT.json
+solver campaign-validate SELECTION.json --checkpoint CHECKPOINT.json
 solver campaign-merge MANIFEST.json --output CHECKPOINT.json
-solver campaign-cache-import SELECTION.json --checkpoint CHECKPOINT.json [--store PATH]
 solver campaign-reduce REDUCTION-BUNDLE.json --output REDUCTION.json
-solver campaign-smoke
+```
+
+Admission commands:
+
+```text
+solver validate-evidence BUNDLE
 solver m02-validate ADMISSION-INPUT.json
 solver m02-admit ADMISSION-INPUT.json --output ADMITTED.json
 solver m02-export ADMITTED.json --admission-id ID --output EXPORTED.json
-solver plan STUDY.json --linear-response-admission ADMITTED.json --linear-response-admission-id ID
-solver run STUDY.json --linear-response-admission ADMITTED.json --linear-response-admission-id ID [--store PATH]
 ```
 
-Every command emits one deterministic JSON value: successful results on stdout and failures on stderr. A provider execution failure returns exit code `1`, invalid input returns `2`, an unavailable provider returns `3`, failed verification returns `4`, and storage/output failure returns `5`. Failed runs include their sealed run record in the structured error and remain available to `inspect`.
+Use `solver --help` or the corresponding `*.ps1` wrapper for the exact options supported by the checked-out commit.
 
-`verify --profile research` checks a successful run's complete dependency
-closure, artifact hashes, request identity, ordered lineage, provider contracts,
-execution accounting, and evidence propagation. `--profile publication` adds
-a hard requirement for a complete evidence-package run whose numerical and
-scientific dimensions were evaluated. A publication check may still verify an
-`UNRESOLVED` or `CONTRADICTED` conclusion: verification establishes intact
-evidence, not a favorable scientific outcome.
+---
 
-## Evidence semantics
-
-A result records independent state dimensions:
+## Repository map
 
 ```text
-execution = SUCCEEDED
-numerical = CONVERGED
-scientific = UNRESOLVED
+src/windows_solver/        production Python package
+src/windows_solver/data/   packaged scientific data, manifests, licences, and Julia sources
+runtime/                   managed-runtime bootstrap and discovery
+examples/                  canonical study and campaign inputs
+tests/                     software, contract, migration, and regression tests
+tools/                     offline generation, validation, and diagnostic utilities
+docs/                      current architecture and operator runbooks only
+.tasks/                    current delivery board only
 ```
 
-An unresolved or contradicted scientific result may still be a valid, successfully produced artifact. Conversely, a successful process does not prove numerical convergence or a physical claim.
+Historical design plans, PR handovers, implementation scratch reports, and superseded architecture documents belong in Git history, not the active documentation surface.
 
-Artifact identities cover the capability-scoped study inputs, mechanism and convention identities, equations, provider implementation, runtime, relevant numerical policy, upstream artifacts, evidence, and payload. Repeating an identical request reuses the verified artifact and performs zero provider work. A numerical-policy key named for a capability applies only to that capability; other policy keys are global. Changing a detector-only policy therefore reuses unchanged spectral and response artifacts.
+---
 
-Run records are content-sealed and verification reconstructs the expected
-capability closure rather than trusting the record's artifact list. Cache
-bindings are accepted only when their key recomputes from the loaded artifact's
-capability, provider, request, and ordered upstream identities.
-The run record retains the complete user request, while each provider receives
-only its canonical capability-scoped request. Upstream artifacts are exposed as
-deeply immutable snapshots so a provider cannot change an input after its
-identity was computed.
+## Documentation authority
 
-See [architecture.md](docs/architecture.md) for the dependency graph, provider admission rules, and artifact contract.
+Use the following order when documents disagree:
 
-## Development
+1. machine-readable manifests, authenticated artifacts, checkpoint receipts, and emitted identities;
+2. current production code and passing contract tests;
+3. this README, `docs/architecture.md`, and the current operator runbooks;
+4. `.tasks/` for delivery state only;
+5. Git history for superseded decisions and provenance.
+
+The active operator runbooks are:
 
 ```text
-python -m compileall -q src tests
+docs/response-replay-powershell.md
+docs/evidence-intake-powershell.md
+docs/m02-admission-powershell.md
+```
+
+A pull-request description, old implementation plan, dated handover, unchecked historical checkbox, or archived benchmark does not override current code or the authorities above.
+
+The delivery board has one live source:
+
+```text
+.tasks/IN_PROGRESS.md
+.tasks/NEXT.md
+.tasks/BACKLOG.md
+.tasks/DONE.md
+.tasks/REJECTED.md
+.tasks/WORK_LOG.md
+```
+
+Do not create a second backlog or treat historical plans as executable instructions.
+
+---
+
+## Development and verification
+
+Run the permitted software suite from a source checkout:
+
+```powershell
+$env:PYTHONPATH = "src"
 python -m unittest discover -s tests -v
+python tools/validate_release_manifest.py
+python .tasks/validate_board.py
 ```
 
-The core package requires Python 3.12 and has no required dependencies outside
-the standard library. The offline lattice builder and native response kernel
-use the pinned numerical extra; promoted M02 execution additionally uses the
-solver-managed Julia environment. The installed spectral provider itself
-selects exact rows from the hash-authenticated packaged result.
+These checks establish software, schema, migration, serialization, orchestration, and static worker contracts. They do not replace native mathematical evidence.
 
-<!-- TASKPLANNER:ATTRIBUTION:START -->
-This project uses [TaskPlanner](https://github.com/smekai/taskplanner) for task planning.
-<!-- TASKPLANNER:ATTRIBUTION:END -->
+Production Kerr/GSN campaigns and native PowerShell/Python/Julia canaries are operator-run. A development agent must not use the production campaign as a unit test or silently substitute mocked success for a required native boundary.
+
+---
+
+## Evidence and release discipline
+
+The solver reports the weakest supported conclusion.
+
+- `SCREENED` is sufficient for provisional atlas visibility and triage.
+- `CERTIFIED` adds the required local authentication and uncertainty evidence.
+- `VALIDATED` adds explicit independent or publication-grade checks.
+- `SCREENED` alone is not release-admissible.
+- A discrepancy outside the retained disk is recorded; it does not silently replace the centre.
+- `UNRESOLVED` and adverse outcomes remain valid evidence when their provenance is intact.
+
+Release admission is explicit, content-sealed, and fail-closed.
+
+---
+
+## Notices and licences
+
+See [`NOTICE.md`](NOTICE.md) for project notices and the licence files under:
+
+```text
+src/windows_solver/data/
+src/windows_solver/data/julia/GeneralizedSasakiNakamura.jl/
+src/windows_solver/data/julia/SpinWeightedSpheroidalHarmonics.jl/
+```
