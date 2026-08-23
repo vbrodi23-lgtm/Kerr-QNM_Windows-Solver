@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import csv
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from decimal import Decimal
 import hashlib
 import json
@@ -16,8 +17,9 @@ import math
 import os
 from pathlib import Path
 import tempfile
-from typing import Mapping, Sequence
+from typing import Callable, Mapping, Sequence
 
+from .contracts import canonical_json_bytes
 from .response_batches import (
     CampaignLeafRecord,
     CampaignPlan,
@@ -34,10 +36,66 @@ from .response_reduction import (
     build_projective_row_plans,
     reduce_projective_rows,
 )
-from .campaign_triage import (
-    CampaignTriageReport,
-    build_campaign_triage,
-    write_campaign_triage_report,
+
+
+SCHEMA11_LEAF_COLUMNS = (
+    "leaf_ordinal",
+    "leaf_id",
+    "role",
+    "mode",
+    "spin_or_Mkappa",
+    "mechanism",
+    "numerical_state",
+    "evidence_level",
+    "binary64_pass_disposition",
+    "promoted_pass_disposition",
+    "promotion_reason",
+    "execution_profile",
+    "survey_pass",
+    "precision_tier",
+    "binary64_seconds",
+    "bf40_seconds",
+    "bf80_seconds",
+    "bf120_seconds",
+    "total_seconds",
+    "response_real",
+    "response_imaginary",
+    "response_magnitude",
+    "response_disk_radius",
+    "relative_disk_radius",
+    "record_sha256",
+    "stage_sha256",
+    "receipt_sha256",
+)
+
+SCHEMA11_PRECISION_STAGE_COLUMNS = (
+    "leaf_ordinal",
+    "leaf_id",
+    "stage_index",
+    "precision_tier",
+    "stage_sha256",
+    "record_sha256",
+)
+
+SCHEMA11_ERROR_CHANNEL_COLUMNS = (
+    "leaf_ordinal",
+    "leaf_id",
+    "stage_index",
+    "channel_index",
+    "family",
+    "signed_delta_real",
+    "signed_delta_imaginary",
+    "stage_sha256",
+    "record_sha256",
+)
+
+SCHEMA11_RESOURCE_FAILURE_COLUMNS = (
+    "failure_ordinal",
+    "leaf_id",
+    "failure_code",
+    "cause_type",
+    "fingerprint_sha256",
+    "receipt_sha256",
 )
 
 
@@ -120,10 +178,6 @@ LEAF_COLUMNS = (
     "spin_binary64_hex",
     "mechanism",
     "terminal_state",
-    "execution_profile",
-    "evidence_level",
-    "evidence_receipt_count",
-    "evidence_discrepancy_codes",
     "component_status",
     "precision_digits",
     "precision_tier",
@@ -256,6 +310,22 @@ RESOURCE_FAILURE_COLUMNS = (
     "checkpoint_source_receipt",
 )
 
+PRECISION_STAGE_COLUMNS = (
+    "leaf_ordinal",
+    "leaf_id",
+    "stage_index",
+    "root",
+    "precision_digits",
+    "numerical_state",
+    "component_status",
+    "converged",
+    "branch_ok",
+    "determinant_abs",
+    "newton_correction",
+    "newton_correction_over_tolerance",
+    "root_displacement_abs",
+)
+
 
 @dataclass(frozen=True, slots=True)
 class CampaignReportModel:
@@ -267,7 +337,6 @@ class CampaignReportModel:
     checkpoint_source_receipt: str
     precision_stage_rows: tuple[Mapping[str, object], ...] = ()
     resource_failure_rows: tuple[Mapping[str, object], ...] = ()
-    triage_report: CampaignTriageReport | None = None
 
 
 def report_directory_for_checkpoint(checkpoint_path: str | os.PathLike[str]) -> Path:
@@ -561,26 +630,6 @@ def _leaf_row(
         "spin_binary64_hex": domain_leaf.spin.hex(),
         "mechanism": leaf.mechanism_id,
         "terminal_state": "PENDING" if record is None else record.state,
-        "execution_profile": (
-            ""
-            if record is None or record.evidence is None
-            else record.evidence.execution_profile.value
-        ),
-        "evidence_level": (
-            ""
-            if record is None or record.evidence is None
-            else record.evidence.evidence_level.value
-        ),
-        "evidence_receipt_count": (
-            0
-            if record is None or record.evidence is None
-            else len(record.evidence.receipts)
-        ),
-        "evidence_discrepancy_codes": (
-            ""
-            if record is None or record.evidence is None
-            else _json_cell(record.evidence.discrepancy_codes)
-        ),
         "run_provenance": provenance if record is not None else "",
         "root_reference_id": job.root.root_reference_id,
         "root_identity_sha256": job.root.identity_sha256,
@@ -593,10 +642,6 @@ def _leaf_row(
 
     stage = record.stages[-1]
     outcome = stage.outcome
-    if not row["execution_profile"]:
-        raw_profile = outcome.component_result.get("execution_profile")
-        if isinstance(raw_profile, str):
-            row["execution_profile"] = raw_profile
     precision = precision_tier_presentation(outcome.digits)
     result = _component_result(record)
     row.update({
@@ -615,20 +660,6 @@ def _leaf_row(
         "record_sha256": record.record_sha256,
         "stage_sha256": stage.stage_sha256,
     })
-    semantic_trace = outcome.component_result.get(
-        "semantic_precision_tier_trace"
-    )
-    if (
-        isinstance(semantic_trace, list)
-        and semantic_trace
-        and semantic_trace[-1] in {
-            "bigfloat-40", "bigfloat-80", "bigfloat-120"
-        }
-    ):
-        row["precision_tier"] = semantic_trace[-1]
-        row["precision_decimal_digits_nominal"] = semantic_trace[-1].rsplit(
-            "-", 1
-        )[-1]
     if result is None:
         return row
 
@@ -890,6 +921,7 @@ def project_campaign_reports(
     checkpoint_path: str | os.PathLike[str],
     *,
     run_provenance: Mapping[str, str] | None = None,
+    include_advanced: bool = True,
 ) -> CampaignReportModel:
     """Authenticate and normalize one committed checkpoint without changing it."""
 
@@ -929,6 +961,18 @@ def project_campaign_reports(
             source_receipt=source_receipt,
         )
     )
+    resource_failure_rows = _resource_failure_rows(
+        plan, summary, source_receipt=source_receipt
+    )
+    if not include_advanced:
+        return CampaignReportModel(
+            leaf_rows=leaf_rows,
+            precision_stage_rows=precision_stage_rows,
+            error_channel_rows=error_rows,
+            projective_rows=(),
+            resource_failure_rows=resource_failure_rows,
+            checkpoint_source_receipt=source_receipt,
+        )
 
     row_plans = build_projective_row_plans()
     projective_component_ids = {
@@ -1040,16 +1084,6 @@ def project_campaign_reports(
         }
         for row_plan, result in zip(reduction.plans, reduction.results)
     )
-    resource_failure_rows = _resource_failure_rows(
-        plan, summary, source_receipt=source_receipt
-    )
-    triage_report = build_campaign_triage(
-        plan,
-        summary,
-        leaf_rows,
-        projective_rows,
-        checkpoint_source_receipt=source_receipt,
-    )
     return CampaignReportModel(
         leaf_rows=leaf_rows,
         precision_stage_rows=precision_stage_rows,
@@ -1057,7 +1091,6 @@ def project_campaign_reports(
         projective_rows=projective_rows,
         resource_failure_rows=resource_failure_rows,
         checkpoint_source_receipt=source_receipt,
-        triage_report=triage_report,
     )
 
 
@@ -1102,38 +1135,615 @@ def _atomic_csv(
         raise
 
 
+def _atomic_json(path: Path, value: object) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        dir=path.parent,
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+    )
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(canonical_json_bytes(value))
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_name, path)
+    except BaseException:
+        try:
+            os.unlink(temporary_name)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def _projection_status(
+    status: str, error: Exception | None = None
+) -> dict[str, object]:
+    return {
+        "status": status,
+        "error_type": None if error is None else type(error).__name__,
+        "message": None if error is None else str(error),
+    }
+
+
+def _write_report_status(
+    directory: Path,
+    checkpoint_source_receipt: str,
+    *,
+    basic: Mapping[str, object],
+    projective: Mapping[str, object],
+    triage: Mapping[str, object],
+) -> None:
+    content: dict[str, object] = {
+        "schema": "windows-solver.m02-report-status/v1",
+        "checkpoint_source_receipt": checkpoint_source_receipt,
+        "basic": dict(basic),
+        "projective": dict(projective),
+        "triage": dict(triage),
+    }
+    receipt = {
+        **content,
+        "receipt_sha256": hashlib.sha256(canonical_json_bytes(content)).hexdigest(),
+    }
+    _atomic_json(directory / "m02-report-status.json", receipt)
+
+
 def refresh_campaign_reports(
     plan: CampaignPlan,
     checkpoint_path: str | os.PathLike[str],
     *,
     run_provenance: Mapping[str, str] | None = None,
+    advanced_triage: Callable[[CampaignReportModel, Path], None] | None = None,
 ) -> CampaignReportModel:
-    """Atomically refresh all disposable CSV views beside a checkpoint."""
+    """Refresh basic reports first; contain projective and triage failures."""
 
-    model = project_campaign_reports(
-        plan,
-        checkpoint_path,
-        run_provenance=run_provenance,
-    )
     directory = report_directory_for_checkpoint(checkpoint_path)
-    _atomic_csv(directory / "m02-leaves.csv", LEAF_COLUMNS, model.leaf_rows)
-    _atomic_csv(
-        directory / "m02-error-channels.csv",
-        ERROR_CHANNEL_COLUMNS,
-        model.error_channel_rows,
-    )
-    _atomic_csv(
-        directory / "m02-projective.csv",
-        PROJECTIVE_COLUMNS,
-        model.projective_rows,
-    )
-    _atomic_csv(
-        directory / "m02-resource-failures.csv",
-        RESOURCE_FAILURE_COLUMNS,
-        model.resource_failure_rows,
-    )
-    if model.triage_report is not None:
-        write_campaign_triage_report(
-            directory / "m02-triage.json", model.triage_report
+    try:
+        basic_model = project_campaign_reports(
+            plan,
+            checkpoint_path,
+            run_provenance=run_provenance,
+            include_advanced=False,
         )
+        _atomic_csv(
+            directory / "m02-leaves.csv", LEAF_COLUMNS, basic_model.leaf_rows
+        )
+        _atomic_csv(
+            directory / "m02-precision-stages.csv",
+            PRECISION_STAGE_COLUMNS,
+            basic_model.precision_stage_rows,
+        )
+        _atomic_csv(
+            directory / "m02-error-channels.csv",
+            ERROR_CHANNEL_COLUMNS,
+            basic_model.error_channel_rows,
+        )
+        _atomic_csv(
+            directory / "m02-resource-failures.csv",
+            RESOURCE_FAILURE_COLUMNS,
+            basic_model.resource_failure_rows,
+        )
+    except Exception as error:
+        checkpoint_bytes = Path(checkpoint_path).read_bytes()
+        source_receipt = "sha256:" + hashlib.sha256(checkpoint_bytes).hexdigest()
+        _write_report_status(
+            directory,
+            source_receipt,
+            basic=_projection_status("FAILED", error),
+            projective=_projection_status("NOT_RUN"),
+            triage=_projection_status("NOT_RUN"),
+        )
+        raise
+
+    basic_status = _projection_status("COMPLETED")
+    projective_status = _projection_status("NOT_RUN")
+    triage_status = _projection_status(
+        "NOT_CONFIGURED" if advanced_triage is None else "NOT_RUN"
+    )
+    model = basic_model
+    try:
+        advanced_model = project_campaign_reports(
+            plan,
+            checkpoint_path,
+            run_provenance=run_provenance,
+            include_advanced=True,
+        )
+        _atomic_csv(
+            directory / "m02-projective.csv",
+            PROJECTIVE_COLUMNS,
+            advanced_model.projective_rows,
+        )
+        model = advanced_model
+        projective_status = _projection_status("COMPLETED")
+    except Exception as error:
+        projective_status = _projection_status("FAILED", error)
+
+    if advanced_triage is not None and projective_status["status"] == "COMPLETED":
+        try:
+            advanced_triage(model, directory)
+            triage_status = _projection_status("COMPLETED")
+        except Exception as error:
+            triage_status = _projection_status("FAILED", error)
+    elif advanced_triage is not None:
+        triage_status = _projection_status("NOT_RUN")
+
+    _write_report_status(
+        directory,
+        basic_model.checkpoint_source_receipt,
+        basic=basic_status,
+        projective=projective_status,
+        triage=triage_status,
+    )
     return model
+
+
+def _schema11_checkpoint_receipt(checkpoint: Mapping[str, object]) -> str:
+    scientific = dict(checkpoint)
+    scientific["report_status_receipt"] = None
+    return hashlib.sha256(canonical_json_bytes(scientific)).hexdigest()
+
+
+def _schema11_complex(value: object) -> complex | None:
+    if not isinstance(value, Mapping):
+        return None
+    imaginary = value.get("imaginary", value.get("imag"))
+    try:
+        result = complex(float(value["real"]), float(imaginary))
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return None
+    return result if math.isfinite(result.real) and math.isfinite(result.imag) else None
+
+
+def _schema11_record_response(
+    record: Mapping[str, object],
+) -> tuple[complex | None, float | None]:
+    centre = _schema11_complex(record.get("retained_centre"))
+    stages = record.get("stages")
+    if not isinstance(stages, list) or not stages:
+        return centre, None
+    stage = stages[-1]
+    if not isinstance(stage, Mapping):
+        return centre, None
+    disk = stage.get("response_disk")
+    if isinstance(disk, Mapping):
+        centre = centre or _schema11_complex(disk.get("centre"))
+        try:
+            radius = float(disk["radius"])
+        except (KeyError, TypeError, ValueError, OverflowError):
+            radius = None
+        if radius is not None and (not math.isfinite(radius) or radius < 0):
+            radius = None
+        return centre, radius
+    try:
+        parsed = CampaignLeafRecord.from_mapping(record)
+        raw = parsed.stages[-1].outcome.component_result.get("result")
+        result = ComponentResult.from_mapping(raw) if isinstance(raw, Mapping) else None
+    except (TypeError, ValueError):
+        result = None
+    if result is None:
+        return centre, None
+    return result.response, sum(result.error_channels.values())
+
+
+def _schema11_stage_tier(stage: Mapping[str, object]) -> str | None:
+    tier = stage.get("precision_tier")
+    if isinstance(tier, str):
+        return tier
+    outcome = stage.get("outcome")
+    digits = outcome.get("digits") if isinstance(outcome, Mapping) else stage.get("digits")
+    if isinstance(digits, int):
+        return "binary64" if digits == 64 else f"BF{digits}"
+    return None
+
+
+def _schema11_timing(
+    binary: Mapping[str, object] | None,
+    promoted: Mapping[str, object] | None,
+) -> dict[str, float]:
+    totals = {"binary64": 0.0, "BF40": 0.0, "BF80": 0.0, "BF120": 0.0}
+    for entry in (binary, promoted):
+        if not isinstance(entry, Mapping):
+            continue
+        timing = entry.get("tier_timing")
+        if not isinstance(timing, list):
+            continue
+        for item in timing:
+            if not isinstance(item, Mapping) or item.get("tier") not in totals:
+                continue
+            totals[str(item["tier"])] += float(item["elapsed_seconds"])
+    return totals
+
+
+def _schema11_basic_rows(
+    plan: object,
+    selection: object,
+    checkpoint: Mapping[str, object],
+) -> tuple[
+    tuple[Mapping[str, object], ...],
+    tuple[Mapping[str, object], ...],
+    tuple[Mapping[str, object], ...],
+    tuple[Mapping[str, object], ...],
+]:
+    leaf_by_id = {leaf.leaf_id: leaf for leaf in getattr(plan, "leaves")}
+    ordered = tuple(getattr(selection, "leaf_ids"))
+    record_by_id = {record["leaf_id"]: record for record in checkpoint["records"]}
+    evidence = checkpoint["evidence_ledger"]
+    binary_ledger = checkpoint["survey_pass_ledger"]["binary64"]
+    promoted_ledger = checkpoint["survey_pass_ledger"]["promoted"]
+    queue_reason = {
+        item["leaf_id"]: item["reason_code"]
+        for item in checkpoint["promotion_queue"]["entries"]
+    }
+    leaf_rows: list[Mapping[str, object]] = []
+    stage_rows: list[Mapping[str, object]] = []
+    channel_rows: list[Mapping[str, object]] = []
+    for ordinal, leaf_id in enumerate(ordered, start=1):
+        leaf = leaf_by_id[leaf_id]
+        record = record_by_id.get(leaf_id)
+        binary = binary_ledger.get(leaf_id)
+        promoted = promoted_ledger.get(leaf_id)
+        evidence_entry = evidence.get(leaf_id)
+        centre, radius = (
+            (None, None)
+            if record is None
+            else _schema11_record_response(record)
+        )
+        magnitude = None if centre is None else abs(centre)
+        relative = (
+            None
+            if magnitude in (None, 0) or radius is None
+            else radius / magnitude
+        )
+        timings = _schema11_timing(binary, promoted)
+        stages = [] if record is None else record.get("stages", [])
+        last_stage = stages[-1] if isinstance(stages, list) and stages else {}
+        precision_tier = (
+            None
+            if not isinstance(last_stage, Mapping)
+            else _schema11_stage_tier(last_stage)
+        )
+        receipts = (
+            evidence_entry.get("receipts", [])
+            if isinstance(evidence_entry, Mapping)
+            else []
+        )
+        receipt_sha = None
+        if isinstance(receipts, list) and receipts and isinstance(receipts[-1], Mapping):
+            receipt_sha = receipts[-1].get("receipt_sha256")
+        terminal_state = None if record is None else record["state"]
+        if terminal_state is None and isinstance(promoted, Mapping):
+            terminal_state = promoted["disposition"]
+        if terminal_state is None and isinstance(binary, Mapping):
+            terminal_state = binary["disposition"]
+        leaf_rows.append({
+            "leaf_ordinal": ordinal,
+            "leaf_id": leaf_id,
+            "role": leaf.role,
+            "mode": leaf.leaf.mode_label,
+            "spin_or_Mkappa": leaf.job.spin,
+            "mechanism": leaf.mechanism_id,
+            "numerical_state": terminal_state or "NOT_ATTEMPTED",
+            "evidence_level": (
+                None if not isinstance(evidence_entry, Mapping)
+                else evidence_entry["evidence_level"]
+            ),
+            "binary64_pass_disposition": (
+                None if not isinstance(binary, Mapping) else binary["disposition"]
+            ),
+            "promoted_pass_disposition": (
+                None if not isinstance(promoted, Mapping) else promoted["disposition"]
+            ),
+            "promotion_reason": queue_reason.get(leaf_id),
+            "execution_profile": (
+                "VALIDATE" if isinstance(evidence_entry, Mapping)
+                and evidence_entry["evidence_level"] == "VALIDATED"
+                else "CERTIFY" if isinstance(evidence_entry, Mapping)
+                and evidence_entry["evidence_level"] == "CERTIFIED"
+                else "SURVEY"
+            ),
+            "survey_pass": (
+                "promoted" if isinstance(promoted, Mapping)
+                else "binary64" if isinstance(binary, Mapping) else None
+            ),
+            "precision_tier": precision_tier,
+            "binary64_seconds": timings["binary64"],
+            "bf40_seconds": timings["BF40"],
+            "bf80_seconds": timings["BF80"],
+            "bf120_seconds": timings["BF120"],
+            "total_seconds": sum(timings.values()),
+            "response_real": None if centre is None else centre.real,
+            "response_imaginary": None if centre is None else centre.imag,
+            "response_magnitude": magnitude,
+            "response_disk_radius": radius,
+            "relative_disk_radius": relative,
+            "record_sha256": None if record is None else record["record_sha256"],
+            "stage_sha256": (
+                last_stage.get("stage_sha256")
+                if isinstance(last_stage, Mapping) else None
+            ),
+            "receipt_sha256": receipt_sha,
+        })
+        if record is None or not isinstance(stages, list):
+            continue
+        for stage_index, stage in enumerate(stages):
+            if not isinstance(stage, Mapping):
+                continue
+            stage_rows.append({
+                "leaf_ordinal": ordinal,
+                "leaf_id": leaf_id,
+                "stage_index": stage_index,
+                "precision_tier": _schema11_stage_tier(stage),
+                "stage_sha256": stage.get("stage_sha256"),
+                "record_sha256": record["record_sha256"],
+            })
+            raw_channels = stage.get("signed_error_channels")
+            if raw_channels is None and isinstance(stage.get("outcome"), Mapping):
+                raw_channels = stage["outcome"].get("signed_error_channels")
+            if not isinstance(raw_channels, list):
+                continue
+            for channel_index, channel in enumerate(raw_channels):
+                if not isinstance(channel, Mapping):
+                    continue
+                delta = _schema11_complex(channel.get("signed_delta"))
+                channel_rows.append({
+                    "leaf_ordinal": ordinal,
+                    "leaf_id": leaf_id,
+                    "stage_index": stage_index,
+                    "channel_index": channel_index,
+                    "family": channel.get("family"),
+                    "signed_delta_real": None if delta is None else delta.real,
+                    "signed_delta_imaginary": None if delta is None else delta.imag,
+                    "stage_sha256": stage.get("stage_sha256"),
+                    "record_sha256": record["record_sha256"],
+                })
+    failures = tuple({
+        "failure_ordinal": ordinal,
+        "leaf_id": item.get("leaf_id"),
+        "failure_code": item.get("failure_code"),
+        "cause_type": item.get("cause_type"),
+        "fingerprint_sha256": item.get("fingerprint_sha256"),
+        "receipt_sha256": item.get("receipt_sha256"),
+    } for ordinal, item in enumerate(checkpoint["system_failures"], start=1))
+    return tuple(leaf_rows), tuple(stage_rows), tuple(channel_rows), failures
+
+
+def _schema11_projection_status(
+    status: str,
+    *,
+    timestamp: str,
+    paths: Sequence[Path] = (),
+    error: Exception | None = None,
+) -> dict[str, object]:
+    outputs = [{
+        "path": str(path),
+        "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+    } for path in paths if path.is_file()]
+    error_receipt = None
+    if error is not None:
+        error_content = {
+            "error_type": type(error).__name__,
+            "message": str(error),
+        }
+        error_receipt = {
+            **error_content,
+            "receipt_sha256": hashlib.sha256(
+                canonical_json_bytes(error_content)
+            ).hexdigest(),
+        }
+    return {
+        "status": status,
+        "updated_at_utc": timestamp,
+        "outputs": outputs,
+        "error_receipt": error_receipt,
+    }
+
+
+def refresh_schema11_reports(
+    plan: object,
+    selection: object,
+    checkpoint: Mapping[str, object],
+    checkpoint_path: str | os.PathLike[str],
+    *,
+    basic_writer: Callable[[Path, Mapping[str, object]], None] | None = None,
+    advanced_projective: Callable[[Mapping[str, object], Path], None] | None = None,
+    advanced_triage: Callable[[Mapping[str, object], Path], None] | None = None,
+    persist_checkpoint: bool = True,
+) -> dict[str, object]:
+    """Atomically project schema-11 basics; contain advanced failures."""
+
+    from .campaign_policy import validate_schema11_checkpoint
+
+    path = Path(checkpoint_path)
+    validated = validate_schema11_checkpoint(checkpoint)
+    directory = report_directory_for_checkpoint(path)
+    timestamp = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    source_receipt = _schema11_checkpoint_receipt(validated)
+    basic_paths = tuple(directory / name for name in (
+        "m02-leaves.csv",
+        "m02-precision-stages.csv",
+        "m02-error-channels.csv",
+        "m02-resource-failures.csv",
+    ))
+    projections: dict[str, object] = {}
+    try:
+        leaf_rows, stage_rows, channel_rows, failure_rows = _schema11_basic_rows(
+            plan, selection, validated
+        )
+        projections = {
+            "leaves": leaf_rows,
+            "precision_stages": stage_rows,
+            "error_channels": channel_rows,
+            "resource_failures": failure_rows,
+        }
+        if basic_writer is None:
+            _atomic_csv(basic_paths[0], SCHEMA11_LEAF_COLUMNS, leaf_rows)
+            _atomic_csv(
+                basic_paths[1], SCHEMA11_PRECISION_STAGE_COLUMNS, stage_rows
+            )
+            _atomic_csv(
+                basic_paths[2], SCHEMA11_ERROR_CHANNEL_COLUMNS, channel_rows
+            )
+            _atomic_csv(
+                basic_paths[3], SCHEMA11_RESOURCE_FAILURE_COLUMNS, failure_rows
+            )
+        else:
+            basic_writer(directory, projections)
+        basic_status = _schema11_projection_status(
+            "COMPLETED", timestamp=timestamp, paths=basic_paths
+        )
+    except Exception as error:
+        basic_status = _schema11_projection_status(
+            "FAILED", timestamp=timestamp, paths=basic_paths, error=error
+        )
+        status_content = {
+            "schema": "windows-solver.m02-schema11-report-status/v1",
+            "checkpoint_source_receipt": source_receipt,
+            "basic": basic_status,
+            "projective": _schema11_projection_status(
+                "NOT_RUN", timestamp=timestamp
+            ),
+            "triage": _schema11_projection_status("NOT_RUN", timestamp=timestamp),
+        }
+        status = {
+            **status_content,
+            "receipt_sha256": hashlib.sha256(
+                canonical_json_bytes(status_content)
+            ).hexdigest(),
+        }
+        _atomic_json(directory / "m02-report-status.json", status)
+        validated["report_status_receipt"] = status
+        if persist_checkpoint:
+            _atomic_json(path, validated)
+        raise
+
+    def run_advanced(
+        callback: Callable[[Mapping[str, object], Path], None] | None,
+        output_name: str,
+    ) -> dict[str, object]:
+        if callback is None:
+            return _schema11_projection_status("NOT_CONFIGURED", timestamp=timestamp)
+        output = directory / output_name
+        try:
+            callback(validated, directory)
+            return _schema11_projection_status(
+                "COMPLETED", timestamp=timestamp, paths=(output,)
+            )
+        except Exception as error:
+            return _schema11_projection_status(
+                "FAILED", timestamp=timestamp, paths=(output,), error=error
+            )
+
+    projective_status = run_advanced(advanced_projective, "m02-projective.csv")
+    triage_status = (
+        _schema11_projection_status("NOT_RUN", timestamp=timestamp)
+        if advanced_triage is not None and projective_status["status"] == "FAILED"
+        else run_advanced(advanced_triage, "m02-triage.json")
+    )
+    status_content = {
+        "schema": "windows-solver.m02-schema11-report-status/v1",
+        "checkpoint_source_receipt": source_receipt,
+        "basic": basic_status,
+        "projective": projective_status,
+        "triage": triage_status,
+    }
+    status = {
+        **status_content,
+        "receipt_sha256": hashlib.sha256(
+            canonical_json_bytes(status_content)
+        ).hexdigest(),
+    }
+    _atomic_json(directory / "m02-report-status.json", status)
+    validated["report_status_receipt"] = status
+    if persist_checkpoint:
+        _atomic_json(path, validated)
+    return validate_schema11_checkpoint(validated)
+
+
+def write_schema11_triage(
+    plan: object,
+    selection: object,
+    checkpoint: Mapping[str, object],
+    directory: Path,
+) -> None:
+    """Write the authenticated mixed-role certification queue after survey."""
+
+    from .campaign_evidence import EvidenceStrengtheningPolicy
+    from .campaign_policy import EvidenceLevel
+    from .campaign_triage import (
+        TriageLeaf,
+        TriagePolicy,
+        build_whole_atlas_triage,
+    )
+
+    leaf_by_id = {leaf.leaf_id: leaf for leaf in getattr(plan, "leaves")}
+    records = {record["leaf_id"]: record for record in checkpoint["records"]}
+    evidence = checkpoint["evidence_ledger"]
+    binary = checkpoint["survey_pass_ledger"]["binary64"]
+    promoted = checkpoint["survey_pass_ledger"]["promoted"]
+    queue = {
+        item["leaf_id"]: item for item in checkpoint["promotion_queue"]["entries"]
+    }
+    leaves = []
+    for leaf_id in tuple(getattr(selection, "leaf_ids")):
+        leaf = leaf_by_id[leaf_id]
+        record = records.get(leaf_id)
+        centre, radius = (
+            (None, None) if record is None else _schema11_record_response(record)
+        )
+        ledger = evidence.get(leaf_id)
+        binary_entry = binary.get(leaf_id)
+        promoted_entry = promoted.get(leaf_id)
+        state = None if record is None else record["state"]
+        if state is None and isinstance(promoted_entry, Mapping):
+            state = promoted_entry["disposition"]
+        if state is None and isinstance(binary_entry, Mapping):
+            state = binary_entry["disposition"]
+        if state not in {"PRODUCED", "UNRESOLVED", "DEFERRED", "REJECTED"}:
+            state = "DEFERRED"
+        discrepancy_codes = (
+            ledger.get("discrepancy_codes", [])
+            if isinstance(ledger, Mapping) else []
+        )
+        queue_entry = queue.get(leaf_id)
+        leaves.append(TriageLeaf(
+            leaf_id=leaf_id,
+            role=leaf.role,
+            mode_family=leaf.leaf.mode_label,
+            mechanism_id=leaf.mechanism_id,
+            numerical_state=state,
+            evidence_level=(
+                None if not isinstance(ledger, Mapping)
+                else EvidenceLevel(ledger["evidence_level"])
+            ),
+            response_magnitude=None if centre is None else abs(centre),
+            response_disk_radius=radius,
+            binary64_promoted_disagreement=(
+                isinstance(binary_entry, Mapping)
+                and isinstance(promoted_entry, Mapping)
+                and binary_entry.get("result_record_sha256") is not None
+                and promoted_entry.get("result_record_sha256") is not None
+                and binary_entry["result_record_sha256"]
+                != promoted_entry["result_record_sha256"]
+            ),
+            derivative_disagreement=any(
+                "DERIVATIVE" in str(code) for code in discrepancy_codes
+            ),
+            branch_risk=(
+                isinstance(queue_entry, Mapping)
+                and queue_entry.get("queue_kind") == "ROOT"
+            ),
+            near_extremal_support=abs(float(leaf.job.spin)) >= 0.99,
+            projective_angle_lower_bound=None,
+            controls_projective_classification=False,
+        ))
+    triage = build_whole_atlas_triage(
+        checkpoint,
+        tuple(leaves),
+        triage_policy=TriagePolicy(),
+        evidence_policy=EvidenceStrengtheningPolicy.certification(),
+        survey_policy_identity=plan.policy.identity_sha256,
+        engine_identity=plan.bindings["engine_source_sha256"],
+    )
+    mapping = triage.to_mapping()
+    _atomic_json(directory / "m02-triage.json", mapping)
+    _atomic_json(directory / "m02-certification-queue.json", mapping)

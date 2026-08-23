@@ -39,35 +39,6 @@ class ContractBackend:
             ),
         )
 
-    def execute_profile_stage(self, leaf, digits, policy, survey_cache):
-        component_result = {
-            "evidence_kind": "synthetic-survey-orchestration-contract",
-            "execution_profile": "survey",
-            "leaf_id": leaf.leaf_id,
-            "mechanism_id": leaf.mechanism_id,
-            "digits": digits,
-            "root_seal_accepted": True,
-            "branch_identity_preserved": True,
-            "domega_excludes_zero": True,
-            "cheap_derivative_refinement_agrees": True,
-            "bounded_response_disk": True,
-            "response": {"real": 1.0e-3, "imaginary": -2.0e-3},
-            "survey_promotion_required": False,
-            "survey_required_precision_digits": None,
-            "survey_failure_code": None,
-        }
-        return StageOutcome(
-            digits=digits,
-            numerical_state="CONVERGED",
-            component_result=component_result,
-            local_disk_radius_abs=1.0e-8,
-            signed_error_channels=synthetic_stage_signed_error_channels(
-                component_result,
-                1.0e-8,
-                precision_ladder_applicable=False,
-            ),
-        )
-
 
 def create_backend():
     return ContractBackend()

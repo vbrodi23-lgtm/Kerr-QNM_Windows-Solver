@@ -545,7 +545,7 @@ class PublicSurfaceTests(unittest.TestCase):
             (root / "docs" / "response-replay-powershell.md").exists()
         )
 
-    def test_m02_launcher_runs_the_full_selection_and_can_rebuild_runtime(self) -> None:
+    def test_m02_launcher_exposes_separate_schema11_passes(self) -> None:
         root = Path(__file__).resolve().parents[1]
         launcher = (root / "m02.ps1").read_text(encoding="utf-8")
         solver_launcher = (root / "solver.ps1").read_text(encoding="utf-8")
@@ -557,34 +557,29 @@ class PublicSurfaceTests(unittest.TestCase):
         self.assertIsNone(selection["leaf_ids"])
         self.assertEqual(selection["precision_digits"], [64, 80, 120])
         self.assertIn("[switch]$RebuildRuntime", launcher)
+        self.assertIn("[switch]$NewCampaign", launcher)
+        self.assertIn('[ValidateSet("survey", "certify", "validate")]', launcher)
+        self.assertIn('[ValidateSet("binary64", "promoted")]', launcher)
         self.assertIn('"campaign-plan"', launcher)
-        self.assertIn('Write-Host "M02 B′ campaign"', launcher)
-        self.assertIn('campaign-resume', launcher)
-        self.assertIn('"--full"', launcher)
+        self.assertIn('Write-Host "M02 campaign startup"', launcher)
+        self.assertIn('"campaign-survey-binary64"', launcher)
+        self.assertIn('"campaign-survey-promoted"', launcher)
+        self.assertIn('"campaign-certify"', launcher)
+        self.assertIn('"campaign-evidence-validate"', launcher)
+        self.assertIn('"campaign-schema11-validate"', launcher)
+        self.assertNotIn('campaign-resume', launcher)
+        self.assertNotIn('"--full"', launcher)
         self.assertIn('if ($RebuildRuntime)', launcher)
         self.assertIn('[ValidateSet("quiet", "normal", "trace")]', launcher)
         self.assertIn('[string]$Progress = "normal"', launcher)
-        self.assertIn('[ValidateSet("survey", "certify", "validate")]', launcher)
-        self.assertIn('[string]$Profile = "survey"', launcher)
-        self.assertIn("[string]$TriageQueue", launcher)
-        self.assertIn("[int]$QueueLimit = 0", launcher)
-        self.assertIn('"--triage-queue"', launcher)
-        self.assertIn('"--queue-limit"', launcher)
-        self.assertGreaterEqual(launcher.count('"--profile"'), 3)
         self.assertIn('"--progress"', launcher)
         self.assertIn("if ($CommandExitCode -eq 130)", launcher)
         self.assertIn("exit 130", launcher)
         self.assertIn("PipelineStoppedException", launcher)
         self.assertIn("PipelineStoppedException", solver_launcher)
         self.assertIn("-1073741510", solver_launcher)
-        self.assertIn(
-            '"campaign-plan",\n        "--profile",\n        $Profile,\n        $Selection\n',
-            launcher,
-        )
-        self.assertEqual(launcher.count("$Selection,"), 2)
-        self.assertEqual(launcher.count("\n        $Checkpoint,\n"), 2)
+        self.assertIn('"campaign-plan",\n        $Selection\n', launcher)
         self.assertNotIn("$SelectionPath,", launcher)
-        self.assertNotIn("$CheckpointPath,", launcher)
 
     def test_m02_launcher_forwards_only_sha_pinned_calibration_overrides(self) -> None:
         root = Path(__file__).resolve().parents[1]
@@ -669,21 +664,21 @@ if ($SolverArguments[0] -eq "campaign-plan") {
     '{"role_counts":{"primary":140,"control":24,"deep":48},"leaf_count":212}'
     exit 0
 }
-$checkpointIndex = [Array]::IndexOf($SolverArguments, "--checkpoint")
-if ($checkpointIndex -lt 0) {
-    exit 91
-}
-if ($SolverArguments[0] -eq "campaign-run") {
-    $checkpointArgument = $SolverArguments[$checkpointIndex + 1]
-    $checkpoint = if ([IO.Path]::IsPathRooted($checkpointArgument)) {
-        [IO.Path]::GetFullPath($checkpointArgument)
-    }
-    else {
-        [IO.Path]::GetFullPath((Join-Path $PSScriptRoot $checkpointArgument))
-    }
+if ($SolverArguments[0] -eq "campaign-recover") {
+    $outputIndex = [Array]::IndexOf($SolverArguments, "--output")
+    $checkpoint = [IO.Path]::GetFullPath($SolverArguments[$outputIndex + 1])
     New-Item -ItemType Directory -Force -Path (Split-Path -Parent $checkpoint) |
         Out-Null
     [IO.File]::WriteAllText($checkpoint, "{}")
+    exit 0
+}
+if ($SolverArguments[0] -eq "campaign-schema11-validate") {
+    '{"selection_id":"selection-1","schema_version":11,"recovered_terminal_count":0,"binary64_pass_count":0,"promotion_queue_count":0,"evidence_counts":{},"basic_report_directory":"reports"}'
+    exit 0
+}
+$checkpointIndex = [Array]::IndexOf($SolverArguments, "--checkpoint")
+if ($checkpointIndex -lt 0) {
+    exit 91
 }
 exit 0
 ''',
@@ -694,7 +689,11 @@ exit 0
             environment["M02_TEST_ARGUMENT_LOG"] = str(argument_log)
             environment["KERR_QNM_RUNTIME_ROOT"] = str(package_root / "managed")
 
-            for extra_arguments in ([], ["-RebuildRuntime"], ["-PortableRuntime"]):
+            for extra_arguments in (
+                ["-NewCampaign"],
+                ["-RebuildRuntime"],
+                ["-PortableRuntime"],
+            ):
                 result = subprocess.run(
                     [
                         str(windows_powershell),
@@ -817,7 +816,7 @@ $record = [ordered]@{ default = $default; portable = $portable } | ConvertTo-Jso
             self.assertTrue(Path(resolved["portable"]).samefile(expected_portable))
 
     @unittest.skipUnless(os.name == "nt", "requires Windows PowerShell 5.1")
-    def test_m02_public_default_invocation_forwards_safe_relative_paths(self) -> None:
+    def test_m02_public_default_invocation_resumes_binary64_only(self) -> None:
         root = Path(__file__).resolve().parents[1]
         windows_powershell = Path(os.environ["SystemRoot"]).joinpath(
             "System32", "WindowsPowerShell", "v1.0", "powershell.exe"
@@ -853,21 +852,13 @@ if ($SolverArguments[0] -eq "campaign-plan") {
     '{"role_counts":{"primary":140,"control":24,"deep":48},"leaf_count":212}'
     exit 0
 }
+if ($SolverArguments[0] -eq "campaign-schema11-validate") {
+    '{"selection_id":"selection-1","schema_version":11,"recovered_terminal_count":0,"binary64_pass_count":0,"promotion_queue_count":0,"evidence_counts":{},"basic_report_directory":"reports"}'
+    exit 0
+}
 $checkpointIndex = [Array]::IndexOf($SolverArguments, "--checkpoint")
 if ($checkpointIndex -lt 0) {
     exit 91
-}
-if ($SolverArguments[0] -eq "campaign-run") {
-    $checkpointArgument = $SolverArguments[$checkpointIndex + 1]
-    $checkpoint = if ([IO.Path]::IsPathRooted($checkpointArgument)) {
-        [IO.Path]::GetFullPath($checkpointArgument)
-    }
-    else {
-        [IO.Path]::GetFullPath((Join-Path $PSScriptRoot $checkpointArgument))
-    }
-    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $checkpoint) |
-        Out-Null
-    [IO.File]::WriteAllText($checkpoint, "{}")
 }
 exit 0
 ''',
@@ -876,6 +867,11 @@ exit 0
             environment = dict(os.environ)
             environment["M02_TEST_ARGUMENT_LOG"] = str(argument_log)
             environment["KERR_QNM_RUNTIME_ROOT"] = str(package_root / "managed")
+            checkpoint_path = (
+                package_root / "m02-output" / "m02-campaign-checkpoint.json"
+            )
+            checkpoint_path.parent.mkdir()
+            checkpoint_path.write_text("{}", encoding="utf-8")
             result = subprocess.run(
                 [
                     str(windows_powershell),
@@ -904,46 +900,47 @@ exit 0
                 json.loads(line)
                 for line in argument_log.read_text(encoding="utf-8").splitlines()
             ]
+            for call in calls[1:]:
+                checkpoint_index = call.index("--checkpoint") + 1
+                self.assertTrue(
+                    Path(call[checkpoint_index]).samefile(checkpoint_path)
+                )
+                call[checkpoint_index] = str(checkpoint_path)
 
         selection = r".\examples\m02-campaign.json"
-        checkpoint = r".\m02-output\m02-campaign-checkpoint.json"
+        checkpoint = str(checkpoint_path)
         self.assertEqual(
             calls,
             [
                 [
                     "campaign-plan",
-                    "--profile",
-                    "survey",
                     selection,
                 ],
                 [
-                    "campaign-run",
+                    "campaign-schema11-validate",
+                    selection,
+                    "--checkpoint",
+                    checkpoint,
+                ],
+                [
+                    "campaign-survey-binary64",
                     selection,
                     "--checkpoint",
                     checkpoint,
                     "--progress",
                     "normal",
-                    "--profile",
-                    "survey",
                 ],
                 [
-                    "campaign-validate",
+                    "campaign-schema11-validate",
                     selection,
                     "--checkpoint",
                     checkpoint,
-                    "--profile",
-                    "survey",
-                    "--full",
+                    "--pass",
+                    "binary64",
                 ],
             ],
         )
-        self.assertTrue(
-            all(
-                not Path(call[index]).is_absolute() and ":" not in call[index]
-                for call in calls[1:]
-                for index in (1, 3)
-            )
-        )
+        self.assertTrue(Path(checkpoint).is_absolute())
 
     def test_windows_ci_captures_native_streams_outside_powershell(self) -> None:
         root = Path(__file__).resolve().parents[1]
@@ -1123,7 +1120,17 @@ $candidate | ConvertTo-Json -Compress | Set-Content -LiteralPath $env:M02_TEST_J
             "canonical-exterior-background-wronskian/v1",
             "background-equivalence/v1",
             "exterior-fixed-root-survey-raw/v1",
+            "zero-coupling-profile-elision/v1",
+            "real-axis-wronskian-at-readout/v1",
+            "relative-1e-5-times-one-plus-abs-omega/v1",
             "legacy-compatibility/v1",
+            "solved-leaf-cache/v1",
+            "windows-solver.campaign-recovery/v1",
+            "windows-solver.recovery-summary/v1",
+            "windows-solver.system-failure/v1",
+            "windows-solver.m02-report-status/v1",
+            "windows-solver.m02-schema11-report-status/v1",
+            "binary64-horizon-production/v1",
             "adaptive-exterior-gap-standoff/v2",
             "factored-homogeneous-gsn/v1",
             "factored-plane-wave-gsn/v1",
@@ -1196,15 +1203,6 @@ $candidate | ConvertTo-Json -Compress | Set-Content -LiteralPath $env:M02_TEST_J
             "authenticated-promoted-root-seal/v1",
             "root-sealed-fixed-root-response-repair/v1",
             "root-sealed-stale-exterior-response-discarded/v1",
-            "exterior-profile-amplitude-zero-background/v1",
-            "exact-exterior-zero-coupling-background-root/v1",
-            "survey-contained-failure/v1",
-            "fixed-root-survey-preflight/v1",
-            "fixed-root-horizon-survey-preflight/v1",
-            "fixed-root-exterior-survey/v1",
-            "retained-survey-central-bridge/v1",
-            "targeted-local-certification/v1",
-            "independent-publication-validation/v1",
             "fixed-root-domega-stencil-only/v1",
             "fixed-root-dc-stencil-only/v1",
             "fixed-root-domega-dc-stencils-only/v1",

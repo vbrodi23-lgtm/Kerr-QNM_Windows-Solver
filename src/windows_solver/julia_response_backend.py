@@ -1,8 +1,8 @@
 """Authenticated Python boundary for the package-owned Julia precision worker.
 
-The worker performs only promoted 80/120-decimal-digit root readouts.  The
-existing Python response engine still owns the signed-amplitude ladder,
-component reduction, error ledger, checkpoints, resume, and admission schema.
+The worker performs reviewed promoted root and fixed-root response requests.
+The Python response engine owns scheduling, component reduction, error ledgers,
+checkpoints, resume, and admission.
 """
 
 from __future__ import annotations
@@ -32,7 +32,11 @@ from .adaptive_controls import (
     ODEErrorBudget,
 )
 from .response_engine import (
+    BINARY64_FIXED_ROOT_SAMPLE_ROLES,
+    BINARY64_FIXED_ROOT_SURVEY_IDENTITY,
     BackendIdentity,
+    CANONICAL_EXTERIOR_BACKGROUND_IDENTITY,
+    DecimalComplex,
     FixedRootDiagnosticEvidence,
     FixedRootDeterminantSample,
     DiagnosticRootReadout,
@@ -108,6 +112,35 @@ _DEFAULT_COORDINATE_STALL_MINIMUM_SPAN_FRACTION = "1e-6"
 _DEFAULT_COORDINATE_STALL_MINIMUM_STEP_FRACTION = "1e-12"
 _PROMOTED_REQUEST_PREFLIGHT_TIMEOUT_SECONDS = 600
 _PROMOTED_REQUEST_PREFLIGHT_OPERATION = "promoted-request-preflight"
+FIXED_ROOT_SURVEY_BATCH_OPERATION = "fixed-root-survey-batch"
+FIXED_ROOT_SURVEY_BATCH_SCHEMA = "windows-solver.fixed-root-survey-batch/1"
+FIXED_ROOT_SURVEY_CONDITIONING_SCHEMA = (
+    "windows-solver.fixed-root-survey-conditioning/1"
+)
+_FIXED_ROOT_SURVEY_MAXIMUM_SAMPLE_COUNT = 9
+_FIXED_ROOT_SURVEY_BACKGROUND_ROLES = BINARY64_FIXED_ROOT_SAMPLE_ROLES[:5]
+_FIXED_ROOT_SURVEY_COORDINATE_ROLES = BINARY64_FIXED_ROOT_SAMPLE_ROLES[5:]
+_FIXED_ROOT_SURVEY_CERTIFICATE_ONLY_POLICY_FIELDS = frozenset({
+    "determinant_error_model",
+    "determinant_error_safety_factor",
+    "determinant_error_required_term_classes",
+    "determinant_error_missing_evidence_outcome",
+    "determinant_error_certificate_statement",
+    "determinant_error_preceding_precision_tier",
+    "human_math_review_receipt_status",
+    "human_math_review_receipt_sha256",
+    "independent_reference_fixture_receipt_status",
+    "independent_reference_fixture_receipt_sha256",
+    "promoted_root_readout_policy",
+})
+_FIXED_ROOT_SURVEY_ROOT_ONLY_POLICY_FIELDS = frozenset({
+    "branch_enclosure_radius_abs",
+    "frequency_step",
+    "frequency_step_minimum",
+    "frequency_step_maximum",
+    "max_newton_iterations",
+    "root_correction_tolerance",
+})
 NUMERICAL_CONTROL_FAILURE_CODES = frozenset({
     "SCATTERING_BASIS_ILL_CONDITIONED",
     "SCATTERING_CHART_ILL_CONDITIONED",
@@ -2185,6 +2218,181 @@ class JuliaResponseEvaluation:
     cached_worker_response_receipt: Mapping[str, object] | None
 
 
+def _survey_complex_mapping(value: complex) -> dict[str, str]:
+    converted = complex(value)
+    if not math.isfinite(converted.real) or not math.isfinite(converted.imag):
+        raise ValueError("fixed-root survey coordinate is nonfinite")
+    return {
+        "real": format(converted.real, ".17g"),
+        "imaginary": format(converted.imag, ".17g"),
+    }
+
+
+def _survey_complex_from_mapping(value: object, label: str) -> complex:
+    if not isinstance(value, Mapping) or set(value) != {"real", "imaginary"}:
+        raise JuliaResponseBackendError(f"M02 {label} fields are invalid")
+    return complex(
+        float(_finite_decimal_text(value["real"], f"{label} real")),
+        float(_finite_decimal_text(value["imaginary"], f"{label} imaginary")),
+    )
+
+
+def _survey_decimal_complex_from_mapping(
+    value: object, label: str
+) -> DecimalComplex:
+    if not isinstance(value, Mapping) or set(value) != {"real", "imaginary"}:
+        raise JuliaResponseBackendError(f"M02 {label} fields are invalid")
+    return DecimalComplex(
+        _finite_decimal_text(value["real"], f"{label} real"),
+        _finite_decimal_text(value["imaginary"], f"{label} imaginary"),
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class FixedRootSurveyConditioning:
+    """Bounded, survey-only conditioning telemetry for one raw sample."""
+
+    mapping: Mapping[str, object]
+
+    def __post_init__(self) -> None:
+        fields = {
+            "schema",
+            "determinant_family",
+            "homogeneous_representation",
+            "branch_convention",
+            "determinant_convention",
+            "determinant_normalisation",
+            "maximum_series_digits_lost",
+            "maximum_recurrence_digits_lost",
+            "minimum_asymptotic_predicted_reliable_digits",
+            "endpoint_remainders_regular",
+            "maximum_endpoint_reconstruction_error",
+            "maximum_contour_angle_deformation",
+            "predicted_reliable_digits",
+            "required_reliable_digits",
+            "precision_limited",
+            "determinant_count",
+        }
+        if not isinstance(self.mapping, Mapping) or set(self.mapping) != fields:
+            raise ValueError("fixed-root survey conditioning fields are invalid")
+        if self.mapping["schema"] != FIXED_ROOT_SURVEY_CONDITIONING_SCHEMA:
+            raise ValueError("fixed-root survey conditioning schema is invalid")
+        for name in (
+            "determinant_family",
+            "homogeneous_representation",
+            "branch_convention",
+            "determinant_convention",
+            "determinant_normalisation",
+        ):
+            if not isinstance(self.mapping[name], str) or not self.mapping[name]:
+                raise ValueError(f"fixed-root survey conditioning {name} is invalid")
+        for name in (
+            "maximum_series_digits_lost",
+            "maximum_recurrence_digits_lost",
+            "minimum_asymptotic_predicted_reliable_digits",
+            "maximum_endpoint_reconstruction_error",
+            "maximum_contour_angle_deformation",
+            "predicted_reliable_digits",
+            "required_reliable_digits",
+        ):
+            _finite_decimal_text(
+                self.mapping[name],
+                f"fixed-root survey conditioning {name}",
+                nonnegative=True,
+            )
+        if (
+            type(self.mapping["endpoint_remainders_regular"]) is not bool
+            or type(self.mapping["precision_limited"]) is not bool
+            or self.mapping["determinant_count"] != 1
+        ):
+            raise ValueError("fixed-root survey conditioning bounds are invalid")
+        object.__setattr__(
+            self,
+            "mapping",
+            json.loads(canonical_json_bytes(dict(self.mapping))),
+        )
+
+    def to_mapping(self) -> dict[str, object]:
+        return dict(self.mapping)
+
+
+@dataclass(frozen=True, slots=True)
+class JuliaFixedRootSurveySample:
+    role: str
+    omega: complex
+    amplitude: complex
+    determinant: DecimalComplex
+    numerical_conditioning: FixedRootSurveyConditioning
+
+
+@dataclass(frozen=True, slots=True)
+class JuliaFixedRootSurveyBatch:
+    leaf_id: str
+    job_id: str
+    mechanism_id: str
+    root_reference_id: str
+    root_seal_sha256: str
+    branch_identity: str
+    fixed_root: complex
+    frequency_step: Decimal
+    coordinate_step: Decimal
+    scientific_operation_identity: str
+    request_sha256: str
+    precision_tier: PrecisionTier
+    working_precision_bits: int
+    samples: tuple[JuliaFixedRootSurveySample, ...]
+    maximum_sample_count: int = _FIXED_ROOT_SURVEY_MAXIMUM_SAMPLE_COUNT
+    operation: str = FIXED_ROOT_SURVEY_BATCH_OPERATION
+    identity: str = BINARY64_FIXED_ROOT_SURVEY_IDENTITY
+    julia_launch_count: int = 1
+    root_read_count: int = 0
+
+    @property
+    def sample_roles(self) -> tuple[str, ...]:
+        return tuple(sample.role for sample in self.samples)
+
+    @property
+    def sample_count(self) -> int:
+        return len(self.samples)
+
+    def to_mapping(self) -> dict[str, object]:
+        return {
+            "schema": FIXED_ROOT_SURVEY_BATCH_SCHEMA,
+            "operation": self.operation,
+            "identity": self.identity,
+            "scientific_operation_identity": self.scientific_operation_identity,
+            "leaf_id": self.leaf_id,
+            "job_id": self.job_id,
+            "mechanism_id": self.mechanism_id,
+            "root_reference_id": self.root_reference_id,
+            "root_seal_sha256": self.root_seal_sha256,
+            "branch_identity": self.branch_identity,
+            "fixed_root": _survey_complex_mapping(self.fixed_root),
+            "frequency_step": str(self.frequency_step),
+            "coordinate_step": str(self.coordinate_step),
+            "request_sha256": self.request_sha256,
+            "precision_tier": self.precision_tier.value,
+            "working_precision_bits": self.working_precision_bits,
+            "sample_roles": list(self.sample_roles),
+            "sample_count": self.sample_count,
+            "maximum_sample_count": self.maximum_sample_count,
+            "julia_launch_count": self.julia_launch_count,
+            "root_read_count": self.root_read_count,
+            "samples": [
+                {
+                    "role": sample.role,
+                    "omega": _survey_complex_mapping(sample.omega),
+                    "amplitude": _survey_complex_mapping(sample.amplitude),
+                    "determinant": sample.determinant.to_mapping(),
+                    "numerical_conditioning": (
+                        sample.numerical_conditioning.to_mapping()
+                    ),
+                }
+                for sample in self.samples
+            ],
+        }
+
+
 @dataclass(frozen=True, slots=True)
 class PromotedRequestPreflightResult:
     response: Mapping[str, object]
@@ -3068,6 +3276,299 @@ class JuliaPrecisionRootBackend:
             complex(amplitude),
             primary_predictor,
             primary_predictor_kind,
+        )
+
+    def _fixed_root_survey_policy(
+        self, job: ResponseComponentJob
+    ) -> dict[str, object]:
+        policy = _precision_policy(
+            job,
+            self.digits,
+            self.refinement,
+            self._request_ode_error_budget(),
+            empirical_control_profile=self.empirical_control_profile,
+            calibration_receipt=self.calibration_receipt,
+        )
+        for field in (
+            _FIXED_ROOT_SURVEY_CERTIFICATE_ONLY_POLICY_FIELDS
+            | _FIXED_ROOT_SURVEY_ROOT_ONLY_POLICY_FIELDS
+        ):
+            policy.pop(field, None)
+        if _FIXED_ROOT_SURVEY_CERTIFICATE_ONLY_POLICY_FIELDS.intersection(policy):
+            raise ValueError("fixed-root survey policy carries certificate fields")
+        return policy
+
+    @staticmethod
+    def _validate_fixed_root_survey_roles(
+        scientific_operation_identity: str,
+        sample_roles: tuple[str, ...],
+    ) -> None:
+        if not isinstance(sample_roles, tuple) or not sample_roles:
+            raise ValueError("fixed-root survey sample roles must be a tuple")
+        if len(sample_roles) > _FIXED_ROOT_SURVEY_MAXIMUM_SAMPLE_COUNT:
+            raise ValueError("fixed-root survey sample budget exceeded")
+        if len(set(sample_roles)) != len(sample_roles):
+            raise ValueError("fixed-root survey sample roles contain duplicates")
+        if any(role not in BINARY64_FIXED_ROOT_SAMPLE_ROLES for role in sample_roles):
+            raise ValueError("fixed-root survey sample role is unknown")
+        if scientific_operation_identity == CANONICAL_EXTERIOR_BACKGROUND_IDENTITY:
+            valid = sample_roles == _FIXED_ROOT_SURVEY_BACKGROUND_ROLES
+        elif scientific_operation_identity == BINARY64_FIXED_ROOT_SURVEY_IDENTITY:
+            valid = sample_roles in (
+                BINARY64_FIXED_ROOT_SAMPLE_ROLES,
+                _FIXED_ROOT_SURVEY_COORDINATE_ROLES,
+            )
+        else:
+            raise ValueError("fixed-root survey scientific operation is invalid")
+        if not valid:
+            raise ValueError("fixed-root survey sample roles are out of order")
+
+    def preview_fixed_root_survey_request(
+        self,
+        job: ResponseComponentJob,
+        *,
+        fixed_root: complex,
+        root_seal_sha256: str,
+        branch_identity: str,
+        sample_roles: tuple[str, ...],
+        scientific_operation_identity: str = BINARY64_FIXED_ROOT_SURVEY_IDENTITY,
+    ) -> dict[str, object]:
+        """Build the strict survey-only Julia batch without launching Julia."""
+
+        if job.backend_identity != self.identity:
+            raise ValueError("response job backend identity does not match Julia adapter")
+        if job.mechanism_id == "horizon-admittance":
+            raise ValueError("fixed-root survey batch requires an exterior job")
+        if self.digits not in (40, 80):
+            raise ValueError("promoted survey permits only BF40 or BF80")
+        root = complex(fixed_root)
+        if not math.isfinite(root.real) or not math.isfinite(root.imag):
+            raise ValueError("fixed-root survey root is invalid")
+        if (
+            not isinstance(root_seal_sha256, str)
+            or len(root_seal_sha256) != 64
+            or any(character not in "0123456789abcdef" for character in root_seal_sha256)
+        ):
+            raise ValueError("fixed-root survey root seal is invalid")
+        if branch_identity != job.root.branch_id:
+            raise ValueError("fixed-root survey branch identity mismatch")
+        self._validate_fixed_root_survey_roles(
+            scientific_operation_identity, sample_roles
+        )
+        frequency_step = 1.0e-5 * (1.0 + abs(root))
+        coordinate_step = float(job.policy.epsilons[0])
+        support = {
+            name: format(value, ".17g")
+            for name, value in _exterior_support(
+                job.spin, job.mechanism_id
+            ).to_mapping().items()
+        }
+        points = {
+            "D0": (root, 0.0j),
+            "DOMEGA_REAL_PLUS_H": (root + frequency_step, 0.0j),
+            "DOMEGA_REAL_MINUS_H": (root - frequency_step, 0.0j),
+            "DOMEGA_REAL_PLUS_HALF_H": (root + frequency_step / 2.0, 0.0j),
+            "DOMEGA_REAL_MINUS_HALF_H": (root - frequency_step / 2.0, 0.0j),
+            "DC_PLUS_EPSILON": (root, complex(coordinate_step, 0.0)),
+            "DC_MINUS_EPSILON": (root, complex(-coordinate_step, 0.0)),
+            "DC_PLUS_HALF_EPSILON": (
+                root, complex(coordinate_step / 2.0, 0.0)
+            ),
+            "DC_MINUS_HALF_EPSILON": (
+                root, complex(-coordinate_step / 2.0, 0.0)
+            ),
+        }
+        samples: list[dict[str, object]] = []
+        for role in sample_roles:
+            omega, amplitude = points[role]
+            sample: dict[str, object] = {
+                "role": role,
+                "omega": _survey_complex_mapping(omega),
+                "amplitude": _survey_complex_mapping(amplitude),
+            }
+            if role in _FIXED_ROOT_SURVEY_COORDINATE_ROLES:
+                sample["support"] = dict(support)
+            samples.append(sample)
+        return {
+            "schema_version": 1,
+            "schema": FIXED_ROOT_SURVEY_BATCH_SCHEMA,
+            "operation": FIXED_ROOT_SURVEY_BATCH_OPERATION,
+            "identity": BINARY64_FIXED_ROOT_SURVEY_IDENTITY,
+            "scientific_operation_identity": scientific_operation_identity,
+            "leaf_id": job.leaf_id,
+            "job_id": job.job_id,
+            "root_reference_id": job.root.root_reference_id,
+            "root_seal_sha256": root_seal_sha256,
+            "branch_identity": branch_identity,
+            "backend_identity_sha256": job.backend_identity.identity_sha256,
+            "mode": {
+                "s": job.mode.s,
+                "ell": job.mode.ell,
+                "m": job.mode.m,
+                "n": job.mode.n,
+            },
+            "spin": format(job.spin, ".17g"),
+            "angular_A": _survey_complex_mapping(
+                job.root.angular_separation_constant
+            ),
+            "mechanism_id": job.mechanism_id,
+            "fixed_root": _survey_complex_mapping(root),
+            "precision_digits": self.digits,
+            "working_precision_bits": math.ceil(self.digits * math.log2(10)) + 32,
+            "semantic_precision_tier": f"bigfloat-{self.digits}",
+            "frequency_step": format(frequency_step, ".17g"),
+            "coordinate_step": format(coordinate_step, ".17g"),
+            "sample_roles": list(sample_roles),
+            "maximum_sample_count": _FIXED_ROOT_SURVEY_MAXIMUM_SAMPLE_COUNT,
+            "samples": samples,
+            "policy": self._fixed_root_survey_policy(job),
+            "execution_resource": _execution_resource_policy(),
+        }
+
+    def fixed_root_survey_batch(
+        self,
+        job: ResponseComponentJob,
+        *,
+        fixed_root: complex,
+        root_seal_sha256: str,
+        branch_identity: str,
+        sample_roles: tuple[str, ...],
+        scientific_operation_identity: str = BINARY64_FIXED_ROOT_SURVEY_IDENTITY,
+    ) -> JuliaFixedRootSurveyBatch:
+        """Run one Julia request for one ordered fixed-root survey batch."""
+
+        request = self.preview_fixed_root_survey_request(
+            job,
+            fixed_root=fixed_root,
+            root_seal_sha256=root_seal_sha256,
+            branch_identity=branch_identity,
+            sample_roles=sample_roles,
+            scientific_operation_identity=scientific_operation_identity,
+        )
+        evaluation = self.adapter.evaluate_for_validation(request)
+        response = evaluation.response
+        response_fields = {
+            "schema_version",
+            "status",
+            "operation",
+            "identity",
+            "scientific_operation_identity",
+            "request_sha256",
+            "leaf_id",
+            "job_id",
+            "root_reference_id",
+            "root_seal_sha256",
+            "branch_identity",
+            "semantic_precision_tier",
+            "working_precision_bits",
+            "sample_roles",
+            "maximum_sample_count",
+            "sample_count",
+            "samples",
+        }
+        if not isinstance(response, Mapping) or set(response) != response_fields:
+            raise JuliaResponseBackendError(
+                "M02 fixed-root survey batch response fields are invalid"
+            )
+        expected_bindings = {
+            "operation": FIXED_ROOT_SURVEY_BATCH_OPERATION,
+            "identity": BINARY64_FIXED_ROOT_SURVEY_IDENTITY,
+            "scientific_operation_identity": scientific_operation_identity,
+            "request_sha256": evaluation.request_sha256,
+            "leaf_id": job.leaf_id,
+            "job_id": job.job_id,
+            "root_reference_id": job.root.root_reference_id,
+            "root_seal_sha256": root_seal_sha256,
+            "branch_identity": branch_identity,
+            "semantic_precision_tier": request["semantic_precision_tier"],
+            "working_precision_bits": request["working_precision_bits"],
+            "sample_roles": list(sample_roles),
+            "maximum_sample_count": _FIXED_ROOT_SURVEY_MAXIMUM_SAMPLE_COUNT,
+            "sample_count": len(sample_roles),
+        }
+        if (
+            response["schema_version"] != 1
+            or response["status"] != "ok"
+            or any(response[name] != value for name, value in expected_bindings.items())
+            or not isinstance(response["samples"], list)
+            or len(response["samples"]) != len(sample_roles)
+        ):
+            raise JuliaResponseBackendError(
+                "M02 fixed-root survey batch response authentication failed"
+            )
+        parsed_samples: list[JuliaFixedRootSurveySample] = []
+        request_samples = request["samples"]
+        policy = request["policy"]
+        for index, (role, raw, requested) in enumerate(
+            zip(sample_roles, response["samples"], request_samples)
+        ):
+            fields = {
+                "role", "omega", "amplitude", "determinant",
+                "numerical_conditioning",
+            }
+            if not isinstance(raw, Mapping) or set(raw) != fields or raw["role"] != role:
+                raise JuliaResponseBackendError(
+                    f"M02 fixed-root survey sample {index} is invalid"
+                )
+            omega = _survey_complex_from_mapping(raw["omega"], "survey omega")
+            amplitude = _survey_complex_from_mapping(
+                raw["amplitude"], "survey amplitude"
+            )
+            if (
+                omega != _survey_complex_from_mapping(requested["omega"], "request omega")
+                or amplitude
+                != _survey_complex_from_mapping(requested["amplitude"], "request amplitude")
+            ):
+                raise JuliaResponseBackendError(
+                    "M02 fixed-root survey sample coordinates moved"
+                )
+            determinant = _survey_decimal_complex_from_mapping(
+                raw["determinant"], "survey determinant"
+            )
+            try:
+                conditioning = FixedRootSurveyConditioning(
+                    raw["numerical_conditioning"]
+                )
+            except ValueError as error:
+                raise JuliaResponseBackendError(
+                    "M02 fixed-root survey conditioning is invalid"
+                ) from error
+            telemetry = conditioning.mapping
+            if any(
+                telemetry[name] != policy[name]
+                for name in (
+                    "determinant_family",
+                    "homogeneous_representation",
+                    "branch_convention",
+                    "determinant_convention",
+                    "determinant_normalisation",
+                )
+            ):
+                raise JuliaResponseBackendError(
+                    "M02 fixed-root survey conditioning disagrees with request"
+                )
+            parsed_samples.append(JuliaFixedRootSurveySample(
+                role, omega, amplitude, determinant, conditioning
+            ))
+        return JuliaFixedRootSurveyBatch(
+            leaf_id=job.leaf_id,
+            job_id=job.job_id,
+            mechanism_id=job.mechanism_id,
+            root_reference_id=job.root.root_reference_id,
+            root_seal_sha256=root_seal_sha256,
+            branch_identity=branch_identity,
+            fixed_root=complex(fixed_root),
+            frequency_step=_finite_decimal_text(
+                request["frequency_step"], "survey frequency step", nonnegative=True
+            ),
+            coordinate_step=_finite_decimal_text(
+                request["coordinate_step"], "survey coordinate step", nonnegative=True
+            ),
+            scientific_operation_identity=scientific_operation_identity,
+            request_sha256=evaluation.request_sha256,
+            precision_tier=precision_tier(str(request["semantic_precision_tier"])),
+            working_precision_bits=int(request["working_precision_bits"]),
+            samples=tuple(parsed_samples),
         )
 
     def preview_fixed_root_request(

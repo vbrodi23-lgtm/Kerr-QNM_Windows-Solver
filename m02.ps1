@@ -1,16 +1,18 @@
 param(
     [string]$Selection = ".\examples\m02-campaign.json",
     [string]$Checkpoint = ".\m02-output\m02-campaign-checkpoint.json",
+    [ValidateSet("survey", "certify", "validate")]
+    [string]$Profile = "survey",
+    [ValidateSet("binary64", "promoted")]
+    [string]$SurveyPass = "binary64",
+    [string]$QueuePath,
+    [switch]$NewCampaign,
     [switch]$SkipBootstrap,
     [switch]$RebuildRuntime,
     [switch]$PortableRuntime,
     [string]$RuntimeRoot,
     [string]$CalibrationReceiptPath,
     [string]$CalibrationReceiptSha256,
-    [ValidateSet("survey", "certify", "validate")]
-    [string]$Profile = "survey",
-    [string]$TriageQueue,
-    [int]$QueueLimit = 0,
     [ValidateSet("quiet", "normal", "trace")]
     [string]$Progress = "normal"
 )
@@ -51,6 +53,18 @@ function Invoke-M02Command([string[]]$Arguments) {
 if ($SkipBootstrap -and $RebuildRuntime) {
     throw "-SkipBootstrap and -RebuildRuntime cannot be used together."
 }
+if ($Profile -ne "survey" -and $SurveyPass -ne "binary64") {
+    throw "-SurveyPass applies only to -Profile survey."
+}
+if ($Profile -eq "survey" -and -not [string]::IsNullOrWhiteSpace($QueuePath)) {
+    throw "-QueuePath applies only to certify or validate."
+}
+if ($Profile -eq "validate" -and [string]::IsNullOrWhiteSpace($QueuePath)) {
+    throw "-Profile validate requires -QueuePath."
+}
+if ($NewCampaign -and ($Profile -ne "survey" -or $SurveyPass -ne "binary64")) {
+    throw "-NewCampaign starts only the binary64 survey."
+}
 $HasCalibrationPath = -not [string]::IsNullOrWhiteSpace($CalibrationReceiptPath)
 $HasCalibrationSha256 = -not [string]::IsNullOrWhiteSpace($CalibrationReceiptSha256)
 if ($HasCalibrationPath -ne $HasCalibrationSha256) {
@@ -74,29 +88,6 @@ if ($HasCalibrationPath) {
         "--calibration-receipt-path", $ResolvedCalibrationReceiptPath,
         "--calibration-receipt-sha256", $CalibrationReceiptSha256.ToLowerInvariant()
     )
-}
-$HasTriageQueue = -not [string]::IsNullOrWhiteSpace($TriageQueue)
-if ($Profile -eq "survey" -and $HasTriageQueue) {
-    throw "A triage queue is valid only for certify or validate."
-}
-if ($QueueLimit -lt 0 -or ($QueueLimit -gt 0 -and -not $HasTriageQueue)) {
-    throw "A positive -QueueLimit requires -TriageQueue."
-}
-$TriageArguments = @()
-if ($HasTriageQueue) {
-    $ResolvedTriageQueue = if ([IO.Path]::IsPathRooted($TriageQueue)) {
-        [IO.Path]::GetFullPath($TriageQueue)
-    }
-    else {
-        [IO.Path]::GetFullPath((Join-Path $PackageRoot $TriageQueue))
-    }
-    if (-not (Test-Path -LiteralPath $ResolvedTriageQueue -PathType Leaf)) {
-        throw "M02 triage queue is absent: $ResolvedTriageQueue"
-    }
-    $TriageArguments = @("--triage-queue", $ResolvedTriageQueue)
-    if ($QueueLimit -gt 0) {
-        $TriageArguments += @("--queue-limit", [string]$QueueLimit)
-    }
 }
 
 if (-not $SkipBootstrap) {
@@ -134,22 +125,52 @@ if (-not (Test-Path -LiteralPath $SelectionPath -PathType Leaf)) {
 New-Item -ItemType Directory -Force -Path (Split-Path -Parent $CheckpointPath) |
     Out-Null
 
-if ($Profile -ne "survey" -and -not (Test-Path -LiteralPath $CheckpointPath -PathType Leaf)) {
-    throw "The $Profile profile requires an existing screened campaign checkpoint."
+$CheckpointExists = Test-Path -LiteralPath $CheckpointPath -PathType Leaf
+if ($NewCampaign -and $CheckpointExists) {
+    throw "-NewCampaign refuses an existing checkpoint: $CheckpointPath"
+}
+if (-not $NewCampaign -and -not $CheckpointExists) {
+    throw "Resume requires an existing checkpoint. Use -NewCampaign with a new path for a cold start: $CheckpointPath"
+}
+
+$ResolvedQueuePath = $null
+if (-not [string]::IsNullOrWhiteSpace($QueuePath)) {
+    $ResolvedQueuePath = if ([IO.Path]::IsPathRooted($QueuePath)) {
+        [IO.Path]::GetFullPath($QueuePath)
+    }
+    else {
+        [IO.Path]::GetFullPath((Join-Path $PackageRoot $QueuePath))
+    }
+    if (-not (Test-Path -LiteralPath $ResolvedQueuePath -PathType Leaf)) {
+        throw "Queue is absent: $ResolvedQueuePath"
+    }
 }
 
 Push-Location $PackageRoot
 try {
-    $Command = if (Test-Path -LiteralPath $CheckpointPath -PathType Leaf) {
-        "campaign-resume"
+    if ($NewCampaign) {
+        $RecoveryReceipt = "$CheckpointPath.recovery-receipt.json"
+        Invoke-M02Command -Arguments @(
+            "campaign-recover",
+            $Selection,
+            "--output", $CheckpointPath,
+            "--receipt", $RecoveryReceipt
+        ) | Out-Null
+    }
+    $Command = if ($Profile -eq "survey" -and $SurveyPass -eq "binary64") {
+        "campaign-survey-binary64"
+    }
+    elseif ($Profile -eq "survey") {
+        "campaign-survey-promoted"
+    }
+    elseif ($Profile -eq "certify") {
+        "campaign-certify"
     }
     else {
-        "campaign-run"
+        "campaign-evidence-validate"
     }
     $CampaignPlan = Invoke-M02Command -Arguments @(
         "campaign-plan",
-        "--profile",
-        $Profile,
         $Selection
     ) | ConvertFrom-Json
     if (
@@ -159,36 +180,56 @@ try {
     ) {
         throw "M02 campaign plan did not report role and leaf counts."
     }
-    Write-Host "M02 B′ campaign" -ForegroundColor Cyan
-    Write-Host ("    Primary : {0}" -f $CampaignPlan.role_counts.primary)
-    Write-Host ("    Control : {0}" -f $CampaignPlan.role_counts.control)
-    Write-Host ("    Deep    : {0}" -f $CampaignPlan.role_counts.deep)
-    Write-Host ("    Total   : {0}" -f $CampaignPlan.leaf_count)
-    Write-Host "M02 live progress status:" -ForegroundColor Cyan
-    Write-Host "    $CheckpointPath.status.json"
-    Invoke-M02Command -Arguments (@(
+    $CheckpointStatus = Invoke-M02Command -Arguments @(
+        "campaign-schema11-validate",
+        $Selection,
+        "--checkpoint", $CheckpointPath
+    ) | ConvertFrom-Json
+    Write-Host "M02 campaign startup" -ForegroundColor Cyan
+    Write-Host ("    Resolved checkpoint      : {0}" -f $CheckpointPath)
+    Write-Host ("    Selected command         : {0}" -f $Command)
+    Write-Host ("    Execution profile        : {0}" -f $Profile)
+    $SelectedSurveyPass = if ($Profile -eq "survey") {
+        $SurveyPass
+    }
+    else {
+        "not-applicable"
+    }
+    Write-Host ("    Survey pass              : {0}" -f $SelectedSurveyPass)
+    Write-Host ("    Selection ID             : {0}" -f $CheckpointStatus.selection_id)
+    Write-Host ("    Checkpoint schema        : {0}" -f $CheckpointStatus.schema_version)
+    Write-Host ("    Recovered terminal count : {0}" -f $CheckpointStatus.recovered_terminal_count)
+    Write-Host ("    Binary64 pass count      : {0}" -f $CheckpointStatus.binary64_pass_count)
+    Write-Host ("    Promotion queue count    : {0}" -f $CheckpointStatus.promotion_queue_count)
+    Write-Host ("    Evidence counts          : {0}" -f ($CheckpointStatus.evidence_counts | ConvertTo-Json -Compress))
+    Write-Host ("    Basic report directory   : {0}" -f $CheckpointStatus.basic_report_directory)
+    Write-Host ("    Status path              : {0}" -f "$CheckpointPath.status.json")
+    $RunArguments = @(
         $Command,
         $Selection,
-        "--checkpoint",
-        $Checkpoint,
-        "--progress",
-        $Progress,
-        "--profile",
+        "--checkpoint", $CheckpointPath,
+        "--progress", $Progress
+    ) + $CalibrationArguments
+    if ($null -ne $ResolvedQueuePath) {
+        $RunArguments += @("--queue", $ResolvedQueuePath)
+    }
+    Invoke-M02Command -Arguments $RunArguments
+    $ValidationPass = if ($Profile -eq "survey") {
+        $SurveyPass
+    }
+    else {
         $Profile
-    ) + $CalibrationArguments + $TriageArguments)
+    }
     Invoke-M02Command -Arguments @(
-        "campaign-validate",
+        "campaign-schema11-validate",
         $Selection,
-        "--checkpoint",
-        $Checkpoint,
-        "--profile",
-        $Profile,
-        "--full"
-    )
+        "--checkpoint", $CheckpointPath,
+        "--pass", $ValidationPass
+    ) | Out-Null
 }
 finally {
     Pop-Location
 }
 
-Write-Host "M02 campaign checkpoint is complete and structurally valid:" -ForegroundColor Green
+Write-Host "M02 requested pass finished; checkpoint is structurally valid:" -ForegroundColor Green
 Write-Host "    $CheckpointPath"

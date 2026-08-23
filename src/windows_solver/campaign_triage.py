@@ -1,480 +1,542 @@
-"""Deterministic whole-atlas risk triage for targeted M02 evidence work."""
+"""Deterministic whole-atlas triage and certification-queue construction."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 import hashlib
-import json
 import math
-import os
-from pathlib import Path
-import tempfile
 from typing import Mapping, Sequence
 
-from .campaign_policy import EvidenceLevel, ExecutionProfile
+from .campaign_evidence import (
+    EvidencePassRequest,
+    EvidenceStrengtheningPolicy,
+    build_evidence_pass_request,
+)
+from .campaign_policy import EvidenceLevel, ExecutionProfile, validate_schema11_checkpoint
 from .contracts import canonical_json_bytes
-from .response_batches import CampaignPlan, CampaignRunSummary
-from .response_engine import ComponentResult, ComponentStatus
 
 
-TRIAGE_SCHEMA = "windows-solver.m02-atlas-triage/1"
-_TRIAGE_ACTION_BY_PROFILE = {
-    ExecutionProfile.CERTIFY: "CERTIFY",
-    ExecutionProfile.VALIDATE: "VALIDATE",
-}
+TRIAGE_SCHEMA = "windows-solver.whole-atlas-triage/1"
+CERTIFICATION_QUEUE_SCHEMA = "windows-solver.certification-queue/1"
 
 
 def _sha256(value: object) -> str:
     return hashlib.sha256(canonical_json_bytes(value)).hexdigest()
 
 
-def _json_ids(value: object) -> tuple[str, ...]:
-    if isinstance(value, str):
-        try:
-            value = json.loads(value)
-        except (TypeError, ValueError):
-            return ()
-    if not isinstance(value, list):
-        return ()
-    return tuple(str(item) for item in value)
+def _is_sha256(value: object) -> bool:
+    if not isinstance(value, str) or len(value) != 64:
+        return False
+    try:
+        int(value, 16)
+    except ValueError:
+        return False
+    return True
 
 
-def triage_leaf_ids_for_profile(
-    plan: CampaignPlan,
-    value: object,
-    profile: ExecutionProfile,
-    *,
-    checkpoint_source_receipt: str,
-    limit: int | None = None,
-) -> tuple[str, ...]:
-    """Authenticate one unified mixed-role queue and select its next action."""
-
-    if profile not in _TRIAGE_ACTION_BY_PROFILE:
-        raise ValueError("triage queues require certify or validate profile")
-    if limit is not None and (
-        type(limit) is not int or limit <= 0
-    ):
-        raise ValueError("triage queue limit must be a positive integer")
-    if (
-        not isinstance(checkpoint_source_receipt, str)
-        or not checkpoint_source_receipt.startswith("sha256:")
-        or len(checkpoint_source_receipt) != 71
-        or any(
-            character not in "0123456789abcdef"
-            for character in checkpoint_source_receipt[7:]
-        )
-    ):
-        raise ValueError("campaign checkpoint source receipt is invalid")
-    if not isinstance(value, Mapping) or set(value) != {
-        "schema",
-        "campaign_id",
-        "checkpoint_source_receipt",
-        "recommended_certification_queue",
-        "triage_sha256",
-    }:
-        raise ValueError("campaign triage report fields are invalid")
-    content = {
-        name: value[name]
-        for name in value
-        if name != "triage_sha256"
-    }
-    if (
-        value.get("schema") != TRIAGE_SCHEMA
-        or value.get("campaign_id") != plan.campaign_id
-        or value.get("triage_sha256") != _sha256(content)
-    ):
-        raise ValueError("campaign triage report identity is invalid")
-    if value.get("checkpoint_source_receipt") != checkpoint_source_receipt:
-        raise ValueError("campaign triage queue targets a stale checkpoint")
-    raw_entries = value.get("recommended_certification_queue")
-    if not isinstance(raw_entries, list) or not raw_entries:
-        raise ValueError("campaign triage queue is empty or invalid")
-    leaf_by_id = {leaf.leaf_id: leaf for leaf in plan.leaves}
-    expected_fields = {
-        "rank",
-        "leaf_id",
-        "mode",
-        "mechanism",
-        "terminal_state",
-        "evidence_level",
-        "recommended_action",
-        "priority_score",
-        "reasons",
-        "metrics",
-    }
-    eligible: list[str] = []
-    seen: set[str] = set()
-    expected_action = _TRIAGE_ACTION_BY_PROFILE[profile]
-    for expected_rank, raw in enumerate(raw_entries, start=1):
-        if (
-            not isinstance(raw, Mapping)
-            or set(raw) != expected_fields
-            or raw.get("rank") != expected_rank
-            or not isinstance(raw.get("reasons"), list)
-            or not isinstance(raw.get("metrics"), Mapping)
-        ):
-            raise ValueError("campaign triage queue entry is invalid")
-        leaf_id = raw.get("leaf_id")
-        if not isinstance(leaf_id, str) or leaf_id in seen:
-            raise ValueError("campaign triage queue leaf identity is invalid")
-        leaf = leaf_by_id.get(leaf_id)
-        if (
-            leaf is None
-            or raw.get("mode") != leaf.leaf.mode_label
-            or raw.get("mechanism") != leaf.mechanism_id
-        ):
-            raise ValueError("campaign triage queue is off-plan")
-        seen.add(leaf_id)
-        if raw.get("recommended_action") == expected_action:
-            eligible.append(leaf_id)
-    if not eligible:
-        raise ValueError(
-            f"campaign triage queue has no {expected_action} leaves"
-        )
-    return tuple(eligible if limit is None else eligible[:limit])
+def _optional_nonnegative(value: object, label: str) -> float | None:
+    if value is None:
+        return None
+    converted = float(value)
+    if not math.isfinite(converted) or converted < 0:
+        raise ValueError(f"triage {label} is invalid")
+    return converted
 
 
 @dataclass(frozen=True, slots=True)
-class CampaignTriageEntry:
-    rank: int
+class TriagePolicy:
+    maximum_queue_size: int = 32
+    relative_disk_risk_threshold: float = 0.25
+    projective_angle_risk_threshold: float = 0.1
+    allow_complete_selection: bool = False
+
+    def __post_init__(self) -> None:
+        if (
+            isinstance(self.maximum_queue_size, bool)
+            or not isinstance(self.maximum_queue_size, int)
+            or self.maximum_queue_size < 1
+        ):
+            raise ValueError("triage queue size is invalid")
+        for name in (
+            "relative_disk_risk_threshold",
+            "projective_angle_risk_threshold",
+        ):
+            value = float(getattr(self, name))
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError(f"triage {name} is invalid")
+            object.__setattr__(self, name, value)
+        if type(self.allow_complete_selection) is not bool:
+            raise ValueError("triage complete-selection policy is invalid")
+
+    @property
+    def identity_material(self) -> dict[str, object]:
+        return {
+            "schema": "windows-solver.whole-atlas-triage-policy/1",
+            "maximum_queue_size": self.maximum_queue_size,
+            "relative_disk_risk_threshold": self.relative_disk_risk_threshold,
+            "projective_angle_risk_threshold": (
+                self.projective_angle_risk_threshold
+            ),
+            "allow_complete_selection": self.allow_complete_selection,
+        }
+
+    @property
+    def identity_sha256(self) -> str:
+        return _sha256(self.identity_material)
+
+
+@dataclass(frozen=True, slots=True)
+class TriageLeaf:
     leaf_id: str
-    mode: str
-    mechanism: str
-    terminal_state: str
-    evidence_level: str | None
-    recommended_action: str
-    priority_score: float
-    reasons: tuple[str, ...]
-    metrics: Mapping[str, object]
+    role: str
+    mode_family: str
+    mechanism_id: str
+    numerical_state: str
+    evidence_level: EvidenceLevel | None
+    response_magnitude: float | None
+    response_disk_radius: float | None
+    binary64_promoted_disagreement: bool
+    derivative_disagreement: bool
+    branch_risk: bool
+    near_extremal_support: bool
+    projective_angle_lower_bound: float | None
+    controls_projective_classification: bool
 
-    def to_mapping(self) -> dict[str, object]:
-        return {
-            "rank": self.rank,
-            "leaf_id": self.leaf_id,
-            "mode": self.mode,
-            "mechanism": self.mechanism,
-            "terminal_state": self.terminal_state,
-            "evidence_level": self.evidence_level,
-            "recommended_action": self.recommended_action,
-            "priority_score": self.priority_score,
-            "reasons": list(self.reasons),
-            "metrics": dict(self.metrics),
-        }
+    def __post_init__(self) -> None:
+        for name in ("leaf_id", "role", "mode_family", "mechanism_id"):
+            if not isinstance(getattr(self, name), str) or not getattr(self, name):
+                raise ValueError(f"triage leaf {name} is invalid")
+        if self.numerical_state not in {
+            "PRODUCED",
+            "UNRESOLVED",
+            "DEFERRED",
+            "REJECTED",
+        }:
+            raise ValueError("triage leaf numerical state is invalid")
+        if self.evidence_level is not None:
+            object.__setattr__(
+                self, "evidence_level", EvidenceLevel(self.evidence_level)
+            )
+        for name in (
+            "response_magnitude",
+            "response_disk_radius",
+            "projective_angle_lower_bound",
+        ):
+            object.__setattr__(
+                self, name, _optional_nonnegative(getattr(self, name), name)
+            )
+        booleans = (
+            "binary64_promoted_disagreement",
+            "derivative_disagreement",
+            "branch_risk",
+            "near_extremal_support",
+            "controls_projective_classification",
+        )
+        if any(type(getattr(self, name)) is not bool for name in booleans):
+            raise ValueError("triage leaf risk flags are invalid")
 
 
 @dataclass(frozen=True, slots=True)
-class CampaignTriageReport:
-    campaign_id: str
-    checkpoint_source_receipt: str
-    entries: tuple[CampaignTriageEntry, ...]
+class AtlasTriageEntry:
+    leaf_id: str
+    role: str
+    mode_family: str
+    mechanism_id: str
+    priority_score: int
+    relative_disk_radius: float | None
+    reasons: tuple[str, ...]
+    certification_eligible: bool
 
-    @property
-    def content(self) -> dict[str, object]:
-        return {
-            "schema": TRIAGE_SCHEMA,
-            "campaign_id": self.campaign_id,
-            "checkpoint_source_receipt": self.checkpoint_source_receipt,
-            "recommended_certification_queue": [
-                entry.to_mapping() for entry in self.entries
-            ],
-        }
-
-    @property
-    def triage_sha256(self) -> str:
-        return _sha256(self.content)
+    def __post_init__(self) -> None:
+        for name in ("leaf_id", "role", "mode_family", "mechanism_id"):
+            if not isinstance(getattr(self, name), str) or not getattr(self, name):
+                raise ValueError(f"atlas triage {name} is invalid")
+        if (
+            isinstance(self.priority_score, bool)
+            or not isinstance(self.priority_score, int)
+            or self.priority_score < 0
+        ):
+            raise ValueError("atlas triage priority is invalid")
+        object.__setattr__(
+            self,
+            "relative_disk_radius",
+            _optional_nonnegative(
+                self.relative_disk_radius, "relative disk radius"
+            ),
+        )
+        if any(not isinstance(reason, str) or not reason for reason in self.reasons):
+            raise ValueError("atlas triage reasons are invalid")
+        if type(self.certification_eligible) is not bool:
+            raise ValueError("atlas triage eligibility is invalid")
 
     def to_mapping(self) -> dict[str, object]:
-        return {**self.content, "triage_sha256": self.triage_sha256}
-
-
-def _component_result(record) -> ComponentResult | None:
-    if not record.stages:
-        return None
-    return _stage_component_result(record.stages[-1])
-
-
-def _stage_component_result(stage) -> ComponentResult | None:
-    raw = stage.outcome.component_result.get("result")
-    if not isinstance(raw, Mapping):
-        return None
-    try:
-        return ComponentResult.from_mapping(raw)
-    except (TypeError, ValueError):
-        return None
-
-
-def build_campaign_triage(
-    plan: CampaignPlan,
-    summary: CampaignRunSummary,
-    leaf_rows: Sequence[Mapping[str, object]],
-    projective_rows: Sequence[Mapping[str, object]],
-    *,
-    checkpoint_source_receipt: str,
-) -> CampaignTriageReport:
-    """Rank atlas risks without changing any numerical acceptance rule."""
-
-    records = {record.leaf_id: record for record in summary.records}
-    rows = {str(row["leaf_id"]): row for row in leaf_rows}
-    leaf_plan = {leaf.leaf_id: leaf for leaf in plan.leaves}
-    reasons: dict[str, set[str]] = {leaf_id: set() for leaf_id in records}
-    scores: dict[str, float] = {leaf_id: 0.0 for leaf_id in records}
-    metrics: dict[str, dict[str, object]] = {
-        leaf_id: {} for leaf_id in records
-    }
-
-    finite_relative: list[tuple[float, str]] = []
-    finite_clearance: list[tuple[float, str]] = []
-    finite_derivative_disagreement: list[tuple[float, str]] = []
-    finite_precision_disagreement: list[tuple[float, str]] = []
-    for leaf_id, record in records.items():
-        row = rows.get(leaf_id, {})
-        if record.evidence is not None and record.evidence.discrepancy_codes:
-            reasons[leaf_id].add("EVIDENCE_DISCREPANCY")
-            scores[leaf_id] += 9500.0
-            metrics[leaf_id]["evidence_discrepancy_codes"] = list(
-                record.evidence.discrepancy_codes
-            )
-        if record.state in {"UNRESOLVED", "FAILED"}:
-            reasons[leaf_id].add(
-                "FAILED_SURVEY_LEAF"
-                if record.state == "FAILED"
-                else "UNRESOLVED_SURVEY_LEAF"
-            )
-            scores[leaf_id] += 10000.0
-        radius = row.get("local_disk_radius")
-        magnitude = row.get("response_magnitude")
-        if isinstance(radius, (int, float)) and isinstance(
-            magnitude, (int, float)
-        ):
-            radius_value = float(radius)
-            magnitude_value = float(magnitude)
-            if math.isfinite(radius_value) and math.isfinite(magnitude_value):
-                metrics[leaf_id]["response_magnitude"] = magnitude_value
-                metrics[leaf_id]["local_disk_radius"] = radius_value
-                if magnitude_value <= radius_value:
-                    reasons[leaf_id].add("RESPONSE_DISK_CONTAINS_ZERO")
-                    scores[leaf_id] += 9000.0
-                if magnitude_value > 0.0:
-                    relative = radius_value / magnitude_value
-                    finite_relative.append((relative, leaf_id))
-                    metrics[leaf_id]["relative_disk_radius"] = relative
-                if radius_value > 0.0:
-                    clearance = (magnitude_value - radius_value) / radius_value
-                    finite_clearance.append((clearance, leaf_id))
-
-        result = _component_result(record)
-        if result is not None:
-            if (
-                result.status is ComponentStatus.BRANCH_LOSS
-                or result.baseline.root_reference_id
-                != leaf_plan[leaf_id].job.root.root_reference_id
-                or result.baseline.branch_id
-                != leaf_plan[leaf_id].job.root.branch_id
-            ):
-                reasons[leaf_id].add("BRANCH_RISK")
-                scores[leaf_id] += 8000.0
-            conditioning = result.baseline.numerical_conditioning
-            if conditioning is not None and conditioning.precision_limited:
-                reasons[leaf_id].add("PRECISION_LIMITED")
-                scores[leaf_id] += 7000.0
-            derivative = result.derivative_evidence
-            if isinstance(derivative, Mapping):
-                disagreements = tuple(
-                    float(value)
-                    for name in (
-                        "raw_step_disagreement_abs",
-                        "frequency_raw_step_disagreement_abs",
-                    )
-                    for value in (derivative.get(name),)
-                    if isinstance(value, (int, float))
-                    and math.isfinite(float(value))
-                )
-                if disagreements and max(disagreements) > 0.0:
-                    disagreement = max(disagreements)
-                    metrics[leaf_id]["derivative_disagreement_abs"] = (
-                        disagreement
-                    )
-                    finite_derivative_disagreement.append(
-                        (disagreement, leaf_id)
-                    )
-                decision = derivative.get("conditioning_decision")
-                if (
-                    isinstance(decision, Mapping)
-                    and decision.get("accepted") is False
-                ):
-                    reasons[leaf_id].add("DERIVATIVE_DISAGREEMENT")
-                    scores[leaf_id] += 7500.0
-
-        if len(record.stages) > 1:
-            left = _stage_component_result(record.stages[0])
-            right = _component_result(record)
-            if (
-                left is not None
-                and right is not None
-                and left.response is not None
-                and right.response is not None
-            ):
-                disagreement = abs(right.response - left.response)
-                bound = (
-                    record.stages[0].outcome.local_disk_radius_abs
-                    + record.stages[-1].outcome.local_disk_radius_abs
-                )
-                metrics[leaf_id]["binary64_promoted_disagreement_abs"] = (
-                    disagreement
-                )
-                if disagreement > 0.0:
-                    finite_precision_disagreement.append(
-                        (disagreement, leaf_id)
-                    )
-                if disagreement > bound:
-                    reasons[leaf_id].add("BINARY64_PROMOTED_DISAGREEMENT")
-                    scores[leaf_id] += 8500.0
-
-    relative_count = max(1, math.ceil(len(finite_relative) / 10))
-    for relative, leaf_id in sorted(finite_relative, reverse=True)[:relative_count]:
-        reasons[leaf_id].add("LARGEST_RELATIVE_RESPONSE_DISK")
-        scores[leaf_id] += 1000.0 + min(relative, 1000.0)
-    near_zero_count = max(1, math.ceil(len(finite_clearance) / 10))
-    for clearance, leaf_id in sorted(finite_clearance)[:near_zero_count]:
-        reasons[leaf_id].add("APPROACHING_ZERO")
-        scores[leaf_id] += 1200.0 + max(0.0, 100.0 - clearance)
-    derivative_count = max(
-        1, math.ceil(len(finite_derivative_disagreement) / 10)
-    )
-    for _, leaf_id in sorted(
-        finite_derivative_disagreement, reverse=True
-    )[:derivative_count]:
-        reasons[leaf_id].add("LARGEST_DERIVATIVE_DISAGREEMENT")
-        scores[leaf_id] += 1100.0
-    precision_count = max(
-        1, math.ceil(len(finite_precision_disagreement) / 10)
-    )
-    for _, leaf_id in sorted(
-        finite_precision_disagreement, reverse=True
-    )[:precision_count]:
-        reasons[leaf_id].add("LARGEST_BINARY64_PROMOTED_DISAGREEMENT")
-        scores[leaf_id] += 1150.0
-
-    complete_angles = tuple(
-        row
-        for row in projective_rows
-        if isinstance(row.get("nominal_angle"), (int, float))
-        and math.isfinite(float(row["nominal_angle"]))
-    )
-    if complete_angles:
-        minimum_angle = min(
-            float(row["nominal_angle"]) for row in complete_angles
-        )
-        controlling_rows = tuple(
-            row
-            for row in complete_angles
-            if float(row["nominal_angle"]) == minimum_angle
-        )
-        controlling_ids = {
-            leaf_id
-            for row in controlling_rows
-            for name in ("left_component_ids", "right_component_ids")
-            for leaf_id in _json_ids(row.get(name))
+        return {
+            "leaf_id": self.leaf_id,
+            "role": self.role,
+            "mode_family": self.mode_family,
+            "mechanism_id": self.mechanism_id,
+            "priority_score": self.priority_score,
+            "relative_disk_radius": self.relative_disk_radius,
+            "reasons": list(self.reasons),
+            "certification_eligible": self.certification_eligible,
         }
-        for leaf_id in controlling_ids & set(records):
-            reasons[leaf_id].update({
-                "SMALLEST_PROJECTIVE_ANGLE_ROW",
-                "PROJECTIVE_CLASSIFICATION_CONTROLLER",
-            })
-            scores[leaf_id] += 6000.0
-            metrics[leaf_id]["controlling_projective_row_ids"] = [
-                row.get("row_id")
-                for row in controlling_rows
-                if leaf_id in {
-                    *(_json_ids(row.get("left_component_ids"))),
-                    *(_json_ids(row.get("right_component_ids"))),
-                }
-            ]
-            metrics[leaf_id]["controlling_nominal_angle"] = minimum_angle
 
-    def add_sentinels(attribute: str, reason: str) -> None:
-        groups: dict[str, list[str]] = {}
-        for leaf_id in records:
-            leaf = leaf_plan[leaf_id]
-            value = (
-                leaf.mechanism_id
-                if attribute == "mechanism"
-                else leaf.leaf.mode_label
-            )
-            groups.setdefault(value, []).append(leaf_id)
-        for members in groups.values():
-            selected = max(
-                members,
-                key=lambda leaf_id: (scores[leaf_id], -plan.leaves.index(leaf_plan[leaf_id])),
-            )
-            reasons[selected].add(reason)
-            scores[selected] += 500.0
-
-    add_sentinels("mechanism", "MECHANISM_SENTINEL")
-    add_sentinels("mode", "MODE_FAMILY_SENTINEL")
-
-    ordered_ids = sorted(
-        records,
-        key=lambda leaf_id: (
-            -scores[leaf_id],
-            plan.leaves.index(leaf_plan[leaf_id]),
-        ),
-    )
-    entries: list[CampaignTriageEntry] = []
-    for rank, leaf_id in enumerate(ordered_ids, start=1):
-        record = records[leaf_id]
-        level = None if record.evidence is None else record.evidence.evidence_level
-        targeted = bool(reasons[leaf_id])
-        action = (
-            "REVIEW"
-            if (
-                record.evidence is not None
-                and bool(record.evidence.discrepancy_codes)
-            )
-            else "RESOLVE_SURVEY"
-            if record.state in {"UNRESOLVED", "FAILED"}
-            else "CERTIFY"
-            if level is EvidenceLevel.SCREENED and targeted
-            else "VALIDATE"
-            if level is EvidenceLevel.CERTIFIED and targeted
-            else "REVIEW"
+    @classmethod
+    def from_mapping(cls, value: object) -> "AtlasTriageEntry":
+        fields = {
+            "leaf_id",
+            "role",
+            "mode_family",
+            "mechanism_id",
+            "priority_score",
+            "relative_disk_radius",
+            "reasons",
+            "certification_eligible",
+        }
+        if not isinstance(value, Mapping) or set(value) != fields:
+            raise ValueError("atlas triage entry fields are invalid")
+        reasons = value["reasons"]
+        if not isinstance(reasons, list) or any(
+            not isinstance(reason, str) or not reason for reason in reasons
+        ):
+            raise ValueError("atlas triage reasons are invalid")
+        score = value["priority_score"]
+        if isinstance(score, bool) or not isinstance(score, int) or score < 0:
+            raise ValueError("atlas triage priority is invalid")
+        if type(value["certification_eligible"]) is not bool:
+            raise ValueError("atlas triage eligibility is invalid")
+        return cls(
+            leaf_id=value["leaf_id"],
+            role=value["role"],
+            mode_family=value["mode_family"],
+            mechanism_id=value["mechanism_id"],
+            priority_score=score,
+            relative_disk_radius=_optional_nonnegative(
+                value["relative_disk_radius"], "relative disk radius"
+            ),
+            reasons=tuple(reasons),
+            certification_eligible=value["certification_eligible"],
         )
-        leaf = leaf_plan[leaf_id]
-        entries.append(CampaignTriageEntry(
-            rank=rank,
-            leaf_id=leaf_id,
-            mode=leaf.leaf.mode_label,
-            mechanism=leaf.mechanism_id,
-            terminal_state=record.state,
-            evidence_level=None if level is None else level.value,
-            recommended_action=action,
-            priority_score=scores[leaf_id],
-            reasons=tuple(sorted(reasons[leaf_id])),
-            metrics=metrics[leaf_id],
-        ))
-    return CampaignTriageReport(
-        campaign_id=plan.campaign_id,
-        checkpoint_source_receipt=checkpoint_source_receipt,
-        entries=tuple(entries),
+
+
+@dataclass(frozen=True, slots=True)
+class WholeAtlasTriage:
+    campaign_id: str
+    selection_id: str
+    source_checkpoint_sha256: str
+    triage_policy_identity: str
+    survey_policy_identity: str
+    evidence_request: EvidencePassRequest
+    atlas_entries: tuple[AtlasTriageEntry, ...]
+    queue_entries: tuple[AtlasTriageEntry, ...]
+    queue_sha256: str
+
+    @property
+    def content_mapping(self) -> dict[str, object]:
+        return {
+            "schema": CERTIFICATION_QUEUE_SCHEMA,
+            "triage_schema": TRIAGE_SCHEMA,
+            "campaign_id": self.campaign_id,
+            "selection_id": self.selection_id,
+            "source_checkpoint_sha256": self.source_checkpoint_sha256,
+            "triage_policy_identity": self.triage_policy_identity,
+            "survey_policy_identity": self.survey_policy_identity,
+            "evidence_request": self.evidence_request.to_mapping(),
+            "atlas_entries": [entry.to_mapping() for entry in self.atlas_entries],
+            "queue_entries": [entry.to_mapping() for entry in self.queue_entries],
+        }
+
+    def to_mapping(self) -> dict[str, object]:
+        return {**self.content_mapping, "queue_sha256": self.queue_sha256}
+
+    def __post_init__(self) -> None:
+        if not self.campaign_id or not self.selection_id:
+            raise ValueError("certification queue campaign binding is invalid")
+        for digest in (
+            self.source_checkpoint_sha256,
+            self.triage_policy_identity,
+            self.survey_policy_identity,
+            self.queue_sha256,
+        ):
+            if not _is_sha256(digest):
+                raise ValueError("certification queue digest is invalid")
+        if self.queue_sha256 != _sha256(self.content_mapping):
+            raise ValueError("certification queue authentication failed")
+        if self.evidence_request.profile is not ExecutionProfile.CERTIFY:
+            raise ValueError("certification queue request profile is invalid")
+        if (
+            self.evidence_request.campaign_id != self.campaign_id
+            or self.evidence_request.selection_id != self.selection_id
+            or self.evidence_request.source_checkpoint_sha256
+            != self.source_checkpoint_sha256
+        ):
+            raise ValueError("certification queue request binding is inconsistent")
+        atlas_by_leaf = {entry.leaf_id: entry for entry in self.atlas_entries}
+        if len(atlas_by_leaf) != len(self.atlas_entries):
+            raise ValueError("certification queue atlas leaf IDs are not unique")
+        queue_ids = tuple(entry.leaf_id for entry in self.queue_entries)
+        if not queue_ids or len(set(queue_ids)) != len(queue_ids):
+            raise ValueError("certification queue leaf IDs are invalid")
+        if any(
+            entry.leaf_id not in atlas_by_leaf
+            or not entry.certification_eligible
+            or entry != atlas_by_leaf[entry.leaf_id]
+            for entry in self.queue_entries
+        ):
+            raise ValueError("certification queue entry is not an eligible atlas row")
+        if tuple(entry.leaf_id for entry in self.queue_entries) != (
+            self.evidence_request.ordered_leaf_ids
+        ):
+            raise ValueError("certification queue order is inconsistent")
+
+    @classmethod
+    def from_mapping(cls, value: object) -> "WholeAtlasTriage":
+        fields = {
+            "schema",
+            "triage_schema",
+            "campaign_id",
+            "selection_id",
+            "source_checkpoint_sha256",
+            "triage_policy_identity",
+            "survey_policy_identity",
+            "evidence_request",
+            "atlas_entries",
+            "queue_entries",
+            "queue_sha256",
+        }
+        if not isinstance(value, Mapping) or set(value) != fields:
+            raise ValueError("certification queue fields are invalid")
+        if (
+            value["schema"] != CERTIFICATION_QUEUE_SCHEMA
+            or value["triage_schema"] != TRIAGE_SCHEMA
+        ):
+            raise ValueError("certification queue schema is invalid")
+        atlas = value["atlas_entries"]
+        queue = value["queue_entries"]
+        if not isinstance(atlas, list) or not isinstance(queue, list):
+            raise ValueError("certification queue entries are invalid")
+        return cls(
+            campaign_id=value["campaign_id"],
+            selection_id=value["selection_id"],
+            source_checkpoint_sha256=value["source_checkpoint_sha256"],
+            triage_policy_identity=value["triage_policy_identity"],
+            survey_policy_identity=value["survey_policy_identity"],
+            evidence_request=EvidencePassRequest.from_mapping(
+                value["evidence_request"]
+            ),
+            atlas_entries=tuple(
+                AtlasTriageEntry.from_mapping(entry) for entry in atlas
+            ),
+            queue_entries=tuple(
+                AtlasTriageEntry.from_mapping(entry) for entry in queue
+            ),
+            queue_sha256=value["queue_sha256"],
+        )
+
+
+def _entry(leaf: TriageLeaf, policy: TriagePolicy) -> AtlasTriageEntry:
+    reasons: list[str] = []
+    score = 0
+    if leaf.numerical_state in {"UNRESOLVED", "DEFERRED", "REJECTED"}:
+        reasons.append(leaf.numerical_state)
+        score += {"UNRESOLVED": 120, "DEFERRED": 110, "REJECTED": 100}[
+            leaf.numerical_state
+        ]
+    relative = None
+    if leaf.response_magnitude is not None and leaf.response_disk_radius is not None:
+        if leaf.response_magnitude == 0:
+            reasons.append("ZERO_RESPONSE")
+            score += 100
+        else:
+            relative = leaf.response_disk_radius / leaf.response_magnitude
+            if leaf.response_disk_radius >= leaf.response_magnitude:
+                reasons.append("RESPONSE_DISK_CONTAINS_ZERO")
+                score += 100
+            elif relative >= policy.relative_disk_risk_threshold:
+                reasons.append("LARGE_RELATIVE_DISK")
+                score += 50
+    if leaf.binary64_promoted_disagreement:
+        reasons.append("BINARY64_PROMOTED_DISAGREEMENT")
+        score += 45
+    if leaf.derivative_disagreement:
+        reasons.append("DERIVATIVE_DISAGREEMENT")
+        score += 40
+    if leaf.branch_risk:
+        reasons.append("BRANCH_RISK")
+        score += 35
+    if leaf.near_extremal_support:
+        reasons.append("NEAR_EXTREMAL_SUPPORT")
+        score += 30
+    if leaf.controls_projective_classification:
+        reasons.append("PROJECTIVE_CLASSIFICATION_CONTROLLER")
+        score += 25
+    if (
+        leaf.projective_angle_lower_bound is not None
+        and leaf.projective_angle_lower_bound
+        <= policy.projective_angle_risk_threshold
+    ):
+        reasons.append("SMALL_PROJECTIVE_ANGLE")
+        score += 20
+    eligible = (
+        leaf.numerical_state == "PRODUCED"
+        and leaf.evidence_level is EvidenceLevel.SCREENED
+    )
+    return AtlasTriageEntry(
+        leaf_id=leaf.leaf_id,
+        role=leaf.role,
+        mode_family=leaf.mode_family,
+        mechanism_id=leaf.mechanism_id,
+        priority_score=score,
+        relative_disk_radius=relative,
+        reasons=tuple(reasons),
+        certification_eligible=eligible,
     )
 
 
-def write_campaign_triage_report(
-    path: Path, report: CampaignTriageReport
-) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, temporary_name = tempfile.mkstemp(
-        dir=path.parent, prefix=f".{path.name}.", suffix=".tmp"
+def _rank_key(entry: AtlasTriageEntry) -> tuple[object, ...]:
+    relative = entry.relative_disk_radius
+    bounded_relative = relative if relative is not None else -1.0
+    return (
+        -entry.priority_score,
+        -bounded_relative,
+        entry.mode_family,
+        entry.mechanism_id,
+        entry.role,
+        entry.leaf_id,
     )
-    try:
-        with os.fdopen(descriptor, "wb") as handle:
-            handle.write(canonical_json_bytes(report.to_mapping()))
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary_name, path)
-    except BaseException:
-        try:
-            os.unlink(temporary_name)
-        except FileNotFoundError:
-            pass
-        raise
+
+
+def build_whole_atlas_triage(
+    checkpoint: Mapping[str, object],
+    leaves: Sequence[TriageLeaf],
+    *,
+    triage_policy: TriagePolicy,
+    evidence_policy: EvidenceStrengtheningPolicy,
+    survey_policy_identity: str,
+    engine_identity: str,
+) -> WholeAtlasTriage:
+    """Rank the full atlas and emit one authenticated mixed-role queue."""
+
+    validated = validate_schema11_checkpoint(checkpoint)
+    if not isinstance(triage_policy, TriagePolicy):
+        raise ValueError("triage policy is invalid")
+    if (
+        not isinstance(evidence_policy, EvidenceStrengtheningPolicy)
+        or evidence_policy.profile is not ExecutionProfile.CERTIFY
+    ):
+        raise ValueError("triage requires an explicit certification policy")
+    if not _is_sha256(survey_policy_identity) or not _is_sha256(engine_identity):
+        raise ValueError("triage survey-policy or engine identity is invalid")
+    leaf_tuple = tuple(leaves)
+    if not leaf_tuple:
+        raise ValueError("whole-atlas triage requires selected leaves")
+    if any(not isinstance(leaf, TriageLeaf) for leaf in leaf_tuple):
+        raise ValueError("whole-atlas triage leaf is invalid")
+    leaf_ids = tuple(leaf.leaf_id for leaf in leaf_tuple)
+    if len(set(leaf_ids)) != len(leaf_ids):
+        raise ValueError("whole-atlas triage contains duplicate leaf IDs")
+
+    entries = tuple(sorted(
+        (_entry(leaf, triage_policy) for leaf in leaf_tuple), key=_rank_key
+    ))
+    eligible = tuple(entry for entry in entries if entry.certification_eligible)
+    if not eligible:
+        raise ValueError("whole-atlas triage found no SCREENED certification input")
+    checkpoint_record_map = {
+        record["leaf_id"]: record for record in validated["records"]
+    }
+    checkpoint_evidence = validated["evidence_ledger"]
+    for leaf in leaf_tuple:
+        ledger = checkpoint_evidence.get(leaf.leaf_id)
+        actual_level = (
+            EvidenceLevel(ledger["evidence_level"])
+            if isinstance(ledger, Mapping)
+            else None
+        )
+        if actual_level is not leaf.evidence_level:
+            raise ValueError(
+                f"triage evidence disagrees with checkpoint for {leaf.leaf_id}"
+            )
+        record = checkpoint_record_map.get(leaf.leaf_id)
+        if record is not None and record["state"] != leaf.numerical_state:
+            raise ValueError(
+                f"triage numerical state disagrees with checkpoint for {leaf.leaf_id}"
+            )
+    for entry in eligible:
+        ledger = checkpoint_evidence.get(entry.leaf_id)
+        if (
+            entry.leaf_id not in checkpoint_record_map
+            or not isinstance(ledger, Mapping)
+            or ledger.get("evidence_level") != EvidenceLevel.SCREENED.value
+        ):
+            raise ValueError(
+                f"triage eligibility disagrees with checkpoint for {entry.leaf_id}"
+            )
+
+    selected: dict[str, AtlasTriageEntry] = {}
+    for field in ("mechanism_id", "mode_family", "role"):
+        groups = sorted({getattr(entry, field) for entry in eligible})
+        for group in groups:
+            sentinel = next(
+                entry for entry in eligible if getattr(entry, field) == group
+            )
+            selected[sentinel.leaf_id] = sentinel
+    if len(selected) > triage_policy.maximum_queue_size:
+        raise ValueError("triage sentinel coverage exceeds the queue budget")
+    for entry in eligible:
+        if entry.priority_score <= 0 or entry.leaf_id in selected:
+            continue
+        if len(selected) >= triage_policy.maximum_queue_size:
+            break
+        selected[entry.leaf_id] = entry
+    queue_entries = tuple(
+        entry for entry in eligible if entry.leaf_id in selected
+    )
+    if (
+        len(queue_entries) == len(eligible)
+        and not triage_policy.allow_complete_selection
+    ):
+        raise ValueError(
+            "triage policy would silently select the entire eligible atlas"
+        )
+
+    request = build_evidence_pass_request(
+        validated,
+        policy=evidence_policy,
+        ordered_leaf_ids=tuple(entry.leaf_id for entry in queue_entries),
+        engine_identity=engine_identity,
+    )
+    content = {
+        "schema": CERTIFICATION_QUEUE_SCHEMA,
+        "triage_schema": TRIAGE_SCHEMA,
+        "campaign_id": validated["campaign_id"],
+        "selection_id": validated["selection_id"],
+        "source_checkpoint_sha256": request.source_checkpoint_sha256,
+        "triage_policy_identity": triage_policy.identity_sha256,
+        "survey_policy_identity": survey_policy_identity,
+        "evidence_request": request.to_mapping(),
+        "atlas_entries": [entry.to_mapping() for entry in entries],
+        "queue_entries": [entry.to_mapping() for entry in queue_entries],
+    }
+    return WholeAtlasTriage(
+        campaign_id=validated["campaign_id"],
+        selection_id=validated["selection_id"],
+        source_checkpoint_sha256=request.source_checkpoint_sha256,
+        triage_policy_identity=triage_policy.identity_sha256,
+        survey_policy_identity=survey_policy_identity,
+        evidence_request=request,
+        atlas_entries=entries,
+        queue_entries=queue_entries,
+        queue_sha256=_sha256(content),
+    )
+
+
+__all__ = [
+    "AtlasTriageEntry",
+    "CERTIFICATION_QUEUE_SCHEMA",
+    "TRIAGE_SCHEMA",
+    "TriageLeaf",
+    "TriagePolicy",
+    "WholeAtlasTriage",
+    "build_whole_atlas_triage",
+]

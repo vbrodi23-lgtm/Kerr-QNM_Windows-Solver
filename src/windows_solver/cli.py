@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import replace
 import hashlib
 import json
 import os
@@ -17,6 +16,24 @@ from typing import Mapping, Sequence
 from .artifacts import ArtifactStore, ArtifactVerificationError
 from .builtin import default_registry
 from .contracts import canonical_json_bytes, load_study
+from .campaign_recovery import (
+    RecoverySelection,
+    recover_campaign,
+    validate_recovery_checkpoint,
+    validate_recovery_receipt,
+)
+from .campaign_policy import (
+    CAMPAIGN_CHECKPOINT_SCHEMA_VERSION as SCHEMA11_VERSION,
+    EvidenceLevel,
+    empty_schema11_checkpoint,
+    validate_schema11_checkpoint,
+)
+from .campaign_evidence import (
+    EvidencePassRequest,
+    EvidenceStrengtheningPolicy,
+)
+from .campaign_triage import WholeAtlasTriage
+from .campaign_survey import preflight_campaign_supports
 from .engine import ExecutionEngine, RunRecord, verify_run_integrity
 from .evidence_intake import load_evidence_bundle
 from .linear_response_admission import (
@@ -34,7 +51,15 @@ from .progress import (
     activate_progress,
     emit_progress,
 )
-from .progress_output import CampaignProgressReporter
+from .progress_output import (
+    CampaignProgressReporter,
+    Schema11ProgressReporter,
+    schema11_dashboard_snapshot,
+)
+from .campaign_reports import (
+    refresh_schema11_reports,
+    report_directory_for_checkpoint,
+)
 from .promoted_control_calibration import load_calibration_receipt
 from .response_engine import (
     BackendIdentity,
@@ -56,7 +81,6 @@ from .response_batches import (
     PrecisionCapabilities,
     PrecisionFactoryIdentity,
     STAGE_SIGNED_ERROR_FAMILIES,
-    build_campaign_evidence_queue_selection,
     build_campaign_plan,
     build_campaign_selection,
     import_campaign_checkpoint_to_solved_leaf_store,
@@ -64,15 +88,11 @@ from .response_batches import (
     resolve_campaign_relative_path,
     run_campaign_selection,
     run_predeclared_campaign_smoke,
+    scientific_computation_identity_sha256,
+    validate_campaign_recovery_record,
     validate_campaign_checkpoint,
     worker_failure_payload,
 )
-from .campaign_policy import (
-    EvidenceLevel,
-    ExecutionProfile,
-    evidence_level_at_least,
-)
-from .campaign_triage import triage_leaf_ids_for_profile
 from .solved_leaf_cache import SolvedLeafStore
 from .response_engine import VettedNativeDeterminantKernel, NativeResourceUnavailableError
 from .response_reduction import (
@@ -88,15 +108,6 @@ def _validate_reduction_component_checkpoint_binding(
     record: CampaignLeafRecord,
     authenticated_receipts: frozenset[str],
 ) -> None:
-    if (
-        record.evidence is None
-        or not evidence_level_at_least(
-            record.evidence.evidence_level, EvidenceLevel.CERTIFIED
-        )
-    ):
-        raise ValueError(
-            "campaign release reduction rejects SCREENED-only evidence"
-        )
     if component.evidence_kind != "authenticated-campaign":
         raise ValueError("campaign reduction CLI accepts authenticated evidence only")
     if record.state not in {"PRODUCED", "UNRESOLVED"} or not record.stages:
@@ -231,11 +242,6 @@ def build_parser() -> argparse.ArgumentParser:
         "campaign-plan", help="materialize the exact B-prime campaign plan"
     )
     campaign_plan.add_argument("selection", type=Path)
-    campaign_plan.add_argument(
-        "--profile",
-        choices=tuple(profile.value for profile in ExecutionProfile),
-        default=ExecutionProfile.SURVEY.value,
-    )
     for name, help_text in (
         ("campaign-run", "execute one selected campaign cold"),
         ("campaign-resume", "resume one compatible selected campaign"),
@@ -244,11 +250,6 @@ def build_parser() -> argparse.ArgumentParser:
         campaign = commands.add_parser(name, help=help_text)
         campaign.add_argument("selection", type=Path)
         campaign.add_argument("--checkpoint", type=Path, required=True)
-        campaign.add_argument(
-            "--profile",
-            choices=tuple(profile.value for profile in ExecutionProfile),
-            default=ExecutionProfile.SURVEY.value,
-        )
         if name in {"campaign-run", "campaign-resume"}:
             campaign.add_argument(
                 "--progress",
@@ -262,9 +263,6 @@ def build_parser() -> argparse.ArgumentParser:
             campaign.add_argument(
                 "--calibration-receipt-sha256",
             )
-            if name == "campaign-resume":
-                campaign.add_argument("--triage-queue", type=Path)
-                campaign.add_argument("--queue-limit", type=int)
         if name == "campaign-validate":
             campaign.add_argument("--full", action="store_true")
     campaign_merge = commands.add_parser(
@@ -279,6 +277,60 @@ def build_parser() -> argparse.ArgumentParser:
     campaign_import.add_argument("selection", type=Path)
     campaign_import.add_argument("--checkpoint", type=Path, required=True)
     campaign_import.add_argument("--store", type=Path)
+    campaign_recover = commands.add_parser(
+        "campaign-recover",
+        help="recover compatible terminal records without numerical work",
+    )
+    campaign_recover.add_argument("selection", type=Path)
+    campaign_recover.add_argument("--output", type=Path, required=True)
+    campaign_recover.add_argument("--receipt", type=Path, required=True)
+    campaign_recover.add_argument(
+        "--source-checkpoint", type=Path, action="append", default=[]
+    )
+    campaign_recover.add_argument(
+        "--solved-leaf-store", type=Path, action="append", default=[]
+    )
+    campaign_recover.add_argument(
+        "--root-readout-store", type=Path, action="append", default=[]
+    )
+    campaign_recover.add_argument("--oracle", type=Path)
+    campaign_recovery_validate = commands.add_parser(
+        "campaign-recovery-validate",
+        help="validate a schema-11 recovery candidate without numerical work",
+    )
+    campaign_recovery_validate.add_argument("selection", type=Path)
+    campaign_recovery_validate.add_argument(
+        "--checkpoint", type=Path, required=True
+    )
+    campaign_recovery_validate.add_argument("--receipt", type=Path)
+    for name, help_text in (
+        ("campaign-survey-binary64", "run only the schema-11 binary64 survey pass"),
+        ("campaign-survey-promoted", "run only the queued schema-11 promoted survey pass"),
+        ("campaign-certify", "strengthen SCREENED evidence from an explicit queue"),
+        ("campaign-evidence-validate", "validate CERTIFIED evidence from an explicit queue"),
+    ):
+        campaign_pass = commands.add_parser(name, help=help_text)
+        campaign_pass.add_argument("selection", type=Path)
+        campaign_pass.add_argument("--checkpoint", type=Path, required=True)
+        campaign_pass.add_argument(
+            "--progress",
+            choices=tuple(mode.value for mode in ProgressMode),
+            default=ProgressMode.NORMAL.value,
+        )
+        campaign_pass.add_argument("--queue", type=Path)
+        campaign_pass.add_argument("--calibration-receipt-path", type=Path)
+        campaign_pass.add_argument("--calibration-receipt-sha256")
+    schema11_validate = commands.add_parser(
+        "campaign-schema11-validate",
+        help="validate a schema-11 checkpoint and one optional pass boundary",
+    )
+    schema11_validate.add_argument("selection", type=Path)
+    schema11_validate.add_argument("--checkpoint", type=Path, required=True)
+    schema11_validate.add_argument(
+        "--pass",
+        dest="pass_name",
+        choices=("binary64", "promoted", "certify", "validate"),
+    )
     campaign_reduce = commands.add_parser(
         "campaign-reduce",
         help="reduce authenticated campaign checkpoints without backend work",
@@ -762,12 +814,7 @@ def _campaign_selected(
     reporter: CampaignProgressReporter | None = None,
     calibration_receipt_path: Path | None = None,
     calibration_receipt_sha256: str | None = None,
-    execution_profile: ExecutionProfile = ExecutionProfile.SURVEY,
-    triage_queue: Path | None = None,
-    queue_limit: int | None = None,
 ):
-    if not isinstance(execution_profile, ExecutionProfile):
-        raise ValueError("campaign execution profile is invalid")
     if command in {"campaign-run", "campaign-resume"}:
         emit_progress(
             ProgressEventKind.REQUEST_STARTED,
@@ -776,37 +823,6 @@ def _campaign_selected(
             checkpoint_path=str(checkpoint),
         )
     plan, selection, descriptor = _campaign_plan_and_selection(selection_path)
-    checkpoint = resolve_campaign_relative_path(Path.cwd(), str(checkpoint))
-    if triage_queue is not None:
-        if (
-            command != "campaign-resume"
-            or execution_profile is ExecutionProfile.SURVEY
-        ):
-            raise ValueError(
-                "triage queues require campaign-resume with certify or validate"
-            )
-        queue_value = _load_strict_json(
-            triage_queue, "campaign triage queue"
-        )
-        if not checkpoint.is_file():
-            raise ValueError(
-                "campaign triage queue requires an existing checkpoint"
-            )
-        selection = build_campaign_evidence_queue_selection(
-            plan,
-            triage_leaf_ids_for_profile(
-                plan,
-                queue_value,
-                execution_profile,
-                checkpoint_source_receipt=(
-                    "sha256:"
-                    + hashlib.sha256(checkpoint.read_bytes()).hexdigest()
-                ),
-                limit=queue_limit,
-            ),
-        )
-    elif queue_limit is not None:
-        raise ValueError("campaign queue limit requires --triage-queue")
     if command in {"campaign-run", "campaign-resume"}:
         emit_progress(
             ProgressEventKind.REQUEST_VALIDATED,
@@ -826,9 +842,9 @@ def _campaign_selected(
             "cohorts": [cohort.to_mapping() for cohort in plan.cohorts],
             "selection": selection.to_mapping(),
             "campaign": plan.to_mapping(),
-            "execution_profile": execution_profile.value,
             "release_admissible": False,
         }
+    checkpoint = resolve_campaign_relative_path(Path.cwd(), str(checkpoint))
     if command == "campaign-validate":
         summary = validate_campaign_checkpoint(
             plan, checkpoint, require_complete_campaign=full
@@ -837,14 +853,6 @@ def _campaign_selected(
         if not full and summary.selection_id != selection.selection_id:
             raise ValueError("campaign checkpoint selection does not match request")
     else:
-        if (
-            command == "campaign-run"
-            and execution_profile is not ExecutionProfile.SURVEY
-        ):
-            raise ValueError(
-                "certify and validate profiles require campaign-resume with "
-                "an existing screened checkpoint"
-            )
         if command == "campaign-run" and checkpoint.exists():
             raise ValueError("campaign cold execution refuses an existing checkpoint")
         if command == "campaign-resume" and not checkpoint.exists():
@@ -858,35 +866,15 @@ def _campaign_selected(
                 "schema_version"
             ) == CAMPAIGN_CHECKPOINT_SCHEMA_VERSION
             _validate_campaign_capability_superset(cached, descriptor, plan)
-            if execution_profile is ExecutionProfile.SURVEY:
-                if cached.selection_id != selection.selection_id:
-                    raise ValueError(
-                        "campaign checkpoint selection does not match request"
-                    )
-            elif not set(selection.leaf_ids).issubset({
-                record.leaf_id for record in cached.records
-            }):
-                raise ValueError(
-                    "campaign evidence selection is outside the checkpoint"
-                )
+            if cached.selection_id != selection.selection_id:
+                raise ValueError("campaign checkpoint selection does not match request")
             if reporter is not None:
                 reporter.bind_campaign_reports(plan)
-            if (
-                execution_profile is ExecutionProfile.SURVEY
-                and cached.state == "COMPLETE"
-                and checkpoint_is_current
-            ):
+            if cached.state == "COMPLETE" and checkpoint_is_current:
                 import_campaign_checkpoint_to_solved_leaf_store(
                     plan, checkpoint, SolvedLeafStore.default()
                 )
-                profiled_cached = (
-                    replace(cached, execution_profile=execution_profile)
-                    if isinstance(cached, CampaignRunSummary)
-                    else cached
-                )
-                return 0, _campaign_console_mapping(
-                    command, profiled_cached
-                )
+                return 0, _campaign_console_mapping(command, cached)
         elif reporter is not None:
             reporter.bind_campaign_reports(plan)
         backend = _load_campaign_backend(
@@ -903,14 +891,8 @@ def _campaign_selected(
             checkpoint,
             resume=command == "campaign-resume",
             solved_leaf_store=SolvedLeafStore.default(),
-            execution_profile=execution_profile,
         )
-    profiled_summary = (
-        replace(summary, execution_profile=execution_profile)
-        if isinstance(summary, CampaignRunSummary)
-        else summary
-    )
-    return 0, _campaign_console_mapping(command, profiled_summary)
+    return 0, _campaign_console_mapping(command, summary)
 
 
 def _campaign_cache_import(
@@ -929,6 +911,389 @@ def _campaign_cache_import(
     return 0, {"command": "campaign-cache-import", **summary.to_mapping()}
 
 
+def _campaign_recover(
+    selection_path: Path,
+    output_path: Path,
+    receipt_path: Path,
+    *,
+    source_checkpoints: Sequence[Path],
+    solved_leaf_stores: Sequence[Path],
+    root_readout_stores: Sequence[Path],
+    oracle_path: Path | None,
+) -> tuple[int, object]:
+    plan, selection, _descriptor = _campaign_plan_and_selection(selection_path)
+    recovery_selection = _campaign_recovery_selection(plan, selection)
+    resolved_output = _resolve_recovery_path(output_path)
+    resolved_receipt = _resolve_recovery_path(receipt_path)
+    summary = recover_campaign(
+        recovery_selection,
+        output_path=resolved_output,
+        receipt_path=resolved_receipt,
+        source_checkpoints=tuple(
+            _resolve_recovery_path(path) for path in source_checkpoints
+        ),
+        solved_leaf_stores=tuple(
+            _resolve_recovery_path(path) for path in solved_leaf_stores
+        ),
+        root_readout_stores=tuple(
+            _resolve_recovery_path(path) for path in root_readout_stores
+        ),
+        oracle_path=(
+            None if oracle_path is None else _resolve_recovery_path(oracle_path)
+        ),
+        record_validator=lambda leaf_id, record: validate_campaign_recovery_record(
+            plan, leaf_id, record
+        ),
+        checkpoint_finalizer=lambda checkpoint, path: refresh_schema11_reports(
+            plan,
+            selection,
+            checkpoint,
+            path,
+            persist_checkpoint=False,
+        ),
+    )
+    return 0, {"command": "campaign-recover", **summary.to_mapping()}
+
+
+def _campaign_recovery_selection(plan, selection) -> RecoverySelection:
+    leaf_by_id = {leaf.leaf_id: leaf for leaf in plan.leaves}
+    return RecoverySelection(
+        campaign_id=plan.campaign_id,
+        selection_id=selection.selection_id,
+        ordered_leaf_ids=tuple(selection.leaf_ids),
+        roles={leaf_id: leaf_by_id[leaf_id].role for leaf_id in selection.leaf_ids},
+        scientific_identities={
+            leaf_id: scientific_computation_identity_sha256(
+                plan, leaf_by_id[leaf_id]
+            )
+            for leaf_id in selection.leaf_ids
+        },
+    )
+
+
+def _resolve_recovery_path(path: Path) -> Path:
+    expanded = path.expanduser()
+    return (
+        expanded.resolve()
+        if expanded.is_absolute()
+        else (Path.cwd() / expanded).resolve()
+    )
+
+
+def _campaign_recovery_validate(
+    selection_path: Path,
+    checkpoint_path: Path,
+    receipt_path: Path | None = None,
+) -> tuple[int, object]:
+    plan, selection, _descriptor = _campaign_plan_and_selection(selection_path)
+    recovery_selection = _campaign_recovery_selection(plan, selection)
+    checkpoint = validate_recovery_checkpoint(
+        recovery_selection,
+        _resolve_recovery_path(checkpoint_path),
+        record_validator=lambda leaf_id, record: validate_campaign_recovery_record(
+            plan, leaf_id, record
+        ),
+    )
+    if receipt_path is not None:
+        validate_recovery_receipt(
+            recovery_selection,
+            _resolve_recovery_path(checkpoint_path),
+            _resolve_recovery_path(receipt_path),
+        )
+    return 0, {
+        "command": "campaign-recovery-validate",
+        "campaign_id": recovery_selection.campaign_id,
+        "selection_id": recovery_selection.selection_id,
+        "state": checkpoint["state"],
+        "result_count": len(checkpoint["records"]),
+        "checkpoint_path": str(_resolve_recovery_path(checkpoint_path)),
+        "release_admissible": False,
+    }
+
+
+def _load_schema11_campaign(
+    selection_path: Path,
+    checkpoint_path: Path,
+):
+    plan, selection, descriptor = _campaign_plan_and_selection(selection_path)
+    recovery_selection = _campaign_recovery_selection(plan, selection)
+    resolved = _resolve_recovery_path(checkpoint_path)
+    value = _load_strict_json(resolved, "schema-11 campaign checkpoint")
+    checkpoint = validate_schema11_checkpoint(value)
+    if (
+        checkpoint["campaign_id"] != recovery_selection.campaign_id
+        or checkpoint["selection_id"] != recovery_selection.selection_id
+    ):
+        raise ValueError("schema-11 checkpoint does not match the selected campaign")
+    preflight_campaign_supports(plan, recovery_selection.ordered_leaf_ids)
+    return plan, selection, descriptor, recovery_selection, resolved, checkpoint
+
+
+def _schema11_leaf_metadata(plan, selection) -> dict[str, dict[str, object]]:
+    leaf_by_id = {leaf.leaf_id: leaf for leaf in plan.leaves}
+    return {
+        leaf_id: {
+            "leaf_ordinal": ordinal,
+            "role": leaf_by_id[leaf_id].role,
+            "mode": leaf_by_id[leaf_id].leaf.mode_label,
+            "spin_or_Mkappa": leaf_by_id[leaf_id].job.spin,
+            "mechanism": leaf_by_id[leaf_id].mechanism_id,
+        }
+        for ordinal, leaf_id in enumerate(selection.leaf_ids, start=1)
+    }
+
+
+def _campaign_schema11_validate(
+    selection_path: Path,
+    checkpoint_path: Path,
+    pass_name: str | None,
+) -> tuple[int, object]:
+    plan, selection, _descriptor, _recovery, resolved, checkpoint = (
+        _load_schema11_campaign(selection_path, checkpoint_path)
+    )
+    rows, counts, report_status = schema11_dashboard_snapshot(
+        checkpoint,
+        leaf_metadata=_schema11_leaf_metadata(plan, selection),
+    )
+    evidence_counts = {level.value: 0 for level in EvidenceLevel}
+    for item in checkpoint["evidence_ledger"].values():
+        evidence_counts[str(item["evidence_level"])] += 1
+    if pass_name == "promoted":
+        pending = [
+            item
+            for item in checkpoint["promotion_queue"]["entries"]
+            if item["disposition"] == "PENDING"
+        ]
+        if any(
+            item["leaf_id"] not in _recovery.scientific_identities
+            or item["scientific_computation_identity"]
+            != _recovery.scientific_identities[item["leaf_id"]]
+            for item in pending
+        ):
+            raise ValueError("promoted survey queue is stale")
+    if pass_name == "certify" and any(
+        item["evidence_level"] not in {
+            EvidenceLevel.SCREENED.value,
+            EvidenceLevel.CERTIFIED.value,
+            EvidenceLevel.VALIDATED.value,
+        }
+        for item in checkpoint["evidence_ledger"].values()
+    ):
+        raise ValueError("certification checkpoint contains invalid evidence")
+    if pass_name == "validate" and not any(
+        item["evidence_level"] == EvidenceLevel.CERTIFIED.value
+        for item in checkpoint["evidence_ledger"].values()
+    ):
+        raise ValueError("validation requires at least one CERTIFIED record")
+    return 0, {
+        "command": "campaign-schema11-validate",
+        "schema_version": SCHEMA11_VERSION,
+        "campaign_id": checkpoint["campaign_id"],
+        "selection_id": checkpoint["selection_id"],
+        "state": checkpoint["state"],
+        "recovered_terminal_count": len(rows),
+        "binary64_pass_count": len(
+            checkpoint["survey_pass_ledger"]["binary64"]
+        ),
+        "promoted_pass_count": len(
+            checkpoint["survey_pass_ledger"]["promoted"]
+        ),
+        "promotion_queue_count": counts["queued"],
+        "evidence_counts": evidence_counts,
+        "report_status": report_status,
+        "basic_report_directory": str(report_directory_for_checkpoint(resolved)),
+        "status_path": f"{resolved}.status.json",
+        "validated_pass": pass_name,
+        "release_admissible": False,
+    }
+
+
+def _campaign_schema11_pass(
+    command: str,
+    selection_path: Path,
+    checkpoint_path: Path,
+    *,
+    queue_path: Path | None,
+    progress_mode: str,
+    calibration_receipt_path: Path | None,
+    calibration_receipt_sha256: str | None,
+) -> tuple[int, object]:
+    if (calibration_receipt_path is None) is not (
+        calibration_receipt_sha256 is None
+    ):
+        raise ValueError(
+            "calibration receipt path and SHA-256 must be supplied together"
+        )
+    if command.startswith("campaign-survey-") and queue_path is not None:
+        raise ValueError("survey pass commands do not accept an evidence queue")
+    if command == "campaign-evidence-validate" and queue_path is None:
+        raise ValueError("validation requires an explicit queue")
+    (
+        plan,
+        selection,
+        _descriptor,
+        recovery_selection,
+        resolved,
+        checkpoint,
+    ) = _load_schema11_campaign(selection_path, checkpoint_path)
+    if command == "campaign-survey-binary64":
+        if calibration_receipt_path is not None:
+            raise ValueError("binary64 survey does not consume promoted calibration")
+        from .campaign_runtime import run_native_binary64_pass
+
+        reporter = Schema11ProgressReporter(
+            resolved,
+            leaf_metadata=_schema11_leaf_metadata(plan, selection),
+            profile="survey",
+            pass_name="binary64",
+            mode=progress_mode,
+        )
+        try:
+            with activate_progress(reporter):
+                result = run_native_binary64_pass(
+                    plan,
+                    selection,
+                    recovery_selection,
+                    checkpoint,
+                    checkpoint_path=resolved,
+                )
+        finally:
+            reporter.close()
+        validated = validate_schema11_checkpoint(result.checkpoint)
+        return 0, {
+            "command": command,
+            "campaign_id": validated["campaign_id"],
+            "selection_id": validated["selection_id"],
+            "schema_version": validated["schema_version"],
+            "checkpoint_path": str(resolved),
+            "completed_count": result.completed_count,
+            "queued_count": result.queued_count,
+            "cache_reused_count": result.cache_reused_count,
+            "skipped_count": result.skipped_count,
+            "release_admissible": False,
+        }
+    if command == "campaign-survey-promoted":
+        from .campaign_runtime import run_native_promoted_pass
+
+        receipt = (
+            None
+            if calibration_receipt_path is None
+            else load_calibration_receipt(
+                calibration_receipt_path, str(calibration_receipt_sha256)
+            )
+        )
+        reporter = Schema11ProgressReporter(
+            resolved,
+            leaf_metadata=_schema11_leaf_metadata(plan, selection),
+            profile="survey",
+            pass_name="promoted",
+            mode=progress_mode,
+        )
+        try:
+            with activate_progress(reporter):
+                result = run_native_promoted_pass(
+                    plan,
+                    selection,
+                    recovery_selection,
+                    checkpoint,
+                    checkpoint_path=resolved,
+                    calibration_receipt=receipt,
+                )
+        finally:
+            reporter.close()
+        validated = validate_schema11_checkpoint(result.checkpoint)
+        return 0, {
+            "command": command,
+            "campaign_id": validated["campaign_id"],
+            "selection_id": validated["selection_id"],
+            "schema_version": validated["schema_version"],
+            "checkpoint_path": str(resolved),
+            "completed_count": result.completed_count,
+            "unresolved_count": result.unresolved_count,
+            "deferred_count": result.deferred_count,
+            "rejected_count": result.rejected_count,
+            "skipped_count": result.skipped_count,
+            "release_admissible": False,
+        }
+    if command in {"campaign-certify", "campaign-evidence-validate"}:
+        from .campaign_runtime import run_native_evidence_pass
+
+        if command == "campaign-certify":
+            policy = EvidenceStrengtheningPolicy.certification()
+            resolved_queue = (
+                report_directory_for_checkpoint(resolved)
+                / "m02-certification-queue.json"
+                if queue_path is None
+                else _resolve_recovery_path(queue_path)
+            )
+            queue_value = _load_strict_json(
+                resolved_queue, "certification queue"
+            )
+            request = WholeAtlasTriage.from_mapping(
+                queue_value
+            ).evidence_request
+            profile_name = "certify"
+        else:
+            policy = EvidenceStrengtheningPolicy.validation()
+            assert queue_path is not None
+            resolved_queue = _resolve_recovery_path(queue_path)
+            queue_value = _load_strict_json(
+                resolved_queue, "validation queue"
+            )
+            raw_request = (
+                queue_value.get("evidence_request")
+                if isinstance(queue_value, Mapping)
+                and "evidence_request" in queue_value
+                else queue_value
+            )
+            request = EvidencePassRequest.from_mapping(raw_request)
+            profile_name = "validate"
+        if request.profile.value != profile_name:
+            raise ValueError("evidence queue profile does not match the command")
+        if request.evidence_policy_identity != policy.identity_sha256:
+            raise ValueError("evidence queue policy binding is stale")
+        receipt = (
+            None
+            if calibration_receipt_path is None
+            else load_calibration_receipt(
+                calibration_receipt_path, str(calibration_receipt_sha256)
+            )
+        )
+        reporter = Schema11ProgressReporter(
+            resolved,
+            leaf_metadata=_schema11_leaf_metadata(plan, selection),
+            profile=profile_name,
+            pass_name=None,
+            mode=progress_mode,
+        )
+        try:
+            with activate_progress(reporter):
+                result = run_native_evidence_pass(
+                    plan,
+                    selection,
+                    checkpoint,
+                    request,
+                    policy,
+                    checkpoint_path=resolved,
+                    calibration_receipt=receipt,
+                )
+        finally:
+            reporter.close()
+        validated = validate_schema11_checkpoint(result)
+        return 0, {
+            "command": command,
+            "campaign_id": validated["campaign_id"],
+            "selection_id": validated["selection_id"],
+            "schema_version": validated["schema_version"],
+            "checkpoint_path": str(resolved),
+            "queue_path": str(resolved_queue),
+            "processed_count": len(request.ordered_leaf_ids),
+            "profile": profile_name,
+            "release_admissible": False,
+        }
+    raise ValueError(f"schema-11 runtime adapter is unavailable for {command}")
+
+
 def _campaign_console_mapping(
     command: str, summary: CampaignRunSummary
 ) -> dict[str, object]:
@@ -941,8 +1306,6 @@ def _campaign_console_mapping(
         "reused_stage_count": summary.reused_stage_count,
         "result_count": summary.result_count,
         "checkpoint_path": summary.checkpoint_path,
-        "execution_profile": summary.execution_profile.value,
-        "evidence_counts": summary.evidence_counts,
         "release_admissible": False,
     }
 
@@ -1186,10 +1549,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         elif arguments.command == "campaign-plan":
             status, output = _campaign_selected(
-                arguments.command,
-                arguments.selection,
-                Path("unused"),
-                execution_profile=ExecutionProfile(arguments.profile),
+                arguments.command, arguments.selection, Path("unused")
             )
         elif arguments.command in {
             "campaign-run", "campaign-resume", "campaign-validate"
@@ -1200,8 +1560,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             calibration_sha256 = getattr(
                 arguments, "calibration_receipt_sha256", None
             )
-            triage_queue = getattr(arguments, "triage_queue", None)
-            queue_limit = getattr(arguments, "queue_limit", None)
             if (calibration_path is None) is not (
                 calibration_sha256 is None
             ):
@@ -1222,9 +1580,6 @@ def main(argv: Sequence[str] | None = None) -> int:
                     arguments.selection,
                     arguments.checkpoint,
                     full=getattr(arguments, "full", False),
-                    execution_profile=ExecutionProfile(arguments.profile),
-                    triage_queue=triage_queue,
-                    queue_limit=queue_limit,
                 )
             else:
                 try:
@@ -1237,11 +1592,6 @@ def main(argv: Sequence[str] | None = None) -> int:
                                 reporter=reporter,
                                 calibration_receipt_path=calibration_path,
                                 calibration_receipt_sha256=calibration_sha256,
-                                execution_profile=ExecutionProfile(
-                                    arguments.profile
-                                ),
-                                triage_queue=triage_queue,
-                                queue_limit=queue_limit,
                             )
                         except KeyboardInterrupt:
                             emit_progress(
@@ -1278,6 +1628,41 @@ def main(argv: Sequence[str] | None = None) -> int:
         elif arguments.command == "campaign-cache-import":
             status, output = _campaign_cache_import(
                 arguments.selection, arguments.checkpoint, arguments.store
+            )
+        elif arguments.command == "campaign-recover":
+            status, output = _campaign_recover(
+                arguments.selection,
+                arguments.output,
+                arguments.receipt,
+                source_checkpoints=arguments.source_checkpoint,
+                solved_leaf_stores=arguments.solved_leaf_store,
+                root_readout_stores=arguments.root_readout_store,
+                oracle_path=arguments.oracle,
+            )
+        elif arguments.command == "campaign-recovery-validate":
+            status, output = _campaign_recovery_validate(
+                arguments.selection, arguments.checkpoint, arguments.receipt
+            )
+        elif arguments.command == "campaign-schema11-validate":
+            status, output = _campaign_schema11_validate(
+                arguments.selection,
+                arguments.checkpoint,
+                arguments.pass_name,
+            )
+        elif arguments.command in {
+            "campaign-survey-binary64",
+            "campaign-survey-promoted",
+            "campaign-certify",
+            "campaign-evidence-validate",
+        }:
+            status, output = _campaign_schema11_pass(
+                arguments.command,
+                arguments.selection,
+                arguments.checkpoint,
+                queue_path=arguments.queue,
+                progress_mode=arguments.progress,
+                calibration_receipt_path=arguments.calibration_receipt_path,
+                calibration_receipt_sha256=arguments.calibration_receipt_sha256,
             )
         elif arguments.command == "campaign-reduce":
             status, output = _campaign_reduce(arguments.bundle, arguments.output)

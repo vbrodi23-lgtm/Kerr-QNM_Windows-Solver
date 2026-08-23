@@ -1,38 +1,46 @@
-"""Execution and evidence policy for staged M02 atlas production.
+"""Schema-11 campaign state contracts.
 
-The profile controls which existing numerical operations may run.  Evidence
-levels describe what has been established around a numerical leaf and remain
-independent of that leaf's terminal state.
+Numerical records are immutable.  Evidence, pass progress, promotions, attempts,
+and system failures live in separate ledgers so an operational update cannot
+change a retained numerical centre or its digest.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from enum import Enum
+import copy
 import hashlib
-import math
-import re
-from typing import Mapping
+from enum import Enum
+from typing import Mapping, Sequence
 
 from .contracts import canonical_json_bytes
+from .campaign_timing import TimingFragment, fold_timing_fragments
 
 
-CAMPAIGN_EVIDENCE_SCHEMA = "windows-solver.campaign-evidence/1"
-BACKGROUND_ROOT_KEY_SCHEMA = "windows-solver.background-root-key/1"
-FIXED_ROOT_DOMEGA_KEY_SCHEMA = "windows-solver.fixed-root-domega-key/1"
-FIXED_ROOT_DOMEGA_EVIDENCE_SCHEMA = (
-    "windows-solver.fixed-root-domega-evidence/1"
-)
-EXTERIOR_ZERO_COUPLING_IDENTITY = (
-    "exterior-profile-amplitude-zero-background/v1"
-)
-_HEX_64 = re.compile(r"[0-9a-f]{64}")
+CAMPAIGN_CHECKPOINT_SCHEMA_VERSION = 11
+PROMOTION_QUEUE_SCHEMA = "windows-solver.m02-promotion-queue/1"
 
 
 class ExecutionProfile(str, Enum):
-    SURVEY = "survey"
-    CERTIFY = "certify"
-    VALIDATE = "validate"
+    SURVEY = "SURVEY"
+    CERTIFY = "CERTIFY"
+    VALIDATE = "VALIDATE"
+
+
+class SurveyPass(str, Enum):
+    BINARY64 = "binary64"
+    PROMOTED = "promoted"
+
+
+class SurveyDisposition(str, Enum):
+    NOT_ATTEMPTED = "NOT_ATTEMPTED"
+    CACHE_REUSED = "CACHE_REUSED"
+    COMPLETED = "COMPLETED"
+    PROMOTION_PENDING_ROOT = "PROMOTION_PENDING_ROOT"
+    PROMOTION_PENDING_RESPONSE = "PROMOTION_PENDING_RESPONSE"
+    UNRESOLVED = "UNRESOLVED"
+    DEFERRED = "DEFERRED"
+    REJECTED = "REJECTED"
+    SUPERSEDED_BY_CACHE = "SUPERSEDED_BY_CACHE"
 
 
 class EvidenceLevel(str, Enum):
@@ -41,708 +49,540 @@ class EvidenceLevel(str, Enum):
     VALIDATED = "VALIDATED"
 
 
-_EVIDENCE_RANK = {
-    EvidenceLevel.SCREENED: 0,
-    EvidenceLevel.CERTIFIED: 1,
-    EvidenceLevel.VALIDATED: 2,
+class PromotionQueueKind(str, Enum):
+    ROOT = "ROOT"
+    RESPONSE = "RESPONSE"
+
+
+class PromotionQueueDisposition(str, Enum):
+    PENDING = "PENDING"
+    COMPLETED = "COMPLETED"
+    UNRESOLVED = "UNRESOLVED"
+    DEFERRED = "DEFERRED"
+    REJECTED = "REJECTED"
+    SUPERSEDED_BY_CACHE = "SUPERSEDED_BY_CACHE"
+
+
+NUMERICAL_RECORD_STATES = frozenset(
+    {"IN_PROGRESS", "PRODUCED", "UNRESOLVED", "REJECTED"}
+)
+BINARY64_SURVEY_DISPOSITIONS = frozenset(item.value for item in SurveyDisposition)
+PROMOTED_SURVEY_DISPOSITIONS = BINARY64_SURVEY_DISPOSITIONS - {
+    SurveyDisposition.PROMOTION_PENDING_ROOT.value,
+    SurveyDisposition.PROMOTION_PENDING_RESPONSE.value,
 }
+TERMINAL_PROMOTION_DISPOSITIONS = frozenset(
+    item.value
+    for item in PromotionQueueDisposition
+    if item is not PromotionQueueDisposition.PENDING
+)
 
-
-def stronger_evidence_level(
-    left: EvidenceLevel,
-    right: EvidenceLevel,
-) -> EvidenceLevel:
-    if not isinstance(left, EvidenceLevel) or not isinstance(
-        right, EvidenceLevel
-    ):
-        raise ValueError("campaign evidence level is invalid")
-    return left if _EVIDENCE_RANK[left] >= _EVIDENCE_RANK[right] else right
-
-
-def evidence_level_at_least(
-    actual: EvidenceLevel,
-    required: EvidenceLevel,
-) -> bool:
-    if not isinstance(actual, EvidenceLevel) or not isinstance(
-        required, EvidenceLevel
-    ):
-        raise ValueError("campaign evidence level is invalid")
-    return _EVIDENCE_RANK[actual] >= _EVIDENCE_RANK[required]
-
-
-@dataclass(frozen=True, slots=True)
-class CampaignExecutionPolicy:
-    profile: ExecutionProfile
-    target_evidence_level: EvidenceLevel
-    prerequisite_evidence_level: EvidenceLevel | None
-    binary64_first: bool
-    stop_at_bounded_response: bool
-    continue_after_leaf_failure: bool
-    allow_truncation_root_solve: bool
-    allow_resolution_root_solve: bool
-    allow_seed_path_root_solve: bool
-    allow_expanded_derivative_ladder: bool
-    allow_full_complex_root_ladder: bool
-    allow_independent_validation: bool
-    allow_automatic_max_precision: bool
-
-    @classmethod
-    def for_profile(
-        cls, profile: ExecutionProfile
-    ) -> "CampaignExecutionPolicy":
-        if not isinstance(profile, ExecutionProfile):
-            raise ValueError("campaign execution profile is invalid")
-        if profile is ExecutionProfile.SURVEY:
-            return cls(
-                profile=profile,
-                target_evidence_level=EvidenceLevel.SCREENED,
-                prerequisite_evidence_level=None,
-                binary64_first=True,
-                stop_at_bounded_response=True,
-                continue_after_leaf_failure=True,
-                allow_truncation_root_solve=False,
-                allow_resolution_root_solve=False,
-                allow_seed_path_root_solve=False,
-                allow_expanded_derivative_ladder=False,
-                allow_full_complex_root_ladder=False,
-                allow_independent_validation=False,
-                allow_automatic_max_precision=False,
-            )
-        if profile is ExecutionProfile.CERTIFY:
-            return cls(
-                profile=profile,
-                target_evidence_level=EvidenceLevel.CERTIFIED,
-                prerequisite_evidence_level=EvidenceLevel.SCREENED,
-                binary64_first=False,
-                stop_at_bounded_response=False,
-                continue_after_leaf_failure=True,
-                allow_truncation_root_solve=True,
-                allow_resolution_root_solve=True,
-                allow_seed_path_root_solve=True,
-                allow_expanded_derivative_ladder=True,
-                allow_full_complex_root_ladder=False,
-                allow_independent_validation=False,
-                allow_automatic_max_precision=True,
-            )
-        return cls(
-            profile=profile,
-            target_evidence_level=EvidenceLevel.VALIDATED,
-            prerequisite_evidence_level=EvidenceLevel.CERTIFIED,
-            binary64_first=False,
-            stop_at_bounded_response=False,
-            continue_after_leaf_failure=True,
-            allow_truncation_root_solve=True,
-            allow_resolution_root_solve=True,
-            allow_seed_path_root_solve=True,
-            allow_expanded_derivative_ladder=True,
-            allow_full_complex_root_ladder=True,
-            allow_independent_validation=True,
-            allow_automatic_max_precision=True,
-        )
-
-    def to_mapping(self) -> dict[str, object]:
-        return {
-            "profile": self.profile.value,
-            "target_evidence_level": self.target_evidence_level.value,
-            "prerequisite_evidence_level": (
-                None
-                if self.prerequisite_evidence_level is None
-                else self.prerequisite_evidence_level.value
-            ),
-            "binary64_first": self.binary64_first,
-            "stop_at_bounded_response": self.stop_at_bounded_response,
-            "continue_after_leaf_failure": self.continue_after_leaf_failure,
-            "allow_truncation_root_solve": self.allow_truncation_root_solve,
-            "allow_resolution_root_solve": self.allow_resolution_root_solve,
-            "allow_seed_path_root_solve": self.allow_seed_path_root_solve,
-            "allow_expanded_derivative_ladder": (
-                self.allow_expanded_derivative_ladder
-            ),
-            "allow_full_complex_root_ladder": (
-                self.allow_full_complex_root_ladder
-            ),
-            "allow_independent_validation": self.allow_independent_validation,
-            "allow_automatic_max_precision": (
-                self.allow_automatic_max_precision
-            ),
-        }
+_EVIDENCE_RANK = {
+    EvidenceLevel.SCREENED.value: 1,
+    EvidenceLevel.CERTIFIED.value: 2,
+    EvidenceLevel.VALIDATED.value: 3,
+}
+_SCHEMA11_FIELDS = {
+    "schema_version",
+    "campaign_id",
+    "selection_id",
+    "state",
+    "records",
+    "evidence_ledger",
+    "survey_pass_ledger",
+    "promotion_queue",
+    "attempts",
+    "system_failures",
+    "recovery_receipts",
+    "report_status_receipt",
+}
+_PASS_ENTRY_FIELDS = {
+    "leaf_id",
+    "pass",
+    "source_record_sha256",
+    "result_record_sha256",
+    "operation_identity",
+    "precision_tiers",
+    "reason_code",
+    "sample_count",
+    "sample_limit",
+    "root_read_count",
+    "root_read_limit",
+    "worker_launch_count",
+    "worker_launch_limit",
+    "tier_timing",
+    "session_fragments",
+    "disposition",
+    "disposition_receipt_sha256",
+}
 
 
 def _sha256(value: object) -> str:
     return hashlib.sha256(canonical_json_bytes(value)).hexdigest()
 
 
-def _validated_digest(value: object, subject: str) -> str:
-    if not isinstance(value, str) or _HEX_64.fullmatch(value) is None:
-        raise ValueError(f"{subject} digest is invalid")
-    return value
+def _is_sha256(value: object) -> bool:
+    if not isinstance(value, str) or len(value) != 64:
+        return False
+    try:
+        int(value, 16)
+    except ValueError:
+        return False
+    return True
 
 
-@dataclass(frozen=True, slots=True)
-class BackgroundRootKey:
-    """Exact c-independent identity for one reusable exterior Kerr root."""
+def _enum_value(value: object, enum_type: type[Enum], label: str) -> str:
+    try:
+        return enum_type(value).value  # type: ignore[call-arg, return-value]
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"invalid {label}: {value!r}") from error
 
-    root_reference_id: str
-    branch_id: str
-    equation_id: str
-    mode_sha256: str
-    spin_binary64_hex: str
-    bound_root_sha256: str
-    determinant_family: str
-    determinant_convention: str
-    determinant_normalisation: str
-    backend_identity_sha256: str
-    numerical_policy_sha256: str
-    controls_sha256: str
-    precision_tier: str
-    working_precision_bits: int
-    zero_coupling_identity: str = EXTERIOR_ZERO_COUPLING_IDENTITY
 
-    def __post_init__(self) -> None:
-        for name in (
-            "root_reference_id",
-            "branch_id",
-            "equation_id",
-            "spin_binary64_hex",
-            "determinant_family",
-            "determinant_convention",
-            "determinant_normalisation",
-            "precision_tier",
-        ):
-            if not isinstance(getattr(self, name), str) or not getattr(
-                self, name
-            ):
-                raise ValueError(f"background root {name} is invalid")
-        for name in (
-            "mode_sha256",
-            "bound_root_sha256",
-            "backend_identity_sha256",
-            "numerical_policy_sha256",
-            "controls_sha256",
-        ):
-            _validated_digest(getattr(self, name), f"background root {name}")
+def _validated_record(value: object) -> dict[str, object]:
+    if not isinstance(value, Mapping):
+        raise ValueError("schema-11 numerical record must be an object")
+    record = copy.deepcopy(dict(value))
+    leaf_id = record.get("leaf_id")
+    if not isinstance(leaf_id, str) or not leaf_id:
+        raise ValueError("schema-11 numerical record leaf_id is invalid")
+    state = record.get("state")
+    if state == "FAILED":
+        raise ValueError("FAILED is not a schema-11 numerical record state")
+    if state not in NUMERICAL_RECORD_STATES:
+        raise ValueError(f"invalid schema-11 numerical record state: {state!r}")
+    supplied = record.get("record_sha256")
+    content = {key: item for key, item in record.items() if key != "record_sha256"}
+    if not _is_sha256(supplied) or supplied != _sha256(content):
+        raise ValueError("schema-11 numerical record digest is invalid")
+    return record
+
+
+def _validated_pass_timing(
+    *,
+    leaf_id: str,
+    pass_value: str,
+    tier_timing: Sequence[Mapping[str, object]],
+    session_fragments: Sequence[Mapping[str, object]],
+) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+    fragments = [TimingFragment.from_mapping(item) for item in session_fragments]
+    if any(
+        fragment.leaf_id != leaf_id
+        or fragment.execution_profile != ExecutionProfile.SURVEY.value
+        or fragment.survey_pass != pass_value
+        for fragment in fragments
+    ):
+        raise ValueError("survey timing fragment binding is invalid")
+    expected = list(fold_timing_fragments(fragments).tier_timing_mappings())
+    supplied = [copy.deepcopy(dict(item)) for item in tier_timing]
+    if fragments and supplied != expected:
+        raise ValueError("survey tier timing disagrees with session fragments")
+    if not fragments and supplied:
+        raise ValueError("survey tier timing requires session fragments")
+    return supplied, [fragment.to_mapping() for fragment in fragments]
+
+
+def empty_schema11_checkpoint(
+    campaign_id: str, selection_id: str
+) -> dict[str, object]:
+    if not campaign_id or not selection_id:
+        raise ValueError("campaign_id and selection_id are required")
+    return {
+        "schema_version": CAMPAIGN_CHECKPOINT_SCHEMA_VERSION,
+        "campaign_id": campaign_id,
+        "selection_id": selection_id,
+        "state": "PARTIAL",
+        "records": [],
+        "evidence_ledger": {},
+        "survey_pass_ledger": {"binary64": {}, "promoted": {}},
+        "promotion_queue": {"schema": PROMOTION_QUEUE_SCHEMA, "entries": []},
+        "attempts": [],
+        "system_failures": [],
+        "recovery_receipts": [],
+        "report_status_receipt": None,
+    }
+
+
+def add_numerical_record(
+    checkpoint: Mapping[str, object], record: Mapping[str, object]
+) -> dict[str, object]:
+    result = validate_schema11_checkpoint(checkpoint)
+    candidate = _validated_record(record)
+    records = result["records"]
+    assert isinstance(records, list)
+    existing = [item for item in records if item["leaf_id"] == candidate["leaf_id"]]
+    if existing:
+        if existing[0] == candidate:
+            return result
+        raise ValueError(f"conflicting numerical record for {candidate['leaf_id']}")
+    records.append(candidate)
+    return result
+
+
+def record_evidence(
+    checkpoint: Mapping[str, object],
+    *,
+    leaf_id: str,
+    central_record_sha256: str,
+    central_stage_sha256: str,
+    evidence_level: EvidenceLevel | str,
+    receipts: Sequence[Mapping[str, object]] = (),
+    discrepancy_codes: Sequence[str] = (),
+) -> dict[str, object]:
+    result = validate_schema11_checkpoint(checkpoint)
+    level = _enum_value(evidence_level, EvidenceLevel, "evidence level")
+    records = result["records"]
+    assert isinstance(records, list)
+    matching = [item for item in records if item["leaf_id"] == leaf_id]
+    if not matching or matching[0]["record_sha256"] != central_record_sha256:
+        raise ValueError("evidence does not bind the retained numerical record")
+    if not _is_sha256(central_stage_sha256):
+        raise ValueError("evidence central stage digest is invalid")
+    ledger = result["evidence_ledger"]
+    assert isinstance(ledger, dict)
+    previous = ledger.get(leaf_id)
+    if previous is not None:
+        previous_level = previous["evidence_level"]
+        if _EVIDENCE_RANK[level] < _EVIDENCE_RANK[previous_level]:
+            raise ValueError("evidence level cannot decrease")
         if (
-            type(self.working_precision_bits) is not int
-            or self.working_precision_bits <= 0
+            previous["central_record_sha256"] != central_record_sha256
+            or previous["central_stage_sha256"] != central_stage_sha256
         ):
-            raise ValueError("background root working precision is invalid")
-        if self.zero_coupling_identity != EXTERIOR_ZERO_COUPLING_IDENTITY:
-            raise ValueError("background root zero-coupling identity is invalid")
-
-    @property
-    def content(self) -> dict[str, object]:
-        return {
-            "schema": BACKGROUND_ROOT_KEY_SCHEMA,
-            "root_reference_id": self.root_reference_id,
-            "branch_id": self.branch_id,
-            "equation_id": self.equation_id,
-            "mode_sha256": self.mode_sha256,
-            "spin_binary64_hex": self.spin_binary64_hex,
-            "bound_root_sha256": self.bound_root_sha256,
-            "determinant_family": self.determinant_family,
-            "determinant_convention": self.determinant_convention,
-            "determinant_normalisation": self.determinant_normalisation,
-            "backend_identity_sha256": self.backend_identity_sha256,
-            "numerical_policy_sha256": self.numerical_policy_sha256,
-            "controls_sha256": self.controls_sha256,
-            "precision_tier": self.precision_tier,
-            "working_precision_bits": self.working_precision_bits,
-            "zero_coupling_identity": self.zero_coupling_identity,
-        }
-
-    @property
-    def sha256(self) -> str:
-        return _sha256(self.content)
-
-    def to_mapping(self) -> dict[str, object]:
-        return {**self.content, "key_sha256": self.sha256}
-
-    @classmethod
-    def from_mapping(cls, value: object) -> "BackgroundRootKey":
-        fields = {
-            "schema",
-            "root_reference_id",
-            "branch_id",
-            "equation_id",
-            "mode_sha256",
-            "spin_binary64_hex",
-            "bound_root_sha256",
-            "determinant_family",
-            "determinant_convention",
-            "determinant_normalisation",
-            "backend_identity_sha256",
-            "numerical_policy_sha256",
-            "controls_sha256",
-            "precision_tier",
-            "working_precision_bits",
-            "zero_coupling_identity",
-            "key_sha256",
-        }
-        if not isinstance(value, Mapping) or set(value) != fields:
-            raise ValueError("background root key fields are invalid")
-        if value.get("schema") != BACKGROUND_ROOT_KEY_SCHEMA:
-            raise ValueError("background root key schema is invalid")
-        key = cls(**{
-            name: value[name]
-            for name in fields - {"schema", "key_sha256"}
-        })
-        if value.get("key_sha256") != key.sha256:
-            raise ValueError("background root key digest is invalid")
-        if key.to_mapping() != value:
-            raise ValueError("background root key is not canonical")
-        return key
-
-
-@dataclass(frozen=True, slots=True)
-class FixedRootDomegaKey:
-    background_key_sha256: str
-    determinant_family: str
-    determinant_normalisation: str
-    controls_sha256: str
-    precision_tier: str
-    working_precision_bits: int
-    derivative_method: str
-    derivative_step_hex: str
-
-    def __post_init__(self) -> None:
-        _validated_digest(
-            self.background_key_sha256, "fixed-root Domega background key"
-        )
-        _validated_digest(self.controls_sha256, "fixed-root Domega controls")
-        for name in (
-            "determinant_family",
-            "determinant_normalisation",
-            "precision_tier",
-            "derivative_method",
-            "derivative_step_hex",
-        ):
-            if not isinstance(getattr(self, name), str) or not getattr(
-                self, name
-            ):
-                raise ValueError(f"fixed-root Domega {name} is invalid")
-        if (
-            type(self.working_precision_bits) is not int
-            or self.working_precision_bits <= 0
-        ):
-            raise ValueError("fixed-root Domega precision is invalid")
-        try:
-            step = float.fromhex(self.derivative_step_hex)
-        except (TypeError, ValueError) as error:
-            raise ValueError("fixed-root Domega derivative step is invalid") from error
-        if not math.isfinite(step) or step <= 0.0:
-            raise ValueError("fixed-root Domega derivative step is invalid")
-
-    @property
-    def content(self) -> dict[str, object]:
-        return {
-            "schema": FIXED_ROOT_DOMEGA_KEY_SCHEMA,
-            "background_key_sha256": self.background_key_sha256,
-            "determinant_family": self.determinant_family,
-            "determinant_normalisation": self.determinant_normalisation,
-            "controls_sha256": self.controls_sha256,
-            "precision_tier": self.precision_tier,
-            "working_precision_bits": self.working_precision_bits,
-            "derivative_method": self.derivative_method,
-            "derivative_step_hex": self.derivative_step_hex,
-        }
-
-    @property
-    def sha256(self) -> str:
-        return _sha256(self.content)
-
-    def to_mapping(self) -> dict[str, object]:
-        return {**self.content, "key_sha256": self.sha256}
-
-    @classmethod
-    def from_mapping(cls, value: object) -> "FixedRootDomegaKey":
-        fields = {
-            "schema",
-            "background_key_sha256",
-            "determinant_family",
-            "determinant_normalisation",
-            "controls_sha256",
-            "precision_tier",
-            "working_precision_bits",
-            "derivative_method",
-            "derivative_step_hex",
-            "key_sha256",
-        }
-        if not isinstance(value, Mapping) or set(value) != fields:
-            raise ValueError("fixed-root Domega key fields are invalid")
-        if value.get("schema") != FIXED_ROOT_DOMEGA_KEY_SCHEMA:
-            raise ValueError("fixed-root Domega key schema is invalid")
-        key = cls(**{
-            name: value[name]
-            for name in fields - {"schema", "key_sha256"}
-        })
-        if value.get("key_sha256") != key.sha256:
-            raise ValueError("fixed-root Domega key digest is invalid")
-        if key.to_mapping() != value:
-            raise ValueError("fixed-root Domega key is not canonical")
-        return key
-
-
-@dataclass(frozen=True, slots=True)
-class FixedRootDomegaEvidence:
-    key: FixedRootDomegaKey
-    source_leaf_id: str
-    source_job_id: str
-    source_root_seal_sha256: str
-    derivative_disk: Mapping[str, object]
-    derivative_radius_provenance: Mapping[str, object]
-    frequency_samples: tuple[Mapping[str, object], ...]
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.key, FixedRootDomegaKey):
-            raise ValueError("fixed-root Domega evidence key is invalid")
-        if not all(
-            isinstance(value, str) and value
-            for value in (self.source_leaf_id, self.source_job_id)
-        ):
-            raise ValueError("fixed-root Domega source identity is invalid")
-        _validated_digest(
-            self.source_root_seal_sha256,
-            "fixed-root Domega source seal",
-        )
-        if not isinstance(self.derivative_disk, Mapping) or not isinstance(
-            self.derivative_radius_provenance, Mapping
-        ):
-            raise ValueError("fixed-root Domega derivative evidence is invalid")
-        samples = tuple(self.frequency_samples)
-        if len(samples) != 4 or any(
-            not isinstance(item, Mapping) for item in samples
-        ):
-            raise ValueError("fixed-root Domega sample evidence is invalid")
-        object.__setattr__(self, "derivative_disk", dict(self.derivative_disk))
-        object.__setattr__(
-            self,
-            "derivative_radius_provenance",
-            dict(self.derivative_radius_provenance),
-        )
-        object.__setattr__(
-            self,
-            "frequency_samples",
-            tuple(dict(item) for item in samples),
-        )
-
-    @property
-    def content(self) -> dict[str, object]:
-        return {
-            "schema": FIXED_ROOT_DOMEGA_EVIDENCE_SCHEMA,
-            "key": self.key.to_mapping(),
-            "source_leaf_id": self.source_leaf_id,
-            "source_job_id": self.source_job_id,
-            "source_root_seal_sha256": self.source_root_seal_sha256,
-            "derivative_disk": dict(self.derivative_disk),
-            "derivative_radius_provenance": dict(
-                self.derivative_radius_provenance
-            ),
-            "frequency_samples": [
-                dict(item) for item in self.frequency_samples
-            ],
-        }
-
-    @property
-    def evidence_sha256(self) -> str:
-        return _sha256(self.content)
-
-    def to_mapping(self) -> dict[str, object]:
-        return {**self.content, "evidence_sha256": self.evidence_sha256}
-
-    @classmethod
-    def from_mapping(cls, value: object) -> "FixedRootDomegaEvidence":
-        fields = {
-            "schema",
-            "key",
-            "source_leaf_id",
-            "source_job_id",
-            "source_root_seal_sha256",
-            "derivative_disk",
-            "derivative_radius_provenance",
-            "frequency_samples",
-            "evidence_sha256",
-        }
-        if not isinstance(value, Mapping) or set(value) != fields:
-            raise ValueError("fixed-root Domega evidence fields are invalid")
-        if value.get("schema") != FIXED_ROOT_DOMEGA_EVIDENCE_SCHEMA:
-            raise ValueError("fixed-root Domega evidence schema is invalid")
-        samples = value.get("frequency_samples")
-        if not isinstance(samples, list):
-            raise ValueError("fixed-root Domega evidence samples are invalid")
-        evidence = cls(
-            key=FixedRootDomegaKey.from_mapping(value["key"]),
-            source_leaf_id=str(value["source_leaf_id"]),
-            source_job_id=str(value["source_job_id"]),
-            source_root_seal_sha256=str(value["source_root_seal_sha256"]),
-            derivative_disk=value["derivative_disk"],
-            derivative_radius_provenance=value[
-                "derivative_radius_provenance"
-            ],
-            frequency_samples=tuple(samples),
-        )
-        if value.get("evidence_sha256") != evidence.evidence_sha256:
-            raise ValueError("fixed-root Domega evidence digest is invalid")
-        if evidence.to_mapping() != value:
-            raise ValueError("fixed-root Domega evidence is not canonical")
-        return evidence
-
-
-class SurveyEvidenceCache:
-    """In-memory exact-key cache used during one atlas survey pass."""
-
-    def __init__(self) -> None:
-        self._domega: dict[str, FixedRootDomegaEvidence] = {}
-        self._keys: dict[str, FixedRootDomegaKey] = {}
-        self._background_seals: dict[str, Mapping[str, object]] = {}
-
-    @property
-    def domega_evidence_count(self) -> int:
-        return len(self._domega)
-
-    @property
-    def domega_keys(self) -> tuple[FixedRootDomegaKey, ...]:
-        return tuple(self._keys[key] for key in self._domega)
-
-    def lookup_domega(
-        self, key: FixedRootDomegaKey
-    ) -> FixedRootDomegaEvidence | None:
-        if not isinstance(key, FixedRootDomegaKey):
-            raise ValueError("fixed-root Domega cache key is invalid")
-        evidence = self._domega.get(key.sha256)
-        if evidence is None or evidence.key != key:
-            return None
-        return evidence
-
-    def store_domega(self, evidence: FixedRootDomegaEvidence) -> None:
-        if not isinstance(evidence, FixedRootDomegaEvidence):
-            raise ValueError("fixed-root Domega cache evidence is invalid")
-        key = evidence.key.sha256
-        existing = self._domega.get(key)
-        if existing is not None and existing != evidence:
-            raise ValueError("fixed-root Domega cache evidence disagrees")
-        self._domega[key] = evidence
-        self._keys[key] = evidence.key
-
-    @property
-    def background_seal_mappings(self) -> tuple[Mapping[str, object], ...]:
-        return tuple(dict(value) for value in self._background_seals.values())
-
-    def store_background_seal(
-        self,
-        key: BackgroundRootKey,
-        seal_mapping: Mapping[str, object],
-    ) -> None:
-        if not isinstance(key, BackgroundRootKey):
-            raise ValueError("survey background cache key is invalid")
-        if not isinstance(seal_mapping, Mapping):
-            raise ValueError("survey background seal mapping is invalid")
-        raw_key = seal_mapping.get("background_key")
-        if BackgroundRootKey.from_mapping(raw_key) != key:
-            raise ValueError("survey background seal key does not match")
-        canonical = dict(seal_mapping)
-        existing = self._background_seals.get(key.sha256)
-        if existing is not None and dict(existing) != canonical:
-            raise ValueError("survey background seal evidence disagrees")
-        self._background_seals[key.sha256] = canonical
-
-
-@dataclass(frozen=True, slots=True)
-class EvidenceReceipt:
-    execution_profile: ExecutionProfile
-    evidence_level: EvidenceLevel
-    receipt_sha256: str
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.execution_profile, ExecutionProfile):
-            raise ValueError("campaign evidence execution profile is invalid")
-        if not isinstance(self.evidence_level, EvidenceLevel):
-            raise ValueError("campaign evidence level is invalid")
-        if (
-            not isinstance(self.receipt_sha256, str)
-            or _HEX_64.fullmatch(self.receipt_sha256) is None
-        ):
-            raise ValueError("campaign evidence receipt digest is invalid")
-        expected = CampaignExecutionPolicy.for_profile(
-            self.execution_profile
-        ).target_evidence_level
-        if self.evidence_level is not expected:
-            raise ValueError("campaign evidence receipt profile/level is invalid")
-
-    def to_mapping(self) -> dict[str, str]:
-        return {
-            "execution_profile": self.execution_profile.value,
-            "evidence_level": self.evidence_level.value,
-            "receipt_sha256": self.receipt_sha256,
-        }
-
-    @classmethod
-    def from_mapping(cls, value: object) -> "EvidenceReceipt":
-        if not isinstance(value, Mapping) or set(value) != {
-            "execution_profile", "evidence_level", "receipt_sha256"
-        }:
-            raise ValueError("campaign evidence receipt fields are invalid")
-        try:
-            receipt = cls(
-                execution_profile=ExecutionProfile(value["execution_profile"]),
-                evidence_level=EvidenceLevel(value["evidence_level"]),
-                receipt_sha256=str(value["receipt_sha256"]),
-            )
-        except (TypeError, ValueError) as error:
-            raise ValueError("campaign evidence receipt is invalid") from error
-        if receipt.to_mapping() != value:
-            raise ValueError("campaign evidence receipt is not canonical")
-        return receipt
-
-
-@dataclass(frozen=True, slots=True)
-class CampaignEvidenceRecord:
-    leaf_id: str
-    central_stage_sha256: str
-    receipts: tuple[EvidenceReceipt, ...]
-    discrepancy_codes: tuple[str, ...] = ()
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.leaf_id, str) or not self.leaf_id:
-            raise ValueError("campaign evidence leaf ID is invalid")
-        if (
-            not isinstance(self.central_stage_sha256, str)
-            or _HEX_64.fullmatch(self.central_stage_sha256) is None
-        ):
-            raise ValueError("campaign evidence central-stage digest is invalid")
-        receipts = tuple(self.receipts)
-        if not receipts or any(
-            not isinstance(item, EvidenceReceipt) for item in receipts
-        ):
-            raise ValueError("campaign evidence receipts are invalid")
-        receipt_ids = tuple(item.receipt_sha256 for item in receipts)
-        if len(receipt_ids) != len(set(receipt_ids)):
-            raise ValueError("campaign evidence receipt digests are duplicated")
-        discrepancy_codes = tuple(self.discrepancy_codes)
-        if (
-            len(discrepancy_codes) != len(set(discrepancy_codes))
-            or any(
-                not isinstance(item, str) or not item
-                for item in discrepancy_codes
-            )
-        ):
-            raise ValueError("campaign evidence discrepancy codes are invalid")
-        object.__setattr__(self, "receipts", receipts)
-        object.__setattr__(self, "discrepancy_codes", discrepancy_codes)
-
-    @property
-    def evidence_level(self) -> EvidenceLevel:
-        level = self.receipts[0].evidence_level
-        for receipt in self.receipts[1:]:
-            level = stronger_evidence_level(level, receipt.evidence_level)
-        return level
-
-    @property
-    def execution_profile(self) -> ExecutionProfile:
-        strongest_rank = _EVIDENCE_RANK[self.evidence_level]
-        return next(
-            receipt.execution_profile
-            for receipt in reversed(self.receipts)
-            if _EVIDENCE_RANK[receipt.evidence_level] == strongest_rank
-        )
-
-    @property
-    def content(self) -> dict[str, object]:
-        return {
-            "schema": CAMPAIGN_EVIDENCE_SCHEMA,
-            "leaf_id": self.leaf_id,
-            "central_stage_sha256": self.central_stage_sha256,
-            "execution_profile": self.execution_profile.value,
-            "evidence_level": self.evidence_level.value,
-            "receipts": [item.to_mapping() for item in self.receipts],
-            "discrepancy_codes": list(self.discrepancy_codes),
-        }
-
-    @property
-    def evidence_sha256(self) -> str:
-        return hashlib.sha256(canonical_json_bytes(self.content)).hexdigest()
-
-    def to_mapping(self) -> dict[str, object]:
-        return {**self.content, "evidence_sha256": self.evidence_sha256}
-
-    @classmethod
-    def create(
-        cls,
-        *,
-        leaf_id: str,
-        central_stage_sha256: str,
-        receipt: EvidenceReceipt,
-    ) -> "CampaignEvidenceRecord":
-        return cls(
-            leaf_id=leaf_id,
-            central_stage_sha256=central_stage_sha256,
-            receipts=(receipt,),
-        )
-
-    def with_receipt(
-        self, receipt: EvidenceReceipt
-    ) -> "CampaignEvidenceRecord":
-        if not isinstance(receipt, EvidenceReceipt):
-            raise ValueError("campaign evidence receipt is invalid")
-        for existing in self.receipts:
-            if existing.receipt_sha256 == receipt.receipt_sha256:
-                if existing != receipt:
-                    raise ValueError("campaign evidence receipt digest is ambiguous")
-                return self
-        return CampaignEvidenceRecord(
-            leaf_id=self.leaf_id,
-            central_stage_sha256=self.central_stage_sha256,
-            receipts=(*self.receipts, receipt),
-            discrepancy_codes=self.discrepancy_codes,
-        )
-
-    def with_discrepancy(self, code: str) -> "CampaignEvidenceRecord":
+            raise ValueError("evidence upgrade cannot replace the retained centre")
+        merged_receipts = list(previous["receipts"])
+        merged_codes = list(previous["discrepancy_codes"])
+    else:
+        merged_receipts = []
+        merged_codes = []
+    for receipt in receipts:
+        candidate = copy.deepcopy(dict(receipt))
+        if candidate not in merged_receipts:
+            merged_receipts.append(candidate)
+    for code in discrepancy_codes:
         if not isinstance(code, str) or not code:
-            raise ValueError("campaign evidence discrepancy code is invalid")
-        if code in self.discrepancy_codes:
-            return self
-        return CampaignEvidenceRecord(
-            leaf_id=self.leaf_id,
-            central_stage_sha256=self.central_stage_sha256,
-            receipts=self.receipts,
-            discrepancy_codes=(*self.discrepancy_codes, code),
-        )
+            raise ValueError("evidence discrepancy code is invalid")
+        if code not in merged_codes:
+            merged_codes.append(code)
+    ledger[leaf_id] = {
+        "leaf_id": leaf_id,
+        "central_record_sha256": central_record_sha256,
+        "central_stage_sha256": central_stage_sha256,
+        "evidence_level": level,
+        "receipts": merged_receipts,
+        "discrepancy_codes": merged_codes,
+    }
+    return result
 
-    @classmethod
-    def from_mapping(cls, value: object) -> "CampaignEvidenceRecord":
-        fields = {
-            "schema",
+
+def record_survey_disposition(
+    checkpoint: Mapping[str, object],
+    *,
+    survey_pass: SurveyPass | str,
+    leaf_id: str,
+    disposition: SurveyDisposition | str,
+    operation_identity: str,
+    precision_tiers: Sequence[str],
+    reason_code: str,
+    sample_count: int,
+    sample_limit: int,
+    root_read_count: int,
+    root_read_limit: int,
+    worker_launch_count: int,
+    worker_launch_limit: int,
+    tier_timing: Sequence[Mapping[str, object]],
+    session_fragments: Sequence[Mapping[str, object]],
+    source_record_sha256: str | None = None,
+    result_record_sha256: str | None = None,
+) -> dict[str, object]:
+    result = validate_schema11_checkpoint(checkpoint)
+    pass_value = _enum_value(survey_pass, SurveyPass, "survey pass")
+    disposition_value = _enum_value(
+        disposition, SurveyDisposition, "survey disposition"
+    )
+    allowed = (
+        BINARY64_SURVEY_DISPOSITIONS
+        if pass_value == SurveyPass.BINARY64.value
+        else PROMOTED_SURVEY_DISPOSITIONS
+    )
+    if disposition_value not in allowed:
+        raise ValueError(f"{disposition_value} is invalid for the promoted pass")
+    if not leaf_id or not operation_identity or not reason_code:
+        raise ValueError("survey disposition identity fields are required")
+    for digest in (source_record_sha256, result_record_sha256):
+        if digest is not None and not _is_sha256(digest):
+            raise ValueError("survey disposition record digest is invalid")
+    counters = {
+        "sample_count": sample_count,
+        "sample_limit": sample_limit,
+        "root_read_count": root_read_count,
+        "root_read_limit": root_read_limit,
+        "worker_launch_count": worker_launch_count,
+        "worker_launch_limit": worker_launch_limit,
+    }
+    if any(
+        isinstance(value, bool) or not isinstance(value, int) or value < 0
+        for value in counters.values()
+    ):
+        raise ValueError("survey disposition counters must be nonnegative integers")
+    count_names = ("sample_count", "root_read_count", "worker_launch_count")
+    if any(
+        counters[name] > counters[name.replace("_count", "_limit")]
+        for name in count_names
+    ):
+        raise ValueError("survey disposition count exceeds its limit")
+    validated_timing, validated_fragments = _validated_pass_timing(
+        leaf_id=leaf_id,
+        pass_value=pass_value,
+        tier_timing=tier_timing,
+        session_fragments=session_fragments,
+    )
+    content: dict[str, object] = {
+        "leaf_id": leaf_id,
+        "pass": pass_value,
+        "source_record_sha256": source_record_sha256,
+        "result_record_sha256": result_record_sha256,
+        "operation_identity": operation_identity,
+        "precision_tiers": list(precision_tiers),
+        "reason_code": reason_code,
+        **counters,
+        "tier_timing": validated_timing,
+        "session_fragments": validated_fragments,
+        "disposition": disposition_value,
+    }
+    entry = {**content, "disposition_receipt_sha256": _sha256(content)}
+    ledger = result["survey_pass_ledger"]
+    assert isinstance(ledger, dict)
+    pass_ledger = ledger[pass_value]
+    assert isinstance(pass_ledger, dict)
+    pass_ledger[leaf_id] = entry
+    return result
+
+
+def append_promotion(
+    checkpoint: Mapping[str, object],
+    *,
+    leaf_id: str,
+    queue_kind: PromotionQueueKind | str,
+    reason_code: str,
+    minimum_requested_tier: str,
+    scientific_computation_identity: str,
+    source_record_sha256: str | None = None,
+    source_stage_sha256: str | None = None,
+    source_root_seal_sha256: str | None = None,
+) -> dict[str, object]:
+    result = validate_schema11_checkpoint(checkpoint)
+    kind = _enum_value(queue_kind, PromotionQueueKind, "promotion queue kind")
+    if not leaf_id or not reason_code or not minimum_requested_tier:
+        raise ValueError("promotion queue identity fields are required")
+    if not _is_sha256(scientific_computation_identity):
+        raise ValueError("scientific computation identity is invalid")
+    for digest in (
+        source_record_sha256,
+        source_stage_sha256,
+        source_root_seal_sha256,
+    ):
+        if digest is not None and not _is_sha256(digest):
+            raise ValueError("promotion queue source digest is invalid")
+    queue = result["promotion_queue"]
+    assert isinstance(queue, dict)
+    entries = queue["entries"]
+    assert isinstance(entries, list)
+    entries.append(
+        {
+            "leaf_id": leaf_id,
+            "queue_kind": kind,
+            "source_pass": SurveyPass.BINARY64.value,
+            "reason_code": reason_code,
+            "minimum_requested_tier": minimum_requested_tier,
+            "source_record_sha256": source_record_sha256,
+            "source_stage_sha256": source_stage_sha256,
+            "source_root_seal_sha256": source_root_seal_sha256,
+            "scientific_computation_identity": scientific_computation_identity,
+            "queue_ordinal": len(entries),
+            "disposition": PromotionQueueDisposition.PENDING.value,
+            "disposition_receipt_sha256": None,
+        }
+    )
+    return result
+
+
+def finish_promotion(
+    checkpoint: Mapping[str, object],
+    *,
+    queue_ordinal: int,
+    disposition: PromotionQueueDisposition | str,
+    disposition_receipt: Mapping[str, object],
+) -> dict[str, object]:
+    result = validate_schema11_checkpoint(checkpoint)
+    disposition_value = _enum_value(
+        disposition, PromotionQueueDisposition, "promotion queue disposition"
+    )
+    if disposition_value not in TERMINAL_PROMOTION_DISPOSITIONS:
+        raise ValueError("promotion completion requires a terminal disposition")
+    queue = result["promotion_queue"]
+    assert isinstance(queue, dict)
+    entries = queue["entries"]
+    assert isinstance(entries, list)
+    if (
+        isinstance(queue_ordinal, bool)
+        or not isinstance(queue_ordinal, int)
+        or queue_ordinal < 0
+        or queue_ordinal >= len(entries)
+    ):
+        raise ValueError("promotion queue ordinal is invalid")
+    entry = entries[queue_ordinal]
+    if entry["queue_ordinal"] != queue_ordinal:
+        raise ValueError("promotion queue order is invalid")
+    if entry["disposition"] != PromotionQueueDisposition.PENDING.value:
+        raise ValueError("promotion queue entry is already terminal")
+    receipt = copy.deepcopy(dict(disposition_receipt))
+    entry["disposition"] = disposition_value
+    entry["disposition_receipt_sha256"] = _sha256(receipt)
+    return result
+
+
+def validate_schema11_checkpoint(
+    value: Mapping[str, object],
+) -> dict[str, object]:
+    if not isinstance(value, Mapping) or set(value) != _SCHEMA11_FIELDS:
+        raise ValueError("schema-11 checkpoint envelope fields are invalid")
+    result = copy.deepcopy(dict(value))
+    if result["schema_version"] != CAMPAIGN_CHECKPOINT_SCHEMA_VERSION:
+        raise ValueError("campaign checkpoint is not schema 11")
+    if not isinstance(result["campaign_id"], str) or not result["campaign_id"]:
+        raise ValueError("schema-11 campaign_id is invalid")
+    if not isinstance(result["selection_id"], str) or not result["selection_id"]:
+        raise ValueError("schema-11 selection_id is invalid")
+    if result["state"] not in {"PARTIAL", "COMPLETE"}:
+        raise ValueError("schema-11 campaign state is invalid")
+    records = result["records"]
+    if not isinstance(records, list):
+        raise ValueError("schema-11 records must be an array")
+    validated_records = [_validated_record(item) for item in records]
+    leaf_ids = [item["leaf_id"] for item in validated_records]
+    if len(leaf_ids) != len(set(leaf_ids)):
+        raise ValueError("schema-11 numerical record leaf IDs are not unique")
+    result["records"] = validated_records
+
+    evidence = result["evidence_ledger"]
+    if not isinstance(evidence, dict):
+        raise ValueError("schema-11 evidence ledger is invalid")
+    record_hashes = {item["leaf_id"]: item["record_sha256"] for item in validated_records}
+    for leaf_id, entry in evidence.items():
+        if not isinstance(leaf_id, str) or not isinstance(entry, Mapping):
+            raise ValueError("schema-11 evidence entry is invalid")
+        if set(entry) != {
             "leaf_id",
+            "central_record_sha256",
             "central_stage_sha256",
-            "execution_profile",
             "evidence_level",
             "receipts",
             "discrepancy_codes",
-            "evidence_sha256",
-        }
-        if not isinstance(value, Mapping) or set(value) != fields:
-            raise ValueError("campaign evidence record fields are invalid")
-        if value.get("schema") != CAMPAIGN_EVIDENCE_SCHEMA:
-            raise ValueError("campaign evidence schema is invalid")
-        raw_receipts = value.get("receipts")
-        raw_discrepancies = value.get("discrepancy_codes")
-        if not isinstance(raw_receipts, list) or not isinstance(
-            raw_discrepancies, list
+        }:
+            raise ValueError("schema-11 evidence entry fields are invalid")
+        if (
+            entry["leaf_id"] != leaf_id
+            or record_hashes.get(leaf_id) != entry["central_record_sha256"]
         ):
-            raise ValueError("campaign evidence record collections are invalid")
-        record = cls(
-            leaf_id=str(value["leaf_id"]),
-            central_stage_sha256=str(value["central_stage_sha256"]),
-            receipts=tuple(
-                EvidenceReceipt.from_mapping(item) for item in raw_receipts
-            ),
-            discrepancy_codes=tuple(raw_discrepancies),
+            raise ValueError("schema-11 evidence entry does not bind a record")
+        _enum_value(entry["evidence_level"], EvidenceLevel, "evidence level")
+        if not _is_sha256(entry["central_stage_sha256"]):
+            raise ValueError("schema-11 evidence stage digest is invalid")
+        if not isinstance(entry["receipts"], list) or not isinstance(
+            entry["discrepancy_codes"], list
+        ):
+            raise ValueError("schema-11 evidence collections are invalid")
+
+    pass_ledgers = result["survey_pass_ledger"]
+    if not isinstance(pass_ledgers, dict) or set(pass_ledgers) != {"binary64", "promoted"}:
+        raise ValueError("schema-11 survey pass ledger is invalid")
+    for pass_name, pass_ledger in pass_ledgers.items():
+        if not isinstance(pass_ledger, dict):
+            raise ValueError("schema-11 survey pass entries are invalid")
+        allowed = (
+            BINARY64_SURVEY_DISPOSITIONS
+            if pass_name == "binary64"
+            else PROMOTED_SURVEY_DISPOSITIONS
         )
-        if value.get("execution_profile") != record.execution_profile.value:
-            raise ValueError("campaign evidence execution profile is inconsistent")
-        if value.get("evidence_level") != record.evidence_level.value:
-            raise ValueError("campaign evidence level is inconsistent")
-        if value.get("evidence_sha256") != record.evidence_sha256:
-            raise ValueError("campaign evidence record digest is invalid")
-        if record.to_mapping() != value:
-            raise ValueError("campaign evidence record is not canonical")
-        return record
+        for leaf_id, entry in pass_ledger.items():
+            if not isinstance(entry, Mapping) or set(entry) != _PASS_ENTRY_FIELDS:
+                raise ValueError("schema-11 survey pass entry fields are invalid")
+            if (
+                entry["leaf_id"] != leaf_id
+                or entry["pass"] != pass_name
+                or entry["disposition"] not in allowed
+            ):
+                raise ValueError("schema-11 survey pass entry identity is invalid")
+            receipt_hash = entry["disposition_receipt_sha256"]
+            content = {
+                key: item
+                for key, item in entry.items()
+                if key != "disposition_receipt_sha256"
+            }
+            if receipt_hash != _sha256(content):
+                raise ValueError("schema-11 survey disposition receipt is invalid")
+            validated_timing, validated_fragments = _validated_pass_timing(
+                leaf_id=leaf_id,
+                pass_value=pass_name,
+                tier_timing=entry["tier_timing"],
+                session_fragments=entry["session_fragments"],
+            )
+            if (
+                entry["tier_timing"] != validated_timing
+                or entry["session_fragments"] != validated_fragments
+            ):
+                raise ValueError("schema-11 survey timing is not canonical")
+
+    queue = result["promotion_queue"]
+    if (
+        not isinstance(queue, dict)
+        or set(queue) != {"schema", "entries"}
+        or queue["schema"] != PROMOTION_QUEUE_SCHEMA
+        or not isinstance(queue["entries"], list)
+    ):
+        raise ValueError("schema-11 promotion queue is invalid")
+    for ordinal, entry in enumerate(queue["entries"]):
+        if not isinstance(entry, Mapping) or entry.get("queue_ordinal") != ordinal:
+            raise ValueError("schema-11 promotion queue order is invalid")
+        _enum_value(entry.get("queue_kind"), PromotionQueueKind, "promotion queue kind")
+        disposition = _enum_value(
+            entry.get("disposition"),
+            PromotionQueueDisposition,
+            "promotion queue disposition",
+        )
+        receipt_hash = entry.get("disposition_receipt_sha256")
+        if disposition == PromotionQueueDisposition.PENDING.value:
+            if receipt_hash is not None:
+                raise ValueError("pending promotion cannot have a terminal receipt")
+        elif not _is_sha256(receipt_hash):
+            raise ValueError("terminal promotion requires a receipt digest")
+
+    for field in ("attempts", "system_failures", "recovery_receipts"):
+        if not isinstance(result[field], list):
+            raise ValueError(f"schema-11 {field} must be an array")
+    report = result["report_status_receipt"]
+    if report is not None and not isinstance(report, Mapping):
+        raise ValueError("schema-11 report status receipt is invalid")
+    return result
+
+
+__all__ = [
+    "BINARY64_SURVEY_DISPOSITIONS",
+    "CAMPAIGN_CHECKPOINT_SCHEMA_VERSION",
+    "EvidenceLevel",
+    "ExecutionProfile",
+    "NUMERICAL_RECORD_STATES",
+    "PROMOTED_SURVEY_DISPOSITIONS",
+    "PROMOTION_QUEUE_SCHEMA",
+    "PromotionQueueDisposition",
+    "PromotionQueueKind",
+    "SurveyDisposition",
+    "SurveyPass",
+    "add_numerical_record",
+    "append_promotion",
+    "empty_schema11_checkpoint",
+    "finish_promotion",
+    "record_evidence",
+    "record_survey_disposition",
+    "validate_schema11_checkpoint",
+]

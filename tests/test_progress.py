@@ -54,42 +54,6 @@ class ProgressBusTests(unittest.TestCase):
             )
             self.assertEqual(traced.progress, "trace")
 
-    def test_campaign_commands_default_to_survey_and_accept_evidence_profiles(self):
-        parser = build_parser()
-        planned = parser.parse_args(["campaign-plan", "selection.json"])
-        self.assertEqual(planned.profile, "survey")
-        for command in ("campaign-run", "campaign-resume", "campaign-validate"):
-            arguments = parser.parse_args(
-                [command, "selection.json", "--checkpoint", "checkpoint.json"]
-            )
-            self.assertEqual(arguments.profile, "survey")
-            for profile in ("survey", "certify", "validate"):
-                profiled = parser.parse_args(
-                    [
-                        command,
-                        "selection.json",
-                        "--checkpoint",
-                        "checkpoint.json",
-                        "--profile",
-                        profile,
-                    ]
-                )
-                self.assertEqual(profiled.profile, profile)
-        queued = parser.parse_args([
-            "campaign-resume",
-            "selection.json",
-            "--checkpoint",
-            "checkpoint.json",
-            "--profile",
-            "certify",
-            "--triage-queue",
-            "m02-triage.json",
-            "--queue-limit",
-            "12",
-        ])
-        self.assertEqual(queued.triage_queue, Path("m02-triage.json"))
-        self.assertEqual(queued.queue_limit, 12)
-
     def test_progress_context_carries_unambiguous_omega_and_counter_fields(self):
         observer = RecordingObserver()
         omega = {"real": 0.5, "imaginary": -0.1}
@@ -1275,15 +1239,12 @@ class CampaignProgressReporterTests(unittest.TestCase):
         )
 
         output = stream.getvalue()
-        self.assertIn("M02 KERR-QNM SCIENTIFIC DASHBOARD", output)
-        self.assertIn(" Completed      1/553", output)
-        self.assertIn(" Accepted       1", output)
-        self.assertIn(" State          PRODUCED", output)
-        self.assertIn(" Mechanism      horizon-admittance", output)
-        self.assertIn(" Precision      binary64 (~15.95 dec)", output)
-        self.assertIn(" No scientific result payload.", output)
-        self.assertNotIn("DeterminantAbs", output)
-        self.assertNotIn("Suboperation", output)
+        self.assertIn("M02 | DASHBOARD", output)
+        self.assertIn("TIME  LEAF", output)
+        self.assertEqual(output.count("leaf-1   "), 1)
+        self.assertIn("horizon-~", output)
+        self.assertIn("PRODUC~", output)
+        self.assertNotIn("\x1b[", output)
 
     def test_published_receipts_increase_the_visible_cache_total(self):
         class ConsoleStream(io.StringIO):
@@ -1322,8 +1283,9 @@ class CampaignProgressReporterTests(unittest.TestCase):
             )
         )
 
-        latest_panel = stream.getvalue().rsplit("\x1b[0J", 1)[-1]
-        self.assertIn(" Stored         12", latest_panel)
+        latest_panel = stream.getvalue()
+        self.assertIn("cache:12", latest_panel)
+        self.assertNotIn("\x1b[", latest_panel)
 
     def test_live_dashboard_renders_latest_completed_scientific_result(self):
         class ConsoleStream(io.StringIO):
@@ -1395,18 +1357,13 @@ class CampaignProgressReporterTests(unittest.TestCase):
         )
 
         latest_panel = stream.getvalue()
-        self.assertIn("LATEST COMPLETED LEAF", latest_panel)
-        self.assertIn(" State          PRODUCED", latest_panel)
-        self.assertIn(" Mechanism      horizon-admittance", latest_panel)
-        self.assertIn(" Precision      binary64 (~15.95 dec)", latest_panel)
-        self.assertIn(" Convergence    ORDER_RESOLVED", latest_panel)
-        self.assertIn(" Response       1.25 -0.500000000000i", latest_panel)
-        self.assertIn(" |Response|     1.346E+00", latest_panel)
-        self.assertIn(" Local disk     2.000E-08", latest_panel)
-        self.assertIn(" Disk / |R|     1.486E-08", latest_panel)
-        self.assertIn(" Baseline |D|   2.000E-13", latest_panel)
-        self.assertIn(" Newton corr    3.000E-14", latest_panel)
-        self.assertNotIn("PROJECTIVE EVIDENCE", latest_panel)
+        self.assertIn("M02 | DASHBOARD", latest_panel)
+        self.assertIn("leaf-ac~", latest_panel)
+        self.assertIn("horizon-~", latest_panel)
+        self.assertIn("ORDER_R~", latest_panel)
+        self.assertIn("1.346", latest_panel)
+        self.assertIn("1.486e-08", latest_panel)
+        self.assertIn("PRODUC~", latest_panel)
 
         status = json.loads(
             Path(f"{self.reporter_checkpoint}.status.json").read_text(
@@ -1557,11 +1514,10 @@ class CampaignProgressReporterTests(unittest.TestCase):
         )
 
         output = stream.getvalue()
-        self.assertTrue(output.startswith(history + "\x1b[0J"))
-        self.assertEqual(output.count("\x1b[0J"), 2)
-        self.assertNotIn("\x1b[2J", output)
-        self.assertIn(" Completed      1/1", output)
-        self.assertNotIn("Event", output)
+        self.assertTrue(output.startswith(history + "=" * 108))
+        self.assertNotIn("\x1b[", output)
+        self.assertEqual(output.count("leaf-1   "), 1)
+        self.assertIn("PRODUC~", output)
 
     def test_normal_console_compacts_without_active_solver_noise(self):
         class ConsoleStream(io.StringIO):
@@ -1572,6 +1528,8 @@ class CampaignProgressReporterTests(unittest.TestCase):
         history = "[bootstrap] solver plan succeeded\nPS> .\\m02.ps1\n"
         stream.write(history)
         reporter = self._console_reporter(stream)
+        assert reporter._clean_tail is not None
+        reporter._clean_tail.width = 80
         with patch.object(reporter, "_terminal_dimensions", return_value=(80, 24)):
             reporter.publish(
                 _event(ProgressEventKind.CAMPAIGN_STARTED, leaf_count=553)
@@ -1605,17 +1563,11 @@ class CampaignProgressReporterTests(unittest.TestCase):
             )
 
         output = stream.getvalue()
-        self.assertTrue(output.startswith(history + "\x1b[0J"))
-        self.assertNotIn("\x1b[2J", output)
-        latest_panel = output.rsplit("\x1b[0J", 1)[-1]
-        lines = latest_panel.splitlines()
-        self.assertLessEqual(len(lines), 23)
-        self.assertTrue(all(len(line) <= 90 for line in lines))
-        self.assertIn("M02 KERR-QNM SCIENTIFIC DASHBOARD", latest_panel)
-        self.assertIn(" Completed      1/553", latest_panel)
-        self.assertIn(" State          UNRESOLVED", latest_panel)
-        self.assertNotIn("DeterminantAbs", latest_panel)
-        self.assertNotIn("Suboperation", latest_panel)
+        self.assertTrue(output.startswith(history + "=" * 79 + "…"))
+        self.assertNotIn("\x1b[", output)
+        self.assertIn("M02 | DASHBOARD", output)
+        self.assertIn("leaf-1", output)
+        self.assertIn("UNRESO~", output)
 
     def test_partial_campaign_dashboard_keeps_outcome_counts_neutral(self):
         class ConsoleStream(io.StringIO):
@@ -1644,10 +1596,10 @@ class CampaignProgressReporterTests(unittest.TestCase):
         )
 
         latest_panel = stream.getvalue()
-        self.assertIn(" Completed      0/553", latest_panel)
-        self.assertIn(" Rejected       0", latest_panel)
-        self.assertIn(" Unresolved     0", latest_panel)
-        self.assertIn(" Failed         0", latest_panel)
+        self.assertIn("COMPLETED=0", latest_panel)
+        self.assertIn("REJECTED=0", latest_panel)
+        self.assertIn("UNRESOLVED=0", latest_panel)
+        self.assertIn("FAILED=0", latest_panel)
 
     def test_completed_leaf_status_retains_rolling_eta_telemetry(self):
         class ConsoleStream(io.StringIO):
@@ -1780,12 +1732,9 @@ class CampaignProgressReporterTests(unittest.TestCase):
         )
 
         latest_panel = stream.getvalue()
-        self.assertIn(" State          PRODUCED", latest_panel)
-        self.assertIn(" Completed      1/553", latest_panel)
-        self.assertIn(" Accepted       1", latest_panel)
-        self.assertIn(" Rejected       0", latest_panel)
-        self.assertIn(" Unresolved     0", latest_panel)
-        self.assertIn(" Failed         0", latest_panel)
+        self.assertIn("leaf-1", latest_panel)
+        self.assertIn("PRODUC~", latest_panel)
+        self.assertNotIn("\x1b[", latest_panel)
 
         reporter.publish(
             _payload_event(
@@ -1797,10 +1746,10 @@ class CampaignProgressReporterTests(unittest.TestCase):
             )
         )
         reused_panel = stream.getvalue()
-        self.assertIn(" State          UNRESOLVED", reused_panel)
-        self.assertIn(" Completed      2/553", reused_panel)
-        self.assertIn(" Accepted       1", reused_panel)
-        self.assertIn(" Unresolved     1", reused_panel)
+        self.assertIn("leaf-2", reused_panel)
+        self.assertIn("UNRESO~", reused_panel)
+        self.assertIn("done:2", reused_panel)
+        self.assertIn("unres:1", reused_panel)
 
         reporter.publish(
             _payload_event(
@@ -1812,10 +1761,10 @@ class CampaignProgressReporterTests(unittest.TestCase):
             )
         )
         failed_panel = stream.getvalue()
-        self.assertIn(" State          FAILED", failed_panel)
-        self.assertIn(" Completed      3/553", failed_panel)
-        self.assertIn(" Rejected       0", failed_panel)
-        self.assertIn(" Failed         1", failed_panel)
+        self.assertIn("leaf-3", failed_panel)
+        self.assertIn("FAILED", failed_panel)
+        self.assertIn("done:3", failed_panel)
+        self.assertIn("fail:1", failed_panel)
 
     def test_trace_appends_session_marker_and_flushes_each_leaf_jsonl_event(self):
         with TemporaryDirectory() as directory:

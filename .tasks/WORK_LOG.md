@@ -2,31 +2,6 @@
 
 Add the newest completed task or milestone-control entry immediately below this heading.
 
-## 2026-08-22 — TASK-079 PR #63 atlas evidence profiles
-
-- **Task:** TASK-079 — Regularise promoted GSN propagation and determinant conditioning.
-- **Deliverable:** Separated ordinary atlas production from targeted
-  certification and validation through one mechanism-general execution policy.
-  Survey now retains authenticated roots, stops at a bounded central response,
-  reuses exact-identity background/Dω evidence, advances past unresolved leaves,
-  migrates stronger schema-9 evidence monotonically, and produces one dynamic
-  mixed-role certification queue. SCREENED evidence is visible to atlas/triage
-  reporting but remains excluded from release admission.
-- **Migration safety:** The uploaded schema-9 PARTIAL checkpoint was copied into
-  an immutable compressed fixture. Tests migrate that copy without numerical
-  recomputation or source mutation, preserve completed records and stronger
-  evidence, and resume from the first genuinely missing survey result.
-- **Verification:** Focused profile, migration, persistence, and orchestration
-  regressions pass 140 tests with 6 Windows-only skips. The full permitted
-  Python discovery passes 1,099 tests with 7 skips; Python compilation and diff
-  hygiene pass. Draft PR
-  [#63](https://github.com/vbrodi23-lgtm/Kerr-QNM_Windows-Solver/pull/63)
-  is open against `main`.
-- **Evidence ceiling:** No production determinant, Newton, angular, coordinate,
-  ODE, Kerr/GSN, M02 campaign, or PowerShell numerical execution was performed.
-  TASK-079 remains In Progress pending hosted CI, native operator evidence,
-  physical results, and human mathematics review.
-
 ## 2026-08-21 — TASK-079 PR #60 authenticated determinant-count repair
 
 - **Task:** TASK-079 — Regularise promoted GSN propagation and determinant conditioning.
