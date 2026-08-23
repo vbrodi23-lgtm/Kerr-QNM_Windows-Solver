@@ -30,9 +30,14 @@ class _AnalyticNativeKernel(VettedNativeDeterminantKernel):
         raise AssertionError("fixed-root survey attempted the component engine")
 
     def _determinant(self, sn, omega, perturbation, policy):
-        self.calls.append((omega, perturbation.amplitude, perturbation.profile_id))
+        amplitude = getattr(perturbation, "amplitude", 0.0j)
+        profile = getattr(
+            perturbation,
+            "profile_id",
+            getattr(perturbation, "operation_identity", ""),
+        )
+        self.calls.append((omega, amplitude, profile))
         offset = omega - self.fixed_root
-        amplitude = perturbation.amplitude
         return 3.0 * offset + 2.0 * amplitude + 0.1 * offset**3 + amplitude**3
 
 

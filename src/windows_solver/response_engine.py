@@ -93,6 +93,15 @@ _EXTERIOR_PROFILE_IDS: Mapping[str, str] = {
 }
 EXTERIOR_SUPPORT_POLICY_ID = "adaptive-exterior-gap-standoff/v2"
 BINARY64_FIXED_ROOT_SURVEY_IDENTITY = "exterior-fixed-root-survey-raw/v1"
+CANONICAL_EXTERIOR_BACKGROUND_IDENTITY = (
+    "canonical-exterior-background-wronskian/v1"
+)
+BACKGROUND_EQUIVALENCE_IDENTITY = "background-equivalence/v1"
+_BACKGROUND_REUSE_KEY_SCHEMA = "windows-solver.exterior-background-reuse-key/1"
+_BACKGROUND_EQUIVALENCE_SCHEMA = "windows-solver.background-equivalence/1"
+_FREQUENCY_STEP_POLICY = "relative-1e-5-times-one-plus-abs-omega/v1"
+_BINARY64_FREQUENCY_STEP_SCALE = 1.0e-5
+_MATCH_READOUT_CONVENTION = "real-axis-wronskian-at-readout/v1"
 BINARY64_FIXED_ROOT_SAMPLE_ROLES = (
     "D0",
     "DOMEGA_REAL_PLUS_H",
@@ -1919,6 +1928,454 @@ class Binary64FixedRootBatch:
         }
 
 
+@dataclass(frozen=True, slots=True)
+class ExteriorBackgroundReuseKey:
+    root_seal_sha256: str
+    root_identity: str
+    branch_identity: str
+    angular_identity: str
+    background_operation_identity: str
+    determinant_family: str
+    determinant_convention: str
+    determinant_normalisation: str
+    match_readout_convention: str
+    backend_identity: str
+    numerical_controls_sha256: str
+    arithmetic_tier: str
+    working_precision: int
+    frequency_step_policy: str
+
+    def __post_init__(self) -> None:
+        for name in (
+            "root_seal_sha256",
+            "root_identity",
+            "angular_identity",
+            "backend_identity",
+            "numerical_controls_sha256",
+        ):
+            if _HEX_64.fullmatch(getattr(self, name)) is None:
+                raise ValueError(f"exterior background {name} is invalid")
+        for name in (
+            "branch_identity",
+            "determinant_family",
+            "determinant_convention",
+            "determinant_normalisation",
+            "match_readout_convention",
+            "frequency_step_policy",
+        ):
+            if not isinstance(getattr(self, name), str) or not getattr(self, name):
+                raise ValueError(f"exterior background {name} is invalid")
+        if self.background_operation_identity != CANONICAL_EXTERIOR_BACKGROUND_IDENTITY:
+            raise ValueError("exterior background operation identity is invalid")
+        if self.arithmetic_tier != "binary64" or self.working_precision != 53:
+            raise ValueError("exterior background arithmetic contract is invalid")
+
+    def to_mapping(self) -> dict[str, object]:
+        return {
+            "schema": _BACKGROUND_REUSE_KEY_SCHEMA,
+            "root_seal_sha256": self.root_seal_sha256,
+            "root_identity": self.root_identity,
+            "branch_identity": self.branch_identity,
+            "angular_identity": self.angular_identity,
+            "background_operation_identity": self.background_operation_identity,
+            "determinant_family": self.determinant_family,
+            "determinant_convention": self.determinant_convention,
+            "determinant_normalisation": self.determinant_normalisation,
+            "match_readout_convention": self.match_readout_convention,
+            "backend_identity": self.backend_identity,
+            "numerical_controls_sha256": self.numerical_controls_sha256,
+            "arithmetic_tier": self.arithmetic_tier,
+            "working_precision": self.working_precision,
+            "frequency_step_policy": self.frequency_step_policy,
+        }
+
+    @classmethod
+    def from_mapping(cls, value: object) -> "ExteriorBackgroundReuseKey":
+        expected = {
+            "schema",
+            "root_seal_sha256",
+            "root_identity",
+            "branch_identity",
+            "angular_identity",
+            "background_operation_identity",
+            "determinant_family",
+            "determinant_convention",
+            "determinant_normalisation",
+            "match_readout_convention",
+            "backend_identity",
+            "numerical_controls_sha256",
+            "arithmetic_tier",
+            "working_precision",
+            "frequency_step_policy",
+        }
+        if not isinstance(value, Mapping) or set(value) != expected:
+            raise ValueError("exterior background reuse key fields are invalid")
+        if value["schema"] != _BACKGROUND_REUSE_KEY_SCHEMA:
+            raise ValueError("exterior background reuse key schema is invalid")
+        return cls(**{name: value[name] for name in expected - {"schema"}})
+
+
+def build_exterior_background_reuse_key(
+    job: ResponseComponentJob,
+    *,
+    root_seal_sha256: str,
+) -> ExteriorBackgroundReuseKey:
+    if job.mechanism_id not in _EXTERIOR_PROFILE_IDS:
+        raise ValueError("exterior background reuse requires an exterior job")
+    contract = regularised_gsn_mechanism_contract(job.mechanism_id)
+    frequency_step = _BINARY64_FREQUENCY_STEP_SCALE * (
+        1.0 + abs(job.root.omega)
+    )
+    return ExteriorBackgroundReuseKey(
+        root_seal_sha256=root_seal_sha256,
+        root_identity=job.root.identity_sha256,
+        branch_identity=job.root.branch_id,
+        angular_identity=_sha256({
+            "angular_separation_constant": _complex_mapping(
+                job.root.angular_separation_constant
+            ),
+            "angular_owner": job.root.owner_data_sha256,
+        }),
+        background_operation_identity=CANONICAL_EXTERIOR_BACKGROUND_IDENTITY,
+        determinant_family=str(contract["determinant_family"]),
+        determinant_convention=str(contract["determinant_convention"]),
+        determinant_normalisation=str(contract["determinant_normalisation"]),
+        match_readout_convention=_sha256({
+            "identity": _MATCH_READOUT_CONVENTION,
+            "readout_radius_binary64_hex": job.policy.readout_radius.hex(),
+        }),
+        backend_identity=job.backend_identity.identity_sha256,
+        numerical_controls_sha256=job.policy.identity_sha256,
+        arithmetic_tier="binary64",
+        working_precision=53,
+        frequency_step_policy=_sha256({
+            "identity": _FREQUENCY_STEP_POLICY,
+            "step_binary64_hex": frequency_step.hex(),
+        }),
+    )
+
+
+_CANONICAL_BACKGROUND_SAMPLE_ROLES = BINARY64_FIXED_ROOT_SAMPLE_ROLES[:5]
+_MECHANISM_DERIVATIVE_SAMPLE_ROLES = BINARY64_FIXED_ROOT_SAMPLE_ROLES[5:]
+
+
+@dataclass(frozen=True, slots=True)
+class CanonicalExteriorBackground:
+    reuse_key: ExteriorBackgroundReuseKey
+    fixed_root: complex
+    frequency_step: float
+    samples: tuple[Binary64FixedRootSample, ...]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.reuse_key, ExteriorBackgroundReuseKey):
+            raise ValueError("canonical exterior background reuse key is invalid")
+        object.__setattr__(
+            self, "fixed_root", _finite_complex(self.fixed_root, "fixed root")
+        )
+        if not math.isfinite(self.frequency_step) or self.frequency_step <= 0.0:
+            raise ValueError("canonical exterior background step is invalid")
+        if tuple(sample.role for sample in self.samples) != (
+            _CANONICAL_BACKGROUND_SAMPLE_ROLES
+        ):
+            raise ValueError("canonical exterior background sample plan is invalid")
+        expected_points = (
+            self.fixed_root,
+            self.fixed_root + self.frequency_step,
+            self.fixed_root - self.frequency_step,
+            self.fixed_root + self.frequency_step / 2.0,
+            self.fixed_root - self.frequency_step / 2.0,
+        )
+        if any(
+            sample.omega != omega or sample.amplitude != 0.0j
+            for sample, omega in zip(self.samples, expected_points)
+        ):
+            raise ValueError("canonical exterior background sample point is invalid")
+
+    @property
+    def sha256(self) -> str:
+        return _sha256(self.to_mapping())
+
+    def to_mapping(self) -> dict[str, object]:
+        return {
+            "schema": "windows-solver.canonical-exterior-background/1",
+            "operation_identity": CANONICAL_EXTERIOR_BACKGROUND_IDENTITY,
+            "reuse_key": self.reuse_key.to_mapping(),
+            "fixed_root": _complex_mapping(self.fixed_root),
+            "frequency_step": self.frequency_step,
+            "samples": [sample.to_mapping() for sample in self.samples],
+        }
+
+
+def canonical_background_from_binary64_batch(
+    batch: Binary64FixedRootBatch,
+    reuse_key: ExteriorBackgroundReuseKey,
+) -> CanonicalExteriorBackground:
+    if batch.branch_identity != reuse_key.branch_identity:
+        raise ValueError("canonical exterior background branch identity mismatch")
+    return CanonicalExteriorBackground(
+        reuse_key=reuse_key,
+        fixed_root=batch.fixed_root,
+        frequency_step=batch.frequency_step,
+        samples=batch.samples[:5],
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class BackgroundEquivalenceReceipt:
+    mechanism_id: str
+    reuse_key: ExteriorBackgroundReuseKey
+    canonical_background_sha256: str
+    proof: Mapping[str, object]
+    identity: str = BACKGROUND_EQUIVALENCE_IDENTITY
+
+    def __post_init__(self) -> None:
+        if self.identity != BACKGROUND_EQUIVALENCE_IDENTITY:
+            raise ValueError("background equivalence identity is invalid")
+        if self.mechanism_id not in _EXTERIOR_PROFILE_IDS:
+            raise ValueError("background equivalence mechanism is invalid")
+        if not isinstance(self.reuse_key, ExteriorBackgroundReuseKey):
+            raise ValueError("background equivalence reuse key is invalid")
+        if _HEX_64.fullmatch(self.canonical_background_sha256) is None:
+            raise ValueError("background equivalence background digest is invalid")
+        if not isinstance(self.proof, Mapping):
+            raise ValueError("background equivalence proof is invalid")
+        proof_fields = {
+            "proof_identity",
+            "root_seal_sha256",
+            "canonical_operation_identity",
+            "mechanism_operation_identity",
+            "realised_support",
+            "determinant_contract",
+            "zero_coupling_amplitude",
+            "reuse_key_sha256",
+        }
+        if set(self.proof) != proof_fields:
+            raise ValueError("background equivalence proof fields are invalid")
+        expected_contract = {
+            "determinant_family": self.reuse_key.determinant_family,
+            "determinant_convention": self.reuse_key.determinant_convention,
+            "determinant_normalisation": self.reuse_key.determinant_normalisation,
+        }
+        if (
+            self.proof["proof_identity"] != "zero-coupling-profile-elision/v1"
+            or self.proof["root_seal_sha256"] != self.reuse_key.root_seal_sha256
+            or self.proof["canonical_operation_identity"]
+            != CANONICAL_EXTERIOR_BACKGROUND_IDENTITY
+            or self.proof["mechanism_operation_identity"]
+            != BINARY64_FIXED_ROOT_SURVEY_IDENTITY
+            or self.proof["determinant_contract"] != expected_contract
+            or self.proof["zero_coupling_amplitude"] != _complex_mapping(0.0j)
+            or self.proof["reuse_key_sha256"]
+            != _sha256(self.reuse_key.to_mapping())
+        ):
+            raise ValueError("background equivalence proof is inconsistent")
+        support = self.proof["realised_support"]
+        if (
+            not isinstance(support, Mapping)
+            or set(support) != {"lower", "upper", "centre", "half_width"}
+        ):
+            raise ValueError("background equivalence support proof is invalid")
+
+    def _material_mapping(self) -> dict[str, object]:
+        return {
+            "schema": _BACKGROUND_EQUIVALENCE_SCHEMA,
+            "identity": self.identity,
+            "mechanism_id": self.mechanism_id,
+            "reuse_key": self.reuse_key.to_mapping(),
+            "canonical_background_sha256": self.canonical_background_sha256,
+            "proof": dict(self.proof),
+        }
+
+    @property
+    def sha256(self) -> str:
+        return _sha256(self._material_mapping())
+
+    def to_mapping(self) -> dict[str, object]:
+        return {**self._material_mapping(), "receipt_sha256": self.sha256}
+
+    @classmethod
+    def issue(
+        cls,
+        *,
+        reuse_key: ExteriorBackgroundReuseKey,
+        job: ResponseComponentJob,
+        canonical_background_sha256: str,
+    ) -> "BackgroundEquivalenceReceipt":
+        if job.mechanism_id not in _EXTERIOR_PROFILE_IDS:
+            raise ValueError("background equivalence requires an exterior job")
+        expected_key = build_exterior_background_reuse_key(
+            job, root_seal_sha256=reuse_key.root_seal_sha256
+        )
+        if reuse_key != expected_key:
+            raise ValueError("background equivalence reuse key mismatch")
+        contract = regularised_gsn_mechanism_contract(job.mechanism_id)
+        proof = {
+            "proof_identity": "zero-coupling-profile-elision/v1",
+            "root_seal_sha256": reuse_key.root_seal_sha256,
+            "canonical_operation_identity": (
+                CANONICAL_EXTERIOR_BACKGROUND_IDENTITY
+            ),
+            "mechanism_operation_identity": BINARY64_FIXED_ROOT_SURVEY_IDENTITY,
+            "realised_support": _exterior_support(
+                job.spin, job.mechanism_id
+            ).to_mapping(),
+            "determinant_contract": {
+                name: contract[name]
+                for name in (
+                    "determinant_family",
+                    "determinant_convention",
+                    "determinant_normalisation",
+                )
+            },
+            "zero_coupling_amplitude": _complex_mapping(0.0j),
+            "reuse_key_sha256": _sha256(reuse_key.to_mapping()),
+        }
+        return cls(
+            mechanism_id=job.mechanism_id,
+            reuse_key=reuse_key,
+            canonical_background_sha256=canonical_background_sha256,
+            proof=proof,
+        )
+
+    @classmethod
+    def from_mapping(cls, value: object) -> "BackgroundEquivalenceReceipt":
+        fields = {
+            "schema",
+            "identity",
+            "mechanism_id",
+            "reuse_key",
+            "canonical_background_sha256",
+            "proof",
+            "receipt_sha256",
+        }
+        if not isinstance(value, Mapping) or set(value) != fields:
+            raise ValueError("background equivalence receipt fields are invalid")
+        receipt = cls(
+            identity=value["identity"],
+            mechanism_id=value["mechanism_id"],
+            reuse_key=ExteriorBackgroundReuseKey.from_mapping(value["reuse_key"]),
+            canonical_background_sha256=value["canonical_background_sha256"],
+            proof=value["proof"],
+        )
+        if value["schema"] != _BACKGROUND_EQUIVALENCE_SCHEMA:
+            raise ValueError("background equivalence receipt schema is invalid")
+        if value["receipt_sha256"] != receipt.sha256:
+            raise ValueError("background equivalence receipt digest mismatch")
+        return receipt
+
+
+@dataclass(frozen=True, slots=True)
+class Binary64ReusedBackgroundBatch:
+    leaf_id: str
+    job_id: str
+    mechanism_id: str
+    fixed_root: complex
+    branch_identity: str
+    coordinate_step: float
+    support: ExteriorSupport
+    background_sha256: str
+    equivalence_receipt_sha256: str
+    samples: tuple[Binary64FixedRootSample, ...]
+    sample_limit: int = 4
+    root_read_count: int = 0
+    julia_launch_count: int = 0
+
+    def __post_init__(self) -> None:
+        for name in ("leaf_id", "job_id", "branch_identity"):
+            if not isinstance(getattr(self, name), str) or not getattr(self, name):
+                raise ValueError(f"reused background {name} is invalid")
+        object.__setattr__(
+            self, "fixed_root", _finite_complex(self.fixed_root, "fixed root")
+        )
+        if self.mechanism_id not in _EXTERIOR_PROFILE_IDS:
+            raise ValueError("reused background mechanism is invalid")
+        if not isinstance(self.support, ExteriorSupport):
+            raise ValueError("reused background support is invalid")
+        if not math.isfinite(self.coordinate_step) or self.coordinate_step <= 0.0:
+            raise ValueError("reused background coordinate step is invalid")
+        if tuple(sample.role for sample in self.samples) != (
+            _MECHANISM_DERIVATIVE_SAMPLE_ROLES
+        ):
+            raise ValueError("reused background mechanism sample plan is invalid")
+        if self.sample_limit != 4 or len(self.samples) != 4:
+            raise ValueError("reused background mechanism sample budget is invalid")
+        if self.root_read_count != 0 or self.julia_launch_count != 0:
+            raise ValueError("reused background execution budget is invalid")
+        for digest in (
+            self.background_sha256,
+            self.equivalence_receipt_sha256,
+        ):
+            if _HEX_64.fullmatch(digest) is None:
+                raise ValueError("reused background digest is invalid")
+        expected_amplitudes = (
+            complex(self.coordinate_step, 0.0),
+            complex(-self.coordinate_step, 0.0),
+            complex(self.coordinate_step / 2.0, 0.0),
+            complex(-self.coordinate_step / 2.0, 0.0),
+        )
+        if any(
+            sample.omega != self.fixed_root or sample.amplitude != amplitude
+            for sample, amplitude in zip(self.samples, expected_amplitudes)
+        ):
+            raise ValueError("reused background mechanism sample point is invalid")
+
+    @property
+    def sample_count(self) -> int:
+        return len(self.samples)
+
+
+def exterior_background_reuse_admitted(
+    job: ResponseComponentJob,
+    background: CanonicalExteriorBackground | None,
+    receipt: BackgroundEquivalenceReceipt | None,
+) -> bool:
+    """Return true only for the exact key plus its canonical proof receipt."""
+
+    if background is None or receipt is None:
+        return False
+    if not isinstance(background, CanonicalExteriorBackground) or not isinstance(
+        receipt, BackgroundEquivalenceReceipt
+    ):
+        raise ValueError("background reuse evidence is invalid")
+    expected_key = build_exterior_background_reuse_key(
+        job,
+        root_seal_sha256=background.reuse_key.root_seal_sha256,
+    )
+    if (
+        background.reuse_key != expected_key
+        or receipt.reuse_key != expected_key
+        or receipt.mechanism_id != job.mechanism_id
+        or receipt.canonical_background_sha256 != background.sha256
+    ):
+        return False
+    expected_receipt = BackgroundEquivalenceReceipt.issue(
+        reuse_key=expected_key,
+        job=job,
+        canonical_background_sha256=background.sha256,
+    )
+    return receipt.to_mapping() == expected_receipt.to_mapping()
+
+
+def screen_binary64_reused_background_batch(
+    background: CanonicalExteriorBackground,
+    batch: Binary64ReusedBackgroundBatch,
+) -> Binary64FixedRootScreening:
+    if batch.background_sha256 != background.sha256:
+        raise ValueError("reused background digest mismatch")
+    combined = Binary64FixedRootBatch(
+        leaf_id=batch.leaf_id,
+        job_id=batch.job_id,
+        mechanism_id=batch.mechanism_id,
+        fixed_root=batch.fixed_root,
+        branch_identity=batch.branch_identity,
+        frequency_step=background.frequency_step,
+        coordinate_step=batch.coordinate_step,
+        support=batch.support,
+        samples=background.samples + batch.samples,
+    )
+    return screen_binary64_fixed_root_batch(combined)
+
+
 class Binary64SurveyDisposition(str, Enum):
     PRODUCED = "PRODUCED"
     PROMOTION_PENDING_RESPONSE = "PROMOTION_PENDING_RESPONSE"
@@ -2090,6 +2547,22 @@ class ExteriorPerturbation:
         if abs(scaled) >= 1.0:
             return 0.0j
         return self.amplitude * math.exp(1.0 - 1.0 / (1.0 - scaled * scaled))
+
+
+@dataclass(frozen=True, slots=True)
+class ExteriorBackgroundPerturbation:
+    """Mechanism-independent zero-coupling exterior background operation."""
+
+    operation_identity: str = CANONICAL_EXTERIOR_BACKGROUND_IDENTITY
+
+    def __post_init__(self) -> None:
+        if self.operation_identity != CANONICAL_EXTERIOR_BACKGROUND_IDENTITY:
+            raise ValueError("canonical exterior background identity is invalid")
+
+    def profile_value(self, radius: float) -> complex:
+        if not math.isfinite(float(radius)):
+            raise ValueError("exterior background radius must be finite")
+        return 0.0j
 
 
 @dataclass(frozen=True, slots=True)

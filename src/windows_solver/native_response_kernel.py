@@ -26,15 +26,21 @@ from .response_engine import (
     BackendIdentity,
     Binary64FixedRootBatch,
     Binary64FixedRootSample,
+    Binary64ReusedBackgroundBatch,
+    BackgroundEquivalenceReceipt,
+    CanonicalExteriorBackground,
     DiagnosticRootReadout,
     DeterminantPartials,
     ExteriorPerturbation,
+    ExteriorBackgroundPerturbation,
     HorizonPerturbation,
     NumericalPolicy,
     ResponseComponentJob,
     RootReadout,
     _EXTERIOR_PROFILE_IDS,
     _exterior_support,
+    build_exterior_background_reuse_key,
+    exterior_background_reuse_admitted,
     mode_specific_branch_enclosure_radius,
 )
 from .progress import ProgressEventKind, emit_progress, progress_scope
@@ -320,7 +326,7 @@ class VettedNativeDeterminantKernel:
         start: float,
         stop: float,
         seed: object,
-        perturbation: ExteriorPerturbation,
+        perturbation: ExteriorPerturbation | ExteriorBackgroundPerturbation,
         policy: NumericalPolicy,
     ) -> object:
         import numpy as np
@@ -337,11 +343,17 @@ class VettedNativeDeterminantKernel:
 
         boundaries = [float(start), float(stop)]
         lower, upper = sorted((float(start), float(stop)))
-        boundaries.extend(
-            value
-            for value in (perturbation.support.lower, perturbation.support.upper)
-            if lower < value < upper
+        support = (
+            perturbation.support
+            if isinstance(perturbation, ExteriorPerturbation)
+            else None
         )
+        if support is not None:
+            boundaries.extend(
+                value
+                for value in (support.lower, support.upper)
+                if lower < value < upper
+            )
         boundaries = sorted(set(boundaries), reverse=stop < start)
         state = np.asarray(seed, dtype=complex)
         segment_count = len(boundaries) - 1
@@ -349,12 +361,15 @@ class VettedNativeDeterminantKernel:
             zip(boundaries[:-1], boundaries[1:]), start=1
         ):
             midpoint = 0.5 * (left + right)
-            inside = perturbation.support.lower <= midpoint <= perturbation.support.upper
+            inside = (
+                support is not None
+                and support.lower <= midpoint <= support.upper
+            )
             step = 0.2
             if inside:
                 step = min(
                     step,
-                    (perturbation.support.upper - perturbation.support.lower)
+                    (support.upper - support.lower)
                     / policy.support_subinterval_count,
                 )
             with _progress_suboperation(
@@ -383,7 +398,11 @@ class VettedNativeDeterminantKernel:
         cls,
         sn: object,
         omega: complex,
-        perturbation: HorizonPerturbation | ExteriorPerturbation,
+        perturbation: (
+            HorizonPerturbation
+            | ExteriorPerturbation
+            | ExteriorBackgroundPerturbation
+        ),
         policy: NumericalPolicy,
     ) -> complex:
         readout = policy.readout_radius
@@ -956,11 +975,15 @@ class VettedNativeDeterminantKernel:
             raise RuntimeError("binary64 fixed-root sample budget exceeded")
         sn = self._standard_sn(job, job.policy)
         samples = []
-        for role, omega, amplitude in planned:
-            perturbation = ExteriorPerturbation(
-                amplitude=amplitude,
-                profile_id=profile_id,
-                support=support,
+        for index, (role, omega, amplitude) in enumerate(planned):
+            perturbation = (
+                ExteriorBackgroundPerturbation()
+                if index < 5
+                else ExteriorPerturbation(
+                    amplitude=amplitude,
+                    profile_id=profile_id,
+                    support=support,
+                )
             )
             determinant = self._determinant(sn, omega, perturbation, job.policy)
             samples.append(
@@ -981,6 +1004,109 @@ class VettedNativeDeterminantKernel:
             coordinate_step=coordinate_step,
             support=support,
             samples=tuple(samples),
+        )
+
+    def fixed_root_reused_background_batch(
+        self,
+        *,
+        job: ResponseComponentJob,
+        fixed_root: complex,
+        branch_identity: str,
+        background: CanonicalExteriorBackground,
+        equivalence_receipt: BackgroundEquivalenceReceipt | None,
+    ) -> Binary64ReusedBackgroundBatch:
+        """Evaluate only D_c after strict authenticated Dω reuse admission."""
+
+        if equivalence_receipt is None:
+            raise ValueError("background equivalence receipt is required")
+        if job.mechanism_id not in _EXTERIOR_PROFILE_IDS:
+            raise ValueError("background reuse requires an exterior job")
+        root = complex(fixed_root)
+        if root != background.fixed_root or branch_identity != job.root.branch_id:
+            raise ValueError("background reuse root or branch mismatch")
+        expected_key = build_exterior_background_reuse_key(
+            job,
+            root_seal_sha256=background.reuse_key.root_seal_sha256,
+        )
+        if background.reuse_key != expected_key:
+            raise ValueError("background reuse key mismatch")
+        if (
+            equivalence_receipt.reuse_key != expected_key
+            or equivalence_receipt.mechanism_id != job.mechanism_id
+            or equivalence_receipt.canonical_background_sha256
+            != background.sha256
+        ):
+            raise ValueError("background equivalence receipt mismatch")
+        expected_receipt = BackgroundEquivalenceReceipt.issue(
+            reuse_key=expected_key,
+            job=job,
+            canonical_background_sha256=background.sha256,
+        )
+        if equivalence_receipt.to_mapping() != expected_receipt.to_mapping():
+            raise ValueError("background equivalence proof mismatch")
+        support = _exterior_support(job.spin, job.mechanism_id)
+        profile_id = _EXTERIOR_PROFILE_IDS[job.mechanism_id]
+        coordinate_step = job.policy.epsilons[0]
+        planned = (
+            ("DC_PLUS_EPSILON", complex(coordinate_step, 0.0)),
+            ("DC_MINUS_EPSILON", complex(-coordinate_step, 0.0)),
+            ("DC_PLUS_HALF_EPSILON", complex(coordinate_step / 2.0, 0.0)),
+            ("DC_MINUS_HALF_EPSILON", complex(-coordinate_step / 2.0, 0.0)),
+        )
+        sn = self._standard_sn(job, job.policy)
+        samples = tuple(
+            Binary64FixedRootSample(
+                role=role,
+                omega=root,
+                amplitude=amplitude,
+                determinant=self._determinant(
+                    sn,
+                    root,
+                    ExteriorPerturbation(amplitude, profile_id, support),
+                    job.policy,
+                ),
+            )
+            for role, amplitude in planned
+        )
+        return Binary64ReusedBackgroundBatch(
+            leaf_id=job.leaf_id,
+            job_id=job.job_id,
+            mechanism_id=job.mechanism_id,
+            fixed_root=root,
+            branch_identity=branch_identity,
+            coordinate_step=coordinate_step,
+            support=support,
+            background_sha256=background.sha256,
+            equivalence_receipt_sha256=equivalence_receipt.sha256,
+            samples=samples,
+        )
+
+    def fixed_root_survey_with_optional_background(
+        self,
+        *,
+        job: ResponseComponentJob,
+        fixed_root: complex,
+        branch_identity: str,
+        background: CanonicalExteriorBackground | None,
+        equivalence_receipt: BackgroundEquivalenceReceipt | None,
+    ) -> Binary64FixedRootBatch | Binary64ReusedBackgroundBatch:
+        """Use four samples only when the exact equivalence gate is satisfied."""
+
+        if exterior_background_reuse_admitted(
+            job, background, equivalence_receipt
+        ):
+            assert background is not None
+            return self.fixed_root_reused_background_batch(
+                job=job,
+                fixed_root=fixed_root,
+                branch_identity=branch_identity,
+                background=background,
+                equivalence_receipt=equivalence_receipt,
+            )
+        return self.fixed_root_survey_batch(
+            job=job,
+            fixed_root=fixed_root,
+            branch_identity=branch_identity,
         )
 
     def horizon_partials(
