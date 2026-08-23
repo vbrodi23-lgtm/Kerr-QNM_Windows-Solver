@@ -439,9 +439,8 @@ Release admission is explicit, content-sealed, and fail-closed.
 
 ---
 
-## Notices and licences
+## Licences
 
-See [`NOTICE.md`](NOTICE.md) for project notices and the licence files under:
 
 ```text
 src/windows_solver/data/
