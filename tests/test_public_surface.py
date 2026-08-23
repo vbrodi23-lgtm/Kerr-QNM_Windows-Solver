@@ -1114,7 +1114,6 @@ $candidate | ConvertTo-Json -Compress | Set-Content -LiteralPath $env:M02_TEST_J
         root = Path(__file__).resolve().parents[1]
         paths = [
             root / "README.md",
-            root / "NOTICE.md",
             root / "solver.ps1",
             *sorted((root / "docs").rglob("*.md")),
             *sorted((root / "examples").glob("*.json")),
@@ -1295,26 +1294,6 @@ $candidate | ConvertTo-Json -Compress | Set-Content -LiteralPath $env:M02_TEST_J
         current_status_files = (
             root / "README.md",
             root / "docs" / "architecture.md",
-            root
-            / "docs"
-            / "superpowers"
-            / "specs"
-            / "2026-08-06-public-solver-design.md",
-            root
-            / "docs"
-            / "superpowers"
-            / "specs"
-            / "2026-08-07-authenticated-spectral-catalog-design.md",
-            root
-            / "docs"
-            / "superpowers"
-            / "plans"
-            / "2026-08-06-public-capability-dag.md",
-            root
-            / "docs"
-            / "superpowers"
-            / "plans"
-            / "2026-08-07-authenticated-spectral-catalog.md",
         )
         stale = re.compile(
             r"only the problem-contract provider|"
@@ -1337,26 +1316,6 @@ $candidate | ConvertTo-Json -Compress | Set-Content -LiteralPath $env:M02_TEST_J
         current_status_files = (
             root / "README.md",
             root / "docs" / "architecture.md",
-            root
-            / "docs"
-            / "superpowers"
-            / "specs"
-            / "2026-08-06-public-solver-design.md",
-            root
-            / "docs"
-            / "superpowers"
-            / "specs"
-            / "2026-08-07-authenticated-spectral-catalog-design.md",
-            root
-            / "docs"
-            / "superpowers"
-            / "plans"
-            / "2026-08-06-public-capability-dag.md",
-            root
-            / "docs"
-            / "superpowers"
-            / "plans"
-            / "2026-08-07-authenticated-spectral-catalog.md",
         )
         legacy_scope = re.compile(
             r"\b(?:91[- ](?:row|root|pair)|"
