@@ -900,6 +900,12 @@ exit 0
                 json.loads(line)
                 for line in argument_log.read_text(encoding="utf-8").splitlines()
             ]
+            for call in calls[1:]:
+                checkpoint_index = call.index("--checkpoint") + 1
+                self.assertTrue(
+                    Path(call[checkpoint_index]).samefile(checkpoint_path)
+                )
+                call[checkpoint_index] = str(checkpoint_path)
 
         selection = r".\examples\m02-campaign.json"
         checkpoint = str(checkpoint_path)
