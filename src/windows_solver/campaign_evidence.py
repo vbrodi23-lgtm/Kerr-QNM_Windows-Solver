@@ -442,6 +442,9 @@ def require_release_evidence(
     """Reject release admission unless every required leaf is strong enough."""
 
     validated = validate_schema11_checkpoint(checkpoint)
+    records_by_leaf_id = {
+        str(record["leaf_id"]): record for record in validated["records"]
+    }
     for leaf_id, required in requirements.items():
         try:
             required_level = EvidenceLevel(required)
@@ -456,6 +459,26 @@ def require_release_evidence(
             raise ValueError(
                 f"release admission requires {required_level.value} evidence "
                 f"for {leaf_id}"
+            )
+        record = records_by_leaf_id.get(leaf_id)
+        if not isinstance(record, Mapping):
+            raise ValueError(
+                f"release evidence record binding is invalid for {leaf_id}"
+            )
+        stages = record.get("stages")
+        if not isinstance(stages, list) or not stages:
+            raise ValueError(
+                f"release evidence stage binding is invalid for {leaf_id}"
+            )
+        terminal_stage = stages[-1]
+        if (
+            not isinstance(terminal_stage, Mapping)
+            or entry.get("central_record_sha256") != record.get("record_sha256")
+            or entry.get("central_stage_sha256")
+            != terminal_stage.get("stage_sha256")
+        ):
+            raise ValueError(
+                f"release evidence stage binding is invalid for {leaf_id}"
             )
         actual = EvidenceLevel(entry["evidence_level"])
         if _EVIDENCE_RANK[actual] < _EVIDENCE_RANK[required_level]:

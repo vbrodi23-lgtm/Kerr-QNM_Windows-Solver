@@ -31,6 +31,7 @@ from .campaign_policy import (
 from .campaign_evidence import (
     EvidencePassRequest,
     EvidenceStrengtheningPolicy,
+    require_release_evidence,
 )
 from .campaign_triage import WholeAtlasTriage
 from .campaign_survey import preflight_campaign_supports
@@ -98,6 +99,7 @@ from .response_engine import VettedNativeDeterminantKernel, NativeResourceUnavai
 from .response_reduction import (
     ComputedUnresolvedComponentEvidence,
     ResolvedComponentEvidence,
+    build_projective_row_plans,
     component_evidence_from_mapping,
     reduce_projective_rows,
 )
@@ -1410,11 +1412,54 @@ def _campaign_reduce(bundle_path: Path, output: Path) -> tuple[int, object]:
     )
     if tuple(declared_hashes) != computed_hashes:
         raise ValueError("campaign reduction checkpoint source hashes are invalid")
+    row_plans = {item.row_id: item for item in build_projective_row_plans()}
+    try:
+        required_leaf_ids = frozenset(
+            leaf_id
+            for row_id in selected_row_ids
+            for leaf_id in (
+                *row_plans[row_id].left_component_ids,
+                *row_plans[row_id].right_component_ids,
+            )
+        )
+    except KeyError as error:
+        raise ValueError("campaign reduction selected row is invalid") from error
+    release_requirements = {
+        leaf_id: EvidenceLevel.CERTIFIED for leaf_id in required_leaf_ids
+    }
+    release_covered_leaf_ids: set[str] = set()
     records_by_id: dict[str, CampaignLeafRecord] = {}
     receipts_by_id: dict[str, set[str]] = {}
     for checkpoint, checkpoint_receipt in zip(
         resolved_checkpoints, computed_hashes
     ):
+        raw_checkpoint = _load_strict_json(
+            checkpoint, "campaign reduction schema-11 checkpoint"
+        )
+        if (
+            not isinstance(raw_checkpoint, Mapping)
+            or raw_checkpoint.get("schema_version") != SCHEMA11_VERSION
+        ):
+            raise ValueError(
+                "campaign reduction requires a schema-11 evidence checkpoint; "
+                "migrate legacy checkpoint material first"
+            )
+        validated_schema11 = validate_schema11_checkpoint(raw_checkpoint)
+        checkpoint_leaf_ids = {
+            str(record["leaf_id"])
+            for record in validated_schema11["records"]
+            if isinstance(record, Mapping)
+        }
+        checkpoint_requirements = {
+            leaf_id: level
+            for leaf_id, level in release_requirements.items()
+            if leaf_id in checkpoint_leaf_ids
+        }
+        if checkpoint_requirements:
+            require_release_evidence(
+                validated_schema11, checkpoint_requirements
+            )
+            release_covered_leaf_ids.update(checkpoint_requirements)
         summary = validate_campaign_checkpoint(plan, checkpoint)
         _validate_campaign_capability_superset(summary, descriptor, plan)
         for record in summary.records:
@@ -1430,6 +1475,12 @@ def _campaign_reduce(bundle_path: Path, output: Path) -> tuple[int, object]:
             receipts_by_id.setdefault(record.leaf_id, set()).add(
                 checkpoint_receipt
             )
+    missing_release_evidence = required_leaf_ids - release_covered_leaf_ids
+    if missing_release_evidence:
+        raise ValueError(
+            "campaign reduction release evidence is absent for selected leaves: "
+            + ", ".join(sorted(missing_release_evidence))
+        )
     components = tuple(
         component_evidence_from_mapping(item) for item in raw_components
     )
