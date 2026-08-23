@@ -1547,6 +1547,7 @@ def refresh_schema11_reports(
     basic_writer: Callable[[Path, Mapping[str, object]], None] | None = None,
     advanced_projective: Callable[[Mapping[str, object], Path], None] | None = None,
     advanced_triage: Callable[[Mapping[str, object], Path], None] | None = None,
+    persist_checkpoint: bool = True,
 ) -> dict[str, object]:
     """Atomically project schema-11 basics; contain advanced failures."""
 
@@ -1611,7 +1612,8 @@ def refresh_schema11_reports(
         }
         _atomic_json(directory / "m02-report-status.json", status)
         validated["report_status_receipt"] = status
-        _atomic_json(path, validated)
+        if persist_checkpoint:
+            _atomic_json(path, validated)
         raise
 
     def run_advanced(
@@ -1652,7 +1654,8 @@ def refresh_schema11_reports(
     }
     _atomic_json(directory / "m02-report-status.json", status)
     validated["report_status_receipt"] = status
-    _atomic_json(path, validated)
+    if persist_checkpoint:
+        _atomic_json(path, validated)
     return validate_schema11_checkpoint(validated)
 
 

@@ -41,6 +41,7 @@ _EVIDENCE_RANK = {None: 0, "SCREENED": 1, "CERTIFIED": 2, "VALIDATED": 3}
 
 
 RecordValidator = Callable[[str, Mapping[str, object]], None]
+CheckpointFinalizer = Callable[[Mapping[str, object], Path], Mapping[str, object]]
 
 
 def _sha256(value: object) -> str:
@@ -57,6 +58,12 @@ def _file_sha256(path: Path) -> str:
 
 def _is_sha256(value: object) -> bool:
     return isinstance(value, str) and _HEX_64.fullmatch(value) is not None
+
+
+def _checkpoint_scientific_sha256(checkpoint: Mapping[str, object]) -> str:
+    scientific = copy.deepcopy(dict(checkpoint))
+    scientific["report_status_receipt"] = None
+    return _sha256(scientific)
 
 
 def _reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -305,6 +312,7 @@ def recover_campaign(
     root_readout_stores: Sequence[str | os.PathLike[str] | Path] = (),
     oracle_path: str | os.PathLike[str] | Path | None = None,
     record_validator: RecordValidator | None = None,
+    checkpoint_finalizer: CheckpointFinalizer | None = None,
 ) -> RecoverySummary:
     """Recover all compatible terminal records without numerical work."""
 
@@ -524,6 +532,15 @@ def recover_campaign(
     }
     candidate_checkpoint["recovery_receipts"].append(recovery_entry)
     validate_schema11_checkpoint(candidate_checkpoint)
+    if checkpoint_finalizer is not None:
+        scientific_sha256 = _checkpoint_scientific_sha256(candidate_checkpoint)
+        candidate_checkpoint = validate_schema11_checkpoint(
+            checkpoint_finalizer(candidate_checkpoint, output)
+        )
+        if _checkpoint_scientific_sha256(candidate_checkpoint) != scientific_sha256:
+            raise ValueError(
+                "recovery checkpoint finalizer changed scientific checkpoint state"
+            )
 
     oracle_status = "NOT_SUPPLIED"
     if oracle_path is not None:

@@ -317,8 +317,15 @@ class CountAgnosticRecoveryTests(unittest.TestCase):
 
     def test_cli_recovery_builds_no_backend(self) -> None:
         from windows_solver.cli import _campaign_recover
+        from windows_solver.campaign_reports import report_directory_for_checkpoint
 
-        leaf = SimpleNamespace(leaf_id="leaf-000", role="control")
+        leaf = SimpleNamespace(
+            leaf_id="leaf-000",
+            role="control",
+            mechanism_id="exterior-light-ring",
+            leaf=SimpleNamespace(mode_label="220"),
+            job=SimpleNamespace(spin=0.9),
+        )
         plan = SimpleNamespace(campaign_id="campaign-1", leaves=(leaf,))
         selection = SimpleNamespace(
             selection_id="selection-1", leaf_ids=("leaf-000",)
@@ -346,9 +353,28 @@ class CountAgnosticRecoveryTests(unittest.TestCase):
                     root_readout_stores=(),
                     oracle_path=None,
                 )
+                candidate = root / "candidate.json"
+                reports = report_directory_for_checkpoint(candidate)
+                report_names = (
+                    "m02-leaves.csv",
+                    "m02-precision-stages.csv",
+                    "m02-error-channels.csv",
+                    "m02-resource-failures.csv",
+                )
+                self.assertTrue(
+                    all((reports / name).is_file() for name in report_names)
+                )
+                recovered = validate_recovery_checkpoint(_selection(1), candidate)
+                validate_recovery_receipt(
+                    _selection(1), candidate, root / "receipt.json"
+                )
 
         self.assertEqual(0, status)
         self.assertEqual(0, output["backend_constructions"])
+        self.assertEqual(
+            "COMPLETED",
+            recovered["report_status_receipt"]["basic"]["status"],
+        )
         backend.assert_not_called()
 
     def test_recovered_candidate_validates_from_disk(self) -> None:

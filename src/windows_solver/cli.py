@@ -56,7 +56,10 @@ from .progress_output import (
     Schema11ProgressReporter,
     schema11_dashboard_snapshot,
 )
-from .campaign_reports import report_directory_for_checkpoint
+from .campaign_reports import (
+    refresh_schema11_reports,
+    report_directory_for_checkpoint,
+)
 from .promoted_control_calibration import load_calibration_receipt
 from .response_engine import (
     BackendIdentity,
@@ -940,6 +943,13 @@ def _campaign_recover(
         ),
         record_validator=lambda leaf_id, record: validate_campaign_recovery_record(
             plan, leaf_id, record
+        ),
+        checkpoint_finalizer=lambda checkpoint, path: refresh_schema11_reports(
+            plan,
+            selection,
+            checkpoint,
+            path,
+            persist_checkpoint=False,
         ),
     )
     return 0, {"command": "campaign-recover", **summary.to_mapping()}
