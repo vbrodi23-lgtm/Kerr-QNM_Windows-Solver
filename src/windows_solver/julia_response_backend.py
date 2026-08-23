@@ -1,8 +1,8 @@
 """Authenticated Python boundary for the package-owned Julia precision worker.
 
-The worker performs only promoted 80/120-decimal-digit root readouts.  The
-existing Python response engine still owns the signed-amplitude ladder,
-component reduction, error ledger, checkpoints, resume, and admission schema.
+The worker performs reviewed promoted root and fixed-root response requests.
+The Python response engine owns scheduling, component reduction, error ledgers,
+checkpoints, resume, and admission.
 """
 
 from __future__ import annotations
@@ -36,6 +36,7 @@ from .response_engine import (
     BINARY64_FIXED_ROOT_SURVEY_IDENTITY,
     BackendIdentity,
     CANONICAL_EXTERIOR_BACKGROUND_IDENTITY,
+    DecimalComplex,
     FixedRootDiagnosticEvidence,
     FixedRootDeterminantSample,
     DiagnosticRootReadout,
@@ -2236,6 +2237,17 @@ def _survey_complex_from_mapping(value: object, label: str) -> complex:
     )
 
 
+def _survey_decimal_complex_from_mapping(
+    value: object, label: str
+) -> DecimalComplex:
+    if not isinstance(value, Mapping) or set(value) != {"real", "imaginary"}:
+        raise JuliaResponseBackendError(f"M02 {label} fields are invalid")
+    return DecimalComplex(
+        _finite_decimal_text(value["real"], f"{label} real"),
+        _finite_decimal_text(value["imaginary"], f"{label} imaginary"),
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class FixedRootSurveyConditioning:
     """Bounded, survey-only conditioning telemetry for one raw sample."""
@@ -2309,7 +2321,7 @@ class JuliaFixedRootSurveySample:
     role: str
     omega: complex
     amplitude: complex
-    determinant: complex
+    determinant: DecimalComplex
     numerical_conditioning: FixedRootSurveyConditioning
 
 
@@ -2317,9 +2329,13 @@ class JuliaFixedRootSurveySample:
 class JuliaFixedRootSurveyBatch:
     leaf_id: str
     job_id: str
+    mechanism_id: str
     root_reference_id: str
     root_seal_sha256: str
     branch_identity: str
+    fixed_root: complex
+    frequency_step: Decimal
+    coordinate_step: Decimal
     scientific_operation_identity: str
     request_sha256: str
     precision_tier: PrecisionTier
@@ -2338,6 +2354,43 @@ class JuliaFixedRootSurveyBatch:
     @property
     def sample_count(self) -> int:
         return len(self.samples)
+
+    def to_mapping(self) -> dict[str, object]:
+        return {
+            "schema": FIXED_ROOT_SURVEY_BATCH_SCHEMA,
+            "operation": self.operation,
+            "identity": self.identity,
+            "scientific_operation_identity": self.scientific_operation_identity,
+            "leaf_id": self.leaf_id,
+            "job_id": self.job_id,
+            "mechanism_id": self.mechanism_id,
+            "root_reference_id": self.root_reference_id,
+            "root_seal_sha256": self.root_seal_sha256,
+            "branch_identity": self.branch_identity,
+            "fixed_root": _survey_complex_mapping(self.fixed_root),
+            "frequency_step": str(self.frequency_step),
+            "coordinate_step": str(self.coordinate_step),
+            "request_sha256": self.request_sha256,
+            "precision_tier": self.precision_tier.value,
+            "working_precision_bits": self.working_precision_bits,
+            "sample_roles": list(self.sample_roles),
+            "sample_count": self.sample_count,
+            "maximum_sample_count": self.maximum_sample_count,
+            "julia_launch_count": self.julia_launch_count,
+            "root_read_count": self.root_read_count,
+            "samples": [
+                {
+                    "role": sample.role,
+                    "omega": _survey_complex_mapping(sample.omega),
+                    "amplitude": _survey_complex_mapping(sample.amplitude),
+                    "determinant": sample.determinant.to_mapping(),
+                    "numerical_conditioning": (
+                        sample.numerical_conditioning.to_mapping()
+                    ),
+                }
+                for sample in self.samples
+            ],
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -3469,7 +3522,7 @@ class JuliaPrecisionRootBackend:
                 raise JuliaResponseBackendError(
                     "M02 fixed-root survey sample coordinates moved"
                 )
-            determinant = _survey_complex_from_mapping(
+            determinant = _survey_decimal_complex_from_mapping(
                 raw["determinant"], "survey determinant"
             )
             try:
@@ -3500,9 +3553,17 @@ class JuliaPrecisionRootBackend:
         return JuliaFixedRootSurveyBatch(
             leaf_id=job.leaf_id,
             job_id=job.job_id,
+            mechanism_id=job.mechanism_id,
             root_reference_id=job.root.root_reference_id,
             root_seal_sha256=root_seal_sha256,
             branch_identity=branch_identity,
+            fixed_root=complex(fixed_root),
+            frequency_step=_finite_decimal_text(
+                request["frequency_step"], "survey frequency step", nonnegative=True
+            ),
+            coordinate_step=_finite_decimal_text(
+                request["coordinate_step"], "survey coordinate step", nonnegative=True
+            ),
             scientific_operation_identity=scientific_operation_identity,
             request_sha256=evaluation.request_sha256,
             precision_tier=precision_tier(str(request["semantic_precision_tier"])),

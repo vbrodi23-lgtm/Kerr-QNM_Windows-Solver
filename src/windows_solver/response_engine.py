@@ -8,7 +8,7 @@ one typed boundary; importing this module cannot start a numerical solve.
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from decimal import Decimal, InvalidOperation, localcontext
+from decimal import Decimal, InvalidOperation, ROUND_FLOOR, localcontext
 from enum import Enum
 from fractions import Fraction
 from functools import lru_cache
@@ -2506,6 +2506,168 @@ def screen_binary64_fixed_root_batch(
         frequency_derivative_disk=frequency,
         coordinate_derivative_disk=coordinate,
         root_correction_upper_bound=root_correction,
+        reason_code=None,
+    )
+
+
+def screen_promoted_fixed_root_samples(
+    samples: Sequence[object],
+    *,
+    frequency_step: Decimal,
+    coordinate_step: Decimal,
+) -> Binary64FixedRootScreening:
+    """Screen one BF40/BF80 raw batch while preserving its decimal text."""
+
+    sample_tuple = tuple(samples)
+    if tuple(getattr(sample, "role", None) for sample in sample_tuple) != (
+        BINARY64_FIXED_ROOT_SAMPLE_ROLES
+    ):
+        raise ValueError("promoted fixed-root sample plan is invalid")
+    if (
+        type(frequency_step) is not Decimal
+        or type(coordinate_step) is not Decimal
+        or not frequency_step.is_finite()
+        or not coordinate_step.is_finite()
+        or frequency_step <= 0
+        or coordinate_step <= 0
+    ):
+        raise ValueError("promoted fixed-root steps are invalid")
+
+    values: dict[str, DecimalComplex] = {}
+    errors: dict[str, Decimal] = {}
+    maximum_digits = 80
+    for sample in sample_tuple:
+        determinant = getattr(sample, "determinant", None)
+        conditioning = getattr(sample, "numerical_conditioning", None)
+        mapping = getattr(conditioning, "mapping", None)
+        if not isinstance(determinant, DecimalComplex) or not isinstance(
+            mapping, Mapping
+        ):
+            raise ValueError("promoted fixed-root sample evidence is invalid")
+        predicted = _conditioning_decimal_from_text(
+            mapping.get("predicted_reliable_digits"),
+            "promoted survey predicted reliable digits",
+        )
+        if predicted <= 0:
+            raise ValueError("promoted survey has no reliable digits")
+        reliable_digits = int(
+            predicted.to_integral_value(rounding=ROUND_FLOOR)
+        )
+        maximum_digits = max(maximum_digits, reliable_digits + 32)
+        values[sample.role] = determinant
+        with localcontext() as context:
+            context.prec = maximum_digits
+            scale = max(Decimal(1), determinant.magnitude())
+            errors[sample.role] = scale * (Decimal(10) ** (-reliable_digits))
+
+    def subtract(left: DecimalComplex, right: DecimalComplex) -> DecimalComplex:
+        return DecimalComplex(
+            left.real - right.real,
+            left.imaginary - right.imaginary,
+        )
+
+    def divide(value: DecimalComplex, denominator: Decimal) -> DecimalComplex:
+        return DecimalComplex(
+            value.real / denominator,
+            value.imaginary / denominator,
+        )
+
+    def stencil(
+        plus_role: str,
+        minus_role: str,
+        plus_half_role: str,
+        minus_half_role: str,
+        step: Decimal,
+    ) -> tuple[DecimalComplex, Decimal]:
+        coarse = divide(
+            subtract(values[plus_role], values[minus_role]),
+            Decimal(2) * step,
+        )
+        fine = divide(
+            subtract(values[plus_half_role], values[minus_half_role]),
+            step,
+        )
+        coarse_error = (
+            errors[plus_role] + errors[minus_role]
+        ) / (Decimal(2) * step)
+        fine_error = (
+            errors[plus_half_role] + errors[minus_half_role]
+        ) / step
+        radius = subtract(fine, coarse).magnitude() + coarse_error + fine_error
+        if not radius.is_finite() or radius <= 0:
+            raise ValueError("promoted derivative disk is not bounded")
+        return fine, radius
+
+    with localcontext() as context:
+        context.prec = maximum_digits
+        frequency_centre, frequency_radius = stencil(
+            "DOMEGA_REAL_PLUS_H",
+            "DOMEGA_REAL_MINUS_H",
+            "DOMEGA_REAL_PLUS_HALF_H",
+            "DOMEGA_REAL_MINUS_HALF_H",
+            frequency_step,
+        )
+        coordinate_centre, coordinate_radius = stencil(
+            "DC_PLUS_EPSILON",
+            "DC_MINUS_EPSILON",
+            "DC_PLUS_HALF_EPSILON",
+            "DC_MINUS_HALF_EPSILON",
+            coordinate_step,
+        )
+        frequency_lower = frequency_centre.magnitude() - frequency_radius
+        frequency_disk = _bounded_binary64_disk_from_decimal(
+            frequency_centre,
+            frequency_radius,
+            subject="promoted frequency derivative",
+        )
+        coordinate_disk = _bounded_binary64_disk_from_decimal(
+            coordinate_centre,
+            coordinate_radius,
+            subject="promoted coordinate derivative",
+        )
+        if frequency_lower <= 0:
+            return Binary64FixedRootScreening(
+                disposition=Binary64SurveyDisposition.PROMOTION_PENDING_RESPONSE,
+                response_disk=None,
+                frequency_derivative_disk=frequency_disk,
+                coordinate_derivative_disk=coordinate_disk,
+                root_correction_upper_bound=None,
+                reason_code="FINITE_DIFFERENCE_NOISE_LIMIT",
+            )
+        residual_upper = values["D0"].magnitude() + errors["D0"]
+        correction = residual_upper / frequency_lower
+        correction_float = float(correction)
+        if Decimal.from_float(correction_float) < correction:
+            correction_float = math.nextafter(correction_float, math.inf)
+        if not math.isfinite(correction_float) or correction > Decimal("2e-11"):
+            return Binary64FixedRootScreening(
+                disposition=Binary64SurveyDisposition.PROMOTION_PENDING_RESPONSE,
+                response_disk=None,
+                frequency_derivative_disk=frequency_disk,
+                coordinate_derivative_disk=coordinate_disk,
+                root_correction_upper_bound=correction_float,
+                reason_code="DETERMINANT_UNCERTAINTY_TOO_LARGE",
+            )
+    try:
+        response = exterior_response_disk(
+            coordinate_derivative=coordinate_disk,
+            frequency_derivative=frequency_disk,
+        )
+    except ZeroContainingDiskError:
+        return Binary64FixedRootScreening(
+            disposition=Binary64SurveyDisposition.PROMOTION_PENDING_RESPONSE,
+            response_disk=None,
+            frequency_derivative_disk=frequency_disk,
+            coordinate_derivative_disk=coordinate_disk,
+            root_correction_upper_bound=correction_float,
+            reason_code="FINITE_DIFFERENCE_NOISE_LIMIT",
+        )
+    return Binary64FixedRootScreening(
+        disposition=Binary64SurveyDisposition.PRODUCED,
+        response_disk=response,
+        frequency_derivative_disk=frequency_disk,
+        coordinate_derivative_disk=coordinate_disk,
+        root_correction_upper_bound=correction_float,
         reason_code=None,
     )
 

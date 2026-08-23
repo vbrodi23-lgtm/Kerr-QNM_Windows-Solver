@@ -58,6 +58,7 @@ class PromotionQueueDisposition(str, Enum):
     COMPLETED = "COMPLETED"
     UNRESOLVED = "UNRESOLVED"
     DEFERRED = "DEFERRED"
+    REJECTED = "REJECTED"
     SUPERSEDED_BY_CACHE = "SUPERSEDED_BY_CACHE"
 
 

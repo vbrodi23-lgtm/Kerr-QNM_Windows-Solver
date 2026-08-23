@@ -12,18 +12,26 @@ from typing import Callable, Mapping
 
 from .campaign_policy import (
     EvidenceLevel,
+    PromotionQueueDisposition,
     PromotionQueueKind,
     SurveyDisposition,
     SurveyPass,
     add_numerical_record,
     append_promotion,
     empty_schema11_checkpoint,
+    finish_promotion,
     record_evidence,
     record_survey_disposition,
     validate_schema11_checkpoint,
 )
 from .campaign_recovery import RecoverySelection
-from .campaign_failures import PROMOTION_ALLOWLIST, abort_unexpected_system_failure
+from .campaign_failures import (
+    FailureDisposition,
+    FailureReport,
+    PROMOTION_ALLOWLIST,
+    abort_unexpected_system_failure,
+    classify_failure,
+)
 from .contracts import canonical_json_bytes
 from .solved_leaf_cache import (
     SolvedLeafLookupStatus,
@@ -31,6 +39,7 @@ from .solved_leaf_cache import (
 )
 from .response_engine import _EXTERIOR_PROFILE_IDS, _exterior_support
 from .response_engine import (
+    BINARY64_FIXED_ROOT_SAMPLE_ROLES,
     BINARY64_FIXED_ROOT_SURVEY_IDENTITY,
     BackgroundEquivalenceReceipt,
     Binary64FixedRootBatch,
@@ -41,6 +50,14 @@ from .response_engine import (
     canonical_background_from_binary64_batch,
     screen_binary64_fixed_root_batch,
     screen_binary64_reused_background_batch,
+    screen_promoted_fixed_root_samples,
+)
+from .julia_response_backend import (
+    JuliaFixedRootSurveyBatch,
+    JuliaNumericalControlError,
+    JuliaODEResourceLimitError,
+    JuliaResponseBackendError,
+    JuliaRootReadoutResourceLimitError,
 )
 
 
@@ -134,6 +151,53 @@ class Binary64SurveyRun:
     completed_count: int
     queued_count: int
     cache_reused_count: int
+    skipped_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class PromotedRootSolveResult:
+    seal: AuthenticatedRootSeal
+    precision_tier: str
+    root_read_count: int = 1
+    worker_launch_count: int = 1
+    diagnostic_root_read_count: int = 0
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.seal, AuthenticatedRootSeal):
+            raise ValueError("promoted root result lacks an authenticated seal")
+        if self.precision_tier not in {"BF40", "BF80"}:
+            raise ValueError("promoted root result precision tier is invalid")
+        if (
+            self.root_read_count != 1
+            or self.worker_launch_count != 1
+            or self.diagnostic_root_read_count != 0
+        ):
+            raise ValueError("promoted root result violates the PRIMARY-only budget")
+
+
+@dataclass(frozen=True, slots=True)
+class PromotedPassOutcome:
+    disposition: SurveyDisposition
+    reason_code: str
+    precision_tiers: tuple[str, ...]
+    record: Mapping[str, object] | None = None
+    stage_sha256: str | None = None
+    sample_count: int = 0
+    sample_limit: int = 18
+    root_read_count: int = 0
+    root_read_limit: int = 2
+    worker_launch_count: int = 0
+    worker_launch_limit: int = 3
+    evidence_receipts: tuple[Mapping[str, object], ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class PromotedSurveyRun:
+    checkpoint: dict[str, object]
+    completed_count: int
+    unresolved_count: int
+    deferred_count: int
+    rejected_count: int
     skipped_count: int
 
 
@@ -495,6 +559,461 @@ def run_binary64_survey(
     )
 
 
+def _screening_receipt(screening: object) -> dict[str, object]:
+    def disk(value: object) -> object:
+        if value is None:
+            return None
+        return {
+            "centre": {
+                "real": value.centre.real,
+                "imaginary": value.centre.imag,
+            },
+            "radius": value.radius,
+        }
+
+    return {
+        "schema": "windows-solver.promoted-fixed-root-screening/1",
+        "disposition": screening.disposition.value,
+        "reason_code": screening.reason_code,
+        "response_disk": disk(screening.response_disk),
+        "frequency_derivative_disk": disk(
+            screening.frequency_derivative_disk
+        ),
+        "coordinate_derivative_disk": disk(
+            screening.coordinate_derivative_disk
+        ),
+        "root_correction_upper_bound": screening.root_correction_upper_bound,
+        "determinant_certificate_status": screening.determinant_certificate_status,
+    }
+
+
+def _promoted_control_decision(
+    error: Exception,
+    *,
+    leaf: object,
+    digits: int,
+) -> object | None:
+    if isinstance(error, JuliaNumericalControlError):
+        code = error.failure_code
+    elif isinstance(error, JuliaODEResourceLimitError):
+        code = "ODE_RESOURCE_LIMIT"
+    elif isinstance(error, JuliaRootReadoutResourceLimitError):
+        code = "ROOT_READOUT_RESOURCE_INFEASIBLE"
+    else:
+        return None
+    worker = getattr(error, "worker_failure", {})
+    structured = worker.get("failure", {}) if isinstance(worker, Mapping) else {}
+    stage = (
+        structured.get("stage", "fixed-root-response")
+        if isinstance(structured, Mapping)
+        else "fixed-root-response"
+    )
+    report = FailureReport(
+        failure_code=code,
+        failure_class="NUMERICAL_CONTROL",
+        stage=str(stage),
+        worker_operation="fixed-root-survey-batch",
+        request_schema="windows-solver.fixed-root-survey-batch/1",
+        backend_identity=str(leaf.job.backend_identity.identity_sha256),
+        policy_identity=str(leaf.job.policy.identity_sha256),
+        precision_tier=f"BF{digits}",
+        cause_type=type(error).__name__,
+        diagnostics={
+            "schema": "windows-solver.promoted-control-failure/1",
+            "complete": True,
+            "worker_failure": dict(worker) if isinstance(worker, Mapping) else {},
+        },
+    )
+    return classify_failure(report)
+
+
+def _terminal_promoted_outcome(
+    decision: object,
+    *,
+    tiers: tuple[str, ...],
+    sample_count: int,
+    root_read_count: int,
+    worker_launch_count: int,
+) -> PromotedPassOutcome:
+    dispositions = {
+        FailureDisposition.UNRESOLVED: SurveyDisposition.UNRESOLVED,
+        FailureDisposition.DEFERRED: SurveyDisposition.DEFERRED,
+        FailureDisposition.REJECTED: SurveyDisposition.REJECTED,
+    }
+    disposition = dispositions.get(decision.disposition)
+    if disposition is None:
+        raise JuliaResponseBackendError(
+            f"promoted survey cannot contain {decision.failure_code}"
+        )
+    return PromotedPassOutcome(
+        disposition=disposition,
+        reason_code=decision.failure_code,
+        precision_tiers=tiers,
+        sample_count=sample_count,
+        root_read_count=root_read_count,
+        worker_launch_count=worker_launch_count,
+    )
+
+
+def _run_promoted_exterior_queue_entry(
+    leaf: object,
+    entry: Mapping[str, object],
+    *,
+    root_seal_lookup: Callable[
+        [object, Mapping[str, object]], AuthenticatedRootSeal | None
+    ],
+    backend_factory: Callable[[object, int], object],
+    primary_root_runner: Callable[
+        [object, object, int], PromotedRootSolveResult
+    ],
+    produced_record_builder: Callable[
+        [object, JuliaFixedRootSurveyBatch, object, int],
+        tuple[Mapping[str, object], str],
+    ],
+) -> PromotedPassOutcome:
+    queue_kind = PromotionQueueKind(entry["queue_kind"])
+    seal: AuthenticatedRootSeal | None = None
+    if queue_kind is PromotionQueueKind.RESPONSE:
+        seal = root_seal_lookup(leaf, entry)
+        if not isinstance(seal, AuthenticatedRootSeal):
+            raise ValueError("promoted response queue lacks its authenticated root seal")
+        if seal.root_seal_sha256 != entry["source_root_seal_sha256"]:
+            raise ValueError("promoted response root seal digest mismatch")
+        if seal.branch_identity != leaf.job.root.branch_id:
+            raise ValueError("promoted response root seal branch mismatch")
+
+    tiers: list[str] = []
+    receipts: list[Mapping[str, object]] = []
+    sample_count = root_reads = worker_launches = 0
+    for digits in (40, 80):
+        tier = f"BF{digits}"
+        tiers.append(tier)
+        backend = backend_factory(leaf, digits)
+        if seal is None:
+            root_reads += 1
+            worker_launches += 1
+            try:
+                root_result = primary_root_runner(leaf, backend, digits)
+            except KeyboardInterrupt:
+                raise
+            except Exception as error:
+                decision = _promoted_control_decision(
+                    error, leaf=leaf, digits=digits
+                )
+                if decision is None or decision.disposition is FailureDisposition.SYSTEM_FAILURE:
+                    raise
+                if (
+                    digits == 40
+                    and decision.disposition is FailureDisposition.PROMOTION_PENDING
+                    and decision.failure_code in PROMOTION_ALLOWLIST
+                ):
+                    continue
+                if decision.disposition is FailureDisposition.PROMOTION_PENDING:
+                    return PromotedPassOutcome(
+                        disposition=SurveyDisposition.UNRESOLVED,
+                        reason_code=decision.failure_code,
+                        precision_tiers=tuple(tiers),
+                        sample_count=sample_count,
+                        root_read_count=root_reads,
+                        worker_launch_count=worker_launches,
+                    )
+                return _terminal_promoted_outcome(
+                    decision,
+                    tiers=tuple(tiers),
+                    sample_count=sample_count,
+                    root_read_count=root_reads,
+                    worker_launch_count=worker_launches,
+                )
+            if not isinstance(root_result, PromotedRootSolveResult):
+                raise ValueError("promoted PRIMARY runner returned an invalid result")
+            if root_result.precision_tier != tier:
+                raise ValueError("promoted PRIMARY result tier mismatch")
+            seal = root_result.seal
+            if seal.branch_identity != leaf.job.root.branch_id:
+                raise ValueError("promoted PRIMARY root seal branch mismatch")
+
+        worker_launches += 1
+        try:
+            batch = backend.fixed_root_survey_batch(
+                leaf.job,
+                fixed_root=seal.fixed_root,
+                root_seal_sha256=seal.root_seal_sha256,
+                branch_identity=seal.branch_identity,
+                sample_roles=tuple(BINARY64_FIXED_ROOT_SAMPLE_ROLES),
+            )
+        except KeyboardInterrupt:
+            raise
+        except Exception as error:
+            decision = _promoted_control_decision(
+                error, leaf=leaf, digits=digits
+            )
+            if decision is None or decision.disposition is FailureDisposition.SYSTEM_FAILURE:
+                raise
+            if (
+                digits == 40
+                and decision.disposition is FailureDisposition.PROMOTION_PENDING
+                and decision.failure_code in PROMOTION_ALLOWLIST
+            ):
+                continue
+            if decision.disposition is FailureDisposition.PROMOTION_PENDING:
+                return PromotedPassOutcome(
+                    disposition=SurveyDisposition.UNRESOLVED,
+                    reason_code=decision.failure_code,
+                    precision_tiers=tuple(tiers),
+                    sample_count=sample_count,
+                    root_read_count=root_reads,
+                    worker_launch_count=worker_launches,
+                )
+            return _terminal_promoted_outcome(
+                decision,
+                tiers=tuple(tiers),
+                sample_count=sample_count,
+                root_read_count=root_reads,
+                worker_launch_count=worker_launches,
+            )
+        if not isinstance(batch, JuliaFixedRootSurveyBatch):
+            raise ValueError("promoted backend returned an invalid survey batch")
+        if (
+            batch.precision_tier.value != f"bigfloat-{digits}"
+            or batch.root_seal_sha256 != seal.root_seal_sha256
+            or batch.root_read_count != 0
+            or batch.julia_launch_count != 1
+        ):
+            raise ValueError("promoted fixed-root survey batch budget mismatch")
+        sample_count += batch.sample_count
+        screening = screen_promoted_fixed_root_samples(
+            batch.samples,
+            frequency_step=batch.frequency_step,
+            coordinate_step=batch.coordinate_step,
+        )
+        receipts.append({
+            "schema": "windows-solver.promoted-fixed-root-batch-receipt/1",
+            "batch": batch.to_mapping(),
+            "screening": _screening_receipt(screening),
+        })
+        if screening.disposition is Binary64SurveyDisposition.PRODUCED:
+            built = produced_record_builder(leaf, batch, screening, digits)
+            if not isinstance(built, tuple) or len(built) != 2:
+                raise ValueError("promoted record builder returned invalid data")
+            record, stage_sha256 = built
+            return PromotedPassOutcome(
+                disposition=SurveyDisposition.COMPLETED,
+                reason_code="BOUNDED_PROMOTED_FIXED_ROOT_RESPONSE",
+                precision_tiers=tuple(tiers),
+                record=record,
+                stage_sha256=stage_sha256,
+                sample_count=sample_count,
+                root_read_count=root_reads,
+                worker_launch_count=worker_launches,
+                evidence_receipts=tuple(receipts),
+            )
+        reason = str(screening.reason_code)
+        if reason not in PROMOTION_ALLOWLIST:
+            raise ValueError(
+                f"promoted screening returned an unknown reason: {reason}"
+            )
+        if digits == 40:
+            continue
+        return PromotedPassOutcome(
+            disposition=SurveyDisposition.UNRESOLVED,
+            reason_code=reason,
+            precision_tiers=tuple(tiers),
+            sample_count=sample_count,
+            root_read_count=root_reads,
+            worker_launch_count=worker_launches,
+            evidence_receipts=tuple(receipts),
+        )
+    raise AssertionError("promoted survey precision ladder did not terminate")
+
+
+def _commit_promoted_outcome(
+    checkpoint: Mapping[str, object],
+    *,
+    leaf_id: str,
+    queue_ordinal: int,
+    queue_kind: PromotionQueueKind,
+    outcome: PromotedPassOutcome,
+) -> dict[str, object]:
+    result = validate_schema11_checkpoint(checkpoint)
+    record_sha256 = None
+    if outcome.disposition is SurveyDisposition.COMPLETED:
+        if outcome.record is None or outcome.stage_sha256 is None:
+            raise ValueError("completed promoted outcome lacks its record")
+        result = add_numerical_record(result, outcome.record)
+        record_sha256 = str(outcome.record["record_sha256"])
+        result = record_evidence(
+            result,
+            leaf_id=leaf_id,
+            central_record_sha256=record_sha256,
+            central_stage_sha256=outcome.stage_sha256,
+            evidence_level=EvidenceLevel.SCREENED,
+            receipts=outcome.evidence_receipts,
+        )
+    queue_dispositions = {
+        SurveyDisposition.COMPLETED: PromotionQueueDisposition.COMPLETED,
+        SurveyDisposition.UNRESOLVED: PromotionQueueDisposition.UNRESOLVED,
+        SurveyDisposition.DEFERRED: PromotionQueueDisposition.DEFERRED,
+        SurveyDisposition.REJECTED: PromotionQueueDisposition.REJECTED,
+    }
+    queue_disposition = queue_dispositions.get(outcome.disposition)
+    if queue_disposition is None:
+        raise ValueError("promoted outcome is not terminal")
+    result = finish_promotion(
+        result,
+        queue_ordinal=queue_ordinal,
+        disposition=queue_disposition,
+        disposition_receipt={
+            "schema": "windows-solver.promoted-queue-disposition/1",
+            "leaf_id": leaf_id,
+            "queue_ordinal": queue_ordinal,
+            "disposition": outcome.disposition.value,
+            "reason_code": outcome.reason_code,
+            "precision_tiers": list(outcome.precision_tiers),
+            "result_record_sha256": record_sha256,
+        },
+    )
+    result = record_survey_disposition(
+        result,
+        survey_pass=SurveyPass.PROMOTED,
+        leaf_id=leaf_id,
+        disposition=outcome.disposition,
+        source_record_sha256=None,
+        result_record_sha256=record_sha256,
+        operation_identity=BINARY64_FIXED_ROOT_SURVEY_IDENTITY,
+        precision_tiers=outcome.precision_tiers,
+        reason_code=outcome.reason_code,
+        sample_count=outcome.sample_count,
+        sample_limit=outcome.sample_limit,
+        root_read_count=outcome.root_read_count,
+        root_read_limit=(
+            0
+            if queue_kind is PromotionQueueKind.RESPONSE
+            else outcome.root_read_limit
+        ),
+        worker_launch_count=outcome.worker_launch_count,
+        worker_launch_limit=(
+            2
+            if queue_kind is PromotionQueueKind.RESPONSE
+            else outcome.worker_launch_limit
+        ),
+        tier_timing=(),
+        session_fragments=(),
+    )
+    return result
+
+
+def run_promoted_survey(
+    plan: object,
+    selection: RecoverySelection,
+    checkpoint: Mapping[str, object],
+    *,
+    checkpoint_path: str | os.PathLike[str] | Path,
+    root_seal_lookup: Callable[
+        [object, Mapping[str, object]], AuthenticatedRootSeal | None
+    ],
+    backend_factory: Callable[[object, int], object],
+    primary_root_runner: Callable[
+        [object, object, int], PromotedRootSolveResult
+    ],
+    horizon_runner: Callable[[object], PromotedPassOutcome],
+    produced_record_builder: Callable[
+        [object, JuliaFixedRootSurveyBatch, object, int],
+        tuple[Mapping[str, object], str],
+    ],
+) -> PromotedSurveyRun:
+    """Consume only pending promotion entries through BF40/BF80 survey work."""
+
+    result = validate_schema11_checkpoint(checkpoint)
+    if (
+        result["campaign_id"] != selection.campaign_id
+        or result["selection_id"] != selection.selection_id
+    ):
+        raise ValueError("promoted survey checkpoint identity mismatch")
+    preflight_campaign_supports(plan, selection.ordered_leaf_ids)
+    leaves = {leaf.leaf_id: leaf for leaf in getattr(plan, "leaves")}
+    path = Path(checkpoint_path)
+    completed = unresolved = deferred = rejected = skipped = 0
+    entries = tuple(result["promotion_queue"]["entries"])
+    for snapshot in entries:
+        ordinal = int(snapshot["queue_ordinal"])
+        if snapshot["disposition"] != PromotionQueueDisposition.PENDING.value:
+            skipped += 1
+            continue
+        leaf_id = str(snapshot["leaf_id"])
+        if leaf_id not in selection.scientific_identities or leaf_id not in leaves:
+            raise ValueError("promoted queue leaf is outside the selection")
+        if (
+            snapshot["scientific_computation_identity"]
+            != selection.scientific_identities[leaf_id]
+        ):
+            raise ValueError("promoted queue scientific identity mismatch")
+        if leaf_id in result["survey_pass_ledger"]["promoted"]:
+            raise ValueError("pending promotion already has a pass disposition")
+        leaf = leaves[leaf_id]
+        committed_before_leaf = result
+
+        def guarded(action: Callable[[], object]) -> object:
+            try:
+                return action()
+            except KeyboardInterrupt:
+                raise
+            except Exception as error:
+                abort_unexpected_system_failure(
+                    committed_before_leaf,
+                    leaf_id=leaf_id,
+                    error=error,
+                    persist_checkpoint=lambda value: _atomic_json(path, value),
+                )
+                raise AssertionError("system failure abort returned unexpectedly")
+
+        if leaf.mechanism_id == "horizon-admittance":
+            outcome = guarded(lambda: horizon_runner(leaf))
+            if not isinstance(outcome, PromotedPassOutcome):
+                guarded(lambda: (_ for _ in ()).throw(
+                    ValueError("promoted horizon runner returned invalid data")
+                ))
+            assert isinstance(outcome, PromotedPassOutcome)
+            if outcome.precision_tiers != ("BF80",):
+                guarded(lambda: (_ for _ in ()).throw(
+                    ValueError("promoted horizon survey must use BF80 only")
+                ))
+        else:
+            outcome = guarded(lambda: _run_promoted_exterior_queue_entry(
+                leaf,
+                snapshot,
+                root_seal_lookup=root_seal_lookup,
+                backend_factory=backend_factory,
+                primary_root_runner=primary_root_runner,
+                produced_record_builder=produced_record_builder,
+            ))
+        assert isinstance(outcome, PromotedPassOutcome)
+        result = guarded(lambda: _commit_promoted_outcome(
+            result,
+            leaf_id=leaf_id,
+            queue_ordinal=ordinal,
+            queue_kind=PromotionQueueKind(snapshot["queue_kind"]),
+            outcome=outcome,
+        ))
+        assert isinstance(result, dict)
+        if outcome.disposition is SurveyDisposition.COMPLETED:
+            completed += 1
+        elif outcome.disposition is SurveyDisposition.UNRESOLVED:
+            unresolved += 1
+        elif outcome.disposition is SurveyDisposition.DEFERRED:
+            deferred += 1
+        elif outcome.disposition is SurveyDisposition.REJECTED:
+            rejected += 1
+        _atomic_json(path, result)
+    return PromotedSurveyRun(
+        checkpoint=validate_schema11_checkpoint(result),
+        completed_count=completed,
+        unresolved_count=unresolved,
+        deferred_count=deferred,
+        rejected_count=rejected,
+        skipped_count=skipped,
+    )
+
+
 def preflight_campaign_supports(
     plan: object, selected_leaf_ids: tuple[str, ...]
 ) -> None:
@@ -645,7 +1164,11 @@ __all__ = [
     "Binary64PassOutcome",
     "Binary64SurveyRun",
     "CacheFirstOutcome",
+    "PromotedPassOutcome",
+    "PromotedRootSolveResult",
+    "PromotedSurveyRun",
     "dispatch_cache_first",
     "preflight_campaign_supports",
     "run_binary64_survey",
+    "run_promoted_survey",
 ]
