@@ -148,6 +148,11 @@ finally {
 }
 
 $ProductionDirectory = Split-Path -Parent $ProductionPath
+$CutoverReceiptPath = "$RecoveryReceiptPath.cutover.json"
+if (Test-Path -LiteralPath $CutoverReceiptPath) {
+    throw "Cutover receipt already exists: $CutoverReceiptPath"
+}
+$CutoverReceiptDirectory = Split-Path -Parent $CutoverReceiptPath
 $Timestamp = [DateTime]::UtcNow.ToString("yyyyMMdd-HHmmss-fffffff")
 $BackupPath = Join-Path $ProductionDirectory (
     "m02-campaign-checkpoint.pre-pr65-recovery.{0}.json" -f $Timestamp
@@ -166,9 +171,43 @@ if ($OriginalLength -ne $BackupLength -or $OriginalHash -ne $BackupHash) {
 }
 
 $CandidateHash = (Get-FileHash -LiteralPath $CandidatePath -Algorithm SHA256).Hash.ToLowerInvariant()
+$RecoveryReceiptHash = (
+    Get-FileHash -LiteralPath $RecoveryReceiptPath -Algorithm SHA256
+).Hash.ToLowerInvariant()
+$CutoverReceiptContent = [ordered]@{
+    schema = "windows-solver.campaign-recovery-cutover/v1"
+    selection_path = $SelectionPath
+    old_production_sha256 = $OriginalHash
+    backup_path = $BackupPath
+    backup_sha256 = $BackupHash
+    candidate_path = $CandidatePath
+    candidate_sha256 = $CandidateHash
+    recovery_receipt_path = $RecoveryReceiptPath
+    recovery_receipt_sha256 = $RecoveryReceiptHash
+    production_path = $ProductionPath
+    installed_sha256 = $CandidateHash
+    atomic_replace = $true
+    rollback_on_receipt_failure = $true
+}
+$CutoverReceiptContentJson = $CutoverReceiptContent | ConvertTo-Json -Depth 8 -Compress
+$ReceiptDigestBytes = [Text.Encoding]::UTF8.GetBytes($CutoverReceiptContentJson)
+$ReceiptDigest = [Convert]::ToHexString(
+    [Security.Cryptography.SHA256]::HashData($ReceiptDigestBytes)
+).ToLowerInvariant()
+$CutoverReceipt = [ordered]@{}
+foreach ($Item in $CutoverReceiptContent.GetEnumerator()) {
+    $CutoverReceipt[$Item.Key] = $Item.Value
+}
+$CutoverReceipt.receipt_sha256 = $ReceiptDigest
+$CutoverJson = $CutoverReceipt | ConvertTo-Json -Depth 8 -Compress
+
 $StagePath = Join-Path $ProductionDirectory (
-    ".m02-pr65-cutover-{0}.tmp" -f ([Guid]::NewGuid().ToString("N"))
+    ".m02-pr66-cutover-{0}.tmp" -f ([Guid]::NewGuid().ToString("N"))
 )
+$ReceiptStagePath = Join-Path $CutoverReceiptDirectory (
+    ".m02-pr66-cutover-receipt-{0}.tmp" -f ([Guid]::NewGuid().ToString("N"))
+)
+$ProductionReplaced = $false
 try {
     [IO.File]::Copy($CandidatePath, $StagePath, $false)
     $StageStream = [IO.File]::Open(
@@ -183,42 +222,136 @@ try {
     finally {
         $StageStream.Dispose()
     }
+    $StageHash = (
+        Get-FileHash -LiteralPath $StagePath -Algorithm SHA256
+    ).Hash.ToLowerInvariant()
+    if ($StageHash -ne $CandidateHash) {
+        throw "The durable cutover stage does not match the validated candidate."
+    }
+
+    [IO.File]::WriteAllText(
+        $ReceiptStagePath,
+        $CutoverJson + "`n",
+        [Text.UTF8Encoding]::new($false)
+    )
+    $ReceiptStageStream = [IO.File]::Open(
+        $ReceiptStagePath,
+        [IO.FileMode]::Open,
+        [IO.FileAccess]::ReadWrite,
+        [IO.FileShare]::None
+    )
+    try {
+        $ReceiptStageStream.Flush($true)
+    }
+    finally {
+        $ReceiptStageStream.Dispose()
+    }
+    $ExpectedReceiptFileHash = (
+        Get-FileHash -LiteralPath $ReceiptStagePath -Algorithm SHA256
+    ).Hash.ToLowerInvariant()
+
     [IO.File]::Replace($StagePath, $ProductionPath, $null)
+    $ProductionReplaced = $true
+    $InstalledHash = (
+        Get-FileHash -LiteralPath $ProductionPath -Algorithm SHA256
+    ).Hash.ToLowerInvariant()
+    if ($InstalledHash -ne $CandidateHash) {
+        throw "The installed production checkpoint does not match the validated candidate."
+    }
+
+    try {
+        [IO.File]::Move($ReceiptStagePath, $CutoverReceiptPath)
+        $InstalledReceiptHash = (
+            Get-FileHash -LiteralPath $CutoverReceiptPath -Algorithm SHA256
+        ).Hash.ToLowerInvariant()
+        if ($InstalledReceiptHash -ne $ExpectedReceiptFileHash) {
+            throw "The installed cutover receipt failed durable verification."
+        }
+    }
+    catch {
+        $ReceiptFailure = $_
+        if (Test-Path -LiteralPath $CutoverReceiptPath) {
+            Remove-Item -LiteralPath $CutoverReceiptPath -Force
+        }
+        $RollbackStagePath = Join-Path $ProductionDirectory (
+            ".m02-pr66-rollback-{0}.tmp" -f ([Guid]::NewGuid().ToString("N"))
+        )
+        try {
+            [IO.File]::Copy($BackupPath, $RollbackStagePath, $false)
+            $RollbackStream = [IO.File]::Open(
+                $RollbackStagePath,
+                [IO.FileMode]::Open,
+                [IO.FileAccess]::ReadWrite,
+                [IO.FileShare]::None
+            )
+            try {
+                $RollbackStream.Flush($true)
+            }
+            finally {
+                $RollbackStream.Dispose()
+            }
+            [IO.File]::Replace($RollbackStagePath, $ProductionPath, $null)
+        }
+        finally {
+            if (Test-Path -LiteralPath $RollbackStagePath) {
+                Remove-Item -LiteralPath $RollbackStagePath -Force
+            }
+        }
+        $RestoredHash = (
+            Get-FileHash -LiteralPath $ProductionPath -Algorithm SHA256
+        ).Hash.ToLowerInvariant()
+        if ($RestoredHash -ne $OriginalHash) {
+            throw "CUTOVER_ROLLBACK_FAILED: production changed, receipt installation failed, and backup restoration did not verify. Original receipt failure: $ReceiptFailure"
+        }
+        $ProductionReplaced = $false
+        throw "CUTOVER_RECEIPT_INSTALLATION_FAILED: verified production backup was restored. Original receipt failure: $ReceiptFailure"
+    }
+}
+catch {
+    $CutoverFailure = $_
+    if ($ProductionReplaced) {
+        $RollbackStagePath = Join-Path $ProductionDirectory (
+            ".m02-pr66-rollback-{0}.tmp" -f ([Guid]::NewGuid().ToString("N"))
+        )
+        try {
+            [IO.File]::Copy($BackupPath, $RollbackStagePath, $false)
+            $RollbackStream = [IO.File]::Open(
+                $RollbackStagePath,
+                [IO.FileMode]::Open,
+                [IO.FileAccess]::ReadWrite,
+                [IO.FileShare]::None
+            )
+            try {
+                $RollbackStream.Flush($true)
+            }
+            finally {
+                $RollbackStream.Dispose()
+            }
+            [IO.File]::Replace($RollbackStagePath, $ProductionPath, $null)
+        }
+        finally {
+            if (Test-Path -LiteralPath $RollbackStagePath) {
+                Remove-Item -LiteralPath $RollbackStagePath -Force
+            }
+        }
+        $RestoredHash = (
+            Get-FileHash -LiteralPath $ProductionPath -Algorithm SHA256
+        ).Hash.ToLowerInvariant()
+        if ($RestoredHash -ne $OriginalHash) {
+            throw "CUTOVER_ROLLBACK_FAILED: production changed and backup restoration did not verify. Original cutover failure: $CutoverFailure"
+        }
+        throw "CUTOVER_COMMIT_FAILED: verified production backup was restored. Original cutover failure: $CutoverFailure"
+    }
+    throw
 }
 finally {
     if (Test-Path -LiteralPath $StagePath) {
         Remove-Item -LiteralPath $StagePath -Force
     }
+    if (Test-Path -LiteralPath $ReceiptStagePath) {
+        Remove-Item -LiteralPath $ReceiptStagePath -Force
+    }
 }
-
-$InstalledHash = (Get-FileHash -LiteralPath $ProductionPath -Algorithm SHA256).Hash.ToLowerInvariant()
-if ($InstalledHash -ne $CandidateHash) {
-    throw "The installed production checkpoint does not match the validated candidate."
-}
-
-$RecoveryReceiptHash = (
-    Get-FileHash -LiteralPath $RecoveryReceiptPath -Algorithm SHA256
-).Hash.ToLowerInvariant()
-$CutoverReceiptPath = "$RecoveryReceiptPath.cutover.json"
-if (Test-Path -LiteralPath $CutoverReceiptPath) {
-    throw "Cutover receipt already exists: $CutoverReceiptPath"
-}
-$CutoverReceipt = [ordered]@{
-    schema = "windows-solver.campaign-recovery-cutover/v1"
-    selection_path = $SelectionPath
-    old_production_sha256 = $OriginalHash
-    backup_path = $BackupPath
-    backup_sha256 = $BackupHash
-    candidate_path = $CandidatePath
-    candidate_sha256 = $CandidateHash
-    recovery_receipt_path = $RecoveryReceiptPath
-    recovery_receipt_sha256 = $RecoveryReceiptHash
-    production_path = $ProductionPath
-    installed_sha256 = $InstalledHash
-    atomic_replace = $true
-}
-$CutoverJson = $CutoverReceipt | ConvertTo-Json -Depth 8 -Compress
-[IO.File]::WriteAllText($CutoverReceiptPath, $CutoverJson + "`n", [Text.UTF8Encoding]::new($false))
 
 Write-Host "Recovery cutover completed." -ForegroundColor Green
 Write-Host "    Production: $ProductionPath"
