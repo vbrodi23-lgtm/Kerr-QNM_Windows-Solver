@@ -240,6 +240,7 @@ def _refresh_runtime_reports(
 
 def _promotion_bound_source_record_sha256(
     checkpoint: Mapping[str, object],
+    plan: object | None = None,
 ) -> set[str]:
     """Return retained records whose mandatory promotion is not successful."""
 
@@ -252,7 +253,7 @@ def _promotion_bound_source_record_sha256(
             entry["disposition"]
             != PromotionQueueDisposition.COMPLETED.value
             or not _completed_horizon_source_is_authenticated(
-                checkpoint, entry
+                checkpoint, entry, plan
             )
         )
     }
@@ -280,6 +281,7 @@ def _receipt_digest_is_valid(receipt: Mapping[str, object]) -> bool:
 def _completed_horizon_source_is_authenticated(
     checkpoint: Mapping[str, object],
     queue_entry: Mapping[str, object],
+    plan: object | None,
 ) -> bool:
     """Prove a retained source completed its mandatory BF80 comparison."""
 
@@ -295,8 +297,17 @@ def _completed_horizon_source_is_authenticated(
         if isinstance(promoted_ledger, Mapping)
         else None
     )
+    leaf = next(
+        (
+            item for item in getattr(plan, "leaves", ())
+            if item.leaf_id == leaf_id
+        ),
+        None,
+    )
     if (
         not isinstance(leaf_id, str)
+        or leaf is None
+        or leaf.mechanism_id != "horizon-admittance"
         or not _is_sha256(source_record_sha256)
         or not _is_sha256(source_stage_sha256)
         or not isinstance(queue_ordinal, int)
@@ -378,12 +389,38 @@ def _completed_horizon_source_is_authenticated(
         "schema", "leaf_id", "source_record_sha256", "source_stage_sha256",
         "source_centre", "source_disk_radius",
         "promotion_trigger_receipt_sha256", "bf80_operation_identity",
-        "bf80_result_sha256", "bf80_centre", "bf80_disk_radius",
+        "bf80_result_sha256", "bf80_stage", "bf80_centre",
+        "bf80_disk_radius",
         "centre_discrepancy", "reviewed_comparison_threshold", "agrees",
         "outcome_code", "runtime_identity", "backend_identity",
         "receipt_sha256",
     }
     for receipt in receipts:
+        bf80_stage = (
+            receipt.get("bf80_stage")
+            if isinstance(receipt, Mapping)
+            else None
+        )
+        if isinstance(bf80_stage, Mapping):
+            try:
+                validate_schema11_horizon_stage(plan, leaf, bf80_stage)
+            except (TypeError, ValueError):
+                bf80_stage = None
+        bf80_payload = (
+            bf80_stage.get("component_result")
+            if isinstance(bf80_stage, Mapping)
+            else None
+        )
+        bf80_result = (
+            bf80_payload.get("result")
+            if isinstance(bf80_payload, Mapping)
+            else None
+        )
+        bf80_disk = (
+            bf80_stage.get("response_disk")
+            if isinstance(bf80_stage, Mapping)
+            else None
+        )
         if (
             not isinstance(receipt, Mapping)
             or set(receipt) != comparison_fields
@@ -397,11 +434,19 @@ def _completed_horizon_source_is_authenticated(
             or receipt.get("promotion_trigger_receipt_sha256") not in triggers
             or receipt.get("agrees") is not True
             or receipt.get("outcome_code") != "AGREES"
-            or not _is_sha256(receipt.get("bf80_result_sha256"))
-            or not _is_sha256(receipt.get("backend_identity"))
+            or not isinstance(bf80_result, Mapping)
+            or receipt.get("bf80_result_sha256") != _sha256(bf80_result)
+            or receipt.get("bf80_operation_identity")
+            != bf80_stage.get("operation_identity")
+            or not isinstance(bf80_disk, Mapping)
+            or receipt.get("bf80_centre") != bf80_disk.get("centre")
+            or receipt.get("bf80_disk_radius") != bf80_disk.get("radius")
+            or receipt.get("runtime_identity")
+            != bf80_payload.get("scientific_runtime")
+            or receipt.get("backend_identity")
+            != leaf.job.backend_identity.identity_sha256
             or not isinstance(receipt.get("bf80_operation_identity"), str)
             or not receipt.get("bf80_operation_identity")
-            or not isinstance(receipt.get("runtime_identity"), Mapping)
             or not _receipt_digest_is_valid(receipt)
         ):
             continue
@@ -1222,7 +1267,7 @@ def run_native_binary64_pass(
     # cache discovery.  A cache hit is therefore durable before any numerical
     # leaf is eligible to be skipped.
     promotion_bound_record_sha256 = (
-        _promotion_bound_source_record_sha256(checkpoint)
+        _promotion_bound_source_record_sha256(checkpoint, plan)
     )
     checkpoint_records = {
         str(item["leaf_id"]): item
@@ -1571,6 +1616,7 @@ def _promoted_horizon_outcome(
             ),
             "bf80_operation_identity": operation_identity,
             "bf80_result_sha256": _sha256(result.to_mapping()),
+            "bf80_stage": stage,
             "bf80_centre": bf80_centre,
             "bf80_disk_radius": bf80_radius,
             "centre_discrepancy": discrepancy,

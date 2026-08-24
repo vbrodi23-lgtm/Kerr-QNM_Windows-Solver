@@ -471,43 +471,131 @@ class HorizonRecordConstructionTests(unittest.TestCase):
             )
 
     def test_authenticated_completed_comparison_allows_source_cache(self) -> None:
-        leaf_id = "authenticated-leaf"
-        source_record_sha256 = "a" * 64
-        source_stage_sha256 = "b" * 64
-        source_centre = {"real": 1.0, "imaginary": 2.0}
-        bf80_centre = {"real": 1.05, "imaginary": 2.0}
-        source_radius = 0.1
-        bf80_radius = 0.1
-        discrepancy = abs(complex(1.0, 2.0) - complex(1.05, 2.0))
+        plan = _plan()
+        leaf = next(
+            item for item in plan.leaves
+            if item.role == "deep"
+            and item.mechanism_id == "horizon-admittance"
+            and item.leaf_id
+            in set(B_PRIME_RELEASE_DOMAIN.fixed_precision_sentinel_leaf_ids)
+        )
+        promoted_result = run_promoted_horizon_component(
+            leaf.job,
+            FakePromotedBackend(
+                leaf.job,
+                _promoted_baseline(leaf.job, omega=leaf.job.root.omega),
+            ),
+            leaf.job.root.omega,
+        )
+        assert promoted_result.response is not None
+        horizon_radius = 1.0 + (
+            max(0.0, 1.0 - leaf.job.spin * leaf.job.spin) ** 0.5
+        )
+        horizon_frequency = leaf.job.root.omega - leaf.job.mode.m * (
+            leaf.job.spin / (2.0 * horizon_radius)
+        )
+
+        class Kernel:
+            identity = VettedNativeDeterminantKernel.identity
+
+            def horizon_partials(self, **_kwargs):
+                return DeterminantPartials(
+                    frequency_derivative=(
+                        1.0
+                        / (
+                            2.0j
+                            * horizon_frequency
+                            * promoted_result.response
+                        )
+                    ),
+                    coordinate_derivative=0.0j,
+                    simple_root_valid=True,
+                    frequency_derivative_error_abs=1.0e-12,
+                )
+
+        backend = NativeCampaignStageBackend(
+            SimpleNamespace(identity=Kernel.identity, kernel=Kernel()),
+            PrecisionCapabilities((64,)),
+            SimpleNamespace(
+                record_artifact_ids=(),
+                path=Path("synthetic-gsn-cache"),
+                sha256="a" * 64,
+                parameter_pairs=(),
+            ),
+        )
+        binary_outcome = replace(
+            backend.execute_horizon_stage(leaf),
+            deep_diagnostics=_triggering_diagnostics(),
+        )
+        source_stage, source_stage_sha256 = build_schema11_horizon_stage(
+            binary_outcome,
+            precision_tier="binary64",
+            operation_identity="test-binary64-horizon/v1",
+        )
+        source_record = build_schema11_horizon_record(
+            plan,
+            leaf,
+            stages=(source_stage,),
+            retained_centre=source_stage["response_disk"]["centre"],
+            state="PRODUCED",
+        )
+        source_record_sha256 = source_record["record_sha256"]
+        trigger = build_horizon_promotion_trigger_receipt(
+            plan, leaf, binary_outcome, source_stage
+        )
+        scientific_runtime = {"runtime": "test-bf80"}
+        bf80_payload = {
+            "evidence_kind": "package-owned-julia-promoted-horizon-survey",
+            "result": promoted_result.to_mapping(),
+            "scientific_runtime": scientific_runtime,
+        }
+        bf80_outcome = StageOutcome(
+            digits=80,
+            numerical_state=promoted_result.status.value,
+            component_result=bf80_payload,
+            local_disk_radius_abs=promoted_result.error_channels["resolution"],
+            signed_error_channels=synthetic_stage_signed_error_channels(
+                bf80_payload,
+                promoted_result.error_channels["resolution"],
+                precision_ladder_applicable=False,
+            ),
+        )
+        bf80_stage, _bf80_stage_sha256 = build_schema11_horizon_stage(
+            bf80_outcome,
+            precision_tier="BF80",
+            operation_identity="test-bf80-operation/v1",
+        )
+        source_disk = source_stage["response_disk"]
+        bf80_disk = bf80_stage["response_disk"]
+        source_centre = source_disk["centre"]
+        bf80_centre = bf80_disk["centre"]
+        source_radius = source_disk["radius"]
+        bf80_radius = bf80_disk["radius"]
+        discrepancy = abs(
+            complex(source_centre["real"], source_centre["imaginary"])
+            - complex(bf80_centre["real"], bf80_centre["imaginary"])
+        )
         threshold = source_radius + bf80_radius
-        trigger_content = {
-            "schema": response_batches.HORIZON_PROMOTION_TRIGGER_RECEIPT_SCHEMA,
-            "leaf_id": leaf_id,
-            "binary64_stage_sha256": source_stage_sha256,
-            "promotion_required": True,
-        }
-        trigger = {
-            **trigger_content,
-            "receipt_sha256": _sha256(trigger_content),
-        }
+        self.assertLessEqual(discrepancy, threshold)
         comparison_content = {
             "schema": response_batches.HORIZON_PROMOTED_COMPARISON_RECEIPT_SCHEMA,
-            "leaf_id": leaf_id,
+            "leaf_id": leaf.leaf_id,
             "source_record_sha256": source_record_sha256,
             "source_stage_sha256": source_stage_sha256,
             "source_centre": source_centre,
             "source_disk_radius": source_radius,
             "promotion_trigger_receipt_sha256": trigger["receipt_sha256"],
             "bf80_operation_identity": "test-bf80-operation/v1",
-            "bf80_result_sha256": "c" * 64,
+            "bf80_result_sha256": _sha256(promoted_result.to_mapping()),
+            "bf80_stage": bf80_stage,
             "bf80_centre": bf80_centre,
             "bf80_disk_radius": bf80_radius,
             "centre_discrepancy": discrepancy,
             "reviewed_comparison_threshold": threshold,
             "agrees": True,
             "outcome_code": "AGREES",
-            "runtime_identity": {"runtime": "test"},
-            "backend_identity": "d" * 64,
+            "runtime_identity": scientific_runtime,
+            "backend_identity": leaf.job.backend_identity.identity_sha256,
         }
         comparison = {
             **comparison_content,
@@ -523,7 +611,7 @@ class HorizonRecordConstructionTests(unittest.TestCase):
         }
         queue_receipt = {
             "schema": "windows-solver.promoted-queue-disposition/1",
-            "leaf_id": leaf_id,
+            "leaf_id": leaf.leaf_id,
             "queue_ordinal": 0,
             "disposition": "COMPLETED",
             "reason_code": promoted["reason_code"],
@@ -533,35 +621,43 @@ class HorizonRecordConstructionTests(unittest.TestCase):
         }
         checkpoint = {
             "promotion_queue": {"entries": [{
-                "leaf_id": leaf_id,
+                "leaf_id": leaf.leaf_id,
                 "queue_ordinal": 0,
                 "source_record_sha256": source_record_sha256,
                 "source_stage_sha256": source_stage_sha256,
                 "disposition": "COMPLETED",
                 "disposition_receipt_sha256": _sha256(queue_receipt),
             }]},
-            "survey_pass_ledger": {"promoted": {leaf_id: promoted}},
-            "evidence_ledger": {leaf_id: {
+            "survey_pass_ledger": {"promoted": {leaf.leaf_id: promoted}},
+            "evidence_ledger": {leaf.leaf_id: {
                 "central_record_sha256": source_record_sha256,
                 "central_stage_sha256": source_stage_sha256,
                 "receipts": [trigger, comparison],
             }},
-            "records": [{
-                "record_sha256": source_record_sha256,
-                "stages": [{
-                    "stage_sha256": source_stage_sha256,
-                    "response_disk": {
-                        "centre": source_centre,
-                        "radius": source_radius,
-                        "exact_zero_radius": False,
-                    },
-                }],
-            }],
+            "records": [source_record],
         }
 
         self.assertEqual(
             set(),
-            campaign_runtime._promotion_bound_source_record_sha256(checkpoint),
+            campaign_runtime._promotion_bound_source_record_sha256(
+                checkpoint, plan
+            ),
+        )
+        tampered = copy.deepcopy(checkpoint)
+        tampered_comparison = tampered["evidence_ledger"][leaf.leaf_id][
+            "receipts"
+        ][1]
+        tampered_comparison["bf80_result_sha256"] = "f" * 64
+        tampered_comparison["receipt_sha256"] = _sha256({
+            key: value
+            for key, value in tampered_comparison.items()
+            if key != "receipt_sha256"
+        })
+        self.assertEqual(
+            {source_record_sha256},
+            campaign_runtime._promotion_bound_source_record_sha256(
+                tampered, plan
+            ),
         )
 
     def test_trigger_receipt_rejects_stage_outcome_payload_mismatch(self) -> None:
