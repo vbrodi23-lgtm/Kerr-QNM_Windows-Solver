@@ -1098,7 +1098,7 @@ def _horizon_outcome(
             operation_identity=operation_identity,
             reason_code="BOUNDED_HORIZON_RESPONSE",
         )
-    code = _typed_horizon_failure_code(result)
+    code = _typed_horizon_failure_code(result, binary64=True)
     decision = classify_failure(FailureReport(
         failure_code=code,
         failure_class="HORIZON_COMPONENT",
@@ -1151,7 +1151,9 @@ def _horizon_outcome(
     )
 
 
-def _typed_horizon_failure_code(result: ComponentResult) -> str:
+def _typed_horizon_failure_code(
+    result: ComponentResult, *, binary64: bool = False
+) -> str:
     for evidence in (
         result.analytic_horizon_evidence,
         result.derivative_evidence,
@@ -1167,7 +1169,9 @@ def _typed_horizon_failure_code(result: ComponentResult) -> str:
         ComponentStatus.BRANCH_LOSS: "HORIZON_BRANCH_LOSS",
         ComponentStatus.NOT_CONVERGED: "HORIZON_LADDER_EXHAUSTED",
         ComponentStatus.DERIVATIVE_UNRESOLVED: (
-            "HORIZON_DERIVATIVE_UNRESOLVED"
+            "HORIZON_ARITHMETIC_INADEQUATE"
+            if binary64
+            else "HORIZON_DERIVATIVE_UNRESOLVED"
         ),
     }
     code = reviewed.get(result.status)

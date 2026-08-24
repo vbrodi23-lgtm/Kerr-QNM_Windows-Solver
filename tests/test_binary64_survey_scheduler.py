@@ -4,11 +4,17 @@ import hashlib
 import json
 from pathlib import Path
 import tempfile
+from types import SimpleNamespace
 import unittest
 
-from windows_solver.campaign_policy import SurveyDisposition, empty_schema11_checkpoint
+from windows_solver.campaign_policy import (
+    PromotionQueueKind,
+    SurveyDisposition,
+    empty_schema11_checkpoint,
+)
 from windows_solver.campaign_failures import CampaignSystemFailure
 from windows_solver.campaign_recovery import RecoverySelection
+from windows_solver.campaign_runtime import _typed_horizon_failure_code
 from windows_solver.campaign_timing import CampaignTimingLog
 from windows_solver.campaign_survey import (
     AuthenticatedRootSeal,
@@ -28,6 +34,7 @@ from windows_solver.response_batches import (
 )
 from windows_solver.response_engine import (
     BackgroundEquivalenceReceipt,
+    ComponentStatus,
     NumericalPolicy,
     VettedNativeDeterminantKernel,
 )
@@ -238,12 +245,23 @@ class Binary64SurveySchedulerTests(unittest.TestCase):
         )
         started: list[str] = []
 
-        def unresolved_horizon(leaf) -> Binary64PassOutcome:
+        def horizon_outcome(leaf) -> Binary64PassOutcome:
             started.append(leaf.leaf_id)
+            if len(started) <= 2:
+                return Binary64PassOutcome(
+                    disposition=SurveyDisposition.PROMOTION_PENDING_RESPONSE,
+                    operation_identity="binary64-horizon-production/v2",
+                    reason_code="HORIZON_ARITHMETIC_INADEQUATE",
+                    queue_kind=PromotionQueueKind.RESPONSE,
+                    minimum_requested_tier="BF80",
+                )
+            record, stage_sha256 = _record(leaf.leaf_id)
             return Binary64PassOutcome(
-                disposition=SurveyDisposition.UNRESOLVED,
-                operation_identity="test-repeated-horizon-outcome/v1",
-                reason_code="HORIZON_DERIVATIVE_UNRESOLVED",
+                disposition=SurveyDisposition.COMPLETED,
+                operation_identity="binary64-horizon-production/v2",
+                reason_code="BOUNDED_HORIZON_RESPONSE",
+                record=record,
+                stage_sha256=stage_sha256,
             )
 
         with tempfile.TemporaryDirectory() as temporary:
@@ -260,14 +278,14 @@ class Binary64SurveySchedulerTests(unittest.TestCase):
                 empty_schema11_checkpoint(selection.campaign_id, selection.selection_id),
                 checkpoint_path=path,
                 root_seal_lookup=lambda _leaf: self.fail(
-                    "unresolved horizon must not request a root seal"
+                    "horizon survey must not request a root seal"
                 ),
                 native_backend_factory=lambda: self.fail(
                     "unresolved horizon must not construct an exterior backend"
                 ),
-                horizon_runner=unresolved_horizon,
+                horizon_runner=horizon_outcome,
                 produced_record_builder=lambda *args: self.fail(
-                    "unresolved horizon must not build a record"
+                    "horizon survey must not build an exterior record"
                 ),
                 diagnostic_session=session,
             )
@@ -276,18 +294,45 @@ class Binary64SurveySchedulerTests(unittest.TestCase):
 
         self.assertEqual(list(horizon), started)
         self.assertEqual([], result.checkpoint["system_failures"])
+        self.assertEqual(2, result.queued_count)
+        self.assertEqual(1, result.completed_count)
         self.assertEqual(
             set(horizon),
             set(result.checkpoint["survey_pass_ledger"]["binary64"]),
         )
+        queued = result.checkpoint["promotion_queue"]["entries"]
+        self.assertEqual(2, len(queued))
+        self.assertTrue(all(
+            item["queue_kind"] == "RESPONSE"
+            and item["reason_code"] == "HORIZON_ARITHMETIC_INADEQUATE"
+            and item["minimum_requested_tier"] == "BF80"
+            for item in queued
+        ))
         repeated = [
             event for event in events
             if event["event_kind"] == "REPEATED_LEAF_OUTCOME_OBSERVED"
         ]
-        self.assertEqual(2, len(repeated))
+        self.assertEqual(1, len(repeated))
         self.assertEqual(2, repeated[0]["compact_diagnostics"]["observation_count"])
         self.assertEqual(list(horizon[:2]), repeated[0]["compact_diagnostics"]["all_observed_leaf_ids"])
         self.assertFalse(repeated[0]["compact_diagnostics"]["campaign_aborted"])
+
+    def test_binary64_horizon_derivative_state_requests_bf80(self) -> None:
+        unresolved = SimpleNamespace(
+            analytic_horizon_evidence=None,
+            derivative_evidence=None,
+            resolved_window=None,
+            status=ComponentStatus.DERIVATIVE_UNRESOLVED,
+        )
+
+        self.assertEqual(
+            "HORIZON_ARITHMETIC_INADEQUATE",
+            _typed_horizon_failure_code(unresolved, binary64=True),
+        )
+        self.assertEqual(
+            "HORIZON_DERIVATIVE_UNRESOLVED",
+            _typed_horizon_failure_code(unresolved, binary64=False),
+        )
 
     def test_missing_root_queues_once_and_resume_is_zero_work(self) -> None:
         leaf_id = next(

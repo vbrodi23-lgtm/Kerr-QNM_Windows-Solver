@@ -11,7 +11,7 @@ from windows_solver.campaign_failures import (
     classify_failure,
     run_guarded_pass,
 )
-from windows_solver.campaign_policy import empty_schema11_checkpoint
+from windows_solver.campaign_policy import PromotionQueueKind, empty_schema11_checkpoint
 
 
 def _report(code: str, *, cause_type: str = "NumericalControlError") -> FailureReport:
@@ -42,6 +42,7 @@ class CampaignFailureTests(unittest.TestCase):
                 "FINITE_DIFFERENCE_NOISE_LIMIT": "RESPONSE",
                 "DETERMINANT_ERROR_EVIDENCE_UNAVAILABLE": "RESPONSE",
                 "DETERMINANT_UNCERTAINTY_TOO_LARGE": "ROOT",
+                "ROOT_SEAL_UNAVAILABLE": "ROOT",
             },
             PROMOTION_ALLOWLIST,
         )
@@ -49,6 +50,10 @@ class CampaignFailureTests(unittest.TestCase):
             decision = classify_failure(_report(code))
             self.assertIs(FailureDisposition.PROMOTION_PENDING, decision.disposition)
             self.assertEqual(queue_kind, decision.queue_kind)
+
+        root_pending = classify_failure(_report("ROOT_SEAL_UNAVAILABLE"))
+        self.assertEqual(PromotionQueueKind.ROOT.value, root_pending.queue_kind)
+        self.assertIs(FailureDisposition.PROMOTION_PENDING, root_pending.disposition)
 
         decision = classify_failure(_report("ODE_RESOURCE_LIMIT"))
         self.assertIs(FailureDisposition.DEFERRED, decision.disposition)

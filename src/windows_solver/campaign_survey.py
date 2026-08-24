@@ -1124,8 +1124,6 @@ def run_binary64_survey(
         if outcome.disposition not in {
             SurveyDisposition.COMPLETED,
             SurveyDisposition.CACHE_REUSED,
-            SurveyDisposition.PROMOTION_PENDING_ROOT,
-            SurveyDisposition.PROMOTION_PENDING_RESPONSE,
         }:
             report = _survey_failure_report(
                 leaf,
