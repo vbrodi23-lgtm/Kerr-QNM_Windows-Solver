@@ -14,8 +14,8 @@ From the directory containing the operator files:
 
 ```powershell
 .\solver.ps1 validate-evidence .\evidence\evidence-bundle.json
-.\solver.ps1 campaign-validate .\campaign-selection.json `
-  --checkpoint .\campaign-complete.json --full
+.\solver.ps1 campaign-schema11-validate .\campaign-selection.json `
+  --checkpoint .\campaign-complete.schema11.json --pass validate
 ```
 
 The evidence manifest must have state `complete-operator`, exactly 212 produced
@@ -27,14 +27,19 @@ malformed, duplicated, or unexecuted leaves fail admission.
 
 ## 2. Reduce all frozen projective rows
 
-Use the reduction bundle described in
-[response-replay-powershell.md](response-replay-powershell.md), selecting all
-57 frozen row IDs:
+Build a schema-2 reduction bundle selecting all 57 frozen row IDs, then run:
 
 ```powershell
 .\solver.ps1 campaign-reduce .\reduction-bundle.json `
   --output .\reduction.json
 ```
+
+The reduction bundle is schema 2. It binds `schema11_checkpoint_paths` and an
+exact `required_evidence_levels` mapping for every selected component leaf.
+Each value is `CERTIFIED` or `VALIDATED` according to release policy;
+`SCREENED` is never release-admissible. Schema-1 reduction bundles are legacy
+inputs and must be regenerated because they cannot authenticate the schema-11
+evidence ledger.
 
 The reducer authenticates its checkpoint receipts and performs no determinant
 or response solve. Admission requires reducer state `COMPLETE`, 48 primary

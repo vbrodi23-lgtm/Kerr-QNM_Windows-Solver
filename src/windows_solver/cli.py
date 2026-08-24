@@ -36,6 +36,10 @@ from .campaign_evidence import (
 from .campaign_triage import WholeAtlasTriage
 from .campaign_survey import preflight_campaign_supports
 from .engine import ExecutionEngine, RunRecord, verify_run_integrity
+from .gsn_cache_producer import (
+    ensure_generated_gsn_cache,
+    parameter_pairs_for_selection,
+)
 from .evidence_intake import load_evidence_bundle
 from .linear_response_admission import (
     AdmittedLinearResponseProvider,
@@ -279,6 +283,17 @@ def build_parser() -> argparse.ArgumentParser:
     campaign_import.add_argument("selection", type=Path)
     campaign_import.add_argument("--checkpoint", type=Path, required=True)
     campaign_import.add_argument("--store", type=Path)
+    campaign_new = commands.add_parser(
+        "campaign-new",
+        help="initialize a genuinely new empty schema-11 campaign",
+    )
+    campaign_new.add_argument("selection", type=Path)
+    campaign_new.add_argument("--output", type=Path, required=True)
+    campaign_prepare = commands.add_parser(
+        "campaign-prepare-resources",
+        help="materialize and seal GSN resources before campaign execution",
+    )
+    campaign_prepare.add_argument("selection", type=Path)
     campaign_recover = commands.add_parser(
         "campaign-recover",
         help="recover compatible terminal records without numerical work",
@@ -955,6 +970,58 @@ def _campaign_recover(
         ),
     )
     return 0, {"command": "campaign-recover", **summary.to_mapping()}
+
+
+def _campaign_new(
+    selection_path: Path,
+    output_path: Path,
+) -> tuple[int, object]:
+    """Create empty NEW state without recovery or fabricated provenance."""
+
+    plan, selection, _descriptor = _campaign_plan_and_selection(selection_path)
+    output = _resolve_recovery_path(output_path)
+    if output.exists():
+        raise ValueError("campaign-new refuses an existing checkpoint")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    checkpoint = empty_schema11_checkpoint(plan.campaign_id, selection.selection_id)
+    checkpoint = refresh_schema11_reports(
+        plan,
+        selection,
+        checkpoint,
+        output,
+        persist_checkpoint=True,
+    )
+    if checkpoint["records"] or checkpoint["recovery_receipts"]:
+        raise ValueError("campaign-new fabricated prior scientific provenance")
+    return 0, {
+        "command": "campaign-new",
+        "origin": "NEW",
+        "campaign_id": plan.campaign_id,
+        "selection_id": selection.selection_id,
+        "checkpoint_path": str(output),
+        "terminal_record_count": 0,
+        "recovery_receipt_count": 0,
+        "release_admissible": False,
+    }
+
+
+def _campaign_prepare_resources(selection_path: Path) -> tuple[int, object]:
+    """Explicit environment preparation; may invoke the Julia GSN producer."""
+
+    plan, selection, _descriptor = _campaign_plan_and_selection(selection_path)
+    generated = ensure_generated_gsn_cache(
+        parameter_pairs_for_selection(plan, selection)
+    )
+    return 0, {
+        "command": "campaign-prepare-resources",
+        "campaign_id": plan.campaign_id,
+        "selection_id": selection.selection_id,
+        "resource_path": str(generated.path),
+        "resource_sha256": generated.sha256,
+        "record_artifact_ids": list(generated.record_artifact_ids),
+        "resource_prepared": True,
+        "release_admissible": False,
+    }
 
 
 def _campaign_recovery_selection(plan, selection) -> RecoverySelection:
@@ -1729,6 +1796,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             status, output = _campaign_cache_import(
                 arguments.selection, arguments.checkpoint, arguments.store
             )
+        elif arguments.command == "campaign-new":
+            status, output = _campaign_new(arguments.selection, arguments.output)
+        elif arguments.command == "campaign-prepare-resources":
+            status, output = _campaign_prepare_resources(arguments.selection)
         elif arguments.command == "campaign-recover":
             status, output = _campaign_recover(
                 arguments.selection,

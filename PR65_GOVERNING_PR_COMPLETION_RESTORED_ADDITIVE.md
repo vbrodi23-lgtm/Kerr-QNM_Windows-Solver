@@ -1,5 +1,11 @@
 # PR #65 — Governing Completion Contract
 
+> **Historical provenance only:** PR #65 is merged. This file preserves the
+> exact historical landing contract and is not current production authority.
+> Current architecture and operator instructions live in `README.md`,
+> `docs/architecture.md`, and the active operator runbooks. During PR #66, the
+> sole PR-specific authority is `PR66_GOVERNING_COMPLETION_CONTRACT.md`.
+
 ## M02 recovery, survey separation, evidence architecture, reporting, and dashboard repair
 
 > **Authority:** This document is the governing completion contract for PR #65. It supersedes the PR #63 implementation plan, the PR #63 repair-chain draft, and any narrower issue-specific repair instructions. A change that conflicts with this document is not an implementation choice; it is a PR #65 defect.
