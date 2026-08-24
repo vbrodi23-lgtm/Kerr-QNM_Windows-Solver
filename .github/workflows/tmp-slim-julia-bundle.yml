@@ -1,0 +1,169 @@
+name: Temporary slim M02 Julia bundle probe
+
+on:
+  push:
+    branches:
+      - tmp/linux-slim-julia-bundle-probe
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: julia-actions/setup-julia@v2
+        with:
+          version: '1.10.11'
+          arch: x64
+
+      - name: Build staged slim source tree
+        shell: bash
+        run: |
+          set -euxo pipefail
+          STAGE="$RUNNER_TEMP/m02-slim"
+          python tools/build_slim_m02_julia_probe.py "$STAGE"
+          echo "STAGE=$STAGE" >> "$GITHUB_ENV"
+          echo "ONLINE_DEPOT=$RUNNER_TEMP/m02-online-depot" >> "$GITHUB_ENV"
+          echo "OFFLINE_DEPOT=$RUNNER_TEMP/m02-offline-depot" >> "$GITHUB_ENV"
+
+      - name: Resolve and instantiate from pinned seed
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$ONLINE_DEPOT"
+          export JULIA_DEPOT_PATH="$ONLINE_DEPOT"
+          export JULIA_PKG_PRECOMPILE_AUTO=0
+          julia --project="$STAGE/project" -e 'using Pkg; Pkg.resolve(); Pkg.instantiate()'
+
+      - name: Audit reduced dependency graph
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python - <<'PY'
+          import json, os, tomllib
+          from pathlib import Path
+          stage = Path(os.environ['STAGE'])
+          seed = tomllib.loads((stage/'project'/'Manifest.seed.toml').read_text())['deps']
+          final = tomllib.loads((stage/'project'/'Manifest.toml').read_text())['deps']
+          forbidden = {
+              'DifferentialEquations', 'OrdinaryDiffEq', 'BoundaryValueDiffEq',
+              'DelayDiffEq', 'StochasticDiffEq', 'Sundials', 'HDF5',
+              'KerrGeodesics', 'ApproxFun', 'AdaptiveLevin', 'LsqFit'
+          }
+          present = forbidden & set(final)
+          if present:
+              raise SystemExit(f'forbidden packages remain: {sorted(present)}')
+          if len(final) > 170:
+              raise SystemExit(f'slim manifest unexpectedly large: {len(final)} entries')
+          changes = {}
+          for name, entries in final.items():
+              if name not in seed:
+                  continue
+              a = entries[0] if isinstance(entries, list) else entries
+              b = seed[name][0] if isinstance(seed[name], list) else seed[name]
+              if a.get('version') != b.get('version'):
+                  changes[name] = [b.get('version'), a.get('version')]
+          print(json.dumps({
+              'seed_manifest_entries': len(seed),
+              'slim_manifest_entries': len(final),
+              'removed_entries': len(seed) - len(final),
+              'version_changes': changes,
+          }, indent=2, sort_keys=True))
+          if changes:
+              raise SystemExit(f'pinned package versions changed: {changes}')
+          PY
+
+      - name: Test real Julia package load and homogeneous ODE path
+        shell: bash
+        run: |
+          set -euxo pipefail
+          export JULIA_DEPOT_PATH="$ONLINE_DEPOT"
+          julia --project="$STAGE/project" "$STAGE/m02_worker.jl" --probe
+          julia --project="$STAGE/project" -e '
+            using SpinWeightedSpheroidalHarmonics
+            λ = spin_weighted_spheroidal_eigenvalue(-2, 2, 2, 0.2 + 0.01im)
+            @assert isfinite(real(λ)) && isfinite(imag(λ))
+            println("SWSH eigenvalue probe: ", λ)
+          '
+          julia --project="$STAGE/project" -e '
+            using GeneralizedSasakiNakamura
+            include(joinpath(ARGS[1], "vendor", "GeneralizedSasakiNakamura.jl", "test", "factored_propagation_spec.jl"))
+          ' "$STAGE"
+
+      - name: Build minimal offline depot and prove no-network reuse
+        shell: bash
+        run: |
+          set -euxo pipefail
+          rm -rf "$OFFLINE_DEPOT"
+          mkdir -p "$OFFLINE_DEPOT"
+          for d in packages artifacts; do
+            if [ -d "$ONLINE_DEPOT/$d" ]; then
+              cp -a "$ONLINE_DEPOT/$d" "$OFFLINE_DEPOT/$d"
+            fi
+          done
+          rm -rf "$ONLINE_DEPOT"
+          export JULIA_DEPOT_PATH="$OFFLINE_DEPOT"
+          export JULIA_PKG_OFFLINE=true
+          export JULIA_PKG_SERVER=""
+          export JULIA_PKG_PRECOMPILE_AUTO=0
+          julia --project="$STAGE/project" -e 'using Pkg; Pkg.instantiate()'
+          julia --project="$STAGE/project" "$STAGE/m02_worker.jl" --probe
+          julia --project="$STAGE/project" -e '
+            using GeneralizedSasakiNakamura, SpinWeightedSpheroidalHarmonics
+            using OrdinaryDiffEqVerner, OrdinaryDiffEqRosenbrock, SciMLBase
+            λ = spin_weighted_spheroidal_eigenvalue(-2, 2, 2, 0.2 + 0.01im)
+            @assert isfinite(real(λ)) && isfinite(imag(λ))
+            println("offline package load: ok")
+          '
+
+      - name: Package and measure offline payload
+        shell: bash
+        run: |
+          set -euxo pipefail
+          OUT="$RUNNER_TEMP/slim-bundle"
+          mkdir -p "$OUT/runtime"
+          cp -a "$STAGE/project" "$OUT/runtime/m02_project"
+          cp -a "$STAGE/vendor" "$OUT/runtime/vendor"
+          cp "$STAGE/m02_worker.jl" "$OUT/runtime/m02_worker.jl"
+          cp -a "$OFFLINE_DEPOT" "$OUT/runtime/julia-depot"
+          python - <<'PY'
+          import json, os, subprocess, tomllib
+          from pathlib import Path
+          stage = Path(os.environ['STAGE'])
+          offline = Path(os.environ['OFFLINE_DEPOT'])
+          out = Path(os.environ['RUNNER_TEMP'])/'slim-bundle'
+          manifest = tomllib.loads((stage/'project'/'Manifest.toml').read_text())['deps']
+          def size(path):
+              return int(subprocess.check_output(['du','-sb',str(path)]).split()[0]) if path.exists() else 0
+          data = {
+              'manifest_entries': len(manifest),
+              'depot_uncompressed_bytes': size(offline),
+              'packages_bytes': size(offline/'packages'),
+              'artifacts_bytes': size(offline/'artifacts'),
+              'vendor_bytes': size(stage/'vendor'),
+              'project_bytes': size(stage/'project'),
+          }
+          (out/'measurements.json').write_text(json.dumps(data, indent=2, sort_keys=True)+'\n')
+          print(json.dumps(data, indent=2, sort_keys=True))
+          PY
+          tar -C "$OUT" -czf "$RUNNER_TEMP/slim-m02-julia-offline-linux-x86_64.tar.gz" runtime measurements.json
+          sha256sum "$RUNNER_TEMP/slim-m02-julia-offline-linux-x86_64.tar.gz" > "$RUNNER_TEMP/slim-m02-julia-offline-linux-x86_64.tar.gz.sha256"
+          stat -c 'compressed_bundle_bytes=%s' "$RUNNER_TEMP/slim-m02-julia-offline-linux-x86_64.tar.gz" | tee "$RUNNER_TEMP/compressed-size.txt"
+          cat "$OUT/measurements.json"
+          cat "$RUNNER_TEMP/slim-m02-julia-offline-linux-x86_64.tar.gz.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: slim-m02-julia-offline-linux-x86_64
+          path: |
+            ${{ runner.temp }}/slim-m02-julia-offline-linux-x86_64.tar.gz
+            ${{ runner.temp }}/slim-m02-julia-offline-linux-x86_64.tar.gz.sha256
+            ${{ runner.temp }}/compressed-size.txt
+            ${{ runner.temp }}/slim-bundle/measurements.json
+            ${{ env.STAGE }}/project/Manifest.toml
+          compression-level: 0
+          retention-days: 1
