@@ -126,10 +126,19 @@ New-Item -ItemType Directory -Force -Path (Split-Path -Parent $CheckpointPath) |
     Out-Null
 
 $CheckpointExists = Test-Path -LiteralPath $CheckpointPath -PathType Leaf
+$IsBinary64SurveyProfile = $Profile -eq "survey" -and $SurveyPass -eq "binary64"
 if ($NewCampaign -and $CheckpointExists) {
     throw "-NewCampaign refuses an existing checkpoint: $CheckpointPath"
 }
-if (-not $NewCampaign -and -not $CheckpointExists) {
+# A plain, argument-free first run must not require a secret -NewCampaign
+# incantation: an absent default checkpoint under the default binary64
+# survey profile is the ordinary first-run state, not an error. Certify,
+# validate, and promoted-survey profiles still require prior binary64 work
+# to exist, so an absent checkpoint there remains a hard failure.
+$StartNewCampaign = $NewCampaign -or (
+    -not $CheckpointExists -and $IsBinary64SurveyProfile
+)
+if (-not $StartNewCampaign -and -not $CheckpointExists) {
     throw "Resume requires an existing checkpoint. Use -NewCampaign with a new path for a cold start: $CheckpointPath"
 }
 
@@ -152,7 +161,7 @@ try {
         "campaign-prepare-resources",
         $SelectionPath
     ) | Out-Null
-    if ($NewCampaign) {
+    if ($StartNewCampaign) {
         Invoke-M02Command -Arguments @(
             "campaign-new",
             $SelectionPath,

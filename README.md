@@ -109,19 +109,7 @@ leaf 1. You do not need to run the command above yourself before `m02.ps1
 -NewCampaign`; it is shown here only for operators driving `solver.ps1`
 directly instead of through `m02.ps1`.
 
-### Start a new campaign
-
-A new campaign is always explicit:
-
-```powershell
-.\m02.ps1 `
-  -NewCampaign `
-  -Checkpoint .\m02-output\m02-campaign-checkpoint.json
-```
-
-A missing checkpoint never silently starts a new campaign.
-
-### Resume the binary64 survey
+### Start or resume the binary64 survey
 
 ```powershell
 .\m02.ps1
@@ -132,6 +120,24 @@ Equivalent explicit form:
 ```powershell
 .\m02.ps1 -Profile survey -SurveyPass binary64
 ```
+
+Under the default binary64 survey profile, the default checkpoint path
+decides what happens: if it does not yet exist, this is an ordinary first
+run and a new campaign is created before the survey starts; if it exists,
+the survey resumes from it. `-NewCampaign` is only needed to protect against
+overwriting an existing checkpoint, or to start a new campaign at an
+explicit, non-default `-Checkpoint` path:
+
+```powershell
+.\m02.ps1 `
+  -NewCampaign `
+  -Checkpoint .\m02-output\m02-campaign-checkpoint.json
+```
+
+`-NewCampaign` refuses to run if that checkpoint already exists. Certify,
+validate, and the promoted survey pass always require an existing
+checkpoint from prior binary64 work; a missing checkpoint there remains a
+hard failure, since there is nothing yet to certify, validate, or promote.
 
 The binary64 survey:
 
