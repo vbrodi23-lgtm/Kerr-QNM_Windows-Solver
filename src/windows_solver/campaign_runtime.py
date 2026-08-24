@@ -630,8 +630,13 @@ def run_native_binary64_pass(
     """Execute the real binary64 scheduler with a Julia-free backend factory."""
 
     store = solved_leaf_store or SolvedLeafStore.default()
-    roots = _root_index(plan, selection, checkpoint, store)
     backend_holder: dict[str, NativeCampaignStageBackend] = {}
+    roots_holder: dict[str, dict[object, tuple[AuthenticatedRootSeal, ...]]] = {}
+
+    def roots() -> dict[object, tuple[AuthenticatedRootSeal, ...]]:
+        if "value" not in roots_holder:
+            roots_holder["value"] = _root_index(plan, selection, checkpoint, store)
+        return roots_holder["value"]
 
     def backend() -> NativeCampaignStageBackend:
         if "value" not in backend_holder:
@@ -639,7 +644,7 @@ def run_native_binary64_pass(
         return backend_holder["value"]
 
     def build(leaf, batch, screening):
-        seal = _seal_for_leaf(roots, leaf)
+        seal = _seal_for_leaf(roots(), leaf)
         if seal is None:
             raise ValueError("fixed-root record builder lost its root seal")
         return build_fixed_root_screening_record(
@@ -656,7 +661,7 @@ def run_native_binary64_pass(
         recovery_selection,
         checkpoint,
         checkpoint_path=checkpoint_path,
-        root_seal_lookup=lambda leaf: _seal_for_leaf(roots, leaf),
+        root_seal_lookup=lambda leaf: _seal_for_leaf(roots(), leaf),
         native_backend_factory=lambda: backend().adapter.kernel,
         horizon_runner=lambda leaf: _horizon_outcome(plan, backend(), leaf),
         produced_record_builder=build,
@@ -769,18 +774,30 @@ def run_native_promoted_pass(
     *,
     checkpoint_path: Path,
     calibration_receipt: object | None = None,
+    solved_leaf_store: SolvedLeafStore | None = None,
 ) -> PromotedSurveyRun:
     """Execute only queued BF40/BF80 work through the survey-only operation."""
 
-    backend = NativeCampaignStageBackend.from_selection(
-        plan,
-        selection,
-        calibration_receipt=calibration_receipt,
-    )
-    roots = _root_index(plan, selection, checkpoint, SolvedLeafStore.default())
+    store = solved_leaf_store or SolvedLeafStore.default()
+    backend_holder: dict[str, NativeCampaignStageBackend] = {}
+    roots_holder: dict[str, dict[object, tuple[AuthenticatedRootSeal, ...]]] = {}
+
+    def backend() -> NativeCampaignStageBackend:
+        if "value" not in backend_holder:
+            backend_holder["value"] = NativeCampaignStageBackend.from_selection(
+                plan,
+                selection,
+                calibration_receipt=calibration_receipt,
+            )
+        return backend_holder["value"]
+
+    def roots() -> dict[object, tuple[AuthenticatedRootSeal, ...]]:
+        if "value" not in roots_holder:
+            roots_holder["value"] = _root_index(plan, selection, checkpoint, store)
+        return roots_holder["value"]
 
     def seal_lookup(leaf, entry):
-        candidates = roots.get(leaf.job.root, ())
+        candidates = roots().get(leaf.job.root, ())
         expected = entry.get("source_root_seal_sha256")
         exact = tuple(
             item
@@ -814,12 +831,16 @@ def run_native_promoted_pass(
         checkpoint,
         checkpoint_path=checkpoint_path,
         root_seal_lookup=seal_lookup,
-        backend_factory=lambda leaf, digits: backend._julia_precision_backend_for(
+        backend_factory=lambda leaf, digits: backend()._julia_precision_backend_for(
             leaf.job, digits
         ),
         primary_root_runner=_promoted_root_result,
-        horizon_runner=lambda leaf: _promoted_horizon_outcome(plan, backend, leaf),
+        horizon_runner=lambda leaf: _promoted_horizon_outcome(plan, backend(), leaf),
         produced_record_builder=build,
+        solved_leaf_store=store,
+        record_validator=lambda leaf_id, record: validate_campaign_recovery_record(
+            plan, leaf_id, record
+        ),
         checkpoint_committed=lambda value: _refresh_runtime_reports(
             plan,
             selection,

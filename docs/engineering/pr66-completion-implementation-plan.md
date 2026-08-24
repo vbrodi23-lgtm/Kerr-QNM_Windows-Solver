@@ -10,6 +10,43 @@
 
 **Spec:** Draft PR #66 governing completion contract at `https://github.com/vbrodi23-lgtm/Kerr-QNM_Windows-Solver/pull/66`, including authoritative completion decisions 1–7.
 
+## Authoritative course correction — 2026-08-24
+
+This plan has one architecture.  The PR66 Governing Completion Contract, the
+seven resolved decisions, and the 2026-08-24 course correction are its
+authoritative inputs.  Where an older task below conflicts with that course
+correction, the course correction wins; do not create a parallel scheduler,
+second reuse implementation, or synthetic incident oracle.
+
+Execute the remaining work in this dependency order:
+
+1. R1 historical scientific-state honesty (complete): authenticate the real
+   schema-9 fixture, preserve source bytes, import only uniquely reconstructable
+   current identities, record `legacy-compatibility/v1` reasons otherwise, and
+   report the absent PR63 oracle as `NOT_SUPPLIED` / Canary X9 `NOT_SUPPLIED`.
+2. R2 universal terminal-cache discovery; R3–R5 one shared authenticated
+   root-seal provider, RootReadoutStore production wiring, and same-pass seal
+   publication; then stop-gate proof that terminal/readout hits construct no
+   numerical backend and N compatible roots require at most one permitted solve.
+3. R6 cold-machine Julia-free binary64 boundary; R7–R8 removal of unapproved
+   determinant-error models; R9–R11 exact promotion/repetition/failure routing;
+   R12–R14 durable exact-key Dω evidence and production reuse wiring.
+4. R15–R18 authenticated evidence strengthening, release admission,
+   certification, and comparator receipts which remain incapable of awarding
+   `VALIDATED` without a human mathematical approval.
+5. R19–R25 projective triage, pass completion, projections, transactional
+   cutover, public CLI/docs parity, and bounded provenance/active-authority
+   repair.
+
+Every discovery, recovery, and reuse boundary is cardinality-agnostic.  It
+must distinguish `EMPTY`, ordinary `MISS`, `HIT`, trusted `CORRUPT`, and
+`CONFLICT` where that boundary can observe a conflict.  Empty and ordinary
+miss are normal outcomes.  Each lookup reports exact discovered, compatible,
+reused, and rejected counts; it authenticates and reuses only the compatible
+subset, and computes only the remainder.  Tests cover empty, one exact match,
+nonmatching content, mixed content, and trusted corruption for each important
+boundary, with N = 0, 1, 7, 20, 42, 212, and arbitrary N where applicable.
+
 ## Global Constraints
 
 - Do not execute the production Kerr/GSN solver, Julia numerical worker, M02 PowerShell campaign, or mathematical acceptance canaries.

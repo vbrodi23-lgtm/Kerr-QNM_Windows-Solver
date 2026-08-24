@@ -1172,6 +1172,9 @@ def _campaign_schema11_pass(
             "queued_count": result.queued_count,
             "cache_reused_count": result.cache_reused_count,
             "skipped_count": result.skipped_count,
+            "terminal_cache_discovery": (
+                result.terminal_cache_discovery.to_mapping()
+            ),
             "release_admissible": False,
         }
     if command == "campaign-survey-promoted":
@@ -1214,7 +1217,11 @@ def _campaign_schema11_pass(
             "unresolved_count": result.unresolved_count,
             "deferred_count": result.deferred_count,
             "rejected_count": result.rejected_count,
+            "cache_reused_count": result.cache_reused_count,
             "skipped_count": result.skipped_count,
+            "terminal_cache_discovery": (
+                result.terminal_cache_discovery.to_mapping()
+            ),
             "release_admissible": False,
         }
     if command in {"campaign-certify", "campaign-evidence-validate"}:

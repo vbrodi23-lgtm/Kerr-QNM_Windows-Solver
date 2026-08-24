@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 import hashlib
 import math
 import os
@@ -35,6 +35,11 @@ from .campaign_failures import (
     classify_failure,
 )
 from .contracts import canonical_json_bytes
+from .evidence_discovery import (
+    EvidenceDiscovery,
+    EvidenceDiscoveryStatus,
+    EvidenceDiscoveryTotals,
+)
 from .campaign_timing import (
     CampaignTimingLog,
     TimingSessionRecorder,
@@ -166,6 +171,9 @@ class Binary64SurveyRun:
     queued_count: int
     cache_reused_count: int
     skipped_count: int
+    terminal_cache_discovery: EvidenceDiscoveryTotals = field(
+        default_factory=EvidenceDiscoveryTotals
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -215,6 +223,10 @@ class PromotedSurveyRun:
     deferred_count: int
     rejected_count: int
     skipped_count: int
+    cache_reused_count: int = 0
+    terminal_cache_discovery: EvidenceDiscoveryTotals = field(
+        default_factory=EvidenceDiscoveryTotals
+    )
 
 
 def _record_pass_outcome(
@@ -274,6 +286,33 @@ def _record_pass_outcome(
     return result
 
 
+def _checkpoint_terminal_discovery() -> EvidenceDiscovery:
+    """Account for one authenticated terminal record already in schema-11 state."""
+
+    return EvidenceDiscovery(
+        status=EvidenceDiscoveryStatus.HIT,
+        discovered_count=1,
+        compatible_count=1,
+        rejected_count=0,
+    )
+
+
+class TerminalCacheConflictError(ValueError):
+    """Two authenticated exact terminal sources disagree for one request."""
+
+    def __init__(self) -> None:
+        self.discovery = EvidenceDiscovery(
+            status=EvidenceDiscoveryStatus.CONFLICT,
+            discovered_count=2,
+            compatible_count=2,
+            rejected_count=0,
+        )
+        super().__init__(
+            "TERMINAL_CACHE_CONFLICT "
+            + canonical_json_bytes(self.discovery.to_mapping()).decode("utf-8")
+        )
+
+
 def run_binary64_survey(
     plan: object,
     selection: RecoverySelection,
@@ -316,6 +355,7 @@ def run_binary64_survey(
     backend = None
     backgrounds: dict[str, CanonicalExteriorBackground] = {}
     completed = queued = reused = skipped = 0
+    terminal_cache_discovery = EvidenceDiscoveryTotals()
     path = Path(checkpoint_path)
     operational_timing = timing_log or CampaignTimingLog(
         path.with_name(f"{path.name}.timing.jsonl")
@@ -329,6 +369,17 @@ def run_binary64_survey(
             durable = validate_schema11_checkpoint(checkpoint_committed(durable))
         return durable
     result = persist(result)
+    cache_inventory = (
+        None
+        if solved_leaf_store is None
+        else solved_leaf_store.discover_many(
+            tuple(
+                (selection.scientific_identities[leaf_id], leaf_id)
+                for leaf_id in selection.ordered_leaf_ids
+            )
+        )
+    )
+    cache_reused_from_store = 0
 
     with progress_scope(execution_profile="SURVEY", survey_pass="binary64"):
         emit_progress(ProgressEventKind.CAMPAIGN_PASS_STARTED)
@@ -368,40 +419,64 @@ def run_binary64_survey(
                 raise AssertionError("system failure abort returned unexpectedly")
 
         retained = existing_records.get(leaf_id)
-        if retained is None and solved_leaf_store is not None:
-            lookup = guarded(
-                lambda: solved_leaf_store.lookup_readonly(
-                    selection.scientific_identities[leaf_id], leaf_id
+        checkpoint_discovery = (
+            None if retained is None else _checkpoint_terminal_discovery()
+        )
+        if retained is not None and record_validator is not None:
+            guarded(lambda: record_validator(leaf_id, retained))
+        cache_lookup = (
+            None
+            if cache_inventory is None
+            else cache_inventory.lookup_for(selection.scientific_identities[leaf_id])
+        )
+        cache_record: Mapping[str, object] | None = None
+        if cache_inventory is not None:
+            if cache_inventory.source_error is not None:
+                guarded(
+                    lambda: (_ for _ in ()).throw(ValueError(
+                        cache_inventory.source_error
+                    ))
                 )
-            )
-            assert hasattr(lookup, "status")
-            if lookup.status is SolvedLeafLookupStatus.CORRUPT:
+            assert cache_lookup is not None
+            if cache_lookup.status is SolvedLeafLookupStatus.CORRUPT:
                 guarded(
                     lambda: (_ for _ in ()).throw(ValueError(
                         "trusted solved-leaf cache receipt is corrupt: "
-                        f"{lookup.path}: {lookup.reason}"
+                        f"{cache_lookup.path}: {cache_lookup.reason}"
                     ))
                 )
-            if lookup.status is SolvedLeafLookupStatus.HIT:
-                if lookup.receipt is None:
+            if cache_lookup.status is SolvedLeafLookupStatus.HIT:
+                if cache_lookup.receipt is None:
                     guarded(
                         lambda: (_ for _ in ()).throw(
                             ValueError("solved-leaf cache hit lacks a receipt")
                         )
                     )
-                assert lookup.receipt is not None
-                retained = lookup.receipt["record"]
-                if not isinstance(retained, Mapping):
+                assert cache_lookup.receipt is not None
+                cache_record = cache_lookup.receipt.get("record")
+                if not isinstance(cache_record, Mapping):
                     guarded(
                         lambda: (_ for _ in ()).throw(
                             ValueError("solved-leaf cache record is invalid")
                         )
                     )
+                assert isinstance(cache_record, Mapping)
                 if record_validator is not None:
-                    guarded(lambda: record_validator(leaf_id, retained))
-                result = guarded(lambda: add_numerical_record(result, retained))
-                assert isinstance(result, dict)
-                existing_records[leaf_id] = retained
+                    guarded(lambda: record_validator(leaf_id, cache_record))
+                if retained is not None and dict(retained) != dict(cache_record):
+                    guarded(
+                        lambda: (_ for _ in ()).throw(TerminalCacheConflictError())
+                    )
+                if retained is None:
+                    retained = cache_record
+                    result = guarded(lambda: add_numerical_record(result, retained))
+                    assert isinstance(result, dict)
+                    existing_records[leaf_id] = retained
+                    cache_reused_from_store += 1
+        if checkpoint_discovery is not None:
+            terminal_cache_discovery = terminal_cache_discovery.add(
+                checkpoint_discovery.with_reused(1)
+            )
         if retained is not None:
             result = guarded(
                 lambda: record_survey_disposition(
@@ -412,10 +487,7 @@ def run_binary64_survey(
                     source_record_sha256=retained["record_sha256"],
                     result_record_sha256=retained["record_sha256"],
                     operation_identity="solved-leaf-cache/v1",
-                    precision_tiers=tuple(
-                        str(stage.get("digits", "retained"))
-                        for stage in retained["stages"]
-                    ),
+                    precision_tiers=_record_precision_tiers(retained),
                     reason_code="EXACT_AUTHENTICATED_CACHE_HIT",
                     sample_count=0,
                     sample_limit=0,
@@ -680,12 +752,17 @@ def run_binary64_survey(
             cache_reused_count=reused,
             skipped_count=skipped,
         )
+    if cache_inventory is not None:
+        terminal_cache_discovery = terminal_cache_discovery.add(
+            cache_inventory.discovery.with_reused(cache_reused_from_store)
+        )
     return Binary64SurveyRun(
         checkpoint=validate_schema11_checkpoint(result),
         completed_count=completed,
         queued_count=queued,
         cache_reused_count=reused,
         skipped_count=skipped,
+        terminal_cache_discovery=terminal_cache_discovery,
     )
 
 
@@ -1049,6 +1126,69 @@ def _commit_promoted_outcome(
     return result
 
 
+def _record_precision_tiers(record: Mapping[str, object]) -> tuple[str, ...]:
+    """Preserve the terminal record's actual precision labels in a cache receipt."""
+
+    stages = record.get("stages")
+    if not isinstance(stages, list) or not stages:
+        raise ValueError("terminal cache record stages are invalid")
+    tiers: list[str] = []
+    for stage in stages:
+        if not isinstance(stage, Mapping):
+            raise ValueError("terminal cache record stage is invalid")
+        value = stage.get("precision_tier", stage.get("digits"))
+        if value is None:
+            raise ValueError("terminal cache record precision is invalid")
+        tiers.append(str(value))
+    return tuple(tiers)
+
+
+def _commit_promoted_cache_reuse(
+    checkpoint: Mapping[str, object],
+    *,
+    leaf_id: str,
+    queue_ordinal: int,
+    record: Mapping[str, object],
+) -> dict[str, object]:
+    """Supersede a stale promotion with exact authenticated terminal evidence."""
+
+    record_sha256 = record.get("record_sha256")
+    if not isinstance(record_sha256, str):
+        raise ValueError("terminal cache record digest is invalid")
+    result = finish_promotion(
+        checkpoint,
+        queue_ordinal=queue_ordinal,
+        disposition=PromotionQueueDisposition.SUPERSEDED_BY_CACHE,
+        disposition_receipt={
+            "schema": "windows-solver.promoted-cache-supersession/v1",
+            "leaf_id": leaf_id,
+            "queue_ordinal": queue_ordinal,
+            "source_record_sha256": record_sha256,
+            "result_record_sha256": record_sha256,
+            "reason_code": "EXACT_AUTHENTICATED_CACHE_HIT",
+        },
+    )
+    return record_survey_disposition(
+        result,
+        survey_pass=SurveyPass.PROMOTED,
+        leaf_id=leaf_id,
+        disposition=SurveyDisposition.SUPERSEDED_BY_CACHE,
+        source_record_sha256=record_sha256,
+        result_record_sha256=record_sha256,
+        operation_identity="solved-leaf-cache/v1",
+        precision_tiers=_record_precision_tiers(record),
+        reason_code="EXACT_AUTHENTICATED_CACHE_HIT",
+        sample_count=0,
+        sample_limit=0,
+        root_read_count=0,
+        root_read_limit=0,
+        worker_launch_count=0,
+        worker_launch_limit=0,
+        tier_timing=(),
+        session_fragments=(),
+    )
+
+
 def run_promoted_survey(
     plan: object,
     selection: RecoverySelection,
@@ -1067,6 +1207,8 @@ def run_promoted_survey(
         [object, JuliaFixedRootSurveyBatch, object, int],
         tuple[Mapping[str, object], str],
     ],
+    solved_leaf_store: SolvedLeafStore | None = None,
+    record_validator: RecordValidator | None = None,
     timing_log: CampaignTimingLog | None = None,
     clock: Callable[[], float] = time.monotonic,
     session_id_factory: Callable[[], str] | None = None,
@@ -1099,7 +1241,22 @@ def run_promoted_survey(
 
 
     result = persist(result)
-    completed = unresolved = deferred = rejected = skipped = 0
+    existing_records = {
+        record["leaf_id"]: record for record in result["records"]
+    }
+    completed = unresolved = deferred = rejected = skipped = cache_reused = 0
+    terminal_cache_discovery = EvidenceDiscoveryTotals()
+    cache_inventory = (
+        None
+        if solved_leaf_store is None
+        else solved_leaf_store.discover_many(
+            tuple(
+                (selection.scientific_identities[leaf_id], leaf_id)
+                for leaf_id in selection.ordered_leaf_ids
+            )
+        )
+    )
+    cache_reused_from_store = 0
     with progress_scope(execution_profile="SURVEY", survey_pass="promoted"):
         emit_progress(ProgressEventKind.CAMPAIGN_PASS_STARTED)
     entries = tuple(result["promotion_queue"]["entries"])
@@ -1140,6 +1297,90 @@ def run_promoted_survey(
                     persist_checkpoint=lambda value: persist(value),
                 )
                 raise AssertionError("system failure abort returned unexpectedly")
+
+        retained = existing_records.get(leaf_id)
+        checkpoint_discovery = (
+            None if retained is None else _checkpoint_terminal_discovery()
+        )
+        if retained is not None and record_validator is not None:
+            guarded(lambda: record_validator(leaf_id, retained))
+        cache_lookup = (
+            None
+            if cache_inventory is None
+            else cache_inventory.lookup_for(selection.scientific_identities[leaf_id])
+        )
+        cache_record: Mapping[str, object] | None = None
+        if cache_inventory is not None:
+            if cache_inventory.source_error is not None:
+                guarded(
+                    lambda: (_ for _ in ()).throw(ValueError(
+                        cache_inventory.source_error
+                    ))
+                )
+            assert cache_lookup is not None
+            if cache_lookup.status is SolvedLeafLookupStatus.CORRUPT:
+                guarded(
+                    lambda: (_ for _ in ()).throw(ValueError(
+                        "trusted solved-leaf cache receipt is corrupt: "
+                        f"{cache_lookup.path}: {cache_lookup.reason}"
+                    ))
+                )
+            if cache_lookup.status is SolvedLeafLookupStatus.HIT:
+                if cache_lookup.receipt is None:
+                    guarded(
+                        lambda: (_ for _ in ()).throw(
+                            ValueError("solved-leaf cache hit lacks a receipt")
+                        )
+                    )
+                assert cache_lookup.receipt is not None
+                cache_record = cache_lookup.receipt.get("record")
+                if not isinstance(cache_record, Mapping):
+                    guarded(
+                        lambda: (_ for _ in ()).throw(
+                            ValueError("solved-leaf cache record is invalid")
+                        )
+                    )
+                assert isinstance(cache_record, Mapping)
+                if record_validator is not None:
+                    guarded(lambda: record_validator(leaf_id, cache_record))
+                if retained is not None and dict(retained) != dict(cache_record):
+                    guarded(
+                        lambda: (_ for _ in ()).throw(TerminalCacheConflictError())
+                    )
+                if retained is None:
+                    retained = cache_record
+                    result = guarded(lambda: add_numerical_record(result, retained))
+                    assert isinstance(result, dict)
+                    existing_records[leaf_id] = retained
+                    cache_reused_from_store += 1
+        if checkpoint_discovery is not None:
+            terminal_cache_discovery = terminal_cache_discovery.add(
+                checkpoint_discovery.with_reused(1)
+            )
+        if retained is not None:
+            result = guarded(lambda: _commit_promoted_cache_reuse(
+                result,
+                leaf_id=leaf_id,
+                queue_ordinal=ordinal,
+                record=retained,
+            ))
+            assert isinstance(result, dict)
+            cache_reused += 1
+            result = persist(result)
+            with progress_scope(
+                leaf_id=leaf_id,
+                execution_profile="SURVEY",
+                survey_pass="promoted",
+                pass_disposition=SurveyDisposition.SUPERSEDED_BY_CACHE.value,
+                sample_count_used=0,
+                sample_count_limit=0,
+                root_read_count=0,
+                root_read_limit=0,
+                worker_launch_count=0,
+                worker_launch_limit=0,
+            ):
+                emit_progress(ProgressEventKind.LEAF_PASS_DISPOSITION_RECORDED)
+            continue
 
         if leaf.mechanism_id == "horizon-admittance":
             outcome = guarded(lambda: horizon_runner(leaf))
@@ -1250,6 +1491,10 @@ def run_promoted_survey(
             rejected_count=rejected,
             skipped_count=skipped,
         )
+    if cache_inventory is not None:
+        terminal_cache_discovery = terminal_cache_discovery.add(
+            cache_inventory.discovery.with_reused(cache_reused_from_store)
+        )
     return PromotedSurveyRun(
         checkpoint=validate_schema11_checkpoint(result),
         completed_count=completed,
@@ -1257,6 +1502,8 @@ def run_promoted_survey(
         deferred_count=deferred,
         rejected_count=rejected,
         skipped_count=skipped,
+        cache_reused_count=cache_reused,
+        terminal_cache_discovery=terminal_cache_discovery,
     )
 
 

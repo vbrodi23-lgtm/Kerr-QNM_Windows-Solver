@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import StrEnum
 import hashlib
@@ -11,9 +11,11 @@ import os
 from pathlib import Path
 import re
 import tempfile
-from typing import Mapping
+from types import MappingProxyType
+from typing import Mapping, Sequence
 
 from .contracts import canonical_json_bytes
+from .evidence_discovery import EvidenceDiscovery, EvidenceDiscoveryStatus
 
 
 SOLVED_LEAF_CACHE_SCHEMA_VERSION = 1
@@ -22,6 +24,7 @@ _STORE_DIRECTORY_NAME = "solved-leaves-" + "v" + str(
 )
 _HEX_64 = re.compile(r"[0-9a-f]{64}")
 _TERMINAL_STATES = frozenset({"PRODUCED", "UNRESOLVED"})
+_SCHEMA11_NUMERICAL_RECORD = "windows-solver.schema11-numerical-record/1"
 _SOURCE_TYPES = frozenset({
     "originating-campaign",
     "imported-authenticated-checkpoint",
@@ -66,6 +69,26 @@ def _load_json(path: Path) -> object:
         raise ValueError("solved-leaf cache entry is not valid JSON") from error
 
 
+def _is_cacheable_terminal_record(
+    record: Mapping[str, object], *, state: object, stages: object
+) -> bool:
+    """Accept both historical leaf records and current schema-11 survey records.
+
+    Schema-11 survey records deliberately do not carry the historical
+    ``computed`` field.  They are nevertheless immutable terminal numerical
+    evidence once their own record digest and current campaign validation pass.
+    """
+
+    if record.get("schema") == _SCHEMA11_NUMERICAL_RECORD:
+        return state == "PRODUCED" and isinstance(stages, list) and bool(stages)
+    return (
+        state in _TERMINAL_STATES
+        and record.get("computed") is True
+        and isinstance(stages, list)
+        and bool(stages)
+    )
+
+
 def _atomic_json(path: Path, value: object) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temporary_name = tempfile.mkstemp(
@@ -98,6 +121,29 @@ class SolvedLeafLookup:
     path: Path | None = None
     receipt: Mapping[str, object] | None = None
     reason: str | None = None
+    discovery: EvidenceDiscovery = field(
+        default_factory=EvidenceDiscovery.not_attempted
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class SolvedLeafStoreDiscovery:
+    """One authenticated inventory of a configured solved-leaf store.
+
+    A pass consumes this inventory once, then selects exact compatible entries
+    from it for each leaf.  That avoids reporting the same physical store as
+    newly discovered for every requested leaf.
+    """
+
+    lookups: Mapping[str, SolvedLeafLookup]
+    discovery: EvidenceDiscovery
+    source_error: str | None = None
+
+    def lookup_for(self, scientific_identity_sha256: str) -> SolvedLeafLookup:
+        try:
+            return self.lookups[scientific_identity_sha256]
+        except KeyError as error:
+            raise ValueError("solved-leaf discovery request is unknown") from error
 
 
 class SolvedLeafStore:
@@ -166,8 +212,9 @@ class SolvedLeafStore:
         if (
             record.get("leaf_id") != leaf_id
             or record.get("state") != state
-            or record.get("computed") is not True
-            or not isinstance(record.get("stages"), list)
+            or not _is_cacheable_terminal_record(
+                record, state=state, stages=record.get("stages")
+            )
             or len(record["stages"]) != stages
             or record.get("record_sha256") != record_sha
         ):
@@ -200,42 +247,190 @@ class SolvedLeafStore:
     ) -> SolvedLeafLookup:
         """Inspect one cache identity without moving or rewriting any source file."""
 
-        path = self._entry_path(scientific_identity_sha256)
-        if path.exists():
-            try:
-                receipt = self._validate_receipt(_load_json(path))
-                if (
-                    receipt["scientific_computation_identity_sha256"]
-                    != scientific_identity_sha256
-                    or receipt["leaf_id"] != leaf_id
-                ):
-                    raise ValueError("solved-leaf cache object identity is invalid")
-            except (OSError, ValueError) as error:
-                return SolvedLeafLookup(
-                    SolvedLeafLookupStatus.CORRUPT,
-                    path=path,
-                    reason=str(error),
-                )
-            return SolvedLeafLookup(
-                SolvedLeafLookupStatus.HIT,
-                path=path,
-                receipt=receipt,
+        inventory = self.discover_many(((scientific_identity_sha256, leaf_id),))
+        lookup = inventory.lookup_for(scientific_identity_sha256)
+        if inventory.source_error is None:
+            return lookup
+        if lookup.status is SolvedLeafLookupStatus.CORRUPT:
+            return lookup
+        return SolvedLeafLookup(
+            SolvedLeafLookupStatus.CORRUPT,
+            reason=inventory.source_error,
+            discovery=inventory.discovery,
+        )
+
+    def discover_many(
+        self, requests: Sequence[tuple[str, str]]
+    ) -> SolvedLeafStoreDiscovery:
+        """Authenticate a whole store once for an exact set of leaf requests.
+
+        ``discovered_count`` is the number of physical cache objects in this
+        configured source, not that count multiplied by the number of leaves
+        which consulted it.  A corrupt object makes the trusted source fail
+        closed even when another request would otherwise be a normal miss.
+        """
+
+        requested: dict[str, str] = {}
+        for scientific_identity_sha256, leaf_id in requests:
+            self._entry_path(scientific_identity_sha256)
+            if not isinstance(leaf_id, str) or not leaf_id:
+                raise ValueError("solved-leaf cache request leaf ID is invalid")
+            previous = requested.setdefault(scientific_identity_sha256, leaf_id)
+            if previous != leaf_id:
+                raise ValueError("solved-leaf cache request identity conflicts")
+
+        def empty_inventory(
+            status: EvidenceDiscoveryStatus,
+            *,
+            reason: str | None = None,
+            discovered_count: int = 0,
+        ) -> SolvedLeafStoreDiscovery:
+            discovery = EvidenceDiscovery(
+                status=status,
+                discovered_count=discovered_count,
+                compatible_count=0,
+                rejected_count=0,
             )
+            lookup_status = (
+                SolvedLeafLookupStatus.CORRUPT
+                if status is EvidenceDiscoveryStatus.CORRUPT
+                else SolvedLeafLookupStatus.MISSING
+            )
+            return SolvedLeafStoreDiscovery(
+                lookups=MappingProxyType({
+                    identity: SolvedLeafLookup(
+                        lookup_status,
+                        reason=reason,
+                        discovery=discovery,
+                    )
+                    for identity in requested
+                }),
+                discovery=discovery,
+                source_error=reason,
+            )
+
+        if not self.root.exists():
+            return empty_inventory(EvidenceDiscoveryStatus.EMPTY)
         if not self.root.is_dir():
-            return SolvedLeafLookup(SolvedLeafLookupStatus.MISSING)
-        for candidate in self.root.glob("*.json"):
+            return empty_inventory(
+                EvidenceDiscoveryStatus.CORRUPT,
+                reason="solved-leaf cache store is not a directory",
+                discovered_count=1,
+            )
+        candidates = tuple(sorted(self.root.glob("*.json"), key=lambda item: item.name))
+        if not candidates:
+            return empty_inventory(EvidenceDiscoveryStatus.EMPTY)
+
+        valid: dict[str, tuple[Path, Mapping[str, object]]] = {}
+        stale_by_leaf: dict[str, tuple[Path, Mapping[str, object]]] = {}
+        corrupt_paths: dict[str, Path] = {}
+        errors: list[str] = []
+        for candidate in candidates:
             try:
+                if candidate.is_symlink():
+                    raise ValueError("solved-leaf cache entry may not be a symlink")
                 receipt = self._validate_receipt(_load_json(candidate))
-            except (OSError, ValueError):
+                identity = str(receipt["scientific_computation_identity_sha256"])
+                if candidate != self._entry_path(identity):
+                    raise ValueError("solved-leaf cache filename does not match identity")
+                if identity in valid:
+                    raise ValueError("solved-leaf cache contains duplicate identities")
+            except (OSError, ValueError, UnicodeDecodeError) as error:
+                errors.append(f"{candidate}: {error}")
+                candidate_identity = candidate.stem
+                if candidate_identity in requested:
+                    corrupt_paths[candidate_identity] = candidate
                 continue
-            if receipt["leaf_id"] == leaf_id:
-                return SolvedLeafLookup(
+            valid[identity] = (candidate, receipt)
+            leaf_id = str(receipt["leaf_id"])
+            stale_by_leaf.setdefault(leaf_id, (candidate, receipt))
+
+        exact: dict[str, tuple[Path, Mapping[str, object]]] = {}
+        for identity, expected_leaf_id in requested.items():
+            candidate = valid.get(identity)
+            if candidate is None:
+                continue
+            path, receipt = candidate
+            if receipt["leaf_id"] != expected_leaf_id:
+                errors.append(
+                    f"{path}: solved-leaf cache object identity is invalid"
+                )
+                corrupt_paths[identity] = path
+                continue
+            exact[identity] = candidate
+
+        discovered_count = len(candidates)
+        compatible_count = len(exact)
+        rejected_count = len(valid) - compatible_count
+        if errors:
+            discovery = EvidenceDiscovery(
+                status=EvidenceDiscoveryStatus.CORRUPT,
+                discovered_count=discovered_count,
+                compatible_count=compatible_count,
+                rejected_count=rejected_count,
+            )
+            source_error = "trusted solved-leaf cache source is corrupt: " + "; ".join(
+                errors
+            )
+        else:
+            status = (
+                EvidenceDiscoveryStatus.HIT
+                if compatible_count
+                else EvidenceDiscoveryStatus.MISS
+            )
+            discovery = EvidenceDiscovery(
+                status=status,
+                discovered_count=discovered_count,
+                compatible_count=compatible_count,
+                rejected_count=rejected_count,
+            )
+            source_error = None
+
+        lookups: dict[str, SolvedLeafLookup] = {}
+        for identity, leaf_id in requested.items():
+            if identity in exact:
+                path, receipt = exact[identity]
+                lookup_status = (
+                    SolvedLeafLookupStatus.CORRUPT
+                    if source_error is not None
+                    else SolvedLeafLookupStatus.HIT
+                )
+                lookups[identity] = SolvedLeafLookup(
+                    lookup_status,
+                    path=path,
+                    receipt=None if source_error is not None else receipt,
+                    reason=source_error,
+                    discovery=discovery,
+                )
+                continue
+            if source_error is not None:
+                lookups[identity] = SolvedLeafLookup(
+                    SolvedLeafLookupStatus.CORRUPT,
+                    path=corrupt_paths.get(identity),
+                    reason=source_error,
+                    discovery=discovery,
+                )
+                continue
+            stale = stale_by_leaf.get(leaf_id)
+            if stale is not None:
+                path, receipt = stale
+                lookups[identity] = SolvedLeafLookup(
                     SolvedLeafLookupStatus.STALE,
-                    path=candidate,
+                    path=path,
                     receipt=receipt,
                     reason="scientific computation identity changed",
+                    discovery=discovery,
                 )
-        return SolvedLeafLookup(SolvedLeafLookupStatus.MISSING)
+            else:
+                lookups[identity] = SolvedLeafLookup(
+                    SolvedLeafLookupStatus.MISSING,
+                    discovery=discovery,
+                )
+        return SolvedLeafStoreDiscovery(
+            lookups=MappingProxyType(lookups),
+            discovery=discovery,
+            source_error=source_error,
+        )
 
     def quarantine(self, path: Path, reason: str) -> Path | None:
         if not path.exists():
@@ -257,7 +452,9 @@ class SolvedLeafStore:
         source_type: str,
     ) -> dict[str, object]:
         state = record.get("state")
-        if state not in _TERMINAL_STATES or record.get("computed") is not True:
+        if not _is_cacheable_terminal_record(
+            record, state=state, stages=record.get("stages")
+        ):
             raise ValueError("solved-leaf cache accepts terminal records only")
         stages = record.get("stages")
         if not isinstance(stages, list) or not stages:
@@ -353,6 +550,12 @@ class SolvedLeafStore:
                 SolvedLeafLookupStatus.HIT,
                 path=path,
                 receipt=receipt,
+                discovery=EvidenceDiscovery(
+                    status=EvidenceDiscoveryStatus.HIT,
+                    discovered_count=1,
+                    compatible_count=1,
+                    rejected_count=0,
+                ),
             )
         finally:
             try:
