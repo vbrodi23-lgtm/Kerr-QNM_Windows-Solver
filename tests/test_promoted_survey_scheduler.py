@@ -217,16 +217,27 @@ class PromotedSurveySchedulerTests(unittest.TestCase):
         root_runner=None,
     ):
         calls: list[int] = []
+        published: dict[str, AuthenticatedRootSeal] = {}
+
+        def root_seal_lookup(leaf, entry):
+            source_sha256 = entry["source_root_seal_sha256"]
+            if source_sha256 is not None:
+                return AuthenticatedRootSeal(
+                    leaf.job.root.omega,
+                    leaf.job.root.branch_id,
+                    source_sha256,
+                )
+            return published.get(leaf.leaf_id)
+
         with tempfile.TemporaryDirectory() as temporary:
             result = run_promoted_survey(
                 self.plan,
                 self.selection,
                 checkpoint,
                 checkpoint_path=Path(temporary) / "checkpoint.json",
-                root_seal_lookup=lambda leaf, entry: AuthenticatedRootSeal(
-                    leaf.job.root.omega,
-                    leaf.job.root.branch_id,
-                    entry["source_root_seal_sha256"],
+                root_seal_lookup=root_seal_lookup,
+                root_seal_publish=lambda leaf, seal: published.__setitem__(
+                    leaf.leaf_id, seal
                 ),
                 backend_factory=lambda leaf, digits: _Backend(
                     leaf, digits,

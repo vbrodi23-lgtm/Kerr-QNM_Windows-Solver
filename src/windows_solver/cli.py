@@ -589,7 +589,7 @@ def _selected_response(
 ) -> tuple[int, object]:
     plan, backend = _load_response_selection(selection)
     if command == "response-plan":
-        return (0 if result.pass_exhausted else 3), {
+        return 0, {
             "command": command,
             "plan_id": plan.plan_id,
             "job_count": len(plan.jobs),
@@ -1444,8 +1444,9 @@ def _campaign_reduce(bundle_path: Path, output: Path) -> tuple[int, object]:
         raise ValueError("campaign reduction bundle must be an object")
     if value.get("schema_version") == 1:
         raise ValueError(
-            "legacy schema-1 reduction bundles cannot prove schema-11 evidence; "
-            "regenerate the bundle with explicit schema-11 checkpoint paths"
+            "campaign-reduce requires a schema-11 evidence checkpoint; legacy "
+            "schema-1 reduction bundles cannot prove schema-11 evidence and must "
+            "be regenerated with explicit schema-11 checkpoint paths"
         )
     expected_fields = {
         "schema_version", "campaign_id", "backend_id", "precision_digits",

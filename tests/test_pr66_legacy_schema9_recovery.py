@@ -117,7 +117,7 @@ def _synthetic_schema9(fixture: dict[str, object], count: int) -> dict[str, obje
 
 class LegacySchema9RecoveryTests(unittest.TestCase):
     def test_real_historical_fixture_is_authenticated_but_not_relabelled(self) -> None:
-        """The real PR63 artifact has 40 terminal records, none current-safe."""
+        """The real artifact has 40 terminal records, none current-compatible."""
 
         self.assertEqual(
             FIXTURE_SHA256, hashlib.sha256(FIXTURE.read_bytes()).hexdigest()
@@ -184,7 +184,7 @@ class LegacySchema9RecoveryTests(unittest.TestCase):
         ]
         self.assertEqual(40, summary.legacy_authenticated_terminal_count)
         self.assertEqual(0, summary.legacy_imported_count)
-        self.assertEqual(40, summary.legacy_unreconstructable_count)
+        self.assertEqual(0, summary.legacy_unreconstructable_count)
         self.assertEqual([], candidate["records"])
         self.assertEqual({}, candidate["evidence_ledger"])
         self.assertEqual(40, len(compatibility))
@@ -192,7 +192,7 @@ class LegacySchema9RecoveryTests(unittest.TestCase):
             item["original_record_status"] == "AUTHENTICATED"
             and item["imported_as_current_numerical_record"] is False
             and item["schema11_evidence_level"] is None
-            and item["reason"] == "CURRENT_CAMPAIGN_IDENTITY_MISMATCH"
+            and item["reason"] == "CURRENT_SCIENTIFIC_IDENTITY_INCOMPATIBLE"
             for item in compatibility
         ))
         self.assertEqual("NOT_SUPPLIED", receipt["oracle_status"])
@@ -297,8 +297,10 @@ class LegacySchema9RecoveryTests(unittest.TestCase):
                 for item in candidate["recovery_receipts"]
                 if item.get("schema") == "legacy-compatibility/v1"
             )
-            self.assertEqual(0, summary.recovered_count)
-            self.assertEqual("CURRENT_SELECTION_IDENTITY_MISMATCH", compatibility["reason"])
+            self.assertEqual(1, summary.recovered_count)
+            self.assertIsNone(compatibility["reason"])
+            self.assertFalse(compatibility["source_selection_matches_current"])
+            self.assertTrue(compatibility["imported_as_current_numerical_record"])
 
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

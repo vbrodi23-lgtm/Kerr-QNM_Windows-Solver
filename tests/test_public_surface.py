@@ -578,8 +578,8 @@ class PublicSurfaceTests(unittest.TestCase):
         self.assertIn("PipelineStoppedException", launcher)
         self.assertIn("PipelineStoppedException", solver_launcher)
         self.assertIn("-1073741510", solver_launcher)
-        self.assertIn('"campaign-plan",\n        $Selection\n', launcher)
-        self.assertNotIn("$SelectionPath,", launcher)
+        self.assertIn('"campaign-plan",\n        $SelectionPath\n', launcher)
+        self.assertNotIn('"campaign-plan",\n        $Selection\n', launcher)
 
     def test_m02_launcher_forwards_only_sha_pinned_calibration_overrides(self) -> None:
         root = Path(__file__).resolve().parents[1]
@@ -664,7 +664,7 @@ if ($SolverArguments[0] -eq "campaign-plan") {
     '{"role_counts":{"primary":140,"control":24,"deep":48},"leaf_count":212}'
     exit 0
 }
-if ($SolverArguments[0] -eq "campaign-recover") {
+if ($SolverArguments[0] -eq "campaign-new") {
     $outputIndex = [Array]::IndexOf($SolverArguments, "--output")
     $checkpoint = [IO.Path]::GetFullPath($SolverArguments[$outputIndex + 1])
     New-Item -ItemType Directory -Force -Path (Split-Path -Parent $checkpoint) |
@@ -900,6 +900,10 @@ exit 0
                 json.loads(line)
                 for line in argument_log.read_text(encoding="utf-8").splitlines()
             ]
+            selection_path = package_root / "examples" / "m02-campaign.json"
+            for call in calls:
+                self.assertTrue(Path(call[1]).samefile(selection_path))
+                call[1] = str(selection_path)
             for call in calls[1:]:
                 checkpoint_index = call.index("--checkpoint") + 1
                 self.assertTrue(
@@ -907,7 +911,7 @@ exit 0
                 )
                 call[checkpoint_index] = str(checkpoint_path)
 
-        selection = r".\examples\m02-campaign.json"
+        selection = str(selection_path)
         checkpoint = str(checkpoint_path)
         self.assertEqual(
             calls,
@@ -1133,6 +1137,14 @@ $candidate | ConvertTo-Json -Compress | Set-Content -LiteralPath $env:M02_TEST_J
             "windows-solver.m02-report-status/v1",
             "windows-solver.m02-schema11-report-status/v1",
             "binary64-horizon-production/v1",
+            "promoted-survey-production/v1",
+            "production-certification-comparator/v1",
+            "independent-validation-comparator/v1",
+            "same-backend-refinement/v1",
+            "exterior-finite-amplitude-root-displacement/v1",
+            "horizon-finite-amplitude-scattering/v1",
+            "windows-solver.projective-triage-projection/v1",
+            "approved-reviewed-error/v1",
             "adaptive-exterior-gap-standoff/v2",
             "factored-homogeneous-gsn/v1",
             "factored-plane-wave-gsn/v1",

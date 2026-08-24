@@ -11,6 +11,7 @@ import tempfile
 import unittest
 
 from windows_solver.contracts import canonical_json_bytes
+from windows_solver.evidence_authentication import evidence_policy_identity
 from windows_solver.campaign_policy import (
     EvidenceLevel,
     add_numerical_record,
@@ -48,6 +49,56 @@ from windows_solver.response_reduction import (
     reduce_projective_row,
     reduce_projective_rows,
 )
+
+
+def _sha256(value: object) -> str:
+    return hashlib.sha256(canonical_json_bytes(value)).hexdigest()
+
+
+def _certification_disposition(
+    leaf_id: str, record_sha256: str, stage_sha256: str
+) -> dict[str, object]:
+    independent_result = {"leaf_id": leaf_id, "route": "synthetic-certification"}
+    source_content = {
+        "schema": "windows-solver.native-evidence-result/1",
+        "profile": "CERTIFY",
+        "evidence_policy_identity": evidence_policy_identity("CERTIFY"),
+        "leaf_id": leaf_id,
+        "central_record_sha256": record_sha256,
+        "central_stage_sha256": stage_sha256,
+        "precision_tier": "BF80",
+        "refinement": 0,
+        "operation_identity": "production-certification-comparator/v1",
+        "backend_identity": "b" * 64,
+        "runtime_identity": "c" * 64,
+        "calculation_route_identity": "same-backend-refinement/v1",
+        "calculation_route_family": "EXTERIOR",
+        "route_output_sha256": _sha256(independent_result),
+        "human_mathematics_review_receipt": None,
+        "centre_agrees": True,
+        "discrepancy_code": None,
+        "independent_result": independent_result,
+    }
+    source = {**source_content, "receipt_sha256": _sha256(source_content)}
+    disposition_content = {
+        "schema": "windows-solver.evidence-pass-disposition/1",
+        "profile": "CERTIFY",
+        "request_sha256": "a" * 64,
+        "evidence_policy_identity": evidence_policy_identity("CERTIFY"),
+        "engine_identity": "d" * 64,
+        "leaf_id": leaf_id,
+        "central_record_sha256": record_sha256,
+        "central_stage_sha256": stage_sha256,
+        "centre_agrees": True,
+        "discrepancy_code": None,
+        "precision_tiers": ["BF80"],
+        "validation_admission_status": "NOT_APPLICABLE",
+        "source_receipt": source,
+    }
+    return {
+        **disposition_content,
+        "receipt_sha256": _sha256(disposition_content),
+    }
 
 
 class ProjectiveRowPlanTests(unittest.TestCase):
@@ -323,21 +374,35 @@ class ProjectiveRowPlanTests(unittest.TestCase):
             )
             bundle_path = directory / "reduction-bundle.json"
 
-            def write_bundle() -> None:
+            def write_bundle(schema_version: int = 1) -> None:
                 source_hash = (
                     "sha256:" + hashlib.sha256(checkpoint.read_bytes()).hexdigest()
                 )
-                material = {
-                    "schema_version": 1,
+                shared = {
                     "campaign_id": plan.campaign_id,
                     "backend_id": plan.backend_identity.backend_id,
                     "precision_digits": [64],
                     "precision_backend": None,
-                    "checkpoint_paths": [checkpoint.name],
                     "selected_row_ids": [row.row_id],
                     "component_evidence": [],
                     "source_hashes": [source_hash],
                 }
+                material = (
+                    {
+                        "schema_version": 1,
+                        **shared,
+                        "checkpoint_paths": [checkpoint.name],
+                    }
+                    if schema_version == 1
+                    else {
+                        "schema_version": 2,
+                        **shared,
+                        "schema11_checkpoint_paths": [checkpoint.name],
+                        "required_evidence_levels": {
+                            leaf_id: "CERTIFIED" for leaf_id in selected_ids
+                        },
+                    }
+                )
                 bundle_path.write_bytes(canonical_json_bytes({
                     **material,
                     "bundle_sha256": hashlib.sha256(
@@ -371,7 +436,7 @@ class ProjectiveRowPlanTests(unittest.TestCase):
                     plan.campaign_id, selection.selection_id
                 )
             ))
-            write_bundle()
+            write_bundle(schema_version=2)
             missing = invoke(
                 "campaign-reduce", bundle_path.name, "--output", "missing.json"
             )
@@ -635,9 +700,13 @@ class ProjectiveRowPlanTests(unittest.TestCase):
                         record_mapping["stages"][-1]["stage_sha256"]
                     ),
                     evidence_level=EvidenceLevel.CERTIFIED,
-                    receipts=({
-                        "schema": "windows-solver.test-certification/1"
-                    },),
+                    receipts=(
+                        _certification_disposition(
+                            row_record.leaf_id,
+                            record_mapping["record_sha256"],
+                            record_mapping["stages"][-1]["stage_sha256"],
+                        ),
+                    ),
                 )
             checkpoint.write_bytes(canonical_json_bytes(schema11))
             source_receipt = (
@@ -667,13 +736,16 @@ class ProjectiveRowPlanTests(unittest.TestCase):
 
             def write_bundle(component_mapping: dict[str, object]) -> Path:
                 material = {
-                    "schema_version": 1,
+                    "schema_version": 2,
                     "campaign_id": plan.campaign_id,
                     "backend_id": plan.backend_identity.backend_id,
                     "precision_digits": [64],
                     "precision_backend": None,
-                    "checkpoint_paths": [checkpoint.name],
+                    "schema11_checkpoint_paths": [checkpoint.name],
                     "selected_row_ids": [row.row_id],
+                    "required_evidence_levels": {
+                        item.leaf_id: "CERTIFIED" for item in row_records
+                    },
                     "component_evidence": [component_mapping],
                     "source_hashes": [source_receipt],
                 }

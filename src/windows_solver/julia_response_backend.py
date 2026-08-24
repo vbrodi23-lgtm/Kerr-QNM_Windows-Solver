@@ -2863,7 +2863,7 @@ class JuliaResponseAdapter:
             _raise_worker_failure(details)
         if response.get("request_sha256") != request_sha256:
             raise JuliaResponseBackendError("M02 Julia response request digest mismatch")
-        if retain_fresh:
+        if retain_fresh and self.readout_cache is not None:
             self._retain_readout(request_sha256, response)
         return JuliaResponseEvaluation(
             response=dict(response),

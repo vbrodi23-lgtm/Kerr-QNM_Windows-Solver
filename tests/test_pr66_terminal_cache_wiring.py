@@ -429,7 +429,7 @@ class PromotedTerminalCacheWiringTests(unittest.TestCase):
                 source_type="originating-campaign",
             )
             with patch(
-                "windows_solver.campaign_runtime._root_index",
+                "windows_solver.campaign_runtime.AuthenticatedRootSealProvider",
                 side_effect=AssertionError("terminal cache consulted root provider"),
             ), patch(
                 "windows_solver.campaign_runtime._binary64_backend",
