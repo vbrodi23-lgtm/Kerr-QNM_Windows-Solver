@@ -108,6 +108,9 @@ class RootDependencyLifecycleTests(unittest.TestCase):
                 produced_record_builder=lambda *args: self.fail(
                     "horizon-only lifecycle test must not build an exterior record"
                 ),
+                provisional_stage_committed=lambda *_args: self.fail(
+                    "horizon-only lifecycle test must not publish an exterior stage"
+                ),
             )
 
             horizon_seal = provider.lookup(self.horizon)

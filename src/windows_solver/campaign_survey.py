@@ -59,7 +59,9 @@ from .response_engine import (
     Binary64ReusedBackgroundBatch,
     Binary64SurveyDisposition,
     CanonicalExteriorBackground,
+    EXTERIOR_PROVISIONAL_REUSE_RECEIPT_SCHEMA,
     build_exterior_background_reuse_key,
+    build_exterior_provisional_stage,
     canonical_background_from_binary64_batch,
     combine_binary64_reused_background_batch,
     reviewed_determinant_error_claims_for_fixed_root_batch,
@@ -78,6 +80,7 @@ from .julia_response_backend import (
     JuliaODEResourceLimitError,
     JuliaResponseBackendError,
     JuliaRootReadoutResourceLimitError,
+    consume_authenticated_binary64_provisional_predecessor,
 )
 from .progress import ProgressEventKind, emit_progress, progress_scope
 from .root_evidence import RootDependencyKey
@@ -574,6 +577,9 @@ def run_binary64_survey(
     produced_record_builder: Callable[
         [object, object, object], tuple[Mapping[str, object], str]
     ],
+    provisional_stage_committed: Callable[
+        [object, Mapping[str, object]], None
+    ],
     equivalence_receipt_lookup: Callable[
         [object, CanonicalExteriorBackground],
         BackgroundEquivalenceReceipt | None,
@@ -924,6 +930,8 @@ def run_binary64_survey(
                             equivalence_receipt=receipt,
                         )
                     )
+                canonical_background: CanonicalExteriorBackground | None = None
+                combined_batch: Binary64FixedRootBatch | None = None
                 if isinstance(batch, Binary64FixedRootBatch):
                     canonical = guarded(
                         lambda: canonical_background_from_binary64_batch(
@@ -931,6 +939,8 @@ def run_binary64_survey(
                         )
                     )
                     assert isinstance(canonical, CanonicalExteriorBackground)
+                    canonical_background = canonical
+                    combined_batch = batch
                     if background_evidence_store is not None:
                         compatible_receipts: dict[
                             str, BackgroundEquivalenceReceipt
@@ -1013,6 +1023,9 @@ def run_binary64_survey(
                             background, batch
                         )
                     )
+                    assert isinstance(combined, Binary64FixedRootBatch)
+                    canonical_background = background
+                    combined_batch = combined
                     determinant_error_evidence = guarded(lambda: (
                         None
                         if determinant_error_store is None
@@ -1042,6 +1055,37 @@ def run_binary64_survey(
                         )
                     )
                     raise AssertionError("invalid batch guard returned")
+                if canonical_background is None or combined_batch is None:
+                    guarded(
+                        lambda: (_ for _ in ()).throw(
+                            ValueError("binary64 provisional background is missing")
+                        )
+                    )
+                    raise AssertionError("missing provisional background guard returned")
+                provisional_background_receipt = guarded(
+                    lambda: BackgroundEquivalenceReceipt.issue(
+                        reuse_key=reuse_key,
+                        job=leaf.job,
+                        canonical_background_sha256=canonical_background.sha256,
+                        fixed_root=seal.fixed_root,
+                    )
+                )
+                assert isinstance(
+                    provisional_background_receipt, BackgroundEquivalenceReceipt
+                )
+                if (
+                    isinstance(batch, Binary64ReusedBackgroundBatch)
+                    and receipt is not None
+                    and receipt != provisional_background_receipt
+                ):
+                    guarded(
+                        lambda: (_ for _ in ()).throw(
+                            ValueError(
+                                "reused binary64 background receipt is incompatible"
+                            )
+                        )
+                    )
+                    raise AssertionError("incompatible background receipt guard returned")
                 evidence_receipts = ({
                     "schema": "windows-solver.binary64-screening/1",
                     "batch": batch.to_mapping(),
@@ -1092,6 +1136,27 @@ def run_binary64_survey(
                         )
                         raise AssertionError("promotion guard returned")
                     queue_kind = PromotionQueueKind(queue_name)
+                    provisional_stage = None
+                    provisional_stage_sha256 = None
+                    provisional_operation_identity = None
+                    if queue_kind is PromotionQueueKind.RESPONSE:
+                        provisional_stage, provisional_stage_sha256 = guarded(
+                            lambda: build_exterior_provisional_stage(
+                                job=leaf.job,
+                                scientific_computation_identity=(
+                                    selection.scientific_identities[leaf_id]
+                                ),
+                                root_seal_sha256=seal.root_seal_sha256,
+                                raw_batch=batch,
+                                combined_batch=combined_batch,
+                                background=canonical_background,
+                                background_receipt=provisional_background_receipt,
+                                reason_code=reason_code,
+                            )
+                        )
+                        provisional_operation_identity = (
+                            "binary64-fixed-root-provisional/v1"
+                        )
                     outcome = Binary64PassOutcome(
                         disposition=(
                             SurveyDisposition.PROMOTION_PENDING_ROOT
@@ -1103,6 +1168,9 @@ def run_binary64_survey(
                         queue_kind=queue_kind,
                         sample_count=batch.sample_count,
                         sample_limit=batch.sample_limit,
+                        provisional_stage=provisional_stage,
+                        provisional_stage_sha256=provisional_stage_sha256,
+                        provisional_operation_identity=provisional_operation_identity,
                     )
                 assert timing_recorder is not None
                 timing_recorder.complete_tier()
@@ -1127,6 +1195,21 @@ def run_binary64_survey(
         )
         assert isinstance(result, dict)
         result = persist(result)
+        if outcome.provisional_stage is not None:
+            try:
+                provisional_stage_committed(leaf, outcome.provisional_stage)
+            except KeyboardInterrupt:
+                raise
+            except Exception as error:
+                # The provisional source stage is already durable in the
+                # checkpoint.  A failed publication must preserve it and
+                # fail closed against the current checkpoint.
+                abort_unexpected_system_failure(
+                    result,
+                    leaf_id=leaf_id,
+                    error=error,
+                    persist_checkpoint=lambda value: persist(value),
+                )
         if (
             outcome.record is not None
             and outcome.disposition is SurveyDisposition.COMPLETED
@@ -1350,6 +1433,7 @@ def _run_promoted_exterior_queue_entry(
     timing_recorder: TimingSessionRecorder,
     determinant_error_store: ReviewedDeterminantErrorStore | None,
     root_promotion_group: _RootPromotionGroup | None,
+    provisional_predecessor_receipt: Mapping[str, object] | None,
 ) -> PromotedPassOutcome:
     queue_kind = PromotionQueueKind(entry["queue_kind"])
     seal = root_seal_lookup(leaf, entry)
@@ -1376,6 +1460,8 @@ def _run_promoted_exterior_queue_entry(
 
     tiers: list[str] = []
     receipts: list[Mapping[str, object]] = []
+    if provisional_predecessor_receipt is not None:
+        receipts.append(dict(provisional_predecessor_receipt))
     sample_count = root_reads = worker_launches = 0
     for digits in (40, 80):
         tier = f"BF{digits}"
@@ -1642,6 +1728,15 @@ def _commit_promoted_outcome(
     queue_disposition = queue_dispositions.get(outcome.disposition)
     if queue_disposition is None:
         raise ValueError("promoted outcome is not terminal")
+    provisional_reuse_receipt = next(
+        (
+            receipt
+            for receipt in outcome.evidence_receipts
+            if isinstance(receipt, Mapping)
+            and receipt.get("schema") == EXTERIOR_PROVISIONAL_REUSE_RECEIPT_SCHEMA
+        ),
+        None,
+    )
     result = finish_promotion(
         result,
         queue_ordinal=queue_ordinal,
@@ -1655,7 +1750,14 @@ def _commit_promoted_outcome(
             "precision_tiers": list(outcome.precision_tiers),
             "result_record_sha256": record_sha256,
             "source_record_sha256": outcome.source_record_sha256,
+            "evidence_receipt_sha256s": [
+                receipt["receipt_sha256"]
+                for receipt in outcome.evidence_receipts
+                if isinstance(receipt, Mapping)
+                and isinstance(receipt.get("receipt_sha256"), str)
+            ],
         },
+        provisional_reuse_receipt=provisional_reuse_receipt,
     )
     result = record_survey_disposition(
         result,
@@ -1761,6 +1863,9 @@ def run_promoted_survey(
     checkpoint_path: str | os.PathLike[str] | Path,
     root_seal_lookup: Callable[
         [object, Mapping[str, object]], AuthenticatedRootSeal | None
+    ],
+    provisional_stage_lookup: Callable[
+        [object, Mapping[str, object]], Mapping[str, object] | None
     ],
     backend_factory: Callable[[object, int], object],
     primary_root_runner: Callable[
@@ -1967,6 +2072,46 @@ def run_promoted_survey(
 
         guarded(validate_binary64_disposition_binding)
 
+        provisional_predecessor_receipt: Mapping[str, object] | None = None
+        if (
+            leaf.mechanism_id != "horizon-admittance"
+            and snapshot["queue_kind"] == PromotionQueueKind.RESPONSE.value
+            and snapshot.get("source_record_sha256") is None
+        ):
+            provisional_stage = guarded(
+                lambda: provisional_stage_lookup(leaf, snapshot)
+            )
+            if not isinstance(provisional_stage, Mapping):
+                guarded(
+                    lambda: (_ for _ in ()).throw(
+                        ValueError(
+                            "exterior RESPONSE promotion lacks a provisional stage"
+                        )
+                    )
+                )
+                raise AssertionError("missing provisional stage guard returned")
+            source_root_seal_sha256 = snapshot.get("source_root_seal_sha256")
+            if not isinstance(source_root_seal_sha256, str):
+                guarded(
+                    lambda: (_ for _ in ()).throw(
+                        ValueError(
+                            "exterior provisional promotion lacks a root seal"
+                        )
+                    )
+                )
+                raise AssertionError("missing provisional root guard returned")
+            provisional_predecessor_receipt = guarded(
+                lambda: consume_authenticated_binary64_provisional_predecessor(
+                    provisional_stage,
+                    job=leaf.job,
+                    scientific_computation_identity=(
+                        selection.scientific_identities[leaf_id]
+                    ),
+                    root_seal_sha256=source_root_seal_sha256,
+                )
+            )
+            assert isinstance(provisional_predecessor_receipt, Mapping)
+
         retained = existing_records.get(leaf_id)
         horizon_source_record = (
             leaf.mechanism_id == "horizon-admittance"
@@ -2159,6 +2304,9 @@ def run_promoted_survey(
                             timing_recorder=recorder,
                             determinant_error_store=determinant_error_store,
                             root_promotion_group=root_promotion_group,
+                            provisional_predecessor_receipt=(
+                                provisional_predecessor_receipt
+                            ),
                         )
                 except BaseException:
                     if recorder.active_tier is not None:

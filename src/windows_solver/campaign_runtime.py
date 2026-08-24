@@ -1313,6 +1313,48 @@ def run_native_binary64_pass(
             if seal is not None:
                 root_provider().publish(leaf, seal)
 
+    def publish_provisional_stage(leaf, stage):
+        """Publish the checkpoint-committed exterior source-stage transition."""
+
+        if not isinstance(stage, Mapping):
+            raise ValueError("provisional stage publication is invalid")
+        stage_sha256 = stage.get("stage_sha256")
+        root_seal_sha256 = stage.get("root_seal_sha256")
+        if (
+            not isinstance(stage_sha256, str)
+            or len(stage_sha256) != 64
+            or not isinstance(root_seal_sha256, str)
+            or len(root_seal_sha256) != 64
+        ):
+            raise ValueError("provisional stage publication is unauthenticated")
+        if diagnostic_session is not None:
+            diagnostic_session.append(
+                "PROVISIONAL_STAGE_PUBLISHED",
+                leaf={"leaf_id": leaf.leaf_id},
+                execution={
+                    "profile": "SURVEY",
+                    "pass": "binary64",
+                    "tier": "binary64",
+                    "operation_identity": str(stage.get("operation_identity")),
+                },
+                connections={
+                    "scientific_computation_identity": (
+                        scientific_computation_identity_sha256(plan, leaf)
+                    ),
+                    "root_seal_sha256": root_seal_sha256,
+                    "source_stage_sha256": stage_sha256,
+                    "provisional_stage_sha256": stage_sha256,
+                },
+                compact_diagnostics={
+                    "raw_sample_count": stage.get("raw_sample_count"),
+                    "raw_sample_limit": stage.get("raw_sample_limit"),
+                    "nonadmission_reason_code": stage.get(
+                        "nonadmission_reason_code"
+                    ),
+                },
+                durable=True,
+            )
+
     # Reconcile authenticated terminal checkpoint records before the survey's
     # cache discovery.  A cache hit is therefore durable before any numerical
     # leaf is eligible to be skipped.
@@ -1356,6 +1398,7 @@ def run_native_binary64_pass(
         native_backend_factory=lambda: backend().adapter.kernel,
         horizon_runner=lambda leaf: _horizon_outcome(plan, backend(), leaf),
         produced_record_builder=build,
+        provisional_stage_committed=publish_provisional_stage,
         equivalence_receipt_lookup=equivalence_lookup,
         determinant_error_store=error_store,
         background_evidence_store=background_store,
@@ -1831,6 +1874,7 @@ def run_native_promoted_pass(
         checkpoint,
         checkpoint_path=checkpoint_path,
         root_seal_lookup=seal_lookup,
+        provisional_stage_lookup=lambda _leaf, entry: entry["provisional_stage"],
         root_seal_publish=lambda leaf, seal: root_provider().publish(leaf, seal),
         backend_factory=lambda leaf, digits: backend()._julia_precision_backend_for(
             leaf.job, digits

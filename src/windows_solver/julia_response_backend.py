@@ -37,6 +37,7 @@ from .response_engine import (
     BackendIdentity,
     CANONICAL_EXTERIOR_BACKGROUND_IDENTITY,
     DecimalComplex,
+    exterior_provisional_reuse_receipt,
     FixedRootDiagnosticEvidence,
     FixedRootDeterminantSample,
     DiagnosticRootReadout,
@@ -120,6 +121,28 @@ FIXED_ROOT_SURVEY_CONDITIONING_SCHEMA = (
 _FIXED_ROOT_SURVEY_MAXIMUM_SAMPLE_COUNT = 9
 _FIXED_ROOT_SURVEY_BACKGROUND_ROLES = BINARY64_FIXED_ROOT_SAMPLE_ROLES[:5]
 _FIXED_ROOT_SURVEY_COORDINATE_ROLES = BINARY64_FIXED_ROOT_SAMPLE_ROLES[5:]
+
+
+def consume_authenticated_binary64_provisional_predecessor(
+    stage: object,
+    *,
+    job: ResponseComponentJob,
+    scientific_computation_identity: str,
+    root_seal_sha256: str,
+) -> dict[str, object]:
+    """Validate the binary64 predecessor before BF40 dispatches new work.
+
+    The receipt makes the cross-tier handoff explicit without presenting the
+    binary64 samples as BF40 determinant-error evidence.
+    """
+
+    return exterior_provisional_reuse_receipt(
+        stage,
+        job=job,
+        scientific_computation_identity=scientific_computation_identity,
+        root_seal_sha256=root_seal_sha256,
+        target_precision_tier="BF40",
+    )
 _FIXED_ROOT_SURVEY_CERTIFICATE_FIELDS = frozenset({
     "determinant_error_model",
     "determinant_error_safety_factor",

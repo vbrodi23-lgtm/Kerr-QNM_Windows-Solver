@@ -10,8 +10,11 @@ import unittest
 from windows_solver.campaign_failures import CampaignSystemFailure
 from windows_solver.campaign_policy import (
     PromotionQueueKind,
+    SurveyDisposition,
+    SurveyPass,
     append_promotion,
     empty_schema11_checkpoint,
+    record_survey_disposition,
 )
 from windows_solver.campaign_recovery import RecoverySelection
 from windows_solver.campaign_timing import CampaignTimingLog
@@ -37,9 +40,16 @@ from windows_solver.response_batches import (
 )
 from windows_solver.response_engine import (
     BINARY64_FIXED_ROOT_SAMPLE_ROLES,
+    BackgroundEquivalenceReceipt,
+    Binary64FixedRootBatch,
+    Binary64FixedRootSample,
     DecimalComplex,
     NumericalPolicy,
     VettedNativeDeterminantKernel,
+    _exterior_support,
+    build_exterior_background_reuse_key,
+    build_exterior_provisional_stage,
+    canonical_background_from_binary64_batch,
 )
 
 
@@ -127,6 +137,66 @@ def _batch(leaf, seal: AuthenticatedRootSeal, digits: int, *, flat=False):
     )
 
 
+def _provisional_stage(leaf, scientific_identity: str, root_seal_sha256: str):
+    root = leaf.job.root.omega
+    frequency_step = 1.0e-5 * (1.0 + abs(root))
+    coordinate_step = float(leaf.job.policy.epsilons[0])
+    points = (
+        (root, 0.0),
+        (root + frequency_step, 0.0),
+        (root - frequency_step, 0.0),
+        (root + frequency_step / 2.0, 0.0),
+        (root - frequency_step / 2.0, 0.0),
+        (root, coordinate_step),
+        (root, -coordinate_step),
+        (root, coordinate_step / 2.0),
+        (root, -coordinate_step / 2.0),
+    )
+    batch = Binary64FixedRootBatch(
+        leaf_id=leaf.leaf_id,
+        job_id=leaf.job.job_id,
+        mechanism_id=leaf.mechanism_id,
+        fixed_root=root,
+        branch_identity=leaf.job.root.branch_id,
+        frequency_step=frequency_step,
+        coordinate_step=coordinate_step,
+        support=_exterior_support(leaf.job.spin, leaf.mechanism_id),
+        samples=tuple(
+            Binary64FixedRootSample(
+                role=role,
+                omega=omega,
+                amplitude=complex(amplitude, 0.0),
+                determinant=complex(index + 1.0, 0.0),
+            )
+            for index, (role, (omega, amplitude)) in enumerate(
+                zip(BINARY64_FIXED_ROOT_SAMPLE_ROLES, points)
+            )
+        ),
+    )
+    reuse_key = build_exterior_background_reuse_key(
+        leaf.job,
+        root_seal_sha256=root_seal_sha256,
+        fixed_root=root,
+    )
+    background = canonical_background_from_binary64_batch(batch, reuse_key)
+    receipt = BackgroundEquivalenceReceipt.issue(
+        reuse_key=reuse_key,
+        job=leaf.job,
+        canonical_background_sha256=background.sha256,
+        fixed_root=root,
+    )
+    return build_exterior_provisional_stage(
+        job=leaf.job,
+        scientific_computation_identity=scientific_identity,
+        root_seal_sha256=root_seal_sha256,
+        raw_batch=batch,
+        combined_batch=batch,
+        background=background,
+        background_receipt=receipt,
+        reason_code="DETERMINANT_ERROR_EVIDENCE_UNAVAILABLE",
+    )
+
+
 class _Backend:
     def __init__(
         self,
@@ -189,6 +259,38 @@ class PromotedSurveySchedulerTests(unittest.TestCase):
             self.selection.campaign_id, self.selection.selection_id
         )
         for leaf in self.leaves[:count]:
+            scientific_identity = self.selection.scientific_identities[leaf.leaf_id]
+            provisional_stage = None
+            provisional_stage_sha256 = None
+            provisional_operation_identity = None
+            binary64_disposition_receipt_sha256 = None
+            if kind is PromotionQueueKind.RESPONSE:
+                provisional_stage, provisional_stage_sha256 = _provisional_stage(
+                    leaf, scientific_identity, "a" * 64
+                )
+                provisional_operation_identity = str(
+                    provisional_stage["operation_identity"]
+                )
+                checkpoint = record_survey_disposition(
+                    checkpoint,
+                    survey_pass=SurveyPass.BINARY64,
+                    leaf_id=leaf.leaf_id,
+                    disposition=SurveyDisposition.PROMOTION_PENDING_RESPONSE,
+                    operation_identity="binary64-fixed-root-survey/v1",
+                    precision_tiers=("binary64",),
+                    reason_code="FINITE_DIFFERENCE_NOISE_LIMIT",
+                    sample_count=9,
+                    sample_limit=9,
+                    root_read_count=0,
+                    root_read_limit=0,
+                    worker_launch_count=0,
+                    worker_launch_limit=0,
+                    tier_timing=(),
+                    session_fragments=(),
+                )
+                binary64_disposition_receipt_sha256 = checkpoint[
+                    "survey_pass_ledger"
+                ]["binary64"][leaf.leaf_id]["disposition_receipt_sha256"]
             checkpoint = append_promotion(
                 checkpoint,
                 leaf_id=leaf.leaf_id,
@@ -199,11 +301,16 @@ class PromotedSurveySchedulerTests(unittest.TestCase):
                     else "DETERMINANT_UNCERTAINTY_TOO_LARGE"
                 ),
                 minimum_requested_tier="BF40",
-                scientific_computation_identity=(
-                    self.selection.scientific_identities[leaf.leaf_id]
-                ),
+                scientific_computation_identity=scientific_identity,
                 source_root_seal_sha256=(
                     "a" * 64 if kind is PromotionQueueKind.RESPONSE else None
+                ),
+                source_stage_sha256=provisional_stage_sha256,
+                provisional_stage=provisional_stage,
+                provisional_stage_sha256=provisional_stage_sha256,
+                provisional_operation_identity=provisional_operation_identity,
+                source_binary64_disposition_receipt_sha256=(
+                    binary64_disposition_receipt_sha256
                 ),
             )
         return checkpoint
@@ -238,6 +345,9 @@ class PromotedSurveySchedulerTests(unittest.TestCase):
                 checkpoint,
                 checkpoint_path=Path(temporary) / "checkpoint.json",
                 root_seal_lookup=root_seal_lookup,
+                provisional_stage_lookup=lambda _leaf, entry: entry[
+                    "provisional_stage"
+                ],
                 root_seal_publish=lambda leaf, seal: published.__setitem__(
                     leaf.leaf_id, seal
                 ),
@@ -272,6 +382,17 @@ class PromotedSurveySchedulerTests(unittest.TestCase):
         self.assertEqual([40, 80], calls)
         self.assertEqual(0, result.completed_count)
         self.assertEqual(1, result.unresolved_count)
+        reuse_receipt = result.checkpoint["promotion_queue"]["entries"][0][
+            "provisional_reuse_receipt"
+        ]
+        self.assertEqual("COMPATIBLE", reuse_receipt["status"])
+        self.assertEqual(
+            result.checkpoint["promotion_queue"]["entries"][0][
+                "provisional_stage_sha256"
+            ],
+            reuse_receipt["provisional_stage_sha256"],
+        )
+        self.assertEqual("BF40", reuse_receipt["target_precision_tier"])
         self.assertEqual("UNRESOLVED", result.checkpoint[
             "survey_pass_ledger"
         ]["promoted"][self.leaves[0].leaf_id]["disposition"])
@@ -309,6 +430,9 @@ class PromotedSurveySchedulerTests(unittest.TestCase):
                     leaf.job.root.branch_id,
                     entry["source_root_seal_sha256"],
                 ),
+                provisional_stage_lookup=lambda _leaf, entry: entry[
+                    "provisional_stage"
+                ],
                 root_seal_publish=lambda *_args: self.fail(
                     "response promotion must not publish a root"
                 ),
@@ -522,6 +646,9 @@ class PromotedSurveySchedulerTests(unittest.TestCase):
                 checkpoint,
                 checkpoint_path=Path(temporary) / "checkpoint.json",
                 root_seal_lookup=lambda leaf, _entry: published.get(leaf.leaf_id),
+                provisional_stage_lookup=lambda _leaf, entry: entry[
+                    "provisional_stage"
+                ],
                 root_seal_publish=lambda leaf, seal: published.__setitem__(
                     leaf.leaf_id, seal
                 ),
@@ -571,6 +698,36 @@ class PromotedSurveySchedulerTests(unittest.TestCase):
         self.assertIn("source.leaf.mode == target.leaf.mode", runtime_source)
         self.assertIn("source.job.spin == target.job.spin", runtime_source)
 
+    def test_static_guards_require_authenticated_exterior_provisional_stage(self):
+        """The production adapter must not silently drop a RESPONSE precursor."""
+
+        source_root = Path(__file__).parents[1] / "src" / "windows_solver"
+        survey_source = (source_root / "campaign_survey.py").read_text(
+            encoding="utf-8"
+        )
+        runtime_source = (source_root / "campaign_runtime.py").read_text(
+            encoding="utf-8"
+        )
+        wiring_source = (source_root / "production_wiring.py").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn(
+            "exterior RESPONSE promotion lacks a provisional stage", survey_source
+        )
+        self.assertIn(
+            "consume_authenticated_binary64_provisional_predecessor", survey_source
+        )
+        self.assertIn("PROVISIONAL_STAGE_PUBLISHED", runtime_source)
+        self.assertIn("provisional_stage_lookup", runtime_source)
+        self.assertNotIn(
+            "provisional_stage_lookup=lambda _leaf, _entry: None", runtime_source
+        )
+        self.assertIn('"provisional_stage_lookup"', wiring_source)
+        self.assertIn('"provisional_stage_committed"', wiring_source)
+        self.assertIn('"terminal_record_committed"', wiring_source)
+        self.assertIn('"diagnostic_session"', wiring_source)
+
     def test_unexpected_error_is_durable_and_stops_before_next_queue_entry(self):
         started: list[str] = []
 
@@ -592,6 +749,9 @@ class PromotedSurveySchedulerTests(unittest.TestCase):
                         leaf.job.root.branch_id,
                         entry["source_root_seal_sha256"],
                     ),
+                    provisional_stage_lookup=lambda _leaf, entry: entry[
+                        "provisional_stage"
+                    ],
                     root_seal_publish=lambda *_args: self.fail(
                         "response promotion must not publish a root"
                     ),

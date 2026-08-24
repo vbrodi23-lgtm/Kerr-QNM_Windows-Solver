@@ -1819,6 +1819,21 @@ class ExteriorSupport:
             "half_width": self.half_width,
         }
 
+    @classmethod
+    def from_mapping(cls, value: object) -> "ExteriorSupport":
+        fields = {"lower", "upper", "centre", "half_width"}
+        if not isinstance(value, Mapping) or set(value) != fields:
+            raise ValueError("exterior support mapping is invalid")
+        converted: dict[str, float] = {}
+        for name in fields:
+            item = value[name]
+            if isinstance(item, bool) or not isinstance(item, (int, float)):
+                raise ValueError("exterior support mapping is invalid")
+            converted[name] = float(item)
+        if any(not math.isfinite(item) for item in converted.values()):
+            raise ValueError("exterior support mapping is invalid")
+        return cls(**converted)
+
 
 @dataclass(frozen=True, slots=True)
 class Binary64FixedRootSample:
@@ -1956,6 +1971,40 @@ class Binary64FixedRootBatch:
             "root_read_count": self.root_read_count,
             "julia_launch_count": self.julia_launch_count,
         }
+
+    @classmethod
+    def from_mapping(cls, value: object) -> "Binary64FixedRootBatch":
+        fields = {
+            "schema", "operation_identity", "leaf_id", "job_id", "mechanism_id",
+            "fixed_root", "branch_identity", "frequency_step", "coordinate_step",
+            "support", "samples", "sample_count", "sample_limit", "root_read_count",
+            "julia_launch_count",
+        }
+        if (
+            not isinstance(value, Mapping)
+            or set(value) != fields
+            or value["schema"] != "windows-solver.binary64-fixed-root-batch/1"
+            or not isinstance(value["samples"], list)
+        ):
+            raise ValueError("binary64 fixed-root batch mapping is invalid")
+        batch = cls(
+            leaf_id=str(value["leaf_id"]),
+            job_id=str(value["job_id"]),
+            mechanism_id=str(value["mechanism_id"]),
+            fixed_root=_complex_from_mapping(value["fixed_root"], "fixed root"),
+            branch_identity=str(value["branch_identity"]),
+            frequency_step=float(value["frequency_step"]),
+            coordinate_step=float(value["coordinate_step"]),
+            support=ExteriorSupport.from_mapping(value["support"]),
+            samples=tuple(Binary64FixedRootSample.from_mapping(item) for item in value["samples"]),
+            operation_identity=str(value["operation_identity"]),
+            sample_limit=value["sample_limit"],
+            root_read_count=value["root_read_count"],
+            julia_launch_count=value["julia_launch_count"],
+        )
+        if value["sample_count"] != batch.sample_count:
+            raise ValueError("binary64 fixed-root batch sample count is invalid")
+        return batch
 
 
 @dataclass(frozen=True, slots=True)
@@ -2489,6 +2538,10 @@ class Binary64ReusedBackgroundBatch:
     def sample_count(self) -> int:
         return len(self.samples)
 
+    @property
+    def sample_roles(self) -> tuple[str, ...]:
+        return tuple(sample.role for sample in self.samples)
+
     def to_mapping(self) -> dict[str, object]:
         return {
             "schema": "windows-solver.binary64-reused-background-batch/1",
@@ -2508,6 +2561,42 @@ class Binary64ReusedBackgroundBatch:
             "root_read_count": self.root_read_count,
             "julia_launch_count": self.julia_launch_count,
         }
+
+    @classmethod
+    def from_mapping(cls, value: object) -> "Binary64ReusedBackgroundBatch":
+        fields = {
+            "schema", "operation_identity", "leaf_id", "job_id", "mechanism_id",
+            "fixed_root", "branch_identity", "coordinate_step", "support",
+            "background_sha256", "equivalence_receipt_sha256", "samples",
+            "sample_count", "sample_limit", "root_read_count", "julia_launch_count",
+        }
+        if (
+            not isinstance(value, Mapping)
+            or set(value) != fields
+            or value["schema"]
+            != "windows-solver.binary64-reused-background-batch/1"
+            or value["operation_identity"] != BINARY64_FIXED_ROOT_SURVEY_IDENTITY
+            or not isinstance(value["samples"], list)
+        ):
+            raise ValueError("reused background batch mapping is invalid")
+        batch = cls(
+            leaf_id=str(value["leaf_id"]),
+            job_id=str(value["job_id"]),
+            mechanism_id=str(value["mechanism_id"]),
+            fixed_root=_complex_from_mapping(value["fixed_root"], "fixed root"),
+            branch_identity=str(value["branch_identity"]),
+            coordinate_step=float(value["coordinate_step"]),
+            support=ExteriorSupport.from_mapping(value["support"]),
+            background_sha256=str(value["background_sha256"]),
+            equivalence_receipt_sha256=str(value["equivalence_receipt_sha256"]),
+            samples=tuple(Binary64FixedRootSample.from_mapping(item) for item in value["samples"]),
+            sample_limit=value["sample_limit"],
+            root_read_count=value["root_read_count"],
+            julia_launch_count=value["julia_launch_count"],
+        )
+        if value["sample_count"] != batch.sample_count:
+            raise ValueError("reused background batch sample count is invalid")
+        return batch
 
 
 def exterior_background_reuse_admitted(
@@ -2561,6 +2650,302 @@ def combine_binary64_reused_background_batch(
         support=batch.support,
         samples=background.samples + batch.samples,
     )
+
+
+EXTERIOR_PROVISIONAL_STAGE_SCHEMA = (
+    "windows-solver.binary64-fixed-root-provisional-stage/1"
+)
+EXTERIOR_PROVISIONAL_STAGE_IDENTITY = "binary64-fixed-root-provisional/v1"
+EXTERIOR_PROVISIONAL_REUSE_RECEIPT_SCHEMA = (
+    "windows-solver.exterior-provisional-reuse-decision/1"
+)
+
+
+def _exterior_provisional_request_sha256(
+    *,
+    job: ResponseComponentJob,
+    scientific_computation_identity: str,
+    root_seal_sha256: str,
+    fixed_root: complex,
+    reuse_key: ExteriorBackgroundReuseKey,
+) -> str:
+    return _sha256({
+        "schema": "windows-solver.binary64-fixed-root-provisional-request/1",
+        "leaf_id": job.leaf_id,
+        "job_id": job.job_id,
+        "scientific_computation_identity": scientific_computation_identity,
+        "root_seal_sha256": root_seal_sha256,
+        "fixed_root": _complex_mapping(fixed_root),
+        "branch_identity": job.root.branch_id,
+        "mechanism_id": job.mechanism_id,
+        "reuse_key": reuse_key.to_mapping(),
+    })
+
+
+def build_exterior_provisional_stage(
+    *,
+    job: ResponseComponentJob,
+    scientific_computation_identity: str,
+    root_seal_sha256: str,
+    raw_batch: Binary64FixedRootBatch | Binary64ReusedBackgroundBatch,
+    combined_batch: Binary64FixedRootBatch,
+    background: CanonicalExteriorBackground,
+    background_receipt: BackgroundEquivalenceReceipt,
+    reason_code: str,
+) -> tuple[dict[str, object], str]:
+    """Preserve unauthenticated exterior raw work without admitting a disk."""
+
+    if job.mechanism_id not in _EXTERIOR_PROFILE_IDS:
+        raise ValueError("exterior provisional stage requires an exterior job")
+    if _HEX_64.fullmatch(scientific_computation_identity) is None:
+        raise ValueError("exterior provisional scientific identity is invalid")
+    if _HEX_64.fullmatch(root_seal_sha256) is None:
+        raise ValueError("exterior provisional root seal is invalid")
+    if not isinstance(reason_code, str) or not reason_code:
+        raise ValueError("exterior provisional reason is invalid")
+    if not isinstance(raw_batch, (Binary64FixedRootBatch, Binary64ReusedBackgroundBatch)):
+        raise ValueError("exterior provisional raw batch is invalid")
+    if not isinstance(combined_batch, Binary64FixedRootBatch):
+        raise ValueError("exterior provisional combined batch is invalid")
+    reuse_key = build_exterior_background_reuse_key(
+        job,
+        root_seal_sha256=root_seal_sha256,
+        fixed_root=combined_batch.fixed_root,
+    )
+    if (
+        background.reuse_key != reuse_key
+        or background.fixed_root != combined_batch.fixed_root
+        or background_receipt.reuse_key != reuse_key
+        or background_receipt.mechanism_id != job.mechanism_id
+        or background_receipt.canonical_background_sha256 != background.sha256
+    ):
+        raise ValueError("exterior provisional background binding is invalid")
+    expected_receipt = BackgroundEquivalenceReceipt.issue(
+        reuse_key=reuse_key,
+        job=job,
+        canonical_background_sha256=background.sha256,
+        fixed_root=combined_batch.fixed_root,
+    )
+    if background_receipt.to_mapping() != expected_receipt.to_mapping():
+        raise ValueError("exterior provisional background receipt is invalid")
+    if (
+        raw_batch.leaf_id != job.leaf_id
+        or raw_batch.job_id != job.job_id
+        or raw_batch.mechanism_id != job.mechanism_id
+        or raw_batch.branch_identity != job.root.branch_id
+        or raw_batch.fixed_root != combined_batch.fixed_root
+        or combined_batch.leaf_id != job.leaf_id
+        or combined_batch.job_id != job.job_id
+        or combined_batch.mechanism_id != job.mechanism_id
+        or combined_batch.branch_identity != job.root.branch_id
+    ):
+        raise ValueError("exterior provisional batch identity is invalid")
+    if isinstance(raw_batch, Binary64FixedRootBatch):
+        if raw_batch != combined_batch:
+            raise ValueError("exterior provisional full batch is inconsistent")
+    elif combine_binary64_reused_background_batch(background, raw_batch) != combined_batch:
+        raise ValueError("exterior provisional reused batch is inconsistent")
+    combined_samples = [sample.to_mapping() for sample in combined_batch.samples]
+    content = {
+        "schema": EXTERIOR_PROVISIONAL_STAGE_SCHEMA,
+        "operation_identity": EXTERIOR_PROVISIONAL_STAGE_IDENTITY,
+        "source_operation_identity": BINARY64_FIXED_ROOT_SURVEY_IDENTITY,
+        "leaf_id": job.leaf_id,
+        "job_id": job.job_id,
+        "scientific_computation_identity": scientific_computation_identity,
+        "root_seal_sha256": root_seal_sha256,
+        "fixed_root": _complex_mapping(combined_batch.fixed_root),
+        "branch_identity": job.root.branch_id,
+        "mechanism_id": job.mechanism_id,
+        "support": combined_batch.support.to_mapping(),
+        "support_identity_sha256": _sha256(combined_batch.support.to_mapping()),
+        "request_sha256": _exterior_provisional_request_sha256(
+            job=job,
+            scientific_computation_identity=scientific_computation_identity,
+            root_seal_sha256=root_seal_sha256,
+            fixed_root=combined_batch.fixed_root,
+            reuse_key=reuse_key,
+        ),
+        "response_sha256": _sha256({
+            "raw_batch": raw_batch.to_mapping(),
+            "combined_samples": combined_samples,
+        }),
+        "numerical_controls": {
+            "policy_identity_sha256": job.policy.identity_sha256,
+            "backend_identity_sha256": job.backend_identity.identity_sha256,
+            "reuse_key": reuse_key.to_mapping(),
+        },
+        "raw_batch": raw_batch.to_mapping(),
+        "raw_sample_roles": list(raw_batch.sample_roles),
+        "raw_sample_count": raw_batch.sample_count,
+        "raw_sample_limit": raw_batch.sample_limit,
+        "combined_sample_roles": list(combined_batch.sample_roles),
+        "raw_determinant_samples": combined_samples,
+        "d0_evidence": combined_samples[0],
+        "domega_evidence": combined_samples[1:5],
+        "dc_evidence": combined_samples[5:9],
+        "canonical_background": background.to_mapping(),
+        "background_reuse_receipt": background_receipt.to_mapping(),
+        "nonadmission_reason_code": reason_code,
+    }
+    stage_sha256 = _sha256(content)
+    return {**content, "stage_sha256": stage_sha256}, stage_sha256
+
+
+def validate_exterior_provisional_stage(
+    stage: object,
+    *,
+    job: ResponseComponentJob,
+    scientific_computation_identity: str,
+    root_seal_sha256: str,
+) -> dict[str, object]:
+    """Authenticate one exact binary64 predecessor before BF40 uses it."""
+
+    fields = {
+        "schema", "operation_identity", "source_operation_identity", "leaf_id",
+        "job_id", "scientific_computation_identity", "root_seal_sha256",
+        "fixed_root", "branch_identity", "mechanism_id", "support",
+        "support_identity_sha256", "request_sha256", "response_sha256",
+        "numerical_controls", "raw_batch", "raw_sample_roles", "raw_sample_count",
+        "raw_sample_limit", "combined_sample_roles", "raw_determinant_samples",
+        "d0_evidence", "domega_evidence", "dc_evidence", "canonical_background",
+        "background_reuse_receipt", "nonadmission_reason_code", "stage_sha256",
+    }
+    if not isinstance(stage, Mapping) or set(stage) != fields:
+        raise ValueError("exterior provisional stage fields are invalid")
+    content = {name: stage[name] for name in fields - {"stage_sha256"}}
+    if (
+        stage["schema"] != EXTERIOR_PROVISIONAL_STAGE_SCHEMA
+        or stage["operation_identity"] != EXTERIOR_PROVISIONAL_STAGE_IDENTITY
+        or stage["source_operation_identity"] != BINARY64_FIXED_ROOT_SURVEY_IDENTITY
+        or stage["stage_sha256"] != _sha256(content)
+    ):
+        raise ValueError("exterior provisional stage authentication failed")
+    if (
+        stage["leaf_id"] != job.leaf_id
+        or stage["job_id"] != job.job_id
+        or stage["scientific_computation_identity"] != scientific_computation_identity
+        or stage["root_seal_sha256"] != root_seal_sha256
+        or stage["branch_identity"] != job.root.branch_id
+        or stage["mechanism_id"] != job.mechanism_id
+    ):
+        raise ValueError("exterior provisional stage identity is incompatible")
+    fixed_root = _complex_from_mapping(stage["fixed_root"], "fixed root")
+    support = ExteriorSupport.from_mapping(stage["support"])
+    if support != _exterior_support(job.spin, job.mechanism_id):
+        raise ValueError("exterior provisional support is incompatible")
+    if stage["support_identity_sha256"] != _sha256(support.to_mapping()):
+        raise ValueError("exterior provisional support digest is invalid")
+    controls = stage["numerical_controls"]
+    if not isinstance(controls, Mapping) or set(controls) != {
+        "policy_identity_sha256", "backend_identity_sha256", "reuse_key"
+    }:
+        raise ValueError("exterior provisional controls are invalid")
+    reuse_key = ExteriorBackgroundReuseKey.from_mapping(controls["reuse_key"])
+    expected_key = build_exterior_background_reuse_key(
+        job, root_seal_sha256=root_seal_sha256, fixed_root=fixed_root
+    )
+    if (
+        reuse_key != expected_key
+        or controls["policy_identity_sha256"] != job.policy.identity_sha256
+        or controls["backend_identity_sha256"] != job.backend_identity.identity_sha256
+        or stage["request_sha256"] != _exterior_provisional_request_sha256(
+            job=job,
+            scientific_computation_identity=scientific_computation_identity,
+            root_seal_sha256=root_seal_sha256,
+            fixed_root=fixed_root,
+            reuse_key=reuse_key,
+        )
+    ):
+        raise ValueError("exterior provisional controls are incompatible")
+    raw_mapping = stage["raw_batch"]
+    if not isinstance(raw_mapping, Mapping):
+        raise ValueError("exterior provisional raw batch is invalid")
+    raw_schema = raw_mapping.get("schema")
+    if raw_schema == "windows-solver.binary64-fixed-root-batch/1":
+        raw_batch: Binary64FixedRootBatch | Binary64ReusedBackgroundBatch = (
+            Binary64FixedRootBatch.from_mapping(raw_mapping)
+        )
+    elif raw_schema == "windows-solver.binary64-reused-background-batch/1":
+        raw_batch = Binary64ReusedBackgroundBatch.from_mapping(raw_mapping)
+    else:
+        raise ValueError("exterior provisional raw batch is invalid")
+    background = CanonicalExteriorBackground.from_mapping(stage["canonical_background"])
+    receipt = BackgroundEquivalenceReceipt.from_mapping(
+        stage["background_reuse_receipt"]
+    )
+    if (
+        background.reuse_key != reuse_key
+        or receipt.to_mapping() != BackgroundEquivalenceReceipt.issue(
+            reuse_key=reuse_key,
+            job=job,
+            canonical_background_sha256=background.sha256,
+            fixed_root=fixed_root,
+        ).to_mapping()
+    ):
+        raise ValueError("exterior provisional background is incompatible")
+    combined = (
+        raw_batch
+        if isinstance(raw_batch, Binary64FixedRootBatch)
+        else combine_binary64_reused_background_batch(background, raw_batch)
+    )
+    if (
+        combined.leaf_id != job.leaf_id
+        or combined.job_id != job.job_id
+        or combined.mechanism_id != job.mechanism_id
+        or combined.fixed_root != fixed_root
+        or combined.branch_identity != job.root.branch_id
+        or combined.support != support
+    ):
+        raise ValueError("exterior provisional combined batch is incompatible")
+    raw_samples = [sample.to_mapping() for sample in combined.samples]
+    if (
+        stage["raw_sample_roles"] != list(raw_batch.sample_roles)
+        or stage["raw_sample_count"] != raw_batch.sample_count
+        or stage["raw_sample_limit"] != raw_batch.sample_limit
+        or stage["combined_sample_roles"] != list(combined.sample_roles)
+        or stage["raw_determinant_samples"] != raw_samples
+        or stage["d0_evidence"] != raw_samples[0]
+        or stage["domega_evidence"] != raw_samples[1:5]
+        or stage["dc_evidence"] != raw_samples[5:9]
+        or stage["response_sha256"] != _sha256({
+            "raw_batch": raw_batch.to_mapping(), "combined_samples": raw_samples,
+        })
+        or not isinstance(stage["nonadmission_reason_code"], str)
+        or not stage["nonadmission_reason_code"]
+    ):
+        raise ValueError("exterior provisional raw evidence is invalid")
+    return {name: stage[name] for name in fields}
+
+
+def exterior_provisional_reuse_receipt(
+    stage: object,
+    *,
+    job: ResponseComponentJob,
+    scientific_computation_identity: str,
+    root_seal_sha256: str,
+    target_precision_tier: str,
+) -> dict[str, object]:
+    """Issue an explicit compatible-predecessor receipt for promoted work."""
+
+    if target_precision_tier != "BF40":
+        raise ValueError("exterior provisional target tier is invalid")
+    authenticated = validate_exterior_provisional_stage(
+        stage,
+        job=job,
+        scientific_computation_identity=scientific_computation_identity,
+        root_seal_sha256=root_seal_sha256,
+    )
+    content = {
+        "schema": EXTERIOR_PROVISIONAL_REUSE_RECEIPT_SCHEMA,
+        "status": "COMPATIBLE",
+        "leaf_id": job.leaf_id,
+        "provisional_stage_sha256": authenticated["stage_sha256"],
+        "root_seal_sha256": root_seal_sha256,
+        "target_precision_tier": target_precision_tier,
+        "decision": "AUTHENTICATED_BINARY64_PREDECESSOR_CONSUMED",
+    }
+    return {**content, "receipt_sha256": _sha256(content)}
 
 
 def screen_binary64_reused_background_batch(

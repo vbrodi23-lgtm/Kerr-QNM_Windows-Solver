@@ -136,6 +136,8 @@ _PROMOTION_ENTRY_PROVISIONAL_FIELDS = _PROMOTION_ENTRY_FIELDS | {
     "provisional_stage_sha256",
     "provisional_operation_identity",
     "source_binary64_disposition_receipt_sha256",
+    "provisional_reuse_receipt",
+    "provisional_reuse_receipt_sha256",
 }
 
 
@@ -489,6 +491,8 @@ def append_promotion(
             "source_binary64_disposition_receipt_sha256": (
                 source_binary64_disposition_receipt_sha256
             ),
+            "provisional_reuse_receipt": None,
+            "provisional_reuse_receipt_sha256": None,
             "queue_ordinal": len(entries),
             "disposition": PromotionQueueDisposition.PENDING.value,
             "disposition_receipt_sha256": None,
@@ -503,6 +507,7 @@ def finish_promotion(
     queue_ordinal: int,
     disposition: PromotionQueueDisposition | str,
     disposition_receipt: Mapping[str, object],
+    provisional_reuse_receipt: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     result = validate_schema11_checkpoint(checkpoint)
     disposition_value = _enum_value(
@@ -527,8 +532,25 @@ def finish_promotion(
     if entry["disposition"] != PromotionQueueDisposition.PENDING.value:
         raise ValueError("promotion queue entry is already terminal")
     receipt = copy.deepcopy(dict(disposition_receipt))
+    reuse_receipt = (
+        None
+        if provisional_reuse_receipt is None
+        else copy.deepcopy(dict(provisional_reuse_receipt))
+    )
+    if reuse_receipt is not None:
+        supplied = reuse_receipt.get("receipt_sha256")
+        content = {
+            key: item for key, item in reuse_receipt.items()
+            if key != "receipt_sha256"
+        }
+        if not _is_sha256(supplied) or supplied != _sha256(content):
+            raise ValueError("provisional reuse receipt is invalid")
     entry["disposition"] = disposition_value
     entry["disposition_receipt_sha256"] = _sha256(receipt)
+    entry["provisional_reuse_receipt"] = reuse_receipt
+    entry["provisional_reuse_receipt_sha256"] = (
+        None if reuse_receipt is None else reuse_receipt["receipt_sha256"]
+    )
     return result
 
 
@@ -645,6 +667,19 @@ def validate_schema11_checkpoint(
                 "provisional_stage_sha256": None,
                 "provisional_operation_identity": None,
                 "source_binary64_disposition_receipt_sha256": None,
+                "provisional_reuse_receipt": None,
+                "provisional_reuse_receipt_sha256": None,
+            })
+            queue["entries"][ordinal] = normalized
+            entry = normalized
+        elif entry_fields == (
+            _PROMOTION_ENTRY_PROVISIONAL_FIELDS
+            - {"provisional_reuse_receipt", "provisional_reuse_receipt_sha256"}
+        ):
+            normalized = copy.deepcopy(dict(entry))
+            normalized.update({
+                "provisional_reuse_receipt": None,
+                "provisional_reuse_receipt_sha256": None,
             })
             queue["entries"][ordinal] = normalized
             entry = normalized
@@ -667,6 +702,7 @@ def validate_schema11_checkpoint(
             entry["source_root_seal_sha256"],
             entry["provisional_stage_sha256"],
             entry["source_binary64_disposition_receipt_sha256"],
+            entry["provisional_reuse_receipt_sha256"],
         ):
             if digest is not None and not _is_sha256(digest):
                 raise ValueError("schema-11 promotion queue source digest is invalid")
@@ -696,6 +732,23 @@ def validate_schema11_checkpoint(
                 or entry["source_record_sha256"] is not None
             ):
                 raise ValueError("schema-11 promotion provisional stage binding is invalid")
+        reuse_receipt = entry["provisional_reuse_receipt"]
+        reuse_digest = entry["provisional_reuse_receipt_sha256"]
+        if reuse_receipt is None:
+            if reuse_digest is not None:
+                raise ValueError("schema-11 provisional reuse receipt is incomplete")
+        elif not isinstance(reuse_receipt, Mapping):
+            raise ValueError("schema-11 provisional reuse receipt is invalid")
+        else:
+            reuse_content = {
+                key: item for key, item in reuse_receipt.items()
+                if key != "receipt_sha256"
+            }
+            if (
+                reuse_receipt.get("receipt_sha256") != reuse_digest
+                or reuse_digest != _sha256(reuse_content)
+            ):
+                raise ValueError("schema-11 provisional reuse receipt is invalid")
         _enum_value(entry.get("queue_kind"), PromotionQueueKind, "promotion queue kind")
         disposition = _enum_value(
             entry.get("disposition"),
