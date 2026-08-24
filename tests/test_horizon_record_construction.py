@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import hashlib
 from dataclasses import replace
 from pathlib import Path
@@ -142,6 +143,66 @@ class HorizonRecordConstructionTests(unittest.TestCase):
         self.assertTrue(
             callable(getattr(response_batches, "validate_schema11_horizon_record", None))
         )
+
+    def test_horizon_validator_rejects_foreign_policy_and_backend_lineage(self) -> None:
+        plan = _plan()
+        leaf = next(
+            item
+            for item in plan.leaves
+            if item.role == "primary"
+            and item.mechanism_id == "horizon-admittance"
+        )
+        component = native_component_result(leaf.job, 0.25 + 0.1j)
+        payload = {
+            "evidence_kind": "synthetic-pr68-horizon-stage",
+            "result": component.to_mapping(),
+        }
+        outcome = StageOutcome(
+            digits=64,
+            numerical_state="CONVERGED",
+            component_result=payload,
+            local_disk_radius_abs=1.0e-6,
+            signed_error_channels=synthetic_stage_signed_error_channels(
+                payload, 1.0e-6
+            ),
+        )
+        stage, _stage_sha256 = build_schema11_horizon_stage(
+            outcome,
+            precision_tier="binary64",
+            operation_identity="test-binary64-horizon/v1",
+        )
+        record = build_schema11_horizon_record(
+            plan,
+            leaf,
+            stages=(stage,),
+            retained_centre=stage["response_disk"]["centre"],
+            state="PRODUCED",
+        )
+
+        for lineage_field in ("policy_sha256", "backend_identity_sha256"):
+            tampered = copy.deepcopy(record)
+            tampered_stage = tampered["stages"][0]
+            tampered_stage["component_result"]["result"]["lineage"][
+                lineage_field
+            ] = "f" * 64
+            stage_content = {
+                key: value
+                for key, value in tampered_stage.items()
+                if key != "stage_sha256"
+            }
+            tampered_stage["stage_sha256"] = _sha256(stage_content)
+            record_content = {
+                key: value
+                for key, value in tampered.items()
+                if key != "record_sha256"
+            }
+            tampered["record_sha256"] = _sha256(record_content)
+
+            with self.subTest(lineage_field=lineage_field):
+                with self.assertRaisesRegex(ValueError, "lineage"):
+                    response_batches.validate_schema11_horizon_record(
+                        plan, leaf, tampered
+                    )
 
     def test_trigger_receipt_rejects_stage_outcome_payload_mismatch(self) -> None:
         plan = _plan()

@@ -8105,6 +8105,27 @@ def _validate_schema11_horizon_stage(
         or stage["numerical_state"] != result.status.value
     ):
         raise ValueError("schema-11 horizon component identity is invalid")
+    expected_lineage = {
+        "leaf_id": leaf.job.leaf_id,
+        "root_reference_id": leaf.job.root.root_reference_id,
+        "root_identity_sha256": leaf.job.root.identity_sha256,
+        "policy_sha256": leaf.job.policy.identity_sha256,
+        "backend_identity_sha256": leaf.job.backend_identity.identity_sha256,
+        "equation_id": leaf.job.equation_id,
+        "sampling_coordinate": leaf.job.sampling_coordinate.to_mapping(),
+        "source_root_mapping": (
+            None
+            if leaf.job.source_root_mapping is None
+            else dict(leaf.job.source_root_mapping)
+        ),
+    }
+    observed_lineage = dict(result.lineage)
+    if "component_scientific_identity" in observed_lineage:
+        expected_lineage["component_scientific_identity"] = (
+            result.component_scientific_identity
+        )
+    if observed_lineage != expected_lineage:
+        raise ValueError("schema-11 horizon component lineage is invalid")
     disk = stage["response_disk"]
     if result.response is None:
         if disk is not None:
