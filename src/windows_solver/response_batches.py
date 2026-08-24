@@ -8250,6 +8250,22 @@ def _validate_schema11_horizon_stage(
             raise ValueError("schema-11 horizon response disk zero flag is invalid")
         if centre != result.response:
             raise ValueError("schema-11 horizon response disk centre is not result-bound")
+        component_evidence = result.analytic_horizon_evidence
+        expected_disk = (
+            component_evidence.get("response_disk")
+            if isinstance(component_evidence, Mapping)
+            else None
+        )
+        if not isinstance(expected_disk, Mapping) or dict(disk) != dict(
+            expected_disk
+        ):
+            raise ValueError(
+                "schema-11 horizon response disk is not component evidence-bound"
+            )
+        if result.error_channels.get("resolution") != radius:
+            raise ValueError(
+                "schema-11 horizon response radius is not component evidence-bound"
+            )
         if radius == 0.0 and disk["exact_zero_radius"] is not True:
             raise ValueError("schema-11 horizon zero-radius provenance is invalid")
         if radius != 0.0 and disk["exact_zero_radius"] is not False:

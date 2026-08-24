@@ -394,6 +394,7 @@ class HorizonRecordConstructionTests(unittest.TestCase):
 
     def test_unsuccessful_promotions_keep_source_records_out_of_cache(self) -> None:
         source = "a" * 64
+        forged_completed = "b" * 64
         entries = [
             {
                 "source_record_sha256": source,
@@ -408,15 +409,159 @@ class HorizonRecordConstructionTests(unittest.TestCase):
             )
         ]
         entries.append({
-            "source_record_sha256": "b" * 64,
+            "source_record_sha256": forged_completed,
+            "source_stage_sha256": "c" * 64,
+            "leaf_id": "forged-leaf",
+            "queue_ordinal": len(entries),
+            "disposition_receipt_sha256": "d" * 64,
             "disposition": "COMPLETED",
         })
 
         self.assertEqual(
-            {source},
+            {source, forged_completed},
             campaign_runtime._promotion_bound_source_record_sha256({
-                "promotion_queue": {"entries": entries}
+                "promotion_queue": {"entries": entries},
+                "survey_pass_ledger": {"promoted": {}},
+                "evidence_ledger": {},
+                "records": [],
             }),
+        )
+
+    def test_horizon_stage_radius_is_bound_to_component_evidence(self) -> None:
+        plan = _plan()
+        leaf = next(
+            item
+            for item in plan.leaves
+            if item.role == "primary"
+            and item.mechanism_id == "horizon-admittance"
+        )
+        outcome = _binary64_horizon_outcome(plan, leaf)
+        stage, _stage_sha256 = build_schema11_horizon_stage(
+            outcome,
+            precision_tier="binary64",
+            operation_identity="test-binary64-horizon/v1",
+        )
+        record = build_schema11_horizon_record(
+            plan,
+            leaf,
+            stages=(stage,),
+            retained_centre=stage["response_disk"]["centre"],
+            state="PRODUCED",
+        )
+
+        tampered = copy.deepcopy(record)
+        tampered_stage = tampered["stages"][0]
+        self.assertGreater(tampered_stage["response_disk"]["radius"], 0.0)
+        tampered_stage["response_disk"]["radius"] = 0.0
+        tampered_stage["response_disk"]["exact_zero_radius"] = True
+        tampered_stage["stage_sha256"] = _sha256({
+            key: value
+            for key, value in tampered_stage.items()
+            if key != "stage_sha256"
+        })
+        tampered["record_sha256"] = _sha256({
+            key: value
+            for key, value in tampered.items()
+            if key != "record_sha256"
+        })
+
+        with self.assertRaisesRegex(ValueError, "component evidence"):
+            response_batches.validate_schema11_horizon_record(
+                plan, leaf, tampered
+            )
+
+    def test_authenticated_completed_comparison_allows_source_cache(self) -> None:
+        leaf_id = "authenticated-leaf"
+        source_record_sha256 = "a" * 64
+        source_stage_sha256 = "b" * 64
+        source_centre = {"real": 1.0, "imaginary": 2.0}
+        bf80_centre = {"real": 1.05, "imaginary": 2.0}
+        source_radius = 0.1
+        bf80_radius = 0.1
+        discrepancy = abs(complex(1.0, 2.0) - complex(1.05, 2.0))
+        threshold = source_radius + bf80_radius
+        trigger_content = {
+            "schema": response_batches.HORIZON_PROMOTION_TRIGGER_RECEIPT_SCHEMA,
+            "leaf_id": leaf_id,
+            "binary64_stage_sha256": source_stage_sha256,
+            "promotion_required": True,
+        }
+        trigger = {
+            **trigger_content,
+            "receipt_sha256": _sha256(trigger_content),
+        }
+        comparison_content = {
+            "schema": response_batches.HORIZON_PROMOTED_COMPARISON_RECEIPT_SCHEMA,
+            "leaf_id": leaf_id,
+            "source_record_sha256": source_record_sha256,
+            "source_stage_sha256": source_stage_sha256,
+            "source_centre": source_centre,
+            "source_disk_radius": source_radius,
+            "promotion_trigger_receipt_sha256": trigger["receipt_sha256"],
+            "bf80_operation_identity": "test-bf80-operation/v1",
+            "bf80_result_sha256": "c" * 64,
+            "bf80_centre": bf80_centre,
+            "bf80_disk_radius": bf80_radius,
+            "centre_discrepancy": discrepancy,
+            "reviewed_comparison_threshold": threshold,
+            "agrees": True,
+            "outcome_code": "AGREES",
+            "runtime_identity": {"runtime": "test"},
+            "backend_identity": "d" * 64,
+        }
+        comparison = {
+            **comparison_content,
+            "receipt_sha256": _sha256(comparison_content),
+        }
+        promoted = {
+            "disposition": "COMPLETED",
+            "operation_identity": "promoted-horizon-comparison/v2",
+            "reason_code": "PROMOTED_HORIZON_COMPARISON_AGREES",
+            "precision_tiers": ["BF80"],
+            "source_record_sha256": source_record_sha256,
+            "result_record_sha256": source_record_sha256,
+        }
+        queue_receipt = {
+            "schema": "windows-solver.promoted-queue-disposition/1",
+            "leaf_id": leaf_id,
+            "queue_ordinal": 0,
+            "disposition": "COMPLETED",
+            "reason_code": promoted["reason_code"],
+            "precision_tiers": promoted["precision_tiers"],
+            "result_record_sha256": source_record_sha256,
+            "source_record_sha256": source_record_sha256,
+        }
+        checkpoint = {
+            "promotion_queue": {"entries": [{
+                "leaf_id": leaf_id,
+                "queue_ordinal": 0,
+                "source_record_sha256": source_record_sha256,
+                "source_stage_sha256": source_stage_sha256,
+                "disposition": "COMPLETED",
+                "disposition_receipt_sha256": _sha256(queue_receipt),
+            }]},
+            "survey_pass_ledger": {"promoted": {leaf_id: promoted}},
+            "evidence_ledger": {leaf_id: {
+                "central_record_sha256": source_record_sha256,
+                "central_stage_sha256": source_stage_sha256,
+                "receipts": [trigger, comparison],
+            }},
+            "records": [{
+                "record_sha256": source_record_sha256,
+                "stages": [{
+                    "stage_sha256": source_stage_sha256,
+                    "response_disk": {
+                        "centre": source_centre,
+                        "radius": source_radius,
+                        "exact_zero_radius": False,
+                    },
+                }],
+            }],
+        }
+
+        self.assertEqual(
+            set(),
+            campaign_runtime._promotion_bound_source_record_sha256(checkpoint),
         )
 
     def test_trigger_receipt_rejects_stage_outcome_payload_mismatch(self) -> None:

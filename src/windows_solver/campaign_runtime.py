@@ -247,9 +247,191 @@ def _promotion_bound_source_record_sha256(
     return {
         source
         for entry in entries
-        if entry["disposition"] != PromotionQueueDisposition.COMPLETED.value
-        and isinstance((source := entry["source_record_sha256"]), str)
+        if isinstance((source := entry["source_record_sha256"]), str)
+        and (
+            entry["disposition"]
+            != PromotionQueueDisposition.COMPLETED.value
+            or not _completed_horizon_source_is_authenticated(
+                checkpoint, entry
+            )
+        )
     }
+
+
+def _is_sha256(value: object) -> bool:
+    if not isinstance(value, str) or len(value) != 64:
+        return False
+    try:
+        int(value, 16)
+    except ValueError:
+        return False
+    return True
+
+
+def _receipt_digest_is_valid(receipt: Mapping[str, object]) -> bool:
+    supplied = receipt.get("receipt_sha256")
+    content = {
+        key: value for key, value in receipt.items()
+        if key != "receipt_sha256"
+    }
+    return _is_sha256(supplied) and supplied == _sha256(content)
+
+
+def _completed_horizon_source_is_authenticated(
+    checkpoint: Mapping[str, object],
+    queue_entry: Mapping[str, object],
+) -> bool:
+    """Prove a retained source completed its mandatory BF80 comparison."""
+
+    leaf_id = queue_entry.get("leaf_id")
+    source_record_sha256 = queue_entry.get("source_record_sha256")
+    source_stage_sha256 = queue_entry.get("source_stage_sha256")
+    queue_ordinal = queue_entry.get("queue_ordinal")
+    promoted_ledger = checkpoint.get("survey_pass_ledger", {}).get(
+        "promoted", {}
+    )
+    promoted = (
+        promoted_ledger.get(leaf_id)
+        if isinstance(promoted_ledger, Mapping)
+        else None
+    )
+    if (
+        not isinstance(leaf_id, str)
+        or not _is_sha256(source_record_sha256)
+        or not _is_sha256(source_stage_sha256)
+        or not isinstance(queue_ordinal, int)
+        or not isinstance(promoted, Mapping)
+        or promoted.get("disposition") != SurveyDisposition.COMPLETED.value
+        or promoted.get("operation_identity")
+        != "promoted-horizon-comparison/v2"
+        or promoted.get("reason_code")
+        != "PROMOTED_HORIZON_COMPARISON_AGREES"
+        or promoted.get("precision_tiers") != ["BF80"]
+        or promoted.get("source_record_sha256") != source_record_sha256
+        or promoted.get("result_record_sha256") != source_record_sha256
+    ):
+        return False
+    queue_receipt = {
+        "schema": "windows-solver.promoted-queue-disposition/1",
+        "leaf_id": leaf_id,
+        "queue_ordinal": queue_ordinal,
+        "disposition": SurveyDisposition.COMPLETED.value,
+        "reason_code": promoted["reason_code"],
+        "precision_tiers": list(promoted["precision_tiers"]),
+        "result_record_sha256": source_record_sha256,
+        "source_record_sha256": source_record_sha256,
+    }
+    if queue_entry.get("disposition_receipt_sha256") != _sha256(
+        queue_receipt
+    ):
+        return False
+
+    records = checkpoint.get("records", ())
+    source_record = next(
+        (
+            item for item in records
+            if isinstance(item, Mapping)
+            and item.get("record_sha256") == source_record_sha256
+        ),
+        None,
+    )
+    stages = source_record.get("stages") if isinstance(source_record, Mapping) else None
+    source_stage = stages[0] if isinstance(stages, list) and stages else None
+    source_disk = (
+        source_stage.get("response_disk")
+        if isinstance(source_stage, Mapping)
+        else None
+    )
+    if (
+        not isinstance(source_stage, Mapping)
+        or source_stage.get("stage_sha256") != source_stage_sha256
+        or not isinstance(source_disk, Mapping)
+    ):
+        return False
+
+    evidence_ledger = checkpoint.get("evidence_ledger", {})
+    evidence = (
+        evidence_ledger.get(leaf_id)
+        if isinstance(evidence_ledger, Mapping)
+        else None
+    )
+    receipts = evidence.get("receipts") if isinstance(evidence, Mapping) else None
+    if (
+        not isinstance(evidence, Mapping)
+        or evidence.get("central_record_sha256") != source_record_sha256
+        or evidence.get("central_stage_sha256") != source_stage_sha256
+        or not isinstance(receipts, list)
+    ):
+        return False
+
+    triggers = {
+        receipt.get("receipt_sha256")
+        for receipt in receipts
+        if isinstance(receipt, Mapping)
+        and receipt.get("schema") == HORIZON_PROMOTION_TRIGGER_RECEIPT_SCHEMA
+        and receipt.get("leaf_id") == leaf_id
+        and receipt.get("binary64_stage_sha256") == source_stage_sha256
+        and receipt.get("promotion_required") is True
+        and _receipt_digest_is_valid(receipt)
+    }
+    comparison_fields = {
+        "schema", "leaf_id", "source_record_sha256", "source_stage_sha256",
+        "source_centre", "source_disk_radius",
+        "promotion_trigger_receipt_sha256", "bf80_operation_identity",
+        "bf80_result_sha256", "bf80_centre", "bf80_disk_radius",
+        "centre_discrepancy", "reviewed_comparison_threshold", "agrees",
+        "outcome_code", "runtime_identity", "backend_identity",
+        "receipt_sha256",
+    }
+    for receipt in receipts:
+        if (
+            not isinstance(receipt, Mapping)
+            or set(receipt) != comparison_fields
+            or receipt.get("schema")
+            != HORIZON_PROMOTED_COMPARISON_RECEIPT_SCHEMA
+            or receipt.get("leaf_id") != leaf_id
+            or receipt.get("source_record_sha256") != source_record_sha256
+            or receipt.get("source_stage_sha256") != source_stage_sha256
+            or receipt.get("source_centre") != source_disk.get("centre")
+            or receipt.get("source_disk_radius") != source_disk.get("radius")
+            or receipt.get("promotion_trigger_receipt_sha256") not in triggers
+            or receipt.get("agrees") is not True
+            or receipt.get("outcome_code") != "AGREES"
+            or not _is_sha256(receipt.get("bf80_result_sha256"))
+            or not _is_sha256(receipt.get("backend_identity"))
+            or not isinstance(receipt.get("bf80_operation_identity"), str)
+            or not receipt.get("bf80_operation_identity")
+            or not isinstance(receipt.get("runtime_identity"), Mapping)
+            or not _receipt_digest_is_valid(receipt)
+        ):
+            continue
+        try:
+            source_centre = complex(
+                float(source_disk["centre"]["real"]),
+                float(source_disk["centre"]["imaginary"]),
+            )
+            bf80_centre = complex(
+                float(receipt["bf80_centre"]["real"]),
+                float(receipt["bf80_centre"]["imaginary"]),
+            )
+            source_radius = float(source_disk["radius"])
+            bf80_radius = float(receipt["bf80_disk_radius"])
+            discrepancy = float(receipt["centre_discrepancy"])
+            threshold = float(receipt["reviewed_comparison_threshold"])
+        except (KeyError, TypeError, ValueError, OverflowError):
+            continue
+        expected_discrepancy = abs(source_centre - bf80_centre)
+        expected_threshold = source_radius + bf80_radius
+        if (
+            all(math.isfinite(value) and value >= 0.0 for value in (
+                source_radius, bf80_radius, discrepancy, threshold
+            ))
+            and discrepancy == expected_discrepancy
+            and threshold == expected_threshold
+            and discrepancy <= threshold
+        ):
+            return True
+    return False
 
 
 def build_fixed_root_screening_record(
