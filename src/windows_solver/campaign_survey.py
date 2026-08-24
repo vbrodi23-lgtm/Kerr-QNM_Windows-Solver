@@ -1795,6 +1795,38 @@ def run_promoted_survey(
                 )
                 raise AssertionError("system failure abort returned unexpectedly")
 
+        def validate_binary64_disposition_binding() -> None:
+            supplied_receipt = snapshot.get(
+                "source_binary64_disposition_receipt_sha256"
+            )
+            provisional_stage = snapshot.get("provisional_stage")
+            if supplied_receipt is None:
+                if provisional_stage is not None:
+                    raise ValueError(
+                        "provisional horizon promotion lacks binary64 disposition receipt"
+                    )
+                return
+            binary64_ledger = result["survey_pass_ledger"]["binary64"]
+            binary64_entry = (
+                binary64_ledger.get(leaf_id)
+                if isinstance(binary64_ledger, Mapping)
+                else None
+            )
+            expected_receipt = (
+                binary64_entry.get("disposition_receipt_sha256")
+                if isinstance(binary64_entry, Mapping)
+                else None
+            )
+            if (
+                not isinstance(expected_receipt, str)
+                or supplied_receipt != expected_receipt
+            ):
+                raise ValueError(
+                    "horizon promotion binary64 disposition receipt mismatch"
+                )
+
+        guarded(validate_binary64_disposition_binding)
+
         retained = existing_records.get(leaf_id)
         horizon_source_record = (
             leaf.mechanism_id == "horizon-admittance"

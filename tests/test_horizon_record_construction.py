@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+from dataclasses import replace
 from pathlib import Path
 import tempfile
 from types import SimpleNamespace
@@ -10,12 +11,15 @@ import unittest
 
 import windows_solver.campaign_runtime as campaign_runtime
 import windows_solver.response_batches as response_batches
+from windows_solver.campaign_failures import CampaignSystemFailure
 from windows_solver.campaign_policy import (
     PromotionQueueKind,
     SurveyDisposition,
+    SurveyPass,
     add_numerical_record,
     append_promotion,
     empty_schema11_checkpoint,
+    record_survey_disposition,
 )
 from windows_solver.campaign_recovery import RecoverySelection
 from windows_solver.campaign_runtime import (
@@ -35,6 +39,7 @@ from windows_solver.response_batches import (
     NativeCampaignStageBackend,
     PrecisionCapabilities,
     StageOutcome,
+    build_horizon_promotion_trigger_receipt,
     build_campaign_plan,
     build_campaign_selection,
     synthetic_stage_signed_error_channels,
@@ -135,6 +140,53 @@ class HorizonRecordConstructionTests(unittest.TestCase):
         self.assertTrue(
             callable(getattr(response_batches, "validate_schema11_horizon_record", None))
         )
+
+    def test_trigger_receipt_rejects_stage_outcome_payload_mismatch(self) -> None:
+        plan = _plan()
+        leaf = next(
+            item
+            for item in plan.leaves
+            if item.role == "primary"
+            and item.mechanism_id == "horizon-admittance"
+        )
+        component = native_component_result(leaf.job, 0.25 + 0.1j)
+        payload = {
+            "evidence_kind": "synthetic-pr68-horizon-stage",
+            "result": component.to_mapping(),
+        }
+        outcome = StageOutcome(
+            digits=64,
+            numerical_state="CONVERGED",
+            component_result=payload,
+            local_disk_radius_abs=1.0e-6,
+            signed_error_channels=synthetic_stage_signed_error_channels(
+                payload, 1.0e-6
+            ),
+        )
+        stage, _stage_sha256 = build_schema11_horizon_stage(
+            outcome,
+            precision_tier="binary64",
+            operation_identity="test-binary64-horizon/v1",
+        )
+        mismatched_payload = {
+            **payload,
+            "evidence_kind": "tampered-after-stage-authentication",
+        }
+        mismatched_outcome = replace(
+            outcome,
+            component_result=mismatched_payload,
+            signed_error_channels=synthetic_stage_signed_error_channels(
+                mismatched_payload, 1.0e-6
+            ),
+        )
+
+        with self.assertRaisesRegex(ValueError, "stage payload"):
+            build_horizon_promotion_trigger_receipt(
+                plan,
+                leaf,
+                mismatched_outcome,
+                stage,
+            )
 
     def test_binary64_horizon_stage_is_fixed_root_analytic_and_ladder_free(self) -> None:
         plan = _plan()
@@ -341,6 +393,126 @@ class HorizonRecordConstructionTests(unittest.TestCase):
             "COMPLETED",
             result.checkpoint["promotion_queue"]["entries"][0]["disposition"],
         )
+
+    def test_promoted_survey_rejects_tampered_binary64_disposition_binding(self) -> None:
+        plan = _plan()
+        leaf = next(
+            item
+            for item in plan.leaves
+            if item.role == "primary"
+            and item.mechanism_id == "horizon-admittance"
+        )
+        selected = build_campaign_selection(
+            plan, role=leaf.role, leaf_ids=(leaf.leaf_id,)
+        )
+        selection = RecoverySelection(
+            campaign_id=plan.campaign_id,
+            selection_id=selected.selection_id,
+            ordered_leaf_ids=(leaf.leaf_id,),
+            roles={leaf.leaf_id: leaf.role},
+            scientific_identities={
+                leaf.leaf_id: response_batches.scientific_computation_identity_sha256(
+                    plan, leaf
+                )
+            },
+        )
+        component = native_component_result(leaf.job, 0.25 + 0.1j)
+        payload = {
+            "evidence_kind": "native-task-008-component-engine",
+            "result": component.to_mapping(),
+        }
+        stage_outcome = StageOutcome(
+            digits=64,
+            numerical_state="CONVERGED",
+            component_result=payload,
+            local_disk_radius_abs=1.0e-6,
+            signed_error_channels=synthetic_stage_signed_error_channels(
+                payload, 1.0e-6
+            ),
+        )
+        stage, stage_sha256 = build_schema11_horizon_stage(
+            stage_outcome,
+            precision_tier="binary64",
+            operation_identity="test-binary64-horizon/v1",
+        )
+        response_disk = stage["response_disk"]
+        assert isinstance(response_disk, dict)
+        record = build_schema11_horizon_record(
+            plan,
+            leaf,
+            stages=(stage,),
+            retained_centre=response_disk["centre"],
+            state="PRODUCED",
+        )
+        checkpoint = add_numerical_record(
+            empty_schema11_checkpoint(plan.campaign_id, selected.selection_id),
+            record,
+        )
+        checkpoint = record_survey_disposition(
+            checkpoint,
+            survey_pass=SurveyPass.BINARY64,
+            leaf_id=leaf.leaf_id,
+            disposition=SurveyDisposition.PROMOTION_PENDING_RESPONSE,
+            operation_identity="test-binary64-horizon/v1",
+            precision_tiers=("binary64",),
+            reason_code="FIXED_PRECISION_SENTINEL_PROMOTION",
+            sample_count=0,
+            sample_limit=0,
+            root_read_count=0,
+            root_read_limit=0,
+            worker_launch_count=0,
+            worker_launch_limit=0,
+            tier_timing=(),
+            session_fragments=(),
+            result_record_sha256=record["record_sha256"],
+        )
+        binary64_receipt = checkpoint["survey_pass_ledger"]["binary64"][
+            leaf.leaf_id
+        ]["disposition_receipt_sha256"]
+        checkpoint = append_promotion(
+            checkpoint,
+            leaf_id=leaf.leaf_id,
+            queue_kind=PromotionQueueKind.RESPONSE,
+            reason_code="FIXED_PRECISION_SENTINEL_PROMOTION",
+            minimum_requested_tier="BF80",
+            scientific_computation_identity=selection.scientific_identities[
+                leaf.leaf_id
+            ],
+            source_record_sha256=record["record_sha256"],
+            source_stage_sha256=stage_sha256,
+            source_binary64_disposition_receipt_sha256=binary64_receipt,
+        )
+        checkpoint["promotion_queue"]["entries"][0][
+            "source_binary64_disposition_receipt_sha256"
+        ] = "b" * 64
+        called = False
+
+        def promoted_runner(*_args):
+            nonlocal called
+            called = True
+            raise AssertionError("BF80 runner must not start")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            with self.assertRaises(CampaignSystemFailure):
+                run_promoted_survey(
+                    plan,
+                    selection,
+                    checkpoint,
+                    checkpoint_path=Path(temporary) / "checkpoint.json",
+                    root_seal_lookup=lambda _leaf, _entry: None,
+                    backend_factory=lambda _leaf, _digits: None,
+                    primary_root_runner=lambda *_args: self.fail(
+                        "unexpected promoted root"
+                    ),
+                    horizon_runner=lambda _leaf: self.fail(
+                        "legacy promoted horizon runner was used"
+                    ),
+                    promoted_horizon_runner=promoted_runner,
+                    produced_record_builder=lambda *_args: self.fail(
+                        "unexpected promoted record builder"
+                    ),
+                )
+        self.assertFalse(called)
 
 
 if __name__ == "__main__":

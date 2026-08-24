@@ -3596,6 +3596,21 @@ def build_horizon_promotion_trigger_receipt(
     operation_identity = stage.get("operation_identity")
     if not isinstance(operation_identity, str) or not operation_identity:
         raise ValueError("horizon trigger receipt operation identity is invalid")
+    staged_component_result = stage.get("component_result")
+    if not isinstance(staged_component_result, Mapping):
+        raise ValueError("horizon trigger receipt stage payload is invalid")
+    expected_component_result = dict(binary64_stage.component_result)
+    if binary64_stage.deep_diagnostics is not None:
+        expected_component_result["deep_diagnostics"] = dict(
+            binary64_stage.deep_diagnostics
+        )
+    if (
+        stage.get("numerical_state") != binary64_stage.numerical_state
+        or dict(staged_component_result) != expected_component_result
+    ):
+        raise ValueError(
+            "horizon trigger receipt stage payload does not match the binary64 stage"
+        )
     content = {
         "schema": HORIZON_PROMOTION_TRIGGER_RECEIPT_SCHEMA,
         "leaf_id": leaf.leaf_id,
