@@ -180,7 +180,7 @@ class CountAgnosticRecoveryTests(unittest.TestCase):
             b["recovery_receipts"] = []
             self.assertEqual(a, b)
 
-    def test_identical_records_union_monotone_evidence_without_rewriting_record(self) -> None:
+    def test_identical_records_union_authenticated_screening_without_rewriting_record(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             selection = _selection(1)
@@ -203,8 +203,8 @@ class CountAgnosticRecoveryTests(unittest.TestCase):
                 leaf_id=record["leaf_id"],
                 central_record_sha256=record["record_sha256"],
                 central_stage_sha256=record["stages"][0]["stage_sha256"],
-                evidence_level=EvidenceLevel.CERTIFIED,
-                receipts=[{"schema": "certification/v1", "source": "b"}],
+                evidence_level=EvidenceLevel.SCREENED,
+                receipts=[{"schema": "screening/v1", "source": "b"}],
             )
             _write(root / "a.json", checkpoint_a)
             _write(root / "b.json", checkpoint_b)
@@ -220,7 +220,7 @@ class CountAgnosticRecoveryTests(unittest.TestCase):
             self.assertEqual(record, candidate["records"][0])
             self.assertEqual("COMPLETE", candidate["state"])
             evidence = candidate["evidence_ledger"][record["leaf_id"]]
-            self.assertEqual("CERTIFIED", evidence["evidence_level"])
+            self.assertEqual("SCREENED", evidence["evidence_level"])
             self.assertEqual(2, len(evidence["receipts"]))
 
     def test_conflicting_terminal_records_abort_without_output(self) -> None:

@@ -104,7 +104,13 @@ class Binary64SurveySchedulerTests(unittest.TestCase):
             reason_code="BOUNDED_HORIZON_RESPONSE",
         )
 
-    def test_full_mocked_plan_has_zero_julia_and_no_inline_promotion(self) -> None:
+    def test_mass_response_promotion_never_trips_the_repetition_breaker(self) -> None:
+        """Every exterior leaf legitimately needing RESPONSE promotion must
+        queue normally; PROMOTION_PENDING_RESPONSE is scheduler state, not
+        failure-monitor evidence, and must never arm the repetition breaker
+        (governing contract §5, invariant: normal promotion is not failure).
+        """
+
         backend = _AnalyticBackend()
         backend_constructions = 0
 
@@ -119,6 +125,12 @@ class Binary64SurveySchedulerTests(unittest.TestCase):
                 job=leaf.job,
                 canonical_background_sha256=background.sha256,
             )
+
+        exterior_leaf_ids = {
+            leaf.leaf_id for leaf in self.plan.leaves
+            if leaf.mechanism_id != "horizon-admittance"
+        }
+        self.assertGreater(len(exterior_leaf_ids), 2)
 
         with tempfile.TemporaryDirectory() as temporary:
             checkpoint_path = Path(temporary) / "checkpoint.json"
@@ -144,36 +156,20 @@ class Binary64SurveySchedulerTests(unittest.TestCase):
                 equivalence_receipt_lookup=equivalence,
             )
 
-            self.assertEqual(len(self.selection.ordered_leaf_ids), result.completed_count)
-            self.assertEqual(1, backend_constructions)
-            self.assertEqual(0, backend.julia_launches)
-            self.assertEqual(0, backend.root_reads)
-            self.assertEqual([], result.checkpoint["promotion_queue"]["entries"])
-            ledger = result.checkpoint["survey_pass_ledger"]["binary64"]
-            self.assertEqual(set(self.selection.ordered_leaf_ids), set(ledger))
-            self.assertTrue(
-                all(entry["worker_launch_count"] == 0 for entry in ledger.values())
-            )
-            exterior_counts = {
-                entry["sample_count"]
-                for leaf_id, entry in ledger.items()
-                if next(
-                    leaf for leaf in self.plan.leaves if leaf.leaf_id == leaf_id
-                ).mechanism_id != "horizon-admittance"
-            }
-            self.assertEqual({4, 9}, exterior_counts)
-            exterior_timing = [
-                entry["tier_timing"]
-                for leaf_id, entry in ledger.items()
-                if next(
-                    leaf for leaf in self.plan.leaves if leaf.leaf_id == leaf_id
-                ).mechanism_id != "horizon-admittance"
-            ]
+            durable = result.checkpoint
+            self.assertEqual([], durable["system_failures"])
+            queued = durable["promotion_queue"]["entries"]
+            self.assertEqual(len(exterior_leaf_ids), len(queued))
             self.assertTrue(all(
-                timing and timing[0]["tier"] == "binary64"
-                and timing[0]["source"] == "direct"
-                for timing in exterior_timing
+                entry["queue_kind"] == "RESPONSE"
+                and entry["reason_code"]
+                == "DETERMINANT_ERROR_EVIDENCE_UNAVAILABLE"
+                for entry in queued
             ))
+            self.assertEqual(
+                exterior_leaf_ids, {entry["leaf_id"] for entry in queued}
+            )
+            self.assertEqual(result.queued_count, len(exterior_leaf_ids))
             self.assertTrue(checkpoint_path.is_file())
 
     def test_typed_response_insufficiency_queues_and_advances_without_promotion(self) -> None:

@@ -20,9 +20,14 @@ from .campaign_policy import (
     validate_schema11_checkpoint,
 )
 from .contracts import canonical_json_bytes
+from .response_batches import CampaignLeafRecord
+from .response_engine import _validated_worker_response_receipt
+from .root_readout_cache import RootReadoutStore
 
 
 RECOVERY_RECEIPT_SCHEMA = "windows-solver.campaign-recovery/v1"
+ROOT_READOUT_RECOVERY_INDEX_SCHEMA = "windows-solver.root-readout-recovery-index/v1"
+LEGACY_COMPATIBILITY_SCHEMA = "legacy-compatibility/v1"
 _HEX_64 = re.compile(r"[0-9a-f]{64}")
 _SOLVED_RECEIPT_FIELDS = {
     "schema_version",
@@ -38,6 +43,42 @@ _SOLVED_RECEIPT_FIELDS = {
 }
 _TERMINAL_STATES = frozenset({"PRODUCED", "UNRESOLVED", "REJECTED"})
 _EVIDENCE_RANK = {None: 0, "SCREENED": 1, "CERTIFIED": 2, "VALIDATED": 3}
+_SCHEMA9_CHECKPOINT_FIELDS = {
+    "schema_version",
+    "state",
+    "bindings",
+    "records",
+    "records_sha256",
+    "attempts",
+    "attempts_sha256",
+    "release_admissible",
+}
+_SCHEMA9_BINDING_FIELDS = {
+    "campaign_bindings",
+    "campaign_id",
+    "precision_contract_sha256",
+    "precision_factory_identity",
+    "selection",
+    "selection_jobs_sha256",
+}
+_SCHEMA9_SELECTION_FIELDS = {
+    "cohort_ids",
+    "leaf_ids",
+    "role",
+    "selection_id",
+}
+_SCHEMA9_CAMPAIGN_BINDING_FIELDS = {
+    "backend_identity_sha256",
+    "campaign_source_sha256",
+    "cohort_set_sha256",
+    "engine_source_sha256",
+    "ordered_leaf_set_sha256",
+    "policy_sha256",
+    "precision_capabilities_sha256",
+    "precision_factory_identity",
+    "root_set_sha256",
+    "schema_version",
+}
 
 
 RecordValidator = Callable[[str, Mapping[str, object]], None]
@@ -153,6 +194,10 @@ class RecoverySummary:
     julia_launches: int = 0
     determinant_evaluations: int = 0
     root_solves: int = 0
+    legacy_authenticated_terminal_count: int = 0
+    legacy_imported_count: int = 0
+    legacy_rejected_count: int = 0
+    legacy_unreconstructable_count: int = 0
 
     def to_mapping(self) -> dict[str, object]:
         return {
@@ -169,6 +214,14 @@ class RecoverySummary:
             "julia_launches": self.julia_launches,
             "determinant_evaluations": self.determinant_evaluations,
             "root_solves": self.root_solves,
+            "legacy_authenticated_terminal_count": (
+                self.legacy_authenticated_terminal_count
+            ),
+            "legacy_imported_count": self.legacy_imported_count,
+            "legacy_rejected_count": self.legacy_rejected_count,
+            "legacy_unreconstructable_count": (
+                self.legacy_unreconstructable_count
+            ),
         }
 
 
@@ -221,6 +274,375 @@ def _validated_record(
     return record
 
 
+def _validated_schema9_checkpoint(value: object) -> dict[str, object]:
+    """Authenticate the historical schema-9 envelope without upgrading it.
+
+    Schema 9 predates the schema-11 evidence ledger.  Its immutable numerical
+    records remain useful provenance, but this adapter must never manufacture
+    SCREENED, CERTIFIED, or VALIDATED evidence for them.
+    """
+
+    if not isinstance(value, Mapping):
+        raise ValueError("schema-9 checkpoint must be an object")
+    checkpoint = copy.deepcopy(dict(value))
+    if set(checkpoint) != _SCHEMA9_CHECKPOINT_FIELDS:
+        raise ValueError("schema-9 checkpoint envelope fields are invalid")
+    if checkpoint["schema_version"] != 9:
+        raise ValueError("schema-9 checkpoint version is invalid")
+    if checkpoint["state"] not in {"PARTIAL", "COMPLETE"}:
+        raise ValueError("schema-9 checkpoint state is invalid")
+    if not isinstance(checkpoint["release_admissible"], bool):
+        raise ValueError("schema-9 checkpoint release flag is invalid")
+
+    bindings = checkpoint["bindings"]
+    if not isinstance(bindings, Mapping) or set(bindings) != _SCHEMA9_BINDING_FIELDS:
+        raise ValueError("schema-9 checkpoint bindings are invalid")
+    if not isinstance(bindings["campaign_id"], str) or not bindings["campaign_id"]:
+        raise ValueError("schema-9 checkpoint campaign ID is invalid")
+    if not _is_sha256(bindings["precision_contract_sha256"]) or not _is_sha256(
+        bindings["selection_jobs_sha256"]
+    ):
+        raise ValueError("schema-9 checkpoint binding digest is invalid")
+
+    source_selection = bindings["selection"]
+    if (
+        not isinstance(source_selection, Mapping)
+        or set(source_selection) != _SCHEMA9_SELECTION_FIELDS
+        or not isinstance(source_selection["selection_id"], str)
+        or not source_selection["selection_id"]
+        or not isinstance(source_selection["role"], str)
+        or not source_selection["role"]
+        or not isinstance(source_selection["cohort_ids"], list)
+        or not isinstance(source_selection["leaf_ids"], list)
+    ):
+        raise ValueError("schema-9 checkpoint selection binding is invalid")
+    source_leaf_ids = source_selection["leaf_ids"]
+    if (
+        not source_leaf_ids
+        or len(source_leaf_ids) != len(set(source_leaf_ids))
+        or any(not isinstance(item, str) or not item for item in source_leaf_ids)
+    ):
+        raise ValueError("schema-9 checkpoint selection leaves are invalid")
+    if (
+        len(source_selection["cohort_ids"])
+        != len(set(source_selection["cohort_ids"]))
+        or any(
+            not isinstance(item, str) or not item
+            for item in source_selection["cohort_ids"]
+        )
+    ):
+        raise ValueError("schema-9 checkpoint selection cohorts are invalid")
+
+    campaign_bindings = bindings["campaign_bindings"]
+    if (
+        not isinstance(campaign_bindings, Mapping)
+        or set(campaign_bindings) != _SCHEMA9_CAMPAIGN_BINDING_FIELDS
+        or campaign_bindings["schema_version"] != 3
+    ):
+        raise ValueError("schema-9 checkpoint campaign provenance is invalid")
+    for name, item in campaign_bindings.items():
+        if name == "schema_version":
+            continue
+        if name == "precision_factory_identity":
+            if not isinstance(item, Mapping) or set(item) != {"factory", "module_sha256"}:
+                raise ValueError("schema-9 precision factory provenance is invalid")
+            if not isinstance(item["factory"], str) or not _is_sha256(item["module_sha256"]):
+                raise ValueError("schema-9 precision factory provenance is invalid")
+        elif not _is_sha256(item):
+            raise ValueError("schema-9 campaign provenance digest is invalid")
+    factory_identity = bindings["precision_factory_identity"]
+    if (
+        not isinstance(factory_identity, Mapping)
+        or dict(factory_identity) != dict(campaign_bindings["precision_factory_identity"])
+    ):
+        raise ValueError("schema-9 precision factory binding is invalid")
+
+    raw_records = checkpoint["records"]
+    if (
+        not isinstance(raw_records, list)
+        or checkpoint["records_sha256"] != _sha256(raw_records)
+    ):
+        raise ValueError("schema-9 checkpoint records digest is invalid")
+    raw_attempts = checkpoint["attempts"]
+    if (
+        not isinstance(raw_attempts, list)
+        or checkpoint["attempts_sha256"] != _sha256(raw_attempts)
+    ):
+        raise ValueError("schema-9 checkpoint attempts digest is invalid")
+
+    for raw_record in raw_records:
+        record = CampaignLeafRecord.from_mapping(raw_record)
+        if record.to_mapping() != raw_record:
+            raise ValueError("schema-9 checkpoint record is not canonical")
+        if record.leaf_id not in source_leaf_ids:
+            raise ValueError("schema-9 record is outside its source selection")
+    return checkpoint
+
+
+def _legacy_compatibility_receipt(
+    *,
+    path: Path,
+    source_sha256: str,
+    checkpoint: Mapping[str, object],
+    record: Mapping[str, object],
+    selection: RecoverySelection,
+    imported: bool,
+    reason: str | None,
+    reason_detail: str | None = None,
+) -> dict[str, object]:
+    """Record a schema-9 decision without claiming absent evidence.
+
+    This is compatibility provenance, not an evidence-ledger receipt.  In
+    particular, a schema-9 record gets no inferred evidence level merely
+    because it was once numerically terminal.
+    """
+
+    bindings = checkpoint["bindings"]
+    assert isinstance(bindings, Mapping)
+    source_selection = bindings["selection"]
+    assert isinstance(source_selection, Mapping)
+    leaf_id = record["leaf_id"]
+    assert isinstance(leaf_id, str)
+    content: dict[str, object] = {
+        "schema": LEGACY_COMPATIBILITY_SCHEMA,
+        "source_checkpoint_schema_version": 9,
+        "source_path": str(path),
+        "source_sha256": source_sha256,
+        "source_campaign_id": bindings["campaign_id"],
+        "source_selection_id": source_selection["selection_id"],
+        "source_records_sha256": checkpoint["records_sha256"],
+        "source_campaign_bindings_sha256": _sha256(
+            bindings["campaign_bindings"]
+        ),
+        "source_selection_binding_sha256": _sha256(source_selection),
+        "leaf_id": leaf_id,
+        "source_record_sha256": record["record_sha256"],
+        "source_terminal_state": record["state"],
+        "source_campaign_matches_current": (
+            bindings["campaign_id"] == selection.campaign_id
+        ),
+        "source_selection_matches_current": (
+            source_selection["selection_id"] == selection.selection_id
+        ),
+        "source_leaf_was_selected": leaf_id in source_selection["leaf_ids"],
+        "current_leaf_is_selected": leaf_id in selection.ordered_leaf_ids,
+        "source_stage_sha256s": [
+            stage["stage_sha256"] for stage in record["stages"]
+        ],
+        "current_scientific_identity_sha256": selection.scientific_identities.get(
+            leaf_id
+        ),
+        "original_record_status": "AUTHENTICATED",
+        "identity_reconstruction_status": (
+            "PROVEN_CURRENT"
+            if imported
+            else (
+                "NOT_APPLICABLE_OFF_SELECTION"
+                if reason == "OFF_SELECTION"
+                else "NOT_PROVEN"
+            )
+        ),
+        "imported_as_current_numerical_record": imported,
+        "schema11_evidence_level": None,
+        "reason": reason,
+        "reason_detail": reason_detail,
+    }
+    return {**content, "receipt_sha256": _sha256(content)}
+
+
+def _schema9_source_candidates(
+    *,
+    path: Path,
+    source_sha256: str,
+    checkpoint: Mapping[str, object],
+    selection: RecoverySelection,
+    record_validator: RecordValidator | None,
+    candidates: dict[str, list[_Candidate]],
+    ignored: list[dict[str, object]],
+    compatibility_receipts: list[dict[str, object]],
+) -> tuple[int, int, int, int]:
+    """Recover only schema-9 records whose current identity is proven.
+
+    A terminal schema-9 record is authentic historical work, not automatically
+    current scientific evidence.  When the current campaign identity cannot be
+    reconstructed, retain a deterministic compatibility receipt and leave the
+    numerical record out of the schema-11 checkpoint.
+    """
+
+    selected = set(selection.ordered_leaf_ids)
+    raw_records = checkpoint["records"]
+    assert isinstance(raw_records, list)
+    by_leaf: dict[str, list[dict[str, object]]] = {}
+    for raw_record in raw_records:
+        assert isinstance(raw_record, Mapping)
+        record = copy.deepcopy(dict(raw_record))
+        leaf_id = record["leaf_id"]
+        assert isinstance(leaf_id, str)
+        by_leaf.setdefault(leaf_id, []).append(record)
+
+    authenticated_terminal_count = 0
+    imported_count = 0
+    rejected_count = 0
+    unreconstructable_count = 0
+    for leaf_id, records in by_leaf.items():
+        terminal_records = [
+            record for record in records if record["state"] in _TERMINAL_STATES
+        ]
+        authenticated_terminal_count += len(terminal_records)
+        if len(records) != 1:
+            for record in terminal_records:
+                compatibility_receipts.append(
+                    _legacy_compatibility_receipt(
+                        path=path,
+                        source_sha256=source_sha256,
+                        checkpoint=checkpoint,
+                        record=record,
+                        selection=selection,
+                        imported=False,
+                        reason="AMBIGUOUS_LEGACY_RECONSTRUCTION",
+                    )
+                )
+                unreconstructable_count += 1
+                rejected_count += 1
+            ignored.append(
+                {
+                    "path": str(path),
+                    "leaf_id": leaf_id,
+                    "reason": "AMBIGUOUS_LEGACY_RECONSTRUCTION",
+                }
+            )
+            continue
+        record = records[0]
+        if record["state"] not in _TERMINAL_STATES:
+            ignored.append(
+                {
+                    "path": str(path),
+                    "leaf_id": leaf_id,
+                    "reason": f"NONTERMINAL_{record['state']}",
+                }
+            )
+            continue
+        if leaf_id not in selected:
+            compatibility_receipts.append(
+                _legacy_compatibility_receipt(
+                    path=path,
+                    source_sha256=source_sha256,
+                    checkpoint=checkpoint,
+                    record=record,
+                    selection=selection,
+                    imported=False,
+                    reason="OFF_SELECTION",
+                )
+            )
+            ignored.append(
+                {"path": str(path), "leaf_id": leaf_id, "reason": "OFF_SELECTION"}
+            )
+            rejected_count += 1
+            continue
+
+        reason = None
+        reason_detail = None
+        if record_validator is None:
+            reason = "CURRENT_SCIENTIFIC_IDENTITY_VALIDATOR_NOT_SUPPLIED"
+        if reason is None:
+            try:
+                validated = _validated_record(
+                    record,
+                    expected_role=selection.roles[leaf_id],
+                    record_validator=record_validator,
+                )
+            except ValueError as error:
+                reason_detail = str(error)
+                insufficient_markers = (
+                    "absent",
+                    "incomplete",
+                    "lacks",
+                    "missing",
+                    "unavailable",
+                )
+                reason = (
+                    "CURRENT_SCIENTIFIC_IDENTITY_UNRECONSTRUCTABLE"
+                    if any(
+                        marker in reason_detail.lower()
+                        for marker in insufficient_markers
+                    )
+                    else "CURRENT_SCIENTIFIC_IDENTITY_INCOMPATIBLE"
+                )
+            else:
+                receipt = _legacy_compatibility_receipt(
+                    path=path,
+                    source_sha256=source_sha256,
+                    checkpoint=checkpoint,
+                    record=validated,
+                    selection=selection,
+                    imported=True,
+                    reason=None,
+                )
+                candidates.setdefault(leaf_id, []).append(
+                    _Candidate(
+                        leaf_id,
+                        validated,
+                        str(path),
+                        source_sha256,
+                        receipt["receipt_sha256"],
+                    )
+                )
+                compatibility_receipts.append(receipt)
+                imported_count += 1
+                continue
+
+        compatibility_receipts.append(
+            _legacy_compatibility_receipt(
+                path=path,
+                source_sha256=source_sha256,
+                checkpoint=checkpoint,
+                record=record,
+                selection=selection,
+                imported=False,
+                reason=reason,
+                reason_detail=reason_detail,
+            )
+        )
+        ignored.append({
+            "path": str(path),
+            "leaf_id": leaf_id,
+            "reason": reason,
+            "reason_detail": reason_detail,
+        })
+        rejected_count += 1
+        if reason in {
+            "CURRENT_SCIENTIFIC_IDENTITY_UNRECONSTRUCTABLE",
+            "CURRENT_SCIENTIFIC_IDENTITY_VALIDATOR_NOT_SUPPLIED",
+        }:
+            unreconstructable_count += 1
+    return (
+        authenticated_terminal_count,
+        imported_count,
+        rejected_count,
+        unreconstructable_count,
+    )
+
+
+def _incident_oracle_status(
+    oracle_path: str | os.PathLike[str] | Path | None,
+) -> str:
+    """Classify the optional historical incident oracle without inventing a schema."""
+
+    if oracle_path is None:
+        return "NOT_SUPPLIED"
+    path = Path(oracle_path)
+    if not path.is_file():
+        return "INCOMPLETE_FIXTURE"
+    try:
+        _read_json(path)
+    except (OSError, ValueError):
+        return "INCOMPLETE_FIXTURE"
+    # No complete historical incident-oracle schema is present in the active
+    # contract. A parseable arbitrary JSON file is therefore still not an
+    # admissible oracle.
+    return "INCOMPLETE_FIXTURE"
+
+
 def _validated_solved_receipt(
     value: object,
     *,
@@ -252,6 +674,38 @@ def _validated_solved_receipt(
     ):
         raise ValueError("solved-leaf receipt disagrees with its numerical record")
     return record, identity
+
+
+def _root_readout_recovery_entry(
+    *, entry: object, source_sha256: str
+) -> dict[str, object]:
+    """Seal a cache address for later root authentication without numerics."""
+
+    receipt = getattr(entry, "worker_response_receipt", None)
+    if receipt is None:
+        raise ValueError("root-readout cache entry lacks a worker response receipt")
+    validated_receipt = _validated_worker_response_receipt(receipt)
+    if validated_receipt is None:
+        raise ValueError("root-readout cache entry lacks a worker response receipt")
+    request_sha256 = getattr(entry, "request_sha256", None)
+    response = getattr(entry, "response", None)
+    if (
+        not _is_sha256(request_sha256)
+        or not isinstance(response, Mapping)
+        or validated_receipt["request_sha256"] != request_sha256
+        or response.get("request_sha256") != request_sha256
+        or validated_receipt["worker_response_schema_version"]
+        != response.get("schema_version")
+    ):
+        raise ValueError("root-readout cache entry receipt binding is invalid")
+    return {
+        "path": str(entry.path),
+        "source_sha256": source_sha256,
+        "readout_identity_sha256": entry.readout_identity_sha256,
+        "request_sha256": request_sha256,
+        "runtime_identity_sha256": entry.runtime_identity_sha256,
+        "worker_response_receipt_sha256": validated_receipt["receipt_sha256"],
+    }
 
 
 def _candidate_like_solved_receipt(path: Path, value: object) -> bool:
@@ -327,6 +781,12 @@ def recover_campaign(
     candidates: dict[str, list[_Candidate]] = {}
     ignored: list[dict[str, object]] = []
     source_artifacts: list[dict[str, object]] = []
+    root_readout_indices: list[dict[str, object]] = []
+    legacy_compatibility_receipts: list[dict[str, object]] = []
+    legacy_authenticated_terminal_count = 0
+    legacy_imported_count = 0
+    legacy_rejected_count = 0
+    legacy_unreconstructable_count = 0
 
     for raw_path in source_checkpoints:
         path = Path(raw_path)
@@ -344,6 +804,30 @@ def recover_campaign(
             raise ValueError(f"explicit source checkpoint is corrupt: {path}")
         if value.get("schema_version") == 10:
             raise ValueError("schema-10 checkpoint is poisoned recovery input")
+        if value.get("schema_version") == 9:
+            try:
+                schema9_checkpoint = _validated_schema9_checkpoint(value)
+            except ValueError as error:
+                raise ValueError(
+                    f"explicit source checkpoint is corrupt: {path}: {error}"
+                ) from error
+            discovered, imported, rejected, unreconstructable = (
+                _schema9_source_candidates(
+                    path=path,
+                    source_sha256=source_sha,
+                    checkpoint=schema9_checkpoint,
+                    selection=selection,
+                    record_validator=record_validator,
+                    candidates=candidates,
+                    ignored=ignored,
+                    compatibility_receipts=legacy_compatibility_receipts,
+                )
+            )
+            legacy_authenticated_terminal_count += discovered
+            legacy_imported_count += imported
+            legacy_rejected_count += rejected
+            legacy_unreconstructable_count += unreconstructable
+            continue
         if value.get("schema_version") != 11:
             ignored.append(
                 {
@@ -463,6 +947,12 @@ def recover_campaign(
         root = Path(raw_root)
         if root.exists() and not root.is_dir():
             raise ValueError(f"root-readout store is not a directory: {root}")
+        try:
+            entries = RootReadoutStore(root).entries()
+        except ValueError as error:
+            raise ValueError(
+                f"trusted root-readout store is corrupt: {root}: {error}"
+            ) from error
         source_artifacts.append(
             {
                 "kind": "root-readout-store",
@@ -470,10 +960,49 @@ def recover_campaign(
                 "status": "AVAILABLE" if root.is_dir() else "MISSING",
             }
         )
+        recovered_entries: list[dict[str, object]] = []
+        for entry in entries:
+            source_sha = _file_sha256(entry.path)
+            try:
+                recovered_entries.append(
+                    _root_readout_recovery_entry(
+                        entry=entry, source_sha256=source_sha
+                    )
+                )
+            except ValueError as error:
+                if "lacks a worker response receipt" in str(error):
+                    ignored.append(
+                        {
+                            "path": str(entry.path),
+                            "reason": "MISSING_WORKER_RESPONSE_RECEIPT",
+                        }
+                    )
+                    continue
+                raise ValueError(
+                    "trusted root-readout entry is corrupt: "
+                    f"{entry.path}: {error}"
+                ) from error
+            source_artifacts.append(
+                {
+                    "kind": "root-readout-entry",
+                    "path": str(entry.path),
+                    "sha256": source_sha,
+                }
+            )
+        if recovered_entries:
+            root_readout_indices.append(
+                {
+                    "schema": ROOT_READOUT_RECOVERY_INDEX_SCHEMA,
+                    "store_path": str(root),
+                    "entries": recovered_entries,
+                }
+            )
 
     candidate_checkpoint = empty_schema11_checkpoint(
         selection.campaign_id, selection.selection_id
     )
+    candidate_checkpoint["recovery_receipts"].extend(root_readout_indices)
+    candidate_checkpoint["recovery_receipts"].extend(legacy_compatibility_receipts)
     accepted_receipts: list[dict[str, object]] = []
     for leaf_id in selection.ordered_leaf_ids:
         leaf_candidates = candidates.get(leaf_id, [])
@@ -529,6 +1058,17 @@ def recover_campaign(
         "lost_valid_records": len(candidates) - recovered_count,
         "fabricated_records": 0,
         "record_hash_changes": 0,
+        "discovery_counts": {
+            "source_checkpoints_configured": len(source_checkpoints),
+            "solved_leaf_stores_configured": len(solved_leaf_stores),
+            "root_readout_stores_configured": len(root_readout_stores),
+            "legacy_authenticated_terminal_records": (
+                legacy_authenticated_terminal_count
+            ),
+            "legacy_current_compatible_records": legacy_imported_count,
+            "legacy_reused_records": legacy_imported_count,
+            "legacy_rejected_records": legacy_rejected_count,
+        },
     }
     candidate_checkpoint["recovery_receipts"].append(recovery_entry)
     validate_schema11_checkpoint(candidate_checkpoint)
@@ -542,10 +1082,7 @@ def recover_campaign(
                 "recovery checkpoint finalizer changed scientific checkpoint state"
             )
 
-    oracle_status = "NOT_SUPPLIED"
-    if oracle_path is not None:
-        oracle = Path(oracle_path)
-        oracle_status = "AVAILABLE" if oracle.is_file() else "INCOMPLETE_FIXTURE"
+    oracle_status = _incident_oracle_status(oracle_path)
     receipt_content: dict[str, object] = {
         **recovery_entry,
         "schema": RECOVERY_RECEIPT_SCHEMA,
@@ -566,6 +1103,7 @@ def recover_campaign(
         "root_solves": 0,
         "source_mutations": 0,
         "oracle_status": oracle_status,
+        "canary_x9_status": oracle_status,
         "output_sha256": _sha256(candidate_checkpoint),
     }
     recovery_receipt = {
@@ -592,6 +1130,10 @@ def recover_campaign(
         ignored_count=len(ignored),
         output_path=str(output),
         receipt_path=str(receipt),
+        legacy_authenticated_terminal_count=legacy_authenticated_terminal_count,
+        legacy_imported_count=legacy_imported_count,
+        legacy_rejected_count=legacy_rejected_count,
+        legacy_unreconstructable_count=legacy_unreconstructable_count,
     )
 
 

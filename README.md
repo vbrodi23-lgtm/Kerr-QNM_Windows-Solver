@@ -91,8 +91,23 @@ For the current checkout it should resolve to the declared full-role campaign. T
 Inspect the current plan before execution:
 
 ```powershell
-.\solver.ps1 campaign-plan .\examples\m02-campaign.json --profile survey
+.\solver.ps1 campaign-plan .\examples\m02-campaign.json
 ```
+
+`m02.ps1` prepares the selection-scoped GSN resources automatically, on every
+cold start and every resume, before it invokes any pass. That step is
+equivalent to running the underlying command directly:
+
+```powershell
+.\solver.ps1 campaign-prepare-resources .\examples\m02-campaign.json
+```
+
+Resource preparation may invoke Julia and writes the sealed resource receipt.
+Campaign execution itself is load-only: if that receipt or its files are
+absent, stale, or corrupt, the pass stops with `GSN_BOOTSTRAP_REQUIRED` before
+leaf 1. You do not need to run the command above yourself before `m02.ps1
+-NewCampaign`; it is shown here only for operators driving `solver.ps1`
+directly instead of through `m02.ps1`.
 
 ### Start a new campaign
 
@@ -335,12 +350,21 @@ Campaign commands:
 
 ```text
 solver campaign-plan SELECTION.json
-solver campaign-run SELECTION.json --checkpoint CHECKPOINT.json
-solver campaign-resume SELECTION.json --checkpoint CHECKPOINT.json
-solver campaign-validate SELECTION.json --checkpoint CHECKPOINT.json
+solver campaign-prepare-resources SELECTION.json
+solver campaign-new SELECTION.json --output CHECKPOINT.json
+solver campaign-survey-binary64 SELECTION.json --checkpoint CHECKPOINT.json
+solver campaign-survey-promoted SELECTION.json --checkpoint CHECKPOINT.json
+solver campaign-certify SELECTION.json --checkpoint CHECKPOINT.json [--queue QUEUE.json]
+solver campaign-evidence-validate SELECTION.json --checkpoint CHECKPOINT.json --queue QUEUE.json
+solver campaign-schema11-validate SELECTION.json --checkpoint CHECKPOINT.json [--pass PASS]
+solver campaign-recover SELECTION.json --output CANDIDATE.json --receipt RECEIPT.json
 solver campaign-merge MANIFEST.json --output CHECKPOINT.json
 solver campaign-reduce REDUCTION-BUNDLE.json --output REDUCTION.json
 ```
+
+The older `campaign-run`, `campaign-resume`, and `campaign-validate` commands
+remain general-purpose legacy checkpoint operations. They are not independent
+M02 schedulers and do not own schema-11 M02 state transitions.
 
 Admission commands:
 
@@ -381,6 +405,11 @@ Use the following order when documents disagree:
 3. this README, `docs/architecture.md`, and the current operator runbooks;
 4. `.tasks/` for delivery state only;
 5. Git history for superseded decisions and provenance.
+
+While draft PR #66 is being completed, its committed
+`PR66_GOVERNING_COMPLETION_CONTRACT.md` governs PR-specific completion and
+acceptance. It does not replace the enduring production architecture above,
+and the PR body is intentionally only a pointer to that committed authority.
 
 The active operator runbooks are:
 

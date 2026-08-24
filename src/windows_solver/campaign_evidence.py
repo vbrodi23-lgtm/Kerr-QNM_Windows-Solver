@@ -18,6 +18,9 @@ from .campaign_policy import (
     validate_schema11_checkpoint,
 )
 from .contracts import canonical_json_bytes
+from .evidence_authentication import certified_disposition_is_admitted
+from .validation_admission import validated_disposition_is_admitted
+from .validation_admission import validation_admission_status
 
 
 EVIDENCE_PASS_REQUEST_SCHEMA = "windows-solver.evidence-pass-request/1"
@@ -386,11 +389,21 @@ def run_evidence_pass(
             ):
                 raise ValueError("evidence outcome attempted to replace the centre")
             current_level = EvidenceLevel(evidence["evidence_level"])
-            next_level = (
-                policy.successful_output_level
-                if outcome.centre_agrees
-                else current_level
-            )
+            validation_status = "NOT_APPLICABLE"
+            if policy.profile is ExecutionProfile.VALIDATE:
+                validation_status = validation_admission_status(outcome.receipt)
+                next_level = (
+                    EvidenceLevel.VALIDATED
+                    if outcome.centre_agrees
+                    and validation_status == "ADMITTED"
+                    else current_level
+                )
+            else:
+                next_level = (
+                    EvidenceLevel.CERTIFIED
+                    if outcome.centre_agrees
+                    else current_level
+                )
             discrepancy_codes = (
                 () if outcome.centre_agrees else (outcome.discrepancy_code,)
             )
@@ -406,6 +419,7 @@ def run_evidence_pass(
                 "centre_agrees": outcome.centre_agrees,
                 "discrepancy_code": outcome.discrepancy_code,
                 "precision_tiers": list(policy.precision_tiers),
+                "validation_admission_status": validation_status,
                 "source_receipt": copy.deepcopy(dict(outcome.receipt)),
             }
             disposition_receipt = {
@@ -442,6 +456,9 @@ def require_release_evidence(
     """Reject release admission unless every required leaf is strong enough."""
 
     validated = validate_schema11_checkpoint(checkpoint)
+    records_by_leaf_id = {
+        str(record["leaf_id"]): record for record in validated["records"]
+    }
     for leaf_id, required in requirements.items():
         try:
             required_level = EvidenceLevel(required)
@@ -457,11 +474,78 @@ def require_release_evidence(
                 f"release admission requires {required_level.value} evidence "
                 f"for {leaf_id}"
             )
+        record = records_by_leaf_id.get(leaf_id)
+        if not isinstance(record, Mapping):
+            raise ValueError(
+                f"release evidence record binding is invalid for {leaf_id}"
+            )
+        stages = record.get("stages")
+        if not isinstance(stages, list) or not stages:
+            raise ValueError(
+                f"release evidence stage binding is invalid for {leaf_id}"
+            )
+        central_stage_sha256 = entry.get("central_stage_sha256")
+        central_stage = next(
+            (
+                stage
+                for stage in stages
+                if isinstance(stage, Mapping)
+                and stage.get("stage_sha256") == central_stage_sha256
+            ),
+            None,
+        )
+        if not isinstance(central_stage, Mapping):
+            raise ValueError(
+                f"release evidence stage binding is invalid for {leaf_id}"
+            )
+        stage_content = {
+            key: value
+            for key, value in central_stage.items()
+            if key != "stage_sha256"
+        }
+        if (
+            entry.get("central_record_sha256") != record.get("record_sha256")
+            or central_stage_sha256 != _sha256(stage_content)
+        ):
+            raise ValueError(
+                f"release evidence stage authentication failed for {leaf_id}"
+            )
         actual = EvidenceLevel(entry["evidence_level"])
         if _EVIDENCE_RANK[actual] < _EVIDENCE_RANK[required_level]:
             raise ValueError(
                 f"release admission requires {required_level.value} evidence "
                 f"for {leaf_id}"
+            )
+        receipts = entry.get("receipts")
+        if not isinstance(receipts, list):
+            raise ValueError(f"release evidence receipts are invalid for {leaf_id}")
+        certification_admitted = any(
+            certified_disposition_is_admitted(
+                receipt,
+                leaf_id=leaf_id,
+                central_record_sha256=str(record["record_sha256"]),
+                central_stage_sha256=str(central_stage_sha256),
+            )
+            for receipt in receipts
+            if isinstance(receipt, Mapping)
+        )
+        validation_admitted = any(
+            validated_disposition_is_admitted(
+                receipt,
+                leaf_id=leaf_id,
+                central_record_sha256=str(record["record_sha256"]),
+                central_stage_sha256=str(central_stage_sha256),
+            )
+            for receipt in receipts
+            if isinstance(receipt, Mapping)
+        )
+        if not certification_admitted or (
+            required_level is EvidenceLevel.VALIDATED
+            and not validation_admitted
+        ):
+            raise ValueError(
+                f"release evidence receipts do not authenticate "
+                f"{required_level.value} for {leaf_id}"
             )
 
 

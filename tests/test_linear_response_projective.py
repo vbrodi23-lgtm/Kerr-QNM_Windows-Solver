@@ -11,6 +11,13 @@ import tempfile
 import unittest
 
 from windows_solver.contracts import canonical_json_bytes
+from windows_solver.evidence_authentication import evidence_policy_identity
+from windows_solver.campaign_policy import (
+    EvidenceLevel,
+    add_numerical_record,
+    empty_schema11_checkpoint,
+    record_evidence,
+)
 from windows_solver.linear_response import B_PRIME_RELEASE_DOMAIN
 from windows_solver.response_batches import (
     CampaignLeafRecord,
@@ -42,6 +49,56 @@ from windows_solver.response_reduction import (
     reduce_projective_row,
     reduce_projective_rows,
 )
+
+
+def _sha256(value: object) -> str:
+    return hashlib.sha256(canonical_json_bytes(value)).hexdigest()
+
+
+def _certification_disposition(
+    leaf_id: str, record_sha256: str, stage_sha256: str
+) -> dict[str, object]:
+    independent_result = {"leaf_id": leaf_id, "route": "synthetic-certification"}
+    source_content = {
+        "schema": "windows-solver.native-evidence-result/1",
+        "profile": "CERTIFY",
+        "evidence_policy_identity": evidence_policy_identity("CERTIFY"),
+        "leaf_id": leaf_id,
+        "central_record_sha256": record_sha256,
+        "central_stage_sha256": stage_sha256,
+        "precision_tier": "BF80",
+        "refinement": 0,
+        "operation_identity": "production-certification-comparator/v1",
+        "backend_identity": "b" * 64,
+        "runtime_identity": "c" * 64,
+        "calculation_route_identity": "same-backend-refinement/v1",
+        "calculation_route_family": "EXTERIOR",
+        "route_output_sha256": _sha256(independent_result),
+        "human_mathematics_review_receipt": None,
+        "centre_agrees": True,
+        "discrepancy_code": None,
+        "independent_result": independent_result,
+    }
+    source = {**source_content, "receipt_sha256": _sha256(source_content)}
+    disposition_content = {
+        "schema": "windows-solver.evidence-pass-disposition/1",
+        "profile": "CERTIFY",
+        "request_sha256": "a" * 64,
+        "evidence_policy_identity": evidence_policy_identity("CERTIFY"),
+        "engine_identity": "d" * 64,
+        "leaf_id": leaf_id,
+        "central_record_sha256": record_sha256,
+        "central_stage_sha256": stage_sha256,
+        "centre_agrees": True,
+        "discrepancy_code": None,
+        "precision_tiers": ["BF80"],
+        "validation_admission_status": "NOT_APPLICABLE",
+        "source_receipt": source,
+    }
+    return {
+        **disposition_content,
+        "receipt_sha256": _sha256(disposition_content),
+    }
 
 
 class ProjectiveRowPlanTests(unittest.TestCase):
@@ -293,7 +350,7 @@ class ProjectiveRowPlanTests(unittest.TestCase):
         self.assertEqual(result.missing_component_ids, ())
         self.assertIsNone(result.empirical_gram_id)
 
-    def test_campaign_reduce_cli_validates_checkpoint_and_is_partial_honest(self) -> None:
+    def test_campaign_reduce_cli_rejects_legacy_and_missing_release_evidence(self) -> None:
         plan = build_campaign_plan(
             policy=NumericalPolicy(),
             backend_identity=VettedNativeDeterminantKernel.identity,
@@ -311,28 +368,49 @@ class ProjectiveRowPlanTests(unittest.TestCase):
         selection = build_campaign_selection(plan, role="deep", leaf_ids=selected_ids)
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
-            checkpoint = directory / "deep-tail-partial.json"
+            checkpoint = directory / "legacy-schema9.json"
             checkpoint.write_bytes(
                 canonical_json_bytes(_checkpoint_mapping(plan, selection, ()))
             )
-            source_hash = "sha256:" + hashlib.sha256(checkpoint.read_bytes()).hexdigest()
-            material = {
-                "schema_version": 1,
-                "campaign_id": plan.campaign_id,
-                "backend_id": plan.backend_identity.backend_id,
-                "precision_digits": [64],
-                "precision_backend": None,
-                "checkpoint_paths": [checkpoint.name],
-                "selected_row_ids": [row.row_id],
-                "component_evidence": [],
-                "source_hashes": [source_hash],
-            }
-            bundle = {
-                **material,
-                "bundle_sha256": hashlib.sha256(canonical_json_bytes(material)).hexdigest(),
-            }
             bundle_path = directory / "reduction-bundle.json"
-            bundle_path.write_bytes(canonical_json_bytes(bundle))
+
+            def write_bundle(schema_version: int = 1) -> None:
+                source_hash = (
+                    "sha256:" + hashlib.sha256(checkpoint.read_bytes()).hexdigest()
+                )
+                shared = {
+                    "campaign_id": plan.campaign_id,
+                    "backend_id": plan.backend_identity.backend_id,
+                    "precision_digits": [64],
+                    "precision_backend": None,
+                    "selected_row_ids": [row.row_id],
+                    "component_evidence": [],
+                    "source_hashes": [source_hash],
+                }
+                material = (
+                    {
+                        "schema_version": 1,
+                        **shared,
+                        "checkpoint_paths": [checkpoint.name],
+                    }
+                    if schema_version == 1
+                    else {
+                        "schema_version": 2,
+                        **shared,
+                        "schema11_checkpoint_paths": [checkpoint.name],
+                        "required_evidence_levels": {
+                            leaf_id: "CERTIFIED" for leaf_id in selected_ids
+                        },
+                    }
+                )
+                bundle_path.write_bytes(canonical_json_bytes({
+                    **material,
+                    "bundle_sha256": hashlib.sha256(
+                        canonical_json_bytes(material)
+                    ).hexdigest(),
+                }))
+
+            write_bundle()
 
             def invoke(*arguments: str) -> subprocess.CompletedProcess[str]:
                 return subprocess.run(
@@ -343,43 +421,28 @@ class ProjectiveRowPlanTests(unittest.TestCase):
                     capture_output=True,
                 )
 
-            reduced = invoke(
-                "campaign-reduce", bundle_path.name, "--output", "partial-reduction.json"
+            legacy = invoke(
+                "campaign-reduce", bundle_path.name, "--output", "legacy.json"
             )
-            self.assertEqual(reduced.returncode, 0, reduced.stderr)
-            self.assertEqual(len(reduced.stdout.splitlines()), 1)
-            output = json.loads(reduced.stdout)
-            self.assertEqual(output["reducer_state"], "INCOMPLETE")
-            self.assertEqual(output["selected_row_ids"], [row.row_id])
-            self.assertEqual(output["results"][0]["projective_outcome"], None)
-            self.assertFalse(output["release_admissible"])
-            self.assertEqual(
-                (directory / "partial-reduction.json").read_bytes(),
-                canonical_json_bytes({key: value for key, value in output.items() if key != "command"}),
+            self.assertEqual(legacy.returncode, 2)
+            self.assertIn(
+                "requires a schema-11 evidence checkpoint", legacy.stderr
             )
+            self.assertFalse((directory / "legacy.json").exists())
 
-            overwrite = invoke(
-                "campaign-reduce", bundle_path.name, "--output", "partial-reduction.json"
+            checkpoint = directory / "schema11-empty.json"
+            checkpoint.write_bytes(canonical_json_bytes(
+                empty_schema11_checkpoint(
+                    plan.campaign_id, selection.selection_id
+                )
+            ))
+            write_bundle(schema_version=2)
+            missing = invoke(
+                "campaign-reduce", bundle_path.name, "--output", "missing.json"
             )
-            self.assertEqual(overwrite.returncode, 2)
-            unsafe = invoke(
-                "campaign-reduce", bundle_path.name, "--output", "C:relative.json"
-            )
-            self.assertEqual(unsafe.returncode, 2)
-
-            stale_material = {**material, "campaign_id": "b-prime-campaign-" + "0" * 64}
-            stale = {
-                **stale_material,
-                "bundle_sha256": hashlib.sha256(
-                    canonical_json_bytes(stale_material)
-                ).hexdigest(),
-            }
-            bundle_path.write_bytes(canonical_json_bytes(stale))
-            rejected = invoke(
-                "campaign-reduce", bundle_path.name, "--output", "stale.json"
-            )
-            self.assertEqual(rejected.returncode, 2)
-            self.assertFalse((directory / "stale.json").exists())
+            self.assertEqual(missing.returncode, 2)
+            self.assertIn("release evidence is absent", missing.stderr)
+            self.assertFalse((directory / "missing.json").exists())
 
             bundle_path.write_text(
                 '{"schema_version":1,"schema_version":1}', encoding="utf-8"
@@ -505,16 +568,147 @@ class ProjectiveRowPlanTests(unittest.TestCase):
                 "available_precision_digits": [64],
             }),),
         )
+        row_leaf_ids = frozenset(
+            (*row.left_component_ids, *row.right_component_ids)
+        )
+
+        def record_for(candidate) -> CampaignLeafRecord:
+            if candidate.leaf_id == leaf.leaf_id:
+                return record
+            candidate_job = candidate.job
+
+            def candidate_readout(amplitude: complex) -> RootReadout:
+                return RootReadout(
+                    omega=candidate_job.root.omega + response * amplitude,
+                    determinant_residual_abs=0.0,
+                    determinant_derivative_abs=1.0,
+                    converged=True,
+                    root_reference_id=candidate_job.root.root_reference_id,
+                    branch_id=candidate_job.root.branch_id,
+                    equation_id=candidate_job.equation_id,
+                    diagnostic_readouts={
+                        family: DiagnosticRootReadout(
+                            omega_delta_from_primary=delta,
+                            determinant_residual_abs=0.0,
+                            determinant_derivative_abs=1.0,
+                            converged=True,
+                        )
+                        for family, delta in diagnostic_deltas.items()
+                    },
+                    source_root_mapping=candidate_job.source_root_mapping,
+                )
+
+            candidate_levels = tuple(
+                LadderLevel(
+                    epsilon=epsilon,
+                    real_plus=candidate_readout(complex(epsilon, 0.0)),
+                    real_minus=candidate_readout(complex(-epsilon, 0.0)),
+                    imaginary_plus=candidate_readout(complex(0.0, epsilon)),
+                    imaginary_minus=candidate_readout(complex(0.0, -epsilon)),
+                )
+                for epsilon in candidate_job.policy.epsilons[-4:]
+            )
+            candidate_result = ComponentResult(
+                job_id=candidate_job.job_id,
+                leaf_id=candidate_job.leaf_id,
+                mechanism_id=candidate_job.mechanism_id,
+                status=ComponentStatus.CONVERGED,
+                convergence_basis="ORDER_RESOLVED",
+                response=response,
+                signed_root_crosscheck=response,
+                closed_form_response=None,
+                error_channels={name: 0.0 for name in ERROR_CHANNELS},
+                baseline=RootReadout(
+                    omega=candidate_job.root.omega,
+                    determinant_residual_abs=0.0,
+                    determinant_derivative_abs=1.0,
+                    converged=True,
+                    root_reference_id=candidate_job.root.root_reference_id,
+                    branch_id=candidate_job.root.branch_id,
+                    equation_id=candidate_job.equation_id,
+                ),
+                levels=candidate_levels,
+                lineage={
+                    "leaf_id": candidate_job.leaf_id,
+                    "root_reference_id": candidate_job.root.root_reference_id,
+                    "root_identity_sha256": candidate_job.root.identity_sha256,
+                    "policy_sha256": candidate_job.policy.identity_sha256,
+                    "backend_identity_sha256": (
+                        candidate_job.backend_identity.identity_sha256
+                    ),
+                    "equation_id": candidate_job.equation_id,
+                    "sampling_coordinate": (
+                        candidate_job.sampling_coordinate.to_mapping()
+                    ),
+                    "source_root_mapping": None,
+                },
+            )
+            candidate_component = {
+                "evidence_kind": "authenticated-test-component",
+                "result": candidate_result.to_mapping(),
+            }
+            candidate_stage = StageOutcome(
+                digits=64,
+                numerical_state="CONVERGED",
+                component_result=candidate_component,
+                local_disk_radius_abs=abs(family_deltas["signed-root"]),
+                signed_error_channels=explicit_stage_signed_error_channels(
+                    candidate_component,
+                    family_deltas=family_deltas,
+                    source_kind="authenticated-test-component",
+                    source_id=candidate_job.job_id,
+                    units="M-delta-omega-per-native-coordinate",
+                ),
+            )
+            return CampaignLeafRecord(
+                leaf_id=candidate.leaf_id,
+                role=candidate.role,
+                state="PRODUCED",
+                stages=(CampaignStageRecord(candidate_stage, {
+                    "precision_factory_identity": (
+                        plan.precision_factory_identity.to_mapping()
+                    ),
+                    "available_precision_digits": [64],
+                }),),
+            )
+
+        row_records = tuple(
+            record_for(candidate)
+            for candidate in plan.leaves
+            if candidate.leaf_id in row_leaf_ids
+        )
         selection = build_campaign_selection(
-            plan, role="primary", leaf_ids=(leaf.leaf_id,)
+            plan,
+            role="primary",
+            leaf_ids=tuple(item.leaf_id for item in row_records),
         )
 
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
             checkpoint = directory / "one-component.json"
-            checkpoint.write_bytes(canonical_json_bytes(
-                _checkpoint_mapping(plan, selection, (record,))
-            ))
+            schema11 = empty_schema11_checkpoint(
+                plan.campaign_id, selection.selection_id
+            )
+            for row_record in row_records:
+                record_mapping = row_record.to_mapping()
+                schema11 = add_numerical_record(schema11, record_mapping)
+                schema11 = record_evidence(
+                    schema11,
+                    leaf_id=row_record.leaf_id,
+                    central_record_sha256=record_mapping["record_sha256"],
+                    central_stage_sha256=(
+                        record_mapping["stages"][-1]["stage_sha256"]
+                    ),
+                    evidence_level=EvidenceLevel.CERTIFIED,
+                    receipts=(
+                        _certification_disposition(
+                            row_record.leaf_id,
+                            record_mapping["record_sha256"],
+                            record_mapping["stages"][-1]["stage_sha256"],
+                        ),
+                    ),
+                )
+            checkpoint.write_bytes(canonical_json_bytes(schema11))
             source_receipt = (
                 "sha256:" + hashlib.sha256(checkpoint.read_bytes()).hexdigest()
             )
@@ -542,13 +736,16 @@ class ProjectiveRowPlanTests(unittest.TestCase):
 
             def write_bundle(component_mapping: dict[str, object]) -> Path:
                 material = {
-                    "schema_version": 1,
+                    "schema_version": 2,
                     "campaign_id": plan.campaign_id,
                     "backend_id": plan.backend_identity.backend_id,
                     "precision_digits": [64],
                     "precision_backend": None,
-                    "checkpoint_paths": [checkpoint.name],
+                    "schema11_checkpoint_paths": [checkpoint.name],
                     "selected_row_ids": [row.row_id],
+                    "required_evidence_levels": {
+                        item.leaf_id: "CERTIFIED" for item in row_records
+                    },
                     "component_evidence": [component_mapping],
                     "source_hashes": [source_receipt],
                 }

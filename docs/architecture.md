@@ -1619,12 +1619,22 @@ solver export RUN_ID --output PACKAGE.json [--store PATH]
 
 ```text
 solver campaign-plan SELECTION.json
-solver campaign-run SELECTION.json --checkpoint CHECKPOINT.json
-solver campaign-resume SELECTION.json --checkpoint CHECKPOINT.json
-solver campaign-validate SELECTION.json --checkpoint CHECKPOINT.json
+solver campaign-prepare-resources SELECTION.json
+solver campaign-new SELECTION.json --output CHECKPOINT.json
+solver campaign-survey-binary64 SELECTION.json --checkpoint CHECKPOINT.json
+solver campaign-survey-promoted SELECTION.json --checkpoint CHECKPOINT.json
+solver campaign-certify SELECTION.json --checkpoint CHECKPOINT.json [--queue QUEUE.json]
+solver campaign-evidence-validate SELECTION.json --checkpoint CHECKPOINT.json --queue QUEUE.json
+solver campaign-schema11-validate SELECTION.json --checkpoint CHECKPOINT.json [--pass PASS]
+solver campaign-recover SELECTION.json --output CANDIDATE.json --receipt RECEIPT.json
 solver campaign-merge MANIFEST.json --output CHECKPOINT.json
 solver campaign-reduce REDUCTION-BUNDLE.json --output REDUCTION.json
 ```
+
+`campaign-prepare-resources` is machine preparation and may invoke Julia.
+Every campaign pass is load-only with respect to those resources. The older
+general-purpose campaign run/resume/validate commands do not own schema-11 M02
+transitions and must not be composed into a second M02 scheduler.
 
 ### Operator entrypoints
 

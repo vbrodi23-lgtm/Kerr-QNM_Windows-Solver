@@ -63,6 +63,26 @@ def _conditioning(request) -> dict[str, object]:
     }
 
 
+def _determinant_error_evidence(request, index: int) -> dict[str, object]:
+    policy = request["policy"]
+    delta_same_point = 1.0e-20 * (index + 1)
+    delta_cross_precision = 2.0e-20 * (index + 1)
+    delta_endpoint_series = 0.5e-20 * (index + 1)
+    safety_factor = 64
+    numerical_error_abs = safety_factor * max(
+        delta_same_point, delta_cross_precision, delta_endpoint_series
+    )
+    return {
+        "schema": "windows-solver.exterior-determinant-error-evidence/1",
+        "error_model_id": policy["determinant_error_model"],
+        "delta_same_point": str(delta_same_point),
+        "delta_cross_precision": str(delta_cross_precision),
+        "delta_endpoint_series": str(delta_endpoint_series),
+        "safety_factor": str(safety_factor),
+        "numerical_error_abs": str(numerical_error_abs),
+    }
+
+
 class _BatchAdapter:
     runtime_provenance = {
         "julia_version": "1.10.11",
@@ -108,6 +128,9 @@ class _BatchAdapter:
                         "imaginary": str(-(index + 1)),
                     },
                     "numerical_conditioning": _conditioning(request),
+                    "determinant_error_evidence": (
+                        _determinant_error_evidence(request, index)
+                    ),
                 }
                 for index, sample in enumerate(request["samples"])
             ],
@@ -163,15 +186,21 @@ class JuliaFixedRootSurveyBatchTests(unittest.TestCase):
             self.assertEqual(set(sample["support"]), {
                 "lower", "upper", "centre", "half_width"
             })
-        forbidden = {
-            "determinant_error_model",
-            "determinant_error_required_term_classes",
-            "determinant_error_certificate_statement",
+        still_forbidden = {
             "human_math_review_receipt_status",
             "independent_reference_fixture_receipt_status",
             "promoted_root_readout_policy",
         }
-        self.assertTrue(forbidden.isdisjoint(request["policy"]))
+        self.assertTrue(still_forbidden.isdisjoint(request["policy"]))
+        self.assertEqual(
+            request["policy"]["determinant_error_model"],
+            "exterior-determinant-absolute-error-certificate/empirical-v1",
+        )
+        self.assertEqual(request["policy"]["determinant_error_safety_factor"], 64)
+        self.assertEqual(
+            request["policy"]["determinant_error_required_term_classes"],
+            ["delta_same_point", "delta_cross_precision", "delta_endpoint_series"],
+        )
 
     def test_canonical_five_and_reused_mechanism_four_are_valid_plans(self):
         job = _job()
@@ -250,7 +279,12 @@ class JuliaFixedRootSurveyBatchTests(unittest.TestCase):
                 sample_roles=BINARY64_FIXED_ROOT_SAMPLE_ROLES,
             )
 
-    def test_worker_survey_function_has_no_root_or_certificate_calls(self):
+    def test_worker_survey_function_has_no_root_solving_calls(self):
+        """The survey batch computes its mandatory determinant-error
+        certificate through the shared ``determinant_progress`` dispatcher
+        (governing contract: promoted survey must produce a real bounded
+        result), but it must never perform a root solve."""
+
         worker = (
             Path(__file__).parents[1]
             / "src/windows_solver/data/julia/m02_worker.jl"
@@ -260,14 +294,12 @@ class JuliaFixedRootSurveyBatchTests(unittest.TestCase):
         body = worker[start:end]
         for prohibited in (
             "select_worker_outer_endpoint_pair",
-            "authenticated_determinant_progress",
-            "exterior_cross_precision_disagreement",
             "tight_control_request",
             "solve_phase",
             "bounded_newton",
         ):
             self.assertNotIn(prohibited, body)
-        self.assertIn("raw_determinant_progress", body)
+        self.assertIn("determinant_progress(", body)
 
     def test_fixed_root_policy_shape_is_checked_only_by_fixed_root_parser(self):
         worker = (

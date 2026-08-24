@@ -148,13 +148,15 @@ if (-not [string]::IsNullOrWhiteSpace($QueuePath)) {
 
 Push-Location $PackageRoot
 try {
+    Invoke-M02Command -Arguments @(
+        "campaign-prepare-resources",
+        $SelectionPath
+    ) | Out-Null
     if ($NewCampaign) {
-        $RecoveryReceipt = "$CheckpointPath.recovery-receipt.json"
         Invoke-M02Command -Arguments @(
-            "campaign-recover",
-            $Selection,
-            "--output", $CheckpointPath,
-            "--receipt", $RecoveryReceipt
+            "campaign-new",
+            $SelectionPath,
+            "--output", $CheckpointPath
         ) | Out-Null
     }
     $Command = if ($Profile -eq "survey" -and $SurveyPass -eq "binary64") {
@@ -171,7 +173,7 @@ try {
     }
     $CampaignPlan = Invoke-M02Command -Arguments @(
         "campaign-plan",
-        $Selection
+        $SelectionPath
     ) | ConvertFrom-Json
     if (
         $null -eq $CampaignPlan -or
@@ -182,7 +184,7 @@ try {
     }
     $CheckpointStatus = Invoke-M02Command -Arguments @(
         "campaign-schema11-validate",
-        $Selection,
+        $SelectionPath,
         "--checkpoint", $CheckpointPath
     ) | ConvertFrom-Json
     Write-Host "M02 campaign startup" -ForegroundColor Cyan
@@ -206,7 +208,7 @@ try {
     Write-Host ("    Status path              : {0}" -f "$CheckpointPath.status.json")
     $RunArguments = @(
         $Command,
-        $Selection,
+        $SelectionPath,
         "--checkpoint", $CheckpointPath,
         "--progress", $Progress
     ) + $CalibrationArguments
@@ -222,7 +224,7 @@ try {
     }
     Invoke-M02Command -Arguments @(
         "campaign-schema11-validate",
-        $Selection,
+        $SelectionPath,
         "--checkpoint", $CheckpointPath,
         "--pass", $ValidationPass
     ) | Out-Null

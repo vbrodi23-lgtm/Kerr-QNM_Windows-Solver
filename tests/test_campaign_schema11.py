@@ -99,32 +99,29 @@ class Schema11CheckpointTests(unittest.TestCase):
         self.assertEqual(original["record_sha256"], checkpoint["records"][0]["record_sha256"])
         validate_schema11_checkpoint(checkpoint)
 
-    def test_evidence_strength_can_only_increase(self) -> None:
+    def test_evidence_strengthening_rejects_unauthenticated_labels(self) -> None:
         record = _record()
         checkpoint = add_numerical_record(
             empty_schema11_checkpoint("campaign-1", "selection-1"), record
         )
-        for level in (
-            EvidenceLevel.SCREENED,
-            EvidenceLevel.CERTIFIED,
-            EvidenceLevel.VALIDATED,
+        checkpoint = record_evidence(
+            checkpoint,
+            leaf_id="leaf-1",
+            central_record_sha256=record["record_sha256"],
+            central_stage_sha256="a" * 64,
+            evidence_level=EvidenceLevel.SCREENED,
+            receipts=[{"schema": "screening/v1"}],
+        )
+        with self.assertRaisesRegex(
+            ValueError, "authenticated certification disposition"
         ):
-            checkpoint = record_evidence(
-                checkpoint,
-                leaf_id="leaf-1",
-                central_record_sha256=record["record_sha256"],
-                central_stage_sha256="a" * 64,
-                evidence_level=level,
-                receipts=[{"schema": f"{level.value.lower()}/v1"}],
-            )
-
-        with self.assertRaisesRegex(ValueError, "cannot decrease"):
             record_evidence(
                 checkpoint,
                 leaf_id="leaf-1",
                 central_record_sha256=record["record_sha256"],
                 central_stage_sha256="a" * 64,
-                evidence_level=EvidenceLevel.SCREENED,
+                evidence_level=EvidenceLevel.CERTIFIED,
+                receipts=[{"schema": "certification/v1"}],
             )
 
     def test_failed_is_not_a_schema11_numerical_state(self) -> None:

@@ -217,16 +217,27 @@ class PromotedSurveySchedulerTests(unittest.TestCase):
         root_runner=None,
     ):
         calls: list[int] = []
+        published: dict[str, AuthenticatedRootSeal] = {}
+
+        def root_seal_lookup(leaf, entry):
+            source_sha256 = entry["source_root_seal_sha256"]
+            if source_sha256 is not None:
+                return AuthenticatedRootSeal(
+                    leaf.job.root.omega,
+                    leaf.job.root.branch_id,
+                    source_sha256,
+                )
+            return published.get(leaf.leaf_id)
+
         with tempfile.TemporaryDirectory() as temporary:
             result = run_promoted_survey(
                 self.plan,
                 self.selection,
                 checkpoint,
                 checkpoint_path=Path(temporary) / "checkpoint.json",
-                root_seal_lookup=lambda leaf, entry: AuthenticatedRootSeal(
-                    leaf.job.root.omega,
-                    leaf.job.root.branch_id,
-                    entry["source_root_seal_sha256"],
+                root_seal_lookup=root_seal_lookup,
+                root_seal_publish=lambda leaf, seal: published.__setitem__(
+                    leaf.leaf_id, seal
                 ),
                 backend_factory=lambda leaf, digits: _Backend(
                     leaf, digits,
@@ -253,14 +264,15 @@ class PromotedSurveySchedulerTests(unittest.TestCase):
             )
         return result, calls
 
-    def test_response_queue_completes_at_bf40_with_one_worker_request(self):
+    def test_response_queue_stops_unresolved_without_approved_error_model(self):
         result, calls = self._run(self._checkpoint())
-        self.assertEqual([40], calls)
-        self.assertEqual(1, result.completed_count)
-        self.assertEqual("COMPLETED", result.checkpoint[
+        self.assertEqual([40, 80], calls)
+        self.assertEqual(0, result.completed_count)
+        self.assertEqual(1, result.unresolved_count)
+        self.assertEqual("UNRESOLVED", result.checkpoint[
             "survey_pass_ledger"
         ]["promoted"][self.leaves[0].leaf_id]["disposition"])
-        self.assertEqual("COMPLETED", result.checkpoint[
+        self.assertEqual("UNRESOLVED", result.checkpoint[
             "promotion_queue"
         ]["entries"][0]["disposition"])
         ledger = result.checkpoint["survey_pass_ledger"]["promoted"][
@@ -268,14 +280,18 @@ class PromotedSurveySchedulerTests(unittest.TestCase):
         ]
         self.assertEqual(0, ledger["root_read_limit"])
         self.assertEqual(2, ledger["worker_launch_limit"])
-        self.assertEqual("BF40", ledger["tier_timing"][0]["tier"])
-        self.assertEqual("direct", ledger["tier_timing"][0]["source"])
+        self.assertEqual(["BF40", "BF80"], [
+            item["tier"] for item in ledger["tier_timing"]
+        ])
+        self.assertTrue(all(
+            item["source"] == "direct" for item in ledger["tier_timing"]
+        ))
         self.assertEqual(
-            ["STARTED", "COMPLETED"],
+            ["STARTED", "COMPLETED", "STARTED", "COMPLETED"],
             [fragment["state"] for fragment in ledger["session_fragments"]],
         )
 
-    def test_completed_disposition_is_committed_before_return(self):
+    def test_unresolved_disposition_is_committed_before_return(self):
         checkpoint = self._checkpoint()
         calls: list[int] = []
         with tempfile.TemporaryDirectory() as temporary:
@@ -304,7 +320,7 @@ class PromotedSurveySchedulerTests(unittest.TestCase):
 
         self.assertEqual(result.checkpoint, durable)
         self.assertEqual(
-            "COMPLETED",
+            "UNRESOLVED",
             durable["survey_pass_ledger"]["promoted"][
                 self.leaves[0].leaf_id
             ]["disposition"],
@@ -315,7 +331,8 @@ class PromotedSurveySchedulerTests(unittest.TestCase):
             self._checkpoint(), flat40=True, flat80=False
         )
         self.assertEqual([40, 80], calls)
-        self.assertEqual(1, result.completed_count)
+        self.assertEqual(0, result.completed_count)
+        self.assertEqual(1, result.unresolved_count)
         tiers = result.checkpoint["survey_pass_ledger"]["promoted"][
             self.leaves[0].leaf_id
         ]["precision_tiers"]
@@ -339,7 +356,8 @@ class PromotedSurveySchedulerTests(unittest.TestCase):
             failure40="INSUFFICIENT_ASYMPTOTIC_PRECISION",
         )
         self.assertEqual([40, 80], calls)
-        self.assertEqual(1, result.completed_count)
+        self.assertEqual(0, result.completed_count)
+        self.assertEqual(1, result.unresolved_count)
         self.assertNotIn("BF120", str(result.checkpoint))
 
     def test_root_queue_allows_one_primary_then_one_fixed_root_batch(self):
@@ -359,12 +377,13 @@ class PromotedSurveySchedulerTests(unittest.TestCase):
             root_runner=root_runner,
         )
         self.assertEqual([40], root_calls)
-        self.assertEqual([40], batch_calls)
+        self.assertEqual([40, 80], batch_calls)
         entry = result.checkpoint["survey_pass_ledger"]["promoted"][
             self.leaves[0].leaf_id
         ]
         self.assertEqual(1, entry["root_read_count"])
-        self.assertEqual(2, entry["worker_launch_count"])
+        self.assertEqual(3, entry["worker_launch_count"])
+        self.assertEqual("UNRESOLVED", entry["disposition"])
 
     def test_unexpected_error_is_durable_and_stops_before_next_queue_entry(self):
         started: list[str] = []

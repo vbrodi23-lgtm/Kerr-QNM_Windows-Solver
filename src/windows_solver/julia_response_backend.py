@@ -120,13 +120,15 @@ FIXED_ROOT_SURVEY_CONDITIONING_SCHEMA = (
 _FIXED_ROOT_SURVEY_MAXIMUM_SAMPLE_COUNT = 9
 _FIXED_ROOT_SURVEY_BACKGROUND_ROLES = BINARY64_FIXED_ROOT_SAMPLE_ROLES[:5]
 _FIXED_ROOT_SURVEY_COORDINATE_ROLES = BINARY64_FIXED_ROOT_SAMPLE_ROLES[5:]
-_FIXED_ROOT_SURVEY_CERTIFICATE_ONLY_POLICY_FIELDS = frozenset({
+_FIXED_ROOT_SURVEY_CERTIFICATE_FIELDS = frozenset({
     "determinant_error_model",
     "determinant_error_safety_factor",
     "determinant_error_required_term_classes",
     "determinant_error_missing_evidence_outcome",
     "determinant_error_certificate_statement",
     "determinant_error_preceding_precision_tier",
+})
+_FIXED_ROOT_SURVEY_REVIEW_ONLY_POLICY_FIELDS = frozenset({
     "human_math_review_receipt_status",
     "human_math_review_receipt_sha256",
     "independent_reference_fixture_receipt_status",
@@ -2316,6 +2318,65 @@ class FixedRootSurveyConditioning:
         return dict(self.mapping)
 
 
+EXTERIOR_DETERMINANT_ERROR_EVIDENCE_SCHEMA = (
+    "windows-solver.exterior-determinant-error-evidence/1"
+)
+
+
+@dataclass(frozen=True, slots=True)
+class ExteriorDeterminantErrorEvidence:
+    """The worker's own per-sample empirical determinant-error certificate.
+
+    This is raw evidence, not yet an admitted receipt: it authenticates only
+    that the worker returned a well-formed, internally consistent
+    certificate for this sample. Whether it is admissible as durable
+    ``reviewed-determinant-error`` evidence is decided by the operator-
+    approved issuance boundary, never by this parser alone.
+    """
+
+    mapping: Mapping[str, object]
+
+    def __post_init__(self) -> None:
+        fields = {
+            "schema",
+            "error_model_id",
+            "delta_same_point",
+            "delta_cross_precision",
+            "delta_endpoint_series",
+            "safety_factor",
+            "numerical_error_abs",
+        }
+        if not isinstance(self.mapping, Mapping) or set(self.mapping) != fields:
+            raise ValueError("exterior determinant-error evidence fields are invalid")
+        if self.mapping["schema"] != EXTERIOR_DETERMINANT_ERROR_EVIDENCE_SCHEMA:
+            raise ValueError("exterior determinant-error evidence schema is invalid")
+        if (
+            not isinstance(self.mapping["error_model_id"], str)
+            or not self.mapping["error_model_id"]
+        ):
+            raise ValueError("exterior determinant-error evidence model is invalid")
+        for name in (
+            "delta_same_point",
+            "delta_cross_precision",
+            "delta_endpoint_series",
+            "safety_factor",
+            "numerical_error_abs",
+        ):
+            _finite_decimal_text(
+                self.mapping[name],
+                f"exterior determinant-error evidence {name}",
+                nonnegative=True,
+            )
+        object.__setattr__(
+            self,
+            "mapping",
+            json.loads(canonical_json_bytes(dict(self.mapping))),
+        )
+
+    def to_mapping(self) -> dict[str, object]:
+        return dict(self.mapping)
+
+
 @dataclass(frozen=True, slots=True)
 class JuliaFixedRootSurveySample:
     role: str
@@ -2323,6 +2384,7 @@ class JuliaFixedRootSurveySample:
     amplitude: complex
     determinant: DecimalComplex
     numerical_conditioning: FixedRootSurveyConditioning
+    determinant_error_evidence: ExteriorDeterminantErrorEvidence | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -2386,6 +2448,10 @@ class JuliaFixedRootSurveyBatch:
                     "determinant": sample.determinant.to_mapping(),
                     "numerical_conditioning": (
                         sample.numerical_conditioning.to_mapping()
+                    ),
+                    "determinant_error_evidence": (
+                        None if sample.determinant_error_evidence is None
+                        else sample.determinant_error_evidence.to_mapping()
                     ),
                 }
                 for sample in self.samples
@@ -2512,15 +2578,15 @@ class JuliaResponseAdapter:
                 request_sha256=request_sha256, runtime_identity=identity
             )
         except (OSError, ValueError) as error:
-            # A work cache must never be able to fail a readout; fall through and
-            # let the worker recompute.
             emit_progress(
                 ProgressEventKind.ROOT_READOUT_CACHE_CORRUPT,
                 request_sha256=request_sha256,
                 error_type=type(error).__name__,
                 message=str(error),
             )
-            return None
+            raise JuliaResponseBackendError(
+                "trusted root-readout store lookup failed closed"
+            ) from error
         if lookup.status is RootReadoutLookupStatus.CORRUPT:
             emit_progress(
                 ProgressEventKind.ROOT_READOUT_CACHE_CORRUPT,
@@ -2528,7 +2594,10 @@ class JuliaResponseAdapter:
                 store_path=str(lookup.path),
                 message=lookup.reason,
             )
-            return None
+            raise JuliaResponseBackendError(
+                "trusted root-readout entry is corrupt: "
+                f"{lookup.path}: {lookup.reason}"
+            )
         if lookup.status is not RootReadoutLookupStatus.HIT:
             return None
         emit_progress(
@@ -2555,7 +2624,9 @@ class JuliaResponseAdapter:
 
         store = self.readout_cache
         if store is None:
-            return
+            raise JuliaResponseBackendError(
+                "durable root-readout store is unavailable"
+            )
         try:
             path = store.publish(
                 request_sha256=request_sha256,
@@ -2570,7 +2641,9 @@ class JuliaResponseAdapter:
                 error_type=type(error).__name__,
                 message=str(error),
             )
-            return
+            raise JuliaResponseBackendError(
+                "validated root readout could not be durably published"
+            ) from error
         emit_progress(
             ProgressEventKind.ROOT_READOUT_RETAINED,
             request_sha256=request_sha256,
@@ -2856,7 +2929,7 @@ class JuliaResponseAdapter:
             _raise_worker_failure(details)
         if response.get("request_sha256") != request_sha256:
             raise JuliaResponseBackendError("M02 Julia response request digest mismatch")
-        if retain_fresh:
+        if retain_fresh and self.readout_cache is not None:
             self._retain_readout(request_sha256, response)
         return JuliaResponseEvaluation(
             response=dict(response),
@@ -3290,12 +3363,15 @@ class JuliaPrecisionRootBackend:
             calibration_receipt=self.calibration_receipt,
         )
         for field in (
-            _FIXED_ROOT_SURVEY_CERTIFICATE_ONLY_POLICY_FIELDS
+            _FIXED_ROOT_SURVEY_REVIEW_ONLY_POLICY_FIELDS
             | _FIXED_ROOT_SURVEY_ROOT_ONLY_POLICY_FIELDS
         ):
             policy.pop(field, None)
-        if _FIXED_ROOT_SURVEY_CERTIFICATE_ONLY_POLICY_FIELDS.intersection(policy):
-            raise ValueError("fixed-root survey policy carries certificate fields")
+        if not _FIXED_ROOT_SURVEY_CERTIFICATE_FIELDS.issubset(policy):
+            raise ValueError(
+                "fixed-root survey policy is missing its determinant-error "
+                "certificate fields"
+            )
         return policy
 
     @staticmethod
@@ -3504,7 +3580,7 @@ class JuliaPrecisionRootBackend:
         ):
             fields = {
                 "role", "omega", "amplitude", "determinant",
-                "numerical_conditioning",
+                "numerical_conditioning", "determinant_error_evidence",
             }
             if not isinstance(raw, Mapping) or set(raw) != fields or raw["role"] != role:
                 raise JuliaResponseBackendError(
@@ -3547,8 +3623,28 @@ class JuliaPrecisionRootBackend:
                 raise JuliaResponseBackendError(
                     "M02 fixed-root survey conditioning disagrees with request"
                 )
+            raw_evidence = raw["determinant_error_evidence"]
+            determinant_error_evidence = None
+            if raw_evidence is not None:
+                try:
+                    determinant_error_evidence = ExteriorDeterminantErrorEvidence(
+                        raw_evidence
+                    )
+                except ValueError as error:
+                    raise JuliaResponseBackendError(
+                        "M02 fixed-root survey determinant-error evidence is invalid"
+                    ) from error
+                if (
+                    determinant_error_evidence.mapping["error_model_id"]
+                    != policy.get("determinant_error_model")
+                ):
+                    raise JuliaResponseBackendError(
+                        "M02 fixed-root survey determinant-error model disagrees "
+                        "with request"
+                    )
             parsed_samples.append(JuliaFixedRootSurveySample(
-                role, omega, amplitude, determinant, conditioning
+                role, omega, amplitude, determinant, conditioning,
+                determinant_error_evidence,
             ))
         return JuliaFixedRootSurveyBatch(
             leaf_id=job.leaf_id,

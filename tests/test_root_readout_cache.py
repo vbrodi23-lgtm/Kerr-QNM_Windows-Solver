@@ -231,8 +231,8 @@ class JuliaAdapterReadoutReuseTests(unittest.TestCase):
             store = RootReadoutStore(runtime / ROOT_READOUT_STORE_DIRECTORY_NAME)
             self.assertEqual(store.stored_count, 0)
 
-    def test_corrupt_entry_recomputes_instead_of_failing_the_readout(self):
-        """Catches letting a damaged work cache break an otherwise valid solve."""
+    def test_corrupt_trusted_entry_fails_closed_before_recomputation(self):
+        """Trusted corruption is not silently converted into an ordinary miss."""
 
         with tempfile.TemporaryDirectory() as temporary:
             runtime = _runtime_receipt(Path(temporary))
@@ -244,9 +244,12 @@ class JuliaAdapterReadoutReuseTests(unittest.TestCase):
             store = RootReadoutStore(runtime / ROOT_READOUT_STORE_DIRECTORY_NAME)
             for path in store.root.glob("*.json"):
                 path.write_text("{ not json", encoding="utf-8")
-            recovered = adapter.evaluate({"schema_version": 1})
-            self.assertEqual(len(runner.commands), 2)
-            self.assertEqual(recovered, expected)
+            self.assertTrue(expected)
+            with self.assertRaisesRegex(
+                JuliaResponseBackendError, "trusted root-readout entry is corrupt"
+            ):
+                adapter.evaluate({"schema_version": 1})
+            self.assertEqual(len(runner.commands), 1)
 
     def test_cache_can_be_switched_off(self):
         """Catches removing the operator's ability to force a clean recompute."""

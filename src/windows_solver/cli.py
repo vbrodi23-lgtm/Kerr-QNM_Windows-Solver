@@ -31,10 +31,15 @@ from .campaign_policy import (
 from .campaign_evidence import (
     EvidencePassRequest,
     EvidenceStrengtheningPolicy,
+    require_release_evidence,
 )
 from .campaign_triage import WholeAtlasTriage
 from .campaign_survey import preflight_campaign_supports
 from .engine import ExecutionEngine, RunRecord, verify_run_integrity
+from .gsn_cache_producer import (
+    ensure_generated_gsn_cache,
+    parameter_pairs_for_selection,
+)
 from .evidence_intake import load_evidence_bundle
 from .linear_response_admission import (
     AdmittedLinearResponseProvider,
@@ -98,6 +103,7 @@ from .response_engine import VettedNativeDeterminantKernel, NativeResourceUnavai
 from .response_reduction import (
     ComputedUnresolvedComponentEvidence,
     ResolvedComponentEvidence,
+    build_projective_row_plans,
     component_evidence_from_mapping,
     reduce_projective_rows,
 )
@@ -277,6 +283,17 @@ def build_parser() -> argparse.ArgumentParser:
     campaign_import.add_argument("selection", type=Path)
     campaign_import.add_argument("--checkpoint", type=Path, required=True)
     campaign_import.add_argument("--store", type=Path)
+    campaign_new = commands.add_parser(
+        "campaign-new",
+        help="initialize a genuinely new empty schema-11 campaign",
+    )
+    campaign_new.add_argument("selection", type=Path)
+    campaign_new.add_argument("--output", type=Path, required=True)
+    campaign_prepare = commands.add_parser(
+        "campaign-prepare-resources",
+        help="materialize and seal GSN resources before campaign execution",
+    )
+    campaign_prepare.add_argument("selection", type=Path)
     campaign_recover = commands.add_parser(
         "campaign-recover",
         help="recover compatible terminal records without numerical work",
@@ -955,6 +972,58 @@ def _campaign_recover(
     return 0, {"command": "campaign-recover", **summary.to_mapping()}
 
 
+def _campaign_new(
+    selection_path: Path,
+    output_path: Path,
+) -> tuple[int, object]:
+    """Create empty NEW state without recovery or fabricated provenance."""
+
+    plan, selection, _descriptor = _campaign_plan_and_selection(selection_path)
+    output = _resolve_recovery_path(output_path)
+    if output.exists():
+        raise ValueError("campaign-new refuses an existing checkpoint")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    checkpoint = empty_schema11_checkpoint(plan.campaign_id, selection.selection_id)
+    checkpoint = refresh_schema11_reports(
+        plan,
+        selection,
+        checkpoint,
+        output,
+        persist_checkpoint=True,
+    )
+    if checkpoint["records"] or checkpoint["recovery_receipts"]:
+        raise ValueError("campaign-new fabricated prior scientific provenance")
+    return 0, {
+        "command": "campaign-new",
+        "origin": "NEW",
+        "campaign_id": plan.campaign_id,
+        "selection_id": selection.selection_id,
+        "checkpoint_path": str(output),
+        "terminal_record_count": 0,
+        "recovery_receipt_count": 0,
+        "release_admissible": False,
+    }
+
+
+def _campaign_prepare_resources(selection_path: Path) -> tuple[int, object]:
+    """Explicit environment preparation; may invoke the Julia GSN producer."""
+
+    plan, selection, _descriptor = _campaign_plan_and_selection(selection_path)
+    generated = ensure_generated_gsn_cache(
+        parameter_pairs_for_selection(plan, selection)
+    )
+    return 0, {
+        "command": "campaign-prepare-resources",
+        "campaign_id": plan.campaign_id,
+        "selection_id": selection.selection_id,
+        "resource_path": str(generated.path),
+        "resource_sha256": generated.sha256,
+        "record_artifact_ids": list(generated.record_artifact_ids),
+        "resource_prepared": True,
+        "release_admissible": False,
+    }
+
+
 def _campaign_recovery_selection(plan, selection) -> RecoverySelection:
     leaf_by_id = {leaf.leaf_id: leaf for leaf in plan.leaves}
     return RecoverySelection(
@@ -1031,9 +1100,11 @@ def _load_schema11_campaign(
 
 def _schema11_leaf_metadata(plan, selection) -> dict[str, dict[str, object]]:
     leaf_by_id = {leaf.leaf_id: leaf for leaf in plan.leaves}
+    leaf_count = len(selection.leaf_ids)
     return {
         leaf_id: {
             "leaf_ordinal": ordinal,
+            "leaf_count": leaf_count,
             "role": leaf_by_id[leaf_id].role,
             "mode": leaf_by_id[leaf_id].leaf.mode_label,
             "spin_or_Mkappa": leaf_by_id[leaf_id].job.spin,
@@ -1170,6 +1241,12 @@ def _campaign_schema11_pass(
             "queued_count": result.queued_count,
             "cache_reused_count": result.cache_reused_count,
             "skipped_count": result.skipped_count,
+            "pass_exhausted": result.pass_exhausted,
+            "pass_status": "EXHAUSTED" if result.pass_exhausted else "PARTIAL",
+            "incomplete_leaf_ids": list(result.incomplete_leaf_ids),
+            "terminal_cache_discovery": (
+                result.terminal_cache_discovery.to_mapping()
+            ),
             "release_admissible": False,
         }
     if command == "campaign-survey-promoted":
@@ -1202,7 +1279,7 @@ def _campaign_schema11_pass(
         finally:
             reporter.close()
         validated = validate_schema11_checkpoint(result.checkpoint)
-        return 0, {
+        return (0 if result.pass_exhausted else 3), {
             "command": command,
             "campaign_id": validated["campaign_id"],
             "selection_id": validated["selection_id"],
@@ -1212,7 +1289,14 @@ def _campaign_schema11_pass(
             "unresolved_count": result.unresolved_count,
             "deferred_count": result.deferred_count,
             "rejected_count": result.rejected_count,
+            "cache_reused_count": result.cache_reused_count,
             "skipped_count": result.skipped_count,
+            "pass_exhausted": result.pass_exhausted,
+            "pass_status": "EXHAUSTED" if result.pass_exhausted else "PARTIAL",
+            "incomplete_leaf_ids": list(result.incomplete_leaf_ids),
+            "terminal_cache_discovery": (
+                result.terminal_cache_discovery.to_mapping()
+            ),
             "release_admissible": False,
         }
     if command in {"campaign-certify", "campaign-evidence-validate"}:
@@ -1356,12 +1440,21 @@ def _campaign_reduce(bundle_path: Path, output: Path) -> tuple[int, object]:
     if resolved_output.exists():
         raise ValueError("campaign reduction refuses an existing output")
     value = _load_strict_json(bundle, "campaign reduction bundle")
+    if not isinstance(value, Mapping):
+        raise ValueError("campaign reduction bundle must be an object")
+    if value.get("schema_version") == 1:
+        raise ValueError(
+            "campaign-reduce requires a schema-11 evidence checkpoint; legacy "
+            "schema-1 reduction bundles cannot prove schema-11 evidence and must "
+            "be regenerated with explicit schema-11 checkpoint paths"
+        )
     expected_fields = {
         "schema_version", "campaign_id", "backend_id", "precision_digits",
-        "precision_backend", "checkpoint_paths", "selected_row_ids",
-        "component_evidence", "source_hashes", "bundle_sha256",
+        "precision_backend", "schema11_checkpoint_paths", "selected_row_ids",
+        "required_evidence_levels", "component_evidence", "source_hashes",
+        "bundle_sha256",
     }
-    if set(value) != expected_fields or value["schema_version"] != 1:
+    if set(value) != expected_fields or value["schema_version"] != 2:
         raise ValueError("campaign reduction bundle fields or schema are invalid")
     sealed = {key: item for key, item in value.items() if key != "bundle_sha256"}
     expected_digest = hashlib.sha256(canonical_json_bytes(sealed)).hexdigest()
@@ -1373,10 +1466,11 @@ def _campaign_reduce(bundle_path: Path, output: Path) -> tuple[int, object]:
     if value["backend_id"] != backend_identity.backend_id:
         raise ValueError("campaign reduction backend identity is invalid")
     digits = value["precision_digits"]
-    checkpoint_paths = value["checkpoint_paths"]
+    checkpoint_paths = value["schema11_checkpoint_paths"]
     selected_row_ids = value["selected_row_ids"]
     raw_components = value["component_evidence"]
     declared_hashes = value["source_hashes"]
+    required_evidence_levels = value["required_evidence_levels"]
     if (
         not isinstance(digits, list)
         or not isinstance(checkpoint_paths, list)
@@ -1388,6 +1482,7 @@ def _campaign_reduce(bundle_path: Path, output: Path) -> tuple[int, object]:
         or not isinstance(raw_components, list)
         or not isinstance(declared_hashes, list)
         or any(not isinstance(item, str) for item in declared_hashes)
+        or not isinstance(required_evidence_levels, Mapping)
     ):
         raise ValueError("campaign reduction bundle arrays are invalid")
     plan = build_campaign_plan(
@@ -1410,14 +1505,81 @@ def _campaign_reduce(bundle_path: Path, output: Path) -> tuple[int, object]:
     )
     if tuple(declared_hashes) != computed_hashes:
         raise ValueError("campaign reduction checkpoint source hashes are invalid")
+    row_plans = {item.row_id: item for item in build_projective_row_plans()}
+    try:
+        required_leaf_ids = frozenset(
+            leaf_id
+            for row_id in selected_row_ids
+            for leaf_id in (
+                *row_plans[row_id].left_component_ids,
+                *row_plans[row_id].right_component_ids,
+            )
+        )
+    except KeyError as error:
+        raise ValueError("campaign reduction selected row is invalid") from error
+    if set(required_evidence_levels) != required_leaf_ids:
+        raise ValueError(
+            "campaign reduction evidence policy must bind every selected leaf"
+        )
+    try:
+        release_requirements = {
+            leaf_id: EvidenceLevel(required_evidence_levels[leaf_id])
+            for leaf_id in required_leaf_ids
+        }
+    except (TypeError, ValueError) as error:
+        raise ValueError("campaign reduction evidence policy is invalid") from error
+    if any(
+        level is EvidenceLevel.SCREENED
+        for level in release_requirements.values()
+    ):
+        raise ValueError("SCREENED evidence is forbidden in release reduction")
+    release_covered_leaf_ids: set[str] = set()
     records_by_id: dict[str, CampaignLeafRecord] = {}
     receipts_by_id: dict[str, set[str]] = {}
     for checkpoint, checkpoint_receipt in zip(
         resolved_checkpoints, computed_hashes
     ):
-        summary = validate_campaign_checkpoint(plan, checkpoint)
-        _validate_campaign_capability_superset(summary, descriptor, plan)
-        for record in summary.records:
+        raw_checkpoint = _load_strict_json(
+            checkpoint, "campaign reduction schema-11 checkpoint"
+        )
+        if (
+            not isinstance(raw_checkpoint, Mapping)
+            or raw_checkpoint.get("schema_version") != SCHEMA11_VERSION
+        ):
+            raise ValueError(
+                "campaign reduction requires a schema-11 evidence checkpoint; "
+                "migrate legacy checkpoint material first"
+            )
+        validated_schema11 = validate_schema11_checkpoint(raw_checkpoint)
+        if validated_schema11["campaign_id"] != plan.campaign_id:
+            raise ValueError(
+                "campaign reduction schema-11 campaign identity is invalid"
+            )
+        checkpoint_leaf_ids = {
+            str(record["leaf_id"])
+            for record in validated_schema11["records"]
+            if isinstance(record, Mapping)
+        }
+        checkpoint_requirements = {
+            leaf_id: level
+            for leaf_id, level in release_requirements.items()
+            if leaf_id in checkpoint_leaf_ids
+        }
+        if checkpoint_requirements:
+            require_release_evidence(
+                validated_schema11, checkpoint_requirements
+            )
+            release_covered_leaf_ids.update(checkpoint_requirements)
+        for raw_record in validated_schema11["records"]:
+            leaf_id = str(raw_record["leaf_id"])
+            validate_campaign_recovery_record(plan, leaf_id, raw_record)
+            try:
+                record = CampaignLeafRecord.from_mapping(raw_record)
+            except ValueError as error:
+                raise ValueError(
+                    "campaign reduction numerical record shape is not yet "
+                    "projective-component compatible"
+                ) from error
             existing = records_by_id.get(record.leaf_id)
             if (
                 existing is not None
@@ -1430,6 +1592,12 @@ def _campaign_reduce(bundle_path: Path, output: Path) -> tuple[int, object]:
             receipts_by_id.setdefault(record.leaf_id, set()).add(
                 checkpoint_receipt
             )
+    missing_release_evidence = required_leaf_ids - release_covered_leaf_ids
+    if missing_release_evidence:
+        raise ValueError(
+            "campaign reduction release evidence is absent for selected leaves: "
+            + ", ".join(sorted(missing_release_evidence))
+        )
     components = tuple(
         component_evidence_from_mapping(item) for item in raw_components
     )
@@ -1629,6 +1797,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             status, output = _campaign_cache_import(
                 arguments.selection, arguments.checkpoint, arguments.store
             )
+        elif arguments.command == "campaign-new":
+            status, output = _campaign_new(arguments.selection, arguments.output)
+        elif arguments.command == "campaign-prepare-resources":
+            status, output = _campaign_prepare_resources(arguments.selection)
         elif arguments.command == "campaign-recover":
             status, output = _campaign_recover(
                 arguments.selection,

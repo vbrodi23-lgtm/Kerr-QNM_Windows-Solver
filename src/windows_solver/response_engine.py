@@ -66,6 +66,10 @@ from .response_uncertainty import (
     exterior_response_disk,
     horizon_response_disk,
 )
+from .reviewed_determinant_error import (
+    AuthenticatedDeterminantErrorBundle,
+    REVIEWED_DETERMINANT_ERROR_CLAIM_SCHEMA,
+)
 from .response_ladder_recovery import (
     LadderLevel as RecoveryLadderLevel,
     LadderPolicy as RecoveryLadderPolicy,
@@ -1838,6 +1842,26 @@ class Binary64FixedRootSample:
             "determinant": _complex_mapping(self.determinant),
         }
 
+    @classmethod
+    def from_mapping(cls, value: object) -> "Binary64FixedRootSample":
+        if not isinstance(value, Mapping) or set(value) != {
+            "role",
+            "omega",
+            "amplitude",
+            "determinant",
+        }:
+            raise ValueError("binary64 fixed-root sample fields are invalid")
+        return cls(
+            role=str(value["role"]),
+            omega=_complex_from_mapping(value["omega"], "sample omega"),
+            amplitude=_complex_from_mapping(
+                value["amplitude"], "sample amplitude"
+            ),
+            determinant=_complex_from_mapping(
+                value["determinant"], "sample determinant"
+            ),
+        )
+
 
 @dataclass(frozen=True, slots=True)
 class Binary64FixedRootBatch:
@@ -2057,6 +2081,103 @@ def build_exterior_background_reuse_key(
     )
 
 
+def reviewed_determinant_error_claims_for_fixed_root_batch(
+    job: ResponseComponentJob,
+    batch: object,
+    *,
+    root_seal_sha256: str,
+    arithmetic_tier: str,
+    working_precision: int,
+) -> tuple[Mapping[str, object], ...]:
+    """Build the exact claims an external reviewed-error issuer must bind.
+
+    This only describes the already-computed sample identities.  It does not
+    derive, estimate, or approve an error bound.
+    """
+
+    if not isinstance(job, ResponseComponentJob):
+        raise ValueError("reviewed determinant-error job is invalid")
+    if not isinstance(root_seal_sha256, str) or _HEX_64.fullmatch(
+        root_seal_sha256
+    ) is None:
+        raise ValueError("reviewed determinant-error root seal is invalid")
+    if not isinstance(arithmetic_tier, str) or not arithmetic_tier:
+        raise ValueError("reviewed determinant-error arithmetic tier is invalid")
+    if type(working_precision) is not int or working_precision < 2:
+        raise ValueError("reviewed determinant-error working precision is invalid")
+    if getattr(batch, "leaf_id", None) != job.leaf_id:
+        raise ValueError("reviewed determinant-error batch leaf mismatch")
+    if getattr(batch, "job_id", None) != job.job_id:
+        raise ValueError("reviewed determinant-error batch job mismatch")
+    fixed_root = _finite_complex(
+        getattr(batch, "fixed_root", None), "reviewed determinant-error fixed root"
+    )
+    if getattr(batch, "branch_identity", None) != job.root.branch_id:
+        raise ValueError("reviewed determinant-error branch mismatch")
+    samples = tuple(getattr(batch, "samples", ()))
+    if tuple(getattr(sample, "role", None) for sample in samples) != (
+        BINARY64_FIXED_ROOT_SAMPLE_ROLES
+    ):
+        raise ValueError("reviewed determinant-error sample plan is invalid")
+    contract = regularised_gsn_mechanism_contract(job.mechanism_id)
+    operation = getattr(batch, "scientific_operation_identity", None)
+    if not isinstance(operation, str) or not operation:
+        operation = getattr(batch, "operation_identity", None)
+    if not isinstance(operation, str) or not operation:
+        raise ValueError("reviewed determinant-error operation identity is invalid")
+    angular_identity = _sha256({
+        "angular_separation_constant": _complex_mapping(
+            job.root.angular_separation_constant
+        ),
+        "angular_owner": job.root.owner_data_sha256,
+    })
+    runtime_identity = _sha256({
+        "backend_identity_sha256": job.backend_identity.identity_sha256,
+        "runtime_fingerprint": job.backend_identity.runtime_fingerprint,
+        "arithmetic_tier": arithmetic_tier,
+        "working_precision": working_precision,
+    })
+
+    claims: list[Mapping[str, object]] = []
+    for sample in samples:
+        determinant = sample.determinant
+        determinant_mapping = (
+            determinant.to_mapping()
+            if isinstance(determinant, DecimalComplex)
+            else _complex_mapping(_finite_complex(determinant, "sample determinant"))
+        )
+        claims.append({
+            "schema": REVIEWED_DETERMINANT_ERROR_CLAIM_SCHEMA,
+            "leaf_id": job.leaf_id,
+            "job_id": job.job_id,
+            "scientific_operation_identity": operation,
+            "root_seal_sha256": root_seal_sha256,
+            "fixed_root": _complex_mapping(fixed_root),
+            "root_identity_sha256": job.root.identity_sha256,
+            "branch_identity": job.root.branch_id,
+            "angular_identity_sha256": angular_identity,
+            "determinant_family": str(contract["determinant_family"]),
+            "determinant_convention": str(contract["determinant_convention"]),
+            "determinant_normalisation": str(
+                contract["determinant_normalisation"]
+            ),
+            "backend_identity_sha256": job.backend_identity.identity_sha256,
+            "runtime_identity_sha256": runtime_identity,
+            "arithmetic_tier": arithmetic_tier,
+            "working_precision": working_precision,
+            "numerical_control_identity_sha256": job.policy.identity_sha256,
+            "sample_role": sample.role,
+            "frequency": _complex_mapping(
+                _finite_complex(sample.omega, "sample frequency")
+            ),
+            "amplitude": _complex_mapping(
+                _finite_complex(sample.amplitude, "sample amplitude")
+            ),
+            "determinant_centre": determinant_mapping,
+        })
+    return tuple(claims)
+
+
 _CANONICAL_BACKGROUND_SAMPLE_ROLES = BINARY64_FIXED_ROOT_SAMPLE_ROLES[:5]
 _MECHANISM_DERIVATIVE_SAMPLE_ROLES = BINARY64_FIXED_ROOT_SAMPLE_ROLES[5:]
 
@@ -2106,6 +2227,40 @@ class CanonicalExteriorBackground:
             "frequency_step": self.frequency_step,
             "samples": [sample.to_mapping() for sample in self.samples],
         }
+
+    @classmethod
+    def from_mapping(cls, value: object) -> "CanonicalExteriorBackground":
+        fields = {
+            "schema",
+            "operation_identity",
+            "reuse_key",
+            "fixed_root",
+            "frequency_step",
+            "samples",
+        }
+        if not isinstance(value, Mapping) or set(value) != fields:
+            raise ValueError("canonical exterior background fields are invalid")
+        if (
+            value["schema"] != "windows-solver.canonical-exterior-background/1"
+            or value["operation_identity"]
+            != CANONICAL_EXTERIOR_BACKGROUND_IDENTITY
+            or not isinstance(value["samples"], list)
+        ):
+            raise ValueError("canonical exterior background schema is invalid")
+        frequency_step = value["frequency_step"]
+        if isinstance(frequency_step, bool) or not isinstance(
+            frequency_step, (int, float)
+        ):
+            raise ValueError("canonical exterior background step is invalid")
+        return cls(
+            reuse_key=ExteriorBackgroundReuseKey.from_mapping(value["reuse_key"]),
+            fixed_root=_complex_from_mapping(value["fixed_root"], "fixed root"),
+            frequency_step=float(frequency_step),
+            samples=tuple(
+                Binary64FixedRootSample.from_mapping(sample)
+                for sample in value["samples"]
+            ),
+        )
 
 
 def canonical_background_from_binary64_batch(
@@ -2383,13 +2538,13 @@ def exterior_background_reuse_admitted(
     return receipt.to_mapping() == expected_receipt.to_mapping()
 
 
-def screen_binary64_reused_background_batch(
+def combine_binary64_reused_background_batch(
     background: CanonicalExteriorBackground,
     batch: Binary64ReusedBackgroundBatch,
-) -> Binary64FixedRootScreening:
+) -> Binary64FixedRootBatch:
     if batch.background_sha256 != background.sha256:
         raise ValueError("reused background digest mismatch")
-    combined = Binary64FixedRootBatch(
+    return Binary64FixedRootBatch(
         leaf_id=batch.leaf_id,
         job_id=batch.job_id,
         mechanism_id=batch.mechanism_id,
@@ -2400,7 +2555,18 @@ def screen_binary64_reused_background_batch(
         support=batch.support,
         samples=background.samples + batch.samples,
     )
-    return screen_binary64_fixed_root_batch(combined)
+
+
+def screen_binary64_reused_background_batch(
+    background: CanonicalExteriorBackground,
+    batch: Binary64ReusedBackgroundBatch,
+    determinant_error_evidence: AuthenticatedDeterminantErrorBundle | None = None,
+) -> Binary64FixedRootScreening:
+    combined = combine_binary64_reused_background_batch(background, batch)
+    return screen_binary64_fixed_root_batch(
+        combined,
+        determinant_error_evidence=determinant_error_evidence,
+    )
 
 
 class Binary64SurveyDisposition(str, Enum):
@@ -2419,94 +2585,132 @@ class Binary64FixedRootScreening:
     determinant_certificate_status: str = "not-claimed"
 
 
-def _binary64_stencil_disk(
-    plus_h: complex,
-    minus_h: complex,
-    plus_half: complex,
-    minus_half: complex,
+def _reviewed_stencil_disk(
+    disks: Mapping[str, ComplexDisk],
     *,
+    coarse_plus_role: str,
+    coarse_minus_role: str,
+    fine_plus_role: str,
+    fine_minus_role: str,
     coarse_denominator: float,
     fine_denominator: float,
 ) -> ComplexDisk:
-    coarse = (plus_h - minus_h) / coarse_denominator
-    fine = (plus_half - minus_half) / fine_denominator
-    arithmetic_radius = sum(
-        math.ulp(abs(value.real)) + math.ulp(abs(value.imag))
-        for value in (plus_h, minus_h, plus_half, minus_half, coarse, fine)
-    )
-    radius = abs(fine - coarse) + arithmetic_radius
-    if not math.isfinite(radius) or radius <= 0.0:
-        raise ValueError("binary64 derivative disk is not bounded")
+    coarse_plus = disks[coarse_plus_role]
+    coarse_minus = disks[coarse_minus_role]
+    fine_plus = disks[fine_plus_role]
+    fine_minus = disks[fine_minus_role]
+    coarse = (coarse_plus.centre - coarse_minus.centre) / coarse_denominator
+    fine = (fine_plus.centre - fine_minus.centre) / fine_denominator
+    coarse_radius = (
+        coarse_plus.radius + coarse_minus.radius
+    ) / coarse_denominator
+    fine_radius = (fine_plus.radius + fine_minus.radius) / fine_denominator
+    # The determinant uncertainty is externally approved evidence.  The
+    # coarse/fine term is retained only as the explicit stencil-disagreement
+    # component required by the reviewed propagation boundary; it is not
+    # presented as determinant-error evidence of its own.
+    radius = fine_radius + abs(fine - coarse) + coarse_radius
     return ComplexDisk(fine, radius)
 
 
-def screen_binary64_fixed_root_batch(
-    batch: Binary64FixedRootBatch,
+def _screen_with_reviewed_determinant_errors(
+    samples: Sequence[object],
+    *,
+    frequency_step: float,
+    coordinate_step: float,
+    determinant_error_evidence: AuthenticatedDeterminantErrorBundle | None,
 ) -> Binary64FixedRootScreening:
-    """Reduce one raw nine-sample batch without claiming a certificate."""
+    if determinant_error_evidence is None:
+        return Binary64FixedRootScreening(
+            disposition=Binary64SurveyDisposition.PROMOTION_PENDING_RESPONSE,
+            response_disk=None,
+            frequency_derivative_disk=None,
+            coordinate_derivative_disk=None,
+            root_correction_upper_bound=None,
+            reason_code="DETERMINANT_ERROR_EVIDENCE_UNAVAILABLE",
+            determinant_certificate_status="unavailable",
+        )
+    if not isinstance(
+        determinant_error_evidence, AuthenticatedDeterminantErrorBundle
+    ):
+        raise ValueError("reviewed determinant-error bundle is invalid")
+    disks = determinant_error_evidence.disks_by_role
+    if set(disks) != set(BINARY64_FIXED_ROOT_SAMPLE_ROLES):
+        raise ValueError("reviewed determinant-error sample coverage is incomplete")
+    sample_by_role = {str(sample.role): sample for sample in samples}
+    if set(sample_by_role) != set(BINARY64_FIXED_ROOT_SAMPLE_ROLES):
+        raise ValueError("fixed-root sample plan is invalid")
+    for role, disk in disks.items():
+        determinant = sample_by_role[role].determinant
+        centre = (
+            complex(float(determinant.real), float(determinant.imaginary))
+            if isinstance(determinant, DecimalComplex)
+            else _finite_complex(determinant, "sample determinant")
+        )
+        if disk.centre != centre:
+            raise ValueError("reviewed determinant-error centre mismatch")
 
-    if not isinstance(batch, Binary64FixedRootBatch):
-        raise ValueError("binary64 fixed-root batch is invalid")
-    values = {sample.role: sample.determinant for sample in batch.samples}
-    frequency = _binary64_stencil_disk(
-        values["DOMEGA_REAL_PLUS_H"],
-        values["DOMEGA_REAL_MINUS_H"],
-        values["DOMEGA_REAL_PLUS_HALF_H"],
-        values["DOMEGA_REAL_MINUS_HALF_H"],
-        coarse_denominator=2.0 * batch.frequency_step,
-        fine_denominator=batch.frequency_step,
+    frequency = _reviewed_stencil_disk(
+        disks,
+        coarse_plus_role="DOMEGA_REAL_PLUS_H",
+        coarse_minus_role="DOMEGA_REAL_MINUS_H",
+        fine_plus_role="DOMEGA_REAL_PLUS_HALF_H",
+        fine_minus_role="DOMEGA_REAL_MINUS_HALF_H",
+        coarse_denominator=2.0 * frequency_step,
+        fine_denominator=frequency_step,
     )
-    coordinate = _binary64_stencil_disk(
-        values["DC_PLUS_EPSILON"],
-        values["DC_MINUS_EPSILON"],
-        values["DC_PLUS_HALF_EPSILON"],
-        values["DC_MINUS_HALF_EPSILON"],
-        coarse_denominator=2.0 * batch.coordinate_step,
-        fine_denominator=batch.coordinate_step,
+    coordinate = _reviewed_stencil_disk(
+        disks,
+        coarse_plus_role="DC_PLUS_EPSILON",
+        coarse_minus_role="DC_MINUS_EPSILON",
+        fine_plus_role="DC_PLUS_HALF_EPSILON",
+        fine_minus_role="DC_MINUS_HALF_EPSILON",
+        coarse_denominator=2.0 * coordinate_step,
+        fine_denominator=coordinate_step,
     )
-    frequency_lower = abs(frequency.centre) - frequency.radius
-    if frequency_lower <= 0.0:
+    if frequency.contains_zero:
         return Binary64FixedRootScreening(
             disposition=Binary64SurveyDisposition.PROMOTION_PENDING_RESPONSE,
             response_disk=None,
             frequency_derivative_disk=frequency,
             coordinate_derivative_disk=coordinate,
             root_correction_upper_bound=None,
-            reason_code="FINITE_DIFFERENCE_NOISE_LIMIT",
-        )
-    residual = values["D0"]
-    residual_radius = math.ulp(abs(residual.real)) + math.ulp(abs(residual.imag))
-    root_correction = (abs(residual) + residual_radius) / frequency_lower
-    if not math.isfinite(root_correction) or root_correction > 2.0e-11:
-        return Binary64FixedRootScreening(
-            disposition=Binary64SurveyDisposition.PROMOTION_PENDING_RESPONSE,
-            response_disk=None,
-            frequency_derivative_disk=frequency,
-            coordinate_derivative_disk=coordinate,
-            root_correction_upper_bound=root_correction,
             reason_code="DETERMINANT_UNCERTAINTY_TOO_LARGE",
+            determinant_certificate_status="approved-reviewed-error/v1",
         )
-    try:
-        response = exterior_response_disk(
-            coordinate_derivative=coordinate,
-            frequency_derivative=frequency,
-        )
-    except ZeroContainingDiskError:
-        return Binary64FixedRootScreening(
-            disposition=Binary64SurveyDisposition.PROMOTION_PENDING_RESPONSE,
-            response_disk=None,
-            frequency_derivative_disk=frequency,
-            coordinate_derivative_disk=coordinate,
-            root_correction_upper_bound=root_correction,
-            reason_code="FINITE_DIFFERENCE_NOISE_LIMIT",
-        )
+    response = exterior_response_disk(
+        coordinate_derivative=coordinate,
+        frequency_derivative=frequency,
+    )
+    central = disks["D0"]
+    root_correction_upper_bound = (
+        abs(central.centre) + central.radius
+    ) / (abs(frequency.centre) - frequency.radius)
     return Binary64FixedRootScreening(
         disposition=Binary64SurveyDisposition.PRODUCED,
         response_disk=response,
         frequency_derivative_disk=frequency,
         coordinate_derivative_disk=coordinate,
-        root_correction_upper_bound=root_correction,
+        root_correction_upper_bound=root_correction_upper_bound,
         reason_code=None,
+        determinant_certificate_status="approved-reviewed-error/v1",
+    )
+
+
+def screen_binary64_fixed_root_batch(
+    batch: Binary64FixedRootBatch,
+    *,
+    determinant_error_evidence: AuthenticatedDeterminantErrorBundle | None = None,
+) -> Binary64FixedRootScreening:
+    """Screen only with complete authenticated reviewed determinant bounds."""
+
+    if not isinstance(batch, Binary64FixedRootBatch):
+        raise ValueError("binary64 fixed-root batch is invalid")
+    return _screen_with_reviewed_determinant_errors(
+        batch.samples,
+        frequency_step=batch.frequency_step,
+        coordinate_step=batch.coordinate_step,
+        determinant_error_evidence=determinant_error_evidence,
     )
 
 
@@ -2515,8 +2719,9 @@ def screen_promoted_fixed_root_samples(
     *,
     frequency_step: Decimal,
     coordinate_step: Decimal,
+    determinant_error_evidence: AuthenticatedDeterminantErrorBundle | None = None,
 ) -> Binary64FixedRootScreening:
-    """Screen one BF40/BF80 raw batch while preserving its decimal text."""
+    """Retain BF40/BF80 raw samples without deriving an unreviewed error model."""
 
     sample_tuple = tuple(samples)
     if tuple(getattr(sample, "role", None) for sample in sample_tuple) != (
@@ -2533,9 +2738,6 @@ def screen_promoted_fixed_root_samples(
     ):
         raise ValueError("promoted fixed-root steps are invalid")
 
-    values: dict[str, DecimalComplex] = {}
-    errors: dict[str, Decimal] = {}
-    maximum_digits = 80
     for sample in sample_tuple:
         determinant = getattr(sample, "determinant", None)
         conditioning = getattr(sample, "numerical_conditioning", None)
@@ -2544,131 +2746,11 @@ def screen_promoted_fixed_root_samples(
             mapping, Mapping
         ):
             raise ValueError("promoted fixed-root sample evidence is invalid")
-        predicted = _conditioning_decimal_from_text(
-            mapping.get("predicted_reliable_digits"),
-            "promoted survey predicted reliable digits",
-        )
-        if predicted <= 0:
-            raise ValueError("promoted survey has no reliable digits")
-        reliable_digits = int(
-            predicted.to_integral_value(rounding=ROUND_FLOOR)
-        )
-        maximum_digits = max(maximum_digits, reliable_digits + 32)
-        values[sample.role] = determinant
-        with localcontext() as context:
-            context.prec = maximum_digits
-            scale = max(Decimal(1), determinant.magnitude())
-            errors[sample.role] = scale * (Decimal(10) ** (-reliable_digits))
-
-    def subtract(left: DecimalComplex, right: DecimalComplex) -> DecimalComplex:
-        return DecimalComplex(
-            left.real - right.real,
-            left.imaginary - right.imaginary,
-        )
-
-    def divide(value: DecimalComplex, denominator: Decimal) -> DecimalComplex:
-        return DecimalComplex(
-            value.real / denominator,
-            value.imaginary / denominator,
-        )
-
-    def stencil(
-        plus_role: str,
-        minus_role: str,
-        plus_half_role: str,
-        minus_half_role: str,
-        step: Decimal,
-    ) -> tuple[DecimalComplex, Decimal]:
-        coarse = divide(
-            subtract(values[plus_role], values[minus_role]),
-            Decimal(2) * step,
-        )
-        fine = divide(
-            subtract(values[plus_half_role], values[minus_half_role]),
-            step,
-        )
-        coarse_error = (
-            errors[plus_role] + errors[minus_role]
-        ) / (Decimal(2) * step)
-        fine_error = (
-            errors[plus_half_role] + errors[minus_half_role]
-        ) / step
-        radius = subtract(fine, coarse).magnitude() + coarse_error + fine_error
-        if not radius.is_finite() or radius <= 0:
-            raise ValueError("promoted derivative disk is not bounded")
-        return fine, radius
-
-    with localcontext() as context:
-        context.prec = maximum_digits
-        frequency_centre, frequency_radius = stencil(
-            "DOMEGA_REAL_PLUS_H",
-            "DOMEGA_REAL_MINUS_H",
-            "DOMEGA_REAL_PLUS_HALF_H",
-            "DOMEGA_REAL_MINUS_HALF_H",
-            frequency_step,
-        )
-        coordinate_centre, coordinate_radius = stencil(
-            "DC_PLUS_EPSILON",
-            "DC_MINUS_EPSILON",
-            "DC_PLUS_HALF_EPSILON",
-            "DC_MINUS_HALF_EPSILON",
-            coordinate_step,
-        )
-        frequency_lower = frequency_centre.magnitude() - frequency_radius
-        frequency_disk = _bounded_binary64_disk_from_decimal(
-            frequency_centre,
-            frequency_radius,
-            subject="promoted frequency derivative",
-        )
-        coordinate_disk = _bounded_binary64_disk_from_decimal(
-            coordinate_centre,
-            coordinate_radius,
-            subject="promoted coordinate derivative",
-        )
-        if frequency_lower <= 0:
-            return Binary64FixedRootScreening(
-                disposition=Binary64SurveyDisposition.PROMOTION_PENDING_RESPONSE,
-                response_disk=None,
-                frequency_derivative_disk=frequency_disk,
-                coordinate_derivative_disk=coordinate_disk,
-                root_correction_upper_bound=None,
-                reason_code="FINITE_DIFFERENCE_NOISE_LIMIT",
-            )
-        residual_upper = values["D0"].magnitude() + errors["D0"]
-        correction = residual_upper / frequency_lower
-        correction_float = float(correction)
-        if Decimal.from_float(correction_float) < correction:
-            correction_float = math.nextafter(correction_float, math.inf)
-        if not math.isfinite(correction_float) or correction > Decimal("2e-11"):
-            return Binary64FixedRootScreening(
-                disposition=Binary64SurveyDisposition.PROMOTION_PENDING_RESPONSE,
-                response_disk=None,
-                frequency_derivative_disk=frequency_disk,
-                coordinate_derivative_disk=coordinate_disk,
-                root_correction_upper_bound=correction_float,
-                reason_code="DETERMINANT_UNCERTAINTY_TOO_LARGE",
-            )
-    try:
-        response = exterior_response_disk(
-            coordinate_derivative=coordinate_disk,
-            frequency_derivative=frequency_disk,
-        )
-    except ZeroContainingDiskError:
-        return Binary64FixedRootScreening(
-            disposition=Binary64SurveyDisposition.PROMOTION_PENDING_RESPONSE,
-            response_disk=None,
-            frequency_derivative_disk=frequency_disk,
-            coordinate_derivative_disk=coordinate_disk,
-            root_correction_upper_bound=correction_float,
-            reason_code="FINITE_DIFFERENCE_NOISE_LIMIT",
-        )
-    return Binary64FixedRootScreening(
-        disposition=Binary64SurveyDisposition.PRODUCED,
-        response_disk=response,
-        frequency_derivative_disk=frequency_disk,
-        coordinate_derivative_disk=coordinate_disk,
-        root_correction_upper_bound=correction_float,
-        reason_code=None,
+    return _screen_with_reviewed_determinant_errors(
+        sample_tuple,
+        frequency_step=float(frequency_step),
+        coordinate_step=float(coordinate_step),
+        determinant_error_evidence=determinant_error_evidence,
     )
 
 
