@@ -5,7 +5,7 @@ externally issued per-sample absolute-error receipts; it never derives an error
 bound from conditioning telemetry, finite-difference agreement, ULPs, or
 predicted reliable digits.
 
-TODO: [HUMAN MATH REVIEW REQUIRED - approve the fixed-root exterior determinant absolute-error construction and issue the governing derivation receipt]
+TODO: [HUMAN MATH REVIEW REQUIRED — no approved receipt establishes the horizon determinant normalisation, horizon numerator/sign and D_R uncertainty, root/p_H uncertainty, or exterior determinant-error construction; retain provisional exterior evidence and do not alter or admit these formulas.]
 """
 
 from __future__ import annotations
