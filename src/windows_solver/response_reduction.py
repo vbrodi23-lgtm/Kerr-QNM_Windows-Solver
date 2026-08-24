@@ -153,6 +153,41 @@ class ResolvedComponentEvidence:
 
 
 @dataclass(frozen=True, slots=True)
+class BoundedComponentEvidence:
+    """An authenticated response centre with a directly retained disk radius."""
+
+    component_id: str
+    centre: complex
+    disk_radius: float
+    units: str
+    source_receipt: str
+    evidence_kind: str = "authenticated-campaign"
+
+    def __post_init__(self) -> None:
+        for field in ("component_id", "units", "source_receipt"):
+            _require_text(getattr(self, field), field)
+        _require_finite_complex(self.centre, "centre")
+        radius = float(self.disk_radius)
+        if not math.isfinite(radius) or radius < 0.0:
+            raise ValueError("bounded component disk radius is invalid")
+        object.__setattr__(self, "disk_radius", radius)
+        if self.evidence_kind != "authenticated-campaign":
+            raise ValueError("bounded component evidence kind is invalid")
+
+    def to_mapping(self) -> dict[str, object]:
+        centre = complex(self.centre)
+        return {
+            "evidence_state": "BOUNDED",
+            "evidence_kind": self.evidence_kind,
+            "component_id": self.component_id,
+            "centre": {"real": centre.real, "imaginary": centre.imag},
+            "disk_radius": self.disk_radius,
+            "units": self.units,
+            "source_receipt": self.source_receipt,
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class ComputedUnresolvedComponentEvidence:
     """A produced component retaining diagnostics but no centre, Gram, or disk."""
 
@@ -931,7 +966,10 @@ def _vector_projective_radius(norm: float, disk_norm: float) -> float | None:
 def reduce_projective_row(
     plan: ProjectiveRowPlan,
     components: Mapping[
-        str, ResolvedComponentEvidence | ComputedUnresolvedComponentEvidence
+        str,
+        ResolvedComponentEvidence
+        | BoundedComponentEvidence
+        | ComputedUnresolvedComponentEvidence,
     ],
     *,
     source_hashes: Sequence[str],
@@ -973,7 +1011,11 @@ def reduce_projective_row(
     if any(
         not isinstance(
             component,
-            (ResolvedComponentEvidence, ComputedUnresolvedComponentEvidence),
+            (
+                ResolvedComponentEvidence,
+                BoundedComponentEvidence,
+                ComputedUnresolvedComponentEvidence,
+            ),
         )
         or component.component_id != component_id
         for component_id, component in zip(required, ordered_evidence)
@@ -1003,6 +1045,92 @@ def reduce_projective_row(
             linearized_angle_gram=None,
             linearized_angle_columns=(),
             reason="one or more produced components are numerically unresolved",
+        )
+    bounded_components = tuple(
+        component for component in ordered_evidence
+        if isinstance(component, BoundedComponentEvidence)
+    )
+    if bounded_components:
+        if len(bounded_components) != len(ordered_evidence):
+            raise ValueError(
+                "projective row cannot mix retained disks with signed-channel evidence"
+            )
+        split = len(plan.left_component_ids)
+        left = tuple(component.centre for component in bounded_components[:split])
+        right = tuple(component.centre for component in bounded_components[split:])
+        left_radius = _vector_projective_radius(
+            math.sqrt(sum(abs(value) ** 2 for value in left)),
+            math.sqrt(sum(item.disk_radius ** 2 for item in bounded_components[:split])),
+        )
+        right_radius = _vector_projective_radius(
+            math.sqrt(sum(abs(value) ** 2 for value in right)),
+            math.sqrt(sum(item.disk_radius ** 2 for item in bounded_components[split:])),
+        )
+        calibration_zero = (
+            abs(bounded_components[0].centre) <= bounded_components[0].disk_radius
+            or abs(bounded_components[split].centre)
+            <= bounded_components[split].disk_radius
+        )
+        if calibration_zero or left_radius is None or right_radius is None:
+            return ProjectiveRowResult(
+                row_id=plan.row_id,
+                reducer_state="COMPLETE",
+                present_component_ids=required,
+                missing_component_ids=(),
+                produced_unresolved_component_ids=(),
+                projective_outcome="UNRESOLVED",
+                scientific_state="UNRESOLVED",
+                nominal_angle_radians=None,
+                bounded_angle_interval_radians=None,
+                calibration_disk_contains_zero=calibration_zero,
+                empirical_gram_id=None,
+                linearized_input_basis=(),
+                linearized_step_policy=None,
+                linearized_angle_jacobian=(),
+                linearized_angle_gram=None,
+                linearized_angle_columns=(),
+                reason=(
+                    "calibration disk contains zero" if calibration_zero
+                    else "component disks do not prove a bounded projective interval"
+                ),
+            )
+        nominal = _calibrated_normalized_angle(left, right)
+        width = left_radius + right_radius
+        interval = (
+            max(0.0, nominal - width),
+            min(math.pi / 2.0, nominal + width),
+        )
+        if interval[0] > plan.separation_lower_radians:
+            outcome, scientific_state = "SEPARATED", "CONTRADICTED"
+            reason = (
+                "conservative angle lower bound exceeds the frozen separation threshold"
+            )
+        elif interval[1] < plan.equivalence_upper_radians:
+            outcome, scientific_state = "EQUIVALENT_WITHIN_TOLERANCE", "SUPPORTED"
+            reason = (
+                "conservative angle upper bound is below the frozen equivalence threshold"
+            )
+        else:
+            outcome = scientific_state = "UNRESOLVED"
+            reason = "bounded angle interval crosses the frozen outcome thresholds"
+        return ProjectiveRowResult(
+            row_id=plan.row_id,
+            reducer_state="COMPLETE",
+            present_component_ids=required,
+            missing_component_ids=(),
+            produced_unresolved_component_ids=(),
+            projective_outcome=outcome,
+            scientific_state=scientific_state,
+            nominal_angle_radians=nominal,
+            bounded_angle_interval_radians=interval,
+            calibration_disk_contains_zero=False,
+            empirical_gram_id=None,
+            linearized_input_basis=(),
+            linearized_step_policy=None,
+            linearized_angle_jacobian=(),
+            linearized_angle_gram=None,
+            linearized_angle_columns=(),
+            reason=reason,
         )
     ordered_components: tuple[ResolvedComponentEvidence, ...] = tuple(
         component for component in ordered_evidence
@@ -1326,7 +1454,10 @@ def reduce_projective_rows(
     campaign_id: str,
     selected_row_ids: Sequence[str],
     components: Mapping[
-        str, ResolvedComponentEvidence | ComputedUnresolvedComponentEvidence
+        str,
+        ResolvedComponentEvidence
+        | BoundedComponentEvidence
+        | ComputedUnresolvedComponentEvidence,
     ],
     *,
     source_hashes: Sequence[str],

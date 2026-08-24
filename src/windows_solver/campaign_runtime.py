@@ -21,7 +21,11 @@ from .campaign_policy import (
     SurveyDisposition,
 )
 from .campaign_recovery import RecoverySelection
-from .campaign_reports import refresh_schema11_reports, write_schema11_triage
+from .campaign_reports import (
+    refresh_schema11_reports,
+    write_schema11_projective,
+    write_schema11_triage,
+)
 from .campaign_survey import (
     AuthenticatedRootSeal,
     Binary64PassOutcome,
@@ -120,6 +124,12 @@ def _refresh_runtime_reports(
         selection,
         checkpoint,
         checkpoint_path,
+        advanced_projective=(
+            (lambda value, directory: write_schema11_projective(
+                plan, selection, value, directory
+            ))
+            if triage_ready else None
+        ),
         advanced_triage=(
             (lambda value, directory: write_schema11_triage(
                 plan, selection, value, directory

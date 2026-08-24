@@ -30,12 +30,28 @@ from .julia_response_backend import promoted_precision_numerical_controls
 from .precision_tiers import precision_tier_presentation
 from .response_engine import ComponentResult, ERROR_CHANNELS
 from .response_reduction import (
+    BoundedComponentEvidence,
+    CampaignReductionSummary,
     ComputedUnresolvedComponentEvidence,
     ResolvedComponentEvidence,
     SignedErrorContribution,
     build_projective_row_plans,
     reduce_projective_rows,
 )
+
+
+PROJECTIVE_TRIAGE_PROJECTION_SCHEMA = (
+    "windows-solver.projective-triage-projection/v1"
+)
+PROJECTIVE_TRIAGE_REVIEW_TODO = (
+    "TODO: [HUMAN MATH REVIEW REQUIRED - approve the deterministic "
+    "projective row-to-leaf aggregation rule if it is not already specified "
+    "by reviewed project mathematics]"
+)
+
+
+class ProjectiveTriageProjectionReviewRequired(RuntimeError):
+    """Raised when projective rows exist but no reviewed leaf projection does."""
 
 
 SCHEMA11_LEAF_COLUMNS = (
@@ -1325,6 +1341,150 @@ def _schema11_record_response(
     return result.response, sum(result.error_channels.values())
 
 
+def _schema11_projective_component(
+    record: Mapping[str, object],
+) -> BoundedComponentEvidence | None:
+    """Project one authenticated schema-11 response disk into reducer evidence."""
+
+    if record.get("state") != "PRODUCED":
+        return None
+    leaf_id = record.get("leaf_id")
+    record_sha256 = record.get("record_sha256")
+    stages = record.get("stages")
+    if (
+        not isinstance(leaf_id, str)
+        or not isinstance(record_sha256, str)
+        or not isinstance(stages, list)
+        or not stages
+        or not isinstance(stages[-1], Mapping)
+    ):
+        return None
+    centre, radius = _schema11_record_response(record)
+    if centre is None or radius is None:
+        return None
+    stage_sha256 = stages[-1].get("stage_sha256")
+    if not isinstance(stage_sha256, str):
+        return None
+    source_receipt = hashlib.sha256(canonical_json_bytes({
+        "record_sha256": record_sha256,
+        "stage_sha256": stage_sha256,
+    })).hexdigest()
+    return BoundedComponentEvidence(
+        component_id=leaf_id,
+        centre=centre,
+        disk_radius=radius,
+        units="dimensionless-response",
+        source_receipt=source_receipt,
+    )
+
+
+def _schema11_selected_projective_plans(selection: object) -> tuple[object, ...]:
+    selected = set(getattr(selection, "leaf_ids"))
+    return tuple(
+        row
+        for row in build_projective_row_plans()
+        if selected.intersection((*row.left_component_ids, *row.right_component_ids))
+    )
+
+
+def _schema11_projective_vector_cell(
+    component_ids: Sequence[str],
+    records: Mapping[str, Mapping[str, object]],
+) -> str:
+    values = []
+    for component_id in component_ids:
+        record = records.get(component_id)
+        centre, radius = (
+            (None, None)
+            if record is None else _schema11_record_response(record)
+        )
+        values.append({
+            "component_id": component_id,
+            "response_real": None if centre is None else centre.real,
+            "response_imaginary": None if centre is None else centre.imag,
+            "local_disk_radius": radius,
+            "terminal_state": None if record is None else record.get("state"),
+        })
+    return _json_cell(values)
+
+
+def _schema11_projective_rows(
+    reduction: CampaignReductionSummary,
+    records: Mapping[str, Mapping[str, object]],
+    *,
+    checkpoint_source_receipt: str,
+) -> tuple[Mapping[str, object], ...]:
+    grams = {
+        item.construction_id: item.to_mapping()
+        for item in reduction.empirical_grams
+    }
+    return tuple({
+        "row_id": row.row_id,
+        "role": row.role,
+        "support": row.support_id,
+        "mode_order": _json_cell(row.mode_labels),
+        "coordinate_role": row.coordinate_role,
+        "coordinate_exact": f"{row.coordinate.numerator}/{row.coordinate.denominator}",
+        "spin_binary64_hex": row.spin_binary64_hex,
+        "left_mechanism": row.left_mechanism_id,
+        "right_mechanism": row.right_mechanism_id,
+        "left_component_ids": _json_cell(row.left_component_ids),
+        "right_component_ids": _json_cell(row.right_component_ids),
+        "present_component_ids": _json_cell(result.present_component_ids),
+        "missing_component_ids": _json_cell(result.missing_component_ids),
+        "produced_unresolved_component_ids": _json_cell(
+            result.produced_unresolved_component_ids
+        ),
+        "left_vector": _schema11_projective_vector_cell(
+            row.left_component_ids, records
+        ),
+        "right_vector": _schema11_projective_vector_cell(
+            row.right_component_ids, records
+        ),
+        "calibration_mode": row.calibration_mode_label,
+        "calibration_component_ids": _json_cell(row.calibration_component_ids),
+        "nominal_angle": result.nominal_angle_radians,
+        "angle_lower_bound": (
+            None
+            if result.bounded_angle_interval_radians is None
+            else result.bounded_angle_interval_radians[0]
+        ),
+        "angle_upper_bound": (
+            None
+            if result.bounded_angle_interval_radians is None
+            else result.bounded_angle_interval_radians[1]
+        ),
+        "separation_threshold": row.separation_lower_radians,
+        "equivalence_threshold": row.equivalence_upper_radians,
+        "calibration_disk_contains_zero": result.calibration_disk_contains_zero,
+        "projective_outcome": result.projective_outcome,
+        "scientific_state": result.scientific_state,
+        "empirical_gram_id": result.empirical_gram_id,
+        "empirical_gram": (
+            "" if result.empirical_gram_id is None
+            else _json_cell(grams[result.empirical_gram_id])
+        ),
+        "linearized_input_basis": _json_cell(result.linearized_input_basis),
+        "linearized_step_policy": (
+            "" if result.linearized_step_policy is None
+            else _json_cell(result.linearized_step_policy)
+        ),
+        "linearized_angle_jacobian": _json_cell(
+            result.linearized_angle_jacobian
+        ),
+        "linearized_angle_gram": result.linearized_angle_gram,
+        "linearized_angle_columns": _json_cell([
+            {"channel_id": channel_id, "signed_angle_delta": value}
+            for channel_id, value in result.linearized_angle_columns
+        ]),
+        "reducer_state": result.reducer_state,
+        "reason": result.reason,
+        "evidence_ceiling": row.evidence_ceiling,
+        "reduction_id": reduction.reduction_id,
+        "checkpoint_source_receipt": checkpoint_source_receipt,
+    } for row, result in zip(reduction.plans, reduction.results))
+
+
 def _schema11_stage_tier(stage: Mapping[str, object]) -> str | None:
     tier = stage.get("precision_tier")
     if isinstance(tier, str):
@@ -1538,6 +1698,165 @@ def _schema11_projection_status(
     }
 
 
+def write_schema11_projective(
+    plan: object,
+    selection: object,
+    checkpoint: Mapping[str, object],
+    directory: Path,
+) -> CampaignReductionSummary:
+    """Write the authenticated non-release projective reduction before triage."""
+
+    row_plans = _schema11_selected_projective_plans(selection)
+    if not row_plans:
+        raise ValueError("selected atlas contains no projective row participation")
+    records = {
+        record["leaf_id"]: record
+        for record in checkpoint["records"]
+        if isinstance(record, Mapping) and isinstance(record.get("leaf_id"), str)
+    }
+    required_ids = {
+        component_id
+        for row in row_plans
+        for component_id in (*row.left_component_ids, *row.right_component_ids)
+    }
+    components = {
+        leaf_id: component
+        for leaf_id, record in records.items()
+        if leaf_id in required_ids
+        for component in (_schema11_projective_component(record),)
+        if component is not None
+    }
+    checkpoint_source_receipt = _schema11_checkpoint_receipt(checkpoint)
+    reduction = reduce_projective_rows(
+        getattr(plan, "campaign_id"),
+        tuple(row.row_id for row in row_plans),
+        components,
+        source_hashes=(checkpoint_source_receipt,),
+    )
+    _atomic_json(directory / "m02-projective.json", reduction.to_mapping())
+    _atomic_csv(
+        directory / "m02-projective.csv",
+        PROJECTIVE_COLUMNS,
+        _schema11_projective_rows(
+            reduction,
+            records,
+            checkpoint_source_receipt=checkpoint_source_receipt,
+        ),
+    )
+    return reduction
+
+
+def _is_sha256_text(value: object) -> bool:
+    if not isinstance(value, str) or len(value) != 64:
+        return False
+    try:
+        int(value, 16)
+    except ValueError:
+        return False
+    return True
+
+
+def _load_reviewed_projective_triage_projection(
+    path: Path,
+    reduction: CampaignReductionSummary,
+    *,
+    checkpoint_source_receipt: str,
+    selected_leaf_ids: Sequence[str],
+) -> Mapping[str, tuple[float | None, bool]]:
+    """Authenticate a human-reviewed row-to-leaf aggregation receipt."""
+
+    if not path.is_file():
+        raise ProjectiveTriageProjectionReviewRequired(
+            PROJECTIVE_TRIAGE_REVIEW_TODO
+        )
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise ValueError("projective triage projection receipt is unreadable") from error
+    fields = {
+        "schema",
+        "checkpoint_source_receipt",
+        "projective_reduction_id",
+        "aggregation_rule_identity",
+        "human_math_review_receipt_sha256",
+        "leaf_projections",
+        "receipt_sha256",
+    }
+    if not isinstance(value, Mapping) or set(value) != fields:
+        raise ValueError("projective triage projection receipt fields are invalid")
+    material = {key: item for key, item in value.items() if key != "receipt_sha256"}
+    if (
+        value["schema"] != PROJECTIVE_TRIAGE_PROJECTION_SCHEMA
+        or value["checkpoint_source_receipt"] != checkpoint_source_receipt
+        or value["projective_reduction_id"] != reduction.reduction_id
+        or not isinstance(value["aggregation_rule_identity"], str)
+        or not value["aggregation_rule_identity"]
+        or not _is_sha256_text(value["human_math_review_receipt_sha256"])
+        or value["receipt_sha256"]
+        != hashlib.sha256(canonical_json_bytes(material)).hexdigest()
+        or not isinstance(value["leaf_projections"], list)
+    ):
+        raise ValueError("projective triage projection receipt authentication failed")
+    row_by_id = {
+        row.row_id: (row, result)
+        for row, result in zip(reduction.plans, reduction.results)
+    }
+    selected = set(selected_leaf_ids)
+    participating = {
+        component_id
+        for row in reduction.plans
+        for component_id in (*row.left_component_ids, *row.right_component_ids)
+        if component_id in selected
+    }
+    projections: dict[str, tuple[float | None, bool]] = {}
+    for item in value["leaf_projections"]:
+        if not isinstance(item, Mapping) or set(item) != {
+            "leaf_id",
+            "supporting_row_ids",
+            "projective_angle_lower_bound",
+            "controls_projective_classification",
+        }:
+            raise ValueError("projective triage leaf projection fields are invalid")
+        leaf_id = item["leaf_id"]
+        row_ids = item["supporting_row_ids"]
+        controls = item["controls_projective_classification"]
+        if (
+            not isinstance(leaf_id, str)
+            or leaf_id not in participating
+            or leaf_id in projections
+            or not isinstance(row_ids, list)
+            or not row_ids
+            or len(row_ids) != len(set(row_ids))
+            or type(controls) is not bool
+        ):
+            raise ValueError("projective triage leaf projection identity is invalid")
+        for row_id in row_ids:
+            if row_id not in row_by_id:
+                raise ValueError("projective triage projection references an unknown row")
+            row, _ = row_by_id[row_id]
+            if leaf_id not in (*row.left_component_ids, *row.right_component_ids):
+                raise ValueError("projective triage projection row does not contain leaf")
+        lower = item["projective_angle_lower_bound"]
+        if lower is not None:
+            try:
+                lower = float(lower)
+            except (TypeError, ValueError, OverflowError) as error:
+                raise ValueError("projective triage lower bound is invalid") from error
+            if not math.isfinite(lower) or lower < 0:
+                raise ValueError("projective triage lower bound is invalid")
+            if any(
+                row_by_id[row_id][1].bounded_angle_interval_radians is None
+                for row_id in row_ids
+            ):
+                raise ValueError(
+                    "incomplete projective rows cannot fabricate a triage angle"
+                )
+        projections[leaf_id] = (lower, controls)
+    if set(projections) != participating:
+        raise ValueError("projective triage projection omits participating leaves")
+    return projections
+
+
 def refresh_schema11_reports(
     plan: object,
     selection: object,
@@ -1683,6 +2002,27 @@ def write_schema11_triage(
     queue = {
         item["leaf_id"]: item for item in checkpoint["promotion_queue"]["entries"]
     }
+    projective_path = directory / "m02-projective.json"
+    if not projective_path.is_file():
+        raise ValueError("authenticated projective reduction is required before triage")
+    try:
+        projective = CampaignReductionSummary.from_mapping(
+            json.loads(projective_path.read_text(encoding="utf-8"))
+        )
+    except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as error:
+        raise ValueError("authenticated projective reduction is invalid") from error
+    checkpoint_source_receipt = _schema11_checkpoint_receipt(checkpoint)
+    if (
+        projective.campaign_id != getattr(plan, "campaign_id")
+        or projective.source_hashes != (checkpoint_source_receipt,)
+    ):
+        raise ValueError("projective reduction and triage checkpoint binding differ")
+    projective_by_leaf = _load_reviewed_projective_triage_projection(
+        directory / "m02-projective-triage-projection.json",
+        projective,
+        checkpoint_source_receipt=checkpoint_source_receipt,
+        selected_leaf_ids=tuple(getattr(selection, "leaf_ids")),
+    )
     leaves = []
     for leaf_id in tuple(getattr(selection, "leaf_ids")):
         leaf = leaf_by_id[leaf_id]
@@ -1705,6 +2045,9 @@ def write_schema11_triage(
             if isinstance(ledger, Mapping) else []
         )
         queue_entry = queue.get(leaf_id)
+        projective_lower, projective_controller = projective_by_leaf.get(
+            leaf_id, (None, False)
+        )
         leaves.append(TriageLeaf(
             leaf_id=leaf_id,
             role=leaf.role,
@@ -1733,8 +2076,8 @@ def write_schema11_triage(
                 and queue_entry.get("queue_kind") == "ROOT"
             ),
             near_extremal_support=abs(float(leaf.job.spin)) >= 0.99,
-            projective_angle_lower_bound=None,
-            controls_projective_classification=False,
+            projective_angle_lower_bound=projective_lower,
+            controls_projective_classification=projective_controller,
         ))
     triage = build_whole_atlas_triage(
         checkpoint,
