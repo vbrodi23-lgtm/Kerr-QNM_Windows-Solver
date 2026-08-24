@@ -71,6 +71,7 @@ from .julia_response_backend import (
 from .promoted_control_calibration import load_default_calibration_receipt
 from .root_readout_cache import RootReadoutStore
 from .reviewed_determinant_error import ReviewedDeterminantErrorStore
+from .background_evidence_store import CanonicalBackgroundEvidenceStore
 from .solved_leaf_cache import SolvedLeafLookupStatus, SolvedLeafStore
 
 
@@ -732,6 +733,7 @@ def run_native_binary64_pass(
     checkpoint_path: Path,
     solved_leaf_store: SolvedLeafStore | None = None,
     determinant_error_store: ReviewedDeterminantErrorStore | None = None,
+    background_evidence_store: CanonicalBackgroundEvidenceStore | None = None,
 ) -> Binary64SurveyRun:
     """Execute the real binary64 scheduler with a Julia-free backend factory."""
 
@@ -739,6 +741,10 @@ def run_native_binary64_pass(
     error_store = determinant_error_store or ReviewedDeterminantErrorStore(
         checkpoint_path.parent
         / f"{checkpoint_path.name}.reviewed-determinant-errors"
+    )
+    background_store = background_evidence_store or CanonicalBackgroundEvidenceStore(
+        checkpoint_path.parent
+        / f"{checkpoint_path.name}.canonical-backgrounds"
     )
     backend_holder: dict[str, NativeCampaignStageBackend] = {}
     root_provider_holder: dict[str, AuthenticatedRootSealProvider] = {}
@@ -768,6 +774,11 @@ def run_native_binary64_pass(
             root_seal_sha256=seal.root_seal_sha256,
         )
 
+    def equivalence_lookup(leaf, background):
+        return background_store.lookup(
+            leaf.job, background.reuse_key
+        ).receipt
+
     return run_binary64_survey(
         plan,
         recovery_selection,
@@ -777,8 +788,9 @@ def run_native_binary64_pass(
         native_backend_factory=lambda: backend().adapter.kernel,
         horizon_runner=lambda leaf: _horizon_outcome(plan, backend(), leaf),
         produced_record_builder=build,
-        equivalence_receipt_lookup=None,
+        equivalence_receipt_lookup=equivalence_lookup,
         determinant_error_store=error_store,
+        background_evidence_store=background_store,
         solved_leaf_store=store,
         record_validator=lambda leaf_id, record: validate_campaign_recovery_record(
             plan, leaf_id, record

@@ -1842,6 +1842,26 @@ class Binary64FixedRootSample:
             "determinant": _complex_mapping(self.determinant),
         }
 
+    @classmethod
+    def from_mapping(cls, value: object) -> "Binary64FixedRootSample":
+        if not isinstance(value, Mapping) or set(value) != {
+            "role",
+            "omega",
+            "amplitude",
+            "determinant",
+        }:
+            raise ValueError("binary64 fixed-root sample fields are invalid")
+        return cls(
+            role=str(value["role"]),
+            omega=_complex_from_mapping(value["omega"], "sample omega"),
+            amplitude=_complex_from_mapping(
+                value["amplitude"], "sample amplitude"
+            ),
+            determinant=_complex_from_mapping(
+                value["determinant"], "sample determinant"
+            ),
+        )
+
 
 @dataclass(frozen=True, slots=True)
 class Binary64FixedRootBatch:
@@ -2207,6 +2227,40 @@ class CanonicalExteriorBackground:
             "frequency_step": self.frequency_step,
             "samples": [sample.to_mapping() for sample in self.samples],
         }
+
+    @classmethod
+    def from_mapping(cls, value: object) -> "CanonicalExteriorBackground":
+        fields = {
+            "schema",
+            "operation_identity",
+            "reuse_key",
+            "fixed_root",
+            "frequency_step",
+            "samples",
+        }
+        if not isinstance(value, Mapping) or set(value) != fields:
+            raise ValueError("canonical exterior background fields are invalid")
+        if (
+            value["schema"] != "windows-solver.canonical-exterior-background/1"
+            or value["operation_identity"]
+            != CANONICAL_EXTERIOR_BACKGROUND_IDENTITY
+            or not isinstance(value["samples"], list)
+        ):
+            raise ValueError("canonical exterior background schema is invalid")
+        frequency_step = value["frequency_step"]
+        if isinstance(frequency_step, bool) or not isinstance(
+            frequency_step, (int, float)
+        ):
+            raise ValueError("canonical exterior background step is invalid")
+        return cls(
+            reuse_key=ExteriorBackgroundReuseKey.from_mapping(value["reuse_key"]),
+            fixed_root=_complex_from_mapping(value["fixed_root"], "fixed root"),
+            frequency_step=float(frequency_step),
+            samples=tuple(
+                Binary64FixedRootSample.from_mapping(sample)
+                for sample in value["samples"]
+            ),
+        )
 
 
 def canonical_background_from_binary64_batch(

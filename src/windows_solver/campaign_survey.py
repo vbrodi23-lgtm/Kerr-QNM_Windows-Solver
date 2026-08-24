@@ -67,6 +67,7 @@ from .response_engine import (
     screen_promoted_fixed_root_samples,
 )
 from .reviewed_determinant_error import ReviewedDeterminantErrorStore
+from .background_evidence_store import CanonicalBackgroundEvidenceStore
 from .julia_response_backend import (
     JuliaFixedRootSurveyBatch,
     JuliaNumericalControlError,
@@ -333,6 +334,7 @@ def run_binary64_survey(
         BackgroundEquivalenceReceipt | None,
     ] | None = None,
     determinant_error_store: ReviewedDeterminantErrorStore | None = None,
+    background_evidence_store: CanonicalBackgroundEvidenceStore | None = None,
     solved_leaf_store: SolvedLeafStore | None = None,
     record_validator: RecordValidator | None = None,
     timing_log: CampaignTimingLog | None = None,
@@ -568,12 +570,24 @@ def run_binary64_survey(
                 key_sha256 = hashlib.sha256(
                     canonical_json_bytes(reuse_key.to_mapping())
                 ).hexdigest()
-                background = backgrounds.get(key_sha256)
-                receipt = guarded(lambda: (
-                    None
-                    if background is None or equivalence_receipt_lookup is None
-                    else equivalence_receipt_lookup(leaf, background)
-                ))
+                issued_equivalence_receipts: tuple[
+                    BackgroundEquivalenceReceipt, ...
+                ] = ()
+                if background_evidence_store is not None:
+                    durable_background = guarded(
+                        lambda: background_evidence_store.lookup(
+                            leaf.job, reuse_key
+                        )
+                    )
+                    background = durable_background.background
+                    receipt = durable_background.receipt
+                else:
+                    background = backgrounds.get(key_sha256)
+                    receipt = guarded(lambda: (
+                        None
+                        if background is None or equivalence_receipt_lookup is None
+                        else equivalence_receipt_lookup(leaf, background)
+                    ))
                 if backend is None:
                     timing_recorder = TimingSessionRecorder(
                         log=operational_timing,
@@ -605,6 +619,62 @@ def run_binary64_survey(
                     )
                 )
                 if isinstance(batch, Binary64FixedRootBatch):
+                    canonical = guarded(
+                        lambda: canonical_background_from_binary64_batch(
+                            batch, reuse_key
+                        )
+                    )
+                    assert isinstance(canonical, CanonicalExteriorBackground)
+                    if background_evidence_store is not None:
+                        compatible_receipts: dict[
+                            str, BackgroundEquivalenceReceipt
+                        ] = {}
+                        for candidate in leaves.values():
+                            if candidate.mechanism_id not in _EXTERIOR_PROFILE_IDS:
+                                continue
+                            candidate_key = guarded(
+                                lambda candidate=candidate: (
+                                    build_exterior_background_reuse_key(
+                                        candidate.job,
+                                        root_seal_sha256=seal.root_seal_sha256,
+                                        fixed_root=seal.fixed_root,
+                                    )
+                                )
+                            )
+                            if candidate_key != reuse_key:
+                                continue
+                            candidate_receipt = guarded(
+                                lambda candidate=candidate: (
+                                    BackgroundEquivalenceReceipt.issue(
+                                        reuse_key=reuse_key,
+                                        job=candidate.job,
+                                        canonical_background_sha256=canonical.sha256,
+                                        fixed_root=seal.fixed_root,
+                                    )
+                                )
+                            )
+                            prior = compatible_receipts.get(
+                                candidate.mechanism_id
+                            )
+                            if prior is not None and prior != candidate_receipt:
+                                guarded(lambda: (_ for _ in ()).throw(
+                                    ValueError(
+                                        "conflicting structural background proofs"
+                                    )
+                                ))
+                            compatible_receipts[
+                                candidate.mechanism_id
+                            ] = candidate_receipt
+                        issued_equivalence_receipts = tuple(
+                            compatible_receipts.values()
+                        )
+                        guarded(
+                            lambda: background_evidence_store.publish(
+                                canonical, issued_equivalence_receipts
+                            )
+                        )
+                    else:
+                        backgrounds[key_sha256] = canonical
                     determinant_error_evidence = guarded(lambda: (
                         None
                         if determinant_error_store is None
@@ -624,13 +694,6 @@ def run_binary64_survey(
                             determinant_error_evidence=determinant_error_evidence,
                         )
                     )
-                    canonical = guarded(
-                        lambda: canonical_background_from_binary64_batch(
-                            batch, reuse_key
-                        )
-                    )
-                    assert isinstance(canonical, CanonicalExteriorBackground)
-                    backgrounds[key_sha256] = canonical
                 elif isinstance(batch, Binary64ReusedBackgroundBatch):
                     if background is None:
                         guarded(
@@ -680,6 +743,11 @@ def run_binary64_survey(
                 if isinstance(batch, Binary64ReusedBackgroundBatch):
                     assert receipt is not None
                     evidence_receipts += (receipt.to_mapping(),)
+                if issued_equivalence_receipts:
+                    evidence_receipts += tuple(
+                        item.to_mapping()
+                        for item in issued_equivalence_receipts
+                    )
                 if determinant_error_evidence is not None:
                     evidence_receipts += (
                         determinant_error_evidence.to_mappings()
