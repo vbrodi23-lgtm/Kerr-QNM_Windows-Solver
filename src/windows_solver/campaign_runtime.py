@@ -898,6 +898,8 @@ class _RootSealCandidate:
 def _root_solving_identity_compatible(source: object, target: object) -> bool:
     return (
         source.job.root.to_mapping() == target.job.root.to_mapping()
+        and source.leaf.mode == target.leaf.mode
+        and source.job.spin == target.job.spin
         and source.job.policy.identity_sha256 == target.job.policy.identity_sha256
         and source.job.backend_identity.identity_sha256
         == target.job.backend_identity.identity_sha256

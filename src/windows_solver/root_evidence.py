@@ -12,8 +12,10 @@ from typing import Mapping
 from .contracts import canonical_json_bytes
 
 
-ROOT_EVIDENCE_SCHEMA = "windows-solver.authenticated-root-evidence/1"
-ROOT_DEPENDENCY_KEY_SCHEMA = "windows-solver.root-dependency-key/1"
+# Version 2 adds spin to the exact dependency identity.  A root receipt from
+# one spin must never be reused merely because another field happens to match.
+ROOT_EVIDENCE_SCHEMA = "windows-solver.authenticated-root-evidence/2"
+ROOT_DEPENDENCY_KEY_SCHEMA = "windows-solver.root-dependency-key/2"
 _HEX_64 = re.compile(r"[0-9a-f]{64}")
 
 
@@ -38,6 +40,15 @@ def _finite_optional(value: object, subject: str) -> float | None:
         raise ValueError(f"{subject} is invalid")
     converted = float(value)
     if not math.isfinite(converted) or converted < 0.0:
+        raise ValueError(f"{subject} is invalid")
+    return converted
+
+
+def _finite(value: object, subject: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{subject} is invalid")
+    converted = float(value)
+    if not math.isfinite(converted):
         raise ValueError(f"{subject} is invalid")
     return converted
 
@@ -73,6 +84,7 @@ class RootDependencyKey:
     root_identity_sha256: str
     mode: Mapping[str, object]
     sampling_coordinate: Mapping[str, object]
+    spin: float
     branch_identity: str
     equation_id: str
     backend_identity: str
@@ -100,6 +112,7 @@ class RootDependencyKey:
             if not isinstance(value, Mapping):
                 raise ValueError(f"root dependency {name} is invalid")
             object.__setattr__(self, name, _copy(dict(value)))
+        object.__setattr__(self, "spin", _finite(self.spin, "root dependency spin"))
 
     @classmethod
     def from_leaf(
@@ -118,6 +131,7 @@ class RootDependencyKey:
             root_identity_sha256=job.root.identity_sha256,
             mode={"ell": mode[0], "m": mode[1], "n": mode[2]},
             sampling_coordinate=job.sampling_coordinate.to_mapping(),
+            spin=job.spin,
             branch_identity=job.root.branch_id,
             equation_id=job.equation_id,
             backend_identity=job.backend_identity.identity_sha256,
@@ -132,6 +146,7 @@ class RootDependencyKey:
             "root_identity_sha256": self.root_identity_sha256,
             "mode": _copy(self.mode),
             "sampling_coordinate": _copy(self.sampling_coordinate),
+            "spin": self.spin,
             "branch_identity": self.branch_identity,
             "equation_id": self.equation_id,
             "backend_identity": self.backend_identity,
@@ -348,13 +363,31 @@ class AuthenticatedRootEvidence:
         if value["schema"] != ROOT_EVIDENCE_SCHEMA:
             raise ValueError("root evidence schema is invalid")
         raw_key = value["root_dependency_key"]
-        if not isinstance(raw_key, Mapping) or raw_key.get("schema") != ROOT_DEPENDENCY_KEY_SCHEMA:
+        key_fields = {
+            "schema",
+            "root_reference_id",
+            "root_identity_sha256",
+            "mode",
+            "sampling_coordinate",
+            "spin",
+            "branch_identity",
+            "equation_id",
+            "backend_identity",
+            "root_acceptance_policy_identity",
+            "arithmetic_tier",
+        }
+        if (
+            not isinstance(raw_key, Mapping)
+            or set(raw_key) != key_fields
+            or raw_key.get("schema") != ROOT_DEPENDENCY_KEY_SCHEMA
+        ):
             raise ValueError("root evidence dependency key is invalid")
         key = RootDependencyKey(
             root_reference_id=str(raw_key.get("root_reference_id")),
             root_identity_sha256=str(raw_key.get("root_identity_sha256")),
             mode=raw_key.get("mode"),  # type: ignore[arg-type]
             sampling_coordinate=raw_key.get("sampling_coordinate"),  # type: ignore[arg-type]
+            spin=raw_key.get("spin"),  # type: ignore[arg-type]
             branch_identity=str(raw_key.get("branch_identity")),
             equation_id=str(raw_key.get("equation_id")),
             backend_identity=str(raw_key.get("backend_identity")),

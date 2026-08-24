@@ -947,6 +947,9 @@ class HorizonRecordConstructionTests(unittest.TestCase):
                 checkpoint,
                 checkpoint_path=Path(temporary) / "checkpoint.json",
                 root_seal_lookup=lambda _leaf, _entry: None,
+                root_seal_publish=lambda *_args: self.fail(
+                    "horizon promotion must not publish a root"
+                ),
                 backend_factory=lambda _leaf, _digits: None,
                 primary_root_runner=lambda *_args: self.fail(
                     "unexpected promoted root"
@@ -1061,6 +1064,9 @@ class HorizonRecordConstructionTests(unittest.TestCase):
                     checkpoint,
                     checkpoint_path=Path(temporary) / "checkpoint.json",
                     root_seal_lookup=lambda _leaf, _entry: None,
+                    root_seal_publish=lambda *_args: self.fail(
+                        "horizon promotion must not publish a root"
+                    ),
                     backend_factory=lambda _leaf, _digits: None,
                     primary_root_runner=lambda *_args: self.fail(
                         "unexpected promoted root"

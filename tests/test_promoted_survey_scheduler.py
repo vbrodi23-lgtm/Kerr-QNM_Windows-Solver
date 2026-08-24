@@ -28,6 +28,7 @@ from windows_solver.julia_response_backend import (
     JuliaNumericalControlError,
 )
 from windows_solver.precision_tiers import PrecisionTier
+from windows_solver.structural_diagnostics import StructuralDiagnosticSession
 from windows_solver.response_batches import (
     PrecisionCapabilities,
     build_campaign_plan,
@@ -215,6 +216,7 @@ class PromotedSurveySchedulerTests(unittest.TestCase):
         flat80=False,
         failure40: str | None = None,
         root_runner=None,
+        diagnostic_session=None,
     ):
         calls: list[int] = []
         published: dict[str, AuthenticatedRootSeal] = {}
@@ -261,6 +263,7 @@ class PromotedSurveySchedulerTests(unittest.TestCase):
                 produced_record_builder=lambda leaf, batch, screening, digits: (
                     _record(leaf.leaf_id, digits)
                 ),
+                diagnostic_session=diagnostic_session,
             )
         return result, calls
 
@@ -305,6 +308,9 @@ class PromotedSurveySchedulerTests(unittest.TestCase):
                     leaf.job.root.omega,
                     leaf.job.root.branch_id,
                     entry["source_root_seal_sha256"],
+                ),
+                root_seal_publish=lambda *_args: self.fail(
+                    "response promotion must not publish a root"
                 ),
                 backend_factory=lambda leaf, digits: _Backend(
                     leaf, digits, False, calls
@@ -385,6 +391,186 @@ class PromotedSurveySchedulerTests(unittest.TestCase):
         self.assertEqual(3, entry["worker_launch_count"])
         self.assertEqual("UNRESOLVED", entry["disposition"])
 
+    def test_exact_root_queue_group_uses_one_primary_root_solve(self):
+        """One exact background root is shared by every dependent leaf."""
+
+        root_calls: list[int] = []
+
+        def root_runner(leaf, backend, digits):
+            root_calls.append(digits)
+            return PromotedRootSolveResult(
+                AuthenticatedRootSeal(
+                    leaf.job.root.omega, leaf.job.root.branch_id, "c" * 64
+                ),
+                precision_tier=f"BF{digits}",
+            )
+
+        result, batch_calls = self._run(
+            self._checkpoint(PromotionQueueKind.ROOT, count=2),
+            root_runner=root_runner,
+        )
+
+        self.assertEqual([40], root_calls)
+        self.assertEqual([40, 80, 40, 80], batch_calls)
+        first, second = (
+            result.checkpoint["survey_pass_ledger"]["promoted"][leaf.leaf_id]
+            for leaf in self.leaves
+        )
+        self.assertEqual(1, first["root_read_count"])
+        self.assertEqual(0, second["root_read_count"])
+        self.assertEqual(3, first["worker_launch_count"])
+        self.assertEqual(2, second["worker_launch_count"])
+
+    def test_exact_root_queue_group_records_compact_structural_summary(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            session = StructuralDiagnosticSession.open(
+                checkpoint_path=Path(temporary) / "diagnostic-checkpoint.json",
+                session_id="root-group-test",
+                campaign_id=self.selection.campaign_id,
+                selection_id=self.selection.selection_id,
+            )
+            try:
+                result, _ = self._run(
+                    self._checkpoint(PromotionQueueKind.ROOT, count=2),
+                    diagnostic_session=session,
+                )
+                events = session.final_events()
+            finally:
+                session.close_completed()
+
+        group_events = [
+            event for event in events
+            if event["event_kind"] == "ROOT_PROMOTION_GROUP_FINISHED"
+        ]
+        self.assertEqual(1, len(group_events))
+        event = group_events[0]
+        self.assertEqual(self.leaves[0].leaf_id, event["leaf"]["leaf_id"])
+        self.assertEqual(
+            [leaf.leaf_id for leaf in self.leaves],
+            event["compact_diagnostics"]["member_leaf_ids"],
+        )
+        self.assertEqual(2, event["compact_diagnostics"]["member_leaf_count"])
+        self.assertEqual(1, event["compact_diagnostics"]["root_solve_count"])
+        self.assertEqual(1, event["compact_diagnostics"]["publication_count"])
+        self.assertEqual("RESOLVED", event["compact_diagnostics"]["status"])
+        self.assertEqual(
+            event["connections"]["root_dependency_key_sha256"],
+            _sha256(event["compact_diagnostics"]["root_dependency_key"]),
+        )
+        self.assertEqual([], result.checkpoint["system_failures"])
+
+    def test_distinct_root_dependency_keys_do_not_share_primary_work(self):
+        first = self.leaves[0]
+        incompatible = next(
+            leaf for leaf in self.plan.leaves
+            if leaf.role == first.role
+            and leaf.mechanism_id != "horizon-admittance"
+            and leaf.leaf.mode != first.leaf.mode
+        )
+        selected = build_campaign_selection(
+            self.plan,
+            role=first.role,
+            leaf_ids=(first.leaf_id, incompatible.leaf_id),
+        )
+        selection = RecoverySelection(
+            campaign_id=self.plan.campaign_id,
+            selection_id=selected.selection_id,
+            ordered_leaf_ids=tuple(selected.leaf_ids),
+            roles={leaf.leaf_id: leaf.role for leaf in (first, incompatible)},
+            scientific_identities={
+                leaf.leaf_id: scientific_computation_identity_sha256(self.plan, leaf)
+                for leaf in (first, incompatible)
+            },
+        )
+        checkpoint = empty_schema11_checkpoint(
+            selection.campaign_id, selection.selection_id
+        )
+        for leaf in (first, incompatible):
+            checkpoint = append_promotion(
+                checkpoint,
+                leaf_id=leaf.leaf_id,
+                queue_kind=PromotionQueueKind.ROOT,
+                reason_code="DETERMINANT_UNCERTAINTY_TOO_LARGE",
+                minimum_requested_tier="BF40",
+                scientific_computation_identity=selection.scientific_identities[
+                    leaf.leaf_id
+                ],
+            )
+
+        root_calls: list[tuple[str, int]] = []
+        batch_calls: list[tuple[str, int]] = []
+        published: dict[str, AuthenticatedRootSeal] = {}
+
+        def root_runner(leaf, _backend, digits):
+            root_calls.append((leaf.leaf_id, digits))
+            return PromotedRootSolveResult(
+                AuthenticatedRootSeal(
+                    leaf.job.root.omega, leaf.job.root.branch_id, "d" * 64
+                ),
+                precision_tier=f"BF{digits}",
+            )
+
+        class Backend(_Backend):
+            def fixed_root_survey_batch(self, job, **kwargs):
+                batch_calls.append((self.leaf.leaf_id, self.digits))
+                return super().fixed_root_survey_batch(job, **kwargs)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            result = run_promoted_survey(
+                self.plan,
+                selection,
+                checkpoint,
+                checkpoint_path=Path(temporary) / "checkpoint.json",
+                root_seal_lookup=lambda leaf, _entry: published.get(leaf.leaf_id),
+                root_seal_publish=lambda leaf, seal: published.__setitem__(
+                    leaf.leaf_id, seal
+                ),
+                backend_factory=lambda leaf, digits: Backend(
+                    leaf, digits, False, [], None
+                ),
+                primary_root_runner=root_runner,
+                horizon_runner=lambda _leaf: self.fail("unexpected horizon"),
+                produced_record_builder=lambda leaf, batch, screening, digits: (
+                    _record(leaf.leaf_id, digits)
+                ),
+            )
+
+        self.assertEqual(
+            [(first.leaf_id, 40), (incompatible.leaf_id, 40)], root_calls
+        )
+        self.assertEqual(
+            [
+                (first.leaf_id, 40),
+                (first.leaf_id, 80),
+                (incompatible.leaf_id, 40),
+                (incompatible.leaf_id, 80),
+            ],
+            batch_calls,
+        )
+        for leaf in (first, incompatible):
+            self.assertEqual(
+                1,
+                result.checkpoint["survey_pass_ledger"]["promoted"][leaf.leaf_id][
+                    "root_read_count"
+                ],
+            )
+
+    def test_static_guard_root_groups_require_publication_and_exact_key(self):
+        source_root = Path(__file__).parents[1] / "src" / "windows_solver"
+        survey_source = (source_root / "campaign_survey.py").read_text(
+            encoding="utf-8"
+        )
+        runtime_source = (source_root / "campaign_runtime.py").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("root_promotion_groups", survey_source)
+        self.assertIn("_ROOT_PROMOTION_ARITHMETIC_TIER", survey_source)
+        self.assertIn("ROOT_PROMOTION_GROUP_FINISHED", survey_source)
+        self.assertNotIn("else lambda _leaf, _seal: None", survey_source)
+        self.assertIn("source.leaf.mode == target.leaf.mode", runtime_source)
+        self.assertIn("source.job.spin == target.job.spin", runtime_source)
+
     def test_unexpected_error_is_durable_and_stops_before_next_queue_entry(self):
         started: list[str] = []
 
@@ -405,6 +591,9 @@ class PromotedSurveySchedulerTests(unittest.TestCase):
                         leaf.job.root.omega,
                         leaf.job.root.branch_id,
                         entry["source_root_seal_sha256"],
+                    ),
+                    root_seal_publish=lambda *_args: self.fail(
+                        "response promotion must not publish a root"
                     ),
                     backend_factory=broken_factory,
                     primary_root_runner=lambda *args: self.fail("unexpected root"),

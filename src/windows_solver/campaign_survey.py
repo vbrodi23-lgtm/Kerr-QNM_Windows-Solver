@@ -80,10 +80,12 @@ from .julia_response_backend import (
     JuliaRootReadoutResourceLimitError,
 )
 from .progress import ProgressEventKind, emit_progress, progress_scope
+from .root_evidence import RootDependencyKey
 from .structural_diagnostics import StructuralDiagnosticSession
 
 
 RecordValidator = Callable[[str, Mapping[str, object]], None]
+_ROOT_PROMOTION_ARITHMETIC_TIER = "root-promotion"
 
 
 @dataclass(frozen=True, slots=True)
@@ -231,6 +233,41 @@ class PromotedPassOutcome:
     evidence_receipts: tuple[Mapping[str, object], ...] = ()
     tier_timing: tuple[Mapping[str, object], ...] = ()
     session_fragments: tuple[Mapping[str, object], ...] = ()
+
+
+@dataclass(slots=True)
+class _RootPromotionGroup:
+    """One exact root dependency shared by pending ROOT queue entries."""
+
+    dependency_key: RootDependencyKey
+    canonical_primary_leaf_id: str
+    member_leaf_ids: tuple[str, ...]
+    root_solve_count: int = 0
+    publication_count: int = 0
+    attempted_tiers: set[str] = field(default_factory=set)
+    seal: AuthenticatedRootSeal | None = None
+    resolved_precision_tier: str | None = None
+    terminal_outcome: PromotedPassOutcome | None = None
+    status: str = "PENDING"
+
+    def reuse(self, seal: AuthenticatedRootSeal) -> None:
+        if self.seal is not None and self.seal != seal:
+            raise ValueError("SYSTEM_FAILURE ROOT_SEAL_CONFLICT")
+        self.seal = seal
+        if self.status == "PENDING":
+            self.status = "REUSED"
+
+    def publish(self, seal: AuthenticatedRootSeal, tier: str) -> None:
+        self.reuse(seal)
+        self.publication_count += 1
+        self.resolved_precision_tier = tier
+        self.status = "RESOLVED"
+
+    def fail(self, outcome: PromotedPassOutcome) -> None:
+        if self.terminal_outcome is not None and self.terminal_outcome != outcome:
+            raise ValueError("SYSTEM_FAILURE ROOT_PROMOTION_GROUP_CONFLICT")
+        self.terminal_outcome = outcome
+        self.status = outcome.disposition.value
 
 
 @dataclass(frozen=True, slots=True)
@@ -1312,6 +1349,7 @@ def _run_promoted_exterior_queue_entry(
     ],
     timing_recorder: TimingSessionRecorder,
     determinant_error_store: ReviewedDeterminantErrorStore | None,
+    root_promotion_group: _RootPromotionGroup | None,
 ) -> PromotedPassOutcome:
     queue_kind = PromotionQueueKind(entry["queue_kind"])
     seal = root_seal_lookup(leaf, entry)
@@ -1322,6 +1360,19 @@ def _run_promoted_exterior_queue_entry(
             raise ValueError("promoted response root seal digest mismatch")
         if seal.branch_identity != leaf.job.root.branch_id:
             raise ValueError("promoted response root seal branch mismatch")
+    elif root_promotion_group is not None:
+        if seal is not None:
+            root_promotion_group.reuse(seal)
+        elif root_promotion_group.terminal_outcome is not None:
+            return replace(
+                root_promotion_group.terminal_outcome,
+                root_read_count=0,
+                worker_launch_count=0,
+                tier_timing=(),
+                session_fragments=(),
+            )
+        elif root_promotion_group.seal is not None:
+            seal = root_promotion_group.seal
 
     tiers: list[str] = []
     receipts: list[Mapping[str, object]] = []
@@ -1332,6 +1383,15 @@ def _run_promoted_exterior_queue_entry(
         timing_recorder.start_tier(tier)
         backend = backend_factory(leaf, digits)
         if seal is None:
+            if (
+                root_promotion_group is not None
+                and tier in root_promotion_group.attempted_tiers
+            ):
+                timing_recorder.complete_tier()
+                continue
+            if root_promotion_group is not None:
+                root_promotion_group.attempted_tiers.add(tier)
+                root_promotion_group.root_solve_count += 1
             root_reads += 1
             worker_launches += 1
             try:
@@ -1360,6 +1420,8 @@ def _run_promoted_exterior_queue_entry(
                         root_read_count=root_reads,
                         worker_launch_count=worker_launches,
                     )
+                    if root_promotion_group is not None:
+                        root_promotion_group.fail(outcome)
                     timing_recorder.complete_tier()
                     return outcome
                 outcome = _terminal_promoted_outcome(
@@ -1369,6 +1431,8 @@ def _run_promoted_exterior_queue_entry(
                     root_read_count=root_reads,
                     worker_launch_count=worker_launches,
                 )
+                if root_promotion_group is not None:
+                    root_promotion_group.fail(outcome)
                 timing_recorder.complete_tier()
                 return outcome
             if not isinstance(root_result, PromotedRootSolveResult):
@@ -1379,6 +1443,8 @@ def _run_promoted_exterior_queue_entry(
             if seal.branch_identity != leaf.job.root.branch_id:
                 raise ValueError("promoted PRIMARY root seal branch mismatch")
             root_seal_publish(leaf, seal)
+            if root_promotion_group is not None:
+                root_promotion_group.publish(seal, tier)
 
         worker_launches += 1
         try:
@@ -1712,7 +1778,7 @@ def run_promoted_survey(
     ],
     root_seal_publish: Callable[
         [object, AuthenticatedRootSeal], None
-    ] | None = None,
+    ],
     determinant_error_store: ReviewedDeterminantErrorStore | None = None,
     solved_leaf_store: SolvedLeafStore | None = None,
     record_validator: RecordValidator | None = None,
@@ -1777,6 +1843,40 @@ def run_promoted_survey(
         for item in entries
         if item["disposition"] == PromotionQueueDisposition.PENDING.value
     )
+    root_group_members: dict[str, tuple[RootDependencyKey, set[str]]] = {}
+    for snapshot in entries:
+        if (
+            snapshot["disposition"] != PromotionQueueDisposition.PENDING.value
+            or snapshot["queue_kind"] != PromotionQueueKind.ROOT.value
+        ):
+            continue
+        leaf_id = str(snapshot["leaf_id"])
+        if leaf_id not in selection.scientific_identities or leaf_id not in leaves:
+            continue
+        key = RootDependencyKey.from_leaf(
+            leaves[leaf_id], arithmetic_tier=_ROOT_PROMOTION_ARITHMETIC_TIER
+        )
+        existing = root_group_members.get(key.sha256)
+        if existing is None:
+            root_group_members[key.sha256] = (key, {leaf_id})
+        else:
+            existing[1].add(leaf_id)
+    root_promotion_groups = {
+        digest: _RootPromotionGroup(
+            dependency_key=key,
+            canonical_primary_leaf_id=next(
+                leaf_id
+                for leaf_id in selection.ordered_leaf_ids
+                if leaf_id in members
+            ),
+            member_leaf_ids=tuple(
+                leaf_id
+                for leaf_id in selection.ordered_leaf_ids
+                if leaf_id in members
+            ),
+        )
+        for digest, (key, members) in root_group_members.items()
+    }
     for snapshot in entries:
         ordinal = int(snapshot["queue_ordinal"])
         if snapshot["disposition"] != PromotionQueueDisposition.PENDING.value:
@@ -1793,6 +1893,14 @@ def run_promoted_survey(
         if leaf_id in result["survey_pass_ledger"]["promoted"]:
             raise ValueError("pending promotion already has a pass disposition")
         leaf = leaves[leaf_id]
+        root_promotion_group = None
+        if snapshot["queue_kind"] == PromotionQueueKind.ROOT.value:
+            key = RootDependencyKey.from_leaf(
+                leaf, arithmetic_tier=_ROOT_PROMOTION_ARITHMETIC_TIER
+            )
+            root_promotion_group = root_promotion_groups.get(key.sha256)
+            if root_promotion_group is None:
+                raise ValueError("root promotion group is missing")
         leaf_context = {
             "leaf_index": selection.ordered_leaf_ids.index(leaf_id) + 1,
             "leaf_count": len(selection.ordered_leaf_ids),
@@ -1957,6 +2065,8 @@ def run_promoted_survey(
                 checkpoint_discovery.with_reused(1)
             )
         if retained is not None and not horizon_source_record:
+            if root_promotion_group is not None:
+                root_promotion_group.status = "SUPERSEDED_BY_CACHE"
             result = guarded(lambda: _commit_promoted_cache_reuse(
                 result,
                 leaf_id=leaf_id,
@@ -2042,16 +2152,13 @@ def run_promoted_survey(
                             leaf,
                             snapshot,
                             root_seal_lookup=root_seal_lookup,
-                            root_seal_publish=(
-                                root_seal_publish
-                                if root_seal_publish is not None
-                                else lambda _leaf, _seal: None
-                            ),
+                            root_seal_publish=root_seal_publish,
                             backend_factory=backend_factory,
                             primary_root_runner=primary_root_runner,
                             produced_record_builder=produced_record_builder,
                             timing_recorder=recorder,
                             determinant_error_store=determinant_error_store,
+                            root_promotion_group=root_promotion_group,
                         )
                 except BaseException:
                     if recorder.active_tier is not None:
@@ -2168,6 +2275,33 @@ def run_promoted_survey(
             total_leaf_seconds=sum(timing_by_tier.values()),
         ):
             emit_progress(ProgressEventKind.LEAF_PASS_DISPOSITION_RECORDED)
+    if diagnostic_session is not None:
+        for group in sorted(
+            root_promotion_groups.values(),
+            key=lambda item: item.dependency_key.sha256,
+        ):
+            diagnostic_session.append(
+                "ROOT_PROMOTION_GROUP_FINISHED",
+                leaf={"leaf_id": group.canonical_primary_leaf_id},
+                execution={"profile": "SURVEY", "pass": "promoted"},
+                connections={
+                    "root_dependency_key_sha256": group.dependency_key.sha256,
+                    "root_seal_sha256": (
+                        None if group.seal is None else group.seal.root_seal_sha256
+                    ),
+                },
+                compact_diagnostics={
+                    "root_dependency_key": group.dependency_key.to_mapping(),
+                    "canonical_primary_leaf_id": group.canonical_primary_leaf_id,
+                    "member_leaf_ids": list(group.member_leaf_ids),
+                    "member_leaf_count": len(group.member_leaf_ids),
+                    "root_solve_count": group.root_solve_count,
+                    "publication_count": group.publication_count,
+                    "resolved_precision_tier": group.resolved_precision_tier,
+                    "status": group.status,
+                },
+                durable=True,
+            )
     exhaustion = promoted_pass_exhaustion(
         result, selection, applicable_queue_ordinals
     )

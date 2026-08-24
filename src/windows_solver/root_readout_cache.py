@@ -35,7 +35,7 @@ ROOT_READOUT_CACHE_SCHEMA_VERSION = 2
 ROOT_READOUT_STORE_DIRECTORY_NAME = "root-readouts-" + "v" + str(
     ROOT_READOUT_CACHE_SCHEMA_VERSION
 )
-ROOT_EVIDENCE_STORE_DIRECTORY_NAME = "authenticated-root-evidence-v1"
+ROOT_EVIDENCE_STORE_DIRECTORY_NAME = "authenticated-root-evidence-v2"
 _HEX_64 = re.compile(r"[0-9a-f]{64}")
 _ENTRY_FIELDS = frozenset({
     "schema_version",
@@ -368,7 +368,7 @@ class RootEvidenceStore:
     @classmethod
     def for_checkpoint(cls, checkpoint_path: str | os.PathLike[str] | Path) -> "RootEvidenceStore":
         checkpoint = Path(checkpoint_path)
-        return cls(checkpoint.parent / f"{checkpoint.name}.root-evidence")
+        return cls(checkpoint.parent / f"{checkpoint.name}.root-evidence-v2")
 
     @classmethod
     def default(cls) -> "RootEvidenceStore":
