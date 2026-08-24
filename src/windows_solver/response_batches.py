@@ -8126,6 +8126,54 @@ def _validate_schema11_horizon_stage(
         )
     if observed_lineage != expected_lineage:
         raise ValueError("schema-11 horizon component lineage is invalid")
+    precision_tier = stage["precision_tier"]
+    if precision_tier == "binary64":
+        if (
+            result.component_scientific_identity
+            != "binary64-horizon-analytic-component/v1"
+            or result.response_method
+            != "binary64-fixed-root-horizon-response/v1"
+            or payload.get("evidence_kind")
+            != "package-owned-binary64-horizon-analytic-component"
+        ):
+            raise ValueError(
+                "schema-11 horizon precision tier component identity is invalid"
+            )
+    else:
+        promoted_methods = dict((
+            (
+                PROMOTED_HORIZON_COMPONENT_V2_IDENTITY,
+                PROMOTED_HORIZON_RESPONSE_METHOD_V2,
+            ),
+            (
+                PROMOTED_HORIZON_COMPONENT_V3_IDENTITY,
+                PROMOTED_HORIZON_RESPONSE_METHOD_V3,
+            ),
+        ))
+        if (
+            promoted_methods.get(result.component_scientific_identity)
+            != result.response_method
+            or payload.get("evidence_kind")
+            != "package-owned-julia-promoted-horizon-survey"
+        ):
+            raise ValueError(
+                "schema-11 horizon precision tier component identity is invalid"
+            )
+    expected_source_root_mapping = (
+        None
+        if leaf.job.source_root_mapping is None
+        else dict(leaf.job.source_root_mapping)
+    )
+    for readout in result.raw_readouts:
+        if (
+            readout.root_reference_id != leaf.job.root.root_reference_id
+            or readout.branch_id != leaf.job.root.branch_id
+            or readout.equation_id != leaf.job.equation_id
+            or readout.source_root_mapping != expected_source_root_mapping
+        ):
+            raise ValueError(
+                "schema-11 horizon component root readout identity is invalid"
+            )
     disk = stage["response_disk"]
     if result.response is None:
         if disk is not None:

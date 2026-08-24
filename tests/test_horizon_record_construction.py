@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+from decimal import Decimal
 import hashlib
 from dataclasses import replace
 from pathlib import Path
@@ -49,6 +50,14 @@ from windows_solver.response_batches import (
 )
 from windows_solver.response_engine import DeterminantPartials, NumericalPolicy
 from tests.test_native_campaign_backend import _result as native_component_result
+from tests.test_promoted_horizon_component import (
+    FakePromotedBackend,
+    _promoted_baseline,
+)
+from windows_solver.response_engine import (
+    DecimalComplex,
+    run_promoted_horizon_component,
+)
 
 
 def _sha256(value: object) -> str:
@@ -91,6 +100,34 @@ def _triggering_diagnostics() -> dict[str, object]:
         "diagnostic_ceiling_abs": 1.0,
         "denominator_or_calibration_disk_contains_zero": False,
     }
+
+
+def _binary64_horizon_outcome(plan, leaf) -> StageOutcome:
+    class Kernel:
+        identity = VettedNativeDeterminantKernel.identity
+
+        def horizon_partials(self, **_kwargs):
+            return DeterminantPartials(
+                frequency_derivative=1.0 + 0.25j,
+                coordinate_derivative=-0.5 + 0.1j,
+                simple_root_valid=True,
+            )
+
+        def evaluate_root(self, **_kwargs):
+            raise AssertionError("binary64 horizon entered root/ladders")
+
+    kernel = Kernel()
+    backend = NativeCampaignStageBackend(
+        SimpleNamespace(identity=kernel.identity, kernel=kernel),
+        PrecisionCapabilities((64,)),
+        SimpleNamespace(
+            record_artifact_ids=(),
+            path=Path("synthetic-gsn-cache"),
+            sha256="a" * 64,
+            parameter_pairs=(),
+        ),
+    )
+    return backend.execute_horizon_stage(leaf)
 
 
 class HorizonRecordConstructionTests(unittest.TestCase):
@@ -152,20 +189,7 @@ class HorizonRecordConstructionTests(unittest.TestCase):
             if item.role == "primary"
             and item.mechanism_id == "horizon-admittance"
         )
-        component = native_component_result(leaf.job, 0.25 + 0.1j)
-        payload = {
-            "evidence_kind": "synthetic-pr68-horizon-stage",
-            "result": component.to_mapping(),
-        }
-        outcome = StageOutcome(
-            digits=64,
-            numerical_state="CONVERGED",
-            component_result=payload,
-            local_disk_radius_abs=1.0e-6,
-            signed_error_channels=synthetic_stage_signed_error_channels(
-                payload, 1.0e-6
-            ),
-        )
+        outcome = _binary64_horizon_outcome(plan, leaf)
         stage, _stage_sha256 = build_schema11_horizon_stage(
             outcome,
             precision_tier="binary64",
@@ -203,6 +227,90 @@ class HorizonRecordConstructionTests(unittest.TestCase):
                     response_batches.validate_schema11_horizon_record(
                         plan, leaf, tampered
                     )
+
+    def test_horizon_validator_rejects_foreign_root_readout_identity(self) -> None:
+        plan = _plan()
+        leaf = next(
+            item
+            for item in plan.leaves
+            if item.role == "primary"
+            and item.mechanism_id == "horizon-admittance"
+        )
+        outcome = _binary64_horizon_outcome(plan, leaf)
+        stage, _stage_sha256 = build_schema11_horizon_stage(
+            outcome,
+            precision_tier="binary64",
+            operation_identity="test-binary64-horizon/v1",
+        )
+        record = build_schema11_horizon_record(
+            plan,
+            leaf,
+            stages=(stage,),
+            retained_centre=stage["response_disk"]["centre"],
+            state="PRODUCED",
+        )
+
+        for readout_field in ("root_reference_id", "branch_id", "equation_id"):
+            tampered = copy.deepcopy(record)
+            tampered_stage = tampered["stages"][0]
+            tampered_stage["component_result"]["result"]["baseline"][
+                readout_field
+            ] = f"foreign-{readout_field}"
+            stage_content = {
+                key: value
+                for key, value in tampered_stage.items()
+                if key != "stage_sha256"
+            }
+            tampered_stage["stage_sha256"] = _sha256(stage_content)
+            record_content = {
+                key: value
+                for key, value in tampered.items()
+                if key != "record_sha256"
+            }
+            tampered["record_sha256"] = _sha256(record_content)
+
+            with self.subTest(readout_field=readout_field):
+                with self.assertRaisesRegex(ValueError, "readout"):
+                    response_batches.validate_schema11_horizon_record(
+                        plan, leaf, tampered
+                    )
+
+    def test_horizon_validator_rejects_generic_component_labeled_bf80(self) -> None:
+        plan = _plan()
+        leaf = next(
+            item
+            for item in plan.leaves
+            if item.role == "primary"
+            and item.mechanism_id == "horizon-admittance"
+        )
+        component = native_component_result(leaf.job, 0.25 + 0.1j)
+        payload = {
+            "evidence_kind": "generic-native-component",
+            "result": component.to_mapping(),
+        }
+        outcome = StageOutcome(
+            digits=80,
+            numerical_state="CONVERGED",
+            component_result=payload,
+            local_disk_radius_abs=1.0e-6,
+            signed_error_channels=synthetic_stage_signed_error_channels(
+                payload, 1.0e-6
+            ),
+        )
+        stage, _stage_sha256 = build_schema11_horizon_stage(
+            outcome,
+            precision_tier="BF80",
+            operation_identity="test-promoted-horizon/v1",
+        )
+
+        with self.assertRaisesRegex(ValueError, "precision tier"):
+            build_schema11_horizon_record(
+                plan,
+                leaf,
+                stages=(stage,),
+                retained_centre=stage["response_disk"]["centre"],
+                state="PRODUCED",
+            )
 
     def test_trigger_receipt_rejects_stage_outcome_payload_mismatch(self) -> None:
         plan = _plan()
@@ -368,20 +476,7 @@ class HorizonRecordConstructionTests(unittest.TestCase):
                 )
             },
         )
-        component = native_component_result(leaf.job, 0.25 + 0.1j)
-        payload = {
-            "evidence_kind": "native-task-008-component-engine",
-            "result": component.to_mapping(),
-        }
-        stage_outcome = StageOutcome(
-            digits=64,
-            numerical_state="CONVERGED",
-            component_result=payload,
-            local_disk_radius_abs=1.0e-6,
-            signed_error_channels=synthetic_stage_signed_error_channels(
-                payload, 1.0e-6
-            ),
-        )
+        stage_outcome = _binary64_horizon_outcome(plan, leaf)
         stage, stage_sha256 = build_schema11_horizon_stage(
             stage_outcome,
             precision_tier="binary64",
@@ -479,20 +574,7 @@ class HorizonRecordConstructionTests(unittest.TestCase):
                 )
             },
         )
-        component = native_component_result(leaf.job, 0.25 + 0.1j)
-        payload = {
-            "evidence_kind": "native-task-008-component-engine",
-            "result": component.to_mapping(),
-        }
-        stage_outcome = StageOutcome(
-            digits=64,
-            numerical_state="CONVERGED",
-            component_result=payload,
-            local_disk_radius_abs=1.0e-6,
-            signed_error_channels=synthetic_stage_signed_error_channels(
-                payload, 1.0e-6
-            ),
-        )
+        stage_outcome = _binary64_horizon_outcome(plan, leaf)
         stage, stage_sha256 = build_schema11_horizon_stage(
             stage_outcome,
             precision_tier="binary64",
@@ -585,20 +667,7 @@ class HorizonRecordConstructionTests(unittest.TestCase):
             if item.role == "primary"
             and item.mechanism_id == "horizon-admittance"
         )
-        component = native_component_result(leaf.job, 0.25 + 0.1j)
-        payload = {
-            "evidence_kind": "native-task-008-component-engine",
-            "result": component.to_mapping(),
-        }
-        stage_outcome = StageOutcome(
-            digits=64,
-            numerical_state="CONVERGED",
-            component_result=payload,
-            local_disk_radius_abs=1.0e-6,
-            signed_error_channels=synthetic_stage_signed_error_channels(
-                payload, 1.0e-6
-            ),
-        )
+        stage_outcome = _binary64_horizon_outcome(plan, leaf)
         stage, stage_sha256 = build_schema11_horizon_stage(
             stage_outcome,
             precision_tier="binary64",
@@ -650,19 +719,8 @@ class HorizonRecordConstructionTests(unittest.TestCase):
             and item.leaf_id
             in set(B_PRIME_RELEASE_DOMAIN.fixed_precision_sentinel_leaf_ids)
         )
-        component = native_component_result(leaf.job, 0.25 + 0.1j)
-        payload = {
-            "evidence_kind": "native-task-008-component-engine",
-            "result": component.to_mapping(),
-        }
-        stage_outcome = StageOutcome(
-            digits=64,
-            numerical_state="CONVERGED",
-            component_result=payload,
-            local_disk_radius_abs=1.0e-6,
-            signed_error_channels=synthetic_stage_signed_error_channels(
-                payload, 1.0e-6
-            ),
+        stage_outcome = replace(
+            _binary64_horizon_outcome(plan, leaf),
             deep_diagnostics=_triggering_diagnostics(),
         )
         stage, stage_sha256 = build_schema11_horizon_stage(
@@ -683,7 +741,18 @@ class HorizonRecordConstructionTests(unittest.TestCase):
             plan, leaf, stage_outcome, stage
         )
         self.assertTrue(trigger_receipt["promotion_required"])
-        bf80_component = native_component_result(leaf.job, 0.25 + 0.1j)
+        bf80_component = run_promoted_horizon_component(
+            leaf.job,
+            FakePromotedBackend(
+                leaf.job,
+                _promoted_baseline(
+                    leaf.job,
+                    omega=leaf.job.root.omega,
+                    derivative=DecimalComplex(Decimal("1"), Decimal("0.25")),
+                ),
+            ),
+            leaf.job.root.omega,
+        )
 
         class Backend:
             def _julia_precision_backend_for(self, *_args):
