@@ -660,6 +660,9 @@ $record = $SolverArguments | ConvertTo-Json -Compress
     $record + [Environment]::NewLine,
     [System.Text.UTF8Encoding]::new($false)
 )
+if ($SolverArguments[0] -eq "campaign-prepare-resources") {
+    exit 0
+}
 if ($SolverArguments[0] -eq "campaign-plan") {
     '{"role_counts":{"primary":140,"control":24,"deep":48},"leaf_count":212}'
     exit 0
@@ -848,6 +851,9 @@ $record = $SolverArguments | ConvertTo-Json -Compress
     $record + [Environment]::NewLine,
     [System.Text.UTF8Encoding]::new($false)
 )
+if ($SolverArguments[0] -eq "campaign-prepare-resources") {
+    exit 0
+}
 if ($SolverArguments[0] -eq "campaign-plan") {
     '{"role_counts":{"primary":140,"control":24,"deep":48},"leaf_count":212}'
     exit 0
@@ -904,7 +910,7 @@ exit 0
             for call in calls:
                 self.assertTrue(Path(call[1]).samefile(selection_path))
                 call[1] = str(selection_path)
-            for call in calls[1:]:
+            for call in calls[2:]:
                 checkpoint_index = call.index("--checkpoint") + 1
                 self.assertTrue(
                     Path(call[checkpoint_index]).samefile(checkpoint_path)
@@ -916,6 +922,10 @@ exit 0
         self.assertEqual(
             calls,
             [
+                [
+                    "campaign-prepare-resources",
+                    selection,
+                ],
                 [
                     "campaign-plan",
                     selection,

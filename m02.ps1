@@ -148,6 +148,10 @@ if (-not [string]::IsNullOrWhiteSpace($QueuePath)) {
 
 Push-Location $PackageRoot
 try {
+    Invoke-M02Command -Arguments @(
+        "campaign-prepare-resources",
+        $SelectionPath
+    ) | Out-Null
     if ($NewCampaign) {
         Invoke-M02Command -Arguments @(
             "campaign-new",

@@ -91,18 +91,23 @@ For the current checkout it should resolve to the declared full-role campaign. T
 Inspect the current plan before execution:
 
 ```powershell
-.\solver.ps1 campaign-plan .\examples\m02-campaign.json --profile survey
+.\solver.ps1 campaign-plan .\examples\m02-campaign.json
 ```
 
-Prepare the selection-scoped GSN resources before the first binary64 pass:
+`m02.ps1` prepares the selection-scoped GSN resources automatically, on every
+cold start and every resume, before it invokes any pass. That step is
+equivalent to running the underlying command directly:
 
 ```powershell
 .\solver.ps1 campaign-prepare-resources .\examples\m02-campaign.json
 ```
 
 Resource preparation may invoke Julia and writes the sealed resource receipt.
-Campaign execution is load-only: if that receipt or its files are absent,
-stale, or corrupt, the pass stops with `GSN_BOOTSTRAP_REQUIRED` before leaf 1.
+Campaign execution itself is load-only: if that receipt or its files are
+absent, stale, or corrupt, the pass stops with `GSN_BOOTSTRAP_REQUIRED` before
+leaf 1. You do not need to run the command above yourself before `m02.ps1
+-NewCampaign`; it is shown here only for operators driving `solver.ps1`
+directly instead of through `m02.ps1`.
 
 ### Start a new campaign
 

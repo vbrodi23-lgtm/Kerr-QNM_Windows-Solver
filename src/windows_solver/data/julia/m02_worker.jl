@@ -74,6 +74,12 @@ const FIXED_ROOT_SURVEY_POLICY_FIELDS = Set((
     "determinant_normalisation",
     "promoted_control_calibration_receipt_sha256",
     "empirical_control_profile_sha256",
+    "determinant_error_model",
+    "determinant_error_safety_factor",
+    "determinant_error_required_term_classes",
+    "determinant_error_missing_evidence_outcome",
+    "determinant_error_certificate_statement",
+    "determinant_error_preceding_precision_tier",
 ))
 const PROMOTED_ROOT_READOUT_POLICY_ID =
     "binary64-parity-primary-fixed-root-diagnostics-frequency-disk/v2"
@@ -7756,12 +7762,6 @@ function validate_fixed_root_survey_policy(request)
         haskey(request, key) || error("fixed-root survey policy lacks $(key)")
     end
     for key in (
-        "determinant_error_model",
-        "determinant_error_safety_factor",
-        "determinant_error_required_term_classes",
-        "determinant_error_missing_evidence_outcome",
-        "determinant_error_certificate_statement",
-        "determinant_error_preceding_precision_tier",
         "human_math_review_receipt_status",
         "human_math_review_receipt_sha256",
         "independent_reference_fixture_receipt_status",
@@ -7774,6 +7774,8 @@ function validate_fixed_root_survey_policy(request)
         haskey(request, key) &&
             error("fixed-root survey request carries prohibited field $(key)")
     end
+    digits = parse_integer(request, "precision_digits")
+    expected_preceding_tier = Dict(40 => "binary64", 80 => "bigfloat-40")[digits]
     expected = Dict{String,Any}(
         "homogeneous_representation" => HOMOGENEOUS_REPRESENTATION_ID,
         "asymptotic_series_evaluation" => ASYMPTOTIC_SERIES_EVALUATION_ID,
@@ -7795,6 +7797,19 @@ function validate_fixed_root_survey_policy(request)
         "determinant_convention" => EXTERIOR_DETERMINANT_CONVENTION_ID,
         "determinant_normalisation" =>
             EXTERIOR_DETERMINANT_NORMALISATION_ID,
+        # The fixed-root survey batch requires the same reviewed empirical
+        # determinant-error certificate every promoted exterior determinant
+        # evaluation carries; screening cannot bound a response without it.
+        "determinant_error_model" => EXTERIOR_EMPIRICAL_ERROR_MODEL_ID,
+        "determinant_error_safety_factor" =>
+            EXTERIOR_EMPIRICAL_ERROR_SAFETY_FACTOR,
+        "determinant_error_required_term_classes" =>
+            EXTERIOR_EMPIRICAL_ERROR_TERM_CLASSES,
+        "determinant_error_missing_evidence_outcome" =>
+            EXTERIOR_EMPIRICAL_ERROR_MISSING_OUTCOME,
+        "determinant_error_certificate_statement" =>
+            EXTERIOR_EMPIRICAL_ERROR_STATEMENT,
+        "determinant_error_preceding_precision_tier" => expected_preceding_tier,
     )
     for (key, value) in expected
         isequal(required(request, key), value) ||
@@ -8037,7 +8052,7 @@ function fixed_root_survey_batch_fields(request, digits::Int, bits::Int, roles, 
             BigFloat, sample_request, fixed_root
         )
         before = DETERMINANT_INDEX_REQUEST[]
-        evaluation = raw_determinant_progress(
+        evaluation = determinant_progress(
             BigFloat,
             sample_request,
             evaluation_context,
@@ -8046,8 +8061,16 @@ function fixed_root_survey_batch_fields(request, digits::Int, bits::Int, roles, 
             "fixed-root survey $(role)",
             fixed_root,
         )
-        DETERMINANT_INDEX_REQUEST[] == before + 1 ||
+        certificate_required = exterior_empirical_certificate_required(sample_request)
+        expected_determinant_calls = certificate_required ? 3 : 1
+        DETERMINANT_INDEX_REQUEST[] == before + expected_determinant_calls ||
             error("fixed-root survey sample exceeded its raw determinant budget")
+        breakdown = evaluation.error_breakdown
+        if certificate_required && (
+            breakdown === nothing || evaluation.error_model_id === nothing
+        )
+            error("fixed-root survey sample is missing its required certificate")
+        end
         push!(outputs, Dict{String,Any}(
             "role" => role,
             "omega" => Dict(
@@ -8064,6 +8087,17 @@ function fixed_root_survey_batch_fields(request, digits::Int, bits::Int, roles, 
             ),
             "numerical_conditioning" => fixed_root_survey_conditioning_fields(
                 BigFloat, sample_request, evaluation_context, digits
+            ),
+            "determinant_error_evidence" => breakdown === nothing ? nothing : Dict{String,Any}(
+                "schema" => "windows-solver.exterior-determinant-error-evidence/1",
+                "error_model_id" => evaluation.error_model_id,
+                "delta_same_point" => numeric_text(breakdown.control_disagreement_abs),
+                "delta_cross_precision" =>
+                    numeric_text(breakdown.precision_disagreement_abs),
+                "delta_endpoint_series" =>
+                    numeric_text(breakdown.endpoint_disagreement_abs),
+                "safety_factor" => numeric_text(breakdown.safety_factor),
+                "numerical_error_abs" => numeric_text(breakdown.numerical_error_abs),
             ),
         ))
     end

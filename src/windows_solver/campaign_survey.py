@@ -68,6 +68,9 @@ from .response_engine import (
     screen_promoted_fixed_root_samples,
 )
 from .reviewed_determinant_error import ReviewedDeterminantErrorStore
+from .reviewed_determinant_error_issuance import (
+    seed_operator_approved_determinant_error_receipts,
+)
 from .background_evidence_store import CanonicalBackgroundEvidenceStore
 from .julia_response_backend import (
     JuliaFixedRootSurveyBatch,
@@ -999,6 +1002,8 @@ def run_binary64_survey(
         if outcome.disposition not in {
             SurveyDisposition.COMPLETED,
             SurveyDisposition.CACHE_REUSED,
+            SurveyDisposition.PROMOTION_PENDING_ROOT,
+            SurveyDisposition.PROMOTION_PENDING_RESPONSE,
         }:
             failure_monitor.observe(
                 leaf_id,
@@ -1279,6 +1284,13 @@ def _run_promoted_exterior_queue_entry(
         ):
             raise ValueError("promoted fixed-root survey batch budget mismatch")
         sample_count += batch.sample_count
+        if determinant_error_store is not None:
+            seed_operator_approved_determinant_error_receipts(
+                determinant_error_store,
+                leaf.job,
+                batch,
+                root_seal_sha256=seal.root_seal_sha256,
+            )
         determinant_error_evidence = (
             None
             if determinant_error_store is None

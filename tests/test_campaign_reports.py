@@ -14,6 +14,7 @@ from unittest.mock import patch
 
 from windows_solver.campaign_reports import (
     CampaignReportModel,
+    _derive_projective_triage_projection,
     _root_correction_tolerance_for_precision,
     refresh_campaign_reports,
 )
@@ -760,6 +761,113 @@ class CampaignReportTests(unittest.TestCase):
                 self.assertEqual(
                     "FAILED", status[failure_kind]["status"]
                 )
+
+
+class ProjectiveTriageProjectionTests(unittest.TestCase):
+    """No hand-authored glue file: triage derives row-to-leaf projection
+    automatically from the authenticated projective reduction."""
+
+    @staticmethod
+    def _row(row_id, left, right):
+        return SimpleNamespace(
+            row_id=row_id, left_component_ids=left, right_component_ids=right
+        )
+
+    @staticmethod
+    def _result(row_id, *, interval, outcome):
+        return SimpleNamespace(
+            row_id=row_id,
+            bounded_angle_interval_radians=interval,
+            projective_outcome=outcome,
+        )
+
+    def test_leaf_lower_bound_is_the_minimum_across_its_complete_rows(self):
+        reduction = SimpleNamespace(
+            plans=(
+                self._row("row-a", ("leaf-1",), ("leaf-2",)),
+                self._row("row-b", ("leaf-1",), ("leaf-3",)),
+            ),
+            results=(
+                self._result(
+                    "row-a", interval=(0.5, 0.6), outcome="SEPARATED"
+                ),
+                self._result(
+                    "row-b",
+                    interval=(0.1, 0.2),
+                    outcome="EQUIVALENT_WITHIN_TOLERANCE",
+                ),
+            ),
+        )
+
+        projections = _derive_projective_triage_projection(
+            reduction, selected_leaf_ids=("leaf-1", "leaf-2", "leaf-3")
+        )
+
+        self.assertEqual((0.1, True), projections["leaf-1"])
+        self.assertEqual((0.5, True), projections["leaf-2"])
+        self.assertEqual((0.1, False), projections["leaf-3"])
+
+    def test_incomplete_row_is_excluded_never_zero_never_safe(self):
+        reduction = SimpleNamespace(
+            plans=(
+                self._row("row-a", ("leaf-1",), ("leaf-2",)),
+                self._row("row-b", ("leaf-1",), ("leaf-3",)),
+            ),
+            results=(
+                self._result("row-a", interval=None, outcome=None),
+                self._result(
+                    "row-b", interval=None, outcome="UNRESOLVED"
+                ),
+            ),
+        )
+
+        projections = _derive_projective_triage_projection(
+            reduction, selected_leaf_ids=("leaf-1", "leaf-2", "leaf-3")
+        )
+
+        lower, controls = projections["leaf-1"]
+        self.assertIsNone(lower)
+        self.assertIs(controls, False)
+
+    def test_mixed_complete_and_incomplete_rows_ignore_the_incomplete_one(self):
+        reduction = SimpleNamespace(
+            plans=(
+                self._row("row-a", ("leaf-1",), ("leaf-2",)),
+                self._row("row-b", ("leaf-1",), ("leaf-3",)),
+            ),
+            results=(
+                self._result("row-a", interval=None, outcome="UNRESOLVED"),
+                self._result(
+                    "row-b",
+                    interval=(0.3, 0.4),
+                    outcome="EQUIVALENT_WITHIN_TOLERANCE",
+                ),
+            ),
+        )
+
+        projections = _derive_projective_triage_projection(
+            reduction, selected_leaf_ids=("leaf-1", "leaf-2", "leaf-3")
+        )
+
+        self.assertEqual((0.3, False), projections["leaf-1"])
+
+    def test_unselected_leaves_are_omitted(self):
+        reduction = SimpleNamespace(
+            plans=(self._row("row-a", ("leaf-1",), ("leaf-2",)),),
+            results=(
+                self._result(
+                    "row-a",
+                    interval=(0.1, 0.2),
+                    outcome="EQUIVALENT_WITHIN_TOLERANCE",
+                ),
+            ),
+        )
+
+        projections = _derive_projective_triage_projection(
+            reduction, selected_leaf_ids=("leaf-1",)
+        )
+
+        self.assertEqual({"leaf-1"}, set(projections))
 
 
 if __name__ == "__main__":

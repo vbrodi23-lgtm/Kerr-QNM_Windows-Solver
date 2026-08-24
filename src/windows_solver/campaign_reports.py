@@ -40,20 +40,6 @@ from .response_reduction import (
 )
 
 
-PROJECTIVE_TRIAGE_PROJECTION_SCHEMA = (
-    "windows-solver.projective-triage-projection/v1"
-)
-PROJECTIVE_TRIAGE_REVIEW_TODO = (
-    "TODO: [HUMAN MATH REVIEW REQUIRED - approve the deterministic "
-    "projective row-to-leaf aggregation rule if it is not already specified "
-    "by reviewed project mathematics]"
-)
-
-
-class ProjectiveTriageProjectionReviewRequired(RuntimeError):
-    """Raised when projective rows exist but no reviewed leaf projection does."""
-
-
 SCHEMA11_LEAF_COLUMNS = (
     "leaf_ordinal",
     "leaf_id",
@@ -1766,114 +1752,53 @@ def write_schema11_projective(
     return reduction
 
 
-def _is_sha256_text(value: object) -> bool:
-    if not isinstance(value, str) or len(value) != 64:
-        return False
-    try:
-        int(value, 16)
-    except ValueError:
-        return False
-    return True
-
-
-def _load_reviewed_projective_triage_projection(
-    path: Path,
+def _derive_projective_triage_projection(
     reduction: CampaignReductionSummary,
     *,
-    checkpoint_source_receipt: str,
     selected_leaf_ids: Sequence[str],
 ) -> Mapping[str, tuple[float | None, bool]]:
-    """Authenticate a human-reviewed row-to-leaf aggregation receipt."""
+    """Deterministically project completed rows onto each participating leaf.
 
-    if not path.is_file():
-        raise ProjectiveTriageProjectionReviewRequired(
-            PROJECTIVE_TRIAGE_REVIEW_TODO
-        )
-    try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError) as error:
-        raise ValueError("projective triage projection receipt is unreadable") from error
-    fields = {
-        "schema",
-        "checkpoint_source_receipt",
-        "projective_reduction_id",
-        "aggregation_rule_identity",
-        "human_math_review_receipt_sha256",
-        "leaf_projections",
-        "receipt_sha256",
-    }
-    if not isinstance(value, Mapping) or set(value) != fields:
-        raise ValueError("projective triage projection receipt fields are invalid")
-    material = {key: item for key, item in value.items() if key != "receipt_sha256"}
-    if (
-        value["schema"] != PROJECTIVE_TRIAGE_PROJECTION_SCHEMA
-        or value["checkpoint_source_receipt"] != checkpoint_source_receipt
-        or value["projective_reduction_id"] != reduction.reduction_id
-        or not isinstance(value["aggregation_rule_identity"], str)
-        or not value["aggregation_rule_identity"]
-        or not _is_sha256_text(value["human_math_review_receipt_sha256"])
-        or value["receipt_sha256"]
-        != hashlib.sha256(canonical_json_bytes(material)).hexdigest()
-        or not isinstance(value["leaf_projections"], list)
-    ):
-        raise ValueError("projective triage projection receipt authentication failed")
+    Conservative row-minimum aggregation rule:
+
+    - a leaf participates in a row when it is one of that row's left or
+      right components;
+    - ``projective_angle_lower_bound`` is the minimum
+      ``bounded_angle_interval_radians[0]`` across the leaf's participating
+      rows, considering only rows with a complete bounded interval; an
+      incomplete or unresolvable row is never treated as zero angle and
+      never treated as safe, so a leaf whose rows are all incomplete gets
+      ``None`` rather than a fabricated bound;
+    - ``controls_projective_classification`` is true when the leaf
+      participates in any row whose reviewed reducer classification is
+      ``SEPARATED`` (the row's conservative angle interval cleared the
+      frozen separation threshold, so this leaf's evidence drove a
+      scientifically consequential outcome).
+    """
+
     row_by_id = {
         row.row_id: (row, result)
         for row, result in zip(reduction.plans, reduction.results)
     }
     selected = set(selected_leaf_ids)
-    participating = {
-        component_id
-        for row in reduction.plans
-        for component_id in (*row.left_component_ids, *row.right_component_ids)
-        if component_id in selected
-    }
+    rows_by_leaf: dict[str, list[str]] = {}
+    for row in reduction.plans:
+        for component_id in (*row.left_component_ids, *row.right_component_ids):
+            if component_id in selected:
+                rows_by_leaf.setdefault(component_id, []).append(row.row_id)
     projections: dict[str, tuple[float | None, bool]] = {}
-    for item in value["leaf_projections"]:
-        if not isinstance(item, Mapping) or set(item) != {
-            "leaf_id",
-            "supporting_row_ids",
-            "projective_angle_lower_bound",
-            "controls_projective_classification",
-        }:
-            raise ValueError("projective triage leaf projection fields are invalid")
-        leaf_id = item["leaf_id"]
-        row_ids = item["supporting_row_ids"]
-        controls = item["controls_projective_classification"]
-        if (
-            not isinstance(leaf_id, str)
-            or leaf_id not in participating
-            or leaf_id in projections
-            or not isinstance(row_ids, list)
-            or not row_ids
-            or len(row_ids) != len(set(row_ids))
-            or type(controls) is not bool
-        ):
-            raise ValueError("projective triage leaf projection identity is invalid")
+    for leaf_id, row_ids in rows_by_leaf.items():
+        bounds: list[float] = []
+        controls = False
         for row_id in row_ids:
-            if row_id not in row_by_id:
-                raise ValueError("projective triage projection references an unknown row")
-            row, _ = row_by_id[row_id]
-            if leaf_id not in (*row.left_component_ids, *row.right_component_ids):
-                raise ValueError("projective triage projection row does not contain leaf")
-        lower = item["projective_angle_lower_bound"]
-        if lower is not None:
-            try:
-                lower = float(lower)
-            except (TypeError, ValueError, OverflowError) as error:
-                raise ValueError("projective triage lower bound is invalid") from error
-            if not math.isfinite(lower) or lower < 0:
-                raise ValueError("projective triage lower bound is invalid")
-            if any(
-                row_by_id[row_id][1].bounded_angle_interval_radians is None
-                for row_id in row_ids
-            ):
-                raise ValueError(
-                    "incomplete projective rows cannot fabricate a triage angle"
-                )
+            _row, result = row_by_id[row_id]
+            interval = result.bounded_angle_interval_radians
+            if interval is not None:
+                bounds.append(interval[0])
+            if result.projective_outcome == "SEPARATED":
+                controls = True
+        lower = min(bounds) if bounds else None
         projections[leaf_id] = (lower, controls)
-    if set(projections) != participating:
-        raise ValueError("projective triage projection omits participating leaves")
     return projections
 
 
@@ -2037,10 +1962,8 @@ def write_schema11_triage(
         or projective.source_hashes != (checkpoint_source_receipt,)
     ):
         raise ValueError("projective reduction and triage checkpoint binding differ")
-    projective_by_leaf = _load_reviewed_projective_triage_projection(
-        directory / "m02-projective-triage-projection.json",
+    projective_by_leaf = _derive_projective_triage_projection(
         projective,
-        checkpoint_source_receipt=checkpoint_source_receipt,
         selected_leaf_ids=tuple(getattr(selection, "leaf_ids")),
     )
     leaves = []

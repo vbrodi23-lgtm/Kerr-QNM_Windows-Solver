@@ -104,7 +104,13 @@ class Binary64SurveySchedulerTests(unittest.TestCase):
             reason_code="BOUNDED_HORIZON_RESPONSE",
         )
 
-    def test_repeated_unbounded_exterior_failure_aborts_before_third_leaf(self) -> None:
+    def test_mass_response_promotion_never_trips_the_repetition_breaker(self) -> None:
+        """Every exterior leaf legitimately needing RESPONSE promotion must
+        queue normally; PROMOTION_PENDING_RESPONSE is scheduler state, not
+        failure-monitor evidence, and must never arm the repetition breaker
+        (governing contract §5, invariant: normal promotion is not failure).
+        """
+
         backend = _AnalyticBackend()
         backend_constructions = 0
 
@@ -120,37 +126,40 @@ class Binary64SurveySchedulerTests(unittest.TestCase):
                 canonical_background_sha256=background.sha256,
             )
 
+        exterior_leaf_ids = {
+            leaf.leaf_id for leaf in self.plan.leaves
+            if leaf.mechanism_id != "horizon-admittance"
+        }
+        self.assertGreater(len(exterior_leaf_ids), 2)
+
         with tempfile.TemporaryDirectory() as temporary:
             checkpoint_path = Path(temporary) / "checkpoint.json"
-            with self.assertRaises(CampaignSystemFailure) as raised:
-                run_binary64_survey(
-                    self.plan,
-                    self.selection,
-                    empty_schema11_checkpoint(
-                        self.selection.campaign_id, self.selection.selection_id
+            result = run_binary64_survey(
+                self.plan,
+                self.selection,
+                empty_schema11_checkpoint(
+                    self.selection.campaign_id, self.selection.selection_id
+                ),
+                checkpoint_path=checkpoint_path,
+                root_seal_lookup=lambda leaf: AuthenticatedRootSeal(
+                    fixed_root=leaf.job.root.omega,
+                    branch_identity=leaf.job.root.branch_id,
+                    root_seal_sha256=_sha256(
+                        {"root_identity": leaf.job.root.identity_sha256}
                     ),
-                    checkpoint_path=checkpoint_path,
-                    root_seal_lookup=lambda leaf: AuthenticatedRootSeal(
-                        fixed_root=leaf.job.root.omega,
-                        branch_identity=leaf.job.root.branch_id,
-                        root_seal_sha256=_sha256(
-                            {"root_identity": leaf.job.root.identity_sha256}
-                        ),
-                    ),
-                    native_backend_factory=backend_factory,
-                    horizon_runner=self._horizon_outcome,
-                    produced_record_builder=lambda leaf, batch, screening: _record(
-                        leaf.leaf_id, screening.response_disk.centre
-                    ),
-                    equivalence_receipt_lookup=equivalence,
-                )
+                ),
+                native_backend_factory=backend_factory,
+                horizon_runner=self._horizon_outcome,
+                produced_record_builder=lambda leaf, batch, screening: _record(
+                    leaf.leaf_id, screening.response_disk.centre
+                ),
+                equivalence_receipt_lookup=equivalence,
+            )
 
-            durable = raised.exception.checkpoint
-            self.assertEqual(1, backend_constructions)
-            self.assertEqual(0, backend.julia_launches)
-            self.assertEqual(0, backend.root_reads)
+            durable = result.checkpoint
+            self.assertEqual([], durable["system_failures"])
             queued = durable["promotion_queue"]["entries"]
-            self.assertEqual(2, len(queued))
+            self.assertEqual(len(exterior_leaf_ids), len(queued))
             self.assertTrue(all(
                 entry["queue_kind"] == "RESPONSE"
                 and entry["reason_code"]
@@ -158,26 +167,9 @@ class Binary64SurveySchedulerTests(unittest.TestCase):
                 for entry in queued
             ))
             self.assertEqual(
-                "REPEATED_LEAF_FAILURE_FINGERPRINT",
-                durable["system_failures"][-1]["failure_code"],
+                exterior_leaf_ids, {entry["leaf_id"] for entry in queued}
             )
-            ledger = durable["survey_pass_ledger"]["binary64"]
-            self.assertTrue(
-                all(entry["worker_launch_count"] == 0 for entry in ledger.values())
-            )
-            queued_leaf_ids = {entry["leaf_id"] for entry in queued}
-            exterior_entries = [ledger[leaf_id] for leaf_id in queued_leaf_ids]
-            self.assertEqual(
-                {4, 9}, {entry["sample_count"] for entry in exterior_entries}
-            )
-            exterior_timing = [
-                entry["tier_timing"] for entry in exterior_entries
-            ]
-            self.assertTrue(all(
-                timing and timing[0]["tier"] == "binary64"
-                and timing[0]["source"] == "direct"
-                for timing in exterior_timing
-            ))
+            self.assertEqual(result.queued_count, len(exterior_leaf_ids))
             self.assertTrue(checkpoint_path.is_file())
 
     def test_typed_response_insufficiency_queues_and_advances_without_promotion(self) -> None:
