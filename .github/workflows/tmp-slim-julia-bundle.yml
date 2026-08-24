@@ -1,4 +1,4 @@
-name: Temporary slim M02 Julia bundle probe
+name: Temporary full-install M02 Julia trace/prune
 
 on:
   push:
@@ -20,150 +20,267 @@ jobs:
           version: '1.10.11'
           arch: x64
 
-      - name: Build staged slim source tree
+      - name: Stage exact current M02 Julia environment
         shell: bash
         run: |
           set -euxo pipefail
-          STAGE="$RUNNER_TEMP/m02-slim"
+          STAGE="$RUNNER_TEMP/m02-full"
+          FULL_DEPOT="$RUNNER_TEMP/m02-full-depot"
+          PRUNED_DEPOT="$RUNNER_TEMP/m02-pruned-depot"
+          TRACE_DIR="$RUNNER_TEMP/m02-traces"
           python tools/build_slim_m02_julia_probe.py "$STAGE"
-          echo "STAGE=$STAGE" >> "$GITHUB_ENV"
-          echo "ONLINE_DEPOT=$RUNNER_TEMP/m02-online-depot" >> "$GITHUB_ENV"
-          echo "OFFLINE_DEPOT=$RUNNER_TEMP/m02-offline-depot" >> "$GITHUB_ENV"
+          mkdir -p "$FULL_DEPOT" "$TRACE_DIR"
+          {
+            echo "STAGE=$STAGE"
+            echo "FULL_DEPOT=$FULL_DEPOT"
+            echo "PRUNED_DEPOT=$PRUNED_DEPOT"
+            echo "TRACE_DIR=$TRACE_DIR"
+          } >> "$GITHUB_ENV"
 
-      - name: Resolve and instantiate from pinned seed
+      - name: Download and instantiate the complete pinned environment
         shell: bash
         run: |
           set -euxo pipefail
-          mkdir -p "$ONLINE_DEPOT"
-          export JULIA_DEPOT_PATH="$ONLINE_DEPOT"
+          export JULIA_DEPOT_PATH="$FULL_DEPOT"
           export JULIA_PKG_PRECOMPILE_AUTO=0
-          julia --project="$STAGE/project" -e 'using Pkg; Pkg.Registry.add("General"); Pkg.resolve(); Pkg.instantiate()'
-
-      - name: Audit reduced dependency graph
-        shell: bash
-        run: |
-          set -euxo pipefail
+          julia --project="$STAGE/project" -e 'using Pkg; Pkg.Registry.add("General"); Pkg.instantiate()'
           python - <<'PY'
-          import json, os, tomllib
+          import json, os, subprocess, tomllib
           from pathlib import Path
           stage = Path(os.environ['STAGE'])
-          seed = tomllib.loads((stage/'project'/'Manifest.seed.toml').read_text())['deps']
-          final = tomllib.loads((stage/'project'/'Manifest.toml').read_text())['deps']
-          forbidden = {
-              'DifferentialEquations', 'OrdinaryDiffEq', 'BoundaryValueDiffEq',
-              'DelayDiffEq', 'StochasticDiffEq', 'Sundials', 'HDF5',
-              'KerrGeodesics', 'ApproxFun', 'AdaptiveLevin', 'LsqFit'
+          depot = Path(os.environ['FULL_DEPOT'])
+          manifest = tomllib.loads((stage/'project'/'Manifest.toml').read_text())['deps']
+          def sz(p):
+              return int(subprocess.check_output(['du','-sb',str(p)]).split()[0]) if p.exists() else 0
+          package_roots = []
+          pdir = depot/'packages'
+          if pdir.exists():
+              for name in pdir.iterdir():
+                  if name.is_dir():
+                      package_roots.extend(x for x in name.iterdir() if x.is_dir())
+          artifact_roots = [p for p in (depot/'artifacts').iterdir() if p.is_dir()] if (depot/'artifacts').exists() else []
+          data = {
+              'manifest_entries': len(manifest),
+              'downloaded_package_roots': len(package_roots),
+              'downloaded_artifact_roots': len(artifact_roots),
+              'packages_bytes': sz(depot/'packages'),
+              'artifacts_bytes': sz(depot/'artifacts'),
+              'registries_bytes': sz(depot/'registries'),
+              'full_depot_bytes_before_execution': sz(depot),
           }
-          present = forbidden & set(final)
-          if present:
-              raise SystemExit(f'forbidden packages remain: {sorted(present)}')
-          if len(final) > 170:
-              raise SystemExit(f'slim manifest unexpectedly large: {len(final)} entries')
-          changes = {}
-          for name, entries in final.items():
-              if name not in seed:
-                  continue
-              a = entries[0] if isinstance(entries, list) else entries
-              b = seed[name][0] if isinstance(seed[name], list) else seed[name]
-              if a.get('version') != b.get('version'):
-                  changes[name] = [b.get('version'), a.get('version')]
-          print(json.dumps({
-              'seed_manifest_entries': len(seed),
-              'slim_manifest_entries': len(final),
-              'removed_entries': len(seed) - len(final),
-              'version_changes': changes,
-          }, indent=2, sort_keys=True))
-          if changes:
-              raise SystemExit(f'pinned package versions changed: {changes}')
+          (Path(os.environ['RUNNER_TEMP'])/'full-install.json').write_text(json.dumps(data, indent=2, sort_keys=True)+'\n')
+          print(json.dumps(data, indent=2, sort_keys=True))
           PY
 
-      - name: Test real Julia package load and homogeneous ODE path
+      - name: Trace the actual M02 numerical/runtime surface
         shell: bash
         run: |
           set -euxo pipefail
-          export JULIA_DEPOT_PATH="$ONLINE_DEPOT"
-          julia --project="$STAGE/project" "$STAGE/m02_worker.jl" --probe
-          julia --project="$STAGE/project" -e '
+          command -v strace >/dev/null || { sudo apt-get update; sudo apt-get install -y strace; }
+          export JULIA_DEPOT_PATH="$FULL_DEPOT"
+          export JULIA_PKG_PRECOMPILE_AUTO=0
+
+          trace_run() {
+            local name="$1"
+            shift
+            strace -f -qq -e trace=%file -o "$TRACE_DIR/$name.log" "$@"
+          }
+
+          # Production worker load/probe.
+          trace_run worker_probe julia --project="$STAGE/project" "$STAGE/m02_worker.jl" --probe
+
+          # Worker-owned numerical/control code, including real determinant caller chains.
+          trace_run worker_fd julia --project="$STAGE/project" "$STAGE/m02_worker_finite_difference_spec.jl"
+
+          # Homogeneous exterior ODE propagation with the same SciML solver family.
+          trace_run gsn_factored julia --project="$STAGE/project" -e '
+            using Test, GeneralizedSasakiNakamura
+            include(joinpath(ARGS[1], "vendor", "GeneralizedSasakiNakamura.jl", "test", "factored_propagation_spec.jl"))
+          ' "$STAGE"
+
+          # Horizon contour/basis path, including real ODE integration.
+          trace_run gsn_horizon julia --project="$STAGE/project" -e '
+            using Test, GeneralizedSasakiNakamura
+            include(joinpath(ARGS[1], "vendor", "GeneralizedSasakiNakamura.jl", "test", "real_inner_horizon_spec.jl"))
+          ' "$STAGE"
+
+          # Horizon endpoint and scattering logic.
+          trace_run gsn_endpoint julia --project="$STAGE/project" -e '
+            using Test, GeneralizedSasakiNakamura
+            include(joinpath(ARGS[1], "vendor", "GeneralizedSasakiNakamura.jl", "test", "horizon_endpoint_adaptive_spec.jl"))
+          ' "$STAGE"
+          trace_run gsn_scattering julia --project="$STAGE/project" -e '
+            using Test, GeneralizedSasakiNakamura
+            include(joinpath(ARGS[1], "vendor", "GeneralizedSasakiNakamura.jl", "test", "scaled_scattering_spec.jl"))
+          ' "$STAGE"
+
+          # Actual angular eigenvalue call used by the worker.
+          trace_run swsh julia --project="$STAGE/project" -e '
             using SpinWeightedSpheroidalHarmonics
             λ = spin_weighted_spheroidal_eigenvalue(-2, 2, 2, 0.2 + 0.01im)
             @assert isfinite(real(λ)) && isfinite(imag(λ))
             println("SWSH eigenvalue probe: ", λ)
           '
-          julia --project="$STAGE/project" -e '
-            using GeneralizedSasakiNakamura
-            include(joinpath(ARGS[1], "vendor", "GeneralizedSasakiNakamura.jl", "test", "factored_propagation_spec.jl"))
-          ' "$STAGE"
 
-      - name: Build minimal offline depot and prove no-network reuse
+      - name: Delete every downloaded package/artifact not observed in the trace
         shell: bash
         run: |
           set -euxo pipefail
-          rm -rf "$OFFLINE_DEPOT"
-          mkdir -p "$OFFLINE_DEPOT"
-          for d in packages artifacts; do
-            if [ -d "$ONLINE_DEPOT/$d" ]; then
-              cp -a "$ONLINE_DEPOT/$d" "$OFFLINE_DEPOT/$d"
-            fi
-          done
-          rm -rf "$ONLINE_DEPOT"
-          export JULIA_DEPOT_PATH="$OFFLINE_DEPOT"
+          python - <<'PY'
+          import json, os, re, shutil, subprocess
+          from pathlib import Path
+
+          full = Path(os.environ['FULL_DEPOT']).resolve()
+          pruned = Path(os.environ['PRUNED_DEPOT']).resolve()
+          traces = Path(os.environ['TRACE_DIR']).resolve()
+          if pruned.exists():
+              shutil.rmtree(pruned)
+          pruned.mkdir(parents=True)
+
+          keep_packages = set()
+          keep_artifacts = set()
+          other_accessed = set()
+          quoted = re.compile(r'"([^"\\]*(?:\\.[^"\\]*)*)"')
+
+          for log in traces.glob('*.log'):
+              for line in log.read_text(errors='replace').splitlines():
+                  for raw in quoted.findall(line):
+                      path_text = raw.replace('\\"', '"')
+                      if not path_text.startswith('/'):
+                          continue
+                      try:
+                          path = Path(path_text).resolve(strict=False)
+                          rel = path.relative_to(full)
+                      except (ValueError, OSError):
+                          continue
+                      parts = rel.parts
+                      if len(parts) >= 3 and parts[0] == 'packages':
+                          keep_packages.add(Path(parts[0], parts[1], parts[2]))
+                      elif len(parts) >= 2 and parts[0] == 'artifacts':
+                          keep_artifacts.add(Path(parts[0], parts[1]))
+                      elif parts and parts[0] not in {'compiled','logs','registries'}:
+                          other_accessed.add(parts[0])
+
+          def copy_rel(rel):
+              src = full/rel
+              dst = pruned/rel
+              if not src.exists():
+                  return
+              dst.parent.mkdir(parents=True, exist_ok=True)
+              if src.is_dir():
+                  shutil.copytree(src, dst, symlinks=True, dirs_exist_ok=True)
+              else:
+                  shutil.copy2(src, dst)
+
+          for rel in sorted(keep_packages):
+              copy_rel(rel)
+          for rel in sorted(keep_artifacts):
+              copy_rel(rel)
+          for top in sorted(other_accessed):
+              copy_rel(Path(top))
+
+          def sz(p):
+              return int(subprocess.check_output(['du','-sb',str(p)]).split()[0]) if p.exists() else 0
+
+          full_package_roots = []
+          if (full/'packages').exists():
+              for name in (full/'packages').iterdir():
+                  if name.is_dir():
+                      full_package_roots.extend(x for x in name.iterdir() if x.is_dir())
+          full_artifact_roots = [x for x in (full/'artifacts').iterdir() if x.is_dir()] if (full/'artifacts').exists() else []
+
+          report = {
+              'full_package_roots': len(full_package_roots),
+              'kept_package_roots': len(keep_packages),
+              'deleted_package_roots': len(full_package_roots)-len(keep_packages),
+              'full_artifact_roots': len(full_artifact_roots),
+              'kept_artifact_roots': len(keep_artifacts),
+              'deleted_artifact_roots': len(full_artifact_roots)-len(keep_artifacts),
+              'full_packages_bytes': sz(full/'packages'),
+              'kept_packages_bytes': sz(pruned/'packages'),
+              'full_artifacts_bytes': sz(full/'artifacts'),
+              'kept_artifacts_bytes': sz(pruned/'artifacts'),
+              'pruned_depot_bytes_before_retest': sz(pruned),
+              'kept_package_paths': [str(x) for x in sorted(keep_packages)],
+              'kept_artifact_hashes': [x.parts[1] for x in sorted(keep_artifacts)],
+              'other_accessed_top_level_depot_dirs': sorted(other_accessed),
+          }
+          out = Path(os.environ['RUNNER_TEMP'])/'trace-prune-report.json'
+          out.write_text(json.dumps(report, indent=2, sort_keys=True)+'\n')
+          print(json.dumps(report, indent=2, sort_keys=True))
+          PY
+
+      - name: Prove the pruned depot runs with network package access disabled
+        shell: bash
+        run: |
+          set -euxo pipefail
+          export JULIA_DEPOT_PATH="$PRUNED_DEPOT"
           export JULIA_PKG_OFFLINE=true
           export JULIA_PKG_SERVER=""
           export JULIA_PKG_PRECOMPILE_AUTO=0
-          julia --project="$STAGE/project" -e 'using Pkg; Pkg.instantiate()'
+
+          # Do NOT invoke Pkg here. A vendored offline depot is the installation;
+          # the proof is that the real runtime can execute without fetching.
           julia --project="$STAGE/project" "$STAGE/m02_worker.jl" --probe
+          julia --project="$STAGE/project" "$STAGE/m02_worker_finite_difference_spec.jl"
           julia --project="$STAGE/project" -e '
-            using GeneralizedSasakiNakamura, SpinWeightedSpheroidalHarmonics
-            using OrdinaryDiffEqVerner, OrdinaryDiffEqRosenbrock, SciMLBase
+            using Test, GeneralizedSasakiNakamura
+            include(joinpath(ARGS[1], "vendor", "GeneralizedSasakiNakamura.jl", "test", "factored_propagation_spec.jl"))
+          ' "$STAGE"
+          julia --project="$STAGE/project" -e '
+            using Test, GeneralizedSasakiNakamura
+            include(joinpath(ARGS[1], "vendor", "GeneralizedSasakiNakamura.jl", "test", "real_inner_horizon_spec.jl"))
+          ' "$STAGE"
+          julia --project="$STAGE/project" -e '
+            using Test, GeneralizedSasakiNakamura
+            include(joinpath(ARGS[1], "vendor", "GeneralizedSasakiNakamura.jl", "test", "horizon_endpoint_adaptive_spec.jl"))
+          ' "$STAGE"
+          julia --project="$STAGE/project" -e '
+            using Test, GeneralizedSasakiNakamura
+            include(joinpath(ARGS[1], "vendor", "GeneralizedSasakiNakamura.jl", "test", "scaled_scattering_spec.jl"))
+          ' "$STAGE"
+          julia --project="$STAGE/project" -e '
+            using SpinWeightedSpheroidalHarmonics
             λ = spin_weighted_spheroidal_eigenvalue(-2, 2, 2, 0.2 + 0.01im)
             @assert isfinite(real(λ)) && isfinite(imag(λ))
-            println("offline package load: ok")
+            println("offline SWSH eigenvalue: ", λ)
           '
 
-      - name: Package and measure offline payload
+      - name: Package and measure the surviving offline Julia payload
         shell: bash
         run: |
           set -euxo pipefail
-          OUT="$RUNNER_TEMP/slim-bundle"
-          mkdir -p "$OUT/runtime"
-          cp -a "$STAGE/project" "$OUT/runtime/m02_project"
-          cp -a "$STAGE/vendor" "$OUT/runtime/vendor"
-          cp "$STAGE/m02_worker.jl" "$OUT/runtime/m02_worker.jl"
-          cp -a "$OFFLINE_DEPOT" "$OUT/runtime/julia-depot"
-          python - <<'PY'
-          import json, os, subprocess, tomllib
-          from pathlib import Path
-          stage = Path(os.environ['STAGE'])
-          offline = Path(os.environ['OFFLINE_DEPOT'])
-          out = Path(os.environ['RUNNER_TEMP'])/'slim-bundle'
-          manifest = tomllib.loads((stage/'project'/'Manifest.toml').read_text())['deps']
-          def size(path):
-              return int(subprocess.check_output(['du','-sb',str(path)]).split()[0]) if path.exists() else 0
-          data = {
-              'manifest_entries': len(manifest),
-              'depot_uncompressed_bytes': size(offline),
-              'packages_bytes': size(offline/'packages'),
-              'artifacts_bytes': size(offline/'artifacts'),
-              'vendor_bytes': size(stage/'vendor'),
-              'project_bytes': size(stage/'project'),
-          }
-          (out/'measurements.json').write_text(json.dumps(data, indent=2, sort_keys=True)+'\n')
-          print(json.dumps(data, indent=2, sort_keys=True))
-          PY
-          tar -C "$OUT" -czf "$RUNNER_TEMP/slim-m02-julia-offline-linux-x86_64.tar.gz" runtime measurements.json
-          sha256sum "$RUNNER_TEMP/slim-m02-julia-offline-linux-x86_64.tar.gz" > "$RUNNER_TEMP/slim-m02-julia-offline-linux-x86_64.tar.gz.sha256"
-          stat -c 'compressed_bundle_bytes=%s' "$RUNNER_TEMP/slim-m02-julia-offline-linux-x86_64.tar.gz" | tee "$RUNNER_TEMP/compressed-size.txt"
-          cat "$OUT/measurements.json"
-          cat "$RUNNER_TEMP/slim-m02-julia-offline-linux-x86_64.tar.gz.sha256"
+          BUNDLE="$RUNNER_TEMP/m02-offline-bundle"
+          rm -rf "$BUNDLE"
+          mkdir -p "$BUNDLE/runtime"
+          cp -a "$STAGE/project" "$BUNDLE/runtime/m02_project"
+          cp -a "$STAGE/vendor" "$BUNDLE/runtime/vendor"
+          cp "$STAGE/m02_worker.jl" "$BUNDLE/runtime/m02_worker.jl"
+          cp -a "$PRUNED_DEPOT" "$BUNDLE/runtime/julia-depot"
+          cp "$RUNNER_TEMP/full-install.json" "$BUNDLE/full-install.json"
+          cp "$RUNNER_TEMP/trace-prune-report.json" "$BUNDLE/trace-prune-report.json"
+
+          # Generated compiled caches are machine-local acceleration, not part of
+          # the vendored package payload. Remove anything created during retest.
+          rm -rf "$BUNDLE/runtime/julia-depot/compiled" "$BUNDLE/runtime/julia-depot/logs"
+
+          tar -C "$BUNDLE" -czf "$RUNNER_TEMP/m02-julia-trace-pruned-linux-x86_64.tar.gz" .
+          sha256sum "$RUNNER_TEMP/m02-julia-trace-pruned-linux-x86_64.tar.gz" > "$RUNNER_TEMP/m02-julia-trace-pruned-linux-x86_64.tar.gz.sha256"
+          stat -c 'compressed_bundle_bytes=%s' "$RUNNER_TEMP/m02-julia-trace-pruned-linux-x86_64.tar.gz" | tee "$RUNNER_TEMP/compressed-size.txt"
+          du -sb "$BUNDLE/runtime/julia-depot" | tee "$RUNNER_TEMP/pruned-depot-size.txt"
+          cat "$RUNNER_TEMP/full-install.json"
+          cat "$RUNNER_TEMP/trace-prune-report.json"
+          cat "$RUNNER_TEMP/m02-julia-trace-pruned-linux-x86_64.tar.gz.sha256"
 
       - uses: actions/upload-artifact@v4
         with:
-          name: slim-m02-julia-offline-linux-x86_64
+          name: m02-julia-trace-pruned-linux-x86_64
           path: |
-            ${{ runner.temp }}/slim-m02-julia-offline-linux-x86_64.tar.gz
-            ${{ runner.temp }}/slim-m02-julia-offline-linux-x86_64.tar.gz.sha256
+            ${{ runner.temp }}/m02-julia-trace-pruned-linux-x86_64.tar.gz
+            ${{ runner.temp }}/m02-julia-trace-pruned-linux-x86_64.tar.gz.sha256
             ${{ runner.temp }}/compressed-size.txt
-            ${{ runner.temp }}/slim-bundle/measurements.json
-            ${{ env.STAGE }}/project/Manifest.toml
+            ${{ runner.temp }}/pruned-depot-size.txt
+            ${{ runner.temp }}/full-install.json
+            ${{ runner.temp }}/trace-prune-report.json
           compression-level: 0
           retention-days: 1
