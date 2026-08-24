@@ -659,6 +659,37 @@ class HorizonRecordConstructionTests(unittest.TestCase):
                 tampered, plan
             ),
         )
+        substituted = copy.deepcopy(checkpoint)
+        substituted_comparison = substituted["evidence_ledger"][leaf.leaf_id][
+            "receipts"
+        ][1]
+        substituted_comparison["bf80_stage"] = source_stage
+        substituted_comparison["bf80_operation_identity"] = source_stage[
+            "operation_identity"
+        ]
+        substituted_comparison["bf80_result_sha256"] = _sha256(
+            source_stage["component_result"]["result"]
+        )
+        substituted_comparison["bf80_centre"] = source_centre
+        substituted_comparison["bf80_disk_radius"] = source_radius
+        substituted_comparison["centre_discrepancy"] = 0.0
+        substituted_comparison["reviewed_comparison_threshold"] = (
+            2.0 * source_radius
+        )
+        substituted_comparison["runtime_identity"] = source_stage[
+            "component_result"
+        ]["scientific_runtime"]
+        substituted_comparison["receipt_sha256"] = _sha256({
+            key: value
+            for key, value in substituted_comparison.items()
+            if key != "receipt_sha256"
+        })
+        self.assertEqual(
+            {source_record_sha256},
+            campaign_runtime._promotion_bound_source_record_sha256(
+                substituted, plan
+            ),
+        )
 
     def test_trigger_receipt_rejects_stage_outcome_payload_mismatch(self) -> None:
         plan = _plan()

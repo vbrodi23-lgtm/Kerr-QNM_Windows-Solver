@@ -435,6 +435,7 @@ def _completed_horizon_source_is_authenticated(
             or receipt.get("agrees") is not True
             or receipt.get("outcome_code") != "AGREES"
             or not isinstance(bf80_result, Mapping)
+            or bf80_stage.get("precision_tier") != "BF80"
             or receipt.get("bf80_result_sha256") != _sha256(bf80_result)
             or receipt.get("bf80_operation_identity")
             != bf80_stage.get("operation_identity")
