@@ -1068,7 +1068,11 @@ def run_binary64_survey(
         )
         assert isinstance(result, dict)
         result = persist(result)
-        if outcome.record is not None and terminal_record_committed is not None:
+        if (
+            outcome.record is not None
+            and outcome.disposition is SurveyDisposition.COMPLETED
+            and terminal_record_committed is not None
+        ):
             try:
                 terminal_record_committed(leaf, outcome.record)
             except KeyboardInterrupt:
@@ -2059,7 +2063,12 @@ def run_promoted_survey(
         elif outcome.disposition is SurveyDisposition.REJECTED:
             rejected += 1
         result = persist(result)
-        if outcome.record is not None and terminal_record_committed is not None:
+        if (
+            outcome.record is not None
+            and outcome.disposition is SurveyDisposition.COMPLETED
+            and outcome.record.get("state") == "PRODUCED"
+            and terminal_record_committed is not None
+        ):
             try:
                 terminal_record_committed(leaf, outcome.record)
             except KeyboardInterrupt:

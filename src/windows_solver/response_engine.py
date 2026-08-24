@@ -2847,10 +2847,16 @@ class DeterminantPartials:
     frequency_derivative: complex
     coordinate_derivative: complex
     simple_root_valid: bool
+    frequency_derivative_error_abs: float | None = None
 
     def __post_init__(self) -> None:
         _finite_complex(self.frequency_derivative, "frequency derivative")
         _finite_complex(self.coordinate_derivative, "coordinate derivative")
+        if self.frequency_derivative_error_abs is not None:
+            error = float(self.frequency_derivative_error_abs)
+            if not math.isfinite(error) or error < 0.0:
+                raise ValueError("frequency derivative error must be finite and nonnegative")
+            object.__setattr__(self, "frequency_derivative_error_abs", error)
 
 
 @dataclass(frozen=True, slots=True)
@@ -7588,6 +7594,32 @@ class ComponentResult:
                 closed_form_response=self.closed_form_response,
                 error_channels=self.error_channels,
             )
+        if self.component_scientific_identity == (
+            PROMOTED_HORIZON_FAILURE_COMPONENT_IDENTITY
+        ):
+            expected_failure_evidence = {
+                "identity": PROMOTED_HORIZON_FAILURE_COMPONENT_IDENTITY,
+                "failure_status": self.status.value,
+            }
+            if (
+                self.mechanism_id != "horizon-admittance"
+                or self.response_method != PROMOTED_HORIZON_FAILURE_RESPONSE_METHOD
+                or self.status
+                not in {ComponentStatus.BRANCH_LOSS, ComponentStatus.NOT_CONVERGED}
+                or self.convergence_basis != "UNRESOLVED"
+                or self.response is not None
+                or self.signed_root_crosscheck is not None
+                or self.closed_form_response is not None
+                or self.finite_amplitude_ladder_required is not False
+                or self.finite_amplitude_ladder_executed is not False
+                or self.finite_amplitude_readout_count != 0
+                or self.levels
+                or self.response_uncertainty_status != UNBOUNDED_ANALYTIC_RESPONSE
+                or any(self.error_channel_applicability.values())
+                or any(float(value) != 0.0 for value in self.error_channels.values())
+                or self.analytic_horizon_evidence != expected_failure_evidence
+            ):
+                raise ValueError("promoted horizon typed failure evidence is inconsistent")
         conditioned_readouts = tuple(
             readout
             for readout in self.raw_readouts

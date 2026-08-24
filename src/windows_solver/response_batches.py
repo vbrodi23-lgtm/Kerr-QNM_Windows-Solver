@@ -12126,22 +12126,31 @@ class NativeCampaignStageBackend:
             job.spin / (2.0 * horizon_radius)
         )
         frequency_radius = math.ulp(max(abs(horizon_frequency), 1.0))
-        derivative_radius = math.ulp(max(abs(derivative), 1.0))
+        derivative_error = partials.frequency_derivative_error_abs
+        derivative_radius = (
+            None
+            if derivative_error is None
+            else derivative_error + math.ulp(max(abs(derivative), 1.0))
+        )
         frequency_disk = ComplexDisk(
             horizon_frequency,
             frequency_radius,
             exact_zero_radius=frequency_radius == 0.0,
         )
-        derivative_disk = ComplexDisk(
-            derivative,
-            derivative_radius,
-            exact_zero_radius=derivative_radius == 0.0,
+        derivative_disk = (
+            None
+            if derivative_radius is None
+            else ComplexDisk(
+                derivative,
+                derivative_radius,
+                exact_zero_radius=derivative_radius == 0.0,
+            )
         )
         response_disk = None
         status = ComponentStatus.DERIVATIVE_UNRESOLVED
         response = None
         try:
-            if partials.simple_root_valid:
+            if partials.simple_root_valid and derivative_disk is not None:
                 response_disk = horizon_response_disk(
                     horizon_frequency=frequency_disk,
                     determinant_derivative=derivative_disk,
@@ -12219,7 +12228,9 @@ class NativeCampaignStageBackend:
                     "imaginary": root.imag,
                 },
                 "horizon_frequency_disk": frequency_disk.to_mapping(),
-                "determinant_derivative_disk": derivative_disk.to_mapping(),
+                "determinant_derivative_disk": (
+                    None if derivative_disk is None else derivative_disk.to_mapping()
+                ),
                 "response_disk": (
                     None
                     if response_disk is None

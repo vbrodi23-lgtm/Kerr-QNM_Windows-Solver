@@ -1149,10 +1149,18 @@ class VettedNativeDeterminantKernel:
                 )
                 return result
 
-        frequency = (
+        frequency_coarse = (
             partial_determinant(omega + h, "closed-form derivative +h")
             - partial_determinant(omega - h, "closed-form derivative -h")
         ) / (2.0 * h)
+        half_h = 0.5 * h
+        frequency = (
+            partial_determinant(omega + half_h, "closed-form derivative +h/2")
+            - partial_determinant(omega - half_h, "closed-form derivative -h/2")
+        ) / (2.0 * half_h)
+        frequency_error = abs(frequency - frequency_coarse) + math.ulp(
+            max(abs(frequency), abs(frequency_coarse), 1.0)
+        )
         with _progress_suboperation("Xup"):
             outgoing, _ = sn.outgoing_at(omega, policy.readout_radius)
         outgoing_horizon = self._integrate_horizon_branch(
@@ -1176,4 +1184,5 @@ class VettedNativeDeterminantKernel:
                 and frequency != 0.0j
                 and math.isfinite(abs(coordinate))
             ),
+            frequency_derivative_error_abs=frequency_error,
         )

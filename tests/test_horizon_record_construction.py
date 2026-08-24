@@ -55,6 +55,7 @@ from tests.test_promoted_horizon_component import (
     _promoted_baseline,
 )
 from windows_solver.response_engine import (
+    ComponentResult,
     DecimalComplex,
     run_promoted_horizon_component,
 )
@@ -111,6 +112,7 @@ def _binary64_horizon_outcome(plan, leaf) -> StageOutcome:
                 frequency_derivative=1.0 + 0.25j,
                 coordinate_derivative=-0.5 + 0.1j,
                 simple_root_valid=True,
+                frequency_derivative_error_abs=1.0e-12,
             )
 
         def evaluate_root(self, **_kwargs):
@@ -361,6 +363,10 @@ class HorizonRecordConstructionTests(unittest.TestCase):
 
         self.assertEqual("UNRESOLVED", record["state"])
         self.assertIsNotNone(component.component_scientific_identity)
+        malformed = component.to_mapping()
+        malformed["finite_amplitude_ladder_required"] = True
+        with self.assertRaisesRegex(ValueError, "typed failure"):
+            ComponentResult.from_mapping(malformed)
 
     def test_trigger_receipt_rejects_stage_outcome_payload_mismatch(self) -> None:
         plan = _plan()
@@ -431,6 +437,7 @@ class HorizonRecordConstructionTests(unittest.TestCase):
                     frequency_derivative=1.0 + 0.25j,
                     coordinate_derivative=-0.5 + 0.1j,
                     simple_root_valid=True,
+                    frequency_derivative_error_abs=1.0e-12,
                 )
 
             def evaluate_root(self, **_kwargs):
@@ -462,6 +469,39 @@ class HorizonRecordConstructionTests(unittest.TestCase):
         self.assertEqual(0, raw["finite_amplitude_readout_count"])
         self.assertEqual(0, raw["analytic_horizon_evidence"]["worker_launch_count"])
         self.assertEqual([], raw["analytic_horizon_evidence"]["levels"])
+
+    def test_binary64_horizon_without_stencil_error_bound_is_unbounded(self) -> None:
+        plan = _plan()
+        leaf = next(
+            item for item in plan.leaves
+            if item.role == "primary"
+            and item.mechanism_id == "horizon-admittance"
+        )
+
+        class Kernel:
+            identity = VettedNativeDeterminantKernel.identity
+
+            def horizon_partials(self, **_kwargs):
+                return DeterminantPartials(
+                    frequency_derivative=1.0 + 0.25j,
+                    coordinate_derivative=-0.5 + 0.1j,
+                    simple_root_valid=True,
+                )
+
+        backend = NativeCampaignStageBackend(
+            SimpleNamespace(identity=Kernel.identity, kernel=Kernel()),
+            PrecisionCapabilities((64,)),
+            SimpleNamespace(
+                record_artifact_ids=(),
+                path=Path("synthetic-gsn-cache"),
+                sha256="a" * 64,
+                parameter_pairs=(),
+            ),
+        )
+        outcome = backend.execute_horizon_stage(leaf)
+
+        self.assertEqual("DERIVATIVE_UNRESOLVED", outcome.numerical_state)
+        self.assertIsNone(outcome.component_result["result"]["response"])
 
     def test_binary64_outcome_commits_record_and_promotion_queue(self) -> None:
         record_content = {

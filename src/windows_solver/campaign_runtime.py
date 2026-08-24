@@ -1024,6 +1024,11 @@ def run_native_binary64_pass(
     # Reconcile authenticated terminal checkpoint records before the survey's
     # cache discovery.  A cache hit is therefore durable before any numerical
     # leaf is eligible to be skipped.
+    pending_record_sha256 = {
+        entry.get("source_record_sha256")
+        for entry in checkpoint.get("promotion_queue", {}).get("entries", ())
+        if isinstance(entry, Mapping) and entry.get("disposition") == "PENDING"
+    }
     checkpoint_records = {
         str(item["leaf_id"]): item
         for item in checkpoint.get("records", ())
@@ -1031,7 +1036,11 @@ def run_native_binary64_pass(
     }
     for leaf_id in recovery_selection.ordered_leaf_ids:
         record = checkpoint_records.get(leaf_id)
-        if record is None or record.get("state") not in {"PRODUCED", "UNRESOLVED"}:
+        if (
+            record is None
+            or record.get("state") != "PRODUCED"
+            or record.get("record_sha256") in pending_record_sha256
+        ):
             continue
         leaf = next(item for item in plan.leaves if item.leaf_id == leaf_id)
         validate_campaign_recovery_record(plan, leaf_id, record)
