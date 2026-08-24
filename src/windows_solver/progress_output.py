@@ -1047,6 +1047,7 @@ class Schema11ProgressReporter:
         stream: TextIO | None = None,
         width: int | None = None,
         mode: ProgressMode | str = ProgressMode.NORMAL,
+        diagnostic_paths: Mapping[str, str | os.PathLike[str] | Path | None] | None = None,
     ) -> None:
         self.checkpoint = Path(checkpoint)
         self.leaf_metadata = dict(leaf_metadata or {})
@@ -1064,6 +1065,41 @@ class Schema11ProgressReporter:
         self._live: dict[str, object] = {
             "profile": profile,
             "pass": pass_name,
+        }
+        paths = dict(diagnostic_paths or {})
+        expected_diagnostic_paths = {
+            "diagnostic_session_directory",
+            "postmortem_path",
+            "bundle_path",
+        }
+        if set(paths) - expected_diagnostic_paths:
+            raise ValueError("schema-11 diagnostic status paths are invalid")
+        self._diagnostic_paths = {
+            name: (
+                None
+                if paths.get(name) is None
+                else str(Path(paths[name]))
+            )
+            for name in expected_diagnostic_paths
+        }
+        self._current_live_event: dict[str, object] | None = None
+        self._last_nonterminal_event: dict[str, object] | None = None
+        self._terminal_event: dict[str, object] | None = None
+        self._active_leaf_at_terminal_event: dict[str, object] | None = None
+        self._last_committed_leaf: dict[str, object] | None = None
+        self._next_intended_leaf: dict[str, object] | None = None
+        self._terminal_failure: dict[str, object] | None = None
+        ordered_metadata = sorted(
+            (
+                (value.get("leaf_ordinal"), leaf_id)
+                for leaf_id, value in self.leaf_metadata.items()
+                if isinstance(value.get("leaf_ordinal"), int)
+            ),
+            key=lambda item: item[0],
+        )
+        self._next_leaf_by_id = {
+            leaf_id: ordered_metadata[index + 1][1]
+            for index, (_ordinal, leaf_id) in enumerate(ordered_metadata[:-1])
         }
         self._counts: dict[str, int] = {}
         self._start_from_checkpoint()
@@ -1112,6 +1148,26 @@ class Schema11ProgressReporter:
         try:
             context = event.context.to_mapping()
             payload = dict(event.payload)
+            event_snapshot = self._event_snapshot(event)
+            terminal = self._is_terminal_event(event.kind)
+            if terminal:
+                self._terminal_event = event_snapshot
+                self._active_leaf_at_terminal_event = self._current_live_event
+                self._current_live_event = None
+                self._terminal_failure = self._terminal_failure_snapshot(event)
+            else:
+                self._current_live_event = event_snapshot
+                self._last_nonterminal_event = event_snapshot
+                if event.kind is ProgressEventKind.LEAF_PASS_DISPOSITION_RECORDED:
+                    self._last_committed_leaf = event_snapshot
+                    leaf_id = context.get("leaf_id")
+                    if isinstance(leaf_id, str):
+                        next_leaf_id = self._next_leaf_by_id.get(leaf_id)
+                        if next_leaf_id is not None:
+                            self._next_intended_leaf = {
+                                "leaf_id": next_leaf_id,
+                                **dict(self.leaf_metadata[next_leaf_id]),
+                            }
             leaf_id = context.get("leaf_id")
             metadata = (
                 self.leaf_metadata.get(leaf_id, {})
@@ -1130,63 +1186,64 @@ class Schema11ProgressReporter:
                     return None
                 return value
 
-            self._live.update(
-                {
-                    "elapsed": f"{max(0.0, event.monotonic_seconds - self._started_monotonic):.1f}s",
-                    "counts": _count_text(self._counts),
-                    "leaf": (
-                        None
-                        if leaf_index is None
-                        else f"{leaf_index}/{leaf_count or '?'}"
-                    ),
-                    "profile": _scalar_or_none(
-                        context.get("execution_profile", self.profile)
-                    ),
-                    "pass": _scalar_or_none(
-                        context.get("survey_pass", self.pass_name)
-                    ),
-                    "root": _scalar_or_none(context.get("root_phase")),
-                    "mode": (
-                        _scalar_or_none(context.get("mode"))
-                        or _scalar_or_none(metadata.get("mode"))
-                    ),
-                    "spin": (
-                        _scalar_or_none(context.get("spin"))
-                        or _scalar_or_none(metadata.get("spin_or_Mkappa"))
-                        or _scalar_or_none(metadata.get("spin"))
-                    ),
-                    "role": (
-                        _scalar_or_none(context.get("role"))
-                        or _scalar_or_none(metadata.get("role"))
-                    ),
-                    "mechanism": (
-                        _scalar_or_none(context.get("mechanism_id"))
-                        or _scalar_or_none(metadata.get("mechanism"))
-                    ),
-                    "tier": _scalar_or_none(context.get("precision_tier")),
-                    "phase": _scalar_or_none(
-                        context.get("phase", event.kind.value)
-                    ),
-                    "sample": _ratio(
-                        context.get("sample_count_used"),
-                        context.get("sample_count_limit"),
-                    ),
-                    "root_reads": _ratio(
-                        context.get("root_read_count"),
-                        context.get("root_read_limit"),
-                    ),
-                    "metric": _scalar_or_none(
-                        payload.get(
-                            "current_metric", payload.get("determinant_abs")
-                        )
-                    ),
-                    "suboperation": _scalar_or_none(context.get("suboperation")),
-                    "timing": _scalar_or_none(context.get("total_leaf_seconds")),
-                    "last_activity_age": _scalar_or_none(
-                        payload.get("last_activity_age_seconds")
-                    ),
-                }
-            )
+            if not terminal:
+                self._live.update(
+                    {
+                        "elapsed": f"{max(0.0, event.monotonic_seconds - self._started_monotonic):.1f}s",
+                        "counts": _count_text(self._counts),
+                        "leaf": (
+                            None
+                            if leaf_index is None
+                            else f"{leaf_index}/{leaf_count or '?'}"
+                        ),
+                        "profile": _scalar_or_none(
+                            context.get("execution_profile", self.profile)
+                        ),
+                        "pass": _scalar_or_none(
+                            context.get("survey_pass", self.pass_name)
+                        ),
+                        "root": _scalar_or_none(context.get("root_phase")),
+                        "mode": (
+                            _scalar_or_none(context.get("mode"))
+                            or _scalar_or_none(metadata.get("mode"))
+                        ),
+                        "spin": (
+                            _scalar_or_none(context.get("spin"))
+                            or _scalar_or_none(metadata.get("spin_or_Mkappa"))
+                            or _scalar_or_none(metadata.get("spin"))
+                        ),
+                        "role": (
+                            _scalar_or_none(context.get("role"))
+                            or _scalar_or_none(metadata.get("role"))
+                        ),
+                        "mechanism": (
+                            _scalar_or_none(context.get("mechanism_id"))
+                            or _scalar_or_none(metadata.get("mechanism"))
+                        ),
+                        "tier": _scalar_or_none(context.get("precision_tier")),
+                        "phase": _scalar_or_none(
+                            context.get("phase", event.kind.value)
+                        ),
+                        "sample": _ratio(
+                            context.get("sample_count_used"),
+                            context.get("sample_count_limit"),
+                        ),
+                        "root_reads": _ratio(
+                            context.get("root_read_count"),
+                            context.get("root_read_limit"),
+                        ),
+                        "metric": _scalar_or_none(
+                            payload.get(
+                                "current_metric", payload.get("determinant_abs")
+                            )
+                        ),
+                        "suboperation": _scalar_or_none(context.get("suboperation")),
+                        "timing": _scalar_or_none(context.get("total_leaf_seconds")),
+                        "last_activity_age": _scalar_or_none(
+                            payload.get("last_activity_age_seconds")
+                        ),
+                    }
+                )
             if event.kind is ProgressEventKind.LEAF_PASS_DISPOSITION_RECORDED:
                 rows, counts, _status = self._snapshot()
                 self._counts = dict(counts)
@@ -1216,12 +1273,54 @@ class Schema11ProgressReporter:
             self.dashboard.finish_live()
         self._write_status(None)
 
+    @staticmethod
+    def _is_terminal_event(kind: ProgressEventKind) -> bool:
+        return kind in {
+            ProgressEventKind.CAMPAIGN_COMPLETED,
+            ProgressEventKind.CAMPAIGN_FAILED,
+            ProgressEventKind.CAMPAIGN_INTERRUPTED,
+            ProgressEventKind.CAMPAIGN_PASS_COMPLETED,
+            ProgressEventKind.CAMPAIGN_PASS_INTERRUPTED,
+            ProgressEventKind.SYSTEM_FAILURE_RECORDED,
+        }
+
+    @staticmethod
+    def _event_snapshot(event: ProgressEvent) -> dict[str, object]:
+        return {
+            "kind": event.kind.value,
+            "context": event.context.to_mapping(),
+            "payload": dict(event.payload),
+            "monotonic_seconds": event.monotonic_seconds,
+        }
+
+    def _terminal_failure_snapshot(
+        self, event: ProgressEvent
+    ) -> dict[str, object] | None:
+        payload = dict(event.payload)
+        meaningful = {
+            name: payload[name]
+            for name in (
+                "reason",
+                "failure_code",
+                "error_type",
+                "message",
+                "system_failure_fingerprint",
+            )
+            if name in payload
+        }
+        if not meaningful and event.kind not in {
+            ProgressEventKind.CAMPAIGN_FAILED,
+            ProgressEventKind.SYSTEM_FAILURE_RECORDED,
+        }:
+            return None
+        return {"event_kind": event.kind.value, **meaningful}
+
     def _write_status(self, event: ProgressEvent | None) -> None:
         path = Path(f"{self.checkpoint}.status.json")
         path.parent.mkdir(parents=True, exist_ok=True)
         rows, counts, reports = self._snapshot()
         status = {
-            "schema": "windows-solver.schema11-progress-status/1",
+            "schema": "windows-solver.schema11-progress-status/2",
             "checkpoint_path": str(self.checkpoint),
             "profile": self.profile,
             "survey_pass": self.pass_name,
@@ -1229,14 +1328,15 @@ class Schema11ProgressReporter:
             "report_status": reports,
             "completed_leaf_ids": [row["leaf_id"] for row in rows],
             "live_execution": dict(self._live),
-            "last_event": (
-                None if event is None else {
-                    "kind": event.kind.value,
-                    "context": event.context.to_mapping(),
-                    "payload": dict(event.payload),
-                    "monotonic_seconds": event.monotonic_seconds,
-                }
-            ),
+            "current_live_event": self._current_live_event,
+            "last_nonterminal_event": self._last_nonterminal_event,
+            "terminal_event": self._terminal_event,
+            "active_leaf_at_terminal_event": self._active_leaf_at_terminal_event,
+            "last_committed_leaf": self._last_committed_leaf,
+            "next_intended_leaf": self._next_intended_leaf,
+            "terminal_failure": self._terminal_failure,
+            **self._diagnostic_paths,
+            "last_event": self._terminal_event or self._last_nonterminal_event,
             "diagnostics": list(self.diagnostics),
             "updated_at_utc": datetime.now(timezone.utc).isoformat(),
         }

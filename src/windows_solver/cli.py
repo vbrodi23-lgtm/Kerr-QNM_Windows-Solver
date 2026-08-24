@@ -1198,6 +1198,7 @@ def _campaign_schema11_pass(
     progress_mode: str,
     calibration_receipt_path: Path | None,
     calibration_receipt_sha256: str | None,
+    diagnostic_paths: Mapping[str, str | os.PathLike[str] | Path | None] | None = None,
 ) -> tuple[int, object]:
     if (calibration_receipt_path is None) is not (
         calibration_receipt_sha256 is None
@@ -1228,6 +1229,7 @@ def _campaign_schema11_pass(
             profile="survey",
             pass_name="binary64",
             mode=progress_mode,
+            diagnostic_paths=diagnostic_paths,
         )
         try:
             with activate_progress(reporter):
@@ -1275,6 +1277,7 @@ def _campaign_schema11_pass(
             profile="survey",
             pass_name="promoted",
             mode=progress_mode,
+            diagnostic_paths=diagnostic_paths,
         )
         try:
             with activate_progress(reporter):
@@ -1359,6 +1362,7 @@ def _campaign_schema11_pass(
             profile=profile_name,
             pass_name=None,
             mode=progress_mode,
+            diagnostic_paths=diagnostic_paths,
         )
         try:
             with activate_progress(reporter):
@@ -1899,6 +1903,11 @@ def _run_schema11_pass_with_diagnostics(arguments: argparse.Namespace) -> tuple[
             progress_mode=arguments.progress,
             calibration_receipt_path=arguments.calibration_receipt_path,
             calibration_receipt_sha256=arguments.calibration_receipt_sha256,
+            diagnostic_paths={
+                "diagnostic_session_directory": session.paths.directory,
+                "postmortem_path": session.paths.postmortem,
+                "bundle_path": session.paths.bundle,
+            },
         )
         if not isinstance(output, Mapping):
             raise ValueError("schema-11 pass output is invalid")

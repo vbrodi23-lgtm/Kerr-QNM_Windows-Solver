@@ -639,6 +639,12 @@ class PromotedTerminalCacheWiringTests(unittest.TestCase):
             def close(self) -> None:
                 return None
 
+        diagnostic_paths = {
+            "diagnostic_session_directory": "/tmp/diagnostics/session-1",
+            "postmortem_path": "/tmp/diagnostics/session-1/postmortem.json",
+            "bundle_path": "/tmp/diagnostics/session-1/diagnostic-bundle.zip",
+        }
+
         with patch(
             "windows_solver.cli._load_schema11_campaign",
             return_value=(
@@ -652,7 +658,7 @@ class PromotedTerminalCacheWiringTests(unittest.TestCase):
         ), patch(
             "windows_solver.cli.Schema11ProgressReporter",
             return_value=_Reporter(),
-        ), patch(
+        ) as progress_reporter, patch(
             "windows_solver.campaign_runtime.run_native_binary64_pass",
             return_value=result,
         ):
@@ -664,11 +670,16 @@ class PromotedTerminalCacheWiringTests(unittest.TestCase):
                 progress_mode="quiet",
                 calibration_receipt_path=None,
                 calibration_receipt_sha256=None,
+                diagnostic_paths=diagnostic_paths,
             )
 
         self.assertEqual(0, status)
         self.assertIsInstance(payload, dict)
         self.assertEqual(totals.to_mapping(), payload["terminal_cache_discovery"])
+        self.assertEqual(
+            diagnostic_paths,
+            progress_reporter.call_args.kwargs["diagnostic_paths"],
+        )
 
 
 if __name__ == "__main__":
