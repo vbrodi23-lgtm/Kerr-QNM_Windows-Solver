@@ -69,6 +69,9 @@ SCHEMA11_LEAF_COLUMNS = (
     "execution_profile",
     "survey_pass",
     "precision_tier",
+    "sample_count",
+    "root_read_count",
+    "worker_launch_count",
     "binary64_seconds",
     "bf40_seconds",
     "bf80_seconds",
@@ -1514,6 +1517,21 @@ def _schema11_timing(
     return totals
 
 
+def _schema11_work_counts(
+    binary: Mapping[str, object] | None,
+    promoted: Mapping[str, object] | None,
+) -> dict[str, int]:
+    totals = {"sample_count": 0, "root_read_count": 0, "worker_launch_count": 0}
+    for entry in (binary, promoted):
+        if not isinstance(entry, Mapping):
+            continue
+        for name in totals:
+            value = entry.get(name)
+            if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                totals[name] += value
+    return totals
+
+
 def _schema11_basic_rows(
     plan: object,
     selection: object,
@@ -1555,6 +1573,7 @@ def _schema11_basic_rows(
             else radius / magnitude
         )
         timings = _schema11_timing(binary, promoted)
+        work_counts = _schema11_work_counts(binary, promoted)
         stages = [] if record is None else record.get("stages", [])
         last_stage = stages[-1] if isinstance(stages, list) and stages else {}
         precision_tier = (
@@ -1606,6 +1625,7 @@ def _schema11_basic_rows(
                 else "binary64" if isinstance(binary, Mapping) else None
             ),
             "precision_tier": precision_tier,
+            **work_counts,
             "binary64_seconds": timings["binary64"],
             "bf40_seconds": timings["BF40"],
             "bf80_seconds": timings["BF80"],

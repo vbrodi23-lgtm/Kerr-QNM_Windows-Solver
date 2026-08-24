@@ -1033,9 +1033,11 @@ def _load_schema11_campaign(
 
 def _schema11_leaf_metadata(plan, selection) -> dict[str, dict[str, object]]:
     leaf_by_id = {leaf.leaf_id: leaf for leaf in plan.leaves}
+    leaf_count = len(selection.leaf_ids)
     return {
         leaf_id: {
             "leaf_ordinal": ordinal,
+            "leaf_count": leaf_count,
             "role": leaf_by_id[leaf_id].role,
             "mode": leaf_by_id[leaf_id].leaf.mode_label,
             "spin_or_Mkappa": leaf_by_id[leaf_id].job.spin,

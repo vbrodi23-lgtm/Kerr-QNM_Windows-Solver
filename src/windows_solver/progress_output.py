@@ -464,6 +464,7 @@ class CleanTailDashboard:
             "profile": "PF" if self.compact else "PROFILE",
             "pass": "P" if self.compact else "PASS",
             "root": "R" if self.compact else "ROOT",
+            "mode": "Q" if self.compact else "MODE",
             "mechanism": "M" if self.compact else "MECH",
             "tier": "D" if self.compact else "TIER",
             "phase": "PH" if self.compact else "PHASE",
@@ -612,16 +613,26 @@ def schema11_dashboard_snapshot(
         if record["state"] == "IN_PROGRESS":
             continue
         pass_name = "promoted" if leaf_id in promoted else "binary64"
-        pass_entry = promoted.get(leaf_id) or binary.get(leaf_id) or {}
-        tier_seconds = {
-            str(item.get("tier")): item.get("elapsed_seconds", 0.0)
-            for item in pass_entry.get("tier_timing", ())
+        pass_entries = tuple(
+            item for item in (binary.get(leaf_id), promoted.get(leaf_id))
             if isinstance(item, Mapping)
-        }
-        fragments = pass_entry.get("session_fragments", ())
+        )
+        tier_seconds: dict[str, float] = {}
+        for pass_entry in pass_entries:
+            for item in pass_entry.get("tier_timing", ()):
+                if not isinstance(item, Mapping):
+                    continue
+                tier = str(item.get("tier"))
+                tier_seconds[tier] = tier_seconds.get(tier, 0.0) + _finite_seconds(
+                    item.get("elapsed_seconds")
+                )
+        fragments = tuple(
+            fragment
+            for pass_entry in pass_entries
+            for fragment in pass_entry.get("session_fragments", ())
+        )
         reconstructed = bool(
-            isinstance(fragments, list)
-            and any(
+            any(
                 isinstance(item, Mapping)
                 and item.get("source") == "RECONSTRUCTED"
                 for item in fragments
@@ -636,6 +647,15 @@ def schema11_dashboard_snapshot(
                 "survey_pass": pass_name,
                 "evidence_level": evidence_entry.get("evidence_level", "-"),
                 "precision_tier": _latest_precision_tier(record),
+                "sample_count": sum(
+                    int(item.get("sample_count", 0)) for item in pass_entries
+                ),
+                "root_read_count": sum(
+                    int(item.get("root_read_count", 0)) for item in pass_entries
+                ),
+                "worker_launch_count": sum(
+                    int(item.get("worker_launch_count", 0)) for item in pass_entries
+                ),
                 "binary64_seconds": tier_seconds.get("binary64", 0.0),
                 "bf40_seconds": tier_seconds.get("BF40", 0.0),
                 "bf80_seconds": tier_seconds.get("BF80", 0.0),
@@ -668,6 +688,18 @@ def schema11_dashboard_snapshot(
             1 for item in dispositions if item.get("disposition") == "REJECTED"
         ),
         "system_failures": len(value["system_failures"]),
+        "SCREENED": sum(
+            1 for item in evidence.values()
+            if item.get("evidence_level") == "SCREENED"
+        ),
+        "CERTIFIED": sum(
+            1 for item in evidence.values()
+            if item.get("evidence_level") == "CERTIFIED"
+        ),
+        "VALIDATED": sum(
+            1 for item in evidence.values()
+            if item.get("evidence_level") == "VALIDATED"
+        ),
     }
     report = value.get("report_status_receipt")
     report_status: dict[str, object] = {}
@@ -716,6 +748,27 @@ def _record_component_result(record: Mapping[str, object]) -> Mapping[str, objec
 
 
 def _record_response_magnitude(record: Mapping[str, object]) -> object:
+    retained = record.get("retained_centre")
+    if isinstance(retained, Mapping):
+        try:
+            return abs(complex(
+                float(retained["real"]),
+                float(retained.get("imaginary", retained.get("imag"))),
+            ))
+        except (KeyError, TypeError, ValueError, OverflowError):
+            pass
+    stages = record.get("stages")
+    if isinstance(stages, list) and stages and isinstance(stages[-1], Mapping):
+        disk = stages[-1].get("response_disk")
+        if isinstance(disk, Mapping) and isinstance(disk.get("centre"), Mapping):
+            centre = disk["centre"]
+            try:
+                return abs(complex(
+                    float(centre["real"]),
+                    float(centre.get("imaginary", centre.get("imag"))),
+                ))
+            except (KeyError, TypeError, ValueError, OverflowError):
+                pass
     component = _record_component_result(record)
     direct = component.get("response_magnitude")
     if direct is not None:
@@ -730,6 +783,22 @@ def _record_response_magnitude(record: Mapping[str, object]) -> object:
 
 
 def _record_relative_error(record: Mapping[str, object]) -> object:
+    stages = record.get("stages")
+    if isinstance(stages, list) and stages and isinstance(stages[-1], Mapping):
+        disk = stages[-1].get("response_disk")
+        if isinstance(disk, Mapping):
+            centre = disk.get("centre", record.get("retained_centre"))
+            if isinstance(centre, Mapping):
+                try:
+                    magnitude = abs(complex(
+                        float(centre["real"]),
+                        float(centre.get("imaginary", centre.get("imag"))),
+                    ))
+                    radius = float(disk["radius"])
+                    if magnitude > 0 and math.isfinite(radius) and radius >= 0:
+                        return radius / magnitude
+                except (KeyError, TypeError, ValueError, OverflowError):
+                    pass
     component = _record_component_result(record)
     for name in ("relative_disk_radius", "relative_error"):
         if component.get(name) is not None:
@@ -814,8 +883,14 @@ class Schema11ProgressReporter:
         try:
             context = event.context.to_mapping()
             payload = dict(event.payload)
-            leaf_index = context.get("leaf_index")
-            leaf_count = context.get("leaf_count")
+            leaf_id = context.get("leaf_id")
+            metadata = (
+                self.leaf_metadata.get(leaf_id, {})
+                if isinstance(leaf_id, str)
+                else {}
+            )
+            leaf_index = context.get("leaf_index", metadata.get("leaf_ordinal"))
+            leaf_count = context.get("leaf_count", metadata.get("leaf_count"))
             self._live.update(
                 {
                     "elapsed": f"{event.monotonic_seconds:.1f}s",
@@ -828,7 +903,10 @@ class Schema11ProgressReporter:
                     "profile": context.get("execution_profile", self.profile),
                     "pass": context.get("survey_pass", self.pass_name),
                     "root": context.get("root_phase"),
-                    "mechanism": context.get("mechanism_id"),
+                    "mode": context.get("mode", metadata.get("mode")),
+                    "mechanism": context.get(
+                        "mechanism_id", metadata.get("mechanism")
+                    ),
                     "tier": context.get("precision_tier"),
                     "phase": context.get("phase", event.kind.value),
                     "sample": _ratio(
