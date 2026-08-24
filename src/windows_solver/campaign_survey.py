@@ -750,35 +750,58 @@ def run_binary64_survey(
             continue
 
         if leaf.mechanism_id == "horizon-admittance":
-            timing_recorder = TimingSessionRecorder(
-                log=operational_timing,
-                session_id=make_session_id(),
-                leaf_id=leaf_id,
-                execution_profile="SURVEY",
-                survey_pass="binary64",
-                clock=clock,
-            )
-            timing_recorder.start_tier("binary64")
-            with progress_scope(**leaf_context):
-                outcome = guarded(lambda: horizon_runner(leaf))
-            if not isinstance(outcome, Binary64PassOutcome):
-                guarded(
-                    lambda: (_ for _ in ()).throw(
-                        ValueError("binary64 horizon runner returned an invalid outcome")
-                    )
+            seal = guarded(lambda: root_seal_lookup(leaf))
+            if seal is None:
+                outcome = Binary64PassOutcome(
+                    disposition=SurveyDisposition.PROMOTION_PENDING_ROOT,
+                    operation_identity="binary64-horizon-production/v2",
+                    reason_code="ROOT_SEAL_UNAVAILABLE",
+                    queue_kind=PromotionQueueKind.ROOT,
                 )
-            assert isinstance(outcome, Binary64PassOutcome)
-            timing_recorder.complete_tier()
-            timing_summary = fold_timing_fragments(timing_recorder.fragments)
-            outcome = replace(
-                outcome,
-                tier_timing=timing_summary.tier_timing_mappings(),
-                session_fragments=tuple(
-                    fragment.to_mapping()
-                    for fragment in timing_recorder.fragments
-                ),
-            )
-            root_seal_sha256 = None
+                root_seal_sha256 = None
+            else:
+                if not isinstance(seal, AuthenticatedRootSeal):
+                    guarded(
+                        lambda: (_ for _ in ()).throw(
+                            ValueError("root seal lookup returned an invalid value")
+                        )
+                    )
+                assert isinstance(seal, AuthenticatedRootSeal)
+                if seal.branch_identity != leaf.job.root.branch_id:
+                    guarded(
+                        lambda: (_ for _ in ()).throw(
+                            ValueError("authenticated root seal branch mismatch")
+                        )
+                    )
+                root_seal_sha256 = seal.root_seal_sha256
+                timing_recorder = TimingSessionRecorder(
+                    log=operational_timing,
+                    session_id=make_session_id(),
+                    leaf_id=leaf_id,
+                    execution_profile="SURVEY",
+                    survey_pass="binary64",
+                    clock=clock,
+                )
+                timing_recorder.start_tier("binary64")
+                with progress_scope(**leaf_context):
+                    outcome = guarded(lambda: horizon_runner(leaf))
+                if not isinstance(outcome, Binary64PassOutcome):
+                    guarded(
+                        lambda: (_ for _ in ()).throw(
+                            ValueError("binary64 horizon runner returned an invalid outcome")
+                        )
+                    )
+                assert isinstance(outcome, Binary64PassOutcome)
+                timing_recorder.complete_tier()
+                timing_summary = fold_timing_fragments(timing_recorder.fragments)
+                outcome = replace(
+                    outcome,
+                    tier_timing=timing_summary.tier_timing_mappings(),
+                    session_fragments=tuple(
+                        fragment.to_mapping()
+                        for fragment in timing_recorder.fragments
+                    ),
+                )
         else:
             seal = guarded(lambda: root_seal_lookup(leaf))
             if seal is None:

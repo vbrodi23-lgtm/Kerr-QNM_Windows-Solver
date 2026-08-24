@@ -92,7 +92,8 @@ from .julia_response_backend import (
     _validated_execution_resource_policy,
 )
 from .promoted_control_calibration import load_default_calibration_receipt
-from .root_readout_cache import RootReadoutStore
+from .root_evidence import AuthenticatedRootEvidence, RootDependencyKey
+from .root_readout_cache import RootEvidenceStore, RootReadoutStore
 from .reviewed_determinant_error import ReviewedDeterminantErrorStore
 from .background_evidence_store import CanonicalBackgroundEvidenceStore
 from .solved_leaf_cache import SolvedLeafLookupStatus, SolvedLeafStore
@@ -915,12 +916,14 @@ class AuthenticatedRootSealProvider:
         selection: object,
         checkpoint: Mapping[str, object],
         solved_leaf_store: SolvedLeafStore,
+        root_evidence_store: RootEvidenceStore,
     ) -> None:
         self._leaf_by_id = {leaf.leaf_id: leaf for leaf in plan.leaves}
         self._checkpoint: list[_RootSealCandidate] = []
         self._solved: list[_RootSealCandidate] = []
         self._readouts: list[_RootSealCandidate] = []
         self._published: list[_RootSealCandidate] = []
+        self._root_evidence_store = root_evidence_store
         self.lookup_count = 0
         self.hit_count = 0
 
@@ -1014,17 +1017,50 @@ class AuthenticatedRootSealProvider:
             (
                 item.seal.fixed_root,
                 item.seal.branch_identity,
-                item.seal.root_seal_sha256,
             )
             for item in all_candidates
         }
         if len(identities) > 1:
             raise ValueError("SYSTEM_FAILURE ROOT_SEAL_CONFLICT")
+        key = RootDependencyKey.from_leaf(leaf)
+        persisted = self._root_evidence_store.lookup(key)
+        if persisted is not None:
+            persisted.validate_for(leaf)
+            durable = AuthenticatedRootSeal(
+                fixed_root=persisted.fixed_root,
+                branch_identity=persisted.branch_identity,
+                root_seal_sha256=persisted.root_seal_sha256,
+            )
+            if identities and next(iter(identities)) != (
+                durable.fixed_root,
+                durable.branch_identity,
+            ):
+                raise ValueError("SYSTEM_FAILURE ROOT_SEAL_CONFLICT")
+            self.hit_count += 1
+            return durable
         for group in compatible_groups:
             if group:
+                source = group[0].seal
+                evidence = AuthenticatedRootEvidence.from_seal(
+                    leaf,
+                    fixed_root=source.fixed_root,
+                    branch_identity=source.branch_identity,
+                    source_receipt_sha256=source.root_seal_sha256,
+                )
+                self._root_evidence_store.publish(evidence)
                 self.hit_count += 1
-                return group[0].seal
-        return None
+                return AuthenticatedRootSeal(
+                    fixed_root=evidence.fixed_root,
+                    branch_identity=evidence.branch_identity,
+                    root_seal_sha256=evidence.root_seal_sha256,
+                )
+        evidence = AuthenticatedRootEvidence.from_bound_leaf(leaf)
+        self._root_evidence_store.publish(evidence)
+        return AuthenticatedRootSeal(
+            fixed_root=evidence.fixed_root,
+            branch_identity=evidence.branch_identity,
+            root_seal_sha256=evidence.root_seal_sha256,
+        )
 
     def publish(self, leaf: object, seal: AuthenticatedRootSeal) -> None:
         """Make a newly authenticated PRIMARY root visible in the same pass."""
@@ -1040,7 +1076,11 @@ class AuthenticatedRootSealProvider:
         except BaseException:
             self._published.pop()
             raise
-        if resolved != seal:
+        if (
+            resolved is None
+            or resolved.fixed_root != seal.fixed_root
+            or resolved.branch_identity != seal.branch_identity
+        ):
             self._published.pop()
             raise ValueError("SYSTEM_FAILURE ROOT_SEAL_CONFLICT")
 
@@ -1205,13 +1245,14 @@ def run_native_binary64_pass(
         checkpoint_path.parent
         / f"{checkpoint_path.name}.canonical-backgrounds"
     )
+    root_evidence_store = RootEvidenceStore.for_checkpoint(checkpoint_path)
     backend_holder: dict[str, NativeCampaignStageBackend] = {}
     root_provider_holder: dict[str, AuthenticatedRootSealProvider] = {}
 
     def root_provider() -> AuthenticatedRootSealProvider:
         if "value" not in root_provider_holder:
             root_provider_holder["value"] = AuthenticatedRootSealProvider(
-                plan, selection, checkpoint, store
+                plan, selection, checkpoint, store, root_evidence_store
             )
         return root_provider_holder["value"]
 
@@ -1709,13 +1750,14 @@ def run_native_promoted_pass(
         checkpoint_path.parent
         / f"{checkpoint_path.name}.reviewed-determinant-errors"
     )
+    root_evidence_store = RootEvidenceStore.for_checkpoint(checkpoint_path)
     backend_holder: dict[str, NativeCampaignStageBackend] = {}
     root_provider_holder: dict[str, AuthenticatedRootSealProvider] = {}
 
     def root_provider() -> AuthenticatedRootSealProvider:
         if "value" not in root_provider_holder:
             root_provider_holder["value"] = AuthenticatedRootSealProvider(
-                plan, selection, checkpoint, store
+                plan, selection, checkpoint, store, root_evidence_store
             )
         return root_provider_holder["value"]
 

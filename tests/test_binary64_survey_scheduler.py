@@ -277,8 +277,10 @@ class Binary64SurveySchedulerTests(unittest.TestCase):
                 selection,
                 empty_schema11_checkpoint(selection.campaign_id, selection.selection_id),
                 checkpoint_path=path,
-                root_seal_lookup=lambda _leaf: self.fail(
-                    "horizon survey must not request a root seal"
+                root_seal_lookup=lambda leaf: AuthenticatedRootSeal(
+                    fixed_root=leaf.job.root.omega,
+                    branch_identity=leaf.job.root.branch_id,
+                    root_seal_sha256="e" * 64,
                 ),
                 native_backend_factory=lambda: self.fail(
                     "unresolved horizon must not construct an exterior backend"
