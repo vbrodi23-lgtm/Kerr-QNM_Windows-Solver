@@ -1207,11 +1207,21 @@ def run_native_evidence_pass(
         receipt_content = {
             "schema": "windows-solver.native-evidence-result/1",
             "profile": reviewed_policy.profile.value,
+            "evidence_policy_identity": reviewed_policy.identity_sha256,
             "leaf_id": leaf_id,
             "central_record_sha256": record["record_sha256"],
             "central_stage_sha256": stage_sha,
             "precision_tier": "BF80",
             "refinement": refinement,
+            "operation_identity": (
+                "production-certification-comparator/v1"
+                if reviewed_policy.profile is ExecutionProfile.CERTIFY
+                else "independent-validation-comparator/v1"
+            ),
+            "backend_identity": leaf.job.backend_identity.identity_sha256,
+            "runtime_identity": _sha256(
+                precision.scientific_runtime_for(leaf.job)
+            ),
             "calculation_route_identity": SAME_BACKEND_REFINEMENT_ROUTE,
             "calculation_route_family": (
                 "HORIZON"

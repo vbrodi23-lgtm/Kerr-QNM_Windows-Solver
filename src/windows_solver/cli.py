@@ -1371,12 +1371,20 @@ def _campaign_reduce(bundle_path: Path, output: Path) -> tuple[int, object]:
     if resolved_output.exists():
         raise ValueError("campaign reduction refuses an existing output")
     value = _load_strict_json(bundle, "campaign reduction bundle")
+    if not isinstance(value, Mapping):
+        raise ValueError("campaign reduction bundle must be an object")
+    if value.get("schema_version") == 1:
+        raise ValueError(
+            "legacy schema-1 reduction bundles cannot prove schema-11 evidence; "
+            "regenerate the bundle with explicit schema-11 checkpoint paths"
+        )
     expected_fields = {
         "schema_version", "campaign_id", "backend_id", "precision_digits",
-        "precision_backend", "checkpoint_paths", "selected_row_ids",
-        "component_evidence", "source_hashes", "bundle_sha256",
+        "precision_backend", "schema11_checkpoint_paths", "selected_row_ids",
+        "required_evidence_levels", "component_evidence", "source_hashes",
+        "bundle_sha256",
     }
-    if set(value) != expected_fields or value["schema_version"] != 1:
+    if set(value) != expected_fields or value["schema_version"] != 2:
         raise ValueError("campaign reduction bundle fields or schema are invalid")
     sealed = {key: item for key, item in value.items() if key != "bundle_sha256"}
     expected_digest = hashlib.sha256(canonical_json_bytes(sealed)).hexdigest()
@@ -1388,10 +1396,11 @@ def _campaign_reduce(bundle_path: Path, output: Path) -> tuple[int, object]:
     if value["backend_id"] != backend_identity.backend_id:
         raise ValueError("campaign reduction backend identity is invalid")
     digits = value["precision_digits"]
-    checkpoint_paths = value["checkpoint_paths"]
+    checkpoint_paths = value["schema11_checkpoint_paths"]
     selected_row_ids = value["selected_row_ids"]
     raw_components = value["component_evidence"]
     declared_hashes = value["source_hashes"]
+    required_evidence_levels = value["required_evidence_levels"]
     if (
         not isinstance(digits, list)
         or not isinstance(checkpoint_paths, list)
@@ -1403,6 +1412,7 @@ def _campaign_reduce(bundle_path: Path, output: Path) -> tuple[int, object]:
         or not isinstance(raw_components, list)
         or not isinstance(declared_hashes, list)
         or any(not isinstance(item, str) for item in declared_hashes)
+        or not isinstance(required_evidence_levels, Mapping)
     ):
         raise ValueError("campaign reduction bundle arrays are invalid")
     plan = build_campaign_plan(
@@ -1437,9 +1447,22 @@ def _campaign_reduce(bundle_path: Path, output: Path) -> tuple[int, object]:
         )
     except KeyError as error:
         raise ValueError("campaign reduction selected row is invalid") from error
-    release_requirements = {
-        leaf_id: EvidenceLevel.CERTIFIED for leaf_id in required_leaf_ids
-    }
+    if set(required_evidence_levels) != required_leaf_ids:
+        raise ValueError(
+            "campaign reduction evidence policy must bind every selected leaf"
+        )
+    try:
+        release_requirements = {
+            leaf_id: EvidenceLevel(required_evidence_levels[leaf_id])
+            for leaf_id in required_leaf_ids
+        }
+    except (TypeError, ValueError) as error:
+        raise ValueError("campaign reduction evidence policy is invalid") from error
+    if any(
+        level is EvidenceLevel.SCREENED
+        for level in release_requirements.values()
+    ):
+        raise ValueError("SCREENED evidence is forbidden in release reduction")
     release_covered_leaf_ids: set[str] = set()
     records_by_id: dict[str, CampaignLeafRecord] = {}
     receipts_by_id: dict[str, set[str]] = {}

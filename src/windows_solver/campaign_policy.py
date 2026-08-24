@@ -13,6 +13,7 @@ from enum import Enum
 from typing import Mapping, Sequence
 
 from .contracts import canonical_json_bytes
+from .evidence_authentication import certified_disposition_is_admitted
 from .validation_admission import validated_disposition_is_admitted
 from .campaign_timing import TimingFragment, fold_timing_fragments
 
@@ -267,6 +268,19 @@ def record_evidence(
     ):
         raise ValueError(
             "VALIDATED requires an authenticated approved independent route"
+        )
+    if level == EvidenceLevel.CERTIFIED.value and not any(
+        certified_disposition_is_admitted(
+            receipt,
+            leaf_id=leaf_id,
+            central_record_sha256=central_record_sha256,
+            central_stage_sha256=central_stage_sha256,
+        )
+        for receipt in (*merged_receipts, *receipts)
+        if isinstance(receipt, Mapping)
+    ):
+        raise ValueError(
+            "CERTIFIED requires an authenticated certification disposition"
         )
     for receipt in receipts:
         candidate = copy.deepcopy(dict(receipt))

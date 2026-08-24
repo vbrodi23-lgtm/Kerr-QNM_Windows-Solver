@@ -18,6 +18,8 @@ from .campaign_policy import (
     validate_schema11_checkpoint,
 )
 from .contracts import canonical_json_bytes
+from .evidence_authentication import certified_disposition_is_admitted
+from .validation_admission import validated_disposition_is_admitted
 from .validation_admission import validation_admission_status
 
 
@@ -482,21 +484,68 @@ def require_release_evidence(
             raise ValueError(
                 f"release evidence stage binding is invalid for {leaf_id}"
             )
-        terminal_stage = stages[-1]
-        if (
-            not isinstance(terminal_stage, Mapping)
-            or entry.get("central_record_sha256") != record.get("record_sha256")
-            or entry.get("central_stage_sha256")
-            != terminal_stage.get("stage_sha256")
-        ):
+        central_stage_sha256 = entry.get("central_stage_sha256")
+        central_stage = next(
+            (
+                stage
+                for stage in stages
+                if isinstance(stage, Mapping)
+                and stage.get("stage_sha256") == central_stage_sha256
+            ),
+            None,
+        )
+        if not isinstance(central_stage, Mapping):
             raise ValueError(
                 f"release evidence stage binding is invalid for {leaf_id}"
+            )
+        stage_content = {
+            key: value
+            for key, value in central_stage.items()
+            if key != "stage_sha256"
+        }
+        if (
+            entry.get("central_record_sha256") != record.get("record_sha256")
+            or central_stage_sha256 != _sha256(stage_content)
+        ):
+            raise ValueError(
+                f"release evidence stage authentication failed for {leaf_id}"
             )
         actual = EvidenceLevel(entry["evidence_level"])
         if _EVIDENCE_RANK[actual] < _EVIDENCE_RANK[required_level]:
             raise ValueError(
                 f"release admission requires {required_level.value} evidence "
                 f"for {leaf_id}"
+            )
+        receipts = entry.get("receipts")
+        if not isinstance(receipts, list):
+            raise ValueError(f"release evidence receipts are invalid for {leaf_id}")
+        certification_admitted = any(
+            certified_disposition_is_admitted(
+                receipt,
+                leaf_id=leaf_id,
+                central_record_sha256=str(record["record_sha256"]),
+                central_stage_sha256=str(central_stage_sha256),
+            )
+            for receipt in receipts
+            if isinstance(receipt, Mapping)
+        )
+        validation_admitted = any(
+            validated_disposition_is_admitted(
+                receipt,
+                leaf_id=leaf_id,
+                central_record_sha256=str(record["record_sha256"]),
+                central_stage_sha256=str(central_stage_sha256),
+            )
+            for receipt in receipts
+            if isinstance(receipt, Mapping)
+        )
+        if not certification_admitted or (
+            required_level is EvidenceLevel.VALIDATED
+            and not validation_admitted
+        ):
+            raise ValueError(
+                f"release evidence receipts do not authenticate "
+                f"{required_level.value} for {leaf_id}"
             )
 
 

@@ -9,6 +9,7 @@ import hashlib
 from typing import Mapping
 
 from .contracts import canonical_json_bytes
+from .evidence_authentication import evidence_policy_identity
 
 
 INDEPENDENT_VALIDATION_ROUTES = {
@@ -36,6 +37,13 @@ def _is_sha256(value: object) -> bool:
 def validation_admission_status(receipt: Mapping[str, object]) -> str:
     """Return ADMITTED only for a complete reviewed route-specific receipt."""
 
+    material = dict(receipt)
+    supplied_receipt_sha256 = material.pop("receipt_sha256", None)
+    if (
+        not _is_sha256(supplied_receipt_sha256)
+        or supplied_receipt_sha256 != _sha256(material)
+    ):
+        raise ValueError("independent validation source receipt digest is invalid")
     route = receipt.get("calculation_route_identity")
     if route == SAME_BACKEND_REFINEMENT_ROUTE:
         return "ROUTE_NOT_INDEPENDENT"
@@ -110,6 +118,18 @@ def validated_disposition_is_admitted(
         and receipt.get("central_record_sha256") == central_record_sha256
         and receipt.get("central_stage_sha256") == central_stage_sha256
         and receipt.get("validation_admission_status") == "ADMITTED"
+        and receipt.get("evidence_policy_identity")
+        == evidence_policy_identity("VALIDATE")
+        and source.get("profile") == "VALIDATE"
+        and source.get("leaf_id") == leaf_id
+        and source.get("central_record_sha256") == central_record_sha256
+        and source.get("central_stage_sha256") == central_stage_sha256
+        and source.get("evidence_policy_identity")
+        == evidence_policy_identity("VALIDATE")
+        and source.get("operation_identity")
+        == "independent-validation-comparator/v1"
+        and _is_sha256(source.get("backend_identity"))
+        and _is_sha256(source.get("runtime_identity"))
         and validation_admission_status(source) == "ADMITTED"
     )
 
