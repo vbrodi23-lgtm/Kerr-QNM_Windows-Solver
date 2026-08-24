@@ -2512,15 +2512,15 @@ class JuliaResponseAdapter:
                 request_sha256=request_sha256, runtime_identity=identity
             )
         except (OSError, ValueError) as error:
-            # A work cache must never be able to fail a readout; fall through and
-            # let the worker recompute.
             emit_progress(
                 ProgressEventKind.ROOT_READOUT_CACHE_CORRUPT,
                 request_sha256=request_sha256,
                 error_type=type(error).__name__,
                 message=str(error),
             )
-            return None
+            raise JuliaResponseBackendError(
+                "trusted root-readout store lookup failed closed"
+            ) from error
         if lookup.status is RootReadoutLookupStatus.CORRUPT:
             emit_progress(
                 ProgressEventKind.ROOT_READOUT_CACHE_CORRUPT,
@@ -2528,7 +2528,10 @@ class JuliaResponseAdapter:
                 store_path=str(lookup.path),
                 message=lookup.reason,
             )
-            return None
+            raise JuliaResponseBackendError(
+                "trusted root-readout entry is corrupt: "
+                f"{lookup.path}: {lookup.reason}"
+            )
         if lookup.status is not RootReadoutLookupStatus.HIT:
             return None
         emit_progress(
@@ -2555,7 +2558,9 @@ class JuliaResponseAdapter:
 
         store = self.readout_cache
         if store is None:
-            return
+            raise JuliaResponseBackendError(
+                "durable root-readout store is unavailable"
+            )
         try:
             path = store.publish(
                 request_sha256=request_sha256,
@@ -2570,7 +2575,9 @@ class JuliaResponseAdapter:
                 error_type=type(error).__name__,
                 message=str(error),
             )
-            return
+            raise JuliaResponseBackendError(
+                "validated root readout could not be durably published"
+            ) from error
         emit_progress(
             ProgressEventKind.ROOT_READOUT_RETAINED,
             request_sha256=request_sha256,

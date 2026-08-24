@@ -913,6 +913,7 @@ def _run_promoted_exterior_queue_entry(
     root_seal_lookup: Callable[
         [object, Mapping[str, object]], AuthenticatedRootSeal | None
     ],
+    root_seal_publish: Callable[[object, AuthenticatedRootSeal], None],
     backend_factory: Callable[[object, int], object],
     primary_root_runner: Callable[
         [object, object, int], PromotedRootSolveResult
@@ -925,9 +926,8 @@ def _run_promoted_exterior_queue_entry(
     determinant_error_store: ReviewedDeterminantErrorStore | None,
 ) -> PromotedPassOutcome:
     queue_kind = PromotionQueueKind(entry["queue_kind"])
-    seal: AuthenticatedRootSeal | None = None
+    seal = root_seal_lookup(leaf, entry)
     if queue_kind is PromotionQueueKind.RESPONSE:
-        seal = root_seal_lookup(leaf, entry)
         if not isinstance(seal, AuthenticatedRootSeal):
             raise ValueError("promoted response queue lacks its authenticated root seal")
         if seal.root_seal_sha256 != entry["source_root_seal_sha256"]:
@@ -990,6 +990,7 @@ def _run_promoted_exterior_queue_entry(
             seal = root_result.seal
             if seal.branch_identity != leaf.job.root.branch_id:
                 raise ValueError("promoted PRIMARY root seal branch mismatch")
+            root_seal_publish(leaf, seal)
 
         worker_launches += 1
         try:
@@ -1268,6 +1269,9 @@ def run_promoted_survey(
         [object, JuliaFixedRootSurveyBatch, object, int],
         tuple[Mapping[str, object], str],
     ],
+    root_seal_publish: Callable[
+        [object, AuthenticatedRootSeal], None
+    ] | None = None,
     determinant_error_store: ReviewedDeterminantErrorStore | None = None,
     solved_leaf_store: SolvedLeafStore | None = None,
     record_validator: RecordValidator | None = None,
@@ -1470,6 +1474,11 @@ def run_promoted_survey(
                         leaf,
                         snapshot,
                         root_seal_lookup=root_seal_lookup,
+                        root_seal_publish=(
+                            root_seal_publish
+                            if root_seal_publish is not None
+                            else lambda _leaf, _seal: None
+                        ),
                         backend_factory=backend_factory,
                         primary_root_runner=primary_root_runner,
                         produced_record_builder=produced_record_builder,

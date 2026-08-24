@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import replace
+from dataclasses import dataclass, replace
 import hashlib
 import math
 import os
@@ -19,6 +19,7 @@ from .campaign_policy import (
     ExecutionProfile,
     PromotionQueueKind,
     SurveyDisposition,
+    validate_schema11_checkpoint,
 )
 from .campaign_recovery import RecoverySelection
 from .campaign_reports import (
@@ -525,70 +526,163 @@ def _recovered_root_readout_entries(
     return tuple(result)
 
 
-def _root_index(
-    plan: object,
-    selection: object,
-    checkpoint: Mapping[str, object],
-    store: SolvedLeafStore,
-) -> dict[object, tuple[AuthenticatedRootSeal, ...]]:
-    leaf_by_id = {leaf.leaf_id: leaf for leaf in plan.leaves}
-    records = list(checkpoint["records"])
-    for leaf_id in selection.leaf_ids:
-        lookup = store.lookup_readonly(
-            scientific_computation_identity_sha256(plan, leaf_by_id[leaf_id]),
-            leaf_id,
-        )
-        if lookup.status is SolvedLeafLookupStatus.CORRUPT:
-            raise ValueError(
-                f"trusted solved-leaf cache receipt is corrupt: {lookup.path}: "
-                f"{lookup.reason}"
+@dataclass(frozen=True, slots=True)
+class _RootSealCandidate:
+    source_leaf: object
+    seal: AuthenticatedRootSeal
+    source_kind: str
+    promoted_root_seal: PromotedRootSeal | None = None
+
+
+def _root_solving_identity_compatible(source: object, target: object) -> bool:
+    return (
+        source.job.root.to_mapping() == target.job.root.to_mapping()
+        and source.job.policy.identity_sha256 == target.job.policy.identity_sha256
+        and source.job.backend_identity.identity_sha256
+        == target.job.backend_identity.identity_sha256
+        and source.job.equation_id == target.job.equation_id
+        and source.job.sampling_coordinate.to_mapping()
+        == target.job.sampling_coordinate.to_mapping()
+    )
+
+
+class AuthenticatedRootSealProvider:
+    """Single live production owner for exact authenticated root-seal reuse."""
+
+    def __init__(
+        self,
+        plan: object,
+        selection: object,
+        checkpoint: Mapping[str, object],
+        solved_leaf_store: SolvedLeafStore,
+    ) -> None:
+        self._leaf_by_id = {leaf.leaf_id: leaf for leaf in plan.leaves}
+        self._checkpoint: list[_RootSealCandidate] = []
+        self._solved: list[_RootSealCandidate] = []
+        self._readouts: list[_RootSealCandidate] = []
+        self._published: list[_RootSealCandidate] = []
+        self.lookup_count = 0
+        self.hit_count = 0
+
+        authenticated_checkpoint = validate_schema11_checkpoint(checkpoint)
+        for record in authenticated_checkpoint["records"]:
+            if not isinstance(record, Mapping):
+                continue
+            source = self._leaf_by_id.get(record.get("leaf_id"))
+            if source is None:
+                continue
+            validate_campaign_recovery_record(plan, source.leaf_id, record)
+            seal = _old_record_root_seal(record) or _new_record_root_seal(record)
+            if seal is not None:
+                self._checkpoint.append(
+                    _RootSealCandidate(source, seal, "checkpoint-terminal")
+                )
+
+        for leaf_id in selection.leaf_ids:
+            source = self._leaf_by_id[leaf_id]
+            lookup = solved_leaf_store.lookup_readonly(
+                scientific_computation_identity_sha256(plan, source),
+                leaf_id,
             )
-        if lookup.status is SolvedLeafLookupStatus.HIT:
+            if lookup.status is SolvedLeafLookupStatus.CORRUPT:
+                raise ValueError(
+                    f"trusted solved-leaf cache receipt is corrupt: {lookup.path}: "
+                    f"{lookup.reason}"
+                )
+            if lookup.status is not SolvedLeafLookupStatus.HIT:
+                continue
             if lookup.receipt is None or not isinstance(
                 lookup.receipt.get("record"), Mapping
             ):
                 raise ValueError("solved-leaf cache hit lacks a valid record")
-            records.append(lookup.receipt["record"])
-    result: dict[object, list[AuthenticatedRootSeal]] = {}
-    for record in records:
-        if not isinstance(record, Mapping):
-            continue
-        source = leaf_by_id.get(record.get("leaf_id"))
-        if source is None:
-            continue
-        seal = _old_record_root_seal(record) or _new_record_root_seal(record)
-        if seal is None:
-            continue
-        result.setdefault(source.job.root, []).append(seal)
-    for entry in _recovered_root_readout_entries(checkpoint):
-        source, seal = _validated_cached_readout(leaf_by_id, entry)
-        for target in leaf_by_id.values():
-            if _root_readout_compatible(source, target, seal):
-                result.setdefault(target.job.root, []).append(
-                    AuthenticatedRootSeal(
-                        fixed_root=seal.root_readout.omega,
-                        branch_identity=target.job.root.branch_id,
-                        root_seal_sha256=seal.sha256,
-                    )
+            record = lookup.receipt["record"]
+            validate_campaign_recovery_record(plan, leaf_id, record)
+            seal = _old_record_root_seal(record) or _new_record_root_seal(record)
+            if seal is not None:
+                self._solved.append(
+                    _RootSealCandidate(source, seal, "solved-leaf-terminal")
                 )
-    return {key: tuple(value) for key, value in result.items()}
 
+        for entry in _recovered_root_readout_entries(authenticated_checkpoint):
+            source, promoted = _validated_cached_readout(self._leaf_by_id, entry)
+            self._readouts.append(
+                _RootSealCandidate(
+                    source,
+                    AuthenticatedRootSeal(
+                        fixed_root=promoted.root_readout.omega,
+                        branch_identity=promoted.root_readout.branch_id,
+                        root_seal_sha256=promoted.sha256,
+                    ),
+                    "root-readout-store",
+                    promoted,
+                )
+            )
 
-def _seal_for_leaf(
-    index: Mapping[object, tuple[AuthenticatedRootSeal, ...]], leaf: object
-) -> AuthenticatedRootSeal | None:
-    candidates = tuple(
-        seal
-        for seal in index.get(leaf.job.root, ())
-        if seal.branch_identity == leaf.job.root.branch_id
-    )
-    identities = {
-        (seal.fixed_root, seal.branch_identity, seal.root_seal_sha256)
-        for seal in candidates
-    }
-    if len(identities) > 1:
-        raise ValueError("conflicting authenticated root seals")
-    return None if not candidates else candidates[0]
+    def _compatible(
+        self, candidate: _RootSealCandidate, target: object
+    ) -> bool:
+        if not _root_solving_identity_compatible(candidate.source_leaf, target):
+            return False
+        if candidate.seal.branch_identity != target.job.root.branch_id:
+            return False
+        if candidate.source_kind == "root-readout-store":
+            promoted = candidate.promoted_root_seal
+            if promoted is None or not _root_readout_compatible(
+                candidate.source_leaf, target, promoted
+            ):
+                return False
+        return True
+
+    def lookup(self, leaf: object) -> AuthenticatedRootSeal | None:
+        """Resolve immediately before work, preserving the mandated order."""
+
+        self.lookup_count += 1
+        groups = (
+            self._checkpoint,
+            self._solved,
+            self._readouts,
+            self._published,
+        )
+        compatible_groups = tuple(
+            tuple(item for item in group if self._compatible(item, leaf))
+            for group in groups
+        )
+        all_candidates = tuple(
+            item for group in compatible_groups for item in group
+        )
+        identities = {
+            (
+                item.seal.fixed_root,
+                item.seal.branch_identity,
+                item.seal.root_seal_sha256,
+            )
+            for item in all_candidates
+        }
+        if len(identities) > 1:
+            raise ValueError("SYSTEM_FAILURE ROOT_SEAL_CONFLICT")
+        for group in compatible_groups:
+            if group:
+                self.hit_count += 1
+                return group[0].seal
+        return None
+
+    def publish(self, leaf: object, seal: AuthenticatedRootSeal) -> None:
+        """Make a newly authenticated PRIMARY root visible in the same pass."""
+
+        if not isinstance(seal, AuthenticatedRootSeal):
+            raise ValueError("published root seal is invalid")
+        if seal.branch_identity != leaf.job.root.branch_id:
+            raise ValueError("published root seal branch mismatch")
+        candidate = _RootSealCandidate(leaf, seal, "same-pass-primary")
+        self._published.append(candidate)
+        try:
+            resolved = self.lookup(leaf)
+        except BaseException:
+            self._published.pop()
+            raise
+        if resolved != seal:
+            self._published.pop()
+            raise ValueError("SYSTEM_FAILURE ROOT_SEAL_CONFLICT")
 
 
 def _horizon_outcome(
@@ -647,12 +741,14 @@ def run_native_binary64_pass(
         / f"{checkpoint_path.name}.reviewed-determinant-errors"
     )
     backend_holder: dict[str, NativeCampaignStageBackend] = {}
-    roots_holder: dict[str, dict[object, tuple[AuthenticatedRootSeal, ...]]] = {}
+    root_provider_holder: dict[str, AuthenticatedRootSealProvider] = {}
 
-    def roots() -> dict[object, tuple[AuthenticatedRootSeal, ...]]:
-        if "value" not in roots_holder:
-            roots_holder["value"] = _root_index(plan, selection, checkpoint, store)
-        return roots_holder["value"]
+    def root_provider() -> AuthenticatedRootSealProvider:
+        if "value" not in root_provider_holder:
+            root_provider_holder["value"] = AuthenticatedRootSealProvider(
+                plan, selection, checkpoint, store
+            )
+        return root_provider_holder["value"]
 
     def backend() -> NativeCampaignStageBackend:
         if "value" not in backend_holder:
@@ -660,7 +756,7 @@ def run_native_binary64_pass(
         return backend_holder["value"]
 
     def build(leaf, batch, screening):
-        seal = _seal_for_leaf(roots(), leaf)
+        seal = root_provider().lookup(leaf)
         if seal is None:
             raise ValueError("fixed-root record builder lost its root seal")
         return build_fixed_root_screening_record(
@@ -677,7 +773,7 @@ def run_native_binary64_pass(
         recovery_selection,
         checkpoint,
         checkpoint_path=checkpoint_path,
-        root_seal_lookup=lambda leaf: _seal_for_leaf(roots(), leaf),
+        root_seal_lookup=lambda leaf: root_provider().lookup(leaf),
         native_backend_factory=lambda: backend().adapter.kernel,
         horizon_runner=lambda leaf: _horizon_outcome(plan, backend(), leaf),
         produced_record_builder=build,
@@ -802,7 +898,14 @@ def run_native_promoted_pass(
         / f"{checkpoint_path.name}.reviewed-determinant-errors"
     )
     backend_holder: dict[str, NativeCampaignStageBackend] = {}
-    roots_holder: dict[str, dict[object, tuple[AuthenticatedRootSeal, ...]]] = {}
+    root_provider_holder: dict[str, AuthenticatedRootSealProvider] = {}
+
+    def root_provider() -> AuthenticatedRootSealProvider:
+        if "value" not in root_provider_holder:
+            root_provider_holder["value"] = AuthenticatedRootSealProvider(
+                plan, selection, checkpoint, store
+            )
+        return root_provider_holder["value"]
 
     def backend() -> NativeCampaignStageBackend:
         if "value" not in backend_holder:
@@ -813,28 +916,17 @@ def run_native_promoted_pass(
             )
         return backend_holder["value"]
 
-    def roots() -> dict[object, tuple[AuthenticatedRootSeal, ...]]:
-        if "value" not in roots_holder:
-            roots_holder["value"] = _root_index(plan, selection, checkpoint, store)
-        return roots_holder["value"]
-
     def seal_lookup(leaf, entry):
-        candidates = roots().get(leaf.job.root, ())
+        candidate = root_provider().lookup(leaf)
         expected = entry.get("source_root_seal_sha256")
-        exact = tuple(
-            item
-            for item in candidates
-            if item.branch_identity == leaf.job.root.branch_id
-            and (expected is None or item.root_seal_sha256 == expected)
-        )
-        if len(
-            {
-                (item.fixed_root, item.branch_identity, item.root_seal_sha256)
-                for item in exact
-            }
-        ) > 1:
-            raise ValueError("conflicting promoted root seals")
-        return None if not exact else exact[0]
+        if (
+            candidate is not None
+            and expected is not None
+            and candidate.root_seal_sha256 != expected
+            and entry.get("queue_kind") == PromotionQueueKind.RESPONSE.value
+        ):
+            raise ValueError("promoted response root seal digest mismatch")
+        return candidate
 
     def build(leaf, batch, screening, digits):
         root_sha = batch.root_seal_sha256
@@ -853,6 +945,7 @@ def run_native_promoted_pass(
         checkpoint,
         checkpoint_path=checkpoint_path,
         root_seal_lookup=seal_lookup,
+        root_seal_publish=lambda leaf, seal: root_provider().publish(leaf, seal),
         backend_factory=lambda leaf, digits: backend()._julia_precision_backend_for(
             leaf.job, digits
         ),
