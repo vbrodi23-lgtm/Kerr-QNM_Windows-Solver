@@ -69,6 +69,7 @@ from .julia_response_backend import (
 )
 from .promoted_control_calibration import load_default_calibration_receipt
 from .root_readout_cache import RootReadoutStore
+from .reviewed_determinant_error import ReviewedDeterminantErrorStore
 from .solved_leaf_cache import SolvedLeafLookupStatus, SolvedLeafStore
 
 
@@ -636,10 +637,15 @@ def run_native_binary64_pass(
     *,
     checkpoint_path: Path,
     solved_leaf_store: SolvedLeafStore | None = None,
+    determinant_error_store: ReviewedDeterminantErrorStore | None = None,
 ) -> Binary64SurveyRun:
     """Execute the real binary64 scheduler with a Julia-free backend factory."""
 
     store = solved_leaf_store or SolvedLeafStore.default()
+    error_store = determinant_error_store or ReviewedDeterminantErrorStore(
+        checkpoint_path.parent
+        / f"{checkpoint_path.name}.reviewed-determinant-errors"
+    )
     backend_holder: dict[str, NativeCampaignStageBackend] = {}
     roots_holder: dict[str, dict[object, tuple[AuthenticatedRootSeal, ...]]] = {}
 
@@ -676,6 +682,7 @@ def run_native_binary64_pass(
         horizon_runner=lambda leaf: _horizon_outcome(plan, backend(), leaf),
         produced_record_builder=build,
         equivalence_receipt_lookup=None,
+        determinant_error_store=error_store,
         solved_leaf_store=store,
         record_validator=lambda leaf_id, record: validate_campaign_recovery_record(
             plan, leaf_id, record
@@ -785,10 +792,15 @@ def run_native_promoted_pass(
     checkpoint_path: Path,
     calibration_receipt: object | None = None,
     solved_leaf_store: SolvedLeafStore | None = None,
+    determinant_error_store: ReviewedDeterminantErrorStore | None = None,
 ) -> PromotedSurveyRun:
     """Execute only queued BF40/BF80 work through the survey-only operation."""
 
     store = solved_leaf_store or SolvedLeafStore.default()
+    error_store = determinant_error_store or ReviewedDeterminantErrorStore(
+        checkpoint_path.parent
+        / f"{checkpoint_path.name}.reviewed-determinant-errors"
+    )
     backend_holder: dict[str, NativeCampaignStageBackend] = {}
     roots_holder: dict[str, dict[object, tuple[AuthenticatedRootSeal, ...]]] = {}
 
@@ -847,6 +859,7 @@ def run_native_promoted_pass(
         primary_root_runner=_promoted_root_result,
         horizon_runner=lambda leaf: _promoted_horizon_outcome(plan, backend(), leaf),
         produced_record_builder=build,
+        determinant_error_store=error_store,
         solved_leaf_store=store,
         record_validator=lambda leaf_id, record: validate_campaign_recovery_record(
             plan, leaf_id, record

@@ -60,10 +60,13 @@ from .response_engine import (
     CanonicalExteriorBackground,
     build_exterior_background_reuse_key,
     canonical_background_from_binary64_batch,
+    combine_binary64_reused_background_batch,
+    reviewed_determinant_error_claims_for_fixed_root_batch,
     screen_binary64_fixed_root_batch,
     screen_binary64_reused_background_batch,
     screen_promoted_fixed_root_samples,
 )
+from .reviewed_determinant_error import ReviewedDeterminantErrorStore
 from .julia_response_backend import (
     JuliaFixedRootSurveyBatch,
     JuliaNumericalControlError,
@@ -329,6 +332,7 @@ def run_binary64_survey(
         [object, CanonicalExteriorBackground],
         BackgroundEquivalenceReceipt | None,
     ] | None = None,
+    determinant_error_store: ReviewedDeterminantErrorStore | None = None,
     solved_leaf_store: SolvedLeafStore | None = None,
     record_validator: RecordValidator | None = None,
     timing_log: CampaignTimingLog | None = None,
@@ -601,8 +605,24 @@ def run_binary64_survey(
                     )
                 )
                 if isinstance(batch, Binary64FixedRootBatch):
+                    determinant_error_evidence = guarded(lambda: (
+                        None
+                        if determinant_error_store is None
+                        else determinant_error_store.resolve_required(
+                            reviewed_determinant_error_claims_for_fixed_root_batch(
+                                leaf.job,
+                                batch,
+                                root_seal_sha256=seal.root_seal_sha256,
+                                arithmetic_tier="binary64",
+                                working_precision=53,
+                            )
+                        )
+                    ))
                     screening = guarded(
-                        lambda: screen_binary64_fixed_root_batch(batch)
+                        lambda: screen_binary64_fixed_root_batch(
+                            batch,
+                            determinant_error_evidence=determinant_error_evidence,
+                        )
                     )
                     canonical = guarded(
                         lambda: canonical_background_from_binary64_batch(
@@ -619,9 +639,29 @@ def run_binary64_survey(
                             )
                         )
                     assert background is not None
+                    combined = guarded(
+                        lambda: combine_binary64_reused_background_batch(
+                            background, batch
+                        )
+                    )
+                    determinant_error_evidence = guarded(lambda: (
+                        None
+                        if determinant_error_store is None
+                        else determinant_error_store.resolve_required(
+                            reviewed_determinant_error_claims_for_fixed_root_batch(
+                                leaf.job,
+                                combined,
+                                root_seal_sha256=seal.root_seal_sha256,
+                                arithmetic_tier="binary64",
+                                working_precision=53,
+                            )
+                        )
+                    ))
                     screening = guarded(
                         lambda: screen_binary64_reused_background_batch(
-                            background, batch
+                            background,
+                            batch,
+                            determinant_error_evidence=determinant_error_evidence,
                         )
                     )
                 else:
@@ -640,6 +680,10 @@ def run_binary64_survey(
                 if isinstance(batch, Binary64ReusedBackgroundBatch):
                     assert receipt is not None
                     evidence_receipts += (receipt.to_mapping(),)
+                if determinant_error_evidence is not None:
+                    evidence_receipts += (
+                        determinant_error_evidence.to_mappings()
+                    )
                 if screening.disposition is Binary64SurveyDisposition.PRODUCED:
                     built = guarded(
                         lambda: produced_record_builder(leaf, batch, screening)
@@ -878,6 +922,7 @@ def _run_promoted_exterior_queue_entry(
         tuple[Mapping[str, object], str],
     ],
     timing_recorder: TimingSessionRecorder,
+    determinant_error_store: ReviewedDeterminantErrorStore | None,
 ) -> PromotedPassOutcome:
     queue_kind = PromotionQueueKind(entry["queue_kind"])
     seal: AuthenticatedRootSeal | None = None
@@ -1000,16 +1045,32 @@ def _run_promoted_exterior_queue_entry(
         ):
             raise ValueError("promoted fixed-root survey batch budget mismatch")
         sample_count += batch.sample_count
+        determinant_error_evidence = (
+            None
+            if determinant_error_store is None
+            else determinant_error_store.resolve_required(
+                reviewed_determinant_error_claims_for_fixed_root_batch(
+                    leaf.job,
+                    batch,
+                    root_seal_sha256=seal.root_seal_sha256,
+                    arithmetic_tier=batch.precision_tier.value,
+                    working_precision=batch.working_precision_bits,
+                )
+            )
+        )
         screening = screen_promoted_fixed_root_samples(
             batch.samples,
             frequency_step=batch.frequency_step,
             coordinate_step=batch.coordinate_step,
+            determinant_error_evidence=determinant_error_evidence,
         )
         receipts.append({
             "schema": "windows-solver.promoted-fixed-root-batch-receipt/1",
             "batch": batch.to_mapping(),
             "screening": _screening_receipt(screening),
         })
+        if determinant_error_evidence is not None:
+            receipts.extend(determinant_error_evidence.to_mappings())
         if screening.disposition is Binary64SurveyDisposition.PRODUCED:
             built = produced_record_builder(leaf, batch, screening, digits)
             if not isinstance(built, tuple) or len(built) != 2:
@@ -1207,6 +1268,7 @@ def run_promoted_survey(
         [object, JuliaFixedRootSurveyBatch, object, int],
         tuple[Mapping[str, object], str],
     ],
+    determinant_error_store: ReviewedDeterminantErrorStore | None = None,
     solved_leaf_store: SolvedLeafStore | None = None,
     record_validator: RecordValidator | None = None,
     timing_log: CampaignTimingLog | None = None,
@@ -1412,6 +1474,7 @@ def run_promoted_survey(
                         primary_root_runner=primary_root_runner,
                         produced_record_builder=produced_record_builder,
                         timing_recorder=recorder,
+                        determinant_error_store=determinant_error_store,
                     )
                 except BaseException:
                     if recorder.active_tier is not None:
