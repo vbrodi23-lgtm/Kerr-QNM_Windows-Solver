@@ -117,6 +117,26 @@ _PASS_ENTRY_FIELDS = {
     "disposition",
     "disposition_receipt_sha256",
 }
+_PROMOTION_ENTRY_FIELDS = {
+    "leaf_id",
+    "queue_kind",
+    "source_pass",
+    "reason_code",
+    "minimum_requested_tier",
+    "source_record_sha256",
+    "source_stage_sha256",
+    "source_root_seal_sha256",
+    "scientific_computation_identity",
+    "queue_ordinal",
+    "disposition",
+    "disposition_receipt_sha256",
+}
+_PROMOTION_ENTRY_PROVISIONAL_FIELDS = _PROMOTION_ENTRY_FIELDS | {
+    "provisional_stage",
+    "provisional_stage_sha256",
+    "provisional_operation_identity",
+    "source_binary64_disposition_receipt_sha256",
+}
 
 
 def _sha256(value: object) -> str:
@@ -397,6 +417,10 @@ def append_promotion(
     source_record_sha256: str | None = None,
     source_stage_sha256: str | None = None,
     source_root_seal_sha256: str | None = None,
+    provisional_stage: Mapping[str, object] | None = None,
+    provisional_stage_sha256: str | None = None,
+    provisional_operation_identity: str | None = None,
+    source_binary64_disposition_receipt_sha256: str | None = None,
 ) -> dict[str, object]:
     result = validate_schema11_checkpoint(checkpoint)
     kind = _enum_value(queue_kind, PromotionQueueKind, "promotion queue kind")
@@ -408,9 +432,40 @@ def append_promotion(
         source_record_sha256,
         source_stage_sha256,
         source_root_seal_sha256,
+        provisional_stage_sha256,
+        source_binary64_disposition_receipt_sha256,
     ):
         if digest is not None and not _is_sha256(digest):
             raise ValueError("promotion queue source digest is invalid")
+    if provisional_stage is None:
+        if (
+            provisional_stage_sha256 is not None
+            or provisional_operation_identity is not None
+        ):
+            raise ValueError("promotion queue provisional stage is incomplete")
+    else:
+        if not isinstance(provisional_stage, Mapping):
+            raise ValueError("promotion queue provisional stage is invalid")
+        stage = copy.deepcopy(dict(provisional_stage))
+        supplied = stage.get("stage_sha256")
+        content = {
+            key: item for key, item in stage.items() if key != "stage_sha256"
+        }
+        if (
+            not _is_sha256(supplied)
+            or supplied != _sha256(content)
+            or provisional_stage_sha256 != supplied
+            or not isinstance(provisional_operation_identity, str)
+            or not provisional_operation_identity
+            or stage.get("operation_identity") != provisional_operation_identity
+        ):
+            raise ValueError("promotion queue provisional stage authentication is invalid")
+        if source_stage_sha256 != provisional_stage_sha256:
+            raise ValueError("promotion queue provisional stage source mismatch")
+        if source_record_sha256 is not None:
+            raise ValueError("promotion queue cannot bind a record and provisional stage")
+    if source_record_sha256 is not None and provisional_stage is not None:
+        raise ValueError("promotion queue source representations are ambiguous")
     queue = result["promotion_queue"]
     assert isinstance(queue, dict)
     entries = queue["entries"]
@@ -426,6 +481,14 @@ def append_promotion(
             "source_stage_sha256": source_stage_sha256,
             "source_root_seal_sha256": source_root_seal_sha256,
             "scientific_computation_identity": scientific_computation_identity,
+            "provisional_stage": (
+                None if provisional_stage is None else copy.deepcopy(dict(provisional_stage))
+            ),
+            "provisional_stage_sha256": provisional_stage_sha256,
+            "provisional_operation_identity": provisional_operation_identity,
+            "source_binary64_disposition_receipt_sha256": (
+                source_binary64_disposition_receipt_sha256
+            ),
             "queue_ordinal": len(entries),
             "disposition": PromotionQueueDisposition.PENDING.value,
             "disposition_receipt_sha256": None,
@@ -572,6 +635,67 @@ def validate_schema11_checkpoint(
     for ordinal, entry in enumerate(queue["entries"]):
         if not isinstance(entry, Mapping) or entry.get("queue_ordinal") != ordinal:
             raise ValueError("schema-11 promotion queue order is invalid")
+        entry_fields = set(entry)
+        if entry_fields == _PROMOTION_ENTRY_FIELDS:
+            # Accept pre-PR68 queue entries at the checkpoint boundary and
+            # normalize the new durable provenance fields to explicit nulls.
+            normalized = copy.deepcopy(dict(entry))
+            normalized.update({
+                "provisional_stage": None,
+                "provisional_stage_sha256": None,
+                "provisional_operation_identity": None,
+                "source_binary64_disposition_receipt_sha256": None,
+            })
+            queue["entries"][ordinal] = normalized
+            entry = normalized
+        elif entry_fields != _PROMOTION_ENTRY_PROVISIONAL_FIELDS:
+            raise ValueError("schema-11 promotion queue entry fields are invalid")
+        if (
+            not isinstance(entry["leaf_id"], str)
+            or not entry["leaf_id"]
+            or entry["source_pass"] != SurveyPass.BINARY64.value
+            or not isinstance(entry["reason_code"], str)
+            or not entry["reason_code"]
+            or not isinstance(entry["minimum_requested_tier"], str)
+            or not entry["minimum_requested_tier"]
+            or not _is_sha256(entry["scientific_computation_identity"])
+        ):
+            raise ValueError("schema-11 promotion queue entry identity is invalid")
+        for digest in (
+            entry["source_record_sha256"],
+            entry["source_stage_sha256"],
+            entry["source_root_seal_sha256"],
+            entry["provisional_stage_sha256"],
+            entry["source_binary64_disposition_receipt_sha256"],
+        ):
+            if digest is not None and not _is_sha256(digest):
+                raise ValueError("schema-11 promotion queue source digest is invalid")
+        provisional = entry["provisional_stage"]
+        if provisional is None:
+            if (
+                entry["provisional_stage_sha256"] is not None
+                or entry["provisional_operation_identity"] is not None
+            ):
+                raise ValueError("schema-11 promotion provisional stage is incomplete")
+        else:
+            if not isinstance(provisional, Mapping):
+                raise ValueError("schema-11 promotion provisional stage is invalid")
+            provisional_content = {
+                key: item
+                for key, item in provisional.items()
+                if key != "stage_sha256"
+            }
+            if (
+                provisional.get("stage_sha256")
+                != entry["provisional_stage_sha256"]
+                or entry["provisional_stage_sha256"] != _sha256(provisional_content)
+                or provisional.get("operation_identity")
+                != entry["provisional_operation_identity"]
+                or entry["source_stage_sha256"]
+                != entry["provisional_stage_sha256"]
+                or entry["source_record_sha256"] is not None
+            ):
+                raise ValueError("schema-11 promotion provisional stage binding is invalid")
         _enum_value(entry.get("queue_kind"), PromotionQueueKind, "promotion queue kind")
         disposition = _enum_value(
             entry.get("disposition"),

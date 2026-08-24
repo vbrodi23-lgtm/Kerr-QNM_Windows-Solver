@@ -125,7 +125,11 @@ class Binary64PassOutcome:
     reason_code: str
     record: Mapping[str, object] | None = None
     stage_sha256: str | None = None
+    provisional_stage: Mapping[str, object] | None = None
+    provisional_stage_sha256: str | None = None
+    provisional_operation_identity: str | None = None
     queue_kind: PromotionQueueKind | None = None
+    minimum_requested_tier: str = "BF40"
     sample_count: int = 0
     sample_limit: int = 0
     root_read_count: int = 0
@@ -212,8 +216,11 @@ class PromotedPassOutcome:
     disposition: SurveyDisposition
     reason_code: str
     precision_tiers: tuple[str, ...]
+    operation_identity: str = "promoted-survey-production/v1"
     record: Mapping[str, object] | None = None
     stage_sha256: str | None = None
+    source_record_sha256: str | None = None
+    source_stage_sha256: str | None = None
     sample_count: int = 0
     sample_limit: int = 18
     root_read_count: int = 0
@@ -380,12 +387,58 @@ def _record_pass_outcome(
     leaf_id: str,
     outcome: Binary64PassOutcome,
     root_seal_sha256: str | None,
+    record_validator: RecordValidator | None = None,
 ) -> dict[str, object]:
     result = validate_schema11_checkpoint(checkpoint)
-    record_sha256 = None
+    if outcome.record is not None and outcome.stage_sha256 is None:
+        raise ValueError("binary64 outcome record lacks its stage digest")
+    if outcome.provisional_stage is not None:
+        if (
+            outcome.record is not None
+            or outcome.queue_kind is not PromotionQueueKind.RESPONSE
+            or outcome.provisional_stage_sha256 is None
+            or outcome.provisional_operation_identity is None
+        ):
+            raise ValueError("binary64 provisional stage has an invalid owner")
+        if not isinstance(outcome.provisional_stage, Mapping):
+            raise ValueError("binary64 provisional stage is invalid")
+        provisional_content = {
+            key: item
+            for key, item in outcome.provisional_stage.items()
+            if key != "stage_sha256"
+        }
+        if (
+            outcome.provisional_stage.get("stage_sha256")
+            != outcome.provisional_stage_sha256
+            or outcome.provisional_stage_sha256
+            != hashlib.sha256(canonical_json_bytes(provisional_content)).hexdigest()
+            or outcome.provisional_stage.get("operation_identity")
+            != outcome.provisional_operation_identity
+        ):
+            raise ValueError("binary64 provisional stage authentication is invalid")
+    elif (
+        outcome.provisional_stage_sha256 is not None
+        or outcome.provisional_operation_identity is not None
+    ):
+        raise ValueError("binary64 provisional stage metadata is incomplete")
     if outcome.disposition is SurveyDisposition.COMPLETED:
+        if outcome.queue_kind is not None:
+            raise ValueError("completed binary64 outcome cannot queue promotion")
         if outcome.record is None or outcome.stage_sha256 is None:
             raise ValueError("completed binary64 outcome lacks a numerical record")
+    elif outcome.queue_kind is None and outcome.record is not None:
+        raise ValueError("binary64 retained record lacks a promotion queue")
+    if outcome.queue_kind is PromotionQueueKind.ROOT and outcome.record is not None:
+        raise ValueError("root promotion cannot retain a binary64 response record")
+    if (
+        outcome.queue_kind is PromotionQueueKind.ROOT
+        and outcome.provisional_stage is not None
+    ):
+        raise ValueError("root promotion cannot retain a provisional response stage")
+    record_sha256 = None
+    if outcome.record is not None:
+        if record_validator is not None:
+            record_validator(leaf_id, outcome.record)
         result = add_numerical_record(result, outcome.record)
         record_sha256 = str(outcome.record["record_sha256"])
         result = record_evidence(
@@ -395,18 +448,6 @@ def _record_pass_outcome(
             central_stage_sha256=outcome.stage_sha256,
             evidence_level=EvidenceLevel.SCREENED,
             receipts=outcome.evidence_receipts,
-        )
-    elif outcome.queue_kind is not None:
-        result = append_promotion(
-            result,
-            leaf_id=leaf_id,
-            queue_kind=outcome.queue_kind,
-            reason_code=outcome.reason_code,
-            minimum_requested_tier="BF40",
-            scientific_computation_identity=(
-                selection.scientific_identities[leaf_id]
-            ),
-            source_root_seal_sha256=root_seal_sha256,
         )
     result = record_survey_disposition(
         result,
@@ -427,6 +468,32 @@ def _record_pass_outcome(
         tier_timing=outcome.tier_timing,
         session_fragments=outcome.session_fragments,
     )
+    if outcome.queue_kind is not None:
+        binary64_entry = result["survey_pass_ledger"]["binary64"][leaf_id]
+        source_stage_sha256 = (
+            outcome.stage_sha256
+            if outcome.stage_sha256 is not None
+            else outcome.provisional_stage_sha256
+        )
+        result = append_promotion(
+            result,
+            leaf_id=leaf_id,
+            queue_kind=outcome.queue_kind,
+            reason_code=outcome.reason_code,
+            minimum_requested_tier=outcome.minimum_requested_tier,
+            scientific_computation_identity=(
+                selection.scientific_identities[leaf_id]
+            ),
+            source_record_sha256=record_sha256,
+            source_stage_sha256=source_stage_sha256,
+            source_root_seal_sha256=root_seal_sha256,
+            provisional_stage=outcome.provisional_stage,
+            provisional_stage_sha256=outcome.provisional_stage_sha256,
+            provisional_operation_identity=outcome.provisional_operation_identity,
+            source_binary64_disposition_receipt_sha256=(
+                binary64_entry["disposition_receipt_sha256"]
+            ),
+        )
     return result
 
 
@@ -483,6 +550,9 @@ def run_binary64_survey(
     checkpoint_committed: Callable[
         [Mapping[str, object]], Mapping[str, object]
     ] | None = None,
+    terminal_record_committed: Callable[
+        [object, Mapping[str, object]], None
+    ] | None = None,
 ) -> Binary64SurveyRun:
     """Run only the binary64 pass; promotion is recorded and never executed."""
 
@@ -533,6 +603,23 @@ def run_binary64_survey(
 
     for leaf_id in selection.ordered_leaf_ids:
         leaf = leaves[leaf_id]
+        leaf_context = {
+            "leaf_index": selection.ordered_leaf_ids.index(leaf_id) + 1,
+            "leaf_count": len(selection.ordered_leaf_ids),
+            "leaf_id": leaf_id,
+            "role": leaf.role,
+            "mode": {
+                "ell": leaf.leaf.mode[0],
+                "m": leaf.leaf.mode[1],
+                "n": leaf.leaf.mode[2],
+            },
+            "spin": leaf.job.spin,
+            "sampling_coordinate": leaf.job.sampling_coordinate.to_mapping(),
+            "mechanism_id": leaf.mechanism_id,
+            "execution_profile": "SURVEY",
+            "survey_pass": "binary64",
+            "precision_tier": "binary64",
+        }
         if leaf_id in binary64_ledger:
             skipped += 1
             continue
@@ -541,12 +628,7 @@ def run_binary64_survey(
         )
         committed_before_leaf = result
         timing_recorder: TimingSessionRecorder | None = None
-        with progress_scope(
-            leaf_id=leaf_id,
-            execution_profile="SURVEY",
-            survey_pass="binary64",
-            precision_tier="binary64",
-        ):
+        with progress_scope(**leaf_context):
             emit_progress(ProgressEventKind.LEAF_PASS_STARTED)
 
         def guarded(action: Callable[[], object]) -> object:
@@ -669,7 +751,17 @@ def run_binary64_survey(
             continue
 
         if leaf.mechanism_id == "horizon-admittance":
-            outcome = guarded(lambda: horizon_runner(leaf))
+            timing_recorder = TimingSessionRecorder(
+                log=operational_timing,
+                session_id=make_session_id(),
+                leaf_id=leaf_id,
+                execution_profile="SURVEY",
+                survey_pass="binary64",
+                clock=clock,
+            )
+            timing_recorder.start_tier("binary64")
+            with progress_scope(**leaf_context):
+                outcome = guarded(lambda: horizon_runner(leaf))
             if not isinstance(outcome, Binary64PassOutcome):
                 guarded(
                     lambda: (_ for _ in ()).throw(
@@ -677,6 +769,16 @@ def run_binary64_survey(
                     )
                 )
             assert isinstance(outcome, Binary64PassOutcome)
+            timing_recorder.complete_tier()
+            timing_summary = fold_timing_fragments(timing_recorder.fragments)
+            outcome = replace(
+                outcome,
+                tier_timing=timing_summary.tier_timing_mappings(),
+                session_fragments=tuple(
+                    fragment.to_mapping()
+                    for fragment in timing_recorder.fragments
+                ),
+            )
             root_seal_sha256 = None
         else:
             seal = guarded(lambda: root_seal_lookup(leaf))
@@ -753,15 +855,16 @@ def run_binary64_survey(
                         clock=clock,
                     )
                     timing_recorder.start_tier("binary64")
-                batch = guarded(
-                    lambda: backend.fixed_root_survey_with_optional_background(
-                        job=leaf.job,
-                        fixed_root=seal.fixed_root,
-                        branch_identity=seal.branch_identity,
-                        background=background,
-                        equivalence_receipt=receipt,
+                with progress_scope(**leaf_context):
+                    batch = guarded(
+                        lambda: backend.fixed_root_survey_with_optional_background(
+                            job=leaf.job,
+                            fixed_root=seal.fixed_root,
+                            branch_identity=seal.branch_identity,
+                            background=background,
+                            equivalence_receipt=receipt,
+                        )
                     )
-                )
                 if isinstance(batch, Binary64FixedRootBatch):
                     canonical = guarded(
                         lambda: canonical_background_from_binary64_batch(
@@ -960,10 +1063,30 @@ def run_binary64_survey(
                 leaf_id=leaf_id,
                 outcome=outcome,
                 root_seal_sha256=root_seal_sha256,
+                record_validator=record_validator,
             )
         )
         assert isinstance(result, dict)
         result = persist(result)
+        if (
+            outcome.record is not None
+            and outcome.disposition is SurveyDisposition.COMPLETED
+            and terminal_record_committed is not None
+        ):
+            try:
+                terminal_record_committed(leaf, outcome.record)
+            except KeyboardInterrupt:
+                raise
+            except Exception as error:
+                # The numerical record is already durable.  Record the
+                # publication/root-reuse failure against that current
+                # checkpoint so recovery never rolls back the committed leaf.
+                abort_unexpected_system_failure(
+                    result,
+                    leaf_id=leaf_id,
+                    error=error,
+                    persist_checkpoint=lambda value: persist(value),
+                )
         if outcome.disposition is SurveyDisposition.COMPLETED:
             completed += 1
             existing_records[leaf_id] = outcome.record
@@ -1364,12 +1487,17 @@ def _commit_promoted_outcome(
     queue_ordinal: int,
     queue_kind: PromotionQueueKind,
     outcome: PromotedPassOutcome,
+    record_validator: RecordValidator | None = None,
 ) -> dict[str, object]:
     result = validate_schema11_checkpoint(checkpoint)
     record_sha256 = None
-    if outcome.disposition is SurveyDisposition.COMPLETED:
-        if outcome.record is None or outcome.stage_sha256 is None:
-            raise ValueError("completed promoted outcome lacks its record")
+    if outcome.record is not None:
+        if outcome.stage_sha256 is None:
+            raise ValueError("promoted outcome record lacks its stage digest")
+        if outcome.source_record_sha256 is not None:
+            raise ValueError("promoted outcome has both a new and source record")
+        if record_validator is not None:
+            record_validator(leaf_id, outcome.record)
         result = add_numerical_record(result, outcome.record)
         record_sha256 = str(outcome.record["record_sha256"])
         result = record_evidence(
@@ -1380,6 +1508,38 @@ def _commit_promoted_outcome(
             evidence_level=EvidenceLevel.SCREENED,
             receipts=outcome.evidence_receipts,
         )
+    elif outcome.source_record_sha256 is not None:
+        if outcome.source_stage_sha256 is None:
+            raise ValueError("promoted comparison lacks its source stage digest")
+        retained = next(
+            (
+                item for item in result["records"]
+                if item.get("leaf_id") == leaf_id
+            ),
+            None,
+        )
+        if (
+            not isinstance(retained, Mapping)
+            or retained.get("record_sha256") != outcome.source_record_sha256
+        ):
+            raise ValueError("promoted comparison source record is not retained")
+        record_sha256 = outcome.source_record_sha256
+        if outcome.evidence_receipts:
+            result = record_evidence(
+                result,
+                leaf_id=leaf_id,
+                central_record_sha256=record_sha256,
+                central_stage_sha256=outcome.source_stage_sha256,
+                evidence_level=EvidenceLevel.SCREENED,
+                receipts=outcome.evidence_receipts,
+                discrepancy_codes=(
+                    ()
+                    if outcome.disposition is SurveyDisposition.COMPLETED
+                    else (outcome.reason_code,)
+                ),
+            )
+    elif outcome.disposition is SurveyDisposition.COMPLETED:
+        raise ValueError("completed promoted outcome lacks a record or source record")
     queue_dispositions = {
         SurveyDisposition.COMPLETED: PromotionQueueDisposition.COMPLETED,
         SurveyDisposition.UNRESOLVED: PromotionQueueDisposition.UNRESOLVED,
@@ -1401,6 +1561,7 @@ def _commit_promoted_outcome(
             "reason_code": outcome.reason_code,
             "precision_tiers": list(outcome.precision_tiers),
             "result_record_sha256": record_sha256,
+            "source_record_sha256": outcome.source_record_sha256,
         },
     )
     result = record_survey_disposition(
@@ -1408,18 +1569,21 @@ def _commit_promoted_outcome(
         survey_pass=SurveyPass.PROMOTED,
         leaf_id=leaf_id,
         disposition=outcome.disposition,
-        source_record_sha256=None,
+        source_record_sha256=outcome.source_record_sha256,
         result_record_sha256=record_sha256,
-        operation_identity=BINARY64_FIXED_ROOT_SURVEY_IDENTITY,
+        operation_identity=outcome.operation_identity,
         precision_tiers=outcome.precision_tiers,
         reason_code=outcome.reason_code,
         sample_count=outcome.sample_count,
         sample_limit=outcome.sample_limit,
         root_read_count=outcome.root_read_count,
         root_read_limit=(
-            0
-            if queue_kind is PromotionQueueKind.RESPONSE
-            else outcome.root_read_limit
+            outcome.root_read_limit
+            if (
+                queue_kind is not PromotionQueueKind.RESPONSE
+                or outcome.operation_identity.startswith("promoted-horizon-")
+            )
+            else 0
         ),
         worker_launch_count=outcome.worker_launch_count,
         worker_launch_limit=(
@@ -1510,6 +1674,11 @@ def run_promoted_survey(
         [object, object, int], PromotedRootSolveResult
     ],
     horizon_runner: Callable[[object], PromotedPassOutcome],
+    promoted_horizon_runner: Callable[
+        [object, Mapping[str, object], Mapping[str, object] | None,
+         tuple[Mapping[str, object], ...]],
+        PromotedPassOutcome,
+    ] | None = None,
     produced_record_builder: Callable[
         [object, JuliaFixedRootSurveyBatch, object, int],
         tuple[Mapping[str, object], str],
@@ -1525,6 +1694,9 @@ def run_promoted_survey(
     session_id_factory: Callable[[], str] | None = None,
     checkpoint_committed: Callable[
         [Mapping[str, object]], Mapping[str, object]
+    ] | None = None,
+    terminal_record_committed: Callable[
+        [object, Mapping[str, object]], None
     ] | None = None,
 ) -> PromotedSurveyRun:
     """Consume only pending promotion entries through BF40/BF80 survey work."""
@@ -1593,15 +1765,27 @@ def run_promoted_survey(
         if leaf_id in result["survey_pass_ledger"]["promoted"]:
             raise ValueError("pending promotion already has a pass disposition")
         leaf = leaves[leaf_id]
+        leaf_context = {
+            "leaf_index": selection.ordered_leaf_ids.index(leaf_id) + 1,
+            "leaf_count": len(selection.ordered_leaf_ids),
+            "leaf_id": leaf_id,
+            "role": leaf.role,
+            "mode": {
+                "ell": leaf.leaf.mode[0],
+                "m": leaf.leaf.mode[1],
+                "n": leaf.leaf.mode[2],
+            },
+            "spin": leaf.job.spin,
+            "sampling_coordinate": leaf.job.sampling_coordinate.to_mapping(),
+            "mechanism_id": leaf.mechanism_id,
+            "execution_profile": "SURVEY",
+            "survey_pass": "promoted",
+        }
         failure_monitor.abort_before_leaf(
             result, leaf_id=leaf_id, persist_checkpoint=lambda value: persist(value)
         )
         committed_before_leaf = result
-        with progress_scope(
-            leaf_id=leaf_id,
-            execution_profile="SURVEY",
-            survey_pass="promoted",
-        ):
+        with progress_scope(**leaf_context):
             emit_progress(ProgressEventKind.LEAF_PASS_STARTED)
 
         def guarded(action: Callable[[], object]) -> object:
@@ -1618,7 +1802,77 @@ def run_promoted_survey(
                 )
                 raise AssertionError("system failure abort returned unexpectedly")
 
+        def validate_binary64_disposition_binding() -> None:
+            supplied_receipt = snapshot.get(
+                "source_binary64_disposition_receipt_sha256"
+            )
+            provisional_stage = snapshot.get("provisional_stage")
+            if supplied_receipt is None:
+                if provisional_stage is not None:
+                    raise ValueError(
+                        "provisional horizon promotion lacks binary64 disposition receipt"
+                    )
+                return
+            binary64_ledger = result["survey_pass_ledger"]["binary64"]
+            binary64_entry = (
+                binary64_ledger.get(leaf_id)
+                if isinstance(binary64_ledger, Mapping)
+                else None
+            )
+            expected_receipt = (
+                binary64_entry.get("disposition_receipt_sha256")
+                if isinstance(binary64_entry, Mapping)
+                else None
+            )
+            if (
+                not isinstance(expected_receipt, str)
+                or supplied_receipt != expected_receipt
+            ):
+                raise ValueError(
+                    "horizon promotion binary64 disposition receipt mismatch"
+                )
+
+        guarded(validate_binary64_disposition_binding)
+
         retained = existing_records.get(leaf_id)
+        horizon_source_record = (
+            leaf.mechanism_id == "horizon-admittance"
+            and snapshot.get("source_record_sha256") is not None
+        )
+        if (
+            leaf.mechanism_id == "horizon-admittance"
+            and retained is not None
+            and snapshot.get("source_record_sha256") is None
+        ):
+            guarded(lambda: (_ for _ in ()).throw(
+                ValueError("horizon promotion source record digest is missing")
+            ))
+        if horizon_source_record:
+            if retained is None:
+                guarded(lambda: (_ for _ in ()).throw(
+                    ValueError("horizon promotion source record is not retained")
+                ))
+            if retained is not None and (
+                retained.get("record_sha256")
+                != snapshot.get("source_record_sha256")
+            ):
+                guarded(lambda: (_ for _ in ()).throw(
+                    ValueError("horizon promotion source record digest mismatch")
+                ))
+            stages = retained.get("stages") if retained is not None else None
+            source_stage = (
+                stages[0]
+                if isinstance(stages, list) and stages
+                else None
+            )
+            if (
+                not isinstance(source_stage, Mapping)
+                or source_stage.get("stage_sha256")
+                != snapshot.get("source_stage_sha256")
+            ):
+                guarded(lambda: (_ for _ in ()).throw(
+                    ValueError("horizon promotion source stage digest mismatch")
+                ))
         checkpoint_discovery = (
             None if retained is None else _checkpoint_terminal_discovery()
         )
@@ -1630,7 +1884,7 @@ def run_promoted_survey(
             else cache_inventory.lookup_for(selection.scientific_identities[leaf_id])
         )
         cache_record: Mapping[str, object] | None = None
-        if cache_inventory is not None:
+        if cache_inventory is not None and not horizon_source_record:
             if cache_inventory.source_error is not None:
                 guarded(
                     lambda: (_ for _ in ()).throw(ValueError(
@@ -1677,7 +1931,7 @@ def run_promoted_survey(
             terminal_cache_discovery = terminal_cache_discovery.add(
                 checkpoint_discovery.with_reused(1)
             )
-        if retained is not None:
+        if retained is not None and not horizon_source_record:
             result = guarded(lambda: _commit_promoted_cache_reuse(
                 result,
                 leaf_id=leaf_id,
@@ -1703,7 +1957,32 @@ def run_promoted_survey(
             continue
 
         if leaf.mechanism_id == "horizon-admittance":
-            outcome = guarded(lambda: horizon_runner(leaf))
+            evidence_entry = result["evidence_ledger"].get(leaf_id)
+            source_receipts = (
+                tuple(evidence_entry["receipts"])
+                if isinstance(evidence_entry, Mapping)
+                and isinstance(evidence_entry.get("receipts"), list)
+                else ()
+            )
+            recorder = TimingSessionRecorder(
+                log=operational_timing,
+                session_id=make_session_id(),
+                leaf_id=leaf_id,
+                execution_profile="SURVEY",
+                survey_pass="promoted",
+                clock=clock,
+            )
+            recorder.start_tier("BF80")
+            with progress_scope(**leaf_context):
+                outcome = guarded(
+                    lambda: (
+                        promoted_horizon_runner(
+                            leaf, snapshot, retained, source_receipts
+                        )
+                        if promoted_horizon_runner is not None
+                        else horizon_runner(leaf)
+                    )
+                )
             if not isinstance(outcome, PromotedPassOutcome):
                 guarded(lambda: (_ for _ in ()).throw(
                     ValueError("promoted horizon runner returned invalid data")
@@ -1713,6 +1992,15 @@ def run_promoted_survey(
                 guarded(lambda: (_ for _ in ()).throw(
                     ValueError("promoted horizon survey must use BF80 only")
                 ))
+            recorder.complete_tier()
+            timing_summary = fold_timing_fragments(recorder.fragments)
+            outcome = replace(
+                outcome,
+                tier_timing=timing_summary.tier_timing_mappings(),
+                session_fragments=tuple(
+                    fragment.to_mapping() for fragment in recorder.fragments
+                ),
+            )
         else:
             def execute_exterior() -> PromotedPassOutcome:
                 recorder = TimingSessionRecorder(
@@ -1724,21 +2012,22 @@ def run_promoted_survey(
                     clock=clock,
                 )
                 try:
-                    timed_outcome = _run_promoted_exterior_queue_entry(
-                        leaf,
-                        snapshot,
-                        root_seal_lookup=root_seal_lookup,
-                        root_seal_publish=(
-                            root_seal_publish
-                            if root_seal_publish is not None
-                            else lambda _leaf, _seal: None
-                        ),
-                        backend_factory=backend_factory,
-                        primary_root_runner=primary_root_runner,
-                        produced_record_builder=produced_record_builder,
-                        timing_recorder=recorder,
-                        determinant_error_store=determinant_error_store,
-                    )
+                    with progress_scope(**leaf_context):
+                        timed_outcome = _run_promoted_exterior_queue_entry(
+                            leaf,
+                            snapshot,
+                            root_seal_lookup=root_seal_lookup,
+                            root_seal_publish=(
+                                root_seal_publish
+                                if root_seal_publish is not None
+                                else lambda _leaf, _seal: None
+                            ),
+                            backend_factory=backend_factory,
+                            primary_root_runner=primary_root_runner,
+                            produced_record_builder=produced_record_builder,
+                            timing_recorder=recorder,
+                            determinant_error_store=determinant_error_store,
+                        )
                 except BaseException:
                     if recorder.active_tier is not None:
                         recorder.interrupt_tier()
@@ -1762,6 +2051,7 @@ def run_promoted_survey(
             queue_ordinal=ordinal,
             queue_kind=PromotionQueueKind(snapshot["queue_kind"]),
             outcome=outcome,
+            record_validator=record_validator,
         ))
         assert isinstance(result, dict)
         if outcome.disposition is SurveyDisposition.COMPLETED:
@@ -1773,6 +2063,23 @@ def run_promoted_survey(
         elif outcome.disposition is SurveyDisposition.REJECTED:
             rejected += 1
         result = persist(result)
+        if (
+            outcome.record is not None
+            and outcome.disposition is SurveyDisposition.COMPLETED
+            and outcome.record.get("state") == "PRODUCED"
+            and terminal_record_committed is not None
+        ):
+            try:
+                terminal_record_committed(leaf, outcome.record)
+            except KeyboardInterrupt:
+                raise
+            except Exception as error:
+                abort_unexpected_system_failure(
+                    result,
+                    leaf_id=leaf_id,
+                    error=error,
+                    persist_checkpoint=lambda value: persist(value),
+                )
         if outcome.disposition not in {
             SurveyDisposition.COMPLETED,
             SurveyDisposition.CACHE_REUSED,
@@ -1806,10 +2113,15 @@ def run_promoted_survey(
             sample_count_limit=outcome.sample_limit,
             root_read_count=outcome.root_read_count,
             root_read_limit=(
-                0
-                if PromotionQueueKind(snapshot["queue_kind"])
-                is PromotionQueueKind.RESPONSE
-                else outcome.root_read_limit
+                outcome.root_read_limit
+                if (
+                    PromotionQueueKind(snapshot["queue_kind"])
+                    is not PromotionQueueKind.RESPONSE
+                    or outcome.operation_identity.startswith(
+                        "promoted-horizon-"
+                    )
+                )
+                else 0
             ),
             worker_launch_count=outcome.worker_launch_count,
             worker_launch_limit=(

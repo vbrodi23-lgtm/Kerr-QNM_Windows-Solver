@@ -22,6 +22,7 @@ from .campaign_failures import (
 )
 from .campaign_policy import (
     ExecutionProfile,
+    PromotionQueueDisposition,
     PromotionQueueKind,
     SurveyDisposition,
     validate_schema11_checkpoint,
@@ -51,12 +52,22 @@ from .native_response_kernel import VettedNativeDeterminantKernel
 from .response_batches import (
     CampaignLeafRecord,
     CampaignStageRecord,
+    HORIZON_PROMOTION_TRIGGER_RECEIPT_SCHEMA,
+    HORIZON_PROMOTED_COMPARISON_RECEIPT_SCHEMA,
+    HORIZON_SCREENING_STAGE_SCHEMA,
     NativeCampaignStageBackend,
     PrecisionCapabilities,
+    StageOutcome,
     _ode_error_budget_from_mapping,
+    _component_stage_signed_error_channels,
     _sealed_root_for_result,
     _run_promoted_exterior_component_with_progress,
+    build_horizon_promotion_trigger_receipt,
+    derive_horizon_promotion_decision,
     scientific_computation_identity_sha256,
+    synthetic_stage_signed_error_channels,
+    validate_schema11_horizon_stage,
+    validate_schema11_horizon_record,
     validate_campaign_recovery_record,
 )
 from .response_engine import (
@@ -85,6 +96,7 @@ from .reviewed_determinant_error import ReviewedDeterminantErrorStore
 from .background_evidence_store import CanonicalBackgroundEvidenceStore
 from .solved_leaf_cache import SolvedLeafLookupStatus, SolvedLeafStore
 from .validation_admission import SAME_BACKEND_REFINEMENT_ROUTE
+from .progress import ProgressEventKind, emit_progress, progress_scope
 
 
 _SCHEMA11_NUMERICAL_RECORD = "windows-solver.schema11-numerical-record/1"
@@ -101,6 +113,78 @@ def _sha256(value: object) -> str:
 def _complex_mapping(value: complex) -> dict[str, float]:
     converted = complex(value)
     return {"real": converted.real, "imaginary": converted.imag}
+
+
+def build_schema11_horizon_stage(
+    outcome: StageOutcome,
+    *,
+    precision_tier: str,
+    operation_identity: str,
+) -> tuple[dict[str, object], str]:
+    """Build one digest-bound schema-11 horizon screening stage."""
+
+    expected_digits = {"binary64": 64, "BF80": 80}.get(precision_tier)
+    if expected_digits != outcome.digits:
+        raise ValueError("horizon stage precision tier does not match outcome")
+    if not isinstance(operation_identity, str) or not operation_identity:
+        raise ValueError("horizon stage operation identity is invalid")
+    raw_result = outcome.component_result.get("result")
+    if not isinstance(raw_result, Mapping):
+        raise ValueError("horizon stage lacks an authenticated component result")
+    result = ComponentResult.from_mapping(raw_result)
+    if result.to_mapping() != raw_result:
+        raise ValueError("horizon stage component result is not canonical")
+    response_disk = None
+    if result.response is not None:
+        radius = float(outcome.local_disk_radius_abs)
+        response_disk = {
+            "centre": _complex_mapping(result.response),
+            "radius": radius,
+            "exact_zero_radius": radius == 0.0,
+        }
+    component_payload = dict(outcome.component_result)
+    if outcome.deep_diagnostics is not None:
+        component_payload["deep_diagnostics"] = dict(outcome.deep_diagnostics)
+    content = {
+        "schema": HORIZON_SCREENING_STAGE_SCHEMA,
+        "operation_identity": operation_identity,
+        "precision_tier": precision_tier,
+        "component_result": component_payload,
+        "response_disk": response_disk,
+        "numerical_state": outcome.numerical_state,
+    }
+    stage = {**content, "stage_sha256": _sha256(content)}
+    return stage, str(stage["stage_sha256"])
+
+
+def build_schema11_horizon_record(
+    plan: object,
+    leaf: object,
+    *,
+    stages: tuple[Mapping[str, object], ...],
+    retained_centre: Mapping[str, object] | None,
+    state: str,
+) -> dict[str, object]:
+    """Build and immediately authenticate a new schema-11 horizon record."""
+
+    if state not in {"PRODUCED", "UNRESOLVED", "REJECTED"}:
+        raise ValueError("horizon record state is invalid")
+    content: dict[str, object] = {
+        "schema": _SCHEMA11_NUMERICAL_RECORD,
+        "leaf_id": leaf.leaf_id,
+        "role": leaf.role,
+        "state": state,
+        "scientific_computation_identity": scientific_computation_identity_sha256(
+            plan, leaf
+        ),
+        "retained_centre": (
+            None if retained_centre is None else dict(retained_centre)
+        ),
+        "stages": [dict(stage) for stage in stages],
+    }
+    record = {**content, "record_sha256": _sha256(content)}
+    validate_schema11_horizon_record(plan, leaf, record)
+    return record
 
 
 def _disk_mapping(value: object) -> Mapping[str, object] | None:
@@ -152,6 +236,248 @@ def _refresh_runtime_reports(
             if triage_ready else None
         ),
     )
+
+
+def _promotion_bound_source_record_sha256(
+    checkpoint: Mapping[str, object],
+    plan: object | None = None,
+) -> set[str]:
+    """Return retained records whose mandatory promotion is not successful."""
+
+    entries = checkpoint["promotion_queue"]["entries"]
+    return {
+        source
+        for entry in entries
+        if isinstance((source := entry["source_record_sha256"]), str)
+        and (
+            entry["disposition"]
+            != PromotionQueueDisposition.COMPLETED.value
+            or not _completed_horizon_source_is_authenticated(
+                checkpoint, entry, plan
+            )
+        )
+    }
+
+
+def _is_sha256(value: object) -> bool:
+    if not isinstance(value, str) or len(value) != 64:
+        return False
+    try:
+        int(value, 16)
+    except ValueError:
+        return False
+    return True
+
+
+def _receipt_digest_is_valid(receipt: Mapping[str, object]) -> bool:
+    supplied = receipt.get("receipt_sha256")
+    content = {
+        key: value for key, value in receipt.items()
+        if key != "receipt_sha256"
+    }
+    return _is_sha256(supplied) and supplied == _sha256(content)
+
+
+def _completed_horizon_source_is_authenticated(
+    checkpoint: Mapping[str, object],
+    queue_entry: Mapping[str, object],
+    plan: object | None,
+) -> bool:
+    """Prove a retained source completed its mandatory BF80 comparison."""
+
+    leaf_id = queue_entry.get("leaf_id")
+    source_record_sha256 = queue_entry.get("source_record_sha256")
+    source_stage_sha256 = queue_entry.get("source_stage_sha256")
+    queue_ordinal = queue_entry.get("queue_ordinal")
+    promoted_ledger = checkpoint.get("survey_pass_ledger", {}).get(
+        "promoted", {}
+    )
+    promoted = (
+        promoted_ledger.get(leaf_id)
+        if isinstance(promoted_ledger, Mapping)
+        else None
+    )
+    leaf = next(
+        (
+            item for item in getattr(plan, "leaves", ())
+            if item.leaf_id == leaf_id
+        ),
+        None,
+    )
+    if (
+        not isinstance(leaf_id, str)
+        or leaf is None
+        or leaf.mechanism_id != "horizon-admittance"
+        or not _is_sha256(source_record_sha256)
+        or not _is_sha256(source_stage_sha256)
+        or not isinstance(queue_ordinal, int)
+        or not isinstance(promoted, Mapping)
+        or promoted.get("disposition") != SurveyDisposition.COMPLETED.value
+        or promoted.get("operation_identity")
+        != "promoted-horizon-comparison/v2"
+        or promoted.get("reason_code")
+        != "PROMOTED_HORIZON_COMPARISON_AGREES"
+        or promoted.get("precision_tiers") != ["BF80"]
+        or promoted.get("source_record_sha256") != source_record_sha256
+        or promoted.get("result_record_sha256") != source_record_sha256
+    ):
+        return False
+    queue_receipt = {
+        "schema": "windows-solver.promoted-queue-disposition/1",
+        "leaf_id": leaf_id,
+        "queue_ordinal": queue_ordinal,
+        "disposition": SurveyDisposition.COMPLETED.value,
+        "reason_code": promoted["reason_code"],
+        "precision_tiers": list(promoted["precision_tiers"]),
+        "result_record_sha256": source_record_sha256,
+        "source_record_sha256": source_record_sha256,
+    }
+    if queue_entry.get("disposition_receipt_sha256") != _sha256(
+        queue_receipt
+    ):
+        return False
+
+    records = checkpoint.get("records", ())
+    source_record = next(
+        (
+            item for item in records
+            if isinstance(item, Mapping)
+            and item.get("record_sha256") == source_record_sha256
+        ),
+        None,
+    )
+    stages = source_record.get("stages") if isinstance(source_record, Mapping) else None
+    source_stage = stages[0] if isinstance(stages, list) and stages else None
+    source_disk = (
+        source_stage.get("response_disk")
+        if isinstance(source_stage, Mapping)
+        else None
+    )
+    if (
+        not isinstance(source_stage, Mapping)
+        or source_stage.get("stage_sha256") != source_stage_sha256
+        or not isinstance(source_disk, Mapping)
+    ):
+        return False
+
+    evidence_ledger = checkpoint.get("evidence_ledger", {})
+    evidence = (
+        evidence_ledger.get(leaf_id)
+        if isinstance(evidence_ledger, Mapping)
+        else None
+    )
+    receipts = evidence.get("receipts") if isinstance(evidence, Mapping) else None
+    if (
+        not isinstance(evidence, Mapping)
+        or evidence.get("central_record_sha256") != source_record_sha256
+        or evidence.get("central_stage_sha256") != source_stage_sha256
+        or not isinstance(receipts, list)
+    ):
+        return False
+
+    triggers = {
+        receipt.get("receipt_sha256")
+        for receipt in receipts
+        if isinstance(receipt, Mapping)
+        and receipt.get("schema") == HORIZON_PROMOTION_TRIGGER_RECEIPT_SCHEMA
+        and receipt.get("leaf_id") == leaf_id
+        and receipt.get("binary64_stage_sha256") == source_stage_sha256
+        and receipt.get("promotion_required") is True
+        and _receipt_digest_is_valid(receipt)
+    }
+    comparison_fields = {
+        "schema", "leaf_id", "source_record_sha256", "source_stage_sha256",
+        "source_centre", "source_disk_radius",
+        "promotion_trigger_receipt_sha256", "bf80_operation_identity",
+        "bf80_result_sha256", "bf80_stage", "bf80_centre",
+        "bf80_disk_radius",
+        "centre_discrepancy", "reviewed_comparison_threshold", "agrees",
+        "outcome_code", "runtime_identity", "backend_identity",
+        "receipt_sha256",
+    }
+    for receipt in receipts:
+        bf80_stage = (
+            receipt.get("bf80_stage")
+            if isinstance(receipt, Mapping)
+            else None
+        )
+        if isinstance(bf80_stage, Mapping):
+            try:
+                validate_schema11_horizon_stage(plan, leaf, bf80_stage)
+            except (TypeError, ValueError):
+                bf80_stage = None
+        bf80_payload = (
+            bf80_stage.get("component_result")
+            if isinstance(bf80_stage, Mapping)
+            else None
+        )
+        bf80_result = (
+            bf80_payload.get("result")
+            if isinstance(bf80_payload, Mapping)
+            else None
+        )
+        bf80_disk = (
+            bf80_stage.get("response_disk")
+            if isinstance(bf80_stage, Mapping)
+            else None
+        )
+        if (
+            not isinstance(receipt, Mapping)
+            or set(receipt) != comparison_fields
+            or receipt.get("schema")
+            != HORIZON_PROMOTED_COMPARISON_RECEIPT_SCHEMA
+            or receipt.get("leaf_id") != leaf_id
+            or receipt.get("source_record_sha256") != source_record_sha256
+            or receipt.get("source_stage_sha256") != source_stage_sha256
+            or receipt.get("source_centre") != source_disk.get("centre")
+            or receipt.get("source_disk_radius") != source_disk.get("radius")
+            or receipt.get("promotion_trigger_receipt_sha256") not in triggers
+            or receipt.get("agrees") is not True
+            or receipt.get("outcome_code") != "AGREES"
+            or not isinstance(bf80_result, Mapping)
+            or bf80_stage.get("precision_tier") != "BF80"
+            or receipt.get("bf80_result_sha256") != _sha256(bf80_result)
+            or receipt.get("bf80_operation_identity")
+            != bf80_stage.get("operation_identity")
+            or not isinstance(bf80_disk, Mapping)
+            or receipt.get("bf80_centre") != bf80_disk.get("centre")
+            or receipt.get("bf80_disk_radius") != bf80_disk.get("radius")
+            or receipt.get("runtime_identity")
+            != bf80_payload.get("scientific_runtime")
+            or receipt.get("backend_identity")
+            != leaf.job.backend_identity.identity_sha256
+            or not isinstance(receipt.get("bf80_operation_identity"), str)
+            or not receipt.get("bf80_operation_identity")
+            or not _receipt_digest_is_valid(receipt)
+        ):
+            continue
+        try:
+            source_centre = complex(
+                float(source_disk["centre"]["real"]),
+                float(source_disk["centre"]["imaginary"]),
+            )
+            bf80_centre = complex(
+                float(receipt["bf80_centre"]["real"]),
+                float(receipt["bf80_centre"]["imaginary"]),
+            )
+            source_radius = float(source_disk["radius"])
+            bf80_radius = float(receipt["bf80_disk_radius"])
+            discrepancy = float(receipt["centre_discrepancy"])
+            threshold = float(receipt["reviewed_comparison_threshold"])
+        except (KeyError, TypeError, ValueError, OverflowError):
+            continue
+        expected_discrepancy = abs(source_centre - bf80_centre)
+        expected_threshold = source_radius + bf80_radius
+        if (
+            all(math.isfinite(value) and value >= 0.0 for value in (
+                source_radius, bf80_radius, discrepancy, threshold
+            ))
+            and discrepancy == expected_discrepancy
+            and threshold == expected_threshold
+            and discrepancy <= threshold
+        ):
+            return True
+    return False
 
 
 def build_fixed_root_screening_record(
@@ -263,14 +589,34 @@ def _new_record_root_seal(
     if not isinstance(stage, Mapping):
         return None
     root = stage.get("fixed_root")
+    branch = stage.get("branch_identity")
+    root_digest = stage.get("root_seal_sha256")
+    if not isinstance(root, Mapping):
+        # Schema-11 horizon stages retain the authenticated central root in
+        # the component baseline rather than copying legacy fixed-root
+        # fields into the numerical stage envelope.
+        payload = stage.get("component_result")
+        raw = payload.get("result") if isinstance(payload, Mapping) else None
+        if not isinstance(raw, Mapping):
+            return None
+        try:
+            result = ComponentResult.from_mapping(raw)
+            root = result.baseline.to_mapping().get("omega")
+            branch = result.baseline.branch_id
+            root_digest = _sha256({
+                "schema": "windows-solver.horizon-root-seal/1",
+                "root_readout": result.baseline.to_mapping(),
+            })
+        except (TypeError, ValueError):
+            return None
     if not isinstance(root, Mapping):
         return None
     try:
         fixed_root = complex(float(root["real"]), float(root["imaginary"]))
         return AuthenticatedRootSeal(
             fixed_root=fixed_root,
-            branch_identity=str(stage["branch_identity"]),
-            root_seal_sha256=str(stage["root_seal_sha256"]),
+            branch_identity=str(branch),
+            root_seal_sha256=str(root_digest),
         )
     except (KeyError, TypeError, ValueError, OverflowError):
         return None
@@ -703,38 +1049,60 @@ def _horizon_outcome(
     backend: NativeCampaignStageBackend,
     leaf: object,
 ) -> Binary64PassOutcome:
-    outcome = backend.execute_stage(leaf, 64)
+    # Horizon work has its own fixed-root analytic boundary.  Calling the
+    # generic stage runner here would silently reintroduce the finite-
+    # amplitude epsilon ladder and its signed-root diagnostics.
+    outcome = backend.execute_horizon_stage(leaf)
     raw = outcome.component_result.get("result")
     result = ComponentResult.from_mapping(raw) if isinstance(raw, Mapping) else None
-    if result is not None and result.response is not None and result.status.value == "CONVERGED":
-        stage = CampaignStageRecord(
+    if result is None:
+        raise ValueError("SYSTEM_FAILURE binary64 horizon component result is missing")
+    operation_identity = "binary64-horizon-production/v2"
+    if result.response is not None and result.status.value == "CONVERGED":
+        stage, stage_sha256 = build_schema11_horizon_stage(
             outcome,
-            {
-                "precision_factory_identity": plan.precision_factory_identity.to_mapping(),
-                "available_precision_digits": [64],
-            },
+            precision_tier="binary64",
+            operation_identity=operation_identity,
         )
-        record = CampaignLeafRecord(
-            leaf_id=leaf.leaf_id,
-            role=leaf.role,
-            state="PRODUCED",
+        decision = derive_horizon_promotion_decision(leaf, outcome)
+        response_disk = stage["response_disk"]
+        if not isinstance(response_disk, Mapping):
+            raise ValueError("SYSTEM_FAILURE bounded horizon lacks a response disk")
+        record = build_schema11_horizon_record(
+            plan,
+            leaf,
             stages=(stage,),
-            trigger_ids=leaf.trigger_ids,
-            sentinel=leaf.sentinel,
+            retained_centre=response_disk["centre"],
+            state="PRODUCED",
         )
+        receipts = (
+            build_horizon_promotion_trigger_receipt(
+                plan, leaf, outcome, stage
+            ),
+        ) if decision.promotion_required else ()
+        if decision.promotion_required:
+            return Binary64PassOutcome(
+                disposition=SurveyDisposition.PROMOTION_PENDING_RESPONSE,
+                operation_identity=operation_identity,
+                reason_code=decision.reason_code or "HORIZON_PROMOTION_REQUIRED",
+                record=record,
+                stage_sha256=stage_sha256,
+                queue_kind=PromotionQueueKind.RESPONSE,
+                minimum_requested_tier="BF80",
+                evidence_receipts=receipts,
+            )
         return Binary64PassOutcome.produced(
-            record=record.to_mapping(),
-            stage_sha256=stage.stage_sha256,
-            operation_identity="binary64-horizon-production/v1",
+            record=record,
+            stage_sha256=stage_sha256,
+            operation_identity=operation_identity,
             reason_code="BOUNDED_HORIZON_RESPONSE",
         )
-    assert result is not None
     code = _typed_horizon_failure_code(result)
     decision = classify_failure(FailureReport(
         failure_code=code,
         failure_class="HORIZON_COMPONENT",
         stage="binary64-horizon",
-        worker_operation="binary64-horizon-production/v1",
+        worker_operation="binary64-horizon-production/v2",
         request_schema="windows-solver.response-component-job/1",
         backend_identity=leaf.job.backend_identity.identity_sha256,
         policy_identity=leaf.job.policy.identity_sha256,
@@ -750,11 +1118,25 @@ def _horizon_outcome(
     if decision.disposition is FailureDisposition.SYSTEM_FAILURE:
         raise ValueError(f"unclassified binary64 horizon failure: {code}")
     if decision.disposition is FailureDisposition.PROMOTION_PENDING:
+        provisional_stage = None
+        provisional_stage_sha256 = None
+        provisional_operation_identity = None
+        if isinstance(raw, Mapping):
+            provisional_stage, provisional_stage_sha256 = build_schema11_horizon_stage(
+                outcome,
+                precision_tier="binary64",
+                operation_identity=operation_identity,
+            )
+            provisional_operation_identity = operation_identity
         return Binary64PassOutcome(
             disposition=SurveyDisposition.PROMOTION_PENDING_RESPONSE,
-            operation_identity="binary64-horizon-production/v1",
+            operation_identity=operation_identity,
             reason_code=code,
             queue_kind=PromotionQueueKind.RESPONSE,
+            minimum_requested_tier="BF80",
+            provisional_stage=provisional_stage,
+            provisional_stage_sha256=provisional_stage_sha256,
+            provisional_operation_identity=provisional_operation_identity,
         )
     dispositions = {
         FailureDisposition.UNRESOLVED: SurveyDisposition.UNRESOLVED,
@@ -763,7 +1145,7 @@ def _horizon_outcome(
     }
     return Binary64PassOutcome(
         disposition=dispositions[decision.disposition],
-        operation_identity="binary64-horizon-production/v1",
+        operation_identity=operation_identity,
         reason_code=code,
     )
 
@@ -850,6 +1232,72 @@ def run_native_binary64_pass(
             leaf.job, background.reuse_key
         ).receipt
 
+    def publish_terminal_record(leaf, record):
+        """Publish one committed terminal record and expose horizon roots."""
+
+        validate_campaign_recovery_record(plan, leaf.leaf_id, record)
+        identity = scientific_computation_identity_sha256(plan, leaf)
+        lookup = store.publish_if_missing(
+            scientific_identity_sha256=identity,
+            leaf_id=leaf.leaf_id,
+            record=record,
+            source_type="originating-campaign",
+        )
+        if (
+            lookup.status is not SolvedLeafLookupStatus.HIT
+            or lookup.receipt is None
+            or lookup.receipt.get("record") != record
+        ):
+            raise ValueError("terminal numerical record was not published exactly")
+        with progress_scope(
+            leaf_id=leaf.leaf_id,
+            execution_profile="SURVEY",
+            survey_pass="binary64",
+        ):
+            emit_progress(
+                ProgressEventKind.LEAF_CACHE_PUBLISHED,
+                source_type="originating-campaign",
+                record_sha256=record["record_sha256"],
+            )
+        if leaf.mechanism_id == "horizon-admittance":
+            seal = _old_record_root_seal(record) or _new_record_root_seal(record)
+            if seal is not None:
+                root_provider().publish(leaf, seal)
+
+    # Reconcile authenticated terminal checkpoint records before the survey's
+    # cache discovery.  A cache hit is therefore durable before any numerical
+    # leaf is eligible to be skipped.
+    promotion_bound_record_sha256 = (
+        _promotion_bound_source_record_sha256(checkpoint, plan)
+    )
+    checkpoint_records = {
+        str(item["leaf_id"]): item
+        for item in checkpoint.get("records", ())
+        if isinstance(item, Mapping)
+    }
+    for leaf_id in recovery_selection.ordered_leaf_ids:
+        record = checkpoint_records.get(leaf_id)
+        if (
+            record is None
+            or record.get("state") != "PRODUCED"
+            or record.get("record_sha256") in promotion_bound_record_sha256
+        ):
+            continue
+        leaf = next(item for item in plan.leaves if item.leaf_id == leaf_id)
+        validate_campaign_recovery_record(plan, leaf_id, record)
+        lookup = store.publish_if_missing(
+            scientific_identity_sha256=recovery_selection.scientific_identities[leaf_id],
+            leaf_id=leaf_id,
+            record=record,
+            source_type="imported-authenticated-checkpoint",
+        )
+        if (
+            lookup.status is not SolvedLeafLookupStatus.HIT
+            or lookup.receipt is None
+            or lookup.receipt.get("record") != record
+        ):
+            raise ValueError("checkpoint terminal publication was not exact")
+
     return run_binary64_survey(
         plan,
         recovery_selection,
@@ -866,6 +1314,7 @@ def run_native_binary64_pass(
         record_validator=lambda leaf_id, record: validate_campaign_recovery_record(
             plan, leaf_id, record
         ),
+        terminal_record_committed=publish_terminal_record,
         checkpoint_committed=lambda value: _refresh_runtime_reports(
             plan,
             selection,
@@ -899,7 +1348,97 @@ def _promoted_horizon_outcome(
     plan: object,
     backend: NativeCampaignStageBackend,
     leaf: object,
+    *,
+    queue_entry: Mapping[str, object] | None = None,
+    source_record: Mapping[str, object] | None = None,
+    trigger_receipts: tuple[Mapping[str, object], ...] = (),
 ) -> PromotedPassOutcome:
+    operation_identity = "promoted-horizon-component/v2"
+    source_record_sha256 = None
+    source_stage_sha256 = None
+    trigger_receipt = None
+    if source_record is not None:
+        validate_schema11_horizon_record(plan, leaf, source_record)
+        stages = source_record["stages"]
+        assert isinstance(stages, list)
+        source_stage = stages[0]
+        assert isinstance(source_stage, Mapping)
+        source_record_sha256 = str(source_record["record_sha256"])
+        source_stage_sha256 = str(source_stage["stage_sha256"])
+        if queue_entry is None or (
+            queue_entry.get("source_record_sha256") != source_record_sha256
+            or queue_entry.get("source_stage_sha256") != source_stage_sha256
+            or not isinstance(
+                queue_entry.get("source_binary64_disposition_receipt_sha256"),
+                str,
+            )
+        ):
+            raise ValueError("horizon promotion source provenance is invalid")
+        candidates = tuple(
+            receipt
+            for receipt in trigger_receipts
+            if receipt.get("schema") == HORIZON_PROMOTION_TRIGGER_RECEIPT_SCHEMA
+        )
+        if len(candidates) != 1:
+            raise ValueError("horizon promotion trigger receipt is missing")
+        trigger_receipt = candidates[0]
+        source_payload = source_stage.get("component_result")
+        if not isinstance(source_payload, Mapping):
+            raise ValueError("horizon source stage component payload is invalid")
+        source_disk = source_stage.get("response_disk")
+        source_radius = (
+            0.0
+            if not isinstance(source_disk, Mapping)
+            else float(source_disk.get("radius", 0.0))
+        )
+        source_stage_outcome = StageOutcome(
+            digits=64,
+            numerical_state=str(source_stage["numerical_state"]),
+            component_result=source_payload,
+            local_disk_radius_abs=source_radius,
+            signed_error_channels=synthetic_stage_signed_error_channels(
+                source_payload,
+                source_radius,
+                precision_ladder_applicable=False,
+            ),
+            deep_diagnostics=(
+                source_payload.get("deep_diagnostics")
+                if isinstance(source_payload.get("deep_diagnostics"), Mapping)
+                else None
+            ),
+        )
+        expected_trigger_receipt = build_horizon_promotion_trigger_receipt(
+            plan,
+            leaf,
+            source_stage_outcome,
+            source_stage,
+        )
+        if dict(trigger_receipt) != expected_trigger_receipt:
+            raise ValueError("horizon promotion trigger receipt is not recomputable")
+        trigger_content = {
+            key: value
+            for key, value in trigger_receipt.items()
+            if key != "receipt_sha256"
+        }
+        if (
+            trigger_receipt.get("receipt_sha256")
+            != _sha256(trigger_content)
+            or trigger_receipt.get("leaf_id") != leaf.leaf_id
+            or trigger_receipt.get("scientific_computation_identity")
+            != scientific_computation_identity_sha256(plan, leaf)
+            or trigger_receipt.get("binary64_stage_sha256") != source_stage_sha256
+            or trigger_receipt.get("promotion_required")
+            != (
+                bool(trigger_receipt.get("trigger_ids"))
+                or trigger_receipt.get("sentinel") is True
+            )
+        ):
+            raise ValueError("horizon promotion trigger receipt binding is invalid")
+        if trigger_receipt.get("promotion_required") is not True:
+            raise ValueError(
+                "horizon promotion trigger receipt does not require promoted work"
+            )
+
     precision = backend._julia_precision_backend_for(leaf.job, 80)
     try:
         result = run_promoted_horizon_component(
@@ -924,7 +1463,7 @@ def _promoted_horizon_outcome(
             failure_code=code,
             failure_class="PROMOTED_HORIZON_EXECUTION",
             stage="promoted-horizon",
-            worker_operation="promoted-horizon-component/v1",
+            worker_operation=operation_identity,
             request_schema="windows-solver.response-component-job/1",
             backend_identity=leaf.job.backend_identity.identity_sha256,
             policy_identity=leaf.job.policy.identity_sha256,
@@ -948,15 +1487,44 @@ def _promoted_horizon_outcome(
             disposition=disposition,
             reason_code=code,
             precision_tiers=("BF80",),
+            operation_identity=operation_identity,
+            source_record_sha256=source_record_sha256,
+            source_stage_sha256=source_stage_sha256,
+            root_read_limit=1,
             worker_launch_count=1,
         )
+    component_result = {
+        "evidence_kind": "package-owned-julia-promoted-horizon-survey",
+        "result": result.to_mapping(),
+        "scientific_runtime": precision.scientific_runtime_for(leaf.job),
+    }
+    stage_outcome = StageOutcome(
+        digits=80,
+        numerical_state=result.status.value,
+        component_result=component_result,
+        local_disk_radius_abs=sum(result.error_channels.values()),
+        signed_error_channels=_component_stage_signed_error_channels(
+            component_result,
+            result,
+            repeat_applicable=False,
+            precision_ladder_applicable=False,
+        ),
+        self_refinement_enclosed=None,
+        discrepancy_from_previous_abs=None,
+        discrepancy_enclosed=None,
+    )
+    stage, stage_sha256 = build_schema11_horizon_stage(
+        stage_outcome,
+        precision_tier="BF80",
+        operation_identity=operation_identity,
+    )
     if result.response is None or result.status.value != "CONVERGED":
         code = _typed_horizon_failure_code(result)
         decision = classify_failure(FailureReport(
             failure_code=code,
             failure_class="HORIZON_COMPONENT",
             stage="promoted-horizon",
-            worker_operation="promoted-horizon-component/v1",
+            worker_operation=operation_identity,
             request_schema="windows-solver.response-component-job/1",
             backend_identity=leaf.job.backend_identity.identity_sha256,
             policy_identity=leaf.job.policy.identity_sha256,
@@ -977,57 +1545,140 @@ def _promoted_horizon_outcome(
             FailureDisposition.DEFERRED: SurveyDisposition.DEFERRED,
             FailureDisposition.REJECTED: SurveyDisposition.REJECTED,
         }[decision.disposition]
+        if source_record is None and disposition in {
+            SurveyDisposition.UNRESOLVED,
+            SurveyDisposition.REJECTED,
+        }:
+            record = build_schema11_horizon_record(
+                plan,
+                leaf,
+                stages=(stage,),
+                retained_centre=None,
+                state=disposition.value,
+            )
+        else:
+            record = None
         return PromotedPassOutcome(
             disposition=disposition,
             reason_code=code,
             precision_tiers=("BF80",),
+            operation_identity=operation_identity,
+            record=record,
+            stage_sha256=stage_sha256 if record is not None else None,
+            source_record_sha256=source_record_sha256,
+            source_stage_sha256=source_stage_sha256,
             root_read_count=1,
+            root_read_limit=1,
             worker_launch_count=1,
         )
-    component_result = {
-        "evidence_kind": "package-owned-julia-promoted-horizon-survey",
-        "result": result.to_mapping(),
-        "scientific_runtime": precision.scientific_runtime_for(leaf.job),
-    }
-    from .response_batches import StageOutcome, _component_stage_signed_error_channels
 
-    outcome = StageOutcome(
-        digits=80,
-        numerical_state=result.status.value,
-        component_result=component_result,
-        local_disk_radius_abs=sum(result.error_channels.values()),
-        signed_error_channels=_component_stage_signed_error_channels(
-            component_result,
-            result,
-            repeat_applicable=False,
-            precision_ladder_applicable=False,
-        ),
-        self_refinement_enclosed=None,
-        discrepancy_from_previous_abs=None,
-        discrepancy_enclosed=None,
+    if source_record is not None:
+        source_stages = source_record["stages"]
+        assert isinstance(source_stages, list)
+        source_stage = source_stages[0]
+        assert isinstance(source_stage, Mapping)
+        source_disk = source_stage.get("response_disk")
+        bf80_disk = stage.get("response_disk")
+        if not isinstance(source_disk, Mapping):
+            raise ValueError("horizon source record lacks a response disk")
+        source_centre = source_disk["centre"]
+        source_radius = float(source_disk["radius"])
+        bf80_centre = (
+            None if not isinstance(bf80_disk, Mapping) else bf80_disk["centre"]
+        )
+        bf80_radius = (
+            None if not isinstance(bf80_disk, Mapping) else float(bf80_disk["radius"])
+        )
+        discrepancy = (
+            None
+            if bf80_centre is None
+            else abs(
+                complex(
+                    float(source_centre["real"]),
+                    float(source_centre["imaginary"]),
+                )
+                - complex(float(bf80_centre["real"]), float(bf80_centre["imaginary"]))
+            )
+        )
+        threshold = (
+            None if bf80_radius is None else source_radius + bf80_radius
+        )
+        agrees = discrepancy is not None and threshold is not None and discrepancy <= threshold
+        comparison_content = {
+            "schema": HORIZON_PROMOTED_COMPARISON_RECEIPT_SCHEMA,
+            "leaf_id": leaf.leaf_id,
+            "source_record_sha256": source_record_sha256,
+            "source_stage_sha256": source_stage_sha256,
+            "source_centre": source_centre,
+            "source_disk_radius": source_radius,
+            "promotion_trigger_receipt_sha256": (
+                trigger_receipt["receipt_sha256"]
+                if trigger_receipt is not None else None
+            ),
+            "bf80_operation_identity": operation_identity,
+            "bf80_result_sha256": _sha256(result.to_mapping()),
+            "bf80_stage": stage,
+            "bf80_centre": bf80_centre,
+            "bf80_disk_radius": bf80_radius,
+            "centre_discrepancy": discrepancy,
+            "reviewed_comparison_threshold": threshold,
+            "agrees": agrees,
+            "outcome_code": "AGREES" if agrees else "DISAGREES_OR_UNBOUNDED",
+            "runtime_identity": precision.scientific_runtime_for(leaf.job),
+            "backend_identity": leaf.job.backend_identity.identity_sha256,
+        }
+        comparison_receipt = {
+            **comparison_content,
+            "receipt_sha256": _sha256(comparison_content),
+        }
+        return PromotedPassOutcome(
+            disposition=(
+                SurveyDisposition.COMPLETED
+                if agrees else SurveyDisposition.UNRESOLVED
+            ),
+            reason_code=(
+                "PROMOTED_HORIZON_COMPARISON_AGREES"
+                if agrees else "PROMOTED_HORIZON_COMPARISON_DISAGREES"
+            ),
+            precision_tiers=("BF80",),
+            operation_identity="promoted-horizon-comparison/v2",
+            source_record_sha256=source_record_sha256,
+            source_stage_sha256=source_stage_sha256,
+            evidence_receipts=(comparison_receipt,),
+            root_read_count=1,
+            root_read_limit=1,
+            worker_launch_count=1,
+        )
+
+    provisional = None if queue_entry is None else queue_entry.get("provisional_stage")
+    stages = (stage,)
+    if provisional is not None:
+        if not isinstance(provisional, Mapping):
+            raise ValueError("horizon provisional stage is invalid")
+        validate_schema11_horizon_stage(plan, leaf, provisional)
+        if queue_entry.get("provisional_stage_sha256") != provisional.get("stage_sha256"):
+            raise ValueError("horizon provisional stage digest is invalid")
+        stages = (provisional, stage)
+    response_disk = stage.get("response_disk")
+    retained_centre = (
+        None if not isinstance(response_disk, Mapping) else response_disk["centre"]
     )
-    stage = CampaignStageRecord(
-        outcome,
-        {
-            "precision_factory_identity": plan.precision_factory_identity.to_mapping(),
-            "available_precision_digits": list(plan.precision_capabilities.digits),
-        },
-    )
-    record = CampaignLeafRecord(
-        leaf_id=leaf.leaf_id,
-        role=leaf.role,
-        state="PRODUCED",
-        stages=(stage,),
-        trigger_ids=leaf.trigger_ids,
-        sentinel=leaf.sentinel,
+    record = build_schema11_horizon_record(
+        plan,
+        leaf,
+        stages=stages,
+        retained_centre=retained_centre,
+        state="PRODUCED" if retained_centre is not None else "UNRESOLVED",
     )
     return PromotedPassOutcome(
         disposition=SurveyDisposition.COMPLETED,
         reason_code="BOUNDED_PROMOTED_HORIZON_RESPONSE",
         precision_tiers=("BF80",),
-        record=record.to_mapping(),
-        stage_sha256=stage.stage_sha256,
+        operation_identity="promoted-horizon-production/v2",
+        record=record,
+        stage_sha256=stage_sha256,
         root_read_count=1,
+        root_read_limit=1,
         worker_launch_count=1,
     )
 
@@ -1092,6 +1743,36 @@ def run_native_promoted_pass(
             root_seal_sha256=root_sha,
         )
 
+    def publish_terminal_record(leaf, record):
+        validate_campaign_recovery_record(plan, leaf.leaf_id, record)
+        identity = scientific_computation_identity_sha256(plan, leaf)
+        lookup = store.publish_if_missing(
+            scientific_identity_sha256=identity,
+            leaf_id=leaf.leaf_id,
+            record=record,
+            source_type="originating-campaign",
+        )
+        if (
+            lookup.status is not SolvedLeafLookupStatus.HIT
+            or lookup.receipt is None
+            or lookup.receipt.get("record") != record
+        ):
+            raise ValueError("promoted terminal record was not published exactly")
+        with progress_scope(
+            leaf_id=leaf.leaf_id,
+            execution_profile="SURVEY",
+            survey_pass="promoted",
+        ):
+            emit_progress(
+                ProgressEventKind.LEAF_CACHE_PUBLISHED,
+                source_type="originating-campaign",
+                record_sha256=record["record_sha256"],
+            )
+        if leaf.mechanism_id == "horizon-admittance":
+            seal = _old_record_root_seal(record) or _new_record_root_seal(record)
+            if seal is not None:
+                root_provider().publish(leaf, seal)
+
     return run_promoted_survey(
         plan,
         recovery_selection,
@@ -1104,12 +1785,23 @@ def run_native_promoted_pass(
         ),
         primary_root_runner=_promoted_root_result,
         horizon_runner=lambda leaf: _promoted_horizon_outcome(plan, backend(), leaf),
+        promoted_horizon_runner=(
+            lambda leaf, entry, source, receipts: _promoted_horizon_outcome(
+                plan,
+                backend(),
+                leaf,
+                queue_entry=entry,
+                source_record=source,
+                trigger_receipts=receipts,
+            )
+        ),
         produced_record_builder=build,
         determinant_error_store=error_store,
         solved_leaf_store=store,
         record_validator=lambda leaf_id, record: validate_campaign_recovery_record(
             plan, leaf_id, record
         ),
+        terminal_record_committed=publish_terminal_record,
         checkpoint_committed=lambda value: _refresh_runtime_reports(
             plan,
             selection,

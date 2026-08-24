@@ -618,14 +618,17 @@ def schema11_dashboard_snapshot(
             if isinstance(item, Mapping)
         )
         tier_seconds: dict[str, float] = {}
+        timed_tiers: set[str] = set()
         for pass_entry in pass_entries:
             for item in pass_entry.get("tier_timing", ()):
                 if not isinstance(item, Mapping):
                     continue
                 tier = str(item.get("tier"))
-                tier_seconds[tier] = tier_seconds.get(tier, 0.0) + _finite_seconds(
-                    item.get("elapsed_seconds")
-                )
+                elapsed = _optional_seconds(item.get("elapsed_seconds"))
+                if elapsed is None:
+                    continue
+                timed_tiers.add(tier)
+                tier_seconds[tier] = tier_seconds.get(tier, 0.0) + elapsed
         fragments = tuple(
             fragment
             for pass_entry in pass_entries
@@ -656,12 +659,22 @@ def schema11_dashboard_snapshot(
                 "worker_launch_count": sum(
                     int(item.get("worker_launch_count", 0)) for item in pass_entries
                 ),
-                "binary64_seconds": tier_seconds.get("binary64", 0.0),
-                "bf40_seconds": tier_seconds.get("BF40", 0.0),
-                "bf80_seconds": tier_seconds.get("BF80", 0.0),
-                "bf120_seconds": tier_seconds.get("BF120", 0.0),
-                "total_leaf_seconds": sum(
-                    _finite_seconds(item) for item in tier_seconds.values()
+                "binary64_seconds": (
+                    tier_seconds.get("binary64")
+                    if "binary64" in timed_tiers
+                    else None
+                ),
+                "bf40_seconds": (
+                    tier_seconds.get("BF40") if "BF40" in timed_tiers else None
+                ),
+                "bf80_seconds": (
+                    tier_seconds.get("BF80") if "BF80" in timed_tiers else None
+                ),
+                "bf120_seconds": (
+                    tier_seconds.get("BF120") if "BF120" in timed_tiers else None
+                ),
+                "total_leaf_seconds": (
+                    sum(tier_seconds.values()) if timed_tiers else None
                 ),
                 "response_magnitude": _record_response_magnitude(record),
                 "relative_disk_radius": _record_relative_error(record),
@@ -718,6 +731,14 @@ def _finite_seconds(value: object) -> float:
     except (TypeError, ValueError, OverflowError):
         return 0.0
     return number if math.isfinite(number) and number >= 0.0 else 0.0
+
+
+def _optional_seconds(value: object) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return number if math.isfinite(number) and number >= 0.0 else None
 
 
 def _latest_precision_tier(record: Mapping[str, object]) -> object:
@@ -779,6 +800,17 @@ def _record_response_magnitude(record: Mapping[str, object]) -> object:
             return abs(complex(float(response["real"]), float(response["imaginary"])))
         except (KeyError, TypeError, ValueError, OverflowError):
             return "-"
+    nested = component.get("result")
+    if isinstance(nested, Mapping):
+        response = nested.get("response")
+        if isinstance(response, Mapping):
+            try:
+                return abs(complex(
+                    float(response["real"]),
+                    float(response.get("imaginary", response.get("imag"))),
+                ))
+            except (KeyError, TypeError, ValueError, OverflowError):
+                return "-"
     return "-"
 
 
@@ -803,6 +835,11 @@ def _record_relative_error(record: Mapping[str, object]) -> object:
     for name in ("relative_disk_radius", "relative_error"):
         if component.get(name) is not None:
             return component[name]
+    nested = component.get("result")
+    if isinstance(nested, Mapping):
+        for name in ("relative_disk_radius", "relative_error"):
+            if nested.get(name) is not None:
+                return nested[name]
     return "-"
 
 
@@ -825,6 +862,7 @@ class Schema11ProgressReporter:
         self.profile = profile
         self.pass_name = pass_name
         self.mode = ProgressMode(mode)
+        self._started_monotonic = time.monotonic()
         self.stream = stream or sys.stdout
         self.dashboard = (
             None
@@ -893,7 +931,7 @@ class Schema11ProgressReporter:
             leaf_count = context.get("leaf_count", metadata.get("leaf_count"))
             self._live.update(
                 {
-                    "elapsed": f"{event.monotonic_seconds:.1f}s",
+                    "elapsed": f"{max(0.0, event.monotonic_seconds - self._started_monotonic):.1f}s",
                     "counts": _count_text(self._counts),
                     "leaf": (
                         None
