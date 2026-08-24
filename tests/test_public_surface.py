@@ -956,6 +956,166 @@ exit 0
         )
         self.assertTrue(Path(checkpoint).is_absolute())
 
+    @unittest.skipUnless(os.name == "nt", "requires Windows PowerShell 5.1")
+    def test_m02_public_default_invocation_starts_new_campaign_when_checkpoint_absent(
+        self,
+    ) -> None:
+        """A fresh checkout has no default checkpoint. Plain ``m02.ps1``
+        must treat that as an ordinary first run under the default binary64
+        survey profile, not require a separate ``-NewCampaign`` flag."""
+
+        root = Path(__file__).resolve().parents[1]
+        windows_powershell = Path(os.environ["SystemRoot"]).joinpath(
+            "System32", "WindowsPowerShell", "v1.0", "powershell.exe"
+        )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            package_root = Path(temporary) / "m02-cold-start"
+            (package_root / "examples").mkdir(parents=True)
+            (package_root / "runtime").mkdir()
+            shutil.copy2(root / "m02.ps1", package_root / "m02.ps1")
+            shutil.copy2(
+                root / "runtime" / "resolve-runtime-root.ps1",
+                package_root / "runtime" / "resolve-runtime-root.ps1",
+            )
+            shutil.copy2(
+                root / "examples" / "m02-campaign.json",
+                package_root / "examples" / "m02-campaign.json",
+            )
+            argument_log = package_root / "arguments.jsonl"
+            (package_root / "solver.ps1").write_text(
+                r'''param(
+    [Parameter(ValueFromRemainingArguments = $true)]
+    [string[]]$SolverArguments
+)
+
+$record = $SolverArguments | ConvertTo-Json -Compress
+[IO.File]::AppendAllText(
+    $env:M02_TEST_ARGUMENT_LOG,
+    $record + [Environment]::NewLine,
+    [System.Text.UTF8Encoding]::new($false)
+)
+if ($SolverArguments[0] -eq "campaign-prepare-resources") {
+    exit 0
+}
+if ($SolverArguments[0] -eq "campaign-new") {
+    $outputIndex = [Array]::IndexOf($SolverArguments, "--output")
+    $checkpoint = [IO.Path]::GetFullPath($SolverArguments[$outputIndex + 1])
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $checkpoint) |
+        Out-Null
+    [IO.File]::WriteAllText($checkpoint, "{}")
+    exit 0
+}
+if ($SolverArguments[0] -eq "campaign-plan") {
+    '{"role_counts":{"primary":140,"control":24,"deep":48},"leaf_count":212}'
+    exit 0
+}
+if ($SolverArguments[0] -eq "campaign-schema11-validate") {
+    '{"selection_id":"selection-1","schema_version":11,"recovered_terminal_count":0,"binary64_pass_count":0,"promotion_queue_count":0,"evidence_counts":{},"basic_report_directory":"reports"}'
+    exit 0
+}
+$checkpointIndex = [Array]::IndexOf($SolverArguments, "--checkpoint")
+if ($checkpointIndex -lt 0) {
+    exit 91
+}
+exit 0
+''',
+                encoding="utf-8",
+            )
+            environment = dict(os.environ)
+            environment["M02_TEST_ARGUMENT_LOG"] = str(argument_log)
+            environment["KERR_QNM_RUNTIME_ROOT"] = str(package_root / "managed")
+            checkpoint_path = (
+                package_root / "m02-output" / "m02-campaign-checkpoint.json"
+            )
+            self.assertFalse(checkpoint_path.exists())
+            result = subprocess.run(
+                [
+                    str(windows_powershell),
+                    "-NoLogo",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-File",
+                    str(package_root / "m02.ps1"),
+                    "-SkipBootstrap",
+                ],
+                cwd=root,
+                env=environment,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            self.assertEqual(
+                result.returncode,
+                0,
+                f"stdout={result.stdout!r} stderr={result.stderr!r}",
+            )
+            self.assertTrue(checkpoint_path.is_file())
+            calls = [
+                json.loads(line)
+                for line in argument_log.read_text(encoding="utf-8").splitlines()
+            ]
+            selection_path = package_root / "examples" / "m02-campaign.json"
+            for call in calls:
+                self.assertTrue(Path(call[1]).samefile(selection_path))
+                call[1] = str(selection_path)
+            output_index = calls[1].index("--output") + 1
+            self.assertTrue(Path(calls[1][output_index]).samefile(checkpoint_path))
+            calls[1][output_index] = str(checkpoint_path)
+            for call in calls[3:]:
+                checkpoint_index = call.index("--checkpoint") + 1
+                self.assertTrue(
+                    Path(call[checkpoint_index]).samefile(checkpoint_path)
+                )
+                call[checkpoint_index] = str(checkpoint_path)
+
+        selection = str(selection_path)
+        checkpoint = str(checkpoint_path)
+        self.assertEqual(
+            calls,
+            [
+                [
+                    "campaign-prepare-resources",
+                    selection,
+                ],
+                [
+                    "campaign-new",
+                    selection,
+                    "--output",
+                    checkpoint,
+                ],
+                [
+                    "campaign-plan",
+                    selection,
+                ],
+                [
+                    "campaign-schema11-validate",
+                    selection,
+                    "--checkpoint",
+                    checkpoint,
+                ],
+                [
+                    "campaign-survey-binary64",
+                    selection,
+                    "--checkpoint",
+                    checkpoint,
+                    "--progress",
+                    "normal",
+                ],
+                [
+                    "campaign-schema11-validate",
+                    selection,
+                    "--checkpoint",
+                    checkpoint,
+                    "--pass",
+                    "binary64",
+                ],
+            ],
+        )
+
     def test_windows_ci_captures_native_streams_outside_powershell(self) -> None:
         root = Path(__file__).resolve().parents[1]
         workflow = (root / ".github" / "workflows" / "ci.yml").read_text(
