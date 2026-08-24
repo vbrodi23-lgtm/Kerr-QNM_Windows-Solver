@@ -8,6 +8,7 @@ from pathlib import Path
 import tempfile
 from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 import windows_solver.campaign_runtime as campaign_runtime
 import windows_solver.response_batches as response_batches
@@ -23,6 +24,7 @@ from windows_solver.campaign_policy import (
 )
 from windows_solver.campaign_recovery import RecoverySelection
 from windows_solver.campaign_runtime import (
+    _promoted_horizon_outcome,
     build_schema11_horizon_record,
     build_schema11_horizon_stage,
 )
@@ -513,6 +515,148 @@ class HorizonRecordConstructionTests(unittest.TestCase):
                     ),
                 )
         self.assertFalse(called)
+
+    def test_promoted_horizon_rejects_nonpromoting_source_receipt(self) -> None:
+        plan = _plan()
+        leaf = next(
+            item
+            for item in plan.leaves
+            if item.role == "primary"
+            and item.mechanism_id == "horizon-admittance"
+        )
+        component = native_component_result(leaf.job, 0.25 + 0.1j)
+        payload = {
+            "evidence_kind": "native-task-008-component-engine",
+            "result": component.to_mapping(),
+        }
+        stage_outcome = StageOutcome(
+            digits=64,
+            numerical_state="CONVERGED",
+            component_result=payload,
+            local_disk_radius_abs=1.0e-6,
+            signed_error_channels=synthetic_stage_signed_error_channels(
+                payload, 1.0e-6
+            ),
+        )
+        stage, stage_sha256 = build_schema11_horizon_stage(
+            stage_outcome,
+            precision_tier="binary64",
+            operation_identity="test-binary64-horizon/v1",
+        )
+        response_disk = stage["response_disk"]
+        assert isinstance(response_disk, dict)
+        record = build_schema11_horizon_record(
+            plan,
+            leaf,
+            stages=(stage,),
+            retained_centre=response_disk["centre"],
+            state="PRODUCED",
+        )
+        trigger_receipt = build_horizon_promotion_trigger_receipt(
+            plan, leaf, stage_outcome, stage
+        )
+        self.assertFalse(trigger_receipt["promotion_required"])
+        called = False
+
+        class Backend:
+            def _julia_precision_backend_for(self, *_args):
+                nonlocal called
+                called = True
+                raise AssertionError("BF80 runner must not start")
+
+        with self.assertRaisesRegex(ValueError, "does not require"):
+            _promoted_horizon_outcome(
+                plan,
+                Backend(),
+                leaf,
+                queue_entry={
+                    "source_record_sha256": record["record_sha256"],
+                    "source_stage_sha256": stage_sha256,
+                    "source_binary64_disposition_receipt_sha256": "c" * 64,
+                },
+                source_record=record,
+                trigger_receipts=(trigger_receipt,),
+            )
+        self.assertFalse(called)
+
+    def test_promoted_horizon_source_record_path_runs_and_retains_source(self) -> None:
+        plan = _plan()
+        leaf = next(
+            item
+            for item in plan.leaves
+            if item.role == "deep"
+            and item.mechanism_id == "horizon-admittance"
+            and item.leaf_id
+            in set(B_PRIME_RELEASE_DOMAIN.fixed_precision_sentinel_leaf_ids)
+        )
+        component = native_component_result(leaf.job, 0.25 + 0.1j)
+        payload = {
+            "evidence_kind": "native-task-008-component-engine",
+            "result": component.to_mapping(),
+        }
+        stage_outcome = StageOutcome(
+            digits=64,
+            numerical_state="CONVERGED",
+            component_result=payload,
+            local_disk_radius_abs=1.0e-6,
+            signed_error_channels=synthetic_stage_signed_error_channels(
+                payload, 1.0e-6
+            ),
+            deep_diagnostics=_triggering_diagnostics(),
+        )
+        stage, stage_sha256 = build_schema11_horizon_stage(
+            stage_outcome,
+            precision_tier="binary64",
+            operation_identity="test-binary64-horizon/v1",
+        )
+        response_disk = stage["response_disk"]
+        assert isinstance(response_disk, dict)
+        record = build_schema11_horizon_record(
+            plan,
+            leaf,
+            stages=(stage,),
+            retained_centre=response_disk["centre"],
+            state="PRODUCED",
+        )
+        trigger_receipt = build_horizon_promotion_trigger_receipt(
+            plan, leaf, stage_outcome, stage
+        )
+        self.assertTrue(trigger_receipt["promotion_required"])
+        bf80_component = native_component_result(leaf.job, 0.25 + 0.1j)
+
+        class Backend:
+            def _julia_precision_backend_for(self, *_args):
+                return SimpleNamespace(
+                    scientific_runtime_for=lambda _job: {
+                        "runtime": "synthetic-bf80"
+                    }
+                )
+
+        with patch(
+            "windows_solver.campaign_runtime.run_promoted_horizon_component",
+            return_value=bf80_component,
+        ):
+            outcome = _promoted_horizon_outcome(
+                plan,
+                Backend(),
+                leaf,
+                queue_entry={
+                    "source_record_sha256": record["record_sha256"],
+                    "source_stage_sha256": stage_sha256,
+                    "source_binary64_disposition_receipt_sha256": "c" * 64,
+                },
+                source_record=record,
+                trigger_receipts=(trigger_receipt,),
+            )
+
+        self.assertIsNone(outcome.record)
+        self.assertEqual(record["record_sha256"], outcome.source_record_sha256)
+        self.assertEqual("COMPLETED", outcome.disposition.value)
+        self.assertEqual(1, len(outcome.evidence_receipts))
+        self.assertEqual(
+            record["record_sha256"],
+            outcome.evidence_receipts[0]["source_record_sha256"],
+        )
 
 
 if __name__ == "__main__":

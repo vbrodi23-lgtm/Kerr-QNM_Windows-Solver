@@ -58,11 +58,13 @@ from .response_batches import (
     PrecisionCapabilities,
     StageOutcome,
     _ode_error_budget_from_mapping,
+    _component_stage_signed_error_channels,
     _sealed_root_for_result,
     _run_promoted_exterior_component_with_progress,
     build_horizon_promotion_trigger_receipt,
     derive_horizon_promotion_decision,
     scientific_computation_identity_sha256,
+    synthetic_stage_signed_error_channels,
     validate_schema11_horizon_stage,
     validate_schema11_horizon_record,
     validate_campaign_recovery_record,
@@ -1144,7 +1146,11 @@ def _promoted_horizon_outcome(
             numerical_state=str(source_stage["numerical_state"]),
             component_result=source_payload,
             local_disk_radius_abs=source_radius,
-            signed_error_channels=(),
+            signed_error_channels=synthetic_stage_signed_error_channels(
+                source_payload,
+                source_radius,
+                precision_ladder_applicable=False,
+            ),
             deep_diagnostics=(
                 source_payload.get("deep_diagnostics")
                 if isinstance(source_payload.get("deep_diagnostics"), Mapping)
@@ -1178,6 +1184,10 @@ def _promoted_horizon_outcome(
             )
         ):
             raise ValueError("horizon promotion trigger receipt binding is invalid")
+        if trigger_receipt.get("promotion_required") is not True:
+            raise ValueError(
+                "horizon promotion trigger receipt does not require promoted work"
+            )
 
     precision = backend._julia_precision_backend_for(leaf.job, 80)
     try:
@@ -1237,8 +1247,6 @@ def _promoted_horizon_outcome(
         "result": result.to_mapping(),
         "scientific_runtime": precision.scientific_runtime_for(leaf.job),
     }
-    from .response_batches import StageOutcome, _component_stage_signed_error_channels
-
     stage_outcome = StageOutcome(
         digits=80,
         numerical_state=result.status.value,
