@@ -31,6 +31,7 @@ GSN_CONSUMER_CONTRACT_VERSION = 1
 GSN_EQUATION_CONVENTION = "generalized-sasaki-nakamura-spin-minus-two-sF-sU"
 GSN_SPIN_WEIGHT = -2
 GSN_MASS_NORMALIZATION = 1
+GSN_BOOTSTRAP_RECEIPT_SCHEMA = "windows-solver.gsn-bootstrap-resource/1"
 
 _ARTIFACT_ID = re.compile(r"gsn-[0-9]{6}")
 _DIGEST = re.compile(r"[0-9a-f]{64}")
@@ -38,6 +39,12 @@ _DIGEST = re.compile(r"[0-9a-f]{64}")
 
 class GsnCacheProductionError(RuntimeError):
     """The package-owned GSN input stage could not produce a trusted cache."""
+
+
+class GsnBootstrapRequiredError(GsnCacheProductionError):
+    """Campaign execution cannot find an authenticated prebuilt GSN resource."""
+
+    failure_code = "GSN_BOOTSTRAP_REQUIRED"
 
 
 def _reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -157,6 +164,43 @@ class GeneratedGsnCache:
     path: Path
     sha256: str
     parameter_pairs: tuple[GsnParameterPair, ...]
+
+
+def _normalise_parameter_pairs(
+    parameter_pairs: Iterable[GsnParameterPair],
+) -> tuple[GsnParameterPair, ...]:
+    origin_sets: dict[tuple[int, int, int], set[GsnSamplingOrigin]] = {}
+    for item in parameter_pairs:
+        pair = GsnParameterPair(
+            item.spin_numerator,
+            item.spin_denominator,
+            item.azimuthal_index,
+            item.origins,
+        )
+        key = (pair.spin_numerator, pair.spin_denominator, pair.azimuthal_index)
+        origin_sets.setdefault(key, set()).update(pair.origins)
+    pairs = tuple(
+        GsnParameterPair(*key, tuple(sorted(origins)))
+        for key, origins in sorted(
+            origin_sets.items(),
+            key=lambda item: (Fraction(item[0][0], item[0][1]), item[0][2]),
+        )
+    )
+    if not pairs:
+        raise GsnCacheProductionError("at least one GSN parameter pair is required")
+    return pairs
+
+
+def _bootstrap_request_sha256(pairs: Sequence[GsnParameterPair]) -> str:
+    return hashlib.sha256(
+        _canonical_json([pair.to_mapping() for pair in pairs]).encode("ascii")
+    ).hexdigest()
+
+
+def _bootstrap_receipt_path(
+    directory: Path, pairs: Sequence[GsnParameterPair]
+) -> Path:
+    return directory / f"gsn-bootstrap-{_bootstrap_request_sha256(pairs)}.json"
 
 
 def _parameter_pair_for_leaf(leaf: object) -> GsnParameterPair:
@@ -859,25 +903,7 @@ def ensure_generated_gsn_cache(
     is regenerated independently and immediately committed to the runtime index.
     """
 
-    origin_sets: dict[tuple[int, int, int], set[GsnSamplingOrigin]] = {}
-    for item in parameter_pairs:
-        pair = GsnParameterPair(
-            item.spin_numerator,
-            item.spin_denominator,
-            item.azimuthal_index,
-            item.origins,
-        )
-        key = (pair.spin_numerator, pair.spin_denominator, pair.azimuthal_index)
-        origin_sets.setdefault(key, set()).update(pair.origins)
-    pairs = tuple(
-        GsnParameterPair(*key, tuple(sorted(origins)))
-        for key, origins in sorted(
-            origin_sets.items(),
-            key=lambda item: (Fraction(item[0][0], item[0][1]), item[0][2]),
-        )
-    )
-    if not pairs:
-        raise GsnCacheProductionError("at least one GSN parameter pair is required")
+    pairs = _normalise_parameter_pairs(parameter_pairs)
 
     package_data = Path(__file__).resolve().parent / "data" / "julia"
     script = Path(producer_script or package_data / "generate_gsn_cache.jl")
@@ -964,9 +990,106 @@ def ensure_generated_gsn_cache(
             resolved.append((str(accepted_row["artifact_id"]), pair, document))
 
     assembled_path, assembled_sha256 = _assemble_selection_cache(directory, resolved)
+    receipt_content: dict[str, object] = {
+        "schema": GSN_BOOTSTRAP_RECEIPT_SCHEMA,
+        "request_sha256": _bootstrap_request_sha256(pairs),
+        "parameter_pairs": [pair.to_mapping() for pair in pairs],
+        "record_artifact_ids": [item[0] for item in resolved],
+        "resource_path": assembled_path.name,
+        "resource_sha256": assembled_sha256,
+    }
+    _write_json(
+        _bootstrap_receipt_path(directory, pairs),
+        {
+            **receipt_content,
+            "receipt_sha256": hashlib.sha256(
+                _canonical_json(receipt_content).encode("ascii")
+            ).hexdigest(),
+        },
+    )
     return GeneratedGsnCache(
         tuple(item[0] for item in resolved),
         assembled_path,
         assembled_sha256,
+        pairs,
+    )
+
+
+def load_generated_gsn_cache(
+    parameter_pairs: Iterable[GsnParameterPair],
+    *,
+    runtime_root: Path | None = None,
+) -> GeneratedGsnCache:
+    """Load an authenticated bootstrap resource without any producer fallback.
+
+    This is the only GSN resource operation permitted from binary64 campaign
+    execution. Missing or invalid bootstrap state fails before construction of
+    a numerical backend. This function has no subprocess or Julia launch path.
+    """
+
+    pairs = _normalise_parameter_pairs(parameter_pairs)
+    runtime = _runtime_root(runtime_root)
+    package_data = Path(__file__).resolve().parent / "data" / "julia"
+    try:
+        _, _, _, _, cache_id = _receipt_julia_invocation(runtime, package_data)
+    except (GsnCacheProductionError, OSError) as error:
+        raise GsnBootstrapRequiredError(
+            "GSN_BOOTSTRAP_REQUIRED: M02 runtime/resource receipt is unavailable; "
+            "run bootstrap resource preparation before campaign execution"
+        ) from error
+    directory = runtime / "generated" / "gsn"
+    if cache_id is not None:
+        directory /= cache_id
+    receipt_path = _bootstrap_receipt_path(directory, pairs)
+    if not receipt_path.is_file() or receipt_path.is_symlink():
+        raise GsnBootstrapRequiredError(
+            "GSN_BOOTSTRAP_REQUIRED: exact prebuilt GSN resource receipt is absent"
+        )
+    try:
+        receipt = _load_json(receipt_path, "GSN bootstrap resource receipt")
+        expected_fields = {
+            "schema",
+            "request_sha256",
+            "parameter_pairs",
+            "record_artifact_ids",
+            "resource_path",
+            "resource_sha256",
+            "receipt_sha256",
+        }
+        if not isinstance(receipt, Mapping) or set(receipt) != expected_fields:
+            raise GsnCacheProductionError("GSN bootstrap receipt fields are invalid")
+        content = {
+            key: value for key, value in receipt.items() if key != "receipt_sha256"
+        }
+        if (
+            receipt["schema"] != GSN_BOOTSTRAP_RECEIPT_SCHEMA
+            or receipt["request_sha256"] != _bootstrap_request_sha256(pairs)
+            or receipt["parameter_pairs"] != [pair.to_mapping() for pair in pairs]
+            or receipt["receipt_sha256"]
+            != hashlib.sha256(_canonical_json(content).encode("ascii")).hexdigest()
+            or not isinstance(receipt["resource_path"], str)
+            or Path(receipt["resource_path"]).name != receipt["resource_path"]
+            or not isinstance(receipt["resource_sha256"], str)
+            or _DIGEST.fullmatch(receipt["resource_sha256"]) is None
+            or not isinstance(receipt["record_artifact_ids"], list)
+            or any(
+                not isinstance(item, str) or _ARTIFACT_ID.fullmatch(item) is None
+                for item in receipt["record_artifact_ids"]
+            )
+        ):
+            raise GsnCacheProductionError("GSN bootstrap receipt is invalid")
+        resource_path = directory / receipt["resource_path"]
+        _validate_regular_file(resource_path, "prebuilt GSN resource")
+        resource_sha256 = hashlib.sha256(resource_path.read_bytes()).hexdigest()
+        if resource_sha256 != receipt["resource_sha256"]:
+            raise GsnCacheProductionError("prebuilt GSN resource digest is invalid")
+    except (GsnCacheProductionError, OSError, TypeError, ValueError) as error:
+        raise GsnBootstrapRequiredError(
+            "GSN_BOOTSTRAP_REQUIRED: prebuilt GSN resource is stale or corrupt"
+        ) from error
+    return GeneratedGsnCache(
+        tuple(receipt["record_artifact_ids"]),
+        resource_path.resolve(),
+        resource_sha256,
         pairs,
     )

@@ -574,7 +574,7 @@ def _selected_response(
 ) -> tuple[int, object]:
     plan, backend = _load_response_selection(selection)
     if command == "response-plan":
-        return 0, {
+        return (0 if result.pass_exhausted else 3), {
             "command": command,
             "plan_id": plan.plan_id,
             "job_count": len(plan.jobs),
@@ -1172,6 +1172,9 @@ def _campaign_schema11_pass(
             "queued_count": result.queued_count,
             "cache_reused_count": result.cache_reused_count,
             "skipped_count": result.skipped_count,
+            "pass_exhausted": result.pass_exhausted,
+            "pass_status": "EXHAUSTED" if result.pass_exhausted else "PARTIAL",
+            "incomplete_leaf_ids": list(result.incomplete_leaf_ids),
             "terminal_cache_discovery": (
                 result.terminal_cache_discovery.to_mapping()
             ),
@@ -1207,7 +1210,7 @@ def _campaign_schema11_pass(
         finally:
             reporter.close()
         validated = validate_schema11_checkpoint(result.checkpoint)
-        return 0, {
+        return (0 if result.pass_exhausted else 3), {
             "command": command,
             "campaign_id": validated["campaign_id"],
             "selection_id": validated["selection_id"],
@@ -1219,6 +1222,9 @@ def _campaign_schema11_pass(
             "rejected_count": result.rejected_count,
             "cache_reused_count": result.cache_reused_count,
             "skipped_count": result.skipped_count,
+            "pass_exhausted": result.pass_exhausted,
+            "pass_status": "EXHAUSTED" if result.pass_exhausted else "PARTIAL",
+            "incomplete_leaf_ids": list(result.incomplete_leaf_ids),
             "terminal_cache_discovery": (
                 result.terminal_cache_discovery.to_mapping()
             ),

@@ -30,6 +30,7 @@ class ProgressEventKind(StrEnum):
     CAMPAIGN_INTERRUPTED = "campaign_interrupted"
     CAMPAIGN_PASS_STARTED = "campaign_pass_started"
     CAMPAIGN_PASS_COMPLETED = "campaign_pass_completed"
+    CAMPAIGN_PASS_INTERRUPTED = "campaign_pass_interrupted"
     LEAF_STARTED = "leaf_started"
     LEAF_REUSED = "leaf_reused"
     LEAF_CACHE_STALE = "leaf_cache_stale"

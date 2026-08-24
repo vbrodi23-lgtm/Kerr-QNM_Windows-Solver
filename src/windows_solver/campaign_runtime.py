@@ -43,6 +43,10 @@ from .campaign_survey import (
     run_promoted_survey,
 )
 from .contracts import canonical_json_bytes
+from .gsn_cache_producer import (
+    load_generated_gsn_cache,
+    parameter_pairs_for_selection,
+)
 from .native_response_kernel import VettedNativeDeterminantKernel
 from .response_batches import (
     CampaignLeafRecord,
@@ -52,8 +56,6 @@ from .response_batches import (
     _ode_error_budget_from_mapping,
     _sealed_root_for_result,
     _run_promoted_exterior_component_with_progress,
-    ensure_generated_gsn_cache,
-    parameter_pairs_for_selection,
     scientific_computation_identity_sha256,
     validate_campaign_recovery_record,
 )
@@ -210,7 +212,7 @@ def _binary64_backend(plan: object, selection: object) -> NativeCampaignStageBac
     """Construct the Python binary64 kernel without touching Julia runtime code."""
 
     pairs = parameter_pairs_for_selection(plan, selection)
-    generated = ensure_generated_gsn_cache(pairs)
+    generated = load_generated_gsn_cache(pairs)
     kernel = VettedNativeDeterminantKernel.from_generated_resource(
         generated.path, generated.sha256
     )

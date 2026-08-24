@@ -178,6 +178,8 @@ class Binary64SurveyRun:
     terminal_cache_discovery: EvidenceDiscoveryTotals = field(
         default_factory=EvidenceDiscoveryTotals
     )
+    pass_exhausted: bool = True
+    incomplete_leaf_ids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -230,6 +232,117 @@ class PromotedSurveyRun:
     cache_reused_count: int = 0
     terminal_cache_discovery: EvidenceDiscoveryTotals = field(
         default_factory=EvidenceDiscoveryTotals
+    )
+    pass_exhausted: bool = True
+    incomplete_leaf_ids: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class PassExhaustion:
+    exhausted: bool
+    incomplete_leaf_ids: tuple[str, ...]
+    reasons: tuple[str, ...]
+
+
+def binary64_pass_exhaustion(
+    checkpoint: Mapping[str, object], selection: RecoverySelection
+) -> PassExhaustion:
+    """Prove every selected leaf has one authenticated binary64 disposition."""
+
+    value = validate_schema11_checkpoint(checkpoint)
+    selected = tuple(selection.ordered_leaf_ids)
+    selected_set = set(selected)
+    ledger = value["survey_pass_ledger"]["binary64"]
+    missing = tuple(leaf_id for leaf_id in selected if leaf_id not in ledger)
+    unexpected = tuple(sorted(set(ledger) - selected_set))
+    queue_by_leaf: dict[str, list[Mapping[str, object]]] = {}
+    for entry in value["promotion_queue"]["entries"]:
+        queue_by_leaf.setdefault(str(entry["leaf_id"]), []).append(entry)
+    reasons: list[str] = []
+    if missing:
+        reasons.append("MISSING_SELECTED_BINARY64_DISPOSITION")
+    if unexpected:
+        reasons.append("OFF_SELECTION_BINARY64_DISPOSITION")
+    for leaf_id in selected:
+        entry = ledger.get(leaf_id)
+        if not isinstance(entry, Mapping):
+            continue
+        disposition = entry["disposition"]
+        expected_kind = {
+            SurveyDisposition.PROMOTION_PENDING_ROOT.value: PromotionQueueKind.ROOT.value,
+            SurveyDisposition.PROMOTION_PENDING_RESPONSE.value: PromotionQueueKind.RESPONSE.value,
+        }.get(disposition)
+        queues = queue_by_leaf.get(leaf_id, [])
+        if expected_kind is None:
+            if queues:
+                reasons.append(f"CONTRADICTORY_PROMOTION_QUEUE:{leaf_id}")
+        elif len(queues) != 1 or queues[0]["queue_kind"] != expected_kind:
+            reasons.append(f"MISSING_OR_DUPLICATE_PROMOTION_QUEUE:{leaf_id}")
+    incomplete = tuple(dict.fromkeys((*missing, *unexpected)))
+    return PassExhaustion(not reasons, incomplete, tuple(reasons))
+
+
+def promoted_pass_exhaustion(
+    checkpoint: Mapping[str, object],
+    selection: RecoverySelection,
+    applicable_queue_ordinals: tuple[int, ...] | None = None,
+) -> PassExhaustion:
+    """Prove each applicable promotion is terminal or cache-superseded."""
+
+    value = validate_schema11_checkpoint(checkpoint)
+    selected = set(selection.ordered_leaf_ids)
+    queue = value["promotion_queue"]["entries"]
+    ordinals = (
+        tuple(range(len(queue)))
+        if applicable_queue_ordinals is None
+        else applicable_queue_ordinals
+    )
+    ledger = value["survey_pass_ledger"]["promoted"]
+    reasons: list[str] = []
+    incomplete: list[str] = []
+    expected_disposition = {
+        PromotionQueueDisposition.COMPLETED.value: SurveyDisposition.COMPLETED.value,
+        PromotionQueueDisposition.UNRESOLVED.value: SurveyDisposition.UNRESOLVED.value,
+        PromotionQueueDisposition.DEFERRED.value: SurveyDisposition.DEFERRED.value,
+        PromotionQueueDisposition.REJECTED.value: SurveyDisposition.REJECTED.value,
+        PromotionQueueDisposition.SUPERSEDED_BY_CACHE.value: (
+            SurveyDisposition.SUPERSEDED_BY_CACHE.value
+        ),
+    }
+    for ordinal in ordinals:
+        if ordinal < 0 or ordinal >= len(queue):
+            reasons.append(f"MISSING_PROMOTION_ORDINAL:{ordinal}")
+            continue
+        item = queue[ordinal]
+        leaf_id = str(item["leaf_id"])
+        if leaf_id not in selected:
+            reasons.append(f"OFF_SELECTION_PROMOTION:{leaf_id}")
+            incomplete.append(leaf_id)
+            continue
+        disposition = str(item["disposition"])
+        if disposition == PromotionQueueDisposition.PENDING.value:
+            reasons.append(f"PENDING_PROMOTION:{leaf_id}")
+            incomplete.append(leaf_id)
+            continue
+        pass_entry = ledger.get(leaf_id)
+        if (
+            not isinstance(pass_entry, Mapping)
+            or pass_entry["disposition"] != expected_disposition.get(disposition)
+        ):
+            reasons.append(f"QUEUE_LEDGER_MISMATCH:{leaf_id}")
+            incomplete.append(leaf_id)
+    for item in queue:
+        if (
+            item["leaf_id"] in selected
+            and item["disposition"] == PromotionQueueDisposition.PENDING.value
+        ):
+            leaf_id = str(item["leaf_id"])
+            marker = f"PENDING_PROMOTION:{leaf_id}"
+            if marker not in reasons:
+                reasons.append(marker)
+                incomplete.append(leaf_id)
+    return PassExhaustion(
+        not reasons, tuple(dict.fromkeys(incomplete)), tuple(reasons)
     )
 
 
@@ -856,13 +969,20 @@ def run_binary64_survey(
             emit_progress(ProgressEventKind.LEAF_PASS_DISPOSITION_RECORDED)
         binary64_ledger = result["survey_pass_ledger"]["binary64"]
 
+    exhaustion = binary64_pass_exhaustion(result, selection)
     with progress_scope(execution_profile="SURVEY", survey_pass="binary64"):
         emit_progress(
-            ProgressEventKind.CAMPAIGN_PASS_COMPLETED,
+            (
+                ProgressEventKind.CAMPAIGN_PASS_COMPLETED
+                if exhaustion.exhausted
+                else ProgressEventKind.CAMPAIGN_PASS_INTERRUPTED
+            ),
             completed_count=completed,
             queued_count=queued,
             cache_reused_count=reused,
             skipped_count=skipped,
+            incomplete_leaf_ids=list(exhaustion.incomplete_leaf_ids),
+            incomplete_reasons=list(exhaustion.reasons),
         )
     if cache_inventory is not None:
         terminal_cache_discovery = terminal_cache_discovery.add(
@@ -875,6 +995,8 @@ def run_binary64_survey(
         cache_reused_count=reused,
         skipped_count=skipped,
         terminal_cache_discovery=terminal_cache_discovery,
+        pass_exhausted=exhaustion.exhausted,
+        incomplete_leaf_ids=exhaustion.incomplete_leaf_ids,
     )
 
 
@@ -1394,6 +1516,11 @@ def run_promoted_survey(
     with progress_scope(execution_profile="SURVEY", survey_pass="promoted"):
         emit_progress(ProgressEventKind.CAMPAIGN_PASS_STARTED)
     entries = tuple(result["promotion_queue"]["entries"])
+    applicable_queue_ordinals = tuple(
+        int(item["queue_ordinal"])
+        for item in entries
+        if item["disposition"] == PromotionQueueDisposition.PENDING.value
+    )
     for snapshot in entries:
         ordinal = int(snapshot["queue_ordinal"])
         if snapshot["disposition"] != PromotionQueueDisposition.PENDING.value:
@@ -1622,14 +1749,23 @@ def run_promoted_survey(
             total_leaf_seconds=sum(timing_by_tier.values()),
         ):
             emit_progress(ProgressEventKind.LEAF_PASS_DISPOSITION_RECORDED)
+    exhaustion = promoted_pass_exhaustion(
+        result, selection, applicable_queue_ordinals
+    )
     with progress_scope(execution_profile="SURVEY", survey_pass="promoted"):
         emit_progress(
-            ProgressEventKind.CAMPAIGN_PASS_COMPLETED,
+            (
+                ProgressEventKind.CAMPAIGN_PASS_COMPLETED
+                if exhaustion.exhausted
+                else ProgressEventKind.CAMPAIGN_PASS_INTERRUPTED
+            ),
             completed_count=completed,
             unresolved_count=unresolved,
             deferred_count=deferred,
             rejected_count=rejected,
             skipped_count=skipped,
+            incomplete_leaf_ids=list(exhaustion.incomplete_leaf_ids),
+            incomplete_reasons=list(exhaustion.reasons),
         )
     if cache_inventory is not None:
         terminal_cache_discovery = terminal_cache_discovery.add(
@@ -1644,6 +1780,8 @@ def run_promoted_survey(
         skipped_count=skipped,
         cache_reused_count=cache_reused,
         terminal_cache_discovery=terminal_cache_discovery,
+        pass_exhausted=exhaustion.exhausted,
+        incomplete_leaf_ids=exhaustion.incomplete_leaf_ids,
     )
 
 
