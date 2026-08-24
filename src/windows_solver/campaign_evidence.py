@@ -18,6 +18,7 @@ from .campaign_policy import (
     validate_schema11_checkpoint,
 )
 from .contracts import canonical_json_bytes
+from .validation_admission import validation_admission_status
 
 
 EVIDENCE_PASS_REQUEST_SCHEMA = "windows-solver.evidence-pass-request/1"
@@ -386,11 +387,21 @@ def run_evidence_pass(
             ):
                 raise ValueError("evidence outcome attempted to replace the centre")
             current_level = EvidenceLevel(evidence["evidence_level"])
-            next_level = (
-                policy.successful_output_level
-                if outcome.centre_agrees
-                else current_level
-            )
+            validation_status = "NOT_APPLICABLE"
+            if policy.profile is ExecutionProfile.VALIDATE:
+                validation_status = validation_admission_status(outcome.receipt)
+                next_level = (
+                    EvidenceLevel.VALIDATED
+                    if outcome.centre_agrees
+                    and validation_status == "ADMITTED"
+                    else current_level
+                )
+            else:
+                next_level = (
+                    EvidenceLevel.CERTIFIED
+                    if outcome.centre_agrees
+                    else current_level
+                )
             discrepancy_codes = (
                 () if outcome.centre_agrees else (outcome.discrepancy_code,)
             )
@@ -406,6 +417,7 @@ def run_evidence_pass(
                 "centre_agrees": outcome.centre_agrees,
                 "discrepancy_code": outcome.discrepancy_code,
                 "precision_tiers": list(policy.precision_tiers),
+                "validation_admission_status": validation_status,
                 "source_receipt": copy.deepcopy(dict(outcome.receipt)),
             }
             disposition_receipt = {

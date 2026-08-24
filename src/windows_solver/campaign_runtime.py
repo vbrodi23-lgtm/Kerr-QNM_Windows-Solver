@@ -15,6 +15,11 @@ from .campaign_evidence import (
     EvidenceStrengtheningPolicy,
     run_evidence_pass,
 )
+from .campaign_failures import (
+    FailureDisposition,
+    FailureReport,
+    classify_failure,
+)
 from .campaign_policy import (
     ExecutionProfile,
     PromotionQueueKind,
@@ -56,6 +61,7 @@ from .response_engine import (
     Binary64FixedRootBatch,
     Binary64FixedRootScreening,
     Binary64SurveyDisposition,
+    ComponentStatus,
     ComponentResult,
     NativeDeterminantAdapter,
     PromotedRootSeal,
@@ -64,8 +70,11 @@ from .response_engine import (
 )
 from .julia_response_backend import (
     JuliaPrecisionRootBackend,
+    JuliaNumericalControlError,
+    JuliaODEResourceLimitError,
     JuliaResponseBackendError,
     JuliaResponseEvaluation,
+    JuliaRootReadoutResourceLimitError,
     _validated_execution_resource_policy,
 )
 from .promoted_control_calibration import load_default_calibration_receipt
@@ -73,6 +82,7 @@ from .root_readout_cache import RootReadoutStore
 from .reviewed_determinant_error import ReviewedDeterminantErrorStore
 from .background_evidence_store import CanonicalBackgroundEvidenceStore
 from .solved_leaf_cache import SolvedLeafLookupStatus, SolvedLeafStore
+from .validation_admission import SAME_BACKEND_REFINEMENT_ROUTE
 
 
 _SCHEMA11_NUMERICAL_RECORD = "windows-solver.schema11-numerical-record/1"
@@ -716,12 +726,71 @@ def _horizon_outcome(
             operation_identity="binary64-horizon-production/v1",
             reason_code="BOUNDED_HORIZON_RESPONSE",
         )
+    assert result is not None
+    code = _typed_horizon_failure_code(result)
+    decision = classify_failure(FailureReport(
+        failure_code=code,
+        failure_class="HORIZON_COMPONENT",
+        stage="binary64-horizon",
+        worker_operation="binary64-horizon-production/v1",
+        request_schema="windows-solver.response-component-job/1",
+        backend_identity=leaf.job.backend_identity.identity_sha256,
+        policy_identity=leaf.job.policy.identity_sha256,
+        precision_tier="binary64",
+        cause_type="ComponentStatus",
+        diagnostics={
+            "schema": "windows-solver.horizon-component-failure/1",
+            "complete": True,
+            "component_status": result.status.value,
+            "failure_code": code,
+        },
+    ))
+    if decision.disposition is FailureDisposition.SYSTEM_FAILURE:
+        raise ValueError(f"unclassified binary64 horizon failure: {code}")
+    if decision.disposition is FailureDisposition.PROMOTION_PENDING:
+        return Binary64PassOutcome(
+            disposition=SurveyDisposition.PROMOTION_PENDING_RESPONSE,
+            operation_identity="binary64-horizon-production/v1",
+            reason_code=code,
+            queue_kind=PromotionQueueKind.RESPONSE,
+        )
+    dispositions = {
+        FailureDisposition.UNRESOLVED: SurveyDisposition.UNRESOLVED,
+        FailureDisposition.DEFERRED: SurveyDisposition.DEFERRED,
+        FailureDisposition.REJECTED: SurveyDisposition.REJECTED,
+    }
     return Binary64PassOutcome(
-        disposition=SurveyDisposition.PROMOTION_PENDING_RESPONSE,
+        disposition=dispositions[decision.disposition],
         operation_identity="binary64-horizon-production/v1",
-        reason_code="DETERMINANT_UNCERTAINTY_TOO_LARGE",
-        queue_kind=PromotionQueueKind.RESPONSE,
+        reason_code=code,
     )
+
+
+def _typed_horizon_failure_code(result: ComponentResult) -> str:
+    for evidence in (
+        result.analytic_horizon_evidence,
+        result.derivative_evidence,
+        result.resolved_window,
+    ):
+        if isinstance(evidence, Mapping):
+            code = evidence.get("failure_code")
+            if isinstance(code, str) and code:
+                return code
+    reviewed = {
+        ComponentStatus.NOISE_FLOOR: "FINITE_DIFFERENCE_NOISE_LIMIT",
+        ComponentStatus.AXIS_MISMATCH: "HORIZON_AXIS_MISMATCH",
+        ComponentStatus.BRANCH_LOSS: "HORIZON_BRANCH_LOSS",
+        ComponentStatus.NOT_CONVERGED: "HORIZON_LADDER_EXHAUSTED",
+        ComponentStatus.DERIVATIVE_UNRESOLVED: (
+            "HORIZON_DERIVATIVE_UNRESOLVED"
+        ),
+    }
+    code = reviewed.get(result.status)
+    if code is None:
+        raise ValueError(
+            f"unknown horizon failure status: {result.status.value}"
+        )
+    return code
 
 
 def run_native_binary64_pass(
@@ -830,15 +899,85 @@ def _promoted_horizon_outcome(
     leaf: object,
 ) -> PromotedPassOutcome:
     precision = backend._julia_precision_backend_for(leaf.job, 80)
-    result = run_promoted_horizon_component(
-        leaf.job,
-        precision,
-        leaf.job.root.omega,
-    )
-    if result.response is None or result.status.value != "CONVERGED":
+    try:
+        result = run_promoted_horizon_component(
+            leaf.job,
+            precision,
+            leaf.job.root.omega,
+        )
+    except KeyboardInterrupt:
+        raise
+    except (
+        JuliaNumericalControlError,
+        JuliaODEResourceLimitError,
+        JuliaRootReadoutResourceLimitError,
+    ) as error:
+        if isinstance(error, JuliaNumericalControlError):
+            code = error.failure_code
+        elif isinstance(error, JuliaODEResourceLimitError):
+            code = "ODE_RESOURCE_LIMIT"
+        else:
+            code = "ROOT_READOUT_RESOURCE_INFEASIBLE"
+        decision = classify_failure(FailureReport(
+            failure_code=code,
+            failure_class="PROMOTED_HORIZON_EXECUTION",
+            stage="promoted-horizon",
+            worker_operation="promoted-horizon-component/v1",
+            request_schema="windows-solver.response-component-job/1",
+            backend_identity=leaf.job.backend_identity.identity_sha256,
+            policy_identity=leaf.job.policy.identity_sha256,
+            precision_tier="BF80",
+            cause_type=type(error).__name__,
+            diagnostics={
+                "schema": "windows-solver.promoted-horizon-failure/1",
+                "complete": True,
+                "failure_code": code,
+            },
+        ))
+        if decision.disposition is FailureDisposition.SYSTEM_FAILURE:
+            raise
+        disposition = {
+            FailureDisposition.PROMOTION_PENDING: SurveyDisposition.UNRESOLVED,
+            FailureDisposition.UNRESOLVED: SurveyDisposition.UNRESOLVED,
+            FailureDisposition.DEFERRED: SurveyDisposition.DEFERRED,
+            FailureDisposition.REJECTED: SurveyDisposition.REJECTED,
+        }[decision.disposition]
         return PromotedPassOutcome(
-            disposition=SurveyDisposition.UNRESOLVED,
-            reason_code=result.status.value,
+            disposition=disposition,
+            reason_code=code,
+            precision_tiers=("BF80",),
+            worker_launch_count=1,
+        )
+    if result.response is None or result.status.value != "CONVERGED":
+        code = _typed_horizon_failure_code(result)
+        decision = classify_failure(FailureReport(
+            failure_code=code,
+            failure_class="HORIZON_COMPONENT",
+            stage="promoted-horizon",
+            worker_operation="promoted-horizon-component/v1",
+            request_schema="windows-solver.response-component-job/1",
+            backend_identity=leaf.job.backend_identity.identity_sha256,
+            policy_identity=leaf.job.policy.identity_sha256,
+            precision_tier="BF80",
+            cause_type="ComponentStatus",
+            diagnostics={
+                "schema": "windows-solver.promoted-horizon-failure/1",
+                "complete": True,
+                "component_status": result.status.value,
+                "failure_code": code,
+            },
+        ))
+        if decision.disposition is FailureDisposition.SYSTEM_FAILURE:
+            raise ValueError(f"unclassified promoted horizon failure: {code}")
+        disposition = {
+            FailureDisposition.PROMOTION_PENDING: SurveyDisposition.UNRESOLVED,
+            FailureDisposition.UNRESOLVED: SurveyDisposition.UNRESOLVED,
+            FailureDisposition.DEFERRED: SurveyDisposition.DEFERRED,
+            FailureDisposition.REJECTED: SurveyDisposition.REJECTED,
+        }[decision.disposition]
+        return PromotedPassOutcome(
+            disposition=disposition,
+            reason_code=code,
             precision_tiers=("BF80",),
             root_read_count=1,
             worker_launch_count=1,
@@ -1071,6 +1210,14 @@ def run_native_evidence_pass(
             "central_stage_sha256": stage_sha,
             "precision_tier": "BF80",
             "refinement": refinement,
+            "calculation_route_identity": SAME_BACKEND_REFINEMENT_ROUTE,
+            "calculation_route_family": (
+                "HORIZON"
+                if leaf.mechanism_id == "horizon-admittance"
+                else "EXTERIOR"
+            ),
+            "route_output_sha256": _sha256(independent.to_mapping()),
+            "human_mathematics_review_receipt": None,
             "centre_agrees": agrees,
             "discrepancy_code": discrepancy,
             "independent_result": independent.to_mapping(),
