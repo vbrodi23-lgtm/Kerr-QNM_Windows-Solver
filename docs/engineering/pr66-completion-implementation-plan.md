@@ -1,5 +1,9 @@
 # PR66 Completion Implementation Plan
 
+> **Status:** This is a non-normative historical planning record. The sole
+> authoritative PR66 source is `PR66_GOVERNING_COMPLETION_CONTRACT.md`.
+> Where this record differs from that contract, do not execute this record.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Repair every mandatory PR66 software boundary, produce complete permitted software/static evidence on one tested code head, and stop before operator-only native and mathematical canaries.
@@ -8,7 +12,7 @@
 
 **Tech Stack:** Python 3.12 standard library, immutable dataclasses/enums, canonical JSON/SHA-256 artifacts, unittest, PowerShell 5.1 launcher text edited and statically tested only.
 
-**Spec:** Draft PR #66 governing completion contract at `https://github.com/vbrodi23-lgtm/Kerr-QNM_Windows-Solver/pull/66`, including authoritative completion decisions 1–7.
+**Spec:** The committed `PR66_GOVERNING_COMPLETION_CONTRACT.md`, including authoritative completion decisions 1–7.
 
 ## Authoritative course correction — 2026-08-24
 
@@ -389,7 +393,7 @@ git commit -m "fix(pr66): separate campaign origins and public paths"
 - Restore: `.tasks/IN_PROGRESS.md` from the last authenticated TASK-079 state
 - Modify: `.tasks/WORK_LOG.md`
 - Delete: `PR65_GOVERNING_PR_COMPLETION_RESTORED_ADDITIVE.md`
-- Delete: `PR66_GOVERNING_COMPLETION_CONTRACT.md`
+- Preserve: `PR66_GOVERNING_COMPLETION_CONTRACT.md` as the sole active PR66 authority
 - Modify: `tests/test_public_surface.py`
 - Test: `tests/test_pr66_operations_governance.py`
 
@@ -407,9 +411,9 @@ Expected before repair: missing `IN_PROGRESS.md`, TASK-079, PR63 milestone, and 
 
 Use Git history as the source; preserve all historical text verbatim. Add PR66 progress only as new entries.
 
-- [ ] **Step 3: Delete only the two named root documents and add the root-surface guard**
+- [ ] **Step 3: Delete only obsolete PR65 root debris and add the root-surface guard**
 
-The files remain recoverable through Git history. The guard rejects future governing/handover/scratch/completion-contract debris.
+The deleted PR65 file remains recoverable through Git history. The guard rejects future governing/handover/scratch debris while explicitly retaining the sole authoritative PR66 contract.
 
 - [ ] **Step 4: Run board/provenance tests GREEN and commit**
 
@@ -417,7 +421,7 @@ Run: `python .tasks/validate_board.py && PYTHONPATH=src python -m unittest tests
 
 ```bash
 git add .tasks tests/test_public_surface.py tests/test_pr66_operations_governance.py
-git rm PR65_GOVERNING_PR_COMPLETION_RESTORED_ADDITIVE.md PR66_GOVERNING_COMPLETION_CONTRACT.md
+git rm PR65_GOVERNING_PR_COMPLETION_RESTORED_ADDITIVE.md
 git commit -m "docs(pr66): restore project provenance"
 ```
 
