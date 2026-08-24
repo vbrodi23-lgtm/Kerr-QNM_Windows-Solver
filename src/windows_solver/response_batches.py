@@ -33,6 +33,7 @@ from .response_engine import (
     BackendIdentity,
     ComponentResult,
     ComponentStatus,
+    ERROR_CHANNELS,
     FixedRootDeterminantSample,
     NativeDeterminantAdapter,
     NativeResourceUnavailableError,
@@ -80,6 +81,7 @@ from .response_engine import (
     run_promoted_horizon_response_from_seal,
     run_selective_readout_promotion,
 )
+from .response_uncertainty import ComplexDisk, ZeroContainingDiskError, horizon_response_disk
 from .partial_component_checkpoint import PartialComponentJournal
 from .promoted_control_calibration import (
     EmpiricalControlProfile,
@@ -3483,6 +3485,141 @@ def _deep_trigger_ids(outcome: StageOutcome) -> tuple[str, ...]:
     if zero:
         triggered.append(gates[3])
     return tuple(triggered)
+
+
+HORIZON_SCREENING_STAGE_SCHEMA = "windows-solver.horizon-screening-stage/1"
+HORIZON_PROMOTION_TRIGGER_RECEIPT_SCHEMA = (
+    "windows-solver.horizon-promotion-trigger/v1"
+)
+HORIZON_PROMOTED_COMPARISON_RECEIPT_SCHEMA = (
+    "windows-solver.promoted-horizon-survey-comparison/v1"
+)
+HORIZON_TRIGGER_POLICY_VERSION = "windows-solver.deep-trigger-policy/v1"
+HORIZON_FIXED_SENTINEL_SET_SCHEMA = "windows-solver.fixed-sentinel-set/v1"
+_SCHEMA11_NUMERICAL_RECORD = "windows-solver.schema11-numerical-record/1"
+
+
+@dataclass(frozen=True, slots=True)
+class HorizonPromotionDecision:
+    """The sole owner of horizon trigger/sentinel promotion semantics."""
+
+    trigger_ids: tuple[str, ...]
+    sentinel: bool
+    promotion_required: bool
+    reason_code: str | None
+
+
+def derive_horizon_promotion_decision(
+    leaf: CampaignLeafPlan,
+    binary64_stage: StageOutcome,
+) -> HorizonPromotionDecision:
+    """Derive horizon promotion only from the real leaf and binary64 stage."""
+
+    if leaf.mechanism_id != "horizon-admittance":
+        raise ValueError(
+            "SYSTEM_FAILURE horizon promotion requires horizon-admittance"
+        )
+    if binary64_stage.digits != 64:
+        raise ValueError(
+            "SYSTEM_FAILURE horizon promotion requires a binary64 stage"
+        )
+    trigger_ids = (
+        _deep_trigger_ids(binary64_stage)
+        if leaf.role == "deep"
+        else ()
+    )
+    sentinel = leaf.leaf_id in set(
+        B_PRIME_RELEASE_DOMAIN.fixed_precision_sentinel_leaf_ids
+    )
+    promotion_required = bool(trigger_ids) or sentinel
+    reason_code = (
+        "DEEP_TRIGGER_AND_FIXED_SENTINEL"
+        if trigger_ids and sentinel
+        else "DEEP_DIAGNOSTIC_PROMOTION"
+        if trigger_ids
+        else "FIXED_PRECISION_SENTINEL_PROMOTION"
+        if sentinel
+        else None
+    )
+    return HorizonPromotionDecision(
+        trigger_ids=trigger_ids,
+        sentinel=sentinel,
+        promotion_required=promotion_required,
+        reason_code=reason_code,
+    )
+
+
+def _horizon_trigger_policy_identity() -> str:
+    return _sha256({
+        "schema": HORIZON_TRIGGER_POLICY_VERSION,
+        "diagnostic_fields": sorted(_DEEP_DIAGNOSTIC_FIELDS),
+        "promotion_gates": list(B_PRIME_RELEASE_DOMAIN.precision_promotion_gates),
+    })
+
+
+def _horizon_fixed_sentinel_set_identity() -> str:
+    return _sha256({
+        "schema": HORIZON_FIXED_SENTINEL_SET_SCHEMA,
+        "leaf_ids": list(B_PRIME_RELEASE_DOMAIN.fixed_precision_sentinel_leaf_ids),
+    })
+
+
+def build_horizon_promotion_trigger_receipt(
+    plan: CampaignPlan,
+    leaf: CampaignLeafPlan,
+    binary64_stage: StageOutcome,
+    stage: Mapping[str, object],
+) -> dict[str, object]:
+    """Authenticate a recomputed horizon promotion decision."""
+
+    decision = derive_horizon_promotion_decision(leaf, binary64_stage)
+    if (
+        set(stage) != {
+            "schema",
+            "operation_identity",
+            "precision_tier",
+            "component_result",
+            "response_disk",
+            "numerical_state",
+            "stage_sha256",
+        }
+        or stage["schema"] != HORIZON_SCREENING_STAGE_SCHEMA
+        or stage["precision_tier"] != "binary64"
+    ):
+        raise ValueError("horizon trigger receipt stage is invalid")
+    stage_content = {
+        key: value for key, value in stage.items() if key != "stage_sha256"
+    }
+    stage_sha256 = stage.get("stage_sha256")
+    if stage_sha256 != _sha256(stage_content):
+        raise ValueError("horizon trigger receipt stage digest is invalid")
+    operation_identity = stage.get("operation_identity")
+    if not isinstance(operation_identity, str) or not operation_identity:
+        raise ValueError("horizon trigger receipt operation identity is invalid")
+    content = {
+        "schema": HORIZON_PROMOTION_TRIGGER_RECEIPT_SCHEMA,
+        "leaf_id": leaf.leaf_id,
+        "scientific_computation_identity": (
+            scientific_computation_identity_sha256(plan, leaf)
+        ),
+        "binary64_stage_sha256": stage_sha256,
+        "binary64_operation_identity": operation_identity,
+        "trigger_ids": list(decision.trigger_ids),
+        "sentinel": decision.sentinel,
+        "promotion_required": decision.promotion_required,
+        "reason_code": decision.reason_code,
+        "fixed_precision_sentinel_set_identity": (
+            _horizon_fixed_sentinel_set_identity()
+        ),
+        "trigger_policy_identity": _horizon_trigger_policy_identity(),
+        "trigger_policy_version": HORIZON_TRIGGER_POLICY_VERSION,
+        "deep_diagnostics": (
+            None
+            if binary64_stage.deep_diagnostics is None
+            else dict(binary64_stage.deep_diagnostics)
+        ),
+    }
+    return {**content, "receipt_sha256": _sha256(content)}
 
 
 def _terminal_state(outcome: StageOutcome, *, enclosed: bool = True) -> str:
@@ -7879,12 +8016,187 @@ def validate_campaign_recovery_record(
     if leaf is None:
         raise ValueError("recovery record is outside the campaign plan")
     if value.get("schema") == "windows-solver.schema11-numerical-record/1":
-        _validate_schema11_survey_record(plan, leaf, value)
+        if leaf.mechanism_id == "horizon-admittance":
+            validate_schema11_horizon_record(plan, leaf, value)
+        else:
+            _validate_schema11_survey_record(plan, leaf, value)
         return
     record = CampaignLeafRecord.from_mapping(value)
     if record.to_mapping() != value:
         raise ValueError("recovery record is not canonical")
     _validate_cacheable_leaf_record(plan, leaf, record)
+
+
+def _horizon_complex_from_mapping(value: object, subject: str) -> complex:
+    if not isinstance(value, Mapping) or set(value) != {"real", "imaginary"}:
+        raise ValueError(f"{subject} is invalid")
+    try:
+        converted = complex(float(value["real"]), float(value["imaginary"]))
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError(f"{subject} is invalid") from error
+    if not math.isfinite(converted.real) or not math.isfinite(converted.imag):
+        raise ValueError(f"{subject} is invalid")
+    return converted
+
+
+def _validate_schema11_horizon_stage(
+    plan: CampaignPlan,
+    leaf: CampaignLeafPlan,
+    stage: Mapping[str, object],
+) -> tuple[ComponentResult, Mapping[str, object] | None]:
+    expected_fields = {
+        "schema",
+        "operation_identity",
+        "precision_tier",
+        "component_result",
+        "response_disk",
+        "numerical_state",
+        "stage_sha256",
+    }
+    if set(stage) != expected_fields:
+        raise ValueError("schema-11 horizon stage fields are invalid")
+    if stage["schema"] != HORIZON_SCREENING_STAGE_SCHEMA:
+        raise ValueError("schema-11 horizon stage schema is invalid")
+    if stage["precision_tier"] not in {"binary64", "BF80"}:
+        raise ValueError("schema-11 horizon precision tier is invalid")
+    if (
+        not isinstance(stage["operation_identity"], str)
+        or not stage["operation_identity"]
+        or not isinstance(stage["numerical_state"], str)
+        or not stage["numerical_state"]
+    ):
+        raise ValueError("schema-11 horizon stage identity is invalid")
+    content = {
+        key: value for key, value in stage.items() if key != "stage_sha256"
+    }
+    if stage["stage_sha256"] != _sha256(content):
+        raise ValueError("schema-11 horizon stage digest is invalid")
+    payload = stage["component_result"]
+    if not isinstance(payload, Mapping):
+        raise ValueError("schema-11 horizon component result is invalid")
+    raw_result = payload.get("result")
+    if not isinstance(raw_result, Mapping):
+        raise ValueError("schema-11 horizon component result body is invalid")
+    try:
+        result = ComponentResult.from_mapping(raw_result)
+    except (TypeError, ValueError) as error:
+        raise ValueError("schema-11 horizon component result is invalid") from error
+    if result.to_mapping() != raw_result:
+        raise ValueError("schema-11 horizon component result is not canonical")
+    if (
+        result.leaf_id != leaf.leaf_id
+        or result.job_id != leaf.job.job_id
+        or result.mechanism_id != leaf.mechanism_id
+        or stage["numerical_state"] != result.status.value
+    ):
+        raise ValueError("schema-11 horizon component identity is invalid")
+    disk = stage["response_disk"]
+    if result.response is None:
+        if disk is not None:
+            raise ValueError("unbounded horizon stage cannot contain a response disk")
+    else:
+        if not isinstance(disk, Mapping) or set(disk) != {
+            "centre", "radius", "exact_zero_radius"
+        }:
+            raise ValueError("schema-11 horizon response disk is invalid")
+        centre = _horizon_complex_from_mapping(
+            disk["centre"], "schema-11 horizon response disk centre"
+        )
+        try:
+            radius = float(disk["radius"])
+        except (TypeError, ValueError, OverflowError) as error:
+            raise ValueError("schema-11 horizon response disk radius is invalid") from error
+        if not math.isfinite(radius) or radius < 0.0:
+            raise ValueError("schema-11 horizon response disk radius is invalid")
+        if not isinstance(disk["exact_zero_radius"], bool):
+            raise ValueError("schema-11 horizon response disk zero flag is invalid")
+        if centre != result.response:
+            raise ValueError("schema-11 horizon response disk centre is not result-bound")
+        if radius == 0.0 and disk["exact_zero_radius"] is not True:
+            raise ValueError("schema-11 horizon zero-radius provenance is invalid")
+        if radius != 0.0 and disk["exact_zero_radius"] is not False:
+            raise ValueError("schema-11 horizon exact-zero provenance is invalid")
+    return result, disk
+
+
+def validate_schema11_horizon_stage(
+    plan: CampaignPlan,
+    leaf: CampaignLeafPlan,
+    value: Mapping[str, object],
+) -> None:
+    """Validate one durable schema-11 horizon stage independently."""
+
+    _validate_schema11_horizon_stage(plan, leaf, value)
+
+
+def validate_schema11_horizon_record(
+    plan: CampaignPlan,
+    leaf: CampaignLeafPlan,
+    value: Mapping[str, object],
+) -> None:
+    """Authenticate a new schema-11 horizon record without legacy fields."""
+
+    expected_fields = {
+        "schema",
+        "leaf_id",
+        "role",
+        "state",
+        "scientific_computation_identity",
+        "retained_centre",
+        "stages",
+        "record_sha256",
+    }
+    if set(value) != expected_fields:
+        raise ValueError("schema-11 horizon record fields are invalid")
+    if leaf.mechanism_id != "horizon-admittance":
+        raise ValueError("schema-11 horizon record leaf mechanism is invalid")
+    if (
+        value["schema"] != _SCHEMA11_NUMERICAL_RECORD
+        or value["leaf_id"] != leaf.leaf_id
+        or value["role"] != leaf.role
+        or value["scientific_computation_identity"]
+        != scientific_computation_identity_sha256(plan, leaf)
+        or value["state"] not in {"PRODUCED", "UNRESOLVED", "REJECTED"}
+    ):
+        raise ValueError("schema-11 horizon record identity is invalid")
+    content = {key: item for key, item in value.items() if key != "record_sha256"}
+    if value["record_sha256"] != _sha256(content):
+        raise ValueError("schema-11 horizon record digest is invalid")
+    retained = value["retained_centre"]
+    retained_centre = (
+        None
+        if retained is None
+        else _horizon_complex_from_mapping(retained, "schema-11 horizon retained centre")
+    )
+    stages = value["stages"]
+    if not isinstance(stages, list) or not stages or len(stages) > 2:
+        raise ValueError("schema-11 horizon stages are invalid")
+    stage_values = tuple(
+        _validate_schema11_horizon_stage(plan, leaf, stage)
+        for stage in stages
+        if isinstance(stage, Mapping)
+    )
+    if len(stage_values) != len(stages):
+        raise ValueError("schema-11 horizon stage is invalid")
+    tiers = tuple(str(stage["precision_tier"]) for stage in stages)
+    if tiers not in {("binary64",), ("BF80",), ("binary64", "BF80")}:
+        raise ValueError("schema-11 horizon precision order is invalid")
+    terminal_result, terminal_disk = stage_values[-1]
+    bounded = terminal_result.response is not None
+    expected_state = "PRODUCED" if bounded else "UNRESOLVED"
+    if value["state"] == "PRODUCED" and not bounded:
+        raise ValueError("schema-11 horizon produced state lacks a response")
+    if value["state"] in {"UNRESOLVED", "REJECTED"} and bounded:
+        raise ValueError("schema-11 horizon nonterminal state has a response")
+    if value["state"] == "PRODUCED" and expected_state != value["state"]:
+        raise ValueError("schema-11 horizon terminal state is invalid")
+    if terminal_disk is None:
+        if retained_centre is not None:
+            raise ValueError("schema-11 horizon retained centre is not null")
+    elif retained_centre != _horizon_complex_from_mapping(
+        terminal_disk["centre"], "schema-11 horizon terminal centre"
+    ):
+        raise ValueError("schema-11 horizon retained centre is not terminal-bound")
 
 
 def _validate_schema11_survey_record(
@@ -11635,6 +11947,173 @@ class NativeCampaignStageBackend:
             local_disk_radius_abs=local_radius,
             signed_error_channels=_component_stage_signed_error_channels(
                 component_result, result
+            ),
+            deep_diagnostics=(
+                _native_deep_diagnostics(leaf, result, local_radius)
+                if leaf.role == "deep"
+                else None
+            ),
+        )
+
+    def execute_horizon_stage(self, leaf: CampaignLeafPlan) -> StageOutcome:
+        """Run the binary64 horizon survey without the finite-amplitude ladder.
+
+        Horizon response is an analytic fixed-root quantity.  This boundary
+        deliberately evaluates only the zero-coupling determinant partials;
+        it never calls ``run_component``/``execute_stage``, never constructs a
+        ``LadderLevel``, and never launches a worker.
+        """
+
+        if leaf.mechanism_id != "horizon-admittance":
+            raise ValueError("binary64 horizon stage requires a horizon leaf")
+        job = leaf.job
+        root = complex(job.root.omega)
+        if not math.isfinite(root.real) or not math.isfinite(root.imag):
+            raise ValueError("binary64 horizon root is not finite")
+        partials = self.adapter.kernel.horizon_partials(
+            job=job,
+            background_root=job.root,
+            policy=job.policy,
+        )
+        derivative = complex(partials.frequency_derivative)
+        if not math.isfinite(derivative.real) or not math.isfinite(derivative.imag):
+            raise ValueError("binary64 horizon derivative is not finite")
+
+        # The fixed root and the binary64 stencil are authenticated inputs to
+        # this stage.  Retain a conservative representable arithmetic radius;
+        # a zero-containing disk becomes a typed promotion rather than an
+        # asserted response.
+        horizon_radius = 1.0 + math.sqrt(max(0.0, 1.0 - job.spin * job.spin))
+        horizon_frequency = root - job.mode.m * (
+            job.spin / (2.0 * horizon_radius)
+        )
+        frequency_radius = math.ulp(max(abs(horizon_frequency), 1.0))
+        derivative_radius = math.ulp(max(abs(derivative), 1.0))
+        frequency_disk = ComplexDisk(
+            horizon_frequency,
+            frequency_radius,
+            exact_zero_radius=frequency_radius == 0.0,
+        )
+        derivative_disk = ComplexDisk(
+            derivative,
+            derivative_radius,
+            exact_zero_radius=derivative_radius == 0.0,
+        )
+        response_disk = None
+        status = ComponentStatus.DERIVATIVE_UNRESOLVED
+        response = None
+        try:
+            if partials.simple_root_valid:
+                response_disk = horizon_response_disk(
+                    horizon_frequency=frequency_disk,
+                    determinant_derivative=derivative_disk,
+                )
+        except ZeroContainingDiskError:
+            response_disk = None
+        if response_disk is not None:
+            status = ComponentStatus.CONVERGED
+            response = response_disk.centre
+
+        baseline = RootReadout(
+            omega=root,
+            determinant_residual_abs=0.0,
+            determinant_derivative_abs=max(abs(derivative), math.ulp(1.0)),
+            converged=True,
+            root_reference_id=job.root.root_reference_id,
+            branch_id=job.root.branch_id,
+            equation_id=job.equation_id,
+            truncation_radius=0.0,
+            resolution_radius=0.0,
+            seed_path_radius=0.0,
+            diagnostic_readouts=None,
+        )
+        result = ComponentResult(
+            job_id=job.job_id,
+            leaf_id=job.leaf_id,
+            mechanism_id=job.mechanism_id,
+            status=status,
+            convergence_basis=(
+                "PRIMARY_HORIZON_ANALYTIC"
+                if response is not None
+                else "UNRESOLVED"
+            ),
+            response=response,
+            signed_root_crosscheck=None,
+            closed_form_response=response,
+            error_channels={
+                **{name: 0.0 for name in ERROR_CHANNELS},
+                "resolution": (
+                    0.0 if response_disk is None else response_disk.radius
+                ),
+            },
+            baseline=baseline,
+            levels=(),
+            lineage={
+                "leaf_id": job.leaf_id,
+                "root_reference_id": job.root.root_reference_id,
+                "root_identity_sha256": job.root.identity_sha256,
+                "policy_sha256": job.policy.identity_sha256,
+                "backend_identity_sha256": job.backend_identity.identity_sha256,
+                "equation_id": job.equation_id,
+                "sampling_coordinate": job.sampling_coordinate.to_mapping(),
+                "source_root_mapping": None,
+            },
+            component_scientific_identity=(
+                "binary64-horizon-analytic-component/v1"
+            ),
+            response_method="binary64-fixed-root-horizon-response/v1",
+            finite_amplitude_ladder_required=False,
+            finite_amplitude_ladder_executed=False,
+            finite_amplitude_readout_count=0,
+            response_uncertainty_status=(
+                "BOUNDED_ANALYTIC_RESPONSE"
+                if response is not None
+                else "UNBOUNDED_ANALYTIC_RESPONSE"
+            ),
+            error_channel_applicability={
+                name: response is not None and name == "resolution"
+                for name in ERROR_CHANNELS
+            },
+            analytic_horizon_evidence={
+                "identity": "binary64-fixed-root-horizon-response/v1",
+                "fixed_root": {
+                    "real": root.real,
+                    "imaginary": root.imag,
+                },
+                "horizon_frequency_disk": frequency_disk.to_mapping(),
+                "determinant_derivative_disk": derivative_disk.to_mapping(),
+                "response_disk": (
+                    None
+                    if response_disk is None
+                    else response_disk.to_mapping()
+                ),
+                "levels": [],
+                "worker_launch_count": 0,
+                "nonzero_amplitude_readout_count": 0,
+            },
+        )
+        component_result = {
+            "evidence_kind": "package-owned-binary64-horizon-analytic-component",
+            "result": result.to_mapping(),
+            "scientific_runtime": self._cache_runtime(),
+            "operation_contract": {
+                "finite_amplitude_ladder": False,
+                "nonzero_amplitudes": False,
+                "diagnostic_root_phases": (),
+                "worker_launch_count": 0,
+            },
+        }
+        local_radius = 0.0 if response_disk is None else response_disk.radius
+        return StageOutcome(
+            digits=64,
+            numerical_state=status.value,
+            component_result=component_result,
+            local_disk_radius_abs=local_radius,
+            signed_error_channels=_component_stage_signed_error_channels(
+                component_result,
+                result,
+                repeat_applicable=False,
+                precision_ladder_applicable=False,
             ),
             deep_diagnostics=(
                 _native_deep_diagnostics(leaf, result, local_radius)
