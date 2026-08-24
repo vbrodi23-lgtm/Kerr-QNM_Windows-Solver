@@ -98,6 +98,18 @@ def _sha256(value: object) -> str:
     return hashlib.sha256(canonical_json_bytes(value)).hexdigest()
 
 
+def _produced_horizon_record(
+    leaf: object,
+    stage: CampaignStageRecord,
+) -> CampaignLeafRecord:
+    return CampaignLeafRecord(
+        leaf_id=leaf.leaf_id,
+        role=leaf.role,
+        state="PRODUCED",
+        stages=(stage,),
+    )
+
+
 def _complex_mapping(value: complex) -> dict[str, float]:
     converted = complex(value)
     return {"real": converted.real, "imaginary": converted.imag}
@@ -714,14 +726,7 @@ def _horizon_outcome(
                 "available_precision_digits": [64],
             },
         )
-        record = CampaignLeafRecord(
-            leaf_id=leaf.leaf_id,
-            role=leaf.role,
-            state="PRODUCED",
-            stages=(stage,),
-            trigger_ids=leaf.trigger_ids,
-            sentinel=leaf.sentinel,
-        )
+        record = _produced_horizon_record(leaf, stage)
         return Binary64PassOutcome.produced(
             record=record.to_mapping(),
             stage_sha256=stage.stage_sha256,
@@ -1013,14 +1018,7 @@ def _promoted_horizon_outcome(
             "available_precision_digits": list(plan.precision_capabilities.digits),
         },
     )
-    record = CampaignLeafRecord(
-        leaf_id=leaf.leaf_id,
-        role=leaf.role,
-        state="PRODUCED",
-        stages=(stage,),
-        trigger_ids=leaf.trigger_ids,
-        sentinel=leaf.sentinel,
-    )
+    record = _produced_horizon_record(leaf, stage)
     return PromotedPassOutcome(
         disposition=SurveyDisposition.COMPLETED,
         reason_code="BOUNDED_PROMOTED_HORIZON_RESPONSE",
