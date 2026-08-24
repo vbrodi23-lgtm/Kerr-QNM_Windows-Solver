@@ -37,7 +37,7 @@ jobs:
           mkdir -p "$ONLINE_DEPOT"
           export JULIA_DEPOT_PATH="$ONLINE_DEPOT"
           export JULIA_PKG_PRECOMPILE_AUTO=0
-          julia --project="$STAGE/project" -e 'using Pkg; Pkg.resolve(); Pkg.instantiate()'
+          julia --project="$STAGE/project" -e 'using Pkg; Pkg.Registry.add("General"); Pkg.resolve(); Pkg.instantiate()'
 
       - name: Audit reduced dependency graph
         shell: bash
