@@ -1,0 +1,88 @@
+name: Temporary full M02 Julia depot snapshot
+
+on:
+  push:
+    branches:
+      - tmp/linux-full-julia-depot-snapshot
+
+permissions:
+  contents: read
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: julia-actions/setup-julia@v2
+        with:
+          version: '1.10.11'
+          arch: x64
+
+      - name: Stage exact current environment
+        shell: bash
+        run: |
+          set -euxo pipefail
+          STAGE="$RUNNER_TEMP/m02-full"
+          FULL_DEPOT="$RUNNER_TEMP/m02-full-depot"
+          python tools/build_slim_m02_julia_probe.py "$STAGE"
+          mkdir -p "$FULL_DEPOT"
+          {
+            echo "STAGE=$STAGE"
+            echo "FULL_DEPOT=$FULL_DEPOT"
+          } >> "$GITHUB_ENV"
+
+      - name: Instantiate all 339 manifest packages
+        shell: bash
+        run: |
+          set -euxo pipefail
+          export JULIA_DEPOT_PATH="$FULL_DEPOT"
+          export JULIA_PKG_PRECOMPILE_AUTO=0
+          julia --project="$STAGE/project" -e 'using Pkg; Pkg.Registry.add("General"); Pkg.instantiate()'
+          python - <<'PY'
+          import json, os, subprocess, tomllib
+          from pathlib import Path
+          stage = Path(os.environ['STAGE'])
+          depot = Path(os.environ['FULL_DEPOT'])
+          deps = tomllib.loads((stage/'project'/'Manifest.toml').read_text())['deps']
+          def size(p):
+              return int(subprocess.check_output(['du','-sb',str(p)]).split()[0]) if p.exists() else 0
+          package_roots=[]
+          if (depot/'packages').exists():
+              for n in (depot/'packages').iterdir():
+                  if n.is_dir(): package_roots.extend(x for x in n.iterdir() if x.is_dir())
+          artifact_roots=[x for x in (depot/'artifacts').iterdir() if x.is_dir()] if (depot/'artifacts').exists() else []
+          data={
+              'manifest_entries':len(deps),
+              'downloaded_package_roots':len(package_roots),
+              'downloaded_artifact_roots':len(artifact_roots),
+              'packages_bytes':size(depot/'packages'),
+              'artifacts_bytes':size(depot/'artifacts'),
+              'registries_bytes':size(depot/'registries'),
+              'full_depot_bytes':size(depot),
+          }
+          out=Path(os.environ['RUNNER_TEMP'])/'full-install.json'
+          out.write_text(json.dumps(data,indent=2,sort_keys=True)+'\n')
+          print(json.dumps(data,indent=2,sort_keys=True))
+          PY
+
+      - name: Pack exact full environment
+        shell: bash
+        run: |
+          set -euxo pipefail
+          tar -C "$RUNNER_TEMP" -cf "$RUNNER_TEMP/m02-full-julia-environment-linux-x86_64.tar" m02-full m02-full-depot full-install.json
+          sha256sum "$RUNNER_TEMP/m02-full-julia-environment-linux-x86_64.tar" > "$RUNNER_TEMP/m02-full-julia-environment-linux-x86_64.tar.sha256"
+          stat -c 'full_snapshot_bytes=%s' "$RUNNER_TEMP/m02-full-julia-environment-linux-x86_64.tar"
+          cat "$RUNNER_TEMP/full-install.json"
+
+      - name: Preserve full environment
+        uses: actions/upload-artifact@v4
+        with:
+          name: m02-full-julia-environment-linux-x86_64
+          path: |
+            ${{ runner.temp }}/m02-full-julia-environment-linux-x86_64.tar
+            ${{ runner.temp }}/m02-full-julia-environment-linux-x86_64.tar.sha256
+            ${{ runner.temp }}/full-install.json
+          compression-level: 0
+          retention-days: 1
