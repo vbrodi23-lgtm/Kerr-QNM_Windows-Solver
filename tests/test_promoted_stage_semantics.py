@@ -36,6 +36,7 @@ from windows_solver.response_engine import (
     ComponentResult,
     ComponentStatus,
     NumericalPolicy,
+    PROMOTED_HORIZON_FAILURE_COMPONENT_IDENTITY,
     PromotedRootSeal,
     VettedNativeDeterminantKernel,
     run_promoted_exterior_response_from_seal,
@@ -632,7 +633,10 @@ class PromotedStageSemanticsRegressionTests(unittest.TestCase):
         result = ComponentResult.from_mapping(
             outcome.component_result["result"]
         )
-        self.assertIsNone(result.component_scientific_identity)
+        self.assertEqual(
+            PROMOTED_HORIZON_FAILURE_COMPONENT_IDENTITY,
+            result.component_scientific_identity,
+        )
         self.assertIsNone(result.response)
         component = {
             **outcome.component_result,
