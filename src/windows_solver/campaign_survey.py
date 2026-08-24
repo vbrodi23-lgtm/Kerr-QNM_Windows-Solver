@@ -31,6 +31,7 @@ from .campaign_failures import (
     FailureDisposition,
     FailureReport,
     PROMOTION_ALLOWLIST,
+    ProductionFailureMonitor,
     abort_unexpected_system_failure,
     classify_failure,
 )
@@ -282,6 +283,29 @@ def binary64_pass_exhaustion(
     return PassExhaustion(not reasons, incomplete, tuple(reasons))
 
 
+def _survey_failure_report(
+    leaf: object,
+    *,
+    survey_pass: str,
+    reason_code: str,
+    operation_identity: str,
+    precision_tier: str,
+    disposition: SurveyDisposition,
+) -> FailureReport:
+    return FailureReport(
+        failure_code=reason_code,
+        failure_class=f"{survey_pass.upper()}_SURVEY_DISPOSITION",
+        stage=survey_pass,
+        worker_operation=operation_identity,
+        request_schema="windows-solver.schema11-survey-pass/1",
+        backend_identity=leaf.job.backend_identity.identity_sha256,
+        policy_identity=leaf.job.policy.identity_sha256,
+        precision_tier=precision_tier,
+        cause_type=f"Reviewed{disposition.value.title().replace('_', '')}",
+        diagnostics={"complete": True, "disposition": disposition.value},
+    )
+
+
 def promoted_pass_exhaustion(
     checkpoint: Mapping[str, object],
     selection: RecoverySelection,
@@ -480,6 +504,7 @@ def run_binary64_survey(
         path.with_name(f"{path.name}.timing.jsonl")
     )
     make_session_id = session_id_factory or (lambda: uuid4().hex)
+    failure_monitor = ProductionFailureMonitor()
 
     def persist(value: Mapping[str, object]) -> dict[str, object]:
         durable = validate_schema11_checkpoint(value)
@@ -508,6 +533,9 @@ def run_binary64_survey(
         if leaf_id in binary64_ledger:
             skipped += 1
             continue
+        failure_monitor.abort_before_leaf(
+            result, leaf_id=leaf_id, persist_checkpoint=lambda value: persist(value)
+        )
         committed_before_leaf = result
         timing_recorder: TimingSessionRecorder | None = None
         with progress_scope(
@@ -968,6 +996,21 @@ def run_binary64_survey(
         ):
             emit_progress(ProgressEventKind.LEAF_PASS_DISPOSITION_RECORDED)
         binary64_ledger = result["survey_pass_ledger"]["binary64"]
+        if outcome.disposition not in {
+            SurveyDisposition.COMPLETED,
+            SurveyDisposition.CACHE_REUSED,
+        }:
+            failure_monitor.observe(
+                leaf_id,
+                _survey_failure_report(
+                    leaf,
+                    survey_pass="binary64",
+                    reason_code=outcome.reason_code,
+                    operation_identity=outcome.operation_identity,
+                    precision_tier="binary64",
+                    disposition=outcome.disposition,
+                ),
+            )
 
     exhaustion = binary64_pass_exhaustion(result, selection)
     with progress_scope(execution_profile="SURVEY", survey_pass="binary64"):
@@ -1487,6 +1530,7 @@ def run_promoted_survey(
         path.with_name(f"{path.name}.timing.jsonl")
     )
     make_session_id = session_id_factory or (lambda: uuid4().hex)
+    failure_monitor = ProductionFailureMonitor()
 
     def persist(value: Mapping[str, object]) -> dict[str, object]:
         durable = validate_schema11_checkpoint(value)
@@ -1537,6 +1581,9 @@ def run_promoted_survey(
         if leaf_id in result["survey_pass_ledger"]["promoted"]:
             raise ValueError("pending promotion already has a pass disposition")
         leaf = leaves[leaf_id]
+        failure_monitor.abort_before_leaf(
+            result, leaf_id=leaf_id, persist_checkpoint=lambda value: persist(value)
+        )
         committed_before_leaf = result
         with progress_scope(
             leaf_id=leaf_id,
@@ -1714,6 +1761,22 @@ def run_promoted_survey(
         elif outcome.disposition is SurveyDisposition.REJECTED:
             rejected += 1
         result = persist(result)
+        if outcome.disposition not in {
+            SurveyDisposition.COMPLETED,
+            SurveyDisposition.CACHE_REUSED,
+            SurveyDisposition.SUPERSEDED_BY_CACHE,
+        }:
+            failure_monitor.observe(
+                leaf_id,
+                _survey_failure_report(
+                    leaf,
+                    survey_pass="promoted",
+                    reason_code=outcome.reason_code,
+                    operation_identity="promoted-survey-production/v1",
+                    precision_tier="+".join(outcome.precision_tiers),
+                    disposition=outcome.disposition,
+                ),
+            )
         timing_by_tier = {
             item["tier"]: item["elapsed_seconds"] for item in outcome.tier_timing
         }

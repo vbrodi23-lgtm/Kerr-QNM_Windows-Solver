@@ -169,6 +169,7 @@ def _system_failure_receipt(
     cause_type: str,
     message: str,
     fingerprint_sha256: str,
+    fingerprint_material: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     content: dict[str, object] = {
         "schema": "windows-solver.system-failure/v1",
@@ -178,6 +179,8 @@ def _system_failure_receipt(
         "message": message,
         "fingerprint_sha256": fingerprint_sha256,
     }
+    if fingerprint_material is not None:
+        content["fingerprint_material"] = copy.deepcopy(dict(fingerprint_material))
     return {**content, "receipt_sha256": _sha256(content)}
 
 
@@ -190,6 +193,7 @@ def _abort_with_receipt(
     message: str,
     fingerprint_sha256: str,
     persist_checkpoint: Callable[[dict[str, object]], None],
+    fingerprint_material: Mapping[str, object] | None = None,
 ) -> None:
     durable = validate_schema11_checkpoint(checkpoint)
     receipt = _system_failure_receipt(
@@ -198,6 +202,7 @@ def _abort_with_receipt(
         cause_type=cause_type,
         message=message,
         fingerprint_sha256=fingerprint_sha256,
+        fingerprint_material=fingerprint_material,
     )
     durable["system_failures"].append(receipt)
     durable["state"] = "PARTIAL"
@@ -213,6 +218,50 @@ def _abort_with_receipt(
             cause_type=cause_type,
         )
     raise CampaignSystemFailure(message, receipt=receipt, checkpoint=durable)
+
+
+class ProductionFailureMonitor:
+    """Abort an active production pass before a third repeated local failure."""
+
+    def __init__(self) -> None:
+        self._leaves_by_fingerprint: dict[str, set[str]] = {}
+        self._material_by_fingerprint: dict[str, dict[str, object]] = {}
+        self._armed_fingerprint: str | None = None
+
+    def observe(self, leaf_id: str, report: FailureReport) -> None:
+        decision = classify_failure(report)
+        if decision.disposition is FailureDisposition.SYSTEM_FAILURE:
+            return
+        seen = self._leaves_by_fingerprint.setdefault(
+            decision.fingerprint_sha256, set()
+        )
+        seen.add(leaf_id)
+        self._material_by_fingerprint[decision.fingerprint_sha256] = (
+            report.fingerprint_material
+        )
+        if len(seen) >= 2:
+            self._armed_fingerprint = decision.fingerprint_sha256
+
+    def abort_before_leaf(
+        self,
+        checkpoint: Mapping[str, object],
+        *,
+        leaf_id: str,
+        persist_checkpoint: Callable[[dict[str, object]], None],
+    ) -> None:
+        fingerprint = self._armed_fingerprint
+        if fingerprint is None:
+            return
+        _abort_with_receipt(
+            checkpoint,
+            leaf_id=leaf_id,
+            failure_code="REPEATED_LEAF_FAILURE_FINGERPRINT",
+            cause_type="RepetitionBreaker",
+            message="failure repetition breaker stopped the pass before the third leaf",
+            fingerprint_sha256=fingerprint,
+            fingerprint_material=self._material_by_fingerprint[fingerprint],
+            persist_checkpoint=persist_checkpoint,
+        )
 
 
 def abort_unexpected_system_failure(
@@ -310,6 +359,7 @@ __all__ = [
     "FailureDisposition",
     "FailureReport",
     "PROMOTION_ALLOWLIST",
+    "ProductionFailureMonitor",
     "abort_unexpected_system_failure",
     "classify_failure",
     "run_guarded_pass",
