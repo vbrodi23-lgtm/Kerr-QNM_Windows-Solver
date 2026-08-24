@@ -368,6 +368,57 @@ class HorizonRecordConstructionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "typed failure"):
             ComponentResult.from_mapping(malformed)
 
+    def test_typed_not_converged_requires_baseline_failure_evidence(self) -> None:
+        plan = _plan()
+        leaf = next(
+            item
+            for item in plan.leaves
+            if item.role == "primary"
+            and item.mechanism_id == "horizon-admittance"
+        )
+        failed_baseline = replace(
+            _promoted_baseline(leaf.job, omega=leaf.job.root.omega),
+            converged=False,
+        )
+        component = run_promoted_horizon_component(
+            leaf.job,
+            FakePromotedBackend(leaf.job, failed_baseline),
+            leaf.job.root.omega,
+        )
+        self.assertEqual("NOT_CONVERGED", component.status.value)
+
+        malformed = component.to_mapping()
+        malformed["baseline"]["converged"] = True
+        with self.assertRaisesRegex(ValueError, "typed failure"):
+            ComponentResult.from_mapping(malformed)
+
+    def test_unsuccessful_promotions_keep_source_records_out_of_cache(self) -> None:
+        source = "a" * 64
+        entries = [
+            {
+                "source_record_sha256": source,
+                "disposition": disposition,
+            }
+            for disposition in (
+                "PENDING",
+                "UNRESOLVED",
+                "DEFERRED",
+                "REJECTED",
+                "SUPERSEDED_BY_CACHE",
+            )
+        ]
+        entries.append({
+            "source_record_sha256": "b" * 64,
+            "disposition": "COMPLETED",
+        })
+
+        self.assertEqual(
+            {source},
+            campaign_runtime._promotion_bound_source_record_sha256({
+                "promotion_queue": {"entries": entries}
+            }),
+        )
+
     def test_trigger_receipt_rejects_stage_outcome_payload_mismatch(self) -> None:
         plan = _plan()
         leaf = next(

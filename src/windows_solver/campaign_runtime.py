@@ -22,6 +22,7 @@ from .campaign_failures import (
 )
 from .campaign_policy import (
     ExecutionProfile,
+    PromotionQueueDisposition,
     PromotionQueueKind,
     SurveyDisposition,
     validate_schema11_checkpoint,
@@ -235,6 +236,20 @@ def _refresh_runtime_reports(
             if triage_ready else None
         ),
     )
+
+
+def _promotion_bound_source_record_sha256(
+    checkpoint: Mapping[str, object],
+) -> set[str]:
+    """Return retained records whose mandatory promotion is not successful."""
+
+    entries = checkpoint["promotion_queue"]["entries"]
+    return {
+        source
+        for entry in entries
+        if entry["disposition"] != PromotionQueueDisposition.COMPLETED.value
+        and isinstance((source := entry["source_record_sha256"]), str)
+    }
 
 
 def build_fixed_root_screening_record(
@@ -1024,11 +1039,9 @@ def run_native_binary64_pass(
     # Reconcile authenticated terminal checkpoint records before the survey's
     # cache discovery.  A cache hit is therefore durable before any numerical
     # leaf is eligible to be skipped.
-    pending_record_sha256 = {
-        entry.get("source_record_sha256")
-        for entry in checkpoint.get("promotion_queue", {}).get("entries", ())
-        if isinstance(entry, Mapping) and entry.get("disposition") == "PENDING"
-    }
+    promotion_bound_record_sha256 = (
+        _promotion_bound_source_record_sha256(checkpoint)
+    )
     checkpoint_records = {
         str(item["leaf_id"]): item
         for item in checkpoint.get("records", ())
@@ -1039,7 +1052,7 @@ def run_native_binary64_pass(
         if (
             record is None
             or record.get("state") != "PRODUCED"
-            or record.get("record_sha256") in pending_record_sha256
+            or record.get("record_sha256") in promotion_bound_record_sha256
         ):
             continue
         leaf = next(item for item in plan.leaves if item.leaf_id == leaf_id)

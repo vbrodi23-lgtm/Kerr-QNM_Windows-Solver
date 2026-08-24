@@ -7606,6 +7606,14 @@ class ComponentResult:
                 or self.response_method != PROMOTED_HORIZON_FAILURE_RESPONSE_METHOD
                 or self.status
                 not in {ComponentStatus.BRANCH_LOSS, ComponentStatus.NOT_CONVERGED}
+                or (
+                    self.status is ComponentStatus.NOT_CONVERGED
+                    and self.baseline.converged
+                    and not (
+                        self.baseline.numerical_conditioning is not None
+                        and self.baseline.numerical_conditioning.precision_limited
+                    )
+                )
                 or self.convergence_basis != "UNRESOLVED"
                 or self.response is not None
                 or self.signed_root_crosscheck is not None
