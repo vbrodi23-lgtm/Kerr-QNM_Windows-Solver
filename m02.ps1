@@ -125,6 +125,19 @@ if (-not (Test-Path -LiteralPath $SelectionPath -PathType Leaf)) {
 New-Item -ItemType Directory -Force -Path (Split-Path -Parent $CheckpointPath) |
     Out-Null
 
+$DiagnosticRoot = "$CheckpointPath.diagnostics"
+$RunSessionId = [Guid]::NewGuid().ToString("N")
+$TranscriptStagingPath = Join-Path $DiagnosticRoot "console-transcript-$RunSessionId.txt"
+$TranscriptStarted = $false
+New-Item -ItemType Directory -Force -Path $DiagnosticRoot | Out-Null
+try {
+    Start-Transcript -Path $TranscriptStagingPath -Force | Out-Null
+    $TranscriptStarted = $true
+}
+catch {
+    Write-Warning "M02 diagnostic transcript was not started: $($_.Exception.Message)"
+}
+
 $CheckpointExists = Test-Path -LiteralPath $CheckpointPath -PathType Leaf
 $IsBinary64SurveyProfile = $Profile -eq "survey" -and $SurveyPass -eq "binary64"
 if ($NewCampaign -and $CheckpointExists) {
@@ -219,7 +232,8 @@ try {
         $Command,
         $SelectionPath,
         "--checkpoint", $CheckpointPath,
-        "--progress", $Progress
+        "--progress", $Progress,
+        "--diagnostic-session-id", $RunSessionId
     ) + $CalibrationArguments
     if ($null -ne $ResolvedQueuePath) {
         $RunArguments += @("--queue", $ResolvedQueuePath)
@@ -239,6 +253,42 @@ try {
     ) | Out-Null
 }
 finally {
+    if ($TranscriptStarted) {
+        try {
+            Stop-Transcript | Out-Null
+        }
+        catch {
+            Write-Warning "M02 diagnostic transcript was not stopped cleanly: $($_.Exception.Message)"
+        }
+    }
+    try {
+        $LatestDiagnosticPath = Join-Path $DiagnosticRoot "latest.json"
+        if (Test-Path -LiteralPath $LatestDiagnosticPath -PathType Leaf) {
+            $LatestDiagnostic = Get-Content -LiteralPath $LatestDiagnosticPath -Raw |
+                ConvertFrom-Json
+            if ($LatestDiagnostic.session_id -eq $RunSessionId) {
+                $DiagnosticSessionDirectory = [string]$LatestDiagnostic.session_directory
+                $SessionTranscriptPath = Join-Path $DiagnosticSessionDirectory "console-transcript.txt"
+                if (
+                    (Test-Path -LiteralPath $TranscriptStagingPath -PathType Leaf) -and
+                    -not (Test-Path -LiteralPath $SessionTranscriptPath -PathType Leaf)
+                ) {
+                    Move-Item -LiteralPath $TranscriptStagingPath `
+                        -Destination $SessionTranscriptPath -ErrorAction Stop
+                }
+                Write-Host ("    Diagnostic session       : {0}" -f $DiagnosticSessionDirectory)
+                if (-not [string]::IsNullOrWhiteSpace([string]$LatestDiagnostic.postmortem_path)) {
+                    Write-Host ("    Postmortem               : {0}" -f $LatestDiagnostic.postmortem_path)
+                }
+                if (-not [string]::IsNullOrWhiteSpace([string]$LatestDiagnostic.bundle_path)) {
+                    Write-Host ("    Diagnostic bundle        : {0}" -f $LatestDiagnostic.bundle_path)
+                }
+            }
+        }
+    }
+    catch {
+        Write-Warning "M02 diagnostic artifact collection failed: $($_.Exception.Message)"
+    }
     Pop-Location
 }
 

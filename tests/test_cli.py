@@ -16,6 +16,7 @@ from windows_solver.builtin import ProblemContractProvider
 from windows_solver.contracts import canonical_json_bytes
 from windows_solver.engine import RunRecord
 from windows_solver.providers import ProviderRegistry
+from windows_solver.structural_diagnostics import read_structural_events
 
 from tests.fixtures import SUPPORTED_SPECTRUM_STUDY, VALID_STUDY
 
@@ -39,6 +40,79 @@ class CliTests(unittest.TestCase):
         path = Path(directory, "study.json")
         path.write_bytes(canonical_json_bytes(value))
         return path
+
+    def test_schema11_pass_exception_writes_diagnostics_and_preserves_exit_code(
+        self,
+    ) -> None:
+        """A production CLI failure must retain its original error outcome.
+
+        The numerical pass is deliberately injected at the CLI adapter boundary:
+        no native worker or numerical campaign is started by this regression.
+        """
+
+        plan = SimpleNamespace(campaign_id="campaign-diagnostics")
+        selection = SimpleNamespace(
+            selection_id="selection-diagnostics", leaf_ids=("leaf-1",)
+        )
+
+        def raise_nested_failure(*_args, **_kwargs):
+            try:
+                raise LookupError("inner diagnostic failure")
+            except LookupError as cause:
+                raise ValueError("outer diagnostic failure") from cause
+
+        with tempfile.TemporaryDirectory() as directory:
+            checkpoint = Path(directory, "m02-campaign-checkpoint.json")
+            with (
+                patch(
+                    "windows_solver.cli._campaign_plan_and_selection",
+                    return_value=(plan, selection, None),
+                ),
+                patch(
+                    "windows_solver.cli._campaign_schema11_pass",
+                    side_effect=raise_nested_failure,
+                ),
+            ):
+                status, output, error = self.invoke([
+                    "campaign-survey-binary64",
+                    "selection.json",
+                    "--checkpoint",
+                    str(checkpoint),
+                    "--progress",
+                    "quiet",
+                    "--diagnostic-session-id",
+                    "cli-failure-session",
+                ])
+
+            root = Path(f"{checkpoint}.diagnostics")
+            sessions = tuple(root.glob("session-*-cli-failure-session"))
+            self.assertEqual(len(sessions), 1)
+            session = sessions[0]
+            events = read_structural_events(session / "structural-events.jsonl")
+            postmortem = json.loads((session / "postmortem.json").read_text())
+            manifest = json.loads(
+                (session / "artifact-manifest.json").read_text()
+            )
+            latest = json.loads((root / "latest.json").read_text())
+
+        self.assertEqual(status, 2)
+        self.assertEqual(output, {})
+        self.assertEqual(json.loads(error)["error"]["code"], "INVALID_INPUT")
+        self.assertEqual(
+            [item["event_kind"] for item in events[:3]],
+            [
+                "DIAGNOSTIC_SESSION_OPENED",
+                "CAMPAIGN_COMMAND_STARTED",
+                "CAMPAIGN_COMMAND_ABORTED",
+            ],
+        )
+        self.assertEqual(postmortem["terminal_classification"], "SYSTEM_FAILURE")
+        self.assertEqual(
+            [item["exception_type"] for item in postmortem["primary_failure"]["chain"]],
+            ["ValueError", "LookupError"],
+        )
+        self.assertIn("structural_events", manifest["artifacts"])
+        self.assertEqual(latest["terminal_state"], "SYSTEM_FAILURE")
 
     def test_plan_prints_deterministic_dependency_closure(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
