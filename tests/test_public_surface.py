@@ -1137,6 +1137,7 @@ $candidate | ConvertTo-Json -Compress | Set-Content -LiteralPath $env:M02_TEST_J
             "windows-solver.m02-report-status/v1",
             "windows-solver.m02-schema11-report-status/v1",
             "binary64-horizon-production/v1",
+            "promoted-horizon-component/v1",
             "promoted-survey-production/v1",
             "production-certification-comparator/v1",
             "independent-validation-comparator/v1",
