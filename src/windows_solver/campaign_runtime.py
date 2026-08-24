@@ -1240,6 +1240,7 @@ def _promoted_horizon_outcome(
             operation_identity=operation_identity,
             source_record_sha256=source_record_sha256,
             source_stage_sha256=source_stage_sha256,
+            root_read_limit=1,
             worker_launch_count=1,
         )
     component_result = {
@@ -1317,6 +1318,7 @@ def _promoted_horizon_outcome(
             source_record_sha256=source_record_sha256,
             source_stage_sha256=source_stage_sha256,
             root_read_count=1,
+            root_read_limit=1,
             worker_launch_count=1,
         )
 
@@ -1393,6 +1395,7 @@ def _promoted_horizon_outcome(
             source_stage_sha256=source_stage_sha256,
             evidence_receipts=(comparison_receipt,),
             root_read_count=1,
+            root_read_limit=1,
             worker_launch_count=1,
         )
 
@@ -1424,6 +1427,7 @@ def _promoted_horizon_outcome(
         record=record,
         stage_sha256=stage_sha256,
         root_read_count=1,
+        root_read_limit=1,
         worker_launch_count=1,
     )
 

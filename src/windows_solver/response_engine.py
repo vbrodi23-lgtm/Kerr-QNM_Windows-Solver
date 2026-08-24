@@ -172,6 +172,12 @@ PROMOTED_HORIZON_COMPONENT_V3_IDENTITY = (
 PROMOTED_HORIZON_RESPONSE_METHOD_V3 = (
     "bounded-analytic-horizon-from-sealed-frequency-derivative/v3"
 )
+PROMOTED_HORIZON_FAILURE_COMPONENT_IDENTITY = (
+    "promoted-horizon-typed-failure-component/v1"
+)
+PROMOTED_HORIZON_FAILURE_RESPONSE_METHOD = (
+    "promoted-horizon-typed-failure/v1"
+)
 PROMOTED_HORIZON_UNCERTAINTY_DERIVATION_IDENTITY = (
     "primary-root-controls-and-derivative-disk/v1"
 )
@@ -9681,6 +9687,37 @@ def _validate_promoted_horizon_baseline(
     return derivative_authentication
 
 
+def _promoted_horizon_typed_failure_result(
+    job: ResponseComponentJob,
+    status: ComponentStatus,
+    baseline: RootReadout,
+) -> ComponentResult:
+    """Give package-owned promoted root failures a durable typed identity."""
+
+    if status not in {ComponentStatus.BRANCH_LOSS, ComponentStatus.NOT_CONVERGED}:
+        raise ValueError("promoted horizon typed failure status is invalid")
+    generic = _unresolved_result(job, status, baseline, ())
+    identity = PROMOTED_HORIZON_FAILURE_COMPONENT_IDENTITY
+    return replace(
+        generic,
+        lineage={
+            **_result_lineage(job),
+            "component_scientific_identity": identity,
+        },
+        component_scientific_identity=identity,
+        response_method=PROMOTED_HORIZON_FAILURE_RESPONSE_METHOD,
+        finite_amplitude_ladder_required=False,
+        finite_amplitude_ladder_executed=False,
+        finite_amplitude_readout_count=0,
+        response_uncertainty_status=UNBOUNDED_ANALYTIC_RESPONSE,
+        error_channel_applicability={name: False for name in ERROR_CHANNELS},
+        analytic_horizon_evidence={
+            "identity": identity,
+            "failure_status": status.value,
+        },
+    )
+
+
 def run_promoted_horizon_component(
     job: ResponseComponentJob,
     backend: RootReadoutBackend,
@@ -9744,7 +9781,9 @@ def run_promoted_horizon_component(
         return _validated_result(
             backend,
             job,
-            _unresolved_result(job, initial_status, baseline, ()),
+            _promoted_horizon_typed_failure_result(
+                job, initial_status, baseline
+            ),
         )
     derivative_authentication = _validate_promoted_horizon_baseline(job, baseline)
 
@@ -9755,7 +9794,9 @@ def run_promoted_horizon_component(
         return _validated_result(
             backend,
             job,
-            _unresolved_result(job, ComponentStatus.NOT_CONVERGED, baseline, ()),
+            _promoted_horizon_typed_failure_result(
+                job, ComponentStatus.NOT_CONVERGED, baseline
+            ),
         )
     root_seal = PromotedRootSeal.derive(job, baseline)
     if _requires_fixed_root_frequency_stencil(baseline):

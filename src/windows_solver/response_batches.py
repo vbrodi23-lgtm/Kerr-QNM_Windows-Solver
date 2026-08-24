@@ -54,6 +54,8 @@ from .response_engine import (
     PROMOTED_HORIZON_COMPONENT_IDENTITY,
     PROMOTED_HORIZON_COMPONENT_V2_IDENTITY,
     PROMOTED_HORIZON_COMPONENT_V3_IDENTITY,
+    PROMOTED_HORIZON_FAILURE_COMPONENT_IDENTITY,
+    PROMOTED_HORIZON_FAILURE_RESPONSE_METHOD,
     PROMOTED_HORIZON_RESPONSE_METHOD,
     PROMOTED_HORIZON_RESPONSE_METHOD_V2,
     PROMOTED_HORIZON_RESPONSE_METHOD_V3,
@@ -3704,6 +3706,7 @@ def _single_promoted_horizon_result(
         PROMOTED_HORIZON_COMPONENT_IDENTITY,
         PROMOTED_HORIZON_COMPONENT_V2_IDENTITY,
         PROMOTED_HORIZON_COMPONENT_V3_IDENTITY,
+        PROMOTED_HORIZON_FAILURE_COMPONENT_IDENTITY,
     }:
         return None
     if result.to_mapping() != raw_result:
@@ -3832,6 +3835,7 @@ def _classify_promoted_stage(
         PROMOTED_HORIZON_COMPONENT_IDENTITY,
         PROMOTED_HORIZON_COMPONENT_V2_IDENTITY,
         PROMOTED_HORIZON_COMPONENT_V3_IDENTITY,
+        PROMOTED_HORIZON_FAILURE_COMPONENT_IDENTITY,
     }
     typed_analytic_failure = (
         evidence_kind == _ANALYTIC_HORIZON_EVIDENCE_KIND
@@ -5991,6 +5995,7 @@ def _validate_component_result(
             PROMOTED_HORIZON_COMPONENT_IDENTITY,
             PROMOTED_HORIZON_COMPONENT_V2_IDENTITY,
             PROMOTED_HORIZON_COMPONENT_V3_IDENTITY,
+            PROMOTED_HORIZON_FAILURE_COMPONENT_IDENTITY,
             EXTERIOR_DERIVATIVE_COMPONENT_IDENTITY,
         }
     ):
@@ -6006,7 +6011,12 @@ def _validate_component_result(
         PROMOTED_HORIZON_COMPONENT_V2_IDENTITY,
         PROMOTED_HORIZON_COMPONENT_V3_IDENTITY,
     }
-    analytic_horizon = historical_horizon or bounded_horizon
+    typed_horizon_failure = result.component_scientific_identity == (
+        PROMOTED_HORIZON_FAILURE_COMPONENT_IDENTITY
+    )
+    analytic_horizon = (
+        historical_horizon or bounded_horizon or typed_horizon_failure
+    )
     promoted_horizon_stage = analytic_horizon or (
         payload.get("evidence_kind")
         == "package-owned-julia-single-promoted-horizon-component"
@@ -6071,6 +6081,19 @@ def _validate_component_result(
     if bounded_horizon:
         _validate_promoted_horizon_checkpoint_evidence_for_job(
             result, leaf.job
+        )
+    if typed_horizon_failure and not (
+        leaf.role in {"primary", "deep"}
+        and leaf.mechanism_id == "horizon-admittance"
+        and outcome.digits in (80, 120)
+        and result.response_method == PROMOTED_HORIZON_FAILURE_RESPONSE_METHOD
+        and result.status
+        in {ComponentStatus.BRANCH_LOSS, ComponentStatus.NOT_CONVERGED}
+        and result.response is None
+        and result.usable is False
+    ):
+        raise _UnauthenticatedComponentEvidence(
+            "campaign promoted horizon typed failure identity is invalid"
         )
     if exterior_derivative and not (
         leaf.mechanism_id.startswith("exterior-")
@@ -8149,12 +8172,32 @@ def _validate_schema11_horizon_stage(
                 PROMOTED_HORIZON_COMPONENT_V3_IDENTITY,
                 PROMOTED_HORIZON_RESPONSE_METHOD_V3,
             ),
+            (
+                PROMOTED_HORIZON_FAILURE_COMPONENT_IDENTITY,
+                PROMOTED_HORIZON_FAILURE_RESPONSE_METHOD,
+            ),
         ))
+        typed_failure = (
+            result.component_scientific_identity
+            == PROMOTED_HORIZON_FAILURE_COMPONENT_IDENTITY
+        )
         if (
             promoted_methods.get(result.component_scientific_identity)
             != result.response_method
             or payload.get("evidence_kind")
             != "package-owned-julia-promoted-horizon-survey"
+            or (
+                typed_failure
+                and (
+                    result.status
+                    not in {
+                        ComponentStatus.BRANCH_LOSS,
+                        ComponentStatus.NOT_CONVERGED,
+                    }
+                    or result.response is not None
+                    or result.usable
+                )
+            )
         ):
             raise ValueError(
                 "schema-11 horizon precision tier component identity is invalid"
@@ -8164,16 +8207,27 @@ def _validate_schema11_horizon_stage(
         if leaf.job.source_root_mapping is None
         else dict(leaf.job.source_root_mapping)
     )
+    branch_loss_mismatch = False
     for readout in result.raw_readouts:
-        if (
+        identity_mismatch = (
             readout.root_reference_id != leaf.job.root.root_reference_id
             or readout.branch_id != leaf.job.root.branch_id
             or readout.equation_id != leaf.job.equation_id
             or readout.source_root_mapping != expected_source_root_mapping
-        ):
-            raise ValueError(
-                "schema-11 horizon component root readout identity is invalid"
-            )
+        )
+        if identity_mismatch:
+            if result.status is not ComponentStatus.BRANCH_LOSS:
+                raise ValueError(
+                    "schema-11 horizon component root readout identity is invalid"
+                )
+            branch_loss_mismatch = True
+    if (
+        result.status is ComponentStatus.BRANCH_LOSS
+        and not branch_loss_mismatch
+    ):
+        raise ValueError(
+            "schema-11 horizon BRANCH_LOSS lacks a readout identity mismatch"
+        )
     disk = stage["response_disk"]
     if result.response is None:
         if disk is not None:

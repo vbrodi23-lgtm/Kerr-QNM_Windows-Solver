@@ -312,6 +312,56 @@ class HorizonRecordConstructionTests(unittest.TestCase):
                 state="PRODUCED",
             )
 
+    def test_horizon_validator_accepts_package_owned_typed_bf80_failure(self) -> None:
+        plan = _plan()
+        leaf = next(
+            item
+            for item in plan.leaves
+            if item.role == "primary"
+            and item.mechanism_id == "horizon-admittance"
+        )
+        branch_lost = replace(
+            _promoted_baseline(leaf.job, omega=leaf.job.root.omega),
+            branch_id="foreign-promoted-branch",
+        )
+        component = run_promoted_horizon_component(
+            leaf.job,
+            FakePromotedBackend(leaf.job, branch_lost),
+            leaf.job.root.omega,
+        )
+        payload = {
+            "evidence_kind": "package-owned-julia-promoted-horizon-survey",
+            "result": component.to_mapping(),
+            "scientific_runtime": {"runtime": "synthetic-bf80"},
+        }
+        outcome = StageOutcome(
+            digits=80,
+            numerical_state="BRANCH_LOSS",
+            component_result=payload,
+            local_disk_radius_abs=0.0,
+            signed_error_channels=synthetic_stage_signed_error_channels(
+                payload,
+                0.0,
+                precision_ladder_applicable=False,
+            ),
+        )
+        stage, _stage_sha256 = build_schema11_horizon_stage(
+            outcome,
+            precision_tier="BF80",
+            operation_identity="promoted-horizon-component/v2",
+        )
+
+        record = build_schema11_horizon_record(
+            plan,
+            leaf,
+            stages=(stage,),
+            retained_centre=None,
+            state="UNRESOLVED",
+        )
+
+        self.assertEqual("UNRESOLVED", record["state"])
+        self.assertIsNotNone(component.component_scientific_identity)
+
     def test_trigger_receipt_rejects_stage_outcome_payload_mismatch(self) -> None:
         plan = _plan()
         leaf = next(
@@ -520,8 +570,11 @@ class HorizonRecordConstructionTests(unittest.TestCase):
                 disposition=SurveyDisposition.COMPLETED,
                 reason_code="PROMOTED_HORIZON_COMPARISON_AGREES",
                 precision_tiers=("BF80",),
+                operation_identity="promoted-horizon-comparison/v2",
                 source_record_sha256=record["record_sha256"],
                 source_stage_sha256=stage_sha256,
+                root_read_count=1,
+                root_read_limit=1,
             )
 
         with tempfile.TemporaryDirectory() as temporary:

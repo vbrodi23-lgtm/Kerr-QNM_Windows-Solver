@@ -1404,6 +1404,8 @@ $candidate | ConvertTo-Json -Compress | Set-Content -LiteralPath $env:M02_TEST_J
             "same-equation-signed-root-component-journal/v1",
             "selective-signed-root-promotion-component/v1",
             "single-promoted-root-bounded-analytic-horizon-component/v2",
+            "promoted-horizon-typed-failure-component/v1",
+            "promoted-horizon-typed-failure/v1",
             "PROMOTED_HORIZON_COMPONENT_V2_IDENTITY",
             "PROMOTED_HORIZON_RESPONSE_METHOD_V2",
             "M02_Production_222_A9999_Endpoint_Recovery_v1.ps1",

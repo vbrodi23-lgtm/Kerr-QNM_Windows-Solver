@@ -1574,9 +1574,12 @@ def _commit_promoted_outcome(
         sample_limit=outcome.sample_limit,
         root_read_count=outcome.root_read_count,
         root_read_limit=(
-            0
-            if queue_kind is PromotionQueueKind.RESPONSE
-            else outcome.root_read_limit
+            outcome.root_read_limit
+            if (
+                queue_kind is not PromotionQueueKind.RESPONSE
+                or outcome.operation_identity.startswith("promoted-horizon-")
+            )
+            else 0
         ),
         worker_launch_count=outcome.worker_launch_count,
         worker_launch_limit=(
@@ -2101,10 +2104,15 @@ def run_promoted_survey(
             sample_count_limit=outcome.sample_limit,
             root_read_count=outcome.root_read_count,
             root_read_limit=(
-                0
-                if PromotionQueueKind(snapshot["queue_kind"])
-                is PromotionQueueKind.RESPONSE
-                else outcome.root_read_limit
+                outcome.root_read_limit
+                if (
+                    PromotionQueueKind(snapshot["queue_kind"])
+                    is not PromotionQueueKind.RESPONSE
+                    or outcome.operation_identity.startswith(
+                        "promoted-horizon-"
+                    )
+                )
+                else 0
             ),
             worker_launch_count=outcome.worker_launch_count,
             worker_launch_limit=(
