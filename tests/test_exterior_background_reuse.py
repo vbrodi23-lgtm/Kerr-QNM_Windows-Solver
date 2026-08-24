@@ -104,7 +104,11 @@ class ExteriorBackgroundReuseTests(unittest.TestCase):
         self.assertEqual(4, reused.sample_count)
         self.assertEqual(4, len(second_kernel.calls))
         self.assertTrue(all(sample.role.startswith("DC_") for sample in reused.samples))
-        self.assertEqual("PRODUCED", result.disposition.value)
+        self.assertEqual("PROMOTION_PENDING_RESPONSE", result.disposition.value)
+        self.assertEqual(
+            "DETERMINANT_ERROR_EVIDENCE_UNAVAILABLE", result.reason_code
+        )
+        self.assertIsNone(result.response_disk)
         self.assertEqual(BACKGROUND_EQUIVALENCE_IDENTITY, receipt.identity)
         self.assertEqual(
             CANONICAL_EXTERIOR_BACKGROUND_IDENTITY,

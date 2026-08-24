@@ -1452,6 +1452,10 @@ def _campaign_reduce(bundle_path: Path, output: Path) -> tuple[int, object]:
                 "migrate legacy checkpoint material first"
             )
         validated_schema11 = validate_schema11_checkpoint(raw_checkpoint)
+        if validated_schema11["campaign_id"] != plan.campaign_id:
+            raise ValueError(
+                "campaign reduction schema-11 campaign identity is invalid"
+            )
         checkpoint_leaf_ids = {
             str(record["leaf_id"])
             for record in validated_schema11["records"]
@@ -1467,9 +1471,16 @@ def _campaign_reduce(bundle_path: Path, output: Path) -> tuple[int, object]:
                 validated_schema11, checkpoint_requirements
             )
             release_covered_leaf_ids.update(checkpoint_requirements)
-        summary = validate_campaign_checkpoint(plan, checkpoint)
-        _validate_campaign_capability_superset(summary, descriptor, plan)
-        for record in summary.records:
+        for raw_record in validated_schema11["records"]:
+            leaf_id = str(raw_record["leaf_id"])
+            validate_campaign_recovery_record(plan, leaf_id, raw_record)
+            try:
+                record = CampaignLeafRecord.from_mapping(raw_record)
+            except ValueError as error:
+                raise ValueError(
+                    "campaign reduction numerical record shape is not yet "
+                    "projective-component compatible"
+                ) from error
             existing = records_by_id.get(record.leaf_id)
             if (
                 existing is not None

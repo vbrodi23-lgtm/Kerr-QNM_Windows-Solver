@@ -75,7 +75,7 @@ class Binary64FixedRootSurveyTests(unittest.TestCase):
                 self.assertEqual(0, batch.julia_launch_count)
                 self.assertTrue(all(call[2] for call in kernel.calls))
 
-    def test_screening_reduces_the_raw_stencils_without_a_certificate(self) -> None:
+    def test_screening_blocks_without_determinant_error_evidence(self) -> None:
         leaf = next(
             item
             for item in self.plan.leaves
@@ -90,12 +90,18 @@ class Binary64FixedRootSurveyTests(unittest.TestCase):
 
         result = screen_binary64_fixed_root_batch(batch)
 
-        self.assertIs(Binary64SurveyDisposition.PRODUCED, result.disposition)
-        self.assertAlmostEqual(-2.0 / 3.0, result.response_disk.centre.real, places=5)
-        self.assertAlmostEqual(0.0, result.response_disk.centre.imag, places=12)
-        self.assertGreater(result.response_disk.radius, 0.0)
-        self.assertLessEqual(result.root_correction_upper_bound, 2.0e-11)
-        self.assertEqual("not-claimed", result.determinant_certificate_status)
+        self.assertIs(
+            Binary64SurveyDisposition.PROMOTION_PENDING_RESPONSE,
+            result.disposition,
+        )
+        self.assertIsNone(result.response_disk)
+        self.assertIsNone(result.frequency_derivative_disk)
+        self.assertIsNone(result.coordinate_derivative_disk)
+        self.assertIsNone(result.root_correction_upper_bound)
+        self.assertEqual(
+            "DETERMINANT_ERROR_EVIDENCE_UNAVAILABLE", result.reason_code
+        )
+        self.assertEqual("unavailable", result.determinant_certificate_status)
 
     def test_nonfinite_sample_fails_closed_at_the_batch_boundary(self) -> None:
         leaf = next(

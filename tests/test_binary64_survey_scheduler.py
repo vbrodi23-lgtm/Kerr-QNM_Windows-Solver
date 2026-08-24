@@ -104,7 +104,7 @@ class Binary64SurveySchedulerTests(unittest.TestCase):
             reason_code="BOUNDED_HORIZON_RESPONSE",
         )
 
-    def test_full_mocked_plan_has_zero_julia_and_no_inline_promotion(self) -> None:
+    def test_full_mocked_plan_is_julia_free_and_queues_unbounded_exterior(self) -> None:
         backend = _AnalyticBackend()
         backend_constructions = 0
 
@@ -144,11 +144,28 @@ class Binary64SurveySchedulerTests(unittest.TestCase):
                 equivalence_receipt_lookup=equivalence,
             )
 
-            self.assertEqual(len(self.selection.ordered_leaf_ids), result.completed_count)
+            horizon_ids = {
+                leaf.leaf_id
+                for leaf in self.plan.leaves
+                if leaf.mechanism_id == "horizon-admittance"
+            }
+            exterior_ids = set(self.selection.ordered_leaf_ids) - horizon_ids
+            self.assertEqual(len(horizon_ids), result.completed_count)
+            self.assertEqual(len(exterior_ids), result.queued_count)
             self.assertEqual(1, backend_constructions)
             self.assertEqual(0, backend.julia_launches)
             self.assertEqual(0, backend.root_reads)
-            self.assertEqual([], result.checkpoint["promotion_queue"]["entries"])
+            queued = result.checkpoint["promotion_queue"]["entries"]
+            self.assertEqual(len(exterior_ids), len(queued))
+            self.assertEqual(
+                exterior_ids, {entry["leaf_id"] for entry in queued}
+            )
+            self.assertTrue(all(
+                entry["queue_kind"] == "RESPONSE"
+                and entry["reason_code"]
+                == "DETERMINANT_ERROR_EVIDENCE_UNAVAILABLE"
+                for entry in queued
+            ))
             ledger = result.checkpoint["survey_pass_ledger"]["binary64"]
             self.assertEqual(set(self.selection.ordered_leaf_ids), set(ledger))
             self.assertTrue(

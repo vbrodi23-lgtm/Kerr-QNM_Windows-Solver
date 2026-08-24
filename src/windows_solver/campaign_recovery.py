@@ -584,7 +584,7 @@ def _schema9_source_candidates(
 def _incident_oracle_status(
     oracle_path: str | os.PathLike[str] | Path | None,
 ) -> str:
-    """Classify the optional PR63 incident oracle without inventing a schema."""
+    """Classify the optional historical incident oracle without inventing a schema."""
 
     if oracle_path is None:
         return "NOT_SUPPLIED"
@@ -595,8 +595,9 @@ def _incident_oracle_status(
         _read_json(path)
     except (OSError, ValueError):
         return "INCOMPLETE_FIXTURE"
-    # No complete PR63 oracle schema is present in the active contract.  A
-    # parseable arbitrary JSON file is therefore still not an admissible oracle.
+    # No complete historical incident-oracle schema is present in the active
+    # contract. A parseable arbitrary JSON file is therefore still not an
+    # admissible oracle.
     return "INCOMPLETE_FIXTURE"
 
 
