@@ -196,6 +196,7 @@ class RecoverySummary:
     root_solves: int = 0
     legacy_authenticated_terminal_count: int = 0
     legacy_imported_count: int = 0
+    legacy_rejected_count: int = 0
     legacy_unreconstructable_count: int = 0
 
     def to_mapping(self) -> dict[str, object]:
@@ -217,6 +218,7 @@ class RecoverySummary:
                 self.legacy_authenticated_terminal_count
             ),
             "legacy_imported_count": self.legacy_imported_count,
+            "legacy_rejected_count": self.legacy_rejected_count,
             "legacy_unreconstructable_count": (
                 self.legacy_unreconstructable_count
             ),
@@ -377,25 +379,6 @@ def _validated_schema9_checkpoint(value: object) -> dict[str, object]:
     return checkpoint
 
 
-def _schema9_current_binding_reason(
-    checkpoint: Mapping[str, object], selection: RecoverySelection
-) -> str | None:
-    """Return why the old campaign cannot be claimed as the current one."""
-
-    bindings = checkpoint["bindings"]
-    assert isinstance(bindings, Mapping)
-    source_selection = bindings["selection"]
-    assert isinstance(source_selection, Mapping)
-    if bindings["campaign_id"] != selection.campaign_id:
-        return "CURRENT_CAMPAIGN_IDENTITY_MISMATCH"
-    if source_selection["selection_id"] != selection.selection_id:
-        return "CURRENT_SELECTION_IDENTITY_MISMATCH"
-    source_leaf_ids = set(source_selection["leaf_ids"])
-    if not set(selection.ordered_leaf_ids).issubset(source_leaf_ids):
-        return "CURRENT_SELECTION_MEMBERSHIP_MISMATCH"
-    return None
-
-
 def _legacy_compatibility_receipt(
     *,
     path: Path,
@@ -405,6 +388,7 @@ def _legacy_compatibility_receipt(
     selection: RecoverySelection,
     imported: bool,
     reason: str | None,
+    reason_detail: str | None = None,
 ) -> dict[str, object]:
     """Record a schema-9 decision without claiming absent evidence.
 
@@ -427,16 +411,41 @@ def _legacy_compatibility_receipt(
         "source_campaign_id": bindings["campaign_id"],
         "source_selection_id": source_selection["selection_id"],
         "source_records_sha256": checkpoint["records_sha256"],
+        "source_campaign_bindings_sha256": _sha256(
+            bindings["campaign_bindings"]
+        ),
+        "source_selection_binding_sha256": _sha256(source_selection),
         "leaf_id": leaf_id,
         "source_record_sha256": record["record_sha256"],
         "source_terminal_state": record["state"],
+        "source_campaign_matches_current": (
+            bindings["campaign_id"] == selection.campaign_id
+        ),
+        "source_selection_matches_current": (
+            source_selection["selection_id"] == selection.selection_id
+        ),
+        "source_leaf_was_selected": leaf_id in source_selection["leaf_ids"],
+        "current_leaf_is_selected": leaf_id in selection.ordered_leaf_ids,
+        "source_stage_sha256s": [
+            stage["stage_sha256"] for stage in record["stages"]
+        ],
         "current_scientific_identity_sha256": selection.scientific_identities.get(
             leaf_id
         ),
         "original_record_status": "AUTHENTICATED",
+        "identity_reconstruction_status": (
+            "PROVEN_CURRENT"
+            if imported
+            else (
+                "NOT_APPLICABLE_OFF_SELECTION"
+                if reason == "OFF_SELECTION"
+                else "NOT_PROVEN"
+            )
+        ),
         "imported_as_current_numerical_record": imported,
         "schema11_evidence_level": None,
         "reason": reason,
+        "reason_detail": reason_detail,
     }
     return {**content, "receipt_sha256": _sha256(content)}
 
@@ -451,7 +460,7 @@ def _schema9_source_candidates(
     candidates: dict[str, list[_Candidate]],
     ignored: list[dict[str, object]],
     compatibility_receipts: list[dict[str, object]],
-) -> tuple[int, int, int]:
+) -> tuple[int, int, int, int]:
     """Recover only schema-9 records whose current identity is proven.
 
     A terminal schema-9 record is authentic historical work, not automatically
@@ -460,7 +469,6 @@ def _schema9_source_candidates(
     numerical record out of the schema-11 checkpoint.
     """
 
-    source_binding_reason = _schema9_current_binding_reason(checkpoint, selection)
     selected = set(selection.ordered_leaf_ids)
     raw_records = checkpoint["records"]
     assert isinstance(raw_records, list)
@@ -474,6 +482,7 @@ def _schema9_source_candidates(
 
     authenticated_terminal_count = 0
     imported_count = 0
+    rejected_count = 0
     unreconstructable_count = 0
     for leaf_id, records in by_leaf.items():
         terminal_records = [
@@ -494,6 +503,7 @@ def _schema9_source_candidates(
                     )
                 )
                 unreconstructable_count += 1
+                rejected_count += 1
             ignored.append(
                 {
                     "path": str(path),
@@ -527,11 +537,12 @@ def _schema9_source_candidates(
             ignored.append(
                 {"path": str(path), "leaf_id": leaf_id, "reason": "OFF_SELECTION"}
             )
-            unreconstructable_count += 1
+            rejected_count += 1
             continue
 
-        reason = source_binding_reason
-        if reason is None and record_validator is None:
+        reason = None
+        reason_detail = None
+        if record_validator is None:
             reason = "CURRENT_SCIENTIFIC_IDENTITY_VALIDATOR_NOT_SUPPLIED"
         if reason is None:
             try:
@@ -540,8 +551,23 @@ def _schema9_source_candidates(
                     expected_role=selection.roles[leaf_id],
                     record_validator=record_validator,
                 )
-            except ValueError:
-                reason = "CURRENT_SCIENTIFIC_IDENTITY_UNRECONSTRUCTABLE"
+            except ValueError as error:
+                reason_detail = str(error)
+                insufficient_markers = (
+                    "absent",
+                    "incomplete",
+                    "lacks",
+                    "missing",
+                    "unavailable",
+                )
+                reason = (
+                    "CURRENT_SCIENTIFIC_IDENTITY_UNRECONSTRUCTABLE"
+                    if any(
+                        marker in reason_detail.lower()
+                        for marker in insufficient_markers
+                    )
+                    else "CURRENT_SCIENTIFIC_IDENTITY_INCOMPATIBLE"
+                )
             else:
                 receipt = _legacy_compatibility_receipt(
                     path=path,
@@ -574,11 +600,27 @@ def _schema9_source_candidates(
                 selection=selection,
                 imported=False,
                 reason=reason,
+                reason_detail=reason_detail,
             )
         )
-        ignored.append({"path": str(path), "leaf_id": leaf_id, "reason": reason})
-        unreconstructable_count += 1
-    return authenticated_terminal_count, imported_count, unreconstructable_count
+        ignored.append({
+            "path": str(path),
+            "leaf_id": leaf_id,
+            "reason": reason,
+            "reason_detail": reason_detail,
+        })
+        rejected_count += 1
+        if reason in {
+            "CURRENT_SCIENTIFIC_IDENTITY_UNRECONSTRUCTABLE",
+            "CURRENT_SCIENTIFIC_IDENTITY_VALIDATOR_NOT_SUPPLIED",
+        }:
+            unreconstructable_count += 1
+    return (
+        authenticated_terminal_count,
+        imported_count,
+        rejected_count,
+        unreconstructable_count,
+    )
 
 
 def _incident_oracle_status(
@@ -743,6 +785,7 @@ def recover_campaign(
     legacy_compatibility_receipts: list[dict[str, object]] = []
     legacy_authenticated_terminal_count = 0
     legacy_imported_count = 0
+    legacy_rejected_count = 0
     legacy_unreconstructable_count = 0
 
     for raw_path in source_checkpoints:
@@ -768,18 +811,21 @@ def recover_campaign(
                 raise ValueError(
                     f"explicit source checkpoint is corrupt: {path}: {error}"
                 ) from error
-            discovered, imported, unreconstructable = _schema9_source_candidates(
-                path=path,
-                source_sha256=source_sha,
-                checkpoint=schema9_checkpoint,
-                selection=selection,
-                record_validator=record_validator,
-                candidates=candidates,
-                ignored=ignored,
-                compatibility_receipts=legacy_compatibility_receipts,
+            discovered, imported, rejected, unreconstructable = (
+                _schema9_source_candidates(
+                    path=path,
+                    source_sha256=source_sha,
+                    checkpoint=schema9_checkpoint,
+                    selection=selection,
+                    record_validator=record_validator,
+                    candidates=candidates,
+                    ignored=ignored,
+                    compatibility_receipts=legacy_compatibility_receipts,
+                )
             )
             legacy_authenticated_terminal_count += discovered
             legacy_imported_count += imported
+            legacy_rejected_count += rejected
             legacy_unreconstructable_count += unreconstructable
             continue
         if value.get("schema_version") != 11:
@@ -1021,7 +1067,7 @@ def recover_campaign(
             ),
             "legacy_current_compatible_records": legacy_imported_count,
             "legacy_reused_records": legacy_imported_count,
-            "legacy_rejected_records": legacy_unreconstructable_count,
+            "legacy_rejected_records": legacy_rejected_count,
         },
     }
     candidate_checkpoint["recovery_receipts"].append(recovery_entry)
@@ -1086,6 +1132,7 @@ def recover_campaign(
         receipt_path=str(receipt),
         legacy_authenticated_terminal_count=legacy_authenticated_terminal_count,
         legacy_imported_count=legacy_imported_count,
+        legacy_rejected_count=legacy_rejected_count,
         legacy_unreconstructable_count=legacy_unreconstructable_count,
     )
 
