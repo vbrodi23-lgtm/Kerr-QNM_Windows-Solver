@@ -80,6 +80,7 @@ from .julia_response_backend import (
     JuliaRootReadoutResourceLimitError,
 )
 from .progress import ProgressEventKind, emit_progress, progress_scope
+from .structural_diagnostics import StructuralDiagnosticSession
 
 
 RecordValidator = Callable[[str, Mapping[str, object]], None]
@@ -553,6 +554,7 @@ def run_binary64_survey(
     terminal_record_committed: Callable[
         [object, Mapping[str, object]], None
     ] | None = None,
+    diagnostic_session: StructuralDiagnosticSession | None = None,
 ) -> Binary64SurveyRun:
     """Run only the binary64 pass; promotion is recorded and never executed."""
 
@@ -577,7 +579,7 @@ def run_binary64_survey(
         path.with_name(f"{path.name}.timing.jsonl")
     )
     make_session_id = session_id_factory or (lambda: uuid4().hex)
-    failure_monitor = ProductionFailureMonitor()
+    failure_monitor = ProductionFailureMonitor(diagnostic_session=diagnostic_session)
 
     def persist(value: Mapping[str, object]) -> dict[str, object]:
         durable = validate_schema11_checkpoint(value)
@@ -623,9 +625,6 @@ def run_binary64_survey(
         if leaf_id in binary64_ledger:
             skipped += 1
             continue
-        failure_monitor.abort_before_leaf(
-            result, leaf_id=leaf_id, persist_checkpoint=lambda value: persist(value)
-        )
         committed_before_leaf = result
         timing_recorder: TimingSessionRecorder | None = None
         with progress_scope(**leaf_context):
@@ -1128,17 +1127,24 @@ def run_binary64_survey(
             SurveyDisposition.PROMOTION_PENDING_ROOT,
             SurveyDisposition.PROMOTION_PENDING_RESPONSE,
         }:
-            failure_monitor.observe(
-                leaf_id,
-                _survey_failure_report(
-                    leaf,
-                    survey_pass="binary64",
-                    reason_code=outcome.reason_code,
-                    operation_identity=outcome.operation_identity,
-                    precision_tier="binary64",
-                    disposition=outcome.disposition,
-                ),
+            report = _survey_failure_report(
+                leaf,
+                survey_pass="binary64",
+                reason_code=outcome.reason_code,
+                operation_identity=outcome.operation_identity,
+                precision_tier="binary64",
+                disposition=outcome.disposition,
             )
+            if (
+                failure_monitor.observe_leaf_outcome(leaf_id, report).disposition
+                is FailureDisposition.SYSTEM_FAILURE
+            ):
+                failure_monitor.observe_system_failure(
+                    result,
+                    leaf_id=leaf_id,
+                    report=report,
+                    persist_checkpoint=lambda value: persist(value),
+                )
 
     exhaustion = binary64_pass_exhaustion(result, selection)
     with progress_scope(execution_profile="SURVEY", survey_pass="binary64"):
@@ -1698,6 +1704,7 @@ def run_promoted_survey(
     terminal_record_committed: Callable[
         [object, Mapping[str, object]], None
     ] | None = None,
+    diagnostic_session: StructuralDiagnosticSession | None = None,
 ) -> PromotedSurveyRun:
     """Consume only pending promotion entries through BF40/BF80 survey work."""
 
@@ -1714,7 +1721,7 @@ def run_promoted_survey(
         path.with_name(f"{path.name}.timing.jsonl")
     )
     make_session_id = session_id_factory or (lambda: uuid4().hex)
-    failure_monitor = ProductionFailureMonitor()
+    failure_monitor = ProductionFailureMonitor(diagnostic_session=diagnostic_session)
 
     def persist(value: Mapping[str, object]) -> dict[str, object]:
         durable = validate_schema11_checkpoint(value)
@@ -1781,9 +1788,6 @@ def run_promoted_survey(
             "execution_profile": "SURVEY",
             "survey_pass": "promoted",
         }
-        failure_monitor.abort_before_leaf(
-            result, leaf_id=leaf_id, persist_checkpoint=lambda value: persist(value)
-        )
         committed_before_leaf = result
         with progress_scope(**leaf_context):
             emit_progress(ProgressEventKind.LEAF_PASS_STARTED)
@@ -2085,17 +2089,24 @@ def run_promoted_survey(
             SurveyDisposition.CACHE_REUSED,
             SurveyDisposition.SUPERSEDED_BY_CACHE,
         }:
-            failure_monitor.observe(
-                leaf_id,
-                _survey_failure_report(
-                    leaf,
-                    survey_pass="promoted",
-                    reason_code=outcome.reason_code,
-                    operation_identity="promoted-survey-production/v1",
-                    precision_tier="+".join(outcome.precision_tiers),
-                    disposition=outcome.disposition,
-                ),
+            report = _survey_failure_report(
+                leaf,
+                survey_pass="promoted",
+                reason_code=outcome.reason_code,
+                operation_identity="promoted-survey-production/v1",
+                precision_tier="+".join(outcome.precision_tiers),
+                disposition=outcome.disposition,
             )
+            if (
+                failure_monitor.observe_leaf_outcome(leaf_id, report).disposition
+                is FailureDisposition.SYSTEM_FAILURE
+            ):
+                failure_monitor.observe_system_failure(
+                    result,
+                    leaf_id=leaf_id,
+                    report=report,
+                    persist_checkpoint=lambda value: persist(value),
+                )
         timing_by_tier = {
             item["tier"]: item["elapsed_seconds"] for item in outcome.tier_timing
         }

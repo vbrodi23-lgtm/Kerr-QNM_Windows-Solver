@@ -1199,6 +1199,7 @@ def _campaign_schema11_pass(
     calibration_receipt_path: Path | None,
     calibration_receipt_sha256: str | None,
     diagnostic_paths: Mapping[str, str | os.PathLike[str] | Path | None] | None = None,
+    diagnostic_session: StructuralDiagnosticSession | None = None,
 ) -> tuple[int, object]:
     if (calibration_receipt_path is None) is not (
         calibration_receipt_sha256 is None
@@ -1239,6 +1240,7 @@ def _campaign_schema11_pass(
                     recovery_selection,
                     checkpoint,
                     checkpoint_path=resolved,
+                    diagnostic_session=diagnostic_session,
                 )
         finally:
             reporter.close()
@@ -1288,6 +1290,7 @@ def _campaign_schema11_pass(
                     checkpoint,
                     checkpoint_path=resolved,
                     calibration_receipt=receipt,
+                    diagnostic_session=diagnostic_session,
                 )
         finally:
             reporter.close()
@@ -1908,6 +1911,7 @@ def _run_schema11_pass_with_diagnostics(arguments: argparse.Namespace) -> tuple[
                 "postmortem_path": session.paths.postmortem,
                 "bundle_path": session.paths.bundle,
             },
+            diagnostic_session=session,
         )
         if not isinstance(output, Mapping):
             raise ValueError("schema-11 pass output is invalid")

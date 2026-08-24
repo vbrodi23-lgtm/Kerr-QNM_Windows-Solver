@@ -44,6 +44,7 @@ from .campaign_survey import (
     run_promoted_survey,
 )
 from .contracts import canonical_json_bytes
+from .structural_diagnostics import StructuralDiagnosticSession
 from .gsn_cache_producer import (
     load_generated_gsn_cache,
     parameter_pairs_for_selection,
@@ -1187,6 +1188,7 @@ def run_native_binary64_pass(
     solved_leaf_store: SolvedLeafStore | None = None,
     determinant_error_store: ReviewedDeterminantErrorStore | None = None,
     background_evidence_store: CanonicalBackgroundEvidenceStore | None = None,
+    diagnostic_session: StructuralDiagnosticSession | None = None,
 ) -> Binary64SurveyRun:
     """Execute the real binary64 scheduler with a Julia-free backend factory."""
 
@@ -1322,6 +1324,7 @@ def run_native_binary64_pass(
             value,
             include_triage=True,
         ),
+        diagnostic_session=diagnostic_session,
     )
 
 
@@ -1693,6 +1696,7 @@ def run_native_promoted_pass(
     calibration_receipt: object | None = None,
     solved_leaf_store: SolvedLeafStore | None = None,
     determinant_error_store: ReviewedDeterminantErrorStore | None = None,
+    diagnostic_session: StructuralDiagnosticSession | None = None,
 ) -> PromotedSurveyRun:
     """Execute only queued BF40/BF80 work through the survey-only operation."""
 
@@ -1809,6 +1813,7 @@ def run_native_promoted_pass(
             value,
             include_triage=True,
         ),
+        diagnostic_session=diagnostic_session,
     )
 
 

@@ -26,6 +26,7 @@ from windows_solver.campaign_survey import Binary64PassOutcome, Binary64SurveyRu
 from windows_solver.contracts import canonical_json_bytes
 from windows_solver.evidence_discovery import EvidenceDiscoveryTotals
 from windows_solver.native_response_kernel import VettedNativeDeterminantKernel
+from windows_solver.structural_diagnostics import StructuralDiagnosticSession
 from windows_solver.response_batches import (
     PrecisionCapabilities,
     build_campaign_plan,
@@ -645,7 +646,7 @@ class PromotedTerminalCacheWiringTests(unittest.TestCase):
             "bundle_path": "/tmp/diagnostics/session-1/diagnostic-bundle.zip",
         }
 
-        with patch(
+        with tempfile.TemporaryDirectory() as temporary, patch(
             "windows_solver.cli._load_schema11_campaign",
             return_value=(
                 plan,
@@ -661,7 +662,13 @@ class PromotedTerminalCacheWiringTests(unittest.TestCase):
         ) as progress_reporter, patch(
             "windows_solver.campaign_runtime.run_native_binary64_pass",
             return_value=result,
-        ):
+        ) as native_binary64:
+            session = StructuralDiagnosticSession.open(
+                checkpoint_path=Path(temporary) / "checkpoint.json",
+                session_id="pr66-diagnostic-session",
+                campaign_id=plan.campaign_id,
+                selection_id=selection.selection_id,
+            )
             status, payload = cli._campaign_schema11_pass(
                 "campaign-survey-binary64",
                 Path("selection.json"),
@@ -671,7 +678,9 @@ class PromotedTerminalCacheWiringTests(unittest.TestCase):
                 calibration_receipt_path=None,
                 calibration_receipt_sha256=None,
                 diagnostic_paths=diagnostic_paths,
+                diagnostic_session=session,
             )
+            session.close_completed()
 
         self.assertEqual(0, status)
         self.assertIsInstance(payload, dict)
@@ -679,6 +688,10 @@ class PromotedTerminalCacheWiringTests(unittest.TestCase):
         self.assertEqual(
             diagnostic_paths,
             progress_reporter.call_args.kwargs["diagnostic_paths"],
+        )
+        self.assertIs(
+            session,
+            native_binary64.call_args.kwargs["diagnostic_session"],
         )
 
 

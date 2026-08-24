@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 import unittest
 
 from windows_solver.campaign_failures import (
@@ -96,7 +97,7 @@ class CampaignFailureTests(unittest.TestCase):
         self.assertEqual("MethodError", durable["system_failures"][0]["cause_type"])
         self.assertNotIn("FAILED", str(durable))
 
-    def test_same_leaf_local_fingerprint_twice_aborts_before_third_leaf(self) -> None:
+    def test_repeated_leaf_local_fingerprint_is_advisory_and_third_leaf_starts(self) -> None:
         checkpoint = empty_schema11_checkpoint("campaign-1", "selection-1")
         started: list[str] = []
         committed: list[tuple[str, FailureDisposition]] = []
@@ -106,27 +107,69 @@ class CampaignFailureTests(unittest.TestCase):
             started.append(leaf_id)
             return _report("ODE_RESOURCE_LIMIT")
 
-        with self.assertRaisesRegex(CampaignSystemFailure, "repetition breaker"):
-            run_guarded_pass(
-                ("leaf-1", "leaf-2", "leaf-3"),
-                checkpoint=checkpoint,
-                execute_leaf=execute,
-                commit_leaf_outcome=lambda leaf, outcome: committed.append(
-                    (leaf, outcome.disposition)
-                ),
-                persist_checkpoint=lambda value: persisted.append(value),
-            )
+        run_guarded_pass(
+            ("leaf-1", "leaf-2", "leaf-3"),
+            checkpoint=checkpoint,
+            execute_leaf=execute,
+            commit_leaf_outcome=lambda leaf, outcome: committed.append(
+                (leaf, outcome.disposition)
+            ),
+            persist_checkpoint=lambda value: persisted.append(value),
+        )
 
-        self.assertEqual(["leaf-1", "leaf-2"], started)
+        self.assertEqual(["leaf-1", "leaf-2", "leaf-3"], started)
         self.assertEqual(
             [
                 ("leaf-1", FailureDisposition.DEFERRED),
                 ("leaf-2", FailureDisposition.DEFERRED),
+                ("leaf-3", FailureDisposition.DEFERRED),
             ],
             committed,
         )
-        self.assertEqual(1, len(persisted[-1]["system_failures"]))
+        self.assertEqual([], persisted[-1]["system_failures"])
         self.assertNotIn("FAILED", str(persisted[-1]))
+
+    def test_classified_system_failure_aborts_on_first_outcome(self) -> None:
+        checkpoint = empty_schema11_checkpoint("campaign-1", "selection-1")
+        started: list[str] = []
+        persisted: list[dict[str, object]] = []
+
+        with self.assertRaises(CampaignSystemFailure):
+            run_guarded_pass(
+                ("leaf-1", "leaf-2"),
+                checkpoint=checkpoint,
+                execute_leaf=lambda leaf_id: (
+                    started.append(leaf_id) or _report("NEW_UNKNOWN_CODE")
+                ),
+                commit_leaf_outcome=lambda _leaf, _outcome: self.fail(
+                    "system failure must not commit an ordinary outcome"
+                ),
+                persist_checkpoint=lambda value: persisted.append(value),
+            )
+
+        self.assertEqual(["leaf-1"], started)
+        self.assertEqual(1, len(persisted))
+        self.assertEqual(1, len(persisted[0]["system_failures"]))
+
+    def test_static_guard_has_no_before_leaf_repetition_abort(self) -> None:
+        failures_source = (
+            Path(__file__).parents[1]
+            / "src"
+            / "windows_solver"
+            / "campaign_failures.py"
+        ).read_text(encoding="utf-8")
+        survey_source = (
+            Path(__file__).parents[1]
+            / "src"
+            / "windows_solver"
+            / "campaign_survey.py"
+        ).read_text(encoding="utf-8")
+
+        self.assertNotIn("abort_before_leaf", failures_source)
+        self.assertNotIn("abort_before_leaf", survey_source)
+        self.assertNotIn("REPEATED_LEAF_FAILURE_FINGERPRINT", failures_source)
+        self.assertIn("def observe_system_failure", failures_source)
+        self.assertIn("def observe_leaf_outcome", failures_source)
 
     def test_operator_interrupt_is_not_relabelled_as_system_failure(self) -> None:
         persisted: list[dict[str, object]] = []

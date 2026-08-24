@@ -6,7 +6,7 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from windows_solver.campaign_policy import empty_schema11_checkpoint
+from windows_solver.campaign_policy import SurveyDisposition, empty_schema11_checkpoint
 from windows_solver.campaign_failures import CampaignSystemFailure
 from windows_solver.campaign_recovery import RecoverySelection
 from windows_solver.campaign_timing import CampaignTimingLog
@@ -16,6 +16,10 @@ from windows_solver.campaign_survey import (
     run_binary64_survey,
 )
 from windows_solver.contracts import canonical_json_bytes
+from windows_solver.structural_diagnostics import (
+    StructuralDiagnosticSession,
+    read_structural_events,
+)
 from windows_solver.response_batches import (
     PrecisionCapabilities,
     build_campaign_plan,
@@ -24,7 +28,6 @@ from windows_solver.response_batches import (
 )
 from windows_solver.response_engine import (
     BackgroundEquivalenceReceipt,
-    Binary64SurveyDisposition,
     NumericalPolicy,
     VettedNativeDeterminantKernel,
 )
@@ -213,6 +216,78 @@ class Binary64SurveySchedulerTests(unittest.TestCase):
             self.assertEqual(18, backend.determinant_calls)
             self.assertEqual(0, result.completed_count)
             self.assertEqual(2, result.queued_count)
+
+    def test_repeated_horizon_derivative_outcomes_are_advisory(self) -> None:
+        """Two repeated numerical outcomes must not block the third leaf."""
+
+        horizon = tuple(
+            leaf.leaf_id
+            for leaf in self.plan.leaves
+            if leaf.mechanism_id == "horizon-admittance"
+        )[:3]
+        self.assertEqual(3, len(horizon))
+        selection = RecoverySelection(
+            campaign_id=self.selection.campaign_id,
+            selection_id="selection-repeated-horizon-outcome",
+            ordered_leaf_ids=horizon,
+            roles={leaf_id: self.selection.roles[leaf_id] for leaf_id in horizon},
+            scientific_identities={
+                leaf_id: self.selection.scientific_identities[leaf_id]
+                for leaf_id in horizon
+            },
+        )
+        started: list[str] = []
+
+        def unresolved_horizon(leaf) -> Binary64PassOutcome:
+            started.append(leaf.leaf_id)
+            return Binary64PassOutcome(
+                disposition=SurveyDisposition.UNRESOLVED,
+                operation_identity="test-repeated-horizon-outcome/v1",
+                reason_code="HORIZON_DERIVATIVE_UNRESOLVED",
+            )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "checkpoint.json"
+            session = StructuralDiagnosticSession.open(
+                checkpoint_path=path,
+                session_id="repeated-horizon-outcome",
+                campaign_id=selection.campaign_id,
+                selection_id=selection.selection_id,
+            )
+            result = run_binary64_survey(
+                self.plan,
+                selection,
+                empty_schema11_checkpoint(selection.campaign_id, selection.selection_id),
+                checkpoint_path=path,
+                root_seal_lookup=lambda _leaf: self.fail(
+                    "unresolved horizon must not request a root seal"
+                ),
+                native_backend_factory=lambda: self.fail(
+                    "unresolved horizon must not construct an exterior backend"
+                ),
+                horizon_runner=unresolved_horizon,
+                produced_record_builder=lambda *args: self.fail(
+                    "unresolved horizon must not build a record"
+                ),
+                diagnostic_session=session,
+            )
+            session.close_completed()
+            events = read_structural_events(session.paths.structural_events)
+
+        self.assertEqual(list(horizon), started)
+        self.assertEqual([], result.checkpoint["system_failures"])
+        self.assertEqual(
+            set(horizon),
+            set(result.checkpoint["survey_pass_ledger"]["binary64"]),
+        )
+        repeated = [
+            event for event in events
+            if event["event_kind"] == "REPEATED_LEAF_OUTCOME_OBSERVED"
+        ]
+        self.assertEqual(2, len(repeated))
+        self.assertEqual(2, repeated[0]["compact_diagnostics"]["observation_count"])
+        self.assertEqual(list(horizon[:2]), repeated[0]["compact_diagnostics"]["all_observed_leaf_ids"])
+        self.assertFalse(repeated[0]["compact_diagnostics"]["campaign_aborted"])
 
     def test_missing_root_queues_once_and_resume_is_zero_work(self) -> None:
         leaf_id = next(
