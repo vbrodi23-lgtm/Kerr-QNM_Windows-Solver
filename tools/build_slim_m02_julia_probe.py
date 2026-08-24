@@ -14,8 +14,9 @@ if STAGE.exists():
 (STAGE / "project").mkdir(parents=True)
 (STAGE / "vendor").mkdir(parents=True)
 
+# Keep the historical full manifest only as a version-comparison oracle.
+# The slim environment must be resolved cleanly from the reduced project.
 shutil.copy2(SRC / "m02_project" / "Manifest.seed.toml", STAGE / "project" / "Manifest.seed.toml")
-shutil.copy2(SRC / "m02_project" / "Manifest.seed.toml", STAGE / "project" / "Manifest.toml")
 shutil.copytree(SRC / "GeneralizedSasakiNakamura.jl", STAGE / "vendor" / "GeneralizedSasakiNakamura.jl")
 shutil.copytree(SRC / "SpinWeightedSpheroidalHarmonics.jl", STAGE / "vendor" / "SpinWeightedSpheroidalHarmonics.jl")
 shutil.copy2(SRC / "m02_worker.jl", STAGE / "m02_worker.jl")
