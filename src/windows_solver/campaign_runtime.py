@@ -1403,6 +1403,57 @@ def _typed_horizon_failure_code(
     return code
 
 
+
+def _provisional_stage_publication_metadata(
+    leaf: object,
+    stage: Mapping[str, object],
+) -> tuple[str, str]:
+    """Authenticate one durable provisional stage for publication diagnostics.
+
+    Horizon and exterior provisional stages intentionally use different
+    envelopes.  The horizon root seal belongs to its authenticated analytic
+    evidence; exterior stages retain the seal at the stage top level.
+    """
+
+    if not isinstance(stage, Mapping):
+        raise ValueError("provisional stage publication is invalid")
+    stage_sha256 = stage.get("stage_sha256")
+    content = {
+        key: item for key, item in stage.items() if key != "stage_sha256"
+    }
+    if not _is_sha256(stage_sha256) or stage_sha256 != _sha256(content):
+        raise ValueError("provisional stage publication digest is invalid")
+
+    if stage.get("schema") == HORIZON_SCREENING_STAGE_SCHEMA:
+        if (
+            getattr(leaf, "mechanism_id", None) != "horizon-admittance"
+            or stage.get("operation_identity") != BINARY64_HORIZON_OPERATION_V3
+        ):
+            raise ValueError("horizon provisional stage identity is invalid")
+        payload = stage.get("component_result")
+        raw_result = payload.get("result") if isinstance(payload, Mapping) else None
+        evidence = (
+            raw_result.get("analytic_horizon_evidence")
+            if isinstance(raw_result, Mapping)
+            else None
+        )
+        if (
+            not isinstance(raw_result, Mapping)
+            or raw_result.get("leaf_id") != getattr(leaf, "leaf_id", None)
+            or raw_result.get("mechanism_id") != "horizon-admittance"
+            or not isinstance(evidence, Mapping)
+        ):
+            raise ValueError("horizon provisional stage binding is invalid")
+        root_seal_sha256 = evidence.get("root_seal_sha256")
+    else:
+        if getattr(leaf, "mechanism_id", None) == "horizon-admittance":
+            raise ValueError("horizon provisional stage schema is invalid")
+        root_seal_sha256 = stage.get("root_seal_sha256")
+
+    if not _is_sha256(root_seal_sha256):
+        raise ValueError("provisional stage publication root seal is invalid")
+    return str(stage_sha256), str(root_seal_sha256)
+
 def run_native_binary64_pass(
     plan: object,
     selection: object,
@@ -1499,19 +1550,11 @@ def run_native_binary64_pass(
                 root_provider().publish(leaf, seal)
 
     def publish_provisional_stage(leaf, stage):
-        """Publish the checkpoint-committed exterior source-stage transition."""
+        """Publish one authenticated checkpoint-committed provisional stage."""
 
-        if not isinstance(stage, Mapping):
-            raise ValueError("provisional stage publication is invalid")
-        stage_sha256 = stage.get("stage_sha256")
-        root_seal_sha256 = stage.get("root_seal_sha256")
-        if (
-            not isinstance(stage_sha256, str)
-            or len(stage_sha256) != 64
-            or not isinstance(root_seal_sha256, str)
-            or len(root_seal_sha256) != 64
-        ):
-            raise ValueError("provisional stage publication is unauthenticated")
+        stage_sha256, root_seal_sha256 = (
+            _provisional_stage_publication_metadata(leaf, stage)
+        )
         if diagnostic_session is not None:
             diagnostic_session.append(
                 "PROVISIONAL_STAGE_PUBLISHED",
