@@ -222,9 +222,16 @@ try {
     Write-Host ("    Survey pass              : {0}" -f $SelectedSurveyPass)
     Write-Host ("    Selection ID             : {0}" -f $CheckpointStatus.selection_id)
     Write-Host ("    Checkpoint schema        : {0}" -f $CheckpointStatus.schema_version)
+    Write-Host ("    Selected leaf count      : {0}" -f $CheckpointStatus.selected_leaf_count)
+    Write-Host ("    Binary64 processed       : {0}/{1}" -f $CheckpointStatus.binary64_processed_count, $CheckpointStatus.selected_leaf_count)
+    Write-Host ("    Binary64 pass count      : {0}" -f $CheckpointStatus.binary64_processed_count)
+    Write-Host ("    Promoted processed       : {0}" -f $CheckpointStatus.promoted_processed_count)
+    Write-Host ("    Produced                 : {0}" -f $CheckpointStatus.produced_count)
+    Write-Host ("    Pending                  : {0}" -f $CheckpointStatus.pending_count)
+    Write-Host ("    Promotion queue count    : {0}" -f $CheckpointStatus.pending_count)
+    Write-Host ("    Pending BF40             : {0}" -f $CheckpointStatus.pending_by_minimum_tier.BF40)
+    Write-Host ("    Pending BF80             : {0}" -f $CheckpointStatus.pending_by_minimum_tier.BF80)
     Write-Host ("    Recovered terminal count : {0}" -f $CheckpointStatus.recovered_terminal_count)
-    Write-Host ("    Binary64 pass count      : {0}" -f $CheckpointStatus.binary64_pass_count)
-    Write-Host ("    Promotion queue count    : {0}" -f $CheckpointStatus.promotion_queue_count)
     Write-Host ("    Evidence counts          : {0}" -f ($CheckpointStatus.evidence_counts | ConvertTo-Json -Compress))
     Write-Host ("    Basic report directory   : {0}" -f $CheckpointStatus.basic_report_directory)
     Write-Host ("    Status path              : {0}" -f "$CheckpointPath.status.json")
@@ -238,7 +245,18 @@ try {
     if ($null -ne $ResolvedQueuePath) {
         $RunArguments += @("--queue", $ResolvedQueuePath)
     }
-    Invoke-M02Command -Arguments $RunArguments
+    # Capture canonical command JSON without merging it with the human
+    # dashboard stream.  The reporter writes dashboard text to stderr; the
+    # solver's final _emit() result remains stdout and is parsed here.
+    $RunOutput = @(Invoke-M02Command -Arguments $RunArguments)
+    $RunJsonText = ($RunOutput | ForEach-Object { [string]$_ }) -join [Environment]::NewLine
+    if ([string]::IsNullOrWhiteSpace($RunJsonText)) {
+        throw "M02 command returned no canonical JSON result."
+    }
+    $RunResult = $RunJsonText | ConvertFrom-Json
+    if ($null -eq $RunResult) {
+        throw "M02 command returned an empty canonical JSON result."
+    }
     $ValidationPass = if ($Profile -eq "survey") {
         $SurveyPass
     }

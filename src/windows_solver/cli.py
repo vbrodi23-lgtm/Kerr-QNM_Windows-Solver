@@ -61,8 +61,8 @@ from .progress import (
 from .progress_output import (
     CampaignProgressReporter,
     Schema11ProgressReporter,
-    schema11_dashboard_snapshot,
 )
+from .schema11_dashboard import project_schema11_dashboard
 from .campaign_reports import (
     refresh_schema11_reports,
     report_directory_for_checkpoint,
@@ -1136,13 +1136,13 @@ def _campaign_schema11_validate(
     plan, selection, _descriptor, _recovery, resolved, checkpoint = (
         _load_schema11_campaign(selection_path, checkpoint_path)
     )
-    rows, counts, report_status = schema11_dashboard_snapshot(
+    projection = project_schema11_dashboard(
         checkpoint,
+        selected_leaf_ids=selection.leaf_ids,
         leaf_metadata=_schema11_leaf_metadata(plan, selection),
     )
-    evidence_counts = {level.value: 0 for level in EvidenceLevel}
-    for item in checkpoint["evidence_ledger"].values():
-        evidence_counts[str(item["evidence_level"])] += 1
+    report_status = projection.report_status
+    evidence_counts = projection.evidence_counts
     if pass_name == "promoted":
         pending = [
             item
@@ -1176,16 +1176,23 @@ def _campaign_schema11_validate(
         "campaign_id": checkpoint["campaign_id"],
         "selection_id": checkpoint["selection_id"],
         "state": checkpoint["state"],
-        "recovered_terminal_count": len(rows),
-        "binary64_pass_count": len(
-            checkpoint["survey_pass_ledger"]["binary64"]
-        ),
-        "promoted_pass_count": len(
-            checkpoint["survey_pass_ledger"]["promoted"]
-        ),
-        "promotion_queue_count": counts["queued"],
-        "evidence_counts": evidence_counts,
-        "report_status": report_status,
+        "recovered_terminal_count": projection.produced_count,
+        "selected_leaf_count": projection.selected_leaf_count,
+        "binary64_processed_count": projection.binary64_processed_count,
+        "promoted_processed_count": projection.promoted_processed_count,
+        "produced_count": projection.produced_count,
+        "pending_count": projection.pending_count,
+        "pending_by_minimum_tier": dict(projection.pending_by_minimum_tier),
+        "retained_binary64_sample_count": projection.retained_binary64_sample_count,
+        "deferred_count": projection.deferred_count,
+        "unresolved_count": projection.unresolved_count,
+        "rejected_count": projection.rejected_count,
+        "system_failure_count": projection.system_failure_count,
+        "binary64_pass_count": projection.binary64_processed_count,
+        "promoted_pass_count": projection.promoted_processed_count,
+        "promotion_queue_count": projection.pending_count,
+        "evidence_counts": dict(evidence_counts),
+        "report_status": dict(report_status),
         "basic_report_directory": str(report_directory_for_checkpoint(resolved)),
         "status_path": f"{resolved}.status.json",
         "validated_pass": pass_name,
