@@ -1541,6 +1541,27 @@ def _validate_failed_preflight_attempt_request(
             else None
         )
         validated_budget = _ode_error_budget_from_mapping(request_budget)
+        diagnostic_model_identity = request_binding.get(
+            "diagnostic_model_identity"
+        )
+        # A binding carries reviewed-calibration hashes only in the
+        # empirical-certificate mode. Their presence — not the mechanism
+        # or the absence of an ODE budget — is the wire-level signal that
+        # empirical reconstruction is required. Horizon and provisional
+        # exterior bindings both live in the "no ODE budget, no
+        # calibration hashes" fork and reconstruct with the default
+        # diagnostic identity for their mechanism.
+        empirical_calibration_bound = (
+            isinstance(request_policy, Mapping)
+            and (
+                request_policy.get(
+                    "promoted_control_calibration_receipt_sha256"
+                )
+                is not None
+                or request_policy.get("empirical_control_profile_sha256")
+                is not None
+            )
+        )
         if validated_budget is not None:
             expected_request = _CanonicalRequestJuliaPrecisionRootBackend(
                 leaf.job.backend_identity,
@@ -1548,16 +1569,14 @@ def _validate_failed_preflight_attempt_request(
                 precision_digits,
                 refinement=refinement_level,
                 ode_error_budget=validated_budget,
-                diagnostic_model_identity=request_binding.get(
-                    "diagnostic_model_identity"
-                ),
+                diagnostic_model_identity=diagnostic_model_identity,
             )._request(
                 leaf.job,
                 amplitude_value,
                 predictor_value,
                 predictor_kind,
             )
-        elif isinstance(request_policy, Mapping):
+        elif empirical_calibration_bound:
             receipt = load_default_calibration_receipt()
             family = (
                 "horizon-scattering/v1"
@@ -1584,9 +1603,38 @@ def _validate_failed_preflight_attempt_request(
                 refinement=refinement_level,
                 empirical_control_profile=profile,
                 calibration_receipt=receipt,
-                diagnostic_model_identity=request_binding.get(
-                    "diagnostic_model_identity"
-                ),
+                diagnostic_model_identity=diagnostic_model_identity,
+            )._request(
+                leaf.job,
+                amplitude_value,
+                predictor_value,
+                predictor_kind,
+            )
+        elif isinstance(request_policy, Mapping):
+            # No ODE budget and no empirical calibration hashes: this is
+            # a default provisional-exterior or horizon binding.
+            # _precision_policy still refuses to run without either a
+            # budget or an authenticated calibration pair, so pass the
+            # default calibration profile+receipt to satisfy the shared
+            # numerical-controls path without adding empirical fields —
+            # the diagnostic identity keeps the policy provisional or
+            # horizon-shaped, and the receipt hashes stay off the wire
+            # exactly as they did in the historical binding.
+            receipt = load_default_calibration_receipt()
+            family = (
+                "horizon-scattering/v1"
+                if leaf.mechanism_id == "horizon-admittance"
+                else "exterior-wronskian/v1"
+            )
+            profile = receipt.budget_for(family, precision_digits)
+            expected_request = _CanonicalRequestJuliaPrecisionRootBackend(
+                leaf.job.backend_identity,
+                object(),
+                precision_digits,
+                refinement=refinement_level,
+                empirical_control_profile=profile,
+                calibration_receipt=receipt,
+                diagnostic_model_identity=diagnostic_model_identity,
             )._request(
                 leaf.job,
                 amplitude_value,

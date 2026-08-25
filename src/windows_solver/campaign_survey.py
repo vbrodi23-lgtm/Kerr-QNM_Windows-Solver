@@ -2173,45 +2173,16 @@ def run_promoted_survey(
 
         guarded(validate_binary64_disposition_binding)
 
+        # PR69 cache-first architecture: terminal-cache discovery and
+        # conflict detection precede the exterior provisional-stage
+        # requirement. If a promoted leaf already has an exact
+        # authenticated terminal record — from the checkpoint or the
+        # solved-leaf store — reuse it and skip backend, provisional
+        # lookup, and root work entirely. If two exact terminal sources
+        # disagree, that is a system failure before backend construction.
+        # The provisional-stage check only runs on a genuine cache miss,
+        # further down in the exterior branch.
         provisional_predecessor_receipt: Mapping[str, object] | None = None
-        if (
-            leaf.mechanism_id != "horizon-admittance"
-            and snapshot["queue_kind"] == PromotionQueueKind.RESPONSE.value
-            and snapshot.get("source_record_sha256") is None
-        ):
-            provisional_stage = guarded(
-                lambda: provisional_stage_lookup(leaf, snapshot)
-            )
-            if not isinstance(provisional_stage, Mapping):
-                guarded(
-                    lambda: (_ for _ in ()).throw(
-                        ValueError(
-                            "exterior RESPONSE promotion lacks a provisional stage"
-                        )
-                    )
-                )
-                raise AssertionError("missing provisional stage guard returned")
-            source_root_seal_sha256 = snapshot.get("source_root_seal_sha256")
-            if not isinstance(source_root_seal_sha256, str):
-                guarded(
-                    lambda: (_ for _ in ()).throw(
-                        ValueError(
-                            "exterior provisional promotion lacks a root seal"
-                        )
-                    )
-                )
-                raise AssertionError("missing provisional root guard returned")
-            provisional_predecessor_receipt = guarded(
-                lambda: consume_authenticated_binary64_provisional_predecessor(
-                    provisional_stage,
-                    job=leaf.job,
-                    scientific_computation_identity=(
-                        selection.scientific_identities[leaf_id]
-                    ),
-                    root_seal_sha256=source_root_seal_sha256,
-                )
-            )
-            assert isinstance(provisional_predecessor_receipt, Mapping)
 
         retained = existing_records.get(leaf_id)
         horizon_source_record = (
@@ -2383,6 +2354,51 @@ def run_promoted_survey(
                 ),
             )
         else:
+            # Cache-first: this branch is only reached on a genuine
+            # terminal-cache miss for exterior leaves. Only here does the
+            # exterior RESPONSE provisional-stage requirement apply.
+            if (
+                snapshot["queue_kind"] == PromotionQueueKind.RESPONSE.value
+                and snapshot.get("source_record_sha256") is None
+            ):
+                provisional_stage = guarded(
+                    lambda: provisional_stage_lookup(leaf, snapshot)
+                )
+                if not isinstance(provisional_stage, Mapping):
+                    guarded(
+                        lambda: (_ for _ in ()).throw(
+                            ValueError(
+                                "exterior RESPONSE promotion lacks a provisional stage"
+                            )
+                        )
+                    )
+                    raise AssertionError(
+                        "missing provisional stage guard returned"
+                    )
+                source_root_seal_sha256 = snapshot.get("source_root_seal_sha256")
+                if not isinstance(source_root_seal_sha256, str):
+                    guarded(
+                        lambda: (_ for _ in ()).throw(
+                            ValueError(
+                                "exterior provisional promotion lacks a root seal"
+                            )
+                        )
+                    )
+                    raise AssertionError(
+                        "missing provisional root guard returned"
+                    )
+                provisional_predecessor_receipt = guarded(
+                    lambda: consume_authenticated_binary64_provisional_predecessor(
+                        provisional_stage,
+                        job=leaf.job,
+                        scientific_computation_identity=(
+                            selection.scientific_identities[leaf_id]
+                        ),
+                        root_seal_sha256=source_root_seal_sha256,
+                    )
+                )
+                assert isinstance(provisional_predecessor_receipt, Mapping)
+
             def execute_exterior() -> PromotedPassOutcome:
                 recorder = TimingSessionRecorder(
                     log=operational_timing,
