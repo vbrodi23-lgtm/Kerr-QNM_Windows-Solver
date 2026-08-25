@@ -648,8 +648,9 @@ def run_binary64_survey(
 
     for leaf_id in selection.ordered_leaf_ids:
         leaf = leaves[leaf_id]
+        leaf_index = selection.ordered_leaf_ids.index(leaf_id) + 1
         leaf_context = {
-            "leaf_index": selection.ordered_leaf_ids.index(leaf_id) + 1,
+            "leaf_index": leaf_index,
             "leaf_count": len(selection.ordered_leaf_ids),
             "leaf_id": leaf_id,
             "role": leaf.role,
@@ -670,8 +671,84 @@ def run_binary64_survey(
             continue
         committed_before_leaf = result
         timing_recorder: TimingSessionRecorder | None = None
+
+        def append_binary64_structural_event(
+            event_kind: str,
+            *,
+            operation_identity: str | None,
+            disposition: str | None,
+            reason_code: str | None,
+            root_seal_sha256: str | None,
+            source_record_sha256: str | None,
+            source_stage_sha256: str | None,
+            provisional_stage_sha256: str | None,
+            post_commit: Mapping[str, object] | None,
+        ) -> None:
+            if diagnostic_session is None:
+                return
+            diagnostic_session.append(
+                event_kind,
+                leaf={
+                    "index": leaf_index,
+                    "count": len(selection.ordered_leaf_ids),
+                    "leaf_id": leaf_id,
+                    "role": leaf.role,
+                    "mode": "-".join(str(item) for item in leaf.leaf.mode),
+                    "exact_coordinate": leaf.job.sampling_coordinate.to_mapping(),
+                    "spin_display": str(leaf.job.spin),
+                    "mechanism": leaf.mechanism_id,
+                },
+                execution={
+                    "profile": "SURVEY",
+                    "pass": "binary64",
+                    "tier": "binary64",
+                    "operation_identity": operation_identity,
+                },
+                transition={
+                    "prior_state": "NOT_ATTEMPTED",
+                    "next_state": disposition,
+                    "reason_code": reason_code,
+                },
+                connections={
+                    "scientific_computation_identity": selection.scientific_identities[
+                        leaf_id
+                    ],
+                    "root_seal_sha256": root_seal_sha256,
+                    "source_record_sha256": source_record_sha256,
+                    "source_stage_sha256": source_stage_sha256,
+                    "provisional_stage_sha256": provisional_stage_sha256,
+                },
+                checkpoint={
+                    "pre_commit_sha256": hashlib.sha256(
+                        canonical_json_bytes(committed_before_leaf)
+                    ).hexdigest(),
+                    "post_commit_sha256": (
+                        None
+                        if post_commit is None
+                        else hashlib.sha256(
+                            canonical_json_bytes(post_commit)
+                        ).hexdigest()
+                    ),
+                },
+                compact_diagnostics={
+                    "julia_worker_launched": False,
+                },
+                durable=False,
+            )
+
         with progress_scope(**leaf_context):
             emit_progress(ProgressEventKind.LEAF_PASS_STARTED)
+        append_binary64_structural_event(
+            "BINARY64_LEAF_STARTED",
+            operation_identity=None,
+            disposition=None,
+            reason_code=None,
+            root_seal_sha256=None,
+            source_record_sha256=None,
+            source_stage_sha256=None,
+            provisional_stage_sha256=None,
+            post_commit=None,
+        )
 
         def guarded(action: Callable[[], object]) -> object:
             try:
@@ -776,6 +853,17 @@ def run_binary64_survey(
             assert isinstance(result, dict)
             reused += 1
             result = persist(result)
+            append_binary64_structural_event(
+                "BINARY64_LEAF_DISPOSITION_RECORDED",
+                operation_identity="solved-leaf-cache/v1",
+                disposition=SurveyDisposition.CACHE_REUSED.value,
+                reason_code="EXACT_AUTHENTICATED_CACHE_HIT",
+                root_seal_sha256=None,
+                source_record_sha256=retained["record_sha256"],
+                source_stage_sha256=None,
+                provisional_stage_sha256=None,
+                post_commit=result,
+            )
             with progress_scope(
                 leaf_id=leaf_id,
                 execution_profile="SURVEY",
@@ -1195,6 +1283,19 @@ def run_binary64_survey(
         )
         assert isinstance(result, dict)
         result = persist(result)
+        append_binary64_structural_event(
+            "BINARY64_LEAF_DISPOSITION_RECORDED",
+            operation_identity=outcome.operation_identity,
+            disposition=outcome.disposition.value,
+            reason_code=outcome.reason_code,
+            root_seal_sha256=root_seal_sha256,
+            source_record_sha256=(
+                None if outcome.record is None else outcome.record["record_sha256"]
+            ),
+            source_stage_sha256=outcome.stage_sha256,
+            provisional_stage_sha256=outcome.provisional_stage_sha256,
+            post_commit=result,
+        )
         if outcome.provisional_stage is not None:
             try:
                 provisional_stage_committed(leaf, outcome.provisional_stage)
