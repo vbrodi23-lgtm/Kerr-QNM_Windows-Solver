@@ -1,0 +1,19 @@
+{
+  "version": 2,
+  "taskplannerVersion": "2.1.1",
+  "readmeAttribution": true,
+  "idPrefix": "TASK",
+  "nextId": 80,
+  "states": {
+    "Backlog": "BACKLOG.md",
+    "Next": "NEXT.md",
+    "In Progress": "IN_PROGRESS.md",
+    "Done": "DONE.md",
+    "Rejected": "REJECTED.md"
+  },
+  "priorities": ["P0", "P1", "P2", "P3", "P4"],
+  "tags": ["M01", "M02", "M03", "M04", "M05", "M06", "M07", "M08", "M09", "M10", "M11", "M12", "architecture", "evidence", "physics", "provider", "validation", "release"],
+  "insertPosition": "top",
+  "aiPlanRequired": true,
+  "sortBy": "priority"
+}
