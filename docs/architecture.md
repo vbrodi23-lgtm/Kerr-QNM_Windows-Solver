@@ -46,19 +46,12 @@ When two sources disagree, use this order:
 1. machine-readable manifests, authenticated artifacts, checkpoint receipts, and identities emitted by the checked-out code;
 2. current production code and passing contract tests;
 3. `README.md`, this document, and the current operator runbooks;
-4. `.tasks/` for delivery state only;
-5. Git history for superseded decisions and provenance.
+4. Git history for superseded decisions and provenance.
 
 The release-domain authority is:
 
 ```text
 src/windows_solver/data/release_domain_manifest.json
-```
-
-Its human reconciliation is:
-
-```text
-docs/release-baseline.md
 ```
 
 Narrative documentation cannot silently widen the release domain, alter a scientific identity, or override authenticated machine-readable evidence.
@@ -134,7 +127,6 @@ No layer may silently absorb the responsibility of another layer.
 | `tests/` | Software, contract, migration, serialization, and regression tests |
 | `tools/` | Offline generation, validation, calibration, and explicitly diagnostic utilities |
 | `docs/` | Current architecture and current operator runbooks only |
-| `.tasks/` | Current delivery board only |
 
 The active documentation surface must not contain superseded implementation plans masquerading as current instructions.
 

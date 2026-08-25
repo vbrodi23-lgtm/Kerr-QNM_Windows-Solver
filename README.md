@@ -27,12 +27,6 @@ The machine-readable release authority is:
 src/windows_solver/data/release_domain_manifest.json
 ```
 
-The human reconciliation is:
-
-```text
-docs/release-baseline.md
-```
-
 Neither narrative documentation nor a successful campaign run may silently widen the admitted scientific scope.
 
 ---
@@ -395,7 +389,6 @@ examples/                  canonical study and campaign inputs
 tests/                     software, contract, migration, and regression tests
 tools/                     offline generation, validation, and diagnostic utilities
 docs/                      current architecture and operator runbooks only
-.tasks/                    current delivery board only
 ```
 
 Historical design plans, PR handovers, implementation scratch reports, and superseded architecture documents belong in Git history, not the active documentation surface.
@@ -404,38 +397,21 @@ Historical design plans, PR handovers, implementation scratch reports, and super
 
 ## Documentation authority
 
-Use the following order when documents disagree:
+Use the following order when sources disagree:
 
 1. machine-readable manifests, authenticated artifacts, checkpoint receipts, and emitted identities;
 2. current production code and passing contract tests;
 3. this README, `docs/architecture.md`, and the current operator runbooks;
-4. `.tasks/` for delivery state only;
-5. Git history for superseded decisions and provenance.
+4. Git history for superseded decisions and provenance.
 
 The active operator runbooks are:
 
 ```text
 docs/response-replay-powershell.md
 docs/evidence-intake-powershell.md
-docs/m02-admission-powershell.md
 ```
 
 A pull-request description, old implementation plan, dated handover, unchecked historical checkbox, or archived benchmark does not override current code or the authorities above.
-
-The delivery board has one live source:
-
-```text
-.tasks/IN_PROGRESS.md
-.tasks/NEXT.md
-.tasks/BACKLOG.md
-.tasks/DONE.md
-.tasks/REJECTED.md
-.tasks/WORK_LOG.md
-```
-
-Do not create a second backlog or treat historical plans as executable instructions.
-
----
 
 ## Development and verification
 
@@ -445,7 +421,6 @@ Run the permitted software suite from a source checkout:
 $env:PYTHONPATH = "src"
 python -m unittest discover -s tests -v
 python tools/validate_release_manifest.py
-python .tasks/validate_board.py
 ```
 
 These checks establish software, schema, migration, serialization, orchestration, and static worker contracts. They do not replace native mathematical evidence.

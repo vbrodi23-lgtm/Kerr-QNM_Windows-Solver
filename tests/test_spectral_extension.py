@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import csv
-from contextlib import redirect_stderr
 from dataclasses import replace
 from fractions import Fraction
 import hashlib
@@ -11,8 +10,6 @@ import io
 import json
 import math
 from pathlib import Path
-import shutil
-import tempfile
 import threading
 import unittest
 from unittest.mock import patch
@@ -723,67 +720,3 @@ class OverlayExecutionSmokeTests(unittest.TestCase):
                     },
                 )
 
-
-class TaskBoardRegressionTests(unittest.TestCase):
-    def test_idle_board_rejects_a_higher_same_priority_next_task(self) -> None:
-        """Equal-priority ready work is ordered deterministically by task ID."""
-
-        repository_root = Path(__file__).resolve().parents[1]
-        source_board = repository_root / ".tasks"
-        spec = importlib.util.spec_from_file_location(
-            "task_board_validator", source_board / "validate_board.py"
-        )
-        validator = importlib.util.module_from_spec(spec)
-        assert spec.loader is not None
-        spec.loader.exec_module(validator)
-
-        with tempfile.TemporaryDirectory() as temporary_directory:
-            board = Path(temporary_directory)
-            for path in source_board.iterdir():
-                if path.is_file():
-                    shutil.copy2(path, board / path.name)
-            config = json.loads(
-                (board / "config.json").read_text(encoding="utf-8")
-            )
-            for filename in config["states"].values():
-                state_path = board / filename
-                if not state_path.exists():
-                    state_path.write_text(
-                        f"# {state_path.stem}\n", encoding="utf-8"
-                    )
-            tasks = {
-                number: body
-                for state, filename in config["states"].items()
-                for _, number, _, body in validator.sections(
-                    (board / filename).read_text(encoding="utf-8")
-                )
-            }
-            task_seven = tasks.pop(7)
-            task_eight = tasks.pop(8).replace(
-                "- **Blocked by:** TASK-006, TASK-007",
-                "- **Blocked by:** TASK-006",
-            )
-            self.assertNotIn("TASK-007", task_eight)
-            (board / config["states"]["Done"]).write_text(
-                "# Done\n\n" + "\n".join(tasks.values()), encoding="utf-8"
-            )
-            (board / config["states"]["Backlog"]).write_text(
-                "# Backlog\n\n" + task_seven, encoding="utf-8"
-            )
-            (board / config["states"]["Next"]).write_text(
-                "# Next\n\n" + task_eight, encoding="utf-8"
-            )
-            (board / config["states"]["In Progress"]).write_text(
-                "# In Progress\n", encoding="utf-8"
-            )
-            (board / config["states"]["Rejected"]).write_text(
-                "# Rejected\n", encoding="utf-8"
-            )
-
-            validator.ROOT = board
-            stderr = io.StringIO()
-            with redirect_stderr(stderr):
-                result = validator.main()
-
-        self.assertEqual(result, 1)
-        self.assertIn("lowest task ID", stderr.getvalue())
