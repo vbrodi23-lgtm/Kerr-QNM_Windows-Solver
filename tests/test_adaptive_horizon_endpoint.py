@@ -120,7 +120,7 @@ class AdaptiveHorizonEndpointStaticTests(unittest.TestCase):
         self.assertIn(
             '"horizon_endpoint_search_evidence"', result_fields
         )
-        self.assertIn('"schema_version" => 10', result_fields)
+        self.assertIn('"schema_version" => 11', result_fields)
 
     def test_search_floor_and_real_inner_contour_share_one_signed_policy_bound(self) -> None:
         controls = horizon_geometry_controls()

@@ -1240,10 +1240,17 @@ class CampaignProgressReporterTests(unittest.TestCase):
 
         output = stream.getvalue()
         self.assertIn("M02 | DASHBOARD", output)
-        self.assertIn("TIME  LEAF", output)
-        self.assertEqual(output.count("leaf-1   "), 1)
-        self.assertIn("horizon-~", output)
-        self.assertIn("PRODUC~", output)
+        self.assertIn("LEAF", output)
+        self.assertIn("MODE", output)
+        # Human ordinal (1/553) replaces the SHA-form leaf id.
+        row_starts = [
+            line for line in output.splitlines() if line and line[0].isdigit()
+        ]
+        self.assertEqual(1, len(row_starts))
+        self.assertTrue(row_starts[0].startswith("1/553"))
+        self.assertIn("horizon", output)
+        self.assertNotIn("horizon-~", output)
+        self.assertNotIn("PRODUC~", output)
         self.assertNotIn("\x1b[", output)
 
     def test_published_receipts_increase_the_visible_cache_total(self):
@@ -1284,6 +1291,7 @@ class CampaignProgressReporterTests(unittest.TestCase):
         )
 
         latest_panel = stream.getvalue()
+        # Cache stats surface in the live counts suffix.
         self.assertIn("cache:12", latest_panel)
         self.assertNotIn("\x1b[", latest_panel)
 
@@ -1358,12 +1366,16 @@ class CampaignProgressReporterTests(unittest.TestCase):
 
         latest_panel = stream.getvalue()
         self.assertIn("M02 | DASHBOARD", latest_panel)
-        self.assertIn("leaf-ac~", latest_panel)
-        self.assertIn("horizon-~", latest_panel)
-        self.assertIn("ORDER_R~", latest_panel)
+        # SHA-form leaf id belongs in logs, not the human dashboard row.
+        self.assertNotIn("leaf-ac~", latest_panel)
+        # Mechanism short name replaces the mutilated form.
+        self.assertIn("horizon", latest_panel)
+        self.assertNotIn("horizon-~", latest_panel)
+        # Full evidence and state words replace ORDER_R~/PRODUC~ truncations.
+        self.assertIn("ORDER_RESOLVED", latest_panel)
         self.assertIn("1.346", latest_panel)
         self.assertIn("1.486e-08", latest_panel)
-        self.assertIn("PRODUC~", latest_panel)
+        self.assertNotIn("PRODUC~", latest_panel)
 
         status = json.loads(
             Path(f"{self.reporter_checkpoint}.status.json").read_text(
@@ -1516,8 +1528,13 @@ class CampaignProgressReporterTests(unittest.TestCase):
         output = stream.getvalue()
         self.assertTrue(output.startswith(history + "=" * 108))
         self.assertNotIn("\x1b[", output)
-        self.assertEqual(output.count("leaf-1   "), 1)
-        self.assertIn("PRODUC~", output)
+        row_starts = [
+            line for line in output.splitlines() if line and line[0].isdigit()
+        ]
+        self.assertEqual(1, len(row_starts))
+        self.assertTrue(row_starts[0].startswith("1/1"))
+        self.assertIn("PRODUCED", output)
+        self.assertNotIn("PRODUC~", output)
 
     def test_normal_console_compacts_without_active_solver_noise(self):
         class ConsoleStream(io.StringIO):
@@ -1563,11 +1580,14 @@ class CampaignProgressReporterTests(unittest.TestCase):
             )
 
         output = stream.getvalue()
-        self.assertTrue(output.startswith(history + "=" * 79 + "…"))
+        # New banner uses the actual terminal width (80), no clip needed.
+        self.assertTrue(output.startswith(history + "=" * 80))
         self.assertNotIn("\x1b[", output)
         self.assertIn("M02 | DASHBOARD", output)
-        self.assertIn("leaf-1", output)
-        self.assertIn("UNRESO~", output)
+        # Ordinal replaces the SHA leaf id in the row.
+        self.assertIn("1/553", output)
+        self.assertIn("UNRESOLVED", output)
+        self.assertNotIn("UNRESO~", output)
 
     def test_partial_campaign_dashboard_keeps_outcome_counts_neutral(self):
         class ConsoleStream(io.StringIO):
@@ -1596,10 +1616,11 @@ class CampaignProgressReporterTests(unittest.TestCase):
         )
 
         latest_panel = stream.getvalue()
-        self.assertIn("COMPLETED=0", latest_panel)
-        self.assertIn("REJECTED=0", latest_panel)
-        self.assertIn("UNRESOLVED=0", latest_panel)
-        self.assertIn("FAILED=0", latest_panel)
+        # New human-readable outcome-counts phrasing.
+        self.assertIn("DONE 0", latest_panel)
+        self.assertIn("REJECTED 0", latest_panel)
+        self.assertIn("UNRESOLVED 0", latest_panel)
+        self.assertIn("FAILED 0", latest_panel)
 
     def test_completed_leaf_status_retains_rolling_eta_telemetry(self):
         class ConsoleStream(io.StringIO):
@@ -1732,8 +1753,9 @@ class CampaignProgressReporterTests(unittest.TestCase):
         )
 
         latest_panel = stream.getvalue()
-        self.assertIn("leaf-1", latest_panel)
-        self.assertIn("PRODUC~", latest_panel)
+        self.assertIn("1/553", latest_panel)
+        self.assertIn("PRODUCED", latest_panel)
+        self.assertNotIn("PRODUC~", latest_panel)
         self.assertNotIn("\x1b[", latest_panel)
 
         reporter.publish(
@@ -1746,8 +1768,9 @@ class CampaignProgressReporterTests(unittest.TestCase):
             )
         )
         reused_panel = stream.getvalue()
-        self.assertIn("leaf-2", reused_panel)
-        self.assertIn("UNRESO~", reused_panel)
+        self.assertIn("2/553", reused_panel)
+        self.assertIn("UNRESOLVED", reused_panel)
+        self.assertNotIn("UNRESO~", reused_panel)
         self.assertIn("done:2", reused_panel)
         self.assertIn("unres:1", reused_panel)
 
@@ -1761,7 +1784,7 @@ class CampaignProgressReporterTests(unittest.TestCase):
             )
         )
         failed_panel = stream.getvalue()
-        self.assertIn("leaf-3", failed_panel)
+        self.assertIn("3/553", failed_panel)
         self.assertIn("FAILED", failed_panel)
         self.assertIn("done:3", failed_panel)
         self.assertIn("fail:1", failed_panel)

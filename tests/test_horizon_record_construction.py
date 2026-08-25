@@ -59,6 +59,7 @@ from windows_solver.response_engine import (
     DecimalComplex,
     run_promoted_horizon_component,
 )
+from windows_solver.root_evidence import AuthenticatedRootEvidence
 
 
 def _sha256(value: object) -> str:
@@ -70,6 +71,16 @@ def _plan():
         policy=NumericalPolicy(),
         backend_identity=VettedNativeDeterminantKernel.identity,
         precision_capabilities=PrecisionCapabilities((64, 80)),
+    )
+
+
+def _root_evidence(leaf):
+    return AuthenticatedRootEvidence.from_authenticated_disk(
+        leaf,
+        fixed_root=leaf.job.root.omega,
+        root_uncertainty_radius=1.0e-9,
+        source_receipt_sha256="b" * 64,
+        evidence_level="SCREENED",
     )
 
 
@@ -107,12 +118,23 @@ def _binary64_horizon_outcome(plan, leaf) -> StageOutcome:
     class Kernel:
         identity = VettedNativeDeterminantKernel.identity
 
-        def horizon_partials(self, **_kwargs):
+        def horizon_partials(self, **kwargs):
+            job = kwargs["job"]
+            omega_h = job.spin / (2.0 * (1.0 + (1.0 - job.spin * job.spin) ** 0.5))
+            p_h = job.root.omega - job.mode.m * omega_h
+            coordinate = -0.5 + 0.1j
+            d_h = coordinate * (2.0j * p_h)
             return DeterminantPartials(
                 frequency_derivative=1.0 + 0.25j,
-                coordinate_derivative=-0.5 + 0.1j,
+                coordinate_derivative=coordinate,
                 simple_root_valid=True,
                 frequency_derivative_error_abs=1.0e-12,
+                dD_dR=d_h,
+                dD_dR_error_abs=1.0e-12,
+                dR_ddeltaB=1.0 / (2.0j * p_h),
+                dD_ddeltaB=coordinate,
+                dD_domega=1.0 + 0.25j,
+                dD_domega_error_abs=1.0e-12,
             )
 
         def evaluate_root(self, **_kwargs):
@@ -129,7 +151,7 @@ def _binary64_horizon_outcome(plan, leaf) -> StageOutcome:
             parameter_pairs=(),
         ),
     )
-    return backend.execute_horizon_stage(leaf)
+    return backend.execute_horizon_stage(leaf, root_evidence=_root_evidence(leaf))
 
 
 class HorizonRecordConstructionTests(unittest.TestCase):
@@ -195,7 +217,7 @@ class HorizonRecordConstructionTests(unittest.TestCase):
         stage, _stage_sha256 = build_schema11_horizon_stage(
             outcome,
             precision_tier="binary64",
-            operation_identity="test-binary64-horizon/v1",
+            operation_identity="binary64-horizon-production/v3",
         )
         record = build_schema11_horizon_record(
             plan,
@@ -242,7 +264,7 @@ class HorizonRecordConstructionTests(unittest.TestCase):
         stage, _stage_sha256 = build_schema11_horizon_stage(
             outcome,
             precision_tier="binary64",
-            operation_identity="test-binary64-horizon/v1",
+            operation_identity="binary64-horizon-production/v3",
         )
         record = build_schema11_horizon_record(
             plan,
@@ -439,7 +461,7 @@ class HorizonRecordConstructionTests(unittest.TestCase):
         stage, _stage_sha256 = build_schema11_horizon_stage(
             outcome,
             precision_tier="binary64",
-            operation_identity="test-binary64-horizon/v1",
+            operation_identity="binary64-horizon-production/v3",
         )
         record = build_schema11_horizon_record(
             plan,
@@ -499,18 +521,21 @@ class HorizonRecordConstructionTests(unittest.TestCase):
             identity = VettedNativeDeterminantKernel.identity
 
             def horizon_partials(self, **_kwargs):
+                d_omega = 1.0 / (
+                    2.0j * horizon_frequency * promoted_result.response
+                )
+                d_h = -1.0 + 0.0j
                 return DeterminantPartials(
-                    frequency_derivative=(
-                        1.0
-                        / (
-                            2.0j
-                            * horizon_frequency
-                            * promoted_result.response
-                        )
-                    ),
-                    coordinate_derivative=0.0j,
+                    frequency_derivative=d_omega,
+                    coordinate_derivative=d_h / (2.0j * horizon_frequency),
                     simple_root_valid=True,
                     frequency_derivative_error_abs=1.0e-12,
+                    dD_dR=d_h,
+                    dD_dR_error_abs=1.0e-12,
+                    dR_ddeltaB=1.0 / (2.0j * horizon_frequency),
+                    dD_ddeltaB=d_h / (2.0j * horizon_frequency),
+                    dD_domega=d_omega,
+                    dD_domega_error_abs=1.0e-12,
                 )
 
         backend = NativeCampaignStageBackend(
@@ -524,13 +549,13 @@ class HorizonRecordConstructionTests(unittest.TestCase):
             ),
         )
         binary_outcome = replace(
-            backend.execute_horizon_stage(leaf),
+            backend.execute_horizon_stage(leaf, root_evidence=_root_evidence(leaf)),
             deep_diagnostics=_triggering_diagnostics(),
         )
         source_stage, source_stage_sha256 = build_schema11_horizon_stage(
             binary_outcome,
             precision_tier="binary64",
-            operation_identity="test-binary64-horizon/v1",
+            operation_identity="binary64-horizon-production/v3",
         )
         source_record = build_schema11_horizon_record(
             plan,
@@ -716,7 +741,7 @@ class HorizonRecordConstructionTests(unittest.TestCase):
         stage, _stage_sha256 = build_schema11_horizon_stage(
             outcome,
             precision_tier="binary64",
-            operation_identity="test-binary64-horizon/v1",
+            operation_identity="binary64-horizon-production/v3",
         )
         mismatched_payload = {
             **payload,
@@ -781,7 +806,7 @@ class HorizonRecordConstructionTests(unittest.TestCase):
             generated,
         )
 
-        outcome = backend.execute_horizon_stage(leaf)
+        outcome = backend.execute_horizon_stage(leaf, root_evidence=_root_evidence(leaf))
         raw = outcome.component_result["result"]
         self.assertEqual(64, outcome.digits)
         self.assertEqual(1, kernel.partial_calls)
@@ -821,7 +846,7 @@ class HorizonRecordConstructionTests(unittest.TestCase):
                 parameter_pairs=(),
             ),
         )
-        outcome = backend.execute_horizon_stage(leaf)
+        outcome = backend.execute_horizon_stage(leaf, root_evidence=_root_evidence(leaf))
 
         self.assertEqual("DERIVATIVE_UNRESOLVED", outcome.numerical_state)
         self.assertIsNone(outcome.component_result["result"]["response"])
@@ -893,7 +918,7 @@ class HorizonRecordConstructionTests(unittest.TestCase):
         stage, stage_sha256 = build_schema11_horizon_stage(
             stage_outcome,
             precision_tier="binary64",
-            operation_identity="test-binary64-horizon/v1",
+            operation_identity="binary64-horizon-production/v3",
         )
         response_disk = stage["response_disk"]
         assert isinstance(response_disk, dict)
@@ -947,6 +972,12 @@ class HorizonRecordConstructionTests(unittest.TestCase):
                 checkpoint,
                 checkpoint_path=Path(temporary) / "checkpoint.json",
                 root_seal_lookup=lambda _leaf, _entry: None,
+                provisional_stage_lookup=lambda _leaf, entry: entry[
+                    "provisional_stage"
+                ],
+                root_seal_publish=lambda *_args: self.fail(
+                    "horizon promotion must not publish a root"
+                ),
                 backend_factory=lambda _leaf, _digits: None,
                 primary_root_runner=lambda *_args: self.fail(
                     "unexpected promoted root"
@@ -994,7 +1025,7 @@ class HorizonRecordConstructionTests(unittest.TestCase):
         stage, stage_sha256 = build_schema11_horizon_stage(
             stage_outcome,
             precision_tier="binary64",
-            operation_identity="test-binary64-horizon/v1",
+            operation_identity="binary64-horizon-production/v3",
         )
         response_disk = stage["response_disk"]
         assert isinstance(response_disk, dict)
@@ -1014,7 +1045,7 @@ class HorizonRecordConstructionTests(unittest.TestCase):
             survey_pass=SurveyPass.BINARY64,
             leaf_id=leaf.leaf_id,
             disposition=SurveyDisposition.PROMOTION_PENDING_RESPONSE,
-            operation_identity="test-binary64-horizon/v1",
+            operation_identity="binary64-horizon-production/v3",
             precision_tiers=("binary64",),
             reason_code="FIXED_PRECISION_SENTINEL_PROMOTION",
             sample_count=0,
@@ -1061,6 +1092,12 @@ class HorizonRecordConstructionTests(unittest.TestCase):
                     checkpoint,
                     checkpoint_path=Path(temporary) / "checkpoint.json",
                     root_seal_lookup=lambda _leaf, _entry: None,
+                    provisional_stage_lookup=lambda _leaf, entry: entry[
+                        "provisional_stage"
+                    ],
+                    root_seal_publish=lambda *_args: self.fail(
+                        "horizon promotion must not publish a root"
+                    ),
                     backend_factory=lambda _leaf, _digits: None,
                     primary_root_runner=lambda *_args: self.fail(
                         "unexpected promoted root"
@@ -1087,7 +1124,7 @@ class HorizonRecordConstructionTests(unittest.TestCase):
         stage, stage_sha256 = build_schema11_horizon_stage(
             stage_outcome,
             precision_tier="binary64",
-            operation_identity="test-binary64-horizon/v1",
+            operation_identity="binary64-horizon-production/v3",
         )
         response_disk = stage["response_disk"]
         assert isinstance(response_disk, dict)
@@ -1142,7 +1179,7 @@ class HorizonRecordConstructionTests(unittest.TestCase):
         stage, stage_sha256 = build_schema11_horizon_stage(
             stage_outcome,
             precision_tier="binary64",
-            operation_identity="test-binary64-horizon/v1",
+            operation_identity="binary64-horizon-production/v3",
         )
         response_disk = stage["response_disk"]
         assert isinstance(response_disk, dict)
@@ -1197,7 +1234,7 @@ class HorizonRecordConstructionTests(unittest.TestCase):
 
         self.assertIsNone(outcome.record)
         self.assertEqual(record["record_sha256"], outcome.source_record_sha256)
-        self.assertEqual("COMPLETED", outcome.disposition.value)
+        self.assertEqual("UNRESOLVED", outcome.disposition.value)
         self.assertEqual(1, len(outcome.evidence_receipts))
         self.assertEqual(
             record["record_sha256"],

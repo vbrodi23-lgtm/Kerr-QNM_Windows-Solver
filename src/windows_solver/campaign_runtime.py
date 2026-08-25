@@ -28,6 +28,10 @@ from .campaign_policy import (
     validate_schema11_checkpoint,
 )
 from .campaign_recovery import RecoverySelection
+from .campaign_record_intake import (
+    assess_campaign_record_for_current_runtime,
+    emit_forensic_record_excluded,
+)
 from .campaign_reports import (
     refresh_schema11_reports,
     write_schema11_projective,
@@ -44,6 +48,7 @@ from .campaign_survey import (
     run_promoted_survey,
 )
 from .contracts import canonical_json_bytes
+from .structural_diagnostics import StructuralDiagnosticSession
 from .gsn_cache_producer import (
     load_generated_gsn_cache,
     parameter_pairs_for_selection,
@@ -74,12 +79,17 @@ from .response_engine import (
     Binary64FixedRootBatch,
     Binary64FixedRootScreening,
     Binary64SurveyDisposition,
+    BINARY64_HORIZON_OPERATION_V3,
     ComponentStatus,
     ComponentResult,
+    EXTERIOR_PROVISIONAL_STAGE_SCHEMA,
     NativeDeterminantAdapter,
     PromotedRootSeal,
+    raw_determinant_contract_from_request,
+    _validate_current_raw_determinant_policy,
     root_readout_preserves_authenticated_branch,
     run_promoted_horizon_component,
+    validate_exterior_provisional_stage,
 )
 from .julia_response_backend import (
     JuliaPrecisionRootBackend,
@@ -91,7 +101,8 @@ from .julia_response_backend import (
     _validated_execution_resource_policy,
 )
 from .promoted_control_calibration import load_default_calibration_receipt
-from .root_readout_cache import RootReadoutStore
+from .root_evidence import AuthenticatedRootEvidence, RootDependencyKey
+from .root_readout_cache import RootEvidenceStore, RootReadoutStore
 from .reviewed_determinant_error import ReviewedDeterminantErrorStore
 from .background_evidence_store import CanonicalBackgroundEvidenceStore
 from .solved_leaf_cache import SolvedLeafLookupStatus, SolvedLeafStore
@@ -182,6 +193,23 @@ def build_schema11_horizon_record(
         ),
         "stages": [dict(stage) for stage in stages],
     }
+    terminal_stage = stages[-1] if stages else None
+    if (
+        isinstance(terminal_stage, Mapping)
+        and terminal_stage.get("operation_identity")
+        == "binary64-horizon-production/v3"
+    ):
+        payload = terminal_stage.get("component_result")
+        raw_result = payload.get("result") if isinstance(payload, Mapping) else None
+        evidence = (
+            raw_result.get("analytic_horizon_evidence")
+            if isinstance(raw_result, Mapping)
+            else None
+        )
+        mathematics = evidence.get("mathematics") if isinstance(evidence, Mapping) else None
+        if not isinstance(mathematics, Mapping):
+            raise ValueError("v3 horizon record lacks mathematical policy")
+        content["horizon_mathematics"] = dict(mathematics)
     record = {**content, "record_sha256": _sha256(content)}
     validate_schema11_horizon_record(plan, leaf, record)
     return record
@@ -257,6 +285,61 @@ def _promotion_bound_source_record_sha256(
             )
         )
     }
+
+
+def _publish_admissible_checkpoint_records(
+    plan: object,
+    recovery_selection: RecoverySelection,
+    checkpoint: Mapping[str, object],
+    store: SolvedLeafStore,
+    *,
+    source_path: Path,
+    diagnostic_session: StructuralDiagnosticSession | None,
+) -> None:
+    """Publish only centrally classified current terminal response records."""
+
+    authenticated = validate_schema11_checkpoint(checkpoint)
+    promotion_bound = _promotion_bound_source_record_sha256(authenticated, plan)
+    checkpoint_records = {
+        str(item["leaf_id"]): item
+        for item in authenticated["records"]
+        if isinstance(item, Mapping)
+    }
+    for leaf_id in recovery_selection.ordered_leaf_ids:
+        record = checkpoint_records.get(leaf_id)
+        if record is None:
+            continue
+        intake = assess_campaign_record_for_current_runtime(plan, leaf_id, record)
+        if not intake.response_admissible:
+            if intake.forensic_only:
+                emit_forensic_record_excluded(
+                    diagnostic_session,
+                    intake,
+                    leaf_id=leaf_id,
+                    source_kind="checkpoint-to-solved-store",
+                    source_path=source_path,
+                    stale_cache_hit_prevented=False,
+                )
+            continue
+        if (
+            record.get("state") != "PRODUCED"
+            or record.get("record_sha256") in promotion_bound
+        ):
+            continue
+        lookup = store.publish_if_missing(
+            scientific_identity_sha256=(
+                recovery_selection.scientific_identities[leaf_id]
+            ),
+            leaf_id=leaf_id,
+            record=intake.record,
+            source_type="imported-authenticated-checkpoint",
+        )
+        if lookup.status is not SolvedLeafLookupStatus.HIT or lookup.receipt is None:
+            raise ValueError("checkpoint terminal publication was not exact")
+        # An existing, separately authenticated record for the same current
+        # identity is left in place. The scheduler owns exact source-conflict
+        # classification and turns disagreement into its durable system
+        # failure rather than letting checkpoint reconciliation overwrite it.
 
 
 def _is_sha256(value: object) -> bool:
@@ -670,6 +753,16 @@ def _cached_readout_backend(source: object, request: Mapping[str, object]):
         or not isinstance(policy, Mapping)
     ):
         raise ValueError("cached root-readout request precision is invalid")
+    diagnostic_model_identity = request.get("diagnostic_model_identity")
+    current_contract = None
+    if diagnostic_model_identity is not None:
+        try:
+            current_contract = raw_determinant_contract_from_request(request)
+            _validate_current_raw_determinant_policy(request, current_contract)
+        except ValueError as error:
+            raise ValueError(
+                "cached root-readout diagnostic contract is invalid"
+            ) from error
     budget = _ode_error_budget_from_mapping(policy.get("ode_error_budget"))
     if budget is not None:
         return JuliaPrecisionRootBackend(
@@ -678,6 +771,7 @@ def _cached_readout_backend(source: object, request: Mapping[str, object]):
             digits,
             refinement=refinement,
             ode_error_budget=budget,
+            diagnostic_model_identity=diagnostic_model_identity,
         )
     receipt = load_default_calibration_receipt()
     family = (
@@ -686,7 +780,7 @@ def _cached_readout_backend(source: object, request: Mapping[str, object]):
         else "exterior-wronskian/v1"
     )
     profile = receipt.budget_for(family, digits)
-    if (
+    if current_contract is None and (
         policy.get("promoted_control_calibration_receipt_sha256")
         != receipt.sha256
         or policy.get("empirical_control_profile_sha256")
@@ -700,6 +794,7 @@ def _cached_readout_backend(source: object, request: Mapping[str, object]):
         refinement=refinement,
         empirical_control_profile=profile,
         calibration_receipt=receipt,
+        diagnostic_model_identity=diagnostic_model_identity,
     )
 
 
@@ -891,11 +986,14 @@ class _RootSealCandidate:
     seal: AuthenticatedRootSeal
     source_kind: str
     promoted_root_seal: PromotedRootSeal | None = None
+    root_evidence: AuthenticatedRootEvidence | None = None
 
 
 def _root_solving_identity_compatible(source: object, target: object) -> bool:
     return (
         source.job.root.to_mapping() == target.job.root.to_mapping()
+        and source.leaf.mode == target.leaf.mode
+        and source.job.spin == target.job.spin
         and source.job.policy.identity_sha256 == target.job.policy.identity_sha256
         and source.job.backend_identity.identity_sha256
         == target.job.backend_identity.identity_sha256
@@ -914,12 +1012,15 @@ class AuthenticatedRootSealProvider:
         selection: object,
         checkpoint: Mapping[str, object],
         solved_leaf_store: SolvedLeafStore,
+        root_evidence_store: RootEvidenceStore,
+        diagnostic_session: StructuralDiagnosticSession | None = None,
     ) -> None:
         self._leaf_by_id = {leaf.leaf_id: leaf for leaf in plan.leaves}
         self._checkpoint: list[_RootSealCandidate] = []
         self._solved: list[_RootSealCandidate] = []
         self._readouts: list[_RootSealCandidate] = []
         self._published: list[_RootSealCandidate] = []
+        self._root_evidence_store = root_evidence_store
         self.lookup_count = 0
         self.hit_count = 0
 
@@ -927,10 +1028,42 @@ class AuthenticatedRootSealProvider:
         for record in authenticated_checkpoint["records"]:
             if not isinstance(record, Mapping):
                 continue
-            source = self._leaf_by_id.get(record.get("leaf_id"))
-            if source is None:
+            leaf_id = record.get("leaf_id")
+            if not isinstance(leaf_id, str):
+                raise ValueError("checkpoint record leaf identity is invalid")
+            intake = assess_campaign_record_for_current_runtime(
+                plan, leaf_id, record
+            )
+            source = self._leaf_by_id[leaf_id]
+            if not intake.response_admissible:
+                if intake.forensic_only:
+                    emit_forensic_record_excluded(
+                        diagnostic_session,
+                        intake,
+                        leaf_id=source.leaf_id,
+                        source_kind="checkpoint-forensic-root-seed",
+                        source_path=(
+                            "in-memory-checkpoint"
+                            if diagnostic_session is None
+                            else diagnostic_session.checkpoint_path
+                        ),
+                        stale_cache_hit_prevented=False,
+                    )
+                    if intake.root_seed is not None:
+                        seed = intake.root_seed
+                        self._checkpoint.append(
+                            _RootSealCandidate(
+                                source,
+                                AuthenticatedRootSeal(
+                                    fixed_root=seed.fixed_root,
+                                    branch_identity=seed.branch_identity,
+                                    root_seal_sha256=seed.root_seal_sha256,
+                                ),
+                                "checkpoint-forensic-root-seed",
+                                root_evidence=seed,
+                            )
+                        )
                 continue
-            validate_campaign_recovery_record(plan, source.leaf_id, record)
             seal = _old_record_root_seal(record) or _new_record_root_seal(record)
             if seal is not None:
                 self._checkpoint.append(
@@ -948,14 +1081,48 @@ class AuthenticatedRootSealProvider:
                     f"trusted solved-leaf cache receipt is corrupt: {lookup.path}: "
                     f"{lookup.reason}"
                 )
-            if lookup.status is not SolvedLeafLookupStatus.HIT:
+            if lookup.status not in {
+                SolvedLeafLookupStatus.HIT,
+                SolvedLeafLookupStatus.STALE,
+            }:
                 continue
             if lookup.receipt is None or not isinstance(
                 lookup.receipt.get("record"), Mapping
             ):
-                raise ValueError("solved-leaf cache hit lacks a valid record")
+                raise ValueError("solved-leaf cache result lacks a valid record")
             record = lookup.receipt["record"]
-            validate_campaign_recovery_record(plan, leaf_id, record)
+            intake = assess_campaign_record_for_current_runtime(plan, leaf_id, record)
+            if not intake.response_admissible:
+                if intake.forensic_only:
+                    emit_forensic_record_excluded(
+                        diagnostic_session,
+                        intake,
+                        leaf_id=leaf_id,
+                        source_kind="solved-leaf-forensic-root-seed",
+                        source_path=(
+                            "solved-leaf-store"
+                            if lookup.path is None
+                            else lookup.path
+                        ),
+                        stale_cache_hit_prevented=False,
+                    )
+                    if intake.root_seed is not None:
+                        seed = intake.root_seed
+                        self._solved.append(
+                            _RootSealCandidate(
+                                source,
+                                AuthenticatedRootSeal(
+                                    fixed_root=seed.fixed_root,
+                                    branch_identity=seed.branch_identity,
+                                    root_seal_sha256=seed.root_seal_sha256,
+                                ),
+                                "solved-leaf-forensic-root-seed",
+                                root_evidence=seed,
+                            )
+                        )
+                continue
+            if lookup.status is not SolvedLeafLookupStatus.HIT:
+                continue
             seal = _old_record_root_seal(record) or _new_record_root_seal(record)
             if seal is not None:
                 self._solved.append(
@@ -1013,17 +1180,68 @@ class AuthenticatedRootSealProvider:
             (
                 item.seal.fixed_root,
                 item.seal.branch_identity,
-                item.seal.root_seal_sha256,
             )
             for item in all_candidates
         }
         if len(identities) > 1:
             raise ValueError("SYSTEM_FAILURE ROOT_SEAL_CONFLICT")
+        key = RootDependencyKey.from_leaf(leaf)
+        persisted = self._root_evidence_store.lookup(key)
+        if persisted is not None:
+            persisted.validate_for(leaf)
+            durable = AuthenticatedRootSeal(
+                fixed_root=persisted.fixed_root,
+                branch_identity=persisted.branch_identity,
+                root_seal_sha256=persisted.root_seal_sha256,
+            )
+            if identities and next(iter(identities)) != (
+                durable.fixed_root,
+                durable.branch_identity,
+            ):
+                raise ValueError("SYSTEM_FAILURE ROOT_SEAL_CONFLICT")
+            self.hit_count += 1
+            return durable
         for group in compatible_groups:
             if group:
+                candidate = group[0]
+                source = candidate.seal
+                evidence = candidate.root_evidence
+                if evidence is None:
+                    evidence = AuthenticatedRootEvidence.from_seal(
+                        leaf,
+                        fixed_root=source.fixed_root,
+                        branch_identity=source.branch_identity,
+                        source_receipt_sha256=source.root_seal_sha256,
+                    )
+                else:
+                    evidence.validate_for(leaf)
+                self._root_evidence_store.publish(evidence)
                 self.hit_count += 1
-                return group[0].seal
-        return None
+                return AuthenticatedRootSeal(
+                    fixed_root=evidence.fixed_root,
+                    branch_identity=evidence.branch_identity,
+                    root_seal_sha256=evidence.root_seal_sha256,
+                )
+        evidence = AuthenticatedRootEvidence.from_bound_leaf(leaf)
+        self._root_evidence_store.publish(evidence)
+        return AuthenticatedRootSeal(
+            fixed_root=evidence.fixed_root,
+            branch_identity=evidence.branch_identity,
+            root_seal_sha256=evidence.root_seal_sha256,
+        )
+
+    def evidence_for(self, leaf: object) -> AuthenticatedRootEvidence:
+        """Return the durable root object consumed by the v3 horizon adapter."""
+
+        key = RootDependencyKey.from_leaf(leaf)
+        evidence = self._root_evidence_store.lookup(key)
+        if evidence is None:
+            self.lookup(leaf)
+            evidence = self._root_evidence_store.lookup(key)
+        if evidence is None:
+            raise ValueError("ROOT_SEAL_UNAVAILABLE")
+        evidence.validate_for(leaf)
+        return evidence
 
     def publish(self, leaf: object, seal: AuthenticatedRootSeal) -> None:
         """Make a newly authenticated PRIMARY root visible in the same pass."""
@@ -1039,7 +1257,11 @@ class AuthenticatedRootSealProvider:
         except BaseException:
             self._published.pop()
             raise
-        if resolved != seal:
+        if (
+            resolved is None
+            or resolved.fixed_root != seal.fixed_root
+            or resolved.branch_identity != seal.branch_identity
+        ):
             self._published.pop()
             raise ValueError("SYSTEM_FAILURE ROOT_SEAL_CONFLICT")
 
@@ -1048,16 +1270,18 @@ def _horizon_outcome(
     plan: object,
     backend: NativeCampaignStageBackend,
     leaf: object,
+    *,
+    root_evidence: AuthenticatedRootEvidence,
 ) -> Binary64PassOutcome:
     # Horizon work has its own fixed-root analytic boundary.  Calling the
     # generic stage runner here would silently reintroduce the finite-
     # amplitude epsilon ladder and its signed-root diagnostics.
-    outcome = backend.execute_horizon_stage(leaf)
+    outcome = backend.execute_horizon_stage(leaf, root_evidence=root_evidence)
     raw = outcome.component_result.get("result")
     result = ComponentResult.from_mapping(raw) if isinstance(raw, Mapping) else None
     if result is None:
         raise ValueError("SYSTEM_FAILURE binary64 horizon component result is missing")
-    operation_identity = "binary64-horizon-production/v2"
+    operation_identity = BINARY64_HORIZON_OPERATION_V3
     if result.response is not None and result.status.value == "CONVERGED":
         stage, stage_sha256 = build_schema11_horizon_stage(
             outcome,
@@ -1097,12 +1321,12 @@ def _horizon_outcome(
             operation_identity=operation_identity,
             reason_code="BOUNDED_HORIZON_RESPONSE",
         )
-    code = _typed_horizon_failure_code(result)
+    code = _typed_horizon_failure_code(result, binary64=True)
     decision = classify_failure(FailureReport(
         failure_code=code,
         failure_class="HORIZON_COMPONENT",
         stage="binary64-horizon",
-        worker_operation="binary64-horizon-production/v2",
+        worker_operation=BINARY64_HORIZON_OPERATION_V3,
         request_schema="windows-solver.response-component-job/1",
         backend_identity=leaf.job.backend_identity.identity_sha256,
         policy_identity=leaf.job.policy.identity_sha256,
@@ -1150,7 +1374,9 @@ def _horizon_outcome(
     )
 
 
-def _typed_horizon_failure_code(result: ComponentResult) -> str:
+def _typed_horizon_failure_code(
+    result: ComponentResult, *, binary64: bool = False
+) -> str:
     for evidence in (
         result.analytic_horizon_evidence,
         result.derivative_evidence,
@@ -1166,7 +1392,9 @@ def _typed_horizon_failure_code(result: ComponentResult) -> str:
         ComponentStatus.BRANCH_LOSS: "HORIZON_BRANCH_LOSS",
         ComponentStatus.NOT_CONVERGED: "HORIZON_LADDER_EXHAUSTED",
         ComponentStatus.DERIVATIVE_UNRESOLVED: (
-            "HORIZON_DERIVATIVE_UNRESOLVED"
+            "HORIZON_ARITHMETIC_INADEQUATE"
+            if binary64
+            else "HORIZON_DERIVATIVE_UNRESOLVED"
         ),
     }
     code = reviewed.get(result.status)
@@ -1175,6 +1403,85 @@ def _typed_horizon_failure_code(result: ComponentResult) -> str:
             f"unknown horizon failure status: {result.status.value}"
         )
     return code
+
+
+
+def _provisional_stage_publication_metadata(
+    plan: object,
+    leaf: object,
+    stage: Mapping[str, object],
+) -> tuple[str, str, Mapping[str, object]]:
+    """Authenticate one durable provisional stage for publication diagnostics.
+
+    Horizon and exterior provisional stages intentionally use different
+    envelopes.  The horizon root seal belongs to its authenticated analytic
+    evidence; exterior stages retain the seal at the stage top level.
+    """
+
+    if not isinstance(stage, Mapping):
+        raise ValueError("provisional stage publication is invalid")
+
+    schema = stage.get("schema")
+    if schema == HORIZON_SCREENING_STAGE_SCHEMA:
+        if (
+            getattr(leaf, "mechanism_id", None) != "horizon-admittance"
+            or stage.get("precision_tier") != "binary64"
+            or stage.get("operation_identity") != BINARY64_HORIZON_OPERATION_V3
+        ):
+            raise ValueError("horizon provisional stage identity is invalid")
+
+        validate_schema11_horizon_stage(plan, leaf, stage)
+        stage_sha256 = stage.get("stage_sha256")
+        payload = stage.get("component_result")
+        raw_result = payload.get("result") if isinstance(payload, Mapping) else None
+        if not isinstance(raw_result, Mapping):
+            raise ValueError("horizon provisional stage result is invalid")
+        result = ComponentResult.from_mapping(raw_result)
+        if result.to_mapping() != raw_result:
+            raise ValueError("horizon provisional stage result is not canonical")
+        evidence = result.analytic_horizon_evidence
+        if not isinstance(evidence, Mapping):
+            raise ValueError("horizon provisional stage evidence is invalid")
+        root_seal_sha256 = evidence.get("root_seal_sha256")
+        if not _is_sha256(stage_sha256) or not _is_sha256(root_seal_sha256):
+            raise ValueError("horizon provisional stage seal is invalid")
+        return (
+            str(stage_sha256),
+            str(root_seal_sha256),
+            {
+                "stage_schema": HORIZON_SCREENING_STAGE_SCHEMA,
+                "numerical_state": stage.get("numerical_state"),
+                "failure_code": evidence.get("failure_code"),
+            },
+        )
+
+    if schema != EXTERIOR_PROVISIONAL_STAGE_SCHEMA:
+        raise ValueError("provisional stage publication schema is invalid")
+    root_seal_sha256 = stage.get("root_seal_sha256")
+    if not _is_sha256(root_seal_sha256):
+        raise ValueError("exterior provisional stage root seal is invalid")
+    authenticated = validate_exterior_provisional_stage(
+        stage,
+        job=leaf.job,
+        scientific_computation_identity=scientific_computation_identity_sha256(
+            plan, leaf
+        ),
+        root_seal_sha256=str(root_seal_sha256),
+    )
+    stage_sha256 = authenticated.get("stage_sha256")
+    if not _is_sha256(stage_sha256):
+        raise ValueError("exterior provisional stage digest is invalid")
+    return (
+        str(stage_sha256),
+        str(root_seal_sha256),
+        {
+            "raw_sample_count": authenticated.get("raw_sample_count"),
+            "raw_sample_limit": authenticated.get("raw_sample_limit"),
+            "nonadmission_reason_code": authenticated.get(
+                "nonadmission_reason_code"
+            ),
+        },
+    )
 
 
 def run_native_binary64_pass(
@@ -1187,6 +1494,7 @@ def run_native_binary64_pass(
     solved_leaf_store: SolvedLeafStore | None = None,
     determinant_error_store: ReviewedDeterminantErrorStore | None = None,
     background_evidence_store: CanonicalBackgroundEvidenceStore | None = None,
+    diagnostic_session: StructuralDiagnosticSession | None = None,
 ) -> Binary64SurveyRun:
     """Execute the real binary64 scheduler with a Julia-free backend factory."""
 
@@ -1199,13 +1507,19 @@ def run_native_binary64_pass(
         checkpoint_path.parent
         / f"{checkpoint_path.name}.canonical-backgrounds"
     )
+    root_evidence_store = RootEvidenceStore.for_checkpoint(checkpoint_path)
     backend_holder: dict[str, NativeCampaignStageBackend] = {}
     root_provider_holder: dict[str, AuthenticatedRootSealProvider] = {}
 
     def root_provider() -> AuthenticatedRootSealProvider:
         if "value" not in root_provider_holder:
             root_provider_holder["value"] = AuthenticatedRootSealProvider(
-                plan, selection, checkpoint, store
+                plan,
+                selection,
+                checkpoint,
+                store,
+                root_evidence_store,
+                diagnostic_session,
             )
         return root_provider_holder["value"]
 
@@ -1246,7 +1560,8 @@ def run_native_binary64_pass(
         if (
             lookup.status is not SolvedLeafLookupStatus.HIT
             or lookup.receipt is None
-            or lookup.receipt.get("record") != record
+            or canonical_json_bytes(lookup.receipt.get("record"))
+            != canonical_json_bytes(record)
         ):
             raise ValueError("terminal numerical record was not published exactly")
         with progress_scope(
@@ -1264,39 +1579,44 @@ def run_native_binary64_pass(
             if seal is not None:
                 root_provider().publish(leaf, seal)
 
-    # Reconcile authenticated terminal checkpoint records before the survey's
-    # cache discovery.  A cache hit is therefore durable before any numerical
-    # leaf is eligible to be skipped.
-    promotion_bound_record_sha256 = (
-        _promotion_bound_source_record_sha256(checkpoint, plan)
-    )
-    checkpoint_records = {
-        str(item["leaf_id"]): item
-        for item in checkpoint.get("records", ())
-        if isinstance(item, Mapping)
-    }
-    for leaf_id in recovery_selection.ordered_leaf_ids:
-        record = checkpoint_records.get(leaf_id)
-        if (
-            record is None
-            or record.get("state") != "PRODUCED"
-            or record.get("record_sha256") in promotion_bound_record_sha256
-        ):
-            continue
-        leaf = next(item for item in plan.leaves if item.leaf_id == leaf_id)
-        validate_campaign_recovery_record(plan, leaf_id, record)
-        lookup = store.publish_if_missing(
-            scientific_identity_sha256=recovery_selection.scientific_identities[leaf_id],
-            leaf_id=leaf_id,
-            record=record,
-            source_type="imported-authenticated-checkpoint",
+    def publish_provisional_stage(leaf, stage):
+        """Publish one authenticated checkpoint-committed provisional stage."""
+
+        stage_sha256, root_seal_sha256, compact_diagnostics = (
+            _provisional_stage_publication_metadata(plan, leaf, stage)
         )
-        if (
-            lookup.status is not SolvedLeafLookupStatus.HIT
-            or lookup.receipt is None
-            or lookup.receipt.get("record") != record
-        ):
-            raise ValueError("checkpoint terminal publication was not exact")
+        if diagnostic_session is not None:
+            diagnostic_session.append(
+                "PROVISIONAL_STAGE_PUBLISHED",
+                leaf={"leaf_id": leaf.leaf_id},
+                execution={
+                    "profile": "SURVEY",
+                    "pass": "binary64",
+                    "tier": "binary64",
+                    "operation_identity": str(stage.get("operation_identity")),
+                },
+                connections={
+                    "scientific_computation_identity": (
+                        scientific_computation_identity_sha256(plan, leaf)
+                    ),
+                    "root_seal_sha256": root_seal_sha256,
+                    "source_stage_sha256": stage_sha256,
+                    "provisional_stage_sha256": stage_sha256,
+                },
+                compact_diagnostics=compact_diagnostics,
+                durable=True,
+            )
+
+    # Reconcile authenticated terminal checkpoint records before cache
+    # discovery. Mixed-version classification precedes current publication.
+    _publish_admissible_checkpoint_records(
+        plan,
+        recovery_selection,
+        checkpoint,
+        store,
+        source_path=checkpoint_path,
+        diagnostic_session=diagnostic_session,
+    )
 
     return run_binary64_survey(
         plan,
@@ -1305,8 +1625,14 @@ def run_native_binary64_pass(
         checkpoint_path=checkpoint_path,
         root_seal_lookup=lambda leaf: root_provider().lookup(leaf),
         native_backend_factory=lambda: backend().adapter.kernel,
-        horizon_runner=lambda leaf: _horizon_outcome(plan, backend(), leaf),
+        horizon_runner=lambda leaf: _horizon_outcome(
+            plan,
+            backend(),
+            leaf,
+            root_evidence=root_provider().evidence_for(leaf),
+        ),
         produced_record_builder=build,
+        provisional_stage_committed=publish_provisional_stage,
         equivalence_receipt_lookup=equivalence_lookup,
         determinant_error_store=error_store,
         background_evidence_store=background_store,
@@ -1322,6 +1648,7 @@ def run_native_binary64_pass(
             value,
             include_triage=True,
         ),
+        diagnostic_session=diagnostic_session,
     )
 
 
@@ -1693,6 +2020,7 @@ def run_native_promoted_pass(
     calibration_receipt: object | None = None,
     solved_leaf_store: SolvedLeafStore | None = None,
     determinant_error_store: ReviewedDeterminantErrorStore | None = None,
+    diagnostic_session: StructuralDiagnosticSession | None = None,
 ) -> PromotedSurveyRun:
     """Execute only queued BF40/BF80 work through the survey-only operation."""
 
@@ -1701,13 +2029,19 @@ def run_native_promoted_pass(
         checkpoint_path.parent
         / f"{checkpoint_path.name}.reviewed-determinant-errors"
     )
+    root_evidence_store = RootEvidenceStore.for_checkpoint(checkpoint_path)
     backend_holder: dict[str, NativeCampaignStageBackend] = {}
     root_provider_holder: dict[str, AuthenticatedRootSealProvider] = {}
 
     def root_provider() -> AuthenticatedRootSealProvider:
         if "value" not in root_provider_holder:
             root_provider_holder["value"] = AuthenticatedRootSealProvider(
-                plan, selection, checkpoint, store
+                plan,
+                selection,
+                checkpoint,
+                store,
+                root_evidence_store,
+                diagnostic_session,
             )
         return root_provider_holder["value"]
 
@@ -1755,7 +2089,8 @@ def run_native_promoted_pass(
         if (
             lookup.status is not SolvedLeafLookupStatus.HIT
             or lookup.receipt is None
-            or lookup.receipt.get("record") != record
+            or canonical_json_bytes(lookup.receipt.get("record"))
+            != canonical_json_bytes(record)
         ):
             raise ValueError("promoted terminal record was not published exactly")
         with progress_scope(
@@ -1773,12 +2108,22 @@ def run_native_promoted_pass(
             if seal is not None:
                 root_provider().publish(leaf, seal)
 
+    _publish_admissible_checkpoint_records(
+        plan,
+        recovery_selection,
+        checkpoint,
+        store,
+        source_path=checkpoint_path,
+        diagnostic_session=diagnostic_session,
+    )
+
     return run_promoted_survey(
         plan,
         recovery_selection,
         checkpoint,
         checkpoint_path=checkpoint_path,
         root_seal_lookup=seal_lookup,
+        provisional_stage_lookup=lambda _leaf, entry: entry["provisional_stage"],
         root_seal_publish=lambda leaf, seal: root_provider().publish(leaf, seal),
         backend_factory=lambda leaf, digits: backend()._julia_precision_backend_for(
             leaf.job, digits
@@ -1809,6 +2154,7 @@ def run_native_promoted_pass(
             value,
             include_triage=True,
         ),
+        diagnostic_session=diagnostic_session,
     )
 
 

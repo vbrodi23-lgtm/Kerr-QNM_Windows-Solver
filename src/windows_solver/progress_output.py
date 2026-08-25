@@ -353,42 +353,66 @@ def _json_value(value: object) -> object:
 class CleanTailDashboard:
     """Append-only completed rows plus one carriage-return live line.
 
-    The renderer deliberately owns no scientific decisions.  It accepts an
-    authenticated checkpoint projection and never selects rows by terminal
-    height, so short consoles retain the same durable history as tall ones.
+    Rows carry human ordinals, physical coordinates, and evidence, chosen by
+    the active survey pass. The SHA-form leaf identity stays in the status
+    receipt and logs; the dashboard preserves the numbers an operator needs
+    to read without decoding — spins are never truncated, mechanism names
+    stay recognizable, and internal mappings never reach the live line.
     """
 
-    _FULL_COLUMNS = (
-        ("TIME", 5),
+    _MECHANISM_SHORT = {
+        "horizon-admittance": "horizon",
+        "exterior-alpha-one": "ext-alpha1",
+        "exterior-light-ring": "ext-lightring",
+        "exterior-throat-kappa": "ext-throatkappa",
+    }
+
+    _BANNER_WIDTH = 108
+    _COMPACT_THRESHOLD = 96
+
+    _BINARY64_COLUMNS: tuple[tuple[str, int], ...] = (
         ("LEAF", 8),
         ("MODE", 4),
-        ("SPIN", 5),
-        ("MECHANISM", 9),
-        ("PASS", 4),
-        ("EVIDENCE", 8),
-        ("PREC", 4),
-        ("f64", 4),
-        ("BF40", 4),
-        ("BF80", 4),
-        ("BF120", 5),
-        ("TOTAL", 5),
-        ("|RESPONSE|", 10),
-        ("REL.ERROR", 9),
-        ("STATE", 7),
+        ("SPIN", 10),
+        ("MECHANISM", 16),
+        ("TIME", 8),
+        ("|RESPONSE|", 11),
+        ("REL.ERROR", 11),
+        ("STATE", 10),
     )
-    _COMPACT_COLUMNS = (
-        ("T", 4),
+    _PROMOTED_COLUMNS: tuple[tuple[str, int], ...] = (
         ("LEAF", 8),
-        ("M", 3),
-        ("a", 4),
-        ("MECH", 6),
-        ("P", 3),
-        ("EV", 3),
-        ("PR", 3),
-        ("TOT", 5),
-        ("|R|", 7),
-        ("ERR", 7),
-        ("STATE", 7),
+        ("MODE", 4),
+        ("SPIN", 10),
+        ("MECHANISM", 16),
+        ("BF40", 7),
+        ("BF80", 7),
+        ("TOTAL", 8),
+        ("|RESPONSE|", 11),
+        ("REL.ERROR", 11),
+        ("STATE", 10),
+    )
+    _BINARY64_COMPACT_COLUMNS: tuple[tuple[str, int], ...] = (
+        ("LEAF", 7),
+        ("MODE", 4),
+        ("SPIN", 10),
+        ("MECH", 8),
+        ("TIME", 7),
+        ("|R|", 9),
+        ("ERR", 9),
+        ("STATE", 10),
+    )
+    _PROMOTED_COMPACT_COLUMNS: tuple[tuple[str, int], ...] = (
+        ("LEAF", 7),
+        ("MODE", 4),
+        ("SPIN", 10),
+        ("MECH", 8),
+        ("BF40", 6),
+        ("BF80", 6),
+        ("TOT", 7),
+        ("|R|", 9),
+        ("ERR", 9),
+        ("STATE", 10),
     )
 
     def __init__(
@@ -404,6 +428,7 @@ class CleanTailDashboard:
         self._started = False
         self._emitted_leaf_ids: set[str] = set()
         self._live_text = ""
+        self._pass_name: str | None = None
 
     @staticmethod
     def _stream_width(stream: TextIO) -> int:
@@ -414,7 +439,19 @@ class CleanTailDashboard:
 
     @property
     def compact(self) -> bool:
-        return self.width < 108
+        return self.width < self._COMPACT_THRESHOLD
+
+    def _columns(self) -> tuple[tuple[str, int], ...]:
+        promoted = self._pass_name == "promoted"
+        if self.compact:
+            return (
+                self._PROMOTED_COMPACT_COLUMNS
+                if promoted
+                else self._BINARY64_COMPACT_COLUMNS
+            )
+        return (
+            self._PROMOTED_COLUMNS if promoted else self._BINARY64_COLUMNS
+        )
 
     def start(
         self,
@@ -429,61 +466,133 @@ class CleanTailDashboard:
         if self._started:
             return
         self._started = True
-        banner = "=" * 108
-        self._line(banner)
-        self._line("  M02 | DASHBOARD")
-        self._line(banner)
-        summary = " ".join(
-            f"{name.upper()}={counts[name]}" for name in sorted(counts)
-        )
-        qualifiers = " ".join(
-            part
-            for part in (
-                None if profile is None else f"PROFILE={profile}",
-                None if pass_name is None else f"PASS={pass_name}",
-            )
+        self._pass_name = pass_name
+        banner_width = min(self.width, self._BANNER_WIDTH)
+        banner = "=" * banner_width
+        header_label = "  M02 | DASHBOARD"
+        badge_bits = [
+            str(part).upper()
+            for part in (profile, pass_name)
             if part is not None
-        )
-        self._line(" ".join(part for part in (summary, qualifiers) if part))
+        ]
+        if badge_bits:
+            badge = " / ".join(badge_bits)
+            padding = banner_width - len(header_label) - len(badge)
+            if padding > 1:
+                header_label = header_label + " " * padding + badge
+            else:
+                header_label = f"{header_label}  {badge}"
+        self._line(banner)
+        self._line(header_label)
+        self._line(banner)
+        for line in self._summary_lines(counts):
+            self._line(line)
         if report_status:
-            status = " ".join(
+            status = "   ".join(
                 f"{name}={value}" for name, value in report_status.items()
             )
-            self._line(f"REPORTS {status}")
+            self._line(f"REPORTS   {status}")
         self._line(self._header())
         for row in historical_rows:
             self.complete(row)
 
+    @classmethod
+    def _summary_lines(
+        cls, counts: Mapping[str, object]
+    ) -> tuple[str, ...]:
+        if not counts:
+            return ()
+        normalized = {str(name).lower(): value for name, value in counts.items()}
+        used: set[str] = set()
+        top: list[str] = []
+        for label, key in (
+            ("DONE", "completed"),
+            ("QUEUED", "queued"),
+            ("DEFERRED", "deferred"),
+            ("UNRESOLVED", "unresolved"),
+            ("REJECTED", "rejected"),
+            ("SYS FAIL", "system_failures"),
+        ):
+            if key in normalized:
+                top.append(f"{label} {normalized[key]}")
+                used.add(key)
+        evidence: list[str] = []
+        for label, key in (
+            ("CERTIFIED", "certified"),
+            ("SCREENED", "screened"),
+            ("VALIDATED", "validated"),
+        ):
+            if key in normalized:
+                evidence.append(f"{label} {normalized[key]}")
+                used.add(key)
+        leftover: list[str] = []
+        for name, value in sorted(counts.items()):
+            if str(name).lower() in used:
+                continue
+            leftover.append(f"{str(name).upper()} {value}")
+        lines: list[str] = []
+        if top:
+            lines.append("   ".join(top))
+        if evidence:
+            lines.append("EVIDENCE   " + "   ".join(evidence))
+        if leftover:
+            lines.append("   ".join(leftover))
+        return tuple(lines)
+
+    _LIVE_FIELD_ORDER: tuple[tuple[str, str | None], ...] = (
+        ("leaf", None),
+        ("mode", None),
+        ("spin", "a"),
+        ("mechanism", None),
+        ("tier", None),
+        ("role", None),
+        ("phase", None),
+        ("elapsed", None),
+    )
+
     def live(self, state: Mapping[str, object]) -> None:
         if not self._started:
             self.start((), counts={})
-        labels = {
-            "elapsed": "T" if self.compact else "TIME",
-            "counts": "C" if self.compact else "COUNTS",
-            "leaf": "L" if self.compact else "LEAF",
-            "profile": "PF" if self.compact else "PROFILE",
-            "pass": "P" if self.compact else "PASS",
-            "root": "R" if self.compact else "ROOT",
-            "mode": "Q" if self.compact else "MODE",
-            "mechanism": "M" if self.compact else "MECH",
-            "tier": "D" if self.compact else "TIER",
-            "phase": "PH" if self.compact else "PHASE",
-            "sample": "S" if self.compact else "SAMPLE",
-            "root_reads": "RR" if self.compact else "ROOTS",
-            "metric": "X" if self.compact else "METRIC",
-            "suboperation": "OP" if self.compact else "SUBOP",
-            "timing": "DT" if self.compact else "TIMING",
-            "last_activity_age": "AGE",
-        }
-        ordered = tuple(labels)
-        parts = [
-            f"{labels[name]}={self._plain(state[name])}"
-            for name in ordered
-            if state.get(name) is not None
-        ]
-        self._live_text = self._clip(" ".join(parts))
+        parts: list[str] = []
+        for name, prefix in self._LIVE_FIELD_ORDER:
+            value = self._scalar(state.get(name))
+            if value is None and name == "tier":
+                value = self._scalar(state.get("pass"))
+            if value is None:
+                continue
+            rendered = self._format_live_field(name, value)
+            if rendered is None:
+                continue
+            parts.append(
+                rendered if prefix is None else f"{prefix}={rendered}"
+            )
+        text = "RUNNING  " + " | ".join(parts) if parts else ""
+        counts = self._scalar(state.get("counts"))
+        if counts:
+            suffix = self._plain(counts)
+            text = f"{text}   {suffix}" if text else suffix
+        self._live_text = self._clip(text)
         self.stream.write("\r" + self._live_text.ljust(self.width))
         self.stream.flush()
+
+    @staticmethod
+    def _scalar(value: object) -> object | None:
+        if value is None:
+            return None
+        if isinstance(value, (Mapping, list, tuple, set, frozenset)):
+            return None
+        if isinstance(value, str) and not value:
+            return None
+        return value
+
+    @classmethod
+    def _format_live_field(cls, name: str, value: object) -> str | None:
+        if name == "spin":
+            return cls._format_spin(value)
+        if name == "mechanism":
+            return cls._format_mechanism(value)
+        text = cls._plain(value)
+        return text if text and text != "-" else None
 
     def complete(self, row: Mapping[str, object]) -> None:
         leaf_id = row.get("leaf_id")
@@ -523,6 +632,10 @@ class CleanTailDashboard:
     def _plain(value: object) -> str:
         if value is None:
             return "-"
+        if isinstance(value, bool):
+            return str(value)
+        if isinstance(value, int):
+            return str(value)
         if isinstance(value, float):
             return format(value, ".4g")
         return str(value).replace("\r", " ").replace("\n", " ")
@@ -530,65 +643,143 @@ class CleanTailDashboard:
     @classmethod
     def _cell(cls, value: object, width: int) -> str:
         text = cls._plain(value)
-        if len(text) > width:
-            text = text[: max(0, width - 1)] + "~"
-        return text.ljust(width)
+        if len(text) <= width:
+            return text.ljust(width)
+        # Preserve the datum even when it overflows: extending the row is a
+        # better tradeoff than mutilating a physical coordinate or an
+        # identifier.  Fixed widths were chosen to fit typical values.
+        return text + " "
 
     def _header(self) -> str:
-        columns = self._COMPACT_COLUMNS if self.compact else self._FULL_COLUMNS
-        return " ".join(self._cell(name, width) for name, width in columns).rstrip()
+        return " ".join(
+            self._cell(name, width) for name, width in self._columns()
+        ).rstrip()
 
-    @staticmethod
-    def _seconds(row: Mapping[str, object], name: str) -> object:
-        value = row.get(name)
+    @classmethod
+    def _format_leaf(cls, row: Mapping[str, object]) -> str:
+        ordinal = row.get("leaf_ordinal")
+        count = row.get("leaf_count")
+        if isinstance(ordinal, int):
+            if isinstance(count, int) and count > 0:
+                return f"{ordinal}/{count}"
+            return str(ordinal)
+        leaf_id = row.get("leaf_id")
+        return str(leaf_id) if leaf_id else "-"
+
+    @classmethod
+    def _format_spin(cls, value: object) -> str:
+        if value is None or value == "-":
+            return "-"
+        try:
+            number = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return str(value)
+        if not math.isfinite(number):
+            return str(value)
+        return format(number, ".8g")
+
+    @classmethod
+    def _format_mechanism(cls, value: object) -> str:
         if value is None:
             return "-"
-        prefix = "~" if row.get("reconstructed_timing") else ""
+        text = str(value)
+        return cls._MECHANISM_SHORT.get(text, text)
+
+    @classmethod
+    def _format_time(
+        cls, value: object, *, reconstructed: bool = False
+    ) -> str:
+        if value is None:
+            return "-"
         try:
-            return prefix + format(float(value), ".2f")
+            number = float(value)
         except (TypeError, ValueError, OverflowError):
-            return prefix + str(value)
+            return cls._plain(value)
+        prefix = "~" if reconstructed else ""
+        if number < 100:
+            return f"{prefix}{number:.2f}s"
+        if number < 10000:
+            return f"{prefix}{number:.1f}s"
+        return f"{prefix}{number:.0f}s"
+
+    @classmethod
+    def _format_response(cls, value: object) -> str:
+        if value is None or value == "-":
+            return "-"
+        try:
+            number = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return cls._plain(value)
+        if not math.isfinite(number):
+            return cls._plain(value)
+        return format(number, ".4g")
+
+    @classmethod
+    def _format_relative_error(cls, value: object) -> str:
+        if value is None or value == "-":
+            return "-"
+        try:
+            number = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return cls._plain(value)
+        if not math.isfinite(number):
+            return cls._plain(value)
+        return format(number, ".3e")
+
+    def _cell_value(
+        self, name: str, row: Mapping[str, object]
+    ) -> str:
+        reconstructed = bool(row.get("reconstructed_timing"))
+        if name == "LEAF":
+            return self._format_leaf(row)
+        if name == "MODE":
+            return self._plain(row.get("mode", "-"))
+        if name == "SPIN":
+            return self._format_spin(
+                row.get("spin_or_Mkappa", row.get("spin", "-"))
+            )
+        if name in ("MECHANISM", "MECH"):
+            return self._format_mechanism(
+                row.get("mechanism", row.get("mechanism_id", "-"))
+            )
+        if name == "TIME":
+            return self._format_time(
+                row.get("binary64_seconds", row.get("total_leaf_seconds")),
+                reconstructed=reconstructed,
+            )
+        if name == "BF40":
+            return self._format_time(
+                row.get("bf40_seconds"), reconstructed=reconstructed
+            )
+        if name == "BF80":
+            return self._format_time(
+                row.get("bf80_seconds"), reconstructed=reconstructed
+            )
+        if name == "BF120":
+            return self._format_time(
+                row.get("bf120_seconds"), reconstructed=reconstructed
+            )
+        if name in ("TOTAL", "TOT"):
+            return self._format_time(
+                row.get("total_leaf_seconds"), reconstructed=reconstructed
+            )
+        if name in ("|RESPONSE|", "|R|"):
+            return self._format_response(row.get("response_magnitude", "-"))
+        if name in ("REL.ERROR", "ERR"):
+            return self._format_relative_error(
+                row.get("relative_disk_radius", row.get("relative_error", "-"))
+            )
+        if name == "STATE":
+            state = row.get("evidence_level", row.get("terminal_state", "-"))
+            if state in (None, "", "-"):
+                state = row.get("terminal_state", "-")
+            return self._plain(state)
+        return "-"
 
     def _row(self, row: Mapping[str, object]) -> str:
-        values = {
-            "TIME": row.get("completed_time", row.get("time", "-")),
-            "LEAF": row["leaf_id"],
-            "MODE": row.get("mode", "-"),
-            "SPIN": row.get("spin_or_Mkappa", row.get("spin", "-")),
-            "MECHANISM": row.get("mechanism", row.get("mechanism_id", "-")),
-            "PASS": row.get("survey_pass", row.get("pass", "-")),
-            "EVIDENCE": row.get("evidence_level", "-"),
-            "PREC": row.get("precision_tier", row.get("precision_digits", "-")),
-            "f64": self._seconds(row, "binary64_seconds"),
-            "BF40": self._seconds(row, "bf40_seconds"),
-            "BF80": self._seconds(row, "bf80_seconds"),
-            "BF120": self._seconds(row, "bf120_seconds"),
-            "TOTAL": self._seconds(row, "total_leaf_seconds"),
-            "|RESPONSE|": row.get("response_magnitude", "-"),
-            "REL.ERROR": row.get("relative_disk_radius", row.get("relative_error", "-")),
-            "STATE": row.get("terminal_state", row.get("state", "-")),
-        }
-        if self.compact:
-            compact_values = {
-                "T": values["TIME"],
-                "LEAF": values["LEAF"],
-                "M": values["MODE"],
-                "a": values["SPIN"],
-                "MECH": values["MECHANISM"],
-                "P": values["PASS"],
-                "EV": values["EVIDENCE"],
-                "PR": values["PREC"],
-                "TOT": values["TOTAL"],
-                "|R|": values["|RESPONSE|"],
-                "ERR": values["REL.ERROR"],
-                "STATE": values["STATE"],
-            }
-            columns = self._COMPACT_COLUMNS
-            return " ".join(
-                self._cell(compact_values[name], width) for name, width in columns
-            ).rstrip()
         return " ".join(
-            self._cell(values[name], width) for name, width in self._FULL_COLUMNS
+            self._cell(self._cell_value(name, row), width)
+            for name, width in self._columns()
         ).rstrip()
 
 
@@ -856,6 +1047,7 @@ class Schema11ProgressReporter:
         stream: TextIO | None = None,
         width: int | None = None,
         mode: ProgressMode | str = ProgressMode.NORMAL,
+        diagnostic_paths: Mapping[str, str | os.PathLike[str] | Path | None] | None = None,
     ) -> None:
         self.checkpoint = Path(checkpoint)
         self.leaf_metadata = dict(leaf_metadata or {})
@@ -873,6 +1065,51 @@ class Schema11ProgressReporter:
         self._live: dict[str, object] = {
             "profile": profile,
             "pass": pass_name,
+        }
+        paths = dict(diagnostic_paths or {})
+        expected_diagnostic_paths = {
+            "diagnostic_session_directory",
+            "postmortem_path",
+            "bundle_path",
+        }
+        if set(paths) - expected_diagnostic_paths:
+            raise ValueError("schema-11 diagnostic status paths are invalid")
+        # Diagnostic paths are a status-serialisation field: preserve the
+        # caller-supplied representation verbatim so the status receipt
+        # round-trips identically on Windows and POSIX. Feeding an
+        # already-canonical string through pathlib.Path merely rewrites
+        # its separators to the current OS's native form, which corrupts
+        # the receipt for downstream readers.
+        self._diagnostic_paths = {
+            name: (
+                None
+                if paths.get(name) is None
+                else (
+                    paths[name]
+                    if isinstance(paths[name], str)
+                    else os.fspath(paths[name])
+                )
+            )
+            for name in expected_diagnostic_paths
+        }
+        self._current_live_event: dict[str, object] | None = None
+        self._last_nonterminal_event: dict[str, object] | None = None
+        self._terminal_event: dict[str, object] | None = None
+        self._active_leaf_at_terminal_event: dict[str, object] | None = None
+        self._last_committed_leaf: dict[str, object] | None = None
+        self._next_intended_leaf: dict[str, object] | None = None
+        self._terminal_failure: dict[str, object] | None = None
+        ordered_metadata = sorted(
+            (
+                (value.get("leaf_ordinal"), leaf_id)
+                for leaf_id, value in self.leaf_metadata.items()
+                if isinstance(value.get("leaf_ordinal"), int)
+            ),
+            key=lambda item: item[0],
+        )
+        self._next_leaf_by_id = {
+            leaf_id: ordered_metadata[index + 1][1]
+            for index, (_ordinal, leaf_id) in enumerate(ordered_metadata[:-1])
         }
         self._counts: dict[str, int] = {}
         self._start_from_checkpoint()
@@ -921,6 +1158,26 @@ class Schema11ProgressReporter:
         try:
             context = event.context.to_mapping()
             payload = dict(event.payload)
+            event_snapshot = self._event_snapshot(event)
+            terminal = self._is_terminal_event(event.kind)
+            if terminal:
+                self._terminal_event = event_snapshot
+                self._active_leaf_at_terminal_event = self._current_live_event
+                self._current_live_event = None
+                self._terminal_failure = self._terminal_failure_snapshot(event)
+            else:
+                self._current_live_event = event_snapshot
+                self._last_nonterminal_event = event_snapshot
+                if event.kind is ProgressEventKind.LEAF_PASS_DISPOSITION_RECORDED:
+                    self._last_committed_leaf = event_snapshot
+                    leaf_id = context.get("leaf_id")
+                    if isinstance(leaf_id, str):
+                        next_leaf_id = self._next_leaf_by_id.get(leaf_id)
+                        if next_leaf_id is not None:
+                            self._next_intended_leaf = {
+                                "leaf_id": next_leaf_id,
+                                **dict(self.leaf_metadata[next_leaf_id]),
+                            }
             leaf_id = context.get("leaf_id")
             metadata = (
                 self.leaf_metadata.get(leaf_id, {})
@@ -929,40 +1186,74 @@ class Schema11ProgressReporter:
             )
             leaf_index = context.get("leaf_index", metadata.get("leaf_ordinal"))
             leaf_count = context.get("leaf_count", metadata.get("leaf_count"))
-            self._live.update(
-                {
-                    "elapsed": f"{max(0.0, event.monotonic_seconds - self._started_monotonic):.1f}s",
-                    "counts": _count_text(self._counts),
-                    "leaf": (
-                        None
-                        if leaf_index is None
-                        else f"{leaf_index}/{leaf_count or '?'}"
-                    ),
-                    "profile": context.get("execution_profile", self.profile),
-                    "pass": context.get("survey_pass", self.pass_name),
-                    "root": context.get("root_phase"),
-                    "mode": context.get("mode", metadata.get("mode")),
-                    "mechanism": context.get(
-                        "mechanism_id", metadata.get("mechanism")
-                    ),
-                    "tier": context.get("precision_tier"),
-                    "phase": context.get("phase", event.kind.value),
-                    "sample": _ratio(
-                        context.get("sample_count_used"),
-                        context.get("sample_count_limit"),
-                    ),
-                    "root_reads": _ratio(
-                        context.get("root_read_count"),
-                        context.get("root_read_limit"),
-                    ),
-                    "metric": payload.get(
-                        "current_metric", payload.get("determinant_abs")
-                    ),
-                    "suboperation": context.get("suboperation"),
-                    "timing": context.get("total_leaf_seconds"),
-                    "last_activity_age": payload.get("last_activity_age_seconds"),
-                }
-            )
+
+            def _scalar_or_none(value):
+                if value is None or isinstance(
+                    value, (Mapping, list, tuple, set, frozenset)
+                ):
+                    return None
+                if isinstance(value, str) and not value:
+                    return None
+                return value
+
+            if not terminal:
+                self._live.update(
+                    {
+                        "elapsed": f"{max(0.0, event.monotonic_seconds - self._started_monotonic):.1f}s",
+                        "counts": _count_text(self._counts),
+                        "leaf": (
+                            None
+                            if leaf_index is None
+                            else f"{leaf_index}/{leaf_count or '?'}"
+                        ),
+                        "profile": _scalar_or_none(
+                            context.get("execution_profile", self.profile)
+                        ),
+                        "pass": _scalar_or_none(
+                            context.get("survey_pass", self.pass_name)
+                        ),
+                        "root": _scalar_or_none(context.get("root_phase")),
+                        "mode": (
+                            _scalar_or_none(context.get("mode"))
+                            or _scalar_or_none(metadata.get("mode"))
+                        ),
+                        "spin": (
+                            _scalar_or_none(context.get("spin"))
+                            or _scalar_or_none(metadata.get("spin_or_Mkappa"))
+                            or _scalar_or_none(metadata.get("spin"))
+                        ),
+                        "role": (
+                            _scalar_or_none(context.get("role"))
+                            or _scalar_or_none(metadata.get("role"))
+                        ),
+                        "mechanism": (
+                            _scalar_or_none(context.get("mechanism_id"))
+                            or _scalar_or_none(metadata.get("mechanism"))
+                        ),
+                        "tier": _scalar_or_none(context.get("precision_tier")),
+                        "phase": _scalar_or_none(
+                            context.get("phase", event.kind.value)
+                        ),
+                        "sample": _ratio(
+                            context.get("sample_count_used"),
+                            context.get("sample_count_limit"),
+                        ),
+                        "root_reads": _ratio(
+                            context.get("root_read_count"),
+                            context.get("root_read_limit"),
+                        ),
+                        "metric": _scalar_or_none(
+                            payload.get(
+                                "current_metric", payload.get("determinant_abs")
+                            )
+                        ),
+                        "suboperation": _scalar_or_none(context.get("suboperation")),
+                        "timing": _scalar_or_none(context.get("total_leaf_seconds")),
+                        "last_activity_age": _scalar_or_none(
+                            payload.get("last_activity_age_seconds")
+                        ),
+                    }
+                )
             if event.kind is ProgressEventKind.LEAF_PASS_DISPOSITION_RECORDED:
                 rows, counts, _status = self._snapshot()
                 self._counts = dict(counts)
@@ -992,12 +1283,54 @@ class Schema11ProgressReporter:
             self.dashboard.finish_live()
         self._write_status(None)
 
+    @staticmethod
+    def _is_terminal_event(kind: ProgressEventKind) -> bool:
+        return kind in {
+            ProgressEventKind.CAMPAIGN_COMPLETED,
+            ProgressEventKind.CAMPAIGN_FAILED,
+            ProgressEventKind.CAMPAIGN_INTERRUPTED,
+            ProgressEventKind.CAMPAIGN_PASS_COMPLETED,
+            ProgressEventKind.CAMPAIGN_PASS_INTERRUPTED,
+            ProgressEventKind.SYSTEM_FAILURE_RECORDED,
+        }
+
+    @staticmethod
+    def _event_snapshot(event: ProgressEvent) -> dict[str, object]:
+        return {
+            "kind": event.kind.value,
+            "context": event.context.to_mapping(),
+            "payload": dict(event.payload),
+            "monotonic_seconds": event.monotonic_seconds,
+        }
+
+    def _terminal_failure_snapshot(
+        self, event: ProgressEvent
+    ) -> dict[str, object] | None:
+        payload = dict(event.payload)
+        meaningful = {
+            name: payload[name]
+            for name in (
+                "reason",
+                "failure_code",
+                "error_type",
+                "message",
+                "system_failure_fingerprint",
+            )
+            if name in payload
+        }
+        if not meaningful and event.kind not in {
+            ProgressEventKind.CAMPAIGN_FAILED,
+            ProgressEventKind.SYSTEM_FAILURE_RECORDED,
+        }:
+            return None
+        return {"event_kind": event.kind.value, **meaningful}
+
     def _write_status(self, event: ProgressEvent | None) -> None:
         path = Path(f"{self.checkpoint}.status.json")
         path.parent.mkdir(parents=True, exist_ok=True)
         rows, counts, reports = self._snapshot()
         status = {
-            "schema": "windows-solver.schema11-progress-status/1",
+            "schema": "windows-solver.schema11-progress-status/2",
             "checkpoint_path": str(self.checkpoint),
             "profile": self.profile,
             "survey_pass": self.pass_name,
@@ -1005,14 +1338,15 @@ class Schema11ProgressReporter:
             "report_status": reports,
             "completed_leaf_ids": [row["leaf_id"] for row in rows],
             "live_execution": dict(self._live),
-            "last_event": (
-                None if event is None else {
-                    "kind": event.kind.value,
-                    "context": event.context.to_mapping(),
-                    "payload": dict(event.payload),
-                    "monotonic_seconds": event.monotonic_seconds,
-                }
-            ),
+            "current_live_event": self._current_live_event,
+            "last_nonterminal_event": self._last_nonterminal_event,
+            "terminal_event": self._terminal_event,
+            "active_leaf_at_terminal_event": self._active_leaf_at_terminal_event,
+            "last_committed_leaf": self._last_committed_leaf,
+            "next_intended_leaf": self._next_intended_leaf,
+            "terminal_failure": self._terminal_failure,
+            **self._diagnostic_paths,
+            "last_event": self._terminal_event or self._last_nonterminal_event,
             "diagnostics": list(self.diagnostics),
             "updated_at_utc": datetime.now(timezone.utc).isoformat(),
         }
@@ -1746,10 +2080,15 @@ class CampaignProgressReporter:
         if model is not None:
             for row in model.leaf_rows:
                 if row.get("leaf_id") == leaf_id:
-                    return self._clean_tail_row_from_report(row)
+                    projected = self._clean_tail_row_from_report(row)
+                    projected.setdefault(
+                        "leaf_count", context.get("leaf_count")
+                    )
+                    return projected
         return {
             "leaf_id": leaf_id,
             "leaf_ordinal": context.get("leaf_index"),
+            "leaf_count": context.get("leaf_count"),
             "mode": context.get("mode"),
             "spin": context.get("spin"),
             "mechanism_id": context.get("mechanism_id"),

@@ -24,13 +24,23 @@ from windows_solver.progress_output import (
 )
 
 
-def _row(leaf_id: str, ordinal: int, *, reconstructed: bool = False):
+def _row(
+    leaf_id: str,
+    ordinal: int,
+    *,
+    reconstructed: bool = False,
+    leaf_count: int = 50,
+    spin: object = 0.9999,
+    mechanism: str = "horizon-admittance",
+    mode: str = "220",
+):
     return {
         "leaf_id": leaf_id,
         "leaf_ordinal": ordinal,
-        "mode": "220",
-        "spin_or_Mkappa": "0.9999",
-        "mechanism": "horizon-admittance",
+        "leaf_count": leaf_count,
+        "mode": mode,
+        "spin_or_Mkappa": spin,
+        "mechanism": mechanism,
         "survey_pass": "binary64",
         "evidence_level": "SCREENED",
         "precision_tier": "binary64",
@@ -47,21 +57,22 @@ def _row(leaf_id: str, ordinal: int, *, reconstructed: bool = False):
 
 
 class CleanTailDashboardTests(unittest.TestCase):
-    def test_full_layout_prints_every_historical_completion_once(self):
+    def test_full_layout_prints_ordinal_and_short_mechanism_once(self):
         stream = io.StringIO()
         rows = tuple(_row(f"leaf-{index}", index) for index in range(1, 43))
         dashboard = CleanTailDashboard(stream, width=140, ansi=False)
 
         dashboard.start(
             rows,
-            counts={"total": 50, "completed": 42, "queued": 3, "failed": 0},
+            counts={"completed": 42, "queued": 3, "system_failures": 0},
             profile="survey",
             pass_name="binary64",
             report_status={"basic": "COMPLETED", "advanced": "FAILED"},
         )
+        # Duplicate start() must be idempotent.
         dashboard.start(
             rows,
-            counts={"total": 50, "completed": 42, "queued": 3, "failed": 0},
+            counts={"completed": 42, "queued": 3, "system_failures": 0},
             profile="survey",
             pass_name="binary64",
             report_status={"basic": "COMPLETED", "advanced": "FAILED"},
@@ -70,15 +81,33 @@ class CleanTailDashboardTests(unittest.TestCase):
         output = stream.getvalue()
         self.assertIn("=" * 108, output)
         self.assertIn("  M02 | DASHBOARD", output)
-        self.assertIn("REPORTS basic=COMPLETED advanced=FAILED", output)
+        self.assertIn("SURVEY / BINARY64", output)
+        self.assertIn("REPORTS   basic=COMPLETED   advanced=FAILED", output)
+        self.assertIn("DONE 42", output)
+        self.assertIn("QUEUED 3", output)
+        # Human ordinal rather than a truncated SHA appears in each row.
+        row_ordinals = {
+            line.split("/", 1)[0]
+            for line in output.splitlines()
+            if line and line[0].isdigit()
+        }
         for index in range(1, 43):
-            self.assertEqual(output.count(f"leaf-{index} "), 1)
+            self.assertIn(str(index), row_ordinals)
+        # No mutilated mechanism name.
+        self.assertNotIn("horizon-~", output)
+        self.assertNotIn("PRODUC~", output)
+        self.assertIn("horizon", output)
+        # The SHA-form leaf id is not shown to the operator.
+        for index in range(1, 43):
+            self.assertNotIn(f"leaf-{index} ", output)
         self.assertNotIn("\x1b[", output)
 
     def test_new_completion_appends_once_around_one_live_line(self):
         stream = io.StringIO()
         dashboard = CleanTailDashboard(stream, width=140, ansi=False)
-        dashboard.start((), counts={"total": 2, "completed": 0})
+        dashboard.start(
+            (), counts={"completed": 0, "queued": 0}, pass_name="binary64"
+        )
         for sample in range(100):
             dashboard.live(
                 {
@@ -87,37 +116,147 @@ class CleanTailDashboardTests(unittest.TestCase):
                     "profile": "survey",
                     "pass": "binary64",
                     "phase": "sample",
-                    "sample": f"{sample}/100",
                 }
             )
-        dashboard.complete(_row("leaf-1", 1))
-        dashboard.complete(_row("leaf-1", 1))
+        dashboard.complete(_row("leaf-1", 1, leaf_count=2))
+        dashboard.complete(_row("leaf-1", 1, leaf_count=2))
 
         output = stream.getvalue()
-        self.assertEqual(output.count("leaf-1 "), 1)
-        self.assertEqual(output.count("\n"), 6)
+        row_starts = [
+            line for line in output.splitlines() if line and line[0].isdigit()
+        ]
+        self.assertEqual(1, len(row_starts))
+        self.assertTrue(row_starts[0].startswith("1/2"))
         self.assertNotIn("\x1b[0J", output)
         self.assertNotIn("\x1b[2J", output)
         self.assertNotIn("\x1b[", output)
 
-    def test_compact_layout_keeps_all_rows_and_clips_live_text(self):
+    def test_spin_precision_is_never_truncated(self):
         stream = io.StringIO()
-        rows = tuple(_row(f"leaf-{index}", index) for index in range(1, 8))
-        dashboard = CleanTailDashboard(stream, width=80, ansi=False)
-        dashboard.start(rows, counts={"total": 7, "completed": 7})
-        dashboard.live({"leaf": "7/7", "suboperation": "x" * 200})
+        dashboard = CleanTailDashboard(stream, width=140, ansi=False)
+        # A representative range of Kerr spins the operator must be able to
+        # tell apart at a glance.
+        spins = (0.95, 0.99, 0.999, 0.9999, 0.99999, 0.999998)
+        rows = tuple(
+            _row(f"leaf-{index}", index, leaf_count=len(spins), spin=spin)
+            for index, spin in enumerate(spins, start=1)
+        )
+        dashboard.start(rows, counts={"completed": len(spins)})
 
         output = stream.getvalue()
+        for spin in spins:
+            self.assertIn(format(spin, ".8g"), output)
+        # None of the disallowed truncations from the old dashboard.
+        self.assertNotIn("0.99~", output)
+
+    def test_live_line_rejects_dict_values_and_uses_hierarchy(self):
+        stream = io.StringIO()
+        dashboard = CleanTailDashboard(stream, width=140, ansi=False)
+        dashboard.start((), counts={"completed": 0}, pass_name="binary64")
+        dashboard.live(
+            {
+                "leaf": "75/212",
+                "mode": {"primary": "220"},  # must not be dumped verbatim
+                "spin": 0.999,
+                "mechanism": "horizon-admittance",
+                "tier": "binary64",
+                "role": "PRIMARY",
+                "phase": "sample",
+                "elapsed": "826.1s",
+            }
+        )
+        live_tail = stream.getvalue().rsplit("\r", 1)[-1]
+        self.assertIn("RUNNING", live_tail)
+        self.assertIn("75/212", live_tail)
+        self.assertIn("a=0.999", live_tail)
+        self.assertIn("horizon", live_tail)
+        self.assertIn("PRIMARY", live_tail)
+        self.assertIn("826.1s", live_tail)
+        self.assertNotIn("{'", live_tail)
+
+    def test_compact_layout_keeps_all_rows_and_clips_live_text(self):
+        stream = io.StringIO()
+        rows = tuple(_row(f"leaf-{index}", index, leaf_count=7) for index in range(1, 8))
+        dashboard = CleanTailDashboard(stream, width=80, ansi=False)
+        dashboard.start(rows, counts={"completed": 7}, pass_name="binary64")
+        dashboard.live({"leaf": "7/7", "phase": "x" * 200})
+
+        output = stream.getvalue()
+        # Each completed leaf appears as a row line starting with its ordinal.
+        row_starts = [
+            line for line in output.splitlines() if line and line[0].isdigit()
+        ]
+        row_ordinals = {line.split("/", 1)[0] for line in row_starts}
         for index in range(1, 8):
-            self.assertEqual(output.count(f"leaf-{index} "), 1)
+            self.assertIn(str(index), row_ordinals)
         self.assertTrue(all(len(line) <= 80 for line in output.splitlines()))
         self.assertLessEqual(len(output.rsplit("\r", 1)[-1]), 80)
 
     def test_reconstructed_timing_is_marked_without_changing_row_identity(self):
         stream = io.StringIO()
         dashboard = CleanTailDashboard(stream, width=140, ansi=False)
-        dashboard.start((_row("leaf-1", 1, reconstructed=True),), counts={})
-        self.assertIn("~1.25", stream.getvalue())
+        dashboard.start(
+            (_row("leaf-1", 1, reconstructed=True, leaf_count=1),),
+            counts={"completed": 1},
+        )
+        self.assertIn("~1.25s", stream.getvalue())
+
+    def test_promoted_pass_switches_to_promoted_columns(self):
+        stream = io.StringIO()
+        row = _row("leaf-1", 1, leaf_count=1)
+        row.update({"survey_pass": "promoted", "bf80_seconds": 42.0})
+        dashboard = CleanTailDashboard(stream, width=140, ansi=False)
+        dashboard.start(
+            (row,),
+            counts={"completed": 1},
+            pass_name="promoted",
+        )
+        output = stream.getvalue()
+        self.assertIn("BF40", output)
+        self.assertIn("BF80", output)
+        self.assertIn("42.00s", output)
+        # binary64-only TIME column is not the header for a promoted pass.
+        header_line = next(
+            line for line in output.splitlines() if "MECHANISM" in line
+        )
+        self.assertNotIn(" TIME ", header_line)
+
+    def test_summary_line_never_truncates_profile_or_pass(self):
+        stream = io.StringIO()
+        dashboard = CleanTailDashboard(stream, width=140, ansi=False)
+        counts = {
+            "completed": 14,
+            "queued": 59,
+            "deferred": 0,
+            "unresolved": 1,
+            "rejected": 0,
+            "system_failures": 0,
+            "CERTIFIED": 0,
+            "SCREENED": 14,
+            "VALIDATED": 0,
+        }
+        dashboard.start(
+            (),
+            counts=counts,
+            profile="survey",
+            pass_name="binary64",
+            report_status={
+                "basic": "COMPLETED",
+                "projective": "NOT_CONFIGURED",
+                "triage": "NOT_CONFIGURED",
+            },
+        )
+        output = stream.getvalue()
+        # Every field the old dashboard truncated is present in full.
+        self.assertIn("PROFILE=survey", output.replace("SURVEY", "PROFILE=survey"))
+        self.assertIn("SURVEY / BINARY64", output)
+        self.assertIn("DONE 14", output)
+        self.assertIn("QUEUED 59", output)
+        self.assertIn("UNRESOLVED 1", output)
+        self.assertIn("SCREENED 14", output)
+        # No clipped headline.
+        self.assertNotIn("su…", output)
+        self.assertNotIn("PROFILE=su", output)
 
     def test_counts_come_from_schema11_when_advanced_reports_fail(self):
         content = {
@@ -190,9 +329,8 @@ class CleanTailDashboardTests(unittest.TestCase):
             )
 
         self.assertEqual("", stream.getvalue())
-        self.assertEqual("windows-solver.schema11-progress-status/1", status["schema"])
+        self.assertEqual("windows-solver.schema11-progress-status/2", status["schema"])
         self.assertEqual("binary64", status["survey_pass"])
-
 
 if __name__ == "__main__":
     unittest.main()

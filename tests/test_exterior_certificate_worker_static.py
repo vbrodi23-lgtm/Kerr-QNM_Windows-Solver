@@ -20,67 +20,49 @@ class ExteriorCertificateWorkerStaticTests(unittest.TestCase):
         end = self.worker.index(f"function {next_name}(", start + 1)
         return self.worker[start:end]
 
-    def test_exterior_policy_requires_the_empirical_certificate_identity(self):
-        self.assertIn(
-            '"exterior-determinant-absolute-error-certificate/empirical-v1"',
-            self.worker,
-        )
+    def test_exterior_policy_declares_the_six_named_channels_and_gate(self):
         validation = self._slice("validate_regularised_gsn_policy", "parse_real")
         for field in (
-            "determinant_error_required_term_classes",
+            "determinant_error_channel_schema",
+            "determinant_error_required_channels",
+            "determinant_error_calibration_status",
             "determinant_error_missing_evidence_outcome",
-            "determinant_error_certificate_statement",
-            "determinant_error_preceding_precision_tier",
         ):
             self.assertIn(field, validation)
+        for channel in (
+            "precision",
+            "ode_controls",
+            "endpoint_order",
+            "match_readout",
+            "angular_data",
+            "arithmetic_rounding",
+        ):
+            self.assertIn(f'"{channel}"', self.worker)
+        self.assertIn('"BLOCKED_BY_REVIEWED_ERROR_EVIDENCE"', self.worker)
 
-    def test_exterior_endpoint_pair_produces_an_absolute_disagreement(self):
+    def test_current_exterior_policy_does_not_require_a_safety_factor(self):
+        validation = self._slice("validate_fixed_root_survey_policy", "validate_fixed_root_survey_request")
+        self.assertNotIn("determinant_error_safety_factor", validation)
+        self.assertNotIn("EXTERIOR_EMPIRICAL_ERROR_SAFETY_FACTOR", validation)
+        gate = self._slice("exterior_empirical_certificate_required", "determinant_progress")
+        self.assertIn("EXTERIOR_ADDITIVE_CHANNEL_SCHEMA_ID", gate)
+        self.assertIn("EXTERIOR_EMPIRICAL_ERROR_MODEL_ID && return true", gate)
+
+    def test_exterior_endpoint_pair_remains_raw_provisional_evidence(self):
         exterior = self._slice("evaluate_exterior_determinant", "determinant")
         self.assertIn("select_worker_outer_endpoint_pair(", exterior)
         self.assertGreaterEqual(
             exterior.count("CF.solve_factored_xup_to_match("), 2
         )
         self.assertIn("endpoint_series_disagreement_abs", exterior)
-        self.assertIn("EXTERIOR_EMPIRICAL_ERROR_MODEL_ID", exterior)
 
-    def test_promoted_exterior_determinants_route_through_authentication(self):
-        routed = self._slice("determinant_progress", "enforce_root_readout_feasibility")
-        authenticated = self._slice(
-            "authenticated_determinant_progress", "diagnostic_determinant_progress"
-        )
-        self.assertIn("exterior_empirical_certificate_required", routed)
-        self.assertIn("authenticated_determinant_progress(", routed)
-        self.assertIn("raw_determinant_progress(", authenticated)
-        self.assertNotIn("base.error_breakdown === nothing && return base", authenticated)
-
-    def test_resource_estimator_uses_one_complete_certificate_cost(self):
-        routed = self._slice("determinant_progress", "enforce_root_readout_feasibility")
-        self.assertIn("LAST_DETERMINANT_SECONDS[] =", routed)
-        self.assertIn("LAST_DETERMINANT_PURPOSE[] = purpose", routed)
-
-    def test_all_three_exterior_disagreement_classes_are_mandatory(self):
-        authenticated = self._slice(
-            "authenticated_determinant_progress", "diagnostic_determinant_progress"
-        )
-        for term in (
-            "delta_same_point",
-            "delta_cross_precision",
-            "delta_endpoint_series",
-        ):
-            self.assertIn(term, authenticated)
-        self.assertIn("EXTERIOR_DETERMINANT_CERTIFICATE_UNAVAILABLE", authenticated)
-        self.assertIn("EXTERIOR_EMPIRICAL_ERROR_MODEL_ID", authenticated)
-
-    def test_cross_precision_comparison_uses_the_immediate_predecessor(self):
+    def test_cross_precision_helper_remains_available_for_future_calibration(self):
         guard = self._slice(
             "exterior_preceding_precision_policy", "precision_guard_disagreement"
         )
         self.assertIn('"binary64"', guard)
         self.assertIn('"bigfloat-40"', guard)
         self.assertIn('"bigfloat-80"', guard)
-        self.assertIn("Float64", guard)
-        self.assertIn("working_precision_bits_for(40)", guard)
-        self.assertIn("working_precision_bits_for(80)", guard)
 
 
 if __name__ == "__main__":

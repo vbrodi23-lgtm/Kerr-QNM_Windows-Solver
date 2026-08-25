@@ -15,7 +15,7 @@ from windows_solver.response_engine import (
     ComponentResult,
     DecimalComplex,
     DerivativeAuthenticationEvidence,
-    PROMOTED_HORIZON_COMPONENT_V2_IDENTITY,
+    PROMOTED_HORIZON_BOUNDED_COMPONENT_IDENTITY,
     _validate_promoted_horizon_checkpoint_evidence_for_job,
     run_promoted_horizon_component,
 )
@@ -23,7 +23,7 @@ from windows_solver.response_uncertainty import (
     ComplexDisk,
     ZeroContainingDiskError,
     exterior_response_disk,
-    horizon_response_disk,
+    legacy_v2_horizon_response_disk,
 )
 
 
@@ -80,7 +80,7 @@ class PromotedHorizonUncertaintyTests(unittest.TestCase):
             coordinate_derivative=ComplexDisk(2.0 + 3.0j, 1.0e-5),
             frequency_derivative=ComplexDisk(10.0 - 2.0j, 2.0e-5),
         )
-        horizon = horizon_response_disk(
+        horizon = legacy_v2_horizon_response_disk(
             horizon_frequency=ComplexDisk(0.1 - 0.02j, 2.0e-11),
             determinant_derivative=ComplexDisk(500.0 - 400.0j, 3.0e-7),
         )
@@ -90,7 +90,7 @@ class PromotedHorizonUncertaintyTests(unittest.TestCase):
 
     def test_zero_containing_denominators_have_typed_failures(self) -> None:
         with self.assertRaises(ZeroContainingDiskError) as caught:
-            horizon_response_disk(
+            legacy_v2_horizon_response_disk(
                 horizon_frequency=ComplexDisk(1.0e-12 + 0.0j, 2.0e-12),
                 determinant_derivative=ComplexDisk(1.0 + 0.0j, 1.0e-6),
             )
@@ -108,7 +108,7 @@ class PromotedHorizonUncertaintyTests(unittest.TestCase):
 
         self.assertEqual(
             mapping["component_scientific_identity"],
-            PROMOTED_HORIZON_COMPONENT_V2_IDENTITY,
+            PROMOTED_HORIZON_BOUNDED_COMPONENT_IDENTITY,
         )
         self.assertEqual(
             mapping["response_uncertainty_status"],
@@ -207,7 +207,7 @@ class PromotedHorizonUncertaintyTests(unittest.TestCase):
             ),
             derivative_mapping["radius"],
         )
-        response = horizon_response_disk(
+        response = legacy_v2_horizon_response_disk(
             horizon_frequency=frequency,
             determinant_derivative=derivative,
         )

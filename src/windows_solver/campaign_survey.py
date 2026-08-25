@@ -27,6 +27,12 @@ from .campaign_policy import (
     validate_schema11_checkpoint,
 )
 from .campaign_recovery import RecoverySelection
+from .campaign_record_intake import (
+    CampaignRecordIntake,
+    archive_excluded_record_in_checkpoint,
+    assess_campaign_record_for_current_runtime,
+    emit_forensic_record_excluded,
+)
 from .campaign_failures import (
     FailureDisposition,
     FailureReport,
@@ -54,12 +60,15 @@ from .response_engine import _EXTERIOR_PROFILE_IDS, _exterior_support
 from .response_engine import (
     BINARY64_FIXED_ROOT_SAMPLE_ROLES,
     BINARY64_FIXED_ROOT_SURVEY_IDENTITY,
+    BINARY64_HORIZON_OPERATION_V3,
     BackgroundEquivalenceReceipt,
     Binary64FixedRootBatch,
     Binary64ReusedBackgroundBatch,
     Binary64SurveyDisposition,
     CanonicalExteriorBackground,
+    EXTERIOR_PROVISIONAL_REUSE_RECEIPT_SCHEMA,
     build_exterior_background_reuse_key,
+    build_exterior_provisional_stage,
     canonical_background_from_binary64_batch,
     combine_binary64_reused_background_batch,
     reviewed_determinant_error_claims_for_fixed_root_batch,
@@ -69,7 +78,7 @@ from .response_engine import (
 )
 from .reviewed_determinant_error import ReviewedDeterminantErrorStore
 from .reviewed_determinant_error_issuance import (
-    seed_operator_approved_determinant_error_receipts,
+    retain_uncalibrated_determinant_error_evidence,
 )
 from .background_evidence_store import CanonicalBackgroundEvidenceStore
 from .julia_response_backend import (
@@ -78,11 +87,97 @@ from .julia_response_backend import (
     JuliaODEResourceLimitError,
     JuliaResponseBackendError,
     JuliaRootReadoutResourceLimitError,
+    consume_authenticated_binary64_provisional_predecessor,
 )
 from .progress import ProgressEventKind, emit_progress, progress_scope
+from .root_evidence import RootDependencyKey
+from .structural_diagnostics import StructuralDiagnosticSession
 
 
 RecordValidator = Callable[[str, Mapping[str, object]], None]
+RecordIntakeAssessor = Callable[
+    [str, Mapping[str, object]], CampaignRecordIntake
+]
+_ROOT_PROMOTION_ARITHMETIC_TIER = "root-promotion"
+
+
+def _intake_checkpoint_records(
+    plan: object,
+    checkpoint: Mapping[str, object],
+    *,
+    source_path: str | os.PathLike[str] | Path,
+    diagnostic_session: StructuralDiagnosticSession | None,
+) -> dict[str, object]:
+    """Authenticate mixed-version checkpoint records before current use."""
+
+    result = validate_schema11_checkpoint(checkpoint)
+    for record in tuple(result["records"]):
+        leaf_id = record.get("leaf_id")
+        if not isinstance(leaf_id, str):
+            raise ValueError("checkpoint record leaf identity is invalid")
+        intake = assess_campaign_record_for_current_runtime(plan, leaf_id, record)
+        if intake.response_admissible:
+            continue
+        if intake.forensic_only:
+            emit_forensic_record_excluded(
+                diagnostic_session,
+                intake,
+                leaf_id=leaf_id,
+                source_kind="checkpoint-forensic-response",
+                source_path=source_path,
+                stale_cache_hit_prevented=False,
+            )
+        result = archive_excluded_record_in_checkpoint(
+            result,
+            intake,
+            source_path=source_path,
+        )
+    return validate_schema11_checkpoint(result)
+
+
+def _current_terminal_cache_record(
+    plan: object,
+    leaf_id: str,
+    lookup: object,
+    *,
+    record_validator: RecordValidator | None,
+    diagnostic_session: StructuralDiagnosticSession | None,
+) -> Mapping[str, object] | None:
+    """Return current response evidence after the central intake decision."""
+
+    status = getattr(lookup, "status", None)
+    if status not in {
+        SolvedLeafLookupStatus.HIT,
+        SolvedLeafLookupStatus.STALE,
+    }:
+        return None
+    receipt = getattr(lookup, "receipt", None)
+    if not isinstance(receipt, Mapping):
+        raise ValueError("solved-leaf cache result lacks an authenticated receipt")
+    record = receipt.get("record")
+    if not isinstance(record, Mapping):
+        raise ValueError("solved-leaf cache record is invalid")
+    intake = assess_campaign_record_for_current_runtime(plan, leaf_id, record)
+    if not intake.response_admissible:
+        if intake.forensic_only:
+            emit_forensic_record_excluded(
+                diagnostic_session,
+                intake,
+                leaf_id=leaf_id,
+                source_kind="solved-leaf-forensic-response",
+                source_path=(
+                    "solved-leaf-store"
+                    if getattr(lookup, "path", None) is None
+                    else getattr(lookup, "path")
+                ),
+                stale_cache_hit_prevented=True,
+            )
+        return None
+    if status is not SolvedLeafLookupStatus.HIT:
+        return None
+    if record_validator is not None:
+        record_validator(leaf_id, record)
+    return intake.record
 
 
 @dataclass(frozen=True, slots=True)
@@ -230,6 +325,41 @@ class PromotedPassOutcome:
     evidence_receipts: tuple[Mapping[str, object], ...] = ()
     tier_timing: tuple[Mapping[str, object], ...] = ()
     session_fragments: tuple[Mapping[str, object], ...] = ()
+
+
+@dataclass(slots=True)
+class _RootPromotionGroup:
+    """One exact root dependency shared by pending ROOT queue entries."""
+
+    dependency_key: RootDependencyKey
+    canonical_primary_leaf_id: str
+    member_leaf_ids: tuple[str, ...]
+    root_solve_count: int = 0
+    publication_count: int = 0
+    attempted_tiers: set[str] = field(default_factory=set)
+    seal: AuthenticatedRootSeal | None = None
+    resolved_precision_tier: str | None = None
+    terminal_outcome: PromotedPassOutcome | None = None
+    status: str = "PENDING"
+
+    def reuse(self, seal: AuthenticatedRootSeal) -> None:
+        if self.seal is not None and self.seal != seal:
+            raise ValueError("SYSTEM_FAILURE ROOT_SEAL_CONFLICT")
+        self.seal = seal
+        if self.status == "PENDING":
+            self.status = "REUSED"
+
+    def publish(self, seal: AuthenticatedRootSeal, tier: str) -> None:
+        self.reuse(seal)
+        self.publication_count += 1
+        self.resolved_precision_tier = tier
+        self.status = "RESOLVED"
+
+    def fail(self, outcome: PromotedPassOutcome) -> None:
+        if self.terminal_outcome is not None and self.terminal_outcome != outcome:
+            raise ValueError("SYSTEM_FAILURE ROOT_PROMOTION_GROUP_CONFLICT")
+        self.terminal_outcome = outcome
+        self.status = outcome.disposition.value
 
 
 @dataclass(frozen=True, slots=True)
@@ -536,6 +666,9 @@ def run_binary64_survey(
     produced_record_builder: Callable[
         [object, object, object], tuple[Mapping[str, object], str]
     ],
+    provisional_stage_committed: Callable[
+        [object, Mapping[str, object]], None
+    ],
     equivalence_receipt_lookup: Callable[
         [object, CanonicalExteriorBackground],
         BackgroundEquivalenceReceipt | None,
@@ -553,10 +686,16 @@ def run_binary64_survey(
     terminal_record_committed: Callable[
         [object, Mapping[str, object]], None
     ] | None = None,
+    diagnostic_session: StructuralDiagnosticSession | None = None,
 ) -> Binary64SurveyRun:
     """Run only the binary64 pass; promotion is recorded and never executed."""
 
-    result = validate_schema11_checkpoint(checkpoint)
+    result = _intake_checkpoint_records(
+        plan,
+        checkpoint,
+        source_path=checkpoint_path,
+        diagnostic_session=diagnostic_session,
+    )
     if (
         result["campaign_id"] != selection.campaign_id
         or result["selection_id"] != selection.selection_id
@@ -577,7 +716,7 @@ def run_binary64_survey(
         path.with_name(f"{path.name}.timing.jsonl")
     )
     make_session_id = session_id_factory or (lambda: uuid4().hex)
-    failure_monitor = ProductionFailureMonitor()
+    failure_monitor = ProductionFailureMonitor(diagnostic_session=diagnostic_session)
 
     def persist(value: Mapping[str, object]) -> dict[str, object]:
         durable = validate_schema11_checkpoint(value)
@@ -603,8 +742,9 @@ def run_binary64_survey(
 
     for leaf_id in selection.ordered_leaf_ids:
         leaf = leaves[leaf_id]
+        leaf_index = selection.ordered_leaf_ids.index(leaf_id) + 1
         leaf_context = {
-            "leaf_index": selection.ordered_leaf_ids.index(leaf_id) + 1,
+            "leaf_index": leaf_index,
             "leaf_count": len(selection.ordered_leaf_ids),
             "leaf_id": leaf_id,
             "role": leaf.role,
@@ -623,13 +763,86 @@ def run_binary64_survey(
         if leaf_id in binary64_ledger:
             skipped += 1
             continue
-        failure_monitor.abort_before_leaf(
-            result, leaf_id=leaf_id, persist_checkpoint=lambda value: persist(value)
-        )
         committed_before_leaf = result
         timing_recorder: TimingSessionRecorder | None = None
+
+        def append_binary64_structural_event(
+            event_kind: str,
+            *,
+            operation_identity: str | None,
+            disposition: str | None,
+            reason_code: str | None,
+            root_seal_sha256: str | None,
+            source_record_sha256: str | None,
+            source_stage_sha256: str | None,
+            provisional_stage_sha256: str | None,
+            post_commit: Mapping[str, object] | None,
+        ) -> None:
+            if diagnostic_session is None:
+                return
+            diagnostic_session.append(
+                event_kind,
+                leaf={
+                    "index": leaf_index,
+                    "count": len(selection.ordered_leaf_ids),
+                    "leaf_id": leaf_id,
+                    "role": leaf.role,
+                    "mode": "-".join(str(item) for item in leaf.leaf.mode),
+                    "exact_coordinate": leaf.job.sampling_coordinate.to_mapping(),
+                    "spin_display": str(leaf.job.spin),
+                    "mechanism": leaf.mechanism_id,
+                },
+                execution={
+                    "profile": "SURVEY",
+                    "pass": "binary64",
+                    "tier": "binary64",
+                    "operation_identity": operation_identity,
+                },
+                transition={
+                    "prior_state": "NOT_ATTEMPTED",
+                    "next_state": disposition,
+                    "reason_code": reason_code,
+                },
+                connections={
+                    "scientific_computation_identity": selection.scientific_identities[
+                        leaf_id
+                    ],
+                    "root_seal_sha256": root_seal_sha256,
+                    "source_record_sha256": source_record_sha256,
+                    "source_stage_sha256": source_stage_sha256,
+                    "provisional_stage_sha256": provisional_stage_sha256,
+                },
+                checkpoint={
+                    "pre_commit_sha256": hashlib.sha256(
+                        canonical_json_bytes(committed_before_leaf)
+                    ).hexdigest(),
+                    "post_commit_sha256": (
+                        None
+                        if post_commit is None
+                        else hashlib.sha256(
+                            canonical_json_bytes(post_commit)
+                        ).hexdigest()
+                    ),
+                },
+                compact_diagnostics={
+                    "julia_worker_launched": False,
+                },
+                durable=False,
+            )
+
         with progress_scope(**leaf_context):
             emit_progress(ProgressEventKind.LEAF_PASS_STARTED)
+        append_binary64_structural_event(
+            "BINARY64_LEAF_STARTED",
+            operation_identity=None,
+            disposition=None,
+            reason_code=None,
+            root_seal_sha256=None,
+            source_record_sha256=None,
+            source_stage_sha256=None,
+            provisional_stage_sha256=None,
+            post_commit=None,
+        )
 
         def guarded(action: Callable[[], object]) -> object:
             try:
@@ -677,34 +890,39 @@ def run_binary64_survey(
                         f"{cache_lookup.path}: {cache_lookup.reason}"
                     ))
                 )
-            if cache_lookup.status is SolvedLeafLookupStatus.HIT:
-                if cache_lookup.receipt is None:
-                    guarded(
-                        lambda: (_ for _ in ()).throw(
-                            ValueError("solved-leaf cache hit lacks a receipt")
+            if cache_lookup.status in {
+                SolvedLeafLookupStatus.HIT,
+                SolvedLeafLookupStatus.STALE,
+            }:
+                cache_record = guarded(
+                    lambda: _current_terminal_cache_record(
+                        plan,
+                        leaf_id,
+                        cache_lookup,
+                        record_validator=record_validator,
+                        diagnostic_session=diagnostic_session,
+                    )
+                )
+                if cache_record is not None:
+                    assert isinstance(cache_record, Mapping)
+                    if (
+                        retained is not None
+                        and canonical_json_bytes(retained)
+                        != canonical_json_bytes(cache_record)
+                    ):
+                        guarded(
+                            lambda: (_ for _ in ()).throw(
+                                TerminalCacheConflictError()
+                            )
                         )
-                    )
-                assert cache_lookup.receipt is not None
-                cache_record = cache_lookup.receipt.get("record")
-                if not isinstance(cache_record, Mapping):
-                    guarded(
-                        lambda: (_ for _ in ()).throw(
-                            ValueError("solved-leaf cache record is invalid")
+                    if retained is None:
+                        retained = cache_record
+                        result = guarded(
+                            lambda: add_numerical_record(result, retained)
                         )
-                    )
-                assert isinstance(cache_record, Mapping)
-                if record_validator is not None:
-                    guarded(lambda: record_validator(leaf_id, cache_record))
-                if retained is not None and dict(retained) != dict(cache_record):
-                    guarded(
-                        lambda: (_ for _ in ()).throw(TerminalCacheConflictError())
-                    )
-                if retained is None:
-                    retained = cache_record
-                    result = guarded(lambda: add_numerical_record(result, retained))
-                    assert isinstance(result, dict)
-                    existing_records[leaf_id] = retained
-                    cache_reused_from_store += 1
+                        assert isinstance(result, dict)
+                        existing_records[leaf_id] = retained
+                        cache_reused_from_store += 1
         if checkpoint_discovery is not None:
             terminal_cache_discovery = terminal_cache_discovery.add(
                 checkpoint_discovery.with_reused(1)
@@ -734,6 +952,17 @@ def run_binary64_survey(
             assert isinstance(result, dict)
             reused += 1
             result = persist(result)
+            append_binary64_structural_event(
+                "BINARY64_LEAF_DISPOSITION_RECORDED",
+                operation_identity="solved-leaf-cache/v1",
+                disposition=SurveyDisposition.CACHE_REUSED.value,
+                reason_code="EXACT_AUTHENTICATED_CACHE_HIT",
+                root_seal_sha256=None,
+                source_record_sha256=retained["record_sha256"],
+                source_stage_sha256=None,
+                provisional_stage_sha256=None,
+                post_commit=result,
+            )
             with progress_scope(
                 leaf_id=leaf_id,
                 execution_profile="SURVEY",
@@ -751,35 +980,58 @@ def run_binary64_survey(
             continue
 
         if leaf.mechanism_id == "horizon-admittance":
-            timing_recorder = TimingSessionRecorder(
-                log=operational_timing,
-                session_id=make_session_id(),
-                leaf_id=leaf_id,
-                execution_profile="SURVEY",
-                survey_pass="binary64",
-                clock=clock,
-            )
-            timing_recorder.start_tier("binary64")
-            with progress_scope(**leaf_context):
-                outcome = guarded(lambda: horizon_runner(leaf))
-            if not isinstance(outcome, Binary64PassOutcome):
-                guarded(
-                    lambda: (_ for _ in ()).throw(
-                        ValueError("binary64 horizon runner returned an invalid outcome")
-                    )
+            seal = guarded(lambda: root_seal_lookup(leaf))
+            if seal is None:
+                outcome = Binary64PassOutcome(
+                    disposition=SurveyDisposition.PROMOTION_PENDING_ROOT,
+                    operation_identity=BINARY64_HORIZON_OPERATION_V3,
+                    reason_code="ROOT_SEAL_UNAVAILABLE",
+                    queue_kind=PromotionQueueKind.ROOT,
                 )
-            assert isinstance(outcome, Binary64PassOutcome)
-            timing_recorder.complete_tier()
-            timing_summary = fold_timing_fragments(timing_recorder.fragments)
-            outcome = replace(
-                outcome,
-                tier_timing=timing_summary.tier_timing_mappings(),
-                session_fragments=tuple(
-                    fragment.to_mapping()
-                    for fragment in timing_recorder.fragments
-                ),
-            )
-            root_seal_sha256 = None
+                root_seal_sha256 = None
+            else:
+                if not isinstance(seal, AuthenticatedRootSeal):
+                    guarded(
+                        lambda: (_ for _ in ()).throw(
+                            ValueError("root seal lookup returned an invalid value")
+                        )
+                    )
+                assert isinstance(seal, AuthenticatedRootSeal)
+                if seal.branch_identity != leaf.job.root.branch_id:
+                    guarded(
+                        lambda: (_ for _ in ()).throw(
+                            ValueError("authenticated root seal branch mismatch")
+                        )
+                    )
+                root_seal_sha256 = seal.root_seal_sha256
+                timing_recorder = TimingSessionRecorder(
+                    log=operational_timing,
+                    session_id=make_session_id(),
+                    leaf_id=leaf_id,
+                    execution_profile="SURVEY",
+                    survey_pass="binary64",
+                    clock=clock,
+                )
+                timing_recorder.start_tier("binary64")
+                with progress_scope(**leaf_context):
+                    outcome = guarded(lambda: horizon_runner(leaf))
+                if not isinstance(outcome, Binary64PassOutcome):
+                    guarded(
+                        lambda: (_ for _ in ()).throw(
+                            ValueError("binary64 horizon runner returned an invalid outcome")
+                        )
+                    )
+                assert isinstance(outcome, Binary64PassOutcome)
+                timing_recorder.complete_tier()
+                timing_summary = fold_timing_fragments(timing_recorder.fragments)
+                outcome = replace(
+                    outcome,
+                    tier_timing=timing_summary.tier_timing_mappings(),
+                    session_fragments=tuple(
+                        fragment.to_mapping()
+                        for fragment in timing_recorder.fragments
+                    ),
+                )
         else:
             seal = guarded(lambda: root_seal_lookup(leaf))
             if seal is None:
@@ -865,6 +1117,8 @@ def run_binary64_survey(
                             equivalence_receipt=receipt,
                         )
                     )
+                canonical_background: CanonicalExteriorBackground | None = None
+                combined_batch: Binary64FixedRootBatch | None = None
                 if isinstance(batch, Binary64FixedRootBatch):
                     canonical = guarded(
                         lambda: canonical_background_from_binary64_batch(
@@ -872,6 +1126,8 @@ def run_binary64_survey(
                         )
                     )
                     assert isinstance(canonical, CanonicalExteriorBackground)
+                    canonical_background = canonical
+                    combined_batch = batch
                     if background_evidence_store is not None:
                         compatible_receipts: dict[
                             str, BackgroundEquivalenceReceipt
@@ -954,6 +1210,9 @@ def run_binary64_survey(
                             background, batch
                         )
                     )
+                    assert isinstance(combined, Binary64FixedRootBatch)
+                    canonical_background = background
+                    combined_batch = combined
                     determinant_error_evidence = guarded(lambda: (
                         None
                         if determinant_error_store is None
@@ -983,6 +1242,37 @@ def run_binary64_survey(
                         )
                     )
                     raise AssertionError("invalid batch guard returned")
+                if canonical_background is None or combined_batch is None:
+                    guarded(
+                        lambda: (_ for _ in ()).throw(
+                            ValueError("binary64 provisional background is missing")
+                        )
+                    )
+                    raise AssertionError("missing provisional background guard returned")
+                provisional_background_receipt = guarded(
+                    lambda: BackgroundEquivalenceReceipt.issue(
+                        reuse_key=reuse_key,
+                        job=leaf.job,
+                        canonical_background_sha256=canonical_background.sha256,
+                        fixed_root=seal.fixed_root,
+                    )
+                )
+                assert isinstance(
+                    provisional_background_receipt, BackgroundEquivalenceReceipt
+                )
+                if (
+                    isinstance(batch, Binary64ReusedBackgroundBatch)
+                    and receipt is not None
+                    and receipt != provisional_background_receipt
+                ):
+                    guarded(
+                        lambda: (_ for _ in ()).throw(
+                            ValueError(
+                                "reused binary64 background receipt is incompatible"
+                            )
+                        )
+                    )
+                    raise AssertionError("incompatible background receipt guard returned")
                 evidence_receipts = ({
                     "schema": "windows-solver.binary64-screening/1",
                     "batch": batch.to_mapping(),
@@ -1033,6 +1323,27 @@ def run_binary64_survey(
                         )
                         raise AssertionError("promotion guard returned")
                     queue_kind = PromotionQueueKind(queue_name)
+                    provisional_stage = None
+                    provisional_stage_sha256 = None
+                    provisional_operation_identity = None
+                    if queue_kind is PromotionQueueKind.RESPONSE:
+                        provisional_stage, provisional_stage_sha256 = guarded(
+                            lambda: build_exterior_provisional_stage(
+                                job=leaf.job,
+                                scientific_computation_identity=(
+                                    selection.scientific_identities[leaf_id]
+                                ),
+                                root_seal_sha256=seal.root_seal_sha256,
+                                raw_batch=batch,
+                                combined_batch=combined_batch,
+                                background=canonical_background,
+                                background_receipt=provisional_background_receipt,
+                                reason_code=reason_code,
+                            )
+                        )
+                        provisional_operation_identity = (
+                            "binary64-fixed-root-provisional/v1"
+                        )
                     outcome = Binary64PassOutcome(
                         disposition=(
                             SurveyDisposition.PROMOTION_PENDING_ROOT
@@ -1044,6 +1355,9 @@ def run_binary64_survey(
                         queue_kind=queue_kind,
                         sample_count=batch.sample_count,
                         sample_limit=batch.sample_limit,
+                        provisional_stage=provisional_stage,
+                        provisional_stage_sha256=provisional_stage_sha256,
+                        provisional_operation_identity=provisional_operation_identity,
                     )
                 assert timing_recorder is not None
                 timing_recorder.complete_tier()
@@ -1068,6 +1382,34 @@ def run_binary64_survey(
         )
         assert isinstance(result, dict)
         result = persist(result)
+        append_binary64_structural_event(
+            "BINARY64_LEAF_DISPOSITION_RECORDED",
+            operation_identity=outcome.operation_identity,
+            disposition=outcome.disposition.value,
+            reason_code=outcome.reason_code,
+            root_seal_sha256=root_seal_sha256,
+            source_record_sha256=(
+                None if outcome.record is None else outcome.record["record_sha256"]
+            ),
+            source_stage_sha256=outcome.stage_sha256,
+            provisional_stage_sha256=outcome.provisional_stage_sha256,
+            post_commit=result,
+        )
+        if outcome.provisional_stage is not None:
+            try:
+                provisional_stage_committed(leaf, outcome.provisional_stage)
+            except KeyboardInterrupt:
+                raise
+            except Exception as error:
+                # The provisional source stage is already durable in the
+                # checkpoint.  A failed publication must preserve it and
+                # fail closed against the current checkpoint.
+                abort_unexpected_system_failure(
+                    result,
+                    leaf_id=leaf_id,
+                    error=error,
+                    persist_checkpoint=lambda value: persist(value),
+                )
         if (
             outcome.record is not None
             and outcome.disposition is SurveyDisposition.COMPLETED
@@ -1125,20 +1467,25 @@ def run_binary64_survey(
         if outcome.disposition not in {
             SurveyDisposition.COMPLETED,
             SurveyDisposition.CACHE_REUSED,
-            SurveyDisposition.PROMOTION_PENDING_ROOT,
-            SurveyDisposition.PROMOTION_PENDING_RESPONSE,
         }:
-            failure_monitor.observe(
-                leaf_id,
-                _survey_failure_report(
-                    leaf,
-                    survey_pass="binary64",
-                    reason_code=outcome.reason_code,
-                    operation_identity=outcome.operation_identity,
-                    precision_tier="binary64",
-                    disposition=outcome.disposition,
-                ),
+            report = _survey_failure_report(
+                leaf,
+                survey_pass="binary64",
+                reason_code=outcome.reason_code,
+                operation_identity=outcome.operation_identity,
+                precision_tier="binary64",
+                disposition=outcome.disposition,
             )
+            if (
+                failure_monitor.observe_leaf_outcome(leaf_id, report).disposition
+                is FailureDisposition.SYSTEM_FAILURE
+            ):
+                failure_monitor.observe_system_failure(
+                    result,
+                    leaf_id=leaf_id,
+                    report=report,
+                    persist_checkpoint=lambda value: persist(value),
+                )
 
     exhaustion = binary64_pass_exhaustion(result, selection)
     with progress_scope(execution_profile="SURVEY", survey_pass="binary64"):
@@ -1285,6 +1632,8 @@ def _run_promoted_exterior_queue_entry(
     ],
     timing_recorder: TimingSessionRecorder,
     determinant_error_store: ReviewedDeterminantErrorStore | None,
+    root_promotion_group: _RootPromotionGroup | None,
+    provisional_predecessor_receipt: Mapping[str, object] | None,
 ) -> PromotedPassOutcome:
     queue_kind = PromotionQueueKind(entry["queue_kind"])
     seal = root_seal_lookup(leaf, entry)
@@ -1295,9 +1644,24 @@ def _run_promoted_exterior_queue_entry(
             raise ValueError("promoted response root seal digest mismatch")
         if seal.branch_identity != leaf.job.root.branch_id:
             raise ValueError("promoted response root seal branch mismatch")
+    elif root_promotion_group is not None:
+        if seal is not None:
+            root_promotion_group.reuse(seal)
+        elif root_promotion_group.terminal_outcome is not None:
+            return replace(
+                root_promotion_group.terminal_outcome,
+                root_read_count=0,
+                worker_launch_count=0,
+                tier_timing=(),
+                session_fragments=(),
+            )
+        elif root_promotion_group.seal is not None:
+            seal = root_promotion_group.seal
 
     tiers: list[str] = []
     receipts: list[Mapping[str, object]] = []
+    if provisional_predecessor_receipt is not None:
+        receipts.append(dict(provisional_predecessor_receipt))
     sample_count = root_reads = worker_launches = 0
     for digits in (40, 80):
         tier = f"BF{digits}"
@@ -1305,6 +1669,15 @@ def _run_promoted_exterior_queue_entry(
         timing_recorder.start_tier(tier)
         backend = backend_factory(leaf, digits)
         if seal is None:
+            if (
+                root_promotion_group is not None
+                and tier in root_promotion_group.attempted_tiers
+            ):
+                timing_recorder.complete_tier()
+                continue
+            if root_promotion_group is not None:
+                root_promotion_group.attempted_tiers.add(tier)
+                root_promotion_group.root_solve_count += 1
             root_reads += 1
             worker_launches += 1
             try:
@@ -1333,6 +1706,8 @@ def _run_promoted_exterior_queue_entry(
                         root_read_count=root_reads,
                         worker_launch_count=worker_launches,
                     )
+                    if root_promotion_group is not None:
+                        root_promotion_group.fail(outcome)
                     timing_recorder.complete_tier()
                     return outcome
                 outcome = _terminal_promoted_outcome(
@@ -1342,6 +1717,8 @@ def _run_promoted_exterior_queue_entry(
                     root_read_count=root_reads,
                     worker_launch_count=worker_launches,
                 )
+                if root_promotion_group is not None:
+                    root_promotion_group.fail(outcome)
                 timing_recorder.complete_tier()
                 return outcome
             if not isinstance(root_result, PromotedRootSolveResult):
@@ -1352,6 +1729,8 @@ def _run_promoted_exterior_queue_entry(
             if seal.branch_identity != leaf.job.root.branch_id:
                 raise ValueError("promoted PRIMARY root seal branch mismatch")
             root_seal_publish(leaf, seal)
+            if root_promotion_group is not None:
+                root_promotion_group.publish(seal, tier)
 
         worker_launches += 1
         try:
@@ -1408,7 +1787,7 @@ def _run_promoted_exterior_queue_entry(
             raise ValueError("promoted fixed-root survey batch budget mismatch")
         sample_count += batch.sample_count
         if determinant_error_store is not None:
-            seed_operator_approved_determinant_error_receipts(
+            retain_uncalibrated_determinant_error_evidence(
                 determinant_error_store,
                 leaf.job,
                 batch,
@@ -1549,6 +1928,15 @@ def _commit_promoted_outcome(
     queue_disposition = queue_dispositions.get(outcome.disposition)
     if queue_disposition is None:
         raise ValueError("promoted outcome is not terminal")
+    provisional_reuse_receipt = next(
+        (
+            receipt
+            for receipt in outcome.evidence_receipts
+            if isinstance(receipt, Mapping)
+            and receipt.get("schema") == EXTERIOR_PROVISIONAL_REUSE_RECEIPT_SCHEMA
+        ),
+        None,
+    )
     result = finish_promotion(
         result,
         queue_ordinal=queue_ordinal,
@@ -1562,7 +1950,14 @@ def _commit_promoted_outcome(
             "precision_tiers": list(outcome.precision_tiers),
             "result_record_sha256": record_sha256,
             "source_record_sha256": outcome.source_record_sha256,
+            "evidence_receipt_sha256s": [
+                receipt["receipt_sha256"]
+                for receipt in outcome.evidence_receipts
+                if isinstance(receipt, Mapping)
+                and isinstance(receipt.get("receipt_sha256"), str)
+            ],
         },
+        provisional_reuse_receipt=provisional_reuse_receipt,
     )
     result = record_survey_disposition(
         result,
@@ -1669,6 +2064,9 @@ def run_promoted_survey(
     root_seal_lookup: Callable[
         [object, Mapping[str, object]], AuthenticatedRootSeal | None
     ],
+    provisional_stage_lookup: Callable[
+        [object, Mapping[str, object]], Mapping[str, object] | None
+    ],
     backend_factory: Callable[[object, int], object],
     primary_root_runner: Callable[
         [object, object, int], PromotedRootSolveResult
@@ -1685,7 +2083,7 @@ def run_promoted_survey(
     ],
     root_seal_publish: Callable[
         [object, AuthenticatedRootSeal], None
-    ] | None = None,
+    ],
     determinant_error_store: ReviewedDeterminantErrorStore | None = None,
     solved_leaf_store: SolvedLeafStore | None = None,
     record_validator: RecordValidator | None = None,
@@ -1698,10 +2096,16 @@ def run_promoted_survey(
     terminal_record_committed: Callable[
         [object, Mapping[str, object]], None
     ] | None = None,
+    diagnostic_session: StructuralDiagnosticSession | None = None,
 ) -> PromotedSurveyRun:
     """Consume only pending promotion entries through BF40/BF80 survey work."""
 
-    result = validate_schema11_checkpoint(checkpoint)
+    result = _intake_checkpoint_records(
+        plan,
+        checkpoint,
+        source_path=checkpoint_path,
+        diagnostic_session=diagnostic_session,
+    )
     if (
         result["campaign_id"] != selection.campaign_id
         or result["selection_id"] != selection.selection_id
@@ -1714,7 +2118,7 @@ def run_promoted_survey(
         path.with_name(f"{path.name}.timing.jsonl")
     )
     make_session_id = session_id_factory or (lambda: uuid4().hex)
-    failure_monitor = ProductionFailureMonitor()
+    failure_monitor = ProductionFailureMonitor(diagnostic_session=diagnostic_session)
 
     def persist(value: Mapping[str, object]) -> dict[str, object]:
         durable = validate_schema11_checkpoint(value)
@@ -1749,6 +2153,40 @@ def run_promoted_survey(
         for item in entries
         if item["disposition"] == PromotionQueueDisposition.PENDING.value
     )
+    root_group_members: dict[str, tuple[RootDependencyKey, set[str]]] = {}
+    for snapshot in entries:
+        if (
+            snapshot["disposition"] != PromotionQueueDisposition.PENDING.value
+            or snapshot["queue_kind"] != PromotionQueueKind.ROOT.value
+        ):
+            continue
+        leaf_id = str(snapshot["leaf_id"])
+        if leaf_id not in selection.scientific_identities or leaf_id not in leaves:
+            continue
+        key = RootDependencyKey.from_leaf(
+            leaves[leaf_id], arithmetic_tier=_ROOT_PROMOTION_ARITHMETIC_TIER
+        )
+        existing = root_group_members.get(key.sha256)
+        if existing is None:
+            root_group_members[key.sha256] = (key, {leaf_id})
+        else:
+            existing[1].add(leaf_id)
+    root_promotion_groups = {
+        digest: _RootPromotionGroup(
+            dependency_key=key,
+            canonical_primary_leaf_id=next(
+                leaf_id
+                for leaf_id in selection.ordered_leaf_ids
+                if leaf_id in members
+            ),
+            member_leaf_ids=tuple(
+                leaf_id
+                for leaf_id in selection.ordered_leaf_ids
+                if leaf_id in members
+            ),
+        )
+        for digest, (key, members) in root_group_members.items()
+    }
     for snapshot in entries:
         ordinal = int(snapshot["queue_ordinal"])
         if snapshot["disposition"] != PromotionQueueDisposition.PENDING.value:
@@ -1765,6 +2203,14 @@ def run_promoted_survey(
         if leaf_id in result["survey_pass_ledger"]["promoted"]:
             raise ValueError("pending promotion already has a pass disposition")
         leaf = leaves[leaf_id]
+        root_promotion_group = None
+        if snapshot["queue_kind"] == PromotionQueueKind.ROOT.value:
+            key = RootDependencyKey.from_leaf(
+                leaf, arithmetic_tier=_ROOT_PROMOTION_ARITHMETIC_TIER
+            )
+            root_promotion_group = root_promotion_groups.get(key.sha256)
+            if root_promotion_group is None:
+                raise ValueError("root promotion group is missing")
         leaf_context = {
             "leaf_index": selection.ordered_leaf_ids.index(leaf_id) + 1,
             "leaf_count": len(selection.ordered_leaf_ids),
@@ -1781,9 +2227,6 @@ def run_promoted_survey(
             "execution_profile": "SURVEY",
             "survey_pass": "promoted",
         }
-        failure_monitor.abort_before_leaf(
-            result, leaf_id=leaf_id, persist_checkpoint=lambda value: persist(value)
-        )
         committed_before_leaf = result
         with progress_scope(**leaf_context):
             emit_progress(ProgressEventKind.LEAF_PASS_STARTED)
@@ -1833,6 +2276,17 @@ def run_promoted_survey(
                 )
 
         guarded(validate_binary64_disposition_binding)
+
+        # PR69 cache-first architecture: terminal-cache discovery and
+        # conflict detection precede the exterior provisional-stage
+        # requirement. If a promoted leaf already has an exact
+        # authenticated terminal record — from the checkpoint or the
+        # solved-leaf store — reuse it and skip backend, provisional
+        # lookup, and root work entirely. If two exact terminal sources
+        # disagree, that is a system failure before backend construction.
+        # The provisional-stage check only runs on a genuine cache miss,
+        # further down in the exterior branch.
+        provisional_predecessor_receipt: Mapping[str, object] | None = None
 
         retained = existing_records.get(leaf_id)
         horizon_source_record = (
@@ -1899,39 +2353,46 @@ def run_promoted_survey(
                         f"{cache_lookup.path}: {cache_lookup.reason}"
                     ))
                 )
-            if cache_lookup.status is SolvedLeafLookupStatus.HIT:
-                if cache_lookup.receipt is None:
-                    guarded(
-                        lambda: (_ for _ in ()).throw(
-                            ValueError("solved-leaf cache hit lacks a receipt")
+            if cache_lookup.status in {
+                SolvedLeafLookupStatus.HIT,
+                SolvedLeafLookupStatus.STALE,
+            }:
+                cache_record = guarded(
+                    lambda: _current_terminal_cache_record(
+                        plan,
+                        leaf_id,
+                        cache_lookup,
+                        record_validator=record_validator,
+                        diagnostic_session=diagnostic_session,
+                    )
+                )
+                if cache_record is not None:
+                    assert isinstance(cache_record, Mapping)
+                    if (
+                        retained is not None
+                        and canonical_json_bytes(retained)
+                        != canonical_json_bytes(cache_record)
+                    ):
+                        guarded(
+                            lambda: (_ for _ in ()).throw(
+                                TerminalCacheConflictError()
+                            )
                         )
-                    )
-                assert cache_lookup.receipt is not None
-                cache_record = cache_lookup.receipt.get("record")
-                if not isinstance(cache_record, Mapping):
-                    guarded(
-                        lambda: (_ for _ in ()).throw(
-                            ValueError("solved-leaf cache record is invalid")
+                    if retained is None:
+                        retained = cache_record
+                        result = guarded(
+                            lambda: add_numerical_record(result, retained)
                         )
-                    )
-                assert isinstance(cache_record, Mapping)
-                if record_validator is not None:
-                    guarded(lambda: record_validator(leaf_id, cache_record))
-                if retained is not None and dict(retained) != dict(cache_record):
-                    guarded(
-                        lambda: (_ for _ in ()).throw(TerminalCacheConflictError())
-                    )
-                if retained is None:
-                    retained = cache_record
-                    result = guarded(lambda: add_numerical_record(result, retained))
-                    assert isinstance(result, dict)
-                    existing_records[leaf_id] = retained
-                    cache_reused_from_store += 1
+                        assert isinstance(result, dict)
+                        existing_records[leaf_id] = retained
+                        cache_reused_from_store += 1
         if checkpoint_discovery is not None:
             terminal_cache_discovery = terminal_cache_discovery.add(
                 checkpoint_discovery.with_reused(1)
             )
         if retained is not None and not horizon_source_record:
+            if root_promotion_group is not None:
+                root_promotion_group.status = "SUPERSEDED_BY_CACHE"
             result = guarded(lambda: _commit_promoted_cache_reuse(
                 result,
                 leaf_id=leaf_id,
@@ -2002,6 +2463,51 @@ def run_promoted_survey(
                 ),
             )
         else:
+            # Cache-first: this branch is only reached on a genuine
+            # terminal-cache miss for exterior leaves. Only here does the
+            # exterior RESPONSE provisional-stage requirement apply.
+            if (
+                snapshot["queue_kind"] == PromotionQueueKind.RESPONSE.value
+                and snapshot.get("source_record_sha256") is None
+            ):
+                provisional_stage = guarded(
+                    lambda: provisional_stage_lookup(leaf, snapshot)
+                )
+                if not isinstance(provisional_stage, Mapping):
+                    guarded(
+                        lambda: (_ for _ in ()).throw(
+                            ValueError(
+                                "exterior RESPONSE promotion lacks a provisional stage"
+                            )
+                        )
+                    )
+                    raise AssertionError(
+                        "missing provisional stage guard returned"
+                    )
+                source_root_seal_sha256 = snapshot.get("source_root_seal_sha256")
+                if not isinstance(source_root_seal_sha256, str):
+                    guarded(
+                        lambda: (_ for _ in ()).throw(
+                            ValueError(
+                                "exterior provisional promotion lacks a root seal"
+                            )
+                        )
+                    )
+                    raise AssertionError(
+                        "missing provisional root guard returned"
+                    )
+                provisional_predecessor_receipt = guarded(
+                    lambda: consume_authenticated_binary64_provisional_predecessor(
+                        provisional_stage,
+                        job=leaf.job,
+                        scientific_computation_identity=(
+                            selection.scientific_identities[leaf_id]
+                        ),
+                        root_seal_sha256=source_root_seal_sha256,
+                    )
+                )
+                assert isinstance(provisional_predecessor_receipt, Mapping)
+
             def execute_exterior() -> PromotedPassOutcome:
                 recorder = TimingSessionRecorder(
                     log=operational_timing,
@@ -2017,16 +2523,16 @@ def run_promoted_survey(
                             leaf,
                             snapshot,
                             root_seal_lookup=root_seal_lookup,
-                            root_seal_publish=(
-                                root_seal_publish
-                                if root_seal_publish is not None
-                                else lambda _leaf, _seal: None
-                            ),
+                            root_seal_publish=root_seal_publish,
                             backend_factory=backend_factory,
                             primary_root_runner=primary_root_runner,
                             produced_record_builder=produced_record_builder,
                             timing_recorder=recorder,
                             determinant_error_store=determinant_error_store,
+                            root_promotion_group=root_promotion_group,
+                            provisional_predecessor_receipt=(
+                                provisional_predecessor_receipt
+                            ),
                         )
                 except BaseException:
                     if recorder.active_tier is not None:
@@ -2085,17 +2591,24 @@ def run_promoted_survey(
             SurveyDisposition.CACHE_REUSED,
             SurveyDisposition.SUPERSEDED_BY_CACHE,
         }:
-            failure_monitor.observe(
-                leaf_id,
-                _survey_failure_report(
-                    leaf,
-                    survey_pass="promoted",
-                    reason_code=outcome.reason_code,
-                    operation_identity="promoted-survey-production/v1",
-                    precision_tier="+".join(outcome.precision_tiers),
-                    disposition=outcome.disposition,
-                ),
+            report = _survey_failure_report(
+                leaf,
+                survey_pass="promoted",
+                reason_code=outcome.reason_code,
+                operation_identity="promoted-survey-production/v1",
+                precision_tier="+".join(outcome.precision_tiers),
+                disposition=outcome.disposition,
             )
+            if (
+                failure_monitor.observe_leaf_outcome(leaf_id, report).disposition
+                is FailureDisposition.SYSTEM_FAILURE
+            ):
+                failure_monitor.observe_system_failure(
+                    result,
+                    leaf_id=leaf_id,
+                    report=report,
+                    persist_checkpoint=lambda value: persist(value),
+                )
         timing_by_tier = {
             item["tier"]: item["elapsed_seconds"] for item in outcome.tier_timing
         }
@@ -2136,6 +2649,33 @@ def run_promoted_survey(
             total_leaf_seconds=sum(timing_by_tier.values()),
         ):
             emit_progress(ProgressEventKind.LEAF_PASS_DISPOSITION_RECORDED)
+    if diagnostic_session is not None:
+        for group in sorted(
+            root_promotion_groups.values(),
+            key=lambda item: item.dependency_key.sha256,
+        ):
+            diagnostic_session.append(
+                "ROOT_PROMOTION_GROUP_FINISHED",
+                leaf={"leaf_id": group.canonical_primary_leaf_id},
+                execution={"profile": "SURVEY", "pass": "promoted"},
+                connections={
+                    "root_dependency_key_sha256": group.dependency_key.sha256,
+                    "root_seal_sha256": (
+                        None if group.seal is None else group.seal.root_seal_sha256
+                    ),
+                },
+                compact_diagnostics={
+                    "root_dependency_key": group.dependency_key.to_mapping(),
+                    "canonical_primary_leaf_id": group.canonical_primary_leaf_id,
+                    "member_leaf_ids": list(group.member_leaf_ids),
+                    "member_leaf_count": len(group.member_leaf_ids),
+                    "root_solve_count": group.root_solve_count,
+                    "publication_count": group.publication_count,
+                    "resolved_precision_tier": group.resolved_precision_tier,
+                    "status": group.status,
+                },
+                durable=True,
+            )
     exhaustion = promoted_pass_exhaustion(
         result, selection, applicable_queue_ordinals
     )
@@ -2241,6 +2781,7 @@ def dispatch_cache_first(
     backend_factory: Callable[[], object],
     execute_misses: Callable[[object], object],
     record_validator: RecordValidator | None = None,
+    record_intake_assessor: RecordIntakeAssessor | None = None,
 ) -> CacheFirstOutcome:
     """Return exact hits before constructing a backend; execute only on a miss."""
 
@@ -2255,15 +2796,39 @@ def dispatch_cache_first(
                 f"trusted solved-leaf cache receipt is corrupt: {lookup.path}: "
                 f"{lookup.reason}"
             )
-        if lookup.status is not SolvedLeafLookupStatus.HIT:
+        if lookup.status not in {
+            SolvedLeafLookupStatus.HIT,
+            SolvedLeafLookupStatus.STALE,
+        }:
             missing.append(leaf_id)
             continue
         if lookup.receipt is None:
-            raise ValueError("solved-leaf cache hit has no authenticated receipt")
+            raise ValueError("solved-leaf cache result has no authenticated receipt")
         record = lookup.receipt["record"]
         if not isinstance(record, Mapping):
-            raise ValueError("solved-leaf cache hit record is invalid")
-        if record_validator is not None:
+            raise ValueError("solved-leaf cache result record is invalid")
+        if (
+            record.get("schema") == "windows-solver.schema11-numerical-record/1"
+            and record_intake_assessor is None
+        ):
+            raise ValueError("schema-11 cache dispatch requires central record intake")
+        intake = (
+            None
+            if record_intake_assessor is None
+            else record_intake_assessor(leaf_id, record)
+        )
+        if intake is not None:
+            if not intake.response_admissible:
+                missing.append(leaf_id)
+                continue
+            admitted = intake.record
+            if not isinstance(admitted, Mapping):
+                raise ValueError("central record intake result is invalid")
+            record = admitted
+        if lookup.status is not SolvedLeafLookupStatus.HIT:
+            missing.append(leaf_id)
+            continue
+        if record_intake_assessor is None and record_validator is not None:
             record_validator(leaf_id, record)
         records[leaf_id] = dict(record)
 

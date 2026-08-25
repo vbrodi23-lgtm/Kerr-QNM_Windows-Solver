@@ -1518,16 +1518,17 @@ class JuliaSchemaThreeConditioningTests(unittest.TestCase):
         self.assertIsNone(policy["horizon_determinant_chart"])
         self.assertIsNone(policy["scattering_chart_safety_factor"])
         # The exterior determinant keeps its own representation and omits the
-        # horizon-only contour/calibration labels.  Its empirical determinant
-        # certificate is mechanism-specific request evidence, not horizon
-        # geometry.
+        # horizon-only contour/calibration labels. The default exterior
+        # diagnostic model is the additive-channels provisional contract;
+        # the empirical certificate identity is available but must be
+        # requested explicitly.
         self.assertEqual(
             policy["homogeneous_representation"], "factored-plane-wave-gsn/v1"
         )
         self.assertNotIn("horizon_contour", policy)
         self.assertEqual(
             policy["determinant_error_model"],
-            EXTERIOR_DETERMINANT_ABSOLUTE_ERROR_CERTIFICATE,
+            response_engine.EXTERIOR_PROVISIONAL_DETERMINANT_ERROR_MODEL,
         )
         self.assertNotIn("control_profile_label", policy)
         self.assertNotIn("calibration_status", policy)

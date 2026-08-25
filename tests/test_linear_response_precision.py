@@ -13,6 +13,7 @@ from types import SimpleNamespace
 import unittest
 
 import windows_solver.julia_response_backend as julia_backend
+import windows_solver.response_engine as response_engine
 from windows_solver.contracts import canonical_json_bytes
 from windows_solver.campaign_reports import refresh_campaign_reports
 from windows_solver.progress import activate_progress
@@ -340,6 +341,7 @@ def _with_baseline_conditioning(
     raw_determinant_evidence_status=None,
     receipt_job=None,
     receipt_role=None,
+    diagnostic_model_identity=None,
 ):
     result = ComponentResult.from_mapping(outcome.component_result["result"])
     mapping = valid_numerical_conditioning(result.mechanism_id)
@@ -350,12 +352,23 @@ def _with_baseline_conditioning(
     })
     evidence = NumericalConditioningEvidence.from_mapping(mapping)
     horizon = evidence.scattering_diagnostics_applicable
+    if diagnostic_model_identity is None:
+        diagnostic_model_identity = (
+            VERIFIED_ENDPOINT_ERROR_MODEL
+            if horizon
+            else response_engine.EXTERIOR_PROVISIONAL_DETERMINANT_ERROR_MODEL
+        )
     raw_status = (
         raw_determinant_evidence_status
-        if horizon
+        if diagnostic_model_identity
+        != response_engine.EXTERIOR_PROVISIONAL_DETERMINANT_ERROR_MODEL
         else "not-applicable/v1"
     )
-    if horizon and raw_status is None:
+    if (
+        diagnostic_model_identity
+        != response_engine.EXTERIOR_PROVISIONAL_DETERMINANT_ERROR_MODEL
+        and raw_status is None
+    ):
         raw_status = "available/v1"
 
     production_request_backend = None
@@ -381,6 +394,7 @@ def _with_baseline_conditioning(
                 determinant_family, outcome.digits
             ),
             calibration_receipt=calibration_receipt,
+            diagnostic_model_identity=diagnostic_model_identity,
         )
         scientific_runtime = production_request_backend.scientific_runtime_for(
             receipt_job
@@ -491,10 +505,17 @@ def _with_baseline_conditioning(
                 derivative * correction_tolerance * Decimal(2),
             )
         correction = normalised / derivative
+        request_model = request_binding.get("diagnostic_model_identity")
+        if not isinstance(request_model, str):
+            request_model = diagnostic_model_identity
+        contract = response_engine.raw_determinant_contract_from_request(
+            request_binding
+        )
         error_model_id = (
-            VERIFIED_ENDPOINT_ERROR_MODEL
-            if horizon
-            else EXTERIOR_DETERMINANT_ABSOLUTE_ERROR_CERTIFICATE
+            None
+            if request_model
+            == response_engine.EXTERIOR_PROVISIONAL_DETERMINANT_ERROR_MODEL
+            else request_model
         )
         primary = PrimaryRootAcceptanceEvidence(
             policy_id=PROMOTED_ROOT_READOUT_POLICY,
@@ -533,7 +554,9 @@ def _with_baseline_conditioning(
                     accepted=True,
                     fixed_root=True,
                     derivative_source="PRIMARY_COMPLEX",
-                    raw_determinant_evaluation_count=(1 if horizon else 3),
+                    raw_determinant_evaluation_count=(
+                        contract.required_raw_determinant_count
+                    ),
                 )
                 diagnostic_readouts[family] = DiagnosticRootReadout(
                     omega_delta_from_primary=0.0j,

@@ -13,21 +13,27 @@ _REQUIRED_CALLS = {
         "run_binary64_survey": {
             "root_seal_lookup",
             "native_backend_factory",
+            "provisional_stage_committed",
             "equivalence_receipt_lookup",
             "determinant_error_store",
             "background_evidence_store",
             "solved_leaf_store",
+            "terminal_record_committed",
             "checkpoint_committed",
+            "diagnostic_session",
         },
     },
     "run_native_promoted_pass": {
         "run_promoted_survey": {
             "root_seal_lookup",
+            "provisional_stage_lookup",
             "root_seal_publish",
             "backend_factory",
             "determinant_error_store",
             "solved_leaf_store",
+            "terminal_record_committed",
             "checkpoint_committed",
+            "diagnostic_session",
         },
     },
 }

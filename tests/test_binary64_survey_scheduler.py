@@ -4,11 +4,18 @@ import hashlib
 import json
 from pathlib import Path
 import tempfile
+from types import SimpleNamespace
 import unittest
 
-from windows_solver.campaign_policy import empty_schema11_checkpoint
+from windows_solver.campaign_policy import (
+    PromotionQueueKind,
+    SurveyDisposition,
+    empty_schema11_checkpoint,
+    validate_schema11_checkpoint,
+)
 from windows_solver.campaign_failures import CampaignSystemFailure
 from windows_solver.campaign_recovery import RecoverySelection
+from windows_solver.campaign_runtime import _typed_horizon_failure_code
 from windows_solver.campaign_timing import CampaignTimingLog
 from windows_solver.campaign_survey import (
     AuthenticatedRootSeal,
@@ -16,6 +23,10 @@ from windows_solver.campaign_survey import (
     run_binary64_survey,
 )
 from windows_solver.contracts import canonical_json_bytes
+from windows_solver.structural_diagnostics import (
+    StructuralDiagnosticSession,
+    read_structural_events,
+)
 from windows_solver.response_batches import (
     PrecisionCapabilities,
     build_campaign_plan,
@@ -24,7 +35,7 @@ from windows_solver.response_batches import (
 )
 from windows_solver.response_engine import (
     BackgroundEquivalenceReceipt,
-    Binary64SurveyDisposition,
+    ComponentStatus,
     NumericalPolicy,
     VettedNativeDeterminantKernel,
 )
@@ -134,6 +145,7 @@ class Binary64SurveySchedulerTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temporary:
             checkpoint_path = Path(temporary) / "checkpoint.json"
+            published_stage_sha256s: list[str] = []
             result = run_binary64_survey(
                 self.plan,
                 self.selection,
@@ -153,6 +165,9 @@ class Binary64SurveySchedulerTests(unittest.TestCase):
                 produced_record_builder=lambda leaf, batch, screening: _record(
                     leaf.leaf_id, screening.response_disk.centre
                 ),
+                provisional_stage_committed=lambda _leaf, stage: (
+                    published_stage_sha256s.append(stage["stage_sha256"])
+                ),
                 equivalence_receipt_lookup=equivalence,
             )
 
@@ -163,14 +178,164 @@ class Binary64SurveySchedulerTests(unittest.TestCase):
             self.assertTrue(all(
                 entry["queue_kind"] == "RESPONSE"
                 and entry["reason_code"]
-                == "DETERMINANT_ERROR_EVIDENCE_UNAVAILABLE"
+                == "BLOCKED_BY_REVIEWED_ERROR_EVIDENCE"
                 for entry in queued
             ))
             self.assertEqual(
                 exterior_leaf_ids, {entry["leaf_id"] for entry in queued}
             )
             self.assertEqual(result.queued_count, len(exterior_leaf_ids))
+            self.assertEqual(len(queued), len(published_stage_sha256s))
             self.assertTrue(checkpoint_path.is_file())
+
+    def test_full_structural_212_leaf_orchestration_is_worker_free(self) -> None:
+        """The production scheduler completes a non-physics atlas trace.
+
+        This exercises real campaign leaf plans, schema-11 persistence, root
+        dependency sharing, retained exterior provisional stages, and the
+        advisory repetition path without launching a numerical worker.
+        """
+
+        self.assertEqual(212, len(self.selection.ordered_leaf_ids))
+        backend = _AnalyticBackend()
+        root_seals: dict[str, AuthenticatedRootSeal] = {}
+        root_builds: list[str] = []
+        root_lookups: list[str] = []
+        horizon_started: list[str] = []
+        published_provisional_stage_sha256s: list[str] = []
+
+        def root_seal_lookup(leaf):
+            root_lookups.append(leaf.leaf_id)
+            key = leaf.job.root.identity_sha256
+            seal = root_seals.get(key)
+            if seal is None:
+                root_builds.append(key)
+                seal = AuthenticatedRootSeal(
+                    fixed_root=leaf.job.root.omega,
+                    branch_identity=leaf.job.root.branch_id,
+                    root_seal_sha256=_sha256({"root_identity": key}),
+                )
+                root_seals[key] = seal
+            return seal
+
+        def horizon_runner(leaf) -> Binary64PassOutcome:
+            horizon_started.append(leaf.leaf_id)
+            if len(horizon_started) <= 2:
+                return Binary64PassOutcome(
+                    disposition=SurveyDisposition.PROMOTION_PENDING_RESPONSE,
+                    operation_identity="binary64-horizon-production/v3",
+                    reason_code="HORIZON_ARITHMETIC_INADEQUATE",
+                    queue_kind=PromotionQueueKind.RESPONSE,
+                    minimum_requested_tier="BF80",
+                )
+            record, stage_sha256 = _record(leaf.leaf_id)
+            return Binary64PassOutcome.produced(
+                record=record,
+                stage_sha256=stage_sha256,
+                operation_identity="binary64-horizon-production/v3",
+                reason_code="BOUNDED_HORIZON_RESPONSE",
+            )
+
+        def equivalence(leaf, background):
+            return BackgroundEquivalenceReceipt.issue(
+                reuse_key=background.reuse_key,
+                job=leaf.job,
+                canonical_background_sha256=background.sha256,
+            )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            checkpoint_path = Path(temporary) / "checkpoint.json"
+            session = StructuralDiagnosticSession.open(
+                checkpoint_path=checkpoint_path,
+                session_id="full-structural-212",
+                campaign_id=self.selection.campaign_id,
+                selection_id=self.selection.selection_id,
+            )
+            result = run_binary64_survey(
+                self.plan,
+                self.selection,
+                empty_schema11_checkpoint(
+                    self.selection.campaign_id, self.selection.selection_id
+                ),
+                checkpoint_path=checkpoint_path,
+                root_seal_lookup=root_seal_lookup,
+                native_backend_factory=lambda: backend,
+                horizon_runner=horizon_runner,
+                produced_record_builder=lambda leaf, batch, screening: _record(
+                    leaf.leaf_id, screening.response_disk.centre
+                ),
+                provisional_stage_committed=lambda _leaf, stage: (
+                    published_provisional_stage_sha256s.append(stage["stage_sha256"])
+                ),
+                equivalence_receipt_lookup=equivalence,
+                diagnostic_session=session,
+            )
+            session.close_completed()
+            events = read_structural_events(session.paths.structural_events)
+
+        exterior_leaf_ids = {
+            leaf.leaf_id
+            for leaf in self.plan.leaves
+            if leaf.mechanism_id != "horizon-admittance"
+        }
+        queue = result.checkpoint["promotion_queue"]["entries"]
+        exterior_queue = [
+            item for item in queue if item["leaf_id"] in exterior_leaf_ids
+        ]
+        pass_ledger = result.checkpoint["survey_pass_ledger"]["binary64"]
+        root_keys = {leaf.job.root.identity_sha256 for leaf in self.plan.leaves}
+
+        self.assertEqual(set(self.selection.ordered_leaf_ids), set(pass_ledger))
+        self.assertEqual(len(self.selection.ordered_leaf_ids), len(pass_ledger))
+        self.assertEqual(
+            len(self.selection.ordered_leaf_ids),
+            result.completed_count + result.queued_count,
+        )
+        self.assertEqual([], result.checkpoint["system_failures"])
+        self.assertEqual(list(self.selection.ordered_leaf_ids), root_lookups)
+        self.assertEqual(len(root_keys), len(root_builds))
+        self.assertEqual(len(root_builds), len(set(root_builds)))
+        self.assertLess(len(root_builds), len(self.selection.ordered_leaf_ids))
+        self.assertGreaterEqual(len(horizon_started), 3)
+        self.assertEqual(len(exterior_leaf_ids), len(exterior_queue))
+        self.assertTrue(all(
+            item["provisional_stage"] is not None
+            and item["source_record_sha256"] is None
+            and item["source_stage_sha256"] == item["provisional_stage_sha256"]
+            for item in exterior_queue
+        ))
+        self.assertEqual(
+            {item["provisional_stage_sha256"] for item in exterior_queue},
+            set(published_provisional_stage_sha256s),
+        )
+        self.assertEqual(0, backend.julia_launches)
+        self.assertTrue(all(
+            entry["worker_launch_count"] == 0 for entry in pass_ledger.values()
+        ))
+        self.assertEqual(
+            result.checkpoint, validate_schema11_checkpoint(result.checkpoint)
+        )
+        self.assertEqual(
+            len(self.selection.ordered_leaf_ids),
+            sum(event["event_kind"] == "BINARY64_LEAF_STARTED" for event in events),
+        )
+        self.assertEqual(
+            len(self.selection.ordered_leaf_ids),
+            sum(
+                event["event_kind"] == "BINARY64_LEAF_DISPOSITION_RECORDED"
+                for event in events
+            ),
+        )
+        repeated = [
+            event
+            for event in events
+            if event["event_kind"] == "REPEATED_LEAF_OUTCOME_OBSERVED"
+        ]
+        self.assertGreaterEqual(len(repeated), 1)
+        self.assertTrue(all(
+            event["compact_diagnostics"]["campaign_aborted"] is False
+            for event in repeated
+        ))
 
     def test_typed_response_insufficiency_queues_and_advances_without_promotion(self) -> None:
         exterior = tuple(
@@ -190,6 +355,21 @@ class Binary64SurveySchedulerTests(unittest.TestCase):
         backend = _AnalyticBackend(flat_frequency=True)
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "checkpoint.json"
+            published_stage_sha256s: list[str] = []
+
+            def publish_provisional_stage(leaf, stage) -> None:
+                durable = json.loads(path.read_text(encoding="utf-8"))
+                entry = next(
+                    item
+                    for item in durable["promotion_queue"]["entries"]
+                    if item["leaf_id"] == leaf.leaf_id
+                )
+                self.assertEqual(stage, entry["provisional_stage"])
+                self.assertEqual(
+                    stage["stage_sha256"], entry["provisional_stage_sha256"]
+                )
+                published_stage_sha256s.append(stage["stage_sha256"])
+
             result = run_binary64_survey(
                 self.plan,
                 selection,
@@ -205,14 +385,183 @@ class Binary64SurveySchedulerTests(unittest.TestCase):
                 produced_record_builder=lambda *args: (_ for _ in ()).throw(
                     AssertionError("unbounded response produced a record")
                 ),
+                provisional_stage_committed=publish_provisional_stage,
+                equivalence_receipt_lookup=lambda leaf, background: (
+                    BackgroundEquivalenceReceipt.issue(
+                        reuse_key=background.reuse_key,
+                        job=leaf.job,
+                        canonical_background_sha256=background.sha256,
+                    )
+                ),
             )
 
             entries = result.checkpoint["promotion_queue"]["entries"]
             self.assertEqual(2, len(entries))
             self.assertTrue(all(item["queue_kind"] == "RESPONSE" for item in entries))
-            self.assertEqual(18, backend.determinant_calls)
+            stages = [item["provisional_stage"] for item in entries]
+            self.assertTrue(all(isinstance(stage, dict) for stage in stages))
+            self.assertTrue(all(
+                stage["stage_sha256"] == entry["provisional_stage_sha256"]
+                and stage["stage_sha256"] == entry["source_stage_sha256"]
+                and stage["raw_sample_roles"]
+                and len(stage["raw_determinant_samples"]) == 9
+                and len(stage["domega_evidence"]) == 4
+                and len(stage["dc_evidence"]) == 4
+                for entry, stage in zip(entries, stages)
+            ))
+            self.assertEqual({4, 9}, {stage["raw_sample_count"] for stage in stages})
+            self.assertEqual(13, backend.determinant_calls)
             self.assertEqual(0, result.completed_count)
             self.assertEqual(2, result.queued_count)
+            self.assertEqual(
+                [stage["stage_sha256"] for stage in stages],
+                published_stage_sha256s,
+            )
+
+            durable_checkpoint = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(result.checkpoint, durable_checkpoint)
+
+            restarted = run_binary64_survey(
+                self.plan,
+                selection,
+                durable_checkpoint,
+                checkpoint_path=path,
+                root_seal_lookup=lambda _leaf: self.fail(
+                    "restart must retain the committed provisional stage"
+                ),
+                native_backend_factory=lambda: self.fail(
+                    "restart must not rerun binary64 exterior work"
+                ),
+                horizon_runner=lambda _leaf: self.fail("unexpected horizon"),
+                produced_record_builder=lambda *_args: self.fail(
+                    "restart must not rebuild an exterior record"
+                ),
+                provisional_stage_committed=lambda *_args: self.fail(
+                    "restart must not republish a provisional stage"
+                ),
+            )
+            self.assertEqual(2, restarted.skipped_count)
+            self.assertEqual(
+                stages,
+                [item["provisional_stage"] for item in restarted.checkpoint[
+                    "promotion_queue"
+                ]["entries"]],
+            )
+
+    def test_repeated_horizon_derivative_outcomes_are_advisory(self) -> None:
+        """Two repeated numerical outcomes must not block the third leaf."""
+
+        horizon = tuple(
+            leaf.leaf_id
+            for leaf in self.plan.leaves
+            if leaf.mechanism_id == "horizon-admittance"
+        )[:3]
+        self.assertEqual(3, len(horizon))
+        selection = RecoverySelection(
+            campaign_id=self.selection.campaign_id,
+            selection_id="selection-repeated-horizon-outcome",
+            ordered_leaf_ids=horizon,
+            roles={leaf_id: self.selection.roles[leaf_id] for leaf_id in horizon},
+            scientific_identities={
+                leaf_id: self.selection.scientific_identities[leaf_id]
+                for leaf_id in horizon
+            },
+        )
+        started: list[str] = []
+
+        def horizon_outcome(leaf) -> Binary64PassOutcome:
+            started.append(leaf.leaf_id)
+            if len(started) <= 2:
+                return Binary64PassOutcome(
+                    disposition=SurveyDisposition.PROMOTION_PENDING_RESPONSE,
+                    operation_identity="binary64-horizon-production/v2",
+                    reason_code="HORIZON_ARITHMETIC_INADEQUATE",
+                    queue_kind=PromotionQueueKind.RESPONSE,
+                    minimum_requested_tier="BF80",
+                )
+            record, stage_sha256 = _record(leaf.leaf_id)
+            return Binary64PassOutcome(
+                disposition=SurveyDisposition.COMPLETED,
+                operation_identity="binary64-horizon-production/v2",
+                reason_code="BOUNDED_HORIZON_RESPONSE",
+                record=record,
+                stage_sha256=stage_sha256,
+            )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "checkpoint.json"
+            session = StructuralDiagnosticSession.open(
+                checkpoint_path=path,
+                session_id="repeated-horizon-outcome",
+                campaign_id=selection.campaign_id,
+                selection_id=selection.selection_id,
+            )
+            result = run_binary64_survey(
+                self.plan,
+                selection,
+                empty_schema11_checkpoint(selection.campaign_id, selection.selection_id),
+                checkpoint_path=path,
+                root_seal_lookup=lambda leaf: AuthenticatedRootSeal(
+                    fixed_root=leaf.job.root.omega,
+                    branch_identity=leaf.job.root.branch_id,
+                    root_seal_sha256="e" * 64,
+                ),
+                native_backend_factory=lambda: self.fail(
+                    "unresolved horizon must not construct an exterior backend"
+                ),
+                horizon_runner=horizon_outcome,
+                produced_record_builder=lambda *args: self.fail(
+                    "horizon survey must not build an exterior record"
+                ),
+                provisional_stage_committed=lambda *_args: self.fail(
+                    "horizon-only test must not publish an exterior stage"
+                ),
+                diagnostic_session=session,
+            )
+            session.close_completed()
+            events = read_structural_events(session.paths.structural_events)
+
+        self.assertEqual(list(horizon), started)
+        self.assertEqual([], result.checkpoint["system_failures"])
+        self.assertEqual(2, result.queued_count)
+        self.assertEqual(1, result.completed_count)
+        self.assertEqual(
+            set(horizon),
+            set(result.checkpoint["survey_pass_ledger"]["binary64"]),
+        )
+        queued = result.checkpoint["promotion_queue"]["entries"]
+        self.assertEqual(2, len(queued))
+        self.assertTrue(all(
+            item["queue_kind"] == "RESPONSE"
+            and item["reason_code"] == "HORIZON_ARITHMETIC_INADEQUATE"
+            and item["minimum_requested_tier"] == "BF80"
+            for item in queued
+        ))
+        repeated = [
+            event for event in events
+            if event["event_kind"] == "REPEATED_LEAF_OUTCOME_OBSERVED"
+        ]
+        self.assertEqual(1, len(repeated))
+        self.assertEqual(2, repeated[0]["compact_diagnostics"]["observation_count"])
+        self.assertEqual(list(horizon[:2]), repeated[0]["compact_diagnostics"]["all_observed_leaf_ids"])
+        self.assertFalse(repeated[0]["compact_diagnostics"]["campaign_aborted"])
+
+    def test_binary64_horizon_derivative_state_requests_bf80(self) -> None:
+        unresolved = SimpleNamespace(
+            analytic_horizon_evidence=None,
+            derivative_evidence=None,
+            resolved_window=None,
+            status=ComponentStatus.DERIVATIVE_UNRESOLVED,
+        )
+
+        self.assertEqual(
+            "HORIZON_ARITHMETIC_INADEQUATE",
+            _typed_horizon_failure_code(unresolved, binary64=True),
+        )
+        self.assertEqual(
+            "HORIZON_DERIVATIVE_UNRESOLVED",
+            _typed_horizon_failure_code(unresolved, binary64=False),
+        )
 
     def test_missing_root_queues_once_and_resume_is_zero_work(self) -> None:
         leaf_id = next(
@@ -246,6 +595,9 @@ class Binary64SurveySchedulerTests(unittest.TestCase):
                 native_backend_factory=forbidden_backend,
                 horizon_runner=lambda leaf: None,
                 produced_record_builder=lambda *args: None,
+                provisional_stage_committed=lambda *_args: self.fail(
+                    "missing-root outcome must not publish an exterior stage"
+                ),
             )
             second = run_binary64_survey(
                 self.plan,
@@ -258,6 +610,9 @@ class Binary64SurveySchedulerTests(unittest.TestCase):
                 native_backend_factory=forbidden_backend,
                 horizon_runner=lambda leaf: None,
                 produced_record_builder=lambda *args: None,
+                provisional_stage_committed=lambda *_args: self.fail(
+                    "restart must not publish an exterior stage"
+                ),
             )
 
             self.assertEqual(0, constructions)
@@ -314,6 +669,9 @@ class Binary64SurveySchedulerTests(unittest.TestCase):
                     native_backend_factory=lambda: backend,
                     horizon_runner=lambda leaf: None,
                     produced_record_builder=lambda *args: None,
+                    provisional_stage_committed=lambda *_args: self.fail(
+                        "backend failure must not publish an exterior stage"
+                    ),
                 )
 
             durable = json.loads(path.read_text(encoding="utf-8"))

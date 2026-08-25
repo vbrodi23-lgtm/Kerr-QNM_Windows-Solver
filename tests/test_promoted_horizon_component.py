@@ -123,14 +123,25 @@ def _promoted_baseline(
     omega: complex = OPERATOR_OMEGA,
     derivative: DecimalComplex = OPERATOR_DPRIME,
     conditioning_mechanism: str = "horizon-admittance",
+    diagnostic_model_identity: str | None = None,
 ) -> RootReadout:
     conditioning = NumericalConditioningEvidence.from_mapping(
         valid_numerical_conditioning(conditioning_mechanism)
     )
+    if diagnostic_model_identity is None:
+        diagnostic_model_identity = (
+            response_engine.VERIFIED_ENDPOINT_ERROR_MODEL
+            if conditioning.scattering_diagnostics_applicable
+            else response_engine.EXTERIOR_PROVISIONAL_DETERMINANT_ERROR_MODEL
+        )
+    contract_fields = response_engine.raw_determinant_contract_fields_for_model(
+        diagnostic_model_identity
+    )
     error_model_id = (
-        "verified-endpoint-control-equivalence-absolute-error/v2"
-        if conditioning.scattering_diagnostics_applicable
-        else None
+        None
+        if diagnostic_model_identity
+        == response_engine.EXTERIOR_PROVISIONAL_DETERMINANT_ERROR_MODEL
+        else diagnostic_model_identity
     )
     determinant = DecimalComplex(Decimal("1e-12"), Decimal(0))
     with localcontext() as context:
@@ -198,7 +209,9 @@ def _promoted_baseline(
             accepted=True,
             fixed_root=True,
             derivative_source="PRIMARY_COMPLEX",
-            raw_determinant_evaluation_count=1,
+            raw_determinant_evaluation_count=(
+                contract_fields["required_raw_determinant_count"]
+            ),
         )
         diagnostics[family] = DiagnosticRootReadout(
             omega_delta_from_primary=0.0j,
@@ -208,9 +221,10 @@ def _promoted_baseline(
             fixed_root_evidence=fixed,
         )
     raw_status = (
-        "available/v1"
-        if conditioning.scattering_diagnostics_applicable
-        else "not-applicable/v1"
+        "not-applicable/v1"
+        if diagnostic_model_identity
+        == response_engine.EXTERIOR_PROVISIONAL_DETERMINANT_ERROR_MODEL
+        else "available/v1"
     )
     return RootReadout(
         omega=omega,
@@ -331,13 +345,26 @@ class RootForbiddenHorizonResponseBackend:
         )
 
 
-def _with_worker_receipt(job, baseline, digits, primary_predictor):
+def _with_worker_receipt(
+    job,
+    baseline,
+    digits,
+    primary_predictor,
+    *,
+    diagnostic_model_identity: str | None = None,
+):
     calibration_receipt = load_default_calibration_receipt()
     determinant_family = (
         "horizon-scattering/v1"
         if job.mechanism_id == "horizon-admittance"
         else "exterior-wronskian/v1"
     )
+    if diagnostic_model_identity is None:
+        diagnostic_model_identity = (
+            response_engine.VERIFIED_ENDPOINT_ERROR_MODEL
+            if job.mechanism_id == "horizon-admittance"
+            else response_engine.EXTERIOR_PROVISIONAL_DETERMINANT_ERROR_MODEL
+        )
     adapter = SimpleNamespace(runtime_provenance={})
     backend = JuliaPrecisionRootBackend(
         job.backend_identity,
@@ -347,6 +374,7 @@ def _with_worker_receipt(job, baseline, digits, primary_predictor):
             determinant_family, digits
         ),
         calibration_receipt=calibration_receipt,
+        diagnostic_model_identity=diagnostic_model_identity,
     )
     runtime = backend.scientific_runtime_for(job)
     request = backend._request(
@@ -355,9 +383,7 @@ def _with_worker_receipt(job, baseline, digits, primary_predictor):
         primary_predictor,
         None,
     )
-    expected_raw_count = (
-        1 if job.mechanism_id == "horizon-admittance" else 3
-    )
+    contract = response_engine.raw_determinant_contract_from_request(request)
     baseline = replace(
         baseline,
         diagnostic_readouts={
@@ -365,7 +391,9 @@ def _with_worker_receipt(job, baseline, digits, primary_predictor):
                 diagnostic,
                 fixed_root_evidence=replace(
                     diagnostic.fixed_root_evidence,
-                    raw_determinant_evaluation_count=expected_raw_count,
+                    raw_determinant_evaluation_count=(
+                        contract.required_raw_determinant_count
+                    ),
                 ),
             )
             for family, diagnostic in baseline.diagnostic_readouts.items()

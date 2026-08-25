@@ -43,6 +43,9 @@ from .response_engine import (
     NumericalPolicy,
     HISTORICAL_PROMOTED_ROOT_READOUT_POLICY,
     BOUNDED_ANALYTIC_RESPONSE,
+    BINARY64_HORIZON_COMPONENT,
+    BINARY64_HORIZON_OPERATION_V3,
+    BINARY64_HORIZON_RESPONSE_METHOD,
     BOUNDED_DERIVATIVE_RESPONSE,
     EXTERIOR_SUPPORT_POLICY_ID,
     EXTERIOR_DERIVATIVE_COMPONENT_IDENTITY,
@@ -52,22 +55,33 @@ from .response_engine import (
     FIXED_ROOT_DERIVATIVE_CONDITIONING_IDENTITY,
     FULL_COMPLEX_LADDER_VALIDATION_IDENTITY,
     PROMOTED_HORIZON_COMPONENT_IDENTITY,
-    PROMOTED_HORIZON_COMPONENT_V2_IDENTITY,
+    PROMOTED_HORIZON_BOUNDED_COMPONENT_IDENTITY,
     PROMOTED_HORIZON_COMPONENT_V3_IDENTITY,
     PROMOTED_HORIZON_FAILURE_COMPONENT_IDENTITY,
     PROMOTED_HORIZON_FAILURE_RESPONSE_METHOD,
     PROMOTED_HORIZON_RESPONSE_METHOD,
-    PROMOTED_HORIZON_RESPONSE_METHOD_V2,
+    PROMOTED_HORIZON_BOUNDED_RESPONSE_METHOD,
     PROMOTED_HORIZON_RESPONSE_METHOD_V3,
     PromotedRootSeal,
     ROOT_SEALED_RESPONSE_REPAIR_IDENTITY,
     PROMOTED_ROOT_READOUT_POLICY,
+    FINITE_RADIUS_ENDPOINT_WEDGE_DETERMINANT_CONVENTION,
+    M02_HORIZON_EXTERIOR_RESPONSE_MATH_IDENTITY,
+    PR69_COMMIT9_HUMAN_MATH_REVIEW_SHA256,
     RECORDED_REPLAY_BACKEND_ID,
     RecordedReplayBackend,
     ResponseComponentJob,
     RootReadout,
     VettedNativeDeterminantKernel,
     WORKER_RESPONSE_RECEIPT_SCHEMA,
+    VERIFIED_ENDPOINT_ERROR_MODEL,
+    EXTERIOR_PROVISIONAL_DETERMINANT_ERROR_MODEL,
+    EXTERIOR_DETERMINANT_ABSOLUTE_ERROR_CERTIFICATE,
+    RawDeterminantContract,
+    raw_determinant_contract_fields_for_model,
+    raw_determinant_contract_from_request,
+    raw_determinant_evidence_semantics,
+    _validate_current_raw_determinant_policy,
     UNCALIBRATED_ANALYTIC_RESPONSE,
     regularised_gsn_precision_policy,
     root_readout_preserves_authenticated_branch,
@@ -83,7 +97,14 @@ from .response_engine import (
     run_promoted_horizon_response_from_seal,
     run_selective_readout_promotion,
 )
-from .response_uncertainty import ComplexDisk, ZeroContainingDiskError, horizon_response_disk
+from .response_uncertainty import (
+    ComplexDisk,
+    ZeroContainingDiskError,
+    horizon_chart_base_partials,
+    horizon_frequency_disk,
+    horizon_response_disk,
+)
+from .root_evidence import AuthenticatedRootEvidence
 from .partial_component_checkpoint import PartialComponentJournal
 from .promoted_control_calibration import (
     EmpiricalControlProfile,
@@ -209,7 +230,13 @@ _EXECUTION_ROLE_ORDER = {
     "deep": 1,
     "control": 2,
 }
-_LEGACY_MIGRATION_LOCK_TIMEOUT_SECONDS = 1.0
+# The migration wait must survive normal hosted-CI thread scheduling on
+# Windows while still bounding the wait so a genuinely dead writer fails
+# closed rather than blocking recovery indefinitely. Real solved-leaf
+# publishes take milliseconds; only a truly-stuck writer would exceed a
+# 30-second budget, which comfortably covers CI jitter and the test
+# harness's own 5-second coordination events.
+_LEGACY_MIGRATION_LOCK_TIMEOUT_SECONDS = 30.0
 _LEGACY_MIGRATION_LOCK_RETRY_SECONDS = 0.01
 _BINARY64_ROOT_CORRECTION_TOLERANCE_ABS = 2.0e-11
 _ACTIVE_CAMPAIGN_LEAF_CONTEXT: ContextVar[Mapping[str, object] | None] = ContextVar(
@@ -1520,6 +1547,27 @@ def _validate_failed_preflight_attempt_request(
             else None
         )
         validated_budget = _ode_error_budget_from_mapping(request_budget)
+        diagnostic_model_identity = request_binding.get(
+            "diagnostic_model_identity"
+        )
+        # A binding carries reviewed-calibration hashes only in the
+        # empirical-certificate mode. Their presence — not the mechanism
+        # or the absence of an ODE budget — is the wire-level signal that
+        # empirical reconstruction is required. Horizon and provisional
+        # exterior bindings both live in the "no ODE budget, no
+        # calibration hashes" fork and reconstruct with the default
+        # diagnostic identity for their mechanism.
+        empirical_calibration_bound = (
+            isinstance(request_policy, Mapping)
+            and (
+                request_policy.get(
+                    "promoted_control_calibration_receipt_sha256"
+                )
+                is not None
+                or request_policy.get("empirical_control_profile_sha256")
+                is not None
+            )
+        )
         if validated_budget is not None:
             expected_request = _CanonicalRequestJuliaPrecisionRootBackend(
                 leaf.job.backend_identity,
@@ -1527,13 +1575,14 @@ def _validate_failed_preflight_attempt_request(
                 precision_digits,
                 refinement=refinement_level,
                 ode_error_budget=validated_budget,
+                diagnostic_model_identity=diagnostic_model_identity,
             )._request(
                 leaf.job,
                 amplitude_value,
                 predictor_value,
                 predictor_kind,
             )
-        elif isinstance(request_policy, Mapping):
+        elif empirical_calibration_bound:
             receipt = load_default_calibration_receipt()
             family = (
                 "horizon-scattering/v1"
@@ -1560,6 +1609,38 @@ def _validate_failed_preflight_attempt_request(
                 refinement=refinement_level,
                 empirical_control_profile=profile,
                 calibration_receipt=receipt,
+                diagnostic_model_identity=diagnostic_model_identity,
+            )._request(
+                leaf.job,
+                amplitude_value,
+                predictor_value,
+                predictor_kind,
+            )
+        elif isinstance(request_policy, Mapping):
+            # No ODE budget and no empirical calibration hashes: this is
+            # a default provisional-exterior or horizon binding.
+            # _precision_policy still refuses to run without either a
+            # budget or an authenticated calibration pair, so pass the
+            # default calibration profile+receipt to satisfy the shared
+            # numerical-controls path without adding empirical fields —
+            # the diagnostic identity keeps the policy provisional or
+            # horizon-shaped, and the receipt hashes stay off the wire
+            # exactly as they did in the historical binding.
+            receipt = load_default_calibration_receipt()
+            family = (
+                "horizon-scattering/v1"
+                if leaf.mechanism_id == "horizon-admittance"
+                else "exterior-wronskian/v1"
+            )
+            profile = receipt.budget_for(family, precision_digits)
+            expected_request = _CanonicalRequestJuliaPrecisionRootBackend(
+                leaf.job.backend_identity,
+                object(),
+                precision_digits,
+                refinement=refinement_level,
+                empirical_control_profile=profile,
+                calibration_receipt=receipt,
+                diagnostic_model_identity=diagnostic_model_identity,
             )._request(
                 leaf.job,
                 amplitude_value,
@@ -2106,7 +2187,7 @@ def _failed_preflight_recovery_precision_contract() -> dict[str, object]:
         **_multi_readout_failed_preflight_recovery_precision_contract(),
         "primary_horizon_override": {
             "component_scientific_identity": (
-                PROMOTED_HORIZON_COMPONENT_V2_IDENTITY
+                PROMOTED_HORIZON_BOUNDED_COMPONENT_IDENTITY
             ),
             "base_refinement_levels": [0],
             "amplitude_readout_count": 1,
@@ -2143,9 +2224,9 @@ def _primary_recovery_precision_contract() -> dict[str, object]:
         "promoted_numerical_controls": promoted_precision_numerical_controls(),
         "promoted_horizon_component": {
             "component_scientific_identity": (
-                PROMOTED_HORIZON_COMPONENT_V2_IDENTITY
+                PROMOTED_HORIZON_BOUNDED_COMPONENT_IDENTITY
             ),
-            "response_method": PROMOTED_HORIZON_RESPONSE_METHOD_V2,
+            "response_method": PROMOTED_HORIZON_BOUNDED_RESPONSE_METHOD,
             "amplitude_readout_count": 1,
             "amplitudes": [
                 {"real": 0.0, "imaginary": 0.0},
@@ -2319,10 +2400,10 @@ def _response_uncertainty_contract() -> dict[str, object]:
         "version": 5,
         "promoted_root_readout_policy": PROMOTED_ROOT_READOUT_POLICY,
         "promoted_primary_horizon_component_identity": (
-            PROMOTED_HORIZON_COMPONENT_V2_IDENTITY
+            PROMOTED_HORIZON_BOUNDED_COMPONENT_IDENTITY
         ),
         "promoted_primary_horizon_response_method": (
-            PROMOTED_HORIZON_RESPONSE_METHOD_V2
+            PROMOTED_HORIZON_BOUNDED_RESPONSE_METHOD
         ),
         "promoted_primary_horizon_finite_amplitude_ladder": (
             "not-required-not-executed"
@@ -2544,6 +2625,62 @@ def _scientific_computation_identity_material(
     return material
 
 
+def _canonical_scientific_execution_contract(
+    scientific_execution_contract: Mapping[str, object] | None,
+) -> dict[str, object] | None:
+    if scientific_execution_contract is None:
+        return None
+    try:
+        canonical_contract = json.loads(
+            canonical_json_bytes(dict(scientific_execution_contract))
+        )
+    except (TypeError, ValueError) as error:
+        raise ValueError(
+            "solved-leaf scientific execution contract is invalid"
+        ) from error
+    if not isinstance(canonical_contract, dict):
+        raise ValueError("solved-leaf scientific execution contract is invalid")
+    return canonical_contract
+
+
+def _binary64_horizon_mathematics_identity() -> dict[str, object]:
+    return {
+        "binary64_operation": BINARY64_HORIZON_OPERATION_V3,
+        "component_identity": BINARY64_HORIZON_COMPONENT,
+        "response_method": BINARY64_HORIZON_RESPONSE_METHOD,
+        "mathematical_decision": M02_HORIZON_EXTERIOR_RESPONSE_MATH_IDENTITY,
+        "determinant_convention": (
+            FINITE_RADIUS_ENDPOINT_WEDGE_DETERMINANT_CONVENTION
+        ),
+        "human_review_receipt": PR69_COMMIT9_HUMAN_MATH_REVIEW_SHA256,
+    }
+
+
+def scientific_computation_identity_material(
+    plan: CampaignPlan,
+    leaf: CampaignLeafPlan,
+    *,
+    scientific_execution_contract: Mapping[str, object] | None = None,
+) -> dict[str, object]:
+    """Return the canonical current computation identity material."""
+
+    if leaf.leaf_id not in {item.leaf_id for item in plan.leaves}:
+        raise ValueError("solved-leaf scientific identity is outside the campaign plan")
+    material = _scientific_computation_identity_material(
+        plan, leaf, _leaf_precision_contract(leaf)
+    )
+    if leaf.mechanism_id == "horizon-admittance":
+        material["binary64_horizon_mathematics"] = (
+            _binary64_horizon_mathematics_identity()
+        )
+    canonical_contract = _canonical_scientific_execution_contract(
+        scientific_execution_contract
+    )
+    if canonical_contract is not None:
+        material["scientific_execution_contract"] = canonical_contract
+    return json.loads(canonical_json_bytes(material))
+
+
 def scientific_computation_identity_sha256(
     plan: CampaignPlan,
     leaf: CampaignLeafPlan,
@@ -2552,24 +2689,33 @@ def scientific_computation_identity_sha256(
 ) -> str:
     """Bind one requested calculation without binding campaign presentation code."""
 
+    material = scientific_computation_identity_material(
+        plan,
+        leaf,
+        scientific_execution_contract=scientific_execution_contract,
+    )
+    return _sha256(material)
+
+
+def forensic_v2_scientific_computation_identity_sha256(
+    plan: CampaignPlan,
+    leaf: CampaignLeafPlan,
+    *,
+    scientific_execution_contract: Mapping[str, object] | None = None,
+) -> str:
+    """Reconstruct the frozen pre-v3 identity solely to authenticate history."""
+
     if leaf.leaf_id not in {item.leaf_id for item in plan.leaves}:
-        raise ValueError("solved-leaf scientific identity is outside the campaign plan")
+        raise ValueError("forensic scientific identity is outside the campaign plan")
+    if leaf.mechanism_id != "horizon-admittance":
+        raise ValueError("forensic predecessor identity is horizon-only")
     material = _scientific_computation_identity_material(
         plan, leaf, _leaf_precision_contract(leaf)
     )
-    if scientific_execution_contract is not None:
-        try:
-            canonical_contract = json.loads(
-                canonical_json_bytes(dict(scientific_execution_contract))
-            )
-        except (TypeError, ValueError) as error:
-            raise ValueError(
-                "solved-leaf scientific execution contract is invalid"
-            ) from error
-        if not isinstance(canonical_contract, dict):
-            raise ValueError(
-                "solved-leaf scientific execution contract is invalid"
-            )
+    canonical_contract = _canonical_scientific_execution_contract(
+        scientific_execution_contract
+    )
+    if canonical_contract is not None:
         material["scientific_execution_contract"] = canonical_contract
     return _sha256(material)
 
@@ -3704,7 +3850,7 @@ def _single_promoted_horizon_result(
     result = ComponentResult.from_mapping(raw_result)
     if result.component_scientific_identity not in {
         PROMOTED_HORIZON_COMPONENT_IDENTITY,
-        PROMOTED_HORIZON_COMPONENT_V2_IDENTITY,
+        PROMOTED_HORIZON_BOUNDED_COMPONENT_IDENTITY,
         PROMOTED_HORIZON_COMPONENT_V3_IDENTITY,
         PROMOTED_HORIZON_FAILURE_COMPONENT_IDENTITY,
     }:
@@ -3778,7 +3924,7 @@ def _claims_specialized_promoted_semantics(result: ComponentResult) -> bool:
         or result.response_method in {
             EXTERIOR_DERIVATIVE_METHOD,
             PROMOTED_HORIZON_RESPONSE_METHOD,
-            PROMOTED_HORIZON_RESPONSE_METHOD_V2,
+            PROMOTED_HORIZON_BOUNDED_RESPONSE_METHOD,
             PROMOTED_HORIZON_RESPONSE_METHOD_V3,
         }
         or result.response_uncertainty_status in {
@@ -3833,7 +3979,7 @@ def _classify_promoted_stage(
 
     analytic_identity = identity in {
         PROMOTED_HORIZON_COMPONENT_IDENTITY,
-        PROMOTED_HORIZON_COMPONENT_V2_IDENTITY,
+        PROMOTED_HORIZON_BOUNDED_COMPONENT_IDENTITY,
         PROMOTED_HORIZON_COMPONENT_V3_IDENTITY,
         PROMOTED_HORIZON_FAILURE_COMPONENT_IDENTITY,
     }
@@ -4259,6 +4405,9 @@ def _validate_selective_tier_journal(
         "journal", "journal_sha256", "promoted_work_unit_ids",
         "scientific_runtime", "scientific_runtime_sha256",
         "ode_error_budget", "ode_error_budget_sha256",
+        "diagnostic_model_identity", "required_raw_determinant_roles",
+        "required_raw_determinant_count",
+        "evidence_level", "evidence_disposition",
     }
     empirical_fields = {
         "schema", "configured", "component_identity", "precision_tier",
@@ -4266,6 +4415,9 @@ def _validate_selective_tier_journal(
         "scientific_runtime", "scientific_runtime_sha256",
         "promoted_control_calibration", "empirical_control_profile",
         "empirical_control_profile_sha256",
+        "diagnostic_model_identity", "required_raw_determinant_roles",
+        "required_raw_determinant_count",
+        "evidence_level", "evidence_disposition",
     }
     if not isinstance(evidence, Mapping) or set(evidence) not in {
         frozenset(legacy_fields), frozenset(empirical_fields)
@@ -4279,12 +4431,56 @@ def _validate_selective_tier_journal(
     component_identity = (
         f"selective-signed-root-promotion-component/v1/{tier_label}"
     )
+    diagnostic_model_identity = evidence.get("diagnostic_model_identity")
+    diagnostic_roles = evidence.get("required_raw_determinant_roles")
+    diagnostic_count = evidence.get("required_raw_determinant_count")
+    if (
+        not isinstance(diagnostic_model_identity, str)
+        or not isinstance(diagnostic_roles, list)
+        or type(diagnostic_count) is not int
+    ):
+        raise _UnauthenticatedComponentEvidence(
+            "campaign selective tier raw determinant contract is invalid"
+        )
+    try:
+        expected_contract = raw_determinant_contract_from_request({
+            "mechanism_id": leaf.job.mechanism_id,
+            **raw_determinant_contract_fields_for_model(
+                diagnostic_model_identity
+            ),
+            "policy": {
+                "determinant_error_model": diagnostic_model_identity,
+            },
+        })
+        expected_semantics = raw_determinant_evidence_semantics(
+            expected_contract
+        )
+    except ValueError as error:
+        raise _UnauthenticatedComponentEvidence(
+            "campaign selective tier raw determinant contract is invalid"
+        ) from error
+    if (
+        diagnostic_roles
+        != list(expected_contract.required_raw_determinant_roles)
+        or diagnostic_count != expected_contract.required_raw_determinant_count
+        or evidence.get("evidence_level")
+        != expected_semantics["evidence_level"]
+        or evidence.get("evidence_disposition")
+        != expected_semantics["evidence_disposition"]
+    ):
+        raise _UnauthenticatedComponentEvidence(
+            "campaign selective tier evidence disposition is invalid"
+        )
     runtime = evidence.get("scientific_runtime")
     budget = evidence.get("ode_error_budget")
     runtime_sha256 = evidence.get("scientific_runtime_sha256")
     empirical = evidence.get("schema") == (
         _EMPIRICAL_SELECTIVE_TIER_JOURNAL_SCHEMA
     )
+    if empirical != expected_contract.empirical_certificate_required:
+        raise _UnauthenticatedComponentEvidence(
+            "campaign selective tier schema disagrees with diagnostic model"
+        )
     validated_budget: ODEErrorBudget | None = None
     empirical_profile: EmpiricalControlProfile | None = None
     empirical_receipt: _EmpiricalCalibrationBindingView | None = None
@@ -4304,6 +4500,78 @@ def _validate_selective_tier_journal(
         raise _UnauthenticatedComponentEvidence(
             "campaign selective tier runtime or ODE budget is invalid"
         )
+    if not empirical:
+        # A provisional root may use the pinned control profile as an
+        # operational numerical input.  That profile is not the selected
+        # empirical certificate and must not change the request's evidence
+        # disposition.  Authenticate it only so the journal can reconstruct
+        # the exact request without promoting it to schema 2.
+        runtime_profile = runtime.get("empirical_control_profile")
+        runtime_profile_sha256 = runtime.get(
+            "empirical_control_profile_sha256"
+        )
+        runtime_binding = runtime.get("promoted_control_calibration")
+        has_runtime_profile = any(
+            value is not None
+            for value in (
+                runtime_profile,
+                runtime_profile_sha256,
+                runtime_binding,
+            )
+        )
+        if has_runtime_profile:
+            determinant_family = (
+                "horizon-scattering/v1"
+                if leaf.job.mechanism_id == "horizon-admittance"
+                else "exterior-wronskian/v1"
+            )
+            try:
+                pinned_receipt = load_default_calibration_receipt()
+                pinned_profile = pinned_receipt.budget_for(
+                    determinant_family, digits
+                )
+            except (KeyError, ValueError) as error:
+                raise _UnauthenticatedComponentEvidence(
+                    "campaign selective tier operational control profile is invalid"
+                ) from error
+            expected_binding = {
+                "schema": (
+                    "windows-solver.promoted-control-calibration-binding/1"
+                ),
+                "receipt_identity": pinned_receipt.identity,
+                "receipt_sha256": pinned_receipt.sha256,
+                "execution_status": pinned_receipt.execution_status,
+                "source_audit_sha256": pinned_receipt.source_audit_sha256,
+                "determinant_family": determinant_family,
+                "determinant_certificate_identity": (
+                    pinned_receipt.certificate_identity
+                ),
+                "determinant_certificate_safety_factor": (
+                    pinned_receipt.certificate_safety_factor
+                ),
+                "derivative_floor_status": (
+                    pinned_receipt.derivative_floor_status_for(
+                        determinant_family
+                    )
+                ),
+            }
+            if (
+                not isinstance(runtime_binding, Mapping)
+                or dict(runtime_binding) != expected_binding
+                or not isinstance(runtime_profile, Mapping)
+                or dict(runtime_profile) != pinned_profile.to_mapping()
+                or runtime_profile_sha256 != _sha256(dict(runtime_profile))
+            ):
+                raise _UnauthenticatedComponentEvidence(
+                    "campaign selective tier operational control profile is invalid"
+                )
+            empirical_profile = pinned_profile
+            empirical_receipt = _EmpiricalCalibrationBindingView(
+                sha256=pinned_receipt.sha256,
+                certificate_identity=pinned_receipt.certificate_identity,
+                certificate_safety_factor=pinned_receipt.certificate_safety_factor,
+                profile=pinned_profile,
+            )
     if empirical:
         raw_binding = evidence.get("promoted_control_calibration")
         raw_profile = evidence.get("empirical_control_profile")
@@ -4384,19 +4652,28 @@ def _validate_selective_tier_journal(
     else:
         budget_sha256 = evidence.get("ode_error_budget_sha256")
         validated_budget = _ode_error_budget_from_mapping(budget)
+        valid_ode_budget = (
+            isinstance(budget, Mapping)
+            and validated_budget is not None
+            and validated_budget.to_mapping() == dict(budget)
+            and budget_sha256 == _sha256(dict(budget))
+            and budget.get("schema") == "windows-solver.ode-error-budget/1"
+            and budget.get("precision_tier") == tier_label
+            and budget.get("nominal_decimal_digits") == digits
+            and budget.get("working_precision_bits") == bits
+            and isinstance(budget.get("calibration_identity"), str)
+            and bool(budget["calibration_identity"])
+        )
+        valid_operational_profile = (
+            empirical_profile is not None
+            and empirical_receipt is not None
+            and budget is None
+            and budget_sha256 is None
+        )
         if (
             evidence.get("schema") != _SELECTIVE_TIER_JOURNAL_SCHEMA
             or set(evidence) != legacy_fields
-            or not isinstance(budget, Mapping)
-            or validated_budget is None
-            or validated_budget.to_mapping() != dict(budget)
-            or budget_sha256 != _sha256(dict(budget))
-            or budget.get("schema") != "windows-solver.ode-error-budget/1"
-            or budget.get("precision_tier") != tier_label
-            or budget.get("nominal_decimal_digits") != digits
-            or budget.get("working_precision_bits") != bits
-            or not isinstance(budget.get("calibration_identity"), str)
-            or not budget["calibration_identity"]
+            or not (valid_ode_budget or valid_operational_profile)
         ):
             raise _UnauthenticatedComponentEvidence(
                 "campaign selective tier runtime or ODE budget is invalid"
@@ -4464,6 +4741,7 @@ def _validate_selective_tier_journal(
         ode_error_budget=validated_budget,
         empirical_control_profile=empirical_profile,
         calibration_receipt=empirical_receipt,
+        diagnostic_model_identity=diagnostic_model_identity,
     )
     for work_unit_id in promoted_ids:
         entry = journal.entries[work_unit_id]
@@ -4509,9 +4787,22 @@ def _validate_selective_tier_journal(
             "mechanism_id", "amplitude", "precision_digits",
             "working_precision_bits", "semantic_precision_tier", "policy",
             "execution_resource", "primary_predictor",
+            "diagnostic_model_identity", "required_raw_determinant_roles",
+            "required_raw_determinant_count",
         }
         if leaf.job.mechanism_id != "horizon-admittance":
             expected_request_fields.add("support")
+        request_contract: RawDeterminantContract | None = None
+        if isinstance(request, Mapping):
+            try:
+                request_contract = raw_determinant_contract_from_request(request)
+                _validate_current_raw_determinant_policy(
+                    request, request_contract
+                )
+            except ValueError as error:
+                raise _UnauthenticatedComponentEvidence(
+                    "campaign selective tier raw determinant contract is invalid"
+                ) from error
         if (
             entry.component_scientific_identity != component_identity
             or entry.leaf_id != leaf.leaf_id
@@ -4536,6 +4827,13 @@ def _validate_selective_tier_journal(
             or expected_request is None
             or dict(request) != expected_request
             or set(request) != expected_request_fields
+            or request_contract is None
+            or request_contract.diagnostic_model_identity
+            != diagnostic_model_identity
+            or list(request_contract.required_raw_determinant_roles)
+            != diagnostic_roles
+            or request_contract.required_raw_determinant_count
+            != diagnostic_count
             or request.get("schema_version") != 1
             or request.get("operation") != "root-readout"
             or _sha256(dict(request)) != entry.request_sha256
@@ -4579,13 +4877,27 @@ def _validate_selective_tier_journal(
             != entry.amplitude.imag
             or not isinstance(request.get("policy"), Mapping)
             or (
-                not empirical
-                and request["policy"].get("ode_error_budget") != dict(budget)
+                request_contract is not None
+                and not request_contract.empirical_certificate_required
+                and not empirical
+                and (
+                    (
+                        validated_budget is not None
+                        and request["policy"].get("ode_error_budget")
+                        != validated_budget.to_mapping()
+                    )
+                    or (
+                        validated_budget is None
+                        and empirical_profile is None
+                    )
+                )
             )
             or (
-                empirical
+                request_contract is not None
+                and request_contract.empirical_certificate_required
                 and (
-                    "ode_error_budget" in request["policy"]
+                    not empirical
+                    or "ode_error_budget" in request["policy"]
                     or request["policy"].get(
                         "promoted_control_calibration_receipt_sha256"
                     ) != raw_binding["receipt_sha256"]
@@ -5450,7 +5762,7 @@ def _validate_current_promoted_runtime(
         classified_kind is _PromotedStageKind.ANALYTIC_HORIZON
         or result.component_scientific_identity in {
             PROMOTED_HORIZON_COMPONENT_IDENTITY,
-            PROMOTED_HORIZON_COMPONENT_V2_IDENTITY,
+            PROMOTED_HORIZON_BOUNDED_COMPONENT_IDENTITY,
             PROMOTED_HORIZON_COMPONENT_V3_IDENTITY,
         }
         or (
@@ -5927,6 +6239,9 @@ def _validate_current_promoted_runtime(
                         ode_error_budget=validated_budget,
                         empirical_control_profile=empirical_profile,
                         calibration_receipt=empirical_receipt,
+                        diagnostic_model_identity=binding.get(
+                            "diagnostic_model_identity"
+                        ),
                     ).preview_root_request(
                         leaf.job,
                         amplitude,
@@ -5993,7 +6308,7 @@ def _validate_component_result(
         or result.component_scientific_identity
         in {
             PROMOTED_HORIZON_COMPONENT_IDENTITY,
-            PROMOTED_HORIZON_COMPONENT_V2_IDENTITY,
+            PROMOTED_HORIZON_BOUNDED_COMPONENT_IDENTITY,
             PROMOTED_HORIZON_COMPONENT_V3_IDENTITY,
             PROMOTED_HORIZON_FAILURE_COMPONENT_IDENTITY,
             EXTERIOR_DERIVATIVE_COMPONENT_IDENTITY,
@@ -6008,7 +6323,7 @@ def _validate_component_result(
         PROMOTED_HORIZON_COMPONENT_IDENTITY
     )
     bounded_horizon = result.component_scientific_identity in {
-        PROMOTED_HORIZON_COMPONENT_V2_IDENTITY,
+        PROMOTED_HORIZON_BOUNDED_COMPONENT_IDENTITY,
         PROMOTED_HORIZON_COMPONENT_V3_IDENTITY,
     }
     typed_horizon_failure = result.component_scientific_identity == (
@@ -6059,7 +6374,7 @@ def _validate_component_result(
         and leaf.mechanism_id == "horizon-admittance"
         and outcome.digits in (80, 120)
         and result.response_method in {
-            PROMOTED_HORIZON_RESPONSE_METHOD_V2,
+            PROMOTED_HORIZON_BOUNDED_RESPONSE_METHOD,
             PROMOTED_HORIZON_RESPONSE_METHOD_V3,
         }
         and result.response_uncertainty_status
@@ -8064,7 +8379,6 @@ def validate_campaign_recovery_record(
         raise ValueError("recovery record is not canonical")
     _validate_cacheable_leaf_record(plan, leaf, record)
 
-
 def _horizon_complex_from_mapping(value: object, subject: str) -> complex:
     if not isinstance(value, Mapping) or set(value) != {"real", "imaginary"}:
         raise ValueError(f"{subject} is invalid")
@@ -8075,6 +8389,151 @@ def _horizon_complex_from_mapping(value: object, subject: str) -> complex:
     if not math.isfinite(converted.real) or not math.isfinite(converted.imag):
         raise ValueError(f"{subject} is invalid")
     return converted
+
+
+def _v3_horizon_disk(value: object, subject: str) -> ComplexDisk | None:
+    if value is None:
+        return None
+    if not isinstance(value, Mapping) or set(value) != {
+        "centre", "radius", "exact_zero_radius"
+    }:
+        raise ValueError(f"{subject} is invalid")
+    centre = _horizon_complex_from_mapping(value["centre"], subject)
+    try:
+        return ComplexDisk(
+            centre,
+            float(value["radius"]),
+            exact_zero_radius=value["exact_zero_radius"],
+        )
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError(f"{subject} is invalid") from error
+
+
+def _validate_v3_horizon_component_evidence(
+    result: ComponentResult,
+    leaf: CampaignLeafPlan,
+) -> None:
+    """Fail closed over the complete approved v3 horizon response contract."""
+
+    evidence = result.analytic_horizon_evidence
+    if not isinstance(evidence, Mapping):
+        raise ValueError("v3 horizon evidence is missing")
+    required = {
+        "identity", "mathematics", "root_centre", "root_radius",
+        "root_evidence_level", "root_receipt_sha256", "root_seal_sha256",
+        "root_disk", "omega_h_disk", "p_H_centre", "p_H_disk", "dD_dR_centre",
+        "dD_dR", "dR_ddeltaB", "dD_ddeltaB", "dD_domega",
+        "dR_domega_at_deltaB", "denominator_disk", "response_disk", "failure_code", "levels",
+        "worker_launch_count", "nonzero_amplitude_readout_count",
+        "fast_path_runtime_contract",
+    }
+    if set(evidence) != required or evidence["identity"] != BINARY64_HORIZON_RESPONSE_METHOD:
+        raise ValueError("v3 horizon evidence identity is invalid")
+    mathematics = evidence["mathematics"]
+    expected_mathematics = {
+        "math_decision_identity": M02_HORIZON_EXTERIOR_RESPONSE_MATH_IDENTITY,
+        "determinant_convention_identity": FINITE_RADIUS_ENDPOINT_WEDGE_DETERMINANT_CONVENTION,
+        "operation_identity": BINARY64_HORIZON_OPERATION_V3,
+        "response_method_identity": BINARY64_HORIZON_RESPONSE_METHOD,
+        "component_identity": BINARY64_HORIZON_COMPONENT,
+        "human_math_review_receipt_sha256": PR69_COMMIT9_HUMAN_MATH_REVIEW_SHA256,
+        "branch_identity": leaf.job.root.branch_id,
+        "equation_id": leaf.job.equation_id,
+        "endpoint_policy_identity": leaf.job.policy.identity_sha256,
+        "backend_identity": leaf.job.backend_identity.identity_sha256,
+        "background_coordinate_identity": "fixed-kerr-background-coordinate/v1",
+    }
+    if not isinstance(mathematics, Mapping) or dict(mathematics) != expected_mathematics:
+        raise ValueError("v3 horizon mathematical policy is invalid")
+    for name in ("root_receipt_sha256", "root_seal_sha256"):
+        if not isinstance(evidence[name], str) or re.fullmatch(r"[0-9a-f]{64}", evidence[name]) is None:
+            raise ValueError("v3 horizon root receipt is invalid")
+    root_centre = _horizon_complex_from_mapping(evidence["root_centre"], "v3 root centre")
+    if evidence["root_evidence_level"] not in {"SEED_ONLY", "SCREENED", "CERTIFIED"}:
+        raise ValueError("v3 horizon root evidence level is invalid")
+    root_disk = _v3_horizon_disk(evidence["root_disk"], "v3 root disk")
+    p_h_disk = _v3_horizon_disk(evidence["p_H_disk"], "v3 p_H disk")
+    d_h_disk = _v3_horizon_disk(evidence["dD_dR"], "v3 D_H disk")
+    d_r_disk = _v3_horizon_disk(evidence["dR_ddeltaB"], "v3 dR/deltaB disk")
+    d_delta_disk = _v3_horizon_disk(evidence["dD_ddeltaB"], "v3 dD/deltaB disk")
+    d_omega_disk = _v3_horizon_disk(evidence["dD_domega"], "v3 D_omega disk")
+    denominator_disk = _v3_horizon_disk(evidence["denominator_disk"], "v3 denominator disk")
+    response_disk = _v3_horizon_disk(evidence["response_disk"], "v3 response disk")
+    omega_h_disk = _v3_horizon_disk(evidence["omega_h_disk"], "v3 omega_H disk")
+    if omega_h_disk is None:
+        raise ValueError("v3 horizon omega_H disk is missing")
+    if root_disk is not None and root_disk.centre != root_centre:
+        raise ValueError("v3 horizon root centre and disk disagree")
+    if evidence["root_radius"] != (
+        None if root_disk is None else root_disk.radius
+    ):
+        raise ValueError("v3 horizon root radius and disk disagree")
+    if evidence["p_H_centre"] != {
+        "real": (root_centre - leaf.job.mode.m * omega_h_disk.centre).real,
+        "imaginary": (root_centre - leaf.job.mode.m * omega_h_disk.centre).imag,
+    }:
+        raise ValueError("v3 horizon p_H centre is inconsistent")
+    if evidence["dR_domega_at_deltaB"] != {"real": 0.0, "imaginary": 0.0}:
+        raise ValueError("v3 horizon base chart frequency partial is invalid")
+    if d_h_disk is not None and evidence["dD_dR_centre"] != {
+        "real": d_h_disk.centre.real,
+        "imaginary": d_h_disk.centre.imag,
+    }:
+        raise ValueError("v3 horizon D_H centre and disk disagree")
+    contract = evidence["fast_path_runtime_contract"]
+    if contract != {
+        "julia_worker": False,
+        "finite_amplitude_ladder": False,
+        "nonzero_amplitude_root_readouts": False,
+        "signed_root_crosscheck": False,
+        "root_phases": [],
+    } or evidence["worker_launch_count"] != 0 or evidence["nonzero_amplitude_readout_count"] != 0:
+        raise ValueError("v3 horizon fast-path contract is invalid")
+    if result.response is None:
+        if response_disk is not None or result.status is not ComponentStatus.DERIVATIVE_UNRESOLVED:
+            raise ValueError("v3 unresolved horizon evidence is inconsistent")
+        return
+    if (
+        root_disk is None
+        or root_disk.radius <= 0.0
+        or evidence["root_evidence_level"] == "SEED_ONLY"
+        or p_h_disk is None
+        or d_h_disk is None
+        or d_r_disk is None
+        or d_delta_disk is None
+        or d_omega_disk is None
+        or denominator_disk is None
+        or response_disk is None
+        or p_h_disk.contains_zero
+        or denominator_disk.contains_zero
+    ):
+        raise ValueError("v3 horizon bounded evidence is incomplete")
+    exact_one = ComplexDisk(1.0 + 0.0j, 0.0, exact_zero_radius=True)
+    exact_two_i = ComplexDisk(2.0j, 0.0, exact_zero_radius=True)
+    expected_p_h = horizon_frequency_disk(
+        root=root_disk,
+        azimuthal_index=leaf.job.mode.m,
+        background_omega_h=omega_h_disk,
+    )
+    expected_d_r = exact_one / (exact_two_i * p_h_disk)
+    expected_d_delta = d_h_disk * expected_d_r
+    expected_denominator = exact_two_i * p_h_disk * d_omega_disk
+    expected_response = horizon_response_disk(
+        horizon_numerator=d_h_disk,
+        horizon_frequency=p_h_disk,
+        determinant_derivative=d_omega_disk,
+    )
+    if (
+        p_h_disk.to_mapping() != expected_p_h.to_mapping()
+        or d_r_disk.to_mapping() != expected_d_r.to_mapping()
+        or d_delta_disk.to_mapping() != expected_d_delta.to_mapping()
+        or denominator_disk.to_mapping() != expected_denominator.to_mapping()
+        or response_disk.to_mapping() != expected_response.to_mapping()
+        or result.response != response_disk.centre
+        or result.closed_form_response != response_disk.centre
+        or result.status is not ComponentStatus.CONVERGED
+    ):
+        raise ValueError("v3 horizon quotient evidence is inconsistent")
 
 
 def _validate_schema11_horizon_stage(
@@ -8151,7 +8610,18 @@ def _validate_schema11_horizon_stage(
         raise ValueError("schema-11 horizon component lineage is invalid")
     precision_tier = stage["precision_tier"]
     if precision_tier == "binary64":
-        if (
+        if stage["operation_identity"] == BINARY64_HORIZON_OPERATION_V3:
+            if (
+                result.component_scientific_identity != BINARY64_HORIZON_COMPONENT
+                or result.response_method != BINARY64_HORIZON_RESPONSE_METHOD
+                or payload.get("evidence_kind")
+                != "package-owned-binary64-horizon-analytic-component"
+            ):
+                raise ValueError(
+                    "schema-11 horizon precision tier component identity is invalid"
+                )
+            _validate_v3_horizon_component_evidence(result, leaf)
+        elif (
             result.component_scientific_identity
             != "binary64-horizon-analytic-component/v1"
             or result.response_method
@@ -8165,8 +8635,8 @@ def _validate_schema11_horizon_stage(
     else:
         promoted_methods = dict((
             (
-                PROMOTED_HORIZON_COMPONENT_V2_IDENTITY,
-                PROMOTED_HORIZON_RESPONSE_METHOD_V2,
+                PROMOTED_HORIZON_BOUNDED_COMPONENT_IDENTITY,
+                PROMOTED_HORIZON_BOUNDED_RESPONSE_METHOD,
             ),
             (
                 PROMOTED_HORIZON_COMPONENT_V3_IDENTITY,
@@ -8283,12 +8753,15 @@ def validate_schema11_horizon_stage(
     _validate_schema11_horizon_stage(plan, leaf, value)
 
 
-def validate_schema11_horizon_record(
+def validate_schema11_horizon_record_for_scientific_identity(
     plan: CampaignPlan,
     leaf: CampaignLeafPlan,
     value: Mapping[str, object],
+    *,
+    expected_scientific_identity: str,
+    allow_mixed_binary64_operations: bool = False,
 ) -> None:
-    """Authenticate a new schema-11 horizon record without legacy fields."""
+    """Authenticate a horizon envelope against an explicitly supplied identity."""
 
     expected_fields = {
         "schema",
@@ -8300,6 +8773,9 @@ def validate_schema11_horizon_record(
         "stages",
         "record_sha256",
     }
+    has_v3_mathematics = "horizon_mathematics" in value
+    if has_v3_mathematics:
+        expected_fields.add("horizon_mathematics")
     if set(value) != expected_fields:
         raise ValueError("schema-11 horizon record fields are invalid")
     if leaf.mechanism_id != "horizon-admittance":
@@ -8309,7 +8785,7 @@ def validate_schema11_horizon_record(
         or value["leaf_id"] != leaf.leaf_id
         or value["role"] != leaf.role
         or value["scientific_computation_identity"]
-        != scientific_computation_identity_sha256(plan, leaf)
+        != expected_scientific_identity
         or value["state"] not in {"PRODUCED", "UNRESOLVED", "REJECTED"}
     ):
         raise ValueError("schema-11 horizon record identity is invalid")
@@ -8333,9 +8809,55 @@ def validate_schema11_horizon_record(
     if len(stage_values) != len(stages):
         raise ValueError("schema-11 horizon stage is invalid")
     tiers = tuple(str(stage["precision_tier"]) for stage in stages)
-    if tiers not in {("binary64",), ("BF80",), ("binary64", "BF80")}:
+    operations = {
+        stage.get("operation_identity")
+        for stage in stages
+        if isinstance(stage, Mapping)
+    }
+    mixed_binary64_operations = (
+        BINARY64_HORIZON_OPERATION_V3 in operations
+        and any(
+            operation != BINARY64_HORIZON_OPERATION_V3
+            and isinstance(operation, str)
+            and operation.startswith("binary64-horizon-production/")
+            for operation in operations
+        )
+    )
+    if (
+        tiers not in {("binary64",), ("BF80",), ("binary64", "BF80")}
+        and not (
+            allow_mixed_binary64_operations
+            and mixed_binary64_operations
+            and tiers == ("binary64", "binary64")
+        )
+    ):
         raise ValueError("schema-11 horizon precision order is invalid")
     terminal_result, terminal_disk = stage_values[-1]
+    terminal_stage = stages[-1]
+    contains_v3_stage = any(
+        isinstance(stage, Mapping)
+        and stage.get("operation_identity") == BINARY64_HORIZON_OPERATION_V3
+        for stage in stages
+    )
+    if not allow_mixed_binary64_operations and contains_v3_stage and any(
+        not isinstance(stage, Mapping)
+        or stage.get("operation_identity") != BINARY64_HORIZON_OPERATION_V3
+        for stage in stages
+    ):
+        raise ValueError("schema-11 horizon v3 record mixes stale stages")
+    terminal_is_v3 = (
+        isinstance(terminal_stage, Mapping)
+        and terminal_stage.get("operation_identity") == BINARY64_HORIZON_OPERATION_V3
+    )
+    if terminal_is_v3 != has_v3_mathematics:
+        raise ValueError("schema-11 horizon mathematical policy binding is invalid")
+    if terminal_is_v3:
+        evidence = terminal_result.analytic_horizon_evidence
+        if (
+            not isinstance(evidence, Mapping)
+            or value["horizon_mathematics"] != evidence.get("mathematics")
+        ):
+            raise ValueError("schema-11 horizon mathematical policy is not stage-bound")
     bounded = terminal_result.response is not None
     expected_state = "PRODUCED" if bounded else "UNRESOLVED"
     if value["state"] == "PRODUCED" and not bounded:
@@ -8351,6 +8873,23 @@ def validate_schema11_horizon_record(
         terminal_disk["centre"], "schema-11 horizon terminal centre"
     ):
         raise ValueError("schema-11 horizon retained centre is not terminal-bound")
+
+
+def validate_schema11_horizon_record(
+    plan: CampaignPlan,
+    leaf: CampaignLeafPlan,
+    value: Mapping[str, object],
+) -> None:
+    """Authenticate a current schema-11 horizon record strictly."""
+
+    validate_schema11_horizon_record_for_scientific_identity(
+        plan,
+        leaf,
+        value,
+        expected_scientific_identity=scientific_computation_identity_sha256(
+            plan, leaf
+        ),
+    )
 
 
 def _validate_schema11_survey_record(
@@ -11095,6 +11634,45 @@ def import_campaign_checkpoint_to_solved_leaf_store(
         and "records" not in diagnostic
     ):
         return SolvedLeafImportSummary(0, 0, (), str(store.root))
+    if isinstance(diagnostic, Mapping) and diagnostic.get("schema_version") == 11:
+        from .campaign_policy import validate_schema11_checkpoint
+        from .campaign_record_intake import (
+            assess_campaign_record_for_current_runtime,
+        )
+
+        checkpoint = validate_schema11_checkpoint(diagnostic)
+        leaf_by_id = {leaf.leaf_id: leaf for leaf in plan.leaves}
+        imported: list[str] = []
+        skipped = 0
+        for raw_record in checkpoint["records"]:
+            leaf_id = raw_record.get("leaf_id")
+            if not isinstance(leaf_id, str) or leaf_id not in leaf_by_id:
+                raise ValueError("schema-11 cache import record is outside the plan")
+            intake = assess_campaign_record_for_current_runtime(
+                plan, leaf_id, raw_record
+            )
+            if (
+                not intake.response_admissible
+                or raw_record.get("state") not in {"PRODUCED", "UNRESOLVED"}
+            ):
+                skipped += 1
+                continue
+            leaf = leaf_by_id[leaf_id]
+            store.publish(
+                scientific_identity_sha256=(
+                    scientific_computation_identity_sha256(plan, leaf)
+                ),
+                leaf_id=leaf_id,
+                record=intake.record,
+                source_type="imported-authenticated-checkpoint",
+            )
+            imported.append(leaf_id)
+        return SolvedLeafImportSummary(
+            imported_count=len(imported),
+            skipped_count=skipped,
+            leaf_ids=tuple(imported),
+            store_root=str(store.root),
+        )
     _, records, _, checkpoint_schema_version = (
         _load_checkpoint_for_solved_leaf_import(
         plan, path
@@ -12109,7 +12687,12 @@ class NativeCampaignStageBackend:
             ),
         )
 
-    def execute_horizon_stage(self, leaf: CampaignLeafPlan) -> StageOutcome:
+    def execute_horizon_stage(
+        self,
+        leaf: CampaignLeafPlan,
+        *,
+        root_evidence: AuthenticatedRootEvidence,
+    ) -> StageOutcome:
         """Run the binary64 horizon survey without the finite-amplitude ladder.
 
         Horizon response is an analytic fixed-root quantity.  This boundary
@@ -12121,7 +12704,10 @@ class NativeCampaignStageBackend:
         if leaf.mechanism_id != "horizon-admittance":
             raise ValueError("binary64 horizon stage requires a horizon leaf")
         job = leaf.job
-        root = complex(job.root.omega)
+        if not isinstance(root_evidence, AuthenticatedRootEvidence):
+            raise ValueError("binary64 horizon stage requires authenticated root evidence")
+        root_evidence.validate_for(leaf)
+        root = complex(root_evidence.fixed_root)
         if not math.isfinite(root.real) or not math.isfinite(root.imag):
             raise ValueError("binary64 horizon root is not finite")
         partials = self.adapter.kernel.horizon_partials(
@@ -12129,49 +12715,92 @@ class NativeCampaignStageBackend:
             background_root=job.root,
             policy=job.policy,
         )
-        derivative = complex(partials.frequency_derivative)
+        derivative = complex(
+            partials.dD_domega
+            if partials.dD_domega is not None
+            else partials.frequency_derivative
+        )
         if not math.isfinite(derivative.real) or not math.isfinite(derivative.imag):
             raise ValueError("binary64 horizon derivative is not finite")
-
-        # The fixed root and the binary64 stencil are authenticated inputs to
-        # this stage.  Retain a conservative representable arithmetic radius;
-        # a zero-containing disk becomes a typed promotion rather than an
-        # asserted response.
         horizon_radius = 1.0 + math.sqrt(max(0.0, 1.0 - job.spin * job.spin))
-        horizon_frequency = root - job.mode.m * (
-            job.spin / (2.0 * horizon_radius)
+        omega_h = job.spin / (2.0 * horizon_radius)
+        omega_h_disk = ComplexDisk(
+            omega_h,
+            math.ulp(omega_h),
         )
-        frequency_radius = math.ulp(max(abs(horizon_frequency), 1.0))
-        derivative_error = partials.frequency_derivative_error_abs
-        derivative_radius = (
+        root_disk = root_evidence.root_disk
+        frequency_disk = (
             None
-            if derivative_error is None
-            else derivative_error + math.ulp(max(abs(derivative), 1.0))
+            if root_disk is None
+            else horizon_frequency_disk(
+                root=root_disk,
+                azimuthal_index=job.mode.m,
+                background_omega_h=omega_h_disk,
+            )
         )
-        frequency_disk = ComplexDisk(
-            horizon_frequency,
-            frequency_radius,
-            exact_zero_radius=frequency_radius == 0.0,
+        horizon_frequency_centre = root - job.mode.m * omega_h
+        d_h_centre = (
+            None if partials.dD_dR is None else complex(partials.dD_dR)
+        )
+        d_h_disk = (
+            None
+            if d_h_centre is None or partials.dD_dR_error_abs is None
+            else ComplexDisk(
+                d_h_centre,
+                float(partials.dD_dR_error_abs)
+                + math.ulp(max(abs(d_h_centre), 1.0)),
+            )
+        )
+        derivative_error = (
+            partials.dD_domega_error_abs
+            if partials.dD_domega_error_abs is not None
+            else partials.frequency_derivative_error_abs
         )
         derivative_disk = (
             None
-            if derivative_radius is None
+            if derivative_error is None
             else ComplexDisk(
                 derivative,
-                derivative_radius,
-                exact_zero_radius=derivative_radius == 0.0,
+                float(derivative_error) + math.ulp(max(abs(derivative), 1.0)),
             )
         )
+        exact_one = ComplexDisk(1.0 + 0.0j, 0.0, exact_zero_radius=True)
+        exact_two_i = ComplexDisk(2.0j, 0.0, exact_zero_radius=True)
+        d_r_ddelta_b_disk = None
+        d_d_delta_b_disk = None
+        denominator_disk = None
         response_disk = None
         status = ComponentStatus.DERIVATIVE_UNRESOLVED
         response = None
+        failure_code: str | None = None
         try:
-            if partials.simple_root_valid and derivative_disk is not None:
+            if root_disk is None:
+                failure_code = "ROOT_UNCERTAINTY_EVIDENCE_UNAVAILABLE"
+            elif d_h_disk is None or derivative_disk is None:
+                failure_code = "DETERMINANT_ERROR_EVIDENCE_UNAVAILABLE"
+            elif not partials.simple_root_valid:
+                failure_code = "HORIZON_ARITHMETIC_INADEQUATE"
+            else:
+                assert frequency_disk is not None
+                chart_partials = horizon_chart_base_partials(frequency_disk)
+                d_r_ddelta_b_disk = chart_partials.dR_ddeltaB
+                d_d_delta_b_disk = d_h_disk * d_r_ddelta_b_disk
+                denominator_disk = exact_two_i * frequency_disk * derivative_disk
                 response_disk = horizon_response_disk(
+                    horizon_numerator=d_h_disk,
                     horizon_frequency=frequency_disk,
                     determinant_derivative=derivative_disk,
                 )
-        except ZeroContainingDiskError:
+        except ZeroContainingDiskError as error:
+            failure_code = (
+                "HORIZON_ADMITTANCE_CHART_SINGULAR"
+                if frequency_disk is not None
+                and frequency_disk.centre == 0.0j
+                and frequency_disk.radius == 0.0
+                else "HORIZON_ARITHMETIC_INADEQUATE"
+            )
+            if error.disk_name == "determinant_derivative":
+                failure_code = "DETERMINANT_ERROR_EVIDENCE_UNAVAILABLE"
             response_disk = None
         if response_disk is not None:
             status = ComponentStatus.CONVERGED
@@ -12179,6 +12808,8 @@ class NativeCampaignStageBackend:
 
         baseline = RootReadout(
             omega=root,
+            # This transport readout is deliberately not root evidence.  The
+            # only v3 root disk is ``root_evidence.root_disk`` above.
             determinant_residual_abs=0.0,
             determinant_derivative_abs=max(abs(derivative), math.ulp(1.0)),
             converged=True,
@@ -12222,9 +12853,9 @@ class NativeCampaignStageBackend:
                 "source_root_mapping": None,
             },
             component_scientific_identity=(
-                "binary64-horizon-analytic-component/v1"
+                BINARY64_HORIZON_COMPONENT
             ),
-            response_method="binary64-fixed-root-horizon-response/v1",
+            response_method=BINARY64_HORIZON_RESPONSE_METHOD,
             finite_amplitude_ladder_required=False,
             finite_amplitude_ladder_executed=False,
             finite_amplitude_readout_count=0,
@@ -12238,23 +12869,80 @@ class NativeCampaignStageBackend:
                 for name in ERROR_CHANNELS
             },
             analytic_horizon_evidence={
-                "identity": "binary64-fixed-root-horizon-response/v1",
-                "fixed_root": {
-                    "real": root.real,
-                    "imaginary": root.imag,
+                "identity": BINARY64_HORIZON_RESPONSE_METHOD,
+                "mathematics": {
+                    "math_decision_identity": M02_HORIZON_EXTERIOR_RESPONSE_MATH_IDENTITY,
+                    "determinant_convention_identity": (
+                        FINITE_RADIUS_ENDPOINT_WEDGE_DETERMINANT_CONVENTION
+                    ),
+                    "operation_identity": BINARY64_HORIZON_OPERATION_V3,
+                    "response_method_identity": BINARY64_HORIZON_RESPONSE_METHOD,
+                    "component_identity": BINARY64_HORIZON_COMPONENT,
+                    "human_math_review_receipt_sha256": (
+                        PR69_COMMIT9_HUMAN_MATH_REVIEW_SHA256
+                    ),
+                    "branch_identity": job.root.branch_id,
+                    "equation_id": job.equation_id,
+                    "endpoint_policy_identity": job.policy.identity_sha256,
+                    "backend_identity": job.backend_identity.identity_sha256,
+                    "background_coordinate_identity": "fixed-kerr-background-coordinate/v1",
                 },
-                "horizon_frequency_disk": frequency_disk.to_mapping(),
-                "determinant_derivative_disk": (
+                "root_centre": {"real": root.real, "imaginary": root.imag},
+                "root_radius": root_evidence.root_uncertainty_radius,
+                "root_evidence_level": root_evidence.evidence_level,
+                "root_receipt_sha256": root_evidence.source_receipt_sha256,
+                "root_seal_sha256": root_evidence.root_seal_sha256,
+                "root_disk": None if root_disk is None else root_disk.to_mapping(),
+                "omega_h_disk": omega_h_disk.to_mapping(),
+                "p_H_centre": {
+                    "real": horizon_frequency_centre.real,
+                    "imaginary": horizon_frequency_centre.imag,
+                },
+                "p_H_disk": (
+                    None if frequency_disk is None else frequency_disk.to_mapping()
+                ),
+                "dD_dR_centre": (
+                    None
+                    if d_h_centre is None
+                    else {"real": d_h_centre.real, "imaginary": d_h_centre.imag}
+                ),
+                "dD_dR": None if d_h_disk is None else d_h_disk.to_mapping(),
+                "dR_ddeltaB": (
+                    None
+                    if d_r_ddelta_b_disk is None
+                    else d_r_ddelta_b_disk.to_mapping()
+                ),
+                "dD_ddeltaB": (
+                    None
+                    if d_d_delta_b_disk is None
+                    else d_d_delta_b_disk.to_mapping()
+                ),
+                "dR_domega_at_deltaB": {
+                    "real": 0.0,
+                    "imaginary": 0.0,
+                },
+                "dD_domega": (
                     None if derivative_disk is None else derivative_disk.to_mapping()
+                ),
+                "denominator_disk": (
+                    None if denominator_disk is None else denominator_disk.to_mapping()
                 ),
                 "response_disk": (
                     None
                     if response_disk is None
                     else response_disk.to_mapping()
                 ),
+                "failure_code": failure_code,
                 "levels": [],
                 "worker_launch_count": 0,
                 "nonzero_amplitude_readout_count": 0,
+                "fast_path_runtime_contract": {
+                    "julia_worker": False,
+                    "finite_amplitude_ladder": False,
+                    "nonzero_amplitude_root_readouts": False,
+                    "signed_root_crosscheck": False,
+                    "root_phases": [],
+                },
             },
         )
         component_result = {

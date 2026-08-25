@@ -19,6 +19,7 @@ from windows_solver.promoted_control_calibration import (
     load_default_calibration_receipt,
 )
 from windows_solver.julia_response_backend import (
+    EXTERIOR_DETERMINANT_ABSOLUTE_ERROR_CERTIFICATE,
     JuliaPrecisionRootBackend,
     _adaptive_ode_request_controls,
     _precision_policy,
@@ -240,12 +241,19 @@ class AdaptiveODEBudgetTests(unittest.TestCase):
         job = self._job()
         receipt = load_default_calibration_receipt()
         profile = receipt.budget_for("exterior-wronskian/v1", 80)
+        # Empirical mode must be requested explicitly. Constructing a
+        # default backend now selects the provisional additive-channel
+        # contract; only the empirical certificate identity carries the
+        # receipt-bound safety factor and calibration hashes on policy.
         backend = JuliaPrecisionRootBackend(
             job.backend_identity,
             SimpleNamespace(runtime_provenance={}),
             80,
             empirical_control_profile=profile,
             calibration_receipt=receipt,
+            diagnostic_model_identity=(
+                EXTERIOR_DETERMINANT_ABSOLUTE_ERROR_CERTIFICATE
+            ),
         )
 
         policy = backend._request(job, 0.0j)["policy"]
@@ -267,6 +275,8 @@ class AdaptiveODEBudgetTests(unittest.TestCase):
     def test_empirical_exterior_request_requires_certificate_identity(self) -> None:
         job = self._job()
         receipt = load_default_calibration_receipt()
+        # Explicit empirical-certificate request — provisional is the
+        # default now, so the certificate identity has to be asked for.
         policy = JuliaPrecisionRootBackend(
             job.backend_identity,
             SimpleNamespace(runtime_provenance={}),
@@ -275,6 +285,9 @@ class AdaptiveODEBudgetTests(unittest.TestCase):
                 "exterior-wronskian/v1", 80
             ),
             calibration_receipt=receipt,
+            diagnostic_model_identity=(
+                EXTERIOR_DETERMINANT_ABSOLUTE_ERROR_CERTIFICATE
+            ),
         )._request(job, 0.0j)["policy"]
 
         self.assertEqual(

@@ -172,7 +172,17 @@ def _origin_schema7_request(leaf, request):
         "base"
     ]
     historical = dict(request)
-    historical.pop("semantic_precision_tier")
+    historical.pop("semantic_precision_tier", None)
+    # Real schema-7 checkpoints predate the PR69 raw-determinant contract
+    # top-level fields. The fixture generates the base binding through the
+    # current _request() constructor, so strip the post-schema-7 additions
+    # to model an actual origin-era wire binding.
+    for field in (
+        "diagnostic_model_identity",
+        "required_raw_determinant_roles",
+        "required_raw_determinant_count",
+    ):
+        historical.pop(field, None)
     historical["policy"] = {
         "readout_radius": format(leaf.job.policy.readout_radius, ".17g"),
         **controls,

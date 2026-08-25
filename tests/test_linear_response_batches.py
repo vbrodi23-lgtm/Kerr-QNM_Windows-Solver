@@ -380,7 +380,7 @@ class CampaignPlanTests(unittest.TestCase):
         )
         self.assertEqual(
             scientific_computation_identity_sha256(plan, deep_horizon),
-            "1ca6eeef17446d2b93b261fab0b1ec907fea37780f65c6e9eea10e1413664800",
+            "bbd767a489951323942e81050a83798d04050013b6b0ef291222a703acf68772",
         )
         self.assertEqual(
             scientific_computation_identity_sha256(plan, deep_exterior),
@@ -459,7 +459,7 @@ class CampaignPlanTests(unittest.TestCase):
         with self.subTest(contract="identity"):
             self.assertEqual(
                 scientific_computation_identity_sha256(plan, primary),
-                "84f765093afa21f76ba4d150e8613d100c6bbaa6b1109283092c0d3ed2f3cdbe",
+                "5e2b694bf91c87b51567cf2bf38aeed641afacdddb94ff5066fba9d3e15761db",
             )
             self.assertEqual(
                 scientific_computation_identity_sha256(plan, control),
@@ -467,7 +467,7 @@ class CampaignPlanTests(unittest.TestCase):
             )
             self.assertEqual(
                 scientific_computation_identity_sha256(plan, deep),
-                "1ca6eeef17446d2b93b261fab0b1ec907fea37780f65c6e9eea10e1413664800",
+                "bbd767a489951323942e81050a83798d04050013b6b0ef291222a703acf68772",
             )
 
         leaf = primary

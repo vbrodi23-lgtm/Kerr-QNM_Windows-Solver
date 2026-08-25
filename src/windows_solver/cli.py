@@ -12,6 +12,7 @@ import sys
 import tempfile
 import types
 from typing import Mapping, Sequence
+from uuid import uuid4
 
 from .artifacts import ArtifactStore, ArtifactVerificationError
 from .builtin import default_registry
@@ -22,6 +23,7 @@ from .campaign_recovery import (
     validate_recovery_checkpoint,
     validate_recovery_receipt,
 )
+from .campaign_record_intake import assess_campaign_record_for_current_runtime
 from .campaign_policy import (
     CAMPAIGN_CHECKPOINT_SCHEMA_VERSION as SCHEMA11_VERSION,
     EvidenceLevel,
@@ -65,6 +67,7 @@ from .campaign_reports import (
     refresh_schema11_reports,
     report_directory_for_checkpoint,
 )
+from .campaign_postmortem import CampaignPostmortemBuilder
 from .promoted_control_calibration import load_calibration_receipt
 from .response_engine import (
     BackendIdentity,
@@ -99,6 +102,7 @@ from .response_batches import (
     worker_failure_payload,
 )
 from .solved_leaf_cache import SolvedLeafStore
+from .structural_diagnostics import StructuralDiagnosticSession
 from .response_engine import VettedNativeDeterminantKernel, NativeResourceUnavailableError
 from .response_reduction import (
     ComputedUnresolvedComponentEvidence,
@@ -337,6 +341,13 @@ def build_parser() -> argparse.ArgumentParser:
         campaign_pass.add_argument("--queue", type=Path)
         campaign_pass.add_argument("--calibration-receipt-path", type=Path)
         campaign_pass.add_argument("--calibration-receipt-sha256")
+        campaign_pass.add_argument(
+            "--diagnostic-session-id",
+            help=(
+                "operator session identity for the immutable structural "
+                "diagnostic session"
+            ),
+        )
     schema11_validate = commands.add_parser(
         "campaign-schema11-validate",
         help="validate a schema-11 checkpoint and one optional pass boundary",
@@ -961,6 +972,9 @@ def _campaign_recover(
         record_validator=lambda leaf_id, record: validate_campaign_recovery_record(
             plan, leaf_id, record
         ),
+        record_intake_assessor=lambda leaf_id, record: (
+            assess_campaign_record_for_current_runtime(plan, leaf_id, record)
+        ),
         checkpoint_finalizer=lambda checkpoint, path: refresh_schema11_reports(
             plan,
             selection,
@@ -1188,6 +1202,8 @@ def _campaign_schema11_pass(
     progress_mode: str,
     calibration_receipt_path: Path | None,
     calibration_receipt_sha256: str | None,
+    diagnostic_paths: Mapping[str, str | os.PathLike[str] | Path | None] | None = None,
+    diagnostic_session: StructuralDiagnosticSession | None = None,
 ) -> tuple[int, object]:
     if (calibration_receipt_path is None) is not (
         calibration_receipt_sha256 is None
@@ -1218,6 +1234,7 @@ def _campaign_schema11_pass(
             profile="survey",
             pass_name="binary64",
             mode=progress_mode,
+            diagnostic_paths=diagnostic_paths,
         )
         try:
             with activate_progress(reporter):
@@ -1227,6 +1244,7 @@ def _campaign_schema11_pass(
                     recovery_selection,
                     checkpoint,
                     checkpoint_path=resolved,
+                    diagnostic_session=diagnostic_session,
                 )
         finally:
             reporter.close()
@@ -1265,6 +1283,7 @@ def _campaign_schema11_pass(
             profile="survey",
             pass_name="promoted",
             mode=progress_mode,
+            diagnostic_paths=diagnostic_paths,
         )
         try:
             with activate_progress(reporter):
@@ -1275,6 +1294,7 @@ def _campaign_schema11_pass(
                     checkpoint,
                     checkpoint_path=resolved,
                     calibration_receipt=receipt,
+                    diagnostic_session=diagnostic_session,
                 )
         finally:
             reporter.close()
@@ -1349,6 +1369,7 @@ def _campaign_schema11_pass(
             profile=profile_name,
             pass_name=None,
             mode=progress_mode,
+            diagnostic_paths=diagnostic_paths,
         )
         try:
             with activate_progress(reporter):
@@ -1683,6 +1704,261 @@ def _m02_export(
     )
 
 
+_SCHEMA11_DIAGNOSTIC_COMMANDS = frozenset({
+    "campaign-survey-binary64",
+    "campaign-survey-promoted",
+    "campaign-certify",
+    "campaign-evidence-validate",
+})
+
+
+def _schema11_diagnostic_execution(command: str) -> dict[str, object]:
+    if command == "campaign-survey-binary64":
+        return {
+            "profile": "survey",
+            "pass": "binary64",
+            "tier": "binary64",
+            "operation_identity": command,
+        }
+    if command == "campaign-survey-promoted":
+        return {
+            "profile": "survey",
+            "pass": "promoted",
+            "tier": "promoted",
+            "operation_identity": command,
+        }
+    if command == "campaign-certify":
+        return {
+            "profile": "certify",
+            "pass": "certify",
+            "tier": None,
+            "operation_identity": command,
+        }
+    if command == "campaign-evidence-validate":
+        return {
+            "profile": "validate",
+            "pass": "validate",
+            "tier": None,
+            "operation_identity": command,
+        }
+    raise ValueError(f"schema-11 diagnostic command is invalid: {command}")
+
+
+def _diagnostic_path_sha256(path: Path) -> str | None:
+    if not path.is_file():
+        return None
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _diagnostic_failure_fingerprint(error: BaseException) -> str:
+    payload = f"{type(error).__module__}.{type(error).__qualname__}\0{error}"
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _schema11_optional_diagnostic_artifacts(
+    checkpoint: Path, session: StructuralDiagnosticSession
+) -> dict[str, Path]:
+    return {
+        "checkpoint_status": Path(f"{checkpoint}.status.json"),
+        "campaign_timing": Path(f"{checkpoint}.timing.jsonl"),
+        "campaign_progress": Path(f"{checkpoint}.progress"),
+        "console_transcript": session.paths.console_transcript,
+        "root_solves": checkpoint.parent / "root-solves.jsonl",
+        "reports": report_directory_for_checkpoint(checkpoint),
+    }
+
+
+def _finalize_schema11_diagnostic_failure(
+    *,
+    session: StructuralDiagnosticSession,
+    command: str,
+    execution: Mapping[str, object],
+    checkpoint: Path,
+    selected_leaf_count: int,
+    error: BaseException,
+    interrupted: bool,
+) -> None:
+    """Best-effort diagnostic cleanup which must never replace ``error``."""
+
+    terminal_classification = "INTERRUPTED" if interrupted else "SYSTEM_FAILURE"
+    event_kind = (
+        "CAMPAIGN_COMMAND_INTERRUPTED"
+        if interrupted
+        else "CAMPAIGN_COMMAND_ABORTED"
+    )
+    builder = CampaignPostmortemBuilder(session)
+    try:
+        session.append(
+            event_kind,
+            execution=execution,
+            compact_diagnostics={
+                "exception_type": type(error).__name__,
+                "exception_fingerprint_sha256": _diagnostic_failure_fingerprint(error),
+            },
+            durable=True,
+        )
+        checkpoint_hash = _diagnostic_path_sha256(checkpoint)
+        builder.capture_exception(
+            error,
+            failure_code=("INTERRUPTED" if interrupted else "UNHANDLED_PYTHON_EXCEPTION"),
+            failure_class=("OPERATOR_INTERRUPT" if interrupted else "SOFTWARE"),
+            disposition=terminal_classification,
+            fingerprint_sha256=_diagnostic_failure_fingerprint(error),
+        ).capture_campaign({
+            "campaign_id": session.campaign_id,
+            "selection_id": session.selection_id,
+            "schema_version": SCHEMA11_VERSION,
+            "profile": execution["profile"],
+            "pass": execution["pass"],
+            "selected_leaf_count": selected_leaf_count,
+        }).capture_source({
+            "command": command,
+            "python_executable": sys.executable,
+        }).capture_scheduler({
+            "active_leaf": None,
+            "last_committed_leaf": None,
+            "next_intended_leaf": None,
+            "next_leaf_started": False,
+        }).capture_checkpoint({
+            "path": str(checkpoint),
+            "pre_failure_sha256": checkpoint_hash,
+            "post_failure_sha256": checkpoint_hash,
+            "valid": None,
+        }).capture_counts({
+            "selected_leaf_count": selected_leaf_count,
+            **session.forensic_record_counters(),
+        }).capture_queue_summary({}).capture_repetition_monitor({}).capture_provider_summaries({
+            "root_provider": session.forensic_record_counters(),
+            "solved_leaf_store": session.forensic_record_counters(),
+        })
+        builder.write_atomic(terminal_classification)
+        required_artifacts = {
+            "checkpoint": checkpoint,
+            "structural_events": session.paths.structural_events,
+            "postmortem": session.paths.postmortem,
+        }
+        optional_artifacts = _schema11_optional_diagnostic_artifacts(
+            checkpoint, session
+        )
+        builder.write_manifest_atomic(
+            required_artifacts=required_artifacts,
+            optional_artifacts=optional_artifacts,
+        )
+        bundle_artifacts = {
+            **required_artifacts,
+            "artifact_manifest": session.paths.artifact_manifest,
+            **optional_artifacts,
+        }
+        _bundle, collection_failure = builder.build_bundle_best_effort(
+            bundle_artifacts
+        )
+        if collection_failure is not None:
+            session.append(
+                "DIAGNOSTIC_COLLECTION_FAILED",
+                execution=execution,
+                compact_diagnostics=dict(collection_failure),
+                durable=True,
+            )
+            builder.write_atomic(terminal_classification)
+    except BaseException as collection_error:
+        try:
+            session.append(
+                "DIAGNOSTIC_COLLECTION_FAILED",
+                execution=execution,
+                compact_diagnostics={
+                    "exception_type": type(collection_error).__name__,
+                    "exception_fingerprint_sha256": _diagnostic_failure_fingerprint(
+                        collection_error
+                    ),
+                },
+                durable=True,
+            )
+        except BaseException:
+            pass
+    finally:
+        try:
+            if interrupted:
+                session.close_interrupted()
+            else:
+                session.close_failed()
+        except BaseException:
+            pass
+
+
+def _run_schema11_pass_with_diagnostics(arguments: argparse.Namespace) -> tuple[int, object]:
+    command = arguments.command
+    if command not in _SCHEMA11_DIAGNOSTIC_COMMANDS:
+        raise ValueError(f"schema-11 diagnostic command is invalid: {command}")
+    plan, selection, _descriptor = _campaign_plan_and_selection(arguments.selection)
+    checkpoint = _resolve_recovery_path(arguments.checkpoint)
+    session = StructuralDiagnosticSession.open(
+        checkpoint_path=checkpoint,
+        session_id=(arguments.diagnostic_session_id or uuid4().hex),
+        campaign_id=plan.campaign_id,
+        selection_id=selection.selection_id,
+    )
+    execution = _schema11_diagnostic_execution(command)
+    selected_leaf_count = len(selection.leaf_ids)
+    session.append("DIAGNOSTIC_SESSION_OPENED", execution=execution, durable=True)
+    session.append("CAMPAIGN_COMMAND_STARTED", execution=execution, durable=True)
+    try:
+        status, output = _campaign_schema11_pass(
+            command,
+            arguments.selection,
+            arguments.checkpoint,
+            queue_path=arguments.queue,
+            progress_mode=arguments.progress,
+            calibration_receipt_path=arguments.calibration_receipt_path,
+            calibration_receipt_sha256=arguments.calibration_receipt_sha256,
+            diagnostic_paths={
+                "diagnostic_session_directory": session.paths.directory,
+                "postmortem_path": session.paths.postmortem,
+                "bundle_path": session.paths.bundle,
+            },
+            diagnostic_session=session,
+        )
+        if not isinstance(output, Mapping):
+            raise ValueError("schema-11 pass output is invalid")
+    except KeyboardInterrupt as error:
+        _finalize_schema11_diagnostic_failure(
+            session=session,
+            command=command,
+            execution=execution,
+            checkpoint=checkpoint,
+            selected_leaf_count=selected_leaf_count,
+            error=error,
+            interrupted=True,
+        )
+        raise
+    except BaseException as error:
+        _finalize_schema11_diagnostic_failure(
+            session=session,
+            command=command,
+            execution=execution,
+            checkpoint=checkpoint,
+            selected_leaf_count=selected_leaf_count,
+            error=error,
+            interrupted=False,
+        )
+        raise
+    session.append(
+        "CAMPAIGN_COMMAND_COMPLETED",
+        execution=execution,
+        compact_diagnostics={"status": status},
+        durable=True,
+    )
+    session.close_completed()
+    return status, {
+        **output,
+        "diagnostic_session_directory": str(session.paths.directory),
+        "diagnostic_events_path": str(session.paths.structural_events),
+    }
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     try:
         arguments = build_parser().parse_args(argv)
@@ -1827,15 +2103,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "campaign-certify",
             "campaign-evidence-validate",
         }:
-            status, output = _campaign_schema11_pass(
-                arguments.command,
-                arguments.selection,
-                arguments.checkpoint,
-                queue_path=arguments.queue,
-                progress_mode=arguments.progress,
-                calibration_receipt_path=arguments.calibration_receipt_path,
-                calibration_receipt_sha256=arguments.calibration_receipt_sha256,
-            )
+            status, output = _run_schema11_pass_with_diagnostics(arguments)
         elif arguments.command == "campaign-reduce":
             status, output = _campaign_reduce(arguments.bundle, arguments.output)
         elif arguments.command == "campaign-smoke":

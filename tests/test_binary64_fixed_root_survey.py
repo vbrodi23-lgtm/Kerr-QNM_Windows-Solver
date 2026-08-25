@@ -99,9 +99,12 @@ class Binary64FixedRootSurveyTests(unittest.TestCase):
         self.assertIsNone(result.coordinate_derivative_disk)
         self.assertIsNone(result.root_correction_upper_bound)
         self.assertEqual(
-            "DETERMINANT_ERROR_EVIDENCE_UNAVAILABLE", result.reason_code
+            "BLOCKED_BY_REVIEWED_ERROR_EVIDENCE", result.reason_code
         )
-        self.assertEqual("unavailable", result.determinant_certificate_status)
+        self.assertEqual(
+            "blocked-by-reviewed-error-evidence",
+            result.determinant_certificate_status,
+        )
 
     def test_nonfinite_sample_fails_closed_at_the_batch_boundary(self) -> None:
         leaf = next(

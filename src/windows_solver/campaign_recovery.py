@@ -20,6 +20,10 @@ from .campaign_policy import (
     validate_schema11_checkpoint,
 )
 from .contracts import canonical_json_bytes
+from .campaign_record_intake import (
+    CampaignRecordIntake,
+    HORIZON_RESPONSE_V2_SCIENTIFICALLY_STALE,
+)
 from .response_batches import CampaignLeafRecord
 from .response_engine import _validated_worker_response_receipt
 from .root_readout_cache import RootReadoutStore
@@ -28,6 +32,8 @@ from .root_readout_cache import RootReadoutStore
 RECOVERY_RECEIPT_SCHEMA = "windows-solver.campaign-recovery/v1"
 ROOT_READOUT_RECOVERY_INDEX_SCHEMA = "windows-solver.root-readout-recovery-index/v1"
 LEGACY_COMPATIBILITY_SCHEMA = "legacy-compatibility/v1"
+SCIENTIFIC_COMPATIBILITY_SCHEMA = "scientific-compatibility/v1"
+STALE_HORIZON_REASON = HORIZON_RESPONSE_V2_SCIENTIFICALLY_STALE
 _HEX_64 = re.compile(r"[0-9a-f]{64}")
 _SOLVED_RECEIPT_FIELDS = {
     "schema_version",
@@ -82,6 +88,9 @@ _SCHEMA9_CAMPAIGN_BINDING_FIELDS = {
 
 
 RecordValidator = Callable[[str, Mapping[str, object]], None]
+RecordIntakeAssessor = Callable[
+    [str, Mapping[str, object]], CampaignRecordIntake
+]
 CheckpointFinalizer = Callable[[Mapping[str, object], Path], Mapping[str, object]]
 
 
@@ -450,6 +459,69 @@ def _legacy_compatibility_receipt(
     return {**content, "receipt_sha256": _sha256(content)}
 
 
+def _stale_horizon_v2_receipt(
+    *,
+    path: Path,
+    source_sha256: str,
+    checkpoint: Mapping[str, object] | None,
+    record: Mapping[str, object],
+    selection: RecoverySelection,
+    source_evidence: Mapping[str, object] | None,
+    source_kind: str = "checkpoint",
+) -> dict[str, object]:
+    """Bind an authenticated legacy horizon record as forensic-only input.
+
+    The source checkpoint remains untouched. Its terminal record and attached
+    evidence are deliberately excluded from current schema-11 numerical and
+    evidence ledgers because their response identity is stale under PR69 v3.
+    """
+
+    leaf_id = record["leaf_id"]
+    assert isinstance(leaf_id, str)
+    stages = record["stages"]
+    assert isinstance(stages, list)
+    operations = sorted(
+        {
+            str(stage["operation_identity"])
+            for stage in stages
+            if isinstance(stage, Mapping)
+            and isinstance(stage.get("operation_identity"), str)
+        }
+    )
+    content: dict[str, object] = {
+        "schema": SCIENTIFIC_COMPATIBILITY_SCHEMA,
+        "source_checkpoint_schema_version": 11 if checkpoint is not None else None,
+        "source_kind": source_kind,
+        "source_path": str(path),
+        "source_sha256": source_sha256,
+        "source_campaign_id": (
+            selection.campaign_id
+            if checkpoint is None
+            else checkpoint["campaign_id"]
+        ),
+        "source_selection_id": (
+            selection.selection_id
+            if checkpoint is None
+            else checkpoint["selection_id"]
+        ),
+        "leaf_id": leaf_id,
+        "source_record_sha256": record["record_sha256"],
+        "source_stage_sha256s": [stage["stage_sha256"] for stage in stages],
+        "source_operation_identities": operations,
+        "current_scientific_identity_sha256": selection.scientific_identities[
+            leaf_id
+        ],
+        "original_record_status": "AUTHENTICATED",
+        "source_evidence_was_present": source_evidence is not None,
+        "imported_as_current_numerical_record": False,
+        "imported_as_current_evidence": False,
+        "forensic_record_status": "RETAINED_IN_SOURCE_ONLY",
+        "operational_queue_disposition": "REBUILT_FROM_CURRENT_SELECTION",
+        "reason": STALE_HORIZON_REASON,
+    }
+    return {**content, "receipt_sha256": _sha256(content)}
+
+
 def _schema9_source_candidates(
     *,
     path: Path,
@@ -766,6 +838,7 @@ def recover_campaign(
     root_readout_stores: Sequence[str | os.PathLike[str] | Path] = (),
     oracle_path: str | os.PathLike[str] | Path | None = None,
     record_validator: RecordValidator | None = None,
+    record_intake_assessor: RecordIntakeAssessor | None = None,
     checkpoint_finalizer: CheckpointFinalizer | None = None,
 ) -> RecoverySummary:
     """Recover all compatible terminal records without numerical work."""
@@ -783,6 +856,7 @@ def recover_campaign(
     source_artifacts: list[dict[str, object]] = []
     root_readout_indices: list[dict[str, object]] = []
     legacy_compatibility_receipts: list[dict[str, object]] = []
+    scientific_compatibility_receipts: list[dict[str, object]] = []
     legacy_authenticated_terminal_count = 0
     legacy_imported_count = 0
     legacy_rejected_count = 0
@@ -863,8 +937,45 @@ def recover_campaign(
                 record = _validated_record(
                     raw_record,
                     expected_role=selection.roles[leaf_id],
-                    record_validator=record_validator,
+                    record_validator=None,
                 )
+                if (
+                    record.get("schema")
+                    == "windows-solver.schema11-numerical-record/1"
+                    and record_intake_assessor is None
+                ):
+                    raise ValueError(
+                        "schema-11 recovery requires central record intake"
+                    )
+                intake = (
+                    None
+                    if record_intake_assessor is None
+                    else record_intake_assessor(leaf_id, record)
+                )
+                if intake is not None and not intake.response_admissible:
+                    reason = str(
+                        intake.reason_code
+                        or "INCOMPATIBLE_SCIENTIFIC_IDENTITY"
+                    )
+                    if intake.forensic_only:
+                        scientific_compatibility_receipts.append(
+                            _stale_horizon_v2_receipt(
+                                path=path,
+                                source_sha256=source_sha,
+                                checkpoint=checkpoint,
+                                record=record,
+                                selection=selection,
+                                source_evidence=evidence_ledger.get(leaf_id),
+                            )
+                        )
+                    ignored.append({
+                        "path": str(path),
+                        "leaf_id": leaf_id,
+                        "reason": reason,
+                    })
+                    continue
+                if record_intake_assessor is None and record_validator is not None:
+                    record_validator(leaf_id, record)
             except ValueError as error:
                 raise ValueError(
                     f"explicit source checkpoint is corrupt: {path}: {error}"
@@ -907,9 +1018,7 @@ def recover_campaign(
                 record, identity = _validated_solved_receipt(
                     value,
                     expected_role=expected_role,
-                    record_validator=(
-                        record_validator if raw_leaf_id in selected else None
-                    ),
+                    record_validator=None,
                 )
             except ValueError as error:
                 raise ValueError(
@@ -924,6 +1033,49 @@ def recover_campaign(
                     {"path": str(path), "leaf_id": leaf_id, "reason": "OFF_SELECTION"}
                 )
                 continue
+            try:
+                if (
+                    record.get("schema")
+                    == "windows-solver.schema11-numerical-record/1"
+                    and record_intake_assessor is None
+                ):
+                    raise ValueError(
+                        "schema-11 recovery requires central record intake"
+                    )
+                intake = (
+                    None
+                    if record_intake_assessor is None
+                    else record_intake_assessor(leaf_id, record)
+                )
+                if intake is not None and not intake.response_admissible:
+                    reason = str(
+                        intake.reason_code
+                        or "INCOMPATIBLE_SCIENTIFIC_IDENTITY"
+                    )
+                    if intake.forensic_only:
+                        scientific_compatibility_receipts.append(
+                            _stale_horizon_v2_receipt(
+                                path=path,
+                                source_sha256=source_sha,
+                                checkpoint=None,
+                                record=record,
+                                selection=selection,
+                                source_evidence=None,
+                                source_kind="solved-leaf-store",
+                            )
+                        )
+                    ignored.append({
+                        "path": str(path),
+                        "leaf_id": leaf_id,
+                        "reason": reason,
+                    })
+                    continue
+                if record_intake_assessor is None and record_validator is not None:
+                    record_validator(leaf_id, record)
+            except ValueError as error:
+                raise ValueError(
+                    f"trusted solved-leaf receipt is corrupt: {path}: {error}"
+                ) from error
             if identity != selection.scientific_identities[leaf_id]:
                 ignored.append(
                     {
@@ -1003,6 +1155,7 @@ def recover_campaign(
     )
     candidate_checkpoint["recovery_receipts"].extend(root_readout_indices)
     candidate_checkpoint["recovery_receipts"].extend(legacy_compatibility_receipts)
+    candidate_checkpoint["recovery_receipts"].extend(scientific_compatibility_receipts)
     accepted_receipts: list[dict[str, object]] = []
     for leaf_id in selection.ordered_leaf_ids:
         leaf_candidates = candidates.get(leaf_id, [])

@@ -64,7 +64,7 @@ from .response_uncertainty import (
     ComplexDisk,
     ZeroContainingDiskError,
     exterior_response_disk,
-    horizon_response_disk,
+    legacy_v2_horizon_response_disk,
 )
 from .reviewed_determinant_error import (
     AuthenticatedDeterminantErrorBundle,
@@ -160,10 +160,10 @@ PROMOTED_HORIZON_COMPONENT_IDENTITY = (
 PROMOTED_HORIZON_RESPONSE_METHOD = (
     "analytic-horizon-from-promoted-primary-derivative/v1"
 )
-PROMOTED_HORIZON_COMPONENT_V2_IDENTITY = (
+PROMOTED_HORIZON_BOUNDED_COMPONENT_IDENTITY = (
     "single-promoted-root-bounded-analytic-horizon-component/v2"
 )
-PROMOTED_HORIZON_RESPONSE_METHOD_V2 = (
+PROMOTED_HORIZON_BOUNDED_RESPONSE_METHOD = (
     "bounded-analytic-horizon-from-promoted-primary-derivative/v2"
 )
 PROMOTED_HORIZON_COMPONENT_V3_IDENTITY = (
@@ -171,6 +171,20 @@ PROMOTED_HORIZON_COMPONENT_V3_IDENTITY = (
 )
 PROMOTED_HORIZON_RESPONSE_METHOD_V3 = (
     "bounded-analytic-horizon-from-sealed-frequency-derivative/v3"
+)
+M02_HORIZON_EXTERIOR_RESPONSE_MATH_IDENTITY = (
+    "m02-horizon-exterior-response-math/v1"
+)
+FINITE_RADIUS_ENDPOINT_WEDGE_DETERMINANT_CONVENTION = (
+    "finite-radius-endpoint-wedge/raw-oriented/v1"
+)
+BINARY64_HORIZON_OPERATION_V3 = "binary64-horizon-production/v3"
+BINARY64_HORIZON_RESPONSE_METHOD = (
+    "binary64-fixed-root-horizon-response/v2"
+)
+BINARY64_HORIZON_COMPONENT = "binary64-horizon-analytic-component/v2"
+PR69_COMMIT9_HUMAN_MATH_REVIEW_SHA256 = (
+    "a886985b081fdc2dc5fd7789ddb18eb60c995960b8aaa76bd33dbb0f5b4844bd"
 )
 PROMOTED_HORIZON_FAILURE_COMPONENT_IDENTITY = (
     "promoted-horizon-typed-failure-component/v1"
@@ -232,11 +246,14 @@ HISTORICAL_WORKER_RESPONSE_RECEIPT_SCHEMA = (
 # binary64-parity PRIMARY Newton and fixed-root TRUNCATION/RESOLUTION evidence.
 # Version 8 added frequency-disk derivative authentication. Version 9 persists
 # every successful adaptive horizon endpoint search in the sealed response.
-# Version 10 separates one logical authenticated fixed-root determinant from
+# Version 10 separated one logical authenticated fixed-root determinant from
 # the raw determinant evaluations required to construct its certificate.
+# Version 11 makes the diagnostic model and exact raw-role contract explicit
+# on both sides of the request/response boundary.
 # Error responses remain independently versioned at 1.
-WORKER_RESPONSE_WIRE_SCHEMA = 10
-HISTORICAL_WORKER_RESPONSE_WIRE_SCHEMAS = frozenset({3, 4, 5, 6, 7, 8, 9})
+LEGACY_PROMOTED_WORKER_RESPONSE_WIRE_SCHEMA = 10
+WORKER_RESPONSE_WIRE_SCHEMA = 11
+HISTORICAL_WORKER_RESPONSE_WIRE_SCHEMAS = frozenset({3, 4, 5, 6, 7, 8, 9, 10})
 _ROOT_AUTHENTICATION_WIRE_SCHEMAS = frozenset({4, 5, 6})
 _HISTORICAL_WORKER_RESPONSE_RECEIPT_FIELDS = frozenset({
     "schema",
@@ -288,8 +305,383 @@ HORIZON_BASIS_AT_MATCH_EXTRACTION = "scaled-horizon-basis-at-match/v1"
 VERIFIED_ENDPOINT_ERROR_MODEL = (
     "verified-endpoint-control-equivalence-absolute-error/v2"
 )
+EXTERIOR_PROVISIONAL_DETERMINANT_ERROR_MODEL = (
+    "exterior-determinant-additive-channels/provisional-v1"
+)
+RAW_DETERMINANT_ROLE_PRIMARY = "PRIMARY"
+RAW_DETERMINANT_ROLE_TRUNCATION = "TRUNCATION"
+RAW_DETERMINANT_ROLE_RESOLUTION = "RESOLUTION"
 PROMOTED_CONTROL_PROFILE_LABEL = "provisional promoted control profile"
 PROMOTED_CONTROL_PROFILE_CALIBRATION_STATUS = "UNMEASURED"
+
+_RAW_DETERMINANT_MODE_CONTRACTS = MappingProxyType({
+    VERIFIED_ENDPOINT_ERROR_MODEL: (
+        (RAW_DETERMINANT_ROLE_PRIMARY,),
+        False,
+        False,
+        VERIFIED_ENDPOINT_ERROR_MODEL,
+        "horizon-admittance",
+    ),
+    EXTERIOR_PROVISIONAL_DETERMINANT_ERROR_MODEL: (
+        (RAW_DETERMINANT_ROLE_PRIMARY,),
+        False,
+        False,
+        None,
+        None,
+    ),
+    EXTERIOR_DETERMINANT_ABSOLUTE_ERROR_CERTIFICATE: (
+        (
+            RAW_DETERMINANT_ROLE_PRIMARY,
+            RAW_DETERMINANT_ROLE_TRUNCATION,
+            RAW_DETERMINANT_ROLE_RESOLUTION,
+        ),
+        True,
+        True,
+        EXTERIOR_DETERMINANT_ABSOLUTE_ERROR_CERTIFICATE,
+        None,
+    ),
+})
+
+
+@dataclass(frozen=True, slots=True)
+class RawDeterminantContract:
+    """Immutable raw-determinant contract selected by an authenticated request."""
+
+    diagnostic_model_identity: str
+    required_raw_determinant_roles: tuple[str, ...]
+    empirical_certificate_required: bool
+    calibration_receipt_required: bool
+    permitted_response_receipt_identity: str | None
+
+    @property
+    def required_raw_determinant_count(self) -> int:
+        return len(self.required_raw_determinant_roles)
+
+
+def raw_determinant_evidence_semantics(
+    contract: RawDeterminantContract,
+) -> dict[str, str]:
+    """Return the evidence disposition bound to one selected mode."""
+
+    if not isinstance(contract, RawDeterminantContract):
+        raise ValueError("raw determinant evidence contract is invalid")
+    if contract.diagnostic_model_identity == VERIFIED_ENDPOINT_ERROR_MODEL:
+        return {
+            "evidence_level": "HORIZON_V3_ANALYTIC",
+            "evidence_disposition": "HORIZON_V3_ANALYTIC",
+        }
+    if (
+        contract.diagnostic_model_identity
+        == EXTERIOR_PROVISIONAL_DETERMINANT_ERROR_MODEL
+    ):
+        return {
+            "evidence_level": "NOT_SCREENED",
+            "evidence_disposition": "BLOCKED_BY_REVIEWED_ERROR_EVIDENCE",
+        }
+    if (
+        contract.diagnostic_model_identity
+        == EXTERIOR_DETERMINANT_ABSOLUTE_ERROR_CERTIFICATE
+    ):
+        return {
+            "evidence_level": "SCREENED",
+            "evidence_disposition": "EMPIRICAL_CERTIFICATE_AUTHENTICATED",
+        }
+    raise ValueError("unknown raw determinant evidence contract")
+
+
+def raw_determinant_contract_from_request(
+    request: Mapping[str, object],
+) -> RawDeterminantContract:
+    """Resolve the exact raw-role contract from explicit request fields.
+
+    The mechanism is only a compatibility guard. It never selects the
+    diagnostic model or derives the raw count.
+    """
+
+    if not isinstance(request, Mapping):
+        raise ValueError("raw determinant request is invalid")
+    model = request.get("diagnostic_model_identity")
+    if not isinstance(model, str) or not model:
+        raise ValueError("diagnostic model identity is required")
+    roles_value = request.get("required_raw_determinant_roles")
+    if not isinstance(roles_value, (list, tuple)):
+        raise ValueError("raw determinant roles are required")
+    roles = tuple(roles_value)
+    if (
+        not roles
+        or any(not isinstance(role, str) or not role for role in roles)
+        or len(set(roles)) != len(roles)
+    ):
+        raise ValueError("raw determinant roles are invalid")
+    declared_count = request.get("required_raw_determinant_count")
+    if type(declared_count) is not int or declared_count != len(roles):
+        raise ValueError("raw determinant role/count binding is invalid")
+    policy = request.get("policy")
+    if not isinstance(policy, Mapping):
+        raise ValueError("raw determinant request policy is invalid")
+    if policy.get("determinant_error_model") != model:
+        raise ValueError("diagnostic model identity is not policy-bound")
+
+    selected = _RAW_DETERMINANT_MODE_CONTRACTS.get(model)
+    if selected is None:
+        raise ValueError(f"unknown diagnostic model identity: {model}")
+    expected_roles, empirical, calibration, permitted, required_mechanism = selected
+    mechanism_id = request.get("mechanism_id")
+    if required_mechanism is not None and mechanism_id != required_mechanism:
+        raise ValueError("horizon diagnostic model is bound to the wrong mechanism")
+    if required_mechanism is None and mechanism_id == "horizon-admittance":
+        raise ValueError("exterior diagnostic model is bound to the horizon mechanism")
+    if roles != expected_roles:
+        raise ValueError("raw determinant roles do not match diagnostic model")
+    if model == EXTERIOR_PROVISIONAL_DETERMINANT_ERROR_MODEL:
+        forbidden = {
+            "determinant_error_required_term_classes",
+            "determinant_error_certificate_statement",
+            "determinant_error_safety_factor",
+            "promoted_control_calibration_receipt_sha256",
+            "empirical_control_profile_sha256",
+        }
+        present = sorted(field for field in forbidden if field in policy)
+        if present:
+            raise ValueError(
+                "provisional diagnostic model carries empirical fields: "
+                + ", ".join(present)
+            )
+    return RawDeterminantContract(
+        diagnostic_model_identity=model,
+        required_raw_determinant_roles=expected_roles,
+        empirical_certificate_required=empirical,
+        calibration_receipt_required=calibration,
+        permitted_response_receipt_identity=permitted,
+    )
+
+
+def raw_determinant_contract_fields_for_model(
+    diagnostic_model_identity: str,
+) -> dict[str, object]:
+    """Return the canonical request fields for one explicit model identity."""
+
+    selected = _RAW_DETERMINANT_MODE_CONTRACTS.get(diagnostic_model_identity)
+    if selected is None:
+        raise ValueError(
+            f"unknown diagnostic model identity: {diagnostic_model_identity}"
+        )
+    roles = selected[0]
+    return {
+        "diagnostic_model_identity": diagnostic_model_identity,
+        "required_raw_determinant_roles": list(roles),
+        "required_raw_determinant_count": len(roles),
+    }
+
+
+def raw_determinant_contract_golden_cases() -> tuple[dict[str, object], ...]:
+    """Return the small cross-language request/response contract fixtures.
+
+    These are semantic wire fixtures rather than numerical outputs.  The
+    Python parser, receipt tests, and hosted Julia contract spec consume the
+    same model/role/count values so a future wire change cannot silently make
+    one side reinterpret the other.
+    """
+
+    return (
+        {
+            "label": "horizon-analytic",
+            "request": {
+                "mechanism_class": "horizon",
+                "mechanism_id": "horizon-admittance",
+                "diagnostic_model_identity": VERIFIED_ENDPOINT_ERROR_MODEL,
+                "required_raw_determinant_roles": [RAW_DETERMINANT_ROLE_PRIMARY],
+                "required_raw_determinant_count": 1,
+                "policy": {
+                    "determinant_error_model": VERIFIED_ENDPOINT_ERROR_MODEL,
+                },
+            },
+            "response": {
+                "schema_version": WORKER_RESPONSE_WIRE_SCHEMA,
+                "operation": "root-readout",
+                "diagnostic_model_identity": VERIFIED_ENDPOINT_ERROR_MODEL,
+                "required_raw_determinant_roles": [RAW_DETERMINANT_ROLE_PRIMARY],
+                "required_raw_determinant_count": 1,
+                "certificate_requirement": "not-applicable",
+                "provisional_stage": "not-applicable",
+                "evidence_disposition": "HORIZON_V3_ANALYTIC",
+            },
+        },
+        {
+            "label": "exterior-provisional-additive",
+            "request": {
+                "mechanism_class": "exterior",
+                "mechanism_id": "exterior-light-ring",
+                "diagnostic_model_identity": (
+                    EXTERIOR_PROVISIONAL_DETERMINANT_ERROR_MODEL
+                ),
+                "required_raw_determinant_roles": [RAW_DETERMINANT_ROLE_PRIMARY],
+                "required_raw_determinant_count": 1,
+                "policy": {
+                    "determinant_error_model": (
+                        EXTERIOR_PROVISIONAL_DETERMINANT_ERROR_MODEL
+                    ),
+                },
+            },
+            "response": {
+                "schema_version": WORKER_RESPONSE_WIRE_SCHEMA,
+                "operation": "root-readout",
+                "diagnostic_model_identity": (
+                    EXTERIOR_PROVISIONAL_DETERMINANT_ERROR_MODEL
+                ),
+                "required_raw_determinant_roles": [RAW_DETERMINANT_ROLE_PRIMARY],
+                "required_raw_determinant_count": 1,
+                "certificate_requirement": "forbidden",
+                "provisional_stage": "persisted-authenticated",
+                "evidence_disposition": (
+                    "PROVISIONAL_NOT_SCREENED_WITHOUT_CALIBRATION"
+                ),
+            },
+        },
+        {
+            "label": "exterior-empirical-certificate",
+            "request": {
+                "mechanism_class": "exterior",
+                "mechanism_id": "exterior-light-ring",
+                "diagnostic_model_identity": (
+                    EXTERIOR_DETERMINANT_ABSOLUTE_ERROR_CERTIFICATE
+                ),
+                "required_raw_determinant_roles": [
+                    RAW_DETERMINANT_ROLE_PRIMARY,
+                    RAW_DETERMINANT_ROLE_TRUNCATION,
+                    RAW_DETERMINANT_ROLE_RESOLUTION,
+                ],
+                "required_raw_determinant_count": 3,
+                "policy": {
+                    "determinant_error_model": (
+                        EXTERIOR_DETERMINANT_ABSOLUTE_ERROR_CERTIFICATE
+                    ),
+                },
+            },
+            "response": {
+                "schema_version": WORKER_RESPONSE_WIRE_SCHEMA,
+                "operation": "root-readout",
+                "diagnostic_model_identity": (
+                    EXTERIOR_DETERMINANT_ABSOLUTE_ERROR_CERTIFICATE
+                ),
+                "required_raw_determinant_roles": [
+                    RAW_DETERMINANT_ROLE_PRIMARY,
+                    RAW_DETERMINANT_ROLE_TRUNCATION,
+                    RAW_DETERMINANT_ROLE_RESOLUTION,
+                ],
+                "required_raw_determinant_count": 3,
+                "certificate_requirement": "required",
+                "provisional_stage": "not-applicable",
+                "evidence_disposition": "EMPIRICAL_CERTIFICATE_REQUIRED",
+            },
+        },
+    )
+
+
+def _validate_current_raw_determinant_policy(
+    request: Mapping[str, object],
+    contract: RawDeterminantContract,
+) -> None:
+    """Validate the mode-specific policy fields after model selection."""
+
+    policy = request.get("policy")
+    if not isinstance(policy, Mapping):
+        raise ValueError("determinant policy is invalid")
+    empirical_only_fields = frozenset({
+        "determinant_error_required_term_classes",
+        "determinant_error_certificate_statement",
+        "determinant_error_safety_factor",
+        "promoted_control_calibration_receipt_sha256",
+        "empirical_control_profile_sha256",
+    })
+    provisional_only_fields = frozenset({
+        "determinant_error_channel_schema",
+        "determinant_error_required_channels",
+        "determinant_error_calibration_status",
+    })
+    if contract.diagnostic_model_identity == VERIFIED_ENDPOINT_ERROR_MODEL:
+        horizon_forbidden_empirical_fields = empirical_only_fields - {
+            # Horizon v3 uses its own analytic safety factor.  It is not an
+            # exterior empirical-certificate claim and remains part of the
+            # approved horizon request contract.
+            "determinant_error_safety_factor",
+        }
+        if (
+            policy.get("determinant_error_model")
+            != VERIFIED_ENDPOINT_ERROR_MODEL
+            or horizon_forbidden_empirical_fields & policy.keys()
+            or provisional_only_fields & policy.keys()
+        ):
+            raise ValueError("determinant certificate policy is invalid")
+        return
+    digits = request.get("precision_digits")
+    preceding_tier = {
+        40: "binary64",
+        80: "bigfloat-40",
+        120: "bigfloat-80",
+    }.get(digits) if type(digits) is int else None
+    if contract.diagnostic_model_identity == EXTERIOR_PROVISIONAL_DETERMINANT_ERROR_MODEL:
+        required_channels = policy.get("determinant_error_required_channels")
+        if (
+            policy.get("determinant_error_channel_schema")
+            != EXTERIOR_PROVISIONAL_DETERMINANT_ERROR_MODEL
+            or not isinstance(required_channels, (list, tuple))
+            or list(required_channels) != [
+                "precision",
+                "ode_controls",
+                "endpoint_order",
+                "match_readout",
+                "angular_data",
+                "arithmetic_rounding",
+            ]
+            or policy.get("determinant_error_calibration_status")
+            != "MISSING_AUTHENTICATED_CALIBRATION"
+            or policy.get("determinant_error_missing_evidence_outcome")
+            != "BLOCKED_BY_REVIEWED_ERROR_EVIDENCE"
+            or policy.get("determinant_error_preceding_precision_tier")
+            != preceding_tier
+        ):
+            raise ValueError("determinant provisional policy is invalid")
+        return
+    required_terms = policy.get("determinant_error_required_term_classes")
+    if (
+        policy.get("determinant_error_model")
+        != EXTERIOR_DETERMINANT_ABSOLUTE_ERROR_CERTIFICATE
+        or not isinstance(required_terms, (list, tuple))
+        or list(required_terms) != [
+            "delta_same_point",
+            "delta_cross_precision",
+            "delta_endpoint_series",
+        ]
+        or policy.get("determinant_error_missing_evidence_outcome")
+        != EXTERIOR_DETERMINANT_CERTIFICATE_UNAVAILABLE
+        or policy.get("determinant_error_certificate_statement")
+        != (
+            "conservative empirical certificate; not a formal interval "
+            "enclosure"
+        )
+        or policy.get("determinant_error_preceding_precision_tier")
+        != preceding_tier
+        or type(policy.get("determinant_error_safety_factor")) is not int
+        or policy.get("determinant_error_safety_factor") != 64
+        or not isinstance(
+            policy.get("promoted_control_calibration_receipt_sha256"), str
+        )
+        or policy.get("promoted_control_calibration_receipt_sha256")
+        != DEFAULT_CALIBRATION_RECEIPT_SHA256
+        or _HEX_64.fullmatch(
+            policy["promoted_control_calibration_receipt_sha256"]
+        ) is None
+        or not isinstance(policy.get("empirical_control_profile_sha256"), str)
+        or _HEX_64.fullmatch(policy["empirical_control_profile_sha256"]) is None
+        or provisional_only_fields & policy.keys()
+    ):
+        raise ValueError("determinant certificate policy is invalid")
+    expected_profile_sha256 = _current_empirical_control_profile_sha256(
+        "exterior-wronskian/v1", digits
+    )
+    if policy["empirical_control_profile_sha256"] != expected_profile_sha256:
+        raise ValueError("determinant certificate policy is invalid")
 
 _REGULARISED_GSN_COMMON_IDENTITIES: Mapping[str, str] = MappingProxyType({
     "homogeneous_representation": "factored-plane-wave-gsn/v1",
@@ -1128,9 +1520,13 @@ def _validated_worker_response_receipt(
         raise ValueError("worker response receipt request digest is invalid")
     wire_schema = value["worker_response_schema_version"]
     allowed_wire_schemas = (
-        # Receipt schema 3 predates wire 10.  Sealed wire-9 checkpoints stay
-        # readable, while new live responses must satisfy the wire-10 parser.
-        {9, WORKER_RESPONSE_WIRE_SCHEMA}
+        # Receipt schema 3 predates wire 10. Sealed wire-9 and legacy wire-10
+        # checkpoints stay readable; new live responses satisfy wire 11.
+        {
+            9,
+            LEGACY_PROMOTED_WORKER_RESPONSE_WIRE_SCHEMA,
+            WORKER_RESPONSE_WIRE_SCHEMA,
+        }
         if current
         else (
             {8}
@@ -1163,6 +1559,8 @@ def _validated_worker_response_receipt(
             )
         if wire_schema == WORKER_RESPONSE_WIRE_SCHEMA:
             _current_authenticated_determinant_raw_count(request_binding)
+        elif wire_schema == LEGACY_PROMOTED_WORKER_RESPONSE_WIRE_SCHEMA:
+            _legacy_authenticated_determinant_raw_count(request_binding)
     residual = _conditioning_decimal_from_text(
         value["root_residual_abs_text"],
         "worker response receipt root residual",
@@ -1196,15 +1594,15 @@ def _validated_worker_response_receipt(
     }
 
 
-def _current_authenticated_determinant_raw_count(
+def _legacy_authenticated_determinant_raw_count(
     request_binding: Mapping[str, object],
 ) -> int:
-    """Return the raw count bound to one current authenticated determinant.
+    """Return the raw count bound to one retained wire-10 determinant.
 
-    Wire 10 records the implementation work behind one logical determinant.
-    Its count is a mechanism contract, not something an absent optional policy
-    field may silently downgrade.  Validate the determinant-family join before
-    interpreting the count so resealed hybrid requests fail closed.
+    Wire 10 predates the response-side model/role echo.  It is retained only
+    for the exact horizon and empirical identities already bound by its
+    request policy.  The provisional one-evaluation exterior identity requires
+    wire 11, where the response repeats the authenticated contract.
     """
 
     mechanism_id = request_binding.get("mechanism_id")
@@ -1228,61 +1626,82 @@ def _current_authenticated_determinant_raw_count(
         raise ValueError(
             "worker response receipt determinant policy is invalid"
         )
-    if mechanism_id == "horizon-admittance":
-        expected_error_model = VERIFIED_ENDPOINT_ERROR_MODEL
-        raw_count = 1
-    elif mechanism_id in _EXTERIOR_PROFILE_IDS:
-        expected_error_model = (
-            EXTERIOR_DETERMINANT_ABSOLUTE_ERROR_CERTIFICATE
+    selected_model = policy.get("determinant_error_model")
+    if selected_model == VERIFIED_ENDPOINT_ERROR_MODEL:
+        if mechanism_id != "horizon-admittance":
+            raise ValueError(
+                "worker response receipt horizon model is bound to the wrong mechanism"
+            )
+        return 1
+    if selected_model == EXTERIOR_PROVISIONAL_DETERMINANT_ERROR_MODEL:
+        raise ValueError(
+            "wire 10 cannot carry a provisional exterior determinant contract"
         )
-        raw_count = 3
-    else:  # guarded by regularised_gsn_mechanism_contract; kept fail-closed.
+    if selected_model != EXTERIOR_DETERMINANT_ABSOLUTE_ERROR_CERTIFICATE:
         raise ValueError(
             "worker response receipt determinant policy is invalid"
         )
-    if policy.get("determinant_error_model") != expected_error_model:
+    if mechanism_id not in _EXTERIOR_PROFILE_IDS:
+        raise ValueError(
+            "worker response receipt empirical model is bound to the wrong mechanism"
+        )
+    if policy.get("determinant_error_model") != (
+        EXTERIOR_DETERMINANT_ABSOLUTE_ERROR_CERTIFICATE
+    ):
         raise ValueError(
             "worker response receipt determinant certificate policy is invalid"
         )
-    if raw_count == 3:
-        digits = request_binding.get("precision_digits")
-        preceding_tier = {
-            40: "binary64",
-            80: "bigfloat-40",
-            120: "bigfloat-80",
-        }.get(digits) if type(digits) is int else None
-        required_terms = policy.get(
-            "determinant_error_required_term_classes"
+    digits = request_binding.get("precision_digits")
+    preceding_tier = {
+        40: "binary64",
+        80: "bigfloat-40",
+        120: "bigfloat-80",
+    }.get(digits) if type(digits) is int else None
+    required_terms = policy.get("determinant_error_required_term_classes")
+    if (
+        type(required_terms) is not list
+        or required_terms != [
+            "delta_same_point",
+            "delta_cross_precision",
+            "delta_endpoint_series",
+        ]
+        or policy.get("determinant_error_missing_evidence_outcome")
+        != EXTERIOR_DETERMINANT_CERTIFICATE_UNAVAILABLE
+        or policy.get("determinant_error_certificate_statement")
+        != (
+            "conservative empirical certificate; not a formal interval "
+            "enclosure"
         )
-        if (
-            type(required_terms) is not list
-            or required_terms != [
-                "delta_same_point",
-                "delta_cross_precision",
-                "delta_endpoint_series",
-            ]
-            or policy.get("determinant_error_missing_evidence_outcome")
-            != EXTERIOR_DETERMINANT_CERTIFICATE_UNAVAILABLE
-            or policy.get("determinant_error_certificate_statement")
-            != (
-                "conservative empirical certificate; not a formal interval "
-                "enclosure"
-            )
-            or policy.get("determinant_error_preceding_precision_tier")
-            != preceding_tier
-            or type(policy.get("determinant_error_safety_factor")) is not int
-            or policy.get("determinant_error_safety_factor") != 64
-            or policy.get("promoted_control_calibration_receipt_sha256")
-            != DEFAULT_CALIBRATION_RECEIPT_SHA256
-            or policy.get("empirical_control_profile_sha256")
-            != _current_empirical_control_profile_sha256(
-                "exterior-wronskian/v1", digits
-            )
-        ):
-            raise ValueError(
-                "worker response receipt determinant certificate policy is invalid"
-            )
-    return raw_count
+        or policy.get("determinant_error_preceding_precision_tier")
+        != preceding_tier
+        or type(policy.get("determinant_error_safety_factor")) is not int
+        or policy.get("determinant_error_safety_factor") != 64
+        or policy.get("promoted_control_calibration_receipt_sha256")
+        != DEFAULT_CALIBRATION_RECEIPT_SHA256
+        or policy.get("empirical_control_profile_sha256")
+        != _current_empirical_control_profile_sha256(
+            "exterior-wronskian/v1", digits
+        )
+    ):
+        raise ValueError(
+            "worker response receipt determinant certificate policy is invalid"
+        )
+    return 3
+
+
+def _current_authenticated_determinant_raw_count(
+    request_binding: Mapping[str, object],
+) -> int:
+    """Return the count selected by the explicit current request contract."""
+
+    try:
+        contract = raw_determinant_contract_from_request(request_binding)
+        _validate_current_raw_determinant_policy(request_binding, contract)
+        return contract.required_raw_determinant_count
+    except ValueError as error:
+        raise ValueError(
+            "worker response receipt determinant certificate policy/raw contract is invalid"
+        ) from error
 
 
 @lru_cache(maxsize=None)
@@ -1819,6 +2238,21 @@ class ExteriorSupport:
             "half_width": self.half_width,
         }
 
+    @classmethod
+    def from_mapping(cls, value: object) -> "ExteriorSupport":
+        fields = {"lower", "upper", "centre", "half_width"}
+        if not isinstance(value, Mapping) or set(value) != fields:
+            raise ValueError("exterior support mapping is invalid")
+        converted: dict[str, float] = {}
+        for name in fields:
+            item = value[name]
+            if isinstance(item, bool) or not isinstance(item, (int, float)):
+                raise ValueError("exterior support mapping is invalid")
+            converted[name] = float(item)
+        if any(not math.isfinite(item) for item in converted.values()):
+            raise ValueError("exterior support mapping is invalid")
+        return cls(**converted)
+
 
 @dataclass(frozen=True, slots=True)
 class Binary64FixedRootSample:
@@ -1956,6 +2390,40 @@ class Binary64FixedRootBatch:
             "root_read_count": self.root_read_count,
             "julia_launch_count": self.julia_launch_count,
         }
+
+    @classmethod
+    def from_mapping(cls, value: object) -> "Binary64FixedRootBatch":
+        fields = {
+            "schema", "operation_identity", "leaf_id", "job_id", "mechanism_id",
+            "fixed_root", "branch_identity", "frequency_step", "coordinate_step",
+            "support", "samples", "sample_count", "sample_limit", "root_read_count",
+            "julia_launch_count",
+        }
+        if (
+            not isinstance(value, Mapping)
+            or set(value) != fields
+            or value["schema"] != "windows-solver.binary64-fixed-root-batch/1"
+            or not isinstance(value["samples"], list)
+        ):
+            raise ValueError("binary64 fixed-root batch mapping is invalid")
+        batch = cls(
+            leaf_id=str(value["leaf_id"]),
+            job_id=str(value["job_id"]),
+            mechanism_id=str(value["mechanism_id"]),
+            fixed_root=_complex_from_mapping(value["fixed_root"], "fixed root"),
+            branch_identity=str(value["branch_identity"]),
+            frequency_step=float(value["frequency_step"]),
+            coordinate_step=float(value["coordinate_step"]),
+            support=ExteriorSupport.from_mapping(value["support"]),
+            samples=tuple(Binary64FixedRootSample.from_mapping(item) for item in value["samples"]),
+            operation_identity=str(value["operation_identity"]),
+            sample_limit=value["sample_limit"],
+            root_read_count=value["root_read_count"],
+            julia_launch_count=value["julia_launch_count"],
+        )
+        if value["sample_count"] != batch.sample_count:
+            raise ValueError("binary64 fixed-root batch sample count is invalid")
+        return batch
 
 
 @dataclass(frozen=True, slots=True)
@@ -2489,6 +2957,10 @@ class Binary64ReusedBackgroundBatch:
     def sample_count(self) -> int:
         return len(self.samples)
 
+    @property
+    def sample_roles(self) -> tuple[str, ...]:
+        return tuple(sample.role for sample in self.samples)
+
     def to_mapping(self) -> dict[str, object]:
         return {
             "schema": "windows-solver.binary64-reused-background-batch/1",
@@ -2508,6 +2980,42 @@ class Binary64ReusedBackgroundBatch:
             "root_read_count": self.root_read_count,
             "julia_launch_count": self.julia_launch_count,
         }
+
+    @classmethod
+    def from_mapping(cls, value: object) -> "Binary64ReusedBackgroundBatch":
+        fields = {
+            "schema", "operation_identity", "leaf_id", "job_id", "mechanism_id",
+            "fixed_root", "branch_identity", "coordinate_step", "support",
+            "background_sha256", "equivalence_receipt_sha256", "samples",
+            "sample_count", "sample_limit", "root_read_count", "julia_launch_count",
+        }
+        if (
+            not isinstance(value, Mapping)
+            or set(value) != fields
+            or value["schema"]
+            != "windows-solver.binary64-reused-background-batch/1"
+            or value["operation_identity"] != BINARY64_FIXED_ROOT_SURVEY_IDENTITY
+            or not isinstance(value["samples"], list)
+        ):
+            raise ValueError("reused background batch mapping is invalid")
+        batch = cls(
+            leaf_id=str(value["leaf_id"]),
+            job_id=str(value["job_id"]),
+            mechanism_id=str(value["mechanism_id"]),
+            fixed_root=_complex_from_mapping(value["fixed_root"], "fixed root"),
+            branch_identity=str(value["branch_identity"]),
+            coordinate_step=float(value["coordinate_step"]),
+            support=ExteriorSupport.from_mapping(value["support"]),
+            background_sha256=str(value["background_sha256"]),
+            equivalence_receipt_sha256=str(value["equivalence_receipt_sha256"]),
+            samples=tuple(Binary64FixedRootSample.from_mapping(item) for item in value["samples"]),
+            sample_limit=value["sample_limit"],
+            root_read_count=value["root_read_count"],
+            julia_launch_count=value["julia_launch_count"],
+        )
+        if value["sample_count"] != batch.sample_count:
+            raise ValueError("reused background batch sample count is invalid")
+        return batch
 
 
 def exterior_background_reuse_admitted(
@@ -2561,6 +3069,302 @@ def combine_binary64_reused_background_batch(
         support=batch.support,
         samples=background.samples + batch.samples,
     )
+
+
+EXTERIOR_PROVISIONAL_STAGE_SCHEMA = (
+    "windows-solver.binary64-fixed-root-provisional-stage/1"
+)
+EXTERIOR_PROVISIONAL_STAGE_IDENTITY = "binary64-fixed-root-provisional/v1"
+EXTERIOR_PROVISIONAL_REUSE_RECEIPT_SCHEMA = (
+    "windows-solver.exterior-provisional-reuse-decision/1"
+)
+
+
+def _exterior_provisional_request_sha256(
+    *,
+    job: ResponseComponentJob,
+    scientific_computation_identity: str,
+    root_seal_sha256: str,
+    fixed_root: complex,
+    reuse_key: ExteriorBackgroundReuseKey,
+) -> str:
+    return _sha256({
+        "schema": "windows-solver.binary64-fixed-root-provisional-request/1",
+        "leaf_id": job.leaf_id,
+        "job_id": job.job_id,
+        "scientific_computation_identity": scientific_computation_identity,
+        "root_seal_sha256": root_seal_sha256,
+        "fixed_root": _complex_mapping(fixed_root),
+        "branch_identity": job.root.branch_id,
+        "mechanism_id": job.mechanism_id,
+        "reuse_key": reuse_key.to_mapping(),
+    })
+
+
+def build_exterior_provisional_stage(
+    *,
+    job: ResponseComponentJob,
+    scientific_computation_identity: str,
+    root_seal_sha256: str,
+    raw_batch: Binary64FixedRootBatch | Binary64ReusedBackgroundBatch,
+    combined_batch: Binary64FixedRootBatch,
+    background: CanonicalExteriorBackground,
+    background_receipt: BackgroundEquivalenceReceipt,
+    reason_code: str,
+) -> tuple[dict[str, object], str]:
+    """Preserve unauthenticated exterior raw work without admitting a disk."""
+
+    if job.mechanism_id not in _EXTERIOR_PROFILE_IDS:
+        raise ValueError("exterior provisional stage requires an exterior job")
+    if _HEX_64.fullmatch(scientific_computation_identity) is None:
+        raise ValueError("exterior provisional scientific identity is invalid")
+    if _HEX_64.fullmatch(root_seal_sha256) is None:
+        raise ValueError("exterior provisional root seal is invalid")
+    if not isinstance(reason_code, str) or not reason_code:
+        raise ValueError("exterior provisional reason is invalid")
+    if not isinstance(raw_batch, (Binary64FixedRootBatch, Binary64ReusedBackgroundBatch)):
+        raise ValueError("exterior provisional raw batch is invalid")
+    if not isinstance(combined_batch, Binary64FixedRootBatch):
+        raise ValueError("exterior provisional combined batch is invalid")
+    reuse_key = build_exterior_background_reuse_key(
+        job,
+        root_seal_sha256=root_seal_sha256,
+        fixed_root=combined_batch.fixed_root,
+    )
+    if (
+        background.reuse_key != reuse_key
+        or background.fixed_root != combined_batch.fixed_root
+        or background_receipt.reuse_key != reuse_key
+        or background_receipt.mechanism_id != job.mechanism_id
+        or background_receipt.canonical_background_sha256 != background.sha256
+    ):
+        raise ValueError("exterior provisional background binding is invalid")
+    expected_receipt = BackgroundEquivalenceReceipt.issue(
+        reuse_key=reuse_key,
+        job=job,
+        canonical_background_sha256=background.sha256,
+        fixed_root=combined_batch.fixed_root,
+    )
+    if background_receipt.to_mapping() != expected_receipt.to_mapping():
+        raise ValueError("exterior provisional background receipt is invalid")
+    if (
+        raw_batch.leaf_id != job.leaf_id
+        or raw_batch.job_id != job.job_id
+        or raw_batch.mechanism_id != job.mechanism_id
+        or raw_batch.branch_identity != job.root.branch_id
+        or raw_batch.fixed_root != combined_batch.fixed_root
+        or combined_batch.leaf_id != job.leaf_id
+        or combined_batch.job_id != job.job_id
+        or combined_batch.mechanism_id != job.mechanism_id
+        or combined_batch.branch_identity != job.root.branch_id
+    ):
+        raise ValueError("exterior provisional batch identity is invalid")
+    if isinstance(raw_batch, Binary64FixedRootBatch):
+        if raw_batch != combined_batch:
+            raise ValueError("exterior provisional full batch is inconsistent")
+    elif combine_binary64_reused_background_batch(background, raw_batch) != combined_batch:
+        raise ValueError("exterior provisional reused batch is inconsistent")
+    combined_samples = [sample.to_mapping() for sample in combined_batch.samples]
+    content = {
+        "schema": EXTERIOR_PROVISIONAL_STAGE_SCHEMA,
+        "operation_identity": EXTERIOR_PROVISIONAL_STAGE_IDENTITY,
+        "source_operation_identity": BINARY64_FIXED_ROOT_SURVEY_IDENTITY,
+        "leaf_id": job.leaf_id,
+        "job_id": job.job_id,
+        "scientific_computation_identity": scientific_computation_identity,
+        "root_seal_sha256": root_seal_sha256,
+        "fixed_root": _complex_mapping(combined_batch.fixed_root),
+        "branch_identity": job.root.branch_id,
+        "mechanism_id": job.mechanism_id,
+        "support": combined_batch.support.to_mapping(),
+        "support_identity_sha256": _sha256(combined_batch.support.to_mapping()),
+        "request_sha256": _exterior_provisional_request_sha256(
+            job=job,
+            scientific_computation_identity=scientific_computation_identity,
+            root_seal_sha256=root_seal_sha256,
+            fixed_root=combined_batch.fixed_root,
+            reuse_key=reuse_key,
+        ),
+        "response_sha256": _sha256({
+            "raw_batch": raw_batch.to_mapping(),
+            "combined_samples": combined_samples,
+        }),
+        "numerical_controls": {
+            "policy_identity_sha256": job.policy.identity_sha256,
+            "backend_identity_sha256": job.backend_identity.identity_sha256,
+            "reuse_key": reuse_key.to_mapping(),
+        },
+        "raw_batch": raw_batch.to_mapping(),
+        "raw_sample_roles": list(raw_batch.sample_roles),
+        "raw_sample_count": raw_batch.sample_count,
+        "raw_sample_limit": raw_batch.sample_limit,
+        "combined_sample_roles": list(combined_batch.sample_roles),
+        "raw_determinant_samples": combined_samples,
+        "d0_evidence": combined_samples[0],
+        "domega_evidence": combined_samples[1:5],
+        "dc_evidence": combined_samples[5:9],
+        "canonical_background": background.to_mapping(),
+        "background_reuse_receipt": background_receipt.to_mapping(),
+        "nonadmission_reason_code": reason_code,
+    }
+    stage_sha256 = _sha256(content)
+    return {**content, "stage_sha256": stage_sha256}, stage_sha256
+
+
+def validate_exterior_provisional_stage(
+    stage: object,
+    *,
+    job: ResponseComponentJob,
+    scientific_computation_identity: str,
+    root_seal_sha256: str,
+) -> dict[str, object]:
+    """Authenticate one exact binary64 predecessor before BF40 uses it."""
+
+    fields = {
+        "schema", "operation_identity", "source_operation_identity", "leaf_id",
+        "job_id", "scientific_computation_identity", "root_seal_sha256",
+        "fixed_root", "branch_identity", "mechanism_id", "support",
+        "support_identity_sha256", "request_sha256", "response_sha256",
+        "numerical_controls", "raw_batch", "raw_sample_roles", "raw_sample_count",
+        "raw_sample_limit", "combined_sample_roles", "raw_determinant_samples",
+        "d0_evidence", "domega_evidence", "dc_evidence", "canonical_background",
+        "background_reuse_receipt", "nonadmission_reason_code", "stage_sha256",
+    }
+    if not isinstance(stage, Mapping) or set(stage) != fields:
+        raise ValueError("exterior provisional stage fields are invalid")
+    content = {name: stage[name] for name in fields - {"stage_sha256"}}
+    if (
+        stage["schema"] != EXTERIOR_PROVISIONAL_STAGE_SCHEMA
+        or stage["operation_identity"] != EXTERIOR_PROVISIONAL_STAGE_IDENTITY
+        or stage["source_operation_identity"] != BINARY64_FIXED_ROOT_SURVEY_IDENTITY
+        or stage["stage_sha256"] != _sha256(content)
+    ):
+        raise ValueError("exterior provisional stage authentication failed")
+    if (
+        stage["leaf_id"] != job.leaf_id
+        or stage["job_id"] != job.job_id
+        or stage["scientific_computation_identity"] != scientific_computation_identity
+        or stage["root_seal_sha256"] != root_seal_sha256
+        or stage["branch_identity"] != job.root.branch_id
+        or stage["mechanism_id"] != job.mechanism_id
+    ):
+        raise ValueError("exterior provisional stage identity is incompatible")
+    fixed_root = _complex_from_mapping(stage["fixed_root"], "fixed root")
+    support = ExteriorSupport.from_mapping(stage["support"])
+    if support != _exterior_support(job.spin, job.mechanism_id):
+        raise ValueError("exterior provisional support is incompatible")
+    if stage["support_identity_sha256"] != _sha256(support.to_mapping()):
+        raise ValueError("exterior provisional support digest is invalid")
+    controls = stage["numerical_controls"]
+    if not isinstance(controls, Mapping) or set(controls) != {
+        "policy_identity_sha256", "backend_identity_sha256", "reuse_key"
+    }:
+        raise ValueError("exterior provisional controls are invalid")
+    reuse_key = ExteriorBackgroundReuseKey.from_mapping(controls["reuse_key"])
+    expected_key = build_exterior_background_reuse_key(
+        job, root_seal_sha256=root_seal_sha256, fixed_root=fixed_root
+    )
+    if (
+        reuse_key != expected_key
+        or controls["policy_identity_sha256"] != job.policy.identity_sha256
+        or controls["backend_identity_sha256"] != job.backend_identity.identity_sha256
+        or stage["request_sha256"] != _exterior_provisional_request_sha256(
+            job=job,
+            scientific_computation_identity=scientific_computation_identity,
+            root_seal_sha256=root_seal_sha256,
+            fixed_root=fixed_root,
+            reuse_key=reuse_key,
+        )
+    ):
+        raise ValueError("exterior provisional controls are incompatible")
+    raw_mapping = stage["raw_batch"]
+    if not isinstance(raw_mapping, Mapping):
+        raise ValueError("exterior provisional raw batch is invalid")
+    raw_schema = raw_mapping.get("schema")
+    if raw_schema == "windows-solver.binary64-fixed-root-batch/1":
+        raw_batch: Binary64FixedRootBatch | Binary64ReusedBackgroundBatch = (
+            Binary64FixedRootBatch.from_mapping(raw_mapping)
+        )
+    elif raw_schema == "windows-solver.binary64-reused-background-batch/1":
+        raw_batch = Binary64ReusedBackgroundBatch.from_mapping(raw_mapping)
+    else:
+        raise ValueError("exterior provisional raw batch is invalid")
+    background = CanonicalExteriorBackground.from_mapping(stage["canonical_background"])
+    receipt = BackgroundEquivalenceReceipt.from_mapping(
+        stage["background_reuse_receipt"]
+    )
+    if (
+        background.reuse_key != reuse_key
+        or receipt.to_mapping() != BackgroundEquivalenceReceipt.issue(
+            reuse_key=reuse_key,
+            job=job,
+            canonical_background_sha256=background.sha256,
+            fixed_root=fixed_root,
+        ).to_mapping()
+    ):
+        raise ValueError("exterior provisional background is incompatible")
+    combined = (
+        raw_batch
+        if isinstance(raw_batch, Binary64FixedRootBatch)
+        else combine_binary64_reused_background_batch(background, raw_batch)
+    )
+    if (
+        combined.leaf_id != job.leaf_id
+        or combined.job_id != job.job_id
+        or combined.mechanism_id != job.mechanism_id
+        or combined.fixed_root != fixed_root
+        or combined.branch_identity != job.root.branch_id
+        or combined.support != support
+    ):
+        raise ValueError("exterior provisional combined batch is incompatible")
+    raw_samples = [sample.to_mapping() for sample in combined.samples]
+    if (
+        stage["raw_sample_roles"] != list(raw_batch.sample_roles)
+        or stage["raw_sample_count"] != raw_batch.sample_count
+        or stage["raw_sample_limit"] != raw_batch.sample_limit
+        or stage["combined_sample_roles"] != list(combined.sample_roles)
+        or stage["raw_determinant_samples"] != raw_samples
+        or stage["d0_evidence"] != raw_samples[0]
+        or stage["domega_evidence"] != raw_samples[1:5]
+        or stage["dc_evidence"] != raw_samples[5:9]
+        or stage["response_sha256"] != _sha256({
+            "raw_batch": raw_batch.to_mapping(), "combined_samples": raw_samples,
+        })
+        or not isinstance(stage["nonadmission_reason_code"], str)
+        or not stage["nonadmission_reason_code"]
+    ):
+        raise ValueError("exterior provisional raw evidence is invalid")
+    return {name: stage[name] for name in fields}
+
+
+def exterior_provisional_reuse_receipt(
+    stage: object,
+    *,
+    job: ResponseComponentJob,
+    scientific_computation_identity: str,
+    root_seal_sha256: str,
+    target_precision_tier: str,
+) -> dict[str, object]:
+    """Issue an explicit compatible-predecessor receipt for promoted work."""
+
+    if target_precision_tier != "BF40":
+        raise ValueError("exterior provisional target tier is invalid")
+    authenticated = validate_exterior_provisional_stage(
+        stage,
+        job=job,
+        scientific_computation_identity=scientific_computation_identity,
+        root_seal_sha256=root_seal_sha256,
+    )
+    content = {
+        "schema": EXTERIOR_PROVISIONAL_REUSE_RECEIPT_SCHEMA,
+        "status": "COMPATIBLE",
+        "leaf_id": job.leaf_id,
+        "provisional_stage_sha256": authenticated["stage_sha256"],
+        "root_seal_sha256": root_seal_sha256,
+        "target_precision_tier": target_precision_tier,
+        "decision": "AUTHENTICATED_BINARY64_PREDECESSOR_CONSUMED",
+    }
+    return {**content, "receipt_sha256": _sha256(content)}
 
 
 def screen_binary64_reused_background_batch(
@@ -2633,8 +3437,8 @@ def _screen_with_reviewed_determinant_errors(
             frequency_derivative_disk=None,
             coordinate_derivative_disk=None,
             root_correction_upper_bound=None,
-            reason_code="DETERMINANT_ERROR_EVIDENCE_UNAVAILABLE",
-            determinant_certificate_status="unavailable",
+            reason_code="BLOCKED_BY_REVIEWED_ERROR_EVIDENCE",
+            determinant_certificate_status="blocked-by-reviewed-error-evidence",
         )
     if not isinstance(
         determinant_error_evidence, AuthenticatedDeterminantErrorBundle
@@ -2848,6 +3652,12 @@ class DeterminantPartials:
     coordinate_derivative: complex
     simple_root_valid: bool
     frequency_derivative_error_abs: float | None = None
+    dD_dR: complex | None = None
+    dD_dR_error_abs: float | None = None
+    dR_ddeltaB: complex | None = None
+    dD_ddeltaB: complex | None = None
+    dD_domega: complex | None = None
+    dD_domega_error_abs: float | None = None
 
     def __post_init__(self) -> None:
         _finite_complex(self.frequency_derivative, "frequency derivative")
@@ -2857,6 +3667,17 @@ class DeterminantPartials:
             if not math.isfinite(error) or error < 0.0:
                 raise ValueError("frequency derivative error must be finite and nonnegative")
             object.__setattr__(self, "frequency_derivative_error_abs", error)
+        for name in ("dD_dR", "dR_ddeltaB", "dD_ddeltaB", "dD_domega"):
+            value = getattr(self, name)
+            if value is not None:
+                _finite_complex(value, name)
+        for name in ("dD_dR_error_abs", "dD_domega_error_abs"):
+            value = getattr(self, name)
+            if value is not None:
+                error = float(value)
+                if not math.isfinite(error) or error < 0.0:
+                    raise ValueError(f"{name} must be finite and nonnegative")
+                object.__setattr__(self, name, error)
 
 
 @dataclass(frozen=True, slots=True)
@@ -5047,14 +5868,18 @@ class RootReadout:
                     raise ValueError(
                         "worker response receipt disagrees with promoted acceptance"
                     )
-                if (
-                    receipt["worker_response_schema_version"]
-                    == WORKER_RESPONSE_WIRE_SCHEMA
-                ):
-                    expected_raw_count = (
-                        _current_authenticated_determinant_raw_count(
-                            receipt["request_binding"]
-                        )
+                if receipt["worker_response_schema_version"] in {
+                    LEGACY_PROMOTED_WORKER_RESPONSE_WIRE_SCHEMA,
+                    WORKER_RESPONSE_WIRE_SCHEMA,
+                }:
+                    count_contract = (
+                        _current_authenticated_determinant_raw_count
+                        if receipt["worker_response_schema_version"]
+                        == WORKER_RESPONSE_WIRE_SCHEMA
+                        else _legacy_authenticated_determinant_raw_count
+                    )
+                    expected_raw_count = count_contract(
+                        receipt["request_binding"]
                     )
                     for diagnostic in (
                         self.diagnostic_readouts or {}
@@ -7061,7 +7886,7 @@ def _validate_promoted_horizon_checkpoint_evidence(
     expected_response: ComplexDisk | None
     expected_zero: str | None
     try:
-        expected_response = horizon_response_disk(
+        expected_response = legacy_v2_horizon_response_disk(
             horizon_frequency=frequency,
             determinant_derivative=expected_derivative,
         )
@@ -7102,7 +7927,7 @@ def _validate_promoted_horizon_checkpoint_evidence_for_job(
     """Bind a structurally valid horizon certificate to the selected Kerr job."""
 
     if result.component_scientific_identity not in {
-        PROMOTED_HORIZON_COMPONENT_V2_IDENTITY,
+        PROMOTED_HORIZON_BOUNDED_COMPONENT_IDENTITY,
         PROMOTED_HORIZON_COMPONENT_V3_IDENTITY,
     }:
         return
@@ -7283,7 +8108,7 @@ def _validate_root_sealed_horizon_checkpoint_evidence(
     ):
         raise ValueError("root-sealed horizon derivative is not sample-derived")
     try:
-        response_disk = horizon_response_disk(
+        response_disk = legacy_v2_horizon_response_disk(
             horizon_frequency=frequency,
             determinant_derivative=derivative,
         )
@@ -7526,13 +8351,13 @@ class ComponentResult:
                     "promoted analytic horizon component evidence is inconsistent"
                 )
         if self.component_scientific_identity == (
-            PROMOTED_HORIZON_COMPONENT_V2_IDENTITY
+            PROMOTED_HORIZON_BOUNDED_COMPONENT_IDENTITY
         ):
             bounded = self.response_uncertainty_status == BOUNDED_ANALYTIC_RESPONSE
             unbounded = self.response_uncertainty_status == UNBOUNDED_ANALYTIC_RESPONSE
             if (
                 self.mechanism_id != "horizon-admittance"
-                or self.response_method != PROMOTED_HORIZON_RESPONSE_METHOD_V2
+                or self.response_method != PROMOTED_HORIZON_BOUNDED_RESPONSE_METHOD
                 or self.finite_amplitude_ladder_required
                 or self.finite_amplitude_ladder_executed
                 or self.finite_amplitude_readout_count != 0
@@ -9419,14 +10244,14 @@ def _promoted_horizon_result(
         lineage={
             **_result_lineage(job),
             "component_scientific_identity": (
-                PROMOTED_HORIZON_COMPONENT_V2_IDENTITY
+                PROMOTED_HORIZON_BOUNDED_COMPONENT_IDENTITY
             ),
         },
         component_scientific_identity=(
-            PROMOTED_HORIZON_COMPONENT_V2_IDENTITY
+            PROMOTED_HORIZON_BOUNDED_COMPONENT_IDENTITY
         ),
         response_method=(
-            PROMOTED_HORIZON_RESPONSE_METHOD_V2
+            PROMOTED_HORIZON_BOUNDED_RESPONSE_METHOD
         ),
         finite_amplitude_ladder_required=False,
         finite_amplitude_ladder_executed=False,
@@ -9640,7 +10465,7 @@ def run_promoted_horizon_response_from_seal(
         },
     }
     try:
-        response_disk = horizon_response_disk(
+        response_disk = legacy_v2_horizon_response_disk(
             horizon_frequency=frequency,
             determinant_derivative=derivative,
         )
@@ -9936,7 +10761,7 @@ def run_promoted_horizon_component(
         "zero_containing_disk": None,
     }
     try:
-        response_disk = horizon_response_disk(
+        response_disk = legacy_v2_horizon_response_disk(
             horizon_frequency=horizon_frequency_disk,
             determinant_derivative=derivative_disk,
         )
@@ -11044,6 +11869,66 @@ def run_selective_readout_promotion(
         if callable(scientific_runtime_provider)
         else None
     )
+    backend_model = getattr(promoted_backend, "diagnostic_model_identity", None)
+    if not isinstance(backend_model, str):
+        backend_model = (
+            VERIFIED_ENDPOINT_ERROR_MODEL
+            if job.mechanism_id == "horizon-admittance"
+            else EXTERIOR_PROVISIONAL_DETERMINANT_ERROR_MODEL
+        )
+    fallback_fields = raw_determinant_contract_fields_for_model(backend_model)
+    fallback_request = {
+        "mechanism_id": job.mechanism_id,
+        **fallback_fields,
+        "policy": {
+            "determinant_error_model": backend_model,
+        },
+    }
+    try:
+        first_contract = raw_determinant_contract_from_request(fallback_request)
+    except ValueError as error:
+        raise ValueError(
+            "selective promotion fallback raw determinant contract is invalid"
+        ) from error
+    first_request = fallback_request
+    first_entry = None
+    request_from_receipt = False
+    if journaled is not None:
+        promoted_work_unit_ids = tuple(
+            unit.work_unit_id
+            for (_, amplitude), unit in journaled.units.items()
+            if amplitude in amplitudes
+        )
+        promoted_entries = {
+            work_unit_id: journaled.journal.entries[work_unit_id]
+            for work_unit_id in promoted_work_unit_ids
+        }
+        first_entry = next(iter(promoted_entries.values()))
+        first_output = first_entry.worker_response_receipt.get("output")
+        first_receipt = (
+            first_output.get("worker_response_receipt")
+            if isinstance(first_output, Mapping)
+            else None
+        )
+        first_request = (
+            first_receipt.get("request_binding")
+            if isinstance(first_receipt, Mapping)
+            else None
+        )
+        if first_request is None:
+            first_request = fallback_request
+        else:
+            request_from_receipt = True
+        try:
+            first_contract = raw_determinant_contract_from_request(first_request)
+            if request_from_receipt:
+                _validate_current_raw_determinant_policy(
+                    first_request, first_contract
+                )
+        except (TypeError, ValueError) as error:
+            raise ValueError(
+                "selective promotion journal raw determinant contract is invalid"
+            ) from error
     empirical_calibration = (
         scientific_runtime.get("promoted_control_calibration")
         if isinstance(scientific_runtime, Mapping)
@@ -11059,11 +11944,20 @@ def run_selective_readout_promotion(
         if isinstance(scientific_runtime, Mapping)
         else None
     )
-    empirical_journal = (
-        isinstance(empirical_calibration, Mapping)
-        and isinstance(empirical_profile, Mapping)
-        and isinstance(empirical_profile_sha256, str)
-    )
+    # Runtime controls are not an evidence-mode selector.  The authenticated
+    # root-readout request selects the empirical certificate contract; a
+    # provisional request may still use an internal control profile without
+    # turning that profile into a certificate claim in the journal.
+    empirical_journal = first_contract.empirical_certificate_required
+    if empirical_journal and (
+        not isinstance(empirical_calibration, Mapping)
+        or not isinstance(empirical_profile, Mapping)
+        or not isinstance(empirical_profile_sha256, str)
+    ):
+        raise ValueError(
+            "empirical selective promotion lacks authenticated control evidence"
+        )
+    evidence_semantics = raw_determinant_evidence_semantics(first_contract)
     journal_evidence: dict[str, object] = {
         "schema": (
             "windows-solver.selective-tier-journal-evidence/2"
@@ -11073,17 +11967,9 @@ def run_selective_readout_promotion(
         "configured": journaled is not None,
         "component_identity": selective.journal_component_identity,
         "precision_tier": actual_tier.value,
+        **evidence_semantics,
     }
     if journaled is not None:
-        promoted_work_unit_ids = tuple(
-            unit.work_unit_id
-            for (_, amplitude), unit in journaled.units.items()
-            if amplitude in amplitudes
-        )
-        promoted_entries = {
-            work_unit_id: journaled.journal.entries[work_unit_id]
-            for work_unit_id in promoted_work_unit_ids
-        }
         journal_mapping = PartialComponentJournal(
             journaled.journal.path,
             promoted_work_unit_ids,
@@ -11127,6 +12013,13 @@ def run_selective_readout_promotion(
                 None
                 if not isinstance(scientific_runtime, Mapping)
                 else _sha256(dict(scientific_runtime))
+            ),
+            "diagnostic_model_identity": first_contract.diagnostic_model_identity,
+            "required_raw_determinant_roles": list(
+                first_contract.required_raw_determinant_roles
+            ),
+            "required_raw_determinant_count": (
+                first_contract.required_raw_determinant_count
             ),
         }
         if empirical_journal:

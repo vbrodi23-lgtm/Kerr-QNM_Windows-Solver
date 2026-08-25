@@ -28,12 +28,14 @@ import tempfile
 from typing import Mapping
 
 from .contracts import canonical_json_bytes
+from .root_evidence import AuthenticatedRootEvidence, RootDependencyKey
 
 
 ROOT_READOUT_CACHE_SCHEMA_VERSION = 2
 ROOT_READOUT_STORE_DIRECTORY_NAME = "root-readouts-" + "v" + str(
     ROOT_READOUT_CACHE_SCHEMA_VERSION
 )
+ROOT_EVIDENCE_STORE_DIRECTORY_NAME = "authenticated-root-evidence-v2"
 _HEX_64 = re.compile(r"[0-9a-f]{64}")
 _ENTRY_FIELDS = frozenset({
     "schema_version",
@@ -349,3 +351,65 @@ class RootReadoutStore:
             return False
         path.unlink()
         return True
+
+
+class RootEvidenceStore:
+    """Durable immutable root receipts, separate from worker readout reuse."""
+
+    def __init__(self, root: str | os.PathLike[str] | Path) -> None:
+        self.root = Path(root)
+
+    @property
+    def stored_count(self) -> int:
+        if not self.root.is_dir():
+            return 0
+        return sum(path.is_file() for path in self.root.glob("*.json"))
+
+    @classmethod
+    def for_checkpoint(cls, checkpoint_path: str | os.PathLike[str] | Path) -> "RootEvidenceStore":
+        checkpoint = Path(checkpoint_path)
+        return cls(checkpoint.parent / f"{checkpoint.name}.root-evidence-v2")
+
+    @classmethod
+    def default(cls) -> "RootEvidenceStore":
+        return cls(RootReadoutStore.default().root.parent / ROOT_EVIDENCE_STORE_DIRECTORY_NAME)
+
+    @staticmethod
+    def _path(root: Path, key_sha256: str) -> Path:
+        if _HEX_64.fullmatch(key_sha256) is None:
+            raise ValueError("root evidence dependency SHA-256 is invalid")
+        return root / f"{key_sha256}.json"
+
+    def lookup(self, key: RootDependencyKey) -> AuthenticatedRootEvidence | None:
+        if not isinstance(key, RootDependencyKey):
+            raise ValueError("root evidence lookup key is invalid")
+        path = self._path(self.root, key.sha256)
+        if not path.exists():
+            return None
+        if not path.is_file() or path.is_symlink():
+            raise ValueError("trusted root evidence entry is invalid")
+        try:
+            evidence = AuthenticatedRootEvidence.from_mapping(_load_json(path))
+        except (OSError, ValueError, UnicodeDecodeError) as error:
+            raise ValueError(
+                f"trusted root evidence entry is corrupt: {path}: {error}"
+            ) from error
+        if evidence.root_dependency_key != key:
+            raise ValueError("trusted root evidence dependency key is incompatible")
+        return evidence
+
+    def publish(self, evidence: AuthenticatedRootEvidence) -> Path:
+        if not isinstance(evidence, AuthenticatedRootEvidence):
+            raise ValueError("root evidence publication is invalid")
+        path = self._path(self.root, evidence.root_dependency_key.sha256)
+        if path.exists():
+            existing = self.lookup(evidence.root_dependency_key)
+            if (
+                existing is None
+                or existing.fixed_root != evidence.fixed_root
+                or existing.branch_identity != evidence.branch_identity
+            ):
+                raise ValueError("SYSTEM_FAILURE ROOT_SEAL_CONFLICT")
+            return path
+        _atomic_json(path, evidence.to_mapping())
+        return path
