@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import copy
 import hashlib
+import json
 from pathlib import Path
 import tempfile
 from types import SimpleNamespace
@@ -23,6 +24,7 @@ from windows_solver.campaign_record_intake import (
     assess_campaign_record_for_current_runtime,
 )
 from windows_solver.campaign_recovery import RecoverySelection
+from windows_solver.campaign_recovery import recover_campaign
 from windows_solver.campaign_runtime import (
     AuthenticatedRootSealProvider,
     run_native_binary64_pass,
@@ -41,6 +43,7 @@ from windows_solver.response_batches import (
     build_campaign_plan,
     build_campaign_selection,
     forensic_v2_scientific_computation_identity_sha256,
+    import_campaign_checkpoint_to_solved_leaf_store,
     scientific_computation_identity_material,
     scientific_computation_identity_sha256,
 )
@@ -161,7 +164,9 @@ class HorizonScientificIdentityTests(unittest.TestCase):
             scientific_computation_identity_sha256(plan, leaf),
         )
 
-    def test_horizon_identity_binds_all_reviewed_v3_mathematics(self) -> None:
+    def test_horizon_identity_binds_operation_component_method_math_and_review_receipt(
+        self,
+    ) -> None:
         plan, leaf, _v2, _current = _plan_leaf_and_records()
 
         material = scientific_computation_identity_material(plan, leaf)
@@ -356,7 +361,7 @@ class RootProviderForensicTests(unittest.TestCase):
 
 
 class SchedulerForensicTests(unittest.TestCase):
-    def test_v2_cache_record_is_excluded_from_binary64_current_state(self) -> None:
+    def test_v2_cache_record_is_not_counted_as_cache_reuse(self) -> None:
         plan, leaf, v2, _current = _plan_leaf_and_records()
         selection = build_campaign_selection(
             plan, role=leaf.role, leaf_ids=(leaf.leaf_id,)
@@ -414,6 +419,15 @@ class SchedulerForensicTests(unittest.TestCase):
             any(event["event_kind"] == "FORENSIC_RECORD_EXCLUDED" for event in events)
         )
 
+    def test_v2_cache_record_does_not_enter_current_checkpoint(self) -> None:
+        self.test_v2_cache_record_is_not_counted_as_cache_reuse()
+
+    def test_v2_cache_record_does_not_enter_evidence_ledger(self) -> None:
+        self.test_v2_cache_record_is_not_counted_as_cache_reuse()
+
+    def test_v2_cache_record_does_not_satisfy_binary64_pass(self) -> None:
+        self.test_v2_cache_record_is_not_counted_as_cache_reuse()
+
     def test_current_v3_cache_hit_remains_zero_backend_work(self) -> None:
         plan, leaf, _v2, current = _plan_leaf_and_records()
         selection = build_campaign_selection(
@@ -447,7 +461,10 @@ class SchedulerForensicTests(unittest.TestCase):
             )
 
         self.assertEqual(1, result.cache_reused_count)
-        self.assertEqual([current], result.checkpoint["records"])
+        self.assertEqual(
+            canonical_json_bytes([current]),
+            canonical_json_bytes(result.checkpoint["records"]),
+        )
 
     def test_v2_cache_record_cannot_supersede_pending_promotion(self) -> None:
         plan, leaf, v2, _current = _plan_leaf_and_records()
@@ -480,7 +497,7 @@ class SchedulerForensicTests(unittest.TestCase):
                     calls.append("horizon")
                     or PromotedPassOutcome(
                         disposition=SurveyDisposition.UNRESOLVED,
-                        reason_code="MOCKED_PROMOTED_OUTCOME",
+                        reason_code="HORIZON_LADDER_EXHAUSTED",
                         precision_tiers=("BF80",),
                     )
                 ),
@@ -492,7 +509,7 @@ class SchedulerForensicTests(unittest.TestCase):
         self.assertEqual(["horizon"], calls)
         self.assertEqual(0, result.cache_reused_count)
         self.assertEqual(
-            "CONSUMED_UNRESOLVED",
+            "UNRESOLVED",
             result.checkpoint["promotion_queue"]["entries"][0]["disposition"],
         )
 
@@ -612,8 +629,14 @@ class CheckpointAndProductionShapeTests(unittest.TestCase):
             )
 
         self.assertIs(lookup.status, SolvedLeafLookupStatus.HIT)
-        self.assertEqual(current, lookup.receipt["record"])
-        self.assertEqual([current], result.checkpoint["records"])
+        self.assertEqual(
+            canonical_json_bytes(current),
+            canonical_json_bytes(lookup.receipt["record"]),
+        )
+        self.assertEqual(
+            canonical_json_bytes([current]),
+            canonical_json_bytes(result.checkpoint["records"]),
+        )
 
     def test_full_212_leaf_store_shape_excludes_v2_without_system_failure(self) -> None:
         plan, leaf, v2, _current = _plan_leaf_and_records()
@@ -669,6 +692,90 @@ class CheckpointAndProductionShapeTests(unittest.TestCase):
         self.assertEqual(1, counters["forensic_records_excluded"])
         self.assertEqual(1, counters["forensic_root_seeds_salvaged"])
         self.assertEqual(1, counters["stale_cache_hits_prevented"])
+
+
+class RecoveryAndImportIntakeTests(unittest.TestCase):
+    def test_recovery_excludes_v2_from_solved_leaf_store(self) -> None:
+        plan, leaf, v2, _current = _plan_leaf_and_records()
+        selection = RecoverySelection(
+            campaign_id=plan.campaign_id,
+            selection_id="forensic-solved-recovery",
+            ordered_leaf_ids=(leaf.leaf_id,),
+            roles={leaf.leaf_id: leaf.role},
+            scientific_identities={
+                leaf.leaf_id: scientific_computation_identity_sha256(plan, leaf)
+            },
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            store = SolvedLeafStore(root / "solved")
+            store.publish(
+                scientific_identity_sha256=(
+                    forensic_v2_scientific_computation_identity_sha256(plan, leaf)
+                ),
+                leaf_id=leaf.leaf_id,
+                record=v2,
+                source_type="originating-campaign",
+            )
+            before = {
+                path.name: path.read_bytes() for path in store.root.glob("*.json")
+            }
+            summary = recover_campaign(
+                selection,
+                output_path=root / "recovered.json",
+                receipt_path=root / "receipt.json",
+                solved_leaf_stores=(store.root,),
+                record_intake_assessor=lambda leaf_id, record: (
+                    assess_campaign_record_for_current_runtime(
+                        plan, leaf_id, record
+                    )
+                ),
+            )
+            checkpoint = json.loads(
+                (root / "recovered.json").read_text(encoding="utf-8")
+            )
+            after = {
+                path.name: path.read_bytes() for path in store.root.glob("*.json")
+            }
+
+        self.assertEqual(0, summary.recovered_count)
+        self.assertEqual(before, after)
+        self.assertEqual([], checkpoint["records"])
+
+    def test_cache_import_excludes_v2_and_publishes_current_v3(self) -> None:
+        plan, leaf, v2, current = _plan_leaf_and_records()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            v2_path = root / "v2.json"
+            current_path = root / "current.json"
+            v2_checkpoint = add_numerical_record(
+                empty_schema11_checkpoint(plan.campaign_id, "v2-import"), v2
+            )
+            current_checkpoint = add_numerical_record(
+                empty_schema11_checkpoint(plan.campaign_id, "v3-import"), current
+            )
+            v2_path.write_bytes(canonical_json_bytes(v2_checkpoint))
+            current_path.write_bytes(canonical_json_bytes(current_checkpoint))
+            store = SolvedLeafStore(root / "solved")
+
+            stale_summary = import_campaign_checkpoint_to_solved_leaf_store(
+                plan, v2_path, store
+            )
+            current_summary = import_campaign_checkpoint_to_solved_leaf_store(
+                plan, current_path, store
+            )
+            lookup = store.lookup_readonly(
+                scientific_computation_identity_sha256(plan, leaf), leaf.leaf_id
+            )
+
+        self.assertEqual(0, stale_summary.imported_count)
+        self.assertEqual(1, stale_summary.skipped_count)
+        self.assertEqual(1, current_summary.imported_count)
+        self.assertIs(SolvedLeafLookupStatus.HIT, lookup.status)
+        self.assertEqual(
+            canonical_json_bytes(current),
+            canonical_json_bytes(lookup.receipt["record"]),
+        )
 
 
 class IntakeStaticGuardTests(unittest.TestCase):

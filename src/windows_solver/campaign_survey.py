@@ -27,6 +27,12 @@ from .campaign_policy import (
     validate_schema11_checkpoint,
 )
 from .campaign_recovery import RecoverySelection
+from .campaign_record_intake import (
+    CampaignRecordIntake,
+    archive_excluded_record_in_checkpoint,
+    assess_campaign_record_for_current_runtime,
+    emit_forensic_record_excluded,
+)
 from .campaign_failures import (
     FailureDisposition,
     FailureReport,
@@ -54,6 +60,7 @@ from .response_engine import _EXTERIOR_PROFILE_IDS, _exterior_support
 from .response_engine import (
     BINARY64_FIXED_ROOT_SAMPLE_ROLES,
     BINARY64_FIXED_ROOT_SURVEY_IDENTITY,
+    BINARY64_HORIZON_OPERATION_V3,
     BackgroundEquivalenceReceipt,
     Binary64FixedRootBatch,
     Binary64ReusedBackgroundBatch,
@@ -88,7 +95,89 @@ from .structural_diagnostics import StructuralDiagnosticSession
 
 
 RecordValidator = Callable[[str, Mapping[str, object]], None]
+RecordIntakeAssessor = Callable[
+    [str, Mapping[str, object]], CampaignRecordIntake
+]
 _ROOT_PROMOTION_ARITHMETIC_TIER = "root-promotion"
+
+
+def _intake_checkpoint_records(
+    plan: object,
+    checkpoint: Mapping[str, object],
+    *,
+    source_path: str | os.PathLike[str] | Path,
+    diagnostic_session: StructuralDiagnosticSession | None,
+) -> dict[str, object]:
+    """Authenticate mixed-version checkpoint records before current use."""
+
+    result = validate_schema11_checkpoint(checkpoint)
+    for record in tuple(result["records"]):
+        leaf_id = record.get("leaf_id")
+        if not isinstance(leaf_id, str):
+            raise ValueError("checkpoint record leaf identity is invalid")
+        intake = assess_campaign_record_for_current_runtime(plan, leaf_id, record)
+        if intake.response_admissible:
+            continue
+        if intake.forensic_only:
+            emit_forensic_record_excluded(
+                diagnostic_session,
+                intake,
+                leaf_id=leaf_id,
+                source_kind="checkpoint-forensic-response",
+                source_path=source_path,
+                stale_cache_hit_prevented=False,
+            )
+        result = archive_excluded_record_in_checkpoint(
+            result,
+            intake,
+            source_path=source_path,
+        )
+    return validate_schema11_checkpoint(result)
+
+
+def _current_terminal_cache_record(
+    plan: object,
+    leaf_id: str,
+    lookup: object,
+    *,
+    record_validator: RecordValidator | None,
+    diagnostic_session: StructuralDiagnosticSession | None,
+) -> Mapping[str, object] | None:
+    """Return current response evidence after the central intake decision."""
+
+    status = getattr(lookup, "status", None)
+    if status not in {
+        SolvedLeafLookupStatus.HIT,
+        SolvedLeafLookupStatus.STALE,
+    }:
+        return None
+    receipt = getattr(lookup, "receipt", None)
+    if not isinstance(receipt, Mapping):
+        raise ValueError("solved-leaf cache result lacks an authenticated receipt")
+    record = receipt.get("record")
+    if not isinstance(record, Mapping):
+        raise ValueError("solved-leaf cache record is invalid")
+    intake = assess_campaign_record_for_current_runtime(plan, leaf_id, record)
+    if not intake.response_admissible:
+        if intake.forensic_only:
+            emit_forensic_record_excluded(
+                diagnostic_session,
+                intake,
+                leaf_id=leaf_id,
+                source_kind="solved-leaf-forensic-response",
+                source_path=(
+                    "solved-leaf-store"
+                    if getattr(lookup, "path", None) is None
+                    else getattr(lookup, "path")
+                ),
+                stale_cache_hit_prevented=True,
+            )
+        return None
+    if status is not SolvedLeafLookupStatus.HIT:
+        return None
+    if record_validator is not None:
+        record_validator(leaf_id, record)
+    return intake.record
 
 
 @dataclass(frozen=True, slots=True)
@@ -601,7 +690,12 @@ def run_binary64_survey(
 ) -> Binary64SurveyRun:
     """Run only the binary64 pass; promotion is recorded and never executed."""
 
-    result = validate_schema11_checkpoint(checkpoint)
+    result = _intake_checkpoint_records(
+        plan,
+        checkpoint,
+        source_path=checkpoint_path,
+        diagnostic_session=diagnostic_session,
+    )
     if (
         result["campaign_id"] != selection.campaign_id
         or result["selection_id"] != selection.selection_id
@@ -796,62 +890,25 @@ def run_binary64_survey(
                         f"{cache_lookup.path}: {cache_lookup.reason}"
                     ))
                 )
-            if cache_lookup.status is SolvedLeafLookupStatus.HIT:
-                if cache_lookup.receipt is None:
-                    guarded(
-                        lambda: (_ for _ in ()).throw(
-                            ValueError("solved-leaf cache hit lacks a receipt")
-                        )
+            if cache_lookup.status in {
+                SolvedLeafLookupStatus.HIT,
+                SolvedLeafLookupStatus.STALE,
+            }:
+                cache_record = guarded(
+                    lambda: _current_terminal_cache_record(
+                        plan,
+                        leaf_id,
+                        cache_lookup,
+                        record_validator=record_validator,
+                        diagnostic_session=diagnostic_session,
                     )
-                assert cache_lookup.receipt is not None
-                cache_record = cache_lookup.receipt.get("record")
-                if not isinstance(cache_record, Mapping):
-                    guarded(
-                        lambda: (_ for _ in ()).throw(
-                            ValueError("solved-leaf cache record is invalid")
-                        )
-                    )
-                assert isinstance(cache_record, Mapping)
-                # Legacy binary64-horizon-production/v2 records are
-                # readable but not admissible as current science under
-                # PR69's horizon rewrite. On a cache hit for such a
-                # forensic record, quarantine the store entry so future
-                # runs stop re-encountering it and fall through as a
-                # cache MISS so fresh computation produces a current-v3
-                # record. Non-legacy hits still authenticate through the
-                # strict recovery validator.
-                from .response_batches import (  # local import: avoid a module-level cycle
-                    horizon_record_scientific_status,
                 )
-
-                forensic_legacy_horizon_hit = (
-                    horizon_record_scientific_status(cache_record)
-                    == "FORENSIC_V2_STALE"
-                )
-                if forensic_legacy_horizon_hit:
-                    if (
-                        cache_lookup.path is not None
-                        and solved_leaf_store is not None
-                    ):
-                        try:
-                            solved_leaf_store.quarantine(
-                                cache_lookup.path,
-                                "legacy binary64-horizon-production/v2 "
-                                "record is forensic-only",
-                            )
-                        except Exception:
-                            # Best-effort quarantine — do not abort the
-                            # campaign if the store cannot move the file
-                            # aside; the campaign proceeds with fresh
-                            # computation for this leaf either way.
-                            pass
-                    cache_record = None
-                else:
-                    if record_validator is not None:
-                        guarded(lambda: record_validator(leaf_id, cache_record))
+                if cache_record is not None:
+                    assert isinstance(cache_record, Mapping)
                     if (
                         retained is not None
-                        and dict(retained) != dict(cache_record)
+                        and canonical_json_bytes(retained)
+                        != canonical_json_bytes(cache_record)
                     ):
                         guarded(
                             lambda: (_ for _ in ()).throw(
@@ -927,7 +984,7 @@ def run_binary64_survey(
             if seal is None:
                 outcome = Binary64PassOutcome(
                     disposition=SurveyDisposition.PROMOTION_PENDING_ROOT,
-                    operation_identity="binary64-horizon-production/v2",
+                    operation_identity=BINARY64_HORIZON_OPERATION_V3,
                     reason_code="ROOT_SEAL_UNAVAILABLE",
                     queue_kind=PromotionQueueKind.ROOT,
                 )
@@ -2043,7 +2100,12 @@ def run_promoted_survey(
 ) -> PromotedSurveyRun:
     """Consume only pending promotion entries through BF40/BF80 survey work."""
 
-    result = validate_schema11_checkpoint(checkpoint)
+    result = _intake_checkpoint_records(
+        plan,
+        checkpoint,
+        source_path=checkpoint_path,
+        diagnostic_session=diagnostic_session,
+    )
     if (
         result["campaign_id"] != selection.campaign_id
         or result["selection_id"] != selection.selection_id
@@ -2291,62 +2353,25 @@ def run_promoted_survey(
                         f"{cache_lookup.path}: {cache_lookup.reason}"
                     ))
                 )
-            if cache_lookup.status is SolvedLeafLookupStatus.HIT:
-                if cache_lookup.receipt is None:
-                    guarded(
-                        lambda: (_ for _ in ()).throw(
-                            ValueError("solved-leaf cache hit lacks a receipt")
-                        )
+            if cache_lookup.status in {
+                SolvedLeafLookupStatus.HIT,
+                SolvedLeafLookupStatus.STALE,
+            }:
+                cache_record = guarded(
+                    lambda: _current_terminal_cache_record(
+                        plan,
+                        leaf_id,
+                        cache_lookup,
+                        record_validator=record_validator,
+                        diagnostic_session=diagnostic_session,
                     )
-                assert cache_lookup.receipt is not None
-                cache_record = cache_lookup.receipt.get("record")
-                if not isinstance(cache_record, Mapping):
-                    guarded(
-                        lambda: (_ for _ in ()).throw(
-                            ValueError("solved-leaf cache record is invalid")
-                        )
-                    )
-                assert isinstance(cache_record, Mapping)
-                # Legacy binary64-horizon-production/v2 records are
-                # readable but not admissible as current science under
-                # PR69's horizon rewrite. On a cache hit for such a
-                # forensic record, quarantine the store entry so future
-                # runs stop re-encountering it and fall through as a
-                # cache MISS so fresh computation produces a current-v3
-                # record. Non-legacy hits still authenticate through the
-                # strict recovery validator.
-                from .response_batches import (  # local import: avoid a module-level cycle
-                    horizon_record_scientific_status,
                 )
-
-                forensic_legacy_horizon_hit = (
-                    horizon_record_scientific_status(cache_record)
-                    == "FORENSIC_V2_STALE"
-                )
-                if forensic_legacy_horizon_hit:
-                    if (
-                        cache_lookup.path is not None
-                        and solved_leaf_store is not None
-                    ):
-                        try:
-                            solved_leaf_store.quarantine(
-                                cache_lookup.path,
-                                "legacy binary64-horizon-production/v2 "
-                                "record is forensic-only",
-                            )
-                        except Exception:
-                            # Best-effort quarantine — do not abort the
-                            # campaign if the store cannot move the file
-                            # aside; the campaign proceeds with fresh
-                            # computation for this leaf either way.
-                            pass
-                    cache_record = None
-                else:
-                    if record_validator is not None:
-                        guarded(lambda: record_validator(leaf_id, cache_record))
+                if cache_record is not None:
+                    assert isinstance(cache_record, Mapping)
                     if (
                         retained is not None
-                        and dict(retained) != dict(cache_record)
+                        and canonical_json_bytes(retained)
+                        != canonical_json_bytes(cache_record)
                     ):
                         guarded(
                             lambda: (_ for _ in ()).throw(
@@ -2756,6 +2781,7 @@ def dispatch_cache_first(
     backend_factory: Callable[[], object],
     execute_misses: Callable[[object], object],
     record_validator: RecordValidator | None = None,
+    record_intake_assessor: RecordIntakeAssessor | None = None,
 ) -> CacheFirstOutcome:
     """Return exact hits before constructing a backend; execute only on a miss."""
 
@@ -2770,15 +2796,39 @@ def dispatch_cache_first(
                 f"trusted solved-leaf cache receipt is corrupt: {lookup.path}: "
                 f"{lookup.reason}"
             )
-        if lookup.status is not SolvedLeafLookupStatus.HIT:
+        if lookup.status not in {
+            SolvedLeafLookupStatus.HIT,
+            SolvedLeafLookupStatus.STALE,
+        }:
             missing.append(leaf_id)
             continue
         if lookup.receipt is None:
-            raise ValueError("solved-leaf cache hit has no authenticated receipt")
+            raise ValueError("solved-leaf cache result has no authenticated receipt")
         record = lookup.receipt["record"]
         if not isinstance(record, Mapping):
-            raise ValueError("solved-leaf cache hit record is invalid")
-        if record_validator is not None:
+            raise ValueError("solved-leaf cache result record is invalid")
+        if (
+            record.get("schema") == "windows-solver.schema11-numerical-record/1"
+            and record_intake_assessor is None
+        ):
+            raise ValueError("schema-11 cache dispatch requires central record intake")
+        intake = (
+            None
+            if record_intake_assessor is None
+            else record_intake_assessor(leaf_id, record)
+        )
+        if intake is not None:
+            if not intake.response_admissible:
+                missing.append(leaf_id)
+                continue
+            admitted = intake.record
+            if not isinstance(admitted, Mapping):
+                raise ValueError("central record intake result is invalid")
+            record = admitted
+        if lookup.status is not SolvedLeafLookupStatus.HIT:
+            missing.append(leaf_id)
+            continue
+        if record_intake_assessor is None and record_validator is not None:
             record_validator(leaf_id, record)
         records[leaf_id] = dict(record)
 

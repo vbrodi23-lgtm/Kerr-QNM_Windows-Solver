@@ -1475,6 +1475,7 @@ $candidate | ConvertTo-Json -Compress | Set-Content -LiteralPath $env:M02_TEST_J
             "HORIZON_RESPONSE_V2_SCIENTIFICALLY_STALE",
             "FORENSIC_V2_STALE",
             "MIXED_V2_V3_INVALID",
+            "HORIZON_RESPONSE_MIXED_V2_V3_INVALID",
             # Internal helper names for legacy-forensic paths. They only
             # appear inside the package's Python source and never reach
             # a persisted receipt or a public identifier, so approving
@@ -1482,6 +1483,9 @@ $candidate | ConvertTo-Json -Compress | Set-Content -LiteralPath $env:M02_TEST_J
             # renaming symbols that document the forensic boundary.
             "_stale_horizon_v2_receipt",
             "legacy_v2_horizon_response_disk",
+            "forensic_v2_scientific_computation_identity_sha256",
+            "_forensic_v2_root_seed",
+            "_V2_HORIZON_OPERATION",
         })
         lineage_character = r"A-Za-z0-9_/:;=+\-"
         approved_identity = re.compile(

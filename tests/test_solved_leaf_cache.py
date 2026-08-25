@@ -105,7 +105,7 @@ _POLISHED_BASELINES = {
     ),
 }
 _POLISHED_IDENTITIES = {
-    "b-prime-leaf-4c8594e4a59486a1c56206e41cd7f7f3ff1ab5193a5ff6b699cbe9492bc45355": "ec654b7047015d7d38963416bd7625742f84f6c85fbb5a2479adc5ad65597fc7",
+    "b-prime-leaf-4c8594e4a59486a1c56206e41cd7f7f3ff1ab5193a5ff6b699cbe9492bc45355": "88bf3831a4959aff78b3be984e52412011ffc51c07d754bc4c03e5906b354443",
     "b-prime-leaf-0f36daefa853de1280f17c8b8ef89bbaf9b34f5e5044a5eb85bc563d3896b60d": "0c5a5c15ccf2ef29e7937c4a75266043043c3238075eb4b169652b09af73d9c2",
     "b-prime-leaf-08b8dc3df83fc1304a61d8b6105c412a316a44816ca229d375573fdf72ac0a57": "779da2d453b4492e8f9a847d768362c2d902e4fa8c3846e3dab9a6aa8a6da023",
 }
@@ -910,7 +910,7 @@ class SolvedLeafCacheTests(unittest.TestCase):
         )
         self.assertEqual(
             scientific_computation_identity_sha256(plan, leaf),
-            "d87307db60bbd8a5f4bfcbadf60eb2272aceddffa2e3bcffa7bbfd6fc88403dd",
+            "3c0a59d7cb82e720a805d2a088976bebbd5b27debbc50a7e1380e55d6ab1a1bd",
         )
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

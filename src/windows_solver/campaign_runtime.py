@@ -28,6 +28,10 @@ from .campaign_policy import (
     validate_schema11_checkpoint,
 )
 from .campaign_recovery import RecoverySelection
+from .campaign_record_intake import (
+    assess_campaign_record_for_current_runtime,
+    emit_forensic_record_excluded,
+)
 from .campaign_reports import (
     refresh_schema11_reports,
     write_schema11_projective,
@@ -279,6 +283,61 @@ def _promotion_bound_source_record_sha256(
             )
         )
     }
+
+
+def _publish_admissible_checkpoint_records(
+    plan: object,
+    recovery_selection: RecoverySelection,
+    checkpoint: Mapping[str, object],
+    store: SolvedLeafStore,
+    *,
+    source_path: Path,
+    diagnostic_session: StructuralDiagnosticSession | None,
+) -> None:
+    """Publish only centrally classified current terminal response records."""
+
+    authenticated = validate_schema11_checkpoint(checkpoint)
+    promotion_bound = _promotion_bound_source_record_sha256(authenticated, plan)
+    checkpoint_records = {
+        str(item["leaf_id"]): item
+        for item in authenticated["records"]
+        if isinstance(item, Mapping)
+    }
+    for leaf_id in recovery_selection.ordered_leaf_ids:
+        record = checkpoint_records.get(leaf_id)
+        if record is None:
+            continue
+        intake = assess_campaign_record_for_current_runtime(plan, leaf_id, record)
+        if not intake.response_admissible:
+            if intake.forensic_only:
+                emit_forensic_record_excluded(
+                    diagnostic_session,
+                    intake,
+                    leaf_id=leaf_id,
+                    source_kind="checkpoint-to-solved-store",
+                    source_path=source_path,
+                    stale_cache_hit_prevented=False,
+                )
+            continue
+        if (
+            record.get("state") != "PRODUCED"
+            or record.get("record_sha256") in promotion_bound
+        ):
+            continue
+        lookup = store.publish_if_missing(
+            scientific_identity_sha256=(
+                recovery_selection.scientific_identities[leaf_id]
+            ),
+            leaf_id=leaf_id,
+            record=intake.record,
+            source_type="imported-authenticated-checkpoint",
+        )
+        if lookup.status is not SolvedLeafLookupStatus.HIT or lookup.receipt is None:
+            raise ValueError("checkpoint terminal publication was not exact")
+        # An existing, separately authenticated record for the same current
+        # identity is left in place. The scheduler owns exact source-conflict
+        # classification and turns disagreement into its durable system
+        # failure rather than letting checkpoint reconciliation overwrite it.
 
 
 def _is_sha256(value: object) -> bool:
@@ -925,6 +984,7 @@ class _RootSealCandidate:
     seal: AuthenticatedRootSeal
     source_kind: str
     promoted_root_seal: PromotedRootSeal | None = None
+    root_evidence: AuthenticatedRootEvidence | None = None
 
 
 def _root_solving_identity_compatible(source: object, target: object) -> bool:
@@ -951,6 +1011,7 @@ class AuthenticatedRootSealProvider:
         checkpoint: Mapping[str, object],
         solved_leaf_store: SolvedLeafStore,
         root_evidence_store: RootEvidenceStore,
+        diagnostic_session: StructuralDiagnosticSession | None = None,
     ) -> None:
         self._leaf_by_id = {leaf.leaf_id: leaf for leaf in plan.leaves}
         self._checkpoint: list[_RootSealCandidate] = []
@@ -965,10 +1026,42 @@ class AuthenticatedRootSealProvider:
         for record in authenticated_checkpoint["records"]:
             if not isinstance(record, Mapping):
                 continue
-            source = self._leaf_by_id.get(record.get("leaf_id"))
-            if source is None:
+            leaf_id = record.get("leaf_id")
+            if not isinstance(leaf_id, str):
+                raise ValueError("checkpoint record leaf identity is invalid")
+            intake = assess_campaign_record_for_current_runtime(
+                plan, leaf_id, record
+            )
+            source = self._leaf_by_id[leaf_id]
+            if not intake.response_admissible:
+                if intake.forensic_only:
+                    emit_forensic_record_excluded(
+                        diagnostic_session,
+                        intake,
+                        leaf_id=source.leaf_id,
+                        source_kind="checkpoint-forensic-root-seed",
+                        source_path=(
+                            "in-memory-checkpoint"
+                            if diagnostic_session is None
+                            else diagnostic_session.checkpoint_path
+                        ),
+                        stale_cache_hit_prevented=False,
+                    )
+                    if intake.root_seed is not None:
+                        seed = intake.root_seed
+                        self._checkpoint.append(
+                            _RootSealCandidate(
+                                source,
+                                AuthenticatedRootSeal(
+                                    fixed_root=seed.fixed_root,
+                                    branch_identity=seed.branch_identity,
+                                    root_seal_sha256=seed.root_seal_sha256,
+                                ),
+                                "checkpoint-forensic-root-seed",
+                                root_evidence=seed,
+                            )
+                        )
                 continue
-            validate_campaign_recovery_record(plan, source.leaf_id, record)
             seal = _old_record_root_seal(record) or _new_record_root_seal(record)
             if seal is not None:
                 self._checkpoint.append(
@@ -986,14 +1079,48 @@ class AuthenticatedRootSealProvider:
                     f"trusted solved-leaf cache receipt is corrupt: {lookup.path}: "
                     f"{lookup.reason}"
                 )
-            if lookup.status is not SolvedLeafLookupStatus.HIT:
+            if lookup.status not in {
+                SolvedLeafLookupStatus.HIT,
+                SolvedLeafLookupStatus.STALE,
+            }:
                 continue
             if lookup.receipt is None or not isinstance(
                 lookup.receipt.get("record"), Mapping
             ):
-                raise ValueError("solved-leaf cache hit lacks a valid record")
+                raise ValueError("solved-leaf cache result lacks a valid record")
             record = lookup.receipt["record"]
-            validate_campaign_recovery_record(plan, leaf_id, record)
+            intake = assess_campaign_record_for_current_runtime(plan, leaf_id, record)
+            if not intake.response_admissible:
+                if intake.forensic_only:
+                    emit_forensic_record_excluded(
+                        diagnostic_session,
+                        intake,
+                        leaf_id=leaf_id,
+                        source_kind="solved-leaf-forensic-root-seed",
+                        source_path=(
+                            "solved-leaf-store"
+                            if lookup.path is None
+                            else lookup.path
+                        ),
+                        stale_cache_hit_prevented=False,
+                    )
+                    if intake.root_seed is not None:
+                        seed = intake.root_seed
+                        self._solved.append(
+                            _RootSealCandidate(
+                                source,
+                                AuthenticatedRootSeal(
+                                    fixed_root=seed.fixed_root,
+                                    branch_identity=seed.branch_identity,
+                                    root_seal_sha256=seed.root_seal_sha256,
+                                ),
+                                "solved-leaf-forensic-root-seed",
+                                root_evidence=seed,
+                            )
+                        )
+                continue
+            if lookup.status is not SolvedLeafLookupStatus.HIT:
+                continue
             seal = _old_record_root_seal(record) or _new_record_root_seal(record)
             if seal is not None:
                 self._solved.append(
@@ -1074,13 +1201,18 @@ class AuthenticatedRootSealProvider:
             return durable
         for group in compatible_groups:
             if group:
-                source = group[0].seal
-                evidence = AuthenticatedRootEvidence.from_seal(
-                    leaf,
-                    fixed_root=source.fixed_root,
-                    branch_identity=source.branch_identity,
-                    source_receipt_sha256=source.root_seal_sha256,
-                )
+                candidate = group[0]
+                source = candidate.seal
+                evidence = candidate.root_evidence
+                if evidence is None:
+                    evidence = AuthenticatedRootEvidence.from_seal(
+                        leaf,
+                        fixed_root=source.fixed_root,
+                        branch_identity=source.branch_identity,
+                        source_receipt_sha256=source.root_seal_sha256,
+                    )
+                else:
+                    evidence.validate_for(leaf)
                 self._root_evidence_store.publish(evidence)
                 self.hit_count += 1
                 return AuthenticatedRootSeal(
@@ -1301,7 +1433,12 @@ def run_native_binary64_pass(
     def root_provider() -> AuthenticatedRootSealProvider:
         if "value" not in root_provider_holder:
             root_provider_holder["value"] = AuthenticatedRootSealProvider(
-                plan, selection, checkpoint, store, root_evidence_store
+                plan,
+                selection,
+                checkpoint,
+                store,
+                root_evidence_store,
+                diagnostic_session,
             )
         return root_provider_holder["value"]
 
@@ -1342,7 +1479,8 @@ def run_native_binary64_pass(
         if (
             lookup.status is not SolvedLeafLookupStatus.HIT
             or lookup.receipt is None
-            or lookup.receipt.get("record") != record
+            or canonical_json_bytes(lookup.receipt.get("record"))
+            != canonical_json_bytes(record)
         ):
             raise ValueError("terminal numerical record was not published exactly")
         with progress_scope(
@@ -1402,39 +1540,16 @@ def run_native_binary64_pass(
                 durable=True,
             )
 
-    # Reconcile authenticated terminal checkpoint records before the survey's
-    # cache discovery.  A cache hit is therefore durable before any numerical
-    # leaf is eligible to be skipped.
-    promotion_bound_record_sha256 = (
-        _promotion_bound_source_record_sha256(checkpoint, plan)
+    # Reconcile authenticated terminal checkpoint records before cache
+    # discovery. Mixed-version classification precedes current publication.
+    _publish_admissible_checkpoint_records(
+        plan,
+        recovery_selection,
+        checkpoint,
+        store,
+        source_path=checkpoint_path,
+        diagnostic_session=diagnostic_session,
     )
-    checkpoint_records = {
-        str(item["leaf_id"]): item
-        for item in checkpoint.get("records", ())
-        if isinstance(item, Mapping)
-    }
-    for leaf_id in recovery_selection.ordered_leaf_ids:
-        record = checkpoint_records.get(leaf_id)
-        if (
-            record is None
-            or record.get("state") != "PRODUCED"
-            or record.get("record_sha256") in promotion_bound_record_sha256
-        ):
-            continue
-        leaf = next(item for item in plan.leaves if item.leaf_id == leaf_id)
-        validate_campaign_recovery_record(plan, leaf_id, record)
-        lookup = store.publish_if_missing(
-            scientific_identity_sha256=recovery_selection.scientific_identities[leaf_id],
-            leaf_id=leaf_id,
-            record=record,
-            source_type="imported-authenticated-checkpoint",
-        )
-        if (
-            lookup.status is not SolvedLeafLookupStatus.HIT
-            or lookup.receipt is None
-            or lookup.receipt.get("record") != record
-        ):
-            raise ValueError("checkpoint terminal publication was not exact")
 
     return run_binary64_survey(
         plan,
@@ -1854,7 +1969,12 @@ def run_native_promoted_pass(
     def root_provider() -> AuthenticatedRootSealProvider:
         if "value" not in root_provider_holder:
             root_provider_holder["value"] = AuthenticatedRootSealProvider(
-                plan, selection, checkpoint, store, root_evidence_store
+                plan,
+                selection,
+                checkpoint,
+                store,
+                root_evidence_store,
+                diagnostic_session,
             )
         return root_provider_holder["value"]
 
@@ -1902,7 +2022,8 @@ def run_native_promoted_pass(
         if (
             lookup.status is not SolvedLeafLookupStatus.HIT
             or lookup.receipt is None
-            or lookup.receipt.get("record") != record
+            or canonical_json_bytes(lookup.receipt.get("record"))
+            != canonical_json_bytes(record)
         ):
             raise ValueError("promoted terminal record was not published exactly")
         with progress_scope(
@@ -1919,6 +2040,15 @@ def run_native_promoted_pass(
             seal = _old_record_root_seal(record) or _new_record_root_seal(record)
             if seal is not None:
                 root_provider().publish(leaf, seal)
+
+    _publish_admissible_checkpoint_records(
+        plan,
+        recovery_selection,
+        checkpoint,
+        store,
+        source_path=checkpoint_path,
+        diagnostic_session=diagnostic_session,
+    )
 
     return run_promoted_survey(
         plan,

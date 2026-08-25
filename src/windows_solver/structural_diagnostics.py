@@ -442,6 +442,48 @@ class StructuralDiagnosticSession:
         events = read_structural_events(self.paths.structural_events)
         return events[-limit:] if limit else ()
 
+    def forensic_record_counters(self) -> dict[str, int]:
+        """Summarize distinct forensic records across all intake consumers."""
+
+        self.flush()
+        records: dict[tuple[object, object], dict[str, bool]] = {}
+        for event in read_structural_events(self.paths.structural_events):
+            if event.get("event_kind") != "FORENSIC_RECORD_EXCLUDED":
+                continue
+            leaf = event.get("leaf")
+            connections = event.get("connections")
+            diagnostics = event.get("compact_diagnostics")
+            if not isinstance(leaf, Mapping) or not isinstance(
+                connections, Mapping
+            ) or not isinstance(diagnostics, Mapping):
+                raise ValueError("forensic exclusion event is malformed")
+            key = (
+                leaf.get("leaf_id"),
+                connections.get("source_record_sha256"),
+            )
+            summary = records.setdefault(
+                key,
+                {"root_seed_salvaged": False, "stale_cache_hit_prevented": False},
+            )
+            summary["root_seed_salvaged"] = (
+                summary["root_seed_salvaged"]
+                or diagnostics.get("root_seed_salvaged") is True
+            )
+            summary["stale_cache_hit_prevented"] = (
+                summary["stale_cache_hit_prevented"]
+                or diagnostics.get("stale_cache_hit_prevented") is True
+            )
+        return {
+            "forensic_records_discovered": len(records),
+            "forensic_records_excluded": len(records),
+            "forensic_root_seeds_salvaged": sum(
+                item["root_seed_salvaged"] for item in records.values()
+            ),
+            "stale_cache_hits_prevented": sum(
+                item["stale_cache_hit_prevented"] for item in records.values()
+            ),
+        }
+
     def set_artifact_paths(
         self,
         *,

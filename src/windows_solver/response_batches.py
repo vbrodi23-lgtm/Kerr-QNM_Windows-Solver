@@ -2625,6 +2625,62 @@ def _scientific_computation_identity_material(
     return material
 
 
+def _canonical_scientific_execution_contract(
+    scientific_execution_contract: Mapping[str, object] | None,
+) -> dict[str, object] | None:
+    if scientific_execution_contract is None:
+        return None
+    try:
+        canonical_contract = json.loads(
+            canonical_json_bytes(dict(scientific_execution_contract))
+        )
+    except (TypeError, ValueError) as error:
+        raise ValueError(
+            "solved-leaf scientific execution contract is invalid"
+        ) from error
+    if not isinstance(canonical_contract, dict):
+        raise ValueError("solved-leaf scientific execution contract is invalid")
+    return canonical_contract
+
+
+def _binary64_horizon_mathematics_identity() -> dict[str, object]:
+    return {
+        "binary64_operation": BINARY64_HORIZON_OPERATION_V3,
+        "component_identity": BINARY64_HORIZON_COMPONENT,
+        "response_method": BINARY64_HORIZON_RESPONSE_METHOD,
+        "mathematical_decision": M02_HORIZON_EXTERIOR_RESPONSE_MATH_IDENTITY,
+        "determinant_convention": (
+            FINITE_RADIUS_ENDPOINT_WEDGE_DETERMINANT_CONVENTION
+        ),
+        "human_review_receipt": PR69_COMMIT9_HUMAN_MATH_REVIEW_SHA256,
+    }
+
+
+def scientific_computation_identity_material(
+    plan: CampaignPlan,
+    leaf: CampaignLeafPlan,
+    *,
+    scientific_execution_contract: Mapping[str, object] | None = None,
+) -> dict[str, object]:
+    """Return the canonical current computation identity material."""
+
+    if leaf.leaf_id not in {item.leaf_id for item in plan.leaves}:
+        raise ValueError("solved-leaf scientific identity is outside the campaign plan")
+    material = _scientific_computation_identity_material(
+        plan, leaf, _leaf_precision_contract(leaf)
+    )
+    if leaf.mechanism_id == "horizon-admittance":
+        material["binary64_horizon_mathematics"] = (
+            _binary64_horizon_mathematics_identity()
+        )
+    canonical_contract = _canonical_scientific_execution_contract(
+        scientific_execution_contract
+    )
+    if canonical_contract is not None:
+        material["scientific_execution_contract"] = canonical_contract
+    return json.loads(canonical_json_bytes(material))
+
+
 def scientific_computation_identity_sha256(
     plan: CampaignPlan,
     leaf: CampaignLeafPlan,
@@ -2633,24 +2689,33 @@ def scientific_computation_identity_sha256(
 ) -> str:
     """Bind one requested calculation without binding campaign presentation code."""
 
+    material = scientific_computation_identity_material(
+        plan,
+        leaf,
+        scientific_execution_contract=scientific_execution_contract,
+    )
+    return _sha256(material)
+
+
+def forensic_v2_scientific_computation_identity_sha256(
+    plan: CampaignPlan,
+    leaf: CampaignLeafPlan,
+    *,
+    scientific_execution_contract: Mapping[str, object] | None = None,
+) -> str:
+    """Reconstruct the frozen pre-v3 identity solely to authenticate history."""
+
     if leaf.leaf_id not in {item.leaf_id for item in plan.leaves}:
-        raise ValueError("solved-leaf scientific identity is outside the campaign plan")
+        raise ValueError("forensic scientific identity is outside the campaign plan")
+    if leaf.mechanism_id != "horizon-admittance":
+        raise ValueError("forensic predecessor identity is horizon-only")
     material = _scientific_computation_identity_material(
         plan, leaf, _leaf_precision_contract(leaf)
     )
-    if scientific_execution_contract is not None:
-        try:
-            canonical_contract = json.loads(
-                canonical_json_bytes(dict(scientific_execution_contract))
-            )
-        except (TypeError, ValueError) as error:
-            raise ValueError(
-                "solved-leaf scientific execution contract is invalid"
-            ) from error
-        if not isinstance(canonical_contract, dict):
-            raise ValueError(
-                "solved-leaf scientific execution contract is invalid"
-            )
+    canonical_contract = _canonical_scientific_execution_contract(
+        scientific_execution_contract
+    )
+    if canonical_contract is not None:
         material["scientific_execution_contract"] = canonical_contract
     return _sha256(material)
 
@@ -8305,8 +8370,6 @@ def validate_campaign_recovery_record(
         raise ValueError("recovery record is outside the campaign plan")
     if value.get("schema") == "windows-solver.schema11-numerical-record/1":
         if leaf.mechanism_id == "horizon-admittance":
-            if horizon_record_scientific_status(value) == "FORENSIC_V2_STALE":
-                raise ValueError("binary64-horizon-production/v2 is forensic-only")
             validate_schema11_horizon_record(plan, leaf, value)
         else:
             _validate_schema11_survey_record(plan, leaf, value)
@@ -8315,27 +8378,6 @@ def validate_campaign_recovery_record(
     if record.to_mapping() != value:
         raise ValueError("recovery record is not canonical")
     _validate_cacheable_leaf_record(plan, leaf, record)
-
-
-def horizon_record_scientific_status(value: Mapping[str, object]) -> str:
-    """Classify legacy horizon records as forensic data before recovery consumes it."""
-
-    stages = value.get("stages")
-    if not isinstance(stages, list):
-        return "UNKNOWN"
-    operations = {
-        stage.get("operation_identity")
-        for stage in stages
-        if isinstance(stage, Mapping)
-    }
-    if BINARY64_HORIZON_OPERATION_V3 in operations:
-        if "binary64-horizon-production/v2" in operations:
-            return "MIXED_V2_V3_INVALID"
-        return "CURRENT_V3"
-    if "binary64-horizon-production/v2" in operations:
-        return "FORENSIC_V2_STALE"
-    return "UNKNOWN"
-
 
 def _horizon_complex_from_mapping(value: object, subject: str) -> complex:
     if not isinstance(value, Mapping) or set(value) != {"real", "imaginary"}:
@@ -8711,12 +8753,15 @@ def validate_schema11_horizon_stage(
     _validate_schema11_horizon_stage(plan, leaf, value)
 
 
-def validate_schema11_horizon_record(
+def validate_schema11_horizon_record_for_scientific_identity(
     plan: CampaignPlan,
     leaf: CampaignLeafPlan,
     value: Mapping[str, object],
+    *,
+    expected_scientific_identity: str,
+    allow_mixed_binary64_operations: bool = False,
 ) -> None:
-    """Authenticate a new schema-11 horizon record without legacy fields."""
+    """Authenticate a horizon envelope against an explicitly supplied identity."""
 
     expected_fields = {
         "schema",
@@ -8740,7 +8785,7 @@ def validate_schema11_horizon_record(
         or value["leaf_id"] != leaf.leaf_id
         or value["role"] != leaf.role
         or value["scientific_computation_identity"]
-        != scientific_computation_identity_sha256(plan, leaf)
+        != expected_scientific_identity
         or value["state"] not in {"PRODUCED", "UNRESOLVED", "REJECTED"}
     ):
         raise ValueError("schema-11 horizon record identity is invalid")
@@ -8764,7 +8809,28 @@ def validate_schema11_horizon_record(
     if len(stage_values) != len(stages):
         raise ValueError("schema-11 horizon stage is invalid")
     tiers = tuple(str(stage["precision_tier"]) for stage in stages)
-    if tiers not in {("binary64",), ("BF80",), ("binary64", "BF80")}:
+    operations = {
+        stage.get("operation_identity")
+        for stage in stages
+        if isinstance(stage, Mapping)
+    }
+    mixed_binary64_operations = (
+        BINARY64_HORIZON_OPERATION_V3 in operations
+        and any(
+            operation != BINARY64_HORIZON_OPERATION_V3
+            and isinstance(operation, str)
+            and operation.startswith("binary64-horizon-production/")
+            for operation in operations
+        )
+    )
+    if (
+        tiers not in {("binary64",), ("BF80",), ("binary64", "BF80")}
+        and not (
+            allow_mixed_binary64_operations
+            and mixed_binary64_operations
+            and tiers == ("binary64", "binary64")
+        )
+    ):
         raise ValueError("schema-11 horizon precision order is invalid")
     terminal_result, terminal_disk = stage_values[-1]
     terminal_stage = stages[-1]
@@ -8773,7 +8839,7 @@ def validate_schema11_horizon_record(
         and stage.get("operation_identity") == BINARY64_HORIZON_OPERATION_V3
         for stage in stages
     )
-    if contains_v3_stage and any(
+    if not allow_mixed_binary64_operations and contains_v3_stage and any(
         not isinstance(stage, Mapping)
         or stage.get("operation_identity") != BINARY64_HORIZON_OPERATION_V3
         for stage in stages
@@ -8807,6 +8873,23 @@ def validate_schema11_horizon_record(
         terminal_disk["centre"], "schema-11 horizon terminal centre"
     ):
         raise ValueError("schema-11 horizon retained centre is not terminal-bound")
+
+
+def validate_schema11_horizon_record(
+    plan: CampaignPlan,
+    leaf: CampaignLeafPlan,
+    value: Mapping[str, object],
+) -> None:
+    """Authenticate a current schema-11 horizon record strictly."""
+
+    validate_schema11_horizon_record_for_scientific_identity(
+        plan,
+        leaf,
+        value,
+        expected_scientific_identity=scientific_computation_identity_sha256(
+            plan, leaf
+        ),
+    )
 
 
 def _validate_schema11_survey_record(
@@ -11551,6 +11634,45 @@ def import_campaign_checkpoint_to_solved_leaf_store(
         and "records" not in diagnostic
     ):
         return SolvedLeafImportSummary(0, 0, (), str(store.root))
+    if isinstance(diagnostic, Mapping) and diagnostic.get("schema_version") == 11:
+        from .campaign_policy import validate_schema11_checkpoint
+        from .campaign_record_intake import (
+            assess_campaign_record_for_current_runtime,
+        )
+
+        checkpoint = validate_schema11_checkpoint(diagnostic)
+        leaf_by_id = {leaf.leaf_id: leaf for leaf in plan.leaves}
+        imported: list[str] = []
+        skipped = 0
+        for raw_record in checkpoint["records"]:
+            leaf_id = raw_record.get("leaf_id")
+            if not isinstance(leaf_id, str) or leaf_id not in leaf_by_id:
+                raise ValueError("schema-11 cache import record is outside the plan")
+            intake = assess_campaign_record_for_current_runtime(
+                plan, leaf_id, raw_record
+            )
+            if (
+                not intake.response_admissible
+                or raw_record.get("state") not in {"PRODUCED", "UNRESOLVED"}
+            ):
+                skipped += 1
+                continue
+            leaf = leaf_by_id[leaf_id]
+            store.publish(
+                scientific_identity_sha256=(
+                    scientific_computation_identity_sha256(plan, leaf)
+                ),
+                leaf_id=leaf_id,
+                record=intake.record,
+                source_type="imported-authenticated-checkpoint",
+            )
+            imported.append(leaf_id)
+        return SolvedLeafImportSummary(
+            imported_count=len(imported),
+            skipped_count=skipped,
+            leaf_ids=tuple(imported),
+            store_root=str(store.root),
+        )
     _, records, _, checkpoint_schema_version = (
         _load_checkpoint_for_solved_leaf_import(
         plan, path

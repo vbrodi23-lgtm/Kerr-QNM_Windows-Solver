@@ -23,6 +23,9 @@ from windows_solver.campaign_recovery import (
     recover_campaign,
     validate_recovery_checkpoint,
 )
+from windows_solver.campaign_record_intake import (
+    assess_campaign_record_for_current_runtime,
+)
 from windows_solver.campaign_runtime import (
     build_schema11_horizon_record,
     build_schema11_horizon_stage,
@@ -33,6 +36,7 @@ from windows_solver.response_batches import (
     NativeCampaignStageBackend,
     PrecisionCapabilities,
     build_campaign_plan,
+    forensic_v2_scientific_computation_identity_sha256,
     scientific_computation_identity_sha256,
     validate_campaign_recovery_record,
 )
@@ -134,6 +138,9 @@ class Commit10RecoveryTests(unittest.TestCase):
         )
         stale_result["response_method"] = "binary64-fixed-root-horizon-response/v1"
         _rehashed_stage(stale_stage)
+        stale["scientific_computation_identity"] = (
+            forensic_v2_scientific_computation_identity_sha256(plan, leaf)
+        )
         _rehashed_record(stale)
         return stale
 
@@ -176,6 +183,9 @@ class Commit10RecoveryTests(unittest.TestCase):
                 source_checkpoints=(source_path,),
                 record_validator=lambda leaf_id, record: validate_campaign_recovery_record(
                     plan, leaf_id, record
+                ),
+                record_intake_assessor=lambda leaf_id, record: (
+                    assess_campaign_record_for_current_runtime(plan, leaf_id, record)
                 ),
             )
 
@@ -250,6 +260,11 @@ class Commit10RecoveryTests(unittest.TestCase):
                     source_checkpoints=(source_path,),
                     record_validator=lambda leaf_id, record: validate_campaign_recovery_record(
                         plan, leaf_id, record
+                    ),
+                    record_intake_assessor=lambda leaf_id, record: (
+                        assess_campaign_record_for_current_runtime(
+                            plan, leaf_id, record
+                        )
                     ),
                 )
             self.assertFalse(output_path.exists())

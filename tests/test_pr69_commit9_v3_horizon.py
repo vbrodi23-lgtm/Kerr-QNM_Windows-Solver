@@ -12,6 +12,9 @@ from windows_solver.campaign_runtime import (
     build_schema11_horizon_record,
     build_schema11_horizon_stage,
 )
+from windows_solver.campaign_record_intake import (
+    assess_campaign_record_for_current_runtime,
+)
 from windows_solver.contracts import canonical_json_bytes
 from windows_solver.response_engine import DeterminantPartials, NumericalPolicy
 from windows_solver.native_response_kernel import VettedNativeDeterminantKernel
@@ -19,7 +22,7 @@ from windows_solver.response_batches import (
     NativeCampaignStageBackend,
     PrecisionCapabilities,
     build_campaign_plan,
-    validate_campaign_recovery_record,
+    forensic_v2_scientific_computation_identity_sha256,
     validate_schema11_horizon_record,
 )
 from windows_solver.response_uncertainty import (
@@ -240,11 +243,17 @@ class Commit9V3HorizonTests(unittest.TestCase):
         stale_stage["stage_sha256"] = hashlib.sha256(canonical_json_bytes({
             key: value for key, value in stale_stage.items() if key != "stage_sha256"
         })).hexdigest()
+        stale["scientific_computation_identity"] = (
+            forensic_v2_scientific_computation_identity_sha256(plan, leaf)
+        )
         stale["record_sha256"] = hashlib.sha256(canonical_json_bytes({
             key: value for key, value in stale.items() if key != "record_sha256"
         })).hexdigest()
-        with self.assertRaisesRegex(ValueError, "forensic-only"):
-            validate_campaign_recovery_record(plan, leaf.leaf_id, stale)
+        intake = assess_campaign_record_for_current_runtime(
+            plan, leaf.leaf_id, stale
+        )
+        self.assertTrue(intake.forensic_only)
+        self.assertFalse(intake.response_admissible)
 
     def test_exterior_error_channels_are_additive_and_block_without_calibration(self) -> None:
         channels = ExteriorDeterminantErrorChannels(

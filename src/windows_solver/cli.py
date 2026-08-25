@@ -23,6 +23,7 @@ from .campaign_recovery import (
     validate_recovery_checkpoint,
     validate_recovery_receipt,
 )
+from .campaign_record_intake import assess_campaign_record_for_current_runtime
 from .campaign_policy import (
     CAMPAIGN_CHECKPOINT_SCHEMA_VERSION as SCHEMA11_VERSION,
     EvidenceLevel,
@@ -971,6 +972,9 @@ def _campaign_recover(
         record_validator=lambda leaf_id, record: validate_campaign_recovery_record(
             plan, leaf_id, record
         ),
+        record_intake_assessor=lambda leaf_id, record: (
+            assess_campaign_record_for_current_runtime(plan, leaf_id, record)
+        ),
         checkpoint_finalizer=lambda checkpoint, path: refresh_schema11_reports(
             plan,
             selection,
@@ -1826,7 +1830,11 @@ def _finalize_schema11_diagnostic_failure(
             "valid": None,
         }).capture_counts({
             "selected_leaf_count": selected_leaf_count,
-        }).capture_queue_summary({}).capture_repetition_monitor({}).capture_provider_summaries({})
+            **session.forensic_record_counters(),
+        }).capture_queue_summary({}).capture_repetition_monitor({}).capture_provider_summaries({
+            "root_provider": session.forensic_record_counters(),
+            "solved_leaf_store": session.forensic_record_counters(),
+        })
         builder.write_atomic(terminal_classification)
         required_artifacts = {
             "checkpoint": checkpoint,
