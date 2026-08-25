@@ -145,7 +145,8 @@ class PromotedRequestPreflightTests(unittest.TestCase):
         ):
             self.assertNotIn(forbidden, body)
         self.assertIn('ARGS[1] == "--validate-request-batch"', source)
-        self.assertIn("typeof(safety_factor) === Int", source)
+        self.assertIn("safety isa Integer && !(safety isa Bool)", source)
+        self.assertIn("required_raw_determinant_evaluation_count", source)
 
     def test_julia_contract_reads_the_python_generated_fixture(self):
         source = JULIA_SPEC.read_text(encoding="utf-8")
@@ -180,13 +181,22 @@ class PromotedRequestPreflightTests(unittest.TestCase):
             ],
         )
         for document in documents:
-            value = document["policy"]["determinant_error_safety_factor"]
             if document["mechanism_id"] == "horizon-admittance":
+                value = document["policy"]["determinant_error_safety_factor"]
                 self.assertIs(type(value), str)
                 self.assertEqual(value, "64")
             else:
-                self.assertIs(type(value), int)
-                self.assertEqual(value, receipt.certificate_safety_factor)
+                self.assertNotIn(
+                    "determinant_error_safety_factor", document["policy"]
+                )
+                self.assertEqual(
+                    document["diagnostic_model_identity"],
+                    "exterior-determinant-additive-channels/provisional-v1",
+                )
+                self.assertEqual(
+                    document["required_raw_determinant_roles"], ["PRIMARY"]
+                )
+                self.assertEqual(document["required_raw_determinant_count"], 1)
 
     def test_contract_fixture_is_canonical_python_json_with_typed_negatives(self):
         _, _, documents = _preflight_documents()
@@ -204,6 +214,20 @@ class PromotedRequestPreflightTests(unittest.TestCase):
                 for case in round_tripped["invalid_exterior_cases"]
             ],
             ["64", 64.0, True, 63, None],
+        )
+        self.assertEqual(
+            [case["label"] for case in round_tripped["golden_contracts"]],
+            [
+                "horizon-analytic",
+                "exterior-provisional-additive",
+                "exterior-empirical-certificate",
+            ],
+        )
+        self.assertEqual(
+            round_tripped["golden_contracts"][2]["wire_request"][
+                "required_raw_determinant_count"
+            ],
+            3,
         )
 
     def test_preflight_response_integer_fields_are_type_exact(self):

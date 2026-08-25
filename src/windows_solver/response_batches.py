@@ -74,6 +74,14 @@ from .response_engine import (
     RootReadout,
     VettedNativeDeterminantKernel,
     WORKER_RESPONSE_RECEIPT_SCHEMA,
+    VERIFIED_ENDPOINT_ERROR_MODEL,
+    EXTERIOR_PROVISIONAL_DETERMINANT_ERROR_MODEL,
+    EXTERIOR_DETERMINANT_ABSOLUTE_ERROR_CERTIFICATE,
+    RawDeterminantContract,
+    raw_determinant_contract_fields_for_model,
+    raw_determinant_contract_from_request,
+    raw_determinant_evidence_semantics,
+    _validate_current_raw_determinant_policy,
     UNCALIBRATED_ANALYTIC_RESPONSE,
     regularised_gsn_precision_policy,
     root_readout_preserves_authenticated_branch,
@@ -1540,6 +1548,9 @@ def _validate_failed_preflight_attempt_request(
                 precision_digits,
                 refinement=refinement_level,
                 ode_error_budget=validated_budget,
+                diagnostic_model_identity=request_binding.get(
+                    "diagnostic_model_identity"
+                ),
             )._request(
                 leaf.job,
                 amplitude_value,
@@ -1573,6 +1584,9 @@ def _validate_failed_preflight_attempt_request(
                 refinement=refinement_level,
                 empirical_control_profile=profile,
                 calibration_receipt=receipt,
+                diagnostic_model_identity=request_binding.get(
+                    "diagnostic_model_identity"
+                ),
             )._request(
                 leaf.job,
                 amplitude_value,
@@ -4272,6 +4286,9 @@ def _validate_selective_tier_journal(
         "journal", "journal_sha256", "promoted_work_unit_ids",
         "scientific_runtime", "scientific_runtime_sha256",
         "ode_error_budget", "ode_error_budget_sha256",
+        "diagnostic_model_identity", "required_raw_determinant_roles",
+        "required_raw_determinant_count",
+        "evidence_level", "evidence_disposition",
     }
     empirical_fields = {
         "schema", "configured", "component_identity", "precision_tier",
@@ -4279,6 +4296,9 @@ def _validate_selective_tier_journal(
         "scientific_runtime", "scientific_runtime_sha256",
         "promoted_control_calibration", "empirical_control_profile",
         "empirical_control_profile_sha256",
+        "diagnostic_model_identity", "required_raw_determinant_roles",
+        "required_raw_determinant_count",
+        "evidence_level", "evidence_disposition",
     }
     if not isinstance(evidence, Mapping) or set(evidence) not in {
         frozenset(legacy_fields), frozenset(empirical_fields)
@@ -4292,12 +4312,56 @@ def _validate_selective_tier_journal(
     component_identity = (
         f"selective-signed-root-promotion-component/v1/{tier_label}"
     )
+    diagnostic_model_identity = evidence.get("diagnostic_model_identity")
+    diagnostic_roles = evidence.get("required_raw_determinant_roles")
+    diagnostic_count = evidence.get("required_raw_determinant_count")
+    if (
+        not isinstance(diagnostic_model_identity, str)
+        or not isinstance(diagnostic_roles, list)
+        or type(diagnostic_count) is not int
+    ):
+        raise _UnauthenticatedComponentEvidence(
+            "campaign selective tier raw determinant contract is invalid"
+        )
+    try:
+        expected_contract = raw_determinant_contract_from_request({
+            "mechanism_id": leaf.job.mechanism_id,
+            **raw_determinant_contract_fields_for_model(
+                diagnostic_model_identity
+            ),
+            "policy": {
+                "determinant_error_model": diagnostic_model_identity,
+            },
+        })
+        expected_semantics = raw_determinant_evidence_semantics(
+            expected_contract
+        )
+    except ValueError as error:
+        raise _UnauthenticatedComponentEvidence(
+            "campaign selective tier raw determinant contract is invalid"
+        ) from error
+    if (
+        diagnostic_roles
+        != list(expected_contract.required_raw_determinant_roles)
+        or diagnostic_count != expected_contract.required_raw_determinant_count
+        or evidence.get("evidence_level")
+        != expected_semantics["evidence_level"]
+        or evidence.get("evidence_disposition")
+        != expected_semantics["evidence_disposition"]
+    ):
+        raise _UnauthenticatedComponentEvidence(
+            "campaign selective tier evidence disposition is invalid"
+        )
     runtime = evidence.get("scientific_runtime")
     budget = evidence.get("ode_error_budget")
     runtime_sha256 = evidence.get("scientific_runtime_sha256")
     empirical = evidence.get("schema") == (
         _EMPIRICAL_SELECTIVE_TIER_JOURNAL_SCHEMA
     )
+    if empirical != expected_contract.empirical_certificate_required:
+        raise _UnauthenticatedComponentEvidence(
+            "campaign selective tier schema disagrees with diagnostic model"
+        )
     validated_budget: ODEErrorBudget | None = None
     empirical_profile: EmpiricalControlProfile | None = None
     empirical_receipt: _EmpiricalCalibrationBindingView | None = None
@@ -4317,6 +4381,78 @@ def _validate_selective_tier_journal(
         raise _UnauthenticatedComponentEvidence(
             "campaign selective tier runtime or ODE budget is invalid"
         )
+    if not empirical:
+        # A provisional root may use the pinned control profile as an
+        # operational numerical input.  That profile is not the selected
+        # empirical certificate and must not change the request's evidence
+        # disposition.  Authenticate it only so the journal can reconstruct
+        # the exact request without promoting it to schema 2.
+        runtime_profile = runtime.get("empirical_control_profile")
+        runtime_profile_sha256 = runtime.get(
+            "empirical_control_profile_sha256"
+        )
+        runtime_binding = runtime.get("promoted_control_calibration")
+        has_runtime_profile = any(
+            value is not None
+            for value in (
+                runtime_profile,
+                runtime_profile_sha256,
+                runtime_binding,
+            )
+        )
+        if has_runtime_profile:
+            determinant_family = (
+                "horizon-scattering/v1"
+                if leaf.job.mechanism_id == "horizon-admittance"
+                else "exterior-wronskian/v1"
+            )
+            try:
+                pinned_receipt = load_default_calibration_receipt()
+                pinned_profile = pinned_receipt.budget_for(
+                    determinant_family, digits
+                )
+            except (KeyError, ValueError) as error:
+                raise _UnauthenticatedComponentEvidence(
+                    "campaign selective tier operational control profile is invalid"
+                ) from error
+            expected_binding = {
+                "schema": (
+                    "windows-solver.promoted-control-calibration-binding/1"
+                ),
+                "receipt_identity": pinned_receipt.identity,
+                "receipt_sha256": pinned_receipt.sha256,
+                "execution_status": pinned_receipt.execution_status,
+                "source_audit_sha256": pinned_receipt.source_audit_sha256,
+                "determinant_family": determinant_family,
+                "determinant_certificate_identity": (
+                    pinned_receipt.certificate_identity
+                ),
+                "determinant_certificate_safety_factor": (
+                    pinned_receipt.certificate_safety_factor
+                ),
+                "derivative_floor_status": (
+                    pinned_receipt.derivative_floor_status_for(
+                        determinant_family
+                    )
+                ),
+            }
+            if (
+                not isinstance(runtime_binding, Mapping)
+                or dict(runtime_binding) != expected_binding
+                or not isinstance(runtime_profile, Mapping)
+                or dict(runtime_profile) != pinned_profile.to_mapping()
+                or runtime_profile_sha256 != _sha256(dict(runtime_profile))
+            ):
+                raise _UnauthenticatedComponentEvidence(
+                    "campaign selective tier operational control profile is invalid"
+                )
+            empirical_profile = pinned_profile
+            empirical_receipt = _EmpiricalCalibrationBindingView(
+                sha256=pinned_receipt.sha256,
+                certificate_identity=pinned_receipt.certificate_identity,
+                certificate_safety_factor=pinned_receipt.certificate_safety_factor,
+                profile=pinned_profile,
+            )
     if empirical:
         raw_binding = evidence.get("promoted_control_calibration")
         raw_profile = evidence.get("empirical_control_profile")
@@ -4397,19 +4533,28 @@ def _validate_selective_tier_journal(
     else:
         budget_sha256 = evidence.get("ode_error_budget_sha256")
         validated_budget = _ode_error_budget_from_mapping(budget)
+        valid_ode_budget = (
+            isinstance(budget, Mapping)
+            and validated_budget is not None
+            and validated_budget.to_mapping() == dict(budget)
+            and budget_sha256 == _sha256(dict(budget))
+            and budget.get("schema") == "windows-solver.ode-error-budget/1"
+            and budget.get("precision_tier") == tier_label
+            and budget.get("nominal_decimal_digits") == digits
+            and budget.get("working_precision_bits") == bits
+            and isinstance(budget.get("calibration_identity"), str)
+            and bool(budget["calibration_identity"])
+        )
+        valid_operational_profile = (
+            empirical_profile is not None
+            and empirical_receipt is not None
+            and budget is None
+            and budget_sha256 is None
+        )
         if (
             evidence.get("schema") != _SELECTIVE_TIER_JOURNAL_SCHEMA
             or set(evidence) != legacy_fields
-            or not isinstance(budget, Mapping)
-            or validated_budget is None
-            or validated_budget.to_mapping() != dict(budget)
-            or budget_sha256 != _sha256(dict(budget))
-            or budget.get("schema") != "windows-solver.ode-error-budget/1"
-            or budget.get("precision_tier") != tier_label
-            or budget.get("nominal_decimal_digits") != digits
-            or budget.get("working_precision_bits") != bits
-            or not isinstance(budget.get("calibration_identity"), str)
-            or not budget["calibration_identity"]
+            or not (valid_ode_budget or valid_operational_profile)
         ):
             raise _UnauthenticatedComponentEvidence(
                 "campaign selective tier runtime or ODE budget is invalid"
@@ -4477,6 +4622,7 @@ def _validate_selective_tier_journal(
         ode_error_budget=validated_budget,
         empirical_control_profile=empirical_profile,
         calibration_receipt=empirical_receipt,
+        diagnostic_model_identity=diagnostic_model_identity,
     )
     for work_unit_id in promoted_ids:
         entry = journal.entries[work_unit_id]
@@ -4522,9 +4668,22 @@ def _validate_selective_tier_journal(
             "mechanism_id", "amplitude", "precision_digits",
             "working_precision_bits", "semantic_precision_tier", "policy",
             "execution_resource", "primary_predictor",
+            "diagnostic_model_identity", "required_raw_determinant_roles",
+            "required_raw_determinant_count",
         }
         if leaf.job.mechanism_id != "horizon-admittance":
             expected_request_fields.add("support")
+        request_contract: RawDeterminantContract | None = None
+        if isinstance(request, Mapping):
+            try:
+                request_contract = raw_determinant_contract_from_request(request)
+                _validate_current_raw_determinant_policy(
+                    request, request_contract
+                )
+            except ValueError as error:
+                raise _UnauthenticatedComponentEvidence(
+                    "campaign selective tier raw determinant contract is invalid"
+                ) from error
         if (
             entry.component_scientific_identity != component_identity
             or entry.leaf_id != leaf.leaf_id
@@ -4549,6 +4708,13 @@ def _validate_selective_tier_journal(
             or expected_request is None
             or dict(request) != expected_request
             or set(request) != expected_request_fields
+            or request_contract is None
+            or request_contract.diagnostic_model_identity
+            != diagnostic_model_identity
+            or list(request_contract.required_raw_determinant_roles)
+            != diagnostic_roles
+            or request_contract.required_raw_determinant_count
+            != diagnostic_count
             or request.get("schema_version") != 1
             or request.get("operation") != "root-readout"
             or _sha256(dict(request)) != entry.request_sha256
@@ -4592,13 +4758,27 @@ def _validate_selective_tier_journal(
             != entry.amplitude.imag
             or not isinstance(request.get("policy"), Mapping)
             or (
-                not empirical
-                and request["policy"].get("ode_error_budget") != dict(budget)
+                request_contract is not None
+                and not request_contract.empirical_certificate_required
+                and not empirical
+                and (
+                    (
+                        validated_budget is not None
+                        and request["policy"].get("ode_error_budget")
+                        != validated_budget.to_mapping()
+                    )
+                    or (
+                        validated_budget is None
+                        and empirical_profile is None
+                    )
+                )
             )
             or (
-                empirical
+                request_contract is not None
+                and request_contract.empirical_certificate_required
                 and (
-                    "ode_error_budget" in request["policy"]
+                    not empirical
+                    or "ode_error_budget" in request["policy"]
                     or request["policy"].get(
                         "promoted_control_calibration_receipt_sha256"
                     ) != raw_binding["receipt_sha256"]
@@ -5940,6 +6120,9 @@ def _validate_current_promoted_runtime(
                         ode_error_budget=validated_budget,
                         empirical_control_profile=empirical_profile,
                         calibration_receipt=empirical_receipt,
+                        diagnostic_model_identity=binding.get(
+                            "diagnostic_model_identity"
+                        ),
                     ).preview_root_request(
                         leaf.job,
                         amplitude,

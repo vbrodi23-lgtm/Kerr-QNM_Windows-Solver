@@ -15,6 +15,7 @@ Set(keys(fixture)) == Set((
     "operation",
     "requests",
     "invalid_exterior_cases",
+    "golden_contracts",
 )) || error("Python request-contract fixture fields are invalid")
 fixture["schema_version"] == 1 ||
     error("Python request-contract fixture schema is invalid")
@@ -22,6 +23,7 @@ fixture["operation"] == "promoted-request-contract-fixture" ||
     error("Python request-contract fixture operation is invalid")
 requests = fixture["requests"]
 invalid_exterior_cases = fixture["invalid_exterior_cases"]
+golden_contracts = fixture["golden_contracts"]
 
 const EXTERIOR_CERTIFICATE_FIELDS = (
     "determinant_error_model",
@@ -62,7 +64,7 @@ end
     @test response["request_count"] == 10
 end
 
-@testset "exterior certificate value and JSON type survive the boundary" begin
+@testset "default exterior request selects the provisional one-role contract" begin
     exterior = only(filter(requests) do document
         document["mechanism_id"] == "exterior-light-ring" &&
             document["precision_digits"] == 80 &&
@@ -71,9 +73,15 @@ end
     flattened, failure = flatten_validation_result(exterior)
     @test failure === nothing
     if flattened !== nothing
-        @test flattened["determinant_error_safety_factor"] === 64
-        for field in EXTERIOR_CERTIFICATE_FIELDS
-            @test flattened[field] == exterior["policy"][field]
+        @test flattened["diagnostic_model_identity"] ==
+            "exterior-determinant-additive-channels/provisional-v1"
+        @test flattened["required_raw_determinant_roles"] == ["PRIMARY"]
+        @test flattened["required_raw_determinant_count"] === 1
+        @test flattened["determinant_error_model"] ==
+            "exterior-determinant-additive-channels/provisional-v1"
+        @test !haskey(flattened, "determinant_error_safety_factor")
+        for field in EXTERIOR_CERTIFICATE_FIELDS[2:end]
+            @test !haskey(flattened, field)
         end
     end
 
@@ -86,6 +94,54 @@ end
     @test horizon_failure === nothing
     if horizon_flattened !== nothing
         @test horizon_flattened["determinant_error_safety_factor"] == "64"
+    end
+end
+
+@testset "canonical three-mode request/response golden contracts agree" begin
+    @test length(golden_contracts) == 3
+    expected = Dict(
+        "horizon-analytic" => (
+            "horizon-admittance",
+            "verified-endpoint-control-equivalence-absolute-error/v2",
+            ["PRIMARY"], 1, "not-applicable", "HORIZON_V3_ANALYTIC",
+        ),
+        "exterior-provisional-additive" => (
+            "exterior-light-ring",
+            "exterior-determinant-additive-channels/provisional-v1",
+            ["PRIMARY"], 1, "forbidden",
+            "PROVISIONAL_NOT_SCREENED_WITHOUT_CALIBRATION",
+        ),
+        "exterior-empirical-certificate" => (
+            "exterior-light-ring",
+            "exterior-determinant-absolute-error-certificate/empirical-v1",
+            ["PRIMARY", "TRUNCATION", "RESOLUTION"], 3, "required",
+            "EMPIRICAL_CERTIFICATE_REQUIRED",
+        ),
+    )
+    for case in golden_contracts
+        label = string(case["label"])
+        @test haskey(expected, label)
+        if haskey(expected, label)
+            mechanism, model, roles, count, certificate, disposition =
+                expected[label]
+            request = case["request"]
+            response = case["response"]
+            @test request["mechanism_id"] == mechanism
+            @test request["diagnostic_model_identity"] == model
+            @test request["required_raw_determinant_roles"] == roles
+            @test request["required_raw_determinant_count"] === count
+            @test response["schema_version"] === 11
+            @test response["operation"] == "root-readout"
+            @test response["diagnostic_model_identity"] == model
+            @test response["required_raw_determinant_roles"] == roles
+            @test response["required_raw_determinant_count"] === count
+            @test response["certificate_requirement"] == certificate
+            @test response["provisional_stage"] == (
+                label == "exterior-provisional-additive" ?
+                "persisted-authenticated" : "not-applicable"
+            )
+            @test response["evidence_disposition"] == disposition
+        end
     end
 end
 

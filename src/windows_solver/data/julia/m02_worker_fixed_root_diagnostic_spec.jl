@@ -169,6 +169,13 @@ function production_document(mechanism::String)
     end)
 end
 
+function golden_document(label::String)
+    case = only(filter(fixture["golden_contracts"]) do item
+        string(item["label"]) == label
+    end)
+    return case["wire_request"]
+end
+
 function run_fixed_root_phase(
     document,
     phase::String;
@@ -223,7 +230,7 @@ function run_fixed_root_phase(
 end
 
 @testset "promoted exterior fixed-root phases return one logical authenticated determinant" begin
-    exterior = production_document("exterior-light-ring")
+    exterior = golden_document("exterior-empirical-certificate")
     for phase in ("TRUNCATION", "RESOLUTION")
         result, scenario, omega_primary, expected_cross =
             run_fixed_root_phase(exterior, phase)
@@ -254,8 +261,19 @@ end
     end
 end
 
+@testset "canonical exterior provisional request requires one raw role" begin
+    provisional = golden_document("exterior-provisional-additive")
+    flattened = flatten_request(provisional)
+    validate_regularised_gsn_policy(flattened)
+    @test required_raw_determinant_evaluation_count(flattened) == 1
+    @test flattened["required_raw_determinant_roles"] == ["PRIMARY"]
+    @test !haskey(flattened, "determinant_error_safety_factor")
+    @test !haskey(flattened, "empirical_control_profile_sha256")
+    @test !haskey(flattened, "promoted_control_calibration_receipt_sha256")
+end
+
 @testset "horizon fixed-root phase keeps its one-raw one-logical contract" begin
-    horizon = production_document("horizon-admittance")
+    horizon = golden_document("horizon-analytic")
     result, scenario, omega_primary, expected_cross =
         run_fixed_root_phase(horizon, "TRUNCATION")
     @test result.logical_authenticated_determinant_count == 1
@@ -268,7 +286,7 @@ end
 
 
 @testset "missing exterior certificate evidence fails closed" begin
-    exterior = production_document("exterior-light-ring")
+    exterior = golden_document("exterior-empirical-certificate")
     for missing_call in (1, 2, 3)
         scenario = FixedRootSpecScenario(
             missing_evidence_call=missing_call
@@ -289,7 +307,7 @@ end
 end
 
 @testset "an unexpected fourth raw evaluation fails closed" begin
-    exterior = production_document("exterior-light-ring")
+    exterior = golden_document("exterior-empirical-certificate")
     scenario = FixedRootSpecScenario(extra_raw_evaluation=true)
     failure = try
         run_fixed_root_phase(

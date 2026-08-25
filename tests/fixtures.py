@@ -353,13 +353,15 @@ def current_promoted_component_payload(
         PrimaryRootAcceptanceEvidence,
         PROMOTED_ROOT_ACCEPTANCE_METRIC,
         PROMOTED_ROOT_READOUT_POLICY,
+        EXTERIOR_PROVISIONAL_DETERMINANT_ERROR_MODEL,
         VERIFIED_ENDPOINT_ERROR_MODEL,
         WORKER_RESPONSE_RECEIPT_SCHEMA,
         WORKER_RESPONSE_WIRE_SCHEMA,
+        raw_determinant_contract_fields_for_model,
+        raw_determinant_contract_from_request,
     )
     from windows_solver.julia_response_backend import JuliaPrecisionRootBackend
     from windows_solver.promoted_control_calibration import (
-        EXTERIOR_DETERMINANT_ABSOLUTE_ERROR_CERTIFICATE,
         load_default_calibration_receipt,
     )
 
@@ -372,6 +374,14 @@ def current_promoted_component_payload(
         "precision_limited": precision_limited,
     })
     evidence = NumericalConditioningEvidence.from_mapping(mapping)
+    diagnostic_model_identity = (
+        VERIFIED_ENDPOINT_ERROR_MODEL
+        if evidence.scattering_diagnostics_applicable
+        else EXTERIOR_PROVISIONAL_DETERMINANT_ERROR_MODEL
+    )
+    contract_fields = raw_determinant_contract_fields_for_model(
+        diagnostic_model_identity
+    )
     raw_status = (
         "available/v1"
         if evidence.scattering_diagnostics_applicable
@@ -402,6 +412,7 @@ def current_promoted_component_payload(
             determinant_family, digits
         ),
         calibration_receipt=calibration_receipt,
+        diagnostic_model_identity=diagnostic_model_identity,
     )
     scientific_runtime = request_backend.scientific_runtime_for(leaf.job)
 
@@ -421,9 +432,10 @@ def current_promoted_component_payload(
             )
         correction = normalised / derivative
         error_model_id = (
-            VERIFIED_ENDPOINT_ERROR_MODEL
-            if evidence.scattering_diagnostics_applicable
-            else EXTERIOR_DETERMINANT_ABSOLUTE_ERROR_CERTIFICATE
+            None
+            if diagnostic_model_identity
+            == EXTERIOR_PROVISIONAL_DETERMINANT_ERROR_MODEL
+            else diagnostic_model_identity
         )
         primary = PrimaryRootAcceptanceEvidence(
             policy_id=PROMOTED_ROOT_READOUT_POLICY,
@@ -463,9 +475,7 @@ def current_promoted_component_payload(
                     fixed_root=True,
                     derivative_source="PRIMARY_COMPLEX",
                     raw_determinant_evaluation_count=(
-                        1
-                        if evidence.scattering_diagnostics_applicable
-                        else 3
+                        contract_fields["required_raw_determinant_count"]
                     ),
                 )
                 diagnostics[family] = DiagnosticRootReadout(
@@ -505,6 +515,12 @@ def current_promoted_component_payload(
         request_binding = request_backend.preview_root_request(
             leaf.job, amplitude
         )
+        contract = raw_determinant_contract_from_request(request_binding)
+        if (
+            contract.required_raw_determinant_count
+            != contract_fields["required_raw_determinant_count"]
+        ):
+            raise AssertionError("fixture request contract drifted")
         receipt_material = {
             "schema": WORKER_RESPONSE_RECEIPT_SCHEMA,
             "request_binding": request_binding,
@@ -1160,14 +1176,14 @@ def valid_legacy_julia_root_response(
 def valid_julia_root_response(
     request: dict[str, object],
 ) -> dict[str, object]:
-    """Return one schema-10 derivative-authenticated promoted-worker response."""
+    """Return one schema-11 derivative-authenticated promoted-worker response."""
 
     omega = request["omega"]
     policy = request["policy"]
     horizon = request["mechanism_id"] == "horizon-admittance"
+    diagnostic_model_identity = request["diagnostic_model_identity"]
     exterior_empirical = (
-        not horizon
-        and policy.get("determinant_error_model")
+        diagnostic_model_identity
         == "exterior-determinant-absolute-error-certificate/empirical-v1"
     )
     derivative_re = "6"
@@ -1212,19 +1228,27 @@ def valid_julia_root_response(
             "solve_role": "FIXED_ROOT_DIAGNOSTIC",
             "authoritative": False,
             "determinant_count": 1,
-            "raw_determinant_evaluation_count": (
-                3 if exterior_empirical else 1
-            ),
+            "raw_determinant_evaluation_count": request[
+                "required_raw_determinant_count"
+            ],
             "root_converged": Decimal(correction) <= Decimal(tolerance),
         }
 
     return {
-        "schema_version": 10,
+        "schema_version": 11,
         "status": "ok",
         "adapter": "package-owned-julia-gsn-root-readout",
+        "operation": "root-readout",
         "request_sha256": hashlib.sha256(
             canonical_json_bytes(request)
         ).hexdigest(),
+        "diagnostic_model_identity": diagnostic_model_identity,
+        "required_raw_determinant_roles": list(
+            request["required_raw_determinant_roles"]
+        ),
+        "required_raw_determinant_count": request[
+            "required_raw_determinant_count"
+        ],
         "precision_digits": request["precision_digits"],
         "working_precision_bits": request["working_precision_bits"],
         "promoted_root_readout_policy": (

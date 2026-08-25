@@ -854,9 +854,6 @@ function flatten_request(document)
         "horizon_maximum_endpoint_distance" => required(
             policy, "horizon_maximum_endpoint_distance"
         ),
-        "determinant_error_safety_factor" => required(
-            policy, "determinant_error_safety_factor"
-        ),
         "frequency_step" => required(policy, "frequency_step"),
         "frequency_step_minimum" => required(policy, "frequency_step_minimum"),
         "frequency_step_maximum" => required(policy, "frequency_step_maximum"),
@@ -901,6 +898,19 @@ function flatten_request(document)
             execution_resource, "coordinate_stall_minimum_step_fraction"
         ),
     )
+    if string(required(document, "operation")) in (
+        "root-readout", "fixed-root-determinant-sample"
+    )
+        flattened["diagnostic_model_identity"] = required(
+            document, "diagnostic_model_identity"
+        )
+        flattened["required_raw_determinant_roles"] = required(
+            document, "required_raw_determinant_roles"
+        )
+        flattened["required_raw_determinant_count"] = required(
+            document, "required_raw_determinant_count"
+        )
+    end
     for key in (
         "homogeneous_representation",
         "asymptotic_series_evaluation",
@@ -939,6 +949,7 @@ function flatten_request(document)
             "horizon_endpoint_prefix_order_step",
             "horizon_contour",
             "determinant_error_model",
+            "determinant_error_safety_factor",
             "control_profile_label",
             "calibration_status",
         )
@@ -946,15 +957,44 @@ function flatten_request(document)
         end
     end
     if mechanism != "horizon-admittance"
+        model = string(required(policy, "determinant_error_model"))
+        fields = if model == EXTERIOR_ADDITIVE_CHANNEL_SCHEMA_ID
+            (
+                "determinant_error_model",
+                "determinant_error_channel_schema",
+                "determinant_error_required_channels",
+                "determinant_error_calibration_status",
+                "determinant_error_missing_evidence_outcome",
+                "determinant_error_preceding_precision_tier",
+            )
+        elseif model == EXTERIOR_EMPIRICAL_ERROR_MODEL_ID
+            (
+                "determinant_error_model",
+                "determinant_error_required_term_classes",
+                "determinant_error_missing_evidence_outcome",
+                "determinant_error_certificate_statement",
+                "determinant_error_preceding_precision_tier",
+                "determinant_error_safety_factor",
+                "promoted_control_calibration_receipt_sha256",
+                "empirical_control_profile_sha256",
+            )
+        else
+            error("exterior request carries an unknown diagnostic model")
+        end
+        for key in fields
+            flattened[key] = required(policy, key)
+        end
         for key in (
-            "determinant_error_model",
             "determinant_error_channel_schema",
             "determinant_error_required_channels",
             "determinant_error_calibration_status",
-            "determinant_error_missing_evidence_outcome",
-            "determinant_error_preceding_precision_tier",
+            "determinant_error_required_term_classes",
+            "determinant_error_certificate_statement",
+            "determinant_error_safety_factor",
+            "promoted_control_calibration_receipt_sha256",
+            "empirical_control_profile_sha256",
         )
-            flattened[key] = required(policy, key)
+            haskey(policy, key) && (flattened[key] = policy[key])
         end
         support = required(document, "support")
         for key in ("lower", "upper", "centre", "half_width")
@@ -983,6 +1023,61 @@ function flatten_request(document)
     return flattened
 end
 
+function validate_raw_determinant_contract(request)
+    for key in (
+        "diagnostic_model_identity",
+        "required_raw_determinant_roles",
+        "required_raw_determinant_count",
+    )
+        haskey(request, key) || error("raw determinant contract lacks $(key)")
+    end
+    model = string(required(request, "diagnostic_model_identity"))
+    roles = required(request, "required_raw_determinant_roles")
+    roles isa Vector && all(item -> item isa String, roles) ||
+        error("raw determinant roles are invalid")
+    length(unique(roles)) == length(roles) ||
+        error("raw determinant roles contain duplicates")
+    declared_count = required(request, "required_raw_determinant_count")
+    declared_count isa Integer && !(declared_count isa Bool) ||
+        error("raw determinant count is invalid")
+    declared_count == length(roles) ||
+        error("raw determinant role/count binding is invalid")
+
+    expected_roles = if model == VERIFIED_ENDPOINT_ERROR_MODEL_ID
+        ["PRIMARY"]
+    elseif model == EXTERIOR_ADDITIVE_CHANNEL_SCHEMA_ID
+        ["PRIMARY"]
+    elseif model == EXTERIOR_EMPIRICAL_ERROR_MODEL_ID
+        ["PRIMARY", "TRUNCATION", "RESOLUTION"]
+    else
+        error("unknown diagnostic model identity")
+    end
+    roles == expected_roles || error("raw determinant roles do not match model")
+    mechanism = string(required(request, "mechanism_id"))
+    if model == VERIFIED_ENDPOINT_ERROR_MODEL_ID
+        mechanism == "horizon-admittance" ||
+            error("horizon diagnostic model is bound to the wrong mechanism")
+    else
+        mechanism != "horizon-admittance" ||
+            error("exterior diagnostic model is bound to the horizon mechanism")
+    end
+    string(required(request, "determinant_error_model")) == model ||
+        error("diagnostic model identity is not policy-bound")
+    if model == EXTERIOR_ADDITIVE_CHANNEL_SCHEMA_ID
+        for key in (
+            "determinant_error_required_term_classes",
+            "determinant_error_certificate_statement",
+            "determinant_error_safety_factor",
+            "promoted_control_calibration_receipt_sha256",
+            "empirical_control_profile_sha256",
+        )
+            !haskey(request, key) ||
+                error("provisional diagnostic model carries empirical field $(key)")
+        end
+    end
+    return nothing
+end
+
 function validate_regularised_gsn_policy(request)
     expected_common = Dict{String,Any}(
         "asymptotic_series_evaluation" => ASYMPTOTIC_SERIES_EVALUATION_ID,
@@ -1009,6 +1104,10 @@ function validate_regularised_gsn_policy(request)
     for (key, expected) in expected_common
         required(request, key) == expected ||
             error("regularised GSN policy identity $(key) is invalid")
+    end
+
+    if haskey(request, "diagnostic_model_identity")
+        validate_raw_determinant_contract(request)
     end
 
     horizon = string(required(request, "mechanism_id")) ==
@@ -1043,7 +1142,7 @@ function validate_regularised_gsn_policy(request)
                 PROMOTED_CONTROL_PROFILE_CALIBRATION_STATUS,
         )
     else
-        Dict{String,Any}(
+        exterior = Dict{String,Any}(
             "homogeneous_representation" => HOMOGENEOUS_REPRESENTATION_ID,
             "determinant_family" => EXTERIOR_DETERMINANT_FAMILY_ID,
             "scattering_diagnostics_applicable" => false,
@@ -1055,25 +1154,63 @@ function validate_regularised_gsn_policy(request)
                 EXTERIOR_DETERMINANT_CONVENTION_ID,
             "determinant_normalisation" =>
                 EXTERIOR_DETERMINANT_NORMALISATION_ID,
-            "determinant_error_model" =>
-                EXTERIOR_ADDITIVE_CHANNEL_SCHEMA_ID,
-            "determinant_error_channel_schema" =>
-                EXTERIOR_ADDITIVE_CHANNEL_SCHEMA_ID,
-            "determinant_error_required_channels" =>
-                EXTERIOR_ADDITIVE_CHANNELS,
-            "determinant_error_calibration_status" =>
-                EXTERIOR_ADDITIVE_CALIBRATION_STATUS,
-            "determinant_error_missing_evidence_outcome" =>
-                EXTERIOR_ADDITIVE_MISSING_OUTCOME,
-            "determinant_error_preceding_precision_tier" =>
-                Dict(40 => "binary64", 80 => "bigfloat-40", 120 => "bigfloat-80")[
-                    parse_integer(request, "precision_digits")
-                ],
         )
+        model = string(required(request, "determinant_error_model"))
+        preceding_tier = Dict(
+            40 => "binary64", 80 => "bigfloat-40", 120 => "bigfloat-80"
+        )[parse_integer(request, "precision_digits")]
+        if model == EXTERIOR_ADDITIVE_CHANNEL_SCHEMA_ID
+            merge!(exterior, Dict{String,Any}(
+                "determinant_error_model" => model,
+                "determinant_error_channel_schema" => model,
+                "determinant_error_required_channels" => EXTERIOR_ADDITIVE_CHANNELS,
+                "determinant_error_calibration_status" =>
+                    EXTERIOR_ADDITIVE_CALIBRATION_STATUS,
+                "determinant_error_missing_evidence_outcome" =>
+                    EXTERIOR_ADDITIVE_MISSING_OUTCOME,
+                "determinant_error_preceding_precision_tier" => preceding_tier,
+            ))
+        elseif model == EXTERIOR_EMPIRICAL_ERROR_MODEL_ID
+            merge!(exterior, Dict{String,Any}(
+                "determinant_error_model" => model,
+                "determinant_error_required_term_classes" =>
+                    EXTERIOR_EMPIRICAL_ERROR_TERM_CLASSES,
+                "determinant_error_missing_evidence_outcome" =>
+                    EXTERIOR_EMPIRICAL_ERROR_MISSING_OUTCOME,
+                "determinant_error_certificate_statement" =>
+                    EXTERIOR_EMPIRICAL_ERROR_STATEMENT,
+                "determinant_error_preceding_precision_tier" => preceding_tier,
+                "determinant_error_safety_factor" =>
+                    EXTERIOR_EMPIRICAL_ERROR_SAFETY_FACTOR,
+                "promoted_control_calibration_receipt_sha256" =>
+                    required(request, "promoted_control_calibration_receipt_sha256"),
+                "empirical_control_profile_sha256" =>
+                    required(request, "empirical_control_profile_sha256"),
+            ))
+        else
+            error("exterior request carries an unknown diagnostic model")
+        end
+        exterior
     end
     for (key, expected) in expected_mechanism
         isequal(required(request, key), expected) ||
             error("regularised GSN mechanism policy $(key) is invalid")
+    end
+    if !horizon &&
+       string(required(request, "determinant_error_model")) ==
+       EXTERIOR_EMPIRICAL_ERROR_MODEL_ID
+        safety = required(request, "determinant_error_safety_factor")
+        safety isa Integer && !(safety isa Bool) &&
+            safety == EXTERIOR_EMPIRICAL_ERROR_SAFETY_FACTOR ||
+            error("exterior empirical safety factor is invalid")
+        for key in (
+            "promoted_control_calibration_receipt_sha256",
+            "empirical_control_profile_sha256",
+        )
+            value = string(required(request, key))
+            occursin(r"^[0-9a-f]{64}$", value) ||
+                error("exterior empirical receipt hash is invalid")
+        end
     end
     # The horizon-only identities must be absent from an exterior request, not
     # merely null. A null would still change the exterior policy mapping, and
@@ -3763,10 +3900,13 @@ function raw_determinant_progress(
 end
 
 function exterior_empirical_certificate_required(request)
-    string(required(request, "mechanism_id")) != "horizon-admittance" ||
+    string(required(request, "mechanism_id")) == "horizon-admittance" &&
         return false
-    haskey(request, "determinant_error_model") || return false
-    model = string(required(request, "determinant_error_model"))
+    model = string(required(
+        request,
+        haskey(request, "diagnostic_model_identity") ?
+            "diagnostic_model_identity" : "determinant_error_model",
+    ))
     model == EXTERIOR_ADDITIVE_CHANNEL_SCHEMA_ID && return false
     model == EXTERIOR_EMPIRICAL_ERROR_MODEL_ID && return true
     error("exterior determinant request carries an unsupported error model")
@@ -6023,8 +6163,20 @@ function solve_binary64_parity_primary(
     )
 end
 
-required_raw_determinant_evaluation_count(request) =
-    exterior_empirical_certificate_required(request) ? 3 : 1
+function required_raw_determinant_evaluation_count(request)
+    if haskey(request, "diagnostic_model_identity")
+        validate_raw_determinant_contract(request)
+        return parse_integer(request, "required_raw_determinant_count")
+    end
+    # Fixed-root survey/sample requests predate the promoted root-readout
+    # role fields. They still select by their explicit error-model identity,
+    # never by mechanism or by a returned raw count.
+    model = string(required(request, "determinant_error_model"))
+    model == EXTERIOR_EMPIRICAL_ERROR_MODEL_ID && return 3
+    model == EXTERIOR_ADDITIVE_CHANNEL_SCHEMA_ID && return 1
+    model == VERIFIED_ENDPOINT_ERROR_MODEL_ID && return 1
+    error("request carries an unsupported raw determinant model")
+end
 
 function solve_fixed_root_diagnostic(
     ::Type{T},
@@ -7546,10 +7698,20 @@ function result_fields(::Type{T}, request, digits::Int, bits::Int) where {T<:Abs
         )
         branch_valid = primary.branch_authenticated
         return [
-            "schema_version" => 10,
+            "schema_version" => 11,
             "status" => "ok",
             "adapter" => "package-owned-julia-gsn-root-readout",
+            "operation" => "root-readout",
             "request_sha256" => string(required(request, "request_sha256")),
+            "diagnostic_model_identity" => string(required(
+                request, "diagnostic_model_identity"
+            )),
+            "required_raw_determinant_roles" => required(
+                request, "required_raw_determinant_roles"
+            ),
+            "required_raw_determinant_count" => required(
+                request, "required_raw_determinant_count"
+            ),
             "precision_digits" => digits,
             "working_precision_bits" => bits,
             "promoted_root_readout_policy" =>
@@ -7620,10 +7782,20 @@ function result_fields(::Type{T}, request, digits::Int, bits::Int) where {T<:Abs
     )
 
     return [
-        "schema_version" => 10,
+        "schema_version" => 11,
         "status" => "ok",
         "adapter" => "package-owned-julia-gsn-root-readout",
+        "operation" => "root-readout",
         "request_sha256" => string(required(request, "request_sha256")),
+        "diagnostic_model_identity" => string(required(
+            request, "diagnostic_model_identity"
+        )),
+        "required_raw_determinant_roles" => required(
+            request, "required_raw_determinant_roles"
+        ),
+        "required_raw_determinant_count" => required(
+            request, "required_raw_determinant_count"
+        ),
         "precision_digits" => digits,
         "working_precision_bits" => bits,
         "promoted_root_readout_policy" =>

@@ -42,12 +42,19 @@ from .response_engine import (
     FixedRootDeterminantSample,
     DiagnosticRootReadout,
     HISTORICAL_WORKER_RESPONSE_RECEIPT_SCHEMA,
+    LEGACY_PROMOTED_WORKER_RESPONSE_WIRE_SCHEMA,
     NumericalConditioningEvidence,
     NUMERICAL_CONDITIONING_SCHEMA,
     ResponseComponentJob,
     PrimaryRootAcceptanceEvidence,
     PROMOTED_ROOT_ACCEPTANCE_METRIC,
     PROMOTED_ROOT_READOUT_POLICY,
+    EXTERIOR_PROVISIONAL_DETERMINANT_ERROR_MODEL,
+    RawDeterminantContract,
+    raw_determinant_contract_golden_cases,
+    raw_determinant_contract_fields_for_model,
+    raw_determinant_contract_from_request,
+    _validate_current_raw_determinant_policy,
     RootAuthenticationEvidence,
     RootReadout,
     VERIFIED_ENDPOINT_ERROR_MODEL,
@@ -62,8 +69,10 @@ from .response_engine import (
 from .precision_tiers import PrecisionTier, precision_tier
 from .promoted_control_calibration import (
     EXTERIOR_DETERMINANT_ABSOLUTE_ERROR_CERTIFICATE,
+    EXTERIOR_DETERMINANT_CERTIFICATE_UNAVAILABLE,
     EmpiricalControlProfile,
     PromotedControlCalibrationReceipt,
+    load_default_calibration_receipt,
 )
 from .progress import (
     PROGRESS_SCHEMA,
@@ -162,6 +171,14 @@ _EXTERIOR_ADDITIVE_CHANNELS = [
     "angular_data",
     "arithmetic_rounding",
 ]
+_EXTERIOR_EMPIRICAL_TERM_CLASSES = [
+    "delta_same_point",
+    "delta_cross_precision",
+    "delta_endpoint_series",
+]
+_EXTERIOR_EMPIRICAL_CERTIFICATE_STATEMENT = (
+    "conservative empirical certificate; not a formal interval enclosure"
+)
 
 
 def _is_uncalibrated_exterior_error_policy(policy: Mapping[str, object]) -> bool:
@@ -3021,12 +3038,31 @@ def _precision_policy(
     *,
     empirical_control_profile: EmpiricalControlProfile | None = None,
     calibration_receipt: PromotedControlCalibrationReceipt | None = None,
+    diagnostic_model_identity: str | None = None,
+    include_control_provenance: bool = False,
 ) -> dict[str, object]:
     if digits not in _PROMOTED_DIGITS:
         raise ValueError("Julia response precision must be 40, 80, or 120 digits")
     if refinement not in (0, 1):
         raise ValueError("Julia response refinement level must be zero or one")
     level = "base" if refinement == 0 else "refinement"
+    if diagnostic_model_identity is None:
+        diagnostic_model_identity = (
+            VERIFIED_ENDPOINT_ERROR_MODEL
+            if job.mechanism_id == "horizon-admittance"
+            else EXTERIOR_PROVISIONAL_DETERMINANT_ERROR_MODEL
+        )
+    if job.mechanism_id == "horizon-admittance":
+        if diagnostic_model_identity != VERIFIED_ENDPOINT_ERROR_MODEL:
+            raise ValueError("horizon requests require the horizon diagnostic model")
+    elif diagnostic_model_identity not in {
+        EXTERIOR_PROVISIONAL_DETERMINANT_ERROR_MODEL,
+        EXTERIOR_DETERMINANT_ABSOLUTE_ERROR_CERTIFICATE,
+    }:
+        raise ValueError("exterior diagnostic model identity is invalid")
+
+    profile_mapping: dict[str, object] | None = None
+    profile_sha256: str | None = None
     if empirical_control_profile is not None or calibration_receipt is not None:
         if (
             empirical_control_profile is None
@@ -3049,40 +3085,13 @@ def _precision_policy(
                 "empirical control profile disagrees with determinant request"
             )
         profile_mapping = empirical_control_profile.to_mapping()
+        profile_sha256 = hashlib.sha256(
+            canonical_json_bytes(profile_mapping)
+        ).hexdigest()
         numerical_controls: dict[str, object] = {
             **empirical_control_profile.controls_for_refinement(refinement),
-            "promoted_control_calibration_receipt_sha256": (
-                calibration_receipt.sha256
-            ),
-            "empirical_control_profile_sha256": hashlib.sha256(
-                canonical_json_bytes(profile_mapping)
-            ).hexdigest(),
         }
-        if expected_family == "exterior-wronskian/v1":
-            numerical_controls.update({
-                "determinant_error_model": _EXTERIOR_ADDITIVE_CHANNEL_SCHEMA,
-                "determinant_error_channel_schema": (
-                    _EXTERIOR_ADDITIVE_CHANNEL_SCHEMA
-                ),
-                "determinant_error_required_channels": (
-                    list(_EXTERIOR_ADDITIVE_CHANNELS)
-                ),
-                "determinant_error_calibration_status": (
-                    "MISSING_AUTHENTICATED_CALIBRATION"
-                ),
-                "determinant_error_missing_evidence_outcome": (
-                    "BLOCKED_BY_REVIEWED_ERROR_EVIDENCE"
-                ),
-                "determinant_error_preceding_precision_tier": {
-                    40: "binary64",
-                    80: "bigfloat-40",
-                    120: "bigfloat-80",
-                }[digits],
-            })
     else:
-        # Legacy injected budgets remain constructible for exact historical
-        # wire-9 fixture/checkpoint reconstruction. Current wire-10 exterior
-        # execution uses the committed empirical receipt path above.
         ode_controls = _adaptive_ode_request_controls(digits, ode_error_budget)
         root_search_controls = {
             (40, "base"): ("1e-6", "1e-12", "1e-3"),
@@ -3099,11 +3108,65 @@ def _precision_policy(
             "frequency_step_maximum": root_search_controls[2],
             **ode_controls,
         }
+    if include_control_provenance and profile_mapping is not None:
+        numerical_controls.update({
+            "promoted_control_calibration_receipt_sha256": (
+                calibration_receipt.sha256
+                if calibration_receipt is not None
+                else None
+            ),
+            "empirical_control_profile_sha256": profile_sha256,
+        })
     if job.mechanism_id == "horizon-admittance":
         numerical_controls["determinant_error_safety_factor"] = "64"
-    # Exterior SCREENED factors are deliberately absent.  The separate
-    # promoted-control receipt may still authenticate ODE controls, but it is
-    # not a calibration receipt for the six named determinant-error channels.
+    else:
+        preceding_tier = {
+            40: "binary64",
+            80: "bigfloat-40",
+            120: "bigfloat-80",
+        }[digits]
+        if diagnostic_model_identity == EXTERIOR_PROVISIONAL_DETERMINANT_ERROR_MODEL:
+            numerical_controls.update({
+                "determinant_error_model": _EXTERIOR_ADDITIVE_CHANNEL_SCHEMA,
+                "determinant_error_channel_schema": (
+                    _EXTERIOR_ADDITIVE_CHANNEL_SCHEMA
+                ),
+                "determinant_error_required_channels": (
+                    list(_EXTERIOR_ADDITIVE_CHANNELS)
+                ),
+                "determinant_error_calibration_status": (
+                    "MISSING_AUTHENTICATED_CALIBRATION"
+                ),
+                "determinant_error_missing_evidence_outcome": (
+                    "BLOCKED_BY_REVIEWED_ERROR_EVIDENCE"
+                ),
+                "determinant_error_preceding_precision_tier": preceding_tier,
+            })
+        else:
+            if profile_mapping is None or calibration_receipt is None:
+                raise ValueError(
+                    "empirical exterior diagnostics require authenticated controls"
+                )
+            numerical_controls.update({
+                "determinant_error_model": (
+                    EXTERIOR_DETERMINANT_ABSOLUTE_ERROR_CERTIFICATE
+                ),
+                "determinant_error_required_term_classes": (
+                    list(_EXTERIOR_EMPIRICAL_TERM_CLASSES)
+                ),
+                "determinant_error_missing_evidence_outcome": (
+                    EXTERIOR_DETERMINANT_CERTIFICATE_UNAVAILABLE
+                ),
+                "determinant_error_certificate_statement": (
+                    _EXTERIOR_EMPIRICAL_CERTIFICATE_STATEMENT
+                ),
+                "determinant_error_preceding_precision_tier": preceding_tier,
+                "determinant_error_safety_factor": 64,
+                "promoted_control_calibration_receipt_sha256": (
+                    calibration_receipt.sha256
+                ),
+                "empirical_control_profile_sha256": profile_sha256,
+            })
 
     endpoint_series_order = job.policy.endpoint_series_order + 8 * refinement
     policy = _merge_policy_fragments(
@@ -3174,6 +3237,7 @@ class JuliaPrecisionRootBackend:
     ode_error_budget: ODEErrorBudget | None = None
     empirical_control_profile: EmpiricalControlProfile | None = None
     calibration_receipt: PromotedControlCalibrationReceipt | None = None
+    diagnostic_model_identity: str | None = None
 
     def __post_init__(self) -> None:
         if self.digits not in _PROMOTED_DIGITS:
@@ -3295,6 +3359,25 @@ class JuliaPrecisionRootBackend:
         primary_predictor: complex | None = None,
         primary_predictor_kind: str | None = None,
     ) -> dict[str, object]:
+        diagnostic_model_identity = self.diagnostic_model_identity
+        if diagnostic_model_identity is None:
+            diagnostic_model_identity = (
+                VERIFIED_ENDPOINT_ERROR_MODEL
+                if job.mechanism_id == "horizon-admittance"
+                else EXTERIOR_PROVISIONAL_DETERMINANT_ERROR_MODEL
+            )
+        policy = _precision_policy(
+            job,
+            self.digits,
+            self.refinement,
+            self._request_ode_error_budget(),
+            empirical_control_profile=self.empirical_control_profile,
+            calibration_receipt=self.calibration_receipt,
+            diagnostic_model_identity=diagnostic_model_identity,
+        )
+        contract_fields = raw_determinant_contract_fields_for_model(
+            diagnostic_model_identity
+        )
         request: dict[str, object] = {
             "schema_version": 1,
             "operation": "root-readout",
@@ -3327,16 +3410,11 @@ class JuliaPrecisionRootBackend:
             "precision_digits": self.digits,
             "working_precision_bits": math.ceil(self.digits * math.log2(10)) + 32,
             "semantic_precision_tier": f"bigfloat-{self.digits}",
-            "policy": _precision_policy(
-                job,
-                self.digits,
-                self.refinement,
-                self._request_ode_error_budget(),
-                empirical_control_profile=self.empirical_control_profile,
-                calibration_receipt=self.calibration_receipt,
-            ),
+            **contract_fields,
+            "policy": policy,
             "execution_resource": _execution_resource_policy(),
         }
+        raw_determinant_contract_from_request(request)
         _validate_mechanism_precision_policy(
             job.mechanism_id, request["policy"]
         )
@@ -3390,6 +3468,8 @@ class JuliaPrecisionRootBackend:
             self._request_ode_error_budget(),
             empirical_control_profile=self.empirical_control_profile,
             calibration_receipt=self.calibration_receipt,
+            diagnostic_model_identity=EXTERIOR_PROVISIONAL_DETERMINANT_ERROR_MODEL,
+            include_control_provenance=True,
         )
         for field in (
             _FIXED_ROOT_SURVEY_REVIEW_ONLY_POLICY_FIELDS
@@ -4007,8 +4087,17 @@ class JuliaPrecisionRootBackend:
             and policy.get("promoted_root_readout_policy")
             == PROMOTED_ROOT_READOUT_POLICY
         )
-        if response_schema == WORKER_RESPONSE_WIRE_SCHEMA and current_request:
-            return self._read_root_response_v7(job, request, evaluation)
+        if current_request and response_schema == WORKER_RESPONSE_WIRE_SCHEMA:
+            return self._read_root_response_v7(
+                job, request, evaluation, legacy_wire=False
+            )
+        if (
+            current_request
+            and response_schema == LEGACY_PROMOTED_WORKER_RESPONSE_WIRE_SCHEMA
+        ):
+            return self._read_root_response_v7(
+                job, request, evaluation, legacy_wire=True
+            )
         if response_schema == 6 and not current_request:
             return self._read_root_response_v6(job, request, evaluation)
         raise JuliaResponseBackendError(
@@ -4020,6 +4109,8 @@ class JuliaPrecisionRootBackend:
         job: ResponseComponentJob,
         request: Mapping[str, object],
         evaluation: JuliaResponseEvaluation,
+        *,
+        legacy_wire: bool = False,
     ) -> RootReadout:
         response = dict(evaluation.response)
         expected_fields = {
@@ -4053,6 +4144,13 @@ class JuliaPrecisionRootBackend:
             "numerical_conditioning",
             "horizon_endpoint_search_evidence",
         }
+        if not legacy_wire:
+            expected_fields.update({
+                "operation",
+                "diagnostic_model_identity",
+                "required_raw_determinant_roles",
+                "required_raw_determinant_count",
+            })
         if set(response) != expected_fields:
             raise JuliaResponseBackendError("M02 Julia response fields are invalid")
         if (
@@ -4066,9 +4164,18 @@ class JuliaPrecisionRootBackend:
                     "seed_path_determinant_count",
                 )
             )
-            or response["schema_version"] != WORKER_RESPONSE_WIRE_SCHEMA
+            or response["schema_version"]
+            != (
+                LEGACY_PROMOTED_WORKER_RESPONSE_WIRE_SCHEMA
+                if legacy_wire
+                else WORKER_RESPONSE_WIRE_SCHEMA
+            )
             or response["status"] != "ok"
             or response["adapter"] != "package-owned-julia-gsn-root-readout"
+            or (
+                not legacy_wire
+                and response["operation"] != "root-readout"
+            )
             or response["request_sha256"] != evaluation.request_sha256
             or response["precision_digits"] != self.digits
             or response["working_precision_bits"]
@@ -4100,6 +4207,37 @@ class JuliaPrecisionRootBackend:
             raise JuliaResponseBackendError(
                 "M02 Julia promoted root policy identity is invalid"
             )
+
+        diagnostic_contract: RawDeterminantContract | None = None
+        if not legacy_wire:
+            try:
+                diagnostic_contract = raw_determinant_contract_from_request(
+                    request
+                )
+            except ValueError as error:
+                raise JuliaResponseBackendError(
+                    "M02 Julia request raw determinant contract is invalid"
+                ) from error
+            try:
+                _validate_current_raw_determinant_policy(
+                    request, diagnostic_contract
+                )
+            except ValueError as error:
+                raise JuliaResponseBackendError(
+                    "M02 Julia determinant certificate policy is invalid"
+                ) from error
+            if (
+                response["diagnostic_model_identity"]
+                != diagnostic_contract.diagnostic_model_identity
+                or response["required_raw_determinant_roles"]
+                != list(diagnostic_contract.required_raw_determinant_roles)
+                or type(response["required_raw_determinant_count"]) is not int
+                or response["required_raw_determinant_count"]
+                != diagnostic_contract.required_raw_determinant_count
+            ):
+                raise JuliaResponseBackendError(
+                    "M02 Julia response raw determinant contract is invalid"
+                )
 
         try:
             numerical_conditioning = NumericalConditioningEvidence.from_mapping(
@@ -4172,21 +4310,29 @@ class JuliaPrecisionRootBackend:
             raise JuliaResponseBackendError(
                 "M02 Julia PRIMARY acceptance evidence is invalid"
             ) from error
-        uncalibrated_exterior = (
-            job.mechanism_id != "horizon-admittance"
-            and _is_uncalibrated_exterior_error_policy(policy)
-        )
-        expected_error_model_id = (
-            VERIFIED_ENDPOINT_ERROR_MODEL
-            if job.mechanism_id == "horizon-admittance"
-            else (
-                None if uncalibrated_exterior
+        if legacy_wire:
+            legacy_model = policy.get("determinant_error_model")
+            if legacy_model == _EXTERIOR_ADDITIVE_CHANNEL_SCHEMA:
+                raise JuliaResponseBackendError(
+                    "M02 Julia wire-10 cannot carry a provisional exterior contract"
+                )
+            uncalibrated_exterior = False
+            expected_error_model_id = (
+                VERIFIED_ENDPOINT_ERROR_MODEL
+                if legacy_model == VERIFIED_ENDPOINT_ERROR_MODEL
                 else EXTERIOR_DETERMINANT_ABSOLUTE_ERROR_CERTIFICATE
             )
-        )
+        else:
+            assert diagnostic_contract is not None
+            uncalibrated_exterior = not diagnostic_contract.empirical_certificate_required
+            expected_error_model_id = (
+                diagnostic_contract.permitted_response_receipt_identity
+            )
         if (
-            not uncalibrated_exterior
-            and policy.get("determinant_error_model") != expected_error_model_id
+            legacy_wire
+            and job.mechanism_id == "horizon-admittance"
+            and policy.get("determinant_error_model")
+            != VERIFIED_ENDPOINT_ERROR_MODEL
         ):
             raise JuliaResponseBackendError(
                 "M02 Julia determinant certificate policy is invalid"
@@ -4339,9 +4485,25 @@ class JuliaPrecisionRootBackend:
             "raw_determinant_evaluation_count",
             "root_converged",
         }
-        expected_raw_determinant_count = (
-            1 if job.mechanism_id == "horizon-admittance" else 3
-        )
+        if legacy_wire:
+            legacy_model = policy.get("determinant_error_model")
+            if legacy_model == VERIFIED_ENDPOINT_ERROR_MODEL:
+                expected_raw_determinant_count = 1
+            elif legacy_model == EXTERIOR_DETERMINANT_ABSOLUTE_ERROR_CERTIFICATE:
+                expected_raw_determinant_count = 3
+            elif legacy_model == _EXTERIOR_ADDITIVE_CHANNEL_SCHEMA:
+                raise JuliaResponseBackendError(
+                    "M02 Julia wire-10 cannot carry a provisional exterior contract"
+                )
+            else:
+                raise JuliaResponseBackendError(
+                    "M02 Julia legacy raw determinant model is invalid"
+                )
+        else:
+            assert diagnostic_contract is not None
+            expected_raw_determinant_count = (
+                diagnostic_contract.required_raw_determinant_count
+            )
         expected_families = {"truncation", "resolution"}
         if (
             not isinstance(raw_diagnostics, Mapping)
@@ -5419,9 +5581,79 @@ def build_promoted_request_contract_fixture(
         request["policy"]["determinant_error_safety_factor"] = value
         _, document, _ = _worker_request_document(request)
         invalid_cases.append({"label": label, "document": document})
+    golden_contracts = copy.deepcopy(
+        list(raw_determinant_contract_golden_cases())
+    )
+    default_receipt = load_default_calibration_receipt()
+    empirical_profile = default_receipt.budget_for(
+        "exterior-wronskian/v1", int(exterior["precision_digits"])
+    )
+    empirical_request = copy.deepcopy(exterior)
+    empirical_request.pop("request_sha256", None)
+    empirical_request.update({
+        "diagnostic_model_identity": (
+            EXTERIOR_DETERMINANT_ABSOLUTE_ERROR_CERTIFICATE
+        ),
+        "required_raw_determinant_roles": [
+            "PRIMARY", "TRUNCATION", "RESOLUTION"
+        ],
+        "required_raw_determinant_count": 3,
+    })
+    empirical_policy = empirical_request["policy"]
+    assert isinstance(empirical_policy, dict)
+    for field in (
+        "determinant_error_channel_schema",
+        "determinant_error_required_channels",
+        "determinant_error_calibration_status",
+        "determinant_error_missing_evidence_outcome",
+        "determinant_error_preceding_precision_tier",
+        "determinant_error_required_term_classes",
+        "determinant_error_certificate_statement",
+        "determinant_error_safety_factor",
+        "promoted_control_calibration_receipt_sha256",
+        "empirical_control_profile_sha256",
+    ):
+        empirical_policy.pop(field, None)
+    empirical_policy.update({
+        "determinant_error_model": (
+            EXTERIOR_DETERMINANT_ABSOLUTE_ERROR_CERTIFICATE
+        ),
+        "determinant_error_required_term_classes": list(
+            _EXTERIOR_EMPIRICAL_TERM_CLASSES
+        ),
+        "determinant_error_missing_evidence_outcome": (
+            EXTERIOR_DETERMINANT_CERTIFICATE_UNAVAILABLE
+        ),
+        "determinant_error_certificate_statement": (
+            _EXTERIOR_EMPIRICAL_CERTIFICATE_STATEMENT
+        ),
+        "determinant_error_preceding_precision_tier": "bigfloat-40",
+        "determinant_error_safety_factor": 64,
+        "promoted_control_calibration_receipt_sha256": (
+            default_receipt.sha256
+        ),
+        "empirical_control_profile_sha256": hashlib.sha256(
+            canonical_json_bytes(empirical_profile.to_mapping())
+        ).hexdigest(),
+    })
+    _, empirical_document, _ = _worker_request_document(empirical_request)
+    wire_documents = {
+        "horizon-analytic": next(
+            document
+            for document in documents
+            if document["mechanism_id"] == "horizon-admittance"
+            and document["precision_digits"] == 80
+            and document["refinement_level"] == 0
+        ),
+        "exterior-provisional-additive": exterior,
+        "exterior-empirical-certificate": empirical_document,
+    }
+    for case in golden_contracts:
+        case["wire_request"] = wire_documents[case["label"]]
     return {
         "schema_version": 1,
         "operation": "promoted-request-contract-fixture",
         "requests": documents,
         "invalid_exterior_cases": invalid_cases,
+        "golden_contracts": golden_contracts,
     }

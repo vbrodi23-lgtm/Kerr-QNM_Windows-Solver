@@ -57,7 +57,24 @@ class CampaignSampleAdapter(FakeAdapter):
             float(request["amplitude"]["real"]),
             float(request["amplitude"]["imaginary"]),
         )
-        determinant = 1.0e-12 + (2.0 + 3.0j) * amplitude
+        sample_omega = complex(
+            float(request["omega"]["real"]),
+            float(request["omega"]["imaginary"]),
+        )
+        fixed_omega = complex(
+            float(request["fixed_omega"]["real"]),
+            float(request["fixed_omega"]["imaginary"]),
+        )
+        determinant = (
+            1.0e-12
+            + (2.0 + 3.0j) * amplitude
+            + (4.0 + 5.0j) * (sample_omega - fixed_omega)
+        )
+        amplitude_abs = abs(amplitude)
+        # The fixed-root frequency stencil evaluates at zero amplitude.  Keep
+        # a positive deterministic numerical-error floor there; zero error is
+        # not a valid available receipt even in this stub worker.
+        determinant_error_abs = max(1.0e-12 * amplitude_abs, 1.0e-12)
         request_sha256 = hashlib.sha256(canonical_json_bytes(request)).hexdigest()
         response = {
             "schema_version": 1,
@@ -70,17 +87,17 @@ class CampaignSampleAdapter(FakeAdapter):
             "amplitude_im": request["amplitude"]["imaginary"],
             "determinant_re": format(determinant.real, ".17g"),
             "determinant_im": format(determinant.imag, ".17g"),
-            "determinant_error_abs": format(1.0e-12 * abs(amplitude), ".17g"),
+            "determinant_error_abs": format(determinant_error_abs, ".17g"),
             "determinant_error_status": "available/v1",
-            "determinant_error_model_id": (
-                EXTERIOR_DETERMINANT_ABSOLUTE_ERROR_CERTIFICATE
-            ),
+            "determinant_error_model_id": request["policy"][
+                "determinant_error_model"
+            ],
             "determinant_family": "exterior-wronskian/v1",
             "determinant_normalisation": "unit-asymptotic-branch-wronskian/v1",
             "branch_identity": "gsn-complex-rho/v1",
             "branch_authenticated": True,
-            "semantic_precision_tier": "bigfloat-80",
-            "working_precision_bits": 298,
+            "semantic_precision_tier": request["semantic_precision_tier"],
+            "working_precision_bits": request["working_precision_bits"],
             "readout_role": request["readout_role"],
         }
         return SimpleNamespace(
@@ -148,6 +165,7 @@ class SelectiveReadoutPromotionTests(unittest.TestCase):
                 "exterior-wronskian/v1", 40
             ),
             calibration_receipt=receipt,
+            diagnostic_model_identity=EXTERIOR_DETERMINANT_ABSOLUTE_ERROR_CERTIFICATE,
         )
         with tempfile.TemporaryDirectory() as temporary, patch.dict(
             "os.environ",
@@ -161,6 +179,11 @@ class SelectiveReadoutPromotionTests(unittest.TestCase):
         self.assertEqual(
             evidence["schema"],
             "windows-solver.selective-tier-journal-evidence/2",
+        )
+        self.assertEqual(evidence["evidence_level"], "SCREENED")
+        self.assertEqual(
+            evidence["evidence_disposition"],
+            "EMPIRICAL_CERTIFICATE_AUTHENTICATED",
         )
         self.assertNotIn("ode_error_budget", evidence)
         self.assertEqual(
@@ -992,6 +1015,15 @@ class SelectiveReadoutPromotionTests(unittest.TestCase):
         self.assertTrue(all(value.real == 0.0 for value in promoted_calls))
         mapping = outcome.component_result["result"]
         self.assertEqual(mapping["resolved_window"]["executed_precision_tier"], "bigfloat-40")
+        evidence = mapping["resolved_window"]["journal_evidence"]
+        self.assertEqual(evidence["evidence_level"], "NOT_SCREENED")
+        self.assertEqual(
+            evidence["evidence_disposition"],
+            "BLOCKED_BY_REVIEWED_ERROR_EVIDENCE",
+        )
+        self.assertNotIn("promoted_control_calibration", evidence)
+        self.assertNotIn("empirical_control_profile", evidence)
+        self.assertNotIn("empirical_control_profile_sha256", evidence)
         self.assertEqual(
             mapping["resolved_window"]["promoted_readout_count_by_tier"],
             {"bigfloat-40": len(expected)},
@@ -1080,7 +1112,7 @@ class SelectiveReadoutPromotionTests(unittest.TestCase):
         self.assertEqual(
             operations,
             ["root-readout"]
-            + ["fixed-root-determinant-sample"] * 4,
+            + ["fixed-root-determinant-sample"] * 8,
         )
         self.assertEqual(
             [request["amplitude"] for request in root_requests],
@@ -1095,7 +1127,7 @@ class SelectiveReadoutPromotionTests(unittest.TestCase):
         self.assertNotIn("failure_code", mapping["derivative_evidence"])
         self.assertEqual(
             len(mapping["derivative_evidence"]["fixed_root_samples"]),
-            4,
+            8,
         )
         self.assertGreater(outcome.local_disk_radius_abs, 0.0)
 

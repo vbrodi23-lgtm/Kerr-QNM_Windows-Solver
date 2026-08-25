@@ -45,7 +45,8 @@ class ExteriorCertificateWorkerStaticTests(unittest.TestCase):
         self.assertNotIn("determinant_error_safety_factor", validation)
         self.assertNotIn("EXTERIOR_EMPIRICAL_ERROR_SAFETY_FACTOR", validation)
         gate = self._slice("exterior_empirical_certificate_required", "determinant_progress")
-        self.assertIn("EXTERIOR_ADDITIVE_CHANNEL_SCHEMA_ID && return false", gate)
+        self.assertIn("EXTERIOR_ADDITIVE_CHANNEL_SCHEMA_ID", gate)
+        self.assertIn("EXTERIOR_EMPIRICAL_ERROR_MODEL_ID && return true", gate)
 
     def test_exterior_endpoint_pair_remains_raw_provisional_evidence(self):
         exterior = self._slice("evaluate_exterior_determinant", "determinant")

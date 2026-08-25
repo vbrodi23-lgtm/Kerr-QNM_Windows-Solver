@@ -36,12 +36,10 @@ EXTERIOR_CERTIFICATE_FIELDS = frozenset({
     "determinant_error_preceding_precision_tier",
 })
 
-# These provenance hashes bind the nested Python request/receipt.  The worker
-# does not consume them as flattened numerical controls.
-DELIBERATELY_NESTED_EXTERIOR_POLICY_FIELDS = frozenset({
-    "empirical_control_profile_sha256",
-    "promoted_control_calibration_receipt_sha256",
-})
+# The default promoted exterior request is provisional.  Calibration/profile
+# hashes remain reserved for the explicitly selected empirical contract (and
+# for the separate operational survey receipt), not this root-readout policy.
+DELIBERATELY_NESTED_EXTERIOR_POLICY_FIELDS = frozenset()
 
 EXTERIOR_FLATTENED_POLICY_FIELDS = frozenset({
     "angular_pad",
@@ -178,7 +176,7 @@ class PromotedExteriorRequestFlatteningTests(unittest.TestCase):
             hashlib.sha256(
                 canonical_json_bytes(horizon_request)
             ).hexdigest(),
-            "da7c91c801e13c8d91afdf6a8d2ed235a1d7363917b7ed5dd7916623e118532d",
+            "790ccc762b8cf8663bc407505edf5335a515afbd3b0e8b16a8acccebd50ad259",
         )
 
     def test_policy_fragment_merger_rejects_duplicate_fields(self):

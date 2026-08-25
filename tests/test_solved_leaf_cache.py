@@ -60,6 +60,9 @@ from windows_solver.root_readout_cache import (
     runtime_identity_sha256,
 )
 from windows_solver.solved_leaf_cache import SolvedLeafLookupStatus, SolvedLeafStore
+from windows_solver.promoted_control_calibration import (
+    EXTERIOR_DETERMINANT_ABSOLUTE_ERROR_CERTIFICATE,
+)
 from tests.fixtures import (
     current_promoted_component_payload,
     frozen_pr58_native_backend_identity,
@@ -2570,6 +2573,9 @@ class SolvedLeafCacheTests(unittest.TestCase):
                 "exterior-wronskian/v1", 80
             ),
             calibration_receipt=receipt,
+            diagnostic_model_identity=(
+                EXTERIOR_DETERMINANT_ABSOLUTE_ERROR_CERTIFICATE
+            ),
         )
         corrected_request = request_backend._request(leaf_42.job, 0.0j)
         self.assertIs(
@@ -2590,11 +2596,11 @@ class SolvedLeafCacheTests(unittest.TestCase):
         ).hexdigest()
         self.assertEqual(
             obsolete_sha256,
-            "281e8f958ad79a541dedd368af78cadd1ff99899cb971008b652a684c0dc45cc",
+            "c31516bf16659f28de040da1ae9e8c1953b495c0a09415f327bf731e27a6cff5",
         )
         self.assertEqual(
             corrected_sha256,
-            "95934bdfb8cb9ccc070ba1a601b8c41a8cedecec7113b3228fc2d1c82ee11637",
+            "d9f2376d3476298bb891426e2325f9b0c314d982161fdc8f70ce8139498a7905",
         )
         self.assertNotEqual(obsolete_sha256, corrected_sha256)
 

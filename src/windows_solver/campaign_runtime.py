@@ -80,6 +80,8 @@ from .response_engine import (
     ComponentResult,
     NativeDeterminantAdapter,
     PromotedRootSeal,
+    raw_determinant_contract_from_request,
+    _validate_current_raw_determinant_policy,
     root_readout_preserves_authenticated_branch,
     run_promoted_horizon_component,
 )
@@ -690,6 +692,16 @@ def _cached_readout_backend(source: object, request: Mapping[str, object]):
         or not isinstance(policy, Mapping)
     ):
         raise ValueError("cached root-readout request precision is invalid")
+    diagnostic_model_identity = request.get("diagnostic_model_identity")
+    current_contract = None
+    if diagnostic_model_identity is not None:
+        try:
+            current_contract = raw_determinant_contract_from_request(request)
+            _validate_current_raw_determinant_policy(request, current_contract)
+        except ValueError as error:
+            raise ValueError(
+                "cached root-readout diagnostic contract is invalid"
+            ) from error
     budget = _ode_error_budget_from_mapping(policy.get("ode_error_budget"))
     if budget is not None:
         return JuliaPrecisionRootBackend(
@@ -698,6 +710,7 @@ def _cached_readout_backend(source: object, request: Mapping[str, object]):
             digits,
             refinement=refinement,
             ode_error_budget=budget,
+            diagnostic_model_identity=diagnostic_model_identity,
         )
     receipt = load_default_calibration_receipt()
     family = (
@@ -706,7 +719,7 @@ def _cached_readout_backend(source: object, request: Mapping[str, object]):
         else "exterior-wronskian/v1"
     )
     profile = receipt.budget_for(family, digits)
-    if (
+    if current_contract is None and (
         policy.get("promoted_control_calibration_receipt_sha256")
         != receipt.sha256
         or policy.get("empirical_control_profile_sha256")
@@ -720,6 +733,7 @@ def _cached_readout_backend(source: object, request: Mapping[str, object]):
         refinement=refinement,
         empirical_control_profile=profile,
         calibration_receipt=receipt,
+        diagnostic_model_identity=diagnostic_model_identity,
     )
 
 
