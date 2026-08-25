@@ -1,0 +1,33 @@
+name: Temporary export Python wheelhouse
+
+on:
+  push:
+    branches:
+      - tmp/export-python-wheelhouse
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12.13'
+      - name: Download exact pinned binary wheels
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$RUNNER_TEMP/wheelhouse"
+          python -m pip download --only-binary=:all: --no-deps --dest "$RUNNER_TEMP/wheelhouse" numpy==2.4.6 scipy==1.18.0
+          ls -lh "$RUNNER_TEMP/wheelhouse"
+          sha256sum "$RUNNER_TEMP/wheelhouse"/* > "$RUNNER_TEMP/wheelhouse/SHA256SUMS"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: python-3.12.13-numpy-2.4.6-scipy-1.18.0-linux-x86_64
+          path: ${{ runner.temp }}/wheelhouse
+          compression-level: 0
+          retention-days: 1
