@@ -1202,7 +1202,9 @@ function validate_regularised_gsn_policy(request)
         safety = required(request, "determinant_error_safety_factor")
         safety isa Integer && !(safety isa Bool) &&
             safety == EXTERIOR_EMPIRICAL_ERROR_SAFETY_FACTOR ||
-            error("exterior empirical safety factor is invalid")
+            error(
+                "exterior empirical determinant_error_safety_factor is invalid"
+            )
         for key in (
             "promoted_control_calibration_receipt_sha256",
             "empirical_control_profile_sha256",
