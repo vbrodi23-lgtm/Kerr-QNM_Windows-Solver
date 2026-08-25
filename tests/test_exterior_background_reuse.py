@@ -106,7 +106,7 @@ class ExteriorBackgroundReuseTests(unittest.TestCase):
         self.assertTrue(all(sample.role.startswith("DC_") for sample in reused.samples))
         self.assertEqual("PROMOTION_PENDING_RESPONSE", result.disposition.value)
         self.assertEqual(
-            "DETERMINANT_ERROR_EVIDENCE_UNAVAILABLE", result.reason_code
+            "BLOCKED_BY_REVIEWED_ERROR_EVIDENCE", result.reason_code
         )
         self.assertIsNone(result.response_disk)
         self.assertEqual(BACKGROUND_EQUIVALENCE_IDENTITY, receipt.identity)

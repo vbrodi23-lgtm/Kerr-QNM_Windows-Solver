@@ -1173,9 +1173,11 @@ class VettedNativeDeterminantKernel:
             )
         horizon_frequency = omega - job.mode.m * sn.OmH
         if horizon_frequency == 0.0j:
-            coordinate = complex(math.nan, math.nan)
+            d_r_ddelta_b = None
+            coordinate = 0.0j
         else:
-            coordinate = reflectivity_partial / (2.0j * horizon_frequency)
+            d_r_ddelta_b = 1.0 / (2.0j * horizon_frequency)
+            coordinate = reflectivity_partial * d_r_ddelta_b
         return DeterminantPartials(
             frequency_derivative=frequency,
             coordinate_derivative=coordinate,
@@ -1185,4 +1187,15 @@ class VettedNativeDeterminantKernel:
                 and math.isfinite(abs(coordinate))
             ),
             frequency_derivative_error_abs=frequency_error,
+            dD_dR=reflectivity_partial,
+            # Binary64 computes the useful raw numerator centre but has no
+            # reviewed disk for it.  The v3 adapter retains this evidence and
+            # promotes rather than fabricating a radius.
+            dD_dR_error_abs=None,
+            dR_ddeltaB=d_r_ddelta_b,
+            dD_ddeltaB=(
+                None if d_r_ddelta_b is None else reflectivity_partial * d_r_ddelta_b
+            ),
+            dD_domega=frequency,
+            dD_domega_error_abs=frequency_error,
         )

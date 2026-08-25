@@ -39,8 +39,10 @@ class CampaignFailureTests(unittest.TestCase):
             {
                 "INSUFFICIENT_ASYMPTOTIC_PRECISION": "RESPONSE",
                 "HORIZON_ARITHMETIC_INADEQUATE": "RESPONSE",
+                "ROOT_UNCERTAINTY_EVIDENCE_UNAVAILABLE": "ROOT",
                 "FINITE_DIFFERENCE_NOISE_LIMIT": "RESPONSE",
                 "DETERMINANT_ERROR_EVIDENCE_UNAVAILABLE": "RESPONSE",
+                "BLOCKED_BY_REVIEWED_ERROR_EVIDENCE": "RESPONSE",
                 "DETERMINANT_UNCERTAINTY_TOO_LARGE": "ROOT",
                 "ROOT_SEAL_UNAVAILABLE": "ROOT",
             },

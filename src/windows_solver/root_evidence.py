@@ -10,11 +10,14 @@ import re
 from typing import Mapping
 
 from .contracts import canonical_json_bytes
+from .response_uncertainty import ComplexDisk
 
 
-# Version 2 adds spin to the exact dependency identity.  A root receipt from
-# one spin must never be reused merely because another field happens to match.
-ROOT_EVIDENCE_SCHEMA = "windows-solver.authenticated-root-evidence/2"
+# Version 3 adds an explicit admissibility level to the authenticated complex
+# disk.  A radius without the receipt level that authorised it is not current
+# v3 evidence.  Version 2 centre-only receipts remain readable as seeds.
+ROOT_EVIDENCE_SCHEMA = "windows-solver.authenticated-root-evidence/3"
+_LEGACY_ROOT_EVIDENCE_SCHEMA = "windows-solver.authenticated-root-evidence/2"
 ROOT_DEPENDENCY_KEY_SCHEMA = "windows-solver.root-dependency-key/2"
 _HEX_64 = re.compile(r"[0-9a-f]{64}")
 
@@ -176,6 +179,8 @@ class AuthenticatedRootEvidence:
     backend_identity: str
     source_receipt_sha256: str
     root_seal_sha256: str
+    root_evidence_level: str | None = None
+    root_evidence_schema: str = ROOT_EVIDENCE_SCHEMA
 
     def __post_init__(self) -> None:
         if not isinstance(self.root_dependency_key, RootDependencyKey):
@@ -192,6 +197,11 @@ class AuthenticatedRootEvidence:
             "root_seal_sha256",
         ):
             _digest(getattr(self, name), f"root evidence {name}")
+        if self.root_evidence_schema not in {
+            ROOT_EVIDENCE_SCHEMA,
+            _LEGACY_ROOT_EVIDENCE_SCHEMA,
+        }:
+            raise ValueError("root evidence schema is invalid")
         _complex_mapping(self.fixed_root)
         if self.source_root_mapping is not None:
             if not isinstance(self.source_root_mapping, Mapping):
@@ -201,6 +211,26 @@ class AuthenticatedRootEvidence:
             )
         for name in ("root_correction_upper_bound", "root_uncertainty_radius"):
             object.__setattr__(self, name, _finite_optional(getattr(self, name), name))
+        if (
+            self.root_uncertainty_radius is not None
+            and self.root_uncertainty_radius <= 0.0
+        ):
+            raise ValueError("root uncertainty radius must be strictly positive")
+        level = self.root_evidence_level
+        if self.root_uncertainty_radius is None:
+            if level not in {None, "SEED_ONLY"}:
+                raise ValueError("centre-only root evidence must be a seed")
+            level = "SEED_ONLY"
+        elif level not in {"SCREENED", "CERTIFIED"}:
+            raise ValueError(
+                "bounded root evidence requires an explicit admissibility level"
+            )
+        if (
+            self.root_evidence_schema == _LEGACY_ROOT_EVIDENCE_SCHEMA
+            and (self.root_uncertainty_radius is not None or level != "SEED_ONLY")
+        ):
+            raise ValueError("legacy root evidence cannot authenticate a root disk")
+        object.__setattr__(self, "root_evidence_level", level)
         if self.root_dependency_key.root_reference_id != self.root_reference_id:
             raise ValueError("root evidence reference disagrees with dependency key")
         if self.root_dependency_key.root_identity_sha256 != self.root_identity_sha256:
@@ -241,6 +271,7 @@ class AuthenticatedRootEvidence:
             # provenance.  The unavailable values remain explicit evidence.
             "root_correction_upper_bound": None,
             "root_uncertainty_radius": None,
+            "root_evidence_level": "SEED_ONLY",
             "root_acceptance_policy_identity": job.policy.identity_sha256,
             "backend_identity": job.backend_identity.identity_sha256,
             "source_receipt_sha256": job.root.owner_data_sha256,
@@ -261,6 +292,7 @@ class AuthenticatedRootEvidence:
             backend_identity=str(content["backend_identity"]),
             source_receipt_sha256=str(content["source_receipt_sha256"]),
             root_seal_sha256=_sha256(content),
+            root_evidence_level="SEED_ONLY",
         )
 
     @classmethod
@@ -292,6 +324,7 @@ class AuthenticatedRootEvidence:
             ),
             "root_correction_upper_bound": None,
             "root_uncertainty_radius": None,
+            "root_evidence_level": "SEED_ONLY",
             "root_acceptance_policy_identity": job.policy.identity_sha256,
             "backend_identity": job.backend_identity.identity_sha256,
             "source_receipt_sha256": source_receipt_sha256,
@@ -312,11 +345,90 @@ class AuthenticatedRootEvidence:
             backend_identity=str(content["backend_identity"]),
             source_receipt_sha256=str(content["source_receipt_sha256"]),
             root_seal_sha256=_sha256(content),
+            root_evidence_level="SEED_ONLY",
         )
+
+    @classmethod
+    def from_authenticated_disk(
+        cls,
+        leaf: object,
+        *,
+        fixed_root: complex,
+        root_uncertainty_radius: float,
+        source_receipt_sha256: str,
+        evidence_level: str,
+    ) -> "AuthenticatedRootEvidence":
+        """Issue current root evidence only from an explicit nonzero disk.
+
+        Catalogue and adapter centre values remain seeds.  A caller may invoke
+        this constructor only after it holds the separate authenticated root
+        receipt that supplied the disk radius.
+        """
+
+        if evidence_level not in {"SCREENED", "CERTIFIED"}:
+            raise ValueError("root evidence level is invalid")
+        if float(root_uncertainty_radius) <= 0.0:
+            raise ValueError("root uncertainty radius must be strictly positive")
+        job = getattr(leaf, "job")
+        key = RootDependencyKey.from_leaf(leaf)
+        content = {
+            "schema": ROOT_EVIDENCE_SCHEMA,
+            "root_dependency_key": key.to_mapping(),
+            "root_dependency_key_sha256": key.sha256,
+            "root_reference_id": job.root.root_reference_id,
+            "root_identity_sha256": job.root.identity_sha256,
+            "fixed_root": _complex_mapping(fixed_root),
+            "branch_identity": job.root.branch_id,
+            "equation_id": job.equation_id,
+            "source_root_mapping": (
+                None
+                if job.source_root_mapping is None
+                else _copy(dict(job.source_root_mapping))
+            ),
+            "root_correction_upper_bound": None,
+            "root_uncertainty_radius": float(root_uncertainty_radius),
+            "root_evidence_level": evidence_level,
+            "root_acceptance_policy_identity": job.policy.identity_sha256,
+            "backend_identity": job.backend_identity.identity_sha256,
+            "source_receipt_sha256": source_receipt_sha256,
+        }
+        return cls(
+            root_dependency_key=key,
+            root_reference_id=str(content["root_reference_id"]),
+            root_identity_sha256=str(content["root_identity_sha256"]),
+            fixed_root=_complex_from_mapping(content["fixed_root"]),
+            branch_identity=str(content["branch_identity"]),
+            equation_id=str(content["equation_id"]),
+            source_root_mapping=content["source_root_mapping"],
+            root_correction_upper_bound=None,
+            root_uncertainty_radius=float(content["root_uncertainty_radius"]),
+            root_acceptance_policy_identity=str(
+                content["root_acceptance_policy_identity"]
+            ),
+            backend_identity=str(content["backend_identity"]),
+            source_receipt_sha256=str(content["source_receipt_sha256"]),
+            root_seal_sha256=_sha256(content),
+            root_evidence_level=str(content["root_evidence_level"]),
+        )
+
+    @property
+    def evidence_level(self) -> str:
+        """Return the current admissibility level, never inferred from a seed."""
+
+        assert self.root_evidence_level is not None
+        return self.root_evidence_level
+
+    @property
+    def root_disk(self) -> ComplexDisk | None:
+        """Return the authenticated disk, or ``None`` for a centre-only seed."""
+
+        if self.root_uncertainty_radius is None:
+            return None
+        return ComplexDisk(self.fixed_root, self.root_uncertainty_radius)
 
     def _content(self) -> dict[str, object]:
         return {
-            "schema": ROOT_EVIDENCE_SCHEMA,
+            "schema": self.root_evidence_schema,
             "root_dependency_key": self.root_dependency_key.to_mapping(),
             "root_dependency_key_sha256": self.root_dependency_key.sha256,
             "root_reference_id": self.root_reference_id,
@@ -331,6 +443,11 @@ class AuthenticatedRootEvidence:
             ),
             "root_correction_upper_bound": self.root_correction_upper_bound,
             "root_uncertainty_radius": self.root_uncertainty_radius,
+            **(
+                {"root_evidence_level": self.evidence_level}
+                if self.root_evidence_schema == ROOT_EVIDENCE_SCHEMA
+                else {}
+            ),
             "root_acceptance_policy_identity": self.root_acceptance_policy_identity,
             "backend_identity": self.backend_identity,
             "source_receipt_sha256": self.source_receipt_sha256,
@@ -341,7 +458,7 @@ class AuthenticatedRootEvidence:
 
     @classmethod
     def from_mapping(cls, value: object) -> "AuthenticatedRootEvidence":
-        fields = {
+        v3_fields = {
             "schema",
             "root_dependency_key",
             "root_dependency_key_sha256",
@@ -353,14 +470,23 @@ class AuthenticatedRootEvidence:
             "source_root_mapping",
             "root_correction_upper_bound",
             "root_uncertainty_radius",
+            "root_evidence_level",
             "root_acceptance_policy_identity",
             "backend_identity",
             "source_receipt_sha256",
             "root_seal_sha256",
         }
-        if not isinstance(value, Mapping) or set(value) != fields:
+        legacy_fields = v3_fields - {"root_evidence_level"}
+        if not isinstance(value, Mapping) or frozenset(value) not in {
+            frozenset(v3_fields), frozenset(legacy_fields)
+        }:
             raise ValueError("root evidence schema is invalid")
-        if value["schema"] != ROOT_EVIDENCE_SCHEMA:
+        schema = value["schema"]
+        if schema not in {ROOT_EVIDENCE_SCHEMA, _LEGACY_ROOT_EVIDENCE_SCHEMA}:
+            raise ValueError("root evidence schema is invalid")
+        if schema == ROOT_EVIDENCE_SCHEMA and set(value) != v3_fields:
+            raise ValueError("root evidence schema is invalid")
+        if schema == _LEGACY_ROOT_EVIDENCE_SCHEMA and set(value) != legacy_fields:
             raise ValueError("root evidence schema is invalid")
         raw_key = value["root_dependency_key"]
         key_fields = {
@@ -414,6 +540,11 @@ class AuthenticatedRootEvidence:
             backend_identity=str(value["backend_identity"]),
             source_receipt_sha256=str(value["source_receipt_sha256"]),
             root_seal_sha256=str(value["root_seal_sha256"]),
+            root_evidence_level=(
+                str(value["root_evidence_level"])
+                if schema == ROOT_EVIDENCE_SCHEMA else "SEED_ONLY"
+            ),
+            root_evidence_schema=str(schema),
         )
 
     def validate_for(self, leaf: object) -> None:

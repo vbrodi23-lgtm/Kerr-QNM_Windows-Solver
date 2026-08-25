@@ -71,7 +71,7 @@ from .response_engine import (
 )
 from .reviewed_determinant_error import ReviewedDeterminantErrorStore
 from .reviewed_determinant_error_issuance import (
-    seed_operator_approved_determinant_error_receipts,
+    retain_uncalibrated_determinant_error_evidence,
 )
 from .background_evidence_store import CanonicalBackgroundEvidenceStore
 from .julia_response_backend import (
@@ -1587,7 +1587,7 @@ def _run_promoted_exterior_queue_entry(
             raise ValueError("promoted fixed-root survey batch budget mismatch")
         sample_count += batch.sample_count
         if determinant_error_store is not None:
-            seed_operator_approved_determinant_error_receipts(
+            retain_uncalibrated_determinant_error_evidence(
                 determinant_error_store,
                 leaf.job,
                 batch,

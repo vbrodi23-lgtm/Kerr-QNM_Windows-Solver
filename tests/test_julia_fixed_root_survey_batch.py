@@ -63,26 +63,6 @@ def _conditioning(request) -> dict[str, object]:
     }
 
 
-def _determinant_error_evidence(request, index: int) -> dict[str, object]:
-    policy = request["policy"]
-    delta_same_point = 1.0e-20 * (index + 1)
-    delta_cross_precision = 2.0e-20 * (index + 1)
-    delta_endpoint_series = 0.5e-20 * (index + 1)
-    safety_factor = 64
-    numerical_error_abs = safety_factor * max(
-        delta_same_point, delta_cross_precision, delta_endpoint_series
-    )
-    return {
-        "schema": "windows-solver.exterior-determinant-error-evidence/1",
-        "error_model_id": policy["determinant_error_model"],
-        "delta_same_point": str(delta_same_point),
-        "delta_cross_precision": str(delta_cross_precision),
-        "delta_endpoint_series": str(delta_endpoint_series),
-        "safety_factor": str(safety_factor),
-        "numerical_error_abs": str(numerical_error_abs),
-    }
-
-
 class _BatchAdapter:
     runtime_provenance = {
         "julia_version": "1.10.11",
@@ -128,9 +108,7 @@ class _BatchAdapter:
                         "imaginary": str(-(index + 1)),
                     },
                     "numerical_conditioning": _conditioning(request),
-                    "determinant_error_evidence": (
-                        _determinant_error_evidence(request, index)
-                    ),
+                    "determinant_error_evidence": None,
                 }
                 for index, sample in enumerate(request["samples"])
             ],
@@ -194,12 +172,19 @@ class JuliaFixedRootSurveyBatchTests(unittest.TestCase):
         self.assertTrue(still_forbidden.isdisjoint(request["policy"]))
         self.assertEqual(
             request["policy"]["determinant_error_model"],
-            "exterior-determinant-absolute-error-certificate/empirical-v1",
+            "exterior-determinant-additive-channels/provisional-v1",
         )
-        self.assertEqual(request["policy"]["determinant_error_safety_factor"], 64)
         self.assertEqual(
-            request["policy"]["determinant_error_required_term_classes"],
-            ["delta_same_point", "delta_cross_precision", "delta_endpoint_series"],
+            request["policy"]["determinant_error_required_channels"],
+            [
+                "precision", "ode_controls", "endpoint_order",
+                "match_readout", "angular_data", "arithmetic_rounding",
+            ],
+        )
+        self.assertNotIn("determinant_error_safety_factor", request["policy"])
+        self.assertEqual(
+            request["policy"]["determinant_error_missing_evidence_outcome"],
+            "BLOCKED_BY_REVIEWED_ERROR_EVIDENCE",
         )
 
     def test_canonical_five_and_reused_mechanism_four_are_valid_plans(self):

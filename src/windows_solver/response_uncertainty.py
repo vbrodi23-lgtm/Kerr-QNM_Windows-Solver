@@ -125,9 +125,15 @@ def exterior_response_disk(
     )
 
 
-def horizon_response_disk(
+def legacy_v2_horizon_response_disk(
     *, horizon_frequency: ComplexDisk, determinant_derivative: ComplexDisk
 ) -> ComplexDisk:
+    """Evaluate the forensic v2 quotient without a horizon numerator.
+
+    This is deliberately not the v3 production response.  Kept only so
+    historical v2 evidence remains readable as forensic material, it must not
+    be used to construct a v3 horizon record.
+    """
     if horizon_frequency.contains_zero:
         raise ZeroContainingDiskError("horizon_frequency")
     if determinant_derivative.contains_zero:
@@ -152,4 +158,79 @@ def horizon_response_disk(
             and horizon_frequency.exact_zero_radius
             and determinant_derivative.exact_zero_radius
         ),
+    )
+
+
+def horizon_response_disk(
+    *,
+    horizon_numerator: ComplexDisk,
+    horizon_frequency: ComplexDisk,
+    determinant_derivative: ComplexDisk,
+) -> ComplexDisk:
+    """Return the approved v3 disk ``-D_H / (2 i p_H D_0,omega)``.
+
+    The product is formed as one complex-ball denominator and the numerator is
+    explicit.  This prevents a v2 unit-numerator quotient from being attached
+    to v3 uncertainty evidence.
+    """
+
+    if horizon_numerator.contains_zero and horizon_numerator.radius == 0.0:
+        # Exact zero is mathematically valid; ComplexDisk itself protects the
+        # provenance.  Keep this branch only to make the intentional behaviour
+        # explicit rather than treating numerator zero as a denominator error.
+        pass
+    if horizon_frequency.contains_zero:
+        raise ZeroContainingDiskError("horizon_frequency")
+    if determinant_derivative.contains_zero:
+        raise ZeroContainingDiskError("determinant_derivative")
+    exact_two_i = ComplexDisk(2.0j, 0.0, exact_zero_radius=True)
+    denominator = exact_two_i * horizon_frequency * determinant_derivative
+    if denominator.contains_zero:
+        raise ZeroContainingDiskError("analytic_horizon_denominator")
+    return (-horizon_numerator) / denominator
+
+
+def horizon_frequency_disk(
+    *,
+    root: ComplexDisk,
+    azimuthal_index: int,
+    background_omega_h: ComplexDisk,
+) -> ComplexDisk:
+    """Construct ``p_H = omega - m Omega_H`` with rounding included.
+
+    ``background_omega_h`` carries the exact-background transform's directed
+    rounding contribution (and any declared physical background uncertainty).
+    The final subtraction is rounded outward once more.
+    """
+
+    if isinstance(azimuthal_index, bool) or not isinstance(azimuthal_index, int):
+        raise ValueError("horizon azimuthal index is invalid")
+    centre = root.centre - azimuthal_index * background_omega_h.centre
+    rounding = math.ulp(centre.real) + math.ulp(centre.imag)
+    radius = (
+        root.radius
+        + abs(azimuthal_index) * background_omega_h.radius
+        + rounding
+    )
+    return ComplexDisk(centre, radius)
+
+
+@dataclass(frozen=True, slots=True)
+class HorizonChartBasePartials:
+    """Exact coordinate partials at the unperturbed ``deltaB = 0`` base."""
+
+    dR_ddeltaB: ComplexDisk
+    dR_domega_at_deltaB: complex
+
+
+def horizon_chart_base_partials(
+    horizon_frequency: ComplexDisk,
+) -> HorizonChartBasePartials:
+    """Return chart derivatives without introducing an invalid chain term."""
+
+    exact_one = ComplexDisk(1.0 + 0.0j, 0.0, exact_zero_radius=True)
+    exact_two_i = ComplexDisk(2.0j, 0.0, exact_zero_radius=True)
+    return HorizonChartBasePartials(
+        dR_ddeltaB=exact_one / (exact_two_i * horizon_frequency),
+        dR_domega_at_deltaB=0.0j,
     )

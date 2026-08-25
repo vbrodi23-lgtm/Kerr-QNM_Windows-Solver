@@ -29,9 +29,10 @@ WORKER = (
 
 EXTERIOR_CERTIFICATE_FIELDS = frozenset({
     "determinant_error_model",
-    "determinant_error_required_term_classes",
+    "determinant_error_channel_schema",
+    "determinant_error_required_channels",
+    "determinant_error_calibration_status",
     "determinant_error_missing_evidence_outcome",
-    "determinant_error_certificate_statement",
     "determinant_error_preceding_precision_tier",
 })
 
@@ -51,12 +52,12 @@ EXTERIOR_FLATTENED_POLICY_FIELDS = frozenset({
     "coordinate_ode_absolute_tolerance",
     "coordinate_ode_relative_tolerance",
     "determinant_convention",
-    "determinant_error_certificate_statement",
+    "determinant_error_calibration_status",
+    "determinant_error_channel_schema",
     "determinant_error_missing_evidence_outcome",
     "determinant_error_model",
     "determinant_error_preceding_precision_tier",
-    "determinant_error_required_term_classes",
-    "determinant_error_safety_factor",
+    "determinant_error_required_channels",
     "determinant_family",
     "determinant_normalisation",
     "endpoint_series_order",
@@ -98,7 +99,7 @@ EXTERIOR_FLATTENED_POLICY_FIELDS = frozenset({
 
 
 class PromotedExteriorRequestFlatteningTests(unittest.TestCase):
-    def test_leaf_42_request_preserves_receipt_safety_factor_json_type(self):
+    def test_leaf_42_request_uses_named_channels_and_calibration_gate(self):
         plan = build_campaign_plan(
             policy=NumericalPolicy(),
             backend_identity=frozen_pr58_native_backend_identity(),
@@ -130,18 +131,22 @@ class PromotedExteriorRequestFlatteningTests(unittest.TestCase):
         exterior_request = json.loads(
             canonical_json_bytes(exterior_backend._request(leaf_42.job, 0.0j))
         )
-        exterior_value = exterior_request["policy"][
-            "determinant_error_safety_factor"
-        ]
-
-        self.assertIs(type(exterior_value), int)
-        self.assertEqual(exterior_value, 64)
-        self.assertEqual(exterior_value, receipt.certificate_safety_factor)
+        exterior_policy = exterior_request["policy"]
+        self.assertNotIn("determinant_error_safety_factor", exterior_policy)
         self.assertEqual(
-            hashlib.sha256(
-                canonical_json_bytes(exterior_request)
-            ).hexdigest(),
-            "95934bdfb8cb9ccc070ba1a601b8c41a8cedecec7113b3228fc2d1c82ee11637",
+            exterior_policy["determinant_error_channel_schema"],
+            "exterior-determinant-additive-channels/provisional-v1",
+        )
+        self.assertEqual(
+            exterior_policy["determinant_error_required_channels"],
+            [
+                "precision", "ode_controls", "endpoint_order",
+                "match_readout", "angular_data", "arithmetic_rounding",
+            ],
+        )
+        self.assertEqual(
+            exterior_policy["determinant_error_calibration_status"],
+            "MISSING_AUTHENTICATED_CALIBRATION",
         )
 
         horizon_leaf = next(
@@ -184,7 +189,7 @@ class PromotedExteriorRequestFlatteningTests(unittest.TestCase):
                 {"shared": 64}, {"shared": "64"}
             )
 
-    def test_exterior_receipt_safety_factor_is_exactly_integer_64(self):
+    def test_exterior_request_does_not_consume_a_safety_factor_from_controls(self):
         plan = build_campaign_plan(
             policy=NumericalPolicy(),
             backend_identity=VettedNativeDeterminantKernel.identity,
@@ -198,30 +203,18 @@ class PromotedExteriorRequestFlatteningTests(unittest.TestCase):
         )
         receipt = load_default_calibration_receipt()
 
-        class ReceiptProxy:
-            def __init__(self, safety_factor):
-                self.certificate_safety_factor = safety_factor
-
-            def __getattr__(self, name):
-                return getattr(receipt, name)
-
-        for invalid in ("64", 64.0, True, 63):
-            with self.subTest(invalid=invalid):
-                forged = ReceiptProxy(invalid)
-                backend = JuliaPrecisionRootBackend(
-                    job.backend_identity,
-                    SimpleNamespace(runtime_provenance={}),
-                    80,
-                    empirical_control_profile=receipt.budget_for(
-                        "exterior-wronskian/v1", 80
-                    ),
-                    calibration_receipt=forged,
-                )
-                with self.assertRaisesRegex(
-                    ValueError,
-                    "exterior determinant certificate safety factor is invalid",
-                ):
-                    backend._request(job, 0.0j)
+        backend = JuliaPrecisionRootBackend(
+            job.backend_identity,
+            SimpleNamespace(runtime_provenance={}),
+            80,
+            empirical_control_profile=receipt.budget_for(
+                "exterior-wronskian/v1", 80
+            ),
+            calibration_receipt=receipt,
+        )
+        self.assertNotIn(
+            "determinant_error_safety_factor", backend._request(job, 0.0j)["policy"]
+        )
 
     def test_horizon_geometry_cannot_own_certificate_safety_factor(self):
         self.assertNotIn(
@@ -262,7 +255,7 @@ class PromotedExteriorRequestFlatteningTests(unittest.TestCase):
             @staticmethod
             def _obsolete(request):
                 value = deepcopy(request)
-                value["policy"]["determinant_error_safety_factor"] = "64"
+                value["policy"]["determinant_error_calibration_status"] = "FORGED"
                 return value
 
             def preview_root_request(self, *args, **kwargs):

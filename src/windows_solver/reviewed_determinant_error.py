@@ -1,11 +1,8 @@
-"""Authenticated, human-reviewed determinant-error evidence.
+"""Authenticated determinant-error evidence and the v3 exterior gate.
 
-This module is deliberately load-only at campaign runtime.  It authenticates
-externally issued per-sample absolute-error receipts; it never derives an error
-bound from conditioning telemetry, finite-difference agreement, ULPs, or
-predicted reliable digits.
-
-TODO: [HUMAN MATH REVIEW REQUIRED — no approved receipt establishes the horizon determinant normalisation, horizon numerator/sign and D_R uncertainty, root/p_H uncertainty, or exterior determinant-error construction; retain provisional exterior evidence and do not alter or admit these formulas.]
+The approved PR69 receipt authorises the named additive channel structure, but
+not numerical SCREENED safety factors.  Runtime therefore preserves channels
+and provisional work while refusing to manufacture a determinant-error disk.
 """
 
 from __future__ import annotations
@@ -45,6 +42,60 @@ class DeterminantErrorEvidenceStatus(str, Enum):
 
 class DeterminantErrorEvidenceCorruption(ValueError):
     """A receipt at its trusted content address did not authenticate."""
+
+
+EXTERIOR_DETERMINANT_ERROR_CHANNELS = (
+    "precision",
+    "ode_controls",
+    "endpoint_order",
+    "match_readout",
+    "angular_data",
+    "arithmetic_rounding",
+)
+BLOCKED_BY_REVIEWED_ERROR_EVIDENCE = "BLOCKED_BY_REVIEWED_ERROR_EVIDENCE"
+
+
+@dataclass(frozen=True, slots=True)
+class ExteriorDeterminantErrorChannels:
+    """Named absolute discrepancy channels for one exterior sample.
+
+    This structure intentionally carries no default multiplier.  It is useful
+    provisional evidence now and becomes a SCREENED disk only when a separate
+    authenticated calibration receipt supplies frozen channel factors.
+    """
+
+    precision: float
+    ode_controls: float
+    endpoint_order: float
+    match_readout: float
+    angular_data: float
+    arithmetic_rounding: float
+
+    def __post_init__(self) -> None:
+        for name in EXTERIOR_DETERMINANT_ERROR_CHANNELS:
+            value = float(getattr(self, name))
+            if not math.isfinite(value) or value < 0.0:
+                raise ValueError(f"exterior determinant-error {name} is invalid")
+            object.__setattr__(self, name, value)
+
+    @property
+    def unscaled_additive_radius(self) -> float:
+        return sum(getattr(self, name) for name in EXTERIOR_DETERMINANT_ERROR_CHANNELS)
+
+    def screening_status(self, *, calibration_receipt: Mapping[str, object] | None) -> str:
+        """Return the only honest runtime state without frozen factors."""
+
+        if calibration_receipt is None:
+            return BLOCKED_BY_REVIEWED_ERROR_EVIDENCE
+        raise ValueError(
+            "calibrated exterior safety-factor receipt parsing is not available"
+        )
+
+    def to_mapping(self) -> dict[str, object]:
+        return {
+            "schema": "windows-solver.exterior-determinant-error-channels/1",
+            **{name: getattr(self, name) for name in EXTERIOR_DETERMINANT_ERROR_CHANNELS},
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -338,8 +389,11 @@ class ReviewedDeterminantErrorStore:
 
 __all__ = [
     "AuthenticatedDeterminantErrorBundle",
+    "BLOCKED_BY_REVIEWED_ERROR_EVIDENCE",
     "DeterminantErrorEvidenceCorruption",
     "DeterminantErrorEvidenceStatus",
+    "EXTERIOR_DETERMINANT_ERROR_CHANNELS",
+    "ExteriorDeterminantErrorChannels",
     "ReviewedDeterminantErrorReceipt",
     "ReviewedDeterminantErrorStore",
 ]

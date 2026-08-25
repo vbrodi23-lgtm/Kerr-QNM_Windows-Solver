@@ -75,6 +75,7 @@ from .response_engine import (
     Binary64FixedRootBatch,
     Binary64FixedRootScreening,
     Binary64SurveyDisposition,
+    BINARY64_HORIZON_OPERATION_V3,
     ComponentStatus,
     ComponentResult,
     NativeDeterminantAdapter,
@@ -184,6 +185,23 @@ def build_schema11_horizon_record(
         ),
         "stages": [dict(stage) for stage in stages],
     }
+    terminal_stage = stages[-1] if stages else None
+    if (
+        isinstance(terminal_stage, Mapping)
+        and terminal_stage.get("operation_identity")
+        == "binary64-horizon-production/v3"
+    ):
+        payload = terminal_stage.get("component_result")
+        raw_result = payload.get("result") if isinstance(payload, Mapping) else None
+        evidence = (
+            raw_result.get("analytic_horizon_evidence")
+            if isinstance(raw_result, Mapping)
+            else None
+        )
+        mathematics = evidence.get("mathematics") if isinstance(evidence, Mapping) else None
+        if not isinstance(mathematics, Mapping):
+            raise ValueError("v3 horizon record lacks mathematical policy")
+        content["horizon_mathematics"] = dict(mathematics)
     record = {**content, "record_sha256": _sha256(content)}
     validate_schema11_horizon_record(plan, leaf, record)
     return record
@@ -1064,6 +1082,19 @@ class AuthenticatedRootSealProvider:
             root_seal_sha256=evidence.root_seal_sha256,
         )
 
+    def evidence_for(self, leaf: object) -> AuthenticatedRootEvidence:
+        """Return the durable root object consumed by the v3 horizon adapter."""
+
+        key = RootDependencyKey.from_leaf(leaf)
+        evidence = self._root_evidence_store.lookup(key)
+        if evidence is None:
+            self.lookup(leaf)
+            evidence = self._root_evidence_store.lookup(key)
+        if evidence is None:
+            raise ValueError("ROOT_SEAL_UNAVAILABLE")
+        evidence.validate_for(leaf)
+        return evidence
+
     def publish(self, leaf: object, seal: AuthenticatedRootSeal) -> None:
         """Make a newly authenticated PRIMARY root visible in the same pass."""
 
@@ -1091,16 +1122,18 @@ def _horizon_outcome(
     plan: object,
     backend: NativeCampaignStageBackend,
     leaf: object,
+    *,
+    root_evidence: AuthenticatedRootEvidence,
 ) -> Binary64PassOutcome:
     # Horizon work has its own fixed-root analytic boundary.  Calling the
     # generic stage runner here would silently reintroduce the finite-
     # amplitude epsilon ladder and its signed-root diagnostics.
-    outcome = backend.execute_horizon_stage(leaf)
+    outcome = backend.execute_horizon_stage(leaf, root_evidence=root_evidence)
     raw = outcome.component_result.get("result")
     result = ComponentResult.from_mapping(raw) if isinstance(raw, Mapping) else None
     if result is None:
         raise ValueError("SYSTEM_FAILURE binary64 horizon component result is missing")
-    operation_identity = "binary64-horizon-production/v2"
+    operation_identity = BINARY64_HORIZON_OPERATION_V3
     if result.response is not None and result.status.value == "CONVERGED":
         stage, stage_sha256 = build_schema11_horizon_stage(
             outcome,
@@ -1145,7 +1178,7 @@ def _horizon_outcome(
         failure_code=code,
         failure_class="HORIZON_COMPONENT",
         stage="binary64-horizon",
-        worker_operation="binary64-horizon-production/v2",
+        worker_operation=BINARY64_HORIZON_OPERATION_V3,
         request_schema="windows-solver.response-component-job/1",
         backend_identity=leaf.job.backend_identity.identity_sha256,
         policy_identity=leaf.job.policy.identity_sha256,
@@ -1396,7 +1429,12 @@ def run_native_binary64_pass(
         checkpoint_path=checkpoint_path,
         root_seal_lookup=lambda leaf: root_provider().lookup(leaf),
         native_backend_factory=lambda: backend().adapter.kernel,
-        horizon_runner=lambda leaf: _horizon_outcome(plan, backend(), leaf),
+        horizon_runner=lambda leaf: _horizon_outcome(
+            plan,
+            backend(),
+            leaf,
+            root_evidence=root_provider().evidence_for(leaf),
+        ),
         produced_record_builder=build,
         provisional_stage_committed=publish_provisional_stage,
         equivalence_receipt_lookup=equivalence_lookup,
