@@ -20,7 +20,7 @@ from .campaign_policy import (
     validate_schema11_checkpoint,
 )
 from .contracts import canonical_json_bytes
-from .response_batches import CampaignLeafRecord
+from .response_batches import CampaignLeafRecord, horizon_record_scientific_status
 from .response_engine import _validated_worker_response_receipt
 from .root_readout_cache import RootReadoutStore
 
@@ -28,6 +28,8 @@ from .root_readout_cache import RootReadoutStore
 RECOVERY_RECEIPT_SCHEMA = "windows-solver.campaign-recovery/v1"
 ROOT_READOUT_RECOVERY_INDEX_SCHEMA = "windows-solver.root-readout-recovery-index/v1"
 LEGACY_COMPATIBILITY_SCHEMA = "legacy-compatibility/v1"
+SCIENTIFIC_COMPATIBILITY_SCHEMA = "scientific-compatibility/v1"
+V2_STALE_HORIZON_REASON = "HORIZON_RESPONSE_V2_SCIENTIFICALLY_STALE"
 _HEX_64 = re.compile(r"[0-9a-f]{64}")
 _SOLVED_RECEIPT_FIELDS = {
     "schema_version",
@@ -450,6 +452,59 @@ def _legacy_compatibility_receipt(
     return {**content, "receipt_sha256": _sha256(content)}
 
 
+def _stale_horizon_v2_receipt(
+    *,
+    path: Path,
+    source_sha256: str,
+    checkpoint: Mapping[str, object],
+    record: Mapping[str, object],
+    selection: RecoverySelection,
+    source_evidence: Mapping[str, object] | None,
+) -> dict[str, object]:
+    """Bind an authenticated v2 horizon record as forensic-only input.
+
+    The source checkpoint remains untouched. Its terminal record and attached
+    evidence are deliberately excluded from current schema-11 numerical and
+    evidence ledgers because their response identity is stale under PR69 v3.
+    """
+
+    leaf_id = record["leaf_id"]
+    assert isinstance(leaf_id, str)
+    stages = record["stages"]
+    assert isinstance(stages, list)
+    operations = sorted(
+        {
+            str(stage["operation_identity"])
+            for stage in stages
+            if isinstance(stage, Mapping)
+            and isinstance(stage.get("operation_identity"), str)
+        }
+    )
+    content: dict[str, object] = {
+        "schema": SCIENTIFIC_COMPATIBILITY_SCHEMA,
+        "source_checkpoint_schema_version": 11,
+        "source_path": str(path),
+        "source_sha256": source_sha256,
+        "source_campaign_id": checkpoint["campaign_id"],
+        "source_selection_id": checkpoint["selection_id"],
+        "leaf_id": leaf_id,
+        "source_record_sha256": record["record_sha256"],
+        "source_stage_sha256s": [stage["stage_sha256"] for stage in stages],
+        "source_operation_identities": operations,
+        "current_scientific_identity_sha256": selection.scientific_identities[
+            leaf_id
+        ],
+        "original_record_status": "AUTHENTICATED",
+        "source_evidence_was_present": source_evidence is not None,
+        "imported_as_current_numerical_record": False,
+        "imported_as_current_evidence": False,
+        "forensic_record_status": "RETAINED_IN_SOURCE_ONLY",
+        "operational_queue_disposition": "REBUILT_FROM_CURRENT_SELECTION",
+        "reason": V2_STALE_HORIZON_REASON,
+    }
+    return {**content, "receipt_sha256": _sha256(content)}
+
+
 def _schema9_source_candidates(
     *,
     path: Path,
@@ -783,6 +838,7 @@ def recover_campaign(
     source_artifacts: list[dict[str, object]] = []
     root_readout_indices: list[dict[str, object]] = []
     legacy_compatibility_receipts: list[dict[str, object]] = []
+    scientific_compatibility_receipts: list[dict[str, object]] = []
     legacy_authenticated_terminal_count = 0
     legacy_imported_count = 0
     legacy_rejected_count = 0
@@ -863,8 +919,27 @@ def recover_campaign(
                 record = _validated_record(
                     raw_record,
                     expected_role=selection.roles[leaf_id],
-                    record_validator=record_validator,
+                    record_validator=None,
                 )
+                if horizon_record_scientific_status(record) == "FORENSIC_V2_STALE":
+                    scientific_compatibility_receipts.append(
+                        _stale_horizon_v2_receipt(
+                            path=path,
+                            source_sha256=source_sha,
+                            checkpoint=checkpoint,
+                            record=record,
+                            selection=selection,
+                            source_evidence=evidence_ledger.get(leaf_id),
+                        )
+                    )
+                    ignored.append({
+                        "path": str(path),
+                        "leaf_id": leaf_id,
+                        "reason": V2_STALE_HORIZON_REASON,
+                    })
+                    continue
+                if record_validator is not None:
+                    record_validator(leaf_id, record)
             except ValueError as error:
                 raise ValueError(
                     f"explicit source checkpoint is corrupt: {path}: {error}"
@@ -1003,6 +1078,7 @@ def recover_campaign(
     )
     candidate_checkpoint["recovery_receipts"].extend(root_readout_indices)
     candidate_checkpoint["recovery_receipts"].extend(legacy_compatibility_receipts)
+    candidate_checkpoint["recovery_receipts"].extend(scientific_compatibility_receipts)
     accepted_receipts: list[dict[str, object]] = []
     for leaf_id in selection.ordered_leaf_ids:
         leaf_candidates = candidates.get(leaf_id, [])
