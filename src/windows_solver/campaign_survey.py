@@ -812,18 +812,60 @@ def run_binary64_survey(
                         )
                     )
                 assert isinstance(cache_record, Mapping)
-                if record_validator is not None:
-                    guarded(lambda: record_validator(leaf_id, cache_record))
-                if retained is not None and dict(retained) != dict(cache_record):
-                    guarded(
-                        lambda: (_ for _ in ()).throw(TerminalCacheConflictError())
-                    )
-                if retained is None:
-                    retained = cache_record
-                    result = guarded(lambda: add_numerical_record(result, retained))
-                    assert isinstance(result, dict)
-                    existing_records[leaf_id] = retained
-                    cache_reused_from_store += 1
+                # Legacy binary64-horizon-production/v2 records are
+                # readable but not admissible as current science under
+                # PR69's horizon rewrite. On a cache hit for such a
+                # forensic record, quarantine the store entry so future
+                # runs stop re-encountering it and fall through as a
+                # cache MISS so fresh computation produces a current-v3
+                # record. Non-legacy hits still authenticate through the
+                # strict recovery validator.
+                from .response_batches import (  # local import: avoid a module-level cycle
+                    horizon_record_scientific_status,
+                )
+
+                forensic_legacy_horizon_hit = (
+                    horizon_record_scientific_status(cache_record)
+                    == "FORENSIC_V2_STALE"
+                )
+                if forensic_legacy_horizon_hit:
+                    if (
+                        cache_lookup.path is not None
+                        and solved_leaf_store is not None
+                    ):
+                        try:
+                            solved_leaf_store.quarantine(
+                                cache_lookup.path,
+                                "legacy binary64-horizon-production/v2 "
+                                "record is forensic-only",
+                            )
+                        except Exception:
+                            # Best-effort quarantine — do not abort the
+                            # campaign if the store cannot move the file
+                            # aside; the campaign proceeds with fresh
+                            # computation for this leaf either way.
+                            pass
+                    cache_record = None
+                else:
+                    if record_validator is not None:
+                        guarded(lambda: record_validator(leaf_id, cache_record))
+                    if (
+                        retained is not None
+                        and dict(retained) != dict(cache_record)
+                    ):
+                        guarded(
+                            lambda: (_ for _ in ()).throw(
+                                TerminalCacheConflictError()
+                            )
+                        )
+                    if retained is None:
+                        retained = cache_record
+                        result = guarded(
+                            lambda: add_numerical_record(result, retained)
+                        )
+                        assert isinstance(result, dict)
+                        existing_records[leaf_id] = retained
+                        cache_reused_from_store += 1
         if checkpoint_discovery is not None:
             terminal_cache_discovery = terminal_cache_discovery.add(
                 checkpoint_discovery.with_reused(1)
@@ -2265,18 +2307,60 @@ def run_promoted_survey(
                         )
                     )
                 assert isinstance(cache_record, Mapping)
-                if record_validator is not None:
-                    guarded(lambda: record_validator(leaf_id, cache_record))
-                if retained is not None and dict(retained) != dict(cache_record):
-                    guarded(
-                        lambda: (_ for _ in ()).throw(TerminalCacheConflictError())
-                    )
-                if retained is None:
-                    retained = cache_record
-                    result = guarded(lambda: add_numerical_record(result, retained))
-                    assert isinstance(result, dict)
-                    existing_records[leaf_id] = retained
-                    cache_reused_from_store += 1
+                # Legacy binary64-horizon-production/v2 records are
+                # readable but not admissible as current science under
+                # PR69's horizon rewrite. On a cache hit for such a
+                # forensic record, quarantine the store entry so future
+                # runs stop re-encountering it and fall through as a
+                # cache MISS so fresh computation produces a current-v3
+                # record. Non-legacy hits still authenticate through the
+                # strict recovery validator.
+                from .response_batches import (  # local import: avoid a module-level cycle
+                    horizon_record_scientific_status,
+                )
+
+                forensic_legacy_horizon_hit = (
+                    horizon_record_scientific_status(cache_record)
+                    == "FORENSIC_V2_STALE"
+                )
+                if forensic_legacy_horizon_hit:
+                    if (
+                        cache_lookup.path is not None
+                        and solved_leaf_store is not None
+                    ):
+                        try:
+                            solved_leaf_store.quarantine(
+                                cache_lookup.path,
+                                "legacy binary64-horizon-production/v2 "
+                                "record is forensic-only",
+                            )
+                        except Exception:
+                            # Best-effort quarantine — do not abort the
+                            # campaign if the store cannot move the file
+                            # aside; the campaign proceeds with fresh
+                            # computation for this leaf either way.
+                            pass
+                    cache_record = None
+                else:
+                    if record_validator is not None:
+                        guarded(lambda: record_validator(leaf_id, cache_record))
+                    if (
+                        retained is not None
+                        and dict(retained) != dict(cache_record)
+                    ):
+                        guarded(
+                            lambda: (_ for _ in ()).throw(
+                                TerminalCacheConflictError()
+                            )
+                        )
+                    if retained is None:
+                        retained = cache_record
+                        result = guarded(
+                            lambda: add_numerical_record(result, retained)
+                        )
+                        assert isinstance(result, dict)
+                        existing_records[leaf_id] = retained
+                        cache_reused_from_store += 1
         if checkpoint_discovery is not None:
             terminal_cache_discovery = terminal_cache_discovery.add(
                 checkpoint_discovery.with_reused(1)
