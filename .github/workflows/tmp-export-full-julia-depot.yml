@@ -1,0 +1,48 @@
+name: Temporary export full Julia depot
+
+on:
+  push:
+    branches:
+      - tmp/export-full-julia-depot
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: julia-actions/setup-julia@v2
+        with:
+          version: '1.10.11'
+          arch: x64
+      - name: Instantiate exact pinned M02 environment
+        shell: bash
+        run: |
+          set -euxo pipefail
+          STAGE="$RUNNER_TEMP/m02-export"
+          DEPOT="$RUNNER_TEMP/m02-depot"
+          SRC="$GITHUB_WORKSPACE/src/windows_solver/data/julia"
+          mkdir -p "$STAGE/project" "$STAGE/vendor" "$DEPOT"
+          cp "$SRC/m02_project/Project.toml" "$STAGE/project/Project.toml"
+          cp "$SRC/m02_project/Manifest.seed.toml" "$STAGE/project/Manifest.toml"
+          cp -a "$SRC/GeneralizedSasakiNakamura.jl" "$STAGE/vendor/GeneralizedSasakiNakamura.jl"
+          cp -a "$SRC/SpinWeightedSpheroidalHarmonics.jl" "$STAGE/vendor/SpinWeightedSpheroidalHarmonics.jl"
+          export JULIA_DEPOT_PATH="$DEPOT"
+          export JULIA_PKG_PRECOMPILE_AUTO=0
+          julia --project="$STAGE/project" -e 'using Pkg; Pkg.Registry.add("General"); Pkg.instantiate()'
+          rm -rf "$DEPOT/compiled" "$DEPOT/logs" "$DEPOT/scratchspaces"
+          du -sh "$DEPOT"
+          tar -C "$DEPOT" -czf "$RUNNER_TEMP/m02-full-julia-depot-linux-x86_64.tar.gz" packages artifacts registries
+          sha256sum "$RUNNER_TEMP/m02-full-julia-depot-linux-x86_64.tar.gz" > "$RUNNER_TEMP/m02-full-julia-depot-linux-x86_64.tar.gz.sha256"
+          stat -c 'compressed_bytes=%s' "$RUNNER_TEMP/m02-full-julia-depot-linux-x86_64.tar.gz"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: m02-full-julia-depot-linux-x86_64
+          path: |
+            ${{ runner.temp }}/m02-full-julia-depot-linux-x86_64.tar.gz
+            ${{ runner.temp }}/m02-full-julia-depot-linux-x86_64.tar.gz.sha256
+          compression-level: 0
+          retention-days: 1
