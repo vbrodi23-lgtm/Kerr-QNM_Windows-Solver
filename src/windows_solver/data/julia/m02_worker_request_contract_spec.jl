@@ -15,6 +15,7 @@ Set(keys(fixture)) == Set((
     "operation",
     "requests",
     "invalid_exterior_cases",
+    "empirical_safety_factor_invalid_cases",
     "golden_contracts",
 )) || error("Python request-contract fixture fields are invalid")
 fixture["schema_version"] == 1 ||
@@ -23,6 +24,8 @@ fixture["operation"] == "promoted-request-contract-fixture" ||
     error("Python request-contract fixture operation is invalid")
 requests = fixture["requests"]
 invalid_exterior_cases = fixture["invalid_exterior_cases"]
+empirical_safety_factor_invalid_cases =
+    fixture["empirical_safety_factor_invalid_cases"]
 golden_contracts = fixture["golden_contracts"]
 
 # Field taxonomy shared by both exterior diagnostic models. COMMON fields
@@ -170,7 +173,11 @@ end
     end
 end
 
-@testset "exterior safety-factor type and value fail closed" begin
+@testset "provisional exterior policy forbids empirical safety-factor field" begin
+    # These cases inject determinant_error_safety_factor into a
+    # PROVISIONAL exterior policy. The raw-determinant contract must
+    # reject it as a disjointness violation regardless of the JSON
+    # value's type — the mode boundary itself is under test.
     @test [case["label"] for case in invalid_exterior_cases] == [
         "string",
         "floating-point",
@@ -179,6 +186,26 @@ end
         "null",
     ]
     for case in invalid_exterior_cases
+        _, failure = flatten_validation_result(case["document"])
+        @test failure !== nothing
+        @test occursin("determinant_error_safety_factor", failure)
+    end
+end
+
+@testset "empirical exterior safety-factor JSON type and value fail closed" begin
+    # These cases start from the EMPIRICAL golden request and mutate
+    # only its determinant_error_safety_factor. The empirical validator
+    # requires an exact integer 64; every alternative type and every
+    # wrong integer value must fail closed with the field named in the
+    # failure message.
+    @test [case["label"] for case in empirical_safety_factor_invalid_cases] == [
+        "string",
+        "floating-point",
+        "boolean",
+        "wrong-integer",
+        "null",
+    ]
+    for case in empirical_safety_factor_invalid_cases
         _, failure = flatten_validation_result(case["document"])
         @test failure !== nothing
         @test occursin("determinant_error_safety_factor", failure)

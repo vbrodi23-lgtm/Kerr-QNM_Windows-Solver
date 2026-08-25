@@ -43,9 +43,9 @@ from .response_engine import (
     NumericalPolicy,
     HISTORICAL_PROMOTED_ROOT_READOUT_POLICY,
     BOUNDED_ANALYTIC_RESPONSE,
-    BINARY64_HORIZON_COMPONENT_V2,
+    BINARY64_HORIZON_COMPONENT,
     BINARY64_HORIZON_OPERATION_V3,
-    BINARY64_HORIZON_RESPONSE_METHOD_V2,
+    BINARY64_HORIZON_RESPONSE_METHOD,
     BOUNDED_DERIVATIVE_RESPONSE,
     EXTERIOR_SUPPORT_POLICY_ID,
     EXTERIOR_DERIVATIVE_COMPONENT_IDENTITY,
@@ -55,12 +55,12 @@ from .response_engine import (
     FIXED_ROOT_DERIVATIVE_CONDITIONING_IDENTITY,
     FULL_COMPLEX_LADDER_VALIDATION_IDENTITY,
     PROMOTED_HORIZON_COMPONENT_IDENTITY,
-    PROMOTED_HORIZON_COMPONENT_V2_IDENTITY,
+    PROMOTED_HORIZON_BOUNDED_COMPONENT_IDENTITY,
     PROMOTED_HORIZON_COMPONENT_V3_IDENTITY,
     PROMOTED_HORIZON_FAILURE_COMPONENT_IDENTITY,
     PROMOTED_HORIZON_FAILURE_RESPONSE_METHOD,
     PROMOTED_HORIZON_RESPONSE_METHOD,
-    PROMOTED_HORIZON_RESPONSE_METHOD_V2,
+    PROMOTED_HORIZON_BOUNDED_RESPONSE_METHOD,
     PROMOTED_HORIZON_RESPONSE_METHOD_V3,
     PromotedRootSeal,
     ROOT_SEALED_RESPONSE_REPAIR_IDENTITY,
@@ -230,7 +230,13 @@ _EXECUTION_ROLE_ORDER = {
     "deep": 1,
     "control": 2,
 }
-_LEGACY_MIGRATION_LOCK_TIMEOUT_SECONDS = 1.0
+# The migration wait must survive normal hosted-CI thread scheduling on
+# Windows while still bounding the wait so a genuinely dead writer fails
+# closed rather than blocking recovery indefinitely. Real solved-leaf
+# publishes take milliseconds; only a truly-stuck writer would exceed a
+# 30-second budget, which comfortably covers CI jitter and the test
+# harness's own 5-second coordination events.
+_LEGACY_MIGRATION_LOCK_TIMEOUT_SECONDS = 30.0
 _LEGACY_MIGRATION_LOCK_RETRY_SECONDS = 0.01
 _BINARY64_ROOT_CORRECTION_TOLERANCE_ABS = 2.0e-11
 _ACTIVE_CAMPAIGN_LEAF_CONTEXT: ContextVar[Mapping[str, object] | None] = ContextVar(
@@ -2181,7 +2187,7 @@ def _failed_preflight_recovery_precision_contract() -> dict[str, object]:
         **_multi_readout_failed_preflight_recovery_precision_contract(),
         "primary_horizon_override": {
             "component_scientific_identity": (
-                PROMOTED_HORIZON_COMPONENT_V2_IDENTITY
+                PROMOTED_HORIZON_BOUNDED_COMPONENT_IDENTITY
             ),
             "base_refinement_levels": [0],
             "amplitude_readout_count": 1,
@@ -2218,9 +2224,9 @@ def _primary_recovery_precision_contract() -> dict[str, object]:
         "promoted_numerical_controls": promoted_precision_numerical_controls(),
         "promoted_horizon_component": {
             "component_scientific_identity": (
-                PROMOTED_HORIZON_COMPONENT_V2_IDENTITY
+                PROMOTED_HORIZON_BOUNDED_COMPONENT_IDENTITY
             ),
-            "response_method": PROMOTED_HORIZON_RESPONSE_METHOD_V2,
+            "response_method": PROMOTED_HORIZON_BOUNDED_RESPONSE_METHOD,
             "amplitude_readout_count": 1,
             "amplitudes": [
                 {"real": 0.0, "imaginary": 0.0},
@@ -2394,10 +2400,10 @@ def _response_uncertainty_contract() -> dict[str, object]:
         "version": 5,
         "promoted_root_readout_policy": PROMOTED_ROOT_READOUT_POLICY,
         "promoted_primary_horizon_component_identity": (
-            PROMOTED_HORIZON_COMPONENT_V2_IDENTITY
+            PROMOTED_HORIZON_BOUNDED_COMPONENT_IDENTITY
         ),
         "promoted_primary_horizon_response_method": (
-            PROMOTED_HORIZON_RESPONSE_METHOD_V2
+            PROMOTED_HORIZON_BOUNDED_RESPONSE_METHOD
         ),
         "promoted_primary_horizon_finite_amplitude_ladder": (
             "not-required-not-executed"
@@ -3779,7 +3785,7 @@ def _single_promoted_horizon_result(
     result = ComponentResult.from_mapping(raw_result)
     if result.component_scientific_identity not in {
         PROMOTED_HORIZON_COMPONENT_IDENTITY,
-        PROMOTED_HORIZON_COMPONENT_V2_IDENTITY,
+        PROMOTED_HORIZON_BOUNDED_COMPONENT_IDENTITY,
         PROMOTED_HORIZON_COMPONENT_V3_IDENTITY,
         PROMOTED_HORIZON_FAILURE_COMPONENT_IDENTITY,
     }:
@@ -3853,7 +3859,7 @@ def _claims_specialized_promoted_semantics(result: ComponentResult) -> bool:
         or result.response_method in {
             EXTERIOR_DERIVATIVE_METHOD,
             PROMOTED_HORIZON_RESPONSE_METHOD,
-            PROMOTED_HORIZON_RESPONSE_METHOD_V2,
+            PROMOTED_HORIZON_BOUNDED_RESPONSE_METHOD,
             PROMOTED_HORIZON_RESPONSE_METHOD_V3,
         }
         or result.response_uncertainty_status in {
@@ -3908,7 +3914,7 @@ def _classify_promoted_stage(
 
     analytic_identity = identity in {
         PROMOTED_HORIZON_COMPONENT_IDENTITY,
-        PROMOTED_HORIZON_COMPONENT_V2_IDENTITY,
+        PROMOTED_HORIZON_BOUNDED_COMPONENT_IDENTITY,
         PROMOTED_HORIZON_COMPONENT_V3_IDENTITY,
         PROMOTED_HORIZON_FAILURE_COMPONENT_IDENTITY,
     }
@@ -5691,7 +5697,7 @@ def _validate_current_promoted_runtime(
         classified_kind is _PromotedStageKind.ANALYTIC_HORIZON
         or result.component_scientific_identity in {
             PROMOTED_HORIZON_COMPONENT_IDENTITY,
-            PROMOTED_HORIZON_COMPONENT_V2_IDENTITY,
+            PROMOTED_HORIZON_BOUNDED_COMPONENT_IDENTITY,
             PROMOTED_HORIZON_COMPONENT_V3_IDENTITY,
         }
         or (
@@ -6237,7 +6243,7 @@ def _validate_component_result(
         or result.component_scientific_identity
         in {
             PROMOTED_HORIZON_COMPONENT_IDENTITY,
-            PROMOTED_HORIZON_COMPONENT_V2_IDENTITY,
+            PROMOTED_HORIZON_BOUNDED_COMPONENT_IDENTITY,
             PROMOTED_HORIZON_COMPONENT_V3_IDENTITY,
             PROMOTED_HORIZON_FAILURE_COMPONENT_IDENTITY,
             EXTERIOR_DERIVATIVE_COMPONENT_IDENTITY,
@@ -6252,7 +6258,7 @@ def _validate_component_result(
         PROMOTED_HORIZON_COMPONENT_IDENTITY
     )
     bounded_horizon = result.component_scientific_identity in {
-        PROMOTED_HORIZON_COMPONENT_V2_IDENTITY,
+        PROMOTED_HORIZON_BOUNDED_COMPONENT_IDENTITY,
         PROMOTED_HORIZON_COMPONENT_V3_IDENTITY,
     }
     typed_horizon_failure = result.component_scientific_identity == (
@@ -6303,7 +6309,7 @@ def _validate_component_result(
         and leaf.mechanism_id == "horizon-admittance"
         and outcome.digits in (80, 120)
         and result.response_method in {
-            PROMOTED_HORIZON_RESPONSE_METHOD_V2,
+            PROMOTED_HORIZON_BOUNDED_RESPONSE_METHOD,
             PROMOTED_HORIZON_RESPONSE_METHOD_V3,
         }
         and result.response_uncertainty_status
@@ -8312,7 +8318,7 @@ def validate_campaign_recovery_record(
 
 
 def horizon_record_scientific_status(value: Mapping[str, object]) -> str:
-    """Classify v2 horizon records as forensic data before recovery consumes it."""
+    """Classify legacy horizon records as forensic data before recovery consumes it."""
 
     stages = value.get("stages")
     if not isinstance(stages, list):
@@ -8379,15 +8385,15 @@ def _validate_v3_horizon_component_evidence(
         "worker_launch_count", "nonzero_amplitude_readout_count",
         "fast_path_runtime_contract",
     }
-    if set(evidence) != required or evidence["identity"] != BINARY64_HORIZON_RESPONSE_METHOD_V2:
+    if set(evidence) != required or evidence["identity"] != BINARY64_HORIZON_RESPONSE_METHOD:
         raise ValueError("v3 horizon evidence identity is invalid")
     mathematics = evidence["mathematics"]
     expected_mathematics = {
         "math_decision_identity": M02_HORIZON_EXTERIOR_RESPONSE_MATH_IDENTITY,
         "determinant_convention_identity": FINITE_RADIUS_ENDPOINT_WEDGE_DETERMINANT_CONVENTION,
         "operation_identity": BINARY64_HORIZON_OPERATION_V3,
-        "response_method_identity": BINARY64_HORIZON_RESPONSE_METHOD_V2,
-        "component_identity": BINARY64_HORIZON_COMPONENT_V2,
+        "response_method_identity": BINARY64_HORIZON_RESPONSE_METHOD,
+        "component_identity": BINARY64_HORIZON_COMPONENT,
         "human_math_review_receipt_sha256": PR69_COMMIT9_HUMAN_MATH_REVIEW_SHA256,
         "branch_identity": leaf.job.root.branch_id,
         "equation_id": leaf.job.equation_id,
@@ -8564,8 +8570,8 @@ def _validate_schema11_horizon_stage(
     if precision_tier == "binary64":
         if stage["operation_identity"] == BINARY64_HORIZON_OPERATION_V3:
             if (
-                result.component_scientific_identity != BINARY64_HORIZON_COMPONENT_V2
-                or result.response_method != BINARY64_HORIZON_RESPONSE_METHOD_V2
+                result.component_scientific_identity != BINARY64_HORIZON_COMPONENT
+                or result.response_method != BINARY64_HORIZON_RESPONSE_METHOD
                 or payload.get("evidence_kind")
                 != "package-owned-binary64-horizon-analytic-component"
             ):
@@ -8587,8 +8593,8 @@ def _validate_schema11_horizon_stage(
     else:
         promoted_methods = dict((
             (
-                PROMOTED_HORIZON_COMPONENT_V2_IDENTITY,
-                PROMOTED_HORIZON_RESPONSE_METHOD_V2,
+                PROMOTED_HORIZON_BOUNDED_COMPONENT_IDENTITY,
+                PROMOTED_HORIZON_BOUNDED_RESPONSE_METHOD,
             ),
             (
                 PROMOTED_HORIZON_COMPONENT_V3_IDENTITY,
@@ -12725,9 +12731,9 @@ class NativeCampaignStageBackend:
                 "source_root_mapping": None,
             },
             component_scientific_identity=(
-                BINARY64_HORIZON_COMPONENT_V2
+                BINARY64_HORIZON_COMPONENT
             ),
-            response_method=BINARY64_HORIZON_RESPONSE_METHOD_V2,
+            response_method=BINARY64_HORIZON_RESPONSE_METHOD,
             finite_amplitude_ladder_required=False,
             finite_amplitude_ladder_executed=False,
             finite_amplitude_readout_count=0,
@@ -12741,15 +12747,15 @@ class NativeCampaignStageBackend:
                 for name in ERROR_CHANNELS
             },
             analytic_horizon_evidence={
-                "identity": BINARY64_HORIZON_RESPONSE_METHOD_V2,
+                "identity": BINARY64_HORIZON_RESPONSE_METHOD,
                 "mathematics": {
                     "math_decision_identity": M02_HORIZON_EXTERIOR_RESPONSE_MATH_IDENTITY,
                     "determinant_convention_identity": (
                         FINITE_RADIUS_ENDPOINT_WEDGE_DETERMINANT_CONVENTION
                     ),
                     "operation_identity": BINARY64_HORIZON_OPERATION_V3,
-                    "response_method_identity": BINARY64_HORIZON_RESPONSE_METHOD_V2,
-                    "component_identity": BINARY64_HORIZON_COMPONENT_V2,
+                    "response_method_identity": BINARY64_HORIZON_RESPONSE_METHOD,
+                    "component_identity": BINARY64_HORIZON_COMPONENT,
                     "human_math_review_receipt_sha256": (
                         PR69_COMMIT9_HUMAN_MATH_REVIEW_SHA256
                     ),

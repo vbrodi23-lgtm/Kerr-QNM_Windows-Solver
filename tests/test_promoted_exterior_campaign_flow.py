@@ -20,6 +20,7 @@ from tests.test_solved_leaf_cache import _production_outcome
 from windows_solver.contracts import canonical_json_bytes
 from windows_solver.gsn_cache_producer import GeneratedGsnCache, GsnParameterPair
 from windows_solver.julia_response_backend import (
+    EXTERIOR_DETERMINANT_ABSOLUTE_ERROR_CERTIFICATE,
     JuliaNumericalControlError,
     JuliaPrecisionRootBackend,
 )
@@ -428,7 +429,23 @@ class PromotedExteriorCampaignFlowCanary(unittest.TestCase):
         )
 
     @staticmethod
-    def _empirical_failed_preflight_error(leaf, *, digits: int = 80):
+    def _failed_preflight_error(
+        leaf,
+        *,
+        digits: int = 80,
+        diagnostic_model_identity: str | None = None,
+    ):
+        """Build a synthetic failed-preflight error at the given diagnostic mode.
+
+        An empirical operational control profile is NOT an evidence-mode
+        selector — the diagnostic model identity is. When
+        ``diagnostic_model_identity`` is left ``None`` the request selects
+        the default exterior provisional additive-channels contract.
+        Passing ``EXTERIOR_DETERMINANT_ABSOLUTE_ERROR_CERTIFICATE`` builds
+        an empirical-mode request whose policy carries the empirical
+        certificate fields and receipt-bound calibration hashes.
+        """
+
         predecessor = _failed_preflight_attempt(leaf)
         failure = JuliaNumericalControlError(
             "synthetic INSUFFICIENT_ASYMPTOTIC_PRECISION",
@@ -446,6 +463,7 @@ class PromotedExteriorCampaignFlowCanary(unittest.TestCase):
                 "exterior-wronskian/v1", digits
             ),
             calibration_receipt=calibration,
+            diagnostic_model_identity=diagnostic_model_identity,
         )._request(leaf.job, 0.0j, leaf.job.root.omega)
         failure_payload = receipt["failure"]
         failure_payload.pop("promotion_decision", None)
@@ -466,6 +484,31 @@ class PromotedExteriorCampaignFlowCanary(unittest.TestCase):
         })
         failure.worker_failure = receipt
         return failure
+
+    @classmethod
+    def _provisional_failed_preflight_error(cls, leaf, *, digits: int = 80):
+        """Default-provisional failed-preflight error (exterior default mode)."""
+
+        return cls._failed_preflight_error(leaf, digits=digits)
+
+    @classmethod
+    def _empirical_certificate_failed_preflight_error(
+        cls, leaf, *, digits: int = 80
+    ):
+        """Explicit-empirical failed-preflight error, for empirical lifecycle regressions."""
+
+        return cls._failed_preflight_error(
+            leaf,
+            digits=digits,
+            diagnostic_model_identity=(
+                EXTERIOR_DETERMINANT_ABSOLUTE_ERROR_CERTIFICATE
+            ),
+        )
+
+    # Back-compat alias for callers written before the mode split. New
+    # callers pick _provisional_failed_preflight_error or
+    # _empirical_certificate_failed_preflight_error explicitly.
+    _empirical_failed_preflight_error = _provisional_failed_preflight_error
 
     def test_leaf42_native_80_stage_uses_explicit_na_response_comparison(self):
         """Catches a root-frequency delta relabelled as response discrepancy."""
@@ -1023,7 +1066,7 @@ class PromotedExteriorCampaignFlowCanary(unittest.TestCase):
             self.leaf.job,
             baseline120,
             120,
-            self._empirical_failed_preflight_error(self.leaf, digits=120),
+            self._provisional_failed_preflight_error(self.leaf, digits=120),
         )
         workers = {80: worker80, 120: worker120}
         with patch(
@@ -1064,7 +1107,7 @@ class PromotedExteriorCampaignFlowCanary(unittest.TestCase):
             self.leaf.job,
             baseline120,
             120,
-            self._empirical_failed_preflight_error(self.leaf, digits=120),
+            self._provisional_failed_preflight_error(self.leaf, digits=120),
         )
         with patch(
             "windows_solver.response_batches.run_component",
@@ -1103,7 +1146,7 @@ class PromotedExteriorCampaignFlowCanary(unittest.TestCase):
             self.plan, role="primary", leaf_ids=(self.leaf.leaf_id,)
         )
         native = self._native_backend()
-        failure = self._empirical_failed_preflight_error(self.leaf)
+        failure = self._provisional_failed_preflight_error(self.leaf)
         worker80 = _FailingScientificFixedRootBackend(
             self.leaf.job,
             (
@@ -1189,6 +1232,109 @@ class PromotedExteriorCampaignFlowCanary(unittest.TestCase):
         self.assertEqual(cached.executed_stage_count, 0)
         self.assertEqual(cached.reused_stage_count, 2)
 
+    def test_empirical_failed_preflight_exterior_recovery_persists_and_reuses(self):
+        """Companion lifecycle regression for the empirical certificate mode.
+
+        The sibling test above exercises the provisional-default failed
+        preflight recovery path. This one asks explicitly for the
+        empirical-certificate diagnostic model and drives the same
+        checkpoint / cache / reload cycle: recovery must persist a
+        PRODUCED 120-digit stage, the solved-leaf cache must retain it,
+        and reload from the cache must skip all numerical work.
+        """
+
+        checkpoint = self.root / "failed-preflight-empirical.json"
+        cache = SolvedLeafStore(self.root / "failed-preflight-empirical-cache")
+        selection = build_campaign_selection(
+            self.plan, role="primary", leaf_ids=(self.leaf.leaf_id,)
+        )
+        native = self._native_backend()
+        failure = self._empirical_certificate_failed_preflight_error(self.leaf)
+        # The generated binding must carry the empirical diagnostic
+        # identity; that is what makes this a distinct lifecycle from
+        # the provisional-default case.
+        self.assertEqual(
+            failure.worker_failure["failure"]["request_binding"][
+                "diagnostic_model_identity"
+            ],
+            EXTERIOR_DETERMINANT_ABSOLUTE_ERROR_CERTIFICATE,
+        )
+        worker80 = _FailingScientificFixedRootBackend(
+            self.leaf.job,
+            (
+                exterior_derivative_fixtures
+                .PromotedExteriorDerivativeTests
+                ._baseline_with_derivative_evidence(self.leaf)
+            ),
+            80,
+            failure,
+        )
+        worker120 = self._precision_backend(self.leaf, 120)
+        with patch(
+            "windows_solver.response_batches.run_component",
+            return_value=self._binary_result(),
+        ), patch.object(
+            native,
+            "_julia_precision_backend_for",
+            side_effect=lambda job, digits, refinement=0: {
+                80: worker80,
+                120: worker120,
+            }[digits],
+        ):
+            summary = run_campaign_selection(
+                self.plan,
+                selection,
+                native,
+                checkpoint,
+                resume=False,
+                solved_leaf_store=cache,
+            )
+
+        record = summary.records[0]
+        self.assertEqual(record.state, "PRODUCED")
+        self.assertEqual(
+            tuple(stage.outcome.digits for stage in record.stages),
+            (64, 120),
+        )
+        self.assertEqual(len(summary.attempts), 1)
+        self.assertEqual(worker80.read_calls, 1)
+        self.assertEqual(
+            validate_campaign_checkpoint(self.plan, checkpoint).records,
+            summary.records,
+        )
+        self.assertEqual(cache.stored_count, 1)
+
+        class NoNumerics:
+            identity = native.identity
+            precision_capabilities = native.precision_capabilities
+
+            def scientific_execution_contract_for(self, leaf):
+                return native.scientific_execution_contract_for(leaf)
+
+            def execute_stage(self, leaf, digits):
+                raise AssertionError("cache reload repeated binary numerics")
+
+            def execute_promoted_stage(self, leaf, digits, previous):
+                raise AssertionError("cache reload repeated promoted numerics")
+
+            def execute_promoted_stage_after_failed_preflight(
+                self, leaf, digits, predecessor
+            ):
+                raise AssertionError("cache reload repeated recovery numerics")
+
+        cached = run_campaign_selection(
+            self.plan,
+            selection,
+            NoNumerics(),
+            self.root / "failed-preflight-empirical-cache-reload.json",
+            resume=False,
+            solved_leaf_store=SolvedLeafStore(
+                self.root / "failed-preflight-empirical-cache"
+            ),
+        )
+        self.assertEqual(cached.executed_stage_count, 0)
+        self.assertEqual(cached.reused_stage_count, 2)
+
     def test_deep_failed_preflight_compares_available_binary_response(self):
         """Recovery derives 64→120 response evidence instead of forcing N/A."""
 
@@ -1211,7 +1357,7 @@ class PromotedExteriorCampaignFlowCanary(unittest.TestCase):
             binary_fixture.component_result["result"]
         )
         native = self._native_backend(deep)
-        failure = self._empirical_failed_preflight_error(deep)
+        failure = self._provisional_failed_preflight_error(deep)
         worker80 = _FailingScientificFixedRootBackend(
             deep.job,
             (

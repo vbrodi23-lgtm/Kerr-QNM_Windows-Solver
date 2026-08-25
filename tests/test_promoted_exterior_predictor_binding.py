@@ -259,7 +259,7 @@ class PromotedExteriorPredictorBindingTests(unittest.TestCase):
             leaf_ids=(self.flow.leaf.leaf_id,),
         )
         native = self.flow._native_backend()
-        failure = self.flow._empirical_failed_preflight_error(self.flow.leaf)
+        failure = self.flow._provisional_failed_preflight_error(self.flow.leaf)
         worker80 = campaign_fixtures._FailingScientificFixedRootBackend(
             self.flow.leaf.job,
             self._worker(

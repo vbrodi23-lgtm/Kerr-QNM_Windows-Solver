@@ -1074,11 +1074,21 @@ class Schema11ProgressReporter:
         }
         if set(paths) - expected_diagnostic_paths:
             raise ValueError("schema-11 diagnostic status paths are invalid")
+        # Diagnostic paths are a status-serialisation field: preserve the
+        # caller-supplied representation verbatim so the status receipt
+        # round-trips identically on Windows and POSIX. Feeding an
+        # already-canonical string through pathlib.Path merely rewrites
+        # its separators to the current OS's native form, which corrupts
+        # the receipt for downstream readers.
         self._diagnostic_paths = {
             name: (
                 None
                 if paths.get(name) is None
-                else str(Path(paths[name]))
+                else (
+                    paths[name]
+                    if isinstance(paths[name], str)
+                    else os.fspath(paths[name])
+                )
             )
             for name in expected_diagnostic_paths
         }

@@ -178,7 +178,7 @@ class Binary64SurveySchedulerTests(unittest.TestCase):
             self.assertTrue(all(
                 entry["queue_kind"] == "RESPONSE"
                 and entry["reason_code"]
-                == "DETERMINANT_ERROR_EVIDENCE_UNAVAILABLE"
+                == "BLOCKED_BY_REVIEWED_ERROR_EVIDENCE"
                 for entry in queued
             ))
             self.assertEqual(

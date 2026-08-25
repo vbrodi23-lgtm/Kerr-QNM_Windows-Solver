@@ -15,7 +15,7 @@ from windows_solver.response_engine import (
     ComponentResult,
     DecimalComplex,
     DerivativeAuthenticationEvidence,
-    PROMOTED_HORIZON_COMPONENT_V2_IDENTITY,
+    PROMOTED_HORIZON_BOUNDED_COMPONENT_IDENTITY,
     _validate_promoted_horizon_checkpoint_evidence_for_job,
     run_promoted_horizon_component,
 )
@@ -108,7 +108,7 @@ class PromotedHorizonUncertaintyTests(unittest.TestCase):
 
         self.assertEqual(
             mapping["component_scientific_identity"],
-            PROMOTED_HORIZON_COMPONENT_V2_IDENTITY,
+            PROMOTED_HORIZON_BOUNDED_COMPONENT_IDENTITY,
         )
         self.assertEqual(
             mapping["response_uncertainty_status"],

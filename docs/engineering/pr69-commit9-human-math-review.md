@@ -1,4 +1,4 @@
-# PR69 Commit 9 — Human Mathematical Review Receipt v1
+# PR69 Commit 9 — Human Mathematical Review Receipt
 
 ## Status
 

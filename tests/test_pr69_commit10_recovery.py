@@ -18,7 +18,7 @@ from windows_solver.campaign_policy import (
 )
 from windows_solver.campaign_recovery import (
     SCIENTIFIC_COMPATIBILITY_SCHEMA,
-    V2_STALE_HORIZON_REASON,
+    STALE_HORIZON_REASON,
     RecoverySelection,
     recover_campaign,
     validate_recovery_checkpoint,
@@ -191,7 +191,7 @@ class Commit10RecoveryTests(unittest.TestCase):
                 for item in candidate["recovery_receipts"]
                 if item.get("schema") == SCIENTIFIC_COMPATIBILITY_SCHEMA
             )
-            self.assertEqual(V2_STALE_HORIZON_REASON, compatibility["reason"])
+            self.assertEqual(STALE_HORIZON_REASON, compatibility["reason"])
             self.assertEqual(source_sha256, compatibility["source_sha256"])
             self.assertTrue(compatibility["source_evidence_was_present"])
             self.assertFalse(compatibility["imported_as_current_numerical_record"])
@@ -205,7 +205,7 @@ class Commit10RecoveryTests(unittest.TestCase):
                 compatibility["source_operation_identities"],
             )
             self.assertIn(
-                V2_STALE_HORIZON_REASON,
+                STALE_HORIZON_REASON,
                 {item["reason"] for item in receipt["ignored_inputs"]},
             )
             self.assertEqual(0, receipt["source_mutations"])

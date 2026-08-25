@@ -128,11 +128,11 @@ def exterior_response_disk(
 def legacy_v2_horizon_response_disk(
     *, horizon_frequency: ComplexDisk, determinant_derivative: ComplexDisk
 ) -> ComplexDisk:
-    """Evaluate the forensic v2 quotient without a horizon numerator.
+    """Evaluate the forensic legacy quotient without a horizon numerator.
 
-    This is deliberately not the v3 production response.  Kept only so
-    historical v2 evidence remains readable as forensic material, it must not
-    be used to construct a v3 horizon record.
+    This is deliberately not the current production response.  Kept only so
+    historical legacy evidence remains readable as forensic material, it must
+    not be used to construct a current horizon record.
     """
     if horizon_frequency.contains_zero:
         raise ZeroContainingDiskError("horizon_frequency")
@@ -167,11 +167,11 @@ def horizon_response_disk(
     horizon_frequency: ComplexDisk,
     determinant_derivative: ComplexDisk,
 ) -> ComplexDisk:
-    """Return the approved v3 disk ``-D_H / (2 i p_H D_0,omega)``.
+    """Return the approved current disk ``-D_H / (2 i p_H D_0,omega)``.
 
     The product is formed as one complex-ball denominator and the numerator is
-    explicit.  This prevents a v2 unit-numerator quotient from being attached
-    to v3 uncertainty evidence.
+    explicit.  This prevents a legacy unit-numerator quotient from being
+    attached to current uncertainty evidence.
     """
 
     if horizon_numerator.contains_zero and horizon_numerator.radius == 0.0:

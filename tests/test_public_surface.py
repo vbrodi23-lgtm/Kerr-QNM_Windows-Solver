@@ -1424,8 +1424,8 @@ $candidate | ConvertTo-Json -Compress | Set-Content -LiteralPath $env:M02_TEST_J
             "single-promoted-root-bounded-analytic-horizon-component/v2",
             "promoted-horizon-typed-failure-component/v1",
             "promoted-horizon-typed-failure/v1",
-            "PROMOTED_HORIZON_COMPONENT_V2_IDENTITY",
-            "PROMOTED_HORIZON_RESPONSE_METHOD_V2",
+            "PROMOTED_HORIZON_BOUNDED_COMPONENT_IDENTITY",
+            "PROMOTED_HORIZON_BOUNDED_RESPONSE_METHOD",
             "M02_Production_222_A9999_Endpoint_Recovery_v1.ps1",
             "M02_Production_LightRing_A9999_Response_Recovery_v1.ps1",
             "selective-signed-root-promotion-component/v1/",
@@ -1445,6 +1445,43 @@ $candidate | ConvertTo-Json -Compress | Set-Content -LiteralPath $env:M02_TEST_J
             "windows-solver.fixed-sentinel-set/v1",
             "data/promoted_control_empirical_calibration_v1.json",
             "data/promoted_control_derivative_lower_bound_source_audit_v1.json",
+            # PR69 public scientific identities: the additive-channels
+            # provisional exterior model, the v2 horizon response contract,
+            # the provisional-stage operation identity, and the root
+            # evidence store identities all authenticate real current
+            # production output.
+            "exterior-determinant-additive-channels/provisional-v1",
+            "binary64-fixed-root-horizon-response/v2",
+            "binary64-horizon-analytic-component/v2",
+            "binary64-fixed-root-provisional/v1",
+            "m02-horizon-exterior-response-math/v1",
+            "finite-radius-endpoint-wedge/raw-oriented/v1",
+            "fixed-kerr-background-coordinate/v1",
+            "scientific-compatibility/v1",
+            "windows-solver.repeated-outcome-diagnostics/v1",
+            "authenticated-root-evidence-v2",
+            "root-evidence-v2",
+            # PR69 keeps the forensic v2 horizon lineage readable without
+            # letting it re-authenticate as current science. The
+            # constants below name that forensic path in code, in
+            # persisted receipts, and in the recovery reason field; each
+            # points at internal legacy handling, not a public scientific
+            # identity, so they are approved as tokens the guard should
+            # treat as expected internal references.
+            "binary64-horizon-production/v2",
+            "BINARY64_HORIZON_COMPONENT",
+            "BINARY64_HORIZON_RESPONSE_METHOD",
+            "STALE_HORIZON_REASON",
+            "HORIZON_RESPONSE_V2_SCIENTIFICALLY_STALE",
+            "FORENSIC_V2_STALE",
+            "MIXED_V2_V3_INVALID",
+            # Internal helper names for legacy-forensic paths. They only
+            # appear inside the package's Python source and never reach
+            # a persisted receipt or a public identifier, so approving
+            # the identifier tokens keeps the guard tight without
+            # renaming symbols that document the forensic boundary.
+            "_stale_horizon_v2_receipt",
+            "legacy_v2_horizon_response_disk",
         })
         lineage_character = r"A-Za-z0-9_/:;=+\-"
         approved_identity = re.compile(

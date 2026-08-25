@@ -29,7 +29,7 @@ RECOVERY_RECEIPT_SCHEMA = "windows-solver.campaign-recovery/v1"
 ROOT_READOUT_RECOVERY_INDEX_SCHEMA = "windows-solver.root-readout-recovery-index/v1"
 LEGACY_COMPATIBILITY_SCHEMA = "legacy-compatibility/v1"
 SCIENTIFIC_COMPATIBILITY_SCHEMA = "scientific-compatibility/v1"
-V2_STALE_HORIZON_REASON = "HORIZON_RESPONSE_V2_SCIENTIFICALLY_STALE"
+STALE_HORIZON_REASON = "HORIZON_RESPONSE_V2_SCIENTIFICALLY_STALE"
 _HEX_64 = re.compile(r"[0-9a-f]{64}")
 _SOLVED_RECEIPT_FIELDS = {
     "schema_version",
@@ -461,7 +461,7 @@ def _stale_horizon_v2_receipt(
     selection: RecoverySelection,
     source_evidence: Mapping[str, object] | None,
 ) -> dict[str, object]:
-    """Bind an authenticated v2 horizon record as forensic-only input.
+    """Bind an authenticated legacy horizon record as forensic-only input.
 
     The source checkpoint remains untouched. Its terminal record and attached
     evidence are deliberately excluded from current schema-11 numerical and
@@ -500,7 +500,7 @@ def _stale_horizon_v2_receipt(
         "imported_as_current_evidence": False,
         "forensic_record_status": "RETAINED_IN_SOURCE_ONLY",
         "operational_queue_disposition": "REBUILT_FROM_CURRENT_SELECTION",
-        "reason": V2_STALE_HORIZON_REASON,
+        "reason": STALE_HORIZON_REASON,
     }
     return {**content, "receipt_sha256": _sha256(content)}
 
@@ -935,7 +935,7 @@ def recover_campaign(
                     ignored.append({
                         "path": str(path),
                         "leaf_id": leaf_id,
-                        "reason": V2_STALE_HORIZON_REASON,
+                        "reason": STALE_HORIZON_REASON,
                     })
                     continue
                 if record_validator is not None:

@@ -5567,7 +5567,12 @@ def build_promoted_request_contract_fixture(
         and document["precision_digits"] == 80
         and document["refinement_level"] == 0
     )
-    invalid_values = (
+    # invalid_exterior_cases prove that empirical-only fields such as
+    # determinant_error_safety_factor are forbidden on a PROVISIONAL
+    # exterior policy. Injecting the field with any value must fail the
+    # raw-determinant-contract disjointness check — the value's own JSON
+    # type is irrelevant here, only the mode-boundary is under test.
+    invalid_provisional_injection_values = (
         ("string", "64"),
         ("floating-point", 64.0),
         ("boolean", True),
@@ -5575,7 +5580,7 @@ def build_promoted_request_contract_fixture(
         ("null", None),
     )
     invalid_cases: list[dict[str, object]] = []
-    for label, value in invalid_values:
+    for label, value in invalid_provisional_injection_values:
         request = copy.deepcopy(exterior)
         request.pop("request_sha256")
         request["policy"]["determinant_error_safety_factor"] = value
@@ -5637,6 +5642,26 @@ def build_promoted_request_contract_fixture(
         ).hexdigest(),
     })
     _, empirical_document, _ = _worker_request_document(empirical_request)
+    # empirical_safety_factor_invalid_cases exercise the empirical
+    # validator's own JSON type/value enforcement of
+    # determinant_error_safety_factor. The mode is empirical, the field
+    # is required, and the empirical validator requires an exact int 64.
+    empirical_safety_factor_invalid_values = (
+        ("string", "64"),
+        ("floating-point", 64.0),
+        ("boolean", True),
+        ("wrong-integer", 63),
+        ("null", None),
+    )
+    empirical_safety_factor_invalid_cases: list[dict[str, object]] = []
+    for label, value in empirical_safety_factor_invalid_values:
+        broken = copy.deepcopy(empirical_request)
+        broken.pop("request_sha256", None)
+        broken["policy"]["determinant_error_safety_factor"] = value
+        _, broken_document, _ = _worker_request_document(broken)
+        empirical_safety_factor_invalid_cases.append(
+            {"label": label, "document": broken_document}
+        )
     wire_documents = {
         "horizon-analytic": next(
             document
@@ -5655,5 +5680,8 @@ def build_promoted_request_contract_fixture(
         "operation": "promoted-request-contract-fixture",
         "requests": documents,
         "invalid_exterior_cases": invalid_cases,
+        "empirical_safety_factor_invalid_cases": (
+            empirical_safety_factor_invalid_cases
+        ),
         "golden_contracts": golden_contracts,
     }

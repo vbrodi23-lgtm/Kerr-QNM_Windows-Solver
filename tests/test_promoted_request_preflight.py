@@ -215,6 +215,39 @@ class PromotedRequestPreflightTests(unittest.TestCase):
             ],
             ["64", 64.0, True, 63, None],
         )
+        # Empirical safety-factor negatives regenerate the same value
+        # matrix from the empirical golden request, so the Julia
+        # empirical validator's JSON type/value enforcement has explicit
+        # regression coverage independent of the provisional forbidden-
+        # field check.
+        self.assertEqual(
+            [
+                case["label"]
+                for case in round_tripped[
+                    "empirical_safety_factor_invalid_cases"
+                ]
+            ],
+            ["string", "floating-point", "boolean", "wrong-integer", "null"],
+        )
+        for case in round_tripped["empirical_safety_factor_invalid_cases"]:
+            document = case["document"]
+            self.assertEqual(
+                document["diagnostic_model_identity"],
+                "exterior-determinant-absolute-error-certificate/empirical-v1",
+            )
+            self.assertEqual(
+                document["required_raw_determinant_roles"],
+                ["PRIMARY", "TRUNCATION", "RESOLUTION"],
+            )
+        self.assertEqual(
+            [
+                case["document"]["policy"]["determinant_error_safety_factor"]
+                for case in round_tripped[
+                    "empirical_safety_factor_invalid_cases"
+                ]
+            ],
+            ["64", 64.0, True, 63, None],
+        )
         self.assertEqual(
             [case["label"] for case in round_tripped["golden_contracts"]],
             [

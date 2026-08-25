@@ -160,10 +160,10 @@ PROMOTED_HORIZON_COMPONENT_IDENTITY = (
 PROMOTED_HORIZON_RESPONSE_METHOD = (
     "analytic-horizon-from-promoted-primary-derivative/v1"
 )
-PROMOTED_HORIZON_COMPONENT_V2_IDENTITY = (
+PROMOTED_HORIZON_BOUNDED_COMPONENT_IDENTITY = (
     "single-promoted-root-bounded-analytic-horizon-component/v2"
 )
-PROMOTED_HORIZON_RESPONSE_METHOD_V2 = (
+PROMOTED_HORIZON_BOUNDED_RESPONSE_METHOD = (
     "bounded-analytic-horizon-from-promoted-primary-derivative/v2"
 )
 PROMOTED_HORIZON_COMPONENT_V3_IDENTITY = (
@@ -179,10 +179,10 @@ FINITE_RADIUS_ENDPOINT_WEDGE_DETERMINANT_CONVENTION = (
     "finite-radius-endpoint-wedge/raw-oriented/v1"
 )
 BINARY64_HORIZON_OPERATION_V3 = "binary64-horizon-production/v3"
-BINARY64_HORIZON_RESPONSE_METHOD_V2 = (
+BINARY64_HORIZON_RESPONSE_METHOD = (
     "binary64-fixed-root-horizon-response/v2"
 )
-BINARY64_HORIZON_COMPONENT_V2 = "binary64-horizon-analytic-component/v2"
+BINARY64_HORIZON_COMPONENT = "binary64-horizon-analytic-component/v2"
 PR69_COMMIT9_HUMAN_MATH_REVIEW_SHA256 = (
     "a886985b081fdc2dc5fd7789ddb18eb60c995960b8aaa76bd33dbb0f5b4844bd"
 )
@@ -7927,7 +7927,7 @@ def _validate_promoted_horizon_checkpoint_evidence_for_job(
     """Bind a structurally valid horizon certificate to the selected Kerr job."""
 
     if result.component_scientific_identity not in {
-        PROMOTED_HORIZON_COMPONENT_V2_IDENTITY,
+        PROMOTED_HORIZON_BOUNDED_COMPONENT_IDENTITY,
         PROMOTED_HORIZON_COMPONENT_V3_IDENTITY,
     }:
         return
@@ -8351,13 +8351,13 @@ class ComponentResult:
                     "promoted analytic horizon component evidence is inconsistent"
                 )
         if self.component_scientific_identity == (
-            PROMOTED_HORIZON_COMPONENT_V2_IDENTITY
+            PROMOTED_HORIZON_BOUNDED_COMPONENT_IDENTITY
         ):
             bounded = self.response_uncertainty_status == BOUNDED_ANALYTIC_RESPONSE
             unbounded = self.response_uncertainty_status == UNBOUNDED_ANALYTIC_RESPONSE
             if (
                 self.mechanism_id != "horizon-admittance"
-                or self.response_method != PROMOTED_HORIZON_RESPONSE_METHOD_V2
+                or self.response_method != PROMOTED_HORIZON_BOUNDED_RESPONSE_METHOD
                 or self.finite_amplitude_ladder_required
                 or self.finite_amplitude_ladder_executed
                 or self.finite_amplitude_readout_count != 0
@@ -10244,14 +10244,14 @@ def _promoted_horizon_result(
         lineage={
             **_result_lineage(job),
             "component_scientific_identity": (
-                PROMOTED_HORIZON_COMPONENT_V2_IDENTITY
+                PROMOTED_HORIZON_BOUNDED_COMPONENT_IDENTITY
             ),
         },
         component_scientific_identity=(
-            PROMOTED_HORIZON_COMPONENT_V2_IDENTITY
+            PROMOTED_HORIZON_BOUNDED_COMPONENT_IDENTITY
         ),
         response_method=(
-            PROMOTED_HORIZON_RESPONSE_METHOD_V2
+            PROMOTED_HORIZON_BOUNDED_RESPONSE_METHOD
         ),
         finite_amplitude_ladder_required=False,
         finite_amplitude_ladder_executed=False,
