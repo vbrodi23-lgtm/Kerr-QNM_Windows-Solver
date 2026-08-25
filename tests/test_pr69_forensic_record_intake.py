@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import copy
+from dataclasses import replace
 import hashlib
 import json
 from pathlib import Path
@@ -71,6 +72,14 @@ _V2_METHOD = "binary64-fixed-root-horizon-response/" + "v1"
 _FROZEN_V2_IDENTITY = (
     "84f765093afa21f76ba4d150e8613d100c6bbaa6b1109283092c0d3ed2f3cdbe"
 )
+_FROZEN_IDENTITY_TEST_BACKEND = replace(
+    VettedNativeDeterminantKernel.identity,
+    runtime_fingerprint=(
+        "cpython-3.12.13-linux-python-64bit-"
+        "gsn-input-julia-exact-f-u-cache-contract-1-"
+        "adapted-source-native-gsn-adapter-contract-2"
+    ),
+)
 
 
 def _sha256(value: object) -> str:
@@ -115,6 +124,20 @@ def _plan_leaf_and_records():
     return plan, leaf, v2, current
 
 
+def _frozen_identity_plan_and_horizon_leaf():
+    plan = build_campaign_plan(
+        policy=NumericalPolicy(),
+        backend_identity=_FROZEN_IDENTITY_TEST_BACKEND,
+        precision_capabilities=PrecisionCapabilities((64, 80)),
+    )
+    leaf = next(
+        item
+        for item in plan.leaves
+        if item.role == "primary" and item.mechanism_id == "horizon-admittance"
+    )
+    return plan, leaf
+
+
 def _one_leaf_recovery(plan, selection, leaf) -> RecoverySelection:
     return RecoverySelection(
         campaign_id=plan.campaign_id,
@@ -153,7 +176,7 @@ def _pending_horizon_outcome() -> Binary64PassOutcome:
 
 class HorizonScientificIdentityTests(unittest.TestCase):
     def test_v3_horizon_identity_differs_from_frozen_v2_identity(self) -> None:
-        plan, leaf, _v2, _current = _plan_leaf_and_records()
+        plan, leaf = _frozen_identity_plan_and_horizon_leaf()
 
         self.assertEqual(
             _FROZEN_V2_IDENTITY,
@@ -167,7 +190,7 @@ class HorizonScientificIdentityTests(unittest.TestCase):
     def test_horizon_identity_binds_operation_component_method_math_and_review_receipt(
         self,
     ) -> None:
-        plan, leaf, _v2, _current = _plan_leaf_and_records()
+        plan, leaf = _frozen_identity_plan_and_horizon_leaf()
 
         material = scientific_computation_identity_material(plan, leaf)
 
@@ -188,7 +211,7 @@ class HorizonScientificIdentityTests(unittest.TestCase):
         )
 
     def test_horizon_identity_change_does_not_change_exterior_identities(self) -> None:
-        plan, _leaf, _v2, _current = _plan_leaf_and_records()
+        plan, _leaf = _frozen_identity_plan_and_horizon_leaf()
         exterior = next(
             item
             for item in plan.leaves
