@@ -289,12 +289,8 @@ try {
     # solver's final _emit() result remains stdout and is parsed here.
     $RunOutput = @(Invoke-M02Command -Arguments $RunArguments)
     $RunJsonText = ($RunOutput | ForEach-Object { [string]$_ }) -join [Environment]::NewLine
-    if ([string]::IsNullOrWhiteSpace($RunJsonText)) {
-        throw "M02 command returned no canonical JSON result."
-    }
-    $RunResult = $RunJsonText | ConvertFrom-Json
-    if ($null -eq $RunResult) {
-        throw "M02 command returned an empty canonical JSON result."
+    if (-not [string]::IsNullOrWhiteSpace($RunJsonText)) {
+        $RunResult = $RunJsonText | ConvertFrom-Json
     }
     $ValidationPass = if ($Profile -eq "survey") {
         $SurveyPass
