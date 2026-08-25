@@ -82,12 +82,14 @@ from .response_engine import (
     BINARY64_HORIZON_OPERATION_V3,
     ComponentStatus,
     ComponentResult,
+    EXTERIOR_PROVISIONAL_STAGE_SCHEMA,
     NativeDeterminantAdapter,
     PromotedRootSeal,
     raw_determinant_contract_from_request,
     _validate_current_raw_determinant_policy,
     root_readout_preserves_authenticated_branch,
     run_promoted_horizon_component,
+    validate_exterior_provisional_stage,
 )
 from .julia_response_backend import (
     JuliaPrecisionRootBackend,
@@ -1405,9 +1407,10 @@ def _typed_horizon_failure_code(
 
 
 def _provisional_stage_publication_metadata(
+    plan: object,
     leaf: object,
     stage: Mapping[str, object],
-) -> tuple[str, str]:
+) -> tuple[str, str, Mapping[str, object]]:
     """Authenticate one durable provisional stage for publication diagnostics.
 
     Horizon and exterior provisional stages intentionally use different
@@ -1417,42 +1420,69 @@ def _provisional_stage_publication_metadata(
 
     if not isinstance(stage, Mapping):
         raise ValueError("provisional stage publication is invalid")
-    stage_sha256 = stage.get("stage_sha256")
-    content = {
-        key: item for key, item in stage.items() if key != "stage_sha256"
-    }
-    if not _is_sha256(stage_sha256) or stage_sha256 != _sha256(content):
-        raise ValueError("provisional stage publication digest is invalid")
 
-    if stage.get("schema") == HORIZON_SCREENING_STAGE_SCHEMA:
+    schema = stage.get("schema")
+    if schema == HORIZON_SCREENING_STAGE_SCHEMA:
         if (
             getattr(leaf, "mechanism_id", None) != "horizon-admittance"
+            or stage.get("precision_tier") != "binary64"
             or stage.get("operation_identity") != BINARY64_HORIZON_OPERATION_V3
         ):
             raise ValueError("horizon provisional stage identity is invalid")
+
+        validate_schema11_horizon_stage(plan, leaf, stage)
+        stage_sha256 = stage.get("stage_sha256")
         payload = stage.get("component_result")
         raw_result = payload.get("result") if isinstance(payload, Mapping) else None
-        evidence = (
-            raw_result.get("analytic_horizon_evidence")
-            if isinstance(raw_result, Mapping)
-            else None
-        )
-        if (
-            not isinstance(raw_result, Mapping)
-            or raw_result.get("leaf_id") != getattr(leaf, "leaf_id", None)
-            or raw_result.get("mechanism_id") != "horizon-admittance"
-            or not isinstance(evidence, Mapping)
-        ):
-            raise ValueError("horizon provisional stage binding is invalid")
+        if not isinstance(raw_result, Mapping):
+            raise ValueError("horizon provisional stage result is invalid")
+        result = ComponentResult.from_mapping(raw_result)
+        if result.to_mapping() != raw_result:
+            raise ValueError("horizon provisional stage result is not canonical")
+        evidence = result.analytic_horizon_evidence
+        if not isinstance(evidence, Mapping):
+            raise ValueError("horizon provisional stage evidence is invalid")
         root_seal_sha256 = evidence.get("root_seal_sha256")
-    else:
-        if getattr(leaf, "mechanism_id", None) == "horizon-admittance":
-            raise ValueError("horizon provisional stage schema is invalid")
-        root_seal_sha256 = stage.get("root_seal_sha256")
+        if not _is_sha256(stage_sha256) or not _is_sha256(root_seal_sha256):
+            raise ValueError("horizon provisional stage seal is invalid")
+        return (
+            str(stage_sha256),
+            str(root_seal_sha256),
+            {
+                "stage_schema": HORIZON_SCREENING_STAGE_SCHEMA,
+                "numerical_state": stage.get("numerical_state"),
+                "failure_code": evidence.get("failure_code"),
+            },
+        )
 
+    if schema != EXTERIOR_PROVISIONAL_STAGE_SCHEMA:
+        raise ValueError("provisional stage publication schema is invalid")
+    root_seal_sha256 = stage.get("root_seal_sha256")
     if not _is_sha256(root_seal_sha256):
-        raise ValueError("provisional stage publication root seal is invalid")
-    return str(stage_sha256), str(root_seal_sha256)
+        raise ValueError("exterior provisional stage root seal is invalid")
+    authenticated = validate_exterior_provisional_stage(
+        stage,
+        job=leaf.job,
+        scientific_computation_identity=scientific_computation_identity_sha256(
+            plan, leaf
+        ),
+        root_seal_sha256=str(root_seal_sha256),
+    )
+    stage_sha256 = authenticated.get("stage_sha256")
+    if not _is_sha256(stage_sha256):
+        raise ValueError("exterior provisional stage digest is invalid")
+    return (
+        str(stage_sha256),
+        str(root_seal_sha256),
+        {
+            "raw_sample_count": authenticated.get("raw_sample_count"),
+            "raw_sample_limit": authenticated.get("raw_sample_limit"),
+            "nonadmission_reason_code": authenticated.get(
+                "nonadmission_reason_code"
+            ),
+        },
+    )
+
 
 def run_native_binary64_pass(
     plan: object,
@@ -1552,8 +1582,8 @@ def run_native_binary64_pass(
     def publish_provisional_stage(leaf, stage):
         """Publish one authenticated checkpoint-committed provisional stage."""
 
-        stage_sha256, root_seal_sha256 = (
-            _provisional_stage_publication_metadata(leaf, stage)
+        stage_sha256, root_seal_sha256, compact_diagnostics = (
+            _provisional_stage_publication_metadata(plan, leaf, stage)
         )
         if diagnostic_session is not None:
             diagnostic_session.append(
@@ -1573,13 +1603,7 @@ def run_native_binary64_pass(
                     "source_stage_sha256": stage_sha256,
                     "provisional_stage_sha256": stage_sha256,
                 },
-                compact_diagnostics={
-                    "raw_sample_count": stage.get("raw_sample_count"),
-                    "raw_sample_limit": stage.get("raw_sample_limit"),
-                    "nonadmission_reason_code": stage.get(
-                        "nonadmission_reason_code"
-                    ),
-                },
+                compact_diagnostics=compact_diagnostics,
                 durable=True,
             )
 
