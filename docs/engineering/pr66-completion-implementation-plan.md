@@ -1,8 +1,8 @@
 # PR66 Completion Implementation Plan
 
-> **Status:** This is a non-normative historical planning record. The sole
-> authoritative PR66 source is `PR66_GOVERNING_COMPLETION_CONTRACT.md`.
-> Where this record differs from that contract, do not execute this record.
+> **Status:** This is a non-normative historical planning record. Its former
+> PR66 governing contract is retained in Git history only. Do not execute this
+> record as current authority.
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
@@ -12,15 +12,13 @@
 
 **Tech Stack:** Python 3.12 standard library, immutable dataclasses/enums, canonical JSON/SHA-256 artifacts, unittest, PowerShell 5.1 launcher text edited and statically tested only.
 
-**Spec:** The committed `PR66_GOVERNING_COMPLETION_CONTRACT.md`, including authoritative completion decisions 1–7.
+**Spec:** Historical PR66 decisions, recoverable from Git history only when an audit requires their exact text.
 
 ## Authoritative course correction — 2026-08-24
 
-This plan has one architecture.  The PR66 Governing Completion Contract, the
-seven resolved decisions, and the 2026-08-24 course correction are its
-authoritative inputs.  Where an older task below conflicts with that course
-correction, the course correction wins; do not create a parallel scheduler,
-second reuse implementation, or synthetic incident oracle.
+This plan records the architecture selected during PR66. It is historical and
+cannot supersede current production architecture, manifests, code, or operator
+runbooks.
 
 Execute the remaining work in this dependency order:
 
@@ -393,7 +391,7 @@ git commit -m "fix(pr66): separate campaign origins and public paths"
 - Restore: `.tasks/IN_PROGRESS.md` from the last authenticated TASK-079 state
 - Modify: `.tasks/WORK_LOG.md`
 - Delete: `PR65_GOVERNING_PR_COMPLETION_RESTORED_ADDITIVE.md`
-- Preserve: `PR66_GOVERNING_COMPLETION_CONTRACT.md` as the sole active PR66 authority
+- Historical PR66 governing contract: retained in Git history only
 - Modify: `tests/test_public_surface.py`
 - Test: `tests/test_pr66_operations_governance.py`
 
@@ -413,7 +411,7 @@ Use Git history as the source; preserve all historical text verbatim. Add PR66 p
 
 - [ ] **Step 3: Delete only obsolete PR65 root debris and add the root-surface guard**
 
-The deleted PR65 file remains recoverable through Git history. The guard rejects future governing/handover/scratch debris while explicitly retaining the sole authoritative PR66 contract.
+The deleted PR65 file remains recoverable through Git history. The guard rejects future governing/handover/scratch debris.
 
 - [ ] **Step 4: Run board/provenance tests GREEN and commit**
 

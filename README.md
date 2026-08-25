@@ -412,11 +412,6 @@ Use the following order when documents disagree:
 4. `.tasks/` for delivery state only;
 5. Git history for superseded decisions and provenance.
 
-While draft PR #66 is being completed, its committed
-`PR66_GOVERNING_COMPLETION_CONTRACT.md` governs PR-specific completion and
-acceptance. It does not replace the enduring production architecture above,
-and the PR body is intentionally only a pointer to that committed authority.
-
 The active operator runbooks are:
 
 ```text
