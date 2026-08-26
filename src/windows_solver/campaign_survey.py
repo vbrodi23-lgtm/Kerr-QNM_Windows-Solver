@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
 import hashlib
+import json
 import math
 import os
 from pathlib import Path
@@ -78,6 +79,7 @@ from .response_engine import (
 )
 from .reviewed_determinant_error import ReviewedDeterminantErrorStore
 from .reviewed_determinant_error_issuance import (
+    require_locked_bf40_determinant_error_issuance_authority,
     retain_uncalibrated_determinant_error_evidence,
 )
 from .background_evidence_store import CanonicalBackgroundEvidenceStore
@@ -1644,6 +1646,8 @@ def _run_promoted_exterior_queue_entry(
             raise ValueError("promoted response root seal digest mismatch")
         if seal.branch_identity != leaf.job.root.branch_id:
             raise ValueError("promoted response root seal branch mismatch")
+        if entry.get("minimum_requested_tier") == "BF40":
+            require_locked_bf40_determinant_error_issuance_authority()
     elif root_promotion_group is not None:
         if seal is not None:
             root_promotion_group.reuse(seal)
@@ -1867,6 +1871,7 @@ def _commit_promoted_outcome(
     queue_kind: PromotionQueueKind,
     outcome: PromotedPassOutcome,
     record_validator: RecordValidator | None = None,
+    layer1_guard: object | None = None,
 ) -> dict[str, object]:
     result = validate_schema11_checkpoint(checkpoint)
     record_sha256 = None
@@ -1958,6 +1963,7 @@ def _commit_promoted_outcome(
             ],
         },
         provisional_reuse_receipt=provisional_reuse_receipt,
+        layer1_guard=layer1_guard,
     )
     result = record_survey_disposition(
         result,
@@ -1988,6 +1994,7 @@ def _commit_promoted_outcome(
         ),
         tier_timing=outcome.tier_timing,
         session_fragments=outcome.session_fragments,
+        layer1_guard=layer1_guard,
     )
     return result
 
@@ -2015,6 +2022,7 @@ def _commit_promoted_cache_reuse(
     leaf_id: str,
     queue_ordinal: int,
     record: Mapping[str, object],
+    layer1_guard: object | None = None,
 ) -> dict[str, object]:
     """Supersede a stale promotion with exact authenticated terminal evidence."""
 
@@ -2033,6 +2041,7 @@ def _commit_promoted_cache_reuse(
             "result_record_sha256": record_sha256,
             "reason_code": "EXACT_AUTHENTICATED_CACHE_HIT",
         },
+        layer1_guard=layer1_guard,
     )
     return record_survey_disposition(
         result,
@@ -2052,6 +2061,7 @@ def _commit_promoted_cache_reuse(
         worker_launch_limit=0,
         tier_timing=(),
         session_fragments=(),
+        layer1_guard=layer1_guard,
     )
 
 
@@ -2063,9 +2073,6 @@ def run_promoted_survey(
     checkpoint_path: str | os.PathLike[str] | Path,
     root_seal_lookup: Callable[
         [object, Mapping[str, object]], AuthenticatedRootSeal | None
-    ],
-    provisional_stage_lookup: Callable[
-        [object, Mapping[str, object]], Mapping[str, object] | None
     ],
     backend_factory: Callable[[object, int], object],
     primary_root_runner: Callable[
@@ -2084,6 +2091,11 @@ def run_promoted_survey(
     root_seal_publish: Callable[
         [object, AuthenticatedRootSeal], None
     ],
+    provisional_stage_lookup: Callable[
+        [object, Mapping[str, object]], Mapping[str, object] | None
+    ] | None = None,
+    layer1_guard: object | None = None,
+    locked_routes_by_ordinal: Mapping[int, object] | None = None,
     determinant_error_store: ReviewedDeterminantErrorStore | None = None,
     solved_leaf_store: SolvedLeafStore | None = None,
     record_validator: RecordValidator | None = None,
@@ -2111,6 +2123,20 @@ def run_promoted_survey(
         or result["selection_id"] != selection.selection_id
     ):
         raise ValueError("promoted survey checkpoint identity mismatch")
+    if (layer1_guard is None) != (locked_routes_by_ordinal is None):
+        raise ValueError(
+            "promoted survey requires both the Layer-1 guard and typed routes"
+        )
+    if layer1_guard is not None:
+        for method_name in ("pre_write", "post_write", "post_callback"):
+            if not callable(getattr(layer1_guard, method_name, None)):
+                raise ValueError("promoted survey Layer-1 guard is invalid")
+        if not isinstance(locked_routes_by_ordinal, Mapping):
+            raise ValueError("promoted survey locked routes are invalid")
+        if provisional_stage_lookup is not None:
+            raise ValueError(
+                "promoted survey cannot mix typed locked routes with a raw provisional lookup"
+            )
     preflight_campaign_supports(plan, selection.ordered_leaf_ids)
     leaves = {leaf.leaf_id: leaf for leaf in getattr(plan, "leaves")}
     path = Path(checkpoint_path)
@@ -2121,10 +2147,17 @@ def run_promoted_survey(
     failure_monitor = ProductionFailureMonitor(diagnostic_session=diagnostic_session)
 
     def persist(value: Mapping[str, object]) -> dict[str, object]:
-        durable = validate_schema11_checkpoint(value)
-        _atomic_json(path, durable)
+        candidate = validate_schema11_checkpoint(value)
+        if layer1_guard is not None:
+            layer1_guard.pre_write(candidate)
+        _atomic_json(path, candidate)
+        durable = _load_durable_schema11_checkpoint(path)
+        if layer1_guard is not None:
+            layer1_guard.post_write(durable)
         if checkpoint_committed is not None:
             durable = validate_schema11_checkpoint(checkpoint_committed(durable))
+        if layer1_guard is not None:
+            layer1_guard.post_callback(durable)
         return durable
 
 
@@ -2200,6 +2233,30 @@ def run_promoted_survey(
             != selection.scientific_identities[leaf_id]
         ):
             raise ValueError("promoted queue scientific identity mismatch")
+        locked_route = None
+        if locked_routes_by_ordinal is not None:
+            locked_route = locked_routes_by_ordinal.get(ordinal)
+            if locked_route is None:
+                raise ValueError("pending promotion has no locked route")
+            expected_route = (
+                "HORIZON_BF80"
+                if getattr(leaves[leaf_id], "mechanism_id") == "horizon-admittance"
+                else "EXTERIOR_BF40"
+            )
+            if (
+                getattr(locked_route, "queue_ordinal", None) != ordinal
+                or getattr(locked_route, "leaf_id", None) != leaf_id
+                or getattr(locked_route, "route", None) != expected_route
+                or getattr(locked_route, "minimum_requested_tier", None)
+                != snapshot["minimum_requested_tier"]
+                or getattr(locked_route, "source_stage_sha256", None)
+                != snapshot["source_stage_sha256"]
+                or getattr(locked_route, "source_root_seal_sha256", None)
+                != snapshot["source_root_seal_sha256"]
+                or getattr(locked_route, "source_fingerprint_sha256", None)
+                != snapshot.get("source_fingerprint_sha256")
+            ):
+                raise ValueError("pending promotion diverges from its locked route")
         if leaf_id in result["survey_pass_ledger"]["promoted"]:
             raise ValueError("pending promotion already has a pass disposition")
         leaf = leaves[leaf_id]
@@ -2398,6 +2455,7 @@ def run_promoted_survey(
                 leaf_id=leaf_id,
                 queue_ordinal=ordinal,
                 record=retained,
+                layer1_guard=layer1_guard,
             ))
             assert isinstance(result, dict)
             cache_reused += 1
@@ -2470,9 +2528,14 @@ def run_promoted_survey(
                 snapshot["queue_kind"] == PromotionQueueKind.RESPONSE.value
                 and snapshot.get("source_record_sha256") is None
             ):
-                provisional_stage = guarded(
-                    lambda: provisional_stage_lookup(leaf, snapshot)
-                )
+                if locked_route is not None:
+                    provisional_stage = locked_route.provisional_stage
+                elif provisional_stage_lookup is not None:
+                    provisional_stage = guarded(
+                        lambda: provisional_stage_lookup(leaf, snapshot)
+                    )
+                else:
+                    provisional_stage = None
                 if not isinstance(provisional_stage, Mapping):
                     guarded(
                         lambda: (_ for _ in ()).throw(
@@ -2558,6 +2621,7 @@ def run_promoted_survey(
             queue_kind=PromotionQueueKind(snapshot["queue_kind"]),
             outcome=outcome,
             record_validator=record_validator,
+            layer1_guard=layer1_guard,
         ))
         assert isinstance(result, dict)
         if outcome.disposition is SurveyDisposition.COMPLETED:
@@ -2771,6 +2835,15 @@ def _atomic_json(path: Path, value: object) -> None:
         except FileNotFoundError:
             pass
         raise
+
+
+def _load_durable_schema11_checkpoint(path: Path) -> dict[str, object]:
+    """Read back an atomic checkpoint before post-write lock validation."""
+
+    try:
+        return validate_schema11_checkpoint(json.loads(path.read_text(encoding="utf-8")))
+    except (OSError, TypeError, ValueError, json.JSONDecodeError) as error:
+        raise ValueError(f"durable schema-11 checkpoint is invalid: {path}") from error
 
 
 def dispatch_cache_first(

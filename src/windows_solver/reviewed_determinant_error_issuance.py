@@ -12,6 +12,15 @@ from .response_engine import ResponseComponentJob
 from .reviewed_determinant_error import ReviewedDeterminantErrorStore
 
 
+LOCKED_BF40_DETERMINANT_ERROR_ISSUANCE_BLOCKER = "TODO: [HUMAN NUMERICAL CALIBRATION REQUIRED — the current promoted-control receipt does not authorize production exterior determinant-error issuance for the locked BF40 handoff]"
+
+
+def require_locked_bf40_determinant_error_issuance_authority() -> None:
+    """Fail closed until a reviewed BF40 issuance certificate is available."""
+
+    raise RuntimeError(LOCKED_BF40_DETERMINANT_ERROR_ISSUANCE_BLOCKER)
+
+
 def retain_uncalibrated_determinant_error_evidence(
     store: ReviewedDeterminantErrorStore,
     job: ResponseComponentJob,
@@ -30,4 +39,8 @@ def retain_uncalibrated_determinant_error_evidence(
     return 0
 
 
-__all__ = ["retain_uncalibrated_determinant_error_evidence"]
+__all__ = [
+    "LOCKED_BF40_DETERMINANT_ERROR_ISSUANCE_BLOCKER",
+    "require_locked_bf40_determinant_error_issuance_authority",
+    "retain_uncalibrated_determinant_error_evidence",
+]

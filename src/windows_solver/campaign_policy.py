@@ -131,7 +131,7 @@ _PROMOTION_ENTRY_FIELDS = {
     "disposition",
     "disposition_receipt_sha256",
 }
-_PROMOTION_ENTRY_PROVISIONAL_FIELDS = _PROMOTION_ENTRY_FIELDS | {
+_PROMOTION_ENTRY_PRE_FINGERPRINT_FIELDS = _PROMOTION_ENTRY_FIELDS | {
     "provisional_stage",
     "provisional_stage_sha256",
     "provisional_operation_identity",
@@ -139,6 +139,25 @@ _PROMOTION_ENTRY_PROVISIONAL_FIELDS = _PROMOTION_ENTRY_FIELDS | {
     "provisional_reuse_receipt",
     "provisional_reuse_receipt_sha256",
 }
+_PROMOTION_SOURCE_FINGERPRINT_FIELDS = (
+    "leaf_id",
+    "queue_kind",
+    "source_pass",
+    "reason_code",
+    "minimum_requested_tier",
+    "source_record_sha256",
+    "source_stage_sha256",
+    "source_root_seal_sha256",
+    "scientific_computation_identity",
+    "provisional_stage",
+    "provisional_stage_sha256",
+    "provisional_operation_identity",
+    "source_binary64_disposition_receipt_sha256",
+    "queue_ordinal",
+)
+_PROMOTION_ENTRY_PROVISIONAL_FIELDS = (
+    _PROMOTION_ENTRY_PRE_FINGERPRINT_FIELDS | {"source_fingerprint_sha256"}
+)
 
 
 def _sha256(value: object) -> str:
@@ -153,6 +172,25 @@ def _is_sha256(value: object) -> bool:
     except ValueError:
         return False
     return True
+
+
+def promotion_source_fingerprint_sha256(entry: Mapping[str, object]) -> str:
+    """Hash the exact immutable Layer-1 source portion of one queue entry."""
+
+    if not isinstance(entry, Mapping):
+        raise ValueError("promotion source entry is invalid")
+    if set(_PROMOTION_SOURCE_FINGERPRINT_FIELDS) - set(entry):
+        raise ValueError("promotion source entry is incomplete")
+    return _sha256({field: entry[field] for field in _PROMOTION_SOURCE_FINGERPRINT_FIELDS})
+
+
+def _assert_layer1_guard(layer1_guard: object | None, checkpoint: Mapping[str, object]) -> None:
+    if layer1_guard is None:
+        return
+    assertion = getattr(layer1_guard, "assert_unchanged", None)
+    if not callable(assertion):
+        raise ValueError("Layer-1 guard is invalid")
+    assertion(checkpoint)
 
 
 def _enum_value(value: object, enum_type: type[Enum], label: str) -> str:
@@ -343,6 +381,7 @@ def record_survey_disposition(
     session_fragments: Sequence[Mapping[str, object]],
     source_record_sha256: str | None = None,
     result_record_sha256: str | None = None,
+    layer1_guard: object | None = None,
 ) -> dict[str, object]:
     result = validate_schema11_checkpoint(checkpoint)
     pass_value = _enum_value(survey_pass, SurveyPass, "survey pass")
@@ -405,6 +444,7 @@ def record_survey_disposition(
     pass_ledger = ledger[pass_value]
     assert isinstance(pass_ledger, dict)
     pass_ledger[leaf_id] = entry
+    _assert_layer1_guard(layer1_guard, result)
     return result
 
 
@@ -423,6 +463,7 @@ def append_promotion(
     provisional_stage_sha256: str | None = None,
     provisional_operation_identity: str | None = None,
     source_binary64_disposition_receipt_sha256: str | None = None,
+    layer1_guard: object | None = None,
 ) -> dict[str, object]:
     result = validate_schema11_checkpoint(checkpoint)
     kind = _enum_value(queue_kind, PromotionQueueKind, "promotion queue kind")
@@ -472,32 +513,33 @@ def append_promotion(
     assert isinstance(queue, dict)
     entries = queue["entries"]
     assert isinstance(entries, list)
-    entries.append(
-        {
-            "leaf_id": leaf_id,
-            "queue_kind": kind,
-            "source_pass": SurveyPass.BINARY64.value,
-            "reason_code": reason_code,
-            "minimum_requested_tier": minimum_requested_tier,
-            "source_record_sha256": source_record_sha256,
-            "source_stage_sha256": source_stage_sha256,
-            "source_root_seal_sha256": source_root_seal_sha256,
-            "scientific_computation_identity": scientific_computation_identity,
-            "provisional_stage": (
-                None if provisional_stage is None else copy.deepcopy(dict(provisional_stage))
-            ),
-            "provisional_stage_sha256": provisional_stage_sha256,
-            "provisional_operation_identity": provisional_operation_identity,
-            "source_binary64_disposition_receipt_sha256": (
-                source_binary64_disposition_receipt_sha256
-            ),
-            "provisional_reuse_receipt": None,
-            "provisional_reuse_receipt_sha256": None,
-            "queue_ordinal": len(entries),
-            "disposition": PromotionQueueDisposition.PENDING.value,
-            "disposition_receipt_sha256": None,
-        }
-    )
+    entry = {
+        "leaf_id": leaf_id,
+        "queue_kind": kind,
+        "source_pass": SurveyPass.BINARY64.value,
+        "reason_code": reason_code,
+        "minimum_requested_tier": minimum_requested_tier,
+        "source_record_sha256": source_record_sha256,
+        "source_stage_sha256": source_stage_sha256,
+        "source_root_seal_sha256": source_root_seal_sha256,
+        "scientific_computation_identity": scientific_computation_identity,
+        "provisional_stage": (
+            None if provisional_stage is None else copy.deepcopy(dict(provisional_stage))
+        ),
+        "provisional_stage_sha256": provisional_stage_sha256,
+        "provisional_operation_identity": provisional_operation_identity,
+        "source_binary64_disposition_receipt_sha256": (
+            source_binary64_disposition_receipt_sha256
+        ),
+        "provisional_reuse_receipt": None,
+        "provisional_reuse_receipt_sha256": None,
+        "queue_ordinal": len(entries),
+        "disposition": PromotionQueueDisposition.PENDING.value,
+        "disposition_receipt_sha256": None,
+    }
+    entry["source_fingerprint_sha256"] = promotion_source_fingerprint_sha256(entry)
+    entries.append(entry)
+    _assert_layer1_guard(layer1_guard, result)
     return result
 
 
@@ -508,6 +550,7 @@ def finish_promotion(
     disposition: PromotionQueueDisposition | str,
     disposition_receipt: Mapping[str, object],
     provisional_reuse_receipt: Mapping[str, object] | None = None,
+    layer1_guard: object | None = None,
 ) -> dict[str, object]:
     result = validate_schema11_checkpoint(checkpoint)
     disposition_value = _enum_value(
@@ -532,6 +575,14 @@ def finish_promotion(
     if entry["disposition"] != PromotionQueueDisposition.PENDING.value:
         raise ValueError("promotion queue entry is already terminal")
     receipt = copy.deepcopy(dict(disposition_receipt))
+    source_fingerprint_sha256 = entry["source_fingerprint_sha256"]
+    supplied_fingerprint = receipt.get("source_fingerprint_sha256")
+    if (
+        supplied_fingerprint is not None
+        and supplied_fingerprint != source_fingerprint_sha256
+    ):
+        raise ValueError("promotion disposition source fingerprint is invalid")
+    receipt["source_fingerprint_sha256"] = source_fingerprint_sha256
     reuse_receipt = (
         None
         if provisional_reuse_receipt is None
@@ -551,6 +602,7 @@ def finish_promotion(
     entry["provisional_reuse_receipt_sha256"] = (
         None if reuse_receipt is None else reuse_receipt["receipt_sha256"]
     )
+    _assert_layer1_guard(layer1_guard, result)
     return result
 
 
@@ -670,10 +722,13 @@ def validate_schema11_checkpoint(
                 "provisional_reuse_receipt": None,
                 "provisional_reuse_receipt_sha256": None,
             })
+            normalized["source_fingerprint_sha256"] = (
+                promotion_source_fingerprint_sha256(normalized)
+            )
             queue["entries"][ordinal] = normalized
             entry = normalized
         elif entry_fields == (
-            _PROMOTION_ENTRY_PROVISIONAL_FIELDS
+            _PROMOTION_ENTRY_PRE_FINGERPRINT_FIELDS
             - {"provisional_reuse_receipt", "provisional_reuse_receipt_sha256"}
         ):
             normalized = copy.deepcopy(dict(entry))
@@ -681,6 +736,16 @@ def validate_schema11_checkpoint(
                 "provisional_reuse_receipt": None,
                 "provisional_reuse_receipt_sha256": None,
             })
+            normalized["source_fingerprint_sha256"] = (
+                promotion_source_fingerprint_sha256(normalized)
+            )
+            queue["entries"][ordinal] = normalized
+            entry = normalized
+        elif entry_fields == _PROMOTION_ENTRY_PRE_FINGERPRINT_FIELDS:
+            normalized = copy.deepcopy(dict(entry))
+            normalized["source_fingerprint_sha256"] = (
+                promotion_source_fingerprint_sha256(normalized)
+            )
             queue["entries"][ordinal] = normalized
             entry = normalized
         elif entry_fields != _PROMOTION_ENTRY_PROVISIONAL_FIELDS:
@@ -761,6 +826,10 @@ def validate_schema11_checkpoint(
                 raise ValueError("pending promotion cannot have a terminal receipt")
         elif not _is_sha256(receipt_hash):
             raise ValueError("terminal promotion requires a receipt digest")
+        if entry["source_fingerprint_sha256"] != promotion_source_fingerprint_sha256(
+            entry
+        ):
+            raise ValueError("schema-11 promotion source fingerprint is invalid")
 
     for field in ("attempts", "system_failures", "recovery_receipts"):
         if not isinstance(result[field], list):
@@ -787,6 +856,7 @@ __all__ = [
     "append_promotion",
     "empty_schema11_checkpoint",
     "finish_promotion",
+    "promotion_source_fingerprint_sha256",
     "record_evidence",
     "record_survey_disposition",
     "validate_schema11_checkpoint",

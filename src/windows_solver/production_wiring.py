@@ -26,7 +26,8 @@ _REQUIRED_CALLS = {
     "run_native_promoted_pass": {
         "run_promoted_survey": {
             "root_seal_lookup",
-            "provisional_stage_lookup",
+            "layer1_guard",
+            "locked_routes_by_ordinal",
             "root_seal_publish",
             "backend_factory",
             "determinant_error_store",

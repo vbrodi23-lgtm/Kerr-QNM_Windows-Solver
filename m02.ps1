@@ -135,6 +135,7 @@ $CheckpointPath = if ([IO.Path]::IsPathRooted($Checkpoint)) {
 else {
     [IO.Path]::GetFullPath((Join-Path $PackageRoot $Checkpoint))
 }
+$Binary64LockPath = "$CheckpointPath.binary64-lock.json"
 if (-not (Test-Path -LiteralPath $SelectionPath -PathType Leaf)) {
     throw "M02 selection is absent: $SelectionPath"
 }
@@ -274,6 +275,24 @@ try {
     Write-Host ("    Evidence counts          : {0}" -f ($EvidenceCounts | ConvertTo-Json -Compress))
     Write-Host ("    Basic report directory   : {0}" -f $BasicReportDirectory)
     Write-Host ("    Status path              : {0}" -f "$CheckpointPath.status.json")
+    if ($Profile -eq "survey" -and $SurveyPass -eq "promoted") {
+        $Binary64LockExists = Test-Path -LiteralPath $Binary64LockPath -PathType Leaf
+        if ($PromotedProcessed -gt 0 -and -not $Binary64LockExists) {
+            throw "Promoted ledger is nonempty but the binary64 lock is absent: $Binary64LockPath"
+        }
+        if (-not $Binary64LockExists) {
+            Invoke-M02Command -Arguments @(
+                "campaign-lock-binary64",
+                $SelectionPath,
+                "--checkpoint", $CheckpointPath,
+                "--output", $Binary64LockPath
+            ) | Out-Null
+            $Binary64LockExists = Test-Path -LiteralPath $Binary64LockPath -PathType Leaf
+            if (-not $Binary64LockExists) {
+                throw "Binary64 lock command did not create: $Binary64LockPath"
+            }
+        }
+    }
     $RunArguments = @(
         $Command,
         $SelectionPath,
@@ -283,6 +302,9 @@ try {
     ) + $CalibrationArguments
     if ($null -ne $ResolvedQueuePath) {
         $RunArguments += @("--queue", $ResolvedQueuePath)
+    }
+    if ($Profile -eq "survey" -and $SurveyPass -eq "promoted") {
+        $RunArguments += @("--binary64-lock", $Binary64LockPath)
     }
     # Capture canonical command JSON without merging it with the human
     # dashboard stream.  The reporter writes dashboard text to stderr; the
@@ -298,12 +320,16 @@ try {
     else {
         $Profile
     }
-    Invoke-M02Command -Arguments @(
+    $ValidationArguments = @(
         "campaign-schema11-validate",
         $SelectionPath,
         "--checkpoint", $CheckpointPath,
         "--pass", $ValidationPass
-    ) | Out-Null
+    )
+    if ($ValidationPass -eq "promoted") {
+        $ValidationArguments += @("--binary64-lock", $Binary64LockPath)
+    }
+    Invoke-M02Command -Arguments $ValidationArguments | Out-Null
 }
 finally {
     if ($TranscriptStarted) {

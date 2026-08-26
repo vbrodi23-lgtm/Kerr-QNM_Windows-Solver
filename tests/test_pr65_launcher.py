@@ -16,7 +16,15 @@ class PR65LauncherTests(unittest.TestCase):
             "campaign-certify",
             "campaign-evidence-validate",
         ):
-            arguments = parser.parse_args([command, *common])
+            arguments = parser.parse_args([
+                command,
+                *common,
+                *(
+                    ("--binary64-lock", "state.json.binary64-lock.json")
+                    if command == "campaign-survey-promoted"
+                    else ()
+                ),
+            ])
             self.assertEqual(command, arguments.command)
 
     def test_powershell_default_is_resume_only_binary64(self):

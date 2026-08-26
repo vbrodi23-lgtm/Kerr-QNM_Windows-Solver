@@ -25,6 +25,7 @@ from .campaign_policy import (
     PromotionQueueDisposition,
     PromotionQueueKind,
     SurveyDisposition,
+    promotion_source_fingerprint_sha256,
     validate_schema11_checkpoint,
 )
 from .campaign_recovery import RecoverySelection
@@ -46,6 +47,14 @@ from .campaign_survey import (
     PromotedSurveyRun,
     run_binary64_survey,
     run_promoted_survey,
+)
+from .binary64_layer_lock import (
+    Layer1Guard,
+    binary64_layer_lock_path,
+    build_binary64_layer_auxiliary_evidence_manifest,
+    build_binary64_layer_lock,
+    load_binary64_layer_lock,
+    write_binary64_layer_lock,
 )
 from .contracts import canonical_json_bytes
 from .structural_diagnostics import StructuralDiagnosticSession
@@ -104,6 +113,9 @@ from .promoted_control_calibration import load_default_calibration_receipt
 from .root_evidence import AuthenticatedRootEvidence, RootDependencyKey
 from .root_readout_cache import RootEvidenceStore, RootReadoutStore
 from .reviewed_determinant_error import ReviewedDeterminantErrorStore
+from .reviewed_determinant_error_issuance import (
+    require_locked_bf40_determinant_error_issuance_authority,
+)
 from .background_evidence_store import CanonicalBackgroundEvidenceStore
 from .solved_leaf_cache import SolvedLeafLookupStatus, SolvedLeafStore
 from .validation_admission import SAME_BACKEND_REFINEMENT_ROUTE
@@ -119,6 +131,18 @@ _ROOT_READOUT_RECOVERY_INDEX_SCHEMA = (
 
 def _sha256(value: object) -> str:
     return hashlib.sha256(canonical_json_bytes(value)).hexdigest()
+
+
+def _layer1_leaf_mechanism_ids(
+    plan: object, recovery_selection: RecoverySelection
+) -> dict[str, str]:
+    leaves = {leaf.leaf_id: leaf for leaf in plan.leaves}
+    if set(recovery_selection.ordered_leaf_ids) - set(leaves):
+        raise ValueError("Layer-1 selection contains a leaf absent from the plan")
+    return {
+        leaf_id: leaves[leaf_id].mechanism_id
+        for leaf_id in recovery_selection.ordered_leaf_ids
+    }
 
 
 def _complex_mapping(value: complex) -> dict[str, float]:
@@ -414,6 +438,9 @@ def _completed_horizon_source_is_authenticated(
         "precision_tiers": list(promoted["precision_tiers"]),
         "result_record_sha256": source_record_sha256,
         "source_record_sha256": source_record_sha256,
+        "source_fingerprint_sha256": promotion_source_fingerprint_sha256(
+            queue_entry
+        ),
     }
     if queue_entry.get("disposition_receipt_sha256") != _sha256(
         queue_receipt
@@ -1618,7 +1645,7 @@ def run_native_binary64_pass(
         diagnostic_session=diagnostic_session,
     )
 
-    return run_binary64_survey(
+    survey_run = run_binary64_survey(
         plan,
         recovery_selection,
         checkpoint,
@@ -1650,6 +1677,24 @@ def run_native_binary64_pass(
         ),
         diagnostic_session=diagnostic_session,
     )
+    if survey_run.pass_exhausted:
+        final_checkpoint = validate_schema11_checkpoint(survey_run.checkpoint)
+        manifest = build_binary64_layer_auxiliary_evidence_manifest(
+            plan,
+            final_checkpoint,
+            root_evidence_store=root_evidence_store,
+            background_evidence_store=background_store,
+        )
+        lock = build_binary64_layer_lock(
+            final_checkpoint,
+            selection=recovery_selection,
+            leaf_mechanism_ids=_layer1_leaf_mechanism_ids(
+                plan, recovery_selection
+            ),
+            auxiliary_evidence_manifest=manifest,
+        )
+        write_binary64_layer_lock(binary64_layer_lock_path(checkpoint_path), lock)
+    return survey_run
 
 
 def _promoted_root_result(leaf: object, backend: object, digits: int):
@@ -2017,19 +2062,44 @@ def run_native_promoted_pass(
     checkpoint: Mapping[str, object],
     *,
     checkpoint_path: Path,
+    binary64_lock_path: Path,
     calibration_receipt: object | None = None,
     solved_leaf_store: SolvedLeafStore | None = None,
     determinant_error_store: ReviewedDeterminantErrorStore | None = None,
+    background_evidence_store: CanonicalBackgroundEvidenceStore | None = None,
     diagnostic_session: StructuralDiagnosticSession | None = None,
 ) -> PromotedSurveyRun:
     """Execute only queued BF40/BF80 work through the survey-only operation."""
+
+    root_evidence_store = RootEvidenceStore.for_checkpoint(checkpoint_path)
+    background_store = background_evidence_store or CanonicalBackgroundEvidenceStore(
+        checkpoint_path.parent / f"{checkpoint_path.name}.canonical-backgrounds"
+    )
+    lock = load_binary64_layer_lock(binary64_lock_path)
+    manifest = build_binary64_layer_auxiliary_evidence_manifest(
+        plan,
+        checkpoint,
+        root_evidence_store=root_evidence_store,
+        background_evidence_store=background_store,
+    )
+    layer1_guard = Layer1Guard.from_authenticated_lock(
+        lock,
+        checkpoint,
+        selection=recovery_selection,
+        leaf_mechanism_ids=_layer1_leaf_mechanism_ids(plan, recovery_selection),
+        auxiliary_evidence_manifest=manifest,
+    )
+    if any(
+        route.route == "EXTERIOR_BF40"
+        for route in layer1_guard.locked_routes_by_ordinal.values()
+    ):
+        require_locked_bf40_determinant_error_issuance_authority()
 
     store = solved_leaf_store or SolvedLeafStore.default()
     error_store = determinant_error_store or ReviewedDeterminantErrorStore(
         checkpoint_path.parent
         / f"{checkpoint_path.name}.reviewed-determinant-errors"
     )
-    root_evidence_store = RootEvidenceStore.for_checkpoint(checkpoint_path)
     backend_holder: dict[str, NativeCampaignStageBackend] = {}
     root_provider_holder: dict[str, AuthenticatedRootSealProvider] = {}
 
@@ -2123,8 +2193,9 @@ def run_native_promoted_pass(
         checkpoint,
         checkpoint_path=checkpoint_path,
         root_seal_lookup=seal_lookup,
-        provisional_stage_lookup=lambda _leaf, entry: entry["provisional_stage"],
         root_seal_publish=lambda leaf, seal: root_provider().publish(leaf, seal),
+        layer1_guard=layer1_guard,
+        locked_routes_by_ordinal=layer1_guard.locked_routes_by_ordinal,
         backend_factory=lambda leaf, digits: backend()._julia_precision_backend_for(
             leaf.job, digits
         ),
