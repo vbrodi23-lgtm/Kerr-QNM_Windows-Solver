@@ -6,6 +6,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -285,6 +286,20 @@ class AppendOnlyRendererTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.tempdir.cleanup()
+
+    def test_default_stream_is_stderr_for_cli_stream_separation(self) -> None:
+        checkpoint = _checkpoint_for(self.leaf_ids[:1], pending_routes=False)
+        _write_checkpoint(self.checkpoint_path, checkpoint)
+        reporter = Schema11ProgressReporter(
+            self.checkpoint_path,
+            leaf_metadata=self.metadata,
+            profile="survey",
+            pass_name="binary64",
+        )
+        try:
+            self.assertIs(sys.stderr, reporter.stream)
+        finally:
+            reporter.close()
 
     def test_constructor_is_silent_and_rows_are_append_only(self) -> None:
         first = _checkpoint_for(self.leaf_ids[:1], pending_routes=False)

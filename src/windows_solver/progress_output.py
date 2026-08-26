@@ -1290,7 +1290,11 @@ class Schema11ProgressReporter:
         self.pass_name = pass_name
         self.mode = ProgressMode(mode)
         self._started_monotonic = time.monotonic()
-        self.stream = stream or sys.stdout
+        # Human dashboard output is intentionally out-of-band from the CLI's
+        # canonical JSON result.  In particular, m02.ps1 captures stdout so
+        # it can parse that JSON; sending this stream to stdout would swallow
+        # the dashboard before it reaches the operator console.
+        self.stream = sys.stderr if stream is None else stream
         self.dashboard = (
             None
             if self.mode is ProgressMode.QUIET
