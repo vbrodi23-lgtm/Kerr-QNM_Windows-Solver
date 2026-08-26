@@ -335,6 +335,24 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         help="optional lock sidecar path; defaults beside the checkpoint",
     )
+    campaign_admit_promoted = commands.add_parser(
+        "campaign-admit-promoted",
+        help="admit one retained promoted stage after independent review",
+    )
+    campaign_admit_promoted.add_argument("selection", type=Path)
+    campaign_admit_promoted.add_argument("--checkpoint", type=Path, required=True)
+    campaign_admit_promoted.add_argument(
+        "--binary64-lock", type=Path, required=True
+    )
+    campaign_admit_promoted.add_argument(
+        "--queue-ordinal", type=int, required=True
+    )
+    campaign_admit_promoted.add_argument(
+        "--review-receipt", type=Path, required=True
+    )
+    campaign_admit_promoted.add_argument(
+        "--review-authority-sha256", required=True
+    )
     for name, help_text in (
         ("campaign-survey-binary64", "run only the schema-11 binary64 survey pass"),
         ("campaign-survey-promoted", "run only the queued schema-11 promoted survey pass"),
@@ -1313,6 +1331,58 @@ def _campaign_schema11_validate(
     }
 
 
+def _campaign_admit_promoted(
+    selection_path: Path,
+    checkpoint_path: Path,
+    *,
+    binary64_lock_path: Path,
+    queue_ordinal: int,
+    review_receipt_path: Path,
+    review_authority_sha256: str,
+) -> tuple[int, object]:
+    (
+        plan,
+        selection,
+        _descriptor,
+        recovery_selection,
+        resolved,
+        checkpoint,
+    ) = _load_schema11_campaign(selection_path, checkpoint_path)
+    review_receipt = _load_strict_json(
+        _resolve_recovery_path(review_receipt_path),
+        "independent promoted review receipt",
+    )
+    from .campaign_runtime import run_native_promoted_admission
+
+    result = run_native_promoted_admission(
+        plan,
+        selection,
+        recovery_selection,
+        checkpoint,
+        checkpoint_path=resolved,
+        binary64_lock_path=_resolve_recovery_path(binary64_lock_path),
+        queue_ordinal=queue_ordinal,
+        independent_review_receipt=review_receipt,
+        expected_authority_sha256=review_authority_sha256,
+    )
+    return 0, {
+        "command": "campaign-admit-promoted",
+        "campaign_id": result.checkpoint["campaign_id"],
+        "selection_id": result.checkpoint["selection_id"],
+        "checkpoint_path": str(resolved),
+        "queue_ordinal": result.queue_ordinal,
+        "leaf_id": result.leaf_id,
+        "admitted_record_sha256": result.admitted_record_sha256,
+        "review_receipt_sha256": result.review_receipt_sha256,
+        "backend_call_count": result.backend_call_count,
+        "julia_launch_count": result.julia_launch_count,
+        "root_read_count": result.root_read_count,
+        "determinant_evaluation_count": result.determinant_evaluation_count,
+        "evidence_level": "SCREENED",
+        "release_admissible": False,
+    }
+
+
 def _campaign_schema11_pass(
     command: str,
     selection_path: Path,
@@ -2120,6 +2190,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         elif arguments.command == "campaign-plan":
             status, output = _campaign_selected(
                 arguments.command, arguments.selection, Path("unused")
+            )
+        elif arguments.command == "campaign-admit-promoted":
+            status, output = _campaign_admit_promoted(
+                arguments.selection,
+                arguments.checkpoint,
+                binary64_lock_path=arguments.binary64_lock,
+                queue_ordinal=arguments.queue_ordinal,
+                review_receipt_path=arguments.review_receipt,
+                review_authority_sha256=arguments.review_authority_sha256,
             )
         elif arguments.command in {
             "campaign-run", "campaign-resume", "campaign-validate"

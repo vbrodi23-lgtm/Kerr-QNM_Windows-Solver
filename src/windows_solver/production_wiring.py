@@ -39,6 +39,15 @@ _REQUIRED_CALLS = {
             "diagnostic_session",
         },
     },
+    "run_native_promoted_admission": {
+        "admit_retained_promoted_checkpoint": {
+            "queue_ordinal",
+            "independent_review_receipt",
+            "expected_authority_sha256",
+            "layer1_guard",
+            "terminal_record_committed",
+        },
+    },
 }
 
 

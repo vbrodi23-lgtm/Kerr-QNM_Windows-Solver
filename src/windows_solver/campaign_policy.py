@@ -769,6 +769,50 @@ def finish_promotion(
     return result
 
 
+def complete_promoted_admission(
+    checkpoint: Mapping[str, object],
+    *,
+    queue_ordinal: int,
+    admission_receipt: Mapping[str, object],
+    layer1_guard: object | None = None,
+) -> dict[str, object]:
+    """Transition retained numerics to COMPLETED without numerical work."""
+
+    result = validate_schema11_checkpoint(checkpoint)
+    queue = result["promotion_queue"]
+    assert isinstance(queue, dict)
+    entries = queue["entries"]
+    assert isinstance(entries, list)
+    if (
+        isinstance(queue_ordinal, bool)
+        or not isinstance(queue_ordinal, int)
+        or queue_ordinal < 0
+        or queue_ordinal >= len(entries)
+    ):
+        raise ValueError("promotion queue ordinal is invalid")
+    entry = entries[queue_ordinal]
+    if (
+        entry["queue_ordinal"] != queue_ordinal
+        or entry["disposition"]
+        != PromotionQueueDisposition.AWAITING_ADMISSION.value
+        or not _is_sha256(entry["retained_promoted_stage_sha256"])
+    ):
+        raise ValueError("promotion queue entry is not awaiting admission")
+    receipt = copy.deepcopy(dict(admission_receipt))
+    if (
+        receipt.get("queue_ordinal") != queue_ordinal
+        or receipt.get("leaf_id") != entry["leaf_id"]
+        or receipt.get("retained_stage_sha256")
+        != entry["retained_promoted_stage_sha256"]
+    ):
+        raise ValueError("promotion admission receipt binding is invalid")
+    receipt["source_fingerprint_sha256"] = entry["source_fingerprint_sha256"]
+    entry["disposition"] = PromotionQueueDisposition.COMPLETED.value
+    entry["disposition_receipt_sha256"] = _sha256(receipt)
+    _assert_layer1_guard(layer1_guard, result)
+    return result
+
+
 def validate_schema11_checkpoint(
     value: Mapping[str, object],
 ) -> dict[str, object]:
@@ -1123,6 +1167,7 @@ __all__ = [
     "SurveyPass",
     "add_numerical_record",
     "append_promotion",
+    "complete_promoted_admission",
     "empty_schema11_checkpoint",
     "finish_promotion",
     "promotion_source_fingerprint_sha256",

@@ -24,6 +24,7 @@ from windows_solver.campaign_policy import (
     SurveyPass,
     add_numerical_record,
     append_promotion,
+    complete_promoted_admission,
     empty_schema11_checkpoint,
     finish_promotion,
     promotion_source_fingerprint_sha256,
@@ -379,6 +380,45 @@ class Binary64LayerLockTests(unittest.TestCase):
             assert_binary64_layer_unchanged(
                 lock,
                 retained,
+                selection=self.selection,
+                leaf_mechanism_ids={self.leaf.leaf_id: self.leaf.mechanism_id},
+                auxiliary_evidence_manifest=self._auxiliary_manifest(source_stage),
+            ),
+        )
+        admitted = complete_promoted_admission(
+            retained,
+            queue_ordinal=0,
+            admission_receipt={
+                "schema": "windows-solver.test-independent-review/1",
+                "queue_ordinal": 0,
+                "leaf_id": self.leaf.leaf_id,
+                "retained_stage_sha256": promoted_stage["stage_sha256"],
+            },
+            layer1_guard=guard,
+        )
+        admitted = record_survey_disposition(
+            admitted,
+            survey_pass=SurveyPass.PROMOTED,
+            leaf_id=self.leaf.leaf_id,
+            disposition=SurveyDisposition.COMPLETED,
+            operation_identity="promoted-independent-review-admission/v1",
+            precision_tiers=("BF40",),
+            reason_code="ADMITTED_AFTER_INDEPENDENT_REVIEW",
+            sample_count=0,
+            sample_limit=0,
+            root_read_count=0,
+            root_read_limit=0,
+            worker_launch_count=0,
+            worker_launch_limit=0,
+            tier_timing=(),
+            session_fragments=(),
+            layer1_guard=guard,
+        )
+        self.assertEqual(
+            lock,
+            assert_binary64_layer_unchanged(
+                lock,
+                admitted,
                 selection=self.selection,
                 leaf_mechanism_ids={self.leaf.leaf_id: self.leaf.mechanism_id},
                 auxiliary_evidence_manifest=self._auxiliary_manifest(source_stage),

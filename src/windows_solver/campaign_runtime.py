@@ -110,6 +110,10 @@ from .julia_response_backend import (
     _validated_execution_resource_policy,
 )
 from .promoted_control_calibration import load_default_calibration_receipt
+from .promoted_admission import (
+    PromotedAdmissionResult,
+    admit_retained_promoted_checkpoint,
+)
 from .root_evidence import AuthenticatedRootEvidence, RootDependencyKey
 from .root_readout_cache import RootEvidenceStore, RootReadoutStore
 from .reviewed_determinant_error import ReviewedDeterminantErrorStore
@@ -2246,6 +2250,74 @@ def run_native_promoted_pass(
     )
 
 
+def run_native_promoted_admission(
+    plan: object,
+    selection: object,
+    recovery_selection: RecoverySelection,
+    checkpoint: Mapping[str, object],
+    *,
+    checkpoint_path: Path,
+    binary64_lock_path: Path,
+    queue_ordinal: int,
+    independent_review_receipt: Mapping[str, object],
+    expected_authority_sha256: str,
+    solved_leaf_store: SolvedLeafStore | None = None,
+    background_evidence_store: CanonicalBackgroundEvidenceStore | None = None,
+) -> PromotedAdmissionResult:
+    """Admit retained Layer-2 work and publish it with zero numerical calls."""
+
+    root_evidence_store = RootEvidenceStore.for_checkpoint(checkpoint_path)
+    background_store = background_evidence_store or CanonicalBackgroundEvidenceStore(
+        checkpoint_path.parent / f"{checkpoint_path.name}.canonical-backgrounds"
+    )
+    lock = load_binary64_layer_lock(binary64_lock_path)
+    manifest = build_binary64_layer_auxiliary_evidence_manifest(
+        plan,
+        checkpoint,
+        root_evidence_store=root_evidence_store,
+        background_evidence_store=background_store,
+    )
+    layer1_guard = Layer1Guard.from_authenticated_lock(
+        lock,
+        checkpoint,
+        selection=recovery_selection,
+        leaf_mechanism_ids=_layer1_leaf_mechanism_ids(plan, recovery_selection),
+        auxiliary_evidence_manifest=manifest,
+    )
+    leaves = {leaf.leaf_id: leaf for leaf in getattr(plan, "leaves")}
+    store = solved_leaf_store or SolvedLeafStore.default()
+
+    def publish(record: Mapping[str, object]) -> None:
+        leaf_id = str(record.get("leaf_id"))
+        leaf = leaves.get(leaf_id)
+        if leaf is None or leaf_id not in recovery_selection.scientific_identities:
+            raise ValueError("admitted promoted record leaf is outside the selection")
+        validate_campaign_recovery_record(plan, leaf_id, record)
+        identity = recovery_selection.scientific_identities[leaf_id]
+        lookup = store.publish_if_missing(
+            scientific_identity_sha256=identity,
+            leaf_id=leaf_id,
+            record=record,
+            source_type="independent-review-admission",
+        )
+        if (
+            lookup.status is not SolvedLeafLookupStatus.HIT
+            or lookup.receipt is None
+            or canonical_json_bytes(lookup.receipt.get("record"))
+            != canonical_json_bytes(record)
+        ):
+            raise ValueError("admitted promoted record was not published exactly")
+
+    return admit_retained_promoted_checkpoint(
+        checkpoint_path,
+        queue_ordinal=queue_ordinal,
+        independent_review_receipt=independent_review_receipt,
+        expected_authority_sha256=expected_authority_sha256,
+        layer1_guard=layer1_guard,
+        terminal_record_committed=publish,
+    )
+
+
 def _central_evidence(
     record: Mapping[str, object],
 ) -> tuple[complex, float, str]:
@@ -2394,5 +2466,6 @@ __all__ = [
     "build_fixed_root_screening_record",
     "run_native_binary64_pass",
     "run_native_evidence_pass",
+    "run_native_promoted_admission",
     "run_native_promoted_pass",
 ]
