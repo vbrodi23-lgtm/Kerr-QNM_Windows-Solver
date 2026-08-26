@@ -559,16 +559,20 @@ class PublicSurfaceTests(unittest.TestCase):
         self.assertIn("[switch]$RebuildRuntime", launcher)
         self.assertIn("[switch]$NewCampaign", launcher)
         self.assertIn('[ValidateSet("survey", "certify", "validate")]', launcher)
-        self.assertIn('[ValidateSet("binary64", "promoted")]', launcher)
+        self.assertIn(
+            '[ValidateSet("binary64", "promoted", "full")]',
+            launcher,
+        )
+        self.assertIn('[string]$SurveyPass = "full"', launcher)
         self.assertIn('"campaign-plan"', launcher)
         self.assertIn('Write-Host "M02 campaign startup"', launcher)
         self.assertIn('"campaign-survey-binary64"', launcher)
+        self.assertIn('"campaign-lock-binary64"', launcher)
         self.assertIn('"campaign-survey-promoted"', launcher)
         self.assertIn('"campaign-certify"', launcher)
         self.assertIn('"campaign-evidence-validate"', launcher)
         self.assertIn('"campaign-schema11-validate"', launcher)
         self.assertNotIn('campaign-resume', launcher)
-        self.assertNotIn('"--full"', launcher)
         self.assertIn('if ($RebuildRuntime)', launcher)
         self.assertIn('[ValidateSet("quiet", "normal", "trace")]', launcher)
         self.assertIn('[string]$Progress = "normal"', launcher)
@@ -677,6 +681,14 @@ if ($SolverArguments[0] -eq "campaign-new") {
     New-Item -ItemType Directory -Force -Path (Split-Path -Parent $checkpoint) |
         Out-Null
     [IO.File]::WriteAllText($checkpoint, "{}")
+    exit 0
+}
+if ($SolverArguments[0] -eq "campaign-lock-binary64") {
+    $outputIndex = [Array]::IndexOf($SolverArguments, "--output")
+    $lock = [IO.Path]::GetFullPath($SolverArguments[$outputIndex + 1])
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $lock) |
+        Out-Null
+    [IO.File]::WriteAllText($lock, "{}")
     exit 0
 }
 if ($SolverArguments[0] -eq "campaign-schema11-validate") {
@@ -823,7 +835,7 @@ $record = [ordered]@{ default = $default; portable = $portable } | ConvertTo-Jso
             self.assertTrue(Path(resolved["portable"]).samefile(expected_portable))
 
     @unittest.skipUnless(os.name == "nt", "requires Windows PowerShell 5.1")
-    def test_m02_public_default_invocation_resumes_binary64_only(self) -> None:
+    def test_m02_public_default_invocation_runs_locked_full_chain(self) -> None:
         root = Path(__file__).resolve().parents[1]
         windows_powershell = Path(os.environ["SystemRoot"]).joinpath(
             "System32", "WindowsPowerShell", "v1.0", "powershell.exe"
@@ -860,6 +872,14 @@ if ($SolverArguments[0] -eq "campaign-prepare-resources") {
 }
 if ($SolverArguments[0] -eq "campaign-plan") {
     '{"role_counts":{"primary":140,"control":24,"deep":48},"leaf_count":212}'
+    exit 0
+}
+if ($SolverArguments[0] -eq "campaign-lock-binary64") {
+    $outputIndex = [Array]::IndexOf($SolverArguments, "--output")
+    $lock = [IO.Path]::GetFullPath($SolverArguments[$outputIndex + 1])
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $lock) |
+        Out-Null
+    [IO.File]::WriteAllText($lock, "{}")
     exit 0
 }
 if ($SolverArguments[0] -eq "campaign-schema11-validate") {
@@ -911,6 +931,7 @@ exit 0
                 for line in argument_log.read_text(encoding="utf-8").splitlines()
             ]
             selection_path = package_root / "examples" / "m02-campaign.json"
+            binary64_lock_path = Path(f"{checkpoint_path}.binary64-lock.json")
             for call in calls:
                 self.assertTrue(Path(call[1]).samefile(selection_path))
                 call[1] = str(selection_path)
@@ -921,6 +942,19 @@ exit 0
                 )
                 call[checkpoint_index] = str(checkpoint_path)
             for call in calls:
+                if "--output" in call:
+                    output_index = call.index("--output") + 1
+                    self.assertTrue(
+                        Path(call[output_index]).samefile(binary64_lock_path)
+                    )
+                    call[output_index] = str(binary64_lock_path)
+                if "--binary64-lock" in call:
+                    lock_index = call.index("--binary64-lock") + 1
+                    self.assertTrue(
+                        Path(call[lock_index]).samefile(binary64_lock_path)
+                    )
+                    call[lock_index] = str(binary64_lock_path)
+            for call in calls:
                 if "--diagnostic-session-id" in call:
                     session_index = call.index("--diagnostic-session-id") + 1
                     self.assertRegex(call[session_index], r"^[0-9a-f]{32}$")
@@ -928,6 +962,7 @@ exit 0
 
         selection = str(selection_path)
         checkpoint = str(checkpoint_path)
+        binary64_lock = str(binary64_lock_path)
         self.assertEqual(
             calls,
             [
@@ -956,12 +991,34 @@ exit 0
                     "generated-session-id",
                 ],
                 [
+                    "campaign-lock-binary64",
+                    selection,
+                    "--checkpoint",
+                    checkpoint,
+                    "--output",
+                    binary64_lock,
+                ],
+                [
+                    "campaign-survey-promoted",
+                    selection,
+                    "--checkpoint",
+                    checkpoint,
+                    "--progress",
+                    "normal",
+                    "--diagnostic-session-id",
+                    "generated-session-id",
+                    "--binary64-lock",
+                    binary64_lock,
+                ],
+                [
                     "campaign-schema11-validate",
                     selection,
                     "--checkpoint",
                     checkpoint,
                     "--pass",
-                    "binary64",
+                    "promoted",
+                    "--binary64-lock",
+                    binary64_lock,
                 ],
             ],
         )
@@ -972,7 +1029,7 @@ exit 0
         self,
     ) -> None:
         """A fresh checkout has no default checkpoint. Plain ``m02.ps1``
-        must treat that as an ordinary first run under the default binary64
+        must treat that as an ordinary first run under the default full
         survey profile, not require a separate ``-NewCampaign`` flag."""
 
         root = Path(__file__).resolve().parents[1]
@@ -1019,6 +1076,14 @@ if ($SolverArguments[0] -eq "campaign-new") {
 }
 if ($SolverArguments[0] -eq "campaign-plan") {
     '{"role_counts":{"primary":140,"control":24,"deep":48},"leaf_count":212}'
+    exit 0
+}
+if ($SolverArguments[0] -eq "campaign-lock-binary64") {
+    $outputIndex = [Array]::IndexOf($SolverArguments, "--output")
+    $lock = [IO.Path]::GetFullPath($SolverArguments[$outputIndex + 1])
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $lock) |
+        Out-Null
+    [IO.File]::WriteAllText($lock, "{}")
     exit 0
 }
 if ($SolverArguments[0] -eq "campaign-schema11-validate") {
@@ -1076,12 +1141,26 @@ exit 0
             output_index = calls[1].index("--output") + 1
             self.assertTrue(Path(calls[1][output_index]).samefile(checkpoint_path))
             calls[1][output_index] = str(checkpoint_path)
+            binary64_lock_path = Path(f"{checkpoint_path}.binary64-lock.json")
             for call in calls[3:]:
                 checkpoint_index = call.index("--checkpoint") + 1
                 self.assertTrue(
                     Path(call[checkpoint_index]).samefile(checkpoint_path)
                 )
                 call[checkpoint_index] = str(checkpoint_path)
+            for call in calls:
+                if "--output" in call and call[0] == "campaign-lock-binary64":
+                    output_index = call.index("--output") + 1
+                    self.assertTrue(
+                        Path(call[output_index]).samefile(binary64_lock_path)
+                    )
+                    call[output_index] = str(binary64_lock_path)
+                if "--binary64-lock" in call:
+                    lock_index = call.index("--binary64-lock") + 1
+                    self.assertTrue(
+                        Path(call[lock_index]).samefile(binary64_lock_path)
+                    )
+                    call[lock_index] = str(binary64_lock_path)
             for call in calls:
                 if "--diagnostic-session-id" in call:
                     session_index = call.index("--diagnostic-session-id") + 1
@@ -1090,6 +1169,7 @@ exit 0
 
         selection = str(selection_path)
         checkpoint = str(checkpoint_path)
+        binary64_lock = str(binary64_lock_path)
         self.assertEqual(
             calls,
             [
@@ -1124,12 +1204,34 @@ exit 0
                     "generated-session-id",
                 ],
                 [
+                    "campaign-lock-binary64",
+                    selection,
+                    "--checkpoint",
+                    checkpoint,
+                    "--output",
+                    binary64_lock,
+                ],
+                [
+                    "campaign-survey-promoted",
+                    selection,
+                    "--checkpoint",
+                    checkpoint,
+                    "--progress",
+                    "normal",
+                    "--diagnostic-session-id",
+                    "generated-session-id",
+                    "--binary64-lock",
+                    binary64_lock,
+                ],
+                [
                     "campaign-schema11-validate",
                     selection,
                     "--checkpoint",
                     checkpoint,
                     "--pass",
-                    "binary64",
+                    "promoted",
+                    "--binary64-lock",
+                    binary64_lock,
                 ],
             ],
         )
@@ -1440,6 +1542,7 @@ $candidate | ConvertTo-Json -Compress | Set-Content -LiteralPath $env:M02_TEST_J
             "operator-approved/v1",
             "permitted/v1",
             "blocked-pending-independent-review/v1",
+            "independent-promoted-review-retained-stage/v1",
             "empirical-current-run-only/v1",
             "windows-solver.horizon-promotion-trigger/v1",
             "windows-solver.promoted-horizon-survey-comparison/v1",
