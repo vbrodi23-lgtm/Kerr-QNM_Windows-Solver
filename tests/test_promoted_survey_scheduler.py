@@ -532,6 +532,118 @@ class PromotedSurveySchedulerTests(unittest.TestCase):
         self.assertEqual({}, result.checkpoint["evidence_ledger"])
         self.assertEqual([], result.checkpoint["records"])
 
+    def test_bf80_interruption_resumes_from_the_retained_bf40_stage(self):
+        checkpoint = self._checkpoint(PromotionQueueKind.ROOT)
+        interrupted_calls: list[int] = []
+        resumed_calls: list[int] = []
+        root_calls: list[int] = []
+
+        def root_seal_lookup(_leaf, _entry):
+            return None
+
+        def primary_root_runner(leaf, _backend, digits):
+            root_calls.append(digits)
+            return PromotedRootSolveResult(
+                AuthenticatedRootSeal(
+                    leaf.job.root.omega,
+                    leaf.job.root.branch_id,
+                    "b" * 64,
+                ),
+                precision_tier=f"BF{digits}",
+            )
+
+        class InterruptingBackend(_Backend):
+            def fixed_root_survey_batch(self, job, **kwargs):
+                if self.digits == 40:
+                    self.calls.append(self.digits)
+                    raise JuliaNumericalControlError(
+                        "reviewed numerical insufficiency",
+                        "INSUFFICIENT_ASYMPTOTIC_PRECISION",
+                    )
+                if self.digits == 80:
+                    self.calls.append(self.digits)
+                    raise KeyboardInterrupt
+                return super().fixed_root_survey_batch(job, **kwargs)
+
+        preflight = require_locked_bf40_determinant_error_issuance_authority(
+            route="EXTERIOR_BF40"
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "checkpoint.json"
+            with self.assertRaises(KeyboardInterrupt):
+                run_promoted_survey(
+                    self.plan,
+                    self.selection,
+                    checkpoint,
+                    checkpoint_path=path,
+                    root_seal_lookup=root_seal_lookup,
+                    provisional_stage_lookup=lambda _leaf, entry: entry[
+                        "provisional_stage"
+                    ],
+                    root_seal_publish=lambda *_args: None,
+                    backend_factory=lambda leaf, digits: InterruptingBackend(
+                        leaf,
+                        digits,
+                        False,
+                        interrupted_calls,
+                    ),
+                    primary_root_runner=primary_root_runner,
+                    horizon_runner=lambda _leaf: self.fail("unexpected horizon"),
+                    produced_record_builder=lambda leaf, batch, screening, digits: (
+                        _record(leaf.leaf_id, digits)
+                    ),
+                    promoted_preflights_by_ordinal={0: preflight},
+                    layer1_lock_receipt_sha256="f" * 64,
+                )
+
+            interrupted = json.loads(path.read_text(encoding="utf-8"))
+            partial = interrupted["promoted_stage_ledger"]["0"][
+                self.leaves[0].leaf_id
+            ]
+            self.assertEqual([40, 80], interrupted_calls)
+            self.assertEqual([40], root_calls)
+            self.assertEqual(
+                "PENDING",
+                interrupted["promotion_queue"]["entries"][0]["disposition"],
+            )
+            self.assertEqual("NUMERICAL_CONTINUATION", partial["admission_state"])
+            self.assertEqual(["BF40"], partial["precision_tiers"])
+
+            resumed = run_promoted_survey(
+                self.plan,
+                self.selection,
+                interrupted,
+                checkpoint_path=path,
+                root_seal_lookup=root_seal_lookup,
+                provisional_stage_lookup=lambda _leaf, entry: entry[
+                    "provisional_stage"
+                ],
+                root_seal_publish=lambda *_args: None,
+                backend_factory=lambda leaf, digits: _Backend(
+                    leaf, digits, False, resumed_calls
+                ),
+                primary_root_runner=lambda *_args: self.fail(
+                    "resume must reuse the retained BF40 root seal"
+                ),
+                horizon_runner=lambda _leaf: self.fail("unexpected horizon"),
+                produced_record_builder=lambda leaf, batch, screening, digits: (
+                    _record(leaf.leaf_id, digits)
+                ),
+                promoted_preflights_by_ordinal={0: preflight},
+                layer1_lock_receipt_sha256="f" * 64,
+            )
+
+        retained = resumed.checkpoint["promoted_stage_ledger"]["0"][
+            self.leaves[0].leaf_id
+        ]
+        self.assertEqual([80], resumed_calls)
+        self.assertEqual([40], root_calls)
+        self.assertEqual(
+            "AWAITING_ADMISSION",
+            resumed.checkpoint["promotion_queue"]["entries"][0]["disposition"],
+        )
+        self.assertEqual(["BF40", "BF80"], retained["precision_tiers"])
+
     def test_resume_reloads_promoted_background_without_reacquiring_it(self):
         first, _ = self._run(
             self._checkpoint(count=1),

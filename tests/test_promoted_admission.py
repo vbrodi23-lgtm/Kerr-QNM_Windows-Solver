@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
+from unittest.mock import patch
 
+import windows_solver.promoted_admission as promoted_admission
 from windows_solver.campaign_policy import (
     PromotionQueueKind,
     SurveyDisposition,
@@ -16,6 +19,9 @@ from windows_solver.campaign_policy import (
 )
 from windows_solver.contracts import canonical_json_bytes
 from windows_solver.cli import build_parser
+from windows_solver.promoted_control_calibration import (
+    load_default_calibration_receipt,
+)
 from windows_solver.promoted_admission import admit_retained_promoted_checkpoint
 
 
@@ -24,7 +30,7 @@ def _sha256(value: object) -> str:
 
 
 class PromotedAdmissionTests(unittest.TestCase):
-    def test_cli_requires_review_receipt_authority_and_layer1_lock(self):
+    def test_cli_derives_review_authority_from_the_canonical_receipt(self):
         parsed = build_parser().parse_args([
             "campaign-admit-promoted",
             "selection.json",
@@ -36,15 +42,19 @@ class PromotedAdmissionTests(unittest.TestCase):
             "7",
             "--review-receipt",
             "review.json",
-            "--review-authority-sha256",
-            "d" * 64,
         ])
 
         self.assertEqual("campaign-admit-promoted", parsed.command)
         self.assertEqual(7, parsed.queue_ordinal)
         self.assertEqual(Path("review.json"), parsed.review_receipt)
+        self.assertFalse(hasattr(parsed, "review_authority_sha256"))
 
-    def _checkpoint_and_review(self):
+    def _checkpoint_and_review(
+        self,
+        *,
+        calibration_receipt_sha256: str = "c" * 64,
+        authority_sha256: str = "d" * 64,
+    ):
         leaf_id = "leaf-1"
         scientific_identity = "b" * 64
         central_stage_content = {
@@ -82,7 +92,7 @@ class PromotedAdmissionTests(unittest.TestCase):
             "route": "EXTERIOR_BF40",
             "execution_mode": "CALCULATE_ONLY",
             "admission_state": "AWAITING_ADMISSION",
-            "calibration_receipt_sha256": "c" * 64,
+            "calibration_receipt_sha256": calibration_receipt_sha256,
             "precision_tiers": ["BF40"],
             "current_run_disagreement_terms": [
                 {"delta_same_point": "0.1", "delta_cross_precision": "0.2"}
@@ -124,14 +134,14 @@ class PromotedAdmissionTests(unittest.TestCase):
         review_content = {
             "schema": "windows-solver.independent-promoted-review-receipt/1",
             "decision": "ADMIT_SCREENED",
-            "authority_sha256": "d" * 64,
+            "authority_sha256": authority_sha256,
             "reviewed_at_utc": "2026-08-26T00:00:00Z",
             "queue_ordinal": 0,
             "leaf_id": leaf_id,
             "route": "EXTERIOR_BF40",
             "scientific_computation_identity": scientific_identity,
             "retained_stage_sha256": calculation["stage_sha256"],
-            "calibration_receipt_sha256": "c" * 64,
+            "calibration_receipt_sha256": calibration_receipt_sha256,
             "disagreement_term_sha256s": [
                 _sha256(calculation_content["current_run_disagreement_terms"][0])
             ],
@@ -142,7 +152,11 @@ class PromotedAdmissionTests(unittest.TestCase):
         return checkpoint, calculation, review, record
 
     def test_review_admission_is_durable_and_performs_zero_numerical_work(self):
-        checkpoint, calculation, review, record = self._checkpoint_and_review()
+        calibration = load_default_calibration_receipt()
+        checkpoint, calculation, review, record = self._checkpoint_and_review(
+            calibration_receipt_sha256=calibration.sha256,
+            authority_sha256=calibration.independent_review_authority_sha256,
+        )
         published: list[dict[str, object]] = []
 
         with TemporaryDirectory() as temporary:
@@ -152,7 +166,6 @@ class PromotedAdmissionTests(unittest.TestCase):
                 path,
                 queue_ordinal=0,
                 independent_review_receipt=review,
-                expected_authority_sha256="d" * 64,
                 terminal_record_committed=lambda value: published.append(dict(value)),
             )
 
@@ -174,8 +187,128 @@ class PromotedAdmissionTests(unittest.TestCase):
         )
         self.assertEqual([record], published)
 
+    def test_publication_failure_leaves_admission_pending_for_retry(self):
+        calibration = load_default_calibration_receipt()
+        checkpoint, _calculation, review, record = self._checkpoint_and_review(
+            calibration_receipt_sha256=calibration.sha256,
+            authority_sha256=calibration.independent_review_authority_sha256,
+        )
+        published: list[dict[str, object]] = []
+
+        def unavailable(_record: object) -> None:
+            raise RuntimeError("solved-leaf store unavailable")
+
+        with TemporaryDirectory() as temporary:
+            path = Path(temporary) / "checkpoint.json"
+            path.write_bytes(canonical_json_bytes(checkpoint))
+            with self.assertRaisesRegex(RuntimeError, "solved-leaf store unavailable"):
+                admit_retained_promoted_checkpoint(
+                    path,
+                    queue_ordinal=0,
+                    independent_review_receipt=review,
+                    terminal_record_committed=unavailable,
+                )
+            durable = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                "AWAITING_ADMISSION",
+                durable["promotion_queue"]["entries"][0]["disposition"],
+            )
+            self.assertEqual([], durable["records"])
+            self.assertEqual({}, durable["evidence_ledger"])
+            retried = admit_retained_promoted_checkpoint(
+                path,
+                queue_ordinal=0,
+                independent_review_receipt=review,
+                terminal_record_committed=lambda value: published.append(dict(value)),
+            )
+
+        self.assertEqual("COMPLETED", retried.checkpoint[
+            "promotion_queue"
+        ]["entries"][0]["disposition"])
+        self.assertEqual([record], published)
+
+    def test_checkpoint_interruption_retries_through_idempotent_publication(self):
+        calibration = load_default_calibration_receipt()
+        checkpoint, _calculation, review, record = self._checkpoint_and_review(
+            calibration_receipt_sha256=calibration.sha256,
+            authority_sha256=calibration.independent_review_authority_sha256,
+        )
+        published: list[dict[str, object]] = []
+
+        def publish_if_missing(value: object) -> None:
+            candidate = dict(value)
+            if published and canonical_json_bytes(published[0]) != canonical_json_bytes(
+                candidate
+            ):
+                self.fail("retry tried to publish different solved-leaf evidence")
+            if not published:
+                published.append(candidate)
+
+        original_write = promoted_admission._write_atomic
+        attempts = 0
+
+        def interrupt_once(path: Path, candidate: object) -> None:
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise OSError("simulated checkpoint interruption")
+            original_write(path, candidate)
+
+        with TemporaryDirectory() as temporary:
+            path = Path(temporary) / "checkpoint.json"
+            path.write_bytes(canonical_json_bytes(checkpoint))
+            with patch.object(
+                promoted_admission, "_write_atomic", side_effect=interrupt_once
+            ):
+                with self.assertRaisesRegex(OSError, "checkpoint interruption"):
+                    admit_retained_promoted_checkpoint(
+                        path,
+                        queue_ordinal=0,
+                        independent_review_receipt=review,
+                        terminal_record_committed=publish_if_missing,
+                    )
+                pending = json.loads(path.read_text(encoding="utf-8"))
+                self.assertEqual(
+                    "AWAITING_ADMISSION",
+                    pending["promotion_queue"]["entries"][0]["disposition"],
+                )
+                result = admit_retained_promoted_checkpoint(
+                    path,
+                    queue_ordinal=0,
+                    independent_review_receipt=review,
+                    terminal_record_committed=publish_if_missing,
+                )
+
+        self.assertEqual(2, attempts)
+        self.assertEqual([record], published)
+        self.assertEqual(
+            "COMPLETED",
+            result.checkpoint["promotion_queue"]["entries"][0]["disposition"],
+        )
+
+    def test_review_authority_is_pinned_to_the_calibration_receipt(self):
+        calibration = load_default_calibration_receipt()
+        checkpoint, _calculation, review, _record = self._checkpoint_and_review(
+            calibration_receipt_sha256=calibration.sha256,
+            authority_sha256="d" * 64,
+        )
+
+        with TemporaryDirectory() as temporary:
+            path = Path(temporary) / "checkpoint.json"
+            path.write_bytes(canonical_json_bytes(checkpoint))
+            with self.assertRaisesRegex(ValueError, "authentication"):
+                admit_retained_promoted_checkpoint(
+                    path,
+                    queue_ordinal=0,
+                    independent_review_receipt=review,
+                )
+
     def test_review_receipt_tampering_fails_before_admission(self):
-        checkpoint, _calculation, review, _record = self._checkpoint_and_review()
+        calibration = load_default_calibration_receipt()
+        checkpoint, _calculation, review, _record = self._checkpoint_and_review(
+            calibration_receipt_sha256=calibration.sha256,
+            authority_sha256=calibration.independent_review_authority_sha256,
+        )
         review["route"] = "HORIZON_BF80"
 
         with TemporaryDirectory() as temporary:
@@ -186,7 +319,6 @@ class PromotedAdmissionTests(unittest.TestCase):
                     path,
                     queue_ordinal=0,
                     independent_review_receipt=review,
-                    expected_authority_sha256="d" * 64,
                 )
 
 

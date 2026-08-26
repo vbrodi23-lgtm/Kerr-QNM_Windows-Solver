@@ -561,6 +561,70 @@ def append_promotion(
     return result
 
 
+def retain_promoted_continuation(
+    checkpoint: Mapping[str, object],
+    *,
+    queue_ordinal: int,
+    promoted_stage: Mapping[str, object],
+    execution_mode: str,
+    layer1_guard: object | None = None,
+) -> dict[str, object]:
+    """Durably retain completed BF40 work before its one allowed BF80 retry."""
+
+    result = validate_schema11_checkpoint(checkpoint)
+    if execution_mode not in _PROMOTED_EXECUTION_MODES - {"BLOCK_ALL"}:
+        raise ValueError("promoted continuation execution mode is invalid")
+    queue = result["promotion_queue"]
+    assert isinstance(queue, dict)
+    entries = queue["entries"]
+    assert isinstance(entries, list)
+    if (
+        isinstance(queue_ordinal, bool)
+        or not isinstance(queue_ordinal, int)
+        or queue_ordinal < 0
+        or queue_ordinal >= len(entries)
+    ):
+        raise ValueError("promotion queue ordinal is invalid")
+    entry = entries[queue_ordinal]
+    if (
+        entry["queue_ordinal"] != queue_ordinal
+        or entry["disposition"] != PromotionQueueDisposition.PENDING.value
+    ):
+        raise ValueError("promotion queue entry is not pending")
+    if not isinstance(promoted_stage, Mapping):
+        raise ValueError("promoted continuation stage is invalid")
+    stage = copy.deepcopy(dict(promoted_stage))
+    stage_content = {
+        key: item for key, item in stage.items() if key != "stage_sha256"
+    }
+    supplied_stage_sha256 = stage.get("stage_sha256")
+    if (
+        not _is_sha256(supplied_stage_sha256)
+        or supplied_stage_sha256 != _sha256(stage_content)
+        or stage.get("leaf_id") != entry["leaf_id"]
+        or stage.get("queue_ordinal") != queue_ordinal
+        or stage.get("execution_mode") != execution_mode
+        or stage.get("admission_state") != "NUMERICAL_CONTINUATION"
+        or stage.get("next_precision_tier") != "BF80"
+        or stage.get("precision_tiers") != ["BF40"]
+    ):
+        raise ValueError("promoted continuation stage authentication is invalid")
+    stage_ledger = result["promoted_stage_ledger"]
+    assert isinstance(stage_ledger, dict)
+    ordinal_key = str(queue_ordinal)
+    bucket = stage_ledger.setdefault(ordinal_key, {})
+    if not isinstance(bucket, dict):
+        raise ValueError("promoted stage ledger ordinal is invalid")
+    leaf_id = str(entry["leaf_id"])
+    existing_stage = bucket.get(leaf_id)
+    if existing_stage is not None and existing_stage != stage:
+        raise ValueError("conflicting promoted continuation stage")
+    bucket[leaf_id] = stage
+    entry["retained_promoted_stage_sha256"] = supplied_stage_sha256
+    _assert_layer1_guard(layer1_guard, result)
+    return result
+
+
 def retain_promoted_calculation(
     checkpoint: Mapping[str, object],
     *,
@@ -654,7 +718,12 @@ def retain_promoted_calculation(
     leaf_id = str(entry["leaf_id"])
     existing_stage = bucket.get(leaf_id)
     if existing_stage is not None and existing_stage != stage:
-        raise ValueError("conflicting retained promoted stage")
+        if not (
+            isinstance(existing_stage, Mapping)
+            and existing_stage.get("admission_state")
+            == "NUMERICAL_CONTINUATION"
+        ):
+            raise ValueError("conflicting retained promoted stage")
     bucket[leaf_id] = stage
     for ledger_field, payload, schema in (
         (
@@ -759,6 +828,26 @@ def finish_promotion(
         }
         if not _is_sha256(supplied) or supplied != _sha256(content):
             raise ValueError("provisional reuse receipt is invalid")
+    continuation_sha256 = entry["retained_promoted_stage_sha256"]
+    if continuation_sha256 is not None:
+        stage_ledger = result["promoted_stage_ledger"]
+        assert isinstance(stage_ledger, dict)
+        bucket = stage_ledger.get(str(queue_ordinal))
+        stage = (
+            bucket.get(str(entry["leaf_id"]))
+            if isinstance(bucket, dict)
+            else None
+        )
+        if (
+            not isinstance(stage, Mapping)
+            or stage.get("stage_sha256") != continuation_sha256
+            or stage.get("admission_state") != "NUMERICAL_CONTINUATION"
+        ):
+            raise ValueError("promotion continuation stage is invalid")
+        del bucket[str(entry["leaf_id"])]
+        if not bucket:
+            del stage_ledger[str(queue_ordinal)]
+        entry["retained_promoted_stage_sha256"] = None
     entry["disposition"] = disposition_value
     entry["disposition_receipt_sha256"] = _sha256(receipt)
     entry["provisional_reuse_receipt"] = reuse_receipt
@@ -1045,7 +1134,7 @@ def validate_schema11_checkpoint(
         )
         receipt_hash = entry.get("disposition_receipt_sha256")
         if disposition == PromotionQueueDisposition.PENDING.value:
-            if receipt_hash is not None or retained_promoted_stage_sha256 is not None:
+            if receipt_hash is not None:
                 raise ValueError("pending promotion cannot have a terminal receipt")
         elif not _is_sha256(receipt_hash):
             raise ValueError("terminal promotion requires a receipt digest")
@@ -1094,12 +1183,28 @@ def validate_schema11_checkpoint(
                 key: item for key, item in stage.items() if key != "stage_sha256"
             }
             stage_sha256 = stage.get("stage_sha256")
+            admission_state = stage.get("admission_state")
+            valid_terminal_stage = (
+                admission_state == "AWAITING_ADMISSION"
+                and queue_entry["disposition"]
+                in {
+                    PromotionQueueDisposition.AWAITING_ADMISSION.value,
+                    PromotionQueueDisposition.COMPLETED.value,
+                }
+            )
+            valid_continuation_stage = (
+                admission_state == "NUMERICAL_CONTINUATION"
+                and queue_entry["disposition"]
+                == PromotionQueueDisposition.PENDING.value
+                and stage.get("next_precision_tier") == "BF80"
+                and stage.get("precision_tiers") == ["BF40"]
+            )
             if (
                 not _is_sha256(stage_sha256)
                 or stage_sha256 != _sha256(content)
                 or queue_entry["retained_promoted_stage_sha256"] != stage_sha256
                 or stage.get("execution_mode") not in _PROMOTED_EXECUTION_MODES
-                or stage.get("admission_state") != "AWAITING_ADMISSION"
+                or not (valid_terminal_stage or valid_continuation_stage)
             ):
                 raise ValueError("schema-11 retained promoted stage is invalid")
             seen_stages.add((ordinal, leaf_id))
@@ -1174,5 +1279,6 @@ __all__ = [
     "record_evidence",
     "record_survey_disposition",
     "retain_promoted_calculation",
+    "retain_promoted_continuation",
     "validate_schema11_checkpoint",
 ]

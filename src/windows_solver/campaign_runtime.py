@@ -2260,7 +2260,6 @@ def run_native_promoted_admission(
     binary64_lock_path: Path,
     queue_ordinal: int,
     independent_review_receipt: Mapping[str, object],
-    expected_authority_sha256: str,
     solved_leaf_store: SolvedLeafStore | None = None,
     background_evidence_store: CanonicalBackgroundEvidenceStore | None = None,
 ) -> PromotedAdmissionResult:
@@ -2312,7 +2311,6 @@ def run_native_promoted_admission(
         checkpoint_path,
         queue_ordinal=queue_ordinal,
         independent_review_receipt=independent_review_receipt,
-        expected_authority_sha256=expected_authority_sha256,
         layer1_guard=layer1_guard,
         terminal_record_committed=publish,
     )

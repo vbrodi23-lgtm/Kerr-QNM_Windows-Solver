@@ -21,6 +21,7 @@ from .campaign_policy import (
     validate_schema11_checkpoint,
 )
 from .contracts import canonical_json_bytes
+from .promoted_control_calibration import load_default_calibration_receipt
 
 
 INDEPENDENT_PROMOTED_REVIEW_RECEIPT_SCHEMA = (
@@ -102,15 +103,17 @@ def admit_retained_promoted_work(
     *,
     queue_ordinal: int,
     independent_review_receipt: Mapping[str, object],
-    expected_authority_sha256: str,
     layer1_guard: object | None = None,
 ) -> PromotedAdmissionResult:
     """Admit one retained stage using hashes and policy only; run no numerics."""
 
+    calibration_receipt = load_default_calibration_receipt()
     result = validate_schema11_checkpoint(checkpoint)
     receipt = _validated_review_receipt(
         independent_review_receipt,
-        expected_authority_sha256=expected_authority_sha256,
+        expected_authority_sha256=(
+            calibration_receipt.independent_review_authority_sha256
+        ),
     )
     queue = result["promotion_queue"]
     if (
@@ -128,6 +131,8 @@ def admit_retained_promoted_work(
     )
     if not isinstance(retained_stage, Mapping):
         raise ValueError("independent review receipt retained stage is missing")
+    if retained_stage.get("calibration_receipt_sha256") != calibration_receipt.sha256:
+        raise ValueError("retained promoted stage calibration receipt mismatch")
     disagreement_terms = retained_stage.get("current_run_disagreement_terms")
     if not isinstance(disagreement_terms, list):
         raise ValueError("independent review receipt disagreement terms are missing")
@@ -250,11 +255,10 @@ def admit_retained_promoted_checkpoint(
     *,
     queue_ordinal: int,
     independent_review_receipt: Mapping[str, object],
-    expected_authority_sha256: str,
     layer1_guard: object | None = None,
     terminal_record_committed: Callable[[Mapping[str, object]], None] | None = None,
 ) -> PromotedAdmissionResult:
-    """Atomically persist one zero-numerics admission, then publish if requested."""
+    """Publish one reviewed result, then atomically persist its admission."""
 
     path = Path(checkpoint_path)
     checkpoint = _load_canonical_checkpoint(path)
@@ -262,11 +266,17 @@ def admit_retained_promoted_checkpoint(
         checkpoint,
         queue_ordinal=queue_ordinal,
         independent_review_receipt=independent_review_receipt,
-        expected_authority_sha256=expected_authority_sha256,
         layer1_guard=layer1_guard,
     )
     if layer1_guard is not None:
         layer1_guard.pre_write(admitted.checkpoint)
+    if terminal_record_committed is not None:
+        record = next(
+            item
+            for item in admitted.checkpoint["records"]
+            if item["leaf_id"] == admitted.leaf_id
+        )
+        terminal_record_committed(record)
     _write_atomic(path, admitted.checkpoint)
     durable = _load_canonical_checkpoint(path)
     if layer1_guard is not None:
@@ -278,11 +288,6 @@ def admit_retained_promoted_checkpoint(
         admitted_record_sha256=admitted.admitted_record_sha256,
         review_receipt_sha256=admitted.review_receipt_sha256,
     )
-    if terminal_record_committed is not None:
-        record = next(
-            item for item in durable["records"] if item["leaf_id"] == admitted.leaf_id
-        )
-        terminal_record_committed(record)
     if layer1_guard is not None:
         layer1_guard.post_callback(durable)
     return durable_result

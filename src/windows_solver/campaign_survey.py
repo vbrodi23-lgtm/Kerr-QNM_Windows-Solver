@@ -28,6 +28,7 @@ from .campaign_policy import (
     record_evidence,
     record_survey_disposition,
     retain_promoted_calculation,
+    retain_promoted_continuation,
     validate_schema11_checkpoint,
 )
 from .campaign_recovery import RecoverySelection
@@ -1872,6 +1873,50 @@ def _load_promoted_background_cache(
     return cache
 
 
+def _continuation_root_seal(
+    continuation_stage: Mapping[str, object] | None,
+    *,
+    leaf: object,
+) -> AuthenticatedRootSeal | None:
+    """Recover the exact BF40 root seal retained before a BF80 continuation."""
+
+    if continuation_stage is None:
+        return None
+    receipts = continuation_stage.get("receipts")
+    if not isinstance(receipts, list):
+        raise ValueError("promoted continuation receipts are invalid")
+    restored: AuthenticatedRootSeal | None = None
+    for receipt in receipts:
+        if (
+            not isinstance(receipt, Mapping)
+            or receipt.get("schema") != _PROMOTED_ROOT_RECEIPT_SCHEMA
+        ):
+            continue
+        fixed_root = receipt.get("fixed_root")
+        if (
+            receipt.get("precision_tier") != "BF40"
+            or not isinstance(fixed_root, Mapping)
+        ):
+            raise ValueError("promoted continuation root receipt is invalid")
+        try:
+            candidate = AuthenticatedRootSeal(
+                complex(
+                    float(fixed_root["real"]),
+                    float(fixed_root["imaginary"]),
+                ),
+                str(receipt["branch_identity"]),
+                str(receipt["root_seal_sha256"]),
+            )
+        except (KeyError, TypeError, ValueError) as error:
+            raise ValueError("promoted continuation root receipt is invalid") from error
+        if candidate.branch_identity != leaf.job.root.branch_id:
+            raise ValueError("promoted continuation root branch mismatch")
+        if restored is not None and restored != candidate:
+            raise ValueError("conflicting promoted continuation root")
+        restored = candidate
+    return restored
+
+
 def _run_promoted_exterior_queue_entry(
     leaf: object,
     entry: Mapping[str, object],
@@ -1894,9 +1939,19 @@ def _run_promoted_exterior_queue_entry(
     provisional_predecessor_receipt: Mapping[str, object] | None,
     execution_mode: PromotedExecutionMode,
     promoted_background_cache: dict[str, dict[str, object]],
+    continuation_stage: Mapping[str, object] | None = None,
+    tier_checkpoint: Callable[[PromotedPassOutcome], None] | None = None,
 ) -> PromotedPassOutcome:
     queue_kind = PromotionQueueKind(entry["queue_kind"])
     seal = root_seal_lookup(leaf, entry)
+    retained_root_seal = _continuation_root_seal(
+        continuation_stage,
+        leaf=leaf,
+    )
+    if retained_root_seal is not None:
+        if seal is not None and seal != retained_root_seal:
+            raise ValueError("promoted continuation root seal conflict")
+        seal = retained_root_seal
     if queue_kind is PromotionQueueKind.RESPONSE:
         if not isinstance(seal, AuthenticatedRootSeal):
             raise ValueError("promoted response queue lacks its authenticated root seal")
@@ -1920,10 +1975,50 @@ def _run_promoted_exterior_queue_entry(
 
     tiers: list[str] = []
     receipts: list[Mapping[str, object]] = []
-    if provisional_predecessor_receipt is not None:
-        receipts.append(dict(provisional_predecessor_receipt))
     sample_count = root_reads = worker_launches = 0
-    for digits in (40, 80):
+    digits_to_run = (40, 80)
+    if continuation_stage is not None:
+        if (
+            continuation_stage.get("admission_state")
+            != "NUMERICAL_CONTINUATION"
+            or continuation_stage.get("next_precision_tier") != "BF80"
+            or continuation_stage.get("queue_ordinal") != entry["queue_ordinal"]
+            or continuation_stage.get("leaf_id") != entry["leaf_id"]
+            or continuation_stage.get("precision_tiers") != ["BF40"]
+        ):
+            raise ValueError("promoted continuation stage is invalid")
+        retained_receipts = continuation_stage.get("receipts")
+        if not isinstance(retained_receipts, list) or not all(
+            isinstance(receipt, Mapping) for receipt in retained_receipts
+        ):
+            raise ValueError("promoted continuation receipts are invalid")
+        counters: list[int] = []
+        for field in ("sample_count", "root_read_count", "worker_launch_count"):
+            value = continuation_stage.get(field)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError("promoted continuation counters are invalid")
+            counters.append(value)
+        tiers = ["BF40"]
+        receipts = [copy.deepcopy(dict(receipt)) for receipt in retained_receipts]
+        sample_count, root_reads, worker_launches = counters
+        digits_to_run = (80,)
+    elif provisional_predecessor_receipt is not None:
+        receipts.append(dict(provisional_predecessor_receipt))
+
+    def checkpoint_bf40_before_bf80(reason_code: str) -> None:
+        if tier_checkpoint is None:
+            return
+        tier_checkpoint(PromotedPassOutcome(
+            disposition=SurveyDisposition.UNRESOLVED,
+            reason_code=reason_code,
+            precision_tiers=tuple(tiers),
+            sample_count=sample_count,
+            root_read_count=root_reads,
+            worker_launch_count=worker_launches,
+            evidence_receipts=tuple(receipts),
+        ))
+
+    for digits in digits_to_run:
         tier = f"BF{digits}"
         tiers.append(tier)
         timing_recorder.start_tier(tier)
@@ -1956,6 +2051,7 @@ def _run_promoted_exterior_queue_entry(
                     and decision.failure_code in PROMOTION_ALLOWLIST
                 ):
                     timing_recorder.complete_tier()
+                    checkpoint_bf40_before_bf80(decision.failure_code)
                     continue
                 if decision.disposition is FailureDisposition.PROMOTION_PENDING:
                     outcome = PromotedPassOutcome(
@@ -2047,6 +2143,7 @@ def _run_promoted_exterior_queue_entry(
                 and decision.failure_code in PROMOTION_ALLOWLIST
             ):
                 timing_recorder.complete_tier()
+                checkpoint_bf40_before_bf80(decision.failure_code)
                 continue
             if decision.disposition is FailureDisposition.PROMOTION_PENDING:
                 outcome = PromotedPassOutcome(
@@ -2226,6 +2323,7 @@ def _run_promoted_exterior_queue_entry(
             )
         if digits == 40:
             timing_recorder.complete_tier()
+            checkpoint_bf40_before_bf80(reason)
             continue
         outcome = PromotedPassOutcome(
             disposition=SurveyDisposition.UNRESOLVED,
@@ -2251,6 +2349,9 @@ def _retained_promoted_stage(
     preflight: PromotedExecutionPreflight,
     layer1_lock_receipt_sha256: str,
     scientific_computation_identity: str,
+    admission_state: str = "AWAITING_ADMISSION",
+    next_precision_tier: str | None = None,
+    numerical_disposition: str | None = None,
 ) -> dict[str, object]:
     """Authenticate all current-run numerics without admitting their claims."""
 
@@ -2298,7 +2399,8 @@ def _retained_promoted_stage(
         "scientific_computation_identity": scientific_computation_identity,
         "route": route,
         "execution_mode": preflight.mode.value,
-        "admission_state": "AWAITING_ADMISSION",
+        "admission_state": admission_state,
+        "next_precision_tier": next_precision_tier,
         "layer1_lock_receipt_sha256": layer1_lock_receipt_sha256,
         "source_fingerprint_sha256": queue_entry["source_fingerprint_sha256"],
         "predecessor_stage_sha256": queue_entry["source_stage_sha256"],
@@ -2308,7 +2410,11 @@ def _retained_promoted_stage(
         "numerical_control_identity_sha256": leaf.job.policy.identity_sha256,
         "operation_identity": outcome.operation_identity,
         "precision_tiers": list(outcome.precision_tiers),
-        "numerical_disposition": outcome.disposition.value,
+        "numerical_disposition": (
+            outcome.disposition.value
+            if numerical_disposition is None
+            else numerical_disposition
+        ),
         "reason_code": outcome.reason_code,
         "raw_promoted_batches": raw_batches,
         "current_run_disagreement_terms": disagreement_terms,
@@ -2332,6 +2438,50 @@ def _retained_promoted_stage(
         **material,
         "stage_sha256": hashlib.sha256(canonical_json_bytes(material)).hexdigest(),
     }
+
+
+def _commit_promoted_continuation(
+    checkpoint: Mapping[str, object],
+    *,
+    leaf: object,
+    queue_ordinal: int,
+    route: str,
+    outcome: PromotedPassOutcome,
+    execution_preflight: PromotedExecutionPreflight | None,
+    layer1_lock_receipt_sha256: str | None,
+    scientific_computation_identity: str,
+    layer1_guard: object | None = None,
+) -> dict[str, object]:
+    """Persist an allowlisted BF40 outcome before starting BF80."""
+
+    if (
+        execution_preflight is None
+        or execution_preflight.mode is PromotedExecutionMode.BLOCK_ALL
+        or layer1_lock_receipt_sha256 is None
+    ):
+        raise ValueError("promoted continuation lacks authenticated route policy")
+    result = validate_schema11_checkpoint(checkpoint)
+    queue_entry = result["promotion_queue"]["entries"][queue_ordinal]
+    stage = _retained_promoted_stage(
+        leaf=leaf,
+        queue_entry=queue_entry,
+        queue_ordinal=queue_ordinal,
+        route=route,
+        outcome=outcome,
+        preflight=execution_preflight,
+        layer1_lock_receipt_sha256=layer1_lock_receipt_sha256,
+        scientific_computation_identity=scientific_computation_identity,
+        admission_state="NUMERICAL_CONTINUATION",
+        next_precision_tier="BF80",
+        numerical_disposition="AWAITING_BF80",
+    )
+    return retain_promoted_continuation(
+        result,
+        queue_ordinal=queue_ordinal,
+        promoted_stage=stage,
+        execution_mode=execution_preflight.mode.value,
+        layer1_guard=layer1_guard,
+    )
 
 
 def _commit_promoted_outcome(
@@ -2894,6 +3044,26 @@ def run_promoted_survey(
             if execution_preflight is None
             else execution_preflight.mode
         )
+        continuation_stage: Mapping[str, object] | None = None
+        continuation_sha256 = snapshot.get("retained_promoted_stage_sha256")
+        if continuation_sha256 is not None:
+            stage_bucket = result["promoted_stage_ledger"].get(str(ordinal))
+            candidate = (
+                stage_bucket.get(leaf_id)
+                if isinstance(stage_bucket, Mapping)
+                else None
+            )
+            if (
+                not isinstance(candidate, Mapping)
+                or candidate.get("stage_sha256") != continuation_sha256
+                or candidate.get("admission_state") != "NUMERICAL_CONTINUATION"
+                or candidate.get("route") != expected_route
+                or candidate.get("execution_mode") != execution_mode.value
+                or candidate.get("scientific_computation_identity")
+                != selection.scientific_identities[leaf_id]
+            ):
+                raise ValueError("pending promotion continuation is invalid")
+            continuation_stage = candidate
         if leaf_id in result["survey_pass_ledger"]["promoted"]:
             raise ValueError("pending promotion already has a pass disposition")
         leaf = leaves[leaf_id]
@@ -3174,6 +3344,7 @@ def run_promoted_survey(
             if (
                 snapshot["queue_kind"] == PromotionQueueKind.RESPONSE.value
                 and snapshot.get("source_record_sha256") is None
+                and continuation_stage is None
             ):
                 if locked_route is not None:
                     provisional_stage = locked_route.provisional_stage
@@ -3227,6 +3398,52 @@ def run_promoted_survey(
                     survey_pass="promoted",
                     clock=clock,
                 )
+                prior_tier_timing: tuple[Mapping[str, object], ...] = ()
+                prior_session_fragments: tuple[Mapping[str, object], ...] = ()
+                if continuation_stage is not None:
+                    saved_tier_timing = continuation_stage.get("tier_timing")
+                    saved_session_fragments = continuation_stage.get(
+                        "session_fragments"
+                    )
+                    if (
+                        not isinstance(saved_tier_timing, list)
+                        or not isinstance(saved_session_fragments, list)
+                        or not all(
+                            isinstance(item, Mapping)
+                            for item in saved_tier_timing + saved_session_fragments
+                        )
+                    ):
+                        raise ValueError("promoted continuation timing is invalid")
+                    prior_tier_timing = tuple(saved_tier_timing)
+                    prior_session_fragments = tuple(saved_session_fragments)
+
+                def checkpoint_bf40(partial: PromotedPassOutcome) -> None:
+                    nonlocal result, committed_before_leaf
+                    summary = fold_timing_fragments(recorder.fragments)
+                    retained_partial = replace(
+                        partial,
+                        tier_timing=summary.tier_timing_mappings(),
+                        session_fragments=tuple(
+                            fragment.to_mapping() for fragment in recorder.fragments
+                        ),
+                    )
+                    result = guarded(lambda: _commit_promoted_continuation(
+                        result,
+                        leaf=leaf,
+                        queue_ordinal=ordinal,
+                        route=expected_route,
+                        outcome=retained_partial,
+                        execution_preflight=execution_preflight,
+                        layer1_lock_receipt_sha256=layer1_lock_receipt_sha256,
+                        scientific_computation_identity=(
+                            selection.scientific_identities[leaf_id]
+                        ),
+                        layer1_guard=layer1_guard,
+                    ))
+                    assert isinstance(result, dict)
+                    result = persist(result)
+                    committed_before_leaf = result
+
                 try:
                     with progress_scope(**leaf_context):
                         timed_outcome = _run_promoted_exterior_queue_entry(
@@ -3245,6 +3462,13 @@ def run_promoted_survey(
                             ),
                             execution_mode=execution_mode,
                             promoted_background_cache=promoted_background_cache,
+                            continuation_stage=continuation_stage,
+                            tier_checkpoint=(
+                                checkpoint_bf40
+                                if execution_preflight is not None
+                                and layer1_lock_receipt_sha256 is not None
+                                else None
+                            ),
                         )
                 except BaseException:
                     if recorder.active_tier is not None:
@@ -3255,9 +3479,17 @@ def run_promoted_survey(
                 summary = fold_timing_fragments(recorder.fragments)
                 return replace(
                     timed_outcome,
-                    tier_timing=summary.tier_timing_mappings(),
-                    session_fragments=tuple(
-                        fragment.to_mapping() for fragment in recorder.fragments
+                    tier_timing=(
+                        prior_tier_timing
+                        + tuple(timed_outcome.tier_timing)
+                        + summary.tier_timing_mappings()
+                    ),
+                    session_fragments=(
+                        prior_session_fragments
+                        + tuple(timed_outcome.session_fragments)
+                        + tuple(
+                            fragment.to_mapping() for fragment in recorder.fragments
+                        )
                     ),
                 )
 

@@ -43,7 +43,6 @@ _REQUIRED_CALLS = {
         "admit_retained_promoted_checkpoint": {
             "queue_ordinal",
             "independent_review_receipt",
-            "expected_authority_sha256",
             "layer1_guard",
             "terminal_record_committed",
         },

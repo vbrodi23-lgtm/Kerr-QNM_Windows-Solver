@@ -270,6 +270,23 @@ class PromotedControlCalibrationReceipt:
         return self.admission_boundary.execution_mode
 
     @property
+    def independent_review_authority_sha256(self) -> str:
+        """Return the review-authority anchor authenticated by this receipt."""
+
+        mapping = self.to_mapping()
+        approval = mapping.get("operator_approval")
+        if not isinstance(approval, Mapping):
+            raise CalibrationReceiptError(
+                "calibration receipt operator approval is unavailable"
+            )
+        authority_material = {
+            "schema": "windows-solver.independent-promoted-review-authority/1",
+            "calibration_receipt_sha256": self.sha256,
+            "operator_approval": dict(approval),
+        }
+        return hashlib.sha256(canonical_json_bytes(authority_material)).hexdigest()
+
+    @property
     def covered_pairs(self) -> frozenset[tuple[str, int]]:
         return frozenset(
             (profile.determinant_family, profile.nominal_decimal_digits)

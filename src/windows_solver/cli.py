@@ -350,9 +350,6 @@ def build_parser() -> argparse.ArgumentParser:
     campaign_admit_promoted.add_argument(
         "--review-receipt", type=Path, required=True
     )
-    campaign_admit_promoted.add_argument(
-        "--review-authority-sha256", required=True
-    )
     for name, help_text in (
         ("campaign-survey-binary64", "run only the schema-11 binary64 survey pass"),
         ("campaign-survey-promoted", "run only the queued schema-11 promoted survey pass"),
@@ -1338,7 +1335,6 @@ def _campaign_admit_promoted(
     binary64_lock_path: Path,
     queue_ordinal: int,
     review_receipt_path: Path,
-    review_authority_sha256: str,
 ) -> tuple[int, object]:
     (
         plan,
@@ -1363,7 +1359,6 @@ def _campaign_admit_promoted(
         binary64_lock_path=_resolve_recovery_path(binary64_lock_path),
         queue_ordinal=queue_ordinal,
         independent_review_receipt=review_receipt,
-        expected_authority_sha256=review_authority_sha256,
     )
     return 0, {
         "command": "campaign-admit-promoted",
@@ -2198,7 +2193,6 @@ def main(argv: Sequence[str] | None = None) -> int:
                 binary64_lock_path=arguments.binary64_lock,
                 queue_ordinal=arguments.queue_ordinal,
                 review_receipt_path=arguments.review_receipt,
-                review_authority_sha256=arguments.review_authority_sha256,
             )
         elif arguments.command in {
             "campaign-run", "campaign-resume", "campaign-validate"
