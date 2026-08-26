@@ -93,6 +93,7 @@ from .background_evidence_store import CanonicalBackgroundEvidenceStore
 from .julia_response_backend import (
     ExteriorDeterminantErrorEvidence,
     FIXED_ROOT_SURVEY_BATCH_SCHEMA,
+    FixedRootSurveyPlan,
     FixedRootSurveyConditioning,
     JuliaFixedRootSurveyBatch,
     JuliaFixedRootSurveySample,
@@ -2301,7 +2302,7 @@ def _run_promoted_exterior_queue_entry(
                     fixed_root=seal.fixed_root,
                     root_seal_sha256=seal.root_seal_sha256,
                     branch_identity=seal.branch_identity,
-                    sample_roles=tuple(_PROMOTED_BACKGROUND_SAMPLE_ROLES),
+                    plan=FixedRootSurveyPlan.CANONICAL_BACKGROUND_FIVE,
                 )
                 if not isinstance(background_batch, JuliaFixedRootSurveyBatch):
                     raise ValueError("promoted backend returned an invalid survey batch")
@@ -2348,7 +2349,12 @@ def _run_promoted_exterior_queue_entry(
                 fixed_root=seal.fixed_root,
                 root_seal_sha256=seal.root_seal_sha256,
                 branch_identity=seal.branch_identity,
-                sample_roles=requested_sample_roles,
+                plan=(
+                    FixedRootSurveyPlan.MECHANISM_COMPONENT_FOUR
+                    if requested_sample_roles
+                    == tuple(_PROMOTED_COMPONENT_SAMPLE_ROLES)
+                    else FixedRootSurveyPlan.FULL_NINE
+                ),
             )
         except KeyboardInterrupt:
             raise
