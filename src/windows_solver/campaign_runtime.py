@@ -438,10 +438,18 @@ def _completed_horizon_source_is_authenticated(
         "precision_tiers": list(promoted["precision_tiers"]),
         "result_record_sha256": source_record_sha256,
         "source_record_sha256": source_record_sha256,
-        "source_fingerprint_sha256": promotion_source_fingerprint_sha256(
-            queue_entry
-        ),
     }
+    supplied_fingerprint = queue_entry.get("source_fingerprint_sha256")
+    if supplied_fingerprint is not None:
+        if not _is_sha256(supplied_fingerprint):
+            return False
+        try:
+            expected_fingerprint = promotion_source_fingerprint_sha256(queue_entry)
+        except ValueError:
+            return False
+        if supplied_fingerprint != expected_fingerprint:
+            return False
+        queue_receipt["source_fingerprint_sha256"] = expected_fingerprint
     if queue_entry.get("disposition_receipt_sha256") != _sha256(
         queue_receipt
     ):
@@ -2069,7 +2077,7 @@ def run_native_promoted_pass(
     background_evidence_store: CanonicalBackgroundEvidenceStore | None = None,
     diagnostic_session: StructuralDiagnosticSession | None = None,
 ) -> PromotedSurveyRun:
-    """Execute only queued BF40/BF80 work through the survey-only operation."""
+    """Execute only locked queued BF40/BF80 work through the survey operation."""
 
     root_evidence_store = RootEvidenceStore.for_checkpoint(checkpoint_path)
     background_store = background_evidence_store or CanonicalBackgroundEvidenceStore(

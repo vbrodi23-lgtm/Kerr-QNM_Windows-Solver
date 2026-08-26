@@ -33,6 +33,7 @@ from windows_solver.campaign_policy import (
 from windows_solver.campaign_recovery import RecoverySelection
 from windows_solver.cli import build_parser
 from windows_solver.contracts import canonical_json_bytes
+from windows_solver.campaign_survey import binary64_pass_exhaustion
 from windows_solver.response_batches import (
     PrecisionCapabilities,
     build_campaign_plan,
@@ -200,6 +201,46 @@ class Binary64LayerLockTests(unittest.TestCase):
             leaf_mechanism_ids={self.leaf.leaf_id: self.leaf.mechanism_id},
             auxiliary_evidence_manifest=self._auxiliary_manifest(stage),
         ))
+
+    def test_unbound_promotion_keeps_binary64_handoff_partial(self) -> None:
+        """Break caught: a promotion without a lockable source is marked ready."""
+
+        checkpoint = empty_schema11_checkpoint(
+            self.selection.campaign_id, self.selection.selection_id
+        )
+        checkpoint = record_survey_disposition(
+            checkpoint,
+            survey_pass=SurveyPass.BINARY64,
+            leaf_id=self.leaf.leaf_id,
+            disposition=SurveyDisposition.PROMOTION_PENDING_RESPONSE,
+            operation_identity="exterior-fixed-root-survey-raw/v1",
+            precision_tiers=("binary64",),
+            reason_code="BLOCKED_BY_REVIEWED_ERROR_EVIDENCE",
+            sample_count=9,
+            sample_limit=9,
+            root_read_count=0,
+            root_read_limit=0,
+            worker_launch_count=0,
+            worker_launch_limit=0,
+            tier_timing=(),
+            session_fragments=(),
+        )
+        checkpoint = append_promotion(
+            checkpoint,
+            leaf_id=self.leaf.leaf_id,
+            queue_kind=PromotionQueueKind.RESPONSE,
+            reason_code="BLOCKED_BY_REVIEWED_ERROR_EVIDENCE",
+            minimum_requested_tier="BF40",
+            scientific_computation_identity=self.selection.scientific_identities[
+                self.leaf.leaf_id
+            ],
+            source_root_seal_sha256="a" * 64,
+        )
+
+        exhaustion = binary64_pass_exhaustion(checkpoint, self.selection)
+
+        self.assertFalse(exhaustion.exhausted)
+        self.assertIn("UNLOCKABLE_PROMOTION_SOURCE", exhaustion.reasons)
 
     def test_promoted_queue_completion_preserves_the_layer1_lock(self) -> None:
         """Break caught: the lock incorrectly includes Layer-2 disposition state."""

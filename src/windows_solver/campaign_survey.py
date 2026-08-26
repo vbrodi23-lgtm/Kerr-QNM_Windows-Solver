@@ -406,6 +406,7 @@ def binary64_pass_exhaustion(
         reasons.append("MISSING_SELECTED_BINARY64_DISPOSITION")
     if unexpected:
         reasons.append("OFF_SELECTION_BINARY64_DISPOSITION")
+    incomplete: list[str] = [*missing, *unexpected]
     for leaf_id in selected:
         entry = ledger.get(leaf_id)
         if not isinstance(entry, Mapping):
@@ -421,8 +422,23 @@ def binary64_pass_exhaustion(
                 reasons.append(f"CONTRADICTORY_PROMOTION_QUEUE:{leaf_id}")
         elif len(queues) != 1 or queues[0]["queue_kind"] != expected_kind:
             reasons.append(f"MISSING_OR_DUPLICATE_PROMOTION_QUEUE:{leaf_id}")
-    incomplete = tuple(dict.fromkeys((*missing, *unexpected)))
-    return PassExhaustion(not reasons, incomplete, tuple(reasons))
+        elif expected_kind == PromotionQueueKind.RESPONSE.value:
+            queue_entry = queues[0]
+            if any(
+                queue_entry.get(field) is None
+                for field in (
+                    "source_stage_sha256",
+                    "source_root_seal_sha256",
+                    "source_binary64_disposition_receipt_sha256",
+                )
+            ):
+                reasons.append("UNLOCKABLE_PROMOTION_SOURCE")
+                incomplete.append(leaf_id)
+    return PassExhaustion(
+        not reasons,
+        tuple(dict.fromkeys(incomplete)),
+        tuple(reasons),
+    )
 
 
 def _survey_failure_report(
@@ -1636,6 +1652,7 @@ def _run_promoted_exterior_queue_entry(
     determinant_error_store: ReviewedDeterminantErrorStore | None,
     root_promotion_group: _RootPromotionGroup | None,
     provisional_predecessor_receipt: Mapping[str, object] | None,
+    locked_bf40_gate_required: bool,
 ) -> PromotedPassOutcome:
     queue_kind = PromotionQueueKind(entry["queue_kind"])
     seal = root_seal_lookup(leaf, entry)
@@ -1646,7 +1663,10 @@ def _run_promoted_exterior_queue_entry(
             raise ValueError("promoted response root seal digest mismatch")
         if seal.branch_identity != leaf.job.root.branch_id:
             raise ValueError("promoted response root seal branch mismatch")
-        if entry.get("minimum_requested_tier") == "BF40":
+        if (
+            locked_bf40_gate_required
+            and entry.get("minimum_requested_tier") == "BF40"
+        ):
             require_locked_bf40_determinant_error_issuance_authority()
     elif root_promotion_group is not None:
         if seal is not None:
@@ -2596,6 +2616,7 @@ def run_promoted_survey(
                             provisional_predecessor_receipt=(
                                 provisional_predecessor_receipt
                             ),
+                            locked_bf40_gate_required=layer1_guard is not None,
                         )
                 except BaseException:
                     if recorder.active_tier is not None:

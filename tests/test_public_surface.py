@@ -1461,6 +1461,15 @@ $candidate | ConvertTo-Json -Compress | Set-Content -LiteralPath $env:M02_TEST_J
             "windows-solver.repeated-outcome-diagnostics/v1",
             "authenticated-root-evidence-v2",
             "root-evidence-v2",
+            # The frozen binary64 handoff uses explicit public receipt and
+            # evidence-store identities for its externally inspectable
+            # checkpoint sidecar.
+            "windows-solver.binary64-layer-lock/1",
+            "windows-solver.binary64-layer-projection/1",
+            "windows-solver.root-evidence-store/v2",
+            "windows-solver.canonical-background-evidence-store/v1",
+            "windows-solver.root-readout-store/v2",
+            "windows-solver.root-readout-cache/2",
             # PR69 keeps the forensic v2 horizon lineage readable without
             # letting it re-authenticate as current science. The
             # constants below name that forensic path in code, in

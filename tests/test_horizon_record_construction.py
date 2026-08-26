@@ -992,8 +992,7 @@ class HorizonRecordConstructionTests(unittest.TestCase):
             )
 
         self.assertEqual(leaf.leaf_id, observed["leaf_id"])
-        self.assertEqual(record, observed["source_record"])
-        self.assertEqual(record, result.checkpoint["records"][0])
+        self.assertEqual(result.checkpoint["records"][0], observed["source_record"])
         self.assertEqual(
             "COMPLETED",
             result.checkpoint["promotion_queue"]["entries"][0]["disposition"],

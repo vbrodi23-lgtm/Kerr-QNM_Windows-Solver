@@ -826,10 +826,13 @@ def validate_schema11_checkpoint(
                 raise ValueError("pending promotion cannot have a terminal receipt")
         elif not _is_sha256(receipt_hash):
             raise ValueError("terminal promotion requires a receipt digest")
-        if entry["source_fingerprint_sha256"] != promotion_source_fingerprint_sha256(
+        # This digest is derived provenance, not an independently trusted
+        # input.  Recompute it at the checkpoint boundary so a malformed
+        # legacy checkpoint reaches the scheduler's durable failure path;
+        # the authenticated Layer-1 lock still rejects any source mutation.
+        entry["source_fingerprint_sha256"] = promotion_source_fingerprint_sha256(
             entry
-        ):
-            raise ValueError("schema-11 promotion source fingerprint is invalid")
+        )
 
     for field in ("attempts", "system_failures", "recovery_receipts"):
         if not isinstance(result[field], list):

@@ -719,11 +719,11 @@ class PromotedSurveySchedulerTests(unittest.TestCase):
             "consume_authenticated_binary64_provisional_predecessor", survey_source
         )
         self.assertIn("PROVISIONAL_STAGE_PUBLISHED", runtime_source)
-        self.assertIn("provisional_stage_lookup", runtime_source)
         self.assertNotIn(
-            "provisional_stage_lookup=lambda _leaf, _entry: None", runtime_source
+            "provisional_stage_lookup", runtime_source
         )
-        self.assertIn('"provisional_stage_lookup"', wiring_source)
+        self.assertIn('"layer1_guard"', wiring_source)
+        self.assertIn('"locked_routes_by_ordinal"', wiring_source)
         self.assertIn('"provisional_stage_committed"', wiring_source)
         self.assertIn('"terminal_record_committed"', wiring_source)
         self.assertIn('"diagnostic_session"', wiring_source)
