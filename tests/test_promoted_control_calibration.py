@@ -13,10 +13,12 @@ from windows_solver.promoted_control_calibration import (
     DERIVATIVE_AUTHENTICATION_UNAVAILABLE,
     EMPIRICAL_TEST_ONLY_NO_ARCHIVED_FLOOR,
     EXTERIOR_DETERMINANT_ABSOLUTE_ERROR_CERTIFICATE,
+    CalibrationAdmissionBoundary,
     CalibrationReceiptError,
     DerivativeAuthenticationUnavailable,
     ExteriorDeterminantCertificateUnavailable,
     PROMOTED_CONTROL_EMPIRICAL_CALIBRATION_IDENTITY,
+    PromotedExecutionMode,
     authenticated_derivative_lower_bound_abs,
     empirical_exterior_determinant_error_abs,
     empirical_root_error_radius_abs,
@@ -43,6 +45,22 @@ class PromotedControlCalibrationTests(unittest.TestCase):
         self.assertTrue(receipt.operator_approved)
         self.assertFalse(receipt.interval_arithmetic)
         self.assertFalse(receipt.independent_mathematical_proof)
+        self.assertIs(
+            receipt.execution_mode,
+            PromotedExecutionMode.CALCULATE_ONLY,
+        )
+        self.assertEqual(
+            receipt.admission_boundary.to_mapping(),
+            {
+                "calculation": "permitted/v1",
+                "checkpointing": "permitted/v1",
+                "publication": "blocked-pending-independent-review/v1",
+                "scientific_admission": (
+                    "blocked-pending-independent-review/v1"
+                ),
+                "uncertainty_disks": "empirical-current-run-only/v1",
+            },
+        )
         self.assertEqual(
             receipt.covered_pairs,
             frozenset({
@@ -84,6 +102,44 @@ class PromotedControlCalibrationTests(unittest.TestCase):
         self.assertEqual(
             exterior_40.refinement_ode_controls,
             exterior_80.refinement_ode_controls,
+        )
+
+    def test_admission_boundary_selects_each_execution_mode_without_raising(self) -> None:
+        """Break caught: publication policy is mistaken for execution policy."""
+
+        calculate_and_admit = CalibrationAdmissionBoundary(
+            calculation="permitted/v1",
+            checkpointing="permitted/v1",
+            publication="permitted/v1",
+            scientific_admission="permitted/v1",
+            uncertainty_disks="empirical-current-run-only/v1",
+        )
+        calculate_only = CalibrationAdmissionBoundary(
+            calculation="permitted/v1",
+            checkpointing="permitted/v1",
+            publication="blocked-pending-independent-review/v1",
+            scientific_admission="blocked-pending-independent-review/v1",
+            uncertainty_disks="empirical-current-run-only/v1",
+        )
+        blocked = CalibrationAdmissionBoundary(
+            calculation="blocked/v1",
+            checkpointing="blocked/v1",
+            publication="blocked/v1",
+            scientific_admission="blocked/v1",
+            uncertainty_disks="blocked/v1",
+        )
+
+        self.assertIs(
+            calculate_and_admit.execution_mode,
+            PromotedExecutionMode.CALCULATE_AND_ADMIT,
+        )
+        self.assertIs(
+            calculate_only.execution_mode,
+            PromotedExecutionMode.CALCULATE_ONLY,
+        )
+        self.assertIs(
+            blocked.execution_mode,
+            PromotedExecutionMode.BLOCK_ALL,
         )
 
     def test_pinned_override_rejects_wrong_digest_and_noncanonical_bytes(self) -> None:
