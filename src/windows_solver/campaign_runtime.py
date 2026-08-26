@@ -2083,14 +2083,12 @@ def _promoted_horizon_outcome(
         )
 
     provisional = None if queue_entry is None else queue_entry.get("provisional_stage")
-    stages = (stage,)
     if provisional is not None:
         if not isinstance(provisional, Mapping):
             raise ValueError("horizon provisional stage is invalid")
         validate_schema11_horizon_stage(plan, leaf, provisional)
         if queue_entry.get("provisional_stage_sha256") != provisional.get("stage_sha256"):
             raise ValueError("horizon provisional stage digest is invalid")
-        stages = (provisional, stage)
     response_disk = stage.get("response_disk")
     retained_centre = (
         None if not isinstance(response_disk, Mapping) else response_disk["centre"]
@@ -2098,7 +2096,7 @@ def _promoted_horizon_outcome(
     record = build_schema11_horizon_record(
         plan,
         leaf,
-        stages=stages,
+        stages=(stage,),
         retained_centre=retained_centre,
         state="PRODUCED" if retained_centre is not None else "UNRESOLVED",
     )

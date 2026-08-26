@@ -13,6 +13,7 @@ import unittest
 from unittest.mock import patch
 
 import windows_solver.campaign_runtime as campaign_runtime
+import windows_solver.campaign_survey as campaign_survey
 import windows_solver.response_batches as response_batches
 from windows_solver.campaign_failures import CampaignSystemFailure
 from windows_solver.campaign_policy import (
@@ -58,6 +59,10 @@ from windows_solver.response_engine import (
     ComponentResult,
     DecimalComplex,
     run_promoted_horizon_component,
+)
+from windows_solver.promoted_control_calibration import PromotedExecutionMode
+from windows_solver.reviewed_determinant_error_issuance import (
+    PromotedExecutionPreflight,
 )
 from windows_solver.root_evidence import AuthenticatedRootEvidence
 
@@ -1160,6 +1165,141 @@ class HorizonRecordConstructionTests(unittest.TestCase):
                 trigger_receipts=(trigger_receipt,),
             )
         self.assertFalse(called)
+
+    def test_source_less_bf80_keeps_binary64_lineage_out_of_record_stages(self) -> None:
+        """A locked v3 predecessor is provenance, not a BF80 record stage."""
+
+        plan = _plan()
+        leaf = next(
+            item
+            for item in plan.leaves
+            if item.role == "primary"
+            and item.mechanism_id == "horizon-admittance"
+        )
+        selected = build_campaign_selection(
+            plan, role=leaf.role, leaf_ids=(leaf.leaf_id,)
+        )
+        scientific_identity = response_batches.scientific_computation_identity_sha256(
+            plan, leaf
+        )
+        provisional_outcome = _binary64_horizon_outcome(plan, leaf)
+        provisional, provisional_sha256 = build_schema11_horizon_stage(
+            provisional_outcome,
+            precision_tier="binary64",
+            operation_identity="binary64-horizon-production/v3",
+        )
+        checkpoint = record_survey_disposition(
+            empty_schema11_checkpoint(plan.campaign_id, selected.selection_id),
+            survey_pass=SurveyPass.BINARY64,
+            leaf_id=leaf.leaf_id,
+            disposition=SurveyDisposition.PROMOTION_PENDING_RESPONSE,
+            operation_identity="binary64-horizon-production/v3",
+            precision_tiers=("binary64",),
+            reason_code="ROOT_UNCERTAINTY_EVIDENCE_UNAVAILABLE",
+            sample_count=0,
+            sample_limit=0,
+            root_read_count=0,
+            root_read_limit=0,
+            worker_launch_count=0,
+            worker_launch_limit=0,
+            tier_timing=(),
+            session_fragments=(),
+        )
+        binary64_receipt_sha256 = checkpoint["survey_pass_ledger"]["binary64"][
+            leaf.leaf_id
+        ]["disposition_receipt_sha256"]
+        checkpoint = append_promotion(
+            checkpoint,
+            leaf_id=leaf.leaf_id,
+            queue_kind=PromotionQueueKind.RESPONSE,
+            reason_code="ROOT_UNCERTAINTY_EVIDENCE_UNAVAILABLE",
+            minimum_requested_tier="BF80",
+            scientific_computation_identity=scientific_identity,
+            source_stage_sha256=provisional_sha256,
+            source_root_seal_sha256="d" * 64,
+            provisional_stage=provisional,
+            provisional_stage_sha256=provisional_sha256,
+            provisional_operation_identity="binary64-horizon-production/v3",
+            source_binary64_disposition_receipt_sha256=binary64_receipt_sha256,
+        )
+        queue_entry = checkpoint["promotion_queue"]["entries"][0]
+        bf80_component = run_promoted_horizon_component(
+            leaf.job,
+            FakePromotedBackend(
+                leaf.job,
+                _promoted_baseline(
+                    leaf.job,
+                    omega=leaf.job.root.omega,
+                    derivative=DecimalComplex(Decimal("1"), Decimal("0.25")),
+                ),
+            ),
+            leaf.job.root.omega,
+        )
+        self.assertEqual("CONVERGED", bf80_component.status.value)
+
+        class Backend:
+            def _julia_precision_backend_for(self, *_args):
+                return SimpleNamespace(
+                    scientific_runtime_for=lambda _job: {"runtime": "synthetic-bf80"}
+                )
+
+        with patch(
+            "windows_solver.campaign_runtime.run_promoted_horizon_component",
+            return_value=bf80_component,
+        ):
+            outcome = _promoted_horizon_outcome(
+                plan,
+                Backend(),
+                leaf,
+                queue_entry=queue_entry,
+            )
+
+        self.assertIsNotNone(outcome.record)
+        record = outcome.record
+        assert isinstance(record, dict)
+        response_batches.validate_schema11_horizon_record(plan, leaf, record)
+        self.assertEqual(1, len(record["stages"]))
+        self.assertEqual("BF80", record["stages"][0]["precision_tier"])
+        self.assertEqual(
+            "promoted-horizon-component/v2",
+            record["stages"][0]["operation_identity"],
+        )
+        self.assertEqual(provisional, queue_entry["provisional_stage"])
+
+        retained = campaign_survey._commit_promoted_outcome(
+            checkpoint,
+            leaf=leaf,
+            leaf_id=leaf.leaf_id,
+            queue_ordinal=0,
+            queue_kind=PromotionQueueKind.RESPONSE,
+            outcome=outcome,
+            route="HORIZON_BF80",
+            execution_preflight=PromotedExecutionPreflight(
+                mode=PromotedExecutionMode.CALCULATE_ONLY,
+                route="HORIZON_BF80",
+                calibration_receipt_sha256="e" * 64,
+                calculation_permitted=True,
+                checkpointing_permitted=True,
+                admission_permitted=False,
+                publication_permitted=False,
+                result_code="REVIEW_PENDING",
+            ),
+            layer1_lock_receipt_sha256="f" * 64,
+            scientific_computation_identity=scientific_identity,
+        )
+        retained_stage = retained["promoted_stage_ledger"]["0"][leaf.leaf_id]
+        self.assertEqual(provisional_sha256, retained_stage["predecessor_stage_sha256"])
+        self.assertEqual(
+            queue_entry["source_fingerprint_sha256"],
+            retained_stage["source_fingerprint_sha256"],
+        )
+        self.assertEqual("f" * 64, retained_stage["layer1_lock_receipt_sha256"])
+        self.assertEqual(
+            "AWAITING_ADMISSION",
+            retained["promotion_queue"]["entries"][0]["disposition"],
+        )
+        self.assertEqual([], retained["records"])
+        self.assertEqual({}, retained["evidence_ledger"])
 
     def test_promoted_horizon_source_record_path_runs_and_retains_source(self) -> None:
         plan = _plan()
