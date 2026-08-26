@@ -302,6 +302,7 @@ class PromotedHorizonCalculationResult:
             not _is_sha256(stage.get("stage_sha256"))
             or stage["stage_sha256"] != _sha256(content)
             or stage.get("precision_tier") != "BF80"
+            or stage.get("operation_identity") != "promoted-horizon-component/v2"
         ):
             raise ValueError("promoted horizon stage digest is invalid")
         if not all(
@@ -325,6 +326,44 @@ class PromotedHorizonCalculationResult:
             "layer1_lock_receipt_sha256": self.layer1_lock_receipt_sha256,
         }
         return {**content, "calculation_sha256": _sha256(content)}
+
+    @classmethod
+    def from_mapping(cls, value: object) -> "PromotedHorizonCalculationResult":
+        fields = {
+            "schema",
+            "component_stage",
+            "component_stage_sha256",
+            "predecessor_stage_sha256",
+            "source_fingerprint_sha256",
+            "layer1_lock_receipt_sha256",
+            "calculation_sha256",
+        }
+        if not isinstance(value, Mapping) or set(value) != fields:
+            raise ValueError("promoted horizon calculation artifact is invalid")
+        if value.get("schema") != PROMOTED_HORIZON_CALCULATION_SCHEMA:
+            raise ValueError("promoted horizon calculation artifact schema is invalid")
+        content = {
+            key: item for key, item in value.items() if key != "calculation_sha256"
+        }
+        if (
+            not _is_sha256(value.get("calculation_sha256"))
+            or value.get("calculation_sha256") != _sha256(content)
+            or not isinstance(value.get("component_stage"), Mapping)
+        ):
+            raise ValueError("promoted horizon calculation artifact digest is invalid")
+        result = cls(
+            component_stage=value["component_stage"],
+            predecessor_stage_sha256=str(value["predecessor_stage_sha256"]),
+            source_fingerprint_sha256=str(value["source_fingerprint_sha256"]),
+            layer1_lock_receipt_sha256=str(value["layer1_lock_receipt_sha256"]),
+        )
+        if (
+            value.get("component_stage_sha256")
+            != result.component_stage["stage_sha256"]
+            or result.to_mapping() != dict(value)
+        ):
+            raise ValueError("promoted horizon calculation artifact is not canonical")
+        return result
 
 
 __all__ = [

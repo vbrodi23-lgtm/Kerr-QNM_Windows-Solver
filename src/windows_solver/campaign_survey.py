@@ -111,6 +111,7 @@ from .promoted_artifacts import (
     PromotedCanonicalBackgroundReceipt,
     PromotedExteriorCalculationResult,
     PromotedFixedRootComposite,
+    PromotedHorizonCalculationResult,
 )
 from .precision_tiers import PrecisionTier
 from .progress import ProgressEventKind, emit_progress, progress_scope
@@ -942,6 +943,33 @@ def run_binary64_survey(
                     persist_checkpoint=lambda value: persist(value),
                 )
                 raise AssertionError("system failure abort returned unexpectedly")
+
+        def checkpoint_raw_outcome(raw: PromotedPassOutcome) -> str:
+            """Persist a worker return before any reducer consumes it."""
+
+            nonlocal result, committed_before_leaf
+            result = guarded(lambda: _commit_promoted_raw_calculation(
+                result,
+                leaf=leaf,
+                queue_ordinal=ordinal,
+                route=expected_route,
+                outcome=raw,
+                execution_preflight=execution_preflight,
+                layer1_lock_receipt_sha256=layer1_lock_receipt_sha256,
+                scientific_computation_identity=(
+                    selection.scientific_identities[leaf_id]
+                ),
+                layer1_guard=layer1_guard,
+            ))
+            assert isinstance(result, dict)
+            result = persist(result)
+            committed_before_leaf = result
+            digest = result["promotion_queue"]["entries"][ordinal][
+                "retained_promoted_stage_sha256"
+            ]
+            if not isinstance(digest, str):
+                raise ValueError("raw promoted checkpoint digest is invalid")
+            return digest
 
         retained = existing_records.get(leaf_id)
         checkpoint_discovery = (
@@ -2010,6 +2038,74 @@ def _resumed_promoted_exterior_outcome(
     artifact = retained_stage.get("calculation_artifact")
     calculation, canonical_artifact = _promoted_exterior_calculation_from_mapping(
         artifact
+    )
+
+
+def _resumed_promoted_horizon_outcome(
+    retained_stage: Mapping[str, object],
+) -> PromotedPassOutcome:
+    """Advance one checkpointed BF80 return without reopening a worker."""
+
+    artifact = PromotedHorizonCalculationResult.from_mapping(
+        retained_stage.get("calculation_artifact")
+    ).to_mapping()
+    if (
+        retained_stage.get("route") != "HORIZON_BF80"
+        or retained_stage.get("predecessor_stage_sha256")
+        != artifact["predecessor_stage_sha256"]
+        or retained_stage.get("source_fingerprint_sha256")
+        != artifact["source_fingerprint_sha256"]
+        or retained_stage.get("layer1_lock_receipt_sha256")
+        != artifact["layer1_lock_receipt_sha256"]
+    ):
+        raise ValueError("retained horizon calculation lineage is invalid")
+    counters = (
+        retained_stage.get("sample_count"),
+        retained_stage.get("root_read_count"),
+        retained_stage.get("worker_launch_count"),
+    )
+    if not all(isinstance(item, int) and item >= 0 for item in counters):
+        raise ValueError("retained horizon calculation counters are invalid")
+    stage_sha256 = retained_stage.get("stage_sha256")
+    if not isinstance(stage_sha256, str) or len(stage_sha256) != 64:
+        raise ValueError("retained horizon calculation stage digest is invalid")
+    return PromotedPassOutcome(
+        disposition=SurveyDisposition.CALCULATED_AWAITING_ADMISSION,
+        reason_code="AWAITING_INDEPENDENT_REVIEW_ADMISSION",
+        precision_tiers=("BF80",),
+        operation_identity="promoted-horizon-calculation/v2",
+        source_record_sha256=(
+            None
+            if retained_stage.get("source_record_sha256") is None
+            else str(retained_stage["source_record_sha256"])
+        ),
+        source_stage_sha256=(
+            None
+            if retained_stage.get("source_record_stage_sha256") is None
+            else str(retained_stage["source_record_stage_sha256"])
+        ),
+        sample_count=int(counters[0]),
+        root_read_count=int(counters[1]),
+        root_read_limit=1,
+        worker_launch_count=int(counters[2]),
+        worker_launch_limit=1,
+        calculation_artifact=artifact,
+        source_calculation_stage_sha256=stage_sha256,
+        calculation_chain=tuple(
+            copy.deepcopy(dict(item))
+            for item in retained_stage.get("calculation_chain", [])
+            if isinstance(item, Mapping)
+        ),
+        tier_timing=tuple(
+            copy.deepcopy(dict(item))
+            for item in retained_stage.get("tier_timing", [])
+            if isinstance(item, Mapping)
+        ),
+        session_fragments=tuple(
+            copy.deepcopy(dict(item))
+            for item in retained_stage.get("session_fragments", [])
+            if isinstance(item, Mapping)
+        ),
     )
     background_entry = next(
         (
@@ -3784,12 +3880,17 @@ def run_promoted_survey(
             continue
 
         if raw_calculation_stage is not None:
-            if expected_route != "EXTERIOR_BF40":
-                raise ValueError("retained horizon calculation requires its reducer")
-            outcome = guarded(lambda: _resumed_promoted_exterior_outcome(
-                raw_calculation_stage,
-                promoted_background_cache=promoted_background_cache,
-            ))
+            if expected_route == "EXTERIOR_BF40":
+                outcome = guarded(lambda: _resumed_promoted_exterior_outcome(
+                    raw_calculation_stage,
+                    promoted_background_cache=promoted_background_cache,
+                ))
+            elif expected_route == "HORIZON_BF80":
+                outcome = guarded(lambda: _resumed_promoted_horizon_outcome(
+                    raw_calculation_stage
+                ))
+            else:
+                raise ValueError("retained promoted calculation route is invalid")
         elif execution_mode is PromotedExecutionMode.BLOCK_ALL:
             outcome = PromotedPassOutcome(
                 disposition=SurveyDisposition.DEFERRED,
@@ -3801,6 +3902,10 @@ def run_promoted_survey(
                 worker_launch_limit=0,
             )
         elif leaf.mechanism_id == "horizon-admittance":
+            if execution_mode is not PromotedExecutionMode.CALCULATE_ONLY:
+                raise ValueError(
+                    "promoted horizon calculation requires independent admission"
+                )
             evidence_entry = result["evidence_ledger"].get(leaf_id)
             source_receipts = (
                 tuple(evidence_entry["receipts"])
@@ -3844,6 +3949,16 @@ def run_promoted_survey(
                 session_fragments=tuple(
                     fragment.to_mapping() for fragment in recorder.fragments
                 ),
+            )
+            if outcome.calculation_artifact is None:
+                raise ValueError("promoted horizon worker return lacks an artifact")
+            source_calculation_stage_sha256 = guarded(
+                lambda: checkpoint_raw_outcome(outcome)
+            )
+            outcome = replace(
+                outcome,
+                reason_code="AWAITING_INDEPENDENT_REVIEW_ADMISSION",
+                source_calculation_stage_sha256=source_calculation_stage_sha256,
             )
         else:
             # Cache-first: this branch is only reached on a genuine
@@ -3969,35 +4084,6 @@ def run_promoted_survey(
                     result = persist(result)
                     committed_before_leaf = result
 
-                def checkpoint_raw(
-                    raw: PromotedPassOutcome,
-                ) -> str:
-                    """Make the worker return durable before reduction."""
-
-                    nonlocal result, committed_before_leaf
-                    result = guarded(lambda: _commit_promoted_raw_calculation(
-                        result,
-                        leaf=leaf,
-                        queue_ordinal=ordinal,
-                        route=expected_route,
-                        outcome=raw,
-                        execution_preflight=execution_preflight,
-                        layer1_lock_receipt_sha256=layer1_lock_receipt_sha256,
-                        scientific_computation_identity=(
-                            selection.scientific_identities[leaf_id]
-                        ),
-                        layer1_guard=layer1_guard,
-                    ))
-                    assert isinstance(result, dict)
-                    result = persist(result)
-                    committed_before_leaf = result
-                    digest = result["promotion_queue"]["entries"][ordinal][
-                        "retained_promoted_stage_sha256"
-                    ]
-                    if not isinstance(digest, str):
-                        raise ValueError("raw promoted checkpoint digest is invalid")
-                    return digest
-
                 try:
                     with progress_scope(**leaf_context):
                         timed_outcome = _run_promoted_exterior_queue_entry(
@@ -4027,7 +4113,7 @@ def run_promoted_survey(
                                 checkpoint_background
                             ),
                             raw_checkpoint=(
-                                checkpoint_raw
+                                checkpoint_raw_outcome
                                 if execution_mode
                                 is PromotedExecutionMode.CALCULATE_ONLY
                                 else None
