@@ -444,6 +444,7 @@ class ProvisionalStagePublicationTests(unittest.TestCase):
                 queued_count=0,
                 cache_reused_count=0,
                 skipped_count=0,
+                pass_exhausted=False,
             )
 
         with tempfile.TemporaryDirectory() as temporary:

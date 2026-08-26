@@ -3,8 +3,8 @@ param(
     [string]$Checkpoint = ".\m02-output\m02-campaign-checkpoint.json",
     [ValidateSet("survey", "certify", "validate")]
     [string]$Profile = "survey",
-    [ValidateSet("binary64", "promoted")]
-    [string]$SurveyPass = "binary64",
+    [ValidateSet("binary64", "promoted", "full")]
+    [string]$SurveyPass = "full",
     [string]$QueuePath,
     [switch]$NewCampaign,
     [switch]$SkipBootstrap,
@@ -69,7 +69,7 @@ function Get-OptionalProperty {
 if ($SkipBootstrap -and $RebuildRuntime) {
     throw "-SkipBootstrap and -RebuildRuntime cannot be used together."
 }
-if ($Profile -ne "survey" -and $SurveyPass -ne "binary64") {
+if ($Profile -ne "survey" -and $SurveyPass -ne "full") {
     throw "-SurveyPass applies only to -Profile survey."
 }
 if ($Profile -eq "survey" -and -not [string]::IsNullOrWhiteSpace($QueuePath)) {
@@ -78,8 +78,8 @@ if ($Profile -eq "survey" -and -not [string]::IsNullOrWhiteSpace($QueuePath)) {
 if ($Profile -eq "validate" -and [string]::IsNullOrWhiteSpace($QueuePath)) {
     throw "-Profile validate requires -QueuePath."
 }
-if ($NewCampaign -and ($Profile -ne "survey" -or $SurveyPass -ne "binary64")) {
-    throw "-NewCampaign starts only the binary64 survey."
+if ($NewCampaign -and ($Profile -ne "survey" -or $SurveyPass -notin @("binary64", "full"))) {
+    throw "-NewCampaign starts only a binary64 or full survey."
 }
 $HasCalibrationPath = -not [string]::IsNullOrWhiteSpace($CalibrationReceiptPath)
 $HasCalibrationSha256 = -not [string]::IsNullOrWhiteSpace($CalibrationReceiptSha256)
@@ -135,6 +135,7 @@ $CheckpointPath = if ([IO.Path]::IsPathRooted($Checkpoint)) {
 else {
     [IO.Path]::GetFullPath((Join-Path $PackageRoot $Checkpoint))
 }
+$Binary64LockPath = "$CheckpointPath.binary64-lock.json"
 if (-not (Test-Path -LiteralPath $SelectionPath -PathType Leaf)) {
     throw "M02 selection is absent: $SelectionPath"
 }
@@ -155,12 +156,12 @@ catch {
 }
 
 $CheckpointExists = Test-Path -LiteralPath $CheckpointPath -PathType Leaf
-$IsBinary64SurveyProfile = $Profile -eq "survey" -and $SurveyPass -eq "binary64"
+$IsBinary64SurveyProfile = $Profile -eq "survey" -and $SurveyPass -in @("binary64", "full")
 if ($NewCampaign -and $CheckpointExists) {
     throw "-NewCampaign refuses an existing checkpoint: $CheckpointPath"
 }
 # A plain, argument-free first run must not require a secret -NewCampaign
-# incantation: an absent default checkpoint under the default binary64
+# incantation: an absent default checkpoint under the default full
 # survey profile is the ordinary first-run state, not an error. Certify,
 # validate, and promoted-survey profiles still require prior binary64 work
 # to exist, so an absent checkpoint there remains a hard failure.
@@ -199,6 +200,9 @@ try {
     }
     $Command = if ($Profile -eq "survey" -and $SurveyPass -eq "binary64") {
         "campaign-survey-binary64"
+    }
+    elseif ($Profile -eq "survey" -and $SurveyPass -eq "full") {
+        "campaign-survey-binary64 -> campaign-lock-binary64 -> campaign-survey-promoted"
     }
     elseif ($Profile -eq "survey") {
         "campaign-survey-promoted"
@@ -274,15 +278,60 @@ try {
     Write-Host ("    Evidence counts          : {0}" -f ($EvidenceCounts | ConvertTo-Json -Compress))
     Write-Host ("    Basic report directory   : {0}" -f $BasicReportDirectory)
     Write-Host ("    Status path              : {0}" -f "$CheckpointPath.status.json")
+    function Ensure-Binary64Lock {
+        Invoke-M02Command -Arguments @(
+            "campaign-lock-binary64",
+            $SelectionPath,
+            "--checkpoint", $CheckpointPath,
+            "--output", $Binary64LockPath
+        ) | Out-Null
+        if (-not (Test-Path -LiteralPath $Binary64LockPath -PathType Leaf)) {
+            throw "Binary64 lock command did not retain: $Binary64LockPath"
+        }
+    }
+    $EffectiveSurveyPass = $SurveyPass
+    if ($Profile -eq "survey" -and $SurveyPass -eq "full") {
+        $Binary64RunArguments = @(
+            "campaign-survey-binary64",
+            $SelectionPath,
+            "--checkpoint", $CheckpointPath,
+            "--progress", $Progress,
+            "--diagnostic-session-id", $RunSessionId
+        )
+        $null = @(Invoke-M02Command -Arguments $Binary64RunArguments)
+        Ensure-Binary64Lock
+        $EffectiveSurveyPass = "promoted"
+    }
+    elseif ($Profile -eq "survey" -and $SurveyPass -eq "promoted") {
+        Ensure-Binary64Lock
+    }
+    $EffectiveCommand = if ($Profile -eq "survey" -and $EffectiveSurveyPass -eq "binary64") {
+        "campaign-survey-binary64"
+    }
+    elseif ($Profile -eq "survey") {
+        "campaign-survey-promoted"
+    }
+    elseif ($Profile -eq "certify") {
+        "campaign-certify"
+    }
+    else {
+        "campaign-evidence-validate"
+    }
     $RunArguments = @(
-        $Command,
+        $EffectiveCommand,
         $SelectionPath,
         "--checkpoint", $CheckpointPath,
         "--progress", $Progress,
         "--diagnostic-session-id", $RunSessionId
-    ) + $CalibrationArguments
+    )
+    if (-not ($Profile -eq "survey" -and $EffectiveSurveyPass -eq "binary64")) {
+        $RunArguments += $CalibrationArguments
+    }
     if ($null -ne $ResolvedQueuePath) {
         $RunArguments += @("--queue", $ResolvedQueuePath)
+    }
+    if ($Profile -eq "survey" -and $EffectiveSurveyPass -eq "promoted") {
+        $RunArguments += @("--binary64-lock", $Binary64LockPath)
     }
     # Capture canonical command JSON without merging it with the human
     # dashboard stream.  The reporter writes dashboard text to stderr; the
@@ -293,17 +342,21 @@ try {
         $RunResult = $RunJsonText | ConvertFrom-Json
     }
     $ValidationPass = if ($Profile -eq "survey") {
-        $SurveyPass
+        $EffectiveSurveyPass
     }
     else {
         $Profile
     }
-    Invoke-M02Command -Arguments @(
+    $ValidationArguments = @(
         "campaign-schema11-validate",
         $SelectionPath,
         "--checkpoint", $CheckpointPath,
         "--pass", $ValidationPass
-    ) | Out-Null
+    )
+    if ($ValidationPass -eq "promoted") {
+        $ValidationArguments += @("--binary64-lock", $Binary64LockPath)
+    }
+    Invoke-M02Command -Arguments $ValidationArguments | Out-Null
 }
 finally {
     if ($TranscriptStarted) {

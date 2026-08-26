@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
+from enum import Enum
 import hashlib
 from importlib.resources import files
 import json
@@ -114,6 +115,65 @@ class ExteriorDeterminantCertificateUnavailable(ValueError):
     code = EXTERIOR_DETERMINANT_CERTIFICATE_UNAVAILABLE
 
 
+class PromotedExecutionMode(str, Enum):
+    """Numerical authority derived from one calibration admission boundary."""
+
+    CALCULATE_AND_ADMIT = "CALCULATE_AND_ADMIT"
+    CALCULATE_ONLY = "CALCULATE_ONLY"
+    BLOCK_ALL = "BLOCK_ALL"
+
+
+@dataclass(frozen=True, slots=True)
+class CalibrationAdmissionBoundary:
+    """Separate numerical production authority from evidence admission."""
+
+    calculation: str
+    checkpointing: str
+    publication: str
+    scientific_admission: str
+    uncertainty_disks: str
+
+    def __post_init__(self) -> None:
+        if any(
+            not isinstance(value, str) or not value
+            for value in self.to_mapping().values()
+        ):
+            raise CalibrationReceiptError(
+                "calibration admission boundary values are invalid"
+            )
+
+    @property
+    def execution_mode(self) -> PromotedExecutionMode:
+        calculation_ready = (
+            self.calculation == "permitted/v1"
+            and self.checkpointing == "permitted/v1"
+        )
+        if not calculation_ready:
+            return PromotedExecutionMode.BLOCK_ALL
+        if (
+            self.publication == "permitted/v1"
+            and self.scientific_admission == "permitted/v1"
+        ):
+            return PromotedExecutionMode.CALCULATE_AND_ADMIT
+        if (
+            self.publication
+            == "blocked-pending-independent-review/v1"
+            and self.scientific_admission
+            == "blocked-pending-independent-review/v1"
+        ):
+            return PromotedExecutionMode.CALCULATE_ONLY
+        return PromotedExecutionMode.BLOCK_ALL
+
+    def to_mapping(self) -> dict[str, str]:
+        return {
+            "calculation": self.calculation,
+            "checkpointing": self.checkpointing,
+            "publication": self.publication,
+            "scientific_admission": self.scientific_admission,
+            "uncertainty_disks": self.uncertainty_disks,
+        }
+
+
 def _exact_fields(
     value: object, expected: frozenset[str], subject: str
 ) -> Mapping[str, object]:
@@ -199,10 +259,32 @@ class PromotedControlCalibrationReceipt:
     source_audit_sha256: str
     certificate_identity: str
     certificate_safety_factor: int
+    admission_boundary: CalibrationAdmissionBoundary
     profiles: tuple[EmpiricalControlProfile, ...]
     derivative_floor_records: Mapping[str, Mapping[str, object]]
     sha256: str
     _canonical_bytes: bytes
+
+    @property
+    def execution_mode(self) -> PromotedExecutionMode:
+        return self.admission_boundary.execution_mode
+
+    @property
+    def independent_review_authority_sha256(self) -> str:
+        """Return the review-authority anchor authenticated by this receipt."""
+
+        mapping = self.to_mapping()
+        approval = mapping.get("operator_approval")
+        if not isinstance(approval, Mapping):
+            raise CalibrationReceiptError(
+                "calibration receipt operator approval is unavailable"
+            )
+        authority_material = {
+            "schema": "windows-solver.independent-promoted-review-authority/1",
+            "calibration_receipt_sha256": self.sha256,
+            "operator_approval": dict(approval),
+        }
+        return hashlib.sha256(canonical_json_bytes(authority_material)).hexdigest()
 
     @property
     def covered_pairs(self) -> frozenset[tuple[str, int]]:
@@ -497,6 +579,13 @@ def _parse_receipt(mapping: Mapping[str, object], digest: str) -> PromotedContro
     }
     if admission != expected_admission:
         raise CalibrationReceiptError("calibration receipt admission boundary is invalid")
+    parsed_admission = CalibrationAdmissionBoundary(
+        calculation=str(admission["calculation"]),
+        checkpointing=str(admission["checkpointing"]),
+        publication=str(admission["publication"]),
+        scientific_admission=str(admission["scientific_admission"]),
+        uncertainty_disks=str(admission["uncertainty_disks"]),
+    )
 
     return PromotedControlCalibrationReceipt(
         identity=str(top["identity"]),
@@ -508,6 +597,7 @@ def _parse_receipt(mapping: Mapping[str, object], digest: str) -> PromotedContro
         source_audit_sha256=str(audit["sha256"]),
         certificate_identity=str(certificate["identity"]),
         certificate_safety_factor=64,
+        admission_boundary=parsed_admission,
         profiles=tuple(profiles),
         derivative_floor_records=MappingProxyType(floor_records),
         sha256=digest,

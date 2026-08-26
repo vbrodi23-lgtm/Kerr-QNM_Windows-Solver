@@ -26,7 +26,10 @@ _REQUIRED_CALLS = {
     "run_native_promoted_pass": {
         "run_promoted_survey": {
             "root_seal_lookup",
-            "provisional_stage_lookup",
+            "layer1_guard",
+            "locked_routes_by_ordinal",
+            "promoted_preflights_by_ordinal",
+            "layer1_lock_receipt_sha256",
             "root_seal_publish",
             "backend_factory",
             "determinant_error_store",
@@ -34,6 +37,14 @@ _REQUIRED_CALLS = {
             "terminal_record_committed",
             "checkpoint_committed",
             "diagnostic_session",
+        },
+    },
+    "run_native_promoted_admission": {
+        "admit_retained_promoted_checkpoint": {
+            "queue_ordinal",
+            "independent_review_receipt",
+            "layer1_guard",
+            "terminal_record_committed",
         },
     },
 }

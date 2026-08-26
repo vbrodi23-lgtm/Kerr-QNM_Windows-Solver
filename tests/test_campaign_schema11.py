@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import hashlib
 import unittest
 
@@ -15,9 +16,14 @@ from windows_solver.campaign_policy import (
     finish_promotion,
     record_evidence,
     record_survey_disposition,
+    retain_promoted_calculation,
     validate_schema11_checkpoint,
 )
 from windows_solver.contracts import canonical_json_bytes
+
+
+def _sha256(value: object) -> str:
+    return hashlib.sha256(canonical_json_bytes(value)).hexdigest()
 
 
 def _record(leaf_id: str = "leaf-1", state: str = "PRODUCED") -> dict[str, object]:
@@ -64,6 +70,9 @@ class Schema11CheckpointTests(unittest.TestCase):
             },
             checkpoint["promotion_queue"],
         )
+        self.assertEqual({}, checkpoint["promoted_stage_ledger"])
+        self.assertEqual({}, checkpoint["promoted_background_ledger"])
+        self.assertEqual({}, checkpoint["promoted_root_ledger"])
         self.assertEqual([], checkpoint["attempts"])
         self.assertEqual([], checkpoint["system_failures"])
         self.assertEqual([], checkpoint["recovery_receipts"])
@@ -193,6 +202,84 @@ class Schema11CheckpointTests(unittest.TestCase):
         )
         self.assertIn("disposition_receipt_sha256", entries[0])
         validate_schema11_checkpoint(checkpoint)
+
+    def test_calculated_promotion_is_retained_while_admission_is_pending(self) -> None:
+        checkpoint = append_promotion(
+            empty_schema11_checkpoint("campaign-1", "selection-1"),
+            leaf_id="leaf-1",
+            queue_kind=PromotionQueueKind.RESPONSE,
+            reason_code="REVIEWED_ERROR_EVIDENCE_PENDING",
+            minimum_requested_tier="BF40",
+            scientific_computation_identity="b" * 64,
+        )
+        stage_content = {
+            "schema": "windows-solver.promoted-calculation-stage/1",
+            "leaf_id": "leaf-1",
+            "queue_ordinal": 0,
+            "route": "EXTERIOR_BF40",
+            "execution_mode": "CALCULATE_ONLY",
+            "admission_state": "AWAITING_ADMISSION",
+            "precision_tiers": ["BF40"],
+            "batch": {"sample_count": 18},
+            "receipts": [{"schema": "windows-solver.test-comparison/1"}],
+        }
+        stage = {**stage_content, "stage_sha256": _sha256(stage_content)}
+
+        checkpoint = retain_promoted_calculation(
+            checkpoint,
+            queue_ordinal=0,
+            promoted_stage=stage,
+            execution_mode="CALCULATE_ONLY",
+            disposition_receipt={
+                "schema": "windows-solver.promoted-admission-pending/1"
+            },
+            promoted_background={
+                "schema": "windows-solver.test-promoted-background/1",
+                "reuse_key_sha256": "c" * 64,
+                "status": "ACQUIRED",
+            },
+            promoted_root={
+                "schema": "windows-solver.test-promoted-root/1",
+                "root_seal_sha256": "d" * 64,
+            },
+        )
+        checkpoint = record_survey_disposition(
+            checkpoint,
+            survey_pass=SurveyPass.PROMOTED,
+            leaf_id="leaf-1",
+            disposition=SurveyDisposition.CALCULATED_AWAITING_ADMISSION,
+            reason_code="AWAITING_INDEPENDENT_REVIEW_ADMISSION",
+            **_pass_limits(),
+        )
+
+        entry = checkpoint["promotion_queue"]["entries"][0]
+        self.assertEqual("AWAITING_ADMISSION", entry["disposition"])
+        self.assertEqual(stage["stage_sha256"], entry["retained_promoted_stage_sha256"])
+        self.assertNotIn("retained_promoted_stage", entry)
+        self.assertEqual(
+            stage,
+            checkpoint["promoted_stage_ledger"]["0"]["leaf-1"],
+        )
+        background_entry = checkpoint["promoted_background_ledger"]["0"][
+            "leaf-1"
+        ]
+        root_entry = checkpoint["promoted_root_ledger"]["0"]["leaf-1"]
+        self.assertEqual("ACQUIRED", background_entry["payload"]["status"])
+        self.assertEqual("d" * 64, root_entry["payload"]["root_seal_sha256"])
+        self.assertEqual({}, checkpoint["evidence_ledger"])
+        self.assertEqual([], checkpoint["records"])
+        self.assertEqual(
+            "CALCULATED_AWAITING_ADMISSION",
+            checkpoint["survey_pass_ledger"]["promoted"]["leaf-1"]["disposition"],
+        )
+        validate_schema11_checkpoint(checkpoint)
+
+        corrupted = copy.deepcopy(checkpoint)
+        corrupted["promoted_stage_ledger"]["0"]["leaf-1"]["batch"][
+            "sample_count"
+        ] = 17
+        with self.assertRaisesRegex(ValueError, "retained promoted stage"):
+            validate_schema11_checkpoint(corrupted)
 
 
 if __name__ == "__main__":

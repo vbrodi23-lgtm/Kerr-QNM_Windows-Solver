@@ -324,6 +324,32 @@ def build_parser() -> argparse.ArgumentParser:
         "--checkpoint", type=Path, required=True
     )
     campaign_recovery_validate.add_argument("--receipt", type=Path)
+    campaign_lock_binary64 = commands.add_parser(
+        "campaign-lock-binary64",
+        help="create the deterministic schema-11 binary64 Layer-1 lock",
+    )
+    campaign_lock_binary64.add_argument("selection", type=Path)
+    campaign_lock_binary64.add_argument("--checkpoint", type=Path, required=True)
+    campaign_lock_binary64.add_argument(
+        "--output",
+        type=Path,
+        help="optional lock sidecar path; defaults beside the checkpoint",
+    )
+    campaign_admit_promoted = commands.add_parser(
+        "campaign-admit-promoted",
+        help="admit one retained promoted stage after independent review",
+    )
+    campaign_admit_promoted.add_argument("selection", type=Path)
+    campaign_admit_promoted.add_argument("--checkpoint", type=Path, required=True)
+    campaign_admit_promoted.add_argument(
+        "--binary64-lock", type=Path, required=True
+    )
+    campaign_admit_promoted.add_argument(
+        "--queue-ordinal", type=int, required=True
+    )
+    campaign_admit_promoted.add_argument(
+        "--review-receipt", type=Path, required=True
+    )
     for name, help_text in (
         ("campaign-survey-binary64", "run only the schema-11 binary64 survey pass"),
         ("campaign-survey-promoted", "run only the queued schema-11 promoted survey pass"),
@@ -341,6 +367,8 @@ def build_parser() -> argparse.ArgumentParser:
         campaign_pass.add_argument("--queue", type=Path)
         campaign_pass.add_argument("--calibration-receipt-path", type=Path)
         campaign_pass.add_argument("--calibration-receipt-sha256")
+        if name == "campaign-survey-promoted":
+            campaign_pass.add_argument("--binary64-lock", type=Path, required=True)
         campaign_pass.add_argument(
             "--diagnostic-session-id",
             help=(
@@ -359,6 +387,7 @@ def build_parser() -> argparse.ArgumentParser:
         dest="pass_name",
         choices=("binary64", "promoted", "certify", "validate"),
     )
+    schema11_validate.add_argument("--binary64-lock", type=Path)
     campaign_reduce = commands.add_parser(
         "campaign-reduce",
         help="reduce authenticated campaign checkpoints without backend work",
@@ -1112,6 +1141,99 @@ def _load_schema11_campaign(
     return plan, selection, descriptor, recovery_selection, resolved, checkpoint
 
 
+def _schema11_leaf_mechanism_ids(
+    plan: object, recovery_selection: RecoverySelection
+) -> dict[str, str]:
+    leaves = {leaf.leaf_id: leaf for leaf in plan.leaves}
+    if set(recovery_selection.ordered_leaf_ids) - set(leaves):
+        raise ValueError("schema-11 selection contains a leaf absent from the plan")
+    return {
+        leaf_id: leaves[leaf_id].mechanism_id
+        for leaf_id in recovery_selection.ordered_leaf_ids
+    }
+
+
+def _schema11_binary64_lock_manifest(
+    plan: object,
+    checkpoint: Mapping[str, object],
+    checkpoint_path: Path,
+) -> list[dict[str, object]]:
+    """Read the exact durable evidence objects named by the Layer-1 state."""
+
+    from .background_evidence_store import CanonicalBackgroundEvidenceStore
+    from .binary64_layer_lock import build_binary64_layer_auxiliary_evidence_manifest
+    from .root_readout_cache import RootEvidenceStore
+
+    return build_binary64_layer_auxiliary_evidence_manifest(
+        plan,
+        checkpoint,
+        root_evidence_store=RootEvidenceStore.for_checkpoint(checkpoint_path),
+        background_evidence_store=CanonicalBackgroundEvidenceStore(
+            checkpoint_path.parent / f"{checkpoint_path.name}.canonical-backgrounds"
+        ),
+    )
+
+
+def _campaign_lock_binary64(
+    selection_path: Path,
+    checkpoint_path: Path,
+    output_path: Path | None,
+) -> tuple[int, object]:
+    """Create one deterministic binary64 lock without numerical work."""
+
+    from .binary64_layer_lock import (
+        binary64_layer_lock_path,
+        build_binary64_layer_lock,
+        load_binary64_layer_lock,
+        promoted_layer2_state_exists,
+        validate_binary64_layer_lock,
+        write_binary64_layer_lock,
+    )
+
+    plan, _selection, _descriptor, recovery_selection, resolved, checkpoint = (
+        _load_schema11_campaign(selection_path, checkpoint_path)
+    )
+    destination = (
+        binary64_layer_lock_path(resolved)
+        if output_path is None
+        else _resolve_recovery_path(output_path)
+    )
+    manifest = _schema11_binary64_lock_manifest(plan, checkpoint, resolved)
+    leaf_mechanism_ids = _schema11_leaf_mechanism_ids(plan, recovery_selection)
+    if destination.is_file():
+        lock = validate_binary64_layer_lock(
+            load_binary64_layer_lock(destination),
+            checkpoint,
+            selection=recovery_selection,
+            leaf_mechanism_ids=leaf_mechanism_ids,
+            auxiliary_evidence_manifest=manifest,
+        )
+        lock_status = "REUSED"
+    else:
+        if promoted_layer2_state_exists(checkpoint):
+            raise ValueError("binary64 lock is absent after promoted work began")
+        lock = build_binary64_layer_lock(
+            checkpoint,
+            selection=recovery_selection,
+            leaf_mechanism_ids=leaf_mechanism_ids,
+            auxiliary_evidence_manifest=manifest,
+        )
+        write_binary64_layer_lock(destination, lock)
+        lock_status = "CREATED"
+    return 0, {
+        "command": "campaign-lock-binary64",
+        "checkpoint_path": str(resolved),
+        "binary64_lock_path": str(destination),
+        "campaign_id": lock["campaign_id"],
+        "selection_id": lock["selection_id"],
+        "receipt_sha256": lock["receipt_sha256"],
+        "pending_promotion_count": lock["pending_promotion_count"],
+        "route_counts": lock["route_counts"],
+        "lock_status": lock_status,
+        "release_admissible": False,
+    }
+
+
 def _schema11_leaf_metadata(plan, selection) -> dict[str, dict[str, object]]:
     leaf_by_id = {leaf.leaf_id: leaf for leaf in plan.leaves}
     leaf_count = len(selection.leaf_ids)
@@ -1132,6 +1254,7 @@ def _campaign_schema11_validate(
     selection_path: Path,
     checkpoint_path: Path,
     pass_name: str | None,
+    binary64_lock_path: Path | None = None,
 ) -> tuple[int, object]:
     plan, selection, _descriptor, _recovery, resolved, checkpoint = (
         _load_schema11_campaign(selection_path, checkpoint_path)
@@ -1144,6 +1267,24 @@ def _campaign_schema11_validate(
     report_status = projection.report_status
     evidence_counts = projection.evidence_counts
     if pass_name == "promoted":
+        if binary64_lock_path is None:
+            raise ValueError("promoted validation requires a binary64 lock")
+        from .binary64_layer_lock import (
+            load_binary64_layer_lock,
+            validate_binary64_layer_lock,
+        )
+
+        lock_path = _resolve_recovery_path(binary64_lock_path)
+        lock = load_binary64_layer_lock(lock_path)
+        validate_binary64_layer_lock(
+            lock,
+            checkpoint,
+            selection=_recovery,
+            leaf_mechanism_ids=_schema11_leaf_mechanism_ids(plan, _recovery),
+            auxiliary_evidence_manifest=_schema11_binary64_lock_manifest(
+                plan, checkpoint, resolved
+            ),
+        )
         pending = [
             item
             for item in checkpoint["promotion_queue"]["entries"]
@@ -1195,7 +1336,63 @@ def _campaign_schema11_validate(
         "report_status": dict(report_status),
         "basic_report_directory": str(report_directory_for_checkpoint(resolved)),
         "status_path": f"{resolved}.status.json",
+        "binary64_lock_path": (
+            None
+            if binary64_lock_path is None
+            else str(_resolve_recovery_path(binary64_lock_path))
+        ),
         "validated_pass": pass_name,
+        "release_admissible": False,
+    }
+
+
+def _campaign_admit_promoted(
+    selection_path: Path,
+    checkpoint_path: Path,
+    *,
+    binary64_lock_path: Path,
+    queue_ordinal: int,
+    review_receipt_path: Path,
+) -> tuple[int, object]:
+    (
+        plan,
+        selection,
+        _descriptor,
+        recovery_selection,
+        resolved,
+        checkpoint,
+    ) = _load_schema11_campaign(selection_path, checkpoint_path)
+    review_receipt = _load_strict_json(
+        _resolve_recovery_path(review_receipt_path),
+        "independent promoted review receipt",
+    )
+    from .campaign_runtime import run_native_promoted_admission
+
+    result = run_native_promoted_admission(
+        plan,
+        selection,
+        recovery_selection,
+        checkpoint,
+        checkpoint_path=resolved,
+        binary64_lock_path=_resolve_recovery_path(binary64_lock_path),
+        queue_ordinal=queue_ordinal,
+        independent_review_receipt=review_receipt,
+    )
+    return 0, {
+        "command": "campaign-admit-promoted",
+        "campaign_id": result.checkpoint["campaign_id"],
+        "selection_id": result.checkpoint["selection_id"],
+        "checkpoint_path": str(resolved),
+        "queue_ordinal": result.queue_ordinal,
+        "leaf_id": result.leaf_id,
+        "admitted_record_sha256": result.admitted_record_sha256,
+        "review_receipt_sha256": result.review_receipt_sha256,
+        "backend_call_count": result.backend_call_count,
+        "julia_launch_count": result.julia_launch_count,
+        "root_read_count": result.root_read_count,
+        "determinant_evaluation_count": result.determinant_evaluation_count,
+        "binary64_evaluation_count": result.binary64_evaluation_count,
+        "evidence_level": "SCREENED",
         "release_admissible": False,
     }
 
@@ -1209,6 +1406,7 @@ def _campaign_schema11_pass(
     progress_mode: str,
     calibration_receipt_path: Path | None,
     calibration_receipt_sha256: str | None,
+    binary64_lock_path: Path | None = None,
     diagnostic_paths: Mapping[str, str | os.PathLike[str] | Path | None] | None = None,
     diagnostic_session: StructuralDiagnosticSession | None = None,
 ) -> tuple[int, object]:
@@ -1277,6 +1475,9 @@ def _campaign_schema11_pass(
     if command == "campaign-survey-promoted":
         from .campaign_runtime import run_native_promoted_pass
 
+        if binary64_lock_path is None:
+            raise ValueError("promoted survey requires a binary64 lock")
+
         receipt = (
             None
             if calibration_receipt_path is None
@@ -1300,6 +1501,7 @@ def _campaign_schema11_pass(
                     recovery_selection,
                     checkpoint,
                     checkpoint_path=resolved,
+                    binary64_lock_path=_resolve_recovery_path(binary64_lock_path),
                     calibration_receipt=receipt,
                     diagnostic_session=diagnostic_session,
                 )
@@ -1324,6 +1526,30 @@ def _campaign_schema11_pass(
             "terminal_cache_discovery": (
                 result.terminal_cache_discovery.to_mapping()
             ),
+            "locked_route_count": result.locked_route_count,
+            "exterior_bf40_route_count": result.exterior_bf40_route_count,
+            "horizon_bf80_route_count": result.horizon_bf80_route_count,
+            "exterior_bf40_executed_count": result.exterior_bf40_executed_count,
+            "horizon_bf80_executed_count": result.horizon_bf80_executed_count,
+            "binary64_predecessor_evaluation_count": (
+                result.binary64_predecessor_evaluation_count
+            ),
+            "binary64_recomputed_evaluation_count": (
+                result.binary64_recomputed_evaluation_count
+            ),
+            "promoted_background_acquired_count": (
+                result.promoted_background_acquired_count
+            ),
+            "promoted_background_reused_count": (
+                result.promoted_background_reused_count
+            ),
+            "calculated_awaiting_admission_count": (
+                result.calculated_awaiting_admission_count
+            ),
+            "admitted_count": result.admitted_count,
+            "screened_count": result.screened_count,
+            "terminal_publication_count": result.terminal_publication_count,
+            "policy_blocked_count": result.policy_blocked_count,
             "release_admissible": False,
         }
     if command in {"campaign-certify", "campaign-evidence-validate"}:
@@ -1921,6 +2147,7 @@ def _run_schema11_pass_with_diagnostics(arguments: argparse.Namespace) -> tuple[
             progress_mode=arguments.progress,
             calibration_receipt_path=arguments.calibration_receipt_path,
             calibration_receipt_sha256=arguments.calibration_receipt_sha256,
+            binary64_lock_path=getattr(arguments, "binary64_lock", None),
             diagnostic_paths={
                 "diagnostic_session_directory": session.paths.directory,
                 "postmortem_path": session.paths.postmortem,
@@ -2001,6 +2228,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         elif arguments.command == "campaign-plan":
             status, output = _campaign_selected(
                 arguments.command, arguments.selection, Path("unused")
+            )
+        elif arguments.command == "campaign-admit-promoted":
+            status, output = _campaign_admit_promoted(
+                arguments.selection,
+                arguments.checkpoint,
+                binary64_lock_path=arguments.binary64_lock,
+                queue_ordinal=arguments.queue_ordinal,
+                review_receipt_path=arguments.review_receipt,
             )
         elif arguments.command in {
             "campaign-run", "campaign-resume", "campaign-validate"
@@ -2098,11 +2333,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             status, output = _campaign_recovery_validate(
                 arguments.selection, arguments.checkpoint, arguments.receipt
             )
+        elif arguments.command == "campaign-lock-binary64":
+            status, output = _campaign_lock_binary64(
+                arguments.selection, arguments.checkpoint, arguments.output
+            )
         elif arguments.command == "campaign-schema11-validate":
             status, output = _campaign_schema11_validate(
                 arguments.selection,
                 arguments.checkpoint,
                 arguments.pass_name,
+                arguments.binary64_lock,
             )
         elif arguments.command in {
             "campaign-survey-binary64",

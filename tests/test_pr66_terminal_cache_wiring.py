@@ -18,11 +18,12 @@ from windows_solver.campaign_policy import (
 )
 from windows_solver.campaign_failures import CampaignSystemFailure
 from windows_solver.campaign_recovery import RecoverySelection
-from windows_solver.campaign_runtime import (
-    run_native_binary64_pass,
-    run_native_promoted_pass,
+from windows_solver.campaign_runtime import run_native_binary64_pass
+from windows_solver.campaign_survey import (
+    Binary64PassOutcome,
+    Binary64SurveyRun,
+    run_promoted_survey,
 )
-from windows_solver.campaign_survey import Binary64PassOutcome, Binary64SurveyRun
 from windows_solver.contracts import canonical_json_bytes
 from windows_solver.evidence_discovery import EvidenceDiscoveryTotals
 from windows_solver.native_response_kernel import VettedNativeDeterminantKernel
@@ -39,6 +40,34 @@ from windows_solver.solved_leaf_cache import SolvedLeafStore
 
 def _sha256(value: object) -> str:
     return hashlib.sha256(canonical_json_bytes(value)).hexdigest()
+
+
+def _run_cache_only_promoted_survey(
+    plan: object,
+    recovery: RecoverySelection,
+    checkpoint: dict[str, object],
+    *,
+    checkpoint_path: Path,
+    store: SolvedLeafStore,
+):
+    """Exercise cache supersession below the lock/admission composition root."""
+
+    def unexpected(*_args, **_kwargs):
+        raise AssertionError("cache supersession constructed a numerical capability")
+
+    return run_promoted_survey(
+        plan,
+        recovery,
+        checkpoint,
+        checkpoint_path=checkpoint_path,
+        root_seal_lookup=unexpected,
+        root_seal_publish=unexpected,
+        backend_factory=unexpected,
+        primary_root_runner=unexpected,
+        horizon_runner=unexpected,
+        produced_record_builder=unexpected,
+        solved_leaf_store=store,
+    )
 
 
 def _recovery_selection(plan: object, selection: object) -> RecoverySelection:
@@ -308,13 +337,12 @@ class PromotedTerminalCacheWiringTests(unittest.TestCase):
                 with self.assertRaisesRegex(
                     CampaignSystemFailure, "TERMINAL_CACHE_CONFLICT"
                 ) as raised:
-                    run_native_promoted_pass(
+                    _run_cache_only_promoted_survey(
                         plan,
-                        selection,
                         recovery,
                         checkpoint,
                         checkpoint_path=root / "checkpoint.json",
-                        solved_leaf_store=store,
+                        store=store,
                     )
 
         self.assertEqual(
@@ -373,12 +401,12 @@ class PromotedTerminalCacheWiringTests(unittest.TestCase):
                     value
                 ),
             ):
-                result = run_native_promoted_pass(
+                result = _run_cache_only_promoted_survey(
                     plan,
-                    selection,
                     recovery,
                     checkpoint,
                     checkpoint_path=root / "checkpoint.json",
+                    store=store,
                 )
 
         entry = result.checkpoint["promotion_queue"]["entries"][0]
@@ -579,13 +607,12 @@ class PromotedTerminalCacheWiringTests(unittest.TestCase):
                     value
                 ),
             ):
-                result = run_native_promoted_pass(
+                result = _run_cache_only_promoted_survey(
                     plan,
-                    selection,
                     recovery,
                     checkpoint,
                     checkpoint_path=root / "checkpoint.json",
-                    solved_leaf_store=store,
+                    store=store,
                 )
 
         self.assertEqual(2, result.cache_reused_count)
