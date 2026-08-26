@@ -10,12 +10,15 @@ import unittest
 
 from windows_solver.campaign_policy import (
     EvidenceLevel,
+    PromotionQueueKind,
     SurveyDisposition,
     SurveyPass,
     add_numerical_record,
+    append_promotion,
     empty_schema11_checkpoint,
     record_evidence,
     record_survey_disposition,
+    retain_promoted_calculation,
 )
 from windows_solver.campaign_reports import (
     refresh_schema11_reports,
@@ -88,6 +91,112 @@ def _fixture():
 
 
 class Schema11ReportTests(unittest.TestCase):
+    def test_basic_csvs_project_retained_calculate_only_stage(self):
+        plan, selection, _checkpoint = _fixture()
+        checkpoint = append_promotion(
+            empty_schema11_checkpoint("campaign-1", "selection-1"),
+            leaf_id="leaf-1",
+            queue_kind=PromotionQueueKind.RESPONSE,
+            reason_code="REVIEWED_ERROR_EVIDENCE_PENDING",
+            minimum_requested_tier="BF40",
+            scientific_computation_identity="a" * 64,
+        )
+        disagreement = {
+            "family": "CURRENT_RUN_DETERMINANT_DISAGREEMENT",
+            "signed_delta": {"real": "0.125", "imaginary": "-0.25"},
+        }
+        stage_content = {
+            "schema": "windows-solver.promoted-calculation-stage/1",
+            "queue_ordinal": 0,
+            "leaf_id": "leaf-1",
+            "scientific_computation_identity": "a" * 64,
+            "route": "EXTERIOR_BF40",
+            "execution_mode": "CALCULATE_ONLY",
+            "admission_state": "AWAITING_ADMISSION",
+            "calibration_receipt_sha256": "b" * 64,
+            "precision_tiers": ["BF40"],
+            "raw_promoted_batches": [{"precision_tier": "BF40", "samples": []}],
+            "current_run_disagreement_terms": [disagreement],
+            "retained_record": None,
+            "retained_record_stage_sha256": None,
+            "receipts": [],
+            "sample_count": 9,
+            "root_read_count": 1,
+            "worker_launch_count": 1,
+            "tier_timing": [{"tier": "BF40", "elapsed_seconds": 2.5}],
+            "session_fragments": [],
+        }
+        stage = {**stage_content, "stage_sha256": _sha256(stage_content)}
+        checkpoint = retain_promoted_calculation(
+            checkpoint,
+            queue_ordinal=0,
+            promoted_stage=stage,
+            execution_mode="CALCULATE_ONLY",
+            disposition_receipt={
+                "schema": "windows-solver.promoted-admission-pending/1",
+            },
+        )
+        checkpoint = record_survey_disposition(
+            checkpoint,
+            survey_pass=SurveyPass.PROMOTED,
+            leaf_id="leaf-1",
+            disposition=SurveyDisposition.CALCULATED_AWAITING_ADMISSION,
+            operation_identity="promoted-fixed-root-survey/v1",
+            precision_tiers=("BF40",),
+            reason_code="AWAITING_INDEPENDENT_REVIEW_ADMISSION",
+            sample_count=9,
+            sample_limit=9,
+            root_read_count=1,
+            root_read_limit=1,
+            worker_launch_count=1,
+            worker_launch_limit=1,
+            tier_timing=(),
+            session_fragments=(),
+        )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "checkpoint.json"
+            path.write_bytes(canonical_json_bytes(checkpoint))
+            refresh_schema11_reports(
+                plan,
+                selection,
+                checkpoint,
+                path,
+                advanced_projective=lambda *_: None,
+                advanced_triage=lambda *_: None,
+            )
+            directory = report_directory_for_checkpoint(path)
+            with (directory / "m02-leaves.csv").open(
+                encoding="utf-8", newline=""
+            ) as handle:
+                leaves = list(csv.DictReader(handle))
+            with (directory / "m02-precision-stages.csv").open(
+                encoding="utf-8", newline=""
+            ) as handle:
+                stages = list(csv.DictReader(handle))
+            with (directory / "m02-error-channels.csv").open(
+                encoding="utf-8", newline=""
+            ) as handle:
+                channels = list(csv.DictReader(handle))
+
+        self.assertEqual([], checkpoint["records"])
+        self.assertEqual("EXTERIOR_BF40", leaves[0]["promoted_route"])
+        self.assertEqual("AWAITING_ADMISSION", leaves[0]["admission_state"])
+        self.assertEqual(stage["stage_sha256"], leaves[0]["stage_sha256"])
+        self.assertEqual("BF40", leaves[0]["precision_tier"])
+        self.assertEqual("2.5", leaves[0]["bf40_seconds"])
+        self.assertEqual("9", leaves[0]["sample_count"])
+        self.assertEqual("1", leaves[0]["root_read_count"])
+        self.assertEqual("1", leaves[0]["worker_launch_count"])
+        self.assertEqual(1, len(stages))
+        self.assertEqual("BF40", stages[0]["precision_tier"])
+        self.assertEqual(stage["stage_sha256"], stages[0]["stage_sha256"])
+        self.assertEqual(1, len(channels))
+        self.assertEqual(
+            "CURRENT_RUN_DETERMINANT_DISAGREEMENT", channels[0]["family"]
+        )
+        self.assertEqual(stage["stage_sha256"], channels[0]["stage_sha256"])
+
     def test_basic_csvs_survive_advanced_projection_failure(self):
         plan, selection, checkpoint = _fixture()
         with tempfile.TemporaryDirectory() as temporary:

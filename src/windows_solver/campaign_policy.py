@@ -625,6 +625,129 @@ def retain_promoted_continuation(
     return result
 
 
+def _retain_promoted_auxiliary_entry(
+    result: dict[str, object],
+    *,
+    ledger_field: str,
+    queue_ordinal: int,
+    leaf_id: str,
+    payload: Mapping[str, object],
+    schema: str,
+) -> None:
+    """Store one checkpoint-owned promoted dependency without a sidecar."""
+
+    content: dict[str, object] = {
+        "schema": schema,
+        "queue_ordinal": queue_ordinal,
+        "leaf_id": leaf_id,
+        "payload": copy.deepcopy(dict(payload)),
+    }
+    ledger_entry = {**content, "ledger_entry_sha256": _sha256(content)}
+    auxiliary_ledger = result[ledger_field]
+    assert isinstance(auxiliary_ledger, dict)
+    ordinal_key = str(queue_ordinal)
+    auxiliary_bucket = auxiliary_ledger.setdefault(ordinal_key, {})
+    if not isinstance(auxiliary_bucket, dict):
+        raise ValueError(f"{ledger_field} ordinal is invalid")
+    existing = auxiliary_bucket.get(leaf_id)
+    if existing is None or existing == ledger_entry:
+        auxiliary_bucket[leaf_id] = ledger_entry
+        return
+    if ledger_field != "promoted_background_ledger":
+        raise ValueError(f"conflicting {ledger_field} entry")
+    if not isinstance(existing, Mapping):
+        raise ValueError("conflicting promoted background entry")
+    existing_payload = existing.get("payload")
+    existing_receipts = (
+        existing_payload.get("background_receipts")
+        if isinstance(existing_payload, Mapping)
+        else None
+    )
+    incoming_receipts = payload.get("background_receipts")
+    if (
+        not isinstance(existing_receipts, list)
+        or not isinstance(incoming_receipts, list)
+        or existing_payload.get("schema") != payload.get("schema")
+        or existing_payload.get("route") != payload.get("route")
+    ):
+        raise ValueError("conflicting promoted background entry")
+    merged: list[dict[str, object]] = []
+    by_digest: dict[str, dict[str, object]] = {}
+    for receipt in [*existing_receipts, *incoming_receipts]:
+        if not isinstance(receipt, Mapping):
+            raise ValueError("promoted background receipt is invalid")
+        canonical = copy.deepcopy(dict(receipt))
+        digest = canonical.get("receipt_sha256")
+        if not _is_sha256(digest):
+            raise ValueError("promoted background receipt digest is invalid")
+        prior = by_digest.get(str(digest))
+        if prior is not None:
+            if prior != canonical:
+                raise ValueError("conflicting promoted background receipt")
+            continue
+        by_digest[str(digest)] = canonical
+        merged.append(canonical)
+    merged_payload = copy.deepcopy(dict(payload))
+    merged_payload["background_receipts"] = merged
+    merged_content = {
+        "schema": schema,
+        "queue_ordinal": queue_ordinal,
+        "leaf_id": leaf_id,
+        "payload": merged_payload,
+    }
+    auxiliary_bucket[leaf_id] = {
+        **merged_content,
+        "ledger_entry_sha256": _sha256(merged_content),
+    }
+
+
+def retain_promoted_background(
+    checkpoint: Mapping[str, object],
+    *,
+    queue_ordinal: int,
+    route: str,
+    background_receipt: Mapping[str, object],
+    layer1_guard: object | None = None,
+) -> dict[str, object]:
+    """Commit a shared promoted background before its mechanism samples run."""
+
+    result = validate_schema11_checkpoint(checkpoint)
+    queue = result["promotion_queue"]
+    assert isinstance(queue, dict)
+    entries = queue["entries"]
+    assert isinstance(entries, list)
+    if (
+        isinstance(queue_ordinal, bool)
+        or not isinstance(queue_ordinal, int)
+        or queue_ordinal < 0
+        or queue_ordinal >= len(entries)
+    ):
+        raise ValueError("promotion queue ordinal is invalid")
+    entry = entries[queue_ordinal]
+    if (
+        entry["queue_ordinal"] != queue_ordinal
+        or entry["disposition"] != PromotionQueueDisposition.PENDING.value
+        or route not in {"EXTERIOR_BF40", "HORIZON_BF80"}
+        or not isinstance(background_receipt, Mapping)
+        or not _is_sha256(background_receipt.get("receipt_sha256"))
+    ):
+        raise ValueError("promoted background retention is invalid")
+    _retain_promoted_auxiliary_entry(
+        result,
+        ledger_field="promoted_background_ledger",
+        queue_ordinal=queue_ordinal,
+        leaf_id=str(entry["leaf_id"]),
+        payload={
+            "schema": "windows-solver.promoted-background-retention/1",
+            "route": route,
+            "background_receipts": [copy.deepcopy(dict(background_receipt))],
+        },
+        schema="windows-solver.promoted-background-ledger-entry/1",
+    )
+    _assert_layer1_guard(layer1_guard, result)
+    return result
+
+
 def retain_promoted_calculation(
     checkpoint: Mapping[str, object],
     *,
@@ -741,25 +864,14 @@ def retain_promoted_calculation(
             continue
         if not isinstance(payload, Mapping):
             raise ValueError(f"{ledger_field} payload is invalid")
-        content: dict[str, object] = {
-            "schema": schema,
-            "queue_ordinal": queue_ordinal,
-            "leaf_id": leaf_id,
-            "payload": copy.deepcopy(dict(payload)),
-        }
-        ledger_entry = {
-            **content,
-            "ledger_entry_sha256": _sha256(content),
-        }
-        auxiliary_ledger = result[ledger_field]
-        assert isinstance(auxiliary_ledger, dict)
-        auxiliary_bucket = auxiliary_ledger.setdefault(ordinal_key, {})
-        if not isinstance(auxiliary_bucket, dict):
-            raise ValueError(f"{ledger_field} ordinal is invalid")
-        existing_auxiliary = auxiliary_bucket.get(leaf_id)
-        if existing_auxiliary is not None and existing_auxiliary != ledger_entry:
-            raise ValueError(f"conflicting {ledger_field} entry")
-        auxiliary_bucket[leaf_id] = ledger_entry
+        _retain_promoted_auxiliary_entry(
+            result,
+            ledger_field=ledger_field,
+            queue_ordinal=queue_ordinal,
+            leaf_id=leaf_id,
+            payload=payload,
+            schema=schema,
+        )
     entry["retained_promoted_stage_sha256"] = supplied_stage_sha256
     entry["disposition"] = PromotionQueueDisposition.AWAITING_ADMISSION.value
     entry["disposition_receipt_sha256"] = _sha256(receipt)
@@ -891,8 +1003,10 @@ def complete_promoted_admission(
     if (
         receipt.get("queue_ordinal") != queue_ordinal
         or receipt.get("leaf_id") != entry["leaf_id"]
-        or receipt.get("retained_stage_sha256")
+        or receipt.get("retained_promoted_stage_sha256")
         != entry["retained_promoted_stage_sha256"]
+        or receipt.get("source_fingerprint_sha256")
+        != entry["source_fingerprint_sha256"]
     ):
         raise ValueError("promotion admission receipt binding is invalid")
     receipt["source_fingerprint_sha256"] = entry["source_fingerprint_sha256"]
@@ -1278,6 +1392,7 @@ __all__ = [
     "promotion_source_fingerprint_sha256",
     "record_evidence",
     "record_survey_disposition",
+    "retain_promoted_background",
     "retain_promoted_calculation",
     "retain_promoted_continuation",
     "validate_schema11_checkpoint",

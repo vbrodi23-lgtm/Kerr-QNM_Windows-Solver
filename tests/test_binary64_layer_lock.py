@@ -5,6 +5,9 @@ import hashlib
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
+from unittest.mock import patch
+
+import windows_solver.campaign_runtime as campaign_runtime
 
 from windows_solver.binary64_layer_lock import (
     BINARY64_LAYER_LOCK_SCHEMA,
@@ -65,6 +68,7 @@ class Binary64LayerLockTests(unittest.TestCase):
             backend_identity=VettedNativeDeterminantKernel.identity,
             precision_capabilities=PrecisionCapabilities((64, 80)),
         )
+        cls.plan = plan
         cls.leaf = next(
             leaf
             for leaf in plan.leaves
@@ -392,7 +396,10 @@ class Binary64LayerLockTests(unittest.TestCase):
                 "schema": "windows-solver.test-independent-review/1",
                 "queue_ordinal": 0,
                 "leaf_id": self.leaf.leaf_id,
-                "retained_stage_sha256": promoted_stage["stage_sha256"],
+                "retained_promoted_stage_sha256": promoted_stage["stage_sha256"],
+                "source_fingerprint_sha256": retained["promotion_queue"][
+                    "entries"
+                ][0]["source_fingerprint_sha256"],
             },
             layer1_guard=guard,
         )
@@ -635,6 +642,39 @@ class Binary64LayerLockTests(unittest.TestCase):
 
             self.assertEqual(canonical_json_bytes(lock), path.read_bytes())
             self.assertEqual(lock, load_binary64_layer_lock(path))
+
+    def test_existing_lock_rerun_validates_without_repeating_binary64_work(self) -> None:
+        """An exhausted Layer 1 is immutable once its exact lock exists."""
+
+        checkpoint, stage = self._checkpoint()
+        lock = self._lock(checkpoint, stage)
+        with TemporaryDirectory() as directory:
+            checkpoint_path = Path(directory) / "checkpoint.json"
+            lock_path = binary64_layer_lock_path(checkpoint_path)
+            write_binary64_layer_lock(lock_path, lock)
+            before = lock_path.read_bytes()
+            with patch.object(
+                campaign_runtime,
+                "build_binary64_layer_auxiliary_evidence_manifest",
+                return_value=self._auxiliary_manifest(stage),
+            ), patch.object(
+                campaign_runtime,
+                "run_binary64_survey",
+                side_effect=AssertionError("existing lock must skip binary64 work"),
+            ):
+                result = campaign_runtime.run_native_binary64_pass(
+                    self.plan,
+                    self.selection,
+                    self.selection,
+                    checkpoint,
+                    checkpoint_path=checkpoint_path,
+                )
+
+            self.assertTrue(result.pass_exhausted)
+            self.assertEqual(0, result.completed_count)
+            self.assertEqual(0, result.queued_count)
+            self.assertEqual(1, result.skipped_count)
+            self.assertEqual(before, lock_path.read_bytes())
 
     def test_locking_and_promoted_commands_require_the_shared_sidecar(self) -> None:
         """Break caught: the promoted path can bypass the binary64 receipt."""

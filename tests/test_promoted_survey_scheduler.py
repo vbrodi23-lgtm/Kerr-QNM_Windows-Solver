@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+from dataclasses import replace
 from decimal import Decimal
 import hashlib
 import json
@@ -228,7 +229,14 @@ class _Backend:
             kwargs["fixed_root"], kwargs["branch_identity"],
             kwargs["root_seal_sha256"],
         )
-        return _batch(self.leaf, seal, self.digits, flat=self.flat)
+        batch = _batch(self.leaf, seal, self.digits, flat=self.flat)
+        requested = tuple(kwargs["sample_roles"])
+        return replace(
+            batch,
+            samples=tuple(
+                sample for sample in batch.samples if sample.role in requested
+            ),
+        )
 
 
 class PromotedSurveySchedulerTests(unittest.TestCase):
@@ -433,7 +441,7 @@ class PromotedSurveySchedulerTests(unittest.TestCase):
         leaf_id = self.leaves[0].leaf_id
         queue_entry = first.checkpoint["promotion_queue"]["entries"][0]
         stage = first.checkpoint["promoted_stage_ledger"]["0"][leaf_id]
-        self.assertEqual([40], calls)
+        self.assertEqual([40, 40], calls)
         self.assertEqual("AWAITING_ADMISSION", queue_entry["disposition"])
         self.assertEqual(
             "CALCULATED_AWAITING_ADMISSION",
@@ -485,7 +493,7 @@ class PromotedSurveySchedulerTests(unittest.TestCase):
             calculate_only=True,
         )
 
-        self.assertEqual([40, 40], calls)
+        self.assertEqual([40, 40, 40], calls)
         background_entries = result.checkpoint["promoted_background_ledger"]
         receipts = [
             background_entries[str(ordinal)][leaf.leaf_id]["payload"][
@@ -636,7 +644,7 @@ class PromotedSurveySchedulerTests(unittest.TestCase):
         retained = resumed.checkpoint["promoted_stage_ledger"]["0"][
             self.leaves[0].leaf_id
         ]
-        self.assertEqual([80], resumed_calls)
+        self.assertEqual([80, 80], resumed_calls)
         self.assertEqual([40], root_calls)
         self.assertEqual(
             "AWAITING_ADMISSION",
@@ -678,6 +686,138 @@ class PromotedSurveySchedulerTests(unittest.TestCase):
             ]["sample_count"],
         )
 
+    def test_interruption_after_background_acquisition_reuses_it_on_resume(self):
+        """The five shared samples survive an interruption before mechanisms run."""
+
+        checkpoint = self._checkpoint(count=1)
+        first_roles: list[tuple[str, ...]] = []
+        resumed_roles: list[tuple[str, ...]] = []
+        preflight = require_locked_bf40_determinant_error_issuance_authority(
+            route="EXTERIOR_BF40"
+        )
+
+        def root_seal_lookup(leaf, entry):
+            return AuthenticatedRootSeal(
+                leaf.job.root.omega,
+                leaf.job.root.branch_id,
+                str(entry["source_root_seal_sha256"]),
+            )
+
+        def subset_batch(backend, kwargs):
+            seal = AuthenticatedRootSeal(
+                kwargs["fixed_root"],
+                kwargs["branch_identity"],
+                kwargs["root_seal_sha256"],
+            )
+            full = _batch(backend.leaf, seal, backend.digits)
+            requested = tuple(kwargs["sample_roles"])
+            return replace(
+                full,
+                samples=tuple(
+                    sample for sample in full.samples if sample.role in requested
+                ),
+            )
+
+        class InterruptingBackend(_Backend):
+            def fixed_root_survey_batch(self, job, **kwargs):
+                roles = tuple(kwargs["sample_roles"])
+                first_roles.append(roles)
+                self.calls.append(self.digits)
+                if roles == tuple(BINARY64_FIXED_ROOT_SAMPLE_ROLES[:5]):
+                    return subset_batch(self, kwargs)
+                if roles == tuple(BINARY64_FIXED_ROOT_SAMPLE_ROLES[5:]):
+                    raise KeyboardInterrupt
+                raise AssertionError("unexpected promoted sample request")
+
+        class ResumeBackend(_Backend):
+            def fixed_root_survey_batch(self, job, **kwargs):
+                roles = tuple(kwargs["sample_roles"])
+                resumed_roles.append(roles)
+                self.calls.append(self.digits)
+                if roles != tuple(BINARY64_FIXED_ROOT_SAMPLE_ROLES[5:]):
+                    raise AssertionError(
+                        "resume must not reacquire the promoted background"
+                    )
+                return subset_batch(self, kwargs)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "checkpoint.json"
+            with self.assertRaises(KeyboardInterrupt):
+                run_promoted_survey(
+                    self.plan,
+                    self.selection,
+                    checkpoint,
+                    checkpoint_path=path,
+                    root_seal_lookup=root_seal_lookup,
+                    provisional_stage_lookup=lambda _leaf, entry: entry[
+                        "provisional_stage"
+                    ],
+                    root_seal_publish=lambda *_args: None,
+                    backend_factory=lambda leaf, digits: InterruptingBackend(
+                        leaf, digits, False, []
+                    ),
+                    primary_root_runner=lambda *_args: self.fail("unexpected root"),
+                    horizon_runner=lambda _leaf: self.fail("unexpected horizon"),
+                    produced_record_builder=lambda leaf, batch, screening, digits: (
+                        _record(leaf.leaf_id, digits)
+                    ),
+                    promoted_preflights_by_ordinal={0: preflight},
+                    layer1_lock_receipt_sha256="f" * 64,
+                )
+
+            interrupted = json.loads(path.read_text(encoding="utf-8"))
+            leaf_id = self.leaves[0].leaf_id
+            background_receipts = interrupted["promoted_background_ledger"]["0"][
+                leaf_id
+            ]["payload"]["background_receipts"]
+            self.assertEqual("ACQUIRED", background_receipts[0]["status"])
+            self.assertEqual(
+                "PENDING", interrupted["promotion_queue"]["entries"][0]["disposition"]
+            )
+            self.assertEqual({}, interrupted["promoted_stage_ledger"])
+
+            resumed = run_promoted_survey(
+                self.plan,
+                self.selection,
+                interrupted,
+                checkpoint_path=path,
+                root_seal_lookup=root_seal_lookup,
+                provisional_stage_lookup=lambda _leaf, entry: entry[
+                    "provisional_stage"
+                ],
+                root_seal_publish=lambda *_args: None,
+                backend_factory=lambda leaf, digits: ResumeBackend(
+                    leaf, digits, False, []
+                ),
+                primary_root_runner=lambda *_args: self.fail("unexpected root"),
+                horizon_runner=lambda _leaf: self.fail("unexpected horizon"),
+                produced_record_builder=lambda leaf, batch, screening, digits: (
+                    _record(leaf.leaf_id, digits)
+                ),
+                promoted_preflights_by_ordinal={0: preflight},
+                layer1_lock_receipt_sha256="f" * 64,
+            )
+
+        self.assertEqual(
+            [
+                tuple(BINARY64_FIXED_ROOT_SAMPLE_ROLES[:5]),
+                tuple(BINARY64_FIXED_ROOT_SAMPLE_ROLES[5:]),
+            ],
+            first_roles,
+        )
+        self.assertEqual(
+            [tuple(BINARY64_FIXED_ROOT_SAMPLE_ROLES[5:])], resumed_roles
+        )
+        self.assertEqual(
+            "AWAITING_ADMISSION",
+            resumed.checkpoint["promotion_queue"]["entries"][0]["disposition"],
+        )
+        promoted = resumed.checkpoint["survey_pass_ledger"]["promoted"][
+            self.leaves[0].leaf_id
+        ]
+        self.assertEqual(9, promoted["sample_count"])
+        self.assertEqual(2, promoted["worker_launch_count"])
+
     def test_calculated_root_evidence_is_retained_in_root_ledger(self):
         result, calls = self._run(
             self._checkpoint(PromotionQueueKind.ROOT),
@@ -688,7 +828,7 @@ class PromotedSurveySchedulerTests(unittest.TestCase):
         root_payload = result.checkpoint["promoted_root_ledger"]["0"][leaf_id][
             "payload"
         ]
-        self.assertEqual([40], calls)
+        self.assertEqual([40, 40], calls)
         self.assertEqual(1, len(root_payload["root_receipts"]))
         self.assertEqual(
             "BF40", root_payload["root_receipts"][0]["precision_tier"]

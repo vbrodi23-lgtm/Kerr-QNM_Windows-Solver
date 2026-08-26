@@ -45,6 +45,8 @@ from .campaign_survey import (
     PromotedPassOutcome,
     PromotedRootSolveResult,
     PromotedSurveyRun,
+    binary64_pass_exhaustion,
+    promoted_fixed_root_batch_from_mapping,
     run_binary64_survey,
     run_promoted_survey,
 )
@@ -54,6 +56,8 @@ from .binary64_layer_lock import (
     build_binary64_layer_auxiliary_evidence_manifest,
     build_binary64_layer_lock,
     load_binary64_layer_lock,
+    promoted_layer2_state_exists,
+    validate_binary64_layer_lock,
     write_binary64_layer_lock,
 )
 from .contracts import canonical_json_bytes
@@ -85,6 +89,7 @@ from .response_batches import (
     validate_campaign_recovery_record,
 )
 from .response_engine import (
+    BINARY64_FIXED_ROOT_SAMPLE_ROLES,
     Binary64FixedRootBatch,
     Binary64FixedRootScreening,
     Binary64SurveyDisposition,
@@ -97,10 +102,14 @@ from .response_engine import (
     raw_determinant_contract_from_request,
     _validate_current_raw_determinant_policy,
     root_readout_preserves_authenticated_branch,
+    reviewed_determinant_error_claims_for_fixed_root_batch,
     run_promoted_horizon_component,
+    screen_promoted_fixed_root_samples,
     validate_exterior_provisional_stage,
 )
 from .julia_response_backend import (
+    ExteriorDeterminantErrorEvidence,
+    JuliaFixedRootSurveyBatch,
     JuliaPrecisionRootBackend,
     JuliaNumericalControlError,
     JuliaODEResourceLimitError,
@@ -111,12 +120,17 @@ from .julia_response_backend import (
 )
 from .promoted_control_calibration import load_default_calibration_receipt
 from .promoted_admission import (
+    PromotedAdmissionReduction,
     PromotedAdmissionResult,
     admit_retained_promoted_checkpoint,
 )
 from .root_evidence import AuthenticatedRootEvidence, RootDependencyKey
 from .root_readout_cache import RootEvidenceStore, RootReadoutStore
-from .reviewed_determinant_error import ReviewedDeterminantErrorStore
+from .reviewed_determinant_error import (
+    AuthenticatedDeterminantErrorBundle,
+    ReviewedDeterminantErrorReceipt,
+    ReviewedDeterminantErrorStore,
+)
 from .reviewed_determinant_error_issuance import (
     require_locked_bf40_determinant_error_issuance_authority,
 )
@@ -1537,16 +1551,50 @@ def run_native_binary64_pass(
 ) -> Binary64SurveyRun:
     """Execute the real binary64 scheduler with a Julia-free backend factory."""
 
-    store = solved_leaf_store or SolvedLeafStore.default()
-    error_store = determinant_error_store or ReviewedDeterminantErrorStore(
-        checkpoint_path.parent
-        / f"{checkpoint_path.name}.reviewed-determinant-errors"
-    )
     background_store = background_evidence_store or CanonicalBackgroundEvidenceStore(
         checkpoint_path.parent
         / f"{checkpoint_path.name}.canonical-backgrounds"
     )
     root_evidence_store = RootEvidenceStore.for_checkpoint(checkpoint_path)
+    validated_checkpoint = validate_schema11_checkpoint(checkpoint)
+    lock_path = binary64_layer_lock_path(checkpoint_path)
+    if lock_path.is_file():
+        lock = load_binary64_layer_lock(lock_path)
+        validate_binary64_layer_lock(
+            lock,
+            validated_checkpoint,
+            selection=recovery_selection,
+            leaf_mechanism_ids=_layer1_leaf_mechanism_ids(
+                plan, recovery_selection
+            ),
+            auxiliary_evidence_manifest=build_binary64_layer_auxiliary_evidence_manifest(
+                plan,
+                validated_checkpoint,
+                root_evidence_store=root_evidence_store,
+                background_evidence_store=background_store,
+            ),
+        )
+        exhaustion = binary64_pass_exhaustion(
+            validated_checkpoint, recovery_selection
+        )
+        if not exhaustion.exhausted:
+            raise ValueError("existing binary64 lock requires an exhausted Layer 1")
+        return Binary64SurveyRun(
+            checkpoint=validated_checkpoint,
+            completed_count=0,
+            queued_count=0,
+            cache_reused_count=0,
+            skipped_count=len(recovery_selection.ordered_leaf_ids),
+            pass_exhausted=True,
+        )
+    if promoted_layer2_state_exists(validated_checkpoint):
+        raise ValueError("binary64 lock is absent after promoted work began")
+
+    store = solved_leaf_store or SolvedLeafStore.default()
+    error_store = determinant_error_store or ReviewedDeterminantErrorStore(
+        checkpoint_path.parent
+        / f"{checkpoint_path.name}.reviewed-determinant-errors"
+    )
     backend_holder: dict[str, NativeCampaignStageBackend] = {}
     root_provider_holder: dict[str, AuthenticatedRootSealProvider] = {}
 
@@ -2250,6 +2298,187 @@ def run_native_promoted_pass(
     )
 
 
+def _retained_exterior_batch_for_admission(
+    retained_stage: Mapping[str, object],
+) -> JuliaFixedRootSurveyBatch:
+    raw_batches = retained_stage.get("raw_promoted_batches")
+    if not isinstance(raw_batches, list):
+        raise ValueError("retained exterior promoted batches are invalid")
+    candidates: list[JuliaFixedRootSurveyBatch] = []
+    for raw_batch in raw_batches:
+        if not isinstance(raw_batch, Mapping):
+            raise ValueError("retained exterior promoted batch is invalid")
+        batch = promoted_fixed_root_batch_from_mapping(raw_batch)
+        if batch.sample_roles == tuple(BINARY64_FIXED_ROOT_SAMPLE_ROLES):
+            candidates.append(batch)
+    if not candidates:
+        raise ValueError("retained exterior promoted batch is missing")
+    batch = candidates[-1]
+    expected_tier = {
+        "BF40": "bigfloat-40",
+        "BF80": "bigfloat-80",
+    }.get(
+        str((retained_stage.get("precision_tiers") or [None])[-1])
+        if isinstance(retained_stage.get("precision_tiers"), list)
+        and retained_stage.get("precision_tiers")
+        else ""
+    )
+    if expected_tier is None or batch.precision_tier.value != expected_tier:
+        raise ValueError("retained exterior promoted precision tier is invalid")
+    return batch
+
+
+def _assert_retained_exterior_support(
+    checkpoint: Mapping[str, object],
+    retained_stage: Mapping[str, object],
+    *,
+    queue_ordinal: int,
+    leaf_id: str,
+    batch: JuliaFixedRootSurveyBatch,
+) -> None:
+    """Bind the solver reduction to the retained root and background ledgers."""
+
+    source_root = retained_stage.get("source_root_seal_sha256")
+    if isinstance(source_root, str):
+        if batch.root_seal_sha256 != source_root:
+            raise ValueError("retained exterior promoted root seal mismatch")
+    else:
+        receipts = retained_stage.get("receipts")
+        if not isinstance(receipts, list) or not any(
+            isinstance(receipt, Mapping)
+            and receipt.get("schema")
+            == "windows-solver.promoted-root-evidence-receipt/1"
+            and receipt.get("root_seal_sha256") == batch.root_seal_sha256
+            for receipt in receipts
+        ):
+            raise ValueError("retained exterior promoted root evidence is missing")
+
+    ledgers = checkpoint.get("promoted_background_ledger")
+    bucket = ledgers.get(str(queue_ordinal)) if isinstance(ledgers, Mapping) else None
+    ledger_entry = bucket.get(leaf_id) if isinstance(bucket, Mapping) else None
+    payload = ledger_entry.get("payload") if isinstance(ledger_entry, Mapping) else None
+    receipts = payload.get("background_receipts") if isinstance(payload, Mapping) else None
+    batch_samples = batch.to_mapping()["samples"][:5]
+    if not isinstance(receipts, list) or not any(
+        isinstance(receipt, Mapping)
+        and isinstance(receipt.get("background"), Mapping)
+        and receipt["background"].get("samples") == batch_samples
+        and receipt.get("precision_tier") == batch.precision_tier.value
+        for receipt in receipts
+    ):
+        raise ValueError("retained exterior promoted background evidence is missing")
+
+
+def _reduce_retained_exterior_for_admission(
+    plan: object,
+    leaf: object,
+    checkpoint: Mapping[str, object],
+    retained_stage: Mapping[str, object],
+    review_receipt: Mapping[str, object],
+    *,
+    queue_ordinal: int,
+) -> PromotedAdmissionReduction:
+    """Perform only Python reduction over reviewed, retained BF40/BF80 samples."""
+
+    batch = _retained_exterior_batch_for_admission(retained_stage)
+    _assert_retained_exterior_support(
+        checkpoint,
+        retained_stage,
+        queue_ordinal=queue_ordinal,
+        leaf_id=leaf.leaf_id,
+        batch=batch,
+    )
+    raw_errors = tuple(
+        sample.determinant_error_evidence
+        for sample in batch.samples
+    )
+    if not all(isinstance(error, ExteriorDeterminantErrorEvidence) for error in raw_errors):
+        raise ValueError("retained exterior determinant-error terms are incomplete")
+    claims = reviewed_determinant_error_claims_for_fixed_root_batch(
+        leaf.job,
+        batch,
+        root_seal_sha256=batch.root_seal_sha256,
+        arithmetic_tier=batch.precision_tier.value,
+        working_precision=batch.working_precision_bits,
+    )
+    reviewed_receipts: list[ReviewedDeterminantErrorReceipt] = []
+    for claim, raw_error in zip(claims, raw_errors, strict=True):
+        assert isinstance(raw_error, ExteriorDeterminantErrorEvidence)
+        try:
+            bound = float(raw_error.mapping["numerical_error_abs"])
+        except (KeyError, TypeError, ValueError, OverflowError) as error:
+            raise ValueError(
+                "retained exterior determinant-error bound is invalid"
+            ) from error
+        if not math.isfinite(bound) or bound <= 0.0:
+            raise ValueError("retained exterior determinant-error bound is invalid")
+        reviewed_receipts.append(ReviewedDeterminantErrorReceipt.issue(
+            claim=claim,
+            absolute_determinant_error_bound=bound,
+            derivation_identity="independent-promoted-review-retained-stage/v1",
+            derivation_version="1",
+            human_mathematics_approval_receipt_sha256=str(
+                review_receipt["receipt_sha256"]
+            ),
+        ))
+    screening = screen_promoted_fixed_root_samples(
+        batch.samples,
+        frequency_step=batch.frequency_step,
+        coordinate_step=batch.coordinate_step,
+        determinant_error_evidence=AuthenticatedDeterminantErrorBundle(
+            tuple(reviewed_receipts)
+        ),
+    )
+    if screening.disposition is not Binary64SurveyDisposition.PRODUCED:
+        raise ValueError("reviewed retained exterior stage remains numerically unbounded")
+    precision_tier = {
+        "bigfloat-40": "BF40",
+        "bigfloat-80": "BF80",
+    }.get(batch.precision_tier.value)
+    if precision_tier is None:
+        raise ValueError("retained exterior promoted precision tier is invalid")
+    record, _stage_sha256 = build_fixed_root_screening_record(
+        plan,
+        leaf,
+        batch,
+        screening,
+        precision_tier=precision_tier,
+        root_seal_sha256=batch.root_seal_sha256,
+    )
+    return PromotedAdmissionReduction(
+        record=record,
+        evidence_receipts=tuple(
+            receipt.to_mapping() for receipt in reviewed_receipts
+        ),
+    )
+
+
+def _reduce_retained_horizon_for_admission(
+    checkpoint: Mapping[str, object],
+    retained_stage: Mapping[str, object],
+    *,
+    queue_ordinal: int,
+    leaf_id: str,
+) -> PromotedAdmissionReduction:
+    """Recover the package-owned BF80 horizon record without rerunning it."""
+
+    record = retained_stage.get("retained_record")
+    roots = checkpoint.get("promoted_root_ledger")
+    bucket = roots.get(str(queue_ordinal)) if isinstance(roots, Mapping) else None
+    entry = bucket.get(leaf_id) if isinstance(bucket, Mapping) else None
+    payload = entry.get("payload") if isinstance(entry, Mapping) else None
+    retained_horizon_record = (
+        payload.get("retained_horizon_record") if isinstance(payload, Mapping) else None
+    )
+    if (
+        not isinstance(record, Mapping)
+        or not isinstance(retained_horizon_record, Mapping)
+        or canonical_json_bytes(record) != canonical_json_bytes(retained_horizon_record)
+    ):
+        raise ValueError("retained promoted horizon record is missing or conflicting")
+    return PromotedAdmissionReduction(record=dict(record))
+
+
 def run_native_promoted_admission(
     plan: object,
     selection: object,
@@ -2285,6 +2514,50 @@ def run_native_promoted_admission(
     )
     leaves = {leaf.leaf_id: leaf for leaf in getattr(plan, "leaves")}
     store = solved_leaf_store or SolvedLeafStore.default()
+    retained_checkpoint = validate_schema11_checkpoint(checkpoint)
+
+    def reduce_retained_stage(
+        retained_stage: Mapping[str, object],
+        review_receipt: Mapping[str, object],
+    ) -> PromotedAdmissionReduction:
+        stage_bucket = retained_checkpoint["promoted_stage_ledger"].get(
+            str(queue_ordinal)
+        )
+        stored_stage = (
+            stage_bucket.get(str(retained_stage.get("leaf_id")))
+            if isinstance(stage_bucket, Mapping)
+            else None
+        )
+        if (
+            not isinstance(stored_stage, Mapping)
+            or stored_stage.get("stage_sha256")
+            != retained_stage.get("stage_sha256")
+            or canonical_json_bytes(stored_stage)
+            != canonical_json_bytes(retained_stage)
+        ):
+            raise ValueError("admission retained stage does not match the checkpoint")
+        leaf_id = str(retained_stage.get("leaf_id"))
+        leaf = leaves.get(leaf_id)
+        if leaf is None or leaf_id not in recovery_selection.scientific_identities:
+            raise ValueError("admission retained stage leaf is outside the selection")
+        route = retained_stage.get("route")
+        if route == "EXTERIOR_BF40":
+            return _reduce_retained_exterior_for_admission(
+                plan,
+                leaf,
+                retained_checkpoint,
+                retained_stage,
+                review_receipt,
+                queue_ordinal=queue_ordinal,
+            )
+        if route == "HORIZON_BF80":
+            return _reduce_retained_horizon_for_admission(
+                retained_checkpoint,
+                retained_stage,
+                queue_ordinal=queue_ordinal,
+                leaf_id=leaf_id,
+            )
+        raise ValueError("admission retained stage route is invalid")
 
     def publish(record: Mapping[str, object]) -> None:
         leaf_id = str(record.get("leaf_id"))
@@ -2307,12 +2580,23 @@ def run_native_promoted_admission(
         ):
             raise ValueError("admitted promoted record was not published exactly")
 
-    return admit_retained_promoted_checkpoint(
+    admitted = admit_retained_promoted_checkpoint(
         checkpoint_path,
         queue_ordinal=queue_ordinal,
         independent_review_receipt=independent_review_receipt,
         layer1_guard=layer1_guard,
         terminal_record_committed=publish,
+        record_reducer=reduce_retained_stage,
+    )
+    return replace(
+        admitted,
+        checkpoint=_refresh_runtime_reports(
+            plan,
+            selection,
+            checkpoint_path,
+            admitted.checkpoint,
+            include_triage=True,
+        ),
     )
 
 

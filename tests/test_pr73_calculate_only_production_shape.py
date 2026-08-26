@@ -447,10 +447,27 @@ class PR73CalculateOnlyProductionShapeTests(unittest.TestCase):
             self.assertEqual(
                 928, binary64_predecessor_evaluations_consumed
             )
-            self.assertEqual([40] * 172, promoted_calls)
+            # The 48 canonical groups acquire five shared samples before
+            # their four mechanisms; the other 124 routes reuse them.
+            self.assertEqual(220, len(promoted_calls))
+            self.assertEqual([40] * 220, promoted_calls)
             self.assertEqual(0, sum(digits == 64 for digits in promoted_calls))
             self.assertEqual(40, len(horizon_calls))
             self.assertEqual(212, promoted.review_pending_count)
+            self.assertEqual(212, promoted.locked_route_count)
+            self.assertEqual(172, promoted.exterior_bf40_route_count)
+            self.assertEqual(40, promoted.horizon_bf80_route_count)
+            self.assertEqual(172, promoted.exterior_bf40_executed_count)
+            self.assertEqual(40, promoted.horizon_bf80_executed_count)
+            self.assertEqual(928, promoted.binary64_predecessor_evaluation_count)
+            self.assertEqual(0, promoted.binary64_recomputed_evaluation_count)
+            self.assertEqual(48, promoted.promoted_background_acquired_count)
+            self.assertEqual(124, promoted.promoted_background_reused_count)
+            self.assertEqual(212, promoted.calculated_awaiting_admission_count)
+            self.assertEqual(0, promoted.admitted_count)
+            self.assertEqual(0, promoted.screened_count)
+            self.assertEqual(0, promoted.terminal_publication_count)
+            self.assertEqual(0, promoted.policy_blocked_count)
             self.assertEqual(0, promoted.completed_count)
             self.assertEqual([], terminal_commits)
             self.assertEqual({}, promoted.checkpoint["evidence_ledger"])

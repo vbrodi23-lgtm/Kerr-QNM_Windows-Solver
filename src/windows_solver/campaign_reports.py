@@ -51,10 +51,13 @@ SCHEMA11_LEAF_COLUMNS = (
     "evidence_level",
     "binary64_pass_disposition",
     "promoted_pass_disposition",
+    "promoted_route",
+    "admission_state",
     "promotion_reason",
     "execution_profile",
     "survey_pass",
     "precision_tier",
+    "precision_tiers",
     "sample_count",
     "root_read_count",
     "worker_launch_count",
@@ -70,6 +73,7 @@ SCHEMA11_LEAF_COLUMNS = (
     "relative_disk_radius",
     "record_sha256",
     "stage_sha256",
+    "retained_promoted_stage_sha256",
     "receipt_sha256",
 )
 
@@ -80,6 +84,8 @@ SCHEMA11_PRECISION_STAGE_COLUMNS = (
     "precision_tier",
     "stage_sha256",
     "record_sha256",
+    "stage_source",
+    "admission_state",
 )
 
 SCHEMA11_ERROR_CHANNEL_COLUMNS = (
@@ -92,6 +98,9 @@ SCHEMA11_ERROR_CHANNEL_COLUMNS = (
     "signed_delta_imaginary",
     "stage_sha256",
     "record_sha256",
+    "stage_source",
+    "admission_state",
+    "disagreement_term_sha256",
 )
 
 SCHEMA11_RESOURCE_FAILURE_COLUMNS = (
@@ -1488,6 +1497,7 @@ def _schema11_stage_tier(stage: Mapping[str, object]) -> str | None:
 def _schema11_timing(
     binary: Mapping[str, object] | None,
     promoted: Mapping[str, object] | None,
+    retained_promoted_stage: Mapping[str, object] | None = None,
 ) -> dict[str, float]:
     totals = {"binary64": 0.0, "BF40": 0.0, "BF80": 0.0, "BF120": 0.0}
     for entry in (binary, promoted):
@@ -1500,12 +1510,27 @@ def _schema11_timing(
             if not isinstance(item, Mapping) or item.get("tier") not in totals:
                 continue
             totals[str(item["tier"])] += float(item["elapsed_seconds"])
+    # CALCULATE_ONLY keeps its durable timings inside the retained stage as
+    # well as the promoted pass ledger.  Use that authenticated copy only as
+    # a fallback so a normal promoted ledger is never counted twice.
+    if isinstance(retained_promoted_stage, Mapping):
+        timing = retained_promoted_stage.get("tier_timing")
+        if isinstance(timing, list):
+            for item in timing:
+                if (
+                    not isinstance(item, Mapping)
+                    or item.get("tier") not in totals
+                    or totals[str(item["tier"])] != 0.0
+                ):
+                    continue
+                totals[str(item["tier"])] = float(item["elapsed_seconds"])
     return totals
 
 
 def _schema11_work_counts(
     binary: Mapping[str, object] | None,
     promoted: Mapping[str, object] | None,
+    retained_promoted_stage: Mapping[str, object] | None = None,
 ) -> dict[str, int]:
     totals = {"sample_count": 0, "root_read_count": 0, "worker_launch_count": 0}
     for entry in (binary, promoted):
@@ -1515,7 +1540,110 @@ def _schema11_work_counts(
             value = entry.get(name)
             if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
                 totals[name] += value
+    # Admission records a zero-numerics disposition.  Preserve the actual
+    # BF40/BF80 work from its retained stage instead of hiding it behind that
+    # terminal administrative update.
+    if isinstance(retained_promoted_stage, Mapping):
+        for name in totals:
+            promoted_value = (
+                promoted.get(name) if isinstance(promoted, Mapping) else None
+            )
+            retained_value = retained_promoted_stage.get(name)
+            if (
+                (promoted_value is None or promoted_value == 0)
+                and isinstance(retained_value, int)
+                and not isinstance(retained_value, bool)
+                and retained_value >= 0
+            ):
+                totals[name] += retained_value
     return totals
+
+
+def _schema11_retained_promoted_stages(
+    checkpoint: Mapping[str, object],
+) -> dict[str, Mapping[str, object]]:
+    """Index checkpoint-owned, unadmitted Layer-2 stages by leaf identity."""
+
+    ledger = checkpoint.get("promoted_stage_ledger")
+    if not isinstance(ledger, Mapping):
+        return {}
+    result: dict[str, Mapping[str, object]] = {}
+    for bucket in ledger.values():
+        if not isinstance(bucket, Mapping):
+            continue
+        for leaf_id, stage in bucket.items():
+            if not isinstance(leaf_id, str) or not isinstance(stage, Mapping):
+                continue
+            existing = result.get(leaf_id)
+            if existing is not None and existing != stage:
+                raise ValueError("multiple retained promoted stages for one leaf")
+            result[leaf_id] = stage
+    return result
+
+
+def _schema11_admission_state(
+    queue_entry: Mapping[str, object] | None,
+    retained_stage: Mapping[str, object] | None,
+) -> str | None:
+    """Project the current queue-owned admission state for retained work."""
+
+    if isinstance(queue_entry, Mapping):
+        disposition = queue_entry.get("disposition")
+        if disposition == "AWAITING_ADMISSION":
+            return "AWAITING_ADMISSION"
+        if disposition == "COMPLETED" and isinstance(retained_stage, Mapping):
+            return "ADMITTED"
+    if isinstance(retained_stage, Mapping):
+        value = retained_stage.get("admission_state")
+        return value if isinstance(value, str) else None
+    return None
+
+
+def _schema11_normalized_tier(value: object) -> str | None:
+    if not isinstance(value, str) or not value:
+        return None
+    if value == "binary64":
+        return value
+    normalized = value.upper().replace("BIGFLOAT-", "BF")
+    return normalized
+
+
+def _schema11_retained_precision_tiers(
+    stage: Mapping[str, object] | None,
+) -> tuple[str, ...]:
+    if not isinstance(stage, Mapping):
+        return ()
+    values = stage.get("precision_tiers")
+    if isinstance(values, list):
+        tiers = tuple(
+            tier
+            for value in values
+            if (tier := _schema11_normalized_tier(value)) is not None
+        )
+        if tiers:
+            return tiers
+    batches = stage.get("raw_promoted_batches")
+    if not isinstance(batches, list):
+        return ()
+    return tuple(
+        tier
+        for batch in batches
+        if isinstance(batch, Mapping)
+        and (tier := _schema11_normalized_tier(batch.get("precision_tier")))
+        is not None
+    )
+
+
+def _schema11_retained_term_delta(term: Mapping[str, object]) -> complex | None:
+    for key in ("signed_delta", "delta", "difference"):
+        delta = _schema11_complex(term.get(key))
+        if delta is not None:
+            return delta
+    return None
+
+
+def _schema11_digest(value: object) -> str:
+    return hashlib.sha256(canonical_json_bytes(value)).hexdigest()
 
 
 def _schema11_basic_rows(
@@ -1534,10 +1662,11 @@ def _schema11_basic_rows(
     evidence = checkpoint["evidence_ledger"]
     binary_ledger = checkpoint["survey_pass_ledger"]["binary64"]
     promoted_ledger = checkpoint["survey_pass_ledger"]["promoted"]
-    queue_reason = {
-        item["leaf_id"]: item["reason_code"]
+    queue_by_leaf = {
+        item["leaf_id"]: item
         for item in checkpoint["promotion_queue"]["entries"]
     }
+    retained_stage_by_leaf = _schema11_retained_promoted_stages(checkpoint)
     leaf_rows: list[Mapping[str, object]] = []
     stage_rows: list[Mapping[str, object]] = []
     channel_rows: list[Mapping[str, object]] = []
@@ -1546,6 +1675,9 @@ def _schema11_basic_rows(
         record = record_by_id.get(leaf_id)
         binary = binary_ledger.get(leaf_id)
         promoted = promoted_ledger.get(leaf_id)
+        queue_entry = queue_by_leaf.get(leaf_id)
+        retained_stage = retained_stage_by_leaf.get(leaf_id)
+        admission_state = _schema11_admission_state(queue_entry, retained_stage)
         evidence_entry = evidence.get(leaf_id)
         centre, radius = (
             (None, None)
@@ -1558,14 +1690,15 @@ def _schema11_basic_rows(
             if magnitude in (None, 0) or radius is None
             else radius / magnitude
         )
-        timings = _schema11_timing(binary, promoted)
-        work_counts = _schema11_work_counts(binary, promoted)
+        timings = _schema11_timing(binary, promoted, retained_stage)
+        work_counts = _schema11_work_counts(binary, promoted, retained_stage)
         stages = [] if record is None else record.get("stages", [])
         last_stage = stages[-1] if isinstance(stages, list) and stages else {}
+        retained_tiers = _schema11_retained_precision_tiers(retained_stage)
         precision_tier = (
-            None
-            if not isinstance(last_stage, Mapping)
-            else _schema11_stage_tier(last_stage)
+            _schema11_stage_tier(last_stage)
+            if isinstance(last_stage, Mapping) and last_stage
+            else (retained_tiers[-1] if retained_tiers else None)
         )
         receipts = (
             evidence_entry.get("receipts", [])
@@ -1598,7 +1731,19 @@ def _schema11_basic_rows(
             "promoted_pass_disposition": (
                 None if not isinstance(promoted, Mapping) else promoted["disposition"]
             ),
-            "promotion_reason": queue_reason.get(leaf_id),
+            "promoted_route": (
+                retained_stage.get("route")
+                if isinstance(retained_stage, Mapping)
+                else None
+            ),
+            "admission_state": (
+                admission_state
+            ),
+            "promotion_reason": (
+                queue_entry.get("reason_code")
+                if isinstance(queue_entry, Mapping)
+                else None
+            ),
             "execution_profile": (
                 "VALIDATE" if isinstance(evidence_entry, Mapping)
                 and evidence_entry["evidence_level"] == "VALIDATED"
@@ -1611,6 +1756,11 @@ def _schema11_basic_rows(
                 else "binary64" if isinstance(binary, Mapping) else None
             ),
             "precision_tier": precision_tier,
+            "precision_tiers": (
+                _json_cell(retained_tiers)
+                if retained_tiers
+                else None
+            ),
             **work_counts,
             "binary64_seconds": timings["binary64"],
             "bf40_seconds": timings["BF40"],
@@ -1625,43 +1775,92 @@ def _schema11_basic_rows(
             "record_sha256": None if record is None else record["record_sha256"],
             "stage_sha256": (
                 last_stage.get("stage_sha256")
-                if isinstance(last_stage, Mapping) else None
+                if isinstance(last_stage, Mapping) and last_stage
+                else (
+                    retained_stage.get("stage_sha256")
+                    if isinstance(retained_stage, Mapping)
+                    else None
+                )
+            ),
+            "retained_promoted_stage_sha256": (
+                retained_stage.get("stage_sha256")
+                if isinstance(retained_stage, Mapping)
+                else None
             ),
             "receipt_sha256": receipt_sha,
         })
-        if record is None or not isinstance(stages, list):
+        if isinstance(stages, list):
+            for stage_index, stage in enumerate(stages):
+                if not isinstance(stage, Mapping):
+                    continue
+                stage_rows.append({
+                    "leaf_ordinal": ordinal,
+                    "leaf_id": leaf_id,
+                    "stage_index": stage_index,
+                    "precision_tier": _schema11_stage_tier(stage),
+                    "stage_sha256": stage.get("stage_sha256"),
+                    "record_sha256": None if record is None else record["record_sha256"],
+                    "stage_source": "TERMINAL_RECORD",
+                    "admission_state": "ADMITTED",
+                })
+                raw_channels = stage.get("signed_error_channels")
+                if raw_channels is None and isinstance(stage.get("outcome"), Mapping):
+                    raw_channels = stage["outcome"].get("signed_error_channels")
+                if not isinstance(raw_channels, list):
+                    continue
+                for channel_index, channel in enumerate(raw_channels):
+                    if not isinstance(channel, Mapping):
+                        continue
+                    delta = _schema11_complex(channel.get("signed_delta"))
+                    channel_rows.append({
+                        "leaf_ordinal": ordinal,
+                        "leaf_id": leaf_id,
+                        "stage_index": stage_index,
+                        "channel_index": channel_index,
+                        "family": channel.get("family"),
+                        "signed_delta_real": None if delta is None else delta.real,
+                        "signed_delta_imaginary": None if delta is None else delta.imag,
+                        "stage_sha256": stage.get("stage_sha256"),
+                        "record_sha256": None if record is None else record["record_sha256"],
+                        "stage_source": "TERMINAL_RECORD",
+                        "admission_state": "ADMITTED",
+                        "disagreement_term_sha256": None,
+                    })
+        if not isinstance(retained_stage, Mapping):
             continue
-        for stage_index, stage in enumerate(stages):
-            if not isinstance(stage, Mapping):
-                continue
+        retained_stage_sha256 = retained_stage.get("stage_sha256")
+        for stage_index, tier in enumerate(retained_tiers):
             stage_rows.append({
                 "leaf_ordinal": ordinal,
                 "leaf_id": leaf_id,
                 "stage_index": stage_index,
-                "precision_tier": _schema11_stage_tier(stage),
-                "stage_sha256": stage.get("stage_sha256"),
-                "record_sha256": record["record_sha256"],
+                "precision_tier": tier,
+                "stage_sha256": retained_stage_sha256,
+                "record_sha256": None,
+                "stage_source": "RETAINED_PROMOTED_STAGE",
+                "admission_state": admission_state,
             })
-            raw_channels = stage.get("signed_error_channels")
-            if raw_channels is None and isinstance(stage.get("outcome"), Mapping):
-                raw_channels = stage["outcome"].get("signed_error_channels")
-            if not isinstance(raw_channels, list):
+        terms = retained_stage.get("current_run_disagreement_terms")
+        if not isinstance(terms, list):
+            continue
+        for channel_index, term in enumerate(terms):
+            if not isinstance(term, Mapping):
                 continue
-            for channel_index, channel in enumerate(raw_channels):
-                if not isinstance(channel, Mapping):
-                    continue
-                delta = _schema11_complex(channel.get("signed_delta"))
-                channel_rows.append({
-                    "leaf_ordinal": ordinal,
-                    "leaf_id": leaf_id,
-                    "stage_index": stage_index,
-                    "channel_index": channel_index,
-                    "family": channel.get("family"),
-                    "signed_delta_real": None if delta is None else delta.real,
-                    "signed_delta_imaginary": None if delta is None else delta.imag,
-                    "stage_sha256": stage.get("stage_sha256"),
-                    "record_sha256": record["record_sha256"],
-                })
+            delta = _schema11_retained_term_delta(term)
+            channel_rows.append({
+                "leaf_ordinal": ordinal,
+                "leaf_id": leaf_id,
+                "stage_index": 0,
+                "channel_index": channel_index,
+                "family": term.get("family", term.get("schema", "CURRENT_RUN_DISAGREEMENT")),
+                "signed_delta_real": None if delta is None else delta.real,
+                "signed_delta_imaginary": None if delta is None else delta.imag,
+                "stage_sha256": retained_stage_sha256,
+                "record_sha256": None,
+                "stage_source": "RETAINED_PROMOTED_STAGE",
+                "admission_state": admission_state,
+                "disagreement_term_sha256": _schema11_digest(term),
+            })
     failures = tuple({
         "failure_ordinal": ordinal,
         "leaf_id": item.get("leaf_id"),

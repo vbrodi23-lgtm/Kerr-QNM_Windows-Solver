@@ -283,6 +283,11 @@ def write_binary64_layer_lock(path: Path, lock: Mapping[str, object]) -> None:
     if not isinstance(lock, Mapping):
         raise ValueError("binary64 lock is invalid")
     destination = Path(path)
+    if destination.exists():
+        existing = load_binary64_layer_lock(destination)
+        if canonical_json_bytes(existing) != canonical_json_bytes(dict(lock)):
+            raise ValueError("binary64 lock already exists and cannot be replaced")
+        return
     destination.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temporary_name = tempfile.mkstemp(
         dir=destination.parent, prefix=f".{destination.name}.", suffix=".tmp"
@@ -872,7 +877,7 @@ def build_binary64_layer_lock(
     """Authenticate an exhausted, clean Layer-1 handoff and freeze its receipt."""
 
     value = validate_schema11_checkpoint(checkpoint)
-    if value["survey_pass_ledger"]["promoted"]:
+    if promoted_layer2_state_exists(value):
         raise ValueError("cannot create a binary64 lock after promoted work exists")
     if value["system_failures"]:
         raise ValueError("cannot create a binary64 lock with system failures")
@@ -888,6 +893,29 @@ def build_binary64_layer_lock(
         auxiliary_evidence_manifest=auxiliary_evidence_manifest,
     )
     return _build_lock_receipt(value, projection)
+
+
+def promoted_layer2_state_exists(checkpoint: Mapping[str, object]) -> bool:
+    """Return whether Layer 2 has begun and therefore freezes lock creation."""
+
+    value = validate_schema11_checkpoint(checkpoint)
+    if any(
+        value[name]
+        for name in (
+            "promoted_stage_ledger",
+            "promoted_background_ledger",
+            "promoted_root_ledger",
+        )
+    ):
+        return True
+    if value["survey_pass_ledger"]["promoted"]:
+        return True
+    entries = value["promotion_queue"]["entries"]
+    return any(
+        entry["disposition"] != "PENDING"
+        or entry["retained_promoted_stage_sha256"] is not None
+        for entry in entries
+    )
 
 
 def validate_binary64_layer_lock(
@@ -978,6 +1006,7 @@ __all__ = [
     "build_binary64_layer_auxiliary_evidence_manifest",
     "build_binary64_layer_lock",
     "load_binary64_layer_lock",
+    "promoted_layer2_state_exists",
     "project_binary64_layer",
     "validate_binary64_layer_lock",
     "write_binary64_layer_lock",

@@ -32,15 +32,15 @@ _REVIEW_FIELDS = {
     "decision",
     "authority_sha256",
     "reviewed_at_utc",
+    "binary64_lock_receipt_sha256",
+    "calibration_receipt_sha256",
     "queue_ordinal",
     "leaf_id",
     "route",
     "scientific_computation_identity",
-    "retained_stage_sha256",
-    "calibration_receipt_sha256",
+    "retained_promoted_stage_sha256",
+    "source_fingerprint_sha256",
     "disagreement_term_sha256s",
-    "admitted_record",
-    "admitted_record_stage_sha256",
     "receipt_sha256",
 }
 
@@ -70,6 +70,15 @@ class PromotedAdmissionResult:
     julia_launch_count: int = 0
     root_read_count: int = 0
     determinant_evaluation_count: int = 0
+    binary64_evaluation_count: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class PromotedAdmissionReduction:
+    """Solver-owned reduction of retained work after review authorisation."""
+
+    record: Mapping[str, object]
+    evidence_receipts: tuple[Mapping[str, object], ...] = ()
 
 
 def _validated_review_receipt(
@@ -95,7 +104,68 @@ def _validated_review_receipt(
         or receipt["receipt_sha256"] != _sha256(content)
     ):
         raise ValueError("independent review receipt authentication is invalid")
+    if any(
+        not _is_sha256(receipt[name])
+        for name in (
+            "binary64_lock_receipt_sha256",
+            "calibration_receipt_sha256",
+            "retained_promoted_stage_sha256",
+            "source_fingerprint_sha256",
+        )
+    ) or not isinstance(receipt["disagreement_term_sha256s"], list) or any(
+        not _is_sha256(item) for item in receipt["disagreement_term_sha256s"]
+    ):
+        raise ValueError("independent review receipt bindings are invalid")
     return receipt
+
+
+def _solver_owned_retained_record(
+    retained_stage: Mapping[str, object],
+) -> dict[str, object]:
+    """Recover only the record already reduced by solver-owned code."""
+
+    record = retained_stage.get("retained_record")
+    if not isinstance(record, Mapping):
+        raise ValueError("retained promoted stage has no solver-owned record")
+    return json.loads(canonical_json_bytes(dict(record)))
+
+
+def _terminal_stage_sha256(
+    record: Mapping[str, object],
+    retained_stage: Mapping[str, object],
+) -> str:
+    stages = record.get("stages")
+    if not isinstance(stages, list) or not stages or not isinstance(stages[-1], Mapping):
+        raise ValueError("solver-owned admitted record stages are invalid")
+    stage_sha256 = stages[-1].get("stage_sha256")
+    if not _is_sha256(stage_sha256):
+        raise ValueError("solver-owned admitted record stage is invalid")
+    retained_stage_sha256 = retained_stage.get("retained_record_stage_sha256")
+    if retained_stage_sha256 is not None and retained_stage_sha256 != stage_sha256:
+        raise ValueError("solver-owned admitted record diverges from retained stage")
+    return str(stage_sha256)
+
+
+def _normalise_reduction(
+    value: Mapping[str, object] | PromotedAdmissionReduction,
+) -> PromotedAdmissionReduction:
+    if isinstance(value, PromotedAdmissionReduction):
+        record = value.record
+        receipts = value.evidence_receipts
+    else:
+        record = value
+        receipts = ()
+    if not isinstance(record, Mapping) or not all(
+        isinstance(receipt, Mapping) for receipt in receipts
+    ):
+        raise ValueError("solver-owned promoted reduction returned invalid data")
+    return PromotedAdmissionReduction(
+        record=json.loads(canonical_json_bytes(dict(record))),
+        evidence_receipts=tuple(
+            json.loads(canonical_json_bytes(dict(receipt)))
+            for receipt in receipts
+        ),
+    )
 
 
 def admit_retained_promoted_work(
@@ -104,17 +174,14 @@ def admit_retained_promoted_work(
     queue_ordinal: int,
     independent_review_receipt: Mapping[str, object],
     layer1_guard: object | None = None,
+    record_reducer: Callable[
+        [Mapping[str, object], Mapping[str, object]],
+        Mapping[str, object] | PromotedAdmissionReduction,
+    ] | None = None,
 ) -> PromotedAdmissionResult:
     """Admit one retained stage using hashes and policy only; run no numerics."""
 
-    calibration_receipt = load_default_calibration_receipt()
     result = validate_schema11_checkpoint(checkpoint)
-    receipt = _validated_review_receipt(
-        independent_review_receipt,
-        expected_authority_sha256=(
-            calibration_receipt.independent_review_authority_sha256
-        ),
-    )
     queue = result["promotion_queue"]
     if (
         isinstance(queue_ordinal, bool)
@@ -131,8 +198,15 @@ def admit_retained_promoted_work(
     )
     if not isinstance(retained_stage, Mapping):
         raise ValueError("independent review receipt retained stage is missing")
+    calibration_receipt = load_default_calibration_receipt()
     if retained_stage.get("calibration_receipt_sha256") != calibration_receipt.sha256:
         raise ValueError("retained promoted stage calibration receipt mismatch")
+    receipt = _validated_review_receipt(
+        independent_review_receipt,
+        expected_authority_sha256=(
+            calibration_receipt.independent_review_authority_sha256
+        ),
+    )
     disagreement_terms = retained_stage.get("current_run_disagreement_terms")
     if not isinstance(disagreement_terms, list):
         raise ValueError("independent review receipt disagreement terms are missing")
@@ -146,34 +220,29 @@ def admit_retained_promoted_work(
         != entry["scientific_computation_identity"]
         or receipt["scientific_computation_identity"]
         != retained_stage.get("scientific_computation_identity")
-        or receipt["retained_stage_sha256"] != retained_stage.get("stage_sha256")
-        or receipt["retained_stage_sha256"]
+        or receipt["retained_promoted_stage_sha256"]
+        != retained_stage.get("stage_sha256")
+        or receipt["retained_promoted_stage_sha256"]
         != entry["retained_promoted_stage_sha256"]
         or receipt["calibration_receipt_sha256"]
         != retained_stage.get("calibration_receipt_sha256")
+        or receipt["binary64_lock_receipt_sha256"]
+        != retained_stage.get("layer1_lock_receipt_sha256")
+        or receipt["source_fingerprint_sha256"]
+        != entry["source_fingerprint_sha256"]
+        or receipt["source_fingerprint_sha256"]
+        != retained_stage.get("source_fingerprint_sha256")
         or receipt["disagreement_term_sha256s"]
         != expected_disagreement_sha256s
     ):
         raise ValueError("independent review receipt binding is invalid")
-    record = receipt["admitted_record"]
-    if not isinstance(record, Mapping):
-        raise ValueError("independent review receipt admitted record is invalid")
-    retained_record = retained_stage.get("retained_record")
-    if retained_record is not None and canonical_json_bytes(retained_record) != (
-        canonical_json_bytes(record)
-    ):
-        raise ValueError("independent review receipt changes retained record")
-    stages = record.get("stages")
-    if (
-        not isinstance(stages, list)
-        or not any(
-            isinstance(stage, Mapping)
-            and stage.get("stage_sha256")
-            == receipt["admitted_record_stage_sha256"]
-            for stage in stages
-        )
-    ):
-        raise ValueError("independent review receipt admitted stage is invalid")
+    reduction = _normalise_reduction(
+        _solver_owned_retained_record(retained_stage)
+        if record_reducer is None
+        else record_reducer(retained_stage, receipt)
+    )
+    record = reduction.record
+    central_stage_sha256 = _terminal_stage_sha256(record, retained_stage)
 
     result = add_numerical_record(result, record)
     record_sha256 = str(record["record_sha256"])
@@ -181,9 +250,9 @@ def admit_retained_promoted_work(
         result,
         leaf_id=leaf_id,
         central_record_sha256=record_sha256,
-        central_stage_sha256=str(receipt["admitted_record_stage_sha256"]),
+        central_stage_sha256=central_stage_sha256,
         evidence_level=EvidenceLevel.SCREENED,
-        receipts=(receipt,),
+        receipts=(receipt, *reduction.evidence_receipts),
     )
     result = complete_promoted_admission(
         result,
@@ -257,6 +326,10 @@ def admit_retained_promoted_checkpoint(
     independent_review_receipt: Mapping[str, object],
     layer1_guard: object | None = None,
     terminal_record_committed: Callable[[Mapping[str, object]], None] | None = None,
+    record_reducer: Callable[
+        [Mapping[str, object], Mapping[str, object]],
+        Mapping[str, object] | PromotedAdmissionReduction,
+    ] | None = None,
 ) -> PromotedAdmissionResult:
     """Publish one reviewed result, then atomically persist its admission."""
 
@@ -267,6 +340,7 @@ def admit_retained_promoted_checkpoint(
         queue_ordinal=queue_ordinal,
         independent_review_receipt=independent_review_receipt,
         layer1_guard=layer1_guard,
+        record_reducer=record_reducer,
     )
     if layer1_guard is not None:
         layer1_guard.pre_write(admitted.checkpoint)
@@ -287,6 +361,7 @@ def admit_retained_promoted_checkpoint(
         leaf_id=admitted.leaf_id,
         admitted_record_sha256=admitted.admitted_record_sha256,
         review_receipt_sha256=admitted.review_receipt_sha256,
+        binary64_evaluation_count=admitted.binary64_evaluation_count,
     )
     if layer1_guard is not None:
         layer1_guard.post_callback(durable)
@@ -295,6 +370,7 @@ def admit_retained_promoted_checkpoint(
 
 __all__ = [
     "INDEPENDENT_PROMOTED_REVIEW_RECEIPT_SCHEMA",
+    "PromotedAdmissionReduction",
     "PromotedAdmissionResult",
     "admit_retained_promoted_checkpoint",
     "admit_retained_promoted_work",

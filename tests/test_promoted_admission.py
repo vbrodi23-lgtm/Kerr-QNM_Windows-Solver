@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from dataclasses import replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
@@ -17,12 +18,26 @@ from windows_solver.campaign_policy import (
     record_survey_disposition,
     retain_promoted_calculation,
 )
+from windows_solver.campaign_runtime import _reduce_retained_exterior_for_admission
+from windows_solver.campaign_survey import (
+    AuthenticatedRootSeal,
+    _promoted_background_key,
+    _promoted_background_receipt,
+)
 from windows_solver.contracts import canonical_json_bytes
 from windows_solver.cli import build_parser
 from windows_solver.promoted_control_calibration import (
     load_default_calibration_receipt,
 )
 from windows_solver.promoted_admission import admit_retained_promoted_checkpoint
+from windows_solver.julia_response_backend import ExteriorDeterminantErrorEvidence
+from windows_solver.response_batches import (
+    PrecisionCapabilities,
+    build_campaign_plan,
+)
+from windows_solver.response_engine import NumericalPolicy, VettedNativeDeterminantKernel
+
+from tests.test_promoted_survey_scheduler import _batch
 
 
 def _sha256(value: object) -> str:
@@ -84,6 +99,9 @@ class PromotedAdmissionTests(unittest.TestCase):
             minimum_requested_tier="BF40",
             scientific_computation_identity=scientific_identity,
         )
+        source_fingerprint_sha256 = checkpoint["promotion_queue"]["entries"][0][
+            "source_fingerprint_sha256"
+        ]
         calculation_content = {
             "schema": "windows-solver.promoted-calculation-stage/1",
             "queue_ordinal": 0,
@@ -92,6 +110,8 @@ class PromotedAdmissionTests(unittest.TestCase):
             "route": "EXTERIOR_BF40",
             "execution_mode": "CALCULATE_ONLY",
             "admission_state": "AWAITING_ADMISSION",
+            "layer1_lock_receipt_sha256": "e" * 64,
+            "source_fingerprint_sha256": source_fingerprint_sha256,
             "calibration_receipt_sha256": calibration_receipt_sha256,
             "precision_tiers": ["BF40"],
             "current_run_disagreement_terms": [
@@ -136,17 +156,19 @@ class PromotedAdmissionTests(unittest.TestCase):
             "decision": "ADMIT_SCREENED",
             "authority_sha256": authority_sha256,
             "reviewed_at_utc": "2026-08-26T00:00:00Z",
+            "binary64_lock_receipt_sha256": calculation_content[
+                "layer1_lock_receipt_sha256"
+            ],
+            "calibration_receipt_sha256": calibration_receipt_sha256,
             "queue_ordinal": 0,
             "leaf_id": leaf_id,
             "route": "EXTERIOR_BF40",
             "scientific_computation_identity": scientific_identity,
-            "retained_stage_sha256": calculation["stage_sha256"],
-            "calibration_receipt_sha256": calibration_receipt_sha256,
+            "retained_promoted_stage_sha256": calculation["stage_sha256"],
+            "source_fingerprint_sha256": source_fingerprint_sha256,
             "disagreement_term_sha256s": [
                 _sha256(calculation_content["current_run_disagreement_terms"][0])
             ],
-            "admitted_record": record,
-            "admitted_record_stage_sha256": central_stage["stage_sha256"],
         }
         review = {**review_content, "receipt_sha256": _sha256(review_content)}
         return checkpoint, calculation, review, record
@@ -173,6 +195,7 @@ class PromotedAdmissionTests(unittest.TestCase):
         self.assertEqual(0, result.julia_launch_count)
         self.assertEqual(0, result.root_read_count)
         self.assertEqual(0, result.determinant_evaluation_count)
+        self.assertEqual(0, result.binary64_evaluation_count)
         self.assertEqual("COMPLETED", result.checkpoint[
             "promotion_queue"
         ]["entries"][0]["disposition"])
@@ -186,6 +209,63 @@ class PromotedAdmissionTests(unittest.TestCase):
             result.checkpoint["evidence_ledger"]["leaf-1"]["evidence_level"],
         )
         self.assertEqual([record], published)
+
+    def test_review_receipt_cannot_inject_a_terminal_record(self):
+        calibration = load_default_calibration_receipt()
+        checkpoint, _calculation, review, _record = self._checkpoint_and_review(
+            calibration_receipt_sha256=calibration.sha256,
+            authority_sha256=calibration.independent_review_authority_sha256,
+        )
+        injected = dict(review)
+        injected["admitted_record"] = {"leaf_id": "forged"}
+        content = {
+            key: value for key, value in injected.items() if key != "receipt_sha256"
+        }
+        injected["receipt_sha256"] = _sha256(content)
+
+        with TemporaryDirectory() as temporary:
+            path = Path(temporary) / "checkpoint.json"
+            original = canonical_json_bytes(checkpoint)
+            path.write_bytes(original)
+            with self.assertRaisesRegex(ValueError, "review receipt fields"):
+                admit_retained_promoted_checkpoint(
+                    path,
+                    queue_ordinal=0,
+                    independent_review_receipt=injected,
+                )
+            self.assertEqual(original, path.read_bytes())
+
+    def test_foreign_lock_or_calibration_fails_before_mutation(self):
+        calibration = load_default_calibration_receipt()
+        checkpoint, _calculation, review, _record = self._checkpoint_and_review(
+            calibration_receipt_sha256=calibration.sha256,
+            authority_sha256=calibration.independent_review_authority_sha256,
+        )
+        for field in (
+            "binary64_lock_receipt_sha256",
+            "calibration_receipt_sha256",
+        ):
+            with self.subTest(field=field):
+                foreign = dict(review)
+                foreign[field] = "f" * 64
+                content = {
+                    key: value
+                    for key, value in foreign.items()
+                    if key != "receipt_sha256"
+                }
+                foreign["receipt_sha256"] = _sha256(content)
+
+                with TemporaryDirectory() as temporary:
+                    path = Path(temporary) / "checkpoint.json"
+                    original = canonical_json_bytes(checkpoint)
+                    path.write_bytes(original)
+                    with self.assertRaisesRegex(ValueError, "binding"):
+                        admit_retained_promoted_checkpoint(
+                            path,
+                            queue_ordinal=0,
+                            independent_review_receipt=foreign,
+                        )
+                    self.assertEqual(original, path.read_bytes())
 
     def test_publication_failure_leaves_admission_pending_for_retry(self):
         calibration = load_default_calibration_receipt()
@@ -302,6 +382,87 @@ class PromotedAdmissionTests(unittest.TestCase):
                     queue_ordinal=0,
                     independent_review_receipt=review,
                 )
+
+    def test_solver_reduces_a_retained_exterior_batch_without_new_numerics(self):
+        plan = build_campaign_plan(
+            policy=NumericalPolicy(),
+            backend_identity=VettedNativeDeterminantKernel.identity,
+            precision_capabilities=PrecisionCapabilities((64, 80)),
+        )
+        leaf = next(
+            item for item in plan.leaves
+            if item.mechanism_id != "horizon-admittance"
+        )
+        seal = AuthenticatedRootSeal(
+            leaf.job.root.omega,
+            leaf.job.root.branch_id,
+            "a" * 64,
+        )
+        raw_error = {
+            "schema": "windows-solver.exterior-determinant-error-evidence/1",
+            "error_model_id": "retained-test-model/v1",
+            "delta_same_point": "1e-12",
+            "delta_cross_precision": "1e-12",
+            "delta_endpoint_series": "1e-12",
+            "safety_factor": "2",
+            "numerical_error_abs": "1e-12",
+        }
+        batch = _batch(leaf, seal, 40)
+        batch = replace(
+            batch,
+            samples=tuple(
+                replace(
+                    sample,
+                    determinant_error_evidence=ExteriorDeterminantErrorEvidence(
+                        raw_error
+                    ),
+                )
+                for sample in batch.samples
+            ),
+        )
+        queue_entry = {"queue_ordinal": 0, "leaf_id": leaf.leaf_id}
+        cache_key, reuse_key = _promoted_background_key(leaf, seal, 40)
+        background_receipt = _promoted_background_receipt(
+            leaf=leaf,
+            entry=queue_entry,
+            batch=batch,
+            cache_key_sha256=cache_key,
+            reuse_key=reuse_key,
+            background_samples=tuple(batch.samples[:5]),
+            status="ACQUIRED",
+            source_queue_ordinal=0,
+            source_leaf_id=leaf.leaf_id,
+        )
+        retained_stage = {
+            "route": "EXTERIOR_BF40",
+            "source_root_seal_sha256": seal.root_seal_sha256,
+            "precision_tiers": ["BF40"],
+            "raw_promoted_batches": [batch.to_mapping()],
+        }
+        checkpoint = {
+            "promoted_background_ledger": {
+                "0": {
+                    leaf.leaf_id: {
+                        "payload": {
+                            "background_receipts": [background_receipt]
+                        }
+                    }
+                }
+            }
+        }
+        reduction = _reduce_retained_exterior_for_admission(
+            plan,
+            leaf,
+            checkpoint,
+            retained_stage,
+            {"receipt_sha256": "b" * 64},
+            queue_ordinal=0,
+        )
+
+        self.assertEqual(9, len(reduction.evidence_receipts))
+        self.assertEqual(leaf.leaf_id, reduction.record["leaf_id"])
+        self.assertEqual("PRODUCED", reduction.record["state"])
+        self.assertEqual("BF40", reduction.record["stages"][0]["precision_tier"])
 
     def test_review_receipt_tampering_fails_before_admission(self):
         calibration = load_default_calibration_receipt()

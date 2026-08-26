@@ -27,19 +27,23 @@ class PR65LauncherTests(unittest.TestCase):
             ])
             self.assertEqual(command, arguments.command)
 
-    def test_powershell_default_is_resume_only_binary64(self):
+    def test_powershell_default_runs_the_locked_layer1_to_layer2_chain(self):
         launcher = Path("m02.ps1").read_text(encoding="utf-8")
 
         self.assertIn('[string]$Profile = "survey"', launcher)
-        self.assertIn('[string]$SurveyPass = "binary64"', launcher)
+        self.assertIn('[string]$SurveyPass = "full"', launcher)
+        self.assertIn('[ValidateSet("binary64", "promoted", "full")]', launcher)
         self.assertIn("[switch]$NewCampaign", launcher)
         self.assertIn(
             "Resume requires an existing checkpoint. Use -NewCampaign",
             launcher,
         )
         self.assertIn("-NewCampaign refuses an existing checkpoint", launcher)
+        self.assertIn("campaign-survey-binary64", launcher)
+        self.assertIn("campaign-lock-binary64", launcher)
+        self.assertIn("campaign-survey-promoted", launcher)
+        self.assertIn("Ensure-Binary64Lock", launcher)
         self.assertNotIn("campaign-validate", launcher)
-        self.assertNotIn('"--full"', launcher)
         self.assertNotIn("Clear-Host", launcher)
 
     def test_launcher_discloses_resolved_state_before_execution(self):

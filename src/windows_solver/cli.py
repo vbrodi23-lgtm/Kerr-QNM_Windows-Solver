@@ -1184,6 +1184,9 @@ def _campaign_lock_binary64(
     from .binary64_layer_lock import (
         binary64_layer_lock_path,
         build_binary64_layer_lock,
+        load_binary64_layer_lock,
+        promoted_layer2_state_exists,
+        validate_binary64_layer_lock,
         write_binary64_layer_lock,
     )
 
@@ -1196,13 +1199,27 @@ def _campaign_lock_binary64(
         else _resolve_recovery_path(output_path)
     )
     manifest = _schema11_binary64_lock_manifest(plan, checkpoint, resolved)
-    lock = build_binary64_layer_lock(
-        checkpoint,
-        selection=recovery_selection,
-        leaf_mechanism_ids=_schema11_leaf_mechanism_ids(plan, recovery_selection),
-        auxiliary_evidence_manifest=manifest,
-    )
-    write_binary64_layer_lock(destination, lock)
+    leaf_mechanism_ids = _schema11_leaf_mechanism_ids(plan, recovery_selection)
+    if destination.is_file():
+        lock = validate_binary64_layer_lock(
+            load_binary64_layer_lock(destination),
+            checkpoint,
+            selection=recovery_selection,
+            leaf_mechanism_ids=leaf_mechanism_ids,
+            auxiliary_evidence_manifest=manifest,
+        )
+        lock_status = "REUSED"
+    else:
+        if promoted_layer2_state_exists(checkpoint):
+            raise ValueError("binary64 lock is absent after promoted work began")
+        lock = build_binary64_layer_lock(
+            checkpoint,
+            selection=recovery_selection,
+            leaf_mechanism_ids=leaf_mechanism_ids,
+            auxiliary_evidence_manifest=manifest,
+        )
+        write_binary64_layer_lock(destination, lock)
+        lock_status = "CREATED"
     return 0, {
         "command": "campaign-lock-binary64",
         "checkpoint_path": str(resolved),
@@ -1212,6 +1229,7 @@ def _campaign_lock_binary64(
         "receipt_sha256": lock["receipt_sha256"],
         "pending_promotion_count": lock["pending_promotion_count"],
         "route_counts": lock["route_counts"],
+        "lock_status": lock_status,
         "release_admissible": False,
     }
 
@@ -1373,6 +1391,7 @@ def _campaign_admit_promoted(
         "julia_launch_count": result.julia_launch_count,
         "root_read_count": result.root_read_count,
         "determinant_evaluation_count": result.determinant_evaluation_count,
+        "binary64_evaluation_count": result.binary64_evaluation_count,
         "evidence_level": "SCREENED",
         "release_admissible": False,
     }
@@ -1507,6 +1526,30 @@ def _campaign_schema11_pass(
             "terminal_cache_discovery": (
                 result.terminal_cache_discovery.to_mapping()
             ),
+            "locked_route_count": result.locked_route_count,
+            "exterior_bf40_route_count": result.exterior_bf40_route_count,
+            "horizon_bf80_route_count": result.horizon_bf80_route_count,
+            "exterior_bf40_executed_count": result.exterior_bf40_executed_count,
+            "horizon_bf80_executed_count": result.horizon_bf80_executed_count,
+            "binary64_predecessor_evaluation_count": (
+                result.binary64_predecessor_evaluation_count
+            ),
+            "binary64_recomputed_evaluation_count": (
+                result.binary64_recomputed_evaluation_count
+            ),
+            "promoted_background_acquired_count": (
+                result.promoted_background_acquired_count
+            ),
+            "promoted_background_reused_count": (
+                result.promoted_background_reused_count
+            ),
+            "calculated_awaiting_admission_count": (
+                result.calculated_awaiting_admission_count
+            ),
+            "admitted_count": result.admitted_count,
+            "screened_count": result.screened_count,
+            "terminal_publication_count": result.terminal_publication_count,
+            "policy_blocked_count": result.policy_blocked_count,
             "release_admissible": False,
         }
     if command in {"campaign-certify", "campaign-evidence-validate"}:
