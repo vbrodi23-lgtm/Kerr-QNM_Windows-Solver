@@ -42,6 +42,7 @@ class SurveyDisposition(str, Enum):
     UNRESOLVED = "UNRESOLVED"
     DEFERRED = "DEFERRED"
     REJECTED = "REJECTED"
+    CALCULATED_AWAITING_ADMISSION = "CALCULATED_AWAITING_ADMISSION"
     SUPERSEDED_BY_CACHE = "SUPERSEDED_BY_CACHE"
 
 
@@ -58,6 +59,7 @@ class PromotionQueueKind(str, Enum):
 
 class PromotionQueueDisposition(str, Enum):
     PENDING = "PENDING"
+    AWAITING_ADMISSION = "AWAITING_ADMISSION"
     COMPLETED = "COMPLETED"
     UNRESOLVED = "UNRESOLVED"
     DEFERRED = "DEFERRED"
@@ -84,7 +86,7 @@ _EVIDENCE_RANK = {
     EvidenceLevel.CERTIFIED.value: 2,
     EvidenceLevel.VALIDATED.value: 3,
 }
-_SCHEMA11_FIELDS = {
+_SCHEMA11_BASE_FIELDS = {
     "schema_version",
     "campaign_id",
     "selection_id",
@@ -98,6 +100,12 @@ _SCHEMA11_FIELDS = {
     "recovery_receipts",
     "report_status_receipt",
 }
+_SCHEMA11_LAYER2_LEDGER_FIELDS = {
+    "promoted_stage_ledger",
+    "promoted_background_ledger",
+    "promoted_root_ledger",
+}
+_SCHEMA11_FIELDS = _SCHEMA11_BASE_FIELDS | _SCHEMA11_LAYER2_LEDGER_FIELDS
 _PASS_ENTRY_FIELDS = {
     "leaf_id",
     "pass",
@@ -157,6 +165,12 @@ _PROMOTION_SOURCE_FINGERPRINT_FIELDS = (
 )
 _PROMOTION_ENTRY_PROVISIONAL_FIELDS = (
     _PROMOTION_ENTRY_PRE_FINGERPRINT_FIELDS | {"source_fingerprint_sha256"}
+)
+_PROMOTION_ENTRY_LAYER2_FIELDS = _PROMOTION_ENTRY_PROVISIONAL_FIELDS | {
+    "retained_promoted_stage_sha256",
+}
+_PROMOTED_EXECUTION_MODES = frozenset(
+    {"CALCULATE_AND_ADMIT", "CALCULATE_ONLY", "BLOCK_ALL"}
 )
 
 
@@ -257,6 +271,9 @@ def empty_schema11_checkpoint(
         "evidence_ledger": {},
         "survey_pass_ledger": {"binary64": {}, "promoted": {}},
         "promotion_queue": {"schema": PROMOTION_QUEUE_SCHEMA, "entries": []},
+        "promoted_stage_ledger": {},
+        "promoted_background_ledger": {},
+        "promoted_root_ledger": {},
         "attempts": [],
         "system_failures": [],
         "recovery_receipts": [],
@@ -533,12 +550,117 @@ def append_promotion(
         ),
         "provisional_reuse_receipt": None,
         "provisional_reuse_receipt_sha256": None,
+        "retained_promoted_stage_sha256": None,
         "queue_ordinal": len(entries),
         "disposition": PromotionQueueDisposition.PENDING.value,
         "disposition_receipt_sha256": None,
     }
     entry["source_fingerprint_sha256"] = promotion_source_fingerprint_sha256(entry)
     entries.append(entry)
+    _assert_layer1_guard(layer1_guard, result)
+    return result
+
+
+def retain_promoted_calculation(
+    checkpoint: Mapping[str, object],
+    *,
+    queue_ordinal: int,
+    promoted_stage: Mapping[str, object],
+    execution_mode: str,
+    disposition_receipt: Mapping[str, object],
+    provisional_reuse_receipt: Mapping[str, object] | None = None,
+    layer1_guard: object | None = None,
+) -> dict[str, object]:
+    """Durably retain promoted numerics without admitting them as evidence."""
+
+    result = validate_schema11_checkpoint(checkpoint)
+    if execution_mode != "CALCULATE_ONLY":
+        raise ValueError(
+            "retained unadmitted calculation requires CALCULATE_ONLY mode"
+        )
+    queue = result["promotion_queue"]
+    assert isinstance(queue, dict)
+    entries = queue["entries"]
+    assert isinstance(entries, list)
+    if (
+        isinstance(queue_ordinal, bool)
+        or not isinstance(queue_ordinal, int)
+        or queue_ordinal < 0
+        or queue_ordinal >= len(entries)
+    ):
+        raise ValueError("promotion queue ordinal is invalid")
+    entry = entries[queue_ordinal]
+    if (
+        entry["queue_ordinal"] != queue_ordinal
+        or entry["disposition"] != PromotionQueueDisposition.PENDING.value
+    ):
+        raise ValueError("promotion queue entry is not pending")
+    if not isinstance(promoted_stage, Mapping):
+        raise ValueError("retained promoted stage is invalid")
+    stage = copy.deepcopy(dict(promoted_stage))
+    supplied_stage_sha256 = stage.get("stage_sha256")
+    stage_content = {
+        key: item for key, item in stage.items() if key != "stage_sha256"
+    }
+    if (
+        not _is_sha256(supplied_stage_sha256)
+        or supplied_stage_sha256 != _sha256(stage_content)
+        or stage.get("leaf_id") != entry["leaf_id"]
+        or stage.get("queue_ordinal") != queue_ordinal
+        or stage.get("execution_mode") != execution_mode
+        or stage.get("admission_state") != "AWAITING_ADMISSION"
+    ):
+        raise ValueError("retained promoted stage authentication is invalid")
+    reuse_receipt = (
+        None
+        if provisional_reuse_receipt is None
+        else copy.deepcopy(dict(provisional_reuse_receipt))
+    )
+    if reuse_receipt is not None:
+        reuse_content = {
+            key: item
+            for key, item in reuse_receipt.items()
+            if key != "receipt_sha256"
+        }
+        if (
+            not _is_sha256(reuse_receipt.get("receipt_sha256"))
+            or reuse_receipt["receipt_sha256"] != _sha256(reuse_content)
+        ):
+            raise ValueError("provisional reuse receipt is invalid")
+    receipt = copy.deepcopy(dict(disposition_receipt))
+    source_fingerprint_sha256 = entry["source_fingerprint_sha256"]
+    supplied_fingerprint = receipt.get("source_fingerprint_sha256")
+    if (
+        supplied_fingerprint is not None
+        and supplied_fingerprint != source_fingerprint_sha256
+    ):
+        raise ValueError("promotion disposition source fingerprint is invalid")
+    receipt.update(
+        {
+            "source_fingerprint_sha256": source_fingerprint_sha256,
+            "retained_promoted_stage_sha256": supplied_stage_sha256,
+            "execution_mode": execution_mode,
+            "admission_state": "AWAITING_ADMISSION",
+        }
+    )
+    stage_ledger = result["promoted_stage_ledger"]
+    assert isinstance(stage_ledger, dict)
+    ordinal_key = str(queue_ordinal)
+    bucket = stage_ledger.setdefault(ordinal_key, {})
+    if not isinstance(bucket, dict):
+        raise ValueError("promoted stage ledger ordinal is invalid")
+    leaf_id = str(entry["leaf_id"])
+    existing_stage = bucket.get(leaf_id)
+    if existing_stage is not None and existing_stage != stage:
+        raise ValueError("conflicting retained promoted stage")
+    bucket[leaf_id] = stage
+    entry["retained_promoted_stage_sha256"] = supplied_stage_sha256
+    entry["disposition"] = PromotionQueueDisposition.AWAITING_ADMISSION.value
+    entry["disposition_receipt_sha256"] = _sha256(receipt)
+    entry["provisional_reuse_receipt"] = reuse_receipt
+    entry["provisional_reuse_receipt_sha256"] = (
+        None if reuse_receipt is None else reuse_receipt["receipt_sha256"]
+    )
     _assert_layer1_guard(layer1_guard, result)
     return result
 
@@ -556,6 +678,10 @@ def finish_promotion(
     disposition_value = _enum_value(
         disposition, PromotionQueueDisposition, "promotion queue disposition"
     )
+    if disposition_value == PromotionQueueDisposition.AWAITING_ADMISSION.value:
+        raise ValueError(
+            "AWAITING_ADMISSION requires retained promoted calculation"
+        )
     if disposition_value not in TERMINAL_PROMOTION_DISPOSITIONS:
         raise ValueError("promotion completion requires a terminal disposition")
     queue = result["promotion_queue"]
@@ -609,9 +735,14 @@ def finish_promotion(
 def validate_schema11_checkpoint(
     value: Mapping[str, object],
 ) -> dict[str, object]:
-    if not isinstance(value, Mapping) or set(value) != _SCHEMA11_FIELDS:
+    if not isinstance(value, Mapping) or set(value) not in {
+        frozenset(_SCHEMA11_BASE_FIELDS),
+        frozenset(_SCHEMA11_FIELDS),
+    }:
         raise ValueError("schema-11 checkpoint envelope fields are invalid")
     result = copy.deepcopy(dict(value))
+    if set(result) == _SCHEMA11_BASE_FIELDS:
+        result.update({field: {} for field in _SCHEMA11_LAYER2_LEDGER_FIELDS})
     if result["schema_version"] != CAMPAIGN_CHECKPOINT_SCHEMA_VERSION:
         raise ValueError("campaign checkpoint is not schema 11")
     if not isinstance(result["campaign_id"], str) or not result["campaign_id"]:
@@ -748,8 +879,17 @@ def validate_schema11_checkpoint(
             )
             queue["entries"][ordinal] = normalized
             entry = normalized
-        elif entry_fields != _PROMOTION_ENTRY_PROVISIONAL_FIELDS:
+        elif entry_fields != _PROMOTION_ENTRY_PROVISIONAL_FIELDS and (
+            entry_fields != _PROMOTION_ENTRY_LAYER2_FIELDS
+        ):
             raise ValueError("schema-11 promotion queue entry fields are invalid")
+        if set(entry) == _PROMOTION_ENTRY_PROVISIONAL_FIELDS:
+            normalized = copy.deepcopy(dict(entry))
+            normalized.update({
+                "retained_promoted_stage_sha256": None,
+            })
+            queue["entries"][ordinal] = normalized
+            entry = normalized
         if (
             not isinstance(entry["leaf_id"], str)
             or not entry["leaf_id"]
@@ -768,6 +908,7 @@ def validate_schema11_checkpoint(
             entry["provisional_stage_sha256"],
             entry["source_binary64_disposition_receipt_sha256"],
             entry["provisional_reuse_receipt_sha256"],
+            entry["retained_promoted_stage_sha256"],
         ):
             if digest is not None and not _is_sha256(digest):
                 raise ValueError("schema-11 promotion queue source digest is invalid")
@@ -814,6 +955,7 @@ def validate_schema11_checkpoint(
                 or reuse_digest != _sha256(reuse_content)
             ):
                 raise ValueError("schema-11 provisional reuse receipt is invalid")
+        retained_promoted_stage_sha256 = entry["retained_promoted_stage_sha256"]
         _enum_value(entry.get("queue_kind"), PromotionQueueKind, "promotion queue kind")
         disposition = _enum_value(
             entry.get("disposition"),
@@ -822,10 +964,16 @@ def validate_schema11_checkpoint(
         )
         receipt_hash = entry.get("disposition_receipt_sha256")
         if disposition == PromotionQueueDisposition.PENDING.value:
-            if receipt_hash is not None:
+            if receipt_hash is not None or retained_promoted_stage_sha256 is not None:
                 raise ValueError("pending promotion cannot have a terminal receipt")
         elif not _is_sha256(receipt_hash):
             raise ValueError("terminal promotion requires a receipt digest")
+        if disposition == PromotionQueueDisposition.AWAITING_ADMISSION.value and (
+            retained_promoted_stage_sha256 is None
+        ):
+            raise ValueError(
+                "awaiting-admission promotion requires retained calculation"
+            )
         # This digest is derived provenance, not an independently trusted
         # input.  Recompute it at the checkpoint boundary so a malformed
         # legacy checkpoint reaches the scheduler's durable failure path;
@@ -833,6 +981,87 @@ def validate_schema11_checkpoint(
         entry["source_fingerprint_sha256"] = promotion_source_fingerprint_sha256(
             entry
         )
+
+    queue_entries = queue["entries"]
+    assert isinstance(queue_entries, list)
+    stage_ledger = result["promoted_stage_ledger"]
+    if not isinstance(stage_ledger, dict):
+        raise ValueError("schema-11 promoted stage ledger is invalid")
+    seen_stages: set[tuple[int, str]] = set()
+    for ordinal_key, bucket in stage_ledger.items():
+        if (
+            not isinstance(ordinal_key, str)
+            or not ordinal_key.isdigit()
+            or str(int(ordinal_key)) != ordinal_key
+            or not isinstance(bucket, Mapping)
+        ):
+            raise ValueError("schema-11 promoted stage ledger key is invalid")
+        ordinal = int(ordinal_key)
+        if ordinal >= len(queue_entries):
+            raise ValueError("schema-11 promoted stage ledger ordinal is invalid")
+        queue_entry = queue_entries[ordinal]
+        for leaf_id, stage in bucket.items():
+            if (
+                not isinstance(leaf_id, str)
+                or not isinstance(stage, Mapping)
+                or queue_entry["leaf_id"] != leaf_id
+                or stage.get("leaf_id") != leaf_id
+                or stage.get("queue_ordinal") != ordinal
+            ):
+                raise ValueError("schema-11 promoted stage ledger binding is invalid")
+            content = {
+                key: item for key, item in stage.items() if key != "stage_sha256"
+            }
+            stage_sha256 = stage.get("stage_sha256")
+            if (
+                not _is_sha256(stage_sha256)
+                or stage_sha256 != _sha256(content)
+                or queue_entry["retained_promoted_stage_sha256"] != stage_sha256
+                or stage.get("execution_mode") not in _PROMOTED_EXECUTION_MODES
+                or stage.get("admission_state") != "AWAITING_ADMISSION"
+            ):
+                raise ValueError("schema-11 retained promoted stage is invalid")
+            seen_stages.add((ordinal, leaf_id))
+    for ordinal, queue_entry in enumerate(queue_entries):
+        pointer = queue_entry["retained_promoted_stage_sha256"]
+        if pointer is not None and (ordinal, str(queue_entry["leaf_id"])) not in seen_stages:
+            raise ValueError("schema-11 retained promoted stage pointer is dangling")
+
+    for field in ("promoted_background_ledger", "promoted_root_ledger"):
+        ledger = result[field]
+        if not isinstance(ledger, dict):
+            raise ValueError(f"schema-11 {field} is invalid")
+        for ordinal_key, bucket in ledger.items():
+            if (
+                not isinstance(ordinal_key, str)
+                or not ordinal_key.isdigit()
+                or str(int(ordinal_key)) != ordinal_key
+                or not isinstance(bucket, Mapping)
+            ):
+                raise ValueError(f"schema-11 {field} key is invalid")
+            ordinal = int(ordinal_key)
+            if ordinal >= len(queue_entries):
+                raise ValueError(f"schema-11 {field} ordinal is invalid")
+            queue_entry = queue_entries[ordinal]
+            for leaf_id, ledger_entry in bucket.items():
+                if (
+                    not isinstance(leaf_id, str)
+                    or not isinstance(ledger_entry, Mapping)
+                    or ledger_entry.get("leaf_id") != leaf_id
+                    or ledger_entry.get("queue_ordinal") != ordinal
+                    or queue_entry["leaf_id"] != leaf_id
+                ):
+                    raise ValueError(f"schema-11 {field} binding is invalid")
+                content = {
+                    key: item
+                    for key, item in ledger_entry.items()
+                    if key != "ledger_entry_sha256"
+                }
+                if (
+                    not _is_sha256(ledger_entry.get("ledger_entry_sha256"))
+                    or ledger_entry["ledger_entry_sha256"] != _sha256(content)
+                ):
+                    raise ValueError(f"schema-11 {field} digest is invalid")
 
     for field in ("attempts", "system_failures", "recovery_receipts"):
         if not isinstance(result[field], list):
@@ -862,5 +1091,6 @@ __all__ = [
     "promotion_source_fingerprint_sha256",
     "record_evidence",
     "record_survey_disposition",
+    "retain_promoted_calculation",
     "validate_schema11_checkpoint",
 ]

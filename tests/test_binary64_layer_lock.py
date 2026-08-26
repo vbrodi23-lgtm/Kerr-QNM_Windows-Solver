@@ -29,11 +29,15 @@ from windows_solver.campaign_policy import (
     promotion_source_fingerprint_sha256,
     record_evidence,
     record_survey_disposition,
+    retain_promoted_calculation,
 )
 from windows_solver.campaign_recovery import RecoverySelection
 from windows_solver.cli import build_parser
 from windows_solver.contracts import canonical_json_bytes
-from windows_solver.campaign_survey import binary64_pass_exhaustion
+from windows_solver.campaign_survey import (
+    binary64_pass_exhaustion,
+    promoted_pass_exhaustion,
+)
 from windows_solver.response_batches import (
     PrecisionCapabilities,
     build_campaign_plan,
@@ -308,6 +312,78 @@ class Binary64LayerLockTests(unittest.TestCase):
             leaf_mechanism_ids={self.leaf.leaf_id: self.leaf.mechanism_id},
             auxiliary_evidence_manifest=self._auxiliary_manifest(stage),
         ))
+
+    def test_review_pending_promoted_stage_preserves_the_layer1_lock(self) -> None:
+        """Break caught: durable Layer-2 retention mutates locked Layer 1."""
+
+        checkpoint, source_stage = self._checkpoint()
+        lock = self._lock(checkpoint, source_stage)
+        guard = Layer1Guard.from_authenticated_lock(
+            lock,
+            checkpoint,
+            selection=self.selection,
+            leaf_mechanism_ids={self.leaf.leaf_id: self.leaf.mechanism_id},
+            auxiliary_evidence_manifest=self._auxiliary_manifest(source_stage),
+        )
+        promoted_content = {
+            "schema": "windows-solver.promoted-calculation-stage/1",
+            "leaf_id": self.leaf.leaf_id,
+            "queue_ordinal": 0,
+            "route": "EXTERIOR_BF40",
+            "execution_mode": "CALCULATE_ONLY",
+            "admission_state": "AWAITING_ADMISSION",
+            "precision_tiers": ["BF40"],
+            "batch": {"sample_count": 18},
+            "receipts": [{"schema": "windows-solver.test-comparison/1"}],
+        }
+        promoted_stage = {
+            **promoted_content,
+            "stage_sha256": _sha256(promoted_content),
+        }
+
+        retained = retain_promoted_calculation(
+            checkpoint,
+            queue_ordinal=0,
+            promoted_stage=promoted_stage,
+            execution_mode="CALCULATE_ONLY",
+            disposition_receipt={
+                "schema": "windows-solver.promoted-admission-pending/1"
+            },
+            layer1_guard=guard,
+        )
+        retained = record_survey_disposition(
+            retained,
+            survey_pass=SurveyPass.PROMOTED,
+            leaf_id=self.leaf.leaf_id,
+            disposition=SurveyDisposition.CALCULATED_AWAITING_ADMISSION,
+            operation_identity="promoted-fixed-root-survey/v1",
+            precision_tiers=("BF40",),
+            reason_code="AWAITING_INDEPENDENT_REVIEW_ADMISSION",
+            sample_count=18,
+            sample_limit=18,
+            root_read_count=0,
+            root_read_limit=0,
+            worker_launch_count=2,
+            worker_launch_limit=2,
+            tier_timing=(),
+            session_fragments=(),
+            layer1_guard=guard,
+        )
+
+        self.assertEqual({}, retained["evidence_ledger"])
+        exhaustion = promoted_pass_exhaustion(retained, self.selection, (0,))
+        self.assertTrue(exhaustion.exhausted)
+        self.assertEqual((), exhaustion.incomplete_leaf_ids)
+        self.assertEqual(
+            lock,
+            assert_binary64_layer_unchanged(
+                lock,
+                retained,
+                selection=self.selection,
+                leaf_mechanism_ids={self.leaf.leaf_id: self.leaf.mechanism_id},
+                auxiliary_evidence_manifest=self._auxiliary_manifest(source_stage),
+            ),
+        )
 
     def test_layer1_guard_rejects_a_new_or_rewritten_queue_source(self) -> None:
         """Break caught: promoted work can append a second Layer-1 source."""

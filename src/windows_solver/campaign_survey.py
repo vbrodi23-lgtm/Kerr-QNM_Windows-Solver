@@ -483,6 +483,9 @@ def promoted_pass_exhaustion(
     reasons: list[str] = []
     incomplete: list[str] = []
     expected_disposition = {
+        PromotionQueueDisposition.AWAITING_ADMISSION.value: (
+            SurveyDisposition.CALCULATED_AWAITING_ADMISSION.value
+        ),
         PromotionQueueDisposition.COMPLETED.value: SurveyDisposition.COMPLETED.value,
         PromotionQueueDisposition.UNRESOLVED.value: SurveyDisposition.UNRESOLVED.value,
         PromotionQueueDisposition.DEFERRED.value: SurveyDisposition.DEFERRED.value,
