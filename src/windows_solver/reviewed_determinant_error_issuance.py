@@ -25,6 +25,7 @@ class PromotedExecutionPreflight:
 
     mode: PromotedExecutionMode
     route: str
+    calibration_receipt_sha256: str
     calculation_permitted: bool
     checkpointing_permitted: bool
     admission_permitted: bool
@@ -48,6 +49,7 @@ def require_locked_bf40_determinant_error_issuance_authority(
     return PromotedExecutionPreflight(
         mode=mode,
         route=route,
+        calibration_receipt_sha256=active.sha256,
         calculation_permitted=calculation_permitted,
         checkpointing_permitted=calculation_permitted,
         admission_permitted=admission_permitted,

@@ -233,6 +233,15 @@ class Schema11CheckpointTests(unittest.TestCase):
             disposition_receipt={
                 "schema": "windows-solver.promoted-admission-pending/1"
             },
+            promoted_background={
+                "schema": "windows-solver.test-promoted-background/1",
+                "reuse_key_sha256": "c" * 64,
+                "status": "ACQUIRED",
+            },
+            promoted_root={
+                "schema": "windows-solver.test-promoted-root/1",
+                "root_seal_sha256": "d" * 64,
+            },
         )
         checkpoint = record_survey_disposition(
             checkpoint,
@@ -251,6 +260,12 @@ class Schema11CheckpointTests(unittest.TestCase):
             stage,
             checkpoint["promoted_stage_ledger"]["0"]["leaf-1"],
         )
+        background_entry = checkpoint["promoted_background_ledger"]["0"][
+            "leaf-1"
+        ]
+        root_entry = checkpoint["promoted_root_ledger"]["0"]["leaf-1"]
+        self.assertEqual("ACQUIRED", background_entry["payload"]["status"])
+        self.assertEqual("d" * 64, root_entry["payload"]["root_seal_sha256"])
         self.assertEqual({}, checkpoint["evidence_ledger"])
         self.assertEqual([], checkpoint["records"])
         self.assertEqual(

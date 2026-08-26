@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass, field, replace
+from decimal import Decimal
 import hashlib
 import json
 import math
@@ -25,6 +27,7 @@ from .campaign_policy import (
     finish_promotion,
     record_evidence,
     record_survey_disposition,
+    retain_promoted_calculation,
     validate_schema11_checkpoint,
 )
 from .campaign_recovery import RecoverySelection
@@ -67,6 +70,7 @@ from .response_engine import (
     Binary64ReusedBackgroundBatch,
     Binary64SurveyDisposition,
     CanonicalExteriorBackground,
+    DecimalComplex,
     EXTERIOR_PROVISIONAL_REUSE_RECEIPT_SCHEMA,
     build_exterior_background_reuse_key,
     build_exterior_provisional_stage,
@@ -79,12 +83,16 @@ from .response_engine import (
 )
 from .reviewed_determinant_error import ReviewedDeterminantErrorStore
 from .reviewed_determinant_error_issuance import (
-    require_locked_bf40_determinant_error_issuance_authority,
+    PromotedExecutionPreflight,
     retain_uncalibrated_determinant_error_evidence,
 )
+from .promoted_control_calibration import PromotedExecutionMode
 from .background_evidence_store import CanonicalBackgroundEvidenceStore
 from .julia_response_backend import (
+    ExteriorDeterminantErrorEvidence,
+    FixedRootSurveyConditioning,
     JuliaFixedRootSurveyBatch,
+    JuliaFixedRootSurveySample,
     JuliaNumericalControlError,
     JuliaODEResourceLimitError,
     JuliaResponseBackendError,
@@ -365,6 +373,19 @@ class _RootPromotionGroup:
 
 
 @dataclass(frozen=True, slots=True)
+class PromotedRouteExecutionResult:
+    """Typed per-route result, including known non-software policy boundaries."""
+
+    queue_ordinal: int
+    leaf_id: str
+    route: str
+    execution_mode: str
+    result_code: str
+    numerical_work_performed: bool
+    admission_state: str
+
+
+@dataclass(frozen=True, slots=True)
 class PromotedSurveyRun:
     checkpoint: dict[str, object]
     completed_count: int
@@ -378,6 +399,9 @@ class PromotedSurveyRun:
     )
     pass_exhausted: bool = True
     incomplete_leaf_ids: tuple[str, ...] = ()
+    review_pending_count: int = 0
+    policy_blocked_count: int = 0
+    route_results: tuple[PromotedRouteExecutionResult, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -1635,6 +1659,219 @@ def _terminal_promoted_outcome(
     )
 
 
+_PROMOTED_BACKGROUND_RECEIPT_SCHEMA = (
+    "windows-solver.promoted-background-reuse-receipt/1"
+)
+_PROMOTED_ROOT_RECEIPT_SCHEMA = "windows-solver.promoted-root-evidence-receipt/1"
+_PROMOTED_BACKGROUND_SAMPLE_ROLES = BINARY64_FIXED_ROOT_SAMPLE_ROLES[:5]
+_PROMOTED_COMPONENT_SAMPLE_ROLES = BINARY64_FIXED_ROOT_SAMPLE_ROLES[5:]
+
+
+def _promoted_sample_from_mapping(value: object) -> JuliaFixedRootSurveySample:
+    if not isinstance(value, Mapping) or set(value) != {
+        "role",
+        "omega",
+        "amplitude",
+        "determinant",
+        "numerical_conditioning",
+        "determinant_error_evidence",
+    }:
+        raise ValueError("retained promoted background sample is invalid")
+
+    def parse_complex(item: object, label: str) -> complex:
+        if not isinstance(item, Mapping) or set(item) != {"real", "imaginary"}:
+            raise ValueError(f"retained promoted {label} is invalid")
+        try:
+            result = complex(float(item["real"]), float(item["imaginary"]))
+        except (TypeError, ValueError, OverflowError) as error:
+            raise ValueError(f"retained promoted {label} is invalid") from error
+        if not math.isfinite(result.real) or not math.isfinite(result.imag):
+            raise ValueError(f"retained promoted {label} is invalid")
+        return result
+
+    determinant = value["determinant"]
+    if not isinstance(determinant, Mapping) or set(determinant) != {
+        "real",
+        "imaginary",
+    }:
+        raise ValueError("retained promoted determinant is invalid")
+    try:
+        decimal_determinant = DecimalComplex(
+            Decimal(str(determinant["real"])),
+            Decimal(str(determinant["imaginary"])),
+        )
+    except Exception as error:
+        raise ValueError("retained promoted determinant is invalid") from error
+    raw_error = value["determinant_error_evidence"]
+    return JuliaFixedRootSurveySample(
+        role=str(value["role"]),
+        omega=parse_complex(value["omega"], "sample frequency"),
+        amplitude=parse_complex(value["amplitude"], "sample amplitude"),
+        determinant=decimal_determinant,
+        numerical_conditioning=FixedRootSurveyConditioning(
+            value["numerical_conditioning"]
+        ),
+        determinant_error_evidence=(
+            None
+            if raw_error is None
+            else ExteriorDeterminantErrorEvidence(raw_error)
+        ),
+    )
+
+
+def _promoted_background_key(
+    leaf: object,
+    seal: AuthenticatedRootSeal,
+    digits: int,
+) -> tuple[str, Mapping[str, object]]:
+    reuse_key = build_exterior_background_reuse_key(
+        leaf.job,
+        root_seal_sha256=seal.root_seal_sha256,
+        fixed_root=seal.fixed_root,
+    )
+    mapping = reuse_key.to_mapping()
+    digest = hashlib.sha256(canonical_json_bytes({
+        "precision_tier": f"bigfloat-{digits}",
+        "reuse_key": mapping,
+    })).hexdigest()
+    return digest, mapping
+
+
+def _promoted_background_receipt(
+    *,
+    leaf: object,
+    entry: Mapping[str, object],
+    batch: JuliaFixedRootSurveyBatch,
+    cache_key_sha256: str,
+    reuse_key: Mapping[str, object],
+    background_samples: tuple[JuliaFixedRootSurveySample, ...],
+    status: str,
+    source_queue_ordinal: int,
+    source_leaf_id: str,
+) -> dict[str, object]:
+    background_material = {
+        "schema": "windows-solver.promoted-canonical-background/1",
+        "precision_tier": batch.precision_tier.value,
+        "reuse_key": copy.deepcopy(dict(reuse_key)),
+        "fixed_root": {
+            "real": format(batch.fixed_root.real, ".17g"),
+            "imaginary": format(batch.fixed_root.imag, ".17g"),
+        },
+        "frequency_step": str(batch.frequency_step),
+        "samples": [
+            next(
+                item
+                for item in batch.to_mapping()["samples"]
+                if item["role"] == sample.role
+            )
+            for sample in background_samples
+        ],
+    }
+    background_sha256 = hashlib.sha256(
+        canonical_json_bytes(background_material)
+    ).hexdigest()
+    equivalence = BackgroundEquivalenceReceipt.issue(
+        reuse_key=build_exterior_background_reuse_key(
+            leaf.job,
+            root_seal_sha256=batch.root_seal_sha256,
+            fixed_root=batch.fixed_root,
+        ),
+        job=leaf.job,
+        canonical_background_sha256=background_sha256,
+        fixed_root=batch.fixed_root,
+    ).to_mapping()
+    content: dict[str, object] = {
+        "schema": _PROMOTED_BACKGROUND_RECEIPT_SCHEMA,
+        "queue_ordinal": entry["queue_ordinal"],
+        "leaf_id": entry["leaf_id"],
+        "precision_tier": batch.precision_tier.value,
+        "cache_key_sha256": cache_key_sha256,
+        "reuse_key": copy.deepcopy(dict(reuse_key)),
+        "background": background_material,
+        "background_sha256": background_sha256,
+        "equivalence_receipt": equivalence,
+        "status": status,
+        "source_queue_ordinal": source_queue_ordinal,
+        "source_leaf_id": source_leaf_id,
+    }
+    return {**content, "receipt_sha256": hashlib.sha256(
+        canonical_json_bytes(content)
+    ).hexdigest()}
+
+
+def _load_promoted_background_cache(
+    checkpoint: Mapping[str, object],
+) -> dict[str, dict[str, object]]:
+    cache: dict[str, dict[str, object]] = {}
+    ledger = checkpoint.get("promoted_background_ledger")
+    if not isinstance(ledger, Mapping):
+        raise ValueError("promoted background ledger is invalid")
+    for bucket in ledger.values():
+        if not isinstance(bucket, Mapping):
+            raise ValueError("promoted background ledger bucket is invalid")
+        for ledger_entry in bucket.values():
+            payload = (
+                ledger_entry.get("payload")
+                if isinstance(ledger_entry, Mapping)
+                else None
+            )
+            receipts = (
+                payload.get("background_receipts")
+                if isinstance(payload, Mapping)
+                else None
+            )
+            if receipts is None:
+                continue
+            if not isinstance(receipts, list):
+                raise ValueError("promoted background receipts are invalid")
+            for receipt in receipts:
+                if (
+                    not isinstance(receipt, Mapping)
+                    or receipt.get("schema") != _PROMOTED_BACKGROUND_RECEIPT_SCHEMA
+                ):
+                    raise ValueError("promoted background receipt is invalid")
+                content = {
+                    key: item
+                    for key, item in receipt.items()
+                    if key != "receipt_sha256"
+                }
+                if receipt.get("receipt_sha256") != hashlib.sha256(
+                    canonical_json_bytes(content)
+                ).hexdigest():
+                    raise ValueError("promoted background receipt digest is invalid")
+                background = receipt.get("background")
+                samples = (
+                    background.get("samples")
+                    if isinstance(background, Mapping)
+                    else None
+                )
+                if not isinstance(samples, list):
+                    raise ValueError("promoted background samples are invalid")
+                parsed_samples = tuple(
+                    _promoted_sample_from_mapping(sample) for sample in samples
+                )
+                if tuple(sample.role for sample in parsed_samples) != tuple(
+                    _PROMOTED_BACKGROUND_SAMPLE_ROLES
+                ):
+                    raise ValueError("promoted background sample roles are invalid")
+                BackgroundEquivalenceReceipt.from_mapping(
+                    receipt.get("equivalence_receipt")
+                )
+                cache_key = receipt.get("cache_key_sha256")
+                candidate = {
+                    "background_sha256": receipt.get("background_sha256"),
+                    "background_samples": parsed_samples,
+                    "queue_ordinal": receipt.get("source_queue_ordinal"),
+                    "leaf_id": receipt.get("source_leaf_id"),
+                    "reuse_key": copy.deepcopy(dict(receipt["reuse_key"])),
+                }
+                existing = cache.get(str(cache_key))
+                if existing is not None and existing != candidate:
+                    raise ValueError("conflicting promoted background")
+                cache[str(cache_key)] = candidate
+    return cache
+
+
 def _run_promoted_exterior_queue_entry(
     leaf: object,
     entry: Mapping[str, object],
@@ -1655,7 +1892,8 @@ def _run_promoted_exterior_queue_entry(
     determinant_error_store: ReviewedDeterminantErrorStore | None,
     root_promotion_group: _RootPromotionGroup | None,
     provisional_predecessor_receipt: Mapping[str, object] | None,
-    locked_bf40_gate_required: bool,
+    execution_mode: PromotedExecutionMode,
+    promoted_background_cache: dict[str, dict[str, object]],
 ) -> PromotedPassOutcome:
     queue_kind = PromotionQueueKind(entry["queue_kind"])
     seal = root_seal_lookup(leaf, entry)
@@ -1666,11 +1904,6 @@ def _run_promoted_exterior_queue_entry(
             raise ValueError("promoted response root seal digest mismatch")
         if seal.branch_identity != leaf.job.root.branch_id:
             raise ValueError("promoted response root seal branch mismatch")
-        if (
-            locked_bf40_gate_required
-            and entry.get("minimum_requested_tier") == "BF40"
-        ):
-            require_locked_bf40_determinant_error_issuance_authority()
     elif root_promotion_group is not None:
         if seal is not None:
             root_promotion_group.reuse(seal)
@@ -1758,15 +1991,47 @@ def _run_promoted_exterior_queue_entry(
             root_seal_publish(leaf, seal)
             if root_promotion_group is not None:
                 root_promotion_group.publish(seal, tier)
+            root_content: dict[str, object] = {
+                "schema": _PROMOTED_ROOT_RECEIPT_SCHEMA,
+                "queue_ordinal": entry["queue_ordinal"],
+                "leaf_id": entry["leaf_id"],
+                "precision_tier": tier,
+                "root_seal_sha256": seal.root_seal_sha256,
+                "branch_identity": seal.branch_identity,
+                "fixed_root": {
+                    "real": format(seal.fixed_root.real, ".17g"),
+                    "imaginary": format(seal.fixed_root.imag, ".17g"),
+                },
+                "root_dependency_key": (
+                    None
+                    if root_promotion_group is None
+                    else root_promotion_group.dependency_key.to_mapping()
+                ),
+            }
+            receipts.append({
+                **root_content,
+                "receipt_sha256": hashlib.sha256(
+                    canonical_json_bytes(root_content)
+                ).hexdigest(),
+            })
 
+        background_cache_key, background_reuse_key = _promoted_background_key(
+            leaf, seal, digits
+        )
+        cached_background = promoted_background_cache.get(background_cache_key)
+        requested_sample_roles = (
+            tuple(_PROMOTED_COMPONENT_SAMPLE_ROLES)
+            if cached_background is not None
+            else tuple(BINARY64_FIXED_ROOT_SAMPLE_ROLES)
+        )
         worker_launches += 1
         try:
-            batch = backend.fixed_root_survey_batch(
+            executed_batch = backend.fixed_root_survey_batch(
                 leaf.job,
                 fixed_root=seal.fixed_root,
                 root_seal_sha256=seal.root_seal_sha256,
                 branch_identity=seal.branch_identity,
-                sample_roles=tuple(BINARY64_FIXED_ROOT_SAMPLE_ROLES),
+                sample_roles=requested_sample_roles,
             )
         except KeyboardInterrupt:
             raise
@@ -1803,16 +2068,87 @@ def _run_promoted_exterior_queue_entry(
             )
             timing_recorder.complete_tier()
             return outcome
-        if not isinstance(batch, JuliaFixedRootSurveyBatch):
+        if not isinstance(executed_batch, JuliaFixedRootSurveyBatch):
             raise ValueError("promoted backend returned an invalid survey batch")
         if (
-            batch.precision_tier.value != f"bigfloat-{digits}"
-            or batch.root_seal_sha256 != seal.root_seal_sha256
-            or batch.root_read_count != 0
-            or batch.julia_launch_count != 1
+            executed_batch.precision_tier.value != f"bigfloat-{digits}"
+            or executed_batch.root_seal_sha256 != seal.root_seal_sha256
+            or executed_batch.root_read_count != 0
+            or executed_batch.julia_launch_count != 1
         ):
             raise ValueError("promoted fixed-root survey batch budget mismatch")
-        sample_count += batch.sample_count
+        if cached_background is None:
+            if executed_batch.sample_roles != tuple(BINARY64_FIXED_ROOT_SAMPLE_ROLES):
+                raise ValueError("promoted background acquisition sample plan is invalid")
+            batch = executed_batch
+            background_samples = tuple(batch.samples[:5])
+            cache_entry = {
+                "background_sha256": None,
+                "background_samples": tuple(background_samples),
+                "queue_ordinal": int(entry["queue_ordinal"]),
+                "leaf_id": str(entry["leaf_id"]),
+                "reuse_key": copy.deepcopy(dict(background_reuse_key)),
+            }
+            promoted_background_cache[background_cache_key] = cache_entry
+            background_status = "ACQUIRED"
+        else:
+            retained_samples = cached_background.get("background_samples")
+            if (
+                not isinstance(retained_samples, tuple)
+                or tuple(sample.role for sample in retained_samples)
+                != tuple(_PROMOTED_BACKGROUND_SAMPLE_ROLES)
+                or cached_background.get("reuse_key") != background_reuse_key
+            ):
+                raise ValueError("conflicting promoted background")
+            component_samples = tuple(
+                sample
+                for sample in executed_batch.samples
+                if sample.role in _PROMOTED_COMPONENT_SAMPLE_ROLES
+            )
+            if tuple(sample.role for sample in component_samples) != tuple(
+                _PROMOTED_COMPONENT_SAMPLE_ROLES
+            ):
+                raise ValueError("promoted reused-background sample plan is invalid")
+            combined_request_sha256 = hashlib.sha256(canonical_json_bytes({
+                "background_cache_key_sha256": background_cache_key,
+                "background_source_queue_ordinal": cached_background[
+                    "queue_ordinal"
+                ],
+                "component_request_sha256": executed_batch.request_sha256,
+            })).hexdigest()
+            batch = replace(
+                executed_batch,
+                request_sha256=combined_request_sha256,
+                samples=tuple(retained_samples) + component_samples,
+            )
+            background_samples = tuple(retained_samples)
+            background_status = "REUSED"
+        sample_count += len(requested_sample_roles)
+        background_receipt = _promoted_background_receipt(
+            leaf=leaf,
+            entry=entry,
+            batch=batch,
+            cache_key_sha256=background_cache_key,
+            reuse_key=background_reuse_key,
+            background_samples=background_samples,
+            status=background_status,
+            source_queue_ordinal=int(
+                promoted_background_cache[background_cache_key]["queue_ordinal"]
+            ),
+            source_leaf_id=str(
+                promoted_background_cache[background_cache_key]["leaf_id"]
+            ),
+        )
+        cached_sha256 = promoted_background_cache[background_cache_key].get(
+            "background_sha256"
+        )
+        if cached_sha256 is None:
+            promoted_background_cache[background_cache_key][
+                "background_sha256"
+            ] = background_receipt["background_sha256"]
+        elif cached_sha256 != background_receipt["background_sha256"]:
+            raise ValueError("conflicting promoted background")
+        receipts.append(background_receipt)
         if determinant_error_store is not None:
             retain_uncalibrated_determinant_error_evidence(
                 determinant_error_store,
@@ -1865,6 +2201,25 @@ def _run_promoted_exterior_queue_entry(
             timing_recorder.complete_tier()
             return outcome
         reason = str(screening.reason_code)
+        if (
+            execution_mode is PromotedExecutionMode.CALCULATE_ONLY
+            and reason
+            in {
+                "BLOCKED_BY_REVIEWED_ERROR_EVIDENCE",
+                "DETERMINANT_ERROR_EVIDENCE_UNAVAILABLE",
+            }
+        ):
+            outcome = PromotedPassOutcome(
+                disposition=SurveyDisposition.CALCULATED_AWAITING_ADMISSION,
+                reason_code="AWAITING_INDEPENDENT_REVIEW_ADMISSION",
+                precision_tiers=tuple(tiers),
+                sample_count=sample_count,
+                root_read_count=root_reads,
+                worker_launch_count=worker_launches,
+                evidence_receipts=tuple(receipts),
+            )
+            timing_recorder.complete_tier()
+            return outcome
         if reason not in PROMOTION_ALLOWLIST:
             raise ValueError(
                 f"promoted screening returned an unknown reason: {reason}"
@@ -1886,17 +2241,236 @@ def _run_promoted_exterior_queue_entry(
     raise AssertionError("promoted survey precision ladder did not terminate")
 
 
+def _retained_promoted_stage(
+    *,
+    leaf: object,
+    queue_entry: Mapping[str, object],
+    queue_ordinal: int,
+    route: str,
+    outcome: PromotedPassOutcome,
+    preflight: PromotedExecutionPreflight,
+    layer1_lock_receipt_sha256: str,
+    scientific_computation_identity: str,
+) -> dict[str, object]:
+    """Authenticate all current-run numerics without admitting their claims."""
+
+    raw_batches: list[dict[str, object]] = []
+    disagreement_terms: list[dict[str, object]] = []
+    for receipt in outcome.evidence_receipts:
+        if not isinstance(receipt, Mapping):
+            raise ValueError("promoted calculation receipt is invalid")
+        batch = receipt.get("batch")
+        if isinstance(batch, Mapping):
+            raw_batches.append(copy.deepcopy(dict(batch)))
+            samples = batch.get("samples")
+            if isinstance(samples, list):
+                for sample in samples:
+                    evidence = (
+                        sample.get("determinant_error_evidence")
+                        if isinstance(sample, Mapping)
+                        else None
+                    )
+                    if isinstance(evidence, Mapping):
+                        disagreement_terms.append(copy.deepcopy(dict(evidence)))
+    retained_record = (
+        None if outcome.record is None else copy.deepcopy(dict(outcome.record))
+    )
+    if retained_record is not None:
+        stages = retained_record.get("stages")
+        if isinstance(stages, list):
+            for stage in stages:
+                component = (
+                    stage.get("component_result")
+                    if isinstance(stage, Mapping)
+                    else None
+                )
+                raw_result = (
+                    component.get("result")
+                    if isinstance(component, Mapping)
+                    else None
+                )
+                if isinstance(raw_result, Mapping):
+                    raw_batches.append(copy.deepcopy(dict(raw_result)))
+    material: dict[str, object] = {
+        "schema": "windows-solver.promoted-calculation-stage/1",
+        "queue_ordinal": queue_ordinal,
+        "leaf_id": str(queue_entry["leaf_id"]),
+        "scientific_computation_identity": scientific_computation_identity,
+        "route": route,
+        "execution_mode": preflight.mode.value,
+        "admission_state": "AWAITING_ADMISSION",
+        "layer1_lock_receipt_sha256": layer1_lock_receipt_sha256,
+        "source_fingerprint_sha256": queue_entry["source_fingerprint_sha256"],
+        "predecessor_stage_sha256": queue_entry["source_stage_sha256"],
+        "source_root_seal_sha256": queue_entry["source_root_seal_sha256"],
+        "calibration_receipt_sha256": preflight.calibration_receipt_sha256,
+        "backend_identity_sha256": leaf.job.backend_identity.identity_sha256,
+        "numerical_control_identity_sha256": leaf.job.policy.identity_sha256,
+        "operation_identity": outcome.operation_identity,
+        "precision_tiers": list(outcome.precision_tiers),
+        "numerical_disposition": outcome.disposition.value,
+        "reason_code": outcome.reason_code,
+        "raw_promoted_batches": raw_batches,
+        "current_run_disagreement_terms": disagreement_terms,
+        "retained_record": retained_record,
+        "retained_record_stage_sha256": outcome.stage_sha256,
+        "source_record_sha256": outcome.source_record_sha256,
+        "source_record_stage_sha256": outcome.source_stage_sha256,
+        "receipts": [copy.deepcopy(dict(item)) for item in outcome.evidence_receipts],
+        "sample_count": outcome.sample_count,
+        "sample_limit": outcome.sample_limit,
+        "root_read_count": outcome.root_read_count,
+        "root_read_limit": outcome.root_read_limit,
+        "worker_launch_count": outcome.worker_launch_count,
+        "worker_launch_limit": outcome.worker_launch_limit,
+        "tier_timing": [copy.deepcopy(dict(item)) for item in outcome.tier_timing],
+        "session_fragments": [
+            copy.deepcopy(dict(item)) for item in outcome.session_fragments
+        ],
+    }
+    return {
+        **material,
+        "stage_sha256": hashlib.sha256(canonical_json_bytes(material)).hexdigest(),
+    }
+
+
 def _commit_promoted_outcome(
     checkpoint: Mapping[str, object],
     *,
+    leaf: object,
     leaf_id: str,
     queue_ordinal: int,
     queue_kind: PromotionQueueKind,
     outcome: PromotedPassOutcome,
+    route: str,
+    execution_preflight: PromotedExecutionPreflight | None,
+    layer1_lock_receipt_sha256: str | None,
+    scientific_computation_identity: str,
     record_validator: RecordValidator | None = None,
     layer1_guard: object | None = None,
 ) -> dict[str, object]:
     result = validate_schema11_checkpoint(checkpoint)
+    if execution_preflight is not None and (
+        execution_preflight.mode is PromotedExecutionMode.CALCULATE_ONLY
+        and outcome.disposition
+        in {
+            SurveyDisposition.COMPLETED,
+            SurveyDisposition.CALCULATED_AWAITING_ADMISSION,
+        }
+    ):
+        if layer1_lock_receipt_sha256 is None:
+            raise ValueError("retained promoted stage lacks the Layer-1 lock receipt")
+        queue_entry = result["promotion_queue"]["entries"][queue_ordinal]
+        promoted_stage = _retained_promoted_stage(
+            leaf=leaf,
+            queue_entry=queue_entry,
+            queue_ordinal=queue_ordinal,
+            route=route,
+            outcome=outcome,
+            preflight=execution_preflight,
+            layer1_lock_receipt_sha256=layer1_lock_receipt_sha256,
+            scientific_computation_identity=scientific_computation_identity,
+        )
+        background_receipts = [
+            copy.deepcopy(dict(receipt))
+            for receipt in outcome.evidence_receipts
+            if isinstance(receipt, Mapping)
+            and receipt.get("schema") == _PROMOTED_BACKGROUND_RECEIPT_SCHEMA
+        ]
+        root_receipts = [
+            copy.deepcopy(dict(receipt))
+            for receipt in outcome.evidence_receipts
+            if isinstance(receipt, Mapping)
+            and receipt.get("schema") == _PROMOTED_ROOT_RECEIPT_SCHEMA
+        ]
+        promoted_background = (
+            None
+            if not background_receipts
+            else {
+                "schema": "windows-solver.promoted-background-retention/1",
+                "route": route,
+                "background_receipts": background_receipts,
+            }
+        )
+        promoted_root = (
+            None
+            if not root_receipts and route != "HORIZON_BF80"
+            else {
+                "schema": "windows-solver.promoted-root-retention/1",
+                "route": route,
+                "root_receipts": root_receipts,
+                "source_root_seal_sha256": queue_entry[
+                    "source_root_seal_sha256"
+                ],
+                "retained_horizon_record": (
+                    copy.deepcopy(dict(outcome.record))
+                    if route == "HORIZON_BF80"
+                    and isinstance(outcome.record, Mapping)
+                    else None
+                ),
+            }
+        )
+        provisional_reuse_receipt = next(
+            (
+                receipt
+                for receipt in outcome.evidence_receipts
+                if isinstance(receipt, Mapping)
+                and receipt.get("schema")
+                == EXTERIOR_PROVISIONAL_REUSE_RECEIPT_SCHEMA
+            ),
+            None,
+        )
+        result = retain_promoted_calculation(
+            result,
+            queue_ordinal=queue_ordinal,
+            promoted_stage=promoted_stage,
+            execution_mode=execution_preflight.mode.value,
+            disposition_receipt={
+                "schema": "windows-solver.promoted-admission-pending/1",
+                "leaf_id": leaf_id,
+                "queue_ordinal": queue_ordinal,
+                "route": route,
+                "reason_code": "AWAITING_INDEPENDENT_REVIEW_ADMISSION",
+                "calibration_receipt_sha256": (
+                    execution_preflight.calibration_receipt_sha256
+                ),
+            },
+            provisional_reuse_receipt=provisional_reuse_receipt,
+            promoted_background=promoted_background,
+            promoted_root=promoted_root,
+            layer1_guard=layer1_guard,
+        )
+        return record_survey_disposition(
+            result,
+            survey_pass=SurveyPass.PROMOTED,
+            leaf_id=leaf_id,
+            disposition=SurveyDisposition.CALCULATED_AWAITING_ADMISSION,
+            source_record_sha256=outcome.source_record_sha256,
+            result_record_sha256=None,
+            operation_identity=outcome.operation_identity,
+            precision_tiers=outcome.precision_tiers,
+            reason_code="AWAITING_INDEPENDENT_REVIEW_ADMISSION",
+            sample_count=outcome.sample_count,
+            sample_limit=outcome.sample_limit,
+            root_read_count=outcome.root_read_count,
+            root_read_limit=(
+                outcome.root_read_limit
+                if (
+                    queue_kind is not PromotionQueueKind.RESPONSE
+                    or outcome.operation_identity.startswith("promoted-horizon-")
+                )
+                else 0
+            ),
+            worker_launch_count=outcome.worker_launch_count,
+            worker_launch_limit=(
+                2
+                if queue_kind is PromotionQueueKind.RESPONSE
+                else outcome.worker_launch_limit
+            ),
+            tier_timing=outcome.tier_timing,
+            session_fragments=outcome.session_fragments,
+            layer1_guard=layer1_guard,
+        )
     record_sha256 = None
     if outcome.record is not None:
         if outcome.stage_sha256 is None:
@@ -2119,6 +2693,10 @@ def run_promoted_survey(
     ] | None = None,
     layer1_guard: object | None = None,
     locked_routes_by_ordinal: Mapping[int, object] | None = None,
+    promoted_preflights_by_ordinal: Mapping[
+        int, PromotedExecutionPreflight
+    ] | None = None,
+    layer1_lock_receipt_sha256: str | None = None,
     determinant_error_store: ReviewedDeterminantErrorStore | None = None,
     solved_leaf_store: SolvedLeafStore | None = None,
     record_validator: RecordValidator | None = None,
@@ -2150,6 +2728,17 @@ def run_promoted_survey(
         raise ValueError(
             "promoted survey requires both the Layer-1 guard and typed routes"
         )
+    if (promoted_preflights_by_ordinal is None) != (
+        layer1_lock_receipt_sha256 is None
+    ):
+        raise ValueError(
+            "promoted survey preflights require the Layer-1 lock receipt"
+        )
+    if layer1_lock_receipt_sha256 is not None and (
+        not isinstance(layer1_lock_receipt_sha256, str)
+        or len(layer1_lock_receipt_sha256) != 64
+    ):
+        raise ValueError("promoted survey Layer-1 lock receipt digest is invalid")
     if layer1_guard is not None:
         for method_name in ("pre_write", "post_write", "post_callback"):
             if not callable(getattr(layer1_guard, method_name, None)):
@@ -2160,6 +2749,8 @@ def run_promoted_survey(
             raise ValueError(
                 "promoted survey cannot mix typed locked routes with a raw provisional lookup"
             )
+        if promoted_preflights_by_ordinal is None:
+            raise ValueError("locked promoted survey requires route preflights")
     preflight_campaign_supports(plan, selection.ordered_leaf_ids)
     leaves = {leaf.leaf_id: leaf for leaf in getattr(plan, "leaves")}
     path = Path(checkpoint_path)
@@ -2189,6 +2780,9 @@ def run_promoted_survey(
         record["leaf_id"]: record for record in result["records"]
     }
     completed = unresolved = deferred = rejected = skipped = cache_reused = 0
+    review_pending = policy_blocked = 0
+    route_results: list[PromotedRouteExecutionResult] = []
+    promoted_background_cache = _load_promoted_background_cache(result)
     terminal_cache_discovery = EvidenceDiscoveryTotals()
     cache_inventory = (
         None
@@ -2257,15 +2851,15 @@ def run_promoted_survey(
         ):
             raise ValueError("promoted queue scientific identity mismatch")
         locked_route = None
+        expected_route = (
+            "HORIZON_BF80"
+            if getattr(leaves[leaf_id], "mechanism_id") == "horizon-admittance"
+            else "EXTERIOR_BF40"
+        )
         if locked_routes_by_ordinal is not None:
             locked_route = locked_routes_by_ordinal.get(ordinal)
             if locked_route is None:
                 raise ValueError("pending promotion has no locked route")
-            expected_route = (
-                "HORIZON_BF80"
-                if getattr(leaves[leaf_id], "mechanism_id") == "horizon-admittance"
-                else "EXTERIOR_BF40"
-            )
             if (
                 getattr(locked_route, "queue_ordinal", None) != ordinal
                 or getattr(locked_route, "leaf_id", None) != leaf_id
@@ -2280,6 +2874,23 @@ def run_promoted_survey(
                 != snapshot.get("source_fingerprint_sha256")
             ):
                 raise ValueError("pending promotion diverges from its locked route")
+        execution_preflight = (
+            None
+            if promoted_preflights_by_ordinal is None
+            else promoted_preflights_by_ordinal.get(ordinal)
+        )
+        if promoted_preflights_by_ordinal is not None and execution_preflight is None:
+            raise ValueError("pending promotion has no route preflight")
+        if execution_preflight is not None and (
+            not isinstance(execution_preflight, PromotedExecutionPreflight)
+            or execution_preflight.route != expected_route
+        ):
+            raise ValueError("promoted route preflight binding is invalid")
+        execution_mode = (
+            PromotedExecutionMode.CALCULATE_AND_ADMIT
+            if execution_preflight is None
+            else execution_preflight.mode
+        )
         if leaf_id in result["survey_pass_ledger"]["promoted"]:
             raise ValueError("pending promotion already has a pass disposition")
         leaf = leaves[leaf_id]
@@ -2498,7 +3109,17 @@ def run_promoted_survey(
                 emit_progress(ProgressEventKind.LEAF_PASS_DISPOSITION_RECORDED)
             continue
 
-        if leaf.mechanism_id == "horizon-admittance":
+        if execution_mode is PromotedExecutionMode.BLOCK_ALL:
+            outcome = PromotedPassOutcome(
+                disposition=SurveyDisposition.DEFERRED,
+                reason_code="BLOCKED_BY_ADMISSION_POLICY",
+                precision_tiers=(),
+                operation_identity="promoted-policy-preflight/v1",
+                sample_limit=0,
+                root_read_limit=0,
+                worker_launch_limit=0,
+            )
+        elif leaf.mechanism_id == "horizon-admittance":
             evidence_entry = result["evidence_ledger"].get(leaf_id)
             source_receipts = (
                 tuple(evidence_entry["receipts"])
@@ -2619,7 +3240,8 @@ def run_promoted_survey(
                             provisional_predecessor_receipt=(
                                 provisional_predecessor_receipt
                             ),
-                            locked_bf40_gate_required=layer1_guard is not None,
+                            execution_mode=execution_mode,
+                            promoted_background_cache=promoted_background_cache,
                         )
                 except BaseException:
                     if recorder.active_tier is not None:
@@ -2640,26 +3262,68 @@ def run_promoted_survey(
         assert isinstance(outcome, PromotedPassOutcome)
         result = guarded(lambda: _commit_promoted_outcome(
             result,
+            leaf=leaf,
             leaf_id=leaf_id,
             queue_ordinal=ordinal,
             queue_kind=PromotionQueueKind(snapshot["queue_kind"]),
             outcome=outcome,
+            route=expected_route,
+            execution_preflight=execution_preflight,
+            layer1_lock_receipt_sha256=layer1_lock_receipt_sha256,
+            scientific_computation_identity=selection.scientific_identities[
+                leaf_id
+            ],
             record_validator=record_validator,
             layer1_guard=layer1_guard,
         ))
         assert isinstance(result, dict)
-        if outcome.disposition is SurveyDisposition.COMPLETED:
+        if (
+            outcome.disposition
+            is SurveyDisposition.CALCULATED_AWAITING_ADMISSION
+            or (
+                execution_mode is PromotedExecutionMode.CALCULATE_ONLY
+                and outcome.disposition is SurveyDisposition.COMPLETED
+            )
+        ):
+            review_pending += 1
+        elif outcome.disposition is SurveyDisposition.COMPLETED:
             completed += 1
         elif outcome.disposition is SurveyDisposition.UNRESOLVED:
             unresolved += 1
         elif outcome.disposition is SurveyDisposition.DEFERRED:
             deferred += 1
+            if execution_mode is PromotedExecutionMode.BLOCK_ALL:
+                policy_blocked += 1
         elif outcome.disposition is SurveyDisposition.REJECTED:
             rejected += 1
         result = persist(result)
+        route_results.append(PromotedRouteExecutionResult(
+            queue_ordinal=ordinal,
+            leaf_id=leaf_id,
+            route=expected_route,
+            execution_mode=execution_mode.value,
+            result_code=(
+                "AWAITING_ADMISSION"
+                if result["promotion_queue"]["entries"][ordinal]["disposition"]
+                == PromotionQueueDisposition.AWAITING_ADMISSION.value
+                else outcome.reason_code
+            ),
+            numerical_work_performed=(
+                outcome.sample_count > 0
+                or outcome.root_read_count > 0
+                or outcome.worker_launch_count > 0
+            ),
+            admission_state=(
+                "AWAITING_ADMISSION"
+                if result["promotion_queue"]["entries"][ordinal]["disposition"]
+                == PromotionQueueDisposition.AWAITING_ADMISSION.value
+                else "NOT_APPLICABLE"
+            ),
+        ))
         if (
             outcome.record is not None
             and outcome.disposition is SurveyDisposition.COMPLETED
+            and execution_mode is PromotedExecutionMode.CALCULATE_AND_ADMIT
             and outcome.record.get("state") == "PRODUCED"
             and terminal_record_committed is not None
         ):
@@ -2676,9 +3340,10 @@ def run_promoted_survey(
                 )
         if outcome.disposition not in {
             SurveyDisposition.COMPLETED,
+            SurveyDisposition.CALCULATED_AWAITING_ADMISSION,
             SurveyDisposition.CACHE_REUSED,
             SurveyDisposition.SUPERSEDED_BY_CACHE,
-        }:
+        } and execution_mode is not PromotedExecutionMode.BLOCK_ALL:
             report = _survey_failure_report(
                 leaf,
                 survey_pass="promoted",
@@ -2700,14 +3365,20 @@ def run_promoted_survey(
         timing_by_tier = {
             item["tier"]: item["elapsed_seconds"] for item in outcome.tier_timing
         }
+        effective_disposition = (
+            SurveyDisposition.CALCULATED_AWAITING_ADMISSION
+            if result["promotion_queue"]["entries"][ordinal]["disposition"]
+            == PromotionQueueDisposition.AWAITING_ADMISSION.value
+            else outcome.disposition
+        )
         with progress_scope(
             leaf_id=leaf_id,
             execution_profile="SURVEY",
             survey_pass="promoted",
-            pass_disposition=outcome.disposition.value,
+            pass_disposition=effective_disposition.value,
             evidence_level=(
                 "SCREENED"
-                if outcome.disposition is SurveyDisposition.COMPLETED
+                if effective_disposition is SurveyDisposition.COMPLETED
                 else None
             ),
             sample_count_used=outcome.sample_count,
@@ -2797,6 +3468,9 @@ def run_promoted_survey(
         terminal_cache_discovery=terminal_cache_discovery,
         pass_exhausted=exhaustion.exhausted,
         incomplete_leaf_ids=exhaustion.incomplete_leaf_ids,
+        review_pending_count=review_pending,
+        policy_blocked_count=policy_blocked,
+        route_results=tuple(route_results),
     )
 
 

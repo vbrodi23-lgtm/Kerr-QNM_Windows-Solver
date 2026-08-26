@@ -569,6 +569,8 @@ def retain_promoted_calculation(
     execution_mode: str,
     disposition_receipt: Mapping[str, object],
     provisional_reuse_receipt: Mapping[str, object] | None = None,
+    promoted_background: Mapping[str, object] | None = None,
+    promoted_root: Mapping[str, object] | None = None,
     layer1_guard: object | None = None,
 ) -> dict[str, object]:
     """Durably retain promoted numerics without admitting them as evidence."""
@@ -654,6 +656,41 @@ def retain_promoted_calculation(
     if existing_stage is not None and existing_stage != stage:
         raise ValueError("conflicting retained promoted stage")
     bucket[leaf_id] = stage
+    for ledger_field, payload, schema in (
+        (
+            "promoted_background_ledger",
+            promoted_background,
+            "windows-solver.promoted-background-ledger-entry/1",
+        ),
+        (
+            "promoted_root_ledger",
+            promoted_root,
+            "windows-solver.promoted-root-ledger-entry/1",
+        ),
+    ):
+        if payload is None:
+            continue
+        if not isinstance(payload, Mapping):
+            raise ValueError(f"{ledger_field} payload is invalid")
+        content: dict[str, object] = {
+            "schema": schema,
+            "queue_ordinal": queue_ordinal,
+            "leaf_id": leaf_id,
+            "payload": copy.deepcopy(dict(payload)),
+        }
+        ledger_entry = {
+            **content,
+            "ledger_entry_sha256": _sha256(content),
+        }
+        auxiliary_ledger = result[ledger_field]
+        assert isinstance(auxiliary_ledger, dict)
+        auxiliary_bucket = auxiliary_ledger.setdefault(ordinal_key, {})
+        if not isinstance(auxiliary_bucket, dict):
+            raise ValueError(f"{ledger_field} ordinal is invalid")
+        existing_auxiliary = auxiliary_bucket.get(leaf_id)
+        if existing_auxiliary is not None and existing_auxiliary != ledger_entry:
+            raise ValueError(f"conflicting {ledger_field} entry")
+        auxiliary_bucket[leaf_id] = ledger_entry
     entry["retained_promoted_stage_sha256"] = supplied_stage_sha256
     entry["disposition"] = PromotionQueueDisposition.AWAITING_ADMISSION.value
     entry["disposition_receipt_sha256"] = _sha256(receipt)

@@ -2097,11 +2097,18 @@ def run_native_promoted_pass(
         leaf_mechanism_ids=_layer1_leaf_mechanism_ids(plan, recovery_selection),
         auxiliary_evidence_manifest=manifest,
     )
-    if any(
-        route.route == "EXTERIOR_BF40"
-        for route in layer1_guard.locked_routes_by_ordinal.values()
-    ):
-        require_locked_bf40_determinant_error_issuance_authority()
+    active_calibration_receipt = (
+        load_default_calibration_receipt()
+        if calibration_receipt is None
+        else calibration_receipt
+    )
+    promoted_preflights_by_ordinal = {
+        ordinal: require_locked_bf40_determinant_error_issuance_authority(
+            active_calibration_receipt,
+            route=route.route,
+        )
+        for ordinal, route in layer1_guard.locked_routes_by_ordinal.items()
+    }
 
     store = solved_leaf_store or SolvedLeafStore.default()
     error_store = determinant_error_store or ReviewedDeterminantErrorStore(
@@ -2128,7 +2135,7 @@ def run_native_promoted_pass(
             backend_holder["value"] = NativeCampaignStageBackend.from_selection(
                 plan,
                 selection,
-                calibration_receipt=calibration_receipt,
+                calibration_receipt=active_calibration_receipt,
             )
         return backend_holder["value"]
 
@@ -2204,6 +2211,8 @@ def run_native_promoted_pass(
         root_seal_publish=lambda leaf, seal: root_provider().publish(leaf, seal),
         layer1_guard=layer1_guard,
         locked_routes_by_ordinal=layer1_guard.locked_routes_by_ordinal,
+        promoted_preflights_by_ordinal=promoted_preflights_by_ordinal,
+        layer1_lock_receipt_sha256=str(lock["receipt_sha256"]),
         backend_factory=lambda leaf, digits: backend()._julia_precision_backend_for(
             leaf.job, digits
         ),

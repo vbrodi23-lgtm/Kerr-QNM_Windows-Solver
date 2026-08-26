@@ -28,6 +28,8 @@ _REQUIRED_CALLS = {
             "root_seal_lookup",
             "layer1_guard",
             "locked_routes_by_ordinal",
+            "promoted_preflights_by_ordinal",
+            "layer1_lock_receipt_sha256",
             "root_seal_publish",
             "backend_factory",
             "determinant_error_store",

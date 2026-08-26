@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 from decimal import Decimal
 import hashlib
 import json
@@ -31,6 +32,11 @@ from windows_solver.julia_response_backend import (
     JuliaNumericalControlError,
 )
 from windows_solver.precision_tiers import PrecisionTier
+from windows_solver.reviewed_determinant_error_issuance import (
+    PromotedExecutionPreflight,
+    require_locked_bf40_determinant_error_issuance_authority,
+)
+from windows_solver.promoted_control_calibration import PromotedExecutionMode
 from windows_solver.structural_diagnostics import StructuralDiagnosticSession
 from windows_solver.response_batches import (
     PrecisionCapabilities,
@@ -324,6 +330,9 @@ class PromotedSurveySchedulerTests(unittest.TestCase):
         failure40: str | None = None,
         root_runner=None,
         diagnostic_session=None,
+        calculate_only=False,
+        block_all=False,
+        terminal_commits=None,
     ):
         calls: list[int] = []
         published: dict[str, AuthenticatedRootSeal] = {}
@@ -373,9 +382,184 @@ class PromotedSurveySchedulerTests(unittest.TestCase):
                 produced_record_builder=lambda leaf, batch, screening, digits: (
                     _record(leaf.leaf_id, digits)
                 ),
+                promoted_preflights_by_ordinal=(
+                    {
+                        ordinal: (
+                            PromotedExecutionPreflight(
+                                mode=PromotedExecutionMode.BLOCK_ALL,
+                                route="EXTERIOR_BF40",
+                                calibration_receipt_sha256="e" * 64,
+                                calculation_permitted=False,
+                                checkpointing_permitted=False,
+                                admission_permitted=False,
+                                publication_permitted=False,
+                                result_code="BLOCKED_BY_ADMISSION_POLICY",
+                            )
+                            if block_all
+                            else require_locked_bf40_determinant_error_issuance_authority(
+                                route="EXTERIOR_BF40"
+                            )
+                        )
+                        for ordinal in range(
+                            len(checkpoint["promotion_queue"]["entries"])
+                        )
+                    }
+                    if calculate_only or block_all
+                    else None
+                ),
+                layer1_lock_receipt_sha256=(
+                    "f" * 64 if calculate_only or block_all else None
+                ),
+                terminal_record_committed=(
+                    None
+                    if terminal_commits is None
+                    else lambda leaf, record: terminal_commits.append(
+                        (leaf.leaf_id, record["record_sha256"])
+                    )
+                ),
                 diagnostic_session=diagnostic_session,
             )
         return result, calls
+
+    def test_calculate_only_stops_at_bf40_and_retains_without_admission(self):
+        terminal_commits: list[tuple[str, str]] = []
+        first, calls = self._run(
+            self._checkpoint(),
+            calculate_only=True,
+            terminal_commits=terminal_commits,
+        )
+
+        leaf_id = self.leaves[0].leaf_id
+        queue_entry = first.checkpoint["promotion_queue"]["entries"][0]
+        stage = first.checkpoint["promoted_stage_ledger"]["0"][leaf_id]
+        self.assertEqual([40], calls)
+        self.assertEqual("AWAITING_ADMISSION", queue_entry["disposition"])
+        self.assertEqual(
+            "CALCULATED_AWAITING_ADMISSION",
+            first.checkpoint["survey_pass_ledger"]["promoted"][leaf_id][
+                "disposition"
+            ],
+        )
+        self.assertEqual("CALCULATE_ONLY", stage["execution_mode"])
+        self.assertEqual("EXTERIOR_BF40", stage["route"])
+        self.assertEqual("f" * 64, stage["layer1_lock_receipt_sha256"])
+        self.assertEqual(["bigfloat-40"], [
+            batch["precision_tier"] for batch in stage["raw_promoted_batches"]
+        ])
+        self.assertEqual([], first.checkpoint["records"])
+        self.assertEqual({}, first.checkpoint["evidence_ledger"])
+        self.assertEqual([], terminal_commits)
+        self.assertEqual(1, first.review_pending_count)
+
+        resumed, resumed_calls = self._run(
+            first.checkpoint,
+            calculate_only=True,
+            terminal_commits=terminal_commits,
+        )
+        self.assertEqual([], resumed_calls)
+        self.assertEqual(
+            stage,
+            resumed.checkpoint["promoted_stage_ledger"]["0"][leaf_id],
+        )
+        self.assertEqual([], terminal_commits)
+
+    def test_block_all_returns_typed_policy_result_without_backend_work(self):
+        result, calls = self._run(self._checkpoint(), block_all=True)
+
+        self.assertEqual([], calls)
+        self.assertEqual(1, result.policy_blocked_count)
+        self.assertEqual("DEFERRED", result.checkpoint[
+            "promotion_queue"
+        ]["entries"][0]["disposition"])
+        self.assertEqual(1, len(result.route_results))
+        self.assertEqual(
+            "BLOCKED_BY_ADMISSION_POLICY",
+            result.route_results[0].result_code,
+        )
+        self.assertFalse(result.route_results[0].numerical_work_performed)
+
+    def test_calculate_only_reuses_same_tier_promoted_background(self):
+        result, calls = self._run(
+            self._checkpoint(count=2),
+            calculate_only=True,
+        )
+
+        self.assertEqual([40, 40], calls)
+        background_entries = result.checkpoint["promoted_background_ledger"]
+        receipts = [
+            background_entries[str(ordinal)][leaf.leaf_id]["payload"][
+                "background_receipts"
+            ][0]
+            for ordinal, leaf in enumerate(self.leaves)
+        ]
+        self.assertEqual(["ACQUIRED", "REUSED"], [
+            receipt["status"] for receipt in receipts
+        ])
+        self.assertEqual(
+            receipts[0]["background_sha256"],
+            receipts[1]["background_sha256"],
+        )
+        promoted_ledger = result.checkpoint["survey_pass_ledger"]["promoted"]
+        self.assertEqual(
+            [9, 4],
+            [promoted_ledger[leaf.leaf_id]["sample_count"] for leaf in self.leaves],
+        )
+
+    def test_resume_reloads_promoted_background_without_reacquiring_it(self):
+        first, _ = self._run(
+            self._checkpoint(count=1),
+            calculate_only=True,
+        )
+        resumable = self._checkpoint(count=2)
+        resumable["promotion_queue"]["entries"][0] = copy.deepcopy(
+            first.checkpoint["promotion_queue"]["entries"][0]
+        )
+        resumable["survey_pass_ledger"]["promoted"] = copy.deepcopy(
+            first.checkpoint["survey_pass_ledger"]["promoted"]
+        )
+        for ledger_name in (
+            "promoted_stage_ledger",
+            "promoted_background_ledger",
+            "promoted_root_ledger",
+        ):
+            resumable[ledger_name] = copy.deepcopy(first.checkpoint[ledger_name])
+
+        resumed, calls = self._run(resumable, calculate_only=True)
+
+        second = self.leaves[1]
+        receipt = resumed.checkpoint["promoted_background_ledger"]["1"][
+            second.leaf_id
+        ]["payload"]["background_receipts"][0]
+        self.assertEqual([40], calls)
+        self.assertEqual("REUSED", receipt["status"])
+        self.assertEqual(
+            4,
+            resumed.checkpoint["survey_pass_ledger"]["promoted"][
+                second.leaf_id
+            ]["sample_count"],
+        )
+
+    def test_calculated_root_evidence_is_retained_in_root_ledger(self):
+        result, calls = self._run(
+            self._checkpoint(PromotionQueueKind.ROOT),
+            calculate_only=True,
+        )
+
+        leaf_id = self.leaves[0].leaf_id
+        root_payload = result.checkpoint["promoted_root_ledger"]["0"][leaf_id][
+            "payload"
+        ]
+        self.assertEqual([40], calls)
+        self.assertEqual(1, len(root_payload["root_receipts"]))
+        self.assertEqual(
+            "BF40", root_payload["root_receipts"][0]["precision_tier"]
+        )
+        self.assertEqual(
+            1,
+            result.checkpoint["survey_pass_ledger"]["promoted"][leaf_id][
+                "root_read_count"
+            ],
+        )
 
     def test_response_queue_stops_unresolved_without_approved_error_model(self):
         result, calls = self._run(self._checkpoint())
