@@ -59,6 +59,8 @@ class PromotionQueueKind(str, Enum):
 
 class PromotionQueueDisposition(str, Enum):
     PENDING = "PENDING"
+    CALCULATED_PENDING_DERIVATION = "CALCULATED_PENDING_DERIVATION"
+    NUMERICAL_CONTINUATION = "NUMERICAL_CONTINUATION"
     AWAITING_ADMISSION = "AWAITING_ADMISSION"
     COMPLETED = "COMPLETED"
     UNRESOLVED = "UNRESOLVED"
@@ -78,7 +80,12 @@ PROMOTED_SURVEY_DISPOSITIONS = BINARY64_SURVEY_DISPOSITIONS - {
 TERMINAL_PROMOTION_DISPOSITIONS = frozenset(
     item.value
     for item in PromotionQueueDisposition
-    if item is not PromotionQueueDisposition.PENDING
+    if item
+    not in {
+        PromotionQueueDisposition.PENDING,
+        PromotionQueueDisposition.CALCULATED_PENDING_DERIVATION,
+        PromotionQueueDisposition.NUMERICAL_CONTINUATION,
+    }
 )
 
 _EVIDENCE_RANK = {
@@ -588,7 +595,11 @@ def retain_promoted_continuation(
     entry = entries[queue_ordinal]
     if (
         entry["queue_ordinal"] != queue_ordinal
-        or entry["disposition"] != PromotionQueueDisposition.PENDING.value
+        or entry["disposition"]
+        not in {
+            PromotionQueueDisposition.PENDING.value,
+            PromotionQueueDisposition.CALCULATED_PENDING_DERIVATION.value,
+        }
     ):
         raise ValueError("promotion queue entry is not pending")
     if not isinstance(promoted_stage, Mapping):
@@ -617,10 +628,22 @@ def retain_promoted_continuation(
         raise ValueError("promoted stage ledger ordinal is invalid")
     leaf_id = str(entry["leaf_id"])
     existing_stage = bucket.get(leaf_id)
-    if existing_stage is not None and existing_stage != stage:
+    if existing_stage is not None and existing_stage != stage and not (
+        isinstance(existing_stage, Mapping)
+        and existing_stage.get("admission_state")
+        == "CALCULATED_PENDING_DERIVATION"
+    ):
         raise ValueError("conflicting promoted continuation stage")
     bucket[leaf_id] = stage
     entry["retained_promoted_stage_sha256"] = supplied_stage_sha256
+    entry["disposition"] = PromotionQueueDisposition.NUMERICAL_CONTINUATION.value
+    entry["disposition_receipt_sha256"] = _sha256({
+        "schema": "windows-solver.promoted-numerical-continuation/2",
+        "queue_ordinal": queue_ordinal,
+        "leaf_id": leaf_id,
+        "retained_promoted_stage_sha256": supplied_stage_sha256,
+        "source_fingerprint_sha256": entry["source_fingerprint_sha256"],
+    })
     _assert_layer1_guard(layer1_guard, result)
     return result
 
@@ -726,7 +749,12 @@ def retain_promoted_background(
     entry = entries[queue_ordinal]
     if (
         entry["queue_ordinal"] != queue_ordinal
-        or entry["disposition"] != PromotionQueueDisposition.PENDING.value
+        or entry["disposition"]
+        not in {
+            PromotionQueueDisposition.PENDING.value,
+            PromotionQueueDisposition.CALCULATED_PENDING_DERIVATION.value,
+            PromotionQueueDisposition.NUMERICAL_CONTINUATION.value,
+        }
         or route not in {"EXTERIOR_BF40", "HORIZON_BF80"}
         or not isinstance(background_receipt, Mapping)
         or not _is_sha256(background_receipt.get("receipt_sha256"))
@@ -744,6 +772,100 @@ def retain_promoted_background(
         },
         schema="windows-solver.promoted-background-ledger-entry/1",
     )
+    _assert_layer1_guard(layer1_guard, result)
+    return result
+
+
+def retain_promoted_raw_calculation(
+    checkpoint: Mapping[str, object],
+    *,
+    queue_ordinal: int,
+    promoted_stage: Mapping[str, object],
+    execution_mode: str,
+    disposition_receipt: Mapping[str, object],
+    layer1_guard: object | None = None,
+) -> dict[str, object]:
+    """Durably retain one worker return before any reducer may consume it.
+
+    This is intentionally a distinct state from ``AWAITING_ADMISSION``.  A
+    raw result can survive an interrupt and later be reduced without a second
+    worker launch; it is not yet a screened claim or a terminal record.
+    """
+
+    result = validate_schema11_checkpoint(checkpoint)
+    if execution_mode != "CALCULATE_ONLY":
+        raise ValueError("raw promoted retention requires CALCULATE_ONLY mode")
+    queue = result["promotion_queue"]
+    assert isinstance(queue, dict)
+    entries = queue["entries"]
+    assert isinstance(entries, list)
+    if (
+        isinstance(queue_ordinal, bool)
+        or not isinstance(queue_ordinal, int)
+        or queue_ordinal < 0
+        or queue_ordinal >= len(entries)
+    ):
+        raise ValueError("promotion queue ordinal is invalid")
+    entry = entries[queue_ordinal]
+    if (
+        entry["queue_ordinal"] != queue_ordinal
+        or entry["disposition"]
+        not in {
+            PromotionQueueDisposition.PENDING.value,
+            PromotionQueueDisposition.NUMERICAL_CONTINUATION.value,
+        }
+        or not isinstance(promoted_stage, Mapping)
+    ):
+        raise ValueError("promotion queue cannot retain a raw calculation")
+    stage = copy.deepcopy(dict(promoted_stage))
+    stage_content = {key: item for key, item in stage.items() if key != "stage_sha256"}
+    stage_sha256 = stage.get("stage_sha256")
+    artifact = stage.get("calculation_artifact")
+    if (
+        not _is_sha256(stage_sha256)
+        or stage_sha256 != _sha256(stage_content)
+        or stage.get("leaf_id") != entry["leaf_id"]
+        or stage.get("queue_ordinal") != queue_ordinal
+        or stage.get("execution_mode") != execution_mode
+        or stage.get("admission_state") != "CALCULATED_PENDING_DERIVATION"
+        or not isinstance(artifact, Mapping)
+    ):
+        raise ValueError("raw promoted calculation authentication is invalid")
+    artifact_content = {
+        key: item for key, item in artifact.items() if key != "calculation_sha256"
+    }
+    if (
+        not _is_sha256(artifact.get("calculation_sha256"))
+        or artifact["calculation_sha256"] != _sha256(artifact_content)
+    ):
+        raise ValueError("raw promoted calculation artifact digest is invalid")
+    receipt = copy.deepcopy(dict(disposition_receipt))
+    source_fingerprint_sha256 = entry["source_fingerprint_sha256"]
+    supplied_fingerprint = receipt.get("source_fingerprint_sha256")
+    if supplied_fingerprint is not None and supplied_fingerprint != source_fingerprint_sha256:
+        raise ValueError("raw promoted calculation source fingerprint is invalid")
+    receipt.update({
+        "source_fingerprint_sha256": source_fingerprint_sha256,
+        "retained_promoted_stage_sha256": stage_sha256,
+        "execution_mode": execution_mode,
+        "admission_state": "CALCULATED_PENDING_DERIVATION",
+    })
+    stage_ledger = result["promoted_stage_ledger"]
+    assert isinstance(stage_ledger, dict)
+    bucket = stage_ledger.setdefault(str(queue_ordinal), {})
+    if not isinstance(bucket, dict):
+        raise ValueError("promoted stage ledger ordinal is invalid")
+    leaf_id = str(entry["leaf_id"])
+    existing = bucket.get(leaf_id)
+    if existing is not None and existing != stage and not (
+        isinstance(existing, Mapping)
+        and existing.get("admission_state") == "NUMERICAL_CONTINUATION"
+    ):
+        raise ValueError("conflicting raw promoted calculation")
+    bucket[leaf_id] = stage
+    entry["retained_promoted_stage_sha256"] = stage_sha256
+    entry["disposition"] = PromotionQueueDisposition.CALCULATED_PENDING_DERIVATION.value
+    entry["disposition_receipt_sha256"] = _sha256(receipt)
     _assert_layer1_guard(layer1_guard, result)
     return result
 
@@ -781,9 +903,14 @@ def retain_promoted_calculation(
     entry = entries[queue_ordinal]
     if (
         entry["queue_ordinal"] != queue_ordinal
-        or entry["disposition"] != PromotionQueueDisposition.PENDING.value
+        or entry["disposition"]
+        not in {
+            PromotionQueueDisposition.PENDING.value,
+            PromotionQueueDisposition.CALCULATED_PENDING_DERIVATION.value,
+            PromotionQueueDisposition.NUMERICAL_CONTINUATION.value,
+        }
     ):
-        raise ValueError("promotion queue entry is not pending")
+        raise ValueError("promotion queue entry cannot retain a reduced calculation")
     if not isinstance(promoted_stage, Mapping):
         raise ValueError("retained promoted stage is invalid")
     stage = copy.deepcopy(dict(promoted_stage))
@@ -844,7 +971,7 @@ def retain_promoted_calculation(
         if not (
             isinstance(existing_stage, Mapping)
             and existing_stage.get("admission_state")
-            == "NUMERICAL_CONTINUATION"
+            in {"NUMERICAL_CONTINUATION", "CALCULATED_PENDING_DERIVATION"}
         ):
             raise ValueError("conflicting retained promoted stage")
     bucket[leaf_id] = stage
@@ -1252,11 +1379,14 @@ def validate_schema11_checkpoint(
                 raise ValueError("pending promotion cannot have a terminal receipt")
         elif not _is_sha256(receipt_hash):
             raise ValueError("terminal promotion requires a receipt digest")
-        if disposition == PromotionQueueDisposition.AWAITING_ADMISSION.value and (
-            retained_promoted_stage_sha256 is None
-        ):
+        if disposition in {
+            PromotionQueueDisposition.CALCULATED_PENDING_DERIVATION.value,
+            PromotionQueueDisposition.NUMERICAL_CONTINUATION.value,
+            PromotionQueueDisposition.AWAITING_ADMISSION.value,
+            PromotionQueueDisposition.COMPLETED.value,
+        } and retained_promoted_stage_sha256 is None:
             raise ValueError(
-                "awaiting-admission promotion requires retained calculation"
+                "retained promotion state requires a retained calculation"
             )
         # This digest is derived provenance, not an independently trusted
         # input.  Recompute it at the checkpoint boundary so a malformed
@@ -1309,16 +1439,37 @@ def validate_schema11_checkpoint(
             valid_continuation_stage = (
                 admission_state == "NUMERICAL_CONTINUATION"
                 and queue_entry["disposition"]
-                == PromotionQueueDisposition.PENDING.value
+                in {
+                    PromotionQueueDisposition.PENDING.value,
+                    PromotionQueueDisposition.NUMERICAL_CONTINUATION.value,
+                }
                 and stage.get("next_precision_tier") == "BF80"
                 and stage.get("precision_tiers") == ["BF40"]
+            )
+            raw_artifact = stage.get("calculation_artifact")
+            valid_raw_stage = (
+                admission_state == "CALCULATED_PENDING_DERIVATION"
+                and queue_entry["disposition"]
+                == PromotionQueueDisposition.CALCULATED_PENDING_DERIVATION.value
+                and isinstance(raw_artifact, Mapping)
+                and _is_sha256(raw_artifact.get("calculation_sha256"))
+                and raw_artifact["calculation_sha256"]
+                == _sha256({
+                    key: item
+                    for key, item in raw_artifact.items()
+                    if key != "calculation_sha256"
+                })
             )
             if (
                 not _is_sha256(stage_sha256)
                 or stage_sha256 != _sha256(content)
                 or queue_entry["retained_promoted_stage_sha256"] != stage_sha256
                 or stage.get("execution_mode") not in _PROMOTED_EXECUTION_MODES
-                or not (valid_terminal_stage or valid_continuation_stage)
+                or not (
+                    valid_terminal_stage
+                    or valid_continuation_stage
+                    or valid_raw_stage
+                )
             ):
                 raise ValueError("schema-11 retained promoted stage is invalid")
             seen_stages.add((ordinal, leaf_id))
@@ -1395,5 +1546,6 @@ __all__ = [
     "retain_promoted_background",
     "retain_promoted_calculation",
     "retain_promoted_continuation",
+    "retain_promoted_raw_calculation",
     "validate_schema11_checkpoint",
 ]
