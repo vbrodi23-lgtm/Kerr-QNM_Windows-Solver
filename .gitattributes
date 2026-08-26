@@ -1,1 +1,2 @@
 src/windows_solver/data/** -text
+tools/M02_Operator_Dashboard_Append_Only_Reference.ps1 text eol=lf

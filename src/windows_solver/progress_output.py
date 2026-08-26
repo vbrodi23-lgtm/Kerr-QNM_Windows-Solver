@@ -23,7 +23,19 @@ from .campaign_reports import (
     refresh_campaign_reports,
 )
 from .precision_tiers import precision_tier_presentation
-from .progress import PROGRESS_SCHEMA, ProgressEvent, ProgressEventKind, ProgressMode
+from .progress import (
+    PROGRESS_SCHEMA,
+    ProgressContext,
+    ProgressEvent,
+    ProgressEventKind,
+    ProgressMode,
+)
+from .schema11_dashboard import (
+    Schema11DashboardRow,
+    Schema11DashboardSnapshot,
+    Schema11EvidenceRow,
+    project_schema11_dashboard,
+)
 
 if TYPE_CHECKING:
     from .response_batches import CampaignPlan
@@ -783,137 +795,360 @@ class CleanTailDashboard:
         ).rstrip()
 
 
+class AppendOnlySchema11Dashboard:
+    """Render the approved schema-11 dashboard using newline writes only."""
+
+    WIDTH = 118
+    INITIAL_ROWS = 14
+    _MECHANISM_SHORT = {
+        "horizon-admittance": "horizon",
+        "exterior-fixed-r3": "ext-r3",
+        "exterior-alpha-zero": "ext-alpha0",
+        "exterior-alpha-half": "ext-alpha1/2",
+        "exterior-alpha-one": "ext-alpha1",
+        "exterior-light-ring": "ext-lightring",
+        "exterior-throat-kappa": "ext-throatk",
+    }
+
+    def __init__(self, stream: TextIO) -> None:
+        self.stream = stream
+        self._started = False
+        self._terminal_summary_emitted = False
+        self._emitted_leaf_ids: set[str] = set()
+        self._active_pass = "binary64"
+
+    @property
+    def started(self) -> bool:
+        return self._started
+
+    def start(
+        self,
+        snapshot: Schema11DashboardSnapshot,
+        rows: tuple[Schema11DashboardRow, ...],
+        *,
+        profile: str,
+        active_pass: str,
+        running: Mapping[str, object] | None,
+        terminal: bool = False,
+    ) -> tuple[str, ...]:
+        if self._started:
+            return tuple(self._emitted_leaf_ids)
+        self._started = True
+        self._active_pass = active_pass
+        rule = "=" * self.WIDTH
+        dash = "-" * self.WIDTH
+        self._line(rule)
+        self._line("  M02 | OPERATOR DASHBOARD")
+        self._line(rule)
+        self._line(
+            "  PROFILE  {profile:<8}  PASS  {active:<10}    CHECKPOINT  "
+            "schema-11    LAYER-1 LOCK  NOT YET CREATED".format(
+                profile=str(profile).upper(), active=str(active_pass).upper()
+            )
+        )
+        self._line(dash)
+        self._line(
+            "  BINARY64 PROCESSED   {processed:3}/{selected:<3}     PRODUCED   "
+            "{produced:3}     PENDING   {pending:3}     SYS FAIL   {failures:3}".format(
+                processed=snapshot.binary64_processed_count,
+                selected=snapshot.selected_leaf_count,
+                produced=snapshot.produced_count,
+                pending=snapshot.pending_count,
+                failures=snapshot.system_failure_count,
+            )
+        )
+        self._line(
+            "  PROMOTION ROUTES        BF40 {bf40:3}     BF80 {bf80:3}     "
+            "RETAINED BINARY64 SAMPLES {samples:4}".format(
+                bf40=snapshot.pending_by_minimum_tier.get("BF40", 0),
+                bf80=snapshot.pending_by_minimum_tier.get("BF80", 0),
+                samples=snapshot.retained_binary64_sample_count,
+            )
+        )
+        self._line(
+            "  PROMOTED PROCESSED    {processed:3}         DEFERRED {deferred:3}     "
+            "UNRESOLVED {unresolved:3}     REJECTED {rejected:3}".format(
+                processed=snapshot.promoted_processed_count,
+                deferred=snapshot.deferred_count,
+                unresolved=snapshot.unresolved_count,
+                rejected=snapshot.rejected_count,
+            )
+        )
+        self._line(
+            "  EVIDENCE             SCREENED {screened:3}     CERTIFIED {certified:3}     "
+            "VALIDATED {validated:3}".format(
+                screened=snapshot.evidence_counts.get("SCREENED", 0),
+                certified=snapshot.evidence_counts.get("CERTIFIED", 0),
+                validated=snapshot.evidence_counts.get("VALIDATED", 0),
+            )
+        )
+        self._line(dash)
+        if terminal:
+            self._line("  PASS COMPLETE — no active leaf")
+        elif running:
+            self._line("  " + self._running_text(running))
+        else:
+            self._line("  WAITING FOR ACTIVE LEAF...")
+        self._line(dash)
+        self._line("  LAST SETTLED LEAVES")
+        self._line("")
+        self._line(
+            "  {0:<9} {1:<5} {2:<10} {3:<16} {4:<8} {5:>8} {6:>7} {7:<6} {8}".format(
+                "LEAF", "MODE", "SPIN", "MECHANISM", "ROLE", "TIME", "SAMPLES", "NEXT", "STATE"
+            )
+        )
+        self._line(
+            "  {0:<9} {1:<5} {2:<10} {3:<16} {4:<8} {5:>8} {6:>7} {7:<6} {8}".format(
+                "-" * 9,
+                "-" * 5,
+                "-" * 10,
+                "-" * 16,
+                "-" * 8,
+                "-" * 8,
+                "-" * 7,
+                "-" * 6,
+                "-" * 18,
+            )
+        )
+        for row in rows[-self.INITIAL_ROWS :]:
+            self.append_row(row)
+        return tuple(self._emitted_leaf_ids)
+
+    def append_row(self, row: Schema11DashboardRow) -> None:
+        if row.leaf_id in self._emitted_leaf_ids:
+            return
+        self._line(self._row_text(row))
+        self._emitted_leaf_ids.add(row.leaf_id)
+
+    def append_terminal_summary(
+        self,
+        snapshot: Schema11DashboardSnapshot,
+        event: ProgressEvent,
+    ) -> None:
+        if self._terminal_summary_emitted:
+            return
+        self._terminal_summary_emitted = True
+        dash = "-" * self.WIDTH
+        self._line("")
+        self._line(dash)
+        completed = event.kind in {
+            ProgressEventKind.CAMPAIGN_PASS_COMPLETED,
+            ProgressEventKind.CAMPAIGN_COMPLETED,
+        }
+        if completed:
+            title = (
+                "BINARY64 SURVEY COMPLETE"
+                if self._active_pass == "binary64"
+                else "PROMOTED PASS COMPLETE"
+            )
+        else:
+            title = "M02 PASS INTERRUPTED"
+        self._line("  " + title)
+        self._line("")
+        self._line(
+            "  PROCESSED                  {0:>3}/{1}".format(
+                snapshot.binary64_processed_count
+                if self._active_pass == "binary64"
+                else snapshot.promoted_processed_count,
+                snapshot.selected_leaf_count,
+            )
+        )
+        self._line("  PENDING PROMOTIONS         {0:>3}".format(snapshot.pending_count))
+        self._line(
+            "    EXTERIOR -> BF40         {0:>3}".format(
+                snapshot.pending_by_minimum_tier.get("BF40", 0)
+            )
+        )
+        self._line(
+            "    HORIZON  -> BF80         {0:>3}".format(
+                snapshot.pending_by_minimum_tier.get("BF80", 0)
+            )
+        )
+        self._line(
+            "  RETAINED BINARY64 SAMPLES {0:>4}".format(
+                snapshot.retained_binary64_sample_count
+            )
+        )
+        self._line("  SYSTEM FAILURES            {0:>3}".format(snapshot.system_failure_count))
+        self._line("")
+        if completed:
+            self._line("  NEXT PASS: SURVEY / PROMOTED")
+        else:
+            reason = self._terminal_reason(event)
+            self._line("  TERMINAL FAILURE: " + reason)
+        self._line(dash)
+        self._line("  Ctrl+C stops this preview. The solver in the other window is untouched.")
+        self._line("=" * self.WIDTH)
+
+    def _row_text(self, row: Schema11DashboardRow | Schema11EvidenceRow) -> str:
+        leaf = (
+            f"{row.leaf_ordinal}/{row.leaf_count}"
+            if row.leaf_ordinal is not None
+            else f"?/{row.leaf_count}"
+        )
+        if isinstance(row, Schema11EvidenceRow):
+            return (
+                "  {0:<9} {1:<5} {2:<10} {3:<16} {4:<8} {5:>8} {6:>7} {7:<6} {8}"
+            ).format(
+                leaf,
+                self._safe(row.mode),
+                self._spin(row.spin),
+                self._mechanism(row.mechanism),
+                self._safe(row.role),
+                "-",
+                "-",
+                "-",
+                row.state,
+            )
+        return (
+            "  {0:<9} {1:<5} {2:<10} {3:<16} {4:<8} {5:>8} {6:>7} {7:<6} {8}"
+        ).format(
+            leaf,
+            self._safe(row.mode),
+            self._spin(row.spin),
+            self._mechanism(row.mechanism),
+            self._safe(row.role),
+            self._time(row.time_seconds),
+            row.sample_count,
+            row.next_tier or "-",
+            row.state,
+        )
+
+    @classmethod
+    def _running_text(cls, running: Mapping[str, object]) -> str:
+        parts = ["RUNNING"]
+        for name in ("leaf", "mode", "spin", "mechanism", "tier", "role", "phase", "elapsed"):
+            value = running.get(name)
+            if value is None or isinstance(value, Mapping) or value == "":
+                continue
+            if name == "spin":
+                value = cls._spin(value)
+            elif name == "mechanism":
+                value = cls._mechanism(value)
+            parts.append(str(value))
+        return "  |  ".join(parts)
+
+    @classmethod
+    def _safe(cls, value: object) -> str:
+        return str(value if value not in (None, "") else "-").replace("\r", " ").replace("\n", " ")
+
+    @classmethod
+    def _spin(cls, value: object) -> str:
+        try:
+            number = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return cls._safe(value)
+        return format(number, ".8g") if math.isfinite(number) else cls._safe(value)
+
+    @classmethod
+    def _mechanism(cls, value: object) -> str:
+        text = cls._safe(value)
+        return cls._MECHANISM_SHORT.get(text, text)
+
+    @classmethod
+    def _time(cls, value: object) -> str:
+        if value is None:
+            return "-"
+        try:
+            number = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return cls._safe(value)
+        if number < 100:
+            return f"{number:.2f}s"
+        if number < 10000:
+            return f"{number:.1f}s"
+        return f"{number:.0f}s"
+
+    @classmethod
+    def _terminal_reason(cls, event: ProgressEvent) -> str:
+        payload = event.payload
+        for name in ("reason", "failure_code", "message", "error_type"):
+            value = payload.get(name)
+            if value:
+                return cls._safe(value)
+        return event.kind.value
+
+    def _line(self, value: str) -> None:
+        self.stream.write(self._safe(value) + "\n")
+        self.stream.flush()
+
+
 def schema11_dashboard_snapshot(
     checkpoint: Mapping[str, object],
     *,
     leaf_metadata: Mapping[str, Mapping[str, object]] | None = None,
 ) -> tuple[tuple[dict[str, object], ...], dict[str, int], dict[str, object]]:
-    """Project authenticated schema-11 state without consulting reports."""
+    """Compatibility adapter backed entirely by the canonical projection."""
 
     from .campaign_policy import validate_schema11_checkpoint
 
     value = validate_schema11_checkpoint(checkpoint)
     metadata = leaf_metadata or {}
-    binary = value["survey_pass_ledger"]["binary64"]
-    promoted = value["survey_pass_ledger"]["promoted"]
-    evidence = value["evidence_ledger"]
-    records = tuple(value["records"])
-    rows: list[dict[str, object]] = []
-    for ordinal, record in enumerate(records, start=1):
-        leaf_id = str(record["leaf_id"])
-        if record["state"] == "IN_PROGRESS":
-            continue
-        pass_name = "promoted" if leaf_id in promoted else "binary64"
-        pass_entries = tuple(
-            item for item in (binary.get(leaf_id), promoted.get(leaf_id))
-            if isinstance(item, Mapping)
-        )
-        tier_seconds: dict[str, float] = {}
-        timed_tiers: set[str] = set()
-        for pass_entry in pass_entries:
-            for item in pass_entry.get("tier_timing", ()):
-                if not isinstance(item, Mapping):
-                    continue
-                tier = str(item.get("tier"))
-                elapsed = _optional_seconds(item.get("elapsed_seconds"))
-                if elapsed is None:
-                    continue
-                timed_tiers.add(tier)
-                tier_seconds[tier] = tier_seconds.get(tier, 0.0) + elapsed
-        fragments = tuple(
-            fragment
-            for pass_entry in pass_entries
-            for fragment in pass_entry.get("session_fragments", ())
-        )
-        reconstructed = bool(
-            any(
-                isinstance(item, Mapping)
-                and item.get("source") == "RECONSTRUCTED"
-                for item in fragments
-            )
-        )
-        details = dict(metadata.get(leaf_id, {}))
-        evidence_entry = evidence.get(leaf_id, {})
-        details.update(
-            {
-                "leaf_id": leaf_id,
-                "leaf_ordinal": details.get("leaf_ordinal", ordinal),
-                "survey_pass": pass_name,
-                "evidence_level": evidence_entry.get("evidence_level", "-"),
-                "precision_tier": _latest_precision_tier(record),
-                "sample_count": sum(
-                    int(item.get("sample_count", 0)) for item in pass_entries
-                ),
-                "root_read_count": sum(
-                    int(item.get("root_read_count", 0)) for item in pass_entries
-                ),
-                "worker_launch_count": sum(
-                    int(item.get("worker_launch_count", 0)) for item in pass_entries
-                ),
-                "binary64_seconds": (
-                    tier_seconds.get("binary64")
-                    if "binary64" in timed_tiers
-                    else None
-                ),
-                "bf40_seconds": (
-                    tier_seconds.get("BF40") if "BF40" in timed_tiers else None
-                ),
-                "bf80_seconds": (
-                    tier_seconds.get("BF80") if "BF80" in timed_tiers else None
-                ),
-                "bf120_seconds": (
-                    tier_seconds.get("BF120") if "BF120" in timed_tiers else None
-                ),
-                "total_leaf_seconds": (
-                    sum(tier_seconds.values()) if timed_tiers else None
-                ),
-                "response_magnitude": _record_response_magnitude(record),
-                "relative_disk_radius": _record_relative_error(record),
-                "terminal_state": record["state"],
-                "reconstructed_timing": reconstructed,
-            }
-        )
-        rows.append(details)
-    dispositions = tuple(binary.values()) + tuple(promoted.values())
+    selected: list[str] = []
+    for leaf_id in sorted(
+        metadata,
+        key=lambda item: (
+            metadata[item].get("leaf_ordinal", 2**31)
+            if isinstance(metadata[item], Mapping)
+            else 2**31,
+            item,
+        ),
+    ):
+        selected.append(leaf_id)
+    ledgers = value["survey_pass_ledger"]
+    if isinstance(ledgers, Mapping):
+        for pass_name in ("binary64", "promoted"):
+            ledger = ledgers.get(pass_name)
+            if isinstance(ledger, Mapping):
+                for leaf_id in ledger:
+                    if isinstance(leaf_id, str) and leaf_id not in selected:
+                        selected.append(leaf_id)
+    for record in value["records"]:
+        if isinstance(record, Mapping):
+            leaf_id = record.get("leaf_id")
+            if isinstance(leaf_id, str) and leaf_id not in selected:
+                selected.append(leaf_id)
+    snapshot = project_schema11_dashboard(
+        checkpoint,
+        selected_leaf_ids=selected,
+        leaf_metadata=metadata,
+    )
+    rows = tuple(
+        {
+            "leaf_id": row.leaf_id,
+            "leaf_ordinal": row.leaf_ordinal,
+            "leaf_count": row.leaf_count,
+            "survey_pass": row.survey_pass,
+            "mode": row.mode,
+            "spin_or_Mkappa": row.spin,
+            "mechanism": row.mechanism,
+            "role": row.role,
+            "evidence_level": row.evidence_level,
+            "sample_count": row.sample_count,
+            "binary64_seconds": row.binary64_seconds,
+            "bf40_seconds": row.bf40_seconds,
+            "bf80_seconds": row.bf80_seconds,
+            "bf120_seconds": row.bf120_seconds,
+            "total_leaf_seconds": row.total_leaf_seconds,
+            "response_magnitude": row.response_magnitude,
+            "relative_disk_radius": row.relative_error,
+            "terminal_state": row.state,
+        }
+        for row in (*snapshot.binary64_rows, *snapshot.promoted_rows)
+    )
     counts = {
-        "completed": len(rows),
-        "queued": sum(
-            1
-            for item in value["promotion_queue"]["entries"]
-            if item.get("disposition") == "PENDING"
-        ),
-        "deferred": sum(
-            1 for item in dispositions if item.get("disposition") == "DEFERRED"
-        ),
-        "unresolved": sum(
-            1 for item in dispositions if item.get("disposition") == "UNRESOLVED"
-        ),
-        "rejected": sum(
-            1 for item in dispositions if item.get("disposition") == "REJECTED"
-        ),
-        "system_failures": len(value["system_failures"]),
-        "SCREENED": sum(
-            1 for item in evidence.values()
-            if item.get("evidence_level") == "SCREENED"
-        ),
-        "CERTIFIED": sum(
-            1 for item in evidence.values()
-            if item.get("evidence_level") == "CERTIFIED"
-        ),
-        "VALIDATED": sum(
-            1 for item in evidence.values()
-            if item.get("evidence_level") == "VALIDATED"
-        ),
+        "completed": snapshot.binary64_processed_count
+        + snapshot.promoted_processed_count,
+        "queued": snapshot.pending_count,
+        "deferred": snapshot.deferred_count,
+        "unresolved": snapshot.unresolved_count,
+        "rejected": snapshot.rejected_count,
+        "system_failures": snapshot.system_failure_count,
+        "SCREENED": snapshot.evidence_counts["SCREENED"],
+        "CERTIFIED": snapshot.evidence_counts["CERTIFIED"],
+        "VALIDATED": snapshot.evidence_counts["VALIDATED"],
     }
-    report = value.get("report_status_receipt")
-    report_status: dict[str, object] = {}
-    if isinstance(report, Mapping):
-        for name in ("basic", "projective", "triage"):
-            item = report.get(name)
-            report_status[name] = (
-                item.get("status", "UNKNOWN") if isinstance(item, Mapping) else "UNKNOWN"
-            )
-    return tuple(rows), counts, report_status
+    return rows, counts, dict(snapshot.report_status)
 
 
 def _finite_seconds(value: object) -> float:
@@ -1035,7 +1270,7 @@ def _record_relative_error(record: Mapping[str, object]) -> object:
 
 
 class Schema11ProgressReporter:
-    """Drive the PR65 clean-tail view from typed progress and checkpoint state."""
+    """Synchronise one append-only schema-11 view from committed checkpoints."""
 
     def __init__(
         self,
@@ -1055,11 +1290,15 @@ class Schema11ProgressReporter:
         self.pass_name = pass_name
         self.mode = ProgressMode(mode)
         self._started_monotonic = time.monotonic()
-        self.stream = stream or sys.stdout
+        # Human dashboard output is intentionally out-of-band from the CLI's
+        # canonical JSON result.  In particular, m02.ps1 captures stdout so
+        # it can parse that JSON; sending this stream to stdout would swallow
+        # the dashboard before it reaches the operator console.
+        self.stream = sys.stderr if stream is None else stream
         self.dashboard = (
             None
             if self.mode is ProgressMode.QUIET
-            else CleanTailDashboard(self.stream, width=width, ansi=False)
+            else AppendOnlySchema11Dashboard(self.stream)
         )
         self.diagnostics: list[str] = []
         self._live: dict[str, object] = {
@@ -1095,10 +1334,17 @@ class Schema11ProgressReporter:
         self._current_live_event: dict[str, object] | None = None
         self._last_nonterminal_event: dict[str, object] | None = None
         self._terminal_event: dict[str, object] | None = None
+        self._terminal_event_object: ProgressEvent | None = None
         self._active_leaf_at_terminal_event: dict[str, object] | None = None
         self._last_committed_leaf: dict[str, object] | None = None
         self._next_intended_leaf: dict[str, object] | None = None
         self._terminal_failure: dict[str, object] | None = None
+        self._opened = False
+        self._closed = False
+        self._dashboard_degraded = False
+        self._terminal_summary_emitted = False
+        self._emitted_leaf_ids: set[str] = set()
+        self._snapshot: Schema11DashboardSnapshot | None = None
         ordered_metadata = sorted(
             (
                 (value.get("leaf_ordinal"), leaf_id)
@@ -1112,56 +1358,125 @@ class Schema11ProgressReporter:
             for index, (_ordinal, leaf_id) in enumerate(ordered_metadata[:-1])
         }
         self._counts: dict[str, int] = {}
-        self._start_from_checkpoint()
         self._write_status(None)
 
     def _load(self) -> Mapping[str, object] | None:
         if not self.checkpoint.is_file():
             return None
-        value = json.loads(self.checkpoint.read_text(encoding="utf-8"))
+        try:
+            value = json.loads(self.checkpoint.read_text(encoding="utf-8"))
+        except (FileNotFoundError, json.JSONDecodeError, UnicodeDecodeError):
+            # An atomic checkpoint replacement can be observed between the
+            # existence check and the read.  The next safe event retries it.
+            return None
         if not isinstance(value, Mapping):
             raise ValueError("schema-11 progress checkpoint is not an object")
         return value
 
-    def _snapshot(self):
-        value = self._load()
-        if value is None:
-            return (), {}, {}
-        return schema11_dashboard_snapshot(
-            value, leaf_metadata=self.leaf_metadata
+    def _selected_leaf_ids(self, value: Mapping[str, object]) -> tuple[str, ...]:
+        selected: list[str] = []
+        ordered_metadata = sorted(
+            self.leaf_metadata.items(),
+            key=lambda item: (
+                item[1].get("leaf_ordinal", 2**31)
+                if isinstance(item[1], Mapping)
+                else 2**31,
+                item[0],
+            ),
+        )
+        for leaf_id, _metadata in ordered_metadata:
+            if leaf_id not in selected:
+                selected.append(leaf_id)
+        ledgers = value.get("survey_pass_ledger")
+        if isinstance(ledgers, Mapping):
+            for pass_name in ("binary64", "promoted"):
+                ledger = ledgers.get(pass_name)
+                if isinstance(ledger, Mapping):
+                    for leaf_id in ledger:
+                        if isinstance(leaf_id, str) and leaf_id not in selected:
+                            selected.append(leaf_id)
+        records = value.get("records")
+        if isinstance(records, list):
+            for record in records:
+                if isinstance(record, Mapping):
+                    leaf_id = record.get("leaf_id")
+                    if isinstance(leaf_id, str) and leaf_id not in selected:
+                        selected.append(leaf_id)
+        return tuple(selected)
+
+    def _project(self, value: Mapping[str, object]) -> Schema11DashboardSnapshot:
+        return project_schema11_dashboard(
+            value,
+            selected_leaf_ids=self._selected_leaf_ids(value),
+            leaf_metadata=self.leaf_metadata,
         )
 
+    def _snapshot_from_checkpoint(self) -> Schema11DashboardSnapshot | None:
+        value = self._load()
+        if value is None:
+            return None
+        return self._project(value)
+
+    def rows_for_current_view(
+        self, snapshot: Schema11DashboardSnapshot
+    ) -> tuple[Schema11DashboardRow | Schema11EvidenceRow, ...]:
+        if self.profile in {"certify", "validate"}:
+            return snapshot.evidence_rows
+        if str(self.pass_name).lower() == "promoted":
+            return snapshot.promoted_rows
+        return snapshot.binary64_rows
+
+    def _active_pass_label(self, snapshot: Schema11DashboardSnapshot) -> str:
+        if self.profile in {"certify", "validate"}:
+            return self.profile
+        if str(self.pass_name).lower() == "promoted":
+            return "promoted"
+        return "binary64"
+
+    def sync_from_checkpoint(self) -> Schema11DashboardSnapshot:
+        """Project once, append only unseen durable rows, then write status."""
+
+        snapshot = self._snapshot_from_checkpoint()
+        if snapshot is None:
+            if self._snapshot is not None:
+                return self._snapshot
+            from .campaign_policy import empty_schema11_checkpoint
+
+            snapshot = project_schema11_dashboard(
+                empty_schema11_checkpoint("unavailable", "unavailable"),
+                selected_leaf_ids=(),
+                leaf_metadata={},
+            )
+        rows = self.rows_for_current_view(snapshot)
+        if self._opened and self.dashboard is not None and not self._dashboard_degraded:
+            new_rows = sorted(
+                (row for row in rows if row.leaf_id not in self._emitted_leaf_ids),
+                key=lambda row: (
+                    row.leaf_ordinal if row.leaf_ordinal is not None else 2**31,
+                    row.leaf_id,
+                ),
+            )
+            for row in new_rows:
+                self._render(lambda row=row: self.dashboard.append_row(row))
+                if not self._dashboard_degraded:
+                    self._emitted_leaf_ids.add(row.leaf_id)
+        self._snapshot = snapshot
+        self._counts = dict(snapshot.counts)
+        self._write_status_from(snapshot, None)
+        return snapshot
+
     def _start_from_checkpoint(self) -> None:
-        try:
-            rows, counts, report_status = self._snapshot()
-            self._counts = dict(counts)
-            if self.dashboard is not None:
-                self.dashboard.start(
-                    rows,
-                    counts=counts,
-                    profile=self.profile,
-                    pass_name=self.pass_name,
-                    report_status=report_status,
-                )
-        except Exception as error:
-            self.diagnostics.append(f"{type(error).__name__}: {error}")
-            if self.dashboard is not None:
-                self.dashboard.start(
-                    (),
-                    counts={"checkpoint": "UNAVAILABLE"},
-                    profile=self.profile,
-                    pass_name=self.pass_name,
-                    report_status={"basic": "DEGRADED"},
-                )
+        # Kept as a compatibility hook for callers that used the old private
+        # method.  Schema-11 opens only in response to an approved event.
+        return None
 
     def publish(self, event: ProgressEvent) -> None:
         try:
-            context = event.context.to_mapping()
-            payload = dict(event.payload)
             event_snapshot = self._event_snapshot(event)
             terminal = self._is_terminal_event(event.kind)
             if terminal:
                 self._terminal_event = event_snapshot
+                self._terminal_event_object = event
                 self._active_leaf_at_terminal_event = self._current_live_event
                 self._current_live_event = None
                 self._terminal_failure = self._terminal_failure_snapshot(event)
@@ -1170,7 +1485,7 @@ class Schema11ProgressReporter:
                 self._last_nonterminal_event = event_snapshot
                 if event.kind is ProgressEventKind.LEAF_PASS_DISPOSITION_RECORDED:
                     self._last_committed_leaf = event_snapshot
-                    leaf_id = context.get("leaf_id")
+                    leaf_id = event.context.leaf_id
                     if isinstance(leaf_id, str):
                         next_leaf_id = self._next_leaf_by_id.get(leaf_id)
                         if next_leaf_id is not None:
@@ -1178,110 +1493,174 @@ class Schema11ProgressReporter:
                                 "leaf_id": next_leaf_id,
                                 **dict(self.leaf_metadata[next_leaf_id]),
                             }
-            leaf_id = context.get("leaf_id")
-            metadata = (
-                self.leaf_metadata.get(leaf_id, {})
-                if isinstance(leaf_id, str)
-                else {}
-            )
-            leaf_index = context.get("leaf_index", metadata.get("leaf_ordinal"))
-            leaf_count = context.get("leaf_count", metadata.get("leaf_count"))
-
-            def _scalar_or_none(value):
-                if value is None or isinstance(
-                    value, (Mapping, list, tuple, set, frozenset)
-                ):
-                    return None
-                if isinstance(value, str) and not value:
-                    return None
-                return value
-
             if not terminal:
-                self._live.update(
-                    {
-                        "elapsed": f"{max(0.0, event.monotonic_seconds - self._started_monotonic):.1f}s",
-                        "counts": _count_text(self._counts),
-                        "leaf": (
-                            None
-                            if leaf_index is None
-                            else f"{leaf_index}/{leaf_count or '?'}"
-                        ),
-                        "profile": _scalar_or_none(
-                            context.get("execution_profile", self.profile)
-                        ),
-                        "pass": _scalar_or_none(
-                            context.get("survey_pass", self.pass_name)
-                        ),
-                        "root": _scalar_or_none(context.get("root_phase")),
-                        "mode": (
-                            _scalar_or_none(context.get("mode"))
-                            or _scalar_or_none(metadata.get("mode"))
-                        ),
-                        "spin": (
-                            _scalar_or_none(context.get("spin"))
-                            or _scalar_or_none(metadata.get("spin_or_Mkappa"))
-                            or _scalar_or_none(metadata.get("spin"))
-                        ),
-                        "role": (
-                            _scalar_or_none(context.get("role"))
-                            or _scalar_or_none(metadata.get("role"))
-                        ),
-                        "mechanism": (
-                            _scalar_or_none(context.get("mechanism_id"))
-                            or _scalar_or_none(metadata.get("mechanism"))
-                        ),
-                        "tier": _scalar_or_none(context.get("precision_tier")),
-                        "phase": _scalar_or_none(
-                            context.get("phase", event.kind.value)
-                        ),
-                        "sample": _ratio(
-                            context.get("sample_count_used"),
-                            context.get("sample_count_limit"),
-                        ),
-                        "root_reads": _ratio(
-                            context.get("root_read_count"),
-                            context.get("root_read_limit"),
-                        ),
-                        "metric": _scalar_or_none(
-                            payload.get(
-                                "current_metric", payload.get("determinant_abs")
-                            )
-                        ),
-                        "suboperation": _scalar_or_none(context.get("suboperation")),
-                        "timing": _scalar_or_none(context.get("total_leaf_seconds")),
-                        "last_activity_age": _scalar_or_none(
-                            payload.get("last_activity_age_seconds")
-                        ),
-                    }
+                self._update_live(event)
+
+            if not self._opened and event.kind in self._opening_kinds():
+                self._open(event, terminal=terminal)
+
+            if event.kind in self._sync_kinds() or terminal:
+                snapshot = self.sync_from_checkpoint()
+            else:
+                snapshot = self._snapshot
+
+            if terminal and self._opened and snapshot is not None:
+                if self.dashboard is not None and not self._dashboard_degraded:
+                    self._render(
+                        lambda: self.dashboard.append_terminal_summary(
+                            snapshot, event
+                        )
+                    )
+                if not self._dashboard_degraded:
+                    self._terminal_summary_emitted = True
+            elif snapshot is not None:
+                self._write_status_from(snapshot, event)
+        except Exception as error:
+            self._degrade(error)
+            self._safe_write_status()
+
+    def close(self) -> None:
+        try:
+            snapshot = self.sync_from_checkpoint()
+            if (
+                self._terminal_event is not None
+                and not self._terminal_summary_emitted
+                and self._opened
+                and self.dashboard is not None
+                and not self._dashboard_degraded
+            ):
+                event = self._terminal_event_object
+                if event is None:
+                    raise ValueError("terminal event object is unavailable")
+                self._render(
+                    lambda: self.dashboard.append_terminal_summary(snapshot, event)
                 )
-            if event.kind is ProgressEventKind.LEAF_PASS_DISPOSITION_RECORDED:
-                rows, counts, _status = self._snapshot()
-                self._counts = dict(counts)
-                leaf_id = context.get("leaf_id")
-                for row in rows:
-                    if row["leaf_id"] == leaf_id:
-                        if self.dashboard is not None:
-                            self.dashboard.complete(row)
-                        break
-            elif event.kind in {
+                if not self._dashboard_degraded:
+                    self._terminal_summary_emitted = True
+            self._closed = True
+        except Exception as error:
+            self._degrade(error)
+            self._safe_write_status()
+
+    @staticmethod
+    def _opening_kinds() -> frozenset[ProgressEventKind]:
+        return frozenset(
+            {
+                ProgressEventKind.LEAF_PASS_STARTED,
                 ProgressEventKind.CAMPAIGN_PASS_COMPLETED,
+                ProgressEventKind.CAMPAIGN_PASS_INTERRUPTED,
                 ProgressEventKind.CAMPAIGN_COMPLETED,
                 ProgressEventKind.CAMPAIGN_FAILED,
                 ProgressEventKind.CAMPAIGN_INTERRUPTED,
                 ProgressEventKind.SYSTEM_FAILURE_RECORDED,
-            }:
-                if self.dashboard is not None:
-                    self.dashboard.finish_live()
-            elif self.dashboard is not None:
-                self.dashboard.live(self._live)
-            self._write_status(event)
-        except Exception as error:
-            self.diagnostics.append(f"{type(error).__name__}: {error}")
+            }
+        )
 
-    def close(self) -> None:
-        if self.dashboard is not None:
-            self.dashboard.finish_live()
-        self._write_status(None)
+    @staticmethod
+    def _sync_kinds() -> frozenset[ProgressEventKind]:
+        return frozenset(
+            {
+                ProgressEventKind.CHECKPOINT_WRITTEN,
+                ProgressEventKind.LEAF_PASS_DISPOSITION_RECORDED,
+                ProgressEventKind.PROMOTION_QUEUED,
+                ProgressEventKind.REPORT_STATUS_CHANGED,
+                ProgressEventKind.SYSTEM_FAILURE_RECORDED,
+            }
+        )
+
+    def _open(self, event: ProgressEvent, *, terminal: bool) -> None:
+        snapshot = self._snapshot_from_checkpoint()
+        if snapshot is None:
+            return
+        self._snapshot = snapshot
+        self._counts = dict(snapshot.counts)
+        rows = self.rows_for_current_view(snapshot)
+        self._opened = True
+        if self.dashboard is not None and not self._dashboard_degraded:
+            self._render(
+                lambda: self.dashboard.start(
+                    snapshot,
+                    rows,
+                    profile=self.profile,
+                    active_pass=self._active_pass_label(snapshot),
+                    running=None if terminal else self._live,
+                    terminal=terminal,
+                )
+            )
+        # The initial display is intentionally only the latest fourteen rows,
+        # but every already-settled ID is known so omitted history never
+        # reappears after the first checkpoint refresh.
+        self._emitted_leaf_ids.update(row.leaf_id for row in rows)
+        self._write_status_from(snapshot, event)
+
+    def _update_live(self, event: ProgressEvent) -> None:
+        context = event.context.to_mapping()
+        leaf_id = context.get("leaf_id")
+        metadata = (
+            self.leaf_metadata.get(leaf_id, {})
+            if isinstance(leaf_id, str)
+            else {}
+        )
+
+        def scalar(value: object) -> object | None:
+            if value is None or isinstance(value, Mapping):
+                return None
+            if isinstance(value, str) and not value:
+                return None
+            return value
+
+        leaf_index = context.get("leaf_index", metadata.get("leaf_ordinal"))
+        leaf_count = context.get("leaf_count", metadata.get("leaf_count"))
+        self._live.update(
+            {
+                "leaf": (
+                    None
+                    if leaf_index is None
+                    else f"{leaf_index}/{leaf_count or '?'}"
+                ),
+                "mode": scalar(context.get("mode")) or scalar(metadata.get("mode")),
+                "spin": (
+                    scalar(context.get("spin"))
+                    or scalar(metadata.get("spin_or_Mkappa"))
+                    or scalar(metadata.get("spin"))
+                ),
+                "mechanism": scalar(context.get("mechanism_id")) or scalar(
+                    metadata.get("mechanism")
+                ),
+                "tier": scalar(context.get("precision_tier")),
+                "role": scalar(context.get("role")) or scalar(metadata.get("role")),
+                "phase": scalar(context.get("phase", event.kind.value)),
+                "elapsed": f"{max(0.0, event.monotonic_seconds - self._started_monotonic):.1f}s",
+            }
+        )
+
+    def _render(self, action) -> None:
+        if self.dashboard is None or self._dashboard_degraded:
+            return
+        try:
+            action()
+        except Exception as error:
+            self._degrade(error)
+
+    def _degrade(self, error: Exception) -> None:
+        diagnostic = f"{type(error).__name__}: {error}"
+        self.diagnostics.append(diagnostic)
+        if self._dashboard_degraded:
+            return
+        self._dashboard_degraded = True
+        try:
+            self.stream.write("DASHBOARD DEGRADED\n")
+            self.stream.flush()
+        except Exception:
+            pass
+
+    def _safe_write_status(self) -> None:
+        try:
+            snapshot = self._snapshot or self._snapshot_from_checkpoint()
+            if snapshot is not None:
+                self._write_status_from(snapshot, None)
+        except Exception as error:
+            self.diagnostics.append(f"status {type(error).__name__}: {error}")
 
     @staticmethod
     def _is_terminal_event(kind: ProgressEventKind) -> bool:
@@ -1326,18 +1705,68 @@ class Schema11ProgressReporter:
         return {"event_kind": event.kind.value, **meaningful}
 
     def _write_status(self, event: ProgressEvent | None) -> None:
+        snapshot = self._snapshot or self._snapshot_from_checkpoint()
+        if snapshot is None:
+            return
+        self._write_status_from(snapshot, event)
+
+    def _write_status_from(
+        self,
+        snapshot: Schema11DashboardSnapshot,
+        event: ProgressEvent | None,
+    ) -> None:
         path = Path(f"{self.checkpoint}.status.json")
         path.parent.mkdir(parents=True, exist_ok=True)
-        rows, counts, reports = self._snapshot()
+        current_rows = self.rows_for_current_view(snapshot)
+        numerical_records: list[str] = []
+        value = self._load()
+        if value is not None and isinstance(value.get("records"), list):
+            numerical_records = [
+                str(record["leaf_id"])
+                for record in value["records"]
+                if isinstance(record, Mapping)
+                and record.get("state") == "PRODUCED"
+                and isinstance(record.get("leaf_id"), str)
+            ]
+        active_leaf = None
+        if self._current_live_event is not None:
+            active_leaf = dict(self._current_live_event.get("context", {}))
+            active_leaf["event_kind"] = self._current_live_event.get("kind")
         status = {
             "schema": "windows-solver.schema11-progress-status/2",
             "checkpoint_path": str(self.checkpoint),
             "profile": self.profile,
             "survey_pass": self.pass_name,
-            "counts": counts,
-            "report_status": reports,
-            "completed_leaf_ids": [row["leaf_id"] for row in rows],
+            "selected_leaf_count": snapshot.selected_leaf_count,
+            "binary64_processed_count": snapshot.binary64_processed_count,
+            "promoted_processed_count": snapshot.promoted_processed_count,
+            "produced_count": snapshot.produced_count,
+            "pending_count": snapshot.pending_count,
+            "pending_by_minimum_tier": dict(snapshot.pending_by_minimum_tier),
+            "retained_binary64_sample_count": snapshot.retained_binary64_sample_count,
+            "deferred_count": snapshot.deferred_count,
+            "unresolved_count": snapshot.unresolved_count,
+            "rejected_count": snapshot.rejected_count,
+            "system_failure_count": snapshot.system_failure_count,
+            "evidence_counts": dict(snapshot.evidence_counts),
+            "settled_leaf_ids": list(snapshot.settled_leaf_ids),
+            "printed_leaf_ids": [
+                row.leaf_id
+                for row in current_rows
+                if row.leaf_id in self._emitted_leaf_ids
+            ],
+            "presentation": {
+                "opened": self._opened,
+                "emitted_leaf_ids": sorted(self._emitted_leaf_ids),
+                "terminal_summary_emitted": self._terminal_summary_emitted,
+            },
+            "counts": snapshot.counts,
+            "report_status": dict(snapshot.report_status),
+            # The legacy name is retained only for explicit numerical records;
+            # it is never used for human dashboard progress.
+            "completed_leaf_ids": numerical_records,
             "live_execution": dict(self._live),
+            "active_leaf": active_leaf,
             "current_live_event": self._current_live_event,
             "last_nonterminal_event": self._last_nonterminal_event,
             "terminal_event": self._terminal_event,

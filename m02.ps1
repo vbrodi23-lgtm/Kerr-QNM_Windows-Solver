@@ -50,6 +50,22 @@ function Invoke-M02Command([string[]]$Arguments) {
     }
 }
 
+function Get-OptionalProperty {
+    param(
+        [object]$Object,
+        [string]$Name,
+        [object]$DefaultValue = $null
+    )
+    if ($null -eq $Object) {
+        return $DefaultValue
+    }
+    $Property = $Object.PSObject.Properties[$Name]
+    if ($null -eq $Property) {
+        return $DefaultValue
+    }
+    return $Property.Value
+}
+
 if ($SkipBootstrap -and $RebuildRuntime) {
     throw "-SkipBootstrap and -RebuildRuntime cannot be used together."
 }
@@ -209,6 +225,29 @@ try {
         $SelectionPath,
         "--checkpoint", $CheckpointPath
     ) | ConvertFrom-Json
+    $SelectedLeafCount = Get-OptionalProperty `
+        $CheckpointStatus "selected_leaf_count" $CampaignPlan.leaf_count
+    $Binary64Processed = Get-OptionalProperty `
+        $CheckpointStatus "binary64_processed_count" `
+        (Get-OptionalProperty $CheckpointStatus "binary64_pass_count" 0)
+    $PromotedProcessed = Get-OptionalProperty `
+        $CheckpointStatus "promoted_processed_count" 0
+    $ProducedCount = Get-OptionalProperty `
+        $CheckpointStatus "produced_count" `
+        (Get-OptionalProperty $CheckpointStatus "recovered_terminal_count" 0)
+    $PendingCount = Get-OptionalProperty `
+        $CheckpointStatus "pending_count" `
+        (Get-OptionalProperty $CheckpointStatus "promotion_queue_count" 0)
+    $PendingByMinimumTier = Get-OptionalProperty `
+        $CheckpointStatus "pending_by_minimum_tier" @{}
+    $PendingBF40 = Get-OptionalProperty $PendingByMinimumTier "BF40" 0
+    $PendingBF80 = Get-OptionalProperty $PendingByMinimumTier "BF80" 0
+    $RecoveredTerminalCount = Get-OptionalProperty `
+        $CheckpointStatus "recovered_terminal_count" $ProducedCount
+    $EvidenceCounts = Get-OptionalProperty `
+        $CheckpointStatus "evidence_counts" @{}
+    $BasicReportDirectory = Get-OptionalProperty `
+        $CheckpointStatus "basic_report_directory" "-"
     Write-Host "M02 campaign startup" -ForegroundColor Cyan
     Write-Host ("    Resolved checkpoint      : {0}" -f $CheckpointPath)
     Write-Host ("    Selected command         : {0}" -f $Command)
@@ -222,11 +261,18 @@ try {
     Write-Host ("    Survey pass              : {0}" -f $SelectedSurveyPass)
     Write-Host ("    Selection ID             : {0}" -f $CheckpointStatus.selection_id)
     Write-Host ("    Checkpoint schema        : {0}" -f $CheckpointStatus.schema_version)
-    Write-Host ("    Recovered terminal count : {0}" -f $CheckpointStatus.recovered_terminal_count)
-    Write-Host ("    Binary64 pass count      : {0}" -f $CheckpointStatus.binary64_pass_count)
-    Write-Host ("    Promotion queue count    : {0}" -f $CheckpointStatus.promotion_queue_count)
-    Write-Host ("    Evidence counts          : {0}" -f ($CheckpointStatus.evidence_counts | ConvertTo-Json -Compress))
-    Write-Host ("    Basic report directory   : {0}" -f $CheckpointStatus.basic_report_directory)
+    Write-Host ("    Selected leaf count      : {0}" -f $SelectedLeafCount)
+    Write-Host ("    Binary64 processed       : {0}/{1}" -f $Binary64Processed, $SelectedLeafCount)
+    Write-Host ("    Binary64 pass count      : {0}" -f $Binary64Processed)
+    Write-Host ("    Promoted processed       : {0}" -f $PromotedProcessed)
+    Write-Host ("    Produced                 : {0}" -f $ProducedCount)
+    Write-Host ("    Pending                  : {0}" -f $PendingCount)
+    Write-Host ("    Promotion queue count    : {0}" -f $PendingCount)
+    Write-Host ("    Pending BF40             : {0}" -f $PendingBF40)
+    Write-Host ("    Pending BF80             : {0}" -f $PendingBF80)
+    Write-Host ("    Recovered terminal count : {0}" -f $RecoveredTerminalCount)
+    Write-Host ("    Evidence counts          : {0}" -f ($EvidenceCounts | ConvertTo-Json -Compress))
+    Write-Host ("    Basic report directory   : {0}" -f $BasicReportDirectory)
     Write-Host ("    Status path              : {0}" -f "$CheckpointPath.status.json")
     $RunArguments = @(
         $Command,
@@ -238,7 +284,14 @@ try {
     if ($null -ne $ResolvedQueuePath) {
         $RunArguments += @("--queue", $ResolvedQueuePath)
     }
-    Invoke-M02Command -Arguments $RunArguments
+    # Capture canonical command JSON without merging it with the human
+    # dashboard stream.  The reporter writes dashboard text to stderr; the
+    # solver's final _emit() result remains stdout and is parsed here.
+    $RunOutput = @(Invoke-M02Command -Arguments $RunArguments)
+    $RunJsonText = ($RunOutput | ForEach-Object { [string]$_ }) -join [Environment]::NewLine
+    if (-not [string]::IsNullOrWhiteSpace($RunJsonText)) {
+        $RunResult = $RunJsonText | ConvertFrom-Json
+    }
     $ValidationPass = if ($Profile -eq "survey") {
         $SurveyPass
     }
