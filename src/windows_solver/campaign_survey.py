@@ -2356,6 +2356,9 @@ def _commit_promoted_outcome(
         in {
             SurveyDisposition.COMPLETED,
             SurveyDisposition.CALCULATED_AWAITING_ADMISSION,
+            SurveyDisposition.UNRESOLVED,
+            SurveyDisposition.DEFERRED,
+            SurveyDisposition.REJECTED,
         }
     ):
         if layer1_lock_receipt_sha256 is None:
@@ -3277,14 +3280,10 @@ def run_promoted_survey(
             layer1_guard=layer1_guard,
         ))
         assert isinstance(result, dict)
-        if (
-            outcome.disposition
-            is SurveyDisposition.CALCULATED_AWAITING_ADMISSION
-            or (
-                execution_mode is PromotedExecutionMode.CALCULATE_ONLY
-                and outcome.disposition is SurveyDisposition.COMPLETED
-            )
-        ):
+        queue_disposition = result["promotion_queue"]["entries"][ordinal][
+            "disposition"
+        ]
+        if queue_disposition == PromotionQueueDisposition.AWAITING_ADMISSION.value:
             review_pending += 1
         elif outcome.disposition is SurveyDisposition.COMPLETED:
             completed += 1
@@ -3338,12 +3337,17 @@ def run_promoted_survey(
                     error=error,
                     persist_checkpoint=lambda value: persist(value),
                 )
-        if outcome.disposition not in {
-            SurveyDisposition.COMPLETED,
-            SurveyDisposition.CALCULATED_AWAITING_ADMISSION,
-            SurveyDisposition.CACHE_REUSED,
-            SurveyDisposition.SUPERSEDED_BY_CACHE,
-        } and execution_mode is not PromotedExecutionMode.BLOCK_ALL:
+        if (
+            queue_disposition
+            != PromotionQueueDisposition.AWAITING_ADMISSION.value
+            and outcome.disposition not in {
+                SurveyDisposition.COMPLETED,
+                SurveyDisposition.CALCULATED_AWAITING_ADMISSION,
+                SurveyDisposition.CACHE_REUSED,
+                SurveyDisposition.SUPERSEDED_BY_CACHE,
+            }
+            and execution_mode is not PromotedExecutionMode.BLOCK_ALL
+        ):
             report = _survey_failure_report(
                 leaf,
                 survey_pass="promoted",

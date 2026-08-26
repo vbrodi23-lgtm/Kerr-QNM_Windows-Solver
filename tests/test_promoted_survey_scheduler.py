@@ -328,6 +328,7 @@ class PromotedSurveySchedulerTests(unittest.TestCase):
         flat40=False,
         flat80=False,
         failure40: str | None = None,
+        failure80: str | None = None,
         root_runner=None,
         diagnostic_session=None,
         calculate_only=False,
@@ -364,7 +365,7 @@ class PromotedSurveySchedulerTests(unittest.TestCase):
                     leaf, digits,
                     flat40 if digits == 40 else flat80,
                     calls,
-                    failure40 if digits == 40 else None,
+                    failure40 if digits == 40 else failure80,
                 ),
                 primary_root_runner=(
                     root_runner
@@ -504,6 +505,32 @@ class PromotedSurveySchedulerTests(unittest.TestCase):
             [9, 4],
             [promoted_ledger[leaf.leaf_id]["sample_count"] for leaf in self.leaves],
         )
+
+    def test_calculate_only_retains_bf80_numerical_exhaustion_without_screening(self):
+        result, calls = self._run(
+            self._checkpoint(),
+            calculate_only=True,
+            failure40="INSUFFICIENT_ASYMPTOTIC_PRECISION",
+            failure80="INSUFFICIENT_ASYMPTOTIC_PRECISION",
+        )
+
+        leaf_id = self.leaves[0].leaf_id
+        queue_entry = result.checkpoint["promotion_queue"]["entries"][0]
+        retained = result.checkpoint["promoted_stage_ledger"]["0"][leaf_id]
+        self.assertEqual([40, 80], calls)
+        self.assertEqual("AWAITING_ADMISSION", queue_entry["disposition"])
+        self.assertEqual(
+            "CALCULATED_AWAITING_ADMISSION",
+            result.checkpoint["survey_pass_ledger"]["promoted"][leaf_id][
+                "disposition"
+            ],
+        )
+        self.assertEqual(
+            "INSUFFICIENT_ASYMPTOTIC_PRECISION", retained["reason_code"]
+        )
+        self.assertEqual(["BF40", "BF80"], retained["precision_tiers"])
+        self.assertEqual({}, result.checkpoint["evidence_ledger"])
+        self.assertEqual([], result.checkpoint["records"])
 
     def test_resume_reloads_promoted_background_without_reacquiring_it(self):
         first, _ = self._run(

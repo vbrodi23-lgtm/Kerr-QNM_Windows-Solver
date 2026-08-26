@@ -308,6 +308,14 @@ class Binary64SurveySchedulerTests(unittest.TestCase):
             {item["provisional_stage_sha256"] for item in exterior_queue},
             set(published_provisional_stage_sha256s),
         )
+        self.assertEqual(
+            928,
+            sum(
+                item["provisional_stage"]["raw_sample_count"]
+                for item in exterior_queue
+            ),
+        )
+        self.assertEqual(928, backend.determinant_calls)
         self.assertEqual(0, backend.julia_launches)
         self.assertTrue(all(
             entry["worker_launch_count"] == 0 for entry in pass_ledger.values()

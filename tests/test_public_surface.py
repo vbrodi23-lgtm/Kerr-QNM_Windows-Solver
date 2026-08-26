@@ -1321,6 +1321,8 @@ $candidate | ConvertTo-Json -Compress | Set-Content -LiteralPath $env:M02_TEST_J
             "windows-solver.recovery-summary/v1",
             "windows-solver.root-readout-recovery-index/v1",
             "windows-solver.promoted-cache-supersession/v1",
+            "promoted-policy-preflight/v1",
+            "promoted-independent-review-admission/v1",
             "windows-solver.system-failure/v1",
             "windows-solver.m02-report-status/v1",
             "windows-solver.m02-schema11-report-status/v1",
