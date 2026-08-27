@@ -27,6 +27,7 @@ from .campaign_record_intake import assess_campaign_record_for_current_runtime
 from .campaign_policy import (
     CAMPAIGN_CHECKPOINT_SCHEMA_VERSION as SCHEMA11_VERSION,
     EvidenceLevel,
+    PromotionQueueDisposition,
     empty_schema11_checkpoint,
     validate_schema11_checkpoint,
 )
@@ -349,6 +350,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     campaign_admit_promoted.add_argument(
         "--review-receipt", type=Path, required=True
+    )
+    campaign_admit_promoted.add_argument(
+        "--calibration-receipt-path", type=Path, required=True
+    )
+    campaign_admit_promoted.add_argument(
+        "--calibration-receipt-sha256", required=True
     )
     for name, help_text in (
         ("campaign-survey-binary64", "run only the schema-11 binary64 survey pass"),
@@ -1288,7 +1295,12 @@ def _campaign_schema11_validate(
         pending = [
             item
             for item in checkpoint["promotion_queue"]["entries"]
-            if item["disposition"] == "PENDING"
+            if item["disposition"]
+            in {
+                PromotionQueueDisposition.PENDING.value,
+                PromotionQueueDisposition.CALCULATED_PENDING_DERIVATION.value,
+                PromotionQueueDisposition.NUMERICAL_CONTINUATION.value,
+            }
         ]
         if any(
             item["leaf_id"] not in _recovery.scientific_identities
@@ -1353,6 +1365,8 @@ def _campaign_admit_promoted(
     binary64_lock_path: Path,
     queue_ordinal: int,
     review_receipt_path: Path,
+    calibration_receipt_path: Path,
+    calibration_receipt_sha256: str,
 ) -> tuple[int, object]:
     (
         plan,
@@ -1366,6 +1380,10 @@ def _campaign_admit_promoted(
         _resolve_recovery_path(review_receipt_path),
         "independent promoted review receipt",
     )
+    calibration_receipt = load_calibration_receipt(
+        _resolve_recovery_path(calibration_receipt_path),
+        calibration_receipt_sha256,
+    )
     from .campaign_runtime import run_native_promoted_admission
 
     result = run_native_promoted_admission(
@@ -1377,6 +1395,7 @@ def _campaign_admit_promoted(
         binary64_lock_path=_resolve_recovery_path(binary64_lock_path),
         queue_ordinal=queue_ordinal,
         independent_review_receipt=review_receipt,
+        calibration_receipt=calibration_receipt,
     )
     return 0, {
         "command": "campaign-admit-promoted",
@@ -2236,6 +2255,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 binary64_lock_path=arguments.binary64_lock,
                 queue_ordinal=arguments.queue_ordinal,
                 review_receipt_path=arguments.review_receipt,
+                calibration_receipt_path=arguments.calibration_receipt_path,
+                calibration_receipt_sha256=arguments.calibration_receipt_sha256,
             )
         elif arguments.command in {
             "campaign-run", "campaign-resume", "campaign-validate"

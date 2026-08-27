@@ -944,33 +944,6 @@ def run_binary64_survey(
                 )
                 raise AssertionError("system failure abort returned unexpectedly")
 
-        def checkpoint_raw_outcome(raw: PromotedPassOutcome) -> str:
-            """Persist a worker return before any reducer consumes it."""
-
-            nonlocal result, committed_before_leaf
-            result = guarded(lambda: _commit_promoted_raw_calculation(
-                result,
-                leaf=leaf,
-                queue_ordinal=ordinal,
-                route=expected_route,
-                outcome=raw,
-                execution_preflight=execution_preflight,
-                layer1_lock_receipt_sha256=layer1_lock_receipt_sha256,
-                scientific_computation_identity=(
-                    selection.scientific_identities[leaf_id]
-                ),
-                layer1_guard=layer1_guard,
-            ))
-            assert isinstance(result, dict)
-            result = persist(result)
-            committed_before_leaf = result
-            digest = result["promotion_queue"]["entries"][ordinal][
-                "retained_promoted_stage_sha256"
-            ]
-            if not isinstance(digest, str):
-                raise ValueError("raw promoted checkpoint digest is invalid")
-            return digest
-
         retained = existing_records.get(leaf_id)
         checkpoint_discovery = (
             None if retained is None else _checkpoint_terminal_discovery()
@@ -2039,6 +2012,71 @@ def _resumed_promoted_exterior_outcome(
     calculation, canonical_artifact = _promoted_exterior_calculation_from_mapping(
         artifact
     )
+    background_entry = next(
+        (
+            item
+            for item in promoted_background_cache.values()
+            if isinstance(item, Mapping)
+            and isinstance(item.get("background_receipt"), Mapping)
+            and item["background_receipt"].get("receipt_sha256")
+            == calculation.background.background_receipt_sha256
+        ),
+        None,
+    )
+    if not isinstance(background_entry, Mapping):
+        raise ValueError("retained exterior calculation background is missing")
+    background = background_entry.get("background_batch")
+    if not isinstance(background, JuliaFixedRootSurveyBatch):
+        raise ValueError("retained exterior calculation uses a legacy background")
+    # This is a reducer-owned composition of two retained worker artifacts;
+    # it is not a replacement worker batch and invokes no numerical backend.
+    PromotedFixedRootComposite(
+        background_batch=background,
+        component_batch=calculation.component_batch,
+        background_receipt_sha256=calculation.background.background_receipt_sha256,
+    )
+    receipts = retained_stage.get("receipts")
+    tiers = retained_stage.get("precision_tiers")
+    chain = retained_stage.get("calculation_chain")
+    counters = (
+        retained_stage.get("sample_count"),
+        retained_stage.get("root_read_count"),
+        retained_stage.get("worker_launch_count"),
+    )
+    if (
+        not isinstance(receipts, list)
+        or not isinstance(tiers, list)
+        or not all(isinstance(item, Mapping) for item in receipts)
+        or not all(isinstance(item, Mapping) for item in (chain or []))
+        or not all(isinstance(item, int) and item >= 0 for item in counters)
+    ):
+        raise ValueError("retained exterior calculation state is invalid")
+    stage_sha256 = retained_stage.get("stage_sha256")
+    if not isinstance(stage_sha256, str) or len(stage_sha256) != 64:
+        raise ValueError("retained exterior calculation stage digest is invalid")
+    return PromotedPassOutcome(
+        disposition=SurveyDisposition.CALCULATED_AWAITING_ADMISSION,
+        reason_code="AWAITING_INDEPENDENT_REVIEW_ADMISSION",
+        precision_tiers=tuple(str(item) for item in tiers),
+        operation_identity="promoted-exterior-calculation/v2",
+        sample_count=int(counters[0]),
+        root_read_count=int(counters[1]),
+        worker_launch_count=int(counters[2]),
+        evidence_receipts=tuple(copy.deepcopy(dict(item)) for item in receipts),
+        calculation_artifact=canonical_artifact,
+        source_calculation_stage_sha256=stage_sha256,
+        calculation_chain=tuple(copy.deepcopy(dict(item)) for item in (chain or [])),
+        tier_timing=tuple(
+            copy.deepcopy(dict(item))
+            for item in retained_stage.get("tier_timing", [])
+            if isinstance(item, Mapping)
+        ),
+        session_fragments=tuple(
+            copy.deepcopy(dict(item))
+            for item in retained_stage.get("session_fragments", [])
+            if isinstance(item, Mapping)
+        ),
+    )
 
 
 def _resumed_promoted_horizon_outcome(
@@ -2096,71 +2134,6 @@ def _resumed_promoted_horizon_outcome(
             for item in retained_stage.get("calculation_chain", [])
             if isinstance(item, Mapping)
         ),
-        tier_timing=tuple(
-            copy.deepcopy(dict(item))
-            for item in retained_stage.get("tier_timing", [])
-            if isinstance(item, Mapping)
-        ),
-        session_fragments=tuple(
-            copy.deepcopy(dict(item))
-            for item in retained_stage.get("session_fragments", [])
-            if isinstance(item, Mapping)
-        ),
-    )
-    background_entry = next(
-        (
-            item
-            for item in promoted_background_cache.values()
-            if isinstance(item, Mapping)
-            and isinstance(item.get("background_receipt"), Mapping)
-            and item["background_receipt"].get("receipt_sha256")
-            == calculation.background.background_receipt_sha256
-        ),
-        None,
-    )
-    if not isinstance(background_entry, Mapping):
-        raise ValueError("retained exterior calculation background is missing")
-    background = background_entry.get("background_batch")
-    if not isinstance(background, JuliaFixedRootSurveyBatch):
-        raise ValueError("retained exterior calculation uses a legacy background")
-    # This creates only a reducer-owned view, proving the source requests are
-    # mutually compatible without invoking a numerical backend.
-    PromotedFixedRootComposite(
-        background_batch=background,
-        component_batch=calculation.component_batch,
-        background_receipt_sha256=calculation.background.background_receipt_sha256,
-    )
-    receipts = retained_stage.get("receipts")
-    tiers = retained_stage.get("precision_tiers")
-    chain = retained_stage.get("calculation_chain")
-    counters = (
-        retained_stage.get("sample_count"),
-        retained_stage.get("root_read_count"),
-        retained_stage.get("worker_launch_count"),
-    )
-    if (
-        not isinstance(receipts, list)
-        or not isinstance(tiers, list)
-        or not all(isinstance(item, Mapping) for item in receipts)
-        or not all(isinstance(item, Mapping) for item in (chain or []))
-        or not all(isinstance(item, int) and item >= 0 for item in counters)
-    ):
-        raise ValueError("retained exterior calculation state is invalid")
-    stage_sha256 = retained_stage.get("stage_sha256")
-    if not isinstance(stage_sha256, str) or len(stage_sha256) != 64:
-        raise ValueError("retained exterior calculation stage digest is invalid")
-    return PromotedPassOutcome(
-        disposition=SurveyDisposition.CALCULATED_AWAITING_ADMISSION,
-        reason_code="AWAITING_INDEPENDENT_REVIEW_ADMISSION",
-        precision_tiers=tuple(str(item) for item in tiers),
-        operation_identity="promoted-exterior-calculation/v2",
-        sample_count=int(counters[0]),
-        root_read_count=int(counters[1]),
-        worker_launch_count=int(counters[2]),
-        evidence_receipts=tuple(copy.deepcopy(dict(item)) for item in receipts),
-        calculation_artifact=canonical_artifact,
-        source_calculation_stage_sha256=stage_sha256,
-        calculation_chain=tuple(copy.deepcopy(dict(item)) for item in (chain or [])),
         tier_timing=tuple(
             copy.deepcopy(dict(item))
             for item in retained_stage.get("tier_timing", [])
@@ -2735,6 +2708,10 @@ def _run_promoted_exterior_queue_entry(
                 calculation_artifact=calculation_mapping,
                 calculation_chain=tuple(calculation_chain),
             )
+            # The checkpoint must include the completed numerical timing too;
+            # an interrupt after this point must not erase the duration of a
+            # worker return that is already durable.
+            timing_recorder.complete_tier()
             source_calculation_stage_sha256 = raw_checkpoint(raw_outcome)
             if not isinstance(source_calculation_stage_sha256, str) or len(
                 source_calculation_stage_sha256
@@ -2757,7 +2734,6 @@ def _run_promoted_exterior_queue_entry(
                 source_calculation_stage_sha256=source_calculation_stage_sha256,
                 calculation_chain=tuple(calculation_chain),
             )
-            timing_recorder.complete_tier()
             return outcome
         screening = screen_promoted_fixed_root_samples(
             composite.samples,
@@ -2855,22 +2831,38 @@ def _retained_promoted_stage(
 
     raw_batches: list[dict[str, object]] = []
     disagreement_terms: list[dict[str, object]] = []
+
+    def retain_batch(raw_batch: object) -> None:
+        if not isinstance(raw_batch, Mapping):
+            raise ValueError("promoted calculation batch is invalid")
+        batch = copy.deepcopy(dict(raw_batch))
+        raw_batches.append(batch)
+        samples = batch.get("samples")
+        if not isinstance(samples, list):
+            raise ValueError("promoted calculation batch samples are invalid")
+        for sample in samples:
+            evidence = (
+                sample.get("determinant_error_evidence")
+                if isinstance(sample, Mapping)
+                else None
+            )
+            if isinstance(evidence, Mapping):
+                disagreement_terms.append(copy.deepcopy(dict(evidence)))
+
     for receipt in outcome.evidence_receipts:
         if not isinstance(receipt, Mapping):
             raise ValueError("promoted calculation receipt is invalid")
         batch = receipt.get("batch")
         if isinstance(batch, Mapping):
-            raw_batches.append(copy.deepcopy(dict(batch)))
-            samples = batch.get("samples")
-            if isinstance(samples, list):
-                for sample in samples:
-                    evidence = (
-                        sample.get("determinant_error_evidence")
-                        if isinstance(sample, Mapping)
-                        else None
-                    )
-                    if isinstance(evidence, Mapping):
-                        disagreement_terms.append(copy.deepcopy(dict(evidence)))
+            retain_batch(batch)
+        background_batch = receipt.get("background_worker_batch")
+        if isinstance(background_batch, Mapping):
+            retain_batch(background_batch)
+        calculation = receipt.get("calculation")
+        if isinstance(calculation, Mapping):
+            component_batch = calculation.get("component_worker_batch")
+            if isinstance(component_batch, Mapping):
+                retain_batch(component_batch)
     retained_record = (
         None if outcome.record is None else copy.deepcopy(dict(outcome.record))
     )
@@ -3706,6 +3698,33 @@ def run_promoted_survey(
                 )
                 raise AssertionError("system failure abort returned unexpectedly")
 
+        def checkpoint_raw_outcome(raw: PromotedPassOutcome) -> str:
+            """Persist a promoted worker return before a reducer sees it."""
+
+            nonlocal result, committed_before_leaf
+            result = guarded(lambda: _commit_promoted_raw_calculation(
+                result,
+                leaf=leaf,
+                queue_ordinal=ordinal,
+                route=expected_route,
+                outcome=raw,
+                execution_preflight=execution_preflight,
+                layer1_lock_receipt_sha256=layer1_lock_receipt_sha256,
+                scientific_computation_identity=(
+                    selection.scientific_identities[leaf_id]
+                ),
+                layer1_guard=layer1_guard,
+            ))
+            assert isinstance(result, dict)
+            result = persist(result)
+            committed_before_leaf = result
+            digest = result["promotion_queue"]["entries"][ordinal][
+                "retained_promoted_stage_sha256"
+            ]
+            if not isinstance(digest, str):
+                raise ValueError("raw promoted checkpoint digest is invalid")
+            return digest
+
         def validate_binary64_disposition_binding() -> None:
             supplied_receipt = snapshot.get(
                 "source_binary64_disposition_receipt_sha256"
@@ -4113,7 +4132,18 @@ def run_promoted_survey(
                                 checkpoint_background
                             ),
                             raw_checkpoint=(
-                                checkpoint_raw_outcome
+                                lambda raw: checkpoint_raw_outcome(
+                                    replace(
+                                        raw,
+                                        tier_timing=fold_timing_fragments(
+                                            recorder.fragments
+                                        ).tier_timing_mappings(),
+                                        session_fragments=tuple(
+                                            fragment.to_mapping()
+                                            for fragment in recorder.fragments
+                                        ),
+                                    )
+                                )
                                 if execution_mode
                                 is PromotedExecutionMode.CALCULATE_ONLY
                                 else None
@@ -4374,6 +4404,8 @@ def run_promoted_survey(
         if isinstance(binary64_ledger.get(leaf_id), Mapping)
     )
     background_acquired = background_reused = 0
+    v2_background_sources: dict[str, int] = {}
+    seen_v2_background_receipts: set[str] = set()
     for bucket in final_checkpoint["promoted_background_ledger"].values():
         if not isinstance(bucket, Mapping):
             continue
@@ -4389,10 +4421,44 @@ def run_promoted_survey(
             for receipt in receipts:
                 if not isinstance(receipt, Mapping):
                     continue
-                if receipt.get("status") == "ACQUIRED":
+                if receipt.get("schema") == PROMOTED_CANONICAL_BACKGROUND_RECEIPT_SCHEMA:
+                    digest = receipt.get("receipt_sha256")
+                    source_ordinal = receipt.get("source_queue_ordinal")
+                    if (
+                        isinstance(digest, str)
+                        and isinstance(source_ordinal, int)
+                        and digest not in seen_v2_background_receipts
+                    ):
+                        seen_v2_background_receipts.add(digest)
+                        v2_background_sources[digest] = source_ordinal
+                        background_acquired += 1
+                elif receipt.get("status") == "ACQUIRED":
                     background_acquired += 1
                 elif receipt.get("status") == "REUSED":
                     background_reused += 1
+    for stage_bucket in final_checkpoint["promoted_stage_ledger"].values():
+        if not isinstance(stage_bucket, Mapping):
+            continue
+        for stage in stage_bucket.values():
+            if not isinstance(stage, Mapping) or stage.get("route") != "EXTERIOR_BF40":
+                continue
+            artifact = stage.get("calculation_artifact")
+            binding = artifact.get("background") if isinstance(artifact, Mapping) else None
+            digest = (
+                binding.get("background_receipt_sha256")
+                if isinstance(binding, Mapping)
+                else None
+            )
+            source_ordinal = (
+                v2_background_sources.get(digest)
+                if isinstance(digest, str)
+                else None
+            )
+            if (
+                isinstance(source_ordinal, int)
+                and stage.get("queue_ordinal") != source_ordinal
+            ):
+                background_reused += 1
     queue_entries = final_checkpoint["promotion_queue"]["entries"]
     awaiting_admission = sum(
         entry["disposition"] == PromotionQueueDisposition.AWAITING_ADMISSION.value

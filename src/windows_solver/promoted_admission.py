@@ -21,7 +21,7 @@ from .campaign_policy import (
     validate_schema11_checkpoint,
 )
 from .contracts import canonical_json_bytes
-from .promoted_control_calibration import load_default_calibration_receipt
+from .promoted_control_calibration import PromotedControlCalibrationReceipt
 
 
 INDEPENDENT_PROMOTED_REVIEW_RECEIPT_SCHEMA = (
@@ -173,6 +173,7 @@ def admit_retained_promoted_work(
     *,
     queue_ordinal: int,
     independent_review_receipt: Mapping[str, object],
+    calibration_receipt: PromotedControlCalibrationReceipt,
     layer1_guard: object | None = None,
     record_reducer: Callable[
         [Mapping[str, object], Mapping[str, object]],
@@ -198,7 +199,8 @@ def admit_retained_promoted_work(
     )
     if not isinstance(retained_stage, Mapping):
         raise ValueError("independent review receipt retained stage is missing")
-    calibration_receipt = load_default_calibration_receipt()
+    if not isinstance(calibration_receipt, PromotedControlCalibrationReceipt):
+        raise ValueError("admission calibration receipt is invalid")
     if retained_stage.get("calibration_receipt_sha256") != calibration_receipt.sha256:
         raise ValueError("retained promoted stage calibration receipt mismatch")
     receipt = _validated_review_receipt(
@@ -324,6 +326,7 @@ def admit_retained_promoted_checkpoint(
     *,
     queue_ordinal: int,
     independent_review_receipt: Mapping[str, object],
+    calibration_receipt: PromotedControlCalibrationReceipt,
     layer1_guard: object | None = None,
     terminal_record_committed: Callable[[Mapping[str, object]], None] | None = None,
     record_reducer: Callable[
@@ -339,6 +342,7 @@ def admit_retained_promoted_checkpoint(
         checkpoint,
         queue_ordinal=queue_ordinal,
         independent_review_receipt=independent_review_receipt,
+        calibration_receipt=calibration_receipt,
         layer1_guard=layer1_guard,
         record_reducer=record_reducer,
     )

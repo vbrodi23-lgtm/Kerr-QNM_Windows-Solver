@@ -1599,6 +1599,19 @@ def _schema11_admission_state(
     return None
 
 
+def _schema11_queue_route(queue_entry: Mapping[str, object] | None) -> str | None:
+    """Expose the locked route even before its first promoted artifact."""
+
+    if not isinstance(queue_entry, Mapping):
+        return None
+    tier = queue_entry.get("minimum_requested_tier")
+    if tier == "BF40":
+        return "EXTERIOR_BF40"
+    if tier == "BF80":
+        return "HORIZON_BF80"
+    return None
+
+
 def _schema11_normalized_tier(value: object) -> str | None:
     if not isinstance(value, str) or not value:
         return None
@@ -1734,7 +1747,7 @@ def _schema11_basic_rows(
             "promoted_route": (
                 retained_stage.get("route")
                 if isinstance(retained_stage, Mapping)
-                else None
+                else _schema11_queue_route(queue_entry)
             ),
             "admission_state": (
                 admission_state

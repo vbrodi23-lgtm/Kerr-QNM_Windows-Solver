@@ -43,8 +43,10 @@ _REQUIRED_CALLS = {
         "admit_retained_promoted_checkpoint": {
             "queue_ordinal",
             "independent_review_receipt",
+            "calibration_receipt",
             "layer1_guard",
             "terminal_record_committed",
+            "record_reducer",
         },
     },
 }

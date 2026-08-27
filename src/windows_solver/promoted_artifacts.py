@@ -77,9 +77,6 @@ def _require_shared_batch_context(
     component: JuliaFixedRootSurveyBatch,
 ) -> None:
     for field in (
-        "leaf_id",
-        "job_id",
-        "mechanism_id",
         "root_reference_id",
         "root_seal_sha256",
         "branch_identity",
@@ -230,11 +227,19 @@ class PromotedFixedRootComposite:
 
     @property
     def leaf_id(self) -> str:
-        return self.background_batch.leaf_id
+        return self.component_batch.leaf_id
 
     @property
     def job_id(self) -> str:
-        return self.background_batch.job_id
+        return self.component_batch.job_id
+
+    @property
+    def mechanism_id(self) -> str:
+        return self.component_batch.mechanism_id
+
+    @property
+    def root_reference_id(self) -> str:
+        return self.component_batch.root_reference_id
 
     @property
     def branch_identity(self) -> str:
@@ -272,6 +277,22 @@ class PromotedFixedRootComposite:
         content = {
             "schema": PROMOTED_FIXED_ROOT_COMPOSITE_SCHEMA,
             "operation_identity": self.scientific_operation_identity,
+            # These fields name the consuming mechanism request.  The two
+            # nested worker batches below retain their own, possibly earlier,
+            # request identities without being rewritten to this leaf.
+            "leaf_id": self.leaf_id,
+            "job_id": self.job_id,
+            "mechanism_id": self.mechanism_id,
+            "root_reference_id": self.root_reference_id,
+            "root_seal_sha256": self.root_seal_sha256,
+            "branch_identity": self.branch_identity,
+            "fixed_root": dict(self.component_batch.to_mapping()["fixed_root"]),
+            "frequency_step": str(self.frequency_step),
+            "coordinate_step": str(self.coordinate_step),
+            "precision_tier": self.precision_tier.value,
+            "working_precision_bits": self.working_precision_bits,
+            "sample_roles": [sample.role for sample in self.samples],
+            "sample_count": len(self.samples),
             "background_receipt_sha256": self.background_receipt_sha256,
             "background_worker_request_sha256": self.background_batch.request_sha256,
             "component_worker_request_sha256": self.component_batch.request_sha256,

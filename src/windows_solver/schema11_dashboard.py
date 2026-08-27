@@ -14,11 +14,18 @@ from dataclasses import dataclass
 import math
 from types import MappingProxyType
 
-from .campaign_policy import validate_schema11_checkpoint
+from .campaign_policy import PromotionQueueDisposition, validate_schema11_checkpoint
 
 
 _EVIDENCE_LEVELS = ("SCREENED", "CERTIFIED", "VALIDATED")
 _ROUTE_TIERS = ("BF40", "BF80")
+_ACTIVE_CALCULATION_DISPOSITIONS = frozenset(
+    {
+        PromotionQueueDisposition.PENDING.value,
+        PromotionQueueDisposition.CALCULATED_PENDING_DERIVATION.value,
+        PromotionQueueDisposition.NUMERICAL_CONTINUATION.value,
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -176,7 +183,10 @@ def project_schema11_dashboard(
         if not isinstance(item, Mapping):
             continue
         leaf_id = item.get("leaf_id")
-        if item.get("disposition") != "PENDING" or leaf_id not in selected_set:
+        if (
+            item.get("disposition") not in _ACTIVE_CALCULATION_DISPOSITIONS
+            or leaf_id not in selected_set
+        ):
             continue
         pending_count += 1
         tier = str(item.get("minimum_requested_tier", "-"))
