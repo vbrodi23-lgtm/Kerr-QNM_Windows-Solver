@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import json
 from pathlib import Path
+from typing import Mapping
 
 
 _CAPABILITY_SUFFIXES = ("_lookup", "_resolver", "_store", "_provider")
@@ -51,6 +52,28 @@ _REQUIRED_CALLS = {
     },
 }
 
+_PROMOTED_SURVEY_REQUIRED_CALLS = {
+    "_commit_promoted_raw_calculation": {
+        "retain_promoted_raw_calculation",
+    },
+    "run_promoted_survey": {
+        "_commit_promoted_raw_calculation",
+        "_commit_promoted_outcome",
+        "retain_promoted_background",
+        "_resumed_promoted_exterior_outcome",
+        "_resumed_promoted_horizon_outcome",
+    },
+}
+_RESUME_NUMERICAL_CALLS = frozenset(
+    {
+        "backend_factory",
+        "fixed_root_survey_batch",
+        "horizon_runner",
+        "promoted_horizon_runner",
+        "root_seal_lookup",
+    }
+)
+
 
 def _call_name(call: ast.Call) -> str | None:
     target = call.func
@@ -71,14 +94,149 @@ def _obvious_placeholder(value: ast.expr) -> bool:
     )
 
 
-def validate_production_wiring(path: Path | None = None) -> dict[str, object]:
-    runtime = path or Path(__file__).with_name("campaign_runtime.py")
-    tree = ast.parse(runtime.read_text(encoding="utf-8"), filename=str(runtime))
-    functions = {
+def _function_map(tree: ast.Module) -> dict[str, ast.FunctionDef | ast.AsyncFunctionDef]:
+    return {
         node.name: node
         for node in tree.body
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
     }
+
+
+def _call_nodes(function: ast.FunctionDef | ast.AsyncFunctionDef) -> list[ast.Call]:
+    return [node for node in ast.walk(function) if isinstance(node, ast.Call)]
+
+
+def _call_names(function: ast.FunctionDef | ast.AsyncFunctionDef) -> set[str]:
+    return {
+        name
+        for call in _call_nodes(function)
+        for name in (_call_name(call),)
+        if name is not None
+    }
+
+
+def _is_guarded_non_calculate_only(
+    function: ast.FunctionDef | ast.AsyncFunctionDef,
+    call_name: str,
+) -> bool:
+    """Require a terminal exterior builder to sit below its explicit gate."""
+
+    parents = {
+        child: parent
+        for parent in ast.walk(function)
+        for child in ast.iter_child_nodes(parent)
+    }
+    for call in _call_nodes(function):
+        if _call_name(call) != call_name:
+            continue
+        node: ast.AST | None = call
+        while node is not None:
+            node = parents.get(node)
+            if isinstance(node, ast.If):
+                test = ast.unparse(node.test)
+                if (
+                    "execution_mode" in test
+                    and "CALCULATE_ONLY" in test
+                    and "is not" in test
+                ):
+                    return True
+    return False
+
+
+def _promoted_ownership_failures(
+    runtime_functions: Mapping[str, ast.FunctionDef | ast.AsyncFunctionDef],
+    survey_path: Path,
+) -> list[str]:
+    """Prove the static ownership seams that protect a live promoted pass."""
+
+    survey_tree = ast.parse(
+        survey_path.read_text(encoding="utf-8"), filename=str(survey_path)
+    )
+    survey_functions = _function_map(survey_tree)
+    failures: list[str] = []
+    for function_name, required_calls in _PROMOTED_SURVEY_REQUIRED_CALLS.items():
+        function = survey_functions.get(function_name)
+        if function is None:
+            failures.append(f"missing promoted ownership adapter {function_name}")
+            continue
+        names = _call_names(function)
+        missing = required_calls - names
+        if missing:
+            failures.append(
+                f"{function_name} lacks promoted ownership calls {sorted(missing)}"
+            )
+
+    raw_commit = survey_functions.get("_commit_promoted_raw_calculation")
+    final_commit = survey_functions.get("_commit_promoted_outcome")
+    scheduler = survey_functions.get("run_promoted_survey")
+    if raw_commit is not None and final_commit is not None and scheduler is not None:
+        raw_lines = [
+            call.lineno
+            for call in _call_nodes(scheduler)
+            if _call_name(call) == "_commit_promoted_raw_calculation"
+        ]
+        final_lines = [
+            call.lineno
+            for call in _call_nodes(scheduler)
+            if _call_name(call) == "_commit_promoted_outcome"
+        ]
+        if not raw_lines or not final_lines or min(raw_lines) >= min(final_lines):
+            failures.append(
+                "promoted scheduler does not source-order raw checkpoint before final retention"
+            )
+
+    for function_name in (
+        "_resumed_promoted_exterior_outcome",
+        "_resumed_promoted_horizon_outcome",
+    ):
+        function = survey_functions.get(function_name)
+        if function is None:
+            failures.append(f"missing retained-result reducer {function_name}")
+            continue
+        numerical = _call_names(function) & _RESUME_NUMERICAL_CALLS
+        if numerical:
+            failures.append(
+                f"{function_name} can reopen numerical work: {sorted(numerical)}"
+            )
+
+    exterior = survey_functions.get("_run_promoted_exterior_queue_entry")
+    if exterior is None:
+        failures.append("missing promoted exterior acquisition adapter")
+    elif not _is_guarded_non_calculate_only(exterior, "produced_record_builder"):
+        failures.append(
+            "promoted exterior terminal builder is not outside CALCULATE_ONLY"
+        )
+
+    horizon_acquire = runtime_functions.get("_promoted_horizon_outcome")
+    horizon_reduce = runtime_functions.get("_reduce_retained_horizon_for_admission")
+    if horizon_acquire is None:
+        failures.append("missing promoted horizon acquisition adapter")
+    elif "build_schema11_horizon_record" in _call_names(horizon_acquire):
+        failures.append("promoted horizon acquisition can construct a terminal record")
+    if horizon_reduce is None:
+        failures.append("missing retained horizon admission reducer")
+    elif "build_schema11_horizon_record" not in _call_names(horizon_reduce):
+        failures.append("retained horizon admission does not own terminal construction")
+
+    admission = runtime_functions.get("run_native_promoted_admission")
+    if admission is not None:
+        numerical = _call_names(admission) & {
+            "NativeCampaignStageBackend",
+            "fixed_root_survey_batch",
+            "_julia_precision_backend_for",
+        }
+        if numerical:
+            failures.append(
+                "promoted admission can reach numerical work: "
+                f"{sorted(numerical)}"
+            )
+    return failures
+
+
+def validate_production_wiring(path: Path | None = None) -> dict[str, object]:
+    runtime = path or Path(__file__).with_name("campaign_runtime.py")
+    tree = ast.parse(runtime.read_text(encoding="utf-8"), filename=str(runtime))
+    functions = _function_map(tree)
     failures: list[str] = []
     checked_dependencies = 0
     for function_name, required_calls in _REQUIRED_CALLS.items():
@@ -155,6 +313,12 @@ def validate_production_wiring(path: Path | None = None) -> dict[str, object]:
         ):
             if required not in names:
                 failures.append(f"report refresh does not reach {required}")
+
+    failures.extend(
+        _promoted_ownership_failures(
+            functions, runtime.with_name("campaign_survey.py")
+        )
+    )
 
     if failures:
         raise RuntimeError("production wiring validation failed: " + "; ".join(failures))

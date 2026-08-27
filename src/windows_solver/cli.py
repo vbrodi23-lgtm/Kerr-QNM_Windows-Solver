@@ -1298,9 +1298,12 @@ def _campaign_schema11_validate(
     pass_name: str | None,
     binary64_lock_path: Path | None = None,
 ) -> tuple[int, object]:
+    from .production_wiring import validate_production_wiring
+
     plan, selection, _descriptor, _recovery, resolved, checkpoint = (
         _load_schema11_campaign(selection_path, checkpoint_path)
     )
+    production_wiring = validate_production_wiring()
     projection = project_schema11_dashboard(
         checkpoint,
         selected_leaf_ids=selection.leaf_ids,
@@ -1385,6 +1388,7 @@ def _campaign_schema11_validate(
         "promotion_queue_count": projection.pending_count,
         "evidence_counts": dict(evidence_counts),
         "report_status": dict(report_status),
+        "production_wiring": production_wiring,
         "basic_report_directory": str(report_directory_for_checkpoint(resolved)),
         "status_path": f"{resolved}.status.json",
         "binary64_lock_path": (
