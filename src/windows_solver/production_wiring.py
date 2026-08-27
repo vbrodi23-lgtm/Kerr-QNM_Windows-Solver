@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import ast
+import hashlib
 import json
 from pathlib import Path
 from typing import Mapping
+
+from .contracts import canonical_json_bytes
 
 
 _CAPABILITY_SUFFIXES = ("_lookup", "_resolver", "_store", "_provider")
@@ -45,6 +48,7 @@ _REQUIRED_CALLS = {
             "independent_review_receipt",
             "calibration_receipt",
             "layer1_guard",
+            "diagnostic_session",
             "terminal_record_committed",
             "record_reducer",
         },
@@ -76,6 +80,27 @@ _RESUME_NUMERICAL_CALLS = frozenset(
         "root_seal_lookup",
     }
 )
+_PROMOTED_RUNTIME_IDENTITY_FILES = (
+    "binary64_layer_lock.py",
+    "campaign_failures.py",
+    "campaign_policy.py",
+    "campaign_runtime.py",
+    "campaign_survey.py",
+    "promoted_admission.py",
+    "production_wiring.py",
+    "structural_diagnostics.py",
+)
+
+
+def promoted_runtime_identity_sha256() -> str:
+    """Bind failure-resume authority to the Python sources being executed."""
+
+    root = Path(__file__).parent
+    source_sha256s = {
+        name: hashlib.sha256((root / name).read_bytes()).hexdigest()
+        for name in _PROMOTED_RUNTIME_IDENTITY_FILES
+    }
+    return hashlib.sha256(canonical_json_bytes(source_sha256s)).hexdigest()
 
 
 def _call_name(call: ast.Call) -> str | None:
@@ -360,4 +385,4 @@ if __name__ == "__main__":
     raise SystemExit(main())
 
 
-__all__ = ["validate_production_wiring"]
+__all__ = ["promoted_runtime_identity_sha256", "validate_production_wiring"]

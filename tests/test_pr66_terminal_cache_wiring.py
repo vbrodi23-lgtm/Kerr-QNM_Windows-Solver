@@ -65,7 +65,6 @@ def _run_cache_only_promoted_survey(
         backend_factory=unexpected,
         primary_root_runner=unexpected,
         horizon_runner=unexpected,
-        produced_record_builder=unexpected,
         solved_leaf_store=store,
     )
 

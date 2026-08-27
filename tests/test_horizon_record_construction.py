@@ -497,7 +497,7 @@ class HorizonRecordConstructionTests(unittest.TestCase):
                 plan, leaf, tampered
             )
 
-    def test_authenticated_completed_comparison_allows_source_cache(self) -> None:
+    def test_completed_comparison_remains_cache_bound_without_admission(self) -> None:
         plan = _plan()
         leaf = next(
             item for item in plan.leaves
@@ -668,7 +668,7 @@ class HorizonRecordConstructionTests(unittest.TestCase):
         }
 
         self.assertEqual(
-            set(),
+            {source_record_sha256},
             campaign_runtime._promotion_bound_source_record_sha256(
                 checkpoint, plan
             ),
@@ -991,9 +991,6 @@ class HorizonRecordConstructionTests(unittest.TestCase):
                     "legacy promoted horizon runner was used"
                 ),
                 promoted_horizon_runner=compare,
-                produced_record_builder=lambda *_args: self.fail(
-                    "unexpected promoted record builder"
-                ),
             )
 
         self.assertEqual(leaf.leaf_id, observed["leaf_id"])
@@ -1110,9 +1107,6 @@ class HorizonRecordConstructionTests(unittest.TestCase):
                         "legacy promoted horizon runner was used"
                     ),
                     promoted_horizon_runner=promoted_runner,
-                    produced_record_builder=lambda *_args: self.fail(
-                        "unexpected promoted record builder"
-                    ),
                 )
         self.assertFalse(called)
 

@@ -22,6 +22,7 @@ from .campaign_policy import (
 )
 from .contracts import canonical_json_bytes
 from .promoted_control_calibration import PromotedControlCalibrationReceipt
+from .structural_diagnostics import StructuralDiagnosticSession
 
 
 INDEPENDENT_PROMOTED_REVIEW_RECEIPT_SCHEMA = (
@@ -321,6 +322,104 @@ def _write_atomic(path: Path, checkpoint: Mapping[str, object]) -> None:
         raise
 
 
+def _completed_promoted_admission(
+    checkpoint: Mapping[str, object],
+    *,
+    queue_ordinal: int,
+    independent_review_receipt: Mapping[str, object],
+    calibration_receipt: PromotedControlCalibrationReceipt,
+) -> PromotedAdmissionResult | None:
+    """Authenticate an already-durable admission for publication retry."""
+
+    result = validate_schema11_checkpoint(checkpoint)
+    queue = result["promotion_queue"]
+    if (
+        isinstance(queue_ordinal, bool)
+        or not isinstance(queue_ordinal, int)
+        or queue_ordinal < 0
+        or queue_ordinal >= len(queue["entries"])
+    ):
+        raise ValueError("independent review receipt queue ordinal is invalid")
+    entry = queue["entries"][queue_ordinal]
+    if entry["disposition"] != "COMPLETED":
+        return None
+    if not isinstance(calibration_receipt, PromotedControlCalibrationReceipt):
+        raise ValueError("admission calibration receipt is invalid")
+    receipt = _validated_review_receipt(
+        independent_review_receipt,
+        expected_authority_sha256=(
+            calibration_receipt.independent_review_authority_sha256
+        ),
+    )
+    leaf_id = str(entry["leaf_id"])
+    stage_bucket = result["promoted_stage_ledger"].get(str(queue_ordinal))
+    retained_stage = (
+        stage_bucket.get(leaf_id) if isinstance(stage_bucket, Mapping) else None
+    )
+    if not isinstance(retained_stage, Mapping):
+        raise ValueError("completed promoted admission retained stage is missing")
+    disagreement_terms = retained_stage.get("current_run_disagreement_terms")
+    if not isinstance(disagreement_terms, list):
+        raise ValueError("completed promoted admission disagreement terms are missing")
+    if (
+        receipt["queue_ordinal"] != queue_ordinal
+        or receipt["leaf_id"] != leaf_id
+        or receipt["authority_sha256"]
+        != calibration_receipt.independent_review_authority_sha256
+        or receipt["calibration_receipt_sha256"] != calibration_receipt.sha256
+        or receipt["calibration_receipt_sha256"]
+        != retained_stage.get("calibration_receipt_sha256")
+        or receipt["binary64_lock_receipt_sha256"]
+        != retained_stage.get("layer1_lock_receipt_sha256")
+        or receipt["route"] != retained_stage.get("route")
+        or receipt["scientific_computation_identity"]
+        != entry["scientific_computation_identity"]
+        or receipt["scientific_computation_identity"]
+        != retained_stage.get("scientific_computation_identity")
+        or receipt["retained_promoted_stage_sha256"]
+        != entry["retained_promoted_stage_sha256"]
+        or receipt["retained_promoted_stage_sha256"]
+        != retained_stage.get("stage_sha256")
+        or receipt["source_fingerprint_sha256"]
+        != entry["source_fingerprint_sha256"]
+        or receipt["source_fingerprint_sha256"]
+        != retained_stage.get("source_fingerprint_sha256")
+        or receipt["disagreement_term_sha256s"]
+        != [_sha256(item) for item in disagreement_terms]
+        or entry["disposition_receipt_sha256"] != _sha256(receipt)
+    ):
+        raise ValueError("completed promoted admission receipt binding is invalid")
+    matching_records = [
+        item for item in result["records"] if item.get("leaf_id") == leaf_id
+    ]
+    if len(matching_records) != 1:
+        raise ValueError("completed promoted admission record is missing")
+    record = matching_records[0]
+    record_sha256 = str(record["record_sha256"])
+    terminal_stage_sha256 = _terminal_stage_sha256(record, retained_stage)
+    evidence = result["evidence_ledger"].get(leaf_id)
+    promoted_pass = result["survey_pass_ledger"][SurveyPass.PROMOTED.value].get(
+        leaf_id
+    )
+    if (
+        not isinstance(evidence, Mapping)
+        or evidence.get("central_record_sha256") != record_sha256
+        or evidence.get("central_stage_sha256") != terminal_stage_sha256
+        or receipt not in evidence.get("receipts", [])
+        or not isinstance(promoted_pass, Mapping)
+        or promoted_pass.get("disposition") != SurveyDisposition.COMPLETED.value
+        or promoted_pass.get("result_record_sha256") != record_sha256
+    ):
+        raise ValueError("completed promoted admission ledger binding is invalid")
+    return PromotedAdmissionResult(
+        checkpoint=result,
+        queue_ordinal=queue_ordinal,
+        leaf_id=leaf_id,
+        admitted_record_sha256=record_sha256,
+        review_receipt_sha256=str(receipt["receipt_sha256"]),
+    )
+
+
 def admit_retained_promoted_checkpoint(
     checkpoint_path: Path | str,
     *,
@@ -328,37 +427,136 @@ def admit_retained_promoted_checkpoint(
     independent_review_receipt: Mapping[str, object],
     calibration_receipt: PromotedControlCalibrationReceipt,
     layer1_guard: object | None = None,
+    diagnostic_session: StructuralDiagnosticSession | None = None,
     terminal_record_committed: Callable[[Mapping[str, object]], None] | None = None,
     record_reducer: Callable[
         [Mapping[str, object], Mapping[str, object]],
         Mapping[str, object] | PromotedAdmissionReduction,
     ] | None = None,
 ) -> PromotedAdmissionResult:
-    """Publish one reviewed result, then atomically persist its admission."""
+    """Persist one reviewed admission, then publish its terminal cache record."""
 
     path = Path(checkpoint_path)
     checkpoint = _load_canonical_checkpoint(path)
-    admitted = admit_retained_promoted_work(
+    pre_commit_sha256 = _sha256(checkpoint)
+    admitted = _completed_promoted_admission(
         checkpoint,
         queue_ordinal=queue_ordinal,
         independent_review_receipt=independent_review_receipt,
         calibration_receipt=calibration_receipt,
-        layer1_guard=layer1_guard,
-        record_reducer=record_reducer,
     )
-    if layer1_guard is not None:
-        layer1_guard.pre_write(admitted.checkpoint)
+    if admitted is None:
+        admitted = admit_retained_promoted_work(
+            checkpoint,
+            queue_ordinal=queue_ordinal,
+            independent_review_receipt=independent_review_receipt,
+            calibration_receipt=calibration_receipt,
+            layer1_guard=layer1_guard,
+            record_reducer=record_reducer,
+        )
+        if diagnostic_session is not None:
+            diagnostic_session.append(
+                "PROMOTED_ADMISSION_REDUCED",
+                leaf={"leaf_id": admitted.leaf_id},
+                execution={
+                    "profile": "ADMISSION",
+                    "pass": "promoted",
+                    "tier": "retained",
+                    "operation_identity": "promoted-independent-review-admission/v1",
+                },
+                transition={
+                    "prior_state": "AWAITING_ADMISSION",
+                    "next_state": "PENDING_DURABLE_COMMIT",
+                    "reason_code": "INDEPENDENT_REVIEW_AUTHENTICATED",
+                },
+                connections={
+                    "queue_ordinal": queue_ordinal,
+                    "disposition_receipt_sha256": admitted.review_receipt_sha256,
+                },
+                compact_diagnostics={
+                    "admitted_record_sha256": admitted.admitted_record_sha256,
+                },
+                durable=True,
+            )
+        if layer1_guard is not None:
+            layer1_guard.pre_write(admitted.checkpoint)
+        _write_atomic(path, admitted.checkpoint)
+        durable = _load_canonical_checkpoint(path)
+        if layer1_guard is not None:
+            layer1_guard.post_write(durable)
+        if diagnostic_session is not None:
+            diagnostic_session.append(
+                "PROMOTED_ADMISSION_CHECKPOINT_COMMITTED",
+                leaf={"leaf_id": admitted.leaf_id},
+                execution={
+                    "profile": "ADMISSION",
+                    "pass": "promoted",
+                    "tier": "retained",
+                    "operation_identity": "promoted-admission-checkpoint-commit/v1",
+                },
+                transition={
+                    "prior_state": "PENDING_DURABLE_COMMIT",
+                    "next_state": "COMPLETED",
+                    "reason_code": "CHECKPOINT_OWNS_TERMINAL_RECORD",
+                },
+                connections={"queue_ordinal": queue_ordinal},
+                checkpoint={
+                    "pre_commit_sha256": pre_commit_sha256,
+                    "post_commit_sha256": _sha256(durable),
+                },
+                compact_diagnostics={
+                    "admitted_record_sha256": admitted.admitted_record_sha256,
+                },
+                durable=True,
+            )
+    else:
+        durable = admitted.checkpoint
+        if diagnostic_session is not None:
+            diagnostic_session.append(
+                "PROMOTED_ADMISSION_PUBLICATION_RETRY_AUTHENTICATED",
+                leaf={"leaf_id": admitted.leaf_id},
+                execution={
+                    "profile": "ADMISSION",
+                    "pass": "promoted",
+                    "tier": "retained",
+                    "operation_identity": "promoted-admission-publication-retry/v1",
+                },
+                transition={
+                    "prior_state": "COMPLETED",
+                    "next_state": "PENDING_TERMINAL_PUBLICATION",
+                    "reason_code": "DURABLE_ADMISSION_REUSED",
+                },
+                connections={"queue_ordinal": queue_ordinal},
+                durable=True,
+            )
     if terminal_record_committed is not None:
         record = next(
             item
-            for item in admitted.checkpoint["records"]
+            for item in durable["records"]
             if item["leaf_id"] == admitted.leaf_id
         )
         terminal_record_committed(record)
-    _write_atomic(path, admitted.checkpoint)
-    durable = _load_canonical_checkpoint(path)
-    if layer1_guard is not None:
-        layer1_guard.post_write(durable)
+        if diagnostic_session is not None:
+            diagnostic_session.append(
+                "PROMOTED_TERMINAL_RECORD_PUBLISHED",
+                leaf={"leaf_id": admitted.leaf_id},
+                execution={
+                    "profile": "ADMISSION",
+                    "pass": "promoted",
+                    "tier": "retained",
+                    "operation_identity": "solved-leaf-store-publication/v1",
+                },
+                transition={
+                    "prior_state": "COMPLETED",
+                    "next_state": "TERMINAL_CACHE_PUBLISHED",
+                    "reason_code": "CHECKPOINT_PRECEDES_CACHE_PUBLICATION",
+                },
+                connections={"queue_ordinal": queue_ordinal},
+                compact_diagnostics={
+                    "admitted_record_sha256": admitted.admitted_record_sha256,
+                },
+                durable=True,
+            )
     durable_result = PromotedAdmissionResult(
         checkpoint=durable,
         queue_ordinal=admitted.queue_ordinal,

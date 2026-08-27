@@ -2025,13 +2025,19 @@ def run_native_promoted_pass(
     *,
     checkpoint_path: Path,
     binary64_lock_path: Path,
-    calibration_receipt: object | None = None,
+    calibration_receipt: PromotedControlCalibrationReceipt,
     solved_leaf_store: SolvedLeafStore | None = None,
     determinant_error_store: ReviewedDeterminantErrorStore | None = None,
     background_evidence_store: CanonicalBackgroundEvidenceStore | None = None,
     diagnostic_session: StructuralDiagnosticSession | None = None,
 ) -> PromotedSurveyRun:
     """Execute only locked queued BF40/BF80 work through the survey operation."""
+
+    from .production_wiring import validate_production_wiring
+
+    validate_production_wiring()
+    if not isinstance(calibration_receipt, PromotedControlCalibrationReceipt):
+        raise ValueError("promoted survey requires an explicit calibration receipt")
 
     root_evidence_store = RootEvidenceStore.for_checkpoint(checkpoint_path)
     background_store = background_evidence_store or CanonicalBackgroundEvidenceStore(
@@ -2051,10 +2057,18 @@ def run_native_promoted_pass(
         leaf_mechanism_ids=_layer1_leaf_mechanism_ids(plan, recovery_selection),
         auxiliary_evidence_manifest=manifest,
     )
-    active_calibration_receipt = (
-        load_default_calibration_receipt()
-        if calibration_receipt is None
-        else calibration_receipt
+    active_calibration_receipt = calibration_receipt
+    from .campaign_failures import (
+        require_system_failures_resolved_for_promoted_resume,
+    )
+
+    require_system_failures_resolved_for_promoted_resume(
+        checkpoint,
+        expected_authority_sha256=(
+            active_calibration_receipt.independent_review_authority_sha256
+        ),
+        calibration_receipt_sha256=active_calibration_receipt.sha256,
+        binary64_lock_receipt_sha256=str(lock["receipt_sha256"]),
     )
     promoted_preflights_by_ordinal = {
         ordinal: require_locked_bf40_determinant_error_issuance_authority(
@@ -2315,7 +2329,13 @@ def _rederived_exterior_determinant_error(
             "retained exterior determinant-error aggregate is not derivable"
         )
     bound = float(derived)
-    if not math.isfinite(bound) or bound <= 0.0:
+    if Decimal.from_float(bound) < derived:
+        bound = math.nextafter(bound, math.inf)
+    if (
+        not math.isfinite(bound)
+        or bound <= 0.0
+        or Decimal.from_float(bound) < derived
+    ):
         raise ValueError("retained exterior determinant-error bound is invalid")
     receipt_content = {
         "schema": "windows-solver.promoted-exterior-determinant-rederivation/1",
@@ -2325,6 +2345,8 @@ def _rederived_exterior_determinant_error(
         "raw_error": mapping,
         "safety_factor": str(calibration_receipt.certificate_safety_factor),
         "derived_absolute_determinant_error": str(derived),
+        "emitted_absolute_determinant_error_binary64": bound.hex(),
+        "binary64_rounding_direction": "OUTWARD_TOWARD_POSITIVE_INFINITY",
     }
     return bound, {
         **receipt_content,
@@ -2625,8 +2647,15 @@ def run_native_promoted_admission(
     calibration_receipt: PromotedControlCalibrationReceipt,
     solved_leaf_store: SolvedLeafStore | None = None,
     background_evidence_store: CanonicalBackgroundEvidenceStore | None = None,
+    diagnostic_session: StructuralDiagnosticSession | None = None,
 ) -> PromotedAdmissionResult:
     """Admit retained Layer-2 work and publish it with zero numerical calls."""
+
+    from .production_wiring import validate_production_wiring
+
+    validate_production_wiring()
+    if not isinstance(calibration_receipt, PromotedControlCalibrationReceipt):
+        raise ValueError("promoted admission requires an explicit calibration receipt")
 
     root_evidence_store = RootEvidenceStore.for_checkpoint(checkpoint_path)
     background_store = background_evidence_store or CanonicalBackgroundEvidenceStore(
@@ -2723,6 +2752,7 @@ def run_native_promoted_admission(
         independent_review_receipt=independent_review_receipt,
         calibration_receipt=calibration_receipt,
         layer1_guard=layer1_guard,
+        diagnostic_session=diagnostic_session,
         terminal_record_committed=publish,
         record_reducer=reduce_retained_stage,
     )

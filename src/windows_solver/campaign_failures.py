@@ -68,10 +68,13 @@ _SYSTEM_CAUSE_TYPES = frozenset(
         "BudgetBreachError",
     }
 )
-SYSTEM_FAILURE_RESOLUTION_RECEIPT_SCHEMA = (
+_LEGACY_SYSTEM_FAILURE_RESOLUTION_RECEIPT_SCHEMA = (
     "windows-solver.system-failure-resolution/1"
 )
-_SYSTEM_FAILURE_RESOLUTION_FIELDS = frozenset({
+SYSTEM_FAILURE_RESOLUTION_RECEIPT_SCHEMA = (
+    "windows-solver.system-failure-resolution/2"
+)
+_SYSTEM_FAILURE_RESOLUTION_BASE_FIELDS = frozenset({
     "schema",
     "decision",
     "resolution_scope",
@@ -85,6 +88,10 @@ _SYSTEM_FAILURE_RESOLUTION_FIELDS = frozenset({
     "reason",
     "receipt_sha256",
 })
+_SYSTEM_FAILURE_RESOLUTION_FIELDS = _SYSTEM_FAILURE_RESOLUTION_BASE_FIELDS | {
+    "repair_runtime_sha256",
+    "supersedes_resolution_receipt_sha256",
+}
 _GIT_COMMIT_SHA_RE = re.compile(r"[0-9a-f]{40,64}")
 
 
@@ -107,13 +114,22 @@ def _validated_system_failure_resolution(
 ) -> dict[str, object]:
     """Authenticate one append-only operator resolution receipt."""
 
-    if not isinstance(value, Mapping) or set(value) != _SYSTEM_FAILURE_RESOLUTION_FIELDS:
+    if not isinstance(value, Mapping) or value.get("schema") not in {
+        _LEGACY_SYSTEM_FAILURE_RESOLUTION_RECEIPT_SCHEMA,
+        SYSTEM_FAILURE_RESOLUTION_RECEIPT_SCHEMA,
+    }:
+        raise ValueError("system failure resolution receipt fields are invalid")
+    expected_fields = (
+        _SYSTEM_FAILURE_RESOLUTION_FIELDS
+        if value.get("schema") == SYSTEM_FAILURE_RESOLUTION_RECEIPT_SCHEMA
+        else _SYSTEM_FAILURE_RESOLUTION_BASE_FIELDS
+    )
+    if set(value) != expected_fields:
         raise ValueError("system failure resolution receipt fields are invalid")
     receipt = copy.deepcopy(dict(value))
     content = {key: item for key, item in receipt.items() if key != "receipt_sha256"}
     if (
-        receipt.get("schema") != SYSTEM_FAILURE_RESOLUTION_RECEIPT_SCHEMA
-        or receipt.get("decision") != "RESOLVE_FOR_RESUME"
+        receipt.get("decision") != "RESOLVE_FOR_RESUME"
         or receipt.get("resolution_scope")
         != "RESUME_UNRETAINED_LAYER2_WORK_ONLY"
         or receipt.get("receipt_sha256") != _sha256(content)
@@ -138,13 +154,19 @@ def _validated_system_failure_resolution(
         or _GIT_COMMIT_SHA_RE.fullmatch(receipt["repair_commit_sha"]) is None
     ):
         raise ValueError("system failure resolution receipt identity is invalid")
+    if receipt["schema"] == SYSTEM_FAILURE_RESOLUTION_RECEIPT_SCHEMA:
+        if not _is_sha256(receipt.get("repair_runtime_sha256")):
+            raise ValueError("system failure repair runtime identity is invalid")
+        supersedes = receipt.get("supersedes_resolution_receipt_sha256")
+        if supersedes is not None and not _is_sha256(supersedes):
+            raise ValueError("system failure resolution supersession is invalid")
     return receipt
 
 
 def system_failure_resolution_index(
     checkpoint: Mapping[str, object],
 ) -> dict[str, dict[str, object]]:
-    """Return the one immutable resolution receipt allowed for each failure."""
+    """Return the latest authenticated receipt in each resolution chain."""
 
     validated = validate_schema11_checkpoint(checkpoint)
     failures: dict[str, Mapping[str, object]] = {}
@@ -167,9 +189,10 @@ def system_failure_resolution_index(
         failures[receipt_sha256] = candidate
     result: dict[str, dict[str, object]] = {}
     for candidate in validated["recovery_receipts"]:
-        if not isinstance(candidate, Mapping) or candidate.get("schema") != (
-            SYSTEM_FAILURE_RESOLUTION_RECEIPT_SCHEMA
-        ):
+        if not isinstance(candidate, Mapping) or candidate.get("schema") not in {
+            _LEGACY_SYSTEM_FAILURE_RESOLUTION_RECEIPT_SCHEMA,
+            SYSTEM_FAILURE_RESOLUTION_RECEIPT_SCHEMA,
+        }:
             continue
         receipt = _validated_system_failure_resolution(candidate)
         target = str(receipt["system_failure_receipt_sha256"])
@@ -179,10 +202,69 @@ def system_failure_resolution_index(
         ):
             raise ValueError("system failure resolution target is invalid")
         prior = result.get(target)
-        if prior is not None and prior != receipt:
-            raise ValueError("system failure has conflicting resolution receipts")
+        if prior is not None:
+            if (
+                receipt["schema"] != SYSTEM_FAILURE_RESOLUTION_RECEIPT_SCHEMA
+                or receipt["supersedes_resolution_receipt_sha256"]
+                != prior["receipt_sha256"]
+            ):
+                raise ValueError("system failure has an invalid resolution chain")
+        elif (
+            receipt["schema"] == SYSTEM_FAILURE_RESOLUTION_RECEIPT_SCHEMA
+            and receipt["supersedes_resolution_receipt_sha256"] is not None
+        ):
+            raise ValueError("system failure resolution supersedes a missing receipt")
         result[target] = receipt
     return result
+
+
+def require_system_failures_resolved_for_promoted_resume(
+    checkpoint: Mapping[str, object],
+    *,
+    expected_authority_sha256: str,
+    calibration_receipt_sha256: str,
+    binary64_lock_receipt_sha256: str,
+) -> tuple[dict[str, object], ...]:
+    """Fail closed until every software incident authorises this runtime."""
+
+    if not all(
+        _is_sha256(value)
+        for value in (
+            expected_authority_sha256,
+            calibration_receipt_sha256,
+            binary64_lock_receipt_sha256,
+        )
+    ):
+        raise ValueError("promoted resume authority binding is invalid")
+    validated = validate_schema11_checkpoint(checkpoint)
+    resolutions = system_failure_resolution_index(validated)
+    from .production_wiring import promoted_runtime_identity_sha256
+
+    runtime_sha256 = promoted_runtime_identity_sha256()
+    active: list[str] = []
+    authorised: list[dict[str, object]] = []
+    for failure in validated["system_failures"]:
+        target = str(failure["receipt_sha256"])
+        receipt = resolutions.get(target)
+        if (
+            receipt is None
+            or receipt.get("schema") != SYSTEM_FAILURE_RESOLUTION_RECEIPT_SCHEMA
+            or receipt.get("authority_sha256") != expected_authority_sha256
+            or receipt.get("calibration_receipt_sha256")
+            != calibration_receipt_sha256
+            or receipt.get("binary64_lock_receipt_sha256")
+            != binary64_lock_receipt_sha256
+            or receipt.get("repair_runtime_sha256") != runtime_sha256
+        ):
+            active.append(target)
+        else:
+            authorised.append(receipt)
+    if active:
+        raise ValueError(
+            "promoted resume is blocked by active SYSTEM_FAILURE receipts: "
+            + ",".join(active)
+        )
+    return tuple(authorised)
 
 
 def resolve_system_failure_for_resume(
@@ -198,10 +280,9 @@ def resolve_system_failure_for_resume(
 ) -> tuple[dict[str, object], dict[str, object]]:
     """Append—not rewrite—operator authority to resume one failed Layer-2 pass.
 
-    The historical failure remains in ``system_failures``.  The scheduler is
-    not told that a calculation succeeded, and no queue/record/stage state is
-    modified here; the next promoted pass decides resume solely from retained
-    state.  This receipt only closes the operational incident in reports.
+    The historical failure remains in ``system_failures`` and no numerical
+    state is modified.  The next promoted pass accepts the resume only when
+    this authority, Layer-1 lock, calibration, and executing runtime all match.
     """
 
     result = validate_schema11_checkpoint(checkpoint)
@@ -244,15 +325,19 @@ def resolve_system_failure_for_resume(
     existing = system_failure_resolution_index(result).get(
         system_failure_receipt_sha256
     )
-    if existing is not None:
-        if (
-            existing["authority_sha256"] != expected_authority_sha256
-            or existing["calibration_receipt_sha256"] != calibration_receipt_sha256
-            or existing["binary64_lock_receipt_sha256"]
-            != binary64_lock_receipt_sha256
-            or existing["failure_fingerprint_sha256"] != fingerprint
-        ):
-            raise ValueError("existing system failure resolution binding conflicts")
+    from .production_wiring import promoted_runtime_identity_sha256
+
+    repair_runtime_sha256 = promoted_runtime_identity_sha256()
+    if existing is not None and (
+        existing.get("schema") == SYSTEM_FAILURE_RESOLUTION_RECEIPT_SCHEMA
+        and existing["authority_sha256"] == expected_authority_sha256
+        and existing["calibration_receipt_sha256"] == calibration_receipt_sha256
+        and existing["binary64_lock_receipt_sha256"]
+        == binary64_lock_receipt_sha256
+        and existing["failure_fingerprint_sha256"] == fingerprint
+        and existing["repair_commit_sha"] == repair_commit_sha
+        and existing["repair_runtime_sha256"] == repair_runtime_sha256
+    ):
         return result, existing
 
     content = {
@@ -270,6 +355,10 @@ def resolve_system_failure_for_resume(
         "system_failure_receipt_sha256": system_failure_receipt_sha256,
         "failure_fingerprint_sha256": fingerprint,
         "repair_commit_sha": repair_commit_sha,
+        "repair_runtime_sha256": repair_runtime_sha256,
+        "supersedes_resolution_receipt_sha256": (
+            None if existing is None else existing["receipt_sha256"]
+        ),
         "reason": reason.strip(),
     }
     receipt = {**content, "receipt_sha256": _sha256(content)}
@@ -631,6 +720,7 @@ __all__ = [
     "ProductionFailureMonitor",
     "abort_unexpected_system_failure",
     "classify_failure",
+    "require_system_failures_resolved_for_promoted_resume",
     "run_guarded_pass",
     "resolve_system_failure_for_resume",
     "system_failure_resolution_index",

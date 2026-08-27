@@ -413,11 +413,6 @@ class PR73CalculateOnlyProductionShapeTests(unittest.TestCase):
                         "official fixture contains no root-promotion route"
                     ),
                     horizon_runner=horizon_runner,
-                    produced_record_builder=(
-                        lambda leaf, _batch, _screening, digits: _record(
-                            leaf.leaf_id, digits
-                        )
-                    ),
                     layer1_guard=ShapeGuard(),
                     locked_routes_by_ordinal=guard.locked_routes_by_ordinal,
                     promoted_preflights_by_ordinal=preflights,
@@ -553,9 +548,6 @@ class PR73CalculateOnlyProductionShapeTests(unittest.TestCase):
                     ),
                     horizon_runner=lambda *_args: self.fail(
                         "resume repeated BF80 horizon work"
-                    ),
-                    produced_record_builder=lambda *_args: self.fail(
-                        "resume rebuilt a record"
                     ),
                     layer1_guard=ShapeGuard(),
                     locked_routes_by_ordinal=guard.locked_routes_by_ordinal,

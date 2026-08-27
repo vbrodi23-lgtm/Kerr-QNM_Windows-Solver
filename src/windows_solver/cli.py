@@ -361,6 +361,10 @@ def build_parser() -> argparse.ArgumentParser:
     campaign_admit_promoted.add_argument(
         "--calibration-receipt-sha256", required=True
     )
+    campaign_admit_promoted.add_argument(
+        "--diagnostic-session-id",
+        help="operator identity for the immutable structural diagnostic session",
+    )
     campaign_resolve_system_failure = commands.add_parser(
         "campaign-resolve-system-failure",
         help=(
@@ -407,8 +411,15 @@ def build_parser() -> argparse.ArgumentParser:
             default=ProgressMode.NORMAL.value,
         )
         campaign_pass.add_argument("--queue", type=Path)
-        campaign_pass.add_argument("--calibration-receipt-path", type=Path)
-        campaign_pass.add_argument("--calibration-receipt-sha256")
+        campaign_pass.add_argument(
+            "--calibration-receipt-path",
+            type=Path,
+            required=name == "campaign-survey-promoted",
+        )
+        campaign_pass.add_argument(
+            "--calibration-receipt-sha256",
+            required=name == "campaign-survey-promoted",
+        )
         if name == "campaign-survey-promoted":
             campaign_pass.add_argument("--binary64-lock", type=Path, required=True)
         campaign_pass.add_argument(
@@ -1410,6 +1421,7 @@ def _campaign_admit_promoted(
     review_receipt_path: Path,
     calibration_receipt_path: Path,
     calibration_receipt_sha256: str,
+    diagnostic_session: StructuralDiagnosticSession | None = None,
 ) -> tuple[int, object]:
     (
         plan,
@@ -1439,6 +1451,7 @@ def _campaign_admit_promoted(
         queue_ordinal=queue_ordinal,
         independent_review_receipt=review_receipt,
         calibration_receipt=calibration_receipt,
+        diagnostic_session=diagnostic_session,
     )
     return 0, {
         "command": "campaign-admit-promoted",
@@ -1529,6 +1542,7 @@ def _campaign_resolve_system_failure(
         "system_failure_receipt_sha256": system_failure_receipt_sha256,
         "resolution_receipt_sha256": resolution["receipt_sha256"],
         "repair_commit_sha": resolution["repair_commit_sha"],
+        "repair_runtime_sha256": resolution["repair_runtime_sha256"],
         "active_system_failure_count": len(refreshed["system_failures"])
         - historical,
         "historical_system_failure_count": historical,
@@ -1616,13 +1630,10 @@ def _campaign_schema11_pass(
 
         if binary64_lock_path is None:
             raise ValueError("promoted survey requires a binary64 lock")
-
-        receipt = (
-            None
-            if calibration_receipt_path is None
-            else load_calibration_receipt(
-                calibration_receipt_path, str(calibration_receipt_sha256)
-            )
+        if calibration_receipt_path is None or calibration_receipt_sha256 is None:
+            raise ValueError("promoted survey requires an explicit calibration receipt")
+        receipt = load_calibration_receipt(
+            calibration_receipt_path, calibration_receipt_sha256
         )
         reporter = Schema11ProgressReporter(
             resolved,
@@ -2099,6 +2110,13 @@ def _schema11_diagnostic_execution(command: str) -> dict[str, object]:
             "tier": "promoted",
             "operation_identity": command,
         }
+    if command == "campaign-admit-promoted":
+        return {
+            "profile": "admission",
+            "pass": "promoted",
+            "tier": "retained",
+            "operation_identity": command,
+        }
     if command == "campaign-certify":
         return {
             "profile": "certify",
@@ -2332,6 +2350,70 @@ def _run_schema11_pass_with_diagnostics(arguments: argparse.Namespace) -> tuple[
     }
 
 
+def _run_promoted_admission_with_diagnostics(
+    arguments: argparse.Namespace,
+) -> tuple[int, object]:
+    plan, selection, _descriptor = _campaign_plan_and_selection(arguments.selection)
+    checkpoint = _resolve_recovery_path(arguments.checkpoint)
+    session = StructuralDiagnosticSession.open(
+        checkpoint_path=checkpoint,
+        session_id=(arguments.diagnostic_session_id or uuid4().hex),
+        campaign_id=plan.campaign_id,
+        selection_id=selection.selection_id,
+    )
+    command = "campaign-admit-promoted"
+    execution = _schema11_diagnostic_execution(command)
+    session.append("DIAGNOSTIC_SESSION_OPENED", execution=execution, durable=True)
+    session.append("CAMPAIGN_COMMAND_STARTED", execution=execution, durable=True)
+    try:
+        status, output = _campaign_admit_promoted(
+            arguments.selection,
+            arguments.checkpoint,
+            binary64_lock_path=arguments.binary64_lock,
+            queue_ordinal=arguments.queue_ordinal,
+            review_receipt_path=arguments.review_receipt,
+            calibration_receipt_path=arguments.calibration_receipt_path,
+            calibration_receipt_sha256=arguments.calibration_receipt_sha256,
+            diagnostic_session=session,
+        )
+        if not isinstance(output, Mapping):
+            raise ValueError("promoted admission output is invalid")
+    except KeyboardInterrupt as error:
+        _finalize_schema11_diagnostic_failure(
+            session=session,
+            command=command,
+            execution=execution,
+            checkpoint=checkpoint,
+            selected_leaf_count=len(selection.leaf_ids),
+            error=error,
+            interrupted=True,
+        )
+        raise
+    except BaseException as error:
+        _finalize_schema11_diagnostic_failure(
+            session=session,
+            command=command,
+            execution=execution,
+            checkpoint=checkpoint,
+            selected_leaf_count=len(selection.leaf_ids),
+            error=error,
+            interrupted=False,
+        )
+        raise
+    session.append(
+        "CAMPAIGN_COMMAND_COMPLETED",
+        execution=execution,
+        compact_diagnostics={"status": status},
+        durable=True,
+    )
+    session.close_completed()
+    return status, {
+        **output,
+        "diagnostic_session_directory": str(session.paths.directory),
+        "diagnostic_events_path": str(session.paths.structural_events),
+    }
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     try:
         arguments = build_parser().parse_args(argv)
@@ -2369,15 +2451,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 arguments.command, arguments.selection, Path("unused")
             )
         elif arguments.command == "campaign-admit-promoted":
-            status, output = _campaign_admit_promoted(
-                arguments.selection,
-                arguments.checkpoint,
-                binary64_lock_path=arguments.binary64_lock,
-                queue_ordinal=arguments.queue_ordinal,
-                review_receipt_path=arguments.review_receipt,
-                calibration_receipt_path=arguments.calibration_receipt_path,
-                calibration_receipt_sha256=arguments.calibration_receipt_sha256,
-            )
+            status, output = _run_promoted_admission_with_diagnostics(arguments)
         elif arguments.command == "campaign-resolve-system-failure":
             status, output = _campaign_resolve_system_failure(
                 arguments.selection,

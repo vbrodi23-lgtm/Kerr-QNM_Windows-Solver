@@ -103,19 +103,20 @@ leaf 1. You do not need to run the command above yourself before `m02.ps1
 -NewCampaign`; it is shown here only for operators driving `solver.ps1`
 directly instead of through `m02.ps1`.
 
-### Start or resume the binary64 survey
+### Start or resume the locked survey chain
 
 ```powershell
 .\m02.ps1
 ```
 
-Equivalent explicit form:
+The default runs binary64, creates the Layer-1 lock, and then runs the
+promoted calculation pass. To run only binary64:
 
 ```powershell
 .\m02.ps1 -Profile survey -SurveyPass binary64
 ```
 
-Under the default binary64 survey profile, the default checkpoint path
+Under the default full survey profile, the default checkpoint path
 decides what happens: if it does not yet exist, this is an ordinary first
 run and a new campaign is created before the survey starts; if it exists,
 the survey resumes from it. `-NewCampaign` is only needed to protect against
@@ -149,6 +150,26 @@ The binary64 survey:
 ```
 
 The promoted survey consumes only the durable promotion queue. It uses BF40 first and BF80 only for approved typed arithmetic insufficiency. BF120, publication certificates, diagnostic root ladders, and independent validation are not survey work.
+
+The launcher passes the committed promoted-control calibration file and its
+computed SHA-256 explicitly, and prints both before execution. An operator
+override must supply `-CalibrationReceiptPath` and
+`-CalibrationReceiptSha256` together.
+
+An active `SYSTEM_FAILURE` blocks promoted resume. After deploying the repair,
+append a runtime-bound resolution receipt for each reported failure:
+
+```powershell
+.\m02.ps1 `
+  -Profile resolve-system-failure `
+  -FailureReceiptSha256 <failure-receipt-sha256> `
+  -RepairCommit <deployed-git-commit> `
+  -ResolutionReason <operator-reason>
+```
+
+The resolution retains the original failure, binds the authority, Layer-1
+lock, calibration, repair commit, and exact executing Python sources, and can
+be superseded append-only when a later deployed runtime must be authorised.
 
 ### Certify screened results
 

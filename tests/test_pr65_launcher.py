@@ -20,7 +20,14 @@ class PR65LauncherTests(unittest.TestCase):
                 command,
                 *common,
                 *(
-                    ("--binary64-lock", "state.json.binary64-lock.json")
+                    (
+                        "--binary64-lock",
+                        "state.json.binary64-lock.json",
+                        "--calibration-receipt-path",
+                        "calibration.json",
+                        "--calibration-receipt-sha256",
+                        "a" * 64,
+                    )
                     if command == "campaign-survey-promoted"
                     else ()
                 ),

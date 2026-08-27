@@ -388,9 +388,6 @@ class PromotedSurveySchedulerTests(unittest.TestCase):
                     )
                 ),
                 horizon_runner=lambda leaf: self.fail("unexpected horizon"),
-                produced_record_builder=lambda leaf, batch, screening, digits: (
-                    _record(leaf.leaf_id, digits)
-                ),
                 promoted_preflights_by_ordinal=(
                     {
                         ordinal: (
@@ -597,9 +594,6 @@ class PromotedSurveySchedulerTests(unittest.TestCase):
                     ),
                     primary_root_runner=primary_root_runner,
                     horizon_runner=lambda _leaf: self.fail("unexpected horizon"),
-                    produced_record_builder=lambda leaf, batch, screening, digits: (
-                        _record(leaf.leaf_id, digits)
-                    ),
                     promoted_preflights_by_ordinal={0: preflight},
                     layer1_lock_receipt_sha256="f" * 64,
                 )
@@ -634,9 +628,6 @@ class PromotedSurveySchedulerTests(unittest.TestCase):
                     "resume must reuse the retained BF40 root seal"
                 ),
                 horizon_runner=lambda _leaf: self.fail("unexpected horizon"),
-                produced_record_builder=lambda leaf, batch, screening, digits: (
-                    _record(leaf.leaf_id, digits)
-                ),
                 promoted_preflights_by_ordinal={0: preflight},
                 layer1_lock_receipt_sha256="f" * 64,
             )
@@ -758,9 +749,6 @@ class PromotedSurveySchedulerTests(unittest.TestCase):
                     ),
                     primary_root_runner=lambda *_args: self.fail("unexpected root"),
                     horizon_runner=lambda _leaf: self.fail("unexpected horizon"),
-                    produced_record_builder=lambda leaf, batch, screening, digits: (
-                        _record(leaf.leaf_id, digits)
-                    ),
                     promoted_preflights_by_ordinal={0: preflight},
                     layer1_lock_receipt_sha256="f" * 64,
                 )
@@ -791,9 +779,6 @@ class PromotedSurveySchedulerTests(unittest.TestCase):
                 ),
                 primary_root_runner=lambda *_args: self.fail("unexpected root"),
                 horizon_runner=lambda _leaf: self.fail("unexpected horizon"),
-                produced_record_builder=lambda leaf, batch, screening, digits: (
-                    _record(leaf.leaf_id, digits)
-                ),
                 promoted_preflights_by_ordinal={0: preflight},
                 layer1_lock_receipt_sha256="f" * 64,
             )
@@ -904,9 +889,6 @@ class PromotedSurveySchedulerTests(unittest.TestCase):
                 ),
                 primary_root_runner=lambda *args: self.fail("unexpected root"),
                 horizon_runner=lambda leaf: self.fail("unexpected horizon"),
-                produced_record_builder=lambda leaf, batch, screening, digits: (
-                    _record(leaf.leaf_id, digits)
-                ),
             )
 
             durable = json.loads(path.read_text(encoding="utf-8"))
@@ -1120,9 +1102,6 @@ class PromotedSurveySchedulerTests(unittest.TestCase):
                 ),
                 primary_root_runner=root_runner,
                 horizon_runner=lambda _leaf: self.fail("unexpected horizon"),
-                produced_record_builder=lambda leaf, batch, screening, digits: (
-                    _record(leaf.leaf_id, digits)
-                ),
             )
 
         self.assertEqual(
@@ -1221,9 +1200,6 @@ class PromotedSurveySchedulerTests(unittest.TestCase):
                     backend_factory=broken_factory,
                     primary_root_runner=lambda *args: self.fail("unexpected root"),
                     horizon_runner=lambda leaf: self.fail("unexpected horizon"),
-                    produced_record_builder=lambda *args: self.fail(
-                        "unexpected record"
-                    ),
                 )
             self.assertEqual([self.leaves[0].leaf_id], started)
             self.assertTrue(path.is_file())

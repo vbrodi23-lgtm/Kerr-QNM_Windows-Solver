@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import replace
+from decimal import Decimal
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
@@ -57,6 +58,10 @@ class PromotedAdmissionTests(unittest.TestCase):
             "7",
             "--review-receipt",
             "review.json",
+            "--calibration-receipt-path",
+            "calibration.json",
+            "--calibration-receipt-sha256",
+            "a" * 64,
         ])
 
         self.assertEqual("campaign-admit-promoted", parsed.command)
@@ -188,6 +193,7 @@ class PromotedAdmissionTests(unittest.TestCase):
                 path,
                 queue_ordinal=0,
                 independent_review_receipt=review,
+                calibration_receipt=calibration,
                 terminal_record_committed=lambda value: published.append(dict(value)),
             )
 
@@ -232,6 +238,7 @@ class PromotedAdmissionTests(unittest.TestCase):
                     path,
                     queue_ordinal=0,
                     independent_review_receipt=injected,
+                    calibration_receipt=calibration,
                 )
             self.assertEqual(original, path.read_bytes())
 
@@ -264,6 +271,7 @@ class PromotedAdmissionTests(unittest.TestCase):
                             path,
                             queue_ordinal=0,
                             independent_review_receipt=foreign,
+                            calibration_receipt=calibration,
                         )
                     self.assertEqual(original, path.read_bytes())
 
@@ -286,19 +294,23 @@ class PromotedAdmissionTests(unittest.TestCase):
                     path,
                     queue_ordinal=0,
                     independent_review_receipt=review,
+                    calibration_receipt=calibration,
                     terminal_record_committed=unavailable,
                 )
             durable = json.loads(path.read_text(encoding="utf-8"))
             self.assertEqual(
-                "AWAITING_ADMISSION",
+                "COMPLETED",
                 durable["promotion_queue"]["entries"][0]["disposition"],
             )
-            self.assertEqual([], durable["records"])
-            self.assertEqual({}, durable["evidence_ledger"])
+            self.assertEqual([record], durable["records"])
+            self.assertEqual(
+                "SCREENED", durable["evidence_ledger"]["leaf-1"]["evidence_level"]
+            )
             retried = admit_retained_promoted_checkpoint(
                 path,
                 queue_ordinal=0,
                 independent_review_receipt=review,
+                calibration_receipt=calibration,
                 terminal_record_committed=lambda value: published.append(dict(value)),
             )
 
@@ -345,6 +357,7 @@ class PromotedAdmissionTests(unittest.TestCase):
                         path,
                         queue_ordinal=0,
                         independent_review_receipt=review,
+                        calibration_receipt=calibration,
                         terminal_record_committed=publish_if_missing,
                     )
                 pending = json.loads(path.read_text(encoding="utf-8"))
@@ -352,10 +365,12 @@ class PromotedAdmissionTests(unittest.TestCase):
                     "AWAITING_ADMISSION",
                     pending["promotion_queue"]["entries"][0]["disposition"],
                 )
+                self.assertEqual([], published)
                 result = admit_retained_promoted_checkpoint(
                     path,
                     queue_ordinal=0,
                     independent_review_receipt=review,
+                    calibration_receipt=calibration,
                     terminal_record_committed=publish_if_missing,
                 )
 
@@ -381,9 +396,11 @@ class PromotedAdmissionTests(unittest.TestCase):
                     path,
                     queue_ordinal=0,
                     independent_review_receipt=review,
+                    calibration_receipt=calibration,
                 )
 
     def test_solver_reduces_a_retained_exterior_batch_without_new_numerics(self):
+        calibration = load_default_calibration_receipt()
         plan = build_campaign_plan(
             policy=NumericalPolicy(),
             backend_identity=VettedNativeDeterminantKernel.identity,
@@ -404,8 +421,10 @@ class PromotedAdmissionTests(unittest.TestCase):
             "delta_same_point": "1e-12",
             "delta_cross_precision": "1e-12",
             "delta_endpoint_series": "1e-12",
-            "safety_factor": "2",
-            "numerical_error_abs": "1e-12",
+            "safety_factor": str(calibration.certificate_safety_factor),
+            "numerical_error_abs": str(
+                Decimal(calibration.certificate_safety_factor) * Decimal("1e-12")
+            ),
         }
         batch = _batch(leaf, seal, 40)
         batch = replace(
@@ -420,16 +439,11 @@ class PromotedAdmissionTests(unittest.TestCase):
                 for sample in batch.samples
             ),
         )
-        queue_entry = {"queue_ordinal": 0, "leaf_id": leaf.leaf_id}
         cache_key, reuse_key = _promoted_background_key(leaf, seal, 40)
         background_receipt = _promoted_background_receipt(
-            leaf=leaf,
-            entry=queue_entry,
             batch=batch,
             cache_key_sha256=cache_key,
             reuse_key=reuse_key,
-            background_samples=tuple(batch.samples[:5]),
-            status="ACQUIRED",
             source_queue_ordinal=0,
             source_leaf_id=leaf.leaf_id,
         )
@@ -456,6 +470,7 @@ class PromotedAdmissionTests(unittest.TestCase):
             checkpoint,
             retained_stage,
             {"receipt_sha256": "b" * 64},
+            calibration,
             queue_ordinal=0,
         )
 
@@ -480,6 +495,7 @@ class PromotedAdmissionTests(unittest.TestCase):
                     path,
                     queue_ordinal=0,
                     independent_review_receipt=review,
+                    calibration_receipt=calibration,
                 )
 
 

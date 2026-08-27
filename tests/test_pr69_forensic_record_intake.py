@@ -524,7 +524,6 @@ class SchedulerForensicTests(unittest.TestCase):
                         precision_tiers=("BF80",),
                     )
                 ),
-                produced_record_builder=lambda *_args: self.fail("unexpected record"),
                 root_seal_publish=lambda *_args: self.fail("unexpected publish"),
                 solved_leaf_store=store,
             )
@@ -565,7 +564,6 @@ class SchedulerForensicTests(unittest.TestCase):
                 backend_factory=lambda *_args: self.fail("unexpected backend"),
                 primary_root_runner=lambda *_args: self.fail("unexpected root work"),
                 horizon_runner=lambda _leaf: self.fail("unexpected horizon work"),
-                produced_record_builder=lambda *_args: self.fail("unexpected record"),
                 root_seal_publish=lambda *_args: self.fail("unexpected publish"),
                 solved_leaf_store=store,
             )
