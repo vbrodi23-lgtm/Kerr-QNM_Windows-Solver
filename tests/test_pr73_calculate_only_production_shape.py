@@ -511,13 +511,31 @@ class PR73CalculateOnlyProductionShapeTests(unittest.TestCase):
                 and isinstance(entry["retained_promoted_stage_sha256"], str)
                 for entry in promoted.checkpoint["promotion_queue"]["entries"]
             ))
+            retained_stages = [
+                stage
+                for bucket in promoted.checkpoint[
+                    "promoted_stage_ledger"
+                ].values()
+                for stage in bucket.values()
+            ]
             self.assertTrue(all(
-                ledger[leaf_id]["raw_promoted_batches"]
-                and isinstance(
-                    ledger[leaf_id]["current_run_disagreement_terms"], list
-                )
-                for ledger in promoted.checkpoint["promoted_stage_ledger"].values()
-                for leaf_id in ledger
+                isinstance(stage["calculation_artifact"], dict)
+                and isinstance(stage["source_calculation_stage_sha256"], str)
+                and stage["calculation_chain"]
+                for stage in retained_stages
+            ))
+            self.assertTrue(all(
+                len(stage["raw_promoted_batches"]) == 2
+                and isinstance(stage["current_run_disagreement_terms"], list)
+                for stage in retained_stages
+                if stage["route"] == "EXTERIOR_BF40"
+            ))
+            self.assertTrue(all(
+                not stage["raw_promoted_batches"]
+                and stage["calculation_artifact"]["schema"]
+                == "windows-solver.promoted-horizon-calculation/3"
+                for stage in retained_stages
+                if stage["route"] == "HORIZON_BF80"
             ))
             self.assertEqual(
                 {"BF40": 172, "BF80": 40},

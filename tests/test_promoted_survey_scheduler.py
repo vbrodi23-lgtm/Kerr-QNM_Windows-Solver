@@ -945,7 +945,8 @@ class PromotedSurveySchedulerTests(unittest.TestCase):
             self.leaves[0].leaf_id
         ]
         self.assertEqual(0, ledger["root_read_limit"])
-        self.assertEqual(2, ledger["worker_launch_limit"])
+        self.assertEqual(2, ledger["worker_launch_count"])
+        self.assertEqual(4, ledger["worker_launch_limit"])
         self.assertEqual(["BF40"], [
             item["tier"] for item in ledger["tier_timing"]
         ])
