@@ -31,6 +31,10 @@ from .campaign_policy import (
     empty_schema11_checkpoint,
     validate_schema11_checkpoint,
 )
+from .campaign_failures import (
+    resolve_system_failure_for_resume,
+    system_failure_resolution_index,
+)
 from .campaign_evidence import (
     EvidencePassRequest,
     EvidenceStrengtheningPolicy,
@@ -356,6 +360,37 @@ def build_parser() -> argparse.ArgumentParser:
     )
     campaign_admit_promoted.add_argument(
         "--calibration-receipt-sha256", required=True
+    )
+    campaign_resolve_system_failure = commands.add_parser(
+        "campaign-resolve-system-failure",
+        help=(
+            "append an authenticated resolution of one retained software "
+            "failure before resuming unretained Layer-2 work"
+        ),
+    )
+    campaign_resolve_system_failure.add_argument("selection", type=Path)
+    campaign_resolve_system_failure.add_argument(
+        "--checkpoint", type=Path, required=True
+    )
+    campaign_resolve_system_failure.add_argument(
+        "--binary64-lock", type=Path, required=True
+    )
+    campaign_resolve_system_failure.add_argument(
+        "--failure-receipt-sha256", required=True
+    )
+    campaign_resolve_system_failure.add_argument(
+        "--calibration-receipt-path", type=Path, required=True
+    )
+    campaign_resolve_system_failure.add_argument(
+        "--calibration-receipt-sha256", required=True
+    )
+    campaign_resolve_system_failure.add_argument(
+        "--repair-commit",
+        required=True,
+        help="full public Git commit SHA carrying the repair",
+    )
+    campaign_resolve_system_failure.add_argument(
+        "--reason", required=True, help="operator incident-resolution reason"
     )
     for name, help_text in (
         ("campaign-survey-binary64", "run only the schema-11 binary64 survey pass"),
@@ -1341,6 +1376,10 @@ def _campaign_schema11_validate(
         "unresolved_count": projection.unresolved_count,
         "rejected_count": projection.rejected_count,
         "system_failure_count": projection.system_failure_count,
+        "active_system_failure_count": projection.active_system_failure_count,
+        "historical_system_failure_count": (
+            projection.historical_system_failure_count
+        ),
         "binary64_pass_count": projection.binary64_processed_count,
         "promoted_pass_count": projection.promoted_processed_count,
         "promotion_queue_count": projection.pending_count,
@@ -1412,6 +1451,83 @@ def _campaign_admit_promoted(
         "determinant_evaluation_count": result.determinant_evaluation_count,
         "binary64_evaluation_count": result.binary64_evaluation_count,
         "evidence_level": "SCREENED",
+        "release_admissible": False,
+    }
+
+
+def _campaign_resolve_system_failure(
+    selection_path: Path,
+    checkpoint_path: Path,
+    *,
+    binary64_lock_path: Path,
+    system_failure_receipt_sha256: str,
+    calibration_receipt_path: Path,
+    calibration_receipt_sha256: str,
+    repair_commit_sha: str,
+    reason: str,
+) -> tuple[int, object]:
+    """Close one retained software incident without altering numerical state.
+
+    This is deliberately separate from the promoted scheduler.  It verifies
+    the immutable Layer-1 lock and the exact calibration authority, appends a
+    canonical receipt, and refreshes reports.  It never changes a queue entry,
+    raw calculation, retained promoted stage, terminal record, or evidence.
+    """
+
+    (
+        plan,
+        selection,
+        _descriptor,
+        recovery_selection,
+        resolved,
+        checkpoint,
+    ) = _load_schema11_campaign(selection_path, checkpoint_path)
+    calibration_receipt = load_calibration_receipt(
+        _resolve_recovery_path(calibration_receipt_path),
+        calibration_receipt_sha256,
+    )
+    from .binary64_layer_lock import (
+        load_binary64_layer_lock,
+        validate_binary64_layer_lock,
+    )
+
+    lock = validate_binary64_layer_lock(
+        load_binary64_layer_lock(_resolve_recovery_path(binary64_lock_path)),
+        checkpoint,
+        selection=recovery_selection,
+        leaf_mechanism_ids=_schema11_leaf_mechanism_ids(plan, recovery_selection),
+        auxiliary_evidence_manifest=_schema11_binary64_lock_manifest(
+            plan, checkpoint, resolved
+        ),
+    )
+    updated, resolution = resolve_system_failure_for_resume(
+        checkpoint,
+        system_failure_receipt_sha256=system_failure_receipt_sha256,
+        expected_authority_sha256=(
+            calibration_receipt.independent_review_authority_sha256
+        ),
+        calibration_receipt_sha256=calibration_receipt.sha256,
+        binary64_lock_receipt_sha256=lock["receipt_sha256"],
+        repair_commit_sha=repair_commit_sha,
+        reason=reason,
+    )
+    # Persist the receipt before deriving a disposable report view.  A report
+    # problem can never erase the operator's incident decision.
+    _atomic_export(resolved, updated)
+    refreshed = refresh_schema11_reports(plan, selection, updated, resolved)
+    resolutions = system_failure_resolution_index(refreshed)
+    historical = len(resolutions)
+    return 0, {
+        "command": "campaign-resolve-system-failure",
+        "campaign_id": refreshed["campaign_id"],
+        "selection_id": refreshed["selection_id"],
+        "checkpoint_path": str(resolved),
+        "system_failure_receipt_sha256": system_failure_receipt_sha256,
+        "resolution_receipt_sha256": resolution["receipt_sha256"],
+        "repair_commit_sha": resolution["repair_commit_sha"],
+        "active_system_failure_count": len(refreshed["system_failures"])
+        - historical,
+        "historical_system_failure_count": historical,
         "release_admissible": False,
     }
 
@@ -2257,6 +2373,19 @@ def main(argv: Sequence[str] | None = None) -> int:
                 review_receipt_path=arguments.review_receipt,
                 calibration_receipt_path=arguments.calibration_receipt_path,
                 calibration_receipt_sha256=arguments.calibration_receipt_sha256,
+            )
+        elif arguments.command == "campaign-resolve-system-failure":
+            status, output = _campaign_resolve_system_failure(
+                arguments.selection,
+                arguments.checkpoint,
+                binary64_lock_path=arguments.binary64_lock,
+                system_failure_receipt_sha256=(
+                    arguments.failure_receipt_sha256
+                ),
+                calibration_receipt_path=arguments.calibration_receipt_path,
+                calibration_receipt_sha256=arguments.calibration_receipt_sha256,
+                repair_commit_sha=arguments.repair_commit,
+                reason=arguments.reason,
             )
         elif arguments.command in {
             "campaign-run", "campaign-resume", "campaign-validate"

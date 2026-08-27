@@ -20,6 +20,7 @@ import tempfile
 from typing import Callable, Mapping, Sequence
 
 from .contracts import canonical_json_bytes
+from .campaign_failures import system_failure_resolution_index
 from .response_batches import (
     CampaignLeafRecord,
     CampaignPlan,
@@ -110,6 +111,10 @@ SCHEMA11_RESOURCE_FAILURE_COLUMNS = (
     "cause_type",
     "fingerprint_sha256",
     "receipt_sha256",
+    "resolution_state",
+    "resolution_receipt_sha256",
+    "resolution_repair_commit_sha",
+    "resolution_reason",
 )
 
 
@@ -1874,14 +1879,31 @@ def _schema11_basic_rows(
                 "admission_state": admission_state,
                 "disagreement_term_sha256": _schema11_digest(term),
             })
-    failures = tuple({
-        "failure_ordinal": ordinal,
-        "leaf_id": item.get("leaf_id"),
-        "failure_code": item.get("failure_code"),
-        "cause_type": item.get("cause_type"),
-        "fingerprint_sha256": item.get("fingerprint_sha256"),
-        "receipt_sha256": item.get("receipt_sha256"),
-    } for ordinal, item in enumerate(checkpoint["system_failures"], start=1))
+    resolutions = system_failure_resolution_index(checkpoint)
+    failures = tuple(
+        {
+            "failure_ordinal": ordinal,
+            "leaf_id": item.get("leaf_id"),
+            "failure_code": item.get("failure_code"),
+            "cause_type": item.get("cause_type"),
+            "fingerprint_sha256": item.get("fingerprint_sha256"),
+            "receipt_sha256": item.get("receipt_sha256"),
+            "resolution_state": (
+                "RESOLVED" if resolution is not None else "ACTIVE"
+            ),
+            "resolution_receipt_sha256": (
+                None if resolution is None else resolution["receipt_sha256"]
+            ),
+            "resolution_repair_commit_sha": (
+                None if resolution is None else resolution["repair_commit_sha"]
+            ),
+            "resolution_reason": (
+                None if resolution is None else resolution["reason"]
+            ),
+        }
+        for ordinal, item in enumerate(checkpoint["system_failures"], start=1)
+        for resolution in (resolutions.get(item.get("receipt_sha256")),)
+    )
     return tuple(leaf_rows), tuple(stage_rows), tuple(channel_rows), failures
 
 
