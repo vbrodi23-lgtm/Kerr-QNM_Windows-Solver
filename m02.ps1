@@ -250,6 +250,11 @@ try {
         $CheckpointStatus "recovered_terminal_count" $ProducedCount
     $EvidenceCounts = Get-OptionalProperty `
         $CheckpointStatus "evidence_counts" @{}
+    $ActiveSystemFailures = Get-OptionalProperty `
+        $CheckpointStatus "active_system_failure_count" `
+        (Get-OptionalProperty $CheckpointStatus "system_failure_count" 0)
+    $HistoricalSystemFailures = Get-OptionalProperty `
+        $CheckpointStatus "historical_system_failure_count" 0
     $BasicReportDirectory = Get-OptionalProperty `
         $CheckpointStatus "basic_report_directory" "-"
     Write-Host "M02 campaign startup" -ForegroundColor Cyan
@@ -276,6 +281,8 @@ try {
     Write-Host ("    Pending BF80             : {0}" -f $PendingBF80)
     Write-Host ("    Recovered terminal count : {0}" -f $RecoveredTerminalCount)
     Write-Host ("    Evidence counts          : {0}" -f ($EvidenceCounts | ConvertTo-Json -Compress))
+    Write-Host ("    Active system failures   : {0}" -f $ActiveSystemFailures)
+    Write-Host ("    Historical failures      : {0}" -f $HistoricalSystemFailures)
     Write-Host ("    Basic report directory   : {0}" -f $BasicReportDirectory)
     Write-Host ("    Status path              : {0}" -f "$CheckpointPath.status.json")
     function Ensure-Binary64Lock {
