@@ -75,10 +75,10 @@ const FIXED_ROOT_SURVEY_POLICY_FIELDS = Set((
     "promoted_control_calibration_receipt_sha256",
     "empirical_control_profile_sha256",
     "determinant_error_model",
-    "determinant_error_safety_factor",
-    "determinant_error_required_term_classes",
+    "determinant_error_channel_schema",
+    "determinant_error_required_channels",
+    "determinant_error_calibration_status",
     "determinant_error_missing_evidence_outcome",
-    "determinant_error_certificate_statement",
     "determinant_error_preceding_precision_tier",
 ))
 const PROMOTED_ROOT_READOUT_POLICY_ID =
@@ -8424,31 +8424,70 @@ function validate_request_batch(batch)
     documents = required(batch, "requests")
     documents isa Vector ||
         error("promoted-request preflight requests are invalid")
-    length(documents) == 10 ||
+    length(documents) == 16 ||
         error("promoted-request preflight request count is invalid")
-    observed = Set{Tuple{String,Int,Int}}()
+    observed_promoted = Set{Tuple{String,Int,Int}}()
+    observed_fixed_root = Set{Tuple{Int,String,String}}()
     request_sha256s = String[]
     for document in documents
         document isa AbstractDict ||
             error("promoted-request preflight document is invalid")
-        request = flatten_request(document)
-        validate_worker_request_contract(request)
-        mechanism = string(required(request, "mechanism_id"))
-        digits = parse_integer(request, "precision_digits")
-        refinement = parse_integer(request, "refinement_level")
-        push!(observed, (mechanism, digits, refinement))
+        operation = string(required(document, "operation"))
+        request = if operation == FIXED_ROOT_SURVEY_BATCH_OPERATION
+            fixed_root_request = flatten_fixed_root_survey_request(document)
+            digits, _, roles, _ =
+                validate_fixed_root_survey_request(fixed_root_request)
+            push!(observed_fixed_root, (
+                digits,
+                string(required(
+                    fixed_root_request, "scientific_operation_identity"
+                )),
+                join(roles, "|"),
+            ))
+            fixed_root_request
+        elseif operation == "root-readout"
+            promoted_request = flatten_request(document)
+            validate_worker_request_contract(promoted_request)
+            mechanism = string(required(promoted_request, "mechanism_id"))
+            digits = parse_integer(promoted_request, "precision_digits")
+            refinement = parse_integer(promoted_request, "refinement_level")
+            push!(observed_promoted, (mechanism, digits, refinement))
+            promoted_request
+        else
+            error("promoted-request preflight document operation is invalid")
+        end
         push!(request_sha256s, string(required(request, "request_sha256")))
     end
-    expected = Set{Tuple{String,Int,Int}}(
+    expected_promoted = Set{Tuple{String,Int,Int}}(
         ("exterior-light-ring", digits, refinement)
         for digits in (40, 80, 120) for refinement in (0, 1)
     )
-    union!(expected, Set{Tuple{String,Int,Int}}(
+    union!(expected_promoted, Set{Tuple{String,Int,Int}}(
         ("horizon-admittance", digits, refinement)
         for digits in (80, 120) for refinement in (0, 1)
     ))
-    observed == expected ||
+    observed_promoted == expected_promoted ||
         error("promoted-request preflight matrix is invalid")
+    expected_fixed_root = Set{Tuple{Int,String,String}}()
+    for digits in (40, 80)
+        push!(expected_fixed_root, (
+            digits,
+            FIXED_ROOT_SURVEY_IDENTITY,
+            join(FIXED_ROOT_SURVEY_ROLES, "|"),
+        ))
+        push!(expected_fixed_root, (
+            digits,
+            CANONICAL_EXTERIOR_BACKGROUND_IDENTITY,
+            join(FIXED_ROOT_SURVEY_BACKGROUND_ROLES, "|"),
+        ))
+        push!(expected_fixed_root, (
+            digits,
+            FIXED_ROOT_SURVEY_IDENTITY,
+            join(FIXED_ROOT_SURVEY_COORDINATE_ROLES, "|"),
+        ))
+    end
+    observed_fixed_root == expected_fixed_root ||
+        error("fixed-root survey preflight matrix is invalid")
     return Dict(
         "schema_version" => 1,
         "status" => "ok",

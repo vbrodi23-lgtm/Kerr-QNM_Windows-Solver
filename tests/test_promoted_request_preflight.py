@@ -12,6 +12,7 @@ from unittest.mock import patch
 
 from windows_solver.contracts import canonical_json_bytes
 from windows_solver.julia_response_backend import (
+    FIXED_ROOT_SURVEY_BATCH_OPERATION,
     JuliaResponseAdapter,
     JuliaResponseBackendError,
     _validate_promoted_request_preflight_response,
@@ -136,10 +137,13 @@ class PromotedRequestPreflightTests(unittest.TestCase):
         body = source[start:end]
 
         self.assertIn("flatten_request(document)", body)
-        self.assertIn("validate_worker_request_contract(request)", body)
+        self.assertIn("validate_worker_request_contract(", body)
+        self.assertIn("flatten_fixed_root_survey_request(document)", body)
+        self.assertIn("validate_fixed_root_survey_request(", body)
         for forbidden in (
             "evaluate_request(",
             "result_fields(",
+            "fixed_root_survey_batch_fields(",
             "fixed_root_determinant_sample_fields(",
             "setprecision(",
         ):
@@ -154,9 +158,17 @@ class PromotedRequestPreflightTests(unittest.TestCase):
         self.assertIn("JSON.parsefile(ARGS[1])", source)
         self.assertNotIn("function promoted_exterior_document()", source)
         self.assertIn('case["label"]', source)
+        self.assertIn("flatten_fixed_root_survey_request(document)", source)
+        self.assertIn("validate_fixed_root_survey_request(request)", source)
+        self.assertNotIn("fixed_root_survey_batch_fields(", source)
 
     def test_matrix_uses_actual_production_requests_and_wire_types(self):
         _, receipt, documents = _preflight_documents()
+        root_documents = [
+            document
+            for document in documents
+            if document["operation"] == "root-readout"
+        ]
 
         self.assertEqual(
             [
@@ -165,7 +177,7 @@ class PromotedRequestPreflightTests(unittest.TestCase):
                     item["precision_digits"],
                     item["refinement_level"],
                 )
-                for item in documents
+                for item in root_documents
             ],
             [
                 ("exterior-light-ring", 40, 0),
@@ -180,7 +192,7 @@ class PromotedRequestPreflightTests(unittest.TestCase):
                 ("horizon-admittance", 120, 1),
             ],
         )
-        for document in documents:
+        for document in root_documents:
             if document["mechanism_id"] == "horizon-admittance":
                 value = document["policy"]["determinant_error_safety_factor"]
                 self.assertIs(type(value), str)
@@ -198,12 +210,72 @@ class PromotedRequestPreflightTests(unittest.TestCase):
                 )
                 self.assertEqual(document["required_raw_determinant_count"], 1)
 
+    def test_fixed_root_matrix_uses_all_named_plans_at_bf40_and_bf80(self):
+        _, _, documents = _preflight_documents()
+        fixed_root_documents = [
+            document
+            for document in documents
+            if document["operation"] == FIXED_ROOT_SURVEY_BATCH_OPERATION
+        ]
+        full_roles = [
+            "D0",
+            "DOMEGA_REAL_PLUS_H",
+            "DOMEGA_REAL_MINUS_H",
+            "DOMEGA_REAL_PLUS_HALF_H",
+            "DOMEGA_REAL_MINUS_HALF_H",
+            "DC_PLUS_EPSILON",
+            "DC_MINUS_EPSILON",
+            "DC_PLUS_HALF_EPSILON",
+            "DC_MINUS_HALF_EPSILON",
+        ]
+        background_roles = full_roles[:5]
+        mechanism_roles = full_roles[5:]
+
+        self.assertEqual(
+            [
+                (
+                    document["precision_digits"],
+                    document["scientific_operation_identity"],
+                    document["sample_roles"],
+                )
+                for document in fixed_root_documents
+            ],
+            [
+                (40, "exterior-fixed-root-survey-raw/v1", full_roles),
+                (
+                    40,
+                    "canonical-exterior-background-wronskian/v1",
+                    background_roles,
+                ),
+                (40, "exterior-fixed-root-survey-raw/v1", mechanism_roles),
+                (80, "exterior-fixed-root-survey-raw/v1", full_roles),
+                (
+                    80,
+                    "canonical-exterior-background-wronskian/v1",
+                    background_roles,
+                ),
+                (80, "exterior-fixed-root-survey-raw/v1", mechanism_roles),
+            ],
+        )
+        for document in fixed_root_documents:
+            policy = document["policy"]
+            self.assertEqual(
+                policy["determinant_error_model"],
+                "exterior-determinant-additive-channels/provisional-v1",
+            )
+            self.assertIn("determinant_error_channel_schema", policy)
+            self.assertIn("determinant_error_required_channels", policy)
+            self.assertIn("determinant_error_calibration_status", policy)
+            self.assertNotIn("determinant_error_safety_factor", policy)
+            self.assertNotIn("determinant_error_required_term_classes", policy)
+            self.assertNotIn("determinant_error_certificate_statement", policy)
+
     def test_contract_fixture_is_canonical_python_json_with_typed_negatives(self):
         _, _, documents = _preflight_documents()
         fixture = build_promoted_request_contract_fixture(documents)
         round_tripped = json.loads(canonical_json_bytes(fixture))
 
-        self.assertEqual(len(round_tripped["requests"]), 10)
+        self.assertEqual(len(round_tripped["requests"]), 16)
         self.assertEqual(
             [case["label"] for case in round_tripped["invalid_exterior_cases"]],
             ["string", "floating-point", "boolean", "wrong-integer", "null"],

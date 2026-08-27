@@ -1,6 +1,7 @@
 # Cross-language no-solver request-boundary contract.
-# Python generates every document through JuliaPrecisionRootBackend._request and
-# canonical JSON. This spec only parses, flattens, and validates those bytes.
+# Python generates every document through JuliaPrecisionRootBackend production
+# request builders and canonical JSON. This spec only parses, flattens, and
+# validates those bytes.
 
 using Test
 
@@ -62,13 +63,28 @@ function flatten_validation_result(document)
     end
 end
 
+function fixed_root_flatten_validation_result(document)
+    try
+        request = flatten_fixed_root_survey_request(document)
+        validate_fixed_root_survey_request(request)
+        return request, nothing
+    catch failure
+        return nothing, sprint(showerror, failure)
+    end
+end
+
 @testset "Python production promoted-request matrix passes Julia schema gate" begin
-    @test length(requests) == 10
+    @test length(requests) == 16
     for document in requests
-        flattened, failure = flatten_validation_result(document)
-        @test failure === nothing
-        if flattened !== nothing
-            @test validate_worker_request_contract(flattened) !== nothing
+        if document["operation"] == FIXED_ROOT_SURVEY_BATCH_OPERATION
+            _, failure = fixed_root_flatten_validation_result(document)
+            @test failure === nothing
+        else
+            flattened, failure = flatten_validation_result(document)
+            @test failure === nothing
+            if flattened !== nothing
+                @test validate_worker_request_contract(flattened) !== nothing
+            end
         end
     end
 
@@ -80,12 +96,51 @@ end
     )
     response = validate_request_batch(batch)
     @test response["status"] == "ok"
-    @test response["request_count"] == 10
+    @test response["request_count"] == 16
+end
+
+@testset "fixed-root survey matrix passes the real Julia parser" begin
+    fixed_root_requests = filter(requests) do document
+        document["operation"] == FIXED_ROOT_SURVEY_BATCH_OPERATION
+    end
+    @test length(fixed_root_requests) == 6
+    observed = Set{Tuple{Int,String,String}}()
+    for document in fixed_root_requests
+        request, failure = fixed_root_flatten_validation_result(document)
+        @test failure === nothing
+        if request !== nothing
+            push!(observed, (
+                parse_integer(request, "precision_digits"),
+                string(required(request, "scientific_operation_identity")),
+                join(required(request, "sample_roles"), "|"),
+            ))
+        end
+    end
+    expected = Set{Tuple{Int,String,String}}()
+    for digits in (40, 80)
+        push!(expected, (
+            digits,
+            FIXED_ROOT_SURVEY_IDENTITY,
+            join(FIXED_ROOT_SURVEY_ROLES, "|"),
+        ))
+        push!(expected, (
+            digits,
+            CANONICAL_EXTERIOR_BACKGROUND_IDENTITY,
+            join(FIXED_ROOT_SURVEY_BACKGROUND_ROLES, "|"),
+        ))
+        push!(expected, (
+            digits,
+            FIXED_ROOT_SURVEY_IDENTITY,
+            join(FIXED_ROOT_SURVEY_COORDINATE_ROLES, "|"),
+        ))
+    end
+    @test observed == expected
 end
 
 @testset "default exterior request selects the provisional one-role contract" begin
     exterior = only(filter(requests) do document
-        document["mechanism_id"] == "exterior-light-ring" &&
+        document["operation"] == "root-readout" &&
+            document["mechanism_id"] == "exterior-light-ring" &&
             document["precision_digits"] == 80 &&
             document["refinement_level"] == 0
     end)
@@ -114,7 +169,8 @@ end
     end
 
     horizon = only(filter(requests) do document
-        document["mechanism_id"] == "horizon-admittance" &&
+        document["operation"] == "root-readout" &&
+            document["mechanism_id"] == "horizon-admittance" &&
             document["precision_digits"] == 80 &&
             document["refinement_level"] == 0
     end)
@@ -214,7 +270,8 @@ end
 
 @testset "exterior policy fields fail closed independently" begin
     exterior = only(filter(requests) do document
-        document["mechanism_id"] == "exterior-light-ring" &&
+        document["operation"] == "root-readout" &&
+            document["mechanism_id"] == "exterior-light-ring" &&
             document["precision_digits"] == 80 &&
             document["refinement_level"] == 0
     end)

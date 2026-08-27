@@ -5640,7 +5640,7 @@ def promoted_request_preflight_documents(
     adapter: object,
     calibration_receipt: PromotedControlCalibrationReceipt,
 ) -> tuple[dict[str, object], ...]:
-    """Build every supported promoted policy shape through production code."""
+    """Build every promoted root and fixed-root wire shape through production."""
 
     if exterior_job.mechanism_id != "exterior-light-ring":
         raise ValueError("promoted-request preflight exterior job is invalid")
@@ -5676,6 +5676,40 @@ def promoted_request_preflight_documents(
             calibration_receipt=calibration_receipt,
         )
         requests.append(backend.preview_root_request(job, 0.0j))
+    # This digest is a contract-preflight placeholder, not root evidence.  It
+    # exists only so the real fixed-root parser can authenticate the complete
+    # production envelope without asking a root provider or running numerics.
+    preflight_root_seal_sha256 = hashlib.sha256(canonical_json_bytes({
+        "schema": "windows-solver.fixed-root-survey-preflight-root/1",
+        "root_reference_id": exterior_job.root.root_reference_id,
+        "branch_identity": exterior_job.root.branch_id,
+        "fixed_root": {
+            "real": format(exterior_job.root.omega.real, ".17g"),
+            "imaginary": format(exterior_job.root.omega.imag, ".17g"),
+        },
+    })).hexdigest()
+    for digits in (40, 80):
+        backend = JuliaPrecisionRootBackend(
+            exterior_job.backend_identity,
+            adapter,
+            digits,
+            empirical_control_profile=calibration_receipt.budget_for(
+                "exterior-wronskian/v1", digits
+            ),
+            calibration_receipt=calibration_receipt,
+        )
+        for plan in (
+            FixedRootSurveyPlan.FULL_NINE,
+            FixedRootSurveyPlan.CANONICAL_BACKGROUND_FIVE,
+            FixedRootSurveyPlan.MECHANISM_COMPONENT_FOUR,
+        ):
+            requests.append(backend.preview_fixed_root_survey_request(
+                exterior_job,
+                fixed_root=exterior_job.root.omega,
+                root_seal_sha256=preflight_root_seal_sha256,
+                branch_identity=exterior_job.root.branch_id,
+                plan=plan,
+            ))
     return tuple(requests)
 
 
@@ -5689,7 +5723,8 @@ def build_promoted_request_contract_fixture(
     exterior = next(
         document
         for document in documents
-        if document["mechanism_id"] == "exterior-light-ring"
+        if document["operation"] == "root-readout"
+        and document["mechanism_id"] == "exterior-light-ring"
         and document["precision_digits"] == 80
         and document["refinement_level"] == 0
     )
