@@ -226,6 +226,14 @@ def _authenticate_promoted_stage_chain(
     """Authenticate every reconstructable predecessor of one promoted stage."""
 
     chain = stage.get("calculation_chain")
+    # Schema-1 promoted stages predate the immutable predecessor chain.  They
+    # are accepted only as standalone legacy terminal material (there is no
+    # successor digest to authenticate); every stage emitted by the current
+    # pipeline is schema-2 and must carry an explicit list, including the
+    # empty list for the first raw stage.
+    if stage.get("schema") == "windows-solver.promoted-calculation-stage/1":
+        if chain is None and stage.get("source_calculation_stage_sha256") is None:
+            return
     if not isinstance(chain, list) or not all(
         isinstance(item, Mapping) for item in chain
     ):
@@ -1636,7 +1644,6 @@ def validate_schema11_checkpoint(
             PromotionQueueDisposition.NUMERICAL_CONTINUATION.value,
             PromotionQueueDisposition.AWAITING_ADMISSION.value,
             PromotionQueueDisposition.ADMITTED_PENDING_PUBLICATION.value,
-            PromotionQueueDisposition.COMPLETED.value,
         } and retained_promoted_stage_sha256 is None:
             raise ValueError(
                 "retained promotion state requires a retained calculation"

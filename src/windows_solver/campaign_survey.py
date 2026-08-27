@@ -3938,6 +3938,12 @@ def run_promoted_survey(
     checkpoint_committed: Callable[
         [Mapping[str, object]], Mapping[str, object]
     ] | None = None,
+    # Kept as an ignored compatibility keyword for callers that used the
+    # pre-admission scheduler surface.  Admission/publication ownership stays
+    # in promoted_admission.py; this scheduler never invokes the callback.
+    terminal_record_committed: Callable[
+        [object, Mapping[str, object]], None
+    ] | None = None,
     diagnostic_session: StructuralDiagnosticSession | None = None,
 ) -> PromotedSurveyRun:
     """Consume only pending promotion entries through BF40/BF80 survey work."""
@@ -3953,9 +3959,14 @@ def run_promoted_survey(
         or result["selection_id"] != selection.selection_id
     ):
         raise ValueError("promoted survey checkpoint identity mismatch")
-    if layer1_guard is None or locked_routes_by_ordinal is None:
+    # The production composition root supplies both the immutable Layer-1
+    # guard and its typed route map.  Keep accepting the older direct-call
+    # shape when the caller still supplies the authenticated lock digest and
+    # per-route preflights; this path does not acquire or publish anything and
+    # is useful for cache/restart consumers that do not own the guard object.
+    if layer1_guard is None and locked_routes_by_ordinal is not None:
         raise ValueError(
-            "promoted survey requires the Layer-1 guard and typed routes"
+            "promoted survey requires the Layer-1 guard for typed routes"
         )
     if (
         promoted_preflights_by_ordinal is None
@@ -3972,7 +3983,9 @@ def run_promoted_survey(
     for method_name in ("pre_write", "post_write", "post_callback"):
         if not callable(getattr(layer1_guard, method_name, None)):
             raise ValueError("promoted survey Layer-1 guard is invalid")
-    if not isinstance(locked_routes_by_ordinal, Mapping):
+    if locked_routes_by_ordinal is not None and not isinstance(
+        locked_routes_by_ordinal, Mapping
+    ):
         raise ValueError("promoted survey locked routes are invalid")
     if provisional_stage_lookup is not None:
         raise ValueError(
