@@ -3256,6 +3256,9 @@ def _run_promoted_exterior_queue_entry(
             worker_launch_count=worker_launches,
             evidence_receipts=tuple(receipts),
             calculation_artifact=calculation_mapping,
+            source_calculation_stage_sha256=(
+                source_calculation_stage_sha256
+            ),
             calculation_chain=tuple(calculation_chain),
         )
         # The checkpoint must include the completed numerical timing too; an

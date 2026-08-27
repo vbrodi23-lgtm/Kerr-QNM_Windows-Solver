@@ -457,18 +457,46 @@ class PR73CalculateOnlyProductionShapeTests(unittest.TestCase):
             self.assertEqual([], promoted.checkpoint["records"])
             self.assertEqual(212, len(promoted.checkpoint["promoted_stage_ledger"]))
             self.assertEqual(
-                172, len(promoted.checkpoint["promoted_background_ledger"])
+                48, len(promoted.checkpoint["promoted_background_ledger"])
             )
             self.assertEqual(40, len(promoted.checkpoint["promoted_root_ledger"]))
-            background_statuses = [
-                entry[leaf_id]["payload"]["background_receipts"][0]["status"]
-                for entry in promoted.checkpoint[
+            canonical_backgrounds = {
+                receipt["receipt_sha256"]: receipt
+                for bucket in promoted.checkpoint[
                     "promoted_background_ledger"
                 ].values()
-                for leaf_id in entry
+                for entry in bucket.values()
+                for receipt in entry["payload"]["background_receipts"]
+            }
+            self.assertEqual(48, len(canonical_backgrounds))
+            exterior_bindings = [
+                (
+                    stage["queue_ordinal"],
+                    stage["calculation_artifact"]["background"][
+                        "background_receipt_sha256"
+                    ],
+                )
+                for bucket in promoted.checkpoint[
+                    "promoted_stage_ledger"
+                ].values()
+                for stage in bucket.values()
+                if stage["route"] == "EXTERIOR_BF40"
             ]
-            self.assertEqual(48, background_statuses.count("ACQUIRED"))
-            self.assertEqual(124, background_statuses.count("REUSED"))
+            self.assertEqual(172, len(exterior_bindings))
+            self.assertEqual(
+                set(canonical_backgrounds),
+                {receipt_sha256 for _, receipt_sha256 in exterior_bindings},
+            )
+            self.assertEqual(
+                124,
+                sum(
+                    ordinal
+                    != canonical_backgrounds[receipt_sha256][
+                        "source_queue_ordinal"
+                    ]
+                    for ordinal, receipt_sha256 in exterior_bindings
+                ),
+            )
             self.assertGreater(guard_phase_counts["pre_write"], 212)
             self.assertEqual(
                 guard_phase_counts["pre_write"],
