@@ -298,6 +298,8 @@ def _refresh_runtime_reports(
             PromotionQueueDisposition.PENDING.value,
             PromotionQueueDisposition.CALCULATED_PENDING_DERIVATION.value,
             PromotionQueueDisposition.NUMERICAL_CONTINUATION.value,
+            PromotionQueueDisposition.AWAITING_ADMISSION.value,
+            PromotionQueueDisposition.ADMITTED_PENDING_PUBLICATION.value,
         }
     )
     triage_ready = (
@@ -460,7 +462,7 @@ def _completed_horizon_source_is_authenticated(
         or promoted.get("operation_identity")
         != "promoted-independent-review-admission/v1"
         or promoted.get("reason_code")
-        != "ADMITTED_AFTER_INDEPENDENT_REVIEW"
+        != "PUBLISHED_AFTER_DURABLE_ADMISSION"
         or promoted.get("precision_tiers") != ["BF80"]
         or promoted.get("source_record_sha256") != source_record_sha256
         or promoted.get("result_record_sha256") != source_record_sha256
@@ -499,22 +501,6 @@ def _completed_horizon_source_is_authenticated(
     ):
         return False
 
-    if not any(
-        isinstance(receipt, Mapping)
-        and receipt.get("schema")
-        == "windows-solver.independent-promoted-review-receipt/1"
-        and receipt.get("decision") == "ADMIT_SCREENED"
-        and receipt.get("queue_ordinal") == queue_ordinal
-        and receipt.get("leaf_id") == leaf_id
-        and receipt.get("route") == "HORIZON_BF80"
-        and receipt.get("source_fingerprint_sha256") == expected_fingerprint
-        and receipt.get("receipt_sha256")
-        == queue_entry.get("disposition_receipt_sha256")
-        and _receipt_digest_is_valid(receipt)
-        for receipt in receipts
-    ):
-        return False
-
     evidence_ledger = checkpoint.get("evidence_ledger", {})
     evidence = (
         evidence_ledger.get(leaf_id)
@@ -528,6 +514,47 @@ def _completed_horizon_source_is_authenticated(
         or evidence.get("central_stage_sha256") != source_stage_sha256
         or not isinstance(receipts, list)
     ):
+        return False
+    review_receipt = next(
+        (
+            receipt
+            for receipt in receipts
+            if isinstance(receipt, Mapping)
+            and receipt.get("schema")
+            == "windows-solver.independent-promoted-review-receipt/1"
+            and receipt.get("decision") == "ADMIT_SCREENED"
+            and receipt.get("queue_ordinal") == queue_ordinal
+            and receipt.get("leaf_id") == leaf_id
+            and receipt.get("route") == "HORIZON_BF80"
+            and receipt.get("source_fingerprint_sha256") == expected_fingerprint
+            and _receipt_digest_is_valid(receipt)
+        ),
+        None,
+    )
+    if not isinstance(review_receipt, Mapping):
+        return False
+    publication_receipt = next(
+        (
+            receipt
+            for receipt in receipts
+            if isinstance(receipt, Mapping)
+            and receipt.get("schema")
+            == "windows-solver.promoted-publication-completion/1"
+            and receipt.get("queue_ordinal") == queue_ordinal
+            and receipt.get("leaf_id") == leaf_id
+            and receipt.get("source_fingerprint_sha256") == expected_fingerprint
+            and receipt.get("admitted_record_sha256") == source_record_sha256
+            and receipt.get("review_receipt_sha256")
+            == review_receipt.get("receipt_sha256")
+            and receipt.get("receipt_sha256")
+            == queue_entry.get("disposition_receipt_sha256")
+            and receipt.get("publication_receipt_sha256")
+            == _sha256(receipt.get("publication_receipt"))
+            and _receipt_digest_is_valid(receipt)
+        ),
+        None,
+    )
+    if not isinstance(publication_receipt, Mapping):
         return False
 
     triggers = {
@@ -1960,6 +1987,16 @@ def _promoted_horizon_outcome(
             FailureDisposition.DEFERRED: SurveyDisposition.DEFERRED,
             FailureDisposition.REJECTED: SurveyDisposition.REJECTED,
         }[decision.disposition]
+        control_content = {
+            "schema": "windows-solver.promoted-horizon-control-return/1",
+            "precision_tier": "BF80",
+            "failure_code": code,
+            "policy_disposition": decision.disposition.value,
+            "failure_fingerprint_sha256": decision.fingerprint_sha256,
+            "predecessor_stage_sha256": predecessor_stage_sha256,
+            "source_fingerprint_sha256": source_fingerprint_sha256,
+            "layer1_lock_receipt_sha256": layer1_lock_receipt_sha256,
+        }
         return PromotedPassOutcome(
             disposition=disposition,
             reason_code=code,
@@ -1969,6 +2006,11 @@ def _promoted_horizon_outcome(
             source_stage_sha256=source_stage_sha256,
             root_read_limit=1,
             worker_launch_count=1,
+            calculation_artifact={
+                **control_content,
+                "calculation_sha256": _sha256(control_content),
+            },
+            calculation_chain=(),
         )
     component_result = {
         "evidence_kind": "package-owned-julia-promoted-horizon-survey",
@@ -1997,6 +2039,7 @@ def _promoted_horizon_outcome(
     )
     calculation_artifact = PromotedHorizonCalculationResult(
         component_stage=stage,
+        numerical_outcome=stage_outcome.to_mapping(),
         predecessor_stage_sha256=predecessor_stage_sha256,
         source_fingerprint_sha256=source_fingerprint_sha256,
         layer1_lock_receipt_sha256=layer1_lock_receipt_sha256,
@@ -2013,7 +2056,7 @@ def _promoted_horizon_outcome(
         worker_launch_count=1,
         worker_launch_limit=1,
         calculation_artifact=calculation_artifact,
-        calculation_chain=(calculation_artifact,),
+        calculation_chain=(),
     )
 
 
@@ -2675,6 +2718,18 @@ def run_native_promoted_admission(
         leaf_mechanism_ids=_layer1_leaf_mechanism_ids(plan, recovery_selection),
         auxiliary_evidence_manifest=manifest,
     )
+    from .campaign_failures import (
+        require_system_failures_resolved_for_promoted_resume,
+    )
+
+    require_system_failures_resolved_for_promoted_resume(
+        checkpoint,
+        expected_authority_sha256=(
+            calibration_receipt.independent_review_authority_sha256
+        ),
+        calibration_receipt_sha256=calibration_receipt.sha256,
+        binary64_lock_receipt_sha256=str(lock["receipt_sha256"]),
+    )
     leaves = {leaf.leaf_id: leaf for leaf in getattr(plan, "leaves")}
     store = solved_leaf_store or SolvedLeafStore.default()
     retained_checkpoint = validate_schema11_checkpoint(checkpoint)
@@ -2725,7 +2780,7 @@ def run_native_promoted_admission(
             )
         raise ValueError("admission retained stage route is invalid")
 
-    def publish(record: Mapping[str, object]) -> None:
+    def publish(record: Mapping[str, object]) -> Mapping[str, object]:
         leaf_id = str(record.get("leaf_id"))
         leaf = leaves.get(leaf_id)
         if leaf is None or leaf_id not in recovery_selection.scientific_identities:
@@ -2745,6 +2800,7 @@ def run_native_promoted_admission(
             != canonical_json_bytes(record)
         ):
             raise ValueError("admitted promoted record was not published exactly")
+        return dict(lookup.receipt)
 
     admitted = admit_retained_promoted_checkpoint(
         checkpoint_path,

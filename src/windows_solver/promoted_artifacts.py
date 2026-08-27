@@ -26,7 +26,7 @@ PROMOTED_CANONICAL_BACKGROUND_RECEIPT_SCHEMA = (
     "windows-solver.promoted-canonical-background-receipt/3"
 )
 PROMOTED_BACKGROUND_REUSE_KEY_SCHEMA = (
-    "windows-solver.promoted-background-reuse-key/1"
+    "windows-solver.promoted-background-reuse-key/2"
 )
 PROMOTED_BACKGROUND_BINDING_SCHEMA = "windows-solver.promoted-background-binding/3"
 PROMOTED_EXTERIOR_CALCULATION_SCHEMA = (
@@ -36,7 +36,7 @@ PROMOTED_FIXED_ROOT_COMPOSITE_SCHEMA = (
     "windows-solver.promoted-fixed-root-composite/2"
 )
 PROMOTED_HORIZON_CALCULATION_SCHEMA = (
-    "windows-solver.promoted-horizon-calculation/2"
+    "windows-solver.promoted-horizon-calculation/3"
 )
 
 
@@ -92,33 +92,6 @@ def _batch_complex_mapping(batch: JuliaFixedRootSurveyBatch) -> dict[str, str]:
     }
 
 
-def _batch_conditioning_identity(
-    batch: JuliaFixedRootSurveyBatch,
-) -> dict[str, str]:
-    """Extract the process identity shared by every raw sample in a batch."""
-
-    fields = (
-        "determinant_family",
-        "homogeneous_representation",
-        "determinant_convention",
-        "determinant_normalisation",
-    )
-    values: dict[str, str] | None = None
-    for sample in batch.samples:
-        mapping = sample.numerical_conditioning.to_mapping()
-        candidate = {field: mapping.get(field) for field in fields}
-        if any(not isinstance(value, str) or not value for value in candidate.values()):
-            raise ValueError("promoted background conditioning identity is invalid")
-        typed = {field: str(value) for field, value in candidate.items()}
-        if values is None:
-            values = typed
-        elif values != typed:
-            raise ValueError("promoted background conditioning identity diverges")
-    if values is None:
-        raise ValueError("promoted background conditioning identity is missing")
-    return values
-
-
 def _require_batch_plan(
     batch: JuliaFixedRootSurveyBatch,
     plan: FixedRootSurveyPlan,
@@ -145,7 +118,6 @@ def _require_shared_batch_context(
         "branch_identity",
         "fixed_root",
         "frequency_step",
-        "coordinate_step",
         "precision_tier",
         "working_precision_bits",
     ):
@@ -157,12 +129,10 @@ def _require_shared_batch_context(
 class PromotedBackgroundReuseKey:
     """The exact non-leaf request context that may share five BF samples.
 
-    This is intentionally a promoted key, not an exterior-binary64 key with a
-    different label.  It carries the precision, steps, support, controls, and
-    plan identity selected for the actual five-sample worker request.  Leaf,
-    job, mechanism, and root-reference labels are excluded only because the
-    raw background receipt retains them separately and a compatible later
-    component is allowed to consume that receipt.
+    This key names only the canonical zero-coupling Dω request.  The worker
+    receipt retains the source leaf and its original request exactly; support,
+    mechanism, amplitude-coordinate, and D_c material belongs exclusively to
+    the consuming four-sample component request.
     """
 
     root_seal_sha256: str
@@ -175,12 +145,6 @@ class PromotedBackgroundReuseKey:
     precision_tier: str
     working_precision_bits: int
     frequency_step: str
-    coordinate_step: str
-    support_sha256: str
-    determinant_family: str
-    homogeneous_representation: str
-    determinant_convention: str
-    determinant_normalisation: str
     background_operation_identity: str
     sample_roles: tuple[str, ...]
 
@@ -191,17 +155,12 @@ class PromotedBackgroundReuseKey:
             "angular_identity_sha256",
             "backend_identity_sha256",
             "numerical_controls_sha256",
-            "support_sha256",
         ):
             if not _is_sha256(getattr(self, name)):
                 raise ValueError(f"promoted background reuse {name} is invalid")
         for name in (
             "branch_identity",
             "precision_tier",
-            "determinant_family",
-            "homogeneous_representation",
-            "determinant_convention",
-            "determinant_normalisation",
             "background_operation_identity",
         ):
             if not isinstance(getattr(self, name), str) or not getattr(self, name):
@@ -230,11 +189,6 @@ class PromotedBackgroundReuseKey:
             "frequency_step",
             _decimal_text(self.frequency_step, "promoted background frequency step", positive=True),
         )
-        object.__setattr__(
-            self,
-            "coordinate_step",
-            _decimal_text(self.coordinate_step, "promoted background coordinate step", positive=True),
-        )
         object.__setattr__(self, "sample_roles", tuple(self.sample_roles))
 
     def _content(self) -> dict[str, object]:
@@ -250,12 +204,6 @@ class PromotedBackgroundReuseKey:
             "precision_tier": self.precision_tier,
             "working_precision_bits": self.working_precision_bits,
             "frequency_step": self.frequency_step,
-            "coordinate_step": self.coordinate_step,
-            "support_sha256": self.support_sha256,
-            "determinant_family": self.determinant_family,
-            "homogeneous_representation": self.homogeneous_representation,
-            "determinant_convention": self.determinant_convention,
-            "determinant_normalisation": self.determinant_normalisation,
             "background_operation_identity": self.background_operation_identity,
             "sample_roles": list(self.sample_roles),
         }
@@ -281,12 +229,6 @@ class PromotedBackgroundReuseKey:
             "precision_tier",
             "working_precision_bits",
             "frequency_step",
-            "coordinate_step",
-            "support_sha256",
-            "determinant_family",
-            "homogeneous_representation",
-            "determinant_convention",
-            "determinant_normalisation",
             "background_operation_identity",
             "sample_roles",
             "reuse_key_sha256",
@@ -309,12 +251,6 @@ class PromotedBackgroundReuseKey:
             precision_tier=str(value["precision_tier"]),
             working_precision_bits=value["working_precision_bits"],
             frequency_step=str(value["frequency_step"]),
-            coordinate_step=str(value["coordinate_step"]),
-            support_sha256=str(value["support_sha256"]),
-            determinant_family=str(value["determinant_family"]),
-            homogeneous_representation=str(value["homogeneous_representation"]),
-            determinant_convention=str(value["determinant_convention"]),
-            determinant_normalisation=str(value["determinant_normalisation"]),
             background_operation_identity=str(value["background_operation_identity"]),
             sample_roles=tuple(value["sample_roles"]),
         )
@@ -352,7 +288,6 @@ class PromotedCanonicalBackgroundReceipt:
         if self.source_leaf_id != self.batch.leaf_id:
             raise ValueError("promoted canonical background source leaf is invalid")
         reuse_key = PromotedBackgroundReuseKey.from_mapping(self.reuse_key)
-        conditioning = _batch_conditioning_identity(self.batch)
         if (
             self.cache_key_sha256 != reuse_key.sha256
             or reuse_key.root_seal_sha256 != self.batch.root_seal_sha256
@@ -363,19 +298,9 @@ class PromotedCanonicalBackgroundReceipt:
             or reuse_key.frequency_step != _decimal_text(
                 str(self.batch.frequency_step), "promoted background frequency step", positive=True
             )
-            or reuse_key.coordinate_step != _decimal_text(
-                str(self.batch.coordinate_step), "promoted background coordinate step", positive=True
-            )
             or reuse_key.background_operation_identity
             != self.batch.scientific_operation_identity
             or reuse_key.sample_roles != self.batch.sample_roles
-            or reuse_key.determinant_family != conditioning["determinant_family"]
-            or reuse_key.homogeneous_representation
-            != conditioning["homogeneous_representation"]
-            or reuse_key.determinant_convention
-            != conditioning["determinant_convention"]
-            or reuse_key.determinant_normalisation
-            != conditioning["determinant_normalisation"]
         ):
             raise ValueError("promoted canonical background reuse binding is invalid")
         object.__setattr__(
@@ -483,11 +408,6 @@ class PromotedFixedRootComposite:
             label="promoted fixed-root component",
         )
         _require_shared_batch_context(self.background_batch, self.component_batch)
-        if (
-            _batch_conditioning_identity(self.background_batch)
-            != _batch_conditioning_identity(self.component_batch)
-        ):
-            raise ValueError("promoted fixed-root worker batches disagree on process")
         if not _is_sha256(self.background_receipt_sha256):
             raise ValueError("promoted fixed-root background receipt is invalid")
 
@@ -533,7 +453,7 @@ class PromotedFixedRootComposite:
 
     @property
     def coordinate_step(self):
-        return self.background_batch.coordinate_step
+        return self.component_batch.coordinate_step
 
     @property
     def precision_tier(self):
@@ -582,12 +502,16 @@ class PromotedHorizonCalculationResult:
     """
 
     component_stage: Mapping[str, object]
+    numerical_outcome: Mapping[str, object]
     predecessor_stage_sha256: str
     source_fingerprint_sha256: str
     layer1_lock_receipt_sha256: str
 
     def __post_init__(self) -> None:
         stage = _canonical_mapping(self.component_stage, "promoted horizon stage")
+        outcome = _canonical_mapping(
+            self.numerical_outcome, "promoted horizon numerical outcome"
+        )
         content = {key: value for key, value in stage.items() if key != "stage_sha256"}
         if (
             not _is_sha256(stage.get("stage_sha256"))
@@ -605,13 +529,40 @@ class PromotedHorizonCalculationResult:
             )
         ):
             raise ValueError("promoted horizon calculation lineage is invalid")
+        raw_component = outcome.get("component_result")
+        if not isinstance(raw_component, Mapping):
+            raise ValueError("promoted horizon numerical component is invalid")
+        expected_component = dict(raw_component)
+        if outcome.get("deep_diagnostics") is not None:
+            if not isinstance(outcome["deep_diagnostics"], Mapping):
+                raise ValueError("promoted horizon deep diagnostics are invalid")
+            expected_component["deep_diagnostics"] = dict(
+                outcome["deep_diagnostics"]
+            )
+        if set(outcome) != {
+            "digits",
+            "numerical_state",
+            "component_result",
+            "local_disk_radius_abs",
+            "signed_error_channels",
+            "deep_diagnostics",
+            "self_refinement_enclosed",
+            "discrepancy_from_previous_abs",
+            "discrepancy_enclosed",
+        } or outcome.get("digits") != 80 or (
+            outcome.get("numerical_state") != stage.get("numerical_state")
+            or expected_component != stage.get("component_result")
+        ):
+            raise ValueError("promoted horizon numerical outcome binding is invalid")
         object.__setattr__(self, "component_stage", stage)
+        object.__setattr__(self, "numerical_outcome", outcome)
 
     def to_mapping(self) -> dict[str, object]:
         content = {
             "schema": PROMOTED_HORIZON_CALCULATION_SCHEMA,
             "component_stage": dict(self.component_stage),
             "component_stage_sha256": self.component_stage["stage_sha256"],
+            "numerical_outcome": dict(self.numerical_outcome),
             "predecessor_stage_sha256": self.predecessor_stage_sha256,
             "source_fingerprint_sha256": self.source_fingerprint_sha256,
             "layer1_lock_receipt_sha256": self.layer1_lock_receipt_sha256,
@@ -624,6 +575,7 @@ class PromotedHorizonCalculationResult:
             "schema",
             "component_stage",
             "component_stage_sha256",
+            "numerical_outcome",
             "predecessor_stage_sha256",
             "source_fingerprint_sha256",
             "layer1_lock_receipt_sha256",
@@ -644,6 +596,7 @@ class PromotedHorizonCalculationResult:
             raise ValueError("promoted horizon calculation artifact digest is invalid")
         result = cls(
             component_stage=value["component_stage"],
+            numerical_outcome=value["numerical_outcome"],
             predecessor_stage_sha256=str(value["predecessor_stage_sha256"]),
             source_fingerprint_sha256=str(value["source_fingerprint_sha256"]),
             layer1_lock_receipt_sha256=str(value["layer1_lock_receipt_sha256"]),

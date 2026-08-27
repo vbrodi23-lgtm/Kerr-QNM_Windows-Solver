@@ -1,7 +1,7 @@
 param(
     [string]$Selection = ".\examples\m02-campaign.json",
     [string]$Checkpoint = ".\m02-output\m02-campaign-checkpoint.json",
-    [ValidateSet("survey", "certify", "validate", "resolve-system-failure")]
+    [ValidateSet("survey", "admit", "certify", "validate", "resolve-system-failure")]
     [string]$Profile = "survey",
     [ValidateSet("binary64", "promoted", "full")]
     [string]$SurveyPass = "full",
@@ -13,6 +13,8 @@ param(
     [string]$RuntimeRoot,
     [string]$CalibrationReceiptPath,
     [string]$CalibrationReceiptSha256,
+    [string[]]$ReviewReceiptPath = @(),
+    [string]$ReviewReceiptDirectory,
     [string]$FailureReceiptSha256,
     [string]$RepairCommit,
     [string]$ResolutionReason,
@@ -75,7 +77,7 @@ if ($SkipBootstrap -and $RebuildRuntime) {
 if ($Profile -ne "survey" -and $SurveyPass -ne "full") {
     throw "-SurveyPass applies only to -Profile survey."
 }
-if ($Profile -eq "survey" -and -not [string]::IsNullOrWhiteSpace($QueuePath)) {
+if ($Profile -in @("survey", "admit", "resolve-system-failure") -and -not [string]::IsNullOrWhiteSpace($QueuePath)) {
     throw "-QueuePath applies only to certify or validate."
 }
 if ($Profile -eq "validate" -and [string]::IsNullOrWhiteSpace($QueuePath)) {
@@ -93,6 +95,16 @@ if ($Profile -eq "resolve-system-failure") {
         throw "-QueuePath does not apply to -Profile resolve-system-failure."
     }
 }
+$HasReviewReceiptDirectory = -not [string]::IsNullOrWhiteSpace($ReviewReceiptDirectory)
+if ($Profile -eq "admit" -and $ReviewReceiptPath.Count -eq 0 -and -not $HasReviewReceiptDirectory) {
+    throw "-Profile admit requires -ReviewReceiptDirectory or at least one -ReviewReceiptPath."
+}
+if ($Profile -eq "admit" -and $ReviewReceiptPath.Count -gt 0 -and $HasReviewReceiptDirectory) {
+    throw "Supply either -ReviewReceiptDirectory or -ReviewReceiptPath, not both."
+}
+if ($Profile -ne "admit" -and ($ReviewReceiptPath.Count -gt 0 -or $HasReviewReceiptDirectory)) {
+    throw "Review receipt inputs apply only to -Profile admit."
+}
 if ($NewCampaign -and ($Profile -ne "survey" -or $SurveyPass -notin @("binary64", "full"))) {
     throw "-NewCampaign starts only a binary64 or full survey."
 }
@@ -103,6 +115,7 @@ if ($HasCalibrationPath -ne $HasCalibrationSha256) {
 }
 $RequiresPromotedCalibration = (
     ($Profile -eq "survey" -and $SurveyPass -in @("promoted", "full")) -or
+    $Profile -eq "admit" -or
     $Profile -eq "resolve-system-failure"
 )
 if ($RequiresPromotedCalibration -and -not $HasCalibrationPath) {
@@ -215,6 +228,31 @@ if (-not [string]::IsNullOrWhiteSpace($QueuePath)) {
         throw "Queue is absent: $ResolvedQueuePath"
     }
 }
+$ResolvedReviewReceiptPaths = @()
+foreach ($ReceiptPath in $ReviewReceiptPath) {
+    $ResolvedReceiptPath = if ([IO.Path]::IsPathRooted($ReceiptPath)) {
+        [IO.Path]::GetFullPath($ReceiptPath)
+    }
+    else {
+        [IO.Path]::GetFullPath((Join-Path $PackageRoot $ReceiptPath))
+    }
+    if (-not (Test-Path -LiteralPath $ResolvedReceiptPath -PathType Leaf)) {
+        throw "Independent review receipt is absent: $ResolvedReceiptPath"
+    }
+    $ResolvedReviewReceiptPaths += $ResolvedReceiptPath
+}
+$ResolvedReviewReceiptDirectory = $null
+if ($HasReviewReceiptDirectory) {
+    $ResolvedReviewReceiptDirectory = if ([IO.Path]::IsPathRooted($ReviewReceiptDirectory)) {
+        [IO.Path]::GetFullPath($ReviewReceiptDirectory)
+    }
+    else {
+        [IO.Path]::GetFullPath((Join-Path $PackageRoot $ReviewReceiptDirectory))
+    }
+    if (-not (Test-Path -LiteralPath $ResolvedReviewReceiptDirectory -PathType Container)) {
+        throw "Independent review receipt directory is absent: $ResolvedReviewReceiptDirectory"
+    }
+}
 
 Push-Location $PackageRoot
 try {
@@ -237,6 +275,9 @@ try {
     }
     elseif ($Profile -eq "survey") {
         "campaign-survey-promoted"
+    }
+    elseif ($Profile -eq "admit") {
+        "campaign-admit-promoted-queue"
     }
     elseif ($Profile -eq "certify") {
         "campaign-certify"
@@ -356,8 +397,10 @@ try {
         return
     }
     if (
-        $Profile -eq "survey" -and
-        $SurveyPass -in @("promoted", "full") -and
+        (
+            ($Profile -eq "survey" -and $SurveyPass -in @("promoted", "full")) -or
+            $Profile -eq "admit"
+        ) -and
         $ActiveSystemFailures -gt 0
     ) {
         throw (
@@ -381,11 +424,17 @@ try {
     elseif ($Profile -eq "survey" -and $SurveyPass -eq "promoted") {
         Ensure-Binary64Lock
     }
+    elseif ($Profile -eq "admit") {
+        Ensure-Binary64Lock
+    }
     $EffectiveCommand = if ($Profile -eq "survey" -and $EffectiveSurveyPass -eq "binary64") {
         "campaign-survey-binary64"
     }
     elseif ($Profile -eq "survey") {
         "campaign-survey-promoted"
+    }
+    elseif ($Profile -eq "admit") {
+        "campaign-admit-promoted-queue"
     }
     elseif ($Profile -eq "certify") {
         "campaign-certify"
@@ -393,13 +442,24 @@ try {
     else {
         "campaign-evidence-validate"
     }
-    $RunArguments = @(
-        $EffectiveCommand,
-        $SelectionPath,
-        "--checkpoint", $CheckpointPath,
-        "--progress", $Progress,
-        "--diagnostic-session-id", $RunSessionId
-    )
+    $RunArguments = if ($Profile -eq "admit") {
+        @(
+            $EffectiveCommand,
+            $SelectionPath,
+            "--checkpoint", $CheckpointPath,
+            "--binary64-lock", $Binary64LockPath,
+            "--diagnostic-session-id", $RunSessionId
+        )
+    }
+    else {
+        @(
+            $EffectiveCommand,
+            $SelectionPath,
+            "--checkpoint", $CheckpointPath,
+            "--progress", $Progress,
+            "--diagnostic-session-id", $RunSessionId
+        )
+    }
     if (-not ($Profile -eq "survey" -and $EffectiveSurveyPass -eq "binary64")) {
         $RunArguments += $CalibrationArguments
     }
@@ -408,6 +468,18 @@ try {
     }
     if ($Profile -eq "survey" -and $EffectiveSurveyPass -eq "promoted") {
         $RunArguments += @("--binary64-lock", $Binary64LockPath)
+    }
+    if ($Profile -eq "admit") {
+        if ($null -ne $ResolvedReviewReceiptDirectory) {
+            $RunArguments += @(
+                "--review-receipt-directory", $ResolvedReviewReceiptDirectory
+            )
+        }
+        else {
+            foreach ($ResolvedReceiptPath in $ResolvedReviewReceiptPaths) {
+                $RunArguments += @("--review-receipt", $ResolvedReceiptPath)
+            }
+        }
     }
     # Capture canonical command JSON without merging it with the human
     # dashboard stream.  The reporter writes dashboard text to stderr; the
@@ -419,6 +491,9 @@ try {
     }
     $ValidationPass = if ($Profile -eq "survey") {
         $EffectiveSurveyPass
+    }
+    elseif ($Profile -eq "admit") {
+        "promoted"
     }
     else {
         $Profile

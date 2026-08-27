@@ -63,8 +63,8 @@ _PROMOTED_SURVEY_REQUIRED_CALLS = {
         "_commit_promoted_raw_calculation",
         "_commit_promoted_outcome",
         "retain_promoted_background",
-        "_resumed_promoted_exterior_outcome",
-        "_resumed_promoted_horizon_outcome",
+        "reduce_promoted_exterior_from_checkpoint",
+        "reduce_promoted_horizon_from_checkpoint",
         "_validate_promoted_scheduler_preflight",
     },
     "_commit_promoted_outcome": {
@@ -86,8 +86,10 @@ _PROMOTED_RUNTIME_IDENTITY_FILES = (
     "campaign_policy.py",
     "campaign_runtime.py",
     "campaign_survey.py",
+    "promoted_artifacts.py",
     "promoted_admission.py",
     "production_wiring.py",
+    "response_batches.py",
     "structural_diagnostics.py",
 )
 
@@ -186,8 +188,8 @@ def _promoted_ownership_failures(
             )
 
     for function_name in (
-        "_resumed_promoted_exterior_outcome",
-        "_resumed_promoted_horizon_outcome",
+        "reduce_promoted_exterior_from_checkpoint",
+        "reduce_promoted_horizon_from_checkpoint",
     ):
         function = survey_functions.get(function_name)
         if function is None:
@@ -197,6 +199,17 @@ def _promoted_ownership_failures(
         if numerical:
             failures.append(
                 f"{function_name} can reopen numerical work: {sorted(numerical)}"
+            )
+        terminal = _call_names(function) & {
+            "add_numerical_record",
+            "build_fixed_root_screening_record",
+            "build_schema11_horizon_record",
+            "record_evidence",
+            "terminal_record_committed",
+        }
+        if terminal:
+            failures.append(
+                f"{function_name} can reach terminal ownership: {sorted(terminal)}"
             )
 
     exterior = survey_functions.get("_run_promoted_exterior_queue_entry")

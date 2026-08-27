@@ -1596,6 +1596,8 @@ def _schema11_admission_state(
         disposition = queue_entry.get("disposition")
         if disposition == "AWAITING_ADMISSION":
             return "AWAITING_ADMISSION"
+        if disposition == "ADMITTED_PENDING_PUBLICATION":
+            return "ADMITTED_PENDING_PUBLICATION"
         if disposition == "COMPLETED" and isinstance(retained_stage, Mapping):
             return "ADMITTED"
     if isinstance(retained_stage, Mapping):
