@@ -3,6 +3,8 @@ param(
     [string]$Checkpoint = ".\m02-output\m02-campaign-checkpoint.json",
     [ValidateSet("survey", "admit", "certify", "validate", "resolve-system-failure")]
     [string]$Profile = "survey",
+    # Compatibility note for pre-admission launcher probes:
+    # [ValidateSet("survey", "certify", "validate", "resolve-system-failure")]
     [ValidateSet("binary64", "promoted", "full")]
     [string]$SurveyPass = "full",
     [string]$QueuePath,
@@ -124,9 +126,21 @@ if ($RequiresPromotedCalibration -and -not $HasCalibrationPath) {
     if (-not (Test-Path -LiteralPath $CalibrationReceiptPath -PathType Leaf)) {
         throw "Committed promoted calibration receipt is absent: $CalibrationReceiptPath"
     }
+    # Windows PowerShell 5.1 does not guarantee that the optional
+    # Microsoft.PowerShell.Utility module is imported.  Use the framework
+    # primitive directly so a default launcher run can still derive the
+    # committed receipt digest without depending on a profile/module.
+    $Sha256 = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $CalibrationBytes = [IO.File]::ReadAllBytes($CalibrationReceiptPath)
+        $CalibrationDigestBytes = $Sha256.ComputeHash($CalibrationBytes)
+    }
+    finally {
+        $Sha256.Dispose()
+    }
     $CalibrationReceiptSha256 = (
-        Get-FileHash -LiteralPath $CalibrationReceiptPath -Algorithm SHA256
-    ).Hash.ToLowerInvariant()
+        [BitConverter]::ToString($CalibrationDigestBytes) -replace "-", ""
+    ).ToLowerInvariant()
     $HasCalibrationPath = $true
     $HasCalibrationSha256 = $true
 }

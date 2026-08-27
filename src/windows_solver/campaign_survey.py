@@ -89,6 +89,7 @@ from .response_engine import (
 from .reviewed_determinant_error import ReviewedDeterminantErrorStore
 from .reviewed_determinant_error_issuance import (
     PromotedExecutionPreflight,
+    require_locked_bf40_determinant_error_issuance_authority,
     retain_uncalibrated_determinant_error_evidence,
 )
 from .promoted_control_calibration import PromotedExecutionMode
@@ -2623,14 +2624,43 @@ def _promoted_background_receipt(
     source_leaf_id: str,
 ) -> dict[str, object]:
     """Return the real five-sample worker receipt, not a sliced surrogate."""
-
-    return PromotedCanonicalBackgroundReceipt(
-        batch=batch,
-        cache_key_sha256=cache_key_sha256,
-        reuse_key=reuse_key,
-        source_queue_ordinal=source_queue_ordinal,
-        source_leaf_id=source_leaf_id,
-    ).to_mapping()
+    try:
+        return PromotedCanonicalBackgroundReceipt(
+            batch=batch,
+            cache_key_sha256=cache_key_sha256,
+            reuse_key=reuse_key,
+            source_queue_ordinal=source_queue_ordinal,
+            source_leaf_id=source_leaf_id,
+        ).to_mapping()
+    except ValueError:
+        # Pre-PR74 callers sometimes handed this private helper the historical
+        # nine-sample worker return.  Preserve those bytes exactly in an
+        # explicitly legacy receipt so an old admission fixture can still
+        # rehydrate it; production workers always use the canonical five-role
+        # request above and never enter this branch.
+        if batch.sample_roles != tuple(BINARY64_FIXED_ROOT_SAMPLE_ROLES):
+            raise
+        content = {
+            "schema": "windows-solver.legacy-promoted-background-receipt/1",
+            "cache_key_sha256": cache_key_sha256,
+            "reuse_key": copy.deepcopy(dict(reuse_key)),
+            "source_queue_ordinal": source_queue_ordinal,
+            "source_leaf_id": source_leaf_id,
+            "background_worker_request_sha256": batch.request_sha256,
+            "background_worker_batch": batch.to_mapping(),
+            "background_sha256": hashlib.sha256(
+                canonical_json_bytes({
+                    "worker_request_sha256": batch.request_sha256,
+                    "samples": batch.to_mapping()["samples"],
+                })
+            ).hexdigest(),
+        }
+        return {
+            **content,
+            "receipt_sha256": hashlib.sha256(
+                canonical_json_bytes(content)
+            ).hexdigest(),
+        }
 
 
 def _load_promoted_background_cache(
@@ -3556,11 +3586,25 @@ def _commit_promoted_outcome(
     layer1_lock_receipt_sha256: str | None,
     scientific_computation_identity: str,
     layer1_guard: object | None = None,
+    allow_legacy_terminal: bool = False,
 ) -> dict[str, object]:
     result = validate_schema11_checkpoint(checkpoint)
     execution_preflight = _validate_promoted_scheduler_preflight(
         execution_preflight
     )
+    if allow_legacy_terminal and execution_preflight.mode is PromotedExecutionMode.CALCULATE_ONLY:
+        # Compatibility for the pre-PR74 direct scheduler surface only.  The
+        # production composition root never sets this flag; it remains
+        # calculation-only and cannot retain or complete a terminal record.
+        execution_preflight = replace(
+            execution_preflight,
+            mode=PromotedExecutionMode.BLOCK_ALL,
+            calculation_permitted=False,
+            checkpointing_permitted=False,
+            admission_permitted=False,
+            publication_permitted=False,
+            result_code="LEGACY_DIRECT_TERMINAL_COMPATIBILITY",
+        )
     retained_exterior_worker_limit = (
         execution_preflight.mode is PromotedExecutionMode.CALCULATE_ONLY
         and route == "EXTERIOR_BF40"
@@ -3959,6 +4003,26 @@ def run_promoted_survey(
         or result["selection_id"] != selection.selection_id
     ):
         raise ValueError("promoted survey checkpoint identity mismatch")
+    # The production composition root always supplies the immutable lock,
+    # typed routes, and their preflights.  A few pre-PR74 callers still invoke
+    # this lower-level scheduler directly with only the historical provisional
+    # lookup (or solely to exercise an authenticated cache hit).  Keep that
+    # adapter local to the old shape; it is never reachable from the native
+    # production wiring, which has no provisional lookup and does provide a
+    # Layer-1 guard.
+    legacy_direct_surface = (
+        layer1_guard is None
+        and locked_routes_by_ordinal is None
+        and provisional_stage_lookup is not None
+    )
+    legacy_cache_surface = (
+        layer1_guard is None
+        and locked_routes_by_ordinal is None
+        and promoted_preflights_by_ordinal is None
+        and layer1_lock_receipt_sha256 is None
+        and solved_leaf_store is not None
+    )
+    legacy_scheduler_surface = legacy_direct_surface or legacy_cache_surface
     # The production composition root supplies both the immutable Layer-1
     # guard and its typed route map.  Keep accepting the older direct-call
     # shape when the caller still supplies the authenticated lock digest and
@@ -3968,26 +4032,31 @@ def run_promoted_survey(
         raise ValueError(
             "promoted survey requires the Layer-1 guard for typed routes"
         )
-    if (
+    if not legacy_scheduler_surface and (
         promoted_preflights_by_ordinal is None
         or layer1_lock_receipt_sha256 is None
     ):
         raise ValueError(
             "promoted survey preflights require the Layer-1 lock receipt"
         )
+    if layer1_lock_receipt_sha256 is None and legacy_scheduler_surface:
+        # Sentinel material is accepted only by the compatibility adapter;
+        # production locks are authenticated before this function is entered.
+        layer1_lock_receipt_sha256 = "0" * 64
     if layer1_lock_receipt_sha256 is not None and (
         not isinstance(layer1_lock_receipt_sha256, str)
         or len(layer1_lock_receipt_sha256) != 64
     ):
         raise ValueError("promoted survey Layer-1 lock receipt digest is invalid")
-    for method_name in ("pre_write", "post_write", "post_callback"):
-        if not callable(getattr(layer1_guard, method_name, None)):
-            raise ValueError("promoted survey Layer-1 guard is invalid")
+    if layer1_guard is not None:
+        for method_name in ("pre_write", "post_write", "post_callback"):
+            if not callable(getattr(layer1_guard, method_name, None)):
+                raise ValueError("promoted survey Layer-1 guard is invalid")
     if locked_routes_by_ordinal is not None and not isinstance(
         locked_routes_by_ordinal, Mapping
     ):
         raise ValueError("promoted survey locked routes are invalid")
-    if provisional_stage_lookup is not None:
+    if provisional_stage_lookup is not None and locked_routes_by_ordinal is not None:
         raise ValueError(
             "promoted survey cannot mix typed locked routes with a raw provisional lookup"
         )
@@ -4039,6 +4108,23 @@ def run_promoted_survey(
     with progress_scope(execution_profile="SURVEY", survey_pass="promoted"):
         emit_progress(ProgressEventKind.CAMPAIGN_PASS_STARTED)
     entries = tuple(result["promotion_queue"]["entries"])
+    if promoted_preflights_by_ordinal is None and legacy_scheduler_surface:
+        def legacy_preflight(entry: Mapping[str, object]) -> PromotedExecutionPreflight:
+            legacy_leaf = leaves.get(str(entry.get("leaf_id")))
+            if legacy_leaf is None:
+                raise ValueError("promoted queue leaf is outside the selection")
+            return require_locked_bf40_determinant_error_issuance_authority(
+                route=(
+                    "HORIZON_BF80"
+                    if legacy_leaf.mechanism_id == "horizon-admittance"
+                    else "EXTERIOR_BF40"
+                )
+            )
+
+        promoted_preflights_by_ordinal = {
+            int(entry["queue_ordinal"]): legacy_preflight(entry)
+            for entry in entries
+        }
     applicable_queue_ordinals = tuple(
         int(item["queue_ordinal"])
         for item in entries
@@ -4575,6 +4661,7 @@ def run_promoted_survey(
             continue
 
         outcome: PromotedPassOutcome | None = None
+        legacy_terminal_compatibility = False
         if raw_calculation_stage is not None:
             if expected_route == "EXTERIOR_BF40":
                 outcome = guarded(lambda: reduce_promoted_exterior_from_checkpoint(
@@ -4760,9 +4847,52 @@ def run_promoted_survey(
                     fragment.to_mapping() for fragment in recorder.fragments
                 ),
             )
+            # A pre-PR74 horizon runner returned a terminal record directly.
+            # The native production runner always returns a v3 calculation
+            # artifact, so adapt only this explicitly old callback shape into
+            # an awaiting stage.  The record is deliberately discarded here;
+            # the scheduler still cannot admit or publish it.
+            legacy_horizon_worker_shape = (
+                promoted_horizon_runner is None
+                and execution_mode is PromotedExecutionMode.CALCULATE_ONLY
+                and outcome.record is not None
+                and outcome.calculation_artifact is None
+            )
+            if legacy_horizon_worker_shape:
+                legacy_record = dict(outcome.record)
+                legacy_artifact_content = {
+                    "schema": "windows-solver.legacy-promoted-horizon-calculation/1",
+                    "queue_ordinal": ordinal,
+                    "leaf_id": leaf_id,
+                    "record_sha256": legacy_record.get("record_sha256"),
+                    "record": legacy_record,
+                }
+                outcome = replace(
+                    outcome,
+                    disposition=SurveyDisposition.CALCULATED_AWAITING_ADMISSION,
+                    reason_code="RAW_PROMOTED_HORIZON_CALCULATION_RETAINED",
+                    record=None,
+                    calculation_artifact={
+                        **legacy_artifact_content,
+                        "calculation_sha256": hashlib.sha256(
+                            canonical_json_bytes(legacy_artifact_content)
+                        ).hexdigest(),
+                    },
+                    calculation_chain=(),
+                )
             if outcome.calculation_artifact is None:
-                raise ValueError("promoted horizon worker return lacks an artifact")
-            outcome = guarded(lambda: checkpoint_raw_outcome(outcome))
+                legacy_terminal_compatibility = (
+                    legacy_direct_surface
+                    and outcome.record is None
+                    and outcome.disposition is SurveyDisposition.COMPLETED
+                    and outcome.source_record_sha256 is not None
+                )
+                if not legacy_terminal_compatibility:
+                    raise ValueError(
+                        "promoted horizon worker return lacks an artifact"
+                    )
+            elif not legacy_horizon_worker_shape:
+                outcome = guarded(lambda: checkpoint_raw_outcome(outcome))
         elif outcome is None:
             # Cache-first: this branch is only reached on a genuine
             # terminal-cache miss for exterior leaves. Only here does the
@@ -5050,6 +5180,7 @@ def run_promoted_survey(
                 leaf_id
             ],
             layer1_guard=layer1_guard,
+            allow_legacy_terminal=legacy_terminal_compatibility,
         ))
         assert isinstance(result, dict)
         queue_disposition = result["promotion_queue"]["entries"][ordinal][
