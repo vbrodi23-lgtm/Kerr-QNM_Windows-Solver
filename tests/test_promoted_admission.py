@@ -6,6 +6,7 @@ from dataclasses import replace
 from decimal import Decimal
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from typing import Mapping
 import unittest
 from unittest.mock import patch
 
@@ -186,6 +187,14 @@ class PromotedAdmissionTests(unittest.TestCase):
         )
         published: list[dict[str, object]] = []
 
+        def publish(value: object) -> dict[str, object]:
+            record_value = dict(value)
+            published.append(record_value)
+            return {
+                "schema": "windows-solver.test-publication-receipt/1",
+                "record_sha256": record_value["record_sha256"],
+            }
+
         with TemporaryDirectory() as temporary:
             path = Path(temporary) / "checkpoint.json"
             path.write_bytes(canonical_json_bytes(checkpoint))
@@ -194,7 +203,7 @@ class PromotedAdmissionTests(unittest.TestCase):
                 queue_ordinal=0,
                 independent_review_receipt=review,
                 calibration_receipt=calibration,
-                terminal_record_committed=lambda value: published.append(dict(value)),
+                terminal_record_committed=publish,
             )
 
         self.assertEqual(0, result.backend_call_count)
@@ -283,7 +292,7 @@ class PromotedAdmissionTests(unittest.TestCase):
         )
         published: list[dict[str, object]] = []
 
-        def unavailable(_record: object) -> None:
+        def unavailable(_record: object) -> Mapping[str, object]:
             raise RuntimeError("solved-leaf store unavailable")
 
         with TemporaryDirectory() as temporary:
@@ -299,19 +308,27 @@ class PromotedAdmissionTests(unittest.TestCase):
                 )
             durable = json.loads(path.read_text(encoding="utf-8"))
             self.assertEqual(
-                "COMPLETED",
+                "ADMITTED_PENDING_PUBLICATION",
                 durable["promotion_queue"]["entries"][0]["disposition"],
             )
             self.assertEqual([record], durable["records"])
             self.assertEqual(
                 "SCREENED", durable["evidence_ledger"]["leaf-1"]["evidence_level"]
             )
+            def publish(value: object) -> dict[str, object]:
+                record_value = dict(value)
+                published.append(record_value)
+                return {
+                    "schema": "windows-solver.test-publication-receipt/1",
+                    "record_sha256": record_value["record_sha256"],
+                }
+
             retried = admit_retained_promoted_checkpoint(
                 path,
                 queue_ordinal=0,
                 independent_review_receipt=review,
                 calibration_receipt=calibration,
-                terminal_record_committed=lambda value: published.append(dict(value)),
+                terminal_record_committed=publish,
             )
 
         self.assertEqual("COMPLETED", retried.checkpoint[
@@ -327,7 +344,7 @@ class PromotedAdmissionTests(unittest.TestCase):
         )
         published: list[dict[str, object]] = []
 
-        def publish_if_missing(value: object) -> None:
+        def publish_if_missing(value: object) -> dict[str, object]:
             candidate = dict(value)
             if published and canonical_json_bytes(published[0]) != canonical_json_bytes(
                 candidate
@@ -335,6 +352,10 @@ class PromotedAdmissionTests(unittest.TestCase):
                 self.fail("retry tried to publish different solved-leaf evidence")
             if not published:
                 published.append(candidate)
+            return {
+                "schema": "windows-solver.test-publication-receipt/1",
+                "record_sha256": candidate["record_sha256"],
+            }
 
         original_write = promoted_admission._write_atomic
         attempts = 0

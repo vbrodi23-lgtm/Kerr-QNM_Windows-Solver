@@ -8,7 +8,6 @@ import hashlib
 import math
 import os
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Mapping
 
 from .campaign_evidence import (
@@ -1923,20 +1922,6 @@ def _promoted_horizon_outcome(
         raise ValueError("promoted horizon calculation lacks a locked queue entry")
     predecessor_stage_sha256 = queue_entry.get("source_stage_sha256")
     source_fingerprint_sha256 = queue_entry.get("source_fingerprint_sha256")
-    legacy_source_lineage = (
-        source_record is not None
-        and source_fingerprint_sha256 is None
-        and layer1_lock_receipt_sha256 is None
-    )
-    # The old standalone helper tests supplied only the source-record/stage
-    # pair (or the provisional stage) and predated the Layer-1 lock digest
-    # fields.  Keep that narrow direct-call compatibility while the native
-    # production adapter remains strict: it always supplies all three
-    # authenticated lineage values from the lock and queue entry.
-    if source_fingerprint_sha256 is None and source_record is not None:
-        source_fingerprint_sha256 = "0" * 64
-    if layer1_lock_receipt_sha256 is None:
-        layer1_lock_receipt_sha256 = "0" * 64
     if not all(
         isinstance(value, str) and len(value) == 64
         for value in (
@@ -2052,85 +2037,6 @@ def _promoted_horizon_outcome(
         precision_tier="BF80",
         operation_identity=operation_identity,
     )
-    if legacy_source_lineage:
-        # The pre-PR74 direct helper returned a source comparison outcome
-        # rather than a retained worker artifact.  Keep that shape available
-        # only when its two authenticated Layer-2 lineage fields are absent;
-        # the native production adapter always supplies them and therefore
-        # takes the raw-artifact path below.
-        source_disk = (
-            source_stage.get("response_disk")
-            if isinstance(source_stage, Mapping)
-            else None
-        )
-        bf80_disk = stage.get("response_disk")
-        source_centre = (
-            source_disk.get("centre") if isinstance(source_disk, Mapping) else None
-        )
-        bf80_centre = (
-            bf80_disk.get("centre") if isinstance(bf80_disk, Mapping) else None
-        )
-        try:
-            discrepancy = abs(
-                complex(
-                    float(source_centre["real"]),
-                    float(source_centre["imaginary"]),
-                )
-                - complex(
-                    float(bf80_centre["real"]),
-                    float(bf80_centre["imaginary"]),
-                )
-            )
-            source_radius = float(source_disk["radius"])
-            bf80_radius = float(bf80_disk["radius"])
-        except (KeyError, TypeError, ValueError, OverflowError):
-            discrepancy = None
-            source_radius = None
-            bf80_radius = None
-        comparison_content = {
-            "schema": HORIZON_PROMOTED_COMPARISON_RECEIPT_SCHEMA,
-            "leaf_id": leaf.leaf_id,
-            "source_record_sha256": source_record_sha256,
-            "source_stage_sha256": source_stage_sha256,
-            "source_centre": source_centre,
-            "source_disk_radius": source_radius,
-            "promotion_trigger_receipt_sha256": (
-                None
-                if not isinstance(trigger_receipt, Mapping)
-                else trigger_receipt.get("receipt_sha256")
-            ),
-            "bf80_operation_identity": stage.get("operation_identity"),
-            "bf80_result_sha256": _sha256(result.to_mapping()),
-            "bf80_stage": dict(stage),
-            "bf80_centre": bf80_centre,
-            "bf80_disk_radius": bf80_radius,
-            "centre_discrepancy": discrepancy,
-            "reviewed_comparison_threshold": (
-                None
-                if source_radius is None or bf80_radius is None
-                else source_radius + bf80_radius
-            ),
-            "agrees": True,
-            "outcome_code": "AGREES",
-            "runtime_identity": component_result.get("scientific_runtime"),
-            "backend_identity": leaf.job.backend_identity.identity_sha256,
-        }
-        return PromotedPassOutcome(
-            disposition=SurveyDisposition.UNRESOLVED,
-            reason_code="PROMOTED_HORIZON_COMPARISON_AGREES",
-            precision_tiers=("BF80",),
-            operation_identity="promoted-horizon-comparison/v2",
-            source_record_sha256=source_record_sha256,
-            source_stage_sha256=source_stage_sha256,
-            root_read_count=1,
-            root_read_limit=1,
-            worker_launch_count=1,
-            worker_launch_limit=1,
-            evidence_receipts=({
-                **comparison_content,
-                "receipt_sha256": _sha256(comparison_content),
-            },),
-        )
     calculation_artifact = PromotedHorizonCalculationResult(
         component_stage=stage,
         numerical_outcome=stage_outcome.to_mapping(),
@@ -2335,79 +2241,8 @@ def _retained_exterior_artifacts_for_admission(
     """
 
     calculation_artifact = retained_stage.get("calculation_artifact")
-    if calculation_artifact is None:
-        # A pre-PR74 standalone admission fixture retained one historical
-        # nine-sample worker batch instead of the v3 split background/component
-        # artifacts.  Rehydrate that immutable batch as-is for the legacy
-        # reduction path; no production stage emitted by the current scheduler
-        # can take this branch.
-        raw_batches = retained_stage.get("raw_promoted_batches")
-        if not isinstance(raw_batches, list) or len(raw_batches) != 1:
-            raise ValueError("retained exterior calculation artifact is missing")
-        legacy_batch = promoted_fixed_root_batch_from_mapping(raw_batches[0])
-        if legacy_batch.sample_roles != tuple(BINARY64_FIXED_ROOT_SAMPLE_ROLES):
-            raise ValueError("retained exterior legacy batch plan is invalid")
-        if (
-            legacy_batch.leaf_id != leaf.leaf_id
-            or legacy_batch.job_id != leaf.job.job_id
-            or legacy_batch.root_seal_sha256 != retained_stage.get(
-                "source_root_seal_sha256"
-            )
-        ):
-            raise ValueError("retained exterior legacy batch binding is invalid")
-        if legacy_batch.precision_tier.value != "bigfloat-40":
-            raise ValueError("retained exterior legacy precision tier is invalid")
-        ledgers = checkpoint.get("promoted_background_ledger")
-        candidates: list[Mapping[str, object]] = []
-        if isinstance(ledgers, Mapping):
-            for bucket in ledgers.values():
-                if not isinstance(bucket, Mapping):
-                    continue
-                for ledger_entry in bucket.values():
-                    payload = (
-                        ledger_entry.get("payload")
-                        if isinstance(ledger_entry, Mapping)
-                        else None
-                    )
-                    receipts = (
-                        payload.get("background_receipts")
-                        if isinstance(payload, Mapping)
-                        else None
-                    )
-                    if isinstance(receipts, list):
-                        candidates.extend(
-                            receipt
-                            for receipt in receipts
-                            if isinstance(receipt, Mapping)
-                            and receipt.get("background_worker_request_sha256")
-                            == legacy_batch.request_sha256
-                        )
-        if len(candidates) != 1:
-            raise ValueError("retained exterior legacy background evidence is missing")
-        receipt = candidates[0]
-        if receipt.get("schema") != "windows-solver.legacy-promoted-background-receipt/1":
-            raise ValueError("retained exterior legacy background receipt is invalid")
-        content = {
-            key: item for key, item in receipt.items() if key != "receipt_sha256"
-        }
-        if receipt.get("receipt_sha256") != _sha256(content):
-            raise ValueError("retained exterior legacy background receipt digest is invalid")
-        if receipt.get("source_leaf_id") != legacy_batch.leaf_id:
-            raise ValueError("retained exterior legacy background source is invalid")
-        if receipt.get("background_worker_batch") != legacy_batch.to_mapping():
-            raise ValueError("retained exterior legacy background bytes changed")
-        # The reducer below intentionally consumes a request-batch sequence,
-        # not a worker-produced composite.  This tiny view supplies the same
-        # immutable fields without manufacturing a new worker artifact.
-        legacy_view = SimpleNamespace(
-            samples=legacy_batch.samples,
-            root_seal_sha256=legacy_batch.root_seal_sha256,
-            precision_tier=legacy_batch.precision_tier,
-            working_precision_bits=legacy_batch.working_precision_bits,
-            frequency_step=legacy_batch.frequency_step,
-            coordinate_step=legacy_batch.coordinate_step,
-        )
-        return legacy_view, (legacy_batch,)
+    if not isinstance(calculation_artifact, Mapping):
+        raise ValueError("retained exterior calculation artifact is missing")
     calculation, _canonical_calculation = _promoted_exterior_calculation_from_mapping(
         calculation_artifact
     )

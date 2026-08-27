@@ -3,8 +3,6 @@ param(
     [string]$Checkpoint = ".\m02-output\m02-campaign-checkpoint.json",
     [ValidateSet("survey", "admit", "certify", "validate", "resolve-system-failure")]
     [string]$Profile = "survey",
-    # Compatibility note for pre-admission launcher probes:
-    # [ValidateSet("survey", "certify", "validate", "resolve-system-failure")]
     [ValidateSet("binary64", "promoted", "full")]
     [string]$SurveyPass = "full",
     [string]$QueuePath,
