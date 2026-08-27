@@ -548,7 +548,21 @@ class PromotedAdmissionTests(unittest.TestCase):
             queue_ordinal=0,
         )
 
-        self.assertEqual(9, len(reduction.evidence_receipts))
+        receipt_schemas = [
+            receipt["schema"] for receipt in reduction.evidence_receipts
+        ]
+        self.assertEqual(
+            9,
+            receipt_schemas.count(
+                "windows-solver.promoted-exterior-determinant-rederivation/1"
+            ),
+        )
+        self.assertEqual(
+            9,
+            receipt_schemas.count(
+                "windows-solver.reviewed-determinant-error-receipt/1"
+            ),
+        )
         self.assertEqual(leaf.leaf_id, reduction.record["leaf_id"])
         self.assertEqual("PRODUCED", reduction.record["state"])
         self.assertEqual("BF40", reduction.record["stages"][0]["precision_tier"])

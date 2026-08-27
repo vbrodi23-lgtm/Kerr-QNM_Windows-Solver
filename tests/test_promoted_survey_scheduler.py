@@ -34,7 +34,7 @@ from windows_solver.julia_response_backend import (
     JuliaNumericalControlError,
     fixed_root_survey_request_contract,
 )
-from windows_solver.precision_tiers import PrecisionTier
+from windows_solver.precision_tiers import PrecisionTier, working_precision_bits
 from windows_solver.reviewed_determinant_error_issuance import (
     PromotedExecutionPreflight,
     require_locked_bf40_determinant_error_issuance_authority,
@@ -194,6 +194,10 @@ def _batch(leaf, seal: AuthenticatedRootSeal, digits: int, *, flat=False):
             determinant,
             _conditioning(digits),
         ))
+    tier = (
+        PrecisionTier.BIGFLOAT_40
+        if digits == 40 else PrecisionTier.BIGFLOAT_80
+    )
     return JuliaFixedRootSurveyBatch(
         leaf_id=leaf.leaf_id,
         job_id=leaf.job.job_id,
@@ -202,15 +206,12 @@ def _batch(leaf, seal: AuthenticatedRootSeal, digits: int, *, flat=False):
         root_seal_sha256=seal.root_seal_sha256,
         branch_identity=seal.branch_identity,
         fixed_root=root,
-        frequency_step=Decimal(str(h)),
+        frequency_step=Decimal(format(h, ".17g")),
         coordinate_step=Decimal(str(epsilon)),
         scientific_operation_identity="exterior-fixed-root-survey-raw/v1",
         request_sha256=str(digits // 40) * 64,
-        precision_tier=(
-            PrecisionTier.BIGFLOAT_40
-            if digits == 40 else PrecisionTier.BIGFLOAT_80
-        ),
-        working_precision_bits=digits * 4,
+        precision_tier=tier,
+        working_precision_bits=working_precision_bits(tier),
         samples=tuple(samples),
     )
 
@@ -305,6 +306,11 @@ class _Backend:
         return replace(
             batch,
             scientific_operation_identity=contract.scientific_operation_identity,
+            request_sha256=_sha256({
+                "leaf_id": self.leaf.leaf_id,
+                "digits": self.digits,
+                "plan": contract.plan.value,
+            }),
             samples=tuple(
                 sample
                 for sample in batch.samples
@@ -759,6 +765,11 @@ class PromotedSurveySchedulerTests(unittest.TestCase):
             return replace(
                 full,
                 scientific_operation_identity=contract.scientific_operation_identity,
+                request_sha256=_sha256({
+                    "leaf_id": backend.leaf.leaf_id,
+                    "digits": backend.digits,
+                    "plan": contract.plan.value,
+                }),
                 samples=tuple(
                     sample
                     for sample in full.samples
