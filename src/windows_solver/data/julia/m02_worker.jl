@@ -8055,11 +8055,15 @@ function validate_fixed_root_survey_request(request)
         "homogeneous_ode_maxiters",
         "max_accepted_steps_per_homogeneous_leg",
         "max_rhs_evaluations_per_homogeneous_leg",
-        "homogeneous_leg_wall_clock_seconds",
         "coordinate_stall_rhs_threshold",
     )
         parse_integer(request, key) > 0 ||
             error("fixed-root survey resource control $(key) is invalid")
+    end
+    leg_timeout = required(request, "homogeneous_leg_wall_clock_seconds")
+    if leg_timeout !== nothing
+        parse_integer(request, "homogeneous_leg_wall_clock_seconds") > 0 ||
+            error("fixed-root survey homogeneous leg timeout is invalid")
     end
     parse_integer(request, "cooperative_request_deadline_seconds") <
         parse_integer(request, "worker_request_wall_clock_seconds") ||
