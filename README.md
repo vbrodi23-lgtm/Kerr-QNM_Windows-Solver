@@ -19,6 +19,8 @@ A process completing successfully is not, by itself, a scientific result. A nume
 
 The public control plane and authenticated pure-Kerr spectral catalogue are available. The packaged catalogue contains 2,736 roots over the declared ℓ, m, n, and spin domain, with exact-coordinate selection and recorded numerical diagnostics.
 
+This boundary statement was reviewed on 27 August 2026.
+
 M02 linear response is an operator-run evidence pipeline. It can build and resume the response atlas, but the linear-response provider remains closed until the required certification, validation, reduction, and admission gates are satisfied.
 
 The machine-readable release authority is:
