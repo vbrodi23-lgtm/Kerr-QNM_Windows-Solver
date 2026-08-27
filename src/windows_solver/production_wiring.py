@@ -35,7 +35,6 @@ _REQUIRED_CALLS = {
             "backend_factory",
             "determinant_error_store",
             "solved_leaf_store",
-            "terminal_record_committed",
             "checkpoint_committed",
             "diagnostic_session",
         },
@@ -62,6 +61,10 @@ _PROMOTED_SURVEY_REQUIRED_CALLS = {
         "retain_promoted_background",
         "_resumed_promoted_exterior_outcome",
         "_resumed_promoted_horizon_outcome",
+        "_validate_promoted_scheduler_preflight",
+    },
+    "_commit_promoted_outcome": {
+        "_validate_promoted_scheduler_preflight",
     },
 }
 _RESUME_NUMERICAL_CALLS = frozenset(
@@ -113,34 +116,6 @@ def _call_names(function: ast.FunctionDef | ast.AsyncFunctionDef) -> set[str]:
         for name in (_call_name(call),)
         if name is not None
     }
-
-
-def _is_guarded_non_calculate_only(
-    function: ast.FunctionDef | ast.AsyncFunctionDef,
-    call_name: str,
-) -> bool:
-    """Require a terminal exterior builder to sit below its explicit gate."""
-
-    parents = {
-        child: parent
-        for parent in ast.walk(function)
-        for child in ast.iter_child_nodes(parent)
-    }
-    for call in _call_nodes(function):
-        if _call_name(call) != call_name:
-            continue
-        node: ast.AST | None = call
-        while node is not None:
-            node = parents.get(node)
-            if isinstance(node, ast.If):
-                test = ast.unparse(node.test)
-                if (
-                    "execution_mode" in test
-                    and "CALCULATE_ONLY" in test
-                    and "is not" in test
-                ):
-                    return True
-    return False
 
 
 def _promoted_ownership_failures(
@@ -202,10 +177,56 @@ def _promoted_ownership_failures(
     exterior = survey_functions.get("_run_promoted_exterior_queue_entry")
     if exterior is None:
         failures.append("missing promoted exterior acquisition adapter")
-    elif not _is_guarded_non_calculate_only(exterior, "produced_record_builder"):
-        failures.append(
-            "promoted exterior terminal builder is not outside CALCULATE_ONLY"
-        )
+    else:
+        forbidden = _call_names(exterior) & {
+            "produced_record_builder",
+            "build_fixed_root_screening_record",
+            "add_numerical_record",
+            "record_evidence",
+            "terminal_record_committed",
+        }
+        if forbidden:
+            failures.append(
+                "promoted exterior acquisition can reach terminal ownership: "
+                f"{sorted(forbidden)}"
+            )
+
+    if scheduler is not None:
+        forbidden = _call_names(scheduler) & {
+            "produced_record_builder",
+            "build_fixed_root_screening_record",
+            "record_evidence",
+            "terminal_record_committed",
+        }
+        if forbidden:
+            failures.append(
+                "promoted scheduler can reach terminal ownership: "
+                f"{sorted(forbidden)}"
+            )
+
+    native_promoted = runtime_functions.get("run_native_promoted_pass")
+    if native_promoted is None:
+        failures.append("missing native promoted calculation adapter")
+    else:
+        names = _call_names(native_promoted)
+        forbidden = names & {
+            "build_fixed_root_screening_record",
+            "terminal_record_committed",
+        }
+        if forbidden:
+            failures.append(
+                "native promoted calculation can reach terminal ownership: "
+                f"{sorted(forbidden)}"
+            )
+        mode_names = {
+            node.attr
+            for node in ast.walk(native_promoted)
+            if isinstance(node, ast.Attribute)
+        }
+        if "CALCULATE_AND_ADMIT" not in mode_names:
+            failures.append(
+                "native promoted calculation does not reject alternate admission authority"
+            )
 
     horizon_acquire = runtime_functions.get("_promoted_horizon_outcome")
     horizon_reduce = runtime_functions.get("_reduce_retained_horizon_for_admission")
