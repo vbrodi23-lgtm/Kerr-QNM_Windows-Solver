@@ -3,8 +3,10 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import replace
+from decimal import Decimal
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from typing import Mapping
 import unittest
 from unittest.mock import patch
 
@@ -30,7 +32,15 @@ from windows_solver.promoted_control_calibration import (
     load_default_calibration_receipt,
 )
 from windows_solver.promoted_admission import admit_retained_promoted_checkpoint
-from windows_solver.julia_response_backend import ExteriorDeterminantErrorEvidence
+from windows_solver.julia_response_backend import (
+    ExteriorDeterminantErrorEvidence,
+    FixedRootSurveyPlan,
+    fixed_root_survey_request_contract,
+)
+from windows_solver.promoted_artifacts import (
+    PromotedBackgroundBinding,
+    PromotedExteriorCalculationResult,
+)
 from windows_solver.response_batches import (
     PrecisionCapabilities,
     build_campaign_plan,
@@ -57,6 +67,10 @@ class PromotedAdmissionTests(unittest.TestCase):
             "7",
             "--review-receipt",
             "review.json",
+            "--calibration-receipt-path",
+            "calibration.json",
+            "--calibration-receipt-sha256",
+            "a" * 64,
         ])
 
         self.assertEqual("campaign-admit-promoted", parsed.command)
@@ -181,6 +195,14 @@ class PromotedAdmissionTests(unittest.TestCase):
         )
         published: list[dict[str, object]] = []
 
+        def publish(value: object) -> dict[str, object]:
+            record_value = dict(value)
+            published.append(record_value)
+            return {
+                "schema": "windows-solver.test-publication-receipt/1",
+                "record_sha256": record_value["record_sha256"],
+            }
+
         with TemporaryDirectory() as temporary:
             path = Path(temporary) / "checkpoint.json"
             path.write_bytes(canonical_json_bytes(checkpoint))
@@ -188,7 +210,8 @@ class PromotedAdmissionTests(unittest.TestCase):
                 path,
                 queue_ordinal=0,
                 independent_review_receipt=review,
-                terminal_record_committed=lambda value: published.append(dict(value)),
+                calibration_receipt=calibration,
+                terminal_record_committed=publish,
             )
 
         self.assertEqual(0, result.backend_call_count)
@@ -232,6 +255,7 @@ class PromotedAdmissionTests(unittest.TestCase):
                     path,
                     queue_ordinal=0,
                     independent_review_receipt=injected,
+                    calibration_receipt=calibration,
                 )
             self.assertEqual(original, path.read_bytes())
 
@@ -264,6 +288,7 @@ class PromotedAdmissionTests(unittest.TestCase):
                             path,
                             queue_ordinal=0,
                             independent_review_receipt=foreign,
+                            calibration_receipt=calibration,
                         )
                     self.assertEqual(original, path.read_bytes())
 
@@ -275,7 +300,7 @@ class PromotedAdmissionTests(unittest.TestCase):
         )
         published: list[dict[str, object]] = []
 
-        def unavailable(_record: object) -> None:
+        def unavailable(_record: object) -> Mapping[str, object]:
             raise RuntimeError("solved-leaf store unavailable")
 
         with TemporaryDirectory() as temporary:
@@ -286,20 +311,32 @@ class PromotedAdmissionTests(unittest.TestCase):
                     path,
                     queue_ordinal=0,
                     independent_review_receipt=review,
+                    calibration_receipt=calibration,
                     terminal_record_committed=unavailable,
                 )
             durable = json.loads(path.read_text(encoding="utf-8"))
             self.assertEqual(
-                "AWAITING_ADMISSION",
+                "ADMITTED_PENDING_PUBLICATION",
                 durable["promotion_queue"]["entries"][0]["disposition"],
             )
-            self.assertEqual([], durable["records"])
-            self.assertEqual({}, durable["evidence_ledger"])
+            self.assertEqual([record], durable["records"])
+            self.assertEqual(
+                "SCREENED", durable["evidence_ledger"]["leaf-1"]["evidence_level"]
+            )
+            def publish(value: object) -> dict[str, object]:
+                record_value = dict(value)
+                published.append(record_value)
+                return {
+                    "schema": "windows-solver.test-publication-receipt/1",
+                    "record_sha256": record_value["record_sha256"],
+                }
+
             retried = admit_retained_promoted_checkpoint(
                 path,
                 queue_ordinal=0,
                 independent_review_receipt=review,
-                terminal_record_committed=lambda value: published.append(dict(value)),
+                calibration_receipt=calibration,
+                terminal_record_committed=publish,
             )
 
         self.assertEqual("COMPLETED", retried.checkpoint[
@@ -315,7 +352,7 @@ class PromotedAdmissionTests(unittest.TestCase):
         )
         published: list[dict[str, object]] = []
 
-        def publish_if_missing(value: object) -> None:
+        def publish_if_missing(value: object) -> dict[str, object]:
             candidate = dict(value)
             if published and canonical_json_bytes(published[0]) != canonical_json_bytes(
                 candidate
@@ -323,6 +360,10 @@ class PromotedAdmissionTests(unittest.TestCase):
                 self.fail("retry tried to publish different solved-leaf evidence")
             if not published:
                 published.append(candidate)
+            return {
+                "schema": "windows-solver.test-publication-receipt/1",
+                "record_sha256": candidate["record_sha256"],
+            }
 
         original_write = promoted_admission._write_atomic
         attempts = 0
@@ -345,6 +386,7 @@ class PromotedAdmissionTests(unittest.TestCase):
                         path,
                         queue_ordinal=0,
                         independent_review_receipt=review,
+                        calibration_receipt=calibration,
                         terminal_record_committed=publish_if_missing,
                     )
                 pending = json.loads(path.read_text(encoding="utf-8"))
@@ -352,14 +394,18 @@ class PromotedAdmissionTests(unittest.TestCase):
                     "AWAITING_ADMISSION",
                     pending["promotion_queue"]["entries"][0]["disposition"],
                 )
+                self.assertEqual([], published)
                 result = admit_retained_promoted_checkpoint(
                     path,
                     queue_ordinal=0,
                     independent_review_receipt=review,
+                    calibration_receipt=calibration,
                     terminal_record_committed=publish_if_missing,
                 )
 
-        self.assertEqual(2, attempts)
+        # First admission write is interrupted; retry then writes the durable
+        # admission and the publication-completion checkpoint separately.
+        self.assertEqual(3, attempts)
         self.assertEqual([record], published)
         self.assertEqual(
             "COMPLETED",
@@ -381,9 +427,11 @@ class PromotedAdmissionTests(unittest.TestCase):
                     path,
                     queue_ordinal=0,
                     independent_review_receipt=review,
+                    calibration_receipt=calibration,
                 )
 
     def test_solver_reduces_a_retained_exterior_batch_without_new_numerics(self):
+        calibration = load_default_calibration_receipt()
         plan = build_campaign_plan(
             policy=NumericalPolicy(),
             backend_identity=VettedNativeDeterminantKernel.identity,
@@ -404,12 +452,14 @@ class PromotedAdmissionTests(unittest.TestCase):
             "delta_same_point": "1e-12",
             "delta_cross_precision": "1e-12",
             "delta_endpoint_series": "1e-12",
-            "safety_factor": "2",
-            "numerical_error_abs": "1e-12",
+            "safety_factor": str(calibration.certificate_safety_factor),
+            "numerical_error_abs": str(
+                Decimal(calibration.certificate_safety_factor) * Decimal("1e-12")
+            ),
         }
-        batch = _batch(leaf, seal, 40)
-        batch = replace(
-            batch,
+        full_batch = _batch(leaf, seal, 40)
+        full_batch = replace(
+            full_batch,
             samples=tuple(
                 replace(
                     sample,
@@ -417,27 +467,65 @@ class PromotedAdmissionTests(unittest.TestCase):
                         raw_error
                     ),
                 )
-                for sample in batch.samples
+                for sample in full_batch.samples
             ),
         )
-        queue_entry = {"queue_ordinal": 0, "leaf_id": leaf.leaf_id}
+        background_contract = fixed_root_survey_request_contract(
+            FixedRootSurveyPlan.CANONICAL_BACKGROUND_FIVE
+        )
+        component_contract = fixed_root_survey_request_contract(
+            FixedRootSurveyPlan.MECHANISM_COMPONENT_FOUR
+        )
+        background_batch = replace(
+            full_batch,
+            scientific_operation_identity=(
+                background_contract.scientific_operation_identity
+            ),
+            request_sha256="1" * 64,
+            samples=tuple(
+                sample
+                for sample in full_batch.samples
+                if sample.role in background_contract.sample_roles
+            ),
+        )
+        component_batch = replace(
+            full_batch,
+            scientific_operation_identity=(
+                component_contract.scientific_operation_identity
+            ),
+            request_sha256="2" * 64,
+            samples=tuple(
+                sample
+                for sample in full_batch.samples
+                if sample.role in component_contract.sample_roles
+            ),
+        )
         cache_key, reuse_key = _promoted_background_key(leaf, seal, 40)
         background_receipt = _promoted_background_receipt(
-            leaf=leaf,
-            entry=queue_entry,
-            batch=batch,
+            batch=background_batch,
             cache_key_sha256=cache_key,
             reuse_key=reuse_key,
-            background_samples=tuple(batch.samples[:5]),
-            status="ACQUIRED",
             source_queue_ordinal=0,
             source_leaf_id=leaf.leaf_id,
+        )
+        calculation = PromotedExteriorCalculationResult(
+            component_batch=component_batch,
+            background=PromotedBackgroundBinding(
+                background_receipt_sha256=str(
+                    background_receipt["receipt_sha256"]
+                ),
+                background_worker_request_sha256=(
+                    background_batch.request_sha256
+                ),
+                background_sha256=str(background_receipt["background_sha256"]),
+                background_reuse_key_sha256=cache_key,
+            ),
         )
         retained_stage = {
             "route": "EXTERIOR_BF40",
             "source_root_seal_sha256": seal.root_seal_sha256,
             "precision_tiers": ["BF40"],
-            "raw_promoted_batches": [batch.to_mapping()],
+            "calculation_artifact": calculation.to_mapping(),
         }
         checkpoint = {
             "promoted_background_ledger": {
@@ -456,10 +544,25 @@ class PromotedAdmissionTests(unittest.TestCase):
             checkpoint,
             retained_stage,
             {"receipt_sha256": "b" * 64},
+            calibration,
             queue_ordinal=0,
         )
 
-        self.assertEqual(9, len(reduction.evidence_receipts))
+        receipt_schemas = [
+            receipt["schema"] for receipt in reduction.evidence_receipts
+        ]
+        self.assertEqual(
+            9,
+            receipt_schemas.count(
+                "windows-solver.promoted-exterior-determinant-rederivation/1"
+            ),
+        )
+        self.assertEqual(
+            9,
+            receipt_schemas.count(
+                "windows-solver.reviewed-determinant-error-receipt/1"
+            ),
+        )
         self.assertEqual(leaf.leaf_id, reduction.record["leaf_id"])
         self.assertEqual("PRODUCED", reduction.record["state"])
         self.assertEqual("BF40", reduction.record["stages"][0]["precision_tier"])
@@ -480,6 +583,7 @@ class PromotedAdmissionTests(unittest.TestCase):
                     path,
                     queue_ordinal=0,
                     independent_review_receipt=review,
+                    calibration_receipt=calibration,
                 )
 
 

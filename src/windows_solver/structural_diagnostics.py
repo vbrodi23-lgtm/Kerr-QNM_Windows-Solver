@@ -16,7 +16,8 @@ from typing import Mapping
 from .contracts import canonical_json_bytes
 
 
-DIAGNOSTIC_EVENT_SCHEMA = "windows-solver.structural-event/1"
+_LEGACY_DIAGNOSTIC_EVENT_SCHEMA = "windows-solver.structural-event/1"
+DIAGNOSTIC_EVENT_SCHEMA = "windows-solver.structural-event/2"
 DIAGNOSTIC_LATEST_SCHEMA = "windows-solver.diagnostic-session-latest/1"
 
 _SESSION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
@@ -45,6 +46,17 @@ _CONNECTION_FIELDS = (
     "disposition_receipt_sha256",
 )
 _CHECKPOINT_FIELDS = ("pre_commit_sha256", "post_commit_sha256")
+_OPERATION_FLOW_FIELDS = (
+    "who",
+    "did_what",
+    "to_what",
+    "using_what",
+    "produced_what",
+    "handed_to_whom",
+    "caller",
+    "callee",
+    "process_id",
+)
 _EVENT_FIELDS = frozenset(
     {
         "schema",
@@ -64,9 +76,11 @@ _EVENT_FIELDS = frozenset(
         "transition",
         "connections",
         "checkpoint",
+        "operation_flow",
         "compact_diagnostics",
     }
 )
+_LEGACY_EVENT_FIELDS = _EVENT_FIELDS - {"operation_flow"}
 
 
 def _sha256(value: object) -> str:
@@ -176,6 +190,7 @@ class StructuralEvent:
         transition: Mapping[str, object] | None = None,
         connections: Mapping[str, object] | None = None,
         checkpoint: Mapping[str, object] | None = None,
+        operation_flow: Mapping[str, object] | None = None,
         compact_diagnostics: Mapping[str, object] | None = None,
     ) -> "StructuralEvent":
         if isinstance(sequence, bool) or not isinstance(sequence, int) or sequence < 1:
@@ -200,6 +215,38 @@ class StructuralEvent:
             compact_diagnostics = {}
         if not isinstance(compact_diagnostics, Mapping):
             raise ValueError("structural event compact diagnostics must be an object")
+        execution_section = _section(_EXECUTION_FIELDS, execution, "execution")
+        transition_section = _section(_TRANSITION_FIELDS, transition, "transition")
+        leaf_section = _section(_LEAF_FIELDS, leaf, "leaf")
+        if operation_flow is None:
+            operation_identity = execution_section["operation_identity"]
+            profile = execution_section["profile"]
+            pass_name = execution_section["pass"]
+            target = leaf_section["leaf_id"] or checkpoint_path
+            next_owner = transition_section["next_state"] or "diagnostic-ledger"
+            actor = operation_identity or profile or "windows-solver"
+            operation_flow = {
+                "who": str(actor),
+                "did_what": event_kind,
+                "to_what": str(target),
+                "using_what": str(operation_identity or pass_name or event_kind),
+                "produced_what": str(transition_section["next_state"] or event_kind),
+                "handed_to_whom": str(next_owner),
+                "caller": str(profile or "windows-solver"),
+                "callee": str(next_owner),
+                "process_id": os.getpid(),
+            }
+        operation_flow_section = _section(
+            _OPERATION_FLOW_FIELDS,
+            operation_flow,
+            "operation flow",
+            require_complete=True,
+        )
+        for name in _OPERATION_FLOW_FIELDS[:-1]:
+            _nonempty_string(operation_flow_section[name], f"operation flow {name}")
+        process_id = operation_flow_section["process_id"]
+        if isinstance(process_id, bool) or not isinstance(process_id, int) or process_id < 1:
+            raise ValueError("structural event operation flow process id is invalid")
         content: dict[str, object] = {
             "schema": DIAGNOSTIC_EVENT_SCHEMA,
             "sequence": sequence,
@@ -212,11 +259,12 @@ class StructuralEvent:
             "selection_id": selection_id,
             "checkpoint_path": checkpoint_path,
             "event_kind": event_kind,
-            "leaf": _section(_LEAF_FIELDS, leaf, "leaf"),
-            "execution": _section(_EXECUTION_FIELDS, execution, "execution"),
-            "transition": _section(_TRANSITION_FIELDS, transition, "transition"),
+            "leaf": leaf_section,
+            "execution": execution_section,
+            "transition": transition_section,
             "connections": _section(_CONNECTION_FIELDS, connections, "connections"),
             "checkpoint": _section(_CHECKPOINT_FIELDS, checkpoint, "checkpoint"),
+            "operation_flow": operation_flow_section,
             "compact_diagnostics": _json_copy(dict(compact_diagnostics)),
         }
         event = {**content, "event_sha256": _sha256(content)}
@@ -224,9 +272,17 @@ class StructuralEvent:
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, object]) -> "StructuralEvent":
-        if not isinstance(value, Mapping) or set(value) != _EVENT_FIELDS:
+        if not isinstance(value, Mapping) or value.get("schema") not in {
+            _LEGACY_DIAGNOSTIC_EVENT_SCHEMA,
+            DIAGNOSTIC_EVENT_SCHEMA,
+        }:
             raise ValueError("structural event schema is invalid")
-        if value.get("schema") != DIAGNOSTIC_EVENT_SCHEMA:
+        expected_fields = (
+            _EVENT_FIELDS
+            if value.get("schema") == DIAGNOSTIC_EVENT_SCHEMA
+            else _LEGACY_EVENT_FIELDS
+        )
+        if set(value) != expected_fields:
             raise ValueError("structural event schema is invalid")
         sequence = value.get("sequence")
         if isinstance(sequence, bool) or not isinstance(sequence, int) or sequence < 1:
@@ -273,6 +329,22 @@ class StructuralEvent:
             "checkpoint",
             require_complete=True,
         )
+        if value.get("schema") == DIAGNOSTIC_EVENT_SCHEMA:
+            flow = _section(
+                _OPERATION_FLOW_FIELDS,
+                value.get("operation_flow"),
+                "operation flow",
+                require_complete=True,
+            )
+            for name in _OPERATION_FLOW_FIELDS[:-1]:
+                _nonempty_string(flow[name], f"operation flow {name}")
+            process_id = flow["process_id"]
+            if (
+                isinstance(process_id, bool)
+                or not isinstance(process_id, int)
+                or process_id < 1
+            ):
+                raise ValueError("structural event operation flow process id is invalid")
         if not isinstance(value.get("compact_diagnostics"), Mapping):
             raise ValueError("structural event compact diagnostics must be an object")
         if sequence == 1 and previous is not None:
@@ -397,6 +469,7 @@ class StructuralDiagnosticSession:
         transition: Mapping[str, object] | None = None,
         connections: Mapping[str, object] | None = None,
         checkpoint: Mapping[str, object] | None = None,
+        operation_flow: Mapping[str, object] | None = None,
         compact_diagnostics: Mapping[str, object] | None = None,
         durable: bool = False,
     ) -> StructuralEvent:
@@ -419,6 +492,7 @@ class StructuralDiagnosticSession:
             transition=transition,
             connections=connections,
             checkpoint=checkpoint,
+            operation_flow=operation_flow,
             compact_diagnostics=compact_diagnostics,
         )
         self._handle.write(canonical_json_bytes(event.to_mapping()) + b"\n")

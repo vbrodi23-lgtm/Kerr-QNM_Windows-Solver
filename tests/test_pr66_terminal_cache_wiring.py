@@ -22,7 +22,6 @@ from windows_solver.campaign_runtime import run_native_binary64_pass
 from windows_solver.campaign_survey import (
     Binary64PassOutcome,
     Binary64SurveyRun,
-    run_promoted_survey,
 )
 from windows_solver.contracts import canonical_json_bytes
 from windows_solver.evidence_discovery import EvidenceDiscoveryTotals
@@ -36,6 +35,7 @@ from windows_solver.response_batches import (
 )
 from windows_solver.response_engine import NumericalPolicy
 from windows_solver.solved_leaf_cache import SolvedLeafStore
+from tests.test_promoted_survey_scheduler import _strict_run
 
 
 def _sha256(value: object) -> str:
@@ -55,7 +55,7 @@ def _run_cache_only_promoted_survey(
     def unexpected(*_args, **_kwargs):
         raise AssertionError("cache supersession constructed a numerical capability")
 
-    return run_promoted_survey(
+    return _strict_run(
         plan,
         recovery,
         checkpoint,
@@ -65,7 +65,6 @@ def _run_cache_only_promoted_survey(
         backend_factory=unexpected,
         primary_root_runner=unexpected,
         horizon_runner=unexpected,
-        produced_record_builder=unexpected,
         solved_leaf_store=store,
     )
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+from decimal import Decimal
 from pathlib import Path
 import tempfile
 import unittest
@@ -27,25 +28,35 @@ from windows_solver.campaign_survey import (
     PromotedPassOutcome,
     run_promoted_survey,
 )
+from windows_solver.campaign_runtime import build_schema11_horizon_stage
 from windows_solver.contracts import canonical_json_bytes
 from windows_solver.response_batches import (
     PrecisionCapabilities,
+    StageOutcome,
+    _component_stage_signed_error_channels,
     build_campaign_plan,
     build_campaign_selection,
     scientific_computation_identity_sha256,
 )
 from windows_solver.response_engine import (
     BINARY64_HORIZON_OPERATION_V3,
+    DecimalComplex,
     EXTERIOR_PROVISIONAL_REUSE_RECEIPT_SCHEMA,
     NumericalPolicy,
     VettedNativeDeterminantKernel,
     build_exterior_background_reuse_key,
+    run_promoted_horizon_component,
 )
+from windows_solver.promoted_artifacts import PromotedHorizonCalculationResult
 from windows_solver.reviewed_determinant_error_issuance import (
     require_locked_bf40_determinant_error_issuance_authority,
 )
 
-from tests.test_promoted_survey_scheduler import _Backend, _record
+from tests.test_promoted_horizon_component import (
+    FakePromotedBackend,
+    _promoted_baseline,
+)
+from tests.test_promoted_survey_scheduler import _Backend
 
 
 def _sha256(value: object) -> str:
@@ -171,48 +182,71 @@ class PR73CalculateOnlyProductionShapeTests(unittest.TestCase):
         self.assertEqual(48, len(exterior_reuse_groups))
         return checkpoint
 
-    @staticmethod
-    def _promoted_horizon_outcome(leaf) -> PromotedPassOutcome:
-        record, stage_sha256 = _record(leaf.leaf_id, 80)
-        record_stage = record["stages"][0]
-        record_stage["precision_tier"] = "BF80"
-        record_stage["component_result"] = {
-            "result": {
-                "schema": "windows-solver.test-promoted-horizon-batch/1",
-                "precision_tier": "BF80",
-                "leaf_id": leaf.leaf_id,
-            }
+    def _promoted_horizon_outcome(
+        self,
+        leaf,
+        queue_entry,
+        layer1_lock_receipt_sha256: str,
+    ) -> PromotedPassOutcome:
+        component = run_promoted_horizon_component(
+            leaf.job,
+            FakePromotedBackend(
+                leaf.job,
+                _promoted_baseline(
+                    leaf.job,
+                    omega=leaf.job.root.omega,
+                    derivative=DecimalComplex(Decimal("1"), Decimal("0.25")),
+                ),
+            ),
+            leaf.job.root.omega,
+        )
+        component_payload = {
+            "evidence_kind": "package-owned-julia-promoted-horizon-survey",
+            "result": component.to_mapping(),
+            "scientific_runtime": {"runtime": "synthetic-bf80"},
         }
-        record_stage["stage_sha256"] = _sha256({
-            key: value
-            for key, value in record_stage.items()
-            if key != "stage_sha256"
-        })
-        record["record_sha256"] = _sha256({
-            key: value for key, value in record.items() if key != "record_sha256"
-        })
+        stage_outcome = StageOutcome(
+            digits=80,
+            numerical_state=component.status.value,
+            component_result=component_payload,
+            local_disk_radius_abs=sum(component.error_channels.values()),
+            signed_error_channels=_component_stage_signed_error_channels(
+                component_payload,
+                component,
+                repeat_applicable=False,
+                precision_ladder_applicable=False,
+            ),
+            self_refinement_enclosed=None,
+            discrepancy_from_previous_abs=None,
+            discrepancy_enclosed=None,
+        )
+        stage, _stage_sha256 = build_schema11_horizon_stage(
+            stage_outcome,
+            precision_tier="BF80",
+            operation_identity="promoted-horizon-component/v2",
+        )
+        artifact = PromotedHorizonCalculationResult(
+            component_stage=stage,
+            numerical_outcome=stage_outcome.to_mapping(),
+            predecessor_stage_sha256=str(queue_entry["source_stage_sha256"]),
+            source_fingerprint_sha256=str(
+                queue_entry["source_fingerprint_sha256"]
+            ),
+            layer1_lock_receipt_sha256=layer1_lock_receipt_sha256,
+        ).to_mapping()
         return PromotedPassOutcome(
-            disposition=SurveyDisposition.COMPLETED,
-            reason_code="BOUNDED_PROMOTED_HORIZON_RESPONSE",
+            disposition=SurveyDisposition.CALCULATED_AWAITING_ADMISSION,
+            reason_code="RAW_PROMOTED_HORIZON_CALCULATION_RETAINED",
             precision_tiers=("BF80",),
-            operation_identity="promoted-horizon-production/v2",
-            record=record,
-            stage_sha256=str(record_stage["stage_sha256"]),
+            operation_identity="promoted-horizon-calculation/v2",
             sample_count=1,
             sample_limit=1,
             root_read_count=1,
             root_read_limit=1,
             worker_launch_count=1,
             worker_launch_limit=1,
-            evidence_receipts=({
-                "schema": "windows-solver.test-promoted-horizon-raw-batch/1",
-                "batch": {
-                    "schema": "windows-solver.test-promoted-horizon-batch/1",
-                    "precision_tier": "BF80",
-                    "leaf_id": leaf.leaf_id,
-                    "samples": [],
-                },
-            },),
+            calculation_artifact=artifact,
+            calculation_chain=(),
         )
 
     @staticmethod
@@ -292,7 +326,6 @@ class PR73CalculateOnlyProductionShapeTests(unittest.TestCase):
             }
             promoted_calls: list[int] = []
             horizon_calls: list[str] = []
-            terminal_commits: list[str] = []
             binary64_predecessor_evaluations_consumed = 0
             guard_phase_counts = {
                 "pre_write": 0,
@@ -318,7 +351,16 @@ class PR73CalculateOnlyProductionShapeTests(unittest.TestCase):
 
             def horizon_runner(leaf):
                 horizon_calls.append(leaf.leaf_id)
-                return self._promoted_horizon_outcome(leaf)
+                entry = next(
+                    item
+                    for item in checkpoint["promotion_queue"]["entries"]
+                    if item["leaf_id"] == leaf.leaf_id
+                )
+                return self._promoted_horizon_outcome(
+                    leaf,
+                    entry,
+                    str(lock["receipt_sha256"]),
+                )
 
             def consume_predecessor(stage, **_bindings):
                 nonlocal binary64_predecessor_evaluations_consumed
@@ -333,53 +375,6 @@ class PR73CalculateOnlyProductionShapeTests(unittest.TestCase):
                 }
                 return {**content, "receipt_sha256": _sha256(content)}
 
-            def compact_retained_stage(**arguments):
-                outcome = arguments["outcome"]
-                queue_entry = arguments["queue_entry"]
-                raw_batch_digests = [
-                    _sha256(receipt["batch"])
-                    for receipt in outcome.evidence_receipts
-                    if isinstance(receipt, dict)
-                    and isinstance(receipt.get("batch"), dict)
-                ]
-                material = {
-                    "schema": "windows-solver.promoted-calculation-stage/1",
-                    "queue_ordinal": arguments["queue_ordinal"],
-                    "leaf_id": queue_entry["leaf_id"],
-                    "scientific_computation_identity": arguments[
-                        "scientific_computation_identity"
-                    ],
-                    "route": arguments["route"],
-                    "execution_mode": arguments["preflight"].mode.value,
-                    "admission_state": "AWAITING_ADMISSION",
-                    "layer1_lock_receipt_sha256": arguments[
-                        "layer1_lock_receipt_sha256"
-                    ],
-                    "source_fingerprint_sha256": queue_entry[
-                        "source_fingerprint_sha256"
-                    ],
-                    "predecessor_stage_sha256": queue_entry[
-                        "source_stage_sha256"
-                    ],
-                    "source_root_seal_sha256": queue_entry[
-                        "source_root_seal_sha256"
-                    ],
-                    "calibration_receipt_sha256": arguments[
-                        "preflight"
-                    ].calibration_receipt_sha256,
-                    "precision_tiers": list(outcome.precision_tiers),
-                    "raw_promoted_batches": [{
-                        "schema": "windows-solver.test-retained-batch-pointer/1",
-                        "precision_tier": outcome.precision_tiers[-1],
-                        "batch_sha256s": raw_batch_digests,
-                    }],
-                    "current_run_disagreement_terms": [],
-                    "sample_count": outcome.sample_count,
-                    "root_read_count": outcome.root_read_count,
-                    "worker_launch_count": outcome.worker_launch_count,
-                }
-                return {**material, "stage_sha256": _sha256(material)}
-
             with patch(
                 "windows_solver.campaign_survey._atomic_json",
                 side_effect=retain_in_memory,
@@ -389,9 +384,6 @@ class PR73CalculateOnlyProductionShapeTests(unittest.TestCase):
             ), patch(
                 "windows_solver.campaign_survey.consume_authenticated_binary64_provisional_predecessor",
                 side_effect=consume_predecessor,
-            ), patch(
-                "windows_solver.campaign_survey._retained_promoted_stage",
-                side_effect=compact_retained_stage,
             ):
                 promoted = run_promoted_survey(
                     self.plan,
@@ -413,18 +405,10 @@ class PR73CalculateOnlyProductionShapeTests(unittest.TestCase):
                         "official fixture contains no root-promotion route"
                     ),
                     horizon_runner=horizon_runner,
-                    produced_record_builder=(
-                        lambda leaf, _batch, _screening, digits: _record(
-                            leaf.leaf_id, digits
-                        )
-                    ),
                     layer1_guard=ShapeGuard(),
                     locked_routes_by_ordinal=guard.locked_routes_by_ordinal,
                     promoted_preflights_by_ordinal=preflights,
                     layer1_lock_receipt_sha256=str(lock["receipt_sha256"]),
-                    terminal_record_committed=lambda leaf, _record: (
-                        terminal_commits.append(leaf.leaf_id)
-                    ),
                 )
 
             layer1_after = project_binary64_layer(
@@ -469,23 +453,50 @@ class PR73CalculateOnlyProductionShapeTests(unittest.TestCase):
             self.assertEqual(0, promoted.terminal_publication_count)
             self.assertEqual(0, promoted.policy_blocked_count)
             self.assertEqual(0, promoted.completed_count)
-            self.assertEqual([], terminal_commits)
             self.assertEqual({}, promoted.checkpoint["evidence_ledger"])
             self.assertEqual([], promoted.checkpoint["records"])
             self.assertEqual(212, len(promoted.checkpoint["promoted_stage_ledger"]))
             self.assertEqual(
-                172, len(promoted.checkpoint["promoted_background_ledger"])
+                48, len(promoted.checkpoint["promoted_background_ledger"])
             )
             self.assertEqual(40, len(promoted.checkpoint["promoted_root_ledger"]))
-            background_statuses = [
-                entry[leaf_id]["payload"]["background_receipts"][0]["status"]
-                for entry in promoted.checkpoint[
+            canonical_backgrounds = {
+                receipt["receipt_sha256"]: receipt
+                for bucket in promoted.checkpoint[
                     "promoted_background_ledger"
                 ].values()
-                for leaf_id in entry
+                for entry in bucket.values()
+                for receipt in entry["payload"]["background_receipts"]
+            }
+            self.assertEqual(48, len(canonical_backgrounds))
+            exterior_bindings = [
+                (
+                    stage["queue_ordinal"],
+                    stage["calculation_artifact"]["background"][
+                        "background_receipt_sha256"
+                    ],
+                )
+                for bucket in promoted.checkpoint[
+                    "promoted_stage_ledger"
+                ].values()
+                for stage in bucket.values()
+                if stage["route"] == "EXTERIOR_BF40"
             ]
-            self.assertEqual(48, background_statuses.count("ACQUIRED"))
-            self.assertEqual(124, background_statuses.count("REUSED"))
+            self.assertEqual(172, len(exterior_bindings))
+            self.assertEqual(
+                set(canonical_backgrounds),
+                {receipt_sha256 for _, receipt_sha256 in exterior_bindings},
+            )
+            self.assertEqual(
+                124,
+                sum(
+                    ordinal
+                    != canonical_backgrounds[receipt_sha256][
+                        "source_queue_ordinal"
+                    ]
+                    for ordinal, receipt_sha256 in exterior_bindings
+                ),
+            )
             self.assertGreater(guard_phase_counts["pre_write"], 212)
             self.assertEqual(
                 guard_phase_counts["pre_write"],
@@ -500,13 +511,31 @@ class PR73CalculateOnlyProductionShapeTests(unittest.TestCase):
                 and isinstance(entry["retained_promoted_stage_sha256"], str)
                 for entry in promoted.checkpoint["promotion_queue"]["entries"]
             ))
+            retained_stages = [
+                stage
+                for bucket in promoted.checkpoint[
+                    "promoted_stage_ledger"
+                ].values()
+                for stage in bucket.values()
+            ]
             self.assertTrue(all(
-                ledger[leaf_id]["raw_promoted_batches"]
-                and isinstance(
-                    ledger[leaf_id]["current_run_disagreement_terms"], list
-                )
-                for ledger in promoted.checkpoint["promoted_stage_ledger"].values()
-                for leaf_id in ledger
+                isinstance(stage["calculation_artifact"], dict)
+                and isinstance(stage["source_calculation_stage_sha256"], str)
+                and stage["calculation_chain"]
+                for stage in retained_stages
+            ))
+            self.assertTrue(all(
+                len(stage["raw_promoted_batches"]) == 2
+                and isinstance(stage["current_run_disagreement_terms"], list)
+                for stage in retained_stages
+                if stage["route"] == "EXTERIOR_BF40"
+            ))
+            self.assertTrue(all(
+                not stage["raw_promoted_batches"]
+                and stage["calculation_artifact"]["schema"]
+                == "windows-solver.promoted-horizon-calculation/3"
+                for stage in retained_stages
+                if stage["route"] == "HORIZON_BF80"
             ))
             self.assertEqual(
                 {"BF40": 172, "BF80": 40},
@@ -553,9 +582,6 @@ class PR73CalculateOnlyProductionShapeTests(unittest.TestCase):
                     ),
                     horizon_runner=lambda *_args: self.fail(
                         "resume repeated BF80 horizon work"
-                    ),
-                    produced_record_builder=lambda *_args: self.fail(
-                        "resume rebuilt a record"
                     ),
                     layer1_guard=ShapeGuard(),
                     locked_routes_by_ordinal=guard.locked_routes_by_ordinal,

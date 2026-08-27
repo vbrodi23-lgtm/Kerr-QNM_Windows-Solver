@@ -35,7 +35,6 @@ from windows_solver.campaign_survey import (
     Binary64PassOutcome,
     PromotedPassOutcome,
     run_binary64_survey,
-    run_promoted_survey,
 )
 from windows_solver.contracts import canonical_json_bytes
 from windows_solver.native_response_kernel import VettedNativeDeterminantKernel
@@ -64,6 +63,7 @@ from windows_solver.structural_diagnostics import StructuralDiagnosticSession
 
 from tests.test_pr66_terminal_cache_wiring import _terminal_survey_record
 from tests.test_pr69_commit10_recovery import Commit10RecoveryTests
+from tests.test_promoted_survey_scheduler import _strict_run
 
 
 _V2_OPERATION = "binary64-horizon-production/" + "v2"
@@ -507,24 +507,43 @@ class SchedulerForensicTests(unittest.TestCase):
                 record=v2,
                 source_type="originating-campaign",
             )
-            result = run_promoted_survey(
+            result = _strict_run(
                 plan,
                 recovery,
                 _queue_checkpoint(plan, selection, leaf),
                 checkpoint_path=root / "checkpoint.json",
                 root_seal_lookup=lambda *_args: self.fail("unexpected root lookup"),
-                provisional_stage_lookup=lambda *_args: None,
                 backend_factory=lambda *_args: self.fail("unexpected backend"),
                 primary_root_runner=lambda *_args: self.fail("unexpected root work"),
-                horizon_runner=lambda _leaf: (
+                horizon_runner=lambda _leaf: self.fail(
+                    "typed promoted horizon runner was not used"
+                ),
+                promoted_horizon_runner=lambda _leaf, entry, _source, _receipts: (
                     calls.append("horizon")
                     or PromotedPassOutcome(
                         disposition=SurveyDisposition.UNRESOLVED,
                         reason_code="HORIZON_LADDER_EXHAUSTED",
                         precision_tiers=("BF80",),
+                        operation_identity="promoted-horizon-control-return/v1",
+                        calculation_artifact=(
+                            lambda content: {
+                                **content,
+                                "calculation_sha256": _sha256(content),
+                            }
+                        )({
+                            "schema": "windows-solver.promoted-horizon-control-return/1",
+                            "precision_tier": "BF80",
+                            "failure_code": "HORIZON_LADDER_EXHAUSTED",
+                            "policy_disposition": "UNRESOLVED",
+                            "failure_fingerprint_sha256": "a" * 64,
+                            "predecessor_stage_sha256": entry["source_stage_sha256"],
+                            "source_fingerprint_sha256": entry[
+                                "source_fingerprint_sha256"
+                            ],
+                            "layer1_lock_receipt_sha256": "f" * 64,
+                        }),
                     )
                 ),
-                produced_record_builder=lambda *_args: self.fail("unexpected record"),
                 root_seal_publish=lambda *_args: self.fail("unexpected publish"),
                 solved_leaf_store=store,
             )
@@ -553,19 +572,15 @@ class SchedulerForensicTests(unittest.TestCase):
                 record=current,
                 source_type="originating-campaign",
             )
-            result = run_promoted_survey(
+            result = _strict_run(
                 plan,
                 recovery,
                 _queue_checkpoint(plan, selection, leaf),
                 checkpoint_path=root / "checkpoint.json",
                 root_seal_lookup=lambda *_args: self.fail("unexpected root lookup"),
-                provisional_stage_lookup=lambda *_args: self.fail(
-                    "unexpected predecessor"
-                ),
                 backend_factory=lambda *_args: self.fail("unexpected backend"),
                 primary_root_runner=lambda *_args: self.fail("unexpected root work"),
                 horizon_runner=lambda _leaf: self.fail("unexpected horizon work"),
-                produced_record_builder=lambda *_args: self.fail("unexpected record"),
                 root_seal_publish=lambda *_args: self.fail("unexpected publish"),
                 solved_leaf_store=store,
             )

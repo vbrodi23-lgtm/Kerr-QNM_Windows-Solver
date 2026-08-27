@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from decimal import Decimal, InvalidOperation, localcontext
 import hashlib
 import math
 import os
@@ -45,8 +46,9 @@ from .campaign_survey import (
     PromotedPassOutcome,
     PromotedRootSolveResult,
     PromotedSurveyRun,
+    _promoted_canonical_background_receipt_from_mapping,
+    _promoted_exterior_calculation_from_mapping,
     binary64_pass_exhaustion,
-    promoted_fixed_root_batch_from_mapping,
     run_binary64_survey,
     run_promoted_survey,
 )
@@ -102,7 +104,7 @@ from .response_engine import (
     raw_determinant_contract_from_request,
     _validate_current_raw_determinant_policy,
     root_readout_preserves_authenticated_branch,
-    reviewed_determinant_error_claims_for_fixed_root_batch,
+    reviewed_determinant_error_claims_for_fixed_root_batches,
     run_promoted_horizon_component,
     screen_promoted_fixed_root_samples,
     validate_exterior_provisional_stage,
@@ -118,7 +120,11 @@ from .julia_response_backend import (
     JuliaRootReadoutResourceLimitError,
     _validated_execution_resource_policy,
 )
-from .promoted_control_calibration import load_default_calibration_receipt
+from .promoted_control_calibration import (
+    PromotedControlCalibrationReceipt,
+    PromotedExecutionMode,
+    load_default_calibration_receipt,
+)
 from .promoted_admission import (
     PromotedAdmissionReduction,
     PromotedAdmissionResult,
@@ -135,6 +141,11 @@ from .reviewed_determinant_error_issuance import (
     require_locked_bf40_determinant_error_issuance_authority,
 )
 from .background_evidence_store import CanonicalBackgroundEvidenceStore
+from .promoted_artifacts import (
+    PromotedBackgroundReuseKey,
+    PromotedFixedRootComposite,
+    PromotedHorizonCalculationResult,
+)
 from .solved_leaf_cache import SolvedLeafLookupStatus, SolvedLeafStore
 from .validation_admission import SAME_BACKEND_REFINEMENT_ROUTE
 from .progress import ProgressEventKind, emit_progress, progress_scope
@@ -280,8 +291,16 @@ def _refresh_runtime_reports(
     selected = tuple(selection.leaf_ids)
     binary = checkpoint["survey_pass_ledger"]["binary64"]
     pending = tuple(
-        item for item in checkpoint["promotion_queue"]["entries"]
-        if item["disposition"] == "PENDING"
+        item
+        for item in checkpoint["promotion_queue"]["entries"]
+        if item["disposition"]
+        in {
+            PromotionQueueDisposition.PENDING.value,
+            PromotionQueueDisposition.CALCULATED_PENDING_DERIVATION.value,
+            PromotionQueueDisposition.NUMERICAL_CONTINUATION.value,
+            PromotionQueueDisposition.AWAITING_ADMISSION.value,
+            PromotionQueueDisposition.ADMITTED_PENDING_PUBLICATION.value,
+        }
     )
     triage_ready = (
         include_triage
@@ -436,41 +455,27 @@ def _completed_horizon_source_is_authenticated(
         or not _is_sha256(source_record_sha256)
         or not _is_sha256(source_stage_sha256)
         or not isinstance(queue_ordinal, int)
+        or queue_entry.get("disposition")
+        != PromotionQueueDisposition.COMPLETED.value
         or not isinstance(promoted, Mapping)
         or promoted.get("disposition") != SurveyDisposition.COMPLETED.value
         or promoted.get("operation_identity")
-        != "promoted-horizon-comparison/v2"
+        != "promoted-independent-review-admission/v1"
         or promoted.get("reason_code")
-        != "PROMOTED_HORIZON_COMPARISON_AGREES"
+        != "PUBLISHED_AFTER_DURABLE_ADMISSION"
         or promoted.get("precision_tiers") != ["BF80"]
         or promoted.get("source_record_sha256") != source_record_sha256
         or promoted.get("result_record_sha256") != source_record_sha256
     ):
         return False
-    queue_receipt = {
-        "schema": "windows-solver.promoted-queue-disposition/1",
-        "leaf_id": leaf_id,
-        "queue_ordinal": queue_ordinal,
-        "disposition": SurveyDisposition.COMPLETED.value,
-        "reason_code": promoted["reason_code"],
-        "precision_tiers": list(promoted["precision_tiers"]),
-        "result_record_sha256": source_record_sha256,
-        "source_record_sha256": source_record_sha256,
-    }
     supplied_fingerprint = queue_entry.get("source_fingerprint_sha256")
-    if supplied_fingerprint is not None:
-        if not _is_sha256(supplied_fingerprint):
-            return False
-        try:
-            expected_fingerprint = promotion_source_fingerprint_sha256(queue_entry)
-        except ValueError:
-            return False
-        if supplied_fingerprint != expected_fingerprint:
-            return False
-        queue_receipt["source_fingerprint_sha256"] = expected_fingerprint
-    if queue_entry.get("disposition_receipt_sha256") != _sha256(
-        queue_receipt
-    ):
+    if not _is_sha256(supplied_fingerprint):
+        return False
+    try:
+        expected_fingerprint = promotion_source_fingerprint_sha256(queue_entry)
+    except ValueError:
+        return False
+    if supplied_fingerprint != expected_fingerprint:
         return False
 
     records = checkpoint.get("records", ())
@@ -509,6 +514,47 @@ def _completed_horizon_source_is_authenticated(
         or evidence.get("central_stage_sha256") != source_stage_sha256
         or not isinstance(receipts, list)
     ):
+        return False
+    review_receipt = next(
+        (
+            receipt
+            for receipt in receipts
+            if isinstance(receipt, Mapping)
+            and receipt.get("schema")
+            == "windows-solver.independent-promoted-review-receipt/1"
+            and receipt.get("decision") == "ADMIT_SCREENED"
+            and receipt.get("queue_ordinal") == queue_ordinal
+            and receipt.get("leaf_id") == leaf_id
+            and receipt.get("route") == "HORIZON_BF80"
+            and receipt.get("source_fingerprint_sha256") == expected_fingerprint
+            and _receipt_digest_is_valid(receipt)
+        ),
+        None,
+    )
+    if not isinstance(review_receipt, Mapping):
+        return False
+    publication_receipt = next(
+        (
+            receipt
+            for receipt in receipts
+            if isinstance(receipt, Mapping)
+            and receipt.get("schema")
+            == "windows-solver.promoted-publication-completion/1"
+            and receipt.get("queue_ordinal") == queue_ordinal
+            and receipt.get("leaf_id") == leaf_id
+            and receipt.get("source_fingerprint_sha256") == expected_fingerprint
+            and receipt.get("admitted_record_sha256") == source_record_sha256
+            and receipt.get("review_receipt_sha256")
+            == review_receipt.get("receipt_sha256")
+            and receipt.get("receipt_sha256")
+            == queue_entry.get("disposition_receipt_sha256")
+            and receipt.get("publication_receipt_sha256")
+            == _sha256(receipt.get("publication_receipt"))
+            and _receipt_digest_is_valid(receipt)
+        ),
+        None,
+    )
+    if not isinstance(publication_receipt, Mapping):
         return False
 
     triggers = {
@@ -1784,6 +1830,7 @@ def _promoted_horizon_outcome(
     queue_entry: Mapping[str, object] | None = None,
     source_record: Mapping[str, object] | None = None,
     trigger_receipts: tuple[Mapping[str, object], ...] = (),
+    layer1_lock_receipt_sha256: str | None = None,
 ) -> PromotedPassOutcome:
     operation_identity = "promoted-horizon-component/v2"
     source_record_sha256 = None
@@ -1871,6 +1918,31 @@ def _promoted_horizon_outcome(
                 "horizon promotion trigger receipt does not require promoted work"
             )
 
+    if not isinstance(queue_entry, Mapping):
+        raise ValueError("promoted horizon calculation lacks a locked queue entry")
+    predecessor_stage_sha256 = queue_entry.get("source_stage_sha256")
+    source_fingerprint_sha256 = queue_entry.get("source_fingerprint_sha256")
+    if not all(
+        isinstance(value, str) and len(value) == 64
+        for value in (
+            predecessor_stage_sha256,
+            source_fingerprint_sha256,
+            layer1_lock_receipt_sha256,
+        )
+    ):
+        raise ValueError("promoted horizon calculation lineage is invalid")
+    if source_record is None:
+        provisional = queue_entry.get("provisional_stage")
+        if not isinstance(provisional, Mapping):
+            raise ValueError("horizon provisional stage is missing")
+        validate_schema11_horizon_stage(plan, leaf, provisional)
+        if (
+            queue_entry.get("provisional_stage_sha256")
+            != provisional.get("stage_sha256")
+            or predecessor_stage_sha256 != provisional.get("stage_sha256")
+        ):
+            raise ValueError("horizon provisional stage digest is invalid")
+
     precision = backend._julia_precision_backend_for(leaf.job, 80)
     try:
         result = run_promoted_horizon_component(
@@ -1915,6 +1987,16 @@ def _promoted_horizon_outcome(
             FailureDisposition.DEFERRED: SurveyDisposition.DEFERRED,
             FailureDisposition.REJECTED: SurveyDisposition.REJECTED,
         }[decision.disposition]
+        control_content = {
+            "schema": "windows-solver.promoted-horizon-control-return/1",
+            "precision_tier": "BF80",
+            "failure_code": code,
+            "policy_disposition": decision.disposition.value,
+            "failure_fingerprint_sha256": decision.fingerprint_sha256,
+            "predecessor_stage_sha256": predecessor_stage_sha256,
+            "source_fingerprint_sha256": source_fingerprint_sha256,
+            "layer1_lock_receipt_sha256": layer1_lock_receipt_sha256,
+        }
         return PromotedPassOutcome(
             disposition=disposition,
             reason_code=code,
@@ -1924,6 +2006,11 @@ def _promoted_horizon_outcome(
             source_stage_sha256=source_stage_sha256,
             root_read_limit=1,
             worker_launch_count=1,
+            calculation_artifact={
+                **control_content,
+                "calculation_sha256": _sha256(control_content),
+            },
+            calculation_chain=(),
         )
     component_result = {
         "evidence_kind": "package-owned-julia-promoted-horizon-survey",
@@ -1950,166 +2037,26 @@ def _promoted_horizon_outcome(
         precision_tier="BF80",
         operation_identity=operation_identity,
     )
-    if result.response is None or result.status.value != "CONVERGED":
-        code = _typed_horizon_failure_code(result)
-        decision = classify_failure(FailureReport(
-            failure_code=code,
-            failure_class="HORIZON_COMPONENT",
-            stage="promoted-horizon",
-            worker_operation=operation_identity,
-            request_schema="windows-solver.response-component-job/1",
-            backend_identity=leaf.job.backend_identity.identity_sha256,
-            policy_identity=leaf.job.policy.identity_sha256,
-            precision_tier="BF80",
-            cause_type="ComponentStatus",
-            diagnostics={
-                "schema": "windows-solver.promoted-horizon-failure/1",
-                "complete": True,
-                "component_status": result.status.value,
-                "failure_code": code,
-            },
-        ))
-        if decision.disposition is FailureDisposition.SYSTEM_FAILURE:
-            raise ValueError(f"unclassified promoted horizon failure: {code}")
-        disposition = {
-            FailureDisposition.PROMOTION_PENDING: SurveyDisposition.UNRESOLVED,
-            FailureDisposition.UNRESOLVED: SurveyDisposition.UNRESOLVED,
-            FailureDisposition.DEFERRED: SurveyDisposition.DEFERRED,
-            FailureDisposition.REJECTED: SurveyDisposition.REJECTED,
-        }[decision.disposition]
-        if source_record is None and disposition in {
-            SurveyDisposition.UNRESOLVED,
-            SurveyDisposition.REJECTED,
-        }:
-            record = build_schema11_horizon_record(
-                plan,
-                leaf,
-                stages=(stage,),
-                retained_centre=None,
-                state=disposition.value,
-            )
-        else:
-            record = None
-        return PromotedPassOutcome(
-            disposition=disposition,
-            reason_code=code,
-            precision_tiers=("BF80",),
-            operation_identity=operation_identity,
-            record=record,
-            stage_sha256=stage_sha256 if record is not None else None,
-            source_record_sha256=source_record_sha256,
-            source_stage_sha256=source_stage_sha256,
-            root_read_count=1,
-            root_read_limit=1,
-            worker_launch_count=1,
-        )
-
-    if source_record is not None:
-        source_stages = source_record["stages"]
-        assert isinstance(source_stages, list)
-        source_stage = source_stages[0]
-        assert isinstance(source_stage, Mapping)
-        source_disk = source_stage.get("response_disk")
-        bf80_disk = stage.get("response_disk")
-        if not isinstance(source_disk, Mapping):
-            raise ValueError("horizon source record lacks a response disk")
-        source_centre = source_disk["centre"]
-        source_radius = float(source_disk["radius"])
-        bf80_centre = (
-            None if not isinstance(bf80_disk, Mapping) else bf80_disk["centre"]
-        )
-        bf80_radius = (
-            None if not isinstance(bf80_disk, Mapping) else float(bf80_disk["radius"])
-        )
-        discrepancy = (
-            None
-            if bf80_centre is None
-            else abs(
-                complex(
-                    float(source_centre["real"]),
-                    float(source_centre["imaginary"]),
-                )
-                - complex(float(bf80_centre["real"]), float(bf80_centre["imaginary"]))
-            )
-        )
-        threshold = (
-            None if bf80_radius is None else source_radius + bf80_radius
-        )
-        agrees = discrepancy is not None and threshold is not None and discrepancy <= threshold
-        comparison_content = {
-            "schema": HORIZON_PROMOTED_COMPARISON_RECEIPT_SCHEMA,
-            "leaf_id": leaf.leaf_id,
-            "source_record_sha256": source_record_sha256,
-            "source_stage_sha256": source_stage_sha256,
-            "source_centre": source_centre,
-            "source_disk_radius": source_radius,
-            "promotion_trigger_receipt_sha256": (
-                trigger_receipt["receipt_sha256"]
-                if trigger_receipt is not None else None
-            ),
-            "bf80_operation_identity": operation_identity,
-            "bf80_result_sha256": _sha256(result.to_mapping()),
-            "bf80_stage": stage,
-            "bf80_centre": bf80_centre,
-            "bf80_disk_radius": bf80_radius,
-            "centre_discrepancy": discrepancy,
-            "reviewed_comparison_threshold": threshold,
-            "agrees": agrees,
-            "outcome_code": "AGREES" if agrees else "DISAGREES_OR_UNBOUNDED",
-            "runtime_identity": precision.scientific_runtime_for(leaf.job),
-            "backend_identity": leaf.job.backend_identity.identity_sha256,
-        }
-        comparison_receipt = {
-            **comparison_content,
-            "receipt_sha256": _sha256(comparison_content),
-        }
-        return PromotedPassOutcome(
-            disposition=(
-                SurveyDisposition.COMPLETED
-                if agrees else SurveyDisposition.UNRESOLVED
-            ),
-            reason_code=(
-                "PROMOTED_HORIZON_COMPARISON_AGREES"
-                if agrees else "PROMOTED_HORIZON_COMPARISON_DISAGREES"
-            ),
-            precision_tiers=("BF80",),
-            operation_identity="promoted-horizon-comparison/v2",
-            source_record_sha256=source_record_sha256,
-            source_stage_sha256=source_stage_sha256,
-            evidence_receipts=(comparison_receipt,),
-            root_read_count=1,
-            root_read_limit=1,
-            worker_launch_count=1,
-        )
-
-    provisional = None if queue_entry is None else queue_entry.get("provisional_stage")
-    if provisional is not None:
-        if not isinstance(provisional, Mapping):
-            raise ValueError("horizon provisional stage is invalid")
-        validate_schema11_horizon_stage(plan, leaf, provisional)
-        if queue_entry.get("provisional_stage_sha256") != provisional.get("stage_sha256"):
-            raise ValueError("horizon provisional stage digest is invalid")
-    response_disk = stage.get("response_disk")
-    retained_centre = (
-        None if not isinstance(response_disk, Mapping) else response_disk["centre"]
-    )
-    record = build_schema11_horizon_record(
-        plan,
-        leaf,
-        stages=(stage,),
-        retained_centre=retained_centre,
-        state="PRODUCED" if retained_centre is not None else "UNRESOLVED",
-    )
+    calculation_artifact = PromotedHorizonCalculationResult(
+        component_stage=stage,
+        numerical_outcome=stage_outcome.to_mapping(),
+        predecessor_stage_sha256=predecessor_stage_sha256,
+        source_fingerprint_sha256=source_fingerprint_sha256,
+        layer1_lock_receipt_sha256=layer1_lock_receipt_sha256,
+    ).to_mapping()
     return PromotedPassOutcome(
-        disposition=SurveyDisposition.COMPLETED,
-        reason_code="BOUNDED_PROMOTED_HORIZON_RESPONSE",
+        disposition=SurveyDisposition.CALCULATED_AWAITING_ADMISSION,
+        reason_code="RAW_PROMOTED_HORIZON_CALCULATION_RETAINED",
         precision_tiers=("BF80",),
-        operation_identity="promoted-horizon-production/v2",
-        record=record,
-        stage_sha256=stage_sha256,
+        operation_identity="promoted-horizon-calculation/v2",
+        source_record_sha256=source_record_sha256,
+        source_stage_sha256=source_stage_sha256,
         root_read_count=1,
         root_read_limit=1,
         worker_launch_count=1,
+        worker_launch_limit=1,
+        calculation_artifact=calculation_artifact,
+        calculation_chain=(),
     )
 
 
@@ -2121,13 +2068,19 @@ def run_native_promoted_pass(
     *,
     checkpoint_path: Path,
     binary64_lock_path: Path,
-    calibration_receipt: object | None = None,
+    calibration_receipt: PromotedControlCalibrationReceipt,
     solved_leaf_store: SolvedLeafStore | None = None,
     determinant_error_store: ReviewedDeterminantErrorStore | None = None,
     background_evidence_store: CanonicalBackgroundEvidenceStore | None = None,
     diagnostic_session: StructuralDiagnosticSession | None = None,
 ) -> PromotedSurveyRun:
     """Execute only locked queued BF40/BF80 work through the survey operation."""
+
+    from .production_wiring import validate_production_wiring
+
+    validate_production_wiring()
+    if not isinstance(calibration_receipt, PromotedControlCalibrationReceipt):
+        raise ValueError("promoted survey requires an explicit calibration receipt")
 
     root_evidence_store = RootEvidenceStore.for_checkpoint(checkpoint_path)
     background_store = background_evidence_store or CanonicalBackgroundEvidenceStore(
@@ -2147,10 +2100,18 @@ def run_native_promoted_pass(
         leaf_mechanism_ids=_layer1_leaf_mechanism_ids(plan, recovery_selection),
         auxiliary_evidence_manifest=manifest,
     )
-    active_calibration_receipt = (
-        load_default_calibration_receipt()
-        if calibration_receipt is None
-        else calibration_receipt
+    active_calibration_receipt = calibration_receipt
+    from .campaign_failures import (
+        require_system_failures_resolved_for_promoted_resume,
+    )
+
+    require_system_failures_resolved_for_promoted_resume(
+        checkpoint,
+        expected_authority_sha256=(
+            active_calibration_receipt.independent_review_authority_sha256
+        ),
+        calibration_receipt_sha256=active_calibration_receipt.sha256,
+        binary64_lock_receipt_sha256=str(lock["receipt_sha256"]),
     )
     promoted_preflights_by_ordinal = {
         ordinal: require_locked_bf40_determinant_error_issuance_authority(
@@ -2159,6 +2120,14 @@ def run_native_promoted_pass(
         )
         for ordinal, route in layer1_guard.locked_routes_by_ordinal.items()
     }
+    if any(
+        preflight.mode is PromotedExecutionMode.CALCULATE_AND_ADMIT
+        for preflight in promoted_preflights_by_ordinal.values()
+    ):
+        raise ValueError(
+            "schema-11 promoted pass is calculation-only; use "
+            "campaign-admit-promoted for terminal admission"
+        )
 
     store = solved_leaf_store or SolvedLeafStore.default()
     error_store = determinant_error_store or ReviewedDeterminantErrorStore(
@@ -2201,48 +2170,6 @@ def run_native_promoted_pass(
             raise ValueError("promoted response root seal digest mismatch")
         return candidate
 
-    def build(leaf, batch, screening, digits):
-        root_sha = batch.root_seal_sha256
-        return build_fixed_root_screening_record(
-            plan,
-            leaf,
-            batch,
-            screening,
-            precision_tier=f"BF{digits}",
-            root_seal_sha256=root_sha,
-        )
-
-    def publish_terminal_record(leaf, record):
-        validate_campaign_recovery_record(plan, leaf.leaf_id, record)
-        identity = scientific_computation_identity_sha256(plan, leaf)
-        lookup = store.publish_if_missing(
-            scientific_identity_sha256=identity,
-            leaf_id=leaf.leaf_id,
-            record=record,
-            source_type="originating-campaign",
-        )
-        if (
-            lookup.status is not SolvedLeafLookupStatus.HIT
-            or lookup.receipt is None
-            or canonical_json_bytes(lookup.receipt.get("record"))
-            != canonical_json_bytes(record)
-        ):
-            raise ValueError("promoted terminal record was not published exactly")
-        with progress_scope(
-            leaf_id=leaf.leaf_id,
-            execution_profile="SURVEY",
-            survey_pass="promoted",
-        ):
-            emit_progress(
-                ProgressEventKind.LEAF_CACHE_PUBLISHED,
-                source_type="originating-campaign",
-                record_sha256=record["record_sha256"],
-            )
-        if leaf.mechanism_id == "horizon-admittance":
-            seal = _old_record_root_seal(record) or _new_record_root_seal(record)
-            if seal is not None:
-                root_provider().publish(leaf, seal)
-
     _publish_admissible_checkpoint_records(
         plan,
         recovery_selection,
@@ -2267,7 +2194,12 @@ def run_native_promoted_pass(
             leaf.job, digits
         ),
         primary_root_runner=_promoted_root_result,
-        horizon_runner=lambda leaf: _promoted_horizon_outcome(plan, backend(), leaf),
+        horizon_runner=lambda leaf: _promoted_horizon_outcome(
+            plan,
+            backend(),
+            leaf,
+            layer1_lock_receipt_sha256=str(lock["receipt_sha256"]),
+        ),
         promoted_horizon_runner=(
             lambda leaf, entry, source, receipts: _promoted_horizon_outcome(
                 plan,
@@ -2276,15 +2208,14 @@ def run_native_promoted_pass(
                 queue_entry=entry,
                 source_record=source,
                 trigger_receipts=receipts,
+                layer1_lock_receipt_sha256=str(lock["receipt_sha256"]),
             )
         ),
-        produced_record_builder=build,
         determinant_error_store=error_store,
         solved_leaf_store=store,
         record_validator=lambda leaf_id, record: validate_campaign_recovery_record(
             plan, leaf_id, record
         ),
-        terminal_record_committed=publish_terminal_record,
         checkpoint_committed=lambda value: _refresh_runtime_reports(
             plan,
             selection,
@@ -2296,75 +2227,177 @@ def run_native_promoted_pass(
     )
 
 
-def _retained_exterior_batch_for_admission(
-    retained_stage: Mapping[str, object],
-) -> JuliaFixedRootSurveyBatch:
-    raw_batches = retained_stage.get("raw_promoted_batches")
-    if not isinstance(raw_batches, list):
-        raise ValueError("retained exterior promoted batches are invalid")
-    candidates: list[JuliaFixedRootSurveyBatch] = []
-    for raw_batch in raw_batches:
-        if not isinstance(raw_batch, Mapping):
-            raise ValueError("retained exterior promoted batch is invalid")
-        batch = promoted_fixed_root_batch_from_mapping(raw_batch)
-        if batch.sample_roles == tuple(BINARY64_FIXED_ROOT_SAMPLE_ROLES):
-            candidates.append(batch)
-    if not candidates:
-        raise ValueError("retained exterior promoted batch is missing")
-    batch = candidates[-1]
-    expected_tier = {
-        "BF40": "bigfloat-40",
-        "BF80": "bigfloat-80",
-    }.get(
-        str((retained_stage.get("precision_tiers") or [None])[-1])
-        if isinstance(retained_stage.get("precision_tiers"), list)
-        and retained_stage.get("precision_tiers")
-        else ""
-    )
-    if expected_tier is None or batch.precision_tier.value != expected_tier:
-        raise ValueError("retained exterior promoted precision tier is invalid")
-    return batch
-
-
-def _assert_retained_exterior_support(
+def _retained_exterior_artifacts_for_admission(
     checkpoint: Mapping[str, object],
     retained_stage: Mapping[str, object],
     *,
     queue_ordinal: int,
-    leaf_id: str,
-    batch: JuliaFixedRootSurveyBatch,
-) -> None:
-    """Bind the solver reduction to the retained root and background ledgers."""
+    leaf: object,
+) -> tuple[PromotedFixedRootComposite, tuple[JuliaFixedRootSurveyBatch, ...]]:
+    """Rejoin two retained requests only through their durable hashes.
 
+    The background receipt can originate from an earlier compatible queue
+    entry.  It is never rewritten to look like the consuming leaf's request.
+    """
+
+    calculation_artifact = retained_stage.get("calculation_artifact")
+    if not isinstance(calculation_artifact, Mapping):
+        raise ValueError("retained exterior calculation artifact is missing")
+    calculation, _canonical_calculation = _promoted_exterior_calculation_from_mapping(
+        calculation_artifact
+    )
+    component = calculation.component_batch
+    if (
+        retained_stage.get("route") != "EXTERIOR_BF40"
+        or component.leaf_id != leaf.leaf_id
+        or component.job_id != leaf.job.job_id
+    ):
+        raise ValueError("retained exterior promoted component is invalid")
     source_root = retained_stage.get("source_root_seal_sha256")
-    if isinstance(source_root, str):
-        if batch.root_seal_sha256 != source_root:
-            raise ValueError("retained exterior promoted root seal mismatch")
-    else:
-        receipts = retained_stage.get("receipts")
-        if not isinstance(receipts, list) or not any(
-            isinstance(receipt, Mapping)
-            and receipt.get("schema")
-            == "windows-solver.promoted-root-evidence-receipt/1"
-            and receipt.get("root_seal_sha256") == batch.root_seal_sha256
-            for receipt in receipts
-        ):
-            raise ValueError("retained exterior promoted root evidence is missing")
+    if not isinstance(source_root, str) or component.root_seal_sha256 != source_root:
+        raise ValueError("retained exterior promoted root seal mismatch")
+    tiers = retained_stage.get("precision_tiers")
+    expected_tier = {
+        "BF40": "bigfloat-40",
+        "BF80": "bigfloat-80",
+    }.get(
+        str(tiers[-1]) if isinstance(tiers, list) and tiers else ""
+    )
+    if expected_tier is None or component.precision_tier.value != expected_tier:
+        raise ValueError("retained exterior promoted precision tier is invalid")
 
     ledgers = checkpoint.get("promoted_background_ledger")
-    bucket = ledgers.get(str(queue_ordinal)) if isinstance(ledgers, Mapping) else None
-    ledger_entry = bucket.get(leaf_id) if isinstance(bucket, Mapping) else None
-    payload = ledger_entry.get("payload") if isinstance(ledger_entry, Mapping) else None
-    receipts = payload.get("background_receipts") if isinstance(payload, Mapping) else None
-    batch_samples = batch.to_mapping()["samples"][:5]
-    if not isinstance(receipts, list) or not any(
-        isinstance(receipt, Mapping)
-        and isinstance(receipt.get("background"), Mapping)
-        and receipt["background"].get("samples") == batch_samples
-        and receipt.get("precision_tier") == batch.precision_tier.value
-        for receipt in receipts
-    ):
+    candidates: list[Mapping[str, object]] = []
+    if isinstance(ledgers, Mapping):
+        for bucket in ledgers.values():
+            if not isinstance(bucket, Mapping):
+                continue
+            for ledger_entry in bucket.values():
+                payload = (
+                    ledger_entry.get("payload")
+                    if isinstance(ledger_entry, Mapping)
+                    else None
+                )
+                receipts = (
+                    payload.get("background_receipts")
+                    if isinstance(payload, Mapping)
+                    else None
+                )
+                if isinstance(receipts, list):
+                    candidates.extend(
+                        receipt
+                        for receipt in receipts
+                        if isinstance(receipt, Mapping)
+                        and receipt.get("receipt_sha256")
+                        == calculation.background.background_receipt_sha256
+                    )
+    canonical_candidates = {
+        canonical_json_bytes(dict(receipt)): receipt for receipt in candidates
+    }
+    if len(canonical_candidates) != 1:
         raise ValueError("retained exterior promoted background evidence is missing")
+    background_receipt, _canonical_background = (
+        _promoted_canonical_background_receipt_from_mapping(
+            next(iter(canonical_candidates.values()))
+        )
+    )
+    background = background_receipt.batch
+    if (
+        background_receipt.to_mapping()["receipt_sha256"]
+        != calculation.background.background_receipt_sha256
+        or background.request_sha256
+        != calculation.background.background_worker_request_sha256
+        or background_receipt.background_sha256
+        != calculation.background.background_sha256
+        or PromotedBackgroundReuseKey.from_mapping(
+            background_receipt.reuse_key
+        ).sha256
+        != calculation.background.background_reuse_key_sha256
+    ):
+        raise ValueError("retained exterior promoted background binding is invalid")
+    composite = PromotedFixedRootComposite(
+        background_batch=background,
+        component_batch=component,
+        background_receipt_sha256=calculation.background.background_receipt_sha256,
+    )
+    return composite, (background, component)
+
+
+def _rederived_exterior_determinant_error(
+    raw_error: ExteriorDeterminantErrorEvidence,
+    *,
+    calibration_receipt: PromotedControlCalibrationReceipt,
+    review_receipt_sha256: str,
+) -> tuple[float, Mapping[str, object]]:
+    """Derive the admitted 64× bound from retained terms, never its aggregate."""
+
+    if not isinstance(raw_error, ExteriorDeterminantErrorEvidence):
+        raise ValueError("retained exterior determinant-error evidence is invalid")
+    mapping = raw_error.to_mapping()
+
+    def decimal_text(name: str) -> Decimal:
+        value = mapping.get(name)
+        if not isinstance(value, str):
+            raise ValueError("retained exterior determinant-error term is invalid")
+        try:
+            parsed = Decimal(value)
+        except InvalidOperation as error:
+            raise ValueError(
+                "retained exterior determinant-error term is invalid"
+            ) from error
+        if not parsed.is_finite() or parsed < 0:
+            raise ValueError("retained exterior determinant-error term is invalid")
+        return parsed
+
+    terms = tuple(
+        decimal_text(name)
+        for name in (
+            "delta_same_point",
+            "delta_cross_precision",
+            "delta_endpoint_series",
+        )
+    )
+    supplied_safety_factor = decimal_text("safety_factor")
+    expected_safety_factor = Decimal(calibration_receipt.certificate_safety_factor)
+    if supplied_safety_factor != expected_safety_factor:
+        raise ValueError("retained exterior determinant-error safety factor is stale")
+    with localcontext() as context:
+        context.prec = max(
+            100,
+            max(len(term.as_tuple().digits) for term in terms)
+            + len(str(calibration_receipt.certificate_safety_factor))
+            + 8,
+        )
+        derived = expected_safety_factor * max(terms)
+    supplied_aggregate = decimal_text("numerical_error_abs")
+    if supplied_aggregate != derived:
+        raise ValueError(
+            "retained exterior determinant-error aggregate is not derivable"
+        )
+    bound = float(derived)
+    if Decimal.from_float(bound) < derived:
+        bound = math.nextafter(bound, math.inf)
+    if (
+        not math.isfinite(bound)
+        or bound <= 0.0
+        or Decimal.from_float(bound) < derived
+    ):
+        raise ValueError("retained exterior determinant-error bound is invalid")
+    receipt_content = {
+        "schema": "windows-solver.promoted-exterior-determinant-rederivation/1",
+        "calibration_receipt_sha256": calibration_receipt.sha256,
+        "review_receipt_sha256": review_receipt_sha256,
+        "raw_error_sha256": _sha256(mapping),
+        "raw_error": mapping,
+        "safety_factor": str(calibration_receipt.certificate_safety_factor),
+        "derived_absolute_determinant_error": str(derived),
+        "emitted_absolute_determinant_error_binary64": bound.hex(),
+        "binary64_rounding_direction": "OUTWARD_TOWARD_POSITIVE_INFINITY",
+    }
+    return bound, {
+        **receipt_content,
+        "receipt_sha256": _sha256(receipt_content),
+    }
 
 
 def _reduce_retained_exterior_for_admission(
@@ -2373,56 +2406,54 @@ def _reduce_retained_exterior_for_admission(
     checkpoint: Mapping[str, object],
     retained_stage: Mapping[str, object],
     review_receipt: Mapping[str, object],
+    calibration_receipt: PromotedControlCalibrationReceipt,
     *,
     queue_ordinal: int,
 ) -> PromotedAdmissionReduction:
     """Perform only Python reduction over reviewed, retained BF40/BF80 samples."""
 
-    batch = _retained_exterior_batch_for_admission(retained_stage)
-    _assert_retained_exterior_support(
+    composite, request_batches = _retained_exterior_artifacts_for_admission(
         checkpoint,
         retained_stage,
         queue_ordinal=queue_ordinal,
-        leaf_id=leaf.leaf_id,
-        batch=batch,
+        leaf=leaf,
     )
     raw_errors = tuple(
         sample.determinant_error_evidence
-        for sample in batch.samples
+        for sample in composite.samples
     )
     if not all(isinstance(error, ExteriorDeterminantErrorEvidence) for error in raw_errors):
         raise ValueError("retained exterior determinant-error terms are incomplete")
-    claims = reviewed_determinant_error_claims_for_fixed_root_batch(
+    claims = reviewed_determinant_error_claims_for_fixed_root_batches(
         leaf.job,
-        batch,
-        root_seal_sha256=batch.root_seal_sha256,
-        arithmetic_tier=batch.precision_tier.value,
-        working_precision=batch.working_precision_bits,
+        request_batches,
+        root_seal_sha256=composite.root_seal_sha256,
+        arithmetic_tier=composite.precision_tier.value,
+        working_precision=composite.working_precision_bits,
     )
     reviewed_receipts: list[ReviewedDeterminantErrorReceipt] = []
+    rederivation_receipts: list[Mapping[str, object]] = []
     for claim, raw_error in zip(claims, raw_errors, strict=True):
         assert isinstance(raw_error, ExteriorDeterminantErrorEvidence)
-        try:
-            bound = float(raw_error.mapping["numerical_error_abs"])
-        except (KeyError, TypeError, ValueError, OverflowError) as error:
-            raise ValueError(
-                "retained exterior determinant-error bound is invalid"
-            ) from error
-        if not math.isfinite(bound) or bound <= 0.0:
-            raise ValueError("retained exterior determinant-error bound is invalid")
+        bound, rederivation = _rederived_exterior_determinant_error(
+            raw_error,
+            calibration_receipt=calibration_receipt,
+            review_receipt_sha256=str(review_receipt["receipt_sha256"]),
+        )
+        rederivation_receipts.append(rederivation)
         reviewed_receipts.append(ReviewedDeterminantErrorReceipt.issue(
             claim=claim,
             absolute_determinant_error_bound=bound,
-            derivation_identity="independent-promoted-review-retained-stage/v1",
-            derivation_version="1",
+            derivation_identity="promoted-exterior-retained-artifact/v2",
+            derivation_version="2",
             human_mathematics_approval_receipt_sha256=str(
                 review_receipt["receipt_sha256"]
             ),
         ))
     screening = screen_promoted_fixed_root_samples(
-        batch.samples,
-        frequency_step=batch.frequency_step,
-        coordinate_step=batch.coordinate_step,
+        composite.samples,
+        frequency_step=composite.frequency_step,
+        coordinate_step=composite.coordinate_step,
         determinant_error_evidence=AuthenticatedDeterminantErrorBundle(
             tuple(reviewed_receipts)
         ),
@@ -2432,49 +2463,221 @@ def _reduce_retained_exterior_for_admission(
     precision_tier = {
         "bigfloat-40": "BF40",
         "bigfloat-80": "BF80",
-    }.get(batch.precision_tier.value)
+    }.get(composite.precision_tier.value)
     if precision_tier is None:
         raise ValueError("retained exterior promoted precision tier is invalid")
     record, _stage_sha256 = build_fixed_root_screening_record(
         plan,
         leaf,
-        batch,
+        composite,
         screening,
         precision_tier=precision_tier,
-        root_seal_sha256=batch.root_seal_sha256,
+        root_seal_sha256=composite.root_seal_sha256,
     )
     return PromotedAdmissionReduction(
         record=record,
-        evidence_receipts=tuple(
-            receipt.to_mapping() for receipt in reviewed_receipts
+        evidence_receipts=(
+            *rederivation_receipts,
+            *(receipt.to_mapping() for receipt in reviewed_receipts),
         ),
     )
 
 
+def _validated_horizon_promotion_trigger(
+    plan: object,
+    leaf: object,
+    checkpoint: Mapping[str, object],
+    *,
+    source_stage: Mapping[str, object],
+) -> Mapping[str, object]:
+    """Recover the exact binary64 trigger that authorised BF80 work."""
+
+    source_payload = source_stage.get("component_result")
+    if not isinstance(source_payload, Mapping):
+        raise ValueError("horizon source stage component payload is invalid")
+    source_disk = source_stage.get("response_disk")
+    source_radius = (
+        0.0
+        if not isinstance(source_disk, Mapping)
+        else float(source_disk.get("radius", 0.0))
+    )
+    source_outcome = StageOutcome(
+        digits=64,
+        numerical_state=str(source_stage["numerical_state"]),
+        component_result=source_payload,
+        local_disk_radius_abs=source_radius,
+        signed_error_channels=synthetic_stage_signed_error_channels(
+            source_payload,
+            source_radius,
+            precision_ladder_applicable=False,
+        ),
+        deep_diagnostics=(
+            source_payload.get("deep_diagnostics")
+            if isinstance(source_payload.get("deep_diagnostics"), Mapping)
+            else None
+        ),
+    )
+    expected = build_horizon_promotion_trigger_receipt(
+        plan, leaf, source_outcome, source_stage
+    )
+    evidence = checkpoint.get("evidence_ledger")
+    entry = evidence.get(leaf.leaf_id) if isinstance(evidence, Mapping) else None
+    receipts = entry.get("receipts") if isinstance(entry, Mapping) else None
+    if not isinstance(receipts, list) or not any(
+        isinstance(receipt, Mapping) and dict(receipt) == expected
+        for receipt in receipts
+    ):
+        raise ValueError("horizon promotion trigger receipt is missing")
+    return expected
+
+
 def _reduce_retained_horizon_for_admission(
+    plan: object,
+    leaf: object,
     checkpoint: Mapping[str, object],
     retained_stage: Mapping[str, object],
     *,
     queue_ordinal: int,
     leaf_id: str,
 ) -> PromotedAdmissionReduction:
-    """Recover the package-owned BF80 horizon record without rerunning it."""
+    """Construct/compare only from a retained BF80 calculation artifact."""
 
-    record = retained_stage.get("retained_record")
-    roots = checkpoint.get("promoted_root_ledger")
-    bucket = roots.get(str(queue_ordinal)) if isinstance(roots, Mapping) else None
-    entry = bucket.get(leaf_id) if isinstance(bucket, Mapping) else None
-    payload = entry.get("payload") if isinstance(entry, Mapping) else None
-    retained_horizon_record = (
-        payload.get("retained_horizon_record") if isinstance(payload, Mapping) else None
+    artifact = PromotedHorizonCalculationResult.from_mapping(
+        retained_stage.get("calculation_artifact")
     )
     if (
-        not isinstance(record, Mapping)
-        or not isinstance(retained_horizon_record, Mapping)
-        or canonical_json_bytes(record) != canonical_json_bytes(retained_horizon_record)
+        retained_stage.get("route") != "HORIZON_BF80"
+        or retained_stage.get("predecessor_stage_sha256")
+        != artifact.predecessor_stage_sha256
+        or retained_stage.get("source_fingerprint_sha256")
+        != artifact.source_fingerprint_sha256
+        or retained_stage.get("layer1_lock_receipt_sha256")
+        != artifact.layer1_lock_receipt_sha256
+        or retained_stage.get("source_record_sha256") is not None
+        and retained_stage.get("source_record_stage_sha256") is None
     ):
-        raise ValueError("retained promoted horizon record is missing or conflicting")
-    return PromotedAdmissionReduction(record=dict(record))
+        raise ValueError("retained promoted horizon lineage is invalid")
+    stage = artifact.component_stage
+    validate_schema11_horizon_stage(plan, leaf, stage)
+    source_record_sha256 = retained_stage.get("source_record_sha256")
+    if source_record_sha256 is None:
+        response_disk = stage.get("response_disk")
+        if not isinstance(response_disk, Mapping):
+            raise ValueError("retained promoted horizon response is unbounded")
+        record = build_schema11_horizon_record(
+            plan,
+            leaf,
+            stages=(stage,),
+            retained_centre=response_disk.get("centre"),
+            state="PRODUCED",
+        )
+        lineage_content = {
+            "schema": "windows-solver.promoted-horizon-lineage-reduction/1",
+            "queue_ordinal": queue_ordinal,
+            "leaf_id": leaf_id,
+            "calculation_sha256": artifact.to_mapping()["calculation_sha256"],
+            "predecessor_stage_sha256": artifact.predecessor_stage_sha256,
+            "source_fingerprint_sha256": artifact.source_fingerprint_sha256,
+            "layer1_lock_receipt_sha256": artifact.layer1_lock_receipt_sha256,
+            "terminal_record_sha256": record["record_sha256"],
+            "terminal_stage_sha256": stage["stage_sha256"],
+        }
+        return PromotedAdmissionReduction(
+            record=record,
+            evidence_receipts=({
+                **lineage_content,
+                "receipt_sha256": _sha256(lineage_content),
+            },),
+        )
+
+    if not isinstance(source_record_sha256, str):
+        raise ValueError("retained promoted horizon source record is invalid")
+    source_stage_sha256 = retained_stage.get("source_record_stage_sha256")
+    record = next(
+        (
+            item
+            for item in checkpoint.get("records", [])
+            if isinstance(item, Mapping)
+            and item.get("record_sha256") == source_record_sha256
+        ),
+        None,
+    )
+    if not isinstance(record, Mapping):
+        raise ValueError("retained promoted horizon source record is missing")
+    validate_schema11_horizon_record(plan, leaf, record)
+    stages = record.get("stages")
+    source_stage = stages[0] if isinstance(stages, list) and stages else None
+    if (
+        not isinstance(source_stage, Mapping)
+        or source_stage.get("stage_sha256") != source_stage_sha256
+        or source_stage.get("stage_sha256") != artifact.predecessor_stage_sha256
+    ):
+        raise ValueError("retained promoted horizon source stage is invalid")
+    trigger = _validated_horizon_promotion_trigger(
+        plan, leaf, checkpoint, source_stage=source_stage
+    )
+    source_disk = source_stage.get("response_disk")
+    bf80_disk = stage.get("response_disk")
+    if not isinstance(source_disk, Mapping) or not isinstance(bf80_disk, Mapping):
+        raise ValueError("retained promoted horizon comparison is unbounded")
+    try:
+        source_centre = source_disk["centre"]
+        bf80_centre = bf80_disk["centre"]
+        source_radius = float(source_disk["radius"])
+        bf80_radius = float(bf80_disk["radius"])
+        discrepancy = abs(
+            complex(
+                float(source_centre["real"]), float(source_centre["imaginary"])
+            )
+            - complex(
+                float(bf80_centre["real"]), float(bf80_centre["imaginary"])
+            )
+        )
+    except (KeyError, TypeError, ValueError, OverflowError) as error:
+        raise ValueError("retained promoted horizon comparison is invalid") from error
+    threshold = source_radius + bf80_radius
+    if not (
+        all(math.isfinite(value) and value >= 0.0 for value in (
+            source_radius, bf80_radius, discrepancy, threshold
+        ))
+        and discrepancy <= threshold
+    ):
+        raise ValueError("retained promoted horizon comparison disagrees")
+    component_payload = stage.get("component_result")
+    bf80_result = (
+        component_payload.get("result")
+        if isinstance(component_payload, Mapping)
+        else None
+    )
+    if not isinstance(bf80_result, Mapping):
+        raise ValueError("retained promoted horizon component result is invalid")
+    comparison_content = {
+        "schema": HORIZON_PROMOTED_COMPARISON_RECEIPT_SCHEMA,
+        "leaf_id": leaf_id,
+        "source_record_sha256": source_record_sha256,
+        "source_stage_sha256": source_stage_sha256,
+        "source_centre": source_centre,
+        "source_disk_radius": source_radius,
+        "promotion_trigger_receipt_sha256": trigger["receipt_sha256"],
+        "bf80_operation_identity": stage["operation_identity"],
+        "bf80_result_sha256": _sha256(bf80_result),
+        "bf80_stage": dict(stage),
+        "bf80_centre": bf80_centre,
+        "bf80_disk_radius": bf80_radius,
+        "centre_discrepancy": discrepancy,
+        "reviewed_comparison_threshold": threshold,
+        "agrees": True,
+        "outcome_code": "AGREES",
+        "runtime_identity": component_payload.get("scientific_runtime"),
+        "backend_identity": leaf.job.backend_identity.identity_sha256,
+    }
+    return PromotedAdmissionReduction(
+        record=dict(record),
+        evidence_receipts=({
+            **comparison_content,
+            "receipt_sha256": _sha256(comparison_content),
+        },),
+    )
 
 
 def run_native_promoted_admission(
@@ -2487,10 +2690,18 @@ def run_native_promoted_admission(
     binary64_lock_path: Path,
     queue_ordinal: int,
     independent_review_receipt: Mapping[str, object],
+    calibration_receipt: PromotedControlCalibrationReceipt,
     solved_leaf_store: SolvedLeafStore | None = None,
     background_evidence_store: CanonicalBackgroundEvidenceStore | None = None,
+    diagnostic_session: StructuralDiagnosticSession | None = None,
 ) -> PromotedAdmissionResult:
     """Admit retained Layer-2 work and publish it with zero numerical calls."""
+
+    from .production_wiring import validate_production_wiring
+
+    validate_production_wiring()
+    if not isinstance(calibration_receipt, PromotedControlCalibrationReceipt):
+        raise ValueError("promoted admission requires an explicit calibration receipt")
 
     root_evidence_store = RootEvidenceStore.for_checkpoint(checkpoint_path)
     background_store = background_evidence_store or CanonicalBackgroundEvidenceStore(
@@ -2509,6 +2720,18 @@ def run_native_promoted_admission(
         selection=recovery_selection,
         leaf_mechanism_ids=_layer1_leaf_mechanism_ids(plan, recovery_selection),
         auxiliary_evidence_manifest=manifest,
+    )
+    from .campaign_failures import (
+        require_system_failures_resolved_for_promoted_resume,
+    )
+
+    require_system_failures_resolved_for_promoted_resume(
+        checkpoint,
+        expected_authority_sha256=(
+            calibration_receipt.independent_review_authority_sha256
+        ),
+        calibration_receipt_sha256=calibration_receipt.sha256,
+        binary64_lock_receipt_sha256=str(lock["receipt_sha256"]),
     )
     leaves = {leaf.leaf_id: leaf for leaf in getattr(plan, "leaves")}
     store = solved_leaf_store or SolvedLeafStore.default()
@@ -2546,10 +2769,13 @@ def run_native_promoted_admission(
                 retained_checkpoint,
                 retained_stage,
                 review_receipt,
+                calibration_receipt,
                 queue_ordinal=queue_ordinal,
             )
         if route == "HORIZON_BF80":
             return _reduce_retained_horizon_for_admission(
+                plan,
+                leaf,
                 retained_checkpoint,
                 retained_stage,
                 queue_ordinal=queue_ordinal,
@@ -2557,7 +2783,7 @@ def run_native_promoted_admission(
             )
         raise ValueError("admission retained stage route is invalid")
 
-    def publish(record: Mapping[str, object]) -> None:
+    def publish(record: Mapping[str, object]) -> Mapping[str, object]:
         leaf_id = str(record.get("leaf_id"))
         leaf = leaves.get(leaf_id)
         if leaf is None or leaf_id not in recovery_selection.scientific_identities:
@@ -2577,12 +2803,15 @@ def run_native_promoted_admission(
             != canonical_json_bytes(record)
         ):
             raise ValueError("admitted promoted record was not published exactly")
+        return dict(lookup.receipt)
 
     admitted = admit_retained_promoted_checkpoint(
         checkpoint_path,
         queue_ordinal=queue_ordinal,
         independent_review_receipt=independent_review_receipt,
+        calibration_receipt=calibration_receipt,
         layer1_guard=layer1_guard,
+        diagnostic_session=diagnostic_session,
         terminal_record_committed=publish,
         record_reducer=reduce_retained_stage,
     )

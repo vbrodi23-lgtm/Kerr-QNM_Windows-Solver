@@ -558,7 +558,10 @@ class PublicSurfaceTests(unittest.TestCase):
         self.assertEqual(selection["precision_digits"], [64, 80, 120])
         self.assertIn("[switch]$RebuildRuntime", launcher)
         self.assertIn("[switch]$NewCampaign", launcher)
-        self.assertIn('[ValidateSet("survey", "certify", "validate")]', launcher)
+        self.assertIn(
+            '[ValidateSet("survey", "admit", "certify", "validate", "resolve-system-failure")]',
+            launcher,
+        )
         self.assertIn(
             '[ValidateSet("binary64", "promoted", "full")]',
             launcher,
@@ -622,6 +625,7 @@ class PublicSurfaceTests(unittest.TestCase):
             package_root = Path(temporary) / "m02-bootstrap-binding"
             (package_root / "examples").mkdir(parents=True)
             (package_root / "runtime").mkdir()
+            (package_root / "src" / "windows_solver" / "data").mkdir(parents=True)
             shutil.copy2(root / "m02.ps1", package_root / "m02.ps1")
             shutil.copy2(
                 root / "runtime" / "resolve-runtime-root.ps1",
@@ -630,6 +634,18 @@ class PublicSurfaceTests(unittest.TestCase):
             shutil.copy2(
                 root / "examples" / "m02-campaign.json",
                 package_root / "examples" / "m02-campaign.json",
+            )
+            shutil.copy2(
+                root
+                / "src"
+                / "windows_solver"
+                / "data"
+                / "promoted_control_empirical_calibration_v1.json",
+                package_root
+                / "src"
+                / "windows_solver"
+                / "data"
+                / "promoted_control_empirical_calibration_v1.json",
             )
             bootstrap_log = package_root / "bootstrap-bindings.jsonl"
             argument_log = package_root / "arguments.jsonl"
@@ -845,6 +861,7 @@ $record = [ordered]@{ default = $default; portable = $portable } | ConvertTo-Jso
             package_root = Path(temporary) / "m02-public"
             (package_root / "examples").mkdir(parents=True)
             (package_root / "runtime").mkdir()
+            (package_root / "src" / "windows_solver" / "data").mkdir(parents=True)
             shutil.copy2(root / "m02.ps1", package_root / "m02.ps1")
             shutil.copy2(
                 root / "runtime" / "resolve-runtime-root.ps1",
@@ -854,6 +871,24 @@ $record = [ordered]@{ default = $default; portable = $portable } | ConvertTo-Jso
                 root / "examples" / "m02-campaign.json",
                 package_root / "examples" / "m02-campaign.json",
             )
+            calibration_path = (
+                package_root
+                / "src"
+                / "windows_solver"
+                / "data"
+                / "promoted_control_empirical_calibration_v1.json"
+            )
+            shutil.copy2(
+                root
+                / "src"
+                / "windows_solver"
+                / "data"
+                / "promoted_control_empirical_calibration_v1.json",
+                calibration_path,
+            )
+            calibration_sha256 = hashlib.sha256(
+                calibration_path.read_bytes()
+            ).hexdigest()
             argument_log = package_root / "arguments.jsonl"
             (package_root / "solver.ps1").write_text(
                 r'''param(
@@ -954,6 +989,12 @@ exit 0
                         Path(call[lock_index]).samefile(binary64_lock_path)
                     )
                     call[lock_index] = str(binary64_lock_path)
+                if "--calibration-receipt-path" in call:
+                    calibration_index = call.index("--calibration-receipt-path") + 1
+                    self.assertTrue(
+                        Path(call[calibration_index]).samefile(calibration_path)
+                    )
+                    call[calibration_index] = str(calibration_path)
             for call in calls:
                 if "--diagnostic-session-id" in call:
                     session_index = call.index("--diagnostic-session-id") + 1
@@ -963,6 +1004,7 @@ exit 0
         selection = str(selection_path)
         checkpoint = str(checkpoint_path)
         binary64_lock = str(binary64_lock_path)
+        calibration = str(calibration_path)
         self.assertEqual(
             calls,
             [
@@ -1007,6 +1049,10 @@ exit 0
                     "normal",
                     "--diagnostic-session-id",
                     "generated-session-id",
+                    "--calibration-receipt-path",
+                    calibration,
+                    "--calibration-receipt-sha256",
+                    calibration_sha256,
                     "--binary64-lock",
                     binary64_lock,
                 ],
@@ -1041,6 +1087,7 @@ exit 0
             package_root = Path(temporary) / "m02-cold-start"
             (package_root / "examples").mkdir(parents=True)
             (package_root / "runtime").mkdir()
+            (package_root / "src" / "windows_solver" / "data").mkdir(parents=True)
             shutil.copy2(root / "m02.ps1", package_root / "m02.ps1")
             shutil.copy2(
                 root / "runtime" / "resolve-runtime-root.ps1",
@@ -1050,6 +1097,24 @@ exit 0
                 root / "examples" / "m02-campaign.json",
                 package_root / "examples" / "m02-campaign.json",
             )
+            calibration_path = (
+                package_root
+                / "src"
+                / "windows_solver"
+                / "data"
+                / "promoted_control_empirical_calibration_v1.json"
+            )
+            shutil.copy2(
+                root
+                / "src"
+                / "windows_solver"
+                / "data"
+                / "promoted_control_empirical_calibration_v1.json",
+                calibration_path,
+            )
+            calibration_sha256 = hashlib.sha256(
+                calibration_path.read_bytes()
+            ).hexdigest()
             argument_log = package_root / "arguments.jsonl"
             (package_root / "solver.ps1").write_text(
                 r'''param(
@@ -1161,6 +1226,12 @@ exit 0
                         Path(call[lock_index]).samefile(binary64_lock_path)
                     )
                     call[lock_index] = str(binary64_lock_path)
+                if "--calibration-receipt-path" in call:
+                    calibration_index = call.index("--calibration-receipt-path") + 1
+                    self.assertTrue(
+                        Path(call[calibration_index]).samefile(calibration_path)
+                    )
+                    call[calibration_index] = str(calibration_path)
             for call in calls:
                 if "--diagnostic-session-id" in call:
                     session_index = call.index("--diagnostic-session-id") + 1
@@ -1170,6 +1241,7 @@ exit 0
         selection = str(selection_path)
         checkpoint = str(checkpoint_path)
         binary64_lock = str(binary64_lock_path)
+        calibration = str(calibration_path)
         self.assertEqual(
             calls,
             [
@@ -1220,6 +1292,10 @@ exit 0
                     "normal",
                     "--diagnostic-session-id",
                     "generated-session-id",
+                    "--calibration-receipt-path",
+                    calibration,
+                    "--calibration-receipt-sha256",
+                    calibration_sha256,
                     "--binary64-lock",
                     binary64_lock,
                 ],
@@ -1425,7 +1501,38 @@ $candidate | ConvertTo-Json -Compress | Set-Content -LiteralPath $env:M02_TEST_J
             "windows-solver.promoted-cache-supersession/v1",
             "promoted-policy-preflight/v1",
             "promoted-independent-review-admission/v1",
+            "promoted-admission-checkpoint-commit/v1",
+            "promoted-admission-publication-retry/v1",
+            "promoted-publication-completion/v1",
+            "solved-leaf-store-publication/v1",
+            "promoted-exterior-checkpoint-reduction/v1",
+            "promoted-horizon-checkpoint-reduction/v1",
+            "promoted-exterior-control-return/v1",
+            "promoted-exterior-retained-artifact/v2",
+            "promoted-fixed-root-composite/v2",
+            "promoted-fixed-root-survey/v2",
+            "promoted-horizon-calculation/v2",
             "windows-solver.system-failure/v1",
+            "windows-solver.system-failure-resolution/1",
+            "windows-solver.system-failure-resolution/2",
+            "windows-solver.structural-event/1",
+            "windows-solver.structural-event/2",
+            "windows-solver.independent-promoted-review-receipt/1",
+            "windows-solver.promoted-background-reuse-key/1",
+            "windows-solver.promoted-calculation-stage/1",
+            "windows-solver.promoted-calculation-stage/2",
+            "windows-solver.promoted-canonical-background/1",
+            "windows-solver.promoted-exterior-determinant-rederivation/1",
+            "windows-solver.promoted-fixed-root-batch-receipt/1",
+            "windows-solver.promoted-fixed-root-composite/2",
+            "windows-solver.promoted-horizon-calculation/2",
+            "windows-solver.promoted-horizon-failure/1",
+            "windows-solver.promoted-horizon-lineage-reduction/1",
+            "windows-solver.promoted-numerical-continuation/2",
+            "windows-solver.promoted-queue-disposition/1",
+            "windows-solver.promoted-raw-calculation-retention/2",
+            "windows-solver.promoted-root-evidence-receipt/1",
+            "windows-solver.response-component-job/1",
             "windows-solver.m02-report-status/v1",
             "windows-solver.m02-schema11-report-status/v1",
             "binary64-horizon-production/v1",

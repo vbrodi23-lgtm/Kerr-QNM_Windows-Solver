@@ -1,7 +1,7 @@
 param(
     [string]$Selection = ".\examples\m02-campaign.json",
     [string]$Checkpoint = ".\m02-output\m02-campaign-checkpoint.json",
-    [ValidateSet("survey", "certify", "validate")]
+    [ValidateSet("survey", "admit", "certify", "validate", "resolve-system-failure")]
     [string]$Profile = "survey",
     [ValidateSet("binary64", "promoted", "full")]
     [string]$SurveyPass = "full",
@@ -13,6 +13,11 @@ param(
     [string]$RuntimeRoot,
     [string]$CalibrationReceiptPath,
     [string]$CalibrationReceiptSha256,
+    [string[]]$ReviewReceiptPath = @(),
+    [string]$ReviewReceiptDirectory,
+    [string]$FailureReceiptSha256,
+    [string]$RepairCommit,
+    [string]$ResolutionReason,
     [ValidateSet("quiet", "normal", "trace")]
     [string]$Progress = "normal"
 )
@@ -72,11 +77,33 @@ if ($SkipBootstrap -and $RebuildRuntime) {
 if ($Profile -ne "survey" -and $SurveyPass -ne "full") {
     throw "-SurveyPass applies only to -Profile survey."
 }
-if ($Profile -eq "survey" -and -not [string]::IsNullOrWhiteSpace($QueuePath)) {
+if ($Profile -in @("survey", "admit", "resolve-system-failure") -and -not [string]::IsNullOrWhiteSpace($QueuePath)) {
     throw "-QueuePath applies only to certify or validate."
 }
 if ($Profile -eq "validate" -and [string]::IsNullOrWhiteSpace($QueuePath)) {
     throw "-Profile validate requires -QueuePath."
+}
+if ($Profile -eq "resolve-system-failure") {
+    if (
+        [string]::IsNullOrWhiteSpace($FailureReceiptSha256) -or
+        [string]::IsNullOrWhiteSpace($RepairCommit) -or
+        [string]::IsNullOrWhiteSpace($ResolutionReason)
+    ) {
+        throw "-Profile resolve-system-failure requires -FailureReceiptSha256, -RepairCommit, and -ResolutionReason."
+    }
+    if (-not [string]::IsNullOrWhiteSpace($QueuePath)) {
+        throw "-QueuePath does not apply to -Profile resolve-system-failure."
+    }
+}
+$HasReviewReceiptDirectory = -not [string]::IsNullOrWhiteSpace($ReviewReceiptDirectory)
+if ($Profile -eq "admit" -and $ReviewReceiptPath.Count -eq 0 -and -not $HasReviewReceiptDirectory) {
+    throw "-Profile admit requires -ReviewReceiptDirectory or at least one -ReviewReceiptPath."
+}
+if ($Profile -eq "admit" -and $ReviewReceiptPath.Count -gt 0 -and $HasReviewReceiptDirectory) {
+    throw "Supply either -ReviewReceiptDirectory or -ReviewReceiptPath, not both."
+}
+if ($Profile -ne "admit" -and ($ReviewReceiptPath.Count -gt 0 -or $HasReviewReceiptDirectory)) {
+    throw "Review receipt inputs apply only to -Profile admit."
 }
 if ($NewCampaign -and ($Profile -ne "survey" -or $SurveyPass -notin @("binary64", "full"))) {
     throw "-NewCampaign starts only a binary64 or full survey."
@@ -85,6 +112,35 @@ $HasCalibrationPath = -not [string]::IsNullOrWhiteSpace($CalibrationReceiptPath)
 $HasCalibrationSha256 = -not [string]::IsNullOrWhiteSpace($CalibrationReceiptSha256)
 if ($HasCalibrationPath -ne $HasCalibrationSha256) {
     throw "calibration receipt path and SHA-256 must be supplied together"
+}
+$RequiresPromotedCalibration = (
+    ($Profile -eq "survey" -and $SurveyPass -in @("promoted", "full")) -or
+    $Profile -eq "admit" -or
+    $Profile -eq "resolve-system-failure"
+)
+if ($RequiresPromotedCalibration -and -not $HasCalibrationPath) {
+    $CalibrationReceiptPath = Join-Path $PackageRoot `
+        "src\windows_solver\data\promoted_control_empirical_calibration_v1.json"
+    if (-not (Test-Path -LiteralPath $CalibrationReceiptPath -PathType Leaf)) {
+        throw "Committed promoted calibration receipt is absent: $CalibrationReceiptPath"
+    }
+    # Windows PowerShell 5.1 does not guarantee that the optional
+    # Microsoft.PowerShell.Utility module is imported.  Use the framework
+    # primitive directly so a default launcher run can still derive the
+    # committed receipt digest without depending on a profile/module.
+    $Sha256 = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $CalibrationBytes = [IO.File]::ReadAllBytes($CalibrationReceiptPath)
+        $CalibrationDigestBytes = $Sha256.ComputeHash($CalibrationBytes)
+    }
+    finally {
+        $Sha256.Dispose()
+    }
+    $CalibrationReceiptSha256 = (
+        [BitConverter]::ToString($CalibrationDigestBytes) -replace "-", ""
+    ).ToLowerInvariant()
+    $HasCalibrationPath = $true
+    $HasCalibrationSha256 = $true
 }
 $CalibrationArguments = @()
 if ($HasCalibrationPath) {
@@ -184,6 +240,31 @@ if (-not [string]::IsNullOrWhiteSpace($QueuePath)) {
         throw "Queue is absent: $ResolvedQueuePath"
     }
 }
+$ResolvedReviewReceiptPaths = @()
+foreach ($ReceiptPath in $ReviewReceiptPath) {
+    $ResolvedReceiptPath = if ([IO.Path]::IsPathRooted($ReceiptPath)) {
+        [IO.Path]::GetFullPath($ReceiptPath)
+    }
+    else {
+        [IO.Path]::GetFullPath((Join-Path $PackageRoot $ReceiptPath))
+    }
+    if (-not (Test-Path -LiteralPath $ResolvedReceiptPath -PathType Leaf)) {
+        throw "Independent review receipt is absent: $ResolvedReceiptPath"
+    }
+    $ResolvedReviewReceiptPaths += $ResolvedReceiptPath
+}
+$ResolvedReviewReceiptDirectory = $null
+if ($HasReviewReceiptDirectory) {
+    $ResolvedReviewReceiptDirectory = if ([IO.Path]::IsPathRooted($ReviewReceiptDirectory)) {
+        [IO.Path]::GetFullPath($ReviewReceiptDirectory)
+    }
+    else {
+        [IO.Path]::GetFullPath((Join-Path $PackageRoot $ReviewReceiptDirectory))
+    }
+    if (-not (Test-Path -LiteralPath $ResolvedReviewReceiptDirectory -PathType Container)) {
+        throw "Independent review receipt directory is absent: $ResolvedReviewReceiptDirectory"
+    }
+}
 
 Push-Location $PackageRoot
 try {
@@ -207,8 +288,14 @@ try {
     elseif ($Profile -eq "survey") {
         "campaign-survey-promoted"
     }
+    elseif ($Profile -eq "admit") {
+        "campaign-admit-promoted-queue"
+    }
     elseif ($Profile -eq "certify") {
         "campaign-certify"
+    }
+    elseif ($Profile -eq "resolve-system-failure") {
+        "campaign-resolve-system-failure"
     }
     else {
         "campaign-evidence-validate"
@@ -250,6 +337,11 @@ try {
         $CheckpointStatus "recovered_terminal_count" $ProducedCount
     $EvidenceCounts = Get-OptionalProperty `
         $CheckpointStatus "evidence_counts" @{}
+    $ActiveSystemFailures = Get-OptionalProperty `
+        $CheckpointStatus "active_system_failure_count" `
+        (Get-OptionalProperty $CheckpointStatus "system_failure_count" 0)
+    $HistoricalSystemFailures = Get-OptionalProperty `
+        $CheckpointStatus "historical_system_failure_count" 0
     $BasicReportDirectory = Get-OptionalProperty `
         $CheckpointStatus "basic_report_directory" "-"
     Write-Host "M02 campaign startup" -ForegroundColor Cyan
@@ -276,6 +368,12 @@ try {
     Write-Host ("    Pending BF80             : {0}" -f $PendingBF80)
     Write-Host ("    Recovered terminal count : {0}" -f $RecoveredTerminalCount)
     Write-Host ("    Evidence counts          : {0}" -f ($EvidenceCounts | ConvertTo-Json -Compress))
+    Write-Host ("    Active system failures   : {0}" -f $ActiveSystemFailures)
+    Write-Host ("    Historical failures      : {0}" -f $HistoricalSystemFailures)
+    if ($HasCalibrationPath) {
+        Write-Host ("    Calibration receipt     : {0}" -f $ResolvedCalibrationReceiptPath)
+        Write-Host ("    Calibration SHA-256      : {0}" -f $CalibrationReceiptSha256.ToLowerInvariant())
+    }
     Write-Host ("    Basic report directory   : {0}" -f $BasicReportDirectory)
     Write-Host ("    Status path              : {0}" -f "$CheckpointPath.status.json")
     function Ensure-Binary64Lock {
@@ -288,6 +386,39 @@ try {
         if (-not (Test-Path -LiteralPath $Binary64LockPath -PathType Leaf)) {
             throw "Binary64 lock command did not retain: $Binary64LockPath"
         }
+    }
+    if ($Profile -eq "resolve-system-failure") {
+        if ($FailureReceiptSha256 -notmatch '^[0-9A-Fa-f]{64}$') {
+            throw "System failure receipt SHA-256 is invalid."
+        }
+        if ($RepairCommit -notmatch '^[0-9A-Fa-f]{40,64}$') {
+            throw "Repair commit identity is invalid."
+        }
+        Ensure-Binary64Lock
+        $ResolutionArguments = @(
+            "campaign-resolve-system-failure",
+            $SelectionPath,
+            "--checkpoint", $CheckpointPath,
+            "--binary64-lock", $Binary64LockPath,
+            "--failure-receipt-sha256", $FailureReceiptSha256.ToLowerInvariant(),
+            "--repair-commit", $RepairCommit.ToLowerInvariant(),
+            "--reason", $ResolutionReason
+        ) + $CalibrationArguments
+        $ResolutionOutput = Invoke-M02Command -Arguments $ResolutionArguments
+        $ResolutionOutput
+        return
+    }
+    if (
+        (
+            ($Profile -eq "survey" -and $SurveyPass -in @("promoted", "full")) -or
+            $Profile -eq "admit"
+        ) -and
+        $ActiveSystemFailures -gt 0
+    ) {
+        throw (
+            "Promoted resume is blocked by {0} active SYSTEM_FAILURE receipt(s). " +
+            "Use -Profile resolve-system-failure before resuming."
+        ) -f $ActiveSystemFailures
     }
     $EffectiveSurveyPass = $SurveyPass
     if ($Profile -eq "survey" -and $SurveyPass -eq "full") {
@@ -305,11 +436,17 @@ try {
     elseif ($Profile -eq "survey" -and $SurveyPass -eq "promoted") {
         Ensure-Binary64Lock
     }
+    elseif ($Profile -eq "admit") {
+        Ensure-Binary64Lock
+    }
     $EffectiveCommand = if ($Profile -eq "survey" -and $EffectiveSurveyPass -eq "binary64") {
         "campaign-survey-binary64"
     }
     elseif ($Profile -eq "survey") {
         "campaign-survey-promoted"
+    }
+    elseif ($Profile -eq "admit") {
+        "campaign-admit-promoted-queue"
     }
     elseif ($Profile -eq "certify") {
         "campaign-certify"
@@ -317,13 +454,24 @@ try {
     else {
         "campaign-evidence-validate"
     }
-    $RunArguments = @(
-        $EffectiveCommand,
-        $SelectionPath,
-        "--checkpoint", $CheckpointPath,
-        "--progress", $Progress,
-        "--diagnostic-session-id", $RunSessionId
-    )
+    $RunArguments = if ($Profile -eq "admit") {
+        @(
+            $EffectiveCommand,
+            $SelectionPath,
+            "--checkpoint", $CheckpointPath,
+            "--binary64-lock", $Binary64LockPath,
+            "--diagnostic-session-id", $RunSessionId
+        )
+    }
+    else {
+        @(
+            $EffectiveCommand,
+            $SelectionPath,
+            "--checkpoint", $CheckpointPath,
+            "--progress", $Progress,
+            "--diagnostic-session-id", $RunSessionId
+        )
+    }
     if (-not ($Profile -eq "survey" -and $EffectiveSurveyPass -eq "binary64")) {
         $RunArguments += $CalibrationArguments
     }
@@ -332,6 +480,18 @@ try {
     }
     if ($Profile -eq "survey" -and $EffectiveSurveyPass -eq "promoted") {
         $RunArguments += @("--binary64-lock", $Binary64LockPath)
+    }
+    if ($Profile -eq "admit") {
+        if ($null -ne $ResolvedReviewReceiptDirectory) {
+            $RunArguments += @(
+                "--review-receipt-directory", $ResolvedReviewReceiptDirectory
+            )
+        }
+        else {
+            foreach ($ResolvedReceiptPath in $ResolvedReviewReceiptPaths) {
+                $RunArguments += @("--review-receipt", $ResolvedReceiptPath)
+            }
+        }
     }
     # Capture canonical command JSON without merging it with the human
     # dashboard stream.  The reporter writes dashboard text to stderr; the
@@ -343,6 +503,9 @@ try {
     }
     $ValidationPass = if ($Profile -eq "survey") {
         $EffectiveSurveyPass
+    }
+    elseif ($Profile -eq "admit") {
+        "promoted"
     }
     else {
         $Profile

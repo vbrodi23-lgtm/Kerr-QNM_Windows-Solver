@@ -10,6 +10,7 @@ from __future__ import annotations
 import copy
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation, localcontext
+from enum import Enum
 import hashlib
 import json
 import math
@@ -130,6 +131,111 @@ FIXED_ROOT_SURVEY_CONDITIONING_SCHEMA = (
 _FIXED_ROOT_SURVEY_MAXIMUM_SAMPLE_COUNT = 9
 _FIXED_ROOT_SURVEY_BACKGROUND_ROLES = BINARY64_FIXED_ROOT_SAMPLE_ROLES[:5]
 _FIXED_ROOT_SURVEY_COORDINATE_ROLES = BINARY64_FIXED_ROOT_SAMPLE_ROLES[5:]
+
+
+class FixedRootSurveyPlan(str, Enum):
+    """The only valid numerical request shapes for a promoted exterior leaf.
+
+    A plan owns both the scientific operation identity and the ordered role
+    vector.  Keeping those values coupled at this boundary prevents a caller
+    from sending the canonical-background identity with a raw/full role set
+    (the exact mismatch that stopped the first promoted exterior route).
+    """
+
+    FULL_NINE = "FULL_NINE"
+    CANONICAL_BACKGROUND_FIVE = "CANONICAL_BACKGROUND_FIVE"
+    MECHANISM_COMPONENT_FOUR = "MECHANISM_COMPONENT_FOUR"
+
+
+@dataclass(frozen=True, slots=True)
+class FixedRootSurveyRequestContract:
+    """One authenticated worker-request shape.
+
+    This is deliberately a small value object rather than a caller-built
+    mapping: scheduler code chooses a named plan, and this module resolves the
+    corresponding identity and ordered sample roles exactly once.
+    """
+
+    plan: FixedRootSurveyPlan
+    scientific_operation_identity: str
+    sample_roles: tuple[str, ...]
+
+
+_FIXED_ROOT_SURVEY_REQUEST_CONTRACTS: Mapping[
+    FixedRootSurveyPlan, FixedRootSurveyRequestContract
+] = {
+    FixedRootSurveyPlan.FULL_NINE: FixedRootSurveyRequestContract(
+        plan=FixedRootSurveyPlan.FULL_NINE,
+        scientific_operation_identity=BINARY64_FIXED_ROOT_SURVEY_IDENTITY,
+        sample_roles=tuple(BINARY64_FIXED_ROOT_SAMPLE_ROLES),
+    ),
+    FixedRootSurveyPlan.CANONICAL_BACKGROUND_FIVE: FixedRootSurveyRequestContract(
+        plan=FixedRootSurveyPlan.CANONICAL_BACKGROUND_FIVE,
+        scientific_operation_identity=CANONICAL_EXTERIOR_BACKGROUND_IDENTITY,
+        sample_roles=tuple(_FIXED_ROOT_SURVEY_BACKGROUND_ROLES),
+    ),
+    FixedRootSurveyPlan.MECHANISM_COMPONENT_FOUR: FixedRootSurveyRequestContract(
+        plan=FixedRootSurveyPlan.MECHANISM_COMPONENT_FOUR,
+        scientific_operation_identity=BINARY64_FIXED_ROOT_SURVEY_IDENTITY,
+        sample_roles=tuple(_FIXED_ROOT_SURVEY_COORDINATE_ROLES),
+    ),
+}
+
+
+def fixed_root_survey_request_contract(
+    plan: FixedRootSurveyPlan | str,
+) -> FixedRootSurveyRequestContract:
+    """Resolve a named plan to its exact identity/role contract."""
+
+    try:
+        resolved = FixedRootSurveyPlan(plan)
+    except (TypeError, ValueError) as error:
+        raise ValueError("fixed-root survey plan is invalid") from error
+    return _FIXED_ROOT_SURVEY_REQUEST_CONTRACTS[resolved]
+
+
+def fixed_root_survey_plan_for_pair(
+    scientific_operation_identity: str,
+    sample_roles: tuple[str, ...],
+) -> FixedRootSurveyPlan:
+    """Return the sole named plan compatible with a persisted batch pair."""
+
+    for plan, contract in _FIXED_ROOT_SURVEY_REQUEST_CONTRACTS.items():
+        if (
+            scientific_operation_identity == contract.scientific_operation_identity
+            and sample_roles == contract.sample_roles
+        ):
+            return plan
+    raise ValueError("fixed-root survey identity and roles are not one request plan")
+
+
+def _resolve_fixed_root_survey_request_contract(
+    *,
+    plan: FixedRootSurveyPlan | str | None,
+    sample_roles: tuple[str, ...] | None,
+    scientific_operation_identity: str | None,
+) -> FixedRootSurveyRequestContract:
+    """Resolve one plan, accepting only exact legacy pairs while callers move.
+
+    Production scheduler code must pass ``plan``.  The narrow compatibility
+    path keeps historical readers and controlled fixtures usable, but still
+    rejects every identity/roles cross-pair before a worker is invoked.
+    """
+
+    if plan is not None:
+        if sample_roles is not None or scientific_operation_identity is not None:
+            raise ValueError(
+                "fixed-root survey plan cannot be combined with identity or roles"
+            )
+        return fixed_root_survey_request_contract(plan)
+    if sample_roles is None:
+        raise ValueError("fixed-root survey request requires a named plan")
+    if scientific_operation_identity is None:
+        scientific_operation_identity = BINARY64_FIXED_ROOT_SURVEY_IDENTITY
+    resolved_plan = fixed_root_survey_plan_for_pair(
+        scientific_operation_identity, sample_roles
+    )
+    return fixed_root_survey_request_contract(resolved_plan)
 
 
 def consume_authenticated_binary64_provisional_predecessor(
@@ -2466,6 +2572,32 @@ class JuliaFixedRootSurveyBatch:
     julia_launch_count: int = 1
     root_read_count: int = 0
 
+    def __post_init__(self) -> None:
+        """Reject a batch whose identity and roles do not name one plan.
+
+        The worker response is a persistence boundary as well as a numerical
+        value.  Validate the pair here so an invalid construction cannot be
+        cached, composed, or serialized by a later caller.
+        """
+
+        fixed_root_survey_plan_for_pair(
+            self.scientific_operation_identity,
+            self.sample_roles,
+        )
+        if self.operation != FIXED_ROOT_SURVEY_BATCH_OPERATION:
+            raise ValueError("fixed-root survey batch operation is invalid")
+        if self.identity != BINARY64_FIXED_ROOT_SURVEY_IDENTITY:
+            raise ValueError("fixed-root survey batch identity is invalid")
+        if (
+            isinstance(self.maximum_sample_count, bool)
+            or not isinstance(self.maximum_sample_count, int)
+            or self.maximum_sample_count < self.sample_count
+            or self.maximum_sample_count > _FIXED_ROOT_SURVEY_MAXIMUM_SAMPLE_COUNT
+        ):
+            raise ValueError("fixed-root survey batch sample budget is invalid")
+        if self.julia_launch_count != 1 or self.root_read_count != 0:
+            raise ValueError("fixed-root survey batch worker accounting is invalid")
+
     @property
     def sample_roles(self) -> tuple[str, ...]:
         return tuple(sample.role for sample in self.samples)
@@ -3483,31 +3615,6 @@ class JuliaPrecisionRootBackend:
             )
         return policy
 
-    @staticmethod
-    def _validate_fixed_root_survey_roles(
-        scientific_operation_identity: str,
-        sample_roles: tuple[str, ...],
-    ) -> None:
-        if not isinstance(sample_roles, tuple) or not sample_roles:
-            raise ValueError("fixed-root survey sample roles must be a tuple")
-        if len(sample_roles) > _FIXED_ROOT_SURVEY_MAXIMUM_SAMPLE_COUNT:
-            raise ValueError("fixed-root survey sample budget exceeded")
-        if len(set(sample_roles)) != len(sample_roles):
-            raise ValueError("fixed-root survey sample roles contain duplicates")
-        if any(role not in BINARY64_FIXED_ROOT_SAMPLE_ROLES for role in sample_roles):
-            raise ValueError("fixed-root survey sample role is unknown")
-        if scientific_operation_identity == CANONICAL_EXTERIOR_BACKGROUND_IDENTITY:
-            valid = sample_roles == _FIXED_ROOT_SURVEY_BACKGROUND_ROLES
-        elif scientific_operation_identity == BINARY64_FIXED_ROOT_SURVEY_IDENTITY:
-            valid = sample_roles in (
-                BINARY64_FIXED_ROOT_SAMPLE_ROLES,
-                _FIXED_ROOT_SURVEY_COORDINATE_ROLES,
-            )
-        else:
-            raise ValueError("fixed-root survey scientific operation is invalid")
-        if not valid:
-            raise ValueError("fixed-root survey sample roles are out of order")
-
     def preview_fixed_root_survey_request(
         self,
         job: ResponseComponentJob,
@@ -3515,10 +3622,16 @@ class JuliaPrecisionRootBackend:
         fixed_root: complex,
         root_seal_sha256: str,
         branch_identity: str,
-        sample_roles: tuple[str, ...],
-        scientific_operation_identity: str = BINARY64_FIXED_ROOT_SURVEY_IDENTITY,
+        plan: FixedRootSurveyPlan | str | None = None,
+        sample_roles: tuple[str, ...] | None = None,
+        scientific_operation_identity: str | None = None,
     ) -> dict[str, object]:
-        """Build the strict survey-only Julia batch without launching Julia."""
+        """Build one strict plan-owned Julia batch without launching Julia.
+
+        ``sample_roles``/``scientific_operation_identity`` remain a narrow
+        reader/fixture compatibility path.  New scheduler code supplies only
+        the named ``plan``; both concrete values are resolved below.
+        """
 
         if job.backend_identity != self.identity:
             raise ValueError("response job backend identity does not match Julia adapter")
@@ -3537,9 +3650,13 @@ class JuliaPrecisionRootBackend:
             raise ValueError("fixed-root survey root seal is invalid")
         if branch_identity != job.root.branch_id:
             raise ValueError("fixed-root survey branch identity mismatch")
-        self._validate_fixed_root_survey_roles(
-            scientific_operation_identity, sample_roles
+        contract = _resolve_fixed_root_survey_request_contract(
+            plan=plan,
+            sample_roles=sample_roles,
+            scientific_operation_identity=scientific_operation_identity,
         )
+        sample_roles = contract.sample_roles
+        scientific_operation_identity = contract.scientific_operation_identity
         frequency_step = 1.0e-5 * (1.0 + abs(root))
         coordinate_step = float(job.policy.epsilons[0])
         support = {
@@ -3617,8 +3734,9 @@ class JuliaPrecisionRootBackend:
         fixed_root: complex,
         root_seal_sha256: str,
         branch_identity: str,
-        sample_roles: tuple[str, ...],
-        scientific_operation_identity: str = BINARY64_FIXED_ROOT_SURVEY_IDENTITY,
+        plan: FixedRootSurveyPlan | str | None = None,
+        sample_roles: tuple[str, ...] | None = None,
+        scientific_operation_identity: str | None = None,
     ) -> JuliaFixedRootSurveyBatch:
         """Run one Julia request for one ordered fixed-root survey batch."""
 
@@ -3627,9 +3745,17 @@ class JuliaPrecisionRootBackend:
             fixed_root=fixed_root,
             root_seal_sha256=root_seal_sha256,
             branch_identity=branch_identity,
+            plan=plan,
             sample_roles=sample_roles,
             scientific_operation_identity=scientific_operation_identity,
         )
+        contract = _resolve_fixed_root_survey_request_contract(
+            plan=plan,
+            sample_roles=sample_roles,
+            scientific_operation_identity=scientific_operation_identity,
+        )
+        sample_roles = contract.sample_roles
+        scientific_operation_identity = contract.scientific_operation_identity
         evaluation = self.adapter.evaluate_for_validation(request)
         response = evaluation.response
         response_fields = {
@@ -5514,7 +5640,7 @@ def promoted_request_preflight_documents(
     adapter: object,
     calibration_receipt: PromotedControlCalibrationReceipt,
 ) -> tuple[dict[str, object], ...]:
-    """Build every supported promoted policy shape through production code."""
+    """Build every promoted root and fixed-root wire shape through production."""
 
     if exterior_job.mechanism_id != "exterior-light-ring":
         raise ValueError("promoted-request preflight exterior job is invalid")
@@ -5550,6 +5676,40 @@ def promoted_request_preflight_documents(
             calibration_receipt=calibration_receipt,
         )
         requests.append(backend.preview_root_request(job, 0.0j))
+    # This digest is a contract-preflight placeholder, not root evidence.  It
+    # exists only so the real fixed-root parser can authenticate the complete
+    # production envelope without asking a root provider or running numerics.
+    preflight_root_seal_sha256 = hashlib.sha256(canonical_json_bytes({
+        "schema": "windows-solver.fixed-root-survey-preflight-root/1",
+        "root_reference_id": exterior_job.root.root_reference_id,
+        "branch_identity": exterior_job.root.branch_id,
+        "fixed_root": {
+            "real": format(exterior_job.root.omega.real, ".17g"),
+            "imaginary": format(exterior_job.root.omega.imag, ".17g"),
+        },
+    })).hexdigest()
+    for digits in (40, 80):
+        backend = JuliaPrecisionRootBackend(
+            exterior_job.backend_identity,
+            adapter,
+            digits,
+            empirical_control_profile=calibration_receipt.budget_for(
+                "exterior-wronskian/v1", digits
+            ),
+            calibration_receipt=calibration_receipt,
+        )
+        for plan in (
+            FixedRootSurveyPlan.FULL_NINE,
+            FixedRootSurveyPlan.CANONICAL_BACKGROUND_FIVE,
+            FixedRootSurveyPlan.MECHANISM_COMPONENT_FOUR,
+        ):
+            requests.append(backend.preview_fixed_root_survey_request(
+                exterior_job,
+                fixed_root=exterior_job.root.omega,
+                root_seal_sha256=preflight_root_seal_sha256,
+                branch_identity=exterior_job.root.branch_id,
+                plan=plan,
+            ))
     return tuple(requests)
 
 
@@ -5563,7 +5723,8 @@ def build_promoted_request_contract_fixture(
     exterior = next(
         document
         for document in documents
-        if document["mechanism_id"] == "exterior-light-ring"
+        if document["operation"] == "root-readout"
+        and document["mechanism_id"] == "exterior-light-ring"
         and document["precision_digits"] == 80
         and document["refinement_level"] == 0
     )

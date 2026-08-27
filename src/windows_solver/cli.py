@@ -27,8 +27,13 @@ from .campaign_record_intake import assess_campaign_record_for_current_runtime
 from .campaign_policy import (
     CAMPAIGN_CHECKPOINT_SCHEMA_VERSION as SCHEMA11_VERSION,
     EvidenceLevel,
+    PromotionQueueDisposition,
     empty_schema11_checkpoint,
     validate_schema11_checkpoint,
+)
+from .campaign_failures import (
+    resolve_system_failure_for_resume,
+    system_failure_resolution_index,
 )
 from .campaign_evidence import (
     EvidencePassRequest,
@@ -350,6 +355,75 @@ def build_parser() -> argparse.ArgumentParser:
     campaign_admit_promoted.add_argument(
         "--review-receipt", type=Path, required=True
     )
+    campaign_admit_promoted.add_argument(
+        "--calibration-receipt-path", type=Path, required=True
+    )
+    campaign_admit_promoted.add_argument(
+        "--calibration-receipt-sha256", required=True
+    )
+    campaign_admit_promoted.add_argument(
+        "--diagnostic-session-id",
+        help="operator identity for the immutable structural diagnostic session",
+    )
+    campaign_admit_promoted_queue = commands.add_parser(
+        "campaign-admit-promoted-queue",
+        help="admit every ready promoted stage in canonical queue order",
+    )
+    campaign_admit_promoted_queue.add_argument("selection", type=Path)
+    campaign_admit_promoted_queue.add_argument(
+        "--checkpoint", type=Path, required=True
+    )
+    campaign_admit_promoted_queue.add_argument(
+        "--binary64-lock", type=Path, required=True
+    )
+    queue_reviews = campaign_admit_promoted_queue.add_mutually_exclusive_group(
+        required=True
+    )
+    queue_reviews.add_argument(
+        "--review-receipt", type=Path, action="append", default=[]
+    )
+    queue_reviews.add_argument("--review-receipt-directory", type=Path)
+    campaign_admit_promoted_queue.add_argument(
+        "--calibration-receipt-path", type=Path, required=True
+    )
+    campaign_admit_promoted_queue.add_argument(
+        "--calibration-receipt-sha256", required=True
+    )
+    campaign_admit_promoted_queue.add_argument(
+        "--diagnostic-session-id",
+        help="operator identity for the immutable structural diagnostic session",
+    )
+    campaign_resolve_system_failure = commands.add_parser(
+        "campaign-resolve-system-failure",
+        help=(
+            "append an authenticated resolution of one retained software "
+            "failure before resuming unretained Layer-2 work"
+        ),
+    )
+    campaign_resolve_system_failure.add_argument("selection", type=Path)
+    campaign_resolve_system_failure.add_argument(
+        "--checkpoint", type=Path, required=True
+    )
+    campaign_resolve_system_failure.add_argument(
+        "--binary64-lock", type=Path, required=True
+    )
+    campaign_resolve_system_failure.add_argument(
+        "--failure-receipt-sha256", required=True
+    )
+    campaign_resolve_system_failure.add_argument(
+        "--calibration-receipt-path", type=Path, required=True
+    )
+    campaign_resolve_system_failure.add_argument(
+        "--calibration-receipt-sha256", required=True
+    )
+    campaign_resolve_system_failure.add_argument(
+        "--repair-commit",
+        required=True,
+        help="full public Git commit SHA carrying the repair",
+    )
+    campaign_resolve_system_failure.add_argument(
+        "--reason", required=True, help="operator incident-resolution reason"
+    )
     for name, help_text in (
         ("campaign-survey-binary64", "run only the schema-11 binary64 survey pass"),
         ("campaign-survey-promoted", "run only the queued schema-11 promoted survey pass"),
@@ -365,8 +439,15 @@ def build_parser() -> argparse.ArgumentParser:
             default=ProgressMode.NORMAL.value,
         )
         campaign_pass.add_argument("--queue", type=Path)
-        campaign_pass.add_argument("--calibration-receipt-path", type=Path)
-        campaign_pass.add_argument("--calibration-receipt-sha256")
+        campaign_pass.add_argument(
+            "--calibration-receipt-path",
+            type=Path,
+            required=name == "campaign-survey-promoted",
+        )
+        campaign_pass.add_argument(
+            "--calibration-receipt-sha256",
+            required=name == "campaign-survey-promoted",
+        )
         if name == "campaign-survey-promoted":
             campaign_pass.add_argument("--binary64-lock", type=Path, required=True)
         campaign_pass.add_argument(
@@ -1256,9 +1337,12 @@ def _campaign_schema11_validate(
     pass_name: str | None,
     binary64_lock_path: Path | None = None,
 ) -> tuple[int, object]:
+    from .production_wiring import validate_production_wiring
+
     plan, selection, _descriptor, _recovery, resolved, checkpoint = (
         _load_schema11_campaign(selection_path, checkpoint_path)
     )
+    production_wiring = validate_production_wiring()
     projection = project_schema11_dashboard(
         checkpoint,
         selected_leaf_ids=selection.leaf_ids,
@@ -1288,7 +1372,12 @@ def _campaign_schema11_validate(
         pending = [
             item
             for item in checkpoint["promotion_queue"]["entries"]
-            if item["disposition"] == "PENDING"
+            if item["disposition"]
+            in {
+                PromotionQueueDisposition.PENDING.value,
+                PromotionQueueDisposition.CALCULATED_PENDING_DERIVATION.value,
+                PromotionQueueDisposition.NUMERICAL_CONTINUATION.value,
+            }
         ]
         if any(
             item["leaf_id"] not in _recovery.scientific_identities
@@ -1329,11 +1418,16 @@ def _campaign_schema11_validate(
         "unresolved_count": projection.unresolved_count,
         "rejected_count": projection.rejected_count,
         "system_failure_count": projection.system_failure_count,
+        "active_system_failure_count": projection.active_system_failure_count,
+        "historical_system_failure_count": (
+            projection.historical_system_failure_count
+        ),
         "binary64_pass_count": projection.binary64_processed_count,
         "promoted_pass_count": projection.promoted_processed_count,
         "promotion_queue_count": projection.pending_count,
         "evidence_counts": dict(evidence_counts),
         "report_status": dict(report_status),
+        "production_wiring": production_wiring,
         "basic_report_directory": str(report_directory_for_checkpoint(resolved)),
         "status_path": f"{resolved}.status.json",
         "binary64_lock_path": (
@@ -1353,6 +1447,9 @@ def _campaign_admit_promoted(
     binary64_lock_path: Path,
     queue_ordinal: int,
     review_receipt_path: Path,
+    calibration_receipt_path: Path,
+    calibration_receipt_sha256: str,
+    diagnostic_session: StructuralDiagnosticSession | None = None,
 ) -> tuple[int, object]:
     (
         plan,
@@ -1366,6 +1463,10 @@ def _campaign_admit_promoted(
         _resolve_recovery_path(review_receipt_path),
         "independent promoted review receipt",
     )
+    calibration_receipt = load_calibration_receipt(
+        _resolve_recovery_path(calibration_receipt_path),
+        calibration_receipt_sha256,
+    )
     from .campaign_runtime import run_native_promoted_admission
 
     result = run_native_promoted_admission(
@@ -1377,6 +1478,8 @@ def _campaign_admit_promoted(
         binary64_lock_path=_resolve_recovery_path(binary64_lock_path),
         queue_ordinal=queue_ordinal,
         independent_review_receipt=review_receipt,
+        calibration_receipt=calibration_receipt,
+        diagnostic_session=diagnostic_session,
     )
     return 0, {
         "command": "campaign-admit-promoted",
@@ -1393,6 +1496,227 @@ def _campaign_admit_promoted(
         "determinant_evaluation_count": result.determinant_evaluation_count,
         "binary64_evaluation_count": result.binary64_evaluation_count,
         "evidence_level": "SCREENED",
+        "release_admissible": False,
+    }
+
+
+def _campaign_admit_promoted_queue(
+    selection_path: Path,
+    checkpoint_path: Path,
+    *,
+    binary64_lock_path: Path,
+    review_receipt_paths: Sequence[Path],
+    review_receipt_directory: Path | None,
+    calibration_receipt_path: Path,
+    calibration_receipt_sha256: str,
+    diagnostic_session: StructuralDiagnosticSession | None = None,
+) -> tuple[int, object]:
+    """Drive the single-leaf admission primitive in immutable queue order."""
+
+    (
+        _plan,
+        _selection,
+        _descriptor,
+        _recovery_selection,
+        resolved,
+        checkpoint,
+    ) = _load_schema11_campaign(selection_path, checkpoint_path)
+    supplied_paths = list(review_receipt_paths)
+    if review_receipt_directory is not None:
+        directory = _resolve_recovery_path(review_receipt_directory)
+        if not directory.is_dir():
+            raise ValueError(f"review receipt directory is absent: {directory}")
+        supplied_paths = sorted(
+            (
+                path
+                for path in directory.iterdir()
+                if path.is_file() and path.suffix.lower() == ".json"
+            ),
+            key=lambda path: path.name,
+        )
+        if not supplied_paths:
+            raise ValueError("review receipt directory contains no files")
+    receipt_paths_by_ordinal: dict[int, Path] = {}
+    for path in supplied_paths:
+        resolved_receipt_path = _resolve_recovery_path(path)
+        receipt = _load_strict_json(
+            resolved_receipt_path, "independent promoted review receipt"
+        )
+        ordinal = receipt.get("queue_ordinal")
+        if isinstance(ordinal, bool) or not isinstance(ordinal, int) or ordinal < 0:
+            raise ValueError(
+                f"review receipt has an invalid queue ordinal: {resolved_receipt_path}"
+            )
+        if ordinal in receipt_paths_by_ordinal:
+            raise ValueError(f"duplicate review receipt for queue ordinal {ordinal}")
+        receipt_paths_by_ordinal[ordinal] = resolved_receipt_path
+
+    queue_ordinals = {
+        int(entry["queue_ordinal"])
+        for entry in checkpoint["promotion_queue"]["entries"]
+    }
+    extra_receipts = sorted(set(receipt_paths_by_ordinal) - queue_ordinals)
+    if extra_receipts:
+        raise ValueError(
+            "review receipts reference absent queue ordinals: "
+            + ",".join(str(item) for item in extra_receipts)
+        )
+    for entry in checkpoint["promotion_queue"]["entries"]:
+        ordinal = int(entry["queue_ordinal"])
+        disposition = str(entry["disposition"])
+        if disposition == "COMPLETED":
+            continue
+        if disposition not in {
+            "AWAITING_ADMISSION",
+            "ADMITTED_PENDING_PUBLICATION",
+        }:
+            raise ValueError(
+                "promoted admission queue is not ready at ordinal "
+                f"{ordinal}: {disposition}"
+            )
+        if ordinal not in receipt_paths_by_ordinal:
+            raise ValueError(
+                f"independent review receipt is missing for queue ordinal {ordinal}"
+            )
+
+    admitted: list[Mapping[str, object]] = []
+    skipped_completed: list[int] = []
+    for initial_entry in checkpoint["promotion_queue"]["entries"]:
+        ordinal = int(initial_entry["queue_ordinal"])
+        current = _load_schema11_campaign(selection_path, resolved)[5]
+        entry = current["promotion_queue"]["entries"][ordinal]
+        disposition = str(entry["disposition"])
+        if disposition == "COMPLETED":
+            skipped_completed.append(ordinal)
+            continue
+        if disposition not in {
+            "AWAITING_ADMISSION",
+            "ADMITTED_PENDING_PUBLICATION",
+        }:
+            raise ValueError(
+                "promoted admission queue is not ready at ordinal "
+                f"{ordinal}: {disposition}"
+            )
+        receipt_path = receipt_paths_by_ordinal.get(ordinal)
+        if receipt_path is None:
+            raise ValueError(
+                f"independent review receipt is missing for queue ordinal {ordinal}"
+            )
+        _status, output = _campaign_admit_promoted(
+            selection_path,
+            resolved,
+            binary64_lock_path=binary64_lock_path,
+            queue_ordinal=ordinal,
+            review_receipt_path=receipt_path,
+            calibration_receipt_path=calibration_receipt_path,
+            calibration_receipt_sha256=calibration_receipt_sha256,
+            diagnostic_session=diagnostic_session,
+        )
+        if not isinstance(output, Mapping):
+            raise ValueError("single-leaf promoted admission output is invalid")
+        admitted.append(dict(output))
+    final_checkpoint = _load_schema11_campaign(selection_path, resolved)[5]
+    remaining = [
+        int(entry["queue_ordinal"])
+        for entry in final_checkpoint["promotion_queue"]["entries"]
+        if entry["disposition"] != "COMPLETED"
+    ]
+    if remaining:
+        raise ValueError(
+            "promoted admission queue remains incomplete at ordinals: "
+            + ",".join(str(item) for item in remaining)
+        )
+    return 0, {
+        "command": "campaign-admit-promoted-queue",
+        "campaign_id": final_checkpoint["campaign_id"],
+        "selection_id": final_checkpoint["selection_id"],
+        "checkpoint_path": str(resolved),
+        "queue_count": len(final_checkpoint["promotion_queue"]["entries"]),
+        "admitted_count": len(admitted),
+        "skipped_completed_count": len(skipped_completed),
+        "skipped_completed_ordinals": skipped_completed,
+        "completed_count": sum(
+            entry["disposition"] == "COMPLETED"
+            for entry in final_checkpoint["promotion_queue"]["entries"]
+        ),
+        "release_admissible": False,
+    }
+
+
+def _campaign_resolve_system_failure(
+    selection_path: Path,
+    checkpoint_path: Path,
+    *,
+    binary64_lock_path: Path,
+    system_failure_receipt_sha256: str,
+    calibration_receipt_path: Path,
+    calibration_receipt_sha256: str,
+    repair_commit_sha: str,
+    reason: str,
+) -> tuple[int, object]:
+    """Close one retained software incident without altering numerical state.
+
+    This is deliberately separate from the promoted scheduler.  It verifies
+    the immutable Layer-1 lock and the exact calibration authority, appends a
+    canonical receipt, and refreshes reports.  It never changes a queue entry,
+    raw calculation, retained promoted stage, terminal record, or evidence.
+    """
+
+    (
+        plan,
+        selection,
+        _descriptor,
+        recovery_selection,
+        resolved,
+        checkpoint,
+    ) = _load_schema11_campaign(selection_path, checkpoint_path)
+    calibration_receipt = load_calibration_receipt(
+        _resolve_recovery_path(calibration_receipt_path),
+        calibration_receipt_sha256,
+    )
+    from .binary64_layer_lock import (
+        load_binary64_layer_lock,
+        validate_binary64_layer_lock,
+    )
+
+    lock = validate_binary64_layer_lock(
+        load_binary64_layer_lock(_resolve_recovery_path(binary64_lock_path)),
+        checkpoint,
+        selection=recovery_selection,
+        leaf_mechanism_ids=_schema11_leaf_mechanism_ids(plan, recovery_selection),
+        auxiliary_evidence_manifest=_schema11_binary64_lock_manifest(
+            plan, checkpoint, resolved
+        ),
+    )
+    updated, resolution = resolve_system_failure_for_resume(
+        checkpoint,
+        system_failure_receipt_sha256=system_failure_receipt_sha256,
+        expected_authority_sha256=(
+            calibration_receipt.independent_review_authority_sha256
+        ),
+        calibration_receipt_sha256=calibration_receipt.sha256,
+        binary64_lock_receipt_sha256=lock["receipt_sha256"],
+        repair_commit_sha=repair_commit_sha,
+        reason=reason,
+    )
+    # Persist the receipt before deriving a disposable report view.  A report
+    # problem can never erase the operator's incident decision.
+    _atomic_export(resolved, updated)
+    refreshed = refresh_schema11_reports(plan, selection, updated, resolved)
+    resolutions = system_failure_resolution_index(refreshed)
+    historical = len(resolutions)
+    return 0, {
+        "command": "campaign-resolve-system-failure",
+        "campaign_id": refreshed["campaign_id"],
+        "selection_id": refreshed["selection_id"],
+        "checkpoint_path": str(resolved),
+        "system_failure_receipt_sha256": system_failure_receipt_sha256,
+        "resolution_receipt_sha256": resolution["receipt_sha256"],
+        "repair_commit_sha": resolution["repair_commit_sha"],
+        "repair_runtime_sha256": resolution["repair_runtime_sha256"],
+        "active_system_failure_count": len(refreshed["system_failures"])
+        - historical,
+        "historical_system_failure_count": historical,
         "release_admissible": False,
     }
 
@@ -1477,13 +1801,10 @@ def _campaign_schema11_pass(
 
         if binary64_lock_path is None:
             raise ValueError("promoted survey requires a binary64 lock")
-
-        receipt = (
-            None
-            if calibration_receipt_path is None
-            else load_calibration_receipt(
-                calibration_receipt_path, str(calibration_receipt_sha256)
-            )
+        if calibration_receipt_path is None or calibration_receipt_sha256 is None:
+            raise ValueError("promoted survey requires an explicit calibration receipt")
+        receipt = load_calibration_receipt(
+            calibration_receipt_path, calibration_receipt_sha256
         )
         reporter = Schema11ProgressReporter(
             resolved,
@@ -1960,6 +2281,20 @@ def _schema11_diagnostic_execution(command: str) -> dict[str, object]:
             "tier": "promoted",
             "operation_identity": command,
         }
+    if command == "campaign-admit-promoted":
+        return {
+            "profile": "admission",
+            "pass": "promoted",
+            "tier": "retained",
+            "operation_identity": command,
+        }
+    if command == "campaign-admit-promoted-queue":
+        return {
+            "profile": "admission",
+            "pass": "promoted",
+            "tier": "retained",
+            "operation_identity": command,
+        }
     if command == "campaign-certify":
         return {
             "profile": "certify",
@@ -2193,6 +2528,82 @@ def _run_schema11_pass_with_diagnostics(arguments: argparse.Namespace) -> tuple[
     }
 
 
+def _run_promoted_admission_with_diagnostics(
+    arguments: argparse.Namespace,
+) -> tuple[int, object]:
+    plan, selection, _descriptor = _campaign_plan_and_selection(arguments.selection)
+    checkpoint = _resolve_recovery_path(arguments.checkpoint)
+    session = StructuralDiagnosticSession.open(
+        checkpoint_path=checkpoint,
+        session_id=(arguments.diagnostic_session_id or uuid4().hex),
+        campaign_id=plan.campaign_id,
+        selection_id=selection.selection_id,
+    )
+    command = arguments.command
+    execution = _schema11_diagnostic_execution(command)
+    session.append("DIAGNOSTIC_SESSION_OPENED", execution=execution, durable=True)
+    session.append("CAMPAIGN_COMMAND_STARTED", execution=execution, durable=True)
+    try:
+        if command == "campaign-admit-promoted":
+            status, output = _campaign_admit_promoted(
+                arguments.selection,
+                arguments.checkpoint,
+                binary64_lock_path=arguments.binary64_lock,
+                queue_ordinal=arguments.queue_ordinal,
+                review_receipt_path=arguments.review_receipt,
+                calibration_receipt_path=arguments.calibration_receipt_path,
+                calibration_receipt_sha256=arguments.calibration_receipt_sha256,
+                diagnostic_session=session,
+            )
+        else:
+            status, output = _campaign_admit_promoted_queue(
+                arguments.selection,
+                arguments.checkpoint,
+                binary64_lock_path=arguments.binary64_lock,
+                review_receipt_paths=arguments.review_receipt,
+                review_receipt_directory=arguments.review_receipt_directory,
+                calibration_receipt_path=arguments.calibration_receipt_path,
+                calibration_receipt_sha256=arguments.calibration_receipt_sha256,
+                diagnostic_session=session,
+            )
+        if not isinstance(output, Mapping):
+            raise ValueError("promoted admission output is invalid")
+    except KeyboardInterrupt as error:
+        _finalize_schema11_diagnostic_failure(
+            session=session,
+            command=command,
+            execution=execution,
+            checkpoint=checkpoint,
+            selected_leaf_count=len(selection.leaf_ids),
+            error=error,
+            interrupted=True,
+        )
+        raise
+    except BaseException as error:
+        _finalize_schema11_diagnostic_failure(
+            session=session,
+            command=command,
+            execution=execution,
+            checkpoint=checkpoint,
+            selected_leaf_count=len(selection.leaf_ids),
+            error=error,
+            interrupted=False,
+        )
+        raise
+    session.append(
+        "CAMPAIGN_COMMAND_COMPLETED",
+        execution=execution,
+        compact_diagnostics={"status": status},
+        durable=True,
+    )
+    session.close_completed()
+    return status, {
+        **output,
+        "diagnostic_session_directory": str(session.paths.directory),
+        "diagnostic_events_path": str(session.paths.structural_events),
+    }
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     try:
         arguments = build_parser().parse_args(argv)
@@ -2229,13 +2640,23 @@ def main(argv: Sequence[str] | None = None) -> int:
             status, output = _campaign_selected(
                 arguments.command, arguments.selection, Path("unused")
             )
-        elif arguments.command == "campaign-admit-promoted":
-            status, output = _campaign_admit_promoted(
+        elif arguments.command in {
+            "campaign-admit-promoted",
+            "campaign-admit-promoted-queue",
+        }:
+            status, output = _run_promoted_admission_with_diagnostics(arguments)
+        elif arguments.command == "campaign-resolve-system-failure":
+            status, output = _campaign_resolve_system_failure(
                 arguments.selection,
                 arguments.checkpoint,
                 binary64_lock_path=arguments.binary64_lock,
-                queue_ordinal=arguments.queue_ordinal,
-                review_receipt_path=arguments.review_receipt,
+                system_failure_receipt_sha256=(
+                    arguments.failure_receipt_sha256
+                ),
+                calibration_receipt_path=arguments.calibration_receipt_path,
+                calibration_receipt_sha256=arguments.calibration_receipt_sha256,
+                repair_commit_sha=arguments.repair_commit,
+                reason=arguments.reason,
             )
         elif arguments.command in {
             "campaign-run", "campaign-resume", "campaign-validate"

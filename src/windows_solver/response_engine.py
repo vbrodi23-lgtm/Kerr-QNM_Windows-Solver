@@ -2652,6 +2652,124 @@ def reviewed_determinant_error_claims_for_fixed_root_batch(
     return tuple(claims)
 
 
+def reviewed_determinant_error_claims_for_fixed_root_batches(
+    job: ResponseComponentJob,
+    batches: Sequence[object],
+    *,
+    root_seal_sha256: str,
+    arithmetic_tier: str,
+    working_precision: int,
+) -> tuple[Mapping[str, object], ...]:
+    """Issue claims for several authentic worker requests without fusing them.
+
+    A promoted exterior calculation is physically nine sample roles but may be
+    executed as a five-sample shared-background request plus a four-sample
+    mechanism request.  This function retains those two operation identities
+    in the claim set; callers must not manufacture a synthetic worker batch.
+    """
+
+    if not isinstance(job, ResponseComponentJob):
+        raise ValueError("reviewed determinant-error job is invalid")
+    if not isinstance(root_seal_sha256, str) or _HEX_64.fullmatch(
+        root_seal_sha256
+    ) is None:
+        raise ValueError("reviewed determinant-error root seal is invalid")
+    if not isinstance(arithmetic_tier, str) or not arithmetic_tier:
+        raise ValueError("reviewed determinant-error arithmetic tier is invalid")
+    if type(working_precision) is not int or working_precision < 2:
+        raise ValueError("reviewed determinant-error working precision is invalid")
+    request_batches = tuple(batches)
+    if not request_batches:
+        raise ValueError("reviewed determinant-error request batches are missing")
+    samples_by_batch = tuple(
+        tuple(getattr(batch, "samples", ())) for batch in request_batches
+    )
+    if tuple(
+        getattr(sample, "role", None)
+        for samples in samples_by_batch
+        for sample in samples
+    ) != BINARY64_FIXED_ROOT_SAMPLE_ROLES:
+        raise ValueError("reviewed determinant-error sample plan is invalid")
+    roots = tuple(
+        _finite_complex(
+            getattr(batch, "fixed_root", None),
+            "reviewed determinant-error fixed root",
+        )
+        for batch in request_batches
+    )
+    component_batch = request_batches[-1]
+    if (
+        getattr(component_batch, "leaf_id", None) != job.leaf_id
+        or getattr(component_batch, "job_id", None) != job.job_id
+        or any(
+            getattr(batch, "branch_identity", None) != job.root.branch_id
+            for batch in request_batches
+        )
+        or len(set(roots)) != 1
+    ):
+        raise ValueError("reviewed determinant-error request context is invalid")
+    operations = tuple(
+        getattr(batch, "scientific_operation_identity", None)
+        for batch in request_batches
+    )
+    if any(not isinstance(operation, str) or not operation for operation in operations):
+        raise ValueError("reviewed determinant-error operation identity is invalid")
+    contract = regularised_gsn_mechanism_contract(job.mechanism_id)
+    angular_identity = _sha256({
+        "angular_separation_constant": _complex_mapping(
+            job.root.angular_separation_constant
+        ),
+        "angular_owner": job.root.owner_data_sha256,
+    })
+    runtime_identity = _sha256({
+        "backend_identity_sha256": job.backend_identity.identity_sha256,
+        "runtime_fingerprint": job.backend_identity.runtime_fingerprint,
+        "arithmetic_tier": arithmetic_tier,
+        "working_precision": working_precision,
+    })
+    claims: list[Mapping[str, object]] = []
+    for operation, samples in zip(operations, samples_by_batch, strict=True):
+        for sample in samples:
+            determinant = sample.determinant
+            determinant_mapping = (
+                determinant.to_mapping()
+                if isinstance(determinant, DecimalComplex)
+                else _complex_mapping(
+                    _finite_complex(determinant, "sample determinant")
+                )
+            )
+            claims.append({
+                "schema": REVIEWED_DETERMINANT_ERROR_CLAIM_SCHEMA,
+                "leaf_id": job.leaf_id,
+                "job_id": job.job_id,
+                "scientific_operation_identity": operation,
+                "root_seal_sha256": root_seal_sha256,
+                "fixed_root": _complex_mapping(roots[0]),
+                "root_identity_sha256": job.root.identity_sha256,
+                "branch_identity": job.root.branch_id,
+                "angular_identity_sha256": angular_identity,
+                "determinant_family": str(contract["determinant_family"]),
+                "determinant_convention": str(contract["determinant_convention"]),
+                "determinant_normalisation": str(
+                    contract["determinant_normalisation"]
+                ),
+                "backend_identity_sha256": job.backend_identity.identity_sha256,
+                "runtime_identity_sha256": runtime_identity,
+                "arithmetic_tier": arithmetic_tier,
+                "working_precision": working_precision,
+                "numerical_control_identity_sha256": job.policy.identity_sha256,
+                "sample_role": sample.role,
+                "frequency": _complex_mapping(
+                    _finite_complex(sample.omega, "sample frequency")
+                ),
+                "amplitude": _complex_mapping(
+                    _finite_complex(sample.amplitude, "sample amplitude")
+                ),
+                "determinant_centre": determinant_mapping,
+            })
+    return tuple(claims)
+
+
 _CANONICAL_BACKGROUND_SAMPLE_ROLES = BINARY64_FIXED_ROOT_SAMPLE_ROLES[:5]
 _MECHANISM_DERIVATIVE_SAMPLE_ROLES = BINARY64_FIXED_ROOT_SAMPLE_ROLES[5:]
 

@@ -8,6 +8,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from types import SimpleNamespace
 
 from windows_solver.campaign_failures import CampaignSystemFailure
 from windows_solver.campaign_policy import (
@@ -31,8 +32,9 @@ from windows_solver.julia_response_backend import (
     JuliaFixedRootSurveyBatch,
     JuliaFixedRootSurveySample,
     JuliaNumericalControlError,
+    fixed_root_survey_request_contract,
 )
-from windows_solver.precision_tiers import PrecisionTier
+from windows_solver.precision_tiers import PrecisionTier, working_precision_bits
 from windows_solver.reviewed_determinant_error_issuance import (
     PromotedExecutionPreflight,
     require_locked_bf40_determinant_error_issuance_authority,
@@ -64,6 +66,75 @@ def _sha256(value: object) -> str:
     return hashlib.sha256(canonical_json_bytes(value)).hexdigest()
 
 
+def _requested_contract(kwargs):
+    """Resolve fake-worker identity and roles through the production contract."""
+
+    return fixed_root_survey_request_contract(kwargs["plan"])
+
+
+class _TestLayer1Guard:
+    """Minimal guard seam for scheduler unit tests; routes remain explicit."""
+
+    def assert_unchanged(self, checkpoint):
+        return checkpoint
+
+    def pre_write(self, checkpoint):
+        return checkpoint
+
+    def post_write(self, checkpoint):
+        return checkpoint
+
+    def post_callback(self, checkpoint):
+        return checkpoint
+
+
+def _locked_routes(checkpoint, leaves) -> dict[int, object]:
+    leaf_by_id = {leaf.leaf_id: leaf for leaf in leaves}
+    routes = {}
+    for entry in checkpoint["promotion_queue"]["entries"]:
+        leaf = leaf_by_id[entry["leaf_id"]]
+        routes[int(entry["queue_ordinal"])] = SimpleNamespace(
+            queue_ordinal=int(entry["queue_ordinal"]),
+            leaf_id=entry["leaf_id"],
+            route=(
+                "HORIZON_BF80"
+                if leaf.mechanism_id == "horizon-admittance"
+                else "EXTERIOR_BF40"
+            ),
+            minimum_requested_tier=entry["minimum_requested_tier"],
+            source_stage_sha256=entry["source_stage_sha256"],
+            source_root_seal_sha256=entry["source_root_seal_sha256"],
+            source_fingerprint_sha256=entry.get("source_fingerprint_sha256"),
+            provisional_stage=entry.get("provisional_stage"),
+        )
+    return routes
+
+
+def _strict_run(plan, selection, checkpoint, **kwargs):
+    """Invoke the scheduler with the same typed seams as production wiring."""
+
+    kwargs.pop("provisional_stage_lookup", None)
+    kwargs.pop("terminal_record_committed", None)
+    leaves = {leaf.leaf_id: leaf for leaf in plan.leaves}
+    routes = _locked_routes(
+        checkpoint,
+        tuple(leaves[leaf_id] for leaf_id in selection.ordered_leaf_ids),
+    )
+    kwargs.setdefault("layer1_guard", _TestLayer1Guard())
+    kwargs.setdefault("locked_routes_by_ordinal", routes)
+    kwargs.setdefault(
+        "promoted_preflights_by_ordinal",
+        {
+            ordinal: require_locked_bf40_determinant_error_issuance_authority(
+                route=route.route
+            )
+            for ordinal, route in routes.items()
+        },
+    )
+    kwargs.setdefault("layer1_lock_receipt_sha256", "f" * 64)
+    return run_promoted_survey(plan, selection, checkpoint, **kwargs)
+
+
 def _record(leaf_id: str, digits: int):
     stage_content = {
         "schema": "windows-solver.test-promoted-stage/1",
@@ -74,7 +145,11 @@ def _record(leaf_id: str, digits: int):
     return {**content, "record_sha256": _sha256(content)}, stage["stage_sha256"]
 
 
-def _conditioning(digits: int) -> FixedRootSurveyConditioning:
+def _conditioning(
+    digits: int,
+    *,
+    precision_limited: bool = False,
+) -> FixedRootSurveyConditioning:
     return FixedRootSurveyConditioning({
         "schema": "windows-solver.fixed-root-survey-conditioning/1",
         "determinant_family": "exterior-wronskian/v1",
@@ -90,7 +165,7 @@ def _conditioning(digits: int) -> FixedRootSurveyConditioning:
         "maximum_contour_angle_deformation": "0",
         "predicted_reliable_digits": str(digits - 6),
         "required_reliable_digits": "20",
-        "precision_limited": False,
+        "precision_limited": precision_limited,
         "determinant_count": 1,
     })
 
@@ -121,8 +196,12 @@ def _batch(leaf, seal: AuthenticatedRootSeal, digits: int, *, flat=False):
             complex(omega),
             complex(amplitude),
             determinant,
-            _conditioning(digits),
+            _conditioning(digits, precision_limited=flat),
         ))
+    tier = (
+        PrecisionTier.BIGFLOAT_40
+        if digits == 40 else PrecisionTier.BIGFLOAT_80
+    )
     return JuliaFixedRootSurveyBatch(
         leaf_id=leaf.leaf_id,
         job_id=leaf.job.job_id,
@@ -131,15 +210,12 @@ def _batch(leaf, seal: AuthenticatedRootSeal, digits: int, *, flat=False):
         root_seal_sha256=seal.root_seal_sha256,
         branch_identity=seal.branch_identity,
         fixed_root=root,
-        frequency_step=Decimal(str(h)),
+        frequency_step=Decimal(format(h, ".17g")),
         coordinate_step=Decimal(str(epsilon)),
         scientific_operation_identity="exterior-fixed-root-survey-raw/v1",
         request_sha256=str(digits // 40) * 64,
-        precision_tier=(
-            PrecisionTier.BIGFLOAT_40
-            if digits == 40 else PrecisionTier.BIGFLOAT_80
-        ),
-        working_precision_bits=digits * 4,
+        precision_tier=tier,
+        working_precision_bits=working_precision_bits(tier),
         samples=tuple(samples),
     )
 
@@ -230,11 +306,19 @@ class _Backend:
             kwargs["root_seal_sha256"],
         )
         batch = _batch(self.leaf, seal, self.digits, flat=self.flat)
-        requested = tuple(kwargs["sample_roles"])
+        contract = _requested_contract(kwargs)
         return replace(
             batch,
+            scientific_operation_identity=contract.scientific_operation_identity,
+            request_sha256=_sha256({
+                "leaf_id": self.leaf.leaf_id,
+                "digits": self.digits,
+                "plan": contract.plan.value,
+            }),
             samples=tuple(
-                sample for sample in batch.samples if sample.role in requested
+                sample
+                for sample in batch.samples
+                if sample.role in contract.sample_roles
             ),
         )
 
@@ -341,7 +425,6 @@ class PromotedSurveySchedulerTests(unittest.TestCase):
         diagnostic_session=None,
         calculate_only=False,
         block_all=False,
-        terminal_commits=None,
     ):
         calls: list[int] = []
         published: dict[str, AuthenticatedRootSeal] = {}
@@ -357,15 +440,32 @@ class PromotedSurveySchedulerTests(unittest.TestCase):
             return published.get(leaf.leaf_id)
 
         with tempfile.TemporaryDirectory() as temporary:
-            result = run_promoted_survey(
+            routes = _locked_routes(checkpoint, self.leaves)
+            preflights = {
+                ordinal: (
+                    PromotedExecutionPreflight(
+                        mode=PromotedExecutionMode.BLOCK_ALL,
+                        route=route.route,
+                        calibration_receipt_sha256="e" * 64,
+                        calculation_permitted=False,
+                        checkpointing_permitted=False,
+                        admission_permitted=False,
+                        publication_permitted=False,
+                        result_code="BLOCKED_BY_ADMISSION_POLICY",
+                    )
+                    if block_all
+                    else require_locked_bf40_determinant_error_issuance_authority(
+                        route=route.route
+                    )
+                )
+                for ordinal, route in routes.items()
+            }
+            result = _strict_run(
                 self.plan,
                 self.selection,
                 checkpoint,
                 checkpoint_path=Path(temporary) / "checkpoint.json",
                 root_seal_lookup=root_seal_lookup,
-                provisional_stage_lookup=lambda _leaf, entry: entry[
-                    "provisional_stage"
-                ],
                 root_seal_publish=lambda leaf, seal: published.__setitem__(
                     leaf.leaf_id, seal
                 ),
@@ -388,54 +488,18 @@ class PromotedSurveySchedulerTests(unittest.TestCase):
                     )
                 ),
                 horizon_runner=lambda leaf: self.fail("unexpected horizon"),
-                produced_record_builder=lambda leaf, batch, screening, digits: (
-                    _record(leaf.leaf_id, digits)
-                ),
-                promoted_preflights_by_ordinal=(
-                    {
-                        ordinal: (
-                            PromotedExecutionPreflight(
-                                mode=PromotedExecutionMode.BLOCK_ALL,
-                                route="EXTERIOR_BF40",
-                                calibration_receipt_sha256="e" * 64,
-                                calculation_permitted=False,
-                                checkpointing_permitted=False,
-                                admission_permitted=False,
-                                publication_permitted=False,
-                                result_code="BLOCKED_BY_ADMISSION_POLICY",
-                            )
-                            if block_all
-                            else require_locked_bf40_determinant_error_issuance_authority(
-                                route="EXTERIOR_BF40"
-                            )
-                        )
-                        for ordinal in range(
-                            len(checkpoint["promotion_queue"]["entries"])
-                        )
-                    }
-                    if calculate_only or block_all
-                    else None
-                ),
-                layer1_lock_receipt_sha256=(
-                    "f" * 64 if calculate_only or block_all else None
-                ),
-                terminal_record_committed=(
-                    None
-                    if terminal_commits is None
-                    else lambda leaf, record: terminal_commits.append(
-                        (leaf.leaf_id, record["record_sha256"])
-                    )
-                ),
+                layer1_guard=_TestLayer1Guard(),
+                locked_routes_by_ordinal=routes,
+                promoted_preflights_by_ordinal=preflights,
+                layer1_lock_receipt_sha256="f" * 64,
                 diagnostic_session=diagnostic_session,
             )
         return result, calls
 
     def test_calculate_only_stops_at_bf40_and_retains_without_admission(self):
-        terminal_commits: list[tuple[str, str]] = []
         first, calls = self._run(
             self._checkpoint(),
             calculate_only=True,
-            terminal_commits=terminal_commits,
         )
 
         leaf_id = self.leaves[0].leaf_id
@@ -452,25 +516,22 @@ class PromotedSurveySchedulerTests(unittest.TestCase):
         self.assertEqual("CALCULATE_ONLY", stage["execution_mode"])
         self.assertEqual("EXTERIOR_BF40", stage["route"])
         self.assertEqual("f" * 64, stage["layer1_lock_receipt_sha256"])
-        self.assertEqual(["bigfloat-40"], [
+        self.assertEqual(["bigfloat-40", "bigfloat-40"], [
             batch["precision_tier"] for batch in stage["raw_promoted_batches"]
         ])
         self.assertEqual([], first.checkpoint["records"])
         self.assertEqual({}, first.checkpoint["evidence_ledger"])
-        self.assertEqual([], terminal_commits)
         self.assertEqual(1, first.review_pending_count)
 
         resumed, resumed_calls = self._run(
             first.checkpoint,
             calculate_only=True,
-            terminal_commits=terminal_commits,
         )
         self.assertEqual([], resumed_calls)
         self.assertEqual(
             stage,
             resumed.checkpoint["promoted_stage_ledger"]["0"][leaf_id],
         )
-        self.assertEqual([], terminal_commits)
 
     def test_block_all_returns_typed_policy_result_without_backend_work(self):
         result, calls = self._run(self._checkpoint(), block_all=True)
@@ -495,18 +556,26 @@ class PromotedSurveySchedulerTests(unittest.TestCase):
 
         self.assertEqual([40, 40, 40], calls)
         background_entries = result.checkpoint["promoted_background_ledger"]
-        receipts = [
-            background_entries[str(ordinal)][leaf.leaf_id]["payload"][
-                "background_receipts"
-            ][0]
+        self.assertEqual(["0"], list(background_entries))
+        source_leaf = self.leaves[0]
+        receipt = background_entries["0"][source_leaf.leaf_id]["payload"][
+            "background_receipts"
+        ][0]
+        self.assertEqual(0, receipt["source_queue_ordinal"])
+        self.assertEqual(source_leaf.leaf_id, receipt["source_leaf_id"])
+        bindings = [
+            result.checkpoint["promoted_stage_ledger"][str(ordinal)][leaf.leaf_id][
+                "calculation_artifact"
+            ]["background"]
             for ordinal, leaf in enumerate(self.leaves)
         ]
-        self.assertEqual(["ACQUIRED", "REUSED"], [
-            receipt["status"] for receipt in receipts
-        ])
         self.assertEqual(
-            receipts[0]["background_sha256"],
-            receipts[1]["background_sha256"],
+            [receipt["receipt_sha256"], receipt["receipt_sha256"]],
+            [binding["background_receipt_sha256"] for binding in bindings],
+        )
+        self.assertEqual(
+            [receipt["background_sha256"], receipt["background_sha256"]],
+            [binding["background_sha256"] for binding in bindings],
         )
         promoted_ledger = result.checkpoint["survey_pass_ledger"]["promoted"]
         self.assertEqual(
@@ -526,9 +595,9 @@ class PromotedSurveySchedulerTests(unittest.TestCase):
         queue_entry = result.checkpoint["promotion_queue"]["entries"][0]
         retained = result.checkpoint["promoted_stage_ledger"]["0"][leaf_id]
         self.assertEqual([40, 80], calls)
-        self.assertEqual("AWAITING_ADMISSION", queue_entry["disposition"])
+        self.assertEqual("UNRESOLVED", queue_entry["disposition"])
         self.assertEqual(
-            "CALCULATED_AWAITING_ADMISSION",
+            "UNRESOLVED",
             result.checkpoint["survey_pass_ledger"]["promoted"][leaf_id][
                 "disposition"
             ],
@@ -579,7 +648,7 @@ class PromotedSurveySchedulerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "checkpoint.json"
             with self.assertRaises(KeyboardInterrupt):
-                run_promoted_survey(
+                _strict_run(
                     self.plan,
                     self.selection,
                     checkpoint,
@@ -597,9 +666,6 @@ class PromotedSurveySchedulerTests(unittest.TestCase):
                     ),
                     primary_root_runner=primary_root_runner,
                     horizon_runner=lambda _leaf: self.fail("unexpected horizon"),
-                    produced_record_builder=lambda leaf, batch, screening, digits: (
-                        _record(leaf.leaf_id, digits)
-                    ),
                     promoted_preflights_by_ordinal={0: preflight},
                     layer1_lock_receipt_sha256="f" * 64,
                 )
@@ -611,13 +677,13 @@ class PromotedSurveySchedulerTests(unittest.TestCase):
             self.assertEqual([40, 80], interrupted_calls)
             self.assertEqual([40], root_calls)
             self.assertEqual(
-                "PENDING",
+                "NUMERICAL_CONTINUATION",
                 interrupted["promotion_queue"]["entries"][0]["disposition"],
             )
             self.assertEqual("NUMERICAL_CONTINUATION", partial["admission_state"])
             self.assertEqual(["BF40"], partial["precision_tiers"])
 
-            resumed = run_promoted_survey(
+            resumed = _strict_run(
                 self.plan,
                 self.selection,
                 interrupted,
@@ -634,9 +700,6 @@ class PromotedSurveySchedulerTests(unittest.TestCase):
                     "resume must reuse the retained BF40 root seal"
                 ),
                 horizon_runner=lambda _leaf: self.fail("unexpected horizon"),
-                produced_record_builder=lambda leaf, batch, screening, digits: (
-                    _record(leaf.leaf_id, digits)
-                ),
                 promoted_preflights_by_ordinal={0: preflight},
                 layer1_lock_receipt_sha256="f" * 64,
             )
@@ -673,12 +736,20 @@ class PromotedSurveySchedulerTests(unittest.TestCase):
 
         resumed, calls = self._run(resumable, calculate_only=True)
 
-        second = self.leaves[1]
-        receipt = resumed.checkpoint["promoted_background_ledger"]["1"][
-            second.leaf_id
+        first_leaf, second = self.leaves
+        receipt = resumed.checkpoint["promoted_background_ledger"]["0"][
+            first_leaf.leaf_id
         ]["payload"]["background_receipts"][0]
+        second_binding = resumed.checkpoint["promoted_stage_ledger"]["1"][
+            second.leaf_id
+        ]["calculation_artifact"]["background"]
         self.assertEqual([40], calls)
-        self.assertEqual("REUSED", receipt["status"])
+        self.assertEqual(0, receipt["source_queue_ordinal"])
+        self.assertEqual(first_leaf.leaf_id, receipt["source_leaf_id"])
+        self.assertEqual(
+            receipt["receipt_sha256"],
+            second_binding["background_receipt_sha256"],
+        )
         self.assertEqual(
             4,
             resumed.checkpoint["survey_pass_ledger"]["promoted"][
@@ -710,17 +781,25 @@ class PromotedSurveySchedulerTests(unittest.TestCase):
                 kwargs["root_seal_sha256"],
             )
             full = _batch(backend.leaf, seal, backend.digits)
-            requested = tuple(kwargs["sample_roles"])
+            contract = _requested_contract(kwargs)
             return replace(
                 full,
+                scientific_operation_identity=contract.scientific_operation_identity,
+                request_sha256=_sha256({
+                    "leaf_id": backend.leaf.leaf_id,
+                    "digits": backend.digits,
+                    "plan": contract.plan.value,
+                }),
                 samples=tuple(
-                    sample for sample in full.samples if sample.role in requested
+                    sample
+                    for sample in full.samples
+                    if sample.role in contract.sample_roles
                 ),
             )
 
         class InterruptingBackend(_Backend):
             def fixed_root_survey_batch(self, job, **kwargs):
-                roles = tuple(kwargs["sample_roles"])
+                roles = _requested_contract(kwargs).sample_roles
                 first_roles.append(roles)
                 self.calls.append(self.digits)
                 if roles == tuple(BINARY64_FIXED_ROOT_SAMPLE_ROLES[:5]):
@@ -731,7 +810,7 @@ class PromotedSurveySchedulerTests(unittest.TestCase):
 
         class ResumeBackend(_Backend):
             def fixed_root_survey_batch(self, job, **kwargs):
-                roles = tuple(kwargs["sample_roles"])
+                roles = _requested_contract(kwargs).sample_roles
                 resumed_roles.append(roles)
                 self.calls.append(self.digits)
                 if roles != tuple(BINARY64_FIXED_ROOT_SAMPLE_ROLES[5:]):
@@ -743,7 +822,7 @@ class PromotedSurveySchedulerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "checkpoint.json"
             with self.assertRaises(KeyboardInterrupt):
-                run_promoted_survey(
+                _strict_run(
                     self.plan,
                     self.selection,
                     checkpoint,
@@ -758,9 +837,6 @@ class PromotedSurveySchedulerTests(unittest.TestCase):
                     ),
                     primary_root_runner=lambda *_args: self.fail("unexpected root"),
                     horizon_runner=lambda _leaf: self.fail("unexpected horizon"),
-                    produced_record_builder=lambda leaf, batch, screening, digits: (
-                        _record(leaf.leaf_id, digits)
-                    ),
                     promoted_preflights_by_ordinal={0: preflight},
                     layer1_lock_receipt_sha256="f" * 64,
                 )
@@ -770,13 +846,18 @@ class PromotedSurveySchedulerTests(unittest.TestCase):
             background_receipts = interrupted["promoted_background_ledger"]["0"][
                 leaf_id
             ]["payload"]["background_receipts"]
-            self.assertEqual("ACQUIRED", background_receipts[0]["status"])
+            self.assertEqual(0, background_receipts[0]["source_queue_ordinal"])
+            self.assertEqual(leaf_id, background_receipts[0]["source_leaf_id"])
+            self.assertEqual(
+                list(BINARY64_FIXED_ROOT_SAMPLE_ROLES[:5]),
+                background_receipts[0]["background_worker_batch"]["sample_roles"],
+            )
             self.assertEqual(
                 "PENDING", interrupted["promotion_queue"]["entries"][0]["disposition"]
             )
             self.assertEqual({}, interrupted["promoted_stage_ledger"])
 
-            resumed = run_promoted_survey(
+            resumed = _strict_run(
                 self.plan,
                 self.selection,
                 interrupted,
@@ -791,9 +872,6 @@ class PromotedSurveySchedulerTests(unittest.TestCase):
                 ),
                 primary_root_runner=lambda *_args: self.fail("unexpected root"),
                 horizon_runner=lambda _leaf: self.fail("unexpected horizon"),
-                produced_record_builder=lambda leaf, batch, screening, digits: (
-                    _record(leaf.leaf_id, digits)
-                ),
                 promoted_preflights_by_ordinal={0: preflight},
                 layer1_lock_receipt_sha256="f" * 64,
             )
@@ -840,11 +918,12 @@ class PromotedSurveySchedulerTests(unittest.TestCase):
             ],
         )
 
-    def test_response_queue_stops_unresolved_without_approved_error_model(self):
+    def test_adequate_response_queue_waits_for_independent_admission(self):
         result, calls = self._run(self._checkpoint())
-        self.assertEqual([40, 80], calls)
+        self.assertEqual([40, 40], calls)
         self.assertEqual(0, result.completed_count)
-        self.assertEqual(1, result.unresolved_count)
+        self.assertEqual(0, result.unresolved_count)
+        self.assertEqual(1, result.review_pending_count)
         reuse_receipt = result.checkpoint["promotion_queue"]["entries"][0][
             "provisional_reuse_receipt"
         ]
@@ -856,34 +935,35 @@ class PromotedSurveySchedulerTests(unittest.TestCase):
             reuse_receipt["provisional_stage_sha256"],
         )
         self.assertEqual("BF40", reuse_receipt["target_precision_tier"])
-        self.assertEqual("UNRESOLVED", result.checkpoint[
+        self.assertEqual("CALCULATED_AWAITING_ADMISSION", result.checkpoint[
             "survey_pass_ledger"
         ]["promoted"][self.leaves[0].leaf_id]["disposition"])
-        self.assertEqual("UNRESOLVED", result.checkpoint[
+        self.assertEqual("AWAITING_ADMISSION", result.checkpoint[
             "promotion_queue"
         ]["entries"][0]["disposition"])
         ledger = result.checkpoint["survey_pass_ledger"]["promoted"][
             self.leaves[0].leaf_id
         ]
         self.assertEqual(0, ledger["root_read_limit"])
-        self.assertEqual(2, ledger["worker_launch_limit"])
-        self.assertEqual(["BF40", "BF80"], [
+        self.assertEqual(2, ledger["worker_launch_count"])
+        self.assertEqual(4, ledger["worker_launch_limit"])
+        self.assertEqual(["BF40"], [
             item["tier"] for item in ledger["tier_timing"]
         ])
         self.assertTrue(all(
             item["source"] == "direct" for item in ledger["tier_timing"]
         ))
         self.assertEqual(
-            ["STARTED", "COMPLETED", "STARTED", "COMPLETED"],
+            ["STARTED", "COMPLETED"],
             [fragment["state"] for fragment in ledger["session_fragments"]],
         )
 
-    def test_unresolved_disposition_is_committed_before_return(self):
+    def test_awaiting_admission_disposition_is_committed_before_return(self):
         checkpoint = self._checkpoint()
         calls: list[int] = []
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "checkpoint.json"
-            result = run_promoted_survey(
+            result = _strict_run(
                 self.plan,
                 self.selection,
                 checkpoint,
@@ -904,39 +984,40 @@ class PromotedSurveySchedulerTests(unittest.TestCase):
                 ),
                 primary_root_runner=lambda *args: self.fail("unexpected root"),
                 horizon_runner=lambda leaf: self.fail("unexpected horizon"),
-                produced_record_builder=lambda leaf, batch, screening, digits: (
-                    _record(leaf.leaf_id, digits)
-                ),
             )
 
             durable = json.loads(path.read_text(encoding="utf-8"))
 
         self.assertEqual(result.checkpoint, durable)
         self.assertEqual(
-            "UNRESOLVED",
+            "CALCULATED_AWAITING_ADMISSION",
             durable["survey_pass_ledger"]["promoted"][
                 self.leaves[0].leaf_id
             ]["disposition"],
         )
 
-    def test_response_queue_escalates_once_to_bf80_then_stops(self):
+    def test_response_queue_escalates_once_to_bf80_then_awaits_admission(self):
         result, calls = self._run(
             self._checkpoint(), flat40=True, flat80=False
         )
-        self.assertEqual([40, 80], calls)
+        self.assertEqual([40, 40, 80, 80], calls)
         self.assertEqual(0, result.completed_count)
-        self.assertEqual(1, result.unresolved_count)
+        self.assertEqual(0, result.unresolved_count)
+        self.assertEqual(1, result.review_pending_count)
         tiers = result.checkpoint["survey_pass_ledger"]["promoted"][
             self.leaves[0].leaf_id
         ]["precision_tiers"]
         self.assertEqual(["BF40", "BF80"], tiers)
+        self.assertEqual("AWAITING_ADMISSION", result.checkpoint[
+            "promotion_queue"
+        ]["entries"][0]["disposition"])
         self.assertNotIn("BF120", str(result.checkpoint))
 
     def test_bf80_exhaustion_is_unresolved_not_another_promotion(self):
         result, calls = self._run(
             self._checkpoint(), flat40=True, flat80=True
         )
-        self.assertEqual([40, 80], calls)
+        self.assertEqual([40, 40, 80, 80], calls)
         self.assertEqual(1, result.unresolved_count)
         self.assertEqual([], result.checkpoint["records"])
         self.assertEqual("UNRESOLVED", result.checkpoint[
@@ -948,9 +1029,13 @@ class PromotedSurveySchedulerTests(unittest.TestCase):
             self._checkpoint(),
             failure40="INSUFFICIENT_ASYMPTOTIC_PRECISION",
         )
-        self.assertEqual([40, 80], calls)
+        self.assertEqual([40, 80, 80], calls)
         self.assertEqual(0, result.completed_count)
-        self.assertEqual(1, result.unresolved_count)
+        self.assertEqual(0, result.unresolved_count)
+        self.assertEqual(1, result.review_pending_count)
+        self.assertEqual("AWAITING_ADMISSION", result.checkpoint[
+            "promotion_queue"
+        ]["entries"][0]["disposition"])
         self.assertNotIn("BF120", str(result.checkpoint))
 
     def test_root_queue_allows_one_primary_then_one_fixed_root_batch(self):
@@ -970,13 +1055,13 @@ class PromotedSurveySchedulerTests(unittest.TestCase):
             root_runner=root_runner,
         )
         self.assertEqual([40], root_calls)
-        self.assertEqual([40, 80], batch_calls)
+        self.assertEqual([40, 40], batch_calls)
         entry = result.checkpoint["survey_pass_ledger"]["promoted"][
             self.leaves[0].leaf_id
         ]
         self.assertEqual(1, entry["root_read_count"])
         self.assertEqual(3, entry["worker_launch_count"])
-        self.assertEqual("UNRESOLVED", entry["disposition"])
+        self.assertEqual("CALCULATED_AWAITING_ADMISSION", entry["disposition"])
 
     def test_exact_root_queue_group_uses_one_primary_root_solve(self):
         """One exact background root is shared by every dependent leaf."""
@@ -998,7 +1083,7 @@ class PromotedSurveySchedulerTests(unittest.TestCase):
         )
 
         self.assertEqual([40], root_calls)
-        self.assertEqual([40, 80, 40, 80], batch_calls)
+        self.assertEqual([40, 40, 40], batch_calls)
         first, second = (
             result.checkpoint["survey_pass_ledger"]["promoted"][leaf.leaf_id]
             for leaf in self.leaves
@@ -1006,7 +1091,7 @@ class PromotedSurveySchedulerTests(unittest.TestCase):
         self.assertEqual(1, first["root_read_count"])
         self.assertEqual(0, second["root_read_count"])
         self.assertEqual(3, first["worker_launch_count"])
-        self.assertEqual(2, second["worker_launch_count"])
+        self.assertEqual(1, second["worker_launch_count"])
 
     def test_exact_root_queue_group_records_compact_structural_summary(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -1103,7 +1188,7 @@ class PromotedSurveySchedulerTests(unittest.TestCase):
                 return super().fixed_root_survey_batch(job, **kwargs)
 
         with tempfile.TemporaryDirectory() as temporary:
-            result = run_promoted_survey(
+            result = _strict_run(
                 self.plan,
                 selection,
                 checkpoint,
@@ -1120,9 +1205,6 @@ class PromotedSurveySchedulerTests(unittest.TestCase):
                 ),
                 primary_root_runner=root_runner,
                 horizon_runner=lambda _leaf: self.fail("unexpected horizon"),
-                produced_record_builder=lambda leaf, batch, screening, digits: (
-                    _record(leaf.leaf_id, digits)
-                ),
             )
 
         self.assertEqual(
@@ -1131,9 +1213,9 @@ class PromotedSurveySchedulerTests(unittest.TestCase):
         self.assertEqual(
             [
                 (first.leaf_id, 40),
-                (first.leaf_id, 80),
+                (first.leaf_id, 40),
                 (incompatible.leaf_id, 40),
-                (incompatible.leaf_id, 80),
+                (incompatible.leaf_id, 40),
             ],
             batch_calls,
         )
@@ -1202,7 +1284,7 @@ class PromotedSurveySchedulerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "checkpoint.json"
             with self.assertRaises(CampaignSystemFailure):
-                run_promoted_survey(
+                _strict_run(
                     self.plan,
                     self.selection,
                     checkpoint,
@@ -1221,9 +1303,6 @@ class PromotedSurveySchedulerTests(unittest.TestCase):
                     backend_factory=broken_factory,
                     primary_root_runner=lambda *args: self.fail("unexpected root"),
                     horizon_runner=lambda leaf: self.fail("unexpected horizon"),
-                    produced_record_builder=lambda *args: self.fail(
-                        "unexpected record"
-                    ),
                 )
             self.assertEqual([self.leaves[0].leaf_id], started)
             self.assertTrue(path.is_file())

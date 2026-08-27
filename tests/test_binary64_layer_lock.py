@@ -693,6 +693,10 @@ class Binary64LayerLockTests(unittest.TestCase):
             "checkpoint.json",
             "--binary64-lock",
             "checkpoint.json.binary64-lock.json",
+            "--calibration-receipt-path",
+            "calibration.json",
+            "--calibration-receipt-sha256",
+            "a" * 64,
         ])
         validation = parser.parse_args([
             "campaign-schema11-validate",

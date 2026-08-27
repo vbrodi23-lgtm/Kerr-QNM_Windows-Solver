@@ -5578,6 +5578,38 @@ def _primary_precision120_decision(
     )
 
 
+def promoted_stage_precision_policy(
+    outcome: StageOutcome,
+    *,
+    predecessor: StageOutcome | None = None,
+) -> dict[str, object]:
+    """Expose the existing promoted-stage policy without executing a backend.
+
+    This is a read-only adapter over the policy that already owns the explicit
+    BF120 gate.  Checkpoint reducers use it to preserve that gate without
+    inventing a second precision policy.
+    """
+
+    if not isinstance(outcome, StageOutcome):
+        raise ValueError("promoted precision policy outcome is invalid")
+    semantics = _promoted_stage_semantics(outcome, predecessor=predecessor)
+    decision = _primary_precision120_decision(
+        outcome, predecessor=predecessor
+    )
+    content = {
+        "schema": "windows-solver.promoted-stage-precision-policy/1",
+        "precision120_decision": decision,
+        "terminal_admissible": semantics.terminal_admissible,
+        "root_requires_precision120": semantics.root_requires_precision120,
+        "response_requires_precision120": semantics.response_requires_precision120,
+        "response_repair_precision_digits": (
+            semantics.response_repair_precision_digits
+        ),
+        "response_repair_families": sorted(semantics.response_repair_families),
+    }
+    return {**content, "policy_sha256": _sha256(content)}
+
+
 def _deep_precision120_decision(
     outcome: StageOutcome,
     *,
