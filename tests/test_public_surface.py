@@ -625,6 +625,7 @@ class PublicSurfaceTests(unittest.TestCase):
             package_root = Path(temporary) / "m02-bootstrap-binding"
             (package_root / "examples").mkdir(parents=True)
             (package_root / "runtime").mkdir()
+            (package_root / "src" / "windows_solver" / "data").mkdir(parents=True)
             shutil.copy2(root / "m02.ps1", package_root / "m02.ps1")
             shutil.copy2(
                 root / "runtime" / "resolve-runtime-root.ps1",
@@ -633,6 +634,18 @@ class PublicSurfaceTests(unittest.TestCase):
             shutil.copy2(
                 root / "examples" / "m02-campaign.json",
                 package_root / "examples" / "m02-campaign.json",
+            )
+            shutil.copy2(
+                root
+                / "src"
+                / "windows_solver"
+                / "data"
+                / "promoted_control_empirical_calibration_v1.json",
+                package_root
+                / "src"
+                / "windows_solver"
+                / "data"
+                / "promoted_control_empirical_calibration_v1.json",
             )
             bootstrap_log = package_root / "bootstrap-bindings.jsonl"
             argument_log = package_root / "arguments.jsonl"
@@ -873,6 +886,9 @@ $record = [ordered]@{ default = $default; portable = $portable } | ConvertTo-Jso
                 / "promoted_control_empirical_calibration_v1.json",
                 calibration_path,
             )
+            calibration_sha256 = hashlib.sha256(
+                calibration_path.read_bytes()
+            ).hexdigest()
             argument_log = package_root / "arguments.jsonl"
             (package_root / "solver.ps1").write_text(
                 r'''param(
@@ -989,7 +1005,6 @@ exit 0
         checkpoint = str(checkpoint_path)
         binary64_lock = str(binary64_lock_path)
         calibration = str(calibration_path)
-        calibration_sha256 = hashlib.sha256(calibration_path.read_bytes()).hexdigest()
         self.assertEqual(
             calls,
             [
@@ -1097,6 +1112,9 @@ exit 0
                 / "promoted_control_empirical_calibration_v1.json",
                 calibration_path,
             )
+            calibration_sha256 = hashlib.sha256(
+                calibration_path.read_bytes()
+            ).hexdigest()
             argument_log = package_root / "arguments.jsonl"
             (package_root / "solver.ps1").write_text(
                 r'''param(
@@ -1224,7 +1242,6 @@ exit 0
         checkpoint = str(checkpoint_path)
         binary64_lock = str(binary64_lock_path)
         calibration = str(calibration_path)
-        calibration_sha256 = hashlib.sha256(calibration_path.read_bytes()).hexdigest()
         self.assertEqual(
             calls,
             [
