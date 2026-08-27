@@ -559,7 +559,7 @@ class PublicSurfaceTests(unittest.TestCase):
         self.assertIn("[switch]$RebuildRuntime", launcher)
         self.assertIn("[switch]$NewCampaign", launcher)
         self.assertIn(
-            '[ValidateSet("survey", "certify", "validate", "resolve-system-failure")]',
+            '[ValidateSet("survey", "admit", "certify", "validate", "resolve-system-failure")]',
             launcher,
         )
         self.assertIn(

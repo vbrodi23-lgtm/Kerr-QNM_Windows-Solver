@@ -32,7 +32,15 @@ from windows_solver.promoted_control_calibration import (
     load_default_calibration_receipt,
 )
 from windows_solver.promoted_admission import admit_retained_promoted_checkpoint
-from windows_solver.julia_response_backend import ExteriorDeterminantErrorEvidence
+from windows_solver.julia_response_backend import (
+    ExteriorDeterminantErrorEvidence,
+    FixedRootSurveyPlan,
+    fixed_root_survey_request_contract,
+)
+from windows_solver.promoted_artifacts import (
+    PromotedBackgroundBinding,
+    PromotedExteriorCalculationResult,
+)
 from windows_solver.response_batches import (
     PrecisionCapabilities,
     build_campaign_plan,
@@ -395,7 +403,9 @@ class PromotedAdmissionTests(unittest.TestCase):
                     terminal_record_committed=publish_if_missing,
                 )
 
-        self.assertEqual(2, attempts)
+        # First admission write is interrupted; retry then writes the durable
+        # admission and the publication-completion checkpoint separately.
+        self.assertEqual(3, attempts)
         self.assertEqual([record], published)
         self.assertEqual(
             "COMPLETED",
@@ -447,9 +457,9 @@ class PromotedAdmissionTests(unittest.TestCase):
                 Decimal(calibration.certificate_safety_factor) * Decimal("1e-12")
             ),
         }
-        batch = _batch(leaf, seal, 40)
-        batch = replace(
-            batch,
+        full_batch = _batch(leaf, seal, 40)
+        full_batch = replace(
+            full_batch,
             samples=tuple(
                 replace(
                     sample,
@@ -457,22 +467,65 @@ class PromotedAdmissionTests(unittest.TestCase):
                         raw_error
                     ),
                 )
-                for sample in batch.samples
+                for sample in full_batch.samples
+            ),
+        )
+        background_contract = fixed_root_survey_request_contract(
+            FixedRootSurveyPlan.CANONICAL_BACKGROUND_FIVE
+        )
+        component_contract = fixed_root_survey_request_contract(
+            FixedRootSurveyPlan.MECHANISM_COMPONENT_FOUR
+        )
+        background_batch = replace(
+            full_batch,
+            scientific_operation_identity=(
+                background_contract.scientific_operation_identity
+            ),
+            request_sha256="1" * 64,
+            samples=tuple(
+                sample
+                for sample in full_batch.samples
+                if sample.role in background_contract.sample_roles
+            ),
+        )
+        component_batch = replace(
+            full_batch,
+            scientific_operation_identity=(
+                component_contract.scientific_operation_identity
+            ),
+            request_sha256="2" * 64,
+            samples=tuple(
+                sample
+                for sample in full_batch.samples
+                if sample.role in component_contract.sample_roles
             ),
         )
         cache_key, reuse_key = _promoted_background_key(leaf, seal, 40)
         background_receipt = _promoted_background_receipt(
-            batch=batch,
+            batch=background_batch,
             cache_key_sha256=cache_key,
             reuse_key=reuse_key,
             source_queue_ordinal=0,
             source_leaf_id=leaf.leaf_id,
         )
+        calculation = PromotedExteriorCalculationResult(
+            component_batch=component_batch,
+            background=PromotedBackgroundBinding(
+                background_receipt_sha256=str(
+                    background_receipt["receipt_sha256"]
+                ),
+                background_worker_request_sha256=(
+                    background_batch.request_sha256
+                ),
+                background_sha256=str(background_receipt["background_sha256"]),
+                background_reuse_key_sha256=cache_key,
+            ),
+        )
         retained_stage = {
             "route": "EXTERIOR_BF40",
             "source_root_seal_sha256": seal.root_seal_sha256,
             "precision_tiers": ["BF40"],
-            "raw_promoted_batches": [batch.to_mapping()],
+            "calculation_artifact": calculation.to_mapping(),
         }
         checkpoint = {
             "promoted_background_ledger": {

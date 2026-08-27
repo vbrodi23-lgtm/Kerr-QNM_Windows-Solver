@@ -9,6 +9,7 @@ from dataclasses import replace
 from pathlib import Path
 import tempfile
 from types import SimpleNamespace
+from typing import Mapping
 import unittest
 from unittest.mock import patch
 
@@ -1149,7 +1150,7 @@ class HorizonRecordConstructionTests(unittest.TestCase):
             raise AssertionError("BF80 runner must not start")
 
         with tempfile.TemporaryDirectory() as temporary:
-            with self.assertRaises(CampaignSystemFailure):
+            with self.assertRaisesRegex(ValueError, "locked route"):
                 _strict_run(
                     plan,
                     selection,
@@ -1430,20 +1431,29 @@ class HorizonRecordConstructionTests(unittest.TestCase):
                 queue_entry={
                     "source_record_sha256": record["record_sha256"],
                     "source_stage_sha256": stage_sha256,
+                    "source_fingerprint_sha256": "d" * 64,
                     "source_binary64_disposition_receipt_sha256": "c" * 64,
                 },
                 source_record=record,
                 trigger_receipts=(trigger_receipt,),
+                layer1_lock_receipt_sha256="f" * 64,
             )
 
         self.assertIsNone(outcome.record)
         self.assertEqual(record["record_sha256"], outcome.source_record_sha256)
-        self.assertEqual("UNRESOLVED", outcome.disposition.value)
-        self.assertEqual(1, len(outcome.evidence_receipts))
         self.assertEqual(
-            record["record_sha256"],
-            outcome.evidence_receipts[0]["source_record_sha256"],
+            "CALCULATED_AWAITING_ADMISSION", outcome.disposition.value
         )
+        self.assertEqual((), outcome.evidence_receipts)
+        self.assertIsNotNone(outcome.calculation_artifact)
+        artifact = outcome.calculation_artifact
+        assert isinstance(artifact, Mapping)
+        self.assertEqual(
+            stage_sha256,
+            artifact["predecessor_stage_sha256"],
+        )
+        self.assertEqual("d" * 64, artifact["source_fingerprint_sha256"])
+        self.assertEqual("f" * 64, artifact["layer1_lock_receipt_sha256"])
 
 
 if __name__ == "__main__":

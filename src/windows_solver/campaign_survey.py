@@ -120,6 +120,7 @@ from .promoted_artifacts import (
 )
 from .response_batches import (
     StageOutcome,
+    _ANALYTIC_HORIZON_EVIDENCE_KIND,
     _component_stage_signed_error_channels,
     promoted_stage_precision_policy,
     synthetic_stage_signed_error_channels,
@@ -2529,6 +2530,10 @@ def reduce_promoted_horizon_from_checkpoint(
     )
     reduced_component = {
         **raw_component,
+        # The retained worker artifact keeps the campaign-wire evidence kind.
+        # Policy reduction consumes the canonical analytic-component identity;
+        # this derived view does not rewrite the authenticated raw artifact.
+        "evidence_kind": _ANALYTIC_HORIZON_EVIDENCE_KIND,
         "precision_ladder_discrepancy_applicable": comparison_applicable,
         "precision_ladder_discrepancy_reason": (
             None

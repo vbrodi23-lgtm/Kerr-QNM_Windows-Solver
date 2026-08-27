@@ -66,14 +66,17 @@ def _sha256(value: object) -> str:
     return hashlib.sha256(canonical_json_bytes(value)).hexdigest()
 
 
-def _requested_roles(kwargs) -> tuple[str, ...]:
-    """Resolve fake-worker samples through the production request contract."""
+def _requested_contract(kwargs):
+    """Resolve fake-worker identity and roles through the production contract."""
 
-    return fixed_root_survey_request_contract(kwargs["plan"]).sample_roles
+    return fixed_root_survey_request_contract(kwargs["plan"])
 
 
 class _TestLayer1Guard:
     """Minimal guard seam for scheduler unit tests; routes remain explicit."""
+
+    def assert_unchanged(self, checkpoint):
+        return checkpoint
 
     def pre_write(self, checkpoint):
         return checkpoint
@@ -298,11 +301,14 @@ class _Backend:
             kwargs["root_seal_sha256"],
         )
         batch = _batch(self.leaf, seal, self.digits, flat=self.flat)
-        requested = _requested_roles(kwargs)
+        contract = _requested_contract(kwargs)
         return replace(
             batch,
+            scientific_operation_identity=contract.scientific_operation_identity,
             samples=tuple(
-                sample for sample in batch.samples if sample.role in requested
+                sample
+                for sample in batch.samples
+                if sample.role in contract.sample_roles
             ),
         )
 
@@ -749,17 +755,20 @@ class PromotedSurveySchedulerTests(unittest.TestCase):
                 kwargs["root_seal_sha256"],
             )
             full = _batch(backend.leaf, seal, backend.digits)
-            requested = _requested_roles(kwargs)
+            contract = _requested_contract(kwargs)
             return replace(
                 full,
+                scientific_operation_identity=contract.scientific_operation_identity,
                 samples=tuple(
-                    sample for sample in full.samples if sample.role in requested
+                    sample
+                    for sample in full.samples
+                    if sample.role in contract.sample_roles
                 ),
             )
 
         class InterruptingBackend(_Backend):
             def fixed_root_survey_batch(self, job, **kwargs):
-                roles = _requested_roles(kwargs)
+                roles = _requested_contract(kwargs).sample_roles
                 first_roles.append(roles)
                 self.calls.append(self.digits)
                 if roles == tuple(BINARY64_FIXED_ROOT_SAMPLE_ROLES[:5]):
@@ -770,7 +779,7 @@ class PromotedSurveySchedulerTests(unittest.TestCase):
 
         class ResumeBackend(_Backend):
             def fixed_root_survey_batch(self, job, **kwargs):
-                roles = _requested_roles(kwargs)
+                roles = _requested_contract(kwargs).sample_roles
                 resumed_roles.append(roles)
                 self.calls.append(self.digits)
                 if roles != tuple(BINARY64_FIXED_ROOT_SAMPLE_ROLES[5:]):
