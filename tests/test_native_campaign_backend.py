@@ -17,6 +17,12 @@ from windows_solver.julia_response_backend import (
     JuliaNumericalControlError,
     JuliaPrecisionRootBackend,
 )
+from windows_solver.operation_control import (
+    JULIA_WORKER_ORIGIN,
+    build_operation_control_receipt,
+    execution_identity_from_request,
+    validate_operation_control_receipt,
+)
 from windows_solver.response_batches import (
     B_PRIME_RELEASE_DOMAIN,
     CampaignExecutionAttempt,
@@ -24,6 +30,7 @@ from windows_solver.response_batches import (
     PrecisionCapabilities,
     build_campaign_selection,
     build_campaign_plan,
+    _execution_attempt_from_failure,
     run_campaign_selection,
     synthetic_stage_signed_error_channels,
     validate_campaign_checkpoint,
@@ -308,6 +315,65 @@ class NativeCampaignBackendTests(unittest.TestCase):
             "execution_resource_policy"
         ]
         self.assertEqual(restored_policy, legacy_policy)
+
+    def test_operation_control_attempt_round_trips_exact_receipt_and_request(self):
+        legacy = _failed_preflight_attempt(self.leaf)
+        legacy_failure = legacy.failure_receipt["failure"]
+        request = legacy_failure["request_binding"]
+        request_sha256 = hashlib.sha256(
+            canonical_json_bytes(request)
+        ).hexdigest()
+        identity = execution_identity_from_request(
+            request,
+            request_sha256=request_sha256,
+        )
+        control_mapping = build_operation_control_receipt(
+            origin=JULIA_WORKER_ORIGIN,
+            failure_code="INSUFFICIENT_ASYMPTOTIC_PRECISION",
+            stage="asymptotic-preflight",
+            identity=identity,
+            retryable=True,
+            retryable_basis="worker-declared bounded control continuation/v1",
+            diagnostics=legacy_failure["diagnostics"],
+        )
+        control = validate_operation_control_receipt(
+            control_mapping,
+            request=request,
+            request_sha256=request_sha256,
+        )
+        error = JuliaNumericalControlError(
+            "synthetic operation-control failure",
+            "INSUFFICIENT_ASYMPTOTIC_PRECISION",
+            control_receipt=control,
+        )
+        error.worker_failure = {
+            "worker_exit_code": 21,
+            "worker_timed_out": False,
+            "worker_stderr_tail": "synthetic",
+            "worker_error_type": "AsymptoticPrecisionError",
+            "worker_error_message": "preflight rejected 80 digits",
+            "failure": control.to_mapping(),
+        }
+
+        attempt = _execution_attempt_from_failure(
+            error,
+            leaf=self.leaf,
+            context={"leaf_index": 1},
+            digits=80,
+            attempt_ordinal=1,
+        )
+
+        self.assertIsNotNone(attempt)
+        receipt = attempt.failure_receipt
+        self.assertEqual(
+            receipt["schema"],
+            "windows-solver.campaign-operation-control-attempt/1",
+        )
+        self.assertEqual(receipt["control_receipt"], control.to_mapping())
+        self.assertNotIn("promotion_decision", receipt["control_receipt"])
+        self.assertEqual(receipt["canonical_request"], request)
+        restored = CampaignExecutionAttempt.from_mapping(attempt.to_mapping())
+        self.assertEqual(restored, attempt)
 
     def test_deep_binary64_stage_derives_trigger_diagnostics(self):
         result = _result(self.leaf.job, 1.0 + 0.5j)
