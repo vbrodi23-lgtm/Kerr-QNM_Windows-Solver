@@ -8,6 +8,10 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Mapping
 
+from tests.fixtures import (
+    valid_julia_root_response,
+    valid_numerical_conditioning,
+)
 from windows_solver.julia_response_backend import (
     FIXED_ROOT_SURVEY_BATCH_RESPONSE_SCHEMA,
     FixedRootSurveyPlan,
@@ -19,7 +23,11 @@ from windows_solver.julia_response_backend import (
     _raise_worker_failure,
     _worker_request_document,
 )
-from windows_solver.operation_control import ValidatedControlReceipt
+from windows_solver.operation_control import (
+    FIXED_ROOT_DETERMINANT_SAMPLE_OPERATION,
+    ROOT_READOUT_OPERATION,
+    ValidatedControlReceipt,
+)
 from windows_solver.promoted_control_calibration import (
     load_default_calibration_receipt,
 )
@@ -33,8 +41,8 @@ from windows_solver.response_engine import (
 )
 
 
-CASE_BATCH_SCHEMA = "windows-solver.pr75-fixed-root-case-batch/1"
-RESULT_BATCH_SCHEMA = "windows-solver.pr75-fixed-root-result-batch/1"
+CASE_BATCH_SCHEMA = "windows-solver.pr75-fixed-root-case-batch/2"
+RESULT_BATCH_SCHEMA = "windows-solver.pr75-fixed-root-result-batch/2"
 ROOT_SEAL_SHA256 = "1" * 64
 RUNTIME_PROVENANCE = {
     "julia_version": "1.10.11-pr75-no-solver",
@@ -108,7 +116,80 @@ def build_case_batch() -> dict[str, object]:
                 })
     if len(cases) != 42:
         raise AssertionError("PR75 case matrix must contain 6 success and 36 failure cases")
-    return {"schema": CASE_BATCH_SCHEMA, "cases": cases}
+
+    compatibility_backend = _backend(preview_adapter, 80)
+    root_request = compatibility_backend.preview_root_request(job, 0.0j)
+    root_binding, root_wire, _ = _worker_request_document(root_request)
+    root_success = valid_julia_root_response(root_wire)
+    for field in (
+        "schema_version",
+        "status",
+        "adapter",
+        "operation",
+        "request_sha256",
+        "execution_identity",
+    ):
+        root_success.pop(field)
+
+    readout_role = "coordinate-real-plus-h"
+    amplitude = 0.003 + 0.0j
+    fixed_request = compatibility_backend.preview_fixed_root_request(
+        job, job.root.omega, amplitude, readout_role
+    )
+    fixed_binding, fixed_wire, _ = _worker_request_document(fixed_request)
+    fixed_policy = fixed_wire["policy"]
+    fixed_success = {
+        "omega_re": fixed_wire["fixed_omega"]["real"],
+        "omega_im": fixed_wire["fixed_omega"]["imaginary"],
+        "amplitude_re": fixed_wire["amplitude"]["real"],
+        "amplitude_im": fixed_wire["amplitude"]["imaginary"],
+        "determinant_re": "0.006000000001",
+        "determinant_im": "0.009",
+        "determinant_error_abs": "4e-12",
+        "determinant_error_status": "available/v1",
+        "determinant_error_model_id": fixed_policy["determinant_error_model"],
+        "determinant_family": fixed_policy["determinant_family"],
+        "determinant_normalisation": fixed_policy["determinant_normalisation"],
+        "branch_identity": fixed_policy["branch_convention"],
+        "branch_authenticated": True,
+        "semantic_precision_tier": fixed_wire["semantic_precision_tier"],
+        "working_precision_bits": fixed_wire["working_precision_bits"],
+        "readout_role": readout_role,
+        "numerical_conditioning": valid_numerical_conditioning(
+            job.mechanism_id
+        ),
+    }
+    compatibility_cases = []
+    for operation, binding, wire, success_fields in (
+        (ROOT_READOUT_OPERATION, root_binding, root_wire, root_success),
+        (
+            FIXED_ROOT_DETERMINANT_SAMPLE_OPERATION,
+            fixed_binding,
+            fixed_wire,
+            fixed_success,
+        ),
+    ):
+        compatibility_cases.extend((
+            {
+                "case_id": f"compatibility:{operation}:success",
+                "outcome": "success",
+                "request_binding": binding,
+                "request": wire,
+                "success_fields": success_fields,
+            },
+            {
+                "case_id": f"compatibility:{operation}:control",
+                "outcome": "control",
+                "request_binding": binding,
+                "request": wire,
+                "success_fields": None,
+            },
+        ))
+    return {
+        "schema": CASE_BATCH_SCHEMA,
+        "cases": cases,
+        "compatibility_cases": compatibility_cases,
+    }
 
 
 class CapturedJuliaAdapter:
@@ -163,19 +244,29 @@ class CapturedJuliaAdapter:
 
 def parsed_case_batch(path: Path) -> dict[str, object]:
     value = json.loads(path.read_bytes())
-    if not isinstance(value, dict) or set(value) != {"schema", "cases"}:
+    if not isinstance(value, dict) or set(value) != {
+        "schema", "cases", "compatibility_cases"
+    }:
         raise ValueError("PR75 case batch fields are invalid")
-    if value["schema"] != CASE_BATCH_SCHEMA or not isinstance(value["cases"], list):
+    if (
+        value["schema"] != CASE_BATCH_SCHEMA
+        or not isinstance(value["cases"], list)
+        or not isinstance(value["compatibility_cases"], list)
+    ):
         raise ValueError("PR75 case batch schema is invalid")
     return value
 
 
 def parsed_result_batch(path: Path) -> dict[str, object]:
     value = json.loads(path.read_bytes())
-    if not isinstance(value, dict) or set(value) != {"schema", "results"}:
+    if not isinstance(value, dict) or set(value) != {
+        "schema", "results", "compatibility_results"
+    }:
         raise ValueError("PR75 result batch fields are invalid")
-    if value["schema"] != RESULT_BATCH_SCHEMA or not isinstance(
-        value["results"], list
+    if (
+        value["schema"] != RESULT_BATCH_SCHEMA
+        or not isinstance(value["results"], list)
+        or not isinstance(value["compatibility_results"], list)
     ):
         raise ValueError("PR75 result batch schema is invalid")
     return value
@@ -254,7 +345,82 @@ def verify_case_matrix(
             raise AssertionError("PR75 failure case returned success")
     if (success_count, failure_count) != (6, 36):
         raise AssertionError("PR75 matrix cardinality is invalid")
-    return {"success_count": success_count, "failure_count": failure_count}
+    compatibility = verify_compatibility_cases(
+        case_batch["compatibility_cases"],
+        result_batch["compatibility_results"],
+    )
+    return {
+        "success_count": success_count,
+        "failure_count": failure_count,
+        **compatibility,
+    }
+
+
+def verify_compatibility_cases(
+    cases: object, results: object
+) -> dict[str, int]:
+    if not isinstance(cases, list) or not isinstance(results, list):
+        raise ValueError("PR75 compatibility collections are invalid")
+    if len(cases) != 4 or len(results) != 4:
+        raise ValueError("PR75 compatibility matrix cardinality is invalid")
+    by_id = {
+        result["case_id"]: result
+        for result in results
+        if isinstance(result, Mapping) and isinstance(result.get("case_id"), str)
+    }
+    if len(by_id) != 4 or set(by_id) != {case["case_id"] for case in cases}:
+        raise ValueError("PR75 compatibility results are incomplete")
+
+    job = _job()
+    success_count = control_count = 0
+    for case in cases:
+        result = by_id[case["case_id"]]
+        if result.get("determinant_kernel_calls") != 0:
+            raise AssertionError("compatibility case reached determinant work")
+        response = result.get("response")
+        if not isinstance(response, Mapping):
+            raise ValueError("PR75 compatibility response is invalid")
+        operation = case["request"]["operation"]
+        backend = _backend(CapturedJuliaAdapter(case, response), 80)
+        try:
+            if operation == ROOT_READOUT_OPERATION:
+                outcome = backend.read_root(job, 0.0j)
+            elif operation == FIXED_ROOT_DETERMINANT_SAMPLE_OPERATION:
+                outcome = backend.sample_fixed_root_determinant(
+                    job,
+                    job.root.omega,
+                    0.003 + 0.0j,
+                    readout_role="coordinate-real-plus-h",
+                )
+            else:
+                raise AssertionError("unknown compatibility operation")
+        except JuliaNumericalControlError as error:
+            if case["outcome"] != "control":
+                raise
+            receipt = error.control_receipt
+            if not isinstance(receipt, ValidatedControlReceipt):
+                raise AssertionError("compatibility control lacks validated receipt")
+            identity = receipt.identity.mapping
+            if identity["operation"] != operation or identity["scope"] != "REQUEST":
+                raise AssertionError("compatibility control identity is invalid")
+            if operation == FIXED_ROOT_DETERMINANT_SAMPLE_OPERATION and (
+                identity["fixed_omega"] != case["request"]["fixed_omega"]
+                or identity["branch_identity"]
+                != case["request"]["policy"]["branch_convention"]
+                or identity["readout_role"] != case["request"]["readout_role"]
+            ):
+                raise AssertionError("fixed-sample compatibility identity is invalid")
+            control_count += 1
+        else:
+            if case["outcome"] != "success" or outcome is None:
+                raise AssertionError("compatibility success returned invalid outcome")
+            success_count += 1
+    if (success_count, control_count) != (2, 2):
+        raise AssertionError("PR75 compatibility matrix result is invalid")
+    return {
+        "compatibility_success_count": success_count,
+        "compatibility_control_count": control_count,
+    }
 
 
 def main() -> None:

@@ -176,7 +176,12 @@ class PR75FixedRootLifecycleTests(unittest.TestCase):
         )
         self.assertEqual(
             verify_case_matrix(case_batch, result_batch),
-            {"success_count": 6, "failure_count": 36},
+            {
+                "success_count": 6,
+                "failure_count": 36,
+                "compatibility_success_count": 2,
+                "compatibility_control_count": 2,
+            },
         )
         cases = {item["case_id"]: item for item in case_batch["cases"]}
         results = {item["case_id"]: item for item in result_batch["results"]}

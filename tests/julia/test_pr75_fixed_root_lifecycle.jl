@@ -142,22 +142,87 @@ function evaluate_case(case)
     )
 end
 
+function compatibility_control_details()
+    return Dict{String,Any}(
+        "failure_code" => "INSUFFICIENT_ASYMPTOTIC_PRECISION",
+        "stage" => "asymptotic-preflight",
+        "retryable" => true,
+        "diagnostics" => Dict{String,Any}(
+            "reason" => "INSUFFICIENT_ASYMPTOTIC_PRECISION",
+            "precision_bits" => 298,
+            "factored_homogeneous_rhs_evaluations" => 0,
+            "avoided_ode_scope" => "factored-homogeneous-gsn/v1",
+            "predicted_reliable_digits" => "10",
+            "required_reliable_digits" => "20",
+            "asymptotic_preflight_avoided_ode" => true,
+            "asymptotic_preflight_reason" =>
+                "INSUFFICIENT_ASYMPTOTIC_PRECISION",
+            "maximum_series_digits_lost" => "30",
+            "maximum_recurrence_digits_lost" => "5",
+        ),
+    )
+end
+
+function evaluate_compatibility_case(case)
+    document = required(case, "request")
+    request = flatten_request(document)
+    operation, _, _ = validate_worker_request_contract(request)
+    outcome = string(required(case, "outcome"))
+    DETERMINANT_INDEX_REQUEST[] = 0
+    response = if outcome == "success"
+        fields = required(case, "success_fields")
+        if operation == "root-readout"
+            root_readout_response_fields(request, fields)
+        elseif operation == "fixed-root-determinant-sample"
+            fixed_root_determinant_sample_response_fields(request, fields)
+        else
+            error("PR75 compatibility operation is invalid")
+        end
+    elseif outcome == "control"
+        Dict{String,Any}(
+            "schema_version" => 1,
+            "status" => "error",
+            "error_type" => "DeterministicOperationControl",
+            "message" => "deterministic PR75 compatibility control",
+            "failure" => operation_control_receipt(
+                request, compatibility_control_details()
+            ),
+        )
+    else
+        error("PR75 compatibility outcome is invalid")
+    end
+    DETERMINANT_INDEX_REQUEST[] == 0 ||
+        error("PR75 compatibility case reached the determinant kernel")
+    return Dict{String,Any}(
+        "case_id" => string(required(case, "case_id")),
+        "determinant_kernel_calls" => DETERMINANT_INDEX_REQUEST[],
+        "response" => response,
+    )
+end
+
 function main()
     length(ARGS) == 2 || error(
         "usage: test_pr75_fixed_root_lifecycle.jl INPUT_JSON OUTPUT_JSON"
     )
     input = JSON.parsefile(abspath(ARGS[1]))
-    Set(keys(input)) == Set(("schema", "cases")) ||
+    Set(keys(input)) == Set(("schema", "cases", "compatibility_cases")) ||
         error("PR75 lifecycle input fields are invalid")
     string(required(input, "schema")) ==
-        "windows-solver.pr75-fixed-root-case-batch/1" ||
+        "windows-solver.pr75-fixed-root-case-batch/2" ||
         error("PR75 lifecycle input schema is invalid")
     cases = required(input, "cases")
     cases isa Vector || error("PR75 lifecycle cases are invalid")
+    compatibility_cases = required(input, "compatibility_cases")
+    compatibility_cases isa Vector ||
+        error("PR75 compatibility cases are invalid")
     results = [evaluate_case(case) for case in cases]
+    compatibility_results = [
+        evaluate_compatibility_case(case) for case in compatibility_cases
+    ]
     output = Dict{String,Any}(
-        "schema" => "windows-solver.pr75-fixed-root-result-batch/1",
+        "schema" => "windows-solver.pr75-fixed-root-result-batch/2",
         "results" => results,
+        "compatibility_results" => compatibility_results,
     )
     output_path = abspath(ARGS[2])
     mkpath(dirname(output_path))

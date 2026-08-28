@@ -7968,6 +7968,19 @@ function diagnostic_root_text(result, authenticated_primary_root)
     )
 end
 
+function root_readout_response_fields(request, fields)
+    string(required(request, "operation")) == "root-readout" ||
+        error("root-readout serializer received the wrong operation")
+    response = Dict{String,Any}(string(key) => value for (key, value) in fields)
+    response["schema_version"] = 11
+    response["status"] = "ok"
+    response["adapter"] = "package-owned-julia-gsn-root-readout"
+    response["operation"] = "root-readout"
+    response["request_sha256"] = string(required(request, "request_sha256"))
+    response["execution_identity"] = request_execution_identity(request)
+    return response
+end
+
 function result_fields(::Type{T}, request, digits::Int, bits::Int) where {T<:AbstractFloat}
     omega = parse_complex(T, request, "omega_re", "omega_im")
     amplitude = parse_complex(T, request, "amplitude_re", "amplitude_im")
@@ -8069,7 +8082,7 @@ function result_fields(::Type{T}, request, digits::Int, bits::Int) where {T<:Abs
             T, request, evaluation_context, digits
         )
         branch_valid = primary.branch_authenticated
-        return [
+        return root_readout_response_fields(request, [
             "schema_version" => 11,
             "status" => "ok",
             "adapter" => "package-owned-julia-gsn-root-readout",
@@ -8114,7 +8127,7 @@ function result_fields(::Type{T}, request, digits::Int, bits::Int) where {T<:Abs
             "numerical_conditioning" => numerical_conditioning,
             "horizon_endpoint_search_evidence" =>
                 horizon_endpoint_evidence,
-        ]
+        ])
     end
     truncation = solve_phase(
         T,
@@ -8154,7 +8167,7 @@ function result_fields(::Type{T}, request, digits::Int, bits::Int) where {T<:Abs
         T, request, evaluation_context, digits
     )
 
-    return [
+    return root_readout_response_fields(request, [
         "schema_version" => 11,
         "status" => "ok",
         "adapter" => "package-owned-julia-gsn-root-readout",
@@ -8203,7 +8216,7 @@ function result_fields(::Type{T}, request, digits::Int, bits::Int) where {T<:Abs
         "diagnostics_skipped_reason" => nothing,
         "numerical_conditioning" => numerical_conditioning,
         "horizon_endpoint_search_evidence" => horizon_endpoint_evidence,
-    ]
+    ])
 end
 
 function flatten_fixed_root_survey_request(document)
@@ -8785,6 +8798,20 @@ function fixed_root_survey_batch_fields(
     )
 end
 
+function fixed_root_determinant_sample_response_fields(request, fields)
+    string(required(request, "operation")) ==
+        "fixed-root-determinant-sample" || error(
+            "fixed-root determinant serializer received the wrong operation"
+        )
+    response = Dict{String,Any}(string(key) => value for (key, value) in fields)
+    response["schema_version"] = 2
+    response["status"] = "ok"
+    response["operation"] = "fixed-root-determinant-sample"
+    response["execution_identity"] = request_execution_identity(request)
+    response["request_sha256"] = string(required(request, "request_sha256"))
+    return response
+end
+
 function fixed_root_determinant_sample_fields(
     ::Type{T}, request, digits::Int, bits::Int
 ) where {T<:AbstractFloat}
@@ -8818,7 +8845,7 @@ function fixed_root_determinant_sample_fields(
     numerical_conditioning = conditioning_response(
         T, request, evaluation_context, digits
     )
-    return [
+    return fixed_root_determinant_sample_response_fields(request, [
         "schema_version" => 2,
         "status" => "ok",
         "operation" => "fixed-root-determinant-sample",
@@ -8847,7 +8874,7 @@ function fixed_root_determinant_sample_fields(
         "working_precision_bits" => bits,
         "readout_role" => string(required(request, "readout_role")),
         "numerical_conditioning" => numerical_conditioning,
-    ]
+    ])
 end
 
 function validate_worker_request_contract(request)
