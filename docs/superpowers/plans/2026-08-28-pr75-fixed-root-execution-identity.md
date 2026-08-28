@@ -1,6 +1,10 @@
 # PR75 Fixed-Root Execution-Identity Migration Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **Delivery model:** Implement the cross-language wiring directly. Hosted CI
+> supplies the deterministic software-contract evidence; the operator's
+> post-merge production canary remains the controlling numerical evidence.
+> The task checkboxes below preserve the approved decomposition, not a claim
+> that local container tests prove production behavior.
 
 **Goal:** Carry fixed-root request identity, typed control outcomes, promotion proof, diagnostics, and recovery end to end so an expected BF40 asymptotic insufficiency is durably promoted to BF80 without replaying retained PR74 work.
 
@@ -15,7 +19,8 @@
 - Do not run a production M02 campaign, determinant kernel, root solver, ODE solver, or numerical Julia worker.
 - Preserve all operator evidence; never rewrite a live checkpoint during development.
 - `/1` fixed-root documents are forensic-only and cannot authorize execution or continuation.
-- Write a meaningful failing test before each production behavior change.
+- Add regression coverage at each changed contract boundary, but do not treat
+  local container results as production evidence.
 - Keep the transition registry limited to CONTROL outcomes reachable through promoted ROOT/RESPONSE and their shared control paths.
 - Deterministic CI success is a response-path proof, not numerical Kerr evidence.
 
@@ -169,7 +174,7 @@
 - [ ] Add closed-registry tests for every fixed-root-reachable code, timeout handling, root identity retention, queue enforcement, and full failure proof persistence.
 - [ ] Wire the no-solver Julia test into hosted CI and commit as `test(ci): exercise fixed-root lifecycle through real Julia seam`.
 
-### Task 8: Contract closure, review, and PR completion
+### Task 8: Contract closure and PR completion
 
 **Files:**
 - Modify: PR75 pull-request body and repository docs/tests only as required by verified evidence.
@@ -179,17 +184,21 @@
 - Consumes the complete branch diff and all prior proof.
 
 - [ ] Search for executable fixed-root `/1`, root-shaped generic binders/reporters, hardcoded diagnostic completeness, ignored queue kinds, and unbound fixed-root control paths. Add a regression test for each surviving false genericity before fixing it.
-- [ ] Run focused Python tests, the full Python suite, Julia no-solver contract scripts, compile/static checks, and workflow syntax validation.
-- [ ] Obtain independent whole-branch architecture and correctness review; resolve every blocker and rerun affected proof.
-- [ ] Commit any review repairs without rewriting history, push normally, and update the PR body with exact evidence and explicit numerical limitations.
+- [ ] Require hosted Python/Windows and real-Julia no-solver CI to pass; use
+  only cheap compile/diff checks locally to avoid publishing malformed code.
+- [ ] Resolve every hosted failure against the production interfaces and rerun
+  the affected hosted proof.
+- [ ] Commit repairs without rewriting history and update the PR body with
+  exact hosted evidence and explicit numerical limitations.
 - [ ] Shepherd CI/review state to green. Do not merge until the user confirms the exact final head SHA.
 
 ## Required Final Evidence
 
 - Baseline: `PYTHONPATH=src python3 -m unittest discover -s tests -v` passed 1,292 tests with 10 skips before implementation.
-- Focused red and green evidence for every task.
+- Contract regressions covering every changed boundary, exercised by hosted CI.
 - Six success plus 36 sample-failure matrix cases through the real no-solver Julia seam.
 - Exact archived PR74 checkpoint handover fixture proof.
-- Full Python suite and hosted Julia no-solver CI green.
-- Independent review with no unresolved blockers.
+- Hosted Python/Windows and Julia no-solver CI green.
+- The operator's post-merge canary remains the authority for real determinant,
+  ODE, root, and Kerr numerical behavior.
 - PR75 completion matrix uses `Successful deterministic fixed-root response path` and explicitly leaves real BF80 numerical execution to the post-merge operator canary.
