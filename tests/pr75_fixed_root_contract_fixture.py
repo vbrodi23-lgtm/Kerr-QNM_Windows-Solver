@@ -8,10 +8,19 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Mapping
 
-from tests.fixtures import (
-    valid_julia_root_response,
-    valid_numerical_conditioning,
-)
+if __package__:
+    from tests.fixtures import (
+        valid_julia_root_response,
+        valid_numerical_conditioning,
+    )
+else:
+    # GitHub's real-Julia seam executes this file directly with
+    # ``PYTHONPATH=src``.  In that mode the tests directory, rather than the
+    # repository root, is the import root.
+    from fixtures import (  # type: ignore[import-not-found]
+        valid_julia_root_response,
+        valid_numerical_conditioning,
+    )
 from windows_solver.julia_response_backend import (
     FIXED_ROOT_SURVEY_BATCH_RESPONSE_SCHEMA,
     FixedRootSurveyPlan,
