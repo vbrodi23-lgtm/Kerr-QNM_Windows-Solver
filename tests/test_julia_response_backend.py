@@ -25,6 +25,7 @@ from windows_solver.julia_response_backend import (
     JuliaResponseAdapter,
     JuliaResponseBackendError,
     _forward_julia_progress_line,
+    _control_receipt_diagnostics_validator,
     _mode_specific_branch_enclosure_radius,
     _run_streamed_julia,
     _valid_numerical_control_diagnostics,
@@ -266,6 +267,57 @@ def _set_distinct_derivative_binding(response, wire_derivative_abs):
 
 
 class JuliaResponseBackendTests(unittest.TestCase):
+    def test_operation_resource_receipts_require_code_specific_evidence(self):
+        ode = {
+            "failure_code": "ODE_RESOURCE_LIMIT",
+            "stage": "homogeneous-propagation",
+            "diagnostics": {
+                "limit_kind": "ode_solver_iterations",
+                "limiting_resource": "homogeneous_ode_maxiters",
+                "elapsed_leg_seconds": 12.5,
+                "ode_leg": "Xup_outer_to_match",
+                "ode_snapshot": {
+                    "ode_leg": "Xup_outer_to_match",
+                    "ode_retcode": "MaxIters",
+                    "ode_endpoint_reached": False,
+                    "elapsed_seconds": 12.5,
+                },
+            },
+        }
+        self.assertTrue(
+            _control_receipt_diagnostics_validator(ode, request_binding={})
+        )
+        forged_ode = json.loads(canonical_json_bytes(ode))
+        forged_ode["diagnostics"]["limiting_resource"] = "rhs_evaluations"
+        self.assertFalse(
+            _control_receipt_diagnostics_validator(
+                forged_ode, request_binding={}
+            )
+        )
+
+        root = {
+            "failure_code": "ROOT_READOUT_RESOURCE_INFEASIBLE",
+            "stage": "request-policy",
+            "diagnostics": {
+                "limiting_resource": "cooperative_request_deadline",
+                "measured_determinant_seconds": 800.0,
+                "minimum_remaining_determinant_count": 8,
+                "remaining_wall_time_seconds": 5000.0,
+                "estimated_mandatory_seconds": 6400.0,
+                "estimator": "first-determinant-linear-lower-bound/v1",
+            },
+        }
+        self.assertTrue(
+            _control_receipt_diagnostics_validator(root, request_binding={})
+        )
+        forged_root = json.loads(canonical_json_bytes(root))
+        forged_root["diagnostics"]["estimated_mandatory_seconds"] = 6000.0
+        self.assertFalse(
+            _control_receipt_diagnostics_validator(
+                forged_root, request_binding={}
+            )
+        )
+
     def test_empirical_exterior_root_requires_three_term_certificate(self):
         job = _job_for_mechanism("exterior-light-ring")
         receipt = load_default_calibration_receipt()

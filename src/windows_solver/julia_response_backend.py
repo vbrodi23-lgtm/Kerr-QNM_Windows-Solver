@@ -1291,8 +1291,86 @@ def _control_receipt_diagnostics_validator(
             request_binding=request_binding,
         )
     diagnostics = receipt.get("diagnostics")
-    if code in {"ODE_RESOURCE_LIMIT", "ROOT_READOUT_RESOURCE_INFEASIBLE"}:
-        return isinstance(diagnostics, Mapping) and bool(diagnostics)
+    if code == "ODE_RESOURCE_LIMIT":
+        if not isinstance(diagnostics, Mapping):
+            return False
+        resource_pairs = {
+            "request_wall_clock": "cooperative_request_deadline",
+            "homogeneous_leg_wall_clock": "homogeneous_leg_wall_clock",
+            "accepted_steps": "accepted_steps",
+            "rhs_evaluations": "rhs_evaluations",
+            "ode_solver_iterations": "homogeneous_ode_maxiters",
+        }
+        limit_kind = diagnostics.get("limit_kind")
+        snapshot = diagnostics.get("ode_snapshot")
+        try:
+            elapsed = _finite_text(
+                diagnostics.get("elapsed_leg_seconds"),
+                "ODE resource elapsed_leg_seconds",
+            )
+            snapshot_elapsed = _finite_text(
+                snapshot.get("elapsed_seconds")
+                if isinstance(snapshot, Mapping)
+                else None,
+                "ODE resource snapshot elapsed_seconds",
+            )
+        except JuliaResponseBackendError:
+            return False
+        return (
+            receipt.get("stage") == "homogeneous-propagation"
+            and limit_kind in resource_pairs
+            and diagnostics.get("limiting_resource")
+            == resource_pairs[limit_kind]
+            and isinstance(diagnostics.get("ode_leg"), str)
+            and bool(diagnostics["ode_leg"])
+            and isinstance(snapshot, Mapping)
+            and snapshot.get("ode_leg") == diagnostics["ode_leg"]
+            and snapshot.get("ode_endpoint_reached") is False
+            and (
+                snapshot.get("ode_retcode") == "MaxIters"
+                if limit_kind == "ode_solver_iterations"
+                else snapshot.get("ode_retcode") == "ResourceLimit"
+            )
+            and elapsed >= 0
+            and snapshot_elapsed == elapsed
+        )
+    if code == "ROOT_READOUT_RESOURCE_INFEASIBLE":
+        if not isinstance(diagnostics, Mapping):
+            return False
+        minimum_count = diagnostics.get("minimum_remaining_determinant_count")
+        try:
+            measured = _finite_text(
+                diagnostics.get("measured_determinant_seconds"),
+                "root feasibility measured_determinant_seconds",
+            )
+            remaining = _finite_text(
+                diagnostics.get("remaining_wall_time_seconds"),
+                "root feasibility remaining_wall_time_seconds",
+            )
+            estimated = _finite_text(
+                diagnostics.get("estimated_mandatory_seconds"),
+                "root feasibility estimated_mandatory_seconds",
+            )
+        except JuliaResponseBackendError:
+            return False
+        return (
+            receipt.get("stage") == "request-policy"
+            and diagnostics.get("limiting_resource")
+            == "cooperative_request_deadline"
+            and type(minimum_count) is int
+            and minimum_count >= 0
+            and measured >= 0
+            and remaining >= 0
+            and estimated >= remaining
+            and math.isclose(
+                estimated,
+                measured * minimum_count,
+                rel_tol=1e-12,
+                abs_tol=1e-12,
+            )
+            and diagnostics.get("estimator")
+            == "first-determinant-linear-lower-bound/v1"
+        )
     if code == "WORKER_TIMEOUT":
         return (
             receipt.get("origin") == PYTHON_SUPERVISOR_ORIGIN
