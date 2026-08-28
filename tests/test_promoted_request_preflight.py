@@ -15,6 +15,7 @@ from windows_solver.julia_response_backend import (
     FIXED_ROOT_SURVEY_BATCH_OPERATION,
     JuliaResponseAdapter,
     JuliaResponseBackendError,
+    _worker_request_document,
     _validate_promoted_request_preflight_response,
     build_promoted_request_contract_fixture,
     promoted_request_preflight_documents,
@@ -130,6 +131,23 @@ class _PreflightRunner:
 
 
 class PromotedRequestPreflightTests(unittest.TestCase):
+    def test_rebinding_wire_documents_excludes_derived_identity_fields(self):
+        _, _, documents = _preflight_documents()
+
+        for original in documents:
+            with self.subTest(
+                operation=original["operation"],
+                request_sha256=original["request_sha256"],
+            ):
+                binding, rebound, request_sha256 = _worker_request_document(
+                    copy.deepcopy(original)
+                )
+
+                self.assertNotIn("request_sha256", binding)
+                self.assertNotIn("execution_identity", binding)
+                self.assertEqual(request_sha256, original["request_sha256"])
+                self.assertEqual(rebound, original)
+
     def test_worker_batch_mode_is_structurally_no_solver(self):
         source = WORKER.read_text(encoding="utf-8")
         start = source.index("function validate_request_batch(")

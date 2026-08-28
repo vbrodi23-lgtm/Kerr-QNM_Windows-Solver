@@ -2500,7 +2500,15 @@ def _worker_request_document(
 ) -> tuple[dict[str, object], dict[str, object], str]:
     """Return the request binding, wire document, and canonical wire digest."""
 
-    request_binding = dict(request)
+    # A caller may need to derive a variant from an already-bound wire
+    # document.  Both fields below are products of binding, never inputs to
+    # it.  Excluding them here keeps rebinding canonical and matches Julia's
+    # request-digest projection.
+    request_binding = {
+        key: value
+        for key, value in request.items()
+        if key not in {"request_sha256", "execution_identity"}
+    }
     execution_resource = _validated_execution_resource_policy(
         request_binding["execution_resource"]
         if "execution_resource" in request_binding
