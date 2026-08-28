@@ -65,7 +65,9 @@ def _conditioning() -> FixedRootSurveyConditioning:
         "maximum_endpoint_reconstruction_error": "1e-30",
         "maximum_contour_angle_deformation": "0",
         "predicted_reliable_digits": "34",
-        "required_reliable_digits": "20",
+        "required_reliable_digits": (
+            "16.698970004336018804786261105275506973231810118538"
+        ),
         "precision_limited": False,
         "determinant_count": 1,
     })

@@ -2592,6 +2592,19 @@ class FixedRootSurveyConditioning:
             "fixed-root survey conditioning required_reliable_digits",
             nonnegative=True,
         )
+        with localcontext() as context:
+            context.prec = 128
+            expected_required = -target.log10() + Decimal(6)
+        required_exponent = required.as_tuple().exponent
+        if (
+            not isinstance(required_exponent, int)
+            or required_exponent > -12
+            or abs(required - expected_required)
+            > Decimal(8).scaleb(required_exponent)
+        ):
+            raise ValueError(
+                "fixed-root survey conditioning required digits are invalid"
+            )
         if (
             type(self.mapping["endpoint_remainders_regular"]) is not bool
             or type(self.mapping["precision_limited"]) is not bool

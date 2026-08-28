@@ -173,12 +173,18 @@ def _conditioning(
         "determinant_normalisation": "unit-asymptotic-branch-wronskian/v1",
         "maximum_series_digits_lost": "1",
         "maximum_recurrence_digits_lost": "1",
-        "minimum_asymptotic_predicted_reliable_digits": str(digits - 5),
+        "minimum_asymptotic_predicted_reliable_digits": (
+            "10" if precision_limited else str(digits - 5)
+        ),
         "endpoint_remainders_regular": True,
         "maximum_endpoint_reconstruction_error": f"1e-{digits - 5}",
         "maximum_contour_angle_deformation": "0",
-        "predicted_reliable_digits": str(digits - 6),
-        "required_reliable_digits": "20",
+        "predicted_reliable_digits": (
+            "10" if precision_limited else str(digits - 6)
+        ),
+        "required_reliable_digits": (
+            "16.698970004336018804786261105275506973231810118538"
+        ),
         "precision_limited": precision_limited,
         "determinant_count": 1,
     })

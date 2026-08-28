@@ -67,7 +67,9 @@ def _conditioning(request) -> dict[str, object]:
         "maximum_endpoint_reconstruction_error": "1e-30",
         "maximum_contour_angle_deformation": "0",
         "predicted_reliable_digits": "34",
-        "required_reliable_digits": "20",
+        "required_reliable_digits": (
+            "16.698970004336018804786261105275506973231810118538"
+        ),
         "precision_limited": False,
         "determinant_count": 1,
     }
@@ -363,6 +365,29 @@ class JuliaFixedRootSurveyBatchTests(unittest.TestCase):
                 job,
                 fixed_root=job.root.omega,
                 root_seal_sha256="6" * 64,
+                branch_identity=job.root.branch_id,
+                plan=FixedRootSurveyPlan.FULL_NINE,
+            )
+
+    def test_response_conditioning_required_digits_are_request_derived(self):
+        job = _job()
+
+        class _ForgedRequiredDigitsAdapter(_BatchAdapter):
+            def evaluate_for_validation(self, request):
+                evaluation = super().evaluate_for_validation(request)
+                evaluation.response["samples"][0]["numerical_conditioning"][
+                    "required_reliable_digits"
+                ] = "17"
+                return evaluation
+
+        with self.assertRaisesRegex(
+            JuliaResponseBackendError,
+            "conditioning is invalid",
+        ):
+            _backend(_ForgedRequiredDigitsAdapter()).fixed_root_survey_batch(
+                job,
+                fixed_root=job.root.omega,
+                root_seal_sha256="7" * 64,
                 branch_identity=job.root.branch_id,
                 plan=FixedRootSurveyPlan.FULL_NINE,
             )
