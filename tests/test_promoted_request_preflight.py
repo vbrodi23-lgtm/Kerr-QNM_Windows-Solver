@@ -134,7 +134,8 @@ class PromotedRequestPreflightTests(unittest.TestCase):
     def test_rebinding_wire_documents_excludes_derived_identity_fields(self):
         _, _, documents = _preflight_documents()
 
-        for original in documents:
+        for request in documents:
+            _, original, _ = _worker_request_document(request)
             with self.subTest(
                 operation=original["operation"],
                 request_sha256=original["request_sha256"],

@@ -1101,33 +1101,36 @@ class PromotedSurveySchedulerTests(unittest.TestCase):
             ]["disposition"],
         )
 
-    def test_response_queue_escalates_once_to_bf80_then_awaits_admission(self):
+    def test_success_response_cannot_authorize_bf80_without_control_proof(self):
         result, calls = self._run(
             self._checkpoint(), flat40=True, flat80=False
         )
-        self.assertEqual([40, 40, 80, 80], calls)
+        self.assertEqual([40, 40], calls)
         self.assertEqual(0, result.completed_count)
-        self.assertEqual(0, result.unresolved_count)
-        self.assertEqual(1, result.review_pending_count)
+        self.assertEqual(1, result.unresolved_count)
+        self.assertEqual(0, result.review_pending_count)
         tiers = result.checkpoint["survey_pass_ledger"]["promoted"][
             self.leaves[0].leaf_id
         ]["precision_tiers"]
-        self.assertEqual(["BF40", "BF80"], tiers)
-        self.assertEqual("AWAITING_ADMISSION", result.checkpoint[
+        self.assertEqual(["BF40"], tiers)
+        self.assertEqual("UNRESOLVED", result.checkpoint[
             "promotion_queue"
         ]["entries"][0]["disposition"])
-        self.assertNotIn("BF120", str(result.checkpoint))
+        self.assertNotIn("BF80", str(tiers))
 
-    def test_bf80_exhaustion_is_unresolved_not_another_promotion(self):
+    def test_bf80_control_exhaustion_is_unresolved_not_another_promotion(self):
         result, calls = self._run(
-            self._checkpoint(), flat40=True, flat80=True
+            self._checkpoint(),
+            failure40="INSUFFICIENT_ASYMPTOTIC_PRECISION",
+            failure80="INSUFFICIENT_ASYMPTOTIC_PRECISION",
         )
-        self.assertEqual([40, 40, 80, 80], calls)
+        self.assertEqual([40, 80], calls)
         self.assertEqual(1, result.unresolved_count)
         self.assertEqual([], result.checkpoint["records"])
         self.assertEqual("UNRESOLVED", result.checkpoint[
             "promotion_queue"
         ]["entries"][0]["disposition"])
+        self.assertNotIn("BF120", str(result.checkpoint))
 
     def test_allowlisted_bf40_control_failure_advances_only_to_bf80(self):
         result, calls = self._run(

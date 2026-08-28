@@ -152,7 +152,7 @@
 - [ ] Import a canonical redacted copy of the archived PR74 failed checkpoint. Verify its source checkpoint SHA and record the redaction method; do not synthesize a look-alike.
 - [ ] Write the mandatory failing fixture test proving Binary64 212/212, root evidence, canonical backgrounds, and ordinal-0 BF80 horizon retention; `/1` failure evidence is forensic-only; active failure resolution leaves evidence intact; ordinal 1 emits a fresh `/2`; no Binary64, root, horizon, or retained-background replay/loss occurs.
 - [ ] Run the test red against main behavior, implement only the exposed handover migration, then run green.
-- [ ] Commit as `test(recovery): prove PR74 checkpoint handover to request v2`.
+- [ ] Commit as `test(recovery): prove PR74 checkpoint handover to schema 2`.
 
 ### Task 7: Hosted no-solver lifecycle seam and complete matrix
 

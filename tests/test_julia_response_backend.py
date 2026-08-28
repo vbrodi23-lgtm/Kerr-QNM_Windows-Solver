@@ -2827,6 +2827,10 @@ class JuliaResponseBackendTests(unittest.TestCase):
             if match is None:
                 continue
             name, expression = match.groups()
+            if name == "failure_context":
+                # Operation-control failure context is serialized evidence,
+                # not an out-of-band progress context.
+                continue
             if not expression.startswith(("Dict", "merge(")):
                 continue
             assigned_context_names.add(name)
@@ -2843,7 +2847,7 @@ class JuliaResponseBackendTests(unittest.TestCase):
 
         # This deliberately bounded inventory prevents the audit itself from
         # silently overlooking a new worker context construction style.
-        self.assertEqual(len(context_blocks), 7)
+        self.assertEqual(len(context_blocks), 8)
         self.assertEqual(
             assigned_context_names,
             {
@@ -4069,8 +4073,15 @@ class JuliaResponseBackendTests(unittest.TestCase):
                 {},
                 runner,
             )
+            job = _deep_job()
+            request = JuliaPrecisionRootBackend(
+                job.backend_identity,
+                object(),
+                80,
+                ode_error_budget=synthetic_ode_error_budget(80),
+            )._request(job, 0.0j)
             with self.assertRaisesRegex(JuliaResponseBackendError, "timed out") as raised:
-                adapter.evaluate({"schema_version": 1})
+                adapter.evaluate(request)
 
         receipt = raised.exception.worker_failure
         self.assertEqual(receipt["worker_exit_code"], -9)
@@ -4079,24 +4090,42 @@ class JuliaResponseBackendTests(unittest.TestCase):
             receipt["worker_stderr_tail"],
             "Julia worker timed out after 60 seconds\n",
         )
-        self.assertEqual(receipt["failure"]["failure_code"], "WORKER_TIMEOUT")
-        self.assertEqual(receipt["failure"]["failure_class"], "CONTROL")
-        self.assertIs(receipt["failure"]["retryable"], True)
-        self.assertEqual(receipt["failure"]["root_phase"], "PRIMARY")
-        self.assertEqual(receipt["failure"]["determinant_index"], 3)
-        self.assertEqual(receipt["failure"]["elapsed_request_seconds"], 5271.5)
+        failure = receipt["failure"]
         self.assertEqual(
-            receipt["failure"]["ode_leg"], "Xup_match_to_inner"
+            failure["schema"], "windows-solver.operation-control-receipt/1"
         )
+        self.assertEqual(failure["failure_code"], "WORKER_TIMEOUT")
+        self.assertEqual(failure["failure_class"], "CONTROL")
+        self.assertIs(failure["retryable_evidence"]["retryable"], True)
+        diagnostics = failure["diagnostics"]
         self.assertEqual(
-            receipt["failure"]["ode_snapshot"]["ode_rhs_evaluations"],
+            diagnostics["elapsed_request_seconds"],
+            request["execution_resource"]["worker_request_wall_clock_seconds"],
+        )
+        progress = diagnostics["last_validated_progress"]
+        self.assertEqual(progress["context"]["phase"], "PRIMARY")
+        self.assertEqual(progress["context"]["determinant_index_leaf"], 3)
+        self.assertEqual(progress["payload"]["request_elapsed_seconds"], 5271.5)
+        self.assertEqual(progress["payload"]["ode_leg"], "Xup_match_to_inner")
+        self.assertEqual(
+            progress["payload"]["ode_rhs_evaluations"],
             1960000,
         )
-        policy = receipt["failure"]["execution_resource_policy"]
+        policy = diagnostics["execution_resource_policy"]
         self.assertEqual(
             policy["schema"], "windows-solver.execution-resource-policy/1"
         )
         self.assertEqual(len(policy["sha256"]), 64)
+        self.assertEqual(
+            failure["execution_identity"][
+                "execution_resource_policy_identity"
+            ],
+            {
+                "schema": policy["schema"],
+                "version": policy["version"],
+                "sha256": policy["sha256"],
+            },
+        )
 
     def test_campaign_failure_status_persists_worker_diagnostic(self):
         """Catches final status overwriting the failed worker's exact diagnostic."""

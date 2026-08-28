@@ -1771,10 +1771,14 @@ class JuliaNumericalControlFailureTests(unittest.TestCase):
                     details["failure"]["diagnostics"],
                 )
                 self.assertEqual(
-                    raised.exception.worker_failure["failure"][
-                        "execution_resource_policy"
-                    ],
-                    policy,
+                    raised.exception.worker_failure["failure"]
+                    ["execution_identity"]
+                    ["execution_resource_policy_identity"],
+                    {
+                        "schema": policy["schema"],
+                        "version": policy["version"],
+                        "sha256": policy["sha256"],
+                    },
                 )
 
     def test_unknown_control_code_remains_a_generic_backend_failure(self):

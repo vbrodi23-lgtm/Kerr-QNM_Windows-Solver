@@ -2370,7 +2370,7 @@ def _timeout_worker_failure_details(
 
 
 def _timeout_progress_failure_fields(value: object) -> dict[str, object]:
-    """Project the last already-validated worker event into timeout evidence."""
+    """Retain the last already-validated worker event as timeout evidence."""
 
     if not isinstance(value, Mapping) or set(value) != {
         "schema",
@@ -2392,38 +2392,7 @@ def _timeout_progress_failure_fields(value: object) -> dict[str, object]:
     payload = copied.get("payload")
     if not isinstance(context, Mapping) or not isinstance(payload, Mapping):
         return {}
-    fields: dict[str, object] = {"last_progress_kind": copied["kind"]}
-    for receipt_name, context_names in (
-        ("readout_index", ("readout_index",)),
-        ("readout_role", ("readout_role",)),
-        ("root_phase", ("phase",)),
-        ("newton_index", ("newton_index",)),
-        ("determinant_index", ("determinant_index_leaf", "determinant_index")),
-        ("phase_determinant_index", ("determinant_index_phase",)),
-        ("determinant_purpose", ("determinant_purpose",)),
-    ):
-        for context_name in context_names:
-            item = context.get(context_name)
-            if item is not None:
-                fields[receipt_name] = item
-                break
-    request_elapsed = payload.get("request_elapsed_seconds")
-    if request_elapsed is not None:
-        fields["elapsed_request_seconds"] = request_elapsed
-    ode_kinds = {
-        ProgressEventKind.ODE_SOLVE_STARTED.value,
-        ProgressEventKind.ODE_SOLVE_PROGRESS.value,
-        ProgressEventKind.ODE_SOLVE_COMPLETED.value,
-        ProgressEventKind.ODE_SOLVE_FAILED.value,
-        ProgressEventKind.ODE_RESOURCE_LIMIT.value,
-    }
-    if copied["kind"] in ode_kinds:
-        fields["ode_snapshot"] = dict(payload)
-        if payload.get("ode_leg") is not None:
-            fields["ode_leg"] = payload["ode_leg"]
-        if payload.get("elapsed_seconds") is not None:
-            fields["elapsed_leg_seconds"] = payload["elapsed_seconds"]
-    return fields
+    return dict(copied)
 
 
 def _finite_text(value: object, label: str) -> float:

@@ -1713,19 +1713,19 @@ def _validate_failed_preflight_attempt_request(
                 predictor_kind,
             )
         elif empirical_calibration_bound:
-            receipt = load_default_calibration_receipt()
+            calibration_receipt = load_default_calibration_receipt()
             family = (
                 "horizon-scattering/v1"
                 if leaf.mechanism_id == "horizon-admittance"
                 else "exterior-wronskian/v1"
             )
-            profile = receipt.budget_for(family, precision_digits)
+            profile = calibration_receipt.budget_for(family, precision_digits)
             profile_mapping = profile.to_mapping()
             if (
                 request_policy.get(
                     "promoted_control_calibration_receipt_sha256"
                 )
-                != receipt.sha256
+                != calibration_receipt.sha256
                 or request_policy.get("empirical_control_profile_sha256")
                 != _sha256(profile_mapping)
             ):
@@ -1738,7 +1738,7 @@ def _validate_failed_preflight_attempt_request(
                 precision_digits,
                 refinement=refinement_level,
                 empirical_control_profile=profile,
-                calibration_receipt=receipt,
+                calibration_receipt=calibration_receipt,
                 diagnostic_model_identity=diagnostic_model_identity,
             )._request(
                 leaf.job,
@@ -1756,20 +1756,20 @@ def _validate_failed_preflight_attempt_request(
             # the diagnostic identity keeps the policy provisional or
             # horizon-shaped, and the receipt hashes stay off the wire
             # exactly as they did in the historical binding.
-            receipt = load_default_calibration_receipt()
+            calibration_receipt = load_default_calibration_receipt()
             family = (
                 "horizon-scattering/v1"
                 if leaf.mechanism_id == "horizon-admittance"
                 else "exterior-wronskian/v1"
             )
-            profile = receipt.budget_for(family, precision_digits)
+            profile = calibration_receipt.budget_for(family, precision_digits)
             expected_request = _CanonicalRequestJuliaPrecisionRootBackend(
                 leaf.job.backend_identity,
                 object(),
                 precision_digits,
                 refinement=refinement_level,
                 empirical_control_profile=profile,
-                calibration_receipt=receipt,
+                calibration_receipt=calibration_receipt,
                 diagnostic_model_identity=diagnostic_model_identity,
             )._request(
                 leaf.job,

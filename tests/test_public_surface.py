@@ -1651,6 +1651,7 @@ $candidate | ConvertTo-Json -Compress | Set-Content -LiteralPath $env:M02_TEST_J
             "julia-control-diagnostics/v1",
             "supervisor-timeout/v1",
             "bounded-worker-wall-clock-resource-exhausted/v1",
+            "first-determinant-linear-lower-bound/v1",
             "exterior-determinant-absolute-error-certificate/empirical-v1",
             "operator-approved/v1",
             "permitted/v1",
