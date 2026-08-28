@@ -33,6 +33,7 @@ from windows_solver.julia_response_backend import (
     JuliaFixedRootSurveyBatch,
     JuliaFixedRootSurveySample,
     JuliaNumericalControlError,
+    _execution_resource_policy,
     fixed_root_survey_request_contract,
 )
 from windows_solver.operation_control import (
@@ -358,11 +359,7 @@ class _Backend:
                 ),
                 "semantic_precision_tier": f"bigfloat-{self.digits}",
                 "policy": {"job_policy_sha256": job.policy.identity_sha256},
-                "execution_resource": {
-                    "schema": "windows-solver.execution-resource-policy/1",
-                    "version": 1,
-                    "sha256": "3" * 64,
-                },
+                "execution_resource": _execution_resource_policy(),
                 "plan": contract.plan.value,
                 "scientific_operation_identity": (
                     contract.scientific_operation_identity

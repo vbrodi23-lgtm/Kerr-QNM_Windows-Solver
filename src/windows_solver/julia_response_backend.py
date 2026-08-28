@@ -1347,6 +1347,14 @@ def validate_persisted_operation_control_receipt(
 ) -> ValidatedControlReceipt:
     """Revalidate a checkpointed worker/supervisor CONTROL proof."""
 
+    try:
+        _validated_execution_resource_policy(
+            canonical_request.get("execution_resource")
+        )
+    except JuliaResponseBackendError as error:
+        raise ValueError(
+            "persisted operation-control resource policy is invalid"
+        ) from error
     request_sha256 = hashlib.sha256(
         canonical_json_bytes(dict(canonical_request))
     ).hexdigest()

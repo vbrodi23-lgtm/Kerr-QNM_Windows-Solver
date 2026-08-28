@@ -96,7 +96,7 @@ function coordinate_identity_spec_request()
         "precision_digits" => 80,
         "request_sha256" => digest,
         "job_id" => "coordinate-identity-spec",
-        "leaf_id" => 13,
+        "leaf_id" => "coordinate-identity-spec-leaf",
         "role" => "specification",
         "job_policy_sha256" => digest,
         "backend_identity_sha256" => digest,
@@ -107,6 +107,28 @@ function coordinate_identity_spec_request()
         "resource_policy_sha256" => digest,
         "coordinate_ode_relative_tolerance" => "1e-12",
         "coordinate_ode_absolute_tolerance" => "1e-14",
+        "execution_identity" => Dict{String,Any}(
+            "schema" => OPERATION_EXECUTION_IDENTITY_SCHEMA,
+            "scope" => "REQUEST",
+            "operation" => "root-readout",
+            "request_schema" => "windows-solver.root-readout/1",
+            "request_sha256" => digest,
+            "leaf_id" => "coordinate-identity-spec-leaf",
+            "job_id" => "coordinate-identity-spec",
+            "backend_identity_sha256" => digest,
+            "precision_digits" => 80,
+            "working_precision_bits" => 298,
+            "semantic_precision_tier" => "BF80",
+            "effective_policy_identity" => digest,
+            "execution_resource_policy_identity" => Dict{String,Any}(
+                "schema" => "windows-solver.execution-resource-policy/1",
+                "version" => 1,
+                "sha256" => digest,
+            ),
+            "role" => "specification",
+            "job_policy_sha256" => digest,
+            "refinement_level" => 0,
+        ),
     )
 end
 
