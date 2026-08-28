@@ -313,7 +313,12 @@ class JuliaFixedRootSurveyBatchTests(unittest.TestCase):
             "bounded_newton",
         ):
             self.assertNotIn(prohibited, body)
-        self.assertIn("determinant_progress(", body)
+        evaluator_start = worker.index(
+            "function production_fixed_root_survey_sample_fields"
+        )
+        evaluator = worker[evaluator_start:start]
+        self.assertIn("determinant_progress(", evaluator)
+        self.assertIn("sample_evaluator(", body)
 
     def test_fixed_root_policy_shape_is_checked_only_by_fixed_root_parser(self):
         worker = (

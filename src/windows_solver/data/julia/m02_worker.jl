@@ -584,7 +584,7 @@ end
 function control_failure_context(request)
     now = time_ns()
     identity = request_execution_identity(request)
-    context = Dict{String,Any}(
+    failure_context = Dict{String,Any}(
         "retryable" => true,
         "precision_digits" => parse_integer(request, "precision_digits"),
         "request_sha256" => required(request, "request_sha256"),
@@ -608,14 +608,14 @@ function control_failure_context(request)
     if string(required(identity, "operation")) in (
         "root-readout", "fixed-root-determinant-sample"
     )
-        context["role"] = required(identity, "role")
-        context["job_policy_sha256"] = required(identity, "job_policy_sha256")
-        context["refinement_level"] = required(identity, "refinement_level")
+        failure_context["role"] = required(identity, "role")
+        failure_context["job_policy_sha256"] = required(identity, "job_policy_sha256")
+        failure_context["refinement_level"] = required(identity, "refinement_level")
     elseif string(required(identity, "scope")) == "SAMPLE"
-        context["sample_index"] = required(identity, "sample_index")
-        context["sample_role"] = required(identity, "sample_role")
+        failure_context["sample_index"] = required(identity, "sample_index")
+        failure_context["sample_role"] = required(identity, "sample_role")
     end
-    return context
+    return failure_context
 end
 
 const CONTROL_STAGE_BY_CODE = Dict(

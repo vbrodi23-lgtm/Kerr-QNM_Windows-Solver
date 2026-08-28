@@ -457,49 +457,39 @@ class PromotedAdmissionTests(unittest.TestCase):
                 Decimal(calibration.certificate_safety_factor) * Decimal("1e-12")
             ),
         }
-        full_batch = _batch(leaf, seal, 40)
-        full_batch = replace(
-            full_batch,
-            samples=tuple(
-                replace(
-                    sample,
-                    determinant_error_evidence=ExteriorDeterminantErrorEvidence(
-                        raw_error
-                    ),
-                )
-                for sample in full_batch.samples
-            ),
-        )
+
+        def with_error(batch):
+            return replace(
+                batch,
+                samples=tuple(
+                    replace(
+                        sample,
+                        determinant_error_evidence=(
+                            ExteriorDeterminantErrorEvidence(raw_error)
+                        ),
+                    )
+                    for sample in batch.samples
+                ),
+            )
+
         background_contract = fixed_root_survey_request_contract(
             FixedRootSurveyPlan.CANONICAL_BACKGROUND_FIVE
         )
         component_contract = fixed_root_survey_request_contract(
             FixedRootSurveyPlan.MECHANISM_COMPONENT_FOUR
         )
-        background_batch = replace(
-            full_batch,
-            scientific_operation_identity=(
-                background_contract.scientific_operation_identity
-            ),
-            request_sha256="1" * 64,
-            samples=tuple(
-                sample
-                for sample in full_batch.samples
-                if sample.role in background_contract.sample_roles
-            ),
-        )
-        component_batch = replace(
-            full_batch,
-            scientific_operation_identity=(
-                component_contract.scientific_operation_identity
-            ),
-            request_sha256="2" * 64,
-            samples=tuple(
-                sample
-                for sample in full_batch.samples
-                if sample.role in component_contract.sample_roles
-            ),
-        )
+        background_batch = with_error(_batch(
+            leaf,
+            seal,
+            40,
+            plan=background_contract.plan,
+        ))
+        component_batch = with_error(_batch(
+            leaf,
+            seal,
+            40,
+            plan=component_contract.plan,
+        ))
         cache_key, reuse_key = _promoted_background_key(leaf, seal, 40)
         background_receipt = _promoted_background_receipt(
             batch=background_batch,

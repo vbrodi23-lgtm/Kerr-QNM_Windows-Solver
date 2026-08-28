@@ -29,6 +29,11 @@ from windows_solver.julia_response_backend import (
     _run_streamed_julia,
     _valid_numerical_control_diagnostics,
 )
+from windows_solver.operation_control import (
+    JULIA_WORKER_ORIGIN,
+    build_operation_control_receipt,
+    operation_execution_identity,
+)
 from windows_solver.progress import (
     PROGRESS_SCHEMA,
     ProgressContext,
@@ -96,6 +101,31 @@ def _job_for_mechanism(mechanism_id: str):
     )
 
 
+def _worker_control_receipt(
+    request: dict[str, object],
+    failure_code: str,
+    *,
+    request_sha256: str | None = None,
+) -> dict[str, object]:
+    identity_mapping = dict(request["execution_identity"])
+    if request_sha256 is not None:
+        identity_mapping["request_sha256"] = request_sha256
+    identity = operation_execution_identity(identity_mapping)
+    return build_operation_control_receipt(
+        origin=JULIA_WORKER_ORIGIN,
+        failure_code=failure_code,
+        stage=control_failure_stage(failure_code),
+        identity=identity,
+        retryable=failure_code in {
+            "INSUFFICIENT_ASYMPTOTIC_PRECISION",
+            "HORIZON_ARITHMETIC_INADEQUATE",
+        },
+        retryable_basis="worker-control test fixture/v1",
+        diagnostics=valid_control_failure_diagnostics(
+            failure_code,
+            precision_bits=int(request["working_precision_bits"]),
+        ),
+    )
 def _production_promoted_backend(
     mechanism_id: str,
     adapter,
@@ -1952,19 +1982,24 @@ class JuliaResponseBackendTests(unittest.TestCase):
             worker.index("function control_failure_context(") :
             worker.index("function throw_ode_resource_limit(")
         ]
-        for field in (
-            "job_id",
-            "leaf_id",
-            "role",
-            "job_policy_sha256",
-            "backend_identity_sha256",
-            "refinement_level",
-            "request_sha256",
-        ):
+        for field in ("job_id", "leaf_id", "request_sha256"):
             self.assertIn(f'"{field}" =>', flatten)
             self.assertIn(f'required(document, "{field}")', flatten)
             self.assertIn(f'"{field}" =>', context)
             self.assertIn(f'required(request, "{field}")', context)
+        for field in (
+            "role",
+            "job_policy_sha256",
+            "refinement_level",
+        ):
+            self.assertIn(f'"{field}" =>', flatten)
+            self.assertIn(f'required(document, "{field}")', flatten)
+            self.assertIn(
+                f'failure_context["{field}"] = required(identity, "{field}")',
+                context,
+            )
+        self.assertIn('"execution_identity" => identity', context)
+        self.assertIn('"operation" => required(identity, "operation")', context)
 
     @staticmethod
     def _force_stop_process(pid_path: Path) -> None:
@@ -2264,7 +2299,8 @@ class JuliaResponseBackendTests(unittest.TestCase):
         self.assertIn('"ODE_RESOURCE_LIMIT"', worker)
         self.assertIn('"ODE_SOLVER_FAILURE"', worker)
         self.assertIn("failure isa ODEControlFailure && rethrow()", worker)
-        self.assertIn('"failure" => failure_details(failure)', worker)
+        self.assertIn("operation_control_receipt(", worker)
+        self.assertIn("failure_details(failure)", worker)
         self.assertIn("homogeneous_ode_maxiters", worker)
         self.assertNotIn("maxiters=Inf", worker)
         self.assertNotIn("maxiters=Inf", complex_frequencies)
@@ -2697,7 +2733,7 @@ class JuliaResponseBackendTests(unittest.TestCase):
 
         # This deliberately bounded inventory prevents the audit itself from
         # silently overlooking a new worker context construction style.
-        self.assertEqual(len(context_blocks), 8)
+        self.assertEqual(len(context_blocks), 7)
         self.assertEqual(
             assigned_context_names,
             {
@@ -3657,37 +3693,10 @@ class JuliaResponseBackendTests(unittest.TestCase):
                     "status": "error",
                     "error_type": "AsymptoticPrecisionError",
                     "message": "preflight rejected 80 digits",
-                    "failure": {
-                        "failure_code": "INSUFFICIENT_ASYMPTOTIC_PRECISION",
-                        "failure_class": "CONTROL",
-                        "retryable": True,
-                        "precision_digits": request["precision_digits"],
-                        "request_sha256": request["request_sha256"],
-                        "job_id": request["job_id"],
-                        "leaf_id": request["leaf_id"],
-                        "role": request["role"],
-                        "job_policy_sha256": request["job_policy_sha256"],
-                        "backend_identity_sha256": request[
-                            "backend_identity_sha256"
-                        ],
-                        "refinement_level": request["refinement_level"],
-                        "execution_resource_policy": {
-                            name: request["execution_resource"][name]
-                            for name in ("schema", "version", "sha256")
-                        },
-                        "diagnostics": {
-                            "predicted_reliable_digits": "11",
-                            "required_reliable_digits": "24",
-                            "asymptotic_preflight_avoided_ode": True,
-                            "asymptotic_preflight_reason": (
-                                "INSUFFICIENT_ASYMPTOTIC_PRECISION"
-                            ),
-                            "factored_homogeneous_rhs_evaluations": 0,
-                            "avoided_ode_scope": (
-                                "factored-homogeneous-gsn/v1"
-                            ),
-                        },
-                    },
+                    "failure": _worker_control_receipt(
+                        request,
+                        "INSUFFICIENT_ASYMPTOTIC_PRECISION",
+                    ),
                 }))
                 return SimpleNamespace(returncode=21, stdout="", stderr="")
 
@@ -3702,10 +3711,13 @@ class JuliaResponseBackendTests(unittest.TestCase):
                 adapter.evaluate(request)
 
         failure = raised.exception.worker_failure["failure"]
-        self.assertEqual(failure["request_binding"], request)
         self.assertEqual(
-            failure["request_sha256"],
+            failure["canonical_request_binding"]["request_sha256"],
             hashlib.sha256(canonical_json_bytes(request)).hexdigest(),
+        )
+        self.assertEqual(
+            dict(raised.exception.control_receipt.canonical_request),
+            request,
         )
 
     def test_failed_preflight_worker_cannot_substitute_valid_request_digest(self):
@@ -3726,37 +3738,11 @@ class JuliaResponseBackendTests(unittest.TestCase):
                     "status": "error",
                     "error_type": "AsymptoticPrecisionError",
                     "message": "forged request digest",
-                    "failure": {
-                        "failure_code": "INSUFFICIENT_ASYMPTOTIC_PRECISION",
-                        "failure_class": "CONTROL",
-                        "retryable": True,
-                        "precision_digits": request["precision_digits"],
-                        "request_sha256": "0" * 64,
-                        "job_id": request["job_id"],
-                        "leaf_id": request["leaf_id"],
-                        "role": request["role"],
-                        "job_policy_sha256": request["job_policy_sha256"],
-                        "backend_identity_sha256": request[
-                            "backend_identity_sha256"
-                        ],
-                        "refinement_level": request["refinement_level"],
-                        "execution_resource_policy": {
-                            name: request["execution_resource"][name]
-                            for name in ("schema", "version", "sha256")
-                        },
-                        "diagnostics": {
-                            "predicted_reliable_digits": "11",
-                            "required_reliable_digits": "24",
-                            "asymptotic_preflight_avoided_ode": True,
-                            "asymptotic_preflight_reason": (
-                                "INSUFFICIENT_ASYMPTOTIC_PRECISION"
-                            ),
-                            "factored_homogeneous_rhs_evaluations": 0,
-                            "avoided_ode_scope": (
-                                "factored-homogeneous-gsn/v1"
-                            ),
-                        },
-                    },
+                    "failure": _worker_control_receipt(
+                        request,
+                        "INSUFFICIENT_ASYMPTOTIC_PRECISION",
+                        request_sha256="0" * 64,
+                    ),
                 }))
                 return SimpleNamespace(returncode=21, stdout="", stderr="")
 

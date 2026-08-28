@@ -20,6 +20,12 @@ from windows_solver.julia_response_backend import (
     JuliaPrecisionRootBackend,
     JuliaResponseBackendError,
 )
+from windows_solver.operation_control import (
+    JULIA_WORKER_ORIGIN,
+    build_operation_control_receipt,
+    execution_identity_from_request,
+    validate_operation_control_receipt,
+)
 import windows_solver.julia_response_backend as julia_backend
 from windows_solver.response_batches import (
     PrecisionCapabilities,
@@ -1642,6 +1648,8 @@ class JuliaNumericalControlFailureTests(unittest.TestCase):
         "HORIZON_COORDINATE_INVERSION_FAILED",
         "HORIZON_ONLY_ONE_ENDPOINT",
         "COORDINATE_INVERSION_STALLED",
+        "COORDINATE_IDENTITY_MISMATCH",
+        "ODE_SOLVER_FAILURE",
         "DETERMINANT_UNCERTAINTY_TOO_LARGE",
         "EXTERIOR_DETERMINANT_CERTIFICATE_UNAVAILABLE",
         "FINITE_DIFFERENCE_NOISE_LIMIT",
@@ -1709,9 +1717,54 @@ class JuliaNumericalControlFailureTests(unittest.TestCase):
         for code in self.CODES:
             with self.subTest(code=code):
                 policy, details = self._details(code)
+                legacy_failure = details["failure"]
+                plan = build_campaign_plan(
+                    policy=response_engine.NumericalPolicy(),
+                    backend_identity=(
+                        response_engine.VettedNativeDeterminantKernel.identity
+                    ),
+                    precision_capabilities=PrecisionCapabilities((64, 80, 120)),
+                )
+                leaf = next(
+                    item for item in plan.leaves
+                    if item.mechanism_id == "horizon-admittance"
+                )
+                request = JuliaPrecisionRootBackend(
+                    leaf.job.backend_identity,
+                    object(),
+                    80,
+                    ode_error_budget=synthetic_ode_error_budget(80),
+                )._request(leaf.job, 0.0j)
+                request_sha256 = hashlib.sha256(
+                    canonical_json_bytes(request)
+                ).hexdigest()
+                identity = execution_identity_from_request(
+                    request,
+                    request_sha256=request_sha256,
+                )
+                receipt_mapping = build_operation_control_receipt(
+                    origin=JULIA_WORKER_ORIGIN,
+                    failure_code=code,
+                    stage=legacy_failure["stage"],
+                    identity=identity,
+                    retryable=legacy_failure["retryable"],
+                    retryable_basis="typed numerical-control fixture/v1",
+                    diagnostics=legacy_failure["diagnostics"],
+                )
+                control_receipt = validate_operation_control_receipt(
+                    receipt_mapping,
+                    request=request,
+                    request_sha256=request_sha256,
+                    diagnostics_validator=lambda _receipt: True,
+                )
+                details = dict(details)
+                details["failure"] = control_receipt.to_mapping()
                 julia_backend._require_worker_resource_identity(details, policy)
                 with self.assertRaises(error_type) as raised:
-                    julia_backend._raise_worker_failure(details)
+                    julia_backend._raise_worker_failure(
+                        details,
+                        control_receipt=control_receipt,
+                    )
                 self.assertEqual(raised.exception.failure_code, code)
                 self.assertEqual(
                     raised.exception.worker_failure["failure"]["diagnostics"],

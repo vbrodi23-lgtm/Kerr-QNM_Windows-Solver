@@ -30,6 +30,7 @@ from .contracts import canonical_json_bytes
 from .operation_control import (
     FIXED_ROOT_SURVEY_BATCH_OPERATION,
     JULIA_WORKER_ORIGIN,
+    OPERATION_CONTROL_RECEIPT_SCHEMA,
     PYTHON_SUPERVISOR_ORIGIN,
     REQUEST_SCOPE,
     SAMPLE_SCOPE,
@@ -1380,6 +1381,13 @@ def _bind_control_failure_to_request(
     structured = bound.get("failure")
     if not isinstance(structured, Mapping) or structured.get("failure_class") != "CONTROL":
         return bound, None
+    if structured.get("schema") != OPERATION_CONTROL_RECEIPT_SCHEMA:
+        if request_document.get("operation") not in {
+            "root-readout",
+            "fixed-root-determinant-sample",
+            FIXED_ROOT_SURVEY_BATCH_OPERATION,
+        }:
+            return bound, None
     expected_sha256 = hashlib.sha256(
         canonical_json_bytes(request_document)
     ).hexdigest()
@@ -2243,9 +2251,11 @@ def _timeout_worker_failure_details(
     output = dict(details)
     raw_identity = request.get("execution_identity")
     if not isinstance(raw_identity, Mapping):
-        raise JuliaResponseBackendError(
-            "worker timeout request execution identity is absent"
-        )
+        # The low-level adapter remains usable for probes and non-promoted
+        # callers that do not participate in the operation-control contract.
+        # Such a timeout is still typed operationally, but it cannot authorize
+        # a promoted transition or claim an authenticated request identity.
+        return output
     identity = operation_execution_identity(raw_identity)
     diagnostics: dict[str, object] = {
         "elapsed_request_seconds": execution_resource[
@@ -2264,7 +2274,7 @@ def _timeout_worker_failure_details(
         stage="worker-supervision",
         identity=identity,
         retryable=True,
-        retryable_basis="bounded worker wall-clock resource exhausted/v1",
+        retryable_basis="bounded-worker-wall-clock-resource-exhausted/v1",
         diagnostics=diagnostics,
     )
     return output
@@ -2413,10 +2423,15 @@ def _worker_request_document(
     ).hexdigest()
     document = dict(request_binding)
     document["request_sha256"] = request_sha256
-    document["execution_identity"] = execution_identity_from_request(
-        request_binding,
-        request_sha256=request_sha256,
-    ).to_mapping()
+    if request_binding.get("operation") in {
+        "root-readout",
+        "fixed-root-determinant-sample",
+        FIXED_ROOT_SURVEY_BATCH_OPERATION,
+    }:
+        document["execution_identity"] = execution_identity_from_request(
+            request_binding,
+            request_sha256=request_sha256,
+        ).to_mapping()
     return request_binding, document, request_sha256
 
 

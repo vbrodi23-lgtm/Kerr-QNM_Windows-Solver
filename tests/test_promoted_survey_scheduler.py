@@ -184,7 +184,14 @@ def _conditioning(
     })
 
 
-def _batch(leaf, seal: AuthenticatedRootSeal, digits: int, *, flat=False):
+def _batch(
+    leaf,
+    seal: AuthenticatedRootSeal,
+    digits: int,
+    *,
+    flat=False,
+    plan: FixedRootSurveyPlan = FixedRootSurveyPlan.FULL_NINE,
+):
     root = seal.fixed_root
     h = 1.0e-5 * (1.0 + abs(root))
     epsilon = float(leaf.job.policy.epsilons[0])
@@ -199,7 +206,13 @@ def _batch(leaf, seal: AuthenticatedRootSeal, digits: int, *, flat=False):
         (root, epsilon / 2.0),
         (root, -epsilon / 2.0),
     )
-    request_sha256 = str(digits // 40) * 64
+    contract = fixed_root_survey_request_contract(plan)
+    point_by_role = dict(zip(BINARY64_FIXED_ROOT_SAMPLE_ROLES, points))
+    request_sha256 = _sha256({
+        "leaf_id": leaf.leaf_id,
+        "digits": digits,
+        "plan": contract.plan.value,
+    })
     identity = OperationExecutionIdentity({
         "schema": OPERATION_EXECUTION_IDENTITY_SCHEMA,
         "scope": "REQUEST",
@@ -217,17 +230,16 @@ def _batch(leaf, seal: AuthenticatedRootSeal, digits: int, *, flat=False):
         "semantic_precision_tier": f"bigfloat-{digits}",
         "effective_policy_identity": leaf.job.policy.identity_sha256,
         "execution_resource_policy_identity": {"sha256": "3" * 64},
-        "plan": FixedRootSurveyPlan.FULL_NINE.value,
-        "scientific_operation_identity": "exterior-fixed-root-survey-raw/v1",
+        "plan": contract.plan.value,
+        "scientific_operation_identity": contract.scientific_operation_identity,
         "root_reference_id": leaf.job.root.root_reference_id,
         "root_seal_sha256": seal.root_seal_sha256,
         "branch_identity": seal.branch_identity,
-        "sample_roles": list(BINARY64_FIXED_ROOT_SAMPLE_ROLES),
+        "sample_roles": list(contract.sample_roles),
     })
     samples = []
-    for index, (role, (omega, amplitude)) in enumerate(
-        zip(BINARY64_FIXED_ROOT_SAMPLE_ROLES, points)
-    ):
+    for index, role in enumerate(contract.sample_roles):
+        omega, amplitude = point_by_role[role]
         frequency = 0.0 if flat else 3.0 * (omega.real - root.real)
         determinant = DecimalComplex(
             Decimal(str(frequency + 2.0 * amplitude)), Decimal(0)
@@ -255,8 +267,8 @@ def _batch(leaf, seal: AuthenticatedRootSeal, digits: int, *, flat=False):
         fixed_root=root,
         frequency_step=Decimal(format(h, ".17g")),
         coordinate_step=Decimal(str(epsilon)),
-        scientific_operation_identity="exterior-fixed-root-survey-raw/v1",
-        plan=FixedRootSurveyPlan.FULL_NINE,
+        scientific_operation_identity=contract.scientific_operation_identity,
+        plan=contract.plan,
         execution_identity=identity.to_mapping(),
         request_sha256=request_sha256,
         precision_tier=tier,
@@ -413,21 +425,12 @@ class _Backend:
             kwargs["fixed_root"], kwargs["branch_identity"],
             kwargs["root_seal_sha256"],
         )
-        batch = _batch(self.leaf, seal, self.digits, flat=self.flat)
-        contract = _requested_contract(kwargs)
-        return replace(
-            batch,
-            scientific_operation_identity=contract.scientific_operation_identity,
-            request_sha256=_sha256({
-                "leaf_id": self.leaf.leaf_id,
-                "digits": self.digits,
-                "plan": contract.plan.value,
-            }),
-            samples=tuple(
-                sample
-                for sample in batch.samples
-                if sample.role in contract.sample_roles
-            ),
+        return _batch(
+            self.leaf,
+            seal,
+            self.digits,
+            flat=self.flat,
+            plan=_requested_contract(kwargs).plan,
         )
 
 
@@ -885,21 +888,12 @@ class PromotedSurveySchedulerTests(unittest.TestCase):
                 kwargs["branch_identity"],
                 kwargs["root_seal_sha256"],
             )
-            full = _batch(backend.leaf, seal, backend.digits)
             contract = _requested_contract(kwargs)
-            return replace(
-                full,
-                scientific_operation_identity=contract.scientific_operation_identity,
-                request_sha256=_sha256({
-                    "leaf_id": backend.leaf.leaf_id,
-                    "digits": backend.digits,
-                    "plan": contract.plan.value,
-                }),
-                samples=tuple(
-                    sample
-                    for sample in full.samples
-                    if sample.role in contract.sample_roles
-                ),
+            return _batch(
+                backend.leaf,
+                seal,
+                backend.digits,
+                plan=contract.plan,
             )
 
         class InterruptingBackend(_Backend):
