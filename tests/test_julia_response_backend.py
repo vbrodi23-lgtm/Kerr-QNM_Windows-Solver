@@ -26,6 +26,7 @@ from windows_solver.julia_response_backend import (
     JuliaResponseBackendError,
     _forward_julia_progress_line,
     _control_receipt_diagnostics_validator,
+    _execution_resource_policy,
     _mode_specific_branch_enclosure_radius,
     _run_streamed_julia,
     _valid_numerical_control_diagnostics,
@@ -315,6 +316,44 @@ class JuliaResponseBackendTests(unittest.TestCase):
         self.assertFalse(
             _control_receipt_diagnostics_validator(
                 forged_root, request_binding={}
+            )
+        )
+
+    def test_supervisor_timeout_receipt_is_bound_to_request_resources(self):
+        resource = _execution_resource_policy()
+        request = {
+            "precision_digits": 40,
+            "execution_resource": resource,
+        }
+        timeout = {
+            "origin": "PYTHON_SUPERVISOR",
+            "failure_code": "WORKER_TIMEOUT",
+            "stage": "worker-supervision",
+            "diagnostics": {
+                "elapsed_request_seconds": resource[
+                    "worker_request_wall_clock_seconds"
+                ],
+                "limiting_resource": "worker_request_wall_clock",
+                "precision_digits": 40,
+                "execution_resource_policy": resource,
+                "last_validated_progress": {
+                    "schema": PROGRESS_SCHEMA,
+                    "kind": "request_started",
+                    "context": {},
+                    "payload": {},
+                },
+            },
+        }
+        self.assertTrue(
+            _control_receipt_diagnostics_validator(
+                timeout, request_binding=request
+            )
+        )
+        forged = json.loads(canonical_json_bytes(timeout))
+        forged["diagnostics"]["elapsed_request_seconds"] -= 1
+        self.assertFalse(
+            _control_receipt_diagnostics_validator(
+                forged, request_binding=request
             )
         )
 

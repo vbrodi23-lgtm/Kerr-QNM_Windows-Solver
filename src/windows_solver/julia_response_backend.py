@@ -1372,14 +1372,44 @@ def _control_receipt_diagnostics_validator(
             == "first-determinant-linear-lower-bound/v1"
         )
     if code == "WORKER_TIMEOUT":
+        if not isinstance(diagnostics, Mapping):
+            return False
+        expected_fields = {
+            "elapsed_request_seconds",
+            "limiting_resource",
+            "precision_digits",
+            "execution_resource_policy",
+        }
+        if "last_validated_progress" in diagnostics:
+            expected_fields.add("last_validated_progress")
+        resource = request_binding.get("execution_resource")
+        last_progress = diagnostics.get("last_validated_progress")
+        valid_last_progress = "last_validated_progress" not in diagnostics or (
+            isinstance(last_progress, Mapping)
+            and set(last_progress) == {"schema", "kind", "context", "payload"}
+            and last_progress.get("schema") == PROGRESS_SCHEMA
+            and isinstance(last_progress.get("kind"), str)
+            and last_progress.get("kind") in {item.value for item in ProgressEventKind}
+            and isinstance(last_progress.get("context"), Mapping)
+            and isinstance(last_progress.get("payload"), Mapping)
+        )
         return (
             receipt.get("origin") == PYTHON_SUPERVISOR_ORIGIN
             and receipt.get("stage") == "worker-supervision"
-            and isinstance(diagnostics, Mapping)
+            and set(diagnostics) == expected_fields
             and diagnostics.get("limiting_resource")
             == "worker_request_wall_clock"
             and isinstance(diagnostics.get("elapsed_request_seconds"), int)
             and diagnostics["elapsed_request_seconds"] > 0
+            and isinstance(resource, Mapping)
+            and diagnostics["elapsed_request_seconds"]
+            == resource.get("worker_request_wall_clock_seconds")
+            and diagnostics.get("precision_digits")
+            == request_binding.get("precision_digits")
+            and _worker_resource_identity_matches(
+                diagnostics.get("execution_resource_policy"), resource
+            )
+            and valid_last_progress
         )
     return False
 
