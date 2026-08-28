@@ -14,11 +14,14 @@ function finite_difference_control_request(;
     determinant_error_safety_factor="8",
 )
     digest = repeat("0", 64)
-    return Dict{String,Any}(
+    request = Dict{String,Any}(
+        "operation" => "root-readout",
         "precision_digits" => 80,
+        "working_precision_bits" => working_precision_bits_for(80),
+        "semantic_precision_tier" => "bigfloat-80",
         "request_sha256" => digest,
         "job_id" => "finite-difference-spec",
-        "leaf_id" => 13,
+        "leaf_id" => "finite-difference-spec-leaf",
         "role" => "specification",
         "job_policy_sha256" => digest,
         "backend_identity_sha256" => digest,
@@ -36,6 +39,29 @@ function finite_difference_control_request(;
         "spin" => "0.95",
         "m" => 2,
     )
+    request["execution_identity"] = Dict{String,Any}(
+        "schema" => OPERATION_EXECUTION_IDENTITY_SCHEMA,
+        "scope" => "REQUEST",
+        "operation" => "root-readout",
+        "request_schema" => "windows-solver.root-readout/1",
+        "request_sha256" => digest,
+        "leaf_id" => request["leaf_id"],
+        "job_id" => request["job_id"],
+        "backend_identity_sha256" => request["backend_identity_sha256"],
+        "precision_digits" => request["precision_digits"],
+        "working_precision_bits" => request["working_precision_bits"],
+        "semantic_precision_tier" => request["semantic_precision_tier"],
+        "effective_policy_identity" => digest,
+        "execution_resource_policy_identity" => Dict{String,Any}(
+            "schema" => request["resource_policy_schema"],
+            "version" => request["resource_policy_version"],
+            "sha256" => request["resource_policy_sha256"],
+        ),
+        "role" => request["role"],
+        "job_policy_sha256" => request["job_policy_sha256"],
+        "refinement_level" => request["refinement_level"],
+    )
+    return request
 end
 
 @testset "determinant error breakdown validates and aggregates absolute components" begin
