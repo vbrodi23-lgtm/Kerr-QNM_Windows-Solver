@@ -98,6 +98,7 @@ from .background_evidence_store import CanonicalBackgroundEvidenceStore
 from .julia_response_backend import (
     ExteriorDeterminantErrorEvidence,
     FIXED_ROOT_SURVEY_BATCH_SCHEMA,
+    FIXED_ROOT_SURVEY_BATCH_RESPONSE_SCHEMA,
     FixedRootSurveyPlan,
     FixedRootSurveyConditioning,
     JuliaFixedRootSurveyBatch,
@@ -1718,6 +1719,13 @@ _PROMOTED_BACKGROUND_RECEIPT_SCHEMA = (
     "windows-solver.promoted-background-reuse-receipt/1"
 )
 _PROMOTED_ROOT_RECEIPT_SCHEMA = "windows-solver.promoted-root-evidence-receipt/1"
+_PROMOTED_CONTROL_RETURN_SCHEMA = (
+    "windows-solver.promoted-exterior-control-return/2"
+)
+_PROMOTED_CONTROL_DECISION_SCHEMA = (
+    "windows-solver.promoted-exterior-control-decision/1"
+)
+_PROMOTED_PARTIAL_WORK_SCHEMA = "windows-solver.promoted-partial-work/1"
 _PROMOTED_BACKGROUND_SAMPLE_ROLES = BINARY64_FIXED_ROOT_SAMPLE_ROLES[:5]
 _PROMOTED_COMPONENT_SAMPLE_ROLES = BINARY64_FIXED_ROOT_SAMPLE_ROLES[5:]
 
@@ -1811,7 +1819,7 @@ def promoted_fixed_root_batch_from_mapping(
     }
     if not isinstance(value, Mapping) or set(value) != fields:
         raise ValueError("retained promoted batch fields are invalid")
-    if value.get("schema") != FIXED_ROOT_SURVEY_BATCH_SCHEMA:
+    if value.get("schema") != FIXED_ROOT_SURVEY_BATCH_RESPONSE_SCHEMA:
         raise ValueError("retained promoted batch schema is invalid")
 
     def parse_complex(item: object, label: str) -> complex:
@@ -2116,10 +2124,10 @@ def _promoted_artifact_digest(
 
     schema = artifact.get("schema")
     digest_field = {
-        "windows-solver.promoted-exterior-control-return/2": (
+        _PROMOTED_CONTROL_RETURN_SCHEMA: (
             "control_return_sha256"
         ),
-        "windows-solver.promoted-exterior-control-decision/1": (
+        _PROMOTED_CONTROL_DECISION_SCHEMA: (
             "control_decision_sha256"
         ),
     }.get(schema, "calculation_sha256")
@@ -2133,6 +2141,32 @@ def _promoted_artifact_digest(
     return digest_field, supplied
 
 
+def _validated_promoted_partial_work(value: object) -> dict[str, object]:
+    """Validate the raw return's authenticated work already completed."""
+
+    fields = {
+        "schema",
+        "sample_count",
+        "root_read_count",
+        "worker_launch_count",
+        "evidence_receipts",
+    }
+    if not isinstance(value, Mapping) or set(value) != fields:
+        raise ValueError("promoted partial-work accounting fields are invalid")
+    if value.get("schema") != _PROMOTED_PARTIAL_WORK_SCHEMA:
+        raise ValueError("promoted partial-work accounting schema is invalid")
+    for name in ("sample_count", "root_read_count", "worker_launch_count"):
+        item = value[name]
+        if isinstance(item, bool) or not isinstance(item, int) or item < 0:
+            raise ValueError("promoted partial-work accounting is invalid")
+    receipts = value["evidence_receipts"]
+    if not isinstance(receipts, list) or not all(
+        isinstance(item, Mapping) for item in receipts
+    ):
+        raise ValueError("promoted partial-work receipts are invalid")
+    return json.loads(canonical_json_bytes(dict(value)))
+
+
 def _revalidate_promoted_control_proof(
     control_return: Mapping[str, object],
     control_decision: Mapping[str, object],
@@ -2140,14 +2174,45 @@ def _revalidate_promoted_control_proof(
     """Re-hash, re-bind, and reclassify a retained continuation proof."""
 
     if (
-        control_return.get("schema")
-        != "windows-solver.promoted-exterior-control-return/2"
-        or control_decision.get("schema")
-        != "windows-solver.promoted-exterior-control-decision/1"
+        control_return.get("schema") != _PROMOTED_CONTROL_RETURN_SCHEMA
+        or control_decision.get("schema") != _PROMOTED_CONTROL_DECISION_SCHEMA
         or not isinstance(control_return.get("control_receipt"), Mapping)
         or not isinstance(control_return.get("canonical_request"), Mapping)
     ):
         raise ValueError("promoted control proof schemas are invalid")
+    return_fields = {
+        "schema",
+        "operation",
+        "request_schema",
+        "request_sha256",
+        "execution_identity_sha256",
+        "effective_policy_identity",
+        "current_tier",
+        "current_action_kind",
+        "canonical_request",
+        "control_receipt",
+        "control_receipt_sha256",
+        "partial_work",
+        "control_return_sha256",
+    }
+    decision_fields = {
+        "schema",
+        "control_return_sha256",
+        "control_receipt_sha256",
+        "failure_code",
+        "failure_fingerprint_sha256",
+        "fingerprint_material",
+        "disposition",
+        "queue_kind",
+        "current_tier",
+        "current_action_kind",
+        "next_tier",
+        "next_action_kind",
+        "control_decision_sha256",
+    }
+    if set(control_return) != return_fields or set(control_decision) != decision_fields:
+        raise ValueError("promoted control proof fields are invalid")
+    _validated_promoted_partial_work(control_return["partial_work"])
     _, return_sha256 = _promoted_artifact_digest(control_return)
     _, decision_sha256 = _promoted_artifact_digest(control_decision)
     del decision_sha256
@@ -2155,6 +2220,26 @@ def _revalidate_promoted_control_proof(
         control_return["control_receipt"],
         control_return["canonical_request"],
     )
+    identity = receipt.identity
+    effective_policy = identity.mapping["effective_policy_identity"]
+    effective_policy_sha256 = (
+        str(effective_policy["sha256"])
+        if isinstance(effective_policy, Mapping)
+        else str(effective_policy)
+    )
+    if (
+        control_return["operation"] != identity.operation
+        or control_return["request_schema"]
+        != identity.mapping["request_schema"]
+        or control_return["request_sha256"] != identity.request_sha256
+        or control_return["execution_identity_sha256"] != identity.sha256
+        or control_return["effective_policy_identity"]
+        != effective_policy_sha256
+        or control_return["control_receipt_sha256"] != receipt.sha256
+        or control_return["current_tier"] not in {"BF40", "BF80"}
+        or control_return["current_action_kind"] not in {"ROOT", "RESPONSE"}
+    ):
+        raise ValueError("promoted control return identity is invalid")
     report, decision = classify_validated_control_receipt(
         receipt,
         current_tier=str(control_return.get("current_tier")),
@@ -2186,8 +2271,7 @@ def _control_decision_authorizes_bf80(
     if not isinstance(decision, Mapping):
         return False
     return (
-        decision.get("schema")
-        == "windows-solver.promoted-exterior-control-decision/1"
+        decision.get("schema") == _PROMOTED_CONTROL_DECISION_SCHEMA
         and decision.get("disposition")
         == FailureDisposition.PROMOTION_PENDING.value
         and decision.get("queue_kind") == decision.get("current_action_kind")
@@ -2200,23 +2284,23 @@ def _control_decision_authorizes_bf80(
 def _outcome_authorizes_bf80(outcome: PromotedPassOutcome) -> bool:
     artifact = outcome.calculation_artifact
     if isinstance(artifact, Mapping) and artifact.get("schema") == (
-        "windows-solver.promoted-exterior-control-decision/1"
+        _PROMOTED_CONTROL_DECISION_SCHEMA
     ):
         return _control_decision_authorizes_bf80(outcome)
-    return outcome.reason_code in PROMOTION_ALLOWLIST
+    return False
 
 
 def _control_trace_fields(outcome: PromotedPassOutcome) -> dict[str, object]:
     decision = outcome.calculation_artifact
     if not isinstance(decision, Mapping) or decision.get("schema") != (
-        "windows-solver.promoted-exterior-control-decision/1"
+        _PROMOTED_CONTROL_DECISION_SCHEMA
     ):
         return {}
     raw: Mapping[str, object] | None = None
     for stage in reversed(outcome.calculation_chain):
         candidate = stage.get("calculation_artifact")
         if isinstance(candidate, Mapping) and candidate.get("schema") == (
-            "windows-solver.promoted-exterior-control-return/2"
+            _PROMOTED_CONTROL_RETURN_SCHEMA
         ):
             raw = candidate
             break
@@ -2274,7 +2358,7 @@ def reduce_promoted_exterior_from_checkpoint(
             "fixed-root control return /1 is forensic history only"
         )
     if isinstance(artifact, Mapping) and artifact.get("schema") == (
-        "windows-solver.promoted-exterior-control-return/2"
+        _PROMOTED_CONTROL_RETURN_SCHEMA
     ):
         artifact_fields = {
             "schema",
@@ -2288,6 +2372,7 @@ def reduce_promoted_exterior_from_checkpoint(
             "canonical_request",
             "control_receipt",
             "control_receipt_sha256",
+            "partial_work",
             "control_return_sha256",
         }
         receipts = retained_stage.get("receipts")
@@ -2310,6 +2395,16 @@ def reduce_promoted_exterior_from_checkpoint(
             or not all(isinstance(item, int) and item >= 0 for item in counters)
         ):
             raise ValueError("promoted exterior control return is invalid")
+        partial_work = _validated_promoted_partial_work(artifact["partial_work"])
+        if (
+            partial_work["sample_count"] != counters[0]
+            or partial_work["root_read_count"] != counters[1]
+            or partial_work["worker_launch_count"] != counters[2]
+            or partial_work["evidence_receipts"] != receipts
+        ):
+            raise ValueError(
+                "promoted exterior control partial work does not match checkpoint"
+            )
         _, control_return_sha256 = _promoted_artifact_digest(artifact)
         validated_receipt = validate_persisted_operation_control_receipt(
             artifact["control_receipt"], artifact["canonical_request"]
@@ -2348,7 +2443,7 @@ def reduce_promoted_exterior_from_checkpoint(
         ):
             raise ValueError("promoted control queue transition is invalid")
         decision_content: dict[str, object] = {
-            "schema": "windows-solver.promoted-exterior-control-decision/1",
+            "schema": _PROMOTED_CONTROL_DECISION_SCHEMA,
             "control_return_sha256": control_return_sha256,
             "control_receipt_sha256": validated_receipt.sha256,
             "failure_code": decision.failure_code,
@@ -3107,19 +3202,31 @@ def _run_promoted_exterior_queue_entry(
                 for item in reversed(retained_chain)
                 if isinstance(item.get("calculation_artifact"), Mapping)
                 and item["calculation_artifact"].get("schema")
-                == "windows-solver.promoted-exterior-control-return/2"
+                == _PROMOTED_CONTROL_RETURN_SCHEMA
             ),
             None,
         )
         if isinstance(retained_decision, Mapping) and retained_decision.get(
             "schema"
-        ) == "windows-solver.promoted-exterior-control-decision/1":
+        ) == _PROMOTED_CONTROL_DECISION_SCHEMA:
             if not isinstance(raw_control_return, Mapping):
                 raise ValueError("promoted continuation lost its raw control return")
             _revalidate_promoted_control_proof(
                 raw_control_return,
                 retained_decision,
             )
+            partial_work = _validated_promoted_partial_work(
+                raw_control_return["partial_work"]
+            )
+            if (
+                partial_work["sample_count"] != sample_count
+                or partial_work["root_read_count"] != root_reads
+                or partial_work["worker_launch_count"] != worker_launches
+                or partial_work["evidence_receipts"] != retained_receipts
+            ):
+                raise ValueError(
+                    "promoted continuation partial work is not authenticated"
+                )
             if not _control_decision_authorizes_bf80(
                 PromotedPassOutcome(
                     disposition=SurveyDisposition.UNRESOLVED,
@@ -3164,7 +3271,7 @@ def _run_promoted_exterior_queue_entry(
             else str(effective_policy)
         )
         content: dict[str, object] = {
-            "schema": "windows-solver.promoted-exterior-control-return/2",
+            "schema": _PROMOTED_CONTROL_RETURN_SCHEMA,
             "operation": identity.operation,
             "request_schema": identity.mapping["request_schema"],
             "request_sha256": identity.request_sha256,
@@ -3175,6 +3282,13 @@ def _run_promoted_exterior_queue_entry(
             "canonical_request": copy.deepcopy(dict(canonical_request)),
             "control_receipt": control_receipt.to_mapping(),
             "control_receipt_sha256": control_receipt.sha256,
+            "partial_work": {
+                "schema": _PROMOTED_PARTIAL_WORK_SCHEMA,
+                "sample_count": sample_count,
+                "root_read_count": root_reads,
+                "worker_launch_count": worker_launches,
+                "evidence_receipts": copy.deepcopy(receipts),
+            },
         }
         artifact = {
             **content,
@@ -3261,7 +3375,7 @@ def _run_promoted_exterior_queue_entry(
                     digits == 40
                     and isinstance(control_decision, Mapping)
                     and control_decision.get("schema")
-                    == "windows-solver.promoted-exterior-control-decision/1"
+                    == _PROMOTED_CONTROL_DECISION_SCHEMA
                     and control_decision.get("disposition")
                     == FailureDisposition.PROMOTION_PENDING.value
                     and control_decision.get("queue_kind") == "ROOT"
@@ -3492,7 +3606,7 @@ def _run_promoted_exterior_queue_entry(
                 digits == 40
                 and isinstance(control_decision, Mapping)
                 and control_decision.get("schema")
-                == "windows-solver.promoted-exterior-control-decision/1"
+                == _PROMOTED_CONTROL_DECISION_SCHEMA
                 and control_decision.get("disposition")
                 == FailureDisposition.PROMOTION_PENDING.value
                 and control_decision.get("queue_kind") == "RESPONSE"
@@ -4706,7 +4820,7 @@ def run_promoted_survey(
                     "PROMOTED_CONTROL_RETURN_CHECKPOINTED"
                     if isinstance(raw_artifact, Mapping)
                     and raw_artifact.get("schema")
-                    == "windows-solver.promoted-exterior-control-return/2"
+                    == _PROMOTED_CONTROL_RETURN_SCHEMA
                     else "PROMOTED_RAW_CALCULATION_CHECKPOINTED"
                 ),
                 phase="raw-return-checkpoint",
@@ -4821,7 +4935,7 @@ def run_promoted_survey(
                         }
                         if isinstance(reduced.calculation_artifact, Mapping)
                         and reduced.calculation_artifact.get("schema")
-                        == "windows-solver.promoted-exterior-control-decision/1"
+                        == _PROMOTED_CONTROL_DECISION_SCHEMA
                         else {}
                     ),
                 },

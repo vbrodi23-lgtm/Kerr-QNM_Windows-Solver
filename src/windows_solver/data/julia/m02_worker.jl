@@ -20,6 +20,8 @@ const CONDITIONING_SCHEMA = "windows-solver.m02-conditioning/3"
 const FIXED_ROOT_SURVEY_BATCH_OPERATION = "fixed-root-survey-batch"
 const FIXED_ROOT_SURVEY_BATCH_SCHEMA =
     "windows-solver.fixed-root-survey-batch/2"
+const FIXED_ROOT_SURVEY_BATCH_RESPONSE_SCHEMA =
+    "windows-solver.fixed-root-survey-batch-response/2"
 const FIXED_ROOT_SURVEY_IDENTITY = "exterior-fixed-root-survey-raw/v1"
 const CANONICAL_EXTERIOR_BACKGROUND_IDENTITY =
     "canonical-exterior-background-wronskian/v1"
@@ -8545,6 +8547,10 @@ function fixed_root_survey_conditioning_fields(
     required_digits = required_reliable_digits(T, request)
     return Dict{String,Any}(
         "schema" => FIXED_ROOT_SURVEY_CONDITIONING_SCHEMA,
+        "fixed_root_reliability_target_abs" =>
+            string(required(request, "fixed_root_reliability_target_abs")),
+        "fixed_root_reliability_rule" =>
+            string(required(request, "fixed_root_reliability_rule")),
         "determinant_family" => EXTERIOR_DETERMINANT_FAMILY_ID,
         "homogeneous_representation" => HOMOGENEOUS_REPRESENTATION_ID,
         "branch_convention" => BRANCH_CONVENTION_ID,
@@ -8685,7 +8691,7 @@ function fixed_root_survey_batch_fields(request, digits::Int, bits::Int, roles, 
         error("fixed-root survey response count is invalid")
     return Dict{String,Any}(
         "schema_version" => 2,
-        "schema" => FIXED_ROOT_SURVEY_BATCH_SCHEMA,
+        "schema" => FIXED_ROOT_SURVEY_BATCH_RESPONSE_SCHEMA,
         "status" => "ok",
         "operation" => FIXED_ROOT_SURVEY_BATCH_OPERATION,
         "identity" => FIXED_ROOT_SURVEY_IDENTITY,

@@ -157,6 +157,10 @@ def _conditioning(
 ) -> FixedRootSurveyConditioning:
     return FixedRootSurveyConditioning({
         "schema": "windows-solver.fixed-root-survey-conditioning/2",
+        "fixed_root_reliability_target_abs": "2e-11",
+        "fixed_root_reliability_rule": (
+            "minus-log10-target-plus-required-digit-guard/v1"
+        ),
         "determinant_family": "exterior-wronskian/v1",
         "homogeneous_representation": "factored-plane-wave-gsn/v1",
         "branch_convention": "gsn-complex-rho/v1",

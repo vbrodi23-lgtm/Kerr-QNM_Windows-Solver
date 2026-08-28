@@ -9,6 +9,7 @@ from windows_solver.contracts import canonical_json_bytes
 from windows_solver.julia_response_backend import (
     FIXED_ROOT_SURVEY_BATCH_OPERATION,
     FIXED_ROOT_SURVEY_BATCH_SCHEMA,
+    FIXED_ROOT_SURVEY_BATCH_RESPONSE_SCHEMA,
     FixedRootSurveyPlan,
     JuliaFixedRootSurveyBatch,
     JuliaPrecisionRootBackend,
@@ -48,6 +49,10 @@ def _conditioning(request) -> dict[str, object]:
     policy = request["policy"]
     return {
         "schema": "windows-solver.fixed-root-survey-conditioning/2",
+        "fixed_root_reliability_target_abs": request[
+            "fixed_root_reliability_target_abs"
+        ],
+        "fixed_root_reliability_rule": request["fixed_root_reliability_rule"],
         "determinant_family": "exterior-wronskian/v1",
         "homogeneous_representation": policy["homogeneous_representation"],
         "branch_convention": policy["branch_convention"],
@@ -88,7 +93,7 @@ class _BatchAdapter:
         )
         response = {
             "schema_version": 2,
-            "schema": FIXED_ROOT_SURVEY_BATCH_SCHEMA,
+            "schema": FIXED_ROOT_SURVEY_BATCH_RESPONSE_SCHEMA,
             "status": "ok",
             "operation": FIXED_ROOT_SURVEY_BATCH_OPERATION,
             "identity": BINARY64_FIXED_ROOT_SURVEY_IDENTITY,

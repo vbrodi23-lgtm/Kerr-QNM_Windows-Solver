@@ -136,6 +136,9 @@ _DEFAULT_COORDINATE_STALL_MINIMUM_STEP_FRACTION = "1e-12"
 _PROMOTED_REQUEST_PREFLIGHT_TIMEOUT_SECONDS = 600
 _PROMOTED_REQUEST_PREFLIGHT_OPERATION = "promoted-request-preflight"
 FIXED_ROOT_SURVEY_BATCH_SCHEMA = "windows-solver.fixed-root-survey-batch/2"
+FIXED_ROOT_SURVEY_BATCH_RESPONSE_SCHEMA = (
+    "windows-solver.fixed-root-survey-batch-response/2"
+)
 FIXED_ROOT_SURVEY_CONDITIONING_SCHEMA = (
     "windows-solver.fixed-root-survey-conditioning/2"
 )
@@ -2517,6 +2520,8 @@ class FixedRootSurveyConditioning:
     def __post_init__(self) -> None:
         fields = {
             "schema",
+            "fixed_root_reliability_target_abs",
+            "fixed_root_reliability_rule",
             "determinant_family",
             "homogeneous_representation",
             "branch_convention",
@@ -2537,6 +2542,19 @@ class FixedRootSurveyConditioning:
             raise ValueError("fixed-root survey conditioning fields are invalid")
         if self.mapping["schema"] != FIXED_ROOT_SURVEY_CONDITIONING_SCHEMA:
             raise ValueError("fixed-root survey conditioning schema is invalid")
+        target = _finite_decimal_text(
+            self.mapping["fixed_root_reliability_target_abs"],
+            "fixed-root survey conditioning reliability target",
+            nonnegative=True,
+        )
+        if target <= 0 or target >= 1:
+            raise ValueError(
+                "fixed-root survey conditioning reliability target is invalid"
+            )
+        if self.mapping["fixed_root_reliability_rule"] != FIXED_ROOT_RELIABILITY_RULE:
+            raise ValueError(
+                "fixed-root survey conditioning reliability rule is invalid"
+            )
         for name in (
             "determinant_family",
             "homogeneous_representation",
@@ -2736,7 +2754,7 @@ class JuliaFixedRootSurveyBatch:
 
     def to_mapping(self) -> dict[str, object]:
         return {
-            "schema": FIXED_ROOT_SURVEY_BATCH_SCHEMA,
+            "schema": FIXED_ROOT_SURVEY_BATCH_RESPONSE_SCHEMA,
             "operation": self.operation,
             "identity": self.identity,
             "plan": self.plan.value,
@@ -3754,8 +3772,10 @@ class JuliaPrecisionRootBackend:
             "fixed-root reliability target",
             nonnegative=True,
         )
-        if target <= 0:
-            raise ValueError("fixed-root reliability target must be positive")
+        if target <= 0 or target >= 1:
+            raise ValueError(
+                "fixed-root reliability target must be between zero and one"
+            )
         for field in (
             _FIXED_ROOT_SURVEY_REVIEW_ONLY_POLICY_FIELDS
             | _FIXED_ROOT_SURVEY_ROOT_ONLY_POLICY_FIELDS
@@ -3928,7 +3948,7 @@ class JuliaPrecisionRootBackend:
                 "M02 fixed-root survey batch response fields are invalid"
             )
         expected_bindings = {
-            "schema": FIXED_ROOT_SURVEY_BATCH_SCHEMA,
+            "schema": FIXED_ROOT_SURVEY_BATCH_RESPONSE_SCHEMA,
             "operation": FIXED_ROOT_SURVEY_BATCH_OPERATION,
             "identity": BINARY64_FIXED_ROOT_SURVEY_IDENTITY,
             "plan": contract.plan.value,
@@ -4045,6 +4065,16 @@ class JuliaPrecisionRootBackend:
             ):
                 raise JuliaResponseBackendError(
                     "M02 fixed-root survey conditioning disagrees with request"
+                )
+            if (
+                telemetry["fixed_root_reliability_target_abs"]
+                != request["fixed_root_reliability_target_abs"]
+                or telemetry["fixed_root_reliability_rule"]
+                != request["fixed_root_reliability_rule"]
+            ):
+                raise JuliaResponseBackendError(
+                    "M02 fixed-root survey reliability telemetry disagrees "
+                    "with request"
                 )
             raw_evidence = raw["determinant_error_evidence"]
             determinant_error_evidence = None
