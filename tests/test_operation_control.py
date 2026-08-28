@@ -360,24 +360,19 @@ class OperationControlTests(unittest.TestCase):
         request, identity = _identity(
             FIXED_ROOT_SURVEY_BATCH_OPERATION, SAMPLE_SCOPE, tier="BF80"
         )
-        unknown = validate_operation_control_receipt(
-            build_operation_control_receipt(
-                origin=JULIA_WORKER_ORIGIN,
-                failure_code="UNKNOWN_CONTROL_OUTCOME",
-                stage="unknown-stage",
-                identity=identity,
-                retryable=True,
-                retryable_basis="worker-requested-retry/v1",
-                diagnostics={"reason": "UNKNOWN_CONTROL_OUTCOME"},
-            ),
-            request=request,
-            request_sha256=identity.request_sha256,
-        )
-        with self.assertRaises(ValueError):
-            promoted_control_transition(
-                unknown,
-                current_tier="BF80",
-                current_action_kind="RESPONSE",
+        with self.assertRaisesRegex(ValueError, "not registered"):
+            validate_operation_control_receipt(
+                build_operation_control_receipt(
+                    origin=JULIA_WORKER_ORIGIN,
+                    failure_code="UNKNOWN_CONTROL_OUTCOME",
+                    stage="unknown-stage",
+                    identity=identity,
+                    retryable=True,
+                    retryable_basis="worker-requested-retry/v1",
+                    diagnostics={"reason": "UNKNOWN_CONTROL_OUTCOME"},
+                ),
+                request=request,
+                request_sha256=identity.request_sha256,
             )
 
         known = validate_operation_control_receipt(
@@ -420,24 +415,19 @@ class OperationControlTests(unittest.TestCase):
         request, identity = _identity(
             FIXED_ROOT_SURVEY_BATCH_OPERATION, SAMPLE_SCOPE, tier="BF40"
         )
-        receipt = validate_operation_control_receipt(
-            build_operation_control_receipt(
-                origin=JULIA_WORKER_ORIGIN,
-                failure_code="FINITE_DIFFERENCE_NOISE_LIMIT",
-                stage="finite-difference",
-                identity=identity,
-                retryable=True,
-                retryable_basis="forged fixed-root derivative outcome/v1",
-                diagnostics={"reason": "FINITE_DIFFERENCE_NOISE_LIMIT"},
-            ),
-            request=request,
-            request_sha256=identity.request_sha256,
-        )
-        with self.assertRaisesRegex(ValueError, "no exact transition"):
-            promoted_control_transition(
-                receipt,
-                current_tier="BF40",
-                current_action_kind="RESPONSE",
+        with self.assertRaisesRegex(ValueError, "not registered"):
+            validate_operation_control_receipt(
+                build_operation_control_receipt(
+                    origin=JULIA_WORKER_ORIGIN,
+                    failure_code="FINITE_DIFFERENCE_NOISE_LIMIT",
+                    stage="finite-difference",
+                    identity=identity,
+                    retryable=True,
+                    retryable_basis="forged fixed-root derivative outcome/v1",
+                    diagnostics={"reason": "FINITE_DIFFERENCE_NOISE_LIMIT"},
+                ),
+                request=request,
+                request_sha256=identity.request_sha256,
             )
 
     def test_multi_stage_worker_codes_have_exact_registry_entries(self) -> None:

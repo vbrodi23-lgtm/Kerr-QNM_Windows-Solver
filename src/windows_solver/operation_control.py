@@ -495,6 +495,7 @@ def validate_operation_control_receipt(
         )
         if identity.to_mapping() != expected_identity.to_mapping():
             raise ValueError("operation control identity does not match request")
+    _validate_registered_control_emission(receipt, identity)
     return ValidatedControlReceipt(
         receipt,
         identity,
@@ -627,6 +628,44 @@ _FIXED_ROOT_SURVEY_CONTROL_STAGE: Mapping[str, tuple[str, ...]] = (
         "WORKER_TIMEOUT": ("worker-supervision",),
     })
 )
+_FIXED_ROOT_DETERMINANT_CONTROL_STAGE: Mapping[str, tuple[str, ...]] = (
+    MappingProxyType({
+        **dict(_FIXED_ROOT_SURVEY_CONTROL_STAGE),
+        "WORKER_TIMEOUT": ("worker-supervision",),
+    })
+)
+_CONTROL_STAGE_BY_OPERATION: Mapping[
+    str, Mapping[str, tuple[str, ...]]
+] = MappingProxyType({
+    ROOT_READOUT_OPERATION: _ROOT_READOUT_CONTROL_STAGE,
+    FIXED_ROOT_SURVEY_BATCH_OPERATION: _FIXED_ROOT_SURVEY_CONTROL_STAGE,
+    FIXED_ROOT_DETERMINANT_SAMPLE_OPERATION: (
+        _FIXED_ROOT_DETERMINANT_CONTROL_STAGE
+    ),
+})
+
+
+def _validate_registered_control_emission(
+    receipt: Mapping[str, object],
+    identity: OperationExecutionIdentity,
+) -> None:
+    """Reject an operation/code/stage/scope combination no producer owns."""
+
+    operation_stages = _CONTROL_STAGE_BY_OPERATION[identity.operation]
+    code = str(receipt["failure_code"])
+    stage = str(receipt["stage"])
+    if stage not in operation_stages.get(code, ()):
+        raise ValueError("operation control emission is not registered")
+    timeout = code == "WORKER_TIMEOUT"
+    expected_origin = PYTHON_SUPERVISOR_ORIGIN if timeout else JULIA_WORKER_ORIGIN
+    expected_scope = (
+        SAMPLE_SCOPE
+        if identity.operation == FIXED_ROOT_SURVEY_BATCH_OPERATION
+        and not timeout
+        else REQUEST_SCOPE
+    )
+    if receipt.get("origin") != expected_origin or identity.scope != expected_scope:
+        raise ValueError("operation control emission identity is incompatible")
 
 _PROMOTION_CODES: Mapping[str, str] = MappingProxyType({
     "INSUFFICIENT_ASYMPTOTIC_PRECISION": "RESPONSE",
@@ -669,13 +708,13 @@ def _build_transition_registry() -> Mapping[tuple[str, str, str, str, str, str, 
             ROOT_READOUT_OPERATION,
             "ROOT",
             REQUEST_SCOPE,
-            _ROOT_READOUT_CONTROL_STAGE,
+            _CONTROL_STAGE_BY_OPERATION[ROOT_READOUT_OPERATION],
         ),
         (
             FIXED_ROOT_SURVEY_BATCH_OPERATION,
             "RESPONSE",
             SAMPLE_SCOPE,
-            _FIXED_ROOT_SURVEY_CONTROL_STAGE,
+            _CONTROL_STAGE_BY_OPERATION[FIXED_ROOT_SURVEY_BATCH_OPERATION],
         ),
     )
     for operation, action, scope, code_stages in operation_actions:
