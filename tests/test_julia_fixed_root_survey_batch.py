@@ -344,6 +344,29 @@ class JuliaFixedRootSurveyBatchTests(unittest.TestCase):
                 plan=FixedRootSurveyPlan.FULL_NINE,
             )
 
+    def test_response_conditioning_precision_verdict_is_recomputed(self):
+        job = _job()
+
+        class _ContradictoryConditioningAdapter(_BatchAdapter):
+            def evaluate_for_validation(self, request):
+                evaluation = super().evaluate_for_validation(request)
+                evaluation.response["samples"][0]["numerical_conditioning"][
+                    "precision_limited"
+                ] = True
+                return evaluation
+
+        with self.assertRaisesRegex(
+            JuliaResponseBackendError,
+            "conditioning is invalid",
+        ):
+            _backend(_ContradictoryConditioningAdapter()).fixed_root_survey_batch(
+                job,
+                fixed_root=job.root.omega,
+                root_seal_sha256="6" * 64,
+                branch_identity=job.root.branch_id,
+                plan=FixedRootSurveyPlan.FULL_NINE,
+            )
+
     def test_worker_survey_function_has_no_root_solving_calls(self):
         """The survey batch computes its mandatory determinant-error
         certificate through the shared ``determinant_progress`` dispatcher

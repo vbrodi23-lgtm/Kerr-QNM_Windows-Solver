@@ -2582,10 +2582,21 @@ class FixedRootSurveyConditioning:
                 f"fixed-root survey conditioning {name}",
                 nonnegative=True,
             )
+        predicted = _finite_decimal_text(
+            self.mapping["predicted_reliable_digits"],
+            "fixed-root survey conditioning predicted_reliable_digits",
+            nonnegative=True,
+        )
+        required = _finite_decimal_text(
+            self.mapping["required_reliable_digits"],
+            "fixed-root survey conditioning required_reliable_digits",
+            nonnegative=True,
+        )
         if (
             type(self.mapping["endpoint_remainders_regular"]) is not bool
             or type(self.mapping["precision_limited"]) is not bool
             or self.mapping["determinant_count"] != 1
+            or self.mapping["precision_limited"] is not (predicted < required)
         ):
             raise ValueError("fixed-root survey conditioning bounds are invalid")
         object.__setattr__(
