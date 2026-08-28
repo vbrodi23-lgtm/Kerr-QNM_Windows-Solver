@@ -55,6 +55,10 @@ _ROOT_REQUIRED_FIELDS = frozenset({
 _ROOT_OPTIONAL_FIELDS = frozenset({
     "root_phase",
     "newton_index",
+})
+_FIXED_ROOT_DETERMINANT_REQUIRED_FIELDS = frozenset({
+    "fixed_omega",
+    "branch_identity",
     "readout_role",
 })
 _FIXED_ROOT_REQUIRED_FIELDS = frozenset({
@@ -173,6 +177,9 @@ def _validate_execution_identity_mapping(value: object) -> dict[str, object]:
     if operation in {ROOT_READOUT_OPERATION, FIXED_ROOT_DETERMINANT_SAMPLE_OPERATION}:
         required.update(_ROOT_REQUIRED_FIELDS)
         allowed.update(_ROOT_REQUIRED_FIELDS | _ROOT_OPTIONAL_FIELDS)
+        if operation == FIXED_ROOT_DETERMINANT_SAMPLE_OPERATION:
+            required.update(_FIXED_ROOT_DETERMINANT_REQUIRED_FIELDS)
+            allowed.update(_FIXED_ROOT_DETERMINANT_REQUIRED_FIELDS)
     elif operation == FIXED_ROOT_SURVEY_BATCH_OPERATION:
         required.update(_FIXED_ROOT_REQUIRED_FIELDS)
         allowed.update(_FIXED_ROOT_REQUIRED_FIELDS)
@@ -224,6 +231,24 @@ def _validate_execution_identity_mapping(value: object) -> dict[str, object]:
         refinement = result.get("refinement_level")
         if isinstance(refinement, bool) or not isinstance(refinement, int) or refinement < 0:
             raise ValueError("root-readout refinement identity is invalid")
+        if operation == FIXED_ROOT_DETERMINANT_SAMPLE_OPERATION:
+            fixed_omega = result.get("fixed_omega")
+            if (
+                not isinstance(fixed_omega, Mapping)
+                or set(fixed_omega) != {"real", "imaginary"}
+                or any(
+                    not _is_nonempty_text(fixed_omega.get(component))
+                    for component in ("real", "imaginary")
+                )
+            ):
+                raise ValueError(
+                    "fixed-root determinant frequency identity is invalid"
+                )
+            for field in ("branch_identity", "readout_role"):
+                if not _is_nonempty_text(result.get(field)):
+                    raise ValueError(
+                        f"fixed-root determinant {field} identity is invalid"
+                    )
     else:
         for field in (
             "plan",
@@ -314,6 +339,12 @@ def execution_identity_from_request(
         for field in _ROOT_OPTIONAL_FIELDS:
             if field in request:
                 common[field] = request[field]
+        if operation == FIXED_ROOT_DETERMINANT_SAMPLE_OPERATION:
+            common.update({
+                "fixed_omega": copy.deepcopy(request.get("fixed_omega")),
+                "branch_identity": policy.get("branch_convention"),
+                "readout_role": request.get("readout_role"),
+            })
     elif operation == FIXED_ROOT_SURVEY_BATCH_OPERATION:
         common.update({
             "plan": request.get("plan"),

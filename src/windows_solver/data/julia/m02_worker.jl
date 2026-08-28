@@ -54,7 +54,10 @@ const ROOT_EXECUTION_REQUIRED_FIELDS = Set((
     "role", "job_policy_sha256", "refinement_level",
 ))
 const ROOT_EXECUTION_OPTIONAL_FIELDS = Set((
-    "root_phase", "newton_index", "readout_role",
+    "root_phase", "newton_index",
+))
+const FIXED_ROOT_DETERMINANT_EXECUTION_FIELDS = Set((
+    "fixed_omega", "branch_identity", "readout_role",
 ))
 const FIXED_ROOT_EXECUTION_FIELDS = Set((
     "plan",
@@ -427,6 +430,10 @@ function validated_execution_identity(value)
         union!(expected_fields, ROOT_EXECUTION_REQUIRED_FIELDS)
         union!(allowed_fields, ROOT_EXECUTION_REQUIRED_FIELDS)
         union!(allowed_fields, ROOT_EXECUTION_OPTIONAL_FIELDS)
+        if operation == "fixed-root-determinant-sample"
+            union!(expected_fields, FIXED_ROOT_DETERMINANT_EXECUTION_FIELDS)
+            union!(allowed_fields, FIXED_ROOT_DETERMINANT_EXECUTION_FIELDS)
+        end
         observed_fields = Set(string(key) for key in keys(value))
         expected_fields ⊆ observed_fields ⊆ allowed_fields ||
             error("root operation execution identity fields are invalid")
@@ -473,6 +480,22 @@ function validated_execution_identity(value)
         scope == "REQUEST" || error("root execution identity scope is invalid")
         for key in ("role", "job_policy_sha256", "refinement_level")
             required(value, key)
+        end
+        if operation == "fixed-root-determinant-sample"
+            fixed_omega = required(value, "fixed_omega")
+            fixed_omega isa AbstractDict &&
+                Set(string(key) for key in keys(fixed_omega)) ==
+                    Set(("real", "imaginary")) ||
+                error("fixed-root determinant frequency identity is invalid")
+            for key in ("real", "imaginary")
+                !isempty(string(required(fixed_omega, key))) ||
+                    error("fixed-root determinant frequency identity is invalid")
+            end
+            for key in ("branch_identity", "readout_role")
+                !isempty(string(required(value, key))) || error(
+                    "fixed-root determinant $(key) identity is invalid"
+                )
+            end
         end
     end
     for key in ("backend_identity_sha256",)
@@ -559,6 +582,23 @@ function validate_wire_execution_identity(document, default_request_schema::Stri
                 isequal(required(identity, key), required(document, key)) ||
                     error("root operation execution identity $(key) mismatch")
             end
+        end
+        if string(required(identity, "operation")) ==
+                "fixed-root-determinant-sample"
+            isequal(
+                required(identity, "fixed_omega"),
+                required(document, "fixed_omega"),
+            ) || error(
+                "fixed-root determinant execution identity frequency mismatch"
+            )
+            string(required(identity, "branch_identity")) ==
+                string(required(policy, "branch_convention")) || error(
+                    "fixed-root determinant execution identity branch mismatch"
+                )
+            string(required(identity, "readout_role")) ==
+                string(required(document, "readout_role")) || error(
+                    "fixed-root determinant execution identity role mismatch"
+                )
         end
     end
     return identity

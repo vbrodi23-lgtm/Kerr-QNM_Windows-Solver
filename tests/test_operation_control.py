@@ -4,6 +4,7 @@ import copy
 import unittest
 
 from windows_solver.operation_control import (
+    FIXED_ROOT_DETERMINANT_SAMPLE_OPERATION,
     FIXED_ROOT_SURVEY_BATCH_OPERATION,
     JULIA_WORKER_ORIGIN,
     OPERATION_CONTROL_RECEIPT_SCHEMA,
@@ -75,6 +76,20 @@ def _root_request() -> dict[str, object]:
     }
 
 
+def _fixed_sample_request() -> dict[str, object]:
+    request = _root_request()
+    request.update({
+        "operation": FIXED_ROOT_DETERMINANT_SAMPLE_OPERATION,
+        "fixed_omega": {"real": "0.5", "imaginary": "-0.1"},
+        "readout_role": "coordinate-real-plus-h",
+    })
+    request["policy"] = {
+        **request["policy"],
+        "branch_convention": "gsn-complex-rho/v1",
+    }
+    return request
+
+
 def _identity(
     operation: str,
     scope: str,
@@ -123,6 +138,43 @@ def _validated_for_transition(transition):
 
 
 class OperationControlTests(unittest.TestCase):
+    def test_fixed_root_determinant_identity_requires_sample_contract(self) -> None:
+        request = _fixed_sample_request()
+        request_sha256 = canonical_sha256(request)
+        identity = execution_identity_from_request(
+            request, request_sha256=request_sha256
+        )
+
+        self.assertEqual(FIXED_ROOT_DETERMINANT_SAMPLE_OPERATION, identity.operation)
+        self.assertEqual(request["fixed_omega"], identity.mapping["fixed_omega"])
+        self.assertEqual(
+            request["policy"]["branch_convention"],
+            identity.mapping["branch_identity"],
+        )
+        self.assertEqual(request["readout_role"], identity.mapping["readout_role"])
+
+        for field in ("fixed_omega", "branch_identity", "readout_role"):
+            with self.subTest(field=field):
+                forged = identity.to_mapping()
+                forged.pop(field)
+                receipt = build_operation_control_receipt(
+                    origin=JULIA_WORKER_ORIGIN,
+                    failure_code="INSUFFICIENT_ASYMPTOTIC_PRECISION",
+                    stage="asymptotic-preflight",
+                    identity=identity,
+                    retryable=True,
+                    retryable_basis="fixed-sample-contract/v1",
+                    diagnostics={"reason": "INSUFFICIENT_ASYMPTOTIC_PRECISION"},
+                )
+                receipt["execution_identity"] = forged
+                receipt["receipt_sha256"] = canonical_sha256({
+                    key: value
+                    for key, value in receipt.items()
+                    if key != "receipt_sha256"
+                })
+                with self.assertRaises(ValueError):
+                    validate_operation_control_receipt(receipt)
+
     def test_request_and_sample_identity_are_disjoint(self) -> None:
         request = _fixed_request()
         request_sha256 = canonical_sha256(request)
