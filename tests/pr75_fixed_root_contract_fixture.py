@@ -260,13 +260,15 @@ def parsed_case_batch(path: Path) -> dict[str, object]:
 def parsed_result_batch(path: Path) -> dict[str, object]:
     value = json.loads(path.read_bytes())
     if not isinstance(value, dict) or set(value) != {
-        "schema", "results", "compatibility_results"
+        "schema", "results", "compatibility_results",
+        "reliability_negative_count",
     }:
         raise ValueError("PR75 result batch fields are invalid")
     if (
         value["schema"] != RESULT_BATCH_SCHEMA
         or not isinstance(value["results"], list)
         or not isinstance(value["compatibility_results"], list)
+        or value["reliability_negative_count"] != 10
     ):
         raise ValueError("PR75 result batch schema is invalid")
     return value
@@ -352,6 +354,9 @@ def verify_case_matrix(
     return {
         "success_count": success_count,
         "failure_count": failure_count,
+        "reliability_negative_count": int(
+            result_batch["reliability_negative_count"]
+        ),
         **compatibility,
     }
 

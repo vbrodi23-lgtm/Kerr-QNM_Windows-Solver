@@ -179,6 +179,7 @@ class PR75FixedRootLifecycleTests(unittest.TestCase):
             {
                 "success_count": 6,
                 "failure_count": 36,
+                "reliability_negative_count": 10,
                 "compatibility_success_count": 2,
                 "compatibility_control_count": 2,
             },

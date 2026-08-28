@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import hashlib
 from pathlib import Path
 from types import SimpleNamespace
@@ -14,6 +15,7 @@ from windows_solver.julia_response_backend import (
     JuliaFixedRootSurveyBatch,
     JuliaPrecisionRootBackend,
     JuliaResponseBackendError,
+    _worker_request_document,
 )
 from windows_solver.operation_control import execution_identity_from_request
 from windows_solver.promoted_control_calibration import (
@@ -156,6 +158,55 @@ def _backend(adapter: _BatchAdapter, digits: int = 40):
 
 
 class JuliaFixedRootSurveyBatchTests(unittest.TestCase):
+    def test_reliability_projection_is_profile_bound_and_request_hashed(self):
+        job = _job()
+        receipt = load_default_calibration_receipt()
+        profile = receipt.budget_for("exterior-wronskian/v1", 40)
+        backend = _backend(_BatchAdapter())
+        request = backend.preview_fixed_root_survey_request(
+            job,
+            fixed_root=job.root.omega,
+            root_seal_sha256="0" * 64,
+            branch_identity=job.root.branch_id,
+            plan=FixedRootSurveyPlan.FULL_NINE,
+        )
+        self.assertEqual(
+            request["fixed_root_reliability_target_abs"],
+            profile.base_controls["root_correction_tolerance"],
+        )
+        _, _, original_sha256 = _worker_request_document(request)
+        for field, value in (
+            ("fixed_root_reliability_target_abs", "3e-11"),
+            ("fixed_root_reliability_rule", "forged-rule/v1"),
+        ):
+            with self.subTest(field=field):
+                changed = dict(request)
+                changed[field] = value
+                _, _, changed_sha256 = _worker_request_document(changed)
+                self.assertNotEqual(original_sha256, changed_sha256)
+
+        forged_controls = dict(profile.base_controls)
+        forged_controls["root_correction_tolerance"] = "3e-11"
+        forged_profile = replace(profile, base_controls=forged_controls)
+        forged_backend = JuliaPrecisionRootBackend(
+            VettedNativeDeterminantKernel.identity,
+            _BatchAdapter(),
+            40,
+            empirical_control_profile=forged_profile,
+            calibration_receipt=receipt,
+        )
+        with self.assertRaisesRegex(
+            ValueError,
+            "empirical control profile disagrees",
+        ):
+            forged_backend.preview_fixed_root_survey_request(
+                job,
+                fixed_root=job.root.omega,
+                root_seal_sha256="0" * 64,
+                branch_identity=job.root.branch_id,
+                plan=FixedRootSurveyPlan.FULL_NINE,
+            )
+
     def test_one_worker_request_returns_the_ordered_nine_sample_batch(self):
         job = _job()
         adapter = _BatchAdapter()

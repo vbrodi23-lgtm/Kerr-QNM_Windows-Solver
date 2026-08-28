@@ -200,6 +200,87 @@ function evaluate_compatibility_case(case)
     )
 end
 
+function reseal_fixed_root_document(document)
+    resealed = deepcopy(document)
+    binding = Dict{String,Any}(
+        string(key) => value for (key, value) in resealed
+        if string(key) ∉ ("request_sha256", "execution_identity")
+    )
+    request_sha256 = canonical_sha256(binding)
+    identity = Dict{String,Any}(
+        string(key) => value
+        for (key, value) in required(resealed, "execution_identity")
+    )
+    identity["request_sha256"] = request_sha256
+    resealed["request_sha256"] = request_sha256
+    resealed["execution_identity"] = identity
+    return resealed
+end
+
+function fixed_root_request_is_rejected(document)
+    try
+        request = flatten_fixed_root_survey_request(document)
+        validate_fixed_root_survey_request(request)
+    catch
+        return true
+    end
+    return false
+end
+
+function validate_reliability_negative_matrix(document)
+    rejected = 0
+    for (field, replacement, remove_field) in (
+        ("fixed_root_reliability_target_abs", nothing, true),
+        ("fixed_root_reliability_target_abs", "not-a-number", false),
+        ("fixed_root_reliability_target_abs", "NaN", false),
+        ("fixed_root_reliability_target_abs", "Inf", false),
+        ("fixed_root_reliability_target_abs", "0", false),
+        ("fixed_root_reliability_target_abs", "-1e-11", false),
+        ("fixed_root_reliability_target_abs", "1", false),
+        ("fixed_root_reliability_rule", nothing, true),
+        ("fixed_root_reliability_rule", "forged-rule/v1", false),
+    )
+        candidate = deepcopy(document)
+        if remove_field
+            delete!(candidate, field)
+        else
+            candidate[field] = replacement
+        end
+        candidate = reseal_fixed_root_document(candidate)
+        fixed_root_request_is_rejected(candidate) || error(
+            "PR75 fixed-root reliability negative was accepted: $(field)"
+        )
+        rejected += 1
+    end
+
+    legacy = deepcopy(document)
+    legacy["schema_version"] = 1
+    legacy["schema"] = "windows-solver.fixed-root-survey-batch/1"
+    legacy_identity = deepcopy(required(legacy, "execution_identity"))
+    legacy_identity["request_schema"] = legacy["schema"]
+    legacy["execution_identity"] = legacy_identity
+    legacy = reseal_fixed_root_document(legacy)
+    fixed_root_request_is_rejected(legacy) ||
+        error("PR75 executable fixed-root request /1 was accepted")
+    rejected += 1
+
+    original_sha256 = string(required(document, "request_sha256"))
+    changed_target = deepcopy(document)
+    changed_target["fixed_root_reliability_target_abs"] = "3e-11"
+    changed_target = reseal_fixed_root_document(changed_target)
+    string(required(changed_target, "request_sha256")) != original_sha256 ||
+        error("fixed-root reliability target is absent from request hashing")
+    changed_request = flatten_fixed_root_survey_request(changed_target)
+    validate_fixed_root_survey_request(changed_request)
+
+    changed_rule = deepcopy(document)
+    changed_rule["fixed_root_reliability_rule"] = "forged-rule/v1"
+    changed_rule = reseal_fixed_root_document(changed_rule)
+    string(required(changed_rule, "request_sha256")) != original_sha256 ||
+        error("fixed-root reliability rule is absent from request hashing")
+    return rejected
+end
+
 function main()
     length(ARGS) == 2 || error(
         "usage: test_pr75_fixed_root_lifecycle.jl INPUT_JSON OUTPUT_JSON"
@@ -219,10 +300,15 @@ function main()
     compatibility_results = [
         evaluate_compatibility_case(case) for case in compatibility_cases
     ]
+    isempty(cases) && error("PR75 lifecycle case matrix is empty")
+    reliability_negative_count = validate_reliability_negative_matrix(
+        required(first(cases), "request")
+    )
     output = Dict{String,Any}(
         "schema" => "windows-solver.pr75-fixed-root-result-batch/2",
         "results" => results,
         "compatibility_results" => compatibility_results,
+        "reliability_negative_count" => reliability_negative_count,
     )
     output_path = abspath(ARGS[2])
     mkpath(dirname(output_path))
