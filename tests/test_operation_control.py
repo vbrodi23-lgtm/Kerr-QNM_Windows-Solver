@@ -7,6 +7,7 @@ from windows_solver.operation_control import (
     FIXED_ROOT_DETERMINANT_SAMPLE_OPERATION,
     FIXED_ROOT_SURVEY_BATCH_OPERATION,
     JULIA_WORKER_ORIGIN,
+    NUMERICAL_CONTROL_FAILURE_CODES,
     OPERATION_CONTROL_RECEIPT_SCHEMA,
     PROMOTED_CONTROL_TRANSITIONS,
     PYTHON_SUPERVISOR_ORIGIN,
@@ -17,6 +18,7 @@ from windows_solver.operation_control import (
     build_operation_control_receipt,
     canonical_sha256,
     execution_identity_from_request,
+    operation_execution_identity,
     promoted_control_transition,
     validate_operation_control_receipt,
 )
@@ -138,6 +140,60 @@ def _validated_for_transition(transition):
 
 
 class OperationControlTests(unittest.TestCase):
+    def test_all_identity_variants_reject_omission_and_cross_fields(self) -> None:
+        root_request = _root_request()
+        fixed_sample_request = _fixed_sample_request()
+        fixed_request = _fixed_request()
+        fixed_sha256 = canonical_sha256(fixed_request)
+        identities = (
+            execution_identity_from_request(
+                root_request,
+                request_sha256=canonical_sha256(root_request),
+            ),
+            execution_identity_from_request(
+                fixed_sample_request,
+                request_sha256=canonical_sha256(fixed_sample_request),
+            ),
+            execution_identity_from_request(
+                fixed_request,
+                request_sha256=fixed_sha256,
+            ),
+            execution_identity_from_request(
+                fixed_request,
+                request_sha256=fixed_sha256,
+                sample_index=0,
+                sample_role="D0",
+            ),
+        )
+        for identity in identities:
+            for field in identity.mapping:
+                with self.subTest(
+                    operation=identity.operation,
+                    scope=identity.scope,
+                    missing=field,
+                ):
+                    incomplete = identity.to_mapping()
+                    incomplete.pop(field)
+                    with self.assertRaises(ValueError):
+                        operation_execution_identity(incomplete)
+
+        root_identity = identities[0].to_mapping()
+        root_identity["plan"] = "FULL_NINE"
+        with self.assertRaises(ValueError):
+            operation_execution_identity(root_identity)
+
+        outer_identity = identities[2].to_mapping()
+        outer_identity["sample_index"] = 0
+        outer_identity["sample_role"] = "D0"
+        with self.assertRaises(ValueError):
+            operation_execution_identity(outer_identity)
+
+        fixed_sample_identity = identities[1].to_mapping()
+        fixed_sample_identity["sample_index"] = 0
+        fixed_sample_identity["sample_role"] = "D0"
+        with self.assertRaises(ValueError):
+            operation_execution_identity(fixed_sample_identity)
+
     def test_fixed_root_determinant_identity_requires_sample_contract(self) -> None:
         request = _fixed_sample_request()
         request_sha256 = canonical_sha256(request)
@@ -279,6 +335,61 @@ class OperationControlTests(unittest.TestCase):
                         current_action_kind=transition.current_action_kind,
                     ),
                 )
+
+        for operation in (ROOT_READOUT_OPERATION, FIXED_ROOT_SURVEY_BATCH_OPERATION):
+            operation_codes = {
+                transition.failure_code
+                for transition in PROMOTED_CONTROL_TRANSITIONS.values()
+                if transition.operation == operation
+            }
+            self.assertTrue(
+                NUMERICAL_CONTROL_FAILURE_CODES.issubset(operation_codes)
+            )
+
+    def test_unknown_control_and_retryable_evidence_cannot_schedule(self) -> None:
+        request, identity = _identity(
+            FIXED_ROOT_SURVEY_BATCH_OPERATION, SAMPLE_SCOPE, tier="BF80"
+        )
+        unknown = validate_operation_control_receipt(
+            build_operation_control_receipt(
+                origin=JULIA_WORKER_ORIGIN,
+                failure_code="UNKNOWN_CONTROL_OUTCOME",
+                stage="unknown-stage",
+                identity=identity,
+                retryable=True,
+                retryable_basis="worker-requested-retry/v1",
+                diagnostics={"reason": "UNKNOWN_CONTROL_OUTCOME"},
+            ),
+            request=request,
+            request_sha256=identity.request_sha256,
+        )
+        with self.assertRaises(ValueError):
+            promoted_control_transition(
+                unknown,
+                current_tier="BF80",
+                current_action_kind="RESPONSE",
+            )
+
+        known = validate_operation_control_receipt(
+            build_operation_control_receipt(
+                origin=JULIA_WORKER_ORIGIN,
+                failure_code="INSUFFICIENT_ASYMPTOTIC_PRECISION",
+                stage="asymptotic-preflight",
+                identity=identity,
+                retryable=True,
+                retryable_basis="worker-requested-retry/v1",
+                diagnostics={"reason": "INSUFFICIENT_ASYMPTOTIC_PRECISION"},
+            ),
+            request=request,
+            request_sha256=identity.request_sha256,
+        )
+        transition = promoted_control_transition(
+            known,
+            current_tier="BF80",
+            current_action_kind="RESPONSE",
+        )
+        self.assertEqual("UNRESOLVED", transition.disposition)
+        self.assertIsNone(transition.next_tier)
 
     def test_observed_bf40_failure_promotes_only_response_to_bf80(self) -> None:
         transition = next(

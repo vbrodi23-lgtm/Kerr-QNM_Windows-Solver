@@ -564,7 +564,7 @@ class PromotedControlTransition:
         )
 
 
-_CODE_STAGE: Mapping[str, tuple[str, ...]] = MappingProxyType({
+_JULIA_NUMERICAL_CONTROL_STAGE: Mapping[str, tuple[str, ...]] = MappingProxyType({
     "SCATTERING_BASIS_ILL_CONDITIONED": ("scattering-extraction",),
     "SCATTERING_CHART_ILL_CONDITIONED": ("determinant-chart",),
     "ASYMPTOTIC_SERIES_INVALID": ("asymptotic-preflight",),
@@ -586,10 +586,17 @@ _CODE_STAGE: Mapping[str, tuple[str, ...]] = MappingProxyType({
     "HORIZON_ARITHMETIC_INADEQUATE": ("horizon-endpoint-geometry",),
     "HORIZON_COORDINATE_INVERSION_FAILED": ("coordinate-inversion",),
     "HORIZON_ONLY_ONE_ENDPOINT": ("horizon-endpoint-geometry",),
-    "ODE_RESOURCE_LIMIT": ("homogeneous-propagation",),
-    "ROOT_READOUT_RESOURCE_INFEASIBLE": ("request-policy",),
     "COORDINATE_IDENTITY_MISMATCH": ("coordinate-inversion",),
     "ODE_SOLVER_FAILURE": ("homogeneous-propagation",),
+})
+NUMERICAL_CONTROL_FAILURE_CODES = frozenset(
+    _JULIA_NUMERICAL_CONTROL_STAGE
+)
+
+_CODE_STAGE: Mapping[str, tuple[str, ...]] = MappingProxyType({
+    **dict(_JULIA_NUMERICAL_CONTROL_STAGE),
+    "ODE_RESOURCE_LIMIT": ("homogeneous-propagation",),
+    "ROOT_READOUT_RESOURCE_INFEASIBLE": ("request-policy",),
     "WORKER_TIMEOUT": ("worker-supervision",),
     "ROOT_UNCERTAINTY_EVIDENCE_UNAVAILABLE": ("root-authentication",),
     "DETERMINANT_ERROR_EVIDENCE_UNAVAILABLE": ("determinant-chart",),

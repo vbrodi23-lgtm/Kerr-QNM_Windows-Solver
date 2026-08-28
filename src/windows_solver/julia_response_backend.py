@@ -30,6 +30,7 @@ from .contracts import canonical_json_bytes
 from .operation_control import (
     FIXED_ROOT_SURVEY_BATCH_OPERATION,
     JULIA_WORKER_ORIGIN,
+    NUMERICAL_CONTROL_FAILURE_CODES,
     OPERATION_CONTROL_RECEIPT_SCHEMA,
     PYTHON_SUPERVISOR_ORIGIN,
     REQUEST_SCOPE,
@@ -295,43 +296,6 @@ _FIXED_ROOT_SURVEY_ROOT_ONLY_POLICY_FIELDS = frozenset({
     "max_newton_iterations",
     "root_correction_tolerance",
 })
-NUMERICAL_CONTROL_FAILURE_CODES = frozenset({
-    "SCATTERING_BASIS_ILL_CONDITIONED",
-    "SCATTERING_CHART_ILL_CONDITIONED",
-    "ASYMPTOTIC_SERIES_INVALID",
-    "INSUFFICIENT_ASYMPTOTIC_PRECISION",
-    "PHYSICAL_SINGULAR_LIMIT",
-    "ALGEBRAIC_REPRESENTATION_SINGULAR",
-    "CARRIER_CHANGE_INCONSISTENT",
-    "INVALID_FACTORED_PROPAGATION_INPUT",
-    "FACTORED_PROPAGATION_PRECISION_MISMATCH",
-    "NONFINITE_FACTORED_PROPAGATION_DATA",
-    "FACTORED_ODE_FAILURE",
-    # Fewer than two horizon endpoints passed the radial-approach and
-    # dual-series gate. Raised before any homogeneous ODE starts.
-    "NO_VERIFIED_HORIZON_ENDPOINT",
-    # The coordinate map made no meaningful progress. Distinguishes an
-    # impossible local-error target from an exhausted resource budget.
-    "COORDINATE_INVERSION_STALLED",
-    # The central determinant is small but its absolute error is too large to
-    # call the root located. Never reported as a solved root.
-    "DETERMINANT_UNCERTAINTY_TOO_LARGE",
-    # An exterior promoted determinant lacked one of its mandatory empirical
-    # same-point, preceding-tier, or endpoint/series comparisons.
-    "EXTERIOR_DETERMINANT_CERTIFICATE_UNAVAILABLE",
-    # The finite-difference ladder was exhausted without a step at which the
-    # derivative estimates agree and determinant noise does not dominate.
-    "FINITE_DIFFERENCE_NOISE_LIMIT",
-    "HORIZON_GEOMETRY_EXHAUSTED",
-    "HORIZON_MAXIMUM_ORDER_INADEQUATE",
-    "HORIZON_ARITHMETIC_INADEQUATE",
-    "HORIZON_COORDINATE_INVERSION_FAILED",
-    "HORIZON_ONLY_ONE_ENDPOINT",
-    "COORDINATE_IDENTITY_MISMATCH",
-    "ODE_SOLVER_FAILURE",
-})
-
-
 def _mode_specific_branch_enclosure_radius(
     job: ResponseComponentJob,
 ) -> float:
