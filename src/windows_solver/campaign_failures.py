@@ -486,7 +486,6 @@ def classify_validated_control_receipt(
     *,
     current_tier: str,
     current_action_kind: str,
-    cause_type: str,
 ) -> tuple[FailureReport, FailureDecision]:
     """Classify an authenticated promoted outcome by exact registry lookup."""
 
@@ -510,7 +509,7 @@ def classify_validated_control_receipt(
         backend_identity=str(identity.mapping["backend_identity_sha256"]),
         policy_identity=effective_policy_sha256,
         precision_tier=current_tier,
-        cause_type=cause_type,
+        cause_type=transition.exception_type,
         diagnostics=copy.deepcopy(dict(receipt.mapping["diagnostics"])),
         request_sha256=identity.request_sha256,
         control_receipt_sha256=receipt.sha256,

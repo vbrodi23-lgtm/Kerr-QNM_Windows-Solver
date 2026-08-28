@@ -2159,11 +2159,6 @@ def _revalidate_promoted_control_proof(
         receipt,
         current_tier=str(control_return.get("current_tier")),
         current_action_kind=str(control_return.get("current_action_kind")),
-        cause_type=(
-            "JuliaWorkerTimeoutError"
-            if receipt.failure_code == "WORKER_TIMEOUT"
-            else "JuliaNumericalControlError"
-        ),
     )
     expected = {
         "control_return_sha256": return_sha256,
@@ -2342,11 +2337,6 @@ def reduce_promoted_exterior_from_checkpoint(
             validated_receipt,
             current_tier=str(artifact["current_tier"]),
             current_action_kind=str(artifact["current_action_kind"]),
-            cause_type=(
-                "JuliaWorkerTimeoutError"
-                if validated_receipt.failure_code == "WORKER_TIMEOUT"
-                else "JuliaNumericalControlError"
-            ),
         )
         if (
             decision.disposition is FailureDisposition.PROMOTION_PENDING

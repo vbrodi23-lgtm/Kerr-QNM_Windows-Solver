@@ -608,6 +608,14 @@ def _build_transition_registry() -> Mapping[tuple[str, str, str, str, str, str, 
     )
     for operation, action, scope in operation_actions:
         for code, stages in _CODE_STAGE.items():
+            if (
+                code == "WORKER_TIMEOUT"
+                and operation == FIXED_ROOT_SURVEY_BATCH_OPERATION
+            ):
+                # The Python supervisor owns outer-process timeout and cannot
+                # authenticate a Julia-selected descriptor after terminating
+                # the process.  Its fixed-root receipt is REQUEST-scoped below.
+                continue
             origin = PYTHON_SUPERVISOR_ORIGIN if code == "WORKER_TIMEOUT" else JULIA_WORKER_ORIGIN
             for stage in stages:
                 for tier in ("BF40", "BF80"):
@@ -657,11 +665,13 @@ def _build_transition_registry() -> Mapping[tuple[str, str, str, str, str, str, 
                             if origin == PYTHON_SUPERVISOR_ORIGIN
                             else "julia-control-diagnostics/v1"
                         ),
-                        exception_type=(
-                            "JuliaWorkerTimeoutError"
-                            if code == "WORKER_TIMEOUT"
-                            else "JuliaNumericalControlError"
-                        ),
+                        exception_type={
+                            "WORKER_TIMEOUT": "JuliaWorkerTimeoutError",
+                            "ODE_RESOURCE_LIMIT": "JuliaODEResourceLimitError",
+                            "ROOT_READOUT_RESOURCE_INFEASIBLE": (
+                                "JuliaRootReadoutResourceLimitError"
+                            ),
+                        }.get(code, "JuliaNumericalControlError"),
                         containable=containable,
                         disposition=disposition,
                         queue_kind=queue_kind,
