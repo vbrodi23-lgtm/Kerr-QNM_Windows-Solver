@@ -601,16 +601,32 @@ NUMERICAL_CONTROL_FAILURE_CODES = frozenset(
     _JULIA_NUMERICAL_CONTROL_STAGE
 )
 
-_CODE_STAGE: Mapping[str, tuple[str, ...]] = MappingProxyType({
+_ROOT_READOUT_CONTROL_STAGE: Mapping[str, tuple[str, ...]] = MappingProxyType({
     **dict(_JULIA_NUMERICAL_CONTROL_STAGE),
     "ODE_RESOURCE_LIMIT": ("homogeneous-propagation",),
     "ROOT_READOUT_RESOURCE_INFEASIBLE": ("request-policy",),
     "WORKER_TIMEOUT": ("worker-supervision",),
-    "ROOT_UNCERTAINTY_EVIDENCE_UNAVAILABLE": ("root-authentication",),
-    "DETERMINANT_ERROR_EVIDENCE_UNAVAILABLE": ("determinant-chart",),
-    "BLOCKED_BY_REVIEWED_ERROR_EVIDENCE": ("determinant-chart",),
-    "ROOT_SEAL_UNAVAILABLE": ("root-authentication",),
 })
+_FIXED_ROOT_SURVEY_CONTROL_STAGE: Mapping[str, tuple[str, ...]] = (
+    MappingProxyType({
+        **{
+            code: stages
+            for code, stages in _JULIA_NUMERICAL_CONTROL_STAGE.items()
+            if code not in {
+                "FINITE_DIFFERENCE_NOISE_LIMIT",
+                "DETERMINANT_UNCERTAINTY_TOO_LARGE",
+            }
+        },
+        # A fixed-root survey evaluates already-selected determinant samples;
+        # it does not run the root request-policy or derivative ladder.
+        "ALGEBRAIC_REPRESENTATION_SINGULAR": (
+            "determinant-chart",
+            "homogeneous-propagation",
+        ),
+        "ODE_RESOURCE_LIMIT": ("homogeneous-propagation",),
+        "WORKER_TIMEOUT": ("worker-supervision",),
+    })
+)
 
 _PROMOTION_CODES: Mapping[str, str] = MappingProxyType({
     "INSUFFICIENT_ASYMPTOTIC_PRECISION": "RESPONSE",
@@ -649,11 +665,21 @@ _EXPLICIT_FATAL_CODES = frozenset({
 def _build_transition_registry() -> Mapping[tuple[str, str, str, str, str, str, str], PromotedControlTransition]:
     result: dict[tuple[str, str, str, str, str, str, str], PromotedControlTransition] = {}
     operation_actions = (
-        (ROOT_READOUT_OPERATION, "ROOT", REQUEST_SCOPE),
-        (FIXED_ROOT_SURVEY_BATCH_OPERATION, "RESPONSE", SAMPLE_SCOPE),
+        (
+            ROOT_READOUT_OPERATION,
+            "ROOT",
+            REQUEST_SCOPE,
+            _ROOT_READOUT_CONTROL_STAGE,
+        ),
+        (
+            FIXED_ROOT_SURVEY_BATCH_OPERATION,
+            "RESPONSE",
+            SAMPLE_SCOPE,
+            _FIXED_ROOT_SURVEY_CONTROL_STAGE,
+        ),
     )
-    for operation, action, scope in operation_actions:
-        for code, stages in _CODE_STAGE.items():
+    for operation, action, scope, code_stages in operation_actions:
+        for code, stages in code_stages.items():
             if (
                 code == "WORKER_TIMEOUT"
                 and operation == FIXED_ROOT_SURVEY_BATCH_OPERATION

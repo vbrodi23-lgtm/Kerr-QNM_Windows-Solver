@@ -336,15 +336,25 @@ class OperationControlTests(unittest.TestCase):
                     ),
                 )
 
-        for operation in (ROOT_READOUT_OPERATION, FIXED_ROOT_SURVEY_BATCH_OPERATION):
-            operation_codes = {
-                transition.failure_code
-                for transition in PROMOTED_CONTROL_TRANSITIONS.values()
-                if transition.operation == operation
-            }
-            self.assertTrue(
-                NUMERICAL_CONTROL_FAILURE_CODES.issubset(operation_codes)
-            )
+        root_codes = {
+            transition.failure_code
+            for transition in PROMOTED_CONTROL_TRANSITIONS.values()
+            if transition.operation == ROOT_READOUT_OPERATION
+        }
+        self.assertTrue(NUMERICAL_CONTROL_FAILURE_CODES.issubset(root_codes))
+        fixed_codes = {
+            transition.failure_code
+            for transition in PROMOTED_CONTROL_TRANSITIONS.values()
+            if transition.operation == FIXED_ROOT_SURVEY_BATCH_OPERATION
+        }
+        self.assertEqual(
+            NUMERICAL_CONTROL_FAILURE_CODES
+            - {
+                "FINITE_DIFFERENCE_NOISE_LIMIT",
+                "DETERMINANT_UNCERTAINTY_TOO_LARGE",
+            },
+            fixed_codes - {"ODE_RESOURCE_LIMIT", "WORKER_TIMEOUT"},
+        )
 
     def test_unknown_control_and_retryable_evidence_cannot_schedule(self) -> None:
         request, identity = _identity(
@@ -406,6 +416,30 @@ class OperationControlTests(unittest.TestCase):
         self.assertEqual("BF80", transition.next_tier)
         self.assertEqual("RESPONSE", transition.next_action_kind)
 
+    def test_root_only_control_stage_is_prohibited_for_fixed_root(self) -> None:
+        request, identity = _identity(
+            FIXED_ROOT_SURVEY_BATCH_OPERATION, SAMPLE_SCOPE, tier="BF40"
+        )
+        receipt = validate_operation_control_receipt(
+            build_operation_control_receipt(
+                origin=JULIA_WORKER_ORIGIN,
+                failure_code="FINITE_DIFFERENCE_NOISE_LIMIT",
+                stage="finite-difference",
+                identity=identity,
+                retryable=True,
+                retryable_basis="forged fixed-root derivative outcome/v1",
+                diagnostics={"reason": "FINITE_DIFFERENCE_NOISE_LIMIT"},
+            ),
+            request=request,
+            request_sha256=identity.request_sha256,
+        )
+        with self.assertRaisesRegex(ValueError, "no exact transition"):
+            promoted_control_transition(
+                receipt,
+                current_tier="BF40",
+                current_action_kind="RESPONSE",
+            )
+
     def test_multi_stage_worker_codes_have_exact_registry_entries(self) -> None:
         expected = {
             "ALGEBRAIC_REPRESENTATION_SINGULAR": {
@@ -419,11 +453,23 @@ class OperationControlTests(unittest.TestCase):
                 "determinant-chart",
             },
         }
-        for operation, action, scope in (
-            (ROOT_READOUT_OPERATION, "ROOT", REQUEST_SCOPE),
-            (FIXED_ROOT_SURVEY_BATCH_OPERATION, "RESPONSE", SAMPLE_SCOPE),
-        ):
-            for code, stages in expected.items():
+        operation_stages = (
+            (ROOT_READOUT_OPERATION, "ROOT", REQUEST_SCOPE, expected),
+            (
+                FIXED_ROOT_SURVEY_BATCH_OPERATION,
+                "RESPONSE",
+                SAMPLE_SCOPE,
+                {
+                    **expected,
+                    "ALGEBRAIC_REPRESENTATION_SINGULAR": {
+                        "determinant-chart",
+                        "homogeneous-propagation",
+                    },
+                },
+            ),
+        )
+        for operation, action, scope, expected_stages in operation_stages:
+            for code, stages in expected_stages.items():
                 with self.subTest(operation=operation, failure_code=code):
                     observed = {
                         transition.stage
