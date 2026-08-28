@@ -1534,6 +1534,7 @@ $candidate | ConvertTo-Json -Compress | Set-Content -LiteralPath $env:M02_TEST_J
             "windows-solver.promoted-queue-disposition/1",
             "windows-solver.promoted-raw-calculation-retention/2",
             "windows-solver.promoted-root-evidence-receipt/1",
+            "windows-solver.promoted-root-evidence-receipt/2",
             "windows-solver.response-component-job/1",
             "windows-solver.m02-report-status/v1",
             "windows-solver.m02-schema11-report-status/v1",

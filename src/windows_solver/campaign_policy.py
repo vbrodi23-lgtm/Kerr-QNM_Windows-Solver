@@ -16,10 +16,75 @@ from .contracts import canonical_json_bytes
 from .evidence_authentication import certified_disposition_is_admitted
 from .validation_admission import validated_disposition_is_admitted
 from .campaign_timing import TimingFragment, fold_timing_fragments
+from .promoted_control_authority import (
+    authenticate_persisted_control_decision,
+    authenticate_persisted_control_return,
+    validate_persisted_control_stage_accounting,
+)
 
 
 CAMPAIGN_CHECKPOINT_SCHEMA_VERSION = 11
 PROMOTION_QUEUE_SCHEMA = "windows-solver.m02-promotion-queue/1"
+PROMOTED_CALCULATION_STAGE_SCHEMA = (
+    "windows-solver.promoted-calculation-stage/2"
+)
+PROMOTED_CONTROL_RETURN_STAGE_SCHEMA = (
+    "windows-solver.promoted-control-return-stage/1"
+)
+PROMOTED_CONTROL_DECISION_STAGE_SCHEMA = (
+    "windows-solver.promoted-control-decision-stage/1"
+)
+PROMOTED_CONTROL_CONTINUATION_STAGE_SCHEMA = (
+    "windows-solver.promoted-control-continuation-stage/1"
+)
+PROMOTED_CONTROL_RETURN_SCHEMA = (
+    "windows-solver.promoted-exterior-control-return/3"
+)
+PROMOTED_CONTROL_DECISION_SCHEMA = (
+    "windows-solver.promoted-exterior-control-decision/1"
+)
+PROMOTED_HORIZON_CONTROL_RETURN_SCHEMA = (
+    "windows-solver.promoted-horizon-control-return/2"
+)
+PROMOTED_HORIZON_CONTROL_DECISION_SCHEMA = (
+    "windows-solver.promoted-horizon-control-decision/1"
+)
+PROMOTED_CONTROL_CONTINUATION_PROOF_SCHEMA = (
+    "windows-solver.promoted-control-continuation-proof/1"
+)
+PROMOTED_CONTROL_TERMINAL_RECEIPT_SCHEMA = (
+    "windows-solver.promoted-control-terminal-disposition/2"
+)
+PROMOTED_POLICY_TERMINAL_STAGE_SCHEMA = (
+    "windows-solver.promoted-policy-terminal-stage/1"
+)
+PROMOTED_POLICY_TERMINAL_DECISION_SCHEMA = (
+    "windows-solver.promoted-policy-terminal-decision/1"
+)
+PROMOTED_POLICY_TERMINAL_RECEIPT_SCHEMA = (
+    "windows-solver.promoted-policy-terminal-disposition/1"
+)
+
+_PROMOTED_CONTROL_DECISION_RETURN_SCHEMAS = {
+    PROMOTED_CONTROL_DECISION_SCHEMA: PROMOTED_CONTROL_RETURN_SCHEMA,
+    PROMOTED_HORIZON_CONTROL_DECISION_SCHEMA: (
+        PROMOTED_HORIZON_CONTROL_RETURN_SCHEMA
+    ),
+}
+_PROMOTED_CONTROL_RETURN_SCHEMAS = frozenset(
+    _PROMOTED_CONTROL_DECISION_RETURN_SCHEMAS.values()
+)
+_PROMOTED_CONTROL_DECISION_SCHEMAS = frozenset(
+    _PROMOTED_CONTROL_DECISION_RETURN_SCHEMAS
+)
+_PROMOTED_ARTIFACT_DIGEST_FIELDS = {
+    "windows-solver.promoted-exterior-calculation/3": "calculation_sha256",
+    "windows-solver.promoted-horizon-calculation/3": "calculation_sha256",
+    PROMOTED_CONTROL_RETURN_SCHEMA: "control_return_sha256",
+    PROMOTED_CONTROL_DECISION_SCHEMA: "control_decision_sha256",
+    PROMOTED_HORIZON_CONTROL_RETURN_SCHEMA: "control_return_sha256",
+    PROMOTED_HORIZON_CONTROL_DECISION_SCHEMA: "control_decision_sha256",
+}
 
 
 class ExecutionProfile(str, Enum):
@@ -60,6 +125,8 @@ class PromotionQueueKind(str, Enum):
 class PromotionQueueDisposition(str, Enum):
     PENDING = "PENDING"
     CALCULATED_PENDING_DERIVATION = "CALCULATED_PENDING_DERIVATION"
+    CONTROL_RETURN_RETAINED = "CONTROL_RETURN_RETAINED"
+    CONTROL_DECISION_RETAINED = "CONTROL_DECISION_RETAINED"
     NUMERICAL_CONTINUATION = "NUMERICAL_CONTINUATION"
     AWAITING_ADMISSION = "AWAITING_ADMISSION"
     ADMITTED_PENDING_PUBLICATION = "ADMITTED_PENDING_PUBLICATION"
@@ -85,6 +152,8 @@ TERMINAL_PROMOTION_DISPOSITIONS = frozenset(
     not in {
         PromotionQueueDisposition.PENDING,
         PromotionQueueDisposition.CALCULATED_PENDING_DERIVATION,
+        PromotionQueueDisposition.CONTROL_RETURN_RETAINED,
+        PromotionQueueDisposition.CONTROL_DECISION_RETAINED,
         PromotionQueueDisposition.NUMERICAL_CONTINUATION,
         PromotionQueueDisposition.AWAITING_ADMISSION,
         PromotionQueueDisposition.ADMITTED_PENDING_PUBLICATION,
@@ -198,6 +267,29 @@ def _is_sha256(value: object) -> bool:
     return True
 
 
+def promoted_artifact_digest(
+    artifact: Mapping[str, object],
+) -> tuple[str, str]:
+    """Authenticate one explicitly registered promoted artifact.
+
+    Schema discrimination is deliberately exhaustive.  A misspelled, future,
+    or corrupted CONTROL schema cannot fall through to calculation handling.
+    """
+
+    if not isinstance(artifact, Mapping):
+        raise ValueError("retained promoted artifact is invalid")
+    schema = artifact.get("schema")
+    try:
+        digest_field = _PROMOTED_ARTIFACT_DIGEST_FIELDS[str(schema)]
+    except KeyError as error:
+        raise ValueError("retained promoted artifact schema is unsupported") from error
+    supplied = artifact.get(digest_field)
+    content = {key: item for key, item in artifact.items() if key != digest_field}
+    if not _is_sha256(supplied) or supplied != _sha256(content):
+        raise ValueError("retained promoted artifact digest is invalid")
+    return digest_field, str(supplied)
+
+
 def promotion_source_fingerprint_sha256(entry: Mapping[str, object]) -> str:
     """Hash the exact immutable Layer-1 source portion of one queue entry."""
 
@@ -217,6 +309,430 @@ def _assert_layer1_guard(layer1_guard: object | None, checkpoint: Mapping[str, o
     assertion(checkpoint)
 
 
+def _expected_promoted_control_action(
+    stage: Mapping[str, object],
+    control_return: Mapping[str, object],
+    queue_entry: Mapping[str, object],
+) -> str:
+    """Derive the active action from the concrete operation and route.
+
+    A ROOT queue performs its primary readout and then may execute a fixed-root
+    RESPONSE batch.  Consequently the original queue kind is not itself the
+    current action.  The concrete operation is decisive; the route only
+    disambiguates the root-readout operation embedded in a horizon response.
+    """
+
+    operation = control_return.get("operation")
+    if operation in {
+        "fixed-root-survey-batch",
+        "fixed-root-determinant-sample",
+    }:
+        return PromotionQueueKind.RESPONSE.value
+    if operation == "root-readout":
+        if stage.get("route") == "HORIZON_BF80":
+            return PromotionQueueKind.RESPONSE.value
+        if queue_entry.get("queue_kind") == PromotionQueueKind.ROOT.value:
+            return PromotionQueueKind.ROOT.value
+    raise ValueError("promoted CONTROL stage action cannot be derived")
+
+
+def promoted_control_terminal_disposition_receipt(
+    queue_entry: Mapping[str, object],
+    decision_stage: Mapping[str, object],
+) -> dict[str, object]:
+    """Project the only terminal receipt authorised by a CONTROL decision.
+
+    The queue stores the receipt digest while the decision stage retains all
+    receipt inputs.  Keeping this projection exact makes the terminal receipt
+    independently recomputable at every checkpoint load instead of trusting
+    caller-authored descriptive fields.
+    """
+
+    if not isinstance(queue_entry, Mapping) or not isinstance(
+        decision_stage, Mapping
+    ):
+        raise ValueError("CONTROL terminal proof is invalid")
+    decision = decision_stage.get("control_decision")
+    chain = decision_stage.get("calculation_chain")
+    return_stage = chain[-1] if isinstance(chain, list) and chain else None
+    control_return = (
+        return_stage.get("control_return")
+        if isinstance(return_stage, Mapping)
+        else None
+    )
+    decision_schema = (
+        decision.get("schema") if isinstance(decision, Mapping) else None
+    )
+    expected_return_schema = _PROMOTED_CONTROL_DECISION_RETURN_SCHEMAS.get(
+        decision_schema
+    )
+    terminal = decision.get("disposition") if isinstance(decision, Mapping) else None
+    if (
+        decision_stage.get("schema")
+        != PROMOTED_CONTROL_DECISION_STAGE_SCHEMA
+        or decision_stage.get("admission_state")
+        != PromotionQueueDisposition.CONTROL_DECISION_RETAINED.value
+        or not isinstance(decision, Mapping)
+        or decision_schema not in _PROMOTED_CONTROL_DECISION_SCHEMAS
+        or terminal
+        not in {
+            PromotionQueueDisposition.UNRESOLVED.value,
+            PromotionQueueDisposition.DEFERRED.value,
+            PromotionQueueDisposition.REJECTED.value,
+        }
+        or decision_stage.get("numerical_disposition") != terminal
+        or decision_stage.get("reason_code") != decision.get("failure_code")
+        or not isinstance(return_stage, Mapping)
+        or return_stage.get("schema") != PROMOTED_CONTROL_RETURN_STAGE_SCHEMA
+        or return_stage.get("route") != decision_stage.get("route")
+        or not isinstance(control_return, Mapping)
+        or control_return.get("schema") != expected_return_schema
+        or decision.get("control_return_sha256")
+        != control_return.get("control_return_sha256")
+        or queue_entry.get("queue_ordinal")
+        != decision_stage.get("queue_ordinal")
+        or queue_entry.get("leaf_id") != decision_stage.get("leaf_id")
+        or queue_entry.get("retained_promoted_stage_sha256")
+        != decision_stage.get("stage_sha256")
+    ):
+        raise ValueError("CONTROL terminal proof chain is invalid")
+    return {
+        "schema": PROMOTED_CONTROL_TERMINAL_RECEIPT_SCHEMA,
+        "queue_ordinal": queue_entry["queue_ordinal"],
+        "leaf_id": queue_entry["leaf_id"],
+        "route": decision_stage["route"],
+        "disposition": terminal,
+        "reason_code": decision["failure_code"],
+        "source_fingerprint_sha256": queue_entry["source_fingerprint_sha256"],
+        "retained_promoted_stage_sha256": decision_stage["stage_sha256"],
+        "control_decision_schema": decision_schema,
+        "control_decision_sha256": decision["control_decision_sha256"],
+        "control_return_stage_sha256": return_stage["stage_sha256"],
+        "control_return_schema": expected_return_schema,
+        "control_return_sha256": control_return["control_return_sha256"],
+        "control_receipt_sha256": control_return["control_receipt_sha256"],
+        "current_tier": decision["current_tier"],
+        "current_action_kind": decision["current_action_kind"],
+    }
+
+
+def promoted_policy_terminal_disposition_receipt(
+    queue_entry: Mapping[str, object],
+    policy_stage: Mapping[str, object],
+) -> dict[str, object]:
+    """Project a deterministic receipt for a no-work policy terminal."""
+
+    if not isinstance(queue_entry, Mapping) or not isinstance(
+        policy_stage, Mapping
+    ):
+        raise ValueError("promoted policy terminal proof is invalid")
+    policy_terminal = policy_stage.get("policy_terminal")
+    terminal = policy_stage.get("admission_state")
+    if (
+        policy_stage.get("schema") != PROMOTED_POLICY_TERMINAL_STAGE_SCHEMA
+        or policy_stage.get("execution_mode") != "BLOCK_ALL"
+        or terminal
+        not in {
+            PromotionQueueDisposition.UNRESOLVED.value,
+            PromotionQueueDisposition.DEFERRED.value,
+            PromotionQueueDisposition.REJECTED.value,
+        }
+        or not isinstance(policy_terminal, Mapping)
+        or queue_entry.get("queue_ordinal") != policy_stage.get("queue_ordinal")
+        or queue_entry.get("leaf_id") != policy_stage.get("leaf_id")
+    ):
+        raise ValueError("promoted policy terminal proof is invalid")
+    return {
+        "schema": PROMOTED_POLICY_TERMINAL_RECEIPT_SCHEMA,
+        "queue_ordinal": queue_entry["queue_ordinal"],
+        "leaf_id": queue_entry["leaf_id"],
+        "route": policy_stage["route"],
+        "disposition": terminal,
+        "reason_code": policy_stage["reason_code"],
+        "source_fingerprint_sha256": queue_entry["source_fingerprint_sha256"],
+        "retained_promoted_stage_sha256": policy_stage["stage_sha256"],
+        "policy_terminal_sha256": policy_terminal["policy_terminal_sha256"],
+    }
+
+
+def _validate_promoted_stage_payload(
+    stage: Mapping[str, object],
+    *,
+    queue_entry: Mapping[str, object],
+) -> None:
+    """Validate the schema-owned payload of one current or predecessor stage."""
+
+    schema = stage.get("schema")
+    if schema == PROMOTED_POLICY_TERMINAL_STAGE_SCHEMA:
+        policy_terminal = stage.get("policy_terminal")
+        policy_fields = {
+            "schema",
+            "disposition",
+            "reason_code",
+            "operation_identity",
+            "route",
+            "execution_mode",
+            "policy_terminal_sha256",
+        }
+        expected_content = {
+            "schema": PROMOTED_POLICY_TERMINAL_DECISION_SCHEMA,
+            "disposition": stage.get("admission_state"),
+            "reason_code": stage.get("reason_code"),
+            "operation_identity": stage.get("operation_identity"),
+            "route": stage.get("route"),
+            "execution_mode": stage.get("execution_mode"),
+        }
+        if (
+            stage.get("execution_mode") != "BLOCK_ALL"
+            or stage.get("admission_state")
+            not in {
+                PromotionQueueDisposition.UNRESOLVED.value,
+                PromotionQueueDisposition.DEFERRED.value,
+                PromotionQueueDisposition.REJECTED.value,
+            }
+            or stage.get("numerical_disposition")
+            != stage.get("admission_state")
+            or stage.get("precision_tiers") != []
+            or stage.get("receipts") != []
+            or any(
+                stage.get(field) != 0
+                for field in (
+                    "sample_count",
+                    "sample_limit",
+                    "root_read_count",
+                    "root_read_limit",
+                    "worker_launch_count",
+                    "worker_launch_limit",
+                )
+            )
+            or not isinstance(policy_terminal, Mapping)
+            or set(policy_terminal) != policy_fields
+            or {
+                key: item
+                for key, item in policy_terminal.items()
+                if key != "policy_terminal_sha256"
+            }
+            != expected_content
+            or policy_terminal.get("policy_terminal_sha256")
+            != _sha256(expected_content)
+            or any(
+                field in stage
+                for field in (
+                    "calculation_artifact",
+                    "control_return",
+                    "control_decision",
+                    "control_proof",
+                )
+            )
+        ):
+            raise ValueError("promoted policy terminal stage is invalid")
+        return
+    if schema == "windows-solver.promoted-calculation-stage/1":
+        # Schema 1 is retained only as a standalone, historical terminal
+        # presentation.  It predates typed raw artifacts and therefore cannot
+        # be used as an escape hatch for an unknown or mistyped CONTROL
+        # payload.  Current typed artifacts belong exclusively to the
+        # authenticated schema-2 stage family below.
+        if any(
+            field in stage
+            for field in (
+                "calculation_artifact",
+                "control_return",
+                "control_decision",
+                "control_proof",
+            )
+        ):
+            raise ValueError("legacy promoted stage cannot carry a typed artifact")
+        return
+    if schema == PROMOTED_CALCULATION_STAGE_SCHEMA:
+        artifact = stage.get("calculation_artifact")
+        if (
+            not isinstance(artifact, Mapping)
+            or artifact.get("schema")
+            in (
+                _PROMOTED_CONTROL_RETURN_SCHEMAS
+                | _PROMOTED_CONTROL_DECISION_SCHEMAS
+                | {"windows-solver.promoted-horizon-control-return/1"}
+            )
+        ):
+            raise ValueError("promoted calculation stage artifact is invalid")
+        promoted_artifact_digest(artifact)
+        return
+    if schema == PROMOTED_CONTROL_RETURN_STAGE_SCHEMA:
+        artifact = stage.get("control_return")
+        if (
+            stage.get("admission_state")
+            != PromotionQueueDisposition.CONTROL_RETURN_RETAINED.value
+            or not isinstance(artifact, Mapping)
+            or artifact.get("schema") not in _PROMOTED_CONTROL_RETURN_SCHEMAS
+            or "calculation_artifact" in stage
+            or "control_decision" in stage
+            or "control_proof" in stage
+        ):
+            raise ValueError("promoted control-return stage is invalid")
+        promoted_artifact_digest(artifact)
+        authority = authenticate_persisted_control_return(
+            artifact,
+            expected_schema=str(artifact["schema"]),
+            expected_leaf_id=str(queue_entry["leaf_id"]),
+            expected_current_action_kind=_expected_promoted_control_action(
+                stage,
+                artifact,
+                queue_entry,
+            ),
+            expected_queue_ordinal=int(stage["queue_ordinal"]),
+        )
+        validate_persisted_control_stage_accounting(stage, authority)
+        return
+    if schema == PROMOTED_CONTROL_DECISION_STAGE_SCHEMA:
+        artifact = stage.get("control_decision")
+        chain = stage.get("calculation_chain")
+        predecessor = chain[-1] if isinstance(chain, list) and chain else None
+        predecessor_return = (
+            predecessor.get("control_return")
+            if isinstance(predecessor, Mapping)
+            else None
+        )
+        expected_return_schema = _PROMOTED_CONTROL_DECISION_RETURN_SCHEMAS.get(
+            artifact.get("schema") if isinstance(artifact, Mapping) else None
+        )
+        if (
+            stage.get("admission_state")
+            != PromotionQueueDisposition.CONTROL_DECISION_RETAINED.value
+            or not isinstance(artifact, Mapping)
+            or artifact.get("schema") not in _PROMOTED_CONTROL_DECISION_SCHEMAS
+            or expected_return_schema is None
+            or not isinstance(predecessor, Mapping)
+            or predecessor.get("schema") != PROMOTED_CONTROL_RETURN_STAGE_SCHEMA
+            or not isinstance(predecessor_return, Mapping)
+            or predecessor_return.get("schema") != expected_return_schema
+            or artifact.get("control_return_sha256")
+            != predecessor_return.get("control_return_sha256")
+            or "calculation_artifact" in stage
+            or "control_return" in stage
+            or "control_proof" in stage
+        ):
+            raise ValueError("promoted control-decision stage is invalid")
+        promoted_artifact_digest(artifact)
+        promoted_artifact_digest(predecessor_return)
+        authority = authenticate_persisted_control_decision(
+            predecessor_return,
+            artifact,
+            expected_return_schema=str(expected_return_schema),
+            expected_decision_schema=str(artifact["schema"]),
+            expected_leaf_id=str(queue_entry["leaf_id"]),
+            expected_current_action_kind=_expected_promoted_control_action(
+                predecessor,
+                predecessor_return,
+                queue_entry,
+            ),
+            expected_queue_ordinal=int(stage["queue_ordinal"]),
+        )
+        validate_persisted_control_stage_accounting(stage, authority)
+        return
+    if schema == PROMOTED_CONTROL_CONTINUATION_STAGE_SCHEMA:
+        proof = stage.get("control_proof")
+        chain = stage.get("calculation_chain")
+        decision_stage = chain[-1] if isinstance(chain, list) and chain else None
+        decision = (
+            decision_stage.get("control_decision")
+            if isinstance(decision_stage, Mapping)
+            else None
+        )
+        decision_chain = (
+            decision_stage.get("calculation_chain")
+            if isinstance(decision_stage, Mapping)
+            else None
+        )
+        return_stage = (
+            decision_chain[-1]
+            if isinstance(decision_chain, list) and decision_chain
+            else None
+        )
+        control_return = (
+            return_stage.get("control_return")
+            if isinstance(return_stage, Mapping)
+            else None
+        )
+        proof_fields = {
+            "schema",
+            "control_return_stage_sha256",
+            "control_return_sha256",
+            "control_decision_stage_sha256",
+            "control_decision_sha256",
+            "current_tier",
+            "current_action_kind",
+            "next_tier",
+            "next_action_kind",
+            "proof_sha256",
+        }
+        proof_content = (
+            {key: item for key, item in proof.items() if key != "proof_sha256"}
+            if isinstance(proof, Mapping)
+            else None
+        )
+        if (
+            stage.get("admission_state")
+            != PromotionQueueDisposition.NUMERICAL_CONTINUATION.value
+            or not isinstance(proof, Mapping)
+            or set(proof) != proof_fields
+            or proof.get("schema") != PROMOTED_CONTROL_CONTINUATION_PROOF_SCHEMA
+            or proof.get("proof_sha256") != _sha256(proof_content)
+            or not isinstance(decision_stage, Mapping)
+            or decision_stage.get("schema")
+            != PROMOTED_CONTROL_DECISION_STAGE_SCHEMA
+            or not isinstance(decision, Mapping)
+            or decision.get("schema") != PROMOTED_CONTROL_DECISION_SCHEMA
+            or not isinstance(return_stage, Mapping)
+            or return_stage.get("schema") != PROMOTED_CONTROL_RETURN_STAGE_SCHEMA
+            or not isinstance(control_return, Mapping)
+            or control_return.get("schema") != PROMOTED_CONTROL_RETURN_SCHEMA
+            or proof.get("control_return_stage_sha256")
+            != return_stage.get("stage_sha256")
+            or proof.get("control_return_sha256")
+            != control_return.get("control_return_sha256")
+            or proof.get("control_decision_stage_sha256")
+            != decision_stage.get("stage_sha256")
+            or proof.get("control_decision_sha256")
+            != decision.get("control_decision_sha256")
+            or proof.get("current_tier") != "BF40"
+            or proof.get("next_tier") != "BF80"
+            or proof.get("current_action_kind") not in {"ROOT", "RESPONSE"}
+            or proof.get("next_action_kind")
+            != proof.get("current_action_kind")
+            or decision.get("disposition") != "PROMOTION_PENDING"
+            or decision.get("queue_kind") != proof.get("current_action_kind")
+            or decision.get("current_tier") != proof.get("current_tier")
+            or decision.get("current_action_kind")
+            != proof.get("current_action_kind")
+            or decision.get("next_tier") != proof.get("next_tier")
+            or decision.get("next_action_kind")
+            != proof.get("next_action_kind")
+            or "calculation_artifact" in stage
+            or "control_return" in stage
+            or "control_decision" in stage
+        ):
+            raise ValueError("promoted control continuation proof is invalid")
+        promoted_artifact_digest(control_return)
+        promoted_artifact_digest(decision)
+        authority = authenticate_persisted_control_decision(
+            control_return,
+            decision,
+            expected_return_schema=PROMOTED_CONTROL_RETURN_SCHEMA,
+            expected_decision_schema=PROMOTED_CONTROL_DECISION_SCHEMA,
+            expected_leaf_id=str(queue_entry["leaf_id"]),
+            expected_current_action_kind=_expected_promoted_control_action(
+                return_stage,
+                control_return,
+                queue_entry,
+            ),
+            expected_queue_ordinal=int(stage["queue_ordinal"]),
+        )
+        validate_persisted_control_stage_accounting(stage, authority)
+        return
+    raise ValueError("promoted stage schema is unsupported")
+
+
 def _authenticate_promoted_stage_chain(
     stage: Mapping[str, object],
     *,
@@ -233,6 +749,7 @@ def _authenticate_promoted_stage_chain(
     # empty list for the first raw stage.
     if stage.get("schema") == "windows-solver.promoted-calculation-stage/1":
         if chain is None and stage.get("source_calculation_stage_sha256") is None:
+            _validate_promoted_stage_payload(stage, queue_entry=queue_entry)
             return
     if not isinstance(chain, list) or not all(
         isinstance(item, Mapping) for item in chain
@@ -246,7 +763,13 @@ def _authenticate_promoted_stage_chain(
         digest = predecessor.get("stage_sha256")
         if (
             predecessor.get("schema")
-            != "windows-solver.promoted-calculation-stage/2"
+            not in {
+                PROMOTED_CALCULATION_STAGE_SCHEMA,
+                PROMOTED_CONTROL_RETURN_STAGE_SCHEMA,
+                PROMOTED_CONTROL_DECISION_STAGE_SCHEMA,
+                PROMOTED_CONTROL_CONTINUATION_STAGE_SCHEMA,
+                PROMOTED_POLICY_TERMINAL_STAGE_SCHEMA,
+            }
             or not _is_sha256(digest)
             or digest != _sha256(content)
             or predecessor.get("queue_ordinal") != queue_ordinal
@@ -263,9 +786,14 @@ def _authenticate_promoted_stage_chain(
             != expected_source
         ):
             raise ValueError("promoted calculation predecessor is invalid")
+        _validate_promoted_stage_payload(
+            predecessor,
+            queue_entry=queue_entry,
+        )
         expected_source = str(digest)
     if stage.get("source_calculation_stage_sha256") != expected_source:
         raise ValueError("promoted calculation chain head is invalid")
+    _validate_promoted_stage_payload(stage, queue_entry=queue_entry)
 
 
 def _require_replaced_promoted_stage(
@@ -644,6 +1172,256 @@ def append_promotion(
     return result
 
 
+def retain_promoted_control_return(
+    checkpoint: Mapping[str, object],
+    *,
+    queue_ordinal: int,
+    promoted_stage: Mapping[str, object],
+    execution_mode: str,
+    disposition_receipt: Mapping[str, object],
+    layer1_guard: object | None = None,
+) -> dict[str, object]:
+    """Durably retain a CONTROL return without calling it a calculation."""
+
+    result = validate_schema11_checkpoint(checkpoint)
+    if execution_mode != "CALCULATE_ONLY":
+        raise ValueError("control-return retention requires CALCULATE_ONLY mode")
+    entries = result["promotion_queue"]["entries"]
+    if (
+        isinstance(queue_ordinal, bool)
+        or not isinstance(queue_ordinal, int)
+        or queue_ordinal < 0
+        or queue_ordinal >= len(entries)
+    ):
+        raise ValueError("promotion queue ordinal is invalid")
+    entry = entries[queue_ordinal]
+    prior_disposition = entry["disposition"]
+    if prior_disposition not in {
+        PromotionQueueDisposition.PENDING.value,
+        PromotionQueueDisposition.NUMERICAL_CONTINUATION.value,
+    }:
+        raise ValueError("promotion queue cannot retain a control return")
+    stage = copy.deepcopy(dict(promoted_stage))
+    content = {key: item for key, item in stage.items() if key != "stage_sha256"}
+    if (
+        stage.get("stage_sha256") != _sha256(content)
+        or stage.get("schema") != PROMOTED_CONTROL_RETURN_STAGE_SCHEMA
+        or stage.get("leaf_id") != entry["leaf_id"]
+        or stage.get("queue_ordinal") != queue_ordinal
+        or stage.get("execution_mode") != execution_mode
+        or stage.get("admission_state")
+        != PromotionQueueDisposition.CONTROL_RETURN_RETAINED.value
+    ):
+        raise ValueError("promoted control-return stage authentication is invalid")
+    _authenticate_promoted_stage_chain(
+        stage, queue_entry=entry, queue_ordinal=queue_ordinal
+    )
+    bucket = result["promoted_stage_ledger"].setdefault(str(queue_ordinal), {})
+    if not isinstance(bucket, dict):
+        raise ValueError("promoted stage ledger ordinal is invalid")
+    leaf_id = str(entry["leaf_id"])
+    existing = bucket.get(leaf_id)
+    if prior_disposition == PromotionQueueDisposition.PENDING.value:
+        if existing is not None:
+            raise ValueError("initial control return conflicts with retained state")
+    elif (
+        not isinstance(existing, Mapping)
+        or existing.get("schema") != PROMOTED_CONTROL_CONTINUATION_STAGE_SCHEMA
+    ):
+        raise ValueError("BF80 control return lacks its continuation predecessor")
+    _require_replaced_promoted_stage(existing, stage)
+    receipt = copy.deepcopy(dict(disposition_receipt))
+    receipt.update({
+        "source_fingerprint_sha256": entry["source_fingerprint_sha256"],
+        "retained_promoted_stage_sha256": stage["stage_sha256"],
+        "execution_mode": execution_mode,
+        "admission_state": PromotionQueueDisposition.CONTROL_RETURN_RETAINED.value,
+    })
+    bucket[leaf_id] = stage
+    entry["retained_promoted_stage_sha256"] = stage["stage_sha256"]
+    entry["disposition"] = PromotionQueueDisposition.CONTROL_RETURN_RETAINED.value
+    entry["disposition_receipt_sha256"] = _sha256(receipt)
+    _assert_layer1_guard(layer1_guard, result)
+    return result
+
+
+def retain_promoted_control_decision(
+    checkpoint: Mapping[str, object],
+    *,
+    queue_ordinal: int,
+    promoted_stage: Mapping[str, object],
+    execution_mode: str,
+    disposition_receipt: Mapping[str, object],
+    layer1_guard: object | None = None,
+) -> dict[str, object]:
+    """Durably retain the pure classification of a retained CONTROL return."""
+
+    result = validate_schema11_checkpoint(checkpoint)
+    if execution_mode != "CALCULATE_ONLY":
+        raise ValueError("control-decision retention requires CALCULATE_ONLY mode")
+    entries = result["promotion_queue"]["entries"]
+    if (
+        isinstance(queue_ordinal, bool)
+        or not isinstance(queue_ordinal, int)
+        or queue_ordinal < 0
+        or queue_ordinal >= len(entries)
+    ):
+        raise ValueError("promotion queue ordinal is invalid")
+    entry = entries[queue_ordinal]
+    if entry["disposition"] != PromotionQueueDisposition.CONTROL_RETURN_RETAINED.value:
+        raise ValueError("control decision lacks a durable control return")
+    stage = copy.deepcopy(dict(promoted_stage))
+    content = {key: item for key, item in stage.items() if key != "stage_sha256"}
+    if (
+        stage.get("stage_sha256") != _sha256(content)
+        or stage.get("schema") != PROMOTED_CONTROL_DECISION_STAGE_SCHEMA
+        or stage.get("leaf_id") != entry["leaf_id"]
+        or stage.get("queue_ordinal") != queue_ordinal
+        or stage.get("execution_mode") != execution_mode
+        or stage.get("admission_state")
+        != PromotionQueueDisposition.CONTROL_DECISION_RETAINED.value
+    ):
+        raise ValueError("promoted control-decision stage authentication is invalid")
+    _authenticate_promoted_stage_chain(
+        stage, queue_entry=entry, queue_ordinal=queue_ordinal
+    )
+    bucket = result["promoted_stage_ledger"].get(str(queue_ordinal))
+    existing = (
+        bucket.get(str(entry["leaf_id"])) if isinstance(bucket, dict) else None
+    )
+    if (
+        not isinstance(existing, Mapping)
+        or existing.get("schema") != PROMOTED_CONTROL_RETURN_STAGE_SCHEMA
+    ):
+        raise ValueError("durable control-return stage is missing")
+    _require_replaced_promoted_stage(existing, stage)
+    receipt = copy.deepcopy(dict(disposition_receipt))
+    receipt.update({
+        "source_fingerprint_sha256": entry["source_fingerprint_sha256"],
+        "retained_promoted_stage_sha256": stage["stage_sha256"],
+        "execution_mode": execution_mode,
+        "admission_state": PromotionQueueDisposition.CONTROL_DECISION_RETAINED.value,
+    })
+    assert isinstance(bucket, dict)
+    leaf_id = str(entry["leaf_id"])
+    bucket[leaf_id] = stage
+    entry["retained_promoted_stage_sha256"] = stage["stage_sha256"]
+    entry["disposition"] = PromotionQueueDisposition.CONTROL_DECISION_RETAINED.value
+    entry["disposition_receipt_sha256"] = _sha256(receipt)
+    _assert_layer1_guard(layer1_guard, result)
+    return result
+
+
+def retain_promoted_control_terminal(
+    checkpoint: Mapping[str, object],
+    *,
+    queue_ordinal: int,
+    disposition: PromotionQueueDisposition | str,
+    disposition_receipt: Mapping[str, object],
+    layer1_guard: object | None = None,
+) -> dict[str, object]:
+    """Finish a non-promoting CONTROL decision without fabricating numerics."""
+
+    result = validate_schema11_checkpoint(checkpoint)
+    terminal = _enum_value(
+        disposition, PromotionQueueDisposition, "control terminal disposition"
+    )
+    if terminal not in {
+        PromotionQueueDisposition.UNRESOLVED.value,
+        PromotionQueueDisposition.DEFERRED.value,
+        PromotionQueueDisposition.REJECTED.value,
+    }:
+        raise ValueError("control terminal disposition is invalid")
+    entries = result["promotion_queue"]["entries"]
+    if (
+        isinstance(queue_ordinal, bool)
+        or not isinstance(queue_ordinal, int)
+        or queue_ordinal < 0
+        or queue_ordinal >= len(entries)
+    ):
+        raise ValueError("promotion queue ordinal is invalid")
+    entry = entries[queue_ordinal]
+    bucket = result["promoted_stage_ledger"].get(str(queue_ordinal))
+    stage = bucket.get(str(entry["leaf_id"])) if isinstance(bucket, dict) else None
+    decision = stage.get("control_decision") if isinstance(stage, Mapping) else None
+    if (
+        entry["disposition"]
+        != PromotionQueueDisposition.CONTROL_DECISION_RETAINED.value
+        or not isinstance(stage, Mapping)
+        or stage.get("schema") != PROMOTED_CONTROL_DECISION_STAGE_SCHEMA
+        or stage.get("stage_sha256") != entry["retained_promoted_stage_sha256"]
+        or not isinstance(decision, Mapping)
+        or decision.get("disposition") != terminal
+    ):
+        raise ValueError("control terminal decision is invalid")
+    receipt = promoted_control_terminal_disposition_receipt(entry, stage)
+    if copy.deepcopy(dict(disposition_receipt)) != receipt:
+        raise ValueError("control terminal disposition receipt is invalid")
+    entry["disposition"] = terminal
+    entry["disposition_receipt_sha256"] = _sha256(receipt)
+    _assert_layer1_guard(layer1_guard, result)
+    return result
+
+
+def retain_promoted_policy_terminal(
+    checkpoint: Mapping[str, object],
+    *,
+    queue_ordinal: int,
+    promoted_stage: Mapping[str, object],
+    disposition: PromotionQueueDisposition | str,
+    disposition_receipt: Mapping[str, object],
+    layer1_guard: object | None = None,
+) -> dict[str, object]:
+    """Retain an explicit no-work policy decision as a typed terminal stage."""
+
+    result = validate_schema11_checkpoint(checkpoint)
+    terminal = _enum_value(
+        disposition, PromotionQueueDisposition, "policy terminal disposition"
+    )
+    if terminal not in {
+        PromotionQueueDisposition.UNRESOLVED.value,
+        PromotionQueueDisposition.DEFERRED.value,
+        PromotionQueueDisposition.REJECTED.value,
+    }:
+        raise ValueError("policy terminal disposition is invalid")
+    entries = result["promotion_queue"]["entries"]
+    if (
+        isinstance(queue_ordinal, bool)
+        or not isinstance(queue_ordinal, int)
+        or queue_ordinal < 0
+        or queue_ordinal >= len(entries)
+    ):
+        raise ValueError("promotion queue ordinal is invalid")
+    entry = entries[queue_ordinal]
+    stage = copy.deepcopy(dict(promoted_stage))
+    content = {key: item for key, item in stage.items() if key != "stage_sha256"}
+    if (
+        entry["disposition"] != PromotionQueueDisposition.PENDING.value
+        or stage.get("stage_sha256") != _sha256(content)
+        or stage.get("schema") != PROMOTED_POLICY_TERMINAL_STAGE_SCHEMA
+        or stage.get("leaf_id") != entry["leaf_id"]
+        or stage.get("queue_ordinal") != queue_ordinal
+        or stage.get("execution_mode") != "BLOCK_ALL"
+        or stage.get("admission_state") != terminal
+    ):
+        raise ValueError("promoted policy terminal stage is invalid")
+    _authenticate_promoted_stage_chain(
+        stage, queue_entry=entry, queue_ordinal=queue_ordinal
+    )
+    receipt = promoted_policy_terminal_disposition_receipt(entry, stage)
+    if copy.deepcopy(dict(disposition_receipt)) != receipt:
+        raise ValueError("policy terminal disposition receipt is invalid")
+    bucket = result["promoted_stage_ledger"].setdefault(str(queue_ordinal), {})
+    if not isinstance(bucket, dict) or bucket.get(str(entry["leaf_id"])) is not None:
+        raise ValueError("conflicting promoted policy terminal stage")
+    bucket[str(entry["leaf_id"])] = stage
+    entry["retained_promoted_stage_sha256"] = stage["stage_sha256"]
+    entry["disposition"] = terminal
+    entry["disposition_receipt_sha256"] = _sha256(receipt)
+    _assert_layer1_guard(layer1_guard, result)
+    return result
+
+
 def retain_promoted_continuation(
     checkpoint: Mapping[str, object],
     *,
@@ -652,7 +1430,7 @@ def retain_promoted_continuation(
     execution_mode: str,
     layer1_guard: object | None = None,
 ) -> dict[str, object]:
-    """Durably retain completed BF40 work before its one allowed BF80 retry."""
+    """Retain BF80 authority only from a durable classified CONTROL decision."""
 
     result = validate_schema11_checkpoint(checkpoint)
     if execution_mode not in _PROMOTED_EXECUTION_MODES - {"BLOCK_ALL"}:
@@ -672,12 +1450,9 @@ def retain_promoted_continuation(
     if (
         entry["queue_ordinal"] != queue_ordinal
         or entry["disposition"]
-        not in {
-            PromotionQueueDisposition.PENDING.value,
-            PromotionQueueDisposition.CALCULATED_PENDING_DERIVATION.value,
-        }
+        != PromotionQueueDisposition.CONTROL_DECISION_RETAINED.value
     ):
-        raise ValueError("promotion queue entry is not pending")
+        raise ValueError("promotion continuation lacks a durable control decision")
     if not isinstance(promoted_stage, Mapping):
         raise ValueError("promoted continuation stage is invalid")
     stage = copy.deepcopy(dict(promoted_stage))
@@ -690,6 +1465,7 @@ def retain_promoted_continuation(
         or supplied_stage_sha256 != _sha256(stage_content)
         or stage.get("leaf_id") != entry["leaf_id"]
         or stage.get("queue_ordinal") != queue_ordinal
+        or stage.get("schema") != PROMOTED_CONTROL_CONTINUATION_STAGE_SCHEMA
         or stage.get("execution_mode") != execution_mode
         or stage.get("admission_state") != "NUMERICAL_CONTINUATION"
         or stage.get("next_precision_tier") != "BF80"
@@ -707,10 +1483,16 @@ def retain_promoted_continuation(
         raise ValueError("promoted stage ledger ordinal is invalid")
     leaf_id = str(entry["leaf_id"])
     existing_stage = bucket.get(leaf_id)
-    if existing_stage is not None and existing_stage != stage and not (
-        isinstance(existing_stage, Mapping)
-        and existing_stage.get("admission_state")
-        == "CALCULATED_PENDING_DERIVATION"
+    if (
+        not isinstance(existing_stage, Mapping)
+        or existing_stage.get("schema")
+        != PROMOTED_CONTROL_DECISION_STAGE_SCHEMA
+        or existing_stage.get("admission_state")
+        != PromotionQueueDisposition.CONTROL_DECISION_RETAINED.value
+    ):
+        raise ValueError("promoted continuation decision stage is missing")
+    if existing_stage != stage and stage.get("source_calculation_stage_sha256") != (
+        existing_stage.get("stage_sha256")
     ):
         raise ValueError("conflicting promoted continuation stage")
     _require_replaced_promoted_stage(existing_stage, stage)
@@ -914,20 +1696,13 @@ def retain_promoted_raw_calculation(
     _authenticate_promoted_stage_chain(
         stage, queue_entry=entry, queue_ordinal=queue_ordinal
     )
-    artifact_digest_field = (
-        "control_return_sha256"
-        if artifact.get("schema")
-        == "windows-solver.promoted-exterior-control-return/2"
-        else "calculation_sha256"
-    )
-    artifact_content = {
-        key: item for key, item in artifact.items() if key != artifact_digest_field
-    }
-    if (
-        not _is_sha256(artifact.get(artifact_digest_field))
-        or artifact[artifact_digest_field] != _sha256(artifact_content)
+    artifact_digest_field, artifact_sha256 = promoted_artifact_digest(artifact)
+    if artifact.get("schema") in (
+        _PROMOTED_CONTROL_RETURN_SCHEMAS
+        | _PROMOTED_CONTROL_DECISION_SCHEMAS
+        | {"windows-solver.promoted-horizon-control-return/1"}
     ):
-        raise ValueError("raw promoted calculation artifact digest is invalid")
+        raise ValueError("CONTROL artifact cannot be retained as a calculation")
     receipt = copy.deepcopy(dict(disposition_receipt))
     source_fingerprint_sha256 = entry["source_fingerprint_sha256"]
     supplied_fingerprint = receipt.get("source_fingerprint_sha256")
@@ -936,7 +1711,7 @@ def retain_promoted_raw_calculation(
     if receipt.get("schema") == "windows-solver.promoted-raw-return-retention/3":
         if (
             receipt.get("artifact_digest_field") != artifact_digest_field
-            or receipt.get("artifact_sha256") != artifact[artifact_digest_field]
+            or receipt.get("artifact_sha256") != artifact_sha256
         ):
             raise ValueError("raw promoted return receipt is invalid")
     receipt.update({
@@ -1188,6 +1963,14 @@ def finish_promotion(
     if disposition_value == PromotionQueueDisposition.AWAITING_ADMISSION.value:
         raise ValueError(
             "AWAITING_ADMISSION requires retained promoted calculation"
+        )
+    if disposition_value in {
+        PromotionQueueDisposition.UNRESOLVED.value,
+        PromotionQueueDisposition.DEFERRED.value,
+        PromotionQueueDisposition.REJECTED.value,
+    }:
+        raise ValueError(
+            "UNRESOLVED/DEFERRED/REJECTED require a typed retained authority stage"
         )
     if disposition_value not in TERMINAL_PROMOTION_DISPOSITIONS:
         raise ValueError("promotion completion requires a terminal disposition")
@@ -1653,6 +2436,8 @@ def validate_schema11_checkpoint(
             raise ValueError("terminal promotion requires a receipt digest")
         if disposition in {
             PromotionQueueDisposition.CALCULATED_PENDING_DERIVATION.value,
+            PromotionQueueDisposition.CONTROL_RETURN_RETAINED.value,
+            PromotionQueueDisposition.CONTROL_DECISION_RETAINED.value,
             PromotionQueueDisposition.NUMERICAL_CONTINUATION.value,
             PromotionQueueDisposition.AWAITING_ADMISSION.value,
             PromotionQueueDisposition.ADMITTED_PENDING_PUBLICATION.value,
@@ -1713,29 +2498,48 @@ def validate_schema11_checkpoint(
                 admission_state == "NUMERICAL_CONTINUATION"
                 and queue_entry["disposition"]
                 == PromotionQueueDisposition.NUMERICAL_CONTINUATION.value
+                and stage.get("schema")
+                == PROMOTED_CONTROL_CONTINUATION_STAGE_SCHEMA
                 and stage.get("next_precision_tier") == "BF80"
                 and stage.get("precision_tiers") == ["BF40"]
             )
             raw_artifact = stage.get("calculation_artifact")
-            raw_digest_field = (
-                "control_return_sha256"
-                if isinstance(raw_artifact, Mapping)
-                and raw_artifact.get("schema")
-                == "windows-solver.promoted-exterior-control-return/2"
-                else "calculation_sha256"
-            )
             valid_raw_stage = (
                 admission_state == "CALCULATED_PENDING_DERIVATION"
                 and queue_entry["disposition"]
                 == PromotionQueueDisposition.CALCULATED_PENDING_DERIVATION.value
+                and stage.get("schema") == PROMOTED_CALCULATION_STAGE_SCHEMA
                 and isinstance(raw_artifact, Mapping)
-                and _is_sha256(raw_artifact.get(raw_digest_field))
-                and raw_artifact[raw_digest_field]
-                == _sha256({
-                    key: item
-                    for key, item in raw_artifact.items()
-                    if key != raw_digest_field
-                })
+            )
+            valid_control_return_stage = (
+                admission_state
+                == PromotionQueueDisposition.CONTROL_RETURN_RETAINED.value
+                and queue_entry["disposition"]
+                == PromotionQueueDisposition.CONTROL_RETURN_RETAINED.value
+                and stage.get("schema") == PROMOTED_CONTROL_RETURN_STAGE_SCHEMA
+            )
+            valid_control_decision_stage = (
+                admission_state
+                == PromotionQueueDisposition.CONTROL_DECISION_RETAINED.value
+                and stage.get("schema") == PROMOTED_CONTROL_DECISION_STAGE_SCHEMA
+                and queue_entry["disposition"]
+                in {
+                    PromotionQueueDisposition.CONTROL_DECISION_RETAINED.value,
+                    PromotionQueueDisposition.UNRESOLVED.value,
+                    PromotionQueueDisposition.DEFERRED.value,
+                    PromotionQueueDisposition.REJECTED.value,
+                }
+            )
+            valid_policy_terminal_stage = (
+                admission_state
+                in {
+                    PromotionQueueDisposition.UNRESOLVED.value,
+                    PromotionQueueDisposition.DEFERRED.value,
+                    PromotionQueueDisposition.REJECTED.value,
+                }
+                and queue_entry["disposition"] == admission_state
+                and stage.get("schema") == PROMOTED_POLICY_TERMINAL_STAGE_SCHEMA
+                and stage.get("execution_mode") == "BLOCK_ALL"
             )
             valid_reduced_numerical_terminal = (
                 admission_state
@@ -1745,6 +2549,7 @@ def validate_schema11_checkpoint(
                     PromotionQueueDisposition.REJECTED.value,
                 }
                 and queue_entry["disposition"] == admission_state
+                and stage.get("schema") == PROMOTED_CALCULATION_STAGE_SCHEMA
             )
             if (
                 not _is_sha256(stage_sha256)
@@ -1755,6 +2560,9 @@ def validate_schema11_checkpoint(
                     valid_terminal_stage
                     or valid_continuation_stage
                     or valid_raw_stage
+                    or valid_control_return_stage
+                    or valid_control_decision_stage
+                    or valid_policy_terminal_stage
                     or valid_reduced_numerical_terminal
                 )
             ):
@@ -1762,9 +2570,76 @@ def validate_schema11_checkpoint(
             _authenticate_promoted_stage_chain(
                 stage, queue_entry=queue_entry, queue_ordinal=ordinal
             )
+            if valid_control_decision_stage and queue_entry["disposition"] in {
+                PromotionQueueDisposition.UNRESOLVED.value,
+                PromotionQueueDisposition.DEFERRED.value,
+                PromotionQueueDisposition.REJECTED.value,
+            }:
+                expected_terminal_receipt = (
+                    promoted_control_terminal_disposition_receipt(
+                        queue_entry,
+                        stage,
+                    )
+                )
+                if (
+                    stage.get("control_decision", {}).get("disposition")
+                    != queue_entry["disposition"]
+                    or queue_entry["disposition_receipt_sha256"]
+                    != _sha256(expected_terminal_receipt)
+                ):
+                    raise ValueError(
+                        "CONTROL terminal disposition proof is invalid"
+                    )
+                promoted_pass = pass_ledgers[SurveyPass.PROMOTED.value].get(
+                    leaf_id
+                )
+                if (
+                    promoted_pass is not None
+                    and promoted_pass.get("disposition")
+                    != queue_entry["disposition"]
+                ):
+                    raise ValueError(
+                        "CONTROL terminal survey disposition is invalid"
+                    )
+            if valid_policy_terminal_stage:
+                expected_policy_receipt = (
+                    promoted_policy_terminal_disposition_receipt(
+                        queue_entry,
+                        stage,
+                    )
+                )
+                if queue_entry["disposition_receipt_sha256"] != _sha256(
+                    expected_policy_receipt
+                ):
+                    raise ValueError(
+                        "policy terminal disposition proof is invalid"
+                    )
+                promoted_pass = pass_ledgers[SurveyPass.PROMOTED.value].get(
+                    leaf_id
+                )
+                if (
+                    promoted_pass is not None
+                    and promoted_pass.get("disposition")
+                    != queue_entry["disposition"]
+                ):
+                    raise ValueError(
+                        "policy terminal survey disposition is invalid"
+                    )
             seen_stages.add((ordinal, leaf_id))
     for ordinal, queue_entry in enumerate(queue_entries):
         pointer = queue_entry["retained_promoted_stage_sha256"]
+        if (
+            queue_entry["disposition"]
+            in {
+                PromotionQueueDisposition.UNRESOLVED.value,
+                PromotionQueueDisposition.DEFERRED.value,
+                PromotionQueueDisposition.REJECTED.value,
+            }
+            and pointer is None
+        ):
+            raise ValueError(
+                "current terminal disposition lacks its retained authority stage"
+            )
         if pointer is not None and (ordinal, str(queue_entry["leaf_id"])) not in seen_stages:
             raise ValueError("schema-11 retained promoted stage pointer is dangling")
 
@@ -1819,6 +2694,19 @@ __all__ = [
     "EvidenceLevel",
     "ExecutionProfile",
     "NUMERICAL_RECORD_STATES",
+    "PROMOTED_CALCULATION_STAGE_SCHEMA",
+    "PROMOTED_CONTROL_CONTINUATION_PROOF_SCHEMA",
+    "PROMOTED_CONTROL_CONTINUATION_STAGE_SCHEMA",
+    "PROMOTED_CONTROL_DECISION_SCHEMA",
+    "PROMOTED_CONTROL_DECISION_STAGE_SCHEMA",
+    "PROMOTED_CONTROL_RETURN_SCHEMA",
+    "PROMOTED_CONTROL_RETURN_STAGE_SCHEMA",
+    "PROMOTED_CONTROL_TERMINAL_RECEIPT_SCHEMA",
+    "PROMOTED_HORIZON_CONTROL_DECISION_SCHEMA",
+    "PROMOTED_HORIZON_CONTROL_RETURN_SCHEMA",
+    "PROMOTED_POLICY_TERMINAL_DECISION_SCHEMA",
+    "PROMOTED_POLICY_TERMINAL_RECEIPT_SCHEMA",
+    "PROMOTED_POLICY_TERMINAL_STAGE_SCHEMA",
     "PROMOTED_SURVEY_DISPOSITIONS",
     "PROMOTION_QUEUE_SCHEMA",
     "PromotionQueueDisposition",
@@ -1831,12 +2719,19 @@ __all__ = [
     "complete_promoted_publication",
     "empty_schema11_checkpoint",
     "finish_promotion",
+    "promoted_artifact_digest",
+    "promoted_control_terminal_disposition_receipt",
+    "promoted_policy_terminal_disposition_receipt",
     "promotion_source_fingerprint_sha256",
     "record_evidence",
     "record_survey_disposition",
     "retain_promoted_background",
     "retain_promoted_calculation",
     "retain_promoted_continuation",
+    "retain_promoted_control_decision",
+    "retain_promoted_control_return",
+    "retain_promoted_control_terminal",
+    "retain_promoted_policy_terminal",
     "retain_promoted_raw_calculation",
     "retain_promoted_terminal_reduction",
     "validate_schema11_checkpoint",

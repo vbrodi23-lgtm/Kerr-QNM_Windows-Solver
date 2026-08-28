@@ -6,6 +6,7 @@ import json
 import lzma
 from pathlib import Path
 from types import SimpleNamespace
+import tempfile
 import unittest
 
 from windows_solver.campaign_failures import (
@@ -13,6 +14,13 @@ from windows_solver.campaign_failures import (
     resolve_system_failure_for_resume,
 )
 from windows_solver.campaign_policy import validate_schema11_checkpoint
+from windows_solver.campaign_recovery import (
+    checkpoint_bound_promoted_recovery_selection,
+)
+from windows_solver.campaign_survey import (
+    AuthenticatedRootSeal,
+    run_promoted_survey,
+)
 from windows_solver.contracts import canonical_json_bytes
 from windows_solver.julia_response_backend import (
     FIXED_ROOT_SURVEY_BATCH_SCHEMA,
@@ -26,11 +34,16 @@ from windows_solver.promoted_control_calibration import (
 from windows_solver.response_batches import (
     PrecisionCapabilities,
     build_campaign_plan,
+    build_campaign_selection,
+)
+from windows_solver.reviewed_determinant_error_issuance import (
+    require_locked_bf40_determinant_error_issuance_authority,
 )
 from windows_solver.response_engine import (
     NumericalPolicy,
     VettedNativeDeterminantKernel,
 )
+from tests.test_promoted_survey_scheduler import _TestLayer1Guard
 
 
 FIXTURE = (
@@ -70,6 +83,46 @@ def _preview_backend(digits: int) -> JuliaPrecisionRootBackend:
         "runtime_policy_sha256": "d" * 64,
         "scientific_sources": [],
     })
+    return JuliaPrecisionRootBackend(
+        VettedNativeDeterminantKernel.identity,
+        adapter,
+        digits,
+        empirical_control_profile=calibration.budget_for(
+            "exterior-wronskian/v1", digits
+        ),
+        calibration_receipt=calibration,
+    )
+
+
+class _SchedulerDispatchReached(KeyboardInterrupt):
+    pass
+
+
+class _DispatchCaptureAdapter:
+    runtime_provenance = {
+        "julia_version": "fixture-no-worker",
+        "julia_executable_sha256": "a" * 64,
+        "julia_manifest_sha256": "b" * 64,
+        "worker_sha256": "c" * 64,
+        "runtime_policy_sha256": "d" * 64,
+        "scientific_sources": [],
+    }
+
+    def __init__(self) -> None:
+        self.requests: list[
+            tuple[dict[str, object], dict[str, object], str]
+        ] = []
+
+    def evaluate_for_validation(self, request):
+        captured = _worker_request_document(request)
+        self.requests.append(captured)
+        raise _SchedulerDispatchReached
+
+
+def _backend_with_adapter(
+    digits: int, adapter: object
+) -> JuliaPrecisionRootBackend:
+    calibration = load_default_calibration_receipt()
     return JuliaPrecisionRootBackend(
         VettedNativeDeterminantKernel.identity,
         adapter,
@@ -232,6 +285,175 @@ class PR74CheckpointHandoverTests(unittest.TestCase):
         )
         self.assertEqual(resolved_entries[0], entries[0])
         self.assertEqual(resolved_entries[1], entries[1])
+
+        current_selection = build_campaign_selection(plan, role="all")
+        self.assertNotEqual(plan.campaign_id, resolved["campaign_id"])
+        self.assertNotEqual(
+            current_selection.selection_id, resolved["selection_id"]
+        )
+        recovery_selection = checkpoint_bound_promoted_recovery_selection(
+            plan, current_selection, resolved
+        )
+        self.assertEqual(recovery_selection.campaign_id, resolved["campaign_id"])
+        self.assertEqual(
+            recovery_selection.selection_id, resolved["selection_id"]
+        )
+        self.assertEqual(
+            recovery_selection.ordered_leaf_ids,
+            tuple(item.leaf_id for item in plan.leaves),
+        )
+        self.assertEqual(
+            tuple(recovery_selection.scientific_identities),
+            recovery_selection.ordered_leaf_ids,
+        )
+        swapped_leaf_ids = (
+            recovery_selection.ordered_leaf_ids[1],
+            recovery_selection.ordered_leaf_ids[0],
+            *recovery_selection.ordered_leaf_ids[2:],
+        )
+        with self.assertRaisesRegex(ValueError, "exact full 212-leaf"):
+            checkpoint_bound_promoted_recovery_selection(
+                plan,
+                SimpleNamespace(role="all", leaf_ids=swapped_leaf_ids),
+                resolved,
+            )
+
+        locked_route = SimpleNamespace(
+            queue_ordinal=1,
+            leaf_id=ordinal_one["leaf_id"],
+            route="EXTERIOR_BF40",
+            minimum_requested_tier=ordinal_one["minimum_requested_tier"],
+            source_stage_sha256=ordinal_one["source_stage_sha256"],
+            source_root_seal_sha256=ordinal_one["source_root_seal_sha256"],
+            source_fingerprint_sha256=ordinal_one[
+                "source_fingerprint_sha256"
+            ],
+            provisional_stage=ordinal_one["provisional_stage"],
+        )
+        preflight = require_locked_bf40_determinant_error_issuance_authority(
+            route="EXTERIOR_BF40"
+        )
+        adapter = _DispatchCaptureAdapter()
+        root_lookups: list[str] = []
+        backend_calls: list[tuple[str, int]] = []
+
+        def root_seal_lookup(requested_leaf, queue_entry):
+            root_lookups.append(requested_leaf.leaf_id)
+            self.assertEqual(queue_entry["queue_ordinal"], 1)
+            return AuthenticatedRootSeal(
+                requested_leaf.job.root.omega,
+                requested_leaf.job.root.branch_id,
+                queue_entry["source_root_seal_sha256"],
+            )
+
+        def backend_factory(requested_leaf, digits):
+            backend_calls.append((requested_leaf.leaf_id, digits))
+            self.assertEqual(requested_leaf.leaf_id, ordinal_one["leaf_id"])
+            self.assertEqual(digits, 40)
+            return _backend_with_adapter(digits, adapter)
+
+        resolved_digest = _sha256(resolved)
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "checkpoint.json"
+            forged_identities = dict(
+                recovery_selection.scientific_identities
+            )
+            forged_identities[ordinal_one["leaf_id"]] = "0" * 64
+            forged_selection = type(recovery_selection)(
+                campaign_id=recovery_selection.campaign_id,
+                selection_id=recovery_selection.selection_id,
+                ordered_leaf_ids=recovery_selection.ordered_leaf_ids,
+                roles=recovery_selection.roles,
+                scientific_identities=forged_identities,
+            )
+            with self.assertRaisesRegex(
+                ValueError, "historical promoted recovery binding"
+            ):
+                run_promoted_survey(
+                    plan,
+                    forged_selection,
+                    resolved,
+                    checkpoint_path=Path(temporary) / "forged.json",
+                    root_seal_lookup=root_seal_lookup,
+                    backend_factory=backend_factory,
+                    primary_root_runner=lambda *_args: self.fail(
+                        "forged handover reached root execution"
+                    ),
+                    horizon_runner=lambda *_args: self.fail(
+                        "forged handover reached horizon execution"
+                    ),
+                    root_seal_publish=lambda *_args: self.fail(
+                        "forged handover reached publication"
+                    ),
+                    layer1_guard=_TestLayer1Guard(),
+                    locked_routes_by_ordinal={1: locked_route},
+                    promoted_preflights_by_ordinal={1: preflight},
+                    layer1_lock_receipt_sha256=layer1_lock,
+                )
+            with self.assertRaises(_SchedulerDispatchReached):
+                run_promoted_survey(
+                    plan,
+                    recovery_selection,
+                    resolved,
+                    checkpoint_path=path,
+                    root_seal_lookup=root_seal_lookup,
+                    backend_factory=backend_factory,
+                    primary_root_runner=lambda *_args: self.fail(
+                        "retained response root was replayed"
+                    ),
+                    horizon_runner=lambda *_args: self.fail(
+                        "ordinal-zero horizon work was replayed"
+                    ),
+                    root_seal_publish=lambda *_args: self.fail(
+                        "retained response root was republished"
+                    ),
+                    layer1_guard=_TestLayer1Guard(),
+                    locked_routes_by_ordinal={1: locked_route},
+                    promoted_preflights_by_ordinal={1: preflight},
+                    layer1_lock_receipt_sha256=layer1_lock,
+                )
+            durable = validate_schema11_checkpoint(json.loads(path.read_bytes()))
+
+        self.assertEqual(_sha256(durable), resolved_digest)
+        self.assertEqual(durable["campaign_id"], checkpoint["campaign_id"])
+        self.assertEqual(durable["selection_id"], checkpoint["selection_id"])
+        self.assertEqual(durable["survey_pass_ledger"], resolved["survey_pass_ledger"])
+        self.assertEqual(durable["promotion_queue"], resolved["promotion_queue"])
+        self.assertEqual(
+            durable["promoted_stage_ledger"], resolved["promoted_stage_ledger"]
+        )
+        self.assertEqual(durable["promoted_root_ledger"], resolved["promoted_root_ledger"])
+        self.assertEqual(
+            durable["promoted_background_ledger"],
+            resolved["promoted_background_ledger"],
+        )
+        self.assertEqual(root_lookups, [ordinal_one["leaf_id"]])
+        self.assertEqual(backend_calls, [(ordinal_one["leaf_id"], 40)])
+        self.assertEqual(len(adapter.requests), 1)
+        dispatched_binding, dispatched_wire, dispatched_sha256 = adapter.requests[0]
+        self.assertEqual(
+            dispatched_binding["schema"], FIXED_ROOT_SURVEY_BATCH_SCHEMA
+        )
+        self.assertEqual(dispatched_binding["schema_version"], 2)
+        self.assertEqual(
+            dispatched_binding["leaf_id"], ordinal_one["leaf_id"]
+        )
+        self.assertEqual(
+            dispatched_binding["plan"],
+            FixedRootSurveyPlan.CANONICAL_BACKGROUND_FIVE.value,
+        )
+        self.assertEqual(dispatched_wire["request_sha256"], dispatched_sha256)
+        self.assertEqual(dispatched_wire["execution_identity"]["scope"], "REQUEST")
+        self.assertNotIn("sample_index", dispatched_wire["execution_identity"])
+        self.assertNotIn("sample_role", dispatched_wire["execution_identity"])
+        self.assertEqual(
+            [item["sample_index"] for item in dispatched_wire["samples"]],
+            list(range(5)),
+        )
+        self.assertNotIn(
+            "windows-solver.fixed-root-survey-batch/1",
+            json.dumps(dispatched_wire, sort_keys=True),
+        )
 
 
 if __name__ == "__main__":

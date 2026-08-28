@@ -16,6 +16,7 @@ from .campaign_policy import (
     EvidenceLevel,
     add_numerical_record,
     empty_schema11_checkpoint,
+    promotion_source_fingerprint_sha256,
     record_evidence,
     validate_schema11_checkpoint,
 )
@@ -186,6 +187,129 @@ class RecoverySelection:
         object.__setattr__(
             self, "scientific_identities", dict(self.scientific_identities)
         )
+
+
+def checkpoint_bound_promoted_recovery_selection(
+    plan: object,
+    selection: object,
+    checkpoint: Mapping[str, object],
+) -> RecoverySelection:
+    """Bind one fully queued historical checkpoint without rewriting evidence.
+
+    Campaign source hashes legitimately change across a control-plane repair.
+    A stale identifier is therefore accepted only when the authenticated
+    promotion queue covers the current full 212-leaf selection exactly and
+    every queue source still binds to its retained Binary64 disposition.
+    """
+
+    plan_leaf_ids = tuple(leaf.leaf_id for leaf in plan.leaves)
+    selected_leaf_ids = tuple(selection.leaf_ids)
+    if (
+        getattr(selection, "role", None) != "all"
+        or len(plan_leaf_ids) != 212
+        or selected_leaf_ids != plan_leaf_ids
+    ):
+        raise ValueError(
+            "historical promoted handover requires the exact full 212-leaf selection"
+        )
+    value, roles, scientific_identities = (
+        _checkpoint_bound_promoted_recovery_material(
+            plan, selected_leaf_ids, checkpoint
+        )
+    )
+    return RecoverySelection(
+        campaign_id=str(value["campaign_id"]),
+        selection_id=str(value["selection_id"]),
+        ordered_leaf_ids=selected_leaf_ids,
+        roles=roles,
+        scientific_identities=scientific_identities,
+    )
+
+
+def _checkpoint_bound_promoted_recovery_material(
+    plan: object,
+    selected_leaf_ids: tuple[str, ...],
+    checkpoint: Mapping[str, object],
+) -> tuple[dict[str, object], dict[str, str], dict[str, str]]:
+    """Authenticate the historical queue as routing evidence, not calculations."""
+
+    value = validate_schema11_checkpoint(checkpoint)
+    plan_leaf_ids = tuple(leaf.leaf_id for leaf in plan.leaves)
+    if len(plan_leaf_ids) != 212 or selected_leaf_ids != plan_leaf_ids:
+        raise ValueError(
+            "historical promoted handover requires the exact full 212-leaf order"
+        )
+    entries = value["promotion_queue"]["entries"]
+    if (
+        len(entries) != len(selected_leaf_ids)
+        or tuple(entry.get("queue_ordinal") for entry in entries)
+        != tuple(range(len(selected_leaf_ids)))
+        or tuple(entry.get("leaf_id") for entry in entries) != selected_leaf_ids
+    ):
+        raise ValueError(
+            "historical promoted handover queue does not match the selected leaf order"
+        )
+
+    binary64 = value["survey_pass_ledger"]["binary64"]
+    scientific_identities: dict[str, str] = {}
+    roles = {leaf.leaf_id: leaf.role for leaf in plan.leaves}
+    for leaf_id, entry in zip(selected_leaf_ids, entries, strict=True):
+        binary64_entry = binary64.get(leaf_id)
+        scientific_identity = entry.get("scientific_computation_identity")
+        source_fingerprint = entry.get("source_fingerprint_sha256")
+        if (
+            not isinstance(binary64_entry, Mapping)
+            or binary64_entry.get("leaf_id") != leaf_id
+            or entry.get("source_binary64_disposition_receipt_sha256")
+            != binary64_entry.get("disposition_receipt_sha256")
+            or not _is_sha256(scientific_identity)
+            or not _is_sha256(entry.get("source_stage_sha256"))
+            or not _is_sha256(entry.get("source_root_seal_sha256"))
+            or not _is_sha256(source_fingerprint)
+            or source_fingerprint != promotion_source_fingerprint_sha256(entry)
+        ):
+            raise ValueError(
+                "historical promoted handover queue source binding is invalid"
+            )
+        provisional = entry.get("provisional_stage")
+        if provisional is not None and (
+            not isinstance(provisional, Mapping)
+            or entry.get("provisional_stage_sha256")
+            != provisional.get("stage_sha256")
+            or entry.get("source_stage_sha256") != provisional.get("stage_sha256")
+        ):
+            raise ValueError(
+                "historical promoted handover provisional source is invalid"
+            )
+        scientific_identities[leaf_id] = scientific_identity
+
+    return value, roles, scientific_identities
+
+
+def validate_checkpoint_bound_promoted_recovery_selection(
+    plan: object,
+    selection: RecoverySelection,
+    checkpoint: Mapping[str, object],
+) -> RecoverySelection:
+    """Reauthenticate a historical handover at the scheduler boundary."""
+
+    if not isinstance(selection, RecoverySelection):
+        raise ValueError("historical promoted recovery selection is invalid")
+    if getattr(plan, "campaign_id", None) == selection.campaign_id:
+        raise ValueError("historical promoted handover requires a stale campaign ID")
+    value, roles, scientific_identities = (
+        _checkpoint_bound_promoted_recovery_material(
+            plan, selection.ordered_leaf_ids, checkpoint
+        )
+    )
+    if (
+        value["campaign_id"] != selection.campaign_id
+        or value["selection_id"] != selection.selection_id
+        or roles != selection.roles
+        or scientific_identities != selection.scientific_identities
+    ):
+        raise ValueError("historical promoted recovery binding is invalid")
+    return selection
 
 
 @dataclass(frozen=True, slots=True)
@@ -1364,7 +1488,9 @@ __all__ = [
     "RECOVERY_RECEIPT_SCHEMA",
     "RecoverySelection",
     "RecoverySummary",
+    "checkpoint_bound_promoted_recovery_selection",
     "recover_campaign",
+    "validate_checkpoint_bound_promoted_recovery_selection",
     "validate_recovery_checkpoint",
     "validate_recovery_receipt",
 ]

@@ -941,12 +941,17 @@ class CampaignLeafRecord:
         return record
 
 
-_CONTAINABLE_FAILURE_CODES = frozenset({
+# This module owns the historical campaign-checkpoint/9 precision ladder
+# (BF80 -> BF120).  It is intentionally isolated from the schema-11 promoted
+# CONTROL lifecycle, whose BF40 -> BF80 authority lives exclusively in the
+# operation-discriminated registry.  These tables validate and resume only
+# campaign-checkpoint/9 artifacts; they must never be imported by schema 11.
+_LEGACY_CAMPAIGN9_CONTAINABLE_FAILURE_CODES = frozenset({
     "ODE_RESOURCE_LIMIT",
     "ROOT_READOUT_RESOURCE_INFEASIBLE",
     "WORKER_TIMEOUT",
 }) | NUMERICAL_CONTROL_FAILURE_CODES
-_CONTAINABLE_FAILURE_STATES = {
+_LEGACY_CAMPAIGN9_CONTAINABLE_FAILURE_STATES = {
     "ODE_RESOURCE_LIMIT": "EXECUTION_RESOURCE_LIMITED",
     "ROOT_READOUT_RESOURCE_INFEASIBLE": "EXECUTION_RESOURCE_LIMITED",
     "WORKER_TIMEOUT": "WORKER_TIMEOUT",
@@ -955,13 +960,13 @@ _CONTAINABLE_FAILURE_STATES = {
         for code in NUMERICAL_CONTROL_FAILURE_CODES
     },
 }
-_CONTAINABLE_EXCEPTION_TYPES = (
+_LEGACY_CAMPAIGN9_CONTAINABLE_EXCEPTION_TYPES = (
     JuliaODEResourceLimitError,
     JuliaRootReadoutResourceLimitError,
     JuliaWorkerTimeoutError,
     JuliaNumericalControlError,
 )
-_RETRYABLE_NUMERICAL_CONTROL_FAILURE_CODES = frozenset({
+_LEGACY_CAMPAIGN9_RETRYABLE_NUMERICAL_CONTROL_FAILURE_CODES = frozenset({
     "INSUFFICIENT_ASYMPTOTIC_PRECISION",
     "HORIZON_ARITHMETIC_INADEQUATE",
 })
@@ -1023,7 +1028,7 @@ def _validated_operation_control_attempt_receipt(
     if value.get("control_receipt_sha256") != validated.sha256:
         raise ValueError("campaign operation-control receipt digest is invalid")
     code = validated.failure_code
-    if code not in _CONTAINABLE_FAILURE_CODES:
+    if code not in _LEGACY_CAMPAIGN9_CONTAINABLE_FAILURE_CODES:
         raise ValueError("campaign operation-control attempt is not containable")
     timed_out = bounded_worker["worker_timed_out"]
     if (code == "WORKER_TIMEOUT") is not (timed_out is True):
@@ -1105,14 +1110,14 @@ def _validated_attempt_failure_receipt(
         raise ValueError("campaign execution attempt lacks a structured failure")
     code = failure.get("failure_code")
     if (
-        code not in _CONTAINABLE_FAILURE_CODES
+        code not in _LEGACY_CAMPAIGN9_CONTAINABLE_FAILURE_CODES
         or failure.get("failure_class") != "CONTROL"
         or not isinstance(failure.get("retryable"), bool)
     ):
         raise ValueError("campaign execution attempt is not containable")
     if code in NUMERICAL_CONTROL_FAILURE_CODES and (
         failure.get("retryable")
-        is not (code in _RETRYABLE_NUMERICAL_CONTROL_FAILURE_CODES)
+        is not (code in _LEGACY_CAMPAIGN9_RETRYABLE_NUMERICAL_CONTROL_FAILURE_CODES)
         or not _valid_numerical_control_diagnostics(
             failure,
             allow_historical_schema7_policy=(
@@ -1261,9 +1266,9 @@ class CampaignExecutionAttempt:
             raise ValueError("campaign execution attempt ordinal is invalid")
         if self.precision_digits not in {80, 120}:
             raise ValueError("campaign execution attempt precision is invalid")
-        if self.failure_code not in _CONTAINABLE_FAILURE_CODES:
+        if self.failure_code not in _LEGACY_CAMPAIGN9_CONTAINABLE_FAILURE_CODES:
             raise ValueError("campaign execution attempt failure code is invalid")
-        if self.state != _CONTAINABLE_FAILURE_STATES[self.failure_code]:
+        if self.state != _LEGACY_CAMPAIGN9_CONTAINABLE_FAILURE_STATES[self.failure_code]:
             raise ValueError("campaign execution attempt state is invalid")
         receipt = _validated_attempt_failure_receipt(
             self.failure_receipt,
@@ -1277,7 +1282,7 @@ class CampaignExecutionAttempt:
             raise ValueError(
                 "campaign execution attempt precision does not match receipt"
             )
-        expected_decision = _numerical_failure_promotion_decision(
+        expected_decision = _legacy_campaign9_numerical_failure_promotion_decision(
             failure, self.precision_digits
         )
         raw_decision = _attempt_promotion_decision(receipt)
@@ -1498,8 +1503,9 @@ def _validate_failed_preflight_attempt_request(
             required_failure_code is not None
             and attempt.failure_code != required_failure_code
         )
-        or attempt.failure_code not in _CONTAINABLE_FAILURE_CODES
-        or attempt.state != _CONTAINABLE_FAILURE_STATES[attempt.failure_code]
+        or attempt.failure_code not in _LEGACY_CAMPAIGN9_CONTAINABLE_FAILURE_CODES
+        or attempt.state
+        != _LEGACY_CAMPAIGN9_CONTAINABLE_FAILURE_STATES[attempt.failure_code]
     ):
         raise ValueError("failed-preflight attempt identity is invalid")
     receipt = attempt.failure_receipt
@@ -1804,7 +1810,7 @@ def _validate_failed_preflight_attempt_request(
         ):
             raise ValueError("failed-preflight zero-work evidence is invalid")
     decision = _attempt_promotion_decision(receipt)
-    expected_decision = _numerical_failure_promotion_decision(
+    expected_decision = _legacy_campaign9_numerical_failure_promotion_decision(
         failure, precision_digits
     )
     if expected_decision is None:
@@ -9908,7 +9914,7 @@ def _execute_endpoint_arithmetic_recovery_with_progress(
     return outcome, time.monotonic() - started
 
 
-def _numerical_failure_promotion_decision(
+def _legacy_campaign9_numerical_failure_promotion_decision(
     failure: Mapping[str, object], digits: int
 ) -> dict[str, object] | None:
     code = failure.get("failure_code")
@@ -9918,7 +9924,9 @@ def _numerical_failure_promotion_decision(
     required: str | None = None
     limited: bool | None = None
     preflight: bool | None = None
-    requested = code in _RETRYABLE_NUMERICAL_CONTROL_FAILURE_CODES
+    requested = (
+        code in _LEGACY_CAMPAIGN9_RETRYABLE_NUMERICAL_CONTROL_FAILURE_CODES
+    )
     if code == "INSUFFICIENT_ASYMPTOTIC_PRECISION":
         diagnostics = failure.get("diagnostics")
         if not isinstance(diagnostics, Mapping):
@@ -9950,7 +9958,7 @@ def _execution_attempt_from_failure(
 ) -> CampaignExecutionAttempt | None:
     """Return a durable control attempt only for exact, well-formed typed failures."""
 
-    if not isinstance(error, _CONTAINABLE_EXCEPTION_TYPES):
+    if not isinstance(error, _LEGACY_CAMPAIGN9_CONTAINABLE_EXCEPTION_TYPES):
         return None
     worker_receipt = _worker_failure_payload(error)
     if worker_receipt is None:
@@ -10013,7 +10021,9 @@ def _execution_attempt_from_failure(
     leaf_index = context.get("leaf_index")
     if isinstance(leaf_index, bool) or not isinstance(leaf_index, int):
         return None
-    promotion_decision = _numerical_failure_promotion_decision(failure, digits)
+    promotion_decision = _legacy_campaign9_numerical_failure_promotion_decision(
+        failure, digits
+    )
     if promotion_decision is not None:
         receipt = dict(receipt)
         if _attempt_is_operation_control(receipt):
@@ -10028,7 +10038,7 @@ def _execution_attempt_from_failure(
         leaf_id=leaf.leaf_id,
         leaf_index=leaf_index,
         role=leaf.role,
-        state=_CONTAINABLE_FAILURE_STATES[code],
+        state=_LEGACY_CAMPAIGN9_CONTAINABLE_FAILURE_STATES[code],
         precision_digits=digits,
         failure_code=code,
         failure_receipt=receipt,
@@ -10903,7 +10913,7 @@ def _run_campaign_selection_active(
                             response_predictor,
                         )
                     )
-                except _CONTAINABLE_EXCEPTION_TYPES as recovery_error:
+                except _LEGACY_CAMPAIGN9_CONTAINABLE_EXCEPTION_TYPES as recovery_error:
                     recovery_attempt = _execution_attempt_from_failure(
                         recovery_error,
                         leaf=leaf,
@@ -10990,7 +11000,7 @@ def _run_campaign_selection_active(
                     record.stages,
                     response_predictor,
                 )
-            except _CONTAINABLE_EXCEPTION_TYPES as error:
+            except _LEGACY_CAMPAIGN9_CONTAINABLE_EXCEPTION_TYPES as error:
                 attempt = _execution_attempt_from_failure(
                     error,
                     leaf=leaf,
@@ -11055,7 +11065,7 @@ def _run_campaign_selection_active(
                                 response_predictor,
                             )
                         )
-                except _CONTAINABLE_EXCEPTION_TYPES as recovery_error:
+                except _LEGACY_CAMPAIGN9_CONTAINABLE_EXCEPTION_TYPES as recovery_error:
                     recovery_attempt = _execution_attempt_from_failure(
                         recovery_error,
                         leaf=leaf,
@@ -11582,7 +11592,7 @@ def _run_campaign_selection_active(
                             response_predictor,
                         )
                     )
-            except _CONTAINABLE_EXCEPTION_TYPES as error:
+            except _LEGACY_CAMPAIGN9_CONTAINABLE_EXCEPTION_TYPES as error:
                 attempt = _execution_attempt_from_failure(
                     error,
                     leaf=leaf,

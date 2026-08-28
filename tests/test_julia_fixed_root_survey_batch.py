@@ -1,12 +1,19 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import replace
 import hashlib
+import json
 from pathlib import Path
 from types import SimpleNamespace
 import unittest
 
 from windows_solver.contracts import canonical_json_bytes
+from windows_solver.fixed_root_reliability import (
+    FixedRootReliabilityAuthorityError,
+    _parse_fixed_root_reliability_projection_authority,
+    load_fixed_root_reliability_projection_authority,
+)
 from windows_solver.julia_response_backend import (
     FIXED_ROOT_SURVEY_BATCH_OPERATION,
     FIXED_ROOT_SURVEY_BATCH_SCHEMA,
@@ -49,12 +56,19 @@ def _job():
 
 def _conditioning(request) -> dict[str, object]:
     policy = request["policy"]
+    projection = request["fixed_root_reliability_projection"]
     return {
         "schema": "windows-solver.fixed-root-survey-conditioning/2",
-        "fixed_root_reliability_target_abs": request[
+        "fixed_root_reliability_target_abs": projection[
             "fixed_root_reliability_target_abs"
         ],
-        "fixed_root_reliability_rule": request["fixed_root_reliability_rule"],
+        "fixed_root_reliability_rule": projection[
+            "fixed_root_reliability_rule"
+        ],
+        "required_digit_guard": projection["required_digit_guard"],
+        "fixed_root_reliability_projection_sha256": projection[
+            "projection_sha256"
+        ],
         "determinant_family": "exterior-wronskian/v1",
         "homogeneous_representation": policy["homogeneous_representation"],
         "branch_convention": policy["branch_convention"],
@@ -146,12 +160,15 @@ class _BatchAdapter:
         )
 
 
-def _backend(adapter: _BatchAdapter, digits: int = 40):
+def _backend(
+    adapter: _BatchAdapter, digits: int = 40, refinement: int = 0
+):
     receipt = load_default_calibration_receipt()
     return JuliaPrecisionRootBackend(
         VettedNativeDeterminantKernel.identity,
         adapter,
         digits,
+        refinement=refinement,
         empirical_control_profile=receipt.budget_for(
             "exterior-wronskian/v1", digits
         ),
@@ -160,6 +177,187 @@ def _backend(adapter: _BatchAdapter, digits: int = 40):
 
 
 class JuliaFixedRootSurveyBatchTests(unittest.TestCase):
+    def test_committed_reliability_authority_is_canonical_and_contract_bound(self):
+        root = Path(__file__).resolve().parents[1]
+        authority_path = root / (
+            "src/windows_solver/data/"
+            "fixed_root_reliability_projection_authority_v1.json"
+        )
+        raw = authority_path.read_bytes()
+        authority = load_fixed_root_reliability_projection_authority()
+        self.assertEqual(raw, canonical_json_bytes(authority.to_mapping()) + b"\n")
+
+        for field, replacement in (
+            (
+                "schema",
+                "windows-solver.fixed-root-reliability-projection-authority/2",
+            ),
+            ("identity", "forged-fixed-root-reliability-authority/v1"),
+            (
+                "calibration_receipt_schema",
+                "windows-solver.promoted-control-empirical-calibration-receipt/2",
+            ),
+            (
+                "calibration_receipt_identity",
+                "forged-promoted-control-calibration/v1",
+            ),
+            (
+                "fixed_root_policy_control_fields",
+                [
+                    "coordinate_ode_absolute_tolerance",
+                    "coordinate_ode_relative_tolerance",
+                    "frequency_step",
+                    "homogeneous_ode_absolute_tolerance",
+                    "homogeneous_ode_relative_tolerance",
+                    "ode_absolute_tolerance",
+                    "ode_relative_tolerance",
+                ],
+            ),
+            (
+                "fixed_root_reliability_target_control_field",
+                "frequency_step",
+            ),
+        ):
+            with self.subTest(field=field):
+                changed = json.loads(raw)
+                changed[field] = replacement
+                binding = {
+                    key: value
+                    for key, value in changed.items()
+                    if key != "authority_sha256"
+                }
+                changed["authority_sha256"] = hashlib.sha256(
+                    canonical_json_bytes(binding)
+                ).hexdigest()
+                with self.assertRaises(FixedRootReliabilityAuthorityError):
+                    _parse_fixed_root_reliability_projection_authority(
+                        canonical_json_bytes(changed) + b"\n"
+                    )
+
+        with self.assertRaisesRegex(
+            FixedRootReliabilityAuthorityError,
+            "not canonical JSON",
+        ):
+            _parse_fixed_root_reliability_projection_authority(
+                json.dumps(json.loads(raw), indent=2).encode("utf-8")
+            )
+
+        digest_mismatch = json.loads(raw)
+        digest_mismatch["fixed_root_reliability_rule"] = "forged-rule/v1"
+        with self.assertRaisesRegex(
+            FixedRootReliabilityAuthorityError,
+            "digest does not match",
+        ):
+            _parse_fixed_root_reliability_projection_authority(
+                canonical_json_bytes(digest_mismatch) + b"\n"
+            )
+
+    def test_julia_fixed_root_reliability_has_one_committed_authority(self):
+        root = Path(__file__).resolve().parents[1]
+        worker = (
+            root / "src/windows_solver/data/julia/m02_worker.jl"
+        ).read_text(encoding="utf-8")
+        response_engine = (
+            root / "src/windows_solver/response_engine.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn(
+            '"windows-solver.fixed-root-reliability-projection/2"', worker
+        )
+        self.assertIn(
+            '"fixed_root_reliability_projection_authority_v1.json"', worker
+        )
+        self.assertIn(
+            "function fixed_root_reliability_projection_authority()", worker
+        )
+        projection_start = worker.index(
+            "function fixed_root_reliability_projection(request)"
+        )
+        projection_end = worker.index(
+            "function required_reliable_digits", projection_start
+        )
+        projection_source = worker[projection_start:projection_end]
+        self.assertIn("for field in policy_control_fields", projection_source)
+        self.assertNotIn("for (key, value) in controls", projection_source)
+        self.assertIn(
+            "target = string(required(controls, target_control_field))",
+            projection_source,
+        )
+        self.assertNotIn("FIXED_ROOT_RELIABILITY_RULE", worker)
+        self.assertNotIn(
+            "load_fixed_root_reliability_projection_authority", response_engine
+        )
+
+        harness = (
+            root / "tests/julia/test_pr75_fixed_root_lifecycle.jl"
+        ).read_text(encoding="utf-8")
+        negative_start = harness.index(
+            "function validate_reliability_negative_matrix(document)"
+        )
+        negative_end = harness.index("function main()", negative_start)
+        negative_source = harness[negative_start:negative_end]
+        self.assertLess(
+            negative_source.index("PR75 fixed-root reliability baseline was rejected"),
+            negative_source.index("for (field, replacement"),
+        )
+
+    def test_reliability_authority_accepts_the_fixed_root_baseline_shape(self):
+        job = _job()
+        receipt = load_default_calibration_receipt()
+        authority = load_fixed_root_reliability_projection_authority()
+        self.assertEqual(
+            authority.fixed_root_policy_control_fields,
+            (
+                "coordinate_ode_absolute_tolerance",
+                "coordinate_ode_relative_tolerance",
+                "homogeneous_ode_absolute_tolerance",
+                "homogeneous_ode_relative_tolerance",
+                "ode_absolute_tolerance",
+                "ode_relative_tolerance",
+            ),
+        )
+        for digits in (40, 80):
+            profile = receipt.budget_for("exterior-wronskian/v1", digits)
+            for refinement in (0, 1):
+                controls = (
+                    profile.base_controls
+                    if refinement == 0
+                    else profile.refinement_controls
+                )
+                request = _backend(
+                    _BatchAdapter(), digits, refinement
+                ).preview_fixed_root_survey_request(
+                    job,
+                    fixed_root=job.root.omega,
+                    root_seal_sha256="0" * 64,
+                    branch_identity=job.root.branch_id,
+                    plan=FixedRootSurveyPlan.FULL_NINE,
+                )
+                for field in authority.fixed_root_policy_control_fields:
+                    with self.subTest(
+                        digits=digits, refinement=refinement, field=field
+                    ):
+                        self.assertEqual(request["policy"][field], controls[field])
+                self.assertEqual(
+                    request["fixed_root_reliability_projection"][
+                        "fixed_root_reliability_target_abs"
+                    ],
+                    controls[
+                        authority.fixed_root_reliability_target_control_field
+                    ],
+                )
+                self.assertNotEqual(
+                    request["frequency_step"], controls["frequency_step"]
+                )
+                self.assertNotIn("root_correction_tolerance", request["policy"])
+                _worker_request_document(request)
+        self.assertNotIn(
+            "frequency_step", authority.fixed_root_policy_control_fields
+        )
+        self.assertEqual(
+            authority.fixed_root_reliability_target_control_field,
+            "root_correction_tolerance",
+        )
+
     def test_reliability_projection_is_profile_bound_and_request_hashed(self):
         job = _job()
         receipt = load_default_calibration_receipt()
@@ -172,18 +370,70 @@ class JuliaFixedRootSurveyBatchTests(unittest.TestCase):
             branch_identity=job.root.branch_id,
             plan=FixedRootSurveyPlan.FULL_NINE,
         )
+        projection = request["fixed_root_reliability_projection"]
         self.assertEqual(
-            request["fixed_root_reliability_target_abs"],
+            projection["schema"],
+            "windows-solver.fixed-root-reliability-projection/2",
+        )
+        self.assertEqual(
+            projection["source_reliability_projection_authority_schema"],
+            "windows-solver.fixed-root-reliability-projection-authority/1",
+        )
+        self.assertEqual(
+            projection["source_reliability_projection_authority_identity"],
+            "fixed-root-reliability-projection-authority/v1",
+        )
+        self.assertEqual(
+            projection["source_reliability_projection_authority_sha256"],
+            "3e2b617990b25221aa0e6ed11d45c0fab93a1c1abc928f7fbddad4bd2725277c",
+        )
+        self.assertEqual(
+            projection["source_calibration_receipt_sha256"], receipt.sha256
+        )
+        self.assertEqual(
+            projection["source_empirical_control_profile_sha256"],
+            hashlib.sha256(canonical_json_bytes(profile.to_mapping())).hexdigest(),
+        )
+        self.assertEqual(projection["source_refinement_level"], 0)
+        self.assertEqual(
+            projection["fixed_root_reliability_target_abs"],
             profile.base_controls["root_correction_tolerance"],
         )
+        self.assertEqual(projection["required_digit_guard"], 6)
+        projection_binding = {
+            key: value
+            for key, value in projection.items()
+            if key != "projection_sha256"
+        }
+        self.assertEqual(
+            projection["projection_sha256"],
+            hashlib.sha256(
+                canonical_json_bytes(projection_binding)
+            ).hexdigest(),
+        )
+        self.assertNotIn("root_correction_tolerance", request)
+        self.assertNotIn("root_correction_tolerance", request["policy"])
+        self.assertNotIn("fixed_root_reliability_target_abs", request)
+        self.assertNotIn("fixed_root_reliability_rule", request)
         _, _, original_sha256 = _worker_request_document(request)
         for field, value in (
+            ("schema", "windows-solver.fixed-root-reliability-projection/1"),
+            (
+                "source_reliability_projection_authority_schema",
+                "windows-solver.fixed-root-reliability-projection-authority/2",
+            ),
+            (
+                "source_reliability_projection_authority_identity",
+                "forged-fixed-root-reliability-authority/v1",
+            ),
+            ("source_reliability_projection_authority_sha256", "0" * 64),
             ("fixed_root_reliability_target_abs", "3e-11"),
             ("fixed_root_reliability_rule", "forged-rule/v1"),
+            ("required_digit_guard", 7),
         ):
             with self.subTest(field=field):
-                changed = dict(request)
-                changed[field] = value
+                changed = deepcopy(request)
+                changed["fixed_root_reliability_projection"][field] = value
                 _, _, changed_sha256 = _worker_request_document(changed)
                 self.assertNotEqual(original_sha256, changed_sha256)
 
@@ -231,7 +481,12 @@ class JuliaFixedRootSurveyBatchTests(unittest.TestCase):
         self.assertEqual(request["schema_version"], 2)
         self.assertEqual(request["schema"], FIXED_ROOT_SURVEY_BATCH_SCHEMA)
         self.assertEqual(request["plan"], FixedRootSurveyPlan.FULL_NINE.value)
-        self.assertEqual(request["fixed_root_reliability_target_abs"], "2e-11")
+        self.assertEqual(
+            request["fixed_root_reliability_projection"][
+                "fixed_root_reliability_target_abs"
+            ],
+            "2e-11",
+        )
         self.assertNotIn("root_correction_tolerance", request["policy"])
         self.assertEqual(
             [sample["sample_index"] for sample in request["samples"]],

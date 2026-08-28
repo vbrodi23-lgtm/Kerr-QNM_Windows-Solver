@@ -277,7 +277,7 @@ def parsed_result_batch(path: Path) -> dict[str, object]:
         value["schema"] != RESULT_BATCH_SCHEMA
         or not isinstance(value["results"], list)
         or not isinstance(value["compatibility_results"], list)
-        or value["reliability_negative_count"] != 10
+        or value["reliability_negative_count"] != 14
     ):
         raise ValueError("PR75 result batch schema is invalid")
     return value

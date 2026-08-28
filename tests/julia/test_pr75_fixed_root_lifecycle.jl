@@ -14,12 +14,23 @@ include(joinpath(
 
 function deterministic_conditioning(::Type{T}, request, digits::Int) where {T<:AbstractFloat}
     required_digits = required_reliable_digits(T, request)
+    reliability_projection = required(
+        request, "fixed_root_reliability_projection"
+    )
     return Dict{String,Any}(
         "schema" => FIXED_ROOT_SURVEY_CONDITIONING_SCHEMA,
         "fixed_root_reliability_target_abs" =>
-            string(required(request, "fixed_root_reliability_target_abs")),
+            string(required(
+                reliability_projection, "fixed_root_reliability_target_abs"
+            )),
         "fixed_root_reliability_rule" =>
-            string(required(request, "fixed_root_reliability_rule")),
+            string(required(
+                reliability_projection, "fixed_root_reliability_rule"
+            )),
+        "required_digit_guard" =>
+            required(reliability_projection, "required_digit_guard"),
+        "fixed_root_reliability_projection_sha256" =>
+            string(required(reliability_projection, "projection_sha256")),
         "determinant_family" => EXTERIOR_DETERMINANT_FAMILY_ID,
         "homogeneous_representation" => HOMOGENEOUS_REPRESENTATION_ID,
         "branch_convention" => BRANCH_CONVENTION_ID,
@@ -227,26 +238,73 @@ function fixed_root_request_is_rejected(document)
     return false
 end
 
+function reseal_fixed_root_projection(document)
+    resealed = deepcopy(document)
+    projection = required(resealed, "fixed_root_reliability_projection")
+    binding = Dict{String,Any}(
+        string(key) => value for (key, value) in projection
+        if string(key) != "projection_sha256"
+    )
+    projection["projection_sha256"] = canonical_sha256(binding)
+    return reseal_fixed_root_document(resealed)
+end
+
 function validate_reliability_negative_matrix(document)
+    fixed_root_request_is_rejected(document) && error(
+        "PR75 fixed-root reliability baseline was rejected"
+    )
+    !haskey(document, "root_correction_tolerance") ||
+        error("fixed-root wire restored root_correction_tolerance")
+    !haskey(required(document, "policy"), "root_correction_tolerance") ||
+        error("fixed-root policy restored root_correction_tolerance")
     rejected = 0
-    for (field, replacement, remove_field) in (
-        ("fixed_root_reliability_target_abs", nothing, true),
-        ("fixed_root_reliability_target_abs", "not-a-number", false),
-        ("fixed_root_reliability_target_abs", "NaN", false),
-        ("fixed_root_reliability_target_abs", "Inf", false),
-        ("fixed_root_reliability_target_abs", "0", false),
-        ("fixed_root_reliability_target_abs", "-1e-11", false),
-        ("fixed_root_reliability_target_abs", "1", false),
-        ("fixed_root_reliability_rule", nothing, true),
-        ("fixed_root_reliability_rule", "forged-rule/v1", false),
+    for (field, replacement, remove_projection, reseal_projection) in (
+        ("fixed_root_reliability_projection", nothing, true, false),
+        (
+            "schema",
+            "windows-solver.fixed-root-reliability-projection/1",
+            false,
+            true,
+        ),
+        (
+            "source_reliability_projection_authority_schema",
+            "windows-solver.fixed-root-reliability-projection-authority/2",
+            false,
+            true,
+        ),
+        (
+            "source_reliability_projection_authority_identity",
+            "forged-fixed-root-reliability-authority/v1",
+            false,
+            true,
+        ),
+        (
+            "source_reliability_projection_authority_sha256",
+            "0"^64,
+            false,
+            true,
+        ),
+        ("fixed_root_reliability_target_abs", "not-a-number", false, true),
+        ("fixed_root_reliability_target_abs", "0", false, true),
+        ("fixed_root_reliability_target_abs", "3e-11", false, true),
+        ("fixed_root_reliability_rule", "forged-rule/v1", false, true),
+        ("required_digit_guard", 7, false, true),
+        ("source_calibration_receipt_sha256", "0"^64, false, true),
+        ("source_empirical_control_profile_sha256", "0"^64, false, true),
+        ("projection_sha256", "0"^64, false, false),
     )
         candidate = deepcopy(document)
-        if remove_field
-            delete!(candidate, field)
+        if remove_projection
+            delete!(candidate, "fixed_root_reliability_projection")
         else
-            candidate[field] = replacement
+            projection = required(
+                candidate, "fixed_root_reliability_projection"
+            )
+            projection[field] = replacement
         end
-        candidate = reseal_fixed_root_document(candidate)
+        candidate = reseal_projection ?
+            reseal_fixed_root_projection(candidate) :
+            reseal_fixed_root_document(candidate)
         fixed_root_request_is_rejected(candidate) || error(
             "PR75 fixed-root reliability negative was accepted: $(field)"
         )
@@ -263,21 +321,6 @@ function validate_reliability_negative_matrix(document)
     fixed_root_request_is_rejected(legacy) ||
         error("PR75 executable fixed-root request /1 was accepted")
     rejected += 1
-
-    original_sha256 = string(required(document, "request_sha256"))
-    changed_target = deepcopy(document)
-    changed_target["fixed_root_reliability_target_abs"] = "3e-11"
-    changed_target = reseal_fixed_root_document(changed_target)
-    string(required(changed_target, "request_sha256")) != original_sha256 ||
-        error("fixed-root reliability target is absent from request hashing")
-    changed_request = flatten_fixed_root_survey_request(changed_target)
-    validate_fixed_root_survey_request(changed_request)
-
-    changed_rule = deepcopy(document)
-    changed_rule["fixed_root_reliability_rule"] = "forged-rule/v1"
-    changed_rule = reseal_fixed_root_document(changed_rule)
-    string(required(changed_rule, "request_sha256")) != original_sha256 ||
-        error("fixed-root reliability rule is absent from request hashing")
     return rejected
 end
 

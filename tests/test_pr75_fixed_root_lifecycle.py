@@ -158,11 +158,39 @@ class PR75FixedRootLifecycleTests(unittest.TestCase):
             root / "src/windows_solver/data/julia/m02_worker.jl"
         ).read_text(encoding="utf-8")
         cli = (root / "src/windows_solver/cli.py").read_text(encoding="utf-8")
-        main_call = "fixed_root_survey_batch_fields(\n                    request, digits, bits, roles, samples\n                )"
+        main_call = (
+            "fixed_root_survey_batch_fields(\n"
+            "                    request, digits, bits, roles, samples\n"
+            "                )"
+        )
         self.assertIn(main_call, worker)
+        self.assertIn("exit(main())", worker)
+        self.assertIn("function main()", worker)
+        self.assertNotIn("function main(;", worker)
+        self.assertNotIn("_fixed_root_survey_sample_evaluator", worker)
         self.assertNotIn("deterministic_success_sample", worker)
+        self.assertNotIn("deterministic_insufficient_precision", worker)
         self.assertNotIn("PR75_FIXED_ROOT", worker)
+        self.assertNotIn("PR75_REAL_WORKER_PROCESS", worker)
+        self.assertNotIn("pr75_fixed_root_process_worker", worker)
+        self.assertNotIn("PR75_REAL_WORKER_PROCESS", cli)
+        self.assertNotIn("pr75_fixed_root_process_worker", cli)
         self.assertNotIn("sample_evaluator", cli)
+
+        main_source = worker.split("function main()", 1)[1]
+        self.assertIn("try\n        document = JSON.parsefile(request_path)", main_source)
+        self.assertLess(
+            main_source.index("validate_fixed_root_survey_request(request)"),
+            main_source.index('progress_emit("request_validated"'),
+        )
+        self.assertEqual(
+            main_source.count(
+                "operation_control_receipt(request, failure_details(failure))"
+            ),
+            1,
+        )
+        self.assertNotIn('request_failure["failure"]', main_source)
+        self.assertIn('"control_receipt_sha256"', main_source)
 
     @unittest.skipUnless(
         os.environ.get("PR75_FIXED_ROOT_CASES")
@@ -179,7 +207,7 @@ class PR75FixedRootLifecycleTests(unittest.TestCase):
             {
                 "success_count": 6,
                 "failure_count": 36,
-                "reliability_negative_count": 10,
+                "reliability_negative_count": 14,
                 "compatibility_success_count": 2,
                 "compatibility_control_count": 2,
             },

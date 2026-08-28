@@ -24,6 +24,8 @@ _ACTIVE_CALCULATION_DISPOSITIONS = frozenset(
     {
         PromotionQueueDisposition.PENDING.value,
         PromotionQueueDisposition.CALCULATED_PENDING_DERIVATION.value,
+        PromotionQueueDisposition.CONTROL_RETURN_RETAINED.value,
+        PromotionQueueDisposition.CONTROL_DECISION_RETAINED.value,
         PromotionQueueDisposition.NUMERICAL_CONTINUATION.value,
     }
 )

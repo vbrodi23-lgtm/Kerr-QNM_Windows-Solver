@@ -18,6 +18,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+import windows_solver.julia_response_backend as julia_backend
 from windows_solver.contracts import canonical_json_bytes
 from windows_solver.julia_response_backend import (
     JULIA_PROGRESS_PREFIX,
@@ -330,18 +331,12 @@ class JuliaResponseBackendTests(unittest.TestCase):
             "failure_code": "WORKER_TIMEOUT",
             "stage": "worker-supervision",
             "diagnostics": {
-                "elapsed_request_seconds": resource[
-                    "worker_request_wall_clock_seconds"
-                ],
+                "elapsed_request_seconds": (
+                    resource["worker_request_wall_clock_seconds"] + 0.25
+                ),
                 "limiting_resource": "worker_request_wall_clock",
                 "precision_digits": 40,
                 "execution_resource_policy": resource,
-                "last_validated_progress": {
-                    "schema": PROGRESS_SCHEMA,
-                    "kind": "request_started",
-                    "context": {},
-                    "payload": {},
-                },
             },
         }
         self.assertTrue(
@@ -350,7 +345,9 @@ class JuliaResponseBackendTests(unittest.TestCase):
             )
         )
         forged = json.loads(canonical_json_bytes(timeout))
-        forged["diagnostics"]["elapsed_request_seconds"] -= 1
+        forged["diagnostics"]["elapsed_request_seconds"] = (
+            resource["worker_request_wall_clock_seconds"] - 0.25
+        )
         self.assertFalse(
             _control_receipt_diagnostics_validator(
                 forged, request_binding=request
@@ -4036,16 +4033,33 @@ class JuliaResponseBackendTests(unittest.TestCase):
             depot.mkdir()
 
             def runner(command, **kwargs):
+                document = json.loads(
+                    Path(command[-2]).read_text(encoding="utf-8")
+                )
+                identity = document["execution_identity"]
+                identity_sha256 = hashlib.sha256(
+                    canonical_json_bytes(identity)
+                ).hexdigest()
                 return SimpleNamespace(
                     returncode=-9,
                     stdout="",
                     stderr="Julia worker timed out after 60 seconds\n",
                     timed_out=True,
+                    elapsed_seconds=(
+                        document["execution_resource"][
+                            "worker_request_wall_clock_seconds"
+                        ]
+                        + 0.25
+                    ),
                     last_progress_event_validated=True,
                     last_progress_event={
                         "schema": PROGRESS_SCHEMA,
                         "kind": "ode_solve_progress",
                         "context": {
+                            "operation": identity["operation"],
+                            "scope": identity["scope"],
+                            "request_sha256": identity["request_sha256"],
+                            "execution_identity_sha256": identity_sha256,
                             "readout_index": 1,
                             "readout_role": "baseline",
                             "phase": "PRIMARY",
@@ -4080,7 +4094,19 @@ class JuliaResponseBackendTests(unittest.TestCase):
                 80,
                 ode_error_budget=synthetic_ode_error_budget(80),
             )._request(job, 0.0j)
-            with self.assertRaisesRegex(JuliaResponseBackendError, "timed out") as raised:
+            configured_limit = request["execution_resource"][
+                "worker_request_wall_clock_seconds"
+            ]
+            with (
+                patch.object(
+                    julia_backend.time,
+                    "monotonic",
+                    side_effect=[100.0, 100.0 + configured_limit + 0.25],
+                ),
+                self.assertRaisesRegex(
+                    JuliaResponseBackendError, "timed out"
+                ) as raised,
+            ):
                 adapter.evaluate(request)
 
         receipt = raised.exception.worker_failure
@@ -4100,7 +4126,8 @@ class JuliaResponseBackendTests(unittest.TestCase):
         diagnostics = failure["diagnostics"]
         self.assertEqual(
             diagnostics["elapsed_request_seconds"],
-            request["execution_resource"]["worker_request_wall_clock_seconds"],
+            request["execution_resource"]["worker_request_wall_clock_seconds"]
+            + 0.25,
         )
         progress = diagnostics["last_validated_progress"]
         self.assertEqual(progress["context"]["phase"], "PRIMARY")
@@ -4126,6 +4153,90 @@ class JuliaResponseBackendTests(unittest.TestCase):
                 "sha256": policy["sha256"],
             },
         )
+
+    def test_timeout_drops_progress_from_another_authenticated_request(self):
+        job = _deep_job()
+        request = JuliaPrecisionRootBackend(
+            job.backend_identity,
+            object(),
+            80,
+            ode_error_budget=synthetic_ode_error_budget(80),
+        )._request(job, 0.0j)
+        _binding, document, _request_sha256 = (
+            julia_backend._worker_request_document(request)
+        )
+        stale = {
+            "schema": PROGRESS_SCHEMA,
+            "kind": "request_started",
+            "context": {
+                "operation": document["execution_identity"]["operation"],
+                "scope": document["execution_identity"]["scope"],
+                "request_sha256": "0" * 64,
+                "execution_identity_sha256": "1" * 64,
+            },
+            "payload": {},
+        }
+
+        details = julia_backend._timeout_worker_failure_details(
+            {
+                "worker_exit_code": -9,
+                "worker_timed_out": True,
+                "worker_stderr_tail": "timeout",
+                "worker_error_type": None,
+                "worker_error_message": None,
+            },
+            document,
+            document["execution_resource"],
+            document["execution_resource"][
+                "worker_request_wall_clock_seconds"
+            ]
+            + 0.5,
+            stale,
+        )
+
+        self.assertNotIn(
+            "last_validated_progress", details["failure"]["diagnostics"]
+        )
+
+    def test_runner_timeout_flag_before_budget_expiry_cannot_authorize_control(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for name in ("julia.exe", "Project.toml", "Manifest.toml", "worker.jl"):
+                (root / name).write_text(name, encoding="ascii")
+            depot = root / "depot"
+            depot.mkdir()
+
+            def runner(_command, **_kwargs):
+                return SimpleNamespace(
+                    returncode=-9,
+                    stdout="",
+                    stderr="premature timeout flag",
+                    timed_out=True,
+                    last_progress_event_validated=False,
+                )
+
+            adapter = JuliaResponseAdapter(
+                root / "julia.exe", root, depot, root / "worker.jl", {}, runner
+            )
+            job = _deep_job()
+            request = JuliaPrecisionRootBackend(
+                job.backend_identity,
+                object(),
+                80,
+                ode_error_budget=synthetic_ode_error_budget(80),
+            )._request(job, 0.0j)
+            with (
+                patch.object(
+                    julia_backend.time,
+                    "monotonic",
+                    side_effect=[100.0, 101.0],
+                ),
+                self.assertRaises(JuliaResponseBackendError) as raised,
+            ):
+                adapter.evaluate(request)
+
+        self.assertNotIn("failure", raised.exception.worker_failure)
+        self.assertIsNone(getattr(raised.exception, "control_receipt", None))
 
     def test_campaign_failure_status_persists_worker_diagnostic(self):
         """Catches final status overwriting the failed worker's exact diagnostic."""

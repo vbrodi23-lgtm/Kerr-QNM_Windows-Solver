@@ -53,6 +53,8 @@ def _conditioning() -> FixedRootSurveyConditioning:
         "fixed_root_reliability_rule": (
             "minus-log10-target-plus-required-digit-guard/v1"
         ),
+        "required_digit_guard": 6,
+        "fixed_root_reliability_projection_sha256": "a" * 64,
         "determinant_family": "exterior-wronskian/v1",
         "homogeneous_representation": "factored-plane-wave-gsn/v1",
         "branch_convention": "gsn-complex-rho/v1",

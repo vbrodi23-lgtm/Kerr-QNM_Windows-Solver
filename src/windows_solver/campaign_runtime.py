@@ -23,6 +23,7 @@ from .campaign_failures import (
 )
 from .campaign_policy import (
     ExecutionProfile,
+    PROMOTED_HORIZON_CONTROL_RETURN_SCHEMA,
     PromotionQueueDisposition,
     PromotionQueueKind,
     SurveyDisposition,
@@ -118,7 +119,13 @@ from .julia_response_backend import (
     JuliaResponseBackendError,
     JuliaResponseEvaluation,
     JuliaRootReadoutResourceLimitError,
+    JuliaWorkerTimeoutError,
     _validated_execution_resource_policy,
+)
+from .operation_control import (
+    FIXED_ROOT_DETERMINANT_SAMPLE_OPERATION,
+    ROOT_READOUT_OPERATION,
+    ValidatedControlReceipt,
 )
 from .promoted_control_calibration import (
     PromotedControlCalibrationReceipt,
@@ -297,6 +304,8 @@ def _refresh_runtime_reports(
         in {
             PromotionQueueDisposition.PENDING.value,
             PromotionQueueDisposition.CALCULATED_PENDING_DERIVATION.value,
+            PromotionQueueDisposition.CONTROL_RETURN_RETAINED.value,
+            PromotionQueueDisposition.CONTROL_DECISION_RETAINED.value,
             PromotionQueueDisposition.NUMERICAL_CONTINUATION.value,
             PromotionQueueDisposition.AWAITING_ADMISSION.value,
             PromotionQueueDisposition.ADMITTED_PENDING_PUBLICATION.value,
@@ -1815,11 +1824,84 @@ def _promoted_root_result(leaf: object, backend: object, digits: int):
             fixed_root=readout.omega,
             branch_identity=readout.branch_id,
             root_seal_sha256=seal.sha256,
+            root_success_evidence=seal.to_mapping(),
         ),
         precision_tier=f"BF{digits}",
+        root_success_evidence=seal.to_mapping(),
         root_read_count=1,
         worker_launch_count=1,
     )
+
+
+def _validated_promoted_horizon_control(
+    error: JuliaResponseBackendError,
+    *,
+    expected_job: object,
+) -> ValidatedControlReceipt:
+    """Bind one BF80 horizon worker CONTROL receipt to scheduler authority.
+
+    The adapter has already bound the receipt to its canonical worker request.
+    Classification is deliberately absent: the raw receipt must first cross
+    the durable checkpoint boundary and be reloaded by the pure reducer.
+    """
+
+    receipt = getattr(error, "control_receipt", None)
+    if not isinstance(receipt, ValidatedControlReceipt):
+        raise JuliaResponseBackendError(
+            "promoted horizon CONTROL lacks a validated operation-control receipt"
+        ) from error
+    if receipt.identity.operation not in {
+        ROOT_READOUT_OPERATION,
+        FIXED_ROOT_DETERMINANT_SAMPLE_OPERATION,
+    }:
+        raise JuliaResponseBackendError(
+            "promoted horizon CONTROL operation identity is invalid"
+        ) from error
+    identity = receipt.identity.mapping
+    expected_backend = getattr(
+        getattr(expected_job, "backend_identity", None),
+        "identity_sha256",
+        None,
+    )
+    if (
+        identity.get("leaf_id") != getattr(expected_job, "leaf_id", None)
+        or identity.get("job_id") != getattr(expected_job, "job_id", None)
+        or identity.get("backend_identity_sha256") != expected_backend
+        or identity.get("precision_digits") != 80
+        or identity.get("semantic_precision_tier") != "bigfloat-80"
+    ):
+        raise JuliaResponseBackendError(
+            "promoted horizon CONTROL scheduler identity is invalid"
+        ) from error
+    expected_code = (
+        error.failure_code
+        if isinstance(error, JuliaNumericalControlError)
+        else "ODE_RESOURCE_LIMIT"
+        if isinstance(error, JuliaODEResourceLimitError)
+        else "ROOT_READOUT_RESOURCE_INFEASIBLE"
+        if isinstance(error, JuliaRootReadoutResourceLimitError)
+        else "WORKER_TIMEOUT"
+        if isinstance(error, JuliaWorkerTimeoutError)
+        else None
+    )
+    if (
+        expected_code != receipt.failure_code
+        or type(error).__name__
+        not in {
+            "JuliaNumericalControlError",
+            "JuliaODEResourceLimitError",
+            "JuliaRootReadoutResourceLimitError",
+            "JuliaWorkerTimeoutError",
+        }
+    ):
+        raise JuliaResponseBackendError(
+            "promoted horizon CONTROL exception identity is invalid"
+        ) from error
+    if receipt.canonical_request is None:
+        raise JuliaResponseBackendError(
+            "promoted horizon CONTROL lost its canonical request"
+        ) from error
+    return receipt
 
 
 def _promoted_horizon_outcome(
@@ -1956,60 +2038,56 @@ def _promoted_horizon_outcome(
         JuliaNumericalControlError,
         JuliaODEResourceLimitError,
         JuliaRootReadoutResourceLimitError,
+        JuliaWorkerTimeoutError,
     ) as error:
-        if isinstance(error, JuliaNumericalControlError):
-            code = error.failure_code
-        elif isinstance(error, JuliaODEResourceLimitError):
-            code = "ODE_RESOURCE_LIMIT"
-        else:
-            code = "ROOT_READOUT_RESOURCE_INFEASIBLE"
-        decision = classify_failure(FailureReport(
-            failure_code=code,
-            failure_class="PROMOTED_HORIZON_EXECUTION",
-            stage="promoted-horizon",
-            worker_operation=operation_identity,
-            request_schema="windows-solver.response-component-job/1",
-            backend_identity=leaf.job.backend_identity.identity_sha256,
-            policy_identity=leaf.job.policy.identity_sha256,
-            precision_tier="BF80",
-            cause_type=type(error).__name__,
-            diagnostics={
-                "schema": "windows-solver.promoted-horizon-failure/1",
-                "complete": True,
-                "failure_code": code,
-            },
-        ))
-        if decision.disposition is FailureDisposition.SYSTEM_FAILURE:
-            raise
-        disposition = {
-            FailureDisposition.PROMOTION_PENDING: SurveyDisposition.UNRESOLVED,
-            FailureDisposition.UNRESOLVED: SurveyDisposition.UNRESOLVED,
-            FailureDisposition.DEFERRED: SurveyDisposition.DEFERRED,
-            FailureDisposition.REJECTED: SurveyDisposition.REJECTED,
-        }[decision.disposition]
-        control_content = {
-            "schema": "windows-solver.promoted-horizon-control-return/1",
-            "precision_tier": "BF80",
-            "failure_code": code,
-            "policy_disposition": decision.disposition.value,
-            "failure_fingerprint_sha256": decision.fingerprint_sha256,
+        receipt = _validated_promoted_horizon_control(
+            error,
+            expected_job=leaf.job,
+        )
+        identity = receipt.identity
+        effective_policy = identity.mapping["effective_policy_identity"]
+        effective_policy_sha256 = (
+            str(effective_policy["sha256"])
+            if isinstance(effective_policy, Mapping)
+            else str(effective_policy)
+        )
+        canonical_request = receipt.canonical_request
+        assert canonical_request is not None
+        control_content: dict[str, object] = {
+            "schema": PROMOTED_HORIZON_CONTROL_RETURN_SCHEMA,
+            "operation": identity.operation,
+            "request_schema": identity.mapping["request_schema"],
+            "request_sha256": identity.request_sha256,
+            "execution_identity_sha256": identity.sha256,
+            "effective_policy_identity": effective_policy_sha256,
+            "current_tier": "BF80",
+            "current_action_kind": "RESPONSE",
+            "canonical_request": dict(canonical_request),
+            "control_receipt": receipt.to_mapping(),
+            "control_receipt_sha256": receipt.sha256,
             "predecessor_stage_sha256": predecessor_stage_sha256,
             "source_fingerprint_sha256": source_fingerprint_sha256,
             "layer1_lock_receipt_sha256": layer1_lock_receipt_sha256,
         }
+        control_return = {
+            **control_content,
+            "control_return_sha256": _sha256(control_content),
+        }
         return PromotedPassOutcome(
-            disposition=disposition,
-            reason_code=code,
+            # Raw worker evidence has no numerical disposition until the
+            # durably reloaded receipt is classified by the exact registry.
+            disposition=SurveyDisposition.UNRESOLVED,
+            reason_code=receipt.failure_code,
             precision_tiers=("BF80",),
-            operation_identity=operation_identity,
+            operation_identity="promoted-horizon-control-return/v2",
             source_record_sha256=source_record_sha256,
             source_stage_sha256=source_stage_sha256,
+            root_read_count=(
+                1 if identity.operation == ROOT_READOUT_OPERATION else 0
+            ),
             root_read_limit=1,
             worker_launch_count=1,
-            calculation_artifact={
-                **control_content,
-                "calculation_sha256": _sha256(control_content),
-            },
+            calculation_artifact=control_return,
             calculation_chain=(),
         )
     component_result = {
@@ -2160,6 +2238,21 @@ def run_native_promoted_pass(
 
     def seal_lookup(leaf, entry):
         candidate = root_provider().lookup(leaf)
+        if candidate is not None:
+            durable_evidence = root_provider().evidence_for(leaf)
+            if (
+                durable_evidence.fixed_root != candidate.fixed_root
+                or durable_evidence.branch_identity != candidate.branch_identity
+                or durable_evidence.root_seal_sha256
+                != candidate.root_seal_sha256
+            ):
+                raise ValueError("promoted durable root authority mismatch")
+            candidate = AuthenticatedRootSeal(
+                candidate.fixed_root,
+                candidate.branch_identity,
+                candidate.root_seal_sha256,
+                root_success_evidence=durable_evidence.to_mapping(),
+            )
         expected = entry.get("source_root_seal_sha256")
         if (
             candidate is not None

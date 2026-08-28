@@ -33,8 +33,32 @@ const OPERATION_CONTROL_RECEIPT_SCHEMA =
     "windows-solver.operation-control-receipt/1"
 const CANONICAL_REQUEST_BINDING_SCHEMA =
     "windows-solver.canonical-request-binding/1"
-const FIXED_ROOT_RELIABILITY_RULE =
-    "minus-log10-target-plus-required-digit-guard/v1"
+const FIXED_ROOT_RELIABILITY_PROJECTION_SCHEMA =
+    "windows-solver.fixed-root-reliability-projection/2"
+const FIXED_ROOT_RELIABILITY_PROJECTION_AUTHORITY_SCHEMA =
+    "windows-solver.fixed-root-reliability-projection-authority/1"
+const FIXED_ROOT_RELIABILITY_PROJECTION_AUTHORITY_IDENTITY =
+    "fixed-root-reliability-projection-authority/v1"
+const FIXED_ROOT_POLICY_CONTROL_FIELDS = (
+    "coordinate_ode_absolute_tolerance",
+    "coordinate_ode_relative_tolerance",
+    "homogeneous_ode_absolute_tolerance",
+    "homogeneous_ode_relative_tolerance",
+    "ode_absolute_tolerance",
+    "ode_relative_tolerance",
+)
+const FIXED_ROOT_RELIABILITY_TARGET_CONTROL_FIELD =
+    "root_correction_tolerance"
+const FIXED_ROOT_RELIABILITY_PROJECTION_AUTHORITY_PATH = normpath(joinpath(
+    @__DIR__, "..", "fixed_root_reliability_projection_authority_v1.json"
+))
+const PROMOTED_CONTROL_CALIBRATION_RECEIPT_SCHEMA =
+    "windows-solver.promoted-control-empirical-calibration-receipt/1"
+const PROMOTED_CONTROL_CALIBRATION_IDENTITY =
+    "promoted-control-empirical-calibration/v1"
+const PROMOTED_CONTROL_CALIBRATION_RECEIPT_PATH = normpath(joinpath(
+    @__DIR__, "..", "promoted_control_empirical_calibration_v1.json"
+))
 const OPERATION_EXECUTION_COMMON_FIELDS = Set((
     "schema",
     "scope",
@@ -109,7 +133,6 @@ const FIXED_ROOT_SURVEY_POLICY_FIELDS = Set((
     "regular_remainder_contract",
     "factored_remainder_state_convention",
     "reliable_digit_safety_margin",
-    "required_digit_guard",
     "determinant_family",
     "scattering_diagnostics_applicable",
     "scattering_coefficient_extraction",
@@ -118,8 +141,6 @@ const FIXED_ROOT_SURVEY_POLICY_FIELDS = Set((
     "scattering_column_convention",
     "determinant_convention",
     "determinant_normalisation",
-    "promoted_control_calibration_receipt_sha256",
-    "empirical_control_profile_sha256",
     "determinant_error_model",
     "determinant_error_channel_schema",
     "determinant_error_required_channels",
@@ -190,7 +211,9 @@ const EXTERIOR_ADDITIVE_CALIBRATION_STATUS =
 const EXTERIOR_ADDITIVE_MISSING_OUTCOME =
     "BLOCKED_BY_REVIEWED_ERROR_EVIDENCE"
 const RELIABLE_DIGIT_SAFETY_MARGIN = 8
-const REQUIRED_DIGIT_GUARD = 6
+# This guard belongs only to the legacy root-readout request contract.  Fixed-
+# root survey authority is loaded from the committed projection authority.
+const ROOT_READOUT_REQUIRED_DIGIT_GUARD = 6
 const SCATTERING_CHART_SAFETY_FACTOR = 64
 const HUMAN_MATH_REVIEW_RECEIPT_STATUS = "absent-unapproved/v1"
 const HUMAN_MATH_REVIEW_RECEIPT_SHA256 = nothing
@@ -401,6 +424,66 @@ function canonical_json(value)
 end
 
 canonical_sha256(value) = bytes2hex(SHA.sha256(codeunits(canonical_json(value))))
+
+function fixed_root_reliability_projection_authority()
+    raw_authority = read(FIXED_ROOT_RELIABILITY_PROJECTION_AUTHORITY_PATH)
+    authority_text = String(raw_authority)
+    authority = JSON.parse(authority_text)
+    authority isa AbstractDict ||
+        error("fixed-root reliability projection authority is invalid")
+    Set(string(key) for key in keys(authority)) == Set((
+        "schema",
+        "identity",
+        "calibration_receipt_schema",
+        "calibration_receipt_identity",
+        "fixed_root_policy_control_fields",
+        "fixed_root_reliability_rule",
+        "fixed_root_reliability_target_control_field",
+        "required_digit_guard",
+        "authority_sha256",
+    )) || error("fixed-root reliability projection authority fields are invalid")
+    authority_text == canonical_json(authority) * "\n" ||
+        error("fixed-root reliability projection authority is not canonical")
+    string(required(authority, "schema")) ==
+        FIXED_ROOT_RELIABILITY_PROJECTION_AUTHORITY_SCHEMA ||
+        error("fixed-root reliability projection authority schema is invalid")
+    string(required(authority, "identity")) ==
+        FIXED_ROOT_RELIABILITY_PROJECTION_AUTHORITY_IDENTITY ||
+        error("fixed-root reliability projection authority identity is invalid")
+    string(required(authority, "calibration_receipt_schema")) ==
+        PROMOTED_CONTROL_CALIBRATION_RECEIPT_SCHEMA ||
+        error("fixed-root reliability authority calibration schema is invalid")
+    string(required(authority, "calibration_receipt_identity")) ==
+        PROMOTED_CONTROL_CALIBRATION_IDENTITY ||
+        error("fixed-root reliability authority calibration identity is invalid")
+    rule = required(authority, "fixed_root_reliability_rule")
+    rule isa AbstractString && !isempty(rule) ||
+        error("fixed-root reliability authority rule is invalid")
+    policy_control_fields = required(
+        authority, "fixed_root_policy_control_fields"
+    )
+    policy_control_fields isa Vector &&
+        Tuple(string(field) for field in policy_control_fields) ==
+            FIXED_ROOT_POLICY_CONTROL_FIELDS ||
+        error("fixed-root reliability authority policy controls are invalid")
+    string(required(
+        authority, "fixed_root_reliability_target_control_field"
+    )) == FIXED_ROOT_RELIABILITY_TARGET_CONTROL_FIELD ||
+        error("fixed-root reliability authority target control is invalid")
+    guard = required(authority, "required_digit_guard")
+    guard isa Integer && !(guard isa Bool) && guard > 0 ||
+        error("fixed-root reliability authority digit guard is invalid")
+    authority_sha256 = string(required(authority, "authority_sha256"))
+    occursin(r"^[0-9a-f]{64}$", authority_sha256) ||
+        error("fixed-root reliability projection authority digest is invalid")
+    binding = Dict{String,Any}(
+        string(key) => value for (key, value) in authority
+        if string(key) != "authority_sha256"
+    )
+    canonical_sha256(binding) == authority_sha256 ||
+        error("fixed-root reliability projection authority digest disagrees")
+    return authority
+end
 
 function validated_execution_identity(value)
     value isa AbstractDict || error("operation execution identity is invalid")
@@ -1448,7 +1531,7 @@ function validate_regularised_gsn_policy(request)
             FACTORED_REMAINDER_STATE_CONVENTION_ID,
         "reliable_digit_safety_margin" =>
             string(RELIABLE_DIGIT_SAFETY_MARGIN),
-        "required_digit_guard" => string(REQUIRED_DIGIT_GUARD),
+        "required_digit_guard" => string(ROOT_READOUT_REQUIRED_DIGIT_GUARD),
         "human_math_review_receipt_status" =>
             HUMAN_MATH_REVIEW_RECEIPT_STATUS,
         "human_math_review_receipt_sha256" =>
@@ -2094,21 +2177,137 @@ function phase_control_identity(request)
     )
 end
 
+function fixed_root_reliability_projection(request)
+    projection = required(request, "fixed_root_reliability_projection")
+    projection isa AbstractDict ||
+        error("fixed-root reliability projection is invalid")
+    Set(keys(projection)) == Set((
+        "schema",
+        "source_reliability_projection_authority_schema",
+        "source_reliability_projection_authority_identity",
+        "source_reliability_projection_authority_sha256",
+        "source_calibration_receipt_sha256",
+        "source_empirical_control_profile_sha256",
+        "source_refinement_level",
+        "fixed_root_reliability_target_abs",
+        "fixed_root_reliability_rule",
+        "required_digit_guard",
+        "projection_sha256",
+    )) || error("fixed-root reliability projection fields are invalid")
+    string(required(projection, "schema")) ==
+        FIXED_ROOT_RELIABILITY_PROJECTION_SCHEMA ||
+        error("fixed-root reliability projection schema is invalid")
+
+    authority = fixed_root_reliability_projection_authority()
+    authority_schema = string(required(authority, "schema"))
+    authority_identity = string(required(authority, "identity"))
+    authority_sha256 = string(required(authority, "authority_sha256"))
+    authority_rule = string(required(authority, "fixed_root_reliability_rule"))
+    authority_guard = Int(required(authority, "required_digit_guard"))
+    policy_control_fields = String[
+        string(field) for field in
+        required(authority, "fixed_root_policy_control_fields")
+    ]
+    target_control_field = string(required(
+        authority, "fixed_root_reliability_target_control_field"
+    ))
+
+    raw_receipt = read(PROMOTED_CONTROL_CALIBRATION_RECEIPT_PATH)
+    receipt_sha256 = bytes2hex(SHA.sha256(raw_receipt))
+    receipt_sha256 ==
+        string(required(projection, "source_calibration_receipt_sha256")) ||
+        error("fixed-root reliability calibration authority is invalid")
+    receipt_text = String(raw_receipt)
+    receipt = JSON.parse(receipt_text)
+    canonical_json(receipt) == receipt_text ||
+        error("fixed-root reliability calibration receipt is not canonical")
+    string(required(receipt, "schema")) ==
+        string(required(authority, "calibration_receipt_schema")) ||
+        error("fixed-root reliability calibration schema is invalid")
+    string(required(receipt, "identity")) ==
+        string(required(authority, "calibration_receipt_identity")) ||
+        error("fixed-root reliability calibration identity is invalid")
+
+    digits = parse_integer(request, "precision_digits")
+    tier = string(required(request, "semantic_precision_tier"))
+    determinant_family = string(required(request, "determinant_family"))
+    entries = required(receipt, "budget_entries")
+    entries isa Vector ||
+        error("fixed-root reliability calibration budgets are invalid")
+    profiles = [
+        entry for entry in entries
+        if entry isa AbstractDict &&
+            string(required(entry, "determinant_family")) == determinant_family &&
+            parse_integer(entry, "nominal_decimal_digits") == digits &&
+            string(required(entry, "precision_tier")) == tier
+    ]
+    length(profiles) == 1 ||
+        error("fixed-root reliability calibration profile is unavailable")
+    profile = only(profiles)
+    profile_sha256 = canonical_sha256(profile)
+    profile_sha256 ==
+        string(required(projection, "source_empirical_control_profile_sha256")) ||
+        error("fixed-root reliability profile authority is invalid")
+
+    refinement = required(projection, "source_refinement_level")
+    refinement isa Integer && !(refinement isa Bool) && refinement in (0, 1) ||
+        error("fixed-root reliability refinement is invalid")
+    controls = required(
+        profile, refinement == 0 ? "base_controls" : "refinement_controls"
+    )
+    controls isa AbstractDict ||
+        error("fixed-root reliability calibration controls are invalid")
+    for field in policy_control_fields
+        isequal(required(request, field), required(controls, field)) ||
+            error("fixed-root reliability calibration controls disagree")
+    end
+    target = string(required(controls, target_control_field))
+    expected_binding = Dict{String,Any}(
+        "schema" => FIXED_ROOT_RELIABILITY_PROJECTION_SCHEMA,
+        "source_reliability_projection_authority_schema" => authority_schema,
+        "source_reliability_projection_authority_identity" => authority_identity,
+        "source_reliability_projection_authority_sha256" => authority_sha256,
+        "source_calibration_receipt_sha256" => receipt_sha256,
+        "source_empirical_control_profile_sha256" => profile_sha256,
+        "source_refinement_level" => refinement,
+        "fixed_root_reliability_target_abs" => target,
+        "fixed_root_reliability_rule" => authority_rule,
+        "required_digit_guard" => authority_guard,
+    )
+    observed_binding = Dict{String,Any}(
+        string(key) => value for (key, value) in projection
+        if string(key) != "projection_sha256"
+    )
+    observed_binding == expected_binding ||
+        error("fixed-root reliability projection is unauthorised")
+    canonical_sha256(expected_binding) ==
+        string(required(projection, "projection_sha256")) ||
+        error("fixed-root reliability projection digest is invalid")
+    return projection
+end
+
 function required_reliable_digits(::Type{T}, request) where {T<:AbstractFloat}
     operation = string(required(request, "operation"))
-    tolerance = if operation == FIXED_ROOT_SURVEY_BATCH_OPERATION
-        string(required(request, "fixed_root_reliability_rule")) ==
-            FIXED_ROOT_RELIABILITY_RULE ||
-            error("fixed-root reliability rule is invalid")
-        parse_real(T, request, "fixed_root_reliability_target_abs")
+    tolerance, guard = if operation == FIXED_ROOT_SURVEY_BATCH_OPERATION
+        projection = fixed_root_reliability_projection(request)
+        authority = fixed_root_reliability_projection_authority()
+        (
+            parse_real(
+                T, projection, "fixed_root_reliability_target_abs"
+            ),
+            Int(required(authority, "required_digit_guard")),
+        )
     elseif operation in ("root-readout", "fixed-root-determinant-sample")
-        parse_real(T, request, "root_correction_tolerance")
+        (
+            parse_real(T, request, "root_correction_tolerance"),
+            ROOT_READOUT_REQUIRED_DIGIT_GUARD,
+        )
     else
         error("reliable-digit policy is undefined for this operation")
     end
     zero(T) < tolerance < one(T) ||
         error("reliability target must lie strictly between zero and one")
-    return -log10(tolerance) + T(REQUIRED_DIGIT_GUARD)
+    return -log10(tolerance) + T(guard)
 end
 
 function build_sample_spectral_context(
@@ -8242,8 +8441,7 @@ function flatten_fixed_root_survey_request(document)
         "precision_digits",
         "working_precision_bits",
         "semantic_precision_tier",
-        "fixed_root_reliability_target_abs",
-        "fixed_root_reliability_rule",
+        "fixed_root_reliability_projection",
         "frequency_step",
         "coordinate_step",
         "sample_roles",
@@ -8296,10 +8494,8 @@ function flatten_fixed_root_survey_request(document)
         "working_precision_bits" => required(document, "working_precision_bits"),
         "semantic_precision_tier" =>
             required(document, "semantic_precision_tier"),
-        "fixed_root_reliability_target_abs" =>
-            required(document, "fixed_root_reliability_target_abs"),
-        "fixed_root_reliability_rule" =>
-            required(document, "fixed_root_reliability_rule"),
+        "fixed_root_reliability_projection" =>
+            required(document, "fixed_root_reliability_projection"),
         "frequency_step" => required(document, "frequency_step"),
         "coordinate_step" => required(document, "coordinate_step"),
         "sample_roles" => required(document, "sample_roles"),
@@ -8364,7 +8560,6 @@ function validate_fixed_root_survey_policy(request)
             FACTORED_REMAINDER_STATE_CONVENTION_ID,
         "reliable_digit_safety_margin" =>
             string(RELIABLE_DIGIT_SAFETY_MARGIN),
-        "required_digit_guard" => string(REQUIRED_DIGIT_GUARD),
         "determinant_family" => EXTERIOR_DETERMINANT_FAMILY_ID,
         "scattering_diagnostics_applicable" => false,
         "scattering_coefficient_extraction" => nothing,
@@ -8391,13 +8586,6 @@ function validate_fixed_root_survey_policy(request)
     for (key, value) in expected
         isequal(required(request, key), value) ||
             error("fixed-root survey policy $(key) is invalid")
-    end
-    for key in (
-        "promoted_control_calibration_receipt_sha256",
-        "empirical_control_profile_sha256",
-    )
-        length(string(required(request, key))) == 64 ||
-            error("fixed-root survey control receipt is invalid")
     end
     return nothing
 end
@@ -8430,14 +8618,7 @@ function validate_fixed_root_survey_request(request)
         error("fixed-root survey working precision is invalid")
     string(required(request, "semantic_precision_tier")) ==
         "bigfloat-$(digits)" || error("fixed-root survey tier is invalid")
-    string(required(request, "fixed_root_reliability_rule")) ==
-        FIXED_ROOT_RELIABILITY_RULE ||
-        error("fixed-root reliability rule is invalid")
-    reliability_target = parse_real(
-        BigFloat, request, "fixed_root_reliability_target_abs"
-    )
-    zero(BigFloat) < reliability_target < one(BigFloat) ||
-        error("fixed-root reliability target is invalid")
+    fixed_root_reliability_projection(request)
     parse_integer(request, "maximum_sample_count") == 9 ||
         error("fixed-root survey sample budget is invalid")
     for key in (
@@ -8598,12 +8779,23 @@ function fixed_root_survey_conditioning_fields(
         minimum_asymptotic,
     )
     required_digits = required_reliable_digits(T, request)
+    reliability_projection = required(
+        request, "fixed_root_reliability_projection"
+    )
     return Dict{String,Any}(
         "schema" => FIXED_ROOT_SURVEY_CONDITIONING_SCHEMA,
         "fixed_root_reliability_target_abs" =>
-            string(required(request, "fixed_root_reliability_target_abs")),
+            string(required(
+                reliability_projection, "fixed_root_reliability_target_abs"
+            )),
         "fixed_root_reliability_rule" =>
-            string(required(request, "fixed_root_reliability_rule")),
+            string(required(
+                reliability_projection, "fixed_root_reliability_rule"
+            )),
+        "required_digit_guard" =>
+            required(reliability_projection, "required_digit_guard"),
+        "fixed_root_reliability_projection_sha256" =>
+            string(required(reliability_projection, "projection_sha256")),
         "determinant_family" => EXTERIOR_DETERMINANT_FAMILY_ID,
         "homogeneous_representation" => HOMOGENEOUS_REPRESENTATION_ID,
         "branch_convention" => BRANCH_CONVENTION_ID,
@@ -9007,8 +9199,7 @@ function validate_request_batch(batch)
     )
 end
 
-function evaluate_request(request)
-    operation, digits, bits = validate_worker_request_contract(request)
+function evaluate_validated_request(request, operation, digits, bits)
     return setprecision(BigFloat, bits) do
         if operation == "fixed-root-determinant-sample"
             return fixed_root_determinant_sample_fields(
@@ -9017,6 +9208,11 @@ function evaluate_request(request)
         end
         return result_fields(BigFloat, request, digits, bits)
     end
+end
+
+function evaluate_request(request)
+    operation, digits, bits = validate_worker_request_contract(request)
+    return evaluate_validated_request(request, operation, digits, bits)
 end
 
 function main()
@@ -9062,14 +9258,16 @@ function main()
     LAST_DETERMINANT_PURPOSE[] = nothing
     LAST_DETERMINANT_SECONDS[] = 0.0
     LAST_ODE_SNAPSHOT[] = nothing
-    document = JSON.parsefile(request_path)
-    request = if string(required(document, "operation")) ==
-            FIXED_ROOT_SURVEY_BATCH_OPERATION
-        flatten_fixed_root_survey_request(document)
-    else
-        flatten_request(document)
-    end
+    ACTIVE_PROGRESS_CONTEXT[] = Dict{String,Any}()
+    request = nothing
     try
+        document = JSON.parsefile(request_path)
+        request = if string(required(document, "operation")) ==
+                FIXED_ROOT_SURVEY_BATCH_OPERATION
+            flatten_fixed_root_survey_request(document)
+        else
+            flatten_request(document)
+        end
         execution_identity = request_execution_identity(request)
         ACTIVE_PROGRESS_CONTEXT[] = merge(
             ACTIVE_PROGRESS_CONTEXT[],
@@ -9088,21 +9286,26 @@ function main()
             "request_sha256" => string(required(request, "request_sha256")),
             "execution_resource_policy" => resource_policy_identity(request),
         ))
+        operation = string(required(request, "operation"))
+        validated = if operation == FIXED_ROOT_SURVEY_BATCH_OPERATION
+            validate_fixed_root_survey_request(request)
+        else
+            validate_worker_request_contract(request)
+        end
         progress_emit("request_validated"; payload=Dict(
             "request_sha256" => string(required(request, "request_sha256")),
             "execution_resource_policy" => resource_policy_identity(request),
         ))
-        result = if string(required(request, "operation")) ==
-                FIXED_ROOT_SURVEY_BATCH_OPERATION
-            digits, bits, roles, samples =
-                validate_fixed_root_survey_request(request)
+        result = if operation == FIXED_ROOT_SURVEY_BATCH_OPERATION
+            digits, bits, roles, samples = validated
             setprecision(BigFloat, bits) do
                 fixed_root_survey_batch_fields(
                     request, digits, bits, roles, samples
                 )
             end
         else
-            Dict(evaluate_request(request))
+            _, digits, bits = validated
+            Dict(evaluate_validated_request(request, operation, digits, bits))
         end
         mkpath(dirname(response_path))
         write(response_path, JSON.json(result))
@@ -9111,15 +9314,18 @@ function main()
         ))
         return 0
     catch failure
-        result = if failure isa WorkerControlFailure
+        control_receipt = if failure isa WorkerControlFailure && request !== nothing
+            operation_control_receipt(request, failure_details(failure))
+        else
+            nothing
+        end
+        result = if control_receipt !== nothing
             Dict(
                 "schema_version" => 1,
                 "status" => "error",
                 "error_type" => string(typeof(failure)),
                 "message" => sprint(showerror, failure),
-                "failure" => operation_control_receipt(
-                    request, failure_details(failure)
-                ),
+                "failure" => control_receipt,
             )
         else
             Dict(
@@ -9131,12 +9337,33 @@ function main()
         end
         mkpath(dirname(response_path))
         write(response_path, JSON.json(result))
-        request_failure = Dict{String,Any}(
-            "error_type" => string(typeof(failure)),
-            "message" => sprint(showerror, failure),
-        )
-        if failure isa WorkerControlFailure
-            request_failure["failure"] = failure_details(failure)
+        request_failure = if control_receipt === nothing
+            Dict{String,Any}(
+                "error_type" => string(typeof(failure)),
+                "message" => sprint(showerror, failure),
+            )
+        else
+            identity = required(control_receipt, "execution_identity")
+            binding = required(
+                control_receipt, "canonical_request_binding"
+            )
+            identifiers = Dict{String,Any}(
+                "error_type" => string(typeof(failure)),
+                "failure_class" => required(control_receipt, "failure_class"),
+                "failure_code" => required(control_receipt, "failure_code"),
+                "stage" => required(control_receipt, "stage"),
+                "scope" => required(control_receipt, "scope"),
+                "operation" => required(binding, "operation"),
+                "request_sha256" => required(binding, "request_sha256"),
+                "execution_identity_sha256" =>
+                    required(binding, "execution_identity_sha256"),
+                "control_receipt_sha256" =>
+                    required(control_receipt, "receipt_sha256"),
+            )
+            for key in ("plan", "sample_index", "sample_role")
+                haskey(identity, key) && (identifiers[key] = identity[key])
+            end
+            identifiers
         end
         progress_emit("request_failed"; payload=request_failure)
         @error "M02 Julia precision worker failed" exception=(failure, catch_backtrace())

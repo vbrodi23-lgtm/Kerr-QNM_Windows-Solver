@@ -281,6 +281,50 @@ class Schema11CheckpointTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "retained promoted stage"):
             validate_schema11_checkpoint(corrupted)
 
+    def test_legacy_stage_cannot_smuggle_an_unknown_typed_artifact(self) -> None:
+        checkpoint = append_promotion(
+            empty_schema11_checkpoint("campaign-1", "selection-1"),
+            leaf_id="leaf-1",
+            queue_kind=PromotionQueueKind.RESPONSE,
+            reason_code="REVIEWED_ERROR_EVIDENCE_PENDING",
+            minimum_requested_tier="BF40",
+            scientific_computation_identity="b" * 64,
+        )
+        artifact_content = {
+            "schema": "windows-solver.mistyped-control/999",
+        }
+        artifact = {
+            **artifact_content,
+            "calculation_sha256": _sha256(artifact_content),
+        }
+        stage_content = {
+            "schema": "windows-solver.promoted-calculation-stage/1",
+            "leaf_id": "leaf-1",
+            "queue_ordinal": 0,
+            "route": "EXTERIOR_BF40",
+            "execution_mode": "CALCULATE_ONLY",
+            "admission_state": "AWAITING_ADMISSION",
+            "precision_tiers": ["BF40"],
+            "batch": {"sample_count": 18},
+            "receipts": [],
+            "calculation_artifact": artifact,
+        }
+        stage = {**stage_content, "stage_sha256": _sha256(stage_content)}
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "legacy promoted stage cannot carry a typed artifact",
+        ):
+            retain_promoted_calculation(
+                checkpoint,
+                queue_ordinal=0,
+                promoted_stage=stage,
+                execution_mode="CALCULATE_ONLY",
+                disposition_receipt={
+                    "schema": "windows-solver.promoted-admission-pending/1"
+                },
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

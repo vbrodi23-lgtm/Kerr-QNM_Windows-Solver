@@ -119,6 +119,9 @@ jobs:
           PR75_FIXED_ROOT_RESULTS="$results" \
           PYTHONPATH=src python -m unittest \
             tests.test_pr75_fixed_root_lifecycle -v
+          PR75_REAL_WORKER_PROCESS=1 \
+          PYTHONPATH=src python -m unittest \
+            tests.test_pr75_fixed_root_process_seam -v
 
   test:
     strategy:
@@ -156,6 +159,7 @@ jobs:
               "windows_solver/linear_response_admission.py",
               "windows_solver/data/kerr_qnm_roots_2736.csv",
               "windows_solver/data/kerr_qnm_lattice_receipt.json",
+              "windows_solver/data/fixed_root_reliability_projection_authority_v1.json",
               "windows_solver/data/LICENSE-CANONICAL-BACKEND-MIT.txt",
               "windows_solver/data/LICENSE-CC-BY-4.0.txt",
               "windows_solver/data/LICENSE-QNM-MIT.txt",

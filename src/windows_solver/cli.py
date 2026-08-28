@@ -19,6 +19,7 @@ from .builtin import default_registry
 from .contracts import canonical_json_bytes, load_study
 from .campaign_recovery import (
     RecoverySelection,
+    checkpoint_bound_promoted_recovery_selection,
     recover_campaign,
     validate_recovery_checkpoint,
     validate_recovery_receipt,
@@ -1217,7 +1218,9 @@ def _load_schema11_campaign(
         checkpoint["campaign_id"] != recovery_selection.campaign_id
         or checkpoint["selection_id"] != recovery_selection.selection_id
     ):
-        raise ValueError("schema-11 checkpoint does not match the selected campaign")
+        recovery_selection = checkpoint_bound_promoted_recovery_selection(
+            plan, selection, checkpoint
+        )
     preflight_campaign_supports(plan, recovery_selection.ordered_leaf_ids)
     return plan, selection, descriptor, recovery_selection, resolved, checkpoint
 
@@ -1376,6 +1379,8 @@ def _campaign_schema11_validate(
             in {
                 PromotionQueueDisposition.PENDING.value,
                 PromotionQueueDisposition.CALCULATED_PENDING_DERIVATION.value,
+                PromotionQueueDisposition.CONTROL_RETURN_RETAINED.value,
+                PromotionQueueDisposition.CONTROL_DECISION_RETAINED.value,
                 PromotionQueueDisposition.NUMERICAL_CONTINUATION.value,
             }
         ]

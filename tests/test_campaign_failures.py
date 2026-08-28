@@ -7,8 +7,8 @@ from windows_solver.campaign_failures import (
     CampaignSystemFailure,
     FailureDisposition,
     FailureReport,
-    PROMOTION_ALLOWLIST,
     classify_failure,
+    reviewed_screening_promotion_queue,
     run_guarded_pass,
 )
 from windows_solver.campaign_policy import PromotionQueueKind, empty_schema11_checkpoint
@@ -34,21 +34,25 @@ class MethodError(RuntimeError):
 
 
 class CampaignFailureTests(unittest.TestCase):
-    def test_promotion_allowlist_is_closed_and_binds_queue_kind(self) -> None:
+    def test_reviewed_screening_reasons_are_closed_and_bind_queue_kind(self) -> None:
+        expected = {
+            "INSUFFICIENT_ASYMPTOTIC_PRECISION": "RESPONSE",
+            "HORIZON_ARITHMETIC_INADEQUATE": "RESPONSE",
+            "ROOT_UNCERTAINTY_EVIDENCE_UNAVAILABLE": "ROOT",
+            "FINITE_DIFFERENCE_NOISE_LIMIT": "RESPONSE",
+            "DETERMINANT_ERROR_EVIDENCE_UNAVAILABLE": "RESPONSE",
+            "BLOCKED_BY_REVIEWED_ERROR_EVIDENCE": "RESPONSE",
+            "DETERMINANT_UNCERTAINTY_TOO_LARGE": "ROOT",
+            "ROOT_SEAL_UNAVAILABLE": "ROOT",
+        }
         self.assertEqual(
+            expected,
             {
-                "INSUFFICIENT_ASYMPTOTIC_PRECISION": "RESPONSE",
-                "HORIZON_ARITHMETIC_INADEQUATE": "RESPONSE",
-                "ROOT_UNCERTAINTY_EVIDENCE_UNAVAILABLE": "ROOT",
-                "FINITE_DIFFERENCE_NOISE_LIMIT": "RESPONSE",
-                "DETERMINANT_ERROR_EVIDENCE_UNAVAILABLE": "RESPONSE",
-                "BLOCKED_BY_REVIEWED_ERROR_EVIDENCE": "RESPONSE",
-                "DETERMINANT_UNCERTAINTY_TOO_LARGE": "ROOT",
-                "ROOT_SEAL_UNAVAILABLE": "ROOT",
+                code: reviewed_screening_promotion_queue(code)
+                for code in expected
             },
-            PROMOTION_ALLOWLIST,
         )
-        for code, queue_kind in PROMOTION_ALLOWLIST.items():
+        for code, queue_kind in expected.items():
             decision = classify_failure(_report(code))
             self.assertIs(FailureDisposition.PROMOTION_PENDING, decision.disposition)
             self.assertEqual(queue_kind, decision.queue_kind)
@@ -59,6 +63,26 @@ class CampaignFailureTests(unittest.TestCase):
 
         decision = classify_failure(_report("ODE_RESOURCE_LIMIT"))
         self.assertIs(FailureDisposition.DEFERRED, decision.disposition)
+        self.assertIsNone(decision.queue_kind)
+
+    def test_raw_control_report_cannot_use_screening_authority(self) -> None:
+        report = _report("INSUFFICIENT_ASYMPTOTIC_PRECISION")
+        raw_control = FailureReport(
+            failure_code=report.failure_code,
+            failure_class="CONTROL",
+            stage=report.stage,
+            worker_operation=report.worker_operation,
+            request_schema=report.request_schema,
+            backend_identity=report.backend_identity,
+            policy_identity=report.policy_identity,
+            precision_tier=report.precision_tier,
+            cause_type=report.cause_type,
+            diagnostics={"complete": True},
+        )
+
+        decision = classify_failure(raw_control)
+
+        self.assertIs(FailureDisposition.SYSTEM_FAILURE, decision.disposition)
         self.assertIsNone(decision.queue_kind)
 
     def test_unknown_code_and_untyped_inner_cause_are_system_failures(self) -> None:

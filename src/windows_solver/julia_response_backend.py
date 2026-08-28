@@ -27,11 +27,15 @@ from types import SimpleNamespace
 from typing import Callable, Mapping
 
 from .contracts import canonical_json_bytes
+from .fixed_root_reliability import (
+    load_fixed_root_reliability_projection_authority,
+)
 from .operation_control import (
     FIXED_ROOT_SURVEY_BATCH_OPERATION,
     JULIA_WORKER_ORIGIN,
     NUMERICAL_CONTROL_FAILURE_CODES,
     OPERATION_CONTROL_RECEIPT_SCHEMA,
+    OperationExecutionIdentity,
     PYTHON_SUPERVISOR_ORIGIN,
     REQUEST_SCOPE,
     SAMPLE_SCOPE,
@@ -144,8 +148,8 @@ FIXED_ROOT_SURVEY_BATCH_RESPONSE_SCHEMA = (
 FIXED_ROOT_SURVEY_CONDITIONING_SCHEMA = (
     "windows-solver.fixed-root-survey-conditioning/2"
 )
-FIXED_ROOT_RELIABILITY_RULE = (
-    "minus-log10-target-plus-required-digit-guard/v1"
+FIXED_ROOT_RELIABILITY_PROJECTION_SCHEMA = (
+    "windows-solver.fixed-root-reliability-projection/2"
 )
 _FIXED_ROOT_SURVEY_MAXIMUM_SAMPLE_COUNT = 9
 _FIXED_ROOT_SURVEY_BACKGROUND_ROLES = BINARY64_FIXED_ROOT_SAMPLE_ROLES[:5]
@@ -295,6 +299,11 @@ _FIXED_ROOT_SURVEY_ROOT_ONLY_POLICY_FIELDS = frozenset({
     "frequency_step_maximum",
     "max_newton_iterations",
     "root_correction_tolerance",
+})
+_FIXED_ROOT_SURVEY_RELIABILITY_POLICY_FIELDS = frozenset({
+    "required_digit_guard",
+    "promoted_control_calibration_receipt_sha256",
+    "empirical_control_profile_sha256",
 })
 def _mode_specific_branch_enclosure_radius(
     job: ResponseComponentJob,
@@ -833,6 +842,7 @@ def _run_streamed_julia(
 ) -> object:
     """Drain worker pipes concurrently and forward progress before completion."""
 
+    started = time.monotonic()
     popen_options: dict[str, object] = {
         "cwd": cwd,
         "env": dict(env),
@@ -990,6 +1000,7 @@ def _run_streamed_julia(
             None if not last_progress_event else last_progress_event[0]
         ),
         last_progress_event_validated=bool(last_progress_event),
+        elapsed_seconds=max(0.0, time.monotonic() - started),
     )
 
 
@@ -1384,26 +1395,34 @@ def _control_receipt_diagnostics_validator(
             expected_fields.add("last_validated_progress")
         resource = request_binding.get("execution_resource")
         last_progress = diagnostics.get("last_validated_progress")
-        valid_last_progress = "last_validated_progress" not in diagnostics or (
-            isinstance(last_progress, Mapping)
-            and set(last_progress) == {"schema", "kind", "context", "payload"}
-            and last_progress.get("schema") == PROGRESS_SCHEMA
-            and isinstance(last_progress.get("kind"), str)
-            and last_progress.get("kind") in {item.value for item in ProgressEventKind}
-            and isinstance(last_progress.get("context"), Mapping)
-            and isinstance(last_progress.get("payload"), Mapping)
-        )
+        valid_last_progress = "last_validated_progress" not in diagnostics
+        if not valid_last_progress:
+            try:
+                timeout_identity = operation_execution_identity(
+                    receipt.get("execution_identity")
+                )
+            except (TypeError, ValueError):
+                return False
+            valid_last_progress = (
+                _timeout_progress_failure_fields(last_progress, timeout_identity)
+                == last_progress
+            )
+        try:
+            elapsed = _finite_text(
+                diagnostics.get("elapsed_request_seconds"),
+                "timeout elapsed_request_seconds",
+            )
+        except JuliaResponseBackendError:
+            return False
         return (
             receipt.get("origin") == PYTHON_SUPERVISOR_ORIGIN
             and receipt.get("stage") == "worker-supervision"
             and set(diagnostics) == expected_fields
             and diagnostics.get("limiting_resource")
             == "worker_request_wall_clock"
-            and isinstance(diagnostics.get("elapsed_request_seconds"), int)
-            and diagnostics["elapsed_request_seconds"] > 0
             and isinstance(resource, Mapping)
-            and diagnostics["elapsed_request_seconds"]
-            == resource.get("worker_request_wall_clock_seconds")
+            and isinstance(resource.get("worker_request_wall_clock_seconds"), int)
+            and elapsed >= resource["worker_request_wall_clock_seconds"]
             and diagnostics.get("precision_digits")
             == request_binding.get("precision_digits")
             and _worker_resource_identity_matches(
@@ -2333,6 +2352,7 @@ def _timeout_worker_failure_details(
     details: Mapping[str, object],
     request: Mapping[str, object],
     execution_resource: Mapping[str, object],
+    elapsed_request_seconds: object,
     last_progress_event: object = None,
 ) -> dict[str, object]:
     """Attach a bounded control receipt to a forced outer worker timeout."""
@@ -2346,15 +2366,34 @@ def _timeout_worker_failure_details(
         # a promoted transition or claim an authenticated request identity.
         return output
     identity = operation_execution_identity(raw_identity)
+    try:
+        elapsed = _finite_text(
+            elapsed_request_seconds, "timeout elapsed_request_seconds"
+        )
+    except JuliaResponseBackendError:
+        return output
+    configured_limit = execution_resource.get(
+        "worker_request_wall_clock_seconds"
+    )
+    if (
+        isinstance(configured_limit, bool)
+        or not isinstance(configured_limit, int)
+        or configured_limit <= 0
+        or elapsed < configured_limit
+    ):
+        # A runner flag is not evidence that the authenticated request exhausted
+        # its configured wall-clock budget.  Keep the operational failure, but
+        # do not manufacture a CONTROL receipt that could authorize recovery.
+        return output
     diagnostics: dict[str, object] = {
-        "elapsed_request_seconds": execution_resource[
-            "worker_request_wall_clock_seconds"
-        ],
+        "elapsed_request_seconds": elapsed,
         "limiting_resource": "worker_request_wall_clock",
         "precision_digits": request.get("precision_digits"),
         "execution_resource_policy": dict(execution_resource),
     }
-    progress_fields = _timeout_progress_failure_fields(last_progress_event)
+    progress_fields = _timeout_progress_failure_fields(
+        last_progress_event, identity
+    )
     if progress_fields:
         diagnostics["last_validated_progress"] = progress_fields
     output["failure"] = build_operation_control_receipt(
@@ -2369,8 +2408,11 @@ def _timeout_worker_failure_details(
     return output
 
 
-def _timeout_progress_failure_fields(value: object) -> dict[str, object]:
-    """Retain the last already-validated worker event as timeout evidence."""
+def _timeout_progress_failure_fields(
+    value: object,
+    identity: OperationExecutionIdentity,
+) -> dict[str, object]:
+    """Retain only progress bound to this exact authenticated request."""
 
     if not isinstance(value, Mapping) or set(value) != {
         "schema",
@@ -2391,6 +2433,28 @@ def _timeout_progress_failure_fields(value: object) -> dict[str, object]:
     context = copied.get("context")
     payload = copied.get("payload")
     if not isinstance(context, Mapping) or not isinstance(payload, Mapping):
+        return {}
+    expected_identity = identity
+    if context.get("scope") == SAMPLE_SCOPE:
+        try:
+            expected_identity = identity.select_sample(
+                context.get("sample_index"),
+                context.get("sample_role"),
+            )
+        except (TypeError, ValueError):
+            return {}
+    expected_plan = expected_identity.mapping.get("plan")
+    if (
+        context.get("operation") != expected_identity.operation
+        or context.get("scope") != expected_identity.scope
+        or context.get("request_sha256") != expected_identity.request_sha256
+        or context.get("execution_identity_sha256")
+        != expected_identity.sha256
+        or (
+            expected_plan is not None
+            and context.get("plan") != expected_plan
+        )
+    ):
         return {}
     return dict(copied)
 
@@ -2570,6 +2634,42 @@ class JuliaResponseEvaluation:
     cached_worker_response_receipt: Mapping[str, object] | None
 
 
+@dataclass(frozen=True, slots=True)
+class PreparedFixedRootSurveyRequest:
+    """Immutable scheduler-to-adapter authority for one exact `/2` wire request."""
+
+    request: Mapping[str, object]
+    request_binding: Mapping[str, object]
+    document: Mapping[str, object]
+    request_sha256: str
+    execution_identity_sha256: str
+
+    @classmethod
+    def from_request(
+        cls, request: Mapping[str, object]
+    ) -> "PreparedFixedRootSurveyRequest":
+        request_copy = json.loads(canonical_json_bytes(dict(request)))
+        request_binding, document, request_sha256 = _worker_request_document(
+            request_copy
+        )
+        if document.get("operation") != FIXED_ROOT_SURVEY_BATCH_OPERATION:
+            raise ValueError("prepared request is not a fixed-root survey")
+        identity = operation_execution_identity(document.get("execution_identity"))
+        if (
+            identity.scope != REQUEST_SCOPE
+            or identity.operation != FIXED_ROOT_SURVEY_BATCH_OPERATION
+            or identity.request_sha256 != request_sha256
+        ):
+            raise ValueError("prepared fixed-root execution identity is invalid")
+        return cls(
+            request=request_copy,
+            request_binding=json.loads(canonical_json_bytes(request_binding)),
+            document=json.loads(canonical_json_bytes(document)),
+            request_sha256=request_sha256,
+            execution_identity_sha256=identity.sha256,
+        )
+
+
 def _survey_complex_mapping(value: complex) -> dict[str, str]:
     converted = complex(value)
     if not math.isfinite(converted.real) or not math.isfinite(converted.imag):
@@ -2611,6 +2711,8 @@ class FixedRootSurveyConditioning:
             "schema",
             "fixed_root_reliability_target_abs",
             "fixed_root_reliability_rule",
+            "required_digit_guard",
+            "fixed_root_reliability_projection_sha256",
             "determinant_family",
             "homogeneous_representation",
             "branch_convention",
@@ -2640,9 +2742,32 @@ class FixedRootSurveyConditioning:
             raise ValueError(
                 "fixed-root survey conditioning reliability target is invalid"
             )
-        if self.mapping["fixed_root_reliability_rule"] != FIXED_ROOT_RELIABILITY_RULE:
+        authority = load_fixed_root_reliability_projection_authority()
+        if (
+            self.mapping["fixed_root_reliability_rule"]
+            != authority.fixed_root_reliability_rule
+        ):
             raise ValueError(
                 "fixed-root survey conditioning reliability rule is invalid"
+            )
+        guard = self.mapping["required_digit_guard"]
+        if type(guard) is not int or guard != authority.required_digit_guard:
+            raise ValueError(
+                "fixed-root survey conditioning required digit guard is invalid"
+            )
+        projection_sha256 = self.mapping[
+            "fixed_root_reliability_projection_sha256"
+        ]
+        if (
+            not isinstance(projection_sha256, str)
+            or len(projection_sha256) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in projection_sha256
+            )
+        ):
+            raise ValueError(
+                "fixed-root survey conditioning reliability projection is invalid"
             )
         for name in (
             "determinant_family",
@@ -2679,7 +2804,7 @@ class FixedRootSurveyConditioning:
         )
         with localcontext() as context:
             context.prec = 128
-            expected_required = -target.log10() + Decimal(6)
+            expected_required = -target.log10() + Decimal(guard)
         required_exponent = required.as_tuple().exponent
         if (
             not isinstance(required_exponent, int)
@@ -3116,6 +3241,17 @@ class JuliaResponseAdapter:
 
         return self._evaluate(request, retain_fresh=False)
 
+    def evaluate_prepared_for_validation(
+        self, prepared: PreparedFixedRootSurveyRequest
+    ) -> JuliaResponseEvaluation:
+        """Dispatch the exact immutable request already named by the scheduler."""
+
+        return self._evaluate(
+            prepared.request,
+            retain_fresh=False,
+            prepared_request=prepared,
+        )
+
     def retain_validated_readout(
         self,
         evaluation: JuliaResponseEvaluation,
@@ -3277,11 +3413,25 @@ class JuliaResponseAdapter:
         return PromotedRequestPreflightResult(validated, binding, False)
 
     def _evaluate(
-        self, request: Mapping[str, object], *, retain_fresh: bool
+        self,
+        request: Mapping[str, object],
+        *,
+        retain_fresh: bool,
+        prepared_request: PreparedFixedRootSurveyRequest | None = None,
     ) -> JuliaResponseEvaluation:
-        request_document, document, request_sha256 = _worker_request_document(
-            request
-        )
+        if prepared_request is None:
+            request_document, document, request_sha256 = _worker_request_document(
+                request
+            )
+        else:
+            recomputed = PreparedFixedRootSurveyRequest.from_request(request)
+            if recomputed != prepared_request:
+                raise JuliaResponseBackendError(
+                    "prepared fixed-root request changed before dispatch"
+                )
+            request_document = dict(prepared_request.request_binding)
+            document = dict(prepared_request.document)
+            request_sha256 = prepared_request.request_sha256
         execution_resource = request_document["execution_resource"]
         runtime_identity = runtime_identity_sha256(self.runtime_provenance)
         reused = self._reuse_readout(request_sha256)
@@ -3315,6 +3465,7 @@ class JuliaResponseAdapter:
                     str(request_path),
                     str(response_path),
                 )
+            worker_started = time.monotonic()
             if self.runner is subprocess.run:
                 completed = _run_streamed_julia(
                     command, cwd=directory, env=environment, timeout=timeout
@@ -3331,6 +3482,9 @@ class JuliaResponseAdapter:
                         timeout=timeout,
                     )
                 except subprocess.TimeoutExpired as error:
+                    elapsed_request_seconds = max(
+                        0.0, time.monotonic() - worker_started
+                    )
                     stderr = _bounded_text(error.stderr, 4000)
                     if stderr is None:
                         stderr = _bounded_text(error.output, 4000) or ""
@@ -3344,6 +3498,7 @@ class JuliaResponseAdapter:
                         },
                         document,
                         execution_resource,
+                        elapsed_request_seconds,
                     )
                     timeout_details, timeout_receipt = _bind_control_failure_to_request(
                         timeout_details, request_document, request_sha256
@@ -3353,6 +3508,9 @@ class JuliaResponseAdapter:
                         control_receipt=timeout_receipt,
                     )
             returncode = getattr(completed, "returncode", None)
+            elapsed_request_seconds = max(
+                0.0, time.monotonic() - worker_started
+            )
             if bool(getattr(completed, "timed_out", False)) or returncode != 0:
                 details = _worker_failure_details(completed, response_path)
                 if bool(getattr(completed, "timed_out", False)):
@@ -3371,6 +3529,7 @@ class JuliaResponseAdapter:
                         details,
                         document,
                         execution_resource,
+                        elapsed_request_seconds,
                         last_progress_event,
                     )
                 _require_worker_resource_identity(details, execution_resource)
@@ -3864,7 +4023,7 @@ class JuliaPrecisionRootBackend:
 
     def _fixed_root_survey_policy(
         self, job: ResponseComponentJob
-    ) -> tuple[dict[str, object], str]:
+    ) -> tuple[dict[str, object], dict[str, object]]:
         policy = _precision_policy(
             job,
             self.digits,
@@ -3875,7 +4034,35 @@ class JuliaPrecisionRootBackend:
             diagnostic_model_identity=EXTERIOR_PROVISIONAL_DETERMINANT_ERROR_MODEL,
             include_control_provenance=True,
         )
-        reliability_target = policy.get("root_correction_tolerance")
+        profile = self.empirical_control_profile
+        receipt = self.calibration_receipt
+        if profile is None or receipt is None:
+            raise ValueError(
+                "fixed-root reliability projection requires authenticated controls"
+            )
+        authority = load_fixed_root_reliability_projection_authority()
+        calibrated_controls = (
+            profile.base_controls
+            if self.refinement == 0
+            else profile.refinement_controls
+        )
+        for field in authority.fixed_root_policy_control_fields:
+            if (
+                field not in calibrated_controls
+                or policy.get(field) != calibrated_controls[field]
+            ):
+                raise ValueError(
+                    "fixed-root survey policy disagrees with its calibrated "
+                    f"control {field}"
+                )
+        target_control_field = (
+            authority.fixed_root_reliability_target_control_field
+        )
+        reliability_target = calibrated_controls.get(target_control_field)
+        if policy.get(target_control_field) != reliability_target:
+            raise ValueError(
+                "fixed-root reliability target disagrees with calibration"
+            )
         if not isinstance(reliability_target, str):
             raise ValueError(
                 "fixed-root reliability target is absent from calibration"
@@ -3889,9 +4076,30 @@ class JuliaPrecisionRootBackend:
             raise ValueError(
                 "fixed-root reliability target must be between zero and one"
             )
+        receipt_mapping = receipt.to_mapping()
+        if (
+            receipt_mapping.get("schema") != authority.calibration_receipt_schema
+            or receipt_mapping.get("identity")
+            != authority.calibration_receipt_identity
+        ):
+            raise ValueError(
+                "fixed-root reliability authority disagrees with calibration"
+            )
+        profile_sha256 = hashlib.sha256(
+            canonical_json_bytes(profile.to_mapping())
+        ).hexdigest()
+        if (
+            policy.get("promoted_control_calibration_receipt_sha256")
+            != receipt.sha256
+            or policy.get("empirical_control_profile_sha256") != profile_sha256
+        ):
+            raise ValueError(
+                "fixed-root reliability provenance disagrees with calibration"
+            )
         for field in (
             _FIXED_ROOT_SURVEY_REVIEW_ONLY_POLICY_FIELDS
             | _FIXED_ROOT_SURVEY_ROOT_ONLY_POLICY_FIELDS
+            | _FIXED_ROOT_SURVEY_RELIABILITY_POLICY_FIELDS
         ):
             policy.pop(field, None)
         if not _FIXED_ROOT_SURVEY_CERTIFICATE_FIELDS.issubset(policy):
@@ -3899,7 +4107,28 @@ class JuliaPrecisionRootBackend:
                 "fixed-root survey policy is missing its determinant-error "
                 "certificate fields"
             )
-        return policy, reliability_target
+        projection_binding: dict[str, object] = {
+            "schema": FIXED_ROOT_RELIABILITY_PROJECTION_SCHEMA,
+            "source_reliability_projection_authority_schema": authority.schema,
+            "source_reliability_projection_authority_identity": (
+                authority.identity
+            ),
+            "source_reliability_projection_authority_sha256": (
+                authority.authority_sha256
+            ),
+            "source_calibration_receipt_sha256": receipt.sha256,
+            "source_empirical_control_profile_sha256": profile_sha256,
+            "source_refinement_level": self.refinement,
+            "fixed_root_reliability_target_abs": reliability_target,
+            "fixed_root_reliability_rule": authority.fixed_root_reliability_rule,
+            "required_digit_guard": authority.required_digit_guard,
+        }
+        return policy, {
+            **projection_binding,
+            "projection_sha256": hashlib.sha256(
+                canonical_json_bytes(projection_binding)
+            ).hexdigest(),
+        }
 
     def preview_fixed_root_survey_request(
         self,
@@ -3971,7 +4200,9 @@ class JuliaPrecisionRootBackend:
             if role in _FIXED_ROOT_SURVEY_COORDINATE_ROLES:
                 sample["support"] = dict(support)
             samples.append(sample)
-        fixed_root_policy, reliability_target = self._fixed_root_survey_policy(job)
+        fixed_root_policy, reliability_projection = (
+            self._fixed_root_survey_policy(job)
+        )
         return {
             "schema_version": 2,
             "schema": FIXED_ROOT_SURVEY_BATCH_SCHEMA,
@@ -4000,8 +4231,7 @@ class JuliaPrecisionRootBackend:
             "precision_digits": self.digits,
             "working_precision_bits": math.ceil(self.digits * math.log2(10)) + 32,
             "semantic_precision_tier": f"bigfloat-{self.digits}",
-            "fixed_root_reliability_target_abs": reliability_target,
-            "fixed_root_reliability_rule": FIXED_ROOT_RELIABILITY_RULE,
+            "fixed_root_reliability_projection": reliability_projection,
             "frequency_step": format(frequency_step, ".17g"),
             "coordinate_step": format(coordinate_step, ".17g"),
             "sample_roles": list(sample_roles),
@@ -4011,6 +4241,27 @@ class JuliaPrecisionRootBackend:
             "execution_resource": _execution_resource_policy(),
         }
 
+    def prepare_fixed_root_survey_request(
+        self,
+        job: ResponseComponentJob,
+        *,
+        fixed_root: complex,
+        root_seal_sha256: str,
+        branch_identity: str,
+        plan: FixedRootSurveyPlan | str,
+    ) -> PreparedFixedRootSurveyRequest:
+        """Freeze the exact worker bytes before REQUESTED is reported."""
+
+        return PreparedFixedRootSurveyRequest.from_request(
+            self.preview_fixed_root_survey_request(
+                job,
+                fixed_root=fixed_root,
+                root_seal_sha256=root_seal_sha256,
+                branch_identity=branch_identity,
+                plan=plan,
+            )
+        )
+
     def fixed_root_survey_batch(
         self,
         job: ResponseComponentJob,
@@ -4019,20 +4270,41 @@ class JuliaPrecisionRootBackend:
         root_seal_sha256: str,
         branch_identity: str,
         plan: FixedRootSurveyPlan | str,
+        prepared_request: PreparedFixedRootSurveyRequest | None = None,
     ) -> JuliaFixedRootSurveyBatch:
         """Run one Julia request for one ordered fixed-root survey batch."""
 
-        request = self.preview_fixed_root_survey_request(
+        expected_prepared = self.prepare_fixed_root_survey_request(
             job,
             fixed_root=fixed_root,
             root_seal_sha256=root_seal_sha256,
             branch_identity=branch_identity,
             plan=plan,
         )
+        if prepared_request is None:
+            prepared_request = expected_prepared
+        elif prepared_request != expected_prepared:
+            raise JuliaResponseBackendError(
+                "prepared fixed-root request disagrees with scheduler inputs"
+            )
+        request = prepared_request.request
         contract = fixed_root_survey_request_contract(plan)
         sample_roles = contract.sample_roles
         scientific_operation_identity = contract.scientific_operation_identity
-        evaluation = self.adapter.evaluate_for_validation(request)
+        prepared_evaluator = getattr(
+            self.adapter, "evaluate_prepared_for_validation", None
+        )
+        if callable(prepared_evaluator):
+            evaluation = prepared_evaluator(prepared_request)
+        else:
+            evaluation = self.adapter.evaluate_for_validation(request)
+        if (
+            evaluation.request_sha256 != prepared_request.request_sha256
+            or evaluation.request_binding != prepared_request.request_binding
+        ):
+            raise JuliaResponseBackendError(
+                "fixed-root adapter dispatched a different prepared request"
+            )
         response = evaluation.response
         response_fields = {
             "schema_version",
@@ -4166,6 +4438,9 @@ class JuliaPrecisionRootBackend:
                     "M02 fixed-root survey conditioning is invalid"
                 ) from error
             telemetry = conditioning.mapping
+            reliability_projection = request[
+                "fixed_root_reliability_projection"
+            ]
             if any(
                 telemetry[name] != policy[name]
                 for name in (
@@ -4181,9 +4456,13 @@ class JuliaPrecisionRootBackend:
                 )
             if (
                 telemetry["fixed_root_reliability_target_abs"]
-                != request["fixed_root_reliability_target_abs"]
+                != reliability_projection["fixed_root_reliability_target_abs"]
                 or telemetry["fixed_root_reliability_rule"]
-                != request["fixed_root_reliability_rule"]
+                != reliability_projection["fixed_root_reliability_rule"]
+                or telemetry["required_digit_guard"]
+                != reliability_projection["required_digit_guard"]
+                or telemetry["fixed_root_reliability_projection_sha256"]
+                != reliability_projection["projection_sha256"]
             ):
                 raise JuliaResponseBackendError(
                     "M02 fixed-root survey reliability telemetry disagrees "

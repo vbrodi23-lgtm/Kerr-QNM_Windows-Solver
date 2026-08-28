@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import unittest
+from typing import Mapping
 
 from windows_solver.operation_control import (
     FIXED_ROOT_DETERMINANT_SAMPLE_OPERATION,
@@ -17,6 +18,7 @@ from windows_solver.operation_control import (
     ValidatedControlReceipt,
     build_operation_control_receipt,
     canonical_sha256,
+    expected_operation_control_retryability,
     execution_identity_from_request,
     operation_execution_identity,
     promoted_control_transition,
@@ -98,7 +100,13 @@ def _identity(
     *,
     tier: str,
 ):
-    request = _root_request() if operation == ROOT_READOUT_OPERATION else _fixed_request()
+    request = (
+        _root_request()
+        if operation == ROOT_READOUT_OPERATION
+        else _fixed_sample_request()
+        if operation == FIXED_ROOT_DETERMINANT_SAMPLE_OPERATION
+        else _fixed_request()
+    )
     digits = int(tier[2:])
     request["precision_digits"] = digits
     request["working_precision_bits"] = {40: 165, 80: 298}[digits]
@@ -128,7 +136,9 @@ def _validated_for_transition(transition):
         failure_code=transition.failure_code,
         stage=transition.stage,
         identity=identity,
-        retryable=transition.containable,
+        retryable=expected_operation_control_retryability(
+            transition.failure_code
+        ),
         retryable_basis="registry-test/v1",
         diagnostics={"reason": transition.failure_code},
     )
@@ -248,6 +258,58 @@ class OperationControlTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             outer.select_sample(0, "DOMEGA_REAL_PLUS_H")
 
+    def test_execution_identity_recursively_freezes_nested_values(self) -> None:
+        request = _fixed_request()
+        identity = execution_identity_from_request(
+            request,
+            request_sha256=canonical_sha256(request),
+        )
+
+        roles = identity.mapping["sample_roles"]
+        resource = identity.mapping["execution_resource_policy_identity"]
+        self.assertIsInstance(roles, tuple)
+        self.assertIsInstance(resource, Mapping)
+        with self.assertRaises(TypeError):
+            roles[0] = "FORGED"  # type: ignore[index]
+        with self.assertRaises(AttributeError):
+            roles.append("FORGED")  # type: ignore[attr-defined]
+        with self.assertRaises(TypeError):
+            resource["sha256"] = "f" * 64  # type: ignore[index]
+
+    def test_execution_identity_is_detached_from_source_and_exports(self) -> None:
+        request = _fixed_request()
+        source = execution_identity_from_request(
+            request,
+            request_sha256=canonical_sha256(request),
+        ).to_mapping()
+        identity = operation_execution_identity(source)
+        digest = identity.sha256
+        selected = identity.select_sample(0, "D0")
+
+        source["sample_roles"][0] = "FORGED"  # type: ignore[index]
+        source["execution_resource_policy_identity"]["sha256"] = (  # type: ignore[index]
+            "f" * 64
+        )
+        exported = identity.to_mapping()
+        exported["sample_roles"].append("FORGED")  # type: ignore[union-attr]
+        exported["execution_resource_policy_identity"]["sha256"] = (  # type: ignore[index]
+            "f" * 64
+        )
+
+        self.assertEqual(digest, identity.sha256)
+        self.assertEqual(
+            ["D0", "DOMEGA_REAL_PLUS_H"],
+            identity.to_mapping()["sample_roles"],
+        )
+        self.assertEqual(
+            "e" * 64,
+            identity.mapping["execution_resource_policy_identity"]["sha256"],
+        )
+        self.assertEqual("D0", selected.mapping["sample_role"])
+        self.assertEqual(selected, identity.select_sample(0, "D0"))
+        with self.assertRaises(ValueError):
+            identity.select_sample(0, "FORGED")
+
     def test_root_and_fixed_root_identity_cannot_cross_bind(self) -> None:
         fixed_request, fixed_identity = _identity(
             FIXED_ROOT_SURVEY_BATCH_OPERATION, SAMPLE_SCOPE, tier="BF40"
@@ -321,6 +383,85 @@ class OperationControlTests(unittest.TestCase):
         with self.assertRaises(TypeError):
             ValidatedControlReceipt(receipt, identity, _token=object())
 
+    def test_validated_receipt_recursively_freezes_authority(self) -> None:
+        request, identity = _identity(
+            FIXED_ROOT_SURVEY_BATCH_OPERATION, SAMPLE_SCOPE, tier="BF40"
+        )
+        diagnostics = {
+            "reason": "INSUFFICIENT_ASYMPTOTIC_PRECISION",
+            "nested": {"attempts": [{"accepted": False}]},
+        }
+        receipt = build_operation_control_receipt(
+            origin=JULIA_WORKER_ORIGIN,
+            failure_code="INSUFFICIENT_ASYMPTOTIC_PRECISION",
+            stage="asymptotic-preflight",
+            identity=identity,
+            retryable=True,
+            retryable_basis="precision-insufficiency/v1",
+            diagnostics=diagnostics,
+        )
+        validated = validate_operation_control_receipt(
+            receipt,
+            request=request,
+            request_sha256=identity.request_sha256,
+        )
+        digest = validated.sha256
+
+        diagnostics["nested"]["attempts"][0]["accepted"] = True
+        receipt["diagnostics"]["nested"]["attempts"].append(  # type: ignore[index,union-attr]
+            {"accepted": True}
+        )
+        request["samples"][0]["sample_role"] = "FORGED"  # type: ignore[index]
+        exported = validated.to_mapping()
+        exported["diagnostics"]["nested"]["attempts"][0][  # type: ignore[index]
+            "accepted"
+        ] = True
+        exported_request = validated.canonical_request
+        assert exported_request is not None
+        exported_request["samples"][0]["sample_role"] = "FORGED"  # type: ignore[index]
+
+        self.assertEqual(digest, validated.sha256)
+        self.assertFalse(
+            validated.mapping["diagnostics"]["nested"]["attempts"][0][  # type: ignore[index]
+                "accepted"
+            ]
+        )
+        self.assertEqual(
+            "D0",
+            validated.canonical_request["samples"][0]["sample_role"],  # type: ignore[index]
+        )
+        exported_mapping = validated.mapping
+        exported_mapping["diagnostics"]["reason"] = "FORGED"  # type: ignore[index]
+        exported_mapping["diagnostics"]["nested"]["attempts"].append(  # type: ignore[index,union-attr]
+            {"accepted": True}
+        )
+        self.assertEqual(digest, validated.sha256)
+        self.assertEqual(
+            "INSUFFICIENT_ASYMPTOTIC_PRECISION",
+            validated.mapping["diagnostics"]["reason"],  # type: ignore[index]
+        )
+
+    def test_retryability_is_derived_from_failure_code(self) -> None:
+        request, identity = _identity(
+            FIXED_ROOT_SURVEY_BATCH_OPERATION, SAMPLE_SCOPE, tier="BF40"
+        )
+        receipt = build_operation_control_receipt(
+            origin=JULIA_WORKER_ORIGIN,
+            failure_code="INSUFFICIENT_ASYMPTOTIC_PRECISION",
+            stage="asymptotic-preflight",
+            identity=identity,
+            retryable=False,
+            retryable_basis="caller-declared non-retryable/v1",
+            diagnostics={"reason": "INSUFFICIENT_ASYMPTOTIC_PRECISION"},
+        )
+
+        with self.assertRaisesRegex(ValueError, "retryability contradicts"):
+            validate_operation_control_receipt(
+                receipt,
+                request=request,
+                request_sha256=identity.request_sha256,
+            )
+
     def test_registry_is_exact_closed_and_self_consistent(self) -> None:
         self.assertTrue(PROMOTED_CONTROL_TRANSITIONS)
         for key, transition in PROMOTED_CONTROL_TRANSITIONS.items():
@@ -355,6 +496,42 @@ class OperationControlTests(unittest.TestCase):
             },
             fixed_codes - {"ODE_RESOURCE_LIMIT", "WORKER_TIMEOUT"},
         )
+        determinant_codes = {
+            transition.failure_code
+            for transition in PROMOTED_CONTROL_TRANSITIONS.values()
+            if transition.operation == FIXED_ROOT_DETERMINANT_SAMPLE_OPERATION
+        }
+        self.assertEqual(
+            fixed_codes,
+            determinant_codes,
+        )
+
+    def test_promoted_horizon_worker_operations_use_response_authority(self) -> None:
+        for operation in (
+            ROOT_READOUT_OPERATION,
+            FIXED_ROOT_DETERMINANT_SAMPLE_OPERATION,
+        ):
+            with self.subTest(operation=operation):
+                transition = next(
+                    item
+                    for item in PROMOTED_CONTROL_TRANSITIONS.values()
+                    if item.operation == operation
+                    and item.failure_code == "INSUFFICIENT_ASYMPTOTIC_PRECISION"
+                    and item.stage == "asymptotic-preflight"
+                    and item.current_tier == "BF80"
+                    and item.current_action_kind == "RESPONSE"
+                )
+                validated = _validated_for_transition(transition)
+                self.assertEqual(
+                    transition,
+                    promoted_control_transition(
+                        validated,
+                        current_tier="BF80",
+                        current_action_kind="RESPONSE",
+                    ),
+                )
+                self.assertEqual("UNRESOLVED", transition.disposition)
+                self.assertIsNone(transition.next_tier)
 
     def test_unknown_control_and_retryable_evidence_cannot_schedule(self) -> None:
         request, identity = _identity(
@@ -445,10 +622,23 @@ class OperationControlTests(unittest.TestCase):
         }
         operation_stages = (
             (ROOT_READOUT_OPERATION, "ROOT", REQUEST_SCOPE, expected),
+            (ROOT_READOUT_OPERATION, "RESPONSE", REQUEST_SCOPE, expected),
             (
                 FIXED_ROOT_SURVEY_BATCH_OPERATION,
                 "RESPONSE",
                 SAMPLE_SCOPE,
+                {
+                    **expected,
+                    "ALGEBRAIC_REPRESENTATION_SINGULAR": {
+                        "determinant-chart",
+                        "homogeneous-propagation",
+                    },
+                },
+            ),
+            (
+                FIXED_ROOT_DETERMINANT_SAMPLE_OPERATION,
+                "RESPONSE",
+                REQUEST_SCOPE,
                 {
                     **expected,
                     "ALGEBRAIC_REPRESENTATION_SINGULAR": {

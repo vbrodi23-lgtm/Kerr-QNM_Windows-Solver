@@ -118,6 +118,34 @@ def _identity_policy_hash(value: object, label: str) -> str:
     raise ValueError(f"operation execution {label} identity is invalid")
 
 
+def _immutable_identity_snapshot(value: object) -> object:
+    """Recursively freeze one already-validated identity value."""
+
+    if isinstance(value, Mapping):
+        return MappingProxyType(
+            {
+                key: _immutable_identity_snapshot(item)
+                for key, item in value.items()
+            }
+        )
+    if isinstance(value, (list, tuple)):
+        return tuple(_immutable_identity_snapshot(item) for item in value)
+    return copy.deepcopy(value)
+
+
+def _mutable_identity_snapshot(value: object) -> object:
+    """Return a detached JSON-shaped copy of a frozen identity value."""
+
+    if isinstance(value, Mapping):
+        return {
+            key: _mutable_identity_snapshot(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_mutable_identity_snapshot(item) for item in value]
+    return copy.deepcopy(value)
+
+
 @dataclass(frozen=True, slots=True)
 class OperationExecutionIdentity:
     """One validated REQUEST- or SAMPLE-scope execution identity."""
@@ -126,11 +154,14 @@ class OperationExecutionIdentity:
 
     def __post_init__(self) -> None:
         validated = _validate_execution_identity_mapping(self.mapping)
-        object.__setattr__(self, "mapping", MappingProxyType(validated))
+        frozen = _immutable_identity_snapshot(validated)
+        if not isinstance(frozen, Mapping):  # pragma: no cover - structural guard
+            raise TypeError("operation execution identity snapshot is invalid")
+        object.__setattr__(self, "mapping", frozen)
 
     @property
     def sha256(self) -> str:
-        return canonical_sha256(dict(self.mapping))
+        return canonical_sha256(self.to_mapping())
 
     @property
     def operation(self) -> str:
@@ -145,10 +176,20 @@ class OperationExecutionIdentity:
         return str(self.mapping["request_sha256"])
 
     def to_mapping(self) -> dict[str, object]:
-        return copy.deepcopy(dict(self.mapping))
+        mutable = _mutable_identity_snapshot(self.mapping)
+        if not isinstance(mutable, dict):  # pragma: no cover - structural guard
+            raise TypeError("operation execution identity snapshot is invalid")
+        return mutable
 
-    def select_sample(self, sample_index: int, sample_role: str) -> "OperationExecutionIdentity":
-        if self.operation != FIXED_ROOT_SURVEY_BATCH_OPERATION or self.scope != REQUEST_SCOPE:
+    def select_sample(
+        self,
+        sample_index: int,
+        sample_role: str,
+    ) -> "OperationExecutionIdentity":
+        if (
+            self.operation != FIXED_ROOT_SURVEY_BATCH_OPERATION
+            or self.scope != REQUEST_SCOPE
+        ):
             raise ValueError("only a fixed-root REQUEST identity can select a sample")
         roles = tuple(self.mapping["sample_roles"])
         if (
@@ -169,7 +210,10 @@ class OperationExecutionIdentity:
 def _validate_execution_identity_mapping(value: object) -> dict[str, object]:
     if not isinstance(value, Mapping):
         raise ValueError("operation execution identity must be an object")
-    result = copy.deepcopy(dict(value))
+    snapshot = _mutable_identity_snapshot(value)
+    if not isinstance(snapshot, dict):  # pragma: no cover - narrowed above
+        raise ValueError("operation execution identity must be an object")
+    result = snapshot
     operation = result.get("operation")
     scope = result.get("scope")
     required = set(_COMMON_IDENTITY_FIELDS)
@@ -390,17 +434,25 @@ class ValidatedControlReceipt:
     ) -> None:
         if _token is not self._TOKEN:
             raise TypeError("ValidatedControlReceipt is minted only by its validator")
-        self._mapping = MappingProxyType(copy.deepcopy(dict(mapping)))
+        frozen_mapping = _immutable_identity_snapshot(mapping)
+        if not isinstance(frozen_mapping, Mapping):  # pragma: no cover
+            raise TypeError("validated operation-control receipt is invalid")
+        self._mapping = frozen_mapping
         self._identity = identity
-        self._request = (
-            None
-            if request is None
-            else MappingProxyType(copy.deepcopy(dict(request)))
-        )
+        if request is None:
+            self._request = None
+        else:
+            frozen_request = _immutable_identity_snapshot(request)
+            if not isinstance(frozen_request, Mapping):  # pragma: no cover
+                raise TypeError("validated canonical request is invalid")
+            self._request = frozen_request
 
     @property
     def mapping(self) -> Mapping[str, object]:
-        return self._mapping
+        mutable = _mutable_identity_snapshot(self._mapping)
+        if not isinstance(mutable, dict):  # pragma: no cover
+            raise TypeError("validated operation-control receipt is invalid")
+        return mutable
 
     @property
     def identity(self) -> OperationExecutionIdentity:
@@ -423,11 +475,21 @@ class ValidatedControlReceipt:
         return str(self._mapping["origin"])
 
     def to_mapping(self) -> dict[str, object]:
-        return copy.deepcopy(dict(self._mapping))
+        mutable = _mutable_identity_snapshot(self._mapping)
+        if not isinstance(mutable, dict):  # pragma: no cover
+            raise TypeError("validated operation-control receipt is invalid")
+        return mutable
 
     @property
     def canonical_request(self) -> Mapping[str, object] | None:
-        return self._request
+        if self._request is None:
+            return None
+        mutable = _mutable_identity_snapshot(self._request)
+        if not isinstance(mutable, dict):  # pragma: no cover
+            raise TypeError("validated canonical request is invalid")
+        # The retained authority stays recursively frozen.  Callers receive a
+        # detached JSON-shaped export so mutation cannot alter that authority.
+        return mutable
 
 
 def validate_operation_control_receipt(
@@ -644,6 +706,33 @@ _CONTROL_STAGE_BY_OPERATION: Mapping[
     ),
 })
 
+# Retryability is a code-owned worker contract, not an assertion that a caller
+# may choose while constructing otherwise authentic-looking receipt bytes.
+# The Julia worker emits ``true`` only for these bounded continuation outcomes;
+# all other registered operation-control outcomes are non-retryable.
+_RETRYABLE_OPERATION_CONTROL_CODES = frozenset({
+    "INSUFFICIENT_ASYMPTOTIC_PRECISION",
+    "HORIZON_ARITHMETIC_INADEQUATE",
+    "COORDINATE_IDENTITY_MISMATCH",
+    "ODE_RESOURCE_LIMIT",
+    "ROOT_READOUT_RESOURCE_INFEASIBLE",
+    "WORKER_TIMEOUT",
+})
+_OPERATION_CONTROL_RETRYABILITY: Mapping[str, bool] = MappingProxyType({
+    code: code in _RETRYABLE_OPERATION_CONTROL_CODES
+    for operation_stages in _CONTROL_STAGE_BY_OPERATION.values()
+    for code in operation_stages
+})
+
+
+def expected_operation_control_retryability(failure_code: str) -> bool:
+    """Return the producer-owned retryability for one registered code."""
+
+    try:
+        return _OPERATION_CONTROL_RETRYABILITY[failure_code]
+    except KeyError as error:
+        raise ValueError("operation control retryability code is not registered") from error
+
 
 def _validate_registered_control_emission(
     receipt: Mapping[str, object],
@@ -666,6 +755,13 @@ def _validate_registered_control_emission(
     )
     if receipt.get("origin") != expected_origin or identity.scope != expected_scope:
         raise ValueError("operation control emission identity is incompatible")
+    retryable = receipt["retryable_evidence"]
+    if (
+        not isinstance(retryable, Mapping)
+        or retryable.get("retryable")
+        is not expected_operation_control_retryability(code)
+    ):
+        raise ValueError("operation control retryability contradicts its code")
 
 _PROMOTION_CODES: Mapping[str, str] = MappingProxyType({
     "INSUFFICIENT_ASYMPTOTIC_PRECISION": "RESPONSE",
@@ -710,11 +806,33 @@ def _build_transition_registry() -> Mapping[tuple[str, str, str, str, str, str, 
             REQUEST_SCOPE,
             _CONTROL_STAGE_BY_OPERATION[ROOT_READOUT_OPERATION],
         ),
+        # Promoted horizon response work owns a root-readout baseline.  Its
+        # worker receipt still identifies the concrete root-readout operation,
+        # while the scheduler action remains RESPONSE.  Keeping both values in
+        # the transition key prevents that embedded readout from silently using
+        # the standalone ROOT-queue authority.
+        (
+            ROOT_READOUT_OPERATION,
+            "RESPONSE",
+            REQUEST_SCOPE,
+            _CONTROL_STAGE_BY_OPERATION[ROOT_READOUT_OPERATION],
+        ),
         (
             FIXED_ROOT_SURVEY_BATCH_OPERATION,
             "RESPONSE",
             SAMPLE_SCOPE,
             _CONTROL_STAGE_BY_OPERATION[FIXED_ROOT_SURVEY_BATCH_OPERATION],
+        ),
+        # The promoted horizon derivative stencil uses the older one-sample
+        # fixed-root operation rather than the batched exterior operation.
+        # It therefore needs its own exact REQUEST-scope registry entries.
+        (
+            FIXED_ROOT_DETERMINANT_SAMPLE_OPERATION,
+            "RESPONSE",
+            REQUEST_SCOPE,
+            _CONTROL_STAGE_BY_OPERATION[
+                FIXED_ROOT_DETERMINANT_SAMPLE_OPERATION
+            ],
         ),
     )
     for operation, action, scope, code_stages in operation_actions:

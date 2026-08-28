@@ -16,8 +16,8 @@ from .contracts import canonical_json_bytes
 from .operation_control import (
     ValidatedControlReceipt,
     promotion_failure_codes,
-    promoted_control_transition,
 )
+from .promoted_control_authority import classify_control_receipt_material
 from .progress import ProgressEventKind, emit_progress, progress_scope
 from .structural_diagnostics import StructuralDiagnosticSession
 
@@ -30,7 +30,9 @@ class FailureDisposition(str, Enum):
     SYSTEM_FAILURE = "SYSTEM_FAILURE"
 
 
-PROMOTION_ALLOWLIST = MappingProxyType(dict(promotion_failure_codes()))
+_REVIEWED_SCREENING_PROMOTION_REASONS = MappingProxyType(
+    dict(promotion_failure_codes())
+)
 
 _LEAF_LOCAL_DISPOSITIONS = {
     "ODE_RESOURCE_LIMIT": FailureDisposition.DEFERRED,
@@ -458,15 +460,25 @@ class CampaignSystemFailure(RuntimeError):
 
 
 def classify_failure(report: FailureReport) -> FailureDecision:
-    """Classify from reviewed static tables; unknowns fail closed."""
+    """Classify reviewed non-receipt outcomes; unknowns fail closed.
+
+    Authenticated worker ``CONTROL`` outcomes are deliberately excluded from
+    this screening boundary.  They must enter through
+    :func:`classify_validated_control_receipt`, whose operation-discriminated
+    registry is the sole authority for a promoted CONTROL transition.
+    """
 
     diagnostics_complete = report.diagnostics.get("complete") is True
-    if report.cause_type in _SYSTEM_CAUSE_TYPES or not diagnostics_complete:
+    if (
+        report.failure_class == "CONTROL"
+        or report.cause_type in _SYSTEM_CAUSE_TYPES
+        or not diagnostics_complete
+    ):
         disposition = FailureDisposition.SYSTEM_FAILURE
         queue_kind = None
-    elif report.failure_code in PROMOTION_ALLOWLIST:
+    elif report.failure_code in _REVIEWED_SCREENING_PROMOTION_REASONS:
         disposition = FailureDisposition.PROMOTION_PENDING
-        queue_kind = PROMOTION_ALLOWLIST[report.failure_code]
+        queue_kind = _REVIEWED_SCREENING_PROMOTION_REASONS[report.failure_code]
     elif report.failure_code in _LEAF_LOCAL_DISPOSITIONS:
         disposition = _LEAF_LOCAL_DISPOSITIONS[report.failure_code]
         queue_kind = None
@@ -481,6 +493,12 @@ def classify_failure(report: FailureReport) -> FailureDecision:
     )
 
 
+def reviewed_screening_promotion_queue(reason_code: str) -> str | None:
+    """Return a queue only for a reviewed, non-worker screening reason."""
+
+    return _REVIEWED_SCREENING_PROMOTION_REASONS.get(reason_code)
+
+
 def classify_validated_control_receipt(
     receipt: ValidatedControlReceipt,
     *,
@@ -489,17 +507,14 @@ def classify_validated_control_receipt(
 ) -> tuple[FailureReport, FailureDecision]:
     """Classify an authenticated promoted outcome by exact registry lookup."""
 
-    transition = promoted_control_transition(
+    material = classify_control_receipt_material(
         receipt,
         current_tier=current_tier,
         current_action_kind=current_action_kind,
     )
+    transition = material.transition
     identity = receipt.identity
-    effective_policy = identity.mapping["effective_policy_identity"]
-    if isinstance(effective_policy, Mapping):
-        effective_policy_sha256 = str(effective_policy["sha256"])
-    else:
-        effective_policy_sha256 = str(effective_policy)
+    effective_policy_sha256 = material.effective_policy_identity
     report = FailureReport(
         failure_code=receipt.failure_code,
         failure_class="CONTROL",
@@ -516,10 +531,15 @@ def classify_validated_control_receipt(
         execution_identity_sha256=identity.sha256,
         effective_policy_identity=effective_policy_sha256,
     )
+    if (
+        report.fingerprint_material != dict(material.fingerprint_material)
+        or report.fingerprint_sha256 != material.fingerprint_sha256
+    ):
+        raise ValueError("promoted CONTROL fingerprint authority diverged")
     return report, FailureDecision(
         disposition=FailureDisposition(transition.disposition),
         failure_code=receipt.failure_code,
-        fingerprint_sha256=report.fingerprint_sha256,
+        fingerprint_sha256=material.fingerprint_sha256,
         queue_kind=transition.queue_kind,
         next_precision_tier=transition.next_tier,
         next_action_kind=transition.next_action_kind,
@@ -781,11 +801,11 @@ __all__ = [
     "FailureDecision",
     "FailureDisposition",
     "FailureReport",
-    "PROMOTION_ALLOWLIST",
     "SYSTEM_FAILURE_RESOLUTION_RECEIPT_SCHEMA",
     "ProductionFailureMonitor",
     "abort_unexpected_system_failure",
     "classify_failure",
+    "reviewed_screening_promotion_queue",
     "require_system_failures_resolved_for_promoted_resume",
     "run_guarded_pass",
     "resolve_system_failure_for_resume",
