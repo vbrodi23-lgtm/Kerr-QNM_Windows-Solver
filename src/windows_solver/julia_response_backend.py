@@ -2171,6 +2171,23 @@ def _valid_numerical_control_diagnostics(
     }:
         return _valid_scattering_diagnostics(code, stage, diagnostics)
     if code == "COORDINATE_INVERSION_STALLED":
+        # The coordinate watchdog emits the rich ODE snapshot below, while
+        # the shared factored-propagation translator can emit the same typed
+        # outcome with the bounded four-field factored proof.  Both are real
+        # production producers and therefore both must survive the common
+        # CONTROL binder.
+        if _has_exact_fields(diagnostics, _FACTORED_DIAGNOSTIC_FIELDS):
+            return (
+                stage == "coordinate-inversion"
+                and diagnostics.get("reason")
+                == "COORDINATE_INVERSION_STALLED"
+                and _is_positive_int(diagnostics.get("precision_bits"))
+                and _is_nonnegative_int(
+                    diagnostics.get("factored_homogeneous_rhs_evaluations")
+                )
+                and diagnostics.get("avoided_ode_scope")
+                == "factored-homogeneous-gsn/v1"
+            )
         return _valid_coordinate_stall_diagnostics(stage, diagnostics)
     if code == "FINITE_DIFFERENCE_NOISE_LIMIT":
         return _valid_finite_difference_noise_diagnostics(stage, diagnostics)

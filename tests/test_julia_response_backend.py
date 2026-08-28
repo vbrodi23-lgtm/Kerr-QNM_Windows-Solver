@@ -389,6 +389,25 @@ class JuliaResponseBackendTests(unittest.TestCase):
             forged, request_binding=request
         ))
 
+    def test_factored_coordinate_stall_survives_shared_control_binding(self):
+        failure = {
+            "failure_code": "COORDINATE_INVERSION_STALLED",
+            "failure_class": "CONTROL",
+            "stage": "coordinate-inversion",
+            "retryable": False,
+            "diagnostics": {
+                "reason": "COORDINATE_INVERSION_STALLED",
+                "precision_bits": 165,
+                "factored_homogeneous_rhs_evaluations": 0,
+                "avoided_ode_scope": "factored-homogeneous-gsn/v1",
+            },
+        }
+        self.assertTrue(_valid_numerical_control_diagnostics(failure))
+
+        forged = json.loads(canonical_json_bytes(failure))
+        forged["stage"] = "homogeneous-propagation"
+        self.assertFalse(_valid_numerical_control_diagnostics(forged))
+
     def test_horizon_failure_outcome_cannot_be_resealed_from_order_to_arithmetic(self):
         job = _job_for_mechanism("horizon-admittance")
         request = JuliaPrecisionRootBackend(
