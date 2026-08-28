@@ -6154,6 +6154,45 @@ def build_promoted_request_contract_fixture(
         request["policy"]["determinant_error_safety_factor"] = value
         _, document, _ = _worker_request_document(request)
         invalid_cases.append({"label": label, "document": document})
+    common_exterior_fields = (
+        "determinant_error_model",
+        "determinant_error_missing_evidence_outcome",
+        "determinant_error_preceding_precision_tier",
+    )
+    provisional_only_exterior_fields = (
+        "determinant_error_channel_schema",
+        "determinant_error_required_channels",
+        "determinant_error_calibration_status",
+    )
+    empirical_only_exterior_fields = (
+        "determinant_error_required_term_classes",
+        "determinant_error_certificate_statement",
+        "determinant_error_safety_factor",
+        "promoted_control_calibration_receipt_sha256",
+        "empirical_control_profile_sha256",
+    )
+    exterior_policy_field_cases: list[dict[str, object]] = []
+    for field in common_exterior_fields + provisional_only_exterior_fields:
+        missing = copy.deepcopy(exterior)
+        del missing["policy"][field]
+        _, missing_document, _ = _worker_request_document(missing)
+        corrupt = copy.deepcopy(exterior)
+        corrupt["policy"][field] = f"forged-{field}"
+        _, corrupt_document, _ = _worker_request_document(corrupt)
+        exterior_policy_field_cases.append({
+            "field": field,
+            "missing_document": missing_document,
+            "corrupt_document": corrupt_document,
+        })
+    exterior_policy_injection_cases: list[dict[str, object]] = []
+    for field in empirical_only_exterior_fields:
+        injected = copy.deepcopy(exterior)
+        injected["policy"][field] = f"forged-{field}"
+        _, injected_document, _ = _worker_request_document(injected)
+        exterior_policy_injection_cases.append({
+            "field": field,
+            "document": injected_document,
+        })
     golden_contracts = copy.deepcopy(
         list(raw_determinant_contract_golden_cases())
     )
@@ -6251,5 +6290,7 @@ def build_promoted_request_contract_fixture(
         "empirical_safety_factor_invalid_cases": (
             empirical_safety_factor_invalid_cases
         ),
+        "exterior_policy_field_cases": exterior_policy_field_cases,
+        "exterior_policy_injection_cases": exterior_policy_injection_cases,
         "golden_contracts": golden_contracts,
     }
