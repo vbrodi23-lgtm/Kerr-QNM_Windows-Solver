@@ -103,6 +103,22 @@ jobs:
             "$fixture"
           julia --startup-file=no --history-file=no --project="$M02_PROJECT" \
             tools/leaf13_horizon_harness_spec.jl
+      - name: Run PR75 fixed-root lifecycle through real Julia without solver kernels
+        shell: bash
+        run: |
+          cases="$RUNNER_TEMP/pr75-fixed-root-cases.json"
+          results="$RUNNER_TEMP/pr75-fixed-root-results.json"
+          PYTHONPATH=src python tests/pr75_fixed_root_contract_fixture.py \
+            write "$cases"
+          julia --startup-file=no --history-file=no --project="$M02_PROJECT" \
+            tests/julia/test_pr75_fixed_root_lifecycle.jl \
+            "$cases" "$results"
+          PYTHONPATH=src python tests/pr75_fixed_root_contract_fixture.py \
+            verify "$cases" "$results"
+          PR75_FIXED_ROOT_CASES="$cases" \
+          PR75_FIXED_ROOT_RESULTS="$results" \
+          PYTHONPATH=src python -m unittest \
+            tests.test_pr75_fixed_root_lifecycle -v
 
   test:
     strategy:

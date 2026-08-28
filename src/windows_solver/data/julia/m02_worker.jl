@@ -8576,7 +8576,59 @@ function fixed_root_survey_conditioning_fields(
     )
 end
 
-function fixed_root_survey_batch_fields(request, digits::Int, bits::Int, roles, samples)
+function production_fixed_root_survey_sample_fields(
+    ::Type{T}, sample_request, fixed_root::Complex{T},
+    omega::Complex{T}, amplitude::Complex{T}, role::String, digits::Int,
+) where {T<:AbstractFloat}
+    evaluation_context = build_determinant_request_context(
+        T, sample_request, fixed_root
+    )
+    before = DETERMINANT_INDEX_REQUEST[]
+    evaluation = determinant_progress(
+        T,
+        sample_request,
+        evaluation_context,
+        omega,
+        amplitude,
+        "fixed-root survey $(role)",
+        fixed_root,
+    )
+    certificate_required = exterior_empirical_certificate_required(sample_request)
+    expected_determinant_calls = certificate_required ? 3 : 1
+    DETERMINANT_INDEX_REQUEST[] == before + expected_determinant_calls ||
+        error("fixed-root survey sample exceeded its raw determinant budget")
+    breakdown = evaluation.error_breakdown
+    if certificate_required && (
+        breakdown === nothing || evaluation.error_model_id === nothing
+    )
+        error("fixed-root survey sample is missing its required certificate")
+    end
+    return Dict{String,Any}(
+        "determinant" => Dict(
+            "real" => numeric_text(real(evaluation.value)),
+            "imaginary" => numeric_text(imag(evaluation.value)),
+        ),
+        "numerical_conditioning" => fixed_root_survey_conditioning_fields(
+            T, sample_request, evaluation_context, digits
+        ),
+        "determinant_error_evidence" => breakdown === nothing ? nothing : Dict{String,Any}(
+            "schema" => "windows-solver.exterior-determinant-error-evidence/1",
+            "error_model_id" => evaluation.error_model_id,
+            "delta_same_point" => numeric_text(breakdown.control_disagreement_abs),
+            "delta_cross_precision" =>
+                numeric_text(breakdown.precision_disagreement_abs),
+            "delta_endpoint_series" =>
+                numeric_text(breakdown.endpoint_disagreement_abs),
+            "safety_factor" => numeric_text(breakdown.safety_factor),
+            "numerical_error_abs" => numeric_text(breakdown.numerical_error_abs),
+        ),
+    )
+end
+
+function fixed_root_survey_batch_fields(
+    request, digits::Int, bits::Int, roles, samples;
+    sample_evaluator::Function=production_fixed_root_survey_sample_fields,
+)
     fixed_root = parse_complex(
         BigFloat, request, "fixed_root_re", "fixed_root_im"
     )
@@ -8612,11 +8664,7 @@ function fixed_root_survey_batch_fields(request, digits::Int, bits::Int, roles, 
                 sample_request["support_$(key)"] = required(support, key)
             end
         end
-        evaluation_context = build_determinant_request_context(
-            BigFloat, sample_request, fixed_root
-        )
-        before = DETERMINANT_INDEX_REQUEST[]
-        evaluation = try
+        sample_fields = try
             progress_scope(Dict{String,Any}(
                 "operation" => FIXED_ROOT_SURVEY_BATCH_OPERATION,
                 "scope" => "SAMPLE",
@@ -8627,35 +8675,36 @@ function fixed_root_survey_batch_fields(request, digits::Int, bits::Int, roles, 
                     canonical_sha256(selected_identity),
                 "request_sha256" => string(required(request, "request_sha256")),
             )) do
-                determinant_progress(
+                sample_evaluator(
                     BigFloat,
                     sample_request,
-                    evaluation_context,
+                    fixed_root,
                     omega,
                     amplitude,
-                    "fixed-root survey $(role)",
-                    fixed_root,
+                    role,
+                    digits,
                 )
             end
         catch failure
-            if failure isa WorkerControlFailure
-                failure.details["execution_identity"] = selected_identity
-                failure.details["sample_index"] = zero_based_index
-                failure.details["sample_role"] = role
+            translated = translate_numerical_control_failure(
+                sample_request, failure
+            )
+            if translated isa WorkerControlFailure
+                translated.details["execution_identity"] = selected_identity
+                translated.details["sample_index"] = zero_based_index
+                translated.details["sample_role"] = role
             end
-            rethrow()
+            translated === failure && rethrow()
+            throw(translated)
         end
-        certificate_required = exterior_empirical_certificate_required(sample_request)
-        expected_determinant_calls = certificate_required ? 3 : 1
-        DETERMINANT_INDEX_REQUEST[] == before + expected_determinant_calls ||
-            error("fixed-root survey sample exceeded its raw determinant budget")
-        breakdown = evaluation.error_breakdown
-        if certificate_required && (
-            breakdown === nothing || evaluation.error_model_id === nothing
-        )
-            error("fixed-root survey sample is missing its required certificate")
-        end
-        push!(outputs, Dict{String,Any}(
+        sample_fields isa AbstractDict ||
+            error("fixed-root survey sample evaluator returned invalid fields")
+        Set(string(key) for key in keys(sample_fields)) == Set((
+            "determinant",
+            "numerical_conditioning",
+            "determinant_error_evidence",
+        )) || error("fixed-root survey sample evaluator fields are invalid")
+        push!(outputs, merge(Dict{String,Any}(
             "sample_index" => zero_based_index,
             "sample_role" => role,
             "execution_identity" => selected_identity,
@@ -8667,25 +8716,7 @@ function fixed_root_survey_batch_fields(request, digits::Int, bits::Int, roles, 
                 "real" => numeric_text(real(amplitude)),
                 "imaginary" => numeric_text(imag(amplitude)),
             ),
-            "determinant" => Dict(
-                "real" => numeric_text(real(evaluation.value)),
-                "imaginary" => numeric_text(imag(evaluation.value)),
-            ),
-            "numerical_conditioning" => fixed_root_survey_conditioning_fields(
-                BigFloat, sample_request, evaluation_context, digits
-            ),
-            "determinant_error_evidence" => breakdown === nothing ? nothing : Dict{String,Any}(
-                "schema" => "windows-solver.exterior-determinant-error-evidence/1",
-                "error_model_id" => evaluation.error_model_id,
-                "delta_same_point" => numeric_text(breakdown.control_disagreement_abs),
-                "delta_cross_precision" =>
-                    numeric_text(breakdown.precision_disagreement_abs),
-                "delta_endpoint_series" =>
-                    numeric_text(breakdown.endpoint_disagreement_abs),
-                "safety_factor" => numeric_text(breakdown.safety_factor),
-                "numerical_error_abs" => numeric_text(breakdown.numerical_error_abs),
-            ),
-        ))
+        ), Dict{String,Any}(sample_fields)))
     end
     length(outputs) == length(roles) ||
         error("fixed-root survey response count is invalid")

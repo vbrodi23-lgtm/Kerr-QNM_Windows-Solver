@@ -36,8 +36,12 @@ from windows_solver.julia_response_backend import (
     fixed_root_survey_request_contract,
 )
 from windows_solver.operation_control import (
+    JULIA_WORKER_ORIGIN,
     OPERATION_EXECUTION_IDENTITY_SCHEMA,
     OperationExecutionIdentity,
+    build_operation_control_receipt,
+    execution_identity_from_request,
+    validate_operation_control_receipt,
 )
 from windows_solver.precision_tiers import PrecisionTier, working_precision_bits
 from windows_solver.reviewed_determinant_error_issuance import (
@@ -338,8 +342,75 @@ class _Backend:
     def fixed_root_survey_batch(self, job, **kwargs):
         self.calls.append(self.digits)
         if self.failure_code is not None:
+            contract = _requested_contract(kwargs)
+            canonical_request = {
+                "schema_version": 2,
+                "schema": "windows-solver.fixed-root-survey-batch/2",
+                "operation": "fixed-root-survey-batch",
+                "leaf_id": job.leaf_id,
+                "job_id": job.job_id,
+                "backend_identity_sha256": job.backend_identity.identity_sha256,
+                "precision_digits": self.digits,
+                "working_precision_bits": working_precision_bits(
+                    PrecisionTier.BIGFLOAT_40
+                    if self.digits == 40
+                    else PrecisionTier.BIGFLOAT_80
+                ),
+                "semantic_precision_tier": f"bigfloat-{self.digits}",
+                "policy": {"job_policy_sha256": job.policy.identity_sha256},
+                "execution_resource": {
+                    "schema": "windows-solver.execution-resource-policy/1",
+                    "version": 1,
+                    "sha256": "3" * 64,
+                },
+                "plan": contract.plan.value,
+                "scientific_operation_identity": (
+                    contract.scientific_operation_identity
+                ),
+                "root_reference_id": job.root.root_reference_id,
+                "root_seal_sha256": kwargs["root_seal_sha256"],
+                "branch_identity": kwargs["branch_identity"],
+                "sample_roles": list(contract.sample_roles),
+            }
+            request_sha256 = _sha256(canonical_request)
+            identity = execution_identity_from_request(
+                canonical_request,
+                request_sha256=request_sha256,
+                sample_index=0,
+                sample_role=contract.sample_roles[0],
+            )
+            diagnostics = {
+                "reason": "INSUFFICIENT_ASYMPTOTIC_PRECISION",
+                "precision_bits": canonical_request["working_precision_bits"],
+                "factored_homogeneous_rhs_evaluations": 0,
+                "avoided_ode_scope": "factored-homogeneous-gsn/v1",
+                "predicted_reliable_digits": "10",
+                "required_reliable_digits": "20",
+                "asymptotic_preflight_avoided_ode": True,
+                "asymptotic_preflight_reason": (
+                    "INSUFFICIENT_ASYMPTOTIC_PRECISION"
+                ),
+                "maximum_series_digits_lost": "30",
+                "maximum_recurrence_digits_lost": "5",
+            }
+            receipt = validate_operation_control_receipt(
+                build_operation_control_receipt(
+                    origin=JULIA_WORKER_ORIGIN,
+                    failure_code=self.failure_code,
+                    stage="asymptotic-preflight",
+                    identity=identity,
+                    retryable=True,
+                    retryable_basis="scheduler fixture control evidence/v1",
+                    diagnostics=diagnostics,
+                ),
+                request=canonical_request,
+                request_sha256=request_sha256,
+                diagnostics_validator=lambda _receipt: True,
+            )
             raise JuliaNumericalControlError(
-                "reviewed numerical insufficiency", self.failure_code
+                "reviewed numerical insufficiency",
+                self.failure_code,
+                control_receipt=receipt,
             )
         seal = AuthenticatedRootSeal(
             kwargs["fixed_root"], kwargs["branch_identity"],
@@ -672,11 +743,8 @@ class PromotedSurveySchedulerTests(unittest.TestCase):
         class InterruptingBackend(_Backend):
             def fixed_root_survey_batch(self, job, **kwargs):
                 if self.digits == 40:
-                    self.calls.append(self.digits)
-                    raise JuliaNumericalControlError(
-                        "reviewed numerical insufficiency",
-                        "INSUFFICIENT_ASYMPTOTIC_PRECISION",
-                    )
+                    self.failure_code = "INSUFFICIENT_ASYMPTOTIC_PRECISION"
+                    return super().fixed_root_survey_batch(job, **kwargs)
                 if self.digits == 80:
                     self.calls.append(self.digits)
                     raise KeyboardInterrupt
