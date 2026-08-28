@@ -30,7 +30,10 @@ from .campaign_policy import (
     promotion_source_fingerprint_sha256,
     validate_schema11_checkpoint,
 )
-from .campaign_recovery import RecoverySelection
+from .campaign_recovery import (
+    ROOT_READOUT_RECOVERY_INDEX_SCHEMA,
+    RecoverySelection,
+)
 from .campaign_record_intake import (
     assess_campaign_record_for_current_runtime,
     emit_forensic_record_excluded,
@@ -138,7 +141,11 @@ from .promoted_admission import (
     admit_retained_promoted_checkpoint,
 )
 from .root_evidence import AuthenticatedRootEvidence, RootDependencyKey
-from .root_readout_cache import RootEvidenceStore, RootReadoutStore
+from .root_readout_cache import (
+    ROOT_READOUT_RESPONSE_CONTRACT_SHA256,
+    RootEvidenceStore,
+    RootReadoutStore,
+)
 from .reviewed_determinant_error import (
     AuthenticatedDeterminantErrorBundle,
     ReviewedDeterminantErrorReceipt,
@@ -160,9 +167,7 @@ from .progress import ProgressEventKind, emit_progress, progress_scope
 
 _SCHEMA11_NUMERICAL_RECORD = "windows-solver.schema11-numerical-record/1"
 _FIXED_ROOT_STAGE = "windows-solver.fixed-root-screening-stage/1"
-_ROOT_READOUT_RECOVERY_INDEX_SCHEMA = (
-    "windows-solver.root-readout-recovery-index/v1"
-)
+_ROOT_READOUT_RECOVERY_INDEX_SCHEMA = ROOT_READOUT_RECOVERY_INDEX_SCHEMA
 
 
 def _sha256(value: object) -> str:
@@ -1020,6 +1025,7 @@ def _recovery_root_readout_references(
         "readout_identity_sha256",
         "request_sha256",
         "runtime_identity_sha256",
+        "response_contract_sha256",
         "worker_response_receipt_sha256",
     }
     for receipt in receipts:
@@ -1074,6 +1080,10 @@ def _recovered_root_readout_entries(
                     or indexed["request_sha256"] != entry.request_sha256
                     or indexed["runtime_identity_sha256"]
                     != entry.runtime_identity_sha256
+                    or indexed["response_contract_sha256"]
+                    != ROOT_READOUT_RESPONSE_CONTRACT_SHA256
+                    or entry.response_contract_sha256
+                    != ROOT_READOUT_RESPONSE_CONTRACT_SHA256
                     or _file_sha256(entry.path) != indexed["source_sha256"]
                     or not isinstance(entry.worker_response_receipt, Mapping)
                     or entry.worker_response_receipt.get("receipt_sha256")

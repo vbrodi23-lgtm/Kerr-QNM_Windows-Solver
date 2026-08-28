@@ -218,7 +218,7 @@ end
             @test request["diagnostic_model_identity"] == model
             @test request["required_raw_determinant_roles"] == roles
             @test request["required_raw_determinant_count"] === count
-            @test response["schema_version"] === 11
+            @test response["schema_version"] === 12
             @test response["operation"] == "root-readout"
             @test response["diagnostic_model_identity"] == model
             @test response["required_raw_determinant_roles"] == roles

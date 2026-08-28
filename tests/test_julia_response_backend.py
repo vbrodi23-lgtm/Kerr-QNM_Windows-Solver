@@ -922,8 +922,8 @@ class JuliaResponseBackendTests(unittest.TestCase):
                 backend.read_root(_deep_job(), 0.0j)
             self.assertEqual(store.stored_count, 0)
 
-    def test_invalid_cached_success_is_evicted_then_valid_retry_is_reused(self):
-        """Catches one poisoned entry permanently blocking exact recomputation."""
+    def test_incompatible_cached_success_recomputes_without_campaign_failure(self):
+        """An old response contract is a cache miss, never a fatal campaign input."""
 
         calls = []
 
@@ -956,14 +956,6 @@ class JuliaResponseBackendTests(unittest.TestCase):
                 ),
                 response=poisoned,
             )
-
-            with self.assertRaisesRegex(
-                JuliaResponseBackendError,
-                "response policy/wire schema is inconsistent",
-            ):
-                backend.read_root(job, 0.0j)
-            self.assertEqual(store.stored_count, 0)
-            self.assertEqual(calls, [])
 
             first = backend.read_root(job, 0.0j)
             second = backend.read_root(job, 0.0j)
@@ -1030,13 +1022,12 @@ class JuliaResponseBackendTests(unittest.TestCase):
             backend.read_root(_deep_job(), 0.0j)
             self.assertEqual(len(calls), 2)
 
-    def test_success_wire_schema_is_eleven_and_worker_errors_remain_schema_one(self):
+    def test_success_wire_schema_is_twelve_and_worker_errors_remain_schema_one(self):
         """Catches changing the successful wire without preserving error parsing.
 
         The success wire and the error envelope are versioned independently.
-        Schema 11 binds the explicit diagnostic model and raw-role contract;
-        the error envelope stays independently
-        versioned at 1.
+        Schema 12 binds the successful response to the operation execution
+        identity; the error envelope stays independently versioned at 1.
         """
 
         request = JuliaPrecisionRootBackend(
@@ -1048,7 +1039,7 @@ class JuliaResponseBackendTests(unittest.TestCase):
             valid_julia_root_response(request)["schema_version"],
             WORKER_RESPONSE_WIRE_SCHEMA,
         )
-        self.assertEqual(WORKER_RESPONSE_WIRE_SCHEMA, 11)
+        self.assertEqual(WORKER_RESPONSE_WIRE_SCHEMA, 12)
         root = Path(__file__).resolve().parents[1]
         worker = (
             root / "src/windows_solver/data/julia/m02_worker.jl"
@@ -1057,7 +1048,7 @@ class JuliaResponseBackendTests(unittest.TestCase):
             worker.index("function result_fields(") :
             worker.index("function evaluate_request(")
         ]
-        self.assertEqual(result_fields.count('"schema_version" => 11'), 2)
+        self.assertEqual(result_fields.count('"schema_version" => 12'), 2)
         self.assertNotIn('"schema_version" => 6', result_fields)
         error_path = worker[
             worker.rindex("catch failure") : worker.index(

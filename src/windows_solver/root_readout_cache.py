@@ -28,10 +28,19 @@ import tempfile
 from typing import Mapping
 
 from .contracts import canonical_json_bytes
+from .operation_control import (
+    OPERATION_EXECUTION_IDENTITY_SCHEMA,
+    ROOT_READOUT_OPERATION,
+)
+from .response_engine import (
+    PROMOTED_ROOT_READOUT_POLICY,
+    WORKER_RESPONSE_RECEIPT_SCHEMA,
+    WORKER_RESPONSE_WIRE_SCHEMA,
+)
 from .root_evidence import AuthenticatedRootEvidence, RootDependencyKey
 
 
-ROOT_READOUT_CACHE_SCHEMA_VERSION = 2
+ROOT_READOUT_CACHE_SCHEMA_VERSION = 3
 ROOT_READOUT_STORE_DIRECTORY_NAME = "root-readouts-" + "v" + str(
     ROOT_READOUT_CACHE_SCHEMA_VERSION
 )
@@ -42,6 +51,7 @@ _ENTRY_FIELDS = frozenset({
     "readout_identity_sha256",
     "request_sha256",
     "runtime_identity_sha256",
+    "response_contract_sha256",
     "created_utc",
     "response",
     "worker_response_receipt",
@@ -50,6 +60,20 @@ _ENTRY_FIELDS = frozenset({
 
 def _sha256(value: object) -> str:
     return hashlib.sha256(canonical_json_bytes(value)).hexdigest()
+
+
+# This identity is deliberately derived from the actual response, execution-
+# identity, receipt, and policy contracts.  A request can remain byte-identical
+# while the successful response contract changes; request/runtime addressing
+# alone therefore cannot authorise reuse.
+ROOT_READOUT_RESPONSE_CONTRACT_SHA256 = _sha256({
+    "schema": "windows-solver.root-readout-cache-compatibility/1",
+    "operation": ROOT_READOUT_OPERATION,
+    "worker_response_wire_schema": WORKER_RESPONSE_WIRE_SCHEMA,
+    "operation_execution_identity_schema": OPERATION_EXECUTION_IDENTITY_SCHEMA,
+    "worker_response_receipt_schema": WORKER_RESPONSE_RECEIPT_SCHEMA,
+    "promoted_root_readout_policy": PROMOTED_ROOT_READOUT_POLICY,
+})
 
 
 def _reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -100,6 +124,7 @@ def runtime_identity_sha256(runtime_provenance: Mapping[str, object]) -> str:
         raise ValueError("root-readout runtime provenance must be a mapping")
     return _sha256({
         "schema_version": ROOT_READOUT_CACHE_SCHEMA_VERSION,
+        "response_contract_sha256": ROOT_READOUT_RESPONSE_CONTRACT_SHA256,
         "runtime_provenance": dict(runtime_provenance),
     })
 
@@ -119,12 +144,14 @@ def root_readout_identity_sha256(
         "schema_version": ROOT_READOUT_CACHE_SCHEMA_VERSION,
         "request_sha256": request_sha256,
         "runtime_identity_sha256": runtime_identity,
+        "response_contract_sha256": ROOT_READOUT_RESPONSE_CONTRACT_SHA256,
     })
 
 
 class RootReadoutLookupStatus(StrEnum):
     MISSING = "missing"
     HIT = "hit"
+    INCOMPATIBLE = "incompatible"
     CORRUPT = "corrupt"
 
 
@@ -150,6 +177,7 @@ class RootReadoutStoredEntry:
     readout_identity_sha256: str
     request_sha256: str
     runtime_identity_sha256: str
+    response_contract_sha256: str
     response: Mapping[str, object]
     worker_response_receipt: Mapping[str, object] | None
 
@@ -183,6 +211,7 @@ class RootReadoutStore:
             "readout_identity_sha256",
             "request_sha256",
             "runtime_identity_sha256",
+            "response_contract_sha256",
         ):
             digest = value[name]
             if not isinstance(digest, str) or _HEX_64.fullmatch(digest) is None:
@@ -191,6 +220,11 @@ class RootReadoutStore:
             raise ValueError("root-readout cache creation stamp is invalid")
         request_sha256 = value["request_sha256"]
         runtime_identity = value["runtime_identity_sha256"]
+        if (
+            value["response_contract_sha256"]
+            != ROOT_READOUT_RESPONSE_CONTRACT_SHA256
+        ):
+            raise ValueError("root-readout cache response contract is incompatible")
         expected_identity = root_readout_identity_sha256(
             request_sha256=request_sha256, runtime_identity=runtime_identity
         )
@@ -213,6 +247,7 @@ class RootReadoutStore:
             readout_identity_sha256=expected_identity,
             request_sha256=request_sha256,
             runtime_identity_sha256=runtime_identity,
+            response_contract_sha256=ROOT_READOUT_RESPONSE_CONTRACT_SHA256,
             response=dict(response),
             worker_response_receipt=(
                 None if receipt is None else dict(receipt)
@@ -263,7 +298,16 @@ class RootReadoutStore:
         result: list[RootReadoutStoredEntry] = []
         for path in sorted(self.root.glob("*.json"), key=lambda item: item.name):
             try:
-                result.append(self._entry_from_mapping(_load_json(path), path=path))
+                value = _load_json(path)
+                # Older cache generations are forensic files, not current
+                # candidates.  They are left untouched and never upgraded.
+                if (
+                    isinstance(value, Mapping)
+                    and value.get("schema_version")
+                    != ROOT_READOUT_CACHE_SCHEMA_VERSION
+                ):
+                    continue
+                result.append(self._entry_from_mapping(value, path=path))
             except (OSError, ValueError, UnicodeDecodeError) as error:
                 raise ValueError(
                     f"root-readout cache entry is corrupt: {path}: {error}"
@@ -282,8 +326,21 @@ class RootReadoutStore:
         if not path.is_file() or path.is_symlink():
             return RootReadoutLookup(RootReadoutLookupStatus.MISSING, path=path)
         try:
+            value = _load_json(path)
+            if (
+                not isinstance(value, Mapping)
+                or value.get("schema_version")
+                != ROOT_READOUT_CACHE_SCHEMA_VERSION
+                or value.get("response_contract_sha256")
+                != ROOT_READOUT_RESPONSE_CONTRACT_SHA256
+            ):
+                return RootReadoutLookup(
+                    RootReadoutLookupStatus.INCOMPATIBLE,
+                    path=path,
+                    reason="root-readout cache contract is not current",
+                )
             entry = self._validate_entry(
-                _load_json(path),
+                value,
                 request_sha256=request_sha256,
                 runtime_identity=runtime_identity,
                 path=path,
@@ -326,6 +383,7 @@ class RootReadoutStore:
             "readout_identity_sha256": identity,
             "request_sha256": request_sha256,
             "runtime_identity_sha256": runtime_identity,
+            "response_contract_sha256": ROOT_READOUT_RESPONSE_CONTRACT_SHA256,
             "created_utc": datetime.now(timezone.utc)
             .isoformat()
             .replace("+00:00", "Z"),

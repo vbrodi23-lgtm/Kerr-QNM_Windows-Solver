@@ -50,6 +50,7 @@ _QUIET_KINDS = frozenset(
         ProgressEventKind.LEAF_REUSED,
         ProgressEventKind.LEAF_CACHE_STALE,
         ProgressEventKind.LEAF_CACHE_CORRUPT,
+        ProgressEventKind.ROOT_READOUT_CACHE_STALE,
         ProgressEventKind.LEAF_CACHE_PUBLICATION_FAILED,
         ProgressEventKind.LEAF_COMPLETED,
         ProgressEventKind.LEAF_FAILED,

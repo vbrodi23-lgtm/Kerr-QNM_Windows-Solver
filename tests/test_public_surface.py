@@ -1497,7 +1497,7 @@ $candidate | ConvertTo-Json -Compress | Set-Content -LiteralPath $env:M02_TEST_J
             "solved-leaf-cache/v1",
             "windows-solver.campaign-recovery/v1",
             "windows-solver.recovery-summary/v1",
-            "windows-solver.root-readout-recovery-index/v1",
+            "windows-solver.root-readout-recovery-index/v2",
             "windows-solver.promoted-cache-supersession/v1",
             "promoted-policy-preflight/v1",
             "promoted-independent-review-admission/v1",
@@ -1688,8 +1688,8 @@ $candidate | ConvertTo-Json -Compress | Set-Content -LiteralPath $env:M02_TEST_J
             "windows-solver.binary64-layer-projection/1",
             "windows-solver.root-evidence-store/v2",
             "windows-solver.canonical-background-evidence-store/v1",
-            "windows-solver.root-readout-store/v2",
-            "windows-solver.root-readout-cache/2",
+            "windows-solver.root-readout-store/v3",
+            "windows-solver.root-readout-cache/3",
             # PR69 keeps the forensic v2 horizon lineage readable without
             # letting it re-authenticate as current science. The
             # constants below name that forensic path in code, in

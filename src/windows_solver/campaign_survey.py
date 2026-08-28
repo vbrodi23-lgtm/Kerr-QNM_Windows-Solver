@@ -69,6 +69,7 @@ from .campaign_failures import (
     abort_unexpected_system_failure,
     classify_validated_control_receipt,
     classify_failure,
+    require_system_failures_resolved_for_binary64_resume,
     reviewed_screening_promotion_queue,
 )
 from .contracts import canonical_json_bytes
@@ -868,6 +869,7 @@ def run_binary64_survey(
         or result["selection_id"] != selection.selection_id
     ):
         raise ValueError("binary64 survey checkpoint identity mismatch")
+    require_system_failures_resolved_for_binary64_resume(result)
     preflight_campaign_supports(plan, selection.ordered_leaf_ids)
     leaves = {leaf.leaf_id: leaf for leaf in getattr(plan, "leaves")}
     existing_records = {

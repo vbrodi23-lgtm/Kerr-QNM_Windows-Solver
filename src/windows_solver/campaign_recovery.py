@@ -27,11 +27,14 @@ from .campaign_record_intake import (
 )
 from .response_batches import CampaignLeafRecord
 from .response_engine import _validated_worker_response_receipt
-from .root_readout_cache import RootReadoutStore
+from .root_readout_cache import (
+    ROOT_READOUT_RESPONSE_CONTRACT_SHA256,
+    RootReadoutStore,
+)
 
 
 RECOVERY_RECEIPT_SCHEMA = "windows-solver.campaign-recovery/v1"
-ROOT_READOUT_RECOVERY_INDEX_SCHEMA = "windows-solver.root-readout-recovery-index/v1"
+ROOT_READOUT_RECOVERY_INDEX_SCHEMA = "windows-solver.root-readout-recovery-index/v2"
 LEGACY_COMPATIBILITY_SCHEMA = "legacy-compatibility/v1"
 SCIENTIFIC_COMPATIBILITY_SCHEMA = "scientific-compatibility/v1"
 STALE_HORIZON_REASON = HORIZON_RESPONSE_V2_SCIENTIFICALLY_STALE
@@ -884,9 +887,14 @@ def _root_readout_recovery_entry(
     if validated_receipt is None:
         raise ValueError("root-readout cache entry lacks a worker response receipt")
     request_sha256 = getattr(entry, "request_sha256", None)
+    response_contract_sha256 = getattr(
+        entry, "response_contract_sha256", None
+    )
     response = getattr(entry, "response", None)
     if (
         not _is_sha256(request_sha256)
+        or response_contract_sha256
+        != ROOT_READOUT_RESPONSE_CONTRACT_SHA256
         or not isinstance(response, Mapping)
         or validated_receipt["request_sha256"] != request_sha256
         or response.get("request_sha256") != request_sha256
@@ -900,6 +908,7 @@ def _root_readout_recovery_entry(
         "readout_identity_sha256": entry.readout_identity_sha256,
         "request_sha256": request_sha256,
         "runtime_identity_sha256": entry.runtime_identity_sha256,
+        "response_contract_sha256": response_contract_sha256,
         "worker_response_receipt_sha256": validated_receipt["receipt_sha256"],
     }
 

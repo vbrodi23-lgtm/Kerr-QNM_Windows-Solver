@@ -70,6 +70,12 @@ _LEGACY_SYSTEM_FAILURE_RESOLUTION_RECEIPT_SCHEMA = (
 SYSTEM_FAILURE_RESOLUTION_RECEIPT_SCHEMA = (
     "windows-solver.system-failure-resolution/2"
 )
+LAYER1_SYSTEM_FAILURE_RESOLUTION_RECEIPT_SCHEMA = (
+    "windows-solver.layer1-system-failure-resolution/1"
+)
+_LAYER1_SYSTEM_FAILURE_RESOLUTION_SCOPE = (
+    "RESUME_UNRETAINED_LAYER1_WORK_ONLY"
+)
 _SYSTEM_FAILURE_RESOLUTION_BASE_FIELDS = frozenset({
     "schema",
     "decision",
@@ -88,6 +94,25 @@ _SYSTEM_FAILURE_RESOLUTION_FIELDS = _SYSTEM_FAILURE_RESOLUTION_BASE_FIELDS | {
     "repair_runtime_sha256",
     "supersedes_resolution_receipt_sha256",
 }
+_LAYER1_SYSTEM_FAILURE_RESOLUTION_FIELDS = frozenset({
+    "schema",
+    "decision",
+    "resolution_scope",
+    "source_layer_state",
+    "campaign_id",
+    "selection_id",
+    "source_checkpoint_sha256",
+    "source_binary64_processed_count",
+    "authority_sha256",
+    "resolved_at_utc",
+    "system_failure_receipt_sha256",
+    "failure_fingerprint_sha256",
+    "repair_commit_sha",
+    "repair_runtime_sha256",
+    "supersedes_resolution_receipt_sha256",
+    "reason",
+    "receipt_sha256",
+})
 _GIT_COMMIT_SHA_RE = re.compile(r"[0-9a-f]{40,64}")
 
 
@@ -159,6 +184,105 @@ def _validated_system_failure_resolution(
     return receipt
 
 
+def _layer1_resolution_authority_sha256(
+    *,
+    campaign_id: str,
+    selection_id: str,
+    source_checkpoint_sha256: str,
+    source_binary64_processed_count: int,
+    system_failure_receipt_sha256: str,
+    failure_fingerprint_sha256: str,
+    repair_runtime_sha256: str,
+) -> str:
+    return _sha256({
+        "schema": "windows-solver.layer1-system-failure-repair-authority/1",
+        "campaign_id": campaign_id,
+        "selection_id": selection_id,
+        "source_checkpoint_sha256": source_checkpoint_sha256,
+        "source_binary64_processed_count": source_binary64_processed_count,
+        "system_failure_receipt_sha256": system_failure_receipt_sha256,
+        "failure_fingerprint_sha256": failure_fingerprint_sha256,
+        "repair_runtime_sha256": repair_runtime_sha256,
+    })
+
+
+def _validated_layer1_system_failure_resolution(
+    value: Mapping[str, object],
+) -> dict[str, object]:
+    """Authenticate one pre-lock Layer-1 repair authority receipt."""
+
+    if (
+        not isinstance(value, Mapping)
+        or value.get("schema")
+        != LAYER1_SYSTEM_FAILURE_RESOLUTION_RECEIPT_SCHEMA
+        or set(value) != _LAYER1_SYSTEM_FAILURE_RESOLUTION_FIELDS
+    ):
+        raise ValueError("Layer-1 system failure resolution fields are invalid")
+    receipt = copy.deepcopy(dict(value))
+    content = {key: item for key, item in receipt.items() if key != "receipt_sha256"}
+    if (
+        receipt.get("decision") != "RESOLVE_FOR_RESUME"
+        or receipt.get("resolution_scope")
+        != _LAYER1_SYSTEM_FAILURE_RESOLUTION_SCOPE
+        or receipt.get("source_layer_state") != "BINARY64_UNLOCKED"
+        or receipt.get("receipt_sha256") != _sha256(content)
+    ):
+        raise ValueError("Layer-1 system failure resolution is invalid")
+    for field in (
+        "source_checkpoint_sha256",
+        "authority_sha256",
+        "system_failure_receipt_sha256",
+        "failure_fingerprint_sha256",
+        "repair_runtime_sha256",
+        "receipt_sha256",
+    ):
+        if not _is_sha256(receipt.get(field)):
+            raise ValueError("Layer-1 system failure resolution digest is invalid")
+    if (
+        not isinstance(receipt.get("campaign_id"), str)
+        or not receipt["campaign_id"]
+        or not isinstance(receipt.get("selection_id"), str)
+        or not receipt["selection_id"]
+        or isinstance(receipt.get("source_binary64_processed_count"), bool)
+        or not isinstance(receipt.get("source_binary64_processed_count"), int)
+        or receipt["source_binary64_processed_count"] < 0
+        or not isinstance(receipt.get("resolved_at_utc"), str)
+        or not receipt["resolved_at_utc"]
+        or not isinstance(receipt.get("reason"), str)
+        or not receipt["reason"].strip()
+        or not isinstance(receipt.get("repair_commit_sha"), str)
+        or _GIT_COMMIT_SHA_RE.fullmatch(receipt["repair_commit_sha"]) is None
+    ):
+        raise ValueError("Layer-1 system failure resolution identity is invalid")
+    supersedes = receipt.get("supersedes_resolution_receipt_sha256")
+    if supersedes is not None and not _is_sha256(supersedes):
+        raise ValueError("Layer-1 system failure resolution supersession is invalid")
+    expected_authority = _layer1_resolution_authority_sha256(
+        campaign_id=str(receipt["campaign_id"]),
+        selection_id=str(receipt["selection_id"]),
+        source_checkpoint_sha256=str(receipt["source_checkpoint_sha256"]),
+        source_binary64_processed_count=int(
+            receipt["source_binary64_processed_count"]
+        ),
+        system_failure_receipt_sha256=str(
+            receipt["system_failure_receipt_sha256"]
+        ),
+        failure_fingerprint_sha256=str(receipt["failure_fingerprint_sha256"]),
+        repair_runtime_sha256=str(receipt["repair_runtime_sha256"]),
+    )
+    if receipt["authority_sha256"] != expected_authority:
+        raise ValueError("Layer-1 system failure repair authority is invalid")
+    return receipt
+
+
+def _validated_resolution_receipt(
+    value: Mapping[str, object],
+) -> dict[str, object]:
+    if value.get("schema") == LAYER1_SYSTEM_FAILURE_RESOLUTION_RECEIPT_SCHEMA:
+        return _validated_layer1_system_failure_resolution(value)
+    return _validated_system_failure_resolution(value)
+
+
 def system_failure_resolution_index(
     checkpoint: Mapping[str, object],
 ) -> dict[str, dict[str, object]]:
@@ -188,9 +312,10 @@ def system_failure_resolution_index(
         if not isinstance(candidate, Mapping) or candidate.get("schema") not in {
             _LEGACY_SYSTEM_FAILURE_RESOLUTION_RECEIPT_SCHEMA,
             SYSTEM_FAILURE_RESOLUTION_RECEIPT_SCHEMA,
+            LAYER1_SYSTEM_FAILURE_RESOLUTION_RECEIPT_SCHEMA,
         }:
             continue
-        receipt = _validated_system_failure_resolution(candidate)
+        receipt = _validated_resolution_receipt(candidate)
         target = str(receipt["system_failure_receipt_sha256"])
         failure = failures.get(target)
         if failure is None or receipt["failure_fingerprint_sha256"] != (
@@ -198,20 +323,66 @@ def system_failure_resolution_index(
         ):
             raise ValueError("system failure resolution target is invalid")
         prior = result.get(target)
+        supersedes = receipt.get("supersedes_resolution_receipt_sha256")
         if prior is not None:
-            if (
-                receipt["schema"] != SYSTEM_FAILURE_RESOLUTION_RECEIPT_SCHEMA
-                or receipt["supersedes_resolution_receipt_sha256"]
-                != prior["receipt_sha256"]
-            ):
+            if supersedes != prior["receipt_sha256"]:
                 raise ValueError("system failure has an invalid resolution chain")
-        elif (
-            receipt["schema"] == SYSTEM_FAILURE_RESOLUTION_RECEIPT_SCHEMA
-            and receipt["supersedes_resolution_receipt_sha256"] is not None
-        ):
+        elif supersedes is not None:
             raise ValueError("system failure resolution supersedes a missing receipt")
         result[target] = receipt
     return result
+
+
+def _retained_system_failure(
+    checkpoint: Mapping[str, object], system_failure_receipt_sha256: str
+) -> Mapping[str, object]:
+    for candidate in checkpoint["system_failures"]:
+        if not isinstance(candidate, Mapping):
+            continue
+        content = {
+            key: item for key, item in candidate.items() if key != "receipt_sha256"
+        }
+        if (
+            candidate.get("receipt_sha256") == system_failure_receipt_sha256
+            and _is_sha256(candidate.get("receipt_sha256"))
+            and candidate.get("receipt_sha256") == _sha256(content)
+        ):
+            return candidate
+    raise ValueError("system failure receipt is not retained by this checkpoint")
+
+
+def require_system_failures_resolved_for_binary64_resume(
+    checkpoint: Mapping[str, object],
+) -> tuple[dict[str, object], ...]:
+    """Require current repair authority before continuing an unlocked Layer 1."""
+
+    validated = validate_schema11_checkpoint(checkpoint)
+    resolutions = system_failure_resolution_index(validated)
+    from .production_wiring import promoted_runtime_identity_sha256
+
+    runtime_sha256 = promoted_runtime_identity_sha256()
+    active: list[str] = []
+    authorised: list[dict[str, object]] = []
+    for failure in validated["system_failures"]:
+        target = str(failure["receipt_sha256"])
+        receipt = resolutions.get(target)
+        if (
+            receipt is None
+            or receipt.get("schema")
+            != LAYER1_SYSTEM_FAILURE_RESOLUTION_RECEIPT_SCHEMA
+            or receipt.get("campaign_id") != validated["campaign_id"]
+            or receipt.get("selection_id") != validated["selection_id"]
+            or receipt.get("repair_runtime_sha256") != runtime_sha256
+        ):
+            active.append(target)
+        else:
+            authorised.append(receipt)
+    if active:
+        raise ValueError(
+            "binary64 resume is blocked by active SYSTEM_FAILURE receipts: "
+            + ",".join(active)
+        )
+    return tuple(authorised)
 
 
 def require_system_failures_resolved_for_promoted_resume(
@@ -242,18 +413,28 @@ def require_system_failures_resolved_for_promoted_resume(
     for failure in validated["system_failures"]:
         target = str(failure["receipt_sha256"])
         receipt = resolutions.get(target)
-        if (
-            receipt is None
-            or receipt.get("schema") != SYSTEM_FAILURE_RESOLUTION_RECEIPT_SCHEMA
-            or receipt.get("authority_sha256") != expected_authority_sha256
-            or receipt.get("calibration_receipt_sha256")
-            != calibration_receipt_sha256
-            or receipt.get("binary64_lock_receipt_sha256")
-            != binary64_lock_receipt_sha256
-            or receipt.get("repair_runtime_sha256") != runtime_sha256
-        ):
+        layer1_authorised = (
+            receipt is not None
+            and receipt.get("schema")
+            == LAYER1_SYSTEM_FAILURE_RESOLUTION_RECEIPT_SCHEMA
+            and receipt.get("campaign_id") == validated["campaign_id"]
+            and receipt.get("selection_id") == validated["selection_id"]
+            and receipt.get("repair_runtime_sha256") == runtime_sha256
+        )
+        layer2_authorised = (
+            receipt is not None
+            and receipt.get("schema") == SYSTEM_FAILURE_RESOLUTION_RECEIPT_SCHEMA
+            and receipt.get("authority_sha256") == expected_authority_sha256
+            and receipt.get("calibration_receipt_sha256")
+            == calibration_receipt_sha256
+            and receipt.get("binary64_lock_receipt_sha256")
+            == binary64_lock_receipt_sha256
+            and receipt.get("repair_runtime_sha256") == runtime_sha256
+        )
+        if not (layer1_authorised or layer2_authorised):
             active.append(target)
         else:
+            assert receipt is not None
             authorised.append(receipt)
     if active:
         raise ValueError(
@@ -300,20 +481,7 @@ def resolve_system_failure_for_resume(
     ):
         raise ValueError("system failure resolution identity is invalid")
 
-    failure: Mapping[str, object] | None = None
-    for candidate in result["system_failures"]:
-        if not isinstance(candidate, Mapping):
-            continue
-        content = {key: item for key, item in candidate.items() if key != "receipt_sha256"}
-        if (
-            candidate.get("receipt_sha256") == system_failure_receipt_sha256
-            and _is_sha256(candidate.get("receipt_sha256"))
-            and candidate.get("receipt_sha256") == _sha256(content)
-        ):
-            failure = candidate
-            break
-    if failure is None:
-        raise ValueError("system failure receipt is not retained by this checkpoint")
+    failure = _retained_system_failure(result, system_failure_receipt_sha256)
     fingerprint = failure.get("fingerprint_sha256")
     if not _is_sha256(fingerprint):
         raise ValueError("system failure fingerprint is invalid")
@@ -358,6 +526,101 @@ def resolve_system_failure_for_resume(
         "reason": reason.strip(),
     }
     receipt = {**content, "receipt_sha256": _sha256(content)}
+    result["recovery_receipts"].append(receipt)
+    return validate_schema11_checkpoint(result), receipt
+
+
+def resolve_layer1_system_failure_for_resume(
+    checkpoint: Mapping[str, object],
+    *,
+    system_failure_receipt_sha256: str,
+    repair_commit_sha: str,
+    reason: str,
+    resolved_at_utc: str | None = None,
+) -> tuple[dict[str, object], dict[str, object]]:
+    """Authorise resumption of preserved Binary64 work before a lock exists."""
+
+    result = validate_schema11_checkpoint(checkpoint)
+    if (
+        not _is_sha256(system_failure_receipt_sha256)
+        or not isinstance(repair_commit_sha, str)
+        or _GIT_COMMIT_SHA_RE.fullmatch(repair_commit_sha) is None
+        or not isinstance(reason, str)
+        or not reason.strip()
+    ):
+        raise ValueError("Layer-1 system failure resolution identity is invalid")
+    from .binary64_layer_lock import promoted_layer2_state_exists
+
+    if promoted_layer2_state_exists(result):
+        raise ValueError("Layer-1 resolution cannot authorise promoted work")
+    failure = _retained_system_failure(result, system_failure_receipt_sha256)
+    if failure.get("leaf_id") in result["survey_pass_ledger"]["binary64"]:
+        raise ValueError(
+            "Layer-1 resolution target already has a Binary64 disposition"
+        )
+    fingerprint = failure.get("fingerprint_sha256")
+    if not _is_sha256(fingerprint):
+        raise ValueError("system failure fingerprint is invalid")
+    existing = system_failure_resolution_index(result).get(
+        system_failure_receipt_sha256
+    )
+    from .production_wiring import promoted_runtime_identity_sha256
+
+    repair_runtime_sha256 = promoted_runtime_identity_sha256()
+    if existing is not None:
+        if existing.get("schema") != (
+            LAYER1_SYSTEM_FAILURE_RESOLUTION_RECEIPT_SCHEMA
+        ):
+            raise ValueError(
+                "system failure was resolved under a different lifecycle scope"
+            )
+        if (
+            existing.get("repair_commit_sha") == repair_commit_sha
+            and existing.get("repair_runtime_sha256") == repair_runtime_sha256
+            and existing.get("failure_fingerprint_sha256") == fingerprint
+            and existing.get("reason") == reason.strip()
+        ):
+            return result, existing
+
+    source_checkpoint_sha256 = _sha256(result)
+    source_binary64_processed_count = len(
+        result["survey_pass_ledger"]["binary64"]
+    )
+    authority_sha256 = _layer1_resolution_authority_sha256(
+        campaign_id=str(result["campaign_id"]),
+        selection_id=str(result["selection_id"]),
+        source_checkpoint_sha256=source_checkpoint_sha256,
+        source_binary64_processed_count=source_binary64_processed_count,
+        system_failure_receipt_sha256=system_failure_receipt_sha256,
+        failure_fingerprint_sha256=str(fingerprint),
+        repair_runtime_sha256=repair_runtime_sha256,
+    )
+    content = {
+        "schema": LAYER1_SYSTEM_FAILURE_RESOLUTION_RECEIPT_SCHEMA,
+        "decision": "RESOLVE_FOR_RESUME",
+        "resolution_scope": _LAYER1_SYSTEM_FAILURE_RESOLUTION_SCOPE,
+        "source_layer_state": "BINARY64_UNLOCKED",
+        "campaign_id": result["campaign_id"],
+        "selection_id": result["selection_id"],
+        "source_checkpoint_sha256": source_checkpoint_sha256,
+        "source_binary64_processed_count": source_binary64_processed_count,
+        "authority_sha256": authority_sha256,
+        "resolved_at_utc": (
+            datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+            if resolved_at_utc is None
+            else resolved_at_utc
+        ),
+        "system_failure_receipt_sha256": system_failure_receipt_sha256,
+        "failure_fingerprint_sha256": fingerprint,
+        "repair_commit_sha": repair_commit_sha,
+        "repair_runtime_sha256": repair_runtime_sha256,
+        "supersedes_resolution_receipt_sha256": (
+            None if existing is None else existing["receipt_sha256"]
+        ),
+        "reason": reason.strip(),
+    }
+    receipt = {**content, "receipt_sha256": _sha256(content)}
+    _validated_layer1_system_failure_resolution(receipt)
     result["recovery_receipts"].append(receipt)
     return validate_schema11_checkpoint(result), receipt
 
@@ -801,13 +1064,16 @@ __all__ = [
     "FailureDecision",
     "FailureDisposition",
     "FailureReport",
+    "LAYER1_SYSTEM_FAILURE_RESOLUTION_RECEIPT_SCHEMA",
     "SYSTEM_FAILURE_RESOLUTION_RECEIPT_SCHEMA",
     "ProductionFailureMonitor",
     "abort_unexpected_system_failure",
     "classify_failure",
     "reviewed_screening_promotion_queue",
+    "require_system_failures_resolved_for_binary64_resume",
     "require_system_failures_resolved_for_promoted_resume",
     "run_guarded_pass",
     "resolve_system_failure_for_resume",
+    "resolve_layer1_system_failure_for_resume",
     "system_failure_resolution_index",
 ]

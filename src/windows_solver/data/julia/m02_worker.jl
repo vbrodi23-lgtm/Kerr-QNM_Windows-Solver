@@ -8171,7 +8171,7 @@ function root_readout_response_fields(request, fields)
     string(required(request, "operation")) == "root-readout" ||
         error("root-readout serializer received the wrong operation")
     response = Dict{String,Any}(string(key) => value for (key, value) in fields)
-    response["schema_version"] = 11
+    response["schema_version"] = 12
     response["status"] = "ok"
     response["adapter"] = "package-owned-julia-gsn-root-readout"
     response["operation"] = "root-readout"
@@ -8282,7 +8282,7 @@ function result_fields(::Type{T}, request, digits::Int, bits::Int) where {T<:Abs
         )
         branch_valid = primary.branch_authenticated
         return root_readout_response_fields(request, [
-            "schema_version" => 11,
+            "schema_version" => 12,
             "status" => "ok",
             "adapter" => "package-owned-julia-gsn-root-readout",
             "operation" => "root-readout",
@@ -8367,7 +8367,7 @@ function result_fields(::Type{T}, request, digits::Int, bits::Int) where {T<:Abs
     )
 
     return root_readout_response_fields(request, [
-        "schema_version" => 11,
+        "schema_version" => 12,
         "status" => "ok",
         "adapter" => "package-owned-julia-gsn-root-readout",
         "operation" => "root-readout",

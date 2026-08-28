@@ -30,7 +30,7 @@ ROOT_EVIDENCE_STORE_IDENTITY = "windows-solver.root-evidence-store/v2"
 CANONICAL_BACKGROUND_STORE_IDENTITY = (
     "windows-solver.canonical-background-evidence-store/v1"
 )
-ROOT_READOUT_STORE_IDENTITY = "windows-solver.root-readout-store/v2"
+ROOT_READOUT_STORE_IDENTITY = "windows-solver.root-readout-store/v3"
 
 _HEX_64 = re.compile(r"[0-9a-f]{64}")
 _LOCK_FIELDS = frozenset({
@@ -377,7 +377,10 @@ def build_binary64_layer_auxiliary_evidence_manifest(
         CanonicalExteriorBackground,
     )
     from .root_evidence import RootDependencyKey
-    from .root_readout_cache import RootReadoutStore
+    from .root_readout_cache import (
+        ROOT_READOUT_RESPONSE_CONTRACT_SHA256,
+        RootReadoutStore,
+    )
 
     value = validate_schema11_checkpoint(checkpoint)
     leaves = {leaf.leaf_id: leaf for leaf in getattr(plan, "leaves")}
@@ -449,7 +452,7 @@ def build_binary64_layer_auxiliary_evidence_manifest(
     # that file digest is deliberately not lock material.
     for receipt in value["recovery_receipts"]:
         if not isinstance(receipt, Mapping) or receipt.get("schema") != (
-            "windows-solver.root-readout-recovery-index/v1"
+            "windows-solver.root-readout-recovery-index/v2"
         ):
             continue
         if set(receipt) != {"schema", "store_path", "entries"}:
@@ -471,6 +474,7 @@ def build_binary64_layer_auxiliary_evidence_manifest(
                 "readout_identity_sha256",
                 "request_sha256",
                 "runtime_identity_sha256",
+                "response_contract_sha256",
                 "worker_response_receipt_sha256",
             }:
                 raise ValueError("root-readout recovery reference is invalid")
@@ -485,6 +489,7 @@ def build_binary64_layer_auxiliary_evidence_manifest(
                         "readout_identity_sha256",
                         "request_sha256",
                         "runtime_identity_sha256",
+                        "response_contract_sha256",
                         "worker_response_receipt_sha256",
                     )
                 )
@@ -496,6 +501,10 @@ def build_binary64_layer_auxiliary_evidence_manifest(
                 or entry.request_sha256 != reference.get("request_sha256")
                 or entry.runtime_identity_sha256
                 != reference.get("runtime_identity_sha256")
+                or entry.response_contract_sha256
+                != ROOT_READOUT_RESPONSE_CONTRACT_SHA256
+                or reference.get("response_contract_sha256")
+                != ROOT_READOUT_RESPONSE_CONTRACT_SHA256
                 or not isinstance(entry.worker_response_receipt, Mapping)
                 or entry.worker_response_receipt.get("receipt_sha256")
                 != reference.get("worker_response_receipt_sha256")
@@ -506,7 +515,7 @@ def build_binary64_layer_auxiliary_evidence_manifest(
                     "kind": "root-readout",
                     "readout_identity_sha256": identity,
                 },
-                "object_schema": "windows-solver.root-readout-cache/2",
+                "object_schema": "windows-solver.root-readout-cache/3",
                 "object_sha256": identity,
                 "store_identity": ROOT_READOUT_STORE_IDENTITY,
             })
@@ -879,8 +888,11 @@ def build_binary64_layer_lock(
     value = validate_schema11_checkpoint(checkpoint)
     if promoted_layer2_state_exists(value):
         raise ValueError("cannot create a binary64 lock after promoted work exists")
-    if value["system_failures"]:
-        raise ValueError("cannot create a binary64 lock with system failures")
+    from .campaign_failures import (
+        require_system_failures_resolved_for_binary64_resume,
+    )
+
+    require_system_failures_resolved_for_binary64_resume(value)
     exhaustion = binary64_pass_exhaustion(value, selection)
     if not exhaustion.exhausted:
         raise ValueError(

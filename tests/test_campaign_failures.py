@@ -8,7 +8,9 @@ from windows_solver.campaign_failures import (
     FailureDisposition,
     FailureReport,
     classify_failure,
+    require_system_failures_resolved_for_binary64_resume,
     reviewed_screening_promotion_queue,
+    resolve_layer1_system_failure_for_resume,
     run_guarded_pass,
 )
 from windows_solver.campaign_policy import PromotionQueueKind, empty_schema11_checkpoint
@@ -34,6 +36,46 @@ class MethodError(RuntimeError):
 
 
 class CampaignFailureTests(unittest.TestCase):
+    def test_prelock_system_failure_can_resume_preserved_binary64_work(self) -> None:
+        checkpoint = empty_schema11_checkpoint("campaign", "selection")
+        persisted = []
+
+        with self.assertRaises(CampaignSystemFailure) as raised:
+            run_guarded_pass(
+                ("leaf-1",),
+                checkpoint=checkpoint,
+                execute_leaf=lambda _leaf_id: (_ for _ in ()).throw(
+                    MethodError("stale cache contract")
+                ),
+                commit_leaf_outcome=lambda _leaf_id, _outcome: None,
+                persist_checkpoint=lambda value: persisted.append(value),
+            )
+        failed = raised.exception.checkpoint
+        failure_sha256 = raised.exception.receipt["receipt_sha256"]
+        with self.assertRaisesRegex(ValueError, "binary64 resume is blocked"):
+            require_system_failures_resolved_for_binary64_resume(failed)
+
+        resolved, receipt = resolve_layer1_system_failure_for_resume(
+            failed,
+            system_failure_receipt_sha256=failure_sha256,
+            repair_commit_sha="d" * 40,
+            reason="version the successful root-readout cache contract",
+            resolved_at_utc="2026-08-29T00:00:00Z",
+        )
+
+        self.assertEqual(
+            receipt["resolution_scope"],
+            "RESUME_UNRETAINED_LAYER1_WORK_ONLY",
+        )
+        self.assertIsNone(
+            resolved["survey_pass_ledger"]["binary64"].get("leaf-1")
+        )
+        self.assertEqual(resolved["system_failures"], failed["system_failures"])
+        self.assertEqual(
+            require_system_failures_resolved_for_binary64_resume(resolved),
+            (receipt,),
+        )
+
     def test_reviewed_screening_reasons_are_closed_and_bind_queue_kind(self) -> None:
         expected = {
             "INSUFFICIENT_ASYMPTOTIC_PRECISION": "RESPONSE",

@@ -61,7 +61,6 @@ from .response_engine import (
     FixedRootDeterminantSample,
     DiagnosticRootReadout,
     HISTORICAL_WORKER_RESPONSE_RECEIPT_SCHEMA,
-    LEGACY_PROMOTED_WORKER_RESPONSE_WIRE_SCHEMA,
     NumericalConditioningEvidence,
     NUMERICAL_CONDITIONING_SCHEMA,
     ResponseComponentJob,
@@ -3144,7 +3143,9 @@ class JuliaResponseAdapter:
         )
 
     def _reuse_readout(
-        self, request_sha256: str
+        self,
+        request: Mapping[str, object],
+        request_sha256: str,
     ) -> tuple[dict[str, object], dict[str, object] | None] | None:
         """Return an already-computed readout for this exact request, if any."""
 
@@ -3177,19 +3178,68 @@ class JuliaResponseAdapter:
                 "trusted root-readout entry is corrupt: "
                 f"{lookup.path}: {lookup.reason}"
             )
+        if lookup.status is RootReadoutLookupStatus.INCOMPATIBLE:
+            # Compatibility changes are ordinary cache misses.  The old bytes
+            # remain forensic and are never interpreted or upgraded.
+            emit_progress(
+                ProgressEventKind.ROOT_READOUT_CACHE_STALE,
+                request_sha256=request_sha256,
+                store_path=str(lookup.path),
+                message=lookup.reason,
+            )
+            return None
         if lookup.status is not RootReadoutLookupStatus.HIT:
             return None
+        response = dict(lookup.response or {})
+        receipt = lookup.worker_response_receipt
+        if request.get("operation") == "root-readout":
+            try:
+                returned_identity = operation_execution_identity(
+                    response.get("execution_identity")
+                )
+                expected_identity = execution_identity_from_request(
+                    request,
+                    request_sha256=request_sha256,
+                )
+            except (TypeError, ValueError):
+                returned_identity = None
+                expected_identity = None
+            incompatible = (
+                response.get("schema_version") != WORKER_RESPONSE_WIRE_SCHEMA
+                or response.get("operation") != "root-readout"
+                or response.get("request_sha256") != request_sha256
+                or returned_identity is None
+                or expected_identity is None
+                or returned_identity.to_mapping()
+                != expected_identity.to_mapping()
+                or not isinstance(receipt, Mapping)
+                or receipt.get("schema") != WORKER_RESPONSE_RECEIPT_SCHEMA
+                or receipt.get("request_sha256") != request_sha256
+                or receipt.get("worker_response_schema_version")
+                != WORKER_RESPONSE_WIRE_SCHEMA
+            )
+            if incompatible:
+                emit_progress(
+                    ProgressEventKind.ROOT_READOUT_CACHE_STALE,
+                    request_sha256=request_sha256,
+                    store_path=str(lookup.path),
+                    message=(
+                        "cached root-readout response predates the current "
+                        "response/execution-identity contract"
+                    ),
+                )
+                return None
         emit_progress(
             ProgressEventKind.ROOT_READOUT_REUSED,
             request_sha256=request_sha256,
             store_path=str(lookup.path),
         )
         return (
-            dict(lookup.response or {}),
+            response,
             (
                 None
-                if lookup.worker_response_receipt is None
-                else dict(lookup.worker_response_receipt)
+                if receipt is None
+                else dict(receipt)
             ),
         )
 
@@ -3434,7 +3484,7 @@ class JuliaResponseAdapter:
             request_sha256 = prepared_request.request_sha256
         execution_resource = request_document["execution_resource"]
         runtime_identity = runtime_identity_sha256(self.runtime_provenance)
-        reused = self._reuse_readout(request_sha256)
+        reused = self._reuse_readout(request_document, request_sha256)
         if reused is not None:
             response, receipt = reused
             return JuliaResponseEvaluation(
@@ -4851,16 +4901,7 @@ class JuliaPrecisionRootBackend:
             == PROMOTED_ROOT_READOUT_POLICY
         )
         if current_request and response_schema == WORKER_RESPONSE_WIRE_SCHEMA:
-            return self._read_root_response_v7(
-                job, request, evaluation, legacy_wire=False
-            )
-        if (
-            current_request
-            and response_schema == LEGACY_PROMOTED_WORKER_RESPONSE_WIRE_SCHEMA
-        ):
-            return self._read_root_response_v7(
-                job, request, evaluation, legacy_wire=True
-            )
+            return self._read_root_response_v7(job, request, evaluation)
         if response_schema == 6 and not current_request:
             return self._read_root_response_v6(job, request, evaluation)
         raise JuliaResponseBackendError(
@@ -4872,8 +4913,6 @@ class JuliaPrecisionRootBackend:
         job: ResponseComponentJob,
         request: Mapping[str, object],
         evaluation: JuliaResponseEvaluation,
-        *,
-        legacy_wire: bool = False,
     ) -> RootReadout:
         response = dict(evaluation.response)
         expected_fields = {
@@ -4907,14 +4946,13 @@ class JuliaPrecisionRootBackend:
             "numerical_conditioning",
             "horizon_endpoint_search_evidence",
         }
-        if not legacy_wire:
-            expected_fields.update({
-                "operation",
-                "execution_identity",
-                "diagnostic_model_identity",
-                "required_raw_determinant_roles",
-                "required_raw_determinant_count",
-            })
+        expected_fields.update({
+            "operation",
+            "execution_identity",
+            "diagnostic_model_identity",
+            "required_raw_determinant_roles",
+            "required_raw_determinant_count",
+        })
         if set(response) != expected_fields:
             raise JuliaResponseBackendError("M02 Julia response fields are invalid")
         if (
@@ -4928,18 +4966,10 @@ class JuliaPrecisionRootBackend:
                     "seed_path_determinant_count",
                 )
             )
-            or response["schema_version"]
-            != (
-                LEGACY_PROMOTED_WORKER_RESPONSE_WIRE_SCHEMA
-                if legacy_wire
-                else WORKER_RESPONSE_WIRE_SCHEMA
-            )
+            or response["schema_version"] != WORKER_RESPONSE_WIRE_SCHEMA
             or response["status"] != "ok"
             or response["adapter"] != "package-owned-julia-gsn-root-readout"
-            or (
-                not legacy_wire
-                and response["operation"] != "root-readout"
-            )
+            or response["operation"] != "root-readout"
             or response["request_sha256"] != evaluation.request_sha256
             or response["precision_digits"] != self.digits
             or response["working_precision_bits"]
@@ -4955,23 +4985,22 @@ class JuliaPrecisionRootBackend:
             or response["seed_path_radius_abs"] is not None
         ):
             raise JuliaResponseBackendError("M02 Julia response contract is invalid")
-        if not legacy_wire:
-            try:
-                returned_identity = operation_execution_identity(
-                    response["execution_identity"]
-                )
-                expected_identity = execution_identity_from_request(
-                    evaluation.request_binding,
-                    request_sha256=evaluation.request_sha256,
-                )
-            except ValueError as error:
-                raise JuliaResponseBackendError(
-                    "M02 root-readout execution identity is invalid"
-                ) from error
-            if returned_identity.to_mapping() != expected_identity.to_mapping():
-                raise JuliaResponseBackendError(
-                    "M02 root-readout execution identity mismatch"
-                )
+        try:
+            returned_identity = operation_execution_identity(
+                response["execution_identity"]
+            )
+            expected_identity = execution_identity_from_request(
+                evaluation.request_binding,
+                request_sha256=evaluation.request_sha256,
+            )
+        except ValueError as error:
+            raise JuliaResponseBackendError(
+                "M02 root-readout execution identity is invalid"
+            ) from error
+        if returned_identity.to_mapping() != expected_identity.to_mapping():
+            raise JuliaResponseBackendError(
+                "M02 root-readout execution identity mismatch"
+            )
 
         policy = request.get("policy")
         if not isinstance(policy, Mapping):
@@ -4989,36 +5018,30 @@ class JuliaPrecisionRootBackend:
                 "M02 Julia promoted root policy identity is invalid"
             )
 
-        diagnostic_contract: RawDeterminantContract | None = None
-        if not legacy_wire:
-            try:
-                diagnostic_contract = raw_determinant_contract_from_request(
-                    request
-                )
-            except ValueError as error:
-                raise JuliaResponseBackendError(
-                    "M02 Julia request raw determinant contract is invalid"
-                ) from error
-            try:
-                _validate_current_raw_determinant_policy(
-                    request, diagnostic_contract
-                )
-            except ValueError as error:
-                raise JuliaResponseBackendError(
-                    "M02 Julia determinant certificate policy is invalid"
-                ) from error
-            if (
-                response["diagnostic_model_identity"]
-                != diagnostic_contract.diagnostic_model_identity
-                or response["required_raw_determinant_roles"]
-                != list(diagnostic_contract.required_raw_determinant_roles)
-                or type(response["required_raw_determinant_count"]) is not int
-                or response["required_raw_determinant_count"]
-                != diagnostic_contract.required_raw_determinant_count
-            ):
-                raise JuliaResponseBackendError(
-                    "M02 Julia response raw determinant contract is invalid"
-                )
+        try:
+            diagnostic_contract = raw_determinant_contract_from_request(request)
+        except ValueError as error:
+            raise JuliaResponseBackendError(
+                "M02 Julia request raw determinant contract is invalid"
+            ) from error
+        try:
+            _validate_current_raw_determinant_policy(request, diagnostic_contract)
+        except ValueError as error:
+            raise JuliaResponseBackendError(
+                "M02 Julia determinant certificate policy is invalid"
+            ) from error
+        if (
+            response["diagnostic_model_identity"]
+            != diagnostic_contract.diagnostic_model_identity
+            or response["required_raw_determinant_roles"]
+            != list(diagnostic_contract.required_raw_determinant_roles)
+            or type(response["required_raw_determinant_count"]) is not int
+            or response["required_raw_determinant_count"]
+            != diagnostic_contract.required_raw_determinant_count
+        ):
+            raise JuliaResponseBackendError(
+                "M02 Julia response raw determinant contract is invalid"
+            )
 
         try:
             numerical_conditioning = NumericalConditioningEvidence.from_mapping(
@@ -5091,33 +5114,10 @@ class JuliaPrecisionRootBackend:
             raise JuliaResponseBackendError(
                 "M02 Julia PRIMARY acceptance evidence is invalid"
             ) from error
-        if legacy_wire:
-            legacy_model = policy.get("determinant_error_model")
-            if legacy_model == _EXTERIOR_ADDITIVE_CHANNEL_SCHEMA:
-                raise JuliaResponseBackendError(
-                    "M02 Julia wire-10 cannot carry a provisional exterior contract"
-                )
-            uncalibrated_exterior = False
-            expected_error_model_id = (
-                VERIFIED_ENDPOINT_ERROR_MODEL
-                if legacy_model == VERIFIED_ENDPOINT_ERROR_MODEL
-                else EXTERIOR_DETERMINANT_ABSOLUTE_ERROR_CERTIFICATE
-            )
-        else:
-            assert diagnostic_contract is not None
-            uncalibrated_exterior = not diagnostic_contract.empirical_certificate_required
-            expected_error_model_id = (
-                diagnostic_contract.permitted_response_receipt_identity
-            )
-        if (
-            legacy_wire
-            and job.mechanism_id == "horizon-admittance"
-            and policy.get("determinant_error_model")
-            != VERIFIED_ENDPOINT_ERROR_MODEL
-        ):
-            raise JuliaResponseBackendError(
-                "M02 Julia determinant certificate policy is invalid"
-            )
+        uncalibrated_exterior = not diagnostic_contract.empirical_certificate_required
+        expected_error_model_id = (
+            diagnostic_contract.permitted_response_receipt_identity
+        )
         if primary_acceptance.error_model_id != expected_error_model_id:
             raise JuliaResponseBackendError(
                 "M02 Julia PRIMARY determinant telemetry identity is invalid"
@@ -5266,25 +5266,9 @@ class JuliaPrecisionRootBackend:
             "raw_determinant_evaluation_count",
             "root_converged",
         }
-        if legacy_wire:
-            legacy_model = policy.get("determinant_error_model")
-            if legacy_model == VERIFIED_ENDPOINT_ERROR_MODEL:
-                expected_raw_determinant_count = 1
-            elif legacy_model == EXTERIOR_DETERMINANT_ABSOLUTE_ERROR_CERTIFICATE:
-                expected_raw_determinant_count = 3
-            elif legacy_model == _EXTERIOR_ADDITIVE_CHANNEL_SCHEMA:
-                raise JuliaResponseBackendError(
-                    "M02 Julia wire-10 cannot carry a provisional exterior contract"
-                )
-            else:
-                raise JuliaResponseBackendError(
-                    "M02 Julia legacy raw determinant model is invalid"
-                )
-        else:
-            assert diagnostic_contract is not None
-            expected_raw_determinant_count = (
-                diagnostic_contract.required_raw_determinant_count
-            )
+        expected_raw_determinant_count = (
+            diagnostic_contract.required_raw_determinant_count
+        )
         expected_families = {"truncation", "resolution"}
         if (
             not isinstance(raw_diagnostics, Mapping)

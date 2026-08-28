@@ -9,6 +9,7 @@ from windows_solver.contracts import canonical_json_bytes
 from windows_solver.adaptive_controls import ODEToleranceCalibration, derive_ode_error_budget
 from windows_solver.precision_tiers import PrecisionTier
 from windows_solver.operation_control import execution_identity_from_request
+from windows_solver.response_engine import WORKER_RESPONSE_WIRE_SCHEMA
 
 
 SYNTHETIC_ODE_CALIBRATION = ODEToleranceCalibration(
@@ -1267,7 +1268,7 @@ def valid_julia_root_response(
             request_sha256=request_sha256,
         ).to_mapping()
     return {
-        "schema_version": 11,
+        "schema_version": WORKER_RESPONSE_WIRE_SCHEMA,
         "status": "ok",
         "adapter": "package-owned-julia-gsn-root-readout",
         "operation": "root-readout",

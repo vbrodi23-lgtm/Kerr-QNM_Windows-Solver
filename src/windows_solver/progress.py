@@ -132,6 +132,7 @@ class ProgressEventKind(StrEnum):
     ROOT_READOUT_RESOURCE_INFEASIBLE = "root_readout_resource_infeasible"
     ROOT_READOUT_REUSED = "root_readout_reused"
     ROOT_READOUT_RETAINED = "root_readout_retained"
+    ROOT_READOUT_CACHE_STALE = "root_readout_cache_stale"
     ROOT_READOUT_CACHE_CORRUPT = "root_readout_cache_corrupt"
     REQUEST_STARTED = "request_started"
     REQUEST_VALIDATED = "request_validated"
