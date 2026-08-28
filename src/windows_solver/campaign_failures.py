@@ -13,6 +13,11 @@ from typing import Callable, Mapping, Sequence
 
 from .campaign_policy import validate_schema11_checkpoint
 from .contracts import canonical_json_bytes
+from .operation_control import (
+    ValidatedControlReceipt,
+    promotion_failure_codes,
+    promoted_control_transition,
+)
 from .progress import ProgressEventKind, emit_progress, progress_scope
 from .structural_diagnostics import StructuralDiagnosticSession
 
@@ -25,18 +30,7 @@ class FailureDisposition(str, Enum):
     SYSTEM_FAILURE = "SYSTEM_FAILURE"
 
 
-PROMOTION_ALLOWLIST = MappingProxyType(
-    {
-        "INSUFFICIENT_ASYMPTOTIC_PRECISION": "RESPONSE",
-        "HORIZON_ARITHMETIC_INADEQUATE": "RESPONSE",
-        "ROOT_UNCERTAINTY_EVIDENCE_UNAVAILABLE": "ROOT",
-        "FINITE_DIFFERENCE_NOISE_LIMIT": "RESPONSE",
-        "DETERMINANT_ERROR_EVIDENCE_UNAVAILABLE": "RESPONSE",
-        "BLOCKED_BY_REVIEWED_ERROR_EVIDENCE": "RESPONSE",
-        "DETERMINANT_UNCERTAINTY_TOO_LARGE": "ROOT",
-        "ROOT_SEAL_UNAVAILABLE": "ROOT",
-    }
-)
+PROMOTION_ALLOWLIST = MappingProxyType(dict(promotion_failure_codes()))
 
 _LEAF_LOCAL_DISPOSITIONS = {
     "ODE_RESOURCE_LIMIT": FailureDisposition.DEFERRED,
@@ -378,6 +372,10 @@ class FailureReport:
     precision_tier: str
     cause_type: str
     diagnostics: Mapping[str, object]
+    request_sha256: str | None = None
+    control_receipt_sha256: str | None = None
+    execution_identity_sha256: str | None = None
+    effective_policy_identity: str | None = None
 
     def __post_init__(self) -> None:
         identity_fields = (
@@ -395,11 +393,20 @@ class FailureReport:
             raise ValueError("failure report identity fields are invalid")
         if not isinstance(self.diagnostics, Mapping):
             raise ValueError("failure diagnostics must be an object")
+        for name in (
+            "request_sha256",
+            "control_receipt_sha256",
+            "execution_identity_sha256",
+            "effective_policy_identity",
+        ):
+            value = getattr(self, name)
+            if value is not None and not _is_sha256(value):
+                raise ValueError(f"failure report {name} is invalid")
         object.__setattr__(self, "diagnostics", copy.deepcopy(dict(self.diagnostics)))
 
     @property
     def fingerprint_material(self) -> dict[str, object]:
-        return {
+        material: dict[str, object] = {
             "failure_code": self.failure_code,
             "failure_class": self.failure_class,
             "stage": self.stage,
@@ -410,6 +417,16 @@ class FailureReport:
             "precision_tier": self.precision_tier,
             "cause_type": self.cause_type,
         }
+        for name in (
+            "request_sha256",
+            "control_receipt_sha256",
+            "execution_identity_sha256",
+            "effective_policy_identity",
+        ):
+            value = getattr(self, name)
+            if value is not None:
+                material[name] = value
+        return material
 
     @property
     def fingerprint_sha256(self) -> str:
@@ -422,6 +439,9 @@ class FailureDecision:
     failure_code: str
     fingerprint_sha256: str
     queue_kind: str | None = None
+    next_precision_tier: str | None = None
+    next_action_kind: str | None = None
+    control_receipt_sha256: str | None = None
 
 
 class CampaignSystemFailure(RuntimeError):
@@ -458,6 +478,53 @@ def classify_failure(report: FailureReport) -> FailureDecision:
         failure_code=report.failure_code,
         fingerprint_sha256=report.fingerprint_sha256,
         queue_kind=queue_kind,
+    )
+
+
+def classify_validated_control_receipt(
+    receipt: ValidatedControlReceipt,
+    *,
+    current_tier: str,
+    current_action_kind: str,
+    cause_type: str,
+) -> tuple[FailureReport, FailureDecision]:
+    """Classify an authenticated promoted outcome by exact registry lookup."""
+
+    transition = promoted_control_transition(
+        receipt,
+        current_tier=current_tier,
+        current_action_kind=current_action_kind,
+    )
+    identity = receipt.identity
+    effective_policy = identity.mapping["effective_policy_identity"]
+    if isinstance(effective_policy, Mapping):
+        effective_policy_sha256 = str(effective_policy["sha256"])
+    else:
+        effective_policy_sha256 = str(effective_policy)
+    report = FailureReport(
+        failure_code=receipt.failure_code,
+        failure_class="CONTROL",
+        stage=receipt.stage,
+        worker_operation=identity.operation,
+        request_schema=str(identity.mapping["request_schema"]),
+        backend_identity=str(identity.mapping["backend_identity_sha256"]),
+        policy_identity=effective_policy_sha256,
+        precision_tier=current_tier,
+        cause_type=cause_type,
+        diagnostics=copy.deepcopy(dict(receipt.mapping["diagnostics"])),
+        request_sha256=identity.request_sha256,
+        control_receipt_sha256=receipt.sha256,
+        execution_identity_sha256=identity.sha256,
+        effective_policy_identity=effective_policy_sha256,
+    )
+    return report, FailureDecision(
+        disposition=FailureDisposition(transition.disposition),
+        failure_code=receipt.failure_code,
+        fingerprint_sha256=report.fingerprint_sha256,
+        queue_kind=transition.queue_kind,
+        next_precision_tier=transition.next_tier,
+        next_action_kind=transition.next_action_kind,
+        control_receipt_sha256=receipt.sha256,
     )
 
 

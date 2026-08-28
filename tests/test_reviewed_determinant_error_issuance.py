@@ -8,9 +8,14 @@ import unittest
 from pathlib import Path
 
 from windows_solver.julia_response_backend import (
+    FixedRootSurveyPlan,
     FixedRootSurveyConditioning,
     JuliaFixedRootSurveyBatch,
     JuliaFixedRootSurveySample,
+)
+from windows_solver.operation_control import (
+    OPERATION_EXECUTION_IDENTITY_SCHEMA,
+    OperationExecutionIdentity,
 )
 from windows_solver.precision_tiers import PrecisionTier
 from windows_solver.response_batches import PrecisionCapabilities, build_campaign_plan
@@ -43,7 +48,7 @@ def _job():
 
 def _conditioning() -> FixedRootSurveyConditioning:
     return FixedRootSurveyConditioning({
-        "schema": "windows-solver.fixed-root-survey-conditioning/1",
+        "schema": "windows-solver.fixed-root-survey-conditioning/2",
         "determinant_family": "exterior-wronskian/v1",
         "homogeneous_representation": "factored-plane-wave-gsn/v1",
         "branch_convention": "gsn-complex-rho/v1",
@@ -72,17 +77,41 @@ def _batch(job) -> JuliaFixedRootSurveyBatch:
         (root, epsilon), (root, -epsilon),
         (root, epsilon / 2.0), (root, -epsilon / 2.0),
     )
+    request_sha256 = "2" * 64
+    identity = OperationExecutionIdentity({
+        "schema": OPERATION_EXECUTION_IDENTITY_SCHEMA,
+        "scope": "REQUEST",
+        "operation": "fixed-root-survey-batch",
+        "request_schema": "windows-solver.fixed-root-survey-batch/2",
+        "request_sha256": request_sha256,
+        "leaf_id": job.leaf_id,
+        "job_id": job.job_id,
+        "backend_identity_sha256": job.backend_identity.identity_sha256,
+        "precision_digits": 40,
+        "working_precision_bits": 160,
+        "semantic_precision_tier": "bigfloat-40",
+        "effective_policy_identity": job.policy.identity_sha256,
+        "execution_resource_policy_identity": {"sha256": "3" * 64},
+        "plan": FixedRootSurveyPlan.FULL_NINE.value,
+        "scientific_operation_identity": "exterior-fixed-root-survey-raw/v1",
+        "root_reference_id": job.root.root_reference_id,
+        "root_seal_sha256": "1" * 64,
+        "branch_identity": job.root.branch_id,
+        "sample_roles": list(BINARY64_FIXED_ROOT_SAMPLE_ROLES),
+    })
     samples = tuple(
         JuliaFixedRootSurveySample(
+            index,
             role,
             complex(omega),
             complex(amplitude),
             DecimalComplex(Decimal(str(3.0 * (omega.real - root.real))), Decimal(0)),
             _conditioning(),
+            identity.select_sample(index, role).to_mapping(),
         )
-        for role, (omega, amplitude) in zip(
+        for index, (role, (omega, amplitude)) in enumerate(zip(
             BINARY64_FIXED_ROOT_SAMPLE_ROLES, points
-        )
+        ))
     )
     return JuliaFixedRootSurveyBatch(
         leaf_id=job.leaf_id,
@@ -95,7 +124,9 @@ def _batch(job) -> JuliaFixedRootSurveyBatch:
         frequency_step=Decimal(str(h)),
         coordinate_step=Decimal(str(epsilon)),
         scientific_operation_identity="exterior-fixed-root-survey-raw/v1",
-        request_sha256="2" * 64,
+        plan=FixedRootSurveyPlan.FULL_NINE,
+        execution_identity=identity.to_mapping(),
+        request_sha256=request_sha256,
         precision_tier=PrecisionTier.BIGFLOAT_40,
         working_precision_bits=160,
         samples=samples,

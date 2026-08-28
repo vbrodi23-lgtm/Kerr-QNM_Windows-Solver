@@ -47,6 +47,7 @@ from .campaign_failures import (
     PROMOTION_ALLOWLIST,
     ProductionFailureMonitor,
     abort_unexpected_system_failure,
+    classify_validated_control_receipt,
     classify_failure,
 )
 from .contracts import canonical_json_bytes
@@ -105,9 +106,12 @@ from .julia_response_backend import (
     JuliaODEResourceLimitError,
     JuliaResponseBackendError,
     JuliaRootReadoutResourceLimitError,
+    JuliaWorkerTimeoutError,
     consume_authenticated_binary64_provisional_predecessor,
     fixed_root_survey_request_contract,
+    validate_persisted_operation_control_receipt,
 )
+from .operation_control import ValidatedControlReceipt
 from .promoted_artifacts import (
     PROMOTED_CANONICAL_BACKGROUND_RECEIPT_SCHEMA,
     PROMOTED_EXTERIOR_CALCULATION_SCHEMA,
@@ -1639,44 +1643,47 @@ def _screening_receipt(screening: object) -> dict[str, object]:
     }
 
 
-def _promoted_control_decision(
+def _promoted_control_receipt(
     error: Exception,
     *,
     leaf: object,
     digits: int,
-) -> object | None:
-    if isinstance(error, JuliaNumericalControlError):
-        code = error.failure_code
-    elif isinstance(error, JuliaODEResourceLimitError):
-        code = "ODE_RESOURCE_LIMIT"
-    elif isinstance(error, JuliaRootReadoutResourceLimitError):
-        code = "ROOT_READOUT_RESOURCE_INFEASIBLE"
-    else:
+    current_action_kind: str,
+) -> ValidatedControlReceipt | None:
+    if not isinstance(
+        error,
+        (
+            JuliaNumericalControlError,
+            JuliaODEResourceLimitError,
+            JuliaRootReadoutResourceLimitError,
+            JuliaWorkerTimeoutError,
+        ),
+    ):
         return None
-    worker = getattr(error, "worker_failure", {})
-    structured = worker.get("failure", {}) if isinstance(worker, Mapping) else {}
-    stage = (
-        structured.get("stage", "fixed-root-response")
-        if isinstance(structured, Mapping)
-        else "fixed-root-response"
+    receipt = getattr(error, "control_receipt", None)
+    if not isinstance(receipt, ValidatedControlReceipt):
+        raise JuliaResponseBackendError(
+            "promoted CONTROL exception lacks a validated receipt"
+        )
+    identity = receipt.identity.mapping
+    expected_operation = (
+        "root-readout" if current_action_kind == "ROOT"
+        else "fixed-root-survey-batch"
     )
-    report = FailureReport(
-        failure_code=code,
-        failure_class="NUMERICAL_CONTROL",
-        stage=str(stage),
-        worker_operation="fixed-root-survey-batch",
-        request_schema="windows-solver.fixed-root-survey-batch/1",
-        backend_identity=str(leaf.job.backend_identity.identity_sha256),
-        policy_identity=str(leaf.job.policy.identity_sha256),
-        precision_tier=f"BF{digits}",
-        cause_type=type(error).__name__,
-        diagnostics={
-            "schema": "windows-solver.promoted-control-failure/1",
-            "complete": True,
-            "worker_failure": dict(worker) if isinstance(worker, Mapping) else {},
-        },
-    )
-    return classify_failure(report)
+    if (
+        identity.get("operation") != expected_operation
+        or identity.get("leaf_id") != leaf.job.leaf_id
+        or identity.get("job_id") != leaf.job.job_id
+        or identity.get("backend_identity_sha256")
+        != leaf.job.backend_identity.identity_sha256
+        or identity.get("precision_digits") != digits
+        or identity.get("semantic_precision_tier") != f"bigfloat-{digits}"
+        or receipt.canonical_request is None
+    ):
+        raise JuliaResponseBackendError(
+            "promoted CONTROL receipt does not match the active operation"
+        )
+    return receipt
 
 
 def _terminal_promoted_outcome(
@@ -1717,7 +1724,9 @@ _PROMOTED_COMPONENT_SAMPLE_ROLES = BINARY64_FIXED_ROOT_SAMPLE_ROLES[5:]
 
 def _promoted_sample_from_mapping(value: object) -> JuliaFixedRootSurveySample:
     if not isinstance(value, Mapping) or set(value) != {
-        "role",
+        "sample_index",
+        "sample_role",
+        "execution_identity",
         "omega",
         "amplitude",
         "determinant",
@@ -1752,13 +1761,15 @@ def _promoted_sample_from_mapping(value: object) -> JuliaFixedRootSurveySample:
         raise ValueError("retained promoted determinant is invalid") from error
     raw_error = value["determinant_error_evidence"]
     return JuliaFixedRootSurveySample(
-        role=str(value["role"]),
+        sample_index=int(value["sample_index"]),
+        sample_role=str(value["sample_role"]),
         omega=parse_complex(value["omega"], "sample frequency"),
         amplitude=parse_complex(value["amplitude"], "sample amplitude"),
         determinant=decimal_determinant,
         numerical_conditioning=FixedRootSurveyConditioning(
             value["numerical_conditioning"]
         ),
+        execution_identity=value["execution_identity"],
         determinant_error_evidence=(
             None
             if raw_error is None
@@ -1776,6 +1787,8 @@ def promoted_fixed_root_batch_from_mapping(
         "schema",
         "operation",
         "identity",
+        "plan",
+        "execution_identity",
         "scientific_operation_identity",
         "leaf_id",
         "job_id",
@@ -1882,6 +1895,8 @@ def promoted_fixed_root_batch_from_mapping(
         frequency_step=frequency_step,
         coordinate_step=coordinate_step,
         scientific_operation_identity=str(value["scientific_operation_identity"]),
+        plan=FixedRootSurveyPlan(str(value["plan"])),
+        execution_identity=value["execution_identity"],
         request_sha256=str(value["request_sha256"]),
         precision_tier=precision_tier,
         working_precision_bits=integer("working_precision_bits", minimum=2),
@@ -2094,6 +2109,157 @@ def _raw_stage_chain(
     )
 
 
+def _promoted_artifact_digest(
+    artifact: Mapping[str, object],
+) -> tuple[str, str]:
+    """Return the schema-owned digest field and authenticated digest."""
+
+    schema = artifact.get("schema")
+    digest_field = {
+        "windows-solver.promoted-exterior-control-return/2": (
+            "control_return_sha256"
+        ),
+        "windows-solver.promoted-exterior-control-decision/1": (
+            "control_decision_sha256"
+        ),
+    }.get(schema, "calculation_sha256")
+    supplied = artifact.get(digest_field)
+    content = {key: item for key, item in artifact.items() if key != digest_field}
+    if (
+        not isinstance(supplied, str)
+        or supplied != hashlib.sha256(canonical_json_bytes(content)).hexdigest()
+    ):
+        raise ValueError("retained promoted artifact digest is invalid")
+    return digest_field, supplied
+
+
+def _revalidate_promoted_control_proof(
+    control_return: Mapping[str, object],
+    control_decision: Mapping[str, object],
+) -> None:
+    """Re-hash, re-bind, and reclassify a retained continuation proof."""
+
+    if (
+        control_return.get("schema")
+        != "windows-solver.promoted-exterior-control-return/2"
+        or control_decision.get("schema")
+        != "windows-solver.promoted-exterior-control-decision/1"
+        or not isinstance(control_return.get("control_receipt"), Mapping)
+        or not isinstance(control_return.get("canonical_request"), Mapping)
+    ):
+        raise ValueError("promoted control proof schemas are invalid")
+    _, return_sha256 = _promoted_artifact_digest(control_return)
+    _, decision_sha256 = _promoted_artifact_digest(control_decision)
+    del decision_sha256
+    receipt = validate_persisted_operation_control_receipt(
+        control_return["control_receipt"],
+        control_return["canonical_request"],
+    )
+    report, decision = classify_validated_control_receipt(
+        receipt,
+        current_tier=str(control_return.get("current_tier")),
+        current_action_kind=str(control_return.get("current_action_kind")),
+        cause_type=(
+            "JuliaWorkerTimeoutError"
+            if receipt.failure_code == "WORKER_TIMEOUT"
+            else "JuliaNumericalControlError"
+        ),
+    )
+    expected = {
+        "control_return_sha256": return_sha256,
+        "control_receipt_sha256": receipt.sha256,
+        "failure_code": decision.failure_code,
+        "failure_fingerprint_sha256": decision.fingerprint_sha256,
+        "fingerprint_material": report.fingerprint_material,
+        "disposition": decision.disposition.value,
+        "queue_kind": decision.queue_kind,
+        "current_tier": control_return.get("current_tier"),
+        "current_action_kind": control_return.get("current_action_kind"),
+        "next_tier": decision.next_precision_tier,
+        "next_action_kind": decision.next_action_kind,
+    }
+    if any(control_decision.get(name) != value for name, value in expected.items()):
+        raise ValueError("promoted control decision no longer matches registry")
+
+
+def _control_decision_authorizes_bf80(
+    outcome: PromotedPassOutcome,
+    *,
+    action_kind: str | None = None,
+) -> bool:
+    decision = outcome.calculation_artifact
+    if not isinstance(decision, Mapping):
+        return False
+    return (
+        decision.get("schema")
+        == "windows-solver.promoted-exterior-control-decision/1"
+        and decision.get("disposition")
+        == FailureDisposition.PROMOTION_PENDING.value
+        and decision.get("queue_kind") == decision.get("current_action_kind")
+        and decision.get("next_action_kind") == decision.get("current_action_kind")
+        and decision.get("next_tier") == "BF80"
+        and (action_kind is None or decision.get("current_action_kind") == action_kind)
+    )
+
+
+def _outcome_authorizes_bf80(outcome: PromotedPassOutcome) -> bool:
+    artifact = outcome.calculation_artifact
+    if isinstance(artifact, Mapping) and artifact.get("schema") == (
+        "windows-solver.promoted-exterior-control-decision/1"
+    ):
+        return _control_decision_authorizes_bf80(outcome)
+    return outcome.reason_code in PROMOTION_ALLOWLIST
+
+
+def _control_trace_fields(outcome: PromotedPassOutcome) -> dict[str, object]:
+    decision = outcome.calculation_artifact
+    if not isinstance(decision, Mapping) or decision.get("schema") != (
+        "windows-solver.promoted-exterior-control-decision/1"
+    ):
+        return {}
+    raw: Mapping[str, object] | None = None
+    for stage in reversed(outcome.calculation_chain):
+        candidate = stage.get("calculation_artifact")
+        if isinstance(candidate, Mapping) and candidate.get("schema") == (
+            "windows-solver.promoted-exterior-control-return/2"
+        ):
+            raw = candidate
+            break
+    receipt = raw.get("control_receipt") if isinstance(raw, Mapping) else None
+    identity = (
+        receipt.get("execution_identity")
+        if isinstance(receipt, Mapping)
+        else None
+    )
+    return {
+        "operation": (
+            raw.get("operation")
+            if isinstance(raw, Mapping)
+            else decision.get("fingerprint_material", {}).get("worker_operation")
+        ),
+        "execution_identity_sha256": (
+            raw.get("execution_identity_sha256") if isinstance(raw, Mapping) else None
+        ),
+        "request_sha256": (
+            raw.get("request_sha256") if isinstance(raw, Mapping) else None
+        ),
+        "plan": identity.get("plan") if isinstance(identity, Mapping) else None,
+        "scope": identity.get("scope") if isinstance(identity, Mapping) else None,
+        "sample_index": (
+            identity.get("sample_index") if isinstance(identity, Mapping) else None
+        ),
+        "sample_role": (
+            identity.get("sample_role") if isinstance(identity, Mapping) else None
+        ),
+        "control_receipt_sha256": decision.get("control_receipt_sha256"),
+        "control_return_sha256": decision.get("control_return_sha256"),
+        "control_decision_sha256": decision.get("control_decision_sha256"),
+        "current_action_kind": decision.get("current_action_kind"),
+        "current_tier": decision.get("current_tier"),
+        "next_tier": decision.get("next_tier"),
+    }
+
+
 def reduce_promoted_exterior_from_checkpoint(
     checkpoint: Mapping[str, object],
     *,
@@ -2109,18 +2275,26 @@ def reduce_promoted_exterior_from_checkpoint(
     if isinstance(artifact, Mapping) and artifact.get("schema") == (
         "windows-solver.promoted-exterior-control-return/1"
     ):
+        raise ValueError(
+            "fixed-root control return /1 is forensic history only"
+        )
+    if isinstance(artifact, Mapping) and artifact.get("schema") == (
+        "windows-solver.promoted-exterior-control-return/2"
+    ):
         artifact_fields = {
             "schema",
-            "precision_tier",
-            "failure_code",
-            "policy_disposition",
-            "failure_fingerprint_sha256",
-            "calculation_sha256",
+            "operation",
+            "request_schema",
+            "request_sha256",
+            "execution_identity_sha256",
+            "effective_policy_identity",
+            "current_tier",
+            "current_action_kind",
+            "canonical_request",
+            "control_receipt",
+            "control_receipt_sha256",
+            "control_return_sha256",
         }
-        content = {
-            key: item for key, item in artifact.items() if key != "calculation_sha256"
-        }
-        fingerprint = artifact.get("failure_fingerprint_sha256")
         receipts = retained_stage.get("receipts")
         tiers = retained_stage.get("precision_tiers")
         counters = (
@@ -2130,15 +2304,10 @@ def reduce_promoted_exterior_from_checkpoint(
         )
         if (
             set(artifact) != artifact_fields
-            or artifact.get("calculation_sha256") != hashlib.sha256(
-                canonical_json_bytes(content)
-            ).hexdigest()
-            or artifact.get("precision_tier") not in {"BF40", "BF80"}
-            or not isinstance(artifact.get("failure_code"), str)
-            or not artifact["failure_code"]
-            or not isinstance(fingerprint, str)
-            or len(fingerprint) != 64
-            or any(character not in "0123456789abcdef" for character in fingerprint)
+            or artifact.get("current_tier") not in {"BF40", "BF80"}
+            or artifact.get("current_action_kind") not in {"ROOT", "RESPONSE"}
+            or not isinstance(artifact.get("canonical_request"), Mapping)
+            or not isinstance(artifact.get("control_receipt"), Mapping)
             or not isinstance(receipts, list)
             or not all(isinstance(item, Mapping) for item in receipts)
             or not isinstance(tiers, list)
@@ -2146,7 +2315,69 @@ def reduce_promoted_exterior_from_checkpoint(
             or not all(isinstance(item, int) and item >= 0 for item in counters)
         ):
             raise ValueError("promoted exterior control return is invalid")
-        disposition = FailureDisposition(str(artifact["policy_disposition"]))
+        _, control_return_sha256 = _promoted_artifact_digest(artifact)
+        validated_receipt = validate_persisted_operation_control_receipt(
+            artifact["control_receipt"], artifact["canonical_request"]
+        )
+        identity = validated_receipt.identity
+        effective_policy = identity.mapping["effective_policy_identity"]
+        effective_policy_sha256 = (
+            str(effective_policy["sha256"])
+            if isinstance(effective_policy, Mapping)
+            else str(effective_policy)
+        )
+        if (
+            artifact.get("operation") != identity.operation
+            or artifact.get("request_schema")
+            != identity.mapping["request_schema"]
+            or artifact.get("request_sha256") != identity.request_sha256
+            or artifact.get("execution_identity_sha256") != identity.sha256
+            or artifact.get("effective_policy_identity")
+            != effective_policy_sha256
+            or artifact.get("control_receipt_sha256")
+            != validated_receipt.sha256
+        ):
+            raise ValueError("promoted exterior control identity is invalid")
+        report, decision = classify_validated_control_receipt(
+            validated_receipt,
+            current_tier=str(artifact["current_tier"]),
+            current_action_kind=str(artifact["current_action_kind"]),
+            cause_type=(
+                "JuliaWorkerTimeoutError"
+                if validated_receipt.failure_code == "WORKER_TIMEOUT"
+                else "JuliaNumericalControlError"
+            ),
+        )
+        if (
+            decision.disposition is FailureDisposition.PROMOTION_PENDING
+            and (
+                decision.queue_kind != artifact["current_action_kind"]
+                or decision.next_action_kind != artifact["current_action_kind"]
+                or decision.next_precision_tier != "BF80"
+            )
+        ):
+            raise ValueError("promoted control queue transition is invalid")
+        decision_content: dict[str, object] = {
+            "schema": "windows-solver.promoted-exterior-control-decision/1",
+            "control_return_sha256": control_return_sha256,
+            "control_receipt_sha256": validated_receipt.sha256,
+            "failure_code": decision.failure_code,
+            "failure_fingerprint_sha256": decision.fingerprint_sha256,
+            "fingerprint_material": report.fingerprint_material,
+            "disposition": decision.disposition.value,
+            "queue_kind": decision.queue_kind,
+            "current_tier": artifact["current_tier"],
+            "current_action_kind": artifact["current_action_kind"],
+            "next_tier": decision.next_precision_tier,
+            "next_action_kind": decision.next_action_kind,
+        }
+        decision_artifact = {
+            **decision_content,
+            "control_decision_sha256": hashlib.sha256(
+                canonical_json_bytes(decision_content)
+            ).hexdigest(),
+        }
+        disposition = decision.disposition
         if disposition is FailureDisposition.SYSTEM_FAILURE:
             raise ValueError("system failure cannot be reduced as numerical work")
         survey_disposition = {
@@ -2157,9 +2388,9 @@ def reduce_promoted_exterior_from_checkpoint(
         }[disposition]
         return PromotedPassOutcome(
             disposition=survey_disposition,
-            reason_code=str(artifact["failure_code"]),
+            reason_code=decision.failure_code,
             precision_tiers=tuple(tiers),
-            operation_identity="promoted-exterior-checkpoint-reduction/v1",
+            operation_identity="promoted-exterior-control-decision/v1",
             source_record_sha256=(
                 None
                 if retained_stage.get("source_record_sha256") is None
@@ -2176,7 +2407,7 @@ def reduce_promoted_exterior_from_checkpoint(
             evidence_receipts=tuple(
                 copy.deepcopy(dict(item)) for item in receipts
             ),
-            calculation_artifact=copy.deepcopy(dict(artifact)),
+            calculation_artifact=decision_artifact,
             source_calculation_stage_sha256=str(retained_stage["stage_sha256"]),
             calculation_chain=_raw_stage_chain(retained_stage),
             tier_timing=tuple(
@@ -2879,6 +3110,44 @@ def _run_promoted_exterior_queue_entry(
             *(copy.deepcopy(dict(item)) for item in retained_chain),
             copy.deepcopy(dict(continuation_stage)),
         ]
+        retained_decision = continuation_stage.get("calculation_artifact")
+        raw_control_return = next(
+            (
+                item.get("calculation_artifact")
+                for item in reversed(retained_chain)
+                if isinstance(item.get("calculation_artifact"), Mapping)
+                and item["calculation_artifact"].get("schema")
+                == "windows-solver.promoted-exterior-control-return/2"
+            ),
+            None,
+        )
+        if isinstance(retained_decision, Mapping) and retained_decision.get(
+            "schema"
+        ) == "windows-solver.promoted-exterior-control-decision/1":
+            if not isinstance(raw_control_return, Mapping):
+                raise ValueError("promoted continuation lost its raw control return")
+            _revalidate_promoted_control_proof(
+                raw_control_return,
+                retained_decision,
+            )
+            if not _control_decision_authorizes_bf80(
+                PromotedPassOutcome(
+                    disposition=SurveyDisposition.UNRESOLVED,
+                    reason_code=str(retained_decision.get("failure_code")),
+                    precision_tiers=("BF40",),
+                    calculation_artifact=retained_decision,
+                )
+            ):
+                raise ValueError("promoted continuation does not authorize BF80")
+        elif any(
+            isinstance(item.get("calculation_artifact"), Mapping)
+            and item["calculation_artifact"].get("schema")
+            == "windows-solver.promoted-exterior-control-return/1"
+            for item in retained_chain
+        ):
+            raise ValueError(
+                "PR74 fixed-root control evidence is forensic history only"
+            )
         source_calculation_stage_sha256 = str(
             continuation_stage["stage_sha256"]
         )
@@ -2887,31 +3156,48 @@ def _run_promoted_exterior_queue_entry(
         receipts.append(dict(provisional_predecessor_receipt))
 
     def checkpoint_control_return(
-        decision: object,
+        control_receipt: ValidatedControlReceipt,
         *,
         tier: str,
+        current_action_kind: str,
     ) -> PromotedPassOutcome:
         if raw_checkpoint is None:
             raise ValueError("promoted control return is not checkpointable")
-        content = {
-            "schema": "windows-solver.promoted-exterior-control-return/1",
-            "precision_tier": tier,
-            "failure_code": decision.failure_code,
-            "policy_disposition": decision.disposition.value,
-            "failure_fingerprint_sha256": decision.fingerprint_sha256,
+        canonical_request = control_receipt.canonical_request
+        if canonical_request is None:
+            raise ValueError("promoted control receipt lost its canonical request")
+        identity = control_receipt.identity
+        effective_policy = identity.mapping["effective_policy_identity"]
+        effective_policy_sha256 = (
+            str(effective_policy["sha256"])
+            if isinstance(effective_policy, Mapping)
+            else str(effective_policy)
+        )
+        content: dict[str, object] = {
+            "schema": "windows-solver.promoted-exterior-control-return/2",
+            "operation": identity.operation,
+            "request_schema": identity.mapping["request_schema"],
+            "request_sha256": identity.request_sha256,
+            "execution_identity_sha256": identity.sha256,
+            "effective_policy_identity": effective_policy_sha256,
+            "current_tier": tier,
+            "current_action_kind": current_action_kind,
+            "canonical_request": copy.deepcopy(dict(canonical_request)),
+            "control_receipt": control_receipt.to_mapping(),
+            "control_receipt_sha256": control_receipt.sha256,
         }
         artifact = {
             **content,
-            "calculation_sha256": hashlib.sha256(
+            "control_return_sha256": hashlib.sha256(
                 canonical_json_bytes(content)
             ).hexdigest(),
         }
         timing_recorder.complete_tier()
         return raw_checkpoint(PromotedPassOutcome(
             disposition=SurveyDisposition.UNRESOLVED,
-            reason_code=decision.failure_code,
+            reason_code=control_receipt.failure_code,
             precision_tiers=tuple(tiers),
-            operation_identity="promoted-exterior-control-return/v1",
+            operation_identity="promoted-exterior-control-return/v2",
             sample_count=sample_count,
             root_read_count=root_reads,
             worker_launch_count=worker_launches,
@@ -2967,16 +3253,31 @@ def _run_promoted_exterior_queue_entry(
             except KeyboardInterrupt:
                 raise
             except Exception as error:
-                decision = _promoted_control_decision(
-                    error, leaf=leaf, digits=digits
+                control_receipt = _promoted_control_receipt(
+                    error,
+                    leaf=leaf,
+                    digits=digits,
+                    current_action_kind="ROOT",
                 )
-                if decision is None or decision.disposition is FailureDisposition.SYSTEM_FAILURE:
+                if control_receipt is None:
                     raise
-                reduced = checkpoint_control_return(decision, tier=tier)
+                reduced = checkpoint_control_return(
+                    control_receipt,
+                    tier=tier,
+                    current_action_kind="ROOT",
+                )
+                control_decision = reduced.calculation_artifact
                 if (
                     digits == 40
-                    and decision.disposition is FailureDisposition.PROMOTION_PENDING
-                    and decision.failure_code in PROMOTION_ALLOWLIST
+                    and isinstance(control_decision, Mapping)
+                    and control_decision.get("schema")
+                    == "windows-solver.promoted-exterior-control-decision/1"
+                    and control_decision.get("disposition")
+                    == FailureDisposition.PROMOTION_PENDING.value
+                    and control_decision.get("queue_kind") == "ROOT"
+                    and control_decision.get("current_action_kind") == "ROOT"
+                    and control_decision.get("next_action_kind") == "ROOT"
+                    and control_decision.get("next_tier") == "BF80"
                 ):
                     calculation_chain, source_calculation_stage_sha256 = (
                         retain_continuation_chain(reduced)
@@ -3026,6 +3327,7 @@ def _run_promoted_exterior_queue_entry(
         acquired_background = False
         immediate_background_receipt: Mapping[str, object] | None = None
         resumed_own_background = False
+        background_receipt_retained = False
         if cached_background is not None:
             retained_samples = cached_background.get("background_samples")
             if (
@@ -3045,6 +3347,14 @@ def _run_promoted_exterior_queue_entry(
                 # of this route's retained accounting without being rerun.
                 sample_count += len(retained_samples)
                 worker_launches += 1
+            retained_background_receipt = cached_background.get(
+                "background_receipt"
+            )
+            if isinstance(retained_background_receipt, Mapping):
+                receipts.append(
+                    copy.deepcopy(dict(retained_background_receipt))
+                )
+                background_receipt_retained = True
             if trace_event is not None:
                 receipt = cached_background.get("background_receipt")
                 trace_event(
@@ -3077,6 +3387,8 @@ def _run_promoted_exterior_queue_entry(
                         "PROMOTED_BACKGROUND_REQUESTED",
                         {
                             "tier": tier,
+                            "operation": "fixed-root-survey-batch",
+                            "scope": "REQUEST",
                             "background_reuse_key_sha256": background_cache_key,
                             "worker_plan": (
                                 FixedRootSurveyPlan.CANONICAL_BACKGROUND_FIVE.value
@@ -3106,6 +3418,14 @@ def _run_promoted_exterior_queue_entry(
                         "PROMOTED_BACKGROUND_RETURNED",
                         {
                             "tier": tier,
+                            "operation": "fixed-root-survey-batch",
+                            "scope": "REQUEST",
+                            "plan": background_batch.plan.value,
+                            "execution_identity_sha256": hashlib.sha256(
+                                canonical_json_bytes(
+                                    dict(background_batch.execution_identity)
+                                )
+                            ).hexdigest(),
                             "background_reuse_key_sha256": background_cache_key,
                             "worker_request_sha256": background_batch.request_sha256,
                             "sample_count": len(background_batch.samples),
@@ -3134,6 +3454,11 @@ def _run_promoted_exterior_queue_entry(
                 ]
                 cache_entry["background_receipt"] = immediate_background_receipt
                 background_checkpoint(immediate_background_receipt)
+                sample_count += len(_PROMOTED_BACKGROUND_SAMPLE_ROLES)
+                receipts.append(
+                    copy.deepcopy(dict(immediate_background_receipt))
+                )
+                background_receipt_retained = True
                 acquired_background = True
                 cached_background = cache_entry
 
@@ -3143,6 +3468,8 @@ def _run_promoted_exterior_queue_entry(
                     "PROMOTED_COMPONENT_REQUESTED",
                     {
                         "tier": tier,
+                        "operation": "fixed-root-survey-batch",
+                        "scope": "REQUEST",
                         "background_reuse_key_sha256": background_cache_key,
                         "worker_plan": FixedRootSurveyPlan.MECHANISM_COMPONENT_FOUR.value,
                     },
@@ -3157,16 +3484,31 @@ def _run_promoted_exterior_queue_entry(
         except KeyboardInterrupt:
             raise
         except Exception as error:
-            decision = _promoted_control_decision(
-                error, leaf=leaf, digits=digits
+            control_receipt = _promoted_control_receipt(
+                error,
+                leaf=leaf,
+                digits=digits,
+                current_action_kind="RESPONSE",
             )
-            if decision is None or decision.disposition is FailureDisposition.SYSTEM_FAILURE:
+            if control_receipt is None:
                 raise
-            reduced = checkpoint_control_return(decision, tier=tier)
+            reduced = checkpoint_control_return(
+                control_receipt,
+                tier=tier,
+                current_action_kind="RESPONSE",
+            )
+            control_decision = reduced.calculation_artifact
             if (
                 digits == 40
-                and decision.disposition is FailureDisposition.PROMOTION_PENDING
-                and decision.failure_code in PROMOTION_ALLOWLIST
+                and isinstance(control_decision, Mapping)
+                and control_decision.get("schema")
+                == "windows-solver.promoted-exterior-control-decision/1"
+                and control_decision.get("disposition")
+                == FailureDisposition.PROMOTION_PENDING.value
+                and control_decision.get("queue_kind") == "RESPONSE"
+                and control_decision.get("current_action_kind") == "RESPONSE"
+                and control_decision.get("next_action_kind") == "RESPONSE"
+                and control_decision.get("next_tier") == "BF80"
             ):
                 calculation_chain, source_calculation_stage_sha256 = (
                     retain_continuation_chain(reduced)
@@ -3189,6 +3531,12 @@ def _run_promoted_exterior_queue_entry(
                 "PROMOTED_COMPONENT_RETURNED",
                 {
                     "tier": tier,
+                    "operation": "fixed-root-survey-batch",
+                    "scope": "REQUEST",
+                    "plan": executed_batch.plan.value,
+                    "execution_identity_sha256": hashlib.sha256(
+                        canonical_json_bytes(dict(executed_batch.execution_identity))
+                    ).hexdigest(),
                     "background_reuse_key_sha256": background_cache_key,
                     "worker_request_sha256": executed_batch.request_sha256,
                     "sample_count": len(executed_batch.samples),
@@ -3225,9 +3573,8 @@ def _run_promoted_exterior_queue_entry(
             background_receipt_sha256=binding.background_receipt_sha256,
         )
         sample_count += len(requested_sample_roles)
-        if acquired_background:
-            sample_count += len(_PROMOTED_BACKGROUND_SAMPLE_ROLES)
-        receipts.append(copy.deepcopy(dict(background_receipt)))
+        if not background_receipt_retained:
+            receipts.append(copy.deepcopy(dict(background_receipt)))
         calculation_mapping = calculation.to_mapping()
         receipts.append({
             "schema": "windows-solver.promoted-exterior-calculation-receipt/3",
@@ -3270,7 +3617,7 @@ def _run_promoted_exterior_queue_entry(
         if (
             digits == 40
             and reduced.disposition is SurveyDisposition.UNRESOLVED
-            and reduced.reason_code in PROMOTION_ALLOWLIST
+            and _outcome_authorizes_bf80(reduced)
         ):
             calculation_chain, source_calculation_stage_sha256 = (
                 retain_continuation_chain(reduced)
@@ -3360,19 +3707,7 @@ def _retained_promoted_stage(
         copy.deepcopy(dict(item)) for item in outcome.calculation_chain
     ]
     if calculation_artifact is not None:
-        artifact_digest = calculation_artifact.get("calculation_sha256")
-        artifact_content = {
-            key: item
-            for key, item in calculation_artifact.items()
-            if key != "calculation_sha256"
-        }
-        if (
-            not isinstance(artifact_digest, str)
-            or artifact_digest != hashlib.sha256(
-                canonical_json_bytes(artifact_content)
-            ).hexdigest()
-        ):
-            raise ValueError("retained promoted calculation artifact is invalid")
+        _promoted_artifact_digest(calculation_artifact)
     material: dict[str, object] = {
         "schema": "windows-solver.promoted-calculation-stage/2",
         "queue_ordinal": queue_ordinal,
@@ -3495,6 +3830,9 @@ def _commit_promoted_raw_calculation(
         raise ValueError("raw promoted calculation lacks authenticated route policy")
     result = validate_schema11_checkpoint(checkpoint)
     queue_entry = result["promotion_queue"]["entries"][queue_ordinal]
+    digest_field, artifact_sha256 = _promoted_artifact_digest(
+        outcome.calculation_artifact
+    )
     stage = _retained_promoted_stage(
         leaf=leaf,
         queue_entry=queue_entry,
@@ -3513,14 +3851,13 @@ def _commit_promoted_raw_calculation(
         promoted_stage=stage,
         execution_mode=execution_preflight.mode.value,
         disposition_receipt={
-            "schema": "windows-solver.promoted-raw-calculation-retention/2",
+            "schema": "windows-solver.promoted-raw-return-retention/3",
             "queue_ordinal": queue_ordinal,
             "leaf_id": str(queue_entry["leaf_id"]),
             "route": route,
-            "reason_code": "RAW_PROMOTED_CALCULATION_RETAINED",
-            "calculation_sha256": outcome.calculation_artifact[
-                "calculation_sha256"
-            ],
+            "reason_code": "RAW_PROMOTED_RETURN_RETAINED",
+            "artifact_digest_field": digest_field,
+            "artifact_sha256": artifact_sha256,
         },
         layer1_guard=layer1_guard,
     )
@@ -4186,6 +4523,11 @@ def run_promoted_survey(
             }
             if compact_diagnostics is not None:
                 diagnostics.update(dict(compact_diagnostics))
+            def diagnostic_value(*names: str) -> object:
+                for name in names:
+                    if diagnostics.get(name) is not None:
+                        return diagnostics[name]
+                return None
             diagnostic_session.append(
                 event_kind,
                 leaf={
@@ -4203,6 +4545,31 @@ def run_promoted_survey(
                     "pass": "promoted",
                     "tier": tier,
                     "operation_identity": operation_identity,
+                    "operation": diagnostic_value("operation"),
+                    "execution_identity_sha256": diagnostic_value(
+                        "execution_identity_sha256"
+                    ),
+                    "request_sha256": diagnostic_value(
+                        "request_sha256", "worker_request_sha256"
+                    ),
+                    "plan": diagnostic_value("plan", "worker_plan"),
+                    "scope": diagnostic_value("scope"),
+                    "sample_index": diagnostic_value("sample_index"),
+                    "sample_role": diagnostic_value("sample_role"),
+                    "control_receipt_sha256": diagnostic_value(
+                        "control_receipt_sha256"
+                    ),
+                    "control_return_sha256": diagnostic_value(
+                        "control_return_sha256"
+                    ),
+                    "control_decision_sha256": diagnostic_value(
+                        "control_decision_sha256"
+                    ),
+                    "current_action_kind": diagnostic_value(
+                        "current_action_kind"
+                    ),
+                    "current_tier": diagnostic_value("current_tier"),
+                    "next_tier": diagnostic_value("next_tier"),
                 },
                 transition={
                     "prior_state": (
@@ -4298,9 +4665,61 @@ def run_promoted_survey(
             ]
             if not isinstance(digest, str):
                 raise ValueError("raw promoted checkpoint digest is invalid")
+            raw_artifact = raw.calculation_artifact
+            raw_artifact_fields: dict[str, object] = {}
+            if isinstance(raw_artifact, Mapping):
+                receipt = raw_artifact.get("control_receipt")
+                identity = (
+                    receipt.get("execution_identity")
+                    if isinstance(receipt, Mapping)
+                    else None
+                )
+                raw_artifact_fields = {
+                    "operation": raw_artifact.get("operation"),
+                    "execution_identity_sha256": raw_artifact.get(
+                        "execution_identity_sha256"
+                    ),
+                    "request_sha256": raw_artifact.get("request_sha256"),
+                    "plan": (
+                        identity.get("plan")
+                        if isinstance(identity, Mapping)
+                        else None
+                    ),
+                    "scope": (
+                        identity.get("scope")
+                        if isinstance(identity, Mapping)
+                        else None
+                    ),
+                    "sample_index": (
+                        identity.get("sample_index")
+                        if isinstance(identity, Mapping)
+                        else None
+                    ),
+                    "sample_role": (
+                        identity.get("sample_role")
+                        if isinstance(identity, Mapping)
+                        else None
+                    ),
+                    "control_receipt_sha256": raw_artifact.get(
+                        "control_receipt_sha256"
+                    ),
+                    "control_return_sha256": raw_artifact.get(
+                        "control_return_sha256"
+                    ),
+                    "current_action_kind": raw_artifact.get(
+                        "current_action_kind"
+                    ),
+                    "current_tier": raw_artifact.get("current_tier"),
+                }
             append_promoted_structural_event(
-                "PROMOTED_RAW_CALCULATION_CHECKPOINTED",
-                phase="raw-calculation-checkpoint",
+                (
+                    "PROMOTED_CONTROL_RETURN_CHECKPOINTED"
+                    if isinstance(raw_artifact, Mapping)
+                    and raw_artifact.get("schema")
+                    == "windows-solver.promoted-exterior-control-return/2"
+                    else "PROMOTED_RAW_CALCULATION_CHECKPOINTED"
+                ),
+                phase="raw-return-checkpoint",
                 tier=(None if not raw.precision_tiers else raw.precision_tiers[-1]),
                 operation_identity=raw.operation_identity,
                 next_state=PromotionQueueDisposition.CALCULATED_PENDING_DERIVATION.value,
@@ -4311,12 +4730,38 @@ def run_promoted_survey(
                     "retained_promoted_stage_sha256": digest,
                     "calculation_artifact_sha256": (
                         None
-                        if not isinstance(raw.calculation_artifact, Mapping)
-                        else raw.calculation_artifact.get("calculation_sha256")
+                        if not isinstance(raw_artifact, Mapping)
+                        else raw_artifact.get("calculation_sha256")
                     ),
+                    **raw_artifact_fields,
                 },
                 durable=True,
             )
+            progress_context = {
+                key: value
+                for key, value in raw_artifact_fields.items()
+                if key in {
+                    "operation",
+                    "execution_identity_sha256",
+                    "request_sha256",
+                    "plan",
+                    "scope",
+                    "sample_index",
+                    "sample_role",
+                    "control_receipt_sha256",
+                    "control_return_sha256",
+                    "current_action_kind",
+                    "current_tier",
+                }
+                and value is not None
+            }
+            if progress_context:
+                with progress_scope(**progress_context):
+                    emit_progress(
+                        ProgressEventKind.REQUEST_FAILED,
+                        failure_code=raw.reason_code,
+                        persistence_state="CONTROL_RETURN_COMMITTED",
+                    )
             reduced = guarded(
                 lambda: (
                     reduce_promoted_exterior_from_checkpoint(
@@ -4345,7 +4790,7 @@ def run_promoted_survey(
                 next_state=(
                     PromotionQueueDisposition.NUMERICAL_CONTINUATION.value
                     if reduced.precision_tiers[-1:] == ("BF40",)
-                    and reduced.reason_code in PROMOTION_ALLOWLIST
+                    and _outcome_authorizes_bf80(reduced)
                     else (
                         PromotionQueueDisposition.AWAITING_ADMISSION.value
                         if reduced.disposition
@@ -4359,9 +4804,51 @@ def run_promoted_survey(
                     "backend_calls": 0,
                     "julia_launches": 0,
                     "root_reads": 0,
+                    **raw_artifact_fields,
+                    **(
+                        {
+                            "operation": reduced.calculation_artifact.get(
+                                "fingerprint_material", {}
+                            ).get("worker_operation"),
+                            "control_receipt_sha256": reduced.calculation_artifact.get(
+                                "control_receipt_sha256"
+                            ),
+                            "control_return_sha256": reduced.calculation_artifact.get(
+                                "control_return_sha256"
+                            ),
+                            "control_decision_sha256": reduced.calculation_artifact.get(
+                                "control_decision_sha256"
+                            ),
+                            "current_action_kind": reduced.calculation_artifact.get(
+                                "current_action_kind"
+                            ),
+                            "current_tier": reduced.calculation_artifact.get(
+                                "current_tier"
+                            ),
+                            "next_tier": reduced.calculation_artifact.get(
+                                "next_tier"
+                            ),
+                        }
+                        if isinstance(reduced.calculation_artifact, Mapping)
+                        and reduced.calculation_artifact.get("schema")
+                        == "windows-solver.promoted-exterior-control-decision/1"
+                        else {}
+                    ),
                 },
                 durable=True,
             )
+            decision_trace = _control_trace_fields(reduced)
+            if decision_trace:
+                with progress_scope(**{
+                    key: value
+                    for key, value in decision_trace.items()
+                    if value is not None
+                }):
+                    emit_progress(
+                        ProgressEventKind.LEAF_PASS_DISPOSITION_RECORDED,
+                        failure_code=reduced.reason_code,
+                        persistence_state="CONTROL_DECISION_CLASSIFIED",
+                    )
             return reduced
 
         def validate_binary64_disposition_binding() -> None:
@@ -4581,7 +5068,7 @@ def run_promoted_survey(
                 next_state=(
                     PromotionQueueDisposition.NUMERICAL_CONTINUATION.value
                     if outcome.precision_tiers[-1:] == ("BF40",)
-                    and outcome.reason_code in PROMOTION_ALLOWLIST
+                    and _outcome_authorizes_bf80(outcome)
                     else (
                         PromotionQueueDisposition.AWAITING_ADMISSION.value
                         if outcome.disposition
@@ -4604,7 +5091,7 @@ def run_promoted_survey(
                 expected_route == "EXTERIOR_BF40"
                 and outcome.precision_tiers[-1:] == ("BF40",)
                 and outcome.disposition is SurveyDisposition.UNRESOLVED
-                and outcome.reason_code in PROMOTION_ALLOWLIST
+                and _outcome_authorizes_bf80(outcome)
             ):
                 pre_commit = result
                 result = guarded(lambda: _commit_promoted_continuation(
@@ -4644,6 +5131,7 @@ def run_promoted_survey(
                     pre_commit=pre_commit,
                     post_commit=result,
                     compact_diagnostics={
+                        **_control_trace_fields(outcome),
                         "retained_promoted_stage_sha256": (
                             continuation_stage.get("stage_sha256")
                         ),
@@ -4857,6 +5345,7 @@ def run_promoted_survey(
                         pre_commit=pre_commit,
                         post_commit=result,
                         compact_diagnostics={
+                            **_control_trace_fields(retained_partial),
                             "retained_promoted_stage_sha256": retained_stage_sha256,
                             "next_precision_tier": "BF80",
                         },

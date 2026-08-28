@@ -1,0 +1,728 @@
+"""Authenticated operation identity and promoted CONTROL transitions.
+
+This module is the single control-plane boundary shared by the Julia adapter
+and the promoted campaign.  It deliberately contains no solver code: it
+validates identities and receipts, then performs an exact transition lookup.
+"""
+
+from __future__ import annotations
+
+import copy
+from dataclasses import dataclass
+import hashlib
+from types import MappingProxyType
+from typing import Callable, Mapping
+
+from .contracts import canonical_json_bytes
+
+
+OPERATION_EXECUTION_IDENTITY_SCHEMA = (
+    "windows-solver.operation-execution-identity/1"
+)
+OPERATION_CONTROL_RECEIPT_SCHEMA = "windows-solver.operation-control-receipt/1"
+CANONICAL_REQUEST_BINDING_SCHEMA = "windows-solver.canonical-request-binding/1"
+
+ROOT_READOUT_OPERATION = "root-readout"
+FIXED_ROOT_SURVEY_BATCH_OPERATION = "fixed-root-survey-batch"
+FIXED_ROOT_DETERMINANT_SAMPLE_OPERATION = "fixed-root-determinant-sample"
+
+REQUEST_SCOPE = "REQUEST"
+SAMPLE_SCOPE = "SAMPLE"
+
+JULIA_WORKER_ORIGIN = "JULIA_WORKER"
+PYTHON_SUPERVISOR_ORIGIN = "PYTHON_SUPERVISOR"
+
+_COMMON_IDENTITY_FIELDS = frozenset({
+    "schema",
+    "scope",
+    "operation",
+    "request_schema",
+    "request_sha256",
+    "leaf_id",
+    "job_id",
+    "backend_identity_sha256",
+    "precision_digits",
+    "working_precision_bits",
+    "semantic_precision_tier",
+    "effective_policy_identity",
+    "execution_resource_policy_identity",
+})
+_ROOT_REQUIRED_FIELDS = frozenset({
+    "role",
+    "job_policy_sha256",
+    "refinement_level",
+})
+_ROOT_OPTIONAL_FIELDS = frozenset({
+    "root_phase",
+    "newton_index",
+    "readout_role",
+})
+_FIXED_ROOT_REQUIRED_FIELDS = frozenset({
+    "plan",
+    "scientific_operation_identity",
+    "root_reference_id",
+    "root_seal_sha256",
+    "branch_identity",
+    "sample_roles",
+})
+_SAMPLE_FIELDS = frozenset({"sample_index", "sample_role"})
+_CONTROL_RECEIPT_FIELDS = frozenset({
+    "schema",
+    "origin",
+    "failure_class",
+    "failure_code",
+    "stage",
+    "scope",
+    "execution_identity",
+    "retryable_evidence",
+    "diagnostics",
+    "canonical_request_binding",
+    "receipt_sha256",
+})
+_REQUEST_BINDING_FIELDS = frozenset({
+    "schema",
+    "operation",
+    "request_schema",
+    "request_sha256",
+    "execution_identity_sha256",
+})
+
+
+def canonical_sha256(value: object) -> str:
+    return hashlib.sha256(canonical_json_bytes(value)).hexdigest()
+
+
+def _is_sha256(value: object) -> bool:
+    if not isinstance(value, str) or len(value) != 64:
+        return False
+    try:
+        int(value, 16)
+    except ValueError:
+        return False
+    return True
+
+
+def _is_nonempty_text(value: object) -> bool:
+    return isinstance(value, str) and bool(value)
+
+
+def _identity_policy_hash(value: object, label: str) -> str:
+    if _is_sha256(value):
+        return str(value)
+    if isinstance(value, Mapping) and _is_sha256(value.get("sha256")):
+        return str(value["sha256"])
+    raise ValueError(f"operation execution {label} identity is invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class OperationExecutionIdentity:
+    """One validated REQUEST- or SAMPLE-scope execution identity."""
+
+    mapping: Mapping[str, object]
+
+    def __post_init__(self) -> None:
+        validated = _validate_execution_identity_mapping(self.mapping)
+        object.__setattr__(self, "mapping", MappingProxyType(validated))
+
+    @property
+    def sha256(self) -> str:
+        return canonical_sha256(dict(self.mapping))
+
+    @property
+    def operation(self) -> str:
+        return str(self.mapping["operation"])
+
+    @property
+    def scope(self) -> str:
+        return str(self.mapping["scope"])
+
+    @property
+    def request_sha256(self) -> str:
+        return str(self.mapping["request_sha256"])
+
+    def to_mapping(self) -> dict[str, object]:
+        return copy.deepcopy(dict(self.mapping))
+
+    def select_sample(self, sample_index: int, sample_role: str) -> "OperationExecutionIdentity":
+        if self.operation != FIXED_ROOT_SURVEY_BATCH_OPERATION or self.scope != REQUEST_SCOPE:
+            raise ValueError("only a fixed-root REQUEST identity can select a sample")
+        roles = tuple(self.mapping["sample_roles"])
+        if (
+            isinstance(sample_index, bool)
+            or not isinstance(sample_index, int)
+            or sample_index < 0
+            or sample_index >= len(roles)
+            or roles[sample_index] != sample_role
+        ):
+            raise ValueError("fixed-root sample identity does not match its descriptor")
+        selected = self.to_mapping()
+        selected["scope"] = SAMPLE_SCOPE
+        selected["sample_index"] = sample_index
+        selected["sample_role"] = sample_role
+        return OperationExecutionIdentity(selected)
+
+
+def _validate_execution_identity_mapping(value: object) -> dict[str, object]:
+    if not isinstance(value, Mapping):
+        raise ValueError("operation execution identity must be an object")
+    result = copy.deepcopy(dict(value))
+    operation = result.get("operation")
+    scope = result.get("scope")
+    required = set(_COMMON_IDENTITY_FIELDS)
+    allowed = set(_COMMON_IDENTITY_FIELDS)
+    if operation in {ROOT_READOUT_OPERATION, FIXED_ROOT_DETERMINANT_SAMPLE_OPERATION}:
+        required.update(_ROOT_REQUIRED_FIELDS)
+        allowed.update(_ROOT_REQUIRED_FIELDS | _ROOT_OPTIONAL_FIELDS)
+    elif operation == FIXED_ROOT_SURVEY_BATCH_OPERATION:
+        required.update(_FIXED_ROOT_REQUIRED_FIELDS)
+        allowed.update(_FIXED_ROOT_REQUIRED_FIELDS)
+    else:
+        raise ValueError("operation execution identity operation is invalid")
+    if scope == SAMPLE_SCOPE:
+        if operation != FIXED_ROOT_SURVEY_BATCH_OPERATION:
+            raise ValueError("SAMPLE scope is reserved for fixed-root batch samples")
+        required.update(_SAMPLE_FIELDS)
+        allowed.update(_SAMPLE_FIELDS)
+    elif scope != REQUEST_SCOPE:
+        raise ValueError("operation execution identity scope is invalid")
+    if set(result) != required and not (
+        operation in {ROOT_READOUT_OPERATION, FIXED_ROOT_DETERMINANT_SAMPLE_OPERATION}
+        and required.issubset(result)
+        and set(result).issubset(allowed)
+    ):
+        raise ValueError("operation execution identity fields are invalid")
+    if result.get("schema") != OPERATION_EXECUTION_IDENTITY_SCHEMA:
+        raise ValueError("operation execution identity schema is invalid")
+    for field in (
+        "request_schema",
+        "leaf_id",
+        "job_id",
+        "semantic_precision_tier",
+    ):
+        if not _is_nonempty_text(result.get(field)):
+            raise ValueError(f"operation execution identity {field} is invalid")
+    for field in ("request_sha256", "backend_identity_sha256"):
+        if not _is_sha256(result.get(field)):
+            raise ValueError(f"operation execution identity {field} is invalid")
+    for field in ("precision_digits", "working_precision_bits"):
+        item = result.get(field)
+        if isinstance(item, bool) or not isinstance(item, int) or item < 1:
+            raise ValueError(f"operation execution identity {field} is invalid")
+    _identity_policy_hash(result.get("effective_policy_identity"), "policy")
+    _identity_policy_hash(
+        result.get("execution_resource_policy_identity"), "resource-policy"
+    )
+    if operation in {ROOT_READOUT_OPERATION, FIXED_ROOT_DETERMINANT_SAMPLE_OPERATION}:
+        for field in ("role", "job_policy_sha256"):
+            item = result.get(field)
+            if field.endswith("sha256"):
+                valid = _is_sha256(item)
+            else:
+                valid = _is_nonempty_text(item)
+            if not valid:
+                raise ValueError(f"root-readout execution identity {field} is invalid")
+        refinement = result.get("refinement_level")
+        if isinstance(refinement, bool) or not isinstance(refinement, int) or refinement < 0:
+            raise ValueError("root-readout refinement identity is invalid")
+    else:
+        for field in (
+            "plan",
+            "scientific_operation_identity",
+            "root_reference_id",
+            "branch_identity",
+        ):
+            if not _is_nonempty_text(result.get(field)):
+                raise ValueError(f"fixed-root execution identity {field} is invalid")
+        if not _is_sha256(result.get("root_seal_sha256")):
+            raise ValueError("fixed-root root seal identity is invalid")
+        roles = result.get("sample_roles")
+        if (
+            not isinstance(roles, list)
+            or not roles
+            or any(not _is_nonempty_text(role) for role in roles)
+            or len(set(roles)) != len(roles)
+        ):
+            raise ValueError("fixed-root sample-role identity is invalid")
+        if scope == SAMPLE_SCOPE:
+            index = result.get("sample_index")
+            role = result.get("sample_role")
+            if (
+                isinstance(index, bool)
+                or not isinstance(index, int)
+                or index < 0
+                or index >= len(roles)
+                or roles[index] != role
+            ):
+                raise ValueError("fixed-root selected sample identity is invalid")
+        elif _SAMPLE_FIELDS & set(result):
+            raise ValueError("REQUEST identity cannot select a sample")
+    return result
+
+
+def operation_execution_identity(value: object) -> OperationExecutionIdentity:
+    return OperationExecutionIdentity(value)  # type: ignore[arg-type]
+
+
+def execution_identity_from_request(
+    request: Mapping[str, object],
+    *,
+    request_sha256: str,
+    sample_index: int | None = None,
+    sample_role: str | None = None,
+) -> OperationExecutionIdentity:
+    """Project an authenticated wire request into its operation identity."""
+
+    operation = request.get("operation")
+    policy = request.get("policy")
+    resource = request.get("execution_resource")
+    if not isinstance(policy, Mapping) or not isinstance(resource, Mapping):
+        raise ValueError("operation request policy identities are absent")
+    common: dict[str, object] = {
+        "schema": OPERATION_EXECUTION_IDENTITY_SCHEMA,
+        "scope": REQUEST_SCOPE,
+        "operation": operation,
+        "request_schema": request.get(
+            "schema",
+            (
+                "windows-solver.root-readout/1"
+                if operation == ROOT_READOUT_OPERATION
+                else "windows-solver.fixed-root-determinant-sample/1"
+                if operation == FIXED_ROOT_DETERMINANT_SAMPLE_OPERATION
+                else ""
+            ),
+        ),
+        "request_sha256": request_sha256,
+        "leaf_id": request.get("leaf_id"),
+        "job_id": request.get("job_id"),
+        "backend_identity_sha256": request.get("backend_identity_sha256"),
+        "precision_digits": request.get("precision_digits"),
+        "working_precision_bits": request.get("working_precision_bits"),
+        "semantic_precision_tier": request.get("semantic_precision_tier"),
+        "effective_policy_identity": canonical_sha256(dict(policy)),
+        "execution_resource_policy_identity": {
+            "schema": resource.get("schema"),
+            "version": resource.get("version"),
+            "sha256": resource.get("sha256"),
+        },
+    }
+    if operation in {ROOT_READOUT_OPERATION, FIXED_ROOT_DETERMINANT_SAMPLE_OPERATION}:
+        common.update({
+            "role": request.get("role"),
+            "job_policy_sha256": request.get("job_policy_sha256"),
+            "refinement_level": request.get("refinement_level"),
+        })
+        for field in _ROOT_OPTIONAL_FIELDS:
+            if field in request:
+                common[field] = request[field]
+    elif operation == FIXED_ROOT_SURVEY_BATCH_OPERATION:
+        common.update({
+            "plan": request.get("plan"),
+            "scientific_operation_identity": request.get(
+                "scientific_operation_identity"
+            ),
+            "root_reference_id": request.get("root_reference_id"),
+            "root_seal_sha256": request.get("root_seal_sha256"),
+            "branch_identity": request.get("branch_identity"),
+            "sample_roles": copy.deepcopy(request.get("sample_roles")),
+        })
+    identity = OperationExecutionIdentity(common)
+    if sample_index is None and sample_role is None:
+        return identity
+    if sample_index is None or sample_role is None:
+        raise ValueError("sample identity requires both index and role")
+    return identity.select_sample(sample_index, sample_role)
+
+
+def canonical_request_binding(identity: OperationExecutionIdentity) -> dict[str, object]:
+    return {
+        "schema": CANONICAL_REQUEST_BINDING_SCHEMA,
+        "operation": identity.operation,
+        "request_schema": identity.mapping["request_schema"],
+        "request_sha256": identity.request_sha256,
+        "execution_identity_sha256": identity.sha256,
+    }
+
+
+class ValidatedControlReceipt:
+    """Opaque proof that receipt digest, identity, binding, and evidence passed."""
+
+    __slots__ = ("_mapping", "_identity", "_request")
+    _TOKEN = object()
+
+    def __init__(
+        self,
+        mapping: Mapping[str, object],
+        identity: OperationExecutionIdentity,
+        *,
+        _token: object,
+        request: Mapping[str, object] | None = None,
+    ) -> None:
+        if _token is not self._TOKEN:
+            raise TypeError("ValidatedControlReceipt is minted only by its validator")
+        self._mapping = MappingProxyType(copy.deepcopy(dict(mapping)))
+        self._identity = identity
+        self._request = (
+            None
+            if request is None
+            else MappingProxyType(copy.deepcopy(dict(request)))
+        )
+
+    @property
+    def mapping(self) -> Mapping[str, object]:
+        return self._mapping
+
+    @property
+    def identity(self) -> OperationExecutionIdentity:
+        return self._identity
+
+    @property
+    def sha256(self) -> str:
+        return str(self._mapping["receipt_sha256"])
+
+    @property
+    def failure_code(self) -> str:
+        return str(self._mapping["failure_code"])
+
+    @property
+    def stage(self) -> str:
+        return str(self._mapping["stage"])
+
+    @property
+    def origin(self) -> str:
+        return str(self._mapping["origin"])
+
+    def to_mapping(self) -> dict[str, object]:
+        return copy.deepcopy(dict(self._mapping))
+
+    @property
+    def canonical_request(self) -> Mapping[str, object] | None:
+        return self._request
+
+
+def validate_operation_control_receipt(
+    value: object,
+    *,
+    request: Mapping[str, object] | None = None,
+    request_sha256: str | None = None,
+    diagnostics_validator: Callable[[Mapping[str, object]], bool] | None = None,
+) -> ValidatedControlReceipt:
+    if not isinstance(value, Mapping) or set(value) != _CONTROL_RECEIPT_FIELDS:
+        raise ValueError("operation control receipt fields are invalid")
+    receipt = copy.deepcopy(dict(value))
+    if receipt.get("schema") != OPERATION_CONTROL_RECEIPT_SCHEMA:
+        raise ValueError("operation control receipt schema is invalid")
+    content = {key: item for key, item in receipt.items() if key != "receipt_sha256"}
+    if not _is_sha256(receipt.get("receipt_sha256")) or receipt["receipt_sha256"] != canonical_sha256(content):
+        raise ValueError("operation control receipt digest is invalid")
+    if receipt.get("origin") not in {JULIA_WORKER_ORIGIN, PYTHON_SUPERVISOR_ORIGIN}:
+        raise ValueError("operation control receipt origin is invalid")
+    if receipt.get("failure_class") != "CONTROL":
+        raise ValueError("operation control receipt class is invalid")
+    for field in ("failure_code", "stage"):
+        if not _is_nonempty_text(receipt.get(field)):
+            raise ValueError(f"operation control receipt {field} is invalid")
+    identity = OperationExecutionIdentity(receipt["execution_identity"])
+    if receipt.get("scope") != identity.scope:
+        raise ValueError("operation control receipt scope is inconsistent")
+    retryable = receipt.get("retryable_evidence")
+    if (
+        not isinstance(retryable, Mapping)
+        or set(retryable) != {"retryable", "basis"}
+        or not isinstance(retryable.get("retryable"), bool)
+        or not _is_nonempty_text(retryable.get("basis"))
+    ):
+        raise ValueError("operation control retryability evidence is invalid")
+    diagnostics = receipt.get("diagnostics")
+    if not isinstance(diagnostics, Mapping) or not diagnostics:
+        raise ValueError("operation control diagnostics are incomplete")
+    if diagnostics_validator is not None and not diagnostics_validator(receipt):
+        raise ValueError("operation control diagnostics are invalid")
+    binding = receipt.get("canonical_request_binding")
+    if not isinstance(binding, Mapping) or set(binding) != _REQUEST_BINDING_FIELDS:
+        raise ValueError("operation control request binding is invalid")
+    expected_binding = canonical_request_binding(identity)
+    if dict(binding) != expected_binding:
+        raise ValueError("operation control identity binding is inconsistent")
+    if request_sha256 is not None and identity.request_sha256 != request_sha256:
+        raise ValueError("operation control request digest mismatch")
+    if request is not None:
+        if request_sha256 is None:
+            request_sha256 = canonical_sha256(dict(request))
+        expected_identity = execution_identity_from_request(
+            request,
+            request_sha256=request_sha256,
+            sample_index=(
+                int(identity.mapping["sample_index"])
+                if identity.scope == SAMPLE_SCOPE
+                else None
+            ),
+            sample_role=(
+                str(identity.mapping["sample_role"])
+                if identity.scope == SAMPLE_SCOPE
+                else None
+            ),
+        )
+        if identity.to_mapping() != expected_identity.to_mapping():
+            raise ValueError("operation control identity does not match request")
+    return ValidatedControlReceipt(
+        receipt,
+        identity,
+        _token=ValidatedControlReceipt._TOKEN,
+        request=request,
+    )
+
+
+def build_operation_control_receipt(
+    *,
+    origin: str,
+    failure_code: str,
+    stage: str,
+    identity: OperationExecutionIdentity,
+    retryable: bool,
+    retryable_basis: str,
+    diagnostics: Mapping[str, object],
+) -> dict[str, object]:
+    content: dict[str, object] = {
+        "schema": OPERATION_CONTROL_RECEIPT_SCHEMA,
+        "origin": origin,
+        "failure_class": "CONTROL",
+        "failure_code": failure_code,
+        "stage": stage,
+        "scope": identity.scope,
+        "execution_identity": identity.to_mapping(),
+        "retryable_evidence": {
+            "retryable": retryable,
+            "basis": retryable_basis,
+        },
+        "diagnostics": copy.deepcopy(dict(diagnostics)),
+        "canonical_request_binding": canonical_request_binding(identity),
+    }
+    return {**content, "receipt_sha256": canonical_sha256(content)}
+
+
+@dataclass(frozen=True, slots=True)
+class PromotedControlTransition:
+    origin: str
+    operation: str
+    failure_code: str
+    stage: str
+    scope: str
+    current_tier: str
+    current_action_kind: str
+    validator: str
+    exception_type: str
+    containable: bool
+    disposition: str
+    queue_kind: str | None
+    next_tier: str | None
+    next_action_kind: str | None
+    persist_return: bool
+    persist_decision: bool
+    explicitly_fatal: bool
+
+    @property
+    def key(self) -> tuple[str, str, str, str, str, str, str]:
+        return (
+            self.origin,
+            self.operation,
+            self.failure_code,
+            self.stage,
+            self.scope,
+            self.current_tier,
+            self.current_action_kind,
+        )
+
+
+_CODE_STAGE: Mapping[str, tuple[str, ...]] = MappingProxyType({
+    "SCATTERING_BASIS_ILL_CONDITIONED": ("scattering-extraction",),
+    "SCATTERING_CHART_ILL_CONDITIONED": ("determinant-chart",),
+    "ASYMPTOTIC_SERIES_INVALID": ("asymptotic-preflight",),
+    "INSUFFICIENT_ASYMPTOTIC_PRECISION": ("asymptotic-preflight",),
+    "PHYSICAL_SINGULAR_LIMIT": ("homogeneous-propagation",),
+    "ALGEBRAIC_REPRESENTATION_SINGULAR": ("determinant-chart",),
+    "CARRIER_CHANGE_INCONSISTENT": ("homogeneous-propagation",),
+    "INVALID_FACTORED_PROPAGATION_INPUT": ("homogeneous-propagation",),
+    "FACTORED_PROPAGATION_PRECISION_MISMATCH": ("homogeneous-propagation",),
+    "NONFINITE_FACTORED_PROPAGATION_DATA": ("homogeneous-propagation",),
+    "FACTORED_ODE_FAILURE": ("homogeneous-propagation",),
+    "NO_VERIFIED_HORIZON_ENDPOINT": ("horizon-endpoint-geometry",),
+    "COORDINATE_INVERSION_STALLED": ("coordinate-inversion",),
+    "DETERMINANT_UNCERTAINTY_TOO_LARGE": ("root-authentication",),
+    "EXTERIOR_DETERMINANT_CERTIFICATE_UNAVAILABLE": ("determinant-chart",),
+    "FINITE_DIFFERENCE_NOISE_LIMIT": ("finite-difference",),
+    "HORIZON_GEOMETRY_EXHAUSTED": ("horizon-endpoint-geometry",),
+    "HORIZON_MAXIMUM_ORDER_INADEQUATE": ("horizon-endpoint-geometry",),
+    "HORIZON_ARITHMETIC_INADEQUATE": ("horizon-endpoint-geometry",),
+    "HORIZON_COORDINATE_INVERSION_FAILED": ("coordinate-inversion",),
+    "HORIZON_ONLY_ONE_ENDPOINT": ("horizon-endpoint-geometry",),
+    "ODE_RESOURCE_LIMIT": ("homogeneous-propagation",),
+    "ROOT_READOUT_RESOURCE_INFEASIBLE": ("request-policy",),
+    "COORDINATE_IDENTITY_MISMATCH": ("coordinate-inversion",),
+    "ODE_SOLVER_FAILURE": ("homogeneous-propagation",),
+    "WORKER_TIMEOUT": ("worker-supervision",),
+    "ROOT_UNCERTAINTY_EVIDENCE_UNAVAILABLE": ("root-authentication",),
+    "DETERMINANT_ERROR_EVIDENCE_UNAVAILABLE": ("determinant-chart",),
+    "BLOCKED_BY_REVIEWED_ERROR_EVIDENCE": ("determinant-chart",),
+    "ROOT_SEAL_UNAVAILABLE": ("root-authentication",),
+})
+
+_PROMOTION_CODES: Mapping[str, str] = MappingProxyType({
+    "INSUFFICIENT_ASYMPTOTIC_PRECISION": "RESPONSE",
+    "HORIZON_ARITHMETIC_INADEQUATE": "RESPONSE",
+    "ROOT_UNCERTAINTY_EVIDENCE_UNAVAILABLE": "ROOT",
+    "FINITE_DIFFERENCE_NOISE_LIMIT": "RESPONSE",
+    "DETERMINANT_ERROR_EVIDENCE_UNAVAILABLE": "RESPONSE",
+    "BLOCKED_BY_REVIEWED_ERROR_EVIDENCE": "RESPONSE",
+    "DETERMINANT_UNCERTAINTY_TOO_LARGE": "ROOT",
+    "ROOT_SEAL_UNAVAILABLE": "ROOT",
+})
+_DEFERRED_CODES = frozenset({
+    "ODE_RESOURCE_LIMIT",
+    "ROOT_READOUT_RESOURCE_INFEASIBLE",
+    "WORKER_TIMEOUT",
+})
+_REJECTED_CODES = frozenset({
+    "PHYSICAL_SINGULAR_LIMIT",
+    "ALGEBRAIC_REPRESENTATION_SINGULAR",
+})
+_EXPLICIT_FATAL_CODES = frozenset({
+    "ASYMPTOTIC_SERIES_INVALID",
+    "CARRIER_CHANGE_INCONSISTENT",
+    "EXTERIOR_DETERMINANT_CERTIFICATE_UNAVAILABLE",
+    "FACTORED_ODE_FAILURE",
+    "FACTORED_PROPAGATION_PRECISION_MISMATCH",
+    "HORIZON_COORDINATE_INVERSION_FAILED",
+    "INVALID_FACTORED_PROPAGATION_INPUT",
+    "NONFINITE_FACTORED_PROPAGATION_DATA",
+    "NO_VERIFIED_HORIZON_ENDPOINT",
+    "COORDINATE_IDENTITY_MISMATCH",
+    "ODE_SOLVER_FAILURE",
+})
+
+
+def _build_transition_registry() -> Mapping[tuple[str, str, str, str, str, str, str], PromotedControlTransition]:
+    result: dict[tuple[str, str, str, str, str, str, str], PromotedControlTransition] = {}
+    operation_actions = (
+        (ROOT_READOUT_OPERATION, "ROOT", REQUEST_SCOPE),
+        (FIXED_ROOT_SURVEY_BATCH_OPERATION, "RESPONSE", SAMPLE_SCOPE),
+    )
+    for operation, action, scope in operation_actions:
+        for code, stages in _CODE_STAGE.items():
+            origin = PYTHON_SUPERVISOR_ORIGIN if code == "WORKER_TIMEOUT" else JULIA_WORKER_ORIGIN
+            for stage in stages:
+                for tier in ("BF40", "BF80"):
+                    promoted_queue = _PROMOTION_CODES.get(code)
+                    promotes = tier == "BF40" and promoted_queue == action
+                    explicitly_fatal = code in _EXPLICIT_FATAL_CODES
+                    if promotes:
+                        disposition = "PROMOTION_PENDING"
+                        queue_kind = action
+                        next_tier = "BF80"
+                        next_action = action
+                        containable = True
+                    elif explicitly_fatal:
+                        disposition = "SYSTEM_FAILURE"
+                        queue_kind = None
+                        next_tier = None
+                        next_action = None
+                        containable = False
+                    elif code in _DEFERRED_CODES:
+                        disposition = "DEFERRED"
+                        queue_kind = None
+                        next_tier = None
+                        next_action = None
+                        containable = True
+                    elif code in _REJECTED_CODES:
+                        disposition = "REJECTED"
+                        queue_kind = None
+                        next_tier = None
+                        next_action = None
+                        containable = True
+                    else:
+                        disposition = "UNRESOLVED"
+                        queue_kind = None
+                        next_tier = None
+                        next_action = None
+                        containable = True
+                    transition = PromotedControlTransition(
+                        origin=origin,
+                        operation=operation,
+                        failure_code=code,
+                        stage=stage,
+                        scope=scope,
+                        current_tier=tier,
+                        current_action_kind=action,
+                        validator=(
+                            "supervisor-timeout/v1"
+                            if origin == PYTHON_SUPERVISOR_ORIGIN
+                            else "julia-control-diagnostics/v1"
+                        ),
+                        exception_type=(
+                            "JuliaWorkerTimeoutError"
+                            if code == "WORKER_TIMEOUT"
+                            else "JuliaNumericalControlError"
+                        ),
+                        containable=containable,
+                        disposition=disposition,
+                        queue_kind=queue_kind,
+                        next_tier=next_tier,
+                        next_action_kind=next_action,
+                        persist_return=True,
+                        persist_decision=True,
+                        explicitly_fatal=explicitly_fatal,
+                    )
+                    if transition.key in result:
+                        raise RuntimeError("duplicate promoted control transition")
+                    result[transition.key] = transition
+    # A supervisor timeout may occur before Julia selects the first descriptor,
+    # so fixed-root timeout has a separate, exact REQUEST-scope transition.
+    for tier in ("BF40", "BF80"):
+        transition = PromotedControlTransition(
+            origin=PYTHON_SUPERVISOR_ORIGIN,
+            operation=FIXED_ROOT_SURVEY_BATCH_OPERATION,
+            failure_code="WORKER_TIMEOUT",
+            stage="worker-supervision",
+            scope=REQUEST_SCOPE,
+            current_tier=tier,
+            current_action_kind="RESPONSE",
+            validator="supervisor-timeout/v1",
+            exception_type="JuliaWorkerTimeoutError",
+            containable=True,
+            disposition="DEFERRED",
+            queue_kind=None,
+            next_tier=None,
+            next_action_kind=None,
+            persist_return=True,
+            persist_decision=True,
+            explicitly_fatal=False,
+        )
+        result[transition.key] = transition
+    return MappingProxyType(result)
+
+
+PROMOTED_CONTROL_TRANSITIONS = _build_transition_registry()
+
+
+def promoted_control_transition(
+    receipt: ValidatedControlReceipt,
+    *,
+    current_tier: str,
+    current_action_kind: str,
+) -> PromotedControlTransition:
+    key = (
+        receipt.origin,
+        receipt.identity.operation,
+        receipt.failure_code,
+        receipt.stage,
+        receipt.identity.scope,
+        current_tier,
+        current_action_kind,
+    )
+    try:
+        return PROMOTED_CONTROL_TRANSITIONS[key]
+    except KeyError as error:
+        raise ValueError("promoted CONTROL outcome has no exact transition") from error
+
+
+def promotion_failure_codes() -> Mapping[str, str]:
+    return _PROMOTION_CODES

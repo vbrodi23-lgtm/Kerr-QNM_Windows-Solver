@@ -914,12 +914,18 @@ def retain_promoted_raw_calculation(
     _authenticate_promoted_stage_chain(
         stage, queue_entry=entry, queue_ordinal=queue_ordinal
     )
+    artifact_digest_field = (
+        "control_return_sha256"
+        if artifact.get("schema")
+        == "windows-solver.promoted-exterior-control-return/2"
+        else "calculation_sha256"
+    )
     artifact_content = {
-        key: item for key, item in artifact.items() if key != "calculation_sha256"
+        key: item for key, item in artifact.items() if key != artifact_digest_field
     }
     if (
-        not _is_sha256(artifact.get("calculation_sha256"))
-        or artifact["calculation_sha256"] != _sha256(artifact_content)
+        not _is_sha256(artifact.get(artifact_digest_field))
+        or artifact[artifact_digest_field] != _sha256(artifact_content)
     ):
         raise ValueError("raw promoted calculation artifact digest is invalid")
     receipt = copy.deepcopy(dict(disposition_receipt))
@@ -927,6 +933,12 @@ def retain_promoted_raw_calculation(
     supplied_fingerprint = receipt.get("source_fingerprint_sha256")
     if supplied_fingerprint is not None and supplied_fingerprint != source_fingerprint_sha256:
         raise ValueError("raw promoted calculation source fingerprint is invalid")
+    if receipt.get("schema") == "windows-solver.promoted-raw-return-retention/3":
+        if (
+            receipt.get("artifact_digest_field") != artifact_digest_field
+            or receipt.get("artifact_sha256") != artifact[artifact_digest_field]
+        ):
+            raise ValueError("raw promoted return receipt is invalid")
     receipt.update({
         "source_fingerprint_sha256": source_fingerprint_sha256,
         "retained_promoted_stage_sha256": stage_sha256,
@@ -1705,17 +1717,24 @@ def validate_schema11_checkpoint(
                 and stage.get("precision_tiers") == ["BF40"]
             )
             raw_artifact = stage.get("calculation_artifact")
+            raw_digest_field = (
+                "control_return_sha256"
+                if isinstance(raw_artifact, Mapping)
+                and raw_artifact.get("schema")
+                == "windows-solver.promoted-exterior-control-return/2"
+                else "calculation_sha256"
+            )
             valid_raw_stage = (
                 admission_state == "CALCULATED_PENDING_DERIVATION"
                 and queue_entry["disposition"]
                 == PromotionQueueDisposition.CALCULATED_PENDING_DERIVATION.value
                 and isinstance(raw_artifact, Mapping)
-                and _is_sha256(raw_artifact.get("calculation_sha256"))
-                and raw_artifact["calculation_sha256"]
+                and _is_sha256(raw_artifact.get(raw_digest_field))
+                and raw_artifact[raw_digest_field]
                 == _sha256({
                     key: item
                     for key, item in raw_artifact.items()
-                    if key != "calculation_sha256"
+                    if key != raw_digest_field
                 })
             )
             valid_reduced_numerical_terminal = (

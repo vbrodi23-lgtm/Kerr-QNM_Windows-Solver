@@ -8,6 +8,7 @@ from collections.abc import Mapping
 from windows_solver.contracts import canonical_json_bytes
 from windows_solver.adaptive_controls import ODEToleranceCalibration, derive_ode_error_budget
 from windows_solver.precision_tiers import PrecisionTier
+from windows_solver.operation_control import execution_identity_from_request
 
 
 SYNTHETIC_ODE_CALIBRATION = ODEToleranceCalibration(
@@ -1234,14 +1235,19 @@ def valid_julia_root_response(
             "root_converged": Decimal(correction) <= Decimal(tolerance),
         }
 
+    request_sha256 = hashlib.sha256(
+        canonical_json_bytes(request)
+    ).hexdigest()
     return {
         "schema_version": 11,
         "status": "ok",
         "adapter": "package-owned-julia-gsn-root-readout",
         "operation": "root-readout",
-        "request_sha256": hashlib.sha256(
-            canonical_json_bytes(request)
-        ).hexdigest(),
+        "request_sha256": request_sha256,
+        "execution_identity": execution_identity_from_request(
+            request,
+            request_sha256=request_sha256,
+        ).to_mapping(),
         "diagnostic_model_identity": diagnostic_model_identity,
         "required_raw_determinant_roles": list(
             request["required_raw_determinant_roles"]

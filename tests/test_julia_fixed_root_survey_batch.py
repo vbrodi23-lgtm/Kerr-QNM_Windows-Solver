@@ -8,10 +8,13 @@ import unittest
 from windows_solver.contracts import canonical_json_bytes
 from windows_solver.julia_response_backend import (
     FIXED_ROOT_SURVEY_BATCH_OPERATION,
+    FIXED_ROOT_SURVEY_BATCH_SCHEMA,
+    FixedRootSurveyPlan,
     JuliaFixedRootSurveyBatch,
     JuliaPrecisionRootBackend,
     JuliaResponseBackendError,
 )
+from windows_solver.operation_control import execution_identity_from_request
 from windows_solver.promoted_control_calibration import (
     load_default_calibration_receipt,
 )
@@ -44,7 +47,7 @@ def _job():
 def _conditioning(request) -> dict[str, object]:
     policy = request["policy"]
     return {
-        "schema": "windows-solver.fixed-root-survey-conditioning/1",
+        "schema": "windows-solver.fixed-root-survey-conditioning/2",
         "determinant_family": "exterior-wronskian/v1",
         "homogeneous_representation": policy["homogeneous_representation"],
         "branch_convention": policy["branch_convention"],
@@ -79,11 +82,18 @@ class _BatchAdapter:
     def evaluate_for_validation(self, request):
         self.requests.append(request)
         request_sha256 = hashlib.sha256(canonical_json_bytes(request)).hexdigest()
+        execution_identity = execution_identity_from_request(
+            request,
+            request_sha256=request_sha256,
+        )
         response = {
-            "schema_version": 1,
+            "schema_version": 2,
+            "schema": FIXED_ROOT_SURVEY_BATCH_SCHEMA,
             "status": "ok",
             "operation": FIXED_ROOT_SURVEY_BATCH_OPERATION,
             "identity": BINARY64_FIXED_ROOT_SURVEY_IDENTITY,
+            "plan": request["plan"],
+            "execution_identity": execution_identity.to_mapping(),
             "scientific_operation_identity": request[
                 "scientific_operation_identity"
             ],
@@ -100,7 +110,11 @@ class _BatchAdapter:
             "sample_count": len(request["samples"]),
             "samples": [
                 {
-                    "role": sample["role"],
+                    "sample_index": sample["sample_index"],
+                    "sample_role": sample["sample_role"],
+                    "execution_identity": execution_identity.select_sample(
+                        sample["sample_index"], sample["sample_role"]
+                    ).to_mapping(),
                     "omega": sample["omega"],
                     "amplitude": sample["amplitude"],
                     "determinant": {
@@ -147,7 +161,7 @@ class JuliaFixedRootSurveyBatchTests(unittest.TestCase):
             fixed_root=job.root.omega,
             root_seal_sha256="1" * 64,
             branch_identity=job.root.branch_id,
-            sample_roles=BINARY64_FIXED_ROOT_SAMPLE_ROLES,
+            plan=FixedRootSurveyPlan.FULL_NINE,
         )
 
         self.assertIsInstance(batch, JuliaFixedRootSurveyBatch)
@@ -156,6 +170,19 @@ class JuliaFixedRootSurveyBatchTests(unittest.TestCase):
         self.assertEqual(batch.sample_count, 9)
         request = adapter.requests[0]
         self.assertEqual(request["operation"], FIXED_ROOT_SURVEY_BATCH_OPERATION)
+        self.assertEqual(request["schema_version"], 2)
+        self.assertEqual(request["schema"], FIXED_ROOT_SURVEY_BATCH_SCHEMA)
+        self.assertEqual(request["plan"], FixedRootSurveyPlan.FULL_NINE.value)
+        self.assertEqual(request["fixed_root_reliability_target_abs"], "2e-11")
+        self.assertNotIn("root_correction_tolerance", request["policy"])
+        self.assertEqual(
+            [sample["sample_index"] for sample in request["samples"]],
+            list(range(9)),
+        )
+        self.assertEqual(
+            [sample["sample_role"] for sample in request["samples"]],
+            list(BINARY64_FIXED_ROOT_SAMPLE_ROLES),
+        )
         self.assertEqual(request["precision_digits"], 40)
         self.assertEqual(request["maximum_sample_count"], 9)
         for sample in request["samples"][:5]:
@@ -189,12 +216,14 @@ class JuliaFixedRootSurveyBatchTests(unittest.TestCase):
 
     def test_canonical_five_and_reused_mechanism_four_are_valid_plans(self):
         job = _job()
-        for operation_identity, roles in (
+        for requested_plan, operation_identity, roles in (
             (
+                FixedRootSurveyPlan.CANONICAL_BACKGROUND_FIVE,
                 CANONICAL_EXTERIOR_BACKGROUND_IDENTITY,
                 BINARY64_FIXED_ROOT_SAMPLE_ROLES[:5],
             ),
             (
+                FixedRootSurveyPlan.MECHANISM_COMPONENT_FOUR,
                 BINARY64_FIXED_ROOT_SURVEY_IDENTITY,
                 BINARY64_FIXED_ROOT_SAMPLE_ROLES[5:],
             ),
@@ -206,22 +235,17 @@ class JuliaFixedRootSurveyBatchTests(unittest.TestCase):
                     fixed_root=job.root.omega,
                     root_seal_sha256="2" * 64,
                     branch_identity=job.root.branch_id,
-                    scientific_operation_identity=operation_identity,
-                    sample_roles=roles,
+                    plan=requested_plan,
                 )
                 self.assertEqual(batch.sample_roles, roles)
+                self.assertEqual(batch.plan, requested_plan)
                 self.assertEqual(len(adapter.requests), 1)
 
     def test_invalid_roles_and_bf120_are_rejected_before_launch(self):
         job = _job()
-        invalid_plans = (
-            ("D0", "D0"),
-            ("UNKNOWN",),
-            tuple(reversed(BINARY64_FIXED_ROOT_SAMPLE_ROLES)),
-            BINARY64_FIXED_ROOT_SAMPLE_ROLES + ("D0",),
-        )
-        for roles in invalid_plans:
-            with self.subTest(roles=roles):
+        invalid_plans = ("UNKNOWN", "D0", "", None)
+        for invalid_plan in invalid_plans:
+            with self.subTest(plan=invalid_plan):
                 adapter = _BatchAdapter()
                 with self.assertRaises(ValueError):
                     _backend(adapter).preview_fixed_root_survey_request(
@@ -229,7 +253,7 @@ class JuliaFixedRootSurveyBatchTests(unittest.TestCase):
                         fixed_root=job.root.omega,
                         root_seal_sha256="3" * 64,
                         branch_identity=job.root.branch_id,
-                        sample_roles=roles,
+                        plan=invalid_plan,
                     )
                 self.assertEqual(adapter.requests, [])
 
@@ -240,7 +264,7 @@ class JuliaFixedRootSurveyBatchTests(unittest.TestCase):
                 fixed_root=job.root.omega,
                 root_seal_sha256="4" * 64,
                 branch_identity=job.root.branch_id,
-                sample_roles=BINARY64_FIXED_ROOT_SAMPLE_ROLES,
+                plan=FixedRootSurveyPlan.FULL_NINE,
             )
         self.assertEqual(adapter.requests, [])
 
@@ -261,7 +285,7 @@ class JuliaFixedRootSurveyBatchTests(unittest.TestCase):
                 fixed_root=job.root.omega,
                 root_seal_sha256="5" * 64,
                 branch_identity=job.root.branch_id,
-                sample_roles=BINARY64_FIXED_ROOT_SAMPLE_ROLES,
+                plan=FixedRootSurveyPlan.FULL_NINE,
             )
 
     def test_worker_survey_function_has_no_root_solving_calls(self):

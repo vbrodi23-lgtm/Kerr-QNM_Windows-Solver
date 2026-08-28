@@ -13,7 +13,7 @@ from types import MappingProxyType
 from typing import Protocol
 
 
-PROGRESS_SCHEMA = "windows-solver.progress/1"
+PROGRESS_SCHEMA = "windows-solver.progress/2"
 
 
 class ProgressMode(StrEnum):
@@ -191,6 +191,7 @@ _INTEGER_CONTEXT_KEYS = frozenset(
         "root_read_limit",
         "worker_launch_count",
         "worker_launch_limit",
+        "sample_index",
     }
 )
 _FLOAT_CONTEXT_KEYS = frozenset({
@@ -223,6 +224,18 @@ _STRING_CONTEXT_KEYS = frozenset(
         "report_state",
         "system_failure_fingerprint",
         "precision_tier",
+        "operation",
+        "plan",
+        "scope",
+        "sample_role",
+        "execution_identity_sha256",
+        "request_sha256",
+        "control_receipt_sha256",
+        "control_return_sha256",
+        "control_decision_sha256",
+        "current_action_kind",
+        "current_tier",
+        "next_tier",
     }
 )
 _MAPPING_CONTEXT_KEYS = frozenset(
@@ -275,6 +288,10 @@ def _validate_context_values(values: Mapping[str, object]) -> Mapping[str, objec
         "survey_pass": {"binary64", "promoted", "certify", "validate"},
         "evidence_level": {"SCREENED", "CERTIFIED", "VALIDATED"},
         "precision_tier": {"binary64", "BF40", "BF80", "BF120"},
+        "scope": {"REQUEST", "SAMPLE"},
+        "current_action_kind": {"ROOT", "RESPONSE"},
+        "current_tier": {"BF40", "BF80", "BF120"},
+        "next_tier": {"BF40", "BF80", "BF120"},
     }
     for name, allowed in enum_values.items():
         if values.get(name) is not None and values[name] not in allowed:
@@ -287,6 +304,32 @@ def _validate_context_values(values: Mapping[str, object]) -> Mapping[str, objec
             valid_fingerprint = False
         if not valid_fingerprint:
             raise ValueError("progress system failure fingerprint is invalid")
+    for name in (
+        "execution_identity_sha256",
+        "request_sha256",
+        "control_receipt_sha256",
+        "control_return_sha256",
+        "control_decision_sha256",
+    ):
+        digest = values.get(name)
+        if digest is None:
+            continue
+        try:
+            valid_digest = len(digest) == 64 and int(digest, 16) >= 0
+        except (TypeError, ValueError):
+            valid_digest = False
+        if not valid_digest:
+            raise ValueError(f"progress context {name} is invalid")
+    if values.get("scope") == "REQUEST" and (
+        values.get("sample_index") is not None
+        or values.get("sample_role") is not None
+    ):
+        raise ValueError("REQUEST progress context cannot select a sample")
+    if values.get("scope") == "SAMPLE" and (
+        values.get("sample_index") is None
+        or values.get("sample_role") is None
+    ):
+        raise ValueError("SAMPLE progress context requires a sample identity")
     return _mapping_snapshot(values)
 
 
@@ -337,6 +380,19 @@ class ProgressContext:
     report_state: str | None = None
     system_failure_fingerprint: str | None = None
     precision_tier: str | None = None
+    operation: str | None = None
+    plan: str | None = None
+    scope: str | None = None
+    sample_index: int | None = None
+    sample_role: str | None = None
+    execution_identity_sha256: str | None = None
+    request_sha256: str | None = None
+    control_receipt_sha256: str | None = None
+    control_return_sha256: str | None = None
+    control_decision_sha256: str | None = None
+    current_action_kind: str | None = None
+    current_tier: str | None = None
+    next_tier: str | None = None
     binary64_seconds: float | None = None
     bf40_seconds: float | None = None
     bf80_seconds: float | None = None

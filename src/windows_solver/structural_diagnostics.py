@@ -31,7 +31,23 @@ _LEAF_FIELDS = (
     "spin_display",
     "mechanism",
 )
-_EXECUTION_FIELDS = ("profile", "pass", "tier", "operation_identity")
+_PR74_EXECUTION_FIELDS = ("profile", "pass", "tier", "operation_identity")
+_EXECUTION_FIELDS = (
+    *_PR74_EXECUTION_FIELDS,
+    "operation",
+    "execution_identity_sha256",
+    "request_sha256",
+    "plan",
+    "scope",
+    "sample_index",
+    "sample_role",
+    "control_receipt_sha256",
+    "control_return_sha256",
+    "control_decision_sha256",
+    "current_action_kind",
+    "current_tier",
+    "next_tier",
+)
 _TRANSITION_FIELDS = ("prior_state", "next_state", "reason_code")
 _CONNECTION_FIELDS = (
     "scientific_computation_identity",
@@ -153,6 +169,43 @@ def _digest_or_none(value: object, name: str) -> str | None:
     return value
 
 
+def _validate_material_execution(value: Mapping[str, object]) -> None:
+    for name in (
+        "execution_identity_sha256",
+        "request_sha256",
+        "control_receipt_sha256",
+        "control_return_sha256",
+        "control_decision_sha256",
+    ):
+        if name in value:
+            _digest_or_none(value.get(name), f"structural execution {name}")
+    scope = value.get("scope")
+    if scope is not None and scope not in {"REQUEST", "SAMPLE"}:
+        raise ValueError("structural execution scope is invalid")
+    sample_index = value.get("sample_index")
+    sample_role = value.get("sample_role")
+    if scope == "REQUEST" and (sample_index is not None or sample_role is not None):
+        raise ValueError("REQUEST structural execution selects a sample")
+    if scope == "SAMPLE" and (
+        isinstance(sample_index, bool)
+        or not isinstance(sample_index, int)
+        or sample_index < 0
+        or not isinstance(sample_role, str)
+        or not sample_role
+    ):
+        raise ValueError("SAMPLE structural execution identity is invalid")
+    for name in ("current_action_kind",):
+        if value.get(name) is not None and value[name] not in {"ROOT", "RESPONSE"}:
+            raise ValueError(f"structural execution {name} is invalid")
+    for name in ("current_tier", "next_tier"):
+        if value.get(name) is not None and value[name] not in {
+            "BF40",
+            "BF80",
+            "BF120",
+        }:
+            raise ValueError(f"structural execution {name} is invalid")
+
+
 @dataclass(frozen=True, slots=True)
 class StructuralEvent:
     """One authenticated, append-only observation of scheduler movement."""
@@ -216,6 +269,7 @@ class StructuralEvent:
         if not isinstance(compact_diagnostics, Mapping):
             raise ValueError("structural event compact diagnostics must be an object")
         execution_section = _section(_EXECUTION_FIELDS, execution, "execution")
+        _validate_material_execution(execution_section)
         transition_section = _section(_TRANSITION_FIELDS, transition, "transition")
         leaf_section = _section(_LEAF_FIELDS, leaf, "leaf")
         if operation_flow is None:
@@ -308,9 +362,21 @@ class StructuralEvent:
             if isinstance(item, bool) or not isinstance(item, (int, float)) or item < 0:
                 raise ValueError(f"structural event {name} is invalid")
         _section(_LEAF_FIELDS, value.get("leaf"), "leaf", require_complete=True)
-        _section(
-            _EXECUTION_FIELDS, value.get("execution"), "execution", require_complete=True
+        execution_value = value.get("execution")
+        execution_fields = (
+            _PR74_EXECUTION_FIELDS
+            if isinstance(execution_value, Mapping)
+            and set(execution_value) == set(_PR74_EXECUTION_FIELDS)
+            else _EXECUTION_FIELDS
         )
+        _section(
+            execution_fields,
+            execution_value,
+            "execution",
+            require_complete=True,
+        )
+        if execution_fields == _EXECUTION_FIELDS:
+            _validate_material_execution(execution_value)
         _section(
             _TRANSITION_FIELDS,
             value.get("transition"),

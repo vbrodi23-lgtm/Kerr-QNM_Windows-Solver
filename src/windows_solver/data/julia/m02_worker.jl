@@ -3,6 +3,7 @@
 using LinearAlgebra
 using DifferentialEquations
 using JSON
+using SHA
 using SciMLBase
 using GeneralizedSasakiNakamura
 using SpinWeightedSpheroidalHarmonics
@@ -14,16 +15,56 @@ const Potentials = GeneralizedSasakiNakamura.Potentials
 const Solutions = GeneralizedSasakiNakamura.Solutions
 const GSNBranchConvention = GSN.GSNBranchConvention
 const PROGRESS_PREFIX = "@@KERR_QNM_PROGRESS@@"
-const PROGRESS_SCHEMA = "windows-solver.progress/1"
+const PROGRESS_SCHEMA = "windows-solver.progress/2"
 const CONDITIONING_SCHEMA = "windows-solver.m02-conditioning/3"
 const FIXED_ROOT_SURVEY_BATCH_OPERATION = "fixed-root-survey-batch"
 const FIXED_ROOT_SURVEY_BATCH_SCHEMA =
-    "windows-solver.fixed-root-survey-batch/1"
+    "windows-solver.fixed-root-survey-batch/2"
 const FIXED_ROOT_SURVEY_IDENTITY = "exterior-fixed-root-survey-raw/v1"
 const CANONICAL_EXTERIOR_BACKGROUND_IDENTITY =
     "canonical-exterior-background-wronskian/v1"
 const FIXED_ROOT_SURVEY_CONDITIONING_SCHEMA =
-    "windows-solver.fixed-root-survey-conditioning/1"
+    "windows-solver.fixed-root-survey-conditioning/2"
+const OPERATION_EXECUTION_IDENTITY_SCHEMA =
+    "windows-solver.operation-execution-identity/1"
+const OPERATION_CONTROL_RECEIPT_SCHEMA =
+    "windows-solver.operation-control-receipt/1"
+const CANONICAL_REQUEST_BINDING_SCHEMA =
+    "windows-solver.canonical-request-binding/1"
+const FIXED_ROOT_RELIABILITY_RULE =
+    "minus-log10-target-plus-required-digit-guard/v1"
+const OPERATION_EXECUTION_COMMON_FIELDS = Set((
+    "schema",
+    "scope",
+    "operation",
+    "request_schema",
+    "request_sha256",
+    "leaf_id",
+    "job_id",
+    "backend_identity_sha256",
+    "precision_digits",
+    "working_precision_bits",
+    "semantic_precision_tier",
+    "effective_policy_identity",
+    "execution_resource_policy_identity",
+))
+const ROOT_EXECUTION_REQUIRED_FIELDS = Set((
+    "role", "job_policy_sha256", "refinement_level",
+))
+const ROOT_EXECUTION_OPTIONAL_FIELDS = Set((
+    "root_phase", "newton_index", "readout_role",
+))
+const FIXED_ROOT_EXECUTION_FIELDS = Set((
+    "plan",
+    "scientific_operation_identity",
+    "root_reference_id",
+    "root_seal_sha256",
+    "branch_identity",
+    "sample_roles",
+))
+const FIXED_ROOT_SAMPLE_EXECUTION_FIELDS = Set((
+    "sample_index", "sample_role",
+))
 const FIXED_ROOT_SURVEY_ROLES = [
     "D0",
     "DOMEGA_REAL_PLUS_H",
@@ -339,19 +380,216 @@ function resource_policy_identity(request)
     )
 end
 
+function canonical_json(value)
+    if value isa AbstractDict
+        names = sort!(String[string(key) for key in keys(value)])
+        return "{" * join(
+            (JSON.json(name) * ":" * canonical_json(value[name]) for name in names),
+            ",",
+        ) * "}"
+    elseif value isa AbstractVector || value isa Tuple
+        return "[" * join((canonical_json(item) for item in value), ",") * "]"
+    elseif value === nothing || value isa Bool || value isa Number || value isa AbstractString
+        return JSON.json(value)
+    end
+    error("control receipt contains a non-JSON value")
+end
+
+canonical_sha256(value) = bytes2hex(SHA.sha256(codeunits(canonical_json(value))))
+
+function validated_execution_identity(value)
+    value isa AbstractDict || error("operation execution identity is invalid")
+    string(required(value, "schema")) == OPERATION_EXECUTION_IDENTITY_SCHEMA ||
+        error("operation execution identity schema is invalid")
+    scope = string(required(value, "scope"))
+    scope in ("REQUEST", "SAMPLE") ||
+        error("operation execution identity scope is invalid")
+    operation = string(required(value, "operation"))
+    operation in (
+        "root-readout",
+        "fixed-root-determinant-sample",
+        FIXED_ROOT_SURVEY_BATCH_OPERATION,
+    ) || error("operation execution identity operation is invalid")
+    expected_fields = copy(OPERATION_EXECUTION_COMMON_FIELDS)
+    allowed_fields = copy(OPERATION_EXECUTION_COMMON_FIELDS)
+    if operation == FIXED_ROOT_SURVEY_BATCH_OPERATION
+        union!(expected_fields, FIXED_ROOT_EXECUTION_FIELDS)
+        union!(allowed_fields, FIXED_ROOT_EXECUTION_FIELDS)
+        if scope == "SAMPLE"
+            union!(expected_fields, FIXED_ROOT_SAMPLE_EXECUTION_FIELDS)
+            union!(allowed_fields, FIXED_ROOT_SAMPLE_EXECUTION_FIELDS)
+        end
+        Set(string(key) for key in keys(value)) == expected_fields ||
+            error("fixed-root operation execution identity fields are invalid")
+    else
+        union!(expected_fields, ROOT_EXECUTION_REQUIRED_FIELDS)
+        union!(allowed_fields, ROOT_EXECUTION_REQUIRED_FIELDS)
+        union!(allowed_fields, ROOT_EXECUTION_OPTIONAL_FIELDS)
+        observed_fields = Set(string(key) for key in keys(value))
+        expected_fields ⊆ observed_fields ⊆ allowed_fields ||
+            error("root operation execution identity fields are invalid")
+    end
+    for key in (
+        "request_schema",
+        "request_sha256",
+        "leaf_id",
+        "job_id",
+        "backend_identity_sha256",
+        "precision_digits",
+        "working_precision_bits",
+        "semantic_precision_tier",
+        "effective_policy_identity",
+        "execution_resource_policy_identity",
+    )
+        required(value, key)
+    end
+    occursin(r"^[0-9a-f]{64}$", string(required(value, "request_sha256"))) ||
+        error("operation execution identity request digest is invalid")
+    if operation == FIXED_ROOT_SURVEY_BATCH_OPERATION
+        for key in (
+            "plan",
+            "scientific_operation_identity",
+            "root_reference_id",
+            "root_seal_sha256",
+            "branch_identity",
+            "sample_roles",
+        )
+            required(value, key)
+        end
+        if scope == "REQUEST"
+            !haskey(value, "sample_index") && !haskey(value, "sample_role") ||
+                error("fixed-root request identity selects a sample")
+        else
+            index = parse(Int, string(required(value, "sample_index")))
+            roles = required(value, "sample_roles")
+            0 <= index < length(roles) ||
+                error("fixed-root sample identity index is invalid")
+            string(required(value, "sample_role")) == string(roles[index + 1]) ||
+                error("fixed-root sample identity role is invalid")
+        end
+    else
+        scope == "REQUEST" || error("root execution identity scope is invalid")
+        for key in ("role", "job_policy_sha256", "refinement_level")
+            required(value, key)
+        end
+    end
+    for key in ("backend_identity_sha256",)
+        occursin(r"^[0-9a-f]{64}$", string(required(value, key))) ||
+            error("operation execution identity $(key) is invalid")
+    end
+    policy_identity = required(value, "effective_policy_identity")
+    if policy_identity isa AbstractDict
+        occursin(r"^[0-9a-f]{64}$", string(required(policy_identity, "sha256"))) ||
+            error("operation execution policy identity is invalid")
+    else
+        occursin(r"^[0-9a-f]{64}$", string(policy_identity)) ||
+            error("operation execution policy identity is invalid")
+    end
+    resource_identity = required(value, "execution_resource_policy_identity")
+    resource_identity isa AbstractDict &&
+        Set(string(key) for key in keys(resource_identity)) ==
+            Set(("schema", "version", "sha256")) &&
+        occursin(r"^[0-9a-f]{64}$", string(required(resource_identity, "sha256"))) ||
+        error("operation execution resource identity is invalid")
+    return Dict{String,Any}(string(key) => item for (key, item) in value)
+end
+
+function request_execution_identity(request)
+    return validated_execution_identity(required(request, "execution_identity"))
+end
+
+function validate_wire_execution_identity(document, default_request_schema::String)
+    identity = validated_execution_identity(required(document, "execution_identity"))
+    binding = Dict{String,Any}(
+        string(key) => value for (key, value) in document
+        if string(key) ∉ ("request_sha256", "execution_identity")
+    )
+    observed_request_sha256 = canonical_sha256(binding)
+    observed_request_sha256 == string(required(document, "request_sha256")) ==
+        string(required(identity, "request_sha256")) ||
+        error("operation execution identity request digest mismatch")
+    request_schema = haskey(document, "schema") ?
+        string(document["schema"]) : default_request_schema
+    string(required(identity, "request_schema")) == request_schema ||
+        error("operation execution identity request schema mismatch")
+    for key in (
+        "operation",
+        "leaf_id",
+        "job_id",
+        "backend_identity_sha256",
+        "precision_digits",
+        "working_precision_bits",
+        "semantic_precision_tier",
+    )
+        isequal(required(identity, key), required(document, key)) ||
+            error("operation execution identity $(key) mismatch")
+    end
+    policy = required(document, "policy")
+    string(required(identity, "effective_policy_identity")) ==
+        canonical_sha256(policy) ||
+        error("operation execution identity policy mismatch")
+    resource = required(document, "execution_resource")
+    resource_identity = required(identity, "execution_resource_policy_identity")
+    for key in ("schema", "version", "sha256")
+        isequal(required(resource_identity, key), required(resource, key)) ||
+            error("operation execution identity resource policy mismatch")
+    end
+    if string(required(identity, "operation")) ==
+            FIXED_ROOT_SURVEY_BATCH_OPERATION
+        for key in (
+            "plan",
+            "scientific_operation_identity",
+            "root_reference_id",
+            "root_seal_sha256",
+            "branch_identity",
+            "sample_roles",
+        )
+            isequal(required(identity, key), required(document, key)) ||
+                error("fixed-root operation execution identity $(key) mismatch")
+        end
+    else
+        for key in ("role", "job_policy_sha256", "refinement_level")
+            isequal(required(identity, key), required(document, key)) ||
+                error("root operation execution identity $(key) mismatch")
+        end
+        for key in ROOT_EXECUTION_OPTIONAL_FIELDS
+            if haskey(identity, key)
+                isequal(required(identity, key), required(document, key)) ||
+                    error("root operation execution identity $(key) mismatch")
+            end
+        end
+    end
+    return identity
+end
+
+function sample_execution_identity(request, sample_index::Int, sample_role::String)
+    identity = request_execution_identity(request)
+    string(required(identity, "operation")) == FIXED_ROOT_SURVEY_BATCH_OPERATION ||
+        error("sample identity requires a fixed-root request")
+    string(required(identity, "scope")) == "REQUEST" ||
+        error("fixed-root outer identity is not REQUEST scope")
+    roles = required(identity, "sample_roles")
+    0 <= sample_index < length(roles) ||
+        error("fixed-root sample index is invalid")
+    string(roles[sample_index + 1]) == sample_role ||
+        error("fixed-root sample role is invalid")
+    identity["scope"] = "SAMPLE"
+    identity["sample_index"] = sample_index
+    identity["sample_role"] = sample_role
+    return validated_execution_identity(identity)
+end
+
 function control_failure_context(request)
     now = time_ns()
-    return Dict{String,Any}(
+    identity = request_execution_identity(request)
+    context = Dict{String,Any}(
         "retryable" => true,
         "precision_digits" => parse_integer(request, "precision_digits"),
         "request_sha256" => required(request, "request_sha256"),
         "job_id" => required(request, "job_id"),
         "leaf_id" => required(request, "leaf_id"),
-        "role" => required(request, "role"),
-        "job_policy_sha256" => required(request, "job_policy_sha256"),
-        "backend_identity_sha256" =>
-            required(request, "backend_identity_sha256"),
-        "refinement_level" => required(request, "refinement_level"),
+        "operation" => required(identity, "operation"),
+        "execution_identity" => identity,
         "root_phase" => ACTIVE_PHASE[],
         "newton_index" => ACTIVE_NEWTON_INDEX[],
         "determinant_index" => DETERMINANT_INDEX_REQUEST[],
@@ -365,6 +603,77 @@ function control_failure_context(request)
             nothing : (now - ACTIVE_PHASE_STARTED_NS[]) / 1.0e9,
         "execution_resource_policy" => resource_policy_identity(request),
     )
+    if string(required(identity, "operation")) in (
+        "root-readout", "fixed-root-determinant-sample"
+    )
+        context["role"] = required(identity, "role")
+        context["job_policy_sha256"] = required(identity, "job_policy_sha256")
+        context["refinement_level"] = required(identity, "refinement_level")
+    elseif string(required(identity, "scope")) == "SAMPLE"
+        context["sample_index"] = required(identity, "sample_index")
+        context["sample_role"] = required(identity, "sample_role")
+    end
+    return context
+end
+
+const CONTROL_STAGE_BY_CODE = Dict(
+    "ODE_RESOURCE_LIMIT" => "homogeneous-propagation",
+    "ROOT_READOUT_RESOURCE_INFEASIBLE" => "request-policy",
+    "ODE_SOLVER_FAILURE" => "homogeneous-propagation",
+    "COORDINATE_INVERSION_STALLED" => "coordinate-inversion",
+    "COORDINATE_IDENTITY_MISMATCH" => "coordinate-inversion",
+)
+
+function operation_control_receipt(request, details)
+    code = string(required(details, "failure_code"))
+    stage = haskey(details, "stage") ? string(details["stage"]) :
+        get(CONTROL_STAGE_BY_CODE, code, "determinant-chart")
+    identity = haskey(details, "execution_identity") ?
+        validated_execution_identity(details["execution_identity"]) :
+        request_execution_identity(request)
+    diagnostics = if haskey(details, "diagnostics")
+        Dict{String,Any}(details["diagnostics"])
+    else
+        excluded = Set((
+            "failure_code", "failure_class", "retryable", "stage",
+            "execution_identity", "request_sha256", "job_id", "leaf_id",
+            "operation", "role", "job_policy_sha256", "refinement_level",
+            "backend_identity_sha256", "execution_resource_policy",
+        ))
+        Dict{String,Any}(
+            string(key) => value for (key, value) in details
+            if !(string(key) in excluded)
+        )
+    end
+    isempty(diagnostics) && (diagnostics["reason"] = code)
+    retryable = Bool(get(details, "retryable", false))
+    identity_sha256 = canonical_sha256(identity)
+    binding = Dict{String,Any}(
+        "schema" => CANONICAL_REQUEST_BINDING_SCHEMA,
+        "operation" => string(required(identity, "operation")),
+        "request_schema" => string(required(identity, "request_schema")),
+        "request_sha256" => string(required(identity, "request_sha256")),
+        "execution_identity_sha256" => identity_sha256,
+    )
+    content = Dict{String,Any}(
+        "schema" => OPERATION_CONTROL_RECEIPT_SCHEMA,
+        "origin" => "JULIA_WORKER",
+        "failure_class" => "CONTROL",
+        "failure_code" => code,
+        "stage" => stage,
+        "scope" => string(required(identity, "scope")),
+        "execution_identity" => identity,
+        "retryable_evidence" => Dict(
+            "retryable" => retryable,
+            "basis" => retryable ?
+                "worker-declared bounded control continuation/v1" :
+                "worker-declared non-retryable control outcome/v1",
+        ),
+        "diagnostics" => diagnostics,
+        "canonical_request_binding" => binding,
+    )
+    content["receipt_sha256"] = canonical_sha256(content)
+    return content
 end
 
 function throw_ode_resource_limit(
@@ -784,6 +1093,13 @@ end
 required(request, key) = haskey(request, key) ? request[key] : error("missing request key $key")
 
 function flatten_request(document)
+    operation = string(required(document, "operation"))
+    default_request_schema = operation == "fixed-root-determinant-sample" ?
+        "windows-solver.fixed-root-determinant-sample/1" :
+        "windows-solver.root-readout/1"
+    execution_identity = validate_wire_execution_identity(
+        document, default_request_schema
+    )
     mode = required(document, "mode")
     omega = required(document, "omega")
     angular = required(document, "angular_A")
@@ -821,6 +1137,7 @@ function flatten_request(document)
             document, "semantic_precision_tier"
         ),
         "request_sha256" => required(document, "request_sha256"),
+        "execution_identity" => execution_identity,
         "readout_radius" => required(policy, "readout_radius"),
         "ode_relative_tolerance" => required(policy, "ode_relative_tolerance"),
         "ode_absolute_tolerance" => required(policy, "ode_absolute_tolerance"),
@@ -1736,9 +2053,19 @@ function phase_control_identity(request)
 end
 
 function required_reliable_digits(::Type{T}, request) where {T<:AbstractFloat}
-    tolerance = parse_real(T, request, "root_correction_tolerance")
+    operation = string(required(request, "operation"))
+    tolerance = if operation == FIXED_ROOT_SURVEY_BATCH_OPERATION
+        string(required(request, "fixed_root_reliability_rule")) ==
+            FIXED_ROOT_RELIABILITY_RULE ||
+            error("fixed-root reliability rule is invalid")
+        parse_real(T, request, "fixed_root_reliability_target_abs")
+    elseif operation in ("root-readout", "fixed-root-determinant-sample")
+        parse_real(T, request, "root_correction_tolerance")
+    else
+        error("reliable-digit policy is undefined for this operation")
+    end
     zero(T) < tolerance < one(T) ||
-        error("root correction tolerance must lie strictly between zero and one")
+        error("reliability target must lie strictly between zero and one")
     return -log10(tolerance) + T(REQUIRED_DIGIT_GUARD)
 end
 
@@ -2266,6 +2593,7 @@ function throw_coordinate_identity_mismatch(
         "$(label) failed the coordinate identity gate: $(reason)",
         diagnostics;
         retryable=true,
+        stage="coordinate-inversion",
     ))
 end
 
@@ -7705,6 +8033,7 @@ function result_fields(::Type{T}, request, digits::Int, bits::Int) where {T<:Abs
             "adapter" => "package-owned-julia-gsn-root-readout",
             "operation" => "root-readout",
             "request_sha256" => string(required(request, "request_sha256")),
+            "execution_identity" => request_execution_identity(request),
             "diagnostic_model_identity" => string(required(
                 request, "diagnostic_model_identity"
             )),
@@ -7789,6 +8118,7 @@ function result_fields(::Type{T}, request, digits::Int, bits::Int) where {T<:Abs
         "adapter" => "package-owned-julia-gsn-root-readout",
         "operation" => "root-readout",
         "request_sha256" => string(required(request, "request_sha256")),
+        "execution_identity" => request_execution_identity(request),
         "diagnostic_model_identity" => string(required(
             request, "diagnostic_model_identity"
         )),
@@ -7840,6 +8170,8 @@ function flatten_fixed_root_survey_request(document)
         "schema",
         "operation",
         "identity",
+        "plan",
+        "execution_identity",
         "scientific_operation_identity",
         "leaf_id",
         "job_id",
@@ -7855,6 +8187,8 @@ function flatten_fixed_root_survey_request(document)
         "precision_digits",
         "working_precision_bits",
         "semantic_precision_tier",
+        "fixed_root_reliability_target_abs",
+        "fixed_root_reliability_rule",
         "frequency_step",
         "coordinate_step",
         "sample_roles",
@@ -7866,6 +8200,9 @@ function flatten_fixed_root_survey_request(document)
     ))
     Set(keys(document)) == expected_fields ||
         error("fixed-root survey request fields are invalid")
+    execution_identity = validate_wire_execution_identity(
+        document, FIXED_ROOT_SURVEY_BATCH_SCHEMA
+    )
     mode = required(document, "mode")
     angular = required(document, "angular_A")
     fixed_root = required(document, "fixed_root")
@@ -7879,6 +8216,8 @@ function flatten_fixed_root_survey_request(document)
         "schema" => required(document, "schema"),
         "operation" => required(document, "operation"),
         "identity" => required(document, "identity"),
+        "plan" => required(document, "plan"),
+        "execution_identity" => execution_identity,
         "scientific_operation_identity" =>
             required(document, "scientific_operation_identity"),
         "leaf_id" => required(document, "leaf_id"),
@@ -7902,6 +8241,10 @@ function flatten_fixed_root_survey_request(document)
         "working_precision_bits" => required(document, "working_precision_bits"),
         "semantic_precision_tier" =>
             required(document, "semantic_precision_tier"),
+        "fixed_root_reliability_target_abs" =>
+            required(document, "fixed_root_reliability_target_abs"),
+        "fixed_root_reliability_rule" =>
+            required(document, "fixed_root_reliability_rule"),
         "frequency_step" => required(document, "frequency_step"),
         "coordinate_step" => required(document, "coordinate_step"),
         "sample_roles" => required(document, "sample_roles"),
@@ -8005,7 +8348,7 @@ function validate_fixed_root_survey_policy(request)
 end
 
 function validate_fixed_root_survey_request(request)
-    parse_integer(request, "schema_version") == 1 ||
+    parse_integer(request, "schema_version") == 2 ||
         error("fixed-root survey schema version is invalid")
     string(required(request, "schema")) == FIXED_ROOT_SURVEY_BATCH_SCHEMA ||
         error("fixed-root survey schema is invalid")
@@ -8014,6 +8357,12 @@ function validate_fixed_root_survey_request(request)
         error("fixed-root survey operation is invalid")
     string(required(request, "identity")) == FIXED_ROOT_SURVEY_IDENTITY ||
         error("fixed-root survey identity is invalid")
+    identity = request_execution_identity(request)
+    string(required(identity, "scope")) == "REQUEST" ||
+        error("fixed-root outer execution identity is not REQUEST scope")
+    string(required(identity, "request_sha256")) ==
+        string(required(request, "request_sha256")) ||
+        error("fixed-root execution identity request binding is invalid")
     mechanism = string(required(request, "mechanism_id"))
     mechanism in ALLOWED_MECHANISMS && mechanism != "horizon-admittance" ||
         error("fixed-root survey requires an exterior mechanism")
@@ -8026,6 +8375,14 @@ function validate_fixed_root_survey_request(request)
         error("fixed-root survey working precision is invalid")
     string(required(request, "semantic_precision_tier")) ==
         "bigfloat-$(digits)" || error("fixed-root survey tier is invalid")
+    string(required(request, "fixed_root_reliability_rule")) ==
+        FIXED_ROOT_RELIABILITY_RULE ||
+        error("fixed-root reliability rule is invalid")
+    reliability_target = parse_real(
+        BigFloat, request, "fixed_root_reliability_target_abs"
+    )
+    zero(BigFloat) < reliability_target < one(BigFloat) ||
+        error("fixed-root reliability target is invalid")
     parse_integer(request, "maximum_sample_count") == 9 ||
         error("fixed-root survey sample budget is invalid")
     for key in (
@@ -8081,16 +8438,25 @@ function validate_fixed_root_survey_request(request)
     scientific_identity = string(required(
         request, "scientific_operation_identity"
     ))
-    valid_roles = if scientific_identity ==
-            CANONICAL_EXTERIOR_BACKGROUND_IDENTITY
-        roles == FIXED_ROOT_SURVEY_BACKGROUND_ROLES
-    elseif scientific_identity == FIXED_ROOT_SURVEY_IDENTITY
-        roles == FIXED_ROOT_SURVEY_ROLES ||
+    plan = string(required(request, "plan"))
+    valid_roles = if plan == "CANONICAL_BACKGROUND_FIVE"
+        scientific_identity == CANONICAL_EXTERIOR_BACKGROUND_IDENTITY &&
+            roles == FIXED_ROOT_SURVEY_BACKGROUND_ROLES
+    elseif plan == "FULL_NINE"
+        scientific_identity == FIXED_ROOT_SURVEY_IDENTITY &&
+            roles == FIXED_ROOT_SURVEY_ROLES
+    elseif plan == "MECHANISM_COMPONENT_FOUR"
+        scientific_identity == FIXED_ROOT_SURVEY_IDENTITY &&
             roles == FIXED_ROOT_SURVEY_COORDINATE_ROLES
     else
         false
     end
     valid_roles || error("fixed-root survey roles are out of order")
+    string(required(identity, "plan")) == plan &&
+        string(required(identity, "scientific_operation_identity")) ==
+            scientific_identity &&
+        required(identity, "sample_roles") == roles ||
+        error("fixed-root request execution identity is inconsistent")
     samples = required(request, "samples")
     samples isa Vector && length(samples) == length(roles) ||
         error("fixed-root survey samples are invalid")
@@ -8121,11 +8487,13 @@ function validate_fixed_root_survey_request(request)
         role = roles[index]
         coordinate_role = role in FIXED_ROOT_SURVEY_COORDINATE_ROLES
         expected_fields = coordinate_role ?
-            Set(("role", "omega", "amplitude", "support")) :
-            Set(("role", "omega", "amplitude"))
+            Set(("sample_index", "sample_role", "omega", "amplitude", "support")) :
+            Set(("sample_index", "sample_role", "omega", "amplitude"))
         Set(keys(sample)) == expected_fields ||
             error("fixed-root survey sample fields are invalid")
-        string(required(sample, "role")) == role ||
+        parse_integer(sample, "sample_index") == index - 1 ||
+            error("fixed-root survey sample index binding is invalid")
+        string(required(sample, "sample_role")) == role ||
             error("fixed-root survey sample role binding is invalid")
         omega_mapping = required(sample, "omega")
         amplitude_mapping = required(sample, "amplitude")
@@ -8209,6 +8577,7 @@ function fixed_root_survey_batch_fields(request, digits::Int, bits::Int, roles, 
     outputs = Any[]
     for (index, sample) in enumerate(samples)
         role = roles[index]
+        zero_based_index = index - 1
         omega_mapping = required(sample, "omega")
         amplitude_mapping = required(sample, "amplitude")
         omega = Complex{BigFloat}(
@@ -8225,6 +8594,12 @@ function fixed_root_survey_batch_fields(request, digits::Int, bits::Int, roles, 
         sample_request["amplitude_re"] = numeric_text(real(amplitude))
         sample_request["amplitude_im"] = numeric_text(imag(amplitude))
         sample_request["readout_role"] = role
+        sample_request["sample_index"] = zero_based_index
+        sample_request["sample_role"] = role
+        selected_identity = sample_execution_identity(
+            request, zero_based_index, role
+        )
+        sample_request["execution_identity"] = selected_identity
         if role in FIXED_ROOT_SURVEY_COORDINATE_ROLES
             support = required(sample, "support")
             for key in ("lower", "upper", "centre", "half_width")
@@ -8235,15 +8610,35 @@ function fixed_root_survey_batch_fields(request, digits::Int, bits::Int, roles, 
             BigFloat, sample_request, fixed_root
         )
         before = DETERMINANT_INDEX_REQUEST[]
-        evaluation = determinant_progress(
-            BigFloat,
-            sample_request,
-            evaluation_context,
-            omega,
-            amplitude,
-            "fixed-root survey $(role)",
-            fixed_root,
-        )
+        evaluation = try
+            progress_scope(Dict{String,Any}(
+                "operation" => FIXED_ROOT_SURVEY_BATCH_OPERATION,
+                "scope" => "SAMPLE",
+                "plan" => string(required(request, "plan")),
+                "sample_index" => zero_based_index,
+                "sample_role" => role,
+                "execution_identity_sha256" =>
+                    canonical_sha256(selected_identity),
+                "request_sha256" => string(required(request, "request_sha256")),
+            )) do
+                determinant_progress(
+                    BigFloat,
+                    sample_request,
+                    evaluation_context,
+                    omega,
+                    amplitude,
+                    "fixed-root survey $(role)",
+                    fixed_root,
+                )
+            end
+        catch failure
+            if failure isa WorkerControlFailure
+                failure.details["execution_identity"] = selected_identity
+                failure.details["sample_index"] = zero_based_index
+                failure.details["sample_role"] = role
+            end
+            rethrow()
+        end
         certificate_required = exterior_empirical_certificate_required(sample_request)
         expected_determinant_calls = certificate_required ? 3 : 1
         DETERMINANT_INDEX_REQUEST[] == before + expected_determinant_calls ||
@@ -8255,7 +8650,9 @@ function fixed_root_survey_batch_fields(request, digits::Int, bits::Int, roles, 
             error("fixed-root survey sample is missing its required certificate")
         end
         push!(outputs, Dict{String,Any}(
-            "role" => role,
+            "sample_index" => zero_based_index,
+            "sample_role" => role,
+            "execution_identity" => selected_identity,
             "omega" => Dict(
                 "real" => numeric_text(real(omega)),
                 "imaginary" => numeric_text(imag(omega)),
@@ -8287,10 +8684,13 @@ function fixed_root_survey_batch_fields(request, digits::Int, bits::Int, roles, 
     length(outputs) == length(roles) ||
         error("fixed-root survey response count is invalid")
     return Dict{String,Any}(
-        "schema_version" => 1,
+        "schema_version" => 2,
+        "schema" => FIXED_ROOT_SURVEY_BATCH_SCHEMA,
         "status" => "ok",
         "operation" => FIXED_ROOT_SURVEY_BATCH_OPERATION,
         "identity" => FIXED_ROOT_SURVEY_IDENTITY,
+        "plan" => string(required(request, "plan")),
+        "execution_identity" => request_execution_identity(request),
         "scientific_operation_identity" =>
             string(required(request, "scientific_operation_identity")),
         "request_sha256" => string(required(request, "request_sha256")),
@@ -8345,6 +8745,7 @@ function fixed_root_determinant_sample_fields(
         "schema_version" => 2,
         "status" => "ok",
         "operation" => "fixed-root-determinant-sample",
+        "execution_identity" => request_execution_identity(request),
         "request_sha256" => string(required(request, "request_sha256")),
         "omega_re" => numeric_text(real(fixed_omega)),
         "omega_im" => numeric_text(imag(fixed_omega)),
@@ -8565,6 +8966,20 @@ function main()
         flatten_request(document)
     end
     try
+        execution_identity = request_execution_identity(request)
+        ACTIVE_PROGRESS_CONTEXT[] = merge(
+            ACTIVE_PROGRESS_CONTEXT[],
+            Dict{String,Any}(
+                "operation" => string(required(execution_identity, "operation")),
+                "scope" => string(required(execution_identity, "scope")),
+                "execution_identity_sha256" =>
+                    canonical_sha256(execution_identity),
+                "request_sha256" => string(required(request, "request_sha256")),
+            ),
+        )
+        if haskey(execution_identity, "plan")
+            ACTIVE_PROGRESS_CONTEXT[]["plan"] = execution_identity["plan"]
+        end
         progress_emit("request_started"; payload=Dict(
             "request_sha256" => string(required(request, "request_sha256")),
             "execution_resource_policy" => resource_policy_identity(request),
@@ -8598,7 +9013,9 @@ function main()
                 "status" => "error",
                 "error_type" => string(typeof(failure)),
                 "message" => sprint(showerror, failure),
-                "failure" => failure_details(failure),
+                "failure" => operation_control_receipt(
+                    request, failure_details(failure)
+                ),
             )
         else
             Dict(
