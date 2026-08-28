@@ -406,6 +406,35 @@ class OperationControlTests(unittest.TestCase):
         self.assertEqual("BF80", transition.next_tier)
         self.assertEqual("RESPONSE", transition.next_action_kind)
 
+    def test_multi_stage_worker_codes_have_exact_registry_entries(self) -> None:
+        expected = {
+            "ALGEBRAIC_REPRESENTATION_SINGULAR": {
+                "request-policy",
+                "finite-difference",
+                "determinant-chart",
+                "homogeneous-propagation",
+            },
+            "EXTERIOR_DETERMINANT_CERTIFICATE_UNAVAILABLE": {
+                "asymptotic-preflight",
+                "determinant-chart",
+            },
+        }
+        for operation, action, scope in (
+            (ROOT_READOUT_OPERATION, "ROOT", REQUEST_SCOPE),
+            (FIXED_ROOT_SURVEY_BATCH_OPERATION, "RESPONSE", SAMPLE_SCOPE),
+        ):
+            for code, stages in expected.items():
+                with self.subTest(operation=operation, failure_code=code):
+                    observed = {
+                        transition.stage
+                        for transition in PROMOTED_CONTROL_TRANSITIONS.values()
+                        if transition.operation == operation
+                        and transition.current_action_kind == action
+                        and transition.scope == scope
+                        and transition.failure_code == code
+                    }
+                    self.assertEqual(stages, observed)
+
     def test_timeout_is_request_scoped_and_never_precision_promotion(self) -> None:
         fixed_timeouts = [
             item
