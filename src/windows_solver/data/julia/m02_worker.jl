@@ -39,6 +39,8 @@ const OPERATION_EXECUTION_IDENTITY_SCHEMA =
     "windows-solver.operation-execution-identity/1"
 const OPERATION_CONTROL_RECEIPT_SCHEMA =
     "windows-solver.operation-control-receipt/1"
+const OPERATION_CONTROL_FACT_RECEIPT_SCHEMA =
+    "windows-solver.operation-control-fact-receipt/2"
 const CANONICAL_REQUEST_BINDING_SCHEMA =
     "windows-solver.canonical-request-binding/1"
 const FIXED_ROOT_RELIABILITY_PROJECTION_SCHEMA =
@@ -803,6 +805,10 @@ function operation_control_receipt(request, details)
     end
     isempty(diagnostics) && (diagnostics["reason"] = code)
     retryable = Bool(get(details, "retryable", false))
+    fact_only = string(required(identity, "operation")) ==
+        FIXED_ROOT_SURVEY_BATCH_OPERATION &&
+        string(required(identity, "request_schema")) ==
+        FIXED_ROOT_SURVEY_BATCH_SCHEMA
     identity_sha256 = canonical_sha256(identity)
     binding = Dict{String,Any}(
         "schema" => CANONICAL_REQUEST_BINDING_SCHEMA,
@@ -812,22 +818,23 @@ function operation_control_receipt(request, details)
         "execution_identity_sha256" => identity_sha256,
     )
     content = Dict{String,Any}(
-        "schema" => OPERATION_CONTROL_RECEIPT_SCHEMA,
+        "schema" => fact_only ? OPERATION_CONTROL_FACT_RECEIPT_SCHEMA :
+            OPERATION_CONTROL_RECEIPT_SCHEMA,
         "origin" => "JULIA_WORKER",
         "failure_class" => "CONTROL",
         "failure_code" => code,
         "stage" => stage,
         "scope" => string(required(identity, "scope")),
         "execution_identity" => identity,
-        "retryable_evidence" => Dict(
-            "retryable" => retryable,
-            "basis" => retryable ?
-                "worker-declared bounded control continuation/v1" :
-                "worker-declared non-retryable control outcome/v1",
-        ),
         "diagnostics" => diagnostics,
         "canonical_request_binding" => binding,
     )
+    if !fact_only
+        content["retryable_evidence"] = Dict(
+            "retryable" => retryable,
+            "basis" => "legacy compatibility projection/v1",
+        )
+    end
     content["receipt_sha256"] = canonical_sha256(content)
     return content
 end
@@ -3385,12 +3392,9 @@ function translate_numerical_control_failure(
                 "maximum_recurrence_digits_lost" =>
                     string(assessment.maximum_recurrence_digits_lost),
             ))
-            # The generic package condition is diagnostic-only for the `/3`
-            # fixed-root batch.  Legacy root/horizon operations retain their
-            # historical receipt semantics, while Python's transition
-            # registry withholds schema-11 promotion authority from this code.
-            retryable = string(required(request, "operation")) !=
-                "fixed-root-survey-batch"
+            # Generic asymptotic insufficiency is diagnostic-only.  Typed
+            # arithmetic outcomes alone can resolve to a promotion.
+            retryable = false
         end
         stage = if failure_code == "NO_VERIFIED_HORIZON_ENDPOINT"
             "horizon-endpoint-geometry"
@@ -4328,7 +4332,6 @@ function exterior_endpoint_recovery_failure(
         failure_code,
         "fixed-root exterior endpoint recovery failed: $(aggregate)",
         diagnostics;
-        retryable=aggregate == CF.ENDPOINT_ARITHMETIC_LIMITED,
         stage="asymptotic-preflight",
     )
 end
