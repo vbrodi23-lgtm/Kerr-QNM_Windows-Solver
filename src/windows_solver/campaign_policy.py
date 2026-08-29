@@ -41,19 +41,19 @@ PROMOTED_CONTROL_RETURN_SCHEMA = (
     "windows-solver.promoted-exterior-control-return/4"
 )
 PROMOTED_CONTROL_DECISION_SCHEMA = (
-    "windows-solver.promoted-exterior-control-decision/2"
+    "windows-solver.promoted-exterior-control-decision/3"
 )
 PROMOTED_HORIZON_CONTROL_RETURN_SCHEMA = (
     "windows-solver.promoted-horizon-control-return/2"
 )
 PROMOTED_HORIZON_CONTROL_DECISION_SCHEMA = (
-    "windows-solver.promoted-horizon-control-decision/1"
+    "windows-solver.promoted-horizon-control-decision/2"
 )
 PROMOTED_CONTROL_CONTINUATION_PROOF_SCHEMA = (
-    "windows-solver.promoted-control-continuation-proof/1"
+    "windows-solver.promoted-control-continuation-proof/2"
 )
 PROMOTED_CONTROL_TERMINAL_RECEIPT_SCHEMA = (
-    "windows-solver.promoted-control-terminal-disposition/2"
+    "windows-solver.promoted-control-terminal-disposition/3"
 )
 PROMOTED_POLICY_TERMINAL_STAGE_SCHEMA = (
     "windows-solver.promoted-policy-terminal-stage/1"
@@ -85,6 +85,15 @@ _PROMOTED_ARTIFACT_DIGEST_FIELDS = {
     PROMOTED_HORIZON_CONTROL_RETURN_SCHEMA: "control_return_sha256",
     PROMOTED_HORIZON_CONTROL_DECISION_SCHEMA: "control_decision_sha256",
 }
+
+
+def _control_outcome_kind(value: object) -> str | None:
+    """Read the canonical outcome enum without interpreting compatibility flags."""
+
+    transition = value.get("transition") if isinstance(value, Mapping) else None
+    outcome = transition.get("outcome") if isinstance(transition, Mapping) else None
+    kind = outcome.get("kind") if isinstance(outcome, Mapping) else None
+    return kind if isinstance(kind, str) else None
 
 
 class ExecutionProfile(str, Enum):
@@ -368,7 +377,24 @@ def promoted_control_terminal_disposition_receipt(
     expected_return_schema = _PROMOTED_CONTROL_DECISION_RETURN_SCHEMAS.get(
         decision_schema
     )
-    terminal = decision.get("disposition") if isinstance(decision, Mapping) else None
+    transition_payload = (
+        decision.get("transition") if isinstance(decision, Mapping) else None
+    )
+    transition_event = (
+        transition_payload.get("event")
+        if isinstance(transition_payload, Mapping)
+        else None
+    )
+    transition_outcome = (
+        transition_payload.get("outcome")
+        if isinstance(transition_payload, Mapping)
+        else None
+    )
+    terminal = (
+        transition_outcome.get("kind")
+        if isinstance(transition_outcome, Mapping)
+        else None
+    )
     if (
         decision_stage.get("schema")
         != PROMOTED_CONTROL_DECISION_STAGE_SCHEMA
@@ -384,6 +410,7 @@ def promoted_control_terminal_disposition_receipt(
         }
         or decision_stage.get("numerical_disposition") != terminal
         or decision_stage.get("reason_code") != decision.get("failure_code")
+        or not isinstance(transition_event, Mapping)
         or not isinstance(return_stage, Mapping)
         or return_stage.get("schema") != PROMOTED_CONTROL_RETURN_STAGE_SCHEMA
         or return_stage.get("route") != decision_stage.get("route")
@@ -409,12 +436,13 @@ def promoted_control_terminal_disposition_receipt(
         "retained_promoted_stage_sha256": decision_stage["stage_sha256"],
         "control_decision_schema": decision_schema,
         "control_decision_sha256": decision["control_decision_sha256"],
+        "transition_id": decision["transition_id"],
         "control_return_stage_sha256": return_stage["stage_sha256"],
         "control_return_schema": expected_return_schema,
         "control_return_sha256": control_return["control_return_sha256"],
         "control_receipt_sha256": control_return["control_receipt_sha256"],
-        "current_tier": decision["current_tier"],
-        "current_action_kind": decision["current_action_kind"],
+        "current_tier": transition_event["current_tier"],
+        "current_action_kind": transition_event["current_action_kind"],
     }
 
 
@@ -630,6 +658,14 @@ def _validate_promoted_stage_payload(
             ),
             expected_queue_ordinal=int(stage["queue_ordinal"]),
         )
+        transition = authority.classification.transition
+        if (
+            stage.get("numerical_disposition") != transition.disposition
+            or stage.get("reason_code") != transition.failure_code
+        ):
+            raise ValueError(
+                "promoted control-decision stage contradicts its transition"
+            )
         validate_persisted_control_stage_accounting(stage, authority)
         return
     if schema == PROMOTED_CONTROL_CONTINUATION_STAGE_SCHEMA:
@@ -662,6 +698,7 @@ def _validate_promoted_stage_payload(
             "control_return_sha256",
             "control_decision_stage_sha256",
             "control_decision_sha256",
+            "transition_id",
             "current_tier",
             "current_action_kind",
             "next_tier",
@@ -671,6 +708,21 @@ def _validate_promoted_stage_payload(
         proof_content = (
             {key: item for key, item in proof.items() if key != "proof_sha256"}
             if isinstance(proof, Mapping)
+            else None
+        )
+        transition_payload = (
+            decision.get("transition")
+            if isinstance(decision, Mapping)
+            else None
+        )
+        transition_event = (
+            transition_payload.get("event")
+            if isinstance(transition_payload, Mapping)
+            else None
+        )
+        transition_outcome = (
+            transition_payload.get("outcome")
+            if isinstance(transition_payload, Mapping)
             else None
         )
         if (
@@ -697,18 +749,23 @@ def _validate_promoted_stage_payload(
             != decision_stage.get("stage_sha256")
             or proof.get("control_decision_sha256")
             != decision.get("control_decision_sha256")
+            or proof.get("transition_id") != decision.get("transition_id")
             or proof.get("current_tier") != "BF40"
             or proof.get("next_tier") != "BF80"
             or proof.get("current_action_kind") not in {"ROOT", "RESPONSE"}
             or proof.get("next_action_kind")
             != proof.get("current_action_kind")
-            or decision.get("disposition") != "PROMOTION_PENDING"
-            or decision.get("queue_kind") != proof.get("current_action_kind")
-            or decision.get("current_tier") != proof.get("current_tier")
-            or decision.get("current_action_kind")
+            or not isinstance(transition_event, Mapping)
+            or not isinstance(transition_outcome, Mapping)
+            or transition_outcome.get("kind") != "PROMOTION_PENDING"
+            or transition_outcome.get("queue_kind")
             != proof.get("current_action_kind")
-            or decision.get("next_tier") != proof.get("next_tier")
-            or decision.get("next_action_kind")
+            or transition_event.get("current_tier")
+            != proof.get("current_tier")
+            or transition_event.get("current_action_kind")
+            != proof.get("current_action_kind")
+            or transition_outcome.get("next_tier") != proof.get("next_tier")
+            or transition_outcome.get("next_action_kind")
             != proof.get("next_action_kind")
             or "calculation_artifact" in stage
             or "control_return" in stage
@@ -1354,7 +1411,7 @@ def retain_promoted_control_terminal(
         or stage.get("schema") != PROMOTED_CONTROL_DECISION_STAGE_SCHEMA
         or stage.get("stage_sha256") != entry["retained_promoted_stage_sha256"]
         or not isinstance(decision, Mapping)
-        or decision.get("disposition") != terminal
+        or _control_outcome_kind(decision) != terminal
     ):
         raise ValueError("control terminal decision is invalid")
     receipt = promoted_control_terminal_disposition_receipt(entry, stage)
@@ -2716,7 +2773,7 @@ def validate_schema11_checkpoint(
                     )
                 )
                 if (
-                    stage.get("control_decision", {}).get("disposition")
+                    _control_outcome_kind(stage.get("control_decision"))
                     != queue_entry["disposition"]
                     or queue_entry["disposition_receipt_sha256"]
                     != _sha256(expected_terminal_receipt)
