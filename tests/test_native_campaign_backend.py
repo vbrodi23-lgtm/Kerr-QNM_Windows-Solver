@@ -332,8 +332,8 @@ class NativeCampaignBackendTests(unittest.TestCase):
             failure_code="INSUFFICIENT_ASYMPTOTIC_PRECISION",
             stage="asymptotic-preflight",
             identity=identity,
-            retryable=True,
-            retryable_basis="worker-declared bounded control continuation/v1",
+            retryable=False,
+            retryable_basis="generic condition has no continuation authority/v1",
             diagnostics=legacy_failure["diagnostics"],
         )
         control = validate_operation_control_receipt(

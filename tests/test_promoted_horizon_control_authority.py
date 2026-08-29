@@ -92,8 +92,8 @@ def _control_error() -> JuliaNumericalControlError:
         failure_code="INSUFFICIENT_ASYMPTOTIC_PRECISION",
         stage="asymptotic-preflight",
         identity=identity,
-        retryable=True,
-        retryable_basis="precision-insufficiency/v1",
+        retryable=False,
+        retryable_basis="generic condition has no continuation authority/v1",
         diagnostics={
             "reason": "INSUFFICIENT_ASYMPTOTIC_PRECISION",
             "precision_bits": request["working_precision_bits"],
@@ -235,8 +235,8 @@ def _horizon_control_outcome(leaf, entry) -> PromotedPassOutcome:
             failure_code="INSUFFICIENT_ASYMPTOTIC_PRECISION",
             stage="asymptotic-preflight",
             identity=identity,
-            retryable=True,
-            retryable_basis="horizon lifecycle fixture/v1",
+            retryable=False,
+            retryable_basis="generic condition has no continuation authority/v1",
             diagnostics={
                 "reason": "INSUFFICIENT_ASYMPTOTIC_PRECISION",
                 "precision_bits": request["working_precision_bits"],

@@ -38,8 +38,8 @@ def _generic_insufficiency_receipt():
         failure_code="INSUFFICIENT_ASYMPTOTIC_PRECISION",
         stage="asymptotic-preflight",
         identity=identity,
-        retryable=True,
-        retryable_basis="generic-structural-validator/v1",
+        retryable=False,
+        retryable_basis="generic condition has no continuation authority/v1",
         diagnostics={"reason": "INSUFFICIENT_ASYMPTOTIC_PRECISION"},
     )
     return validate_operation_control_receipt(

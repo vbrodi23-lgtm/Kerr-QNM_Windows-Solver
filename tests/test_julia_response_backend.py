@@ -119,10 +119,7 @@ def _worker_control_receipt(
         failure_code=failure_code,
         stage=control_failure_stage(failure_code),
         identity=identity,
-        retryable=failure_code in {
-            "INSUFFICIENT_ASYMPTOTIC_PRECISION",
-            "HORIZON_ARITHMETIC_INADEQUATE",
-        },
+        retryable=failure_code == "HORIZON_ARITHMETIC_INADEQUATE",
         retryable_basis="worker-control test fixture/v1",
         diagnostics=valid_control_failure_diagnostics(
             failure_code,

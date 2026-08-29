@@ -1665,10 +1665,7 @@ class JuliaNumericalControlFailureTests(unittest.TestCase):
         failure = {
             "failure_code": code,
             "failure_class": "CONTROL",
-            "retryable": code in {
-                "INSUFFICIENT_ASYMPTOTIC_PRECISION",
-                "HORIZON_ARITHMETIC_INADEQUATE",
-            },
+            "retryable": code == "HORIZON_ARITHMETIC_INADEQUATE",
             "stage": control_failure_stage(code),
             "diagnostics": (
                 JuliaNumericalControlFailureTests._diagnostics(code)
