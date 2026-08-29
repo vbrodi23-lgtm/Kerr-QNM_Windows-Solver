@@ -1876,6 +1876,8 @@ $candidate | ConvertTo-Json -Compress | Set-Content -LiteralPath $env:M02_TEST_J
             "promoted-control-empirical-calibration/v1",
             "fixed-root-reliability-projection-authority/v1",
             "data/fixed_root_reliability_projection_authority_v1.json",
+            "fixed_root_reliability_projection_authority_v1.json",
+            "promoted_control_empirical_calibration_v1.json",
             "minus-log10-target-plus-required-digit-guard/v1",
             "julia-control-diagnostics/v1",
             "supervisor-timeout/v1",

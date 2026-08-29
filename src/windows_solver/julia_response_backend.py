@@ -3578,6 +3578,49 @@ class JuliaResponseAdapter:
                 raise JuliaResponseBackendError(
                     f"M02 Julia {label} receipt digest does not match the installed runtime"
                 )
+        # The worker's own hash being valid does not prove its authority
+        # resources are staged: a bootstrap repair that only needed to
+        # restore a missing/corrupted resource never republishes an
+        # already-valid m02_worker.jl, so a reader that trusted the worker
+        # hash alone could launch it mid-repair and fail on the first
+        # authority read. Validate every resource the worker depends on
+        # here, using the same same-dir-then-parent-dir resolution the
+        # worker itself uses, before this adapter is considered ready.
+        worker_contract = julia.get("worker_contract")
+        for contract_key, resource_filename, resource_label in (
+            (
+                "fixed_root_authority_sha256",
+                "fixed_root_reliability_projection_authority_v1.json",
+                "fixed-root reliability projection authority",
+            ),
+            (
+                "promoted_calibration_sha256",
+                "promoted_control_empirical_calibration_v1.json",
+                "promoted control empirical calibration",
+            ),
+        ):
+            same_dir_resource = worker.parent / resource_filename
+            resource_path = (
+                same_dir_resource
+                if same_dir_resource.is_file()
+                else worker.parent.parent / resource_filename
+            )
+            observed_resource_sha256 = _sha256(
+                _regular_file(resource_path, f"M02 Julia {resource_label} resource")
+            )
+            declared_resource_sha256 = (
+                worker_contract.get(contract_key)
+                if isinstance(worker_contract, Mapping)
+                else None
+            )
+            if declared_resource_sha256 is not None and (
+                not isinstance(declared_resource_sha256, str)
+                or declared_resource_sha256 != observed_resource_sha256
+            ):
+                raise JuliaResponseBackendError(
+                    f"M02 Julia {resource_label} resource digest does not match "
+                    "the installed runtime"
+                )
         declared_arguments = julia.get("arguments", [])
         if (
             not isinstance(declared_arguments, list)
