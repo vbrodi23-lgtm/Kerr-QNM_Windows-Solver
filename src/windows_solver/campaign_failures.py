@@ -44,9 +44,6 @@ _REVIEWED_SCREENING_PROMOTION_REASONS = MappingProxyType({
 })
 
 _LEAF_LOCAL_DISPOSITIONS = {
-    # The generic package condition remains readable for legacy/internal
-    # producers, but it has no promotion authority in schema 11.
-    "INSUFFICIENT_ASYMPTOTIC_PRECISION": FailureDisposition.UNRESOLVED,
     "ODE_RESOURCE_LIMIT": FailureDisposition.DEFERRED,
     "ROOT_READOUT_RESOURCE_INFEASIBLE": FailureDisposition.DEFERRED,
     "COORDINATE_INVERSION_STALLED": FailureDisposition.UNRESOLVED,
@@ -54,10 +51,6 @@ _LEAF_LOCAL_DISPOSITIONS = {
     "HORIZON_MAXIMUM_ORDER_INADEQUATE": FailureDisposition.UNRESOLVED,
     "HORIZON_ADMITTANCE_CHART_SINGULAR": FailureDisposition.UNRESOLVED,
     "HORIZON_ONLY_ONE_ENDPOINT": FailureDisposition.UNRESOLVED,
-    "EXTERIOR_ENDPOINT_MAXIMUM_ORDER_INADEQUATE": (
-        FailureDisposition.UNRESOLVED
-    ),
-    "EXTERIOR_ENDPOINT_GEOMETRY_EXHAUSTED": FailureDisposition.UNRESOLVED,
     "PHYSICAL_SINGULAR_LIMIT": FailureDisposition.REJECTED,
     "SCATTERING_BASIS_ILL_CONDITIONED": FailureDisposition.UNRESOLVED,
     "SCATTERING_CHART_ILL_CONDITIONED": FailureDisposition.UNRESOLVED,
@@ -68,6 +61,16 @@ _LEAF_LOCAL_DISPOSITIONS = {
     "HORIZON_LADDER_EXHAUSTED": FailureDisposition.UNRESOLVED,
     "DETERMINANT_ERROR_MODEL_UNAVAILABLE": FailureDisposition.UNRESOLVED,
 }
+_RESOLVED_SURVEY_DISPOSITIONS = MappingProxyType({
+    "PROMOTION_PENDING_ROOT": (FailureDisposition.PROMOTION_PENDING, "ROOT"),
+    "PROMOTION_PENDING_RESPONSE": (
+        FailureDisposition.PROMOTION_PENDING,
+        "RESPONSE",
+    ),
+    "UNRESOLVED": (FailureDisposition.UNRESOLVED, None),
+    "DEFERRED": (FailureDisposition.DEFERRED, None),
+    "REJECTED": (FailureDisposition.REJECTED, None),
+})
 _SYSTEM_CAUSE_TYPES = frozenset(
     {
         "MethodError",
@@ -797,6 +800,24 @@ def decision_from_control_transition(
     )
 
 
+def decision_from_survey_disposition(
+    report: FailureReport,
+    disposition: str,
+) -> FailureDecision:
+    """Project an already-resolved non-CONTROL survey disposition."""
+
+    try:
+        resolved, queue_kind = _RESOLVED_SURVEY_DISPOSITIONS[disposition]
+    except KeyError as error:
+        raise ValueError("survey failure disposition is not terminal or queued") from error
+    return FailureDecision(
+        disposition=resolved,
+        failure_code=report.failure_code,
+        fingerprint_sha256=report.fingerprint_sha256,
+        queue_kind=queue_kind,
+    )
+
+
 def reviewed_screening_promotion_queue(reason_code: str) -> str | None:
     """Return a queue only for a reviewed, non-worker screening reason."""
 
@@ -894,6 +915,17 @@ class ProductionFailureMonitor:
         """Render a canonical CONTROL transition without reclassifying its code."""
 
         decision = decision_from_control_transition(report, transition)
+        return self._retain_leaf_decision(leaf_id, report, decision)
+
+    def observe_survey_disposition(
+        self,
+        leaf_id: str,
+        report: FailureReport,
+        disposition: str,
+    ) -> FailureDecision:
+        """Render an existing survey state without switching on its reason code."""
+
+        decision = decision_from_survey_disposition(report, disposition)
         return self._retain_leaf_decision(leaf_id, report, decision)
 
     def _retain_leaf_decision(
@@ -1087,6 +1119,7 @@ __all__ = [
     "abort_unexpected_system_failure",
     "classify_failure",
     "decision_from_control_transition",
+    "decision_from_survey_disposition",
     "reviewed_screening_promotion_queue",
     "require_system_failures_resolved_for_binary64_resume",
     "require_system_failures_resolved_for_promoted_resume",
