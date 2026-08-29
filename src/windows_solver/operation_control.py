@@ -21,6 +21,9 @@ OPERATION_EXECUTION_IDENTITY_SCHEMA = (
     "windows-solver.operation-execution-identity/1"
 )
 OPERATION_CONTROL_RECEIPT_SCHEMA = "windows-solver.operation-control-receipt/1"
+OPERATION_CONTROL_FACT_RECEIPT_SCHEMA = (
+    "windows-solver.operation-control-fact-receipt/2"
+)
 CANONICAL_REQUEST_BINDING_SCHEMA = "windows-solver.canonical-request-binding/1"
 
 ROOT_READOUT_OPERATION = "root-readout"
@@ -76,7 +79,7 @@ _FIXED_ROOT_REQUIRED_FIELDS = frozenset({
     "sample_roles",
 })
 _SAMPLE_FIELDS = frozenset({"sample_index", "sample_role"})
-_CONTROL_RECEIPT_FIELDS = frozenset({
+_CONTROL_RECEIPT_FACT_FIELDS = frozenset({
     "schema",
     "origin",
     "failure_class",
@@ -84,11 +87,13 @@ _CONTROL_RECEIPT_FIELDS = frozenset({
     "stage",
     "scope",
     "execution_identity",
-    "retryable_evidence",
     "diagnostics",
     "canonical_request_binding",
     "receipt_sha256",
 })
+_CONTROL_RECEIPT_COMPATIBILITY_FIELDS = (
+    _CONTROL_RECEIPT_FACT_FIELDS | {"retryable_evidence"}
+)
 _REQUEST_BINDING_FIELDS = frozenset({
     "schema",
     "operation",
@@ -509,11 +514,18 @@ def validate_operation_control_receipt(
     request_sha256: str | None = None,
     diagnostics_validator: Callable[[Mapping[str, object]], bool] | None = None,
 ) -> ValidatedControlReceipt:
-    if not isinstance(value, Mapping) or set(value) != _CONTROL_RECEIPT_FIELDS:
+    if not isinstance(value, Mapping):
         raise ValueError("operation control receipt fields are invalid")
     receipt = copy.deepcopy(dict(value))
-    if receipt.get("schema") != OPERATION_CONTROL_RECEIPT_SCHEMA:
+    receipt_schema = receipt.get("schema")
+    if receipt_schema == OPERATION_CONTROL_RECEIPT_SCHEMA:
+        expected_fields = _CONTROL_RECEIPT_COMPATIBILITY_FIELDS
+    elif receipt_schema == OPERATION_CONTROL_FACT_RECEIPT_SCHEMA:
+        expected_fields = _CONTROL_RECEIPT_FACT_FIELDS
+    else:
         raise ValueError("operation control receipt schema is invalid")
+    if set(receipt) != expected_fields:
+        raise ValueError("operation control receipt fields are invalid")
     content = {key: item for key, item in receipt.items() if key != "receipt_sha256"}
     if not _is_sha256(receipt.get("receipt_sha256")) or receipt["receipt_sha256"] != canonical_sha256(content):
         raise ValueError("operation control receipt digest is invalid")
@@ -527,14 +539,23 @@ def validate_operation_control_receipt(
     identity = OperationExecutionIdentity(receipt["execution_identity"])
     if receipt.get("scope") != identity.scope:
         raise ValueError("operation control receipt scope is inconsistent")
-    retryable = receipt.get("retryable_evidence")
-    if (
-        not isinstance(retryable, Mapping)
-        or set(retryable) != {"retryable", "basis"}
-        or not isinstance(retryable.get("retryable"), bool)
-        or not _is_nonempty_text(retryable.get("basis"))
+    if receipt_schema == OPERATION_CONTROL_RECEIPT_SCHEMA:
+        retryable = receipt.get("retryable_evidence")
+        if (
+            not isinstance(retryable, Mapping)
+            or set(retryable) != {"retryable", "basis"}
+            or not isinstance(retryable.get("retryable"), bool)
+            or not _is_nonempty_text(retryable.get("basis"))
+        ):
+            raise ValueError("operation control retryability evidence is invalid")
+    elif (
+        identity.operation != FIXED_ROOT_SURVEY_BATCH_OPERATION
+        or identity.mapping.get("request_schema")
+        != "windows-solver.fixed-root-survey-batch/3"
+        or identity.mapping.get("control_profile")
+        != FIXED_ROOT_DEEP_CONTROL_PROFILE
     ):
-        raise ValueError("operation control retryability evidence is invalid")
+        raise ValueError("operation control fact receipt is not fixed-root `/3`")
     diagnostics = receipt.get("diagnostics")
     if not isinstance(diagnostics, Mapping) or not diagnostics:
         raise ValueError("operation control diagnostics are incomplete")
@@ -582,25 +603,36 @@ def build_operation_control_receipt(
     failure_code: str,
     stage: str,
     identity: OperationExecutionIdentity,
-    retryable: bool,
-    retryable_basis: str,
+    retryable: bool | None = None,
+    retryable_basis: str | None = None,
     diagnostics: Mapping[str, object],
 ) -> dict[str, object]:
     content: dict[str, object] = {
-        "schema": OPERATION_CONTROL_RECEIPT_SCHEMA,
+        "schema": (
+            OPERATION_CONTROL_FACT_RECEIPT_SCHEMA
+            if identity.operation == FIXED_ROOT_SURVEY_BATCH_OPERATION
+            and identity.mapping.get("request_schema")
+            == "windows-solver.fixed-root-survey-batch/3"
+            else OPERATION_CONTROL_RECEIPT_SCHEMA
+        ),
         "origin": origin,
         "failure_class": "CONTROL",
         "failure_code": failure_code,
         "stage": stage,
         "scope": identity.scope,
         "execution_identity": identity.to_mapping(),
-        "retryable_evidence": {
-            "retryable": retryable,
-            "basis": retryable_basis,
-        },
         "diagnostics": copy.deepcopy(dict(diagnostics)),
         "canonical_request_binding": canonical_request_binding(identity),
     }
+    if content["schema"] == OPERATION_CONTROL_RECEIPT_SCHEMA:
+        if not isinstance(retryable, bool) or not _is_nonempty_text(
+            retryable_basis
+        ):
+            raise ValueError("compatibility retryability projection is absent")
+        content["retryable_evidence"] = {
+            "retryable": retryable,
+            "basis": retryable_basis,
+        }
     return {**content, "receipt_sha256": canonical_sha256(content)}
 
 
@@ -639,9 +671,9 @@ class ControlOutcome:
         if _token is not self._TOKEN:
             raise TypeError("ControlOutcome is minted only by operation_control")
         promotion = kind is ControlOutcomeKind.PROMOTION_PENDING
-        if promotion != all(
-            item is not None
-            for item in (queue_kind, next_tier, next_action_kind)
+        continuation = (queue_kind, next_tier, next_action_kind)
+        if (promotion and not all(item is not None for item in continuation)) or (
+            not promotion and any(item is not None for item in continuation)
         ):
             raise ValueError("control outcome continuation fields are inconsistent")
         object.__setattr__(self, "kind", kind)
@@ -788,14 +820,20 @@ class PromotedControlTransition:
         current_tier: str,
         current_action_kind: str,
         authorized_target_tier: str | None,
-        registered_promotion_queue: str | None,
         validator: str,
         exception_type: str,
     ) -> "PromotedControlTransition":
+        registered_promotion_queue = _NON_FIXED_CONTROL_PROMOTION_CODES.get(
+            failure_code
+        )
+        registered_stages = _CONTROL_STAGE_BY_OPERATION.get(
+            operation, {}
+        ).get(failure_code, ())
         fixed_root_promotion = (
             operation == FIXED_ROOT_SURVEY_BATCH_OPERATION
             and control_profile == FIXED_ROOT_DEEP_CONTROL_PROFILE
             and failure_code == "EXTERIOR_ENDPOINT_ARITHMETIC_INADEQUATE"
+            and stage == "asymptotic-preflight"
             and current_tier == "BF40"
             and authorized_target_tier == "BF80"
             and current_action_kind == "RESPONSE"
@@ -807,6 +845,9 @@ class PromotedControlTransition:
             and registered_promotion_queue == current_action_kind
             and current_tier == "BF40"
             and authorized_target_tier == "BF80"
+            and origin == JULIA_WORKER_ORIGIN
+            and scope == REQUEST_SCOPE
+            and stage in registered_stages
         )
         if fixed_root_promotion or non_fixed_promotion:
             outcome = ControlOutcome._mint(
@@ -1058,12 +1099,6 @@ _NON_FIXED_CONTROL_PROMOTION_CODES: Mapping[str, str] = MappingProxyType({
     "FINITE_DIFFERENCE_NOISE_LIMIT": "RESPONSE",
     "DETERMINANT_UNCERTAINTY_TOO_LARGE": "ROOT",
 })
-_REVIEWED_SCREENING_PROMOTION_CODES: Mapping[str, str] = MappingProxyType({
-    "ROOT_UNCERTAINTY_EVIDENCE_UNAVAILABLE": "ROOT",
-    "DETERMINANT_ERROR_EVIDENCE_UNAVAILABLE": "RESPONSE",
-    "BLOCKED_BY_REVIEWED_ERROR_EVIDENCE": "RESPONSE",
-    "ROOT_SEAL_UNAVAILABLE": "ROOT",
-})
 _DEFERRED_CODES = frozenset({
     "ODE_RESOURCE_LIMIT",
     "ROOT_READOUT_RESOURCE_INFEASIBLE",
@@ -1150,12 +1185,6 @@ def _build_transition_registry() -> Mapping[
                         if operation == FIXED_ROOT_SURVEY_BATCH_OPERATION
                         else None
                     )
-                    registered_promotion_queue = (
-                        "RESPONSE"
-                        if operation == FIXED_ROOT_SURVEY_BATCH_OPERATION
-                        and code == "EXTERIOR_ENDPOINT_ARITHMETIC_INADEQUATE"
-                        else _NON_FIXED_CONTROL_PROMOTION_CODES.get(code)
-                    )
                     transition = PromotedControlTransition.from_authenticated_facts(
                         origin=origin,
                         operation=operation,
@@ -1168,7 +1197,6 @@ def _build_transition_registry() -> Mapping[
                         authorized_target_tier=(
                             "BF80" if tier == "BF40" else None
                         ),
-                        registered_promotion_queue=registered_promotion_queue,
                         validator=(
                             "supervisor-timeout/v1"
                             if origin == PYTHON_SUPERVISOR_ORIGIN
@@ -1198,7 +1226,6 @@ def _build_transition_registry() -> Mapping[
             current_tier=tier,
             current_action_kind="RESPONSE",
             authorized_target_tier=("BF80" if tier == "BF40" else None),
-            registered_promotion_queue=None,
             validator="supervisor-timeout/v1",
             exception_type="JuliaWorkerTimeoutError",
         )
@@ -1271,9 +1298,3 @@ def expected_operation_control_retryability(
             "operation control retryability requires one exact transition"
         )
     return candidates.pop()
-
-
-def promotion_failure_codes() -> Mapping[str, str]:
-    """Return reviewed non-CONTROL promotion reasons for legacy callers."""
-
-    return _REVIEWED_SCREENING_PROMOTION_CODES
