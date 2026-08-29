@@ -398,6 +398,40 @@ class PublicSurfaceTests(unittest.TestCase):
         )
         self.assertNotIn("Expand-Archive", julia_install)
 
+    def test_m02_bootstrap_deploys_worker_data_json_files(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        bootstrap = (root / "runtime" / "bootstrap.ps1").read_text(
+            encoding="utf-8"
+        )
+        data_root = root / "src" / "windows_solver" / "data"
+
+        self.assertTrue(
+            (data_root / "fixed_root_reliability_projection_authority_v1.json").is_file(),
+            "fixed_root_reliability_projection_authority_v1.json must exist in package data",
+        )
+        self.assertTrue(
+            (data_root / "promoted_control_empirical_calibration_v1.json").is_file(),
+            "promoted_control_empirical_calibration_v1.json must exist in package data",
+        )
+
+        # The bootstrap must deploy both JSON files to the m02-workers parent
+        # directory so the worker resolves them via @__DIR__/../<filename>.json.
+        deploy_start = bootstrap.index(
+            '    $WorkerJsonRoot = Join-Path $RuntimeRoot "m02-workers"'
+        )
+        deploy_end = bootstrap.index("\n    $DependencyRejectionReason", deploy_start)
+        deploy_block = bootstrap[deploy_start:deploy_end]
+
+        self.assertIn(
+            '"fixed_root_reliability_projection_authority_v1.json"', deploy_block
+        )
+        self.assertIn(
+            '"promoted_control_empirical_calibration_v1.json"', deploy_block
+        )
+        self.assertIn(r"src\windows_solver\data", deploy_block)
+        self.assertIn("Copy-Item", deploy_block)
+        self.assertNotIn(r"m02-workers\$M02WorkerId", deploy_block)
+
     def test_m02_bootstrap_configures_utf8_console_before_julia(self) -> None:
         root = Path(__file__).resolve().parents[1]
         bootstrap = (root / "runtime" / "bootstrap.ps1").read_text(

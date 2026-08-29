@@ -1325,6 +1325,20 @@ if ($WithM02) {
         Install-PersistentSourceFile $ProducerSource $PersistentProducerPath "GSN producer source"
     }
 
+    $WorkerJsonRoot = Join-Path $RuntimeRoot "m02-workers"
+    New-Item -ItemType Directory -Force -Path $WorkerJsonRoot | Out-Null
+    foreach ($workerDataFile in @(
+        "fixed_root_reliability_projection_authority_v1.json",
+        "promoted_control_empirical_calibration_v1.json"
+    )) {
+        $workerDataSrc = Join-Path (Join-Path $PackageRoot "src\windows_solver\data") $workerDataFile
+        $workerDataDst = Join-Path $WorkerJsonRoot $workerDataFile
+        if (-not (Test-Path -LiteralPath $workerDataSrc -PathType Leaf)) {
+            throw "Required worker data file is absent: $workerDataSrc"
+        }
+        Copy-Item -LiteralPath $workerDataSrc -Destination $workerDataDst -Force
+    }
+
     $DependencyRejectionReason = Get-M02EnvironmentRejectionReason $M02DependencySha256
     $M02Ready = $null -eq $DependencyRejectionReason
     if ($null -ne $LegacyEnvironment -and -not $M02Ready) {
