@@ -534,6 +534,28 @@ class OperationControlTests(unittest.TestCase):
             promoted += int(is_promotion)
         self.assertEqual(1, promoted)
 
+    def test_transition_constructor_is_registry_sealed(self) -> None:
+        transition = next(
+            item
+            for item in PROMOTED_CONTROL_TRANSITIONS.values()
+            if item.outcome_kind is ControlOutcomeKind.PROMOTION_PENDING
+        )
+        with self.assertRaisesRegex(TypeError, "minted only by its registry"):
+            PromotedControlTransition(
+                origin=transition.origin,
+                operation=transition.operation,
+                control_profile=transition.control_profile,
+                failure_code=transition.failure_code,
+                stage=transition.stage,
+                scope=transition.scope,
+                current_tier=transition.current_tier,
+                current_action_kind=transition.current_action_kind,
+                validator=transition.validator,
+                exception_type=transition.exception_type,
+                outcome=transition.outcome,
+                _token=object(),
+            )
+
     def test_registry_is_exact_closed_and_self_consistent(self) -> None:
         self.assertTrue(PROMOTED_CONTROL_TRANSITIONS)
         for key, transition in PROMOTED_CONTROL_TRANSITIONS.items():
