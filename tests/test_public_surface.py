@@ -477,6 +477,51 @@ class PublicSurfaceTests(unittest.TestCase):
                     f"dirname(m02_worker.jl)/{resource_name} must exist after staging",
                 )
 
+    def test_m02_worker_authority_paths_support_dual_layout(self) -> None:
+        """Worker must resolve authority JSONs in both staged and source-tree layouts.
+
+        Staged runtime places the JSONs alongside m02_worker.jl (bootstrap
+        copies them into the same $M02WorkerId directory). CI, however, runs
+        m02_worker.jl directly from src/windows_solver/data/julia/, where the
+        JSONs live one directory up. The worker source must probe @__DIR__
+        first and only fall back to @__DIR__/.. when the same-directory file
+        is absent, so neither execution context regresses.
+        """
+        root = Path(__file__).resolve().parents[1]
+        worker_source = (
+            root / "src" / "windows_solver" / "data" / "julia" / "m02_worker.jl"
+        ).read_text(encoding="utf-8")
+
+        fixed_root_start = worker_source.index(
+            "const FIXED_ROOT_RELIABILITY_PROJECTION_AUTHORITY_PATH"
+        )
+        fixed_root_end = worker_source.index("\nend", fixed_root_start) + len("\nend")
+        fixed_root_block = worker_source[fixed_root_start:fixed_root_end]
+        self.assertIn("isfile(same_dir)", fixed_root_block)
+        self.assertIn('joinpath(@__DIR__, "fixed_root_reliability_projection_authority_v1.json")', fixed_root_block)
+        self.assertIn('joinpath(@__DIR__, "..", "fixed_root_reliability_projection_authority_v1.json")', fixed_root_block)
+
+        calibration_start = worker_source.index(
+            "const PROMOTED_CONTROL_CALIBRATION_RECEIPT_PATH"
+        )
+        calibration_end = worker_source.index("\nend", calibration_start) + len("\nend")
+        calibration_block = worker_source[calibration_start:calibration_end]
+        self.assertIn("isfile(same_dir)", calibration_block)
+        self.assertIn('joinpath(@__DIR__, "promoted_control_empirical_calibration_v1.json")', calibration_block)
+        self.assertIn('joinpath(@__DIR__, "..", "promoted_control_empirical_calibration_v1.json")', calibration_block)
+
+        # Structural check for the source-tree (CI) layout: the worker script
+        # lives in .../julia/, and the authority JSONs live one level up in
+        # .../data/, i.e. exactly where the @__DIR__/.. fallback looks.
+        worker_dir = root / "src" / "windows_solver" / "data" / "julia"
+        data_root = worker_dir.parent
+        for resource_name in (
+            "fixed_root_reliability_projection_authority_v1.json",
+            "promoted_control_empirical_calibration_v1.json",
+        ):
+            self.assertFalse((worker_dir / resource_name).is_file())
+            self.assertTrue((data_root / resource_name).is_file())
+
     def test_m02_bootstrap_configures_utf8_console_before_julia(self) -> None:
         root = Path(__file__).resolve().parents[1]
         bootstrap = (root / "runtime" / "bootstrap.ps1").read_text(
