@@ -61,8 +61,10 @@ from windows_solver.reviewed_determinant_error_issuance import (
     PromotedExecutionPreflight,
     require_locked_bf40_determinant_error_issuance_authority,
 )
+from windows_solver.schema11_dashboard import project_schema11_dashboard
 from windows_solver.promoted_control_calibration import PromotedExecutionMode
 from windows_solver.promoted_control_authority import (
+    authenticate_persisted_control_decision,
     authenticate_persisted_control_return,
 )
 from windows_solver.structural_diagnostics import StructuralDiagnosticSession
@@ -998,6 +1000,7 @@ class PromotedSurveySchedulerTests(unittest.TestCase):
             "control_return_sha256": control_return["control_return_sha256"],
             "control_decision_stage_sha256": decision_stage["stage_sha256"],
             "control_decision_sha256": decision["control_decision_sha256"],
+            "transition_id": decision["transition_id"],
             "current_tier": "BF40",
             "current_action_kind": "RESPONSE",
             "next_tier": "BF80",
@@ -1753,6 +1756,62 @@ class PromotedSurveySchedulerTests(unittest.TestCase):
             PromotionQueueDisposition.AWAITING_ADMISSION.value,
             resumed.checkpoint["promotion_queue"]["entries"][0]["disposition"],
         )
+
+    def test_retained_decision_round_trips_canonical_transition(self):
+        interrupted = self._interrupt_after_control_state(
+            PromotionQueueDisposition.CONTROL_DECISION_RETAINED.value
+        )
+        leaf_id = self.leaves[0].leaf_id
+        decision_stage = interrupted["promoted_stage_ledger"]["0"][leaf_id]
+        return_stage = decision_stage["calculation_chain"][-1]
+        decision = decision_stage["control_decision"]
+        authority = authenticate_persisted_control_decision(
+            return_stage["control_return"],
+            decision,
+            expected_return_schema=return_stage["control_return"]["schema"],
+            expected_decision_schema=PROMOTED_CONTROL_DECISION_SCHEMA,
+            expected_leaf_id=leaf_id,
+            expected_current_action_kind="RESPONSE",
+            expected_queue_ordinal=0,
+        )
+        transition = authority.classification.transition
+        self.assertEqual(transition.transition_id, decision["transition_id"])
+        self.assertEqual(transition.to_mapping(), decision["transition"])
+        self.assertEqual(
+            "PROMOTION_PENDING", decision["transition"]["outcome"]["kind"]
+        )
+        self.assertTrue(decision["transition"]["outcome"]["retryable"])
+        self.assertFalse(decision["transition"]["outcome"]["terminal"])
+        dashboard = project_schema11_dashboard(
+            interrupted,
+            selected_leaf_ids=[leaf_id],
+            leaf_metadata=None,
+        )
+        self.assertEqual(1, len(dashboard.control_transition_rows))
+        row = dashboard.control_transition_rows[0]
+        self.assertEqual(transition.transition_id, row.transition_id)
+        self.assertEqual("PROMOTION_PENDING", row.outcome_kind)
+        self.assertEqual("BF80", row.next_tier)
+
+        forged = copy.deepcopy(decision)
+        forged["transition"]["outcome"]["terminal"] = True
+        forged["control_decision_sha256"] = _sha256({
+            key: value
+            for key, value in forged.items()
+            if key != "control_decision_sha256"
+        })
+        with self.assertRaisesRegex(
+            ValueError, "does not match registry authority"
+        ):
+            authenticate_persisted_control_decision(
+                return_stage["control_return"],
+                forged,
+                expected_return_schema=return_stage["control_return"]["schema"],
+                expected_decision_schema=PROMOTED_CONTROL_DECISION_SCHEMA,
+                expected_leaf_id=leaf_id,
+                expected_current_action_kind="RESPONSE",
+                expected_queue_ordinal=0,
+            )
 
     def test_deferred_control_cannot_be_resealed_as_promotion_on_retention(self):
         interrupted = self._interrupt_after_control_state(
