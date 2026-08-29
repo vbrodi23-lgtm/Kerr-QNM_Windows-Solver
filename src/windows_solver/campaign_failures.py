@@ -13,7 +13,10 @@ from typing import Callable, Mapping, Sequence
 
 from .campaign_policy import validate_schema11_checkpoint
 from .contracts import canonical_json_bytes
-from .operation_control import PromotedControlTransition
+from .operation_control import (
+    PROMOTED_CONTROL_TRANSITIONS,
+    PromotedControlTransition,
+)
 from .progress import ProgressEventKind, emit_progress, progress_scope
 from .structural_diagnostics import StructuralDiagnosticSession
 
@@ -76,6 +79,10 @@ _SYSTEM_CAUSE_TYPES = frozenset(
         "DigestMismatchError",
         "BudgetBreachError",
     }
+)
+_PROMOTED_CONTROL_CODES = frozenset(
+    transition.failure_code
+    for transition in PROMOTED_CONTROL_TRANSITIONS.values()
 )
 _LEGACY_SYSTEM_FAILURE_RESOLUTION_RECEIPT_SCHEMA = (
     "windows-solver.system-failure-resolution/1"
@@ -742,6 +749,10 @@ def classify_failure(report: FailureReport) -> FailureDecision:
     diagnostics_complete = report.diagnostics.get("complete") is True
     if (
         report.failure_class == "CONTROL"
+        or (
+            report.failure_class == "PROMOTED_SURVEY_DISPOSITION"
+            and report.failure_code in _PROMOTED_CONTROL_CODES
+        )
         or report.cause_type in _SYSTEM_CAUSE_TYPES
         or not diagnostics_complete
     ):
@@ -1075,6 +1086,7 @@ __all__ = [
     "ProductionFailureMonitor",
     "abort_unexpected_system_failure",
     "classify_failure",
+    "decision_from_control_transition",
     "reviewed_screening_promotion_queue",
     "require_system_failures_resolved_for_binary64_resume",
     "require_system_failures_resolved_for_promoted_resume",
