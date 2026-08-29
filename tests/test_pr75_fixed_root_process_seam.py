@@ -287,7 +287,11 @@ class PR75FixedRootProcessSeamTests(unittest.TestCase):
                 capture_output=True,
                 text=True,
                 env=environment,
-                timeout=180,
+                # A cold hosted Julia process compiles the package-owned
+                # worker before these two no-solver error cases execute.  The
+                # same compilation can take about fifteen minutes on the CI
+                # runner; subsequent worker launches reuse the warmed cache.
+                timeout=20 * 60,
             )
             malformed_result = json.loads(malformed_response.read_bytes())
             semantic_result = json.loads(semantic_response.read_bytes())
