@@ -22,6 +22,7 @@ const FIXED_ROOT_SURVEY_BATCH_SCHEMA =
     "windows-solver.fixed-root-survey-batch/3"
 const FIXED_ROOT_SURVEY_BATCH_RESPONSE_SCHEMA =
     "windows-solver.fixed-root-survey-batch-response/3"
+const FIXED_ROOT_CONTROL_PROFILE = "fixed-root-deep-v1"
 const FIXED_ROOT_SURVEY_IDENTITY = "exterior-fixed-root-survey-raw/v1"
 const CANONICAL_EXTERIOR_BACKGROUND_IDENTITY =
     "canonical-exterior-background-wronskian/v1"
@@ -91,6 +92,7 @@ const FIXED_ROOT_DETERMINANT_EXECUTION_FIELDS = Set((
     "fixed_omega", "branch_identity", "readout_role",
 ))
 const FIXED_ROOT_EXECUTION_FIELDS = Set((
+    "control_profile",
     "plan",
     "scientific_operation_identity",
     "root_reference_id",
@@ -564,6 +566,7 @@ function validated_execution_identity(value)
         error("operation execution identity request digest is invalid")
     if operation == FIXED_ROOT_SURVEY_BATCH_OPERATION
         for key in (
+            "control_profile",
             "plan",
             "scientific_operation_identity",
             "root_reference_id",
@@ -573,6 +576,9 @@ function validated_execution_identity(value)
         )
             required(value, key)
         end
+        string(required(value, "control_profile")) ==
+            FIXED_ROOT_CONTROL_PROFILE ||
+            error("fixed-root control profile is not registered")
         if scope == "REQUEST"
             !haskey(value, "sample_index") && !haskey(value, "sample_role") ||
                 error("fixed-root request identity selects a sample")
@@ -8711,6 +8717,7 @@ function flatten_fixed_root_survey_request(document)
         "schema_version",
         "schema",
         "operation",
+        "control_profile",
         "identity",
         "plan",
         "execution_identity",
@@ -8757,6 +8764,7 @@ function flatten_fixed_root_survey_request(document)
         "schema_version" => required(document, "schema_version"),
         "schema" => required(document, "schema"),
         "operation" => required(document, "operation"),
+        "control_profile" => required(document, "control_profile"),
         "identity" => required(document, "identity"),
         "plan" => required(document, "plan"),
         "execution_identity" => execution_identity,
@@ -8980,6 +8988,9 @@ function validate_fixed_root_survey_request(request)
     string(required(request, "operation")) ==
         FIXED_ROOT_SURVEY_BATCH_OPERATION ||
         error("fixed-root survey operation is invalid")
+    string(required(request, "control_profile")) ==
+        FIXED_ROOT_CONTROL_PROFILE ||
+        error("fixed-root survey control profile is not registered")
     string(required(request, "identity")) == FIXED_ROOT_SURVEY_IDENTITY ||
         error("fixed-root survey identity is invalid")
     identity = request_execution_identity(request)
