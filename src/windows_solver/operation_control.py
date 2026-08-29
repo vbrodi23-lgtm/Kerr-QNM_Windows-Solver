@@ -9,9 +9,10 @@ from __future__ import annotations
 
 import copy
 from dataclasses import dataclass
+from enum import Enum
 import hashlib
 from types import MappingProxyType
-from typing import Callable, Mapping
+from typing import Callable, ClassVar, Mapping
 
 from .contracts import canonical_json_bytes
 
@@ -25,6 +26,10 @@ CANONICAL_REQUEST_BINDING_SCHEMA = "windows-solver.canonical-request-binding/1"
 ROOT_READOUT_OPERATION = "root-readout"
 FIXED_ROOT_SURVEY_BATCH_OPERATION = "fixed-root-survey-batch"
 FIXED_ROOT_DETERMINANT_SAMPLE_OPERATION = "fixed-root-determinant-sample"
+FIXED_ROOT_DEEP_CONTROL_PROFILE = "fixed-root-deep-v1"
+PROMOTED_CONTROL_TRANSITION_SCHEMA = (
+    "windows-solver.promoted-control-transition/2"
+)
 
 REQUEST_SCOPE = "REQUEST"
 SAMPLE_SCOPE = "SAMPLE"
@@ -62,6 +67,7 @@ _FIXED_ROOT_DETERMINANT_REQUIRED_FIELDS = frozenset({
     "readout_role",
 })
 _FIXED_ROOT_REQUIRED_FIELDS = frozenset({
+    "control_profile",
     "plan",
     "scientific_operation_identity",
     "root_reference_id",
@@ -295,6 +301,7 @@ def _validate_execution_identity_mapping(value: object) -> dict[str, object]:
                     )
     else:
         for field in (
+            "control_profile",
             "plan",
             "scientific_operation_identity",
             "root_reference_id",
@@ -302,6 +309,8 @@ def _validate_execution_identity_mapping(value: object) -> dict[str, object]:
         ):
             if not _is_nonempty_text(result.get(field)):
                 raise ValueError(f"fixed-root execution identity {field} is invalid")
+        if result["control_profile"] != FIXED_ROOT_DEEP_CONTROL_PROFILE:
+            raise ValueError("fixed-root control profile is not registered")
         if not _is_sha256(result.get("root_seal_sha256")):
             raise ValueError("fixed-root root seal identity is invalid")
         roles = result.get("sample_roles")
@@ -391,6 +400,7 @@ def execution_identity_from_request(
             })
     elif operation == FIXED_ROOT_SURVEY_BATCH_OPERATION:
         common.update({
+            "control_profile": request.get("control_profile"),
             "plan": request.get("plan"),
             "scientific_operation_identity": request.get(
                 "scientific_operation_identity"
@@ -594,10 +604,127 @@ def build_operation_control_receipt(
     return {**content, "receipt_sha256": canonical_sha256(content)}
 
 
-@dataclass(frozen=True, slots=True)
+class ControlOutcomeKind(str, Enum):
+    """Closed promoted-campaign outcomes owned by this module."""
+
+    PROMOTION_PENDING = "PROMOTION_PENDING"
+    UNRESOLVED = "UNRESOLVED"
+    DEFERRED = "DEFERRED"
+    REJECTED = "REJECTED"
+    SYSTEM_FAILURE = "SYSTEM_FAILURE"
+
+
+@dataclass(frozen=True, slots=True, init=False)
+class ControlOutcome:
+    """One internally minted outcome with no independently writable flags."""
+
+    kind: ControlOutcomeKind
+    reason_code: str
+    queue_kind: str | None
+    next_tier: str | None
+    next_action_kind: str | None
+
+    _TOKEN: ClassVar[object] = object()
+
+    def __init__(
+        self,
+        *,
+        kind: ControlOutcomeKind,
+        reason_code: str,
+        queue_kind: str | None,
+        next_tier: str | None,
+        next_action_kind: str | None,
+        _token: object,
+    ) -> None:
+        if _token is not self._TOKEN:
+            raise TypeError("ControlOutcome is minted only by operation_control")
+        promotion = kind is ControlOutcomeKind.PROMOTION_PENDING
+        if promotion != all(
+            item is not None
+            for item in (queue_kind, next_tier, next_action_kind)
+        ):
+            raise ValueError("control outcome continuation fields are inconsistent")
+        object.__setattr__(self, "kind", kind)
+        object.__setattr__(self, "reason_code", reason_code)
+        object.__setattr__(self, "queue_kind", queue_kind)
+        object.__setattr__(self, "next_tier", next_tier)
+        object.__setattr__(self, "next_action_kind", next_action_kind)
+
+    @classmethod
+    def _mint(
+        cls,
+        *,
+        kind: ControlOutcomeKind,
+        reason_code: str,
+        queue_kind: str | None = None,
+        next_tier: str | None = None,
+        next_action_kind: str | None = None,
+    ) -> "ControlOutcome":
+        return cls(
+            kind=kind,
+            reason_code=reason_code,
+            queue_kind=queue_kind,
+            next_tier=next_tier,
+            next_action_kind=next_action_kind,
+            _token=cls._TOKEN,
+        )
+
+    @property
+    def retryable(self) -> bool:
+        return self.kind in {
+            ControlOutcomeKind.PROMOTION_PENDING,
+            ControlOutcomeKind.DEFERRED,
+        }
+
+    @property
+    def terminal(self) -> bool:
+        return not self.retryable
+
+    @property
+    def requires_promotion(self) -> bool:
+        return self.kind is ControlOutcomeKind.PROMOTION_PENDING
+
+    @property
+    def containable(self) -> bool:
+        return self.kind is not ControlOutcomeKind.SYSTEM_FAILURE
+
+    @property
+    def persist_return(self) -> bool:
+        return True
+
+    @property
+    def persist_decision(self) -> bool:
+        return True
+
+    @property
+    def explicitly_fatal(self) -> bool:
+        return self.kind is ControlOutcomeKind.SYSTEM_FAILURE
+
+    def to_mapping(self) -> dict[str, object]:
+        """Serialize compatibility flags strictly as projections of ``kind``."""
+
+        return {
+            "kind": self.kind.value,
+            "reason_code": self.reason_code,
+            "retryable": self.retryable,
+            "terminal": self.terminal,
+            "requires_promotion": self.requires_promotion,
+            "containable": self.containable,
+            "queue_kind": self.queue_kind,
+            "next_tier": self.next_tier,
+            "next_action_kind": self.next_action_kind,
+            "persist_return": self.persist_return,
+            "persist_decision": self.persist_decision,
+        }
+
+
+@dataclass(frozen=True, slots=True, init=False)
 class PromotedControlTransition:
+    """Authenticated event identity and its sole canonical campaign outcome."""
+
     origin: str
     operation: str
+    control_profile: str | None
     failure_code: str
     stage: str
     scope: str
@@ -605,26 +732,207 @@ class PromotedControlTransition:
     current_action_kind: str
     validator: str
     exception_type: str
-    containable: bool
-    disposition: str
-    queue_kind: str | None
-    next_tier: str | None
-    next_action_kind: str | None
-    persist_return: bool
-    persist_decision: bool
-    explicitly_fatal: bool
+    outcome: ControlOutcome
+
+    _TOKEN: ClassVar[object] = object()
+
+    def __init__(
+        self,
+        *,
+        origin: str,
+        operation: str,
+        control_profile: str | None,
+        failure_code: str,
+        stage: str,
+        scope: str,
+        current_tier: str,
+        current_action_kind: str,
+        validator: str,
+        exception_type: str,
+        outcome: ControlOutcome,
+        _token: object,
+    ) -> None:
+        if _token is not self._TOKEN:
+            raise TypeError(
+                "PromotedControlTransition is minted only by its registry"
+            )
+        for name, value in (
+            ("origin", origin),
+            ("operation", operation),
+            ("failure_code", failure_code),
+            ("stage", stage),
+            ("scope", scope),
+            ("current_tier", current_tier),
+            ("current_action_kind", current_action_kind),
+            ("validator", validator),
+            ("exception_type", exception_type),
+        ):
+            if not _is_nonempty_text(value):
+                raise ValueError(f"promoted CONTROL transition {name} is invalid")
+            object.__setattr__(self, name, value)
+        if control_profile is not None and not _is_nonempty_text(control_profile):
+            raise ValueError("promoted CONTROL transition profile is invalid")
+        object.__setattr__(self, "control_profile", control_profile)
+        object.__setattr__(self, "outcome", outcome)
+
+    @classmethod
+    def from_authenticated_facts(
+        cls,
+        *,
+        origin: str,
+        operation: str,
+        control_profile: str | None,
+        failure_code: str,
+        stage: str,
+        scope: str,
+        current_tier: str,
+        current_action_kind: str,
+        authorized_target_tier: str | None,
+        registered_promotion_queue: str | None,
+        validator: str,
+        exception_type: str,
+    ) -> "PromotedControlTransition":
+        fixed_root_promotion = (
+            operation == FIXED_ROOT_SURVEY_BATCH_OPERATION
+            and control_profile == FIXED_ROOT_DEEP_CONTROL_PROFILE
+            and failure_code == "EXTERIOR_ENDPOINT_ARITHMETIC_INADEQUATE"
+            and current_tier == "BF40"
+            and authorized_target_tier == "BF80"
+            and current_action_kind == "RESPONSE"
+            and scope == SAMPLE_SCOPE
+            and origin == JULIA_WORKER_ORIGIN
+        )
+        non_fixed_promotion = (
+            operation != FIXED_ROOT_SURVEY_BATCH_OPERATION
+            and registered_promotion_queue == current_action_kind
+            and current_tier == "BF40"
+            and authorized_target_tier == "BF80"
+        )
+        if fixed_root_promotion or non_fixed_promotion:
+            outcome = ControlOutcome._mint(
+                kind=ControlOutcomeKind.PROMOTION_PENDING,
+                reason_code=failure_code,
+                queue_kind=current_action_kind,
+                next_tier="BF80",
+                next_action_kind=current_action_kind,
+            )
+        elif failure_code in _EXPLICIT_FATAL_CODES:
+            outcome = ControlOutcome._mint(
+                kind=ControlOutcomeKind.SYSTEM_FAILURE,
+                reason_code=failure_code,
+            )
+        elif failure_code in _DEFERRED_CODES:
+            outcome = ControlOutcome._mint(
+                kind=ControlOutcomeKind.DEFERRED,
+                reason_code=failure_code,
+            )
+        elif failure_code in _REJECTED_CODES:
+            outcome = ControlOutcome._mint(
+                kind=ControlOutcomeKind.REJECTED,
+                reason_code=failure_code,
+            )
+        else:
+            outcome = ControlOutcome._mint(
+                kind=ControlOutcomeKind.UNRESOLVED,
+                reason_code=failure_code,
+            )
+        return cls(
+            origin=origin,
+            operation=operation,
+            control_profile=control_profile,
+            failure_code=failure_code,
+            stage=stage,
+            scope=scope,
+            current_tier=current_tier,
+            current_action_kind=current_action_kind,
+            validator=validator,
+            exception_type=exception_type,
+            outcome=outcome,
+            _token=cls._TOKEN,
+        )
 
     @property
-    def key(self) -> tuple[str, str, str, str, str, str, str]:
+    def key(self) -> tuple[str, str, str | None, str, str, str, str, str]:
         return (
             self.origin,
             self.operation,
+            self.control_profile,
             self.failure_code,
             self.stage,
             self.scope,
             self.current_tier,
             self.current_action_kind,
         )
+
+    @property
+    def outcome_kind(self) -> ControlOutcomeKind:
+        return self.outcome.kind
+
+    @property
+    def disposition(self) -> str:
+        return self.outcome.kind.value
+
+    @property
+    def retryable(self) -> bool:
+        return self.outcome.retryable
+
+    @property
+    def terminal(self) -> bool:
+        return self.outcome.terminal
+
+    @property
+    def requires_promotion(self) -> bool:
+        return self.outcome.requires_promotion
+
+    @property
+    def containable(self) -> bool:
+        return self.outcome.containable
+
+    @property
+    def queue_kind(self) -> str | None:
+        return self.outcome.queue_kind
+
+    @property
+    def next_tier(self) -> str | None:
+        return self.outcome.next_tier
+
+    @property
+    def next_action_kind(self) -> str | None:
+        return self.outcome.next_action_kind
+
+    @property
+    def persist_return(self) -> bool:
+        return self.outcome.persist_return
+
+    @property
+    def persist_decision(self) -> bool:
+        return self.outcome.persist_decision
+
+    @property
+    def explicitly_fatal(self) -> bool:
+        return self.outcome.explicitly_fatal
+
+    def to_mapping(self) -> dict[str, object]:
+        return {
+            "schema": PROMOTED_CONTROL_TRANSITION_SCHEMA,
+            "event": {
+                "origin": self.origin,
+                "operation": self.operation,
+                "control_profile": self.control_profile,
+                "failure_code": self.failure_code,
+                "stage": self.stage,
+                "scope": self.scope,
+                "current_tier": self.current_tier,
+                "current_action_kind": self.current_action_kind,
+                "validator": self.validator,
+                "exception_type": self.exception_type,
+            },
+            "outcome": self.outcome.to_mapping(),
+        }
+
+    @property
+    def transition_id(self) -> str:
+        return canonical_sha256(self.to_mapping())
 
 
 _JULIA_NUMERICAL_CONTROL_STAGE: Mapping[str, tuple[str, ...]] = MappingProxyType({
@@ -719,46 +1027,6 @@ _CONTROL_STAGE_BY_OPERATION: Mapping[
     ),
 })
 
-# Retryability is a code-owned worker contract, not an assertion that a caller
-# may choose while constructing otherwise authentic-looking receipt bytes.
-# The Julia worker emits ``true`` only for these bounded continuation outcomes;
-# all other registered operation-control outcomes are non-retryable.
-_RETRYABLE_OPERATION_CONTROL_CODES = frozenset({
-    "INSUFFICIENT_ASYMPTOTIC_PRECISION",
-    "HORIZON_ARITHMETIC_INADEQUATE",
-    "EXTERIOR_ENDPOINT_ARITHMETIC_INADEQUATE",
-    "ODE_RESOURCE_LIMIT",
-    "ROOT_READOUT_RESOURCE_INFEASIBLE",
-    "WORKER_TIMEOUT",
-})
-_OPERATION_CONTROL_RETRYABILITY: Mapping[str, bool] = MappingProxyType({
-    code: code in _RETRYABLE_OPERATION_CONTROL_CODES
-    for operation_stages in _CONTROL_STAGE_BY_OPERATION.values()
-    for code in operation_stages
-})
-
-
-def expected_operation_control_retryability(
-    failure_code: str,
-    *,
-    operation: str | None = None,
-) -> bool:
-    """Return the producer-owned retryability for one registered code."""
-
-    try:
-        retryable = _OPERATION_CONTROL_RETRYABILITY[failure_code]
-    except KeyError as error:
-        raise ValueError("operation control retryability code is not registered") from error
-    if operation is not None and operation not in _CONTROL_STAGE_BY_OPERATION:
-        raise ValueError("operation control retryability operation is invalid")
-    if (
-        failure_code == "INSUFFICIENT_ASYMPTOTIC_PRECISION"
-        and operation == FIXED_ROOT_SURVEY_BATCH_OPERATION
-    ):
-        return False
-    return retryable
-
-
 def _validate_registered_control_emission(
     receipt: Mapping[str, object],
     identity: OperationExecutionIdentity,
@@ -780,24 +1048,20 @@ def _validate_registered_control_emission(
     )
     if receipt.get("origin") != expected_origin or identity.scope != expected_scope:
         raise ValueError("operation control emission identity is incompatible")
-    retryable = receipt["retryable_evidence"]
-    if (
-        not isinstance(retryable, Mapping)
-        or retryable.get("retryable")
-        is not expected_operation_control_retryability(
-            code, operation=identity.operation
-        )
-    ):
-        raise ValueError("operation control retryability contradicts its code")
+    # Compatibility retryability is intentionally not interpreted here.  It
+    # is checked against the exact transition only after tier and scheduler
+    # action are authenticated by ``promoted_control_transition``.
 
-_PROMOTION_CODES: Mapping[str, str] = MappingProxyType({
+
+_NON_FIXED_CONTROL_PROMOTION_CODES: Mapping[str, str] = MappingProxyType({
     "HORIZON_ARITHMETIC_INADEQUATE": "RESPONSE",
-    "EXTERIOR_ENDPOINT_ARITHMETIC_INADEQUATE": "RESPONSE",
-    "ROOT_UNCERTAINTY_EVIDENCE_UNAVAILABLE": "ROOT",
     "FINITE_DIFFERENCE_NOISE_LIMIT": "RESPONSE",
+    "DETERMINANT_UNCERTAINTY_TOO_LARGE": "ROOT",
+})
+_REVIEWED_SCREENING_PROMOTION_CODES: Mapping[str, str] = MappingProxyType({
+    "ROOT_UNCERTAINTY_EVIDENCE_UNAVAILABLE": "ROOT",
     "DETERMINANT_ERROR_EVIDENCE_UNAVAILABLE": "RESPONSE",
     "BLOCKED_BY_REVIEWED_ERROR_EVIDENCE": "RESPONSE",
-    "DETERMINANT_UNCERTAINTY_TOO_LARGE": "ROOT",
     "ROOT_SEAL_UNAVAILABLE": "ROOT",
 })
 _DEFERRED_CODES = frozenset({
@@ -824,8 +1088,14 @@ _EXPLICIT_FATAL_CODES = frozenset({
 })
 
 
-def _build_transition_registry() -> Mapping[tuple[str, str, str, str, str, str, str], PromotedControlTransition]:
-    result: dict[tuple[str, str, str, str, str, str, str], PromotedControlTransition] = {}
+def _build_transition_registry() -> Mapping[
+    tuple[str, str, str | None, str, str, str, str, str],
+    PromotedControlTransition,
+]:
+    result: dict[
+        tuple[str, str, str | None, str, str, str, str, str],
+        PromotedControlTransition,
+    ] = {}
     operation_actions = (
         (
             ROOT_READOUT_OPERATION,
@@ -875,47 +1145,30 @@ def _build_transition_registry() -> Mapping[tuple[str, str, str, str, str, str, 
             origin = PYTHON_SUPERVISOR_ORIGIN if code == "WORKER_TIMEOUT" else JULIA_WORKER_ORIGIN
             for stage in stages:
                 for tier in ("BF40", "BF80"):
-                    promoted_queue = _PROMOTION_CODES.get(code)
-                    promotes = tier == "BF40" and promoted_queue == action
-                    explicitly_fatal = code in _EXPLICIT_FATAL_CODES
-                    if promotes:
-                        disposition = "PROMOTION_PENDING"
-                        queue_kind = action
-                        next_tier = "BF80"
-                        next_action = action
-                        containable = True
-                    elif explicitly_fatal:
-                        disposition = "SYSTEM_FAILURE"
-                        queue_kind = None
-                        next_tier = None
-                        next_action = None
-                        containable = False
-                    elif code in _DEFERRED_CODES:
-                        disposition = "DEFERRED"
-                        queue_kind = None
-                        next_tier = None
-                        next_action = None
-                        containable = True
-                    elif code in _REJECTED_CODES:
-                        disposition = "REJECTED"
-                        queue_kind = None
-                        next_tier = None
-                        next_action = None
-                        containable = True
-                    else:
-                        disposition = "UNRESOLVED"
-                        queue_kind = None
-                        next_tier = None
-                        next_action = None
-                        containable = True
-                    transition = PromotedControlTransition(
+                    control_profile = (
+                        FIXED_ROOT_DEEP_CONTROL_PROFILE
+                        if operation == FIXED_ROOT_SURVEY_BATCH_OPERATION
+                        else None
+                    )
+                    registered_promotion_queue = (
+                        "RESPONSE"
+                        if operation == FIXED_ROOT_SURVEY_BATCH_OPERATION
+                        and code == "EXTERIOR_ENDPOINT_ARITHMETIC_INADEQUATE"
+                        else _NON_FIXED_CONTROL_PROMOTION_CODES.get(code)
+                    )
+                    transition = PromotedControlTransition.from_authenticated_facts(
                         origin=origin,
                         operation=operation,
+                        control_profile=control_profile,
                         failure_code=code,
                         stage=stage,
                         scope=scope,
                         current_tier=tier,
                         current_action_kind=action,
+                        authorized_target_tier=(
+                            "BF80" if tier == "BF40" else None
+                        ),
+                        registered_promotion_queue=registered_promotion_queue,
                         validator=(
                             "supervisor-timeout/v1"
                             if origin == PYTHON_SUPERVISOR_ORIGIN
@@ -928,14 +1181,6 @@ def _build_transition_registry() -> Mapping[tuple[str, str, str, str, str, str, 
                                 "JuliaRootReadoutResourceLimitError"
                             ),
                         }.get(code, "JuliaNumericalControlError"),
-                        containable=containable,
-                        disposition=disposition,
-                        queue_kind=queue_kind,
-                        next_tier=next_tier,
-                        next_action_kind=next_action,
-                        persist_return=True,
-                        persist_decision=True,
-                        explicitly_fatal=explicitly_fatal,
                     )
                     if transition.key in result:
                         raise RuntimeError("duplicate promoted control transition")
@@ -943,24 +1188,19 @@ def _build_transition_registry() -> Mapping[tuple[str, str, str, str, str, str, 
     # A supervisor timeout may occur before Julia selects the first descriptor,
     # so fixed-root timeout has a separate, exact REQUEST-scope transition.
     for tier in ("BF40", "BF80"):
-        transition = PromotedControlTransition(
+        transition = PromotedControlTransition.from_authenticated_facts(
             origin=PYTHON_SUPERVISOR_ORIGIN,
             operation=FIXED_ROOT_SURVEY_BATCH_OPERATION,
+            control_profile=FIXED_ROOT_DEEP_CONTROL_PROFILE,
             failure_code="WORKER_TIMEOUT",
             stage="worker-supervision",
             scope=REQUEST_SCOPE,
             current_tier=tier,
             current_action_kind="RESPONSE",
+            authorized_target_tier=("BF80" if tier == "BF40" else None),
+            registered_promotion_queue=None,
             validator="supervisor-timeout/v1",
             exception_type="JuliaWorkerTimeoutError",
-            containable=True,
-            disposition="DEFERRED",
-            queue_kind=None,
-            next_tier=None,
-            next_action_kind=None,
-            persist_return=True,
-            persist_decision=True,
-            explicitly_fatal=False,
         )
         result[transition.key] = transition
     return MappingProxyType(result)
@@ -978,6 +1218,11 @@ def promoted_control_transition(
     key = (
         receipt.origin,
         receipt.identity.operation,
+        (
+            str(receipt.identity.mapping["control_profile"])
+            if "control_profile" in receipt.identity.mapping
+            else None
+        ),
         receipt.failure_code,
         receipt.stage,
         receipt.identity.scope,
@@ -985,10 +1230,50 @@ def promoted_control_transition(
         current_action_kind,
     )
     try:
-        return PROMOTED_CONTROL_TRANSITIONS[key]
+        transition = PROMOTED_CONTROL_TRANSITIONS[key]
     except KeyError as error:
         raise ValueError("promoted CONTROL outcome has no exact transition") from error
+    retryable = receipt.mapping.get("retryable_evidence")
+    if (
+        isinstance(retryable, Mapping)
+        and retryable.get("retryable") is not transition.retryable
+    ):
+        raise ValueError(
+            "operation control retryability contradicts its canonical transition"
+        )
+    return transition
+
+
+def expected_operation_control_retryability(
+    failure_code: str,
+    *,
+    operation: str,
+    current_tier: str | None = None,
+    current_action_kind: str | None = None,
+) -> bool:
+    """Compatibility projection derived from canonical transitions only."""
+
+    candidates = {
+        transition.retryable
+        for transition in PROMOTED_CONTROL_TRANSITIONS.values()
+        if transition.failure_code == failure_code
+        and transition.operation == operation
+        and (
+            current_tier is None or transition.current_tier == current_tier
+        )
+        and (
+            current_action_kind is None
+            or transition.current_action_kind == current_action_kind
+        )
+    }
+    if len(candidates) != 1:
+        raise ValueError(
+            "operation control retryability requires one exact transition"
+        )
+    return candidates.pop()
 
 
 def promotion_failure_codes() -> Mapping[str, str]:
-    return _PROMOTION_CODES
+    """Return reviewed non-CONTROL promotion reasons for legacy callers."""
+
+    return _REVIEWED_SCREENING_PROMOTION_CODES
